@@ -5723,40 +5723,44 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
     whose transcendental rounding differs from every other implementation in the
     final digit.
 
-  **PROVEN 2026-09-08: mongod is NOT correctly rounded here, so no independent
-  implementation can match it by being more accurate.** Computing at 60 digits
-  and rounding correctly to 34 matches mongod for `$sqrt` and `$exp` — and does
-  NOT for `$ln` or `$log10`. Against the true values:
+  **CORRECTED 2026-09-08 (the earlier "proof" in this entry was TOO STRONG).**
+  A first measurement showed correctly-rounded-to-34 differs from mongod for
+  `$ln` / `$log10` and concluded "no independent implementation can match it".
+  Probing further found mongod's actual rule, and it is largely reproducible:
 
-      ln(2.5)    = 0.9162907318741550651835272117680110|714501...
-                   correctly rounded to 34 -> ...680111
-                   mongod                   -> ...680110   (BELOW)
+  - **`$sqrt` is plain correctly-rounded decimal128** — IEEE 754 REQUIRES that
+    for square root, and it matches on **6 of 6** inputs tested (2.5, 0.5, 1.25,
+    3, 7.125, 0.001). This operator is exactly reproducible **today**, with no
+    dependency at all.
+  - **`$exp` / `$ln` go through BINARY128.** Rounding the true value to a
+    113-bit mantissa (the binary128 significand) and converting back to 34
+    decimal digits reproduces mongod exactly where correct decimal rounding does
+    not:
 
-      log10(2.5) = 0.3979400086720376095725222105510139|464636...
-                   correctly rounded to 34 -> ...510139
-                   mongod                   -> ...510140   (ABOVE)
+        ln(2.5)  correctly rounded (decimal) -> ...680111
+                 via binary128               -> ...680110  == mongod
 
-  mongod lands below the true value for one and above it for the other, so it is
-  neither correctly rounded nor consistently truncated: it carries Intel RDFP's
-  own approximation error. Matching it means reproducing that error, which a
-  more accurate library cannot do.
+  - **It is not one uniform rule.** Across 24 covered (operator, input) pairs the
+    binary128 route matched 20 and missed 4 — three `$sqrt` (which follow the
+    decimal rule above) and `$log10(7.125)`. So `$log10` is not purely binary128
+    either, and the trig / hyperbolic family (48 pairs) was not covered at all
+    because the test harness had no series implementation.
 
-  **So there are only TWO real options, not three:**
+  **What this changes.** The item is no longer "needs Intel RDFP or nothing".
+  There is a real pure-Rust path — correctly-rounded decimal `$sqrt`, plus a
+  binary128 intermediate for the log/exp family — that needs no C dependency. It
+  does need a high-precision arithmetic core (compute at ~200 bits, round to 113,
+  convert to 34 decimal digits) and per-operator verification against mongod,
+  which is a genuine feature-sized piece of work rather than a one-line fix.
 
-  1. **Link Intel RDFP** (the library mongod itself uses) — the only way to be
-     bit-identical. Cost: a C dependency in the wheel build, which currently
-     ships cp312+cp313 across macOS arm64, manylinux2014 and musllinux
-     x86_64/aarch64, and Windows AMD64.
-  2. **Keep refusing.** Honest, and what the server does today. Cost: the two
-     servers disagree (Python answers within 1 ULP, Rust refuses), and mongod
-     answers.
+  **Next session should start by** extending the harness with series
+  implementations for sin/cos/tan/atan/sinh/cosh/tanh/asinh and re-running the
+  24-pair sweep over all 72, to find which of them the binary128 route explains.
+  The harness is `scratchpad`-only; the mongod values it compares against are
+  cheap to regenerate (12 operators x 6 inputs, one aggregation each).
 
-  **Adding a pure-Rust decimal crate (`astro-float`, `dashu-float`) is now ruled
-  OUT on evidence, not on taste** — it cannot match `$ln` / `$log10` at any
-  precision, so it would buy a *quietly* wrong last digit in place of a *loudly*
-  unsupported operator. That is the trade `CLAUDE.md`'s "wire-protocol fidelity
-  over feature completeness" exists to prevent.
-
+  Linking Intel RDFP remains the only route to bit-identical results on
+  EVERY operator without that verification work, and is still Joe's call.
   This is Joe's call, not a unilateral one.
 
 - [ ] **Decimal128 operands are refused by 33 Rust operators (2026-09-02).**
