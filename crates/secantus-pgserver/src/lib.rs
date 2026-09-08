@@ -391,20 +391,23 @@ impl PgHandler {
         let enums = self.enums().ok()?;
         // An enum ARRAY: `inttestenum[]` reports the type's typarray oid
         // (derived, oid + 100_000), so a client that registered the array
-        // decodes it rather than reading varchar.
+        // decodes it rather than reading varchar. A `[]` suffix that matches
+        // no enum falls through (composite arrays are handled below), so this
+        // must NOT `?`-short-circuit the whole function on a miss.
         if let Some(element) = pg_type.strip_suffix("[]") {
-            let (name, oid, _) = enums.iter().find(|(n, _, _)| n == element)?;
-            return Some(Type::new(
-                format!("_{name}"),
-                u32::try_from(*oid + Self::USER_TYPE_ARRAY_OID_OFFSET).ok()?,
-                postgres_types::Kind::Array(Type::new(
-                    name.clone(),
-                    u32::try_from(*oid).ok()?,
-                    postgres_types::Kind::Enum(Vec::new()),
+            if let Some((name, oid, _)) = enums.iter().find(|(n, _, _)| n == element) {
+                return Some(Type::new(
+                    format!("_{name}"),
+                    u32::try_from(*oid + Self::USER_TYPE_ARRAY_OID_OFFSET).ok()?,
+                    postgres_types::Kind::Array(Type::new(
+                        name.clone(),
+                        u32::try_from(*oid).ok()?,
+                        postgres_types::Kind::Enum(Vec::new()),
+                        "public".to_string(),
+                    )),
                     "public".to_string(),
-                )),
-                "public".to_string(),
-            ));
+                ));
+            }
         }
         if let Some((name, oid, _)) = enums.iter().find(|(n, _, _)| n == pg_type) {
             return Some(Type::new(
@@ -415,22 +418,60 @@ impl PgHandler {
             ));
         }
         // A composite type reports its own oid so a client that ran
-        // `register_composite` fires its loader; the value goes out in TEXT
-        // format as `(...)` (a composite is not `binary_encodable`).
+        // `register_composite` fires its loader. The type carries
+        // `Kind::Composite` (its declared fields, resolved to their own wire
+        // types), so the value goes out as PostgreSQL composite TEXT `(...)`
+        // in a text cursor and as the binary record format in a binary one.
         let composites = self.composites_with_schema().ok()?;
-        let (schema, bare, oid, _) = composites.iter().find(|(schema, name, _, _)| {
-            let resolution = if schema == "public" {
-                name.clone()
-            } else {
-                format!("{schema}.{name}")
-            };
-            resolution == pg_type
-        })?;
+        // A composite ARRAY: `testcomp[]` reports the derived typarray oid with
+        // `Kind::Array(composite)` so a client that registered the array
+        // decodes each element as the composite rather than reading varchar.
+        if let Some(element) = pg_type.strip_suffix("[]") {
+            let (schema, bare, oid, fields) = composites
+                .iter()
+                .find(|(schema, name, _, _)| Self::type_resolution(schema, name) == element)?;
+            let elem_ty = self.composite_type(schema, bare, *oid, fields)?;
+            return Some(Type::new(
+                format!("_{bare}"),
+                u32::try_from(*oid + Self::USER_TYPE_ARRAY_OID_OFFSET).ok()?,
+                postgres_types::Kind::Array(elem_ty),
+                schema.clone(),
+            ));
+        }
+        let (schema, bare, oid, fields) = composites
+            .iter()
+            .find(|(schema, name, _, _)| Self::type_resolution(schema, name) == pg_type)?;
+        self.composite_type(schema, bare, *oid, fields)
+    }
+
+    /// The wire `Type` for a composite from its `(schema, bare, oid, fields)`.
+    ///
+    /// Carries `Kind::Composite` with one `Field` per declared column, each
+    /// field's type resolved through the same door (so a nested composite
+    /// field resolves recursively) and falling back to `wire_type` for a
+    /// built-in field type. The field oids are what the binary record encoder
+    /// stamps into each field header.
+    fn composite_type(
+        &self,
+        schema: &str,
+        bare: &str,
+        oid: i64,
+        fields: &CompositeFields,
+    ) -> Option<Type> {
+        let field_types = fields
+            .iter()
+            .map(|(fname, ftype)| {
+                let ty = self
+                    .user_wire_type(ftype)
+                    .unwrap_or_else(|| wire_type(ftype));
+                postgres_types::Field::new(fname.clone(), ty)
+            })
+            .collect();
         Some(Type::new(
-            bare.clone(),
-            u32::try_from(*oid).ok()?,
-            postgres_types::Kind::Pseudo,
-            schema.clone(),
+            bare.to_string(),
+            u32::try_from(oid).ok()?,
+            postgres_types::Kind::Composite(field_types),
+            schema.to_string(),
         ))
     }
 
@@ -4287,6 +4328,22 @@ fn binary_encodable(ty: &Type) -> bool {
     if matches!(ty.kind(), postgres_types::Kind::Enum(_)) {
         return true;
     }
+    // A user COMPOSITE has a binary record wire format, and a composite ARRAY
+    // does too (the array encoder length-prefixes each element's binary bytes).
+    //
+    // An ANONYMOUS record (`ROW(...)`, oid 2249) is deliberately NOT included:
+    // its field oids are the expression types (`'x'` is `unknown`, `'x'::text`
+    // is `text`), which the stored record value does not carry, so it cannot be
+    // encoded faithfully in binary and stays on the text path. See
+    // `tasks/backlog.md`.
+    if matches!(ty.kind(), postgres_types::Kind::Composite(_)) {
+        return true;
+    }
+    if let postgres_types::Kind::Array(inner) = ty.kind() {
+        if matches!(inner.kind(), postgres_types::Kind::Composite(_)) {
+            return true;
+        }
+    }
     OK.contains(ty)
 }
 
@@ -4479,6 +4536,14 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
         }
     };
 
+    // A scalar COMPOSITE or anonymous RECORD: the binary record format, built
+    // by `element_binary` (field oids from the composite's declared types, or
+    // inferred per value for an oid-2249 record).
+    if *ty == Type::RECORD || matches!(ty.kind(), postgres_types::Kind::Composite(_)) {
+        let binary = element_binary(v, ty).ok_or_else(|| bad("this value"))?;
+        let text = secantus_pgplan::value_text(v);
+        return enc.encode_field(&RawField { binary, text });
+    }
     if *ty == Type::BYTEA {
         let Bson::Binary(b) = v else {
             return Err(bad("this value"));
@@ -4585,6 +4650,16 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
         let text = secantus_pgplan::value_text(v);
         return enc.encode_field(&RawField { binary, text });
     }
+    // An ARRAY of COMPOSITE / anonymous RECORD: the element type is carried on
+    // the array's own `Kind::Array`, and `array_binary` length-prefixes each
+    // element's binary record bytes (via `element_binary`).
+    if let postgres_types::Kind::Array(inner) = ty.kind() {
+        if *inner == Type::RECORD || matches!(inner.kind(), postgres_types::Kind::Composite(_)) {
+            let binary = array_binary(items, inner).ok_or_else(|| bad("this value"))?;
+            let text = secantus_pgplan::value_text(v);
+            return enc.encode_field(&RawField { binary, text });
+        }
+    }
     if *ty == Type::BOOL_ARRAY {
         let v: Vec<Option<bool>> = items.iter().map(|x| x.as_bool()).collect();
         return enc.encode_field(&v);
@@ -4685,6 +4760,25 @@ fn encode_field_value(
         if let Some(Bson::String(text)) = v {
             let out = secantus_pgplan::net::text_out(text, field.datatype().oid() == 650);
             return enc.encode_field(&Some(out));
+        }
+    }
+    // A COMPOSITE / anonymous-RECORD ARRAY in TEXT format: render each element
+    // as its composite `(...)` text and let the text-array encoder escape it
+    // once. The element oid is a user oid `element_of_array_oid` does not know,
+    // so the generic array branch below misses it and the catch-all renders the
+    // whole `Bson::Array` through a second escaping pass (double-escaped).
+    if let (Some(Bson::Array(items)), postgres_types::Kind::Array(inner)) =
+        (v, field.datatype().kind())
+    {
+        if *inner == Type::RECORD || matches!(inner.kind(), postgres_types::Kind::Composite(_)) {
+            let rendered: Vec<Option<String>> = items
+                .iter()
+                .map(|x| match x {
+                    Bson::Null => None,
+                    other => Some(secantus_pgplan::value_text(other)),
+                })
+                .collect();
+            return enc.encode_field(&rendered);
         }
     }
     // An ARRAY goes through the typed encoder in text too, because the element
@@ -5209,6 +5303,17 @@ impl ToSqlText for RawField {
 /// prefix). Mirrors the single-value arms of `encode_binary`; returns `None`
 /// for an element type whose binary layout this server does not emit.
 fn element_binary(v: &Bson, elem: &Type) -> Option<Vec<u8>> {
+    // A COMPOSITE or anonymous RECORD element: its own binary record format.
+    // (Checked before the oid match because a user composite's oid is not one
+    // of the built-in codes below.)
+    if *elem == Type::RECORD || matches!(elem.kind(), postgres_types::Kind::Composite(_)) {
+        let fields = secantus_pgplan::record_field_values(v)?;
+        let field_types: Vec<Type> = match elem.kind() {
+            postgres_types::Kind::Composite(fs) => fs.iter().map(|f| f.type_().clone()).collect(),
+            _ => fields.iter().map(record_field_type).collect(),
+        };
+        return record_binary(fields, &field_types);
+    }
     let int = |v: &Bson| -> Option<i64> {
         match v {
             Bson::Int32(x) => Some(i64::from(*x)),
@@ -5247,12 +5352,58 @@ fn element_binary(v: &Bson, elem: &Type) -> Option<Vec<u8>> {
             };
             numeric_binary(&text)
         }
-        // text family: the value's UTF-8, verbatim.
-        25 | 1043 | 1042 | 19 | 18 => match v {
+        // text family: the value's UTF-8, verbatim. Oid 705 (`unknown`) is the
+        // type of an untyped string literal inside a record; its binary form is
+        // the raw bytes, exactly like text.
+        25 | 1043 | 1042 | 19 | 18 | 705 => match v {
             Bson::String(x) => Some(x.clone().into_bytes()),
             _ => None,
         },
+        // bytea: the raw bytes verbatim.
+        17 => match v {
+            Bson::Binary(b) => Some(b.bytes.clone()),
+            _ => None,
+        },
         _ => None,
+    }
+}
+
+/// The PostgreSQL binary record wire format: an int32 field count, then per
+/// field an int32 oid, an int32 length (`-1` for NULL), and the field's binary
+/// bytes. `None` if any field's type has no binary encoder.
+fn record_binary(fields: &[Bson], field_types: &[Type]) -> Option<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(&(i32::try_from(fields.len()).ok()?).to_be_bytes());
+    for (fv, fty) in fields.iter().zip(field_types) {
+        out.extend_from_slice(&(fty.oid() as i32).to_be_bytes());
+        match fv {
+            Bson::Null => out.extend_from_slice(&(-1i32).to_be_bytes()),
+            other => {
+                let bytes = element_binary(other, fty)?;
+                out.extend_from_slice(&(i32::try_from(bytes.len()).ok()?).to_be_bytes());
+                out.extend_from_slice(&bytes);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// The oid an anonymous-record field carries in the binary format, inferred
+/// from its stored value: an untyped string literal is `unknown` (705), which
+/// is what PostgreSQL reports for a bare `'x'` inside `ROW(...)`. (A composite
+/// column's field oids come from its declared types instead -- see
+/// `composite_type` -- so this is only ever consulted for oid-2249 records.)
+fn record_field_type(v: &Bson) -> Type {
+    match v {
+        Bson::Boolean(_) => Type::BOOL,
+        Bson::Int32(_) => Type::INT4,
+        Bson::Int64(_) => Type::INT8,
+        Bson::Double(_) => Type::FLOAT8,
+        Bson::Decimal128(_) => Type::NUMERIC,
+        Bson::Binary(_) => Type::BYTEA,
+        // `unknown` (705): an untyped string literal. psycopg decodes it to
+        // bytes, which is what its own record-binary tests expect.
+        _ => Type::UNKNOWN,
     }
 }
 

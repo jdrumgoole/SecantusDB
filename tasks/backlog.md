@@ -5044,27 +5044,54 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   round-trip; field escaping (NULL / empty / comma / quote / backslash / parens /
   whitespace, all 255 chars) matches the oracle at zero divergences; and an array
   of composites renders each element as its `(...)` text (was leaking Rust's
-  `{:?}` debug form). Measured on the psycopg composite gauge: **25→45 of 79
-  passing.** What REMAINS (each a separable follow-on; the composite oid is
-  dropped by pgwire's `Type::from_oid` before `parse_sql`, so all the param-side
-  items need the raw Parse oid plumbed through):
-  - **Composite BINARY wire format** — psycopg's binary composite dumper/loader
-    (`fmt_in`/`fmt_out = BINARY`). The largest chunk, ~19 gauge tests. We always
-    send composites as TEXT (loads survive because pgwire honours the per-column
-    format); the binary DUMP (decode) and binary LOAD (encode) are unimplemented.
-  - **Composite param typed with its oid** (`row(...)::t = %s` with a
-    registered-dumper obj, no explicit cast) — decode a param whose declared oid
-    is a composite oid into a record; surfaces as `comparing document with string
-    using =`.
-  - **`pg_typeof($1)` / field access `($1).bar` of a composite param** — needs
-    the composite oid → name at Describe (else `IndeterminateDatatype: could not
-    determine data type of parameter $N`) plus composite field access (tracked in
-    the record-functions item below).
-  - **Array of composites as a typed value** — the array element TEXT is correct,
-    but the result column reports a generic array, so the per-element composite
-    loader does not fire (`test_load_composite` array half).
-  - **Nested / recursive composite load** (`testcomp2` with a composite field)
-    and a **range-typed composite field**.
+  `{:?}` debug form).
+
+  **Composite BINARY RESULT + array-of-composite load now SHIPPED (2026-09-08,
+  `pgserver-compval`):** a composite result column in a BINARY cursor goes out in
+  PostgreSQL's binary record format (int32 field count, then per field int32 oid
+  + int32 len + bytes) — composite wire types carry `Kind::Composite` with their
+  declared field types so the encoder knows each field's oid, and nested
+  composites recurse. An `array[<composite>]` now reports the composite's derived
+  `typarray` oid (was varchar, so the whole array arrived as one string), and its
+  TEXT rendering escapes each element's `(...)` once (was double-escaped through
+  the catch-all). Measured on the psycopg composite gauge (`test_composite.py`,
+  oracle PostgreSQL 14): **47→55 of 79 passing** (`test_load_composite`,
+  `test_load_composite_factory`, `test_load_keyword_composite_factory`,
+  `test_load_recursive_composite`, all in both wire formats).
+
+  What REMAINS (each a separable follow-on):
+- [ ] **OPEN — composite PARAM decode (the pgwire Parse oid wall), ~18 gauge
+  tests (2026-09-08).** Every remaining `test_dump_*` failure is a composite sent
+  AS A PARAM: `row(...)::t = %s` / `%b` with a registered-dumper obj (surfaces as
+  `comparing document with string using =`), and `pg_typeof($1)` / field access
+  `($1).bar` of a composite param (surfaces as `IndeterminateDatatype: could not
+  determine data type of parameter $N`). Both TEXT and BINARY params hit the same
+  wall: the composite oid is dropped by pgwire's `Type::from_oid` before
+  `parse_sql`, so the param never resolves to a composite type. Needs the raw
+  Parse param oid plumbed through Describe/Parse (`secantus-pgserver` Parse path)
+  before the field-type map is built — deeper than the value-side work, and the
+  binary DUMP additionally raises psycopg-side `InvalidBinaryRepresentation` /
+  `binary parameters of type oid None` until the oid is carried.
+- [ ] **OPEN — anonymous-RECORD (`ROW(...)`, oid 2249) BINARY result, 5 gauge
+  tests (`test_load_record_binary`, 2026-09-08).** A composite's field oids come
+  from its declaration, but an anonymous record's come from the EXPRESSION types
+  (`'x'` is `unknown` 705 → psycopg loads bytes; `'x'::text` is `text` 25 →
+  loads str), which the stored `{__record: [...]}` value does not carry. A
+  value-based guess (String→705) fixes 4 of the 5 but REGRESSES
+  `test_load_different_records_*` / `test_load_all_chars` (which expect str for a
+  `::text`/`chr()` field), so records deliberately stay on the text path. A
+  faithful fix needs the planner's `RowExpr` to record each field's type oid in
+  the record value (touches `record_value`/`record_fields`/`record_text`/
+  comparison/cast — the `d.len()==1` tag shape), out of scope for this slice.
+- [ ] **OPEN — `oid::regtype` does not quote a RESERVED-keyword type name
+  (`test_literal_invalid_name[order]`, 2026-09-08).** A type named `order`
+  renders as `order`, but PostgreSQL quotes reserved keywords: `"order"`.
+  `regtype_text`'s `quote_part` (`secantus-pgplan`) quotes only identifiers with
+  special chars / uppercase / a leading digit; it needs a PG reserved-keyword
+  table to also quote bare-looking keywords. Orthogonal to composite values
+  (identifier quoting), surfaces in one composite test.
+- [ ] **OPEN — range-typed composite field** (a composite whose field type is a
+  custom range) is untested against the value round-trip.
   NOTE the schema-qualified TypeInfo tests additionally need in-transaction DDL
   visibility (separate backlog item above).
 

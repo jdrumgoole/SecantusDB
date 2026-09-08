@@ -5395,6 +5395,12 @@ pub fn record_value_text(v: &Bson) -> Option<String> {
     record_fields(v).map(|f| record_text(f))
 }
 
+/// The ordered field values of a record / composite value, or `None` for any
+/// other value -- the wire layer's binary record encoder walks these.
+pub fn record_field_values(v: &Bson) -> Option<&Vec<Bson>> {
+    record_fields(v)
+}
+
 pub(crate) fn render_value_text(v: &Bson) -> String {
     match cast_value(v.clone(), "text") {
         Ok(Bson::String(s)) => s,
