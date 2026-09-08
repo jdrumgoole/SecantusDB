@@ -550,7 +550,8 @@ fn select_without_from_answers_session_functions() {
                 (
                     "one".to_string(),
                     ConstCol::Value(Bson::Int32(1)),
-                    "int4".to_string()
+                    "int4".to_string(),
+                    -1
                 )
             );
             assert_eq!(
@@ -558,7 +559,8 @@ fn select_without_from_answers_session_functions() {
                 (
                     "current_database".to_string(),
                     ConstCol::Value(Bson::String("postgres".into())),
-                    "text".to_string()
+                    "text".to_string(),
+                    -1
                 )
             );
         }
