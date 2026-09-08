@@ -2211,9 +2211,18 @@ impl PgHandler {
                         .map(|f| rebind_field_format(f, true))
                         .collect::<Vec<_>>(),
                 );
+                // A binary fetch is DateStyle-independent (the encoder takes the
+                // binary branch before any text rendering), so the style passed
+                // here is immaterial; use the session's for consistency.
+                let fetch_ds = self.session_datestyle();
                 let mut out = Vec::with_capacity(indices.len());
                 for &i in &indices {
-                    out.push(encode_typed_row(&bin_schema, &values[i], &cursor.tz)?);
+                    out.push(encode_typed_row(
+                        &bin_schema,
+                        &values[i],
+                        &cursor.tz,
+                        &fetch_ds,
+                    )?);
                 }
                 (bin_schema, out)
             }
@@ -2564,17 +2573,25 @@ impl PgHandler {
     /// Queue a `ParameterStatus` report if this GUC is one PostgreSQL reports
     /// (GUC_REPORT). Sent to the client after the query completes.
     fn note_reportable_guc(&self, key: &str, value: &str) {
-        // ONLY TimeZone: it is the one GUC whose change we actually honour in
-        // output (a timestamptz renders in it). Reporting a GUC we do NOT honour
-        // -- e.g. DateStyle, which we always render ISO regardless -- makes the
-        // client switch its parser to a style our output never uses, which broke
-        // 231 datetime tests. Report what we obey, nothing more.
-        const REPORTED: [&str; 1] = ["TimeZone"];
-        if REPORTED.contains(&key) {
+        // Report ONLY the GUCs whose change this server actually HONOURS in
+        // output -- reporting one we ignore makes the client switch its parser
+        // to a style our output never uses (that is how a past DateStyle report,
+        // without matching output, broke ~160 datetime tests, issue #1370).
+        //  - TimeZone: a timestamptz renders in it.
+        //  - DateStyle: date / timestamp / timestamptz text now renders in it
+        //    (see `encode_field_value`), so it is finally safe to report. The
+        //    reported value is the CANONICAL spelling psycopg matches on
+        //    (`ISO, MDY`, `German, DMY`, ...), not the raw SET text.
+        let (report, value) = match key {
+            "TimeZone" => (true, value.to_string()),
+            "DateStyle" => (true, secantus_pgplan::DateStyle::parse(value).canonical()),
+            _ => (false, String::new()),
+        };
+        if report {
             self.pending_params
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .push((key.to_string(), value.to_string()));
+                .push((key.to_string(), value));
         }
     }
 
@@ -2625,6 +2642,16 @@ impl PgHandler {
         settings
             .get("TimeZone")
             .map(|v| secantus_pgplan::TimeZoneSetting::parse(v))
+            .unwrap_or_default()
+    }
+
+    /// The session's `DateStyle` GUC, resolved. Drives how date / timestamp /
+    /// timestamptz TEXT output is rendered (binary output is style-independent).
+    fn session_datestyle(&self) -> secantus_pgplan::DateStyle {
+        let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+        settings
+            .get("DateStyle")
+            .map(|v| secantus_pgplan::DateStyle::parse(v))
             .unwrap_or_default()
     }
 
@@ -3330,6 +3357,9 @@ impl PgHandler {
         // work: pgwire may encode the DataRows lazily on another async worker
         // thread, where a thread-local set here would not be visible.
         let row_tz = self.session_timezone();
+        // Date / timestamp / timestamptz text renders in the session DateStyle,
+        // captured here for the same reason as the zone above.
+        let row_ds = self.session_datestyle();
         match stmt {
             Statement::Transaction(_) => unreachable!("handled before execute"),
             // Handled in `run`, which can await the row stream.
@@ -3518,7 +3548,13 @@ impl PgHandler {
                             let v = d.get(f).cloned().unwrap_or(Bson::Null);
                             let v = secantus_pgplan::apply_column_expr(expr, v, &tz)
                                 .map_err(|e| PgHandler::err(&e))?;
-                            encode_field_value(&mut enc, &schema_ref[i], Some(&v), &row_tz)?;
+                            encode_field_value(
+                                &mut enc,
+                                &schema_ref[i],
+                                Some(&v),
+                                &row_tz,
+                                &row_ds,
+                            )?;
                             if let Some(row) = captured.as_mut() {
                                 row.push(Some(v));
                             }
@@ -3546,7 +3582,13 @@ impl PgHandler {
                             }
                             None => {
                                 let cell = d.get(f);
-                                encode_field_value(&mut enc, &schema_ref[i], cell, &row_tz)?;
+                                encode_field_value(
+                                    &mut enc,
+                                    &schema_ref[i],
+                                    cell,
+                                    &row_tz,
+                                    &row_ds,
+                                )?;
                                 if let Some(row) = captured.as_mut() {
                                     row.push(cell.cloned());
                                 }
@@ -4116,6 +4158,14 @@ impl PgHandler {
 
             Statement::Set { name, value } => {
                 let key = canonical_setting(&name);
+                // DateStyle is stored in its canonical spelling so `SHOW
+                // datestyle` answers what PostgreSQL does (`ISO, MDY`), and so
+                // the stored value and the reported ParameterStatus agree.
+                let value = if key == "DateStyle" {
+                    secantus_pgplan::DateStyle::parse(&value).canonical()
+                } else {
+                    value
+                };
                 let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
                 settings.insert(key.clone(), value.clone());
                 drop(settings);
@@ -4228,7 +4278,7 @@ impl PgHandler {
                 let rows = stream::iter(std::iter::once(values)).map(move |vals| {
                     let mut enc = DataRowEncoder::new(schema_ref.clone());
                     for (i, v) in vals.iter().enumerate() {
-                        encode_field_value(&mut enc, &schema_ref[i], Some(v), &row_tz)?;
+                        encode_field_value(&mut enc, &schema_ref[i], Some(v), &row_tz, &row_ds)?;
                     }
                     Ok(enc.take_row())
                 });
@@ -4251,7 +4301,7 @@ impl PgHandler {
                 let rows = stream::iter(vc.rows).map(move |vals| {
                     let mut enc = DataRowEncoder::new(schema_ref.clone());
                     for (i, v) in vals.iter().enumerate() {
-                        encode_field_value(&mut enc, &schema_ref[i], Some(v), &row_tz)?;
+                        encode_field_value(&mut enc, &schema_ref[i], Some(v), &row_tz, &row_ds)?;
                     }
                     Ok(enc.take_row())
                 });
@@ -4306,7 +4356,7 @@ impl PgHandler {
                             OutputCol::Group(i) => key[*i].clone().unwrap_or(Bson::Null),
                             OutputCol::Agg(i) => vals[*i].clone(),
                         };
-                        encode_field_value(&mut enc, &schema_ref[n], Some(&v), &row_tz)?;
+                        encode_field_value(&mut enc, &schema_ref[n], Some(&v), &row_tz, &row_ds)?;
                     }
                     Ok(enc.take_row())
                 });
@@ -4872,11 +4922,12 @@ fn encode_typed_row(
     schema: &Arc<Vec<FieldInfo>>,
     values: &[Option<Bson>],
     tz: &secantus_pgplan::TimeZoneSetting,
+    ds: &secantus_pgplan::DateStyle,
 ) -> PgWireResult<DataRow> {
     let mut enc = DataRowEncoder::new(schema.clone());
     for (i, field) in schema.iter().enumerate() {
         let v = values.get(i).and_then(|c| c.as_ref());
-        encode_field_value(&mut enc, field, v, tz)?;
+        encode_field_value(&mut enc, field, v, tz, ds)?;
     }
     Ok(enc.take_row())
 }
@@ -4886,8 +4937,11 @@ fn encode_field_value(
     field: &FieldInfo,
     v: Option<&Bson>,
     tz: &secantus_pgplan::TimeZoneSetting,
+    ds: &secantus_pgplan::DateStyle,
 ) -> PgWireResult<()> {
     if field.format() == FieldFormat::Binary {
+        // Binary datetime output is DateStyle-INDEPENDENT (it is a fixed-width
+        // integer, not text), so `ds` is deliberately unused on this path.
         return encode_binary(enc, field.datatype(), v);
     }
     // An inet/cidr COLUMN in TEXT format uses inet_out/cidr_out: inet drops a
@@ -4950,11 +5004,36 @@ fn encode_field_value(
     if *field.datatype() == Type::TIMESTAMPTZ {
         match v {
             None | Some(Bson::Null) => return enc.encode_field(&None::<&str>),
-            Some(Bson::String(s)) => return enc.encode_field(&Some(s.as_str())),
+            // A special value (infinity / wide / BC) arrives as text. Under a
+            // non-ISO DateStyle psycopg's timestamptz loader refuses to parse
+            // ANY value (it cannot read zone names) and raises
+            // `NotImplementedError`, so the exact text here is not parsed back;
+            // restyle the shape it recognises and pass the rest through.
+            Some(Bson::String(s)) => {
+                let out = secantus_pgplan::render_timestamp_styled(s, ds);
+                return enc.encode_field(&Some(out.as_str()));
+            }
             Some(value) => {
-                if let Some(text) = secantus_pgplan::timestamptz_value_text(value, tz) {
+                if let Some(text) = secantus_pgplan::timestamptz_value_text_styled(value, tz, ds) {
                     return enc.encode_field(&Some(text.as_str()));
                 }
+            }
+        }
+    }
+    // A DATE is stored as its canonical ISO text; restyle it for the session
+    // DateStyle. ISO passes through unchanged.
+    if *field.datatype() == Type::DATE {
+        if let Some(Bson::String(s)) = v {
+            let out = secantus_pgplan::render_date_styled(s, ds);
+            return enc.encode_field(&Some(out.as_str()));
+        }
+    }
+    // A TIMESTAMP (without zone) is a stored instant (or a special text value);
+    // restyle it for the session DateStyle. ISO passes through unchanged.
+    if *field.datatype() == Type::TIMESTAMP {
+        if let Some(value) = v {
+            if let Some(text) = secantus_pgplan::timestamp_value_text_styled(value, ds) {
+                return enc.encode_field(&Some(text.as_str()));
             }
         }
     }

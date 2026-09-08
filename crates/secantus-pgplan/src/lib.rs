@@ -4080,6 +4080,219 @@ fn parse_utc_offset_posix(v: &str) -> Option<chrono::FixedOffset> {
     chrono::FixedOffset::east_opt(sign * (h * 3600 + m * 60))
 }
 
+/// The output half of PostgreSQL's `DateStyle` GUC: the four display formats
+/// (`ISO` / `Postgres` / `SQL` / `German`) crossed with the field ORDER
+/// (`YMD` / `MDY` / `DMY`). Only the output side is modelled here -- the input
+/// side (how an ambiguous literal like `01/02/03` is parsed) is handled by the
+/// datetime parsers, which are already unambiguous about the shapes this server
+/// accepts. See `render_date_styled` / `render_timestamp_styled` for the
+/// per-format layout, all measured against PostgreSQL 14.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DateStyleFormat {
+    Iso,
+    Postgres,
+    Sql,
+    German,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DateStyleOrder {
+    Ymd,
+    Mdy,
+    Dmy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DateStyle {
+    pub format: DateStyleFormat,
+    pub order: DateStyleOrder,
+}
+
+impl Default for DateStyle {
+    fn default() -> Self {
+        DateStyle {
+            format: DateStyleFormat::Iso,
+            order: DateStyleOrder::Mdy,
+        }
+    }
+}
+
+impl DateStyle {
+    /// Parse a `DateStyle` GUC value. Tolerant of case, whitespace, quoting and
+    /// a missing order token (`SET datestyle = German` leaves the order at its
+    /// current default, which is what PostgreSQL does). An unknown token is
+    /// ignored rather than erroring -- the setting is applied when SET, and the
+    /// server has no business refusing a query over a spelling it does not know.
+    pub fn parse(value: &str) -> Self {
+        let mut format = DateStyleFormat::Iso;
+        let mut order = DateStyleOrder::Mdy;
+        for tok in value.trim().trim_matches('\'').split(',') {
+            let t = tok.trim();
+            if t.eq_ignore_ascii_case("iso") {
+                format = DateStyleFormat::Iso;
+            } else if t.eq_ignore_ascii_case("postgres") {
+                format = DateStyleFormat::Postgres;
+            } else if t.eq_ignore_ascii_case("sql") {
+                format = DateStyleFormat::Sql;
+            } else if t.eq_ignore_ascii_case("german") {
+                format = DateStyleFormat::German;
+            } else if t.eq_ignore_ascii_case("ymd") {
+                order = DateStyleOrder::Ymd;
+            } else if t.eq_ignore_ascii_case("mdy") {
+                order = DateStyleOrder::Mdy;
+            } else if t.eq_ignore_ascii_case("dmy") {
+                order = DateStyleOrder::Dmy;
+            }
+        }
+        DateStyle { format, order }
+    }
+
+    /// The canonical spelling PostgreSQL reports over `ParameterStatus` and
+    /// answers `SHOW datestyle` with -- capitalised format, comma, order. The
+    /// client (psycopg) matches on the leading letter and the trailing order,
+    /// so the exact casing is load-bearing.
+    pub fn canonical(&self) -> String {
+        let f = match self.format {
+            DateStyleFormat::Iso => "ISO",
+            DateStyleFormat::Postgres => "Postgres",
+            DateStyleFormat::Sql => "SQL",
+            DateStyleFormat::German => "German",
+        };
+        let o = match self.order {
+            DateStyleOrder::Ymd => "YMD",
+            DateStyleOrder::Mdy => "MDY",
+            DateStyleOrder::Dmy => "DMY",
+        };
+        format!("{f}, {o}")
+    }
+
+    /// Whether the day comes before the month in the output layout. German is
+    /// always day-first; SQL and Postgres are day-first only under `DMY`; ISO
+    /// does not use this (it is always `Y-M-D`).
+    fn day_first(&self) -> bool {
+        match self.format {
+            DateStyleFormat::German => true,
+            DateStyleFormat::Iso => false,
+            DateStyleFormat::Postgres | DateStyleFormat::Sql => self.order == DateStyleOrder::Dmy,
+        }
+    }
+}
+
+const MONTH_ABBR: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+const DOW_ABBR: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/// Split a canonical ISO date string (`YYYY-MM-DD`, year possibly wider than 4
+/// digits, an optional trailing ` BC`) into `(year, month, day, era)` text
+/// parts. Returns `None` for anything that is not that shape (a `-infinity`,
+/// say), so the caller can pass it through unchanged.
+fn split_iso_date(iso: &str) -> Option<(&str, &str, &str, &str)> {
+    let (body, era) = match iso.strip_suffix(" BC") {
+        Some(b) => (b, " BC"),
+        None => (iso, ""),
+    };
+    // Split from the RIGHT so a wide year (`10000-01-01`) keeps all its digits.
+    let mut it = body.rsplitn(3, '-');
+    let da = it.next()?;
+    let mo = it.next()?;
+    let ye = it.next()?;
+    if ye.is_empty()
+        || !ye.bytes().all(|b| b.is_ascii_digit())
+        || mo.len() != 2
+        || da.len() != 2
+        || !mo.bytes().all(|b| b.is_ascii_digit())
+        || !da.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    Some((ye, mo, da, era))
+}
+
+/// Render a canonical ISO date (`render_date_from_pg_days`' output) in the
+/// given `DateStyle`. Measured against PostgreSQL 14:
+/// - ISO: `2026-09-08`
+/// - Postgres: `09-08-2026` (MDY) / `08-09-2026` (DMY)
+/// - SQL: `09/08/2026` (MDY) / `08/09/2026` (DMY)
+/// - German: `08.09.2026` (always day-first)
+pub fn render_date_styled(iso: &str, ds: &DateStyle) -> String {
+    if ds.format == DateStyleFormat::Iso {
+        return iso.to_string();
+    }
+    let Some((ye, mo, da, era)) = split_iso_date(iso) else {
+        return iso.to_string();
+    };
+    let sep = match ds.format {
+        DateStyleFormat::German => '.',
+        DateStyleFormat::Sql => '/',
+        _ => '-', // Postgres
+    };
+    let (a, b) = if ds.day_first() { (da, mo) } else { (mo, da) };
+    format!("{a}{sep}{b}{sep}{ye}{era}")
+}
+
+/// Render a canonical ISO timestamp (`render_timestamp`' output:
+/// `YYYY-MM-DD HH:MM:SS[.frac][ BC]`) in the given `DateStyle`. The time part
+/// (and any fractional seconds) is untouched; only the date is restyled, and
+/// Postgres style also gains a day-of-week and spelled-out month:
+/// - ISO: `2026-09-08 12:34:56.789`
+/// - Postgres: `Tue Sep 08 12:34:56.789 2026` (MDY) / `Tue 08 Sep ... 2026` (DMY)
+/// - SQL: `09/08/2026 12:34:56.789`
+/// - German: `08.09.2026 12:34:56.789`
+pub fn render_timestamp_styled(iso: &str, ds: &DateStyle) -> String {
+    if ds.format == DateStyleFormat::Iso {
+        return iso.to_string();
+    }
+    // Peel a trailing " BC" so it can be re-appended after the year.
+    let (core, era) = match iso.strip_suffix(" BC") {
+        Some(b) => (b, " BC"),
+        None => (iso, ""),
+    };
+    let Some((date_part, time_part)) = core.split_once(' ') else {
+        return iso.to_string();
+    };
+    let Some((ye, mo, da, _)) = split_iso_date(date_part) else {
+        return iso.to_string();
+    };
+    match ds.format {
+        DateStyleFormat::Sql => {
+            let (a, b) = if ds.day_first() { (da, mo) } else { (mo, da) };
+            format!("{a}/{b}/{ye} {time_part}{era}")
+        }
+        DateStyleFormat::German => format!("{da}.{mo}.{ye} {time_part}{era}"),
+        DateStyleFormat::Postgres => {
+            let mon = mo
+                .parse::<usize>()
+                .ok()
+                .and_then(|m| MONTH_ABBR.get(m.wrapping_sub(1)).copied())
+                .unwrap_or(mo);
+            let dow = dow_abbr(ye, mo, da).unwrap_or("");
+            let dow_sp = if dow.is_empty() { "" } else { " " };
+            if ds.day_first() {
+                format!("{dow}{dow_sp}{da} {mon} {time_part} {ye}{era}")
+            } else {
+                format!("{dow}{dow_sp}{mon} {da} {time_part} {ye}{era}")
+            }
+        }
+        DateStyleFormat::Iso => unreachable!(),
+    }
+}
+
+/// The 3-letter English day-of-week for an ISO Y/M/D, or `None` for a year
+/// chrono cannot represent (a BC or >4-digit year -- Postgres output for those
+/// is a feature gap this server does not reach, so an empty DoW is harmless).
+fn dow_abbr(ye: &str, mo: &str, da: &str) -> Option<&'static str> {
+    use chrono::Datelike;
+    let y = ye.parse::<i32>().ok()?;
+    let m = mo.parse::<u32>().ok()?;
+    let d = da.parse::<u32>().ok()?;
+    let date = NaiveDate::from_ymd_opt(y, m, d)?;
+    // chrono's Sunday-based weekday number (Sun=0).
+    DOW_ABBR
+        .get(date.weekday().num_days_from_sunday() as usize)
+        .copied()
+}
+
 thread_local! {
     /// The session `TimeZone` in force for the statement being planned.
     ///
@@ -4628,6 +4841,42 @@ pub fn render_timestamptz(micros: i64, tz: &TimeZoneSetting) -> String {
     format!("{}{}", render_timestamp(local), render_offset(seconds))
 }
 
+/// Render a `timestamptz` instant in the session zone AND the session
+/// `DateStyle`. ISO keeps the numeric-offset form `render_timestamptz`
+/// produces; the non-ISO styles restyle the local timestamp and append the
+/// zone's ABBREVIATION rather than a numeric offset -- which is exactly what
+/// PostgreSQL does, and what makes psycopg (whose non-ISO timestamptz loader
+/// cannot parse zone names) raise the `NotImplementedError` its own suite
+/// expects. Measured against PostgreSQL 14: `Tue Sep 08 12:34:56.789 2026 UTC`,
+/// `09/08/2026 12:34:56.789 UTC`, `08.09.2026 12:34:56.789 UTC`.
+pub fn render_timestamptz_styled(micros: i64, tz: &TimeZoneSetting, ds: &DateStyle) -> String {
+    if ds.format == DateStyleFormat::Iso {
+        return render_timestamptz(micros, tz);
+    }
+    let offset = tz.offset_at(micros);
+    let seconds = offset.local_minus_utc();
+    let local = micros + i64::from(seconds) * 1_000_000;
+    let styled = render_timestamp_styled(&render_timestamp(local), ds);
+    format!("{styled} {}", tz_abbreviation(tz, micros, seconds))
+}
+
+/// The zone abbreviation PostgreSQL prints in a non-ISO `timestamptz`: `UTC`
+/// for UTC, the named zone's abbreviation (`BST`, `CET`, ...) at that instant,
+/// and a numeric offset for a bare fixed-offset zone (which has no name).
+fn tz_abbreviation(tz: &TimeZoneSetting, micros: i64, seconds: i32) -> String {
+    use chrono::TimeZone;
+    match tz {
+        TimeZoneSetting::Utc => "UTC".to_string(),
+        TimeZoneSetting::Fixed(_) => render_offset(seconds),
+        TimeZoneSetting::Named(zone) => {
+            let instant = chrono::DateTime::from_timestamp_micros(micros).unwrap_or_default();
+            zone.from_utc_datetime(&instant.naive_utc())
+                .format("%Z")
+                .to_string()
+        }
+    }
+}
+
 /// PostgreSQL prints an offset as `+02`, widening to `+02:30` for minutes and
 /// `+01:02:03` for seconds -- second-precision offsets are real, and appear in
 /// the psycopg corpus.
@@ -5152,6 +5401,29 @@ pub fn timestamptz_value_text(v: &Bson, tz: &TimeZoneSetting) -> Option<String> 
     Some(render_timestamptz(micros, tz))
 }
 
+/// `timestamptz_value_text`, restyled for the session `DateStyle`. ISO is
+/// identical to the plain form; the non-ISO styles restyle the local wall
+/// clock and append the zone abbreviation (see `render_timestamptz_styled`).
+pub fn timestamptz_value_text_styled(
+    v: &Bson,
+    tz: &TimeZoneSetting,
+    ds: &DateStyle,
+) -> Option<String> {
+    let micros = match v {
+        Bson::DateTime(d) => d.timestamp_millis() * 1000,
+        Bson::Document(doc) if doc.contains_key(COMPOSITE_DATE) => {
+            let ms = match doc.get(COMPOSITE_DATE) {
+                Some(Bson::DateTime(d)) => d.timestamp_millis(),
+                _ => return None,
+            };
+            let us = doc.get(COMPOSITE_US).and_then(|v| v.as_i32()).unwrap_or(0);
+            ms * 1000 + i64::from(us)
+        }
+        _ => return None,
+    };
+    Some(render_timestamptz_styled(micros, tz, ds))
+}
+
 pub fn timestamp_value_text(v: &Bson) -> Option<String> {
     match v {
         Bson::DateTime(d) => Some(render_timestamp(d.timestamp_millis() * 1000)),
@@ -5164,6 +5436,17 @@ pub fn timestamp_value_text(v: &Bson) -> Option<String> {
             Some(render_timestamp(ms * 1000 + i64::from(us)))
         }
         _ => None,
+    }
+}
+
+/// `timestamp_value_text`, restyled for the session `DateStyle` (ISO is
+/// unchanged). A special value already stored as text (`infinity`, a BC or
+/// wide-year timestamp) is restyled too where its shape is recognised, else
+/// passed through.
+pub fn timestamp_value_text_styled(v: &Bson, ds: &DateStyle) -> Option<String> {
+    match v {
+        Bson::String(s) => Some(render_timestamp_styled(s, ds)),
+        _ => timestamp_value_text(v).map(|iso| render_timestamp_styled(&iso, ds)),
     }
 }
 

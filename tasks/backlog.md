@@ -1388,18 +1388,23 @@ Specific items that were left out of the slice that introduced their feature are
   (only the constant `epoch` is).
 
 - [ ] **OPEN — RUST pgserver: separate `test_datetime.py` edges still fail
-  (noted 2026-09-08, after the tz-aware `timestamptz` dump round-trip was
-  fixed).** With `test_dump_datetimetz` now fully green, `test_datetime.py`
-  still has ~56 failures in areas the `timestamptz-dump` batch deliberately did
-  NOT touch: overflow-message wording (`test_load_datetime_overflow`,
-  `test_overflow_message`, `test_load_interval_overflow` — `timestamp too
-  small` / `too large`, incl. the `German` DateStyle variants and the BC /
-  `infinity` inputs, which overlap the wide-year/BC item above);
-  named-zone LOADING (`test_load_datetimetz_tz[Europe/Rome ...]` — a result
-  timestamptz built against a DST-carrying named zone); and the `24:00`
-  boundary time (`test_load_time_24` / `test_load_timetz_24`). None involve the
-  binary/text parameter dump path; each is its own decode / message-fidelity
-  gap. Measured against a real PG 14 before working any of them.
+  (noted 2026-09-08; ~44 remaining after DateStyle text rendering landed).**
+  DateStyle-honouring output (the `datestyle-rendering` batch) fixed the 12
+  `test_overflow_message[timestamptz-*]` cases and reports `DateStyle` again;
+  `test_dump_datetimetz` is green. `test_datetime.py` still has ~44 failures in
+  areas untouched by that work, each its own decode / message-fidelity gap:
+  the timestamp/date arithmetic behind `test_load_date_overflow` /
+  `test_load_datetime_overflow` (`operator + on these operands is not supported
+  yet`); `'epoch'::date` behind `test_dump_date_datestyle` /
+  `test_dump_datetimetz_datestyle`; overflow-message wording for
+  `test_load_interval_overflow` and the binary overflow loaders; named-zone
+  LOADING (`test_load_datetimetz_tz[Europe/Rome ...]` — a result timestamptz
+  built against a DST-carrying named zone) and `test_max_with_timezone`; and the
+  `24:00` boundary time (`test_load_time_24` / `test_load_timetz_24`). NOTE: a
+  date/timestamp ARRAY under a non-ISO DateStyle still renders its elements in
+  ISO (the array text path does not thread the style yet) — no failing test
+  exercises it today, but it is a known divergence. Measured against a real
+  PG 14 before working any of them.
 
 - [ ] **OPEN — RUST pgserver column metadata (`typmod` / `typlen`): landed
   for constant SELECTs, deferred for table columns and computed expressions
