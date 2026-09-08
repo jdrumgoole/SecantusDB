@@ -2831,12 +2831,39 @@ pub fn display_type(internal: &str) -> String {
     .to_string()
 }
 
+/// A target that is `generate_series(...)`, possibly wrapped in one or more
+/// casts (`generate_series(1, 2)::int4`, `...::int4::text`).
+///
+/// Returns the underlying `FuncCall` plus the cast chain, innermost-first, so
+/// `apply_column_expr(ColumnExpr::Casts(chain))` reproduces PostgreSQL's
+/// left-to-right cast application over each generated value. `None` when the
+/// node is not a series (or is a series beside some other expression a cast
+/// can't strip).
+fn series_target_call(
+    node: &pg_query::protobuf::Node,
+) -> Option<(&pg_query::protobuf::FuncCall, Vec<String>)> {
+    match node.node.as_ref() {
+        Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("generate_series") => {
+            Some((f, Vec::new()))
+        }
+        Some(N::TypeCast(tc)) => {
+            let ty = tc.type_name.as_ref().map(type_name_of)?;
+            let arg = tc.arg.as_ref()?;
+            let (f, mut chain) = series_target_call(arg)?;
+            chain.push(ty);
+            Some((f, chain))
+        }
+        _ => None,
+    }
+}
+
 /// A FROM-less select whose target list is a set-returning function.
 ///
 /// Only the single-target form: `select 1, generate_series(1,3)` repeats the
 /// constant across the generated rows, which needs the constants carried into
 /// each row, and nothing in the corpus asks for it. Refusing is better than a
-/// shape that silently drops a column.
+/// shape that silently drops a column. A single `generate_series(...)::type`
+/// cast on the one column IS carried, as an ordinary per-row cast.
 fn plan_select_srf(
     s: &pg_query::protobuf::SelectStmt,
     params: &[Bson],
@@ -2845,10 +2872,11 @@ fn plan_select_srf(
         .target_list
         .iter()
         .filter(|t| match t.node.as_ref() {
-            Some(N::ResTarget(rt)) => matches!(
-                rt.val.as_ref().and_then(|v| v.node.as_ref()),
-                Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("generate_series")
-            ),
+            Some(N::ResTarget(rt)) => rt
+                .val
+                .as_ref()
+                .and_then(|v| series_target_call(v))
+                .is_some(),
             _ => false,
         })
         .count();
@@ -2860,10 +2888,19 @@ fn plan_select_srf(
             "a set-returning function beside another output column".into(),
         ));
     }
+    // A WHERE clause is refused rather than ignored, exactly as the
+    // `FROM generate_series(...)` form is: the filter language runs against
+    // stored columns, and silently dropping the predicate would answer with
+    // rows the client asked to exclude.
+    if s.where_clause.is_some() {
+        return Err(Error::Unsupported(
+            "a WHERE clause over generate_series".into(),
+        ));
+    }
     let Some(N::ResTarget(rt)) = s.target_list[0].node.as_ref() else {
         return Ok(None);
     };
-    let Some(N::FuncCall(f)) = rt.val.as_ref().and_then(|v| v.node.as_ref()) else {
+    let Some((f, cast_chain)) = rt.val.as_ref().and_then(|v| series_target_call(v)) else {
         return Ok(None);
     };
     let series = series_from_args(f, params)?;
@@ -2916,12 +2953,21 @@ fn plan_select_srf(
             _ => return Err(Error::Unsupported("this OFFSET".into())),
         },
     };
+    // A `generate_series(...)::type` cast rides as an ordinary per-row cast
+    // over the one generated column, exactly as a cast over a stored column
+    // does. The executor applies it; the describe pass reads the type off the
+    // chain's last element.
+    let cast = if cast_chain.is_empty() {
+        None
+    } else {
+        Some(ColumnExpr::Casts(cast_chain))
+    };
     Ok(Some(Statement::Select(Select {
         table: String::new(),
         series: Some(series),
         join: None,
         columns: vec![(column.clone(), column)],
-        casts: Vec::new(),
+        casts: vec![cast],
         filter: Document::new(),
         order,
         limit,

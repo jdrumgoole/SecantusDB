@@ -4003,3 +4003,111 @@ def test_savepoint_rollback_discards_a_type_created_after_it(home: Path) -> None
         with pytest.raises(psycopg.errors.UndefinedObject):
             cur.execute("SELECT 'sp'::regtype::text")
         conn.rollback()
+
+
+def test_non_holdable_cursor_is_invalid_after_commit(home: Path) -> None:
+    """A `WITHOUT HOLD` cursor is closed by COMMIT; a `WITH HOLD` one survives.
+
+    This is what psycopg's `ServerCursor(withhold=False)` relies on -- after
+    `conn.commit()` a fetch must raise `InvalidCursorName` (34000). Silently
+    keeping the cursor open would let a client read rows PostgreSQL discarded.
+    """
+    with _Server(home) as server, server.connect(autocommit=False) as conn:
+        cur = conn.cursor()
+        # Default (no HOLD): gone after commit.
+        cur.execute("declare c1 cursor for select * from generate_series(1, 3)")
+        cur.execute("fetch 1 from c1")
+        assert [r[0] for r in cur.fetchall()] == [1]
+        conn.commit()
+        with pytest.raises(psycopg.errors.InvalidCursorName):
+            cur.execute("fetch 1 from c1")
+        conn.rollback()
+        # WITH HOLD: survives commit, keeps its position.
+        cur.execute("declare c2 cursor with hold for select * from generate_series(1, 3)")
+        cur.execute("fetch 1 from c2")
+        assert [r[0] for r in cur.fetchall()] == [1]
+        conn.commit()
+        cur.execute("fetch 1 from c2")
+        assert [r[0] for r in cur.fetchall()] == [2]
+        cur.execute("close c2")
+
+
+def test_rollback_closes_every_cursor_including_holdable(home: Path) -> None:
+    """ROLLBACK closes ALL cursors, `WITH HOLD` included."""
+    with _Server(home) as server, server.connect(autocommit=False) as conn:
+        cur = conn.cursor()
+        cur.execute("declare h cursor with hold for select * from generate_series(1, 3)")
+        cur.execute("fetch 1 from h")
+        assert [r[0] for r in cur.fetchall()] == [1]
+        conn.rollback()
+        with pytest.raises(psycopg.errors.InvalidCursorName):
+            cur.execute("fetch 1 from h")
+        conn.rollback()
+
+
+def test_no_scroll_cursor_rejects_a_backward_fetch(home: Path) -> None:
+    """A `NO SCROLL` cursor may only scan forward.
+
+    A backward FETCH/MOVE raises `ObjectNotInPrerequisiteState` (55000), while a
+    plain (scrollable) cursor still scrolls both ways.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        with conn.transaction():
+            cur = conn.cursor()
+            cur.execute("declare ns no scroll cursor for select * from generate_series(0, 5)")
+            cur.execute("move 5 from ns")
+            with pytest.raises(psycopg.errors.ObjectNotInPrerequisiteState):
+                cur.execute("move backward 1 from ns")
+        # A plain cursor is scrollable and still walks backward: MOVE 5 lands on
+        # the row valued 4, and FETCH BACKWARD 1 then returns the one before it.
+        with conn.transaction():
+            cur = conn.cursor()
+            cur.execute("declare ok cursor for select * from generate_series(0, 5)")
+            cur.execute("move 5 from ok")
+            cur.execute("fetch backward 1 from ok")
+            assert [r[0] for r in cur.fetchall()] == [3]
+
+
+def test_binary_server_cursor_returns_binary_rows(home: Path) -> None:
+    """A binary server cursor's FETCH re-encodes rows in the binary wire format.
+
+    The cursor's rows are frozen in TEXT at DECLARE, but psycopg requests BINARY
+    on the FETCH -- so the server must re-encode from the captured typed values.
+    A text server cursor over the same query still returns text.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.cursor().execute("create table tb (x int4)")
+        conn.cursor().execute("insert into tb values (1), (2)")
+        with conn.transaction():
+            cur = conn.cursor("bc", binary=True)
+            cur.execute("select x from tb order by x")
+            assert cur.fetchone() == (1,)
+            assert cur.pgresult.fformat(0) == 1
+            assert cur.pgresult.get_value(0, 0) == b"\x00\x00\x00\x01"
+            assert cur.fetchone() == (2,)
+            assert cur.pgresult.get_value(0, 0) == b"\x00\x00\x00\x02"
+        with conn.transaction():
+            tcur = conn.cursor("tc")  # text cursor
+            tcur.execute("select x from tb order by x")
+            assert tcur.fetchone() == (1,)
+            assert tcur.pgresult.fformat(0) == 0
+            assert tcur.pgresult.get_value(0, 0) == b"1"
+
+
+def test_generate_series_with_a_cast_in_the_target_list(home: Path) -> None:
+    """`select generate_series(...)::type` casts each generated value.
+
+    The cast rides as an ordinary per-row cast, and the described column type is
+    the cast's -- so a binary server cursor over it decodes against the right
+    oid. A WHERE clause over the series is refused, not silently dropped.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("select generate_series(1, 3)::int8 as n")
+        assert [r[0] for r in cur.fetchall()] == [1, 2, 3]
+        assert cur.description[0].name == "n"
+        assert cur.description[0].type_code == conn.adapters.types["int8"].oid
+        cur.execute("select generate_series(1, 2)::text")
+        assert [r[0] for r in cur.fetchall()] == ["1", "2"]
+        with pytest.raises(psycopg.errors.FeatureNotSupported):
+            cur.execute("select generate_series(1, 3) where false")

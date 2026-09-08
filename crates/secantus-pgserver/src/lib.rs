@@ -120,12 +120,30 @@ pub struct PgHandler {
     /// captured contents back. Capturing lazily is what keeps it affordable --
     /// a savepoint nobody writes through costs nothing.
     savepoints: Mutex<Vec<Savepoint>>,
+    /// Typed row capture for a `DECLARE CURSOR`, armed only around the inner
+    /// query's execution.
+    ///
+    /// A server cursor materialises its rows once, at DECLARE, encoded in TEXT
+    /// (the DECLARE arrives over the simple-query protocol, which is always
+    /// text). But a later `FETCH` may ask for BINARY -- psycopg's binary server
+    /// cursor requests it on the FETCH's `Bind`, not on the DECLARE -- and the
+    /// frozen text bytes cannot be turned back into binary. So the cursor also
+    /// keeps the resolved per-column values, captured here as the inner query's
+    /// rows stream is drained, and re-encodes them in the FETCH's format. `None`
+    /// except during a DECLARE, so a plain SELECT pays only a cheap flag check.
+    cursor_capture: std::sync::Arc<Mutex<Option<CapturedRows>>>,
 }
 
 /// A user type created (`Some(doc)`) or dropped (`None`) in the open
 /// transaction, overlaid on the committed catalog. Keyed by
 /// `(catalog collection, doc _id)`.
 type UncommittedTypes = HashMap<(&'static str, String), Option<Document>>;
+
+/// A materialised result as resolved per-column values: one inner `Vec` per
+/// row, one `Option<Bson>` per output column (`None` is SQL NULL). Kept by a
+/// server cursor so a BINARY `FETCH` can re-encode rows frozen in text at
+/// DECLARE.
+type CapturedRows = Vec<Vec<Option<Bson>>>;
 
 /// One open savepoint and the table contents it can put back.
 struct Savepoint {
@@ -165,6 +183,13 @@ struct CursorState {
     is_binary: bool,
     is_scrollable: bool,
     creation_time: bson::DateTime,
+    /// The resolved per-column values behind each text row in `rows`, kept so a
+    /// BINARY `FETCH` can re-encode them (see `cursor_capture`). `None` when the
+    /// cursor's source is not re-encodable (only a plain `SELECT` is captured);
+    /// a binary FETCH of such a cursor falls back to the text bytes.
+    typed_rows: Option<CapturedRows>,
+    /// The session time zone in force at DECLARE, for re-encoding `typed_rows`.
+    tz: secantus_pgplan::TimeZoneSetting,
 }
 
 struct CopyInState {
@@ -193,6 +218,7 @@ impl PgHandler {
             binary_results: std::sync::atomic::AtomicBool::new(false),
             txn_failed: std::sync::atomic::AtomicBool::new(false),
             savepoints: Mutex::new(Vec::new()),
+            cursor_capture: std::sync::Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1976,7 +2002,35 @@ impl PgHandler {
             backward
         };
 
-        let (rows, new_pos): (Vec<DataRow>, i64) = match direction {
+        // A `NO SCROLL` cursor may only scan forward. Any FETCH/MOVE that would
+        // step to an earlier position is rejected, exactly as PostgreSQL does
+        // (`cursor can only scan forward`, SQLSTATE 55000) -- a materialised
+        // cursor could serve it, but matching the server's contract is what a
+        // client's `ServerCursor` relies on.
+        let is_backward = if single {
+            let target = match direction {
+                Fd::Relative => pos.saturating_add(count),
+                _ if count > 0 => count,
+                _ if count < 0 => len.saturating_add(count).saturating_add(1),
+                _ => 0,
+            }
+            .clamp(0, len + 1);
+            target < pos
+        } else {
+            backward && wanted > 0
+        };
+        if is_backward && !cursor.is_scrollable {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "55000".into(), // object_not_in_prerequisite_state
+                "cursor can only scan forward".into(),
+            ))));
+        }
+
+        // The 0-based indices of the rows to return, in output order. Kept as
+        // indices rather than cloned rows so a BINARY fetch can re-encode from
+        // `typed_rows` at the same positions.
+        let (indices, new_pos): (Vec<usize>, i64) = match direction {
             _ if single => {
                 let target = match direction {
                     Fd::Relative => pos.saturating_add(count),
@@ -1987,12 +2041,12 @@ impl PgHandler {
                     _ => 0,
                 };
                 let target = target.clamp(0, len + 1);
-                let row = if (1..=len).contains(&target) {
-                    vec![cursor.rows[(target - 1) as usize].clone()]
+                let idx = if (1..=len).contains(&target) {
+                    vec![(target - 1) as usize]
                 } else {
                     Vec::new()
                 };
-                (row, target)
+                (idx, target)
             }
             _ if backward => {
                 // Rows below the cursor, nearest first.
@@ -2001,7 +2055,7 @@ impl PgHandler {
                 let mut out = Vec::new();
                 let mut i = first.min(len);
                 while i >= last && i >= 1 {
-                    out.push(cursor.rows[(i - 1) as usize].clone());
+                    out.push((i - 1) as usize);
                     i -= 1;
                 }
                 (out, pos.saturating_sub(wanted).max(0))
@@ -2012,7 +2066,7 @@ impl PgHandler {
                 let mut out = Vec::new();
                 let mut i = first.max(1);
                 while i <= last {
-                    out.push(cursor.rows[(i - 1) as usize].clone());
+                    out.push((i - 1) as usize);
                     i += 1;
                 }
                 (out, pos.saturating_add(wanted).min(len + 1))
@@ -2020,11 +2074,36 @@ impl PgHandler {
         };
 
         cursor.pos = new_pos.clamp(0, len + 1);
-        let n = rows.len();
+        let n = indices.len();
         if is_move {
             return Ok(vec![Response::Execution(Tag::new(&format!("MOVE {n}")))]);
         }
-        let schema = cursor.schema.clone();
+        // A BINARY fetch re-encodes the captured typed values in binary; every
+        // other fetch reuses the text rows frozen at DECLARE. `binary_results`
+        // carries the format this FETCH's `Bind` asked for.
+        let want_binary = self
+            .binary_results
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let (schema, rows): (Arc<Vec<FieldInfo>>, Vec<DataRow>) = match &cursor.typed_rows {
+            Some(values) if want_binary => {
+                let bin_schema = Arc::new(
+                    cursor
+                        .schema
+                        .iter()
+                        .map(|f| rebind_field_format(f, true))
+                        .collect::<Vec<_>>(),
+                );
+                let mut out = Vec::with_capacity(indices.len());
+                for &i in &indices {
+                    out.push(encode_typed_row(&bin_schema, &values[i], &cursor.tz)?);
+                }
+                (bin_schema, out)
+            }
+            _ => (
+                cursor.schema.clone(),
+                indices.iter().map(|&i| cursor.rows[i].clone()).collect(),
+            ),
+        };
         drop(cursors);
         let mut response = QueryResponse::new(schema, stream::iter(rows.into_iter().map(Ok)));
         // The tag is just `FETCH`: the wire layer appends the row count, so
@@ -2406,6 +2485,22 @@ impl PgHandler {
         Ok(())
     }
 
+    /// Close the cursors a transaction boundary invalidates.
+    ///
+    /// A COMMIT closes every non-holdable cursor (`WITH HOLD` cursors survive,
+    /// their rows already materialised); a ROLLBACK closes ALL of them,
+    /// holdable included. After this a `FETCH` of a closed cursor answers
+    /// `34000 cursor does not exist`, which is what a client's `ServerCursor`
+    /// checks for after `conn.commit()`.
+    fn close_cursors_on_txn_end(&self, keep_holdable: bool) {
+        let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
+        if keep_holdable {
+            cursors.retain(|_, c| c.is_holdable);
+        } else {
+            cursors.clear();
+        }
+    }
+
     /// The session's `TimeZone` GUC, resolved.
     fn session_timezone(&self) -> secantus_pgplan::TimeZoneSetting {
         let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
@@ -2427,6 +2522,7 @@ impl PgHandler {
     }
 
     fn commit_implicit(&self) -> PgWireResult<()> {
+        self.close_cursors_on_txn_end(true);
         self.savepoints
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -2455,6 +2551,7 @@ impl PgHandler {
     }
 
     fn rollback_implicit(&self) -> PgWireResult<()> {
+        self.close_cursors_on_txn_end(false);
         self.savepoints
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -2589,19 +2686,44 @@ impl PgHandler {
                     "DECLARE CURSOR can only be used in transaction blocks".into(),
                 ))));
             }
-            // A cursor's rows are encoded ONCE, at DECLARE, but the FETCHes
-            // that read them are separate statements that may ask for a
-            // different format. Text is the format that every client can read
-            // whatever it asked for, and the cursor's own schema -- reported
-            // by both `Describe` and `FETCH` -- says so.
+            // A cursor's rows are encoded ONCE, at DECLARE, in TEXT: the
+            // DECLARE arrives over the simple-query protocol, which is always
+            // text, and every client can read a text row whatever format it
+            // later asks for. But a BINARY `FETCH` needs binary bytes, which the
+            // frozen text cannot supply -- so for a plain SELECT source the
+            // resolved values are also captured (`cursor_capture`), to be
+            // re-encoded per FETCH.
+            let tz = self.session_timezone();
+            let capture_typed = matches!(&*query, Statement::Select(_));
+            if capture_typed {
+                *self
+                    .cursor_capture
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(Vec::new());
+            }
             let binary = self
                 .binary_results
                 .swap(false, std::sync::atomic::Ordering::Relaxed);
             let responses = self.execute(*query, 0);
             self.binary_results
                 .store(binary, std::sync::atomic::Ordering::Relaxed);
-            let responses = responses?;
+            let responses = match responses {
+                Ok(r) => r,
+                Err(e) => {
+                    // Disarm capture on the error path so the buffer does not
+                    // leak into an unrelated later statement.
+                    self.cursor_capture
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take();
+                    return Err(e);
+                }
+            };
             let Some(Response::Query(q)) = responses.into_iter().next() else {
+                self.cursor_capture
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
                 return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".into(),
                     "0A000".into(),
@@ -2610,6 +2732,11 @@ impl PgHandler {
             };
             let schema = q.row_schema.clone();
             let rows = q.data_rows.try_collect::<Vec<_>>().await?;
+            let typed_rows = self
+                .cursor_capture
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
             self.cursors
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -2624,6 +2751,8 @@ impl PgHandler {
                         is_binary: is_binary_cursor,
                         is_scrollable: scrollable,
                         creation_time: bson::DateTime::now(),
+                        typed_rows,
+                        tz,
                     },
                 );
             return Ok(vec![Response::Execution(Tag::new("DECLARE CURSOR"))]);
@@ -2964,6 +3093,9 @@ impl PgHandler {
             }
             TransactionControl::Commit { chain } => {
                 self.reset_transaction_gucs();
+                // A COMMIT closes every non-holdable cursor; `WITH HOLD`
+                // survives with its rows already materialised.
+                self.close_cursors_on_txn_end(true);
                 if let Some(mut handle) = guard.take() {
                     self.in_transaction
                         .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -2975,6 +3107,8 @@ impl PgHandler {
             }
             TransactionControl::Rollback { chain } => {
                 self.reset_transaction_gucs();
+                // A ROLLBACK closes ALL cursors, holdable included.
+                self.close_cursors_on_txn_end(false);
                 if let Some(mut handle) = guard.take() {
                     self.in_transaction
                         .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -3184,8 +3318,21 @@ impl PgHandler {
                 let casts = sel.casts.clone();
                 let tz = self.session_timezone();
                 let schema_ref = schema.clone();
+                // A `DECLARE CURSOR` over this SELECT arms row capture (see
+                // `cursor_capture`); a plain SELECT leaves it disarmed and pays
+                // only the `Option` check below -- no lock, no extra clone.
+                let capture = {
+                    let armed = self
+                        .cursor_capture
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_some();
+                    armed.then(|| self.cursor_capture.clone())
+                };
                 let rows = stream::iter(docs).map(move |d| {
                     let mut enc = DataRowEncoder::new(schema_ref.clone());
+                    let mut captured: Option<Vec<Option<Bson>>> =
+                        capture.as_ref().map(|_| Vec::with_capacity(fields.len()));
                     for (i, f) in fields.iter().enumerate() {
                         // A computed column is applied per row -- the cast
                         // chain or the scalar call the planner recorded.
@@ -3194,6 +3341,9 @@ impl PgHandler {
                             let v = secantus_pgplan::apply_column_expr(expr, v, &tz)
                                 .map_err(|e| PgHandler::err(&e))?;
                             encode_field_value(&mut enc, &schema_ref[i], Some(&v), &row_tz)?;
+                            if let Some(row) = captured.as_mut() {
+                                row.push(Some(v));
+                            }
                             continue;
                         }
                         // A stored timestamp/timestamptz is reassembled from its
@@ -3207,10 +3357,27 @@ impl PgHandler {
                             timestamp_text(&d, f)
                         };
                         match reassembled {
-                            Some(text) => enc.encode_field(&Some(text.as_str()))?,
-                            None => {
-                                encode_field_value(&mut enc, &schema_ref[i], d.get(f), &row_tz)?
+                            Some(text) => {
+                                enc.encode_field(&Some(text.as_str()))?;
+                                // The reassembled text re-encodes as a String,
+                                // which `encode_field_value` passes through for a
+                                // timestamp column (text) unchanged.
+                                if let Some(row) = captured.as_mut() {
+                                    row.push(Some(Bson::String(text)));
+                                }
                             }
+                            None => {
+                                let cell = d.get(f);
+                                encode_field_value(&mut enc, &schema_ref[i], cell, &row_tz)?;
+                                if let Some(row) = captured.as_mut() {
+                                    row.push(cell.cloned());
+                                }
+                            }
+                        }
+                    }
+                    if let (Some(cap), Some(row)) = (&capture, captured) {
+                        if let Some(buf) = cap.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                            buf.push(row);
                         }
                     }
                     Ok(enc.take_row())
@@ -4460,6 +4627,48 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
 }
 
 /// One value in whichever format the column was described in.
+/// The same column, described in the requested wire format.
+///
+/// A server cursor's schema is built in TEXT at DECLARE; a BINARY `FETCH`
+/// re-describes each column as binary (where the type has a binary encoding at
+/// all -- otherwise it stays text, exactly as `field_mod` decides for a live
+/// query).
+fn rebind_field_format(field: &FieldInfo, binary: bool) -> FieldInfo {
+    let format = if binary && binary_encodable(field.datatype()) {
+        FieldFormat::Binary
+    } else {
+        FieldFormat::Text
+    };
+    FieldInfo::new(
+        field.name().to_string(),
+        None,
+        None,
+        field.datatype().clone(),
+        format,
+    )
+    .with_type_size(field.type_size())
+    .with_type_modifier(field.type_modifier())
+}
+
+/// Encode one captured cursor row against a (re-formatted) schema.
+///
+/// The values are the ones captured at DECLARE, so this reuses the very same
+/// `encode_field_value` the live query path uses -- binary via `encode_binary`,
+/// text otherwise -- and a BINARY fetch of a server cursor produces bytes
+/// identical to a binary live query.
+fn encode_typed_row(
+    schema: &Arc<Vec<FieldInfo>>,
+    values: &[Option<Bson>],
+    tz: &secantus_pgplan::TimeZoneSetting,
+) -> PgWireResult<DataRow> {
+    let mut enc = DataRowEncoder::new(schema.clone());
+    for (i, field) in schema.iter().enumerate() {
+        let v = values.get(i).and_then(|c| c.as_ref());
+        encode_field_value(&mut enc, field, v, tz)?;
+    }
+    Ok(enc.take_row())
+}
+
 fn encode_field_value(
     enc: &mut DataRowEncoder,
     field: &FieldInfo,
@@ -5834,18 +6043,41 @@ impl PgHandler {
             // prepared FETCH described zero of them, and psycopg prepares any
             // statement it runs six times -- so a cursor read in a loop worked
             // five times and then sent rows the client had no description for.
+            //
+            // The cursor's schema is stored in TEXT (built at DECLARE), but a
+            // BINARY fetch requests binary result columns on its `Bind`, which
+            // ran before this Describe -- so the RowDescription must report the
+            // binary format the rows will actually arrive in, or the client
+            // records the wrong column format (`PGresult.fformat`).
             Statement::Fetch { name, .. } => {
+                let want_binary = self
+                    .binary_results
+                    .load(std::sync::atomic::Ordering::Relaxed);
                 let cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
                 match cursors.get(&name) {
+                    Some(cursor) if want_binary && cursor.typed_rows.is_some() => cursor
+                        .schema
+                        .iter()
+                        .map(|f| rebind_field_format(f, true))
+                        .collect::<Vec<_>>(),
                     Some(cursor) => cursor.schema.as_ref().clone(),
                     None => Vec::new(),
                 }
             }
-            // A generated source describes its one column.
+            // A generated source describes its one column -- an int4 unless a
+            // `generate_series(...)::type` cast retyped it, in which case the
+            // described type is the cast's, matching the executor's schema.
             Statement::Select(sel) if sel.series.is_some() => sel
                 .columns
                 .iter()
-                .map(|(out, _)| self.field(out.clone(), wire_type("int4")))
+                .enumerate()
+                .map(|(i, (out, _))| {
+                    let ty = match sel.casts.get(i).and_then(|c| c.as_ref()) {
+                        Some(expr) => wire_type(secantus_pgplan::column_expr_type(expr)),
+                        None => wire_type("int4"),
+                    };
+                    self.field(out.clone(), ty)
+                })
                 .collect::<Vec<_>>(),
             Statement::Select(sel) => {
                 let def = match &sel.join {

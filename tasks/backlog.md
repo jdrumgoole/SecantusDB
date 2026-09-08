@@ -481,6 +481,38 @@ issued OUTSIDE an explicit block is a silent no-op here, where PG emits a
 never triggers it (it only tacks the modes onto `BEGIN`), and the server has no
 notice-emission seam on that path, so the warning is omitted.
 
+**Rust pgserver server cursors — LANDED 2026-09-08
+(`vendor/psycopg/tests/test_cursor_server.py`, oracle PostgreSQL 14; 16 → 2
+failures).** COMMIT now closes non-holdable cursors and ROLLBACK closes all of
+them (holdable included), so a `WITHOUT HOLD` cursor is invalid after COMMIT
+(`34000`); a `NO SCROLL` cursor rejects a backward `FETCH`/`MOVE` (`55000
+cursor can only scan forward`); and a binary server cursor re-encodes its rows
+in the FETCH's binary format (rows are frozen in text at DECLARE, so the
+resolved typed values of a `SELECT` source are captured and re-encoded through
+`encode_field_value` / `encode_binary`, with the FETCH's `RowDescription`
+reporting the binary format). Companion planner fix:
+`select generate_series(...)::type` (a cast over a FROM-less set-returning
+target) is now planned as a per-row cast; a WHERE over such a series is refused
+rather than silently dropped. Two of the sixteen remain open — see below.
+
+- [ ] **OPEN — a WHERE clause over a FROM-less `generate_series` target is
+      refused, not evaluated (`select generate_series(1,3) where false`).**
+      This blocks `test_cursor_server.py::test_no_result` (2 cases: sync +
+      async), which expects `[]`. As of 2026-09-08 `plan_select_srf` refuses a
+      WHERE with `0A000` (matching the sibling `plan_series_select`, which
+      refuses `FROM generate_series(...) WHERE ...` for the same reason) — an
+      honest error rather than the previous silent divergence, but still a
+      failure against PG, which returns the filtered rows. A real fix must
+      evaluate the predicate over the synthetic series column (plan the
+      `where_clause` into the `Select.filter` and apply it to the generated
+      docs, which the series executor path does not do today). Sized as a
+      planner/executor slice, not a state check — deferred from this batch.
+      Binary server cursors over non-`SELECT` DECLARE sources (VALUES /
+      aggregate / FROM-less constant) are likewise not re-encodable: only a
+      `SELECT` source captures typed values, so a binary FETCH of those falls
+      back to the text bytes. Untested by the psycopg suite; note if a gauge
+      ever exercises it.
+
 **Rust server errors where Python defers — MEASURED 2026-08-26, and the five
 entries describing it are largely stale.** A three-way probe of 45
 query / update / aggregate constructs against the standalone `secantusd-rs`
