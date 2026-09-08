@@ -2961,9 +2961,7 @@ def test_composite_info_fetch(home: Path) -> None:
     with _Server(home) as server, server.connect() as conn:
         cur = conn.cursor()
         cur.execute("create type ci_two as (a int, b text)")
-        cur.execute(
-            "create type ci_varied as (i int, t text, d float8, ts timestamptz, f bool)"
-        )
+        cur.execute("create type ci_varied as (i int, t text, d float8, ts timestamptz, f bool)")
         cur.execute("create type ci_nested as (x int, sub ci_two)")
         cur.execute("select oid from pg_type where typname = 'ci_two'")
         ci_two_oid = cur.fetchone()[0]
