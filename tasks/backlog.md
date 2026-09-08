@@ -5664,32 +5664,34 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   a quaternary level. It is right on all 64 measured shapes and the mechanism
   is not principled; a future change to the separator layout could move it.
 
-- [x] **WON'T FIX (decided 2026-09-08, on evidence): `$toDate` of an unparseable
-  string.** mongod's message is `timelib`'s re2c-generated scanner talking, and
-  reproducing it means reproducing that scanner. Measured against 8.2.11 across
-  25 strings:
+- [x] **RESOLVED (2026-09-08): `$toDate` on the RUST server — and a much bigger
+  bug found behind it.** Chasing the error MESSAGE turned up that `parse_iso`
+  required exactly 19 characters before a `Z`, so **every ISO timestamp carrying
+  a fractional second failed** — `2020-01-01T00:00:00.123Z`, the ordinary form
+  for a BSON date, came back as an error where mongod parses it. Fractional
+  seconds (1..n digits, truncated to milliseconds) and the `YYYY-MM` form are
+  reproduced now.
 
-      ''            Error parsing date string ''; 0: Empty string ' '
-      'a'           an incomplete date/time string has been found, ... "a"
-      'ab'          0: passing a time zone identifier as part of the string
-                       is not allowed 'a'
-      'a1'          1: Unexpected character '1'      <- position 1 only
-      '1a'          0: Unexpected character '1'      <- position 0 only
-      '123'         0: ...'1'; 1: ...'2'; 2: ...'3'  <- one error PER position
-      '2020-13-01'  6: Unexpected character '3'
-      'junk here'   0: passing a time zone identifier ...'j';
-                    5: Double timezone specification 'h'
-      '2020-01-01X' PARSES — 'X' is the military timezone UTC+11
+  The failure surface is fixed too: a failed parse returned `Conv::Failed`,
+  which surfaces here as `2 BadValue ... not supported by the Rust server` —
+  false, since `$toDate` IS supported and the string was at fault. It carries
+  mongod's 241 always now, with the exact text for the two reproducible shapes.
+  WHITESPACE-ONLY is not empty for mongod (`''` is "Empty string", `'  '` is the
+  incomplete message); the Python server had that backwards because it tested
+  the stripped text, and is fixed here as well.
 
-  There is no small rule here: it needs timelib's lexer states, its timezone
-  abbreviation tables (including the military single letters) and its
-  per-position error accumulation. A partial implementation would emit messages
-  mongod never sends, which is worse than the current refusal under
-  `CLAUDE.md`'s "wire-protocol fidelity over feature completeness".
+  **Still not reproduced, on EITHER server, and now shared rather than
+  divergent:** mongod's per-position timelib diagnostic. Measured across 25
+  strings, there is no small rule — `'a1'` errors at position 1 but `'1a'` at
+  position 0; `'123'` emits one error PER position; `'junk here'` emits two
+  including "Double timezone specification"; and `'2020-01-01X'` PARSES because
+  `X` is the military timezone UTC+11. That needs timelib's lexer, its timezone
+  abbreviation tables and its per-position error accumulation; inventing a
+  position would look authoritative and be wrong.
 
-  **Reopen only if** a driver's test suite asserts these strings, or if timelib
-  is vendored for another reason and the scanner comes along with it.
-
+  34 strings: 18 exact, 16 message-only, 0 with a wrong value or code (from 0
+  exact, all 25 failures carrying the wrong code). Rust and Python agree 23 of
+  23. Pinned by `tests/test_rust_todate_parse_failure.py`.
 - [ ] **DECISION NEEDED (not a coding task): `Decimal128` FINITE operands in the
   transcendentals — 15 shapes, re-measured 2026-09-08.** The Rust server refuses
   `$sqrt` / `$exp` / `$ln` / `$log10` / the six trig / the four hyperbolic /
