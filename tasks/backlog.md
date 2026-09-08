@@ -1473,6 +1473,47 @@ Specific items that were left out of the slice that introduced their feature are
   `::varbit` casts remain unsupported at the value layer (`cast_value` —
   pre-existing, separate item).
 
+- [ ] **OPEN — RUST pgserver `client_encoding`: LATIN1 / LATIN9 landed,
+  non-ASCII through untranscoded encodings and binary text ARRAYS deferred (PR
+  for `pgserver-clientenc`, measured 2026-09-08 against PostgreSQL 16).** The
+  server now honours `SET client_encoding` / `set_config`: it validates the
+  name (`22023` for an unknown name, `0A000` for `MULE_INTERNAL`), stores the
+  canonical spelling, reports it via `ParameterStatus` only once output
+  respects it, transcodes result text and decodes text parameters for `LATIN1`
+  and `LATIN9` (text and binary wire formats + COPY-OUT text), and raises
+  `22P05` for an untranslatable character. `UTF8` / `SQL_ASCII` / every other
+  accepted name keep the internal UTF-8 bytes verbatim (byte-identical to the
+  prior behaviour). **Still open:**
+  - **Function-result WIRE TYPE, not encoding:** `ascii(x)` (and peers) send a
+    text-category column OID rather than `int4`, so `select ascii(%s)` comes
+    back as a string / bytes and `test_string.py::test_dump_enc` fails on all
+    encodings. This is the `column_expr_type` inference for scalar functions,
+    unrelated to `client_encoding` — a separate item.
+  - **Non-ASCII in the QUERY TEXT itself** (a literal `select '€'` or an
+    identifier `select 'x' as "€"` under LATIN9) is mangled to U+FFFD before it
+    reaches the handler: `pgwire`'s `get_cstring` decodes the message body with
+    `String::from_utf8_lossy`, discarding the original bytes, so it cannot be
+    recovered at this layer without forking `pgwire`'s codec. Only PARAMETERS
+    (separate length-delimited byte arrays) and COPY data are decodable. Costs
+    `test_cursor_common.py::test_query_encode[*-latin9]` and
+    `test_column.py::test_name_encode[latin9]`.
+  - **Binary text ARRAYS under LATIN1 / LATIN9** keep UTF-8 element bytes: the
+    binary array wire form interleaves big-endian length words that a blanket
+    transcode would corrupt, and per-element transcoding of `array_binary` /
+    the `TEXT_ARRAY` arm was not attempted (not exercised by the target tests).
+    Text-format arrays DO transcode.
+  - **`select %s` does not propagate a parameter's TYPE OID to the result
+    column** (e.g. a registered enum param echoes as `text`/`unknown`), so under
+    `SQL_ASCII` — where the client returns bytes for text columns — the result
+    is `b'...'` rather than the typed value. Costs
+    `test_enum.py::test_enum_dumper_sqlascii[*-StrTestEnum]`. Same root cause as
+    a scalar function's result OID (the `ascii()` item above); a separate
+    param-OID-passthrough feature.
+  - **Startup `client_encoding` parameter** (a client connecting with
+    `PGCLIENTENCODING=latin9`) is not applied to the session — only the
+    in-session `SET` / `set_config` paths are. `pgwire`'s default startup reply
+    already advertises `UTF8`.
+
 - [ ] **OPEN — `test_tls_against_rust_server` flakes on the Windows runner
   (first seen 2026-08-29, PR #1089).** `storage-engine (windows-latest)` failed
   ONE of 86 tests with `ServerSelectionTimeoutError: No servers found yet,

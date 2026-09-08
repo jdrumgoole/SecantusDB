@@ -9,10 +9,14 @@
 //! because the point of P1 is to prove the SEAM end to end on real storage,
 //! including the shared on-disk catalog format. Breadth is P5's problem.
 
+mod encoding;
+
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI32};
 use std::sync::{Arc, Mutex, OnceLock};
+
+use encoding::ClientEncoding;
 
 use async_trait::async_trait;
 use bson::{Bson, Document};
@@ -656,11 +660,14 @@ impl PgHandler {
             let field_ty = ftype
                 .and_then(|t| self.user_wire_type(t))
                 .or_else(|| ftype.map(wire_type));
+            // A text-family field inside a binary record carries client-encoded
+            // bytes, exactly like a top-level text parameter.
             out.push(decode_parameter(
                 Some(&field_bytes),
                 field_ty.as_ref(),
                 true,
                 tz,
+                self.client_encoding(),
             )?);
         }
         Ok(out)
@@ -2380,6 +2387,7 @@ impl PgHandler {
                 // binary branch before any text rendering), so the style passed
                 // here is immaterial; use the session's for consistency.
                 let fetch_ds = self.session_datestyle();
+                let cenc = self.client_encoding();
                 let mut out = Vec::with_capacity(indices.len());
                 for &i in &indices {
                     out.push(encode_typed_row(
@@ -2387,6 +2395,7 @@ impl PgHandler {
                         &values[i],
                         &cursor.tz,
                         &fetch_ds,
+                        cenc,
                     )?);
                 }
                 (bin_schema, out)
@@ -2587,6 +2596,7 @@ impl PgHandler {
                     Some(&wire_type(ty)),
                     true,
                     &tz,
+                    self.client_encoding(),
                 )?;
                 row.push(Some(value));
             }
@@ -2747,9 +2757,12 @@ impl PgHandler {
         //    (see `encode_field_value`), so it is finally safe to report. The
         //    reported value is the CANONICAL spelling psycopg matches on
         //    (`ISO, MDY`, `German, DMY`, ...), not the raw SET text.
+        //  - client_encoding: result text is transcoded to it (and query
+        //    text / parameters decoded from it), see `encoding.rs`.
         let (report, value) = match key {
             "TimeZone" => (true, value.to_string()),
             "DateStyle" => (true, secantus_pgplan::DateStyle::parse(value).canonical()),
+            "client_encoding" => (true, value.to_string()),
             _ => (false, String::new()),
         };
         if report {
@@ -2818,6 +2831,50 @@ impl PgHandler {
             .get("DateStyle")
             .map(|v| secantus_pgplan::DateStyle::parse(v))
             .unwrap_or_default()
+    }
+
+    /// The session's `client_encoding` GUC, resolved to its transcoding
+    /// behaviour. The stored value is always a canonical PostgreSQL name (the
+    /// SET / `set_config` paths refuse anything else), so a bare lookup is
+    /// enough; an absent value is the UTF8 default.
+    fn client_encoding(&self) -> ClientEncoding {
+        let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+        settings
+            .get("client_encoding")
+            .map(|v| encoding::client_encoding(v))
+            .unwrap_or(ClientEncoding::Utf8)
+    }
+
+    /// Set `client_encoding` from a user-supplied name, mirroring PostgreSQL:
+    /// an unknown name is `22023`, `MULE_INTERNAL` (a real encoding with no
+    /// client conversion) is `0A000`, and a valid name is stored in its
+    /// canonical spelling and queued for a `ParameterStatus` report -- which is
+    /// safe precisely because output is now transcoded to it.
+    fn apply_client_encoding(&self, requested: &str) -> PgWireResult<()> {
+        match encoding::canonical_name(requested) {
+            Ok(canonical) => {
+                self.settings
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert("client_encoding".to_string(), canonical.to_string());
+                self.note_reportable_guc("client_encoding", canonical);
+                Ok(())
+            }
+            Err(encoding::EncodingError::Invalid) => {
+                Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".into(),
+                    "22023".into(), // invalid_parameter_value
+                    format!("invalid value for parameter \"client_encoding\": \"{requested}\""),
+                ))))
+            }
+            Err(encoding::EncodingError::Unconvertible(name)) => {
+                Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".into(),
+                    "0A000".into(), // feature_not_supported
+                    format!("conversion between {name} and UTF8 is not supported"),
+                ))))
+            }
+        }
     }
 
     fn begin_implicit(&self) -> PgWireResult<()> {
@@ -3136,9 +3193,25 @@ impl PgHandler {
                     Bson::Null => String::new(),
                     other => format!("{other}"),
                 };
-                let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
-                settings.insert(canonical_setting(name), text.clone());
-                Ok(Bson::String(text))
+                let key = canonical_setting(name);
+                if key == "client_encoding" {
+                    // Same validation / canonicalisation / report as `SET`, and
+                    // the value returned to the caller is the canonical spelling
+                    // now stored.
+                    self.apply_client_encoding(&text)?;
+                    let stored = self
+                        .settings
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get("client_encoding")
+                        .cloned()
+                        .unwrap_or(text);
+                    Ok(Bson::String(stored))
+                } else {
+                    let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+                    settings.insert(key, text.clone());
+                    Ok(Bson::String(text))
+                }
             }
             ConstCol::BackendPid => Ok(Bson::Int32(
                 self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
@@ -3525,6 +3598,11 @@ impl PgHandler {
         // Date / timestamp / timestamptz text renders in the session DateStyle,
         // captured here for the same reason as the zone above.
         let row_ds = self.session_datestyle();
+        // The client encoding is captured for the same reason as `row_tz`:
+        // pgwire may encode the DataRows lazily on another worker thread, so it
+        // is threaded into the row encoder explicitly rather than read from
+        // session state at encode time. `ClientEncoding` is `Copy`.
+        let row_cenc = self.client_encoding();
         match stmt {
             Statement::Transaction(_) => unreachable!("handled before execute"),
             // Handled in `run`, which can await the row stream.
@@ -3719,6 +3797,7 @@ impl PgHandler {
                                 Some(&v),
                                 &row_tz,
                                 &row_ds,
+                                row_cenc,
                             )?;
                             if let Some(row) = captured.as_mut() {
                                 row.push(Some(v));
@@ -3753,6 +3832,7 @@ impl PgHandler {
                                     cell,
                                     &row_tz,
                                     &row_ds,
+                                    row_cenc,
                                 )?;
                                 if let Some(row) = captured.as_mut() {
                                     row.push(cell.cloned());
@@ -4245,7 +4325,15 @@ impl PgHandler {
                         CopyFormat::Binary => {
                             let mut enc = DataRowEncoder::new(bin_schema.clone());
                             for (i, v) in row.iter().enumerate() {
-                                encode_binary(&mut enc, bin_schema[i].datatype(), v.as_ref())?;
+                                // A text-family column's binary bytes are its
+                                // string in the client encoding, so it goes
+                                // through the same transcoding wrapper the live
+                                // query path uses; everything else is unchanged.
+                                let field = &bin_schema[i];
+                                let v = v.as_ref();
+                                transcoding_field(&mut enc, field, row_cenc, |e| {
+                                    encode_binary(e, field.datatype(), v)
+                                })?;
                             }
                             let dr = enc.take_row();
                             let mut buf = BytesMut::with_capacity(dr.data.len() + 21);
@@ -4259,7 +4347,21 @@ impl PgHandler {
                             buf.extend_from_slice(&dr.data);
                             Ok(CopyData::new(buf.freeze()))
                         }
-                        _ => Ok(CopyData::new(copy_text_row(&row, format))),
+                        _ => {
+                            let line = copy_text_row(&row, format);
+                            // COPY text is line-structured with ASCII delimiters
+                            // and escapes, so the whole line transcodes as one
+                            // blob to the client encoding (only the field
+                            // content bytes move); an untranslatable character
+                            // is the same 22P05 the row path raises.
+                            if row_cenc.transcodes() {
+                                let bytes = encoding::encode(row_cenc, &line)
+                                    .map_err(|ch| untranslatable_char(ch, row_cenc))?;
+                                Ok(CopyData::new(Bytes::from(bytes)))
+                            } else {
+                                Ok(CopyData::new(line))
+                            }
+                        }
                     }
                 });
                 // The response's format code must match: 1 for binary, 0 for
@@ -4323,18 +4425,25 @@ impl PgHandler {
 
             Statement::Set { name, value } => {
                 let key = canonical_setting(&name);
-                // DateStyle is stored in its canonical spelling so `SHOW
-                // datestyle` answers what PostgreSQL does (`ISO, MDY`), and so
-                // the stored value and the reported ParameterStatus agree.
-                let value = if key == "DateStyle" {
-                    secantus_pgplan::DateStyle::parse(&value).canonical()
+                if key == "client_encoding" {
+                    // Validated, canonicalised, and reported separately: an
+                    // invalid name must be refused (not stored), and the stored
+                    // value must be the canonical spelling the client reads back.
+                    self.apply_client_encoding(&value)?;
                 } else {
-                    value
-                };
-                let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
-                settings.insert(key.clone(), value.clone());
-                drop(settings);
-                self.note_reportable_guc(&key, &value);
+                    // DateStyle is stored in its canonical spelling so `SHOW
+                    // datestyle` answers what PostgreSQL does (`ISO, MDY`), and so
+                    // the stored value and the reported ParameterStatus agree.
+                    let value = if key == "DateStyle" {
+                        secantus_pgplan::DateStyle::parse(&value).canonical()
+                    } else {
+                        value
+                    };
+                    let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+                    settings.insert(key.clone(), value.clone());
+                    drop(settings);
+                    self.note_reportable_guc(&key, &value);
+                }
                 Ok(vec![Response::Execution(Tag::new("SET"))])
             }
 
@@ -4443,7 +4552,7 @@ impl PgHandler {
                 let rows = stream::iter(std::iter::once(values)).map(move |vals| {
                     let mut enc = DataRowEncoder::new(schema_ref.clone());
                     for (i, v) in vals.iter().enumerate() {
-                        encode_field_value(&mut enc, &schema_ref[i], Some(v), &row_tz, &row_ds)?;
+                        encode_field_value(&mut enc, &schema_ref[i], Some(v), &row_tz, &row_ds, row_cenc)?;
                     }
                     Ok(enc.take_row())
                 });
@@ -4466,7 +4575,7 @@ impl PgHandler {
                 let rows = stream::iter(vc.rows).map(move |vals| {
                     let mut enc = DataRowEncoder::new(schema_ref.clone());
                     for (i, v) in vals.iter().enumerate() {
-                        encode_field_value(&mut enc, &schema_ref[i], Some(v), &row_tz, &row_ds)?;
+                        encode_field_value(&mut enc, &schema_ref[i], Some(v), &row_tz, &row_ds, row_cenc)?;
                     }
                     Ok(enc.take_row())
                 });
@@ -4521,7 +4630,7 @@ impl PgHandler {
                             OutputCol::Group(i) => key[*i].clone().unwrap_or(Bson::Null),
                             OutputCol::Agg(i) => vals[*i].clone(),
                         };
-                        encode_field_value(&mut enc, &schema_ref[n], Some(&v), &row_tz, &row_ds)?;
+                        encode_field_value(&mut enc, &schema_ref[n], Some(&v), &row_tz, &row_ds, row_cenc)?;
                     }
                     Ok(enc.take_row())
                 });
@@ -4736,6 +4845,43 @@ impl ToSql for PgNumeric {
 
     fn accepts(ty: &Type) -> bool {
         *ty == Type::NUMERIC
+    }
+
+    to_sql_checked!();
+}
+
+/// A field value whose wire bytes are already final -- written verbatim in
+/// either format. Used to emit a text value that has been transcoded to the
+/// client encoding, where the bytes are no longer valid UTF-8 and so cannot
+/// travel as a Rust `String`. A text-family value has the same bytes in text
+/// and binary format, so one wrapper serves both.
+#[derive(Debug)]
+struct RawEncoded(Vec<u8>);
+
+impl ToSqlText for RawEncoded {
+    fn to_sql_text(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+        _options: &FormatOptions,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        out.put_slice(&self.0);
+        Ok(IsNull::No)
+    }
+}
+
+impl ToSql for RawEncoded {
+    fn to_sql(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        out.put_slice(&self.0);
+        Ok(IsNull::No)
+    }
+
+    fn accepts(_ty: &Type) -> bool {
+        true
     }
 
     to_sql_checked!();
@@ -5088,16 +5234,138 @@ fn encode_typed_row(
     values: &[Option<Bson>],
     tz: &secantus_pgplan::TimeZoneSetting,
     ds: &secantus_pgplan::DateStyle,
+    cenc: ClientEncoding,
 ) -> PgWireResult<DataRow> {
     let mut enc = DataRowEncoder::new(schema.clone());
     for (i, field) in schema.iter().enumerate() {
         let v = values.get(i).and_then(|c| c.as_ref());
-        encode_field_value(&mut enc, field, v, tz, ds)?;
+        encode_field_value(&mut enc, field, v, tz, ds, cenc)?;
     }
     Ok(enc.take_row())
 }
 
+/// Whether a field's rendered bytes may carry non-ASCII characters that need
+/// transcoding to the client encoding.
+///
+/// In TEXT format every value is safe to transcode as one blob: the structural
+/// bytes (array braces, separators, escapes) are all ASCII and unchanged across
+/// LATIN1 / LATIN9, so only the character content moves. In BINARY format that
+/// is true only for a scalar text-family value, whose whole payload IS the
+/// string bytes; a binary array or record interleaves big-endian length words
+/// that a blanket transcode would corrupt, so those keep the internal UTF-8
+/// bytes (correct for ASCII; non-ASCII in a binary array under LATIN1 / LATIN9
+/// is deferred -- see `tasks/backlog.md`).
+fn field_may_carry_text(field: &FieldInfo) -> bool {
+    match field.format() {
+        FieldFormat::Text => true,
+        FieldFormat::Binary => {
+            let ty = field.datatype();
+            matches!(
+                *ty,
+                Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME | Type::CHAR
+            ) || matches!(ty.kind(), postgres_types::Kind::Enum(_))
+        }
+    }
+}
+
+/// The single field written into a fresh `DataRowEncoder`, split back into
+/// `None` (SQL NULL) or its raw payload bytes. The buffer is `[i32-BE len]` then
+/// `len` payload bytes, with `len == -1` for NULL.
+fn split_single_field(row: &DataRow) -> Option<Vec<u8>> {
+    let data = &row.data;
+    if data.len() < 4 {
+        return None;
+    }
+    let len = i32::from_be_bytes(data[..4].try_into().expect("4 bytes"));
+    if len < 0 {
+        return None;
+    }
+    Some(data[4..4 + len as usize].to_vec())
+}
+
+/// Encode one live-query field, transcoding to the client encoding when needed.
 fn encode_field_value(
+    enc: &mut DataRowEncoder,
+    field: &FieldInfo,
+    v: Option<&Bson>,
+    tz: &secantus_pgplan::TimeZoneSetting,
+    ds: &secantus_pgplan::DateStyle,
+    cenc: ClientEncoding,
+) -> PgWireResult<()> {
+    transcoding_field(enc, field, cenc, |tmp| {
+        encode_field_value_inner(tmp, field, v, tz, ds)
+    })
+}
+
+/// Encode one field with `encode_once`, transcoding its rendered bytes to the
+/// client encoding when that encoding differs from the internal UTF-8 form and
+/// the field can carry text.
+///
+/// For UTF8 / SQL_ASCII / any accepted-but-untranscoded encoding this is
+/// byte-for-byte `encode_once(enc)` -- the fast path is untouched. For LATIN1 /
+/// LATIN9 the value is rendered once into a throwaway single-column encoder, its
+/// payload transcoded, and the result re-emitted; a character with no
+/// representation in the target encoding becomes PostgreSQL's `22P05`
+/// untranslatable-character error. Shared by the live-query encoder and the
+/// COPY-OUT binary path, whose text-family fields carry the same character
+/// bytes.
+fn transcoding_field<F>(
+    enc: &mut DataRowEncoder,
+    field: &FieldInfo,
+    cenc: ClientEncoding,
+    encode_once: F,
+) -> PgWireResult<()>
+where
+    F: FnOnce(&mut DataRowEncoder) -> PgWireResult<()>,
+{
+    if !cenc.transcodes() || !field_may_carry_text(field) {
+        return encode_once(enc);
+    }
+    let schema = Arc::new(vec![field.clone()]);
+    let mut tmp = DataRowEncoder::new(schema);
+    encode_once(&mut tmp)?;
+    let row = tmp.take_row();
+    match split_single_field(&row) {
+        None => enc.encode_field(&None::<&str>),
+        Some(utf8) => {
+            let bytes =
+                encoding::encode(cenc, &utf8).map_err(|ch| untranslatable_char(ch, cenc))?;
+            enc.encode_field_with_type_and_format(
+                &RawEncoded(bytes),
+                field.datatype(),
+                field.format(),
+                &FormatOptions::default(),
+            )
+        }
+    }
+}
+
+/// PostgreSQL's `22P05`: a character the server holds in UTF-8 has no
+/// representation in the client encoding.
+fn untranslatable_char(ch: char, cenc: ClientEncoding) -> PgWireError {
+    let hex: Vec<String> = ch
+        .to_string()
+        .as_bytes()
+        .iter()
+        .map(|b| format!("0x{b:02x}"))
+        .collect();
+    let target = match cenc {
+        ClientEncoding::Latin1 => "LATIN1",
+        ClientEncoding::Latin9 => "LATIN9",
+        // Only the transcoding encodings ever reach here.
+        _ => "UTF8",
+    };
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".into(),
+        "22P05".into(), // untranslatable_character
+        format!(
+            "character with byte sequence {} in encoding \"UTF8\" has no equivalent in encoding \"{target}\"",
+            hex.join(" "),
+        ),
+    )))
+}
+
+fn encode_field_value_inner(
     enc: &mut DataRowEncoder,
     field: &FieldInfo,
     v: Option<&Bson>,
@@ -5586,7 +5854,11 @@ fn binary_numeric_text(bytes: &[u8]) -> Option<String> {
 /// Wire shape: `ndim`, `has_null`, `element oid`, then per dimension a length
 /// and a lower bound, then each element as a 4-byte length (-1 for NULL)
 /// followed by that many bytes in the ELEMENT's binary format.
-fn binary_array(bytes: &[u8], tz: &secantus_pgplan::TimeZoneSetting) -> PgWireResult<Bson> {
+fn binary_array(
+    bytes: &[u8],
+    tz: &secantus_pgplan::TimeZoneSetting,
+    cenc: ClientEncoding,
+) -> PgWireResult<Bson> {
     if bytes.len() < 12 {
         return Err(unsupported_binary_oid(None));
     }
@@ -5624,7 +5896,7 @@ fn binary_array(bytes: &[u8], tz: &secantus_pgplan::TimeZoneSetting) -> PgWireRe
         }
         let elem = Bytes::copy_from_slice(&bytes[pos..end]);
         let ty = Type::from_oid(elem_oid);
-        items.push(decode_parameter(Some(&elem), ty.as_ref(), true, tz)?);
+        items.push(decode_parameter(Some(&elem), ty.as_ref(), true, tz, cenc)?);
         pos = end;
     }
     Ok(Bson::Array(items))
@@ -5934,7 +6206,9 @@ fn binary_range(
         let raw = Bytes::copy_from_slice(&rest[..n]);
         *rest = &rest[n..];
         let ty = Type::from_oid(element_oid);
-        let value = decode_parameter(Some(&raw), ty.as_ref(), true, tz)?;
+        // A range's element type is always numeric / date / timestamp, never
+        // text, so the client encoding is irrelevant to its bytes.
+        let value = decode_parameter(Some(&raw), ty.as_ref(), true, tz, ClientEncoding::Utf8)?;
         Ok(Some(secantus_pgplan::value_text(&value)))
     };
     let lower = if flags & LB_INF == 0 {
@@ -6222,6 +6496,7 @@ fn decode_parameter(
     ty: Option<&Type>,
     binary: bool,
     tz: &secantus_pgplan::TimeZoneSetting,
+    cenc: ClientEncoding,
 ) -> PgWireResult<Bson> {
     let Some(bytes) = raw else {
         return Ok(Bson::Null);
@@ -6252,7 +6527,10 @@ fn decode_parameter(
                 bytes[..4].try_into().expect("checked"),
             )))),
             Some(25) | Some(1043) | Some(19) | Some(1042) => {
-                Ok(Bson::String(String::from_utf8_lossy(bytes).into_owned()))
+                // A text-family value's binary wire form is its bytes in the
+                // client encoding (same bytes as text format), so decode it
+                // back to the internal UTF-8 form.
+                Ok(Bson::String(encoding::decode(cenc, bytes)))
             }
             // `bytea` is raw bytes on the wire -- stored verbatim as Binary.
             Some(17) => Ok(secantus_pgplan::bytea::to_binary(bytes.to_vec())),
@@ -6399,21 +6677,29 @@ fn decode_parameter(
             )),
             // Every array oid this server knows, decoded through the element's
             // own binary decoder rather than a per-type array reader.
-            Some(oid) if element_of_array_oid(oid).is_some() => binary_array(bytes, tz),
+            Some(oid) if element_of_array_oid(oid).is_some() => binary_array(bytes, tz, cenc),
             // An oid this server has no decoder for is a USER type -- the
             // known builtins all matched above. A user ENUM's binary format is
-            // its label's UTF-8, so valid UTF-8 decodes as the label; anything
-            // else is still a refusal. (pgwire resolves the Parse message's
-            // oids through `Type::from_oid`, so an enum's raw oid arrives here
-            // as `None` -- both cases take this arm.)
-            other => match std::str::from_utf8(bytes) {
-                Ok(text) => Ok(Bson::String(text.to_string())),
-                Err(_) => Err(unsupported_binary_oid(other)),
-            },
+            // its label's bytes in the client encoding, so it decodes to the
+            // label. Under a single-byte encoding (LATIN1 / LATIN9) every byte
+            // is valid; under UTF8 / passthrough invalid bytes are still a
+            // refusal. (pgwire resolves the Parse message's oids through
+            // `Type::from_oid`, so an enum's raw oid arrives here as `None` --
+            // both cases take this arm.)
+            other => {
+                if cenc.transcodes() {
+                    Ok(Bson::String(encoding::decode(cenc, bytes)))
+                } else {
+                    match std::str::from_utf8(bytes) {
+                        Ok(text) => Ok(Bson::String(text.to_string())),
+                        Err(_) => Err(unsupported_binary_oid(other)),
+                    }
+                }
+            }
         };
     }
 
-    let text = String::from_utf8_lossy(bytes);
+    let text: std::borrow::Cow<'_, str> = std::borrow::Cow::Owned(encoding::decode(cenc, bytes));
     match ty.map(|t| t.oid()) {
         Some(23) | Some(21) => text
             .parse::<i32>()
@@ -6543,6 +6829,7 @@ impl PgHandler {
         let declared = &portal.statement.parameter_types;
         let oids = &portal.statement.parameter_oids;
         let tz = self.session_timezone();
+        let cenc = self.client_encoding();
         portal
             .parameters
             .iter()
@@ -6573,6 +6860,7 @@ impl PgHandler {
                     declared.get(i).and_then(|t| t.as_ref()),
                     binary,
                     &tz,
+                    cenc,
                 )
             })
             .collect()
