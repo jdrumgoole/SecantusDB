@@ -37,3 +37,14 @@ postgres-types = "0.2.14"
 [[bin]]
 name = "secantusd-pg"
 path = "src/main.rs"
+
+# Vendored, locally-patched pgwire (crates/vendor/pgwire). The patch adds
+# `StoredStatement::parameter_oids` so the RAW Parse-message type oids survive
+# `Type::from_oid` mapping -- a user composite / enum oid would otherwise be
+# flattened to `None` before our parser sees it, losing the only handle for
+# resolving a composite PARAMETER against our catalog. `[patch.crates-io]`
+# applies to this crate's own Cargo.lock (secantus-pgserver is its own
+# workspace, excluded from the clean workspace). Path is relative to this
+# manifest.
+[patch.crates-io]
+pgwire = { path = "../vendor/pgwire" }

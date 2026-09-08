@@ -501,6 +501,171 @@ impl PgHandler {
         ))
     }
 
+    /// The name a RAW parameter oid resolves under, when the oid names a USER
+    /// type (composite / enum, and their arrays). pgwire's `Type::from_oid`
+    /// only knows builtins, so a user type's oid arrives as `None` in
+    /// `parameter_types` -- this recovers the planner-facing name from the raw
+    /// oid the (patched) `parameter_oids` preserved, so a bound composite /
+    /// enum parameter gets a declared type instead of `could not determine
+    /// data type of parameter $1`.
+    fn user_type_name_for_oid(&self, oid: u32) -> Option<String> {
+        let oid_i = i64::from(oid);
+        if let Ok(cs) = self.composites_with_schema() {
+            if let Some((schema, name, _, _)) = cs.iter().find(|(_, _, o, _)| *o == oid_i) {
+                return Some(Self::type_resolution(schema, name));
+            }
+            if let Some((schema, name, _, _)) = cs
+                .iter()
+                .find(|(_, _, o, _)| *o + Self::USER_TYPE_ARRAY_OID_OFFSET == oid_i)
+            {
+                return Some(format!("{}[]", Self::type_resolution(schema, name)));
+            }
+        }
+        if let Ok(es) = self.enums_with_schema() {
+            if let Some((schema, name, _, _)) = es.iter().find(|(_, _, o, _)| *o == oid_i) {
+                return Some(Self::type_resolution(schema, name));
+            }
+            if let Some((schema, name, _, _)) = es
+                .iter()
+                .find(|(_, _, o, _)| *o + Self::USER_TYPE_ARRAY_OID_OFFSET == oid_i)
+            {
+                return Some(format!("{}[]", Self::type_resolution(schema, name)));
+            }
+        }
+        None
+    }
+
+    /// The declared PLANNER type name for each parameter of a prepared
+    /// statement, in order: the builtin name for a mapped `Type`, else the
+    /// user-type name recovered from the raw Parse oid (see
+    /// `user_type_name_for_oid`), else `None` (the client left it to us).
+    fn param_type_names(&self, stmt: &StoredStatement<ParsedStatement>) -> Vec<Option<String>> {
+        stmt.parameter_types
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                t.as_ref().and_then(internal_type_name).or_else(|| {
+                    stmt.parameter_oids
+                        .get(i)
+                        .copied()
+                        .filter(|o| *o != 0)
+                        .and_then(|oid| self.user_type_name_for_oid(oid))
+                })
+            })
+            .collect()
+    }
+
+    /// The wire `Type` a RAW parameter oid names, when it is a user type. Used
+    /// to report a composite / enum parameter's real oid in
+    /// `ParameterDescription` rather than `unknown`.
+    fn user_wire_type_for_oid(&self, oid: u32) -> Option<Type> {
+        let name = self.user_type_name_for_oid(oid)?;
+        self.user_wire_type(&name)
+    }
+
+    /// Decode a bound PARAMETER whose raw oid names a user COMPOSITE into the
+    /// same record BSON a `'(..)'::comp` literal produces. `Ok(None)` when the
+    /// oid is not a known composite, so the caller falls back to the ordinary
+    /// per-type decoder. Handles both the TEXT `(a,b,..)` form and the binary
+    /// RECORD form, and recurses for a composite-typed field.
+    fn decode_composite_param(
+        &self,
+        oid: u32,
+        raw: Option<&Bytes>,
+        binary: bool,
+        tz: &secantus_pgplan::TimeZoneSetting,
+    ) -> PgWireResult<Option<Bson>> {
+        let oid_i = i64::from(oid);
+        let composites = self.composites_with_schema()?;
+        let Some((schema, name, _, fields)) =
+            composites.into_iter().find(|(_, _, o, _)| *o == oid_i)
+        else {
+            return Ok(None);
+        };
+        let resolution = Self::type_resolution(&schema, &name);
+        let Some(bytes) = raw else {
+            return Ok(Some(Bson::Null));
+        };
+        // The planner coerces the assembled value through its user-composite
+        // table, so it must be installed first.
+        self.install_user_types();
+        if !binary {
+            let text = String::from_utf8_lossy(bytes);
+            return secantus_pgplan::cast_text_to(&text, &resolution, tz)
+                .map(Some)
+                .map_err(|e| Self::err(&e));
+        }
+        let vals = self.decode_binary_record(bytes, &fields, tz)?;
+        let mut d = Document::new();
+        d.insert(secantus_pgplan::RECORD_KEY, Bson::Array(vals));
+        secantus_pgplan::cast_value_with_tz(Bson::Document(d), &resolution, tz)
+            .map(Some)
+            .map_err(|e| Self::err(&e))
+    }
+
+    /// Decode PostgreSQL's binary RECORD datum into one BSON per field. Layout:
+    /// `i32 ncols`, then per field `u32 field_oid`, `i32 len` (`-1` = NULL),
+    /// `len` bytes in the field's binary format. Each field decodes through the
+    /// same per-type decoder its own binary parameter would, recursing into
+    /// `decode_composite_param` when the field is itself a composite.
+    fn decode_binary_record(
+        &self,
+        bytes: &[u8],
+        fields: &CompositeFields,
+        tz: &secantus_pgplan::TimeZoneSetting,
+    ) -> PgWireResult<Vec<Bson>> {
+        let malformed = || {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "22P03".into(), // invalid_binary_representation
+                "malformed binary record parameter".into(),
+            )))
+        };
+        if bytes.len() < 4 {
+            return Err(malformed());
+        }
+        let ncols = i32::from_be_bytes(bytes[..4].try_into().expect("checked")).max(0) as usize;
+        let mut pos = 4usize;
+        let mut out = Vec::with_capacity(ncols);
+        for i in 0..ncols {
+            if pos + 8 > bytes.len() {
+                return Err(malformed());
+            }
+            let field_oid = u32::from_be_bytes(bytes[pos..pos + 4].try_into().expect("checked"));
+            pos += 4;
+            let len = i32::from_be_bytes(bytes[pos..pos + 4].try_into().expect("checked"));
+            pos += 4;
+            if len < 0 {
+                out.push(Bson::Null);
+                continue;
+            }
+            let n = len as usize;
+            if pos + n > bytes.len() {
+                return Err(malformed());
+            }
+            let field_bytes = Bytes::copy_from_slice(&bytes[pos..pos + n]);
+            pos += n;
+            // A composite-typed field is another record: recurse on its oid.
+            if let Some(rec) =
+                self.decode_composite_param(field_oid, Some(&field_bytes), true, tz)?
+            {
+                out.push(rec);
+                continue;
+            }
+            let ftype = fields.get(i).map(|(_, t)| t.as_str());
+            let field_ty = ftype
+                .and_then(|t| self.user_wire_type(t))
+                .or_else(|| ftype.map(wire_type));
+            out.push(decode_parameter(
+                Some(&field_bytes),
+                field_ty.as_ref(),
+                true,
+                tz,
+            )?);
+        }
+        Ok(out)
+    }
+
     /// One table's rows as documents, virtual or stored, unfiltered.
     fn table_docs(&self, table: &str) -> PgWireResult<Vec<Document>> {
         if let Some(docs) = self.virtual_rows(table, &Document::new()) {
@@ -6376,6 +6541,8 @@ impl PgHandler {
         S: Clone + Send + Sync,
     {
         let declared = &portal.statement.parameter_types;
+        let oids = &portal.statement.parameter_oids;
+        let tz = self.session_timezone();
         portal
             .parameters
             .iter()
@@ -6386,12 +6553,26 @@ impl PgHandler {
                     Format::UnifiedBinary => true,
                     Format::Individual(codes) => codes.get(i).copied().unwrap_or(0) == 1,
                 };
-                // 0.40 stores an unspecified parameter type as `None`.
+                // 0.40 maps an unspecified OR non-builtin oid to `None`. When
+                // the raw oid (preserved by the patched `parameter_oids`) names
+                // a user COMPOSITE, decode the value into the record BSON a
+                // `::comp` literal produces -- the ordinary decoder would sniff
+                // the `(a,b)` text into a plain string, so field access and
+                // `= row(..)` on the parameter both broke.
+                if declared.get(i).and_then(|t| t.as_ref()).is_none() {
+                    if let Some(oid) = oids.get(i).copied().filter(|o| *o != 0) {
+                        if let Some(bson) =
+                            self.decode_composite_param(oid, raw.as_ref(), binary, &tz)?
+                        {
+                            return Ok(bson);
+                        }
+                    }
+                }
                 decode_parameter(
                     raw.as_ref(),
                     declared.get(i).and_then(|t| t.as_ref()),
                     binary,
-                    &self.session_timezone(),
+                    &tz,
                 )
             })
             .collect()
@@ -6586,16 +6767,25 @@ impl ExtendedQueryHandler for PgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let declared = &target.parameter_types;
-        let param_types: Vec<Option<String>> = declared
-            .iter()
-            .map(|t| t.as_ref().and_then(internal_type_name))
-            .collect();
+        let param_types = self.param_type_names(target);
         let fields = self.describe_fields(&target.statement.sql, declared.len(), &param_types)?;
-        // An unspecified parameter (`None`) is reported to the client as
-        // `unknown`, which is what PostgreSQL does when it cannot infer.
+        // A parameter with no mapped builtin type reports its user-type oid
+        // when the raw Parse oid named one (a composite / enum), else `unknown`
+        // -- which is what PostgreSQL does when it cannot infer.
         let types: Vec<Type> = declared
             .iter()
-            .map(|t| t.clone().unwrap_or(Type::UNKNOWN))
+            .enumerate()
+            .map(|(i, t)| {
+                t.clone().unwrap_or_else(|| {
+                    target
+                        .parameter_oids
+                        .get(i)
+                        .copied()
+                        .filter(|o| *o != 0)
+                        .and_then(|oid| self.user_wire_type_for_oid(oid))
+                        .unwrap_or(Type::UNKNOWN)
+                })
+            })
             .collect();
         Ok(DescribeStatementResponse::new(types, fields))
     }
@@ -6644,12 +6834,7 @@ impl ExtendedQueryHandler for PgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         self.note_result_format(&target.result_column_format);
-        let param_types: Vec<Option<String>> = target
-            .statement
-            .parameter_types
-            .iter()
-            .map(|t| t.as_ref().and_then(internal_type_name))
-            .collect();
+        let param_types = self.param_type_names(target.statement.as_ref());
         let fields = self.describe_fields(
             &target.statement.statement.sql,
             target.statement.parameter_types.len(),
@@ -6672,12 +6857,7 @@ impl ExtendedQueryHandler for PgHandler {
     {
         self.note_result_format(&portal.result_column_format);
         let params = self.portal_params(portal)?;
-        let param_types: Vec<Option<String>> = portal
-            .statement
-            .parameter_types
-            .iter()
-            .map(|t| t.as_ref().and_then(internal_type_name))
-            .collect();
+        let param_types = self.param_type_names(portal.statement.as_ref());
         let mut responses = self
             .run_typed(
                 &portal.statement.statement.sql,

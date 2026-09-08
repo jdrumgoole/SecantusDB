@@ -464,6 +464,50 @@ pass. STILL OPEN, mapped for a follow-up:
     `encode_binary` has no arm for them (the FROM-side `decode_parameter` does),
     so these are the faker exotic types and are out of the common-scalar scope.
 
+**Rust pgserver composite PARAMETERS — LANDED 2026-09-08 (psycopg's
+`vendor/psycopg/tests/types/test_composite.py`, oracle PostgreSQL 14; 24 → 18
+failures).** A user composite bound as a query parameter used to fail with
+`could not determine data type of parameter $1`: pgwire's
+`StoredStatement::parse` maps every `Parse` OID through `Type::from_oid`, which
+returns `None` for a non-builtin composite, so the raw OID was lost before our
+parser ran (the "pgwire-Parse wall" deferred in #1392/#1411). Fixed by vendoring
+pgwire 0.40.7 into `crates/vendor/pgwire` (wired in via `secantus-pgserver`'s own
+`[patch.crates-io]`; the vendored tree is byte-identical to upstream but for a
+single-field patch to `src/api/stmt.rs` adding `StoredStatement::parameter_oids`).
+`secantus-pgserver` then resolves a parameter's raw OID against its composite
+catalog, gives the parameter a declared type (`pg_typeof($1)` answers the type
+name), and decodes the value into the record BSON a `'(..)'::type` literal
+produces — TEXT `(a,b)` and binary RECORD forms, recursing for composite-typed
+fields. Fixed `test_dump_composite_all_chars` (×3) and
+`test_dump_builtin_empty_range` (×3). The remaining `test_composite.py` failures
+are NOT the Parse wall — each is a separate, pre-existing PLANNER gap the wall
+had been masking:
+  - **OPEN — composite field selection `(expr).field` (`AIndirection`) is
+    unimplemented** (`test_type_dumper_registered` ×3, `test_dump_no_sequence`
+    ×3): the planner rejects `(%s).bar` with "AIndirection is not supported yet".
+    A `secantus-pgplan` feature (extract a named field from a record value),
+    independent of parameter decode.
+  - **OPEN — composite `=` uses three-valued NULL logic, not `record_eq`'s
+    NULL-equality** (`test_dump_composite_null` ×3): `row('foo',1,NULL)::t = $1`
+    returns NULL where PostgreSQL returns TRUE, because `record_compare` in
+    `secantus-pgplan` treats a NULL field with three-valued rules; composite
+    equality (`record_eq`) compares two NULLs in the same position as equal.
+  - **OPEN — nested record `=` errors "comparing document with document"**
+    (`test_dump_recursive_composite` ×3): a composite whose field is itself a
+    composite is not recognised by `record_fields` on both sides, so the compare
+    falls through to the scalar path. A `record_compare` recursion gap.
+  - **OPEN — binary anonymous-record RESULT columns emit text-typed fields**
+    (`test_load_record_binary` several): `select row(42,'foo',...)` read in a
+    BINARY cursor encodes each field as text rather than its typed binary — a
+    result-ENCODING gap (named-composite binary results already work), unrelated
+    to parameter decode.
+  - **OPEN — client_encoding query-DECODE follow-up (now that the vendored-pgwire
+    fork exists).** pgwire decodes the `Query`/`Parse` SQL text as UTF-8; a
+    client on a non-UTF-8 `client_encoding` needs the SQL bytes transcoded (and
+    the deferred `from_utf8_lossy` swap noted in #1392/#1411). Deliberately left
+    out of this PR — the fork infrastructure it would build on now exists, so it
+    is a clean follow-up rather than a blocker.
+
 **Rust pgserver transaction characteristics — LANDED 2026-09-08 (psycopg's
 `vendor/psycopg/tests/test_connection.py::test_set_transaction_param_*`, oracle
 PostgreSQL 14; 16 → 0 failures).** The Rust server now parses the transaction

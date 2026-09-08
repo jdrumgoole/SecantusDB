@@ -3473,6 +3473,39 @@ def test_composite_binary_result(home: Path) -> None:
         assert isinstance(res.baz, float)
 
 
+@pytest.mark.parametrize("binary", [False, True], ids=["text", "binary"])
+def test_composite_parameter_round_trips_in_both_formats(home: Path, binary: bool) -> None:
+    """A registered composite bound as a PARAMETER decodes to its record value.
+
+    psycopg's `register_composite` sends the composite's OID in the `Parse`
+    message and the value in the `Bind` -- but pgwire's `Type::from_oid` maps a
+    non-builtin oid to `None`, so the raw oid (and with it any hope of resolving
+    the parameter's type) was lost before the parser saw it. The vendored
+    pgwire patch preserves the raw oids in `StoredStatement::parameter_oids`, so
+    a bound composite now gets a declared type (`pg_typeof` answers the type
+    name instead of `could not determine data type of parameter $1`) and its
+    value is decoded into the same record BSON a `'(..)'::type` literal
+    produces -- from the TEXT `(a,b)` form and the binary RECORD form alike.
+    """
+    from psycopg.types.composite import CompositeInfo, register_composite
+
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create type cp as (foo text, bar int4, baz float8)")
+        info = CompositeInfo.fetch(conn, "cp")
+        register_composite(info, conn)
+        obj = info.python_type("hi", 42, 3.5)
+
+        cur = conn.cursor(binary=binary)
+        # The Parse wall: the parameter's type is resolved from the raw oid.
+        assert cur.execute("select pg_typeof(%s)", [obj]).fetchone()[0] == "cp"
+        # The value decodes to the composite and round-trips through a cast.
+        got = cur.execute("select %s::cp", [obj]).fetchone()[0]
+        assert (got.foo, got.bar, got.baz) == ("hi", 42, 3.5)
+        # A NULL field survives, and the text render matches PostgreSQL's.
+        obj_null = info.python_type("foo", 1, None)
+        assert cur.execute("select %s::text", [obj_null]).fetchone()[0] == "(foo,1,)"
+
+
 def test_composite_array_load_text_and_binary(home: Path) -> None:
     """`array[<composite>]` reports the composite's ARRAY oid, so the client
     parses it as a one-element array of composites rather than a bare string.
