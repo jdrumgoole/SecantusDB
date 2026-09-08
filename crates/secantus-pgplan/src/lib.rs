@@ -4597,6 +4597,28 @@ fn parse_timestamptz(text: &str, tz: &TimeZoneSetting) -> Result<i64> {
     Ok(naive - i64::from(seconds) * 1_000_000)
 }
 
+/// Build a stored `timestamptz` VALUE from an absolute instant in microseconds
+/// since the Unix epoch -- the same carrier `cast_value("timestamptz")`
+/// produces: a bare BSON date when the instant lands on a whole millisecond, a
+/// `{__subms_d, __subms_u}` composite when it carries sub-millisecond digits.
+///
+/// The binary wire form of a `timestamptz` parameter hands us the instant
+/// outright (i64 microseconds since 2000-01-01 UTC). Rendering it to
+/// session-zone text and shipping THAT as the value dropped the offset the
+/// moment anything re-coerced the string as a bare timestamp, so a binary
+/// parameter compared UNEQUAL to the very literal it was meant to equal. Going
+/// straight to the instant carrier keeps the binary and text paths on the one
+/// representation.
+pub fn timestamptz_value_from_micros(micros: i64) -> Bson {
+    let (ms, rem) = split_subms(micros);
+    let date = Bson::DateTime(bson::DateTime::from_millis(ms));
+    if rem == 0 {
+        date
+    } else {
+        Bson::Document(doc! { COMPOSITE_DATE: date, COMPOSITE_US: rem })
+    }
+}
+
 /// An instant as PostgreSQL renders a `timestamptz`: the wall clock in the
 /// session zone, then the offset that zone had at that instant.
 pub fn render_timestamptz(micros: i64, tz: &TimeZoneSetting) -> String {
@@ -7118,6 +7140,21 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             if let Some(t) = timestamptz_value_text(&value, &session_timezone()) {
                 return Ok(Bson::String(t));
             }
+        }
+        // A redundant `timestamptz` -> `timestamptz` cast (e.g. `$1::timestamptz`
+        // over a parameter already declared timestamptz) is a NO-OP: the value
+        // is the stored INSTANT. Routing it through `cast_value` would render it
+        // to offset-less wall-clock text and re-parse THAT with the session
+        // zone, applying the zone a second time and moving the instant -- the
+        // `timestamp` -> `timestamptz` path legitimately applies the zone, and
+        // must not fire for a value that is already an instant. (`timestamp` ->
+        // `timestamptz` still reaches `cast_value`, since its source type is
+        // `timestamp`, not `timestamptz`.)
+        let is_stored_instant = matches!(&value, Bson::DateTime(_))
+            || matches!(&value, Bson::Document(d) if d.contains_key(COMPOSITE_DATE));
+        if target == "timestamptz" && is_stored_instant && static_type(arg, &value) == "timestamptz"
+        {
+            return Ok(value);
         }
         return cast_value(value, &target);
     }

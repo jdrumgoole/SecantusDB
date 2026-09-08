@@ -1319,6 +1319,39 @@ def test_bound_aware_datetimes_keep_their_instant(home: Path) -> None:
                 assert cur.fetchone()[0] == aware, (binary, zone)
 
 
+def test_bound_aware_datetime_equals_literal_no_cast(home: Path) -> None:
+    """A bound aware datetime compares equal to the ``::timestamptz`` literal
+    for the same instant -- WITHOUT an explicit cast on the parameter.
+
+    This is the shape psycopg's own ``test_dump_datetimetz`` asserts
+    (``'<expr>'::timestamptz = %(val)s``). The binary parameter path used to
+    ship the instant as session-rendered TEXT, whose zone offset was dropped the
+    moment the ``=`` re-coerced it against the literal -- so a binary parameter
+    landed two hours (the session offset) off and compared FALSE. Text was fine;
+    binary was silently wrong, so both formats are checked. The instants span
+    the psycopg corpus edges: year 0001, a sub-second fraction, a seconds-only
+    offset, and year 9999.
+    """
+    utc = dt.timezone.utc
+    cases = [
+        # (bound UTC instant, literal-with-offset that names the same instant)
+        (dt.datetime(1, 1, 1, 12, 0, tzinfo=utc), "0001-01-01 00:00-12:00"),
+        (dt.datetime(1999, 12, 31, 22, 0, tzinfo=utc), "2000-01-01 00:00+2"),
+        (dt.datetime(2000, 12, 31, 21, 59, 59, 999999, tzinfo=utc), "2000-12-31 23:59:59.999999+2"),
+        (dt.datetime(1999, 12, 31, 22, 57, 57, tzinfo=utc), "2000-01-01 00:00+01:02:03"),
+        # No offset in the literal -> read in the session zone (+02), so the
+        # instant is two hours earlier than the wall clock.
+        (dt.datetime(9999, 12, 31, 21, 59, 59, 999999, tzinfo=utc), "9999-12-31 23:59:59.999999"),
+    ]
+    with _Server(home) as server, server.connect() as conn:
+        conn.cursor().execute("set timezone to '-02:00'")
+        for binary in (False, True):
+            cur = conn.cursor(binary=binary)
+            for value, expr in cases:
+                cur.execute(f"select '{expr}'::timestamptz = %s", (value,))
+                assert cur.fetchone()[0] is True, (binary, expr)
+
+
 def test_regtype_names_a_type(home: Path) -> None:
     """`'int4'::regtype` is the type it names, printed as PostgreSQL prints it."""
     with _Server(home) as server, server.connect() as conn:
