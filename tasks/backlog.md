@@ -6236,8 +6236,8 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   Pinned by `tests/test_comparison_operand_types.py` (46 cases, registered in
   `test.yml`).
 
-- [ ] **OPEN — a numeric path component after an array is wrong in BOTH
-  directions, on BOTH servers (measured 2026-09-08).** mongod reads `v.0` over
+- [x] **RESOLVED 2026-09-08 — a numeric path component after an array was wrong
+  in BOTH directions, on BOTH servers.** mongod reads `v.0` over
   an array-valued `v` as EITHER the element at index 0 OR the field named `"0"`
   in each element, and having consumed the index positionally it does NOT then
   re-apply implicit array traversal. Both servers do the opposite on each count:
@@ -6253,9 +6253,20 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   — silently, with no error. Found by the query result-set sweep described in
   the entry below; it is the only cell that sweep still reports.
 
-  The fix is in the path walker (`secantus/query.py` and
-  `crates/secantus-core/src/query.rs`), which is shared by every operator, so it
-  wants its own slice and a full re-run of the 266-case sweep.
+  Fixed in the matcher's path resolver on both servers: it now produces BOTH
+  readings and marks a value reached positionally so the implicit traversal
+  skips it -- a `list` subclass in Python (so it is still an array for `$size` /
+  `$type` / `$elemMatch` / whole-array equality) and a `Cand` carrying the flag
+  in Rust. The Rust RAW-BSON fast lane carries the same provenance; without it
+  the two lanes answered the same query differently depending on which ran.
+
+  **The two readings cannot simply be OR-ed.** `$ne` / `$nin` mean "no candidate
+  matches" over the COMBINED set, not "either reading's negation holds" -- an OR
+  of two `field_matches` calls gets those backwards. The flag therefore travels
+  with each candidate rather than splitting the evaluation.
+
+  22-filter matrix and the 266-case query sweep both at 0 divergent. Pinned by
+  `tests/test_positional_path_matching.py` (22 cases).
 
 - [x] **RESOLVED 2026-09-08 — new probe: query RESULT SETS.** Every existing
   probe covered expressions, stages, errors or INDEXED lookups; none compared
@@ -6264,6 +6275,36 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   operators) over a 36-document corpus of value classes found 2 divergences on
   the Rust server -- the `$expr` comparison family above, and the positional
   path bug above. Worth re-running after any change to `query.rs`.
+
+- [ ] **OPEN — new probe: UPDATE operators compared on the resulting DOCUMENT
+  (2026-09-08).** `tools/probes/update_operators.py` compares update ERRORS;
+  nothing compared the document a successful update produces, which is where a
+  silently wrong WRITE hides. A sweep of 31 updates x 17 seed value classes
+  (527 cells) against mongod 8.2.11 found **30 divergent**, in four families.
+  Two of them corrupt data rather than merely miss an error:
+
+  - **Array operators on a non-array field CREATE an array (7 cells, both
+    servers).** `{$push: {v: 4}}` over `{v: null}` writes `{v: [4]}` where
+    mongod raises `2 The field 'v' must be an array but is of type null`, and
+    `$addToSet` the same with its own wording (`Cannot apply $addToSet to
+    non-array field.`). The null is destroyed.
+  - **`$pull` with a scalar empties an array of arrays (1 cell, both servers).**
+    `{$pull: {v: 1}}` over `{v: [[1, 2]]}` leaves `{v: []}`; mongod leaves the
+    document untouched, because `[1, 2]` does not equal `1`. Same
+    membership-after-nesting family as the positional path bug above --
+    `{$pull: {v: [1, 2]}}` is the one that empties it.
+  - **`$rename` through a non-document path silently no-ops (14 cells, both
+    servers).** `{$rename: {"v.k": "v.j"}}` over any non-document `v` is
+    `28 cannot use the part (v of v.k) to traverse the element` on mongod.
+  - **`$bit` / `$pop` on a non-integer / non-array (8 cells, mixed).** `$bit`
+    over `{v: null}` writes a number on both servers (mongod:
+    `2 Cannot apply $bit to a value of non-integral type`); over `-0.0` and
+    `[]` only the PYTHON server writes, the Rust one already errors. `$pop`
+    over `{v: null}` no-ops on the Python server where mongod and the Rust
+    server both raise `14 Path 'v' contains an element of non-array type`.
+
+  Every message and code above is measured; the harness is `/tmp`-local and
+  should be promoted into `tools/probes/` when this is worked.
 
 - [ ] **The other decimal transcendentals still refuse (2026-09-08).** The six
   trig and the remaining hyperbolics (`$sin`, `$cos`, `$tan`, `$asin`, `$acos`,

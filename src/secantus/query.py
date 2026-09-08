@@ -432,7 +432,33 @@ def _truthy(value: Any) -> bool:
     return True
 
 
+class _Positional(list):
+    """An array reached by a POSITIONAL index -- ``v.0`` over ``{v: [[1, 2]]}``.
+
+    Subclasses ``list`` on purpose: it is still an array for ``$size``,
+    ``$type``, ``$elemMatch`` and whole-array equality, and only the implicit
+    one-level traversal treats it differently. mongod spends the path step on
+    the index, so the element does NOT then match by membership --
+    ``{"v.0": 1}`` does not match ``{v: [[1, 2]]}`` even though ``1`` is in
+    ``v.0``. Measured 8.2.11, 2026-09-08.
+    """
+
+    __slots__ = ()
+
+
+def _expandable(v: Any, descend: bool) -> bool:
+    """Whether the implicit one-level array traversal applies to ``v``."""
+    return descend and isinstance(v, list) and not isinstance(v, _Positional)
+
+
 def _resolve_path(doc: Any, path: str) -> list[Any]:
+    """Every value ``path`` reaches, as mongod's matcher sees them.
+
+    A numeric component over an array means BOTH readings, and mongod tries
+    both: the element at that INDEX, and the value of the FIELD of that name in
+    each element. `{"v.0": 9}` matches `{v: [{"0": 9}]}` on that second reading,
+    which this used to miss entirely (measured 8.2.11, 2026-09-08).
+    """
     parts = path.split(".")
     current: list[Any] = [doc]
     for part in parts:
@@ -443,7 +469,17 @@ def _resolve_path(doc: Any, path: str) -> list[Any]:
             elif isinstance(cur, list):
                 if part.isdigit():
                     idx = int(part)
-                    nxt.append(cur[idx] if 0 <= idx < len(cur) else MISSING)
+                    if 0 <= idx < len(cur):
+                        elem = cur[idx]
+                        # Mark an array reached positionally so the matcher
+                        # does not then expand it by membership.
+                        nxt.append(_Positional(elem) if type(elem) is list else elem)
+                    else:
+                        nxt.append(MISSING)
+                    # ... and the field-of-that-name reading, alongside.
+                    for elem in cur:
+                        if isinstance(elem, Mapping):
+                            nxt.append(elem.get(part, MISSING))
                 else:
                     for elem in cur:
                         if isinstance(elem, Mapping):
@@ -616,11 +652,7 @@ def _eq_with_array(
             continue
         if _eq_numeric_aware(v, expected, collation):
             return True
-        if (
-            descend
-            and isinstance(v, list)
-            and any(_eq_numeric_aware(e, expected, collation) for e in v)
-        ):
+        if _expandable(v, descend) and any(_eq_numeric_aware(e, expected, collation) for e in v):
             return True
     return False
 
@@ -1157,7 +1189,7 @@ def _op_bitwise(
         # An ARRAY field is matched element-wise, one level deep -- the same
         # multikey rule the comparison operators follow. Without it a document
         # holding `[1, 4]` was skipped entirely.
-        if descend and isinstance(v, list):
+        if _expandable(v, descend):
             for elem in v:
                 source = bit_source(elem)
                 if source is not None and predicate(source, mask):
@@ -1190,7 +1222,7 @@ def _cmp(
             v = None
         if _try_cmp(v, target, op, collation):
             return True
-        if descend and isinstance(v, list):
+        if _expandable(v, descend):
             for elem in v:
                 if _try_cmp(elem, target, op, collation):
                     return True
@@ -1439,8 +1471,8 @@ def _op_regex(values: list[Any], pattern: Any, options: Any, *, descend: bool = 
         if _regex_matches_value(v, compiled, query_regex):
             return True
         if (
-            descend
-            and isinstance(v, list)
+            _expandable(v, descend)
+            and True
             and any(_regex_matches_value(elem, compiled, query_regex) for elem in v)
         ):
             return True
@@ -1683,7 +1715,7 @@ def _op_type(values: list[Any], type_spec: Any, field: str = "", *, descend: boo
             continue
         if any(_matches_type(v, t) for t in types):
             return True
-        if descend and isinstance(v, list):
+        if _expandable(v, descend):
             for elem in v:
                 if any(_matches_type(elem, t) for t in types):
                     return True
@@ -1765,7 +1797,7 @@ def _op_all(values: list[Any], required: Any, *, descend: bool = True) -> bool:
         # a one-element array for `$all`, verified against mongod 7.0.12).
         if isinstance(r, Mapping) and list(r.keys()) == ["$elemMatch"]:
             return isinstance(v, list) and _op_elem_match([v], r["$elemMatch"])
-        if descend and isinstance(v, list):
+        if _expandable(v, descend):
             return any(_elem_matches_required(elem, r) for elem in v)
         return _elem_matches_required(v, r)
 
