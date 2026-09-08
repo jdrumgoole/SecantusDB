@@ -2664,6 +2664,26 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
         }
         // These pick one of their arguments, so they report its type.
         Some(N::RowExpr(_)) => "record".to_string(),
+        // `(expr).field` reports the SELECTED field's declared type, taken from
+        // the source composite's field list. An anonymous record (or an unknown
+        // field) falls back to the value's inferred type.
+        Some(N::AIndirection(ind)) => {
+            let field = ind
+                .indirection
+                .first()
+                .and_then(|n| n.node.as_ref())
+                .and_then(|n| match n {
+                    N::String(s) => Some(s.sval.as_str()),
+                    _ => None,
+                });
+            let field_type = ind.arg.as_ref().and_then(|arg| {
+                let ty = static_type(arg, &Bson::Null);
+                user_composite(&ty).and_then(|(_, fields)| {
+                    field.and_then(|f| fields.iter().find(|(n, _)| n == f).map(|(_, t)| t.clone()))
+                })
+            });
+            field_type.unwrap_or_else(|| inferred_type(value).to_string())
+        }
         Some(N::CoalesceExpr(_)) | Some(N::MinMaxExpr(_)) => inferred_type(value).to_string(),
         Some(N::AExpr(e)) => {
             // `NULLIF` is an operator node whose operator is `=`, but it
@@ -3358,6 +3378,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 | N::AExpr(_)
                 | N::AArrayExpr(_)
                 | N::RowExpr(_)
+                | N::AIndirection(_)
                 | N::CoalesceExpr(_)
                 | N::MinMaxExpr(_)),
             ) => {
@@ -3775,13 +3796,38 @@ pub(crate) fn record_text(fields: &[Bson]) -> String {
     out
 }
 
-/// Compare two records with PostgreSQL's three-valued rules, which DIFFER by
-/// operator: `=`/`<>` examine every pair (a non-null unequal pair decides,
-/// else a null makes the result null), while the ordering operators
-/// short-circuit left to right (a null in an earlier field is null overall).
-fn record_compare(op: &str, a: &[Bson], b: &[Bson]) -> Result<Bson> {
+/// Compare two records with PostgreSQL's rules, which DIFFER by operator AND
+/// by whether the operands are ROW CONSTRUCTORS or composite VALUES.
+///
+/// `=`/`<>` examine every pair (a non-null unequal pair decides); the ordering
+/// operators short-circuit left to right. The NULL rule depends on `composite`:
+/// - **row constructor vs row constructor** (`composite == false`): the SQL
+///   three-valued rule -- a NULL the result depends on makes it NULL
+///   (`ROW(1,NULL) = ROW(1,NULL)` is NULL, and `ROW(1,NULL) < ROW(2,...)` is
+///   NULL because the earlier field's NULL is undecidable).
+/// - **composite value vs composite value** (`composite == true`): two NULL
+///   field values are EQUAL and a NULL sorts LARGER than any non-NULL, so the
+///   comparison always resolves to true/false, never NULL (PostgreSQL's rule
+///   for comparing composite-type values, as opposed to row constructors).
+///
+/// A field that is itself a record compares by the SAME rules, recursively.
+fn record_compare(op: &str, a: &[Bson], b: &[Bson], composite: bool) -> Result<Bson> {
     use std::cmp::Ordering;
-    let cmp_pair = |x: &Bson, y: &Bson| -> Result<Ordering> {
+    // One field pair -> an Ordering, recursing into a nested record. Only
+    // reached for a pair with no NULL on either side (the callers handle NULLs
+    // first), so the nested record's own NULLs follow `composite`.
+    fn cmp_pair(op: &str, x: &Bson, y: &Bson, composite: bool) -> Result<Ordering> {
+        if let (Some(rx), Some(ry)) = (record_fields(x), record_fields(y)) {
+            // A `<`-form comparison gives a total order over the nested record,
+            // which is the tie-break the caller needs.
+            return match record_compare("<", rx, ry, composite)? {
+                Bson::Boolean(true) => Ok(Ordering::Less),
+                _ => match record_compare("=", rx, ry, composite)? {
+                    Bson::Boolean(true) => Ok(Ordering::Equal),
+                    _ => Ok(Ordering::Greater),
+                },
+            };
+        }
         compare_constants(x, y).ok_or_else(|| {
             Error::Unsupported(format!(
                 "comparing {} with {} using {op}",
@@ -3789,15 +3835,31 @@ fn record_compare(op: &str, a: &[Bson], b: &[Bson]) -> Result<Bson> {
                 bson_kind(y)
             ))
         })
-    };
+    }
     if matches!(op, "=" | "<>" | "!=") {
         let mut saw_null = false;
         for (x, y) in a.iter().zip(b.iter()) {
-            if *x == Bson::Null || *y == Bson::Null {
-                saw_null = true;
-                continue;
+            match (*x == Bson::Null, *y == Bson::Null) {
+                (true, true) => {
+                    // Composite: two NULLs are equal. Row constructor: the
+                    // result depends on a NULL, so it becomes NULL.
+                    if !composite {
+                        saw_null = true;
+                    }
+                    continue;
+                }
+                (true, false) | (false, true) => {
+                    // Composite: a NULL beside a non-NULL is UNEQUAL. Row
+                    // constructor: still an undecidable NULL.
+                    if composite {
+                        return Ok(Bson::Boolean(op != "="));
+                    }
+                    saw_null = true;
+                    continue;
+                }
+                (false, false) => {}
             }
-            if cmp_pair(x, y)? != Ordering::Equal {
+            if cmp_pair(op, x, y, composite)? != Ordering::Equal {
                 return Ok(Bson::Boolean(op != "="));
             }
         }
@@ -3810,10 +3872,30 @@ fn record_compare(op: &str, a: &[Bson], b: &[Bson]) -> Result<Bson> {
         return Ok(Bson::Boolean(op == "="));
     }
     for (x, y) in a.iter().zip(b.iter()) {
-        if *x == Bson::Null || *y == Bson::Null {
-            return Ok(Bson::Null);
+        match (*x == Bson::Null, *y == Bson::Null) {
+            (true, true) => {
+                // Composite: equal on this field, keep looking. Row
+                // constructor: undecidable -> NULL.
+                if composite {
+                    continue;
+                }
+                return Ok(Bson::Null);
+            }
+            (true, false) | (false, true) => {
+                if composite {
+                    // A NULL sorts LARGER than any non-NULL.
+                    let ord = if *x == Bson::Null {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Less
+                    };
+                    return Ok(Bson::Boolean(decide_ord(op, ord)));
+                }
+                return Ok(Bson::Null);
+            }
+            (false, false) => {}
         }
-        match cmp_pair(x, y)? {
+        match cmp_pair(op, x, y, composite)? {
             Ordering::Equal => continue,
             ord => return Ok(Bson::Boolean(decide_ord(op, ord))),
         }
@@ -6812,10 +6894,12 @@ fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
     }
 
     if matches!(op, "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
-        // Two records compare field by field with PostgreSQL's three-valued
-        // rules (see record_compare).
+        // Two records compare field by field (see record_compare). The AST-less
+        // path treats them as composite VALUES (NULLs equal): the row-constructor
+        // three-valued rule is applied by const_value, which alone can tell a
+        // bare `ROW(...)` from a composite value.
         if let (Some(a), Some(b)) = (record_fields(&lhs), record_fields(&rhs)) {
-            return record_compare(op, a, b);
+            return record_compare(op, a, b, true);
         }
         // A scalar compared to an ARRAY with no ANY/ALL is an operator
         // PostgreSQL does not have (`text = text[]` is 42883). Array = array is
@@ -7612,6 +7696,50 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
         }
         return cast_value(value, &target);
     }
+    // `(expr).field` -- select a named field from a composite or record value.
+    // The field NAME resolves to a position through the source's type: a named
+    // composite carries its field list, an anonymous record names them f1, f2,
+    // ... by position.
+    if let Some(N::AIndirection(ind)) = node.node.as_ref() {
+        let arg = ind
+            .arg
+            .as_ref()
+            .ok_or_else(|| Error::Parse("field selection with no operand".into()))?;
+        // Only single field-name selection is supported here; array subscripts
+        // and `(rec).*` are separate constructs.
+        if ind.indirection.len() != 1 {
+            return Err(Error::Unsupported("this field selection".into()));
+        }
+        let field = match ind.indirection[0].node.as_ref() {
+            Some(N::String(s)) => s.sval.clone(),
+            _ => return Err(Error::Unsupported("this field selection".into())),
+        };
+        let value = const_value(arg, params)?;
+        if value == Bson::Null {
+            return Ok(Bson::Null);
+        }
+        let fields = record_fields(&value)
+            .ok_or_else(|| Error::Unsupported("field selection on a non-record value".into()))?;
+        let ty = static_type(arg, &value);
+        let (idx, err) = if let Some((_, comp_fields)) = user_composite(&ty) {
+            (
+                comp_fields.iter().position(|(n, _)| *n == field),
+                format!("column \"{field}\" not found in data type {ty}"),
+            )
+        } else {
+            // An anonymous record names its fields f1, f2, ... by position.
+            (
+                field
+                    .strip_prefix('f')
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .filter(|n| *n >= 1)
+                    .map(|n| n - 1),
+                format!("could not identify column \"{field}\" in record data type"),
+            )
+        };
+        let idx = idx.ok_or(Error::UndefinedColumn(err))?;
+        return Ok(fields.get(idx).cloned().unwrap_or(Bson::Null));
+    }
     if let Some(N::FuncCall(f)) = node.node.as_ref() {
         if func_name(f).as_deref() == Some("pg_typeof") {
             return pg_typeof(f, params);
@@ -7786,6 +7914,22 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 _ => return Err(Error::Unsupported(format!("unary {op}"))),
             },
         };
+        // Two records compare with rules that depend on whether each side is a
+        // ROW CONSTRUCTOR or a composite VALUE (see record_compare). Only the
+        // AST distinguishes them -- a bare `ROW(...)` is an `N::RowExpr`, while
+        // `row(...)::t` / a bound composite / a stored composite is anything
+        // else -- and only three-valued NULL logic applies when BOTH sides are
+        // row constructors. `eval_binary` has no AST, so decide here.
+        if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
+            if let (Some(a), Some(b)) = (record_fields(&lhs), record_fields(&rhs)) {
+                let is_row_ctor = |n: Option<&pg_query::protobuf::Node>| {
+                    matches!(n.and_then(|n| n.node.as_ref()), Some(N::RowExpr(_)))
+                };
+                let composite =
+                    !(is_row_ctor(e.lexpr.as_deref()) && is_row_ctor(e.rexpr.as_deref()));
+                return record_compare(&op, a, b, composite);
+            }
+        }
         // The JSON operators need the left operand's STATIC type, which the
         // values no longer carry.
         if matches!(
