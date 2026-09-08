@@ -5723,21 +5723,41 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
     whose transcendental rounding differs from every other implementation in the
     final digit.
 
-  **The decision, with its costs — this is Joe's call, not a unilateral one:**
+  **PROVEN 2026-09-08: mongod is NOT correctly rounded here, so no independent
+  implementation can match it by being more accurate.** Computing at 60 digits
+  and rounding correctly to 34 matches mongod for `$sqrt` and `$exp` — and does
+  NOT for `$ln` or `$log10`. Against the true values:
 
-  1. **Link Intel RDFP** (the library mongod itself uses). Exact. Cost: a C
-     dependency in the wheel build, which currently ships cp312+cp313 across
-     macOS arm64, manylinux2014 and musllinux x86_64/aarch64, and Windows AMD64.
-  2. **Add a pure-Rust decimal crate** (`astro-float`, `dashu-float`). Cheap to
-     build, no C. Cost: silently wrong in the last digit on some inputs —
-     which is what `CLAUDE.md`'s "wire-protocol fidelity over feature
-     completeness" exists to prevent, and would make the Rust server *quietly*
-     wrong where it is currently *loudly* unsupported.
-  3. **Keep refusing.** Honest, and what the server does today. Cost: the two
-     servers disagree (Python answers, Rust refuses), and mongod answers.
+      ln(2.5)    = 0.9162907318741550651835272117680110|714501...
+                   correctly rounded to 34 -> ...680111
+                   mongod                   -> ...680110   (BELOW)
 
-  Option 2 is the one to resist without an explicit decision: it trades a
-  visible refusal for an invisible wrong answer in a database.
+      log10(2.5) = 0.3979400086720376095725222105510139|464636...
+                   correctly rounded to 34 -> ...510139
+                   mongod                   -> ...510140   (ABOVE)
+
+  mongod lands below the true value for one and above it for the other, so it is
+  neither correctly rounded nor consistently truncated: it carries Intel RDFP's
+  own approximation error. Matching it means reproducing that error, which a
+  more accurate library cannot do.
+
+  **So there are only TWO real options, not three:**
+
+  1. **Link Intel RDFP** (the library mongod itself uses) — the only way to be
+     bit-identical. Cost: a C dependency in the wheel build, which currently
+     ships cp312+cp313 across macOS arm64, manylinux2014 and musllinux
+     x86_64/aarch64, and Windows AMD64.
+  2. **Keep refusing.** Honest, and what the server does today. Cost: the two
+     servers disagree (Python answers within 1 ULP, Rust refuses), and mongod
+     answers.
+
+  **Adding a pure-Rust decimal crate (`astro-float`, `dashu-float`) is now ruled
+  OUT on evidence, not on taste** — it cannot match `$ln` / `$log10` at any
+  precision, so it would buy a *quietly* wrong last digit in place of a *loudly*
+  unsupported operator. That is the trade `CLAUDE.md`'s "wire-protocol fidelity
+  over feature completeness" exists to prevent.
+
+  This is Joe's call, not a unilateral one.
 
 - [ ] **Decimal128 operands are refused by 33 Rust operators (2026-09-02).**
   Was 38; `$abs`, `$toBool`, `$toInt`, `$toLong` and `$toDouble` now take them.
