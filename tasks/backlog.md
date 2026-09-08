@@ -1945,12 +1945,19 @@ These are explicit non-goals. Don't add them without a reason.
   collide with the bare name — `CreateRange`/`CreateEnum` thread schema per the
   #1388 composite template; range/enum catalog keyed on (schema, name), so
   psycopg's `testschema.testrange` fixture and all four `RangeInfo.fetch` forms
-  pass. **Custom MULTIRANGE resolution is still unimplemented and out of scope
-  for that PR** — `MultirangeInfo.fetch` errors `column "rngmultitypid" does not
-  exist` (pg_range has no `rngmultitypid`, no per-range multirange oid is minted,
-  and no `testmultirange` pg_type row exists). That is a genuine feature build,
-  not the schema-keying template; the ~14 `test_multirange.py::test_fetch_info*`
-  tests need it before they can pass.
+  pass. **Update 2026-09-08 (multirange resolution DONE):** every custom range's
+  auto-created MULTIRANGE companion is now resolvable — `pg_range` carries
+  `rngmultitypid`, each range mints a multirange oid (`range_oid + 200_000`, its
+  array `+300_000`), a multirange `pg_type` row is synthesized (bare `typname`
+  via the `range`→`multirange` first-substring rule, `foo`→`foo_multirange`),
+  and `to_regtype` resolves the multirange name (bare in public, `schema.name`
+  otherwise, distinct per schema). All four `MultirangeInfo.fetch` forms
+  (`testmultirange`, `testschema.testmultirange`, and both as `sql.Identifier`)
+  resolve to the right oid/subtype, verified against a live PG 14 oracle. Custom
+  multirange VALUE round-trip (dump/load of a populated `'{...}'::testmultirange`)
+  is NOT part of this — it rides the existing scalar range/multirange binary
+  codec and was not measured here; the array-of-multirange param campaign above
+  is still open.
 
 
 ### 2026-09-06 READ-PATH sweep: 385 cases, and what is still open

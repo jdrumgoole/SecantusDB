@@ -3734,6 +3734,15 @@ thread_local! {
     /// otherwise route a composite cast into the enum arm).
     static PLAN_USER_COMPOSITES: std::cell::RefCell<Vec<CompositeType>> =
         const { std::cell::RefCell::new(Vec::new()) };
+
+    /// Custom MULTIRANGE types: `(resolution name -> multirange oid)`. The
+    /// companion multirange PostgreSQL auto-creates for every `CREATE TYPE ...
+    /// AS RANGE`. The resolution name is bare in `public` and `schema.name`
+    /// otherwise, so `to_regtype('testmultirange')` reaches the public one and
+    /// `to_regtype('testschema.testmultirange')` the schema one -- exactly like
+    /// ranges. Installed per statement by the wire layer.
+    static PLAN_USER_MULTIRANGES: std::cell::RefCell<Vec<(String, i64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// A composite type's fields: `(field name, field type name)`, in order.
@@ -3765,6 +3774,33 @@ fn user_composite(name: &str) -> Option<(i64, CompositeFields)> {
 /// composites are not in `PLAN_USER_TYPES`.
 pub fn user_composite_oid(name: &str) -> Option<i64> {
     user_composite(name).map(|(oid, _)| oid)
+}
+
+/// Custom multirange types: `(resolution name, multirange oid)`.
+pub fn set_user_multiranges(multiranges: Vec<(String, i64)>) {
+    PLAN_USER_MULTIRANGES.with(|t| *t.borrow_mut() = multiranges);
+}
+
+/// A custom multirange type's oid by name, for regtype resolution.
+fn user_multirange_oid(name: &str) -> Option<i64> {
+    let n = canonical_type_ref(name);
+    PLAN_USER_MULTIRANGES.with(|t| {
+        t.borrow()
+            .iter()
+            .find(|(rn, _)| *rn == n)
+            .map(|(_, oid)| *oid)
+    })
+}
+
+/// A custom multirange type's resolution NAME by oid -- the reverse door, for
+/// rendering `oid::regtype::text`.
+fn user_multirange_name(oid: i64) -> Option<String> {
+    PLAN_USER_MULTIRANGES.with(|t| {
+        t.borrow()
+            .iter()
+            .find(|(_, o)| *o == oid)
+            .map(|(n, _)| n.clone())
+    })
 }
 
 /// The subtype element of a custom range type by name, if one is registered.
@@ -3848,6 +3884,7 @@ fn user_type_oid(name: &str) -> Option<i64> {
                 .map(|(_, oid, _)| *oid)
         })
         .or_else(|| user_range_oid(name))
+        .or_else(|| user_multirange_oid(name))
 }
 
 /// A user ENUM's `(oid, labels)` by name, same folding rule.
@@ -3872,13 +3909,17 @@ fn user_enum(name: &str) -> Option<(i64, Vec<String>)> {
 }
 
 /// A user type's NAME by oid -- the reverse door, for rendering a regtype.
+/// Consults enums / composites first, then custom multiranges (a multirange oid
+/// is not in `PLAN_USER_TYPES`), so `mr_oid::regtype::text` renders its name.
 fn user_type_name(oid: i64) -> Option<String> {
-    PLAN_USER_TYPES.with(|t| {
-        t.borrow()
-            .iter()
-            .find(|(_, o, _)| *o == oid)
-            .map(|(n, _, _)| n.clone())
-    })
+    PLAN_USER_TYPES
+        .with(|t| {
+            t.borrow()
+                .iter()
+                .find(|(_, o, _)| *o == oid)
+                .map(|(n, _, _)| n.clone())
+        })
+        .or_else(|| user_multirange_name(oid))
 }
 
 /// The declared type of `$n`, when the client gave one.
