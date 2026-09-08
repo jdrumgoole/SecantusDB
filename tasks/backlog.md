@@ -1282,6 +1282,29 @@ Specific items that were left out of the slice that introduced their feature are
   clock-dependent input keywords `now` / `today` / `tomorrow` / `yesterday`
   (only the constant `epoch` is).
 
+- [ ] **OPEN — RUST pgserver column metadata (`typmod` / `typlen`): landed
+  for constant SELECTs, deferred for table columns and computed expressions
+  (measured 2026-09-08 against PostgreSQL 16, PR for `pgserver-column`).** The
+  `RowDescription` now sends a real per-type `typlen` (`type_size`) for every
+  wire type and the declared `atttypmod` (`type_modifier`) of a
+  `select null::type(mod)` cast — `numeric(p,s)`, `varchar(n)` / `char(n)`,
+  `bit(n)` / `varbit(n)`, `time` / `timestamp` / `interval` precision — matching
+  PG field-for-field; `bit` / `varbit` now carry oids 1560 / 1562. This cleared
+  all 46 failing `test_column.py` cases (53/53). **`typlen` is right EVERYWHERE**
+  (a pure OID lookup in `field()`), so `internal_size` is correct on every
+  path. **`typmod` is threaded ONLY through the `SelectConstant` cast path**
+  (`cast_typmod` in `secantus-pgplan`, the 4th tuple element on
+  `SelectConstant.columns`). Still `-1` (no modifier) for: a modifier declared
+  on a **table column** (`create table t (a numeric(10,2))` then `select a` —
+  the catalog `pg_type` string drops the `(10,2)`), and a modifier on a
+  **computed/aliased expression** in a SELECT with a FROM (the `Select` /
+  `Aggregate` describe paths at `lib.rs:~3690` / `~5660` still call `field(...)`
+  with no typmod). Propagating those needs the modifier carried on the catalog
+  column definition and on `ColumnExpr`, which this batch did not attempt.
+  Value decoding is unchanged (description metadata only). Non-null `::bit` /
+  `::varbit` casts remain unsupported at the value layer (`cast_value` —
+  pre-existing, separate item).
+
 - [ ] **OPEN — `test_tls_against_rust_server` flakes on the Windows runner
   (first seen 2026-08-29, PR #1089).** `storage-engine (windows-latest)` failed
   ONE of 86 tests with `ServerSelectionTimeoutError: No servers found yet,

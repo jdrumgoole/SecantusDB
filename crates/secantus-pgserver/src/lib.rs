@@ -205,6 +205,18 @@ impl PgHandler {
     /// ROWS are built in two different places that have to agree, or the
     /// client decodes binary bytes as text.
     fn field(&self, name: String, ty: Type) -> FieldInfo {
+        self.field_mod(name, ty, -1)
+    }
+
+    /// Like [`Self::field`], but carrying a declared type-modifier
+    /// (`atttypmod`) such as the `(10, 2)` of `numeric(10,2)` or the `(42)` of
+    /// `varchar(42)`.
+    ///
+    /// The modifier and the type's fixed byte width (`typlen`) travel in the
+    /// `RowDescription` so clients can report `precision` / `scale` /
+    /// `display_size` / `internal_size`. They describe the column, never the
+    /// value bytes, so this is description metadata only.
+    fn field_mod(&self, name: String, ty: Type, type_modifier: i32) -> FieldInfo {
         let binary = self
             .binary_results
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -214,7 +226,9 @@ impl PgHandler {
         } else {
             FieldFormat::Text
         };
-        FieldInfo::new(name, None, None, ty, format)
+        FieldInfo::new(name, None, None, ty.clone(), format)
+            .with_type_size(type_size(&ty))
+            .with_type_modifier(type_modifier)
     }
 
     /// Remember the result format a `Bind` asked for.
@@ -1685,8 +1699,30 @@ fn internal_type_name(ty: &Type) -> Option<String> {
     )
 }
 
+/// `pg_type.typlen` for a wire type: the fixed byte width PostgreSQL reports as
+/// a column's `type_size`, or -1 for a variable-length (varlena) type. Clients
+/// read it back as `internal_size`. Fixed-width types name themselves; every
+/// varlena type (text, numeric, bit, arrays, ranges, json, ...) is -1.
+fn type_size(ty: &Type) -> i16 {
+    match *ty {
+        Type::BOOL | Type::CHAR => 1,
+        Type::INT2 => 2,
+        Type::INT4 | Type::FLOAT4 | Type::DATE | Type::OID | Type::REGTYPE => 4,
+        Type::INT8 | Type::FLOAT8 | Type::TIME | Type::TIMESTAMP | Type::TIMESTAMPTZ => 8,
+        Type::TIMETZ => 12,
+        Type::INTERVAL | Type::UUID => 16,
+        Type::NAME => 64,
+        _ => -1,
+    }
+}
+
 fn wire_type(pg_type: &str) -> Type {
     match pg_type {
+        // Their own oids (1560 / 1562): a bit string is not a varchar, and a
+        // declared `bit(n)` / `varbit(n)` carries a length modifier clients
+        // read as `display_size`.
+        "bit" => Type::BIT,
+        "varbit" | "bit varying" => Type::VARBIT,
         "int2" => Type::INT2,
         "int4" | "integer" | "int" => Type::INT4,
         "int8" | "bigint" => Type::INT8,
@@ -2006,7 +2042,7 @@ impl PgHandler {
             Statement::SelectConstant(sc) => Ok(sc
                 .columns
                 .iter()
-                .map(|(name, _, ty)| {
+                .map(|(name, _, ty, _)| {
                     FieldInfo::new(name.clone(), None, None, wire_type(ty), FieldFormat::Text)
                 })
                 .collect()),
@@ -2059,7 +2095,7 @@ impl PgHandler {
     fn copy_query_rows(&self, inner: &Statement) -> PgWireResult<Vec<Vec<Option<Bson>>>> {
         if let Statement::SelectConstant(sc) = inner {
             let mut row = Vec::with_capacity(sc.columns.len());
-            for (_, col, _) in &sc.columns {
+            for (_, col, _, _) in &sc.columns {
                 row.push(Some(self.resolve_const_col(col)?));
             }
             return Ok(vec![row]);
@@ -3689,16 +3725,16 @@ impl PgHandler {
                 let schema = Arc::new(
                     sc.columns
                         .iter()
-                        .map(|(name, _, ty)| {
+                        .map(|(name, _, ty, typmod)| {
                             let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
-                            self.field(name.clone(), wire)
+                            self.field_mod(name.clone(), wire, *typmod)
                         })
                         .collect::<Vec<_>>(),
                 );
                 let values: Vec<Bson> = sc
                     .columns
                     .iter()
-                    .map(|(_, c, _)| self.resolve_const_col(c))
+                    .map(|(_, c, _, _)| self.resolve_const_col(c))
                     .collect::<PgWireResult<Vec<_>>>()?;
                 let schema_ref = schema.clone();
                 let rows = stream::iter(std::iter::once(values)).map(move |vals| {
@@ -5716,9 +5752,9 @@ impl PgHandler {
             Statement::SelectConstant(sc) => sc
                 .columns
                 .iter()
-                .map(|(name, _, ty)| {
+                .map(|(name, _, ty, typmod)| {
                     let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
-                    self.field(name.clone(), wire)
+                    self.field_mod(name.clone(), wire, *typmod)
                 })
                 .collect(),
             Statement::ValuesConstant(vc) => vc

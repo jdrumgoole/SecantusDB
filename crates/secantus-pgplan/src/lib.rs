@@ -593,13 +593,18 @@ pub struct ValuesConstant {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectConstant {
-    /// (output name, column, declared PostgreSQL type).
+    /// (output name, column, declared PostgreSQL type, type modifier).
     ///
     /// The type is carried EXPLICITLY rather than inferred from the value.
     /// `Describe` arrives before `Bind` and is planned against NULL
     /// placeholders, so inferring from the value typed `$1::int` as `varchar`
     /// and the client then decoded a perfectly good integer as a string.
-    pub columns: Vec<(String, ConstCol, String)>,
+    ///
+    /// The fourth element is the wire type-modifier (`atttypmod`) a declared
+    /// cast carries -- `varchar(10)` -> 14, `numeric(10,2)` -> 655366 -- or -1
+    /// for no modifier. It is DESCRIPTION metadata that clients turn into
+    /// `precision` / `scale` / `display_size`; it never affects the value.
+    pub columns: Vec<(String, ConstCol, String, i32)>,
 }
 
 /// The three wire formats a COPY can use. They are not interchangeable: text
@@ -971,6 +976,75 @@ fn type_name_of(t: &pg_query::protobuf::TypeName) -> String {
         base
     } else {
         format!("{base}[]")
+    }
+}
+
+/// The integer value of a `typmods` node. libpg_query renders a declared
+/// modifier -- including a negative scale like `numeric(2,-3)` -- as an
+/// `A_Const` integer literal directly, so no sign reconstruction is needed.
+fn typmod_ival(node: &pg_query::protobuf::Node) -> Option<i32> {
+    match node.node.as_ref()? {
+        N::AConst(c) => match c.val.as_ref()? {
+            pg_query::protobuf::a_const::Val::Ival(v) => Some(v.ival),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// PostgreSQL's wire type-modifier (`atttypmod`) for a declared cast type such
+/// as `varchar(10)` (-> 14) or `numeric(10,2)` (-> 655366), or `-1` for a bare
+/// type or one whose modifier this server does not encode.
+///
+/// DESCRIPTION metadata only: it feeds the `RowDescription`, from which clients
+/// derive `precision` / `scale` / `display_size`. It never changes how a value
+/// is decoded.
+fn cast_typmod(node: &pg_query::protobuf::Node) -> i32 {
+    let Some(N::TypeCast(tc)) = node.node.as_ref() else {
+        return -1;
+    };
+    let Some(tn) = tc.type_name.as_ref() else {
+        return -1;
+    };
+    let mods: Vec<i32> = tn.typmods.iter().filter_map(typmod_ival).collect();
+    // A modifier we could not read as an integer means no faithful typmod.
+    if mods.len() != tn.typmods.len() {
+        return -1;
+    }
+    match type_name(&tn.names).to_ascii_lowercase().as_str() {
+        // numeric(p,s): ((p << 16) | (s & 0x7FF)) + VARHDRSZ; bare precision
+        // implies scale 0. The low 11 bits hold a signed scale (PG15+).
+        "numeric" | "decimal" => match mods.as_slice() {
+            [p] => (p << 16) + 4,
+            [p, s] => ((p << 16) | (s & 0x7FF)) + 4,
+            _ => -1,
+        },
+        // varchar(n)/char(n): declared length plus the varlena header.
+        "varchar" | "character varying" | "bpchar" | "char" | "character" => {
+            match mods.as_slice() {
+                [n] => n + 4,
+                _ => -1,
+            }
+        }
+        // bit(n)/varbit(n): the length itself, no header.
+        "bit" | "varbit" => match mods.as_slice() {
+            [n] => *n,
+            _ => -1,
+        },
+        // time/timestamp precision is the whole modifier.
+        "time" | "timetz" | "timestamp" | "timestamptz" => match mods.as_slice() {
+            [p] => *p,
+            _ => -1,
+        },
+        // interval carries its typmod as [range-field mask, precision]:
+        // `interval(6)` is [32767, 6] packed as (range << 16) | precision. A
+        // lone precision (no field list) takes the full-range mask.
+        "interval" => match mods.as_slice() {
+            [range, prec] => (range << 16) | prec,
+            [prec] => (0x7FFF << 16) | prec,
+            _ => -1,
+        },
+        _ => -1,
     }
 }
 
@@ -2840,12 +2914,16 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
     if let Some(stmt) = plan_select_srf(s, params)? {
         return Ok(stmt);
     }
-    let mut columns: Vec<(String, ConstCol, String)> = Vec::new();
+    let mut columns: Vec<(String, ConstCol, String, i32)> = Vec::new();
     for t in &s.target_list {
         let Some(N::ResTarget(rt)) = t.node.as_ref() else {
             return Err(Error::Unsupported("this target".into()));
         };
-        let (default_name, value, pg_type) = match rt.val.as_ref().and_then(|v| v.node.as_ref()) {
+        let (default_name, value, pg_type, typmod) = match rt
+            .val
+            .as_ref()
+            .and_then(|v| v.node.as_ref())
+        {
             Some(N::FuncCall(f)) => {
                 let name = f
                     .funcname
@@ -2869,6 +2947,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                         },
                         ConstCol::Value(pg_typeof(f, params)?),
                         "regtype".to_string(),
+                        -1,
                     ));
                     continue;
                 }
@@ -2884,6 +2963,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                         },
                         ConstCol::Value(const_value(rt.val.as_ref().expect("checked"), params)?),
                         "regtype".to_string(),
+                        -1,
                     ));
                     continue;
                 }
@@ -2908,6 +2988,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                         },
                         ConstCol::Value(Bson::String(value)),
                         name.clone(),
+                        -1,
                     ));
                     continue;
                 }
@@ -2930,6 +3011,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                         },
                         ConstCol::Value(Bson::String(value)),
                         name.clone(),
+                        -1,
                     ));
                     continue;
                 }
@@ -2950,6 +3032,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                             },
                             ConstCol::Value(value),
                             t,
+                            -1,
                         ));
                         continue;
                     }
@@ -2968,6 +3051,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                         },
                         ConstCol::Value(regexp_replace(&args)?),
                         "text".to_string(),
+                        -1,
                     ));
                     continue;
                 }
@@ -2981,13 +3065,14 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                         },
                         col,
                         "text".to_string(),
+                        -1,
                     ));
                     continue;
                 }
                 let v = session_function(&name)
                     .ok_or_else(|| Error::Unsupported(format!("function {name}()")))?;
                 let t = inferred_type(&v).to_string();
-                (name, ConstCol::Value(v), t)
+                (name, ConstCol::Value(v), t, -1)
             }
             // `current_user` and friends parse as bare column refs, not calls.
             Some(N::ColumnRef(c)) => {
@@ -3003,7 +3088,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 let v =
                     session_function(&name).ok_or_else(|| Error::UndefinedColumn(name.clone()))?;
                 let t = inferred_type(&v).to_string();
-                (name, ConstCol::Value(v), t)
+                (name, ConstCol::Value(v), t, -1)
             }
             Some(
                 node @ (N::AConst(_)
@@ -3018,7 +3103,8 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 let v = const_value(rt.val.as_ref().expect("checked"), params)?;
                 let t = static_type(rt.val.as_ref().expect("checked"), &v);
                 let _ = node;
-                ("?column?".to_string(), ConstCol::Value(v), t)
+                let typmod = cast_typmod(rt.val.as_ref().expect("checked"));
+                ("?column?".to_string(), ConstCol::Value(v), t, typmod)
             }
             Some(other) => return Err(Error::Unsupported(disc(other))),
             None => return Err(Error::Unsupported("an empty target".into())),
@@ -3028,7 +3114,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
         } else {
             rt.name.clone()
         };
-        columns.push((out, value, pg_type));
+        columns.push((out, value, pg_type, typmod));
     }
     Ok(Statement::SelectConstant(SelectConstant { columns }))
 }

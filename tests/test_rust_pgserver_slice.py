@@ -420,6 +420,66 @@ def test_casts_carry_postgres_types_not_value_types(home: Path) -> None:
         assert exc.value.diag.sqlstate == "22P02"
 
 
+def test_row_description_carries_typmod_and_typlen(home: Path) -> None:
+    """A `RowDescription` reports each column's declared type-modifier
+    (`atttypmod`) and fixed byte width (`typlen`), which psycopg turns into
+    `precision` / `scale` / `display_size` / `internal_size`. Metadata only:
+    the modifier never changes how a value is decoded.
+
+    Measured against PostgreSQL 16 -- every fmod/fsize below is the exact wire
+    value the real server sends for the same `select null::<type>`.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+
+        # numeric(p, s): typmod = ((p << 16) | (s & 0x7FF)) + 4, typlen -1.
+        cur.execute("SELECT NULL::numeric(10,2)")
+        col = cur.description[0]
+        assert cur.pgresult.fmod(0) == 655366
+        assert cur.pgresult.fsize(0) == -1
+        assert (col.precision, col.scale) == (10, 2)
+        assert col.internal_size is None
+
+        # A negative scale (PostgreSQL 15+) rides the signed low 11 bits.
+        cur.execute("SELECT NULL::numeric(2,-3)")
+        assert cur.pgresult.fmod(0) == 133121
+        assert (cur.description[0].precision, cur.description[0].scale) == (2, -3)
+
+        # varchar(n): typmod = n + 4 (varlena header), typlen -1.
+        cur.execute("SELECT NULL::varchar(42)")
+        col = cur.description[0]
+        assert cur.pgresult.fmod(0) == 46
+        assert cur.pgresult.fsize(0) == -1
+        assert col.display_size == 42
+
+        # time(p): typmod = p, typlen 8 fixed.
+        cur.execute("SELECT NULL::time(6)")
+        col = cur.description[0]
+        assert cur.pgresult.fmod(0) == 6
+        assert cur.pgresult.fsize(0) == 8
+        assert col.precision == 6
+        assert col.internal_size == 8
+
+        # interval(p): typmod packs the full-range mask over the precision.
+        cur.execute("SELECT NULL::interval(2)")
+        assert cur.pgresult.fmod(0) == (0x7FFF << 16) | 2
+        assert cur.pgresult.fsize(0) == 16
+        assert cur.description[0].precision == 2
+
+        # bit(n) is its own oid (1560) with the length itself as the modifier.
+        cur.execute("SELECT NULL::bit(5)")
+        col = cur.description[0]
+        assert col.type_code == 1560
+        assert cur.pgresult.fmod(0) == 5
+        assert col.display_size == 5
+
+        # A fixed-width type with no modifier: typlen set, typmod -1.
+        cur.execute("SELECT NULL::int4")
+        assert cur.pgresult.fmod(0) == -1
+        assert cur.pgresult.fsize(0) == 4
+        assert cur.description[0].internal_size == 4
+
+
 def test_constant_expressions_match_postgres(home: Path) -> None:
     """Arithmetic, concatenation and comparison in a SELECT list.
 
