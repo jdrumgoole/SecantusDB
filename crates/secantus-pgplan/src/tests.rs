@@ -472,7 +472,10 @@ fn an_unbound_parameter_is_42p02() {
 #[test]
 fn transaction_statements_are_planned() {
     for (sql, want) in [
-        ("BEGIN", TransactionControl::Begin(TransactionModes::default())),
+        (
+            "BEGIN",
+            TransactionControl::Begin(TransactionModes::default()),
+        ),
         // `START TRANSACTION` is `BEGIN` with a different command tag, so it
         // is a different variant rather than the same one.
         (
