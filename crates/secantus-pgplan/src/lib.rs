@@ -219,6 +219,16 @@ pub enum Statement {
     },
     /// `RESET name` / `RESET ALL`.
     Reset(String),
+    /// `SET TRANSACTION <modes>` -- the characteristics of the CURRENT
+    /// transaction (isolation level / read-write mode / deferrable). Reflected
+    /// in `transaction_isolation` / `transaction_read_only` /
+    /// `transaction_deferrable` for the life of the block.
+    SetTransaction(TransactionModes),
+    /// `SET SESSION CHARACTERISTICS AS TRANSACTION <modes>` -- the session
+    /// DEFAULT for new transactions, reflected in the `default_transaction_*`
+    /// GUCs (and, when not inside an explicit block, the `transaction_*` GUCs
+    /// too, since the next implicit statement inherits the new default).
+    SetSessionCharacteristics(TransactionModes),
     /// `DECLARE <name> CURSOR FOR <query>`.
     ///
     /// The inner query is planned here and executed at DECLARE time, because a
@@ -501,10 +511,13 @@ pub struct JoinSelect {
 /// pretending would silently lose the semantics a client is relying on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransactionControl {
-    Begin,
+    /// `modes` are the transaction characteristics tacked onto the statement
+    /// (`BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE`), which set
+    /// the `transaction_*` GUCs for the life of the block.
+    Begin(TransactionModes),
     /// `START TRANSACTION`, which does exactly what `BEGIN` does and differs
-    /// only in the command tag it answers with.
-    Start,
+    /// only in the command tag it answers with. Carries the same modes.
+    Start(TransactionModes),
     /// `chain` is `AND CHAIN`: the block ends and another opens immediately,
     /// so the connection is still in a transaction afterwards.
     Commit {
@@ -520,6 +533,72 @@ pub enum TransactionControl {
     /// `ROLLBACK TO [SAVEPOINT] <name>`: undo everything written since it, and
     /// leave the savepoint itself open.
     RollbackTo(String),
+}
+
+/// The transaction characteristics on a `BEGIN` / `START TRANSACTION` /
+/// `SET TRANSACTION` / `SET SESSION CHARACTERISTICS AS TRANSACTION` statement.
+///
+/// Each field is `None` when the statement did not name it, so an omitted mode
+/// inherits the session default rather than forcing a value. This server is
+/// single-node and does not truly enforce isolation levels -- it accepts them
+/// and reflects them in the `transaction_*` / `default_transaction_*` GUCs so a
+/// client (e.g. psycopg reading `current_setting('transaction_isolation')`)
+/// sees exactly what it set.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TransactionModes {
+    /// The canonical GUC spelling of the isolation level -- `"serializable"`,
+    /// `"repeatable read"`, `"read committed"`, `"read uncommitted"`.
+    pub isolation: Option<String>,
+    /// `READ ONLY` -> `Some(true)`, `READ WRITE` -> `Some(false)`.
+    pub read_only: Option<bool>,
+    /// `DEFERRABLE` -> `Some(true)`, `NOT DEFERRABLE` -> `Some(false)`.
+    pub deferrable: Option<bool>,
+}
+
+/// Parse a list of `DefElem` nodes (the `options` of a `TransactionStmt` or the
+/// `args` of a `SET TRANSACTION` / `SET SESSION CHARACTERISTICS` statement) into
+/// `TransactionModes`. Unknown DefElems (e.g. `TRANSACTION SNAPSHOT`) are
+/// ignored -- they carry no isolation/read-only/deferrable characteristic this
+/// server reflects.
+fn parse_transaction_modes(nodes: &[pg_query::protobuf::Node]) -> TransactionModes {
+    let mut modes = TransactionModes::default();
+    for node in nodes {
+        let Some(N::DefElem(d)) = node.node.as_ref() else {
+            continue;
+        };
+        match d.defname.as_str() {
+            "transaction_isolation" => {
+                if let Some(arg) = d.arg.as_ref() {
+                    if let Some(N::AConst(c)) = arg.node.as_ref() {
+                        if let Some(pg_query::protobuf::a_const::Val::Sval(s)) = c.val.as_ref() {
+                            modes.isolation = Some(s.sval.to_ascii_lowercase());
+                        }
+                    }
+                }
+            }
+            "transaction_read_only" => modes.read_only = Some(def_elem_bool(d)),
+            "transaction_deferrable" => modes.deferrable = Some(def_elem_bool(d)),
+            _ => {}
+        }
+    }
+    modes
+}
+
+/// A `DefElem` whose arg is an `A_Const` integer used as a boolean
+/// (`transaction_read_only` / `transaction_deferrable`): PostgreSQL renders
+/// `READ ONLY` / `DEFERRABLE` as integer `1` and their negations as `0`.
+fn def_elem_bool(d: &pg_query::protobuf::DefElem) -> bool {
+    d.arg
+        .as_ref()
+        .and_then(|arg| match arg.node.as_ref()? {
+            N::AConst(c) => match c.val.as_ref()? {
+                pg_query::protobuf::a_const::Val::Ival(v) => Some(v.ival != 0),
+                pg_query::protobuf::a_const::Val::Boolval(b) => Some(b.boolval),
+                _ => None,
+            },
+            _ => None,
+        })
+        .unwrap_or(false)
 }
 
 /// `SELECT <items>` with no FROM: one row, computed without touching storage.
@@ -884,12 +963,12 @@ pub fn plan_with_params(
         N::TransactionStmt(t) => {
             // Named enum, not the wire integer -- twice bitten already.
             match TransactionStmtKind::try_from(t.kind) {
-                Ok(TransactionStmtKind::TransStmtBegin) => {
-                    Ok(Statement::Transaction(TransactionControl::Begin))
-                }
-                Ok(TransactionStmtKind::TransStmtStart) => {
-                    Ok(Statement::Transaction(TransactionControl::Start))
-                }
+                Ok(TransactionStmtKind::TransStmtBegin) => Ok(Statement::Transaction(
+                    TransactionControl::Begin(parse_transaction_modes(&t.options)),
+                )),
+                Ok(TransactionStmtKind::TransStmtStart) => Ok(Statement::Transaction(
+                    TransactionControl::Start(parse_transaction_modes(&t.options)),
+                )),
                 Ok(TransactionStmtKind::TransStmtCommit) => {
                     Ok(Statement::Transaction(TransactionControl::Commit {
                         chain: t.chain,
@@ -6474,6 +6553,13 @@ fn guc_function(
                 missing_ok,
             }))
         }
+        // A NULL setting name folds to NULL, not an error -- during a DESCRIBE
+        // the value parameters are still unbound, so the name argument arrives
+        // as NULL and must not blow up the plan (mirrors `current_setting`,
+        // which psycopg's transaction-parameter tests exercise the same way).
+        "set_config" if f.args.len() == 3 && const_value(&f.args[0], params)? == Bson::Null => {
+            Ok(Some(ConstCol::Value(Bson::Null)))
+        }
         "set_config" if f.args.len() == 3 => Ok(Some(ConstCol::SetConfig {
             name: text_arg(0)?,
             value: const_value(&f.args[1], params)?,
@@ -6578,6 +6664,19 @@ fn plan_set(v: &pg_query::protobuf::VariableSetStmt) -> Result<Statement> {
         Ok(VariableSetKind::VarReset) => return Ok(Statement::Reset(v.name.clone())),
         Ok(VariableSetKind::VarResetAll) => return Ok(Statement::Reset(String::new())),
         Ok(VariableSetKind::VarSetValue | VariableSetKind::VarSetDefault) => {}
+        // `SET TRANSACTION ...` and `SET SESSION CHARACTERISTICS AS TRANSACTION
+        // ...` are both VAR_SET_MULTI: the name distinguishes them and the args
+        // are DefElem characteristics rather than plain values.
+        Ok(VariableSetKind::VarSetMulti) => {
+            let modes = parse_transaction_modes(&v.args);
+            return match v.name.as_str() {
+                "TRANSACTION" => Ok(Statement::SetTransaction(modes)),
+                "SESSION CHARACTERISTICS" => Ok(Statement::SetSessionCharacteristics(modes)),
+                // `SET TRANSACTION SNAPSHOT` and any other multi form this
+                // server does not model.
+                _ => Err(Error::Unsupported("this SET form".into())),
+            };
+        }
         _ => return Err(Error::Unsupported("this SET form".into())),
     }
     // The value is one or more A_Const / TypeName items; render them as the

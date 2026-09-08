@@ -604,6 +604,122 @@ def test_session_settings(home: Path) -> None:
             cur.execute("SELECT current_setting('my.y')")
 
 
+def test_transaction_characteristics_reflected_in_gucs(home: Path) -> None:
+    """`BEGIN <modes>` sets the `transaction_*` GUCs for the block.
+
+    Values checked against a live PostgreSQL 14: inside the block the GUCs
+    reflect the requested characteristics, and after the block ends they revert
+    to the session `default_transaction_*`.
+    """
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE")
+        cur.execute(
+            "SELECT current_setting('transaction_isolation'), "
+            "current_setting('transaction_read_only'), "
+            "current_setting('transaction_deferrable')"
+        )
+        assert cur.fetchone() == ("serializable", "on", "on")
+        cur.execute("COMMIT")
+
+        # After the block, the transaction GUCs are back to the defaults.
+        cur.execute(
+            "SELECT current_setting('transaction_isolation'), "
+            "current_setting('transaction_read_only'), "
+            "current_setting('transaction_deferrable')"
+        )
+        assert cur.fetchone() == ("read committed", "off", "off")
+
+
+def test_set_transaction_inside_a_block(home: Path) -> None:
+    """`SET TRANSACTION <modes>` sets the current block's characteristics.
+
+    It answers the `SET` command tag and is reflected in the `transaction_*`
+    GUCs until the block ends (checked against PostgreSQL 14).
+    """
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        cur = conn.cursor()
+        cur.execute("BEGIN")
+        cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        assert cur.statusmessage == "SET"
+        cur.execute(
+            "SELECT current_setting('transaction_isolation'), "
+            "current_setting('transaction_read_only')"
+        )
+        assert cur.fetchone() == ("repeatable read", "on")
+        cur.execute("ROLLBACK")
+        cur.execute("SELECT current_setting('transaction_isolation')")
+        assert cur.fetchone()[0] == "read committed"
+
+
+def test_set_session_characteristics_sets_the_default(home: Path) -> None:
+    """`SET SESSION CHARACTERISTICS AS TRANSACTION <modes>` sets the default.
+
+    Outside a block the current `transaction_*` GUCs move with the default, so
+    a client reads back its choice immediately (checked against PostgreSQL 14).
+    """
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        cur = conn.cursor()
+        cur.execute("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+        assert cur.statusmessage == "SET"
+        cur.execute(
+            "SELECT current_setting('default_transaction_isolation'), "
+            "current_setting('transaction_isolation')"
+        )
+        assert cur.fetchone() == ("serializable", "serializable")
+
+
+def test_set_config_with_a_bound_parameter(home: Path) -> None:
+    """`set_config($1, $2, false)` over the extended protocol round-trips.
+
+    psycopg's transaction-parameter tests call `set_config` with the name and
+    value as bound parameters. During the DESCRIBE the value parameters are
+    still unbound, so the name argument arrives as NULL -- the plan must fold
+    that to NULL rather than error, and the EXECUTE with real values must set
+    the GUC.
+    """
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT set_config(%s, %s, false)",
+            ["default_transaction_isolation", "serializable"],
+        )
+        assert cur.fetchone()[0] == "serializable"
+        cur.execute("SELECT current_setting('default_transaction_isolation')")
+        assert cur.fetchone()[0] == "serializable"
+
+
+def test_psycopg_transaction_parameters_round_trip(home: Path) -> None:
+    """psycopg's own `.isolation_level` / `.read_only` / `.deferrable`.
+
+    On a non-autocommit connection psycopg emits `BEGIN <modes>` before the
+    first statement of each transaction, so the block reflects the client's
+    choice and reverts on rollback.
+    """
+    with _Server(home) as server, server.connect(autocommit=False) as conn:
+        conn.isolation_level = psycopg.IsolationLevel.SERIALIZABLE.value
+        conn.read_only = True
+        conn.deferrable = True
+        cur = conn.execute(
+            "SELECT current_setting('transaction_isolation'), "
+            "current_setting('transaction_read_only'), "
+            "current_setting('transaction_deferrable')"
+        )
+        assert cur.fetchone() == ("serializable", "on", "on")
+        conn.rollback()
+
+        conn.isolation_level = None
+        conn.read_only = None
+        conn.deferrable = None
+        cur = conn.execute(
+            "SELECT current_setting('transaction_isolation'), "
+            "current_setting('transaction_read_only'), "
+            "current_setting('transaction_deferrable')"
+        )
+        assert cur.fetchone() == ("read committed", "off", "off")
+        conn.rollback()
+
+
 def test_copy_from_stdin(home: Path) -> None:
     """`COPY ... FROM STDIN` in PostgreSQL's text format.
 
