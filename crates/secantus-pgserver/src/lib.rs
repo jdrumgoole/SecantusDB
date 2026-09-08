@@ -317,7 +317,184 @@ impl PgHandler {
     /// exists for are dozens of rows. The ON and WHERE equalities compare
     /// NUMERICALLY across int widths and unwrap a regtype to its oid, because
     /// `t.oid = to_regtype(...)` is the shape every caller sends.
+    /// The grouped, ordered aggregate result: (group key, computed values) per
+    /// group, positional. Shared by the Aggregate response arm (which encodes
+    /// positionally) and `aggregate_rows` (which keys by output name for a join
+    /// subquery side).
+    #[allow(clippy::type_complexity)]
+    fn aggregate_groups(
+        &self,
+        agg: &secantus_pgplan::Aggregate,
+        max_rows: usize,
+    ) -> PgWireResult<Vec<(Vec<Option<Bson>>, Vec<Bson>)>> {
+        let docs: Vec<Document> = match &agg.series {
+            Some(series) => series
+                .values()
+                .into_iter()
+                .map(|v| {
+                    let mut d = Document::new();
+                    d.insert(series.column.clone(), Bson::Int32(v as i32));
+                    d
+                })
+                .collect(),
+            // A virtual table's rows are computed, not read: without
+            // this arm `count(*) from pg_type` fell through to storage,
+            // found no such collection, and answered 0 -- the right
+            // shape and the wrong number, which no error would flag.
+            // A joined subquery's rows, already keyed by output name.
+            _ if agg.join.is_some() => self.join_docs(agg.join.as_ref().expect("checked"))?,
+            None if Self::virtual_table(&agg.table).is_some() => {
+                self.virtual_rows(&agg.table, &agg.filter).expect("checked")
+            }
+            None => {
+                let raw = self
+                    .storage
+                    .find_matching(&self.db, &agg.table, &agg.filter)
+                    .map_err(|e| Self::storage_err("could not read", e))?;
+                raw.iter()
+                    .map(|b| bson::from_slice(b))
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| Self::storage_err("could not decode a row", e))?
+            }
+        };
+
+        // Group, preserving first-seen order so output is deterministic
+        // even with no ORDER BY.
+        let mut keys: Vec<Vec<Option<Bson>>> = Vec::new();
+        let mut buckets: Vec<Vec<Document>> = Vec::new();
+        if agg.group_by.is_empty() {
+            keys.push(Vec::new());
+            buckets.push(docs);
+        } else {
+            for d in docs {
+                // NULL forms its OWN group in PostgreSQL, so a missing
+                // or null key is a real key rather than a skip.
+                let key: Vec<Option<Bson>> = agg
+                    .group_by
+                    .iter()
+                    .map(|(_, f)| match d.get(f) {
+                        None | Some(Bson::Null) => None,
+                        Some(v) => Some(v.clone()),
+                    })
+                    .collect();
+                match keys.iter().position(|k| *k == key) {
+                    Some(i) => buckets[i].push(d),
+                    None => {
+                        keys.push(key);
+                        buckets.push(vec![d]);
+                    }
+                }
+            }
+        }
+
+        // (group key, computed aggregates) per group. Kept POSITIONAL:
+        // `SELECT count(*), count(n)` yields two columns both named
+        // `count`, so a name-keyed row silently drops one.
+        let mut groups: Vec<(Vec<Option<Bson>>, Vec<Bson>)> = keys
+            .iter()
+            .zip(buckets.iter())
+            .map(|(k, bucket)| {
+                let vals = agg
+                    .items
+                    .iter()
+                    .map(|item| compute_aggregate(item, bucket))
+                    .collect();
+                (k.clone(), vals)
+            })
+            .collect();
+
+        // Sort on the GROUP KEY, by index -- so `GROUP BY s ORDER BY s`
+        // works even when `s` is not projected.
+        if !agg.order.is_empty() {
+            groups.sort_by(|a, b| {
+                for key in &agg.order {
+                    let (l, r) = (&a.0[key.group_index], &b.0[key.group_index]);
+                    let ord = match (l, r) {
+                        (None, None) => Ordering::Equal,
+                        (None, Some(_)) => match key.nulls {
+                            Nulls::First => Ordering::Less,
+                            Nulls::Last => Ordering::Greater,
+                        },
+                        (Some(_), None) => match key.nulls {
+                            Nulls::First => Ordering::Greater,
+                            Nulls::Last => Ordering::Less,
+                        },
+                        (Some(x), Some(y)) => {
+                            let c = compare_values(x, y);
+                            if key.ascending {
+                                c
+                            } else {
+                                c.reverse()
+                            }
+                        }
+                    };
+                    if ord != Ordering::Equal {
+                        return ord;
+                    }
+                }
+                Ordering::Equal
+            });
+        }
+        if agg.offset > 0 {
+            let skip = usize::try_from(agg.offset).unwrap_or(usize::MAX);
+            groups = groups.into_iter().skip(skip).collect();
+        }
+        if let Some(limit) = agg.limit {
+            groups.truncate(usize::try_from(limit.max(0)).unwrap_or(usize::MAX));
+        }
+        if max_rows > 0 {
+            groups.truncate(max_rows);
+        }
+        Ok(groups)
+    }
+
+    /// An aggregate's output rows as documents keyed by OUTPUT column name, for
+    /// materialising a join subquery side. (Distinct output names are assumed --
+    /// true for the catalog introspection queries this serves.)
+    fn aggregate_rows(&self, agg: &secantus_pgplan::Aggregate) -> PgWireResult<Vec<Document>> {
+        use secantus_pgplan::OutputCol;
+        let groups = self.aggregate_groups(agg, 0)?;
+        let mut out = Vec::with_capacity(groups.len());
+        for (key, vals) in groups {
+            let mut doc = Document::new();
+            for (name, col) in &agg.select {
+                let v = match col {
+                    OutputCol::Group(i) => key[*i].clone().unwrap_or(Bson::Null),
+                    OutputCol::Agg(i) => vals[*i].clone(),
+                };
+                doc.insert(name.clone(), v);
+            }
+            out.push(doc);
+        }
+        Ok(out)
+    }
+
+    /// Materialise a JOIN subquery side (`... JOIN (SELECT ...) a`) to rows.
+    /// Only the shapes the planner emits as a `*_sub` are reachable here (an
+    /// aggregate subquery today); anything else is a planner/executor mismatch.
+    fn sub_plan_rows(&self, stmt: &Statement) -> PgWireResult<Vec<Document>> {
+        match stmt {
+            Statement::Aggregate(agg) => self.aggregate_rows(agg),
+            _ => Err(Self::err(&PlanError::Unsupported(
+                "this JOIN subquery shape".into(),
+            ))),
+        }
+    }
+
     fn join_docs(&self, join: &secantus_pgplan::JoinSelect) -> PgWireResult<Vec<Document>> {
+        self.join_docs_with(join, None, None)
+    }
+
+    /// `join_docs` with optional pre-materialised rows for a side that is a
+    /// SUBQUERY (`... JOIN (SELECT ...) a`) rather than a table -- those rows
+    /// are keyed by the sub-plan's OUTPUT names, so the side's "field" is the
+    /// column name itself. A table side (rows `None`) reads from `table_docs`.
+    fn join_docs_with(
+        &self,
+        join: &secantus_pgplan::JoinSelect,
+        left_rows: Option<Vec<Document>>,
+        right_rows: Option<Vec<Document>>,
+    ) -> PgWireResult<Vec<Document>> {
         let eq = |a: &Bson, b: &Bson| -> bool {
             let num = |v: &Bson| -> Option<i64> {
                 secantus_pgplan::regtype_oid(v).or(match v {
@@ -337,8 +514,30 @@ impl PgHandler {
                 .ok_or_else(|| Self::err(&PlanError::UndefinedColumn(col.to_string())))
         };
 
-        let mut left_rows = self.table_docs(&join.left.0)?;
-        let mut right_rows = self.table_docs(&join.right.0)?;
+        let left_is_sub = join.left_sub.is_some();
+        let right_is_sub = join.right_sub.is_some();
+        let lfield = |col: &str| -> PgWireResult<String> {
+            if left_is_sub {
+                Ok(col.to_string())
+            } else {
+                field_of(&join.left.0, col)
+            }
+        };
+        let rfield = |col: &str| -> PgWireResult<String> {
+            if right_is_sub {
+                Ok(col.to_string())
+            } else {
+                field_of(&join.right.0, col)
+            }
+        };
+        let mut left_rows = match left_rows {
+            Some(r) => r,
+            None => self.table_docs(&join.left.0)?,
+        };
+        let mut right_rows = match right_rows {
+            Some(r) => r,
+            None => self.table_docs(&join.right.0)?,
+        };
 
         // WHERE predicates bind to whichever side each alias names; applying
         // them before the join is correct and keeps the nested loop trivial. A
@@ -351,8 +550,11 @@ impl PgHandler {
         use secantus_pgplan::JoinOp;
         for pred in &join.filter {
             let on_left = pred.alias == join.left.1;
-            let side_table = if on_left { &join.left.0 } else { &join.right.0 };
-            let field = field_of(side_table, &pred.col)?;
+            let field = if on_left {
+                lfield(&pred.col)?
+            } else {
+                rfield(&pred.col)?
+            };
             let value = pred.value.clone();
             let op = pred.op.clone();
             let keep = move |d: &Document| -> bool {
@@ -386,15 +588,9 @@ impl PgHandler {
         let (l_on, r_on) = {
             let (a, b) = (&join.on.0, &join.on.1);
             if a.0 == join.left.1 {
-                (
-                    field_of(&join.left.0, &a.1)?,
-                    field_of(&join.right.0, &b.1)?,
-                )
+                (lfield(&a.1)?, rfield(&b.1)?)
             } else {
-                (
-                    field_of(&join.left.0, &b.1)?,
-                    field_of(&join.right.0, &a.1)?,
-                )
+                (lfield(&b.1)?, rfield(&a.1)?)
             }
         };
 
@@ -420,25 +616,37 @@ impl PgHandler {
             for r in rights {
                 let mut doc = Document::new();
                 for (i, (out_name, alias, col)) in join.columns.iter().enumerate() {
-                    let value = if *alias == join.left.1
-                        || (*alias != join.right.1
-                            && self
-                                .lookup(&join.left.0)
-                                .is_some_and(|d| d.column(col).is_some()))
-                    {
-                        let f = field_of(&join.left.0, col)?;
+                    let on_left = if *alias == join.left.1 {
+                        true
+                    } else if *alias == join.right.1 || left_is_sub {
+                        // A named right alias, or an unaliased column when the
+                        // left side is a subquery (whose columns we cannot probe
+                        // by name), resolves to the right.
+                        false
+                    } else {
+                        self.lookup(&join.left.0)
+                            .is_some_and(|d| d.column(col).is_some())
+                    };
+                    let value = if on_left {
+                        let f = lfield(col)?;
                         l.get(&f).cloned().unwrap_or(Bson::Null)
                     } else {
                         match r {
                             Some(r) => {
-                                let f = field_of(&join.right.0, col)?;
+                                let f = rfield(col)?;
                                 r.get(&f).cloned().unwrap_or(Bson::Null)
                             }
                             None => Bson::Null,
                         }
                     };
+                    // Most column exprs (cast chains, scalar calls) no-op on a
+                    // NULL and are skipped; COALESCE is the exception -- a
+                    // LEFT-JOIN miss is exactly the NULL it must replace.
                     let value = match join.exprs.get(i).and_then(|e| e.as_ref()) {
-                        Some(expr) if value != Bson::Null => {
+                        Some(expr)
+                            if value != Bson::Null
+                                || matches!(expr, secantus_pgplan::ColumnExpr::Coalesce { .. }) =>
+                        {
                             secantus_pgplan::apply_column_expr(expr, value, &tz)
                                 .map_err(|e| PgHandler::err(&e))?
                         }
@@ -451,12 +659,12 @@ impl PgHandler {
                 // projection that does not include it.
                 if let Some((alias, col, _)) = &join.order {
                     let value = if *alias == join.left.1 {
-                        let f = field_of(&join.left.0, col)?;
+                        let f = lfield(col)?;
                         l.get(&f).cloned().unwrap_or(Bson::Null)
                     } else {
                         match r {
                             Some(r) => {
-                                let f = field_of(&join.right.0, col)?;
+                                let f = rfield(col)?;
                                 r.get(&f).cloned().unwrap_or(Bson::Null)
                             }
                             None => Bson::Null,
@@ -571,6 +779,32 @@ impl PgHandler {
         }
         out.sort();
         Ok(out)
+    }
+
+    /// A type name's oid, resolving BUILTINS first, then user types
+    /// (composites, enums, ranges). A composite field whose type is itself a
+    /// user type -- `CREATE TYPE t AS (sub other_composite)` -- resolves here;
+    /// the builtin-only lookup dropped it from `pg_attribute`.
+    fn type_oid_by_name(&self, name: &str) -> Option<i64> {
+        if let Some(oid) = secantus_pgplan::pgtypes::oid_of_name(name) {
+            return Some(oid);
+        }
+        if let Ok(cs) = self.composites() {
+            if let Some((_, oid, _)) = cs.iter().find(|(n, _, _)| n == name) {
+                return Some(*oid);
+            }
+        }
+        if let Ok(es) = self.enums() {
+            if let Some((_, oid, _)) = es.iter().find(|(n, _, _)| n == name) {
+                return Some(*oid);
+            }
+        }
+        if let Ok(rs) = self.ranges() {
+            if let Some((_, oid, _)) = rs.iter().find(|(n, _, _)| n == name) {
+                return Some(*oid);
+            }
+        }
+        None
     }
 
     /// Mint the next range-type oid -- the enum minting rule, base 69000.
@@ -884,7 +1118,7 @@ impl PgHandler {
                 let mut rows = Vec::new();
                 for (_, oid, fields) in self.composites().ok()? {
                     for (i, (fname, ftype)) in fields.iter().enumerate() {
-                        let Some(atttypid) = secantus_pgplan::pgtypes::oid_of_name(ftype) else {
+                        let Some(atttypid) = self.type_oid_by_name(ftype) else {
                             continue;
                         };
                         let mut d = Document::new();
@@ -1247,6 +1481,10 @@ fn wire_type(pg_type: &str) -> Type {
         "uuid[]" => Type::UUID_ARRAY,
         "bpchar[]" | "char[]" | "character[]" => Type::BPCHAR_ARRAY,
         "name[]" => Type::NAME_ARRAY,
+        // `array_agg(atttypid)` is an `oid[]` -- without this arm it fell to
+        // varchar, so psycopg's `CompositeInfo.fetch` read `field_types` back as
+        // the raw string `"{23,25}"` instead of a list of oids.
+        "oid[]" => Type::OID_ARRAY,
         // Everything else renders as text for now; P4 owns the real type map.
         _ => Type::VARCHAR,
     }
@@ -2381,7 +2619,18 @@ impl PgHandler {
                     // A top-level JOIN source: materialise it, treat its
                     // output columns as the table.
                     (_, Some(join)) => {
-                        let docs = self.join_docs(join)?;
+                        // A subquery join side is materialised first (its rows
+                        // keyed by the sub-plan's output names); a table side
+                        // stays `None` and `join_docs_with` reads it itself.
+                        let left_rows = match &join.left_sub {
+                            Some(stmt) => Some(self.sub_plan_rows(stmt)?),
+                            None => None,
+                        };
+                        let right_rows = match &join.right_sub {
+                            Some(stmt) => Some(self.sub_plan_rows(stmt)?),
+                            None => None,
+                        };
+                        let docs = self.join_docs_with(join, left_rows, right_rows)?;
                         let def = secantus_pgplan::join_output_def(join, &|n| self.lookup(n))
                             .map_err(|e| Self::err(&e))?;
                         (docs, def)
@@ -3009,126 +3258,7 @@ impl PgHandler {
                 // A generated source, as for a plain SELECT: the grouping and
                 // accumulation below work on documents and do not care where
                 // they came from.
-                let docs: Vec<Document> = match &agg.series {
-                    Some(series) => series
-                        .values()
-                        .into_iter()
-                        .map(|v| {
-                            let mut d = Document::new();
-                            d.insert(series.column.clone(), Bson::Int32(v as i32));
-                            d
-                        })
-                        .collect(),
-                    // A virtual table's rows are computed, not read: without
-                    // this arm `count(*) from pg_type` fell through to storage,
-                    // found no such collection, and answered 0 -- the right
-                    // shape and the wrong number, which no error would flag.
-                    // A joined subquery's rows, already keyed by output name.
-                    _ if agg.join.is_some() => {
-                        self.join_docs(agg.join.as_ref().expect("checked"))?
-                    }
-                    None if Self::virtual_table(&agg.table).is_some() => {
-                        self.virtual_rows(&agg.table, &agg.filter).expect("checked")
-                    }
-                    None => {
-                        let raw = self
-                            .storage
-                            .find_matching(&self.db, &agg.table, &agg.filter)
-                            .map_err(|e| Self::storage_err("could not read", e))?;
-                        raw.iter()
-                            .map(|b| bson::from_slice(b))
-                            .collect::<Result<_, _>>()
-                            .map_err(|e| Self::storage_err("could not decode a row", e))?
-                    }
-                };
-
-                // Group, preserving first-seen order so output is deterministic
-                // even with no ORDER BY.
-                let mut keys: Vec<Vec<Option<Bson>>> = Vec::new();
-                let mut buckets: Vec<Vec<Document>> = Vec::new();
-                if agg.group_by.is_empty() {
-                    keys.push(Vec::new());
-                    buckets.push(docs);
-                } else {
-                    for d in docs {
-                        // NULL forms its OWN group in PostgreSQL, so a missing
-                        // or null key is a real key rather than a skip.
-                        let key: Vec<Option<Bson>> = agg
-                            .group_by
-                            .iter()
-                            .map(|(_, f)| match d.get(f) {
-                                None | Some(Bson::Null) => None,
-                                Some(v) => Some(v.clone()),
-                            })
-                            .collect();
-                        match keys.iter().position(|k| *k == key) {
-                            Some(i) => buckets[i].push(d),
-                            None => {
-                                keys.push(key);
-                                buckets.push(vec![d]);
-                            }
-                        }
-                    }
-                }
-
-                // (group key, computed aggregates) per group. Kept POSITIONAL:
-                // `SELECT count(*), count(n)` yields two columns both named
-                // `count`, so a name-keyed row silently drops one.
-                let mut groups: Vec<(Vec<Option<Bson>>, Vec<Bson>)> = keys
-                    .iter()
-                    .zip(buckets.iter())
-                    .map(|(k, bucket)| {
-                        let vals = agg
-                            .items
-                            .iter()
-                            .map(|item| compute_aggregate(item, bucket))
-                            .collect();
-                        (k.clone(), vals)
-                    })
-                    .collect();
-
-                // Sort on the GROUP KEY, by index -- so `GROUP BY s ORDER BY s`
-                // works even when `s` is not projected.
-                if !agg.order.is_empty() {
-                    groups.sort_by(|a, b| {
-                        for key in &agg.order {
-                            let (l, r) = (&a.0[key.group_index], &b.0[key.group_index]);
-                            let ord = match (l, r) {
-                                (None, None) => Ordering::Equal,
-                                (None, Some(_)) => match key.nulls {
-                                    Nulls::First => Ordering::Less,
-                                    Nulls::Last => Ordering::Greater,
-                                },
-                                (Some(_), None) => match key.nulls {
-                                    Nulls::First => Ordering::Greater,
-                                    Nulls::Last => Ordering::Less,
-                                },
-                                (Some(x), Some(y)) => {
-                                    let c = compare_values(x, y);
-                                    if key.ascending {
-                                        c
-                                    } else {
-                                        c.reverse()
-                                    }
-                                }
-                            };
-                            if ord != Ordering::Equal {
-                                return ord;
-                            }
-                        }
-                        Ordering::Equal
-                    });
-                }
-                if agg.offset > 0 {
-                    let skip = usize::try_from(agg.offset).unwrap_or(usize::MAX);
-                    groups = groups.into_iter().skip(skip).collect();
-                }
-                if let Some(limit) = agg.limit {
-                    groups.truncate(usize::try_from(limit.max(0)).unwrap_or(usize::MAX));
-                }
-                if max_rows > 0 {
-                    groups.truncate(max_rows);
-                }
+                let groups = self.aggregate_groups(&agg, max_rows)?;
 
                 // A generated source has no table to look up; its one column
                 // is an int4.
