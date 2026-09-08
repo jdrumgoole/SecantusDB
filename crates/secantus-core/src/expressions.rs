@@ -3601,6 +3601,17 @@ fn trig_operand_repr(value: &Bson, x: f64) -> String {
 fn op_trig(arg: &Bson, ctx: &Ctx, kind: Trig) -> R {
     use Trig::*;
     let value = eval(arg, ctx)?;
+    // `$asinh` of a DECIMAL is computed in decimal, and must not reach the
+    // `f64` classification below -- that SATURATES, so a finite
+    // `Decimal128("1E+6144")` reads as an infinity and would be answered with
+    // the operator's limit instead of `14147.77595853597662791595672970219`.
+    // The other operators here still take the f64 route and still defer on a
+    // finite decimal; only this one has a series behind it.
+    if matches!(kind, Asinh) && matches!(value, Bson::Decimal128(_)) {
+        let d = crate::decimal::parse(&value.to_string()).ok_or(Fallback::Defer)?;
+        let r = crate::decimal::asinh(&d).ok_or(Fallback::Defer)?;
+        return crate::decimal::to_bson(&r).ok_or(Fallback::Defer);
+    }
     let x = match &value {
         Bson::Null => return Ok(Bson::Null),
         Bson::Int32(n) => *n as f64,
@@ -6063,6 +6074,10 @@ fn op_exp(arg: &Bson, ctx: &Ctx) -> R {
                 {
                     let digits = coeff.iter().skip_while(|c| **c == 0).count();
                     let adjusted = exp + digits as i32 - 1;
+                    // Two regions answered without a series -- and the series
+                    // must not see them: `e^x` past `x ~ 14149.9` has no
+                    // decimal128 result to compute, and below `1E-40` the whole
+                    // answer is the leading 1.
                     if adjusted >= 5 {
                         return if sign < 0 {
                             decimal_from_text("0E-6176")
@@ -6074,6 +6089,9 @@ fn op_exp(arg: &Bson, ctx: &Ctx) -> R {
                         return decimal_from_text("1");
                     }
                 }
+                let d = crate::decimal::parse(&v.to_string()).ok_or(Fallback::Defer)?;
+                let r = crate::decimal::exp(&d).ok_or(Fallback::Defer)?;
+                return crate::decimal::to_bson(&r).ok_or(Fallback::Defer);
             }
             Ok(Bson::Double(math_float_named(&v, "$exp", 28765)?.exp()))
         }
@@ -6092,23 +6110,31 @@ fn op_ln(arg: &Bson, ctx: &Ctx) -> R {
             // this used to fall through and answer NaN / -Infinity. NaN is not
             // non-positive, and mongod answers a DOUBLE nan for $ln of a
             // Decimal NaN -- the one place here that does not keep the type.
-            if let Some(df) = decimal_as_f64(&v) {
-                if df.is_nan() {
+            if matches!(v, Bson::Decimal128(_)) {
+                let d = crate::decimal::parse(&v.to_string()).ok_or(Fallback::Defer)?;
+                // NaN is not non-positive, and mongod answers a DOUBLE nan for
+                // $ln of a decimal NaN -- the one place here that does not
+                // keep the argument's type.
+                if matches!(d, crate::decimal::Dec::Nan) {
                     return Ok(Bson::Double(f64::NAN));
                 }
-                if df <= 0.0 {
-                    return Err(Fallback::mongo(
-                        28766,
-                        format!(
-                            "$ln's argument must be a positive number, but is {}",
-                            crate::format_double_g(df)
-                        ),
-                    ));
+                // The DOMAIN check is asked of the DECIMAL, never of an `f64`
+                // rendering: that saturates, so a finite `Decimal128("1E-6176")`
+                // read as `0.0` was reported as non-positive, and a finite
+                // `Decimal128("1E+6144")` read as an infinity was answered with
+                // `Infinity` instead of its logarithm.
+                match crate::decimal::ln(&d) {
+                    Some(r) => return crate::decimal::to_bson(&r).ok_or(Fallback::Defer),
+                    None => {
+                        return Err(Fallback::mongo(
+                            28766,
+                            format!(
+                                "$ln's argument must be a positive number, but is {}",
+                                crate::format_double_g(decimal_as_f64(&v).unwrap_or(f64::NAN))
+                            ),
+                        ));
+                    }
                 }
-                if df.is_infinite() {
-                    return Ok(decimal_special_bson(df));
-                }
-                return Err(Fallback::Defer);
             }
             let f = math_float_named(&v, "$ln", 28765)?;
             if f <= 0.0 {
@@ -6138,23 +6164,31 @@ fn op_log10(arg: &Bson, ctx: &Ctx) -> R {
             // this used to fall through and answer NaN / -Infinity. NaN is not
             // non-positive, and mongod answers a DOUBLE nan for $log10 of a
             // Decimal NaN -- the one place here that does not keep the type.
-            if let Some(df) = decimal_as_f64(&v) {
-                if df.is_nan() {
+            if matches!(v, Bson::Decimal128(_)) {
+                let d = crate::decimal::parse(&v.to_string()).ok_or(Fallback::Defer)?;
+                // NaN is not non-positive, and mongod answers a DOUBLE nan for
+                // $log10 of a decimal NaN -- the one place here that does not
+                // keep the argument's type.
+                if matches!(d, crate::decimal::Dec::Nan) {
                     return Ok(Bson::Double(f64::NAN));
                 }
-                if df <= 0.0 {
-                    return Err(Fallback::mongo(
-                        28761,
-                        format!(
-                            "$log10's argument must be a positive number, but is {}",
-                            crate::format_double_g(df)
-                        ),
-                    ));
+                // The DOMAIN check is asked of the DECIMAL, never of an `f64`
+                // rendering: that saturates, so a finite `Decimal128("1E-6176")`
+                // read as `0.0` was reported as non-positive, and a finite
+                // `Decimal128("1E+6144")` read as an infinity was answered with
+                // `Infinity` instead of its logarithm.
+                match crate::decimal::log10(&d) {
+                    Some(r) => return crate::decimal::to_bson(&r).ok_or(Fallback::Defer),
+                    None => {
+                        return Err(Fallback::mongo(
+                            28761,
+                            format!(
+                                "$log10's argument must be a positive number, but is {}",
+                                crate::format_double_g(decimal_as_f64(&v).unwrap_or(f64::NAN))
+                            ),
+                        ));
+                    }
                 }
-                if df.is_infinite() {
-                    return Ok(decimal_special_bson(df));
-                }
-                return Err(Fallback::Defer);
             }
             let f = math_float_named(&v, "$log10", 28765)?;
             // NaN passes through as log10(nan) = nan.

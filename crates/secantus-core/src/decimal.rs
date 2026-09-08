@@ -1208,3 +1208,686 @@ pub fn quantize_integral(d: &Dec, mode: RoundMode) -> Option<Dec> {
         _ => Some(r),
     }
 }
+
+// ---------------------------------------------------------------------------
+// high-precision arithmetic, for the transcendentals
+// ---------------------------------------------------------------------------
+//
+// `add` / `mul` above round every result to decimal128's 34 digits, which is
+// correct for arithmetic and useless for a series: an argument reduction can
+// cancel 30 digits away, and rounding at each step would leave nothing behind
+// the decimal point. These helpers do the same arithmetic at a caller-chosen
+// width and skip the decimal128 range rules entirely -- an intermediate is
+// allowed to be far outside the format. Only the final `to_bson` clamps.
+//
+// None of them handle NaN or the infinities; every caller settles those first.
+
+/// Round a raw `(sign, coeff, exp)` to `prec` digits. The high-precision twin
+/// of `finish`, without its 34-digit cap.
+fn hp_norm(sign: i8, coeff: Vec<u8>, exp: i32, prec: usize) -> Dec {
+    let c = strip_leading(&coeff).to_vec();
+    let (c, bump) = round_half_even(&c, prec);
+    Dec::Fin {
+        sign,
+        coeff: c,
+        exp: exp + bump,
+    }
+}
+
+/// The exponent of a value's LEADING digit, or `None` for a zero.
+fn hp_adjusted(d: &Dec) -> Option<i32> {
+    let Dec::Fin { coeff, exp, .. } = d else {
+        return None;
+    };
+    let mag = strip_leading(coeff);
+    (!mag.iter().all(|x| *x == 0)).then(|| exp + mag.len() as i32 - 1)
+}
+
+fn hp_is_zero(d: &Dec) -> bool {
+    matches!(d, Dec::Fin { coeff, .. } if coeff.iter().all(|x| *x == 0))
+}
+
+fn hp_from_i64(n: i64, exp: i32) -> Dec {
+    let sign = if n < 0 { -1 } else { 1 };
+    let digits: Vec<u8> = if n == 0 {
+        vec![0]
+    } else {
+        n.unsigned_abs()
+            .to_string()
+            .bytes()
+            .map(|b| b - b'0')
+            .collect()
+    };
+    Dec::Fin {
+        sign,
+        coeff: digits,
+        exp,
+    }
+}
+
+fn hp_neg(d: &Dec) -> Dec {
+    match d {
+        Dec::Fin { sign, coeff, exp } => Dec::Fin {
+            sign: -sign,
+            coeff: coeff.clone(),
+            exp: *exp,
+        },
+        other => other.clone(),
+    }
+}
+
+fn hp_mul(a: &Dec, b: &Dec, prec: usize) -> Dec {
+    let (
+        Dec::Fin {
+            sign: s1,
+            coeff: c1,
+            exp: e1,
+        },
+        Dec::Fin {
+            sign: s2,
+            coeff: c2,
+            exp: e2,
+        },
+    ) = (a, b)
+    else {
+        return Dec::Nan;
+    };
+    hp_norm(s1 * s2, mul_mag(c1, c2), e1 + e2, prec)
+}
+
+fn hp_add(a: &Dec, b: &Dec, prec: usize) -> Dec {
+    if hp_is_zero(a) {
+        return b.clone();
+    }
+    if hp_is_zero(b) {
+        return a.clone();
+    }
+    // An operand more than `prec` orders below the other cannot change any
+    // digit that survives, and aligning it would build a vector that size.
+    match (hp_adjusted(a), hp_adjusted(b)) {
+        (Some(x), Some(y)) if x - y > prec as i32 + 2 => return a.clone(),
+        (Some(x), Some(y)) if y - x > prec as i32 + 2 => return b.clone(),
+        _ => {}
+    }
+    let (
+        Dec::Fin {
+            sign: s1,
+            coeff: c1,
+            exp: e1,
+        },
+        Dec::Fin {
+            sign: s2,
+            coeff: c2,
+            exp: e2,
+        },
+    ) = (a, b)
+    else {
+        return Dec::Nan;
+    };
+    let target = (*e1).min(*e2);
+    let x = scale_to(c1, *e1, target);
+    let y = scale_to(c2, *e2, target);
+    let (sign, mag) = if s1 == s2 {
+        (*s1, add_mag(&x, &y))
+    } else {
+        match cmp_mag(&x, &y) {
+            std::cmp::Ordering::Equal => return hp_from_i64(0, target),
+            std::cmp::Ordering::Greater => (*s1, sub_mag(&x, &y)),
+            std::cmp::Ordering::Less => (*s2, sub_mag(&y, &x)),
+        }
+    };
+    hp_norm(sign, mag, target, prec)
+}
+
+fn hp_sub(a: &Dec, b: &Dec, prec: usize) -> Dec {
+    hp_add(a, &hp_neg(b), prec)
+}
+
+/// `a / b` to `prec` digits, by schoolbook long division.
+///
+/// The quotient is TRUNCATED, not rounded, at `prec + 2` digits -- the two
+/// extra are what keeps the caller's own rounding honest.
+fn hp_div(a: &Dec, b: &Dec, prec: usize) -> Dec {
+    let (
+        Dec::Fin {
+            sign: s1,
+            coeff: c1,
+            exp: e1,
+        },
+        Dec::Fin {
+            sign: s2,
+            coeff: c2,
+            exp: e2,
+        },
+    ) = (a, b)
+    else {
+        return Dec::Nan;
+    };
+    let num = strip_leading(c1);
+    let den = strip_leading(c2);
+    if den.iter().all(|x| *x == 0) {
+        return Dec::Nan;
+    }
+    if num.iter().all(|x| *x == 0) {
+        return hp_from_i64(0, 0);
+    }
+    let want = prec + 2;
+    // Produce `want` quotient digits starting at the first non-zero one.
+    let mut rem: Vec<u8> = Vec::with_capacity(den.len() + 2);
+    let mut quot: Vec<u8> = Vec::with_capacity(want + 1);
+    let mut taken = 0usize; // digits of the numerator consumed
+    let mut started = false;
+    while quot.len() < want {
+        // Bring down the next numerator digit (zero once it is exhausted).
+        rem.push(if taken < num.len() { num[taken] } else { 0 });
+        taken += 1;
+        let r = strip_leading(&rem).to_vec();
+        let mut q = 0u8;
+        let mut cur = r;
+        while cmp_mag(&cur, den) != std::cmp::Ordering::Less {
+            cur = sub_mag(&cur, den);
+            cur = strip_leading(&cur).to_vec();
+            q += 1;
+        }
+        rem = cur;
+        if q > 0 {
+            started = true;
+        }
+        if started {
+            quot.push(q);
+        }
+        // While `started` is false the remainder is still below the divisor, so
+        // no significant digit has appeared: the exponent absorbs the position
+        // instead, which `shift` below accounts for via `taken`.
+        // The first significant quotient digit cannot appear until the running
+        // remainder reaches the divisor, which takes one iteration per digit
+        // the DIVISOR has beyond the numerator -- `ln(10)` carries 130 of them.
+        // A bound that ignored `den.len()` aborted `x / ln10` at 90 iterations
+        // and returned ZERO, which left `hp_exp`'s argument unreduced and made
+        // the Taylor series run past its own term cap for any `x` over ~1000.
+        if !started && taken > num.len() + den.len() + prec + 4 {
+            return hp_from_i64(0, 0); // unreachable for a non-zero numerator
+        }
+    }
+    // `taken` numerator digits produced `quot.len()` quotient digits, and the
+    // first quotient digit sits at numerator position `taken - quot.len()`.
+    let shift = e1 - e2 + num.len() as i32 - taken as i32;
+    hp_norm(s1 * s2, quot, shift, prec)
+}
+
+/// `sqrt(a)` to `prec` digits, from the exact integer root.
+fn hp_sqrt(a: &Dec, prec: usize) -> Dec {
+    let Dec::Fin { coeff, exp, .. } = a else {
+        return Dec::Nan;
+    };
+    let mag = strip_leading(coeff);
+    if mag.iter().all(|x| *x == 0) {
+        return hp_from_i64(0, 0);
+    }
+    // Pad so the integer root carries `prec + 2` digits, keeping the exponent
+    // even so it halves cleanly.
+    let want = 2 * (prec + 2);
+    let mut k = want.saturating_sub(mag.len());
+    if (exp - k as i32) % 2 != 0 {
+        k += 1;
+    }
+    let mut n = mag.to_vec();
+    n.extend(std::iter::repeat_n(0u8, k));
+    let (root, _) = isqrt_mag(&n);
+    hp_norm(1, root, (exp - k as i32) / 2, prec)
+}
+
+/// `ln(2)` and `ln(10)` to 130 digits -- more than any working precision here
+/// asks for, so the reduction below adds no error of its own.
+const LN2_TEXT: &str = "0.6931471805599453094172321214581765680755001343602552541206800094933936219696947156058633269964186875420014810205706857336855202358";
+const LN10_TEXT: &str = "2.302585092994045684017991454684364207601101488628772976033327900967572609677352480235997205089598298341967784042286248633409525465";
+
+/// `ln(x)` for a POSITIVE finite `x`, to `prec` digits.
+///
+/// `x = m * 10^k` with `m` in `[1, 10)`, then `m = r * 2^j` with `r` near 1, so
+/// `ln(x) = 2*atanh(z) + j*ln2 + k*ln10` where `z = (r-1)/(r+1)`. The halvings
+/// put `|z|` under 0.172, which the atanh series clears in about 45 terms at 70
+/// digits -- the series is the only slow part and it converges geometrically.
+fn hp_ln(x: &Dec, prec: usize) -> Option<Dec> {
+    let Dec::Fin { coeff, exp, .. } = x else {
+        return None;
+    };
+    let mag = strip_leading(coeff);
+    if mag.iter().all(|d| *d == 0) {
+        return None;
+    }
+    // m in [1, 10): the coefficient with the point after its first digit.
+    let k = exp + mag.len() as i32 - 1;
+    let mut r = Dec::Fin {
+        sign: 1,
+        coeff: mag.to_vec(),
+        exp: -(mag.len() as i32 - 1),
+    };
+    // Halve until r is under sqrt(2); at most four times, since m < 10.
+    let two = hp_from_i64(2, 0);
+    let sqrt2_upper = hp_from_i64(14142136, -7); // slightly above sqrt(2)
+    let mut j: i64 = 0;
+    while cmp_abs(&r, &sqrt2_upper) == Some(std::cmp::Ordering::Greater) {
+        r = hp_div(&r, &two, prec);
+        j += 1;
+    }
+    let one = hp_from_i64(1, 0);
+    let z = hp_div(&hp_sub(&r, &one, prec), &hp_add(&r, &one, prec), prec);
+    // 2 * (z + z^3/3 + z^5/5 + ...)
+    let z2 = hp_mul(&z, &z, prec);
+    let mut term = z.clone();
+    let mut acc = z.clone();
+    let mut n: i64 = 1;
+    loop {
+        term = hp_mul(&term, &z2, prec);
+        n += 2;
+        let piece = hp_div(&term, &hp_from_i64(n, 0), prec);
+        if hp_is_zero(&piece) {
+            break;
+        }
+        // Once a term sits entirely below the working precision it cannot move
+        // any digit, and every later term is smaller still.
+        match (hp_adjusted(&acc), hp_adjusted(&piece)) {
+            (Some(a), Some(p)) if a - p > prec as i32 + 2 => break,
+            _ => {}
+        }
+        acc = hp_add(&acc, &piece, prec);
+        if n > 4 * prec as i64 + 40 {
+            return None; // the reduction failed to make z small; refuse
+        }
+    }
+    let mut out = hp_mul(&acc, &two, prec);
+    if j != 0 {
+        let ln2 = parse(LN2_TEXT)?;
+        out = hp_add(&out, &hp_mul(&hp_from_i64(j, 0), &ln2, prec), prec);
+    }
+    if k != 0 {
+        let ln10 = parse(LN10_TEXT)?;
+        out = hp_add(&out, &hp_mul(&hp_from_i64(k as i64, 0), &ln10, prec), prec);
+    }
+    Some(out)
+}
+
+/// `e^x` for a finite `x`, to `prec` digits.
+///
+/// `x = m*ln10 + r` with `|r| <= ln10/2`, so `e^x = e^r * 10^m` and the power of
+/// ten costs nothing but an exponent. `r` is then halved four more times before
+/// the Taylor series and the result squared back, which cuts the term count by
+/// about half.
+fn hp_exp(x: &Dec, prec: usize) -> Option<Dec> {
+    if hp_is_zero(x) {
+        return Some(hp_from_i64(1, 0));
+    }
+    let ln10 = parse(LN10_TEXT)?;
+    // m = round(x / ln10), as an integer.
+    let quo = hp_div(x, &ln10, prec);
+    let m = hp_round_to_i64(&quo)?;
+    let r = hp_sub(x, &hp_mul(&hp_from_i64(m, 0), &ln10, prec), prec);
+    // Halve r four times; |r| <= ln10/2 so |r/16| <= 0.072.
+    const HALVINGS: u32 = 4;
+    let mut t = r;
+    for _ in 0..HALVINGS {
+        t = hp_div(&t, &hp_from_i64(2, 0), prec);
+    }
+    // sum t^n / n!
+    let mut term = hp_from_i64(1, 0);
+    let mut acc = hp_from_i64(1, 0);
+    let mut n: i64 = 1;
+    loop {
+        term = hp_div(&hp_mul(&term, &t, prec), &hp_from_i64(n, 0), prec);
+        if hp_is_zero(&term) {
+            break;
+        }
+        match (hp_adjusted(&acc), hp_adjusted(&term)) {
+            (Some(a), Some(p)) if a - p > prec as i32 + 2 => break,
+            _ => {}
+        }
+        acc = hp_add(&acc, &term, prec);
+        n += 1;
+        if n > 4 * prec as i64 + 40 {
+            return None;
+        }
+    }
+    for _ in 0..HALVINGS {
+        acc = hp_mul(&acc, &acc, prec);
+    }
+    // Multiply by 10^m -- an exponent shift, not an arithmetic operation.
+    let Dec::Fin { sign, coeff, exp } = acc else {
+        return None;
+    };
+    Some(Dec::Fin {
+        sign,
+        coeff,
+        exp: exp.checked_add(i32::try_from(m).ok()?)?,
+    })
+}
+
+/// A `Dec` known to be a modest integer-valued quantity, as `i64`.
+fn hp_round_to_i64(d: &Dec) -> Option<i64> {
+    let rounded = round_to_exp(d, 0, RoundMode::HalfEven)?;
+    let Dec::Fin { sign, coeff, exp } = rounded else {
+        return None;
+    };
+    if exp < 0 {
+        return None;
+    }
+    let mut v: i64 = 0;
+    for digit in coeff.iter().chain(std::iter::repeat_n(&0u8, exp as usize)) {
+        v = v.checked_mul(10)?.checked_add(i64::from(*digit))?;
+    }
+    Some(v * i64::from(sign))
+}
+
+/// Round a high-precision result to decimal128's 34 digits, or `None` when the
+/// guard digits cannot decide the rounding.
+///
+/// The series above are computed at a wide working precision and are accurate
+/// to within a few units of its last digit. That pins the 34-digit answer
+/// UNLESS the true value sits astride a rounding boundary -- digits 35 onward
+/// reading `4999…` or `5000…` all the way into the guard. Then the guard says
+/// nothing and the caller recomputes wider (Ziv's strategy) rather than
+/// guessing.
+fn hp_round_34(d: &Dec, prec: usize) -> Option<Dec> {
+    let Dec::Fin { sign, coeff, exp } = d else {
+        return Some(d.clone());
+    };
+    let mag = strip_leading(coeff);
+    if mag.len() <= MAX_DIGITS {
+        return Some(d.clone());
+    }
+    // The window between the last digit we keep and the last few the series
+    // cannot vouch for.
+    let tail = &mag[MAX_DIGITS..];
+    let trust = tail.len().saturating_sub(6);
+    if trust > 1 {
+        let window = &tail[1..trust];
+        let borderline = (tail[0] == 4 && window.iter().all(|d| *d == 9))
+            || (tail[0] == 5 && window.iter().all(|d| *d == 0));
+        if borderline {
+            return None;
+        }
+    }
+    let _ = prec;
+    // `round_half_even`'s `bump` ALREADY carries the dropped-digit count (see
+    // `finish`, which adds nothing else); adding it again moved every result up
+    // by `prec - 34` orders.
+    let (kept, bump) = round_half_even(mag, MAX_DIGITS);
+    Some(Dec::Fin {
+        sign: *sign,
+        coeff: kept,
+        exp: exp + bump,
+    })
+}
+
+/// Run `f` at increasing working precision until the 34-digit rounding is
+/// decided. Three attempts is far past what any measured value needed.
+fn with_precision(mut f: impl FnMut(usize) -> Option<Dec>) -> Option<Dec> {
+    for prec in [80usize, 140, 260] {
+        let raw = f(prec)?;
+        if let Some(r) = hp_round_34(&raw, prec) {
+            return Some(r);
+        }
+    }
+    None
+}
+
+/// `ln(x)` at decimal128 precision. `None` for a value outside the domain --
+/// the caller raises mongod's error, which differs per operator.
+pub fn ln(a: &Dec) -> Option<Dec> {
+    match a {
+        Dec::Nan => Some(Dec::Nan),
+        Dec::Inf(1) => Some(Dec::Inf(1)),
+        Dec::Inf(_) => None,
+        Dec::Fin { sign, .. } if *sign < 0 || a.is_zero() => None,
+        _ => with_precision(|p| hp_ln(a, p)),
+    }
+}
+
+/// `e^x` at decimal128 precision.
+pub fn exp(a: &Dec) -> Option<Dec> {
+    match a {
+        Dec::Nan => Some(Dec::Nan),
+        Dec::Inf(1) => Some(Dec::Inf(1)),
+        Dec::Inf(_) => Some(Dec::Fin {
+            sign: 1,
+            coeff: vec![0],
+            exp: 0,
+        }),
+        _ => with_precision(|p| hp_exp(a, p)),
+    }
+}
+
+/// `log10(x)` for a POSITIVE finite `x`, to `prec` digits.
+///
+/// `x = m * 10^k` with `m` in `[1, 10)`, so `log10(x) = k + ln(m)/ln(10)`. An
+/// exact power of ten therefore answers the INTEGER `k` with no series at all,
+/// which is the only way `log10(100)` comes out as `2` rather than
+/// `1.999…`.
+fn hp_log10(x: &Dec, prec: usize) -> Option<Dec> {
+    let Dec::Fin { coeff, exp, .. } = x else {
+        return None;
+    };
+    let mag = strip_leading(coeff);
+    if mag.iter().all(|d| *d == 0) {
+        return None;
+    }
+    let k = exp + mag.len() as i32 - 1;
+    // A coefficient of a single 1 followed by zeros IS a power of ten.
+    if mag[0] == 1 && mag[1..].iter().all(|d| *d == 0) {
+        return Some(hp_from_i64(i64::from(k), 0));
+    }
+    let m = Dec::Fin {
+        sign: 1,
+        coeff: mag.to_vec(),
+        exp: -(mag.len() as i32 - 1),
+    };
+    let ln10 = parse(LN10_TEXT)?;
+    let frac = hp_div(&hp_ln(&m, prec)?, &ln10, prec);
+    Some(hp_add(&hp_from_i64(i64::from(k), 0), &frac, prec))
+}
+
+/// `log10(x)` at decimal128 precision.
+pub fn log10(a: &Dec) -> Option<Dec> {
+    match a {
+        Dec::Nan => Some(Dec::Nan),
+        Dec::Inf(1) => Some(Dec::Inf(1)),
+        Dec::Inf(_) => None,
+        Dec::Fin { sign, .. } if *sign < 0 || a.is_zero() => None,
+        _ => with_precision(|p| hp_log10(a, p)),
+    }
+}
+
+/// `asinh(x) = ln(x + sqrt(x^2 + 1))`, at decimal128 precision.
+///
+/// An odd function, computed on `|x|` and signed back: for a NEGATIVE `x` the
+/// sum `x + sqrt(x^2+1)` cancels to about `1/(2|x|)`, which throws away as many
+/// digits as `x` has, and no working precision fixes that in general.
+pub fn asinh(a: &Dec) -> Option<Dec> {
+    match a {
+        Dec::Nan => Some(Dec::Nan),
+        Dec::Inf(s) => Some(Dec::Inf(*s)),
+        Dec::Fin { sign, .. } => {
+            if a.is_zero() {
+                // Measured 8.2.11: `$asinh` of a decimal zero carries the sign
+                // and the MINIMUM quantum, which no arithmetic here produces.
+                return Some(Dec::Fin {
+                    sign: *sign,
+                    coeff: vec![0],
+                    exp: -6176,
+                });
+            }
+            let neg = *sign < 0;
+            let x = if neg { hp_neg(a) } else { a.clone() };
+            // `asinh(x) = x - x^3/6 + ...`, so once `|x|` is 18 or more orders
+            // below 1 the correction sits at least 36 orders under the leading
+            // digit -- past all 34 of them -- and the answer IS `x`, expressed
+            // at 34 significant digits.
+            //
+            // This is not an optimisation. Any FIXED working precision loses a
+            // tiny argument entirely: `1 + 1E-100` is `1` at 80 digits, so
+            // `asinh(Decimal128("1E-100"))` came back `0` where mongod and the
+            // Python engine both answer `1.000000000000000000000000000000000E-100`.
+            // Scaling the precision with the exponent instead would mean 6000-digit
+            // series arithmetic at the bottom of the format.
+            if let Some(adj) = hp_adjusted(&x) {
+                if adj <= -18 {
+                    let Dec::Fin { coeff, exp, .. } = &x else {
+                        return None;
+                    };
+                    let mag = strip_leading(coeff);
+                    let mut c = mag.to_vec();
+                    let pad = MAX_DIGITS.saturating_sub(c.len());
+                    c.extend(std::iter::repeat_n(0u8, pad));
+                    return Some(Dec::Fin {
+                        sign: if neg { -1 } else { 1 },
+                        coeff: c,
+                        exp: exp - pad as i32,
+                    });
+                }
+            }
+            let out = with_precision(|p| {
+                let x2 = hp_mul(&x, &x, p);
+                let root = hp_sqrt(&hp_add(&x2, &hp_from_i64(1, 0), p), p);
+                hp_ln(&hp_add(&x, &root, p), p)
+            })?;
+            Some(if neg { hp_neg(&out) } else { out })
+        }
+    }
+}
+
+#[cfg(test)]
+mod transcendental_tests {
+    use super::*;
+
+    fn s(d: Option<Dec>) -> String {
+        d.map(|x| to_string(&x)).unwrap_or_else(|| "<none>".into())
+    }
+
+    /// The CORRECTLY-ROUNDED 34-digit values, computed independently at 250
+    /// digits and stable at 60 / 120 / 200.
+    ///
+    /// These are NOT all mongod's answers. Over 290 measured pairs mongod is
+    /// correctly rounded on 231 -- it carries Intel RDFP's approximation error
+    /// in the last digit on the rest -- so six expectations here differ from
+    /// 8.2.11 by one unit in the last place. That divergence is deliberate and
+    /// was asked for; see `tasks/backlog.md`.
+    #[test]
+    fn ln_is_correctly_rounded() {
+        for (input, want) in [
+            ("1", "0"),
+            ("2", "0.6931471805599453094172321214581766"),
+            ("10", "2.302585092994045684017991454684364"),
+            ("2.5", "0.9162907318741550651835272117680111"),
+            ("0.5", "-0.6931471805599453094172321214581766"),
+            ("100", "4.605170185988091368035982909368728"),
+            ("1E+400", "921.0340371976182736071965818737457"),
+        ] {
+            let got = s(ln(&parse(input).unwrap()));
+            assert_eq!(got, want, "ln({input})");
+        }
+    }
+
+    #[test]
+    fn exp_is_correctly_rounded() {
+        for (input, want) in [
+            ("0", "1"),
+            ("1", "2.718281828459045235360287471352662"),
+            ("2.5", "12.18249396070347343807017595116797"),
+            ("-1", "0.3678794411714423215955237701614609"),
+            ("180", "1.489384200781838359564441023032289E+78"),
+        ] {
+            let got = s(exp(&parse(input).unwrap()));
+            assert_eq!(got, want, "exp({input})");
+        }
+    }
+
+    #[test]
+    fn asinh_is_correctly_rounded() {
+        for (input, want) in [
+            ("1", "0.8813735870195430252326093249797923"),
+            ("-1", "-0.8813735870195430252326093249797923"),
+            ("2", "1.443635475178810342493276740273105"),
+            ("2.5", "1.647231146371095710624858610443620"),
+            ("10", "2.998222950297969738846595537596453"),
+            ("0.5", "0.4812118250596034474977589134243684"),
+            ("0.1", "0.09983407889920756332730312470476944"),
+            ("100", "5.298342365610588757368825689112906"),
+            ("3", "1.818446459232066823483698963560709"),
+            ("7.125", "2.661645514507905051660213687863223"),
+            ("0.001", "0.0009999998333334083332886905065723983"),
+            ("1E+10", "23.71899811050040214959964666830182"),
+            ("1E-10", "9.999999999999999999983333333333333E-11"),
+            ("123456789.987654321", "19.32454895472796339991366575636355"),
+            ("1E+34", "78.98104034235749856602894158072656"),
+            ("1E+400", "921.7271843781782189166138139952039"),
+            ("1E+310", "714.4945260087141073549945830736111"),
+            ("1E+6144", "14147.77595853597662791595672970219"),
+            ("-1E+6144", "-14147.77595853597662791595672970219"),
+            // Below 1E-18 the answer is the argument at 34 digits. A fixed
+            // working precision returned 0 for every one of these.
+            ("1E-17", "1.000000000000000000000000000000000E-17"),
+            ("1E-20", "1.000000000000000000000000000000000E-20"),
+            ("1E-34", "1.000000000000000000000000000000000E-34"),
+            ("1E-100", "1.000000000000000000000000000000000E-100"),
+            ("1E-3000", "1.000000000000000000000000000000000E-3000"),
+            ("-1E-100", "-1.000000000000000000000000000000000E-100"),
+            // Just ABOVE the shortcut, where the series must still run.
+            ("1E-15", "9.999999999999999999999999999998333E-16"),
+            ("0.9", "0.8088669356527824625093501673816060"),
+            ("1.1", "0.9503469298211342502700715942698944"),
+            ("-2.5", "-1.647231146371095710624858610443620"),
+            ("-100", "-5.298342365610588757368825689112906"),
+        ] {
+            let got = s(asinh(&parse(input).unwrap()));
+            assert_eq!(got, want, "asinh({input})");
+        }
+    }
+
+    #[test]
+    fn log10_is_correctly_rounded() {
+        for (input, want) in [
+            // Exact powers of ten answer the integer, with no series.
+            ("1", "0"),
+            ("10", "1"),
+            ("100", "2"),
+            ("1E+400", "400"),
+            ("0.001", "-3"),
+            ("2", "0.3010299956639811952137388947244930"),
+            ("2.5", "0.3979400086720376095725222105510139"),
+            ("7.125", "0.8527848686805478131901446948385655"),
+        ] {
+            let got = s(log10(&parse(input).unwrap()));
+            assert_eq!(got, want, "log10({input})");
+        }
+    }
+
+    /// `hp_div` against a divisor far wider than the dividend -- the shape
+    /// that silently returned zero.
+    #[test]
+    fn division_by_a_much_wider_divisor() {
+        let x = parse("4920.26").unwrap();
+        let ln10 = parse(LN10_TEXT).unwrap();
+        let q = hp_div(&x, &ln10, 80);
+        // 4920.26 / ln(10) = 2136.844...
+        assert!(
+            to_string(&q).starts_with("2136.84"),
+            "quotient was {}",
+            to_string(&q)
+        );
+        // And a plain one, to pin the exponent bookkeeping.
+        assert!(
+            to_string(&hp_div(&parse("1").unwrap(), &parse("3").unwrap(), 20))
+                .starts_with("0.3333333333")
+        );
+    }
+
+    #[test]
+    fn specials_pass_through() {
+        assert_eq!(s(asinh(&Dec::Nan)), "NaN");
+        assert_eq!(s(asinh(&Dec::Inf(1))), "Infinity");
+        assert_eq!(s(asinh(&Dec::Inf(-1))), "-Infinity");
+        assert_eq!(s(ln(&Dec::Inf(1))), "Infinity");
+        assert!(ln(&parse("0").unwrap()).is_none());
+        assert!(ln(&parse("-1").unwrap()).is_none());
+    }
+}
