@@ -5657,20 +5657,78 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   a quaternary level. It is right on all 64 measured shapes and the mechanism
   is not principled; a future change to the separator layout could move it.
 
-- [ ] **STILL OPEN: `Decimal128` FINITE operands in the transcendentals — now
-  the ONLY thing left in this family (19 shapes, re-measured 2026-09-07 after
-  the zero and `$avg` work above).** The Rust engine defers
-  `$acosh(Decimal128("2.5"))` and the rest;
-  mongod answers `1.581138830084189665999446772216359`. This is the genuine
-  dependency question — 34-significant-digit decimal transcendentals — and the
-  ZERO column of the matrix below needs a per-operator QUANTUM (`0E-35`,
-  `0E-40`, `0E-6176`, the 34-digit `1.000…`) which is a constant per operator
-  and so is table-able if someone wants a cheaper partial win. The PYTHON
-  server answers these but gets the last digit and the `-0` sign wrong on 19
-  shapes, which is the same family from the other side.
+- [x] **WON'T FIX (decided 2026-09-08, on evidence): `$toDate` of an unparseable
+  string.** mongod's message is `timelib`'s re2c-generated scanner talking, and
+  reproducing it means reproducing that scanner. Measured against 8.2.11 across
+  25 strings:
 
-  The measured special-value matrix that used to sit here is now redundant —
-  the behaviour is pinned by the tests named above; read those for the rules.
+      ''            Error parsing date string ''; 0: Empty string ' '
+      'a'           an incomplete date/time string has been found, ... "a"
+      'ab'          0: passing a time zone identifier as part of the string
+                       is not allowed 'a'
+      'a1'          1: Unexpected character '1'      <- position 1 only
+      '1a'          0: Unexpected character '1'      <- position 0 only
+      '123'         0: ...'1'; 1: ...'2'; 2: ...'3'  <- one error PER position
+      '2020-13-01'  6: Unexpected character '3'
+      'junk here'   0: passing a time zone identifier ...'j';
+                    5: Double timezone specification 'h'
+      '2020-01-01X' PARSES — 'X' is the military timezone UTC+11
+
+  There is no small rule here: it needs timelib's lexer states, its timezone
+  abbreviation tables (including the military single letters) and its
+  per-position error accumulation. A partial implementation would emit messages
+  mongod never sends, which is worse than the current refusal under
+  `CLAUDE.md`'s "wire-protocol fidelity over feature completeness".
+
+  **Reopen only if** a driver's test suite asserts these strings, or if timelib
+  is vendored for another reason and the scanner comes along with it.
+
+- [ ] **DECISION NEEDED (not a coding task): `Decimal128` FINITE operands in the
+  transcendentals — 15 shapes, re-measured 2026-09-08.** The Rust server refuses
+  `$sqrt` / `$exp` / `$ln` / `$log10` / the six trig / the four hyperbolic /
+  `$degreesToRadians` / `$radiansToDegrees` on a finite non-zero decimal; mongod
+  answers at 34 significant digits (`$sqrt(2.5)` is
+  `1.581138830084189665999446772216359`).
+
+  **Two claims in the previous version of this entry were WRONG, both corrected
+  by measurement rather than reading:**
+
+  - **The ZERO column is already done.** It suggested tabling the per-operator
+    quantum (`0E-35`, `0E-40`, `0E-6176`, the 34-digit `1.000…`) as "a cheaper
+    partial win". Measured: the zero column is **0 divergent of 18**, as are all
+    six error cases (`$ln(0)` 28766, `$log10(0)` 28761, `$asin(2.5)` /
+    `$acos(2.5)` / `$acosh(0)` / `$atanh(2.5)` all 50989). Nothing to win there.
+  - **"Needs a 34-digit decimal library" is not the real blocker.** The PYTHON
+    server already has one — the stdlib `decimal` module at full precision — and
+    on nine finite shapes it matches mongod on **six** and differs by exactly
+    **one unit in the last place** on three:
+
+    | op | mongod | python |
+    | --- | --- | --- |
+    | `$ln` | `…117680110` | `…117680111` |
+    | `$log10` | `…105510140` | `…105510139` |
+    | `$sin` | `…021861622` | `…021861623` |
+
+    So a Rust decimal crate lands in the same place: mostly exact, 1-ULP off on
+    some. The divergence is mongod's use of **Intel's RDFP** decimal library,
+    whose transcendental rounding differs from every other implementation in the
+    final digit.
+
+  **The decision, with its costs — this is Joe's call, not a unilateral one:**
+
+  1. **Link Intel RDFP** (the library mongod itself uses). Exact. Cost: a C
+     dependency in the wheel build, which currently ships cp312+cp313 across
+     macOS arm64, manylinux2014 and musllinux x86_64/aarch64, and Windows AMD64.
+  2. **Add a pure-Rust decimal crate** (`astro-float`, `dashu-float`). Cheap to
+     build, no C. Cost: silently wrong in the last digit on some inputs —
+     which is what `CLAUDE.md`'s "wire-protocol fidelity over feature
+     completeness" exists to prevent, and would make the Rust server *quietly*
+     wrong where it is currently *loudly* unsupported.
+  3. **Keep refusing.** Honest, and what the server does today. Cost: the two
+     servers disagree (Python answers, Rust refuses), and mongod answers.
+
+  Option 2 is the one to resist without an explicit decision: it trades a
+  visible refusal for an invisible wrong answer in a database.
 
 - [ ] **Decimal128 operands are refused by 33 Rust operators (2026-09-02).**
   Was 38; `$abs`, `$toBool`, `$toInt`, `$toLong` and `$toDouble` now take them.
@@ -5747,7 +5805,7 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   | shapes | area |
   | --- | --- |
   | 19 | Decimal128 TRANSCENDENTALS and division -- see the decision below |
-  | 3 | `$toDate` of an UNPARSEABLE string. mongod reports its timelib diagnostic (`Error parsing date string 'abc'; 0: passing a time zone identifier as part of the string is not allowed 'a'`); the parse SUCCESS path ships, and a failure defers rather than inventing a message it would not send |
+  | 3 | `$toDate` of an UNPARSEABLE string — **WON'T FIX, evidence below**. mongod reports timelib's scanner diagnostic; the parse SUCCESS path ships, and a failure defers rather than inventing a message it would not send |
 
   **Third pass: 32 -> 22 (2026-09-03).** Decimal128 `$add` / `$subtract` /
   `$multiply` and the whole rounding family (`$ceil` / `$floor` / `$trunc` /
