@@ -24,6 +24,12 @@ answered 40147 for any document argument, shadowing a later arm seventy lines
 below that already implemented mongod's three codes correctly.
 `{$sortByCount: {$add: ["$n", 1]}}` is valid and now works.
 
+Removing the shadowing arm was only half the rule, and the 740-shape stage-spec
+probe caught the other half: a document is an EXPRESSION only when its **first
+key is `$`-prefixed**, so `{a: 1}` and `{a: {$add: [...]}}` are literal documents
+and get 40147 like `{}` does. Without that they fell through to the engine and
+deferred.
+
 **`$arrayElemAt` answered `null` for a non-numeric index** — a silent wrong
 value. Only `bool` was checked, so `{$arrayElemAt: [[1, 2], "x"]}` came back as
 `null` where mongod raises 28690 naming the type. Measured across 19 index
@@ -41,7 +47,9 @@ and `16610 can't $mod by zero`.
 
 `$group` / `$bucket` / `$sortByCount` over twelve named-error expressions plus
 four valid `$sortByCount` forms: **31 of 40 matching, from 18 of 36**.
-`$arrayElemAt` index types: **0 divergences of 19**. The 6,628-case expression
+`$arrayElemAt` index types: **0 divergences of 19**, and the 740-shape
+aggregation stage-spec probe goes to **0 divergent** (it was the only probe of
+twelve still reporting one). The 6,628-case expression
 corpus is unchanged at 38 different-code divergences with 0 wrong values and no
 regressions (it does not cover these shapes, which is why they survived so long).
 

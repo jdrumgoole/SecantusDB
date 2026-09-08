@@ -122,6 +122,23 @@ def test_sort_by_count_still_rejects_an_empty_object(db):
     assert e.value.code == 40147
 
 
+def test_sort_by_count_rejects_a_literal_document(db):
+    """A document is an EXPRESSION only when its FIRST key is `$`-prefixed.
+
+    `{a: 1}` and `{a: {$add: [...]}}` are literal documents and get 40147, the
+    same as `{}`. Removing the shadowing arm alone let these fall through to the
+    engine, which deferred -- the 740-shape stage-spec probe caught it.
+    """
+    for spec in ({"a": 1}, {"a": {"$add": ["$n", 1]}}):
+        with pytest.raises(pymongo.errors.OperationFailure) as e:
+            list(db.c.aggregate([{"$sortByCount": spec}]))
+        assert e.value.code == 40147, spec
+
+
+def test_sort_by_count_accepts_a_literal_expression(db):
+    assert list(db.c.aggregate([{"$sortByCount": {"$literal": 7}}])) == [{"_id": 7, "count": 1}]
+
+
 def test_sort_by_count_still_rejects_a_number(db):
     with pytest.raises(pymongo.errors.OperationFailure) as e:
         list(db.c.aggregate([{"$sortByCount": 5}]))
