@@ -551,7 +551,26 @@ def expression_problem_in_pipeline(
             found = _expression_problem(spec, inner)
         elif name in _EXPR_MAP_STAGES:
             if isinstance(spec, Mapping):
-                for value in spec.values():
+                for field, value in spec.items():
+                    # A `$group` output field is ACCUMULATOR position, which has
+                    # its own spec-shape codes; `_id` is an ordinary expression.
+                    if name == "$group" and field != "_id":
+                        found = _accumulator_shape_problem(value)
+                        if found:
+                            break
+                        # The accumulator NAME is not an expression -- `$topN`
+                        # is unknown as one -- so recurse into its ARGUMENTS
+                        # instead of the operator document itself. Walking the
+                        # whole thing rejected every valid `{$topN: {...}}`.
+                        acc = _accumulator_operand(value)
+                        if acc is not None:
+                            found = next(
+                                (p for p in (_expression_problem(a, bound) for a in acc) if p),
+                                None,
+                            )
+                            if found:
+                                break
+                            continue
                     found = _expression_problem(value, bound)
                     if found:
                         break
@@ -593,7 +612,7 @@ def expression_problem_in_pipeline(
         # were folding them first and reporting "Failed to optimize pipeline",
         # so 279 shapes had both the wrong wrapper and the wrong code.
         if not found:
-            found = _expression_shape_problem(spec)
+            found = _expression_shape_problem(spec, name)
         if found:
             return (found[0], found[1], wrapper)
         # No structural problem: mongod would now FOLD the constant
@@ -666,6 +685,112 @@ _OBJECT_SPEC_EXPRESSIONS: dict[str, int] = {
     "$topN": 168,
     "$bottomN": 168,
 }
+
+#: The SAME operators in ACCUMULATOR position -- a `$group` output field -- where
+#: mongod uses DIFFERENT codes. `{$group: {x: {$median: 5}}}` is 7436100 while
+#: `{$addFields: {x: {$median: 5}}}` is 7436201, and `$percentile` runs
+#: 7429703 / 7436200 the same way. Measured across all eight operators in both
+#: positions on 8.2.11 (2026-09-08); the table above had been applied in both,
+#: which was right for four of them and wrong for four.
+_OBJECT_SPEC_ACCUMULATORS: dict[str, int] = {
+    "$firstN": 5787801,
+    "$lastN": 5787801,
+    "$minN": 5787900,
+    "$maxN": 5787900,
+    "$median": 7436100,
+    "$percentile": 7429703,
+    "$topN": 5788001,
+    "$bottomN": 5788001,
+}
+
+#: Accumulator-only operators: in EXPRESSION position mongod does not know them
+#: at all, so the complaint is "Unrecognized expression" rather than anything
+#: about their spec. The other six in the table above ARE expressions.
+_ACCUMULATOR_ONLY = frozenset({"$topN", "$bottomN"})
+
+
+def _percentile_field_problem(op: str, spec: Any) -> tuple[int, str] | None:
+    """`$median` / `$percentile` field validation, at PARSE time.
+
+    The codes and wording are identical in both positions -- only the
+    object-SHAPE codes differ -- so one check serves `$group` and `$addFields`
+    alike. It lives here rather than in the evaluator because that is what gets
+    the WRAPPER right: mongod raises these while parsing, so `$addFields` says
+    `Invalid $addFields :: caused by ::` and `$group` says nothing at all, where
+    an evaluator-raised error says "Failed to optimize pipeline" or "Executor
+    error during aggregate". Measured 8.2.11, 2026-09-08.
+
+    Order is the IDL's field declaration order: `input`, then `p`, then
+    `method`.
+    """
+    if not isinstance(spec, Mapping):
+        return None
+
+    def missing(field: str) -> tuple[int, str]:
+        return (40414, f"BSON field '{op}.{field}' is missing but a required field")
+
+    if "input" not in spec:
+        return missing("input")
+    if op == "$percentile":
+        if "p" not in spec:
+            return missing("p")
+        ps = spec["p"]
+        if not isinstance(ps, list) or not ps:
+            return (
+                7750301,
+                "The $percentile 'p' field must be an array of numbers from "
+                f"[0.0, 1.0], but found: {bson_value_repr(ps)}",
+            )
+        for value in ps:
+            numeric = not isinstance(value, bool) and isinstance(value, (int, float))
+            if not numeric or not 0.0 <= value <= 1.0:
+                code = 7750303 if numeric else 7750302
+                return (
+                    code,
+                    "The $percentile 'p' field must be an array of numbers from "
+                    f"[0.0, 1.0], but found: {bson_value_repr(value)}",
+                )
+    if "method" not in spec:
+        return missing("method")
+    if spec["method"] != "approximate":
+        return (2, "Currently only 'approximate' can be used as a percentile 'method'.")
+    return None
+
+
+def _accumulator_operand(value: Any) -> list[Any] | None:
+    """The argument expressions of a `$group` accumulator, or ``None`` when the
+    value is not one of the document-spec accumulators.
+
+    Used so the walker recurses into an accumulator's ARGUMENTS without treating
+    its NAME as an expression: `$topN` and `$bottomN` are accumulator-only, so
+    walking `{$topN: {n: 2, ...}}` as an expression rejected valid pipelines.
+    """
+    if not isinstance(value, Mapping) or len(value) != 1:
+        return None
+    op, spec = next(iter(value.items()))
+    if op not in _OBJECT_SPEC_ACCUMULATORS or not isinstance(spec, Mapping):
+        return None
+    return list(spec.values())
+
+
+def _accumulator_shape_problem(value: Any) -> tuple[int, str] | None:
+    """The spec-shape error for a `$group` output field, in ACCUMULATOR position.
+
+    An ARRAY spec is one message for all eight -- "The <op> accumulator is a
+    unary operator", 40237 -- while every other non-document carries the
+    operator's own code. Measured 8.2.11, 2026-09-08.
+    """
+    if not isinstance(value, Mapping) or len(value) != 1:
+        return None
+    op, spec = next(iter(value.items()))
+    if op not in _OBJECT_SPEC_ACCUMULATORS or isinstance(spec, Mapping):
+        return None
+    if isinstance(spec, list):
+        return (40237, f"The {op} accumulator is a unary operator")
+    return (
+        _OBJECT_SPEC_ACCUMULATORS[op],
+        f"specification must be an object; found {op}: {bson_value_repr(spec)}",
+    )
 
 
 # An unrecognised argument in a date-operator spec, per operator: its known
@@ -786,7 +911,7 @@ _PARSE_TIME_REQUIRED_KEY: dict[str, tuple[str, int, str]] = {
 }
 
 
-def _expression_shape_problem(spec: Any) -> tuple[int, str] | None:
+def _expression_shape_problem(spec: Any, stage: str = "") -> tuple[int, str] | None:
     """The first arity / spec-shape error in `spec`, as mongod parses it.
 
     These are PARSE errors: mongod raises them while building the expression
@@ -869,6 +994,10 @@ def _expression_shape_problem(spec: Any) -> tuple[int, str] | None:
                 for opt in value:
                     if opt not in names:
                         return (40415, f"BSON field '{key}.{opt}' is an unknown field.")
+                # ... and then its required fields, in declaration order.
+                found = _percentile_field_problem(key, value)
+                if found:
+                    return found
             # `$getField`'s two OBJECT-form complaints are parse errors: both
             # fire on an EMPTY collection (probed 8.2.11, 2026-09-02). The bare
             # form's "must evaluate to type String" is not -- that one runs per
@@ -895,6 +1024,13 @@ def _expression_shape_problem(spec: Any) -> tuple[int, str] | None:
                 for field in value:
                     if field not in fields:
                         return (code, f"Unrecognized argument to {key}: {field}{tail}")
+            # `$topN` / `$bottomN` are ACCUMULATOR-only: reached as an
+            # expression, mongod does not recognise the name at all and never
+            # looks at the spec. Inside `$group` they ARE accumulators, and the
+            # stage's own branch has already validated them -- without this gate
+            # every valid `{$group: {x: {$topN: {...}}}}` was rejected.
+            if key in _ACCUMULATOR_ONLY and stage != "$group":
+                return (168, f"Unrecognized expression '{key}'")
             if (code := _OBJECT_SPEC_EXPRESSIONS.get(key)) is not None and not isinstance(
                 value, Mapping
             ):
@@ -946,13 +1082,13 @@ def _expression_shape_problem(spec: Any) -> tuple[int, str] | None:
                     40516,
                     "$dateFromParts requires either 'year' or 'isoWeekYear' to be present",
                 )
-            found = _expression_shape_problem(value)
+            found = _expression_shape_problem(value, stage)
             if found:
                 return found
         return None
     if isinstance(spec, list):
         for item in spec:
-            found = _expression_shape_problem(item)
+            found = _expression_shape_problem(item, stage)
             if found:
                 return found
     return None
@@ -2609,25 +2745,38 @@ def _percentile_spec(arg: Any, op: str) -> tuple[Any, list[float] | None]:
             code=7429703,
             code_name="Location7429703",
         )
-    if "method" not in arg:
-        raise AggregateError(
-            f"BSON field '{op}.method' is missing but a required field",
-            code=40414,
-            code_name="IDLFailedToParse",
-        )
-    if arg["method"] != "approximate":
-        raise AggregateError(
-            "Currently only 'approximate' can be used as percentile 'method'.",
-            code=2,
-            code_name="BadValue",
-        )
+    # mongod validates in its IDL's FIELD DECLARATION order -- ``input``, then
+    # ``p`` (``$percentile`` only), then ``method`` -- so the first complaint is
+    # about the earliest declared field, not the first one this function happens
+    # to test. Checking ``method`` first made ``{$median: {}}`` name ``method``
+    # where 8.2.11 names ``input``, and made a bad ``method`` outrank a bad
+    # ``p``. Re-measured 2026-09-08; the ordering here previously came from a
+    # 7.0.12 probe.
     if "input" not in arg:
         raise AggregateError(
             f"BSON field '{op}.input' is missing but a required field",
             code=40414,
             code_name="IDLFailedToParse",
         )
+
+    def _check_method() -> None:
+        if "method" not in arg:
+            raise AggregateError(
+                f"BSON field '{op}.method' is missing but a required field",
+                code=40414,
+                code_name="IDLFailedToParse",
+            )
+        if arg["method"] != "approximate":
+            raise AggregateError(
+                # "as A percentile" -- the article is mongod's, and was missing
+                # here (8.2.11, 2026-09-08).
+                "Currently only 'approximate' can be used as a percentile 'method'.",
+                code=2,
+                code_name="BadValue",
+            )
+
     if op == "$median":
+        _check_method()
         return arg["input"], None
     if "p" not in arg:
         raise AggregateError(
@@ -2639,20 +2788,37 @@ def _percentile_spec(arg: Any, op: str) -> tuple[Any, list[float] | None]:
     if not isinstance(ps, list):
         raise AggregateError(
             "The $percentile 'p' field must be an array of numbers from "
-            f"[0.0, 1.0], but found: {ps}",
+            f"[0.0, 1.0], but found: {bson_value_repr(ps)}",
+            code=7750301,
+            code_name="Location7750301",
+        )
+    if not ps:
+        # An EMPTY array is the same complaint as a non-array (7750301), naming
+        # the array itself -- not a per-element error. Measured 8.2.11,
+        # 2026-09-08; this used to be accepted and produced an empty result.
+        raise AggregateError(
+            "The $percentile 'p' field must be an array of numbers from "
+            f"[0.0, 1.0], but found: {bson_value_repr(ps)}",
             code=7750301,
             code_name="Location7750301",
         )
     out: list[float] = []
     for p in ps:
-        if isinstance(p, bool) or not isinstance(p, (int, float)) or not 0.0 <= p <= 1.0:
+        # THREE codes, not one: a non-number element is 7750302 and a number
+        # out of [0, 1] is 7750303. The value renders in mongod's form, so a
+        # string is quoted and a null prints as `null` -- `{p}` gave `a` and
+        # `None`. Measured 8.2.11, 2026-09-08.
+        numeric = not isinstance(p, bool) and isinstance(p, (int, float))
+        if not numeric or not 0.0 <= p <= 1.0:
+            code = 7750303 if numeric else 7750302
             raise AggregateError(
                 "The $percentile 'p' field must be an array of numbers from "
-                f"[0.0, 1.0], but found: {p}",
-                code=7750303,
-                code_name="Location7750303",
+                f"[0.0, 1.0], but found: {bson_value_repr(p)}",
+                code=code,
+                code_name=f"Location{code}",
             )
         out.append(float(p))
+    _check_method()
     return arg["input"], out
 
 

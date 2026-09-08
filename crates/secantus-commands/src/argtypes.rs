@@ -1255,7 +1255,23 @@ pub fn expression_problem_in_pipeline(
             expression_problem(spec, &inner)
         } else if EXPR_MAP_STAGES.contains(&name.as_str()) {
             match spec {
-                Bson::Document(d) => d.iter().find_map(|(_, v)| expression_problem(v, bound)),
+                Bson::Document(d) => d.iter().find_map(|(field, v)| {
+                    // A `$group` output field is ACCUMULATOR position, which has
+                    // its own spec-shape codes; `_id` is an ordinary expression.
+                    if name == "$group" && field != "_id" {
+                        if let Some(problem) = accumulator_shape_problem(v) {
+                            return Some(problem);
+                        }
+                        // The accumulator NAME is not an expression -- `$topN`
+                        // is unknown as one -- so recurse into its ARGUMENTS
+                        // rather than the operator document itself. Walking the
+                        // whole thing rejected every valid `{$topN: {...}}`.
+                        if let Some(args) = accumulator_operand(v) {
+                            return args.iter().find_map(|a| expression_problem(a, bound));
+                        }
+                    }
+                    expression_problem(v, bound)
+                }),
                 _ => None,
             }
         } else if name == "$replaceRoot" {
@@ -1320,7 +1336,7 @@ pub fn expression_problem_in_pipeline(
         // anything is folded, which is why they carry the STAGE wrapper and not
         // the optimizer's. Mirrors `aggregate._expression_shape_problem`; the
         // Python server took the same fix.
-        let found = found.or_else(|| expression_shape_problem(spec));
+        let found = found.or_else(|| expression_shape_problem_in(spec, name));
         if let Some((code, msg)) = found {
             return Some((code, msg, wrapper));
         }
@@ -1513,6 +1529,146 @@ const OBJECT_SPEC_EXPRESSIONS: &[(&str, i32)] = &[
     ("$bottomN", 168),
 ];
 
+/// The SAME operators in ACCUMULATOR position -- a `$group` output field --
+/// where mongod uses DIFFERENT codes. `{$group: {x: {$median: 5}}}` is 7436100
+/// while `{$addFields: {x: {$median: 5}}}` is 7436201, and `$percentile` runs
+/// 7429703 / 7436200 the same way. Measured across all eight operators in both
+/// positions on 8.2.11 (2026-09-08); the table above had been applied in both,
+/// which was right for four of them and wrong for four.
+const OBJECT_SPEC_ACCUMULATORS: &[(&str, i32)] = &[
+    ("$firstN", 5787801),
+    ("$lastN", 5787801),
+    ("$minN", 5787900),
+    ("$maxN", 5787900),
+    ("$median", 7436100),
+    ("$percentile", 7429703),
+    ("$topN", 5788001),
+    ("$bottomN", 5788001),
+];
+
+/// Accumulator-only operators: in EXPRESSION position mongod does not know the
+/// name at all, so it never looks at the spec. The other six ARE expressions.
+const ACCUMULATOR_ONLY: &[&str] = &["$topN", "$bottomN"];
+
+/// The spec-shape error for a `$group` output field, in ACCUMULATOR position.
+///
+/// An ARRAY spec is one message for all eight -- "The <op> accumulator is a
+/// unary operator", 40237 -- while every other non-document carries the
+/// operator's own code. Measured 8.2.11, 2026-09-08.
+/// The argument expressions of a `$group` accumulator, or `None` when the value
+/// is not one of the document-spec accumulators.
+///
+/// Lets the walker recurse into an accumulator's ARGUMENTS without treating its
+/// NAME as an expression: `$topN` / `$bottomN` are accumulator-only, so walking
+/// `{$topN: {n: 2, ...}}` as an expression rejected valid pipelines.
+/// `$median` / `$percentile` field validation, at PARSE time.
+///
+/// The codes and wording are identical in both positions -- only the
+/// object-SHAPE codes differ -- so one check serves `$group` and `$addFields`
+/// alike. It lives in the parse walk rather than the evaluator because that is
+/// what gets the WRAPPER right: mongod raises these while parsing, so
+/// `$addFields` says `Invalid $addFields :: caused by ::` and `$group` says
+/// nothing at all, where an evaluator-raised error says "Executor error during
+/// aggregate". Order is the IDL's field declaration order. Measured 8.2.11,
+/// 2026-09-08.
+fn percentile_field_problem(op: &str, spec: &bson::Document) -> Option<(i32, String)> {
+    if op != "$median" && op != "$percentile" {
+        return None;
+    }
+    let missing = |field: &str| {
+        Some((
+            40414,
+            format!("BSON field '{op}.{field}' is missing but a required field"),
+        ))
+    };
+    if !spec.contains_key("input") {
+        return missing("input");
+    }
+    if op == "$percentile" {
+        let Some(raw) = spec.get("p") else {
+            return missing("p");
+        };
+        let bad = |v: &Bson, code: i32| {
+            Some((
+                code,
+                format!(
+                    "The $percentile 'p' field must be an array of numbers from \
+                     [0.0, 1.0], but found: {}",
+                    render_stage_value(v)
+                ),
+            ))
+        };
+        let Bson::Array(items) = raw else {
+            return bad(raw, 7750301);
+        };
+        if items.is_empty() {
+            return bad(raw, 7750301);
+        }
+        for item in items {
+            let f = match item {
+                Bson::Int32(n) => f64::from(*n),
+                Bson::Int64(n) => *n as f64,
+                Bson::Double(d) => *d,
+                other => return bad(other, 7750302),
+            };
+            if !(0.0..=1.0).contains(&f) {
+                return bad(item, 7750303);
+            }
+        }
+    }
+    match spec.get("method") {
+        None => missing("method"),
+        Some(Bson::String(m)) if m == "approximate" => None,
+        Some(_) => Some((
+            2,
+            "Currently only 'approximate' can be used as a percentile 'method'.".to_string(),
+        )),
+    }
+}
+
+fn accumulator_operand(value: &Bson) -> Option<Vec<&Bson>> {
+    let Bson::Document(d) = value else {
+        return None;
+    };
+    if d.len() != 1 {
+        return None;
+    }
+    let (op, spec) = d.iter().next()?;
+    if !OBJECT_SPEC_ACCUMULATORS.iter().any(|(name, _)| *name == op) {
+        return None;
+    }
+    match spec {
+        Bson::Document(inner) => Some(inner.iter().map(|(_, v)| v).collect()),
+        _ => None,
+    }
+}
+
+fn accumulator_shape_problem(value: &Bson) -> Option<(i32, String)> {
+    let Bson::Document(d) = value else {
+        return None;
+    };
+    if d.len() != 1 {
+        return None;
+    }
+    let (op, spec) = d.iter().next()?;
+    let (_, code) = OBJECT_SPEC_ACCUMULATORS
+        .iter()
+        .find(|(name, _)| *name == op)?;
+    if matches!(spec, Bson::Document(_)) {
+        return None;
+    }
+    if matches!(spec, Bson::Array(_)) {
+        return Some((40237, format!("The {op} accumulator is a unary operator")));
+    }
+    Some((
+        *code,
+        format!(
+            "specification must be an object; found {op}: {}",
+            render_stage_value(spec)
+        ),
+    ))
+}
+
 /// An unrecognised argument inside a date-operator spec: the operator's known
 /// arguments, its code, and the tail three of them append.
 const DATE_SPEC_ARGUMENTS: &[(&str, &[&str], i32, &str)] = &[
@@ -1578,7 +1734,12 @@ const DATE_SPEC_ARGUMENTS: &[(&str, &[&str], i32, &str)] = &[
 /// These are raised while building the expression tree, before anything folds,
 /// so the caller gives them the stage's wrapper. Several of them were answered
 /// `ok` here -- a spec with an unrecognised date argument simply ignored it.
-pub(crate) fn expression_shape_problem(spec: &Bson) -> Option<(i32, String)> {
+/// `stage` is the enclosing stage name, threaded through the whole walk: inside
+/// `$group` the accumulator-only operators are legal and the stage's own branch
+/// has already validated them, so the "Unrecognized expression" rule must not
+/// fire there. Passing it only at the top and losing it in the recursion
+/// rejected every valid `{$group: {x: {$topN: {...}}}}`.
+pub(crate) fn expression_shape_problem_in(spec: &Bson, stage: &str) -> Option<(i32, String)> {
     match spec {
         Bson::Document(d) => {
             for (key, value) in d {
@@ -1768,7 +1929,16 @@ pub(crate) fn expression_shape_problem(spec: &Bson) -> Option<(i32, String)> {
                                 format!("BSON field '{key}.{bad}' is an unknown field."),
                             ));
                         }
+                        // ... and then its required fields, in declaration order.
+                        if let Some(found) = percentile_field_problem(key, spec) {
+                            return Some(found);
+                        }
                     }
+                }
+                // `$topN` / `$bottomN` are ACCUMULATOR-only: reached as an
+                // expression, mongod does not recognise the name at all.
+                if ACCUMULATOR_ONLY.contains(&key.as_str()) && stage != "$group" {
+                    return Some((168, format!("Unrecognized expression '{key}'")));
                 }
                 if let Some((_, code)) = OBJECT_SPEC_EXPRESSIONS.iter().find(|(op, _)| *op == key) {
                     if !matches!(value, Bson::Document(_)) {
@@ -1804,13 +1974,15 @@ pub(crate) fn expression_shape_problem(spec: &Bson) -> Option<(i32, String)> {
                         }
                     }
                 }
-                if let Some(found) = expression_shape_problem(value) {
+                if let Some(found) = expression_shape_problem_in(value, stage) {
                     return Some(found);
                 }
             }
             None
         }
-        Bson::Array(a) => a.iter().find_map(expression_shape_problem),
+        Bson::Array(a) => a
+            .iter()
+            .find_map(|item| expression_shape_problem_in(item, stage)),
         _ => None,
     }
 }
@@ -3386,7 +3558,7 @@ mod expression_shape_tests {
     use bson::{doc, Bson};
 
     fn problem(expr: Bson) -> (i32, String) {
-        expression_shape_problem(&expr).expect("expected a parse error")
+        expression_shape_problem_in(&expr, "").expect("expected a parse error")
     }
 
     #[test]
@@ -3416,11 +3588,11 @@ mod expression_shape_tests {
     fn a_date_extractor_takes_a_one_element_array_or_a_bare_value() {
         // Legal: exactly one element, or not an array at all.
         assert_eq!(
-            expression_shape_problem(&bson::bson!({"$year": ["$d"]})),
+            expression_shape_problem_in(&bson::bson!({"$year": ["$d"]}), ""),
             None
         );
         assert_eq!(
-            expression_shape_problem(&bson::bson!({"$year": "$d"})),
+            expression_shape_problem_in(&bson::bson!({"$year": "$d"}), ""),
             None
         );
         for n in [0usize, 2, 3] {
@@ -3440,6 +3612,12 @@ mod expression_shape_tests {
 
     #[test]
     fn each_object_spec_expression_carries_its_own_code() {
+        // EXPRESSION position. `$topN` / `$bottomN` are absent on purpose: they
+        // are accumulator-only, so mongod does not recognise the name here and
+        // never reaches the spec. This test used to include them, asserting
+        // "specification must be an object; found $topN: 0" -- and PASSED,
+        // because "Unrecognized expression" carries code 168 too and only the
+        // code was ever right. Measured 8.2.11, 2026-09-08.
         for (op, code) in [
             ("$firstN", 5787801),
             ("$lastN", 5787801),
@@ -3447,8 +3625,6 @@ mod expression_shape_tests {
             ("$maxN", 5787900),
             ("$median", 7436201),
             ("$percentile", 7436200),
-            ("$topN", 168),
-            ("$bottomN", 168),
         ] {
             let mut d = bson::Document::new();
             d.insert(op, 0);
@@ -3459,6 +3635,47 @@ mod expression_shape_tests {
                 format!("specification must be an object; found {op}: 0")
             );
         }
+        for op in ["$topN", "$bottomN"] {
+            let mut d = bson::Document::new();
+            d.insert(op, 0);
+            let (got, msg) = problem(Bson::Document(d));
+            assert_eq!((got, msg), (168, format!("Unrecognized expression '{op}'")));
+        }
+    }
+
+    /// ACCUMULATOR position -- a `$group` output field -- where the same eight
+    /// operators use DIFFERENT codes, and an array spec is one message for all
+    /// of them. Measured 8.2.11, 2026-09-08.
+    #[test]
+    fn accumulator_position_has_its_own_object_spec_codes() {
+        for (op, code) in OBJECT_SPEC_ACCUMULATORS {
+            let mut inner = bson::Document::new();
+            inner.insert(*op, 0);
+            let got = accumulator_shape_problem(&Bson::Document(inner)).expect(op);
+            assert_eq!(
+                got,
+                (
+                    *code,
+                    format!("specification must be an object; found {op}: 0")
+                ),
+                "{op} scalar"
+            );
+            let mut arr = bson::Document::new();
+            arr.insert(*op, vec![1, 2]);
+            let got = accumulator_shape_problem(&Bson::Document(arr)).expect(op);
+            assert_eq!(
+                got,
+                (40237, format!("The {op} accumulator is a unary operator")),
+                "{op} array"
+            );
+        }
+        // A document spec is the operator's own business, not a shape error.
+        let mut ok = bson::Document::new();
+        let mut spec = bson::Document::new();
+        spec.insert("input", "$v");
+        spec.insert("method", "approximate");
+        ok.insert("$median", spec);
+        assert_eq!(accumulator_shape_problem(&Bson::Document(ok)), None);
     }
 
     #[test]
@@ -3519,7 +3736,7 @@ mod expression_shape_tests {
             bson::bson!({"$year": "$d"}),
             bson::bson!({"$add": [1, 2]}),
         ] {
-            assert_eq!(expression_shape_problem(&expr), None, "{expr:?}");
+            assert_eq!(expression_shape_problem_in(&expr, ""), None, "{expr:?}");
         }
     }
 }
