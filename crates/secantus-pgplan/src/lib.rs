@@ -654,6 +654,15 @@ pub enum ConstCol {
         value: Bson,
         is_local: bool,
     },
+    /// `pg_backend_pid()` -- the connection's own backend PID, which only the
+    /// server knows (pgwire assigns it during startup).
+    BackendPid,
+    /// `pg_terminate_backend(pid)` -- terminate the backend with that PID. The
+    /// argument is itself a `ConstCol` because it may be a literal, a bound
+    /// parameter, or a nested `pg_backend_pid()` (the common `SELECT
+    /// pg_terminate_backend(pg_backend_pid())`), all of which the server
+    /// resolves at execution.
+    TerminateBackend(Box<ConstCol>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3190,6 +3199,58 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                         },
                         col,
                         "text".to_string(),
+                        -1,
+                    ));
+                    continue;
+                }
+                // `pg_backend_pid()` and `pg_terminate_backend(pid)` need the
+                // connection's identity, which the stateless planner does not
+                // have -- they become `ConstCol`s the server resolves.
+                if name == "pg_backend_pid" {
+                    columns.push((
+                        if rt.name.is_empty() {
+                            "pg_backend_pid".to_string()
+                        } else {
+                            rt.name.clone()
+                        },
+                        ConstCol::BackendPid,
+                        "int4".to_string(),
+                        -1,
+                    ));
+                    continue;
+                }
+                if name == "pg_terminate_backend" {
+                    let arg = f.args.first().ok_or_else(|| {
+                        Error::Unsupported("pg_terminate_backend() without a PID".into())
+                    })?;
+                    // The PID may itself be `pg_backend_pid()` -- resolve that
+                    // nesting into a `BackendPid` the server fills in, so the
+                    // idiomatic `pg_terminate_backend(pg_backend_pid())` works.
+                    let is_backend_pid = matches!(
+                        arg.node.as_ref(),
+                        Some(N::FuncCall(inner)) if inner
+                            .funcname
+                            .iter()
+                            .filter_map(|n| match n.node.as_ref()? {
+                                N::String(st) => Some(st.sval.as_str()),
+                                _ => None,
+                            })
+                            .next_back()
+                            == Some("pg_backend_pid")
+                    );
+                    let inner = if is_backend_pid {
+                        ConstCol::BackendPid
+                    } else {
+                        ConstCol::Value(const_value(arg, params)?)
+                    };
+                    columns.push((
+                        if rt.name.is_empty() {
+                            "pg_terminate_backend".to_string()
+                        } else {
+                            rt.name.clone()
+                        },
+                        ConstCol::TerminateBackend(Box::new(inner)),
+                        "bool".to_string(),
                         -1,
                     ));
                     continue;

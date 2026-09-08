@@ -513,6 +513,48 @@ rather than silently dropped. Two of the sixteen remain open — see below.
       back to the text bytes. Untested by the psycopg suite; note if a gauge
       ever exercises it.
 
+**Rust pgserver connection error / lifecycle — LANDED 2026-09-08 (psycopg's
+`vendor/psycopg/tests/test_connection.py`, oracle PostgreSQL 16; 11 → 6
+failures).** `pg_backend_pid()` and `pg_terminate_backend(pid)` are implemented
+(self-termination raises a FATAL `57P01` and closes the socket; cross-connection
+arms a per-backend flag the victim honours at its next statement; unknown PID →
+`false`). An error inside a transaction now poisons the block from every path
+that can raise it — the simple protocol's `split_statements` and the extended
+protocol's `Describe`, not only `Execute` — so the next statement gets `25P02`.
+A FATAL over the simple query protocol now closes the socket without a trailing
+`ReadyForQuery`, so the client reads the connection as broken. Fixed
+`test_broken`, `test_broken_connection`, `test_right_exception_on_server_disconnect`,
+`test_context_inerror_rollback_no_clobber`, `test_auto_transaction_fail`. Six
+remain open:
+
+- [ ] **OPEN — RUST pgserver: `test_cancel_safe_error` / `test_cancel_safe_timeout`
+      need real query cancellation.** These drive `conn.cancel_safe()` through a
+      `pproxy` man-in-the-middle (also not installed) and expect the
+      CancelRequest backend protocol. The server assigns a secret key at startup
+      (pgwire) but does not act on a CancelRequest. Sized as a protocol slice
+      (wire the pgwire CancellationManager to interrupt an in-flight query),
+      deferred from this batch. Marked `slow`/`timing`.
+- [ ] **OPEN — RUST pgserver: `test_connect_bad` — connecting with a nonexistent
+      database is accepted, not rejected with `3D000`.** The server hardcodes the
+      `postgres` namespace (`PgHandler::new(storage, "postgres")`) and ignores the
+      startup `database` parameter entirely, so `dbname=nosuchdb` silently uses
+      `postgres` storage. A real fix needs a database registry and a startup-time
+      rejection (FATAL `3D000` before `ReadyForQuery`); the server has no
+      multi-database concept today. Deferred — separate feature, not error mapping.
+- [ ] **OPEN — RUST pgserver: `test_commit_error` needs DEFERRABLE constraints.**
+      Expects a `DEFERRABLE INITIALLY DEFERRED` FK to fire `ForeignKeyViolation`
+      at `COMMIT`, not at the statement. No constraint-deferral machinery exists.
+      Deferred — feature build.
+- [ ] **OPEN — RUST pgserver: `test_right_exception_on_session_timeout` needs
+      `idle_in_transaction_session_timeout`.** Expects an idle transaction to be
+      killed with `25P03` (`IdleInTransactionSessionTimeout`) after the GUC's
+      window. The GUC is accepted but not enforced (no idle timer). Deferred —
+      needs a per-connection idle timer wired to the accept loop.
+- [ ] **OPEN — RUST pgserver: `test_notice_handlers` needs `DO` / plpgsql +
+      `NoticeResponse`.** Uses `do $$ begin raise notice ... end$$ language
+      plpgsql`; the planner refuses `DoStmt` (`0A000`) and the server has no
+      notice-emission seam. Deferred — plpgsql is a large separate feature.
+
 **Rust server errors where Python defers — MEASURED 2026-08-26, and the five
 entries describing it are largely stale.** A three-way probe of 45
 query / update / aggregate constructs against the standalone `secantusd-rs`

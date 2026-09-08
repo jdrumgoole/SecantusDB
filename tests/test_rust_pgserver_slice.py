@@ -4187,3 +4187,85 @@ def test_generate_series_with_a_cast_in_the_target_list(home: Path) -> None:
         assert [r[0] for r in cur.fetchall()] == ["1", "2"]
         with pytest.raises(psycopg.errors.FeatureNotSupported):
             cur.execute("select generate_series(1, 3) where false")
+
+
+def test_pg_backend_pid_returns_the_connections_pid(home: Path) -> None:
+    """`pg_backend_pid()` reports the same PID the startup BackendKeyData did.
+
+    The server only knows the PID pgwire assigned during startup, so the
+    function is resolved from connection state rather than the stateless
+    planner. Probed against PG 14, where the two always agree.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("select pg_backend_pid()")
+        (pid,) = cur.fetchone()
+        assert pid == conn.pgconn.backend_pid
+        assert isinstance(pid, int)
+
+
+def test_pg_terminate_backend_on_self_breaks_the_connection(home: Path) -> None:
+    """`pg_terminate_backend(pg_backend_pid())` ends the connection with a
+    57P01, exactly as a real backend torn down by an administrator does. The
+    connection must read as CLOSED afterwards -- the simple protocol carries no
+    ReadyForQuery on a FATAL, so the client learns the socket is gone. Probed
+    against PG 14."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        with pytest.raises(psycopg.OperationalError) as exc:
+            cur.execute("select pg_terminate_backend(pg_backend_pid())")
+        assert exc.value.sqlstate == "57P01"
+        assert isinstance(exc.value, psycopg.errors.AdminShutdown)
+        assert conn.closed
+
+
+def test_pg_terminate_backend_with_a_bound_pid_parameter(home: Path) -> None:
+    """The same self-termination through the extended protocol: the PID is a
+    bound parameter rather than a nested call. psycopg raises AdminShutdown and
+    the connection breaks. Probed against PG 14."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        with pytest.raises(psycopg.errors.AdminShutdown):
+            cur.execute("select pg_terminate_backend(%s)", [conn.pgconn.backend_pid])
+        assert conn.closed
+
+
+def test_pg_terminate_backend_across_connections(home: Path) -> None:
+    """One connection terminates ANOTHER by PID. The victim notices at its next
+    statement and ends with 57P01; terminating a PID that is not a live backend
+    returns false. Probed against PG 14."""
+    with _Server(home) as server, server.connect() as victim, server.connect() as killer:
+        victim_pid = victim.pgconn.backend_pid
+        kcur = killer.cursor()
+        kcur.execute("select pg_terminate_backend(%s)", [victim_pid])
+        assert kcur.fetchone() == (True,)
+        # The victim finds out on its next statement.
+        with pytest.raises(psycopg.OperationalError) as exc:
+            victim.execute("select 1")
+        assert exc.value.sqlstate == "57P01"
+        # A PID nobody is using is not a backend -> false.
+        kcur.execute("select pg_terminate_backend(2147483)")
+        assert kcur.fetchone() == (False,)
+
+
+def test_error_inside_transaction_poisons_the_block(home: Path) -> None:
+    """A syntax error inside a transaction aborts the block: every later
+    statement gets 25P02 until COMMIT/ROLLBACK, and the COMMIT of a failed
+    block rolls back. This holds whether the failing statement fails while the
+    simple protocol SPLITS it or while the extended protocol DESCRIBES it.
+    Probed against PG 14."""
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        cur = conn.cursor()
+        cur.execute("create table foo (id int primary key)")
+        cur.execute("begin")
+        cur.execute("insert into foo values (1)")
+        with pytest.raises(psycopg.errors.SyntaxError):
+            cur.execute("meh")
+        # The block is now aborted: a perfectly valid statement is refused.
+        with pytest.raises(psycopg.errors.InFailedSqlTransaction) as exc:
+            cur.execute("select 1")
+        assert exc.value.sqlstate == "25P02"
+        # COMMIT of a failed block discards the write.
+        cur.execute("commit")
+        cur.execute("select count(*) from foo")
+        assert cur.fetchone() == (0,)
