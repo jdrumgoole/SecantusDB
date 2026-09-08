@@ -4997,6 +4997,41 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   only as the SOLE target: `select 1, generate_series(1,3)` — which repeats the
   other columns across the generated rows — is refused, as is more than one
   set-returning target in one list.
+- **Rust PG server — psycopg CURSOR gaps (map, 2026-09-08).** Ran psycopg 3's own
+  `test_cursor*.py` against `secantusd-pg` (~151 failures before). The task's
+  `cursor.rowcount`-tag theory did **not** hold — the row-count tags
+  (`SELECT n` / `UPDATE n` / `DELETE n` / `INSERT 0 n`) are already correct; the
+  real shared blockers were two SQL gaps every server-cursor test hit.
+  **LANDED (+38 measured, `pgserver-cursor`):**
+  - `pg_cursors` virtual catalog table over the connection's open cursors
+    (psycopg's server cursor reads it directly and as `SELECT 1 FROM
+    pg_catalog.pg_cursors WHERE name = ...` before closing a stolen cursor).
+  - `ColumnExpr::Const` — a literal select-list column (`SELECT 1 FROM t`,
+    `SELECT 1 FROM generate_series(...)`), named `?column?`, one value per row.
+
+  **DEFERRED (mapped, not started):**
+  - **`INSERT INTO t SELECT <query>`** (e.g. `... SELECT generate_series(1, 42)`)
+    inserts nothing / reports `INSERT 0 0`: `plan_insert` only reads
+    `sel.values_lists`. Needs the executor to run the inner SELECT and stream its
+    rows into the insert (cross-layer). Blocks `test_rowcount` (×3) and
+    `test_executemany_returning`-adjacent shapes.
+  - **`generate_series(...)::int4` and other casts over a SRF projection** — a
+    `TypeCast`/`FuncCall` wrapping the series target in the SELECT LIST is refused
+    (`function generate_series() is not supported yet`). Blocks `test_description`,
+    `test_binary_cursor_execute`, `test_execute_binary`, `test_binary_cursor_text_override`.
+  - **WITHOUT HOLD cursors are not dropped on COMMIT/ROLLBACK** — `test_no_hold`
+    expects a post-commit `fetch` to raise `InvalidCursorName`; our cursors
+    persist across transaction boundaries (task-flagged as deferrable).
+  - **`NO SCROLL` is not enforced** — `test_non_scrollable` expects a backward
+    scroll on a `NO SCROLL` cursor to raise `OperationalError`; every cursor is
+    materialised and scrolls both ways. (`is_scrollable` is now REPORTED
+    correctly in `pg_cursors`, just not enforced on FETCH/MOVE.)
+  - **Streaming / no-column cursors** — `server sent data ("D") without prior row
+    description ("T")` on `test_stream_no_col`; `at least one column expected` on
+    `test_row_maker_returns_none`.
+  - `test_leak` failures are a randomised memory-leak probe round-tripping random
+    values — type-fidelity noise, not cursor mechanics; the failing params shuffle
+    per run.
 - **Rust PG server: DDL IS NOT TRANSACTIONAL.** `CREATE TABLE` inside a
   transaction survives a `ROLLBACK` (and so do rows inserted into it);
   `DROP TABLE` inside one stays dropped. PostgreSQL rolls both back. Measured

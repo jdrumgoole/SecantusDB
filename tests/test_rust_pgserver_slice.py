@@ -1899,6 +1899,73 @@ def test_a_cursor_over_generate_series(home: Path) -> None:
         cur.execute("close c")
 
 
+def test_pg_cursors_lists_open_cursors(home: Path) -> None:
+    """`pg_cursors` reports THIS connection's open cursors.
+
+    psycopg's server cursor reads it two ways: the suite queries it directly to
+    prove a cursor is gone after ``CLOSE``, and the driver itself probes
+    ``SELECT 1 FROM pg_catalog.pg_cursors WHERE name = ...`` before closing a
+    cursor it did not declare. Both the ``*`` and the ``SELECT 1`` shapes must
+    work, and CLOSE must make the row disappear.
+    """
+    with _Server(home) as server, server.connect() as conn, conn.transaction():
+        cur = conn.cursor()
+        cur.execute("declare mycur no scroll cursor for select generate_series(1, 5)")
+
+        row = conn.execute(
+            "select name, statement, is_holdable, is_binary, is_scrollable "
+            "from pg_cursors where name = 'mycur'"
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "mycur"
+        assert "generate_series" in row[1]
+        assert row[2] is False  # not WITH HOLD
+        assert row[3] is False  # not BINARY
+        assert row[4] is False  # NO SCROLL
+
+        # The driver's existence probe (the pg_catalog-qualified SELECT 1).
+        assert conn.execute(
+            "select 1 from pg_catalog.pg_cursors where name = 'mycur'"
+        ).fetchone() == (1,)
+        # A name that was never declared is simply absent.
+        assert conn.execute("select * from pg_cursors where name = 'nope'").fetchone() is None
+
+        cur.execute("close mycur")
+        assert conn.execute("select * from pg_cursors where name = 'mycur'").fetchone() is None
+
+
+def test_constant_select_list_column(home: Path) -> None:
+    """`SELECT 1 FROM <source>` — a literal column, one per row.
+
+    The value ignores the row entirely; an unaliased constant is named
+    ``?column?`` as PostgreSQL does. This is how a client counts a source's
+    rows (``cur.rowcount``) without reading its values, and it works over both a
+    real table and a `generate_series`.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table t (id int primary key)")
+        conn.execute("insert into t values (1),(2),(3)")
+
+        cur = conn.cursor()
+        cur.execute("select 1 from t")
+        assert cur.fetchall() == [(1,), (1,), (1,)]
+        assert cur.rowcount == 3
+        assert cur.description[0].name == "?column?"
+        assert cur.description[0].type_code == 23  # int4
+
+        # An alias names the column; the value is still the constant.
+        cur.execute("select 7 as k from t")
+        assert cur.fetchall() == [(7,), (7,), (7,)]
+        assert cur.description[0].name == "k"
+
+        # Over a generate_series, including the empty case.
+        cur.execute("select 1 from generate_series(1, 42)")
+        assert cur.rowcount == 42
+        cur.execute("select 1 from generate_series(1, 0)")
+        assert cur.fetchall() == []
+        assert cur.rowcount == 0
+
+
 def test_copy_out_formats_keep_null_and_empty_apart(home: Path) -> None:
     """COPY's three formats differ mainly in how they spell NULL.
 
