@@ -419,6 +419,37 @@ predicates, and partial-index reflection (`pg_indexes.indexdef` drops the
 named gap needs its specific case to reproduce. Same lesson as the Rust class:
 **the count overstates the work; reproduce before planning.**
 
+**Rust pgserver COPY — landed and still-open (measured 2026-09-08 against
+psycopg's `vendor/psycopg/tests/test_copy.py`, oracle PostgreSQL 14; 54 → 24
+failures).** LANDED this pass: `serial`/`bigserial`/`smallserial` normalise to
+their integer type so COPY stores/returns ints not strings; `COPY (VALUES ...)
+TO STDOUT` (and a bare `VALUES` query) now returns rows via a new
+`ValuesConstant` plan; text COPY unescaping is complete (`\b \f \v`, octal, hex,
+run once instead of a double-unescape that corrupted `\end`). STILL OPEN, mapped
+for a follow-up:
+  - **COPY BINARY of an array** (`test_read_rows` binary, 2 tests): `float8[]`
+    etc. go out as their TEXT under the array OID, so the client reads garbage
+    dimensions. Needs the real PG binary array wire format (ndim / hasnull /
+    elem-oid / dims / per-element length-prefixed binary) — a per-type binary
+    codec, deferred as a balloon.
+  - **Transaction status after a simple-protocol COPY** (`test_copy_in_empty`
+    ×2, `test_copy_out_error_with_copy_not_finished`): psycopg drives COPY over
+    the *simple* query protocol, and vendored `pgwire` 0.40's process loop
+    hardcodes `ReadyForQuery(TransactionStatus::Idle)` after a simple-protocol
+    CopyDone, ignoring the open transaction. Not fixable from our `CopyHandler`
+    — needs a pgwire change / patch.
+  - **`serial` implicit sequence** (`test_copy_in_records_binary` ×2): the Rust
+    server has no `nextval` default, so a COPY that omits the serial column
+    can't auto-fill `1, 2, ...` the way the Python server does.
+  - **Faker exotic-type round-trips** (`test_copy_to_leaks`/`from_leaks`/
+    `table_across`): numeric-range/multirange comparison, high-precision
+    `numeric`, `inet`/`cidr` binary, `ObjectId` leaking into an integer column —
+    broad type-support work overlapping the type-catalog area, out of COPY scope.
+  - **SQL-helper gaps unrelated to COPY** (`test_copy_*_allchars`,
+    `test_copy_out_server_error`): `unnest()`, `GROUP BY` over an expression, and
+    a bare `AExpr` (`1/n`) in the COPY source query are unsupported SQL, not COPY
+    bugs.
+
 **Rust server errors where Python defers — MEASURED 2026-08-26, and the five
 entries describing it are largely stale.** A three-way probe of 45
 query / update / aggregate constructs against the standalone `secantusd-rs`

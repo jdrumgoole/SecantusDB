@@ -1998,6 +1998,68 @@ def test_copy_binary_round_trips(home: Path) -> None:
         assert cur.fetchall() == [(1, "x", 10), (2, None, None), (3, "", 30)]
 
 
+def test_copy_from_stdin_serial_column_stores_integers(home: Path) -> None:
+    """A `serial` column typed through COPY stores an integer, not a string.
+
+    `serial` is a PostgreSQL pseudo-type: it resolves to `int4`. Before the
+    catalog normalised it the column stayed typed `serial`, so a COPY field
+    parsed as text and `40010` came back as the string ``"40010"`` — the shape
+    psycopg's `test_copy_in_*` cluster caught.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE s (col1 serial primary key, col2 int, data text)")
+        with cur.copy("COPY s (col1, col2, data) FROM STDIN") as cp:
+            cp.write("40010\t40020\thello\n40040\t\\N\tworld\n")
+        cur.execute("SELECT col1, col2, data FROM s ORDER BY col1")
+        assert cur.fetchall() == [(40010, 40020, "hello"), (40040, None, "world")]
+
+
+def test_copy_out_of_a_values_query(home: Path) -> None:
+    """`COPY (VALUES ...) TO STDOUT` reads every literal row.
+
+    A bare multi-row ``VALUES`` list is planned as a `ValuesConstant`. Before
+    that it fell through the single-row constant path and produced no rows, so
+    `copy (values (1),(2)) to stdout` returned an empty body.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        q = (
+            "copy (values (40010::int, 40020::int, 'hello'::text), "
+            "(40040, NULL, 'world')) to stdout"
+        )
+        with cur.copy(q) as cp:
+            assert b"".join(cp) == b"40010\t40020\thello\n40040\t\\N\tworld\n"
+        # The same VALUES executed directly returns its rows, correctly typed.
+        cur.execute("values (1, 'a'), (2, 'b')")
+        assert cur.fetchall() == [(1, "a"), (2, "b")]
+
+
+def test_copy_text_round_trips_control_characters(home: Path) -> None:
+    """Text COPY preserves the C0 control bytes PostgreSQL backslash-escapes.
+
+    psycopg escapes exactly ``\\b \\t \\n \\v \\f \\r \\\\`` on the way out;
+    reading back only ``\\t \\n \\r \\\\`` turned a backspace into a literal
+    ``b`` — silent data corruption of any text carrying those bytes.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE c (id int primary key, data text)")
+        payload = "".join(chr(b) for b in range(1, 32)) + "\\end"
+        with cur.copy("COPY c (id, data) FROM STDIN") as cp:
+            cp.write_row([1, payload])
+        cur.execute("SELECT data FROM c WHERE id = 1")
+        assert cur.fetchone() == (payload,)
+        # And it survives a full COPY TO -> COPY FROM round trip.
+        with cur.copy("COPY c TO STDOUT") as cp:
+            blob = b"".join(cp)
+        cur.execute("DELETE FROM c")
+        with cur.copy("COPY c FROM STDIN") as cp:
+            cp.write(blob)
+        cur.execute("SELECT data FROM c WHERE id = 1")
+        assert cur.fetchone() == (payload,)
+
+
 def test_a_table_created_in_a_transaction_is_visible_to_it(home: Path) -> None:
     """`CREATE TABLE` then use it, without committing in between.
 

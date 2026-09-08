@@ -159,6 +159,11 @@ pub enum Statement {
     Insert(Insert),
     Select(Select),
     SelectConstant(SelectConstant),
+    /// A bare `VALUES (...), (...)` query -- a fixed set of literal rows with no
+    /// FROM. `SelectConstant` is its single-row cousin; this is what a
+    /// multi-row `VALUES` list (`copy (values ...) to stdout`, or `VALUES`
+    /// executed directly) becomes.
+    ValuesConstant(ValuesConstant),
     Transaction(TransactionControl),
     DropTable(DropTable),
     /// `CREATE TYPE <name> AS ENUM (<labels>)`.
@@ -557,6 +562,20 @@ pub enum ConstCol {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ValuesConstant {
+    /// Output column names. A bare `VALUES` names them `column1`, `column2`,
+    /// ... in PostgreSQL, which is what a client sees for
+    /// `copy (values ...) to stdout` too.
+    pub names: Vec<String>,
+    /// The declared PostgreSQL type of each column, carried explicitly for the
+    /// same reason `SelectConstant` does: the describe pass names the columns
+    /// before any row is seen.
+    pub types: Vec<String>,
+    /// The already-resolved literal rows, each with one value per column.
+    pub rows: Vec<Vec<Bson>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct SelectConstant {
     /// (output name, column, declared PostgreSQL type).
     ///
@@ -895,6 +914,22 @@ fn split_qualified_type_name(
     }
 }
 
+/// Resolve a `serial` pseudo-type to its underlying integer type.
+///
+/// PostgreSQL's `smallserial`/`serial`/`bigserial` (and their `serial2`/
+/// `serial4`/`serial8` aliases) are not real types: the parser rewrites them
+/// to `int2`/`int4`/`int8` with an attached sequence default. We keep the
+/// integer type so the column behaves as an integer everywhere; the implicit
+/// sequence default is a separate feature. Any other name passes through.
+fn normalize_serial(ty: &str) -> String {
+    match ty.to_ascii_lowercase().as_str() {
+        "smallserial" | "serial2" => "int2".to_string(),
+        "serial" | "serial4" => "int4".to_string(),
+        "bigserial" | "serial8" => "int8".to_string(),
+        _ => ty.to_string(),
+    }
+}
+
 /// The declared type of a `TypeName`, including its array brackets.
 ///
 /// libpg_query keeps `int[]` as the name `int4` plus a non-empty
@@ -947,6 +982,11 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
         match el.node.as_ref() {
             Some(N::ColumnDef(cd)) => {
                 let ty = cd.type_name.as_ref().map(type_name_of).unwrap_or_default();
+                // `serial` family are pseudo-types: PostgreSQL resolves them to
+                // the underlying integer type (plus an implicit sequence
+                // default). We store the integer type so the column reads and
+                // writes as `int4`/`int8`/`int2` on the wire and through COPY.
+                let ty = normalize_serial(&ty);
                 let pk = cd.constraints.iter().any(|c| {
                     matches!(c.node.as_ref(), Some(N::Constraint(k))
                         if k.contype == pg_query::protobuf::ConstrType::ConstrPrimary as i32)
@@ -2671,7 +2711,60 @@ fn plan_select_srf(
     })))
 }
 
+/// Plan a bare `VALUES (...), (...)` query into a `ValuesConstant`.
+///
+/// Each row's cells are resolved to values, and every column's declared type
+/// is taken from the first row that gives it a non-null literal (PostgreSQL
+/// unifies the column type across rows; taking the first typed cell covers the
+/// cases a client actually sends, including `VALUES (1, NULL), (2, 3)` where
+/// the second row is what types the nullable column).
+fn plan_values_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> Result<Statement> {
+    let mut rows: Vec<Vec<Bson>> = Vec::with_capacity(s.values_lists.len());
+    let mut types: Vec<String> = Vec::new();
+    let mut width = 0usize;
+    for vl in &s.values_lists {
+        let items = match vl.node.as_ref() {
+            Some(N::List(l)) => &l.items,
+            _ => return Err(Error::Unsupported("this VALUES form".into())),
+        };
+        if types.is_empty() {
+            width = items.len();
+            types = vec![String::new(); width];
+        } else if items.len() != width {
+            return Err(Error::Unsupported(
+                "VALUES rows of differing widths".into(),
+            ));
+        }
+        let mut row = Vec::with_capacity(items.len());
+        for (i, item) in items.iter().enumerate() {
+            let value = const_value(item, params)?;
+            // Fill in this column's type from the first row that offers a
+            // non-null typed cell.
+            if types[i].is_empty() && !matches!(value, Bson::Null) {
+                types[i] = static_type(item, &value);
+            }
+            row.push(value);
+        }
+        rows.push(row);
+    }
+    // A column that was NULL in every row defaults to `text`, as PostgreSQL
+    // resolves an all-unknown VALUES column.
+    for t in &mut types {
+        if t.is_empty() {
+            *t = "text".to_string();
+        }
+    }
+    let names = (1..=width).map(|i| format!("column{i}")).collect();
+    Ok(Statement::ValuesConstant(ValuesConstant { names, types, rows }))
+}
+
 fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> Result<Statement> {
+    // A bare `VALUES (...), (...)` -- a multi-row literal source with no target
+    // list at all. `SelectConstant` below is the single-row case; a multi-row
+    // one carries its own rows so COPY and a direct query both read them.
+    if !s.values_lists.is_empty() && s.target_list.is_empty() {
+        return plan_values_constant(s, params);
+    }
     // A SET-RETURNING function in the target list of a FROM-less select is not
     // a constant at all: `select generate_series(1,3)` is three ROWS. It is
     // planned as an ordinary select over a generated source, which is what the

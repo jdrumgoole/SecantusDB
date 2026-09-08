@@ -1958,6 +1958,15 @@ impl PgHandler {
                     FieldInfo::new(name.clone(), None, None, wire_type(ty), FieldFormat::Text)
                 })
                 .collect()),
+            Statement::ValuesConstant(vc) => Ok(vc
+                .names
+                .iter()
+                .zip(&vc.types)
+                .map(|(name, ty)| {
+                    let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
+                    FieldInfo::new(name.clone(), None, None, wire, FieldFormat::Text)
+                })
+                .collect()),
             Statement::Select(sel) => match &sel.series {
                 Some(_) => Ok(sel
                     .columns
@@ -2002,6 +2011,13 @@ impl PgHandler {
                 row.push(Some(self.resolve_const_col(col)?));
             }
             return Ok(vec![row]);
+        }
+        if let Statement::ValuesConstant(vc) = inner {
+            return Ok(vc
+                .rows
+                .iter()
+                .map(|r| r.iter().map(|v| Some(v.clone())).collect())
+                .collect());
         }
         let Statement::Select(sel) = inner else {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -3630,6 +3646,29 @@ impl PgHandler {
                 Ok(vec![Response::Query(QueryResponse::new(schema, rows))])
             }
 
+            Statement::ValuesConstant(vc) => {
+                // A fixed set of literal rows, no storage touched.
+                let schema = Arc::new(
+                    vc.names
+                        .iter()
+                        .zip(&vc.types)
+                        .map(|(name, ty)| {
+                            let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
+                            self.field(name.clone(), wire)
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                let schema_ref = schema.clone();
+                let rows = stream::iter(vc.rows).map(move |vals| {
+                    let mut enc = DataRowEncoder::new(schema_ref.clone());
+                    for (i, v) in vals.iter().enumerate() {
+                        encode_field_value(&mut enc, &schema_ref[i], Some(v), &row_tz)?;
+                    }
+                    Ok(enc.take_row())
+                });
+                Ok(vec![Response::Query(QueryResponse::new(schema, rows))])
+            }
+
             Statement::Aggregate(agg) => {
                 // A generated source, as for a plain SELECT: the grouping and
                 // accumulation below work on documents and do not care where
@@ -4933,24 +4972,85 @@ fn copy_parse_text(text: &str, format: secantus_pgplan::CopyFormat) -> Vec<Vec<O
     rows
 }
 
+/// Undo COPY's text-format escaping for one field.
+///
+/// PostgreSQL's text COPY recognises `\b \f \n \r \t \v \\`, octal (`\ooo`, up
+/// to three digits) and hex (`\xHH`, up to two digits) byte escapes, and treats
+/// `\<anything else>` as that character. Handling only `\t \n \r \\` silently
+/// corrupted `\b`/`\f`/`\v` (a backspace read back as a literal `b`) and,
+/// because a `\<letter>` fell through to "push the letter", dropped the
+/// backslash from an escaped `\\` sequence that had already been halved. Working
+/// over bytes keeps octal/hex faithful and lets a raw multi-byte UTF-8 value
+/// pass through untouched.
 fn unescape_copy_text(field: &str) -> String {
-    let mut out = String::new();
-    let mut chars = field.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
+    let bytes = field.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b != b'\\' {
+            out.push(b);
+            i += 1;
             continue;
         }
-        match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('r') => out.push('\r'),
-            Some('t') => out.push('\t'),
-            Some('\\') => out.push('\\'),
-            Some(other) => out.push(other),
-            None => out.push('\\'),
+        i += 1;
+        let Some(&c) = bytes.get(i) else {
+            out.push(b'\\');
+            break;
+        };
+        match c {
+            b'b' => {
+                out.push(0x08);
+                i += 1;
+            }
+            b'f' => {
+                out.push(0x0c);
+                i += 1;
+            }
+            b'n' => {
+                out.push(b'\n');
+                i += 1;
+            }
+            b'r' => {
+                out.push(b'\r');
+                i += 1;
+            }
+            b't' => {
+                out.push(b'\t');
+                i += 1;
+            }
+            b'v' => {
+                out.push(0x0b);
+                i += 1;
+            }
+            b'0'..=b'7' => {
+                let mut val: u32 = 0;
+                let mut n = 0;
+                while n < 3 && i < bytes.len() && (b'0'..=b'7').contains(&bytes[i]) {
+                    val = val * 8 + u32::from(bytes[i] - b'0');
+                    i += 1;
+                    n += 1;
+                }
+                out.push((val & 0xff) as u8);
+            }
+            b'x' if bytes.get(i + 1).is_some_and(u8::is_ascii_hexdigit) => {
+                i += 1; // consume the `x`
+                let mut val: u32 = 0;
+                let mut n = 0;
+                while n < 2 && i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+                    val = val * 16 + char::from(bytes[i]).to_digit(16).expect("hex");
+                    i += 1;
+                    n += 1;
+                }
+                out.push((val & 0xff) as u8);
+            }
+            other => {
+                out.push(other);
+                i += 1;
+            }
         }
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// CSV, where a newline inside quotes is DATA rather than a row separator --
@@ -5063,9 +5163,12 @@ fn copy_text_row(row: &[Option<Bson>], format: secantus_pgplan::CopyFormat) -> b
         } else {
             for c in text.chars() {
                 match c {
+                    '\u{08}' => out.push_str("\\b"),
+                    '\u{0c}' => out.push_str("\\f"),
                     '\n' => out.push_str("\\n"),
                     '\r' => out.push_str("\\r"),
                     '\t' => out.push_str("\\t"),
+                    '\u{0b}' => out.push_str("\\v"),
                     '\\' => out.push_str("\\\\"),
                     _ => out.push(c),
                 }
@@ -5553,6 +5656,15 @@ impl PgHandler {
                     self.field(name.clone(), wire)
                 })
                 .collect(),
+            Statement::ValuesConstant(vc) => vc
+                .names
+                .iter()
+                .zip(&vc.types)
+                .map(|(name, ty)| {
+                    let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
+                    self.field(name.clone(), wire)
+                })
+                .collect(),
             // CREATE / INSERT / UPDATE / DELETE return no rows.
             _ => Vec::new(),
         })
@@ -5687,30 +5799,6 @@ impl ExtendedQueryHandler for PgHandler {
     }
 }
 
-/// Undo COPY's text-format escaping for one field.
-///
-/// PostgreSQL escapes the delimiter, newline and backslash itself, so a tab
-/// inside a value arrives as `\\t` and must NOT be read as a field separator.
-fn copy_unescape(field: &str) -> String {
-    let mut out = String::with_capacity(field.len());
-    let mut chars = field.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('t') => out.push('\t'),
-            Some('n') => out.push('\n'),
-            Some('r') => out.push('\r'),
-            Some('\\') => out.push('\\'),
-            Some(other) => out.push(other),
-            None => out.push('\\'),
-        }
-    }
-    out
-}
-
 /// Parse one COPY text field into the value its column stores.
 ///
 /// `\N` is NULL -- distinct from the empty string, which is a real empty text
@@ -5719,7 +5807,11 @@ fn copy_field(raw: &str, pg_type: &str) -> PgWireResult<Bson> {
     if raw == "\\N" {
         return Ok(Bson::Null);
     }
-    let text = copy_unescape(raw);
+    // `raw` has already been backslash-unescaped by `copy_parse_text` /
+    // `unescape_copy_text`. Unescaping again halved a literal `\\` a second time
+    // and dropped the backslash from `\<letter>` values -- so the field is used
+    // as-is here, and only interpreted per column type.
+    let text = raw.to_string();
     let bad = |want: &str| {
         PgWireError::UserError(Box::new(ErrorInfo::new(
             "ERROR".into(),
