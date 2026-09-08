@@ -33,8 +33,9 @@ use pgwire::api::{ClientInfo, ClientPortalStore, PgWireServerHandlers, Type, DEF
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
 use pgwire::messages::data::DataRow;
-use pgwire::messages::extendedquery::{Describe, TARGET_TYPE_BYTE_PORTAL};
+use pgwire::messages::extendedquery::{Describe, Parse, TARGET_TYPE_BYTE_PORTAL};
 use pgwire::messages::response::CommandComplete;
+use pgwire::messages::simplequery::Query;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::types::format::FormatOptions;
 use pgwire::types::ToSqlText;
@@ -280,9 +281,16 @@ impl PgHandler {
         } else {
             FieldFormat::Text
         };
+        // The RowDescription carries column names in the client encoding, so
+        // a LATIN1 / LATIN9 session gets the name's transcoded bytes. A name
+        // with a character the encoding cannot represent keeps its UTF-8 bytes
+        // (PostgreSQL raises 22P05 there; `field_mod` is infallible and the
+        // case needs a non-Latin alias under a Latin client encoding).
+        let name_raw = transcoded_name(self.client_encoding(), &name);
         FieldInfo::new(name, None, None, ty.clone(), format)
             .with_type_size(type_size(&ty))
             .with_type_modifier(type_modifier)
+            .with_name_raw(name_raw)
     }
 
     /// Remember the result format a `Bind` asked for.
@@ -2122,6 +2130,23 @@ impl NoopStartupHandler for PgHandler {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(pid, self.terminate.clone());
+        // A `client_encoding` in the startup packet (libpq's PGCLIENTENCODING /
+        // psycopg's `client_encoding=` connection option) is a SET before the
+        // first query. pgwire has already echoed the client's raw spelling in a
+        // ParameterStatus; apply it so the session actually transcodes, and
+        // re-report the CANONICAL name -- the later report wins in libpq, and
+        // it is the spelling psycopg matches on (`utf-8` -> `UTF8`). An invalid
+        // name fails the connection, as PostgreSQL's does (22023).
+        if let Some(requested) = _c.metadata().get("client_encoding").cloned() {
+            self.apply_client_encoding(&requested)
+                .map_err(|e| match e {
+                    PgWireError::UserError(info) => PgWireError::UserError(Box::new(
+                        ErrorInfo::new("FATAL".into(), info.code, info.message),
+                    )),
+                    other => other,
+                })?;
+            self.report_pending_params(_c).await?;
+        }
         Ok(())
     }
 }
@@ -2142,6 +2167,17 @@ impl Drop for PgHandler {
 
 #[async_trait]
 impl SimpleQueryHandler for PgHandler {
+    /// The query text arrives in the client's `client_encoding`, not
+    /// necessarily UTF-8: decode the raw wire bytes from the session's
+    /// encoding (a LATIN9 `select '\u{20ac}'` is the single byte 0xA4, which
+    /// the lossy UTF-8 default would have turned into U+FFFD before we saw it).
+    fn decode_query_text<C>(&self, _c: &C, query: &Query) -> PgWireResult<String>
+    where
+        C: ClientInfo,
+    {
+        Ok(encoding::decode(self.client_encoding(), &query.query_raw))
+    }
+
     async fn do_query<C>(&self, _c: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
@@ -4376,14 +4412,22 @@ impl PgHandler {
 
             Statement::Show(name) => {
                 let key = canonical_setting(&name);
-                let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
-                let value = settings.get(&key).cloned().ok_or_else(|| {
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".into(),
-                        "42704".into(), // undefined_object
-                        format!("unrecognized configuration parameter \"{name}\""),
-                    )))
-                })?;
+                // Release the settings lock BEFORE building the field:
+                // `field` reads `client_encoding` from the same (non-reentrant)
+                // mutex to transcode the column name.
+                let value = self
+                    .settings
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&key)
+                    .cloned()
+                    .ok_or_else(|| {
+                        PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".into(),
+                            "42704".into(), // undefined_object
+                            format!("unrecognized configuration parameter \"{name}\""),
+                        )))
+                    })?;
                 let schema = Arc::new(vec![self.field(key, Type::TEXT)]);
                 let schema_ref = schema.clone();
                 let rows = stream::iter(std::iter::once(value)).map(move |v| {
@@ -4552,7 +4596,14 @@ impl PgHandler {
                 let rows = stream::iter(std::iter::once(values)).map(move |vals| {
                     let mut enc = DataRowEncoder::new(schema_ref.clone());
                     for (i, v) in vals.iter().enumerate() {
-                        encode_field_value(&mut enc, &schema_ref[i], Some(v), &row_tz, &row_ds, row_cenc)?;
+                        encode_field_value(
+                            &mut enc,
+                            &schema_ref[i],
+                            Some(v),
+                            &row_tz,
+                            &row_ds,
+                            row_cenc,
+                        )?;
                     }
                     Ok(enc.take_row())
                 });
@@ -4575,7 +4626,14 @@ impl PgHandler {
                 let rows = stream::iter(vc.rows).map(move |vals| {
                     let mut enc = DataRowEncoder::new(schema_ref.clone());
                     for (i, v) in vals.iter().enumerate() {
-                        encode_field_value(&mut enc, &schema_ref[i], Some(v), &row_tz, &row_ds, row_cenc)?;
+                        encode_field_value(
+                            &mut enc,
+                            &schema_ref[i],
+                            Some(v),
+                            &row_tz,
+                            &row_ds,
+                            row_cenc,
+                        )?;
                     }
                     Ok(enc.take_row())
                 });
@@ -4630,7 +4688,14 @@ impl PgHandler {
                             OutputCol::Group(i) => key[*i].clone().unwrap_or(Bson::Null),
                             OutputCol::Agg(i) => vals[*i].clone(),
                         };
-                        encode_field_value(&mut enc, &schema_ref[n], Some(&v), &row_tz, &row_ds, row_cenc)?;
+                        encode_field_value(
+                            &mut enc,
+                            &schema_ref[n],
+                            Some(&v),
+                            &row_tz,
+                            &row_ds,
+                            row_cenc,
+                        )?;
                     }
                     Ok(enc.take_row())
                 });
@@ -5221,6 +5286,19 @@ fn rebind_field_format(field: &FieldInfo, binary: bool) -> FieldInfo {
     )
     .with_type_size(field.type_size())
     .with_type_modifier(field.type_modifier())
+    .with_name_raw(field.name_raw().cloned())
+}
+
+/// A column name's `RowDescription` bytes under the client encoding, or `None`
+/// when they are the name's own UTF-8 (the UTF8 / passthrough encodings, and a
+/// name the target encoding cannot represent).
+fn transcoded_name(cenc: ClientEncoding, name: &str) -> Option<Bytes> {
+    if !cenc.transcodes() || name.is_ascii() {
+        return None;
+    }
+    encoding::encode(cenc, name.as_bytes())
+        .ok()
+        .map(Bytes::from)
 }
 
 /// Encode one captured cursor row against a (re-formatted) schema.
@@ -7041,6 +7119,15 @@ impl ExtendedQueryHandler for PgHandler {
 
     fn query_parser(&self) -> Arc<Self::QueryParser> {
         Arc::new(SqlParser)
+    }
+
+    /// Same as the simple-query hook: a `Parse` message's SQL is in the
+    /// client encoding.
+    fn decode_query_text<C>(&self, _c: &C, parse: &Parse) -> PgWireResult<String>
+    where
+        C: ClientInfo,
+    {
+        Ok(encoding::decode(self.client_encoding(), &parse.query_raw))
     }
 
     async fn do_describe_statement<C>(

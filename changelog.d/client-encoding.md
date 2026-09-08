@@ -22,6 +22,17 @@ PostgreSQL's encoding table — an unknown name is `22023`, `MULE_INTERNAL` is
 `0A000` — stores the canonical spelling, and reports it via `ParameterStatus`
 only once output genuinely respects it.
 
+The encoding is honoured on the way in as well. The query text itself — a
+literal `select 'café €'` or an alias `as "prix €"` typed by a LATIN9 client —
+used to be decoded as UTF-8 and reach the planner as U+FFFD mojibake, because
+the wire library discarded the original bytes before the server saw them. The
+vendored `pgwire` now keeps the raw `Query` / `Parse` bytes and lets the
+server decode them in the session encoding, and RowDescription column names
+travel back in that encoding too. A `client_encoding` in the startup packet
+(libpq's `PGCLIENTENCODING`, psycopg's `client_encoding=` option) is applied
+before the first query and re-reported under its canonical name; an unknown
+one fails the connection with PostgreSQL's FATAL `22023`.
+
 #### Added
 
 - `crates/secantus-pgserver/src/encoding.rs`: client-encoding name
@@ -36,3 +47,14 @@ only once output genuinely respects it.
   in `encode_field_value` and COPY-OUT text, decode text parameters in
   `decode_parameter`, and report `client_encoding` via `ParameterStatus` now
   that output honours it.
+- `crates/secantus-pgserver/src/lib.rs`: decode the simple-query and `Parse`
+  SQL text in the session `client_encoding` (`decode_query_text`), send
+  RowDescription column names in it (`transcoded_name`), and apply a startup
+  `client_encoding` parameter in `post_startup`. `SHOW <guc>` no longer holds
+  the settings lock while building its result column (a deadlock once that
+  column name went through the encoding lookup).
+- `crates/vendor/pgwire`: `Query` / `Parse` carry `query_raw` (the undecoded
+  C-string bytes) and both query handlers gain a `decode_query_text` hook;
+  `FieldInfo` / `FieldDescription` gain `name_raw` so a handler can send a
+  column name in a non-UTF-8 client encoding. The `cursor` example is updated
+  for the earlier `parameter_oids` patch.

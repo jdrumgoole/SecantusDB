@@ -51,6 +51,18 @@ where
 /// handler for processing simple query.
 #[async_trait]
 pub trait SimpleQueryHandler: Send + Sync {
+    /// Turn the `Query` message's wire bytes into the query string `do_query`
+    /// receives. The default takes the lossy UTF-8 decode (`query.query`). A
+    /// backend that honours a non-UTF-8 `client_encoding` overrides this to
+    /// decode `query.query_raw` from that encoding; returning an error reports
+    /// it to the client like any other query error. (SecantusDB local patch.)
+    fn decode_query_text<C>(&self, _client: &C, query: &Query) -> PgWireResult<String>
+    where
+        C: ClientInfo,
+    {
+        Ok(query.query.clone())
+    }
+
     /// Executed on `Query` request arrived. This is how postgres respond to
     /// simple query. The default implementation calls `do_query` with the
     /// incoming query string.
@@ -89,7 +101,7 @@ pub trait SimpleQueryHandler: Send + Sync {
         let mut transaction_status = client.transaction_status();
 
         client.set_state(super::PgWireConnectionState::QueryInProgress);
-        let query_string = query.query;
+        let query_string = self.decode_query_text(client, &query)?;
 
         if is_empty_query(&query_string) {
             client
@@ -184,6 +196,17 @@ pub trait ExtendedQueryHandler: Send + Sync {
     /// Get a reference to associated `QueryParser` implementation
     fn query_parser(&self) -> Arc<Self::QueryParser>;
 
+    /// Turn the `Parse` message's wire bytes into the SQL text handed to the
+    /// `QueryParser`. The default takes the lossy UTF-8 decode (`parse.query`).
+    /// A backend that honours a non-UTF-8 `client_encoding` overrides this to
+    /// decode `parse.query_raw` from that encoding. (SecantusDB local patch.)
+    fn decode_query_text<C>(&self, _client: &C, parse: &Parse) -> PgWireResult<String>
+    where
+        C: ClientInfo,
+    {
+        Ok(parse.query.clone())
+    }
+
     /// Called when client sends `parse` command.
     ///
     /// The default implementation parsed query with `Self::QueryParser` and
@@ -196,6 +219,10 @@ pub trait ExtendedQueryHandler: Send + Sync {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let parser = self.query_parser();
+        let message = Parse {
+            query: self.decode_query_text(client, &message)?,
+            ..message
+        };
         let stmt = StoredStatement::parse(client, &message, parser).await?;
         client.portal_store().put_statement(Arc::new(stmt));
         client

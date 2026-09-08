@@ -168,9 +168,28 @@ pub struct FieldInfo {
     /// then renders with a long tail of spurious zeros in JDBC-based clients.
     #[new(value = "-1")]
     type_modifier: i32,
+    /// The field name's bytes on the wire, when they differ from `name`'s
+    /// UTF-8. `RowDescription` carries names in the client's `client_encoding`;
+    /// a backend honouring a non-UTF-8 encoding sets this to the transcoded
+    /// bytes with [`FieldInfo::with_name_raw`]. `None` sends `name` as UTF-8.
+    /// (SecantusDB local patch.)
+    #[new(default)]
+    name_raw: Option<Bytes>,
 }
 
 impl FieldInfo {
+    /// The wire bytes of the field name, if they differ from `name`'s UTF-8.
+    pub fn name_raw(&self) -> Option<&Bytes> {
+        self.name_raw.as_ref()
+    }
+
+    /// Send these bytes as the field name instead of `name`'s UTF-8 (the name
+    /// transcoded to the client encoding).
+    pub fn with_name_raw(mut self, name_raw: Option<Bytes>) -> Self {
+        self.name_raw = name_raw;
+        self
+    }
+
     /// Get the field name.
     pub fn name(&self) -> &str {
         &self.name
@@ -241,6 +260,7 @@ impl From<&FieldInfo> for FieldDescription {
             fi.type_modifier,          // type_modifier
             fi.format.value(),
         )
+        .with_name_raw(fi.name_raw.clone())
     }
 }
 

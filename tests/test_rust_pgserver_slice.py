@@ -551,6 +551,66 @@ def test_scalar_array_any_all(home: Path) -> None:
         assert exc.value.diag.sqlstate == "42883"
 
 
+def test_client_encoding_transcodes_both_directions(home: Path) -> None:
+    """`client_encoding` is honoured on the way IN as well as OUT.
+
+    Result text, parameters, the QUERY TEXT itself and RowDescription column
+    names all travel in the session encoding, in both protocols -- psycopg
+    encodes the query with the encoding it learned from ParameterStatus, so a
+    server that decodes it as UTF-8 reads `\u20ac` as three mojibake
+    characters. A `client_encoding` in the startup packet is applied before
+    the first query and re-reported under its canonical name; an unknown one
+    fails the connection with PostgreSQL's FATAL 22023.
+    """
+    with _Server(home) as server:
+        with server.connect() as conn:
+            cur = conn.cursor()
+            cur.execute("SET client_encoding = 'latin9'")
+            assert conn.info.encoding == "iso8859-15"
+            # Simple protocol: literal, alias and value all round-trip.
+            cur.execute("SELECT 'caf\u00e9 \u20ac' AS \"prix \u20ac\"")
+            assert cur.fetchone() == ("caf\u00e9 \u20ac",)
+            assert cur.description[0].name == "prix \u20ac"
+            # Extended protocol: query text and a text parameter.
+            cur.execute("SELECT %s || ' \u20ac'", ("caf\u00e9",))
+            assert cur.fetchone() == ("caf\u00e9 \u20ac",)
+            # Binary results carry the same bytes.
+            cur.execute("SELECT '\u20ac'::text", binary=True)
+            assert cur.fetchone() == ("\u20ac",)
+            # An untranslatable character is 22P05, as PostgreSQL's is
+            # (`chr` builds it server-side: the client could not send it).
+            with pytest.raises(psycopg.errors.UntranslatableCharacter):
+                cur.execute("SELECT chr(20013)")
+            cur.execute("SET client_encoding = 'UTF8'")
+            assert conn.info.encoding == "utf-8"
+            cur.execute("SELECT chr(20013)")
+            assert cur.fetchone() == ("\u4e2d",)
+
+        # Startup packet: libpq's PGCLIENTENCODING / the `client_encoding=`
+        # conninfo option. Reported canonically (`utf-8` -> `UTF8`).
+        for requested, canonical, py_name in (
+            ("utf-8", "UTF8", "utf-8"),
+            ("iso8859-15", "LATIN9", "iso8859-15"),
+        ):
+            with psycopg.connect(
+                f"host=127.0.0.1 port={server.port} dbname=postgres user=test "
+                f"client_encoding={requested}",
+                autocommit=True,
+            ) as conn:
+                assert conn.info.parameter_status("client_encoding") == canonical
+                assert conn.info.encoding == py_name
+                assert conn.execute("SELECT '\u20ac'").fetchone() == ("\u20ac",)
+        with pytest.raises(psycopg.OperationalError) as exc:
+            psycopg.connect(
+                f"host=127.0.0.1 port={server.port} dbname=postgres user=test "
+                "client_encoding=bogus",
+                connect_timeout=10,
+            )
+        assert 'FATAL:  invalid value for parameter "client_encoding": "bogus"' in str(
+            exc.value
+        )
+
+
 def test_session_settings(home: Path) -> None:
     """SET / SHOW / RESET and the GUC functions.
 

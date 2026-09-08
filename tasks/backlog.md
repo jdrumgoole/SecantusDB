@@ -501,12 +501,6 @@ had been masking:
     BINARY cursor encodes each field as text rather than its typed binary — a
     result-ENCODING gap (named-composite binary results already work), unrelated
     to parameter decode.
-  - **OPEN — client_encoding query-DECODE follow-up (now that the vendored-pgwire
-    fork exists).** pgwire decodes the `Query`/`Parse` SQL text as UTF-8; a
-    client on a non-UTF-8 `client_encoding` needs the SQL bytes transcoded (and
-    the deferred `from_utf8_lossy` swap noted in #1392/#1411). Deliberately left
-    out of this PR — the fork infrastructure it would build on now exists, so it
-    is a clean follow-up rather than a blocker.
 
 **Rust pgserver transaction characteristics — LANDED 2026-09-08 (psycopg's
 `vendor/psycopg/tests/test_connection.py::test_set_transaction_param_*`, oracle
@@ -1473,30 +1467,27 @@ Specific items that were left out of the slice that introduced their feature are
   `::varbit` casts remain unsupported at the value layer (`cast_value` —
   pre-existing, separate item).
 
-- [ ] **OPEN — RUST pgserver `client_encoding`: LATIN1 / LATIN9 landed,
-  non-ASCII through untranscoded encodings and binary text ARRAYS deferred (PR
-  for `pgserver-clientenc`, measured 2026-09-08 against PostgreSQL 16).** The
-  server now honours `SET client_encoding` / `set_config`: it validates the
-  name (`22023` for an unknown name, `0A000` for `MULE_INTERNAL`), stores the
-  canonical spelling, reports it via `ParameterStatus` only once output
-  respects it, transcodes result text and decodes text parameters for `LATIN1`
-  and `LATIN9` (text and binary wire formats + COPY-OUT text), and raises
-  `22P05` for an untranslatable character. `UTF8` / `SQL_ASCII` / every other
-  accepted name keep the internal UTF-8 bytes verbatim (byte-identical to the
-  prior behaviour). **Still open:**
-  - **Function-result WIRE TYPE, not encoding:** `ascii(x)` (and peers) send a
-    text-category column OID rather than `int4`, so `select ascii(%s)` comes
-    back as a string / bytes and `test_string.py::test_dump_enc` fails on all
-    encodings. This is the `column_expr_type` inference for scalar functions,
-    unrelated to `client_encoding` — a separate item.
-  - **Non-ASCII in the QUERY TEXT itself** (a literal `select '€'` or an
-    identifier `select 'x' as "€"` under LATIN9) is mangled to U+FFFD before it
-    reaches the handler: `pgwire`'s `get_cstring` decodes the message body with
-    `String::from_utf8_lossy`, discarding the original bytes, so it cannot be
-    recovered at this layer without forking `pgwire`'s codec. Only PARAMETERS
-    (separate length-delimited byte arrays) and COPY data are decodable. Costs
-    `test_cursor_common.py::test_query_encode[*-latin9]` and
-    `test_column.py::test_name_encode[latin9]`.
+- [ ] **OPEN — RUST pgserver `client_encoding`: two result-OID gaps and binary
+  text ARRAYS remain (LATIN1 / LATIN9 transcoding landed, PR #1413, measured
+  2026-09-08 against PostgreSQL 16).** The server honours `client_encoding`
+  end to end: `SET` / `set_config` / the STARTUP packet (`PGCLIENTENCODING`,
+  applied before the first query, re-reported canonically, FATAL `22023` for an
+  unknown name) validate and canonicalise the name; result text, text
+  parameters, COPY-OUT text, the QUERY TEXT itself and RowDescription column
+  names are transcoded for `LATIN1` / `LATIN9` in both wire formats (the
+  vendored `pgwire` keeps the raw `Query` / `Parse` bytes in `query_raw` and
+  offers a `decode_query_text` hook; `FieldInfo::name_raw` carries the encoded
+  column name), and an untranslatable character is `22P05`. `UTF8` /
+  `SQL_ASCII` / every other accepted name keep the internal UTF-8 bytes
+  verbatim. **Still open:**
+  - **Function-result WIRE TYPE, not encoding:** `ascii(x)` / `length(x)` (and
+    peers) send a text-category column OID rather than `int4` — `select
+    length(%s::text)` answers `'3'` as text where PostgreSQL answers `3` —
+    so `select ascii(%s)` comes back as a string / bytes and
+    `test_string.py::test_dump_enc` fails on all encodings. This is the
+    `column_expr_type` inference for scalar functions, unrelated to
+    `client_encoding` — a separate item (pre-dates #1413: measured identical
+    on `main` before the branch, `scratchpad/lenprobe.py`).
   - **Binary text ARRAYS under LATIN1 / LATIN9** keep UTF-8 element bytes: the
     binary array wire form interleaves big-endian length words that a blanket
     transcode would corrupt, and per-element transcoding of `array_binary` /
@@ -1509,10 +1500,16 @@ Specific items that were left out of the slice that introduced their feature are
     `test_enum.py::test_enum_dumper_sqlascii[*-StrTestEnum]`. Same root cause as
     a scalar function's result OID (the `ascii()` item above); a separate
     param-OID-passthrough feature.
-  - **Startup `client_encoding` parameter** (a client connecting with
-    `PGCLIENTENCODING=latin9`) is not applied to the session — only the
-    in-session `SET` / `set_config` paths are. `pgwire`'s default startup reply
-    already advertises `UTF8`.
+  - **A column NAME with a character the client encoding cannot represent** is
+    sent as its UTF-8 bytes; PostgreSQL raises `22P05` for it. No client test
+    exercises it.
+  - **The vendored `pgwire` fork fails two of its own unit tests**
+    (`tokio::server::tests::client_certificates_does_not_panic_under_maybe_tls`
+    and `server_name_metadata_is_set_from_tls_sni_in_memory`, `cargo test
+    --lib` in `crates/vendor/pgwire`): they read TLS certificate fixtures the
+    upstream tarball does not ship. Identical before either patch to the fork;
+    not a server defect. Its `--all-targets` clippy also reports upstream
+    `field_reassign_with_default` lints in test code the fork never touched.
 
 - [ ] **OPEN — `test_tls_against_rust_server` flakes on the Windows runner
   (first seen 2026-08-29, PR #1089).** `storage-engine (windows-latest)` failed
@@ -5360,11 +5357,6 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   tests. The chain: `internal_type_name` drops an unknown (enum) param oid, so
   the declared type is lost before the passthrough column can echo it. The
   CAST form (`select %s::mood`) already reports the enum oid and passes.
-- **Rust PG server: a non-ASCII enum label under a non-UTF-8 client_encoding
-  is not re-encoded on output.** `set client_encoding to latin1` then reading
-  an enum whose label is `Xà` returns UTF-8 bytes where the client expects
-  latin1. The join / array_agg / EnumInfo machinery all work; this is output
-  encoding.
 - **Rust PG server: range and multirange OPERATORS are unsupported.** Both type
   families themselves (literals, constructors, casts, canonicalisation, merging,
   parameters in both wire formats) are in; `@>` / `<@` / `&&` / `-|-` and the
