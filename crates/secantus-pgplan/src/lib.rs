@@ -4944,6 +4944,57 @@ pub fn render_timestamp_from_pg_micros(micros: i64) -> String {
     render_timestamp(micros + 946_684_800 * 1_000_000)
 }
 
+/// PostgreSQL's `date` binary form: signed days since 2000-01-01.
+///
+/// The inverse of `render_date_from_pg_days`. Returns `None` for a value the
+/// binary form cannot hold (a year outside chrono's range, a BC date rendered
+/// with an era suffix); the caller then errors rather than sending wrong bytes,
+/// exactly as `encode_binary` does for any type it cannot render.
+pub fn date_to_pg_days(text: &str) -> Option<i32> {
+    let d = NaiveDate::parse_from_str(text.trim(), "%Y-%m-%d").ok()?;
+    let epoch = NaiveDate::from_ymd_opt(2000, 1, 1)?;
+    i32::try_from(d.signed_duration_since(epoch).num_days()).ok()
+}
+
+/// PostgreSQL's `time` binary form: microseconds since midnight.
+///
+/// The inverse of `render_time_from_micros`.
+pub fn time_to_pg_micros(text: &str) -> Option<i64> {
+    let t = NaiveTime::parse_from_str(text.trim(), "%H:%M:%S%.f")
+        .or_else(|_| NaiveTime::parse_from_str(text.trim(), "%H:%M"))
+        .ok()?;
+    let secs = i64::from(t.num_seconds_from_midnight());
+    let us = i64::from(t.nanosecond()) / 1000;
+    Some(secs * 1_000_000 + us)
+}
+
+/// PostgreSQL's `timestamp` / `timestamptz` binary form: microseconds since
+/// 2000-01-01. Both types store a UTC-instant carrier (`Bson::DateTime` or the
+/// sub-millisecond composite), so one converter serves both. `infinity` /
+/// `-infinity` (kept as text) map to the sentinels PostgreSQL uses on the wire;
+/// BC / wide-year specials the micros form cannot hold return `None`.
+pub fn timestamp_bson_to_pg_micros(v: &Bson) -> Option<i64> {
+    // 2000-01-01T00:00:00Z is 946684800 seconds after the Unix epoch.
+    const EPOCH_2000_US: i64 = 946_684_800 * 1_000_000;
+    match v {
+        Bson::DateTime(d) => Some(d.timestamp_millis() * 1000 - EPOCH_2000_US),
+        Bson::Document(doc) if doc.contains_key(COMPOSITE_DATE) => {
+            let ms = match doc.get(COMPOSITE_DATE) {
+                Some(Bson::DateTime(d)) => d.timestamp_millis(),
+                _ => return None,
+            };
+            let us = doc.get(COMPOSITE_US).and_then(|v| v.as_i32()).unwrap_or(0);
+            Some(ms * 1000 + i64::from(us) - EPOCH_2000_US)
+        }
+        Bson::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "infinity" => Some(i64::MAX),
+            "-infinity" => Some(i64::MIN),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// A timestamp VALUE as PostgreSQL's text, whether it arrived as a BSON date
 /// or as the composite that carries sub-millisecond digits.
 ///

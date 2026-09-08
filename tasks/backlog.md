@@ -425,13 +425,17 @@ failures).** LANDED this pass: `serial`/`bigserial`/`smallserial` normalise to
 their integer type so COPY stores/returns ints not strings; `COPY (VALUES ...)
 TO STDOUT` (and a bare `VALUES` query) now returns rows via a new
 `ValuesConstant` plan; text COPY unescaping is complete (`\b \f \v`, octal, hex,
-run once instead of a double-unescape that corrupted `\end`). STILL OPEN, mapped
-for a follow-up:
-  - **COPY BINARY of an array** (`test_read_rows` binary, 2 tests): `float8[]`
-    etc. go out as their TEXT under the array OID, so the client reads garbage
-    dimensions. Needs the real PG binary array wire format (ndim / hasnull /
-    elem-oid / dims / per-element length-prefixed binary) — a per-type binary
-    codec, deferred as a balloon.
+run once instead of a double-unescape that corrupted `\end`). **COPY BINARY wire
+format LANDED 2026-09-08** (separate PR): `COPY ... TO STDOUT (FORMAT BINARY)`
+routes every field through the shared `encode_binary` codec via a
+`DataRowEncoder` (byte-identical `[i32 len][bytes]` per field), plus new
+`date`/`time`/`timestamp`/`timestamptz` binary encoders and sub-millisecond
+companion reassembly. Verified byte-for-byte against PostgreSQL 16 for
+`int2`/`int4`/`int8`, `float4`/`float8`, `bool`, `text`/`varchar`, `numeric`,
+`date`, `time`, `timestamp`, `timestamptz`, `bytea`, and `int4[]`/`float8[]`/
+`text[]` arrays (arrays already had a binary path in `encode_binary`; the fix
+was routing COPY through it). `test_read_rows[*-1]` (2 binary array tests) now
+pass. STILL OPEN, mapped for a follow-up:
   - **Transaction status after a simple-protocol COPY** (`test_copy_in_empty`
     ×2, `test_copy_out_error_with_copy_not_finished`): psycopg drives COPY over
     the *simple* query protocol, and vendored `pgwire` 0.40's process loop
@@ -449,6 +453,16 @@ for a follow-up:
     `test_copy_out_server_error`): `unnest()`, `GROUP BY` over an expression, and
     a bare `AExpr` (`1/n`) in the COPY source query are unsupported SQL, not COPY
     bugs.
+  - **OPEN — COPY BINARY residual type/path gaps** (not exercised by the
+    deterministic `test_copy.py` failures; deferred as balloons): `COPY (SELECT
+    ...) TO STDOUT` reads values via `copy_query_rows`, which does not reassemble
+    a `timestamp`'s sub-millisecond `__us_` companion, so a fractional-second
+    timestamp read through a *query* source (not a table) loses its last three
+    digits in BOTH text and binary — pre-existing, orthogonal to wire format.
+    COPY BINARY of `uuid` / `json` / `jsonb` / `inet` / `cidr` / range columns
+    now ERRORS ("cannot send … as a binary …") rather than emitting text bytes —
+    `encode_binary` has no arm for them (the FROM-side `decode_parameter` does),
+    so these are the faker exotic types and are out of the common-scalar scope.
 
 **Rust pgserver transaction characteristics — LANDED 2026-09-08 (psycopg's
 `vendor/psycopg/tests/test_connection.py::test_set_transaction_param_*`, oracle
