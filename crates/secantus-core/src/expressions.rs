@@ -433,6 +433,20 @@ const ALLOWED_FIELDS: &[(&str, &[&str])] = &[
         "$dateSubtract",
         &["startDate", "unit", "amount", "timezone"],
     ),
+    (
+        "$dateFromString",
+        &["dateString", "format", "timezone", "onError", "onNull"],
+    ),
+    ("$dateToParts", &["date", "timezone", "iso8601"]),
+    (
+        "$dateTrunc",
+        &["date", "unit", "binSize", "timezone", "startOfWeek"],
+    ),
+    (
+        "$dateDiff",
+        &["startDate", "endDate", "unit", "timezone", "startOfWeek"],
+    ),
+    ("$getField", &["field", "input"]),
 ];
 
 /// Whether every key in `d` is one `op` recognises. `false` means some other
@@ -592,6 +606,66 @@ const REQUIRED_FIELDS: &[(&str, &[RequiredField])] = &[
     (
         "$dateToString",
         &[("date", 18628, "Missing 'date' parameter to $dateToString")],
+    ),
+    // These four answered a NULL where mongod raises -- `{$dateTrunc: {}}` was
+    // `null`, not an error -- which is the wrong-value class, not the
+    // wrong-message one. Note the codes share no pattern with each other or
+    // with `$dateToString` above: 40542 / 40522 / 5439009 / 5166303, and
+    // `$dateTrunc` numbers its two fields 5439009 then 5439010 while
+    // `$dateDiff` runs 5166303 / 5166304 / 5166305. All measured 8.2.11,
+    // 2026-09-08.
+    (
+        "$dateFromString",
+        &[(
+            "dateString",
+            40542,
+            "Missing 'dateString' parameter to $dateFromString",
+        )],
+    ),
+    (
+        "$dateToParts",
+        &[("date", 40522, "Missing 'date' parameter to $dateToParts")],
+    ),
+    (
+        "$dateTrunc",
+        &[
+            ("date", 5439009, "Missing 'date' parameter to $dateTrunc"),
+            ("unit", 5439010, "Missing 'unit' parameter to $dateTrunc"),
+        ],
+    ),
+    (
+        "$dateDiff",
+        &[
+            (
+                "startDate",
+                5166303,
+                "Missing 'startDate' parameter to $dateDiff",
+            ),
+            (
+                "endDate",
+                5166304,
+                "Missing 'endDate' parameter to $dateDiff",
+            ),
+            ("unit", 5166305, "Missing 'unit' parameter to $dateDiff"),
+        ],
+    ),
+    // `field` is checked BEFORE `input`, which is the reverse of the order the
+    // operator reads them in: `{$getField: {}}` is 3041702 (field), not 3041703
+    // (input). `$setField` above agrees -- field, then input.
+    (
+        "$getField",
+        &[
+            (
+                "field",
+                3041702,
+                "$getField requires 'field' to be specified",
+            ),
+            (
+                "input",
+                3041703,
+                "$getField requires 'input' to be specified",
+            ),
+        ],
     ),
     (
         "$cond",
@@ -1636,7 +1710,18 @@ fn op_divide(arg: &Bson, ctx: &Ctx) -> R {
     if let Some(fault) = arith_type_error("$divide", &vals[0], &vals[1]) {
         return Err(fault);
     }
-    // Decimal128 division has type-specific semantics -> defer.
+    // A DECIMAL operand promotes the whole division, whatever the other side
+    // is: `$divide: [Decimal128("2.5"), 2]` is `Decimal128("1.25")`. The
+    // quotient carries the decimal spec's IDEAL EXPONENT, which is why
+    // `100 / 10` is `10` and `2.50 / 1.0` is `2.5` -- an `f64` route loses both
+    // the quantum and, past 15 digits, the value.
+    if matches!(vals[0], Bson::Decimal128(_)) || matches!(vals[1], Bson::Decimal128(_)) {
+        let x = crate::decimal::from_bson(&vals[0]).ok_or(Fallback::Defer)?;
+        let y = crate::decimal::from_bson(&vals[1]).ok_or(Fallback::Defer)?;
+        let q = crate::decimal::div(&x, &y)
+            .ok_or_else(|| Fallback::mongo(2, "can't $divide by zero"))?;
+        return crate::decimal::to_bson(&q).ok_or(Fallback::Defer);
+    }
     let (Some(a), Some(b)) = (as_float_like(&vals[0]), as_float_like(&vals[1])) else {
         return Err(Fallback::Defer);
     };
@@ -1666,6 +1751,17 @@ fn op_mod(arg: &Bson, ctx: &Ctx) -> R {
     // *dividend's* sign: `$mod: [-5, 2]` is -1, not the 1 a flooring `%`
     // gives. Rust's `%` is already truncating for both ints and floats, which
     // is why this needs no sign fixup. Probed 8.2.11.
+    // A DECIMAL operand promotes the whole operation -- and changes the
+    // by-zero CODE: 16610 for int / double operands, but 5733415 the moment a
+    // decimal is on either side, whatever the other one is. Measured 8.2.11
+    // across eight type pairings, 2026-09-08.
+    if matches!(vals[0], Bson::Decimal128(_)) || matches!(vals[1], Bson::Decimal128(_)) {
+        let x = crate::decimal::from_bson(&vals[0]).ok_or(Fallback::Defer)?;
+        let y = crate::decimal::from_bson(&vals[1]).ok_or(Fallback::Defer)?;
+        let r = crate::decimal::rem(&x, &y)
+            .ok_or_else(|| Fallback::mongo(5733415, "can't $mod by zero"))?;
+        return crate::decimal::to_bson(&r).ok_or(Fallback::Defer);
+    }
     if let (Some(a), Some(b)) = (as_int_like(&vals[0]), as_int_like(&vals[1])) {
         if b == 0 {
             // mongod's own text and code, measured 8.2.11. Same defer-cited-by-
@@ -5323,6 +5419,42 @@ fn conversion_target_name(code: i32) -> &'static str {
     }
 }
 
+/// mongod's `241` for a `binData` whose byte length no numeric target accepts.
+///
+/// The rendering is mongod's own: subtype, then the bytes as UPPERCASE hex in
+/// quotes, then the length. Measured 8.2.11, 2026-09-08.
+fn bindata_length_error(sub_type: u8, bytes: &[u8]) -> Fallback {
+    let hex: String = bytes.iter().map(|b| format!("{b:02X}")).collect();
+    Fallback::mongo(
+        241,
+        format!(
+            "Failed to convert 'BinData({sub_type}, \"{hex}\")' to number in \
+             $convert because of invalid length: {}",
+            bytes.len()
+        ),
+    )
+}
+
+/// A `binData`'s bytes as a LITTLE-ENDIAN unsigned integer.
+///
+/// Only 1, 2, 4 and 8 bytes are accepted, and the target narrows it further:
+/// `$toInt` takes 1 / 2 / 4 and `$toLong` 1 / 2 / 4 / 8. Little-endian is
+/// measured, not assumed -- `BinData(0, "01020304")` is `67305985`
+/// (`0x04030201`), not `16909060`.
+fn bindata_as_int(bytes: &[u8]) -> Option<i128> {
+    match bytes.len() {
+        1 => Some(i128::from(bytes[0])),
+        2 => Some(i128::from(u16::from_le_bytes([bytes[0], bytes[1]]))),
+        4 => Some(i128::from(u32::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        ]))),
+        8 => Some(i128::from(u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]) as i64)),
+        _ => None,
+    }
+}
+
 /// mongod's `241` for a pair of types it will not convert between.
 ///
 /// `Conv::Unsupported` used to reach the wire as `Fallback::Defer`, i.e. "the
@@ -5411,6 +5543,20 @@ fn convert_value(value: &Bson, code: i32) -> Conv {
                 Some(_) => Conv::Named(overflow_conversion(value)),
                 None => Conv::Unsupported,
             },
+            // binData's BYTES are the float's own representation -- 4 bytes are
+            // an `f32` widened, 8 an `f64`. Nothing is parsed and no other
+            // length is accepted (`$toInt` takes 1 and 2, this does not).
+            // Measured 8.2.11, 2026-09-08.
+            Bson::Binary(b) => match b.bytes.len() {
+                4 => Conv::Ok(Bson::Double(f64::from(f32::from_le_bytes([
+                    b.bytes[0], b.bytes[1], b.bytes[2], b.bytes[3],
+                ])))),
+                8 => Conv::Ok(Bson::Double(f64::from_le_bytes([
+                    b.bytes[0], b.bytes[1], b.bytes[2], b.bytes[3], b.bytes[4], b.bytes[5],
+                    b.bytes[6], b.bytes[7],
+                ]))),
+                _ => Conv::Named(bindata_length_error(b.subtype.into(), &b.bytes)),
+            },
             // A date is its epoch milliseconds. mongod converts it to double,
             // long and decimal but REFUSES int (241) -- so this cannot be
             // folded into one "numeric" arm.
@@ -5478,6 +5624,20 @@ fn convert_value(value: &Bson, code: i32) -> Conv {
             // Epoch milliseconds -- but only for the LONG target. `$toInt` of a
             // date is `241 Unsupported conversion from date to int`, probed.
             Bson::DateTime(dt) if code == 18 => Conv::Ok(Bson::Int64(dt.timestamp_millis())),
+            // binData is REINTERPRETED as a little-endian integer, not parsed:
+            // `BinData(0, "7A")` is `122`. `$toInt` takes 1 / 2 / 4 bytes and
+            // `$toLong` also 8; every other length is a length error, and the
+            // subtype is ignored. Measured 8.2.11, 2026-09-08.
+            Bson::Binary(b) => {
+                let ok = matches!(b.bytes.len(), 1 | 2 | 4) || (code == 18 && b.bytes.len() == 8);
+                match ok.then(|| bindata_as_int(&b.bytes)).flatten() {
+                    Some(n) => match wrap_int(n, code) {
+                        Conv::Failed => Conv::Named(overflow_conversion(value)),
+                        other => other,
+                    },
+                    None => Conv::Named(bindata_length_error(b.subtype.into(), &b.bytes)),
+                }
+            }
             Bson::Boolean(b) => match wrap_int(i128::from(*b), code) {
                 Conv::Failed => Conv::Named(overflow_conversion(value)),
                 other => other,
@@ -5565,6 +5725,17 @@ fn convert_value(value: &Bson, code: i32) -> Conv {
             Bson::Boolean(b) => decimal_conv(if *b { "1" } else { "0" }),
             Bson::Int32(n) => decimal_conv(&n.to_string()),
             Bson::Int64(n) => decimal_conv(&n.to_string()),
+            // NaN and the infinities convert as themselves. This arm used to
+            // require `is_finite`, so they fell through to `Unsupported` and
+            // `$toDecimal` of `inf` was a 241 where mongod answers
+            // `Decimal128("Infinity")` (measured 8.2.11, 2026-09-08).
+            Bson::Double(d) if !d.is_finite() => decimal_conv(if d.is_nan() {
+                "NaN"
+            } else if *d > 0.0 {
+                "Infinity"
+            } else {
+                "-Infinity"
+            }),
             // 15 significant digits, as `$toDecimal` — mongod-probed 6.0.16.
             Bson::Double(d) if d.is_finite() => {
                 match crate::decimal::from_bson(&Bson::Double(*d))
@@ -5621,11 +5792,21 @@ fn convert_value(value: &Bson, code: i32) -> Conv {
                 None => Conv::Unsupported,
             },
             // A decimal is epoch milliseconds, like a long (probed 8.2.11).
-            Bson::Decimal128(_) => match crate::decimal::parse(&value.to_string())
-                .as_ref()
-                .and_then(crate::decimal::trunc_to_i64)
-            {
-                Some(ms) => Conv::Ok(Bson::DateTime(bson::DateTime::from_millis(ms))),
+            // A NON-FINITE one is named -- `$toDate` of `Decimal128("NaN")` is
+            // "Attempt to convert NaN value to integer type", not a conversion
+            // that merely failed -- and one out of int64 range overflows.
+            // Both used to be `Conv::Failed`, which on this server reads as
+            // "the Rust server does not support this operator": false, and a
+            // different code from mongod's 241 (measured 8.2.11, 2026-09-08).
+            Bson::Decimal128(_) => match crate::decimal::parse(&value.to_string()) {
+                Some(crate::decimal::Dec::Nan) => Conv::Named(nonfinite_conversion(f64::NAN)),
+                Some(crate::decimal::Dec::Inf(_)) => {
+                    Conv::Named(nonfinite_conversion(f64::INFINITY))
+                }
+                Some(d) => match crate::decimal::trunc_to_i64(&d) {
+                    Some(ms) => Conv::Ok(Bson::DateTime(bson::DateTime::from_millis(ms))),
+                    None => Conv::Named(overflow_conversion(value)),
+                },
                 None => Conv::Failed,
             },
             // A date STRING is a supported conversion that mongod parses, so it
@@ -5726,8 +5907,35 @@ fn to_string_value(v: &Bson) -> Option<String> {
         Bson::ObjectId(oid) => oid.to_hex(),
         Bson::DateTime(dt) => render_date(dt.timestamp_millis(), "%Y-%m-%dT%H:%M:%S.%LZ").ok()?,
         Bson::String(s) => s.clone(),
+        // binData stringifies as BASE64 of its bytes, at any length and
+        // whatever the subtype -- `BinData(0, "7A")` is `"eg=="`. Measured
+        // 8.2.11, 2026-09-08; this used to refuse outright.
+        Bson::Binary(b) => base64_encode(&b.bytes),
         _ => return None,
     })
+}
+
+/// Standard base64 with padding. Small enough not to earn a dependency, and
+/// this is the only caller.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[((n >> (18 - 6 * i)) & 0x3F) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 // --- regex expression operators -----------------------------------------

@@ -5,6 +5,7 @@ import decimal as _decimal
 import functools
 import math
 import re
+import struct
 import zoneinfo
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -12,7 +13,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import bson
-from bson import Decimal128, Int64, ObjectId, Timestamp
+from bson import Binary, Decimal128, Int64, ObjectId, Timestamp
 
 from secantus.bsontypes import fmt_double_value, is_bson_string
 from secantus.numerics import IntegerOverflowError, bson_int_width
@@ -569,6 +570,31 @@ _REQUIRED_FIELDS: dict[str, tuple[tuple[str, int, str], ...]] = {
         ("vars", 16876, "Missing 'vars' parameter to $let"),
         ("in", 16877, "Missing 'in' parameter to $let"),
     ),
+    # These four answered a NULL where mongod raises -- ``{$dateTrunc: {}}`` was
+    # ``None``, not an error, which is the wrong-value class rather than the
+    # wrong-message one. The codes share no pattern: 40542 / 40522 / 5439009 /
+    # 5166303, and ``$dateTrunc`` numbers its two fields 5439009 then 5439010
+    # while ``$dateDiff`` runs 5166303 / 5166304 / 5166305. Measured 8.2.11,
+    # 2026-09-08.
+    "$dateFromString": (
+        ("dateString", 40542, "Missing 'dateString' parameter to $dateFromString"),
+    ),
+    "$dateToParts": (("date", 40522, "Missing 'date' parameter to $dateToParts"),),
+    "$dateTrunc": (
+        ("date", 5439009, "Missing 'date' parameter to $dateTrunc"),
+        ("unit", 5439010, "Missing 'unit' parameter to $dateTrunc"),
+    ),
+    "$dateDiff": (
+        ("startDate", 5166303, "Missing 'startDate' parameter to $dateDiff"),
+        ("endDate", 5166304, "Missing 'endDate' parameter to $dateDiff"),
+        ("unit", 5166305, "Missing 'unit' parameter to $dateDiff"),
+    ),
+    # ``field`` is checked BEFORE ``input``, the reverse of the order the
+    # operator reads them in: ``{$getField: {}}`` is 3041702, not 3041703.
+    "$getField": (
+        ("field", 3041702, "$getField requires 'field' to be specified"),
+        ("input", 3041703, "$getField requires 'input' to be specified"),
+    ),
 }
 
 # Required field must also be a NON-EMPTY array; mongod gives the same code for
@@ -597,6 +623,11 @@ _ALLOWED_FIELDS: dict[str, frozenset[str]] = {
     "$reduce": frozenset({"input", "initialValue", "in"}),
     "$filter": frozenset({"input", "cond", "as", "limit"}),
     "$map": frozenset({"input", "as", "in"}),
+    "$dateFromString": frozenset({"dateString", "format", "timezone", "onError", "onNull"}),
+    "$dateToParts": frozenset({"date", "timezone", "iso8601"}),
+    "$dateTrunc": frozenset({"date", "unit", "binSize", "timezone", "startOfWeek"}),
+    "$dateDiff": frozenset({"startDate", "endDate", "unit", "timezone", "startOfWeek"}),
+    "$getField": frozenset({"field", "input"}),
     "$replaceAll": frozenset({"input", "find", "replacement"}),
     "$replaceOne": frozenset({"input", "find", "replacement"}),
     "$setField": frozenset({"field", "input", "value"}),
@@ -965,12 +996,17 @@ def _op_divide(arg: Any, ctx: _Ctx) -> Any:
             f"$divide only supports numeric types, not "
             f"{_bson_type_name(a)} and {_bson_type_name(b)}"
         )
-    if b == 0:
+    # `b == 0` is FALSE for `Decimal128("0")` -- the type has no `__eq__` with
+    # `int` -- so a decimal zero divisor walked straight past this guard and
+    # `decimal.DivisionByZero` escaped the evaluator as an internal server
+    # error. The zero test has to be asked of the DECIMAL.
+    if _is_zero_operand(b):
         raise ExpressionError("can't $divide by zero", code=2)
     if isinstance(a, Decimal128) or isinstance(b, Decimal128):
-        da = a.to_decimal() if isinstance(a, Decimal128) else Decimal(a)
-        db = b.to_decimal() if isinstance(b, Decimal128) else Decimal(b)
-        return Decimal128(da / db)
+        da = _to_decimal(a)
+        db = _to_decimal(b)
+        with _decimal.localcontext(_DEC128_CTX):
+            return _to_decimal128(da / db)
     return a / b
 
 
@@ -983,13 +1019,20 @@ def _op_mod(arg: Any, ctx: _Ctx) -> Any:
             f"$mod only supports numeric types, not {_bson_type_name(a)} and {_bson_type_name(b)}",
             code=16611,
         )
-    if b == 0:
+    # A DECIMAL operand changes the by-zero CODE -- 16610 for int / double, but
+    # 5733415 the moment a decimal is on either side, whatever the other one is
+    # (measured 8.2.11 across eight type pairings, 2026-09-08). And `b == 0` is
+    # FALSE for `Decimal128("0")`, so a decimal zero divisor reached the
+    # arithmetic instead of this guard.
+    if _is_zero_operand(b):
+        if _has_decimal(a, b):
+            raise ExpressionError("can't $mod by zero", code=5733415)
         raise ExpressionError("can't $mod by zero", code=16610)
     if _has_decimal(a, b):
         # `Decimal.__mod__` truncates toward zero, which is C's `fmod` and
         # mongod's rule -- Python's `%` on ints/floats floors instead, which is
         # why this cannot just widen the existing expression.
-        return _decimal_result(lambda x, y: x % y, a, b)
+        return _decimal_result(_dec_remainder, a, b)
     if isinstance(a, float) or isinstance(b, float):
         # Truncating, not flooring: mongod answers -1.5 for `$mod: [-5.5, 2]`
         # where Python's `%` answers 0.5. Probed 8.2.11.
@@ -1384,6 +1427,36 @@ _DEGREES_PER_RADIAN = 180.0 / math.pi
 #: gives 34 (measured 8.2.11, 2026-09-07).
 _DEC_RADIANS_PER_DEGREE = _decimal.Decimal("0.01745329251994329576923690768488613")
 _DEC_DEGREES_PER_RADIAN = _decimal.Decimal("57.29577951308232087679815481410517")
+
+
+def _is_zero_operand(v: Any) -> bool:
+    """Whether a numeric operand is zero, decimals included.
+
+    `v == 0` is FALSE for `Decimal128("0")`: the BSON wrapper defines no
+    comparison against `int`. Two by-zero guards relied on it and let a decimal
+    zero through -- `$divide` then raised `decimal.DivisionByZero` out of the
+    evaluator, and `$mod` produced a `NaN`.
+    """
+    if isinstance(v, Decimal128):
+        d = v.to_decimal()
+        return d.is_finite() and d == 0
+    return not isinstance(v, bool) and isinstance(v, (int, float)) and v == 0
+
+
+def _dec_remainder(x: _decimal.Decimal, y: _decimal.Decimal) -> _decimal.Decimal:
+    """`x % y` at whatever precision the QUOTIENT needs.
+
+    `Decimal.__mod__` raises `InvalidOperation` -- a `NaN` under this module's
+    untrapped context -- when the integer quotient exceeds the working
+    precision, so `Decimal128("1E+6144") % 7` came back `NaN` where mongod
+    answers `1`. The quotient's digit count is bounded by the operands'
+    exponent gap, so ask for that many.
+    """
+    need = 34
+    if x.is_finite() and y.is_finite() and x != 0 and y != 0:
+        need = max(34, x.adjusted() - y.adjusted() + 4)
+    with _decimal.localcontext(_decimal.Context(prec=need, traps=[])):
+        return x % y
 
 
 def _to_decimal(v: Any) -> _decimal.Decimal:
@@ -2162,6 +2235,13 @@ def _dec_asinh(d: _decimal.Decimal) -> _decimal.Decimal:
     for and recorded in `tasks/backlog.md`. The rest of the table keeps its
     34-digit arithmetic, which reproduces mongod more closely.
     """
+    # mongod's own implementation UNDERFLOWS below ``1E-4966`` and answers a
+    # bare ``0`` (``-0`` for a negative argument) -- not the ``0E-6176`` it
+    # gives for an exact zero. Bisected against 8.2.11, 2026-09-08. mongod is
+    # the exemplar, so this follows it rather than the mathematically correct
+    # value.
+    if d != 0 and d.is_finite() and d.adjusted() <= -4966:
+        return _decimal.Decimal("-0") if d.is_signed() else _decimal.Decimal("0")
     guard = 60 + max(0, -d.adjusted()) if d != 0 else 60
     with _decimal.localcontext(_decimal.Context(prec=guard, traps=[])):
         wide = (abs(d) + (d * d + 1).sqrt()).ln()
@@ -4911,6 +4991,36 @@ def _decimal_to_double(value: Decimal128) -> float:
     raise _overflow_error(str(value))
 
 
+def _bindata_length_error(value: Binary) -> ExpressionError:
+    """mongod's 241 for a ``binData`` whose byte length no numeric target takes.
+
+    The rendering is mongod's own: subtype, the bytes as UPPERCASE hex in
+    quotes, then the length. Measured 8.2.11, 2026-09-08.
+    """
+    hexed = "".join(f"{b:02X}" for b in bytes(value))
+    return ExpressionError(
+        f"Failed to convert 'BinData({value.subtype}, \"{hexed}\")' to number "
+        f"in $convert because of invalid length: {len(bytes(value))}",
+        code=241,
+        code_name="ConversionFailure",
+    )
+
+
+def _bindata_as_int(value: Binary) -> int | None:
+    """A ``binData``'s bytes as a LITTLE-ENDIAN unsigned integer, or ``None``.
+
+    Only 1, 2, 4 and 8 bytes are accepted; the caller narrows further
+    (``$toInt`` takes 1 / 2 / 4, ``$toLong`` also 8). Little-endian is measured,
+    not assumed: ``BinData(0, "01020304")`` is ``67305985``, not ``16909060``.
+    The subtype is ignored.
+    """
+    raw = bytes(value)
+    if len(raw) not in (1, 2, 4, 8):
+        return None
+    n = int.from_bytes(raw, "little", signed=False)
+    return int.from_bytes(raw, "little", signed=True) if len(raw) == 8 else n
+
+
 def _nan_to_integer_error() -> ExpressionError:
     return ExpressionError(
         "Attempt to convert NaN value to integer type in $convert with no onError value",
@@ -4947,6 +5057,12 @@ def _epoch_millis_to_date(millis: float) -> Any:
             raise _non_finite_conversion_error(millis)
         if not (-(2**63) <= millis < 2**63):
             raise _overflow_error(_fmt_double(millis))
+    # A BSON date holds WHOLE milliseconds, so a fractional part is truncated
+    # TOWARD ZERO -- `{$toDate: 1.5}` is 1ms and `{$toDate: -1.5}` is -1ms
+    # (measured 8.2.11, 2026-09-08). Passing the fraction through produced a
+    # datetime with 1500 microseconds: a value BSON cannot hold, and one the
+    # Rust server (which truncates) disagreed with.
+    millis = math.trunc(millis)
     try:
         return _dt.datetime.fromtimestamp(millis / 1000.0, tz=_dt.timezone.utc).replace(tzinfo=None)
     except (OverflowError, OSError, ValueError):
@@ -5041,6 +5157,17 @@ def _convert_value(value: Any, target: Any) -> Any:
             return float(value)
         if isinstance(value, Decimal128):
             return _decimal_to_double(value)
+        if isinstance(value, Binary):
+            # binData's BYTES are the float's own representation -- 4 bytes are
+            # an IEEE single widened, 8 a double. Nothing is parsed, and no
+            # other length is accepted (``$toInt`` takes 1 and 2, this does
+            # not). Measured 8.2.11, 2026-09-08.
+            raw = bytes(value)
+            if len(raw) == 4:
+                return float(struct.unpack("<f", raw)[0])
+            if len(raw) == 8:
+                return float(struct.unpack("<d", raw)[0])
+            raise _bindata_length_error(value)
         if is_bson_string(value):
             return _parse_float_string(value)
         if isinstance(value, _dt.datetime):
@@ -5125,7 +5252,16 @@ def _convert_value(value: Any, target: Any) -> Any:
         elif isinstance(value, float):
             return _epoch_millis_to_date(value)
         elif isinstance(value, Decimal128):
-            return _epoch_millis_to_date(float(value.to_decimal()))
+            dec = value.to_decimal()
+            if dec.is_nan():
+                raise _nan_to_integer_error()
+            if dec.is_infinite():
+                raise _infinity_to_integer_error()
+            if not (-(2**63) <= dec < 2**63):
+                # mongod renders the DECIMAL in its own form here (`1E+30`),
+                # not through the double formatter, which prints `1e+30`.
+                raise _overflow_error(str(value))
+            return _epoch_millis_to_date(int(dec.to_integral_value(rounding=_decimal.ROUND_DOWN)))
         elif is_bson_string(value):
             return _parse_date_string(value)
     elif code in (16, 18):
@@ -5146,6 +5282,17 @@ def _convert_value(value: Any, target: Any) -> Any:
             # int`, so this cannot be one "numeric" arm (probed 8.2.11,
             # 2026-09-02, where `$toLong` of a date answered 241 here).
             return _wrap(int(value.replace(tzinfo=_dt.timezone.utc).timestamp() * 1000))
+        if isinstance(value, Binary):
+            # binData is REINTERPRETED as a little-endian integer, not parsed:
+            # ``BinData(0, "7A")`` is 122. ``$toInt`` takes 1 / 2 / 4 bytes and
+            # ``$toLong`` also 8; every other length is a length error.
+            # Measured 8.2.11, 2026-09-08.
+            width = len(bytes(value))
+            allowed = width in (1, 2, 4) or (code == 18 and width == 8)
+            n = _bindata_as_int(value) if allowed else None
+            if n is None:
+                raise _bindata_length_error(value)
+            return _wrap(n)
         if isinstance(value, bool):
             return _wrap(1 if value else 0)
         if isinstance(value, int):
