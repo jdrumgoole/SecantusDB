@@ -446,6 +446,17 @@ class _Positional(list):
     __slots__ = ()
 
 
+def terminal_value(v: Any) -> Any:
+    """``v`` marked so the implicit one-level array traversal skips it.
+
+    A scalar is returned unchanged; an array comes back as the `_Positional`
+    subclass, which is still an array everywhere else. `$pull` needs this: a
+    SCALAR criterion is exact equality against each element, so
+    ``{$pull: {v: 1}}`` must leave ``{v: [[1, 2]]}`` alone.
+    """
+    return _Positional(v) if type(v) is list else v
+
+
 def _expandable(v: Any, descend: bool) -> bool:
     """Whether the implicit one-level array traversal applies to ``v``."""
     return descend and isinstance(v, list) and not isinstance(v, _Positional)

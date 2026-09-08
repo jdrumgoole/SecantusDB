@@ -799,7 +799,7 @@ fn doc_eq(a: &Document, b: &Document, coll: Option<&Collation>) -> R {
     Ok(true)
 }
 
-fn eq_scalar(v: &Bson, expected: &Bson, coll: Option<&Collation>) -> R {
+pub(crate) fn eq_scalar(v: &Bson, expected: &Bson, coll: Option<&Collation>) -> R {
     // Array equality: `{field: [a, b, c]}` matches when the stored value is an
     // array equal element-by-element (same length, each pair `eq_scalar`-equal).
     // The "field-is-an-array-containing-this-array" nested case is handled by the

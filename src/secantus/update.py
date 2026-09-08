@@ -7,11 +7,12 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
-from bson import Code, Int64
+from bson import Code, Int64, Regex
 
 from secantus.bsontypes import Int64CoercionError, bson_value_repr, coerce_int64_argument
 from secantus.numerics import IntegerOverflowError, bson_add, bson_mul
 from secantus.paths import get_path, has_path, path_block, set_path, unset_path
+from secantus.query import terminal_value
 
 _ARRAY_FILTER_TOKEN = re.compile(r"\$\[([^\]]*)\]")
 # An arrayFilter identifier: begins with a lowercase letter, then alphanumeric.
@@ -373,6 +374,33 @@ def _push_slice(arr: list[Any], n: Any) -> list[Any]:
     return arr[:n] if n > 0 else arr[n:]
 
 
+def _traverse_problem(doc: Mapping[str, Any], path: str) -> UpdateError | None:
+    """mongod's ``28`` for a dotted path whose intermediate is not a document.
+
+    ``{$rename: {"v.k": "v.j"}}`` over any non-document ``v`` -- a scalar, an
+    array, a string, or a **null** -- is
+    ``cannot use the part (v of v.k) to traverse the element ({v: 1})``. Both
+    servers silently no-opped, so an invalid update reported success. Measured
+    8.2.11, 2026-09-08.
+    """
+    parts = path.split(".")
+    current: Any = doc
+    for part in parts[:-1]:
+        if isinstance(current, Mapping):
+            if part not in current:
+                return None  # absent is a no-op, not an error
+            current = current[part]
+        else:
+            return None
+        if not isinstance(current, Mapping):
+            return UpdateError(
+                f"cannot use the part ({part} of {path}) to traverse the element "
+                f"({{{part}: {bson_value_repr(current)}}})",
+                code=28,
+            )
+    return None
+
+
 def _pull_matches(matches: Any, element: Any, criterion: Any) -> bool:
     """Whether an array element should be removed by ``$pull`` under mongod's
     query semantics (verified three-way vs mongod 6.0):
@@ -382,13 +410,21 @@ def _pull_matches(matches: Any, element: Any, criterion: Any) -> bool:
     - any other document criterion (``{x: {$gte: 5}}``, ``{y: "b"}``, ``{b.c: 2}``)
       is a **sub-document match** against the element (a scalar element never
       matches, so it stays);
-    - a scalar criterion is equality (BSON-aware, via the same query engine).
+    - a scalar criterion is EXACT equality -- no implicit array traversal, so
+      ``{$pull: {v: 1}}`` leaves ``{v: [[1, 2]]}`` untouched even though ``1``
+      is inside the element. An OPERATOR or REGEX criterion does traverse:
+      ``{$pull: {v: {$gt: 1}}}`` empties that same document. Both measured
+      against 8.2.11 on 2026-09-08; routing the scalar case through the query
+      engine gave it membership and silently emptied arrays of arrays.
     """
     if isinstance(criterion, Mapping):
         if criterion and all(isinstance(k, str) and k.startswith("$") for k in criterion):
             return matches({"__e": element}, {"__e": criterion})
         return matches(element, criterion) if isinstance(element, Mapping) else False
-    return matches({"__e": element}, {"__e": criterion})
+    if isinstance(criterion, (Regex, re.Pattern)):
+        # A regex criterion traverses, like the operator form.
+        return matches({"__e": element}, {"__e": criterion})
+    return matches({"__e": terminal_value(element)}, {"__e": criterion})
 
 
 def _unknown_modifier(name: str) -> UpdateError:
@@ -1170,7 +1206,12 @@ def _apply_op(
         for path, value in payload.items():
             for concrete in _expand(doc, path, array_filters, positional_matches):
                 arr = get_path(doc, concrete, default=None)
-                if arr is None:
+                # MISSING and NULL are different: mongod creates the array for an
+                # absent field and REFUSES a present null. `get_path` returns
+                # `None` for both, so a null field was silently replaced by a
+                # one-element array -- a wrong WRITE, not a missing error
+                # (measured 8.2.11, 2026-09-08).
+                if arr is None and not has_path(doc, concrete):
                     arr = []
                 elif isinstance(arr, list):
                     arr = list(arr)
@@ -1186,7 +1227,8 @@ def _apply_op(
         for path, value in payload.items():
             for concrete in _expand(doc, path, array_filters, positional_matches):
                 arr = get_path(doc, concrete, default=None)
-                if arr is None:
+                # As `$push` above: a present null is a non-array, not an absence.
+                if arr is None and not has_path(doc, concrete):
                     arr = []
                 elif isinstance(arr, list):
                     arr = list(arr)
@@ -1272,7 +1314,7 @@ def _apply_op(
                 # `{a: 5}` is code 14, while a missing `a` or `a: []` return
                 # nModified 0. We silently skipped all three, so an invalid
                 # update reported success.
-                if arr is not None and not isinstance(arr, list):
+                if (arr is not None or has_path(doc, concrete)) and not isinstance(arr, list):
                     raise _exec_error(
                         f"Path '{concrete}' contains an element of non-array type "
                         f"'{_bson_type_name(arr)}'",
@@ -1326,6 +1368,19 @@ def _apply_op(
                     "the same number of concrete paths"
                 )
             for op_path, np_path in zip(old_paths, new_paths, strict=True):
+                # A source path that cannot be TRAVERSED is an error, not a
+                # silent skip -- checked before `has_path`, which cannot tell
+                # "absent" from "blocked by a non-document".
+                # Only for a STATIC path. A positional form (`$`, `$[]`,
+                # `$[id]`) expands to a concrete path whose array step this
+                # predicate cannot tell from a blocked one -- and mongod refuses
+                # those outright for a different reason anyway (`2 The source
+                # field for $rename may not be dynamic`), which neither server
+                # implements yet. See tasks/backlog.md.
+                if "$" not in old:
+                    problem = _traverse_problem(doc, op_path)
+                    if problem is not None:
+                        raise problem
                 # `_id` is immutable in mongod (error code 66
                 # ImmutableField). $rename targeting (or sourcing from)
                 # _id would silently overwrite it without this guard.
@@ -1379,7 +1434,11 @@ def _apply_op(
                     )
                 parsed_ops.append((bit_op, mask))
             for concrete in _expand(doc, path, array_filters, positional_matches):
-                current = get_path(doc, concrete, default=0) or 0
+                # NOT `... or 0`: that turned every FALSY present value into the
+                # integer 0, so a null, a `-0.0` and an empty array all passed
+                # the integral check below and were overwritten with a number.
+                # An ABSENT field still starts at 0, which is mongod's rule.
+                current = get_path(doc, concrete, default=0) if has_path(doc, concrete) else 0
                 if not isinstance(current, int) or isinstance(current, bool):
                     raise _exec_error(
                         "Cannot apply $bit to a value of non-integral type."
