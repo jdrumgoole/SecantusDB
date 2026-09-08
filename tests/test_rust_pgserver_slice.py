@@ -3042,6 +3042,65 @@ def test_schema_qualified_composite_is_distinct(home: Path) -> None:
         assert still == pub.oid
 
 
+def test_schema_qualified_range_is_distinct(home: Path) -> None:
+    """`create type s.t as range` is a DISTINCT type from a bare `t`.
+
+    psycopg's session-scoped range fixture creates `testschema.testrange` beside
+    a bare `testrange` in one script; a server that resolved a qualified type
+    name to its last part collided them and the second CREATE failed 42710,
+    which -- the fixture being session-scoped -- cascaded to every range test.
+    Here the two coexist, each carries its OWN subtype, and `to_regtype` resolves
+    each name (bare, `schema.name`, and the quoted `"schema"."name"` a
+    `sql.Identifier` renders) to the right oid. The bare name resolves only the
+    public range; the schema name resolves only the schema-qualified one;
+    `typname` stays unqualified (`testrange`), matching PostgreSQL.
+    """
+    from psycopg import sql
+    from psycopg.types.range import RangeInfo
+
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        # The whole fixture as one multi-statement simple query, as psycopg sends
+        # it (subtypes chosen to differ so a collision could not go unnoticed).
+        cur.execute(
+            "create schema if not exists testschema;"
+            ' create type testrange as range (subtype = text, collation = "C");'
+            " create type testschema.testrange as range (subtype = float8);"
+        )
+
+        text_oid = conn.adapters.types["text"].oid
+        float8_oid = conn.adapters.types["float8"].oid
+
+        pub = RangeInfo.fetch(conn, "testrange")
+        sch = RangeInfo.fetch(conn, "testschema.testrange")
+        assert pub.name == "testrange" and sch.name == "testrange"  # typname is bare
+        assert pub.oid != sch.oid  # distinct types
+        assert pub.subtype_oid == text_oid
+        assert sch.subtype_oid == float8_oid
+
+        # A quoted schema-qualified reference (what sql.Identifier renders) also
+        # resolves to the schema-qualified range.
+        ident = RangeInfo.fetch(conn, sql.Identifier("testschema", "testrange"))
+        assert ident.oid == sch.oid
+        bare_ident = RangeInfo.fetch(conn, sql.Identifier("testrange"))
+        assert bare_ident.oid == pub.oid
+
+        # to_regtype: the bare name is the public range; the schema name is the
+        # other; a bare name never reaches the schema-qualified range.
+        cur.execute("select to_regtype('testrange')::oid, to_regtype('testschema.testrange')::oid")
+        pub_oid, sch_oid = cur.fetchone()
+        assert pub_oid == pub.oid
+        assert sch_oid == sch.oid
+        assert pub_oid != sch_oid
+
+        # DROP is schema-aware: dropping the qualified type leaves the bare one.
+        cur.execute("drop type testschema.testrange")
+        cur.execute("select to_regtype('testschema.testrange'), to_regtype('testrange')::oid")
+        gone, still = cur.fetchone()
+        assert gone is None
+        assert still == pub.oid
+
+
 def test_a_plain_select_over_a_join(home: Path) -> None:
     """A top-level two-table JOIN outside any aggregate.
 

@@ -164,6 +164,10 @@ pub enum Statement {
     /// `CREATE TYPE <name> AS ENUM (<labels>)`.
     CreateEnum {
         name: String,
+        /// The schema qualifier (`CREATE TYPE s.t AS ENUM (...)`), or `None` for
+        /// an unqualified name, which lands in `public`. Two enums with the same
+        /// bare name in different schemas are distinct types.
+        schema: Option<String>,
         labels: Vec<String>,
     },
     /// `DROP TYPE [IF EXISTS] <names>`.
@@ -189,6 +193,10 @@ pub enum Statement {
     /// `CREATE TYPE <name> AS RANGE (subtype = <type>)` -- a custom range type.
     CreateRange {
         name: String,
+        /// The schema qualifier (`CREATE TYPE s.t AS RANGE (...)`), or `None` for
+        /// an unqualified name, which lands in `public`. Two ranges with the same
+        /// bare name in different schemas are distinct types.
+        schema: Option<String>,
         subtype: String,
     },
     /// `DROP SCHEMA [IF EXISTS] <names> [CASCADE]`.
@@ -740,15 +748,10 @@ pub fn plan_with_params(
         // `CREATE TYPE ... AS ENUM`. The name may be schema-qualified; with no
         // schema support the last part is the name, same rule as columns.
         N::CreateEnumStmt(e) => {
-            let name = e
-                .type_name
-                .iter()
-                .filter_map(|n| match n.node.as_ref()? {
-                    N::String(s) => Some(s.sval.clone()),
-                    _ => None,
-                })
-                .next_back()
-                .ok_or_else(|| Error::Parse("CREATE TYPE without a name".into()))?;
+            // Keep the schema qualifier: `CREATE TYPE s.t AS ENUM` is a distinct
+            // type from a bare `t`. Dropping it (a bare `.next_back()`) collided
+            // the two.
+            let (schema, name) = split_qualified_type_name(&e.type_name)?;
             let labels = e
                 .vals
                 .iter()
@@ -757,19 +760,18 @@ pub fn plan_with_params(
                     _ => None,
                 })
                 .collect();
-            Ok(Statement::CreateEnum { name, labels })
+            Ok(Statement::CreateEnum {
+                name,
+                schema,
+                labels,
+            })
         }
         // `CREATE TYPE name AS RANGE (subtype = T)` -- a custom range type.
         N::CreateRangeStmt(r) => {
-            let name = r
-                .type_name
-                .iter()
-                .filter_map(|n| match n.node.as_ref()? {
-                    N::String(s) => Some(s.sval.clone()),
-                    _ => None,
-                })
-                .next_back()
-                .ok_or_else(|| Error::Parse("CREATE TYPE without a name".into()))?;
+            // Keep the schema qualifier: `CREATE TYPE s.t AS RANGE` is a distinct
+            // type from a bare `t`. Dropping it (a bare `.next_back()`) collided
+            // the two.
+            let (schema, name) = split_qualified_type_name(&r.type_name)?;
             // The subtype is a DefElem `subtype = <type>`; its arg is a TypeName.
             let subtype = r
                 .params
@@ -782,7 +784,11 @@ pub fn plan_with_params(
                 })
                 .flatten()
                 .ok_or_else(|| Error::Unsupported("a RANGE type without a subtype".into()))?;
-            Ok(Statement::CreateRange { name, subtype })
+            Ok(Statement::CreateRange {
+                name,
+                schema,
+                subtype,
+            })
         }
         N::CopyStmt(c) => plan_copy(&c, lookup, params),
         N::VariableShowStmt(v) => Ok(Statement::Show(v.name.clone())),
@@ -857,6 +863,35 @@ pub fn plan_with_params(
         N::UpdateStmt(u) => plan_update(&u, lookup, params),
         N::DeleteStmt(d) => plan_delete(&d, lookup, params),
         other => Err(Error::Unsupported(disc(&other))),
+    }
+}
+
+/// Split a possibly schema-qualified `CREATE TYPE` name (the statement's
+/// `type_name` node list) into `(schema, bare_name)`. An unqualified name -- or
+/// one explicitly in `public` -- yields `None`, so it registers under its bare
+/// name (public is on the default search_path); `schema.name` keeps the schema
+/// so it is a distinct type. A three-part `catalog.schema.name` keeps the last
+/// two parts (the catalog is the current database).
+fn split_qualified_type_name(
+    names: &[pg_query::protobuf::Node],
+) -> Result<(Option<String>, String)> {
+    let parts: Vec<String> = names
+        .iter()
+        .filter_map(|n| match n.node.as_ref()? {
+            N::String(s) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .collect();
+    match parts.as_slice() {
+        [] => Err(Error::Parse("CREATE TYPE without a name".into())),
+        [name] => Ok((None, name.clone())),
+        [schema, name] if schema == "public" => Ok((None, name.clone())),
+        [schema, name] => Ok((Some(schema.clone()), name.clone())),
+        _ => {
+            let name = parts.last().expect("non-empty").clone();
+            let schema = parts[parts.len() - 2].clone();
+            Ok(((schema != "public").then_some(schema), name))
+        }
     }
 }
 
@@ -3538,22 +3573,25 @@ pub fn set_user_ranges(ranges: Vec<(String, String, i64)>) {
 
 /// The subtype element of a custom range type by name, if one is registered.
 pub fn user_range_subtype(name: &str) -> Option<String> {
-    let n = name.trim();
+    // Canonicalise so a schema-qualified `testschema.testrange` (and its quoted
+    // `"testschema"."testrange"` form) resolves to its own registered entry,
+    // distinct from a bare `testrange`.
+    let n = canonical_type_ref(name);
     PLAN_USER_RANGES.with(|t| {
         t.borrow()
             .iter()
-            .find(|(rn, _, _)| rn == n)
+            .find(|(rn, _, _)| *rn == n)
             .map(|(_, sub, _)| sub.clone())
     })
 }
 
 /// A custom range type's oid by name, for regtype resolution.
 fn user_range_oid(name: &str) -> Option<i64> {
-    let n = name.trim().trim_matches('"');
+    let n = canonical_type_ref(name);
     PLAN_USER_RANGES.with(|t| {
         t.borrow()
             .iter()
-            .find(|(rn, _, _)| rn == n || rn.eq_ignore_ascii_case(n))
+            .find(|(rn, _, _)| *rn == n)
             .map(|(_, _, oid)| *oid)
     })
 }
