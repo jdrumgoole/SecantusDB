@@ -3271,6 +3271,160 @@ fn decide_ord(op: &str, ord: std::cmp::Ordering) -> bool {
     }
 }
 
+/// Parse PostgreSQL composite TEXT input -- `(f1,f2,...)` -- into one entry per
+/// field: `None` for an unquoted-empty field (SQL NULL), `Some(text)` for the
+/// decoded field text (a quoted empty is the empty string, not NULL). Mirrors
+/// PostgreSQL's `record_in`: leading and trailing whitespace around an unquoted
+/// field is ignored, a field may be double-quoted with `""`->`"` and `\x`->`x`.
+fn parse_composite_text(input: &str) -> Result<Vec<Option<String>>> {
+    let s = input.trim();
+    let inner = s
+        .strip_prefix('(')
+        .and_then(|r| r.strip_suffix(')'))
+        .ok_or_else(|| {
+            Error::InvalidText(format!(
+                "malformed record literal: \"{input}\"\nDetail: Missing left parenthesis."
+            ))
+        })?;
+    let mut fields: Vec<Option<String>> = Vec::new();
+    // The empty parenthesis pair `()` is a record with zero fields.
+    if inner.is_empty() {
+        return Ok(fields);
+    }
+    let mut chars = inner.chars().peekable();
+    loop {
+        // A field is quoted, or a bare run up to the next top-level comma.
+        let mut value = String::new();
+        let mut quoted = false;
+        let mut saw_content = false;
+        // Skip leading whitespace of an unquoted field. PostgreSQL's `record_in`
+        // trims only ASCII whitespace, so a value char that Unicode calls space
+        // (U+0085, U+00A0, ...) is content, not padding.
+        while matches!(chars.peek(), Some(c) if c.is_ascii_whitespace()) {
+            chars.next();
+        }
+        if chars.peek() == Some(&'"') {
+            quoted = true;
+            saw_content = true;
+            chars.next();
+            loop {
+                match chars.next() {
+                    Some('"') => {
+                        if chars.peek() == Some(&'"') {
+                            value.push('"');
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    Some('\\') => match chars.next() {
+                        Some(c) => value.push(c),
+                        None => {
+                            return Err(Error::InvalidText(format!(
+                                "malformed record literal: \"{input}\""
+                            )))
+                        }
+                    },
+                    Some(c) => value.push(c),
+                    None => {
+                        return Err(Error::InvalidText(format!(
+                        "malformed record literal: \"{input}\"\nDetail: Unexpected end of input."
+                    )))
+                    }
+                }
+            }
+            // Trailing whitespace up to the comma or the end.
+            while matches!(chars.peek(), Some(c) if c.is_ascii_whitespace()) {
+                chars.next();
+            }
+        } else {
+            // A bare field: content up to the next top-level comma. A backslash
+            // still escapes its next character even outside quotes.
+            while let Some(&c) = chars.peek() {
+                if c == ',' {
+                    break;
+                }
+                chars.next();
+                if c == '\\' {
+                    match chars.next() {
+                        Some(n) => {
+                            value.push(n);
+                            saw_content = true;
+                        }
+                        None => {
+                            return Err(Error::InvalidText(format!(
+                                "malformed record literal: \"{input}\""
+                            )))
+                        }
+                    }
+                } else {
+                    value.push(c);
+                    saw_content = true;
+                }
+            }
+            // A bare field has its trailing ASCII whitespace trimmed.
+            let trimmed_len = value
+                .trim_end_matches(|c: char| c.is_ascii_whitespace())
+                .len();
+            value.truncate(trimmed_len);
+        }
+        // An unquoted, content-free field is SQL NULL; a quoted one is "".
+        if quoted || saw_content {
+            fields.push(Some(value));
+        } else {
+            fields.push(None);
+        }
+        match chars.next() {
+            Some(',') => continue,
+            None => break,
+            Some(c) => {
+                return Err(Error::InvalidText(format!(
+                    "malformed record literal: \"{input}\"\nDetail: Unexpected character \"{c}\" after the field."
+                )))
+            }
+        }
+    }
+    Ok(fields)
+}
+
+/// Build a composite VALUE (a record-shaped datum) from a source value and the
+/// composite's declared fields, coercing each field to its declared type. The
+/// source is either PostgreSQL composite TEXT (`(1,x)`) or an already-built
+/// record (`row(1,'x')` / a bound tuple). A field count that disagrees with the
+/// composite's declaration is the 22P02 PostgreSQL reports.
+fn composite_value(value: Bson, target: &str, fields: &[(String, String)]) -> Result<Bson> {
+    let raw: Vec<Bson> = match value {
+        Bson::String(text) => parse_composite_text(&text)?
+            .into_iter()
+            .map(|f| match f {
+                Some(s) => Bson::String(s),
+                None => Bson::Null,
+            })
+            .collect(),
+        other => match record_fields(&other) {
+            Some(items) => items.clone(),
+            None => {
+                return Err(Error::Unsupported(format!(
+                    "a cast of {} to {target}",
+                    bson_kind(&other)
+                )))
+            }
+        },
+    };
+    if raw.len() != fields.len() {
+        return Err(Error::InvalidText(format!(
+            "malformed record literal: has {} columns, {target} has {}",
+            raw.len(),
+            fields.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    for (v, (_, ty)) in raw.into_iter().zip(fields.iter()) {
+        out.push(cast_value(v, ty)?);
+    }
+    Ok(record_value(out))
+}
+
 /// The oid inside a regtype value, or `None` for any other value.
 pub fn regtype_oid(v: &Bson) -> Option<i64> {
     match v {
@@ -3569,6 +3723,48 @@ thread_local! {
 /// Custom range types: `(range name, subtype element, oid)`.
 pub fn set_user_ranges(ranges: Vec<(String, String, i64)>) {
     PLAN_USER_RANGES.with(|t| *t.borrow_mut() = ranges);
+}
+
+thread_local! {
+    /// Composite types: `(resolution name, oid, [(field name, field type)])`,
+    /// installed per statement by the wire layer so a `'(1,x)'::testcomp` cast
+    /// or a `row(1,'x')::testcomp` record cast resolves its field types without
+    /// a per-call catalog read. Composites carry no labels, so they are held
+    /// apart from the enum-shaped `PLAN_USER_TYPES` (whose empty label list would
+    /// otherwise route a composite cast into the enum arm).
+    static PLAN_USER_COMPOSITES: std::cell::RefCell<Vec<CompositeType>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A composite type's fields: `(field name, field type name)`, in order.
+pub type CompositeFields = Vec<(String, String)>;
+
+/// A composite type as the planner holds it: `(resolution name, oid, fields)`.
+pub type CompositeType = (String, i64, CompositeFields);
+
+/// Composite types: `(resolution name, oid, [(field name, field type)])`.
+pub fn set_user_composites(composites: Vec<CompositeType>) {
+    PLAN_USER_COMPOSITES.with(|t| *t.borrow_mut() = composites);
+}
+
+/// A composite type's `(oid, fields)` by name, folded exactly as `user_enum`:
+/// a quoted name keeps its case, a bare one folds to lower.
+fn user_composite(name: &str) -> Option<(i64, CompositeFields)> {
+    let target = canonical_type_ref(name);
+    let trimmed = name.trim();
+    let fold = !(trimmed.starts_with('"') || trimmed.contains('"'));
+    PLAN_USER_COMPOSITES.with(|t| {
+        t.borrow()
+            .iter()
+            .find(|(n, _, _)| *n == target || (fold && n.eq_ignore_ascii_case(&target)))
+            .map(|(_, oid, fields)| (*oid, fields.clone()))
+    })
+}
+
+/// A composite type's oid by name -- the door `user_type_oid` misses because
+/// composites are not in `PLAN_USER_TYPES`.
+pub fn user_composite_oid(name: &str) -> Option<i64> {
+    user_composite(name).map(|(oid, _)| oid)
 }
 
 /// The subtype element of a custom range type by name, if one is registered.
@@ -4544,6 +4740,10 @@ fn render_array_element(v: &Bson) -> String {
         // A bytea element renders as its `\x…` hex, then the array-quoting
         // below wraps and escapes it (`"\\x01"`), matching PostgreSQL.
         Bson::Binary(b) => bytea::render_hex(&b.bytes),
+        // A record / composite element renders as its `(...)` text; the
+        // array-quoting below wraps it (it has parens and commas), so
+        // `array[row('a',1)::t]` becomes `{"(a,1)"}` as PostgreSQL renders it.
+        _ if record_fields(v).is_some() => record_text(record_fields(v).expect("checked")),
         other => format!("{other:?}"),
     };
     let needs_quotes = raw.is_empty()
@@ -4729,6 +4929,13 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
     // A NULL survives every cast; only its declared type changes.
     if value == Bson::Null {
         return Ok(Bson::Null);
+    }
+    // A cast to a user COMPOSITE type -- `'(1,x)'::testcomp` (text input) or
+    // `row(1,'x')::testcomp` (a record). Handled before the bare-record and
+    // enum arms below: a composite carries an empty label list in the enum
+    // table, so without this arm the enum arm rejected it as an unknown label.
+    if let Some((_, comp_fields)) = user_composite(target) {
+        return composite_value(value, target, &comp_fields);
     }
     // A stored `bytea` (Bson::Binary) renders to text as its `\x…` hex form and
     // is a no-op cast to itself; other targets fall through to the usual error.

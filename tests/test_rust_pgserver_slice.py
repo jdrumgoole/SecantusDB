@@ -3216,6 +3216,86 @@ def test_a_composite_created_by_one_server_is_the_others_too(home: Path) -> None
         assert cur.fetchall() == [("c",)]
 
 
+def test_composite_value_record_cast(home: Path) -> None:
+    """`'(1,x)'::testcomp` and `row(1,'x')::testcomp` build a composite VALUE.
+
+    The record cast used to be an outright `FeatureNotSupported` (row form) or a
+    mis-routed enum parse (`invalid input value for enum testcomp`, text form).
+    Both now parse into a composite whose result column carries the composite's
+    own oid, so psycopg's `register_composite` loader fires.
+    """
+    from psycopg.types.composite import CompositeInfo, register_composite
+
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("create type testcomp as (foo int, bar text)")
+        register_composite(CompositeInfo.fetch(conn, "testcomp"), conn)
+
+        # Text-literal cast and record-constructor cast both round-trip, and the
+        # loader turns them into the registered namedtuple.
+        got = conn.execute("select '(1,x)'::testcomp").fetchone()[0]
+        assert (got.foo, got.bar) == (1, "x")
+        got = conn.execute("select row(2, 'y')::testcomp").fetchone()[0]
+        assert (got.foo, got.bar) == (2, "y")
+
+
+def test_composite_value_dump_and_table_round_trip(home: Path) -> None:
+    """A composite param cast on the wire, and INSERT/SELECT through a column."""
+    from psycopg.types.composite import CompositeInfo, register_composite
+
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("create type testcomp as (foo int, bar text)")
+        info = CompositeInfo.fetch(conn, "testcomp")
+        register_composite(info, conn)
+
+        # Dump: a composite tuple param, explicitly cast on the wire.
+        got = conn.execute("select %s::testcomp", [(7, "seven")]).fetchone()[0]
+        assert (got.foo, got.bar) == (7, "seven")
+
+        # Store it in a column of the composite type and read it back.
+        cur.execute("create table ct (id int, val testcomp)")
+        cur.execute("insert into ct values (1, %s)", [info.python_type(9, "nine")])
+        got = conn.execute("select val from ct where id = 1").fetchone()[0]
+        assert (got.foo, got.bar) == (9, "nine")
+
+
+def test_composite_value_field_escaping(home: Path) -> None:
+    """A composite VALUE renders its fields exactly as PostgreSQL does.
+
+    NULL is empty, the empty string is `""`, and a field with a comma, quote,
+    backslash, parenthesis or whitespace is double-quoted with `"`->`""` and
+    `\\`->`\\\\`. The `::text` render is the surface a client compares against.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("create type tc AS (a int, b text)")
+        cases = {
+            "(,)": "(,)",
+            '(1,"")': '(1,"")',
+            '(1,"a,b")': '(1,"a,b")',
+            '(1,"a""b")': '(1,"a""b")',
+            '(1,"(x)")': '(1,"(x)")',
+            '(1," sp ")': '(1," sp ")',
+        }
+        for literal, want in cases.items():
+            got = cur.execute("select (%s::tc)::text", [literal]).fetchone()[0]
+            assert got == want, (literal, got, want)
+
+
+def test_composite_value_array_element_text(home: Path) -> None:
+    """An array of composites renders each element as its `(...)` text.
+
+    A record element used to leak Rust's `{:?}` debug form into the array
+    literal (`{"Document({...})"}`); it now renders `{"(hello,10,30)"}`.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("create type tc AS (foo text, bar int8, baz float8)")
+        got = cur.execute("select array[row('hello', 10, 30)::tc]").fetchone()[0]
+        assert got == '{"(hello,10,30)"}'
+
+
 def test_row_expressions_are_records(home: Path) -> None:
     """`ROW(...)` / `(a, b, ...)` build an anonymous record (oid 2249).
 

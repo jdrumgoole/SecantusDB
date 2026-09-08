@@ -282,10 +282,17 @@ impl PgHandler {
         // (public is on the default search_path); a schema-qualified one
         // resolves only as `schema.name`, so `to_regtype('testschema.t')` finds
         // it while `to_regtype('t')` does not (matching PostgreSQL).
-        for (schema, name, oid, _) in self.composites_with_schema().unwrap_or_default() {
-            types.push((Self::type_resolution(&schema, &name), oid, Vec::new()));
+        let mut composites: Vec<secantus_pgplan::CompositeType> = Vec::new();
+        for (schema, name, oid, fields) in self.composites_with_schema().unwrap_or_default() {
+            let resolution = Self::type_resolution(&schema, &name);
+            types.push((resolution.clone(), oid, Vec::new()));
+            // The field metadata rides its own channel so a composite VALUE cast
+            // (`'(1,x)'::testcomp`) resolves each field's type; the empty label
+            // list above keeps it OUT of the enum arm.
+            composites.push((resolution, oid, fields));
         }
         secantus_pgplan::set_user_types(types);
+        secantus_pgplan::set_user_composites(composites);
         // Custom ranges resolve their subtype at cast time and their oid for
         // regtype -- but they are NOT enums, so they stay OUT of set_user_types.
         // A schema-qualified range resolves as `schema.name`, so
@@ -332,12 +339,31 @@ impl PgHandler {
                 "public".to_string(),
             ));
         }
-        let (name, oid, _) = enums.iter().find(|(n, _, _)| n == pg_type)?;
+        if let Some((name, oid, _)) = enums.iter().find(|(n, _, _)| n == pg_type) {
+            return Some(Type::new(
+                name.clone(),
+                u32::try_from(*oid).ok()?,
+                postgres_types::Kind::Enum(Vec::new()),
+                "public".to_string(),
+            ));
+        }
+        // A composite type reports its own oid so a client that ran
+        // `register_composite` fires its loader; the value goes out in TEXT
+        // format as `(...)` (a composite is not `binary_encodable`).
+        let composites = self.composites_with_schema().ok()?;
+        let (schema, bare, oid, _) = composites.iter().find(|(schema, name, _, _)| {
+            let resolution = if schema == "public" {
+                name.clone()
+            } else {
+                format!("{schema}.{name}")
+            };
+            resolution == pg_type
+        })?;
         Some(Type::new(
-            name.clone(),
+            bare.clone(),
             u32::try_from(*oid).ok()?,
-            postgres_types::Kind::Enum(Vec::new()),
-            "public".to_string(),
+            postgres_types::Kind::Pseudo,
+            schema.clone(),
         ))
     }
 
