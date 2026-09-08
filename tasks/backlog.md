@@ -5723,44 +5723,55 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
     whose transcendental rounding differs from every other implementation in the
     final digit.
 
-  **CORRECTED 2026-09-08 (the earlier "proof" in this entry was TOO STRONG).**
-  A first measurement showed correctly-rounded-to-34 differs from mongod for
-  `$ln` / `$log10` and concluded "no independent implementation can match it".
-  Probing further found mongod's actual rule, and it is largely reproducible:
+  **MEASURED 2026-09-08 over 96 (operator, input) pairs — 12 operators x 8
+  inputs. This supersedes two earlier conclusions in this entry, BOTH of which
+  inferred a mechanism from a handful of points and were wrong.**
 
-  - **`$sqrt` is plain correctly-rounded decimal128** — IEEE 754 REQUIRES that
-    for square root, and it matches on **6 of 6** inputs tested (2.5, 0.5, 1.25,
-    3, 7.125, 0.001). This operator is exactly reproducible **today**, with no
-    dependency at all.
-  - **`$exp` / `$ln` go through BINARY128.** Rounding the true value to a
-    113-bit mantissa (the binary128 significand) and converting back to 34
-    decimal digits reproduces mongod exactly where correct decimal rounding does
-    not:
+  | rule | pairs |
+  | --- | --- |
+  | correctly-rounded **decimal128** | **76** |
+  | matches a **binary128** round-trip instead | 7 |
+  | neither — mongod is 1–2 ULP off the correctly-rounded value | 13 |
 
-        ln(2.5)  correctly rounded (decimal) -> ...680111
-                 via binary128               -> ...680110  == mongod
+  Per operator: `$sqrt` and `$asinh` are correctly-rounded decimal on **8 of 8**
+  (IEEE 754 requires it for square root). Every other operator is mixed, mostly
+  decimal with a few strays.
 
-  - **It is not one uniform rule.** Across 24 covered (operator, input) pairs the
-    binary128 route matched 20 and missed 4 — three `$sqrt` (which follow the
-    decimal rule above) and `$log10(7.125)`. So `$log10` is not purely binary128
-    either, and the trig / hyperbolic family (48 pairs) was not covered at all
-    because the test harness had no series implementation.
+  The strays are real, not harness error — the reference series is stable at 60,
+  130 and 190 digits:
 
-  **What this changes.** The item is no longer "needs Intel RDFP or nothing".
-  There is a real pure-Rust path — correctly-rounded decimal `$sqrt`, plus a
-  binary128 intermediate for the log/exp family — that needs no C dependency. It
-  does need a high-precision arithmetic core (compute at ~200 bits, round to 113,
-  convert to 34 decimal digits) and per-operator verification against mongod,
-  which is a genuine feature-sized piece of work rather than a one-line fix.
+      sin(2.5)  true ...861623   mongod ...861622   (1 ULP low)
+      cos(2.5)  true ...673517   mongod ...673517   (exact)
+      tan(2.5)  true ...252746   mongod ...252744   (2 ULP)
 
-  **Next session should start by** extending the harness with series
-  implementations for sin/cos/tan/atan/sinh/cosh/tanh/asinh and re-running the
-  24-pair sweep over all 72, to find which of them the binary128 route explains.
-  The harness is `scratchpad`-only; the mongod values it compares against are
-  cheap to regenerate (12 operators x 6 inputs, one aggregation each).
+  **What is safe to say:** mongod is correctly-rounded decimal about 79% of the
+  time and carries a small approximation error the rest, and NO rule found so far
+  predicts which. The binary128 idea explains 7 pairs and is not a mechanism —
+  it accounts for only 1 of 8 inputs each for `$exp` and `$ln`.
 
-  Linking Intel RDFP remains the only route to bit-identical results on
-  EVERY operator without that verification work, and is still Joe's call.
+  **So the practical options, now quantified:**
+
+  1. **Implement correctly-rounded decimal transcendentals in pure Rust.** No
+     dependency. Gets `$sqrt` and `$asinh` EXACT (16 of the 96 pairs), ~79%
+     overall exact, and 1–2 ULP off on ~14%. Needs a high-precision core plus
+     argument reduction — feature-sized work.
+  2. **Link Intel RDFP.** The only route to bit-identical on every operator.
+     Cost: a C dependency across the five wheel platforms.
+  3. **Keep refusing.** Today's behaviour: 0% answered, nothing wrong.
+
+  Option 1 is now a legitimate candidate rather than the trap the earlier
+  write-up called it — `$sqrt` alone is exactly reproducible today.
+
+  **A lesson worth keeping.** This entry was rewritten three times in one day:
+  "needs a 34-digit library" (wrong — Python has one and still misses),
+  "not correctly rounded, unmatchable" (wrong — 79% is correctly rounded), and
+  "goes through binary128" (wrong — that explains 7 of 96). Each came from
+  inferring a MECHANISM off four or five data points. The 96-pair sweep is the
+  first statement here that is a measurement rather than a theory. Report counts;
+  do not name a mechanism until the sweep is wide enough to falsify one.
+
+  The harness is `scratchpad/b128_rule.py`; regenerating the mongod values is 12
+  operators x 8 inputs, one aggregation each.
   This is Joe's call, not a unilateral one.
 
 - [ ] **Decimal128 operands are refused by 33 Rust operators (2026-09-02).**
