@@ -5782,11 +5782,26 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   exact, all 25 failures carrying the wrong code). Rust and Python agree 23 of
   23. Pinned by `tests/test_rust_todate_parse_failure.py`.
 - [ ] **DECISION NEEDED (not a coding task): `Decimal128` FINITE operands in the
-  transcendentals — 15 shapes, re-measured 2026-09-08.** The Rust server refuses
-  `$sqrt` / `$exp` / `$ln` / `$log10` / the six trig / the four hyperbolic /
-  `$degreesToRadians` / `$radiansToDegrees` on a finite non-zero decimal; mongod
-  answers at 34 significant digits (`$sqrt(2.5)` is
-  `1.581138830084189665999446772216359`).
+  transcendentals — 15 shapes, re-measured 2026-09-08.**
+
+  **`$sqrt`, `$degreesToRadians`, `$radiansToDegrees` and `$exp` are DONE
+  (2026-09-08) and are no longer part of this decision.** None of them needed a
+  transcendental:
+
+  - `$sqrt` is exact digit-by-digit integer square root plus the decimal spec's
+    ideal exponent (`crate::decimal::sqrt`). IEEE 754 requires square root to be
+    correctly rounded, so it reproduces mongod without matching anyone's
+    approximation error. Verified on 75 values, 0 divergences.
+  - the two angle conversions are ONE correctly-rounded decimal multiply by
+    mongod's own 34-digit constant.
+  - `$exp` is answered only in the two regions that need no series at all
+    (`|x| >= 1E+5` decided by sign; `|x| <= 1E-40` exactly `1`); the middle
+    still refuses.
+
+  What remains is `$ln` / `$log10` / the six trig / the four hyperbolic on a
+  finite non-zero decimal; mongod answers at 34 significant digits. `$asinh`
+  (`ln(x + sqrt(x^2+1))`) is measured correctly-rounded on 8 of 8 and is
+  reachable the moment a decimal `ln` exists — the sqrt half is already built.
 
   **Two claims in the previous version of this entry were WRONG, both corrected
   by measurement rather than reading:**
@@ -5863,16 +5878,76 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   operators x 8 inputs, one aggregation each.
   This is Joe's call, not a unilateral one.
 
-- [ ] **Decimal128 operands are refused by 33 Rust operators (2026-09-02).**
-  Was 38; `$abs`, `$toBool`, `$toInt`, `$toLong` and `$toDouble` now take them.
-  `$add`, `$subtract`, `$multiply`, `$divide`, `$mod`, `$ceil`,
-  `$floor`, `$trunc`, `$round`, `$cmp`, `$gt`, `$gte`, `$lt`, `$lte`, `$pow`,
-  `$sqrt`, `$exp`, `$ln`, `$log10`, the six trig and four hyperbolic functions,
-  `$degreesToRadians` / `$radiansToDegrees`, and `$toDate`. Each declines with a
-  comment reading
-  "-> Python" or "defers to the pure oracle" — meaningless here — so **a
-  collection holding Decimal128 values cannot use most math operators on the
-  Rust server.** mongod answers all 38.
+- [x] **RESOLVED 2026-09-08 — `f64` was used as a CLASSIFIER for Decimal128, and
+  it saturates.** Eight Rust operators asked "is this infinite?" / "is this
+  zero?" of `decimal_as_f64`, whose `f64` round-trip turns a finite
+  `Decimal128("1E+6144")` into `f64::INFINITY` and a finite
+  `Decimal128("1E-6176")` into `0.0`. Each then took the branch for a special
+  value. Measured over 18 operators x 10 extreme inputs against 8.2.11: **79 of
+  180 cells diverged**; the eight fixed here are now 0 and the remaining 30 are
+  the `$ln` / `$log10` / `$sin` / `$atan` transcendentals above.
+
+  Four of the eight were silently WRONG VALUES rather than errors: `$sqrt` of a
+  large decimal said `Infinity`, `$toDouble` of an out-of-range one said `inf` /
+  `0.0` where mongod raises `241`, `$toBool` of `1E-6176` said `false`, and
+  `$floor` / `$ceil` past 34 integer digits returned the value where mongod's
+  `quantize` gives `NaN`.
+
+  Two boundaries worth keeping, both bisected rather than reasoned:
+
+  - **`$toDouble`'s cut is not `f64::MIN_POSITIVE` and not `is_normal()` on the
+    parsed double.** It is IEEE tininess-after-rounding computed with an
+    UNBOUNDED exponent, at exactly `2^-1022 - 2^-1076` — a quarter of a
+    subnormal ULP below `f64::MIN_POSITIVE`. Every value in
+    `[2^-1022 - 2^-1075, 2^-1022)` parses UP to `f64::MIN_POSITIVE` and looks
+    normal, while mongod refuses the lower half of that band. A representable
+    subnormal (`4.9E-324`) is still a `241`.
+  - **`$floor` / `$ceil` quantize and `$trunc` / `$round` do not.** Same input
+    `Decimal128("1E+34")`: `NaN` from the first pair,
+    `1.000000000000000000000000000000000E+34` from the second. The rule
+    therefore belongs in `$floor` / `$ceil`, not in the shared `round_to_exp`.
+
+  Also fixed underneath: arithmetic results outside decimal128's exponent range
+  were REFUSED rather than clamped, so an exact product like
+  `$radiansToDegrees(Decimal128("1E-6176"))` became a `BadValue` instead of the
+  subnormal `5.7E-6175`. `decimal::clamp` now applies the format's own overflow
+  and minimum-quantum rules.
+
+  **The PYTHON engine had the same family, and three crashes of its own.** Same
+  sweep, 14 operators x 26 inputs: **64 of 364 diverged**, now 0.
+  `$degreesToRadians` / `$radiansToDegrees` of a decimal whose exact product
+  falls outside decimal128's range raised a raw `decimal.Inexact` /
+  `decimal.Overflow` OUT of the evaluator — an internal server error where
+  mongod returns `5.7E-6175` / `Infinity`. The angle conversions also computed
+  `x * pi / 180` (two roundings) where the double path's own comment says mongod
+  multiplies by one constant, which showed up as 32 significant digits instead
+  of 34. And `$trunc` / `$round` past 34 integer digits answered `NaN`: they do
+  not quantize, they widen.
+
+  **Neither the parity suites nor any existing test could see any of this.**
+  The parity run was green throughout (734 passed) because its corpus never
+  reaches decimal128's exponent extremes — the two engines were wrong in
+  DIFFERENT ways and still agreed everywhere the corpus looked. Another entry
+  for "parity is not correctness".
+
+  Pinned by `tests/test_rust_decimal_extremes.py` (91 cases) and
+  `tests/test_decimal128_extremes.py` (58).
+
+- [ ] **`$exp` of a mid-range finite decimal still refuses on the Rust server
+  (2026-09-08).** The only cell left on the 364-case grid above: `$exp(1)` is
+  `2.718281828459045235360287471352662` on mongod and a `BadValue` here. The
+  two decided regions (`|x| >= 1E+5`, `|x| <= 1E-40`) are answered; the middle
+  needs a decimal exponential series. The Python engine answers all of them
+  (stdlib `decimal.exp()`), so this is a Rust-only gap. Same series would give
+  `ln`, and `ln` plus the `sqrt` already built gives `$asinh`.
+
+- [ ] **Decimal128 operands are refused by some Rust operators.** Shrinking:
+  `$abs`, `$toBool`, `$toInt`, `$toLong`, `$toDouble`, and now `$sqrt`,
+  `$degreesToRadians`, `$radiansToDegrees` and `$exp`'s decided regions
+  (2026-09-08) take them. What still declines is the transcendental set above
+  (`$ln`, `$log10`, the six trig, the four hyperbolic) plus `$toDate`. Each
+  declines with a comment reading "-> Python" or "defers to the pure oracle" —
+  meaningless here, since a defer on this server is an ERROR.
 
   **Partly closed 2026-09-02**: the COMPARISON half is done. `order::cmp` had
   always handled decimals (rank 3 routes through `numeric::classify`); only

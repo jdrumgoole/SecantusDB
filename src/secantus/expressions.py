@@ -1376,6 +1376,15 @@ _PI = _decimal.Decimal("3.14159265358979323846264338327950288419716939937510")
 _RADIANS_PER_DEGREE = math.pi / 180.0
 _DEGREES_PER_RADIAN = 180.0 / math.pi
 
+#: The DECIMAL conversion factors, mongod's own 34-digit constants. The decimal
+#: path used to compute `x * pi / 180` and `x * 180 / pi`, which is the
+#: association the double path's comment above explicitly warns against -- two
+#: roundings instead of one, and it showed: `$degreesToRadians` of
+#: `Decimal128("4.9E-324")` came back with 32 significant digits where mongod
+#: gives 34 (measured 8.2.11, 2026-09-07).
+_DEC_RADIANS_PER_DEGREE = _decimal.Decimal("0.01745329251994329576923690768488613")
+_DEC_DEGREES_PER_RADIAN = _decimal.Decimal("57.29577951308232087679815481410517")
+
 
 def _to_decimal(v: Any) -> _decimal.Decimal:
     """A numeric operand as a `Decimal`, exactly."""
@@ -1394,10 +1403,78 @@ def _has_decimal(*vals: Any) -> bool:
     return any(isinstance(v, Decimal128) for v in vals)
 
 
+#: decimal128 as IEEE 754 defines it. `clamp=1` with `Emax`/`Emin` is what turns
+#: an out-of-range result into the format's own answer -- `Infinity` above the
+#: top, and a value rounded to the minimum quantum (`Etiny = Emin - prec + 1 =
+#: -6176`) below the bottom, which is where subnormals come from.
+_DEC128_IEEE_CTX = _decimal.Context(prec=34, Emax=6144, Emin=-6143, clamp=1, traps=[])
+
+
+def _to_decimal128(d: _decimal.Decimal) -> Decimal128:
+    """A `Decimal` as a `Decimal128`, clamped into range rather than refused.
+
+    `Decimal128(...)` RAISES `decimal.Inexact` / `decimal.Overflow` for a value
+    the format cannot hold, and that exception escaped the evaluator: the exact
+    product behind `$radiansToDegrees(Decimal128("1E-6176"))` is
+    `5.729…E-6175`, too fine for decimal128, and the operator answered an
+    internal server error where mongod answers the subnormal `5.7E-6175`
+    (measured 8.2.11, 2026-09-07). Three such crashes across the two angle
+    conversions.
+
+    The plain construction is tried first so nothing already in range changes
+    quantum.
+    """
+    try:
+        return Decimal128(d)
+    except _decimal.DecimalException:
+        return Decimal128(_DEC128_IEEE_CTX.plus(d))
+
+
 def _decimal_result(fn: Any, *vals: Any) -> Decimal128:
     """Run `fn` over the operands as `Decimal`s, at decimal128 precision."""
     with _decimal.localcontext(_DEC128_CTX):
-        return Decimal128(fn(*(_to_decimal(v) for v in vals)))
+        return _to_decimal128(fn(*(_to_decimal(v) for v in vals)))
+
+
+def _decimal_quantize_place(d: _decimal.Decimal, place: int, rounding: str) -> _decimal.Decimal:
+    """`$trunc` / `$round` at `place` -- widening rather than failing.
+
+    Unlike `$floor` / `$ceil`, these do NOT answer `NaN` when the requested
+    quantum needs more than 34 digits: mongod expresses the value at the finest
+    quantum that DOES fit, so `$trunc(Decimal128("1E+34"))` is
+    `1.000000000000000000000000000000000E+34` while `$floor` of the same input
+    is `NaN`. Quantizing without the fallback returned `NaN` for every decimal
+    past 34 integer digits (measured 8.2.11, 2026-09-07).
+    """
+    with _decimal.localcontext(_DEC128_CTX):
+        r = d.quantize(_decimal.Decimal(1).scaleb(-place), rounding=rounding)
+        if r.is_nan() and d.is_finite():
+            finest = _decimal.Decimal(1).scaleb(d.adjusted() - 33)
+            r = d.quantize(finest, rounding=rounding)
+        return r
+
+
+def _decimal_quantize_integral(v: Any, rounding: str) -> Decimal128:
+    """`$floor` / `$ceil` of a decimal -- the decimal spec's `quantize`.
+
+    An integral value needing more than decimal128's 34 digits is an Invalid
+    Operation, so mongod answers `NaN`: `$floor(Decimal128("1E+34"))` is `NaN`.
+    `$trunc` / `$round` of the SAME input answer
+    `1.000000000000000000000000000000000E+34` -- they do not quantize -- which
+    is why this cannot live in the shared rounding helper. Measured 8.2.11,
+    2026-09-07.
+    """
+    dec = _to_decimal(v)
+    if dec != 0 and dec.adjusted() >= 34:
+        return Decimal128("NaN")
+    with _decimal.localcontext(_DEC128_CTX):
+        # `quantize`, not `to_integral_value`: the latter leaves a coarse
+        # exponent alone, so `$floor(Decimal128("1E+33"))` stayed `1E+33` where
+        # mongod's quantum is 0 and it renders all 34 digits.
+        integral = dec.quantize(_decimal.Decimal(1), rounding=rounding)
+        if integral.is_nan():
+            return Decimal128("NaN")
+    return _to_decimal128(integral)
 
 
 def _require_math_numeric(v: Any, op: str, code: int = 28765) -> None:
@@ -1520,10 +1597,7 @@ def _op_round(arg: Any, ctx: _Ctx) -> Any:
         # Half-to-even, which is what `round` does for floats and what mongod
         # documents for `$round`.
         return _decimal_result(
-            lambda d: d.quantize(
-                _decimal.Decimal(1).scaleb(-place), rounding=_decimal.ROUND_HALF_EVEN
-            ),
-            n,
+            lambda d: _decimal_quantize_place(d, place, _decimal.ROUND_HALF_EVEN), n
         )
     rounded = round(n, place)
     # Rounding UP out of int64 is an ERROR on mongod, not a widening to double:
@@ -1579,7 +1653,7 @@ def _op_floor(arg: Any, ctx: _Ctx) -> Any:
     if _has_decimal(v):
         if _decimal_is_infinite(v):
             return Decimal128("NaN")
-        return _decimal_result(lambda d: d.to_integral_value(rounding=_decimal.ROUND_FLOOR), v)
+        return _decimal_quantize_integral(v, _decimal.ROUND_FLOOR)
     # These operators are type-preserving in mongod: a double in is a double
     # out (`$floor` of 1.5 is 2.0, not 2), an int stays an int. Python's
     # `math.floor` returns an int for either, which changed the BSON type of
@@ -1602,7 +1676,7 @@ def _op_ceil(arg: Any, ctx: _Ctx) -> Any:
     if _has_decimal(v):
         if _decimal_is_infinite(v):
             return Decimal128("NaN")
-        return _decimal_result(lambda d: d.to_integral_value(rounding=_decimal.ROUND_CEILING), v)
+        return _decimal_quantize_integral(v, _decimal.ROUND_CEILING)
     # A non-finite DOUBLE passes through: `math.ceil(inf)` raises
     # `OverflowError`, which reached the client as `internal server error`
     # where mongod answers `inf` (probed 8.2.11, 2026-09-03).
@@ -1625,7 +1699,20 @@ def _math_domain_float(value: Any) -> float | None:
     ``28766`` for both. A wrong ANSWER, not just a missing error.
     """
     if isinstance(value, Decimal128):
-        return float(value.to_decimal())
+        dec = value.to_decimal()
+        f = float(dec)
+        # `float()` SATURATES: decimal128 reaches `1E-6176` and `1E+6144`, which
+        # `float` renders as `0.0` and `inf`. A domain check reading that
+        # decided `Decimal128("-1E-6176")` was not negative, and
+        # `$sqrt(Decimal128("-1E-6176"))` answered `NaN` where mongod raises
+        # 28714 (measured 8.2.11, 2026-09-07). Only the SIGN and the
+        # zero/non-zero distinction matter to these checks, so a saturated
+        # magnitude is replaced by the nearest float that keeps both.
+        if f == 0.0 and dec != 0:
+            return math.copysign(5e-324, -1.0 if dec.is_signed() else 1.0)
+        if math.isinf(f) and dec.is_finite():
+            return math.copysign(1.7976931348623157e308, f)
+        return f
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
@@ -1728,6 +1815,13 @@ def _op_exp(arg: Any, ctx: _Ctx) -> Any:
         return None
     _require_math_numeric(v, "$exp")
     if _has_decimal(v):
+        dec = v.to_decimal()
+        # `e^x` for |x| <= 1E-40 is 1 to forty orders past decimal128's
+        # resolution, and mongod answers a BARE `1` there -- not the 34-digit
+        # `1.000…000` that carrying the computation out produces. Measured
+        # 8.2.11, 2026-09-07.
+        if dec.is_finite() and dec != 0 and dec.adjusted() <= -40:
+            return Decimal128("1")
         return _decimal_result(lambda d: d.exp(), v)
     try:
         return math.exp(v)
@@ -2202,10 +2296,7 @@ def _op_trunc(arg: Any, ctx: _Ctx) -> Any:
         if not n.to_decimal().is_finite():
             return n
         # `quantize` at the requested place, truncating toward zero.
-        return _decimal_result(
-            lambda d: d.quantize(_decimal.Decimal(1).scaleb(-place), rounding=_decimal.ROUND_DOWN),
-            n,
-        )
+        return _decimal_result(lambda d: _decimal_quantize_place(d, place, _decimal.ROUND_DOWN), n)
     # A non-finite DOUBLE passes through: `math.trunc` raises `OverflowError`
     # on an infinity and `ValueError` on NaN, both of which reached the client
     # as `internal server error` where mongod answers the value (probed 8.2.11,
@@ -4762,6 +4853,40 @@ def _overflow_error(rendered: str | None = None) -> ExpressionError:
     )
 
 
+#: The magnitude below which a decimal does NOT reach a normal double, as an
+#: exact decimal: `2**-1022 - 2**-1076`, TRUNCATED to decimal128's 34 digits.
+#:
+#: The boundary is neither `sys.float_info.min` nor "the rounded double is
+#: normal". IEEE decides tininess by rounding the exact value to a 53-bit
+#: significand with an UNBOUNDED exponent and asking whether THAT falls below
+#: `2**-1022`, which puts the cut a quarter of a subnormal ULP lower. Python's
+#: own `float()` cannot see it: subnormal spacing is twice as coarse, so every
+#: value in `[2**-1022 - 2**-1075, 2**-1022)` converts UP to `sys.float_info.min`
+#: and looks normal, while mongod refuses the lower half of that band.
+#:
+#: Bisected against 8.2.11 on 2026-09-07. The test is STRICTLY greater: the real
+#: cut lies between this truncation and the next 34-digit value, so no
+#: representable argument falls in the gap.
+_DEC_MIN_NORMAL_DOUBLE = _decimal.Decimal("2.225073858507201259573821257020768E-308")
+
+
+def _decimal_to_double(value: Decimal128) -> float:
+    """``$toDouble`` of a decimal, with mongod's range rule.
+
+    A decimal converts only when the double is NORMAL. Saturating to ``inf`` /
+    ``0.0`` -- which is what ``float()`` does over decimal128's much wider range
+    -- was a silently wrong VALUE where mongod raises ``241``: even
+    ``Decimal128("4.9E-324")``, representable as a *subnormal* double, is a
+    ``241``. Measured 8.2.11, 2026-09-07.
+    """
+    dec = value.to_decimal()
+    if dec.is_nan() or dec.is_infinite() or dec == 0:
+        return float(dec)
+    if abs(dec) > _DEC_MIN_NORMAL_DOUBLE and math.isfinite(float(dec)):
+        return float(dec)
+    raise _overflow_error(str(value))
+
+
 def _nan_to_integer_error() -> ExpressionError:
     return ExpressionError(
         "Attempt to convert NaN value to integer type in $convert with no onError value",
@@ -4891,7 +5016,7 @@ def _convert_value(value: Any, target: Any) -> Any:
         if isinstance(value, (int, float)):
             return float(value)
         if isinstance(value, Decimal128):
-            return float(value.to_decimal())
+            return _decimal_to_double(value)
         if is_bson_string(value):
             return _parse_float_string(value)
         if isinstance(value, _dt.datetime):
@@ -5409,33 +5534,13 @@ def _op_bson_size(arg: Any, ctx: _Ctx) -> Any:
     return len(bson.encode(dict(v)))
 
 
-def _dec_conversion_zero(v: Any, positive: str, negative: str) -> Decimal128 | None:
-    """A decimal ZERO through an angle conversion: a constant with the
-    conversion's own QUANTUM, and the sign survives.
-
-    The decimal multiply computed `0E-50` where mongod answers `0E-35`
-    (degrees->radians) and `0E-32` (radians->degrees) — right value, wrong
-    exponent, which `Decimal128.__str__` shows and a client comparing text
-    sees. Measured 8.2.11, 2026-09-07.
-    """
-    if not isinstance(v, Decimal128):
-        return None
-    d = v.to_decimal()
-    if d.is_nan() or d.is_infinite() or d != 0:
-        return None
-    return Decimal128(negative if str(v).startswith("-") else positive)
-
-
 def _op_degrees_to_radians(arg: Any, ctx: _Ctx) -> Any:
     v = _eval(arg, ctx)
     if v is None:
         return None
     _require_math_numeric(v, "$degreesToRadians")
-    zero = _dec_conversion_zero(v, "0E-35", "-0E-35")
-    if zero is not None:
-        return zero
     if _has_decimal(v):
-        return _decimal_result(lambda d: d * _PI / _decimal.Decimal(180), v)
+        return _decimal_result(lambda d: d * _DEC_RADIANS_PER_DEGREE, v)
     # `x * (pi/180)`, not `x * pi / 180`: mongod multiplies by a single
     # precomputed constant, and the two associations differ in the last bit
     # (1.5 degrees -> 0.026179938779914945, not ...94). Probed 8.2.11.
@@ -5447,11 +5552,8 @@ def _op_radians_to_degrees(arg: Any, ctx: _Ctx) -> Any:
     if v is None:
         return None
     _require_math_numeric(v, "$radiansToDegrees")
-    zero = _dec_conversion_zero(v, "0E-32", "-0E-32")
-    if zero is not None:
-        return zero
     if _has_decimal(v):
-        return _decimal_result(lambda d: d * _decimal.Decimal(180) / _PI, v)
+        return _decimal_result(lambda d: d * _DEC_DEGREES_PER_RADIAN, v)
     # One precomputed constant, as `$degreesToRadians` above.
     return float(v) * _DEGREES_PER_RADIAN
 

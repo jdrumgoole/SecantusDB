@@ -3494,17 +3494,28 @@ fn op_deg_rad(arg: &Bson, ctx: &Ctx, to_rad: bool) -> R {
     if let Some(f) = decimal_special_f64(&value) {
         return Ok(decimal_special_bson(f));
     }
-    // A decimal ZERO answers a constant with the conversion's own QUANTUM --
-    // `0E-35` one way and `0E-32` the other -- and the sign survives. Measured
-    // 8.2.11, 2026-09-07; no decimal arithmetic involved.
-    if matches!(value, Bson::Decimal128(_)) && decimal_as_f64(&value) == Some(0.0) {
-        let negative = decimal_is_negative_zero(&value);
-        return decimal_from_text(match (to_rad, negative) {
-            (true, false) => "0E-35",
-            (true, true) => "-0E-35",
-            (false, false) => "0E-32",
-            (false, true) => "-0E-32",
-        });
+    // A decimal ZERO needs no special case: the multiply below gives it the
+    // right quantum for free, because the quantum TRACKS THE ARGUMENT'S.
+    // `0` degrees is `0E-35` but `-0.00` degrees is `-0E-37` -- the argument's
+    // own exponent of -2 carried into the product -- so the fixed `0E-35` /
+    // `0E-32` table this used to consult was right only for an argument whose
+    // exponent happened to be 0. Measured 8.2.11, 2026-09-07.
+    //
+    // A finite decimal is ONE correctly-rounded decimal128 multiply by
+    // mongod's own 34-digit constant -- not a wider computation and not an
+    // `f64` one. Verified against 8.2.11 (2026-09-07) at both extremes and on
+    // values that separate the two associations: `1E-6176` degrees is `0E-6176`
+    // and `1E-6176` radians is `5.7E-6175`, both SUBNORMAL results that only a
+    // decimal multiply reaches. Routing this through `f64` answered `Infinity`
+    // for every input past `1E+309` and `0E-35` for every input below `1E-324`.
+    if matches!(value, Bson::Decimal128(_)) {
+        const RAD_PER_DEG: &str = "0.01745329251994329576923690768488613";
+        const DEG_PER_RAD: &str = "57.29577951308232087679815481410517";
+        let x = crate::decimal::from_bson(&value).ok_or(Fallback::Defer)?;
+        let k = crate::decimal::parse(if to_rad { RAD_PER_DEG } else { DEG_PER_RAD })
+            .ok_or(Fallback::Defer)?;
+        let r = crate::decimal::mul(&x, &k).ok_or(Fallback::Defer)?;
+        return crate::decimal::to_bson(&r).ok_or(Fallback::Defer);
     }
     let x = match value {
         Bson::Null => return Ok(Bson::Null),
@@ -5159,6 +5170,13 @@ fn parse_float_string(value: &str) -> Result<f64, Fallback> {
 ///
 /// `to_string` emits `NaN` / `Infinity` / `-Infinity`, which Rust's `f64`
 /// parser does not accept in that spelling, so they are mapped explicitly.
+///
+/// **This SATURATES, and is therefore never a classifier.** decimal128's range
+/// is far wider than `f64`'s, so a finite `Decimal128("1E+6144")` comes back as
+/// `f64::INFINITY` and a finite `Decimal128("1E-6176")` as `0.0`. Asking this
+/// function "is the argument infinite?" or "is it zero?" answered YES for
+/// ordinary finite decimals and put six operators onto the wrong branch. Use
+/// `decimal_is_special` / `decimal_is_zero`, which read the decimal itself.
 fn decimal_as_f64(v: &Bson) -> Option<f64> {
     let Bson::Decimal128(d) = v else { return None };
     let text = d.to_string();
@@ -5179,8 +5197,30 @@ fn decimal_as_f64(v: &Bson) -> Option<f64> {
 /// is `1.581138830084189665999446772216359` on mongod and reproducing that
 /// needs real decimal transcendentals.
 fn decimal_special_f64(v: &Bson) -> Option<f64> {
-    let f = decimal_as_f64(v)?;
-    (f.is_nan() || f.is_infinite()).then_some(f)
+    // Classified from the decimal's own text, NOT from `decimal_as_f64`: that
+    // saturates, so a finite `Decimal128("1E+6144")` looked infinite here and
+    // `$degreesToRadians` answered `Infinity` where mongod answers
+    // `1.745329251994329576923690768488613E+6142` (measured 8.2.11, 2026-09-07).
+    let Bson::Decimal128(d) = v else { return None };
+    let text = d.to_string();
+    let low = text.to_ascii_lowercase();
+    if low.contains("nan") {
+        return Some(f64::NAN);
+    }
+    if low.contains("inf") {
+        return Some(if text.starts_with('-') {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        });
+    }
+    None
+}
+
+/// Whether a `Decimal128` is NaN or an infinity -- read from the decimal, so a
+/// large FINITE decimal is not mistaken for one.
+fn decimal_is_special(v: &Bson) -> bool {
+    decimal_special_f64(v).is_some()
 }
 
 /// `Decimal128("NaN")` / `("Infinity")` / `("-Infinity")` for a non-finite `f64`.
@@ -5210,6 +5250,36 @@ fn decimal_zero_bson() -> Bson {
         .unwrap_or(Bson::Double(0.0))
 }
 
+/// Whether a `Decimal128` is large enough that `f64` holds it as a NORMAL
+/// value -- IEEE's "tininess after rounding", which is what mongod reports.
+///
+/// The boundary is NOT `f64::MIN_POSITIVE` and NOT `is_normal()` on the parsed
+/// double. Tininess is decided by rounding the exact value to a 53-bit
+/// significand with an UNBOUNDED exponent and asking whether THAT is below
+/// `2^-1022`, so the cut sits a quarter of a subnormal ULP below `f64::MIN_POSITIVE`,
+/// at exactly `2^-1022 - 2^-1076`. A plain `parse::<f64>()` cannot see it:
+/// subnormal spacing is twice as coarse, so every value in
+/// `[2^-1022 - 2^-1075, 2^-1022)` parses UP to `f64::MIN_POSITIVE` and looks
+/// normal, while mongod refuses the lower half of that band.
+///
+/// Bisected against 8.2.11 on 2026-09-07: `2.2250738585072012595738212570267910E-308`
+/// converts and `…569813160E-308` is a 241, and the cut between them is
+/// `2^-1022 - 2^-1076` to every digit measured.
+///
+/// The constant is that cut TRUNCATED to decimal128's 34 digits, and the test is
+/// STRICTLY greater: the real cut lies between this truncation and the next
+/// 34-digit value, so no representable argument can fall in the gap.
+fn decimal_reaches_normal_double(v: &Bson) -> bool {
+    const MIN_NORMAL_CUT: &str = "2.225073858507201259573821257020768E-308";
+    let (Some(x), Some(cut)) = (
+        crate::decimal::from_bson(v),
+        crate::decimal::parse(MIN_NORMAL_CUT),
+    ) else {
+        return false;
+    };
+    crate::decimal::cmp_abs(&x, &cut) == Some(std::cmp::Ordering::Greater)
+}
+
 /// Whether a `Decimal128` is NEGATIVE zero. `f64` loses the distinction the
 /// moment it is compared (`-0.0 == 0.0`), so this reads the decimal's own text.
 fn decimal_is_negative_zero(v: &Bson) -> bool {
@@ -5219,7 +5289,11 @@ fn decimal_is_negative_zero(v: &Bson) -> bool {
 /// Whether a `Decimal128` is zero -- of EITHER sign, since `$toBool` of
 /// `Decimal128("-0")` is false.
 fn decimal_is_zero(v: &Bson) -> bool {
-    decimal_as_f64(v).is_some_and(|d| d == 0.0)
+    // The COEFFICIENT decides, not an `f64` round-trip: `Decimal128("1E-6176")`
+    // underflows to `0.0` as a double, so `$toBool` of it answered `false`
+    // where mongod answers `true` (measured 8.2.11, 2026-09-07).
+    matches!(crate::decimal::from_bson(v), Some(crate::decimal::Dec::Fin { coeff, .. })
+        if coeff.iter().all(|c| *c == 0))
 }
 
 /// The target-type name mongod prints in a conversion error, from the numeric
@@ -5301,11 +5375,29 @@ fn convert_value(value: &Bson, code: i32) -> Conv {
                 Err(Fallback::Defer) => Conv::Unsupported,
                 Err(e) => Conv::Named(e),
             },
-            // Every decimal converts, NaN and the infinities included (probed
-            // 8.2.11: `$toDouble` of `Decimal128("Infinity")` is `inf`). This
-            // used to defer, and a defer on the standalone server is an error.
+            // NaN and the infinities convert as themselves (probed 8.2.11:
+            // `$toDouble` of `Decimal128("Infinity")` is `inf`), and so does a
+            // zero of either sign. Every OTHER decimal converts only when the
+            // correctly-rounded double is NORMAL: mongod raises 241 both when
+            // the magnitude overflows `f64` AND when it lands on a subnormal,
+            // so `Decimal128("4.9E-324")` -- representable as a subnormal
+            // double -- is still a 241. Boundaries measured on 8.2.11
+            // (2026-09-07): `2.2250738585072013E-308` converts and
+            // `…012E-308` does not; `1.7976931348623158E+308` converts and
+            // `1.797693134862315808E+308` does not. Saturating to `inf` / `0.0`
+            // here was a silently wrong VALUE where mongod errors.
             Bson::Decimal128(_) => match decimal_as_f64(value) {
-                Some(d) => Conv::Ok(Bson::Double(d)),
+                Some(d) if d.is_nan() || d.is_infinite() => {
+                    if decimal_is_special(value) {
+                        Conv::Ok(Bson::Double(d))
+                    } else {
+                        Conv::Named(overflow_conversion(value))
+                    }
+                }
+                // A true zero keeps its sign.
+                Some(d) if decimal_is_zero(value) => Conv::Ok(Bson::Double(d)),
+                Some(d) if decimal_reaches_normal_double(value) => Conv::Ok(Bson::Double(d)),
+                Some(_) => Conv::Named(overflow_conversion(value)),
                 None => Conv::Unsupported,
             },
             // A date is its epoch milliseconds. mongod converts it to double,
@@ -5826,16 +5918,27 @@ fn op_floor_ceil(arg: &Bson, ctx: &Ctx, ceil: bool) -> R {
             "NaN".parse().map_err(|_| Fallback::Defer)?,
         )),
         // A decimal rounds to an INTEGER quantum, so `{$ceil:
-        // Decimal128("2.00")}` is `2` and not `2.00` (probed 8.2.11).
-        v @ Bson::Decimal128(_) => decimal_rounded(
-            &v,
-            0,
-            if ceil {
+        // Decimal128("2.00")}` is `2` and not `2.00` (probed 8.2.11). These two
+        // are the decimal spec's `quantize`, so an integral value needing more
+        // than 34 digits is an Invalid Operation and answers NaN --
+        // `$floor(Decimal128("1E+34"))` is `NaN` while `$trunc` of the same
+        // input is `1.000000000000000000000000000000000E+34` (measured 8.2.11,
+        // 2026-09-07). That asymmetry is why the rule lives here rather than in
+        // `round_to_exp`, which `$trunc` / `$round` share.
+        v @ Bson::Decimal128(_) => {
+            let d = crate::decimal::from_bson(&v).ok_or(Fallback::Defer)?;
+            let mode = if ceil {
                 crate::decimal::RoundMode::Ceil
             } else {
                 crate::decimal::RoundMode::Floor
-            },
-        ),
+            };
+            match crate::decimal::quantize_integral(&d, mode) {
+                Some(r) => crate::decimal::to_bson(&r).ok_or(Fallback::Defer),
+                None => Ok(Bson::Decimal128(
+                    "NaN".parse().map_err(|_| Fallback::Defer)?,
+                )),
+            }
+        }
         _ => Err(Fallback::Defer),
     }
 }
@@ -5882,31 +5985,28 @@ fn op_sqrt(arg: &Bson, ctx: &Ctx) -> R {
     match eval(arg, ctx)? {
         Bson::Null => Ok(Bson::Null),
         v => {
-            // The DOMAIN check applies by VALUE, so a negative DECIMAL raises
-            // it too -- finite or not. A special decimal then answers without
-            // decimal math, keeping its type; a finite one still defers,
-            // because its result carries real precision.
-            if let Some(f) = decimal_as_f64(&v) {
-                if f < 0.0 {
-                    return Err(Fallback::mongo(
-                        28714,
-                        "$sqrt's argument must be greater than or equal to 0",
-                    ));
-                }
-                if f.is_nan() || f.is_infinite() {
-                    return Ok(decimal_special_bson(f));
-                }
-                // `sqrt(+-0)` is that zero, sign and all -- a constant, so it
-                // needs none of the 34-digit arithmetic the other finite
-                // decimals do. Measured 8.2.11, 2026-09-07.
-                if f == 0.0 {
-                    return decimal_from_text(if decimal_is_negative_zero(&v) {
-                        "-0"
-                    } else {
-                        "0"
-                    });
-                }
-                return Err(Fallback::Defer);
+            // A DECIMAL argument is answered in decimal throughout, and every
+            // question about it -- sign, NaN, infinity -- is asked of the
+            // DECIMAL, never of an `f64` rendering of it. `decimal_as_f64`
+            // saturates: a finite `Decimal128("1E+6144")` becomes `f64::INFINITY`
+            // and a finite `Decimal128("1E-6176")` becomes `0.0`, so routing on
+            // it answered `$sqrt` of a large finite decimal with `Infinity`
+            // (measured against 8.2.11, which returns `1.00000000000000000E+3072`).
+            if matches!(v, Bson::Decimal128(_)) {
+                let d = crate::decimal::parse(&v.to_string()).ok_or(Fallback::Defer)?;
+                // IEEE 754 requires
+                // square root to be correctly rounded (unlike the
+                // transcendentals, where mongod's own answer is 1-2 ULP off the
+                // true value -- see
+                // `tools/probes/decimal_transcendental_rule.py`), so this is
+                // reproducible without matching anyone's approximation error.
+                // `decimal::sqrt` also carries the IDEAL-EXPONENT rule that
+                // makes `sqrt(4)` `2` and `sqrt(0.00)` `0.0`, and answers NaN /
+                // +Infinity / negatives itself.
+                let r = crate::decimal::sqrt(&d).ok_or_else(|| {
+                    Fallback::mongo(28714, "$sqrt's argument must be greater than or equal to 0")
+                })?;
+                return crate::decimal::to_bson(&r).ok_or(Fallback::Defer);
             }
             let f = math_float_named(&v, "$sqrt", 28765)?;
             // NaN passes through as sqrt(nan) = nan; a negative argument is a
@@ -5942,8 +6042,38 @@ fn op_exp(arg: &Bson, ctx: &Ctx) -> R {
             }
             // `exp(+-0)` is Decimal `1` -- an EVEN-like case, the sign of the
             // zero does not survive. Measured 8.2.11, 2026-09-07.
-            if matches!(v, Bson::Decimal128(_)) && decimal_as_f64(&v) == Some(0.0) {
+            if matches!(v, Bson::Decimal128(_)) && decimal_is_zero(&v) {
                 return decimal_from_text("1");
+            }
+            // Outside a decimal `exp`'s reach, but inside CERTAINTY: two regions
+            // where the answer does not depend on any series at all.
+            //
+            // `e^x` overflows decimal128 past `x ~ 14149.9` and underflows below
+            // `x ~ -14220.5`, so |x| >= 1E+5 is decided by SIGN alone --
+            // `Infinity` or `0E-6176` (note the minimum quantum: `$exp` of a
+            // decimal `-Infinity` is instead a bare `0`). At the other end,
+            // |x| <= 1E-40 puts `e^x - 1` forty orders below the 34-digit
+            // resolution at 1, so the answer is exactly `1`. Both regions
+            // measured on 8.2.11 (2026-09-07), and both thresholds are far
+            // inside the true boundaries rather than at them -- the boundary
+            // itself needs the series and stays refused.
+            if matches!(v, Bson::Decimal128(_)) {
+                if let Some(crate::decimal::Dec::Fin { sign, coeff, exp }) =
+                    crate::decimal::from_bson(&v)
+                {
+                    let digits = coeff.iter().skip_while(|c| **c == 0).count();
+                    let adjusted = exp + digits as i32 - 1;
+                    if adjusted >= 5 {
+                        return if sign < 0 {
+                            decimal_from_text("0E-6176")
+                        } else {
+                            decimal_from_text("Infinity")
+                        };
+                    }
+                    if adjusted <= -40 {
+                        return decimal_from_text("1");
+                    }
+                }
             }
             Ok(Bson::Double(math_float_named(&v, "$exp", 28765)?.exp()))
         }
