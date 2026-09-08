@@ -5636,8 +5636,11 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
   **What is left in that corpus is 16 shapes in three groups, none of them a
   plain bug:** 12 are the trig / hyperbolic / `$pow` decimal family awaiting the
-  same decision as the entry above; 2 are `$median` / `$percentile`, which the
-  Rust server does not implement at all; 2 are `$toLower` / `$toUpper` of a
+  same decision as the entry above; 2 are `$median` / `$percentile` **spec
+  VALIDATION** — the operators themselves are fully implemented and match mongod
+  in all six forms (group, expression, per-group, window), which the line here
+  previously got wrong by reading the corpus label instead of running them; 2
+  are `$toLower` / `$toUpper` of a
   `Timestamp`, which mongod renders through a legacy `asctime`-like path in
   LOCAL time (`Timestamp(1, 1)` prints `jan  1 01:00:01:1` on a UTC+1 host), so
   reproducing it would bake this box's timezone into the answer — measure it on
@@ -6180,6 +6183,37 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   would mean reproducing its error accumulation. Likewise `$log10` of a power of
   ten is exact here and merely usually exact on mongod: `$log10(1E+5)` is
   `5.000000000000000000000000000000001` on 8.2.11.
+
+- [x] **RESOLVED 2026-09-08 — accumulator spec errors are POSITION dependent,
+  and both servers had one table for two positions.** The eight document-spec
+  operators (`$firstN` / `$lastN` / `$minN` / `$maxN` / `$median` /
+  `$percentile` / `$topN` / `$bottomN`) use different codes in a `$group` output
+  field than in an `$addFields` value: `{$group: {x: {$median: 5}}}` is 7436100
+  where `{$addFields: {x: {$median: 5}}}` is 7436201. **16 of 32 cells diverged**
+  (8 operators x scalar/array x accumulator/expression), now 0.
+
+  Three rules that are not guessable from the expression table:
+  - an ARRAY spec in accumulator position is `40237 The <op> accumulator is a
+    unary operator` — one message for all eight;
+  - `$topN` / `$bottomN` are accumulator-ONLY, so as an expression mongod
+    answers `Unrecognized expression '$topN'` and never reads the spec;
+  - `$median` / `$percentile` validate in the IDL's FIELD DECLARATION order
+    (`input`, `p`, `method`), so `{}` names `input` and a bad `p` outranks a bad
+    `method`.
+
+  **A Rust unit test had pinned the wrong thing and passed**: it asserted
+  `$topN: 0` in expression position gives "specification must be an object" —
+  matching only because `Unrecognized expression` carries code 168 as well, and
+  the test compared the code before the message. Another entry for "a test can
+  pin an unverified claim just as easily as a comment can".
+
+  Also fixed on the Python side: `$percentile`'s `p` has THREE codes, not one
+  (7750301 non-array or empty, 7750302 non-number element, 7750303 out of
+  range); an empty `p` was accepted and produced an empty result; and the
+  bad-method message was missing mongod's article ("as **a** percentile
+  'method'"), a stale 7.0.12 measurement.
+
+  Pinned by `tests/test_accumulator_spec_errors.py` (45 cases).
 
 - [ ] **The other decimal transcendentals still refuse (2026-09-08).** The six
   trig and the remaining hyperbolics (`$sin`, `$cos`, `$tan`, `$asin`, `$acos`,

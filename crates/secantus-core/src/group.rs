@@ -529,31 +529,10 @@ pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Docume
             ps,
             values,
         } => {
-            let Bson::Document(spec) = arg else {
-                return Err(Fallback::Defer); // Python raises 7429703 / 40414
-            };
-            if spec.get_str("method") != Ok("approximate") {
-                return Err(Fallback::Defer); // missing (40414) or non-approximate (BadValue)
-            }
-            let input = spec.get("input").ok_or(Fallback::Defer)?;
+            let op = if *is_median { "$median" } else { "$percentile" };
+            let (input, parsed) = percentile_spec(arg, op)?;
             if !*is_median && ps.is_none() {
-                let Some(Bson::Array(raw)) = spec.get("p") else {
-                    return Err(Fallback::Defer); // missing (40414) or non-array (7750301)
-                };
-                let mut parsed = Vec::with_capacity(raw.len());
-                for p in raw {
-                    let f = match p {
-                        Bson::Int32(n) => *n as f64,
-                        Bson::Int64(n) => *n as f64,
-                        Bson::Double(d) => *d,
-                        _ => return Err(Fallback::Defer), // Python raises 7750303
-                    };
-                    if !(0.0..=1.0).contains(&f) {
-                        return Err(Fallback::Defer);
-                    }
-                    parsed.push(f);
-                }
-                *ps = Some(parsed);
+                *ps = parsed;
             }
             let v = eval(input, doc, vars)?;
             if let Some(f) = percentile_f64(&v) {
@@ -1657,6 +1636,129 @@ pub fn bucket_auto_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<V
         i += chunk.len();
     }
     Ok(out)
+}
+
+/// Validate a `$median` / `$percentile` spec, returning `(input, ps)` where
+/// `ps` is `None` for `$median`.
+///
+/// Both call sites used to `Fallback::Defer` on every one of these -- and a
+/// defer on the Rust server is `2 aggregation pipeline uses a stage or operator
+/// not supported`, which blames the operator for a bad argument. mongod's codes
+/// are eight different numbers with no pattern between them, so this is a
+/// transcription of a measurement (8.2.11, 2026-09-08), not a rule.
+///
+/// The ORDER is mongod's IDL field-declaration order -- `input`, then `p` (for
+/// `$percentile`), then `method` -- with an unknown field outranking all of
+/// them. Two consequences that are not guessable: `{$median: {}}` names
+/// `input` and not `method`, and `{$percentile: {input, method: "exact",
+/// p: "x"}}` reports the `p` shape rather than the bad method.
+pub fn percentile_spec<'a>(
+    arg: &'a Bson,
+    op: &str,
+) -> Result<(&'a Bson, Option<Vec<f64>>), Fallback> {
+    let spec = match arg {
+        Bson::Document(d) => d,
+        Bson::Array(_) => {
+            return Err(Fallback::mongo(
+                40237,
+                format!("The {op} accumulator is a unary operator"),
+            ));
+        }
+        other => {
+            let code = if op == "$median" { 7436100 } else { 7436200 };
+            return Err(Fallback::mongo(
+                code,
+                format!(
+                    "specification must be an object; found {op}: {}",
+                    render(other)
+                ),
+            ));
+        }
+    };
+    let known: &[&str] = if op == "$median" {
+        &["input", "method"]
+    } else {
+        &["input", "p", "method"]
+    };
+    for key in spec.keys() {
+        if !known.contains(&key.as_str()) {
+            return Err(Fallback::mongo(
+                40415,
+                format!("BSON field '{op}.{key}' is an unknown field."),
+            ));
+        }
+    }
+    let missing = |field: &str| {
+        Fallback::mongo(
+            40414,
+            format!("BSON field '{op}.{field}' is missing but a required field"),
+        )
+    };
+    let input = spec.get("input").ok_or_else(|| missing("input"))?;
+    let ps = if op == "$median" {
+        None
+    } else {
+        // `p` is read BEFORE `method`, so a bad `p` outranks a bad method.
+        let raw = spec.get("p").ok_or_else(|| missing("p"))?;
+        let bad = |v: &Bson, code: i32| {
+            Fallback::mongo(
+                code,
+                format!(
+                    "The $percentile 'p' field must be an array of numbers from \
+                     [0.0, 1.0], but found: {}",
+                    render(v)
+                ),
+            )
+        };
+        // A non-array AND an EMPTY array are the same code; a bad ELEMENT is
+        // 7750302 (not a number) or 7750303 (out of range).
+        let Bson::Array(items) = raw else {
+            return Err(bad(raw, 7750301));
+        };
+        if items.is_empty() {
+            return Err(bad(raw, 7750301));
+        }
+        let mut parsed = Vec::with_capacity(items.len());
+        for item in items {
+            let f = match item {
+                Bson::Int32(n) => f64::from(*n),
+                Bson::Int64(n) => *n as f64,
+                Bson::Double(d) => *d,
+                other => return Err(bad(other, 7750302)),
+            };
+            if !(0.0..=1.0).contains(&f) {
+                return Err(bad(item, 7750303));
+            }
+            parsed.push(f);
+        }
+        Some(parsed)
+    };
+    match spec.get("method") {
+        None => return Err(missing("method")),
+        Some(Bson::String(m)) if m == "approximate" => {}
+        Some(_) => {
+            return Err(Fallback::mongo(
+                2,
+                "Currently only 'approximate' can be used as a percentile 'method'.",
+            ));
+        }
+    }
+    Ok((input, ps))
+}
+
+/// mongod's rendering of a value inside these messages: a string is quoted,
+/// `null` is `null`, and an empty container prints as itself.
+fn render(v: &Bson) -> String {
+    match v {
+        Bson::String(s) => format!("\"{s}\""),
+        Bson::Null => "null".into(),
+        Bson::Array(a) if a.is_empty() => "[]".into(),
+        Bson::Document(d) if d.is_empty() => "{}".into(),
+        Bson::Double(d) => crate::format_double_g(*d),
+        Bson::Int32(n) => n.to_string(),
+        Bson::Int64(n) => n.to_string(),
+        other => format!("{other}"),
+    }
 }
 
 #[cfg(test)]

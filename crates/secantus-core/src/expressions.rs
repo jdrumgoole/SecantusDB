@@ -2862,34 +2862,9 @@ fn op_substr_cp(arg: &Bson, ctx: &Ctx) -> R {
 /// the value filter and rank math with the group accumulators. An invalid
 /// spec defers to Python, which raises mongod's exact error.
 fn op_percentile_expr(arg: &Bson, ctx: &Ctx, is_median: bool) -> R {
-    let Bson::Document(spec) = arg else {
-        return Err(Fallback::Defer);
-    };
-    if spec.get_str("method") != Ok("approximate") {
-        return Err(Fallback::Defer);
-    }
-    let input = spec.get("input").ok_or(Fallback::Defer)?;
-    let ps: Option<Vec<f64>> = if is_median {
-        None
-    } else {
-        let Some(Bson::Array(raw)) = spec.get("p") else {
-            return Err(Fallback::Defer);
-        };
-        let mut parsed = Vec::with_capacity(raw.len());
-        for p in raw {
-            let f = match p {
-                Bson::Int32(n) => *n as f64,
-                Bson::Int64(n) => *n as f64,
-                Bson::Double(d) => *d,
-                _ => return Err(Fallback::Defer),
-            };
-            if !(0.0..=1.0).contains(&f) {
-                return Err(Fallback::Defer);
-            }
-            parsed.push(f);
-        }
-        Some(parsed)
-    };
+    // Shared with the `$group` accumulator form: same spec, same eight codes.
+    let op = if is_median { "$median" } else { "$percentile" };
+    let (input, ps) = crate::group::percentile_spec(arg, op)?;
     let raw = eval(input, ctx)?;
     let items: Vec<&Bson> = match &raw {
         Bson::Array(a) => a.iter().collect(),

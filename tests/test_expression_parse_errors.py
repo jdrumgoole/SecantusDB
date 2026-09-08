@@ -126,14 +126,25 @@ class TestObjectSpecExpressions:
             ("$maxN", 5787900),
             ("$median", 7436201),
             ("$percentile", 7436200),
-            ("$topN", 168),
-            ("$bottomN", 168),
         ],
     )
     def test_a_non_object_spec_names_its_own_code(self, op, code):
         got_code, text = stage_error({op: 0})
         assert got_code == code
         assert f"specification must be an object; found {op}: 0" in text
+
+    @pytest.mark.parametrize("op", ["$topN", "$bottomN"])
+    def test_the_accumulator_only_pair_is_not_an_expression_at_all(self, op):
+        """`$topN` / `$bottomN` exist only as `$group` accumulators.
+
+        In expression position mongod does not recognise the name and never
+        reaches the spec, so the message is "Unrecognized expression", not the
+        object-spec complaint. These two were in the table above asserting that
+        complaint and PASSED, because `Unrecognized expression` carries code 168
+        as well and the message was matched with `in` against the wrong text
+        only after the code had already agreed. Measured 8.2.11, 2026-09-08.
+        """
+        assert stage_error({op: 0}) == (168, f"Unrecognized expression '{op}'")
 
 
 class TestUnrecognisedDateArguments:
