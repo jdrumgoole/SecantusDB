@@ -1941,6 +1941,16 @@ These are explicit non-goals. Don't add them without a reason.
 
   **`'{...}' = <range/multirange array param>` (36, `test_dump_builtin_array_wrapper`) is a 2-piece campaign with a FIDELITY TRAP (mapped 2026-09-08, no code):** a naive text compare passes the 36 target tests (they use non-canonicalizing `empty`/`(,)`) but is WRONG for canonicalizing ranges — `'{"[1,4]"}' = [Int4Range(1,5,'[)')]` is TRUE on PG (both canonicalize to `[1,5)`), a plain string compare gives FALSE. Build in order, each verified against a canonicalizing case: (1) range/multirange-ARRAY param decode must parse each element through the canonicalizing `::int4range[]` parser (`range::from_text_element`) so the decoded array holds canonical text, not psycopg's raw spelling; (2) `coerce_unknown_operand` (lib.rs:~4987) must fire for a bare `'{...}'` literal vs an array VALUE — it currently bails at the both-unresolved `l_bare == r_bare` guard, then errors at the scalar-vs-array XOR (~5271); cast the literal to `{element}[]` via the canonicalizing `::range[]` path. Then both sides are canonical text arrays and the existing `compare_constants` array arm is correct. **Refined 2026-09-08 (deeper probe):** the 36 tests use TYPED wrappers (`Int4Range`, `Int4Multirange`), not generic `Range` — with typed wrappers we error 42883 in ALL of `%s`/`%t`/`%b` while PG returns True; and PG's behaviour is FORMAT×CONTENT-dependent (e.g. canonicalizing `'{"[1,4]"}' = [Int4Range(1,5,'[)')]` is True on `%t` but PG itself errors `08P01` on `%b`; a populated multirange `%b` is PG `22021`). So a correct fix must ALSO reproduce PG's per-format error cases, not answer uniformly — a dedicated multi-batch campaign touching decode_parameter + coerce_unknown_operand + comparison, with the 800+ differential array/join tests at risk. Do NOT ship a uniform-answer shortcut (fails the fidelity gate). (`CREATE TYPE ... AS RANGE` custom range types shipped
   2026-09-07 — DDL, casts, comparison, and `RangeInfo.fetch`.)
+  **Update 2026-09-08:** schema-qualified RANGE/ENUM types no longer
+  collide with the bare name — `CreateRange`/`CreateEnum` thread schema per the
+  #1388 composite template; range/enum catalog keyed on (schema, name), so
+  psycopg's `testschema.testrange` fixture and all four `RangeInfo.fetch` forms
+  pass. **Custom MULTIRANGE resolution is still unimplemented and out of scope
+  for that PR** — `MultirangeInfo.fetch` errors `column "rngmultitypid" does not
+  exist` (pg_range has no `rngmultitypid`, no per-range multirange oid is minted,
+  and no `testmultirange` pg_type row exists). That is a genuine feature build,
+  not the schema-keying template; the ~14 `test_multirange.py::test_fetch_info*`
+  tests need it before they can pass.
 
 
 ### 2026-09-06 READ-PATH sweep: 385 cases, and what is still open

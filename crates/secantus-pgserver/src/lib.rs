@@ -46,6 +46,8 @@ use secantus_storage::{Storage, UserTransactionHandle};
 
 /// A composite type's fields: `(field name, field type name)`, in order.
 type CompositeFields = Vec<(String, String)>;
+/// One enum as `(schema, bare_name, oid, labels)`.
+type EnumWithSchema = (String, String, i64, Vec<String>);
 
 /// One database's worth of SQL over a shared `Storage`.
 pub struct PgHandler {
@@ -266,30 +268,46 @@ impl PgHandler {
     /// Hand the planner this database's user types, fresh from the store --
     /// which the other server may have written to since the last statement.
     fn install_user_types(&self) {
-        let mut types = self.enums().unwrap_or_default();
+        // Enums resolve by name too. A `public` enum resolves by its bare name
+        // (public is on the default search_path); a schema-qualified one
+        // resolves only as `schema.name`, exactly like composites and ranges.
+        let mut types: Vec<(String, i64, Vec<String>)> = self
+            .enums_with_schema()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(schema, name, oid, labels)| (Self::type_resolution(&schema, &name), oid, labels))
+            .collect();
         // Composites resolve by name too; they have no labels, so an empty
         // label list stands in. A `public` composite resolves by its bare name
         // (public is on the default search_path); a schema-qualified one
         // resolves only as `schema.name`, so `to_regtype('testschema.t')` finds
         // it while `to_regtype('t')` does not (matching PostgreSQL).
         for (schema, name, oid, _) in self.composites_with_schema().unwrap_or_default() {
-            let resolution = if schema == "public" {
-                name
-            } else {
-                format!("{schema}.{name}")
-            };
-            types.push((resolution, oid, Vec::new()));
+            types.push((Self::type_resolution(&schema, &name), oid, Vec::new()));
         }
         secantus_pgplan::set_user_types(types);
         // Custom ranges resolve their subtype at cast time and their oid for
         // regtype -- but they are NOT enums, so they stay OUT of set_user_types.
+        // A schema-qualified range resolves as `schema.name`, so
+        // `to_regtype('testschema.testrange')` reaches it and a bare
+        // `to_regtype('testrange')` reaches only the public one.
         let ranges: Vec<(String, String, i64)> = self
-            .ranges()
+            .ranges_with_schema()
             .unwrap_or_default()
             .into_iter()
-            .map(|(name, oid, subtype)| (name, subtype, oid))
+            .map(|(schema, name, oid, subtype)| (Self::type_resolution(&schema, &name), subtype, oid))
             .collect();
         secantus_pgplan::set_user_ranges(ranges);
+    }
+
+    /// The name a user type resolves under: its bare name in `public` (on the
+    /// default search_path), else `schema.name`.
+    fn type_resolution(schema: &str, name: &str) -> String {
+        if schema == "public" {
+            name.to_string()
+        } else {
+            format!("{schema}.{name}")
+        }
     }
 
     /// The wire type for a column whose type is a USER enum: pgwire's `Type`
@@ -891,6 +909,27 @@ impl PgHandler {
         Ok(out)
     }
 
+    /// Every custom range as `(schema, bare_name, oid, subtype)`. `schema`
+    /// defaults to `public` for a range stored before schema qualification, so
+    /// the bare-name resolution is unchanged for those. `pg_type.typname` still
+    /// uses the BARE name (PostgreSQL keeps a range's typname unqualified); only
+    /// duplicate-checking and `to_regtype` resolution consult the schema.
+    fn ranges_with_schema(&self) -> PgWireResult<Vec<(String, String, i64, String)>> {
+        let mut out = Vec::new();
+        for d in self.type_catalog_docs(Self::RANGE_COLLECTION)? {
+            let name = d.get_str("range").unwrap_or_default().to_string();
+            let schema = d.get_str("schema").unwrap_or("public").to_string();
+            let oid = d
+                .get_i64("oid")
+                .or_else(|_| d.get_i32("oid").map(i64::from))
+                .unwrap_or(0);
+            let subtype = d.get_str("subtype").unwrap_or_default().to_string();
+            out.push((schema, name, oid, subtype));
+        }
+        out.sort();
+        Ok(out)
+    }
+
     /// A type name's oid, resolving BUILTINS first, then user types
     /// (composites, enums, ranges). A composite field whose type is itself a
     /// user type -- `CREATE TYPE t AS (sub other_composite)` -- resolves here;
@@ -992,6 +1031,35 @@ impl PgHandler {
                 })
                 .unwrap_or_default();
             out.push((name, oid, labels));
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Every enum as `(schema, bare_name, oid, labels)`. `schema` defaults to
+    /// `public` for an enum stored before schema qualification, so the bare-name
+    /// resolution is unchanged for those. `pg_type.typname` still uses the BARE
+    /// name; only duplicate-checking and `to_regtype` resolution consult the
+    /// schema.
+    fn enums_with_schema(&self) -> PgWireResult<Vec<EnumWithSchema>> {
+        let mut out = Vec::new();
+        for d in self.type_catalog_docs(Self::ENUM_COLLECTION)? {
+            let name = d.get_str("enum").unwrap_or_default().to_string();
+            let schema = d.get_str("schema").unwrap_or("public").to_string();
+            let oid = d
+                .get_i64("oid")
+                .or_else(|_| d.get_i32("oid").map(i64::from))
+                .unwrap_or(0);
+            let labels = d
+                .get_array("labels")
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push((schema, name, oid, labels));
         }
         out.sort();
         Ok(out)
@@ -3027,11 +3095,28 @@ impl PgHandler {
                 Ok(vec![Response::Execution(Tag::new("CREATE TYPE"))])
             }
 
-            Statement::CreateRange { name, subtype } => {
-                let taken = self.ranges()?.iter().any(|(n, _, _)| *n == name)
-                    || self.composites()?.iter().any(|(n, _, _)| *n == name)
-                    || self.enums()?.iter().any(|(n, _, _)| *n == name)
-                    || secantus_pgplan::pgtypes::oid_of_name(&name).is_some();
+            Statement::CreateRange {
+                name,
+                schema,
+                subtype,
+            } => {
+                // A schema-qualified name (`CREATE TYPE s.t AS RANGE`) is a
+                // distinct type from a bare `t`; unqualified lands in `public`.
+                // A duplicate is 42710, checked per (schema, name): a range
+                // collides with another range in the same schema, and an
+                // unqualified name additionally collides with a composite, enum
+                // or builtin (those live in the default search_path).
+                let schema_name = schema.clone().unwrap_or_else(|| "public".to_string());
+                let unqualified = schema.is_none();
+                let range_dup = self
+                    .ranges_with_schema()?
+                    .iter()
+                    .any(|(s, n, _, _)| *s == schema_name && *n == name);
+                let taken = range_dup
+                    || (unqualified
+                        && (self.composites()?.iter().any(|(n2, _, _)| *n2 == name)
+                            || self.enums()?.iter().any(|(n2, _, _)| *n2 == name)
+                            || secantus_pgplan::pgtypes::oid_of_name(&name).is_some()));
                 if taken {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
@@ -3041,9 +3126,14 @@ impl PgHandler {
                 }
                 self.ensure_collection(Self::RANGE_COLLECTION)?;
                 let oid = self.mint_range_oid()?;
+                // `_id` is keyed on (schema, name) so a bare `t` and a `schema.t`
+                // do not collide; `range` stays the BARE name (pg_type.typname is
+                // unqualified, as in PostgreSQL).
+                let id_key = Self::type_resolution(&schema_name, &name);
                 let doc = bson::doc! {
-                    "_id": &name,
+                    "_id": &id_key,
                     "range": &name,
+                    "schema": &schema_name,
                     "subtype": &subtype,
                     "oid": oid,
                 };
@@ -3052,16 +3142,29 @@ impl PgHandler {
                 self.storage
                     .insert(&self.db, Self::RANGE_COLLECTION, vec![bytes], true)
                     .map_err(|e| Self::storage_err("could not record the type", e))?;
-                self.note_uncommitted_type(Self::RANGE_COLLECTION, &name, Some(doc));
+                self.note_uncommitted_type(Self::RANGE_COLLECTION, &id_key, Some(doc));
                 Ok(vec![Response::Execution(Tag::new("CREATE TYPE"))])
             }
 
-            Statement::CreateEnum { name, labels } => {
-                // A duplicate name is 42710, distinct from a table's 42P07 --
-                // and checked against BUILTINS too: `create type text ...` is
-                // the same refusal on PostgreSQL.
-                let exists = self.enums()?.iter().any(|(n, _, _)| *n == name)
-                    || secantus_pgplan::pgtypes::oid_of_name(&name).is_some();
+            Statement::CreateEnum {
+                name,
+                schema,
+                labels,
+            } => {
+                // A schema-qualified name (`CREATE TYPE s.t AS ENUM`) is a
+                // distinct type from a bare `t`; unqualified lands in `public`.
+                // A duplicate is 42710, distinct from a table's 42P07, checked
+                // per (schema, name): an enum collides with another enum in the
+                // same schema, and an unqualified name additionally collides with
+                // a builtin (`create type text as enum ...` is the same refusal).
+                let schema_name = schema.clone().unwrap_or_else(|| "public".to_string());
+                let unqualified = schema.is_none();
+                let enum_dup = self
+                    .enums_with_schema()?
+                    .iter()
+                    .any(|(s, n, _, _)| *s == schema_name && *n == name);
+                let exists = enum_dup
+                    || (unqualified && secantus_pgplan::pgtypes::oid_of_name(&name).is_some());
                 if exists {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
@@ -3072,9 +3175,11 @@ impl PgHandler {
                 self.ensure_collection(Self::ENUM_COLLECTION)?;
                 self.ensure_collection(Self::ENUM_META_COLLECTION)?;
                 let oid = self.mint_enum_oid()?;
+                let id_key = Self::type_resolution(&schema_name, &name);
                 let doc = bson::doc! {
-                    "_id": &name,
+                    "_id": &id_key,
                     "enum": &name,
+                    "schema": &schema_name,
                     "labels": labels,
                     "oid": oid,
                 };
@@ -3083,7 +3188,7 @@ impl PgHandler {
                 self.storage
                     .insert(&self.db, Self::ENUM_COLLECTION, vec![bytes], true)
                     .map_err(|e| Self::storage_err("could not record the type", e))?;
-                self.note_uncommitted_type(Self::ENUM_COLLECTION, &name, Some(doc));
+                self.note_uncommitted_type(Self::ENUM_COLLECTION, &id_key, Some(doc));
                 Ok(vec![Response::Execution(Tag::new("CREATE TYPE"))])
             }
 
