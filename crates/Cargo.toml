@@ -59,6 +59,11 @@ exclude = [
     "secantus-server-py",
     # R7: the standalone server binary — links WiredTiger transitively, excluded too.
     "secantusdb",
+    # A locally-patched copy of pgwire 0.40.7, used ONLY by secantus-pgserver
+    # (its own workspace, excluded above) through a `[patch.crates-io]`. Not a
+    # member of this clean workspace; exclude it so no `--workspace` command
+    # folds it in.
+    "vendor/pgwire",
 ]
 
 [workspace.dependencies]
