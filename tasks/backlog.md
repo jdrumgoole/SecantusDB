@@ -4934,6 +4934,9 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   sequence and not safe to rush.
 
   **EXECUTION-READY PATH (4th probe, 2026-09-08 — traced planner + executor + caller):**
+  - Piece 1 — **LANDED 2026-09-08** (multi-predicate JOIN WHERE: `JoinSelect.filter`
+    is now `Vec<JoinPred>`, ops `=`/`>`/`>=`/`<`/`<=`/`NOT <bool>` on either side,
+    validated 0-regression across 1029 tests). Original note:
   - Piece 1 (`plan_join_select` pgplan ~1560; `join_docs` pgserver ~346): `JoinSelect.filter:
     Option<(String,String,Bson)>` → `Vec<Predicate{alias,col,op(=|>|>=|<|<=|is_not_true),value}>`.
     In `plan_join_select` walk an AND of AExprs (today one `=`) + handle `NOT <boolcol>`

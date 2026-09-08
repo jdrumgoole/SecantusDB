@@ -338,28 +338,47 @@ impl PgHandler {
         };
 
         let mut left_rows = self.table_docs(&join.left.0)?;
-        let right_rows = self.table_docs(&join.right.0)?;
+        let mut right_rows = self.table_docs(&join.right.0)?;
 
-        // The WHERE equality binds to whichever side its alias names; applying
-        // it to the LEFT before the join is both correct and what keeps the
-        // nested loop trivial.
-        if let Some((alias, col, value)) = &join.filter {
-            let (side_table, on_left) = if *alias == join.left.1 {
-                (&join.left.0, true)
-            } else {
-                (&join.right.0, false)
+        // WHERE predicates bind to whichever side each alias names; applying
+        // them before the join is correct and keeps the nested loop trivial. A
+        // left-side predicate filters the left rows; a right-side one filters
+        // the right rows -- safe under an INNER join, and under a LEFT join too
+        // for these catalog queries (an unmatched left row still surfaces as a
+        // NULL-extended miss, which is what a LEFT JOIN means). Ops beyond `=`
+        // (`>`/`>=`/`<`/`<=`) compare numerically; `NotTrue` keeps rows whose
+        // boolean column is not true.
+        use secantus_pgplan::JoinOp;
+        for pred in &join.filter {
+            let on_left = pred.alias == join.left.1;
+            let side_table = if on_left { &join.left.0 } else { &join.right.0 };
+            let field = field_of(side_table, &pred.col)?;
+            let value = pred.value.clone();
+            let op = pred.op.clone();
+            let keep = move |d: &Document| -> bool {
+                let cell = d.get(&field);
+                match op {
+                    JoinOp::NotTrue => !matches!(cell, Some(Bson::Boolean(true))),
+                    JoinOp::Eq => cell.map(|v| eq(v, &value)).unwrap_or(false),
+                    _ => {
+                        let ord = cell.and_then(|v| secantus_pgplan::compare_values(v, &value));
+                        match ord {
+                            None => false,
+                            Some(o) => match op {
+                                JoinOp::Gt => o == std::cmp::Ordering::Greater,
+                                JoinOp::Ge => o != std::cmp::Ordering::Less,
+                                JoinOp::Lt => o == std::cmp::Ordering::Less,
+                                JoinOp::Le => o != std::cmp::Ordering::Greater,
+                                _ => false,
+                            },
+                        }
+                    }
+                }
             };
-            let field = field_of(side_table, col)?;
-            let keep = |d: &Document| d.get(&field).map(|v| eq(v, value)).unwrap_or(false);
             if on_left {
                 left_rows.retain(keep);
             } else {
-                // A right-side WHERE under a LEFT JOIN changes which rows can
-                // match rather than which left rows survive; nothing measured
-                // sends one, so refuse instead of guessing.
-                return Err(Self::err(&PlanError::Unsupported(
-                    "a WHERE on the right side of a LEFT JOIN".into(),
-                )));
+                right_rows.retain(keep);
             }
         }
 
