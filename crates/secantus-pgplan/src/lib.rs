@@ -419,6 +419,28 @@ type QualifiedColumn = (String, Vec<String>);
 /// One equality in ON, an optional single-column equality filter, an optional
 /// single-column ORDER BY. Anything else in a JOIN is still refused -- a JOIN
 /// half-supported quietly returns wrong rows, which is worse.
+/// A comparison operator usable in a JOIN's WHERE predicate list.
+#[derive(Debug, Clone, PartialEq)]
+pub enum JoinOp {
+    Eq,
+    Gt,
+    Ge,
+    Lt,
+    Le,
+    /// `NOT <boolcol>` -- keep rows whose boolean column is NOT true (false or
+    /// NULL), which is what `NOT a.attisdropped` means. Carries no value.
+    NotTrue,
+}
+
+/// One WHERE predicate `alias.col <op> value` against a JOIN side.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinPred {
+    pub alias: String,
+    pub col: String,
+    pub op: JoinOp,
+    pub value: Bson,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct JoinSelect {
     /// (table, alias) for each side.
@@ -433,8 +455,10 @@ pub struct JoinSelect {
     /// A computed expression per output column (cast chains, mostly:
     /// `t.oid::regtype::text AS regtype`), parallel to `columns`.
     pub exprs: Vec<Option<ColumnExpr>>,
-    /// A WHERE equality against one side's column, already evaluated.
-    pub filter: Option<(String, String, Bson)>,
+    /// WHERE predicates against one side's column, already evaluated. A plain
+    /// single equality is one `Eq` entry (byte-identical to the former
+    /// `Option` form); a subquery's `WHERE a=1 AND b>0 AND NOT c` is several.
+    pub filter: Vec<JoinPred>,
     /// ORDER BY one column: (alias, column, ascending). PostgreSQL sorts NULLS
     /// LAST ascending, which a LEFT JOIN's misses rely on.
     pub order: Option<(String, String, bool)>,
@@ -1596,6 +1620,77 @@ fn plan_join_plain_select(
 /// projected columns (casts allowed), an optional WHERE equality and one
 /// ORDER BY column. Everything else is refused -- a half-supported JOIN
 /// quietly returns wrong rows.
+/// Parse a JOIN/subquery WHERE into a flat list of predicates. Accepts a single
+/// `AExpr` (`=`/`>`/`>=`/`<`/`<=`), a `NOT <boolcol>`, or an `AND` of those.
+/// `alias.col` -> (alias, col) from a two-field ColumnRef; None otherwise.
+fn qualified_col(n: Option<&pg_query::protobuf::Node>) -> Option<(String, String)> {
+    match n.and_then(|x| x.node.as_ref()) {
+        Some(N::ColumnRef(c)) if c.fields.len() == 2 => {
+            let part = |i: usize| match c.fields[i].node.as_ref() {
+                Some(N::String(st)) => Some(st.sval.clone()),
+                _ => None,
+            };
+            Some((part(0)?, part(1)?))
+        }
+        _ => None,
+    }
+}
+
+fn join_where_preds(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Vec<JoinPred>> {
+    use pg_query::protobuf::BoolExprType;
+    match node.node.as_ref() {
+        // AND of sub-predicates -> flatten each.
+        Some(N::BoolExpr(b)) if b.boolop == BoolExprType::AndExpr as i32 => {
+            let mut out = Vec::new();
+            for arg in &b.args {
+                out.extend(join_where_preds(arg, params)?);
+            }
+            Ok(out)
+        }
+        // NOT <boolcol>
+        Some(N::BoolExpr(b)) if b.boolop == BoolExprType::NotExpr as i32 => {
+            let inner = b
+                .args
+                .first()
+                .ok_or_else(|| Error::Unsupported("this subquery WHERE".into()))?;
+            let (alias, col) = qualified_col(Some(inner))
+                .ok_or_else(|| Error::Unsupported("this subquery WHERE".into()))?;
+            Ok(vec![JoinPred {
+                alias,
+                col,
+                op: JoinOp::NotTrue,
+                value: Bson::Null,
+            }])
+        }
+        // alias.col <op> const
+        Some(N::AExpr(e)) => {
+            let op = match operator_name(e) {
+                Ok("=") => JoinOp::Eq,
+                Ok(">") => JoinOp::Gt,
+                Ok(">=") => JoinOp::Ge,
+                Ok("<") => JoinOp::Lt,
+                Ok("<=") => JoinOp::Le,
+                _ => return Err(Error::Unsupported("this subquery WHERE".into())),
+            };
+            let (alias, col) = qualified_col(e.lexpr.as_deref())
+                .ok_or_else(|| Error::Unsupported("this subquery WHERE".into()))?;
+            let value = const_value(
+                e.rexpr
+                    .as_ref()
+                    .ok_or_else(|| Error::Parse("no right operand".into()))?,
+                params,
+            )?;
+            Ok(vec![JoinPred {
+                alias,
+                col,
+                op,
+                value,
+            }])
+        }
+        _ => Err(Error::Unsupported("this subquery WHERE".into())),
+    }
+}
+
 fn plan_join_select(
     s: &pg_query::protobuf::SelectStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
@@ -1700,21 +1795,11 @@ fn plan_join_select(
         }
     }
 
-    // WHERE alias.col = <constant>, evaluated now.
-    let filter = match s.where_clause.as_ref().and_then(|w| w.node.as_ref()) {
-        None => None,
-        Some(N::AExpr(e)) if operator_name(e) == Ok("=") => {
-            let (alias, col) = qualified(e.lexpr.as_deref())
-                .ok_or_else(|| Error::Unsupported("this subquery WHERE".into()))?;
-            let value = const_value(
-                e.rexpr
-                    .as_ref()
-                    .ok_or_else(|| Error::Parse("no right operand".into()))?,
-                params,
-            )?;
-            Some((alias, col, value))
-        }
-        _ => return Err(Error::Unsupported("this subquery WHERE".into())),
+    // WHERE: one predicate, or an AND of several, each `alias.col <op> const`
+    // or `NOT alias.col`. Evaluated now against the constants.
+    let filter = match s.where_clause.as_deref() {
+        None => Vec::new(),
+        Some(node) => join_where_preds(node, params)?,
     };
 
     // ORDER BY one column.

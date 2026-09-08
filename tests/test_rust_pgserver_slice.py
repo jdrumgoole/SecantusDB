@@ -3200,3 +3200,19 @@ def test_binary_array_params_bytea_inet_uuid(home: Path) -> None:
         # The array column reports its own element-array oid, not varchar.
         cur.execute("select b from arr")
         assert cur.description[0].type_code == 1001  # bytea[]
+
+
+def test_join_multi_predicate_where(home: Path) -> None:
+    """A JOIN's WHERE can be several ANDed predicates on either side.
+
+    Foundation for composite `CompositeInfo.fetch` (whose inner subquery joins
+    pg_attribute to pg_type with `WHERE t.oid=$1 AND a.attnum>0 AND NOT ...`).
+    Verifies `=` plus a `>` on the join's right side over the catalog tables.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT t.typname FROM pg_type t JOIN pg_range r ON r.rngtypid = t.oid "
+            "WHERE t.oid = 3904 AND r.rngsubtype > 0"
+        )
+        assert cur.fetchall() == [("int4range",)]
