@@ -1,10 +1,10 @@
 # pgtest wire-protocol conformance report
 
-- SecantusDB (Python server) 0.6.0b15
+- SecantusDB (Python server) 0.6.0b16
 - corpus + runner: cockroachdb/cockroach @ `e3bff5d92ac1` (`pkg/sql/pgwire/testdata/pgtest`, run by `pkg/testutils/pgtest` verbatim)
-- generated: 2026-08-24 06:25 UTC
+- generated: 2026-09-07 06:38 UTC
 
-**49/66 files pass** (12 expected divergences, 0 unexpected failures, 5 skipped).
+**47/66 files pass** (12 expected divergences, 2 unexpected failures, 5 skipped).
 
 | file | result |
 |---|---|
@@ -53,7 +53,7 @@
 | `pgvector` | expected divergence |
 | `portals` | expected divergence |
 | `portals_crbugs` | skip |
-| `prepare` | pass |
+| `prepare` | **FAIL** |
 | `prepared_stmt_invalidation` | pass |
 | `procedure` | expected divergence |
 | `read_committed` | skip |
@@ -68,7 +68,7 @@
 | `spatial` | expected divergence |
 | `statement_hints_pausable_portal` | pass |
 | `timezone` | pass |
-| `tuple` | pass |
+| `tuple` | **FAIL** |
 | `typing` | expected divergence |
 | `unknown` | pass |
 | `update_limit` | pass |
@@ -89,3 +89,8 @@
 - `row_description` — row_description:376 sends `SELECT 'foo'::STRING, 'bar'::STRING(2)` with NO crdb_only marker and expects crdb's STRING aliases (text/25 and varchar/1043 typmod 6, truncating 'bar' to 'ba'). Real PostgreSQL 14 rejects both casts outright — `ERROR: 42704 type "string" does not exist` (probed) — so the stanza can't pass against any non-crdb server, and matching crdb's varchar(2) truncation would diverge from PG. Everything before :376 is green: base-column identity across a JOIN and through a VIEW, char(n) blank padding on the wire, and attnum stability across ALTER COLUMN TYPE.
 - `spatial` — PostGIS GEOMETRY/GEOGRAPHY — an extension type outside SecantusDB's core-PostgreSQL SQL scope (the surrogate models MongoDB, not PostGIS). A GEOMETRY value can't round-trip its EWKB binary form; an untyped binary GEOMETRY parameter now surfaces a faithful 22P03 rather than a generic internal error, but the type itself is not implemented.
 - `typing` — typing's two non-crdb stanzas both use keepErrMessage and pin crdb's wording for a mixed-type comparison: 22023 'unsupported comparison operator: <varchar> = <uuid>' (and <varchar> = <bool>). Real PostgreSQL 14 raises 42883 'operator does not exist: character varying = uuid' (probed), which is what we now emit — matching crdb would be a fidelity REGRESSION, same as the portals file. The behaviour the stanzas actually regression-test (a DECLARED parameter type making the comparison unresolvable AT PARSE, rather than a predicate that silently matches nothing) is implemented and correct.
+
+## Unexpected failures
+
+- `prepare`
+- `tuple`

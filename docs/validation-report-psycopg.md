@@ -1,8 +1,8 @@
 # psycopg conformance report
 
-- SecantusDB (Python server) 0.6.0b15
+- SecantusDB (Python server) 0.6.0b16
 - psycopg suite: vendor/psycopg @ unknown
-- generated: 2026-08-24 06:27 UTC
+- generated: 2026-09-07 06:41 UTC
 
 | category | passed | failed | skipped | total | pass rate |
 |---|---|---|---|---|---|
@@ -35,7 +35,7 @@
 | types/test_datetime.py | 551 | 4 | 12 | 567 | 99.3% |
 | types/test_enum.py | 197 | 0 | 0 | 197 | 100.0% |
 | types/test_hstore.py | 24 | 15 | 0 | 39 | 61.5% |
-| types/test_json.py | 249 | 9 | 0 | 258 | 96.5% |
+| types/test_json.py | 237 | 21 | 0 | 258 | 91.9% |
 | types/test_multirange.py | 205 | 0 | 12 | 217 | 100.0% |
 | types/test_net.py | 33 | 0 | 0 | 33 | 100.0% |
 | types/test_none.py | 1 | 0 | 0 | 1 | 100.0% |
@@ -45,23 +45,23 @@
 | types/test_shapely.py | 2 | 0 | 26 | 28 | 100.0% |
 | types/test_string.py | 134 | 0 | 1 | 135 | 100.0% |
 | types/test_uuid.py | 26 | 0 | 0 | 26 | 100.0% |
-| **total** | **4080** | **59** | **99** | **4238** | **98.6%** |
+| **total** | **4068** | **71** | **99** | **4238** | **98.3%** |
 
-## Failures (59)
+## Failures (71)
 
+- `tests/test_adapt.py::test_random[0-b]`
 - `tests/test_adapt.py::test_random[0-s]`
 - `tests/test_adapt.py::test_random[0-t]`
 - `tests/test_adapt.py::test_random[1-b]`
 - `tests/test_adapt.py::test_random[1-s]`
 - `tests/test_adapt.py::test_random[1-t]`
-- `tests/test_adapt.py::test_return_untyped[b]`
 - `tests/test_connection.py::test_cancel_safe_error`
 - `tests/test_connection.py::test_cancel_safe_timeout`
 - `tests/test_connection.py::test_connect_bad`
 - `tests/test_connection.py::test_right_exception_on_server_disconnect`
 - `tests/test_copy.py::test_copy_from_leaks[0-False]`
+- `tests/test_copy.py::test_copy_from_leaks[0-True]`
 - `tests/test_copy.py::test_copy_from_leaks[1-True]`
-- `tests/test_copy.py::test_copy_out_error_with_copy_not_finished`
 - `tests/test_copy.py::test_copy_table_across[binary]`
 - `tests/test_copy.py::test_copy_table_across[block]`
 - `tests/test_copy.py::test_copy_table_across[row]`
@@ -92,13 +92,25 @@
 - `tests/types/test_hstore.py::test_roundtrip_array[1]`
 - `tests/types/test_json.py::test_dump[b-Json-"\\u00e0\\u20ac"]`
 - `tests/types/test_json.py::test_dump[b-Json-"te'xt"]`
+- `tests/types/test_json.py::test_dump[b-Json-123.45]`
+- `tests/types/test_json.py::test_dump[b-Json-123]`
 - `tests/types/test_json.py::test_dump[b-Json-["a", 100]]`
+- `tests/types/test_json.py::test_dump[b-Json-true]`
+- `tests/types/test_json.py::test_dump[b-Json-{"a": 100}]`
 - `tests/types/test_json.py::test_dump[s-Json-"\\u00e0\\u20ac"]`
 - `tests/types/test_json.py::test_dump[s-Json-"te'xt"]`
+- `tests/types/test_json.py::test_dump[s-Json-123.45]`
+- `tests/types/test_json.py::test_dump[s-Json-123]`
 - `tests/types/test_json.py::test_dump[s-Json-["a", 100]]`
+- `tests/types/test_json.py::test_dump[s-Json-true]`
+- `tests/types/test_json.py::test_dump[s-Json-{"a": 100}]`
 - `tests/types/test_json.py::test_dump[t-Json-"\\u00e0\\u20ac"]`
 - `tests/types/test_json.py::test_dump[t-Json-"te'xt"]`
+- `tests/types/test_json.py::test_dump[t-Json-123.45]`
+- `tests/types/test_json.py::test_dump[t-Json-123]`
 - `tests/types/test_json.py::test_dump[t-Json-["a", 100]]`
+- `tests/types/test_json.py::test_dump[t-Json-true]`
+- `tests/types/test_json.py::test_dump[t-Json-{"a": 100}]`
 - `tests/types/test_numpy.py::test_dump_float[b-float32-2.7182817-float4]`
 - `tests/types/test_numpy.py::test_dump_float[b-float32-256e-6-float4]`
 - `tests/types/test_numpy.py::test_dump_float[b-float32-3.1415927-float4]`

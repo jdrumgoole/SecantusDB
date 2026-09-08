@@ -1,8 +1,8 @@
 # pgjdbc conformance report
 
-- SecantusDB (Python server) 0.6.0b15
+- SecantusDB (Python server) 0.6.0b16
 - suite: vendor/pgjdbc @ unknown (Gradle `:postgresql:test`, unmodified; 60s JUnit default timeout injected)
-- generated: 2026-08-24 06:57 UTC
+- generated: 2026-09-07 08:37 UTC
 
 | test class | passed | failed | skipped | total | pass rate |
 |---|---|---|---|---|---|
@@ -33,7 +33,7 @@
 | jdbc2.DatabaseEncodingTest | 2 | 1 | 0 | 3 | 66.7% |
 | jdbc2.DatabaseMetaDataCacheTest | 2 | 1 | 0 | 3 | 66.7% |
 | jdbc2.DatabaseMetaDataPropertiesTest | 13 | 0 | 0 | 13 | 100.0% |
-| jdbc2.DatabaseMetaDataTest | 119 | 37 | 0 | 156 | 76.3% |
+| jdbc2.DatabaseMetaDataTest | 121 | 35 | 0 | 156 | 77.6% |
 | jdbc2.DatabaseMetaDataTransactionIsolationTest | 14 | 0 | 0 | 14 | 100.0% |
 | jdbc2.DateStyleTest | 4 | 0 | 0 | 4 | 100.0% |
 | jdbc2.DateTest | 178 | 0 | 14 | 192 | 100.0% |
@@ -56,7 +56,7 @@
 | jdbc2.PGTimeTest | 2 | 0 | 0 | 2 | 100.0% |
 | jdbc2.PGTimestampTest | 2 | 0 | 0 | 2 | 100.0% |
 | jdbc2.ParameterStatusTest | 9 | 0 | 0 | 9 | 100.0% |
-| jdbc2.PreparedStatementTest | 100 | 6 | 4 | 110 | 94.3% |
+| jdbc2.PreparedStatementTest | 96 | 10 | 4 | 110 | 90.6% |
 | jdbc2.QuotationTest | 2912 | 0 | 0 | 2912 | 100.0% |
 | jdbc2.RefCursorFetchTest | 0 | 1 | 0 | 1 | 0.0% |
 | jdbc2.RefCursorTest | 8 | 0 | 0 | 8 | 100.0% |
@@ -64,7 +64,7 @@
 | jdbc2.ResultSetMetaDataTest | 60 | 0 | 0 | 60 | 100.0% |
 | jdbc2.ResultSetRefreshTest | 2 | 0 | 0 | 2 | 100.0% |
 | jdbc2.ResultSetTest | 82 | 2 | 0 | 84 | 97.6% |
-| jdbc2.SearchPathLookupTest | 3 | 0 | 0 | 3 | 100.0% |
+| jdbc2.SearchPathLookupTest | 2 | 1 | 0 | 3 | 66.7% |
 | jdbc2.ServerCursorTest | 2 | 0 | 0 | 2 | 100.0% |
 | jdbc2.ServerErrorTest | 7 | 0 | 0 | 7 | 100.0% |
 | jdbc2.ServerPreparedStmtTest | 13 | 0 | 0 | 13 | 100.0% |
@@ -73,7 +73,7 @@
 | jdbc2.StatementTest | 36 | 6 | 0 | 42 | 85.7% |
 | jdbc2.StringTypeUnspecifiedArrayTest | 2 | 0 | 0 | 2 | 100.0% |
 | jdbc2.TimeTest | 3 | 0 | 0 | 3 | 100.0% |
-| jdbc2.TimestampTest | 11 | 3 | 0 | 14 | 78.6% |
+| jdbc2.TimestampTest | 12 | 2 | 0 | 14 | 85.7% |
 | jdbc2.TimezoneCachingTest | 4 | 0 | 0 | 4 | 100.0% |
 | jdbc2.TimezoneTest | 16 | 0 | 0 | 16 | 100.0% |
 | jdbc2.TransactionRoundtripTest | 6 | 0 | 0 | 6 | 100.0% |
@@ -81,9 +81,9 @@
 | jdbc2.TypeCacheDLLStressTest | 1 | 0 | 0 | 1 | 100.0% |
 | jdbc2.UpdateableResultTest | 34 | 2 | 0 | 36 | 94.4% |
 | jdbc2.UpsertTest | 32 | 0 | 0 | 32 | 100.0% |
-| **total** | **5711** | **80** | **28** | **5819** | **98.6%** |
+| **total** | **5709** | **82** | **28** | **5819** | **98.6%** |
 
-## Failures (80)
+## Failures (82)
 
 - `jdbc2.ArrayTest :: testNonStandardBounds()`
 - `jdbc2.ArrayTest :: testNonStandardBounds()`
@@ -131,8 +131,6 @@
 - `jdbc2.DatabaseMetaDataTest :: partitionedTables()`
 - `jdbc2.DatabaseMetaDataTest :: remarkIndexInfo()`
 - `jdbc2.DatabaseMetaDataTest :: remarkIndexInfo()`
-- `jdbc2.DatabaseMetaDataTest :: searchStringEscape()`
-- `jdbc2.DatabaseMetaDataTest :: searchStringEscape()`
 - `jdbc2.DatabaseMetaDataTest :: tablePrivileges()`
 - `jdbc2.DatabaseMetaDataTest :: types()`
 - `jdbc2.DatabaseMetaDataTest :: types()`
@@ -147,13 +145,18 @@
 - `jdbc2.NumericTransfer2Test :: receiveValue()`
 - `jdbc2.PreparedStatementTest :: testDoubleQuestionMark()`
 - `jdbc2.PreparedStatementTest :: testDoubleQuestionMark()`
+- `jdbc2.PreparedStatementTest :: testNegativeNumericScale()`
+- `jdbc2.PreparedStatementTest :: testNegativeNumericScale()`
 - `jdbc2.PreparedStatementTest :: testNumeric()`
 - `jdbc2.PreparedStatementTest :: testNumeric()`
+- `jdbc2.PreparedStatementTest :: testTrailingSpaces()`
+- `jdbc2.PreparedStatementTest :: testTrailingSpaces()`
 - `jdbc2.PreparedStatementTest :: testUnknownSetObject()`
 - `jdbc2.PreparedStatementTest :: testUnknownSetObject()`
 - `jdbc2.RefCursorFetchTest :: initializationError`
 - `jdbc2.ResultSetTest :: testRowResultPositioning()`
 - `jdbc2.ResultSetTest :: testRowResultPositioning()`
+- `jdbc2.SearchPathLookupTest :: searchPathNormalLookup()`
 - `jdbc2.StatementTest :: closeInProgressStatement()`
 - `jdbc2.StatementTest :: closeInProgressStatementProtocol32()`
 - `jdbc2.StatementTest :: concurrentWarningReadAndClear()`
@@ -162,6 +165,5 @@
 - `jdbc2.StatementTest :: warningsAreAvailableAsap()`
 - `jdbc2.TimestampTest :: testGetTimestampWOTZ()`
 - `jdbc2.TimestampTest :: testGetTimestampWOTZ()`
-- `jdbc2.TimestampTest :: testSetTimestampWOTZ()`
 - `jdbc2.UpdateableResultTest :: testOidUpdatable()`
 - `jdbc2.UpdateableResultTest :: testReturnSerial()`
