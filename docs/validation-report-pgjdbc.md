@@ -1,8 +1,8 @@
 # pgjdbc conformance report
 
-- SecantusDB (Python server) 0.6.0b15
+- SecantusDB (Python server) 0.6.0b16
 - suite: vendor/pgjdbc @ unknown (Gradle `:postgresql:test`, unmodified; 60s JUnit default timeout injected)
-- generated: 2026-08-24 06:57 UTC
+- generated: 2026-08-31 08:36 UTC
 
 | test class | passed | failed | skipped | total | pass rate |
 |---|---|---|---|---|---|
@@ -64,7 +64,7 @@
 | jdbc2.ResultSetMetaDataTest | 60 | 0 | 0 | 60 | 100.0% |
 | jdbc2.ResultSetRefreshTest | 2 | 0 | 0 | 2 | 100.0% |
 | jdbc2.ResultSetTest | 82 | 2 | 0 | 84 | 97.6% |
-| jdbc2.SearchPathLookupTest | 3 | 0 | 0 | 3 | 100.0% |
+| jdbc2.SearchPathLookupTest | 2 | 1 | 0 | 3 | 66.7% |
 | jdbc2.ServerCursorTest | 2 | 0 | 0 | 2 | 100.0% |
 | jdbc2.ServerErrorTest | 7 | 0 | 0 | 7 | 100.0% |
 | jdbc2.ServerPreparedStmtTest | 13 | 0 | 0 | 13 | 100.0% |
@@ -81,9 +81,9 @@
 | jdbc2.TypeCacheDLLStressTest | 1 | 0 | 0 | 1 | 100.0% |
 | jdbc2.UpdateableResultTest | 34 | 2 | 0 | 36 | 94.4% |
 | jdbc2.UpsertTest | 32 | 0 | 0 | 32 | 100.0% |
-| **total** | **5711** | **80** | **28** | **5819** | **98.6%** |
+| **total** | **5710** | **81** | **28** | **5819** | **98.6%** |
 
-## Failures (80)
+## Failures (81)
 
 - `jdbc2.ArrayTest :: testNonStandardBounds()`
 - `jdbc2.ArrayTest :: testNonStandardBounds()`
@@ -154,6 +154,7 @@
 - `jdbc2.RefCursorFetchTest :: initializationError`
 - `jdbc2.ResultSetTest :: testRowResultPositioning()`
 - `jdbc2.ResultSetTest :: testRowResultPositioning()`
+- `jdbc2.SearchPathLookupTest :: searchPathNormalLookup()`
 - `jdbc2.StatementTest :: closeInProgressStatement()`
 - `jdbc2.StatementTest :: closeInProgressStatementProtocol32()`
 - `jdbc2.StatementTest :: concurrentWarningReadAndClear()`

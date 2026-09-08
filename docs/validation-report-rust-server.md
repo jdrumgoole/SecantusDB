@@ -1,6 +1,6 @@
 # pymongo Validation Report (Rust server)
 
-Generated 2026-08-30 — SecantusDB 0.6.0b16 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
+Generated 2026-08-31 — SecantusDB 0.6.0b16 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
 
 Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 conformance gate from `tasks/rust-server-plan.md`: the same unmodified pymongo suite the headline gauge runs, pointed at the **Rust server** instead of the pure-Python one. The gap between this pass rate and `docs/validation-report.md` is the Rust server's remaining to-do list.
 
@@ -34,11 +34,11 @@ Run `uv run python -m invoke validate --server rust` to refresh. This is the R8 
 | `test_run_command.py` | 16 | 0 | 0 | 5 | 21 | 100.0% |
 | `test_transactions_unified.py` | 95 | 0 | 0 | 169 | 264 | 100.0% |
 | `test_versioned_api.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
-| `test_versioned_api_integration.py` | 38 | 1 | 0 | 4 | 43 | 97.4% |
+| `test_versioned_api_integration.py` | 39 | 0 | 0 | 4 | 43 | 100.0% |
 | `test_write_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| **Overall** | **1070** | **6** | **0** | **424** | **1500** | **99.4%** |
+| **Overall** | **1071** | **5** | **0** | **424** | **1500** | **99.5%** |
 
-## Failures (6)
+## Failures (5)
 
 First 30 failure node-ids for manual triage:
 
@@ -48,7 +48,6 @@ vendor/pymongo-tests/test/test_collection.py::TestCollection::test_index_text
 vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_maxtime_ms_message
 vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_to_list_csot_applied
 vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_where
-vendor/pymongo-tests/test/test_versioned_api_integration.py::TestVersionedApiCrudApiVersion_1::test_client_bulkWrite_appends_declared_API_version
 ```
 
 ## How this is generated

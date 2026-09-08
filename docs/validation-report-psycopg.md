@@ -1,8 +1,8 @@
 # psycopg conformance report
 
-- SecantusDB (Python server) 0.6.0b15
+- SecantusDB (Python server) 0.6.0b16
 - psycopg suite: vendor/psycopg @ unknown
-- generated: 2026-08-24 06:27 UTC
+- generated: 2026-08-31 06:41 UTC
 
 | category | passed | failed | skipped | total | pass rate |
 |---|---|---|---|---|---|
@@ -12,7 +12,7 @@
 | test_connection.py | 98 | 4 | 2 | 104 | 96.1% |
 | test_connection_info.py | 37 | 0 | 3 | 40 | 100.0% |
 | test_conninfo.py | 38 | 0 | 0 | 38 | 100.0% |
-| test_copy.py | 105 | 7 | 0 | 112 | 93.8% |
+| test_copy.py | 106 | 6 | 0 | 112 | 94.6% |
 | test_cursor.py | 78 | 0 | 0 | 78 | 100.0% |
 | test_cursor_client.py | 28 | 0 | 0 | 28 | 100.0% |
 | test_cursor_common.py | 278 | 2 | 8 | 288 | 99.3% |
@@ -45,9 +45,9 @@
 | types/test_shapely.py | 2 | 0 | 26 | 28 | 100.0% |
 | types/test_string.py | 134 | 0 | 1 | 135 | 100.0% |
 | types/test_uuid.py | 26 | 0 | 0 | 26 | 100.0% |
-| **total** | **4080** | **59** | **99** | **4238** | **98.6%** |
+| **total** | **4081** | **58** | **99** | **4238** | **98.6%** |
 
-## Failures (59)
+## Failures (58)
 
 - `tests/test_adapt.py::test_random[0-s]`
 - `tests/test_adapt.py::test_random[0-t]`
@@ -59,12 +59,11 @@
 - `tests/test_connection.py::test_cancel_safe_timeout`
 - `tests/test_connection.py::test_connect_bad`
 - `tests/test_connection.py::test_right_exception_on_server_disconnect`
-- `tests/test_copy.py::test_copy_from_leaks[0-False]`
+- `tests/test_copy.py::test_copy_from_leaks[0-True]`
 - `tests/test_copy.py::test_copy_from_leaks[1-True]`
 - `tests/test_copy.py::test_copy_out_error_with_copy_not_finished`
 - `tests/test_copy.py::test_copy_table_across[binary]`
 - `tests/test_copy.py::test_copy_table_across[block]`
-- `tests/test_copy.py::test_copy_table_across[row]`
 - `tests/test_copy.py::test_set_custom_type`
 - `tests/test_cursor_common.py::test_executemany_lock[asyncio-Cursor]`
 - `tests/test_cursor_common.py::test_executemany_lock[asyncio-RawCursor]`
