@@ -1387,6 +1387,20 @@ Specific items that were left out of the slice that introduced their feature are
   clock-dependent input keywords `now` / `today` / `tomorrow` / `yesterday`
   (only the constant `epoch` is).
 
+- [ ] **OPEN — RUST pgserver: separate `test_datetime.py` edges still fail
+  (noted 2026-09-08, after the tz-aware `timestamptz` dump round-trip was
+  fixed).** With `test_dump_datetimetz` now fully green, `test_datetime.py`
+  still has ~56 failures in areas the `timestamptz-dump` batch deliberately did
+  NOT touch: overflow-message wording (`test_load_datetime_overflow`,
+  `test_overflow_message`, `test_load_interval_overflow` — `timestamp too
+  small` / `too large`, incl. the `German` DateStyle variants and the BC /
+  `infinity` inputs, which overlap the wide-year/BC item above);
+  named-zone LOADING (`test_load_datetimetz_tz[Europe/Rome ...]` — a result
+  timestamptz built against a DST-carrying named zone); and the `24:00`
+  boundary time (`test_load_time_24` / `test_load_timetz_24`). None involve the
+  binary/text parameter dump path; each is its own decode / message-fidelity
+  gap. Measured against a real PG 14 before working any of them.
+
 - [ ] **OPEN — RUST pgserver column metadata (`typmod` / `typlen`): landed
   for constant SELECTs, deferred for table columns and computed expressions
   (measured 2026-09-08 against PostgreSQL 16, PR for `pgserver-column`).** The

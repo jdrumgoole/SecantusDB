@@ -6050,14 +6050,32 @@ fn decode_parameter(
                     i64::from_be_bytes(bytes[..8].try_into().expect("checked")),
                 )))
             }
-            // An instant on the wire, rendered into the session's zone -- the
-            // same value a `::timestamptz` literal would have produced.
+            // An instant on the wire -- i64 microseconds since 2000-01-01 UTC.
+            // Store it as the same INSTANT carrier a `::timestamptz` literal
+            // produces (a BSON date, or a sub-millisecond composite), NOT as
+            // session-rendered text: text dropped the zone offset the moment
+            // anything re-coerced it as a bare timestamp, so a binary parameter
+            // compared unequal to the literal it was meant to equal.
             Some(1184) if bytes.len() == 8 => {
                 let pg_micros = i64::from_be_bytes(bytes[..8].try_into().expect("checked"));
-                let micros = pg_micros + 946_684_800 * 1_000_000;
-                Ok(Bson::String(secantus_pgplan::render_timestamptz(
-                    micros, tz,
-                )))
+                // PostgreSQL encodes the timestamptz infinities as the extreme
+                // i64 values; keep them as text, the form the loader expects
+                // (the finite-instant carrier cannot hold them).
+                if pg_micros == i64::MAX {
+                    return Ok(Bson::String("infinity".to_string()));
+                }
+                if pg_micros == i64::MIN {
+                    return Ok(Bson::String("-infinity".to_string()));
+                }
+                match pg_micros.checked_add(946_684_800 * 1_000_000) {
+                    Some(micros) => Ok(secantus_pgplan::timestamptz_value_from_micros(micros)),
+                    // A value so far out it overflows the epoch shift is beyond
+                    // the finite range this server plans; render it in the
+                    // session zone as a last resort rather than panic.
+                    None => Ok(Bson::String(secantus_pgplan::render_timestamptz(
+                        pg_micros, tz,
+                    ))),
+                }
             }
             // `timetz` is 8 bytes of microseconds since midnight plus a 4-byte
             // offset in SECONDS WEST of UTC -- the opposite sign to the one the
