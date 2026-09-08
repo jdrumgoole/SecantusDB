@@ -881,10 +881,10 @@ fn map_err(e: WtError) -> StorageError {
         },
         // A named refusal (non-numeric $inc/$mul) → mongod's TypeMismatch (14),
         // not the generic BadValue the plain defer would produce.
-        WtError::UpdateTypeMismatch(m) => StorageError::WriteError {
+        WtError::UpdateTypeMismatch(m, exec) => StorageError::WriteError {
             code: 14,
             errmsg: m,
-            exec: true,
+            exec,
         },
         // Overlapping operator paths → mongod's ConflictingUpdateOperators (40).
         WtError::UpdatePathConflict(m) => StorageError::WriteError {

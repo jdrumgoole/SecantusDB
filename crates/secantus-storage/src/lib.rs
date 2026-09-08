@@ -1440,7 +1440,7 @@ pub enum StorageError {
     /// An update the engine refused for a reason mongod names exactly — today
     /// a non-numeric `$inc` / `$mul`, which mongod answers with TypeMismatch
     /// (14). Distinct from `QueryUnsupported`, which means "can't evaluate".
-    UpdateTypeMismatch(String),
+    UpdateTypeMismatch(String, bool),
     /// Two update operators target overlapping paths (mongod: code 40).
     UpdatePathConflict(String),
     /// An update would create a field under a non-document -- mongod's
@@ -1525,7 +1525,7 @@ impl std::fmt::Display for StorageError {
             StorageError::CreateIndexUnsupported(m) => write!(f, "{m}"),
             StorageError::IndexOptionsConflict(m) => write!(f, "{m}"),
             StorageError::IndexKeySpecsConflict(m) => write!(f, "{m}"),
-            StorageError::UpdateTypeMismatch(m) => write!(f, "{m}"),
+            StorageError::UpdateTypeMismatch(m, _) => write!(f, "{m}"),
             StorageError::UpdatePathConflict(m) => write!(f, "{m}"),
             StorageError::UpdatePathNotViable(m) => write!(f, "{m}"),
             StorageError::QueryUnsupported => {
@@ -10307,9 +10307,12 @@ impl Storage {
                             // Creating through a non-document -> mongod's code 28.
                             return StorageError::UpdatePathNotViable(m);
                         }
-                        if let Some(m) = secantus_core::update::arith_type_error(doc, update) {
+                        if let Some((m, exec)) =
+                            secantus_core::update::arith_type_error(doc, update)
+                        {
                             // A non-numeric field / operand -> mongod's code 14.
-                            return StorageError::UpdateTypeMismatch(m);
+                            // `exec` says which of mongod's two wrappers applies.
+                            return StorageError::UpdateTypeMismatch(m, exec);
                         }
                         match secantus_core::update::arith_overflow_error(doc, update) {
                             // An $inc / $mul past int64 -> mongod's code 2. Not a
