@@ -589,7 +589,12 @@ remain open:
       never received a byte on that socket. The same test lost 9 of 10 rounds
       against NATIVE PostgreSQL 16 over TCP on this box, so it is a client
       timing race (Linux loopback connect is synchronous, which is why psycopg
-      CI never sees it). The `cancel_safe_*` pair import `pproxy`
+      CI never sees it). A logging TCP tap confirmed the shape: the cancel
+      socket is accepted and the client writes NOTHING on it for the life of
+      the test, while the same call sequence polled every 100 ms sends the
+      SSLRequest and the CancelRequest and passes. `sslmode=disable` /
+      `gssencmode=disable` in the DSN change nothing — the race is in the
+      connect, not the encryption negotiation. The `cancel_safe_*` pair import `pproxy`
       (`tests/fix_proxy.py`), which the venv does not carry. Nothing to do
       server-side; count the three as harness failures on macOS.
 - RUST pgserver: `standard_conforming_strings = off` is honoured by a lexer
