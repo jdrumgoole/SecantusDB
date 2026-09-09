@@ -6493,6 +6493,39 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
      `TZ=UTC` server before pinning it -- same caution as the
      `$toLower`-of-a-Timestamp item.
 
+- [x] **RESOLVED 2026-09-09 — a `Decimal128("NaN")` CRASHED `$expr`, and
+  `{$eq: [NaN, NaN]}` was false.** Two bugs, one probe run.
+
+  `find({"$expr": {"$gt": ["$v", 0]}})` over a collection holding a
+  `Decimal128("NaN")` answered **`1 internal server error`** on the Python
+  server. `expressions._cmp_pair` widens a `Decimal128` to a `decimal.Decimal`
+  before handing the pair to `ordering._bson_lt`, so the NaN arrived already
+  unwrapped and `_is_nan_value` -- which knew about `float` and `Decimal128` --
+  missed it. `Decimal("NaN") < 0` then raised `decimal.InvalidOperation`, which
+  is NOT the `TypeError` the fallback catches. One such document made an
+  ordinary query fail.
+
+  And `{$eq: [NaN, NaN]}` is **true** on mongod (its canonical order ranks the
+  two equal, which is also why `find({a: NaN})` matches a stored NaN). Both
+  servers said false -- the Rust server only for two plain doubles, since its
+  `Decimal128` branch was already right, so the operator's answer depended on
+  which numeric type held the NaN. This is the FOURTH instance of the
+  "Python's `==` standing in for a BSON semantic" family, and the second inside
+  `ordering.bson_equal` -- the predicate that exists because `True == 1` had
+  already caused one.
+
+  The change-detection twin was measured and deliberately left alone: `$set` of
+  a NaN over the same-typed NaN is `modifiedCount: 0`, while `float` NaN ->
+  `Decimal128("NaN")` is `1` (the numeric-TYPE rule, not the equality one).
+
+  **Found by promoting a throwaway probe**: the `/tmp` original of
+  `tools/probes/query_result_sets.py` compared mongod against the RUST server
+  only, so the whole Python column was missing. Adding it surfaced a crash on
+  the first run. A sweep that omits a server proves half of what it claims.
+
+  Gates: `tests/test_expression_nan_equality.py` (20) and
+  `tests/test_mongod_differential.py -k nanexpr` (13).
+
 - [x] **RESOLVED 2026-09-09 — `$rename` path refusals, plus two the entry did
   not know about.** Filed as four shapes. The four were right; what was missing
   is that mongod separates the two refusals by WHEN it can decide them, and
