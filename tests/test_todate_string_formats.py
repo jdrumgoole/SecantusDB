@@ -140,3 +140,38 @@ def test_these_are_still_refused(coll, text):
     with pytest.raises(pymongo.errors.OperationFailure) as excinfo:
         list(coll.aggregate([{"$project": {"v": {"$toDate": "$s"}}}]))
     assert excinfo.value.code == 241
+
+
+# --- the version-independent paths ----------------------------------------
+#
+# `datetime.fromisoformat` accepts the compact and week forms only from Python
+# 3.11, so on 3.12 they never reach the explicit parser below and the tests
+# above would exercise the stdlib instead. CI's 3.10 lane caught exactly that:
+# `20200101` parsed locally and raised there. These call the parser DIRECTLY so
+# the code that runs on 3.10 is covered on every interpreter.
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("20200101", dt.datetime(2020, 1, 1)),
+        ("20200101T120000", dt.datetime(2020, 1, 1, 12)),
+        ("2020-W01-1", dt.datetime(2019, 12, 30)),
+        ("2020-W53-7", dt.datetime(2021, 1, 3)),
+        ("2020-01-01T00", dt.datetime(2020, 1, 1)),
+        ("12/31/2020", dt.datetime(2020, 12, 31)),
+        ("Dec 31 2020", dt.datetime(2020, 12, 31)),
+        ("@1577836800", dt.datetime(2020, 1, 1)),
+    ],
+)
+def test_the_explicit_parser_does_not_depend_on_fromisoformat(text, expected):
+    from secantus.expressions import _parse_timelib_forms
+
+    assert _parse_timelib_forms(text) == expected
+
+
+@pytest.mark.parametrize("text", ["2020-W54-1", "2020-W01-8", "2020-W00-1", "20201332"])
+def test_the_explicit_parser_rejects_out_of_range_components(text):
+    from secantus.expressions import _parse_timelib_forms
+
+    assert _parse_timelib_forms(text) is None

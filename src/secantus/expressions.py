@@ -5173,6 +5173,33 @@ def _parse_timelib_forms(text: str) -> _dt.datetime | None:
     before any split on whitespace, because their date part contains spaces --
     a first version split first and could never see `Dec 31 2020`.
     """
+    # These four are covered by `fromisoformat` on Python 3.11+ and NOT on
+    # 3.10, where it accepts only the strict ISO forms. Relying on it made the
+    # server's answer depend on which interpreter it runs under -- `20200101`
+    # parsed on 3.12 and raised on 3.10 -- which mongod's does not. Parsed
+    # explicitly here so every supported Python agrees (caught by CI's 3.10
+    # lane, 2026-09-09; the same trap `tasks`/the probe skill records for
+    # `TIMESTAMP '...'` in the SQL engine).
+    compact = re.match(r"^(\d{4})(\d{2})(\d{2})(?:[Tt](\d{2})(\d{2})(\d{2}))?$", text)
+    if compact:
+        y, mo, d, hh, mi, se = compact.groups()
+        return _build_datetime(int(y), int(mo), int(d), f"{hh}:{mi}:{se}" if hh is not None else "")
+    week = re.match(r"^(\d{4})-[Ww](\d{2})-(\d)$", text)
+    if week:
+        year, wk, day = (int(g) for g in week.groups())
+        if 1 <= wk <= 53 and 1 <= day <= 7:
+            # Week 1 holds the first Thursday and day 1 is Monday, so
+            # `2020-W01-1` is 2019-12-30.
+            jan4 = _dt.date(year, 1, 4)
+            week1_monday = jan4 - _dt.timedelta(days=jan4.weekday())
+            resolved = week1_monday + _dt.timedelta(weeks=wk - 1, days=day - 1)
+            return _dt.datetime(resolved.year, resolved.month, resolved.day)
+        return None
+    hour_only = re.match(r"^(\d{4}-\d{2}-\d{2})[Tt](\d{2})$", text)
+    if hour_only:
+        date_part, hour = hour_only.groups()
+        y, mo, d = (int(g) for g in date_part.split("-"))
+        return _build_datetime(y, mo, d, f"{hour}:00:00")
     epoch = _AT_EPOCH.match(text)
     if epoch:
         whole, frac = epoch.groups()
