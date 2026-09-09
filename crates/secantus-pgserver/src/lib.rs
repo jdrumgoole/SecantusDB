@@ -149,6 +149,57 @@ fn backend_registry() -> &'static Mutex<HashMap<i32, Arc<BackendEntry>>> {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Process-wide cache of the COMMITTED rows of each type-catalog collection,
+/// keyed by `(storage, db, collection)`. Every statement re-read and
+/// re-decoded every catalog collection -- once per describe and once per
+/// result column -- and that decode was the whole cost of a statement: a
+/// `select 1` round trip took 0.86 ms against PostgreSQL 16's 0.034 ms, and
+/// an `executemany` of 20,000 rows 15 s against 0.25 s, until psycopg's
+/// `test_type_error_shadow` (which does exactly that) ran past its 20 s
+/// budget (2026-09-09). The catalog changes only under DDL, so the decoded
+/// rows are kept and re-read only when `CATALOG_VERSION` has moved.
+///
+/// Invalidation is deliberately COARSE: `bump_catalog_version` runs after
+/// every statement that is not a plain read or a row write (see
+/// `Statement::may_change_catalog`), after every transaction-control
+/// statement (a COMMIT publishes a block's DDL to other connections), and
+/// after every rollback to a savepoint. An extra bump costs one re-read; a
+/// missed one is a stale catalog, so the classification errs on bumping.
+///
+/// A session fills the cache from its own read only when nothing can have
+/// moved the catalog since its transaction's snapshot: the version now must
+/// equal the one captured when its transaction handle opened (autocommit
+/// statements in the extended protocol run under a handle too). Otherwise
+/// the read is served but not kept -- a snapshot taken before another
+/// connection's `CREATE TABLE` committed must not be published as current,
+/// and a block's own uncommitted `CREATE TYPE` must not be seen by others.
+struct CatalogCache {
+    version: std::sync::atomic::AtomicU64,
+    /// `(storage, db, collection)` -> the decoded rows of one type-catalog
+    /// collection, `_id`-sorted.
+    entries: Mutex<HashMap<(usize, String, &'static str), (u64, Arc<Vec<Document>>)>>,
+    /// `(storage, db, table)` -> its decoded catalog entry; `None` records
+    /// that the table does not exist.
+    tables: Mutex<HashMap<(usize, String, String), (u64, Option<TableDef>)>>,
+}
+
+fn catalog_cache() -> &'static CatalogCache {
+    static CACHE: OnceLock<CatalogCache> = OnceLock::new();
+    CACHE.get_or_init(|| CatalogCache {
+        version: std::sync::atomic::AtomicU64::new(0),
+        entries: Mutex::new(HashMap::new()),
+        tables: Mutex::new(HashMap::new()),
+    })
+}
+
+/// Declare the committed type catalog changed (or possibly changed): every
+/// cached collection is re-read on its next use, on every connection.
+fn bump_catalog_version() {
+    catalog_cache()
+        .version
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// The `CancelRequest` handler: a cancel connection names a `(pid, secret)`,
 /// and the matching live backend's `cancel` flag is raised. An unknown PID
 /// or a wrong secret is silently ignored, as PostgreSQL ignores it -- the
@@ -451,6 +502,10 @@ pub struct PgHandler {
     /// than a missing feature. Lock-free for the same reason as
     /// `in_transaction`.
     txn_failed: std::sync::atomic::AtomicBool,
+    /// The catalog version when this session's transaction handle opened;
+    /// a catalog read may fill the process-wide cache only while the version
+    /// still equals it (see `CatalogCache`).
+    txn_catalog_version: std::sync::atomic::AtomicU64,
     /// The open savepoints, oldest first.
     ///
     /// WiredTiger has no savepoint of its own, so one is a set of PRE-IMAGES:
@@ -642,6 +697,7 @@ impl PgHandler {
             in_transaction: std::sync::atomic::AtomicBool::new(false),
             binary_results: std::sync::atomic::AtomicBool::new(false),
             txn_failed: std::sync::atomic::AtomicBool::new(false),
+            txn_catalog_version: std::sync::atomic::AtomicU64::new(0),
             savepoints: Mutex::new(Vec::new()),
             cursor_capture: std::sync::Arc::new(Mutex::new(None)),
             backend_pid: AtomicI32::new(0),
@@ -1783,6 +1839,12 @@ impl PgHandler {
         for coll in Self::CATALOG_COLLECTIONS {
             self.ensure_collection(coll)?;
         }
+        self.txn_catalog_version.store(
+            catalog_cache()
+                .version
+                .load(std::sync::atomic::Ordering::SeqCst),
+            std::sync::atomic::Ordering::SeqCst,
+        );
         self.storage
             .begin_user_transaction()
             .map_err(|e| Self::storage_err("could not begin a transaction", e))
@@ -1812,22 +1874,18 @@ impl PgHandler {
     /// reads the catalog OUTSIDE the transaction and a plain read misses the
     /// uncommitted write.
     fn type_catalog_docs(&self, collection: &'static str) -> PgWireResult<Vec<Document>> {
-        let raw = self
-            .storage
-            .find_matching(self.db(), collection, &Document::new())
-            .map_err(|e| Self::storage_err("could not read the type catalog", e))?;
-        let mut by_id: std::collections::BTreeMap<String, Document> =
-            std::collections::BTreeMap::new();
-        for bytes in raw {
-            let d: Document = bson::from_slice(&bytes)
-                .map_err(|e| Self::storage_err("could not decode a type", e))?;
-            let id = d.get_str("_id").unwrap_or_default().to_string();
-            by_id.insert(id, d);
-        }
+        let committed = self.committed_type_catalog_docs(collection)?;
         let overlay = self
             .uncommitted_types
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        if overlay.is_empty() {
+            return Ok(committed.as_ref().clone());
+        }
+        let mut by_id: std::collections::BTreeMap<String, Document> = committed
+            .iter()
+            .map(|d| (d.get_str("_id").unwrap_or_default().to_string(), d.clone()))
+            .collect();
         for ((coll, id), doc) in overlay.iter() {
             if *coll != collection {
                 continue;
@@ -1842,6 +1900,69 @@ impl PgHandler {
             }
         }
         Ok(by_id.into_values().collect())
+    }
+
+    /// The COMMITTED rows of one type-catalog collection, `_id`-sorted, from
+    /// the process-wide cache when its version is current and from storage
+    /// (decoding once for everyone) when it is not. See `CatalogCache`.
+    fn committed_type_catalog_docs(
+        &self,
+        collection: &'static str,
+    ) -> PgWireResult<Arc<Vec<Document>>> {
+        let cache = catalog_cache();
+        let version = cache.version.load(std::sync::atomic::Ordering::SeqCst);
+        let key = (
+            Arc::as_ptr(&self.storage) as usize,
+            self.db().to_string(),
+            collection,
+        );
+        if let Some((v, docs)) = cache
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            if *v == version {
+                return Ok(Arc::clone(docs));
+            }
+        }
+        let raw = self
+            .storage
+            .find_matching(self.db(), collection, &Document::new())
+            .map_err(|e| Self::storage_err("could not read the type catalog", e))?;
+        let mut by_id: std::collections::BTreeMap<String, Document> =
+            std::collections::BTreeMap::new();
+        for bytes in raw {
+            let d: Document = bson::from_slice(&bytes)
+                .map_err(|e| Self::storage_err("could not decode a type", e))?;
+            let id = d.get_str("_id").unwrap_or_default().to_string();
+            by_id.insert(id, d);
+        }
+        let docs: Arc<Vec<Document>> = Arc::new(by_id.into_values().collect());
+        // A read that was in flight while the version moved must not be
+        // recorded as current: store it under the version it was read AT,
+        // so a bump during the read still forces the next reader to storage.
+        if self.may_fill_catalog_cache(version) {
+            cache
+                .entries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key, (version, Arc::clone(&docs)));
+        }
+        Ok(docs)
+    }
+
+    /// May a catalog row this session just read at `version` be published
+    /// as the committed truth? Outside a transaction handle, always; under
+    /// one, only while the catalog has not moved since the handle opened --
+    /// by this block (its own uncommitted DDL) or by anyone else (a commit
+    /// this block's snapshot may predate). See `CatalogCache`.
+    fn may_fill_catalog_cache(&self, version: u64) -> bool {
+        !self.transaction_handle_open()
+            || self
+                .txn_catalog_version
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == version
     }
 
     /// Record that the open transaction created (`Some(doc)`) or dropped
@@ -2986,9 +3107,11 @@ impl PgHandler {
         )
     }
 
-    /// Read one table's catalog entry. Reads it back from storage every time
-    /// rather than caching: the store is shared with the other two servers, so
-    /// a cache here would go stale behind our back.
+    /// Read one table's catalog entry: this transaction's pending creates and
+    /// drops first, then the process-wide cache of committed entries, then
+    /// storage (see `CatalogCache` for when a read fills the cache). The
+    /// store is this process's alone -- WiredTiger locks the directory -- so
+    /// every write to the catalog passes through `run` and bumps the version.
     fn lookup(&self, name: &str) -> Option<TableDef> {
         if let Some(def) = Self::virtual_table(name) {
             return Some(def);
@@ -3005,14 +3128,41 @@ impl PgHandler {
         {
             return pending.clone();
         }
+        let cache = catalog_cache();
+        let version = cache.version.load(std::sync::atomic::Ordering::SeqCst);
+        let key = (
+            Arc::as_ptr(&self.storage) as usize,
+            self.db().to_string(),
+            name.to_string(),
+        );
+        if let Some((v, def)) = cache
+            .tables
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            if *v == version {
+                return def.clone();
+            }
+        }
         let filter = bson::doc! { "_id": name };
+        // A storage error is a transient `None`, not a recorded absence.
         let rows = self
             .storage
             .find_matching(self.db(), CATALOG_COLLECTION, &filter)
             .ok()?;
-        let raw = rows.first()?;
-        let d: Document = bson::from_slice(raw).ok()?;
-        TableDef::from_document(&d)
+        let def = rows.first().and_then(|raw| {
+            let d: Document = bson::from_slice(raw).ok()?;
+            TableDef::from_document(&d)
+        });
+        if self.may_fill_catalog_cache(version) {
+            cache
+                .tables
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key, (version, def.clone()));
+        }
+        def
     }
 
     fn err(e: &PlanError) -> PgWireError {
@@ -4904,7 +5054,7 @@ impl PgHandler {
         // COMMIT and ROLLBACK are: rolling back to a savepoint is how a client
         // RECOVERS from the error that poisoned the block.
         if let Statement::Transaction(control) = &stmt {
-            return match control {
+            let out = match control {
                 TransactionControl::Savepoint(_)
                 | TransactionControl::Release(_)
                 | TransactionControl::RollbackTo(_) => {
@@ -4917,6 +5067,11 @@ impl PgHandler {
                 }
                 other => self.transaction_control(other.clone()),
             };
+            // A COMMIT publishes the block's DDL to every other connection;
+            // a ROLLBACK (to a savepoint or of the block) restores rows the
+            // cache may have read past. See `CatalogCache`.
+            bump_catalog_version();
+            return out;
         }
 
         // Before anything writes, the open savepoints capture what it is about
@@ -6291,7 +6446,57 @@ impl PgHandler {
     }
 
     /// Execute one planned statement against storage.
+    /// Can this statement change the type catalog? Reads, row writes to user
+    /// tables, cursor and session-state statements cannot; everything else
+    /// (every DDL, type, function, schema and database statement, and the
+    /// forms this list does not name) is taken to. Errs on `true`: an extra
+    /// catalog re-read is cheap, a stale catalog is a wrong answer.
+    fn may_change_catalog(stmt: &Statement) -> bool {
+        !matches!(
+            stmt,
+            Statement::Select(_)
+                | Statement::SelectConstant(_)
+                | Statement::ValuesConstant(_)
+                | Statement::Insert(_)
+                | Statement::Update(_)
+                | Statement::Delete(_)
+                | Statement::Aggregate(_)
+                | Statement::CopyFrom(_)
+                | Statement::CopyTo(_)
+                | Statement::Show(_)
+                | Statement::Set { .. }
+                | Statement::Reset(_)
+                | Statement::SetTransaction(_)
+                | Statement::SetSessionCharacteristics(_)
+                | Statement::Fetch { .. }
+                | Statement::CloseCursor(_)
+                | Statement::Deallocate(_)
+                | Statement::DeallocateAll
+                | Statement::Notify { .. }
+                | Statement::Listen(_)
+                | Statement::Unlisten(_)
+        )
+    }
+
+    /// Run one planned statement, and declare the catalog changed afterwards
+    /// when the statement is one that can change it. After, not before: a
+    /// bump before would let the statement's own reads re-fill the cache
+    /// with the rows it is about to change. On failure too -- an autocommit
+    /// DDL that failed halfway is rolled back, and the cache may have read
+    /// the half. Here rather than in `run` because a statement can run
+    /// another: `CREATE TABLE AS` creates its table and then INSERTs into
+    /// it, and that INSERT's lookup must not find the "no such table" the
+    /// CTAS itself cached a moment earlier (see `CatalogCache`).
     fn execute(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response>> {
+        let may_change_catalog = Self::may_change_catalog(&stmt);
+        let out = self.execute_inner(stmt, max_rows);
+        if may_change_catalog {
+            bump_catalog_version();
+        }
+        out
+    }
+
+    fn execute_inner(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response>> {
         // A timestamptz renders in the SESSION zone; capture it once here and
         // thread it into the row encoder explicitly. A thread-local does not
         // work: pgwire may encode the DataRows lazily on another async worker

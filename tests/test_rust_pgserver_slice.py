@@ -17,6 +17,7 @@ import contextlib
 import datetime as dt
 import decimal as dc
 import ipaddress
+import re
 import shutil
 import socket
 import subprocess
@@ -5301,8 +5302,13 @@ def test_literal_column_defaults(home: Path) -> None:
         with pytest.raises(psycopg.errors.InvalidTextRepresentation) as ei:
             cur.execute("create table fp_e (id int, n int default 'a')")
         assert str(ei.value).startswith('invalid input syntax for type integer: "a"')
+        # PostgreSQL accepts a volatile DEFAULT and stamps each INSERT; this
+        # server stores a DEFAULT as one evaluated value, so `now()` would be
+        # frozen at CREATE time. Refused rather than silently wrong.
         with pytest.raises(psycopg.errors.FeatureNotSupported):
             cur.execute("create table fp_e (id int, n text default now())")
+        with pytest.raises(psycopg.errors.FeatureNotSupported):
+            cur.execute("create table fp_e (id int, n timestamptz default current_timestamp)")
     # The default survives a restart: it is in the catalog, not the session.
     with _Server(home) as server, server.connect() as conn:
         cur = conn.cursor()
@@ -8277,3 +8283,87 @@ def test_describe_shapes_and_cursor_portals_match_postgres(home: Path) -> None:
             assert res.command_status == b"ALTER ROLE"
         finally:
             conn.finish()
+
+
+def test_catalog_changes_are_visible_across_connections(home: Path) -> None:
+    """The process-wide catalog cache never serves a stale or an uncommitted row.
+
+    Every step's expectation was measured on PostgreSQL 16 (2026-09-09): a
+    table created on one connection is found by another that had already
+    looked it up as missing; a block's uncommitted CREATE TYPE is its own
+    business until COMMIT; a DROP rolled back leaves the table for everyone;
+    a CREATE rolled back to a savepoint leaves nothing, on either connection.
+    """
+
+    def outcome(conn: psycopg.Connection, sql: str) -> object:
+        try:
+            return conn.execute(sql).fetchall()
+        except psycopg.Error as e:
+            if not conn.autocommit:
+                conn.rollback()
+            return e.sqlstate
+
+    with _Server(home) as server:
+        a = server.connect()
+        b = server.connect()
+        try:
+            # 1. A negative lookup on b must not outlive a's CREATE TABLE.
+            assert outcome(b, "select * from cc_t") == "42P01"
+            a.execute("create table cc_t (id int)")
+            assert outcome(b, "select * from cc_t") == []
+            a.execute("insert into cc_t values (1)")
+            assert outcome(b, "select * from cc_t") == [(1,)]
+
+            # 2. An uncommitted CREATE TYPE is visible to its block only.
+            a.autocommit = False
+            a.execute("create type cc_mood as enum ('sad', 'ok')")
+            assert outcome(a, "select 'ok'::cc_mood") == [("ok",)]
+            assert isinstance(outcome(b, "select 'ok'::cc_mood"), str)
+            a.commit()
+            assert outcome(b, "select 'ok'::cc_mood") == [("ok",)]
+
+            # 3. A DROP rolled back leaves the table, on both connections.
+            a.execute("drop table cc_t")
+            assert outcome(a, "select * from cc_t") == "42P01"
+            a.rollback()
+            assert outcome(b, "select * from cc_t") == [(1,)]
+            assert outcome(a, "select * from cc_t") == [(1,)]
+            a.rollback()
+
+            # 4. A CREATE rolled back to a savepoint leaves nothing.
+            a.execute("savepoint sp")
+            a.execute("create table cc_s (id int)")
+            assert outcome(a, "select * from cc_s") == []
+            a.execute("rollback to savepoint sp")
+            assert outcome(a, "select * from cc_s") == "42P01"
+            a.commit()
+            assert outcome(b, "select * from cc_s") == "42P01"
+
+            # 5. b's autocommit CREATE is found by a once a's block ends.
+            b.execute("create table cc_s (id int, v text)")
+            a.commit()
+            assert outcome(a, "select * from cc_s") == []
+        finally:
+            a.close()
+            b.close()
+
+
+def test_now_casts_to_text_in_session_zone(home: Path) -> None:
+    """`now()::text` carries the session-zone offset, like PostgreSQL 16.
+
+    A timestamptz instant is stored exactly like a naive timestamp, so the cast
+    has to learn the source type from the expression; before that it rendered
+    `2026-09-09 20:58:09.043676` where PostgreSQL renders `...+00` under UTC.
+    `current_timestamp` inside an expression is the same value.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("set timezone to 'UTC'")
+        cur.execute("select now()::text, current_timestamp::text, pg_typeof(now())::text")
+        now_text, ts_text, typ = cur.fetchone()
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d{1,6})?\+00", now_text)
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d{1,6})?\+00", ts_text)
+        assert typ == "timestamp with time zone"
+        cur.execute("set timezone to 'Europe/Dublin'")
+        cur.execute("select now()::text")
+        assert re.search(r"\+0[01]$", cur.fetchone()[0])

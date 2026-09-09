@@ -1180,19 +1180,46 @@ pub fn split_statements(sql: &str) -> Result<Vec<String>> {
         .collect())
 }
 
+/// The parse tree of `sql`, from a process-wide memo. One statement is
+/// parsed several times on its way through the server -- at Describe, at
+/// Execute, and once more each for parameter typing -- and `pg_query` parses
+/// through C and a protobuf round trip, which was the largest single cost of
+/// an `executemany` once the catalog stopped being re-read (2026-09-09). The
+/// text is the whole input to the parser, so the tree is a pure function of
+/// it. Bounded by wholesale clearing: statement text in a loop repeats, and
+/// a rebuilt memo costs one parse per distinct text.
+fn parse_tree(sql: &str) -> Result<std::sync::Arc<pg_query::protobuf::ParseResult>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    const MAX_ENTRIES: usize = 4096;
+    static MEMO: OnceLock<Mutex<HashMap<String, Arc<pg_query::protobuf::ParseResult>>>> =
+        OnceLock::new();
+    let memo = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(tree) = memo.lock().unwrap_or_else(|e| e.into_inner()).get(sql) {
+        return Ok(Arc::clone(tree));
+    }
+    let tree = Arc::new(pg_query::parse(sql).map_err(parse_error)?.protobuf);
+    let mut guard = memo.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.len() >= MAX_ENTRIES {
+        guard.clear();
+    }
+    guard.insert(sql.to_string(), Arc::clone(&tree));
+    Ok(tree)
+}
+
 fn parse_one(sql: &str) -> Result<N> {
-    let parsed = pg_query::parse(sql).map_err(parse_error)?;
-    let mut stmts = parsed.protobuf.stmts;
+    let parsed = parse_tree(sql)?;
+    let stmts = &parsed.stmts;
     if stmts.len() > 1 {
         return Err(Error::MultipleCommands);
     }
     if stmts.is_empty() {
         return Err(Error::Parse("empty statement".into()));
     }
-    stmts
-        .remove(0)
+    stmts[0]
         .stmt
-        .and_then(|s| s.node)
+        .as_ref()
+        .and_then(|s| s.node.clone())
         .ok_or_else(|| Error::Parse("empty statement".into()))
 }
 
@@ -1800,6 +1827,18 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                             let Some(raw) = k.raw_expr.as_ref() else {
                                 continue;
                             };
+                            // A DEFAULT is evaluated ONCE here and stored as a
+                            // value, so a volatile function -- `now()` -- would
+                            // be frozen at CREATE time and every later row
+                            // would carry the table's creation instant where
+                            // PostgreSQL stamps each INSERT. Refuse it rather
+                            // than store the wrong value silently.
+                            if default_is_volatile(raw) {
+                                return Err(Error::Unsupported(format!(
+                                    "a non-literal DEFAULT on column \"{}\"",
+                                    cd.colname
+                                )));
+                            }
                             let value = match const_value(raw, &[]) {
                                 Ok(v) => v,
                                 Err(Error::Unsupported(_)) => {
@@ -4189,6 +4228,21 @@ fn session_function(name: &str) -> Option<Bson> {
 /// `SELECT $1 + 1` evaluates to NULL at describe time. Typing that column from
 /// the value would call it `text`; the operator says `int4`. This is the same
 /// trap that made `$1::int` decode as a string.
+/// Whether a DEFAULT expression calls a function whose value changes from row
+/// to row (`now()` and its siblings, `current_timestamp`). The planner stores a
+/// DEFAULT as one evaluated value, which such a function cannot be.
+fn default_is_volatile(node: &pg_query::protobuf::Node) -> bool {
+    match node.node.as_ref() {
+        Some(N::FuncCall(f)) => matches!(
+            func_name(f).as_deref(),
+            Some("now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp")
+        ),
+        Some(N::SqlvalueFunction(_)) => true,
+        Some(N::TypeCast(tc)) => tc.arg.as_deref().is_some_and(default_is_volatile),
+        _ => false,
+    }
+}
+
 fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
     match node.node.as_ref() {
         Some(N::TypeCast(tc)) => tc
@@ -4262,6 +4316,24 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
         },
         Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("to_regtype") => {
             "regtype".to_string()
+        }
+        // `now()` and its siblings are `timestamptz`. The value alone cannot
+        // say so -- a timestamptz INSTANT is stored exactly like a naive
+        // `timestamp` -- so `now()::text` rendered the wall clock with no zone
+        // suffix where PostgreSQL renders `... +00` in the session zone.
+        Some(N::FuncCall(f))
+            if matches!(
+                func_name(f).as_deref(),
+                Some("now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp")
+            ) =>
+        {
+            "timestamptz".to_string()
+        }
+        Some(N::SqlvalueFunction(svf))
+            if pg_query::protobuf::SqlValueFunctionOp::try_from(svf.op)
+                == Ok(pg_query::protobuf::SqlValueFunctionOp::SvfopCurrentTimestamp) =>
+        {
+            "timestamptz".to_string()
         }
         // `int4range(1,5)` is an `int4range`, not the text it renders as.
         Some(N::FuncCall(f)) if range_constructor_type(f).is_some() => {
@@ -8972,11 +9044,11 @@ fn static_range_type(n: Option<&pg_query::protobuf::Node>) -> Option<String> {
 /// what PostgreSQL does for a parameter with no context: an error.
 pub fn infer_param_types(sql: &str, declared: &[Option<String>]) -> Vec<Option<String>> {
     let mut inferred = declared.to_vec();
-    let Ok(parsed) = pg_query::parse(sql) else {
+    let Ok(parsed) = parse_tree(sql) else {
         return inferred;
     };
     let previous_types = PLAN_PARAM_TYPES.with(|t| t.replace(declared.to_vec()));
-    for (node, _, _, _) in parsed.protobuf.nodes() {
+    for (node, _, _, _) in parsed.nodes() {
         // `$1::int4range`: a cast names the parameter's type outright, which
         // is how PostgreSQL types an unknown parameter under a cast. Only a
         // range-family target: that is the one family psycopg sends untyped.
@@ -9103,6 +9175,25 @@ fn static_text_type(n: Option<&pg_query::protobuf::Node>) -> Option<String> {
 /// oid list, so a describe of `select $1::uuid` answered "there is no
 /// parameter $1" -- PostgreSQL infers the parameter from the SQL.
 pub fn max_param_number(sql: &str) -> usize {
+    // Memoised like `parse_tree`, for the same reason: this runs once per
+    // Describe and once per Execute, and the scan goes through C.
+    const MAX_ENTRIES: usize = 4096;
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+        std::sync::OnceLock::new();
+    let memo = MEMO.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Some(n) = memo.lock().unwrap_or_else(|e| e.into_inner()).get(sql) {
+        return *n;
+    }
+    let n = scan_max_param_number(sql);
+    let mut guard = memo.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.len() >= MAX_ENTRIES {
+        guard.clear();
+    }
+    guard.insert(sql.to_string(), n);
+    n
+}
+
+fn scan_max_param_number(sql: &str) -> usize {
     // The LEXER, not the parse tree: pg_query's `nodes()` walks a curated
     // subset of each statement (a SELECT's target list, WHERE, FROM, ...)
     // and skips a VALUES list, a RETURNING clause and an UPDATE's SET, so
@@ -9170,8 +9261,8 @@ pub fn catalog_param_types_opt(
         Some(N::ParamRef(p)) => usize::try_from(p.number).ok()?.checked_sub(1),
         _ => None,
     };
-    if let Ok(parsed) = pg_query::parse(sql) {
-        for (node, _, _, _) in parsed.protobuf.nodes() {
+    if let Ok(parsed) = parse_tree(sql) {
+        for (node, _, _, _) in parsed.nodes() {
             match node {
                 pg_query::NodeRef::TypeCast(tc) => {
                     let Some(i) = tc.arg.as_deref().and_then(param_index) else {
@@ -10906,6 +10997,14 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 types.push(t);
             }
             Ok(typed_record_value(fields, types))
+        }
+        // `current_timestamp` inside an expression (`current_timestamp::text`)
+        // is `now()`; the bare-column form is handled by `plan_select_constant`.
+        Some(N::SqlvalueFunction(svf))
+            if pg_query::protobuf::SqlValueFunctionOp::try_from(svf.op)
+                == Ok(pg_query::protobuf::SqlValueFunctionOp::SvfopCurrentTimestamp) =>
+        {
+            Ok(scalar::now_value())
         }
         Some(other) => Err(Error::Unsupported(disc(other))),
         None => Err(Error::Parse("empty constant".into())),
