@@ -35,12 +35,17 @@ INCLUDE = [
     "tests/test_query.py",
     "tests/test_rows.py",
     "tests/test_sql.py",
-    "tests/test_tstring.py",
     "tests/test_typeinfo.py",
     "tests/test_typing.py",
     "tests/test_transaction.py",
     "tests/types",
 ]
+
+# t-string syntax (PEP 750) parses only on 3.14+. Upstream's conftest
+# collect_ignores the file below that, but an explicitly listed path bypasses
+# collect_ignore and errors at collection — so list it under the same gate.
+if sys.version_info[:2] >= (3, 14):
+    INCLUDE.append("tests/test_tstring.py")
 
 # Individual node ids excluded from the run (NOT counted as failures), each
 # with a reason. Prefer fixing the server; deselect only test-infrastructure
