@@ -311,10 +311,9 @@ fn shapes_sqlglot_mis_parses_reach_us_as_real_statements() {
     // `NOTIFY chan, 'payload'` and `LISTEN chan` used to live here too; all
     // five now EXECUTE rather than merely parsing, which is the stronger
     // result.
-    for sql in ["COPY t FROM stdin WITH (freeze on)"] {
-        let err = plan(sql, &lookup).expect_err(sql);
-        assert_eq!(err.sqlstate(), "0A000", "for {sql} (got {err})");
-    }
+    let sql = "COPY t FROM stdin WITH (freeze on)";
+    let err = plan(sql, &lookup).expect_err(sql);
+    assert_eq!(err.sqlstate(), "0A000", "for {sql} (got {err})");
     assert_eq!(
         plan_ok("NOTIFY chan, 'payload'"),
         Statement::Notify {

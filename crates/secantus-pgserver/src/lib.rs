@@ -173,14 +173,18 @@ fn backend_registry() -> &'static Mutex<HashMap<i32, Arc<BackendEntry>>> {
 /// the read is served but not kept -- a snapshot taken before another
 /// connection's `CREATE TABLE` committed must not be published as current,
 /// and a block's own uncommitted `CREATE TYPE` must not be seen by others.
+/// A cache map keyed on `(storage, db, name)`, each value tagged with the
+/// catalog version it was read under.
+type VersionedMap<K, V> = Mutex<HashMap<(usize, String, K), (u64, V)>>;
+
 struct CatalogCache {
     version: std::sync::atomic::AtomicU64,
     /// `(storage, db, collection)` -> the decoded rows of one type-catalog
     /// collection, `_id`-sorted.
-    entries: Mutex<HashMap<(usize, String, &'static str), (u64, Arc<Vec<Document>>)>>,
+    entries: VersionedMap<&'static str, Arc<Vec<Document>>>,
     /// `(storage, db, table)` -> its decoded catalog entry; `None` records
     /// that the table does not exist.
-    tables: Mutex<HashMap<(usize, String, String), (u64, Option<TableDef>)>>,
+    tables: VersionedMap<String, Option<TableDef>>,
 }
 
 fn catalog_cache() -> &'static CatalogCache {
