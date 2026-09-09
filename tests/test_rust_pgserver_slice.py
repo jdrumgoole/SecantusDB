@@ -7177,3 +7177,59 @@ def test_create_and_drop_database(home: Path) -> None:
     # The registry is persisted: the database survives a restart.
     with _Server(home) as server, server.connect(dbname="probe_x") as conn:
         assert conn.execute("select current_database()").fetchone() == ("probe_x",)
+
+
+def test_the_first_ddl_on_a_fresh_store_does_not_block_a_second_connection(home: Path) -> None:
+    """Two connections may both create objects on a store nobody has written to.
+
+    The catalog collections (`__sql_catalog__`, `__sql_schemas__`,
+    `__sql_enum_meta__`) were created lazily, on the transaction session of
+    whichever statement first needed them. Inside an open transaction that
+    row stayed uncommitted, and a second connection's identical lazy create
+    then hit WiredTiger's WriteConflict -- so `test_copy_table_across`, which
+    creates a table on a fresh store from one connection and then a second
+    table from another, failed with an internal error that PostgreSQL never
+    raises. The collections are now created OUTSIDE the user transaction
+    (measured 2026-09-09).
+    """
+    with _Server(home) as server:
+        with (
+            server.connect(autocommit=False) as first,
+            server.connect(autocommit=False) as second,
+        ):
+            first.execute("create table t1 (a int)")
+            first.execute("insert into t1 values (1)")
+            second.execute("create table t2 (b text)")
+            second.execute("insert into t2 values ('x')")
+            first.commit()
+            second.commit()
+        with server.connect() as conn:
+            assert conn.execute("select a from t1").fetchall() == [(1,)]
+            assert conn.execute("select b from t2").fetchall() == [("x",)]
+
+        # The same shape for the schema and type catalogs, which are separate
+        # collections and so still unwritten at this point.
+        with (
+            server.connect(autocommit=False) as first,
+            server.connect(autocommit=False) as second,
+        ):
+            first.execute("create schema s1")
+            second.execute("create schema s2")
+            # The type oid counter is minted OUTSIDE the block like
+            # PostgreSQL's OID counter: two open blocks advance it
+            # independently, and one that rolls back just skips an oid.
+            first.execute("create type e1 as enum ('a')")
+            second.execute("create type e2 as enum ('b')")
+            first.execute("create type c1 as (x int)")
+            second.execute("create type c2 as (y int)")
+            first.commit()
+            second.rollback()
+        with server.connect() as conn:
+            conn.execute("create type e3 as enum ('c')")
+            assert conn.execute("select 'a'::e1, 'c'::e3").fetchone() == ("a", "c")
+            oids = conn.execute(
+                "select typname, oid from pg_type where typname in ('e1', 'e2', 'e3', 'c1', 'c2')"
+                " order by typname"
+            ).fetchall()
+            assert [n for n, _ in oids] == ["c1", "e1", "e3"]
+            assert len({o for _, o in oids}) == 3

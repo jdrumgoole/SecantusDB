@@ -6108,6 +6108,28 @@ impl Storage {
         })
     }
 
+    /// Run `f` OUTSIDE the thread's user transaction, if one is installed:
+    /// every storage call it makes runs on its own autocommit session and is
+    /// committed on return, whatever the enclosing transaction later does.
+    ///
+    /// For server bookkeeping that must not ride the user's block -- a
+    /// counter minted like PostgreSQL's OID counter, which two open
+    /// transactions advance independently and a `ROLLBACK` never rewinds.
+    /// Advanced inside the block, the counter row was one key both blocks
+    /// rewrote, and the second hit a WiredTiger write conflict. Nested /
+    /// re-entrant use is safe: the previous state is restored on return,
+    /// panic included.
+    pub fn outside_user_transaction<T>(&self, f: impl FnOnce() -> T) -> T {
+        struct Restore(*const Session);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                ACTIVE_TXN_SESSION.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(ACTIVE_TXN_SESSION.with(|c| c.replace(std::ptr::null())));
+        f()
+    }
+
     /// Run `f` with `handle`'s session installed as this thread's transaction
     /// session (beginning the WT transaction lazily on first entry). Every
     /// storage call `f` makes routes through that session, so it executes inside

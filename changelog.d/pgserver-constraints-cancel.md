@@ -54,3 +54,11 @@ refused at CREATE (`42703`, `42830`).
   (libpq `PQprepare` with `nParams = 0`) sizes its parameters from the lexer,
   so `insert into t values ($1, $2)` no longer fails with `there is no
   parameter $1` — pg_query's node walk skips a VALUES list.
+- Rust PostgreSQL server: the first DDL on a fresh store no longer fails a
+  second connection with a WiredTiger `WriteConflict`. The `__sql_*` catalog
+  collections were registered lazily inside whichever block first needed one,
+  and a block that began before the row landed could not see it; they are
+  now created before a transaction handle opens. The enum / composite type
+  oid counter is likewise advanced outside the block, like PostgreSQL's OID
+  counter, so two open `CREATE TYPE` blocks no longer conflict (a rolled-back
+  block just skips an oid).

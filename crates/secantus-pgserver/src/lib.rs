@@ -1584,6 +1584,45 @@ impl PgHandler {
         Ok(out)
     }
 
+    /// Every `__sql_*` catalog collection, created (empty) before a
+    /// transaction handle opens, so their registry rows are committed on
+    /// their own rather than as part of the user's block.
+    ///
+    /// Lazily creating one inside the block was a real bug (2026-09-09): the
+    /// first `CREATE TABLE` in a store registered `__sql_catalog__` in
+    /// connection 1's uncommitted transaction, and a `CREATE TABLE` of a
+    /// DIFFERENT table on connection 2 then wrote the same registry row and
+    /// failed with a WiredTiger `WriteConflict` -- where PostgreSQL runs the
+    /// two independently. Creating them outside the block but per statement
+    /// was not enough either: a WiredTiger transaction reads its snapshot,
+    /// so a block that began before the registry row landed could not see
+    /// it, tried to register the collection again, and hit the same
+    /// conflict (`create schema s; create type e as enum (...)` on a fresh
+    /// store did exactly that). The rows are server bookkeeping, not
+    /// something a `ROLLBACK` should undo, so they belong before the block.
+    const CATALOG_COLLECTIONS: [&'static str; 7] = [
+        CATALOG_COLLECTION,
+        SEQUENCE_COLLECTION,
+        Self::SCHEMA_COLLECTION,
+        Self::COMPOSITE_COLLECTION,
+        Self::ENUM_COLLECTION,
+        Self::ENUM_META_COLLECTION,
+        Self::RANGE_COLLECTION,
+    ];
+
+    /// Open a transaction handle, with every catalog collection registered
+    /// first (see `CATALOG_COLLECTIONS`). The WiredTiger transaction itself
+    /// begins lazily on the first statement, so the rows are committed and
+    /// visible before its snapshot is taken.
+    fn open_transaction_handle(&self) -> PgWireResult<UserTransactionHandle> {
+        for coll in Self::CATALOG_COLLECTIONS {
+            self.ensure_collection(coll)?;
+        }
+        self.storage
+            .begin_user_transaction()
+            .map_err(|e| Self::storage_err("could not begin a transaction", e))
+    }
+
     /// Make sure a catalog collection exists before writing to it: a delete or
     /// insert against a collection nobody created yet is a WiredTiger ENOENT,
     /// not a no-op. Reads tolerate the absence; writes must not.
@@ -1789,6 +1828,31 @@ impl PgHandler {
         None
     }
 
+    /// Mint an enum / composite oid the way PostgreSQL mints an OID: from a
+    /// counter OUTSIDE the user's transaction, under one process-wide lock.
+    /// Advanced inside the block, the counter row was one key that two open
+    /// `CREATE TYPE` blocks both rewrote, and the second failed with a
+    /// WiredTiger write conflict where PostgreSQL runs them independently
+    /// (2026-09-09). An oid minted by a block that rolls back is simply
+    /// skipped, as PostgreSQL skips one. The lock makes the read-rewrite of
+    /// the counter atomic across connections.
+    fn mint_oid_outside_transaction(
+        &self,
+        mint: impl FnOnce() -> PgWireResult<i64>,
+    ) -> PgWireResult<i64> {
+        static OID_MINT: Mutex<()> = Mutex::new(());
+        let _serial = OID_MINT.lock().unwrap_or_else(|e| e.into_inner());
+        self.storage.outside_user_transaction(mint)
+    }
+
+    fn mint_enum_oid(&self) -> PgWireResult<i64> {
+        self.mint_oid_outside_transaction(|| self.mint_enum_oid_in_session())
+    }
+
+    fn mint_composite_oid(&self) -> PgWireResult<i64> {
+        self.mint_oid_outside_transaction(|| self.mint_composite_oid_in_session())
+    }
+
     /// Mint the next range-type oid -- the enum minting rule, base 69000.
     fn mint_range_oid(&self) -> PgWireResult<i64> {
         let existing = self.ranges()?;
@@ -1801,7 +1865,7 @@ impl PgHandler {
 
     /// Mint the next composite oid -- the enum minting rule, own counter and
     /// base 67000, monotonic and never reused.
-    fn mint_composite_oid(&self) -> PgWireResult<i64> {
+    fn mint_composite_oid_in_session(&self) -> PgWireResult<i64> {
         let key = "composite_oid_counter";
         let counter = self
             .storage
@@ -1902,7 +1966,7 @@ impl PgHandler {
     /// counter, else start above everything already taken; rewrite the counter
     /// as `next = oid + 1`. Monotonic and never reused -- positional minting
     /// would renumber types under a client that registered loaders by oid.
-    fn mint_enum_oid(&self) -> PgWireResult<i64> {
+    fn mint_enum_oid_in_session(&self) -> PgWireResult<i64> {
         let counter = self
             .storage
             .find_matching(
@@ -3873,10 +3937,7 @@ impl PgHandler {
     }
 
     fn begin_implicit(&self) -> PgWireResult<()> {
-        let handle = self
-            .storage
-            .begin_user_transaction()
-            .map_err(|e| Self::storage_err("could not begin a transaction", e))?;
+        let handle = self.open_transaction_handle()?;
         *self.txn.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
         self.in_transaction
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -3902,10 +3963,7 @@ impl PgHandler {
         if guard.is_some() {
             return Ok(());
         }
-        let handle = self
-            .storage
-            .begin_user_transaction()
-            .map_err(|e| Self::storage_err("could not begin a transaction", e))?;
+        let handle = self.open_transaction_handle()?;
         *guard = Some(handle);
         self.group_failed
             .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -4804,10 +4862,7 @@ impl PgHandler {
                 return Ok(());
             }
             if guard.is_none() {
-                let handle = self
-                    .storage
-                    .begin_user_transaction()
-                    .map_err(|e| Self::storage_err("could not begin a transaction", e))?;
+                let handle = self.open_transaction_handle()?;
                 *guard = Some(handle);
                 self.in_transaction
                     .store(true, std::sync::atomic::Ordering::Relaxed);
