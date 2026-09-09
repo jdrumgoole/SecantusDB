@@ -6953,11 +6953,33 @@ fn sniff_text(text: &str) -> Bson {
 
 impl PgHandler {
     /// Every bound parameter of a portal, decoded in order.
-    fn portal_params<S>(&self, portal: &Portal<S>) -> PgWireResult<Vec<Bson>>
+    ///
+    /// `param_types` is the planner name for each parameter -- the client's
+    /// declaration, or the type INFERRED from the statement when the client
+    /// gave none (`infer_param_types`). A parameter the client left untyped
+    /// but the statement compares against a range is decoded AS that range:
+    /// psycopg's bare `Range(empty=True)` arrives with oid 0 and, in binary,
+    /// as the single flag byte `\x01`, which read as text is a control
+    /// character and not a range at all. Only the inferred name can route it
+    /// to the range decoder.
+    fn portal_params<S>(
+        &self,
+        portal: &Portal<S>,
+        param_types: &[Option<String>],
+    ) -> PgWireResult<Vec<Bson>>
     where
         S: Clone + Send + Sync,
     {
-        let declared = &portal.statement.parameter_types;
+        let declared: Vec<Option<Type>> = portal
+            .statement
+            .parameter_types
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                t.clone()
+                    .or_else(|| param_types.get(i).and_then(|n| n.as_deref()).map(wire_type))
+            })
+            .collect();
         let oids = &portal.statement.parameter_oids;
         let tz = self.session_timezone();
         let cenc = self.client_encoding();
@@ -7284,8 +7306,11 @@ impl ExtendedQueryHandler for PgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         self.note_result_format(&portal.result_column_format);
-        let params = self.portal_params(portal)?;
-        let param_types = self.param_type_names(portal.statement.as_ref());
+        let param_types = secantus_pgplan::infer_param_types(
+            &portal.statement.statement.sql,
+            &self.param_type_names(portal.statement.as_ref()),
+        );
+        let params = self.portal_params(portal, &param_types)?;
         let mut responses = self
             .run_typed(
                 &portal.statement.statement.sql,

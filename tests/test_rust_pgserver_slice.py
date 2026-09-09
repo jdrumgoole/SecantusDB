@@ -3063,9 +3063,58 @@ def test_a_literal_beside_a_range_array_parameter_takes_its_type(home: Path, bin
         # the range error, not a string mismatch.
         with pytest.raises(psycopg.errors.DataException) as exc:
             cur.execute("""select '{"[5,1]"}' = %s""", ([Int4Range(1, 5, "[]")],))
-        assert "range lower bound must be less than or equal to range upper bound" in str(
-            exc.value
+        assert "range lower bound must be less than or equal to range upper bound" in str(exc.value)
+
+
+def test_an_untyped_binary_range_parameter_takes_its_type_from_context(home: Path) -> None:
+    """A bare `Range(empty=True)` bound in BINARY beside a typed range.
+
+    psycopg sends an untyped `Range` / `Multirange` with oid 0, and in binary
+    that is a flag byte (`\\x01` = empty) or an int32 count -- bytes that are
+    only a range once something says which range. PostgreSQL's analysis pass
+    gives the parameter the type of the operand it is compared against; the
+    server now infers the same from the statement before decoding, so the
+    byte reaches the range decoder instead of being read as text (which
+    answered False for every one of these). Values measured against
+    PostgreSQL 16, including that a parameter with NO context is still 42P18.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor(binary=True)
+        cur.execute("select 'empty'::int4range = %b", (Range(empty=True),))
+        assert cur.fetchone()[0] is True
+        cur.execute(
+            "select 'empty'::numrange = %b, 'empty'::tstzrange = %b",
+            (Range(empty=True), Range(empty=True)),
         )
+        assert cur.fetchone() == (True, True)
+        cur.execute(
+            "select '[1,5)'::int4range = %b, %b = '[1,5)'::int4range",
+            (Range(1, 5), Range(1, 5)),
+        )
+        assert cur.fetchone() == (True, True)
+        cur.execute("select '[1,5)'::int4range = %b", (Range(1, 6),))
+        assert cur.fetchone()[0] is False
+        cur.execute(
+            "select int4range(NULL::int4, NULL::int4, '()') = %b",
+            (Range(None, None, "()"),),
+        )
+        assert cur.fetchone()[0] is True
+        cur.execute("select '{}'::int4multirange = %b", (Multirange(),))
+        assert cur.fetchone()[0] is True
+        cur.execute(
+            "select int4multirange(%s::int4range) = %b",
+            (Range(empty=True), Multirange([Range(empty=True)])),
+        )
+        assert cur.fetchone()[0] is True
+        cur.execute("select '{[1,5)}'::int4multirange = %b", (Multirange([Range(1, 5)]),))
+        assert cur.fetchone()[0] is True
+        # No context, no type: PostgreSQL refuses, and so do we.
+        with pytest.raises(psycopg.errors.IndeterminateDatatype) as exc:
+            cur.execute(
+                "select 'empty'::int4range = %b, pg_typeof(%b)::text",
+                (Range(empty=True), Range(empty=True)),
+            )
+        assert "could not determine data type of parameter $2" in str(exc.value)
 
 
 def test_pg_typeof_reports_the_type_the_client_declared(home: Path) -> None:

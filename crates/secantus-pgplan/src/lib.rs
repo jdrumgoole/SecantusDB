@@ -6398,11 +6398,65 @@ fn static_range_type(n: Option<&pg_query::protobuf::Node>) -> Option<String> {
         // array of either (psycopg sends `[Int4Range(...)]` as `_int4range`).
         // The declared type is what PostgreSQL resolves the literal beside it
         // to; the decoded value alone says only "an array of strings".
-        Some(N::ParamRef(p)) => {
-            named(declared_param_type(usize::try_from(p.number).unwrap_or(0))?)
-        }
+        Some(N::ParamRef(p)) => named(declared_param_type(usize::try_from(p.number).unwrap_or(0))?),
         _ => None,
     }
+}
+
+/// The range-family type each UNDECLARED parameter takes from its context.
+///
+/// PostgreSQL's analysis pass gives an `unknown` parameter the type of the
+/// operand it is compared against, so `'empty'::int4range = $1` makes `$1`
+/// an `int4range` before the value is ever looked at. That matters for a
+/// BINARY parameter: psycopg sends a bare `Range(empty=True)` with no type
+/// at all, and its binary form is the single flag byte `\x01` -- which is
+/// only a range once something says WHICH range. The wire layer asks this
+/// before decoding, so the byte reaches the range decoder instead of being
+/// read as text.
+///
+/// `declared` is what the client said for each `$n` (`None` = unspecified);
+/// only the unspecified ones are inferred, and only from a comparison where
+/// the other side is STATICALLY a range (a constructor, a cast, or a declared
+/// parameter). Anything else stays `None`, so `pg_typeof($1)` still reports
+/// what PostgreSQL does for a parameter with no context: an error.
+pub fn infer_param_types(sql: &str, declared: &[Option<String>]) -> Vec<Option<String>> {
+    let mut inferred = declared.to_vec();
+    let Ok(parsed) = pg_query::parse(sql) else {
+        return inferred;
+    };
+    let previous_types = PLAN_PARAM_TYPES.with(|t| t.replace(declared.to_vec()));
+    for (node, _, _, _) in parsed.protobuf.nodes() {
+        let pg_query::NodeRef::AExpr(e) = node else {
+            continue;
+        };
+        if !matches!(
+            operator_name(e),
+            Ok("=" | "<>" | "!=" | "<" | "<=" | ">" | ">=")
+        ) {
+            continue;
+        }
+        let param_index =
+            |n: Option<&pg_query::protobuf::Node>| match n.and_then(|x| x.node.as_ref()) {
+                Some(N::ParamRef(p)) => usize::try_from(p.number).ok()?.checked_sub(1),
+                _ => None,
+            };
+        for (param, other) in [
+            (e.lexpr.as_deref(), e.rexpr.as_deref()),
+            (e.rexpr.as_deref(), e.lexpr.as_deref()),
+        ] {
+            let Some(i) = param_index(param) else {
+                continue;
+            };
+            if inferred.get(i).is_some_and(Option::is_some) {
+                continue;
+            }
+            if let (Some(slot), Some(name)) = (inferred.get_mut(i), static_range_type(other)) {
+                *slot = Some(name);
+            }
+        }
+    }
+    PLAN_PARAM_TYPES.with(|t| *t.borrow_mut() = previous_types);
+    inferred
 }
 
 /// A range, a multirange, or an array of either.
