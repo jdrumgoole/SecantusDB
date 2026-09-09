@@ -6723,47 +6723,39 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `findAndModify` over the same corpus is 0 of 160 -- the fixes reach it
   through the shared update path, and it introduces nothing of its own.
 
-- [ ] **OPEN — `$toDate` ACCEPTANCE: mongod runs timelib's FULL date parser and
-  we implement a small ISO-8601 subset (measured 8.2.11, 2026-09-09).** Distinct
-  from the "`$toDate` of an UNPARSEABLE string -- WON'T FIX" note further down,
-  which is about the per-position DIAGNOSTIC. This is about which strings parse
-  at all, and a wrong answer outranks a wrong message.
+- [x] **RESOLVED 2026-09-09 — `$toDate` runs TIMELIB, and both servers now
+  match its format table.** This entry was re-sized three times in one day --
+  "2 shapes, messages only", then "8 of 12, three wrong ANSWERS", then the
+  present understanding -- and every earlier version was written with
+  confidence. A claim from an N-shape probe measures the PROBE, not the area.
 
-  | string | mongod | ours |
-  | --- | --- | --- |
-  | `"12/31/2020"` | 2020-12-31 | reject |
-  | `"1/2/2020"` | 2020-01-02 | reject |
-  | `"12/31/2020 10:30"` | 2020-12-31 10:30 | reject |
-  | `"2020/12/31"` | 2020-12-31 | reject |
-  | `"Dec 31 2020"` | 2020-12-31 | reject |
-  | `"31 Dec 2020"` | 2020-12-31 | reject |
-  | `"20200101"` | 2020-01-01 | reject |
-  | `"2020-1-1"` | 2020-01-01 | reject |
-  | `"@1577836800"` | 2020-01-01 | reject |
-  | `"2020-W01-1"` | 2019-12-30 | reject |
-  | `"2020-01-01T"` / `"...t"` | 2020-01-01 **07:00:00** | reject |
+  mongod's `$toDate` is timelib's parser, not an ISO-8601 one. 15 of 19 shapes
+  diverged; both servers now match on all 45, refusals included.
 
-  **This entry replaces one written EARLIER THE SAME DAY that said "3 shapes",
-  and that entry was wrong twice over.** It undercounted (an 18-string sweep
-  found a whole format table, not three strings), and it claimed "Rust rejects
-  a trailing space where Python and mongod accept" -- which came from a 12-string
-  sweep run against a STALE Rust binary. All three servers accept
-  `"2020-01-01 "`, `"  2020-01-01"`, `"2020-01-01\t"`, `"2020-01-01T00"` and
-  `"2020-01-01T10:00:00.5"` today. Rebuild the binary before believing a
-  Rust-vs-Python difference.
+  Three rules, measured rather than assumed:
 
-  **Sizing: this is porting timelib's format repertoire, not three fixes.** Two
-  sub-decisions before starting:
+  - **US-first by RULE.** `31/12/2020` is refused outright, so `MM/DD/YYYY` wins
+    and day-first is not a fallback.
+  - **A trailing letter is a MILITARY TIMEZONE**, not the ISO separator:
+    `"2020-01-01T"` is `07:00:00` because `T` is UTC-7. That is what the earlier
+    "looks host-dependent, measure on TZ=UTC" caution was actually seeing --
+    the value is deterministic. `J` is invalid, as on mongod. Verified across
+    ten letters.
+  - **An out-of-range component is a parse FAILURE**, not a rollover:
+    `13/01/2020` and `12/32/2020` are both refused.
 
-  1. The slash form is US-first and that is deliberate, not incidental --
-     `"31/12/2020"` is REFUSED (`241 0: Unexpected character '3'`), so
-     `MM/DD/YYYY` wins over `DD/MM/YYYY` by locale rule.
-  2. ~~`"2020-01-01T"` answering **07:00:00** looks host-dependent.~~
-     **Measured and WITHDRAWN (2026-09-09):** a `TZ=UTC` mongod answers
-     07:00:00 too, so it is deterministic timelib behaviour for a bare trailing
-     `T`, not host-local leakage. Unlike the `$toLower`-of-a-Timestamp item,
-     which the same probe confirmed IS host-dependent, nothing here is blocked
-     on a timezone decision.
+  Also accepted: `YYYY/MM/DD`, month names either order with optional comma,
+  non-padded ISO, `@<unix seconds>` (negative and fractional), compact
+  `YYYYMMDD[THHMMSS]`, ISO week dates, an hour with no minutes, surrounding
+  whitespace.
+
+  **Unchanged:** mongod's per-position timelib DIAGNOSTIC stays deferred -- it
+  needs timelib's lexer and abbreviation tables, and inventing a position would
+  look authoritative and be wrong.
+
+  Sweep `tools/probes/todate_string_formats.py`; gates
+  `tests/test_todate_string_formats.py` and
+  `tests/test_mongod_differential.py -k todate`.
 
 - [x] **RESOLVED 2026-09-09 — the decimal trig/hyperbolic family, and the
   "correctly-rounded vs track-mongod" question is SETTLED by measurement.**

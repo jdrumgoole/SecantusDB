@@ -5094,6 +5094,155 @@ def _epoch_millis_to_date(millis: float) -> Any:
         return DatetimeMS(int(millis))
 
 
+#: timelib's MILITARY timezone letters, which mongod inherits: `A`-`I` are
+#: UTC+1..+9, `J` is invalid ("local"), `K`-`M` are +10..+12, `N`-`Y` are
+#: -1..-12 and `Z` is UTC. Measured on 8.2.11 (2026-09-09) across ten letters --
+#: this is why `{$toDate: "2020-01-01T"}` answers `07:00:00` rather than
+#: midnight: the trailing `T` is not the ISO date/time separator there, it is
+#: the zone UTC-7. The value is deterministic, NOT host-local (a `TZ=UTC` server
+#: answers the same).
+_MILITARY_ZONES = {
+    **{chr(ord("A") + i): i + 1 for i in range(9)},  # A..I -> +1..+9
+    **{"K": 10, "L": 11, "M": 12},
+    **{chr(ord("N") + i): -(i + 1) for i in range(12)},  # N..Y -> -1..-12
+    "Z": 0,
+}
+
+_MONTH_NAMES = {
+    m: i + 1
+    for i, full in enumerate(
+        [
+            "january",
+            "february",
+            "march",
+            "april",
+            "may",
+            "june",
+            "july",
+            "august",
+            "september",
+            "october",
+            "november",
+            "december",
+        ]
+    )
+    for m in (full, full[:3])
+}
+
+#: The non-ISO shapes timelib accepts, tried in order after the ISO path.
+#: Each returns `(year, month, day)`; the optional time is parsed separately.
+_DATE_PATTERNS = [
+    # US month-first slash form. `31/12/2020` is REFUSED by mongod, so this is
+    # a locale RULE and not ambiguity-resolution (measured 2026-09-09).
+    (re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{4})$"), ("m", "d", "y")),
+    # Year-first slash form, disambiguated by the four-digit leading field.
+    (re.compile(r"^(\d{4})/(\d{1,2})/(\d{1,2})$"), ("y", "m", "d")),
+    # Non-padded ISO. `fromisoformat` requires two digits.
+    (re.compile(r"^(\d{4})-(\d{1,2})-(\d{1,2})$"), ("y", "m", "d")),
+]
+
+_MONTH_FIRST = re.compile(r"^([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})$")
+_DAY_FIRST = re.compile(r"^(\d{1,2})\s+([A-Za-z]{3,9}),?\s+(\d{4})$")
+_AT_EPOCH = re.compile(r"^@(-?\d+)(\.\d+)?$")
+
+
+def _parse_clock(text: str) -> tuple[int, int, int, int] | None:
+    """`HH[:MM[:SS[.frac]]]` -> `(h, m, s, microseconds)`, or None."""
+    m = re.match(r"^(\d{1,2})(?::(\d{2}))?(?::(\d{2}))?(\.\d+)?$", text)
+    if not m:
+        return None
+    h, mi, se, frac = m.groups()
+    micro = 0
+    if frac:
+        # A BSON date holds whole milliseconds; timelib truncates past three.
+        micro = int(round(float(frac) * 1000)) * 1000
+    return int(h), int(mi or 0), int(se or 0), micro
+
+
+def _parse_timelib_forms(text: str) -> _dt.datetime | None:
+    """The non-ISO date shapes mongod accepts, or None if this is not one.
+
+    mongod's `$toDate` runs **timelib's** parser, not an ISO-8601 one, and
+    accepts a whole format table this server used to reject outright: the US
+    `MM/DD/YYYY` slash form, `YYYY/MM/DD`, month NAMES in either order,
+    non-padded ISO, and `@<unix seconds>`. Each shape was measured against
+    8.2.11 on 2026-09-09; the shapes NOT here (an ISO week date, the compact
+    `YYYYMMDD`) are already handled by `fromisoformat`.
+
+    Order matters: the month-NAME forms are matched against the whole string
+    before any split on whitespace, because their date part contains spaces --
+    a first version split first and could never see `Dec 31 2020`.
+    """
+    # These four are covered by `fromisoformat` on Python 3.11+ and NOT on
+    # 3.10, where it accepts only the strict ISO forms. Relying on it made the
+    # server's answer depend on which interpreter it runs under -- `20200101`
+    # parsed on 3.12 and raised on 3.10 -- which mongod's does not. Parsed
+    # explicitly here so every supported Python agrees (caught by CI's 3.10
+    # lane, 2026-09-09; the same trap `tasks`/the probe skill records for
+    # `TIMESTAMP '...'` in the SQL engine).
+    compact = re.match(r"^(\d{4})(\d{2})(\d{2})(?:[Tt](\d{2})(\d{2})(\d{2}))?$", text)
+    if compact:
+        y, mo, d, hh, mi, se = compact.groups()
+        return _build_datetime(int(y), int(mo), int(d), f"{hh}:{mi}:{se}" if hh is not None else "")
+    week = re.match(r"^(\d{4})-[Ww](\d{2})-(\d)$", text)
+    if week:
+        year, wk, day = (int(g) for g in week.groups())
+        if 1 <= wk <= 53 and 1 <= day <= 7:
+            # Week 1 holds the first Thursday and day 1 is Monday, so
+            # `2020-W01-1` is 2019-12-30.
+            jan4 = _dt.date(year, 1, 4)
+            week1_monday = jan4 - _dt.timedelta(days=jan4.weekday())
+            resolved = week1_monday + _dt.timedelta(weeks=wk - 1, days=day - 1)
+            return _dt.datetime(resolved.year, resolved.month, resolved.day)
+        return None
+    hour_only = re.match(r"^(\d{4}-\d{2}-\d{2})[Tt](\d{2})$", text)
+    if hour_only:
+        date_part, hour = hour_only.groups()
+        y, mo, d = (int(g) for g in date_part.split("-"))
+        return _build_datetime(y, mo, d, f"{hour}:00:00")
+    epoch = _AT_EPOCH.match(text)
+    if epoch:
+        whole, frac = epoch.groups()
+        seconds = int(whole) + (float(frac) if frac else 0.0)
+        return _dt.datetime(1970, 1, 1) + _dt.timedelta(seconds=seconds)
+    for pattern, day_first in ((_MONTH_FIRST, False), (_DAY_FIRST, True)):
+        m = pattern.match(text)
+        if not m:
+            continue
+        a, b, year = m.groups()
+        name, day = (b, a) if day_first else (a, b)
+        month = _MONTH_NAMES.get(name.lower())
+        if month:
+            return _build_datetime(int(year), month, int(day), "")
+    # The numeric forms may carry a trailing clock: `12/31/2020 10:30`.
+    body, _, clock = text.partition(" ")
+    for pattern, order in _DATE_PATTERNS:
+        m = pattern.match(body)
+        if not m:
+            continue
+        parts = dict(zip(order, (int(g) for g in m.groups()), strict=True))
+        return _build_datetime(parts["y"], parts["m"], parts["d"], clock.strip())
+    return None
+
+
+def _build_datetime(year: int, month: int, day: int, clock: str) -> _dt.datetime | None:
+    """Assemble a datetime, or None when a component is out of range.
+
+    mongod REFUSES `13/01/2020` and `12/32/2020`, so an out-of-range month or
+    day is a parse failure rather than a rollover.
+    """
+    hh = mm = ss = micro = 0
+    if clock:
+        parsed = _parse_clock(clock)
+        if parsed is None:
+            return None
+        hh, mm, ss, micro = parsed
+    try:
+        return _dt.datetime(year, month, day, hh, mm, ss, micro)
+    except ValueError:
+        return None
+
+
 def _parse_date_string(value: str) -> _dt.datetime:
     """mongod's string -> date conversion.
 
@@ -5145,6 +5294,24 @@ def _parse_date_string(value: str) -> _dt.datetime:
         if parsed.tzinfo is not None:
             parsed = parsed.astimezone(_dt.timezone.utc).replace(tzinfo=None)
         return parsed
+    # A trailing MILITARY zone letter, which is why `"2020-01-01T"` is 07:00:00
+    # and not midnight -- see `_MILITARY_ZONES`. Stripped and re-parsed, then
+    # the offset applied; `J` is deliberately absent from the table so it stays
+    # a parse error, as it is on mongod.
+    stripped = text[:-1].rstrip()
+    if len(text) > 1 and text[-1].upper() in _MILITARY_ZONES and stripped:
+        offset = _MILITARY_ZONES[text[-1].upper()]
+        try:
+            inner = _parse_date_string(stripped)
+        except ExpressionError:
+            inner = None
+        if inner is not None:
+            return inner - _dt.timedelta(hours=offset)
+    # The non-ISO shapes timelib accepts -- slash forms, month names,
+    # non-padded components, `@<unix seconds>`.
+    other = _parse_timelib_forms(text)
+    if other is not None:
+        return other
     raise ExpressionError(
         f'an incomplete date/time string has been found, with elements missing: "{value}"',
         code=241,

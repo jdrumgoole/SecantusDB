@@ -206,77 +206,67 @@ plus the document being left untouched.
 `tools/probes/rename_paths.py`; gates `tests/test_mongod_differential.py -k
 rename` (17 cases) and `tests/test_rename_array_and_dynamic_paths.py` (25).
 
-### 5. `$toLower` / `$toUpper` of a `Timestamp` — 2 shapes, and the answer IS host-dependent
+### 5. `$toLower` / `$toUpper` of a `Timestamp` — PYTHON DONE, Rust needs a DEPENDENCY decision
 
 mongod renders a `Timestamp` through a legacy `asctime`-like path in **local
-time**. That was suspected; it is now measured, by running a second mongod
-8.2.11 under `TZ=UTC` beside the default one (2026-09-09):
+time**, measured by running a second mongod 8.2.11 under `TZ=UTC` beside the
+default one (2026-09-09):
 
 | expression | mongod, host TZ (Europe/Dublin) | mongod, `TZ=UTC` |
 | --- | --- | --- |
 | `{$toLower: Timestamp(1, 1)}` | `jan  1 01:00:01:1` | `jan  1 00:00:01:1` |
-| `{$toUpper: Timestamp(1, 1)}` | `JAN  1 01:00:01:1` | `JAN  1 00:00:01:1` |
 | `{$toLower: Timestamp(1700000000, 3)}` | `nov 14 22:13:20:3` | `nov 14 22:13:20:3` |
 
-So the two servers disagree only where the host offset is non-zero — the third
-row agrees because Ireland is on UTC in November, which is exactly the kind of
-coincidence that would make a single-shape probe conclude "not TZ-dependent".
+The second row agrees on both because Ireland is on UTC in November — a
+one-shape probe would have concluded "not TZ-dependent" and been wrong.
 
-**The decision this needs is therefore concrete:** reproducing mongod faithfully
-means rendering in the SERVER PROCESS's local timezone, so the same query
-answers differently on two machines and the differential gate only passes where
-the runner's TZ matches. The alternatives are to pin UTC (correct on a UTC host,
-divergent elsewhere) or to keep refusing the conversion. Note `$toString` of a
-`Timestamp` is a `241` on mongod, so these two operators accept a type
-`$toString` rejects — the surface is genuinely two operators wide.
+**The Python server already matches mongod on every measured value**, rendering
+in the process's local timezone via `time.localtime`. Like item 1, the entry
+described a gap that was Rust-only.
 
-### 6. `$toDate` string parsing — RE-SIZED TWICE on 2026-09-09, and it is a FEATURE
+**The Rust server still answers `16007`, and closing it is a DEPENDENCY
+decision, not a coding one.** `secantus-core` is deliberately dependency-light
+and Rust's `std` exposes no timezone database, so local-time rendering needs
+`chrono` (or an equivalent) added to the crate the whole Rust server builds on.
+That is worth deciding deliberately rather than smuggling in behind two
+operators. The format itself is settled: `%b %e %H:%M:%S:<increment>`, the
+increment unpadded, then ASCII-cased.
 
-The original entry said "2 shapes, messages only, lowest value of anything
-here". A 12-string sweep made that "8 of 12, three of them wrong ANSWERS". An
-18-string sweep then made *that* wrong too: mongod's `$toDate` is **timelib's
-full date parser**, and we implement a small ISO-8601 subset.
+### 6. `$toDate` string parsing — DONE 2026-09-09 (was re-sized three times)
 
-| string | mongod | ours |
-| --- | --- | --- |
-| `"12/31/2020"` | 2020-12-31 | reject |
-| `"1/2/2020"` | 2020-01-02 | reject |
-| `"12/31/2020 10:30"` | 2020-12-31 10:30 | reject |
-| `"2020/12/31"` | 2020-12-31 | reject |
-| `"Dec 31 2020"` | 2020-12-31 | reject |
-| `"31 Dec 2020"` | 2020-12-31 | reject |
-| `"20200101"` | 2020-01-01 | reject |
-| `"2020-1-1"` | 2020-01-01 | reject |
-| `"@1577836800"` | 2020-01-01 | reject |
-| `"2020-W01-1"` | 2019-12-30 | reject |
-| `"2020-01-01T"` / `"...t"` | 2020-01-01 **07:00:00** | reject |
+The entry's history is the lesson: "2 shapes, messages only, lowest value here",
+then "8 of 12, three wrong ANSWERS", then "timelib's full format table". Each
+version was written with confidence and each was wrong, because each probe was
+narrower than the area.
 
-Accepted on all three already: `"2020-01-01 "`, `"  2020-01-01"`,
-`"2020-01-01\t"`, `"2020-01-01T00"`, `"2020-01-01T10:00:00.5"` — so the
-12-string sweep's "Rust rejects a trailing space" finding was an artefact of a
-**stale Rust binary**, not a divergence. Rebuild before trusting a
-Rust-vs-Python difference; that is the third time in this campaign a stale
-artefact produced a confident wrong reading.
+mongod's `$toDate` runs **timelib**, and both servers implemented a small
+ISO-8601 subset. 15 of 19 shapes diverged. Both now match on all 45, including
+the refusals.
 
-**Two halves, and only one is worth doing:**
+Three rules, all measured rather than assumed:
 
-- **Acceptance** is a real feature — porting timelib's format repertoire.
-  Not blocked on anything, but it is a slice of its own, not a fix. Two
-  sub-decision first: the slash form is US-first *by rule* (`"31/12/2020"` is
-  refused outright, so this is not ambiguity-resolution).
+* **The slash form is US-first by RULE.** `31/12/2020` is refused outright, so
+  `MM/DD/YYYY` wins and day-first is not a fallback.
+* **A trailing letter is a MILITARY TIMEZONE**, not the ISO separator.
+  `"2020-01-01T"` is `07:00:00` because `T` is UTC-7 — which is what the earlier
+  "looks host-dependent" caution was actually seeing. `J` is invalid. Verified
+  across ten letters, and a `TZ=UTC` server answers the same.
+* **An out-of-range component is a parse FAILURE, not a rollover** —
+  `13/01/2020` and `12/32/2020` are both refused.
 
-  **The `"2020-01-01T"` -> 07:00:00 caution recorded earlier today is
-  WITHDRAWN.** A `TZ=UTC` mongod answers 07:00:00 too (measured 2026-09-09), so
-  it is deterministic timelib behaviour for a bare trailing `T`, not host-local
-  leakage, and nothing here is blocked on the timezone question that item 5 is.
-- **The positioned diagnostics** still need timelib's own lexer, timezone
-  abbreviation tables and per-position error accumulation. Inventing a position
-  would look authoritative and be wrong. Stays deferred.
+Also accepted now: `YYYY/MM/DD`, month names in either order with an optional
+comma, non-padded ISO, `@<unix seconds>` (negative and fractional), compact
+`YYYYMMDD[THHMMSS]`, ISO week dates, an hour with no minutes, and surrounding
+whitespace.
 
-**The reusable lesson is the entry itself.** It was re-sized three times in one
-day, each time by widening the corpus, and each earlier version was written with
-confidence. A 2-shape claim from a 2-shape probe is not a measurement of the
-area — it is a measurement of the probe.
+**Still deferred, unchanged:** mongod's per-position timelib diagnostic for a
+string its scanner got partway through. That needs timelib's own lexer and
+abbreviation tables; inventing a position would look authoritative and be wrong.
+Both servers give the same code and a general message.
+
+Sweep `tools/probes/todate_string_formats.py` (45 shapes, 0 divergent both
+servers); gates `tests/test_todate_string_formats.py` (46) and
+`tests/test_mongod_differential.py -k todate` (28).
 
 ---
 
