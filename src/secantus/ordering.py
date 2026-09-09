@@ -84,13 +84,27 @@ def _bson_type_rank(value: Any) -> float:
 
 
 def _is_nan_value(v: Any) -> bool:
-    """A NaN, `float` or `Decimal128` — the one numeric value the comparison
-    operators below cannot rank, because IEEE says every comparison with it is
-    false."""
+    """A NaN — `float`, `Decimal128`, or a bare `decimal.Decimal`.
+
+    The one numeric value the comparison operators below cannot rank, because
+    IEEE says every comparison with it is false.
+
+    The bare `Decimal` arm is not hypothetical: the expression language's
+    `_cmp_pair` widens a `Decimal128` to a `decimal.Decimal` BEFORE handing the
+    pair to :func:`_bson_lt`, so a `Decimal128("NaN")` arrives here already
+    unwrapped and this predicate missed it. `Decimal("NaN") < 0` then raised
+    `decimal.InvalidOperation` — NOT the `TypeError` the fallback catches — and
+    `find({"$expr": {"$gt": ["$v", 0]}})` over a collection holding one
+    answered `internal server error`. Found by `tools/probes/query_result_sets.py`
+    on its first run with a Python column, 2026-09-09; the Rust server was
+    already right.
+    """
     if isinstance(v, bool):
         return False
     if isinstance(v, float):
         return math.isnan(v)
+    if isinstance(v, Decimal):
+        return v.is_nan()
     if isinstance(v, Decimal128):
         try:
             return v.to_decimal().is_nan()
@@ -150,9 +164,24 @@ def bson_equal(a: Any, b: Any) -> bool:
     Lives here rather than in either caller because both the expression language
     and the diff need exactly this rule -- the field-value rule that was copied
     into two modules and drifted is the cautionary tale.
+
+    **NaN equals NaN**, which Python's ``==`` denies. mongod's canonical order
+    ranks the two as equal, so ``{$eq: [NaN, NaN]}`` is true and
+    ``find({a: NaN})`` matches a stored NaN -- the query path already did this,
+    the EXPRESSION path did not, and `$eq` answered false for every combination
+    of ``float`` and ``Decimal128`` NaN (probed 8.2.11, 2026-09-09). This is the
+    same shape as the bool-vs-int rule above, which is why it belongs in the
+    same predicate rather than at the two call sites.
+
+    It is right for the change-detection twin too: ``$set`` of a NaN over the
+    same-typed NaN reports ``modifiedCount: 0`` on mongod, while NaN ->
+    ``Decimal128("NaN")`` reports 1 -- and that second case is caught by
+    `bson_same_stored_value`'s numeric-TYPE rule, not by this one.
     """
     if isinstance(a, bool) != isinstance(b, bool):
         return False
+    if _is_nan_value(a) or _is_nan_value(b):
+        return _is_nan_value(a) and _is_nan_value(b)
     return bool(a == b)
 
 
@@ -278,6 +307,11 @@ def _bson_lt(a: Any, b: Any) -> bool:
         return bool(a < b)
     except TypeError:
         return type(a).__name__ < type(b).__name__
+    except InvalidOperation:
+        # A `decimal` signal, not a type mismatch. The NaN gate above is the
+        # real fix; this keeps any other signalling operand (a `sNaN`, say)
+        # from leaving the wire as `internal server error`.
+        return False
 
 
 class _EmptyArraySortsAs:

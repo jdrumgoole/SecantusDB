@@ -3037,6 +3037,48 @@ RENAME_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
 ]
 
 
+# --- NaN in the expression language ---------------------------------------
+#
+# Found by `tools/probes/query_result_sets.py` the first time it ran with a
+# PYTHON column: `$expr` over a `Decimal128("NaN")` was a crash, and
+# `{$eq: [NaN, NaN]}` was false where mongod says true. Measured 2026-09-09.
+
+NAN_DOCS: list[dict] = [
+    {"_id": "dblnan", "v": float("nan")},
+    {"_id": "decnan", "v": Decimal128("NaN")},
+    {"_id": "pos", "v": 5},
+    {"_id": "neg", "v": -5},
+]
+
+
+def _proj(expr: dict) -> Callable[[Database], object]:
+    return lambda db: [
+        (d["_id"], d.get("r"))
+        for d in db.c.aggregate([{"$project": {"r": expr}}, {"$sort": {"_id": 1}}])
+    ]
+
+
+NAN_EXPR_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    # The crash: the Decimal128 rows answered `1 internal server error`.
+    ("gt-zero", NAN_DOCS, _proj({"$gt": ["$v", 0]})),
+    ("gte-zero", NAN_DOCS, _proj({"$gte": ["$v", 0]})),
+    ("lt-zero", NAN_DOCS, _proj({"$lt": ["$v", 0]})),
+    ("lte-zero", NAN_DOCS, _proj({"$lte": ["$v", 0]})),
+    ("cmp-zero", NAN_DOCS, _proj({"$cmp": ["$v", 0]})),
+    # ...and the `$expr` FILTER that surfaced it.
+    ("expr-gt-filter", NAN_DOCS, lambda db: _ids(db, {"$expr": {"$gt": ["$v", 0]}})),
+    ("expr-lt-filter", NAN_DOCS, lambda db: _ids(db, {"$expr": {"$lt": ["$v", 0]}})),
+    # NaN equals NaN, in every pairing of the two numeric types that hold one.
+    ("eq-double-nan", NAN_DOCS, _proj({"$eq": ["$v", float("nan")]})),
+    ("eq-decimal-nan", NAN_DOCS, _proj({"$eq": ["$v", Decimal128("NaN")]})),
+    ("ne-double-nan", NAN_DOCS, _proj({"$ne": ["$v", float("nan")]})),
+    # ...and the neighbours the fix must not move.
+    ("eq-zero", NAN_DOCS, _proj({"$eq": ["$v", 0]})),
+    ("eq-bool-one", ONE, _proj({"$eq": [True, 1]})),
+    ("eq-signed-zeros", ONE, _proj({"$eq": [0.0, -0.0]})),
+]
+
+
 ALL_CASES = (
     [("query", c) for c in QUERY_CASES]
     + [("readpath", c) for c in READPATH_CASES]
@@ -3068,6 +3110,7 @@ ALL_CASES = (
     + [("avgdiv", c) for c in AVG_CASES]
     + [("sortpath", c) for c in SORTPATH_CASES]
     + [("rename", c) for c in RENAME_CASES]
+    + [("nanexpr", c) for c in NAN_EXPR_CASES]
 )
 
 

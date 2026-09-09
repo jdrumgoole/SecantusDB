@@ -238,16 +238,32 @@ area — it is a measurement of the probe.
 
 ## Housekeeping the sweeps earned
 
-- **Promote three probes into `tools/probes/`.** The query-result-set,
-  update-result-document and upsert-seeding sweeps are all `/tmp`-local. Each
-  found real bugs on its first run; each is worth re-running after any change to
-  `query.rs` / `update.rs`. (A fourth, `sort_path_resolution.py`, was promoted
-  with item 3 — it is the only probe here that compares ORDER, which is what
-  the descent bug needed.)
-- **Two backlog entries are STALE and should be deleted**, both verified against
-  mongod on 2026-09-08: "`$expr` with `$gt` over a mixed-type collection defers"
-  (fixed in #1418) and "a dotted POSITIONAL component ... we implement only half
-  of it" (fixed in #1420).
+- **Promote three probes into `tools/probes/`** — DONE 2026-09-09, and the
+  promotion itself found two bugs. They are now `query_result_sets.py`,
+  `update_result_documents.py` and `upsert_seeding.py` (266 / 527 / 120 shapes,
+  0 divergent). Two more went in alongside: `sort_path_resolution.py` (item 3 —
+  the only probe here that compares ORDER) and `rename_paths.py` (item 4).
+
+  **The `/tmp` originals compared mongod against the RUST server only.** Moving
+  them onto `_servers.py` added the Python column, and the query sweep
+  immediately found a CRASH — `$expr` with `$gt` over a `Decimal128("NaN")`
+  answered `internal server error` — plus `{$eq: [NaN, NaN]}` answering false
+  where mongod says true (the Rust server got that right for `Decimal128` and
+  wrong for a plain `double`, so the answer depended on the numeric type). Both
+  fixed; see `changelog.d/expression-nan-equality.md`.
+
+  Worth keeping: **a throwaway probe's column list is part of its result.** A
+  sweep that omits a server proves half of what it claims, and "0 divergent"
+  from it reads exactly like "0 divergent" from a complete one.
+
+  One deliberate asymmetry: `upsert_seeding.py` compares field/value PAIRS
+  rather than key order, because mongod's seeded field order is its own hash
+  order and both servers sort deliberately. Comparing it would report four
+  divergences forever and train the reader to ignore the probe.
+- **Two backlog entries are STALE and should be deleted** — DONE. Both are gone
+  from `tasks/backlog.md` as of 2026-09-09: "`$expr` with `$gt` over a
+  mixed-type collection defers" (fixed in #1418) and "a dotted POSITIONAL
+  component ... we implement only half of it" (fixed in #1420).
 
 ---
 

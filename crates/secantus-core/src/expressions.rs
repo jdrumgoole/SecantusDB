@@ -7567,6 +7567,14 @@ pub fn py_eq(a: &Bson, b: &Bson) -> Result<bool, Fallback> {
     if matches!(a, Bson::Boolean(_)) != matches!(b, Bson::Boolean(_)) {
         return Ok(false);
     }
+    // NaN equals NaN, and `fast_cmp_numberish` reports it as INCOMPARABLE --
+    // so `{$eq: [NaN, NaN]}` answered false for two plain doubles while the
+    // Decimal128 branch above got it right, leaving the operator's answer
+    // dependent on which numeric type happened to hold the NaN. mongod says
+    // true for all four combinations (probed 8.2.11, 2026-09-09).
+    if crate::query::is_nan_bson(a) || crate::query::is_nan_bson(b) {
+        return Ok(crate::query::is_nan_bson(a) && crate::query::is_nan_bson(b));
+    }
     if let Some(r) = numeric::fast_cmp_numberish(a, b) {
         return Ok(r == Some(std::cmp::Ordering::Equal));
     }
