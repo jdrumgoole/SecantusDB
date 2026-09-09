@@ -427,10 +427,33 @@ pub fn decimal128_bracket(canonical: &str) -> Option<Bracket> {
 /// constant's own key. A missing `__numkey` (every Decimal128 row) never
 /// satisfies a range or equality on it, and always satisfies `$ne` -- which is
 /// exactly the arm those rows should take.
+///
+/// NaN takes PostgreSQL's place in the order -- equal to itself and ABOVE
+/// every number, infinity included (probed on 16) -- where MQL's range
+/// operators exclude it. So a NaN constant is lowered by hand, and a `$gt` /
+/// `$gte` against any other constant picks up the NaN rows as a third arm.
+/// (A NaN is always a Decimal128; the wide form holds finite values only.)
 pub fn numeric_filter(field: &str, mql_op: &str, value: &Bson) -> Option<Document> {
     let canonical = numeric_operand_text(value)?;
     let key = numeric_sort_key(&canonical);
     let wide_field = format!("{field}.{WIDE_NUMERIC_SORT_KEY}");
+    let nan = decimal128("NaN");
+    if canonical == "NaN" {
+        return match mql_op {
+            "$eq" | "$gte" => Some(doc! { field: nan }),
+            "$ne" => Some(doc! { "$and": [
+                { field: { "$ne": nan } },
+                { field: { "$ne": Bson::Null } },
+            ]}),
+            "$gt" => Some(doc! { field: { "$in": [] } }),
+            "$lt" => Some(doc! { "$and": [
+                { field: { "$ne": nan } },
+                { field: { "$ne": Bson::Null } },
+            ]}),
+            "$lte" => Some(doc! { field: { "$ne": Bson::Null } }),
+            _ => None,
+        };
+    }
     let (exact, lo, hi) = match decimal128_bracket(&canonical)? {
         Bracket::Exact(d) => (true, d, d),
         Bracket::Between(lo, hi) => (false, lo, hi),
@@ -461,9 +484,16 @@ pub fn numeric_filter(field: &str, mql_op: &str, value: &Bson) -> Option<Documen
         _ => return None,
     };
     let wide = doc! { wide_field: { mql_op: key } };
-    Some(match narrow {
-        Some(n) => doc! { "$or": [n, wide] },
-        None => wide,
+    let mut arms = Vec::new();
+    arms.extend(narrow);
+    arms.push(wide);
+    if matches!(mql_op, "$gt" | "$gte") {
+        arms.push(doc! { field: nan });
+    }
+    Some(if arms.len() == 1 {
+        arms.remove(0)
+    } else {
+        doc! { "$or": arms }
     })
 }
 

@@ -1058,13 +1058,23 @@ fn wide_numeric_where_lowers_to_bracket_and_key() {
     };
     assert_eq!(lo.to_string(), "1.234567890123456789012345678901234");
     assert_eq!(hi.to_string(), "1.234567890123456789012345678901235");
+    let nan = Bson::Decimal128("NaN".parse().unwrap());
     assert_eq!(
         f,
         doc! { "$or": [
             { "n": { "$gte": hi } },
             { "n.__numkey": { "$gt": numeric::numeric_sort_key("1.2345678901234567890123456789012345") } },
+            { "n": &nan },
         ]}
     );
+    // NaN sits ABOVE every number on PostgreSQL, where MQL's ranges exclude
+    // it: `n < NaN` is every non-null, non-NaN row; `n > NaN` is no row.
+    assert_eq!(
+        filter("SELECT id FROM w WHERE n < 'NaN'::numeric"),
+        doc! { "$and": [ { "n": { "$ne": &nan } }, { "n": { "$ne": Bson::Null } } ] }
+    );
+    assert_eq!(filter("SELECT id FROM w WHERE n > 'NaN'::numeric"), doc! { "n": { "$in": [] } });
+    assert_eq!(filter("SELECT id FROM w WHERE n >= 'NaN'::numeric"), doc! { "n": &nan });
     // A narrow constant on a numeric column still gets the wide arm, because
     // the column may hold wide rows.
     let f = filter("SELECT id FROM w WHERE n < 5");

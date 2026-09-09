@@ -2391,6 +2391,10 @@ fn sample_value_for_type(pg_type: &str) -> Bson {
         "int2" | "int4" => Bson::Int32(1),
         "int8" => Bson::Int64(1),
         "float4" | "float8" => Bson::Double(1.0),
+        // Without a numeric sample, `n * 2` over a numeric column evaluated
+        // to NULL and was typed `int4`, so the client's int loader choked on
+        // `3.0`.
+        "numeric" | "decimal" => Bson::Decimal128("1".parse().expect("literal")),
         "bool" => Bson::Boolean(true),
         "text" | "varchar" | "bpchar" | "name" => Bson::String(String::new()),
         _ => Bson::Null,
@@ -3016,7 +3020,12 @@ pub fn aggregate_output_def(
             OutputCol::Agg(i) => {
                 let item = &agg.items[*i];
                 match item.func {
-                    AggFunc::CountStar | AggFunc::Count | AggFunc::Sum => "int8".to_string(),
+                    AggFunc::CountStar | AggFunc::Count => "int8".to_string(),
+                    // `sum(numeric)` is numeric; the integer sums are int8.
+                    AggFunc::Sum => match item.source_type.as_deref() {
+                        Some("numeric" | "decimal") => "numeric".to_string(),
+                        _ => "int8".to_string(),
+                    },
                     AggFunc::Min | AggFunc::Max => item
                         .source_type
                         .clone()
@@ -3499,6 +3508,16 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
                         let rt = static_type(r, &Bson::Null);
                         if let Some(t) = datetime_arith_type(op, &lt, &rt) {
                             return t.to_string();
+                        }
+                        // Numeric arithmetic types from the operands too:
+                        // anything beside a `numeric` is `numeric`, and a
+                        // float wins over it (`wider_numeric`'s ladder).
+                        if matches!(op, "+" | "-" | "*" | "/") {
+                            if let Some(t) = wider_numeric(&lt, &rt) {
+                                if t == "numeric" || t == "float8" || t == "float4" {
+                                    return t;
+                                }
+                            }
                         }
                     }
                     if *value == Bson::Null {
