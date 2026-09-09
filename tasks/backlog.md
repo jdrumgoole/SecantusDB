@@ -598,19 +598,99 @@ remain open:
       `postgres` storage. A real fix needs a database registry and a startup-time
       rejection (FATAL `3D000` before `ReadyForQuery`); the server has no
       multi-database concept today. Deferred — separate feature, not error mapping.
-- [ ] **OPEN — RUST pgserver: `test_commit_error` needs DEFERRABLE constraints.**
-      Expects a `DEFERRABLE INITIALLY DEFERRED` FK to fire `ForeignKeyViolation`
-      at `COMMIT`, not at the statement. No constraint-deferral machinery exists.
-      Deferred — feature build.
+      Re-measured 2026-09-09: PG 16.15 answers `FATAL: database "nosuchdb" does
+      not exist` (`3D000`); `test_pgconn_error` / `test_pgconn_error_pickle` in
+      psycopg's `test_errors.py` fail on the same gap. A naive "reject anything
+      but `postgres`" would break the pgjdbc gauge, which connects with
+      `PGDBNAME=test` — the fix needs a database registry, `CREATE DATABASE`,
+      and a runner-side create step for that gauge.
+- [ ] **OPEN — RUST pgserver: `standard_conforming_strings` is not reported as
+      a `ParameterStatus` on `SET` (`test_sql.py::test_quote_stable_despite_
+      deranged_libpq[off]`, 2026-09-09).** The test runs `set
+      standard_conforming_strings to off` and expects libpq's
+      `PQparameterStatus` to flip so `quote_literal` output changes; PG 16.15
+      reports the new value and renders `E'\\'` style literals. The Rust
+      planner's parser (pg_query) has the setting hard-wired ON, so the server
+      could only ANNOUNCE a value it does not honour — per the "only report GUCs
+      you honor" rule it stays silent. The `[on]` variant passes.
+- [ ] **OPEN — RUST pgserver: `test_sql.py::TestLiteral::test_invalid_name[*]`
+      needs shell types + `CREATE FUNCTION ... LANGUAGE internal` + `CREATE
+      TYPE (input=..., output=...)` (`DefineStmt`, 2026-09-09).** The test
+      defines a base type named `a-b` / `€` / `order` / `foo bar` / `FooBar`
+      with `int4in`/`int4out` and then casts a literal to it; PG 16.15 accepts
+      the DDL and renders the cast as `'1'::"a-b"` etc. The Rust planner
+      answers `0A000 DefineStmt is not supported yet` on the `CREATE TYPE`.
+      The `regtype` quoting half (reserved keyword `order` → `"order"`) landed
+      2026-09-09; only the DDL is missing.
+- [ ] **OPEN — RUST pgserver: `DO` blocks cover a SUBSET of PL/pgSQL
+      (2026-09-09).** `plpgsql_do.rs` parses `BEGIN ... END` with `RAISE`
+      (all levels, `USING errcode / message / detail / hint / column /
+      constraint / datatype / table / schema`, `%` format args), `PERFORM`,
+      `EXECUTE <string>`, `NULL` and bare SQL statements; anything else
+      (`EXCEPTION WHEN ... THEN` handlers — `do $$ begin perform 1/0;
+      exception when division_by_zero then raise notice 'caught'; end $$`
+      is `0A000 the PL/pgSQL statement "exception" in an inline code block
+      is not supported yet` where PG prints the notice — `DECLARE`
+      variables, `IF` / `LOOP` / `FOR`, assignments, `SELECT ... INTO`) is
+      refused with `0A000`, where PG runs it. Two known divergences inside
+      the subset: (a)
+      a scalar subquery in a `RAISE` argument (`raise notice '%', (select
+      1)`) is `0A000 SubLink is not supported yet`; PG prints `1`. (b) the
+      block is NOT atomic across `EXECUTE`d writes — PG wraps the whole `DO`
+      in the enclosing transaction and a later `RAISE EXCEPTION` rolls the
+      earlier writes back; the Rust executor runs each statement through the
+      normal path and leaves the earlier writes committed when autocommit is
+      on — `create table t (x int); do $$ begin execute 'insert into t
+      values (1)'; raise exception 'boom'; end $$; select count(*) from t`
+      is `0` on PG and `1` here.
+- [ ] **OPEN — RUST pgserver: a non-boolean constant WHERE over
+      `generate_series` carries no error POSITION (2026-09-09).** `select 1
+      from generate_series(1,3) where 1` is `42804 argument of WHERE must be
+      type boolean, not type integer` on both, but PG 16.15 sets `P` = 42
+      (the `1`) and the Rust server sends no position; the planner has no
+      positioned-error channel beyond `identifier_position` for `42P01`.
+- [ ] **OPEN — RUST pgserver: an UNQUOTED reserved word is accepted as a
+      `regtype` name (2026-09-09).** With a type named `"order"`,
+      `'order'::regtype` is `42601 syntax error at or near "order"` (context
+      `invalid type name "order"`, position at the literal) on PG 16.15; the
+      Rust server resolves it to `"order"`. Only the quoted spelling
+      `'"order"'::regtype` should resolve.
+- [ ] **OPEN — RUST pgserver: `DROP TABLE IF EXISTS` on a missing table is
+      silent (2026-09-09).** PG 16.15 emits `NOTICE: table "t" does not
+      exist, skipping`; the Rust server sends no `NoticeResponse`. The
+      notice seam now exists (added for `RAISE`), so this is a one-site fix.
+- [ ] **OPEN — RUST pgserver: `numeric` values wider than 34 significant
+      digits round (`test_dump_numeric_exhaustive[s/t/b]`,
+      `test_load_numeric_exhaustive[0/1]`, 2026-09-09).** The tests round-trip
+      every width up to hundreds of digits; PG 16.15 returns each value
+      exactly. Storage is Decimal128, so `select
+      1234567890123456789012345678901234567890::numeric` is refused with
+      `22003 numeric value out of range: "..." exceeds the 34 significant
+      digits this server stores` (a deliberate loud refusal rather than a
+      silent round; PG 16.15 returns the value). Same root as the shared
+      "`numeric` beyond 34 significant digits" entry below — needs a
+      text/dual representation that the comparison and sort paths also use.
+- [ ] **OPEN — RUST pgserver: NOT NULL / CHECK / FOREIGN KEY constraints are
+      not enforced at all (re-measured 2026-09-09; `test_commit_error`,
+      `test_diag_from_commit[_async]`, `test_diag_attr_values`).** Against
+      PostgreSQL 16.15: `create table c1 (id int not null); insert into c1
+      values (null)` → `23502 null value in column "id" of relation "c1"
+      violates not-null constraint` (same for `serial`); `create table c1 (id
+      int check (id > 0)); insert into c1 values (-1)` → `23514 new row for
+      relation "c1" violates check constraint "c1_id_check"`; `create table c2
+      (id int references c1(id)); insert into c2 values (42)` → `23503 insert
+      or update on table "c2" violates foreign key constraint "c2_id_fkey"`,
+      and with `deferrable initially deferred` the same 23503 fires at
+      `COMMIT`. The Rust server answers `OK` to all five. The earlier entry
+      framed this as "no constraint-deferral machinery"; the gap is one level
+      down — the catalog records none of the three constraints and the INSERT
+      / UPDATE paths check nothing. Feature build: constraint catalog +
+      per-row checks + a deferred-check list run at COMMIT.
 - [ ] **OPEN — RUST pgserver: `test_right_exception_on_session_timeout` needs
       `idle_in_transaction_session_timeout`.** Expects an idle transaction to be
       killed with `25P03` (`IdleInTransactionSessionTimeout`) after the GUC's
       window. The GUC is accepted but not enforced (no idle timer). Deferred —
       needs a per-connection idle timer wired to the accept loop.
-- [ ] **OPEN — RUST pgserver: `test_notice_handlers` needs `DO` / plpgsql +
-      `NoticeResponse`.** Uses `do $$ begin raise notice ... end$$ language
-      plpgsql`; the planner refuses `DoStmt` (`0A000`) and the server has no
-      notice-emission seam. Deferred — plpgsql is a large separate feature.
 
 **Rust server errors where Python defers — MEASURED 2026-08-26, and the five
 entries describing it are largely stale.** A three-way probe of 45
@@ -5329,24 +5409,6 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   before the field-type map is built — deeper than the value-side work, and the
   binary DUMP additionally raises psycopg-side `InvalidBinaryRepresentation` /
   `binary parameters of type oid None` until the oid is carried.
-- [ ] **OPEN — anonymous-RECORD (`ROW(...)`, oid 2249) BINARY result, 5 gauge
-  tests (`test_load_record_binary`, 2026-09-08).** A composite's field oids come
-  from its declaration, but an anonymous record's come from the EXPRESSION types
-  (`'x'` is `unknown` 705 → psycopg loads bytes; `'x'::text` is `text` 25 →
-  loads str), which the stored `{__record: [...]}` value does not carry. A
-  value-based guess (String→705) fixes 4 of the 5 but REGRESSES
-  `test_load_different_records_*` / `test_load_all_chars` (which expect str for a
-  `::text`/`chr()` field), so records deliberately stay on the text path. A
-  faithful fix needs the planner's `RowExpr` to record each field's type oid in
-  the record value (touches `record_value`/`record_fields`/`record_text`/
-  comparison/cast — the `d.len()==1` tag shape), out of scope for this slice.
-- [ ] **OPEN — `oid::regtype` does not quote a RESERVED-keyword type name
-  (`test_literal_invalid_name[order]`, 2026-09-08).** A type named `order`
-  renders as `order`, but PostgreSQL quotes reserved keywords: `"order"`.
-  `regtype_text`'s `quote_part` (`secantus-pgplan`) quotes only identifiers with
-  special chars / uppercase / a leading digit; it needs a PG reserved-keyword
-  table to also quote bare-looking keywords. Orthogonal to composite values
-  (identifier quoting), surfaces in one composite test.
 - [ ] **OPEN — range-typed composite field** (a composite whose field type is a
   custom range) is untested against the value round-trip.
   NOTE the schema-qualified TypeInfo tests additionally need in-transaction DDL
@@ -5358,11 +5420,13 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   psycopg decodes to a tuple). Still unimplemented: `row_to_json(...)` and other
   record-consuming functions, NAMED composite construction (`ROW(...)::mytype`
   beyond a bare-record no-op), and field access `(ROW(1,2)).f1`.
-- **Rust PG server: a WHERE clause over `generate_series` is refused (`0A000`),
-  and it is the only set-returning function.** The filter language is built
-  against stored columns; applying one to generated rows needs an in-memory
-  matcher. `unnest`, `generate_subscripts` and function calls in FROM other than
-  `generate_series` are also unsupported. In the SELECT LIST it now works
+- **Rust PG server: `generate_series` is the only set-returning function.**
+  A WHERE clause over it now works (2026-09-09: a constant predicate —
+  `where false` / `where true` / `where 1` → `42804` — and a comparison on
+  the series column, `select count(*) from generate_series(1,5) i where i >
+  2` → `3`, all as PG 16.15 answers). `unnest`, `generate_subscripts` and
+  function calls in FROM other than `generate_series` are still
+  unsupported. In the SELECT LIST it works
   (`select generate_series(1, 10)`, with alias / ORDER BY / LIMIT / OFFSET), but
   only as the SOLE target: `select 1, generate_series(1,3)` — which repeats the
   other columns across the generated rows — is refused, as is more than one
@@ -5589,11 +5653,13 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   PostgreSQL never reuses a sequence value (`nextval` is non-transactional).
   The sequence doc in `__sql_sequences__` is written inside the statement's
   transaction, so an abort restores it.
-- [ ] **OPEN — Rust PG server: NOT NULL is not enforced on a serial column
-  (2026-09-09).** `create table t (id serial); insert into t (id) values
-  (null)` stores a NULL id; PostgreSQL 16 is `23502 null value in column
-  "id" of relation "t" violates not-null constraint` — `serial` implies
-  `NOT NULL`, and the catalog does not record it.
+- [ ] **OPEN — Rust PG server: NOT NULL is not enforced — on a serial column
+  OR an explicit `int not null` (re-measured 2026-09-09).** `create table t
+  (id int not null); insert into t (id) values (null)` stores a NULL id;
+  PostgreSQL 16 is `23502 null value in column "id" of relation "t" violates
+  not-null constraint`. Same for `serial` (which implies `NOT NULL`). Part of
+  the "NOT NULL / CHECK / FOREIGN KEY constraints are not enforced" entry in
+  the psycopg gauge section; the catalog does not record the constraint.
 - [ ] **OPEN — Rust PG server: `timestamp + interval` on a STORED timestamp
   loses sub-millisecond precision (2026-09-09).** A `timestamp` column
   holding `2021-01-01 00:00:00.123456` answers `…00.123` for `ts + interval

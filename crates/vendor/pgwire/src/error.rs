@@ -174,10 +174,15 @@ impl ErrorInfo {
     fn into_fields(self) -> Vec<(u8, String)> {
         let mut fields = Vec::with_capacity(18);
 
+        // PostgreSQL (9.6+) always sends the non-localized severity `V`
+        // beside the localized `S`; a client reading
+        // `diag.severity_nonlocalized` expects it on every error and notice.
+        // SecantusDB patch: default it to the severity itself.
+        let nonlocalized = self
+            .severity_nonlocalized
+            .unwrap_or_else(|| self.severity.clone());
         fields.push((b'S', self.severity));
-        if let Some(value) = self.severity_nonlocalized {
-            fields.push((b'V', value));
-        }
+        fields.push((b'V', nonlocalized));
         fields.push((b'C', self.code));
         fields.push((b'M', self.message));
         if let Some(value) = self.detail {

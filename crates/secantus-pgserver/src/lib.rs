@@ -9,7 +9,9 @@
 //! because the point of P1 is to prove the SEAM end to end on real storage,
 //! including the shared on-disk catalog format. Breadth is P5's problem.
 
+mod do_block;
 mod encoding;
+mod plpgsql_do;
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -96,7 +98,11 @@ pub struct PgHandler {
     /// wrong answer, which is worse than refusing `BEGIN` outright.
     txn: Mutex<Option<UserTransactionHandle>>,
     /// Session settings (GUCs), per connection as PostgreSQL's are.
-    settings: Mutex<HashMap<String, String>>,
+    settings: Arc<Mutex<HashMap<String, String>>>,
+    /// NoticeResponses raised by the statement in flight (a `DO` block's
+    /// `RAISE NOTICE` / `WARNING` / `INFO`), sent to the client by the query
+    /// handlers before the statement's own result or error.
+    pending_notices: Mutex<Vec<ErrorInfo>>,
     /// GUC changes to report to the client via `ParameterStatus` after the
     /// current query, for the variables PostgreSQL marks GUC_REPORT (TimeZone,
     /// DateStyle, ...). libpq / psycopg track the session `TimeZone` from these
@@ -282,7 +288,8 @@ impl PgHandler {
             storage,
             db: db.to_string(),
             txn: Mutex::new(None),
-            settings: Mutex::new(default_settings()),
+            settings: Arc::new(Mutex::new(default_settings())),
+            pending_notices: Mutex::new(Vec::new()),
             pending_params: Mutex::new(Vec::new()),
             copy_in: Mutex::new(None),
             cursors: Mutex::new(HashMap::new()),
@@ -901,6 +908,7 @@ impl PgHandler {
         agg: &secantus_pgplan::Aggregate,
         max_rows: usize,
     ) -> PgWireResult<Vec<(Vec<Option<Bson>>, Vec<Bson>)>> {
+        let empty = Document::new();
         let docs: Vec<Document> = match &agg.series {
             Some(series) => series
                 .values()
@@ -909,6 +917,11 @@ impl PgHandler {
                     let mut d = Document::new();
                     d.insert(series.column.clone(), Bson::Int32(v as i32));
                     d
+                })
+                .filter(|d| {
+                    agg.filter.is_empty()
+                        || secantus_core::query::matches(d, &agg.filter, &empty, None)
+                            .unwrap_or(false)
                 })
                 .collect(),
             // A virtual table's rows are computed, not read: without
@@ -2045,11 +2058,22 @@ impl PgHandler {
     }
 
     fn err(e: &PlanError) -> PgWireError {
-        PgWireError::UserError(Box::new(ErrorInfo::new(
-            "ERROR".into(),
-            e.sqlstate().into(),
-            e.to_string(),
-        )))
+        let mut info = ErrorInfo::new("ERROR".into(), e.sqlstate().into(), e.to_string());
+        info.hint = e.hint().map(str::to_string);
+        PgWireError::UserError(Box::new(info))
+    }
+
+    /// `err`, with the statement text to point the error's `P` field at the
+    /// token at fault, for the errors PostgreSQL positions: an unknown
+    /// relation points at its first mention (`LINE 1: select * from wat`).
+    fn err_in(e: &PlanError, sql: &str) -> PgWireError {
+        let mut out = Self::err(e);
+        if let (PlanError::UndefinedTable(name), PgWireError::UserError(info)) = (e, &mut out) {
+            if let Some(pos) = secantus_pgplan::identifier_position(sql, name) {
+                info.position = Some(pos.to_string());
+            }
+        }
+        out
     }
 
     /// A storage write error, rendered as PostgreSQL renders it.
@@ -2193,6 +2217,8 @@ fn internal_type_name(ty: &Type) -> Option<String> {
             1184 => "timestamptz",
             1266 => "timetz",
             2950 => "uuid",
+            26 => "oid",
+            1028 => "oid[]",
             2249 => "record",
             1186 => "interval",
             114 => "json",
@@ -2403,6 +2429,26 @@ impl NoopStartupHandler for PgHandler {
         if let Some(user) = _c.metadata().get("user") {
             *self.session_user.lock().unwrap_or_else(|e| e.into_inner()) = user.clone();
         }
+        // ErrorResponse / NoticeResponse fields leave in the session's
+        // `client_encoding`, like every other text the server sends: a LATIN9
+        // client reading an `ERROR: ... \u{20ac}` expects the single byte 0xA4,
+        // not UTF-8. The transcoder reads the setting at send time, so a later
+        // SET takes effect.
+        let settings = Arc::clone(&self.settings);
+        _c.session_extensions()
+            .insert(pgwire::api::BackendMessageTranscoder(Arc::new(move |s| {
+                let enc = settings
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get("client_encoding")
+                    .map(|name| encoding::client_encoding(name))
+                    .unwrap_or(ClientEncoding::Utf8);
+                if enc.transcodes() {
+                    encoding::encode(enc, s.as_bytes()).ok()
+                } else {
+                    None
+                }
+            })));
         // A `client_encoding` in the startup packet (libpq's PGCLIENTENCODING /
         // psycopg's `client_encoding=` connection option) is a SET before the
         // first query. pgwire has already echoed the client's raw spelling in a
@@ -2476,6 +2522,7 @@ impl SimpleQueryHandler for PgHandler {
         } else {
             self.run_batch(&stmts).await
         };
+        self.flush_notices(_c).await?;
         // Report any GUC change (TimeZone, ...) so the client tracks it.
         self.report_pending_params(_c).await?;
         // A FATAL error (`pg_terminate_backend` on this backend) ends the
@@ -3015,6 +3062,26 @@ impl PgHandler {
     /// `note_reportable_guc`. PostgreSQL reports these (TimeZone, DateStyle,
     /// ...) so the client can interpret values -- psycopg re-expresses a
     /// timestamptz in the session `TimeZone` it learns here.
+    /// Send the NoticeResponses the statement in flight queued up.
+    async fn flush_notices<C>(&self, client: &mut C) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let notices: Vec<ErrorInfo> = std::mem::take(
+            &mut *self
+                .pending_notices
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        for info in notices {
+            client
+                .send(PgWireBackendMessage::NoticeResponse(info.into()))
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn report_pending_params<C>(&self, client: &mut C) -> PgWireResult<()>
     where
         C: Sink<PgWireBackendMessage> + Unpin,
@@ -3251,8 +3318,19 @@ impl PgHandler {
             }
         }
         let stmt = planned
-            .map_err(|e| Self::err(&e))
+            .map_err(|e| Self::err_in(&e, sql))
             .inspect_err(|_| self.note_failure())?;
+
+        // An inline code block runs its statements back through this same
+        // path one at a time, so it is neither a storage operation nor a
+        // single transaction-control step.
+        if let Statement::Do { language, body } = &stmt {
+            let out = self.run_do(language, body, sql).await;
+            if out.is_err() {
+                self.note_failure();
+            }
+            return out;
+        }
 
         // Transaction control is session state, not a storage operation.
         // ROLLBACK TO is exempt from the failed-block gate below, exactly as
@@ -4025,6 +4103,7 @@ impl PgHandler {
             }
             (Some(series), _) => {
                 let column = series.column.clone();
+                let empty = Document::new();
                 let docs = series
                     .values()
                     .into_iter()
@@ -4032,6 +4111,12 @@ impl PgHandler {
                         let mut d = Document::new();
                         d.insert(column.clone(), Bson::Int32(v as i32));
                         d
+                    })
+                    // The WHERE clause, over the one generated column.
+                    .filter(|d| {
+                        sel.filter.is_empty()
+                            || secantus_core::query::matches(d, &sel.filter, &empty, None)
+                                .unwrap_or(false)
                     })
                     .collect();
                 (docs, series_table_def(series))
@@ -4255,6 +4340,7 @@ impl PgHandler {
             Statement::Transaction(_) => unreachable!("handled before execute"),
             // Handled in `run`, which can await the row stream.
             Statement::DeclareCursor { .. } => unreachable!("handled before execute"),
+            Statement::Do { .. } => unreachable!("handled before execute"),
             Statement::CreateTable(def, if_not_exists) => {
                 if self.lookup(&def.name).is_some() {
                     // `IF NOT EXISTS` is a NO-OP on an existing table, tag and
@@ -4917,7 +5003,7 @@ impl PgHandler {
                             Ok(CopyData::new(buf.freeze()))
                         }
                         _ => {
-                            let line = copy_text_row(&row, format);
+                            let line = copy_text_row(&row, format, &bin_schema);
                             // COPY text is line-structured with ASCII delimiters
                             // and escapes, so the whole line transcodes as one
                             // blob to the client encoding (only the field
@@ -5481,8 +5567,9 @@ fn copy_reassemble(d: &Document, field: &str, ty: &Type) -> Option<Bson> {
 /// every type, and the gap is recorded in `tasks/backlog.md` rather than
 /// hidden.
 fn binary_encodable(ty: &Type) -> bool {
-    const OK: [Type; 32] = [
+    const OK: [Type; 33] = [
         Type::OID,
+        Type::OID_ARRAY,
         Type::BYTEA,
         Type::UUID,
         Type::INET,
@@ -5520,17 +5607,20 @@ fn binary_encodable(ty: &Type) -> bool {
     }
     // A user COMPOSITE has a binary record wire format, and a composite ARRAY
     // does too (the array encoder length-prefixes each element's binary bytes).
-    //
-    // An ANONYMOUS record (`ROW(...)`, oid 2249) is deliberately NOT included:
-    // its field oids are the expression types (`'x'` is `unknown`, `'x'::text`
-    // is `text`), which the stored record value does not carry, so it cannot be
-    // encoded faithfully in binary and stays on the text path. See
-    // `tasks/backlog.md`.
-    if matches!(ty.kind(), postgres_types::Kind::Composite(_)) {
+    // So does an ANONYMOUS record (`ROW(...)`, oid 2249): its field oids are
+    // the expression types (`'x'` is `unknown`, `'x'::text` is `text`), which
+    // the planner now records beside the fields (`RECORD_TYPES_KEY`).
+    if *ty == Type::RECORD || matches!(ty.kind(), postgres_types::Kind::Composite(_)) {
         return true;
     }
+    // A user ENUM ARRAY too: each element's binary form is its label bytes,
+    // so the array encoder length-prefixes those (PostgreSQL's `array_send`
+    // over `enum_send`).
     if let postgres_types::Kind::Array(inner) = ty.kind() {
-        if matches!(inner.kind(), postgres_types::Kind::Composite(_)) {
+        if matches!(
+            inner.kind(),
+            postgres_types::Kind::Composite(_) | postgres_types::Kind::Enum(_)
+        ) {
             return true;
         }
     }
@@ -5896,8 +5986,15 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
     // An ARRAY of COMPOSITE / anonymous RECORD: the element type is carried on
     // the array's own `Kind::Array`, and `array_binary` length-prefixes each
     // element's binary record bytes (via `element_binary`).
+    // An ARRAY of a user ENUM takes the same door: the element oid on the
+    // wire is the enum's own, and each element is its label's bytes.
     if let postgres_types::Kind::Array(inner) = ty.kind() {
-        if *inner == Type::RECORD || matches!(inner.kind(), postgres_types::Kind::Composite(_)) {
+        if *inner == Type::RECORD
+            || matches!(
+                inner.kind(),
+                postgres_types::Kind::Composite(_) | postgres_types::Kind::Enum(_)
+            )
+        {
             let binary = array_binary(items, inner).ok_or_else(|| bad("this value"))?;
             let text = secantus_pgplan::value_text(v);
             return enc.encode_field(&RawField { binary, text });
@@ -5923,6 +6020,13 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
     }
     if *ty == Type::INT8_ARRAY {
         let v: Vec<Option<i64>> = items.iter().map(&as_i64).collect();
+        return enc.encode_field(&v);
+    }
+    if *ty == Type::OID_ARRAY {
+        let v: Vec<Option<u32>> = items
+            .iter()
+            .map(|x| as_i64(x).and_then(|n| u32::try_from(n).ok()))
+            .collect();
         return enc.encode_field(&v);
     }
     if *ty == Type::FLOAT4_ARRAY {
@@ -6806,9 +6910,28 @@ fn element_binary(v: &Bson, elem: &Type) -> Option<Vec<u8>> {
         let fields = secantus_pgplan::record_field_values(v)?;
         let field_types: Vec<Type> = match elem.kind() {
             postgres_types::Kind::Composite(fs) => fs.iter().map(|f| f.type_().clone()).collect(),
-            _ => fields.iter().map(record_field_type).collect(),
+            // A `ROW(...)` record carries its fields' STATIC types (a bare
+            // literal is `unknown`, 705); one built any other way is typed
+            // from its values.
+            _ => match secantus_pgplan::record_field_types(v) {
+                Some(names) => names
+                    .iter()
+                    .map(|n| match n.as_str() {
+                        "unknown" => Type::UNKNOWN,
+                        other => wire_type(other),
+                    })
+                    .collect(),
+                None => fields.iter().map(record_field_type).collect(),
+            },
         };
         return record_binary(fields, &field_types);
+    }
+    // A user ENUM element: its label's bytes, as the scalar arm sends them.
+    if matches!(elem.kind(), postgres_types::Kind::Enum(_)) {
+        return match v {
+            Bson::String(x) => Some(x.clone().into_bytes()),
+            _ => None,
+        };
     }
     let int = |v: &Bson| -> Option<i64> {
         match v {
@@ -7032,6 +7155,10 @@ fn element_of_array_oid(oid: u32) -> Option<&'static str> {
         651 => "cidr",
         1020 => "box",
         2951 => "uuid",
+        // `oid[]` sent as text (`{1,2}`, psycopg's `[Oid(1), Oid(2)]`) used to
+        // stay the literal string, and a binary result then refused it as
+        // `cannot send this value as a binary _oid`.
+        1028 => "oid",
         _ => return None,
     })
 }
@@ -7341,7 +7468,11 @@ fn csv_field(text: &str, was_quoted: bool) -> Option<String> {
 ///   doubled.
 ///
 /// All of it measured against PostgreSQL 14.
-fn copy_text_row(row: &[Option<Bson>], format: secantus_pgplan::CopyFormat) -> bytes::Bytes {
+fn copy_text_row(
+    row: &[Option<Bson>],
+    format: secantus_pgplan::CopyFormat,
+    schema: &[FieldInfo],
+) -> bytes::Bytes {
     use secantus_pgplan::CopyFormat;
     let csv = format == CopyFormat::Csv;
     let mut out = String::new();
@@ -7349,6 +7480,7 @@ fn copy_text_row(row: &[Option<Bson>], format: secantus_pgplan::CopyFormat) -> b
         if i > 0 {
             out.push(if csv { ',' } else { '\t' });
         }
+        let oid = schema.get(i).map(|f| f.datatype().oid()).unwrap_or(0);
         let text = match value {
             None | Some(Bson::Null) => {
                 if !csv {
@@ -7357,7 +7489,24 @@ fn copy_text_row(row: &[Option<Bson>], format: secantus_pgplan::CopyFormat) -> b
                 // CSV's null is the empty field, so there is nothing to write.
                 continue;
             }
+            // An inet / cidr field is `inet_out` / `cidr_out`, as in a SELECT:
+            // inet drops a full-host mask, cidr keeps it.
+            Some(Bson::String(v)) if matches!(oid, 869 | 650) => {
+                secantus_pgplan::net::text_out(v, oid == 650)
+            }
             Some(Bson::String(v)) => v.clone(),
+            Some(Bson::Array(items)) if matches!(oid, 1041 | 651) => {
+                let rendered: Vec<Bson> = items
+                    .iter()
+                    .map(|x| match x {
+                        Bson::String(t) => {
+                            Bson::String(secantus_pgplan::net::text_out(t, oid == 651))
+                        }
+                        other => other.clone(),
+                    })
+                    .collect();
+                secantus_pgplan::value_text(&Bson::Array(rendered))
+            }
             Some(other) => secantus_pgplan::value_text(other),
         };
         if csv {
@@ -7599,6 +7748,18 @@ fn decode_parameter(
             // Every array oid this server knows, decoded through the element's
             // own binary decoder rather than a per-type array reader.
             Some(oid) if element_of_array_oid(oid).is_some() => binary_array(bytes, tz, cenc),
+            // A user ENUM ARRAY (the declared type names it): the same array
+            // layout, whose element oid `Type::from_oid` does not know -- so
+            // each element takes the user-type arm below and decodes to its
+            // label. Membership is checked by the caller against the enum.
+            Some(_)
+                if ty.is_some_and(|t| {
+                    matches!(t.kind(), postgres_types::Kind::Array(inner)
+                        if matches!(inner.kind(), postgres_types::Kind::Enum(_)))
+                }) =>
+            {
+                binary_array(bytes, tz, cenc)
+            }
             // An oid this server has no decoder for is a USER type -- the
             // known builtins all matched above. A user ENUM's binary format is
             // its label's bytes in the client encoding, so it decodes to the
@@ -7695,6 +7856,16 @@ fn decode_parameter(
             let element = element_of_array_oid(oid).expect("checked");
             secantus_pgplan::cast_text_to(&text, &format!("{element}[]"), tz)
                 .map_err(|e| PgHandler::err(&e))
+        }
+        // A user ENUM ARRAY in text: an array of labels (the caller checks
+        // membership), parsed as a text array.
+        Some(_)
+            if ty.is_some_and(|t| {
+                matches!(t.kind(), postgres_types::Kind::Array(inner)
+                    if matches!(inner.kind(), postgres_types::Kind::Enum(_)))
+            }) =>
+        {
+            secantus_pgplan::cast_text_to(&text, "text[]", tz).map_err(|e| PgHandler::err(&e))
         }
         // A range or multirange sent as TEXT. Without these it fell through to
         // `sniff_text` and stayed the literal the client wrote, UNCANONICALISED
@@ -7830,15 +8001,83 @@ impl PgHandler {
                         return Ok(bson);
                     }
                 }
-                decode_parameter(
-                    raw.as_ref(),
-                    declared.get(i).and_then(|t| t.as_ref()),
-                    binary,
-                    &tz,
-                    cenc,
-                )
+                // A raw oid naming a user ENUM or enum ARRAY that the planner
+                // did not type itself: resolve it to the wire type so the
+                // decoder reads an enum array's `{a,b}` text as an ARRAY of
+                // labels rather than sniffing it into one string.
+                let enum_ty = match declared_ty {
+                    None => oids
+                        .get(i)
+                        .copied()
+                        .filter(|o| *o != 0)
+                        .and_then(|o| self.user_wire_type_for_oid(o))
+                        .filter(|t| {
+                            matches!(t.kind(), postgres_types::Kind::Enum(_))
+                                || matches!(t.kind(), postgres_types::Kind::Array(inner)
+                                    if matches!(inner.kind(), postgres_types::Kind::Enum(_)))
+                        }),
+                    Some(_) => None,
+                };
+                let declared_ty = enum_ty.as_ref().or(declared_ty);
+                let value = decode_parameter(raw.as_ref(), declared_ty, binary, &tz, cenc)?;
+                self.check_enum_param(i, oids.get(i).copied(), declared_ty, &value)?;
+                Ok(value)
             })
             .collect()
+    }
+
+    /// Reject a parameter typed as a user ENUM (or an enum ARRAY) whose value
+    /// is not one of its labels -- PostgreSQL validates the label at Bind, so
+    /// `select $1::text` with an enum-typed `$1` holding a non-label is a
+    /// `22P02` before the query runs. Measured on 16.15: the context line is
+    /// `unnamed portal parameter $1 = '...'` (the value elided, as
+    /// `log_parameter_max_length_on_error` defaults to 0).
+    fn check_enum_param(
+        &self,
+        index: usize,
+        raw_oid: Option<u32>,
+        declared: Option<&Type>,
+        value: &Bson,
+    ) -> PgWireResult<()> {
+        let enums = self.enums()?;
+        let by_oid = |oid: i64| enums.iter().find(|(_, o, _)| *o == oid);
+        let found = match declared.map(|t| t.kind()) {
+            Some(postgres_types::Kind::Enum(_)) => {
+                declared.and_then(|t| by_oid(i64::from(t.oid())))
+            }
+            Some(postgres_types::Kind::Array(inner))
+                if matches!(inner.kind(), postgres_types::Kind::Enum(_)) =>
+            {
+                by_oid(i64::from(inner.oid()))
+            }
+            _ => raw_oid.filter(|o| *o != 0).and_then(|o| {
+                let o = i64::from(o);
+                by_oid(o).or_else(|| by_oid(o - Self::USER_TYPE_ARRAY_OID_OFFSET))
+            }),
+        };
+        let Some((name, _, labels)) = found else {
+            return Ok(());
+        };
+        fn first_bad<'a>(v: &'a Bson, labels: &[String]) -> Option<&'a str> {
+            match v {
+                Bson::String(s) if !labels.contains(s) => Some(s),
+                Bson::Array(items) => items.iter().find_map(|x| first_bad(x, labels)),
+                _ => None,
+            }
+        }
+        match first_bad(value, labels) {
+            None => Ok(()),
+            Some(label) => {
+                let mut info = ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "22P02".to_owned(),
+                    format!("invalid input value for enum {name}: \"{label}\""),
+                );
+                info.where_context =
+                    Some(format!("unnamed portal parameter ${} = '...'", index + 1));
+                Err(PgWireError::UserError(Box::new(info)))
+            }
+        }
     }
 
     /// The output columns a statement would produce, without running it, or
@@ -8208,14 +8447,17 @@ impl ExtendedQueryHandler for PgHandler {
             &self.param_type_names(portal.statement.as_ref()),
         );
         let params = self.portal_params(portal, &param_types)?;
-        let mut responses = self
+        let result = self
             .run_typed(
                 &portal.statement.statement.sql,
                 &params,
                 &param_types,
                 max_rows,
             )
-            .await?;
+            .await;
+        // Notices go out before the result -- or the error -- they preceded.
+        self.flush_notices(_c).await?;
+        let mut responses = result?;
         // Report any GUC change (TimeZone, DateStyle, ...) the statement made.
         self.report_pending_params(_c).await?;
         // One portal is one statement, so exactly one response.
@@ -8261,8 +8503,13 @@ fn copy_field(
             Bson::Int32(text.trim().parse().map_err(|_| bad("integer"))?)
         }
         "int8" | "bigint" => Bson::Int64(text.trim().parse().map_err(|_| bad("bigint"))?),
-        "float4" | "float8" | "real" | "numeric" => {
+        "float4" | "float8" | "real" => {
             Bson::Double(text.trim().parse().map_err(|_| bad("double precision"))?)
+        }
+        // A numeric is exact: `9223372036854775807` through an f64 came back
+        // as `9.223372036854776E+18`.
+        "numeric" | "decimal" => {
+            Bson::Decimal128(secantus_pgplan::parse_numeric(&text).map_err(|e| PgHandler::err(&e))?)
         }
         "bool" | "boolean" => match text.trim() {
             "t" | "true" | "y" | "yes" | "on" | "1" => Bson::Boolean(true),
