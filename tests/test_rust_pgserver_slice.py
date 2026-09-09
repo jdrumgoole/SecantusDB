@@ -7303,3 +7303,59 @@ def test_is_null_over_a_constant_and_a_from_less_unnest(home: Path) -> None:
         assert [(d.name, d.type_code) for d in cur.description] == [("u", 23)]
         assert cur.fetchall() == [(1,), (2,)]
         assert conn.execute("select unnest(null::text[])").fetchall() == []
+
+
+def test_assignment_needs_an_assignment_cast(home: Path) -> None:
+    """A typed expression assigned to a column with no assignment cast is 42804.
+
+    Measured on PostgreSQL 16: psycopg's binary-format string is declared
+    ``text`` (its text-format one is untyped), and ``text`` has no assignment
+    cast to ``jsonb`` / ``integer`` -- ``column "data" is of type jsonb but
+    expression is of type text`` with PostgreSQL's hint, on INSERT and UPDATE
+    alike. Into a string column any type stores (an I/O cast), an untyped
+    string still coerces through the column's parser, and ``bigint`` into
+    ``integer`` is a plain assignment cast. Before this the server coerced the
+    text through the column's parser whatever the client declared.
+    """
+    hint = "You will need to rewrite or cast the expression."
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        conn.execute("create table testjson(id int, data jsonb, n int, s text)")
+        conn.execute("insert into testjson (id, data) values (1, %t)", ["{}"])
+        assert conn.execute("select data from testjson").fetchone() == ({},)
+        for sql, args in [
+            ("insert into testjson (data) values (%b)", ["{}"]),
+            ("update testjson set data = %b", ["{}"]),
+            ("insert into testjson (data) values (%s::text)", ["{}"]),
+        ]:
+            with pytest.raises(psycopg.errors.DatatypeMismatch) as ex:
+                conn.execute(sql, args)
+            assert ex.value.diag.message_primary == (
+                'column "data" is of type jsonb but expression is of type text'
+            )
+            assert ex.value.diag.message_hint == hint
+        with pytest.raises(psycopg.errors.DatatypeMismatch) as ex:
+            conn.execute("update testjson set n = %s::varchar", ["1"])
+        assert ex.value.diag.message_primary == (
+            'column "n" is of type integer but expression is of type character varying'
+        )
+        with pytest.raises(psycopg.errors.DatatypeMismatch) as ex:
+            conn.execute("update testjson set n = true")
+        assert ex.value.diag.message_primary == (
+            'column "n" is of type integer but expression is of type boolean'
+        )
+        conn.execute("update testjson set s = %b, n = %s::bigint where id = 1", ["x", 7])
+        conn.execute("update testjson set s = 5::int where id = 1")
+        assert conn.execute("select s, n from testjson").fetchone() == ("5", 7)
+
+
+def test_startup_parameter_status_matches_show(home: Path) -> None:
+    """The ``ParameterStatus`` sent at startup is what ``SHOW`` then reports.
+
+    psycopg's ``test_parameter_status`` compares the two; the startup value
+    came from the wire library's defaults (``Etc/UTC``) while ``SHOW
+    TimeZone`` answered the session's ``UTC``.
+    """
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        for name in ("TimeZone", "DateStyle"):
+            shown = conn.execute(f"show {name}").fetchone()[0]
+            assert conn.info.parameter_status(name) == shown

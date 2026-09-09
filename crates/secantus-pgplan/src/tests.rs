@@ -2782,6 +2782,49 @@ fn insert_with_untyped_parameters_takes_the_column_types() {
     }
 }
 
+/// An assignment needs an assignment cast: a `text`-declared parameter into
+/// an `int4` column is 42804 with PostgreSQL's hint, on INSERT and UPDATE
+/// alike, while into `text` it stores and an `int8`-declared one into `int4`
+/// stores too (measured on 16).
+#[test]
+fn assigning_a_text_typed_expression_to_a_non_text_column_is_42804() {
+    let plan_typed = |sql: &str, types: &[Option<String>]| {
+        plan_with_session_types(
+            sql,
+            &lookup,
+            &[Bson::String("1".into())],
+            types,
+            &TimeZoneSetting::default(),
+        )
+    };
+    let text = [Some("text".to_string())];
+    for sql in ["insert into t (n) values ($1)", "update t set n = $1"] {
+        let err = plan_typed(sql, &text).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), "42804");
+        assert_eq!(
+            err.to_string(),
+            "column \"n\" is of type integer but expression is of type text"
+        );
+        assert_eq!(
+            err.hint(),
+            Some("You will need to rewrite or cast the expression.")
+        );
+    }
+    let err = plan_ok_err("update t set n = '1'::varchar");
+    assert_eq!(
+        err.to_string(),
+        "column \"n\" is of type integer but expression is of type character varying"
+    );
+    plan_typed("insert into t (name) values ($1)", &text).expect("text into text");
+    plan_typed("insert into t (n) values ($1)", &[Some("int8".to_string())])
+        .expect("bigint into integer");
+    plan_typed("insert into t (n) values ($1)", &[None]).expect("untyped coerces");
+}
+
+fn plan_ok_err(sql: &str) -> Error {
+    plan(sql, &lookup).expect_err("should refuse")
+}
+
 #[test]
 fn max_param_number_sees_the_values_of_an_insert() {
     assert_eq!(max_param_number("insert into t values ($1, $2)"), 2);

@@ -162,6 +162,11 @@ impl Error {
             Error::InvalidParameter(m) if m.starts_with("unrecognized format() type specifier") => {
                 Some("For a single \"%\" use \"%%\".")
             }
+            // An assignment with no assignment cast (measured on 16: `insert
+            // into t(j) values ($1)` with a `text`-declared `$1` into `jsonb`).
+            Error::DatatypeMismatch(m) if m.contains(" but expression is of type ") => {
+                Some("You will need to rewrite or cast the expression.")
+            }
             _ => None,
         }
     }
@@ -1884,6 +1889,11 @@ fn plan_insert(
             Some(N::List(l)) => &l.items,
             _ => return Err(Error::Unsupported("this VALUES form".into())),
         };
+        for (item, target) in items.iter().zip(&targets) {
+            if let Some(column) = def.column(target) {
+                check_assignment_type(column, item)?;
+            }
+        }
         let values = items
             .iter()
             .map(|item| const_value(item, params))
@@ -1904,6 +1914,77 @@ fn plan_insert(
         targets,
         explicit_columns: !i.cols.is_empty(),
     }))
+}
+
+/// The type an assigned expression DECLARES, when it declares one: an
+/// explicit cast, or a parameter the client typed. Anything else -- a bare
+/// literal (`unknown`), a function call, an operator -- is left to the
+/// coercion `cast_value` already performs, so this never invents a type
+/// from a value.
+fn declared_expression_type(node: &pg_query::protobuf::Node) -> Option<String> {
+    match node.node.as_ref()? {
+        N::TypeCast(tc) => tc.type_name.as_ref().map(type_name_of),
+        N::ParamRef(p) => declared_param_type(usize::try_from(p.number).ok()?),
+        // A bare `true` / `false` is a `boolean` constant, not an unknown
+        // literal: `set n = true` on an integer column is 42804.
+        N::AConst(c) if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Boolval(_))) => {
+            Some("bool".to_string())
+        }
+        _ => None,
+    }
+}
+
+fn is_string_type(t: &str) -> bool {
+    matches!(
+        t,
+        "text" | "varchar" | "character varying" | "bpchar" | "char" | "character" | "name"
+    )
+}
+
+fn is_integer_type(t: &str) -> bool {
+    matches!(
+        t,
+        "int2" | "smallint" | "int4" | "int" | "integer" | "int8" | "bigint"
+    )
+}
+
+fn is_boolean_type(t: &str) -> bool {
+    matches!(t, "bool" | "boolean")
+}
+
+/// PostgreSQL's assignment-cast rule for the part of it a typed value can
+/// hit: an assignment needs an ASSIGNMENT cast, and a string type has one
+/// only to another string type (every other cast out of `text` is explicit),
+/// while any type has an I/O cast INTO a string type. `boolean` and the
+/// integers have only explicit casts between them.
+///
+/// Measured on 16 -- `insert into t(data) values ($1)` with a text-declared
+/// `$1` is `42804 column "data" is of type jsonb but expression is of type
+/// text` for jsonb / json / integer / numeric / real / date / timestamp /
+/// interval / boolean / uuid / bytea / text[] targets; the same statement
+/// into `text`, `varchar` or `char(3)` stores the value, as does an
+/// integer-declared `$1` into `text` or `bigint`, and json into jsonb.
+/// Before this the server coerced the text through the column's parser, so
+/// the psycopg binary-format string that PostgreSQL rejects was stored.
+fn check_assignment_type(column: &Column, node: &pg_query::protobuf::Node) -> Result<()> {
+    let Some(from) = declared_expression_type(node) else {
+        return Ok(());
+    };
+    let to = column.pg_type.as_str();
+    let (from_s, to_s) = (display_type(&from), display_type(to));
+    let allowed = from_s == to_s
+        || from == "unknown"
+        || is_string_type(to)
+        || !(is_string_type(&from)
+            || (is_boolean_type(&from) && is_integer_type(to))
+            || (is_integer_type(&from) && is_boolean_type(to)));
+    if allowed {
+        return Ok(());
+    }
+    Err(Error::DatatypeMismatch(format!(
+        "column \"{}\" is of type {to_s} but expression is of type {from_s}",
+        column.name
+    )))
 }
 
 /// Shape one row of values into the document an INSERT stores, `values`
@@ -9452,6 +9533,7 @@ fn plan_update(
             .val
             .as_ref()
             .ok_or_else(|| Error::Parse("SET without a value".into()))?;
+        check_assignment_type(column, val)?;
         // A value that reads the row (`num * 2`) has no constant to store;
         // it is planned as a row expression and evaluated per matched row.
         if references_columns(val) {

@@ -70,3 +70,15 @@ refused at CREATE (`42703`, `42830`).
   oid counter is likewise advanced outside the block, like PostgreSQL's OID
   counter, so two open `CREATE TYPE` blocks no longer conflict (a rolled-back
   block just skips an oid).
+- Rust PostgreSQL server: an assignment with no assignment cast is refused
+  as PostgreSQL refuses it — a `text` / `varchar`-typed expression (an
+  explicit cast, or a parameter the client declared, which is how psycopg
+  sends a binary-format string) into a `jsonb`, `integer`, `date`, ... column,
+  or `boolean` into an integer column, is `42804 column "data" is of type
+  jsonb but expression is of type text` with the `You will need to rewrite
+  or cast the expression.` hint, on INSERT and UPDATE. Before this the value
+  was coerced through the column's parser and stored.
+- Rust PostgreSQL server: the `TimeZone` / `DateStyle` `ParameterStatus` sent
+  at startup now carries the session's values (`UTC`, `ISO, MDY`) rather than
+  the wire library's defaults, so what a client caches at connect is what
+  `SHOW` reports.

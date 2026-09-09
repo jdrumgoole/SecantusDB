@@ -3096,11 +3096,19 @@ impl StartupHandler for PgHandler {
 
         let (pid, secret_key) = PID_GENERATOR.generate(client);
         client.set_pid_and_secret_key(pid, secret_key);
-        pgwire::api::auth::finish_authentication0(
-            client,
-            &DefaultServerParameterProvider::default(),
-        )
-        .await?;
+        // The startup ParameterStatus values are the SESSION's settings, so
+        // what a client reads from `parameter_status("TimeZone")` is what
+        // `SHOW timezone` answers -- pgwire's own defaults (`Etc/UTC`, `ISO,
+        // YMD`) disagreed with the session's `UTC` / `ISO, MDY`.
+        let mut provider = DefaultServerParameterProvider::default();
+        let defaults = default_settings();
+        if let Some(tz) = defaults.get("TimeZone") {
+            provider.time_zone = tz.clone();
+        }
+        if let Some(ds) = defaults.get("DateStyle") {
+            provider.date_style = ds.clone();
+        }
+        pgwire::api::auth::finish_authentication0(client, &provider).await?;
         self.post_startup(client).await?;
         client
             .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
