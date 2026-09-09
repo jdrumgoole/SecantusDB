@@ -3928,6 +3928,29 @@ def test_composite_parameter_round_trips_in_both_formats(home: Path, binary: boo
         # A NULL field survives, and the text render matches PostgreSQL's.
         obj_null = info.python_type("foo", 1, None)
         assert cur.execute("select %s::text", [obj_null]).fetchone()[0] == "(foo,1,)"
+        # The planner NAMES the slot from the compared operand (`row(..)::cp =
+        # $1` types `$1` as `cp`), so the parameter arrives with a declared
+        # composite type rather than the raw oid alone. That declared type must
+        # take the record decoder too: it once fell through to the generic one,
+        # which read the text form as a plain string (`comparing document with
+        # string`) and refused the binary form outright (`binary parameters of
+        # type oid Some(...) are not supported yet`).
+        assert cur.execute("select row('hi', 42, 3.5)::cp = %s", [obj]).fetchone()[0] is True
+        assert cur.execute("select row('hi', 43, 3.5)::cp = %s", [obj]).fetchone()[0] is False
+        # And a composite holding a range field, on a fresh connection (a
+        # second `register_composite` on the same connection makes psycopg
+        # send the parameter untyped -- PostgreSQL answers `could not
+        # determine data type of parameter $1` for that too).
+        conn.execute("create type cpr as (num int4, r daterange, nums int4[])")
+        conn2 = conn.__class__.connect(conn.info.dsn, autocommit=True)
+        from psycopg.types.range import Range
+
+        rinfo = CompositeInfo.fetch(conn2, "cpr")
+        register_composite(rinfo, conn2)
+        robj = rinfo.python_type(10, Range(empty=True), [])
+        cur = conn2.cursor(binary=binary)
+        assert cur.execute("select pg_typeof(%s)", [robj]).fetchone()[0] == "cpr"
+        assert cur.execute("select %s::text", [robj]).fetchone()[0] == "(10,empty,{})"
 
 
 def test_composite_array_load_text_and_binary(home: Path) -> None:

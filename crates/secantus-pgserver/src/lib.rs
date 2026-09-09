@@ -7123,14 +7123,23 @@ impl PgHandler {
                 // a user COMPOSITE, decode the value into the record BSON a
                 // `::comp` literal produces -- the ordinary decoder would sniff
                 // the `(a,b)` text into a plain string, so field access and
-                // `= row(..)` on the parameter both broke.
-                if declared.get(i).and_then(|t| t.as_ref()).is_none() {
-                    if let Some(oid) = oids.get(i).copied().filter(|o| *o != 0) {
-                        if let Some(bson) =
-                            self.decode_composite_param(oid, raw.as_ref(), binary, &tz)?
-                        {
-                            return Ok(bson);
-                        }
+                // `= row(..)` on the parameter both broke. The planner can
+                // also NAME the slot a composite (`row(..)::comp = $1` infers
+                // it from the compared operand), in which case `declared` is
+                // the composite `Type` itself and its oid takes the same door.
+                let declared_ty = declared.get(i).and_then(|t| t.as_ref());
+                let composite_oid = match declared_ty {
+                    None => oids.get(i).copied().filter(|o| *o != 0),
+                    Some(t) if matches!(t.kind(), postgres_types::Kind::Composite(_)) => {
+                        Some(t.oid())
+                    }
+                    Some(_) => None,
+                };
+                if let Some(oid) = composite_oid {
+                    if let Some(bson) =
+                        self.decode_composite_param(oid, raw.as_ref(), binary, &tz)?
+                    {
+                        return Ok(bson);
                     }
                 }
                 decode_parameter(
