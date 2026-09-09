@@ -645,17 +645,33 @@ remain open:
       silent (2026-09-09).** PG 16.15 emits `NOTICE: table "t" does not
       exist, skipping`; the Rust server sends no `NoticeResponse`. The
       notice seam now exists (added for `RAISE`), so this is a one-site fix.
-- [ ] **OPEN — RUST pgserver: `numeric` values wider than 34 significant
-      digits round (`test_dump_numeric_exhaustive[s/t/b]`,
-      `test_load_numeric_exhaustive[0/1]`, 2026-09-09).** The tests round-trip
-      every width up to hundreds of digits; PG 16.15 returns each value
-      exactly. Storage is Decimal128, so `select
-      1234567890123456789012345678901234567890::numeric` is refused with
-      `22003 numeric value out of range: "..." exceeds the 34 significant
-      digits this server stores` (a deliberate loud refusal rather than a
-      silent round; PG 16.15 returns the value). Same root as the shared
-      "`numeric` beyond 34 significant digits" entry below — needs a
-      text/dual representation that the comparison and sort paths also use.
+- [ ] **OPEN — RUST pgserver: residuals of the wide-`numeric` slice
+      (2026-09-09).** Values wider than Decimal128 now store exactly as
+      `{__numeric: <canonical text>, __numkey: <byte-sortable key>}`
+      (`secantus-pgplan/src/numeric.rs`); round-trip, `::text`, comparison,
+      ORDER BY, `+ - * /`, `sum` / `min` / `max` and the numeric PRIMARY KEY
+      path all match PG 16.15. Left open, each measured:
+  - `numeric(p, s)` typmod is parsed and ignored: `create table t (n
+    numeric(5, 2))` stores `1.234` as `1.234`; PG rounds to `1.23` and
+    refuses a value with more than `p - s` integer digits (22003).
+  - `avg(numeric)` is unsupported (`sum` / `min` / `max` / `count` are);
+    PG returns numeric at the division scale rule.
+  - a bare string literal against a numeric column is not coerced in WHERE:
+    `where n = 'NaN'` / `where n > '1e40'` compare as text; PG coerces the
+    unknown-typed literal to numeric. Cast it (`'NaN'::numeric`) or bind a
+    parameter.
+  - a numeric-column predicate lowers to an `$or` of a Decimal128 arm and a
+    `__numkey` arm (plus a NaN arm for `>` / `>=`), so it never IXSCANs a
+    secondary index — moot today because `CREATE INDEX` is itself
+    unsupported on the Rust pgserver (`IndexStmt is not supported yet`); the
+    `_id` index (numeric PRIMARY KEY) does resolve by value.
+  - `UPDATE t SET pk = <wide value>` on a numeric PRIMARY KEY bypasses the
+    value-equality duplicate precheck that INSERT runs (`UPDATE` of a
+    primary-key column is refused with 0A000 today, so unreachable until
+    that lands — keep the two together).
+  - `float4` / `float8` columns keep MQL's NaN placement (below every
+    number) in WHERE; PG puts NaN above infinity for floats too. Only
+    `numeric` was moved in this slice.
 - [ ] **OPEN — RUST pgserver: NOT NULL / CHECK / FOREIGN KEY constraints are
       not enforced at all (re-measured 2026-09-09; `test_commit_error`,
       `test_diag_from_commit[_async]`, `test_diag_attr_values`).** Against
@@ -2355,10 +2371,6 @@ These are explicit non-goals. Don't add them without a reason.
     statement (psycopg never does this — it re-prepares).
   - `information_schema.columns` for a catalog VIEW (`where table_name =
     'pg_prepared_statements'`) is `relation "columns" does not exist`.
-  - `test_copy.py::test_copy_table_across[*]` fail on some faker draws with
-    `numeric value out of range: ... exceeds the 34 significant digits this
-    server stores` — the 34-digit `numeric` item, not COPY (the numeric range
-    bound comparison they used to fail on is fixed, 2026-09-09).
   - `test_copy_out_error_with_copy_not_finished`: after a COPY OUT is
     abandoned mid-stream psycopg sends CancelRequest and drains; PG ends the
     transaction `INERROR` (57014), ours stays `INTRANS` — the CancelRequest
@@ -9547,7 +9559,11 @@ shared storage engine or building large new protocol subsystems:
   with what they display. Today both sides are rounded and therefore agree.
   Trading a consistent ceiling for an inconsistent one is the worse deal;
   closing this properly means a text/dual representation for `numeric` that the
-  comparison and sort paths also use. Original entry:
+  comparison and sort paths also use. **The RUST pgserver did exactly that on
+  2026-09-09** (`secantus-pgplan/src/numeric.rs`: `__numeric` text +
+  `__numkey` sort key, used by WHERE lowering, ORDER BY, arithmetic and the
+  `_id` index) — the ceiling below is now the PYTHON server's only. Original
+  entry:
 
 - **`numeric` beyond 34 significant digits.** Stored as Decimal128, which
   caps at 34 digits (same shared constraint); wider *stored* values round.

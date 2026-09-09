@@ -12,17 +12,16 @@
 //! refusal, and the two-server model has no third option.
 
 use bson::{doc, Bson, Document};
-use std::str::FromStr;
 
 pub mod bytea;
 pub mod geo;
 pub mod json;
 pub mod net;
+pub mod numeric;
 pub mod pgtypes;
 pub mod range;
 pub mod scalar;
 
-use bson::Decimal128;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use pg_query::protobuf::node::Node as N;
 use pg_query::protobuf::{
@@ -30,6 +29,12 @@ use pg_query::protobuf::{
     SortByNulls, TransactionStmtKind, VariableSetKind,
 };
 use secantus_pgcatalog::{Column, TableDef};
+
+pub use numeric::{
+    canonical_numeric_text, compare_decimal_text, is_numeric, is_wide_numeric, numeric_bson,
+    numeric_text, parse_numeric, plain_numeric_text, WIDE_NUMERIC_KEY, WIDE_NUMERIC_SORT_KEY,
+};
+use numeric::{decimal_arith, negate_numeric_text};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Error {
@@ -2386,6 +2391,10 @@ fn sample_value_for_type(pg_type: &str) -> Bson {
         "int2" | "int4" => Bson::Int32(1),
         "int8" => Bson::Int64(1),
         "float4" | "float8" => Bson::Double(1.0),
+        // Without a numeric sample, `n * 2` over a numeric column evaluated
+        // to NULL and was typed `int4`, so the client's int loader choked on
+        // `3.0`.
+        "numeric" | "decimal" => Bson::Decimal128("1".parse().expect("literal")),
         "bool" => Bson::Boolean(true),
         "text" | "varchar" | "bpchar" | "name" => Bson::String(String::new()),
         _ => Bson::Null,
@@ -3011,7 +3020,12 @@ pub fn aggregate_output_def(
             OutputCol::Agg(i) => {
                 let item = &agg.items[*i];
                 match item.func {
-                    AggFunc::CountStar | AggFunc::Count | AggFunc::Sum => "int8".to_string(),
+                    AggFunc::CountStar | AggFunc::Count => "int8".to_string(),
+                    // `sum(numeric)` is numeric; the integer sums are int8.
+                    AggFunc::Sum => match item.source_type.as_deref() {
+                        Some("numeric" | "decimal") => "numeric".to_string(),
+                        _ => "int8".to_string(),
+                    },
                     AggFunc::Min | AggFunc::Max => item
                         .source_type
                         .clone()
@@ -3495,6 +3509,16 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
                         if let Some(t) = datetime_arith_type(op, &lt, &rt) {
                             return t.to_string();
                         }
+                        // Numeric arithmetic types from the operands too:
+                        // anything beside a `numeric` is `numeric`, and a
+                        // float wins over it (`wider_numeric`'s ladder).
+                        if matches!(op, "+" | "-" | "*" | "/") {
+                            if let Some(t) = wider_numeric(&lt, &rt) {
+                                if t == "numeric" || t == "float8" || t == "float4" {
+                                    return t;
+                                }
+                            }
+                        }
                     }
                     if *value == Bson::Null {
                         "int4".to_string()
@@ -3590,6 +3614,7 @@ fn inferred_type(v: &Bson) -> &'static str {
         Bson::Int64(_) => "int8",
         Bson::Double(_) => "float8",
         Bson::Decimal128(_) => "numeric",
+        Bson::Document(d) if d.contains_key(WIDE_NUMERIC_KEY) => "numeric",
         Bson::Array(items) => match items.first() {
             Some(Bson::Int32(_)) | None => "int4[]",
             Some(Bson::Int64(_)) => "int8[]",
@@ -6688,123 +6713,12 @@ pub fn render_timestamp(micros: i64) -> String {
     }
 }
 
-/// Parse a `numeric` literal.
-///
-/// PostgreSQL's `numeric` carries its SCALE as part of the value: `1.50` is not
-/// `1.5`, and `SELECT 1.50::numeric::text` answers `'1.50'`. BSON's
-/// `Decimal128` preserves scale the same way, so the two agree without any
-/// extra bookkeeping (`1.50` -> `1.50`, `2.5000000000000000` round-trips).
-///
-/// Decimal128 holds 34 significant digits; PostgreSQL's `numeric` is arbitrary
-/// precision. A value that will not fit is REFUSED rather than silently
-/// rounded -- the same line drawn everywhere else here, because a quietly
-/// rounded number is a wrong answer while an error is merely a missing feature.
-pub fn parse_numeric(text: &str) -> Result<Decimal128> {
-    let t = text.trim();
-    // PostgreSQL's numeric has no negative zero: `-0.0` is `0.0`. Decimal128
-    // keeps the sign, and it would print. Strip it from a zero mantissa.
-    let t = match t.strip_prefix('-') {
-        Some(body) if is_zero_mantissa(body) => body,
-        _ => t,
-    };
-    Decimal128::from_str(t).map_err(|_| {
-        // Distinguish "too big for us" from "not a number at all": the first is
-        // a real PostgreSQL value we cannot represent, the second is the
-        // client's mistake.
-        let numeric_shape = {
-            let body = t.strip_prefix(['+', '-']).unwrap_or(t);
-            !body.is_empty()
-                && body.chars().all(|c| {
-                    c.is_ascii_digit() || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-'
-                })
-                && body.chars().any(|c| c.is_ascii_digit())
-        };
-        if numeric_shape {
-            Error::NumericOutOfRange(format!(
-                "numeric value out of range: \"{t}\" exceeds the 34 significant \
-                 digits this server stores"
-            ))
-        } else {
-            Error::InvalidText(format!("invalid input syntax for type numeric: \"{t}\""))
-        }
-    })
-}
-
-/// Whether a numeric literal's body (sign already stripped) is a zero:
-/// digits and at most one point before any exponent, every digit `0`.
-fn is_zero_mantissa(body: &str) -> bool {
-    let mantissa = body.split(['e', 'E']).next().unwrap_or("");
-    let digits: Vec<char> = mantissa.chars().filter(|c| *c != '.').collect();
-    !digits.is_empty() && digits.iter().all(|c| *c == '0')
-}
-
 /// Render one array element as PostgreSQL renders it inside `{...}`.
 ///
 /// Quoting is not cosmetic: an element containing a comma, brace, quote,
 /// backslash or whitespace -- or one that is empty, or that spells `NULL` --
 /// must be quoted, or reading the array back would split it in the wrong place
 /// or turn a literal `"NULL"` string into a null.
-/// A `numeric` rendered the way PostgreSQL renders one: PLAIN, never in
-/// exponent notation.
-///
-/// `Decimal128`'s own rendering keeps the scale (`1.50`, not `1.5`), which is
-/// part of a numeric's value and must survive -- but it also falls back to
-/// `E` notation for large and small magnitudes, and PostgreSQL never does:
-/// `1.5e20::numeric` is `150000000000000000000` there and was `1.5E+20` here,
-/// in the row, in a `::text` cast and inside an array. A value the client
-/// cannot tell from the right one only by luck of `Decimal` comparing equal.
-///
-/// The non-finite renderings (`NaN`, `Infinity`) carry no exponent and pass
-/// through untouched.
-pub fn plain_numeric_text(text: &str) -> String {
-    let Some(epos) = text.find(['e', 'E']) else {
-        return text.to_string();
-    };
-    let (mantissa, exp) = text.split_at(epos);
-    let Ok(exp) = exp[1..].parse::<i32>() else {
-        return text.to_string();
-    };
-    let (sign, mantissa) = match mantissa.strip_prefix('-') {
-        Some(rest) => ("-", rest),
-        None => ("", mantissa.strip_prefix('+').unwrap_or(mantissa)),
-    };
-    let (int_part, frac_part) = match mantissa.split_once('.') {
-        Some((i, f)) => (i.to_string(), f.to_string()),
-        None => (mantissa.to_string(), String::new()),
-    };
-    if !int_part
-        .bytes()
-        .chain(frac_part.bytes())
-        .all(|b| b.is_ascii_digit())
-    {
-        return text.to_string();
-    }
-    let mut digits = format!("{int_part}{frac_part}");
-    // Where the point sits, counted from the left of the digit string.
-    let mut point = int_part.len() as i32 + exp;
-    if point <= 0 {
-        // Padding on the left puts the point just after the digits added,
-        // which is position 1 whatever it was before.
-        digits = format!("{}{digits}", "0".repeat((1 - point) as usize));
-        point = 1;
-    }
-    while (digits.len() as i32) < point {
-        digits.push('0');
-    }
-    let (i, f) = digits.split_at(point as usize);
-    if f.is_empty() {
-        // A zero mantissa with a positive exponent (`0.00e3` is `0E+1`)
-        // is plain `0`, not one zero per power of ten: PostgreSQL gives a
-        // zero no display scale it did not write.
-        if i.bytes().all(|b| b == b'0') {
-            return format!("{sign}0");
-        }
-        format!("{sign}{i}")
-    } else {
-        format!("{sign}{i}.{f}")
-    }
-}
-
 pub fn render_array_element_text(v: &Bson) -> String {
     render_array_element(v)
 }
@@ -6817,6 +6731,7 @@ fn render_array_element(v: &Bson) -> String {
         Bson::Int64(i) => return i.to_string(),
         Bson::Double(d) => return geo::float8_text(*d),
         Bson::Decimal128(d) => return plain_numeric_text(&d.to_string()),
+        _ if is_wide_numeric(v) => return numeric_text(v).unwrap_or_default(),
         Bson::Boolean(b) => return (if *b { "t" } else { "f" }).to_string(),
         Bson::Array(items) => return render_array(items),
         // A box's commas are not the array's delimiter (that is `;`), so the
@@ -7137,32 +7052,11 @@ impl ArrayParser<'_> {
 /// `-1.5`->-2), which is not what it does for float->integer (that is
 /// half-to-even). Measured on PostgreSQL 14.
 ///
-/// Done on the DIGITS rather than through `f64`: a `numeric` carries up to 34
-/// significant digits and an f64 has 15, so routing a big one through a float
+/// Done on the DIGITS rather than through `f64`: a `numeric` carries any
+/// number of digits and an f64 has 15, so routing a big one through a float
 /// would round twice and silently return a different integer.
-fn decimal_to_integer(d: &bson::Decimal128) -> Option<i128> {
-    let text = d.to_string();
-    let (sign, digits) = match text.strip_prefix('-') {
-        Some(rest) => (-1i128, rest),
-        None => (1i128, text.as_str()),
-    };
-    // NaN / Infinity / exponent forms are not whole numbers we can name.
-    if digits.chars().any(|c| !c.is_ascii_digit() && c != '.') {
-        return None;
-    }
-    let (int_part, frac) = match digits.split_once('.') {
-        Some((i, f)) => (i, f),
-        None => (digits, ""),
-    };
-    let mut magnitude: i128 = if int_part.is_empty() {
-        0
-    } else {
-        int_part.parse().ok()?
-    };
-    if frac.starts_with(|c: char| ('5'..='9').contains(&c)) {
-        magnitude = magnitude.checked_add(1)?;
-    }
-    Some(sign * magnitude)
+fn decimal_to_integer(v: &Bson) -> Option<i128> {
+    numeric::bigint_to_i128(&numeric::numeric_text_to_integer(&numeric_text(v)?)?)
 }
 
 /// A value as its PostgreSQL text, which is what `::text` would produce.
@@ -7270,9 +7164,9 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
             // oids (`4294967295::oid`), and anything past 2^32-1 is the same
             // out-of-range PostgreSQL reports.
             Bson::Double(v) if v.fract() == 0.0 => from_i64(v as i64),
-            Bson::Decimal128(d) => match d.to_string().parse::<i64>() {
-                Ok(v) => from_i64(v),
-                Err(_) => Err(out_of_range()),
+            v if is_numeric(&v) => match numeric_text(&v).and_then(|t| t.parse::<i64>().ok()) {
+                Some(v) => from_i64(v),
+                None => Err(out_of_range()),
             },
             Bson::String(text) => match text.trim().parse::<i64>() {
                 Ok(v) if (0..(1i64 << 32)).contains(&v) => Ok(Bson::Int64(v)),
@@ -7352,6 +7246,7 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
         // the expansion drops its exponent notation, which PostgreSQL's
         // numeric output never uses.
         Bson::Decimal128(d) => plain_numeric_text(&d.to_string()),
+        Bson::Document(_) if is_wide_numeric(v) => numeric_text(v).unwrap_or_default(),
         Bson::Document(_) if Interval::from_bson(v).is_some() => {
             render_interval(&Interval::from_bson(v).expect("checked"))
         }
@@ -7383,10 +7278,12 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
             // for numeric->integer. Rust's `round()` is the latter, so using
             // it here answered 3 for `2.5::float8::int`. Measured on PG 14.
             Bson::Double(d) => Ok(Bson::Int32(d.round_ties_even() as i32)),
-            Bson::Decimal128(d) => decimal_to_integer(d)
+            v if is_numeric(v) => decimal_to_integer(v)
                 .and_then(|n| i32::try_from(n).ok())
                 .map(Bson::Int32)
-                .ok_or_else(|| Error::NumericOutOfRange(format!("integer out of range: \"{d}\""))),
+                .ok_or_else(|| {
+                    Error::NumericOutOfRange(format!("integer out of range: \"{}\"", as_text(v)))
+                }),
             Bson::String(s) => s
                 .trim()
                 .parse::<i32>()
@@ -7401,10 +7298,12 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
                 "cannot cast type boolean to bigint".to_string(),
             )),
             Bson::Double(d) => Ok(Bson::Int64(d.round_ties_even() as i64)),
-            Bson::Decimal128(d) => decimal_to_integer(d)
+            v if is_numeric(v) => decimal_to_integer(v)
                 .and_then(|n| i64::try_from(n).ok())
                 .map(Bson::Int64)
-                .ok_or_else(|| Error::NumericOutOfRange(format!("bigint out of range: \"{d}\""))),
+                .ok_or_else(|| {
+                    Error::NumericOutOfRange(format!("bigint out of range: \"{}\"", as_text(v)))
+                }),
             Bson::String(s) => s
                 .trim()
                 .parse::<i64>()
@@ -7441,8 +7340,8 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
             }
         }
         "numeric" | "decimal" => match &value {
-            Bson::Decimal128(_) => Ok(value),
-            other => Ok(Bson::Decimal128(parse_numeric(&as_text(other))?)),
+            v if is_numeric(v) => Ok(value),
+            other => parse_numeric(&as_text(other)),
         },
         "float4" | "float8" | "real" | "double" => match &value {
             Bson::Int32(i) => Ok(Bson::Double(f64::from(*i))),
@@ -7451,11 +7350,10 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
             // A decimal literal is `numeric`, so `1.5::float8` arrives here as
             // a Decimal128 rather than a Double. Missing this arm made the
             // cast fail outright once decimal literals stopped being floats.
-            Bson::Decimal128(d) => d
-                .to_string()
-                .parse::<f64>()
+            v if is_numeric(v) => numeric_text(v)
+                .and_then(|t| numeric::numeric_text_to_f64(&t))
                 .map(Bson::Double)
-                .map_err(|_| bad("double precision", &value)),
+                .ok_or_else(|| bad("double precision", &value)),
             Bson::String(s) => s
                 .trim()
                 .parse::<f64>()
@@ -8241,136 +8139,6 @@ fn coerce_unknown_operand(
     })
 }
 
-/// A decimal as an exact (unscaled value, scale) pair.
-///
-/// PostgreSQL's `numeric` arithmetic is EXACT and carries a defined result
-/// scale, so it cannot go through an `f64`: `0.1 + 0.2` is `0.3`, not
-/// `0.30000000000000004`, and a 34-digit operand has more digits than a float
-/// can hold. `i128` covers the 34 significant digits Decimal128 stores, and an
-/// operation that would exceed them is an error rather than a rounding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Dec {
-    unscaled: i128,
-    scale: u32,
-}
-
-/// Unary minus over a numeric rendered as text. `NaN` is its own negation;
-/// `Infinity` and `-Infinity` swap; zero stays `0` (never `-0`); anything else
-/// flips its sign character. The scale is untouched, which is what PostgreSQL
-/// does (`-'1.50'::numeric` is `-1.50`).
-fn negate_numeric_text(text: &str) -> Result<Bson> {
-    let t = text.trim();
-    let out = if t.eq_ignore_ascii_case("nan") {
-        "NaN".to_string()
-    } else if let Some(rest) = t.strip_prefix('-') {
-        rest.to_string()
-    } else if t.chars().all(|c| c == '0' || c == '.' || c == '+') {
-        t.trim_start_matches('+').to_string()
-    } else {
-        format!("-{}", t.trim_start_matches('+'))
-    };
-    Decimal128::from_str(&out)
-        .map(Bson::Decimal128)
-        .map_err(|_| Error::Parse(format!("cannot negate numeric {text}")))
-}
-
-fn parse_dec(text: &str) -> Option<Dec> {
-    let t = text.trim();
-    let (neg, body) = match t.strip_prefix('-') {
-        Some(r) => (true, r),
-        None => (false, t.strip_prefix('+').unwrap_or(t)),
-    };
-    if body.is_empty() || !body.chars().all(|c| c.is_ascii_digit() || c == '.') {
-        return None;
-    }
-    let (int, frac) = body.split_once('.').unwrap_or((body, ""));
-    let digits: String = format!("{int}{frac}");
-    let unscaled: i128 = digits.parse().ok()?;
-    Some(Dec {
-        unscaled: if neg { -unscaled } else { unscaled },
-        scale: u32::try_from(frac.len()).ok()?,
-    })
-}
-
-fn render_dec(d: Dec) -> String {
-    if d.scale == 0 {
-        return d.unscaled.to_string();
-    }
-    let neg = d.unscaled < 0;
-    let digits = d.unscaled.unsigned_abs().to_string();
-    let scale = d.scale as usize;
-    let padded = if digits.len() <= scale {
-        format!("{}{}", "0".repeat(scale - digits.len() + 1), digits)
-    } else {
-        digits
-    };
-    let split = padded.len() - scale;
-    format!(
-        "{}{}.{}",
-        if neg { "-" } else { "" },
-        &padded[..split],
-        &padded[split..]
-    )
-}
-
-/// Line two decimals up on the greater scale, exactly.
-fn align(a: Dec, b: Dec) -> Option<(i128, i128, u32)> {
-    let scale = a.scale.max(b.scale);
-    let lift = |d: Dec| -> Option<i128> {
-        let steps = scale - d.scale;
-        d.unscaled.checked_mul(10i128.checked_pow(steps)?)
-    };
-    Some((lift(a)?, lift(b)?, scale))
-}
-
-/// Exact `+`, `-` and `*` on decimals, with PostgreSQL's result scales:
-/// addition and subtraction take `max(s1, s2)`, multiplication takes
-/// `s1 + s2`. Both were measured — `1.50 + 1.5` is `3.00` and `1.50 * 1.50` is
-/// `2.2500`, so the scale is part of the answer rather than formatting.
-///
-/// Division is deliberately absent: its result scale depends on the operands'
-/// weights in a way that has not been measured here, and guessing it would
-/// produce a plausible number of decimal places that is not PostgreSQL's.
-pub(crate) fn decimal_arith(op: &str, a: &str, b: &str) -> Option<Result<Bson>> {
-    let (x, y) = (parse_dec(a)?, parse_dec(b)?);
-    let overflow = || {
-        Err(Error::NumericOutOfRange(
-            "numeric value out of range: the result exceeds the 34 significant \
-             digits this server stores"
-                .to_string(),
-        ))
-    };
-    let out = match op {
-        "+" | "-" => {
-            let Some((xa, ya, scale)) = align(x, y) else {
-                return Some(overflow());
-            };
-            let sum = if op == "+" {
-                xa.checked_add(ya)
-            } else {
-                xa.checked_sub(ya)
-            };
-            match sum {
-                Some(unscaled) => Dec { unscaled, scale },
-                None => return Some(overflow()),
-            }
-        }
-        "*" => match x.unscaled.checked_mul(y.unscaled) {
-            Some(unscaled) => Dec {
-                unscaled,
-                scale: x.scale + y.scale,
-            },
-            None => return Some(overflow()),
-        },
-        _ => return None,
-    };
-    let text = render_dec(out);
-    Some(match parse_numeric(&text) {
-        Ok(d) => Ok(Bson::Decimal128(d)),
-        Err(e) => Err(e),
-    })
-}
-
 /// PostgreSQL's `||` on arrays. Arrays of the same dimensionality append;
 /// an N-dimensional array takes an (N-1)-dimensional one as a new last (or
 /// first) slice, which is how `element || array` and `array || element` are
@@ -8600,17 +8368,12 @@ fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
     // literal is `numeric`, so `1.5 + 1.5` arrives here as two Decimal128s --
     // and once decimal literals stopped being floats, every one of these
     // operators refused outright until this arm existed.
-    if matches!(op, "+" | "-" | "*")
-        && (matches!(lhs, Bson::Decimal128(_)) || matches!(rhs, Bson::Decimal128(_)))
+    if matches!(op, "+" | "-" | "*" | "/")
+        && (is_numeric(&lhs) || is_numeric(&rhs))
         && !matches!(lhs, Bson::Double(_))
         && !matches!(rhs, Bson::Double(_))
     {
-        let text = |v: &Bson| match v {
-            Bson::Decimal128(d) => Some(d.to_string()),
-            Bson::Int32(i) => Some(i.to_string()),
-            Bson::Int64(i) => Some(i.to_string()),
-            _ => None,
-        };
+        let text = numeric::numeric_operand_text;
         if let (Some(a), Some(b)) = (text(&lhs), text(&rhs)) {
             if let Some(result) = decimal_arith(op, &a, &b) {
                 return result;
@@ -8638,7 +8401,9 @@ fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
                 Bson::Double(d) => Some(*d),
                 Bson::Int32(i) => Some(f64::from(*i)),
                 Bson::Int64(i) => Some(*i as f64),
-                Bson::Decimal128(d) if mixed_float => d.to_string().parse::<f64>().ok(),
+                v if mixed_float && is_numeric(v) => {
+                    numeric_text(v).and_then(|t| numeric::numeric_text_to_f64(&t))
+                }
                 _ => None,
             };
             let (x, y) = match (floats(&lhs), floats(&rhs)) {
@@ -8715,89 +8480,10 @@ fn bson_kind(v: &Bson) -> &'static str {
         Bson::DateTime(_) => "datetime",
         Bson::Null => "null",
         Bson::Document(d) if d.contains_key(INTERVAL_MONTHS) => "interval",
+        Bson::Document(d) if d.contains_key(WIDE_NUMERIC_KEY) => "numeric",
         Bson::Document(_) => "document",
         _ => "other",
     }
-}
-
-/// Compare two decimal texts EXACTLY, digit by digit.
-///
-/// A `numeric` carries up to 34 significant digits and an `f64` holds 15, so
-/// routing a comparison through a float can report two different numbers as
-/// equal. Scale is not part of equality — `1.50 = 1.5` is true — so trailing
-/// zeros are trimmed before comparing.
-///
-/// PostgreSQL gives NaN a place in a TOTAL order, unlike IEEE: NaN equals
-/// itself and sorts ABOVE every number, infinity included. Probed on PG 14.
-pub(crate) fn compare_decimal_text(a: &str, b: &str) -> Option<std::cmp::Ordering> {
-    use std::cmp::Ordering;
-    let rank = |t: &str| -> Option<i32> {
-        let u = t.trim().to_ascii_lowercase();
-        match u.as_str() {
-            "nan" => Some(2),
-            "infinity" | "inf" | "+infinity" | "+inf" => Some(1),
-            "-infinity" | "-inf" => Some(-1),
-            _ => None,
-        }
-    };
-    match (rank(a), rank(b)) {
-        (Some(x), Some(y)) => return Some(x.cmp(&y)),
-        (Some(x), None) => {
-            return Some(if x > 0 {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            })
-        }
-        (None, Some(y)) => {
-            return Some(if y > 0 {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            })
-        }
-        (None, None) => {}
-    }
-    let split = |t: &str| -> Option<(bool, String, String)> {
-        let t = t.trim();
-        let (neg, body) = match t.strip_prefix('-') {
-            Some(r) => (true, r),
-            None => (false, t.strip_prefix('+').unwrap_or(t)),
-        };
-        if body.is_empty() || !body.chars().all(|c| c.is_ascii_digit() || c == '.') {
-            return None;
-        }
-        let (i, f) = body.split_once('.').unwrap_or((body, ""));
-        // Leading zeros in the integer part and trailing zeros in the fraction
-        // change neither the value nor the ordering.
-        let int = i.trim_start_matches('0').to_string();
-        let frac = f.trim_end_matches('0').to_string();
-        Some((neg, int, frac))
-    };
-    let (an, ai, af) = split(a)?;
-    let (bn, bi, bf) = split(b)?;
-    let a_zero = ai.is_empty() && af.is_empty();
-    let b_zero = bi.is_empty() && bf.is_empty();
-    // Negative zero is zero.
-    let an = an && !a_zero;
-    let bn = bn && !b_zero;
-    if an != bn {
-        return Some(if an {
-            Ordering::Less
-        } else {
-            Ordering::Greater
-        });
-    }
-    let magnitude = ai
-        .len()
-        .cmp(&bi.len())
-        .then_with(|| ai.cmp(&bi))
-        .then_with(|| {
-            let n = af.len().max(bf.len());
-            let pad = |f: &str| format!("{f:0<width$}", width = n);
-            pad(&af).cmp(&pad(&bf))
-        });
-    Some(if an { magnitude.reverse() } else { magnitude })
 }
 
 /// The public door onto `compare_constants` for the wire layer's join sort.
@@ -8871,26 +8557,21 @@ pub(crate) fn compare_constants(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering
             // two different numbers equal. Rendered PLAIN first: Decimal128
             // writes `-8.34184E-7` for a small magnitude, and the digit
             // comparison has no notion of an exponent.
-            let dec = |v: &Bson| match v {
-                Bson::Decimal128(d) => Some(plain_numeric_text(&d.to_string())),
-                Bson::Int32(i) => Some(i.to_string()),
-                Bson::Int64(i) => Some(i.to_string()),
-                _ => None,
-            };
+            let dec = numeric::numeric_operand_text;
             // A decimal beside a FLOAT compares as floats: PostgreSQL widens
             // the numeric to float8 for that operator, so the float's own
             // precision governs and the exact path would be the wrong answer.
             let mixed_float = matches!(a, Bson::Double(_)) || matches!(b, Bson::Double(_));
-            if (matches!(a, Bson::Decimal128(_)) || matches!(b, Bson::Decimal128(_)))
-                && !mixed_float
-            {
+            if (is_numeric(a) || is_numeric(b)) && !mixed_float {
                 return compare_decimal_text(&dec(a)?, &dec(b)?);
             }
             let f = |v: &Bson| match v {
                 Bson::Int32(i) => Some(f64::from(*i)),
                 Bson::Int64(i) => Some(*i as f64),
                 Bson::Double(d) => Some(*d),
-                Bson::Decimal128(d) => d.to_string().parse::<f64>().ok(),
+                v if is_numeric(v) => {
+                    numeric_text(v).and_then(|t| numeric::numeric_text_to_f64(&t))
+                }
                 _ => None,
             };
             let (x, y) = (f(a)?, f(b)?);
@@ -9741,11 +9422,8 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 // stays `NaN` and `-'Infinity'::numeric` is `-Infinity`
                 // (measured), which `0 - x` cannot produce: the decimal
                 // arithmetic has no special values.
-                "-" if matches!(rhs, Bson::Decimal128(_)) => {
-                    let Bson::Decimal128(d) = rhs else {
-                        unreachable!()
-                    };
-                    return negate_numeric_text(&d.to_string());
+                "-" if is_numeric(&rhs) => {
+                    return negate_numeric_text(&numeric_text(&rhs).unwrap_or_default());
                 }
                 "-" => Bson::Int32(0),
                 "+" => return Ok(rhs),
@@ -9807,7 +9485,7 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 // PostgreSQL types a decimal LITERAL as `numeric`, not
                 // float8: `SELECT 1.5` answers oid 1700. Treating it as a
                 // double gave the right value under the wrong type.
-                Some(a_const::Val::Fval(f)) => Ok(Bson::Decimal128(parse_numeric(&f.fval)?)),
+                Some(a_const::Val::Fval(f)) => parse_numeric(&f.fval),
                 Some(a_const::Val::Boolval(b)) => Ok(Bson::Boolean(b.boolval)),
                 _ => Err(Error::Unsupported("this constant".into())),
             }
@@ -9979,6 +9657,41 @@ fn match_nothing() -> Document {
     doc! { "$nor": [Document::new()] }
 }
 
+/// Whether `field <op> value` needs the two-width numeric lowering: the column
+/// is declared `numeric`, or the constant itself is too wide for Decimal128.
+/// A numeric column can hold either stored form, and neither an MQL number
+/// nor an MQL document comparison reaches across to the other.
+fn needs_numeric_filter(def: &TableDef, field: &str, value: &Bson) -> bool {
+    if is_wide_numeric(value) {
+        return true;
+    }
+    let declared = def
+        .columns
+        .iter()
+        .find(|c| c.field() == field || c.name == field)
+        .map(|c| c.pg_type.as_str());
+    matches!(declared, Some("numeric" | "decimal"))
+        && matches!(value, Bson::Int32(_) | Bson::Int64(_) | Bson::Decimal128(_))
+}
+
+/// `field <mql_op> value`, exact for a numeric column of either width, or the
+/// plain MQL form for anything else.
+fn scalar_filter(def: &TableDef, field: &str, mql_op: &str, value: Bson) -> Document {
+    if needs_numeric_filter(def, field, &value) {
+        if let Some(d) = numeric::numeric_filter(field, mql_op, &value) {
+            return d;
+        }
+    }
+    match mql_op {
+        "$eq" => doc! { field: value },
+        "$ne" => doc! { "$and": [
+            doc! { field: { "$ne": value } },
+            doc! { field: { "$ne": Bson::Null } },
+        ]},
+        op => doc! { field: { op: value } },
+    }
+}
+
 fn lower_aexpr(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     // Named enum, never the wire integer. Written against the integers first,
     // this had `Op = 0` (it is 1, so every plain `=` was refused) and
@@ -10046,30 +9759,16 @@ fn lower_aexpr(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
         None => value,
     };
 
-    let mongo_op = match op {
-        // `=` and the range operators are already NULL-correct: MQL brackets by
-        // type, so a null column value matches none of them -- which is what
-        // three-valued logic gives.
-        "=" => return Ok(doc! { field: value }),
-        ">" => "$gt",
-        ">=" => "$gte",
-        "<" => "$lt",
-        "<=" => "$lte",
-        // `<>` is the exception, and it is a WRONG-ROWS bug, not a nicety.
-        // MQL's `$ne` matches a missing-or-null field, so `n <> 1` returned the
-        // row whose `n` is NULL. SQL says `NULL <> 1` is NULL, so PostgreSQL
-        // excludes it (probed 14). The explicit not-null guard restores that.
-        "<>" | "!=" => {
-            return Ok(doc! {
-                "$and": [
-                    doc! { &field: { "$ne": value } },
-                    doc! { &field: { "$ne": Bson::Null } },
-                ]
-            })
-        }
-        other => return Err(Error::Unsupported(format!("operator {other}"))),
-    };
-    Ok(doc! { field: { mongo_op: value } })
+    // `=` and the range operators are already NULL-correct: MQL brackets by
+    // type, so a null column value matches none of them -- which is what
+    // three-valued logic gives.
+    //
+    // `<>` is the exception, and it is a WRONG-ROWS bug, not a nicety.
+    // MQL's `$ne` matches a missing-or-null field, so `n <> 1` returned the
+    // row whose `n` is NULL. SQL says `NULL <> 1` is NULL, so PostgreSQL
+    // excludes it (probed 14). The explicit not-null guard restores that.
+    let mongo_op = op_to_mql(op).ok_or_else(|| Error::Unsupported(format!("operator {op}")))?;
+    Ok(scalar_filter(def, &field, mongo_op, value))
 }
 
 /// `x IN (a, b)` / `x NOT IN (a, b)`.
@@ -10199,14 +9898,19 @@ fn lower_scalar_array(
         if nonnull.is_empty() {
             return Ok(match_nothing());
         }
-        if op == "=" {
+        let numeric = nonnull.iter().any(|v| needs_numeric_filter(def, &field, v));
+        if op == "=" && !numeric {
             // Index-friendly and NULL-correct: `$in` excludes a NULL column.
             return Ok(doc! { &field: { "$in": nonnull } });
         }
         let clauses: Vec<Document> = nonnull
             .into_iter()
-            .map(|v| doc! { &field: { mql: v } })
+            .map(|v| scalar_filter(def, &field, mql, v))
             .collect();
+        if mql == "$ne" {
+            // Each `$ne` arm already carries its own not-null guard.
+            return Ok(doc! { "$or": clauses });
+        }
         return Ok(doc! { "$and": [
             doc! { "$or": clauses },
             doc! { &field: { "$ne": Bson::Null } },
@@ -10220,7 +9924,8 @@ fn lower_scalar_array(
     if nonnull.is_empty() {
         return Ok(Document::new());
     }
-    if op == "<>" {
+    let numeric = nonnull.iter().any(|v| needs_numeric_filter(def, &field, v));
+    if op == "<>" && !numeric {
         return Ok(doc! { "$and": [
             doc! { &field: { "$nin": nonnull } },
             doc! { &field: { "$ne": Bson::Null } },
@@ -10228,7 +9933,7 @@ fn lower_scalar_array(
     }
     let mut arms: Vec<Document> = nonnull
         .into_iter()
-        .map(|v| doc! { &field: { mql: v } })
+        .map(|v| scalar_filter(def, &field, mql, v))
         .collect();
     arms.push(doc! { &field: { "$ne": Bson::Null } });
     Ok(doc! { "$and": arms })
@@ -10251,10 +9956,18 @@ fn lower_in(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
             values.push(v);
         }
     }
+    let numeric = values.iter().any(|v| needs_numeric_filter(def, &field, v));
     if negated {
         if saw_null {
             // `NOT IN` over a list containing NULL is never true.
             return Ok(match_nothing());
+        }
+        if numeric {
+            let arms: Vec<Document> = values
+                .into_iter()
+                .map(|v| scalar_filter(def, &field, "$ne", v))
+                .collect();
+            return Ok(doc! { "$and": arms });
         }
         return Ok(doc! {
             "$and": [
@@ -10265,6 +9978,13 @@ fn lower_in(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     }
     // A NULL in a positive IN list simply never matches, so dropping it is
     // exactly right.
+    if numeric {
+        let arms: Vec<Document> = values
+            .into_iter()
+            .map(|v| scalar_filter(def, &field, "$eq", v))
+            .collect();
+        return Ok(doc! { "$or": arms });
+    }
     Ok(doc! { field: { "$in": values } })
 }
 
@@ -10286,12 +10006,18 @@ fn lower_between(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document>
         return Ok(doc! {
             "$and": [
                 doc! { "$or": [
-                    doc! { &field: { "$lt": &lo } },
-                    doc! { &field: { "$gt": &hi } },
+                    scalar_filter(def, &field, "$lt", lo),
+                    scalar_filter(def, &field, "$gt", hi),
                 ]},
                 doc! { &field: { "$ne": Bson::Null } },
             ]
         });
+    }
+    if needs_numeric_filter(def, &field, &lo) || needs_numeric_filter(def, &field, &hi) {
+        return Ok(doc! { "$and": [
+            scalar_filter(def, &field, "$gte", lo),
+            scalar_filter(def, &field, "$lte", hi),
+        ]});
     }
     Ok(doc! { field: { "$gte": lo, "$lte": hi } })
 }

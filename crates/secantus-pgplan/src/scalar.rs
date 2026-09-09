@@ -77,6 +77,7 @@ fn text(v: &Bson) -> String {
         Bson::Int64(i) => i.to_string(),
         Bson::Double(d) => d.to_string(),
         Bson::Decimal128(d) => crate::plain_numeric_text(&d.to_string()),
+        v if crate::is_wide_numeric(v) => crate::numeric_text(v).unwrap_or_default(),
         // A boolean's text form is `t` / `f`: `concat(true)` is `t`
         // (measured), never `true`.
         Bson::Boolean(b) => (if *b { "t" } else { "f" }).to_string(),
@@ -90,6 +91,7 @@ fn as_f64(v: &Bson) -> Option<f64> {
         Bson::Int64(i) => Some(*i as f64),
         Bson::Double(d) => Some(*d),
         Bson::Decimal128(d) => d.to_string().parse().ok(),
+        v if crate::is_wide_numeric(v) => crate::numeric_text(v).and_then(|t| t.parse().ok()),
         _ => None,
     }
 }
@@ -394,9 +396,9 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
                 Bson::Int32(i) => Bson::Int32(i.abs()),
                 Bson::Int64(i) => Bson::Int64(i.abs()),
                 Bson::Double(d) => Bson::Double(d.abs()),
-                Bson::Decimal128(d) => {
-                    let t = d.to_string();
-                    Bson::Decimal128(parse_numeric(t.strip_prefix('-').unwrap_or(&t))?)
+                v if crate::is_numeric(&v) => {
+                    let t = crate::numeric_text(&v).unwrap_or_default();
+                    parse_numeric(t.strip_prefix('-').unwrap_or(&t))?
                 }
                 other => return Err(Error::Unsupported(format!("abs of {other:?}"))),
             })
@@ -414,8 +416,8 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
             // `sign` answers `float8` for a float or an integer, and `numeric`
             // only when handed one -- so `sign(-3)` is `-1.0`, not `-1`.
             Ok(match arg(0) {
-                Bson::Decimal128(_) => {
-                    Bson::Decimal128(parse_numeric(&out.to_string()).expect("a one-digit decimal"))
+                v if crate::is_numeric(&v) => {
+                    parse_numeric(&out.to_string()).expect("a one-digit decimal")
                 }
                 _ => Bson::Double(f64::from(out)),
             })
@@ -449,7 +451,7 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
             if b == 0 {
                 return Err(Error::DivisionByZero);
             }
-            Ok(Bson::Decimal128(parse_numeric(&(a / b).to_string())?))
+            parse_numeric(&(a / b).to_string())
         }
         "greatest" | "least" => {
             if args.is_empty() {
@@ -496,9 +498,7 @@ fn numeric_rounding(name: &str, args: &[Bson]) -> Result<Bson> {
         }
         let places = as_i64(&args[1]).unwrap_or(0);
         let text = text(&subject);
-        return round_decimal_text(&text, places, name == "round")
-            .map(Bson::Decimal128)
-            .ok_or_else(|| wrong_args(name));
+        return round_decimal_text(&text, places, name == "round").ok_or_else(|| wrong_args(name));
     }
     if args.len() != 1 {
         return Err(wrong_args(name));
@@ -511,7 +511,7 @@ fn numeric_rounding(name: &str, args: &[Bson]) -> Result<Bson> {
             "trunc" => d.trunc(),
             _ => d.round_ties_even(),
         }),
-        Bson::Decimal128(_) => {
+        ref v if crate::is_numeric(v) => {
             let t = text(&subject);
             let places = 0;
             let out = match name {
@@ -520,7 +520,7 @@ fn numeric_rounding(name: &str, args: &[Bson]) -> Result<Bson> {
                 "trunc" => round_decimal_text(&t, places, false),
                 _ => round_decimal_text(&t, places, true),
             };
-            Bson::Decimal128(out.ok_or_else(|| wrong_args(name))?)
+            out.ok_or_else(|| wrong_args(name))?
         }
         other => return Err(Error::Unsupported(format!("{name} of {other:?}"))),
     })
@@ -528,7 +528,7 @@ fn numeric_rounding(name: &str, args: &[Bson]) -> Result<Bson> {
 
 /// Round or truncate a decimal to `places`, on the DIGITS. Rounding is half
 /// away from zero, which is what PostgreSQL does for `numeric`.
-fn round_decimal_text(text: &str, places: i64, round: bool) -> Option<bson::Decimal128> {
+fn round_decimal_text(text: &str, places: i64, round: bool) -> Option<Bson> {
     let (neg, body) = match text.trim().strip_prefix('-') {
         Some(r) => (true, r),
         None => (false, text.trim()),
@@ -586,7 +586,7 @@ fn round_decimal_text(text: &str, places: i64, round: bool) -> Option<bson::Deci
     parse_numeric(&out).ok()
 }
 
-fn decimal_ceil_floor(text: &str, up: bool) -> Option<bson::Decimal128> {
+fn decimal_ceil_floor(text: &str, up: bool) -> Option<Bson> {
     let truncated = round_decimal_text(text, 0, false)?;
     let neg = text.trim_start().starts_with('-');
     let has_fraction = text
@@ -600,8 +600,8 @@ fn decimal_ceil_floor(text: &str, up: bool) -> Option<bson::Decimal128> {
         return Some(truncated);
     }
     let one = if neg { "-1" } else { "1" };
-    match decimal_arith("+", &truncated.to_string(), one) {
-        Some(Ok(Bson::Decimal128(d))) => Some(d),
+    match decimal_arith("+", &crate::numeric_text(&truncated)?, one) {
+        Some(Ok(v)) => Some(v),
         _ => None,
     }
 }

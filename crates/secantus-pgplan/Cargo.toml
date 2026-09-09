@@ -20,3 +20,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 chrono-tz = { version = "0.10", default-features = false }
 pg_query = "6"
 secantus-pgcatalog = { path = "../secantus-pgcatalog" }
+# `numeric` arithmetic beyond Decimal128's 34 digits: PostgreSQL's numeric is
+# arbitrary precision, and a sum or product of two wide values has to be exact.
+num-bigint = "0.4"
+num-traits = "0.2"

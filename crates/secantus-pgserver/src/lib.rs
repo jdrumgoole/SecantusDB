@@ -2105,6 +2105,11 @@ impl PgHandler {
                     .and_then(|kv| kv.get(c.field()).cloned());
                 match v {
                     Some(Bson::String(s)) => format!("Key ({})=({}) already exists.", c.name, s),
+                    Some(ref b) if secantus_pgplan::is_numeric(b) => format!(
+                        "Key ({})=({}) already exists.",
+                        c.name,
+                        secantus_pgplan::numeric_text(b).unwrap_or_default()
+                    ),
                     Some(b) => format!(
                         "Key ({})=({}) already exists.",
                         c.name,
@@ -2134,6 +2139,60 @@ impl PgHandler {
             return PgWireError::UserError(Box::new(info));
         }
         Self::storage_err("could not insert", msg)
+    }
+
+    /// The first row whose numeric PRIMARY KEY is wider than Decimal128 and
+    /// equal in VALUE to a key already in the table (or earlier in the same
+    /// batch), or `None`.
+    ///
+    /// The `_id` index keys a Decimal128 by value, so `1.5` and `1.50` collide
+    /// there as PostgreSQL requires. A wide numeric is a document carrying its
+    /// display scale, so the index sees `1e40` and `1e40.0` as two keys; this
+    /// lookup applies the value-equality the index cannot.
+    fn wide_numeric_pk_conflict(
+        &self,
+        table: &str,
+        def: &TableDef,
+        rows: &[Document],
+    ) -> PgWireResult<Option<Bson>> {
+        let Some(pk) = def.columns.iter().find(|c| c.pk) else {
+            return Ok(None);
+        };
+        if !matches!(pk.pg_type.as_str(), "numeric" | "decimal") {
+            return Ok(None);
+        }
+        let mut seen: Vec<String> = Vec::new();
+        for row in rows {
+            let Some(id) = row.get(pk.field()) else {
+                continue;
+            };
+            if !secantus_pgplan::is_numeric(id) {
+                continue;
+            }
+            let text = secantus_pgplan::numeric_text(id).unwrap_or_default();
+            let wide = secantus_pgplan::is_wide_numeric(id);
+            let clash = seen.iter().any(|prev| {
+                secantus_pgplan::compare_decimal_text(prev, &text) == Some(Ordering::Equal)
+            });
+            if clash && wide {
+                return Ok(Some(id.clone()));
+            }
+            if wide {
+                let Some(filter) = secantus_pgplan::numeric::numeric_filter(&pk.field(), "$eq", id)
+                else {
+                    continue;
+                };
+                let hit = self
+                    .storage
+                    .find_matching(&self.db, table, &filter)
+                    .map_err(|e| Self::storage_err("could not check the primary key", e))?;
+                if !hit.is_empty() {
+                    return Ok(Some(id.clone()));
+                }
+            }
+            seen.push(text);
+        }
+        Ok(None)
     }
 
     fn storage_err(context: &str, e: impl std::fmt::Display) -> PgWireError {
@@ -4460,6 +4519,13 @@ impl PgHandler {
                 }
                 self.apply_serial_defaults(&def, &mut ins.rows)?;
                 apply_column_defaults(&def, &mut ins.rows);
+                if let Some(dup) = self.wide_numeric_pk_conflict(&ins.table, &def, &ins.rows)? {
+                    return Err(Self::write_error(
+                        &ins.table,
+                        &def,
+                        &bson::doc! { "code": 11000, "keyValue": { "_id": dup } },
+                    ));
+                }
                 let n = ins.rows.len();
                 let docs = ins
                     .rows
@@ -5895,15 +5961,19 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
             Bson::Int32(x) => Some(f64::from(*x)),
             Bson::Int64(x) => Some(*x as f64),
             Bson::Double(x) => Some(*x),
-            Bson::Decimal128(d) => d.to_string().parse().ok(),
+            v if secantus_pgplan::is_numeric(v) => {
+                secantus_pgplan::numeric::numeric_text_to_f64(&secantus_pgplan::numeric_text(v)?)
+            }
             _ => None,
         }
     };
     let as_numeric = |v: &Bson| -> Option<PgNumeric> {
         match v {
-            Bson::Decimal128(d) => Some(PgNumeric(secantus_pgplan::plain_numeric_text(
-                &d.to_string(),
-            ))),
+            // Decimal128 and the wide-numeric document alike render to their
+            // canonical text; the binary codec is built from that text.
+            v if secantus_pgplan::is_numeric(v) => {
+                Some(PgNumeric(secantus_pgplan::numeric_text(v)?))
+            }
             Bson::Int32(x) => Some(PgNumeric(x.to_string())),
             Bson::Int64(x) => Some(PgNumeric(x.to_string())),
             Bson::Double(x) => Some(PgNumeric(x.to_string())),
@@ -6672,6 +6742,13 @@ fn encode_value(enc: &mut DataRowEncoder, v: Option<&Bson>) -> PgWireResult<()> 
         Some(Bson::Decimal128(x)) => enc.encode_field(&Some(
             secantus_pgplan::plain_numeric_text(&x.to_string()).as_str(),
         )),
+        // A numeric wider than Decimal128 is stored as its canonical text
+        // inside a marker document (`secantus_pgplan::numeric`).
+        Some(v) if secantus_pgplan::is_wide_numeric(v) => enc.encode_field(&Some(
+            secantus_pgplan::numeric_text(v)
+                .unwrap_or_default()
+                .as_str(),
+        )),
         // An array must be handed over as a TYPED vector, not as pre-rendered
         // text: `encode_field` encodes against the column's declared type, so
         // giving it a `&str` for an `int4[]` field wraps the whole literal as a
@@ -6739,7 +6816,11 @@ fn encode_value(enc: &mut DataRowEncoder, v: Option<&Bson>) -> PgWireResult<()> 
 /// `sum(int4)` is **int8**, not int4, and `min`/`max` return the INPUT type.
 fn aggregate_wire_type(item: &AggItem) -> Type {
     match item.func {
-        AggFunc::CountStar | AggFunc::Count | AggFunc::Sum => Type::INT8,
+        AggFunc::CountStar | AggFunc::Count => Type::INT8,
+        AggFunc::Sum => match item.source_type.as_deref() {
+            Some("numeric" | "decimal") => Type::NUMERIC,
+            _ => Type::INT8,
+        },
         AggFunc::Min | AggFunc::Max => item
             .source_type
             .as_deref()
@@ -6786,7 +6867,24 @@ fn compute_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
             if values.is_empty() {
                 return Bson::Null;
             }
-            // Integer inputs sum as int8; a float anywhere makes it a double.
+            // Integer inputs sum as int8; a numeric anywhere sums EXACTLY as
+            // a numeric (PostgreSQL's `sum(numeric)` keeps the widest input
+            // scale); a float anywhere makes it a double.
+            if values.iter().any(|v| secantus_pgplan::is_numeric(v))
+                && !values.iter().any(|v| matches!(v, Bson::Double(_)))
+            {
+                let texts: Vec<String> = values
+                    .iter()
+                    .filter_map(|v| secantus_pgplan::numeric::numeric_operand_text(v))
+                    .collect();
+                if texts.len() == values.len() {
+                    if let Some(total) = secantus_pgplan::numeric::sum_numeric_texts(
+                        texts.iter().map(String::as_str),
+                    ) {
+                        return total;
+                    }
+                }
+            }
             if values
                 .iter()
                 .all(|v| matches!(v, Bson::Int32(_) | Bson::Int64(_)))
@@ -6877,27 +6975,16 @@ fn sort_rows(docs: &mut [Document], order: &[OrderKey]) {
 }
 
 /// Compare two non-null stored values the way PostgreSQL compares the SQL types
-/// this slice supports. Numbers compare numerically across int/long/double,
-/// strings byte-wise, booleans false < true.
+/// this slice supports.
+///
+/// This is the planner's `compare_constants`, which already knows every
+/// stored shape -- ints, doubles, Decimal128, the wide-numeric document,
+/// strings, bytea, arrays. The local float-only version it replaced treated
+/// a `numeric` (Decimal128) as "unsupported" and returned `Equal`, so
+/// `ORDER BY` on a numeric column was a no-op.
 fn compare_values(a: &Bson, b: &Bson) -> Ordering {
-    fn as_f64(v: &Bson) -> Option<f64> {
-        match v {
-            Bson::Int32(i) => Some(f64::from(*i)),
-            Bson::Int64(i) => Some(*i as f64),
-            Bson::Double(d) => Some(*d),
-            _ => None,
-        }
-    }
-    match (a, b) {
-        (Bson::String(x), Bson::String(y)) => x.cmp(y),
-        (Bson::Boolean(x), Bson::Boolean(y)) => x.cmp(y),
-        _ => match (as_f64(a), as_f64(b)) {
-            (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
-            // Mixed or unsupported types cannot arise from one SQL column
-            // today; keeping them equal is stable rather than arbitrary.
-            _ => Ordering::Equal,
-        },
-    }
+    // A pair no SQL column can hold is kept stable rather than arbitrary.
+    secantus_pgplan::compare_values(a, b).unwrap_or(Ordering::Equal)
 }
 
 /// A parsed statement: the SQL text plus whatever parameter types the client
@@ -7204,7 +7291,9 @@ fn element_binary(v: &Bson, elem: &Type) -> Option<Vec<u8>> {
             Bson::Int32(x) => Some(f64::from(*x)),
             Bson::Int64(x) => Some(*x as f64),
             Bson::Double(x) => Some(*x),
-            Bson::Decimal128(d) => d.to_string().parse().ok(),
+            v if secantus_pgplan::is_numeric(v) => {
+                secantus_pgplan::numeric::numeric_text_to_f64(&secantus_pgplan::numeric_text(v)?)
+            }
             _ => None,
         }
     };
@@ -7229,7 +7318,7 @@ fn element_binary(v: &Bson, elem: &Type) -> Option<Vec<u8>> {
         701 => Some(float(v)?.to_be_bytes().to_vec()),
         1700 => {
             let text = match v {
-                Bson::Decimal128(d) => secantus_pgplan::plain_numeric_text(&d.to_string()),
+                v if secantus_pgplan::is_numeric(v) => secantus_pgplan::numeric_text(v)?,
                 Bson::Int32(x) => x.to_string(),
                 Bson::Int64(x) => x.to_string(),
                 Bson::Double(x) => x.to_string(),
@@ -7336,6 +7425,7 @@ fn record_field_type(v: &Bson) -> Type {
         Bson::Int64(_) => Type::INT8,
         Bson::Double(_) => Type::FLOAT8,
         Bson::Decimal128(_) => Type::NUMERIC,
+        v if secantus_pgplan::is_wide_numeric(v) => Type::NUMERIC,
         Bson::Binary(_) => Type::BYTEA,
         // `unknown` (705): an untyped string literal. psycopg decodes it to
         // bytes, which is what its own record-binary tests expect.
@@ -7919,9 +8009,7 @@ fn decode_parameter(
             // text path already turns each of these into the right value, and
             // duplicating that here is how the two formats drift apart.
             Some(1700) => match binary_numeric_text(bytes) {
-                Some(t) => secantus_pgplan::parse_numeric(&t)
-                    .map(Bson::Decimal128)
-                    .map_err(|e| PgHandler::err(&e)),
+                Some(t) => secantus_pgplan::parse_numeric(&t).map_err(|e| PgHandler::err(&e)),
                 None => Err(unsupported_binary_oid(Some(1700))),
             },
             Some(1082) if bytes.len() == 4 => {
@@ -8100,9 +8188,7 @@ fn decode_parameter(
         // A `numeric` parameter is EXACT, and was being parsed as an f64 --
         // so a client binding Decimal("0.1") got a float, and one binding
         // `1.50` lost the scale that makes it a different value from `1.5`.
-        Some(1700) => secantus_pgplan::parse_numeric(&text)
-            .map(Bson::Decimal128)
-            .map_err(|e| PgHandler::err(&e)),
+        Some(1700) => secantus_pgplan::parse_numeric(&text).map_err(|e| PgHandler::err(&e)),
         Some(16) => Ok(Bson::Boolean(matches!(
             text.as_ref(),
             "t" | "true" | "TRUE" | "1" | "y" | "yes" | "on"
@@ -8883,7 +8969,7 @@ fn copy_field(
         // A numeric is exact: `9223372036854775807` through an f64 came back
         // as `9.223372036854776E+18`.
         "numeric" | "decimal" => {
-            Bson::Decimal128(secantus_pgplan::parse_numeric(&text).map_err(|e| PgHandler::err(&e))?)
+            secantus_pgplan::parse_numeric(&text).map_err(|e| PgHandler::err(&e))?
         }
         "bool" | "boolean" => match text.trim() {
             "t" | "true" | "y" | "yes" | "on" | "1" => Bson::Boolean(true),
