@@ -177,17 +177,29 @@ plus the document being left untouched.
 `tools/probes/rename_paths.py`; gates `tests/test_mongod_differential.py -k
 rename` (17 cases) and `tests/test_rename_array_and_dynamic_paths.py` (25).
 
-### 5. `$toLower` / `$toUpper` of a `Timestamp` — 2 shapes, needs a decision
+### 5. `$toLower` / `$toUpper` of a `Timestamp` — 2 shapes, and the answer IS host-dependent
 
 mongod renders a `Timestamp` through a legacy `asctime`-like path in **local
-time**: `Timestamp(1, 1)` prints `jan  1 01:00:01:1` on this box, because the UK
-and Ireland were on UTC+1 through 1970. Reproducing it faithfully bakes a
-timezone into the answer.
+time**. That was suspected; it is now measured, by running a second mongod
+8.2.11 under `TZ=UTC` beside the default one (2026-09-09):
 
-Note `$toString` of a `Timestamp` is a `241` on mongod, so these two operators
-accept a type `$toString` refuses. **Measure on a `TZ=UTC` server before
-implementing**, and decide whether a host-timezone-dependent answer is wanted at
-all.
+| expression | mongod, host TZ (Europe/Dublin) | mongod, `TZ=UTC` |
+| --- | --- | --- |
+| `{$toLower: Timestamp(1, 1)}` | `jan  1 01:00:01:1` | `jan  1 00:00:01:1` |
+| `{$toUpper: Timestamp(1, 1)}` | `JAN  1 01:00:01:1` | `JAN  1 00:00:01:1` |
+| `{$toLower: Timestamp(1700000000, 3)}` | `nov 14 22:13:20:3` | `nov 14 22:13:20:3` |
+
+So the two servers disagree only where the host offset is non-zero — the third
+row agrees because Ireland is on UTC in November, which is exactly the kind of
+coincidence that would make a single-shape probe conclude "not TZ-dependent".
+
+**The decision this needs is therefore concrete:** reproducing mongod faithfully
+means rendering in the SERVER PROCESS's local timezone, so the same query
+answers differently on two machines and the differential gate only passes where
+the runner's TZ matches. The alternatives are to pin UTC (correct on a UTC host,
+divergent elsewhere) or to keep refusing the conversion. Note `$toString` of a
+`Timestamp` is a `241` on mongod, so these two operators accept a type
+`$toString` rejects — the surface is genuinely two operators wide.
 
 ### 6. `$toDate` string parsing — RE-SIZED TWICE on 2026-09-09, and it is a FEATURE
 
@@ -221,10 +233,13 @@ artefact produced a confident wrong reading.
 
 - **Acceptance** is a real feature — porting timelib's format repertoire.
   Not blocked on anything, but it is a slice of its own, not a fix. Two
-  sub-decisions first: the slash form is US-first *by rule* (`"31/12/2020"` is
-  refused outright, so this is not ambiguity-resolution), and `"2020-01-01T"`
-  answering **07:00:00** must be re-measured on a `TZ=UTC` server before
-  anything is pinned.
+  sub-decision first: the slash form is US-first *by rule* (`"31/12/2020"` is
+  refused outright, so this is not ambiguity-resolution).
+
+  **The `"2020-01-01T"` -> 07:00:00 caution recorded earlier today is
+  WITHDRAWN.** A `TZ=UTC` mongod answers 07:00:00 too (measured 2026-09-09), so
+  it is deterministic timelib behaviour for a bare trailing `T`, not host-local
+  leakage, and nothing here is blocked on the timezone question that item 5 is.
 - **The positioned diagnostics** still need timelib's own lexer, timezone
   abbreviation tables and per-position error accumulation. Inventing a position
   would look authoritative and be wrong. Stays deferred.
