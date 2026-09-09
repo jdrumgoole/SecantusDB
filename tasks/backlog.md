@@ -5662,15 +5662,16 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   is supported; the named form would need the wire layer's prepared-statement
   store, and PostgreSQL answers `26000` for a name that does not exist, so
   accepting it as a no-op would be a wrong answer.
-- [ ] **OPEN — Rust PG server: the `aclitem` type (2026-09-09).**
-  `select '{postgres=r/postgres}'::aclitem[]` is `a cast to aclitem is not
-  supported yet`; on PostgreSQL 16 it is oid 1033 / array 1034, and its
-  parser resolves grantee and grantor against the ROLE catalog
-  (`'nobody=r'::aclitem` is `role "nobody" does not exist`, a bare grantee
-  defaults the grantor to the session user with a WARNING, a bad mode char
-  is `invalid mode character: must be one of "arwdDxtXUCTcsA"`, `'junk'` is
-  `unrecognized key word: "junk"`). Needs a roles catalog first. psycopg
-  `test_array_of_unknown_builtin`.
+- **Rust PG server: `aclitem` knows one role (2026-09-09).** The parser is
+  PostgreSQL 16's, but there is no role catalog, so the only grantee /
+  grantor it resolves is the session user (`'nobody=r/test'::aclitem` is
+  `42704 role "nobody" does not exist`, as on PostgreSQL for a role that is
+  not there; `public` too — PostgreSQL's `PUBLIC` is the EMPTY grantee, so
+  `'=r/test'` is the spelling that works on both). An omitted grantor
+  defaults to the session user, where PostgreSQL uses the bootstrap
+  superuser (`jd=r/postgres`), with the same WARNING. Stored as text, so
+  `'x=r/x'::aclitem::oid` is `22P02` where PostgreSQL has no such cast
+  (`42846`).
 - [ ] **OPEN — Rust PG server: `box = box` is refused (2026-09-09).**
   `select '(1,2),(3,4)'::box = '(3,4),(1,2)'::box` is `comparing document
   with document using = is not supported yet`; PostgreSQL 16 answers `t`
@@ -5735,12 +5736,11 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   goes through ryu, so `1e20::float4` is `1e20` where PostgreSQL 16 prints
   `1e+20`. Same fix as `geo::float8_text`, with float4's 6-digit shortest
   round-trip.
-- **Rust PG server: psycopg's `test_array.py` is 157/158 (2026-09-09).**
+- **Rust PG server: psycopg's `test_array.py` is 158/158 (2026-09-09).**
   Multidimensional arrays round-trip in text and binary both ways,
   `INSERT … RETURNING`, the `box` type and its `;` array separator all
-  land, and a table's row type is a composite (`test_array_register`,
-  2026-09-09); what is left is `test_array_of_unknown_builtin` (`aclitem`),
-  above.
+  land, a table's row type is a composite (`test_array_register`) and
+  `aclitem` parses (`test_array_of_unknown_builtin`), both 2026-09-09.
 
 - [x] **Five probes never compared the Rust server — instrumented 2026-09-02.**
   `tools/probes/_servers.py` is now the shared `probe_targets()` helper, and

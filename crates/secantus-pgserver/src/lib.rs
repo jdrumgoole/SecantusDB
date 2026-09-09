@@ -726,6 +726,12 @@ impl PgHandler {
         }
         secantus_pgplan::set_user_types(types);
         secantus_pgplan::set_user_composites(composites);
+        secantus_pgplan::set_session_user(Some(
+            self.session_user
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        ));
         // Custom ranges resolve their subtype at cast time and their oid for
         // regtype -- but they are NOT enums, so they stay OUT of set_user_types.
         // A schema-qualified range resolves as `schema.name`, so
@@ -2555,16 +2561,20 @@ impl PgHandler {
     }
 
     fn err(e: &PlanError) -> PgWireError {
-        // A planner message may carry PostgreSQL's DETAIL line after the
-        // primary one; it travels in the `D` field, not the message.
+        // A planner message may carry PostgreSQL's DETAIL / HINT line after
+        // the primary one; each travels in its own field, not the message.
         let text = e.to_string();
-        let (message, detail) = match text.split_once("\nDetail: ") {
-            Some((m, d)) => (m.to_string(), Some(d.to_string())),
+        let (message, hint) = match text.split_once("\nHint: ") {
+            Some((m, h)) => (m.to_string(), Some(h.to_string())),
             None => (text, None),
+        };
+        let (message, detail) = match message.split_once("\nDetail: ") {
+            Some((m, d)) => (m.to_string(), Some(d.to_string())),
+            None => (message, None),
         };
         let mut info = ErrorInfo::new("ERROR".into(), e.sqlstate().into(), message);
         info.detail = detail;
-        info.hint = e.hint().map(str::to_string);
+        info.hint = hint.or_else(|| e.hint().map(str::to_string));
         PgWireError::UserError(Box::new(info))
     }
 
@@ -2870,6 +2880,7 @@ fn internal_type_name(ty: &Type) -> Option<String> {
             17 => "bytea",
             869 => "inet",
             650 => "cidr",
+            1033 => "aclitem",
             603 => "box",
             1043 => "varchar",
             1042 => "bpchar",
@@ -2896,6 +2907,7 @@ fn internal_type_name(ty: &Type) -> Option<String> {
             1009 => "text[]",
             1015 => "varchar[]",
             1001 => "bytea[]",
+            1034 => "aclitem[]",
             1041 => "inet[]",
             651 => "cidr[]",
             1020 => "box[]",
@@ -2962,6 +2974,7 @@ fn wire_type(pg_type: &str) -> Type {
         "bytea" => Type::BYTEA,
         "inet" => Type::INET,
         "cidr" => Type::CIDR,
+        "aclitem" => Type::ACLITEM,
         "box" => Type::BOX,
         "varchar" | "character varying" => Type::VARCHAR,
         "bpchar" | "char" | "character" => Type::BPCHAR,
@@ -3055,6 +3068,7 @@ fn wire_type(pg_type: &str) -> Type {
         "bytea[]" => Type::BYTEA_ARRAY,
         "inet[]" => Type::INET_ARRAY,
         "cidr[]" => Type::CIDR_ARRAY,
+        "aclitem[]" => Type::ACLITEM_ARRAY,
         "box[]" => Type::BOX_ARRAY,
         "uuid[]" => Type::UUID_ARRAY,
         "bpchar[]" | "char[]" | "character[]" => Type::BPCHAR_ARRAY,
@@ -4279,6 +4293,7 @@ impl PgHandler {
             param_types,
             &tz,
         );
+        self.collect_planner_warnings();
         if self.txn_failed.load(std::sync::atomic::Ordering::Relaxed) {
             let ends_the_block = matches!(
                 &planned,
@@ -4448,10 +4463,27 @@ impl PgHandler {
                 .and_then(|r| r),
             None => self.execute(stmt, max_rows),
         });
+        self.collect_planner_warnings();
         if out.is_err() {
             self.note_failure();
         }
         out
+    }
+
+    /// Queue the WARNINGs the planner raised on this thread (an `aclitem`
+    /// with no grantor) as NoticeResponses for the statement in flight.
+    fn collect_planner_warnings(&self) {
+        let warnings = secantus_pgplan::take_warnings();
+        if warnings.is_empty() {
+            return;
+        }
+        let mut pending = self
+            .pending_notices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (sqlstate, message) in warnings {
+            pending.push(ErrorInfo::new("WARNING".into(), sqlstate, message));
+        }
     }
 
     /// Mark the open transaction failed, if there is one.
@@ -9121,6 +9153,7 @@ fn element_of_array_oid(oid: u32) -> Option<&'static str> {
         1001 => "bytea",
         1041 => "inet",
         651 => "cidr",
+        1034 => "aclitem",
         1020 => "box",
         2951 => "uuid",
         // `oid[]` sent as text (`{1,2}`, psycopg's `[Oid(1), Oid(2)]`) used to
@@ -9792,6 +9825,9 @@ fn decode_parameter(
         Some(650) => secantus_pgplan::net::normalize_cidr(&text)
             .map(Bson::String)
             .map_err(|e| PgHandler::err(&e)),
+        Some(1033) => {
+            secantus_pgplan::cast_text_to(&text, "aclitem", tz).map_err(|e| PgHandler::err(&e))
+        }
         Some(603) => {
             secantus_pgplan::cast_text_to(&text, "box", tz).map_err(|e| PgHandler::err(&e))
         }

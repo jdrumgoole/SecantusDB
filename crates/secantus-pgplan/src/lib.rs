@@ -13,6 +13,7 @@
 
 use bson::{doc, Bson, Document};
 
+pub mod acl;
 pub mod bytea;
 pub mod geo;
 pub mod json;
@@ -6125,6 +6126,35 @@ pub fn plan_with_session_types(
     out
 }
 
+thread_local! {
+    /// The session user, installed per statement by the wire layer: the one
+    /// role this server can vouch for (an `aclitem` grantee / grantor).
+    static PLAN_SESSION_USER: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+    /// WARNINGs the statement in flight raised, as `(sqlstate, message)`; the
+    /// wire layer drains them into NoticeResponses.
+    static PLAN_WARNINGS: std::cell::RefCell<Vec<(String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Install the session user for the statements that follow on this thread.
+pub fn set_session_user(user: Option<String>) {
+    PLAN_SESSION_USER.with(|u| *u.borrow_mut() = user);
+}
+
+pub(crate) fn session_user() -> Option<String> {
+    PLAN_SESSION_USER.with(|u| u.borrow().clone())
+}
+
+pub(crate) fn warn(sqlstate: &str, message: String) {
+    PLAN_WARNINGS.with(|w| w.borrow_mut().push((sqlstate.to_string(), message)));
+}
+
+/// The WARNINGs raised since the last call, as `(sqlstate, message)`.
+pub fn take_warnings() -> Vec<(String, String)> {
+    PLAN_WARNINGS.with(|w| std::mem::take(&mut *w.borrow_mut()))
+}
+
 /// Install the user-defined types for the statements that follow on this
 /// thread. The wire layer reads them from the shared store per statement.
 pub fn set_user_types(types: Vec<(String, i64, Vec<String>)>) {
@@ -8158,6 +8188,7 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
         "time" => Ok(Bson::String(parse_time(&as_text(&value))?)),
         "inet" => Ok(Bson::String(net::normalize_inet(&as_text(&value))?)),
         "cidr" => Ok(Bson::String(net::normalize_cidr(&as_text(&value))?)),
+        "aclitem" => Ok(Bson::String(acl::parse(&as_text(&value))?)),
         "bytea" => {
             let bytes = bytea::parse(&value)?;
             Ok(bytea::to_binary(bytes))

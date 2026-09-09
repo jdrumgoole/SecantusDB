@@ -57,6 +57,16 @@ refused at CREATE (`42703`, `42830`).
   a relation collides with a type) or `42P07 relation "x" already exists`.
   `to_regtype` also resolves a user type's array — `mood[]`, `rtt[]` or the
   internal `_rtt` spelling — which was NULL for every enum and composite.
+- Rust PostgreSQL server: the `aclitem` type (oid 1033, array 1034) with
+  PostgreSQL 16's parser and renderer — `grantee=privileges/grantor` with
+  the `group` / `user` key words, quoted names, `*` grant options and the
+  canonical `arwdDxtXUCTcsA` order — and its errors (`role "x" does not
+  exist`, `invalid mode character`, `unrecognized key word` with its hint,
+  `extra garbage at the end of the ACL specification`). The roles it knows
+  are the session user (there is no role catalog); an omitted grantor
+  defaults to it with PostgreSQL's `defaulting grantor to user ID 10`
+  WARNING, and a planner WARNING now reaches the client as a
+  NoticeResponse.
 
 #### Fixed
 

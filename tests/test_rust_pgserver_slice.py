@@ -7437,3 +7437,72 @@ def test_a_table_is_also_its_row_type(home: Path) -> None:
             "42P07",
             'relation "rtt" already exists',
         )
+
+
+def test_aclitem_parses_and_renders_as_postgresql(home: Path) -> None:
+    """``aclitem`` — oid 1033 / array 1034 — with PostgreSQL 16's parser.
+
+    psycopg's ``test_array_of_unknown_builtin`` reads the session user's
+    grant back through both. The grantee and grantor are roles: the one this
+    server knows is the session user.
+    """
+    from psycopg.types import TypeInfo
+
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        notices: list[tuple[str, str, str]] = []
+        conn.add_notice_handler(
+            lambda d: notices.append((d.severity, d.sqlstate, d.message_primary))
+        )
+        user = conn.execute("select user").fetchone()[0]
+        assert user == "test"
+        info = TypeInfo.fetch(conn, "aclitem")
+        assert (info.oid, info.array_oid) == (1033, 1034)
+
+        cur = conn.execute(
+            "select 'test=arwdDxt/test'::aclitem, array['test=arwdDxt/test']::aclitem[],"
+            " '{test=r/test, \"\\\"test\\\"=w*a/test\"}'::aclitem[], '=r/test'::aclitem,"
+            " pg_typeof('test=r/test'::aclitem)::text, %s::aclitem, %s::aclitem[]",
+            ("group test=r/test", "{user test=wr/test}"),
+        )
+        assert cur.fetchone() == (
+            "test=arwdDxt/test",
+            ["test=arwdDxt/test"],
+            ["test=r/test", "test=aw*/test"],
+            "=r/test",
+            "aclitem",
+            "test=r/test",
+            ["test=rw/test"],
+        )
+        assert [d.type_code for d in cur.description[:2]] == [1033, 1034]
+
+        # An omitted grantor defaults to the superuser, with PostgreSQL's WARNING.
+        assert conn.execute("select 'test=r'::aclitem").fetchone() == ("test=r/test",)
+        assert notices == [("WARNING", "0L000", "defaulting grantor to user ID 10")]
+
+        for sql, sqlstate, message, hint in [
+            ("select 'nobody=r/test'::aclitem", "42704", 'role "nobody" does not exist', None),
+            ("select 'test=r/nobody'::aclitem", "42704", 'role "nobody" does not exist', None),
+            (
+                "select 'test=q/test'::aclitem",
+                "22P02",
+                'invalid mode character: must be one of "arwdDxtXUCTcsA"',
+                None,
+            ),
+            (
+                "select 'junk'::aclitem",
+                "22P02",
+                'unrecognized key word: "junk"',
+                'ACL key word must be "group" or "user".',
+            ),
+            ("select 'test=r/'::aclitem", "22P02", 'a name must follow the "/" sign', None),
+            (
+                "select 'test=r/test extra'::aclitem",
+                "22P02",
+                "extra garbage at the end of the ACL specification",
+                None,
+            ),
+        ]:
+            with pytest.raises(psycopg.Error) as exc:
+                conn.execute(sql)
+            assert (exc.value.sqlstate, exc.value.diag.message_primary) == (sqlstate, message), sql
+            assert exc.value.diag.message_hint == hint, sql
