@@ -5035,3 +5035,68 @@ def test_array_concatenation_follows_array_cat(home: Path) -> None:
         assert cur.fetchone() == ("integer[]",)
         with pytest.raises(psycopg.errors.InvalidTextRepresentation):
             cur.execute("select array['a'] || 'b'")
+
+
+def test_expressions_over_generate_series_rows(home: Path) -> None:
+    """A select-list expression over a `generate_series` row -- arithmetic, a
+    cast, a scalar call, date arithmetic, a comparison -- evaluates per row,
+    is named as PostgreSQL names it, and is typed from the row's declared
+    column type. Every value, name and `pg_typeof` here is PG 16's."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "select i, i + 1, i::int8 as j, i * 2.5, abs(-i), "
+            "'2021-01-01'::date + i, i > 1 from generate_series(1, 2) as i"
+        )
+        assert [d.name for d in cur.description] == [
+            "i",
+            "?column?",
+            "j",
+            "?column?",
+            "abs",
+            "?column?",
+            "?column?",
+        ]
+        assert cur.fetchall() == [
+            (1, 2, 1, Decimal("2.5"), 1, dt.date(2021, 1, 2), False),
+            (2, 3, 2, Decimal("5.0"), 2, dt.date(2021, 1, 3), True),
+        ]
+        cur.execute(
+            "select pg_typeof(abs(-i)), pg_typeof(i + 1), pg_typeof(i * 2.5), "
+            "pg_typeof(i::int8), pg_typeof('2021-01-01'::date + i), "
+            "pg_typeof(i > 1), pg_typeof(i) from generate_series(1, 1) as i"
+        )
+        assert cur.fetchone() == (
+            "integer",
+            "integer",
+            "numeric",
+            "bigint",
+            "date",
+            "boolean",
+            "integer",
+        )
+        # The stream path (Execute with a row limit) takes the same route.
+        rows = list(
+            cur.stream(
+                "select i, '2021-01-01'::date + i from generate_series(1, %s) as i",
+                [2],
+            )
+        )
+        assert rows == [(1, dt.date(2021, 1, 2)), (2, dt.date(2021, 1, 3))]
+
+
+def test_describe_distinguishes_no_columns_from_no_rows(home: Path) -> None:
+    """Describe answers `NoData` only for a statement that returns no rows at
+    all; a `select` with an empty target list is a RowDescription of zero
+    fields and yields one empty row. psycopg's `stream()` reads the difference:
+    a NoData select raised `the last operation didn't produce a result`.
+    Probed against PG 16 at the protocol level."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        assert list(cur.stream("select")) == [()]
+        assert cur.description == []
+        cur.execute("create table if not exists nodata_t (a int)")
+        assert cur.description is None
+        assert list(cur.stream("select %s::int", [1], binary=True)) == [(1,)]
+        with conn.cursor(binary=True) as bcur:
+            assert list(bcur.stream("select %s::int", [1])) == [(1,)]

@@ -541,6 +541,13 @@ pub trait ExtendedQueryHandler: Send + Sync {
             })
             .collect::<Vec<Type>>();
 
+        // The default parser cannot tell "no result set" from "no columns";
+        // keep the historical reading, where no fields means NoData.
+        if result_schema.is_empty() {
+            return Ok(DescribeStatementResponse::no_data_with_parameters(
+                param_types,
+            ));
+        }
         Ok(DescribeStatementResponse::new(param_types, result_schema))
     }
 
@@ -561,6 +568,9 @@ pub trait ExtendedQueryHandler: Send + Sync {
 
         let result_schema =
             query_parser.get_result_schema(stmt, Some(&target.result_column_format))?;
+        if result_schema.is_empty() {
+            return Ok(DescribePortalResponse::no_data());
+        }
         Ok(DescribePortalResponse::new(result_schema))
     }
 

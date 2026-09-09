@@ -3922,9 +3922,15 @@ impl PgHandler {
                         // A computed column is applied per row -- the cast
                         // chain or the scalar call the planner recorded.
                         if let Some(expr) = casts.get(i).and_then(|c| c.as_ref()) {
-                            let v = d.get(f).cloned().unwrap_or(Bson::Null);
-                            let v = secantus_pgplan::apply_column_expr(expr, v, &tz)
-                                .map_err(|e| PgHandler::err(&e))?;
+                            let v = if matches!(expr, secantus_pgplan::ColumnExpr::Row { .. }) {
+                                // An expression over the row sees every
+                                // column, not just the one it is filed under.
+                                secantus_pgplan::apply_row_expr(expr, &d)
+                            } else {
+                                let v = d.get(f).cloned().unwrap_or(Bson::Null);
+                                secantus_pgplan::apply_column_expr(expr, v, &tz)
+                            }
+                            .map_err(|e| PgHandler::err(&e))?;
                             encode_field_value(
                                 &mut enc,
                                 &schema_ref[i],
@@ -7164,7 +7170,13 @@ impl PgHandler {
             .collect()
     }
 
-    /// The output columns a statement would produce, without running it.
+    /// The output columns a statement would produce, without running it, or
+    /// `None` for a statement that produces no result set at all.
+    ///
+    /// The two are different wire answers: `select` (no columns) is a
+    /// `RowDescription` of zero fields, and psycopg's `stream()` iterates its
+    /// one empty row; `insert` is `NoData`. Answering `NoData` for both made
+    /// `cur.stream("select")` yield nothing.
     ///
     /// Planned against NULL placeholders: `Describe` arrives before `Bind`, so
     /// no values exist yet, and the result SHAPE does not depend on them.
@@ -7173,7 +7185,7 @@ impl PgHandler {
         sql: &str,
         n_params: usize,
         param_types: &[Option<String>],
-    ) -> PgWireResult<Vec<FieldInfo>> {
+    ) -> PgWireResult<Option<Vec<FieldInfo>>> {
         let params = vec![Bson::Null; n_params];
         // Describe resolves table names too, and against the same uncommitted
         // catalog, through `self.lookup`. The DECLARED parameter types
@@ -7198,7 +7210,7 @@ impl PgHandler {
         // the failure went unrecorded and the aborted block kept accepting
         // commands.
         .inspect_err(|_| self.note_failure())?;
-        Ok(match stmt {
+        Ok(Some(match stmt {
             // A FETCH describes the CURSOR's columns. Without this arm a
             // prepared FETCH described zero of them, and psycopg prepares any
             // statement it runs six times -- so a cursor read in a loop worked
@@ -7327,8 +7339,8 @@ impl PgHandler {
                 })
                 .collect(),
             // CREATE / INSERT / UPDATE / DELETE return no rows.
-            _ => Vec::new(),
-        })
+            _ => return Ok(None),
+        }))
     }
 }
 
@@ -7382,7 +7394,10 @@ impl ExtendedQueryHandler for PgHandler {
                 })
             })
             .collect();
-        Ok(DescribeStatementResponse::new(types, fields))
+        Ok(match fields {
+            Some(fields) => DescribeStatementResponse::new(types, fields),
+            None => DescribeStatementResponse::no_data_with_parameters(types),
+        })
     }
 
     /// PostgreSQL exposes a DECLAREd cursor as a PORTAL of the same name, and
@@ -7435,7 +7450,10 @@ impl ExtendedQueryHandler for PgHandler {
             target.statement.parameter_types.len(),
             &param_types,
         )?;
-        Ok(DescribePortalResponse::new(fields))
+        Ok(match fields {
+            Some(fields) => DescribePortalResponse::new(fields),
+            None => pgwire::api::results::DescribeResponse::no_data(),
+        })
     }
 
     async fn do_query<C>(

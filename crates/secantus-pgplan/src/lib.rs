@@ -644,6 +644,20 @@ pub enum ColumnExpr {
     /// existence, and `SELECT 1 FROM generate_series(...)` is how the suite
     /// counts rows.
     Const { value: Bson, result_type: String },
+    /// An arbitrary expression over the row -- `'2021-01-01'::date + i`,
+    /// `i::int4`, `i * 2`. Every column reference in `expr` was rewritten at
+    /// plan time into a parameter numbered PAST the statement's own, so the
+    /// constant evaluator runs it unchanged over `params ++ row values`;
+    /// `fields` names and types the row values in that order (the types are
+    /// declared as the parameters' when the expression runs, so `pg_typeof(i)`
+    /// answers the column's declared type). `result_type` is fixed at plan
+    /// time for the DESCRIBE pass.
+    Row {
+        expr: Box<pg_query::protobuf::Node>,
+        fields: Vec<(String, String)>,
+        params: Vec<Bson>,
+        result_type: String,
+    },
 }
 
 /// One column of a FROM-less SELECT.
@@ -1556,7 +1570,27 @@ fn plan_series_select(
                 columns.push((out.clone(), out));
                 casts.push(Some(ColumnExpr::Const { value, result_type }));
             }
-            Some(other) => return Err(Error::Unsupported(disc(other))),
+            // Anything else is an expression over the row -- `i + 1`,
+            // `'2021-01-01'::date + i`, `i::int4`.
+            Some(_) => {
+                let val = rt.val.as_ref().expect("ResTarget has a val");
+                let out = if rt.name.is_empty() {
+                    expression_column_name(val)
+                } else {
+                    rt.name.clone()
+                };
+                let fields = vec![(series.column.clone(), "int4".to_string())];
+                // The series' first value is a real row to type the
+                // expression from: a scalar call is typed by its result.
+                let mut sample = Document::new();
+                sample.insert(
+                    series.column.clone(),
+                    Bson::Int32(i32::try_from(series.start).unwrap_or_default()),
+                );
+                let row = row_column_expr(val, &fields, params, &sample)?;
+                columns.push((out, series.column.clone()));
+                casts.push(Some(row));
+            }
         }
     }
     if columns.is_empty() {
@@ -1615,6 +1649,190 @@ fn plan_series_select(
         limit,
         offset,
     }))
+}
+
+/// The name PostgreSQL gives an unaliased expression column: a cast or a
+/// parenthesised reference keeps the column's name, a call takes the
+/// function's, anything else is `?column?`.
+fn expression_column_name(node: &pg_query::protobuf::Node) -> String {
+    match node.node.as_ref() {
+        Some(N::ColumnRef(c)) => column_ref_name(c).unwrap_or_else(|| "?column?".to_string()),
+        Some(N::TypeCast(tc)) => tc
+            .arg
+            .as_deref()
+            .map(expression_column_name)
+            .unwrap_or_else(|| "?column?".to_string()),
+        Some(N::FuncCall(f)) => f
+            .funcname
+            .last()
+            .and_then(|n| match n.node.as_ref() {
+                Some(N::String(st)) => Some(st.sval.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "?column?".to_string()),
+        _ => "?column?".to_string(),
+    }
+}
+
+/// Build a `ColumnExpr::Row` for an expression over the row's `fields`
+/// (`(name, pg_type)`), given the statement's own `params`.
+///
+/// Every column reference is rewritten into a parameter reference numbered
+/// past the statement's parameters, and the result type is inferred with the
+/// row columns' types visible to `declared_param_type`, so a `$n` standing in
+/// for an `int4` column types as one.
+fn row_column_expr(
+    node: &pg_query::protobuf::Node,
+    fields: &[(String, String)],
+    params: &[Bson],
+    sample: &Document,
+) -> Result<ColumnExpr> {
+    let mut expr = node.clone();
+    rewrite_column_refs(&mut expr, fields, params.len())?;
+    let mut out = ColumnExpr::Row {
+        expr: Box::new(expr.clone()),
+        fields: fields.to_vec(),
+        params: params.to_vec(),
+        result_type: String::new(),
+    };
+    // A sample row's value types what the node alone cannot (a scalar call's
+    // result); an expression that fails on the sample still gets the node's
+    // own type, and fails per row when run.
+    let sample_value = apply_row_expr(&out, sample).unwrap_or(Bson::Null);
+    let previous = declare_row_fields(params.len(), fields);
+    let result_type = static_type(&expr, &sample_value);
+    PLAN_PARAM_TYPES.with(|t| *t.borrow_mut() = previous);
+    if let ColumnExpr::Row { result_type: t, .. } = &mut out {
+        *t = result_type;
+    }
+    Ok(out)
+}
+
+/// Replace each `ColumnRef` under `node` with `ParamRef(n_params + 1 + i)`
+/// where `i` is the column's position in `fields`; an unknown column is
+/// `42703`. Walks the expression node kinds the constant evaluator handles.
+fn rewrite_column_refs(
+    node: &mut pg_query::protobuf::Node,
+    fields: &[(String, String)],
+    n_params: usize,
+) -> Result<()> {
+    let Some(inner) = node.node.as_mut() else {
+        return Ok(());
+    };
+    match inner {
+        N::ColumnRef(c) => {
+            let name =
+                column_ref_name(c).ok_or_else(|| Error::Unsupported("this column".into()))?;
+            let idx = fields
+                .iter()
+                .position(|(f, _)| *f == name)
+                .ok_or_else(|| Error::UndefinedColumn(name.clone()))?;
+            let number = i32::try_from(n_params + 1 + idx)
+                .map_err(|_| Error::Unsupported("this many columns".into()))?;
+            *inner = N::ParamRef(pg_query::protobuf::ParamRef {
+                number,
+                location: c.location,
+            });
+            Ok(())
+        }
+        N::TypeCast(tc) => tc
+            .arg
+            .as_deref_mut()
+            .map_or(Ok(()), |a| rewrite_column_refs(a, fields, n_params)),
+        N::AExpr(e) => {
+            if let Some(l) = e.lexpr.as_deref_mut() {
+                rewrite_column_refs(l, fields, n_params)?;
+            }
+            if let Some(r) = e.rexpr.as_deref_mut() {
+                rewrite_column_refs(r, fields, n_params)?;
+            }
+            Ok(())
+        }
+        N::FuncCall(f) => f
+            .args
+            .iter_mut()
+            .try_for_each(|a| rewrite_column_refs(a, fields, n_params)),
+        N::BoolExpr(b) => b
+            .args
+            .iter_mut()
+            .try_for_each(|a| rewrite_column_refs(a, fields, n_params)),
+        N::AArrayExpr(a) => a
+            .elements
+            .iter_mut()
+            .try_for_each(|a| rewrite_column_refs(a, fields, n_params)),
+        N::RowExpr(r) => r
+            .args
+            .iter_mut()
+            .try_for_each(|a| rewrite_column_refs(a, fields, n_params)),
+        N::CoalesceExpr(c) => c
+            .args
+            .iter_mut()
+            .try_for_each(|a| rewrite_column_refs(a, fields, n_params)),
+        N::MinMaxExpr(m) => m
+            .args
+            .iter_mut()
+            .try_for_each(|a| rewrite_column_refs(a, fields, n_params)),
+        N::NullTest(t) => t
+            .arg
+            .as_deref_mut()
+            .map_or(Ok(()), |a| rewrite_column_refs(a, fields, n_params)),
+        N::CaseExpr(c) => {
+            if let Some(a) = c.arg.as_deref_mut() {
+                rewrite_column_refs(a, fields, n_params)?;
+            }
+            for w in &mut c.args {
+                if let Some(N::CaseWhen(cw)) = w.node.as_mut() {
+                    if let Some(e) = cw.expr.as_deref_mut() {
+                        rewrite_column_refs(e, fields, n_params)?;
+                    }
+                    if let Some(r) = cw.result.as_deref_mut() {
+                        rewrite_column_refs(r, fields, n_params)?;
+                    }
+                }
+            }
+            c.defresult
+                .as_deref_mut()
+                .map_or(Ok(()), |d| rewrite_column_refs(d, fields, n_params))
+        }
+        N::AIndirection(a) => a
+            .arg
+            .as_deref_mut()
+            .map_or(Ok(()), |a| rewrite_column_refs(a, fields, n_params)),
+        _ => Ok(()),
+    }
+}
+
+/// Evaluate a `ColumnExpr::Row` over one row.
+pub fn apply_row_expr(expr: &ColumnExpr, row: &Document) -> Result<Bson> {
+    let ColumnExpr::Row {
+        expr,
+        fields,
+        params,
+        ..
+    } = expr
+    else {
+        return Err(Error::Unsupported("not a row expression".into()));
+    };
+    let mut all = params.clone();
+    all.extend(
+        fields
+            .iter()
+            .map(|(f, _)| row.get(f).cloned().unwrap_or(Bson::Null)),
+    );
+    let previous = declare_row_fields(params.len(), fields);
+    let out = const_value(expr, &all);
+    PLAN_PARAM_TYPES.with(|t| *t.borrow_mut() = previous);
+    out
+}
+
+/// Declare a row's fields as the parameter types numbered past the
+/// statement's own `n_params`, returning the previous declarations so the
+/// caller can restore them.
+fn declare_row_fields(n_params: usize, fields: &[(String, String)]) -> Vec<Option<String>> {
+    let mut types = PLAN_PARAM_TYPES.with(|t| t.borrow().clone());
+    types.resize(n_params, None);
+    types.extend(fields.iter().map(|(_, t)| Some(t.clone())));
+    PLAN_PARAM_TYPES.with(|t| t.replace(types))
 }
 
 /// The column NAME in a ColumnRef, with any table qualification stripped.
@@ -5086,6 +5304,16 @@ pub fn apply_column_expr(expr: &ColumnExpr, value: Bson, tz: &TimeZoneSetting) -
         }
         // A literal ignores the row and returns its constant.
         ColumnExpr::Const { value, .. } => Ok(value.clone()),
+        // A row expression over ONE column: the executor's doc-aware path
+        // (`apply_row_expr`) is the normal route; this one serves a caller
+        // that has only the one value.
+        ColumnExpr::Row { fields, .. } => {
+            let mut row = Document::new();
+            if let Some((f, _)) = fields.first() {
+                row.insert(f.clone(), value);
+            }
+            apply_row_expr(expr, &row)
+        }
     }
 }
 
@@ -5098,6 +5326,7 @@ pub fn column_expr_type(expr: &ColumnExpr) -> &str {
         // from the side column, so this fallback is not used for typing.
         ColumnExpr::Coalesce { .. } => "text",
         ColumnExpr::Const { result_type, .. } => result_type,
+        ColumnExpr::Row { result_type, .. } => result_type,
     }
 }
 
