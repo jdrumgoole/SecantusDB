@@ -405,6 +405,22 @@ pub enum Statement {
     Aggregate(Aggregate),
     Update(Update),
     Delete(Delete),
+    /// `CREATE [TEMP] TABLE name [(cols)] AS query [WITH [NO] DATA]`.
+    ///
+    /// The table's columns are the query's output columns -- names and
+    /// types as the query DESCRIBES them -- so they are settled by the
+    /// executor, which is the only place the query's description exists.
+    /// `column_names` is the optional explicit list that renames them.
+    CreateTableAs {
+        table: String,
+        if_not_exists: bool,
+        temp: bool,
+        column_names: Vec<String>,
+        query: Box<Statement>,
+        /// `WITH NO DATA` creates the table empty and tags `CREATE TABLE AS`;
+        /// the default fills it and tags `SELECT n`.
+        with_data: bool,
+    },
 }
 
 /// Which way a `FETCH` or `MOVE` runs, and from where.
@@ -557,6 +573,10 @@ pub struct AggItem {
     /// The declared PostgreSQL type of the source column, for `min`/`max`
     /// which return the input type. `count` and `sum` are always int8.
     pub source_type: Option<String>,
+    /// An aggregate over an EXPRESSION -- `max(length(data))`,
+    /// `sum(n * 2)` -- evaluated per row into `field` (a hidden `__aggN`
+    /// slot) before the group is computed. `None` for a bare column.
+    pub expr: Option<ColumnExpr>,
 }
 
 /// One output column of an aggregate query, by POSITION.
@@ -872,6 +892,10 @@ pub enum ConstCol {
     /// `pg_listening_channels()` -- one row per channel this session
     /// LISTENs on, which only the server's session knows.
     ListeningChannels,
+    /// The output column of a `FROM function(...)` source -- `select * from
+    /// pg_sleep(1)`, `select x from pg_listening_channels() x` -- read from
+    /// `SelectConstant::source`'s row rather than resolved on its own.
+    FromColumn,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -906,6 +930,11 @@ pub struct SelectConstant {
     /// where false` is ZERO rows in PostgreSQL; before this was carried, the
     /// predicate was ignored and the row answered anyway.
     pub where_true: bool,
+    /// `FROM function(...)`: the function stands in for a table. It is
+    /// evaluated once per statement (so `select 'ok' from pg_sleep(0.5)`
+    /// still waits), a set-returning one yields one row per result, and
+    /// every `ConstCol::FromColumn` in `columns` reads that row's value.
+    pub source: Option<Box<ConstCol>>,
 }
 
 /// The three wire formats a COPY can use. They are not interchangeable: text
@@ -1182,6 +1211,7 @@ pub fn plan_with_params(
 ) -> Result<Statement> {
     match parse_one(sql)? {
         N::CreateStmt(c) => plan_create(&c),
+        N::CreateTableAsStmt(c) => plan_create_table_as(&c, lookup, params),
         N::InsertStmt(i) => plan_insert(&i, lookup, params),
         N::SelectStmt(s) => plan_select(&s, lookup, params),
         N::DropStmt(d) => plan_drop(&d),
@@ -1666,6 +1696,41 @@ fn type_name(names: &[pg_query::protobuf::Node]) -> String {
         [schema, n] => canonical_type_ref(&format!("{schema}.{n}")),
         other => other.join("."),
     }
+}
+
+/// `CREATE TABLE ... AS <query>`. Only a table target: a materialized view
+/// (`objtype` OBJECT_MATVIEW) is a refreshable relation this server has no
+/// catalog for, and `SELECT ... INTO` is the same statement in older clothes.
+fn plan_create_table_as(
+    c: &pg_query::protobuf::CreateTableAsStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Result<Statement> {
+    use pg_query::protobuf::ObjectType;
+    if c.objtype != ObjectType::ObjectTable as i32 {
+        return Err(Error::Unsupported("CREATE MATERIALIZED VIEW".into()));
+    }
+    let into = c
+        .into
+        .as_ref()
+        .ok_or_else(|| Error::Parse("CREATE TABLE AS without a target".into()))?;
+    let rel = into
+        .rel
+        .as_ref()
+        .ok_or_else(|| Error::Parse("CREATE TABLE AS without a relation".into()))?;
+    let query = match c.query.as_ref().and_then(|q| q.node.as_ref()) {
+        Some(N::SelectStmt(sel)) => plan_select(sel, lookup, params)?,
+        Some(other) => return Err(Error::Unsupported(disc(other))),
+        None => return Err(Error::Parse("CREATE TABLE AS without a query".into())),
+    };
+    Ok(Statement::CreateTableAs {
+        table: rel.relname.clone(),
+        if_not_exists: c.if_not_exists,
+        temp: rel.relpersistence == "t",
+        column_names: string_list(&into.col_names),
+        query: Box::new(query),
+        with_data: !into.skip_data,
+    })
 }
 
 fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
@@ -3045,6 +3110,11 @@ fn plan_select(
         let join = plan_join_select(s, lookup, params)?;
         return plan_join_plain_select(s, join, lookup, params);
     }
+    // Any other function in FROM -- `pg_sleep`, `pg_listening_channels` --
+    // is a FROM-less select with the function as its row source.
+    if let Some(N::RangeFunction(rf)) = s.from_clause[0].node.as_ref() {
+        return plan_function_source_select(s, rf, params);
+    }
     let table = match s.from_clause[0].node.as_ref() {
         Some(N::RangeVar(r)) => r.relname.clone(),
         Some(other) => return Err(Error::Unsupported(disc(other))),
@@ -3232,6 +3302,7 @@ fn plan_aggregate(
                 out,
                 // `min`/`max` return the input type, which here is always int4.
                 source_type: Some("int4".to_string()),
+                expr: None,
             });
         }
         // The WHERE clause was silently dropped here before: `count(*)
@@ -3846,7 +3917,29 @@ fn finish_aggregate(
                                 _ => None,
                             })
                             .ok_or_else(|| Error::Unsupported("this aggregate argument".into()))?,
-                        _ => {
+                        Some(_) => {
+                            let expr = row_column_expr(&f.args[0], &fields, params, &sample)?;
+                            let pg_type = match &expr {
+                                ColumnExpr::Row { result_type, .. } => result_type.clone(),
+                                _ => "text".to_string(),
+                            };
+                            let slot = format!("__agg{}", items.len());
+                            let out = if rt.name.is_empty() {
+                                name.clone()
+                            } else {
+                                rt.name.clone()
+                            };
+                            select.push((out.clone(), OutputCol::Agg(items.len())));
+                            items.push(AggItem {
+                                func,
+                                field: Some(slot),
+                                out,
+                                source_type: Some(pg_type),
+                                expr: Some(expr),
+                            });
+                            continue;
+                        }
+                        None => {
                             return Err(Error::Unsupported(
                                 "an aggregate over an expression".into(),
                             ))
@@ -3868,6 +3961,7 @@ fn finish_aggregate(
                     field,
                     out,
                     source_type,
+                    expr: None,
                 });
             }
             Some(N::ColumnRef(c)) => {
@@ -4878,8 +4972,11 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                         // as text and the executed `91` went out as `'91'`
                         // under oid 25. The function's declared result type
                         // is what PostgreSQL reports there.
-                        let t = if value == Bson::Null {
-                            scalar::static_result_type(&name).to_string()
+                        // A `timestamptz` value is a bare date on the wire
+                        // and would read as `timestamp` from its shape.
+                        let declared = scalar::static_result_type(&name);
+                        let t = if value == Bson::Null || declared == "timestamptz" {
+                            declared.to_string()
                         } else {
                             inferred_type(&value).to_string()
                         };
@@ -5053,13 +5150,26 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                     (name, ConstCol::Value(v), t, -1)
                 }
             }
-            // `user`, `current_user`, `current_date` and the other keyword
-            // functions: the role ones resolve on the server, which knows
-            // the session; the date/time ones need `now()`, which this
-            // server does not evaluate yet, so they are refused by name.
+            // `user`, `current_user`, `current_timestamp` and the other
+            // keyword functions: the role ones resolve on the server, which
+            // knows the session; `current_timestamp` is `now()`; the
+            // remaining date/time ones are refused by name.
             Some(N::SqlvalueFunction(svf)) => {
                 use pg_query::protobuf::SqlValueFunctionOp as Op;
                 let op = Op::try_from(svf.op).unwrap_or(Op::SqlvalueFunctionOpUndefined);
+                if op == Op::SvfopCurrentTimestamp {
+                    columns.push((
+                        if rt.name.is_empty() {
+                            "current_timestamp".to_string()
+                        } else {
+                            rt.name.clone()
+                        },
+                        ConstCol::Value(scalar::now_value()),
+                        "timestamptz".to_string(),
+                        -1,
+                    ));
+                    continue;
+                }
                 let (name, col) = match op {
                     Op::SvfopCurrentUser => ("current_user", ConstCol::SessionUser),
                     Op::SvfopUser => ("user", ConstCol::SessionUser),
@@ -5134,6 +5244,161 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
     Ok(Statement::SelectConstant(SelectConstant {
         columns,
         where_true,
+        source: None,
+    }))
+}
+
+/// `SELECT ... FROM function(args) [AS alias[(col)]]` for a function that is
+/// not `generate_series`: `select 'ok' from pg_sleep(0.5)`, `select * from
+/// pg_listening_channels()`. The function is planned as the FROM-less
+/// target it would be on its own, and becomes the statement's SOURCE; the
+/// select list is planned FROM-less too, with every reference to the
+/// function's column (by its alias, the function's name, or `*`) reading the
+/// source row.
+fn plan_function_source_select(
+    s: &pg_query::protobuf::SelectStmt,
+    rf: &pg_query::protobuf::RangeFunction,
+    params: &[Bson],
+) -> Result<Statement> {
+    let call = rf
+        .functions
+        .iter()
+        .flat_map(|f| match f.node.as_ref() {
+            Some(N::List(l)) => l.items.clone(),
+            _ => vec![f.clone()],
+        })
+        .find(|n| matches!(n.node.as_ref(), Some(N::FuncCall(_))))
+        .ok_or_else(|| Error::Unsupported("this FROM function".into()))?;
+    let Some(N::FuncCall(func)) = call.node.as_ref() else {
+        unreachable!("filtered to FuncCall");
+    };
+    let func_name = func_name(func).unwrap_or_default();
+    // The table alias and the column name: `AS g(x)` names both, `AS g`
+    // names the table AND the column (a single-column function's column
+    // takes the alias), no alias leaves the function's own name.
+    let (table_alias, column) = match rf.alias.as_ref() {
+        Some(a) => {
+            let col = a
+                .colnames
+                .iter()
+                .find_map(|c| match c.node.as_ref() {
+                    Some(N::String(st)) => Some(st.sval.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| a.aliasname.clone());
+            (a.aliasname.clone(), col)
+        }
+        None => (func_name.clone(), func_name.clone()),
+    };
+    // Plan the function as a FROM-less target to learn its column and type.
+    let source_target = pg_query::protobuf::Node {
+        node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+            name: column.clone(),
+            indirection: Vec::new(),
+            val: Some(Box::new(call.clone())),
+            location: 0,
+        }))),
+    };
+    let planned = plan_select_constant(
+        &pg_query::protobuf::SelectStmt {
+            target_list: vec![source_target],
+            ..Default::default()
+        },
+        params,
+    )?;
+    let Statement::SelectConstant(source) = planned else {
+        return Err(Error::Unsupported("this FROM function".into()));
+    };
+    let (_, source_col, source_type, source_typmod) = source
+        .columns
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::Unsupported("this FROM function".into()))?;
+    // Which targets read the function's column: `*`, `col`, `alias.col`,
+    // `alias.*`. The rest are planned FROM-less as they stand.
+    let refers = |c: &pg_query::protobuf::ColumnRef| -> Option<bool> {
+        let parts: Vec<&pg_query::protobuf::Node> = c.fields.iter().collect();
+        let name = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
+            Some(N::String(st)) => Some(st.sval.clone()),
+            _ => None,
+        };
+        match parts.as_slice() {
+            [one] if matches!(one.node.as_ref(), Some(N::AStar(_))) => Some(true),
+            [one] => Some(name(one)? == column),
+            [t, c] => {
+                let t = name(t)?;
+                if t != table_alias {
+                    return None;
+                }
+                if matches!(c.node.as_ref(), Some(N::AStar(_))) {
+                    return Some(true);
+                }
+                Some(name(c)? == column)
+            }
+            _ => None,
+        }
+    };
+    let mut others: Vec<pg_query::protobuf::Node> = Vec::new();
+    // Per original target: `Some(name)` for one reading the source column,
+    // `None` for one planned among `others`.
+    let mut slots: Vec<Option<String>> = Vec::new();
+    for t in &s.target_list {
+        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+            return Err(Error::Unsupported("this target".into()));
+        };
+        if let Some(N::ColumnRef(c)) = rt.val.as_ref().and_then(|v| v.node.as_ref()) {
+            match refers(c) {
+                Some(true) => {
+                    slots.push(Some(if rt.name.is_empty() {
+                        column.clone()
+                    } else {
+                        rt.name.clone()
+                    }));
+                    continue;
+                }
+                Some(false) => {
+                    return Err(Error::UndefinedColumn(
+                        column_ref_name(c).unwrap_or_default(),
+                    ));
+                }
+                None => {}
+            }
+        }
+        slots.push(None);
+        others.push(t.clone());
+    }
+    let planned = plan_select_constant(
+        &pg_query::protobuf::SelectStmt {
+            target_list: others,
+            where_clause: s.where_clause.clone(),
+            ..Default::default()
+        },
+        params,
+    )?;
+    let Statement::SelectConstant(rest) = planned else {
+        return Err(Error::Unsupported("this select list".into()));
+    };
+    let mut rest_cols = rest.columns.into_iter();
+    let mut columns = Vec::with_capacity(slots.len());
+    for slot in slots {
+        match slot {
+            Some(name) => columns.push((
+                name,
+                ConstCol::FromColumn,
+                source_type.clone(),
+                source_typmod,
+            )),
+            None => columns.push(
+                rest_cols
+                    .next()
+                    .ok_or_else(|| Error::Unsupported("this select list".into()))?,
+            ),
+        }
+    }
+    Ok(Statement::SelectConstant(SelectConstant {
+        columns,
+        where_true: rest.where_true,
+        source: Some(Box::new(source_col)),
     }))
 }
 

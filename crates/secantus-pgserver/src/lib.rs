@@ -1387,6 +1387,19 @@ impl PgHandler {
             }
         };
 
+        // An aggregate over an expression reads a hidden per-row slot
+        // (`__aggN`), filled here so the aggregate itself only ever sees a
+        // field.
+        let mut docs = docs;
+        for item in &agg.items {
+            let (Some(expr), Some(slot)) = (item.expr.as_ref(), item.field.as_deref()) else {
+                continue;
+            };
+            for d in docs.iter_mut() {
+                let v = secantus_pgplan::apply_row_expr(expr, d).map_err(|e| Self::err(&e))?;
+                d.insert(slot, v);
+            }
+        }
         // Group, preserving first-seen order so output is deterministic
         // even with no ORDER BY.
         let mut keys: Vec<Vec<Option<Bson>>> = Vec::new();
@@ -2512,6 +2525,24 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("backend_type", "text", false),
                 ],
             )),
+            // PostgreSQL 16's `pg_tables` view: every user table (and the
+            // catalog's own, so `where schemaname = 'pg_catalog'` finds
+            // `pg_class`). No index / rule / trigger / row-security support
+            // here, so those flags are false; `tablespace` is NULL as it is
+            // for a table in the default tablespace.
+            "pg_tables" => Some(TableDef::new(
+                "pg_tables",
+                vec![
+                    secantus_pgcatalog::Column::new("schemaname", "name", false),
+                    secantus_pgcatalog::Column::new("tablename", "name", false),
+                    secantus_pgcatalog::Column::new("tableowner", "name", false),
+                    secantus_pgcatalog::Column::new("tablespace", "name", false),
+                    secantus_pgcatalog::Column::new("hasindexes", "bool", false),
+                    secantus_pgcatalog::Column::new("hasrules", "bool", false),
+                    secantus_pgcatalog::Column::new("hastriggers", "bool", false),
+                    secantus_pgcatalog::Column::new("rowsecurity", "bool", false),
+                ],
+            )),
             "pg_cursors" => Some(TableDef::new(
                 "pg_cursors",
                 vec![
@@ -2864,6 +2895,55 @@ impl PgHandler {
                         d
                     })
                     .collect()
+            }
+            "pg_tables" => {
+                let field = |name: &str| def.field_of(name).expect("column");
+                let owner = self
+                    .session_user
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let mut rows: Vec<Document> = self
+                    .all_table_defs()
+                    .ok()?
+                    .into_iter()
+                    .map(|t| {
+                        let mut d = Document::new();
+                        d.insert(field("schemaname"), Self::schema_of(&t));
+                        d.insert(field("tablename"), t.name.as_str());
+                        d.insert(field("tableowner"), owner.as_str());
+                        d.insert(field("tablespace"), Bson::Null);
+                        d.insert(field("hasindexes"), t.columns.iter().any(|c| c.pk));
+                        d.insert(field("hasrules"), false);
+                        d.insert(field("hastriggers"), false);
+                        d.insert(field("rowsecurity"), false);
+                        d
+                    })
+                    .collect();
+                // The catalog relations this server answers for, as
+                // PostgreSQL lists its own: owned by the bootstrap
+                // superuser, indexed.
+                for name in [
+                    "pg_type",
+                    "pg_attribute",
+                    "pg_range",
+                    "pg_enum",
+                    "pg_database",
+                    "pg_class",
+                    "pg_namespace",
+                ] {
+                    let mut d = Document::new();
+                    d.insert(field("schemaname"), "pg_catalog");
+                    d.insert(field("tablename"), name);
+                    d.insert(field("tableowner"), "postgres");
+                    d.insert(field("tablespace"), Bson::Null);
+                    d.insert(field("hasindexes"), true);
+                    d.insert(field("hasrules"), false);
+                    d.insert(field("hastriggers"), false);
+                    d.insert(field("rowsecurity"), false);
+                    rows.push(d);
+                }
+                rows
             }
             "pg_cursors" => {
                 let cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
@@ -4139,6 +4219,14 @@ impl PgHandler {
                     Self::COMPOSITE_COLLECTION.to_string(),
                 ]
             }
+            Statement::CreateTableAs { table, .. } => {
+                vec![
+                    table.clone(),
+                    CATALOG_COLLECTION.to_string(),
+                    SEQUENCE_COLLECTION.to_string(),
+                    Self::COMPOSITE_COLLECTION.to_string(),
+                ]
+            }
             Statement::DropTable(d) => {
                 let mut v = d.tables.clone();
                 v.push(CATALOG_COLLECTION.to_string());
@@ -5145,6 +5233,12 @@ impl PgHandler {
                 "0A000".into(), // feature_not_supported
                 "pg_listening_channels() beside other columns is not supported yet".into(),
             )))),
+            // Read from the source row by `const_rows`; never resolved alone.
+            ConstCol::FromColumn => Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "XX000".into(), // internal_error
+                "a FROM column outside its source".into(),
+            )))),
             ConstCol::TerminateBackend(inner) | ConstCol::CancelBackend(inner) => {
                 let terminate = matches!(col, ConstCol::TerminateBackend(_));
                 let name = if terminate {
@@ -5403,21 +5497,38 @@ impl PgHandler {
         if !sc.where_true {
             return Ok(Vec::new());
         }
-        if let [(_, ConstCol::ListeningChannels, _, _)] = sc.columns.as_slice() {
-            return Ok(self
-                .backend
+        let channels = || -> Vec<Bson> {
+            self.backend
                 .listening
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .iter()
-                .map(|c| vec![Bson::String(c.clone())])
-                .collect());
+                .map(|c| Bson::String(c.clone()))
+                .collect()
+        };
+        if let [(_, ConstCol::ListeningChannels, _, _)] = sc.columns.as_slice() {
+            return Ok(channels().into_iter().map(|c| vec![c]).collect());
         }
-        Ok(vec![sc
-            .columns
-            .iter()
-            .map(|(_, c, _, _)| self.resolve_const_col(c))
-            .collect::<PgWireResult<Vec<_>>>()?])
+        // `FROM function(...)`: the function is the row source -- one row
+        // per result of a set-returning one, one row otherwise -- and is
+        // evaluated exactly once, before the select list.
+        let source_rows: Vec<Option<Bson>> = match sc.source.as_deref() {
+            None => vec![None],
+            Some(ConstCol::ListeningChannels) => channels().into_iter().map(Some).collect(),
+            Some(col) => vec![Some(self.resolve_const_col(col)?)],
+        };
+        source_rows
+            .into_iter()
+            .map(|source| {
+                sc.columns
+                    .iter()
+                    .map(|(_, c, _, _)| match c {
+                        ConstCol::FromColumn => Ok(source.clone().unwrap_or(Bson::Null)),
+                        other => self.resolve_const_col(other),
+                    })
+                    .collect::<PgWireResult<Vec<_>>>()
+            })
+            .collect()
     }
 
     /// Send the owed `NotificationResponse`s, before a `ReadyForQuery`.
@@ -6334,6 +6445,112 @@ impl PgHandler {
                 // above is not committed yet, so a plain read cannot see it.
                 self.note_uncommitted(&def.name, Some(def.clone()));
                 Ok(vec![Response::Execution(Tag::new("CREATE TABLE"))])
+            }
+
+            // `CREATE TABLE t AS query`: the table takes the query's output
+            // columns (renamed by an explicit column list), then the query's
+            // rows are written as an `INSERT ... SELECT` would write them.
+            // Measured on 16: the tag is `SELECT n` when rows are copied and
+            // `CREATE TABLE AS` for `WITH NO DATA` or an `IF NOT EXISTS`
+            // that found the table.
+            Statement::CreateTableAs {
+                table,
+                if_not_exists,
+                temp,
+                column_names,
+                query,
+                with_data,
+            } => {
+                if self.lookup(&table).is_some() {
+                    if if_not_exists {
+                        return Ok(vec![Response::Execution(Tag::new("CREATE TABLE AS"))]);
+                    }
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42P07".into(), // duplicate_table
+                        format!("relation \"{table}\" already exists"),
+                    ))));
+                }
+                let fields = self.copy_query_fields(&query)?;
+                if column_names.len() > fields.len() {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42601".into(), // syntax_error
+                        "too many column names were specified".into(),
+                    ))));
+                }
+                let mut seen: Vec<String> = Vec::new();
+                let columns = fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| {
+                        let name = column_names
+                            .get(i)
+                            .cloned()
+                            .unwrap_or_else(|| f.name().to_string());
+                        if seen.contains(&name) {
+                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".into(),
+                                "42701".into(), // duplicate_column
+                                format!("column \"{name}\" specified more than once"),
+                            ))));
+                        }
+                        seen.push(name.clone());
+                        let pg_type = internal_type_name(f.datatype()).ok_or_else(|| {
+                            PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".into(),
+                                "0A000".into(), // feature_not_supported
+                                format!(
+                                    "CREATE TABLE AS over a column of type {} is not supported yet",
+                                    f.datatype().name()
+                                ),
+                            )))
+                        })?;
+                        Ok(secantus_pgcatalog::Column::new(&name, &pg_type, false))
+                    })
+                    .collect::<PgWireResult<Vec<_>>>()?;
+                let mut def = TableDef::new(&table, columns);
+                def.temp = temp;
+                let targets: Vec<String> = def.columns.iter().map(|c| c.name.clone()).collect();
+                // The rows are read BEFORE the table exists so a query that
+                // fails leaves nothing behind, as PostgreSQL's single
+                // transaction would.
+                let rows = if with_data {
+                    self.query_rows(&query)?
+                        .into_iter()
+                        .map(|values| {
+                            let values = values
+                                .into_iter()
+                                .map(|v| v.unwrap_or(Bson::Null))
+                                .collect();
+                            secantus_pgplan::insert_row(&def, &targets, false, values)
+                                .map_err(|e| Self::err(&e))
+                        })
+                        .collect::<PgWireResult<Vec<_>>>()?
+                } else {
+                    Vec::new()
+                };
+                self.execute(Statement::CreateTable(def, false), max_rows)?;
+                if !with_data {
+                    return Ok(vec![Response::Execution(Tag::new("CREATE TABLE AS"))]);
+                }
+                let written = rows.len();
+                if written > 0 {
+                    self.execute(
+                        Statement::Insert(secantus_pgplan::Insert {
+                            table: table.clone(),
+                            rows,
+                            returning: None,
+                            source: None,
+                            targets,
+                            explicit_columns: false,
+                        }),
+                        max_rows,
+                    )?;
+                }
+                Ok(vec![Response::Execution(
+                    Tag::new("SELECT").with_rows(written),
+                )])
             }
 
             Statement::Insert(mut ins) => {
@@ -8203,10 +8420,9 @@ impl PgHandler {
     }
 
     /// Every table whose FOREIGN KEYs reference `parent`, with those keys.
-    fn referencing_keys(
-        &self,
-        parent: &str,
-    ) -> PgWireResult<Vec<(TableDef, secantus_pgcatalog::ForeignKey)>> {
+    /// Every user table this session can see: the committed catalog with
+    /// what this transaction created or dropped overlaid on it.
+    fn all_table_defs(&self) -> PgWireResult<Vec<TableDef>> {
         let raw = self
             .storage
             .find_matching(self.db(), CATALOG_COLLECTION, &Document::new())
@@ -8216,12 +8432,19 @@ impl PgHandler {
             .filter_map(|b| bson::from_slice::<Document>(b).ok())
             .filter_map(|d| TableDef::from_document(&d))
             .collect();
-        // What this transaction created or dropped overlays the catalog.
         {
             let pending = self.uncommitted.lock().unwrap_or_else(|e| e.into_inner());
             defs.retain(|d| !pending.contains_key(&d.name));
             defs.extend(pending.values().filter_map(|d| d.clone()));
         }
+        Ok(defs)
+    }
+
+    fn referencing_keys(
+        &self,
+        parent: &str,
+    ) -> PgWireResult<Vec<(TableDef, secantus_pgcatalog::ForeignKey)>> {
+        let defs = self.all_table_defs()?;
         Ok(defs
             .into_iter()
             .flat_map(|d| {

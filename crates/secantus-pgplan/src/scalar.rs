@@ -68,7 +68,26 @@ const SCALAR_NAMES: &[&str] = &[
     "set_byte",
     "encode",
     "decode",
+    "now",
+    "transaction_timestamp",
+    "statement_timestamp",
+    "clock_timestamp",
 ];
+
+/// The current instant as a stored `timestamptz` value.
+///
+/// PostgreSQL's `now()` is the TRANSACTION's start time and
+/// `statement_timestamp()` the statement's; this planner evaluates a
+/// constant when it plans the statement, so all four clocks read the
+/// statement's own time. A transaction that reads `now()` twice sees two
+/// values where PostgreSQL shows one.
+pub fn now_value() -> Bson {
+    let micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0);
+    crate::timestamptz_value_from_micros(micros)
+}
 
 fn text(v: &Bson) -> String {
     match v {
@@ -163,6 +182,10 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
     };
 
     match name {
+        "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp" => {
+            need(0)?;
+            Ok(now_value())
+        }
         "upper" => {
             need(1)?;
             Ok(Bson::String(s(0).to_uppercase()))
@@ -856,6 +879,9 @@ pub fn static_result_type(name: &str) -> &'static str {
         "sqrt" | "exp" | "ln" | "log" | "log10" | "power" | "pow" | "sign" => "float8",
         "starts_with" => "bool",
         "set_byte" | "decode" => "bytea",
+        "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp" => {
+            "timestamptz"
+        }
         _ => "text",
     }
 }

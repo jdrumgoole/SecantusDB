@@ -8119,3 +8119,87 @@ def test_pg_cancel_and_terminate_backend_signal_a_running_statement(home: Path) 
             assert other.execute(
                 "select count(*) from pg_stat_activity where pid = %s", (idle_pid,)
             ).fetchone() == (0,)
+
+
+def test_create_table_as_function_sources_and_expression_aggregates(home: Path) -> None:
+    """The planner shapes psycopg's own suite leans on, measured on PG 16.
+
+    `CREATE TABLE ... AS query` takes the query's columns (renamed by a column
+    list) and answers `SELECT n`, or `CREATE TABLE AS` for `WITH NO DATA` and
+    for an `IF NOT EXISTS` that found the table; a duplicate is 42P07. A
+    function in FROM is the row source (`select 'ok' from pg_sleep(0)` is one
+    row named `?column?`; `select * from pg_listening_channels()` is one row
+    per channel). An aggregate over an expression evaluates it per row.
+    `pg_tables` lists every table with PostgreSQL's eight columns. `now()` is
+    a `timestamptz`.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.execute("create table t1 as select 1 as f1")
+        assert cur.statusmessage == "SELECT 1"
+        cur = conn.execute("create temp table tt (a, b) as select 1, 'x'::text")
+        assert cur.statusmessage == "SELECT 1"
+        cur = conn.execute("select a, b from tt")
+        assert [(d.name, d.type_code) for d in cur.description] == [("a", 23), ("b", 25)]
+        assert cur.fetchall() == [(1, "x")]
+        cur = conn.execute("create table t2 as select f1, f1 * 2 as d from t1 with no data")
+        assert cur.statusmessage == "CREATE TABLE AS"
+        assert conn.execute("select count(*) from t2").fetchone() == (0,)
+        with pytest.raises(psycopg.errors.DuplicateTable) as info:
+            conn.execute("create table t1 as select 2")
+        assert info.value.diag.message_primary == 'relation "t1" already exists'
+        cur = conn.execute("create table if not exists t1 as select 2")
+        assert cur.statusmessage == "CREATE TABLE AS"
+        assert conn.execute("select f1 from t1").fetchall() == [(1,)]
+        cur = conn.execute("create table accessed as (select now() as value)")
+        assert cur.statusmessage == "SELECT 1"
+        cur = conn.execute("select value from accessed")
+        assert cur.description[0].type_code == 1184
+        assert cur.fetchone()[0].tzinfo is not None
+
+        # pg_tables: the psycopg pipeline tests probe it for a table's presence.
+        cur = conn.execute("select * from pg_tables where tablename in ('t1', 'tt') order by 2")
+        assert [d.name for d in cur.description] == [
+            "schemaname",
+            "tablename",
+            "tableowner",
+            "tablespace",
+            "hasindexes",
+            "hasrules",
+            "hastriggers",
+            "rowsecurity",
+        ]
+        assert cur.fetchall() == [
+            ("public", "t1", "test", None, False, False, False, False),
+            ("pg_temp_1", "tt", "test", None, False, False, False, False),
+        ]
+        cur = conn.execute("select count(*) from pg_tables where tablename = 'nope'")
+        assert cur.fetchone() == (0,)
+
+        # A function in FROM.
+        cur = conn.execute("select 'ok' from pg_sleep(0)")
+        assert [(d.name, d.type_code) for d in cur.description] == [("?column?", 25)]
+        assert cur.fetchall() == [("ok",)]
+        assert conn.execute("select * from pg_listening_channels()").fetchall() == []
+        conn.execute("listen a")
+        conn.execute("listen b")
+        cur = conn.execute("select * from pg_listening_channels()")
+        assert cur.description[0].name == "pg_listening_channels"
+        assert cur.fetchall() == [("a",), ("b",)]
+        assert conn.execute("select ch from pg_listening_channels() ch").fetchall() == [
+            ("a",),
+            ("b",),
+        ]
+        with pytest.raises(psycopg.errors.UndefinedColumn):
+            conn.execute("select nope from pg_sleep(0)")
+
+        # Aggregates over expressions.
+        conn.execute("create table copy_in (col1 int primary key, col2 int, data text)")
+        conn.execute("insert into copy_in values (1, 2, 'abc'), (2, 3, 'de')")
+        cur = conn.execute(
+            "select min(col1), max(col1), count(*), max(length(data)), sum(col1 * 2) from copy_in"
+        )
+        assert [d.type_code for d in cur.description] == [23, 23, 20, 23, 20]
+        assert cur.fetchall() == [(1, 2, 2, 3, 6)]
+        assert conn.execute(
+            "select col2 % 2, max(length(data)) from copy_in group by 1 order by 1"
+        ).fetchall() == [(0, 3), (1, 2)]
