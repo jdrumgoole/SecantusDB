@@ -3019,6 +3019,55 @@ def test_a_range_bound_as_a_parameter_is_the_same_range(home: Path, binary: bool
             assert cur.fetchone()[0] is True, sql
 
 
+@pytest.mark.parametrize("binary", [False, True], ids=["text", "binary"])
+def test_a_literal_beside_a_range_array_parameter_takes_its_type(home: Path, binary: bool) -> None:
+    """`'{"[1,5]"}' = %s` with a LIST of ranges bound: the literal is an
+    `int4range[]` and compares as ranges, not as strings.
+
+    psycopg sends `[Int4Range(...)]` as `_int4range` (oid 3905), and the
+    planner had no name for that oid -- so `$1` was typed from its decoded
+    value (`text[]`), the untyped literal beside it was never coerced, and the
+    comparison was refused as `text = text[]`. Every value here was measured
+    against PostgreSQL 16: `[1,5]` canonicalises to `[1,6)` on the way in, so
+    it equals a bound `[1,6)` and NOT a bound `[1,5)`, a crossed literal is
+    22000, and the parameter reports its array type.
+    """
+    from psycopg.types.multirange import Int4Multirange
+    from psycopg.types.range import Int4Range
+
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor(binary=binary)
+        cur.execute(
+            """select '{"[1,5]"}' = %s, pg_typeof(%s)::text""",
+            ([Int4Range(1, 5, "[]")], [Int4Range(1, 5, "[]")]),
+        )
+        assert cur.fetchone() == (True, "int4range[]")
+        cur.execute("""select '{"[1,5]"}' = %s""", ([Int4Range(1, 6, "[)")],))
+        assert cur.fetchone()[0] is True
+        cur.execute("""select '{"[1,5]"}' = %s""", ([Int4Range(1, 5, "[)")],))
+        assert cur.fetchone()[0] is False
+        # The psycopg gauge's own shape: an empty range and an unbounded one.
+        cur.execute(
+            """select '{empty,"(,)"}' = %s""",
+            ([Int4Range(empty=True), Int4Range(bounds="()")],),
+        )
+        assert cur.fetchone()[0] is True
+        # A multirange array too, through its own array oid.
+        mr = [Int4Multirange([Int4Range(1, 6), Int4Range(7, 8)])]
+        cur.execute(
+            """select '{"{[1,5],[7,8)}"}' = %s, pg_typeof(%s)::text""",
+            (mr, mr),
+        )
+        assert cur.fetchone() == (True, "int4multirange[]")
+        # The literal is parsed as the parameter's type, so a crossed pair is
+        # the range error, not a string mismatch.
+        with pytest.raises(psycopg.errors.DataException) as exc:
+            cur.execute("""select '{"[5,1]"}' = %s""", ([Int4Range(1, 5, "[]")],))
+        assert "range lower bound must be less than or equal to range upper bound" in str(
+            exc.value
+        )
+
+
 def test_pg_typeof_reports_the_type_the_client_declared(home: Path) -> None:
     """…which is not the one the decoded value suggests.
 

@@ -6390,14 +6390,25 @@ fn instant_micros(v: &Bson) -> Option<i64> {
 /// cast. That is enough to resolve an unknown parameter beside it, which is
 /// what PostgreSQL does at analysis time.
 fn static_range_type(n: Option<&pg_query::protobuf::Node>) -> Option<String> {
-    let named = |name: String| {
-        (range::is_range_type(&name) || range::is_multirange_type(&name)).then_some(name)
-    };
+    let named = |name: String| is_range_family(&name).then_some(name);
     match n.and_then(|x| x.node.as_ref()) {
         Some(N::FuncCall(f)) => named(func_name(f)?),
         Some(N::TypeCast(tc)) => named(type_name_of(tc.type_name.as_ref()?)),
+        // A parameter the client DECLARED as a range, a multirange, or an
+        // array of either (psycopg sends `[Int4Range(...)]` as `_int4range`).
+        // The declared type is what PostgreSQL resolves the literal beside it
+        // to; the decoded value alone says only "an array of strings".
+        Some(N::ParamRef(p)) => {
+            named(declared_param_type(usize::try_from(p.number).unwrap_or(0))?)
+        }
         _ => None,
     }
+}
+
+/// A range, a multirange, or an array of either.
+fn is_range_family(name: &str) -> bool {
+    let element = name.strip_suffix("[]").unwrap_or(name);
+    range::is_range_type(element) || range::is_multirange_type(element)
 }
 
 /// The JSON operators: `->`, `->>`, `#>`, `#>>` and `?`.
@@ -6518,7 +6529,11 @@ fn coerce_unknown_operand(
                 c.val.as_ref(),
                 Some(pg_query::protobuf::a_const::Val::Sval(_))
             ),
-            Some(N::ParamRef(_)) => true,
+            // A parameter the client typed is RESOLVED: it is the side the
+            // literal takes its type from, not a second unknown.
+            Some(N::ParamRef(p)) => {
+                declared_param_type(usize::try_from(p.number).unwrap_or(0)).is_none()
+            }
             _ => false,
         };
     let bare_string = unresolved;
@@ -6532,6 +6547,27 @@ fn coerce_unknown_operand(
     let Bson::String(text) = unknown else {
         return Ok((lhs, rhs));
     };
+    let typed_node = if r_bare {
+        e.lexpr.as_deref()
+    } else {
+        e.rexpr.as_deref()
+    };
+    // A range beside an unknown parameter: `int4range(10, 20, '[]') = $1`.
+    // Both sides are strings by now, so the type has to come from the
+    // expression -- and without it the parameter kept the client's spelling
+    // while the constructor had been canonicalised, so two spellings of one
+    // range compared UNEQUAL while printing identically. This goes FIRST: a
+    // range ARRAY parameter decodes to an array of strings, and the array
+    // arm below would type the literal beside it as `text[]`, comparing
+    // `[1,5]` unequal to the `[1,6)` the parameter canonicalised to.
+    if let Some(name) = static_range_type(typed_node) {
+        let coerced = cast_value(Bson::String(text.clone()), &name)?;
+        return Ok(if r_bare {
+            (lhs, coerced)
+        } else {
+            (coerced, rhs)
+        });
+    }
     let coerced = match typed {
         v if Interval::from_bson(v).is_some() => Some(parse_interval(text)?.to_bson()),
         // A timestamp, as the sub-millisecond composite or a BSON date.
@@ -6549,20 +6585,6 @@ fn coerce_unknown_operand(
         }
         _ => None,
     };
-    // A range beside an unknown parameter: `int4range(10, 20, '[]') = $1`.
-    // Both sides are strings by now, so the type has to come from the
-    // expression -- and without it the parameter kept the client's spelling
-    // while the constructor had been canonicalised, so two spellings of one
-    // range compared UNEQUAL while printing identically.
-    let coerced = coerced.or_else(|| {
-        let typed_node = if r_bare {
-            e.lexpr.as_deref()
-        } else {
-            e.rexpr.as_deref()
-        };
-        let name = static_range_type(typed_node)?;
-        cast_value(Bson::String(text.clone()), &name).ok()
-    });
     let Some(coerced) = coerced else {
         return Ok((lhs, rhs));
     };

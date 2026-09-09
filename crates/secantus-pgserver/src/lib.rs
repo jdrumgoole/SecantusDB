@@ -1965,6 +1965,19 @@ fn internal_type_name(ty: &Type) -> Option<String> {
                 return secantus_pgplan::range::range_oid_name(oid)
                     .or_else(|| secantus_pgplan::range::multirange_oid_name(oid))
                     .map(str::to_string)
+                    // An ARRAY of ranges / multiranges (`_int4range`, oid
+                    // 3905, and friends). Without a declared name the planner
+                    // typed the parameter from its decoded value -- `text[]`
+                    // -- so an untyped literal beside it was never coerced
+                    // and `'{empty,"(,)"}' = $1` was "text = text[]".
+                    .or_else(|| {
+                        element_of_array_oid(oid)
+                            .filter(|e| {
+                                secantus_pgplan::range::is_range_type(e)
+                                    || secantus_pgplan::range::is_multirange_type(e)
+                            })
+                            .map(|e| format!("{e}[]"))
+                    });
             }
         }
         .to_string(),
