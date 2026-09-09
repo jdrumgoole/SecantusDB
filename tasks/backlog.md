@@ -986,6 +986,33 @@ These work end-to-end but cut corners.
 
 Specific items that were left out of the slice that introduced their feature area.
 
+- [ ] **OPEN — Rust PostgreSQL server: storage concurrency for PG-grade scaling
+      (queued by Joe 2026-09-08, to start now that the psycopg gauge is clean).**
+      The psycopg gauge against `secantusd-pg` reached **4114 passed / 0 failed /
+      0 errors** on 2026-09-09 (`main` `446f59a9`; 3 macOS-only harness deselects
+      documented in `psycopg_validation/include_paths.py`). The next headline item
+      for the Rust PG server is throughput under real connection concurrency,
+      measured against native PostgreSQL 16 — the reference is PG's behaviour AND
+      performance, not parity with the Python server.
+      **What is there now** (`crates/secantus-storage/src/lib.rs`): a global
+      `lock: Mutex<()>` taken on the write paths (22 sites), per-collection
+      `coll_locks` so writes to different namespaces already run in parallel,
+      lock-free multi-row reads guarded by `ddl_generation`, optional
+      `write_tickets` admission, and one WT session per thread. The PG server
+      runs each statement under `tokio::task::block_in_place` with a
+      per-connection `txn` guard, so the runtime is not the bottleneck; whatever
+      serialises is inside `Storage`.
+      **The work — measure before building.** (1) A stress harness: N psycopg
+      connections doing conflicting and non-conflicting INSERT/UPDATE/SELECT
+      against `secantusd-pg` and against PG 16 on the same box, reporting
+      throughput vs N. (2) From the profile, lift what serialises: real WT
+      transactions per statement / per `BEGIN` block on the connection's own
+      session, snapshot-isolated readers, writers contending only on actual key
+      conflicts with a bounded `WT_ROLLBACK` retry. (3) Keep the two things the
+      serial model protects: the oplog's strictly-monotonic `seq` / event order
+      (a small dedicated critical section) and the durable-close / checkpoint
+      path (no data-loss regression — this is a database). Sizable, own branch;
+      not a cluster PR.
 - [x] **find/aggregate firstBatch is byte-capped — FIXED 2026-08-22 (both servers).**
   `getMore` had mongod's 16MB reply budget; a FIRST batch was capped on document
   count alone, so `find` with `batchSize: 25` over 1MB documents assembled a 25MB
