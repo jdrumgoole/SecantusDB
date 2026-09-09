@@ -3141,6 +3141,60 @@ TODATE_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
 ]
 
 
+# --- projection results ----------------------------------------------------
+#
+# `apply_projection` had no probe at all until 2026-09-09. Wider sweep in
+# `tools/probes/projection_results.py`; these are the three shapes it found.
+
+#: Key order `_id, b, a` -- deliberately not alphabetical, so a spec-ordered or
+#: sorted result is distinguishable from the document's own order.
+PROJ_DOCS: list[dict] = [{"_id": 1, "b": 9, "a": [1, 2, 3], "c": 7}]
+PROJ_ARRAYS: list[dict] = [
+    {"_id": 1, "a": [1, 2, 3]},
+    {"_id": 2, "a": [[1, 2], [3, 4]]},
+    {"_id": 3, "a": [{"x": 1}, {"x": 2}]},
+    {"_id": 4, "a": [[1, 2], [3]]},
+]
+PROJ_NESTED: list[dict] = [{"_id": 1, "a": {"x": 1, "y": 2}, "ab": {"x": 3}, "b": 4}]
+
+
+def _proj(projection: dict) -> Callable[[Database], object]:
+    def run(db: Database) -> object:
+        from pymongo.errors import OperationFailure
+
+        try:
+            # `list(doc)` -- the KEY SEQUENCE, which an equality compare drops.
+            return [(list(d), d) for d in db.c.find({}, projection).sort("_id", 1)]
+        except OperationFailure as exc:
+            return ("ERR", exc.code, exc.details.get("errmsg"))
+
+    return run
+
+
+PROJECTION_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    # Field ORDER: the document's own, not the spec's, with computed appended.
+    ("order-include", PROJ_DOCS, _proj({"a": 1, "b": 1})),
+    ("order-spec-reversed", PROJ_DOCS, _proj({"b": 1, "a": 1})),
+    ("order-slice", PROJ_DOCS, _proj({"a": {"$slice": 2}, "b": 1})),
+    ("order-elemmatch", PROJ_DOCS, _proj({"a": {"$elemMatch": {"$gt": 1}}, "b": 1})),
+    ("order-computed", PROJ_DOCS, _proj({"z": {"$literal": 1}, "b": 1})),
+    # `$elemMatch` as an element-VALUE predicate, with no array traversal.
+    ("elemmatch-value", PROJ_ARRAYS, _proj({"a": {"$elemMatch": {"$gt": 2}}})),
+    ("elemmatch-size", PROJ_ARRAYS, _proj({"a": {"$elemMatch": {"$size": 2}}})),
+    ("elemmatch-eq-array", PROJ_ARRAYS, _proj({"a": {"$elemMatch": {"$eq": [3, 4]}}})),
+    ("elemmatch-all", PROJ_ARRAYS, _proj({"a": {"$elemMatch": {"$all": [3]}}})),
+    ("elemmatch-field", PROJ_ARRAYS, _proj({"a": {"$elemMatch": {"x": {"$gt": 1}}}})),
+    # Path collision, both codes, and the shapes that are NOT collisions.
+    ("collide-parent-child", PROJ_NESTED, _proj({"a": 1, "a.x": 1})),
+    ("collide-child-parent", PROJ_NESTED, _proj({"a.x": 1, "a": 1})),
+    ("collide-deep", PROJ_NESTED, _proj({"a.x": 1, "a.x.y": 1})),
+    ("collide-exclusion", PROJ_NESTED, _proj({"a": 0, "a.x": 0})),
+    ("collide-mixed", PROJ_NESTED, _proj({"a": 0, "a.x": 1})),
+    ("nocollide-siblings", PROJ_NESTED, _proj({"a.x": 1, "a.y": 1})),
+    ("nocollide-string-prefix", PROJ_NESTED, _proj({"a": 1, "ab.x": 1})),
+]
+
+
 ALL_CASES = (
     [("query", c) for c in QUERY_CASES]
     + [("readpath", c) for c in READPATH_CASES]
@@ -3174,6 +3228,7 @@ ALL_CASES = (
     + [("rename", c) for c in RENAME_CASES]
     + [("nanexpr", c) for c in NAN_EXPR_CASES]
     + [("todate", c) for c in TODATE_CASES]
+    + [("projection", c) for c in PROJECTION_CASES]
 )
 
 

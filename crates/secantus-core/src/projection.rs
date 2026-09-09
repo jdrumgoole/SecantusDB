@@ -265,7 +265,54 @@ fn positional_predicate(
 /// error cases (>1 positional / exclusion / array field not in the query) — the
 /// find handler surfaces it as `BadValue`, and the pure-Python oracle raises the
 /// exact Location code (31276 / 31395 / 51246).
+/// mongod's refusal when one projected path is an ancestor of another.
+///
+/// `{a: 1, "a.x": 1}` is not a narrowing of `a`; mongod rejects the pair, and
+/// WHICH code depends on the order (measured 8.2.11, 2026-09-09):
+///
+/// ```text
+///     {a: 1, "a.x": 1}       31249  Path collision at a.x remaining portion x
+///     {"a.x": 1, a: 1}       31250  Path collision at a
+///     {"a.x": 1, "a.x.y": 1} 31249  Path collision at a.x.y remaining portion x.y
+///     {a: 0, "a.x": 0}       31249  (exclusion collides too)
+/// ```
+///
+/// Siblings, a shared string prefix that is not a path component, and the same
+/// path twice are NOT collisions. Mirrors `projection._path_collision_error`.
+fn path_collision(spec: &Document) -> Option<Fallback> {
+    let mut seen: Vec<&str> = Vec::new();
+    for (key, value) in spec {
+        if key.ends_with(".$") || meta_spec(value).is_some() {
+            continue;
+        }
+        let parts: Vec<&str> = key.split('.').collect();
+        for earlier in &seen {
+            let e_parts: Vec<&str> = earlier.split('.').collect();
+            if e_parts == parts {
+                continue;
+            }
+            if parts.len() > e_parts.len() && parts[..e_parts.len()] == e_parts[..] {
+                return Some(Fallback::mongo(
+                    31249,
+                    format!(
+                        "Path collision at {key} remaining portion {}",
+                        parts[1..].join(".")
+                    ),
+                ));
+            }
+            if e_parts.len() > parts.len() && e_parts[..parts.len()] == parts[..] {
+                return Some(Fallback::mongo(31250, format!("Path collision at {key}")));
+            }
+        }
+        seen.push(key);
+    }
+    None
+}
+
 pub fn validate_projection(spec: &Document, query: Option<&Document>) -> R<()> {
+    if let Some(err) = path_collision(spec) {
+        return Err(err);
+    }
     let positional: Vec<&String> = spec.keys().filter(|k| k.ends_with(".$")).collect();
     if positional.is_empty() {
         return Ok(());
@@ -394,21 +441,44 @@ fn apply_positional(
 
 /// First array element under `path` matching `sub_filter` (`$elemMatch`
 /// projection). `Ok(None)` for no match / non-array.
+/// The first array element satisfying a `$elemMatch` projection criterion.
+///
+/// The criterion's SHAPE decides how each element is tested, decided once for
+/// the whole array rather than per element: a criterion of only `$`-operators
+/// (`{$gt: 2}`) is an ELEMENT-VALUE predicate, and anything else is a per-FIELD
+/// predicate applied to the element as a document. Mirrors
+/// `projection._first_match`, and the same rule `update._pull_matches` carries.
+///
+/// The value predicate tests each element as a SINGLE VALUE with no implicit
+/// one-level array traversal, which is why it builds a NON-EXPANDABLE `Cand`
+/// rather than going through `matches` with a wrapper document. Measured
+/// 8.2.11 (2026-09-09) -- `$size` and `$eq` still see the element as the array
+/// it is, so it is the traversal being suppressed, not the type:
+///
+/// ```text
+///     [[1, 2], [3, 4]]  {$gt: 2}      -> omitted
+///     [1, [3, 4], 5]    {$gt: 2}      -> [5]
+///     [[1, 2], [3]]     {$size: 2}    -> [[1, 2]]
+///     [[1, 2], [3, 4]]  {$eq: [3, 4]} -> [[3, 4]]
+///     [1, 2, 3]         {$gt: 2}      -> [3]
+/// ```
+///
+/// Branching on whether the ELEMENT was a document sent a bare operator
+/// criterion over an array of documents into `matches(ed, {"$gt": 2})`, which
+/// raised `2 unknown top level operator: $gt` -- a valid projection refused.
 fn first_match(doc: &Document, path: &str, sub_filter: &Document) -> R<Option<Bson>> {
     let Some(Bson::Array(arr)) = paths::get_path(doc, path) else {
         return Ok(None);
     };
     let empty = Document::new();
+    let value_predicate = !sub_filter.is_empty() && sub_filter.keys().all(|k| k.starts_with('$'));
+    let cond = Bson::Document(sub_filter.clone());
     for elem in arr {
         let hit = match elem {
-            Bson::Document(ed) => query::matches(ed, sub_filter, &empty, None)?,
-            scalar => {
-                // matches({"_": elem}, {"_": sub_filter})
-                let mut wrapper = Document::new();
-                wrapper.insert("_".to_string(), scalar.clone());
-                let mut q = Document::new();
-                q.insert("_".to_string(), Bson::Document(sub_filter.clone()));
-                query::matches(&wrapper, &q, &empty, None)?
+            Bson::Document(ed) if !value_predicate => query::matches(ed, sub_filter, &empty, None)?,
+            other => {
+                let cands = [query::Cand::new(Some(other), false)];
+                query::field_matches(&cands, &cond, None, "_")?
             }
         };
         if hit {
@@ -785,7 +855,7 @@ pub fn apply_projection(doc: &Document, spec: &Document, query: Option<&Document
                 set(&mut result, path, sliced)?;
             }
         }
-        return Ok(result);
+        return Ok(in_document_order(result, doc));
     }
 
     // Exclusion mode: trie-walk so dotted unsets map over array
@@ -885,6 +955,42 @@ fn exclude_value(val: &mut Bson, subtree: &SpecTree) {
         }
         _ => {}
     }
+}
+
+/// Reorder a projected document's top-level keys the way mongod emits them.
+///
+/// `_id` first, then the SOURCE DOCUMENT's order -- not the projection spec's
+/// -- with any key the document does not have (a computed field) appended
+/// after, in spec order. Measured 8.2.11 (2026-09-09) against a document whose
+/// own key order is `_id, b, a, c`: `{a: 1, b: 1}`, `{b: 1, a: 1}`,
+/// `{a: {$slice: 2}, b: 1}` and `{a: {$elemMatch: ...}, b: 1}` all emit
+/// `_id, b, a`, while `{z: {$literal: 1}, b: 1}` emits `_id, b, z`.
+///
+/// `$slice` and `$elemMatch` were applied after the plain inclusions and so
+/// landed at the end. Key order is what a driver renders, and comparing
+/// documents for equality ignores it, so nothing else in the suite could see
+/// this. Mirrors `projection._in_document_order`.
+fn in_document_order(result: Document, doc: &Document) -> Document {
+    let order: std::collections::HashMap<&str, usize> = doc
+        .keys()
+        .enumerate()
+        .map(|(i, k)| (k.as_str(), i))
+        .collect();
+    let mut ordered = Document::new();
+    let mut rest: Vec<(String, Bson)> = Vec::new();
+    for (k, v) in result {
+        if k == "_id" {
+            ordered.insert(k, v);
+        } else {
+            rest.push((k, v));
+        }
+    }
+    // Stable: keys absent from the document keep their spec order at the end.
+    rest.sort_by_key(|(k, _)| *order.get(k.as_str()).unwrap_or(&usize::MAX));
+    for (k, v) in rest {
+        ordered.insert(k, v);
+    }
+    ordered
 }
 
 fn apply_slices(result: &mut Document, slice_specs: &[(&str, &Bson)]) -> R<()> {

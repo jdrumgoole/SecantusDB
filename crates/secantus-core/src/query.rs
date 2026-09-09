@@ -436,7 +436,19 @@ fn regex_options_ok(arg: &Bson) -> Result<(), Fallback> {
     Ok(())
 }
 
-fn field_matches(values: &[Cand], cond: &Bson, coll: Option<&Collation>, field: &str) -> R {
+/// Evaluate one field's condition against already-resolved candidates.
+///
+/// `pub(crate)` so the PROJECTION layer can reuse it for `$elemMatch`'s
+/// element-value predicate, where the element must be tested with the implicit
+/// one-level array traversal SUPPRESSED -- a `Cand` built with
+/// `expandable: false`. Going through `matches` with a wrapper document cannot
+/// express that.
+pub(crate) fn field_matches(
+    values: &[Cand],
+    cond: &Bson,
+    coll: Option<&Collation>,
+    field: &str,
+) -> R {
     field_matches_descend(values, cond, coll, field, true)
 }
 
