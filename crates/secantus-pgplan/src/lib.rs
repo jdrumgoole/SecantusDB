@@ -2840,9 +2840,12 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
                     let side = |n: Option<&pg_query::protobuf::Node>| {
                         n.map(|node| static_type(node, &Bson::Null))
                     };
-                    if side(e.lexpr.as_deref()).as_deref() == Some("bytea")
-                        || side(e.rexpr.as_deref()).as_deref() == Some("bytea")
-                    {
+                    let (l, r) = (side(e.lexpr.as_deref()), side(e.rexpr.as_deref()));
+                    // An array beside anything is `array_cat` / `array_append`
+                    // / `array_prepend`, typed as the array.
+                    if let Some(t) = l.iter().chain(r.iter()).find(|t| t.ends_with("[]")) {
+                        t.clone()
+                    } else if l.as_deref() == Some("bytea") || r.as_deref() == Some("bytea") {
                         "bytea".to_string()
                     } else {
                         "text".to_string()
@@ -6028,85 +6031,218 @@ fn array_rectangular(items: &[Bson]) -> bool {
 }
 
 fn parse_array(text: &str, element_type: &str) -> Result<Bson> {
-    let t = text.trim();
-    if !t.starts_with('{') || !t.ends_with('}') {
-        return Err(Error::InvalidText(format!(
-            "malformed array literal: \"{t}\""
-        )));
-    }
-    let body = &t[1..t.len() - 1];
-    if body.trim().is_empty() {
-        return Ok(Bson::Array(Vec::new()));
-    }
-
-    let mut items: Vec<Bson> = Vec::new();
-    let mut cur = String::new();
-    let mut quoted = false;
-    let mut escaped = false;
-    let mut depth = 0usize;
-    let mut was_quoted = false;
-    for c in body.chars() {
-        if escaped {
-            cur.push(c);
-            escaped = false;
-            continue;
+    let malformed = || Error::InvalidText(format!("malformed array literal: \"{text}\""));
+    let mut p = ArrayParser {
+        chars: text.chars().collect(),
+        pos: 0,
+        element_type,
+    };
+    p.skip_space();
+    // An optional dimension decoration, `[lo:hi]...=`, which PostgreSQL checks
+    // against the contents and otherwise discards -- the parsed value carries
+    // no lower bounds. A wrong bound count is the same 22P02 as any other
+    // malformed literal.
+    let mut declared: Vec<usize> = Vec::new();
+    while p.peek() == Some('[') {
+        p.pos += 1;
+        let lo = p.take_int().ok_or_else(malformed)?;
+        let hi = if p.peek() == Some(':') {
+            p.pos += 1;
+            p.take_int().ok_or_else(malformed)?
+        } else {
+            lo
+        };
+        if p.peek() != Some(']') || hi < lo {
+            return Err(malformed());
         }
-        match c {
-            '\\' if quoted => escaped = true,
-            '"' => {
-                quoted = !quoted;
-                was_quoted = true;
-            }
-            '{' if !quoted => {
-                depth += 1;
-                cur.push(c);
-            }
-            '}' if !quoted => {
-                depth -= 1;
-                cur.push(c);
-            }
-            ',' if !quoted && depth == 0 => {
-                items.push(array_element(&cur, was_quoted, element_type)?);
-                cur.clear();
-                was_quoted = false;
-            }
-            _ => cur.push(c),
+        p.pos += 1;
+        declared.push(usize::try_from(hi - lo + 1).map_err(|_| malformed())?);
+    }
+    if !declared.is_empty() {
+        p.skip_space();
+        if p.peek() != Some('=') {
+            return Err(malformed());
         }
+        p.pos += 1;
+        p.skip_space();
     }
-    if quoted || depth != 0 {
-        return Err(Error::InvalidText(format!(
-            "malformed array literal: \"{t}\""
-        )));
+    if p.peek() != Some('{') {
+        return Err(malformed());
     }
-    items.push(array_element(&cur, was_quoted, element_type)?);
+    let items = p.parse_braced().map_err(|_| malformed())?;
+    p.skip_space();
+    if p.pos != p.chars.len() {
+        return Err(malformed());
+    }
     if !array_rectangular(&items) {
-        return Err(Error::InvalidText(format!(
-            "malformed array literal: \"{t}\""
-        )));
+        return Err(malformed());
+    }
+    if !declared.is_empty() && array_dims(&items) != declared {
+        return Err(malformed());
     }
     Ok(Bson::Array(items))
 }
 
-fn array_element(raw: &str, was_quoted: bool, element_type: &str) -> Result<Bson> {
-    // ASCII whitespace only. Rust's `trim` also strips U+0085 and U+00A0,
-    // which PostgreSQL keeps -- so a text array carrying either of them (any
-    // corpus that walks the byte range does) round-tripped them to the EMPTY
-    // STRING. Silent data loss, and invisible in any test whose alphabet is
-    // ASCII.
-    let trimmed = raw.trim_matches(|c: char| c.is_ascii_whitespace());
-    // An UNQUOTED `NULL` is the null element; a quoted one is the string.
-    if !was_quoted && trimmed.eq_ignore_ascii_case("null") {
-        return Ok(Bson::Null);
+/// The lengths of a (rectangular) array along each dimension, outermost first.
+/// `{}` is zero dimensions, as in PostgreSQL.
+fn array_dims(items: &[Bson]) -> Vec<usize> {
+    if items.is_empty() {
+        return Vec::new();
     }
-    // Only an UNQUOTED `{` opens a nested array. A quoted one is the string
-    // `{`, and treating it as a sub-array made `'{"{"}'::text[]` -- an ordinary
-    // element in any corpus that walks the ASCII range -- answer "malformed
-    // array literal" for the element rather than returning it.
-    if !was_quoted && trimmed.starts_with('{') {
-        return parse_array(trimmed, element_type);
+    let mut dims = vec![items.len()];
+    if let Some(Bson::Array(inner)) = items.first() {
+        dims.extend(array_dims(inner));
     }
-    let text = if was_quoted { raw } else { trimmed };
-    cast_value(Bson::String(text.to_string()), element_type)
+    dims
+}
+
+/// PostgreSQL's `array_isspace`: the six ASCII whitespace characters and
+/// nothing else. Rust's `char::is_whitespace` also strips U+0085 and U+00A0,
+/// which PostgreSQL keeps -- a text array carrying either round-tripped to the
+/// EMPTY ARRAY -- and `is_ascii_whitespace` omits the vertical tab.
+fn array_isspace(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{0b}' | '\u{0c}')
+}
+
+/// A cursor over one array literal. Mirrors PostgreSQL's `array_in` scanner:
+/// an unquoted element runs to the next `,` or `}` with surrounding whitespace
+/// dropped; a quoted one keeps everything between the quotes; a backslash
+/// escapes the next character in both; an unquoted `NULL` is the null element.
+struct ArrayParser<'a> {
+    chars: Vec<char>,
+    pos: usize,
+    element_type: &'a str,
+}
+
+impl ArrayParser<'_> {
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.pos).copied()
+    }
+
+    fn skip_space(&mut self) {
+        while self.peek().is_some_and(array_isspace) {
+            self.pos += 1;
+        }
+    }
+
+    fn take_int(&mut self) -> Option<i64> {
+        let start = self.pos;
+        if matches!(self.peek(), Some('-' | '+')) {
+            self.pos += 1;
+        }
+        while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+            self.pos += 1;
+        }
+        self.chars[start..self.pos]
+            .iter()
+            .collect::<String>()
+            .parse()
+            .ok()
+    }
+
+    /// Parse `{ ... }` with the cursor on the opening brace, leaving it just
+    /// past the closing one.
+    fn parse_braced(&mut self) -> Result<Vec<Bson>> {
+        let unexpected = || Error::InvalidText("unexpected".into());
+        self.pos += 1; // the `{`
+        let mut items = Vec::new();
+        self.skip_space();
+        // `{}` is the empty array; `{{}}` is not a literal at all.
+        if self.peek() == Some('}') {
+            self.pos += 1;
+            return Ok(items);
+        }
+        loop {
+            self.skip_space();
+            match self.peek() {
+                Some('{') => {
+                    let sub = self.parse_braced()?;
+                    if sub.is_empty() {
+                        return Err(unexpected());
+                    }
+                    items.push(Bson::Array(sub));
+                }
+                Some(',' | '}') | None => return Err(unexpected()),
+                Some(_) => items.push(self.parse_element()?),
+            }
+            self.skip_space();
+            match self.peek() {
+                Some(',') => self.pos += 1,
+                Some('}') => {
+                    self.pos += 1;
+                    return Ok(items);
+                }
+                _ => return Err(unexpected()),
+            }
+        }
+    }
+
+    /// One scalar element, quoted or not, with the cursor on its first
+    /// character.
+    fn parse_element(&mut self) -> Result<Bson> {
+        let unexpected = || Error::InvalidText("unexpected".into());
+        let mut raw = String::new();
+        let mut was_quoted = false;
+        // Whitespace inside an unquoted element is kept when more content
+        // follows (`{a b}` is `a b`); trailing whitespace is dropped.
+        let mut pending_space = String::new();
+        loop {
+            match self.peek() {
+                None => return Err(unexpected()),
+                Some('"') => {
+                    // A quote may not follow element text, nor text a quote.
+                    if was_quoted || !raw.is_empty() {
+                        return Err(unexpected());
+                    }
+                    was_quoted = true;
+                    self.pos += 1;
+                    loop {
+                        match self.peek() {
+                            None => return Err(unexpected()),
+                            Some('"') => {
+                                self.pos += 1;
+                                break;
+                            }
+                            Some('\\') => {
+                                self.pos += 1;
+                                raw.push(self.peek().ok_or_else(unexpected)?);
+                                self.pos += 1;
+                            }
+                            Some(c) => {
+                                raw.push(c);
+                                self.pos += 1;
+                            }
+                        }
+                    }
+                }
+                Some(',' | '}') => break,
+                Some('{') => return Err(unexpected()),
+                Some(c) if array_isspace(c) => {
+                    pending_space.push(c);
+                    self.pos += 1;
+                }
+                Some(c) => {
+                    if was_quoted {
+                        return Err(unexpected());
+                    }
+                    raw.push_str(&pending_space);
+                    pending_space.clear();
+                    if c == '\\' {
+                        self.pos += 1;
+                        raw.push(self.peek().ok_or_else(unexpected)?);
+                    } else {
+                        raw.push(c);
+                    }
+                    self.pos += 1;
+                }
+            }
+        }
+        // An UNQUOTED `NULL` is the null element; a quoted one is the string.
+        if !was_quoted && raw.eq_ignore_ascii_case("null") {
+            return Ok(Bson::Null);
+        }
+        cast_value(Bson::String(raw), self.element_type)
+    }
 }
 
 /// A `numeric` rounded to a whole number, as PostgreSQL rounds it.
@@ -6843,7 +6979,10 @@ fn coerce_unknown_operand(
     rhs: Bson,
     op: &str,
 ) -> Result<(Bson, Bson)> {
-    if !matches!(op, "+" | "-" | "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
+    if !matches!(
+        op,
+        "+" | "-" | "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" | "||"
+    ) {
         return Ok((lhs, rhs));
     }
     // A bare string literal, or a PARAMETER whose type the client left
@@ -7033,7 +7172,64 @@ pub(crate) fn decimal_arith(op: &str, a: &str, b: &str) -> Option<Result<Bson>> 
     })
 }
 
+/// PostgreSQL's `||` on arrays. Arrays of the same dimensionality append;
+/// an N-dimensional array takes an (N-1)-dimensional one as a new last (or
+/// first) slice, which is how `element || array` and `array || element` are
+/// the same rule with N = 1; a NULL or empty side yields the other.
+fn array_concat(lhs: Bson, rhs: Bson) -> Result<Bson> {
+    fn ndim(v: &Bson) -> usize {
+        match v {
+            Bson::Array(items) => 1 + items.first().map_or(0, ndim),
+            _ => 0,
+        }
+    }
+    let mismatch = || {
+        Error::InvalidText(
+            "cannot concatenate incompatible arrays: Arrays with differing dimensions are not compatible for concatenation".to_string(),
+        )
+    };
+    match (lhs, rhs) {
+        (Bson::Null, other) | (other, Bson::Null) => Ok(other),
+        (Bson::Array(a), Bson::Array(b)) if a.is_empty() => Ok(Bson::Array(b)),
+        (Bson::Array(a), Bson::Array(b)) if b.is_empty() => Ok(Bson::Array(a)),
+        (lhs, rhs) => {
+            let (nl, nr) = (ndim(&lhs), ndim(&rhs));
+            let out = if nl == nr {
+                let (Bson::Array(mut a), Bson::Array(b)) = (lhs, rhs) else {
+                    return Err(mismatch());
+                };
+                a.extend(b);
+                a
+            } else if nl == nr + 1 {
+                let Bson::Array(mut a) = lhs else {
+                    return Err(mismatch());
+                };
+                a.push(rhs);
+                a
+            } else if nr == nl + 1 {
+                let Bson::Array(b) = rhs else {
+                    return Err(mismatch());
+                };
+                let mut a = vec![lhs];
+                a.extend(b);
+                a
+            } else {
+                return Err(mismatch());
+            };
+            if !array_rectangular(&out) {
+                return Err(mismatch());
+            }
+            Ok(Bson::Array(out))
+        }
+    }
+}
+
 fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
+    // Array concatenation is `array_cat`, which is NOT strict: a NULL beside
+    // an array is the array. So it goes before the NULL propagation below.
+    if op == "||" && (matches!(lhs, Bson::Array(_)) || matches!(rhs, Bson::Array(_))) {
+        return array_concat(lhs, rhs);
+    }
     // NULL propagates through every operator here (PG: `1 + NULL` is NULL).
     if lhs == Bson::Null || rhs == Bson::Null {
         return Ok(Bson::Null);

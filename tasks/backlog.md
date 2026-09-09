@@ -5458,11 +5458,18 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `CompositeInfo.fetch`'s inner subquery (`AND NOT a.attisdropped`). lower_where
   handles comparisons and BoolExpr(AND/OR/NOT of comparisons) but not a bare
   ColumnRef or `NOT <ColumnRef>` as a truth test.
-- **Rust PG server: a multidimensional array sent as a BINARY parameter is
-  refused (`0A000`)**, matching the refusal when returning one. Both lift
-  together when array wire encoding grows a second dimension. The array LITERAL
-  parser handles nesting (`'{{1,2},{3,4}}'` parses); it is the wire encoding
-  and `rust-postgres`'s single-dimension `ToSql` that stop at one dimension.
+- [ ] **OPEN — Rust PG server: an array's dimension decoration is dropped
+  on the way back out.** `select '[0:1]={a,b}'::text[]::text` is
+  `[0:1]={a,b}` on PostgreSQL 16 and `{a,b}` here: the literal parser
+  validates the `[lo:hi]` prefix and discards it, because a `Bson::Array`
+  has nowhere to carry lower bounds. The binary form drops them the same
+  way (every dimension is sent with lower bound 1). psycopg's loaders ignore
+  bounds, so no gauge test sees this.
+- [ ] **OPEN — Rust PG server: a composite RESULT column in BINARY format
+  with a range / date / array field fails with `cannot send this value as a
+  binary <comp>`.** `element_binary` has no range / date / array arms, so
+  `conn.cursor(binary=True).execute("select row(int4range(1,2))")` is refused
+  where PostgreSQL sends the record.
 - **Rust PG server: an array of MIXED non-numeric types keeps the
   value-derived type where PostgreSQL coerces and often errors.** `array[1,
   'a']` is `22P02` on PostgreSQL (the unknown literal is coerced to `integer`
@@ -5480,14 +5487,11 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 - **Rust PG server: `1.5::bool` reports `22P02` where PostgreSQL reports
   `42846`** (`cannot cast type numeric to boolean`). A cast that is not defined
   at all is a different error class from a value that will not parse.
-- **Rust PG server: multidimensional arrays are refused (`0A000`), not
-  answered.** `{{1,2},{3,4}}` plans and compares correctly; only returning one
-  to a client is unsupported, because rust-postgres encodes a single dimension
-  and the flattening it produced was a wrong answer rather than a missing
-  feature. Needs hand-built PostgreSQL array wire encoding (text and binary).
-- **Rust PG server: psycopg's `test_array.py` is 34/124.** 1-D round-trips,
-  comparison and oids are done; the rest of that corpus (multidimensional,
-  binary format, the full type matrix, `ARRAY` subscripting) is not.
+- **Rust PG server: psycopg's `test_array.py` is 148/158 (2026-09-09).**
+  Multidimensional arrays round-trip in text and binary both ways; what is
+  left is `INSERT ... RETURNING`, the `box` type (its `;` array separator),
+  a table's row type as a composite (`test_array_register`), and
+  `test_array_of_unknown_builtin` (`aclitem`).
 
 - [x] **Five probes never compared the Rust server — instrumented 2026-09-02.**
   `tools/probes/_servers.py` is now the shared `probe_targets()` helper, and

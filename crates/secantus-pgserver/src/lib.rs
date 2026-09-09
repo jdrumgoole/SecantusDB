@@ -6060,26 +6060,27 @@ fn binary_array(
     if ndim == 0 {
         return Ok(Bson::Array(Vec::new()));
     }
-    // Only one dimension: a nested array cannot be returned to a client here
-    // either, so accepting one as a parameter would only move the wrong answer.
-    if ndim != 1 {
-        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-            "ERROR".into(),
-            "0A000".into(),
-            "multidimensional arrays are not supported yet".into(),
-        ))));
+    let ndim = usize::try_from(ndim).map_err(|_| unsupported_binary_oid(None))?;
+    if bytes.len() < 12 + 8 * ndim {
+        return Err(unsupported_binary_oid(None));
     }
-    let count = be32(12);
-    let mut pos = 20; // 12 header + 8 for one dimension's length and lower bound
-    let mut items = Vec::with_capacity(count.max(0) as usize);
-    for _ in 0..count.max(0) {
+    // Each dimension's length; the lower bound beside it is dropped (the
+    // parsed value carries none, as with the text form).
+    let dims: Vec<usize> = (0..ndim)
+        .map(|d| usize::try_from(be32(12 + 8 * d).max(0)).unwrap_or(0))
+        .collect();
+    let count: usize = dims.iter().product();
+    let mut pos = 12 + 8 * ndim;
+    let mut flat = Vec::with_capacity(count);
+    let ty = Type::from_oid(elem_oid);
+    for _ in 0..count {
         if pos + 4 > bytes.len() {
             return Err(unsupported_binary_oid(None));
         }
         let len = be32(pos);
         pos += 4;
         if len < 0 {
-            items.push(Bson::Null);
+            flat.push(Bson::Null);
             continue;
         }
         let end = pos + len as usize;
@@ -6087,11 +6088,21 @@ fn binary_array(
             return Err(unsupported_binary_oid(None));
         }
         let elem = Bytes::copy_from_slice(&bytes[pos..end]);
-        let ty = Type::from_oid(elem_oid);
-        items.push(decode_parameter(Some(&elem), ty.as_ref(), true, tz, cenc)?);
+        flat.push(decode_parameter(Some(&elem), ty.as_ref(), true, tz, cenc)?);
         pos = end;
     }
-    Ok(Bson::Array(items))
+    // Reshape the row-major leaves into nested arrays, innermost last.
+    let mut level = flat;
+    for &d in dims.iter().skip(1).rev() {
+        if d == 0 {
+            return Ok(Bson::Array(Vec::new()));
+        }
+        level = level
+            .chunks(d)
+            .map(|chunk| Bson::Array(chunk.to_vec()))
+            .collect();
+    }
+    Ok(Bson::Array(level))
 }
 
 fn unsupported_binary_oid(oid: Option<u32>) -> PgWireError {

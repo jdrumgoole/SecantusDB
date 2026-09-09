@@ -4924,3 +4924,114 @@ def test_error_inside_transaction_poisons_the_block(home: Path) -> None:
         cur.execute("commit")
         cur.execute("select count(*) from foo")
         assert cur.fetchone() == (0,)
+
+
+def test_array_literal_keeps_unicode_whitespace_elements(home: Path) -> None:
+    """The array scanner trims only PostgreSQL's `array_isspace` set (space,
+    tab, newline, CR, VT, FF) -- never U+0085 / U+00A0, which Rust's
+    `char::is_whitespace` strips. `select %s::text[]` with `['\\x85']` used
+    to come back as the EMPTY array. Probed against PG 16."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        for fmt in ("s", "t", "b"):
+            for ch in ("\x85", "\xa0", " a "):
+                cur.execute(f"select %{fmt}::text[]", ([ch],))
+                assert cur.fetchone() == ([ch],), (fmt, ch)
+        cur.execute("select '{ a , b }'::text[]")
+        assert cur.fetchone() == (["a", "b"],)
+        cur.execute("select E'{\\ta\\t,\\nb\\v\\f}'::text[]")
+        assert cur.fetchone() == (["a", "b"],)
+        cur.execute("select E'{\\u0085a}'::text[]")
+        assert cur.fetchone() == (["\x85a"],)
+        cur.execute('select \'{a b, "c d", " e ", NULL, "null"}\'::text[]')
+        assert cur.fetchone() == (["a b", "c d", " e ", None, "null"],)
+        cur.execute("select '{ { NULL } }'::text[]")
+        assert cur.fetchone() == ([[None]],)
+
+
+def test_array_literal_grammar_matches_postgresql(home: Path) -> None:
+    """The literal forms PostgreSQL accepts and rejects (probed against PG 16):
+    unquoted `NULL` is the null element while `"null"` is a string, a
+    backslash escapes in and out of quotes, and each malformed shape is 22P02."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cases = {
+            "{a b}": ["a b"],
+            '{ NULL , "null", NuLl}': [None, "null", None],
+            '{a\\,b, \\a, "a\\"b"}': ["a,b", "a", 'a"b'],
+            "{}": [],
+        }
+        for literal, expected in cases.items():
+            cur.execute("select %s::text[]", (literal,))
+            assert cur.fetchone() == (expected,), literal
+        for bad in ("{a,}", "{,a}", "{{}}", "{a}x", '{"a"b}', "{a", "a}", "{{a},{b,c}}", "{{a},b}"):
+            with pytest.raises(psycopg.errors.InvalidTextRepresentation) as exc:
+                cur.execute("select %s::text[]", (bad,))
+            assert exc.value.sqlstate == "22P02", bad
+
+
+def test_array_literal_dimension_decoration(home: Path) -> None:
+    """`[lo:hi]...={...}` is accepted, checked against the contents, and
+    otherwise discarded -- the value has no lower bounds. Probed against PG
+    16."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("select '[0:1]={a,b}'::text[]")
+        assert cur.fetchone() == (["a", "b"],)
+        cur.execute("select '[1:1][-2:-1][3:5]={{{1,2,3},{4,5,6}}}'::int[]")
+        assert cur.fetchone() == ([[[1, 2, 3], [4, 5, 6]]],)
+        cur.execute("select '[0:1]={a,b}'::text[] || %s::text[]", (["c"],))
+        assert cur.fetchone() == (["a", "b", "c"],)
+        for bad in ("[0:0]={a,b}", "[1:2={a,b}", "[1:2]{a,b}"):
+            with pytest.raises(psycopg.errors.InvalidTextRepresentation):
+                cur.execute("select %s::text[]", (bad,))
+
+
+NESTED_TEXT = [[["fo{o", "ba}r"], ['ba"z', "qu'x"], ["qu ux", " "]]]
+
+
+def test_nested_arrays_round_trip_in_every_format(home: Path) -> None:
+    """A multidimensional array parses to nested lists from its text literal,
+    from a text parameter, and from a BINARY parameter (whose decoder used to
+    refuse `ndim > 1`), and renders back the same way. Probed against PG 16."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("select '{{{{{{\"NULL\"}}}}}}'::text[]")
+        assert cur.fetchone() == ([[[[[["NULL"]]]]]],)
+        for fmt in ("s", "t", "b"):
+            cur.execute(f"select %{fmt}::text[]", (NESTED_TEXT,))
+            assert cur.fetchone() == (NESTED_TEXT,), fmt
+            cur.execute(f"select %{fmt}::int[]", ([[1, 2], [3, 4]],))
+            assert cur.fetchone() == ([[1, 2], [3, 4]],), fmt
+            cur.execute(f"select %{fmt}::text[]", ([[[[[["NULL"]]]]]],))
+            assert cur.fetchone() == ([[[[[["NULL"]]]]]],), fmt
+        bcur = conn.cursor(binary=True)
+        bcur.execute("select %b::int[]", ([[1, None], [3, 4]],))
+        assert bcur.fetchone() == ([[1, None], [3, 4]],)
+
+
+def test_array_concatenation_follows_array_cat(home: Path) -> None:
+    """`||` on arrays is `array_cat` / `array_append` / `array_prepend`: same
+    dimensionality appends, an (N-1)-dim side becomes a new slice, a NULL side
+    yields the other, and the result is typed as the array. Probed against PG
+    16."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cases = [
+            ("select array[1] || null", [1]),
+            ("select null || array[1]", [1]),
+            ("select array[1] || 2", [1, 2]),
+            ("select 0 || array[1]", [0, 1]),
+            ("select array[[1,2]] || array[3,4]", [[1, 2], [3, 4]]),
+            ("select array[3,4] || array[[1,2]]", [[3, 4], [1, 2]]),
+            ("select array[[1,2]] || array[[3,4]]", [[1, 2], [3, 4]]),
+            ("select '{}'::int[] || array[1]", [1]),
+            ("select '{{1,2},{3,4}}'::int[] || '{5,6}'", [[1, 2], [3, 4], [5, 6]]),
+        ]
+        for sql, expected in cases:
+            cur.execute(sql)
+            assert cur.fetchone() == (expected,), sql
+        cur.execute("select pg_typeof(array[1] || 2)")
+        assert cur.fetchone() == ("integer[]",)
+        with pytest.raises(psycopg.errors.InvalidTextRepresentation):
+            cur.execute("select array['a'] || 'b'")
