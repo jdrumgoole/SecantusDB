@@ -6733,3 +6733,168 @@ def test_numeric_wider_than_decimal128_compares_and_sorts_exactly(home: Path) ->
         assert cur.rowcount == 1
         cur.execute("select count(*) from wpk")
         assert cur.fetchone() == (4,)
+
+
+def _diag(exc: psycopg.Error) -> tuple:
+    d = exc.diag
+    return (
+        d.sqlstate,
+        d.message_primary,
+        d.message_detail,
+        d.schema_name,
+        d.table_name,
+        d.column_name,
+        d.constraint_name,
+    )
+
+
+def test_not_null_and_check_constraints_report_what_postgres_reports(home: Path) -> None:
+    """NOT NULL (23502) and CHECK (23514) are enforced on INSERT and UPDATE
+    with PostgreSQL 16's message, `Failing row contains (...)` detail
+    (every column in declaration order, NULL as `null`), and diagnostic
+    fields. Unnamed CHECKs take PG's names: `<table>_<col>_check` when the
+    expression names one column, `<table>_check` (then `_check1`, ...) otherwise.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table nn (a int not null, b text)")
+        with pytest.raises(psycopg.errors.NotNullViolation) as exc:
+            conn.execute("insert into nn (b) values ('x')")
+        assert _diag(exc.value) == (
+            "23502",
+            'null value in column "a" of relation "nn" violates not-null constraint',
+            "Failing row contains (null, x).",
+            "public",
+            "nn",
+            "a",
+            None,
+        )
+        conn.execute("insert into nn values (1, 'z')")
+        with pytest.raises(psycopg.errors.NotNullViolation):
+            conn.execute("update nn set a = null")
+        assert conn.execute("select a from nn").fetchall() == [(1,)]
+
+        conn.execute("create table ck (a int check (a > 0), b int, c int check (a < b))")
+        with pytest.raises(psycopg.errors.CheckViolation) as exc:
+            conn.execute("insert into ck values (-1, 2, 3)")
+        assert _diag(exc.value) == (
+            "23514",
+            'new row for relation "ck" violates check constraint "ck_a_check"',
+            "Failing row contains (-1, 2, 3).",
+            "public",
+            "ck",
+            None,
+            "ck_a_check",
+        )
+        with pytest.raises(psycopg.errors.CheckViolation) as exc:
+            conn.execute("insert into ck values (5, 2, 3)")
+        assert exc.value.diag.constraint_name == "ck_check"
+        # A CHECK that evaluates to NULL passes (SQL's rule), and a violation
+        # on a later row inserts none of them.
+        conn.execute("insert into ck values (null, 2, 3)")
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute("insert into ck values (1, 2, 3), (0, 1, 1)")
+        assert conn.execute("select count(*) from ck").fetchone() == (1,)
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute("update ck set a = 9")
+
+        # A TEMP table's schema is the session's pg_temp namespace.
+        conn.execute("create temp table tt (data int constraint chk_eq1 check (data = 1))")
+        with pytest.raises(psycopg.errors.CheckViolation) as exc:
+            conn.execute("insert into tt values (2)")
+        assert exc.value.diag.schema_name.startswith("pg_temp")
+        assert exc.value.diag.constraint_name == "chk_eq1"
+        assert exc.value.diag.severity_nonlocalized == "ERROR"
+
+
+def test_foreign_keys_are_enforced_on_both_sides(home: Path) -> None:
+    """FOREIGN KEY (23503): the child side on INSERT / UPDATE, the parent side
+    on DELETE with NO ACTION, CASCADE and SET NULL, NULL keys pass, and a
+    self-reference sees the rows of its own statement. Messages and fields
+    probed against PostgreSQL 16.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table p (id int primary key)")
+        conn.execute("create table c (id serial primary key, p int references p)")
+        with pytest.raises(psycopg.errors.ForeignKeyViolation) as exc:
+            conn.execute("insert into c (p) values (7)")
+        assert _diag(exc.value) == (
+            "23503",
+            'insert or update on table "c" violates foreign key constraint "c_p_fkey"',
+            'Key (p)=(7) is not present in table "p".',
+            "public",
+            "c",
+            None,
+            "c_p_fkey",
+        )
+        conn.execute("insert into c (p) values (null)")
+        conn.execute("insert into p values (1)")
+        conn.execute("insert into c (p) values (1)")
+        with pytest.raises(psycopg.errors.ForeignKeyViolation) as exc:
+            conn.execute("delete from p where id = 1")
+        assert _diag(exc.value) == (
+            "23503",
+            'update or delete on table "p" violates foreign key constraint "c_p_fkey" on table "c"',
+            'Key (id)=(1) is still referenced from table "c".',
+            "public",
+            "c",
+            None,
+            "c_p_fkey",
+        )
+        assert conn.execute("select count(*) from p").fetchone() == (1,)
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):
+            conn.execute("update c set p = 99 where p = 1")
+        with pytest.raises(psycopg.errors.UndefinedTable):
+            conn.execute("create table bad (p int references nosuch)")
+
+        conn.execute("create table p2 (id int primary key)")
+        conn.execute(
+            "create table c2 (id serial primary key, p int references p2 on delete cascade)"
+        )
+        conn.execute("insert into p2 values (1), (2)")
+        conn.execute("insert into c2 (p) values (1), (1), (2)")
+        conn.execute("delete from p2 where id = 1")
+        assert conn.execute("select p from c2").fetchall() == [(2,)]
+
+        conn.execute("create table p3 (id int primary key)")
+        conn.execute(
+            "create table c3 (id serial primary key, p int references p3 on delete set null)"
+        )
+        conn.execute("insert into p3 values (1)")
+        conn.execute("insert into c3 (p) values (1)")
+        conn.execute("delete from p3 where id = 1")
+        assert conn.execute("select p from c3").fetchall() == [(None,)]
+
+        conn.execute("create table s (id int primary key, r int references s)")
+        conn.execute("insert into s values (1, 2), (2, 1)")
+        assert conn.execute("select count(*) from s").fetchone() == (2,)
+
+
+def test_deferred_foreign_key_fails_at_commit_and_leaves_the_connection_idle(
+    home: Path,
+) -> None:
+    """`DEFERRABLE INITIALLY DEFERRED` is checked at COMMIT inside a
+    transaction (and at the statement in autocommit). The COMMIT answers the
+    23503, the transaction is rolled back, and the connection is IDLE -- not
+    "in a failed transaction" -- so the next statement runs. PostgreSQL 16.
+    """
+    from psycopg.pq import TransactionStatus
+
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute(
+            "create table selfref (x serial primary key, "
+            "y int references selfref (x) deferrable initially deferred)"
+        )
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):
+            conn.execute("insert into selfref (y) values (-1)")
+        assert conn.execute("select count(*) from selfref").fetchone() == (0,)
+    with _Server(home) as server, server.connect(autocommit=False) as conn:
+        conn.execute("insert into selfref (y) values (-1)")
+        assert conn.info.transaction_status == TransactionStatus.INTRANS
+        with pytest.raises(psycopg.errors.ForeignKeyViolation) as exc:
+            conn.commit()
+        assert exc.value.diag.constraint_name == "selfref_y_fkey"
+        assert conn.info.transaction_status == TransactionStatus.IDLE
+        assert conn.execute("select count(*) from selfref").fetchone() == (0,)
+        conn.rollback()
+        # The catalog carries the constraints for the Python server too.
+    assert _python_sql(home, "select count(*) from selfref") == [(0,)]

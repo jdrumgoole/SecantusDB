@@ -2513,3 +2513,100 @@ fn datetime_arith_type_maps_the_operand_combinations() {
     assert_eq!(t("+", "int4", "int4"), None);
     assert_eq!(t("/", "int4", "interval"), None);
 }
+
+// -- constraints: names and shapes measured on PostgreSQL 16 (2026-09-09) --
+
+#[test]
+fn create_table_records_not_null_check_and_foreign_key_constraints() {
+    let sql = "CREATE TEMP TABLE nm_t (a int not null, b serial, c int check (c > 0), \
+               x int, check (a < b), check (x > 0), check (b*2 > a + c), \
+               z int references t on delete cascade, \
+               w int constraint fkw references t (id) deferrable initially deferred, \
+               check (true))";
+    let Statement::CreateTable(def, _) = plan_ok(sql) else {
+        panic!("not a CREATE TABLE");
+    };
+    assert!(def.temp);
+    assert!(!def.column("a").unwrap().nullable);
+    assert!(!def.column("b").unwrap().nullable, "serial is NOT NULL");
+    assert!(def.column("c").unwrap().nullable);
+    let names: Vec<(&str, &str)> = def
+        .check_constraints
+        .iter()
+        .map(|c| (c.name.as_str(), c.expression.as_str()))
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            ("nm_t_c_check", "(c > 0)"),
+            ("nm_t_check", "(a < b)"),
+            ("nm_t_check1", "((b * 2) > (a + c))"),
+            ("nm_t_check2", "true"),
+            ("nm_t_x_check", "(x > 0)"),
+        ]
+    );
+    let fks: Vec<_> = def
+        .foreign_keys
+        .iter()
+        .map(|f| {
+            (
+                f.name.as_str(),
+                f.columns.clone(),
+                f.ref_table.as_str(),
+                f.ref_columns.clone(),
+                f.on_delete.as_deref(),
+                f.deferrable,
+                f.initially_deferred,
+            )
+        })
+        .collect();
+    assert_eq!(
+        fks,
+        vec![
+            ("nm_t_z_fkey", vec!["z".to_string()], "t", vec![], Some("CASCADE"), false, false),
+            ("fkw", vec!["w".to_string()], "t", vec!["id".to_string()], None, true, true),
+        ]
+    );
+}
+
+#[test]
+fn create_table_self_referencing_foreign_key_resolves_to_the_pk() {
+    let Statement::CreateTable(def, _) = plan_ok(
+        "create table selfref (x serial primary key, y int references selfref (x) \
+         deferrable initially deferred)",
+    ) else {
+        panic!("not a CREATE TABLE");
+    };
+    let fk = &def.foreign_keys[0];
+    assert_eq!(fk.name, "selfref_y_fkey");
+    assert_eq!(fk.ref_columns, vec!["x".to_string()]);
+    assert!(fk.deferrable && fk.initially_deferred);
+    let err = plan("create table s2 (x int primary key, u int, y int references s2 (u))", &lookup)
+        .unwrap_err();
+    assert_eq!(err.sqlstate(), "42830");
+    assert_eq!(
+        err.to_string(),
+        "there is no unique constraint matching given keys for referenced table \"s2\""
+    );
+}
+
+#[test]
+fn create_table_check_naming_a_missing_column_is_42703_at_create() {
+    let err = plan("create table bad (a int, check (nope > 0))", &lookup).unwrap_err();
+    assert_eq!(err.sqlstate(), "42703");
+}
+
+#[test]
+fn check_expression_evaluates_false_true_and_null() {
+    let def = t();
+    let expr = plan_check_expression("(n > 0)", &def).unwrap();
+    let row = |n: Bson| {
+        let mut d = Document::new();
+        d.insert("_id", 1);
+        d.insert("n", n);
+        d
+    };
+    assert_eq!(apply_row_expr(&expr, &row(Bson::Int32(1))).unwrap(), Bson::Boolean(true));
+    assert_eq!(apply_row_expr(&expr, &row(Bson::Int32(0))).unwrap(), Bson::Boolean(false));
+    assert_eq!(apply_row_expr(&expr, &row(Bson::Null)).unwrap(), Bson::Null);
+}

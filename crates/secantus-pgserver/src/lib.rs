@@ -198,6 +198,13 @@ pub struct PgHandler {
     /// `pg_terminate_backend` sets it, and `run_typed` checks it before every
     /// statement so the connection ends with a `57P01`.
     terminate: Arc<AtomicBool>,
+    /// `(table, constraint name)` of every INITIALLY DEFERRED foreign key a
+    /// write in the open transaction touched; re-checked at COMMIT.
+    deferred_fks: Mutex<Vec<(String, String)>>,
+    /// Set when a COMMIT failed its deferred checks and rolled back: the
+    /// error goes out, and the `ReadyForQuery` after it must say IDLE (the
+    /// transaction is over), where pgwire's error path would say failed.
+    commit_failed: AtomicBool,
 }
 
 /// A user type created (`Some(doc)`) or dropped (`None`) in the open
@@ -304,6 +311,8 @@ impl PgHandler {
             backend_pid: AtomicI32::new(0),
             session_user: Mutex::new(String::new()),
             terminate: Arc::new(AtomicBool::new(false)),
+            deferred_fks: Mutex::new(Vec::new()),
+            commit_failed: AtomicBool::new(false),
         }
     }
 
@@ -2589,6 +2598,7 @@ impl SimpleQueryHandler for PgHandler {
         self.flush_notices(_c).await?;
         // Report any GUC change (TimeZone, ...) so the client tracks it.
         self.report_pending_params(_c).await?;
+        self.settle_failed_commit(_c);
         // A FATAL error (`pg_terminate_backend` on this backend) ends the
         // connection. pgwire's own error path would send a `ReadyForQuery`
         // after the `ErrorResponse` and leave the socket open, so the client
@@ -3279,6 +3289,17 @@ impl PgHandler {
         self.in_transaction
             .store(false, std::sync::atomic::Ordering::Relaxed);
         if let Some(mut handle) = self.txn.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let checked = self
+                .storage
+                .with_user_transaction(&mut handle, || self.run_deferred_checks())
+                .map_err(|e| Self::storage_err("transaction failed", e))
+                .and_then(|r| r);
+            if let Err(e) = checked {
+                self.storage
+                    .rollback_user_transaction(&mut handle)
+                    .map_err(|e| Self::storage_err("could not roll back a transaction", e))?;
+                return Err(e);
+            }
             self.storage
                 .commit_user_transaction(&mut handle)
                 .map_err(|e| Self::storage_err("could not commit a transaction", e))?;
@@ -3307,6 +3328,10 @@ impl PgHandler {
             .clear();
         self.in_transaction
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.deferred_fks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         if let Some(mut handle) = self.txn.lock().unwrap_or_else(|e| e.into_inner()).take() {
             self.storage
                 .rollback_user_transaction(&mut handle)
@@ -3957,6 +3982,21 @@ impl PgHandler {
                 if let Some(mut handle) = guard.take() {
                     self.in_transaction
                         .store(false, std::sync::atomic::Ordering::Relaxed);
+                    // INITIALLY DEFERRED constraints are checked now, inside
+                    // the transaction; a violation rolls it back and the
+                    // error is the COMMIT's answer, with the connection IDLE.
+                    let checked = self
+                        .storage
+                        .with_user_transaction(&mut handle, || self.run_deferred_checks())
+                        .map_err(|e| Self::storage_err("transaction failed", e))
+                        .and_then(|r| r);
+                    if let Err(e) = checked {
+                        self.storage
+                            .rollback_user_transaction(&mut handle)
+                            .map_err(|e| Self::storage_err("could not roll back", e))?;
+                        self.commit_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return Err(e);
+                    }
                     self.storage
                         .commit_user_transaction(&mut handle)
                         .map_err(|e| Self::storage_err("could not commit", e))?;
@@ -3967,6 +4007,10 @@ impl PgHandler {
                 self.reset_transaction_gucs();
                 // A ROLLBACK closes ALL cursors, holdable included.
                 self.close_cursors_on_txn_end(false);
+                self.deferred_fks
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
                 if let Some(mut handle) = guard.take() {
                     self.in_transaction
                         .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -4426,7 +4470,7 @@ impl PgHandler {
             // Handled in `run`, which can await the row stream.
             Statement::DeclareCursor { .. } => unreachable!("handled before execute"),
             Statement::Do { .. } => unreachable!("handled before execute"),
-            Statement::CreateTable(def, if_not_exists) => {
+            Statement::CreateTable(mut def, if_not_exists) => {
                 if self.lookup(&def.name).is_some() {
                     // `IF NOT EXISTS` is a NO-OP on an existing table, tag and
                     // all -- PostgreSQL only adds a notice. Raising here made
@@ -4440,6 +4484,17 @@ impl PgHandler {
                         "42P07".into(), // duplicate_table
                         format!("relation \"{}\" already exists", def.name),
                     ))));
+                }
+                // A FOREIGN KEY to another table names its PRIMARY KEY (the
+                // planner settled self-references, which need no lookup).
+                for fk in &mut def.foreign_keys {
+                    if fk.ref_table == def.name {
+                        continue;
+                    }
+                    let target = self
+                        .lookup(&fk.ref_table)
+                        .ok_or_else(|| Self::err(&PlanError::UndefinedTable(fk.ref_table.clone())))?;
+                    secantus_pgplan::resolve_fk_target(fk, &target).map_err(|e| Self::err(&e))?;
                 }
                 self.storage
                     .create_collection(&self.db, &def.name)
@@ -4519,6 +4574,11 @@ impl PgHandler {
                 }
                 self.apply_serial_defaults(&def, &mut ins.rows)?;
                 apply_column_defaults(&def, &mut ins.rows);
+                // Every constraint is checked BEFORE the first write, so a
+                // violation on any row leaves none of them inserted.
+                for row in &ins.rows {
+                    self.check_row_constraints(&def, row)?;
+                }
                 if let Some(dup) = self.wide_numeric_pk_conflict(&ins.table, &def, &ins.rows)? {
                     return Err(Self::write_error(
                         &ins.table,
@@ -4526,6 +4586,7 @@ impl PgHandler {
                         &bson::doc! { "code": 11000, "keyValue": { "_id": dup } },
                     ));
                 }
+                self.check_foreign_keys(&def, &ins.rows)?;
                 let n = ins.rows.len();
                 let docs = ins
                     .rows
@@ -5445,7 +5506,9 @@ impl PgHandler {
             }
 
             Statement::Update(upd) => {
-                let matched = if upd.set_exprs.is_empty() {
+                let def = self.lookup(&upd.table);
+                let constrained = def.as_ref().is_some_and(table_has_row_constraints);
+                let matched = if upd.set_exprs.is_empty() && !constrained {
                     self.update_rows(&upd.table, &upd.filter, &upd.set, &upd.unset)?
                 } else {
                     // A SET list that reads the row (`num = num * 2`) is
@@ -5457,13 +5520,32 @@ impl PgHandler {
                         .find_matching(&self.db, &upd.table, &upd.filter)
                         .map_err(|e| Self::storage_err("could not read", e))?;
                     let mut writes = Vec::with_capacity(raw.len());
+                    let mut new_rows = Vec::with_capacity(raw.len());
                     for bytes in &raw {
                         let row: Document = bson::from_slice(bytes)
                             .map_err(|e| Self::storage_err("could not decode a row", e))?;
-                        let (set, unset) = secantus_pgplan::update_row_sets(&upd, &row)
-                            .map_err(|e| Self::err(&e))?;
+                        let (set, unset) = if upd.set_exprs.is_empty() {
+                            (upd.set.clone(), upd.unset.clone())
+                        } else {
+                            secantus_pgplan::update_row_sets(&upd, &row)
+                                .map_err(|e| Self::err(&e))?
+                        };
+                        if let Some(def) = def.as_ref() {
+                            let mut after = row.clone();
+                            for (k, v) in &set {
+                                after.insert(k.clone(), v.clone());
+                            }
+                            for k in &unset {
+                                after.remove(k);
+                            }
+                            self.check_row_constraints(def, &after)?;
+                            new_rows.push(after);
+                        }
                         let id = row.get("_id").cloned().unwrap_or(Bson::Null);
                         writes.push((id, set, unset));
+                    }
+                    if let Some(def) = def.as_ref() {
+                        self.check_foreign_keys(def, &new_rows)?;
                     }
                     let mut matched = 0usize;
                     for (id, set, unset) in writes {
@@ -5481,6 +5563,9 @@ impl PgHandler {
             }
 
             Statement::Delete(del) => {
+                if let Some(def) = self.lookup(&del.table) {
+                    self.check_referencing_rows(&def, &del.filter)?;
+                }
                 let deleted = self
                     .storage
                     .delete_matching(&self.db, &del.table, &del.filter, 0, &Document::new(), None)
@@ -5528,6 +5613,388 @@ impl PgHandler {
             )
             .map_err(|e| Self::storage_err("could not update", e))?;
         Ok(outcome.matched)
+    }
+}
+
+/// Whether an UPDATE of `def` must look at each row it writes: a NOT NULL
+/// column, a CHECK, or a FOREIGN KEY can all be violated by the new value.
+fn table_has_row_constraints(def: &TableDef) -> bool {
+    def.columns.iter().any(|c| !c.nullable && !c.pk)
+        || !def.check_constraints.is_empty()
+        || !def.foreign_keys.is_empty()
+}
+
+/// Two stored values equal as PostgreSQL compares a key: numerics by value
+/// across the integer / float widths, everything else structurally.
+fn key_values_equal(a: &Bson, b: &Bson) -> bool {
+    fn num(v: &Bson) -> Option<f64> {
+        match v {
+            Bson::Int32(i) => Some(f64::from(*i)),
+            Bson::Int64(i) => Some(*i as f64),
+            Bson::Double(d) => Some(*d),
+            _ => None,
+        }
+    }
+    match (num(a), num(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+impl PgHandler {
+    /// The schema a table's error diagnostics name: a TEMP table lives in the
+    /// session's `pg_temp_N` namespace.
+    fn schema_of(def: &TableDef) -> String {
+        if def.temp {
+            "pg_temp_1".to_string()
+        } else {
+            "public".to_string()
+        }
+    }
+
+    /// PostgreSQL's `Failing row contains (...)` detail: every column in
+    /// declaration order, each as its text output, NULL as `null`.
+    fn failing_row_detail(def: &TableDef, row: &Document) -> String {
+        let cells: Vec<String> = def
+            .columns
+            .iter()
+            .map(|c| match row.get(c.field()) {
+                None | Some(Bson::Null) => "null".to_string(),
+                Some(v) => secantus_pgplan::value_text(v),
+            })
+            .collect();
+        format!("Failing row contains ({}).", cells.join(", "))
+    }
+
+    /// An integrity-constraint error (class 23) with the diagnostic fields
+    /// PostgreSQL attaches: schema and table always, the constraint or the
+    /// column as the kind of violation names it.
+    fn constraint_error(
+        code: &str,
+        message: String,
+        detail: String,
+        def: &TableDef,
+        constraint: Option<&str>,
+        column: Option<&str>,
+    ) -> PgWireError {
+        let mut info = ErrorInfo::new("ERROR".into(), code.into(), message);
+        info.detail = Some(detail);
+        info.schema = Some(Self::schema_of(def));
+        info.table = Some(def.name.clone());
+        info.constraint = constraint.map(str::to_string);
+        info.column = column.map(str::to_string);
+        PgWireError::UserError(Box::new(info))
+    }
+
+    /// NOT NULL and CHECK over one row about to be written, in PostgreSQL's
+    /// order: every NOT NULL column first, then the CHECK constraints by
+    /// name. A CHECK that evaluates to NULL passes (SQL's rule).
+    fn check_row_constraints(&self, def: &TableDef, row: &Document) -> PgWireResult<()> {
+        for c in &def.columns {
+            if c.nullable || c.pk {
+                continue;
+            }
+            if matches!(row.get(c.field()), None | Some(Bson::Null)) {
+                return Err(Self::constraint_error(
+                    "23502",
+                    format!(
+                        "null value in column \"{}\" of relation \"{}\" violates not-null constraint",
+                        c.name, def.name
+                    ),
+                    Self::failing_row_detail(def, row),
+                    def,
+                    None,
+                    Some(&c.name),
+                ));
+            }
+        }
+        for check in &def.check_constraints {
+            let expr = secantus_pgplan::plan_check_expression(&check.expression, def)
+                .map_err(|e| Self::err(&e))?;
+            let verdict = secantus_pgplan::apply_row_expr(&expr, row).map_err(|e| Self::err(&e))?;
+            if verdict == Bson::Boolean(false) {
+                return Err(Self::constraint_error(
+                    "23514",
+                    format!(
+                        "new row for relation \"{}\" violates check constraint \"{}\"",
+                        def.name, check.name
+                    ),
+                    Self::failing_row_detail(def, row),
+                    def,
+                    Some(&check.name),
+                    None,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `value` is present in the referenced column of `parent` --
+    /// among its stored rows, or among `pending` rows the same statement is
+    /// about to write when the key refers back to its own table.
+    fn referenced_key_exists(
+        &self,
+        parent: &TableDef,
+        ref_field: &str,
+        value: &Bson,
+        pending: &[Document],
+    ) -> PgWireResult<bool> {
+        if pending
+            .iter()
+            .any(|r| r.get(ref_field).is_some_and(|v| key_values_equal(v, value)))
+        {
+            return Ok(true);
+        }
+        let found = self
+            .storage
+            .find_matching(&self.db, &parent.name, &bson::doc! { ref_field: value.clone() })
+            .map_err(|e| Self::storage_err("could not read", e))?;
+        Ok(!found.is_empty())
+    }
+
+    /// The child side of every FOREIGN KEY on `def`, over the rows a
+    /// statement is about to write. An INITIALLY DEFERRED key inside a
+    /// transaction is queued for COMMIT instead.
+    fn check_foreign_keys(&self, def: &TableDef, rows: &[Document]) -> PgWireResult<()> {
+        for fk in &def.foreign_keys {
+            if fk.initially_deferred && self.in_transaction.load(std::sync::atomic::Ordering::Relaxed) {
+                self.defer_fk(&def.name, &fk.name);
+                continue;
+            }
+            self.check_fk_child_side(def, fk, rows)?;
+        }
+        Ok(())
+    }
+
+    fn defer_fk(&self, table: &str, name: &str) {
+        let mut q = self.deferred_fks.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (table.to_string(), name.to_string());
+        if !q.contains(&key) {
+            q.push(key);
+        }
+    }
+
+    /// `rows` of `def` (the referencing table) must each find their key in
+    /// the referenced table; a NULL key passes. When the key refers back to
+    /// `def` itself, the rows being written count as present -- PostgreSQL
+    /// checks at the end of the statement, so `(1, 2), (2, 1)` inserts.
+    fn check_fk_child_side(
+        &self,
+        def: &TableDef,
+        fk: &secantus_pgcatalog::ForeignKey,
+        rows: &[Document],
+    ) -> PgWireResult<()> {
+        let (Some(col), Some(ref_col)) = (fk.columns.first(), fk.ref_columns.first()) else {
+            return Ok(());
+        };
+        let Some(field) = def.field_of(col) else {
+            return Ok(());
+        };
+        let parent = if fk.ref_table == def.name {
+            def.clone()
+        } else {
+            self.lookup(&fk.ref_table)
+                .ok_or_else(|| Self::err(&PlanError::UndefinedTable(fk.ref_table.clone())))?
+        };
+        let Some(ref_field) = parent.field_of(ref_col) else {
+            return Ok(());
+        };
+        let pending: &[Document] = if fk.ref_table == def.name { rows } else { &[] };
+        for row in rows {
+            let value = match row.get(&field) {
+                None | Some(Bson::Null) => continue,
+                Some(v) => v,
+            };
+            if !self.referenced_key_exists(&parent, &ref_field, value, pending)? {
+                return Err(Self::constraint_error(
+                    "23503",
+                    format!(
+                        "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
+                        def.name, fk.name
+                    ),
+                    format!(
+                        "Key ({})=({}) is not present in table \"{}\".",
+                        col,
+                        secantus_pgplan::value_text(value),
+                        fk.ref_table
+                    ),
+                    def,
+                    Some(&fk.name),
+                    None,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Every table whose FOREIGN KEYs reference `parent`, with those keys.
+    fn referencing_keys(
+        &self,
+        parent: &str,
+    ) -> PgWireResult<Vec<(TableDef, secantus_pgcatalog::ForeignKey)>> {
+        let raw = self
+            .storage
+            .find_matching(&self.db, CATALOG_COLLECTION, &Document::new())
+            .map_err(|e| Self::storage_err("could not read the catalog", e))?;
+        let mut defs: Vec<TableDef> = raw
+            .iter()
+            .filter_map(|b| bson::from_slice::<Document>(b).ok())
+            .filter_map(|d| TableDef::from_document(&d))
+            .collect();
+        // What this transaction created or dropped overlays the catalog.
+        {
+            let pending = self.uncommitted.lock().unwrap_or_else(|e| e.into_inner());
+            defs.retain(|d| !pending.contains_key(&d.name));
+            defs.extend(pending.values().filter_map(|d| d.clone()));
+        }
+        Ok(defs
+            .into_iter()
+            .flat_map(|d| {
+                let fks: Vec<_> = d
+                    .foreign_keys
+                    .iter()
+                    .filter(|fk| fk.ref_table == parent)
+                    .cloned()
+                    .collect();
+                fks.into_iter().map(move |fk| (d.clone(), fk))
+            })
+            .collect())
+    }
+
+    /// The parent side of a DELETE from `def`: a row another table's row
+    /// still references cannot go (NO ACTION / RESTRICT), is followed by its
+    /// dependants (CASCADE), or leaves them keyless (SET NULL). Applied
+    /// BEFORE the delete, so a refusal leaves the table untouched.
+    fn check_referencing_rows(&self, def: &TableDef, filter: &Document) -> PgWireResult<()> {
+        let referencing = self.referencing_keys(&def.name)?;
+        if referencing.is_empty() {
+            return Ok(());
+        }
+        let raw = self
+            .storage
+            .find_matching(&self.db, &def.name, filter)
+            .map_err(|e| Self::storage_err("could not read", e))?;
+        let going: Vec<Document> = raw
+            .iter()
+            .filter_map(|b| bson::from_slice::<Document>(b).ok())
+            .collect();
+        for (child, fk) in referencing {
+            let (Some(col), Some(ref_col)) = (fk.columns.first(), fk.ref_columns.first()) else {
+                continue;
+            };
+            let (Some(field), Some(ref_field)) = (child.field_of(col), def.field_of(ref_col))
+            else {
+                continue;
+            };
+            for row in &going {
+                let Some(key) = row.get(&ref_field).filter(|v| **v != Bson::Null) else {
+                    continue;
+                };
+                // A self-referencing row that is itself going does not hold
+                // its own parent; only rows that STAY count.
+                let mut child_filter = bson::doc! { &field: key.clone() };
+                if child.name == def.name {
+                    let going_ids: Vec<Bson> =
+                        going.iter().filter_map(|r| r.get("_id").cloned()).collect();
+                    child_filter.insert("_id", bson::doc! { "$nin": going_ids });
+                }
+                let dependants = self
+                    .storage
+                    .find_matching(&self.db, &child.name, &child_filter)
+                    .map_err(|e| Self::storage_err("could not read", e))?;
+                if dependants.is_empty() {
+                    continue;
+                }
+                match fk.on_delete.as_deref() {
+                    Some("CASCADE") => {
+                        self.check_referencing_rows(&child, &child_filter)?;
+                        self.storage
+                            .delete_matching(
+                                &self.db,
+                                &child.name,
+                                &child_filter,
+                                0,
+                                &Document::new(),
+                                None,
+                            )
+                            .map_err(|e| Self::storage_err("could not delete", e))?;
+                    }
+                    Some("SET NULL") => {
+                        let mut after = Vec::new();
+                        for b in &dependants {
+                            let mut r: Document = bson::from_slice(b)
+                                .map_err(|e| Self::storage_err("could not decode a row", e))?;
+                            r.insert(field.clone(), Bson::Null);
+                            self.check_row_constraints(&child, &r)?;
+                            after.push(r);
+                        }
+                        self.update_rows(
+                            &child.name,
+                            &child_filter,
+                            &bson::doc! { &field: Bson::Null },
+                            &[],
+                        )?;
+                    }
+                    _ if fk.initially_deferred && self.in_transaction.load(std::sync::atomic::Ordering::Relaxed) => {
+                        self.defer_fk(&child.name, &fk.name);
+                    }
+                    _ => {
+                        return Err(Self::constraint_error(
+                            "23503",
+                            format!(
+                                "update or delete on table \"{}\" violates foreign key constraint \"{}\" on table \"{}\"",
+                                def.name, fk.name, child.name
+                            ),
+                            format!(
+                                "Key ({})=({}) is still referenced from table \"{}\".",
+                                ref_col,
+                                secantus_pgplan::value_text(key),
+                                child.name
+                            ),
+                            &child,
+                            Some(&fk.name),
+                            None,
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-check every deferred FOREIGN KEY over the whole referencing table,
+    /// as COMMIT does. Runs inside the transaction, so it sees its writes.
+    fn run_deferred_checks(&self) -> PgWireResult<()> {
+        let queued: Vec<(String, String)> = std::mem::take(
+            &mut *self.deferred_fks.lock().unwrap_or_else(|e| e.into_inner()),
+        );
+        for (table, name) in queued {
+            let Some(def) = self.lookup(&table) else {
+                continue;
+            };
+            let Some(fk) = def.foreign_keys.iter().find(|f| f.name == name) else {
+                continue;
+            };
+            let raw = self
+                .storage
+                .find_matching(&self.db, &table, &Document::new())
+                .map_err(|e| Self::storage_err("could not read", e))?;
+            let rows: Vec<Document> = raw
+                .iter()
+                .filter_map(|b| bson::from_slice::<Document>(b).ok())
+                .collect();
+            self.check_fk_child_side(&def, fk, &rows)?;
+        }
+        Ok(())
+    }
+
+    /// After a COMMIT whose deferred checks failed, the transaction is
+    /// already rolled back: the `ReadyForQuery` that follows the error must
+    /// say IDLE, not "in a failed transaction".
+    fn settle_failed_commit<C: ClientInfo>(&self, client: &mut C) {
+        if self.commit_failed.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            client.set_transaction_status(pgwire::messages::response::TransactionStatus::Idle);
+        }
     }
 }
 
@@ -7654,14 +8121,14 @@ fn binary_range(
 /// A one-column table definition standing in for a generated series, so the
 /// row encoder and the describe path can treat it like any other source.
 fn series_table_def(series: &secantus_pgplan::Series) -> TableDef {
-    TableDef {
-        name: "generate_series".to_string(),
-        columns: vec![secantus_pgcatalog::Column::new(
+    TableDef::new(
+        "generate_series",
+        vec![secantus_pgcatalog::Column::new(
             &series.column,
             "int4",
             false,
         )],
-    }
+    )
 }
 
 /// Parse COPY text or CSV input into rows of optional fields, where `None` is
@@ -8900,6 +9367,7 @@ impl ExtendedQueryHandler for PgHandler {
             .await;
         // Notices go out before the result -- or the error -- they preceded.
         self.flush_notices(_c).await?;
+        self.settle_failed_commit(_c);
         let mut responses = result?;
         // Report any GUC change (TimeZone, DateStyle, ...) the statement made.
         self.report_pending_params(_c).await?;

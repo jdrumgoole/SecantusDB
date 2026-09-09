@@ -672,22 +672,14 @@ remain open:
   - `float4` / `float8` columns keep MQL's NaN placement (below every
     number) in WHERE; PG puts NaN above infinity for floats too. Only
     `numeric` was moved in this slice.
-- [ ] **OPEN — RUST pgserver: NOT NULL / CHECK / FOREIGN KEY constraints are
-      not enforced at all (re-measured 2026-09-09; `test_commit_error`,
-      `test_diag_from_commit[_async]`, `test_diag_attr_values`).** Against
-      PostgreSQL 16.15: `create table c1 (id int not null); insert into c1
-      values (null)` → `23502 null value in column "id" of relation "c1"
-      violates not-null constraint` (same for `serial`); `create table c1 (id
-      int check (id > 0)); insert into c1 values (-1)` → `23514 new row for
-      relation "c1" violates check constraint "c1_id_check"`; `create table c2
-      (id int references c1(id)); insert into c2 values (42)` → `23503 insert
-      or update on table "c2" violates foreign key constraint "c2_id_fkey"`,
-      and with `deferrable initially deferred` the same 23503 fires at
-      `COMMIT`. The Rust server answers `OK` to all five. The earlier entry
-      framed this as "no constraint-deferral machinery"; the gap is one level
-      down — the catalog records none of the three constraints and the INSERT
-      / UPDATE paths check nothing. Feature build: constraint catalog +
-      per-row checks + a deferred-check list run at COMMIT.
+- [ ] **OPEN — RUST pgserver: column-level `UNIQUE` is accepted and silently
+      not enforced, and there is no `pg_constraint` virtual table
+      (2026-09-09).** NOT NULL / CHECK / FOREIGN KEY landed (catalog + per-row
+      checks + a deferred-check list run at COMMIT; the same catalog document
+      shape the Python server writes). A `unique` column constraint still
+      plans as a plain column — a second equal value inserts where PG 16
+      answers `23505` — and `pg_constraint` queries answer `42P01`. Multi-
+      column FOREIGN KEYs and `ON DELETE SET DEFAULT` are refused `0A000`.
 - [ ] **OPEN — RUST pgserver: `test_right_exception_on_session_timeout` needs
       `idle_in_transaction_session_timeout`.** Expects an idle transaction to be
       killed with `25P03` (`IdleInTransactionSessionTimeout`) after the GUC's

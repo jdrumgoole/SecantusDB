@@ -28,7 +28,7 @@ use pg_query::protobuf::{
     a_const, AExpr, AExprKind, BoolExprType, DropBehavior, NullTestType, ObjectType, SortByDir,
     SortByNulls, TransactionStmtKind, VariableSetKind,
 };
-use secantus_pgcatalog::{Column, TableDef};
+use secantus_pgcatalog::{CheckConstraint, Column, ForeignKey, TableDef};
 
 pub use numeric::{
     canonical_numeric_text, compare_decimal_text, is_numeric, is_wide_numeric, numeric_bson,
@@ -110,6 +110,9 @@ pub enum Error {
     /// A cast between two types PostgreSQL has no cast for -> 42846
     /// (cannot_coerce): `5::box`, `'(1,2),(3,4)'::box::float8`.
     CannotCoerce(String),
+    /// A FOREIGN KEY whose referenced columns carry no unique constraint ->
+    /// 42830 (invalid_foreign_key).
+    InvalidForeignKey(String),
 }
 
 impl std::fmt::Display for Error {
@@ -138,7 +141,8 @@ impl std::fmt::Display for Error {
             | Error::InvalidRegex(m)
             | Error::ArraySubscript(m)
             | Error::DatatypeMismatch(m)
-            | Error::CannotCoerce(m) => write!(f, "{m}"),
+            | Error::CannotCoerce(m)
+            | Error::InvalidForeignKey(m) => write!(f, "{m}"),
             Error::MultipleCommands => {
                 write!(
                     f,
@@ -189,6 +193,7 @@ impl Error {
             Error::ArraySubscript(_) => "2202E",    // array_subscript_error
             Error::DatatypeMismatch(_) => "42804",  // datatype_mismatch
             Error::CannotCoerce(_) => "42846",      // cannot_coerce
+            Error::InvalidForeignKey(_) => "42830", // invalid_foreign_key
         }
     }
 }
@@ -1427,13 +1432,22 @@ fn type_name(names: &[pg_query::protobuf::Node]) -> String {
 }
 
 fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
-    let table = c
+    use pg_query::protobuf::ConstrType as CT;
+    let relation = c
         .relation
         .as_ref()
-        .map(|r| r.relname.clone())
         .ok_or_else(|| Error::Parse("CREATE TABLE without a relation".into()))?;
+    let table = relation.relname.clone();
+    // `CREATE TEMP TABLE`: `relpersistence` is `t` (RELPERSISTENCE_TEMP).
+    let temp = relation.relpersistence == "t";
 
     let mut columns: Vec<Column> = Vec::new();
+    // (constraint name if given, expression node, the columns it names) --
+    // resolved to CheckConstraints once every column is known, because a
+    // column-level CHECK may read a column declared after it.
+    let mut checks: Vec<(String, pg_query::protobuf::Node)> = Vec::new();
+    let mut fks: Vec<ForeignKey> = Vec::new();
+    let mut table_pk: Vec<String> = Vec::new();
     for el in &c.table_elts {
         match el.node.as_ref() {
             Some(N::ColumnDef(cd)) => {
@@ -1445,47 +1459,121 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                 let underlying = normalize_serial(&ty);
                 let pk = cd.constraints.iter().any(|c| {
                     matches!(c.node.as_ref(), Some(N::Constraint(k))
-                        if k.contype == pg_query::protobuf::ConstrType::ConstrPrimary as i32)
+                        if k.contype == CT::ConstrPrimary as i32)
                 });
                 let mut column = Column::new(&cd.colname, &underlying, pk);
                 // A serial column draws its default from a sequence named
-                // `<table>_<column>_seq`, as PostgreSQL names it.
+                // `<table>_<column>_seq`, as PostgreSQL names it -- and is
+                // NOT NULL, as PostgreSQL declares it.
                 if underlying != ty {
                     column.sequence = Some(format!("{table}_{}_seq", cd.colname));
+                    column.nullable = false;
                 }
-                // A literal DEFAULT is cast to the column's type now (a bad
-                // literal is an error at CREATE, as on PostgreSQL) and stored
-                // in the catalog. An expression default -- `now()`, arithmetic
-                // -- is refused rather than dropped: before this, every
-                // DEFAULT was silently ignored and the omitted column read
-                // NULL.
                 for k in &cd.constraints {
                     let Some(N::Constraint(k)) = k.node.as_ref() else {
                         continue;
                     };
-                    if k.contype != pg_query::protobuf::ConstrType::ConstrDefault as i32 {
-                        continue;
-                    }
-                    let Some(raw) = k.raw_expr.as_ref() else {
-                        continue;
-                    };
-                    let value = match const_value(raw, &[]) {
-                        Ok(v) => v,
-                        Err(Error::Unsupported(_)) => {
+                    match CT::try_from(k.contype) {
+                        Ok(CT::ConstrPrimary) => {}
+                        Ok(CT::ConstrNotnull) => column.nullable = false,
+                        Ok(CT::ConstrNull) => column.nullable = !pk,
+                        // A literal DEFAULT is cast to the column's type now
+                        // (a bad literal is an error at CREATE, as on
+                        // PostgreSQL) and stored in the catalog. An
+                        // expression default -- `now()`, arithmetic -- is
+                        // refused rather than dropped: before this, every
+                        // DEFAULT was silently ignored and the omitted column
+                        // read NULL.
+                        Ok(CT::ConstrDefault) => {
+                            let Some(raw) = k.raw_expr.as_ref() else {
+                                continue;
+                            };
+                            let value = match const_value(raw, &[]) {
+                                Ok(v) => v,
+                                Err(Error::Unsupported(_)) => {
+                                    return Err(Error::Unsupported(format!(
+                                        "a non-literal DEFAULT on column \"{}\"",
+                                        cd.colname
+                                    )));
+                                }
+                                Err(e) => return Err(e),
+                            };
+                            column.default = Some(cast_value(value, &underlying)?);
+                        }
+                        Ok(CT::ConstrCheck) => {
+                            let Some(raw) = k.raw_expr.as_ref() else {
+                                continue;
+                            };
+                            checks.push((k.conname.clone(), (**raw).clone()));
+                        }
+                        Ok(CT::ConstrForeign) => {
+                            fks.push(foreign_key_of(k, &table, vec![cd.colname.clone()])?);
+                        }
+                        // A column constraint's DEFERRABLE / INITIALLY
+                        // DEFERRED arrive as separate attribute constraints
+                        // after the constraint they qualify.
+                        Ok(CT::ConstrAttrDeferrable) => {
+                            if let Some(fk) = fks.last_mut() {
+                                fk.deferrable = true;
+                            }
+                        }
+                        Ok(CT::ConstrAttrNotDeferrable) => {
+                            if let Some(fk) = fks.last_mut() {
+                                fk.deferrable = false;
+                                fk.initially_deferred = false;
+                            }
+                        }
+                        Ok(CT::ConstrAttrDeferred) => {
+                            if let Some(fk) = fks.last_mut() {
+                                fk.deferrable = true;
+                                fk.initially_deferred = true;
+                            }
+                        }
+                        Ok(CT::ConstrAttrImmediate) => {
+                            if let Some(fk) = fks.last_mut() {
+                                fk.initially_deferred = false;
+                            }
+                        }
+                        // A column-level UNIQUE has never been enforced by
+                        // this server; keep accepting it (a recorded gap)
+                        // rather than start refusing tables that used to
+                        // create.
+                        Ok(CT::ConstrUnique) => {}
+                        _ => {
                             return Err(Error::Unsupported(format!(
-                                "a non-literal DEFAULT on column \"{}\"",
-                                cd.colname
+                                "constraint kind {} on column \"{}\"",
+                                k.contype, cd.colname
                             )));
                         }
-                        Err(e) => return Err(e),
-                    };
-                    column.default = Some(cast_value(value, &underlying)?);
+                    }
                 }
                 columns.push(column);
             }
+            Some(N::Constraint(k)) => match CT::try_from(k.contype) {
+                Ok(CT::ConstrCheck) => {
+                    let Some(raw) = k.raw_expr.as_ref() else {
+                        continue;
+                    };
+                    checks.push((k.conname.clone(), (**raw).clone()));
+                }
+                Ok(CT::ConstrForeign) => {
+                    let cols = string_list(&k.fk_attrs);
+                    fks.push(foreign_key_of(k, &table, cols)?);
+                }
+                Ok(CT::ConstrPrimary) => table_pk = string_list(&k.keys),
+                _ => return Err(Error::Unsupported(disc(el.node.as_ref().unwrap()))),
+            },
             Some(other) => return Err(Error::Unsupported(disc(other))),
             None => {}
         }
+    }
+    for name in &table_pk {
+        let col = columns
+            .iter_mut()
+            .find(|c| &c.name == name)
+            .ok_or_else(|| Error::UndefinedColumn(name.clone()))?;
+        col.pk = true;
+        col.nullable = false;
     }
     if columns.iter().filter(|c| c.pk).count() > 1 {
         // The stored form maps the PK onto `_id`, so exactly one column can be
@@ -1493,10 +1581,222 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
         // silently store only one of them.
         return Err(Error::Unsupported("a composite PRIMARY KEY".into()));
     }
-    Ok(Statement::CreateTable(
-        TableDef::new(&table, columns),
-        c.if_not_exists,
-    ))
+    let mut def = TableDef::new(&table, columns);
+    def.temp = temp;
+    // A self-referencing FOREIGN KEY reads this table's own PK, which is only
+    // settled now; a FK to another table is checked against the catalog by
+    // the server, which has it.
+    for fk in &mut fks {
+        if fk.ref_table == table {
+            resolve_fk_target(fk, &def)?;
+        }
+    }
+    let mut check_names: Vec<String> = fks.iter().map(|f| f.name.clone()).collect();
+    if def.columns.iter().any(|c| c.pk) {
+        check_names.push(format!("{table}_pkey"));
+    }
+    for (conname, raw) in checks {
+        // The predicate's SQL text is the catalog record (`(a > 0)`);
+        // planning it now surfaces an unknown column at CREATE.
+        let expression = check_expression_text(&raw)?;
+        plan_check_expression(&expression, &def)?;
+        let name = if conname.is_empty() {
+            // `<table>_<col>_check` when the predicate names exactly one
+            // column, `<table>_check` otherwise, with a counter to keep the
+            // name unique within the table (`ChooseConstraintName`).
+            let named = columns_referenced(&raw, &def);
+            let base = match named.as_slice() {
+                [one] => format!("{table}_{one}_check"),
+                _ => format!("{table}_check"),
+            };
+            let mut candidate = base.clone();
+            let mut n = 1;
+            while check_names.contains(&candidate) {
+                candidate = format!("{base}{n}");
+                n += 1;
+            }
+            candidate
+        } else {
+            conname
+        };
+        check_names.push(name.clone());
+        def.check_constraints.push(CheckConstraint { name, expression });
+    }
+    // PostgreSQL evaluates CHECK constraints in name order.
+    def.check_constraints.sort_by(|a, b| a.name.cmp(&b.name));
+    def.foreign_keys = fks;
+    Ok(Statement::CreateTable(def, c.if_not_exists))
+}
+
+/// The SQL text of a CHECK predicate, as `pg_get_constraintdef` renders it:
+/// an operator expression is parenthesised (`(c > 0)`), a bare constant or
+/// call is not (`true`). pg_query deparses only whole statements, so the
+/// expression rides in a SELECT list and the keyword is stripped.
+fn check_expression_text(raw: &pg_query::protobuf::Node) -> Result<String> {
+    let select = N::SelectStmt(Box::new(pg_query::protobuf::SelectStmt {
+        target_list: vec![pg_query::protobuf::Node {
+            node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+                name: String::new(),
+                indirection: vec![],
+                val: Some(Box::new(raw.clone())),
+                location: 0,
+            }))),
+        }],
+        limit_option: pg_query::protobuf::LimitOption::Default as i32,
+        op: pg_query::protobuf::SetOperation::SetopNone as i32,
+        ..Default::default()
+    }));
+    let text = select.deparse().map_err(|e| Error::Parse(e.to_string()))?;
+    let text = text.strip_prefix("SELECT ").unwrap_or(&text).to_string();
+    Ok(match raw.node.as_ref() {
+        Some(N::AExpr(_) | N::BoolExpr(_) | N::NullTest(_) | N::BooleanTest(_)) => {
+            format!("({text})")
+        }
+        _ => text,
+    })
+}
+
+/// The `String` nodes of a name list, as strings.
+fn string_list(nodes: &[pg_query::protobuf::Node]) -> Vec<String> {
+    nodes
+        .iter()
+        .filter_map(|n| match n.node.as_ref()? {
+            N::String(s) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Which of `def`'s columns `node` references, in column order. Each column
+/// is probed the way `references_columns` probes for any: rewriting against
+/// every field but that one fails on exactly that column iff it is named.
+fn columns_referenced(node: &pg_query::protobuf::Node, def: &TableDef) -> Vec<String> {
+    let all: Vec<RowField> = def
+        .columns
+        .iter()
+        .map(|c| (c.name.clone(), c.field(), c.pg_type.clone()))
+        .collect();
+    def.columns
+        .iter()
+        .filter(|c| {
+            let others: Vec<RowField> = all.iter().filter(|f| f.0 != c.name).cloned().collect();
+            let mut probe = node.clone();
+            matches!(rewrite_column_refs(&mut probe, &others, 0),
+                Err(Error::UndefinedColumn(n)) if n == c.name)
+        })
+        .map(|c| c.name.clone())
+        .collect()
+}
+
+/// A FOREIGN KEY constraint from its parse node. `columns` are the
+/// referencing columns (the column itself for a column constraint, the
+/// `FOREIGN KEY (...)` list for a table constraint). The referenced columns
+/// are left empty when the user named none -- they default to the referenced
+/// table's PRIMARY KEY, which the server resolves against its catalog.
+fn foreign_key_of(
+    k: &pg_query::protobuf::Constraint,
+    table: &str,
+    columns: Vec<String>,
+) -> Result<ForeignKey> {
+    let ref_table = k
+        .pktable
+        .as_ref()
+        .map(|r| r.relname.clone())
+        .ok_or_else(|| Error::Parse("REFERENCES without a table".into()))?;
+    let ref_columns = string_list(&k.pk_attrs);
+    if !ref_columns.is_empty() && ref_columns.len() != columns.len() {
+        return Err(Error::InvalidForeignKey(
+            "number of referencing and referenced columns for foreign key disagree".into(),
+        ));
+    }
+    if columns.len() != 1 {
+        return Err(Error::Unsupported("a multi-column FOREIGN KEY".into()));
+    }
+    // PostgreSQL's one-letter action codes (`parsenodes.h`).
+    let action = |code: &str| -> Result<Option<String>> {
+        Ok(match code {
+            "a" | "" => None,
+            "r" => Some("RESTRICT".to_string()),
+            "c" => Some("CASCADE".to_string()),
+            "n" => Some("SET NULL".to_string()),
+            "d" => return Err(Error::Unsupported("a FOREIGN KEY with SET DEFAULT".into())),
+            other => return Err(Error::Parse(format!("unknown referential action {other:?}"))),
+        })
+    };
+    let on_delete = action(&k.fk_del_action)?;
+    let on_update = action(&k.fk_upd_action)?;
+    let name = if k.conname.is_empty() {
+        format!("{table}_{}_fkey", columns.join("_"))
+    } else {
+        k.conname.clone()
+    };
+    Ok(ForeignKey {
+        name,
+        columns,
+        ref_table,
+        ref_columns,
+        on_delete,
+        on_update,
+        deferrable: k.deferrable,
+        initially_deferred: k.initdeferred,
+    })
+}
+
+/// Settle a FOREIGN KEY's referenced columns against the referenced table's
+/// definition: an empty list defaults to its PRIMARY KEY, and the named
+/// column must BE that key (this server has no other unique constraint to
+/// reference) -- PostgreSQL's 42830 otherwise.
+pub fn resolve_fk_target(fk: &mut ForeignKey, target: &TableDef) -> Result<()> {
+    let pk = target.columns.iter().find(|c| c.pk);
+    if fk.ref_columns.is_empty() {
+        let pk = pk.ok_or_else(|| {
+            Error::InvalidForeignKey(format!(
+                "there is no primary key for referenced table \"{}\"",
+                target.name
+            ))
+        })?;
+        fk.ref_columns = vec![pk.name.clone()];
+        return Ok(());
+    }
+    for col in &fk.ref_columns {
+        if target.column(col).is_none() {
+            return Err(Error::UndefinedColumn(col.clone()));
+        }
+    }
+    match pk {
+        Some(pk) if fk.ref_columns == [pk.name.clone()] => Ok(()),
+        _ => Err(Error::InvalidForeignKey(format!(
+            "there is no unique constraint matching given keys for referenced table \"{}\"",
+            target.name
+        ))),
+    }
+}
+
+/// Plan a CHECK constraint's predicate text over `def`'s columns as a row
+/// expression. `apply_row_expr` then evaluates it per row: `false` is a
+/// violation; `true` and NULL pass (SQL's CHECK rule).
+pub fn plan_check_expression(expression: &str, def: &TableDef) -> Result<ColumnExpr> {
+    let N::SelectStmt(sel) = parse_one(&format!("SELECT {expression}"))? else {
+        return Err(Error::Parse("CHECK expression is not an expression".into()));
+    };
+    let val = sel
+        .target_list
+        .first()
+        .and_then(|t| match t.node.as_ref() {
+            Some(N::ResTarget(rt)) => rt.val.as_deref(),
+            _ => None,
+        })
+        .ok_or_else(|| Error::Parse("CHECK expression is not an expression".into()))?;
+    let fields: Vec<RowField> = def
+        .columns
+        .iter()
+        .map(|c| (c.name.clone(), c.field(), c.pg_type.clone()))
+        .collect();
+    let mut sample = Document::new();
+    for c in &def.columns {
+        sample.insert(c.field(), sample_value_for_type(&c.pg_type));
+    }
+    row_column_expr(val, &fields, &[], &sample)
 }
 
 fn plan_insert(
