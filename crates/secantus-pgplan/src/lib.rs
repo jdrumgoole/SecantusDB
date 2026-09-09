@@ -302,6 +302,31 @@ pub struct Insert {
     pub table: String,
     /// One document per row, already keyed by stored FIELD (PK as `_id`).
     pub rows: Vec<Document>,
+    /// `RETURNING ...`: the output columns and their expressions, planned
+    /// over the table exactly as a SELECT's target list is. `None` when the
+    /// statement returns no rows.
+    pub returning: Option<Returning>,
+    /// `INSERT ... SELECT ...`: the query whose rows are written, planned as
+    /// the same SELECT would be on its own. The executor evaluates it, shapes
+    /// each row through `insert_row` over `targets`, and appends to `rows`.
+    /// `None` for a `VALUES` insert, whose rows are already in `rows`.
+    pub source: Option<Box<Statement>>,
+    /// The columns being written, in the order the source's columns map onto
+    /// them -- the explicit column list, or every column in declared order.
+    pub targets: Vec<String>,
+    /// Whether the statement named its columns. Without a list a short row
+    /// leaves the trailing columns to their defaults (`insert into t(a, b)
+    /// select 1` is an error; `insert into t select 1` writes `b` NULL).
+    pub explicit_columns: bool,
+}
+
+/// The projection a `RETURNING` clause applies to each written row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Returning {
+    /// Output columns in order, as (output name, stored field).
+    pub columns: Vec<(String, String)>,
+    /// A computed expression per output column, parallel to `columns`.
+    pub casts: Vec<Option<ColumnExpr>>,
 }
 
 /// Where SQL puts NULLs in an ORDER BY.
@@ -648,13 +673,14 @@ pub enum ColumnExpr {
     /// `i::int4`, `i * 2`. Every column reference in `expr` was rewritten at
     /// plan time into a parameter numbered PAST the statement's own, so the
     /// constant evaluator runs it unchanged over `params ++ row values`;
-    /// `fields` names and types the row values in that order (the types are
-    /// declared as the parameters' when the expression runs, so `pg_typeof(i)`
-    /// answers the column's declared type). `result_type` is fixed at plan
+    /// `fields` lists the row values in that order as (column name, stored
+    /// field, type): the field is what the row is read by, and the type is
+    /// declared as the parameter's when the expression runs, so `pg_typeof(i)`
+    /// answers the column's declared type. `result_type` is fixed at plan
     /// time for the DESCRIBE pass.
     Row {
         expr: Box<pg_query::protobuf::Node>,
-        fields: Vec<(String, String)>,
+        fields: Vec<RowField>,
         params: Vec<Bson>,
         result_type: String,
     },
@@ -688,6 +714,10 @@ pub enum ConstCol {
     /// pg_terminate_backend(pg_backend_pid())`), all of which the server
     /// resolves at execution.
     TerminateBackend(Box<ConstCol>),
+    /// `pg_sleep(seconds)` -- the argument is already cast to `float8` (or
+    /// NULL). The sleep happens at execution, on the connection's own thread,
+    /// so it costs the caller exactly the wait PostgreSQL would.
+    Sleep(Bson),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -718,6 +748,10 @@ pub struct SelectConstant {
     /// for no modifier. It is DESCRIPTION metadata that clients turn into
     /// `precision` / `scale` / `display_size`; it never affects the value.
     pub columns: Vec<(String, ConstCol, String, i32)>,
+    /// Whether the (constant) WHERE clause admits the one row. `select 1
+    /// where false` is ZERO rows in PostgreSQL; before this was carried, the
+    /// predicate was ignored and the row answered anyway.
+    pub where_true: bool,
 }
 
 /// The three wire formats a COPY can use. They are not interchangeable: text
@@ -1303,12 +1337,46 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                 // the underlying integer type (plus an implicit sequence
                 // default). We store the integer type so the column reads and
                 // writes as `int4`/`int8`/`int2` on the wire and through COPY.
-                let ty = normalize_serial(&ty);
+                let underlying = normalize_serial(&ty);
                 let pk = cd.constraints.iter().any(|c| {
                     matches!(c.node.as_ref(), Some(N::Constraint(k))
                         if k.contype == pg_query::protobuf::ConstrType::ConstrPrimary as i32)
                 });
-                columns.push(Column::new(&cd.colname, &ty, pk));
+                let mut column = Column::new(&cd.colname, &underlying, pk);
+                // A serial column draws its default from a sequence named
+                // `<table>_<column>_seq`, as PostgreSQL names it.
+                if underlying != ty {
+                    column.sequence = Some(format!("{table}_{}_seq", cd.colname));
+                }
+                // A literal DEFAULT is cast to the column's type now (a bad
+                // literal is an error at CREATE, as on PostgreSQL) and stored
+                // in the catalog. An expression default -- `now()`, arithmetic
+                // -- is refused rather than dropped: before this, every
+                // DEFAULT was silently ignored and the omitted column read
+                // NULL.
+                for k in &cd.constraints {
+                    let Some(N::Constraint(k)) = k.node.as_ref() else {
+                        continue;
+                    };
+                    if k.contype != pg_query::protobuf::ConstrType::ConstrDefault as i32 {
+                        continue;
+                    }
+                    let Some(raw) = k.raw_expr.as_ref() else {
+                        continue;
+                    };
+                    let value = match const_value(raw, &[]) {
+                        Ok(v) => v,
+                        Err(Error::Unsupported(_)) => {
+                            return Err(Error::Unsupported(format!(
+                                "a non-literal DEFAULT on column \"{}\"",
+                                cd.colname
+                            )));
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    column.default = Some(cast_value(value, &underlying)?);
+                }
+                columns.push(column);
             }
             Some(other) => return Err(Error::Unsupported(disc(other))),
             None => {}
@@ -1358,36 +1426,85 @@ fn plan_insert(
 
     let sel = match i.select_stmt.as_ref().and_then(|s| s.node.as_ref()) {
         Some(N::SelectStmt(s)) => s,
-        _ => return Err(Error::Unsupported("INSERT without VALUES".into())),
+        _ => return Err(Error::Unsupported("INSERT DEFAULT VALUES".into())),
     };
     let mut rows = Vec::new();
+    // `INSERT ... SELECT`: the query is planned whole and evaluated by the
+    // executor, which has the storage. Before this it was silently treated
+    // as an empty VALUES list -- `INSERT 0 0`, nothing written, no error.
+    let source = if sel.values_lists.is_empty() {
+        Some(Box::new(plan_select(sel, lookup, params)?))
+    } else {
+        None
+    };
     for vl in &sel.values_lists {
         let items = match vl.node.as_ref() {
             Some(N::List(l)) => &l.items,
             _ => return Err(Error::Unsupported("this VALUES form".into())),
         };
-        if items.len() != targets.len() {
-            return Err(Error::Unsupported(
-                "a VALUES row whose width differs from the column list".into(),
-            ));
-        }
-        let mut d = Document::new();
-        for (col, item) in targets.iter().zip(items) {
-            let column = def.column(col).expect("checked above");
-            // PostgreSQL coerces an assigned value to the column's type, so
-            // `INSERT INTO t(d) VALUES ('2026-9-1')` STORES `2026-09-01`.
-            // Without this the literal went in verbatim and a client reading
-            // the column back could not parse it as a date.
-            let value = cast_value(const_value(item, params)?, &column.pg_type)?;
-            // Resolves the hidden companion (setting or CLEARING it), so a
-            // whole-millisecond write cannot inherit stale microseconds.
-            let field = column.field();
-            let stored = carry_subms(&mut d, &field, value);
-            d.insert(field, stored);
-        }
-        rows.push(d);
+        let values = items
+            .iter()
+            .map(|item| const_value(item, params))
+            .collect::<Result<Vec<_>>>()?;
+        rows.push(insert_row(&def, &targets, !i.cols.is_empty(), values)?);
     }
-    Ok(Statement::Insert(Insert { table, rows }))
+    let returning = if i.returning_list.is_empty() {
+        None
+    } else {
+        let (columns, casts) = plan_table_targets(&i.returning_list, &def, params)?;
+        Some(Returning { columns, casts })
+    };
+    Ok(Statement::Insert(Insert {
+        table,
+        rows,
+        returning,
+        source,
+        targets,
+        explicit_columns: !i.cols.is_empty(),
+    }))
+}
+
+/// Shape one row of values into the document an INSERT stores, `values`
+/// mapping positionally onto `targets` (columns of `def`).
+///
+/// A width mismatch is PostgreSQL's 42601 (probed PG 16: `insert into t
+/// select 1, 2, 3` over a two-column table is "INSERT has more expressions
+/// than target columns"; a short row is the mirror message only when the
+/// columns were named -- an unnamed list leaves the trailing columns to
+/// their defaults, so `insert into t select 1` writes the rest NULL).
+pub fn insert_row(
+    def: &TableDef,
+    targets: &[String],
+    explicit_columns: bool,
+    values: Vec<Bson>,
+) -> Result<Document> {
+    if values.len() > targets.len() {
+        return Err(Error::Parse(
+            "INSERT has more expressions than target columns".into(),
+        ));
+    }
+    if values.len() < targets.len() && explicit_columns {
+        return Err(Error::Parse(
+            "INSERT has more target columns than expressions".into(),
+        ));
+    }
+    let mut d = Document::new();
+    for (col, value) in targets.iter().zip(values) {
+        let column = def
+            .column(col)
+            .ok_or_else(|| Error::UndefinedColumn(col.clone()))?;
+        // PostgreSQL coerces an assigned value to the column's type, so
+        // `INSERT INTO t(d) VALUES ('2026-9-1')` STORES `2026-09-01`.
+        // Without this the literal went in verbatim and a client reading
+        // the column back could not parse it as a date.
+        let value = cast_value(value, &column.pg_type)?;
+        // Resolves the hidden companion (setting or CLEARING it), so a
+        // whole-millisecond write cannot inherit stale microseconds.
+        let field = column.field();
+        let stored = carry_subms(&mut d, &field, value);
+        d.insert(field, stored);
+    }
+    Ok(d)
 }
 
 /// Does this target list contain an aggregate call?
@@ -1579,7 +1696,11 @@ fn plan_series_select(
                 } else {
                     rt.name.clone()
                 };
-                let fields = vec![(series.column.clone(), "int4".to_string())];
+                let fields = vec![(
+                    series.column.clone(),
+                    series.column.clone(),
+                    "int4".to_string(),
+                )];
                 // The series' first value is a real row to type the
                 // expression from: a scalar call is typed by its result.
                 let mut sample = Document::new();
@@ -1657,11 +1778,25 @@ fn plan_series_select(
 fn expression_column_name(node: &pg_query::protobuf::Node) -> String {
     match node.node.as_ref() {
         Some(N::ColumnRef(c)) => column_ref_name(c).unwrap_or_else(|| "?column?".to_string()),
-        Some(N::TypeCast(tc)) => tc
-            .arg
-            .as_deref()
-            .map(expression_column_name)
-            .unwrap_or_else(|| "?column?".to_string()),
+        // A cast keeps a column's or a call's name (`id::int8` is `id`,
+        // `abs(n)::int8` is `abs`) and otherwise takes the TARGET type's bare
+        // name: `(1 + 2)::int8` is `int8`, `x::varchar(3)` is `varchar`.
+        // Nested casts resolve from the inside: `(id::text)::int8` is still
+        // `id`, and `('1'::text)::int8` is the OUTER type, `int8`.
+        Some(N::TypeCast(tc)) => {
+            let inner = tc.arg.as_deref();
+            let strong = inner.is_some_and(cast_source_names_column);
+            let inner_name = inner.map(expression_column_name);
+            match inner_name {
+                Some(n) if strong => n,
+                _ => tc
+                    .type_name
+                    .as_ref()
+                    .and_then(|t| t.names.last())
+                    .and_then(type_name_of_node)
+                    .unwrap_or_else(|| "?column?".to_string()),
+            }
+        }
         Some(N::FuncCall(f)) => f
             .funcname
             .last()
@@ -1674,8 +1809,23 @@ fn expression_column_name(node: &pg_query::protobuf::Node) -> String {
     }
 }
 
-/// Build a `ColumnExpr::Row` for an expression over the row's `fields`
-/// (`(name, pg_type)`), given the statement's own `params`.
+/// Does this cast source name its column -- a column reference or a call,
+/// through any number of casts? (PostgreSQL's `FigureColname` strength 2.)
+fn cast_source_names_column(node: &pg_query::protobuf::Node) -> bool {
+    match node.node.as_ref() {
+        Some(N::ColumnRef(_)) | Some(N::FuncCall(_)) => true,
+        Some(N::TypeCast(tc)) => tc.arg.as_deref().is_some_and(cast_source_names_column),
+        _ => false,
+    }
+}
+
+/// One row column an expression can reference: (column name, stored field,
+/// PostgreSQL type). A generated source names its field as its column; a
+/// table's PK column is stored as `_id`.
+pub type RowField = (String, String, String);
+
+/// Build a `ColumnExpr::Row` for an expression over the row's `fields`,
+/// given the statement's own `params`.
 ///
 /// Every column reference is rewritten into a parameter reference numbered
 /// past the statement's parameters, and the result type is inferred with the
@@ -1683,7 +1833,7 @@ fn expression_column_name(node: &pg_query::protobuf::Node) -> String {
 /// for an `int4` column types as one.
 fn row_column_expr(
     node: &pg_query::protobuf::Node,
-    fields: &[(String, String)],
+    fields: &[RowField],
     params: &[Bson],
     sample: &Document,
 ) -> Result<ColumnExpr> {
@@ -1713,7 +1863,7 @@ fn row_column_expr(
 /// `42703`. Walks the expression node kinds the constant evaluator handles.
 fn rewrite_column_refs(
     node: &mut pg_query::protobuf::Node,
-    fields: &[(String, String)],
+    fields: &[RowField],
     n_params: usize,
 ) -> Result<()> {
     let Some(inner) = node.node.as_mut() else {
@@ -1725,7 +1875,7 @@ fn rewrite_column_refs(
                 column_ref_name(c).ok_or_else(|| Error::Unsupported("this column".into()))?;
             let idx = fields
                 .iter()
-                .position(|(f, _)| *f == name)
+                .position(|(f, _, _)| *f == name)
                 .ok_or_else(|| Error::UndefinedColumn(name.clone()))?;
             let number = i32::try_from(n_params + 1 + idx)
                 .map_err(|_| Error::Unsupported("this many columns".into()))?;
@@ -1817,7 +1967,7 @@ pub fn apply_row_expr(expr: &ColumnExpr, row: &Document) -> Result<Bson> {
     all.extend(
         fields
             .iter()
-            .map(|(f, _)| row.get(f).cloned().unwrap_or(Bson::Null)),
+            .map(|(_, f, _)| row.get(f).cloned().unwrap_or(Bson::Null)),
     );
     let previous = declare_row_fields(params.len(), fields);
     let out = const_value(expr, &all);
@@ -1828,10 +1978,10 @@ pub fn apply_row_expr(expr: &ColumnExpr, row: &Document) -> Result<Bson> {
 /// Declare a row's fields as the parameter types numbered past the
 /// statement's own `n_params`, returning the previous declarations so the
 /// caller can restore them.
-fn declare_row_fields(n_params: usize, fields: &[(String, String)]) -> Vec<Option<String>> {
+fn declare_row_fields(n_params: usize, fields: &[RowField]) -> Vec<Option<String>> {
     let mut types = PLAN_PARAM_TYPES.with(|t| t.borrow().clone());
     types.resize(n_params, None);
-    types.extend(fields.iter().map(|(_, t)| Some(t.clone())));
+    types.extend(fields.iter().map(|(_, _, t)| Some(t.clone())));
     PLAN_PARAM_TYPES.with(|t| t.replace(types))
 }
 
@@ -1871,42 +2021,20 @@ fn cast_chain_over_column(tc: &pg_query::protobuf::TypeCast) -> Result<(String, 
     }
 }
 
-fn plan_select(
-    s: &pg_query::protobuf::SelectStmt,
-    lookup: &dyn Fn(&str) -> Option<TableDef>,
-    params: &[Bson],
-) -> Result<Statement> {
-    if s.from_clause.is_empty() {
-        return plan_select_constant(s, params);
-    }
-    if !s.group_clause.is_empty() || has_aggregate(s) {
-        return plan_aggregate(s, lookup, params);
-    }
-    if s.from_clause.len() != 1 {
-        return Err(Error::Unsupported(
-            "a SELECT that is not from one table".into(),
-        ));
-    }
-    // A set-returning function stands in for the table.
-    if let Some(series) = series_from_clause(&s.from_clause[0], params)? {
-        return plan_series_select(s, series, params);
-    }
-    // A top-level JOIN stands in for the table -- `FROM a JOIN b ON ...` in a
-    // plain (non-aggregate) select, which is `RangeInfo.fetch`'s shape.
-    if matches!(s.from_clause[0].node.as_ref(), Some(N::JoinExpr(_))) {
-        let join = plan_join_select(s, lookup, params)?;
-        return plan_join_plain_select(s, join, lookup, params);
-    }
-    let table = match s.from_clause[0].node.as_ref() {
-        Some(N::RangeVar(r)) => r.relname.clone(),
-        Some(other) => return Err(Error::Unsupported(disc(other))),
-        None => return Err(Error::Parse("empty FROM".into())),
-    };
-    let def = lookup(&table).ok_or_else(|| Error::UndefinedTable(table.clone()))?;
+/// A planned target list over one table's rows: the (output name, stored
+/// field) pairs and the per-column expression.
+type TableTargets = (Vec<(String, String)>, Vec<Option<ColumnExpr>>);
 
+/// Plan a target list over one table's rows -- the shape both a SELECT's
+/// select list and an INSERT's RETURNING list take.
+fn plan_table_targets(
+    target_list: &[pg_query::protobuf::Node],
+    def: &TableDef,
+    params: &[Bson],
+) -> Result<TableTargets> {
     let mut columns: Vec<(String, String)> = Vec::new();
     let mut casts: Vec<Option<ColumnExpr>> = Vec::new();
-    for t in &s.target_list {
+    for t in target_list {
         let rt = match t.node.as_ref() {
             Some(N::ResTarget(rt)) => rt,
             Some(other) => return Err(Error::Unsupported(disc(other))),
@@ -1917,13 +2045,15 @@ fn plan_select(
             // client's type-discovery query reads the catalog
             // (`oid::regtype::text AS regtype`). Chained casts flatten into
             // the last one applied to the innermost column.
-            Some(N::TypeCast(tc)) => {
+            Some(N::TypeCast(tc)) if cast_chain_over_column(tc).is_ok() => {
                 let (col_name, chain) = cast_chain_over_column(tc)?;
                 let field = def
                     .field_of(&col_name)
                     .ok_or_else(|| Error::UndefinedColumn(col_name.clone()))?;
+                // A cast of a column keeps the column's name: `id::int8` is
+                // `id` on PostgreSQL, not `int8`.
                 let out = if rt.name.is_empty() {
-                    chain.last().cloned().unwrap_or_else(|| col_name.clone())
+                    col_name.clone()
                 } else {
                     rt.name.clone()
                 };
@@ -1938,28 +2068,11 @@ fn plan_select(
             Some(N::FuncCall(f))
                 if func_name(f)
                     .as_deref()
-                    .is_some_and(|n| scalar::is_scalar(n) || n == "regexp_replace") =>
+                    .is_some_and(|n| scalar::is_scalar(n) || n == "regexp_replace")
+                    && single_column_call(f, params).is_some() =>
             {
                 let name = func_name(f).expect("checked");
-                let mut args: Vec<Option<Bson>> = Vec::new();
-                let mut column: Option<String> = None;
-                for a in &f.args {
-                    if let Some(N::ColumnRef(c)) = a.node.as_ref() {
-                        if column.is_some() {
-                            return Err(Error::Unsupported(
-                                "a scalar call over two columns".into(),
-                            ));
-                        }
-                        let col = column_ref_name(c)
-                            .ok_or_else(|| Error::Unsupported("this call target".into()))?;
-                        column = Some(col);
-                        args.push(None);
-                        continue;
-                    }
-                    args.push(Some(const_value(a, params)?));
-                }
-                let column =
-                    column.ok_or_else(|| Error::Unsupported("a call with no column".into()))?;
+                let (column, args) = single_column_call(f, params).expect("checked");
                 let field = def
                     .field_of(&column)
                     .ok_or_else(|| Error::UndefinedColumn(column.clone()))?;
@@ -2015,10 +2128,113 @@ fn plan_select(
                 columns.push((out.clone(), out));
                 casts.push(Some(ColumnExpr::Const { value, result_type }));
             }
-            Some(other) => return Err(Error::Unsupported(disc(other))),
+            // Anything else is an expression over the row -- `id + 1`,
+            // `abs(n)`, `(a, b)`: the column references are rewritten into
+            // parameters and the constant evaluator runs it per row.
+            Some(_) => {
+                let val = rt.val.as_ref().expect("ResTarget has a val");
+                let out = if rt.name.is_empty() {
+                    expression_column_name(val)
+                } else {
+                    rt.name.clone()
+                };
+                let fields: Vec<RowField> = def
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.field(), c.pg_type.clone()))
+                    .collect();
+                // A sample row typed from the columns' declared types stands
+                // in for a real one, so a scalar call is typed by its result.
+                let mut sample = Document::new();
+                for c in &def.columns {
+                    sample.insert(c.field(), sample_value_for_type(&c.pg_type));
+                }
+                let row = row_column_expr(val, &fields, params, &sample)?;
+                let field = def
+                    .columns
+                    .first()
+                    .map(|c| c.field())
+                    .unwrap_or_else(|| out.clone());
+                columns.push((out, field));
+                casts.push(Some(row));
+            }
             None => return Err(Error::Unsupported("an empty target".into())),
         }
     }
+    Ok((columns, casts))
+}
+
+/// A representative value of a PostgreSQL type, for typing an expression
+/// over a row before any row exists: the constant evaluator's result over
+/// these is what `static_type` reads a scalar call's type from.
+/// The one column and the constant arguments of a scalar call shaped
+/// `f(col, const, ...)` -- `None` for any other shape (two columns, no
+/// column, a nested expression), which the row-expression path handles.
+fn single_column_call(
+    f: &pg_query::protobuf::FuncCall,
+    params: &[Bson],
+) -> Option<(String, Vec<Option<Bson>>)> {
+    let mut args: Vec<Option<Bson>> = Vec::new();
+    let mut column: Option<String> = None;
+    for a in &f.args {
+        if let Some(N::ColumnRef(c)) = a.node.as_ref() {
+            if column.is_some() {
+                return None;
+            }
+            column = Some(column_ref_name(c)?);
+            args.push(None);
+            continue;
+        }
+        args.push(Some(const_value(a, params).ok()?));
+    }
+    Some((column?, args))
+}
+
+fn sample_value_for_type(pg_type: &str) -> Bson {
+    match pg_type {
+        "int2" | "int4" => Bson::Int32(1),
+        "int8" => Bson::Int64(1),
+        "float4" | "float8" => Bson::Double(1.0),
+        "bool" => Bson::Boolean(true),
+        "text" | "varchar" | "bpchar" | "name" => Bson::String(String::new()),
+        _ => Bson::Null,
+    }
+}
+
+fn plan_select(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Result<Statement> {
+    if s.from_clause.is_empty() {
+        return plan_select_constant(s, params);
+    }
+    if !s.group_clause.is_empty() || has_aggregate(s) {
+        return plan_aggregate(s, lookup, params);
+    }
+    if s.from_clause.len() != 1 {
+        return Err(Error::Unsupported(
+            "a SELECT that is not from one table".into(),
+        ));
+    }
+    // A set-returning function stands in for the table.
+    if let Some(series) = series_from_clause(&s.from_clause[0], params)? {
+        return plan_series_select(s, series, params);
+    }
+    // A top-level JOIN stands in for the table -- `FROM a JOIN b ON ...` in a
+    // plain (non-aggregate) select, which is `RangeInfo.fetch`'s shape.
+    if matches!(s.from_clause[0].node.as_ref(), Some(N::JoinExpr(_))) {
+        let join = plan_join_select(s, lookup, params)?;
+        return plan_join_plain_select(s, join, lookup, params);
+    }
+    let table = match s.from_clause[0].node.as_ref() {
+        Some(N::RangeVar(r)) => r.relname.clone(),
+        Some(other) => return Err(Error::Unsupported(disc(other))),
+        None => return Err(Error::Parse("empty FROM".into())),
+    };
+    let def = lookup(&table).ok_or_else(|| Error::UndefinedTable(table.clone()))?;
+
+    let (columns, casts) = plan_table_targets(&s.target_list, &def, params)?;
 
     let filter = match s.where_clause.as_ref() {
         None => Document::new(),
@@ -3480,6 +3696,27 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
     if let Some(stmt) = plan_select_srf(s, params)? {
         return Ok(stmt);
     }
+    // With no FROM there is nothing for a WHERE to range over: it is a
+    // constant predicate that keeps or drops the single row. A non-boolean
+    // is 42804, worded as PostgreSQL words it (probed PG 16).
+    let where_true = match s.where_clause.as_ref() {
+        None => true,
+        Some(w) => match const_value(w, params)? {
+            Bson::Boolean(b) => b,
+            Bson::Null => false,
+            // A bare string literal is of UNKNOWN type and is read as a
+            // boolean: `where 'x'` is 22P02, not 42804.
+            Bson::String(text) if matches!(w.node.as_ref(), Some(N::AConst(_))) => {
+                matches!(cast_value(Bson::String(text), "bool")?, Bson::Boolean(true))
+            }
+            other => {
+                return Err(Error::DatatypeMismatch(format!(
+                    "argument of WHERE must be type boolean, not type {}",
+                    display_type(&static_type(w, &other))
+                )));
+            }
+        },
+    };
     let mut columns: Vec<(String, ConstCol, String, i32)> = Vec::new();
     for t in &s.target_list {
         let Some(N::ResTarget(rt)) = t.node.as_ref() else {
@@ -3675,6 +3912,29 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                     ));
                     continue;
                 }
+                // `pg_sleep(seconds)`: a `void` column (oid 2278) rendered as
+                // the empty string; the wait itself belongs to execution, not
+                // planning (a DESCRIBE must not sleep). Probed PG 16.
+                if name == "pg_sleep" {
+                    if f.args.len() != 1 {
+                        return Err(Error::Unsupported(format!(
+                            "pg_sleep() with {} arguments",
+                            f.args.len()
+                        )));
+                    }
+                    let seconds = cast_value(const_value(&f.args[0], params)?, "float8")?;
+                    columns.push((
+                        if rt.name.is_empty() {
+                            "pg_sleep".to_string()
+                        } else {
+                            rt.name.clone()
+                        },
+                        ConstCol::Sleep(seconds),
+                        "void".to_string(),
+                        -1,
+                    ));
+                    continue;
+                }
                 // `pg_backend_pid()` and `pg_terminate_backend(pid)` need the
                 // connection's identity, which the stateless planner does not
                 // have -- they become `ConstCol`s the server resolves.
@@ -3776,7 +4036,10 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
         };
         columns.push((out, value, pg_type, typmod));
     }
-    Ok(Statement::SelectConstant(SelectConstant { columns }))
+    Ok(Statement::SelectConstant(SelectConstant {
+        columns,
+        where_true,
+    }))
 }
 
 /// `DROP TABLE`. Other DROP targets (index, view, schema) stay unsupported --
@@ -5309,7 +5572,7 @@ pub fn apply_column_expr(expr: &ColumnExpr, value: Bson, tz: &TimeZoneSetting) -
         // that has only the one value.
         ColumnExpr::Row { fields, .. } => {
             let mut row = Document::new();
-            if let Some((f, _)) = fields.first() {
+            if let Some((_, f, _)) = fields.first() {
                 row.insert(f.clone(), value);
             }
             apply_row_expr(expr, &row)
@@ -6259,6 +6522,10 @@ fn array_rectangular(items: &[Bson]) -> bool {
     subs.iter().all(|a| a.len() == len0) && subs.iter().all(|a| array_rectangular(a))
 }
 
+/// The marker `ArrayParser` raises for a structurally broken literal, which
+/// `parse_array` turns into the 22P02 the whole text earns.
+const STRUCTURAL: &str = "unexpected";
+
 fn parse_array(text: &str, element_type: &str) -> Result<Bson> {
     let malformed = || Error::InvalidText(format!("malformed array literal: \"{text}\""));
     let mut p = ArrayParser {
@@ -6298,7 +6565,13 @@ fn parse_array(text: &str, element_type: &str) -> Result<Bson> {
     if p.peek() != Some('{') {
         return Err(malformed());
     }
-    let items = p.parse_braced().map_err(|_| malformed())?;
+    // A structural failure is the array's own 22P02; an element that fails
+    // to parse keeps its type's error (`'{"[5,1]"}'::int4range[]` is the
+    // range's 22000 on PostgreSQL, not "malformed array literal").
+    let items = p.parse_braced().map_err(|e| match e {
+        Error::InvalidText(ref m) if m == STRUCTURAL => malformed(),
+        other => other,
+    })?;
     p.skip_space();
     if p.pos != p.chars.len() {
         return Err(malformed());
@@ -6372,7 +6645,7 @@ impl ArrayParser<'_> {
     /// Parse `{ ... }` with the cursor on the opening brace, leaving it just
     /// past the closing one.
     fn parse_braced(&mut self) -> Result<Vec<Bson>> {
-        let unexpected = || Error::InvalidText("unexpected".into());
+        let unexpected = || Error::InvalidText(STRUCTURAL.into());
         self.pos += 1; // the `{`
         let mut items = Vec::new();
         self.skip_space();
@@ -6409,7 +6682,7 @@ impl ArrayParser<'_> {
     /// One scalar element, quoted or not, with the cursor on its first
     /// character.
     fn parse_element(&mut self) -> Result<Bson> {
-        let unexpected = || Error::InvalidText("unexpected".into());
+        let unexpected = || Error::InvalidText(STRUCTURAL.into());
         let mut raw = String::new();
         let mut was_quoted = false;
         // Whitespace inside an unquoted element is kept when more content

@@ -292,6 +292,10 @@ pub type SendableCopyDataStream = Pin<Box<dyn Stream<Item = PgWireResult<CopyDat
 #[non_exhaustive]
 pub struct QueryResponse {
     pub command_tag: String,
+    /// Whether the CommandComplete tag carries the row count. `SELECT n`,
+    /// `INSERT 0 n` and `FETCH n` do; PostgreSQL's `SHOW` is bare even though
+    /// it returns a row.
+    pub tag_counts_rows: bool,
     pub row_schema: Arc<Vec<FieldInfo>>,
     pub data_rows: SendableRowStream,
 }
@@ -314,6 +318,7 @@ impl QueryResponse {
     {
         QueryResponse {
             command_tag: "SELECT".to_owned(),
+            tag_counts_rows: true,
             row_schema: field_defs,
             data_rows: Box::pin(row_stream),
         }
@@ -327,6 +332,22 @@ impl QueryResponse {
     /// Set the command tag
     pub fn set_command_tag(&mut self, command_tag: &str) {
         command_tag.clone_into(&mut self.command_tag);
+    }
+
+    /// Set a command tag that is sent WITHOUT the row count appended.
+    pub fn set_bare_command_tag(&mut self, command_tag: &str) {
+        self.set_command_tag(command_tag);
+        self.tag_counts_rows = false;
+    }
+
+    /// The CommandComplete tag for `rows` rows sent.
+    pub fn complete_tag(command_tag: &str, tag_counts_rows: bool, rows: usize) -> Tag {
+        let tag = Tag::new(command_tag);
+        if tag_counts_rows {
+            tag.with_rows(rows)
+        } else {
+            tag
+        }
     }
 
     /// Get schema of columns

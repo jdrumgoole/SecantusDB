@@ -40,7 +40,7 @@ use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::types::format::FormatOptions;
 use pgwire::types::ToSqlText;
 use postgres_types::{to_sql_checked, IsNull, ToSql};
-use secantus_pgcatalog::{TableDef, CATALOG_COLLECTION};
+use secantus_pgcatalog::{TableDef, CATALOG_COLLECTION, SEQUENCE_COLLECTION};
 use secantus_pgplan::{
     companion_field, render_array_element_text, render_timestamp, AggFunc, AggItem, ConstCol,
     Error as PlanError, Nulls, OrderKey, OutputCol, Statement, TransactionControl,
@@ -65,6 +65,24 @@ fn backend_registry() -> &'static Mutex<HashMap<i32, Arc<AtomicBool>>> {
 type CompositeFields = Vec<(String, String)>;
 /// One enum as `(schema, bare_name, oid, labels)`.
 type EnumWithSchema = (String, String, i64, Vec<String>);
+
+/// The session settings a row encoder needs, captured once per statement:
+/// pgwire may encode DataRows lazily on another worker thread, where the
+/// session state is not visible.
+struct RowEnv {
+    tz: secantus_pgplan::TimeZoneSetting,
+    ds: secantus_pgplan::DateStyle,
+    cenc: ClientEncoding,
+}
+
+/// An integer sequence field, whichever BSON width it was written at.
+fn bson_i64(v: &Bson) -> Option<i64> {
+    match v {
+        Bson::Int32(n) => Some(i64::from(*n)),
+        Bson::Int64(n) => Some(*n),
+        _ => None,
+    }
+}
 
 /// One database's worth of SQL over a shared `Storage`.
 pub struct PgHandler {
@@ -2099,6 +2117,7 @@ fn wire_type(pg_type: &str) -> Type {
         "float4" => Type::FLOAT4,
         "float8" => Type::FLOAT8,
         "bool" | "boolean" => Type::BOOL,
+        "void" => Type::VOID,
         // `text` is oid 25, NOT varchar (1043). PostgreSQL distinguishes them
         // and clients read the oid: psycopg decodes both to `str` so a value
         // comparison never notices, but pgjdbc and pgx do.
@@ -2568,106 +2587,29 @@ impl PgHandler {
                     FieldInfo::new(name.clone(), None, None, wire, FieldFormat::Text)
                 })
                 .collect()),
-            Statement::Select(sel) => match &sel.series {
-                Some(_) => Ok(sel
-                    .columns
-                    .iter()
-                    .map(|(out, _)| {
-                        FieldInfo::new(out.clone(), None, None, Type::INT4, FieldFormat::Text)
-                    })
-                    .collect()),
-                None => {
-                    let def = self
-                        .lookup(&sel.table)
-                        .ok_or_else(|| Self::err(&PlanError::UndefinedTable(sel.table.clone())))?;
-                    Ok(sel
-                        .columns
-                        .iter()
-                        .map(|(out, _)| {
-                            let ty = def
-                                .column(out)
-                                .map(|c| {
-                                    self.user_wire_type(&c.pg_type)
-                                        .unwrap_or_else(|| wire_type(&c.pg_type))
-                                })
-                                .unwrap_or(Type::VARCHAR);
-                            FieldInfo::new(out.clone(), None, None, ty, FieldFormat::Text)
-                        })
-                        .collect())
-                }
-            },
+            // The query's own description, in TEXT: COPY output is text (or
+            // its own binary framing) whatever the session's result format.
+            // A computed column (`id + 1`, `id::text`) types by its expression
+            // here exactly as it does for a SELECT.
+            Statement::Select(sel) => Ok(self
+                .row_schema(&self.select_def(sel)?, &sel.columns, &sel.casts)
+                .into_iter()
+                .map(|f| {
+                    FieldInfo::new(
+                        f.name().to_string(),
+                        None,
+                        None,
+                        f.datatype().clone(),
+                        FieldFormat::Text,
+                    )
+                })
+                .collect()),
             _ => Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".into(),
                 "0A000".into(),
                 "COPY over this statement is not supported yet".into(),
             )))),
         }
-    }
-
-    /// The rows of a `COPY (query) TO STDOUT`, in output-column order.
-    fn copy_query_rows(&self, inner: &Statement) -> PgWireResult<Vec<Vec<Option<Bson>>>> {
-        if let Statement::SelectConstant(sc) = inner {
-            let mut row = Vec::with_capacity(sc.columns.len());
-            for (_, col, _, _) in &sc.columns {
-                row.push(Some(self.resolve_const_col(col)?));
-            }
-            return Ok(vec![row]);
-        }
-        if let Statement::ValuesConstant(vc) = inner {
-            return Ok(vc
-                .rows
-                .iter()
-                .map(|r| r.iter().map(|v| Some(v.clone())).collect())
-                .collect());
-        }
-        let Statement::Select(sel) = inner else {
-            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".into(),
-                "0A000".into(),
-                "COPY over this statement is not supported yet".into(),
-            ))));
-        };
-        let mut docs: Vec<Document> = match &sel.series {
-            Some(series) => series
-                .values()
-                .into_iter()
-                .map(|v| {
-                    let mut d = Document::new();
-                    d.insert(series.column.clone(), Bson::Int32(v as i32));
-                    d
-                })
-                .collect(),
-            None => {
-                let raw = self
-                    .storage
-                    .find_matching(&self.db, &sel.table, &sel.filter)
-                    .map_err(|e| Self::storage_err("could not read", e))?;
-                raw.iter()
-                    .map(|b| bson::from_slice(b))
-                    .collect::<Result<_, _>>()
-                    .map_err(|e| Self::storage_err("could not decode a row", e))?
-            }
-        };
-        if !sel.order.is_empty() {
-            sort_rows(&mut docs, &sel.order);
-        }
-        if sel.offset > 0 {
-            let skip = usize::try_from(sel.offset).unwrap_or(usize::MAX);
-            docs = docs.into_iter().skip(skip).collect();
-        }
-        if let Some(limit) = sel.limit {
-            let take = usize::try_from(limit).unwrap_or(0);
-            docs.truncate(take);
-        }
-        Ok(docs
-            .iter()
-            .map(|d| {
-                sel.columns
-                    .iter()
-                    .map(|(_, field)| d.get(field).cloned())
-                    .collect()
-            })
-            .collect())
     }
 
     /// Parse a binary COPY payload: an 11-byte signature, flags and a header
@@ -2751,16 +2693,22 @@ impl PgHandler {
     /// catalog would leave a table the server still believes in.
     fn written_tables(stmt: &Statement) -> Vec<String> {
         let mut out = match stmt {
-            Statement::Insert(i) => vec![i.table.clone()],
+            // A serial column's INSERT moves its sequence too.
+            Statement::Insert(i) => vec![i.table.clone(), SEQUENCE_COLLECTION.to_string()],
             Statement::Update(u) => vec![u.table.clone()],
             Statement::Delete(d) => vec![d.table.clone()],
             Statement::CopyFrom(c) => vec![c.table.clone()],
             Statement::CreateTable(def, _) => {
-                vec![def.name.clone(), CATALOG_COLLECTION.to_string()]
+                vec![
+                    def.name.clone(),
+                    CATALOG_COLLECTION.to_string(),
+                    SEQUENCE_COLLECTION.to_string(),
+                ]
             }
             Statement::DropTable(d) => {
                 let mut v = d.tables.clone();
                 v.push(CATALOG_COLLECTION.to_string());
+                v.push(SEQUENCE_COLLECTION.to_string());
                 v
             }
             // CREATE/DROP TYPE writes a type-catalog row; a `ROLLBACK TO`
@@ -3350,6 +3298,22 @@ impl PgHandler {
             ConstCol::BackendPid => Ok(Bson::Int32(
                 self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
             )),
+            // `pg_sleep(NULL)` is NULL (strict); zero or negative seconds
+            // return at once; otherwise the wait is the given fraction of a
+            // second. The `void` result renders as `''` (probed PG 16).
+            ConstCol::Sleep(seconds) => {
+                let secs = match seconds {
+                    Bson::Null => return Ok(Bson::Null),
+                    Bson::Double(d) => *d,
+                    Bson::Int32(i) => f64::from(*i),
+                    Bson::Int64(i) => *i as f64,
+                    _ => 0.0,
+                };
+                if secs > 0.0 && secs.is_finite() {
+                    std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+                }
+                Ok(Bson::String(String::new()))
+            }
             ConstCol::TerminateBackend(inner) => {
                 let target = match self.resolve_const_col(inner)? {
                     Bson::Int32(i) => i64::from(i),
@@ -3722,6 +3686,394 @@ impl PgHandler {
         }])
     }
 
+    /// Draw the next `count` values of sequence `name` and move it past them.
+    ///
+    /// The first draw returns `last_value` as it stands (`is_called` false);
+    /// every later one adds the increment. Exhausting `max_value` is 2200H,
+    /// as PostgreSQL's `nextval` reports it. The move is a storage write, so
+    /// it rolls back with the transaction -- PostgreSQL never re-issues a
+    /// value; this server can.
+    fn nextval(&self, name: &str, count: usize) -> PgWireResult<Vec<i64>> {
+        let filter = bson::doc! { "_id": name };
+        let raw = self
+            .storage
+            .find_matching(&self.db, SEQUENCE_COLLECTION, &filter)
+            .map_err(|e| Self::storage_err("could not read the sequence", e))?;
+        let Some(raw) = raw.first() else {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "42P01".into(), // undefined_table
+                format!("relation \"{name}\" does not exist"),
+            ))));
+        };
+        let seq: Document = bson::from_slice(raw)
+            .map_err(|e| Self::storage_err("could not decode the sequence", e))?;
+        let int = |key: &str| seq.get(key).and_then(bson_i64);
+        let mut last = int("last_value").unwrap_or(1);
+        let increment = int("increment").unwrap_or(1);
+        let max_value = int("max_value").unwrap_or(i64::MAX);
+        let mut called = seq.get_bool("is_called").unwrap_or(false);
+        let mut values = Vec::with_capacity(count);
+        for _ in 0..count {
+            let next = if called {
+                last.checked_add(increment).filter(|v| *v <= max_value)
+            } else {
+                Some(last)
+            };
+            let Some(next) = next else {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".into(),
+                    "2200H".into(), // sequence_generator_limit_exceeded
+                    format!("nextval: reached maximum value of sequence \"{name}\" ({max_value})"),
+                ))));
+            };
+            values.push(next);
+            last = next;
+            called = true;
+        }
+        if !values.is_empty() {
+            self.storage
+                .update_matching(
+                    &self.db,
+                    SEQUENCE_COLLECTION,
+                    &filter,
+                    &bson::doc! { "$set": { "last_value": last, "is_called": true } },
+                    false,
+                    false,
+                    &[],
+                    &Document::new(),
+                    None,
+                    None,
+                    false,
+                )
+                .map_err(|e| Self::storage_err("could not advance the sequence", e))?;
+        }
+        Ok(values)
+    }
+
+    /// Fill each row's omitted `serial` columns from their sequences, as the
+    /// column default PostgreSQL attaches. A column the row names -- even as
+    /// NULL -- keeps what it was given; only an ABSENT one draws a value.
+    fn apply_serial_defaults(&self, def: &TableDef, rows: &mut [Document]) -> PgWireResult<()> {
+        for column in &def.columns {
+            let Some(sequence) = column.sequence.as_deref() else {
+                continue;
+            };
+            let field = column.field();
+            let missing: Vec<usize> = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| !d.contains_key(&field))
+                .map(|(i, _)| i)
+                .collect();
+            let values = self.nextval(sequence, missing.len())?;
+            for (i, v) in missing.into_iter().zip(values) {
+                let value = match column.pg_type.as_str() {
+                    "int8" => Bson::Int64(v),
+                    _ => i32::try_from(v).map(Bson::Int32).unwrap_or(Bson::Int64(v)),
+                };
+                rows[i].insert(field.clone(), value);
+            }
+        }
+        Ok(())
+    }
+
+    /// The RowDescription for a projection over one table's rows: a computed
+    /// column's TYPE comes from its expression (the last cast, or the call's
+    /// fixed result type), a plain one from the catalog. The describe pass and
+    /// the executor share this rule or the client decodes rows against the
+    /// wrong oid.
+    fn row_schema(
+        &self,
+        def: &TableDef,
+        columns: &[(String, String)],
+        casts: &[Option<secantus_pgplan::ColumnExpr>],
+    ) -> Vec<FieldInfo> {
+        columns
+            .iter()
+            .enumerate()
+            .map(|(i, (out, field))| {
+                let ty = match casts.get(i).and_then(|c| c.as_ref()) {
+                    Some(expr) => wire_type(secantus_pgplan::column_expr_type(expr)),
+                    None => def
+                        .column(field)
+                        .or_else(|| def.column(out))
+                        .map(|c| {
+                            self.user_wire_type(&c.pg_type)
+                                .unwrap_or_else(|| wire_type(&c.pg_type))
+                        })
+                        .unwrap_or(Type::VARCHAR),
+                };
+                self.field(out.clone(), ty)
+            })
+            .collect()
+    }
+
+    /// The table definition a SELECT's projection reads through: the join's
+    /// output columns, the series' one int4 column, the virtual table, or the
+    /// catalog entry.
+    fn select_def(&self, sel: &secantus_pgplan::Select) -> PgWireResult<TableDef> {
+        if let Some(join) = &sel.join {
+            return secantus_pgplan::join_output_def(join, &|n| self.lookup(n))
+                .map_err(|e| Self::err(&e));
+        }
+        if let Some(series) = &sel.series {
+            return Ok(series_table_def(series));
+        }
+        if let Some(def) = Self::virtual_table(&sel.table) {
+            return Ok(def);
+        }
+        self.lookup(&sel.table)
+            .ok_or_else(|| Self::err(&PlanError::UndefinedTable(sel.table.clone())))
+    }
+
+    /// The documents a SELECT reads, after its source (table, series, join or
+    /// virtual table), ORDER BY, OFFSET, LIMIT and the protocol row cap, with
+    /// the table definition the projection reads them through. Everything
+    /// that consumes a SELECT -- the row encoder, `COPY (query)`,
+    /// `INSERT ... SELECT` -- starts here, so there is one reader to be wrong.
+    fn select_docs(
+        &self,
+        sel: &secantus_pgplan::Select,
+        max_rows: usize,
+    ) -> PgWireResult<(Vec<Document>, TableDef)> {
+        // A generated source stands in for the table. Everything after
+        // this point -- ORDER BY, OFFSET, LIMIT, the encoder -- works
+        // on documents and does not care where they came from, which is
+        // why the series is a SOURCE rather than its own statement.
+        let (mut docs, def): (Vec<Document>, TableDef) = match (&sel.series, &sel.join) {
+            // A top-level JOIN source: materialise it, treat its
+            // output columns as the table.
+            (_, Some(join)) => {
+                // A subquery join side is materialised first (its rows
+                // keyed by the sub-plan's output names); a table side
+                // stays `None` and `join_docs_with` reads it itself.
+                let left_rows = match &join.left_sub {
+                    Some(stmt) => Some(self.sub_plan_rows(stmt)?),
+                    None => None,
+                };
+                let right_rows = match &join.right_sub {
+                    Some(stmt) => Some(self.sub_plan_rows(stmt)?),
+                    None => None,
+                };
+                let docs = self.join_docs_with(join, left_rows, right_rows)?;
+                let def = secantus_pgplan::join_output_def(join, &|n| self.lookup(n))
+                    .map_err(|e| Self::err(&e))?;
+                (docs, def)
+            }
+            (Some(series), _) => {
+                let column = series.column.clone();
+                let docs = series
+                    .values()
+                    .into_iter()
+                    .map(|v| {
+                        let mut d = Document::new();
+                        d.insert(column.clone(), Bson::Int32(v as i32));
+                        d
+                    })
+                    .collect();
+                (docs, series_table_def(series))
+            }
+            (None, _) if Self::virtual_table(&sel.table).is_some() => {
+                let docs = self.virtual_rows(&sel.table, &sel.filter).expect("checked");
+                (docs, Self::virtual_table(&sel.table).expect("checked"))
+            }
+            (None, _) => {
+                let raw = self
+                    .storage
+                    .find_matching(&self.db, &sel.table, &sel.filter)
+                    .map_err(|e| Self::storage_err("could not read", e))?;
+                let def = self
+                    .lookup(&sel.table)
+                    .ok_or_else(|| Self::err(&PlanError::UndefinedTable(sel.table.clone())))?;
+                // Decode once: ORDER BY, OFFSET and LIMIT all need the
+                // values, and re-decoding per comparison is quadratic.
+                let docs: Vec<Document> = raw
+                    .iter()
+                    .map(|b| bson::from_slice(b))
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| Self::storage_err("could not decode a row", e))?;
+                (docs, def)
+            }
+        };
+
+        if !sel.order.is_empty() {
+            sort_rows(&mut docs, &sel.order);
+        }
+        // OFFSET is applied before LIMIT, as PostgreSQL does.
+        if sel.offset > 0 {
+            let skip = usize::try_from(sel.offset).unwrap_or(usize::MAX);
+            docs = docs.into_iter().skip(skip).collect();
+        }
+        if let Some(limit) = sel.limit {
+            // A negative LIMIT is a PostgreSQL error, but the parser
+            // hands it through; clamp rather than panic on the cast.
+            let take = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
+            docs.truncate(take);
+        }
+        // `Execute` may cap rows independently of any SQL LIMIT; 0 means
+        // "no cap" in the protocol, not "no rows".
+        if max_rows > 0 {
+            docs.truncate(max_rows);
+        }
+        Ok((docs, def))
+    }
+
+    /// Every row of a row-producing statement as resolved values, in output
+    /// column order. This is `COPY (query) TO STDOUT` and `INSERT ... SELECT`
+    /// reading a query the same way the wire encoder does, casts and
+    /// expressions included -- `copy (select id + 1 from t) to stdout` used to
+    /// read the bare column and write `id`.
+    fn query_rows(&self, inner: &Statement) -> PgWireResult<Vec<Vec<Option<Bson>>>> {
+        match inner {
+            Statement::SelectConstant(sc) => {
+                if !sc.where_true {
+                    return Ok(Vec::new());
+                }
+                let mut row = Vec::with_capacity(sc.columns.len());
+                for (_, col, _, _) in &sc.columns {
+                    row.push(Some(self.resolve_const_col(col)?));
+                }
+                Ok(vec![row])
+            }
+            Statement::ValuesConstant(vc) => Ok(vc
+                .rows
+                .iter()
+                .map(|r| r.iter().map(|v| Some(v.clone())).collect())
+                .collect()),
+            Statement::Select(sel) => {
+                let (docs, def) = self.select_docs(sel, 0)?;
+                let schema = self.row_schema(&def, &sel.columns, &sel.casts);
+                let tz = self.session_timezone();
+                docs.iter()
+                    .map(|d| {
+                        sel.columns
+                            .iter()
+                            .enumerate()
+                            .map(|(i, (_, field))| {
+                                resolve_cell(
+                                    d,
+                                    field,
+                                    sel.casts.get(i).and_then(|c| c.as_ref()),
+                                    schema[i].datatype(),
+                                    &tz,
+                                )
+                            })
+                            .collect()
+                    })
+                    .collect()
+            }
+            _ => Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "0A000".into(),
+                "reading rows from this statement is not supported yet".into(),
+            )))),
+        }
+    }
+
+    /// Encode `docs` through a projection -- a SELECT's select list or an
+    /// INSERT's RETURNING list -- as a query response tagged `SELECT`.
+    fn project_rows(
+        &self,
+        docs: Vec<Document>,
+        def: &TableDef,
+        columns: &[(String, String)],
+        casts: &[Option<secantus_pgplan::ColumnExpr>],
+        env: &RowEnv,
+    ) -> PgWireResult<QueryResponse> {
+        let schema = Arc::new(self.row_schema(def, columns, casts));
+        let fields: Vec<String> = columns.iter().map(|(_, f)| f.clone()).collect();
+        let casts = casts.to_vec();
+        let (row_tz, row_ds, row_cenc) = (env.tz.clone(), env.ds, env.cenc);
+        let tz = self.session_timezone();
+        let schema_ref = schema.clone();
+        // A `DECLARE CURSOR` over this SELECT arms row capture (see
+        // `cursor_capture`); a plain SELECT leaves it disarmed and pays
+        // only the `Option` check below -- no lock, no extra clone.
+        let capture = {
+            let armed = self
+                .cursor_capture
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some();
+            armed.then(|| self.cursor_capture.clone())
+        };
+        let rows = stream::iter(docs).map(move |d| {
+            let mut enc = DataRowEncoder::new(schema_ref.clone());
+            let mut captured: Option<Vec<Option<Bson>>> =
+                capture.as_ref().map(|_| Vec::with_capacity(fields.len()));
+            for (i, f) in fields.iter().enumerate() {
+                // A computed column is applied per row -- the cast
+                // chain or the scalar call the planner recorded.
+                if let Some(expr) = casts.get(i).and_then(|c| c.as_ref()) {
+                    let v = if matches!(expr, secantus_pgplan::ColumnExpr::Row { .. }) {
+                        // An expression over the row sees every
+                        // column, not just the one it is filed under.
+                        secantus_pgplan::apply_row_expr(expr, &d)
+                    } else {
+                        let v = d.get(f).cloned().unwrap_or(Bson::Null);
+                        secantus_pgplan::apply_column_expr(expr, v, &tz)
+                    }
+                    .map_err(|e| PgHandler::err(&e))?;
+                    encode_field_value(
+                        &mut enc,
+                        &schema_ref[i],
+                        Some(&v),
+                        &row_tz,
+                        &row_ds,
+                        row_cenc,
+                    )?;
+                    if let Some(row) = captured.as_mut() {
+                        row.push(Some(v));
+                    }
+                    continue;
+                }
+                // A stored timestamp/timestamptz is reassembled from its
+                // date plus the hidden `__us_` companion. Both are a UTC
+                // instant; a `timestamp` renders naively, a `timestamptz`
+                // renders in the SESSION zone. A special value (infinity)
+                // is a String and falls to encode_field_value.
+                let reassembled = if *schema_ref[i].datatype() == Type::TIMESTAMPTZ {
+                    timestamptz_text(&d, f, &row_tz)
+                } else {
+                    timestamp_text(&d, f)
+                };
+                match reassembled {
+                    Some(text) => {
+                        enc.encode_field(&Some(text.as_str()))?;
+                        // The reassembled text re-encodes as a String,
+                        // which `encode_field_value` passes through for a
+                        // timestamp column (text) unchanged.
+                        if let Some(row) = captured.as_mut() {
+                            row.push(Some(Bson::String(text)));
+                        }
+                    }
+                    None => {
+                        let cell = d.get(f);
+                        encode_field_value(
+                            &mut enc,
+                            &schema_ref[i],
+                            cell,
+                            &row_tz,
+                            &row_ds,
+                            row_cenc,
+                        )?;
+                        if let Some(row) = captured.as_mut() {
+                            row.push(cell.cloned());
+                        }
+                    }
+                }
+            }
+            if let (Some(cap), Some(row)) = (&capture, captured) {
+                if let Some(buf) = cap.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                    buf.push(row);
+                }
+            }
+            Ok(enc.take_row())
+        });
+        Ok(QueryResponse::new(schema, rows))
+    }
+
     /// Execute one planned statement against storage.
     fn execute(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response>> {
         // A timestamptz renders in the SESSION zone; capture it once here and
@@ -3764,16 +4116,76 @@ impl PgHandler {
                 self.storage
                     .insert(&self.db, CATALOG_COLLECTION, vec![bytes], true)
                     .map_err(|e| Self::storage_err("could not record the table", e))?;
+                // Each serial column's sequence, owned by the column so the
+                // table's DROP takes it along.
+                let sequences = def
+                    .columns
+                    .iter()
+                    .filter_map(|c| c.sequence.as_deref().map(|seq| (c, seq)))
+                    .map(|(c, seq)| {
+                        let max_value = match c.pg_type.as_str() {
+                            "int2" => i64::from(i16::MAX),
+                            "int8" => i64::MAX,
+                            _ => i64::from(i32::MAX),
+                        };
+                        let owned_by = format!("{}.{}", def.name, c.name);
+                        bson::to_vec(&secantus_pgcatalog::sequence_document(
+                            seq, &owned_by, max_value,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| Self::storage_err("could not encode a sequence", e))?;
+                if !sequences.is_empty() {
+                    self.ensure_collection(SEQUENCE_COLLECTION)?;
+                    // A sequence left behind by a dropped table of the same
+                    // name (a drop that did not know about sequences) would
+                    // otherwise collide on `_id`.
+                    for seq in def.columns.iter().filter_map(|c| c.sequence.as_deref()) {
+                        self.storage
+                            .delete_matching(
+                                &self.db,
+                                SEQUENCE_COLLECTION,
+                                &bson::doc! { "_id": seq },
+                                0,
+                                &Document::new(),
+                                None,
+                            )
+                            .map_err(|e| Self::storage_err("could not reset a sequence", e))?;
+                    }
+                    self.storage
+                        .insert(&self.db, SEQUENCE_COLLECTION, sequences, true)
+                        .map_err(|e| Self::storage_err("could not record a sequence", e))?;
+                }
                 // Remember it for the rest of this transaction: the catalog row
                 // above is not committed yet, so a plain read cannot see it.
                 self.note_uncommitted(&def.name, Some(def.clone()));
                 Ok(vec![Response::Execution(Tag::new("CREATE TABLE"))])
             }
 
-            Statement::Insert(ins) => {
+            Statement::Insert(mut ins) => {
                 let def = self
                     .lookup(&ins.table)
                     .ok_or_else(|| Self::err(&PlanError::UndefinedTable(ins.table.clone())))?;
+                // `INSERT ... SELECT`: read the query's rows first, then write
+                // them exactly as a VALUES list would be written.
+                if let Some(source) = ins.source.take() {
+                    for values in self.query_rows(&source)? {
+                        let values = values
+                            .into_iter()
+                            .map(|v| v.unwrap_or(Bson::Null))
+                            .collect();
+                        let row = secantus_pgplan::insert_row(
+                            &def,
+                            &ins.targets,
+                            ins.explicit_columns,
+                            values,
+                        )
+                        .map_err(|e| Self::err(&e))?;
+                        ins.rows.push(row);
+                    }
+                }
+                self.apply_serial_defaults(&def, &mut ins.rows)?;
+                apply_column_defaults(&def, &mut ins.rows);
                 let n = ins.rows.len();
                 let docs = ins
                     .rows
@@ -3789,205 +4201,44 @@ impl PgHandler {
                     return Err(Self::write_error(&ins.table, &def, first));
                 }
                 debug_assert_eq!(written, n);
-                Ok(vec![Response::Execution(
-                    Tag::new("INSERT").with_oid(0).with_rows(written),
-                )])
+                match ins.returning {
+                    None => Ok(vec![Response::Execution(
+                        Tag::new("INSERT").with_oid(0).with_rows(written),
+                    )]),
+                    // `RETURNING` projects the rows as written -- serial
+                    // defaults included -- and tags the response `INSERT 0 n`
+                    // with the row count pgwire appends.
+                    Some(returning) => {
+                        let mut response = self.project_rows(
+                            ins.rows,
+                            &def,
+                            &returning.columns,
+                            &returning.casts,
+                            &RowEnv {
+                                tz: row_tz,
+                                ds: row_ds,
+                                cenc: row_cenc,
+                            },
+                        )?;
+                        response.set_command_tag("INSERT 0");
+                        Ok(vec![Response::Query(response)])
+                    }
+                }
             }
 
             Statement::Select(sel) => {
-                // A generated source stands in for the table. Everything after
-                // this point -- ORDER BY, OFFSET, LIMIT, the encoder -- works
-                // on documents and does not care where they came from, which is
-                // why the series is a SOURCE rather than its own statement.
-                let (mut docs, def): (Vec<Document>, TableDef) = match (&sel.series, &sel.join) {
-                    // A top-level JOIN source: materialise it, treat its
-                    // output columns as the table.
-                    (_, Some(join)) => {
-                        // A subquery join side is materialised first (its rows
-                        // keyed by the sub-plan's output names); a table side
-                        // stays `None` and `join_docs_with` reads it itself.
-                        let left_rows = match &join.left_sub {
-                            Some(stmt) => Some(self.sub_plan_rows(stmt)?),
-                            None => None,
-                        };
-                        let right_rows = match &join.right_sub {
-                            Some(stmt) => Some(self.sub_plan_rows(stmt)?),
-                            None => None,
-                        };
-                        let docs = self.join_docs_with(join, left_rows, right_rows)?;
-                        let def = secantus_pgplan::join_output_def(join, &|n| self.lookup(n))
-                            .map_err(|e| Self::err(&e))?;
-                        (docs, def)
-                    }
-                    (Some(series), _) => {
-                        let column = series.column.clone();
-                        let docs = series
-                            .values()
-                            .into_iter()
-                            .map(|v| {
-                                let mut d = Document::new();
-                                d.insert(column.clone(), Bson::Int32(v as i32));
-                                d
-                            })
-                            .collect();
-                        (docs, series_table_def(series))
-                    }
-                    (None, _) if Self::virtual_table(&sel.table).is_some() => {
-                        let docs = self.virtual_rows(&sel.table, &sel.filter).expect("checked");
-                        (docs, Self::virtual_table(&sel.table).expect("checked"))
-                    }
-                    (None, _) => {
-                        let raw = self
-                            .storage
-                            .find_matching(&self.db, &sel.table, &sel.filter)
-                            .map_err(|e| Self::storage_err("could not read", e))?;
-                        let def = self.lookup(&sel.table).ok_or_else(|| {
-                            Self::err(&PlanError::UndefinedTable(sel.table.clone()))
-                        })?;
-                        // Decode once: ORDER BY, OFFSET and LIMIT all need the
-                        // values, and re-decoding per comparison is quadratic.
-                        let docs: Vec<Document> = raw
-                            .iter()
-                            .map(|b| bson::from_slice(b))
-                            .collect::<Result<_, _>>()
-                            .map_err(|e| Self::storage_err("could not decode a row", e))?;
-                        (docs, def)
-                    }
-                };
-
-                if !sel.order.is_empty() {
-                    sort_rows(&mut docs, &sel.order);
-                }
-                // OFFSET is applied before LIMIT, as PostgreSQL does.
-                if sel.offset > 0 {
-                    let skip = usize::try_from(sel.offset).unwrap_or(usize::MAX);
-                    docs = docs.into_iter().skip(skip).collect();
-                }
-                if let Some(limit) = sel.limit {
-                    // A negative LIMIT is a PostgreSQL error, but the parser
-                    // hands it through; clamp rather than panic on the cast.
-                    let take = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
-                    docs.truncate(take);
-                }
-                // `Execute` may cap rows independently of any SQL LIMIT; 0 means
-                // "no cap" in the protocol, not "no rows".
-                if max_rows > 0 {
-                    docs.truncate(max_rows);
-                }
-
-                let schema = Arc::new(
-                    sel.columns
-                        .iter()
-                        .enumerate()
-                        .map(|(i, (out, field))| {
-                            // A computed column's TYPE comes from its
-                            // expression -- the last cast, or the call's fixed
-                            // result type.
-                            let ty = match sel.casts.get(i).and_then(|c| c.as_ref()) {
-                                Some(expr) => wire_type(secantus_pgplan::column_expr_type(expr)),
-                                None => def
-                                    .column(field)
-                                    .or_else(|| def.column(out))
-                                    .map(|c| {
-                                        self.user_wire_type(&c.pg_type)
-                                            .unwrap_or_else(|| wire_type(&c.pg_type))
-                                    })
-                                    .unwrap_or(Type::VARCHAR),
-                            };
-                            self.field(out.clone(), ty)
-                        })
-                        .collect::<Vec<_>>(),
-                );
-
-                let fields: Vec<String> = sel.columns.iter().map(|(_, f)| f.clone()).collect();
-                let casts = sel.casts.clone();
-                let tz = self.session_timezone();
-                let schema_ref = schema.clone();
-                // A `DECLARE CURSOR` over this SELECT arms row capture (see
-                // `cursor_capture`); a plain SELECT leaves it disarmed and pays
-                // only the `Option` check below -- no lock, no extra clone.
-                let capture = {
-                    let armed = self
-                        .cursor_capture
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .is_some();
-                    armed.then(|| self.cursor_capture.clone())
-                };
-                let rows = stream::iter(docs).map(move |d| {
-                    let mut enc = DataRowEncoder::new(schema_ref.clone());
-                    let mut captured: Option<Vec<Option<Bson>>> =
-                        capture.as_ref().map(|_| Vec::with_capacity(fields.len()));
-                    for (i, f) in fields.iter().enumerate() {
-                        // A computed column is applied per row -- the cast
-                        // chain or the scalar call the planner recorded.
-                        if let Some(expr) = casts.get(i).and_then(|c| c.as_ref()) {
-                            let v = if matches!(expr, secantus_pgplan::ColumnExpr::Row { .. }) {
-                                // An expression over the row sees every
-                                // column, not just the one it is filed under.
-                                secantus_pgplan::apply_row_expr(expr, &d)
-                            } else {
-                                let v = d.get(f).cloned().unwrap_or(Bson::Null);
-                                secantus_pgplan::apply_column_expr(expr, v, &tz)
-                            }
-                            .map_err(|e| PgHandler::err(&e))?;
-                            encode_field_value(
-                                &mut enc,
-                                &schema_ref[i],
-                                Some(&v),
-                                &row_tz,
-                                &row_ds,
-                                row_cenc,
-                            )?;
-                            if let Some(row) = captured.as_mut() {
-                                row.push(Some(v));
-                            }
-                            continue;
-                        }
-                        // A stored timestamp/timestamptz is reassembled from its
-                        // date plus the hidden `__us_` companion. Both are a UTC
-                        // instant; a `timestamp` renders naively, a `timestamptz`
-                        // renders in the SESSION zone. A special value (infinity)
-                        // is a String and falls to encode_field_value.
-                        let reassembled = if *schema_ref[i].datatype() == Type::TIMESTAMPTZ {
-                            timestamptz_text(&d, f, &row_tz)
-                        } else {
-                            timestamp_text(&d, f)
-                        };
-                        match reassembled {
-                            Some(text) => {
-                                enc.encode_field(&Some(text.as_str()))?;
-                                // The reassembled text re-encodes as a String,
-                                // which `encode_field_value` passes through for a
-                                // timestamp column (text) unchanged.
-                                if let Some(row) = captured.as_mut() {
-                                    row.push(Some(Bson::String(text)));
-                                }
-                            }
-                            None => {
-                                let cell = d.get(f);
-                                encode_field_value(
-                                    &mut enc,
-                                    &schema_ref[i],
-                                    cell,
-                                    &row_tz,
-                                    &row_ds,
-                                    row_cenc,
-                                )?;
-                                if let Some(row) = captured.as_mut() {
-                                    row.push(cell.cloned());
-                                }
-                            }
-                        }
-                    }
-                    if let (Some(cap), Some(row)) = (&capture, captured) {
-                        if let Some(buf) = cap.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-                            buf.push(row);
-                        }
-                    }
-                    Ok(enc.take_row())
-                });
-                Ok(vec![Response::Query(QueryResponse::new(schema, rows))])
+                let (docs, def) = self.select_docs(&sel, max_rows)?;
+                Ok(vec![Response::Query(self.project_rows(
+                    docs,
+                    &def,
+                    &sel.columns,
+                    &sel.casts,
+                    &RowEnv {
+                        tz: row_tz,
+                        ds: row_ds,
+                        cenc: row_cenc,
+                    },
+                )?)])
             }
 
             Statement::CreateSchema {
@@ -4290,7 +4541,7 @@ impl PgHandler {
 
             Statement::DropTable(drop) => {
                 for table in &drop.tables {
-                    if self.lookup(table).is_none() {
+                    let Some(def) = self.lookup(table) else {
                         if drop.if_exists {
                             continue;
                         }
@@ -4299,6 +4550,22 @@ impl PgHandler {
                             "42P01".into(), // undefined_table
                             format!("table \"{table}\" does not exist"),
                         ))));
+                    };
+                    // The sequences its serial columns own go with it.
+                    if def.columns.iter().any(|c| c.sequence.is_some()) {
+                        self.ensure_collection(SEQUENCE_COLLECTION)?;
+                    }
+                    for seq in def.columns.iter().filter_map(|c| c.sequence.as_deref()) {
+                        self.storage
+                            .delete_matching(
+                                &self.db,
+                                SEQUENCE_COLLECTION,
+                                &bson::doc! { "_id": seq },
+                                0,
+                                &Document::new(),
+                                None,
+                            )
+                            .map_err(|e| Self::storage_err("could not drop a sequence", e))?;
                     }
                     // Both halves, and the CATALOG entry last: if the drop
                     // fails midway, a table whose catalog row survived is
@@ -4368,7 +4635,7 @@ impl PgHandler {
                     match ct.query.as_deref() {
                         Some(inner) => {
                             let fields = self.copy_query_fields(inner)?;
-                            let values = self.copy_query_rows(inner)?;
+                            let values = self.query_rows(inner)?;
                             (Arc::new(fields), values)
                         }
                         None => {
@@ -4539,7 +4806,10 @@ impl PgHandler {
                     enc.encode_field(&Some(v.as_str()))?;
                     Ok(enc.take_row())
                 });
-                Ok(vec![Response::Query(QueryResponse::new(schema, rows))])
+                let mut response = QueryResponse::new(schema, rows);
+                // PostgreSQL's tag is a bare `SHOW` -- one row, no count.
+                response.set_bare_command_tag("SHOW");
+                Ok(vec![Response::Query(response)])
             }
 
             // The wire layer owns the prepared-statement store, so there is
@@ -4691,13 +4961,19 @@ impl PgHandler {
                         })
                         .collect::<Vec<_>>(),
                 );
-                let values: Vec<Bson> = sc
-                    .columns
-                    .iter()
-                    .map(|(_, c, _, _)| self.resolve_const_col(c))
-                    .collect::<PgWireResult<Vec<_>>>()?;
+                // A false WHERE means no row -- and nothing to resolve, so a
+                // `pg_sleep()` behind it does not wait either.
+                let values: Option<Vec<Bson>> = sc
+                    .where_true
+                    .then(|| {
+                        sc.columns
+                            .iter()
+                            .map(|(_, c, _, _)| self.resolve_const_col(c))
+                            .collect::<PgWireResult<Vec<_>>>()
+                    })
+                    .transpose()?;
                 let schema_ref = schema.clone();
-                let rows = stream::iter(std::iter::once(values)).map(move |vals| {
+                let rows = stream::iter(values).map(move |vals| {
                     let mut enc = DataRowEncoder::new(schema_ref.clone());
                     for (i, v) in vals.iter().enumerate() {
                         encode_field_value(
@@ -4854,12 +5130,62 @@ impl PgHandler {
     }
 }
 
+/// Fill every column an INSERT omitted with its literal DEFAULT. Sequence
+/// defaults are applied first (`apply_serial_defaults`); a column with
+/// neither stays absent, which reads as NULL.
+fn apply_column_defaults(def: &TableDef, rows: &mut [Document]) {
+    for column in &def.columns {
+        let Some(default) = column.default.as_ref() else {
+            continue;
+        };
+        let field = column.field();
+        for row in rows.iter_mut() {
+            if !row.contains_key(&field) {
+                row.insert(field.clone(), default.clone());
+            }
+        }
+    }
+}
+
 /// A stored timestamp, with its hidden companion added back.
 ///
 /// The remainder is validated rather than trusted: a value outside 0-999, or
 /// not an integer at all, is ignored. A hand-edited or foreign document must
 /// not be able to produce a time that was never written -- the same
 /// defensiveness `subms.py::merge` applies on the Python side.
+/// The value one projected cell carries: a computed expression applied to
+/// the row, a timestamp column reassembled from its hidden sub-millisecond
+/// companion, or the stored value itself. `None` is SQL NULL. The same three
+/// cases the row encoder (`project_rows`) walks, as a value rather than as
+/// wire bytes.
+fn resolve_cell(
+    doc: &Document,
+    field: &str,
+    expr: Option<&secantus_pgplan::ColumnExpr>,
+    datatype: &Type,
+    tz: &secantus_pgplan::TimeZoneSetting,
+) -> PgWireResult<Option<Bson>> {
+    if let Some(expr) = expr {
+        let v = if matches!(expr, secantus_pgplan::ColumnExpr::Row { .. }) {
+            secantus_pgplan::apply_row_expr(expr, doc)
+        } else {
+            let v = doc.get(field).cloned().unwrap_or(Bson::Null);
+            secantus_pgplan::apply_column_expr(expr, v, tz)
+        }
+        .map_err(|e| PgHandler::err(&e))?;
+        return Ok(Some(v));
+    }
+    let reassembled = if *datatype == Type::TIMESTAMPTZ {
+        timestamptz_text(doc, field, tz)
+    } else {
+        timestamp_text(doc, field)
+    };
+    Ok(match reassembled {
+        Some(text) => Some(Bson::String(text)),
+        None => doc.get(field).cloned(),
+    })
+}
+
 fn timestamp_text(doc: &Document, field: &str) -> Option<String> {
     let ms = match doc.get(field) {
         Some(Bson::DateTime(d)) => d.timestamp_millis(),
@@ -4932,8 +5258,9 @@ fn copy_reassemble(d: &Document, field: &str, ty: &Type) -> Option<Bson> {
 /// every type, and the gap is recorded in `tasks/backlog.md` rather than
 /// hidden.
 fn binary_encodable(ty: &Type) -> bool {
-    const OK: [Type; 23] = [
+    const OK: [Type; 24] = [
         Type::OID,
+        Type::VOID,
         Type::JSON,
         Type::JSONB,
         Type::BOOL,
@@ -5297,13 +5624,15 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
         return enc.encode_field(&Some(micros));
     }
     // A user ENUM's binary format is its label's UTF-8 -- the same bytes as
-    // text -- so it rides the text-family arm.
+    // text -- so it rides the text-family arm. So does `void`, whose binary
+    // form is the same zero bytes as its text form.
     if [
         Type::TEXT,
         Type::VARCHAR,
         Type::BPCHAR,
         Type::NAME,
         Type::CHAR,
+        Type::VOID,
     ]
     .contains(ty)
         || matches!(ty.kind(), postgres_types::Kind::Enum(_))
@@ -7259,28 +7588,16 @@ impl PgHandler {
                         .lookup(&sel.table)
                         .ok_or_else(|| Self::err(&PlanError::UndefinedTable(sel.table.clone())))?,
                 };
-                sel.columns
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (out, field))| {
-                        // A computed column's described type comes from its
-                        // expression; the describe and the executor share this
-                        // rule or the client decodes rows against the wrong
-                        // oid.
-                        let ty = match sel.casts.get(i).and_then(|c| c.as_ref()) {
-                            Some(expr) => wire_type(secantus_pgplan::column_expr_type(expr)),
-                            None => def
-                                .column(field)
-                                .or_else(|| def.column(out))
-                                .map(|c| {
-                                    self.user_wire_type(&c.pg_type)
-                                        .unwrap_or_else(|| wire_type(&c.pg_type))
-                                })
-                                .unwrap_or(Type::VARCHAR),
-                        };
-                        self.field(out.clone(), ty)
-                    })
-                    .collect()
+                self.row_schema(&def, &sel.columns, &sel.casts)
+            }
+            // `INSERT ... RETURNING` describes the RETURNING list over the
+            // table, exactly as a SELECT of the same list would.
+            Statement::Insert(ins) if ins.returning.is_some() => {
+                let def = self
+                    .lookup(&ins.table)
+                    .ok_or_else(|| Self::err(&PlanError::UndefinedTable(ins.table.clone())))?;
+                let returning = ins.returning.as_ref().expect("checked");
+                self.row_schema(&def, &returning.columns, &returning.casts)
             }
             // An aggregate over a generated source has no table to look up, and
             // no GROUP BY columns -- only the aggregates themselves.

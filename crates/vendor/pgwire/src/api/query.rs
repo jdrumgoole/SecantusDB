@@ -376,6 +376,7 @@ pub trait ExtendedQueryHandler: Send + Sync {
             let fetch_result = portal.fetch(max_rows).await?;
             let mut response = fetch_result.response;
             let command_tag = response.command_tag().to_owned();
+            let tag_counts_rows = response.tag_counts_rows;
             let mut row_count = 0;
             while let Some(row) = response.data_rows().next().await {
                 client.feed(PgWireBackendMessage::DataRow(row?)).await?;
@@ -386,7 +387,7 @@ pub trait ExtendedQueryHandler: Send + Sync {
                     .send(PgWireBackendMessage::PortalSuspended(PortalSuspended))
                     .await?;
             } else {
-                let tag = Tag::new(&command_tag).with_rows(row_count);
+                let tag = QueryResponse::complete_tag(&command_tag, tag_counts_rows, row_count);
                 client
                     .send(PgWireBackendMessage::CommandComplete(tag.into()))
                     .await?;
@@ -610,6 +611,7 @@ where
 {
     let QueryResponse {
         command_tag,
+        tag_counts_rows,
         row_schema,
         mut data_rows,
     } = results;
@@ -635,7 +637,7 @@ where
         client.feed(PgWireBackendMessage::DataRow(row)).await?;
     }
 
-    let tag = Tag::new(&command_tag).with_rows(rows);
+    let tag = QueryResponse::complete_tag(&command_tag, tag_counts_rows, rows);
     client
         .feed(PgWireBackendMessage::CommandComplete(tag.into()))
         .await?;
@@ -655,6 +657,7 @@ where
     PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
 {
     let command_tag = results.command_tag().to_string();
+    let tag_counts_rows = results.tag_counts_rows;
     let data_rows = results.data_rows();
 
     let mut rows = 0;
@@ -675,7 +678,7 @@ where
             .send(PgWireBackendMessage::PortalSuspended(PortalSuspended))
             .await?;
     } else {
-        let tag = Tag::new(&command_tag).with_rows(rows);
+        let tag = QueryResponse::complete_tag(&command_tag, tag_counts_rows, rows);
         client
             .send(PgWireBackendMessage::CommandComplete(tag.into()))
             .await?;
