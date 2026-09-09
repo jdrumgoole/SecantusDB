@@ -415,7 +415,7 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             &let_vars,
         )
         .map_err(|e| {
-            crate::util::read_exec_error(e, "find", &format!("{}.{}", &ctx.db_name, &coll))
+            crate::util::read_exec_error(e, "find", &format!("{}.{}", ctx.db_name, coll))
         })?;
 
     // Validate the filter even when nothing matched: against a non-empty

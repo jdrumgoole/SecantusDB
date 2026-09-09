@@ -256,18 +256,47 @@ def test_each_stage_spec_carries_its_own_code(db, stage, code) -> None:
     assert err.code == code
 
 
-def test_an_unmatched_array_filter_identifier_is_named(db) -> None:
-    """Fires even though `a` is not an array -- mongod decides this from the
-    update document alone, which is exactly what the engine's walk could not do."""
-    for cmd in (
-        {"update": "c", "updates": [{"q": {}, "u": {"$set": {"a.$[e]": 1}}}]},
-        {"findAndModify": "c", "query": {}, "update": {"$set": {"a.$[e]": 1}}},
-    ):
-        err = _err(db, cmd)
-        assert err.code == 2
-        assert err.details["errmsg"] == (
-            "No array filter found for identifier 'e' in path 'a.$[e]'"
-        )
+MISSING_FILTER = "No array filter found for identifier 'e' in path 'a.$[e]'"
+
+
+def test_an_unmatched_array_filter_identifier_is_a_per_statement_write_error(db) -> None:
+    """`update` reports it in `writeErrors` with `ok: 1`, NOT as a command failure.
+
+    It fires even though `a` is not an array -- mongod decides this from the
+    update document alone, which is exactly what the engine's walk could not do.
+    But it is PER STATEMENT: this used to fail the whole command, which a driver
+    sees as a different exception class (`OperationFailure` rather than
+    `WriteError`) and which loses the other statements of an unordered batch.
+    Measured 8.2.11, 2026-09-09.
+    """
+    reply = db.command({"update": "c", "updates": [{"q": {}, "u": {"$set": {"a.$[e]": 1}}}]})
+    assert reply["ok"] == 1.0
+    assert reply["writeErrors"] == [{"index": 0, "code": 2, "errmsg": MISSING_FILTER}]
+
+
+def test_an_unordered_batch_keeps_the_statements_that_are_fine(db) -> None:
+    """The point of reporting it per statement rather than per command."""
+    db.command({"insert": "c", "documents": [{"_id": 9, "a": 1}]})
+    reply = db.command(
+        {
+            "update": "c",
+            "updates": [
+                {"q": {"_id": 9}, "u": {"$set": {"a": 9}}},
+                {"q": {}, "u": {"$set": {"a.$[e]": 1}}},
+            ],
+            "ordered": False,
+        }
+    )
+    assert reply["ok"] == 1.0
+    assert reply["n"] == 1 and reply["nModified"] == 1
+    assert reply["writeErrors"] == [{"index": 1, "code": 2, "errmsg": MISSING_FILTER}]
+
+
+def test_findandmodify_reports_the_missing_identifier_as_a_command_failure(db) -> None:
+    """`findAndModify` has no `writeErrors`, so mongod fails the command there."""
+    err = _err(db, {"findAndModify": "c", "query": {}, "update": {"$set": {"a.$[e]": 1}}})
+    assert err.code == 2
+    assert err.details["errmsg"] == MISSING_FILTER
 
 
 def test_drop_indexes_by_key_spec_is_not_an_internal_error(db) -> None:
