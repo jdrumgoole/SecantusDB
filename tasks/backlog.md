@@ -5484,14 +5484,92 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   is supported; the named form would need the wire layer's prepared-statement
   store, and PostgreSQL answers `26000` for a name that does not exist, so
   accepting it as a no-op would be a wrong answer.
-- **Rust PG server: `1.5::bool` reports `22P02` where PostgreSQL reports
-  `42846`** (`cannot cast type numeric to boolean`). A cast that is not defined
-  at all is a different error class from a value that will not parse.
-- **Rust PG server: psycopg's `test_array.py` is 148/158 (2026-09-09).**
-  Multidimensional arrays round-trip in text and binary both ways; what is
-  left is `INSERT ... RETURNING`, the `box` type (its `;` array separator),
-  a table's row type as a composite (`test_array_register`), and
-  `test_array_of_unknown_builtin` (`aclitem`).
+- [ ] **OPEN — Rust PG server: a table's row type is not a composite type
+  (2026-09-09).** `create table mytype (data text); select '(foo)'::mytype`
+  is `a cast to mytype is not supported yet` (0A000); PostgreSQL 16 answers
+  `(foo)`, and `TypeInfo.fetch(conn, "mytype")` finds a `pg_type` row with
+  `typrelid` = the table's `pg_class` oid. There is no `pg_class` and no
+  per-table oid anywhere in the shared catalog, so this needs an oid minted
+  at `CREATE TABLE` (a contract with the Python server's `__sql_*__` docs),
+  a `pg_type` row per table, and `composites_with_schema` folding tables in
+  with their columns as the field list. psycopg `test_array_register`.
+- [ ] **OPEN — Rust PG server: the `aclitem` type (2026-09-09).**
+  `select '{postgres=r/postgres}'::aclitem[]` is `a cast to aclitem is not
+  supported yet`; on PostgreSQL 16 it is oid 1033 / array 1034, and its
+  parser resolves grantee and grantor against the ROLE catalog
+  (`'nobody=r'::aclitem` is `role "nobody" does not exist`, a bare grantee
+  defaults the grantor to the session user with a WARNING, a bad mode char
+  is `invalid mode character: must be one of "arwdDxtXUCTcsA"`, `'junk'` is
+  `unrecognized key word: "junk"`). Needs a roles catalog first. psycopg
+  `test_array_of_unknown_builtin`.
+- [ ] **OPEN — Rust PG server: `box = box` is refused (2026-09-09).**
+  `select '(1,2),(3,4)'::box = '(3,4),(1,2)'::box` is `comparing document
+  with document using = is not supported yet`; PostgreSQL 16 answers `t`
+  (box equality is by AREA — `box_eq` compares areas, so `'(0,0),(1,1)'::box
+  = '(0,0),(2,0.5)'::box` is `t` too; probe before assuming corner-wise).
+  `box < box` and friends compare areas likewise; `box && box` overlaps.
+- [ ] **OPEN — Rust PG server: SQL value functions only at the top of a
+  select list, and only the identity ones (2026-09-09).** `select user` /
+  `current_user` / `session_user` / `current_role` / `current_catalog` /
+  `current_schema` work; `select pg_typeof(user)` (the function nested in
+  an argument) is `SqlvalueFunction is not supported yet`, and every
+  date/time one — `current_date`, `current_time`, `current_timestamp`,
+  `localtime`, `localtimestamp` (with or without a precision) — is
+  `current_date is not supported yet`. `now()` is also unsupported
+  (`function now() is not supported yet`). PostgreSQL 16: `current_date`
+  is a `date` (1082), `current_timestamp` a `timestamptz` (1184) named
+  after its keyword.
+- [ ] **OPEN — Rust PG server: subscripting a constant array (2026-09-09).**
+  `select (array[1,2])[1]` and `select ('{1,2}'::int[])[2]` are `this field
+  selection is not supported yet` (0A000); PostgreSQL 16 answers `1` / `2`,
+  named `array` / `int4`. `AIndirection` on the constant path handles only a
+  single field NAME (`(row(1,2)).f1`); an `A_Indices` element needs the
+  1-based (out-of-range → NULL) subscript, and slices `[1:2]`.
+- [ ] **OPEN — Rust PG server: sequence values roll back with the
+  transaction (2026-09-09).** `begin; insert into t (serial col) …;
+  rollback; insert …` reuses the value the rolled-back insert drew;
+  PostgreSQL never reuses a sequence value (`nextval` is non-transactional).
+  The sequence doc in `__sql_sequences__` is written inside the statement's
+  transaction, so an abort restores it.
+- [ ] **OPEN — Rust PG server: NOT NULL is not enforced on a serial column
+  (2026-09-09).** `create table t (id serial); insert into t (id) values
+  (null)` stores a NULL id; PostgreSQL 16 is `23502 null value in column
+  "id" of relation "t" violates not-null constraint` — `serial` implies
+  `NOT NULL`, and the catalog does not record it.
+- [ ] **OPEN — Rust PG server: `timestamp + interval` on a STORED timestamp
+  loses sub-millisecond precision (2026-09-09).** A `timestamp` column
+  holding `2021-01-01 00:00:00.123456` answers `…00.123` for `ts + interval
+  '1 day'`; the literal form `'2021-01-01 00:00:00.123456'::timestamp +
+  interval '1 day'` keeps the micros. The stored value goes through a
+  millisecond `Bson::DateTime` on the arithmetic path where the literal
+  path keeps its micros.
+- [ ] **OPEN — Rust PG server: column DEFAULT expressions (2026-09-09).**
+  Only a literal DEFAULT is stored and applied. `create table t (n int
+  default now())` is refused 0A000 where PostgreSQL 16 is `42804 column "n"
+  is of type integer but default expression is of type timestamp with time
+  zone`; `ts timestamptz default now()` is accepted there and refused here;
+  `insert into t values (default)` and `insert into t default values` are
+  both unsupported (`SetToDefault` / an empty VALUES); DEFAULTs are not
+  applied to columns omitted by `COPY … FROM STDIN`; and a `default_expr`
+  written by the PYTHON server's catalog is ignored by the Rust catalog
+  reader (it reads only the literal form it writes).
+- [ ] **OPEN — Rust PG server: `pg_sleep` only as a bare select-list call
+  (2026-09-09).** `select pg_sleep(1) is null`, `select coalesce(pg_sleep(0),
+  '')` and other nestings are `NullTest is not supported yet` / 0A000 —
+  the sleep is a `ConstCol::Sleep` column, not a value the expression
+  evaluator can nest.
+- [ ] **OPEN — Rust PG server: `float4` (real) text is Rust's shortest
+  form, not `float4out` (2026-09-09).** `float8` now renders exactly as
+  `float8out` (`1e+20`, `1e-07`, `Infinity`, `{1.5,2}`); `float4` still
+  goes through ryu, so `1e20::float4` is `1e20` where PostgreSQL 16 prints
+  `1e+20`. Same fix as `geo::float8_text`, with float4's 6-digit shortest
+  round-trip.
+- **Rust PG server: psycopg's `test_array.py` is 156/158 (2026-09-09).**
+  Multidimensional arrays round-trip in text and binary both ways,
+  `INSERT … RETURNING`, the `box` type and its `;` array separator all
+  land; what is left is a table's row type as a composite
+  (`test_array_register`) and `test_array_of_unknown_builtin` (`aclitem`),
+  both above.
 
 - [x] **Five probes never compared the Rust server — instrumented 2026-09-02.**
   `tools/probes/_servers.py` is now the shared `probe_targets()` helper, and

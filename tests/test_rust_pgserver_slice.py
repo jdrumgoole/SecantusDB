@@ -5346,3 +5346,251 @@ def test_crossed_range_inside_an_array_literal_is_a_data_error(home: Path) -> No
         assert str(ei.value).startswith(
             "range lower bound must be less than or equal to range upper bound"
         )
+
+
+def test_session_user_value_functions(home: Path) -> None:
+    """`user` / `current_user` / `session_user` / `current_role` answer the
+    role the client connected as (this fixture connects as `test`),
+    `current_catalog` / `current_schema` are `postgres` / `public`, every
+    column is typed `name` (oid 19) and named after its keyword, and the
+    QUOTED form `"user"` is an ordinary (missing) column. Probed PG 16."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "select user, current_user, session_user, current_catalog, current_schema, current_role"
+        )
+        assert [(d.name, d.type_code) for d in cur.description] == [
+            ("user", 19),
+            ("current_user", 19),
+            ("session_user", 19),
+            ("current_catalog", 19),
+            ("current_schema", 19),
+            ("current_role", 19),
+        ]
+        assert cur.fetchall() == [("test", "test", "test", "postgres", "public", "test")]
+        cur.execute("select user as u")
+        assert [(d.name, d.type_code) for d in cur.description] == [("u", 19)]
+        assert cur.fetchall() == [("test",)]
+        with pytest.raises(psycopg.errors.UndefinedColumn) as ei:
+            cur.execute('select "user"')
+        assert str(ei.value).startswith('column "user" does not exist')
+
+
+def test_box_type_casts_and_arrays(home: Path) -> None:
+    """`box` (oid 603, array 1020): every input spelling normalises to
+    `(high),(low)` with the corners re-ordered per coordinate, a NaN lands in
+    the high corner, `box[]` is delimited by `;` rather than `,` (so its
+    elements are never quoted), a text-typed array of boxes IS quoted, a
+    bound text parameter casts, and the errors are PostgreSQL's: 22P02 for
+    a malformed box, 22003 for a coordinate out of float8 range, 42846 for
+    the casts PostgreSQL does not have. Every value probed on PG 16."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "select '(1,2),(3,4)'::box, '((1,2),(3,4))'::box, '1,2,3,4'::box, "
+            "'(1,4),(3,2)'::box, '(1.5,2),(3,4e2)'::box, '(2,3),(nan,1)'::box, "
+            "'(1,2),(3,4)'::box::text, pg_typeof('(1,2),(3,4)'::box)"
+        )
+        assert [(d.name, d.type_code) for d in cur.description] == [
+            ("box", 603),
+            ("box", 603),
+            ("box", 603),
+            ("box", 603),
+            ("box", 603),
+            ("box", 603),
+            ("text", 25),
+            ("pg_typeof", 2206),
+        ]
+        assert cur.fetchall() == [
+            (
+                "(3,4),(1,2)",
+                "(3,4),(1,2)",
+                "(3,4),(1,2)",
+                "(3,4),(1,2)",
+                "(3,400),(1.5,2)",
+                "(NaN,3),(2,1)",
+                "(3,4),(1,2)",
+                "box",
+            )
+        ]
+        cur.execute(
+            "select array['(1,2),(3,4)'::box, '(5,6),(7,8)'::box], "
+            "array['(1,2),(3,4)'::box, null], "
+            "'{(1,2),(3,4);(5,6),(7,8)}'::box[], '{\"(1,2),(3,4)\"}'::box[], "
+            "array['(1,2),(3,4)'::box]::text[], pg_typeof(array['(1,2),(3,4)'::box])"
+        )
+        assert [(d.name, d.type_code) for d in cur.description] == [
+            ("array", 1020),
+            ("array", 1020),
+            ("box", 1020),
+            ("box", 1020),
+            ("array", 1009),
+            ("pg_typeof", 2206),
+        ]
+        assert cur.fetchall() == [
+            (
+                ["(3,4),(1,2)", "(7,8),(5,6)"],
+                ["(3,4),(1,2)", None],
+                ["(3,4),(1,2)", "(7,8),(5,6)"],
+                ["(3,4),(1,2)"],
+                ["(3,4),(1,2)"],
+                "box[]",
+            )
+        ]
+        # The raw wire text of a box[] uses the `;` delimiter, unquoted.
+        cur.execute("select '{(1,2),(3,4);(5,6),(7,8)}'::box[]::text")
+        assert cur.fetchall() == [("{(3,4),(1,2);(7,8),(5,6)}",)]
+        cur.execute("select %s::box", ("(1,2),(3,4)",))
+        assert [(d.name, d.type_code) for d in cur.description] == [("box", 603)]
+        assert cur.fetchall() == [("(3,4),(1,2)",)]
+        # psycopg dumps a text list with `,` -- which is not box[]'s
+        # delimiter -- so the literal is malformed, on PostgreSQL too.
+        with pytest.raises(psycopg.errors.InvalidTextRepresentation) as ei:
+            cur.execute("select %s::box[]", (["(1,2),(3,4)", "(5,6),(7,8)"],))
+        assert str(ei.value).startswith('malformed array literal: "{"(1,2),(3,4)","(5,6),(7,8)"}"')
+        for bad in ("(1,2),(3)", "(1,2),(3,4),(5,6)", "x", "(1,2)", "((1,2),(3,4)"):
+            with pytest.raises(psycopg.errors.InvalidTextRepresentation) as ei:
+                cur.execute("select %s::box", (bad,))
+            assert str(ei.value).startswith(f'invalid input syntax for type box: "{bad}"')
+        with pytest.raises(psycopg.errors.NumericValueOutOfRange) as ei:
+            cur.execute("select '(1e400,2),(3,4)'::box")
+        assert str(ei.value).startswith('"1e400" is out of range for type double precision')
+        with pytest.raises(psycopg.errors.CannotCoerce) as ei:
+            cur.execute("select 5::box")
+        assert str(ei.value).startswith("cannot cast type integer to box")
+        with pytest.raises(psycopg.errors.CannotCoerce) as ei:
+            cur.execute("select '(1,2),(3,4)'::box::float8")
+        assert str(ei.value).startswith("cannot cast type box to double precision")
+
+
+def test_float8_text_is_float8out(home: Path) -> None:
+    """A double's text form is PostgreSQL's `float8out` -- shortest round-trip
+    digits, exponent form outside 1e-4..1e15 with a two-digit signed
+    exponent, `Infinity` / `-Infinity` / `NaN`, a signed `-0` -- in a column,
+    in a cast and inside a `float8[]`. A `float8` with a numeric operand is
+    float8 arithmetic, unary minus keeps a double's signed zero, and numeric
+    has no negative zero at all. Every value probed on PG 16."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "select 1e20::float8::text, 1e-7::float8::text, 1e15::float8::text, "
+            "1e14::float8::text, 0.00001::float8::text, 0.0001::float8::text, "
+            "'inf'::float8::text, '-inf'::float8::text, 'nan'::float8::text, "
+            "1.5::float8::text, 2::float8::text, 123456789012345678::float8::text, "
+            "(0.1::float8 + 0.2)::text"
+        )
+        assert cur.fetchall() == [
+            (
+                "1e+20",
+                "1e-07",
+                "1e+15",
+                "100000000000000",
+                "1e-05",
+                "0.0001",
+                "Infinity",
+                "-Infinity",
+                "NaN",
+                "1.5",
+                "2",
+                "1.2345678901234568e+17",
+                "0.30000000000000004",
+            )
+        ]
+        cur.execute(
+            "select array[1e20::float8, 0.5]::text, array[1.5::float8, 2]::text, "
+            "array[1e20::float8, 0.5], array[1.5::float8, 2]"
+        )
+        assert [(d.name, d.type_code) for d in cur.description] == [
+            ("array", 25),
+            ("array", 25),
+            ("array", 1022),
+            ("array", 1022),
+        ]
+        assert cur.fetchall() == [("{1e+20,0.5}", "{1.5,2}", [1e20, 0.5], [1.5, 2.0])]
+        cur.execute(
+            "select 0.1::float8 + 0.2, 1.5::numeric + 1::float8, 2::float8 * 1.5, 1.5 / 2::float8"
+        )
+        assert [(d.name, d.type_code) for d in cur.description] == [
+            ("?column?", 701),
+            ("?column?", 701),
+            ("?column?", 701),
+            ("?column?", 701),
+        ]
+        assert cur.fetchall() == [(0.30000000000000004, 2.5, 3.0, 0.75)]
+        cur.execute(
+            "select (-(0.0::float8))::text, (-0.0::float8)::text, ('-0'::float8)::text, "
+            "(- 0.0)::text, (-0.00e3)::text, (0.0 - 0.0)::text, 0.00e3::text"
+        )
+        assert cur.fetchall() == [("-0", "-0", "-0", "0.0", "0", "0.0", "0")]
+
+
+def test_constant_select_columns_are_named_as_postgresql_names_them(home: Path) -> None:
+    """A FROM-less select names an unaliased cast after its target type's
+    catalog name (`int4`, `float8`, `bpchar`, `numeric`, `char`), a nested
+    cast after the OUTER type, the constructor keywords after themselves
+    (`array`, `row`, `coalesce`, `greatest`, `least`, `nullif`), a cast of a
+    call after the call, and everything else `?column?`. Probed PG 16."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "select array[1], row(1), coalesce(1), greatest(1,2), least(1), "
+            "('1'::text)::int8, -1::int, 1 + 1, nullif(1,2), not true, "
+            "true and false, 1 = any(array[1]), (1), ((1::int)), "
+            "1::double precision, 'a'::char(2), 1::decimal, '1'::\"char\", "
+            "cast(1 as int), abs(-1)::int8"
+        )
+        assert [d.name for d in cur.description] == [
+            "array",
+            "row",
+            "coalesce",
+            "greatest",
+            "least",
+            "int8",
+            "?column?",
+            "?column?",
+            "nullif",
+            "?column?",
+            "?column?",
+            "?column?",
+            "?column?",
+            "int4",
+            "float8",
+            "bpchar",
+            "numeric",
+            "char",
+            "int4",
+            "abs",
+        ]
+
+
+def test_boolean_casts_exist_only_for_integer_and_text(home: Path) -> None:
+    """`boolean` has casts from `integer` and text and to `integer`; every
+    other numeric, temporal or integer-width pairing is 42846 `cannot cast
+    type X to Y` (a `1.5::bool` used to be a 22P02 parse failure). The source
+    type is what decides -- `'2021-01-01'::bool` is the 22P02 text failure
+    while `'2021-01-01'::date::bool` is 42846 -- and a NULL casts through the
+    same rules. Probed PG 16."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "select 1::bool, 0::bool, 2::bool, 'yes'::bool, 't'::bool::int, "
+            "1::bool::int, false::int, true::int4"
+        )
+        assert cur.fetchone() == (True, False, True, True, 1, 1, 0, 1)
+        assert [d.type_code for d in cur.description] == [16, 16, 16, 16, 23, 23, 23, 23]
+        for sql, message in [
+            ("select 1.5::bool", "cannot cast type numeric to boolean"),
+            ("select 1::int8::bool", "cannot cast type bigint to boolean"),
+            ("select 1::int2::bool", "cannot cast type smallint to boolean"),
+            ("select 1.5::float8::bool", "cannot cast type double precision to boolean"),
+            ("select '2021-01-01'::date::bool", "cannot cast type date to boolean"),
+            ("select null::date::bool", "cannot cast type date to boolean"),
+            ("select true::int8", "cannot cast type boolean to bigint"),
+            ("select true::int2", "cannot cast type boolean to smallint"),
+        ]:
+            with pytest.raises(psycopg.errors.CannotCoerce) as ei:
+                cur.execute(sql)
+            assert str(ei.value).startswith(message), sql
+        with pytest.raises(psycopg.errors.InvalidTextRepresentation) as ei:
+            cur.execute("select '2021-01-01'::bool")
+        assert str(ei.value).startswith('invalid input syntax for type boolean: "2021-01-01"')

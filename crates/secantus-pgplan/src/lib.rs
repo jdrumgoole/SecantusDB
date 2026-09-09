@@ -15,6 +15,7 @@ use bson::{doc, Bson, Document};
 use std::str::FromStr;
 
 pub mod bytea;
+pub mod geo;
 pub mod json;
 pub mod net;
 pub mod pgtypes;
@@ -94,6 +95,9 @@ pub enum Error {
     /// An operand of the wrong type where the SYNTAX is fine -> 42804
     /// (datatype_mismatch): `1 AND 2`.
     DatatypeMismatch(String),
+    /// A cast between two types PostgreSQL has no cast for -> 42846
+    /// (cannot_coerce): `5::box`, `'(1,2),(3,4)'::box::float8`.
+    CannotCoerce(String),
 }
 
 impl std::fmt::Display for Error {
@@ -119,7 +123,8 @@ impl std::fmt::Display for Error {
             | Error::UndefinedObject(m)
             | Error::InvalidRegex(m)
             | Error::ArraySubscript(m)
-            | Error::DatatypeMismatch(m) => write!(f, "{m}"),
+            | Error::DatatypeMismatch(m)
+            | Error::CannotCoerce(m) => write!(f, "{m}"),
             Error::MultipleCommands => {
                 write!(
                     f,
@@ -155,6 +160,7 @@ impl Error {
             Error::InvalidRegex(_) => "2201B",      // invalid_regular_expression
             Error::ArraySubscript(_) => "2202E",    // array_subscript_error
             Error::DatatypeMismatch(_) => "42804",  // datatype_mismatch
+            Error::CannotCoerce(_) => "42846",      // cannot_coerce
         }
     }
 }
@@ -714,6 +720,9 @@ pub enum ConstCol {
     /// pg_terminate_backend(pg_backend_pid())`), all of which the server
     /// resolves at execution.
     TerminateBackend(Box<ConstCol>),
+    /// `current_user` / `session_user` / `user` / `current_role` -- the role
+    /// the client connected as, which only the server's session knows.
+    SessionUser,
     /// `pg_sleep(seconds)` -- the argument is already cast to `float8` (or
     /// NULL). The sleep happens at execution, on the connection's own thread,
     /// so it costs the caller exactly the wait PostgreSQL would.
@@ -1805,6 +1814,35 @@ fn expression_column_name(node: &pg_query::protobuf::Node) -> String {
                 _ => None,
             })
             .unwrap_or_else(|| "?column?".to_string()),
+        // The constructor keywords name their column: `array[1]` is `array`,
+        // `row(1)` is `row`, `coalesce(1)` / `greatest(1, 2)` / `least(1)` /
+        // `nullif(1, 2)` take the keyword. Measured on PG 16.
+        Some(N::AArrayExpr(_)) => "array".to_string(),
+        Some(N::RowExpr(_)) => "row".to_string(),
+        Some(N::CoalesceExpr(_)) => "coalesce".to_string(),
+        Some(N::MinMaxExpr(m)) => {
+            if m.op == pg_query::protobuf::MinMaxOp::IsGreatest as i32 {
+                "greatest".to_string()
+            } else {
+                "least".to_string()
+            }
+        }
+        Some(N::AExpr(e)) if AExprKind::try_from(e.kind) == Ok(AExprKind::AexprNullif) => {
+            "nullif".to_string()
+        }
+        // A subscript / field selection names from what it selects: `x[1]`
+        // is `x`, `(array[1, 2])[1]` is `array`, and `(r).f` is the field.
+        Some(N::AIndirection(ind)) => {
+            let field = ind.indirection.last().and_then(|n| match n.node.as_ref() {
+                Some(N::String(st)) => Some(st.sval.clone()),
+                _ => None,
+            });
+            match (field, ind.arg.as_deref()) {
+                (Some(f), _) => f,
+                (None, Some(arg)) => expression_column_name(arg),
+                (None, None) => "?column?".to_string(),
+            }
+        }
         _ => "?column?".to_string(),
     }
 }
@@ -1813,7 +1851,22 @@ fn expression_column_name(node: &pg_query::protobuf::Node) -> String {
 /// through any number of casts? (PostgreSQL's `FigureColname` strength 2.)
 fn cast_source_names_column(node: &pg_query::protobuf::Node) -> bool {
     match node.node.as_ref() {
-        Some(N::ColumnRef(_)) | Some(N::FuncCall(_)) => true,
+        // PostgreSQL's FigureColname "strength 2" sources: anything that
+        // yields a definite name keeps it through a cast (`array[1]::text`
+        // is `array`); only a nameless expression takes the target type.
+        Some(N::ColumnRef(_))
+        | Some(N::FuncCall(_))
+        | Some(N::AArrayExpr(_))
+        | Some(N::RowExpr(_))
+        | Some(N::CoalesceExpr(_))
+        | Some(N::MinMaxExpr(_)) => true,
+        Some(N::AExpr(e)) => AExprKind::try_from(e.kind) == Ok(AExprKind::AexprNullif),
+        Some(N::AIndirection(ind)) => {
+            ind.indirection
+                .last()
+                .is_some_and(|n| matches!(n.node.as_ref(), Some(N::String(_))))
+                || ind.arg.as_deref().is_some_and(cast_source_names_column)
+        }
         Some(N::TypeCast(tc)) => tc.arg.as_deref().is_some_and(cast_source_names_column),
         _ => false,
     }
@@ -3116,7 +3169,6 @@ fn session_function(name: &str) -> Option<Bson> {
         )),
         "current_database" | "current_catalog" => Bson::String("postgres".into()),
         "current_schema" => Bson::String("public".into()),
-        "current_user" | "session_user" | "user" => Bson::String("postgres".into()),
         _ => return None,
     })
 }
@@ -3403,9 +3455,11 @@ fn inferred_type(v: &Bson) -> &'static str {
             Some(Bson::Double(_)) => "float8[]",
             Some(Bson::Decimal128(_)) => "numeric[]",
             Some(Bson::Boolean(_)) => "bool[]",
+            Some(other) if geo::is_box(other) => "box[]",
             _ => "text[]",
         },
         Bson::Boolean(_) => "bool",
+        other if geo::is_box(other) => "box",
         _ => "text",
     }
 }
@@ -3992,7 +4046,38 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 let t = inferred_type(&v).to_string();
                 (name, ConstCol::Value(v), t, -1)
             }
-            // `current_user` and friends parse as bare column refs, not calls.
+            // `user`, `current_user`, `current_date` and the other keyword
+            // functions: the role ones resolve on the server, which knows
+            // the session; the date/time ones need `now()`, which this
+            // server does not evaluate yet, so they are refused by name.
+            Some(N::SqlvalueFunction(svf)) => {
+                use pg_query::protobuf::SqlValueFunctionOp as Op;
+                let op = Op::try_from(svf.op).unwrap_or(Op::SqlvalueFunctionOpUndefined);
+                let (name, col) = match op {
+                    Op::SvfopCurrentUser => ("current_user", ConstCol::SessionUser),
+                    Op::SvfopUser => ("user", ConstCol::SessionUser),
+                    Op::SvfopSessionUser => ("session_user", ConstCol::SessionUser),
+                    Op::SvfopCurrentRole => ("current_role", ConstCol::SessionUser),
+                    Op::SvfopCurrentCatalog => (
+                        "current_catalog",
+                        ConstCol::Value(Bson::String("postgres".into())),
+                    ),
+                    Op::SvfopCurrentSchema => (
+                        "current_schema",
+                        ConstCol::Value(Bson::String("public".into())),
+                    ),
+                    other => {
+                        return Err(Error::Unsupported(
+                            other
+                                .as_str_name()
+                                .trim_start_matches("SVFOP_")
+                                .to_ascii_lowercase(),
+                        ));
+                    }
+                };
+                (name.to_string(), col, "name".to_string(), -1)
+            }
+            // `current_database()` and friends spelled as bare column refs.
             Some(N::ColumnRef(c)) => {
                 let name = c
                     .fields
@@ -4020,11 +4105,12 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 | N::CoalesceExpr(_)
                 | N::MinMaxExpr(_)),
             ) => {
-                let v = const_value(rt.val.as_ref().expect("checked"), params)?;
-                let t = static_type(rt.val.as_ref().expect("checked"), &v);
+                let val = rt.val.as_ref().expect("checked");
+                let v = const_value(val, params)?;
+                let t = static_type(val, &v);
                 let _ = node;
-                let typmod = cast_typmod(rt.val.as_ref().expect("checked"));
-                ("?column?".to_string(), ConstCol::Value(v), t, typmod)
+                let typmod = cast_typmod(val);
+                (expression_column_name(val), ConstCol::Value(v), t, typmod)
             }
             Some(other) => return Err(Error::Unsupported(disc(other))),
             None => return Err(Error::Unsupported("an empty target".into())),
@@ -6370,6 +6456,12 @@ pub fn render_timestamp(micros: i64) -> String {
 /// rounded number is a wrong answer while an error is merely a missing feature.
 pub fn parse_numeric(text: &str) -> Result<Decimal128> {
     let t = text.trim();
+    // PostgreSQL's numeric has no negative zero: `-0.0` is `0.0`. Decimal128
+    // keeps the sign, and it would print. Strip it from a zero mantissa.
+    let t = match t.strip_prefix('-') {
+        Some(body) if is_zero_mantissa(body) => body,
+        _ => t,
+    };
     Decimal128::from_str(t).map_err(|_| {
         // Distinguish "too big for us" from "not a number at all": the first is
         // a real PostgreSQL value we cannot represent, the second is the
@@ -6391,6 +6483,14 @@ pub fn parse_numeric(text: &str) -> Result<Decimal128> {
             Error::InvalidText(format!("invalid input syntax for type numeric: \"{t}\""))
         }
     })
+}
+
+/// Whether a numeric literal's body (sign already stripped) is a zero:
+/// digits and at most one point before any exponent, every digit `0`.
+fn is_zero_mantissa(body: &str) -> bool {
+    let mantissa = body.split(['e', 'E']).next().unwrap_or("");
+    let digits: Vec<char> = mantissa.chars().filter(|c| *c != '.').collect();
+    !digits.is_empty() && digits.iter().all(|c| *c == '0')
 }
 
 /// Render one array element as PostgreSQL renders it inside `{...}`.
@@ -6448,6 +6548,12 @@ pub fn plain_numeric_text(text: &str) -> String {
     }
     let (i, f) = digits.split_at(point as usize);
     if f.is_empty() {
+        // A zero mantissa with a positive exponent (`0.00e3` is `0E+1`)
+        // is plain `0`, not one zero per power of ten: PostgreSQL gives a
+        // zero no display scale it did not write.
+        if i.bytes().all(|b| b == b'0') {
+            return format!("{sign}0");
+        }
         format!("{sign}{i}")
     } else {
         format!("{sign}{i}.{f}")
@@ -6464,10 +6570,13 @@ fn render_array_element(v: &Bson) -> String {
         Bson::String(s) => s.clone(),
         Bson::Int32(i) => return i.to_string(),
         Bson::Int64(i) => return i.to_string(),
-        Bson::Double(d) => return d.to_string(),
+        Bson::Double(d) => return geo::float8_text(*d),
         Bson::Decimal128(d) => return plain_numeric_text(&d.to_string()),
         Bson::Boolean(b) => return (if *b { "t" } else { "f" }).to_string(),
         Bson::Array(items) => return render_array(items),
+        // A box's commas are not the array's delimiter (that is `;`), so the
+        // text needs no quoting: `{(3,4),(1,2);(7,8),(5,6)}`.
+        _ if geo::is_box(v) => return geo::box_text(&geo::box_coords(v).expect("checked")),
         // A bytea element renders as its `\x…` hex, then the array-quoting
         // below wraps and escapes it (`"\\x01"`), matching PostgreSQL.
         Bson::Binary(b) => bytea::render_hex(&b.bytes),
@@ -6491,9 +6600,27 @@ fn render_array_element(v: &Bson) -> String {
 }
 
 /// An array as PostgreSQL's text form: `{1,2,3}`, `{{1,2},{3,4}}`, `{}`.
+/// The element delimiter is the element type's `typdelim`: `,` for every
+/// type but `box`, whose arrays join with `;`.
 pub fn render_array(items: &[Bson]) -> String {
     let inner: Vec<String> = items.iter().map(render_array_element).collect();
-    format!("{{{}}}", inner.join(","))
+    format!("{{{}}}", inner.join(array_delimiter(items)))
+}
+
+/// The delimiter an array's text form uses, read off its elements: a box
+/// anywhere in it (at any depth) makes it a `box[]`.
+fn array_delimiter(items: &[Bson]) -> &'static str {
+    fn holds_box(items: &[Bson]) -> bool {
+        items.iter().any(|v| match v {
+            Bson::Array(inner) => holds_box(inner),
+            other => geo::is_box(other),
+        })
+    }
+    if holds_box(items) {
+        ";"
+    } else {
+        ","
+    }
 }
 
 /// Parse PostgreSQL's array text form into elements, coercing each to
@@ -6532,6 +6659,7 @@ fn parse_array(text: &str, element_type: &str) -> Result<Bson> {
         chars: text.chars().collect(),
         pos: 0,
         element_type,
+        delim: pgtypes::typdelim(element_type),
     };
     p.skip_space();
     // An optional dimension decoration, `[lo:hi]...=`, which PostgreSQL checks
@@ -6614,6 +6742,8 @@ struct ArrayParser<'a> {
     chars: Vec<char>,
     pos: usize,
     element_type: &'a str,
+    /// The element type's `typdelim`: `,` except for `box`, which uses `;`.
+    delim: char,
 }
 
 impl ArrayParser<'_> {
@@ -6664,12 +6794,13 @@ impl ArrayParser<'_> {
                     }
                     items.push(Bson::Array(sub));
                 }
-                Some(',' | '}') | None => return Err(unexpected()),
+                Some(c) if c == self.delim || c == '}' => return Err(unexpected()),
+                None => return Err(unexpected()),
                 Some(_) => items.push(self.parse_element()?),
             }
             self.skip_space();
             match self.peek() {
-                Some(',') => self.pos += 1,
+                Some(c) if c == self.delim => self.pos += 1,
                 Some('}') => {
                     self.pos += 1;
                     return Ok(items);
@@ -6717,7 +6848,7 @@ impl ArrayParser<'_> {
                         }
                     }
                 }
-                Some(',' | '}') => break,
+                Some(c) if c == self.delim || c == '}' => break,
                 Some('{') => return Err(unexpected()),
                 Some(c) if array_isspace(c) => {
                     pending_space.push(c);
@@ -6816,6 +6947,27 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
     // table, so without this arm the enum arm rejected it as an unknown label.
     if let Some((_, comp_fields)) = user_composite(target) {
         return composite_value(value, target, &comp_fields);
+    }
+    // A box renders to text as `(high),(low)` and is a no-op cast to itself;
+    // no other cast is defined for it on PostgreSQL.
+    if let Some(coords) = geo::box_coords(&value) {
+        return match target {
+            "text" | "varchar" | "bpchar" | "name" => Ok(Bson::String(geo::box_text(&coords))),
+            "box" => Ok(value),
+            _ => Err(Error::CannotCoerce(format!(
+                "cannot cast type box to {}",
+                display_type(target)
+            ))),
+        };
+    }
+    if target == "box" {
+        return match &value {
+            Bson::String(text) => geo::parse_box(text).map(geo::box_value),
+            other => Err(Error::CannotCoerce(format!(
+                "cannot cast type {} to box",
+                display_type(inferred_type(other))
+            ))),
+        };
     }
     // A stored `bytea` (Bson::Binary) renders to text as its `\x…` hex form and
     // is a no-op cast to itself; other targets fall through to the usual error.
@@ -6940,14 +7092,8 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
         }
         Bson::Int32(i) => i.to_string(),
         Bson::Int64(i) => i.to_string(),
-        Bson::Double(d) => {
-            // PostgreSQL renders a whole float8 without a trailing `.0`.
-            if d.fract() == 0.0 && d.is_finite() {
-                format!("{}", *d as i64)
-            } else {
-                d.to_string()
-            }
-        }
+        // `float8out`: `1e+20`, `1e-07`, `Infinity`, and no `.0` on a whole.
+        Bson::Double(d) => geo::float8_text(*d),
         Bson::Boolean(b) => (if *b { "true" } else { "false" }).to_string(),
         // Decimal128's own rendering keeps the scale (`1.50`, not `1.5`), and
         // the expansion drops its exponent notation, which PostgreSQL's
@@ -6969,6 +7115,13 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
     match target {
         "int4" | "int2" | "integer" | "int" | "smallint" => match &value {
             Bson::Int32(_) => Ok(value),
+            // `boolean -> integer` is 1 / 0; there is no cast to smallint.
+            Bson::Boolean(b) if matches!(target, "int4" | "integer" | "int") => {
+                Ok(Bson::Int32(i32::from(*b)))
+            }
+            Bson::Boolean(_) => Err(Error::CannotCoerce(
+                "cannot cast type boolean to smallint".to_string(),
+            )),
             Bson::Int64(i) => i32::try_from(*i)
                 .map(Bson::Int32)
                 .map_err(|_| Error::InvalidText(format!("integer out of range: \"{i}\""))),
@@ -6991,6 +7144,9 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
         "int8" | "bigint" => match &value {
             Bson::Int32(i) => Ok(Bson::Int64(i64::from(*i))),
             Bson::Int64(_) => Ok(value),
+            Bson::Boolean(_) => Err(Error::CannotCoerce(
+                "cannot cast type boolean to bigint".to_string(),
+            )),
             Bson::Double(d) => Ok(Bson::Int64(d.round_ties_even() as i64)),
             Bson::Decimal128(d) => decimal_to_integer(d)
                 .and_then(|n| i64::try_from(n).ok())
@@ -7062,7 +7218,13 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
                 "f" | "false" | "n" | "no" | "off" | "0" => Ok(Bson::Boolean(false)),
                 _ => Err(bad("boolean", &value)),
             },
-            _ => Err(bad("boolean", &value)),
+            // PostgreSQL casts only `integer` and text to boolean; a bigint,
+            // numeric, double or date has no cast at all (42846), which is a
+            // different error from a text that will not parse (22P02).
+            other => Err(Error::CannotCoerce(format!(
+                "cannot cast type {} to boolean",
+                display_type(inferred_type(other))
+            ))),
         },
         "text" | "varchar" | "bpchar" | "char" | "name" => Ok(Bson::String(as_text(&value))),
         // `json` VALIDATES and keeps the text it was given -- whitespace, key
@@ -7930,11 +8092,18 @@ fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
         (Some(a), Some(b)) => (a, b),
         _ => {
             // Doubles reach here only from an explicit ::float8 cast, where the
-            // declared type really is float8.
+            // declared type really is float8 -- and a numeric on the other side
+            // is coerced to it, so `0.1::float8 + 0.2` is float8 arithmetic
+            // (PostgreSQL's numeric-to-float8 implicit cast).
+            // A numeric with NO float8 beside it stays numeric: what
+            // `decimal_arith` refused (division) must not be answered by a
+            // float instead, since `1.5 / 3` is a numeric on PostgreSQL.
+            let mixed_float = matches!(lhs, Bson::Double(_)) || matches!(rhs, Bson::Double(_));
             let floats = |v: &Bson| match v {
                 Bson::Double(d) => Some(*d),
                 Bson::Int32(i) => Some(f64::from(*i)),
                 Bson::Int64(i) => Some(*i as f64),
+                Bson::Decimal128(d) if mixed_float => d.to_string().parse::<f64>().ok(),
                 _ => None,
             };
             let (x, y) = match (floats(&lhs), floats(&rhs)) {
@@ -8660,6 +8829,31 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
         {
             return Ok(value);
         }
+        // `boolean` has casts from `integer` and text only. A `smallint` or a
+        // `date` is stored in the same Bson shape as an integer or a text (an
+        // Int32, a String), so `cast_value` cannot tell `1::int2::bool` from
+        // `1::bool`, or `'2021-01-01'::date::bool` from `'2021-01-01'::bool`;
+        // the SOURCE type at the cast site is what decides (42846 on
+        // PostgreSQL, where the text form is a 22P02 parse failure).
+        if matches!(target.as_str(), "bool" | "boolean") {
+            let source = static_type(arg, &value);
+            if matches!(
+                source.as_str(),
+                "int2"
+                    | "smallint"
+                    | "date"
+                    | "time"
+                    | "timetz"
+                    | "timestamp"
+                    | "timestamptz"
+                    | "interval"
+            ) {
+                return Err(Error::CannotCoerce(format!(
+                    "cannot cast type {} to boolean",
+                    display_type(&source)
+                )));
+            }
+        }
         return cast_value(value, &target);
     }
     // `(expr).field` -- select a named field from a composite or record value.
@@ -8950,10 +9144,16 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 .ok_or_else(|| Error::Parse("operator with no right operand".into()))?,
             params,
         )?;
-        // A missing left operand is unary: `-3`, `+3`.
+        // A missing left operand is unary: `-3`, `+3`. A double is negated
+        // outright rather than subtracted from zero, which is the difference
+        // between `-(0.0::float8)` printing `-0` (PostgreSQL) and `0`.
         let lhs = match e.lexpr.as_ref() {
             Some(l) => const_value(l, params)?,
             None => match op.as_str() {
+                "-" if matches!(rhs, Bson::Double(_)) => {
+                    let Bson::Double(d) = rhs else { unreachable!() };
+                    return Ok(Bson::Double(-d));
+                }
                 "-" => Bson::Int32(0),
                 "+" => return Ok(rhs),
                 _ => return Err(Error::Unsupported(format!("unary {op}"))),

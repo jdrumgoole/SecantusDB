@@ -175,6 +175,11 @@ pub struct PgHandler {
     /// against it to recognise a self-termination. Set once in `post_startup`;
     /// `0` before that, which no real PID collides with.
     backend_pid: AtomicI32,
+    /// The role the client connected as (the startup packet's `user`), which
+    /// `current_user` / `session_user` / `user` / `current_role` answer.
+    /// PostgreSQL reports the real role; a fixed name was a wrong answer for
+    /// every client not connecting as that name.
+    session_user: Mutex<String>,
     /// This connection's entry in [`backend_registry`]: another backend's
     /// `pg_terminate_backend` sets it, and `run_typed` checks it before every
     /// statement so the connection ends with a `57P01`.
@@ -267,6 +272,7 @@ impl PgHandler {
             savepoints: Mutex::new(Vec::new()),
             cursor_capture: std::sync::Arc::new(Mutex::new(None)),
             backend_pid: AtomicI32::new(0),
+            session_user: Mutex::new(String::new()),
             terminate: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -1648,7 +1654,10 @@ impl PgHandler {
                             def.field_of("typarray").expect("column"),
                             Bson::Int64(*typarray),
                         );
-                        d.insert(def.field_of("typdelim").expect("column"), ",");
+                        d.insert(
+                            def.field_of("typdelim").expect("column"),
+                            secantus_pgplan::pgtypes::typdelim(typname).to_string(),
+                        );
                         d.insert(def.field_of("typrelid").expect("column"), Bson::Int64(0));
                         d
                     })
@@ -2038,6 +2047,7 @@ fn internal_type_name(ty: &Type) -> Option<String> {
             17 => "bytea",
             869 => "inet",
             650 => "cidr",
+            603 => "box",
             1043 => "varchar",
             1042 => "bpchar",
             19 => "name",
@@ -2063,6 +2073,7 @@ fn internal_type_name(ty: &Type) -> Option<String> {
             1001 => "bytea[]",
             1041 => "inet[]",
             651 => "cidr[]",
+            1020 => "box[]",
             2951 => "uuid[]",
             oid => {
                 return secantus_pgplan::range::range_oid_name(oid)
@@ -2099,6 +2110,7 @@ fn type_size(ty: &Type) -> i16 {
         Type::INT8 | Type::FLOAT8 | Type::TIME | Type::TIMESTAMP | Type::TIMESTAMPTZ => 8,
         Type::TIMETZ => 12,
         Type::INTERVAL | Type::UUID => 16,
+        Type::BOX => 32,
         Type::NAME => 64,
         _ => -1,
     }
@@ -2125,6 +2137,7 @@ fn wire_type(pg_type: &str) -> Type {
         "bytea" => Type::BYTEA,
         "inet" => Type::INET,
         "cidr" => Type::CIDR,
+        "box" => Type::BOX,
         "varchar" | "character varying" => Type::VARCHAR,
         "bpchar" | "char" | "character" => Type::BPCHAR,
         "name" => Type::NAME,
@@ -2217,6 +2230,7 @@ fn wire_type(pg_type: &str) -> Type {
         "bytea[]" => Type::BYTEA_ARRAY,
         "inet[]" => Type::INET_ARRAY,
         "cidr[]" => Type::CIDR_ARRAY,
+        "box[]" => Type::BOX_ARRAY,
         "uuid[]" => Type::UUID_ARRAY,
         "bpchar[]" | "char[]" | "character[]" => Type::BPCHAR_ARRAY,
         "name[]" => Type::NAME_ARRAY,
@@ -2247,6 +2261,9 @@ impl NoopStartupHandler for PgHandler {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(pid, self.terminate.clone());
+        if let Some(user) = _c.metadata().get("user") {
+            *self.session_user.lock().unwrap_or_else(|e| e.into_inner()) = user.clone();
+        }
         // A `client_encoding` in the startup packet (libpq's PGCLIENTENCODING /
         // psycopg's `client_encoding=` connection option) is a SET before the
         // first query. pgwire has already echoed the client's raw spelling in a
@@ -3297,6 +3314,12 @@ impl PgHandler {
             }
             ConstCol::BackendPid => Ok(Bson::Int32(
                 self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
+            )),
+            ConstCol::SessionUser => Ok(Bson::String(
+                self.session_user
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
             )),
             // `pg_sleep(NULL)` is NULL (strict); zero or negative seconds
             // return at once; otherwise the wait is the given fraction of a
@@ -5940,6 +5963,18 @@ fn encode_field_value_inner(
     if let (Some(Bson::Array(items)), Some(element)) =
         (v, element_of_array_oid(field.datatype().oid()))
     {
+        // A `float8[]` in text is `float8out` per element (`{1e+20,2}`),
+        // which the typed encoder's ryu rendering (`{1e20,2.0}`) is not.
+        if element == "float8" && !items.iter().any(|x| matches!(x, Bson::Array(_))) {
+            let rendered: Vec<Option<String>> = items
+                .iter()
+                .map(|x| match x {
+                    Bson::Null => None,
+                    other => Some(secantus_pgplan::value_text(other)),
+                })
+                .collect();
+            return enc.encode_field(&rendered);
+        }
         if binary_encodable(field.datatype()) {
             return encode_binary(enc, field.datatype(), v);
         }
@@ -5947,7 +5982,20 @@ fn encode_field_value_inner(
         // TEXT here, so the elements go out as the strings they already are.
         // (`encode_binary` refuses them on purpose -- their BINARY layouts are
         // not implemented, and this arm only runs for a text column.)
-        let _ = element;
+        // A `box[]` joins its elements with `;`, which the element-wise
+        // encoder cannot do; its whole text is rendered here instead.
+        // Sent as plain TEXT: the `&str` encoder quotes a value that holds
+        // braces when the field is array-typed, and this is the whole array.
+        if element == "box" {
+            let text = secantus_pgplan::value_text(&Bson::Array(items.clone()));
+            let options = field.format_options().clone();
+            return enc.encode_field_with_type_and_format(
+                &Some(text),
+                &Type::TEXT,
+                field.format(),
+                options.as_ref(),
+            );
+        }
         let rendered: Vec<Option<String>> = items
             .iter()
             .map(|x| match x {
@@ -6021,11 +6069,20 @@ fn encode_value(enc: &mut DataRowEncoder, v: Option<&Bson>) -> PgWireResult<()> 
         if let Some(text) = secantus_pgplan::record_value_text(value) {
             return enc.encode_field(&Some(text.as_str()));
         }
+        // A box is four corners in a document; the wire wants `(h),(l)`.
+        if let Some(coords) = secantus_pgplan::geo::box_coords(value) {
+            return enc.encode_field(&Some(secantus_pgplan::geo::box_text(&coords).as_str()));
+        }
     }
     match v {
         Some(Bson::Int32(x)) => enc.encode_field(&Some(*x)),
         Some(Bson::Int64(x)) => enc.encode_field(&Some(*x)),
-        Some(Bson::Double(x)) => enc.encode_field(&Some(*x)),
+        // `float8out`, not Rust's `Display`: `1e+20` and `Infinity`, where
+        // Rust writes `1e20` and `inf` -- text a client's float parser may
+        // still read, but not what PostgreSQL sends.
+        Some(Bson::Double(x)) => {
+            enc.encode_field(&Some(secantus_pgplan::geo::float8_text(*x).as_str()))
+        }
         Some(Bson::Boolean(x)) => enc.encode_field(&Some(*x)),
         Some(Bson::String(x)) => enc.encode_field(&Some(x.as_str())),
         // Decimal128's rendering already carries the scale (`1.50`, not `1.5`),
@@ -6058,8 +6115,13 @@ fn encode_value(enc: &mut DataRowEncoder, v: Option<&Bson>) -> PgWireResult<()> 
                 let v: Vec<Option<i64>> = items.iter().map(|x| x.as_i64()).collect();
                 enc.encode_field(&v)
             }
+            // As `float8out` text, not pgwire's ryu (`1e20`, `inf`); a float's
+            // text never needs the array quoting, so strings are safe here.
             Some(Bson::Double(_)) => {
-                let v: Vec<Option<f64>> = items.iter().map(|x| x.as_f64()).collect();
+                let v: Vec<Option<String>> = items
+                    .iter()
+                    .map(|x| x.as_f64().map(secantus_pgplan::geo::float8_text))
+                    .collect();
                 enc.encode_field(&v)
             }
             Some(Bson::Boolean(_)) => {
@@ -6717,6 +6779,7 @@ fn element_of_array_oid(oid: u32) -> Option<&'static str> {
         1001 => "bytea",
         1041 => "inet",
         651 => "cidr",
+        1020 => "box",
         2951 => "uuid",
         _ => return None,
     })
@@ -7337,6 +7400,9 @@ fn decode_parameter(
         Some(650) => secantus_pgplan::net::normalize_cidr(&text)
             .map(Bson::String)
             .map_err(|e| PgHandler::err(&e)),
+        Some(603) => {
+            secantus_pgplan::cast_text_to(&text, "box", tz).map_err(|e| PgHandler::err(&e))
+        }
         // The TYPED text forms. These reach the same value the BINARY path
         // produces for the same oid, which is the whole point: a parameter's
         // meaning cannot depend on the format a client happened to send it in.

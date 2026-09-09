@@ -5,7 +5,8 @@
 //! called or numbered. Oids are PostgreSQL's own, measured from `pg_type` on
 //! PG 14, not invented.
 
-/// (typname, oid, typarray). `typdelim` is `,` for every type here.
+/// (typname, oid, typarray). `typdelim` is `,` for every type here except
+/// `box` -- see [`typdelim`].
 pub const BUILTIN_TYPES: &[(&str, i64, i64)] = &[
     ("bool", 16, 1000),
     ("bytea", 17, 1001),
@@ -20,6 +21,7 @@ pub const BUILTIN_TYPES: &[(&str, i64, i64)] = &[
     ("json", 114, 199),
     ("float4", 700, 1021),
     ("float8", 701, 1022),
+    ("box", 603, 1020),
     ("bpchar", 1042, 1014),
     ("varchar", 1043, 1015),
     ("date", 1082, 1182),
@@ -45,6 +47,17 @@ pub const BUILTIN_TYPES: &[(&str, i64, i64)] = &[
     ("datemultirange", 4535, 6155),
     ("int8multirange", 4536, 6157),
 ];
+
+/// The character that separates the elements of an array of this type in its
+/// text form: `;` for `box` (whose own text is full of commas), `,` for every
+/// other type.
+pub fn typdelim(element_type: &str) -> char {
+    if element_type == "box" {
+        ';'
+    } else {
+        ','
+    }
+}
 
 /// The oid for a type NAME, in any spelling PostgreSQL itself accepts --
 /// `int4` and `integer`, `varchar` and `character varying`. `None` for a name
