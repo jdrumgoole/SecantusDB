@@ -62,16 +62,29 @@ fn eval_or_missing(expr: &Bson, doc: &Document, vars: &Document) -> R<Option<Bso
 
 /// Canonical, hashable group-key.
 ///
-/// Matches mongod's bucketing, which `_hashable` on the Python side also
-/// implements: `1 == 1.0 == true` share a bucket, and so does every NaN. The
-/// note that used to head this type described it as mirroring "Python dict
-/// equality" -- which is where the NaN bug came from, since Python dicts key a
-/// NaN by identity and mongod does not.
-/// Also used by `$densify` for partition keys (same dict semantics).
+/// Matches mongod's bucketing: `1 == 1.0` share a bucket, the signed zeros
+/// share one, and so does every NaN -- but a BOOL is its own, because a bool is
+/// not a number to mongod. Measured 8.2.11 (2026-09-09):
+///
+/// ```text
+///     _id=0      <- 0, 0.0, -0.0
+///     _id=False  <- False
+///     _id=True   <- True
+///     _id=1      <- 1, 1.0
+/// ```
+///
+/// This comment used to claim `1 == 1.0 == true` share a bucket, and the code
+/// implemented that -- so six documents collapsed into TWO buckets keyed by
+/// truthiness. Both the claim and the NaN bug before it came from describing
+/// this type as mirroring "Python dict equality" rather than mongod: Python
+/// keys a NaN by identity and treats `True == 1`, and mongod does neither.
+/// Also used by `$densify` for partition keys.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum GKey {
     Null,
-    Num(NumVal), // int / int64 / double / bool, normalised (1 == 1.0 == True)
+    Num(NumVal), // int / int64 / double, normalised (1 == 1.0)
+    /// A bool is NOT a number to mongod, so it never shares a numeric bucket.
+    Bool(bool),
     Str(String),
     Date(i64),
     Oid([u8; 12]),
@@ -94,17 +107,21 @@ pub enum GKey {
 pub fn gkey(v: &Bson) -> R<GKey> {
     match v {
         Bson::Null => Ok(GKey::Null),
-        Bson::Boolean(b) => Ok(GKey::Num(
-            numeric::classify(&Bson::Int32(i32::from(*b))).unwrap(),
-        )),
-        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => match numeric::classify(v) {
-            Some(NumVal::Nan) => Ok(GKey::Nan),
-            Some(n) => Ok(GKey::Num(n)),
-            None => Err(Fallback::Defer),
-        },
-        // A Decimal128 NaN joins the SAME bucket as a double NaN; every other
-        // decimal still defers, which is a separate gap.
-        Bson::Decimal128(_) if matches!(numeric::classify(v), Some(NumVal::Nan)) => Ok(GKey::Nan),
+        Bson::Boolean(b) => Ok(GKey::Bool(*b)),
+        // Decimal128 belongs here with the rest: mongod buckets int `1`,
+        // double `1.0`, `Decimal128("1")` and `Decimal128("1.0")` together
+        // under one key (measured 8.2.11, 2026-09-09), and `NumVal` is a
+        // normalised digit form that already collapses all four. Only a
+        // non-NaN decimal used to reach the `Defer` at the bottom -- which on
+        // the standalone server is an ERROR, so one decimal anywhere in the
+        // grouped field failed the whole `$group`.
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => {
+            match numeric::classify(v) {
+                Some(NumVal::Nan) => Ok(GKey::Nan),
+                Some(n) => Ok(GKey::Num(n)),
+                None => Err(Fallback::Defer),
+            }
+        }
         Bson::String(s) => Ok(GKey::Str(s.clone())),
         Bson::DateTime(d) => Ok(GKey::Date(d.timestamp_millis())),
         Bson::ObjectId(o) => Ok(GKey::Oid(o.bytes())),
@@ -1772,7 +1789,12 @@ mod tests {
 
     #[test]
     fn sum_and_count_collide_numeric_keys() {
-        // keys 1 (int) and 1.0 (double) and true bucket together.
+        // The NUMERIC keys 1 (int) and 1.0 (double) bucket together; `true`
+        // does NOT join them. This asserted that it did -- "keys 1 (int) and
+        // 1.0 (double) and true bucket together" -- which pinned the bug it
+        // described: six documents collapsed into two buckets keyed by
+        // truthiness. mongod keeps `true` separate (measured 8.2.11,
+        // 2026-09-09); a bool is not a number to it.
         let docs = vec![
             doc! {"k": 1i32, "v": 10i32},
             doc! {"k": 1.0f64, "v": 5i32},
@@ -1783,11 +1805,14 @@ mod tests {
             bson::bson!({"_id": "$k", "total": {"$sum": "$v"}, "n": {"$sum": 1}}),
             docs,
         );
-        // First bucket: _id == 1 (first-seen), total 17, n 3.
+        // First bucket: _id == 1 (first-seen), total 15, n 2 -- the two numerics.
         assert_eq!(out[0].get("_id"), Some(&Bson::Int32(1)));
-        assert_eq!(out[0].get("total"), Some(&Bson::Int32(17)));
-        assert_eq!(out[0].get("n"), Some(&Bson::Int32(3)));
-        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].get("total"), Some(&Bson::Int32(15)));
+        assert_eq!(out[0].get("n"), Some(&Bson::Int32(2)));
+        // ...then `true` on its own, then 2.
+        assert_eq!(out[1].get("_id"), Some(&Bson::Boolean(true)));
+        assert_eq!(out[1].get("total"), Some(&Bson::Int32(2)));
+        assert_eq!(out.len(), 3);
     }
 
     #[test]

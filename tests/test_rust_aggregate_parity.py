@@ -347,8 +347,16 @@ def test_densify_fuzz():
 
 
 def test_group_numeric_key_collision():
-    # 1 (int), 1.0 (double), True must bucket together (first-seen _id wins),
-    # and stay distinct from 2.
+    # 1 (int) and 1.0 (double) bucket together (first-seen `_id` wins) and stay
+    # distinct from 2. `True` gets its OWN bucket -- a bool is not a number to
+    # mongod (measured 8.2.11, 2026-09-09).
+    #
+    # This comment said "1 (int), 1.0 (double), True must bucket together", the
+    # third place that claim was written down, and it is why both engines
+    # merged them. Note the test passed throughout: parity compares the two
+    # engines to EACH OTHER, so it is equally satisfied by both being wrong.
+    # The correctness assertion lives in
+    # `tests/test_aggregation_stage_results.py`.
     docs = [
         {"_id": 1, "k": 1, "v": 10},
         {"_id": 2, "k": 1.0, "v": 5},

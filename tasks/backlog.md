@@ -6786,6 +6786,36 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `tests/test_todate_string_formats.py` and
   `tests/test_mongod_differential.py -k todate`.
 
+- [ ] **OPEN — aggregation stage RESULTS: 6 shapes (Python) / 7 (Rust) still
+  divergent, measured 2026-09-09.** New surface: `aggregation_stage_specs.py`
+  compares stage ERRORS; `tools/probes/aggregation_stage_results.py` compares
+  the DOCUMENTS a well-formed stage emits. First run found 12 / 14 of 48
+  divergent; the fixes below closed the worst, and these remain.
+
+  | shape | mongod | ours |
+  | --- | --- | --- |
+  | `$project: {"sub.k": 1}` over `{sub: {}}` | emits `sub: {}` | omits `sub` (both servers) |
+  | `$group: {n: {$count: {}}}` | works | `168` on PYTHON only; Rust supports it |
+  | `$bucket` over a mixed corpus | count 3 in bucket `1` | count 2 (both) |
+  | `$bucketAuto` boundary | `max: 2` | `max: Decimal128("1.5")` (both) |
+  | `$setWindowFields` output order | sorted by `sortBy` | original document order (both) |
+  | `$group: {hi: {$max}}` over `{NaN, inf}` | `inf` | `NaN` (RUST only) |
+  | `$group: {_id: "$v"}` over a MinKey | works | `2` whole-stage error (RUST only) |
+
+  Two notes worth keeping:
+
+  - **`$setWindowFields` output order IS promised.** Probed both insertion
+    orders on 8.2.11: it emits sorted by `sortBy` regardless. So ours is a real
+    divergence, not an unpromised order -- and wrong order is wrong RESULTS
+    under a `$limit`.
+  - **`$sortByCount` tie order is NOT promised.** Same probe, both insert
+    orders, same output -- it is mongod's hash order, like the upsert seed's
+    field order. The probe compares those as a multiset for that reason.
+
+  The Rust `$group` key still defers on MinKey / MaxKey / Timestamp / Binary /
+  Regex / Code, and a defer on the standalone server is an ERROR -- the same
+  stale-gate shape as `is_sortable` below, one function further.
+
 - [x] **RESOLVED 2026-09-09 — the decimal trig/hyperbolic family, and the
   "correctly-rounded vs track-mongod" question is SETTLED by measurement.**
 
