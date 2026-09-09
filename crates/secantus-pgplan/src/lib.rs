@@ -15,6 +15,7 @@ use bson::{doc, Bson, Document};
 
 pub mod acl;
 pub mod bytea;
+pub mod escape_strings;
 pub mod geo;
 pub mod json;
 pub mod net;
@@ -114,6 +115,10 @@ pub enum Error {
     /// A FOREIGN KEY whose referenced columns carry no unique constraint ->
     /// 42830 (invalid_foreign_key).
     InvalidForeignKey(String),
+    /// Something PostgreSQL itself refuses as unsupported -> 0A000, worded
+    /// as it words it. Distinct from `Unsupported`, which is a gap in THIS
+    /// server and says so.
+    FeatureNotSupported(String),
 }
 
 impl std::fmt::Display for Error {
@@ -121,6 +126,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::Parse(m) => write!(f, "{m}"),
             Error::Unsupported(m) => write!(f, "{m} is not supported yet"),
+            Error::FeatureNotSupported(m) => write!(f, "{m}"),
             Error::UndefinedColumn(c) => write!(f, "column \"{c}\" does not exist"),
             Error::UndefinedField(m) => write!(f, "{m}"),
             Error::UndefinedTable(t) => write!(f, "relation \"{t}\" does not exist"),
@@ -175,8 +181,8 @@ impl Error {
     /// The SQLSTATE a client should see.
     pub fn sqlstate(&self) -> &'static str {
         match self {
-            Error::Parse(_) => "42601",       // syntax_error
-            Error::Unsupported(_) => "0A000", // feature_not_supported
+            Error::Parse(_) => "42601", // syntax_error
+            Error::Unsupported(_) | Error::FeatureNotSupported(_) => "0A000", // feature_not_supported
             Error::UndefinedColumn(_) | Error::UndefinedField(_) => "42703",
             Error::UndefinedTable(_) => "42P01",
             Error::Grouping(_) => "42803",    // grouping_error
@@ -1056,8 +1062,19 @@ pub fn identifier_position(sql: &str, name: &str) -> Option<usize> {
     None
 }
 
+/// libpg_query's own message, without the `Error splitting: ` / `Invalid
+/// statement: ` label the Rust binding prefixes it with: the message IS
+/// PostgreSQL's (`syntax error at or near "selct"`), and the label reached
+/// the client's `message_primary`.
+fn parse_error(e: pg_query::Error) -> Error {
+    Error::Parse(match e {
+        pg_query::Error::Parse(m) | pg_query::Error::Split(m) | pg_query::Error::Scan(m) => m,
+        other => other.to_string(),
+    })
+}
+
 pub fn split_statements(sql: &str) -> Result<Vec<String>> {
-    let parts = pg_query::split_with_parser(sql).map_err(|e| Error::Parse(e.to_string()))?;
+    let parts = pg_query::split_with_parser(sql).map_err(parse_error)?;
     Ok(parts
         .into_iter()
         .map(str::trim)
@@ -1067,7 +1084,7 @@ pub fn split_statements(sql: &str) -> Result<Vec<String>> {
 }
 
 fn parse_one(sql: &str) -> Result<N> {
-    let parsed = pg_query::parse(sql).map_err(|e| Error::Parse(e.to_string()))?;
+    let parsed = pg_query::parse(sql).map_err(parse_error)?;
     let mut stmts = parsed.protobuf.stmts;
     if stmts.len() > 1 {
         return Err(Error::MultipleCommands);

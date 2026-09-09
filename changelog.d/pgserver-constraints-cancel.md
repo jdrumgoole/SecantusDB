@@ -67,6 +67,19 @@ refused at CREATE (`42703`, `42830`).
   defaults to it with PostgreSQL's `defaulting grantor to user ID 10`
   WARNING, and a planner WARNING now reaches the client as a
   NoticeResponse.
+- Rust PostgreSQL server: `SET standard_conforming_strings TO off` is
+  honoured and reported. A plain `'...'` literal is then read with the
+  pre-9.1 backslash escapes (`'a\'b'`, `'p\nq'`, `'\\'`), `E'...'`,
+  `B'...'`, `X'...'` and `$$...$$` keep their own rules, a statement is read
+  under the setting in force when it is prepared, and `U&'...'` is refused
+  as PostgreSQL refuses it (`0A000 unsafe use of string constant with
+  Unicode escapes`). `escape_string_warning` (default on) raises PostgreSQL's
+  `22P06 nonstandard use of \' / \\ / escape in a string literal` WARNING
+  per literal, with its hint and position. Both GUCs are validated as
+  Booleans in every spelling PostgreSQL accepts (`22023 parameter "x"
+  requires a Boolean value`), and the `standard_conforming_strings` value is
+  sent as a `ParameterStatus` — which is what libpq's `PQescapeString`
+  follows — because the server now obeys it.
 
 #### Fixed
 
@@ -109,3 +122,8 @@ refused at CREATE (`42703`, `42830`).
   cannot cast type record to rtt` with `Input has too few columns.` /
   `Input has too many columns.`; a planner error's `Detail:` line now travels
   in the error's detail field rather than its message.
+- Rust PostgreSQL server: a syntax error's message is PostgreSQL's alone —
+  `syntax error at or near "selct"`, `unterminated quoted string at or near
+  "'q"` — without the `Error splitting: ` / `Invalid statement: ` label the
+  libpg_query Rust binding prefixes it with, which reached the client's
+  `message_primary` on every syntax error.

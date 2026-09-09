@@ -7506,3 +7506,143 @@ def test_aclitem_parses_and_renders_as_postgresql(home: Path) -> None:
                 conn.execute(sql)
             assert (exc.value.sqlstate, exc.value.diag.message_primary) == (sqlstate, message), sql
             assert exc.value.diag.message_hint == hint, sql
+
+
+def test_standard_conforming_strings_off_is_honoured_and_reported(home: Path) -> None:
+    """``SET standard_conforming_strings TO off`` changes how the server READS
+    a plain string literal, and is reported to the client only because it does.
+
+    psycopg's ``test_quote_stable_despite_deranged_libpq`` flips the setting
+    and checks libpq's ``PQescapeString`` follows the report. Every message
+    and position here was measured on PostgreSQL 16.
+    """
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        notices: list[tuple[str, str | None, str, str | None, str | None]] = []
+        conn.add_notice_handler(
+            lambda d: notices.append(
+                (
+                    d.severity or "",
+                    d.sqlstate,
+                    d.message_primary or "",
+                    d.message_hint,
+                    d.statement_position,
+                )
+            )
+        )
+        assert conn.info.parameter_status("standard_conforming_strings") == "on"
+        assert conn.execute("select 'a\\nb', '\\\\'").fetchone() == ("a\\nb", "\\\\")
+        assert notices == []
+
+        conn.execute("set standard_conforming_strings to off")
+        assert conn.info.parameter_status("standard_conforming_strings") == "off"
+        assert conn.execute("show standard_conforming_strings").fetchone() == ("off",)
+        cur = conn.execute(
+            "select 'a\\'b', 'x\\\\y', 'p\\nq', 'r\\101s', 'c''d', E'\\\\', $$e\\f$$, %s",
+            ["z"],
+        )
+        assert cur.fetchone() == ("a'b", "x\\y", "p\nq", "rAs", "c'd", "\\", "e\\f", "z")
+        # One WARNING per literal, for its FIRST escape, worded by that escape
+        # and positioned at the literal.
+        assert notices == [
+            (
+                "WARNING",
+                "22P06",
+                "nonstandard use of \\' in a string literal",
+                "Use '' to write quotes in strings, or use the escape string syntax (E'...').",
+                "8",
+            ),
+            (
+                "WARNING",
+                "22P06",
+                "nonstandard use of \\\\ in a string literal",
+                "Use the escape string syntax for backslashes, e.g., E'\\\\'.",
+                "16",
+            ),
+            (
+                "WARNING",
+                "22P06",
+                "nonstandard use of escape in a string literal",
+                "Use the escape string syntax for escapes, e.g., E'\\r\\n'.",
+                "24",
+            ),
+            (
+                "WARNING",
+                "22P06",
+                "nonstandard use of escape in a string literal",
+                "Use the escape string syntax for escapes, e.g., E'\\r\\n'.",
+                "32",
+            ),
+        ]
+        notices.clear()
+
+        # A literal continued over a newline is one literal; comments, quoted
+        # identifiers and dollar-quoted bodies are not literals.
+        sql = "select 'a\\'b'\n'\\\\' as \"c'\\\" /* '\\' */ -- 'x\\'"
+        assert conn.execute(sql).fetchone() == ("a'b\\",)
+        assert [n[2] for n in notices] == ["nonstandard use of \\' in a string literal"]
+        notices.clear()
+
+        # The warnings precede the error of an unterminated literal, which is
+        # named as written, not as rewritten.
+        with pytest.raises(psycopg.errors.SyntaxError) as exc:
+            conn.execute("select 'q\\'")
+        assert _diag(exc.value)[:2] == ("42601", "unterminated quoted string at or near \"'q\\'\"")
+        assert [n[2] for n in notices] == ["nonstandard use of \\' in a string literal"]
+        notices.clear()
+
+        with pytest.raises(psycopg.errors.FeatureNotSupported) as exc:
+            conn.execute("select U&'d\\0061t'")
+        assert _diag(exc.value)[:3] == (
+            "0A000",
+            "unsafe use of string constant with Unicode escapes",
+            "String constants with Unicode escapes cannot be used when"
+            " standard_conforming_strings is off.",
+        )
+
+        # `escape_string_warning` silences the notices, not the reading.
+        conn.execute("set escape_string_warning to off")
+        assert conn.execute("select 'a\\nb'").fetchone() == ("a\nb",)
+        assert notices == []
+        conn.execute("reset escape_string_warning")
+
+        # A statement is read under the setting in force when it is PREPARED.
+        cur = conn.cursor()
+        assert cur.execute("select 'a\\nb' || %s", ["!"], prepare=True).fetchone() == ("a\nb!",)
+        conn.execute("set standard_conforming_strings to on")
+        assert conn.info.parameter_status("standard_conforming_strings") == "on"
+        assert cur.execute("select 'a\\nb' || %s", ["!"], prepare=True).fetchone() == ("a\nb!",)
+        assert conn.execute("select 'a\\nb'").fetchone() == ("a\\nb",)
+
+        # `set_config` reports it too; the value is a Boolean in any spelling.
+        assert conn.execute(
+            "select set_config('standard_conforming_strings', 'of', false)"
+        ).fetchone() == ("off",)
+        assert conn.info.parameter_status("standard_conforming_strings") == "off"
+        for spelling, value in [("yes", "on"), ("0", "off"), ("TRUE", "on"), ("n", "off")]:
+            conn.execute(f"set standard_conforming_strings to {spelling}")
+            assert conn.execute("show standard_conforming_strings").fetchone() == (value,)
+        for guc in ["standard_conforming_strings", "escape_string_warning"]:
+            with pytest.raises(psycopg.errors.InvalidParameterValue) as exc:
+                conn.execute(f"set {guc} to bogus")
+            assert _diag(exc.value)[:2] == ("22023", f'parameter "{guc}" requires a Boolean value')
+        conn.execute("reset standard_conforming_strings")
+        assert conn.info.parameter_status("standard_conforming_strings") == "on"
+
+
+def test_syntax_errors_carry_postgresqls_message_only(home: Path) -> None:
+    """A syntax error's ``message_primary`` is PostgreSQL's text, without the
+    ``Error splitting: `` label libpg_query's Rust binding prefixes it with."""
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        for sql, message in [
+            ("selct 1", 'syntax error at or near "selct"'),
+            ("select 1 from", "syntax error at end of input"),
+            ("select 'q", 'unterminated quoted string at or near "\'q"'),
+            ("select $$x", 'unterminated dollar-quoted string at or near "$$x"'),
+            ('select "q', 'unterminated quoted identifier at or near ""q"'),
+        ]:
+            with pytest.raises(psycopg.errors.SyntaxError) as exc:
+                conn.execute(sql)
+            assert _diag(exc.value)[:2] == ("42601", message)
+            with pytest.raises(psycopg.errors.SyntaxError) as exc:
+                conn.execute(sql, prepare=True)
+            assert _diag(exc.value)[:2] == ("42601", message)

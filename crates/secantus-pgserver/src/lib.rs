@@ -2826,6 +2826,37 @@ fn canonical_ms_guc(name: &str, value: &str) -> PgWireResult<String> {
     }
 }
 
+/// The boolean GUCs whose value this server OBEYS, so `SET` validates them as
+/// PostgreSQL does (`22023 parameter "x" requires a Boolean value`) and
+/// stores the canonical `on` / `off` a client reads back.
+const BOOL_GUCS: [&str; 2] = ["standard_conforming_strings", "escape_string_warning"];
+
+/// PostgreSQL's `parse_bool`: `on` / `off` / `true` / `false` / `yes` / `no`
+/// / `1` / `0`, case-insensitively, and any unambiguous prefix of the words
+/// (`t`, `of`, `n`; measured on 16).
+fn canonical_bool_guc(name: &str, value: &str) -> PgWireResult<String> {
+    let v = value.trim().to_ascii_lowercase();
+    let prefix_of = |word: &str| !v.is_empty() && word.starts_with(&v);
+    let parsed = if v == "1" || prefix_of("true") || prefix_of("yes") || v == "on" {
+        Some("on")
+    } else if v == "0"
+        || prefix_of("false")
+        || prefix_of("no")
+        || (v.len() >= 2 && prefix_of("off"))
+    {
+        Some("off")
+    } else {
+        None
+    };
+    parsed.map(str::to_string).ok_or_else(|| {
+        PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".into(),
+            "22023".into(),
+            format!("parameter \"{name}\" requires a Boolean value"),
+        )))
+    })
+}
+
 /// The settings a fresh connection starts with, matching what a client expects
 /// to read back before it has set anything.
 fn default_settings() -> HashMap<String, String> {
@@ -2835,6 +2866,7 @@ fn default_settings() -> HashMap<String, String> {
         ("TimeZone", "UTC"),
         ("IntervalStyle", "postgres"),
         ("standard_conforming_strings", "on"),
+        ("escape_string_warning", "on"),
         ("integer_datetimes", "on"),
         ("transaction_read_only", "off"),
         // Transaction GUCs psycopg reads to learn the connection's defaults.
@@ -3303,9 +3335,26 @@ impl SimpleQueryHandler for PgHandler {
         // other error, so the next statement gets `25P02`. Recording it here
         // is the simple-protocol twin of the `Describe` note in
         // `describe_fields`.
-        let stmts = secantus_pgplan::split_statements(query)
-            .map_err(|e| Self::err(&e))
-            .inspect_err(|_| self.note_failure())?;
+        // The text is read under the session's string syntax first (see
+        // `apply_string_syntax`); an error there is a syntax error like any
+        // other, and the scanner's warnings precede the error they led up to.
+        let query = match self.apply_string_syntax(query) {
+            Ok(query) => query,
+            Err(e) => {
+                self.note_failure();
+                self.flush_notices(_c).await?;
+                return Err(e);
+            }
+        };
+        let query = query.as_str();
+        let stmts = match secantus_pgplan::split_statements(query) {
+            Ok(stmts) => stmts,
+            Err(e) => {
+                self.note_failure();
+                self.flush_notices(_c).await?;
+                return Err(Self::err(&e));
+            }
+        };
         let out = if stmts.len() <= 1 {
             self.run(query, &[], 0).await
         } else {
@@ -3852,6 +3901,10 @@ impl PgHandler {
             "TimeZone" => (true, value.to_string()),
             "DateStyle" => (true, secantus_pgplan::DateStyle::parse(value).canonical()),
             "client_encoding" => (true, value.to_string()),
+            //  - standard_conforming_strings: the statement text is read under
+            //    it (`apply_string_syntax`), so libpq's `PQescapeString` may
+            //    follow the report -- it switches its own escaping on it.
+            "standard_conforming_strings" => (true, value.to_string()),
             _ => (false, String::new()),
         };
         if report {
@@ -4472,6 +4525,49 @@ impl PgHandler {
 
     /// Queue the WARNINGs the planner raised on this thread (an `aclitem`
     /// with no grantor) as NoticeResponses for the statement in flight.
+    /// Read statement text the way the session's `standard_conforming_strings`
+    /// says to. The parser only knows the setting ON, so when it is off every
+    /// plain literal is rewritten to the `E'...'` it means, and the scanner's
+    /// `escape_string_warning` notices are queued (see
+    /// `secantus_pgplan::escape_strings`). This runs where the text ARRIVES
+    /// -- the simple `Query` and the extended `Parse` -- because that is when
+    /// PostgreSQL's scanner reads it: a statement prepared under one setting
+    /// keeps its meaning when the setting later changes.
+    fn apply_string_syntax(&self, sql: &str) -> PgWireResult<String> {
+        let (conforming, warn) = {
+            let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                settings
+                    .get("standard_conforming_strings")
+                    .is_none_or(|v| v != "off"),
+                settings
+                    .get("escape_string_warning")
+                    .is_none_or(|v| v != "off"),
+            )
+        };
+        if conforming {
+            return Ok(sql.to_string());
+        }
+        let (rewritten, warnings) = secantus_pgplan::escape_strings::rewrite(sql, warn);
+        if !warnings.is_empty() {
+            let mut pending = self
+                .pending_notices
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for w in warnings {
+                let mut info = ErrorInfo::new(
+                    "WARNING".into(),
+                    secantus_pgplan::escape_strings::SQLSTATE.into(),
+                    w.message,
+                );
+                info.hint = Some(w.hint);
+                info.position = Some(w.position.to_string());
+                pending.push(info);
+            }
+        }
+        rewritten.map_err(|e| Self::err(&e))
+    }
+
     fn collect_planner_warnings(&self) {
         let warnings = secantus_pgplan::take_warnings();
         if warnings.is_empty() {
@@ -4561,6 +4657,8 @@ impl PgHandler {
                     // the client's loader).
                     let text = if key == "DateStyle" {
                         secantus_pgplan::DateStyle::parse(&text).canonical()
+                    } else if BOOL_GUCS.contains(&key.as_str()) {
+                        canonical_bool_guc(&key, &text)?
                     } else {
                         text
                     };
@@ -6422,6 +6520,8 @@ impl PgHandler {
                         secantus_pgplan::DateStyle::parse(&value).canonical()
                     } else if IDLE_TIMEOUT_GUCS.iter().any(|(guc, _, _)| *guc == key) {
                         canonical_ms_guc(&key, &value)?
+                    } else if BOOL_GUCS.contains(&key.as_str()) {
+                        canonical_bool_guc(&key, &value)?
                     } else {
                         value
                     };
@@ -10322,7 +10422,14 @@ impl ExtendedQueryHandler for PgHandler {
     {
         let parser = <Self as ExtendedQueryHandler>::query_parser(self);
         let mut message = message;
-        message.query = <Self as ExtendedQueryHandler>::decode_query_text(self, client, &message)?;
+        let decoded = <Self as ExtendedQueryHandler>::decode_query_text(self, client, &message)?;
+        // Read under the session's string syntax at Parse time, when
+        // PostgreSQL's scanner reads it; the scanner's warnings
+        // (`escape_string_warning`) go out with the Parse they belong to, and
+        // before its error when the text is unterminated.
+        let rewritten = self.apply_string_syntax(&decoded);
+        self.flush_notices(client).await?;
+        message.query = rewritten?;
         let stmt = StoredStatement::parse(client, &message, parser).await?;
         // The message's own name, not `stmt.id`: the wire store files the
         // unnamed statement under its `DEFAULT_NAME` placeholder.

@@ -592,15 +592,12 @@ remain open:
       CI never sees it). The `cancel_safe_*` pair import `pproxy`
       (`tests/fix_proxy.py`), which the venv does not carry. Nothing to do
       server-side; count the three as harness failures on macOS.
-- [ ] **OPEN — RUST pgserver: `standard_conforming_strings` is not reported as
-      a `ParameterStatus` on `SET` (`test_sql.py::test_quote_stable_despite_
-      deranged_libpq[off]`, 2026-09-09).** The test runs `set
-      standard_conforming_strings to off` and expects libpq's
-      `PQparameterStatus` to flip so `quote_literal` output changes; PG 16.15
-      reports the new value and renders `E'\\'` style literals. The Rust
-      planner's parser (pg_query) has the setting hard-wired ON, so the server
-      could only ANNOUNCE a value it does not honour — per the "only report GUCs
-      you honor" rule it stays silent. The `[on]` variant passes.
+- RUST pgserver: `standard_conforming_strings = off` is honoured by a lexer
+  pass that rewrites each plain literal to the `E'...'` it means before
+  pg_query (which has the setting hard-wired on) sees it, with the
+  `escape_string_warning` notices; `N'...'` literals are not rewritten (they
+  keep the conforming reading), and `backslash_quote` is not a setting
+  (2026-09-09).
 - [ ] **OPEN — RUST pgserver: `test_sql.py::TestLiteral::test_invalid_name[*]`
       needs shell types + `CREATE FUNCTION ... LANGUAGE internal` + `CREATE
       TYPE (input=..., output=...)` (`DefineStmt`, 2026-09-09).** The test
