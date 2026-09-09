@@ -260,6 +260,15 @@ pub enum Statement {
         if_exists: bool,
         cascade: bool,
     },
+    /// `CREATE DATABASE <name>` -- the options are accepted and ignored.
+    CreateDatabase {
+        name: String,
+    },
+    /// `DROP DATABASE [IF EXISTS] <name>`.
+    DropDatabase {
+        name: String,
+        if_exists: bool,
+    },
     /// `SHOW name` -- one row, one text column named canonically.
     Show(String),
     /// `SET name = value`.
@@ -767,6 +776,9 @@ pub enum ConstCol {
     /// `current_user` / `session_user` / `user` / `current_role` -- the role
     /// the client connected as, which only the server's session knows.
     SessionUser,
+    /// `current_database()` / `current_catalog` -- the database the client
+    /// connected to, which only the server's session knows.
+    CurrentDatabase,
     /// `pg_sleep(seconds)` -- the argument is already cast to `float8` (or
     /// NULL). The sleep happens at execution, on the connection's own thread,
     /// so it costs the caller exactly the wait PostgreSQL would.
@@ -1076,6 +1088,13 @@ pub fn plan_with_params(
         N::CreateSchemaStmt(c) => Ok(Statement::CreateSchema {
             name: c.schemaname.clone(),
             if_not_exists: c.if_not_exists,
+        }),
+        N::CreatedbStmt(c) => Ok(Statement::CreateDatabase {
+            name: c.dbname.clone(),
+        }),
+        N::DropdbStmt(d) => Ok(Statement::DropDatabase {
+            name: d.dbname.clone(),
+            if_exists: d.missing_ok,
         }),
         // `CREATE TYPE name AS (field type, ...)` -- a composite type.
         N::CompositeTypeStmt(ct) => {
@@ -3627,7 +3646,6 @@ fn session_function(name: &str) -> Option<Bson> {
             "PostgreSQL 15.0 (SecantusDB) on {}, compiled by rust",
             std::env::consts::ARCH
         )),
-        "current_database" | "current_catalog" => Bson::String("postgres".into()),
         "current_schema" => Bson::String("public".into()),
         _ => return None,
     })
@@ -4499,10 +4517,14 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                     ));
                     continue;
                 }
-                let v = session_function(&name)
-                    .ok_or_else(|| Error::Unsupported(format!("function {name}()")))?;
-                let t = inferred_type(&v).to_string();
-                (name, ConstCol::Value(v), t, -1)
+                if name == "current_database" || name == "current_catalog" {
+                    (name, ConstCol::CurrentDatabase, "name".to_string(), -1)
+                } else {
+                    let v = session_function(&name)
+                        .ok_or_else(|| Error::Unsupported(format!("function {name}()")))?;
+                    let t = inferred_type(&v).to_string();
+                    (name, ConstCol::Value(v), t, -1)
+                }
             }
             // `user`, `current_user`, `current_date` and the other keyword
             // functions: the role ones resolve on the server, which knows
@@ -4516,10 +4538,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                     Op::SvfopUser => ("user", ConstCol::SessionUser),
                     Op::SvfopSessionUser => ("session_user", ConstCol::SessionUser),
                     Op::SvfopCurrentRole => ("current_role", ConstCol::SessionUser),
-                    Op::SvfopCurrentCatalog => (
-                        "current_catalog",
-                        ConstCol::Value(Bson::String("postgres".into())),
-                    ),
+                    Op::SvfopCurrentCatalog => ("current_catalog", ConstCol::CurrentDatabase),
                     Op::SvfopCurrentSchema => (
                         "current_schema",
                         ConstCol::Value(Bson::String("public".into())),
@@ -4546,10 +4565,14 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                         _ => None,
                     })
                     .ok_or_else(|| Error::Unsupported("this target".into()))?;
-                let v =
-                    session_function(&name).ok_or_else(|| Error::UndefinedColumn(name.clone()))?;
-                let t = inferred_type(&v).to_string();
-                (name, ConstCol::Value(v), t, -1)
+                if name == "current_database" || name == "current_catalog" {
+                    (name, ConstCol::CurrentDatabase, "name".to_string(), -1)
+                } else {
+                    let v = session_function(&name)
+                        .ok_or_else(|| Error::UndefinedColumn(name.clone()))?;
+                    let t = inferred_type(&v).to_string();
+                    (name, ConstCol::Value(v), t, -1)
+                }
             }
             Some(
                 node @ (N::AConst(_)

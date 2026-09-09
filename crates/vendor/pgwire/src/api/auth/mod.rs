@@ -315,7 +315,7 @@ where
     client.session_extensions().insert::<ConnectionGuard>(guard);
 }
 
-pub(crate) async fn finish_authentication0<C, P>(
+pub async fn finish_authentication0<C, P>(
     client: &mut C,
     server_parameter_provider: &P,
 ) -> PgWireResult<()>

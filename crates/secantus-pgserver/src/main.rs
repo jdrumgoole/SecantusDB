@@ -3,15 +3,36 @@
 use std::sync::mpsc;
 use std::sync::Arc;
 
-use secantus_pgserver::{HandlerFactory, PgHandler};
+use secantus_pgserver::{DatabaseRegistry, HandlerFactory, PgHandler};
 use secantus_storage::Storage;
 use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `secantusd-pg [<home> [<addr>]] [--database NAME]...`: every
+    // `--database` is one more name a client may connect to without a
+    // `CREATE DATABASE` first; the builtin `postgres` / `template1` always are.
+    let mut home: Option<String> = None;
+    let mut addr: Option<String> = None;
+    let mut databases: Vec<String> = Vec::new();
     let mut args = std::env::args().skip(1);
-    let home = args.next().unwrap_or_else(|| "./secantus-pg-data".into());
-    let addr = args.next().unwrap_or_else(|| "127.0.0.1:25434".into());
+    while let Some(arg) = args.next() {
+        if arg == "--database" {
+            let name = args.next().ok_or("--database needs a name")?;
+            databases.push(name);
+        } else if let Some(name) = arg.strip_prefix("--database=") {
+            databases.push(name.to_string());
+        } else if home.is_none() {
+            home = Some(arg);
+        } else if addr.is_none() {
+            addr = Some(arg);
+        } else {
+            return Err(format!("unexpected argument: {arg}").into());
+        }
+    }
+    let home = home.unwrap_or_else(|| "./secantus-pg-data".into());
+    let addr = addr.unwrap_or_else(|| "127.0.0.1:25434".into());
+    let databases = Arc::new(DatabaseRegistry::new("postgres", databases));
 
     let storage = Arc::new(Storage::open(&home)?);
     let listener = TcpListener::bind(&addr).await?;
@@ -28,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                let handler = Arc::new(PgHandler::new(storage.clone(), "postgres"));
+                let handler = Arc::new(PgHandler::new(storage.clone(), databases.clone()));
                 tokio::spawn(async move {
                     let _ = pgwire::tokio::process_socket(
                         sock,

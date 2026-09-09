@@ -593,19 +593,6 @@ remain open:
       CI never sees it). The `cancel_safe_*` pair import `pproxy`
       (`tests/fix_proxy.py`), which the venv does not carry. Nothing to do
       server-side; count the three as harness failures on macOS.
-- [ ] **OPEN — RUST pgserver: `test_connect_bad` — connecting with a nonexistent
-      database is accepted, not rejected with `3D000`.** The server hardcodes the
-      `postgres` namespace (`PgHandler::new(storage, "postgres")`) and ignores the
-      startup `database` parameter entirely, so `dbname=nosuchdb` silently uses
-      `postgres` storage. A real fix needs a database registry and a startup-time
-      rejection (FATAL `3D000` before `ReadyForQuery`); the server has no
-      multi-database concept today. Deferred — separate feature, not error mapping.
-      Re-measured 2026-09-09: PG 16.15 answers `FATAL: database "nosuchdb" does
-      not exist` (`3D000`); `test_pgconn_error` / `test_pgconn_error_pickle` in
-      psycopg's `test_errors.py` fail on the same gap. A naive "reject anything
-      but `postgres`" would break the pgjdbc gauge, which connects with
-      `PGDBNAME=test` — the fix needs a database registry, `CREATE DATABASE`,
-      and a runner-side create step for that gauge.
 - [ ] **OPEN — RUST pgserver: `standard_conforming_strings` is not reported as
       a `ParameterStatus` on `SET` (`test_sql.py::test_quote_stable_despite_
       deranged_libpq[off]`, 2026-09-09).** The test runs `set

@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use bson::{Bson, Document};
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::{stream, Sink, SinkExt, StreamExt, TryStreamExt};
-use pgwire::api::auth::noop::NoopStartupHandler;
+use pgwire::api::auth::{DefaultServerParameterProvider, StartupHandler};
 use pgwire::api::copy::CopyHandler;
 use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{send_describe_response, ExtendedQueryHandler, SimpleQueryHandler};
@@ -32,6 +32,7 @@ use pgwire::api::results::{CopyResponse, DescribePortalResponse, DescribeStateme
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::{ClientInfo, ClientPortalStore, PgWireServerHandlers, Type, DEFAULT_NAME};
+use pgwire::api::{PidSecretKeyGenerator, RandomPidSecretKeyGenerator};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
 use pgwire::messages::data::DataRow;
@@ -166,10 +167,188 @@ fn bson_i64(v: &Bson) -> Option<i64> {
     }
 }
 
+/// One row of `pg_database`: a database this server will accept a connection to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DatabaseInfo {
+    pub oid: i64,
+    pub name: String,
+    pub is_template: bool,
+    pub allow_conn: bool,
+}
+
+/// The databases this server has, which is what a startup packet's `database`
+/// is checked against (an unknown name is FATAL `3D000`, as PostgreSQL's is).
+///
+/// Three sources, in `pg_database` order: the builtin `template1` /
+/// `template0` / `postgres` (oids 1 / 4 / 5, as `initdb` numbers them), the
+/// names the daemon was started with (`--database`, so a harness can serve a
+/// name without a `CREATE DATABASE` first), and the ones `CREATE DATABASE`
+/// recorded -- persisted in a namespace of their own so that dropping any
+/// user database, the default one included, cannot take the registry with it.
+pub struct DatabaseRegistry {
+    /// The storage namespace a connection lands in when it names no database
+    /// the registry knows a namespace for -- every `dbname=postgres` gauge.
+    default: String,
+    /// `--database` names. A `Mutex` because `DROP DATABASE` removes one.
+    configured: Mutex<Vec<String>>,
+}
+
+impl DatabaseRegistry {
+    /// The namespace and collection the `CREATE DATABASE` records live in.
+    const NAMESPACE: &'static str = "__secantus_pg__";
+    const COLLECTION: &'static str = "databases";
+    /// Where `initdb` starts user oids.
+    const FIRST_USER_OID: i64 = 16384;
+
+    pub fn new(default: &str, configured: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            default: default.to_string(),
+            configured: Mutex::new(configured.into_iter().collect()),
+        }
+    }
+
+    pub fn default_db(&self) -> &str {
+        &self.default
+    }
+
+    fn builtin() -> [DatabaseInfo; 3] {
+        let info = |oid, name: &str, is_template, allow_conn| DatabaseInfo {
+            oid,
+            name: name.to_string(),
+            is_template,
+            allow_conn,
+        };
+        [
+            info(1, "template1", true, true),
+            info(4, "template0", true, false),
+            info(5, "postgres", false, true),
+        ]
+    }
+
+    /// The `CREATE DATABASE` records, in oid order.
+    fn persisted(&self, storage: &Storage) -> PgWireResult<Vec<DatabaseInfo>> {
+        let exists = storage
+            .collection_exists(Self::NAMESPACE, Self::COLLECTION)
+            .map_err(|e| PgHandler::storage_err("could not read the databases", e))?;
+        if !exists {
+            return Ok(Vec::new());
+        }
+        let mut out: Vec<DatabaseInfo> = storage
+            .find_matching(Self::NAMESPACE, Self::COLLECTION, &Document::new())
+            .map_err(|e| PgHandler::storage_err("could not read the databases", e))?
+            .iter()
+            .filter_map(|bytes| bson::from_slice::<Document>(bytes).ok())
+            .filter_map(|d| {
+                Some(DatabaseInfo {
+                    oid: d.get("oid").and_then(bson_i64)?,
+                    name: d.get_str("_id").ok()?.to_string(),
+                    is_template: false,
+                    allow_conn: true,
+                })
+            })
+            .collect();
+        out.sort_by_key(|d| d.oid);
+        Ok(out)
+    }
+
+    /// Every database, in `pg_database` order.
+    pub fn all(&self, storage: &Storage) -> PgWireResult<Vec<DatabaseInfo>> {
+        let mut out: Vec<DatabaseInfo> = Self::builtin().to_vec();
+        let configured = self
+            .configured
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut next_oid = Self::FIRST_USER_OID;
+        for name in configured {
+            if out.iter().any(|d| d.name == name) {
+                continue;
+            }
+            next_oid += 1;
+            out.push(DatabaseInfo {
+                oid: next_oid,
+                name,
+                is_template: false,
+                allow_conn: true,
+            });
+        }
+        for info in self.persisted(storage)? {
+            if !out.iter().any(|d| d.name == info.name) {
+                out.push(info);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn lookup(&self, storage: &Storage, name: &str) -> PgWireResult<Option<DatabaseInfo>> {
+        Ok(self.all(storage)?.into_iter().find(|d| d.name == name))
+    }
+
+    /// Records a `CREATE DATABASE`. The caller has checked the name is new.
+    fn create(&self, storage: &Storage, name: &str) -> PgWireResult<()> {
+        let exists = storage
+            .collection_exists(Self::NAMESPACE, Self::COLLECTION)
+            .map_err(|e| PgHandler::storage_err("could not record the database", e))?;
+        if !exists {
+            storage
+                .create_collection(Self::NAMESPACE, Self::COLLECTION)
+                .map_err(|e| PgHandler::storage_err("could not record the database", e))?;
+        }
+        // Past every oid in use, so a dropped-and-recreated name gets a new
+        // one as PostgreSQL's does.
+        let oid = self
+            .all(storage)?
+            .iter()
+            .map(|d| d.oid)
+            .max()
+            .unwrap_or(Self::FIRST_USER_OID)
+            .max(Self::FIRST_USER_OID)
+            + 1;
+        let doc = bson::doc! {"_id": name, "oid": oid};
+        let bytes = bson::to_vec(&doc)
+            .map_err(|e| PgHandler::storage_err("could not encode the database", e))?;
+        storage
+            .insert(Self::NAMESPACE, Self::COLLECTION, vec![bytes], true)
+            .map_err(|e| PgHandler::storage_err("could not record the database", e))?;
+        Ok(())
+    }
+
+    /// Forgets a database and drops its data. The caller has checked it exists
+    /// and may be dropped.
+    fn remove(&self, storage: &Storage, name: &str) -> PgWireResult<()> {
+        self.configured
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|n| n != name);
+        let exists = storage
+            .collection_exists(Self::NAMESPACE, Self::COLLECTION)
+            .map_err(|e| PgHandler::storage_err("could not drop the database", e))?;
+        if exists {
+            storage
+                .delete_matching(
+                    Self::NAMESPACE,
+                    Self::COLLECTION,
+                    &bson::doc! {"_id": name},
+                    0,
+                    &Document::new(),
+                    None,
+                )
+                .map_err(|e| PgHandler::storage_err("could not drop the database", e))?;
+        }
+        storage
+            .drop_database(name)
+            .map_err(|e| PgHandler::storage_err("could not drop the database", e))?;
+        Ok(())
+    }
+}
+
 /// One database's worth of SQL over a shared `Storage`.
 pub struct PgHandler {
     storage: Arc<Storage>,
-    db: String,
+    /// The database the startup packet named, once it has been checked
+    /// against the registry; the registry's default until then.
+    db: OnceLock<String>,
+    databases: Arc<DatabaseRegistry>,
     /// The open explicit transaction, if any.
     ///
     /// One handler per connection, so this is per-session state exactly as
@@ -381,10 +560,11 @@ struct CopyInState {
 }
 
 impl PgHandler {
-    pub fn new(storage: Arc<Storage>, db: &str) -> Self {
+    pub fn new(storage: Arc<Storage>, databases: Arc<DatabaseRegistry>) -> Self {
         Self {
             storage,
-            db: db.to_string(),
+            db: OnceLock::new(),
+            databases,
             txn: Mutex::new(None),
             settings: Arc::new(Mutex::new(default_settings())),
             pending_notices: Mutex::new(Vec::new()),
@@ -401,12 +581,20 @@ impl PgHandler {
             cursor_capture: std::sync::Arc::new(Mutex::new(None)),
             backend_pid: AtomicI32::new(0),
             session_user: Mutex::new(String::new()),
-            backend: Arc::new(BackendEntry::new(db)),
+            backend: Arc::new(BackendEntry::new("")),
             deferred_fks: Mutex::new(Vec::new()),
             commit_failed: AtomicBool::new(false),
             implicit_extended: AtomicBool::new(false),
             group_failed: AtomicBool::new(false),
         }
+    }
+
+    /// The storage namespace this connection reads and writes.
+    fn db(&self) -> &str {
+        self.db
+            .get()
+            .map(String::as_str)
+            .unwrap_or_else(|| self.databases.default_db())
     }
 
     /// One output column, in the format the current statement asked for.
@@ -990,7 +1178,7 @@ impl PgHandler {
         }
         let raw = self
             .storage
-            .find_matching(&self.db, table, &Document::new())
+            .find_matching(self.db(), table, &Document::new())
             .map_err(|e| Self::storage_err("could not read", e))?;
         raw.iter()
             .map(|b| {
@@ -1043,7 +1231,7 @@ impl PgHandler {
             None => {
                 let raw = self
                     .storage
-                    .find_matching(&self.db, &agg.table, &agg.filter)
+                    .find_matching(self.db(), &agg.table, &agg.filter)
                     .map_err(|e| Self::storage_err("could not read", e))?;
                 raw.iter()
                     .map(|b| bson::from_slice(b))
@@ -1402,11 +1590,11 @@ impl PgHandler {
     fn ensure_collection(&self, coll: &str) -> PgWireResult<()> {
         let exists = self
             .storage
-            .collection_exists(&self.db, coll)
+            .collection_exists(self.db(), coll)
             .map_err(|e| Self::storage_err("could not check a catalog collection", e))?;
         if !exists {
             self.storage
-                .create_collection(&self.db, coll)
+                .create_collection(self.db(), coll)
                 .map_err(|e| Self::storage_err("could not create a catalog collection", e))?;
         }
         Ok(())
@@ -1422,7 +1610,7 @@ impl PgHandler {
     fn type_catalog_docs(&self, collection: &'static str) -> PgWireResult<Vec<Document>> {
         let raw = self
             .storage
-            .find_matching(&self.db, collection, &Document::new())
+            .find_matching(self.db(), collection, &Document::new())
             .map_err(|e| Self::storage_err("could not read the type catalog", e))?;
         let mut by_id: std::collections::BTreeMap<String, Document> =
             std::collections::BTreeMap::new();
@@ -1618,7 +1806,7 @@ impl PgHandler {
         let counter = self
             .storage
             .find_matching(
-                &self.db,
+                self.db(),
                 Self::ENUM_META_COLLECTION,
                 &bson::doc! {"_id": key},
             )
@@ -1640,7 +1828,7 @@ impl PgHandler {
         };
         self.storage
             .delete_matching(
-                &self.db,
+                self.db(),
                 Self::ENUM_META_COLLECTION,
                 &bson::doc! {"_id": key},
                 0,
@@ -1652,7 +1840,7 @@ impl PgHandler {
         let bytes = bson::to_vec(&doc)
             .map_err(|e| Self::storage_err("could not encode the oid counter", e))?;
         self.storage
-            .insert(&self.db, Self::ENUM_META_COLLECTION, vec![bytes], true)
+            .insert(self.db(), Self::ENUM_META_COLLECTION, vec![bytes], true)
             .map_err(|e| Self::storage_err("could not advance the oid counter", e))?;
         Ok(oid)
     }
@@ -1718,7 +1906,7 @@ impl PgHandler {
         let counter = self
             .storage
             .find_matching(
-                &self.db,
+                self.db(),
                 Self::ENUM_META_COLLECTION,
                 &bson::doc! {"_id": "oid_counter"},
             )
@@ -1740,7 +1928,7 @@ impl PgHandler {
         };
         self.storage
             .delete_matching(
-                &self.db,
+                self.db(),
                 Self::ENUM_META_COLLECTION,
                 &bson::doc! {"_id": "oid_counter"},
                 0,
@@ -1752,7 +1940,7 @@ impl PgHandler {
         let bytes = bson::to_vec(&doc)
             .map_err(|e| Self::storage_err("could not encode the oid counter", e))?;
         self.storage
-            .insert(&self.db, Self::ENUM_META_COLLECTION, vec![bytes], true)
+            .insert(self.db(), Self::ENUM_META_COLLECTION, vec![bytes], true)
             .map_err(|e| Self::storage_err("could not advance the oid counter", e))?;
         Ok(oid)
     }
@@ -1833,6 +2021,28 @@ impl PgHandler {
             // Every live backend of this server, PostgreSQL 16's column set
             // in its order; the columns a single-node server has no value
             // for (client address, wait events, xids, query_id) are NULL.
+            "pg_database" => Some(TableDef::new(
+                "pg_database",
+                vec![
+                    secantus_pgcatalog::Column::new("oid", "oid", false),
+                    secantus_pgcatalog::Column::new("datname", "name", false),
+                    secantus_pgcatalog::Column::new("datdba", "oid", false),
+                    secantus_pgcatalog::Column::new("encoding", "int4", false),
+                    secantus_pgcatalog::Column::new("datlocprovider", "char", false),
+                    secantus_pgcatalog::Column::new("datistemplate", "bool", false),
+                    secantus_pgcatalog::Column::new("datallowconn", "bool", false),
+                    secantus_pgcatalog::Column::new("datconnlimit", "int4", false),
+                    secantus_pgcatalog::Column::new("datfrozenxid", "xid", false),
+                    secantus_pgcatalog::Column::new("datminmxid", "xid", false),
+                    secantus_pgcatalog::Column::new("dattablespace", "oid", false),
+                    secantus_pgcatalog::Column::new("datcollate", "text", false),
+                    secantus_pgcatalog::Column::new("datctype", "text", false),
+                    secantus_pgcatalog::Column::new("daticulocale", "text", false),
+                    secantus_pgcatalog::Column::new("daticurules", "text", false),
+                    secantus_pgcatalog::Column::new("datcollversion", "text", false),
+                    secantus_pgcatalog::Column::new("datacl", "text", false),
+                ],
+            )),
             "pg_stat_activity" => Some(TableDef::new(
                 "pg_stat_activity",
                 vec![
@@ -2120,7 +2330,37 @@ impl PgHandler {
                     })
                     .collect()
             }
-            // One row per open cursor on this connection.
+            // One row per database the server accepts a connection to. The
+            // constant columns are what `initdb` writes (probed PG 16).
+            "pg_database" => {
+                let field = |name: &str| def.field_of(name).expect("column");
+                self.databases
+                    .all(&self.storage)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|info| {
+                        let mut d = Document::new();
+                        d.insert(field("oid"), Bson::Int64(info.oid));
+                        d.insert(field("datname"), info.name);
+                        d.insert(field("datdba"), Bson::Int64(10));
+                        d.insert(field("encoding"), Bson::Int32(6));
+                        d.insert(field("datlocprovider"), "c");
+                        d.insert(field("datistemplate"), info.is_template);
+                        d.insert(field("datallowconn"), info.allow_conn);
+                        d.insert(field("datconnlimit"), Bson::Int32(-1));
+                        d.insert(field("datfrozenxid"), Bson::Int64(722));
+                        d.insert(field("datminmxid"), Bson::Int64(1));
+                        d.insert(field("dattablespace"), Bson::Int64(1663));
+                        d.insert(field("datcollate"), "C");
+                        d.insert(field("datctype"), "C");
+                        d.insert(field("daticulocale"), Bson::Null);
+                        d.insert(field("daticurules"), Bson::Null);
+                        d.insert(field("datcollversion"), Bson::Null);
+                        d.insert(field("datacl"), Bson::Null);
+                        d
+                    })
+                    .collect()
+            }
             "pg_stat_activity" => {
                 let backends: Vec<(i32, BackendActivity)> = backend_registry()
                     .lock()
@@ -2226,7 +2466,7 @@ impl PgHandler {
         let filter = bson::doc! { "_id": name };
         let rows = self
             .storage
-            .find_matching(&self.db, CATALOG_COLLECTION, &filter)
+            .find_matching(self.db(), CATALOG_COLLECTION, &filter)
             .ok()?;
         let raw = rows.first()?;
         let d: Document = bson::from_slice(raw).ok()?;
@@ -2742,9 +2982,99 @@ fn wire_type(pg_type: &str) -> Type {
     }
 }
 
+static PID_GENERATOR: std::sync::LazyLock<RandomPidSecretKeyGenerator> =
+    std::sync::LazyLock::new(RandomPidSecretKeyGenerator::default);
+
 #[async_trait]
-impl NoopStartupHandler for PgHandler {
-    async fn post_startup<C>(&self, _c: &mut C, _m: PgWireFrontendMessage) -> PgWireResult<()>
+impl StartupHandler for PgHandler {
+    /// pgwire's no-authentication startup, with the `database` check in the
+    /// place PostgreSQL makes it: BEFORE `AuthenticationOk`. An unknown name
+    /// (or `template0`, which never accepts connections) is a FATAL
+    /// `ErrorResponse` and the socket closes, with no `ReadyForQuery` -- what
+    /// libpq reads as a failed connect rather than a failed first query.
+    async fn on_startup<C>(
+        &self,
+        client: &mut C,
+        message: PgWireFrontendMessage,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let PgWireFrontendMessage::Startup(ref startup) = message else {
+            return Ok(());
+        };
+        pgwire::api::auth::protocol_negotiation(client, startup).await?;
+        pgwire::api::auth::save_startup_parameters_to_metadata(client, startup);
+
+        // libpq defaults `database` to the user name; a startup packet with
+        // neither gets the server's default (PostgreSQL would look for a
+        // database named after the user, which is not this server's model).
+        let requested = client
+            .metadata()
+            .get("database")
+            .cloned()
+            .unwrap_or_else(|| self.databases.default_db().to_string());
+        if let Err(e) = self.select_database(&requested) {
+            let info: ErrorInfo = e.into();
+            client
+                .send(PgWireBackendMessage::ErrorResponse(info.into()))
+                .await?;
+            client.close().await?;
+            return Ok(());
+        }
+
+        let (pid, secret_key) = PID_GENERATOR.generate(client);
+        client.set_pid_and_secret_key(pid, secret_key);
+        pgwire::api::auth::finish_authentication0(
+            client,
+            &DefaultServerParameterProvider::default(),
+        )
+        .await?;
+        self.post_startup(client).await?;
+        client
+            .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                pgwire::messages::response::TransactionStatus::Idle,
+            )))
+            .await?;
+        client.set_state(pgwire::api::PgWireConnectionState::ReadyForQuery);
+        Ok(())
+    }
+}
+
+impl PgHandler {
+    /// Binds this connection to the database the startup packet named.
+    fn select_database(&self, name: &str) -> PgWireResult<()> {
+        let fatal = |code: &str, message: String| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".into(),
+                code.into(),
+                message,
+            )))
+        };
+        let Some(info) = self.databases.lookup(&self.storage, name)? else {
+            return Err(fatal(
+                "3D000", // invalid_catalog_name
+                format!("database \"{name}\" does not exist"),
+            ));
+        };
+        if !info.allow_conn {
+            return Err(fatal(
+                "55000", // object_not_in_prerequisite_state
+                format!("database \"{name}\" is not currently accepting connections"),
+            ));
+        }
+        let _ = self.db.set(info.name.clone());
+        self.backend
+            .activity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .datname = info.name;
+        Ok(())
+    }
+
+    async fn post_startup<C>(&self, _c: &mut C) -> PgWireResult<()>
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
         C::Error: std::fmt::Debug,
@@ -3315,10 +3645,10 @@ impl PgHandler {
             for table in tables {
                 // A table that does not exist is captured as `None`, which is not
                 // the same as an empty one: rolling back has to DROP it.
-                let docs = match self.storage.collection_exists(&self.db, &table) {
+                let docs = match self.storage.collection_exists(self.db(), &table) {
                     Ok(true) => Some(
                         self.storage
-                            .find_matching(&self.db, &table, &Document::new())
+                            .find_matching(self.db(), &table, &Document::new())
                             .map_err(|e| Self::storage_err("could not read for a savepoint", e))?,
                     ),
                     Ok(false) => None,
@@ -3343,29 +3673,36 @@ impl PgHandler {
     fn restore_table(&self, table: &str, docs: Option<&Vec<Vec<u8>>>) -> PgWireResult<()> {
         let exists = self
             .storage
-            .collection_exists(&self.db, table)
+            .collection_exists(self.db(), table)
             .map_err(|e| Self::storage_err("could not check a table", e))?;
         match docs {
             // It did not exist at the savepoint, so rolling back drops it.
             None => {
                 if exists {
                     self.storage
-                        .drop_collection(&self.db, table)
+                        .drop_collection(self.db(), table)
                         .map_err(|e| Self::storage_err("could not drop the table", e))?;
                 }
             }
             Some(docs) => {
                 if !exists {
                     self.storage
-                        .create_collection(&self.db, table)
+                        .create_collection(self.db(), table)
                         .map_err(|e| Self::storage_err("could not create the table", e))?;
                 }
                 self.storage
-                    .delete_matching(&self.db, table, &Document::new(), 0, &Document::new(), None)
+                    .delete_matching(
+                        self.db(),
+                        table,
+                        &Document::new(),
+                        0,
+                        &Document::new(),
+                        None,
+                    )
                     .map_err(|e| Self::storage_err("could not clear the table", e))?;
                 if !docs.is_empty() {
                     self.storage
-                        .insert(&self.db, table, docs.clone(), true)
+                        .insert(self.db(), table, docs.clone(), true)
                         .map_err(|e| Self::storage_err("could not restore the table", e))?;
                 }
             }
@@ -4117,6 +4454,7 @@ impl PgHandler {
                     .unwrap_or_else(|e| e.into_inner())
                     .clone(),
             )),
+            ConstCol::CurrentDatabase => Ok(Bson::String(self.db().to_string())),
             // `pg_sleep(NULL)` is NULL (strict); zero or negative seconds
             // return at once; otherwise the wait is the given fraction of a
             // second. The `void` result renders as `''` (probed PG 16).
@@ -4201,6 +4539,22 @@ impl PgHandler {
                 .map_err(|e| Self::storage_err("transaction failed", e))?,
             None => f(),
         }
+    }
+
+    /// `25001` for the statements PostgreSQL refuses inside a block
+    /// (`CREATE DATABASE`, `DROP DATABASE`, ...).
+    fn refuse_in_transaction_block(&self, what: &str) -> PgWireResult<()> {
+        if self
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "25001".into(), // active_sql_transaction
+                format!("{what} cannot run inside a transaction block"),
+            ))));
+        }
+        Ok(())
     }
 
     /// PostgreSQL's answer to any statement in a block that has already failed.
@@ -4569,7 +4923,7 @@ impl PgHandler {
         let filter = bson::doc! { "_id": name };
         let raw = self
             .storage
-            .find_matching(&self.db, SEQUENCE_COLLECTION, &filter)
+            .find_matching(self.db(), SEQUENCE_COLLECTION, &filter)
             .map_err(|e| Self::storage_err("could not read the sequence", e))?;
         let Some(raw) = raw.first() else {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -4606,7 +4960,7 @@ impl PgHandler {
         if !values.is_empty() {
             self.storage
                 .update_matching(
-                    &self.db,
+                    self.db(),
                     SEQUENCE_COLLECTION,
                     &filter,
                     &bson::doc! { "$set": { "last_value": last, "is_called": true } },
@@ -4760,7 +5114,7 @@ impl PgHandler {
             (None, _) => {
                 let raw = self
                     .storage
-                    .find_matching(&self.db, &sel.table, &sel.filter)
+                    .find_matching(self.db(), &sel.table, &sel.filter)
                     .map_err(|e| Self::storage_err("could not read", e))?;
                 let def = self
                     .lookup(&sel.table)
@@ -5011,12 +5365,12 @@ impl PgHandler {
                     secantus_pgplan::resolve_fk_target(fk, &target).map_err(|e| Self::err(&e))?;
                 }
                 self.storage
-                    .create_collection(&self.db, &def.name)
+                    .create_collection(self.db(), &def.name)
                     .map_err(|e| Self::storage_err("could not create the table", e))?;
                 let bytes = bson::to_vec(&def.to_document())
                     .map_err(|e| Self::storage_err("could not encode the catalog entry", e))?;
                 self.storage
-                    .insert(&self.db, CATALOG_COLLECTION, vec![bytes], true)
+                    .insert(self.db(), CATALOG_COLLECTION, vec![bytes], true)
                     .map_err(|e| Self::storage_err("could not record the table", e))?;
                 // Each serial column's sequence, owned by the column so the
                 // table's DROP takes it along.
@@ -5045,7 +5399,7 @@ impl PgHandler {
                     for seq in def.columns.iter().filter_map(|c| c.sequence.as_deref()) {
                         self.storage
                             .delete_matching(
-                                &self.db,
+                                self.db(),
                                 SEQUENCE_COLLECTION,
                                 &bson::doc! { "_id": seq },
                                 0,
@@ -5055,7 +5409,7 @@ impl PgHandler {
                             .map_err(|e| Self::storage_err("could not reset a sequence", e))?;
                     }
                     self.storage
-                        .insert(&self.db, SEQUENCE_COLLECTION, sequences, true)
+                        .insert(self.db(), SEQUENCE_COLLECTION, sequences, true)
                         .map_err(|e| Self::storage_err("could not record a sequence", e))?;
                 }
                 // Remember it for the rest of this transaction: the catalog row
@@ -5110,7 +5464,7 @@ impl PgHandler {
                     .map_err(|e| Self::storage_err("could not encode a row", e))?;
                 let (written, errors) = self
                     .storage
-                    .insert(&self.db, &ins.table, docs, true)
+                    .insert(self.db(), &ins.table, docs, true)
                     .map_err(|e| Self::storage_err("could not insert", e))?;
                 if let Some(first) = errors.first() {
                     return Err(Self::write_error(&ins.table, &def, first));
@@ -5156,6 +5510,57 @@ impl PgHandler {
                 )?)])
             }
 
+            Statement::CreateDatabase { name } => {
+                self.refuse_in_transaction_block("CREATE DATABASE")?;
+                if self.databases.lookup(&self.storage, &name)?.is_some() {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42P04".into(), // duplicate_database
+                        format!("database \"{name}\" already exists"),
+                    ))));
+                }
+                self.databases.create(&self.storage, &name)?;
+                Ok(vec![Response::Execution(Tag::new("CREATE DATABASE"))])
+            }
+
+            Statement::DropDatabase { name, if_exists } => {
+                self.refuse_in_transaction_block("DROP DATABASE")?;
+                let Some(info) = self.databases.lookup(&self.storage, &name)? else {
+                    if if_exists {
+                        self.pending_notices
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(ErrorInfo::new(
+                                "NOTICE".into(),
+                                "00000".into(),
+                                format!("database \"{name}\" does not exist, skipping"),
+                            ));
+                        return Ok(vec![Response::Execution(Tag::new("DROP DATABASE"))]);
+                    }
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "3D000".into(), // invalid_catalog_name
+                        format!("database \"{name}\" does not exist"),
+                    ))));
+                };
+                if info.is_template {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42809".into(), // wrong_object_type
+                        "cannot drop a template database".into(),
+                    ))));
+                }
+                if info.name == self.db() {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "55006".into(), // object_in_use
+                        "cannot drop the currently open database".into(),
+                    ))));
+                }
+                self.databases.remove(&self.storage, &info.name)?;
+                Ok(vec![Response::Execution(Tag::new("DROP DATABASE"))])
+            }
+
             Statement::CreateSchema {
                 name,
                 if_not_exists,
@@ -5164,7 +5569,7 @@ impl PgHandler {
                 let exists = !self
                     .storage
                     .find_matching(
-                        &self.db,
+                        self.db(),
                         Self::SCHEMA_COLLECTION,
                         &bson::doc! {"_id": &name},
                     )
@@ -5185,7 +5590,7 @@ impl PgHandler {
                 let bytes = bson::to_vec(&doc)
                     .map_err(|e| Self::storage_err("could not encode the schema", e))?;
                 self.storage
-                    .insert(&self.db, Self::SCHEMA_COLLECTION, vec![bytes], true)
+                    .insert(self.db(), Self::SCHEMA_COLLECTION, vec![bytes], true)
                     .map_err(|e| Self::storage_err("could not record the schema", e))?;
                 Ok(vec![Response::Execution(Tag::new("CREATE SCHEMA"))])
             }
@@ -5206,7 +5611,7 @@ impl PgHandler {
                     let removed = self
                         .storage
                         .delete_matching(
-                            &self.db,
+                            self.db(),
                             Self::SCHEMA_COLLECTION,
                             &bson::doc! {"_id": name},
                             0,
@@ -5285,7 +5690,7 @@ impl PgHandler {
                 let bytes = bson::to_vec(&doc)
                     .map_err(|e| Self::storage_err("could not encode the type", e))?;
                 self.storage
-                    .insert(&self.db, Self::COMPOSITE_COLLECTION, vec![bytes], true)
+                    .insert(self.db(), Self::COMPOSITE_COLLECTION, vec![bytes], true)
                     .map_err(|e| Self::storage_err("could not record the type", e))?;
                 self.note_uncommitted_type(Self::COMPOSITE_COLLECTION, &id_key, Some(doc));
                 Ok(vec![Response::Execution(Tag::new("CREATE TYPE"))])
@@ -5336,7 +5741,7 @@ impl PgHandler {
                 let bytes = bson::to_vec(&doc)
                     .map_err(|e| Self::storage_err("could not encode the type", e))?;
                 self.storage
-                    .insert(&self.db, Self::RANGE_COLLECTION, vec![bytes], true)
+                    .insert(self.db(), Self::RANGE_COLLECTION, vec![bytes], true)
                     .map_err(|e| Self::storage_err("could not record the type", e))?;
                 self.note_uncommitted_type(Self::RANGE_COLLECTION, &id_key, Some(doc));
                 Ok(vec![Response::Execution(Tag::new("CREATE TYPE"))])
@@ -5382,7 +5787,7 @@ impl PgHandler {
                 let bytes = bson::to_vec(&doc)
                     .map_err(|e| Self::storage_err("could not encode the type", e))?;
                 self.storage
-                    .insert(&self.db, Self::ENUM_COLLECTION, vec![bytes], true)
+                    .insert(self.db(), Self::ENUM_COLLECTION, vec![bytes], true)
                     .map_err(|e| Self::storage_err("could not record the type", e))?;
                 self.note_uncommitted_type(Self::ENUM_COLLECTION, &id_key, Some(doc));
                 Ok(vec![Response::Execution(Tag::new("CREATE TYPE"))])
@@ -5397,7 +5802,7 @@ impl PgHandler {
                     let from_enum = self
                         .storage
                         .delete_matching(
-                            &self.db,
+                            self.db(),
                             Self::ENUM_COLLECTION,
                             &filter,
                             0,
@@ -5408,7 +5813,7 @@ impl PgHandler {
                     let from_comp = self
                         .storage
                         .delete_matching(
-                            &self.db,
+                            self.db(),
                             Self::COMPOSITE_COLLECTION,
                             &filter,
                             0,
@@ -5419,7 +5824,7 @@ impl PgHandler {
                     let from_range = self
                         .storage
                         .delete_matching(
-                            &self.db,
+                            self.db(),
                             Self::RANGE_COLLECTION,
                             &filter,
                             0,
@@ -5473,7 +5878,7 @@ impl PgHandler {
                     for seq in def.columns.iter().filter_map(|c| c.sequence.as_deref()) {
                         self.storage
                             .delete_matching(
-                                &self.db,
+                                self.db(),
                                 SEQUENCE_COLLECTION,
                                 &bson::doc! { "_id": seq },
                                 0,
@@ -5487,11 +5892,11 @@ impl PgHandler {
                     // recoverable, whereas a catalog row pointing at a
                     // collection that no longer exists is not.
                     self.storage
-                        .drop_collection(&self.db, table)
+                        .drop_collection(self.db(), table)
                         .map_err(|e| Self::storage_err("could not drop the table", e))?;
                     self.storage
                         .delete_matching(
-                            &self.db,
+                            self.db(),
                             CATALOG_COLLECTION,
                             &bson::doc! { "_id": table },
                             0,
@@ -5582,7 +5987,7 @@ impl PgHandler {
                             let fields: Vec<String> = cols.iter().map(|c| c.field()).collect();
                             let raw = self
                                 .storage
-                                .find_matching(&self.db, &ct.table, &Document::new())
+                                .find_matching(self.db(), &ct.table, &Document::new())
                                 .map_err(|e| Self::storage_err("could not read", e))?;
                             let docs: Vec<Document> = raw
                                 .iter()
@@ -6044,7 +6449,7 @@ impl PgHandler {
                     // expression that fails on one row leaves none updated.
                     let raw = self
                         .storage
-                        .find_matching(&self.db, &upd.table, &upd.filter)
+                        .find_matching(self.db(), &upd.table, &upd.filter)
                         .map_err(|e| Self::storage_err("could not read", e))?;
                     let mut writes = Vec::with_capacity(raw.len());
                     let mut new_rows = Vec::with_capacity(raw.len());
@@ -6095,7 +6500,14 @@ impl PgHandler {
                 }
                 let deleted = self
                     .storage
-                    .delete_matching(&self.db, &del.table, &del.filter, 0, &Document::new(), None)
+                    .delete_matching(
+                        self.db(),
+                        &del.table,
+                        &del.filter,
+                        0,
+                        &Document::new(),
+                        None,
+                    )
                     .map_err(|e| Self::storage_err("could not delete", e))?;
                 Ok(vec![Response::Execution(
                     Tag::new("DELETE").with_rows(deleted),
@@ -6126,7 +6538,7 @@ impl PgHandler {
         let outcome = self
             .storage
             .update_matching(
-                &self.db,
+                self.db(),
                 table,
                 filter,
                 &ops,
@@ -6275,7 +6687,7 @@ impl PgHandler {
         let found = self
             .storage
             .find_matching(
-                &self.db,
+                self.db(),
                 &parent.name,
                 &bson::doc! { ref_field: value.clone() },
             )
@@ -6369,7 +6781,7 @@ impl PgHandler {
     ) -> PgWireResult<Vec<(TableDef, secantus_pgcatalog::ForeignKey)>> {
         let raw = self
             .storage
-            .find_matching(&self.db, CATALOG_COLLECTION, &Document::new())
+            .find_matching(self.db(), CATALOG_COLLECTION, &Document::new())
             .map_err(|e| Self::storage_err("could not read the catalog", e))?;
         let mut defs: Vec<TableDef> = raw
             .iter()
@@ -6407,7 +6819,7 @@ impl PgHandler {
         }
         let raw = self
             .storage
-            .find_matching(&self.db, &def.name, filter)
+            .find_matching(self.db(), &def.name, filter)
             .map_err(|e| Self::storage_err("could not read", e))?;
         let going: Vec<Document> = raw
             .iter()
@@ -6435,7 +6847,7 @@ impl PgHandler {
                 }
                 let dependants = self
                     .storage
-                    .find_matching(&self.db, &child.name, &child_filter)
+                    .find_matching(self.db(), &child.name, &child_filter)
                     .map_err(|e| Self::storage_err("could not read", e))?;
                 if dependants.is_empty() {
                     continue;
@@ -6445,7 +6857,7 @@ impl PgHandler {
                         self.check_referencing_rows(&child, &child_filter)?;
                         self.storage
                             .delete_matching(
-                                &self.db,
+                                self.db(),
                                 &child.name,
                                 &child_filter,
                                 0,
@@ -6515,7 +6927,7 @@ impl PgHandler {
             };
             let raw = self
                 .storage
-                .find_matching(&self.db, &table, &Document::new())
+                .find_matching(self.db(), &table, &Document::new())
                 .map_err(|e| Self::storage_err("could not read", e))?;
             let rows: Vec<Document> = raw
                 .iter()
@@ -10146,7 +10558,7 @@ impl CopyHandler for PgHandler {
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| Self::storage_err("could not encode a COPY row", e))?;
                 self.storage
-                    .insert(&self.db, &state.table, docs, true)
+                    .insert(self.db(), &state.table, docs, true)
                     .map_err(|e| Self::storage_err("could not insert COPY rows", e))
             };
             let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());

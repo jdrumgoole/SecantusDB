@@ -612,8 +612,8 @@ fn select_without_from_answers_session_functions() {
                 sc.columns[1],
                 (
                     "current_database".to_string(),
-                    ConstCol::Value(Bson::String("postgres".into())),
-                    "text".to_string(),
+                    ConstCol::CurrentDatabase,
+                    "name".to_string(),
                     -1
                 )
             );
@@ -2664,4 +2664,31 @@ fn max_param_number_sees_the_values_of_an_insert() {
     assert_eq!(max_param_number("insert into t (id) select $3"), 3);
     assert_eq!(max_param_number("update t set n = $2 where id = $1"), 2);
     assert_eq!(max_param_number("select '$9' -- $8"), 0);
+}
+
+#[test]
+fn create_and_drop_database_plan() {
+    match plan_ok("CREATE DATABASE mydb WITH OWNER = joe") {
+        Statement::CreateDatabase { name } => assert_eq!(name, "mydb"),
+        other => panic!("wrong statement: {other:?}"),
+    }
+    match plan_ok("DROP DATABASE IF EXISTS mydb") {
+        Statement::DropDatabase { name, if_exists } => {
+            assert_eq!(name, "mydb");
+            assert!(if_exists);
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    match plan_ok("SELECT current_catalog AS c") {
+        Statement::SelectConstant(sc) => assert_eq!(
+            sc.columns[0],
+            (
+                "c".to_string(),
+                ConstCol::CurrentDatabase,
+                "name".to_string(),
+                -1
+            )
+        ),
+        other => panic!("wrong statement: {other:?}"),
+    }
 }

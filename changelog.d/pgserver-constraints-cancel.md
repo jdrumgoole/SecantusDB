@@ -30,6 +30,14 @@ refused at CREATE (`42703`, `42830`).
   validated, rendered (`60000` shows as `1min`) and enforced — the session
   ends with FATAL `25P03` / `57P05` and the connection closes, as on
   PostgreSQL 16.
+- Rust PostgreSQL server: databases. The startup packet's `dbname` is checked
+  before `AuthenticationOk` — an unknown name is FATAL `3D000 database "x"
+  does not exist` (a failed connect in libpq, not a failed first query) and
+  `template0` is `55000` — against a registry of `postgres` / `template1` /
+  `template0`, the daemon's `--database NAME` flags and `CREATE DATABASE`;
+  `DROP DATABASE` (with PostgreSQL's `25001`, `42P04`, `3D000` / `IF EXISTS`
+  notice, `55006` and `42809`) drops the data too; `pg_database` lists the
+  set and `current_database()` / `current_catalog` name the connected one.
 
 #### Fixed
 

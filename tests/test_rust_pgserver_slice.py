@@ -50,10 +50,11 @@ def _free_port() -> int:
 class _Server:
     """A `secantusd-pg` subprocess over one storage home."""
 
-    def __init__(self, home: Path) -> None:
+    def __init__(self, home: Path, *, databases: tuple[str, ...] = ()) -> None:
         self.home = home
         self.port = _free_port()
         self.proc: subprocess.Popen[str] | None = None
+        self.databases = databases
 
     def __enter__(self) -> _Server:
         # `_free_port()` reports a port the OS *had* free, but closes its probe
@@ -65,7 +66,12 @@ class _Server:
         last_out = ""
         for _ in range(5):
             self.proc = subprocess.Popen(
-                [str(BINARY), str(self.home), f"127.0.0.1:{self.port}"],
+                [
+                    str(BINARY),
+                    str(self.home),
+                    f"127.0.0.1:{self.port}",
+                    *(f"--database={name}" for name in self.databases),
+                ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -97,9 +103,9 @@ class _Server:
                 self.proc.kill()
                 self.proc.wait(timeout=10)
 
-    def connect(self, *, autocommit: bool = True) -> psycopg.Connection:
+    def connect(self, *, autocommit: bool = True, dbname: str = "postgres") -> psycopg.Connection:
         return psycopg.connect(
-            f"host=127.0.0.1 port={self.port} dbname=postgres user=test",
+            f"host=127.0.0.1 port={self.port} dbname={dbname} user=test",
             autocommit=autocommit,
             connect_timeout=10,
         )
@@ -7072,3 +7078,102 @@ def test_idle_timeouts_end_the_session_with_a_fatal_error(home: Path) -> None:
                 "terminating connection due to idle-session timeout",
             )
             assert conn.closed
+
+
+def test_connecting_to_an_unknown_database_fails_at_startup(home: Path) -> None:
+    """`dbname=nosuchdb` is FATAL 3D000 BEFORE AuthenticationOk, as PostgreSQL's.
+
+    libpq reports it as a failed connect (`OperationalError` with the FATAL
+    line in the message and no diag), which is what psycopg's
+    `test_connect_bad` / `test_pgconn_error` assert. `template0` is a database
+    but never accepts connections (55000); `template1` and the daemon's
+    `--database` names do, and `pg_database` lists exactly that set.
+    """
+    with _Server(home, databases=("gauge_db",)) as server:
+        with pytest.raises(psycopg.OperationalError) as info:
+            server.connect(dbname="nosuchdb")
+        assert 'FATAL:  database "nosuchdb" does not exist' in str(info.value)
+        with pytest.raises(psycopg.OperationalError) as info:
+            server.connect(dbname="template0")
+        assert 'FATAL:  database "template0" is not currently accepting connections' in str(
+            info.value
+        )
+        for name in ("postgres", "template1", "gauge_db"):
+            with server.connect(dbname=name) as conn:
+                assert conn.execute("select current_database(), current_catalog").fetchone() == (
+                    name,
+                    name,
+                )
+                (pid,) = conn.execute("select pg_backend_pid()").fetchone()
+                assert conn.execute(
+                    "select datname from pg_stat_activity where pid = %s", (pid,)
+                ).fetchone() == (name,)
+        with server.connect() as conn:
+            rows = conn.execute(
+                "select oid, datname, datistemplate, datallowconn, datdba, encoding"
+                " from pg_database order by oid"
+            ).fetchall()
+            assert rows == [
+                (1, "template1", True, True, 10, 6),
+                (4, "template0", True, False, 10, 6),
+                (5, "postgres", False, True, 10, 6),
+                (16385, "gauge_db", False, True, 10, 6),
+            ]
+
+
+def test_create_and_drop_database(home: Path) -> None:
+    """CREATE / DROP DATABASE with PostgreSQL's errors, and a dropped database's
+    data is gone when the name is created again (probed PG 16)."""
+    with _Server(home) as server:
+        with server.connect() as conn:
+            with pytest.raises(psycopg.errors.InvalidCatalogName) as info:
+                conn.execute("drop database probe_x")
+            assert _diag(info.value)[:2] == ("3D000", 'database "probe_x" does not exist')
+            notices: list[str] = []
+            conn.add_notice_handler(lambda d: notices.append(d.message_primary))
+            conn.execute("drop database if exists probe_x")
+            assert notices == ['database "probe_x" does not exist, skipping']
+
+            conn.execute("begin")
+            with pytest.raises(psycopg.errors.ActiveSqlTransaction) as info:
+                conn.execute("create database probe_x")
+            assert _diag(info.value)[:2] == (
+                "25001",
+                "CREATE DATABASE cannot run inside a transaction block",
+            )
+            conn.execute("rollback")
+
+            conn.execute("create database probe_x")
+            with pytest.raises(psycopg.errors.DuplicateDatabase) as info:
+                conn.execute("create database probe_x")
+            assert _diag(info.value)[:2] == ("42P04", 'database "probe_x" already exists')
+            with pytest.raises(psycopg.errors.ObjectInUse) as info:
+                conn.execute("drop database postgres")
+            assert _diag(info.value)[:2] == ("55006", "cannot drop the currently open database")
+            with pytest.raises(psycopg.errors.WrongObjectType) as info:
+                conn.execute("drop database template1")
+            assert _diag(info.value)[:2] == ("42809", "cannot drop a template database")
+            assert conn.execute(
+                "select oid >= 16384 from pg_database where datname = 'probe_x'"
+            ).fetchone() == (True,)
+
+        with server.connect(dbname="probe_x") as conn:
+            conn.execute("create table t (a int)")
+            conn.execute("insert into t values (1)")
+            assert conn.execute("select a from t").fetchall() == [(1,)]
+
+        with server.connect() as conn:
+            conn.execute("drop database probe_x")
+            assert conn.execute(
+                "select count(*) from pg_database where datname = 'probe_x'"
+            ).fetchone() == (0,)
+            conn.execute("create database probe_x")
+        with (
+            server.connect(dbname="probe_x") as conn,
+            pytest.raises(psycopg.errors.UndefinedTable),
+        ):
+            conn.execute("select a from t")
+
+    # The registry is persisted: the database survives a restart.
+    with _Server(home) as server, server.connect(dbname="probe_x") as conn:
+        assert conn.execute("select current_database()").fetchone() == ("probe_x",)
