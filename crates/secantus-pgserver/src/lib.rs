@@ -399,13 +399,14 @@ impl PgHandler {
         // Its resolution name is the range's multirange name (bare in public,
         // else schema-qualified), so `to_regtype('testmultirange')` and the
         // schema-qualified form both reach it -- exactly like the range.
-        let multiranges: Vec<(String, i64)> = ranges_with_schema
+        let multiranges: Vec<(String, i64, String)> = ranges_with_schema
             .iter()
             .map(|(schema, name, oid, _)| {
                 let mr_name = secantus_pgplan::range::multirange_name_for(name);
                 (
                     Self::type_resolution(schema, &mr_name),
                     oid + Self::MULTIRANGE_TYPE_OID_OFFSET,
+                    Self::type_resolution(schema, name),
                 )
             })
             .collect();
@@ -455,6 +456,14 @@ impl PgHandler {
                 "public".to_string(),
             ));
         }
+        // A custom range (`create type testrange as range (...)`), its
+        // auto-created multirange, or an ARRAY of either: its own oid, so a
+        // client that ran `register_range` / `register_multirange` fires its
+        // loader instead of reading text. The value goes out as range TEXT in
+        // either cursor format, as a builtin range does.
+        if let Some(ty) = self.user_range_wire_type(pg_type) {
+            return Some(ty);
+        }
         // A composite type reports its own oid so a client that ran
         // `register_composite` fires its loader. The type carries
         // `Kind::Composite` (its declared fields, resolved to their own wire
@@ -480,6 +489,59 @@ impl PgHandler {
             .iter()
             .find(|(schema, name, _, _)| Self::type_resolution(schema, name) == pg_type)?;
         self.composite_type(schema, bare, *oid, fields)
+    }
+
+    /// The wire `Type` for a custom range, its multirange companion, or an
+    /// array of either, by resolution name (`testrange`, `testmultirange`,
+    /// `testschema.testrange[]`). `Kind::Range(subtype)` / `Kind::Multirange`
+    /// carry the subtype the way pgwire's builtin range types do.
+    fn user_range_wire_type(&self, pg_type: &str) -> Option<Type> {
+        let (element, is_array) = match pg_type.strip_suffix("[]") {
+            Some(e) => (e, true),
+            None => (pg_type, false),
+        };
+        let ranges = self.ranges_with_schema().ok()?;
+        let scalar = ranges.iter().find_map(|(schema, name, oid, subtype)| {
+            // Match the name BEFORE resolving the subtype: resolving it
+            // re-enters `user_wire_type`, which asks this function again
+            // for every non-enum name (`text`), so resolving eagerly for
+            // every registered range recursed without bound.
+            let is_range = Self::type_resolution(schema, name) == element;
+            let mr_name = secantus_pgplan::range::multirange_name_for(name);
+            if !is_range && Self::type_resolution(schema, &mr_name) != element {
+                return None;
+            }
+            let sub = if subtype == element {
+                None
+            } else {
+                self.user_wire_type(subtype)
+            }
+            .unwrap_or_else(|| wire_type(subtype));
+            let range_ty = Type::new(
+                name.clone(),
+                u32::try_from(*oid).ok()?,
+                postgres_types::Kind::Range(sub),
+                schema.clone(),
+            );
+            if is_range {
+                return Some(range_ty);
+            }
+            Some(Type::new(
+                mr_name,
+                u32::try_from(oid + Self::MULTIRANGE_TYPE_OID_OFFSET).ok()?,
+                postgres_types::Kind::Multirange(range_ty),
+                schema.clone(),
+            ))
+        })?;
+        if !is_array {
+            return Some(scalar);
+        }
+        Some(Type::new(
+            format!("_{}", scalar.name()),
+            u32::try_from(i64::from(scalar.oid()) + Self::USER_TYPE_ARRAY_OID_OFFSET).ok()?,
+            postgres_types::Kind::Array(scalar.clone()),
+            scalar.schema().to_string(),
+        ))
     }
 
     /// The wire `Type` for a composite from its `(schema, bare, oid, fields)`.
@@ -542,6 +604,29 @@ impl PgHandler {
                 .find(|(_, _, o, _)| *o + Self::USER_TYPE_ARRAY_OID_OFFSET == oid_i)
             {
                 return Some(format!("{}[]", Self::type_resolution(schema, name)));
+            }
+        }
+        // A custom range, its multirange companion, and their arrays: the
+        // oid psycopg's `register_range` / `register_multirange` dumpers
+        // stamp on a bound parameter.
+        if let Ok(rs) = self.ranges_with_schema() {
+            for (schema, name, oid, _) in &rs {
+                let mr_name = secantus_pgplan::range::multirange_name_for(name);
+                let named = [
+                    (*oid, Self::type_resolution(schema, name)),
+                    (
+                        *oid + Self::MULTIRANGE_TYPE_OID_OFFSET,
+                        Self::type_resolution(schema, &mr_name),
+                    ),
+                ];
+                for (base, resolution) in named {
+                    if base == oid_i {
+                        return Some(resolution);
+                    }
+                    if base + Self::USER_TYPE_ARRAY_OID_OFFSET == oid_i {
+                        return Some(format!("{resolution}[]"));
+                    }
+                }
             }
         }
         None
@@ -1635,8 +1720,8 @@ impl PgHandler {
                     };
                     let element = secantus_pgplan::range::range_element(name)
                         .map(|(e, _)| e)
-                        .unwrap_or("");
-                    let Some(rngsubtype) = secantus_pgplan::pgtypes::oid_of_name(element) else {
+                        .unwrap_or_default();
+                    let Some(rngsubtype) = secantus_pgplan::pgtypes::oid_of_name(&element) else {
                         continue;
                     };
                     // The builtin multirange companion (int4range ->
@@ -1965,6 +2050,19 @@ fn internal_type_name(ty: &Type) -> Option<String> {
                 return secantus_pgplan::range::range_oid_name(oid)
                     .or_else(|| secantus_pgplan::range::multirange_oid_name(oid))
                     .map(str::to_string)
+                    // An ARRAY of ranges / multiranges (`_int4range`, oid
+                    // 3905, and friends). Without a declared name the planner
+                    // typed the parameter from its decoded value -- `text[]`
+                    // -- so an untyped literal beside it was never coerced
+                    // and `'{empty,"(,)"}' = $1` was "text = text[]".
+                    .or_else(|| {
+                        element_of_array_oid(oid)
+                            .filter(|e| {
+                                secantus_pgplan::range::is_range_type(e)
+                                    || secantus_pgplan::range::is_multirange_type(e)
+                            })
+                            .map(|e| format!("{e}[]"))
+                    });
             }
         }
         .to_string(),
@@ -6278,15 +6376,51 @@ fn element_of_array_oid(oid: u32) -> Option<&'static str> {
     })
 }
 
+/// Decode a binary multirange: a 4-byte count, then each member range
+/// length-prefixed in the range's own binary form.
+fn binary_multirange(
+    bytes: &[u8],
+    type_name: &str,
+    member: &str,
+    tz: &secantus_pgplan::TimeZoneSetting,
+    cenc: ClientEncoding,
+    oid: u32,
+) -> PgWireResult<Bson> {
+    if bytes.len() < 4 {
+        return Err(unsupported_binary_oid(Some(oid)));
+    }
+    let count = i32::from_be_bytes(bytes[..4].try_into().expect("checked"));
+    let mut pos = 4usize;
+    let mut members = Vec::new();
+    for _ in 0..count.max(0) {
+        if pos + 4 > bytes.len() {
+            return Err(unsupported_binary_oid(Some(oid)));
+        }
+        let len = i32::from_be_bytes(bytes[pos..pos + 4].try_into().expect("checked"));
+        pos += 4;
+        let n = usize::try_from(len.max(0)).unwrap_or(0);
+        if pos + n > bytes.len() {
+            return Err(unsupported_binary_oid(Some(oid)));
+        }
+        let text = binary_range(&bytes[pos..pos + n], member, tz, cenc)?;
+        pos += n;
+        members.push(secantus_pgplan::value_text(&text));
+    }
+    let literal = format!("{{{}}}", members.join(","));
+    secantus_pgplan::cast_text_to(&literal, type_name, tz).map_err(|e| PgHandler::err(&e))
+}
+
 /// Decode a binary range: a flags byte, then each present bound as a 4-byte
 /// length followed by that many bytes in the element type's binary format.
 ///
-/// The flag bits are PostgreSQL's own: 1 empty, 2 lower bound present, 4 upper
-/// bound present, 16 lower inclusive, 32 upper inclusive.
+/// The flag bits are PostgreSQL's own (`rangetypes.h`): 0x01 empty, 0x02
+/// lower inclusive, 0x04 upper inclusive, 0x08 lower infinite, 0x10 upper
+/// infinite. A bound is present exactly when its infinite bit is clear.
 fn binary_range(
     bytes: &[u8],
     type_name: &str,
     tz: &secantus_pgplan::TimeZoneSetting,
+    cenc: ClientEncoding,
 ) -> PgWireResult<Bson> {
     const EMPTY: u8 = 0x01;
     const LB_INF: u8 = 0x08;
@@ -6316,9 +6450,10 @@ fn binary_range(
         let raw = Bytes::copy_from_slice(&rest[..n]);
         *rest = &rest[n..];
         let ty = Type::from_oid(element_oid);
-        // A range's element type is always numeric / date / timestamp, never
-        // text, so the client encoding is irrelevant to its bytes.
-        let value = decode_parameter(Some(&raw), ty.as_ref(), true, tz, ClientEncoding::Utf8)?;
+        // A builtin range's element is numeric / date / timestamp, where the
+        // client encoding is irrelevant; a custom one over `text` carries its
+        // bound bytes in the client encoding like any other text parameter.
+        let value = decode_parameter(Some(&raw), ty.as_ref(), true, tz, cenc)?;
         Ok(Some(secantus_pgplan::value_text(&value)))
     };
     let lower = if flags & LB_INF == 0 {
@@ -6331,13 +6466,16 @@ fn binary_range(
     } else {
         None
     };
-    let literal = format!(
-        "{}{},{}{}",
-        if flags & LB_INC != 0 { '[' } else { '(' },
-        lower.unwrap_or_default(),
-        upper.unwrap_or_default(),
-        if flags & UB_INC != 0 { ']' } else { ')' }
-    );
+    // Through the range renderer, which quotes a bound that needs it: a
+    // text-subtype bound holding a comma or a quote is not a literal until
+    // it is quoted.
+    let literal = secantus_pgplan::range::render(&secantus_pgplan::range::Range {
+        empty: false,
+        lower,
+        upper,
+        lower_inc: flags & LB_INC != 0,
+        upper_inc: flags & UB_INC != 0,
+    });
     secantus_pgplan::cast_text_to(&literal, type_name, tz).map_err(|e| PgHandler::err(&e))
 }
 
@@ -6751,33 +6889,28 @@ fn decode_parameter(
                 let type_name = secantus_pgplan::range::multirange_oid_name(oid).expect("checked");
                 let member = secantus_pgplan::range::multirange_member(type_name)
                     .expect("a multirange has a member type");
-                if bytes.len() < 4 {
-                    return Err(unsupported_binary_oid(Some(oid)));
-                }
-                let count = i32::from_be_bytes(bytes[..4].try_into().expect("checked"));
-                let mut pos = 4usize;
-                let mut members = Vec::new();
-                for _ in 0..count.max(0) {
-                    if pos + 4 > bytes.len() {
-                        return Err(unsupported_binary_oid(Some(oid)));
-                    }
-                    let len = i32::from_be_bytes(bytes[pos..pos + 4].try_into().expect("checked"));
-                    pos += 4;
-                    let n = usize::try_from(len.max(0)).unwrap_or(0);
-                    if pos + n > bytes.len() {
-                        return Err(unsupported_binary_oid(Some(oid)));
-                    }
-                    let text = binary_range(&bytes[pos..pos + n], member, tz)?;
-                    pos += n;
-                    members.push(secantus_pgplan::value_text(&text));
-                }
-                let literal = format!("{{{}}}", members.join(","));
-                secantus_pgplan::cast_text_to(&literal, type_name, tz)
-                    .map_err(|e| PgHandler::err(&e))
+                binary_multirange(bytes, type_name, &member, tz, cenc, oid)
             }
             Some(oid) if secantus_pgplan::range::range_oid_name(oid).is_some() => {
                 let type_name = secantus_pgplan::range::range_oid_name(oid).expect("checked");
-                binary_range(bytes, type_name, tz)
+                binary_range(bytes, type_name, tz, cenc)
+            }
+            // A CUSTOM range or multirange: the same layouts, with the type
+            // named by the registry the oid was minted from.
+            Some(oid)
+                if ty.is_some_and(|t| {
+                    matches!(
+                        t.kind(),
+                        postgres_types::Kind::Range(_) | postgres_types::Kind::Multirange(_)
+                    )
+                }) =>
+            {
+                let type_name = secantus_pgplan::user_type_name(i64::from(oid))
+                    .ok_or_else(|| unsupported_binary_oid(Some(oid)))?;
+                match secantus_pgplan::range::multirange_member(&type_name) {
+                    Some(member) => binary_multirange(bytes, &type_name, &member, tz, cenc, oid),
+                    None => binary_range(bytes, &type_name, tz, cenc),
+                }
             }
             Some(114) => secantus_pgplan::cast_text_to(&encoding::decode(cenc, bytes), "json", tz)
                 .map_err(|e| PgHandler::err(&e)),
@@ -6940,11 +7073,38 @@ fn sniff_text(text: &str) -> Bson {
 
 impl PgHandler {
     /// Every bound parameter of a portal, decoded in order.
-    fn portal_params<S>(&self, portal: &Portal<S>) -> PgWireResult<Vec<Bson>>
+    ///
+    /// `param_types` is the planner name for each parameter -- the client's
+    /// declaration, or the type INFERRED from the statement when the client
+    /// gave none (`infer_param_types`). A parameter the client left untyped
+    /// but the statement compares against a range is decoded AS that range:
+    /// psycopg's bare `Range(empty=True)` arrives with oid 0 and, in binary,
+    /// as the single flag byte `\x01`, which read as text is a control
+    /// character and not a range at all. Only the inferred name can route it
+    /// to the range decoder.
+    fn portal_params<S>(
+        &self,
+        portal: &Portal<S>,
+        param_types: &[Option<String>],
+    ) -> PgWireResult<Vec<Bson>>
     where
         S: Clone + Send + Sync,
     {
-        let declared = &portal.statement.parameter_types;
+        let declared: Vec<Option<Type>> = portal
+            .statement
+            .parameter_types
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                // A name the plan resolved for the slot: a builtin, or a USER
+                // type (a custom range's oid maps to `None` in the statement's
+                // types, and its binary form is a range, not text).
+                t.clone().or_else(|| {
+                    let name = param_types.get(i).and_then(|n| n.as_deref())?;
+                    Some(self.user_wire_type(name).unwrap_or_else(|| wire_type(name)))
+                })
+            })
+            .collect();
         let oids = &portal.statement.parameter_oids;
         let tz = self.session_timezone();
         let cenc = self.client_encoding();
@@ -6963,14 +7123,23 @@ impl PgHandler {
                 // a user COMPOSITE, decode the value into the record BSON a
                 // `::comp` literal produces -- the ordinary decoder would sniff
                 // the `(a,b)` text into a plain string, so field access and
-                // `= row(..)` on the parameter both broke.
-                if declared.get(i).and_then(|t| t.as_ref()).is_none() {
-                    if let Some(oid) = oids.get(i).copied().filter(|o| *o != 0) {
-                        if let Some(bson) =
-                            self.decode_composite_param(oid, raw.as_ref(), binary, &tz)?
-                        {
-                            return Ok(bson);
-                        }
+                // `= row(..)` on the parameter both broke. The planner can
+                // also NAME the slot a composite (`row(..)::comp = $1` infers
+                // it from the compared operand), in which case `declared` is
+                // the composite `Type` itself and its oid takes the same door.
+                let declared_ty = declared.get(i).and_then(|t| t.as_ref());
+                let composite_oid = match declared_ty {
+                    None => oids.get(i).copied().filter(|o| *o != 0),
+                    Some(t) if matches!(t.kind(), postgres_types::Kind::Composite(_)) => {
+                        Some(t.oid())
+                    }
+                    Some(_) => None,
+                };
+                if let Some(oid) = composite_oid {
+                    if let Some(bson) =
+                        self.decode_composite_param(oid, raw.as_ref(), binary, &tz)?
+                    {
+                        return Ok(bson);
                     }
                 }
                 decode_parameter(
@@ -7271,8 +7440,11 @@ impl ExtendedQueryHandler for PgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         self.note_result_format(&portal.result_column_format);
-        let params = self.portal_params(portal)?;
-        let param_types = self.param_type_names(portal.statement.as_ref());
+        let param_types = secantus_pgplan::infer_param_types(
+            &portal.statement.statement.sql,
+            &self.param_type_names(portal.statement.as_ref()),
+        );
+        let params = self.portal_params(portal, &param_types)?;
         let mut responses = self
             .run_typed(
                 &portal.statement.statement.sql,
@@ -7292,9 +7464,22 @@ impl ExtendedQueryHandler for PgHandler {
 ///
 /// `\N` is NULL -- distinct from the empty string, which is a real empty text
 /// value. That distinction is the whole reason COPY has an escape at all.
-fn copy_field(raw: &str, pg_type: &str) -> PgWireResult<Bson> {
+fn copy_field(
+    raw: &str,
+    pg_type: &str,
+    tz: &secantus_pgplan::TimeZoneSetting,
+) -> PgWireResult<Bson> {
     if raw == "\\N" {
         return Ok(Bson::Null);
+    }
+    // A range or multirange is stored in its CANONICAL text, the same as a
+    // literal or a bound parameter -- `{empty}` is `{}` and `[1,5]` over int4
+    // is `[1,6)`. Stored raw, `{empty}` went back out as `{empty}`, which no
+    // PostgreSQL ever prints and psycopg's loader cannot parse.
+    if secantus_pgplan::range::is_range_type(pg_type)
+        || secantus_pgplan::range::is_multirange_type(pg_type)
+    {
+        return secantus_pgplan::cast_text_to(raw, pg_type, tz).map_err(|e| PgHandler::err(&e));
     }
     // `raw` has already been backslash-unescaped by `copy_parse_text` /
     // `unescape_copy_text`. Unescaping again halved a literal `\\` a second time
@@ -7379,6 +7564,7 @@ impl CopyHandler for PgHandler {
                     )))
                 })?;
                 let parsed = copy_parse_text(&text, format);
+                let tz = self.session_timezone();
                 let mut out = Vec::with_capacity(parsed.len());
                 for raw in parsed {
                     let mut row = Vec::with_capacity(raw.len());
@@ -7387,7 +7573,7 @@ impl CopyHandler for PgHandler {
                             None => None,
                             Some(text) => {
                                 let ty = state.types.get(i).map(String::as_str).unwrap_or("text");
-                                Some(copy_field(&text, ty)?)
+                                Some(copy_field(&text, ty, &tz)?)
                             }
                         });
                     }

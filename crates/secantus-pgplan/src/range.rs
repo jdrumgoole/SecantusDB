@@ -17,16 +17,24 @@ use crate::{cast_value, Error, Result};
 use bson::Bson;
 
 /// The element type of each range type, and whether it is discrete.
-pub fn range_element(name: &str) -> Option<(&'static str, bool)> {
-    Some(match name {
+///
+/// A builtin range comes from the table; a CUSTOM one (`create type testrange
+/// as range (subtype = text)`) from the user-range registry the wire layer
+/// installs per statement. A custom range has no canonical function, so it is
+/// never discrete: `[a,c]` over `text` stays `[a,c]`. Resolving both here is
+/// what lets every constructor, cast and multirange path treat a custom range
+/// exactly as a builtin one.
+pub fn range_element(name: &str) -> Option<(String, bool)> {
+    let (element, discrete) = match name {
         "int4range" => ("int4", true),
         "int8range" => ("int8", true),
         "daterange" => ("date", true),
         "numrange" => ("numeric", false),
         "tsrange" => ("timestamp", false),
         "tstzrange" => ("timestamptz", false),
-        _ => return None,
-    })
+        other => return crate::user_range_subtype(other).map(|sub| (sub, false)),
+    };
+    Some((element.to_string(), discrete))
 }
 
 pub fn is_range_type(name: &str) -> bool {
@@ -78,18 +86,21 @@ fn quote_bound(b: Option<&str>) -> String {
         return String::new();
     };
     let needs = text.is_empty()
-        || text
-            .chars()
-            .any(|c| matches!(c, ',' | '"' | '\\' | '(' | ')' | '[' | ']') || c.is_whitespace());
+        || text.chars().any(|c| {
+            matches!(c, ',' | '"' | '\\' | '(' | ')' | '[' | ']') || c.is_ascii_whitespace()
+        });
     if !needs {
         return text.to_string();
     }
+    // Inside the quotes PostgreSQL DOUBLES a quote and backslash-escapes a
+    // backslash (`range_out`): the bound `"` prints as `""""`, `\` as `"\\"`.
     let mut out = String::from('"');
     for c in text.chars() {
-        if c == '"' || c == '\\' {
-            out.push('\\');
+        match c {
+            '"' => out.push_str("\"\""),
+            '\\' => out.push_str("\\\\"),
+            c => out.push(c),
         }
-        out.push(c);
     }
     out.push('"');
     out
@@ -111,34 +122,50 @@ fn parse_literal(text: &str) -> Result<Range> {
         _ => return Err(bad_range(text)),
     };
     let body = &t[1..t.len() - 1];
-    let mut parts: Vec<String> = Vec::new();
+    // Each part carries whether it was ever quoted: `["",foo)` has an EMPTY
+    // STRING lower bound, where `[,foo)` has an infinite one, and only the
+    // quotes tell them apart once the text is stripped.
+    let mut parts: Vec<(String, bool)> = Vec::new();
     let mut cur = String::new();
     let mut quoted = false;
+    let mut seen_quote = false;
     let mut chars = body.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            '"' => quoted = !quoted,
+            // A doubled quote inside the quotes is one literal quote, the
+            // way PostgreSQL's `range_parse_bound` reads it: `["""",#)` is
+            // the bound `"`.
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                chars.next();
+                cur.push('"');
+            }
+            '"' => {
+                quoted = !quoted;
+                seen_quote = true;
+            }
             '\\' => {
                 if let Some(n) = chars.next() {
                     cur.push(n);
                 }
             }
             ',' if !quoted => {
-                parts.push(std::mem::take(&mut cur));
+                parts.push((std::mem::take(&mut cur), std::mem::take(&mut seen_quote)));
             }
+            // Whitespace outside the quotes is not part of the bound. ASCII only,
+            // as C `isspace` reads it: U+0085 and U+00A0 are bound text.
+            c if !quoted && c.is_ascii_whitespace() => {}
             _ => cur.push(c),
         }
     }
-    parts.push(cur);
+    parts.push((cur, seen_quote));
     if parts.len() != 2 {
         return Err(bad_range(text));
     }
-    let bound = |s: &str| {
-        let t = s.trim();
-        if t.is_empty() {
+    let bound = |(s, was_quoted): &(String, bool)| {
+        if s.is_empty() && !was_quoted {
             None
         } else {
-            Some(t.to_string())
+            Some(s.clone())
         }
     };
     Ok(Range {
@@ -158,7 +185,7 @@ fn bad_range(text: &str) -> Error {
 pub fn from_text(text: &str, type_name: &str) -> Result<Range> {
     let (element, discrete) = range_element(type_name).ok_or_else(|| bad_range(text))?;
     let parsed = parse_literal(text)?;
-    canonicalise(parsed, element, discrete, type_name)
+    canonicalise(parsed, &element, discrete, type_name)
 }
 
 /// Parse a range literal for a KNOWN element type (a custom range's subtype),
@@ -225,7 +252,7 @@ pub fn from_args(args: &[Bson], type_name: &str, null_flags_is_error: bool) -> R
         lower_inc,
         upper_inc,
     };
-    canonicalise(r, element, discrete, type_name)
+    canonicalise(r, &element, discrete, type_name)
 }
 
 /// Normalise a range: reject a crossed pair, collapse an empty one, and — for a
@@ -262,13 +289,16 @@ fn canonicalise(mut r: Range, element: &str, discrete: bool, type_name: &str) ->
             }
             r.upper_inc = false;
         }
-        // An unbounded lower end is always exclusive in the printed form.
-        if r.lower.is_none() {
-            r.lower_inc = false;
-        }
-        if r.upper.is_none() {
-            r.upper_inc = false;
-        }
+    }
+    // An infinite bound is always exclusive, for EVERY range type: PostgreSQL's
+    // `range_serialize` clears the flag, so `'[,foo)'::textrange` prints as
+    // `(,foo)`. Inside the discrete block this left a text-subtype range
+    // carrying `[,foo)`, a form PostgreSQL never prints.
+    if r.lower.is_none() {
+        r.lower_inc = false;
+    }
+    if r.upper.is_none() {
+        r.upper_inc = false;
     }
 
     if let (Some(l), Some(u)) = (&r.lower, &r.upper) {
@@ -337,7 +367,76 @@ pub fn range_element_oid(type_name: &str) -> u32 {
         "numrange" => 1700,
         "daterange" => 1082,
         "tsrange" => 1114,
-        _ => 1184,
+        "tstzrange" => 1184,
+        // A custom range's element is whatever its subtype is; the fallback
+        // is `text`, which is what a subtype this server cannot name decodes
+        // as least wrongly.
+        other => range_element(other)
+            .and_then(|(e, _)| crate::pgtypes::oid_of_name(&e))
+            .and_then(|oid| u32::try_from(oid).ok())
+            .unwrap_or(25),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bound accessors
+// ---------------------------------------------------------------------------
+
+/// The range bound functions: `lower` / `upper` answer the bound in the
+/// ELEMENT type (NULL for an infinite bound or an empty range), `lower_inc` /
+/// `upper_inc` / `lower_inf` / `upper_inf` / `isempty` answer booleans.
+/// Measured against PostgreSQL 16.
+pub const ACCESSORS: &[&str] = &[
+    "lower",
+    "upper",
+    "lower_inc",
+    "upper_inc",
+    "lower_inf",
+    "upper_inf",
+    "isempty",
+];
+
+pub fn is_accessor(name: &str) -> bool {
+    ACCESSORS.contains(&name)
+}
+
+/// The result type of an accessor over a range whose element is `element`.
+pub fn accessor_result_type(name: &str, element: &str) -> String {
+    match name {
+        "lower" | "upper" => element.to_string(),
+        _ => "bool".to_string(),
+    }
+}
+
+/// Apply an accessor to one range.
+pub fn accessor(name: &str, r: &Range, element: &str) -> Result<Bson> {
+    let bound = |b: &Option<String>| -> Result<Bson> {
+        match b {
+            Some(text) if !r.empty => cast_value(Bson::String(text.clone()), element),
+            _ => Ok(Bson::Null),
+        }
+    };
+    Ok(match name {
+        "lower" => bound(&r.lower)?,
+        "upper" => bound(&r.upper)?,
+        "lower_inc" => Bson::Boolean(!r.empty && r.lower_inc),
+        "upper_inc" => Bson::Boolean(!r.empty && r.upper_inc),
+        "lower_inf" => Bson::Boolean(!r.empty && r.lower.is_none()),
+        "upper_inf" => Bson::Boolean(!r.empty && r.upper.is_none()),
+        "isempty" => Bson::Boolean(r.empty),
+        other => return Err(Error::Unsupported(format!("function {other}()"))),
+    })
+}
+
+/// Apply an accessor to a multirange: the lower end is the first member's,
+/// the upper end the last member's, and an empty multirange has neither.
+pub fn multirange_accessor(name: &str, members: &[Range], element: &str) -> Result<Bson> {
+    let (Some(first), Some(last)) = (members.first(), members.last()) else {
+        return accessor(name, &Range::empty(), element);
+    };
+    match name {
+        "upper" | "upper_inc" | "upper_inf" => accessor(name, last, element),
+        _ => accessor(name, first, element),
     }
 }
 
@@ -364,17 +463,20 @@ pub fn multirange_name_for(range: &str) -> String {
     }
 }
 
-/// The range type a multirange is built from, and the multirange's own oid.
-pub fn multirange_member(name: &str) -> Option<&'static str> {
-    Some(match name {
+/// The range type a multirange is built from. A builtin multirange comes
+/// from the table; a custom range's auto-created companion (`testmultirange`
+/// for `testrange`) from the registry the wire layer installs.
+pub fn multirange_member(name: &str) -> Option<String> {
+    let member = match name {
         "int4multirange" => "int4range",
         "int8multirange" => "int8range",
         "nummultirange" => "numrange",
         "datemultirange" => "daterange",
         "tsmultirange" => "tsrange",
         "tstzmultirange" => "tstzrange",
-        _ => return None,
-    })
+        other => return crate::user_multirange_member(other),
+    };
+    Some(member.to_string())
 }
 
 pub fn is_multirange_type(name: &str) -> bool {
@@ -455,6 +557,7 @@ fn bad_multirange(text: &str) -> Error {
 pub fn normalise_multirange(mut members: Vec<Range>, member_type: &str) -> Result<Vec<Range>> {
     let (element, _) = range_element(member_type)
         .ok_or_else(|| Error::Unsupported(format!("the {member_type} type")))?;
+    let element = element.as_str();
     members.retain(|r| !r.empty);
     // An absent lower bound is smaller than any value, so it sorts first.
     let mut sorted: Vec<Range> = Vec::new();
@@ -539,9 +642,9 @@ pub fn multirange_from_text(text: &str, type_name: &str) -> Result<Vec<Range>> {
     let parts = split_members(text)?;
     let members = parts
         .iter()
-        .map(|p| from_text(p, member_type))
+        .map(|p| from_text(p, &member_type))
         .collect::<Result<Vec<_>>>()?;
-    normalise_multirange(members, member_type)
+    normalise_multirange(members, &member_type)
 }
 
 /// A multirange from constructor arguments, each of which is already a range.
@@ -551,7 +654,7 @@ pub fn multirange_from_args(args: &[Bson], type_name: &str) -> Result<Vec<Range>
     let members = args
         .iter()
         .filter(|a| *a != &Bson::Null)
-        .map(|a| from_text(&crate::render_value_text(a), member_type))
+        .map(|a| from_text(&crate::render_value_text(a), &member_type))
         .collect::<Result<Vec<_>>>()?;
-    normalise_multirange(members, member_type)
+    normalise_multirange(members, &member_type)
 }

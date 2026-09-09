@@ -2208,35 +2208,39 @@ These are explicit non-goals. Don't add them without a reason.
   unaffected (0-divergence); only the explicit `::text` cast of an array
   diverges. Needs element-type threading into `render_array`. (2026-09-07)
 
-- [ ] **OPEN — RUST pgserver range family, remaining gaps (measured 2026-09-07).**
-  The scalar range/multirange BINARY wire codec is correct (typed empty /
-  unbounded / populated values round-trip against real PG; the psycopg cases
-  that error do so on real PG too, as `08P01`). `ARRAY`-of-multirange typing was
-  fixed (its own array oids 6150/6151/6152/6153/6155/6157, both formats). Still
-  open in `tests/types/test_range.py` / `test_multirange.py`: the array-of-range
-  element `=` comparison (`comparing string with array using =`), which is the
-  general string-vs-array operator gap, not a range-specific one, and multirange
-  OF a custom range.
+- [ ] **OPEN — RUST pgserver range family, what is left (measured 2026-09-09).**
+  psycopg's `tests/types/test_range.py` + `test_multirange.py` are at 479
+  passed / 1 failed / 24 xfailed against the Rust PG server (was 72 failed);
+  the one failure is `test_literal_invalid_name[order]`, the reserved-keyword
+  `regtype` quoting item below. Shipped 2026-09-09: literal-beside-range-array
+  param typing (the 36-test `test_dump_builtin_array_wrapper` campaign, built
+  the canonicalising way — `'{"[1,5]"}' = [Int4Range(1,6,'[)')]` is True and
+  `= [Int4Range(1,5,'[)')]` is False, both formats), untyped binary range /
+  multirange params typed from context (comparison operand or `$1::int4range`
+  cast), custom range value round-trip in every format (constructor, casts,
+  binary codec, schema-qualified names, `testmultirange`), `range_out` quoting
+  fidelity, range accessors, three-valued `AND`/`OR`/`NOT` in a constant
+  select, and COPY canonical form. Still open, all pre-existing and measured
+  against PG 16:
+  - `isempty(%s)` with an UNTYPED parameter is PG `42725 function
+    isempty(unknown) is not unique`; ours is `0A000`.
+  - A malformed range literal error carries only the first line; PG adds the
+    `LINE 1:` context and, for a bad bound, a `DETAIL:` line.
+  - A binary-format cursor fetching a custom range that psycopg has NOT
+    registered gets PG's raw binary bytes; ours sends the text rendering
+    (builtin and user ranges are not `binary_encodable`). psycopg's own tests
+    never hit this shape.
+  - `RangeSubselect` (`from (select ...)`) is unsupported in the range
+    corpus's few subquery shapes — a general planner gap, not a range one.
 
-  **`'{...}' = <range/multirange array param>` (36, `test_dump_builtin_array_wrapper`) is a 2-piece campaign with a FIDELITY TRAP (mapped 2026-09-08, no code):** a naive text compare passes the 36 target tests (they use non-canonicalizing `empty`/`(,)`) but is WRONG for canonicalizing ranges — `'{"[1,4]"}' = [Int4Range(1,5,'[)')]` is TRUE on PG (both canonicalize to `[1,5)`), a plain string compare gives FALSE. Build in order, each verified against a canonicalizing case: (1) range/multirange-ARRAY param decode must parse each element through the canonicalizing `::int4range[]` parser (`range::from_text_element`) so the decoded array holds canonical text, not psycopg's raw spelling; (2) `coerce_unknown_operand` (lib.rs:~4987) must fire for a bare `'{...}'` literal vs an array VALUE — it currently bails at the both-unresolved `l_bare == r_bare` guard, then errors at the scalar-vs-array XOR (~5271); cast the literal to `{element}[]` via the canonicalizing `::range[]` path. Then both sides are canonical text arrays and the existing `compare_constants` array arm is correct. **Refined 2026-09-08 (deeper probe):** the 36 tests use TYPED wrappers (`Int4Range`, `Int4Multirange`), not generic `Range` — with typed wrappers we error 42883 in ALL of `%s`/`%t`/`%b` while PG returns True; and PG's behaviour is FORMAT×CONTENT-dependent (e.g. canonicalizing `'{"[1,4]"}' = [Int4Range(1,5,'[)')]` is True on `%t` but PG itself errors `08P01` on `%b`; a populated multirange `%b` is PG `22021`). So a correct fix must ALSO reproduce PG's per-format error cases, not answer uniformly — a dedicated multi-batch campaign touching decode_parameter + coerce_unknown_operand + comparison, with the 800+ differential array/join tests at risk. Do NOT ship a uniform-answer shortcut (fails the fidelity gate). (`CREATE TYPE ... AS RANGE` custom range types shipped
-  2026-09-07 — DDL, casts, comparison, and `RangeInfo.fetch`.)
-  **Update 2026-09-08:** schema-qualified RANGE/ENUM types no longer
-  collide with the bare name — `CreateRange`/`CreateEnum` thread schema per the
-  #1388 composite template; range/enum catalog keyed on (schema, name), so
-  psycopg's `testschema.testrange` fixture and all four `RangeInfo.fetch` forms
-  pass. **Update 2026-09-08 (multirange resolution DONE):** every custom range's
-  auto-created MULTIRANGE companion is now resolvable — `pg_range` carries
-  `rngmultitypid`, each range mints a multirange oid (`range_oid + 200_000`, its
-  array `+300_000`), a multirange `pg_type` row is synthesized (bare `typname`
-  via the `range`→`multirange` first-substring rule, `foo`→`foo_multirange`),
-  and `to_regtype` resolves the multirange name (bare in public, `schema.name`
-  otherwise, distinct per schema). All four `MultirangeInfo.fetch` forms
-  (`testmultirange`, `testschema.testmultirange`, and both as `sql.Identifier`)
-  resolve to the right oid/subtype, verified against a live PG 14 oracle. Custom
-  multirange VALUE round-trip (dump/load of a populated `'{...}'::testmultirange`)
-  is NOT part of this — it rides the existing scalar range/multirange binary
-  codec and was not measured here; the array-of-multirange param campaign above
-  is still open.
+- [ ] **OPEN — RUST pgserver `DROP SCHEMA ... CASCADE` drops only the schema
+  record (measured 2026-09-09).** Types created in the schema (range, enum,
+  composite — all three probed) survive it, so a following
+  `create schema s; create type s.t ...` answers `42710 type "t" already
+  exists` where PostgreSQL succeeds. The handler in `secantus-pgserver`
+  (`Statement::DropSchema`) says so in its comment: the server does not track
+  which objects belong to a schema. The slice tests drop
+  `testschema.testrange` by name to work around it.
 
 
 ### 2026-09-06 READ-PATH sweep: 385 cases, and what is still open

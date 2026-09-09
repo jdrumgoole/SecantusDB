@@ -3019,6 +3019,324 @@ def test_a_range_bound_as_a_parameter_is_the_same_range(home: Path, binary: bool
             assert cur.fetchone()[0] is True, sql
 
 
+@pytest.mark.parametrize("binary", [False, True], ids=["text", "binary"])
+def test_a_literal_beside_a_range_array_parameter_takes_its_type(home: Path, binary: bool) -> None:
+    """`'{"[1,5]"}' = %s` with a LIST of ranges bound: the literal is an
+    `int4range[]` and compares as ranges, not as strings.
+
+    psycopg sends `[Int4Range(...)]` as `_int4range` (oid 3905), and the
+    planner had no name for that oid -- so `$1` was typed from its decoded
+    value (`text[]`), the untyped literal beside it was never coerced, and the
+    comparison was refused as `text = text[]`. Every value here was measured
+    against PostgreSQL 16: `[1,5]` canonicalises to `[1,6)` on the way in, so
+    it equals a bound `[1,6)` and NOT a bound `[1,5)`, a crossed literal is
+    22000, and the parameter reports its array type.
+    """
+    from psycopg.types.multirange import Int4Multirange
+    from psycopg.types.range import Int4Range
+
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor(binary=binary)
+        cur.execute(
+            """select '{"[1,5]"}' = %s, pg_typeof(%s)::text""",
+            ([Int4Range(1, 5, "[]")], [Int4Range(1, 5, "[]")]),
+        )
+        assert cur.fetchone() == (True, "int4range[]")
+        cur.execute("""select '{"[1,5]"}' = %s""", ([Int4Range(1, 6, "[)")],))
+        assert cur.fetchone()[0] is True
+        cur.execute("""select '{"[1,5]"}' = %s""", ([Int4Range(1, 5, "[)")],))
+        assert cur.fetchone()[0] is False
+        # The psycopg gauge's own shape: an empty range and an unbounded one.
+        cur.execute(
+            """select '{empty,"(,)"}' = %s""",
+            ([Int4Range(empty=True), Int4Range(bounds="()")],),
+        )
+        assert cur.fetchone()[0] is True
+        # A multirange array too, through its own array oid.
+        mr = [Int4Multirange([Int4Range(1, 6), Int4Range(7, 8)])]
+        cur.execute(
+            """select '{"{[1,5],[7,8)}"}' = %s, pg_typeof(%s)::text""",
+            (mr, mr),
+        )
+        assert cur.fetchone() == (True, "int4multirange[]")
+        # The literal is parsed as the parameter's type, so a crossed pair is
+        # the range error, not a string mismatch.
+        with pytest.raises(psycopg.errors.DataException) as exc:
+            cur.execute("""select '{"[5,1]"}' = %s""", ([Int4Range(1, 5, "[]")],))
+        assert "range lower bound must be less than or equal to range upper bound" in str(exc.value)
+
+
+def test_an_untyped_binary_range_parameter_takes_its_type_from_context(home: Path) -> None:
+    """A bare `Range(empty=True)` bound in BINARY beside a typed range.
+
+    psycopg sends an untyped `Range` / `Multirange` with oid 0, and in binary
+    that is a flag byte (`\\x01` = empty) or an int32 count -- bytes that are
+    only a range once something says which range. PostgreSQL's analysis pass
+    gives the parameter the type of the operand it is compared against; the
+    server now infers the same from the statement before decoding, so the
+    byte reaches the range decoder instead of being read as text (which
+    answered False for every one of these). Values measured against
+    PostgreSQL 16, including that a parameter with NO context is still 42P18.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor(binary=True)
+        cur.execute("select 'empty'::int4range = %b", (Range(empty=True),))
+        assert cur.fetchone()[0] is True
+        cur.execute(
+            "select 'empty'::numrange = %b, 'empty'::tstzrange = %b",
+            (Range(empty=True), Range(empty=True)),
+        )
+        assert cur.fetchone() == (True, True)
+        cur.execute(
+            "select '[1,5)'::int4range = %b, %b = '[1,5)'::int4range",
+            (Range(1, 5), Range(1, 5)),
+        )
+        assert cur.fetchone() == (True, True)
+        cur.execute("select '[1,5)'::int4range = %b", (Range(1, 6),))
+        assert cur.fetchone()[0] is False
+        cur.execute(
+            "select int4range(NULL::int4, NULL::int4, '()') = %b",
+            (Range(None, None, "()"),),
+        )
+        assert cur.fetchone()[0] is True
+        cur.execute("select '{}'::int4multirange = %b", (Multirange(),))
+        assert cur.fetchone()[0] is True
+        cur.execute(
+            "select int4multirange(%s::int4range) = %b",
+            (Range(empty=True), Multirange([Range(empty=True)])),
+        )
+        assert cur.fetchone()[0] is True
+        cur.execute("select '{[1,5)}'::int4multirange = %b", (Multirange([Range(1, 5)]),))
+        assert cur.fetchone()[0] is True
+        # No context, no type: PostgreSQL refuses, and so do we.
+        with pytest.raises(psycopg.errors.IndeterminateDatatype) as exc:
+            cur.execute(
+                "select 'empty'::int4range = %b, pg_typeof(%b)::text",
+                (Range(empty=True), Range(empty=True)),
+            )
+        assert "could not determine data type of parameter $2" in str(exc.value)
+
+
+def test_custom_range_types_are_created_fetched_and_round_tripped(home: Path) -> None:
+    """`CREATE TYPE ... AS RANGE` with the whole psycopg lifecycle around it.
+
+    psycopg's `RangeInfo.fetch` / `register_range` want the type in the
+    catalog with its own oid, its subtype oid, and the auto-created
+    multirange pointing back at it -- and then the constructor, the casts and
+    the dump / load paths in all three formats have to work on the new type.
+    Every value here was measured against PostgreSQL 16 by running the same
+    script on both servers (`scratchpad/slicecheck.py` during the slice).
+    """
+    from psycopg.adapt import Dumper
+    from psycopg.pq import Format
+    from psycopg.types.multirange import MultirangeInfo, register_multirange
+    from psycopg.types.range import RangeInfo, register_range
+
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute('create type testrange as range (subtype = text, collation = "C")')
+        conn.execute("create schema testschema")
+        conn.execute("create type testschema.testrange as range (subtype = float8)")
+        info = RangeInfo.fetch(conn, "testrange")
+        assert info is not None and info.subtype_oid == 25
+        register_range(info, conn)
+        sinfo = RangeInfo.fetch(conn, "testschema.testrange")
+        assert sinfo is not None and sinfo.subtype_oid == 701 and sinfo.oid != info.oid
+        register_range(sinfo, conn)
+        minfo = MultirangeInfo.fetch(conn, "testmultirange")
+        assert minfo is not None and minfo.range_oid == info.oid
+        register_multirange(minfo, conn)
+
+        cur = conn.execute(
+            "select 'empty'::testrange, '[a,c]'::testrange, pg_typeof('[a,c]'::testrange)::text"
+        )
+        assert cur.fetchone() == (Range(empty=True), Range("a", "c", "[]"), "testrange")
+        cur = conn.execute("select '{[a,c),[e,f]}'::testmultirange")
+        assert cur.fetchone()[0] == Multirange([Range("a", "c", "[)"), Range("e", "f", "[]")])
+        cur = conn.execute(
+            "select testrange('a', 'c'), testrange('a', 'c', '(]'), "
+            "testrange('a', NULL), testrange(NULL, NULL, '()')"
+        )
+        assert cur.fetchone() == (
+            Range("a", "c", "[)"),
+            Range("a", "c", "(]"),
+            Range("a", None, "[)"),
+            Range(None, None, "()"),
+        )
+        cur = conn.execute(
+            "select testschema.testrange(1.5, 2.5), '[1.5,2.5)'::testschema.testrange, "
+            "pg_typeof(testschema.testrange(1.5, 2.5))::text"
+        )
+        assert cur.fetchone() == (
+            Range(1.5, 2.5, "[)"),
+            Range(1.5, 2.5, "[)"),
+            "testschema.testrange",
+        )
+        # The empty-string bound is a value; the quotes are what keep it
+        # from being read as an infinite bound.
+        cur = conn.execute(
+            """select '["",foo)'::testrange, '["",foo)'::testrange::text, """
+            """lower('["",foo)'::testrange)"""
+        )
+        assert cur.fetchone() == (Range("", "foo", "[)"), '["",foo)', "")
+        # Dump / load round-trips in every format, including the gauge's
+        # quoting-sweep shape: a `"` bound is rendered as a doubled quote.
+        for fmt in ("s", "t", "b"):
+            cur = conn.execute(
+                f"select %{fmt}, %{fmt} = 'empty'::testrange, %{fmt}::text",
+                (Range("a", "c"), Range[str](empty=True), Range('"', "#")),
+            )
+            assert cur.fetchone() == (Range("a", "c", "[)"), True, '["""",#)'), fmt
+            cur = conn.execute(f"select %{fmt}", (Multirange([Range("a", "c"), Range("x", None)]),))
+            assert cur.fetchone()[0] == Multirange(
+                [Range("a", "c", "[)"), Range("x", None, "[)")]
+            ), fmt
+        # A one-argument constructor call is the cast of a literal, not a
+        # lower bound -- so a bare value is the malformed-literal error.
+        cur = conn.execute(
+            "select testrange('[a,c)'), int4range('[1,3)'), int4multirange('{[1,2)}')"
+        )
+        assert cur.fetchone() == (
+            Range("a", "c", "[)"),
+            Range(1, 3, "[)"),
+            Multirange([Range(1, 2, "[)")]),
+        )
+        for sql, literal in [("select testrange('a')", "a"), ("select int4range('1')", "1")]:
+            with pytest.raises(psycopg.errors.InvalidTextRepresentation) as exc:
+                conn.execute(sql)
+            assert exc.value.sqlstate == "22P02"
+            assert str(exc.value).splitlines()[0] == f'malformed range literal: "{literal}"'
+        # An infinite bound is always exclusive, whatever the subtype.
+        cur = conn.execute(
+            "select '[,foo)'::testrange::text, '(,5]'::int4range::text, '[,5]'::numrange::text"
+        )
+        assert cur.fetchone() == ("(,foo)", "(,6)", "(,5]")
+
+        # With the type registered, `Range[str]` is a testrange and the
+        # accessors give its bounds (psycopg's `test_dump_quoting` shape).
+        cur = conn.execute(
+            "select ascii(lower(%(r)s)) = %(low)s and ascii(upper(%(r)s)) = %(up)s",
+            {"r": Range('"', "#"), "low": 34, "up": 35},
+        )
+        assert cur.fetchone() == (True,)
+
+        # A subtype dumper that turns "" into NULL makes the bound infinite,
+        # in text and in binary (psycopg's `test_dump_custom_null` shape).
+        class StrNoneDumper(Dumper):
+            oid = 25
+
+            def dump(self, obj: str) -> bytes | None:
+                return obj.encode() if obj else None
+
+        class StrNoneBinaryDumper(StrNoneDumper):
+            format = Format.BINARY
+
+        conn.adapters.register_dumper(str, StrNoneDumper)
+        conn.adapters.register_dumper(str, StrNoneBinaryDumper)
+        for fmt in ("s", "t", "b"):
+            cur = conn.execute(f"select %{fmt}::testrange", (Range[str]("", "foo"),))
+            assert cur.fetchone()[0] == Range(None, "foo", "()"), fmt
+
+
+def test_range_accessors_boolean_expressions_and_copy_canonical_form(home: Path) -> None:
+    """The pieces the psycopg quoting sweep and COPY tests lean on.
+
+    `lower` / `upper` and the five predicates over every range family
+    (NULL for an empty or infinite bound, typed by the subtype), the
+    three-valued AND / OR / NOT in a FROM-less select with PostgreSQL's
+    42804 for a non-boolean operand and 22P02 for an untyped literal that
+    is not a boolean, `ascii` typed as int4, and COPY storing the canonical
+    form (`{empty}` is `{}`, `[1,5]` is `[1,6)`). Values measured against
+    PostgreSQL 16.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.execute(
+            "select lower('[1,5)'::int4range), upper('[1,5)'::int4range), "
+            "pg_typeof(lower('[1,5)'::int4range))::text"
+        )
+        assert cur.fetchone() == (1, 5, "integer")
+        cur = conn.execute(
+            "select lower('empty'::int4range), upper('empty'::int4range), "
+            "lower('(,5)'::int4range), upper('[1,)'::int4range)"
+        )
+        assert cur.fetchone() == (None, None, None, None)
+        cur = conn.execute(
+            "select lower_inc('[1,5)'::int4range), upper_inc('[1,5)'::int4range), "
+            "lower_inf('(,5)'::int4range), upper_inf('(,5)'::int4range), "
+            "isempty('empty'::int4range), isempty('[1,5)'::int4range)"
+        )
+        assert cur.fetchone() == (True, False, True, False, True, False)
+        cur = conn.execute(
+            "select lower_inc('empty'::int4range), lower_inf('empty'::int4range), "
+            "upper_inf('empty'::int4range)"
+        )
+        assert cur.fetchone() == (False, False, False)
+        cur = conn.execute(
+            "select lower('[1.5,2.5]'::numrange), upper('(,)'::numrange), "
+            "lower('[2024-01-01,2024-02-01)'::daterange)::text"
+        )
+        assert cur.fetchone() == (Decimal("1.5"), None, "2024-01-01")
+        cur = conn.execute(
+            "select lower('{[1,3),[5,7)}'::int4multirange), "
+            "upper('{[1,3),[5,7)}'::int4multirange), "
+            "isempty('{}'::int4multirange), lower('{}'::int4multirange)"
+        )
+        assert cur.fetchone() == (1, 7, True, None)
+        # An untyped Range goes over as oid 0, and `lower(unknown)` is the
+        # TEXT lower -- the range literal itself, case-folded.
+        cur = conn.execute(
+            "select lower(%s), upper(%s), lower(%s)",
+            (Range(1, 5), Range("a", "c"), Range[str](empty=True)),
+        )
+        assert cur.fetchone() == ("[1,5)", "[A,C)", "empty")
+        cur = conn.execute("select lower(NULL::int4range), lower_inc(NULL::int4range)")
+        assert cur.fetchone() == (None, None)
+
+        cur = conn.execute(
+            "select 1 = 1 and 2 = 2, true or false, not true, 1=1 and 2=3 or 3=3, "
+            "true and null, null or true, not null, false and null, null or false"
+        )
+        assert cur.fetchone() == (True, True, False, True, None, True, None, False, None)
+        # Unregistered, the range is text and `lower` / `upper` fold the
+        # literal, so `ascii` sees its `[`.
+        cur = conn.execute(
+            "select ascii(lower(%(r)s)), ascii(upper(%(r)s))", {"r": Range('"', "#")}
+        )
+        assert cur.fetchone() == (91, 91)
+        cur = conn.execute("select ascii(%s)", ("[",))
+        assert cur.fetchone() == (91,)
+        assert cur.description[0].type_code == 23
+        with pytest.raises(psycopg.errors.DatatypeMismatch) as exc:
+            conn.execute("select 1 and 2")
+        assert exc.value.sqlstate == "42804"
+        assert (
+            str(exc.value).splitlines()[0]
+            == "argument of AND must be type boolean, not type integer"
+        )
+        cur = conn.execute("select not 'f', 't' and true, 'yes' or null")
+        assert cur.fetchone() == (True, True, True)
+        with pytest.raises(psycopg.errors.InvalidTextRepresentation) as exc2:
+            conn.execute("select not 'x'")
+        assert exc2.value.sqlstate == "22P02"
+        assert str(exc2.value).splitlines()[0] == 'invalid input syntax for type boolean: "x"'
+
+        conn.execute("create table cpr (id int, r int4range, mr int4multirange)")
+        cur = conn.cursor()
+        with cur.copy("copy cpr (id, r, mr) from stdin") as cp:
+            cp.write("1\t[1,5]\t{empty}\n2\tempty\t{[1,5],[8,9)}\n3\t\\N\t\\N\n")
+        cur = conn.execute("select id, r::text, mr::text, r, mr from cpr order by id")
+        assert cur.fetchall() == [
+            (1, "[1,6)", "{}", Range(1, 6, "[)"), Multirange()),
+            (
+                2,
+                "empty",
+                "{[1,6),[8,9)}",
+                Range(empty=True),
+                Multirange([Range(1, 6, "[)"), Range(8, 9, "[)")]),
+            ),
+            (3, None, None, None, None),
+        ]
+
+
 def test_pg_typeof_reports_the_type_the_client_declared(home: Path) -> None:
     """…which is not the one the decoded value suggests.
 
@@ -3610,6 +3928,29 @@ def test_composite_parameter_round_trips_in_both_formats(home: Path, binary: boo
         # A NULL field survives, and the text render matches PostgreSQL's.
         obj_null = info.python_type("foo", 1, None)
         assert cur.execute("select %s::text", [obj_null]).fetchone()[0] == "(foo,1,)"
+        # The planner NAMES the slot from the compared operand (`row(..)::cp =
+        # $1` types `$1` as `cp`), so the parameter arrives with a declared
+        # composite type rather than the raw oid alone. That declared type must
+        # take the record decoder too: it once fell through to the generic one,
+        # which read the text form as a plain string (`comparing document with
+        # string`) and refused the binary form outright (`binary parameters of
+        # type oid Some(...) are not supported yet`).
+        assert cur.execute("select row('hi', 42, 3.5)::cp = %s", [obj]).fetchone()[0] is True
+        assert cur.execute("select row('hi', 43, 3.5)::cp = %s", [obj]).fetchone()[0] is False
+        # And a composite holding a range field, on a fresh connection (a
+        # second `register_composite` on the same connection makes psycopg
+        # send the parameter untyped -- PostgreSQL answers `could not
+        # determine data type of parameter $1` for that too).
+        conn.execute("create type cpr as (num int4, r daterange, nums int4[])")
+        conn2 = conn.__class__.connect(conn.info.dsn, autocommit=True)
+        from psycopg.types.range import Range
+
+        rinfo = CompositeInfo.fetch(conn2, "cpr")
+        register_composite(rinfo, conn2)
+        robj = rinfo.python_type(10, Range(empty=True), [])
+        cur = conn2.cursor(binary=binary)
+        assert cur.execute("select pg_typeof(%s)", [robj]).fetchone()[0] == "cpr"
+        assert cur.execute("select %s::text", [robj]).fetchone()[0] == "(10,empty,{})"
 
 
 def test_composite_array_load_text_and_binary(home: Path) -> None:
