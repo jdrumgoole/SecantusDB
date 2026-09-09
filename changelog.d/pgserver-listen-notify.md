@@ -49,7 +49,10 @@ because psycopg's tests asked for them, each measured against PostgreSQL 16.
   `test_pipeline`, `test_concurrency`, `test_tpc`, `test_xid`,
   `test_conninfo_attempts`, `test_waiting`, `test_module` and `tests/pq`, with
   a per-platform pytest marker filter (`MARKER_EXPR`) that excludes psycopg's
-  `proxy` and `timing` markers on macOS as psycopg's own CI does.
+  `proxy` and `timing` markers on macOS as psycopg's own CI does. Three tests
+  are deselected with their reasons recorded in `include_paths.py`: one reads
+  a foreign libpq's `PGconn` and two connect to RFC 5737 unroutable addresses
+  and depend on the host network timing out rather than answering at once.
 
 #### Fixed
 

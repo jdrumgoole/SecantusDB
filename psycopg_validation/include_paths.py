@@ -86,6 +86,16 @@ DESELECT_TESTS: list[str] = [
     # `PQserverVersion` on the foreign PGconn pointer answers 0. A harness
     # mismatch, not a server one.
     "tests/pq/test_pgconn.py::test_pgconn_ptr",
+    # Never reaches the server: the test connects to two RFC 5737 reserved
+    # addresses and expects each attempt to time out after `connect_timeout`.
+    # Alone it passes (4 s, against this server and PostgreSQL 16 alike); in
+    # the full run it failed in 0.04 s on two consecutive runs (the async
+    # twin once, both twins once), i.e. the host's network stack answered the
+    # unroutable address at once instead of letting the attempt time out. A
+    # host-network condition, not a server one, and one that a run has no way
+    # to hold still.
+    "tests/test_connection.py::test_connect_error_multi_hosts_each_message_preserved",
+    "tests/test_connection_async.py::test_connect_error_multi_hosts_each_message_preserved",
 ]
 
 # A pytest `-m` expression the runner threads through, or None for no marker
