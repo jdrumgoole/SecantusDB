@@ -2694,7 +2694,7 @@ impl PgHandler {
                 };
                 let hit = self
                     .storage
-                    .find_matching(&self.db, table, &filter)
+                    .find_matching(self.db(), table, &filter)
                     .map_err(|e| Self::storage_err("could not check the primary key", e))?;
                 if !hit.is_empty() {
                     return Ok(Some(id.clone()));
