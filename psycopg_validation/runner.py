@@ -90,7 +90,7 @@ def _verify_secantus_identity(host: str, port: int) -> None:
 
 
 def main() -> int:
-    from .include_paths import DESELECT_TESTS, INCLUDE
+    from .include_paths import DESELECT_TESTS, INCLUDE, MARKER_EXPR
 
     if not (VENDOR / "tests").is_dir():
         print(
@@ -142,8 +142,12 @@ def main() -> int:
         env = {
             **os.environ,
             "PSYCOPG_TEST_DSN": f"host={host} port={port} user=postgres dbname=postgres",
+            # tests/test_module.py shells out to `mypy`; make it the venv's
+            # (a bare `mypy` on this box is intercepted by pyenv and fails).
+            "PATH": os.pathsep.join([str(Path(sys.executable).parent), os.environ.get("PATH", "")]),
         }
         deselect = [f"--deselect={t}" for t in DESELECT_TESTS]
+        marker = ["-m", MARKER_EXPR] if MARKER_EXPR else []
         # Run from VENDOR so psycopg's own conftest/config apply (this is
         # their suite, unmodified; only the DSN points at us). No xdist: the
         # suite shares databases (serial by design), their session hooks
@@ -171,6 +175,7 @@ def main() -> int:
             "--tb=no",
             "-q",
             *deselect,
+            *marker,
             *INCLUDE,
         ]
         proc = subprocess.run(cmd, cwd=VENDOR, env=env, timeout=PYTEST_TIMEOUT_SECONDS)
