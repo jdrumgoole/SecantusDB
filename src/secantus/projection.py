@@ -10,7 +10,7 @@ from bson import Decimal128
 
 from secantus.expressions import _bson_type_name
 from secantus.paths import get_path, has_path, set_path
-from secantus.query import matches
+from secantus.query import matches, terminal_value
 
 _MISSING = object()
 
@@ -169,6 +169,59 @@ def _positional_element_predicate(
     return doc_pred, value_pred
 
 
+def _path_collision_error(spec: Mapping[str, Any]) -> ProjectionError | None:
+    """mongod's refusal when one projected path is an ancestor of another.
+
+    `{a: 1, "a.x": 1}` is not a narrowing of `a`; mongod rejects the pair
+    outright, and WHICH error depends on the order the two appear in the spec
+    (measured 8.2.11, 2026-09-09):
+
+    ```text
+        {a: 1, "a.x": 1}       31249  Path collision at a.x remaining portion x
+        {"a.x": 1, a: 1}       31250  Path collision at a
+        {"a.x": 1, "a.x.y": 1} 31249  Path collision at a.x.y remaining portion x.y
+        {a: 0, "a.x": 0}       31249  (exclusion collides too)
+        {a: 0, "a.x": 1}       31249  (ahead of the mix-include-exclude check)
+    ```
+
+    So `31249` fires when the ANCESTOR was seen first and names the later,
+    longer path plus its portion after the first component; `31250` fires when
+    the descendant was seen first and names the ancestor.
+
+    Not collisions, and each is in the probe corpus so the rule cannot quietly
+    widen: siblings (`a.x` with `a.y`), a shared string prefix that is not a
+    path component (`a` with `ab.x`), and the same path twice.
+
+    Both servers accepted every one of these and returned a truncated document
+    -- an invalid projection answered rather than refused.
+    """
+    seen: list[str] = []
+    for key in spec:
+        if _is_positional_key(key) or _is_meta_spec(spec[key]):
+            continue
+        parts = key.split(".")
+        for earlier in seen:
+            e_parts = earlier.split(".")
+            if e_parts == parts:
+                continue
+            if parts[: len(e_parts)] == e_parts:
+                # The ancestor came first: name the later path.
+                return ProjectionError(
+                    f"Path collision at {key} remaining portion {'.'.join(parts[1:])}",
+                    code=31249,
+                    code_name="Location31249",
+                )
+            if e_parts[: len(parts)] == parts:
+                # The descendant came first: name the ancestor.
+                return ProjectionError(
+                    f"Path collision at {key}",
+                    code=31250,
+                    code_name="Location31250",
+                )
+        seen.append(key)
+    return None
+
+
 def validate_projection(
     spec: Mapping[str, Any] | None, query: Mapping[str, Any] | None = None
 ) -> None:
@@ -178,6 +231,9 @@ def validate_projection(
     :func:`apply_projection` only sees them once a document is projected)."""
     if not spec:
         return
+    collision = _path_collision_error(spec)
+    if collision is not None:
+        raise collision
     validate_meta_projection(spec, query)
     positional = [k for k in spec if _is_positional_key(k)]
     if not positional:
@@ -703,7 +759,7 @@ def _apply_projection_body(doc: dict[str, Any], plan: _ProjectionPlan) -> dict[s
             current = get_path(result, path, default=_MISSING)
             if current is not _MISSING:
                 set_path(result, path, _apply_slice(current, slice_arg))
-        return result
+        return _in_document_order(result, doc)
     # exclusion
     result = copy.deepcopy(doc)
     assert plan.exclude_tree is not None
@@ -715,6 +771,40 @@ def _apply_projection_body(doc: dict[str, Any], plan: _ProjectionPlan) -> dict[s
         if current is not _MISSING:
             set_path(result, path, _apply_slice(current, slice_arg))
     return result
+
+
+def _in_document_order(result: dict[str, Any], doc: Mapping[str, Any]) -> dict[str, Any]:
+    """Reorder a projected document's top-level keys the way mongod emits them.
+
+    The rule, measured on 8.2.11 (2026-09-09) against a document whose own key
+    order is `_id, b, a, c`:
+
+        {a: 1, b: 1}                 -> _id, b, a
+        {b: 1, a: 1}                 -> _id, b, a
+        {a: {$slice: 2}, b: 1}       -> _id, b, a
+        {a: {$elemMatch: ...}, b: 1} -> _id, b, a
+        {z: {$literal: 1}, b: 1}     -> _id, b, z
+
+    So: `_id` first, then the SOURCE DOCUMENT's order -- not the projection
+    spec's -- and any key the document does not have (a computed field) appended
+    after, in spec order.
+
+    `$slice` and `$elemMatch` were applied after the plain inclusions and so
+    landed at the end, which put `{a: {$slice: 2}, b: 1}` out as `_id, b, a`
+    -- correct here only by luck of the corpus -- and any doc ordered `a` before
+    `b` out as `_id, b, a` where mongod says `_id, a, b`. Key order is what a
+    driver renders, and `==` on a document ignores it entirely, so nothing else
+    in the suite could see this.
+    """
+    order = {key: i for i, key in enumerate(doc)}
+    ordered: dict[str, Any] = {}
+    if "_id" in result:
+        ordered["_id"] = result["_id"]
+    rest = [k for k in result if k != "_id"]
+    # Stable: keys absent from the document keep their spec order at the end.
+    for key in sorted(rest, key=lambda k: order.get(k, len(order))):
+        ordered[key] = result[key]
+    return ordered
 
 
 def _apply_positional(
@@ -841,14 +931,46 @@ def _exclude_value(val: Any, subtree: Mapping[str, Any]) -> None:
 
 
 def _first_match(doc: dict[str, Any], path: str, sub_filter: Mapping[str, Any]) -> Any:
+    """The first array element satisfying a `$elemMatch` projection criterion.
+
+    The criterion's SHAPE decides how each element is tested, and the decision
+    is made once for the whole array rather than per element:
+
+    * a criterion of only ``$``-operators (``{$gt: 2}``) is an ELEMENT-VALUE
+      predicate -- each element is tested as the value, whatever its type;
+    * any other document criterion (``{x: {$gt: 1}}``) is a per-FIELD predicate
+      applied to the element as a document.
+
+    The same rule `update._pull_matches` carries, and for the same reason. This
+    used to branch on whether the ELEMENT was a Mapping, so a bare operator
+    criterion over an array of documents reached `matches(elem, {"$gt": 2})`
+    and raised `2 unknown top level operator: $gt` -- a valid projection
+    refused, where mongod answers.
+
+    The value predicate tests each element as a SINGLE VALUE, with no implicit
+    one-level array traversal, which is why it goes through
+    `query.terminal_value`. Measured 8.2.11 (2026-09-09) -- note `$size` and
+    `$eq` still see the element as the array it is, so this is the traversal
+    being suppressed and not the type:
+
+    ```text
+        [[1, 2], [3, 4]]  {$gt: 2}      -> omitted   (an array is not a number)
+        [1, [3, 4], 5]    {$gt: 2}      -> [5]       (the nested array is skipped)
+        [[1, 2], [3]]     {$size: 2}    -> [[1, 2]]
+        [[1, 2], [3, 4]]  {$eq: [3, 4]} -> [[3, 4]]
+        [[1, 2], [3, 4]]  {$all: [3]}   -> omitted   (no membership either)
+        [1, 2, 3]         {$gt: 2}      -> [3]
+    ```
+    """
     arr = get_path(doc, path)
     if not isinstance(arr, list):
         return _MISSING
+    value_predicate = bool(sub_filter) and all(str(k).startswith("$") for k in sub_filter)
     for elem in arr:
-        if isinstance(elem, Mapping):
-            if matches(elem, sub_filter):
+        if value_predicate or not isinstance(elem, Mapping):
+            if matches({"_": terminal_value(elem)}, {"_": sub_filter}):
                 return elem
-        elif matches({"_": elem}, {"_": sub_filter}):
+        elif matches(elem, sub_filter):
             return elem
     return _MISSING
 

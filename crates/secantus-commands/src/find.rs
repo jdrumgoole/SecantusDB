@@ -346,19 +346,27 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         if let Some(err) = projection_meta_error(spec, &filter) {
             return Ok(err.into_reply());
         }
-        // Positional (`arr.$`) validation is parse-time in mongod, so an invalid
-        // one errors even when nothing matches. The Rust engine can't reproduce
-        // the exact Location code (31276 / 31395 / 51246) — a generic BadValue,
-        // same as its other deferred error paths.
+        // Projection validation is parse-time in mongod, so an invalid spec
+        // errors even when nothing matches.
+        //
+        // A NAMED error is passed through: the path-collision check answers
+        // mongod's own 31249 / 31250, and rewriting it to a generic BadValue
+        // threw that away. Only a `Defer` -- the positional cases whose exact
+        // Location code (31276 / 31395 / 51246) this engine cannot reproduce --
+        // still falls back to the generic message.
         let q = if filter.is_empty() {
             None
         } else {
             Some(&filter)
         };
-        if secantus_core::projection::validate_projection(spec, q).is_err() {
-            return Ok(
-                CommandError::new(2, "BadValue", "invalid positional projection").into_reply(),
-            );
+        if let Err(err) = secantus_core::projection::validate_projection(spec, q) {
+            let reply = match err {
+                secantus_core::fallback::Fallback::Mongo { code, message, .. } => {
+                    CommandError::new(code, crate::util::error_code_name(code), message)
+                }
+                _ => CommandError::new(2, "BadValue", "invalid positional projection"),
+            };
+            return Ok(reply.into_reply());
         }
     }
     let hint = doc.get("hint");
