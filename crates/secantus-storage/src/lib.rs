@@ -6906,8 +6906,14 @@ impl Storage {
     }
 
     pub fn collection_exists(&self, db: &str, coll: &str) -> Result<bool> {
-        // Lock-free read (see the `lock` field's invariants).
-        let session = self.conn.open_session()?;
+        // Lock-free read (see the `lock` field's invariants). Inside a user
+        // transaction the read is on the TRANSACTION's session, so a
+        // collection that transaction created (or dropped) and has not yet
+        // committed answers the way its own later statements see it -- a
+        // fresh session cannot see uncommitted DDL, and the PG server's
+        // savepoint restore relied on this answer to decide whether a
+        // `ROLLBACK TO` had a collection to drop.
+        let session = self.op_session()?;
         let cur = session.open_cursor(COLL_TABLE, None)?;
         cur.set_key_ss(db, coll);
         match cur.search() {

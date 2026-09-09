@@ -307,17 +307,17 @@ fn update_and_delete_are_planned() {
 
 #[test]
 fn shapes_sqlglot_mis_parses_reach_us_as_real_statements() {
-    // `DROP TABLE a, b, c`, `BEGIN ...` and `MOVE FORWARD 2 IN c` used to live
-    // here too; all three now EXECUTE rather than merely parsing, which is the
-    // stronger result.
-    for sql in [
-        "LISTEN chan",
-        "NOTIFY chan, 'payload'",
-        "COPY t FROM stdin WITH (freeze on)",
-    ] {
+    // `DROP TABLE a, b, c`, `BEGIN ...`, `MOVE FORWARD 2 IN c` and
+    // `NOTIFY chan, 'payload'` used to live here too; all four now EXECUTE
+    // rather than merely parsing, which is the stronger result.
+    for sql in ["LISTEN chan", "COPY t FROM stdin WITH (freeze on)"] {
         let err = plan(sql, &lookup).expect_err(sql);
         assert_eq!(err.sqlstate(), "0A000", "for {sql} (got {err})");
     }
+    assert!(matches!(
+        plan_ok("NOTIFY chan, 'payload'"),
+        Statement::Notify
+    ));
 }
 
 /// Aggregates plan to POSITIONAL output columns.

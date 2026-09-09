@@ -1252,18 +1252,18 @@ def test_deallocate_all_is_accepted(home: Path) -> None:
     as a missing feature. The prepared-statement store belongs to the wire
     layer here, so there is nothing to free; the tag is what the client needs.
 
-    `DEALLOCATE <name>` is still refused rather than treated as a no-op:
-    PostgreSQL answers 26000 for a name that does not exist, and silently
-    succeeding would be a wrong answer.
+    `DEALLOCATE <name>` of a name that does not exist is PostgreSQL's 26000
+    `InvalidSqlStatementName` (probed PG 16), not a no-op and not 0A000.
     """
     with _Server(home) as server, server.connect() as conn:
         cur = conn.cursor()
         cur.execute("DEALLOCATE ALL")
         assert cur.statusmessage == "DEALLOCATE ALL"
 
-        with pytest.raises(psycopg.Error) as exc:
+        with pytest.raises(psycopg.errors.InvalidSqlStatementName) as exc:
             cur.execute("DEALLOCATE nosuchstmt")
-        assert exc.value.diag.sqlstate == "0A000"
+        assert exc.value.diag.sqlstate == "26000"
+        assert 'prepared statement "nosuchstmt" does not exist' in str(exc.value)
 
 
 def test_pg_typeof_reports_the_display_type(home: Path) -> None:
@@ -3565,8 +3565,11 @@ def test_type_discovery_through_pg_type(home: Path) -> None:
         # The catalog rows themselves, filtered and aliased.
         cur.execute("select typname from pg_type where oid = 25")
         assert cur.fetchone()[0] == "text"
-        cur.execute("select count(*) from pg_prepared_statements where name != ''")
-        assert cur.fetchone()[0] == 0
+        # By now psycopg has run its TypeInfo query past `prepare_threshold`,
+        # so the view lists that one server-side statement — PG 16 answers 1
+        # here too; the names are psycopg's own `_pg3_N`.
+        cur.execute("select name from pg_prepared_statements")
+        assert all(name.startswith("_pg3_") for (name,) in cur.fetchall())
 
 
 @pytest.mark.parametrize("binary", [False, True], ids=["text", "binary"])
@@ -4594,32 +4597,57 @@ def test_binary_array_params_bytea_inet_uuid(home: Path) -> None:
     2951) and reads array columns back in binary; the element decode reuses the
     scalar bytea / inet / cidr / uuid decoders, and the array types report their
     own oid rather than falling through to varchar.
+
+    Every column of a binary-requested row must actually COME BACK binary:
+    psycopg decodes the whole row with the first column's format
+    (`_py_transformer.py`, `fformat(0)`), so a row mixing a binary `uuid[]`
+    with a text `inet[]` is undecodable ("unexpected number of dimensions").
+    PG 16 honours the requested format on all eight columns here, reports oids
+    `[1001, 2951, 1041, 651, 869, 650, 1041, 869]`, and renders the `::1`
+    host address without its `/128` mask in text as well as binary.
     """
     import ipaddress
     import uuid as _uuid
 
     with _Server(home) as server, server.connect() as conn:
         cur = conn.cursor()
-        cur.execute("create table arr (b bytea[], u uuid[], n inet[])")
+        cur.execute("create table arr (b bytea[], u uuid[], n inet[], c cidr[], i inet, d cidr)")
         u1 = _uuid.UUID("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11")
         cur.execute(
-            "insert into arr values (%b, %b, %b)",
+            "insert into arr values (%b, %b, %b, %b, %b, %b)",
             (
                 [b"\x01", b"\x02\xff"],
                 [u1],
-                [ipaddress.ip_interface("10.0.0.1/8")],
+                [ipaddress.ip_interface("10.0.0.1/8"), ipaddress.ip_interface("::1")],
+                [ipaddress.ip_network("10.0.0.0/8")],
+                ipaddress.ip_interface("192.168.0.1/24"),
+                ipaddress.ip_network("2001:db8::/32"),
             ),
         )
         for binary in (False, True):
             c = conn.cursor(binary=binary)
-            c.execute("select b, u, n from arr")
-            b, u, n = c.fetchone()
-            assert b == [b"\x01", b"\x02\xff"], binary
-            assert u == [u1], binary
-            assert n == [ipaddress.ip_interface("10.0.0.1/8")], binary
-        # The array column reports its own element-array oid, not varchar.
-        cur.execute("select b from arr")
-        assert cur.description[0].type_code == 1001  # bytea[]
+            c.execute("select b, u, n, c, i, d, array[null::inet], null::inet from arr")
+            assert c.fetchone() == (
+                [b"\x01", b"\x02\xff"],
+                [u1],
+                [ipaddress.ip_interface("10.0.0.1/8"), ipaddress.ip_address("::1")],
+                [ipaddress.ip_network("10.0.0.0/8")],
+                ipaddress.ip_interface("192.168.0.1/24"),
+                ipaddress.ip_network("2001:db8::/32"),
+                [None],
+                None,
+            ), binary
+            assert [c.pgresult.fformat(k) for k in range(8)] == [int(binary)] * 8
+            assert [d.type_code for d in c.description] == [
+                1001,
+                2951,
+                1041,
+                651,
+                869,
+                650,
+                1041,
+                869,
+            ]
 
 
 def test_join_multi_predicate_where(home: Path) -> None:
@@ -5594,3 +5622,258 @@ def test_boolean_casts_exist_only_for_integer_and_text(home: Path) -> None:
         with pytest.raises(psycopg.errors.InvalidTextRepresentation) as ei:
             cur.execute("select '2021-01-01'::bool")
         assert str(ei.value).startswith('invalid input syntax for type boolean: "2021-01-01"')
+
+
+def test_pg_prepared_statements_lists_protocol_prepared_statements(home: Path) -> None:
+    """`pg_prepared_statements` shows the connection's NAMED protocol-level
+    statements with PG's columns: `parameter_types` as regtype display names,
+    `result_types` NULL for a statement that returns no rows, `from_sql`
+    false, and a statement without parameters counted as one generic plan
+    where a parameterised one counts as one custom plan (psycopg executes
+    once at prepare time). The unnamed statement never appears. Probed PG 16
+    with psycopg 3.3 / libpq 18."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("create table pp (id serial primary key, num int, s text, j jsonb)")
+        cur.execute("insert into pp (num, s) values (1, 'a')")
+        cur.execute("select count(*) from pg_prepared_statements")
+        assert cur.fetchone() == (0,)
+        cur.execute("select num + %s::smallint, s || %s from pp", (1, "x"), prepare=True)
+        cur.execute("update pp set num = %s", (5,), prepare=True)
+        cur.execute(
+            "insert into pp (j) values (%s)", (psycopg.types.json.Jsonb({"a": 1}),), prepare=True
+        )
+        cur.execute("select 1", prepare=True)
+        cur.execute("select 2", prepare=False)
+        cur.execute(
+            "select name, statement, parameter_types, result_types, from_sql, "
+            "generic_plans, custom_plans from pg_prepared_statements order by name"
+        )
+        assert cur.fetchall() == [
+            (
+                "_pg3_0",
+                "select num + $1::smallint, s || $2 from pp",
+                ["smallint", "text"],
+                ["integer", "text"],
+                False,
+                0,
+                1,
+            ),
+            ("_pg3_1", "update pp set num = $1", ["smallint"], None, False, 0, 1),
+            ("_pg3_2", "insert into pp (j) values ($1)", ["jsonb"], None, False, 0, 1),
+            ("_pg3_3", "select 1", [], ["integer"], False, 1, 0),
+        ]
+        cur.execute("select * from pg_prepared_statements")
+        assert [(d.name, d.type_code) for d in cur.description] == [
+            ("name", 25),
+            ("statement", 25),
+            ("prepare_time", 1184),
+            ("parameter_types", 2211),
+            ("result_types", 2211),
+            ("from_sql", 16),
+            ("generic_plans", 20),
+            ("custom_plans", 20),
+        ]
+        cur.execute("select prepare_time from pg_prepared_statements limit 1")
+        (prepared_at,) = cur.fetchone()
+        assert prepared_at.tzinfo is not None
+        # DEALLOCATE of one name, then of all; a name the session does not
+        # hold is 26000.
+        cur.execute("deallocate _pg3_1")
+        cur.execute("select name from pg_prepared_statements order by name")
+        assert cur.fetchall() == [("_pg3_0",), ("_pg3_2",), ("_pg3_3",)]
+        with pytest.raises(psycopg.errors.InvalidSqlStatementName) as ei:
+            cur.execute("deallocate nosuch")
+        assert str(ei.value).startswith('prepared statement "nosuch" does not exist')
+        cur.execute("deallocate all")
+        cur.execute("select count(*) from pg_prepared_statements")
+        assert cur.fetchone() == (0,)
+        cur.execute("notify foo")
+        assert cur.statusmessage == "NOTIFY"
+
+
+def test_protocol_close_removes_a_prepared_statement(home: Path) -> None:
+    """psycopg evicts a prepared statement past `prepared_max` with the
+    protocol `Close` message (libpq 18's `PQclosePrepared`), and the row
+    leaves `pg_prepared_statements` with it. Probed PG 16."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.prepare_threshold = 0
+        conn.prepared_max = 1
+        for i in range(3):
+            conn.execute(f"select {i}")
+        listing = "select name, statement from pg_prepared_statements order by name"
+        assert conn.execute(listing).fetchall() == [("_pg3_2", "select 2"), ("_pg3_3", listing)]
+        conn.execute("select 100")
+        assert conn.execute(listing).fetchall() == [("_pg3_4", "select 100"), ("_pg3_5", listing)]
+
+
+def test_uuid_text_input_forms(home: Path) -> None:
+    """`uuid_in` accepts the 32-hex form, braces, upper case, and hyphens
+    after ANY group of four hex digits -- not only at the canonical
+    positions -- and rejects a short string, a non-hex digit, and leading
+    whitespace with 22P02. A text parameter bound to a `$n::uuid` is
+    canonicalised on the way in. Probed PG 16."""
+    canonical = uuid.UUID("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11")
+    with _Server(home) as server, server.connect() as conn:
+        for text in [
+            "a0eebc999c0b4ef8bb6d6bb9bd380a11",
+            "{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}",
+            "a0eebc99-9c0b4ef8-bb6d6bb9-bd380a11",
+            "a0ee-bc99-9c0b-4ef8-bb6d-6bb9-bd38-0a11",
+            "{a0eebc99-9c0b4ef8-bb6d6bb9-bd380a11}",
+            "A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11",
+        ]:
+            assert conn.execute("select %s::uuid", (text,)).fetchone() == (canonical,), text
+        for text in [
+            "a0eebc999c0b4ef8bb6d6bb9bd380a1",
+            "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a1z",
+            " a0eebc999c0b4ef8bb6d6bb9bd380a11",
+        ]:
+            with pytest.raises(psycopg.errors.InvalidTextRepresentation) as ei:
+                conn.execute("select %s::uuid", (text,))
+            assert str(ei.value).startswith(f'invalid input syntax for type uuid: "{text}"')
+        assert conn.execute(
+            "select %s::uuid::text", ("a0eebc999c0b4ef8bb6d6bb9bd380a11",)
+        ).fetchone() == (str(canonical),)
+        assert conn.execute("select %s", (canonical,)).fetchone() == (canonical,)
+
+
+def test_bytea_and_uuid_results_are_sent_binary_when_asked(home: Path) -> None:
+    """A binary-format request gets `bytea`, `uuid`, and their arrays in
+    binary (uuid as its 16 raw bytes), including NULL elements and a NULL
+    value; `set_byte` answers bytea. Probed PG 16."""
+    u = uuid.UUID("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11")
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor(binary=True)
+        cur.execute(
+            "select 'abc'::bytea, %s::uuid, array[%s::uuid, null], "
+            "array['ab'::bytea, null], null::uuid, set_byte('abc'::bytea, 0, 100)",
+            (str(u), str(u)),
+        )
+        assert cur.fetchone() == (b"abc", u, [u, None], [b"ab", None], None, b"dbc")
+        assert [d.type_code for d in cur.description] == [17, 2950, 2951, 1001, 2950, 17]
+        assert cur.pgresult is not None
+        assert cur.pgresult.fformat(0) == 1
+        # An untyped text parameter compared with a text expression.
+        cur.execute("select %s = chr(%s)", ("a", 97))
+        assert cur.fetchone() == (True,)
+        cur.execute("select %s = 'a'::text", ("a",))
+        assert cur.fetchone() == (True,)
+
+
+def test_nul_byte_in_a_binary_text_parameter_is_22021(home: Path) -> None:
+    """A binary-format text parameter carrying a NUL byte is refused with
+    22021 `invalid byte sequence for encoding "UTF8": 0x00` (a text-format
+    one never reaches the server: psycopg refuses it client-side). Probed
+    PG 16."""
+    with _Server(home) as server, server.connect() as conn:
+        with pytest.raises(psycopg.errors.CharacterNotInRepertoire) as ei:
+            conn.execute("select %b::text", ("a\x00b",))
+        assert str(ei.value).startswith('invalid byte sequence for encoding "UTF8": 0x00')
+
+
+def test_any_typed_functions_refuse_an_untyped_parameter(home: Path) -> None:
+    """A function whose arguments are `any` / VARIADIC `any` cannot resolve
+    a bare parameter: 42P18 `could not determine data type of parameter
+    $n`, naming the FIRST unresolvable one -- `format`'s and `concat_ws`'s
+    leading `text` argument resolves, so they fault `$2`. Probed PG 16."""
+    with _Server(home) as server, server.connect() as conn:
+        for call, faulted in [
+            ("concat(%s, %s)", 1),
+            ("concat_ws(%s, %s)", 2),
+            ("format(%s, %s)", 2),
+            ("num_nulls(%s, %s)", 1),
+            ("num_nonnulls(%s, %s)", 1),
+            ("json_build_array(%s, %s)", 1),
+            ("jsonb_build_object(%s, %s)", 1),
+        ]:
+            with pytest.raises(psycopg.errors.IndeterminateDatatype) as ei:
+                conn.execute(f"select {call}", ("a", "b"))
+            assert str(ei.value).startswith(
+                f"could not determine data type of parameter ${faulted}"
+            ), call
+        assert conn.execute("select concat_ws(%s, 'a', 'b')", ("x",)).fetchone() == ("axb",)
+
+
+def test_copy_out_encoding_error_keeps_the_connection(home: Path) -> None:
+    """A COPY TO STDOUT that fails mid-stream (a character the client
+    encoding cannot represent) surfaces its 22P05 and leaves the connection
+    usable and idle -- the server used to follow the error with a CopyFail,
+    after which the client saw "you cannot mix COPY with other operations"
+    on the next statement. Probed PG 16."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table enc (s text)")
+        conn.execute("insert into enc values ('€')")
+        conn.execute("set client_encoding to latin1")
+        with (
+            pytest.raises(psycopg.errors.UntranslatableCharacter) as ei,
+            conn.cursor().copy("copy enc to stdout") as cp,
+        ):
+            list(cp)
+        assert str(ei.value).startswith(
+            'character with byte sequence 0xe2 0x82 0xac in encoding "UTF8" '
+            'has no equivalent in encoding "LATIN1"'
+        )
+        assert conn.execute("select 1").fetchone() == (1,)
+        assert conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
+
+
+def test_update_set_with_a_row_expression(home: Path) -> None:
+    """`UPDATE ... SET col = <expression over the row>` -- `num * 2`,
+    `upper(s)`, `s || 'x'`, `coalesce(num, 0)`, `num::text`, a bound
+    parameter in the expression -- evaluates per matched row from the row's
+    pre-update values, and an unknown column is 42703. Probed PG 16."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("create table ut (id serial primary key, num int, s text)")
+        cur.execute("insert into ut (num, s) values (3, 'a'), (4, 'b'), (null, 'c')")
+        rows = "select id, num, s from ut order by id"
+        cur.execute("update ut set num = num * 2")
+        assert cur.statusmessage == "UPDATE 3"
+        assert cur.execute(rows).fetchall() == [(1, 6, "a"), (2, 8, "b"), (3, None, "c")]
+        cur.execute("update ut set s = upper(s), num = num + 1 where num > 6")
+        assert cur.statusmessage == "UPDATE 1"
+        assert cur.execute(rows).fetchall() == [(1, 6, "a"), (2, 9, "B"), (3, None, "c")]
+        cur.execute("update ut set num = num + %s where id = %s", (10, 1))
+        assert cur.statusmessage == "UPDATE 1"
+        assert cur.execute(rows).fetchall() == [(1, 16, "a"), (2, 9, "B"), (3, None, "c")]
+        cur.execute("update ut set s = s || 'x', num = coalesce(num, 0)")
+        assert cur.statusmessage == "UPDATE 3"
+        assert cur.execute(rows).fetchall() == [(1, 16, "ax"), (2, 9, "Bx"), (3, 0, "cx")]
+        cur.execute("update ut set s = num::text")
+        assert cur.execute("select id, s from ut order by id").fetchall() == [
+            (1, "16"),
+            (2, "9"),
+            (3, "0"),
+        ]
+        with pytest.raises(psycopg.errors.UndefinedColumn) as ei:
+            cur.execute("update ut set num = nosuch * 2")
+        assert str(ei.value).startswith('column "nosuch" does not exist')
+
+
+def test_savepoint_rollback_of_ddl_on_a_fresh_store(home: Path) -> None:
+    """On a store with no committed tables yet, ROLLBACK TO a savepoint
+    still undoes a CREATE TYPE issued after it (the restore used to read the
+    catalog through a session blind to the transaction's own writes, and
+    left the type behind: `type ... already exists` on the retry); a table
+    created before the savepoint survives while the rows written after it
+    are undone. Probed PG 16."""
+    with _Server(home) as server, server.connect(autocommit=False) as conn:
+        cur = conn.cursor()
+        cur.execute("savepoint s1")
+        cur.execute("create type prepenum as enum ('foo', 'bar')")
+        cur.execute("rollback to savepoint s1")
+        cur.execute("create type prepenum as enum ('foo', 'bar')")
+        cur.execute("select 'prepenum'::regtype::text")
+        assert cur.fetchone() == ("prepenum",)
+        conn.rollback()
+        cur.execute("create table sp_t (id serial primary key, n int)")
+        cur.execute("savepoint s2")
+        cur.execute("insert into sp_t (n) values (1)")
+        cur.execute("rollback to savepoint s2")
+        cur.execute("select count(*) from sp_t")
+        assert cur.fetchone() == (0,)
+        conn.commit()
+        cur.execute("select count(*) from sp_t")
+        assert cur.fetchone() == (0,)
+        conn.commit()

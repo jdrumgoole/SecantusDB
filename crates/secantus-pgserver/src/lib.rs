@@ -108,6 +108,14 @@ pub struct PgHandler {
     copy_in: Mutex<Option<CopyInState>>,
     /// Open cursors, by name. Per connection, as PostgreSQL's are.
     cursors: Mutex<HashMap<String, CursorState>>,
+    /// The NAMED prepared statements of this connection, in the order they
+    /// were prepared -- what `pg_prepared_statements` lists. Filled by
+    /// `Parse` with a non-empty name, emptied by protocol `Close`,
+    /// `DEALLOCATE <name>` and `DEALLOCATE ALL`. Per connection, as
+    /// PostgreSQL's are: another session sees none of them. The wire layer's
+    /// own statement store is not consulted because it also holds the
+    /// unnamed statement, which PostgreSQL never lists.
+    prepared: Mutex<Vec<PreparedRecord>>,
     /// Tables created (`Some`) or dropped (`None`) in the open transaction and
     /// not yet committed. Cleared when the transaction ends, whichever way.
     uncommitted: Mutex<HashMap<String, Option<TableDef>>>,
@@ -244,6 +252,20 @@ struct CursorState {
     tz: secantus_pgplan::TimeZoneSetting,
 }
 
+/// One row of `pg_prepared_statements`.
+struct PreparedRecord {
+    name: String,
+    /// The query text exactly as it was parsed.
+    statement: String,
+    prepare_time: bson::DateTime,
+    /// Display names (`smallint`, `character varying`), as a `regtype[]`
+    /// renders them.
+    parameter_types: Vec<String>,
+    /// The result columns' display names, or `None` for a statement that
+    /// returns no rows -- PostgreSQL reports NULL there, not an empty array.
+    result_types: Option<Vec<String>>,
+}
+
 struct CopyInState {
     format: secantus_pgplan::CopyFormat,
     table: String,
@@ -264,6 +286,7 @@ impl PgHandler {
             pending_params: Mutex::new(Vec::new()),
             copy_in: Mutex::new(None),
             cursors: Mutex::new(HashMap::new()),
+            prepared: Mutex::new(Vec::new()),
             uncommitted: Mutex::new(HashMap::new()),
             uncommitted_types: Mutex::new(HashMap::new()),
             in_transaction: std::sync::atomic::AtomicBool::new(false),
@@ -660,20 +683,76 @@ impl PgHandler {
     /// statement, in order: the builtin name for a mapped `Type`, else the
     /// user-type name recovered from the raw Parse oid (see
     /// `user_type_name_for_oid`), else `None` (the client left it to us).
+    ///
+    /// Sized by the SQL's own `$n` references when the client listed fewer
+    /// oids than that (none at all is the usual case -- libpq's `PQprepare`
+    /// with `nParams = 0`): the slots past the list are `None`, the same as an
+    /// oid of 0. Sized from the oid list alone, `select $1::uuid` prepared
+    /// with no oids described as "there is no parameter $1".
     fn param_type_names(&self, stmt: &StoredStatement<ParsedStatement>) -> Vec<Option<String>> {
-        stmt.parameter_types
-            .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                t.as_ref().and_then(internal_type_name).or_else(|| {
-                    stmt.parameter_oids
-                        .get(i)
-                        .copied()
-                        .filter(|o| *o != 0)
-                        .and_then(|oid| self.user_type_name_for_oid(oid))
-                })
+        let n = stmt
+            .parameter_types
+            .len()
+            .max(secantus_pgplan::max_param_number(&stmt.statement.sql));
+        (0..n)
+            .map(|i| {
+                stmt.parameter_types
+                    .get(i)
+                    .and_then(|t| t.as_ref())
+                    .and_then(internal_type_name)
+                    .or_else(|| {
+                        stmt.parameter_oids
+                            .get(i)
+                            .copied()
+                            .filter(|o| *o != 0)
+                            .and_then(|oid| self.user_type_name_for_oid(oid))
+                    })
             })
             .collect()
+    }
+
+    /// The `pg_prepared_statements` row for a freshly parsed NAMED statement.
+    ///
+    /// Parameter types are the client's declarations completed from the SQL
+    /// (`catalog_param_types`), in display spelling; result types come from
+    /// the same describe pass a `Describe` would run, and a statement that
+    /// cannot be described (a bad query, a table that does not exist yet)
+    /// records no result types rather than failing the Parse -- PostgreSQL
+    /// reports the parse error at Parse time, and this server reports it at
+    /// Describe, which is where psycopg sees it either way.
+    fn prepared_record(&self, stmt: &StoredStatement<ParsedStatement>) -> PreparedRecord {
+        let sql = stmt.statement.sql.clone();
+        let declared = self.param_type_names(stmt);
+        let column_type = |table: &str, column: &str| {
+            self.lookup(table)
+                .and_then(|def| def.column(column).map(|c| c.pg_type.clone()))
+        };
+        let parameter_types = secantus_pgplan::catalog_param_types(&sql, &declared, &column_type)
+            .into_iter()
+            .map(|t| secantus_pgplan::display_type(&t))
+            .collect();
+        let result_types = self
+            .describe_fields(&sql, declared.len(), &declared)
+            .ok()
+            .flatten()
+            .map(|fields| {
+                fields
+                    .iter()
+                    .map(|f| {
+                        let ty = f.datatype();
+                        internal_type_name(ty)
+                            .map(|n| secantus_pgplan::display_type(&n))
+                            .unwrap_or_else(|| ty.name().to_string())
+                    })
+                    .collect()
+            });
+        PreparedRecord {
+            name: stmt.id.clone(),
+            statement: sql,
+            prepare_time: bson::DateTime::now(),
+            parameter_types,
+            result_types,
+        }
     }
 
     /// The wire `Type` a RAW parameter oid names, when it is a user type. Used
@@ -1610,13 +1689,23 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("enumlabel", "name", false),
                 ],
             )),
+            // PostgreSQL 16's column set and types, measured: `parameter_types`
+            // and `result_types` are `regtype[]` (oid 2211) of DISPLAY names,
+            // `from_sql` is false for a protocol-prepared statement, and the
+            // plan counters are `int8` -- a statement with parameters has had
+            // one custom plan and no generic one, a statement without has the
+            // reverse.
             "pg_prepared_statements" => Some(TableDef::new(
                 "pg_prepared_statements",
                 vec![
                     secantus_pgcatalog::Column::new("name", "text", false),
                     secantus_pgcatalog::Column::new("statement", "text", false),
                     secantus_pgcatalog::Column::new("prepare_time", "timestamptz", false),
-                    secantus_pgcatalog::Column::new("parameter_types", "text", false),
+                    secantus_pgcatalog::Column::new("parameter_types", "regtype[]", false),
+                    secantus_pgcatalog::Column::new("result_types", "regtype[]", true),
+                    secantus_pgcatalog::Column::new("from_sql", "bool", false),
+                    secantus_pgcatalog::Column::new("generic_plans", "int8", false),
+                    secantus_pgcatalog::Column::new("custom_plans", "int8", false),
                 ],
             )),
             // The open cursors of THIS connection, in PostgreSQL's column order.
@@ -1836,6 +1925,53 @@ impl PgHandler {
                     }
                 }
                 rows
+            }
+            // One row per NAMED prepared statement on this connection, in
+            // the order they were prepared -- psycopg's suite sorts by
+            // `prepare_time`, and two statements prepared within the same
+            // millisecond must keep their order under that (stable) sort.
+            "pg_prepared_statements" => {
+                let prepared = self.prepared.lock().unwrap_or_else(|e| e.into_inner());
+                prepared
+                    .iter()
+                    .map(|rec| {
+                        let names = |v: &[String]| {
+                            Bson::Array(v.iter().map(|t| Bson::String(t.clone())).collect())
+                        };
+                        let mut d = Document::new();
+                        d.insert(def.field_of("name").expect("column"), rec.name.as_str());
+                        d.insert(
+                            def.field_of("statement").expect("column"),
+                            rec.statement.as_str(),
+                        );
+                        d.insert(
+                            def.field_of("prepare_time").expect("column"),
+                            Bson::DateTime(rec.prepare_time),
+                        );
+                        d.insert(
+                            def.field_of("parameter_types").expect("column"),
+                            names(&rec.parameter_types),
+                        );
+                        d.insert(
+                            def.field_of("result_types").expect("column"),
+                            rec.result_types.as_deref().map_or(Bson::Null, names),
+                        );
+                        d.insert(
+                            def.field_of("from_sql").expect("column"),
+                            Bson::Boolean(false),
+                        );
+                        let has_params = !rec.parameter_types.is_empty();
+                        d.insert(
+                            def.field_of("generic_plans").expect("column"),
+                            Bson::Int64(i64::from(!has_params)),
+                        );
+                        d.insert(
+                            def.field_of("custom_plans").expect("column"),
+                            Bson::Int64(i64::from(has_params)),
+                        );
+                        d
+                    })
+                    .collect()
             }
             // One row per open cursor on this connection.
             "pg_cursors" => {
@@ -2238,6 +2374,9 @@ fn wire_type(pg_type: &str) -> Type {
         // varchar, so psycopg's `CompositeInfo.fetch` read `field_types` back as
         // the raw string `"{23,25}"` instead of a list of oids.
         "oid[]" => Type::OID_ARRAY,
+        // `pg_prepared_statements.parameter_types`: a client reads 2211 back as
+        // a list of type names.
+        "regtype[]" => Type::REGTYPE_ARRAY,
         // Everything else renders as text for now; P4 owns the real type map.
         _ => Type::VARCHAR,
     }
@@ -4862,7 +5001,29 @@ impl PgHandler {
                 Ok(vec![Response::Execution(Tag::new("CLOSE CURSOR"))])
             }
 
-            Statement::DeallocateAll => Ok(vec![Response::Execution(Tag::new("DEALLOCATE ALL"))]),
+            // The wire layer's own statement store keeps its entry: psycopg
+            // never reuses a deallocated name (its counter only climbs), and
+            // the store is the connection's, dropped with it.
+            Statement::DeallocateAll => {
+                self.prepared
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                Ok(vec![Response::Execution(Tag::new("DEALLOCATE ALL"))])
+            }
+            Statement::Deallocate(name) => {
+                let mut prepared = self.prepared.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(idx) = prepared.iter().position(|r| r.name == name) else {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "26000".into(), // invalid_sql_statement_name
+                        format!("prepared statement \"{name}\" does not exist"),
+                    ))));
+                };
+                prepared.remove(idx);
+                Ok(vec![Response::Execution(Tag::new("DEALLOCATE"))])
+            }
+            Statement::Notify => Ok(vec![Response::Execution(Tag::new("NOTIFY"))]),
 
             Statement::Set { name, value } => {
                 let key = canonical_setting(&name);
@@ -5106,37 +5267,38 @@ impl PgHandler {
             }
 
             Statement::Update(upd) => {
-                let outcome = self
-                    .storage
-                    .update_matching(
-                        &self.db,
-                        &upd.table,
-                        &upd.filter,
-                        &{
-                            let mut ops = bson::doc! { "$set": upd.set };
-                            if !upd.unset.is_empty() {
-                                let mut u = Document::new();
-                                for f in &upd.unset {
-                                    u.insert(f.clone(), "");
-                                }
-                                ops.insert("$unset", u);
-                            }
-                            ops
-                        },
-                        true,  // multi: SQL UPDATE has no single-row default
-                        false, // upsert: never; PostgreSQL UPDATE does not insert
-                        &[],
-                        &Document::new(),
-                        None,
-                        None,
-                        false,
-                    )
-                    .map_err(|e| Self::storage_err("could not update", e))?;
+                let matched = if upd.set_exprs.is_empty() {
+                    self.update_rows(&upd.table, &upd.filter, &upd.set, &upd.unset)?
+                } else {
+                    // A SET list that reads the row (`num = num * 2`) is
+                    // evaluated over each matched row and written by `_id`.
+                    // Every row is evaluated BEFORE the first write, so an
+                    // expression that fails on one row leaves none updated.
+                    let raw = self
+                        .storage
+                        .find_matching(&self.db, &upd.table, &upd.filter)
+                        .map_err(|e| Self::storage_err("could not read", e))?;
+                    let mut writes = Vec::with_capacity(raw.len());
+                    for bytes in &raw {
+                        let row: Document = bson::from_slice(bytes)
+                            .map_err(|e| Self::storage_err("could not decode a row", e))?;
+                        let (set, unset) = secantus_pgplan::update_row_sets(&upd, &row)
+                            .map_err(|e| Self::err(&e))?;
+                        let id = row.get("_id").cloned().unwrap_or(Bson::Null);
+                        writes.push((id, set, unset));
+                    }
+                    let mut matched = 0usize;
+                    for (id, set, unset) in writes {
+                        matched +=
+                            self.update_rows(&upd.table, &bson::doc! {"_id": id}, &set, &unset)?;
+                    }
+                    matched
+                };
                 // PostgreSQL's UPDATE tag counts rows MATCHED, not rows whose
                 // value actually changed: `UPDATE t SET n = n` reports every
                 // row. `modified` would under-report a no-op assignment.
                 Ok(vec![Response::Execution(
-                    Tag::new("UPDATE").with_rows(outcome.matched),
+                    Tag::new("UPDATE").with_rows(matched),
                 )])
             }
 
@@ -5150,6 +5312,44 @@ impl PgHandler {
                 )])
             }
         }
+    }
+}
+
+impl PgHandler {
+    /// Apply one `$set` / `$unset` pair to every row matching `filter`,
+    /// returning the number of rows matched.
+    fn update_rows(
+        &self,
+        table: &str,
+        filter: &Document,
+        set: &Document,
+        unset: &[String],
+    ) -> PgWireResult<usize> {
+        let mut ops = bson::doc! { "$set": set.clone() };
+        if !unset.is_empty() {
+            let mut u = Document::new();
+            for f in unset {
+                u.insert(f.clone(), "");
+            }
+            ops.insert("$unset", u);
+        }
+        let outcome = self
+            .storage
+            .update_matching(
+                &self.db,
+                table,
+                filter,
+                &ops,
+                true,  // multi: SQL UPDATE has no single-row default
+                false, // upsert: never; PostgreSQL UPDATE does not insert
+                &[],
+                &Document::new(),
+                None,
+                None,
+                false,
+            )
+            .map_err(|e| Self::storage_err("could not update", e))?;
+        Ok(outcome.matched)
     }
 }
 
@@ -5281,8 +5481,16 @@ fn copy_reassemble(d: &Document, field: &str, ty: &Type) -> Option<Bson> {
 /// every type, and the gap is recorded in `tasks/backlog.md` rather than
 /// hidden.
 fn binary_encodable(ty: &Type) -> bool {
-    const OK: [Type; 24] = [
+    const OK: [Type; 32] = [
         Type::OID,
+        Type::BYTEA,
+        Type::UUID,
+        Type::INET,
+        Type::CIDR,
+        Type::BYTEA_ARRAY,
+        Type::UUID_ARRAY,
+        Type::INET_ARRAY,
+        Type::CIDR_ARRAY,
         Type::VOID,
         Type::JSON,
         Type::JSONB,
@@ -5576,6 +5784,13 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
         };
         return enc.encode_field(&b.bytes);
     }
+    // A uuid's binary form is its 16 raw bytes (`uuid_send`).
+    if *ty == Type::UUID {
+        let wire = as_text(v)
+            .and_then(|t| secantus_pgplan::uuid_to_wire(&t))
+            .ok_or_else(|| bad("this value"))?;
+        return enc.encode_field(&wire);
+    }
     if *ty == Type::INET || *ty == Type::CIDR {
         let Bson::String(text) = v else {
             return Err(bad("this value"));
@@ -5725,6 +5940,20 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
     if *ty == Type::TEXT_ARRAY {
         let v: Vec<Option<String>> = items.iter().map(&as_text).collect();
         return enc.encode_field(&v);
+    }
+    // bytea[] / uuid[] / inet[] / cidr[]: elements through `element_binary`,
+    // the array framing hand-built (postgres_types has no ToSql for a
+    // `Vec<Option<Vec<u8>>>` typed as any of them).
+    if let Some(elem) = match *ty {
+        Type::BYTEA_ARRAY => Some(Type::BYTEA),
+        Type::UUID_ARRAY => Some(Type::UUID),
+        Type::INET_ARRAY => Some(Type::INET),
+        Type::CIDR_ARRAY => Some(Type::CIDR),
+        _ => None,
+    } {
+        let binary = array_binary(items, &elem).ok_or_else(|| bad("this value"))?;
+        let text = secantus_pgplan::value_text(v);
+        return enc.encode_field(&RawField { binary, text });
     }
     Err(bad("this value"))
 }
@@ -5970,6 +6199,20 @@ fn encode_field_value_inner(
                 .iter()
                 .map(|x| match x {
                     Bson::Null => None,
+                    other => Some(secantus_pgplan::value_text(other)),
+                })
+                .collect();
+            return enc.encode_field(&rendered);
+        }
+        // An `inet[]` / `cidr[]` in text is `inet_out` per element: a host
+        // address drops its full mask (`{::1}`, not `{::1/128}`), same as the
+        // scalar arm above.
+        if matches!(element, "inet" | "cidr") {
+            let rendered: Vec<Option<String>> = items
+                .iter()
+                .map(|x| match x {
+                    Bson::Null => None,
+                    Bson::String(t) => Some(secantus_pgplan::net::text_out(t, element == "cidr")),
                     other => Some(secantus_pgplan::value_text(other)),
                 })
                 .collect();
@@ -6593,6 +6836,14 @@ fn element_binary(v: &Bson, elem: &Type) -> Option<Vec<u8>> {
         23 => Some(i32::try_from(int(v)?).ok()?.to_be_bytes().to_vec()),
         20 => Some(int(v)?.to_be_bytes().to_vec()),
         26 => Some(u32::try_from(int(v)?).ok()?.to_be_bytes().to_vec()),
+        2950 => match v {
+            Bson::String(t) => secantus_pgplan::uuid_to_wire(t),
+            _ => None,
+        },
+        869 | 650 => match v {
+            Bson::String(t) => secantus_pgplan::net::to_wire(t, elem.oid() == 650),
+            _ => None,
+        },
         700 => Some((float(v)? as f32).to_be_bytes().to_vec()),
         701 => Some(float(v)?.to_be_bytes().to_vec()),
         1700 => {
@@ -7186,7 +7437,17 @@ fn decode_parameter(
             Some(25) | Some(1043) | Some(19) | Some(1042) => {
                 // A text-family value's binary wire form is its bytes in the
                 // client encoding (same bytes as text format), so decode it
-                // back to the internal UTF-8 form.
+                // back to the internal UTF-8 form. A NUL byte cannot be in a
+                // text value: PostgreSQL 16 rejects it as `22021` (a text
+                // FORMAT parameter is C-string terminated at the NUL instead
+                // -- that path never sees the byte).
+                if bytes.contains(&0) {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "22021".to_owned(), // character_not_in_repertoire
+                        "invalid byte sequence for encoding \"UTF8\": 0x00".to_owned(),
+                    ))));
+                }
                 Ok(Bson::String(encoding::decode(cenc, bytes)))
             }
             // `bytea` is raw bytes on the wire -- stored verbatim as Binary.
@@ -7394,6 +7655,12 @@ fn decode_parameter(
         Some(17) => secantus_pgplan::bytea::parse_text(&text)
             .map(secantus_pgplan::bytea::to_binary)
             .map_err(|e| PgHandler::err(&e)),
+        // A uuid parameter is stored in its canonical hyphenated form, so a
+        // client sending the 32-digit spelling (psycopg's text dumper) reads
+        // back what PostgreSQL would echo: `8-4-4-4-12`, lowercase.
+        Some(2950) => {
+            secantus_pgplan::cast_text_to(&text, "uuid", tz).map_err(|e| PgHandler::err(&e))
+        }
         Some(869) => secantus_pgplan::net::normalize_inet(&text)
             .map(Bson::String)
             .map_err(|e| PgHandler::err(&e)),
@@ -7502,19 +7769,28 @@ impl PgHandler {
     where
         S: Clone + Send + Sync,
     {
-        let declared: Vec<Option<Type>> = portal
+        // Sized by the plan's list, which covers every `$n` in the SQL even
+        // when the client's oid list is shorter (or empty).
+        let n = portal
             .statement
             .parameter_types
-            .iter()
-            .enumerate()
-            .map(|(i, t)| {
+            .len()
+            .max(param_types.len());
+        let declared: Vec<Option<Type>> = (0..n)
+            .map(|i| {
                 // A name the plan resolved for the slot: a builtin, or a USER
                 // type (a custom range's oid maps to `None` in the statement's
                 // types, and its binary form is a range, not text).
-                t.clone().or_else(|| {
-                    let name = param_types.get(i).and_then(|n| n.as_deref())?;
-                    Some(self.user_wire_type(name).unwrap_or_else(|| wire_type(name)))
-                })
+                portal
+                    .statement
+                    .parameter_types
+                    .get(i)
+                    .cloned()
+                    .flatten()
+                    .or_else(|| {
+                        let name = param_types.get(i).and_then(|n| n.as_deref())?;
+                        Some(self.user_wire_type(name).unwrap_or_else(|| wire_type(name)))
+                    })
             })
             .collect();
         let oids = &portal.statement.parameter_oids;
@@ -7745,6 +8021,80 @@ impl ExtendedQueryHandler for PgHandler {
         Ok(encoding::decode(self.client_encoding(), &parse.query_raw))
     }
 
+    /// The default `Parse` handling, plus the `pg_prepared_statements` row a
+    /// NAMED statement gets. The unnamed statement is not listed -- PostgreSQL
+    /// does not list it either.
+    async fn on_parse<C>(&self, client: &mut C, message: Parse) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: pgwire::api::store::PortalStore<Statement = Self::Statement>,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let parser = <Self as ExtendedQueryHandler>::query_parser(self);
+        let mut message = message;
+        message.query = <Self as ExtendedQueryHandler>::decode_query_text(self, client, &message)?;
+        let stmt = StoredStatement::parse(client, &message, parser).await?;
+        // The message's own name, not `stmt.id`: the wire store files the
+        // unnamed statement under its `DEFAULT_NAME` placeholder.
+        if message.name.as_deref().is_some_and(|n| !n.is_empty()) {
+            let record = self.prepared_record(&stmt);
+            let mut prepared = self.prepared.lock().unwrap_or_else(|e| e.into_inner());
+            // Re-preparing a name replaces the earlier statement of that name
+            // (PostgreSQL refuses it with 42P05; the wire store here replaces,
+            // and the catalog follows the store).
+            prepared.retain(|r| r.name != record.name);
+            prepared.push(record);
+        }
+        pgwire::api::store::PortalStore::put_statement(client.portal_store(), Arc::new(stmt));
+        client
+            .send(PgWireBackendMessage::ParseComplete(
+                pgwire::messages::extendedquery::ParseComplete::new(),
+            ))
+            .await?;
+        Ok(())
+    }
+
+    /// The default `Close`, plus dropping a closed STATEMENT's
+    /// `pg_prepared_statements` row -- libpq 17+ closes a prepared statement
+    /// with this message (`PQclosePrepared`) rather than `DEALLOCATE`.
+    async fn on_close<C>(
+        &self,
+        client: &mut C,
+        message: pgwire::messages::extendedquery::Close,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: pgwire::api::store::PortalStore<Statement = Self::Statement>,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        if message.target_type == pgwire::messages::extendedquery::TARGET_TYPE_BYTE_STATEMENT {
+            if let Some(name) = message.name.as_deref().filter(|n| !n.is_empty()) {
+                self.prepared
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .retain(|r| r.name != name);
+            }
+        }
+        let name = message.name.as_deref().unwrap_or("");
+        match message.target_type {
+            pgwire::messages::extendedquery::TARGET_TYPE_BYTE_STATEMENT => {
+                pgwire::api::store::PortalStore::rm_statement(client.portal_store(), name);
+            }
+            pgwire::messages::extendedquery::TARGET_TYPE_BYTE_PORTAL => {
+                pgwire::api::store::PortalStore::rm_portal(client.portal_store(), name);
+            }
+            _ => {}
+        }
+        client
+            .send(PgWireBackendMessage::CloseComplete(
+                pgwire::messages::extendedquery::CloseComplete::new(),
+            ))
+            .await?;
+        Ok(())
+    }
+
     async fn do_describe_statement<C>(
         &self,
         _c: &mut C,
@@ -7758,15 +8108,16 @@ impl ExtendedQueryHandler for PgHandler {
     {
         let declared = &target.parameter_types;
         let param_types = self.param_type_names(target);
-        let fields = self.describe_fields(&target.statement.sql, declared.len(), &param_types)?;
+        let fields =
+            self.describe_fields(&target.statement.sql, param_types.len(), &param_types)?;
         // A parameter with no mapped builtin type reports its user-type oid
         // when the raw Parse oid named one (a composite / enum), else `unknown`
-        // -- which is what PostgreSQL does when it cannot infer.
-        let types: Vec<Type> = declared
-            .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                t.clone().unwrap_or_else(|| {
+        // -- which is what PostgreSQL does when it cannot infer. A parameter
+        // the client did not list at all (`$1` in the SQL, no oids in the
+        // Parse) is `unknown` too.
+        let types: Vec<Type> = (0..param_types.len())
+            .map(|i| {
+                declared.get(i).cloned().flatten().unwrap_or_else(|| {
                     target
                         .parameter_oids
                         .get(i)
@@ -7830,7 +8181,7 @@ impl ExtendedQueryHandler for PgHandler {
         let param_types = self.param_type_names(target.statement.as_ref());
         let fields = self.describe_fields(
             &target.statement.statement.sql,
-            target.statement.parameter_types.len(),
+            param_types.len(),
             &param_types,
         )?;
         Ok(match fields {
