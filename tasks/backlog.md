@@ -6851,69 +6851,52 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `tests/test_todate_string_formats.py` and
   `tests/test_mongod_differential.py -k todate`.
 
-- [ ] **OPEN — aggregation stage RESULTS: 6 shapes (Python) / 7 (Rust) still
-  divergent, measured 2026-09-09.** New surface: `aggregation_stage_specs.py`
-  compares stage ERRORS; `tools/probes/aggregation_stage_results.py` compares
-  the DOCUMENTS a well-formed stage emits. First run found 12 / 14 of 48
-  divergent; the fixes below closed the worst, and these remain.
+- [x] **RESOLVED 2026-09-09 — aggregation stage RESULTS: 0 of 48 on BOTH
+  servers.** `tools/probes/aggregation_stage_results.py` opened at 12 divergent
+  (Python) / 14 (Rust); everything it measures now matches mongod.
 
-  | shape | mongod | ours |
-  | --- | --- | --- |
-  | `$project: {"sub.k": 1}` over `{sub: {}}` | emits `sub: {}` | omits `sub` (both servers) |
-  | `$group: {n: {$count: {}}}` | works | `168` on PYTHON only; Rust supports it |
-  | `$bucket` over a mixed corpus | count 3 in bucket `1` | count 2 (both) |
-  | `$bucketAuto` boundary | `max: 2` | `max: Decimal128("1.5")` (both) |
-  | `$setWindowFields` output order | sorted by `sortBy` | original document order (both) |
-  | `$group: {hi: {$max}}` over `{NaN, inf}` | `inf` | `NaN` (RUST only) |
-  | `$group: {_id: "$v"}` over a MinKey | works | `2` whole-stage error (RUST only) |
+  Six behaviours, and three of them had a comment or a test asserting the wrong
+  one:
 
-  Two notes worth keeping:
+  - **`$setWindowFields` emitted in INPUT order.** mongod emits partition by
+    partition, in first-seen partition order, and within each partition in
+    `sortBy` order. The implementation's docstring claimed input order was
+    correct, and `test_preserves_original_input_order` pinned it. Wrong order is
+    wrong RESULTS under a `$limit`.
+  - **`{$count: {}}` failed in a `$group`** with `168`. The accumulator existed
+    and evaluated correctly; nothing reached it, because the constant FOLDER got
+    there first -- it reads no field, so it looked constant. `$setWindowFields`
+    turned out to be an accumulator position too, not just `$group`.
+  - **A dotted `$project` dropped the surviving parent.** `find`'s projection
+    had the rule right; the STAGE was a second implementation that only checked
+    the leaf. It now delegates, so there is ONE implementation.
+  - **`$bucket` put a `Decimal128` in `default`** -- the placement used the
+    host language's operators (Python raised `TypeError`, silently swallowed;
+    Rust's `py_order` deferred, which on the standalone server is an error).
+    Both now use the BSON order the boundary validation already used.
+  - **`$bucketAuto` split equal values across buckets** -- `1.5` and
+    `Decimal128("1.5")` are the SAME value to mongod -- reported `max` from the
+    un-extended chunk, and gave the remainder to the LATER buckets (8 into 3 is
+    3/3/2, not 2/3/3). The Rust doc comment justified the split as "matching the
+    Python server", which was itself wrong.
+  - **Rust `$max` over `{NaN, Infinity}` answered `NaN`** (`bson_lt` followed
+    Python's `<` rather than mongod's order), and a **`$group` keyed on a
+    MinKey / Timestamp / Binary / Regex / Code failed the whole stage**.
 
-  - **`$setWindowFields` output order IS promised.** Probed both insertion
-    orders on 8.2.11: it emits sorted by `sortBy` regardless. So ours is a real
-    divergence, not an unpromised order -- and wrong order is wrong RESULTS
-    under a `$limit`.
-  - **`$sortByCount` tie order is NOT promised.** Same probe, both insert
-    orders, same output -- it is mongod's hash order, like the upsert seed's
-    field order. The probe compares those as a multiset for that reason.
+  Worth keeping: **the parity suite is what forced the Rust half.** Fixing only
+  the Python side of `$bucket` / `$bucketAuto` turned six
+  `test_rust_aggregate_parity` cases red -- the two engines genuinely disagreed
+  -- so "fix one server and file the other" is not available for a shared
+  operator. Parity does not say which side is right, but it does say they must
+  move together.
 
-  The Rust `$group` key still defers on MinKey / MaxKey / Timestamp / Binary /
-  Regex / Code, and a defer on the standalone server is an ERROR -- the same
-  stale-gate shape as `is_sortable` below, one function further.
-
-- [x] **RESOLVED 2026-09-09 — the decimal trig/hyperbolic family, and the
-  "correctly-rounded vs track-mongod" question is SETTLED by measurement.**
-
-  The standing entry framed this as a policy choice and said twelve operators
-  "refuse a finite non-zero `Decimal128`". Both halves were wrong:
-
-  - **Which server.** The PYTHON server refused nothing. The RUST server refused
-    all ten trig/hyperbolic operators (108 of 285 shapes). The entry conflated
-    them. A first re-probe of mine then conflated "refuses a decimal" with
-    "refuses an OUT-OF-DOMAIN input", because it ran one aggregate over a corpus
-    holding values outside `[-1,1]` -- worth remembering, since a whole-batch
-    aggregate turns one bad row into a fake operator-wide refusal.
-  - **Whether the choice exists.** It does not. Against a 60-digit mpmath
-    reference, **mongod is correctly-rounded only ~78% of the time**; it carries
-    Intel RDFP's last-digit error. Exact agreement is CAPPED and no working
-    precision reaches it. So **being correct is the best approximation to
-    mongod** -- where we round correctly, agreement equals mongod's own accuracy
-    rate.
-
-  That condemned the "compute at 34 digits to reproduce mongod's accumulation"
-  strategy the Python hyperbolics used, adopted on the strength of ONE `$cosh`
-  case: measured over 60 shapes, `$tanh` went 3/20 -> 12/20 and `$sinh` 8/20 ->
-  12/20 when computed wide, while `$cosh` did not drop at all.
-
-  Both servers now answer all fifteen with zero refusals and identical results.
-  Agreement: Python 209 -> 224 of 285, Rust **90 -> 224**.
-
-  Sweep `tools/probes/decimal_transcendental_rounding.py`; gate
-  `tests/test_decimal_trig_family.py`.
-
-  **Bounded gap:** the Rust `sin`/`cos`/`tan` reduce against 2*pi embedded to
-  ~1200 digits, so an argument past ~1e1100 defers. mongod carries pi to the
-  full decimal128 range.
+- [ ] **OPEN — `$project` reports `168` where mongod reports `31325` for an
+  unknown expression (2026-09-09).** `{$project: {n: {$count: {}}}}` is
+  `31325 Invalid $project :: caused by :: Unknown expression $count` on mongod
+  and `168 ... Unrecognized expression '$count'` here; `$addFields` uses 168 in
+  BOTH. So `$project` carries its own code and wording for this family, and it
+  applies to `$topN` / `$bottomN` too. The ACCEPT/REJECT behaviour matches; only
+  the code and message differ.
 
 - [x] **RESOLVED 2026-09-09 — a `Decimal128("NaN")` CRASHED `$expr`, and
   `{$eq: [NaN, NaN]}` was false.** Two bugs, one probe run.

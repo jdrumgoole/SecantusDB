@@ -337,7 +337,20 @@ pub fn bson_lt(a: &Bson, b: &Bson) -> Option<bool> {
                 return Some(x < lt_text(b)?);
             }
             // Rank 3: the unified numeric type (int / long / double /
-            // Decimal128). NaN is unordered → Python `<` is False.
+            // Decimal128). NaN sorts BELOW every other number, which is what
+            // `cmp` already does and what the storage sort encodes.
+            //
+            // This used to fall straight through to the comparisons below,
+            // justified as "NaN is unordered -> Python `<` is False" -- a rule
+            // taken from Python rather than mongod. `numeric::cmp` reports a
+            // NaN pair as INCOMPARABLE, so `bson_lt` answered false in both
+            // directions and `$max` over `{NaN, Infinity}` never moved off the
+            // NaN it saw first (mongod answers `Infinity`; measured 8.2.11,
+            // 2026-09-09).
+            let (a_nan, b_nan) = (crate::query::is_nan_bson(a), crate::query::is_nan_bson(b));
+            if a_nan || b_nan {
+                return Some(a_nan && !b_nan);
+            }
             if let Some(r) = numeric::fast_cmp(a, b) {
                 return Some(r == Some(Ordering::Less));
             }
