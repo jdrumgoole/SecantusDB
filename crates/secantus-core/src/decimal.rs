@@ -1994,6 +1994,495 @@ fn int_divmod_mag(a: &[u8], b: &[u8]) -> (Vec<u8>, Vec<u8>) {
     (strip_leading(&quot).to_vec(), strip_leading(&rem).to_vec())
 }
 
+/// pi/2 to 330 significant digits, enough for the widest working precision
+/// [`with_precision`] reaches (260) with room to spare.
+///
+/// Needed by `atan` (to fold an argument above 1) and by `acos`. The circular
+/// SINE family is a different problem: reducing a decimal128 argument modulo
+/// 2*pi needs pi to thousands of digits, so `sin` / `cos` / `tan` still defer.
+const HALF_PI_TEXT: &str = "1.5707963267948966192313216916397514420985846996875529104874722961539082031431044993140174126710585339910740432566411533235469223047752911158626797040642405587251420513509692605527798223114744774651909822144054878329667230642378241168933915826356009545728242834617301743052271633241066968036301245706368622935033031577940874407";
+
+fn hp_half_pi(prec: usize) -> Dec {
+    let d = parse(HALF_PI_TEXT).expect("HALF_PI_TEXT parses");
+    // Re-normalise to the working precision so it composes with the rest.
+    hp_add(&d, &hp_from_i64(0, 0), prec)
+}
+
+/// `atan(x)`, by argument reduction then the Taylor series.
+///
+/// Two reductions, because the raw series only converges usefully for a small
+/// `|x|`: an argument above 1 folds through `atan(x) = pi/2 - atan(1/x)`, and
+/// what is left is halved with `atan(x) = 2*atan(x / (1 + sqrt(1 + x^2)))`
+/// until it is under 1/64, which bounds the term count.
+fn hp_atan(x: &Dec, prec: usize) -> Option<Dec> {
+    let one = hp_from_i64(1, 0);
+    let neg = matches!(x, Dec::Fin { sign, .. } if *sign < 0);
+    let ax = if neg { hp_neg(x) } else { x.clone() };
+    if hp_is_zero(&ax) {
+        return Some(hp_from_i64(0, 0));
+    }
+    let big = cmp_abs(&ax, &one)? == std::cmp::Ordering::Greater;
+    let mut t = if big {
+        hp_div(&one, &ax, prec)
+    } else {
+        ax.clone()
+    };
+    // Halve until |t| < 2^-6, so the alternating series needs few terms.
+    let mut halvings = 0u32;
+    let limit = hp_div(&one, &hp_from_i64(64, 0), prec);
+    while cmp_abs(&t, &limit)? == std::cmp::Ordering::Greater && halvings < 64 {
+        let r = hp_sqrt(&hp_add(&one, &hp_mul(&t, &t, prec), prec), prec);
+        t = hp_div(&t, &hp_add(&one, &r, prec), prec);
+        halvings += 1;
+    }
+    // atan(t) = t - t^3/3 + t^5/5 - ...
+    let t2 = hp_mul(&t, &t, prec);
+    let mut term = t.clone();
+    let mut acc = t.clone();
+    let mut k: i64 = 1;
+    loop {
+        term = hp_mul(&term, &t2, prec);
+        k += 2;
+        let piece = hp_div(&term, &hp_from_i64(k, 0), prec);
+        if hp_is_zero(&piece) {
+            break;
+        }
+        // Stop once the term sits entirely below the working precision.
+        if let (Some(a), Some(b)) = (hp_adjusted(&acc), hp_adjusted(&piece)) {
+            if a - b > prec as i32 + 4 {
+                break;
+            }
+        }
+        acc = if k % 4 == 3 {
+            hp_sub(&acc, &piece, prec)
+        } else {
+            hp_add(&acc, &piece, prec)
+        };
+        if k > 4 * prec as i64 + 64 {
+            return None;
+        }
+    }
+    for _ in 0..halvings {
+        acc = hp_mul(&acc, &hp_from_i64(2, 0), prec);
+    }
+    if big {
+        acc = hp_sub(&hp_half_pi(prec), &acc, prec);
+    }
+    Some(if neg { hp_neg(&acc) } else { acc })
+}
+
+/// `atan(x)` at decimal128 precision. Accepts every finite value and both
+/// infinities (which answer +/- pi/2).
+pub fn atan(a: &Dec) -> Option<Dec> {
+    match a {
+        Dec::Nan => Some(Dec::Nan),
+        Dec::Inf(s) => {
+            let h = with_precision(|p| Some(hp_half_pi(p)))?;
+            Some(if *s < 0 { neg(&h) } else { h })
+        }
+        Dec::Fin { sign, .. } => {
+            if a.is_zero() {
+                return Some(Dec::Fin {
+                    sign: *sign,
+                    coeff: vec![0],
+                    exp: 0,
+                });
+            }
+            with_precision(|p| hp_atan(a, p))
+        }
+    }
+}
+
+/// `asin(x) = atan(x / sqrt(1 - x^2))`. Domain `[-1, 1]`; `None` outside it.
+pub fn asin(a: &Dec) -> Option<Dec> {
+    match a {
+        Dec::Nan => Some(Dec::Nan),
+        Dec::Inf(_) => None,
+        Dec::Fin { sign, .. } => {
+            if a.is_zero() {
+                return Some(Dec::Fin {
+                    sign: *sign,
+                    coeff: vec![0],
+                    exp: -40,
+                });
+            }
+            let one = hp_from_i64(1, 0);
+            match cmp_abs(a, &one)? {
+                std::cmp::Ordering::Greater => None,
+                // asin(+/-1) is exactly +/- pi/2.
+                std::cmp::Ordering::Equal => {
+                    let h = with_precision(|p| Some(hp_half_pi(p)))?;
+                    Some(if *sign < 0 { neg(&h) } else { h })
+                }
+                std::cmp::Ordering::Less => with_precision(|p| {
+                    let r = hp_sqrt(&hp_sub(&one, &hp_mul(a, a, p), p), p);
+                    hp_atan(&hp_div(a, &r, p), p)
+                }),
+            }
+        }
+    }
+}
+
+/// `acos(x) = pi/2 - asin(x)`. Domain `[-1, 1]`; `None` outside it.
+pub fn acos(a: &Dec) -> Option<Dec> {
+    match a {
+        Dec::Nan => Some(Dec::Nan),
+        Dec::Inf(_) => None,
+        Dec::Fin { .. } => {
+            let one = hp_from_i64(1, 0);
+            if cmp_abs(a, &one)? == std::cmp::Ordering::Greater {
+                return None;
+            }
+            with_precision(|p| {
+                let s = if a.is_zero() {
+                    hp_from_i64(0, 0)
+                } else {
+                    match cmp_abs(a, &one)? {
+                        std::cmp::Ordering::Equal => {
+                            let h = hp_half_pi(p);
+                            if matches!(a, Dec::Fin { sign, .. } if *sign < 0) {
+                                hp_neg(&h)
+                            } else {
+                                h
+                            }
+                        }
+                        _ => {
+                            let r = hp_sqrt(&hp_sub(&one, &hp_mul(a, a, p), p), p);
+                            hp_atan(&hp_div(a, &r, p), p)?
+                        }
+                    }
+                };
+                Some(hp_sub(&hp_half_pi(p), &s, p))
+            })
+        }
+    }
+}
+
+/// 2*pi to ~1200 significant digits, for reducing a circular argument.
+///
+/// Reduction needs pi to roughly (the argument's decimal exponent + the working
+/// precision) digits, because `x - k*2pi` cancels away everything above the
+/// remainder. 1200 covers `|x|` up to about 1e1100 at the widest precision
+/// [`with_precision`] uses; past that `hp_reduce_2pi` gives up rather than
+/// return a value it cannot justify, and the operator defers. mongod answers
+/// those (it carries pi to the full decimal128 range) so this is a known,
+/// bounded gap rather than a wrong answer.
+const TWO_PI_TEXT: &str = "6.283185307179586476925286766559005768394338798750211641949889184615632812572417997256069650684234135964296173026564613294187689219101164463450718816256962234900568205403877042211119289245897909860763928857621951331866892256951296467573566330542403818291297133846920697220908653296426787214520498282547449174013212631176349763041841925658508183430728735785180720022661061097640933042768293903883023218866114540731519183906184372234763865223586210237096148924759925499134703771505449782455876366023898259667346724881313286172042789892790449474381404359721887405541078434352586353504769349636935338810264001136254290527121655571542685515579218347274357442936881802449906860293099170742101584559378517847084039912224258043921728068836319627259549542619921037414422699999996745956099902119463465632192637190048918910693816605285044616506689370070523862376342020006275677505773175066416762841234355338294607196506980857510937462319125727764707575187503915563715561064342453613226003855753222391818432840397876190514402130971726557731872306763655936460603904070603705937991547245198827782499443550566958263031149714484908301391901659066233723455711778150196763509274929878638510120801855403342278019697648025716723207";
+
+/// `x` reduced into `[-pi, pi]`, or `None` when the embedded 2*pi is too short
+/// to do it without losing the remainder.
+fn hp_reduce_2pi(x: &Dec, prec: usize) -> Option<Dec> {
+    let adj = hp_adjusted(x).unwrap_or(0);
+    if adj < 0 {
+        // Already small; no reduction needed for |x| < 1.
+        return Some(x.clone());
+    }
+    // Digits consumed by the quotient, plus the precision we must keep.
+    if adj as usize + prec + 20 > 1180 {
+        return None;
+    }
+    let wide = adj as usize + prec + 20;
+    let two_pi = parse(TWO_PI_TEXT)?;
+    let q = hp_div(x, &two_pi, wide);
+    let k = hp_trunc_toward_zero(&q, wide);
+    let mut r = hp_sub(x, &hp_mul(&k, &two_pi, wide), wide);
+    // Fold into [-pi, pi] so the series argument is at most pi/2 after the
+    // quadrant step below.
+    let pi = hp_div(&two_pi, &hp_from_i64(2, 0), wide);
+    if cmp_abs(&r, &pi)? == std::cmp::Ordering::Greater {
+        let signed = if matches!(r, Dec::Fin { sign, .. } if sign < 0) {
+            hp_add(&r, &two_pi, wide)
+        } else {
+            hp_sub(&r, &two_pi, wide)
+        };
+        r = signed;
+    }
+    Some(r)
+}
+
+/// Truncate toward zero to an integral `Dec`, at `prec` digits.
+fn hp_trunc_toward_zero(d: &Dec, prec: usize) -> Dec {
+    match d {
+        Dec::Fin { sign, coeff, exp } if *exp < 0 => {
+            let drop = (-*exp) as usize;
+            if drop >= coeff.len() {
+                return hp_from_i64(0, 0);
+            }
+            let kept = coeff[..coeff.len() - drop].to_vec();
+            hp_norm(*sign, kept, 0, prec)
+        }
+        other => other.clone(),
+    }
+}
+
+/// `sin(t)` for a REDUCED `t` in `[-pi, pi]`, by Taylor series.
+fn hp_sin_series(t: &Dec, prec: usize) -> Dec {
+    let t2 = hp_mul(t, t, prec);
+    let mut term = t.clone();
+    let mut acc = t.clone();
+    let mut n: i64 = 1;
+    loop {
+        // term *= -t^2 / ((2n)(2n+1))
+        term = hp_mul(&term, &t2, prec);
+        let d = hp_from_i64((2 * n) * (2 * n + 1), 0);
+        term = hp_div(&term, &d, prec);
+        if hp_is_zero(&term) {
+            break;
+        }
+        if let (Some(a), Some(b)) = (hp_adjusted(&acc), hp_adjusted(&term)) {
+            if a - b > prec as i32 + 4 {
+                break;
+            }
+        }
+        acc = if n % 2 == 1 {
+            hp_sub(&acc, &term, prec)
+        } else {
+            hp_add(&acc, &term, prec)
+        };
+        n += 1;
+        if n > 4 * prec as i64 + 64 {
+            break;
+        }
+    }
+    acc
+}
+
+/// `cos(t)` for a REDUCED `t`, by Taylor series.
+fn hp_cos_series(t: &Dec, prec: usize) -> Dec {
+    let t2 = hp_mul(t, t, prec);
+    let mut term = hp_from_i64(1, 0);
+    let mut acc = hp_from_i64(1, 0);
+    let mut n: i64 = 1;
+    loop {
+        term = hp_mul(&term, &t2, prec);
+        let d = hp_from_i64((2 * n - 1) * (2 * n), 0);
+        term = hp_div(&term, &d, prec);
+        if hp_is_zero(&term) {
+            break;
+        }
+        if let (Some(a), Some(b)) = (hp_adjusted(&acc), hp_adjusted(&term)) {
+            if a - b > prec as i32 + 4 {
+                break;
+            }
+        }
+        acc = if n % 2 == 1 {
+            hp_sub(&acc, &term, prec)
+        } else {
+            hp_add(&acc, &term, prec)
+        };
+        n += 1;
+        if n > 4 * prec as i64 + 64 {
+            break;
+        }
+    }
+    acc
+}
+
+/// `sin(x)` at decimal128 precision. `None` for an infinity (mongod's 50989)
+/// or an argument too large for the embedded 2*pi.
+pub fn sin(a: &Dec) -> Option<Dec> {
+    match a {
+        Dec::Nan => Some(Dec::Nan),
+        Dec::Inf(_) => None,
+        Dec::Fin { sign, .. } => {
+            if a.is_zero() {
+                return Some(Dec::Fin {
+                    sign: *sign,
+                    coeff: vec![0],
+                    exp: 0,
+                });
+            }
+            with_precision(|p| {
+                let t = hp_reduce_2pi(a, p)?;
+                Some(hp_sin_series(&t, p))
+            })
+        }
+    }
+}
+
+/// `cos(x)` at decimal128 precision.
+pub fn cos(a: &Dec) -> Option<Dec> {
+    match a {
+        Dec::Nan => Some(Dec::Nan),
+        Dec::Inf(_) => None,
+        Dec::Fin { .. } => {
+            if a.is_zero() {
+                return parse("1.000000000000000000000000000000000");
+            }
+            with_precision(|p| {
+                let t = hp_reduce_2pi(a, p)?;
+                Some(hp_cos_series(&t, p))
+            })
+        }
+    }
+}
+
+/// `tan(x) = sin(x) / cos(x)` at decimal128 precision.
+pub fn tan(a: &Dec) -> Option<Dec> {
+    match a {
+        Dec::Nan => Some(Dec::Nan),
+        Dec::Inf(_) => None,
+        Dec::Fin { sign, .. } => {
+            if a.is_zero() {
+                return Some(Dec::Fin {
+                    sign: *sign,
+                    coeff: vec![0],
+                    exp: -40,
+                });
+            }
+            with_precision(|p| {
+                let t = hp_reduce_2pi(a, p)?;
+                let c = hp_cos_series(&t, p);
+                if hp_is_zero(&c) {
+                    return None;
+                }
+                Some(hp_div(&hp_sin_series(&t, p), &c, p))
+            })
+        }
+    }
+}
+
+/// The hyperbolic family at decimal128 precision, built from the same
+/// `hp_exp` / `hp_ln` / `hp_sqrt` primitives the rest of this module uses and
+/// rounded once via [`with_precision`].
+///
+/// The Rust server used to REFUSE every one of these for a `Decimal128`
+/// operand, so a client got an error where mongod returns a number — the least
+/// faithful outcome available. Measured 8.2.11 (2026-09-09): mongod answers all
+/// of them, at 34 digits, and is itself correctly-rounded about 78% of the
+/// time. Its residual error is Intel RDFP's and cannot be reproduced by
+/// choosing a working precision, so being CORRECT is the closest we get: the
+/// Python engine's agreement with mongod rose from 39/75 to 54/75 across these
+/// operators when it stopped trying to imitate the error and computed wide.
+fn hp_sinh(x: &Dec, prec: usize) -> Option<Dec> {
+    // (e^x - e^-x) / 2
+    let ex = hp_exp(x, prec)?;
+    let enx = hp_exp(&hp_neg(x), prec)?;
+    Some(hp_div(&hp_sub(&ex, &enx, prec), &hp_from_i64(2, 0), prec))
+}
+
+fn hp_cosh(x: &Dec, prec: usize) -> Option<Dec> {
+    let ex = hp_exp(x, prec)?;
+    let enx = hp_exp(&hp_neg(x), prec)?;
+    Some(hp_div(&hp_add(&ex, &enx, prec), &hp_from_i64(2, 0), prec))
+}
+
+fn hp_tanh(x: &Dec, prec: usize) -> Option<Dec> {
+    let ex = hp_exp(x, prec)?;
+    let enx = hp_exp(&hp_neg(x), prec)?;
+    Some(hp_div(
+        &hp_sub(&ex, &enx, prec),
+        &hp_add(&ex, &enx, prec),
+        prec,
+    ))
+}
+
+/// `sinh(x)`. Odd, and `|x|` past ~14000 overflows the format to +/-Infinity,
+/// which is what mongod answers.
+pub fn sinh(a: &Dec) -> Option<Dec> {
+    match a {
+        Dec::Nan => Some(Dec::Nan),
+        Dec::Inf(s) => Some(Dec::Inf(*s)),
+        Dec::Fin { sign, .. } => {
+            if a.is_zero() {
+                // The zero constants are mongod's own quanta, not something the
+                // series produces — the same table the Python engine carries.
+                return Some(Dec::Fin {
+                    sign: *sign,
+                    coeff: vec![0],
+                    exp: -40,
+                });
+            }
+            with_precision(|p| hp_sinh(a, p))
+        }
+    }
+}
+
+/// `cosh(x)`. Even, so the sign is dropped; `cosh(0)` is exactly 1 at 34 digits.
+pub fn cosh(a: &Dec) -> Option<Dec> {
+    match a {
+        Dec::Nan => Some(Dec::Nan),
+        Dec::Inf(_) => Some(Dec::Inf(1)),
+        Dec::Fin { .. } => {
+            if a.is_zero() {
+                return parse("1.000000000000000000000000000000000");
+            }
+            with_precision(|p| hp_cosh(a, p))
+        }
+    }
+}
+
+/// `tanh(x)`, saturating to +/-1 at an infinity.
+pub fn tanh(a: &Dec) -> Option<Dec> {
+    match a {
+        Dec::Nan => Some(Dec::Nan),
+        Dec::Inf(s) => Some(hp_from_i64(*s as i64, 0)),
+        Dec::Fin { sign, .. } => {
+            if a.is_zero() {
+                return Some(Dec::Fin {
+                    sign: *sign,
+                    coeff: vec![0],
+                    exp: 0,
+                });
+            }
+            with_precision(|p| hp_tanh(a, p))
+        }
+    }
+}
+
+/// `acosh(x) = ln(x + sqrt(x^2 - 1))`. Domain `[1, inf)`; `None` outside it, so
+/// the caller raises mongod's `50989`.
+pub fn acosh(a: &Dec) -> Option<Dec> {
+    match a {
+        Dec::Nan => Some(Dec::Nan),
+        Dec::Inf(1) => Some(Dec::Inf(1)),
+        Dec::Inf(_) => None,
+        Dec::Fin { sign, .. } => {
+            if *sign < 0 {
+                return None;
+            }
+            let one = hp_from_i64(1, 0);
+            if cmp_abs(a, &one)? == std::cmp::Ordering::Less {
+                return None;
+            }
+            with_precision(|p| {
+                let sq = hp_sub(&hp_mul(a, a, p), &one, p);
+                hp_ln(&hp_add(a, &hp_sqrt(&sq, p), p), p)
+            })
+        }
+    }
+}
+
+/// `atanh(x) = ln((1 + x) / (1 - x)) / 2`. Domain `(-1, 1)`; `+/-1` is an
+/// infinity and anything beyond is out of domain.
+pub fn atanh(a: &Dec) -> Option<Dec> {
+    match a {
+        Dec::Nan => Some(Dec::Nan),
+        Dec::Inf(_) => None,
+        Dec::Fin { sign, .. } => {
+            if a.is_zero() {
+                return Some(Dec::Fin {
+                    sign: *sign,
+                    coeff: vec![0],
+                    exp: -6176,
+                });
+            }
+            let one = hp_from_i64(1, 0);
+            match cmp_abs(a, &one)? {
+                std::cmp::Ordering::Greater => return None,
+                std::cmp::Ordering::Equal => return Some(Dec::Inf(*sign)),
+                std::cmp::Ordering::Less => {}
+            }
+            with_precision(|p| {
+                let num = hp_add(&one, a, p);
+                let den = hp_sub(&one, a, p);
+                let l = hp_ln(&hp_div(&num, &den, p), p)?;
+                Some(hp_div(&l, &hp_from_i64(2, 0), p))
+            })
+        }
+    }
+}
+
 /// `a / b` at decimal128 precision, with the decimal spec's IDEAL EXPONENT.
 ///
 /// The ideal exponent of a quotient is `e1 - e2`, and an EXACT result is

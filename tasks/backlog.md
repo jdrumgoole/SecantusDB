@@ -6706,6 +6706,40 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
      which the same probe confirmed IS host-dependent, nothing here is blocked
      on a timezone decision.
 
+- [x] **RESOLVED 2026-09-09 — the decimal trig/hyperbolic family, and the
+  "correctly-rounded vs track-mongod" question is SETTLED by measurement.**
+
+  The standing entry framed this as a policy choice and said twelve operators
+  "refuse a finite non-zero `Decimal128`". Both halves were wrong:
+
+  - **Which server.** The PYTHON server refused nothing. The RUST server refused
+    all ten trig/hyperbolic operators (108 of 285 shapes). The entry conflated
+    them. A first re-probe of mine then conflated "refuses a decimal" with
+    "refuses an OUT-OF-DOMAIN input", because it ran one aggregate over a corpus
+    holding values outside `[-1,1]` -- worth remembering, since a whole-batch
+    aggregate turns one bad row into a fake operator-wide refusal.
+  - **Whether the choice exists.** It does not. Against a 60-digit mpmath
+    reference, **mongod is correctly-rounded only ~78% of the time**; it carries
+    Intel RDFP's last-digit error. Exact agreement is CAPPED and no working
+    precision reaches it. So **being correct is the best approximation to
+    mongod** -- where we round correctly, agreement equals mongod's own accuracy
+    rate.
+
+  That condemned the "compute at 34 digits to reproduce mongod's accumulation"
+  strategy the Python hyperbolics used, adopted on the strength of ONE `$cosh`
+  case: measured over 60 shapes, `$tanh` went 3/20 -> 12/20 and `$sinh` 8/20 ->
+  12/20 when computed wide, while `$cosh` did not drop at all.
+
+  Both servers now answer all fifteen with zero refusals and identical results.
+  Agreement: Python 209 -> 224 of 285, Rust **90 -> 224**.
+
+  Sweep `tools/probes/decimal_transcendental_rounding.py`; gate
+  `tests/test_decimal_trig_family.py`.
+
+  **Bounded gap:** the Rust `sin`/`cos`/`tan` reduce against 2*pi embedded to
+  ~1200 digits, so an argument past ~1e1100 defers. mongod carries pi to the
+  full decimal128 range.
+
 - [x] **RESOLVED 2026-09-09 — a `Decimal128("NaN")` CRASHED `$expr`, and
   `{$eq: [NaN, NaN]}` was false.** Two bugs, one probe run.
 

@@ -3681,10 +3681,41 @@ fn op_trig(arg: &Bson, ctx: &Ctx, kind: Trig) -> R {
     // the operator's limit instead of `14147.77595853597662791595672970219`.
     // The other operators here still take the f64 route and still defer on a
     // finite decimal; only this one has a series behind it.
-    if matches!(kind, Asinh) && matches!(value, Bson::Decimal128(_)) {
-        let d = crate::decimal::parse(&value.to_string()).ok_or(Fallback::Defer)?;
-        let r = crate::decimal::asinh(&d).ok_or(Fallback::Defer)?;
-        return crate::decimal::to_bson(&r).ok_or(Fallback::Defer);
+    // The DECIMAL series operators. These must not reach the `f64`
+    // classification below -- it SATURATES, so a finite `Decimal128("1E+6144")`
+    // reads as an infinity and would be answered with the operator's limit
+    // instead of its value.
+    //
+    // Every one of these used to defer, which on the standalone server is an
+    // ERROR: a client got "a construct the Rust server does not support" where
+    // mongod returns a number, the least faithful outcome available. The
+    // `sin` / `cos` / `tan` reduce modulo 2*pi against an embedded constant
+    // that runs out past about 1e1100; beyond that the series returns `None`
+    // and this still defers, which is a bounded gap rather than a wrong answer.
+    if matches!(value, Bson::Decimal128(_)) {
+        let series: Option<fn(&crate::decimal::Dec) -> Option<crate::decimal::Dec>> = match kind {
+            Asinh => Some(crate::decimal::asinh),
+            Sinh => Some(crate::decimal::sinh),
+            Cosh => Some(crate::decimal::cosh),
+            Tanh => Some(crate::decimal::tanh),
+            Acosh => Some(crate::decimal::acosh),
+            Atanh => Some(crate::decimal::atanh),
+            Atan => Some(crate::decimal::atan),
+            Asin => Some(crate::decimal::asin),
+            Acos => Some(crate::decimal::acos),
+            Sin => Some(crate::decimal::sin),
+            Cos => Some(crate::decimal::cos),
+            Tan => Some(crate::decimal::tan),
+        };
+        if let Some(f) = series {
+            let d = crate::decimal::parse(&value.to_string()).ok_or(Fallback::Defer)?;
+            // `None` from the series is an OUT-OF-DOMAIN operand, which mongod
+            // reports as 50989 -- the same error the f64 range test below
+            // produces. Falling through lets that one message serve both.
+            if let Some(r) = f(&d) {
+                return crate::decimal::to_bson(&r).ok_or(Fallback::Defer);
+            }
+        }
     }
     let x = match &value {
         Bson::Null => return Ok(Bson::Null),
