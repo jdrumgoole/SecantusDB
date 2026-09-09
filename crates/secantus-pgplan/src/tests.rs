@@ -1383,6 +1383,26 @@ fn decimals_compare_exactly() {
         super::compare_constants(&d("-1.5"), &d("-1.4")),
         Some(Ordering::Less)
     );
+    // A magnitude Decimal128 renders in exponent form (`-8.34184E-7`) is
+    // still a number: the digit comparison used to see the `E` and give up,
+    // which reached psycopg as "comparing numeric range bounds is not
+    // supported yet" on any `numrange` with a small enough bound.
+    assert_eq!(
+        super::compare_constants(&d("-8.34184E-7"), &d("1")),
+        Some(Ordering::Less)
+    );
+    assert_eq!(
+        super::compare_constants(&d("1.5E+20"), &d("150000000000000000000")),
+        Some(Ordering::Equal)
+    );
+    assert_eq!(
+        super::compare_constants(&d("8.34184E-7"), &d("0.000000834184")),
+        Some(Ordering::Equal)
+    );
+    assert_eq!(
+        super::compare_constants(&d("8.34184E-7"), &d("0.000000834185")),
+        Some(Ordering::Less)
+    );
 }
 
 /// PostgreSQL gives NaN a place in a TOTAL order, which IEEE does not: NaN

@@ -8729,9 +8729,11 @@ pub(crate) fn compare_constants(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering
         _ => {
             // Decimals compare on their DIGITS: an f64 holds 15 significant
             // digits where a numeric holds 34, so a float comparison can call
-            // two different numbers equal.
+            // two different numbers equal. Rendered PLAIN first: Decimal128
+            // writes `-8.34184E-7` for a small magnitude, and the digit
+            // comparison has no notion of an exponent.
             let dec = |v: &Bson| match v {
-                Bson::Decimal128(d) => Some(d.to_string()),
+                Bson::Decimal128(d) => Some(plain_numeric_text(&d.to_string())),
                 Bson::Int32(i) => Some(i.to_string()),
                 Bson::Int64(i) => Some(i.to_string()),
                 _ => None,
