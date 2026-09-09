@@ -22,3 +22,15 @@ refused at CREATE (`42703`, `42830`).
   `SET NULL`; temp tables report a `pg_temp` schema in diagnostics.
 - `secantus-pgcatalog`: `TableDef` carries `temp`, `check_constraints` and
   `foreign_keys` in the Python server's document shape.
+
+#### Fixed
+
+- Rust PostgreSQL server: every extended-protocol statement between two
+  `Sync`s runs in one transaction that the `Sync` commits, as on PostgreSQL —
+  an error in a pipeline now rolls back the earlier statements of its group
+  (libpq's `PIPELINE_ABORTED` batch is all-or-nothing), `BEGIN` inside a
+  group turns it into a block, and `DECLARE` in a group is still `25P01`.
+- Rust PostgreSQL server: a statement prepared without parameter types
+  (libpq `PQprepare` with `nParams = 0`) sizes its parameters from the lexer,
+  so `insert into t values ($1, $2)` no longer fails with `there is no
+  parameter $1` — pg_query's node walk skips a VALUES list.

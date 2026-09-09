@@ -35,8 +35,8 @@ use pgwire::api::{ClientInfo, ClientPortalStore, PgWireServerHandlers, Type, DEF
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
 use pgwire::messages::data::DataRow;
-use pgwire::messages::extendedquery::{Describe, Parse, TARGET_TYPE_BYTE_PORTAL};
-use pgwire::messages::response::CommandComplete;
+use pgwire::messages::extendedquery::{Describe, Parse, Sync as PgSync, TARGET_TYPE_BYTE_PORTAL};
+use pgwire::messages::response::{CommandComplete, ReadyForQuery};
 use pgwire::messages::simplequery::Query;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::types::format::FormatOptions;
@@ -205,6 +205,17 @@ pub struct PgHandler {
     /// error goes out, and the `ReadyForQuery` after it must say IDLE (the
     /// transaction is over), where pgwire's error path would say failed.
     commit_failed: AtomicBool,
+    /// An extended-protocol STATEMENT GROUP is open: the transaction handle
+    /// in `txn` was opened by the first `Execute` since the last `Sync`, not
+    /// by a `BEGIN`. PostgreSQL runs every statement between two `Sync`s in
+    /// one transaction (`TBLOCK_STARTED`) that commits at the `Sync` -- so an
+    /// error rolls back the group's earlier statements too, which is what a
+    /// pipelining client relies on. It is NOT a transaction block:
+    /// `in_transaction` stays false, so `DECLARE` and `SAVEPOINT` still
+    /// answer `25P01`, and a `BEGIN` inside the group turns it into one.
+    implicit_extended: AtomicBool,
+    /// A statement in the open group failed: the group rolls back at `Sync`.
+    group_failed: AtomicBool,
 }
 
 /// A user type created (`Some(doc)`) or dropped (`None`) in the open
@@ -313,6 +324,8 @@ impl PgHandler {
             terminate: Arc::new(AtomicBool::new(false)),
             deferred_fks: Mutex::new(Vec::new()),
             commit_failed: AtomicBool::new(false),
+            implicit_extended: AtomicBool::new(false),
+            group_failed: AtomicBool::new(false),
         }
     }
 
@@ -1365,10 +1378,7 @@ impl PgHandler {
     /// transaction: an autocommit statement's write is committed at once and
     /// a plain read already finds it.
     fn note_uncommitted_type(&self, collection: &'static str, id: &str, doc: Option<Document>) {
-        if !self
-            .in_transaction
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if !self.transaction_handle_open() {
             return;
         }
         self.uncommitted_types
@@ -2595,6 +2605,13 @@ impl SimpleQueryHandler for PgHandler {
         } else {
             self.run_batch(&stmts).await
         };
+        // A simple query inside an extended-protocol statement group runs in
+        // the group's transaction and ends it, as PostgreSQL's does
+        // (`exec_simple_query` finishes the transaction command).
+        let out = match self.close_extended_group(out.is_err()) {
+            Ok(()) => out,
+            Err(e) => out.and(Err(e)),
+        };
         self.flush_notices(_c).await?;
         // Report any GUC change (TimeZone, ...) so the client tracks it.
         self.report_pending_params(_c).await?;
@@ -3092,10 +3109,7 @@ impl PgHandler {
     }
 
     fn note_uncommitted(&self, name: &str, def: Option<TableDef>) {
-        if !self
-            .in_transaction
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if !self.transaction_handle_open() {
             return;
         }
         self.uncommitted
@@ -3264,6 +3278,80 @@ impl PgHandler {
         *self.txn.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
         self.in_transaction
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// A transaction handle is open -- a block, or an extended-protocol
+    /// statement group. Catalog writes inside either are invisible to the
+    /// planner's committed-catalog reads until the handle commits, so the
+    /// `uncommitted` overlays must record them for both.
+    fn transaction_handle_open(&self) -> bool {
+        self.in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed)
+            || self
+                .implicit_extended
+                .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Open the extended-protocol statement group if no transaction handle is
+    /// open: the first `Execute` since the last `Sync` outside a block.
+    fn open_extended_group(&self) -> PgWireResult<()> {
+        let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_some() {
+            return Ok(());
+        }
+        let handle = self
+            .storage
+            .begin_user_transaction()
+            .map_err(|e| Self::storage_err("could not begin a transaction", e))?;
+        *guard = Some(handle);
+        self.group_failed
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.implicit_extended
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// End the extended-protocol statement group, if one is open: commit it
+    /// (deferred constraints checked first, as at any commit) unless a
+    /// statement in it failed, in which case roll the whole group back.
+    /// No-op when the handle belongs to a block -- a `BEGIN` in the group
+    /// made it one, and only `COMMIT` / `ROLLBACK` end that.
+    fn close_extended_group(&self, failed: bool) -> PgWireResult<()> {
+        if !self
+            .implicit_extended
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(());
+        }
+        let failed = failed
+            | self
+                .group_failed
+                .swap(false, std::sync::atomic::Ordering::Relaxed);
+        if !failed {
+            return self.commit_implicit();
+        }
+        // Not `rollback_implicit`: that closes every cursor, holdable ones
+        // included, and a `WITH HOLD` cursor from an earlier, committed
+        // transaction survives a failed statement in PostgreSQL. The group
+        // itself declared none -- `DECLARE` is refused outside a block.
+        self.uncommitted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.uncommitted_types
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.deferred_fks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        if let Some(mut handle) = self.txn.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            self.storage
+                .rollback_user_transaction(&mut handle)
+                .map_err(|e| Self::storage_err("could not roll back a transaction", e))?;
+        }
         Ok(())
     }
 
@@ -3460,7 +3548,12 @@ impl PgHandler {
             binary: is_binary_cursor,
         } = stmt
         {
-            if self.txn.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+            // The BLOCK, not the handle: an extended-protocol statement group
+            // holds a handle too, and PostgreSQL refuses a cursor there.
+            if !self
+                .in_transaction
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".into(),
                     "25P01".into(), // no_active_sql_transaction
@@ -3566,6 +3659,16 @@ impl PgHandler {
             .load(std::sync::atomic::Ordering::Relaxed)
         {
             self.txn_failed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        // An error anywhere in an extended-protocol statement group -- a
+        // `Describe` that cannot resolve the statement as much as an
+        // `Execute` -- rolls the group back at `Sync`.
+        if self
+            .implicit_extended
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.group_failed
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -3945,6 +4048,18 @@ impl PgHandler {
         };
 
         let begin = |guard: &mut Option<UserTransactionHandle>| -> PgWireResult<()> {
+            // A BEGIN inside an extended-protocol statement group makes the
+            // group's transaction the block: same handle, now explicit.
+            if self
+                .implicit_extended
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                self.in_transaction
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.txn_failed
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                return Ok(());
+            }
             if guard.is_none() {
                 let handle = self
                     .storage
@@ -3976,6 +4091,10 @@ impl PgHandler {
             }
             TransactionControl::Commit { chain } => {
                 self.reset_transaction_gucs();
+                // A COMMIT with no BEGIN commits the statement group so far;
+                // what follows before the Sync starts a new one.
+                self.implicit_extended
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 // A COMMIT closes every non-holdable cursor; `WITH HOLD`
                 // survives with its rows already materialised.
                 self.close_cursors_on_txn_end(true);
@@ -4005,6 +4124,8 @@ impl PgHandler {
             }
             TransactionControl::Rollback { chain } => {
                 self.reset_transaction_gucs();
+                self.implicit_extended
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 // A ROLLBACK closes ALL cursors, holdable included.
                 self.close_cursors_on_txn_end(false);
                 self.deferred_fks
@@ -9287,6 +9408,34 @@ impl ExtendedQueryHandler for PgHandler {
     /// columns -- before it ever sends a `FETCH`. This server's cursors are
     /// its own, not pgwire portals, so the describe found nothing and every
     /// server cursor died on its first row with "portal not found".
+    /// `Sync` ends the statement group the `Execute`s since the last one
+    /// opened: commit it, or roll it back if any of them failed. A commit
+    /// that fails (a deferred constraint) is the `Sync`'s error, and the
+    /// `ReadyForQuery` after it says IDLE, as PostgreSQL's does.
+    async fn on_sync<C>(&self, client: &mut C, _message: PgSync) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: pgwire::api::store::PortalStore<Statement = Self::Statement>,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        if let Err(e) = self.close_extended_group(false) {
+            let info: ErrorInfo = e.into();
+            client
+                .send(PgWireBackendMessage::ErrorResponse(info.into()))
+                .await?;
+            client.set_transaction_status(pgwire::messages::response::TransactionStatus::Idle);
+        }
+        pgwire::api::store::PortalStore::rm_portal(client.portal_store(), DEFAULT_NAME);
+        client
+            .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                client.transaction_status(),
+            )))
+            .await?;
+        client.flush().await?;
+        Ok(())
+    }
+
     async fn on_describe<C>(&self, client: &mut C, message: Describe) -> PgWireResult<()>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
@@ -9356,7 +9505,14 @@ impl ExtendedQueryHandler for PgHandler {
             &self.param_type_names(portal.statement.as_ref()),
         );
         self.type_untyped_binary_params(portal, &mut param_types);
-        let params = self.portal_params(portal, &param_types)?;
+        // Every statement between two `Sync`s runs in ONE transaction that
+        // the `Sync` commits -- or rolls back, if any of them failed. A
+        // pipelining client counts on the rollback: after an error, nothing
+        // before it in the pipeline may have landed either.
+        self.open_extended_group()?;
+        let params = self
+            .portal_params(portal, &param_types)
+            .inspect_err(|_| self.note_failure())?;
         let result = self
             .run_typed(
                 &portal.statement.statement.sql,
@@ -9364,7 +9520,8 @@ impl ExtendedQueryHandler for PgHandler {
                 &param_types,
                 max_rows,
             )
-            .await;
+            .await
+            .inspect_err(|_| self.note_failure());
         // Notices go out before the result -- or the error -- they preceded.
         self.flush_notices(_c).await?;
         self.settle_failed_commit(_c);

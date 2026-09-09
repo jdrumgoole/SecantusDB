@@ -6898,3 +6898,67 @@ def test_deferred_foreign_key_fails_at_commit_and_leaves_the_connection_idle(
         conn.rollback()
         # The catalog carries the constraints for the Python server too.
     assert _python_sql(home, "select count(*) from selfref") == [(0,)]
+
+
+def test_a_pipeline_error_rolls_back_the_statements_before_it(home: Path) -> None:
+    """Every extended-protocol statement between two Syncs runs in one
+    transaction that the Sync commits, so an error in the pipeline rolls
+    back the earlier statements of its group and libpq skips the later ones
+    (`PIPELINE_ABORTED`); after the Sync the connection is IDLE and the next
+    group commits on its own. A `BEGIN` inside a group makes it a block, and
+    `DECLARE` in a group is still refused (`25P01`). PostgreSQL 16.
+    """
+    from psycopg.pq import TransactionStatus
+
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table pipe (n int primary key)")
+        with pytest.raises(psycopg.errors.DivisionByZero):
+            with conn.pipeline():
+                conn.execute("insert into pipe values (1)")
+                conn.execute("select 1/0")
+                conn.execute("insert into pipe values (2)")
+        assert conn.info.transaction_status == TransactionStatus.IDLE
+        conn.execute("insert into pipe values (3)")
+        assert conn.execute("select n from pipe order by n").fetchall() == [(3,)]
+        # The group is NOT a transaction block.
+        with pytest.raises(psycopg.errors.NoActiveSqlTransaction):
+            with conn.pipeline():
+                conn.execute("declare c cursor for select 1")
+        # Unless a BEGIN inside it makes it one: the status after the Sync
+        # is INTRANS, and the rows wait for the COMMIT.
+        with conn.pipeline():
+            conn.execute("begin")
+            conn.execute("insert into pipe values (4)")
+        assert conn.info.transaction_status == TransactionStatus.INTRANS
+        conn.execute("commit")
+        assert conn.execute("select count(*) from pipe").fetchone() == (2,)
+        # A CREATE TABLE and an INSERT into it in one group see each other.
+        with conn.pipeline():
+            conn.execute("create table pipe2 (n int)")
+            conn.execute("insert into pipe2 values (5)")
+        assert conn.execute("select n from pipe2").fetchall() == [(5,)]
+
+
+def test_an_insert_prepared_without_parameter_types_takes_the_column_types(
+    home: Path,
+) -> None:
+    """libpq's `PQprepare` with `nParams = 0` leaves every `$n` for the server
+    to type from the column it lands in. The parameters live in the VALUES
+    list, which pg_query's node walk skips -- so the statement used to be
+    sized at zero parameters and fail with `there is no parameter $1`.
+    """
+    from psycopg import pq
+
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table typed (n int, t text, when_ timestamp)")
+        pgconn = conn.pgconn
+        pgconn.send_prepare(b"ins", b"insert into typed values ($1, $2, $3)")
+        assert pgconn.get_result().status == pq.ExecStatus.COMMAND_OK
+        pgconn.get_result()
+        pgconn.send_query_prepared(b"ins", [b"7", b"seven", b"2024-01-02 03:04:05"])
+        res = pgconn.get_result()
+        assert res.status == pq.ExecStatus.COMMAND_OK, res.error_message
+        pgconn.get_result()
+        assert conn.execute("select * from typed").fetchall() == [
+            (7, "seven", dt.datetime(2024, 1, 2, 3, 4, 5))
+        ]

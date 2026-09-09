@@ -8079,17 +8079,22 @@ fn static_text_type(n: Option<&pg_query::protobuf::Node>) -> Option<String> {
 /// oid list, so a describe of `select $1::uuid` answered "there is no
 /// parameter $1" -- PostgreSQL infers the parameter from the SQL.
 pub fn max_param_number(sql: &str) -> usize {
-    let Ok(parsed) = pg_query::parse(sql) else {
+    // The LEXER, not the parse tree: pg_query's `nodes()` walks a curated
+    // subset of each statement (a SELECT's target list, WHERE, FROM, ...)
+    // and skips a VALUES list, a RETURNING clause and an UPDATE's SET, so
+    // `insert into t values ($1, $2)` counted zero parameters and, prepared
+    // with no declared types, executed as "there is no parameter $1". The
+    // scanner sees every `$n` token and nothing inside a string or comment.
+    let Ok(scanned) = pg_query::scan(sql) else {
         return 0;
     };
-    parsed
-        .protobuf
-        .nodes()
-        .into_iter()
-        .filter_map(|(node, _, _, _)| match node {
-            pg_query::NodeRef::ParamRef(p) => usize::try_from(p.number).ok(),
-            _ => None,
-        })
+    let param = pg_query::protobuf::Token::Param as i32;
+    scanned
+        .tokens
+        .iter()
+        .filter(|t| t.token == param)
+        .filter_map(|t| sql.get(t.start as usize..t.end as usize))
+        .filter_map(|text| text.strip_prefix('$')?.parse::<usize>().ok())
         .max()
         .unwrap_or(0)
 }

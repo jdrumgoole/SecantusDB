@@ -2610,3 +2610,30 @@ fn check_expression_evaluates_false_true_and_null() {
     assert_eq!(apply_row_expr(&expr, &row(Bson::Int32(0))).unwrap(), Bson::Boolean(false));
     assert_eq!(apply_row_expr(&expr, &row(Bson::Null)).unwrap(), Bson::Null);
 }
+
+#[test]
+fn insert_with_untyped_parameters_takes_the_column_types() {
+    // libpq's `PQprepare` with `nParams = 0` declares nothing; the values
+    // still bind. Failed "there is no parameter $1" (2026-09-09).
+    let stmt = plan_with_session_types(
+        "insert into t values ($1, $2, $3)",
+        &lookup,
+        &[Bson::Int64(1), Bson::String("a".into()), Bson::Int64(2)],
+        &[None, None, None],
+        &TimeZoneSetting::default(),
+    )
+    .expect("should plan");
+    match stmt {
+        Statement::Insert(i) => assert_eq!(i.rows[0].get("_id"), Some(&Bson::Int32(1))),
+        other => panic!("wrong statement: {other:?}"),
+    }
+}
+
+#[test]
+fn max_param_number_sees_the_values_of_an_insert() {
+    assert_eq!(max_param_number("insert into t values ($1, $2)"), 2);
+    assert_eq!(max_param_number("insert into t values ($1, $2) returning id"), 2);
+    assert_eq!(max_param_number("insert into t (id) select $3"), 3);
+    assert_eq!(max_param_number("update t set n = $2 where id = $1"), 2);
+    assert_eq!(max_param_number("select '$9' -- $8"), 0);
+}
