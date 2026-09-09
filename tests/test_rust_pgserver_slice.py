@@ -4858,7 +4858,8 @@ def test_generate_series_with_a_cast_in_the_target_list(home: Path) -> None:
 
     The cast rides as an ordinary per-row cast, and the described column type is
     the cast's -- so a binary server cursor over it decodes against the right
-    oid. A WHERE clause over the series is refused, not silently dropped.
+    oid. A constant WHERE over the series filters it (PG 16.15: `where false`
+    is no rows, `where true` all three).
     """
     with _Server(home) as server, server.connect() as conn:
         cur = conn.cursor()
@@ -4868,8 +4869,10 @@ def test_generate_series_with_a_cast_in_the_target_list(home: Path) -> None:
         assert cur.description[0].type_code == conn.adapters.types["int8"].oid
         cur.execute("select generate_series(1, 2)::text")
         assert [r[0] for r in cur.fetchall()] == ["1", "2"]
-        with pytest.raises(psycopg.errors.FeatureNotSupported):
-            cur.execute("select generate_series(1, 3) where false")
+        cur.execute("select generate_series(1, 3) where false")
+        assert cur.fetchall() == []
+        cur.execute("select generate_series(1, 3) where true")
+        assert [r[0] for r in cur.fetchall()] == [1, 2, 3]
 
 
 def test_pg_backend_pid_returns_the_connections_pid(home: Path) -> None:
@@ -5877,3 +5880,373 @@ def test_savepoint_rollback_of_ddl_on_a_fresh_store(home: Path) -> None:
         cur.execute("select count(*) from sp_t")
         assert cur.fetchone() == (0,)
         conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# DO blocks, error diagnostics, numeric / oid / enum / record wire paths.
+# Every expected value below was measured on PostgreSQL 16.15 (2026-09-09).
+# ---------------------------------------------------------------------------
+
+
+def test_unary_minus_on_numeric_specials(home: Path) -> None:
+    """`-'NaN'::numeric` is NaN, and the infinities flip sign."""
+    with _Server(home) as server, server.connect() as conn:
+        row = conn.execute(
+            "select -'NaN'::numeric, -'Infinity'::numeric, -'-Infinity'::numeric, -(1.5::numeric)"
+        ).fetchone()
+        assert row is not None
+        assert row[0].is_nan()
+        assert row[1:] == (Decimal("-Infinity"), Decimal("Infinity"), Decimal("-1.5"))
+
+
+def test_oid_parameters_in_text_and_binary(home: Path) -> None:
+    """An `Oid` parameter keeps its type (`pg_typeof` is `oid`, the column
+    oid is 26), the full unsigned range round-trips, and an `oid[]` sent as
+    text comes back binary as a 1028 array."""
+    from psycopg.types.numeric import Oid
+
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.execute("select pg_typeof(%s)::text, %s", [Oid(10), Oid(4294967295)])
+        assert cur.fetchone() == ("oid", 4294967295)
+        assert cur.description is not None
+        assert [d.type_code for d in cur.description] == [25, 26]
+        cur = conn.cursor(binary=True)
+        cur.execute("select pg_typeof(%s)::text, %s", [Oid(10), Oid(7)])
+        assert cur.fetchone() == ("oid", 7)
+        cur.execute("select %s, pg_typeof(%s)::text", [[Oid(1), Oid(2)], [Oid(1), Oid(2)]])
+        assert cur.fetchone() == ([1, 2], "oid[]")
+        assert cur.description is not None
+        assert cur.description[0].type_code == 1028
+
+
+def test_where_over_generate_series(home: Path) -> None:
+    """A constant or column predicate filters the generated rows; a
+    non-boolean constant is `42804`."""
+    with _Server(home) as server, server.connect() as conn:
+        assert conn.execute("select 1 from generate_series(1,3) where false").fetchall() == []
+        assert conn.execute("select 1 from generate_series(1,3) where true").fetchall() == [
+            (1,),
+            (1,),
+            (1,),
+        ]
+        assert conn.execute(
+            "select count(*) from generate_series(1,5) i where i > 2"
+        ).fetchone() == (3,)
+        assert conn.execute(
+            "select i from generate_series(1,5) i where i > 2 order by i desc"
+        ).fetchall() == [(5,), (4,), (3,)]
+        with pytest.raises(psycopg.errors.DatatypeMismatch) as ei:
+            conn.execute("select 1 from generate_series(1,3) where 1")
+        assert str(ei.value).startswith("argument of WHERE must be type boolean, not type integer")
+
+
+def test_quote_ident_format_and_boolean_concat(home: Path) -> None:
+    """`quote_ident` quotes reserved keywords (`order`, `select`) and leaves
+    unreserved ones (`int4`, `abort`, `zone`) bare; `format()` handles
+    `%s` / `%I` / `%L` / `%%` / `%2$s`, NULL arguments, and its three error
+    shapes; a boolean's text inside `concat` is `t` / `f`."""
+    with _Server(home) as server, server.connect() as conn:
+        assert conn.execute(
+            "select quote_ident('order'), quote_ident('select'), quote_ident('int4'),"
+            " quote_ident('abort'), quote_ident('zone'), quote_ident('Foo'),"
+            " quote_ident('a\"b'), quote_ident('a-b'), quote_ident('1a'), quote_ident('_ok')"
+        ).fetchone() == (
+            '"order"',
+            '"select"',
+            "int4",
+            "abort",
+            "zone",
+            '"Foo"',
+            '"a""b"',
+            '"a-b"',
+            '"1a"',
+            "_ok",
+        )
+        assert conn.execute(
+            "select format('%s|%I|%L|%%|%2$s', 'x', 'order', 'it''s'),"
+            " format('%s-%L-%I', null, null, 'a'), format(null, 1), format('%L', E'a\\\\b')"
+        ).fetchone() == ("x|\"order\"|'it''s'|%|order", "-NULL-a", None, "E'a\\\\b'")
+        with pytest.raises(psycopg.errors.NullValueNotAllowed) as ei:
+            conn.execute("select format('%I', null)")
+        assert str(ei.value).startswith("null values cannot be formatted as an SQL identifier")
+        with pytest.raises(psycopg.errors.InvalidParameterValue) as ei2:
+            conn.execute("select format('%s %s', 1)")
+        assert str(ei2.value).startswith("too few arguments for format()")
+        with pytest.raises(psycopg.errors.InvalidParameterValue) as ei3:
+            conn.execute("select format('%x', 1)")
+        assert str(ei3.value).startswith('unrecognized format() type specifier "x"')
+        assert ei3.value.diag.message_hint == 'For a single "%" use "%%".'
+        assert conn.execute("select concat(true, false, 1, 1.5, 'x'), true::text").fetchone() == (
+            "tf11.5x",
+            "true",
+        )
+
+
+def test_regtype_quotes_a_reserved_keyword_type_name(home: Path) -> None:
+    """A type named `order` renders as `"order"` through `regtype`."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute('create type "order" as (x int)')
+        assert conn.execute("select '\"order\"'::regtype::text").fetchone() == ('"order"',)
+
+
+def test_undefined_table_error_carries_its_position(home: Path) -> None:
+    """`42P01` points `P` at the relation's first mention, counted in
+    characters across lines (`select 1 +\\n 2 from nope` is 20)."""
+    with _Server(home) as server, server.connect() as conn:
+        with pytest.raises(psycopg.errors.UndefinedTable) as ei:
+            conn.execute("select * from wat")
+        assert ei.value.diag.statement_position == "15"
+        assert ei.value.diag.severity_nonlocalized == "ERROR"
+        with pytest.raises(psycopg.errors.UndefinedTable) as ei2:
+            conn.execute("select 1 +\n 2 from nope")
+        assert ei2.value.diag.statement_position == "20"
+
+
+def _notices(conn: psycopg.Connection) -> list[tuple[str, str | None, str, str | None]]:
+    seen: list[tuple[str, str | None, str, str | None]] = []
+    conn.add_notice_handler(
+        lambda d: seen.append(
+            (d.severity or "", d.severity_nonlocalized, d.message_primary or "", d.context)
+        )
+    )
+    return seen
+
+
+def test_do_block_raise_levels_and_notices(home: Path) -> None:
+    """`RAISE NOTICE / WARNING / INFO` reach the client as notices with the
+    block's context; `DEBUG` and `LOG` do not (below `client_min_messages`).
+    Both `DO $$ ... $$ LANGUAGE plpgsql` spellings work, as does `NULL;`."""
+    with _Server(home) as server, server.connect() as conn:
+        seen = _notices(conn)
+        conn.execute(
+            "do $$ begin raise notice 'n %', 1; raise warning 'w'; raise debug 'd';"
+            " raise info 'i'; raise log 'l'; end $$"
+        )
+        ctx = "PL/pgSQL function inline_code_block line 1 at RAISE"
+        assert seen == [
+            ("NOTICE", "NOTICE", "n 1", ctx),
+            ("WARNING", "WARNING", "w", ctx),
+            ("INFO", "INFO", "i", ctx),
+        ]
+        seen.clear()
+        conn.execute("do $$ begin raise notice 'x'; end $$ language plpgsql")
+        conn.execute("do language plpgsql $$ begin raise notice 'y'; end $$")
+        assert [n[2] for n in seen] == ["x", "y"]
+        conn.execute("do $$ begin null; end $$")
+        assert conn.execute("select 1").fetchone() == (1,)
+
+
+def test_do_block_raise_exception_diagnostics(home: Path) -> None:
+    """`RAISE EXCEPTION` carries the message, `USING` fields, the sqlstate
+    (default `P0001`, a named condition, or an arbitrary `errcode`), and the
+    block context; a non-ASCII message survives."""
+    ctx = "PL/pgSQL function inline_code_block line 1 at RAISE"
+    with _Server(home) as server, server.connect() as conn:
+        with pytest.raises(psycopg.errors.DivisionByZero) as ei:
+            conn.execute(
+                "do $$ begin raise exception 'boom %', 'x'"
+                " using errcode = '22012', detail = 'd', hint = 'h'; end $$"
+            )
+        d = ei.value.diag
+        assert (d.message_primary, d.message_detail, d.message_hint, d.context) == (
+            "boom x",
+            "d",
+            "h",
+            ctx,
+        )
+        assert d.severity_nonlocalized == "ERROR"
+        with pytest.raises(psycopg.errors.RaiseException) as ei2:
+            conn.execute("do $$ begin raise exception 'boom'; end $$")
+        assert (ei2.value.sqlstate, ei2.value.diag.message_primary) == ("P0001", "boom")
+        with pytest.raises(psycopg.errors.DivisionByZero) as ei3:
+            conn.execute("do $$ begin raise division_by_zero; end $$")
+        assert ei3.value.diag.message_primary == "division_by_zero"
+        with pytest.raises(psycopg.InternalError) as ei4:
+            conn.execute("do $$ begin raise exception 'boom' using errcode = 'XX123'; end $$")
+        assert ei4.value.sqlstate == "XX123"
+        with pytest.raises(psycopg.errors.RaiseException) as ei5:
+            conn.execute("do $$ begin raise exception 'bad é'; end $$")
+        assert ei5.value.diag.message_primary == "bad é"
+        conn.execute("set client_encoding to latin9")
+        with pytest.raises(psycopg.errors.RaiseException) as ei6:
+            conn.execute("do $$ begin raise exception 'bad €'; end $$")
+        assert ei6.value.diag.message_primary == "bad €"
+        assert conn.execute("select 'bad €'").fetchone() == ("bad €",)
+
+
+def test_do_block_perform_and_execute_contexts(home: Path) -> None:
+    """An error inside `PERFORM` stacks the SQL statement under the block
+    frame; one inside `EXECUTE` carries the executed query and its position
+    in the `q` / `p` fields instead."""
+    with _Server(home) as server, server.connect() as conn:
+        with pytest.raises(psycopg.errors.DivisionByZero) as ei:
+            conn.execute("do $$ begin perform 1/0; end $$")
+        assert ei.value.diag.message_primary == "division by zero"
+        assert ei.value.diag.context == (
+            'SQL statement "SELECT 1/0"\nPL/pgSQL function inline_code_block line 1 at PERFORM'
+        )
+        with pytest.raises(psycopg.errors.UndefinedTable) as ei2:
+            conn.execute("do $$ begin execute 'select * from nope'; end $$")
+        d = ei2.value.diag
+        assert d.context == "PL/pgSQL function inline_code_block line 1 at EXECUTE"
+        assert (d.internal_query, d.internal_position) == ("select * from nope", "15")
+        assert d.statement_position is None
+
+
+def test_do_block_compile_and_condition_errors(home: Path) -> None:
+    """A bad body is `42601` positioned inside the statement; an unknown
+    condition NAME fails at compile time with the compilation context, while
+    an unknown `errcode` fails at the RAISE; a non-plpgsql language is
+    `0A000`."""
+    with _Server(home) as server, server.connect() as conn:
+        with pytest.raises(psycopg.errors.SyntaxError) as ei:
+            conn.execute("do $$ begin raise notice 'x' end $$")
+        assert str(ei.value).startswith('syntax error at or near "end"')
+        assert ei.value.diag.statement_position == "30"
+        with pytest.raises(psycopg.errors.SyntaxError) as ei2:
+            conn.execute("do $$ raise notice 'x'; $$")
+        assert str(ei2.value).startswith('syntax error at or near "raise"')
+        assert ei2.value.diag.statement_position == "7"
+        with pytest.raises(psycopg.errors.UndefinedObject) as ei3:
+            conn.execute("do $$ begin raise unknown_thing; end $$")
+        assert str(ei3.value).startswith('unrecognized exception condition "unknown_thing"')
+        assert ei3.value.diag.context == (
+            'compilation of PL/pgSQL function "inline_code_block" near line 1'
+        )
+        with pytest.raises(psycopg.errors.UndefinedObject) as ei4:
+            conn.execute("do $$ begin raise exception 'x' using errcode = 'unknown_thing'; end $$")
+        assert ei4.value.diag.context == "PL/pgSQL function inline_code_block line 1 at RAISE"
+        with pytest.raises(psycopg.errors.FeatureNotSupported) as ei5:
+            conn.execute("do language sql $$ select 1 $$")
+        assert str(ei5.value).startswith('language "sql" does not support inline code execution')
+
+
+def test_copy_out_renders_inet_without_a_host_mask(home: Path) -> None:
+    """`inet` drops a `/32` (`/128`) host mask on output and keeps any other;
+    `cidr` always shows its mask; an IPv4-mapped address renders dotted."""
+    import io
+
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table cpi (a inet, b cidr)")
+        conn.execute(
+            "insert into cpi values ('127.0.0.1/32', '10.0.0.0/8'),"
+            " ('::ffff:102:300/128', '::ffff:1.2.3.0/120'), ('192.168.0.1/24', '192.168.0.0/24')"
+        )
+        buf = io.StringIO()
+        with conn.cursor().copy("copy cpi to stdout") as cp:
+            for chunk in cp:
+                buf.write(bytes(chunk).decode())
+        assert buf.getvalue() == (
+            "127.0.0.1\t10.0.0.0/8\n"
+            "::ffff:1.2.3.0\t::ffff:1.2.3.0/120\n"
+            "192.168.0.1/24\t192.168.0.0/24\n"
+        )
+        assert conn.execute("select a::text, b::text from cpi").fetchall() == [
+            ("127.0.0.1/32", "10.0.0.0/8"),
+            ("::ffff:1.2.3.0/128", "::ffff:1.2.3.0/120"),
+            ("192.168.0.1/24", "192.168.0.0/24"),
+        ]
+
+
+def test_copy_in_keeps_numeric_text_exact(home: Path) -> None:
+    """`COPY FROM` stores a numeric at its written scale: a tiny fraction,
+    a 34-digit value, `-0.0` (which reads back `0.0`) and `NaN`."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table cpn (n numeric)")
+        with conn.cursor().copy("copy cpn from stdin") as cp:
+            cp.write("0.000000000000000001\n123456789012345678901234567890.1234\n-0.0\nNaN\n")
+        assert conn.execute("select n::text from cpn").fetchall() == [
+            ("0.000000000000000001",),
+            ("123456789012345678901234567890.1234",),
+            ("0.0",),
+            ("NaN",),
+        ]
+
+
+def test_enum_parameters_labels_and_arrays(home: Path) -> None:
+    """A parameter typed with the enum's oid is checked against its labels
+    (`22P02` with the portal context); an enum ARRAY parameter parses in text
+    and in binary, and a binary result carries the enum array's oid with
+    each element as its label."""
+    import enum
+
+    from psycopg.adapt import Dumper
+    from psycopg.types.enum import EnumInfo, register_enum
+
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create type dnm_enum as enum ('ONE', 'TWO', 'THREE')")
+        info = EnumInfo.fetch(conn, "dnm_enum")
+        assert info is not None
+        assert info.labels == ["ONE", "TWO", "THREE"]
+        e = enum.Enum("E", {label: label for label in info.labels})
+        register_enum(info, conn, e)
+        assert conn.execute("select %s::text", [e.ONE]).fetchone() == ("ONE",)
+        assert conn.execute("select %s::dnm_enum[]", [["ONE", "TWO"]]).fetchone() == (
+            [e.ONE, e.TWO],
+        )
+        assert conn.execute("select %b::dnm_enum[]", [[e.ONE, e.TWO]]).fetchone() == (
+            [e.ONE, e.TWO],
+        )
+        cur = conn.cursor(binary=True)
+        cur.execute("select %s::dnm_enum[]", [[e.ONE, e.TWO]])
+        assert cur.description is not None
+        assert cur.description[0].type_code == info.array_oid
+        assert cur.pgresult is not None
+        raw = cur.pgresult.get_value(0, 0)
+        assert raw is not None
+        # ndim=1, no nulls, element oid, dim 2 lower-bound 1, then the labels.
+        assert raw == (
+            b"\x00\x00\x00\x01\x00\x00\x00\x00"
+            + info.oid.to_bytes(4, "big")
+            + b"\x00\x00\x00\x02\x00\x00\x00\x01"
+            b"\x00\x00\x00\x03ONE\x00\x00\x00\x03TWO"
+        )
+        assert cur.fetchone() == ([e.ONE, e.TWO],)
+
+        class WithEnumOid(Dumper):
+            oid = info.oid
+
+            def dump(self, obj: str) -> bytes:
+                return obj.encode()
+
+        conn.adapters.register_dumper(str, WithEnumOid)
+        with pytest.raises(psycopg.errors.InvalidTextRepresentation) as ei:
+            conn.execute("select %s::text", ["NOPE"])
+        assert str(ei.value).startswith('invalid input value for enum dnm_enum: "NOPE"')
+        assert ei.value.diag.context == "unnamed portal parameter $1 = '...'"
+
+
+def test_anonymous_record_binary_result_carries_field_types(home: Path) -> None:
+    """`ROW(...)` in binary: a 4-byte field count, then per field the oid and
+    length-prefixed bytes (`-1` for NULL). An untyped literal is `unknown`
+    (705), a cast one its type -- byte-identical to PostgreSQL 16.15."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor(binary=True)
+        expected = {
+            "select row()": (b"\x00\x00\x00\x00", ((),)),
+            "select row(null)": (b"\x00\x00\x00\x01\x00\x00\x02\xc1\xff\xff\xff\xff", ((None,),)),
+            "select row(null, '')": (
+                b"\x00\x00\x00\x02\x00\x00\x02\xc1\xff\xff\xff\xff\x00\x00\x02\xc1\x00\x00\x00\x00",
+                ((None, b""),),
+            ),
+            "select row(42, 'foo', 'ba,r')": (
+                b"\x00\x00\x00\x03\x00\x00\x00\x17\x00\x00\x00\x04\x00\x00\x00*"
+                b"\x00\x00\x02\xc1\x00\x00\x00\x03foo\x00\x00\x02\xc1\x00\x00\x00\x04ba,r",
+                ((42, b"foo", b"ba,r"),),
+            ),
+            "select row(10::int, null::text, 20::float, null::text, 'foo'::text, 'bar'::bytea)": (
+                b"\x00\x00\x00\x06\x00\x00\x00\x17\x00\x00\x00\x04\x00\x00\x00\n"
+                b"\x00\x00\x00\x19\xff\xff\xff\xff\x00\x00\x02\xbd\x00\x00\x00\x08@4\x00\x00\x00\x00\x00\x00"
+                b"\x00\x00\x00\x19\xff\xff\xff\xff\x00\x00\x00\x19\x00\x00\x00\x03foo"
+                b"\x00\x00\x00\x11\x00\x00\x00\x03bar",
+                ((10, None, 20.0, None, "foo", b"bar"),),
+            ),
+        }
+        for query, (raw, row) in expected.items():
+            cur.execute(query)
+            assert cur.description is not None
+            assert cur.description[0].type_code == 2249, query
+            assert cur.pgresult is not None
+            assert cur.pgresult.get_value(0, 0) == raw, query
+            assert cur.fetchone() == row, query
+        assert conn.execute("select row(42, 'foo', 'ba,r')").fetchone() == (("42", "foo", "ba,r"),)

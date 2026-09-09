@@ -79,8 +79,59 @@ impl<S> Encoder<PgWireBackendMessage> for PgWireMessageServerCodec<S> {
         item: PgWireBackendMessage,
         dst: &mut bytes::BytesMut,
     ) -> Result<(), Self::Error> {
+        // SecantusDB patch: an error or notice goes out in the client's
+        // encoding when the session installed a transcoder (see
+        // `BackendMessageTranscoder`). Every other message is UTF-8 as before.
+        if let Some(transcoder) = self
+            .client_info
+            .session_extensions()
+            .get::<crate::api::BackendMessageTranscoder>()
+        {
+            let (type_byte, fields) = match &item {
+                PgWireBackendMessage::ErrorResponse(e) => (
+                    crate::messages::response::MESSAGE_TYPE_BYTE_ERROR_RESPONSE,
+                    &e.fields,
+                ),
+                PgWireBackendMessage::NoticeResponse(n) => (
+                    crate::messages::response::MESSAGE_TYPE_BYTE_NOTICE_RESPONSE,
+                    &n.fields,
+                ),
+                _ => return item.encode(dst).map_err(Into::into),
+            };
+            encode_transcoded_fields(type_byte, fields, &*transcoder.0, dst);
+            return Ok(());
+        }
         item.encode(dst).map_err(Into::into)
     }
+}
+
+/// Encode an ErrorResponse / NoticeResponse whose field text is passed
+/// through `transcode` (falling back to the UTF-8 bytes when it declines):
+/// type byte, i32 length (self-inclusive), `code byte + cstring` per field,
+/// terminating NUL.
+fn encode_transcoded_fields(
+    type_byte: u8,
+    fields: &[(u8, String)],
+    transcode: &(dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync),
+    dst: &mut bytes::BytesMut,
+) {
+    use bytes::BufMut;
+    let encoded: Vec<(u8, Vec<u8>)> = fields
+        .iter()
+        .map(|(code, value)| {
+            let bytes = transcode(value).unwrap_or_else(|| value.as_bytes().to_vec());
+            (*code, bytes)
+        })
+        .collect();
+    let len = 4 + encoded.iter().map(|(_, b)| 1 + b.len() + 1).sum::<usize>() + 1;
+    dst.put_u8(type_byte);
+    dst.put_i32(len as i32);
+    for (code, bytes) in &encoded {
+        dst.put_u8(*code);
+        dst.put_slice(bytes);
+        dst.put_u8(0);
+    }
+    dst.put_u8(0);
 }
 
 impl<T: 'static, S> ClientInfo for Framed<T, PgWireMessageServerCodec<S>> {

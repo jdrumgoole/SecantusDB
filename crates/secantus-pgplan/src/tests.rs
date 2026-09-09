@@ -1836,19 +1836,22 @@ fn a_series_alias_renames_its_column() {
     assert_eq!(col, "x");
 }
 
-/// A WHERE clause over a generated source is REFUSED, not ignored.
-///
-/// The filter language here is built against stored columns; quietly dropping
-/// a predicate would answer with rows the client asked to exclude, which is
-/// worse than saying so.
+/// A WHERE clause over a generated source becomes the series' filter (it
+/// used to be refused with `0A000`; PostgreSQL 16 answers 3 rows here).
 #[test]
-fn a_where_over_a_series_is_refused() {
-    let err = plan(
+fn a_where_over_a_series_filters_it() {
+    let planned = plan(
         "SELECT * FROM generate_series(1,5) WHERE generate_series > 2",
         &lookup,
     )
-    .expect_err("where over a series");
-    assert_eq!(err.sqlstate(), "0A000");
+    .expect("where over a series");
+    match planned {
+        Statement::Select(sel) => {
+            assert!(sel.series.is_some());
+            assert_eq!(sel.filter, bson::doc! { "generate_series": { "$gt": 2 } });
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
 }
 
 /// A set-returning function in the SELECT LIST of a FROM-less query is not a

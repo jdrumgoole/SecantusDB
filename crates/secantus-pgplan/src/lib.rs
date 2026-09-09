@@ -70,6 +70,9 @@ pub enum Error {
     /// A parameter that is the wrong VALUE rather than the wrong shape ->
     /// 22023. PostgreSQL distinguishes this from the generic data class.
     InvalidParameter(String),
+    /// A NULL where the operation cannot take one -> 22004
+    /// (`format('%I', NULL)`).
+    NullValueNotAllowed(String),
     /// A function call whose ARGUMENT TYPES match no overload -> 42883.
     ///
     /// Distinct from `Unsupported`: PostgreSQL has no such function either, so
@@ -117,6 +120,7 @@ impl std::fmt::Display for Error {
             Error::DivisionByZero => write!(f, "division by zero"),
             Error::NumericOutOfRange(m) => write!(f, "{m}"),
             Error::DataException(m) | Error::InvalidParameter(m) => write!(f, "{m}"),
+            Error::NullValueNotAllowed(m) => write!(f, "{m}"),
             Error::InvalidColumnReference(m)
             | Error::UndefinedFunction(m)
             | Error::IndeterminateDatatype(m)
@@ -136,6 +140,18 @@ impl std::fmt::Display for Error {
 }
 
 impl Error {
+    /// The `H` (hint) field PostgreSQL sends with this error, where it sends
+    /// one: measured on 16, `unrecognized format() type specifier "x"`
+    /// carries `For a single "%" use "%%".`.
+    pub fn hint(&self) -> Option<&'static str> {
+        match self {
+            Error::InvalidParameter(m) if m.starts_with("unrecognized format() type specifier") => {
+                Some("For a single \"%\" use \"%%\".")
+            }
+            _ => None,
+        }
+    }
+
     /// The SQLSTATE a client should see.
     pub fn sqlstate(&self) -> &'static str {
         match self {
@@ -152,6 +168,7 @@ impl Error {
             Error::NumericOutOfRange(_) => "22003", // numeric_value_out_of_range
             Error::DataException(_) => "22000",     // data_exception
             Error::InvalidParameter(_) => "22023",  // invalid_parameter_value
+            Error::NullValueNotAllowed(_) => "22004", // null_value_not_allowed
             Error::InvalidColumnReference(_) => "42P10", // invalid_column_reference
             Error::UndefinedFunction(_) => "42883", // undefined_function
             Error::MultipleCommands => "42601",     // syntax_error, as PostgreSQL reports it
@@ -287,6 +304,13 @@ pub enum Statement {
     /// `NOTIFY channel [, payload]`, completing with the `NOTIFY` tag. No
     /// LISTEN exists here, so there is no delivery.
     Notify,
+    /// `DO [LANGUAGE lang] 'body'`: an inline code block. The planner only
+    /// carries the body and the language (default `plpgsql`); the wire layer
+    /// interprets the small RAISE / EXECUTE subset it supports.
+    Do {
+        language: String,
+        body: String,
+    },
     /// `COPY <table> [(cols)] FROM STDIN`.
     CopyFrom(CopyFrom),
     /// `COPY <table> [(cols)] TO STDOUT`.
@@ -960,6 +984,31 @@ fn range_accessor_value(
 ///
 /// Empty commands (a trailing `;`, or `;;`) are dropped: PostgreSQL accepts them
 /// and produces no result for them.
+/// The 1-based CHARACTER position of the first identifier token spelling
+/// `name` in `sql`, for an error's `P` field. A quoted identifier matches on
+/// its unquoted text; an unquoted one on its case-folded text.
+pub fn identifier_position(sql: &str, name: &str) -> Option<usize> {
+    let scanned = pg_query::scan(sql).ok()?;
+    let ident = pg_query::protobuf::Token::Ident as i32;
+    for tok in &scanned.tokens {
+        if tok.token != ident {
+            continue;
+        }
+        let (start, end) = (tok.start as usize, tok.end as usize);
+        let text = sql.get(start..end)?;
+        let spelled = if let Some(inner) = text.strip_prefix('"').and_then(|t| t.strip_suffix('"'))
+        {
+            inner.replace("\"\"", "\"")
+        } else {
+            text.to_ascii_lowercase()
+        };
+        if spelled == name {
+            return Some(sql[..start].chars().count() + 1);
+        }
+    }
+    None
+}
+
 pub fn split_statements(sql: &str) -> Result<Vec<String>> {
     let parts = pg_query::split_with_parser(sql).map_err(|e| Error::Parse(e.to_string()))?;
     Ok(parts
@@ -1142,6 +1191,28 @@ pub fn plan_with_params(
         // with no listener is the bare `NOTIFY` tag -- which is all a client
         // preparing the statement (psycopg's `test_misc_statement`) sees.
         N::NotifyStmt(_) => Ok(Statement::Notify),
+        N::DoStmt(d) => {
+            let mut language = "plpgsql".to_string();
+            let mut body = None;
+            for node in &d.args {
+                let Some(N::DefElem(e)) = node.node.as_ref() else {
+                    continue;
+                };
+                let value = match e.arg.as_ref().and_then(|a| a.node.as_ref()) {
+                    Some(N::String(sv)) => sv.sval.clone(),
+                    _ => continue,
+                };
+                match e.defname.as_str() {
+                    "as" => body = Some(value),
+                    "language" => language = value,
+                    _ => {}
+                }
+            }
+            Ok(Statement::Do {
+                language,
+                body: body.unwrap_or_default(),
+            })
+        }
         N::VariableSetStmt(v) => plan_set(&v),
         N::TransactionStmt(t) => {
             // Named enum, not the wire integer -- twice bitten already.
@@ -1673,11 +1744,7 @@ fn plan_series_select(
     series: Series,
     params: &[Bson],
 ) -> Result<Statement> {
-    if s.where_clause.is_some() {
-        return Err(Error::Unsupported(
-            "a WHERE clause over generate_series".into(),
-        ));
-    }
+    let filter = series_where(s, &series, params)?;
     let mut columns: Vec<(String, String)> = Vec::new();
     let mut casts: Vec<Option<ColumnExpr>> = Vec::new();
     for t in &s.target_list {
@@ -1788,11 +1855,62 @@ fn plan_series_select(
         join: None,
         columns,
         casts,
-        filter: Document::new(),
+        filter,
         order,
         limit,
         offset,
     }))
+}
+
+/// The WHERE clause of a select over a generated series, lowered against the
+/// one int4 column the series exposes. `where false` over a series answers
+/// no rows and still describes the column (measured), which is what a
+/// server-side cursor opened on it relies on.
+fn series_where(
+    s: &pg_query::protobuf::SelectStmt,
+    series: &Series,
+    params: &[Bson],
+) -> Result<Document> {
+    match s.where_clause.as_ref() {
+        None => Ok(Document::new()),
+        // `where false` / `where $1`: a predicate with no column in it keeps
+        // every row or none.
+        Some(w) if matches!(w.node.as_ref(), Some(N::AConst(_) | N::ParamRef(_))) => {
+            Ok(if constant_where(w, params)? {
+                Document::new()
+            } else {
+                doc! { "$expr": false }
+            })
+        }
+        Some(w) => {
+            let def = TableDef::new(
+                "generate_series",
+                vec![Column::new(&series.column, "int4", false)],
+            );
+            lower_where(w, &def, params)
+        }
+    }
+}
+
+/// A WHERE with no row to range over -- a constant, or a parameter -- keeps
+/// (`true`) or drops (`false`, NULL) what it guards. A non-boolean is 42804,
+/// worded as PostgreSQL words it (probed PG 16).
+fn constant_where(w: &pg_query::protobuf::Node, params: &[Bson]) -> Result<bool> {
+    Ok(match const_value(w, params)? {
+        Bson::Boolean(b) => b,
+        Bson::Null => false,
+        // A bare string literal is of UNKNOWN type and is read as a
+        // boolean: `where 'x'` is 22P02, not 42804.
+        Bson::String(text) if matches!(w.node.as_ref(), Some(N::AConst(_))) => {
+            matches!(cast_value(Bson::String(text), "bool")?, Bson::Boolean(true))
+        }
+        other => {
+            return Err(Error::DatatypeMismatch(format!(
+                "argument of WHERE must be type boolean, not type {}",
+                display_type(&static_type(w, &other))
+            )));
+        }
+    })
 }
 
 /// The name PostgreSQL gives an unaliased expression column: a cast or a
@@ -2483,6 +2601,9 @@ fn plan_aggregate(
                 source_type: Some("int4".to_string()),
             });
         }
+        // The WHERE clause was silently dropped here before: `count(*)
+        // from generate_series(1, 5) i where i > 2` answered 5.
+        let filter = series_where(s, &series, params)?;
         return Ok(Statement::Aggregate(Aggregate {
             table: String::new(),
             series: Some(series),
@@ -2490,7 +2611,7 @@ fn plan_aggregate(
             group_by: Vec::new(),
             items,
             select,
-            filter: Document::new(),
+            filter,
             order: Vec::new(),
             limit: None,
             offset: 0,
@@ -3619,15 +3740,6 @@ fn plan_select_srf(
             "a set-returning function beside another output column".into(),
         ));
     }
-    // A WHERE clause is refused rather than ignored, exactly as the
-    // `FROM generate_series(...)` form is: the filter language runs against
-    // stored columns, and silently dropping the predicate would answer with
-    // rows the client asked to exclude.
-    if s.where_clause.is_some() {
-        return Err(Error::Unsupported(
-            "a WHERE clause over generate_series".into(),
-        ));
-    }
     let Some(N::ResTarget(rt)) = s.target_list[0].node.as_ref() else {
         return Ok(None);
     };
@@ -3644,6 +3756,9 @@ fn plan_select_srf(
         column: column.clone(),
         ..series
     };
+    // The predicate sees the series under its OUTPUT name, which is the only
+    // name the row has (`select generate_series(1, 3) as bar where bar > 1`).
+    let filter = series_where(s, &series, params)?;
     let mut order = Vec::new();
     for item in &s.sort_clause {
         let Some(N::SortBy(sb)) = item.node.as_ref() else {
@@ -3699,7 +3814,7 @@ fn plan_select_srf(
         join: None,
         columns: vec![(column.clone(), column)],
         casts: vec![cast],
-        filter: Document::new(),
+        filter,
         order,
         limit,
         offset,
@@ -3775,21 +3890,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
     // is 42804, worded as PostgreSQL words it (probed PG 16).
     let where_true = match s.where_clause.as_ref() {
         None => true,
-        Some(w) => match const_value(w, params)? {
-            Bson::Boolean(b) => b,
-            Bson::Null => false,
-            // A bare string literal is of UNKNOWN type and is read as a
-            // boolean: `where 'x'` is 22P02, not 42804.
-            Bson::String(text) if matches!(w.node.as_ref(), Some(N::AConst(_))) => {
-                matches!(cast_value(Bson::String(text), "bool")?, Bson::Boolean(true))
-            }
-            other => {
-                return Err(Error::DatatypeMismatch(format!(
-                    "argument of WHERE must be type boolean, not type {}",
-                    display_type(&static_type(w, &other))
-                )));
-            }
-        },
+        Some(w) => constant_where(w, params)?,
     };
     let mut columns: Vec<(String, ConstCol, String, i32)> = Vec::new();
     for t in &s.target_list {
@@ -4494,13 +4595,53 @@ pub(crate) fn record_value(fields: Vec<Bson>) -> Bson {
     Bson::Document(d)
 }
 
+/// The companion key holding a `ROW(...)` record's STATIC field types.
+///
+/// PostgreSQL's binary record format carries an oid per field, and that oid
+/// is the field EXPRESSION's type, which the value alone cannot recover: a
+/// bare `'x'` inside `ROW(...)` is `unknown` (705) where `'x'::text` is `text`
+/// (25), and a bare `null` is `unknown` where `null::text` is `text`. So a
+/// record built from a `ROW(...)` expression records each field's static type
+/// name beside its fields; a record from any other door carries none and the
+/// wire layer infers the oids from the values.
+pub const RECORD_TYPES_KEY: &str = "__record_types";
+
+/// A `ROW(...)` record with its fields' static type names alongside.
+pub(crate) fn typed_record_value(fields: Vec<Bson>, types: Vec<String>) -> Bson {
+    let mut d = Document::new();
+    d.insert(RECORD_KEY, Bson::Array(fields));
+    d.insert(
+        RECORD_TYPES_KEY,
+        Bson::Array(types.into_iter().map(Bson::String).collect()),
+    );
+    Bson::Document(d)
+}
+
+/// The static field type names of a `ROW(...)` record, or `None` when the
+/// record was built without them.
+pub fn record_field_types(v: &Bson) -> Option<Vec<String>> {
+    let Bson::Document(d) = v else {
+        return None;
+    };
+    record_fields(v)?;
+    match d.get(RECORD_TYPES_KEY) {
+        Some(Bson::Array(items)) => items
+            .iter()
+            .map(|t| t.as_str().map(str::to_owned))
+            .collect(),
+        _ => None,
+    }
+}
+
 /// The field list inside a record value, or `None` for any other value.
 pub(crate) fn record_fields(v: &Bson) -> Option<&Vec<Bson>> {
     match v {
-        Bson::Document(d) if d.len() == 1 => match d.get(RECORD_KEY) {
-            Some(Bson::Array(items)) => Some(items),
-            _ => None,
-        },
+        Bson::Document(d) if d.len() == 1 || (d.len() == 2 && d.contains_key(RECORD_TYPES_KEY)) => {
+            match d.get(RECORD_KEY) {
+                Some(Bson::Array(items)) => Some(items),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
@@ -4840,23 +4981,11 @@ pub fn regtype_text(oid: i64) -> String {
     if let Some(name) = user_type_name(oid) {
         // PostgreSQL renders a regtype per IDENTIFIER PART: a schema-qualified
         // `testschema.testcomp` prints unquoted as `schema.name` (each part
-        // quoted only when it is not a plain lower-case identifier -- measured:
-        // `"CamelCase"`, but `mood`), NOT as one quoted `"schema.name"`.
-        let quote_part = |part: &str| -> String {
-            let plain = !part.is_empty()
-                && part
-                    .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-                && !part.chars().next().is_some_and(|c| c.is_ascii_digit());
-            if plain {
-                part.to_string()
-            } else {
-                format!("\"{part}\"")
-            }
-        };
+        // quoted by `quote_identifier`'s rule -- measured: `"CamelCase"` and
+        // `"order"`, but `mood`), NOT as one quoted `"schema.name"`.
         return name
             .split('.')
-            .map(quote_part)
+            .map(scalar::quote_identifier)
             .collect::<Vec<_>>()
             .join(".");
     }
@@ -7016,7 +7145,7 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
     if let Some(fields) = record_fields(&value) {
         return match target {
             "text" | "varchar" | "bpchar" | "name" => Ok(Bson::String(record_text(fields))),
-            "record" => Ok(record_value(fields.clone())),
+            "record" => Ok(value.clone()),
             _ => Err(Error::Unsupported(format!("a record cast to {target}"))),
         };
     }
@@ -7984,6 +8113,26 @@ fn coerce_unknown_operand(
 struct Dec {
     unscaled: i128,
     scale: u32,
+}
+
+/// Unary minus over a numeric rendered as text. `NaN` is its own negation;
+/// `Infinity` and `-Infinity` swap; zero stays `0` (never `-0`); anything else
+/// flips its sign character. The scale is untouched, which is what PostgreSQL
+/// does (`-'1.50'::numeric` is `-1.50`).
+fn negate_numeric_text(text: &str) -> Result<Bson> {
+    let t = text.trim();
+    let out = if t.eq_ignore_ascii_case("nan") {
+        "NaN".to_string()
+    } else if let Some(rest) = t.strip_prefix('-') {
+        rest.to_string()
+    } else if t.chars().all(|c| c == '0' || c == '.' || c == '+') {
+        t.trim_start_matches('+').to_string()
+    } else {
+        format!("-{}", t.trim_start_matches('+'))
+    };
+    Decimal128::from_str(&out)
+        .map(Bson::Decimal128)
+        .map_err(|_| Error::Parse(format!("cannot negate numeric {text}")))
 }
 
 fn parse_dec(text: &str) -> Option<Dec> {
@@ -9447,6 +9596,16 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                     let Bson::Double(d) = rhs else { unreachable!() };
                     return Ok(Bson::Double(-d));
                 }
+                // A numeric is negated as TEXT so that `-'NaN'::numeric`
+                // stays `NaN` and `-'Infinity'::numeric` is `-Infinity`
+                // (measured), which `0 - x` cannot produce: the decimal
+                // arithmetic has no special values.
+                "-" if matches!(rhs, Bson::Decimal128(_)) => {
+                    let Bson::Decimal128(d) = rhs else {
+                        unreachable!()
+                    };
+                    return negate_numeric_text(&d.to_string());
+                }
                 "-" => Bson::Int32(0),
                 "+" => return Ok(rhs),
                 _ => return Err(Error::Unsupported(format!("unary {op}"))),
@@ -9514,13 +9673,27 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
         }
         // `ROW(...)` and the bare `(a, b, ...)` parenthesised list build an
         // anonymous record; each field is any constant expression.
+        // Each field's STATIC type rides with the value for the binary record
+        // format: a bare string literal or bare `null` is `unknown` inside a
+        // row (PostgreSQL never resolves it to text there), everything else
+        // is what the expression says.
         Some(N::RowExpr(r)) => {
-            let fields = r
-                .args
-                .iter()
-                .map(|a| const_value(a, params))
-                .collect::<Result<Vec<_>>>()?;
-            Ok(record_value(fields))
+            let mut fields = Vec::with_capacity(r.args.len());
+            let mut types = Vec::with_capacity(r.args.len());
+            for a in &r.args {
+                let v = const_value(a, params)?;
+                let t = match a.node.as_ref() {
+                    Some(N::AConst(c))
+                        if c.isnull || matches!(c.val, Some(a_const::Val::Sval(_))) =>
+                    {
+                        "unknown".to_string()
+                    }
+                    _ => static_type(a, &v),
+                };
+                fields.push(v);
+                types.push(t);
+            }
+            Ok(typed_record_value(fields, types))
         }
         Some(other) => Err(Error::Unsupported(disc(other))),
         None => Err(Error::Parse("empty constant".into())),

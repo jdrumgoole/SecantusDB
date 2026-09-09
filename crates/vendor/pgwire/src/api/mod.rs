@@ -125,6 +125,23 @@ impl SessionExtensions {
     }
 }
 
+/// SecantusDB patch: a per-session hook that re-encodes the text of an
+/// `ErrorResponse` / `NoticeResponse` field into the client's encoding.
+///
+/// Stored in [`SessionExtensions`] by the handler once the session's
+/// `client_encoding` is known; the server codec consults it when it encodes
+/// those two messages. The closure returns `None` for text that needs no
+/// transcoding (or cannot be represented), in which case the UTF-8 bytes are
+/// sent as they are.
+#[derive(Clone)]
+pub struct BackendMessageTranscoder(pub Arc<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>);
+
+impl std::fmt::Debug for BackendMessageTranscoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BackendMessageTranscoder")
+    }
+}
+
 // TODO: add oauth scope and issuer
 /// Describe a client information holder
 pub trait ClientInfo {

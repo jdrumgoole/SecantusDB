@@ -40,6 +40,8 @@ const SCALAR_NAMES: &[&str] = &[
     "concat",
     "concat_ws",
     "md5",
+    "quote_ident",
+    "format",
     "chr",
     "ascii",
     "split_part",
@@ -75,7 +77,9 @@ fn text(v: &Bson) -> String {
         Bson::Int64(i) => i.to_string(),
         Bson::Double(d) => d.to_string(),
         Bson::Decimal128(d) => crate::plain_numeric_text(&d.to_string()),
-        Bson::Boolean(b) => (if *b { "true" } else { "false" }).to_string(),
+        // A boolean's text form is `t` / `f`: `concat(true)` is `t`
+        // (measured), never `true`.
+        Bson::Boolean(b) => (if *b { "t" } else { "f" }).to_string(),
         other => format!("{other:?}"),
     }
 }
@@ -139,8 +143,10 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
     // answer is NULL, not an error. Four are not, and all four IGNORE a NULL
     // argument instead: `concat` and `concat_ws` skip them, and `greatest` /
     // `least` pick the extreme of what remains, so `greatest(1, NULL)` is 1.
-    if !matches!(name, "concat" | "concat_ws" | "greatest" | "least")
-        && args.iter().any(|a| a == &Bson::Null)
+    if !matches!(
+        name,
+        "concat" | "concat_ws" | "greatest" | "least" | "format"
+    ) && args.iter().any(|a| a == &Bson::Null)
     {
         return Ok(Bson::Null);
     }
@@ -326,6 +332,21 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         "md5" => {
             need(1)?;
             Ok(Bson::String(md5_hex(s(0).as_bytes())))
+        }
+        "quote_ident" => {
+            need(1)?;
+            Ok(Bson::String(quote_identifier(&s(0))))
+        }
+        "format" => {
+            if args.is_empty() {
+                return Err(wrong_args(name));
+            }
+            // A NULL format string is a NULL answer; NULL ARGUMENTS are
+            // formatted (`%s` as empty, `%L` as the bare word NULL).
+            if arg(0) == Bson::Null {
+                return Ok(Bson::Null);
+            }
+            pg_format(&s(0), &args[1..]).map(Bson::String)
         }
         "chr" => {
             need(1)?;
@@ -629,6 +650,151 @@ fn float_math(name: &str, args: &[Bson]) -> Result<Bson> {
 }
 
 /// MD5, for `md5()`. Small enough to carry rather than take a dependency for.
+/// PostgreSQL's `format()`: `%s` (text, NULL empty), `%I` (`quote_ident`,
+/// NULL is an error), `%L` (`quote_literal`, NULL is the word `NULL`), `%%`,
+/// each optionally positional (`%2$s`). Measured on 16: too few arguments is
+/// `22023 too few arguments for format()`, an unknown specifier is
+/// `22023 unrecognized format() type specifier "x"`, and `%I` of NULL is
+/// `22004 null values cannot be formatted as an SQL identifier`.
+fn pg_format(fmt: &str, args: &[Bson]) -> Result<String> {
+    let mut out = String::new();
+    let mut chars = fmt.chars().peekable();
+    let mut next_arg = 0usize;
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        let Some(&after) = chars.peek() else {
+            return Err(Error::InvalidParameter(
+                "unterminated format() type specifier".into(),
+            ));
+        };
+        if after == '%' {
+            chars.next();
+            out.push('%');
+            continue;
+        }
+        // An optional `n$` position.
+        let mut digits = String::new();
+        while let Some(&d) = chars.peek() {
+            if d.is_ascii_digit() {
+                digits.push(d);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        let index = if !digits.is_empty() && chars.peek() == Some(&'$') {
+            chars.next();
+            let n: usize = digits.parse().map_err(|_| {
+                Error::InvalidParameter(
+                    "format specifies argument 0, but arguments are numbered from 1".into(),
+                )
+            })?;
+            if n == 0 {
+                return Err(Error::InvalidParameter(
+                    "format specifies argument 0, but arguments are numbered from 1".into(),
+                ));
+            }
+            n - 1
+        } else {
+            if !digits.is_empty() {
+                // A width, which this server does not lay out.
+                return Err(Error::Unsupported("a format() field width".into()));
+            }
+            let i = next_arg;
+            next_arg += 1;
+            i
+        };
+        let Some(spec) = chars.next() else {
+            return Err(Error::InvalidParameter(
+                "unterminated format() type specifier".into(),
+            ));
+        };
+        let value = args
+            .get(index)
+            .ok_or_else(|| Error::InvalidParameter("too few arguments for format()".into()))?;
+        match spec {
+            's' => {
+                if *value != Bson::Null {
+                    out.push_str(&text(value));
+                }
+            }
+            'I' => {
+                if *value == Bson::Null {
+                    return Err(Error::NullValueNotAllowed(
+                        "null values cannot be formatted as an SQL identifier".into(),
+                    ));
+                }
+                out.push_str(&quote_identifier(&text(value)));
+            }
+            'L' => {
+                if *value == Bson::Null {
+                    out.push_str("NULL");
+                } else {
+                    out.push_str(&quote_literal(&text(value)));
+                }
+            }
+            other => {
+                return Err(Error::InvalidParameter(format!(
+                    "unrecognized format() type specifier \"{other}\""
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// PostgreSQL's `quote_literal`: single quotes doubled, and a backslash
+/// forces the `E'...'` form with the backslashes doubled too.
+fn quote_literal(text: &str) -> String {
+    let body = text.replace('\'', "''");
+    if body.contains('\\') {
+        format!("E'{}'", body.replace('\\', "\\\\"))
+    } else {
+        format!("'{body}'")
+    }
+}
+
+/// PostgreSQL's `quote_identifier`: an identifier is left bare only when it
+/// is all lower-case letters, digits and underscores, does not start with a
+/// digit, AND is not a keyword of any category above UNRESERVED. Measured on
+/// 16: `select`, `user`, `between`, `cross` and `order` are quoted, while
+/// `int4`, `abort` and `zone` (unreserved) are not. Embedded double quotes
+/// are doubled.
+pub fn quote_identifier(ident: &str) -> String {
+    let plain = !ident.is_empty()
+        && ident
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        && !ident.chars().next().is_some_and(|c| c.is_ascii_digit());
+    let safe = plain && !is_reserved_word(ident);
+    if safe {
+        ident.to_string()
+    } else {
+        format!("\"{}\"", ident.replace('"', "\"\""))
+    }
+}
+
+/// Whether a plain lower-case word is a keyword PostgreSQL would quote: any
+/// keyword category except UNRESERVED. The scanner classifies a lone word.
+fn is_reserved_word(word: &str) -> bool {
+    use pg_query::protobuf::KeywordKind;
+    let Ok(scanned) = pg_query::scan(word) else {
+        return false;
+    };
+    let [tok] = scanned.tokens.as_slice() else {
+        return false;
+    };
+    matches!(
+        KeywordKind::try_from(tok.keyword_kind),
+        Ok(KeywordKind::ColNameKeyword
+            | KeywordKind::TypeFuncNameKeyword
+            | KeywordKind::ReservedKeyword)
+    )
+}
+
 fn md5_hex(data: &[u8]) -> String {
     const S: [u32; 64] = [
         7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
