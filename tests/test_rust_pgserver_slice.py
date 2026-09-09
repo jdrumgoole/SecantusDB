@@ -17,6 +17,7 @@ import contextlib
 import datetime as dt
 import decimal as dc
 import ipaddress
+import re
 import shutil
 import socket
 import subprocess
@@ -5301,8 +5302,13 @@ def test_literal_column_defaults(home: Path) -> None:
         with pytest.raises(psycopg.errors.InvalidTextRepresentation) as ei:
             cur.execute("create table fp_e (id int, n int default 'a')")
         assert str(ei.value).startswith('invalid input syntax for type integer: "a"')
+        # PostgreSQL accepts a volatile DEFAULT and stamps each INSERT; this
+        # server stores a DEFAULT as one evaluated value, so `now()` would be
+        # frozen at CREATE time. Refused rather than silently wrong.
         with pytest.raises(psycopg.errors.FeatureNotSupported):
             cur.execute("create table fp_e (id int, n text default now())")
+        with pytest.raises(psycopg.errors.FeatureNotSupported):
+            cur.execute("create table fp_e (id int, n timestamptz default current_timestamp)")
     # The default survives a restart: it is in the catalog, not the session.
     with _Server(home) as server, server.connect() as conn:
         cur = conn.cursor()
@@ -7966,3 +7972,412 @@ def test_drop_function_resolves_signature_types_and_dependents(home: Path) -> No
         notices.clear()
         cur.execute('drop function if exists invout("a-b")')
         assert notices == [("NOTICE", "00000", 'type "a-b" does not exist, skipping', None)]
+
+
+def test_listen_notify_delivers_to_every_listener_at_commit(home: Path) -> None:
+    """LISTEN / NOTIFY / `pg_notify()` / UNLISTEN / `pg_listening_channels()`.
+
+    Every shape here was measured on PostgreSQL 16 over the raw wire: a
+    NOTIFY outside a block reaches the listeners -- the sender included --
+    as a `NotificationResponse` BEFORE the statement's `ReadyForQuery`; inside
+    a block the NOTIFYs queue, duplicates of one `(channel, payload)` collapse
+    to the first, and they go out after the COMMIT's tag (or nowhere on
+    ROLLBACK); an idle listener hears without asking, a listener idle in its
+    own block hears at its COMMIT; an unquoted channel folds to lower case;
+    `pg_notify` refuses an empty or NULL channel with 22023 and takes a NULL
+    payload as the empty string; a payload of 8000 bytes is 22023 too.
+    """
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        a_pid, b_pid = a.info.backend_pid, b.info.backend_pid
+        a.execute("listen foo")
+        assert a.execute("select pg_listening_channels()").fetchall() == [("foo",)]
+
+        # The sender hears its own NOTIFY, before the statement returns.
+        a.execute("notify FOO, 'self'")
+        assert [(n.pid, n.channel, n.payload) for n in a.notifies(timeout=0, stop_after=1)] == [
+            (a_pid, "foo", "self")
+        ]
+
+        # An idle listener hears a NOTIFY from another session unprompted.
+        b.execute("notify foo, 'idle'")
+        assert [(n.pid, n.channel, n.payload) for n in a.notifies(timeout=2, stop_after=1)] == [
+            (b_pid, "foo", "idle")
+        ]
+
+        # Queued in a block, deduplicated, delivered at COMMIT; not on ROLLBACK.
+        with b.transaction():
+            b.execute("notify foo, 'a'")
+            b.execute("select pg_notify('foo', 'b')")
+            b.execute("notify foo, 'a'")
+            assert list(a.notifies(timeout=0.2)) == []
+        assert [n.payload for n in a.notifies(timeout=2, stop_after=2)] == ["a", "b"]
+        with contextlib.suppress(ZeroDivisionError), b.transaction():
+            b.execute("notify foo, 'lost'")
+            raise ZeroDivisionError
+        assert list(a.notifies(timeout=0.2)) == []
+
+        # A listener idle in its own block hears nothing until it commits.
+        with a.transaction():
+            b.execute("notify foo, 'held'")
+            assert list(a.notifies(timeout=0.2)) == []
+        assert [n.payload for n in a.notifies(timeout=2, stop_after=1)] == ["held"]
+
+        # NULL payload is the empty string; empty / NULL channel is 22023.
+        b.execute("select pg_notify('foo', NULL)")
+        assert [n.payload for n in a.notifies(timeout=2, stop_after=1)] == [""]
+        for sql in ["select pg_notify('', 'x')", "select pg_notify(NULL, 'x')"]:
+            with pytest.raises(psycopg.errors.InvalidParameterValue) as info:
+                b.execute(sql)
+            assert info.value.diag.message_primary == "channel name cannot be empty"
+        with pytest.raises(psycopg.errors.InvalidParameterValue) as info:
+            b.execute("select pg_notify('foo', %s)", ("x" * 8000,))
+        assert info.value.diag.message_primary == "payload string too long"
+        b.execute("select pg_notify('foo', %s)", ("x" * 7999,))
+        assert [len(n.payload) for n in a.notifies(timeout=2, stop_after=1)] == [7999]
+
+        # UNLISTEN one, then all; LISTEN in a rolled-back block never lands.
+        a.execute("listen bar")
+        assert a.execute("select pg_listening_channels()").fetchall() == [("foo",), ("bar",)]
+        a.execute("unlisten foo")
+        b.execute("notify foo, 'gone'")
+        b.execute("notify bar, 'still'")
+        assert [(n.channel, n.payload) for n in a.notifies(timeout=2, stop_after=1)] == [
+            ("bar", "still")
+        ]
+        a.execute("unlisten *")
+        assert a.execute("select pg_listening_channels()").fetchall() == []
+        with contextlib.suppress(ZeroDivisionError), a.transaction():
+            a.execute("listen foo")
+            raise ZeroDivisionError
+        assert a.execute("select pg_listening_channels()").fetchall() == []
+        b.execute("notify foo, 'nobody'")
+        assert list(a.notifies(timeout=0.2)) == []
+
+
+def test_pg_cancel_and_terminate_backend_signal_a_running_statement(home: Path) -> None:
+    """`pg_cancel_backend(pid)` interrupts the victim's statement with
+    `57014` and leaves the session usable; `pg_terminate_backend(pid)`
+    ends it with FATAL `57P01` and closes the socket -- both within a few
+    milliseconds of the signal, even while the victim is inside
+    `pg_sleep`, and also while the victim is idle (a terminated idle
+    session fails on its next statement). Both answer `true` for a known
+    pid, `false` plus a `01000` WARNING for an unknown one, and NULL for
+    NULL. PostgreSQL 16.
+    """
+    import threading
+
+    from psycopg.pq import TransactionStatus
+
+    with _Server(home) as server, server.connect() as conn, server.connect() as other:
+        pid = conn.info.backend_pid
+
+        def signal(fn: str, delay: float) -> None:
+            time.sleep(delay)
+            assert other.execute(f"select {fn}(%s)", (pid,)).fetchone() == (True,)
+
+        t = threading.Thread(target=signal, args=("pg_cancel_backend", 0.2))
+        t0 = time.monotonic()
+        t.start()
+        with pytest.raises(psycopg.errors.QueryCanceled) as info:
+            conn.execute("select pg_sleep(5)")
+        t.join()
+        assert time.monotonic() - t0 < 1.0
+        assert info.value.sqlstate == "57014"
+        assert conn.info.transaction_status == TransactionStatus.IDLE
+        assert conn.execute("select 1").fetchone() == (1,)
+
+        # An idle cancel is a no-op the next statement does not see.
+        assert other.execute("select pg_cancel_backend(%s)", (pid,)).fetchone() == (True,)
+        time.sleep(0.05)
+        assert conn.execute("select 2").fetchone() == (2,)
+
+        notices = _notice_diags(other)
+        assert other.execute("select pg_cancel_backend(999999)").fetchone() == (False,)
+        assert other.execute("select pg_terminate_backend(999999)").fetchone() == (False,)
+        assert other.execute("select pg_terminate_backend(NULL::int)").fetchone() == (None,)
+        assert notices == [
+            ("WARNING", "01000", "PID 999999 is not a PostgreSQL backend process", None),
+            ("WARNING", "01000", "PID 999999 is not a PostgreSQL backend process", None),
+        ]
+
+        t = threading.Thread(target=signal, args=("pg_terminate_backend", 0.2))
+        t0 = time.monotonic()
+        t.start()
+        with pytest.raises(psycopg.errors.AdminShutdown) as info:
+            conn.execute("select pg_sleep(5)")
+        t.join()
+        assert time.monotonic() - t0 < 1.0
+        assert info.value.sqlstate == "57P01"
+        assert info.value.diag.severity == "FATAL"
+        assert conn.closed
+
+        # Terminating an IDLE session: it dies on its next statement.
+        with server.connect() as idle:
+            idle_pid = idle.info.backend_pid
+            assert other.execute("select pg_terminate_backend(%s)", (idle_pid,)).fetchone() == (
+                True,
+            )
+            time.sleep(0.1)
+            with pytest.raises(psycopg.errors.AdminShutdown) as info:
+                idle.execute("select 1")
+            assert info.value.sqlstate == "57P01"
+            assert idle.closed
+            assert other.execute(
+                "select count(*) from pg_stat_activity where pid = %s", (idle_pid,)
+            ).fetchone() == (0,)
+
+
+def test_create_table_as_function_sources_and_expression_aggregates(home: Path) -> None:
+    """The planner shapes psycopg's own suite leans on, measured on PG 16.
+
+    `CREATE TABLE ... AS query` takes the query's columns (renamed by a column
+    list) and answers `SELECT n`, or `CREATE TABLE AS` for `WITH NO DATA` and
+    for an `IF NOT EXISTS` that found the table; a duplicate is 42P07. A
+    function in FROM is the row source (`select 'ok' from pg_sleep(0)` is one
+    row named `?column?`; `select * from pg_listening_channels()` is one row
+    per channel). An aggregate over an expression evaluates it per row.
+    `pg_tables` lists every table with PostgreSQL's eight columns. `now()` is
+    a `timestamptz`.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.execute("create table t1 as select 1 as f1")
+        assert cur.statusmessage == "SELECT 1"
+        cur = conn.execute("create temp table tt (a, b) as select 1, 'x'::text")
+        assert cur.statusmessage == "SELECT 1"
+        cur = conn.execute("select a, b from tt")
+        assert [(d.name, d.type_code) for d in cur.description] == [("a", 23), ("b", 25)]
+        assert cur.fetchall() == [(1, "x")]
+        cur = conn.execute("create table t2 as select f1, f1 * 2 as d from t1 with no data")
+        assert cur.statusmessage == "CREATE TABLE AS"
+        assert conn.execute("select count(*) from t2").fetchone() == (0,)
+        with pytest.raises(psycopg.errors.DuplicateTable) as info:
+            conn.execute("create table t1 as select 2")
+        assert info.value.diag.message_primary == 'relation "t1" already exists'
+        cur = conn.execute("create table if not exists t1 as select 2")
+        assert cur.statusmessage == "CREATE TABLE AS"
+        assert conn.execute("select f1 from t1").fetchall() == [(1,)]
+        cur = conn.execute("create table accessed as (select now() as value)")
+        assert cur.statusmessage == "SELECT 1"
+        cur = conn.execute("select value from accessed")
+        assert cur.description[0].type_code == 1184
+        assert cur.fetchone()[0].tzinfo is not None
+
+        # pg_tables: the psycopg pipeline tests probe it for a table's presence.
+        cur = conn.execute("select * from pg_tables where tablename in ('t1', 'tt') order by 2")
+        assert [d.name for d in cur.description] == [
+            "schemaname",
+            "tablename",
+            "tableowner",
+            "tablespace",
+            "hasindexes",
+            "hasrules",
+            "hastriggers",
+            "rowsecurity",
+        ]
+        assert cur.fetchall() == [
+            ("public", "t1", "test", None, False, False, False, False),
+            ("pg_temp_1", "tt", "test", None, False, False, False, False),
+        ]
+        cur = conn.execute("select count(*) from pg_tables where tablename = 'nope'")
+        assert cur.fetchone() == (0,)
+
+        # A function in FROM.
+        cur = conn.execute("select 'ok' from pg_sleep(0)")
+        assert [(d.name, d.type_code) for d in cur.description] == [("?column?", 25)]
+        assert cur.fetchall() == [("ok",)]
+        assert conn.execute("select * from pg_listening_channels()").fetchall() == []
+        conn.execute("listen a")
+        conn.execute("listen b")
+        cur = conn.execute("select * from pg_listening_channels()")
+        assert cur.description[0].name == "pg_listening_channels"
+        assert cur.fetchall() == [("a",), ("b",)]
+        assert conn.execute("select ch from pg_listening_channels() ch").fetchall() == [
+            ("a",),
+            ("b",),
+        ]
+        with pytest.raises(psycopg.errors.UndefinedColumn):
+            conn.execute("select nope from pg_sleep(0)")
+
+        # Aggregates over expressions.
+        conn.execute("create table copy_in (col1 int primary key, col2 int, data text)")
+        conn.execute("insert into copy_in values (1, 2, 'abc'), (2, 3, 'de')")
+        cur = conn.execute(
+            "select min(col1), max(col1), count(*), max(length(data)), sum(col1 * 2) from copy_in"
+        )
+        assert [d.type_code for d in cur.description] == [23, 23, 20, 23, 20]
+        assert cur.fetchall() == [(1, 2, 2, 3, 6)]
+        assert conn.execute(
+            "select col2 % 2, max(length(data)) from copy_in group by 1 order by 1"
+        ).fetchall() == [(0, 3), (1, 2)]
+
+
+def test_describe_shapes_and_cursor_portals_match_postgres(home: Path) -> None:
+    """The libpq-level Describe shapes psycopg's `tests/pq` checks, on PG 16.
+
+    `Describe` of a statement reports a parameter's type from the CAST over
+    it (`$1::int4, $2::text` is 23 / 25; nothing types it -> 705), and an
+    integer expression over cast parameters types from its operands
+    (`$1::int8 + $2::int8` is int8, not int4). A `begin; declare ...` simple
+    query leaves the session IN a transaction with the cursor open; the
+    cursor is a PORTAL of its name, so `Describe portal` sees its columns and
+    a wire `Close portal` closes it (the next Describe is 34000). The
+    `password_encryption` GUC is `scram-sha-256`, and `ALTER USER` of a role
+    that does not exist is 42704.
+    """
+    from psycopg import pq
+
+    with _Server(home) as server:
+        conn = pq.PGconn.connect(
+            f"host=127.0.0.1 port={server.port} dbname=postgres user=test".encode()
+        )
+        assert conn.status == pq.ConnStatus.OK, conn.error_message
+        try:
+            assert (
+                conn.prepare(b"", b"select $1::int4, $2::text").status == pq.ExecStatus.COMMAND_OK
+            )
+            res = conn.describe_prepared(b"")
+            assert [res.param_type(i) for i in range(res.nparams)] == [23, 25]
+            assert [(res.fname(i), res.ftype(i)) for i in range(res.nfields)] == [
+                (b"int4", 23),
+                (b"text", 25),
+            ]
+            conn.prepare(b"p2", b"select $1::int8 + $2::int8 as fld")
+            res = conn.describe_prepared(b"p2")
+            assert [res.param_type(i) for i in range(res.nparams)] == [20, 20]
+            assert [(res.fname(i), res.ftype(i)) for i in range(res.nfields)] == [(b"fld", 20)]
+            conn.prepare(b"p3", b"select $1")
+            res = conn.describe_prepared(b"p3")
+            assert [res.param_type(i) for i in range(res.nparams)] == [705]
+
+            res = conn.exec_(
+                b"begin; declare cur cursor for select * from generate_series(1,10) foo;"
+            )
+            assert res.status == pq.ExecStatus.COMMAND_OK, res.error_message
+            assert conn.transaction_status == pq.TransactionStatus.INTRANS
+            res = conn.describe_portal(b"cur")
+            assert res.status == pq.ExecStatus.COMMAND_OK, res.error_message
+            assert [(res.fname(i), res.ftype(i)) for i in range(res.nfields)] == [(b"foo", 23)]
+            res = conn.exec_(b"fetch 2 from cur")
+            assert [res.get_value(r, 0) for r in range(res.ntuples)] == [b"1", b"2"]
+            res = conn.close_portal(b"cur")
+            assert res.status == pq.ExecStatus.COMMAND_OK, res.error_message
+            res = conn.describe_portal(b"cur")
+            assert res.status == pq.ExecStatus.FATAL_ERROR
+            assert res.error_field(pq.DiagnosticField.SQLSTATE) == b"34000"
+            assert conn.exec_(b"rollback").status == pq.ExecStatus.COMMAND_OK
+            res = conn.exec_(b"begin; select 1; commit; select 2")
+            assert res.status == pq.ExecStatus.TUPLES_OK
+            assert conn.transaction_status == pq.TransactionStatus.IDLE
+
+            res = conn.exec_(b"show password_encryption")
+            assert (res.ftype(0), res.get_value(0, 0)) == (25, b"scram-sha-256")
+            res = conn.exec_(b"alter user \"ashesh\" password 'x'")
+            assert res.status == pq.ExecStatus.FATAL_ERROR
+            assert res.error_field(pq.DiagnosticField.SQLSTATE) == b"42704"
+            assert (
+                res.error_field(pq.DiagnosticField.MESSAGE_PRIMARY)
+                == b'role "ashesh" does not exist'
+            )
+            res = conn.exec_(b"alter user test password 'x'")
+            assert res.status == pq.ExecStatus.COMMAND_OK, res.error_message
+            assert res.command_status == b"ALTER ROLE"
+        finally:
+            conn.finish()
+
+
+def test_catalog_changes_are_visible_across_connections(home: Path) -> None:
+    """The process-wide catalog cache never serves a stale or an uncommitted row.
+
+    Every step's expectation was measured on PostgreSQL 16 (2026-09-09): a
+    table created on one connection is found by another that had already
+    looked it up as missing; a block's uncommitted CREATE TYPE is its own
+    business until COMMIT; a DROP rolled back leaves the table for everyone;
+    a CREATE rolled back to a savepoint leaves nothing, on either connection.
+    """
+
+    def outcome(conn: psycopg.Connection, sql: str) -> object:
+        try:
+            return conn.execute(sql).fetchall()
+        except psycopg.Error as e:
+            if not conn.autocommit:
+                conn.rollback()
+            return e.sqlstate
+
+    with _Server(home) as server:
+        a = server.connect()
+        b = server.connect()
+        try:
+            # 1. A negative lookup on b must not outlive a's CREATE TABLE.
+            assert outcome(b, "select * from cc_t") == "42P01"
+            a.execute("create table cc_t (id int)")
+            assert outcome(b, "select * from cc_t") == []
+            a.execute("insert into cc_t values (1)")
+            assert outcome(b, "select * from cc_t") == [(1,)]
+
+            # 2. An uncommitted CREATE TYPE is visible to its block only.
+            a.autocommit = False
+            a.execute("create type cc_mood as enum ('sad', 'ok')")
+            assert outcome(a, "select 'ok'::cc_mood") == [("ok",)]
+            assert isinstance(outcome(b, "select 'ok'::cc_mood"), str)
+            a.commit()
+            assert outcome(b, "select 'ok'::cc_mood") == [("ok",)]
+
+            # 3. A DROP rolled back leaves the table, on both connections.
+            a.execute("drop table cc_t")
+            assert outcome(a, "select * from cc_t") == "42P01"
+            a.rollback()
+            assert outcome(b, "select * from cc_t") == [(1,)]
+            assert outcome(a, "select * from cc_t") == [(1,)]
+            a.rollback()
+
+            # 4. A CREATE rolled back to a savepoint leaves nothing.
+            a.execute("savepoint sp")
+            a.execute("create table cc_s (id int)")
+            assert outcome(a, "select * from cc_s") == []
+            a.execute("rollback to savepoint sp")
+            assert outcome(a, "select * from cc_s") == "42P01"
+            a.commit()
+            assert outcome(b, "select * from cc_s") == "42P01"
+
+            # 5. b's autocommit CREATE is found by a once a's block ends.
+            b.execute("create table cc_s (id int, v text)")
+            a.commit()
+            assert outcome(a, "select * from cc_s") == []
+
+            # 6. A composite REDEFINED on a is resolved in its new shape by
+            # b's very next statement. The planner's type tables are
+            # published per thread and skipped while the catalog version
+            # stands still, so this is the case that would serve the old
+            # shape if a redefinition ever failed to move the version.
+            a.commit()
+            a.autocommit = True
+            a.execute("create type cc_pt as (a int)")
+            assert outcome(b, "select '(1)'::cc_pt") == [("(1)",)]
+            a.execute("drop type cc_pt")
+            a.execute("create type cc_pt as (a int, b text)")
+            assert outcome(b, "select '(1,x)'::cc_pt") == [("(1,x)",)]
+            assert outcome(b, "select '(1)'::cc_pt") == "22P02"
+        finally:
+            a.close()
+            b.close()
+
+
+def test_now_casts_to_text_in_session_zone(home: Path) -> None:
+    """`now()::text` carries the session-zone offset, like PostgreSQL 16.
+
+    A timestamptz instant is stored exactly like a naive timestamp, so the cast
+    has to learn the source type from the expression; before that it rendered
+    `2026-09-09 20:58:09.043676` where PostgreSQL renders `...+00` under UTC.
+    `current_timestamp` inside an expression is the same value.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("set timezone to 'UTC'")
+        cur.execute("select now()::text, current_timestamp::text, pg_typeof(now())::text")
+        now_text, ts_text, typ = cur.fetchone()
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d{1,6})?\+00", now_text)
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d{1,6})?\+00", ts_text)
+        assert typ == "timestamp with time zone"
+        cur.execute("set timezone to 'Europe/Dublin'")
+        cur.execute("select now()::text")
+        assert re.search(r"\+0[01]$", cur.fetchone()[0])

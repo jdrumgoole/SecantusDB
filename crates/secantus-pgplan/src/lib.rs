@@ -326,6 +326,10 @@ pub enum Statement {
     },
     /// `SHOW name` -- one row, one text column named canonically.
     Show(String),
+    /// `ALTER ROLE / USER name ...` -- the role it names. This server has
+    /// exactly one role (the session user), so the executor answers 42704
+    /// `role "x" does not exist` for any other name, as PostgreSQL 16 does.
+    AlterRole(String),
     /// `SET name = value`.
     Set {
         name: String,
@@ -381,9 +385,16 @@ pub enum Statement {
     /// `DEALLOCATE <name>`: the wire layer drops that one prepared statement,
     /// answering 26000 when no statement of the name exists.
     Deallocate(String),
-    /// `NOTIFY channel [, payload]`, completing with the `NOTIFY` tag. No
-    /// LISTEN exists here, so there is no delivery.
-    Notify,
+    /// `NOTIFY channel [, payload]`: queued for the transaction, delivered
+    /// to every backend LISTENing on the channel when it commits.
+    Notify {
+        channel: String,
+        payload: String,
+    },
+    /// `LISTEN channel`: takes effect at commit, like the NOTIFY it pairs with.
+    Listen(String),
+    /// `UNLISTEN channel` (`Some`) or `UNLISTEN *` (`None`).
+    Unlisten(Option<String>),
     /// `DO [LANGUAGE lang] 'body'`: an inline code block. The planner only
     /// carries the body and the language (default `plpgsql`); the wire layer
     /// interprets the small RAISE / EXECUTE subset it supports.
@@ -398,6 +409,22 @@ pub enum Statement {
     Aggregate(Aggregate),
     Update(Update),
     Delete(Delete),
+    /// `CREATE [TEMP] TABLE name [(cols)] AS query [WITH [NO] DATA]`.
+    ///
+    /// The table's columns are the query's output columns -- names and
+    /// types as the query DESCRIBES them -- so they are settled by the
+    /// executor, which is the only place the query's description exists.
+    /// `column_names` is the optional explicit list that renames them.
+    CreateTableAs {
+        table: String,
+        if_not_exists: bool,
+        temp: bool,
+        column_names: Vec<String>,
+        query: Box<Statement>,
+        /// `WITH NO DATA` creates the table empty and tags `CREATE TABLE AS`;
+        /// the default fills it and tags `SELECT n`.
+        with_data: bool,
+    },
 }
 
 /// Which way a `FETCH` or `MOVE` runs, and from where.
@@ -550,6 +577,10 @@ pub struct AggItem {
     /// The declared PostgreSQL type of the source column, for `min`/`max`
     /// which return the input type. `count` and `sum` are always int8.
     pub source_type: Option<String>,
+    /// An aggregate over an EXPRESSION -- `max(length(data))`,
+    /// `sum(n * 2)` -- evaluated per row into `field` (a hidden `__aggN`
+    /// slot) before the group is computed. `None` for a bare column.
+    pub expr: Option<ColumnExpr>,
 }
 
 /// One output column of an aggregate query, by POSITION.
@@ -841,6 +872,9 @@ pub enum ConstCol {
     /// pg_terminate_backend(pg_backend_pid())`), all of which the server
     /// resolves at execution.
     TerminateBackend(Box<ConstCol>),
+    /// `pg_cancel_backend(pid)` -- cancel that backend's running statement.
+    /// Same argument shapes as `TerminateBackend`.
+    CancelBackend(Box<ConstCol>),
     /// `current_user` / `session_user` / `user` / `current_role` -- the role
     /// the client connected as, which only the server's session knows.
     SessionUser,
@@ -851,6 +885,21 @@ pub enum ConstCol {
     /// NULL). The sleep happens at execution, on the connection's own thread,
     /// so it costs the caller exactly the wait PostgreSQL would.
     Sleep(Bson),
+    /// `pg_notify(channel, payload)` -- a NOTIFY as a function, queued for
+    /// the transaction like the statement. Either argument may be NULL; the
+    /// server applies PostgreSQL's rules (an empty channel is 22023, a NULL
+    /// payload is the empty string).
+    PgNotify {
+        channel: Bson,
+        payload: Bson,
+    },
+    /// `pg_listening_channels()` -- one row per channel this session
+    /// LISTENs on, which only the server's session knows.
+    ListeningChannels,
+    /// The output column of a `FROM function(...)` source -- `select * from
+    /// pg_sleep(1)`, `select x from pg_listening_channels() x` -- read from
+    /// `SelectConstant::source`'s row rather than resolved on its own.
+    FromColumn,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -885,6 +934,11 @@ pub struct SelectConstant {
     /// where false` is ZERO rows in PostgreSQL; before this was carried, the
     /// predicate was ignored and the row answered anyway.
     pub where_true: bool,
+    /// `FROM function(...)`: the function stands in for a table. It is
+    /// evaluated once per statement (so `select 'ok' from pg_sleep(0.5)`
+    /// still waits), a set-returning one yields one row per result, and
+    /// every `ConstCol::FromColumn` in `columns` reads that row's value.
+    pub source: Option<Box<ConstCol>>,
 }
 
 /// The three wire formats a COPY can use. They are not interchangeable: text
@@ -1126,19 +1180,46 @@ pub fn split_statements(sql: &str) -> Result<Vec<String>> {
         .collect())
 }
 
+/// The parse tree of `sql`, from a process-wide memo. One statement is
+/// parsed several times on its way through the server -- at Describe, at
+/// Execute, and once more each for parameter typing -- and `pg_query` parses
+/// through C and a protobuf round trip, which was the largest single cost of
+/// an `executemany` once the catalog stopped being re-read (2026-09-09). The
+/// text is the whole input to the parser, so the tree is a pure function of
+/// it. Bounded by wholesale clearing: statement text in a loop repeats, and
+/// a rebuilt memo costs one parse per distinct text.
+fn parse_tree(sql: &str) -> Result<std::sync::Arc<pg_query::protobuf::ParseResult>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    const MAX_ENTRIES: usize = 4096;
+    static MEMO: OnceLock<Mutex<HashMap<String, Arc<pg_query::protobuf::ParseResult>>>> =
+        OnceLock::new();
+    let memo = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(tree) = memo.lock().unwrap_or_else(|e| e.into_inner()).get(sql) {
+        return Ok(Arc::clone(tree));
+    }
+    let tree = Arc::new(pg_query::parse(sql).map_err(parse_error)?.protobuf);
+    let mut guard = memo.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.len() >= MAX_ENTRIES {
+        guard.clear();
+    }
+    guard.insert(sql.to_string(), Arc::clone(&tree));
+    Ok(tree)
+}
+
 fn parse_one(sql: &str) -> Result<N> {
-    let parsed = pg_query::parse(sql).map_err(parse_error)?;
-    let mut stmts = parsed.protobuf.stmts;
+    let parsed = parse_tree(sql)?;
+    let stmts = &parsed.stmts;
     if stmts.len() > 1 {
         return Err(Error::MultipleCommands);
     }
     if stmts.is_empty() {
         return Err(Error::Parse("empty statement".into()));
     }
-    stmts
-        .remove(0)
+    stmts[0]
         .stmt
-        .and_then(|s| s.node)
+        .as_ref()
+        .and_then(|s| s.node.clone())
         .ok_or_else(|| Error::Parse("empty statement".into()))
 }
 
@@ -1161,6 +1242,7 @@ pub fn plan_with_params(
 ) -> Result<Statement> {
     match parse_one(sql)? {
         N::CreateStmt(c) => plan_create(&c),
+        N::CreateTableAsStmt(c) => plan_create_table_as(&c, lookup, params),
         N::InsertStmt(i) => plan_insert(&i, lookup, params),
         N::SelectStmt(s) => plan_select(&s, lookup, params),
         N::DropStmt(d) => plan_drop(&d),
@@ -1259,6 +1341,12 @@ pub fn plan_with_params(
         N::CreateFunctionStmt(f) => plan_create_function(&f),
         N::CopyStmt(c) => plan_copy(&c, lookup, params),
         N::VariableShowStmt(v) => Ok(Statement::Show(v.name.clone())),
+        N::AlterRoleStmt(a) => Ok(Statement::AlterRole(
+            a.role
+                .as_ref()
+                .map(|r| r.rolename.clone())
+                .unwrap_or_default(),
+        )),
         N::DeclareCursorStmt(d) => {
             let inner_node = d.query.as_ref().and_then(|q| q.node.as_ref());
             let inner = match inner_node {
@@ -1307,11 +1395,19 @@ pub fn plan_with_params(
         // `DEALLOCATE ALL` carries no name; `DEALLOCATE x` names one.
         N::DeallocateStmt(d) if d.name.is_empty() => Ok(Statement::DeallocateAll),
         N::DeallocateStmt(d) => Ok(Statement::Deallocate(d.name.clone())),
-        // `NOTIFY channel [, payload]`: nothing LISTENs on this server, so
-        // there is nobody to deliver to, and PostgreSQL's answer to a NOTIFY
-        // with no listener is the bare `NOTIFY` tag -- which is all a client
-        // preparing the statement (psycopg's `test_misc_statement`) sees.
-        N::NotifyStmt(_) => Ok(Statement::Notify),
+        // LISTEN / UNLISTEN / NOTIFY: the parser has already folded the
+        // channel to lower case unless it was quoted, and `UNLISTEN *` comes
+        // through as the literal name `*`.
+        N::NotifyStmt(n) => Ok(Statement::Notify {
+            channel: n.conditionname.clone(),
+            payload: n.payload.clone(),
+        }),
+        N::ListenStmt(l) => Ok(Statement::Listen(l.conditionname.clone())),
+        // `UNLISTEN *` carries no name at all in the parse tree.
+        N::UnlistenStmt(u) if u.conditionname.is_empty() || u.conditionname == "*" => {
+            Ok(Statement::Unlisten(None))
+        }
+        N::UnlistenStmt(u) => Ok(Statement::Unlisten(Some(u.conditionname.clone()))),
         N::DoStmt(d) => {
             let mut language = "plpgsql".to_string();
             let mut body = None;
@@ -1639,6 +1735,41 @@ fn type_name(names: &[pg_query::protobuf::Node]) -> String {
     }
 }
 
+/// `CREATE TABLE ... AS <query>`. Only a table target: a materialized view
+/// (`objtype` OBJECT_MATVIEW) is a refreshable relation this server has no
+/// catalog for, and `SELECT ... INTO` is the same statement in older clothes.
+fn plan_create_table_as(
+    c: &pg_query::protobuf::CreateTableAsStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Result<Statement> {
+    use pg_query::protobuf::ObjectType;
+    if c.objtype != ObjectType::ObjectTable as i32 {
+        return Err(Error::Unsupported("CREATE MATERIALIZED VIEW".into()));
+    }
+    let into = c
+        .into
+        .as_ref()
+        .ok_or_else(|| Error::Parse("CREATE TABLE AS without a target".into()))?;
+    let rel = into
+        .rel
+        .as_ref()
+        .ok_or_else(|| Error::Parse("CREATE TABLE AS without a relation".into()))?;
+    let query = match c.query.as_ref().and_then(|q| q.node.as_ref()) {
+        Some(N::SelectStmt(sel)) => plan_select(sel, lookup, params)?,
+        Some(other) => return Err(Error::Unsupported(disc(other))),
+        None => return Err(Error::Parse("CREATE TABLE AS without a query".into())),
+    };
+    Ok(Statement::CreateTableAs {
+        table: rel.relname.clone(),
+        if_not_exists: c.if_not_exists,
+        temp: rel.relpersistence == "t",
+        column_names: string_list(&into.col_names),
+        query: Box::new(query),
+        with_data: !into.skip_data,
+    })
+}
+
 fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
     use pg_query::protobuf::ConstrType as CT;
     let relation = c
@@ -1696,6 +1827,18 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                             let Some(raw) = k.raw_expr.as_ref() else {
                                 continue;
                             };
+                            // A DEFAULT is evaluated ONCE here and stored as a
+                            // value, so a volatile function -- `now()` -- would
+                            // be frozen at CREATE time and every later row
+                            // would carry the table's creation instant where
+                            // PostgreSQL stamps each INSERT. Refuse it rather
+                            // than store the wrong value silently.
+                            if default_is_volatile(raw) {
+                                return Err(Error::Unsupported(format!(
+                                    "a non-literal DEFAULT on column \"{}\"",
+                                    cd.colname
+                                )));
+                            }
                             let value = match const_value(raw, &[]) {
                                 Ok(v) => v,
                                 Err(Error::Unsupported(_)) => {
@@ -3016,6 +3159,11 @@ fn plan_select(
         let join = plan_join_select(s, lookup, params)?;
         return plan_join_plain_select(s, join, lookup, params);
     }
+    // Any other function in FROM -- `pg_sleep`, `pg_listening_channels` --
+    // is a FROM-less select with the function as its row source.
+    if let Some(N::RangeFunction(rf)) = s.from_clause[0].node.as_ref() {
+        return plan_function_source_select(s, rf, params);
+    }
     let table = match s.from_clause[0].node.as_ref() {
         Some(N::RangeVar(r)) => r.relname.clone(),
         Some(other) => return Err(Error::Unsupported(disc(other))),
@@ -3203,6 +3351,7 @@ fn plan_aggregate(
                 out,
                 // `min`/`max` return the input type, which here is always int4.
                 source_type: Some("int4".to_string()),
+                expr: None,
             });
         }
         // The WHERE clause was silently dropped here before: `count(*)
@@ -3817,7 +3966,29 @@ fn finish_aggregate(
                                 _ => None,
                             })
                             .ok_or_else(|| Error::Unsupported("this aggregate argument".into()))?,
-                        _ => {
+                        Some(_) => {
+                            let expr = row_column_expr(&f.args[0], &fields, params, &sample)?;
+                            let pg_type = match &expr {
+                                ColumnExpr::Row { result_type, .. } => result_type.clone(),
+                                _ => "text".to_string(),
+                            };
+                            let slot = format!("__agg{}", items.len());
+                            let out = if rt.name.is_empty() {
+                                name.clone()
+                            } else {
+                                rt.name.clone()
+                            };
+                            select.push((out.clone(), OutputCol::Agg(items.len())));
+                            items.push(AggItem {
+                                func,
+                                field: Some(slot),
+                                out,
+                                source_type: Some(pg_type),
+                                expr: Some(expr),
+                            });
+                            continue;
+                        }
+                        None => {
                             return Err(Error::Unsupported(
                                 "an aggregate over an expression".into(),
                             ))
@@ -3839,6 +4010,7 @@ fn finish_aggregate(
                     field,
                     out,
                     source_type,
+                    expr: None,
                 });
             }
             Some(N::ColumnRef(c)) => {
@@ -4056,6 +4228,21 @@ fn session_function(name: &str) -> Option<Bson> {
 /// `SELECT $1 + 1` evaluates to NULL at describe time. Typing that column from
 /// the value would call it `text`; the operator says `int4`. This is the same
 /// trap that made `$1::int` decode as a string.
+/// Whether a DEFAULT expression calls a function whose value changes from row
+/// to row (`now()` and its siblings, `current_timestamp`). The planner stores a
+/// DEFAULT as one evaluated value, which such a function cannot be.
+fn default_is_volatile(node: &pg_query::protobuf::Node) -> bool {
+    match node.node.as_ref() {
+        Some(N::FuncCall(f)) => matches!(
+            func_name(f).as_deref(),
+            Some("now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp")
+        ),
+        Some(N::SqlvalueFunction(_)) => true,
+        Some(N::TypeCast(tc)) => tc.arg.as_deref().is_some_and(default_is_volatile),
+        _ => false,
+    }
+}
+
 fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
     match node.node.as_ref() {
         Some(N::TypeCast(tc)) => tc
@@ -4129,6 +4316,24 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
         },
         Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("to_regtype") => {
             "regtype".to_string()
+        }
+        // `now()` and its siblings are `timestamptz`. The value alone cannot
+        // say so -- a timestamptz INSTANT is stored exactly like a naive
+        // `timestamp` -- so `now()::text` rendered the wall clock with no zone
+        // suffix where PostgreSQL renders `... +00` in the session zone.
+        Some(N::FuncCall(f))
+            if matches!(
+                func_name(f).as_deref(),
+                Some("now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp")
+            ) =>
+        {
+            "timestamptz".to_string()
+        }
+        Some(N::SqlvalueFunction(svf))
+            if pg_query::protobuf::SqlValueFunctionOp::try_from(svf.op)
+                == Ok(pg_query::protobuf::SqlValueFunctionOp::SvfopCurrentTimestamp) =>
+        {
+            "timestamptz".to_string()
         }
         // `int4range(1,5)` is an `int4range`, not the text it renders as.
         Some(N::FuncCall(f)) if range_constructor_type(f).is_some() => {
@@ -4236,6 +4441,13 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
                         if matches!(op, "+" | "-" | "*" | "/") {
                             if let Some(t) = wider_numeric(&lt, &rt) {
                                 if t == "numeric" || t == "float8" || t == "float4" {
+                                    return t;
+                                }
+                                // Integer arithmetic with no value to look at
+                                // (DESCRIBE time) types from the operands too:
+                                // `$1::int8 + $2::int8` is int8 on PostgreSQL 16,
+                                // not the int4 the NULL placeholder implied.
+                                if *value == Bson::Null {
                                     return t;
                                 }
                             }
@@ -4849,8 +5061,11 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                         // as text and the executed `91` went out as `'91'`
                         // under oid 25. The function's declared result type
                         // is what PostgreSQL reports there.
-                        let t = if value == Bson::Null {
-                            scalar::static_result_type(&name).to_string()
+                        // A `timestamptz` value is a bare date on the wire
+                        // and would read as `timestamp` from its shape.
+                        let declared = scalar::static_result_type(&name);
+                        let t = if value == Bson::Null || declared == "timestamptz" {
+                            declared.to_string()
                         } else {
                             inferred_type(&value).to_string()
                         };
@@ -4922,6 +5137,42 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                     ));
                     continue;
                 }
+                // `pg_notify(channel, payload)` and `pg_listening_channels()`
+                // belong to the session, which only the server has.
+                if name == "pg_notify" {
+                    if f.args.len() != 2 {
+                        return Err(Error::Unsupported(format!(
+                            "pg_notify() with {} arguments",
+                            f.args.len()
+                        )));
+                    }
+                    let channel = const_value(&f.args[0], params)?;
+                    let payload = const_value(&f.args[1], params)?;
+                    columns.push((
+                        if rt.name.is_empty() {
+                            "pg_notify".to_string()
+                        } else {
+                            rt.name.clone()
+                        },
+                        ConstCol::PgNotify { channel, payload },
+                        "void".to_string(),
+                        -1,
+                    ));
+                    continue;
+                }
+                if name == "pg_listening_channels" {
+                    columns.push((
+                        if rt.name.is_empty() {
+                            "pg_listening_channels".to_string()
+                        } else {
+                            rt.name.clone()
+                        },
+                        ConstCol::ListeningChannels,
+                        "text".to_string(),
+                        -1,
+                    ));
+                    continue;
+                }
                 // `pg_backend_pid()` and `pg_terminate_backend(pid)` need the
                 // connection's identity, which the stateless planner does not
                 // have -- they become `ConstCol`s the server resolves.
@@ -4938,10 +5189,11 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                     ));
                     continue;
                 }
-                if name == "pg_terminate_backend" {
-                    let arg = f.args.first().ok_or_else(|| {
-                        Error::Unsupported("pg_terminate_backend() without a PID".into())
-                    })?;
+                if name == "pg_terminate_backend" || name == "pg_cancel_backend" {
+                    let arg = f
+                        .args
+                        .first()
+                        .ok_or_else(|| Error::Unsupported(format!("{name}() without a PID")))?;
                     // The PID may itself be `pg_backend_pid()` -- resolve that
                     // nesting into a `BackendPid` the server fills in, so the
                     // idiomatic `pg_terminate_backend(pg_backend_pid())` works.
@@ -4964,11 +5216,15 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                     };
                     columns.push((
                         if rt.name.is_empty() {
-                            "pg_terminate_backend".to_string()
+                            name.clone()
                         } else {
                             rt.name.clone()
                         },
-                        ConstCol::TerminateBackend(Box::new(inner)),
+                        if name == "pg_cancel_backend" {
+                            ConstCol::CancelBackend(Box::new(inner))
+                        } else {
+                            ConstCol::TerminateBackend(Box::new(inner))
+                        },
                         "bool".to_string(),
                         -1,
                     ));
@@ -4983,13 +5239,26 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                     (name, ConstCol::Value(v), t, -1)
                 }
             }
-            // `user`, `current_user`, `current_date` and the other keyword
-            // functions: the role ones resolve on the server, which knows
-            // the session; the date/time ones need `now()`, which this
-            // server does not evaluate yet, so they are refused by name.
+            // `user`, `current_user`, `current_timestamp` and the other
+            // keyword functions: the role ones resolve on the server, which
+            // knows the session; `current_timestamp` is `now()`; the
+            // remaining date/time ones are refused by name.
             Some(N::SqlvalueFunction(svf)) => {
                 use pg_query::protobuf::SqlValueFunctionOp as Op;
                 let op = Op::try_from(svf.op).unwrap_or(Op::SqlvalueFunctionOpUndefined);
+                if op == Op::SvfopCurrentTimestamp {
+                    columns.push((
+                        if rt.name.is_empty() {
+                            "current_timestamp".to_string()
+                        } else {
+                            rt.name.clone()
+                        },
+                        ConstCol::Value(scalar::now_value()),
+                        "timestamptz".to_string(),
+                        -1,
+                    ));
+                    continue;
+                }
                 let (name, col) = match op {
                     Op::SvfopCurrentUser => ("current_user", ConstCol::SessionUser),
                     Op::SvfopUser => ("user", ConstCol::SessionUser),
@@ -5064,6 +5333,161 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
     Ok(Statement::SelectConstant(SelectConstant {
         columns,
         where_true,
+        source: None,
+    }))
+}
+
+/// `SELECT ... FROM function(args) [AS alias[(col)]]` for a function that is
+/// not `generate_series`: `select 'ok' from pg_sleep(0.5)`, `select * from
+/// pg_listening_channels()`. The function is planned as the FROM-less
+/// target it would be on its own, and becomes the statement's SOURCE; the
+/// select list is planned FROM-less too, with every reference to the
+/// function's column (by its alias, the function's name, or `*`) reading the
+/// source row.
+fn plan_function_source_select(
+    s: &pg_query::protobuf::SelectStmt,
+    rf: &pg_query::protobuf::RangeFunction,
+    params: &[Bson],
+) -> Result<Statement> {
+    let call = rf
+        .functions
+        .iter()
+        .flat_map(|f| match f.node.as_ref() {
+            Some(N::List(l)) => l.items.clone(),
+            _ => vec![f.clone()],
+        })
+        .find(|n| matches!(n.node.as_ref(), Some(N::FuncCall(_))))
+        .ok_or_else(|| Error::Unsupported("this FROM function".into()))?;
+    let Some(N::FuncCall(func)) = call.node.as_ref() else {
+        unreachable!("filtered to FuncCall");
+    };
+    let func_name = func_name(func).unwrap_or_default();
+    // The table alias and the column name: `AS g(x)` names both, `AS g`
+    // names the table AND the column (a single-column function's column
+    // takes the alias), no alias leaves the function's own name.
+    let (table_alias, column) = match rf.alias.as_ref() {
+        Some(a) => {
+            let col = a
+                .colnames
+                .iter()
+                .find_map(|c| match c.node.as_ref() {
+                    Some(N::String(st)) => Some(st.sval.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| a.aliasname.clone());
+            (a.aliasname.clone(), col)
+        }
+        None => (func_name.clone(), func_name.clone()),
+    };
+    // Plan the function as a FROM-less target to learn its column and type.
+    let source_target = pg_query::protobuf::Node {
+        node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+            name: column.clone(),
+            indirection: Vec::new(),
+            val: Some(Box::new(call.clone())),
+            location: 0,
+        }))),
+    };
+    let planned = plan_select_constant(
+        &pg_query::protobuf::SelectStmt {
+            target_list: vec![source_target],
+            ..Default::default()
+        },
+        params,
+    )?;
+    let Statement::SelectConstant(source) = planned else {
+        return Err(Error::Unsupported("this FROM function".into()));
+    };
+    let (_, source_col, source_type, source_typmod) = source
+        .columns
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::Unsupported("this FROM function".into()))?;
+    // Which targets read the function's column: `*`, `col`, `alias.col`,
+    // `alias.*`. The rest are planned FROM-less as they stand.
+    let refers = |c: &pg_query::protobuf::ColumnRef| -> Option<bool> {
+        let parts: Vec<&pg_query::protobuf::Node> = c.fields.iter().collect();
+        let name = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
+            Some(N::String(st)) => Some(st.sval.clone()),
+            _ => None,
+        };
+        match parts.as_slice() {
+            [one] if matches!(one.node.as_ref(), Some(N::AStar(_))) => Some(true),
+            [one] => Some(name(one)? == column),
+            [t, c] => {
+                let t = name(t)?;
+                if t != table_alias {
+                    return None;
+                }
+                if matches!(c.node.as_ref(), Some(N::AStar(_))) {
+                    return Some(true);
+                }
+                Some(name(c)? == column)
+            }
+            _ => None,
+        }
+    };
+    let mut others: Vec<pg_query::protobuf::Node> = Vec::new();
+    // Per original target: `Some(name)` for one reading the source column,
+    // `None` for one planned among `others`.
+    let mut slots: Vec<Option<String>> = Vec::new();
+    for t in &s.target_list {
+        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+            return Err(Error::Unsupported("this target".into()));
+        };
+        if let Some(N::ColumnRef(c)) = rt.val.as_ref().and_then(|v| v.node.as_ref()) {
+            match refers(c) {
+                Some(true) => {
+                    slots.push(Some(if rt.name.is_empty() {
+                        column.clone()
+                    } else {
+                        rt.name.clone()
+                    }));
+                    continue;
+                }
+                Some(false) => {
+                    return Err(Error::UndefinedColumn(
+                        column_ref_name(c).unwrap_or_default(),
+                    ));
+                }
+                None => {}
+            }
+        }
+        slots.push(None);
+        others.push(t.clone());
+    }
+    let planned = plan_select_constant(
+        &pg_query::protobuf::SelectStmt {
+            target_list: others,
+            where_clause: s.where_clause.clone(),
+            ..Default::default()
+        },
+        params,
+    )?;
+    let Statement::SelectConstant(rest) = planned else {
+        return Err(Error::Unsupported("this select list".into()));
+    };
+    let mut rest_cols = rest.columns.into_iter();
+    let mut columns = Vec::with_capacity(slots.len());
+    for slot in slots {
+        match slot {
+            Some(name) => columns.push((
+                name,
+                ConstCol::FromColumn,
+                source_type.clone(),
+                source_typmod,
+            )),
+            None => columns.push(
+                rest_cols
+                    .next()
+                    .ok_or_else(|| Error::Unsupported("this select list".into()))?,
+            ),
+        }
+    }
+    Ok(Statement::SelectConstant(SelectConstant {
+        columns,
+        where_true: rest.where_true,
+        source: Some(Box::new(source_col)),
     }))
 }
 
@@ -8620,11 +9044,11 @@ fn static_range_type(n: Option<&pg_query::protobuf::Node>) -> Option<String> {
 /// what PostgreSQL does for a parameter with no context: an error.
 pub fn infer_param_types(sql: &str, declared: &[Option<String>]) -> Vec<Option<String>> {
     let mut inferred = declared.to_vec();
-    let Ok(parsed) = pg_query::parse(sql) else {
+    let Ok(parsed) = parse_tree(sql) else {
         return inferred;
     };
     let previous_types = PLAN_PARAM_TYPES.with(|t| t.replace(declared.to_vec()));
-    for (node, _, _, _) in parsed.protobuf.nodes() {
+    for (node, _, _, _) in parsed.nodes() {
         // `$1::int4range`: a cast names the parameter's type outright, which
         // is how PostgreSQL types an unknown parameter under a cast. Only a
         // range-family target: that is the one family psycopg sends untyped.
@@ -8751,6 +9175,25 @@ fn static_text_type(n: Option<&pg_query::protobuf::Node>) -> Option<String> {
 /// oid list, so a describe of `select $1::uuid` answered "there is no
 /// parameter $1" -- PostgreSQL infers the parameter from the SQL.
 pub fn max_param_number(sql: &str) -> usize {
+    // Memoised like `parse_tree`, for the same reason: this runs once per
+    // Describe and once per Execute, and the scan goes through C.
+    const MAX_ENTRIES: usize = 4096;
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+        std::sync::OnceLock::new();
+    let memo = MEMO.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Some(n) = memo.lock().unwrap_or_else(|e| e.into_inner()).get(sql) {
+        return *n;
+    }
+    let n = scan_max_param_number(sql);
+    let mut guard = memo.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.len() >= MAX_ENTRIES {
+        guard.clear();
+    }
+    guard.insert(sql.to_string(), n);
+    n
+}
+
+fn scan_max_param_number(sql: &str) -> usize {
     // The LEXER, not the parse tree: pg_query's `nodes()` walks a curated
     // subset of each statement (a SELECT's target list, WHERE, FROM, ...)
     // and skips a VALUES list, a RETURNING clause and an UPDATE's SET, so
@@ -8818,8 +9261,8 @@ pub fn catalog_param_types_opt(
         Some(N::ParamRef(p)) => usize::try_from(p.number).ok()?.checked_sub(1),
         _ => None,
     };
-    if let Ok(parsed) = pg_query::parse(sql) {
-        for (node, _, _, _) in parsed.protobuf.nodes() {
+    if let Ok(parsed) = parse_tree(sql) {
+        for (node, _, _, _) in parsed.nodes() {
             match node {
                 pg_query::NodeRef::TypeCast(tc) => {
                     let Some(i) = tc.arg.as_deref().and_then(param_index) else {
@@ -10554,6 +10997,14 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 types.push(t);
             }
             Ok(typed_record_value(fields, types))
+        }
+        // `current_timestamp` inside an expression (`current_timestamp::text`)
+        // is `now()`; the bare-column form is handled by `plan_select_constant`.
+        Some(N::SqlvalueFunction(svf))
+            if pg_query::protobuf::SqlValueFunctionOp::try_from(svf.op)
+                == Ok(pg_query::protobuf::SqlValueFunctionOp::SvfopCurrentTimestamp) =>
+        {
+            Ok(scalar::now_value())
         }
         Some(other) => Err(Error::Unsupported(disc(other))),
         None => Err(Error::Parse("empty constant".into())),

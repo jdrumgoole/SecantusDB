@@ -307,17 +307,68 @@ fn update_and_delete_are_planned() {
 
 #[test]
 fn shapes_sqlglot_mis_parses_reach_us_as_real_statements() {
-    // `DROP TABLE a, b, c`, `BEGIN ...`, `MOVE FORWARD 2 IN c` and
-    // `NOTIFY chan, 'payload'` used to live here too; all four now EXECUTE
-    // rather than merely parsing, which is the stronger result.
-    for sql in ["LISTEN chan", "COPY t FROM stdin WITH (freeze on)"] {
-        let err = plan(sql, &lookup).expect_err(sql);
-        assert_eq!(err.sqlstate(), "0A000", "for {sql} (got {err})");
-    }
-    assert!(matches!(
+    // `DROP TABLE a, b, c`, `BEGIN ...`, `MOVE FORWARD 2 IN c`,
+    // `NOTIFY chan, 'payload'` and `LISTEN chan` used to live here too; all
+    // five now EXECUTE rather than merely parsing, which is the stronger
+    // result.
+    let sql = "COPY t FROM stdin WITH (freeze on)";
+    let err = plan(sql, &lookup).expect_err(sql);
+    assert_eq!(err.sqlstate(), "0A000", "for {sql} (got {err})");
+    assert_eq!(
         plan_ok("NOTIFY chan, 'payload'"),
-        Statement::Notify
-    ));
+        Statement::Notify {
+            channel: "chan".into(),
+            payload: "payload".into()
+        }
+    );
+}
+
+/// LISTEN / UNLISTEN / NOTIFY carry the channel with the parser's case fold
+/// applied (`FOO` is `foo`, `"Foo"` is `Foo`), and `UNLISTEN *` is the
+/// name-less form.
+#[test]
+fn listen_notify_statements_carry_their_channel() {
+    assert_eq!(plan_ok("LISTEN Foo"), Statement::Listen("foo".into()));
+    assert_eq!(plan_ok("LISTEN \"Foo\""), Statement::Listen("Foo".into()));
+    assert_eq!(
+        plan_ok("UNLISTEN foo"),
+        Statement::Unlisten(Some("foo".into()))
+    );
+    assert_eq!(plan_ok("UNLISTEN *"), Statement::Unlisten(None));
+    assert_eq!(
+        plan_ok("NOTIFY foo"),
+        Statement::Notify {
+            channel: "foo".into(),
+            payload: String::new()
+        }
+    );
+    match plan_ok("SELECT pg_notify('foo', 'p')") {
+        Statement::SelectConstant(sc) => assert_eq!(
+            sc.columns,
+            vec![(
+                "pg_notify".to_string(),
+                ConstCol::PgNotify {
+                    channel: Bson::String("foo".into()),
+                    payload: Bson::String("p".into())
+                },
+                "void".to_string(),
+                -1
+            )]
+        ),
+        other => panic!("{other:?}"),
+    }
+    match plan_ok("SELECT pg_listening_channels()") {
+        Statement::SelectConstant(sc) => assert_eq!(
+            sc.columns,
+            vec![(
+                "pg_listening_channels".to_string(),
+                ConstCol::ListeningChannels,
+                "text".to_string(),
+                -1
+            )]
+        ),
+        other => panic!("{other:?}"),
+    }
 }
 
 /// Aggregates plan to POSITIONAL output columns.
@@ -519,8 +570,8 @@ fn aggregate_refusals_carry_the_right_sqlstate() {
         ("SELECT avg(n) FROM t", "0A000"),
         ("SELECT count(DISTINCT n) FROM t", "0A000"),
         ("SELECT count(*) FROM t HAVING count(*) > 1", "0A000"),
-        ("SELECT sum(n + 1) FROM t", "0A000"),
         ("SELECT count(nope) FROM t", "42703"),
+        ("SELECT sum(nope + 1) FROM t", "42703"),
         ("SELECT count(*) FROM t GROUP BY nope", "42703"),
     ];
     for (sql, want) in cases {
@@ -2900,4 +2951,166 @@ fn to_regtype_resolves_user_type_arrays() {
     }
     set_user_types(Vec::new());
     set_user_composites(Vec::new());
+}
+
+/// `CREATE TABLE ... AS query` carries the planned query and the table's
+/// persistence, name list and `WITH [NO] DATA` -- the columns come from the
+/// query's description at execution. Measured on PostgreSQL 16 (2026-09-09).
+#[test]
+fn create_table_as_carries_its_query() {
+    match plan_ok("CREATE TEMP TABLE tt (a, b) AS SELECT 1, 'x'::text WITH NO DATA") {
+        Statement::CreateTableAs {
+            table,
+            if_not_exists,
+            temp,
+            column_names,
+            query,
+            with_data,
+        } => {
+            assert_eq!(table, "tt");
+            assert!(!if_not_exists);
+            assert!(temp);
+            assert_eq!(column_names, vec!["a".to_string(), "b".to_string()]);
+            assert!(!with_data);
+            assert!(matches!(*query, Statement::SelectConstant(_)));
+        }
+        other => panic!("{other:?}"),
+    }
+    match plan_ok("CREATE TABLE IF NOT EXISTS t2 AS (SELECT name FROM t)") {
+        Statement::CreateTableAs {
+            if_not_exists,
+            temp,
+            with_data,
+            query,
+            ..
+        } => {
+            assert!(if_not_exists);
+            assert!(!temp);
+            assert!(with_data);
+            assert!(matches!(*query, Statement::Select(_)));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        plan("CREATE MATERIALIZED VIEW mv AS SELECT 1", &lookup),
+        Err(Error::Unsupported(_))
+    ));
+}
+
+/// A function in FROM is the row source: `select 'ok' from pg_sleep(0.5)`
+/// names its column `?column?`, `select * from pg_listening_channels()` reads
+/// the function's own column (one row per channel), and a column that is not
+/// the function's is 42703. Measured on PostgreSQL 16 (2026-09-09).
+#[test]
+fn a_function_in_from_is_the_row_source() {
+    match plan_ok("SELECT 'ok' FROM pg_sleep(0.5)") {
+        Statement::SelectConstant(sc) => {
+            assert_eq!(
+                sc.source,
+                Some(Box::new(ConstCol::Sleep(Bson::Double(0.5))))
+            );
+            assert_eq!(
+                sc.columns,
+                vec![(
+                    "?column?".to_string(),
+                    ConstCol::Value(Bson::String("ok".into())),
+                    "text".to_string(),
+                    -1
+                )]
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    match plan_ok("SELECT * FROM pg_listening_channels()") {
+        Statement::SelectConstant(sc) => {
+            assert_eq!(sc.source, Some(Box::new(ConstCol::ListeningChannels)));
+            assert_eq!(
+                sc.columns,
+                vec![(
+                    "pg_listening_channels".to_string(),
+                    ConstCol::FromColumn,
+                    "text".to_string(),
+                    -1
+                )]
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    match plan_ok("SELECT ch FROM pg_listening_channels() ch") {
+        Statement::SelectConstant(sc) => {
+            assert_eq!(sc.columns[0].0, "ch");
+            assert_eq!(sc.columns[0].1, ConstCol::FromColumn);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        plan("SELECT nope FROM pg_sleep(0)", &lookup),
+        Err(Error::UndefinedColumn(c)) if c == "nope"
+    ));
+}
+
+/// An aggregate over an EXPRESSION reads a hidden per-row slot the executor
+/// fills; the item's result type follows the expression, not the column.
+#[test]
+fn aggregates_over_expressions_read_a_hidden_slot() {
+    match plan_ok("SELECT max(length(name)), sum(n * 2), count(*) FROM t") {
+        Statement::Aggregate(a) => {
+            assert_eq!(a.items[0].field.as_deref(), Some("__agg0"));
+            assert!(a.items[0].expr.is_some());
+            assert_eq!(a.items[0].source_type.as_deref(), Some("int4"));
+            assert_eq!(a.items[1].field.as_deref(), Some("__agg1"));
+            assert!(a.items[1].expr.is_some());
+            assert!(a.items[2].expr.is_none());
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// `now()` and `current_timestamp` are `timestamptz`, whatever the value
+/// looks like on the wire.
+#[test]
+fn now_is_a_timestamptz() {
+    for sql in ["SELECT now()", "SELECT current_timestamp"] {
+        match plan_ok(sql) {
+            Statement::SelectConstant(sc) => {
+                assert_eq!(sc.columns[0].2, "timestamptz", "{sql}");
+                assert!(matches!(sc.columns[0].1, ConstCol::Value(_)), "{sql}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(scalar::static_result_type("now"), "timestamptz");
+}
+
+/// PostgreSQL 16 describes `$1::int8 + $2::int8` as int8 (and `$1::int2 +
+/// $2::int2` as int2): integer arithmetic types from its operands when the
+/// values are still NULL placeholders, not from the int4 default.
+#[test]
+fn integer_arithmetic_over_casts_types_from_the_operands() {
+    for (sql, want) in [
+        ("SELECT $1::int8 + $2::int8 AS fld", "int8"),
+        ("SELECT $1::int2 * $2::int2", "int2"),
+        ("SELECT $1::int4 - $2::int8", "int8"),
+        ("SELECT $1 + 1", "int4"),
+    ] {
+        match plan_with_params(sql, &lookup, &[Bson::Null, Bson::Null]).unwrap() {
+            Statement::SelectConstant(sc) => assert_eq!(sc.columns[0].2, want, "{sql}"),
+            other => panic!("{sql}: {other:?}"),
+        }
+    }
+}
+
+/// `ALTER ROLE` / `ALTER USER` plan to the role they name; whether it exists
+/// is the executor's question.
+#[test]
+fn alter_role_names_its_role() {
+    for sql in [
+        "ALTER USER \"ashesh\" PASSWORD 'x'",
+        "ALTER ROLE ashesh WITH LOGIN",
+    ] {
+        match plan_ok(sql) {
+            Statement::AlterRole(name) => assert_eq!(name, "ashesh", "{sql}"),
+            other => panic!("{sql}: {other:?}"),
+        }
+    }
 }

@@ -20,7 +20,7 @@ use crate::api::cancel::CancelHandler;
 use crate::api::copy::CopyHandler;
 use crate::api::query::{ExtendedQueryHandler, SimpleQueryHandler, send_ready_for_query};
 use crate::api::{
-    ClientInfo, ClientPortalStore, DefaultClient, ErrorHandler, PgWireConnectionState,
+    ClientInfo, ClientPortalStore, DefaultClient, ErrorHandler, IdleEvent, PgWireConnectionState,
     PgWireServerHandlers,
 };
 use crate::error::{ErrorInfo, PgWireError, PgWireResult};
@@ -626,21 +626,63 @@ macro_rules! process_socket_messages {
                     _ = &mut $startup_timeout => None,
                     msg = socket.next() => msg,
                 }
-            } else if let Some((wait, error)) = $handlers.idle_timeout() {
+            } else {
                 // PostgreSQL's idle timeouts: when the session sits idle past
                 // the handler's deadline, send the FATAL error and close the
                 // connection (the client sees it on its next round trip).
+                // And the handler's out-of-band work (SecantusDB local patch):
+                // a NOTIFY from another session, or a `pg_terminate_backend`
+                // aimed at this one, both of which reach an idle client
+                // without it asking. Both race the next frontend message.
+                let idle_timeout = $handlers.idle_timeout();
+                let idle_event = $handlers.idle_event();
+                let timeout_fut = async {
+                    match idle_timeout {
+                        Some((wait, error)) => {
+                            sleep(wait).await;
+                            error
+                        }
+                        None => std::future::pending().await,
+                    }
+                };
+                let event_fut = async {
+                    match idle_event {
+                        Some(fut) => fut.await,
+                        None => std::future::pending().await,
+                    }
+                };
+                tokio::pin!(timeout_fut);
+                tokio::pin!(event_fut);
                 tokio::select! {
-                    _ = sleep(wait) => {
+                    error = &mut timeout_fut => {
                         let _ = socket
                             .send(PgWireBackendMessage::ErrorResponse(error.into()))
                             .await;
                         break;
                     }
+                    event = &mut event_fut => {
+                        match event {
+                            IdleEvent::Send(messages) => {
+                                for message in messages {
+                                    if socket.feed(message).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                if socket.flush().await.is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            IdleEvent::Fatal(error) => {
+                                let _ = socket
+                                    .send(PgWireBackendMessage::ErrorResponse(error.into()))
+                                    .await;
+                                break;
+                            }
+                        }
+                    }
                     msg = socket.next() => msg,
                 }
-            } else {
-                socket.next().await
             };
 
             if let Some(Ok(msg)) = msg {

@@ -14,7 +14,7 @@ mod encoding;
 mod plpgsql_do;
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI32};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -37,7 +37,7 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
 use pgwire::messages::data::DataRow;
 use pgwire::messages::extendedquery::{Describe, Parse, Sync as PgSync, TARGET_TYPE_BYTE_PORTAL};
-use pgwire::messages::response::{CommandComplete, ReadyForQuery};
+use pgwire::messages::response::{CommandComplete, NotificationResponse, ReadyForQuery};
 use pgwire::messages::simplequery::Query;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::types::format::FormatOptions;
@@ -71,6 +71,32 @@ pub struct BackendEntry {
     /// the way the failed statement itself would have.
     stream_failed: AtomicBool,
     activity: Mutex<BackendActivity>,
+    /// The channels this backend LISTENs on -- read by every other backend's
+    /// NOTIFY, which is why they live here and not on the handler.
+    listening: Mutex<Vec<String>>,
+    /// Notifications addressed to this backend and not yet sent: the
+    /// `NotificationResponse`s it delivers before its next `ReadyForQuery`,
+    /// or straight away when it is idle.
+    inbox: Mutex<VecDeque<Notification>>,
+    /// Wakes the connection's idle wait when the inbox fills or `terminate`
+    /// is set, so an idle client hears without sending anything.
+    wake: tokio::sync::Notify,
+}
+
+/// One queued `NotificationResponse`.
+#[derive(Clone, Debug)]
+struct Notification {
+    pid: i32,
+    channel: String,
+    payload: String,
+}
+
+/// A LISTEN / UNLISTEN waiting for its transaction to commit.
+#[derive(Clone, Debug)]
+enum ListenOp {
+    Listen(String),
+    Unlisten(String),
+    UnlistenAll,
 }
 
 /// What `pg_stat_activity` reports for one backend.
@@ -94,6 +120,9 @@ impl BackendEntry {
             terminate: AtomicBool::new(false),
             cancel: AtomicBool::new(false),
             stream_failed: AtomicBool::new(false),
+            listening: Mutex::new(Vec::new()),
+            inbox: Mutex::new(VecDeque::new()),
+            wake: tokio::sync::Notify::new(),
             activity: Mutex::new(BackendActivity {
                 datname: datname.to_string(),
                 usename: String::new(),
@@ -118,6 +147,70 @@ impl BackendEntry {
 fn backend_registry() -> &'static Mutex<HashMap<i32, Arc<BackendEntry>>> {
     static REGISTRY: OnceLock<Mutex<HashMap<i32, Arc<BackendEntry>>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Process-wide cache of the COMMITTED rows of each type-catalog collection,
+/// keyed by `(storage, db, collection)`. Every statement re-read and
+/// re-decoded every catalog collection -- once per describe and once per
+/// result column -- and that decode was the whole cost of a statement: a
+/// `select 1` round trip took 0.86 ms against PostgreSQL 16's 0.034 ms, and
+/// an `executemany` of 20,000 rows 15 s against 0.25 s, until psycopg's
+/// `test_type_error_shadow` (which does exactly that) ran past its 20 s
+/// budget (2026-09-09). The catalog changes only under DDL, so the decoded
+/// rows are kept and re-read only when `CATALOG_VERSION` has moved.
+///
+/// Invalidation is deliberately COARSE: `bump_catalog_version` runs after
+/// every statement that is not a plain read or a row write (see
+/// `Statement::may_change_catalog`), after every transaction-control
+/// statement (a COMMIT publishes a block's DDL to other connections), and
+/// after every rollback to a savepoint. An extra bump costs one re-read; a
+/// missed one is a stale catalog, so the classification errs on bumping.
+///
+/// A session fills the cache from its own read only when nothing can have
+/// moved the catalog since its transaction's snapshot: the version now must
+/// equal the one captured when its transaction handle opened (autocommit
+/// statements in the extended protocol run under a handle too). Otherwise
+/// the read is served but not kept -- a snapshot taken before another
+/// connection's `CREATE TABLE` committed must not be published as current,
+/// and a block's own uncommitted `CREATE TYPE` must not be seen by others.
+/// A cache map keyed on `(storage, db, name)`, each value tagged with the
+/// catalog version it was read under.
+type VersionedMap<K, V> = Mutex<HashMap<(usize, String, K), (u64, V)>>;
+
+struct CatalogCache {
+    version: std::sync::atomic::AtomicU64,
+    /// `(storage, db, collection)` -> the decoded rows of one type-catalog
+    /// collection, `_id`-sorted.
+    entries: VersionedMap<&'static str, Arc<Vec<Document>>>,
+    /// `(storage, db, table)` -> its decoded catalog entry; `None` records
+    /// that the table does not exist.
+    tables: VersionedMap<String, Option<TableDef>>,
+}
+
+thread_local! {
+    /// The `(storage, db, catalog version)` whose user types this thread's
+    /// planner tables hold, or `None` when they hold something that must
+    /// not be reused: a session's uncommitted overlay, or a read taken
+    /// under a snapshot the catalog has since moved past.
+    static INSTALLED_USER_TYPES: std::cell::RefCell<Option<(usize, String, u64)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn catalog_cache() -> &'static CatalogCache {
+    static CACHE: OnceLock<CatalogCache> = OnceLock::new();
+    CACHE.get_or_init(|| CatalogCache {
+        version: std::sync::atomic::AtomicU64::new(0),
+        entries: Mutex::new(HashMap::new()),
+        tables: Mutex::new(HashMap::new()),
+    })
+}
+
+/// Declare the committed type catalog changed (or possibly changed): every
+/// cached collection is re-read on its next use, on every connection.
+fn bump_catalog_version() {
+    catalog_cache()
+        .version
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// The `CancelRequest` handler: a cancel connection names a `(pid, secret)`,
@@ -422,6 +515,10 @@ pub struct PgHandler {
     /// than a missing feature. Lock-free for the same reason as
     /// `in_transaction`.
     txn_failed: std::sync::atomic::AtomicBool,
+    /// The catalog version when this session's transaction handle opened;
+    /// a catalog read may fill the process-wide cache only while the version
+    /// still equals it (see `CatalogCache`).
+    txn_catalog_version: std::sync::atomic::AtomicU64,
     /// The open savepoints, oldest first.
     ///
     /// WiredTiger has no savepoint of its own, so one is a set of PRE-IMAGES:
@@ -475,6 +572,12 @@ pub struct PgHandler {
     implicit_extended: AtomicBool,
     /// A statement in the open group failed: the group rolls back at `Sync`.
     group_failed: AtomicBool,
+    /// NOTIFYs of the open transaction, `(channel, payload)` in first-issue
+    /// order with duplicates dropped, as PostgreSQL queues them: delivered
+    /// at commit, discarded at rollback.
+    pending_notifies: Mutex<Vec<(String, String)>>,
+    /// LISTEN / UNLISTENs of the open transaction, applied at commit.
+    pending_listens: Mutex<Vec<ListenOp>>,
 }
 
 /// A user type created (`Some(doc)`) or dropped (`None`) in the open
@@ -607,6 +710,7 @@ impl PgHandler {
             in_transaction: std::sync::atomic::AtomicBool::new(false),
             binary_results: std::sync::atomic::AtomicBool::new(false),
             txn_failed: std::sync::atomic::AtomicBool::new(false),
+            txn_catalog_version: std::sync::atomic::AtomicU64::new(0),
             savepoints: Mutex::new(Vec::new()),
             cursor_capture: std::sync::Arc::new(Mutex::new(None)),
             backend_pid: AtomicI32::new(0),
@@ -616,6 +720,8 @@ impl PgHandler {
             commit_failed: AtomicBool::new(false),
             implicit_extended: AtomicBool::new(false),
             group_failed: AtomicBool::new(false),
+            pending_notifies: Mutex::new(Vec::new()),
+            pending_listens: Mutex::new(Vec::new()),
         }
     }
 
@@ -746,9 +852,48 @@ impl PgHandler {
     /// +200_000 (multirange) and +300_000 (multirange array) never collide.
     const MULTIRANGE_TYPE_OID_OFFSET: i64 = 200_000;
 
-    /// Hand the planner this database's user types, fresh from the store --
-    /// which the other server may have written to since the last statement.
+    /// Hand the planner this database's user types, at the current catalog
+    /// version. The planner's type tables are thread-local, so this runs
+    /// before every plan -- but it publishes only when the calling thread
+    /// does not already hold this `(storage, db, version)`, or when this
+    /// session has an uncommitted type overlay (a per-session view, which
+    /// must be re-published every statement and never recorded as held).
+    /// Before the skip, every statement rebuilt every table's row type
+    /// from BSON, and a used store made `select 1` twice as slow.
     fn install_user_types(&self) {
+        secantus_pgplan::set_session_user(Some(
+            self.session_user
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        ));
+        let overlay_empty = self
+            .uncommitted_types
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty();
+        let version = catalog_cache()
+            .version
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let held = (
+            Arc::as_ptr(&self.storage) as usize,
+            self.db().to_string(),
+            version,
+        );
+        if overlay_empty && INSTALLED_USER_TYPES.with(|c| c.borrow().as_ref() == Some(&held)) {
+            return;
+        }
+        self.publish_user_types();
+        // A read under a transaction snapshot that predates a catalog bump
+        // is not the committed truth at `version` (see
+        // `may_fill_catalog_cache`): publish it, but do not record it.
+        let record = overlay_empty && self.may_fill_catalog_cache(version);
+        INSTALLED_USER_TYPES.with(|c| *c.borrow_mut() = record.then_some(held));
+    }
+
+    /// Build the planner's user-type tables from the catalog and publish
+    /// them to this thread. `install_user_types` is the gate in front.
+    fn publish_user_types(&self) {
         // Enums resolve by name too. A `public` enum resolves by its bare name
         // (public is on the default search_path); a schema-qualified one
         // resolves only as `schema.name`, exactly like composites and ranges.
@@ -774,12 +919,6 @@ impl PgHandler {
         }
         secantus_pgplan::set_user_types(types);
         secantus_pgplan::set_user_composites(composites);
-        secantus_pgplan::set_session_user(Some(
-            self.session_user
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone(),
-        ));
         // Custom ranges resolve their subtype at cast time and their oid for
         // regtype -- but they are NOT enums, so they stay OUT of set_user_types.
         // A schema-qualified range resolves as `schema.name`, so
@@ -883,26 +1022,21 @@ impl PgHandler {
         // `Kind::Composite` (its declared fields, resolved to their own wire
         // types), so the value goes out as PostgreSQL composite TEXT `(...)`
         // in a text cursor and as the binary record format in a binary one.
-        let composites = self.composites_with_schema().ok()?;
         // A composite ARRAY: `testcomp[]` reports the derived typarray oid with
         // `Kind::Array(composite)` so a client that registered the array
         // decodes each element as the composite rather than reading varchar.
         if let Some(element) = pg_type.strip_suffix("[]") {
-            let (schema, bare, oid, fields) = composites
-                .iter()
-                .find(|(schema, name, _, _)| Self::type_resolution(schema, name) == element)?;
-            let elem_ty = self.composite_type(schema, bare, *oid, fields)?;
+            let (schema, bare, oid, fields) = self.composite_with_schema_named(element).ok()??;
+            let elem_ty = self.composite_type(&schema, &bare, oid, &fields)?;
             return Some(Type::new(
                 format!("_{bare}"),
-                u32::try_from(*oid + Self::USER_TYPE_ARRAY_OID_OFFSET).ok()?,
+                u32::try_from(oid + Self::USER_TYPE_ARRAY_OID_OFFSET).ok()?,
                 postgres_types::Kind::Array(elem_ty),
-                schema.clone(),
+                schema,
             ));
         }
-        let (schema, bare, oid, fields) = composites
-            .iter()
-            .find(|(schema, name, _, _)| Self::type_resolution(schema, name) == pg_type)?;
-        self.composite_type(schema, bare, *oid, fields)
+        let (schema, bare, oid, fields) = self.composite_with_schema_named(pg_type).ok()??;
+        self.composite_type(&schema, &bare, oid, &fields)
     }
 
     /// The wire `Type` for a DEFINED base type or its array, by resolution
@@ -1350,6 +1484,19 @@ impl PgHandler {
             }
         };
 
+        // An aggregate over an expression reads a hidden per-row slot
+        // (`__aggN`), filled here so the aggregate itself only ever sees a
+        // field.
+        let mut docs = docs;
+        for item in &agg.items {
+            let (Some(expr), Some(slot)) = (item.expr.as_ref(), item.field.as_deref()) else {
+                continue;
+            };
+            for d in docs.iter_mut() {
+                let v = secantus_pgplan::apply_row_expr(expr, d).map_err(|e| Self::err(&e))?;
+                d.insert(slot, v);
+            }
+        }
         // Group, preserving first-seen order so output is deterministic
         // even with no ORDER BY.
         let mut keys: Vec<Vec<Option<Bson>>> = Vec::new();
@@ -1733,6 +1880,12 @@ impl PgHandler {
         for coll in Self::CATALOG_COLLECTIONS {
             self.ensure_collection(coll)?;
         }
+        self.txn_catalog_version.store(
+            catalog_cache()
+                .version
+                .load(std::sync::atomic::Ordering::SeqCst),
+            std::sync::atomic::Ordering::SeqCst,
+        );
         self.storage
             .begin_user_transaction()
             .map_err(|e| Self::storage_err("could not begin a transaction", e))
@@ -1761,23 +1914,26 @@ impl PgHandler {
     /// SELECT 't'::regtype` in one transaction resolve `t`, since planning
     /// reads the catalog OUTSIDE the transaction and a plain read misses the
     /// uncommitted write.
-    fn type_catalog_docs(&self, collection: &'static str) -> PgWireResult<Vec<Document>> {
-        let raw = self
-            .storage
-            .find_matching(self.db(), collection, &Document::new())
-            .map_err(|e| Self::storage_err("could not read the type catalog", e))?;
-        let mut by_id: std::collections::BTreeMap<String, Document> =
-            std::collections::BTreeMap::new();
-        for bytes in raw {
-            let d: Document = bson::from_slice(&bytes)
-                .map_err(|e| Self::storage_err("could not decode a type", e))?;
-            let id = d.get_str("_id").unwrap_or_default().to_string();
-            by_id.insert(id, d);
-        }
+    ///
+    /// Shared, not copied: with no overlay this is the cache's own `Arc`, so
+    /// a statement that consults the catalog several times (the planner
+    /// install, then one wire-type lookup per described column) decodes and
+    /// clones nothing. The per-statement cost used to grow with every table
+    /// the session had ever created -- each one leaves a row type here --
+    /// until a plain `select 1` ran twice as slowly on a used store.
+    fn type_catalog_docs(&self, collection: &'static str) -> PgWireResult<Arc<Vec<Document>>> {
+        let committed = self.committed_type_catalog_docs(collection)?;
         let overlay = self
             .uncommitted_types
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        if overlay.is_empty() {
+            return Ok(committed);
+        }
+        let mut by_id: std::collections::BTreeMap<String, Document> = committed
+            .iter()
+            .map(|d| (d.get_str("_id").unwrap_or_default().to_string(), d.clone()))
+            .collect();
         for ((coll, id), doc) in overlay.iter() {
             if *coll != collection {
                 continue;
@@ -1791,7 +1947,70 @@ impl PgHandler {
                 }
             }
         }
-        Ok(by_id.into_values().collect())
+        Ok(Arc::new(by_id.into_values().collect()))
+    }
+
+    /// The COMMITTED rows of one type-catalog collection, `_id`-sorted, from
+    /// the process-wide cache when its version is current and from storage
+    /// (decoding once for everyone) when it is not. See `CatalogCache`.
+    fn committed_type_catalog_docs(
+        &self,
+        collection: &'static str,
+    ) -> PgWireResult<Arc<Vec<Document>>> {
+        let cache = catalog_cache();
+        let version = cache.version.load(std::sync::atomic::Ordering::SeqCst);
+        let key = (
+            Arc::as_ptr(&self.storage) as usize,
+            self.db().to_string(),
+            collection,
+        );
+        if let Some((v, docs)) = cache
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            if *v == version {
+                return Ok(Arc::clone(docs));
+            }
+        }
+        let raw = self
+            .storage
+            .find_matching(self.db(), collection, &Document::new())
+            .map_err(|e| Self::storage_err("could not read the type catalog", e))?;
+        let mut by_id: std::collections::BTreeMap<String, Document> =
+            std::collections::BTreeMap::new();
+        for bytes in raw {
+            let d: Document = bson::from_slice(&bytes)
+                .map_err(|e| Self::storage_err("could not decode a type", e))?;
+            let id = d.get_str("_id").unwrap_or_default().to_string();
+            by_id.insert(id, d);
+        }
+        let docs: Arc<Vec<Document>> = Arc::new(by_id.into_values().collect());
+        // A read that was in flight while the version moved must not be
+        // recorded as current: store it under the version it was read AT,
+        // so a bump during the read still forces the next reader to storage.
+        if self.may_fill_catalog_cache(version) {
+            cache
+                .entries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key, (version, Arc::clone(&docs)));
+        }
+        Ok(docs)
+    }
+
+    /// May a catalog row this session just read at `version` be published
+    /// as the committed truth? Outside a transaction handle, always; under
+    /// one, only while the catalog has not moved since the handle opened --
+    /// by this block (its own uncommitted DDL) or by anyone else (a commit
+    /// this block's snapshot may predate). See `CatalogCache`.
+    fn may_fill_catalog_cache(&self, version: u64) -> bool {
+        !self.transaction_handle_open()
+            || self
+                .txn_catalog_version
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == version
     }
 
     /// Record that the open transaction created (`Some(doc)`) or dropped
@@ -1815,32 +2034,64 @@ impl PgHandler {
     /// name and `sub` is a nested composite's fields (unused here).
     fn composites(&self) -> PgWireResult<Vec<(String, i64, CompositeFields)>> {
         let mut out = Vec::new();
-        for d in self.type_catalog_docs(Self::COMPOSITE_COLLECTION)? {
+        for d in self.type_catalog_docs(Self::COMPOSITE_COLLECTION)?.iter() {
             let name = d.get_str("composite").unwrap_or_default().to_string();
             let oid = d
                 .get_i64("oid")
                 .or_else(|_| d.get_i32("oid").map(i64::from))
                 .unwrap_or(0);
-            let fields = d
-                .get_array("fields")
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|f| match f {
-                            Bson::Array(pair) => {
-                                let n = pair.first()?.as_str()?.to_string();
-                                let t = pair.get(1)?.as_str()?.to_string();
-                                Some((n, t))
-                            }
-                            _ => None,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            let fields = Self::composite_fields(d);
             out.push((name, oid, fields));
         }
         out.sort();
         Ok(out)
+    }
+
+    /// A composite catalog doc's `fields`: `[[name, type, sub], ...]` as
+    /// `(name, type)` pairs.
+    fn composite_fields(d: &Document) -> CompositeFields {
+        d.get_array("fields")
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|f| match f {
+                        Bson::Array(pair) => {
+                            let n = pair.first()?.as_str()?.to_string();
+                            let t = pair.get(1)?.as_str()?.to_string();
+                            Some((n, t))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// One composite by its resolution name (`name` in public, else
+    /// `schema.name`), as `composites_with_schema` would list it -- decoding
+    /// only that one, since a described column asks for exactly one type.
+    fn composite_with_schema_named(
+        &self,
+        resolution: &str,
+    ) -> PgWireResult<Option<(String, String, i64, CompositeFields)>> {
+        for d in self.type_catalog_docs(Self::COMPOSITE_COLLECTION)?.iter() {
+            let name = d.get_str("composite").unwrap_or_default();
+            let schema = d.get_str("schema").unwrap_or("public");
+            if Self::type_resolution(schema, name) != resolution {
+                continue;
+            }
+            let oid = d
+                .get_i64("oid")
+                .or_else(|_| d.get_i32("oid").map(i64::from))
+                .unwrap_or(0);
+            return Ok(Some((
+                schema.to_string(),
+                name.to_string(),
+                oid,
+                Self::composite_fields(d),
+            )));
+        }
+        Ok(None)
     }
 
     /// Is `name` the ROW TYPE of a table (a composite recorded by CREATE
@@ -1862,29 +2113,14 @@ impl PgHandler {
     /// duplicate-checking and `to_regtype` resolution consult the schema.
     fn composites_with_schema(&self) -> PgWireResult<Vec<(String, String, i64, CompositeFields)>> {
         let mut out = Vec::new();
-        for d in self.type_catalog_docs(Self::COMPOSITE_COLLECTION)? {
+        for d in self.type_catalog_docs(Self::COMPOSITE_COLLECTION)?.iter() {
             let name = d.get_str("composite").unwrap_or_default().to_string();
             let schema = d.get_str("schema").unwrap_or("public").to_string();
             let oid = d
                 .get_i64("oid")
                 .or_else(|_| d.get_i32("oid").map(i64::from))
                 .unwrap_or(0);
-            let fields = d
-                .get_array("fields")
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|f| match f {
-                            Bson::Array(pair) => {
-                                let n = pair.first()?.as_str()?.to_string();
-                                let t = pair.get(1)?.as_str()?.to_string();
-                                Some((n, t))
-                            }
-                            _ => None,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            let fields = Self::composite_fields(d);
             out.push((schema, name, oid, fields));
         }
         out.sort();
@@ -1895,7 +2131,7 @@ impl PgHandler {
     /// range type. `subtype` is the element type name (e.g. `int4`).
     fn ranges(&self) -> PgWireResult<Vec<(String, i64, String)>> {
         let mut out = Vec::new();
-        for d in self.type_catalog_docs(Self::RANGE_COLLECTION)? {
+        for d in self.type_catalog_docs(Self::RANGE_COLLECTION)?.iter() {
             let name = d.get_str("range").unwrap_or_default().to_string();
             let oid = d
                 .get_i64("oid")
@@ -1915,7 +2151,7 @@ impl PgHandler {
     /// duplicate-checking and `to_regtype` resolution consult the schema.
     fn ranges_with_schema(&self) -> PgWireResult<Vec<(String, String, i64, String)>> {
         let mut out = Vec::new();
-        for d in self.type_catalog_docs(Self::RANGE_COLLECTION)? {
+        for d in self.type_catalog_docs(Self::RANGE_COLLECTION)?.iter() {
             let name = d.get_str("range").unwrap_or_default().to_string();
             let schema = d.get_str("schema").unwrap_or("public").to_string();
             let oid = d
@@ -1932,7 +2168,7 @@ impl PgHandler {
     /// The `__sql_base_types__` catalog, name-sorted. See the constant.
     fn base_types(&self) -> PgWireResult<Vec<BaseType>> {
         let mut out = Vec::new();
-        for d in self.type_catalog_docs(Self::BASE_TYPE_COLLECTION)? {
+        for d in self.type_catalog_docs(Self::BASE_TYPE_COLLECTION)?.iter() {
             out.push(BaseType {
                 name: d.get_str("base").unwrap_or_default().to_string(),
                 schema: d.get_str("schema").unwrap_or("public").to_string(),
@@ -1953,7 +2189,7 @@ impl PgHandler {
     /// constant), name-sorted.
     fn functions(&self) -> PgWireResult<Vec<UserFunction>> {
         let mut out = Vec::new();
-        for d in self.type_catalog_docs(Self::FUNCTION_COLLECTION)? {
+        for d in self.type_catalog_docs(Self::FUNCTION_COLLECTION)?.iter() {
             let strings = |key: &str| -> Vec<String> {
                 d.get_array(key)
                     .map(|items| {
@@ -2253,7 +2489,7 @@ impl PgHandler {
     /// Every enum type: `(name, oid, labels)`, name-sorted for stable output.
     fn enums(&self) -> PgWireResult<Vec<(String, i64, Vec<String>)>> {
         let mut out = Vec::new();
-        for d in self.type_catalog_docs(Self::ENUM_COLLECTION)? {
+        for d in self.type_catalog_docs(Self::ENUM_COLLECTION)?.iter() {
             let name = d.get_str("enum").unwrap_or_default().to_string();
             let oid = d
                 .get_i64("oid")
@@ -2281,7 +2517,7 @@ impl PgHandler {
     /// schema.
     fn enums_with_schema(&self) -> PgWireResult<Vec<EnumWithSchema>> {
         let mut out = Vec::new();
-        for d in self.type_catalog_docs(Self::ENUM_COLLECTION)? {
+        for d in self.type_catalog_docs(Self::ENUM_COLLECTION)?.iter() {
             let name = d.get_str("enum").unwrap_or_default().to_string();
             let schema = d.get_str("schema").unwrap_or("public").to_string();
             let oid = d
@@ -2473,6 +2709,24 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("query_id", "int8", false),
                     secantus_pgcatalog::Column::new("query", "text", false),
                     secantus_pgcatalog::Column::new("backend_type", "text", false),
+                ],
+            )),
+            // PostgreSQL 16's `pg_tables` view: every user table (and the
+            // catalog's own, so `where schemaname = 'pg_catalog'` finds
+            // `pg_class`). No index / rule / trigger / row-security support
+            // here, so those flags are false; `tablespace` is NULL as it is
+            // for a table in the default tablespace.
+            "pg_tables" => Some(TableDef::new(
+                "pg_tables",
+                vec![
+                    secantus_pgcatalog::Column::new("schemaname", "name", false),
+                    secantus_pgcatalog::Column::new("tablename", "name", false),
+                    secantus_pgcatalog::Column::new("tableowner", "name", false),
+                    secantus_pgcatalog::Column::new("tablespace", "name", false),
+                    secantus_pgcatalog::Column::new("hasindexes", "bool", false),
+                    secantus_pgcatalog::Column::new("hasrules", "bool", false),
+                    secantus_pgcatalog::Column::new("hastriggers", "bool", false),
+                    secantus_pgcatalog::Column::new("rowsecurity", "bool", false),
                 ],
             )),
             "pg_cursors" => Some(TableDef::new(
@@ -2828,6 +3082,55 @@ impl PgHandler {
                     })
                     .collect()
             }
+            "pg_tables" => {
+                let field = |name: &str| def.field_of(name).expect("column");
+                let owner = self
+                    .session_user
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let mut rows: Vec<Document> = self
+                    .all_table_defs()
+                    .ok()?
+                    .into_iter()
+                    .map(|t| {
+                        let mut d = Document::new();
+                        d.insert(field("schemaname"), Self::schema_of(&t));
+                        d.insert(field("tablename"), t.name.as_str());
+                        d.insert(field("tableowner"), owner.as_str());
+                        d.insert(field("tablespace"), Bson::Null);
+                        d.insert(field("hasindexes"), t.columns.iter().any(|c| c.pk));
+                        d.insert(field("hasrules"), false);
+                        d.insert(field("hastriggers"), false);
+                        d.insert(field("rowsecurity"), false);
+                        d
+                    })
+                    .collect();
+                // The catalog relations this server answers for, as
+                // PostgreSQL lists its own: owned by the bootstrap
+                // superuser, indexed.
+                for name in [
+                    "pg_type",
+                    "pg_attribute",
+                    "pg_range",
+                    "pg_enum",
+                    "pg_database",
+                    "pg_class",
+                    "pg_namespace",
+                ] {
+                    let mut d = Document::new();
+                    d.insert(field("schemaname"), "pg_catalog");
+                    d.insert(field("tablename"), name);
+                    d.insert(field("tableowner"), "postgres");
+                    d.insert(field("tablespace"), Bson::Null);
+                    d.insert(field("hasindexes"), true);
+                    d.insert(field("hasrules"), false);
+                    d.insert(field("hastriggers"), false);
+                    d.insert(field("rowsecurity"), false);
+                    rows.push(d);
+                }
+                rows
+            }
             "pg_cursors" => {
                 let cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
                 cursors
@@ -2869,9 +3172,11 @@ impl PgHandler {
         )
     }
 
-    /// Read one table's catalog entry. Reads it back from storage every time
-    /// rather than caching: the store is shared with the other two servers, so
-    /// a cache here would go stale behind our back.
+    /// Read one table's catalog entry: this transaction's pending creates and
+    /// drops first, then the process-wide cache of committed entries, then
+    /// storage (see `CatalogCache` for when a read fills the cache). The
+    /// store is this process's alone -- WiredTiger locks the directory -- so
+    /// every write to the catalog passes through `run` and bumps the version.
     fn lookup(&self, name: &str) -> Option<TableDef> {
         if let Some(def) = Self::virtual_table(name) {
             return Some(def);
@@ -2888,14 +3193,41 @@ impl PgHandler {
         {
             return pending.clone();
         }
+        let cache = catalog_cache();
+        let version = cache.version.load(std::sync::atomic::Ordering::SeqCst);
+        let key = (
+            Arc::as_ptr(&self.storage) as usize,
+            self.db().to_string(),
+            name.to_string(),
+        );
+        if let Some((v, def)) = cache
+            .tables
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            if *v == version {
+                return def.clone();
+            }
+        }
         let filter = bson::doc! { "_id": name };
+        // A storage error is a transient `None`, not a recorded absence.
         let rows = self
             .storage
             .find_matching(self.db(), CATALOG_COLLECTION, &filter)
             .ok()?;
-        let raw = rows.first()?;
-        let d: Document = bson::from_slice(raw).ok()?;
-        TableDef::from_document(&d)
+        let def = rows.first().and_then(|raw| {
+            let d: Document = bson::from_slice(raw).ok()?;
+            TableDef::from_document(&d)
+        });
+        if self.may_fill_catalog_cache(version) {
+            cache
+                .tables
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key, (version, def.clone()));
+        }
+        def
     }
 
     fn err(e: &PlanError) -> PgWireError {
@@ -3223,6 +3555,9 @@ fn default_settings() -> HashMap<String, String> {
         ("application_name", ""),
         ("server_encoding", "UTF8"),
         ("server_version", "15.0"),
+        // Read by a client before `ALTER USER ... PASSWORD` to pick the hash
+        // (libpq's `PQchangePassword`); PostgreSQL 16's default.
+        ("password_encryption", "scram-sha-256"),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -3645,6 +3980,14 @@ impl Drop for PgHandler {
 
 #[async_trait]
 impl SimpleQueryHandler for PgHandler {
+    async fn before_ready_for_query<C>(&self, client: &mut C) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        self.flush_notifications(client).await
+    }
+
     /// The query text arrives in the client's `client_encoding`, not
     /// necessarily UTF-8: decode the raw wire bytes from the session's
     /// encoding (a LATIN9 `select '\u{20ac}'` is the single byte 0xA4, which
@@ -3751,7 +4094,7 @@ impl PgHandler {
     /// takes the handle. After a mid-batch COMMIT a fresh implicit transaction
     /// is opened for the commands that follow, which is what PostgreSQL does.
     async fn run_batch(&self, stmts: &[String]) -> PgWireResult<Vec<Response>> {
-        let implicit = self.txn.lock().unwrap_or_else(|e| e.into_inner()).is_none();
+        let mut implicit = self.txn.lock().unwrap_or_else(|e| e.into_inner()).is_none();
         if implicit {
             self.begin_implicit()?;
         }
@@ -3759,7 +4102,22 @@ impl PgHandler {
         let mut out = Vec::with_capacity(stmts.len());
         for (i, sql) in stmts.iter().enumerate() {
             match self.run(sql, &[], 0).await {
-                Ok(responses) => out.extend(responses),
+                Ok(responses) => {
+                    // A BEGIN inside the batch makes the implicit transaction
+                    // the BLOCK: it stays open past the batch's end, and so
+                    // does a cursor declared after it. Measured on 16:
+                    // `begin; declare cur cursor for select 1;` leaves the
+                    // session in a transaction with `cur` fetchable.
+                    // Committing it here closed the cursor and left the
+                    // client believing in a block the server had ended.
+                    if responses
+                        .iter()
+                        .any(|r| matches!(r, Response::TransactionStart(_)))
+                    {
+                        implicit = false;
+                    }
+                    out.extend(responses);
+                }
                 Err(e) => {
                     if implicit {
                         // Roll back whatever this batch opened. A failure to
@@ -3771,10 +4129,8 @@ impl PgHandler {
             }
             // An explicit COMMIT or ROLLBACK inside the batch closed the
             // transaction; PostgreSQL starts another for what follows.
-            if implicit
-                && i + 1 < stmts.len()
-                && self.txn.lock().unwrap_or_else(|e| e.into_inner()).is_none()
-            {
+            if i + 1 < stmts.len() && self.txn.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+                implicit = true;
                 self.begin_implicit()?;
             }
         }
@@ -4089,6 +4445,14 @@ impl PgHandler {
             Statement::CreateTable(def, _) => {
                 vec![
                     def.name.clone(),
+                    CATALOG_COLLECTION.to_string(),
+                    SEQUENCE_COLLECTION.to_string(),
+                    Self::COMPOSITE_COLLECTION.to_string(),
+                ]
+            }
+            Statement::CreateTableAs { table, .. } => {
+                vec![
+                    table.clone(),
                     CATALOG_COLLECTION.to_string(),
                     SEQUENCE_COLLECTION.to_string(),
                     Self::COMPOSITE_COLLECTION.to_string(),
@@ -4442,6 +4806,7 @@ impl PgHandler {
         if !failed {
             return self.commit_implicit();
         }
+        self.settle_notifies(false);
         // Not `rollback_implicit`: that closes every cursor, holdable ones
         // included, and a `WITH HOLD` cursor from an earlier, committed
         // transaction survives a failed statement in PostgreSQL. The group
@@ -4497,16 +4862,19 @@ impl PgHandler {
                 self.storage
                     .rollback_user_transaction(&mut handle)
                     .map_err(|e| Self::storage_err("could not roll back a transaction", e))?;
+                self.settle_notifies(false);
                 return Err(e);
             }
             self.storage
                 .commit_user_transaction(&mut handle)
                 .map_err(|e| Self::storage_err("could not commit a transaction", e))?;
         }
+        self.settle_notifies(true);
         Ok(())
     }
 
     fn rollback_implicit(&self) -> PgWireResult<()> {
+        self.settle_notifies(false);
         self.close_cursors_on_txn_end(false);
         self.savepoints
             .lock()
@@ -4595,6 +4963,18 @@ impl PgHandler {
         let result = self
             .run_typed_inner(query, params, param_types, max_rows)
             .await;
+        // Outside a block the statement was its own transaction: its NOTIFYs
+        // go out now, or nowhere if it failed. Inside a block (or an
+        // extended-protocol statement group) they wait for the COMMIT.
+        if !self
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && !self
+                .implicit_extended
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.settle_notifies(result.is_ok());
+        }
         self.note_activity(
             if self
                 .in_transaction
@@ -4663,6 +5043,16 @@ impl PgHandler {
     /// A cancellation point: `57014` if a `CancelRequest` for this backend
     /// has arrived since the running statement started.
     fn check_cancel(&self) -> PgWireResult<()> {
+        // A `pg_terminate_backend` aimed at a RUNNING statement ends it, and
+        // the session, at the statement's next cancellation point -- the
+        // client sees the FATAL within the wait, not after it.
+        if self
+            .backend
+            .terminate
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(Self::admin_shutdown());
+        }
         if self.backend.cancelled() {
             return Err(Self::query_canceled());
         }
@@ -4729,7 +5119,7 @@ impl PgHandler {
         // COMMIT and ROLLBACK are: rolling back to a savepoint is how a client
         // RECOVERS from the error that poisoned the block.
         if let Statement::Transaction(control) = &stmt {
-            return match control {
+            let out = match control {
                 TransactionControl::Savepoint(_)
                 | TransactionControl::Release(_)
                 | TransactionControl::RollbackTo(_) => {
@@ -4742,6 +5132,11 @@ impl PgHandler {
                 }
                 other => self.transaction_control(other.clone()),
             };
+            // A COMMIT publishes the block's DDL to every other connection;
+            // a ROLLBACK (to a savepoint or of the block) restores rows the
+            // cache may have read past. See `CatalogCache`.
+            bump_catalog_version();
+            return out;
         }
 
         // Before anything writes, the open savepoints capture what it is about
@@ -5054,7 +5449,39 @@ impl PgHandler {
                 }
                 Ok(Bson::String(String::new()))
             }
-            ConstCol::TerminateBackend(inner) => {
+            ConstCol::PgNotify { channel, payload } => {
+                // `pg_notify(NULL, ...)` and `pg_notify('', ...)` are the same
+                // 22023; a NULL payload is the empty string. Probed PG 16.
+                let channel = match channel {
+                    Bson::String(c) => c.clone(),
+                    _ => String::new(),
+                };
+                let payload = match payload {
+                    Bson::String(p) => p.clone(),
+                    Bson::Null => String::new(),
+                    other => other.to_string(),
+                };
+                self.queue_notify(&channel, &payload)?;
+                Ok(Bson::String(String::new()))
+            }
+            ConstCol::ListeningChannels => Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "0A000".into(), // feature_not_supported
+                "pg_listening_channels() beside other columns is not supported yet".into(),
+            )))),
+            // Read from the source row by `const_rows`; never resolved alone.
+            ConstCol::FromColumn => Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "XX000".into(), // internal_error
+                "a FROM column outside its source".into(),
+            )))),
+            ConstCol::TerminateBackend(inner) | ConstCol::CancelBackend(inner) => {
+                let terminate = matches!(col, ConstCol::TerminateBackend(_));
+                let name = if terminate {
+                    "pg_terminate_backend"
+                } else {
+                    "pg_cancel_backend"
+                };
                 let target = match self.resolve_const_col(inner)? {
                     Bson::Int32(i) => i64::from(i),
                     Bson::Int64(i) => i,
@@ -5067,30 +5494,58 @@ impl PgHandler {
                         return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                             "ERROR".into(),
                             "22023".into(), // invalid_parameter_value
-                            format!("pg_terminate_backend() PID must be an integer, not {other}"),
+                            format!("{name}() PID must be an integer, not {other}"),
                         ))));
                     }
                 };
                 let my_pid = i64::from(self.backend_pid.load(std::sync::atomic::Ordering::Relaxed));
                 if target == my_pid {
-                    // Terminating our own backend: the CURRENT statement is the
-                    // one that dies, so raise the FATAL now rather than arming
-                    // the flag for a next statement that will never come.
-                    return Err(Self::admin_shutdown());
+                    // Our own backend: the CURRENT statement is the one that
+                    // dies (or is cancelled), so raise it now rather than
+                    // arming a flag for a next statement that will never come.
+                    return Err(if terminate {
+                        Self::admin_shutdown()
+                    } else {
+                        Self::query_canceled()
+                    });
                 }
                 // Another backend: arm its flag if it is live. PostgreSQL
-                // returns true when the signal was sent, false otherwise.
+                // returns true when the signal was sent, false -- with a
+                // WARNING -- when no such backend exists (probed 16).
                 let target = i32::try_from(target).unwrap_or(0);
                 let armed = backend_registry()
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .get(&target)
                     .map(|entry| {
-                        entry
-                            .terminate
-                            .store(true, std::sync::atomic::Ordering::Relaxed)
+                        if terminate {
+                            entry
+                                .terminate
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                        } else {
+                            entry
+                                .cancel
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        // An idle target hears a terminate from its idle
+                        // wait; an active one from its next cancellation
+                        // point (a cancel to an idle backend is dropped, as
+                        // PostgreSQL drops one).
+                        entry.wake.notify_one();
                     })
                     .is_some();
+                if !armed {
+                    let mut info = ErrorInfo::new(
+                        "WARNING".into(),
+                        "01000".into(), // warning
+                        format!("PID {target} is not a PostgreSQL backend process"),
+                    );
+                    info.routine = Some("pg_signal_backend".into());
+                    self.pending_notices
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(info);
+                }
                 Ok(Bson::Boolean(armed))
             }
         }
@@ -5151,6 +5606,177 @@ impl PgHandler {
             "57P01".into(), // admin_shutdown
             "terminating connection due to administrator command".into(),
         )))
+    }
+
+    /// Queue a NOTIFY for the open transaction.
+    ///
+    /// PostgreSQL's rules, probed on 16: the channel must be non-empty
+    /// (22023), the payload is capped at 7999 bytes (22023), and a
+    /// `(channel, payload)` pair already queued in this transaction is not
+    /// queued again -- the listener gets it once, in first-issue order.
+    fn queue_notify(&self, channel: &str, payload: &str) -> PgWireResult<()> {
+        if channel.is_empty() {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "22023".into(), // invalid_parameter_value
+                "channel name cannot be empty".into(),
+            ))));
+        }
+        if payload.len() >= 8000 {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "22023".into(), // invalid_parameter_value
+                "payload string too long".into(),
+            ))));
+        }
+        let mut pending = self
+            .pending_notifies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !pending.iter().any(|(c, p)| c == channel && p == payload) {
+            pending.push((channel.to_string(), payload.to_string()));
+        }
+        Ok(())
+    }
+
+    /// The transaction ended: apply its LISTEN / UNLISTENs and deliver its
+    /// NOTIFYs to every listening backend's inbox (this one's included) on
+    /// commit; drop both on rollback.
+    fn settle_notifies(&self, commit: bool) {
+        let listens = std::mem::take(
+            &mut *self
+                .pending_listens
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        let notifies = std::mem::take(
+            &mut *self
+                .pending_notifies
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        if !commit {
+            return;
+        }
+        if !listens.is_empty() {
+            let mut listening = self
+                .backend
+                .listening
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for op in listens {
+                match op {
+                    ListenOp::Listen(c) => {
+                        if !listening.contains(&c) {
+                            listening.push(c);
+                        }
+                    }
+                    ListenOp::Unlisten(c) => listening.retain(|l| *l != c),
+                    ListenOp::UnlistenAll => listening.clear(),
+                }
+            }
+        }
+        if notifies.is_empty() {
+            return;
+        }
+        let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
+        let registry = backend_registry().lock().unwrap_or_else(|e| e.into_inner());
+        for entry in registry.values() {
+            let mut delivered = false;
+            {
+                let listening = entry.listening.lock().unwrap_or_else(|e| e.into_inner());
+                let mut inbox = entry.inbox.lock().unwrap_or_else(|e| e.into_inner());
+                for (channel, payload) in &notifies {
+                    if listening.contains(channel) {
+                        inbox.push_back(Notification {
+                            pid,
+                            channel: channel.clone(),
+                            payload: payload.clone(),
+                        });
+                        delivered = true;
+                    }
+                }
+            }
+            if delivered {
+                entry.wake.notify_one();
+            }
+        }
+    }
+
+    /// The `NotificationResponse`s this backend owes its client right now:
+    /// everything in the inbox, unless a transaction block is open --
+    /// PostgreSQL holds them until the block ends (probed 16: a listener
+    /// idle in a block hears nothing until its COMMIT).
+    fn drain_notifications(&self) -> Vec<PgWireBackendMessage> {
+        if self
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Vec::new();
+        }
+        let mut inbox = self.backend.inbox.lock().unwrap_or_else(|e| e.into_inner());
+        inbox
+            .drain(..)
+            .map(|n| {
+                PgWireBackendMessage::NotificationResponse(NotificationResponse::new(
+                    n.pid, n.channel, n.payload,
+                ))
+            })
+            .collect()
+    }
+
+    /// The rows of a FROM-less SELECT: one, of its resolved columns -- or
+    /// none under a false WHERE (and nothing resolved, so a `pg_sleep()`
+    /// behind it does not wait) -- or, for `SELECT pg_listening_channels()`,
+    /// one per channel in LISTEN order, the set-returning shape.
+    fn const_rows(&self, sc: &secantus_pgplan::SelectConstant) -> PgWireResult<Vec<Vec<Bson>>> {
+        if !sc.where_true {
+            return Ok(Vec::new());
+        }
+        let channels = || -> Vec<Bson> {
+            self.backend
+                .listening
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .map(|c| Bson::String(c.clone()))
+                .collect()
+        };
+        if let [(_, ConstCol::ListeningChannels, _, _)] = sc.columns.as_slice() {
+            return Ok(channels().into_iter().map(|c| vec![c]).collect());
+        }
+        // `FROM function(...)`: the function is the row source -- one row
+        // per result of a set-returning one, one row otherwise -- and is
+        // evaluated exactly once, before the select list.
+        let source_rows: Vec<Option<Bson>> = match sc.source.as_deref() {
+            None => vec![None],
+            Some(ConstCol::ListeningChannels) => channels().into_iter().map(Some).collect(),
+            Some(col) => vec![Some(self.resolve_const_col(col)?)],
+        };
+        source_rows
+            .into_iter()
+            .map(|source| {
+                sc.columns
+                    .iter()
+                    .map(|(_, c, _, _)| match c {
+                        ConstCol::FromColumn => Ok(source.clone().unwrap_or(Bson::Null)),
+                        other => self.resolve_const_col(other),
+                    })
+                    .collect::<PgWireResult<Vec<_>>>()
+            })
+            .collect()
+    }
+
+    /// Send the owed `NotificationResponse`s, before a `ReadyForQuery`.
+    async fn flush_notifications<C>(&self, client: &mut C) -> PgWireResult<()>
+    where
+        C: Sink<PgWireBackendMessage> + Unpin + Send,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        for message in self.drain_notifications() {
+            client.feed(message).await?;
+        }
+        Ok(())
     }
 
     /// SAVEPOINT / RELEASE / ROLLBACK TO.
@@ -5433,6 +6059,7 @@ impl PgHandler {
                         .commit_user_transaction(&mut handle)
                         .map_err(|e| Self::storage_err("could not commit", e))?;
                 }
+                self.settle_notifies(true);
                 ("COMMIT", chain)
             }
             TransactionControl::Rollback { chain } => {
@@ -5452,6 +6079,7 @@ impl PgHandler {
                         .rollback_user_transaction(&mut handle)
                         .map_err(|e| Self::storage_err("could not roll back", e))?;
                 }
+                self.settle_notifies(false);
                 ("ROLLBACK", chain)
             }
             // Handled before this, in `run`: they are statements INSIDE a
@@ -5731,16 +6359,11 @@ impl PgHandler {
     /// read the bare column and write `id`.
     fn query_rows(&self, inner: &Statement) -> PgWireResult<Vec<Vec<Option<Bson>>>> {
         match inner {
-            Statement::SelectConstant(sc) => {
-                if !sc.where_true {
-                    return Ok(Vec::new());
-                }
-                let mut row = Vec::with_capacity(sc.columns.len());
-                for (_, col, _, _) in &sc.columns {
-                    row.push(Some(self.resolve_const_col(col)?));
-                }
-                Ok(vec![row])
-            }
+            Statement::SelectConstant(sc) => Ok(self
+                .const_rows(sc)?
+                .into_iter()
+                .map(|row| row.into_iter().map(Some).collect())
+                .collect()),
             Statement::ValuesConstant(vc) => Ok(vc
                 .rows
                 .iter()
@@ -5888,7 +6511,57 @@ impl PgHandler {
     }
 
     /// Execute one planned statement against storage.
+    /// Can this statement change the type catalog? Reads, row writes to user
+    /// tables, cursor and session-state statements cannot; everything else
+    /// (every DDL, type, function, schema and database statement, and the
+    /// forms this list does not name) is taken to. Errs on `true`: an extra
+    /// catalog re-read is cheap, a stale catalog is a wrong answer.
+    fn may_change_catalog(stmt: &Statement) -> bool {
+        !matches!(
+            stmt,
+            Statement::Select(_)
+                | Statement::SelectConstant(_)
+                | Statement::ValuesConstant(_)
+                | Statement::Insert(_)
+                | Statement::Update(_)
+                | Statement::Delete(_)
+                | Statement::Aggregate(_)
+                | Statement::CopyFrom(_)
+                | Statement::CopyTo(_)
+                | Statement::Show(_)
+                | Statement::Set { .. }
+                | Statement::Reset(_)
+                | Statement::SetTransaction(_)
+                | Statement::SetSessionCharacteristics(_)
+                | Statement::Fetch { .. }
+                | Statement::CloseCursor(_)
+                | Statement::Deallocate(_)
+                | Statement::DeallocateAll
+                | Statement::Notify { .. }
+                | Statement::Listen(_)
+                | Statement::Unlisten(_)
+        )
+    }
+
+    /// Run one planned statement, and declare the catalog changed afterwards
+    /// when the statement is one that can change it. After, not before: a
+    /// bump before would let the statement's own reads re-fill the cache
+    /// with the rows it is about to change. On failure too -- an autocommit
+    /// DDL that failed halfway is rolled back, and the cache may have read
+    /// the half. Here rather than in `run` because a statement can run
+    /// another: `CREATE TABLE AS` creates its table and then INSERTs into
+    /// it, and that INSERT's lookup must not find the "no such table" the
+    /// CTAS itself cached a moment earlier (see `CatalogCache`).
     fn execute(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response>> {
+        let may_change_catalog = Self::may_change_catalog(&stmt);
+        let out = self.execute_inner(stmt, max_rows);
+        if may_change_catalog {
+            bump_catalog_version();
+        }
+        out
+    }
+
+    fn execute_inner(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response>> {
         // A timestamptz renders in the SESSION zone; capture it once here and
         // thread it into the row encoder explicitly. A thread-local does not
         // work: pgwire may encode the DataRows lazily on another async worker
@@ -6058,6 +6731,112 @@ impl PgHandler {
                 // above is not committed yet, so a plain read cannot see it.
                 self.note_uncommitted(&def.name, Some(def.clone()));
                 Ok(vec![Response::Execution(Tag::new("CREATE TABLE"))])
+            }
+
+            // `CREATE TABLE t AS query`: the table takes the query's output
+            // columns (renamed by an explicit column list), then the query's
+            // rows are written as an `INSERT ... SELECT` would write them.
+            // Measured on 16: the tag is `SELECT n` when rows are copied and
+            // `CREATE TABLE AS` for `WITH NO DATA` or an `IF NOT EXISTS`
+            // that found the table.
+            Statement::CreateTableAs {
+                table,
+                if_not_exists,
+                temp,
+                column_names,
+                query,
+                with_data,
+            } => {
+                if self.lookup(&table).is_some() {
+                    if if_not_exists {
+                        return Ok(vec![Response::Execution(Tag::new("CREATE TABLE AS"))]);
+                    }
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42P07".into(), // duplicate_table
+                        format!("relation \"{table}\" already exists"),
+                    ))));
+                }
+                let fields = self.copy_query_fields(&query)?;
+                if column_names.len() > fields.len() {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42601".into(), // syntax_error
+                        "too many column names were specified".into(),
+                    ))));
+                }
+                let mut seen: Vec<String> = Vec::new();
+                let columns = fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| {
+                        let name = column_names
+                            .get(i)
+                            .cloned()
+                            .unwrap_or_else(|| f.name().to_string());
+                        if seen.contains(&name) {
+                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".into(),
+                                "42701".into(), // duplicate_column
+                                format!("column \"{name}\" specified more than once"),
+                            ))));
+                        }
+                        seen.push(name.clone());
+                        let pg_type = internal_type_name(f.datatype()).ok_or_else(|| {
+                            PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".into(),
+                                "0A000".into(), // feature_not_supported
+                                format!(
+                                    "CREATE TABLE AS over a column of type {} is not supported yet",
+                                    f.datatype().name()
+                                ),
+                            )))
+                        })?;
+                        Ok(secantus_pgcatalog::Column::new(&name, &pg_type, false))
+                    })
+                    .collect::<PgWireResult<Vec<_>>>()?;
+                let mut def = TableDef::new(&table, columns);
+                def.temp = temp;
+                let targets: Vec<String> = def.columns.iter().map(|c| c.name.clone()).collect();
+                // The rows are read BEFORE the table exists so a query that
+                // fails leaves nothing behind, as PostgreSQL's single
+                // transaction would.
+                let rows = if with_data {
+                    self.query_rows(&query)?
+                        .into_iter()
+                        .map(|values| {
+                            let values = values
+                                .into_iter()
+                                .map(|v| v.unwrap_or(Bson::Null))
+                                .collect();
+                            secantus_pgplan::insert_row(&def, &targets, false, values)
+                                .map_err(|e| Self::err(&e))
+                        })
+                        .collect::<PgWireResult<Vec<_>>>()?
+                } else {
+                    Vec::new()
+                };
+                self.execute(Statement::CreateTable(def, false), max_rows)?;
+                if !with_data {
+                    return Ok(vec![Response::Execution(Tag::new("CREATE TABLE AS"))]);
+                }
+                let written = rows.len();
+                if written > 0 {
+                    self.execute(
+                        Statement::Insert(secantus_pgplan::Insert {
+                            table: table.clone(),
+                            rows,
+                            returning: None,
+                            source: None,
+                            targets,
+                            explicit_columns: false,
+                        }),
+                        max_rows,
+                    )?;
+                }
+                Ok(vec![Response::Execution(
+                    Tag::new("SELECT").with_rows(written),
+                )])
             }
 
             Statement::Insert(mut ins) => {
@@ -7268,6 +8047,22 @@ impl PgHandler {
                 Ok(vec![Response::CopyOut(CopyResponse::new(code, n, data))])
             }
 
+            Statement::AlterRole(role) => {
+                let me = self
+                    .session_user
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                if role != me {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42704".into(), // undefined_object
+                        format!("role \"{role}\" does not exist"),
+                    ))));
+                }
+                Ok(vec![Response::Execution(Tag::new("ALTER ROLE"))])
+            }
+
             Statement::Show(name) => {
                 let key = canonical_setting(&name);
                 // Release the settings lock BEFORE building the field:
@@ -7348,7 +8143,27 @@ impl PgHandler {
                 prepared.remove(idx);
                 Ok(vec![Response::Execution(Tag::new("DEALLOCATE"))])
             }
-            Statement::Notify => Ok(vec![Response::Execution(Tag::new("NOTIFY"))]),
+            Statement::Notify { channel, payload } => {
+                self.queue_notify(&channel, &payload)?;
+                Ok(vec![Response::Execution(Tag::new("NOTIFY"))])
+            }
+            Statement::Listen(channel) => {
+                self.pending_listens
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(ListenOp::Listen(channel));
+                Ok(vec![Response::Execution(Tag::new("LISTEN"))])
+            }
+            Statement::Unlisten(channel) => {
+                self.pending_listens
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(match channel {
+                        Some(channel) => ListenOp::Unlisten(channel),
+                        None => ListenOp::UnlistenAll,
+                    });
+                Ok(vec![Response::Execution(Tag::new("UNLISTEN"))])
+            }
 
             Statement::Set { name, value } => {
                 let key = canonical_setting(&name);
@@ -7476,15 +8291,7 @@ impl PgHandler {
                 );
                 // A false WHERE means no row -- and nothing to resolve, so a
                 // `pg_sleep()` behind it does not wait either.
-                let values: Option<Vec<Bson>> = sc
-                    .where_true
-                    .then(|| {
-                        sc.columns
-                            .iter()
-                            .map(|(_, c, _, _)| self.resolve_const_col(c))
-                            .collect::<PgWireResult<Vec<_>>>()
-                    })
-                    .transpose()?;
+                let values = self.const_rows(&sc)?;
                 let schema_ref = schema.clone();
                 let rows = stream::iter(values).map(move |vals| {
                     let mut enc = DataRowEncoder::new(schema_ref.clone());
@@ -7915,10 +8722,9 @@ impl PgHandler {
     }
 
     /// Every table whose FOREIGN KEYs reference `parent`, with those keys.
-    fn referencing_keys(
-        &self,
-        parent: &str,
-    ) -> PgWireResult<Vec<(TableDef, secantus_pgcatalog::ForeignKey)>> {
+    /// Every user table this session can see: the committed catalog with
+    /// what this transaction created or dropped overlaid on it.
+    fn all_table_defs(&self) -> PgWireResult<Vec<TableDef>> {
         let raw = self
             .storage
             .find_matching(self.db(), CATALOG_COLLECTION, &Document::new())
@@ -7928,12 +8734,19 @@ impl PgHandler {
             .filter_map(|b| bson::from_slice::<Document>(b).ok())
             .filter_map(|d| TableDef::from_document(&d))
             .collect();
-        // What this transaction created or dropped overlays the catalog.
         {
             let pending = self.uncommitted.lock().unwrap_or_else(|e| e.into_inner());
             defs.retain(|d| !pending.contains_key(&d.name));
             defs.extend(pending.values().filter_map(|d| d.clone()));
         }
+        Ok(defs)
+    }
+
+    fn referencing_keys(
+        &self,
+        parent: &str,
+    ) -> PgWireResult<Vec<(TableDef, secantus_pgcatalog::ForeignKey)>> {
+        let defs = self.all_table_defs()?;
         Ok(defs
             .into_iter()
             .flat_map(|d| {
@@ -11325,6 +12138,15 @@ impl ExtendedQueryHandler for PgHandler {
             }
             pgwire::messages::extendedquery::TARGET_TYPE_BYTE_PORTAL => {
                 pgwire::api::store::PortalStore::rm_portal(client.portal_store(), name);
+                // A DECLAREd cursor IS a portal of that name on PostgreSQL, so
+                // a wire `Close` of it closes the cursor (libpq 17's
+                // `PQclosePortal`); the next Describe of it is `34000`.
+                if !name.is_empty() {
+                    self.cursors
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(name);
+                }
             }
             _ => {}
         }
@@ -11352,10 +12174,25 @@ impl ExtendedQueryHandler for PgHandler {
         let fields =
             self.describe_fields(&target.statement.sql, param_types.len(), &param_types)?;
         // A parameter with no mapped builtin type reports its user-type oid
-        // when the raw Parse oid named one (a composite / enum), else `unknown`
-        // -- which is what PostgreSQL does when it cannot infer. A parameter
-        // the client did not list at all (`$1` in the SQL, no oids in the
-        // Parse) is `unknown` too.
+        // when the raw Parse oid named one (a composite / enum); otherwise
+        // the type the STATEMENT gives it -- `$1::int4` describes as int4 and
+        // `$1 = 'a'` as text on PostgreSQL 16 -- and `unknown` only when
+        // nothing in the statement types it, which is what PostgreSQL does
+        // when it cannot infer.
+        let column_type = |table: &str, column: secantus_pgplan::ColumnRef<'_>| {
+            self.lookup(table).and_then(|def| {
+                let col = match column {
+                    secantus_pgplan::ColumnRef::Name(name) => def.column(name),
+                    secantus_pgplan::ColumnRef::Position(pos) => def.columns.get(pos),
+                };
+                col.map(|c| c.pg_type.clone())
+            })
+        };
+        let inferred = secantus_pgplan::catalog_param_types_opt(
+            &target.statement.sql,
+            &param_types,
+            &column_type,
+        );
         let types: Vec<Type> = (0..param_types.len())
             .map(|i| {
                 declared.get(i).cloned().flatten().unwrap_or_else(|| {
@@ -11365,6 +12202,14 @@ impl ExtendedQueryHandler for PgHandler {
                         .copied()
                         .filter(|o| *o != 0)
                         .and_then(|oid| self.user_wire_type_for_oid(oid))
+                        .or_else(|| {
+                            let name = inferred.get(i)?.as_deref()?;
+                            let t = wire_type(name);
+                            // `wire_type` answers varchar for a name it does
+                            // not know; only a real varchar keeps that.
+                            (t != Type::VARCHAR || matches!(name, "varchar" | "character varying"))
+                                .then_some(t)
+                        })
                         .unwrap_or(Type::UNKNOWN)
                 })
             })
@@ -11399,6 +12244,7 @@ impl ExtendedQueryHandler for PgHandler {
             client.set_transaction_status(pgwire::messages::response::TransactionStatus::Idle);
         }
         pgwire::api::store::PortalStore::rm_portal(client.portal_store(), DEFAULT_NAME);
+        self.flush_notifications(client).await?;
         client
             .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
                 client.transaction_status(),
@@ -11764,6 +12610,27 @@ impl PgWireServerHandlers for HandlerFactory {
     }
     fn idle_timeout(&self) -> Option<(std::time::Duration, ErrorInfo)> {
         self.0.idle_timeout()
+    }
+
+    fn idle_event(&self) -> Option<pgwire::api::IdleEventFuture<'_>> {
+        let handler = &self.0;
+        Some(Box::pin(async move {
+            loop {
+                if handler
+                    .backend
+                    .terminate
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    let info: ErrorInfo = PgHandler::admin_shutdown().into();
+                    return pgwire::api::IdleEvent::Fatal(info);
+                }
+                let messages = handler.drain_notifications();
+                if !messages.is_empty() {
+                    return pgwire::api::IdleEvent::Send(messages);
+                }
+                handler.backend.wake.notified().await;
+            }
+        }))
     }
 }
 
