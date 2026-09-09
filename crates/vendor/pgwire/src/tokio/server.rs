@@ -626,6 +626,19 @@ macro_rules! process_socket_messages {
                     _ = &mut $startup_timeout => None,
                     msg = socket.next() => msg,
                 }
+            } else if let Some((wait, error)) = $handlers.idle_timeout() {
+                // PostgreSQL's idle timeouts: when the session sits idle past
+                // the handler's deadline, send the FATAL error and close the
+                // connection (the client sees it on its next round trip).
+                tokio::select! {
+                    _ = sleep(wait) => {
+                        let _ = socket
+                            .send(PgWireBackendMessage::ErrorResponse(error.into()))
+                            .await;
+                        break;
+                    }
+                    msg = socket.next() => msg,
+                }
             } else {
                 socket.next().await
             };

@@ -128,10 +128,94 @@ impl Column {
     }
 }
 
+/// A declared CHECK constraint. `expression` is the SQL text of the
+/// predicate (PostgreSQL's deparse of what the user wrote, e.g. `(a > 0)`);
+/// the server re-plans it against the table's columns on every write.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckConstraint {
+    pub name: String,
+    pub expression: String,
+}
+
+/// A declared FOREIGN KEY constraint, in the Python server's on-disk shape.
+/// `on_delete` / `on_update` are the referential action keywords as PostgreSQL
+/// spells them (`NO ACTION`, `RESTRICT`, `CASCADE`, `SET NULL`, `SET DEFAULT`);
+/// `None` is the default (`NO ACTION`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForeignKey {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub ref_table: String,
+    pub ref_columns: Vec<String>,
+    pub on_delete: Option<String>,
+    pub on_update: Option<String>,
+    pub deferrable: bool,
+    pub initially_deferred: bool,
+}
+
+impl CheckConstraint {
+    pub fn to_document(&self) -> Document {
+        doc! {
+            "name": &self.name,
+            "expression": &self.expression,
+            "comment": Bson::Null,
+        }
+    }
+
+    pub fn from_document(d: &Document) -> Option<Self> {
+        Some(Self {
+            name: d.get_str("name").ok()?.to_string(),
+            expression: d.get_str("expression").ok()?.to_string(),
+        })
+    }
+}
+
+impl ForeignKey {
+    pub fn to_document(&self) -> Document {
+        doc! {
+            "name": &self.name,
+            "columns": self.columns.clone(),
+            "ref_table": &self.ref_table,
+            "ref_columns": self.ref_columns.clone(),
+            "on_delete": self.on_delete.as_deref().map_or(Bson::Null, Bson::from),
+            "on_update": self.on_update.as_deref().map_or(Bson::Null, Bson::from),
+            "deferrable": self.deferrable,
+            "initially_deferred": self.initially_deferred,
+            "comment": Bson::Null,
+        }
+    }
+
+    pub fn from_document(d: &Document) -> Option<Self> {
+        let strings = |key: &str| -> Option<Vec<String>> {
+            Some(
+                d.get_array(key)
+                    .ok()?
+                    .iter()
+                    .filter_map(|b| b.as_str().map(str::to_string))
+                    .collect(),
+            )
+        };
+        Some(Self {
+            name: d.get_str("name").ok()?.to_string(),
+            columns: strings("columns")?,
+            ref_table: d.get_str("ref_table").ok()?.to_string(),
+            ref_columns: strings("ref_columns")?,
+            on_delete: d.get_str("on_delete").ok().map(str::to_string),
+            on_update: d.get_str("on_update").ok().map(str::to_string),
+            deferrable: d.get_bool("deferrable").unwrap_or(false),
+            initially_deferred: d.get_bool("initially_deferred").unwrap_or(false),
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableDef {
     pub name: String,
     pub columns: Vec<Column>,
+    /// `CREATE TEMP TABLE`: reflected as living in a `pg_temp_N` schema.
+    pub temp: bool,
+    pub check_constraints: Vec<CheckConstraint>,
+    pub foreign_keys: Vec<ForeignKey>,
 }
 
 impl TableDef {
@@ -139,6 +223,9 @@ impl TableDef {
         Self {
             name: name.to_string(),
             columns,
+            temp: false,
+            check_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
         }
     }
 
@@ -164,9 +251,12 @@ impl TableDef {
             "pk_name": Bson::Null,
             "pk_comment": Bson::Null,
             "pk_column_order": Bson::Null,
-            "temp": false,
-            "foreign_keys": Vec::<Bson>::new(),
-            "check_constraints": Vec::<Bson>::new(),
+            "temp": self.temp,
+            "foreign_keys": self.foreign_keys.iter().map(|f| Bson::Document(f.to_document()))
+                .collect::<Vec<_>>(),
+            "check_constraints": self.check_constraints.iter()
+                .map(|c| Bson::Document(c.to_document()))
+                .collect::<Vec<_>>(),
             "unique_constraints": Vec::<Bson>::new(),
             "expr_indexes": Vec::<Bson>::new(),
         }
@@ -181,6 +271,25 @@ impl TableDef {
                 .filter_map(|b| b.as_document())
                 .filter_map(Column::from_document)
                 .collect(),
+            temp: d.get_bool("temp").unwrap_or(false),
+            check_constraints: d
+                .get_array("check_constraints")
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|b| b.as_document())
+                        .filter_map(CheckConstraint::from_document)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            foreign_keys: d
+                .get_array("foreign_keys")
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|b| b.as_document())
+                        .filter_map(ForeignKey::from_document)
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
     }
 }

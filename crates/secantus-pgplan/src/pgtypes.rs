@@ -21,6 +21,7 @@ pub const BUILTIN_TYPES: &[(&str, i64, i64)] = &[
     ("json", 114, 199),
     ("float4", 700, 1021),
     ("float8", 701, 1022),
+    ("aclitem", 1033, 1034),
     ("box", 603, 1020),
     ("bpchar", 1042, 1014),
     ("varchar", 1043, 1015),

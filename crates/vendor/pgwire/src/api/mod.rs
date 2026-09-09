@@ -587,6 +587,16 @@ pub trait PgWireServerHandlers: 'static {
     fn cancel_handler(&self) -> Arc<impl cancel::CancelHandler> {
         Arc::new(NoopHandler)
     }
+
+    /// An idle timeout for the next wait for a frontend message, once startup
+    /// is complete: how long to wait, and the FATAL error to send before the
+    /// connection is closed when no message arrives in time. This is how
+    /// `idle_in_transaction_session_timeout` / `idle_session_timeout` are
+    /// implemented: the handler decides per wait, from its own session state,
+    /// whether a deadline applies. `None` waits indefinitely.
+    fn idle_timeout(&self) -> Option<(std::time::Duration, crate::error::ErrorInfo)> {
+        None
+    }
 }
 
 impl<T> PgWireServerHandlers for Arc<T>
@@ -615,6 +625,10 @@ where
 
     fn cancel_handler(&self) -> Arc<impl cancel::CancelHandler> {
         (**self).cancel_handler()
+    }
+
+    fn idle_timeout(&self) -> Option<(std::time::Duration, crate::error::ErrorInfo)> {
+        (**self).idle_timeout()
     }
 }
 

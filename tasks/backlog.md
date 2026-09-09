@@ -444,11 +444,10 @@ of `uuid` / `json` / `jsonb` / `inet` / `cidr` / range columns are all fixed
 and byte-identical to PostgreSQL 16 (`test_copy_in_empty`,
 `test_copy_in_records_binary`, `test_copy_to_leaks`, `test_copy_from_leaks`
 pass; the leak tests still hit the 34-digit `numeric` limit on some draws).
-STILL OPEN:
-  - **SQL-helper gaps unrelated to COPY** (`test_copy_*_allchars`,
-    `test_copy_out_server_error`): `unnest()`, `GROUP BY` over an expression, and
-    a bare `AExpr` (`1/n`) in the COPY source query are unsupported SQL, not COPY
-    bugs.
+**2026-09-09:** the SQL-helper gaps behind `test_copy_*_allchars` are closed
+too — `GROUP BY` over an expression or a select-list position, `IS [NOT] NULL`
+as a value, and a FROM-less `select unnest(array)` — so all three pass, as does
+`test_copy_out_server_error`.
 
 **Rust pgserver composite PARAMETERS — LANDED 2026-09-08 (psycopg's
 `vendor/psycopg/tests/types/test_composite.py`, oracle PostgreSQL 14; 24 → 18
@@ -570,35 +569,40 @@ A FATAL over the simple query protocol now closes the socket without a trailing
 `test_context_inerror_rollback_no_clobber`, `test_auto_transaction_fail`. Six
 remain open:
 
-- [ ] **OPEN — RUST pgserver: `test_cancel_safe_error` / `test_cancel_safe_timeout`
-      need real query cancellation.** These drive `conn.cancel_safe()` through a
-      `pproxy` man-in-the-middle (also not installed) and expect the
-      CancelRequest backend protocol. The server assigns a secret key at startup
-      (pgwire) but does not act on a CancelRequest. Sized as a protocol slice
-      (wire the pgwire CancellationManager to interrupt an in-flight query),
-      deferred from this batch. Marked `slow`/`timing`.
-- [ ] **OPEN — RUST pgserver: `test_connect_bad` — connecting with a nonexistent
-      database is accepted, not rejected with `3D000`.** The server hardcodes the
-      `postgres` namespace (`PgHandler::new(storage, "postgres")`) and ignores the
-      startup `database` parameter entirely, so `dbname=nosuchdb` silently uses
-      `postgres` storage. A real fix needs a database registry and a startup-time
-      rejection (FATAL `3D000` before `ReadyForQuery`); the server has no
-      multi-database concept today. Deferred — separate feature, not error mapping.
-      Re-measured 2026-09-09: PG 16.15 answers `FATAL: database "nosuchdb" does
-      not exist` (`3D000`); `test_pgconn_error` / `test_pgconn_error_pickle` in
-      psycopg's `test_errors.py` fail on the same gap. A naive "reject anything
-      but `postgres`" would break the pgjdbc gauge, which connects with
-      `PGDBNAME=test` — the fix needs a database registry, `CREATE DATABASE`,
-      and a runner-side create step for that gauge.
-- [ ] **OPEN — RUST pgserver: `standard_conforming_strings` is not reported as
-      a `ParameterStatus` on `SET` (`test_sql.py::test_quote_stable_despite_
-      deranged_libpq[off]`, 2026-09-09).** The test runs `set
-      standard_conforming_strings to off` and expects libpq's
-      `PQparameterStatus` to flip so `quote_literal` output changes; PG 16.15
-      reports the new value and renders `E'\\'` style literals. The Rust
-      planner's parser (pg_query) has the setting hard-wired ON, so the server
-      could only ANNOUNCE a value it does not honour — per the "only report GUCs
-      you honor" rule it stays silent. The `[on]` variant passes.
+- [ ] **OPEN — RUST pgserver: `test_generators.py::test_cancel` hangs on macOS
+      in a libpq CLIENT race, and `test_cancel_safe_error` /
+      `test_cancel_safe_timeout` need the `pproxy` package (2026-09-09).**
+      CancelRequest itself SHIPPED that day: the backend registry matches the
+      pid / secret key, sets a per-backend flag polled by `pg_sleep`, row scans
+      and the COPY OUT stream, the statement answers `57014`, and the
+      synchronous execution runs under `tokio::task::block_in_place` so the
+      cancel connection is served DURING the statement (before that the
+      runtime's I/O driver was never polled while a statement ran, so every
+      other connection stalled too). `test_copy_out_error_with_copy_not_finished`
+      passes. `test_cancel` still hangs, and it is not the server: psycopg's
+      `waiting.wait_conn(gen, interval=0.0)` drives `PQcancelPoll` before the
+      non-blocking loopback `connect()` has completed; on macOS libpq reads
+      `SO_ERROR == 0` mid-connect, goes STARTED→MADE, `send()`s the SSLRequest
+      and gets `ENOTCONN`, swallows it (`connection to server at "127.0.0.1",
+      port N failed: ` with an empty reason), and waits in `SSL_STARTUP` for
+      an `N` that can never arrive. Instrumented pgwire showed the server
+      never received a byte on that socket. The same test lost 9 of 10 rounds
+      against NATIVE PostgreSQL 16 over TCP on this box, so it is a client
+      timing race (Linux loopback connect is synchronous, which is why psycopg
+      CI never sees it). A logging TCP tap confirmed the shape: the cancel
+      socket is accepted and the client writes NOTHING on it for the life of
+      the test, while the same call sequence polled every 100 ms sends the
+      SSLRequest and the CancelRequest and passes. `sslmode=disable` /
+      `gssencmode=disable` in the DSN change nothing — the race is in the
+      connect, not the encryption negotiation. The `cancel_safe_*` pair import `pproxy`
+      (`tests/fix_proxy.py`), which the venv does not carry. Nothing to do
+      server-side; count the three as harness failures on macOS.
+- RUST pgserver: `standard_conforming_strings = off` is honoured by a lexer
+  pass that rewrites each plain literal to the `E'...'` it means before
+  pg_query (which has the setting hard-wired on) sees it, with the
+  `escape_string_warning` notices; `N'...'` literals are not rewritten (they
+  keep the conforming reading), and `backslash_quote` is not a setting
+  (2026-09-09).
 - [ ] **OPEN — RUST pgserver: `test_sql.py::TestLiteral::test_invalid_name[*]`
       needs shell types + `CREATE FUNCTION ... LANGUAGE internal` + `CREATE
       TYPE (input=..., output=...)` (`DefineStmt`, 2026-09-09).** The test
@@ -672,27 +676,14 @@ remain open:
   - `float4` / `float8` columns keep MQL's NaN placement (below every
     number) in WHERE; PG puts NaN above infinity for floats too. Only
     `numeric` was moved in this slice.
-- [ ] **OPEN — RUST pgserver: NOT NULL / CHECK / FOREIGN KEY constraints are
-      not enforced at all (re-measured 2026-09-09; `test_commit_error`,
-      `test_diag_from_commit[_async]`, `test_diag_attr_values`).** Against
-      PostgreSQL 16.15: `create table c1 (id int not null); insert into c1
-      values (null)` → `23502 null value in column "id" of relation "c1"
-      violates not-null constraint` (same for `serial`); `create table c1 (id
-      int check (id > 0)); insert into c1 values (-1)` → `23514 new row for
-      relation "c1" violates check constraint "c1_id_check"`; `create table c2
-      (id int references c1(id)); insert into c2 values (42)` → `23503 insert
-      or update on table "c2" violates foreign key constraint "c2_id_fkey"`,
-      and with `deferrable initially deferred` the same 23503 fires at
-      `COMMIT`. The Rust server answers `OK` to all five. The earlier entry
-      framed this as "no constraint-deferral machinery"; the gap is one level
-      down — the catalog records none of the three constraints and the INSERT
-      / UPDATE paths check nothing. Feature build: constraint catalog +
-      per-row checks + a deferred-check list run at COMMIT.
-- [ ] **OPEN — RUST pgserver: `test_right_exception_on_session_timeout` needs
-      `idle_in_transaction_session_timeout`.** Expects an idle transaction to be
-      killed with `25P03` (`IdleInTransactionSessionTimeout`) after the GUC's
-      window. The GUC is accepted but not enforced (no idle timer). Deferred —
-      needs a per-connection idle timer wired to the accept loop.
+- [ ] **OPEN — RUST pgserver: column-level `UNIQUE` is accepted and silently
+      not enforced, and there is no `pg_constraint` virtual table
+      (2026-09-09).** NOT NULL / CHECK / FOREIGN KEY landed (catalog + per-row
+      checks + a deferred-check list run at COMMIT; the same catalog document
+      shape the Python server writes). A `unique` column constraint still
+      plans as a plain column — a second equal value inserts where PG 16
+      answers `23505` — and `pg_constraint` queries answer `42P01`. Multi-
+      column FOREIGN KEYs and `ON DELETE SET DEFAULT` are refused `0A000`.
 
 **Rust server errors where Python defers — MEASURED 2026-08-26, and the five
 entries describing it are largely stale.** A three-way probe of 45
@@ -2371,10 +2362,6 @@ These are explicit non-goals. Don't add them without a reason.
     statement (psycopg never does this — it re-prepares).
   - `information_schema.columns` for a catalog VIEW (`where table_name =
     'pg_prepared_statements'`) is `relation "columns" does not exist`.
-  - `test_copy_out_error_with_copy_not_finished`: after a COPY OUT is
-    abandoned mid-stream psycopg sends CancelRequest and drains; PG ends the
-    transaction `INERROR` (57014), ours stays `INTRANS` — the CancelRequest
-    item below.
 
 - [ ] **OPEN — RUST pgserver `DROP SCHEMA ... CASCADE` drops only the schema
   record (measured 2026-09-09).** Types created in the schema (range, enum,
@@ -5677,24 +5664,16 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   is supported; the named form would need the wire layer's prepared-statement
   store, and PostgreSQL answers `26000` for a name that does not exist, so
   accepting it as a no-op would be a wrong answer.
-- [ ] **OPEN — Rust PG server: a table's row type is not a composite type
-  (2026-09-09).** `create table mytype (data text); select '(foo)'::mytype`
-  is `a cast to mytype is not supported yet` (0A000); PostgreSQL 16 answers
-  `(foo)`, and `TypeInfo.fetch(conn, "mytype")` finds a `pg_type` row with
-  `typrelid` = the table's `pg_class` oid. There is no `pg_class` and no
-  per-table oid anywhere in the shared catalog, so this needs an oid minted
-  at `CREATE TABLE` (a contract with the Python server's `__sql_*__` docs),
-  a `pg_type` row per table, and `composites_with_schema` folding tables in
-  with their columns as the field list. psycopg `test_array_register`.
-- [ ] **OPEN — Rust PG server: the `aclitem` type (2026-09-09).**
-  `select '{postgres=r/postgres}'::aclitem[]` is `a cast to aclitem is not
-  supported yet`; on PostgreSQL 16 it is oid 1033 / array 1034, and its
-  parser resolves grantee and grantor against the ROLE catalog
-  (`'nobody=r'::aclitem` is `role "nobody" does not exist`, a bare grantee
-  defaults the grantor to the session user with a WARNING, a bad mode char
-  is `invalid mode character: must be one of "arwdDxtXUCTcsA"`, `'junk'` is
-  `unrecognized key word: "junk"`). Needs a roles catalog first. psycopg
-  `test_array_of_unknown_builtin`.
+- **Rust PG server: `aclitem` knows one role (2026-09-09).** The parser is
+  PostgreSQL 16's, but there is no role catalog, so the only grantee /
+  grantor it resolves is the session user (`'nobody=r/test'::aclitem` is
+  `42704 role "nobody" does not exist`, as on PostgreSQL for a role that is
+  not there; `public` too — PostgreSQL's `PUBLIC` is the EMPTY grantee, so
+  `'=r/test'` is the spelling that works on both). An omitted grantor
+  defaults to the session user, where PostgreSQL uses the bootstrap
+  superuser (`jd=r/postgres`), with the same WARNING. Stored as text, so
+  `'x=r/x'::aclitem::oid` is `22P02` where PostgreSQL has no such cast
+  (`42846`).
 - [ ] **OPEN — Rust PG server: `box = box` is refused (2026-09-09).**
   `select '(1,2),(3,4)'::box = '(3,4),(1,2)'::box` is `comparing document
   with document using = is not supported yet`; PostgreSQL 16 answers `t`
@@ -5759,12 +5738,11 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   goes through ryu, so `1e20::float4` is `1e20` where PostgreSQL 16 prints
   `1e+20`. Same fix as `geo::float8_text`, with float4's 6-digit shortest
   round-trip.
-- **Rust PG server: psycopg's `test_array.py` is 156/158 (2026-09-09).**
+- **Rust PG server: psycopg's `test_array.py` is 158/158 (2026-09-09).**
   Multidimensional arrays round-trip in text and binary both ways,
   `INSERT … RETURNING`, the `box` type and its `;` array separator all
-  land; what is left is a table's row type as a composite
-  (`test_array_register`) and `test_array_of_unknown_builtin` (`aclitem`),
-  both above.
+  land, a table's row type is a composite (`test_array_register`) and
+  `aclitem` parses (`test_array_of_unknown_builtin`), both 2026-09-09.
 
 - [x] **Five probes never compared the Rust server — instrumented 2026-09-02.**
   `tools/probes/_servers.py` is now the shared `probe_targets()` helper, and

@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use bson::{Bson, Document};
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::{stream, Sink, SinkExt, StreamExt, TryStreamExt};
-use pgwire::api::auth::noop::NoopStartupHandler;
+use pgwire::api::auth::{DefaultServerParameterProvider, StartupHandler};
 use pgwire::api::copy::CopyHandler;
 use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{send_describe_response, ExtendedQueryHandler, SimpleQueryHandler};
@@ -32,11 +32,12 @@ use pgwire::api::results::{CopyResponse, DescribePortalResponse, DescribeStateme
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::{ClientInfo, ClientPortalStore, PgWireServerHandlers, Type, DEFAULT_NAME};
+use pgwire::api::{PidSecretKeyGenerator, RandomPidSecretKeyGenerator};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
 use pgwire::messages::data::DataRow;
-use pgwire::messages::extendedquery::{Describe, Parse, TARGET_TYPE_BYTE_PORTAL};
-use pgwire::messages::response::CommandComplete;
+use pgwire::messages::extendedquery::{Describe, Parse, Sync as PgSync, TARGET_TYPE_BYTE_PORTAL};
+use pgwire::messages::response::{CommandComplete, ReadyForQuery};
 use pgwire::messages::simplequery::Query;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::types::format::FormatOptions;
@@ -50,17 +51,97 @@ use secantus_pgplan::{
 };
 use secantus_storage::{Storage, UserTransactionHandle};
 
-/// Process-wide map of every live backend's PID to its "please terminate"
-/// flag.
+/// One live backend as the OTHER backends -- and a `CancelRequest` -- see it.
 ///
-/// `pg_terminate_backend(pid)` on ANOTHER connection sets that connection's
-/// flag; the target notices at the top of its next statement and ends with a
-/// `57P01`, exactly as a real backend torn down by an administrator would.
-/// One handler per connection registers here at startup and deregisters on
-/// drop, so a stale PID is never signalled.
-fn backend_registry() -> &'static Mutex<HashMap<i32, Arc<AtomicBool>>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<i32, Arc<AtomicBool>>>> = OnceLock::new();
+/// `pg_terminate_backend(pid)` on another connection sets `terminate`; the
+/// target notices at the top of its next statement and ends with a `57P01`,
+/// exactly as a real backend torn down by an administrator would. A
+/// `CancelRequest` carrying this backend's PID and secret sets `cancel`; the
+/// running statement's cancellation points (`pg_sleep`, the row scan, the
+/// COPY OUT stream) notice it and answer `57014`. `activity` is the row
+/// `pg_stat_activity` shows for this backend.
+pub struct BackendEntry {
+    /// The `BackendKeyData` secret, set once startup has assigned it. A
+    /// `CancelRequest` with the wrong secret is ignored, as PostgreSQL's is.
+    secret: OnceLock<Bytes>,
+    terminate: AtomicBool,
+    cancel: AtomicBool,
+    /// A result streamed AFTER its statement answered (COPY OUT) failed --
+    /// a cancel mid-stream. The next statement sees it and poisons the block
+    /// the way the failed statement itself would have.
+    stream_failed: AtomicBool,
+    activity: Mutex<BackendActivity>,
+}
+
+/// What `pg_stat_activity` reports for one backend.
+#[derive(Clone)]
+struct BackendActivity {
+    datname: String,
+    usename: String,
+    application_name: String,
+    backend_start: bson::DateTime,
+    query_start: Option<bson::DateTime>,
+    state_change: Option<bson::DateTime>,
+    /// `active`, `idle`, `idle in transaction`, `idle in transaction (aborted)`.
+    state: &'static str,
+    query: String,
+}
+
+impl BackendEntry {
+    fn new(datname: &str) -> Self {
+        Self {
+            secret: OnceLock::new(),
+            terminate: AtomicBool::new(false),
+            cancel: AtomicBool::new(false),
+            stream_failed: AtomicBool::new(false),
+            activity: Mutex::new(BackendActivity {
+                datname: datname.to_string(),
+                usename: String::new(),
+                application_name: String::new(),
+                backend_start: bson::DateTime::now(),
+                query_start: None,
+                state_change: None,
+                state: "idle",
+                query: String::new(),
+            }),
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Process-wide map of every live backend's PID to its entry. One handler
+/// per connection registers here at startup and deregisters on drop, so a
+/// stale PID is never signalled.
+fn backend_registry() -> &'static Mutex<HashMap<i32, Arc<BackendEntry>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<i32, Arc<BackendEntry>>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The `CancelRequest` handler: a cancel connection names a `(pid, secret)`,
+/// and the matching live backend's `cancel` flag is raised. An unknown PID
+/// or a wrong secret is silently ignored, as PostgreSQL ignores it -- the
+/// cancel connection gets no answer either way.
+pub struct CancelBackend;
+
+#[async_trait]
+impl pgwire::api::cancel::CancelHandler for CancelBackend {
+    async fn on_cancel_request(&self, request: pgwire::messages::cancel::CancelRequest) {
+        let entry = backend_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&request.pid)
+            .cloned();
+        if let Some(entry) = entry {
+            if entry.secret.get() == Some(&request.secret_key.to_bytes()) {
+                entry
+                    .cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 /// A composite type's fields: `(field name, field type name)`, in order.
@@ -86,10 +167,188 @@ fn bson_i64(v: &Bson) -> Option<i64> {
     }
 }
 
+/// One row of `pg_database`: a database this server will accept a connection to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DatabaseInfo {
+    pub oid: i64,
+    pub name: String,
+    pub is_template: bool,
+    pub allow_conn: bool,
+}
+
+/// The databases this server has, which is what a startup packet's `database`
+/// is checked against (an unknown name is FATAL `3D000`, as PostgreSQL's is).
+///
+/// Three sources, in `pg_database` order: the builtin `template1` /
+/// `template0` / `postgres` (oids 1 / 4 / 5, as `initdb` numbers them), the
+/// names the daemon was started with (`--database`, so a harness can serve a
+/// name without a `CREATE DATABASE` first), and the ones `CREATE DATABASE`
+/// recorded -- persisted in a namespace of their own so that dropping any
+/// user database, the default one included, cannot take the registry with it.
+pub struct DatabaseRegistry {
+    /// The storage namespace a connection lands in when it names no database
+    /// the registry knows a namespace for -- every `dbname=postgres` gauge.
+    default: String,
+    /// `--database` names. A `Mutex` because `DROP DATABASE` removes one.
+    configured: Mutex<Vec<String>>,
+}
+
+impl DatabaseRegistry {
+    /// The namespace and collection the `CREATE DATABASE` records live in.
+    const NAMESPACE: &'static str = "__secantus_pg__";
+    const COLLECTION: &'static str = "databases";
+    /// Where `initdb` starts user oids.
+    const FIRST_USER_OID: i64 = 16384;
+
+    pub fn new(default: &str, configured: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            default: default.to_string(),
+            configured: Mutex::new(configured.into_iter().collect()),
+        }
+    }
+
+    pub fn default_db(&self) -> &str {
+        &self.default
+    }
+
+    fn builtin() -> [DatabaseInfo; 3] {
+        let info = |oid, name: &str, is_template, allow_conn| DatabaseInfo {
+            oid,
+            name: name.to_string(),
+            is_template,
+            allow_conn,
+        };
+        [
+            info(1, "template1", true, true),
+            info(4, "template0", true, false),
+            info(5, "postgres", false, true),
+        ]
+    }
+
+    /// The `CREATE DATABASE` records, in oid order.
+    fn persisted(&self, storage: &Storage) -> PgWireResult<Vec<DatabaseInfo>> {
+        let exists = storage
+            .collection_exists(Self::NAMESPACE, Self::COLLECTION)
+            .map_err(|e| PgHandler::storage_err("could not read the databases", e))?;
+        if !exists {
+            return Ok(Vec::new());
+        }
+        let mut out: Vec<DatabaseInfo> = storage
+            .find_matching(Self::NAMESPACE, Self::COLLECTION, &Document::new())
+            .map_err(|e| PgHandler::storage_err("could not read the databases", e))?
+            .iter()
+            .filter_map(|bytes| bson::from_slice::<Document>(bytes).ok())
+            .filter_map(|d| {
+                Some(DatabaseInfo {
+                    oid: d.get("oid").and_then(bson_i64)?,
+                    name: d.get_str("_id").ok()?.to_string(),
+                    is_template: false,
+                    allow_conn: true,
+                })
+            })
+            .collect();
+        out.sort_by_key(|d| d.oid);
+        Ok(out)
+    }
+
+    /// Every database, in `pg_database` order.
+    pub fn all(&self, storage: &Storage) -> PgWireResult<Vec<DatabaseInfo>> {
+        let mut out: Vec<DatabaseInfo> = Self::builtin().to_vec();
+        let configured = self
+            .configured
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut next_oid = Self::FIRST_USER_OID;
+        for name in configured {
+            if out.iter().any(|d| d.name == name) {
+                continue;
+            }
+            next_oid += 1;
+            out.push(DatabaseInfo {
+                oid: next_oid,
+                name,
+                is_template: false,
+                allow_conn: true,
+            });
+        }
+        for info in self.persisted(storage)? {
+            if !out.iter().any(|d| d.name == info.name) {
+                out.push(info);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn lookup(&self, storage: &Storage, name: &str) -> PgWireResult<Option<DatabaseInfo>> {
+        Ok(self.all(storage)?.into_iter().find(|d| d.name == name))
+    }
+
+    /// Records a `CREATE DATABASE`. The caller has checked the name is new.
+    fn create(&self, storage: &Storage, name: &str) -> PgWireResult<()> {
+        let exists = storage
+            .collection_exists(Self::NAMESPACE, Self::COLLECTION)
+            .map_err(|e| PgHandler::storage_err("could not record the database", e))?;
+        if !exists {
+            storage
+                .create_collection(Self::NAMESPACE, Self::COLLECTION)
+                .map_err(|e| PgHandler::storage_err("could not record the database", e))?;
+        }
+        // Past every oid in use, so a dropped-and-recreated name gets a new
+        // one as PostgreSQL's does.
+        let oid = self
+            .all(storage)?
+            .iter()
+            .map(|d| d.oid)
+            .max()
+            .unwrap_or(Self::FIRST_USER_OID)
+            .max(Self::FIRST_USER_OID)
+            + 1;
+        let doc = bson::doc! {"_id": name, "oid": oid};
+        let bytes = bson::to_vec(&doc)
+            .map_err(|e| PgHandler::storage_err("could not encode the database", e))?;
+        storage
+            .insert(Self::NAMESPACE, Self::COLLECTION, vec![bytes], true)
+            .map_err(|e| PgHandler::storage_err("could not record the database", e))?;
+        Ok(())
+    }
+
+    /// Forgets a database and drops its data. The caller has checked it exists
+    /// and may be dropped.
+    fn remove(&self, storage: &Storage, name: &str) -> PgWireResult<()> {
+        self.configured
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|n| n != name);
+        let exists = storage
+            .collection_exists(Self::NAMESPACE, Self::COLLECTION)
+            .map_err(|e| PgHandler::storage_err("could not drop the database", e))?;
+        if exists {
+            storage
+                .delete_matching(
+                    Self::NAMESPACE,
+                    Self::COLLECTION,
+                    &bson::doc! {"_id": name},
+                    0,
+                    &Document::new(),
+                    None,
+                )
+                .map_err(|e| PgHandler::storage_err("could not drop the database", e))?;
+        }
+        storage
+            .drop_database(name)
+            .map_err(|e| PgHandler::storage_err("could not drop the database", e))?;
+        Ok(())
+    }
+}
+
 /// One database's worth of SQL over a shared `Storage`.
 pub struct PgHandler {
     storage: Arc<Storage>,
-    db: String,
+    /// The database the startup packet named, once it has been checked
+    /// against the registry; the registry's default until then.
+    db: OnceLock<String>,
+    databases: Arc<DatabaseRegistry>,
     /// The open explicit transaction, if any.
     ///
     /// One handler per connection, so this is per-session state exactly as
@@ -194,10 +453,28 @@ pub struct PgHandler {
     /// PostgreSQL reports the real role; a fixed name was a wrong answer for
     /// every client not connecting as that name.
     session_user: Mutex<String>,
-    /// This connection's entry in [`backend_registry`]: another backend's
-    /// `pg_terminate_backend` sets it, and `run_typed` checks it before every
-    /// statement so the connection ends with a `57P01`.
-    terminate: Arc<AtomicBool>,
+    /// This connection's entry in [`backend_registry`]: what another
+    /// backend's `pg_terminate_backend`, a `CancelRequest`, and every
+    /// `pg_stat_activity` read see of it.
+    backend: Arc<BackendEntry>,
+    /// `(table, constraint name)` of every INITIALLY DEFERRED foreign key a
+    /// write in the open transaction touched; re-checked at COMMIT.
+    deferred_fks: Mutex<Vec<(String, String)>>,
+    /// Set when a COMMIT failed its deferred checks and rolled back: the
+    /// error goes out, and the `ReadyForQuery` after it must say IDLE (the
+    /// transaction is over), where pgwire's error path would say failed.
+    commit_failed: AtomicBool,
+    /// An extended-protocol STATEMENT GROUP is open: the transaction handle
+    /// in `txn` was opened by the first `Execute` since the last `Sync`, not
+    /// by a `BEGIN`. PostgreSQL runs every statement between two `Sync`s in
+    /// one transaction (`TBLOCK_STARTED`) that commits at the `Sync` -- so an
+    /// error rolls back the group's earlier statements too, which is what a
+    /// pipelining client relies on. It is NOT a transaction block:
+    /// `in_transaction` stays false, so `DECLARE` and `SAVEPOINT` still
+    /// answer `25P01`, and a `BEGIN` inside the group turns it into one.
+    implicit_extended: AtomicBool,
+    /// A statement in the open group failed: the group rolls back at `Sync`.
+    group_failed: AtomicBool,
 }
 
 /// A user type created (`Some(doc)`) or dropped (`None`) in the open
@@ -283,10 +560,11 @@ struct CopyInState {
 }
 
 impl PgHandler {
-    pub fn new(storage: Arc<Storage>, db: &str) -> Self {
+    pub fn new(storage: Arc<Storage>, databases: Arc<DatabaseRegistry>) -> Self {
         Self {
             storage,
-            db: db.to_string(),
+            db: OnceLock::new(),
+            databases,
             txn: Mutex::new(None),
             settings: Arc::new(Mutex::new(default_settings())),
             pending_notices: Mutex::new(Vec::new()),
@@ -303,8 +581,20 @@ impl PgHandler {
             cursor_capture: std::sync::Arc::new(Mutex::new(None)),
             backend_pid: AtomicI32::new(0),
             session_user: Mutex::new(String::new()),
-            terminate: Arc::new(AtomicBool::new(false)),
+            backend: Arc::new(BackendEntry::new("")),
+            deferred_fks: Mutex::new(Vec::new()),
+            commit_failed: AtomicBool::new(false),
+            implicit_extended: AtomicBool::new(false),
+            group_failed: AtomicBool::new(false),
         }
+    }
+
+    /// The storage namespace this connection reads and writes.
+    fn db(&self) -> &str {
+        self.db
+            .get()
+            .map(String::as_str)
+            .unwrap_or_else(|| self.databases.default_db())
     }
 
     /// One output column, in the format the current statement asked for.
@@ -401,7 +691,7 @@ impl PgHandler {
     const ENUM_TYPE_OID_BASE: i64 = 65_000;
     const RANGE_COLLECTION: &'static str = "__sql_ranges__";
     const RANGE_TYPE_OID_BASE: i64 = 69_000;
-    const USER_TYPE_ARRAY_OID_OFFSET: i64 = 100_000;
+    const USER_TYPE_ARRAY_OID_OFFSET: i64 = secantus_pgplan::USER_TYPE_ARRAY_OID_OFFSET;
     /// A custom range's auto-created multirange type gets `range_oid + this`,
     /// and the multirange's own array type `multirange_oid + array offset`.
     /// Range oids live in the 69_000 band, their arrays at +100_000, so
@@ -436,6 +726,12 @@ impl PgHandler {
         }
         secantus_pgplan::set_user_types(types);
         secantus_pgplan::set_user_composites(composites);
+        secantus_pgplan::set_session_user(Some(
+            self.session_user
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        ));
         // Custom ranges resolve their subtype at cast time and their oid for
         // regtype -- but they are NOT enums, so they stay OUT of set_user_types.
         // A schema-qualified range resolves as `schema.name`, so
@@ -888,7 +1184,7 @@ impl PgHandler {
         }
         let raw = self
             .storage
-            .find_matching(&self.db, table, &Document::new())
+            .find_matching(self.db(), table, &Document::new())
             .map_err(|e| Self::storage_err("could not read", e))?;
         raw.iter()
             .map(|b| {
@@ -941,7 +1237,7 @@ impl PgHandler {
             None => {
                 let raw = self
                     .storage
-                    .find_matching(&self.db, &agg.table, &agg.filter)
+                    .find_matching(self.db(), &agg.table, &agg.filter)
                     .map_err(|e| Self::storage_err("could not read", e))?;
                 raw.iter()
                     .map(|b| bson::from_slice(b))
@@ -961,14 +1257,19 @@ impl PgHandler {
             for d in docs {
                 // NULL forms its OWN group in PostgreSQL, so a missing
                 // or null key is a real key rather than a skip.
-                let key: Vec<Option<Bson>> = agg
-                    .group_by
-                    .iter()
-                    .map(|(_, f)| match d.get(f) {
-                        None | Some(Bson::Null) => None,
-                        Some(v) => Some(v.clone()),
-                    })
-                    .collect();
+                let mut key: Vec<Option<Bson>> = Vec::with_capacity(agg.group_by.len());
+                for k in &agg.group_by {
+                    let v = match &k.expr {
+                        Some(expr) => {
+                            secantus_pgplan::apply_row_expr(expr, &d).map_err(|e| Self::err(&e))?
+                        }
+                        None => d.get(&k.field).cloned().unwrap_or(Bson::Null),
+                    };
+                    key.push(match v {
+                        Bson::Null => None,
+                        v => Some(v),
+                    });
+                }
                 match keys.iter().position(|k| *k == key) {
                     Some(i) => buckets[i].push(d),
                     None => {
@@ -1294,17 +1595,56 @@ impl PgHandler {
         Ok(out)
     }
 
+    /// Every `__sql_*` catalog collection, created (empty) before a
+    /// transaction handle opens, so their registry rows are committed on
+    /// their own rather than as part of the user's block.
+    ///
+    /// Lazily creating one inside the block was a real bug (2026-09-09): the
+    /// first `CREATE TABLE` in a store registered `__sql_catalog__` in
+    /// connection 1's uncommitted transaction, and a `CREATE TABLE` of a
+    /// DIFFERENT table on connection 2 then wrote the same registry row and
+    /// failed with a WiredTiger `WriteConflict` -- where PostgreSQL runs the
+    /// two independently. Creating them outside the block but per statement
+    /// was not enough either: a WiredTiger transaction reads its snapshot,
+    /// so a block that began before the registry row landed could not see
+    /// it, tried to register the collection again, and hit the same
+    /// conflict (`create schema s; create type e as enum (...)` on a fresh
+    /// store did exactly that). The rows are server bookkeeping, not
+    /// something a `ROLLBACK` should undo, so they belong before the block.
+    const CATALOG_COLLECTIONS: [&'static str; 7] = [
+        CATALOG_COLLECTION,
+        SEQUENCE_COLLECTION,
+        Self::SCHEMA_COLLECTION,
+        Self::COMPOSITE_COLLECTION,
+        Self::ENUM_COLLECTION,
+        Self::ENUM_META_COLLECTION,
+        Self::RANGE_COLLECTION,
+    ];
+
+    /// Open a transaction handle, with every catalog collection registered
+    /// first (see `CATALOG_COLLECTIONS`). The WiredTiger transaction itself
+    /// begins lazily on the first statement, so the rows are committed and
+    /// visible before its snapshot is taken.
+    fn open_transaction_handle(&self) -> PgWireResult<UserTransactionHandle> {
+        for coll in Self::CATALOG_COLLECTIONS {
+            self.ensure_collection(coll)?;
+        }
+        self.storage
+            .begin_user_transaction()
+            .map_err(|e| Self::storage_err("could not begin a transaction", e))
+    }
+
     /// Make sure a catalog collection exists before writing to it: a delete or
     /// insert against a collection nobody created yet is a WiredTiger ENOENT,
     /// not a no-op. Reads tolerate the absence; writes must not.
     fn ensure_collection(&self, coll: &str) -> PgWireResult<()> {
         let exists = self
             .storage
-            .collection_exists(&self.db, coll)
+            .collection_exists(self.db(), coll)
             .map_err(|e| Self::storage_err("could not check a catalog collection", e))?;
         if !exists {
             self.storage
-                .create_collection(&self.db, coll)
+                .create_collection(self.db(), coll)
                 .map_err(|e| Self::storage_err("could not create a catalog collection", e))?;
         }
         Ok(())
@@ -1320,7 +1660,7 @@ impl PgHandler {
     fn type_catalog_docs(&self, collection: &'static str) -> PgWireResult<Vec<Document>> {
         let raw = self
             .storage
-            .find_matching(&self.db, collection, &Document::new())
+            .find_matching(self.db(), collection, &Document::new())
             .map_err(|e| Self::storage_err("could not read the type catalog", e))?;
         let mut by_id: std::collections::BTreeMap<String, Document> =
             std::collections::BTreeMap::new();
@@ -1356,10 +1696,7 @@ impl PgHandler {
     /// transaction: an autocommit statement's write is committed at once and
     /// a plain read already finds it.
     fn note_uncommitted_type(&self, collection: &'static str, id: &str, doc: Option<Document>) {
-        if !self
-            .in_transaction
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if !self.transaction_handle_open() {
             return;
         }
         self.uncommitted_types
@@ -1400,6 +1737,18 @@ impl PgHandler {
         }
         out.sort();
         Ok(out)
+    }
+
+    /// Is `name` the ROW TYPE of a table (a composite recorded by CREATE
+    /// TABLE, `relation: true`) rather than a CREATE TYPE composite?
+    fn row_type_of_table(&self, name: &str) -> PgWireResult<bool> {
+        Ok(self
+            .type_catalog_docs(Self::COMPOSITE_COLLECTION)?
+            .iter()
+            .any(|d| {
+                d.get_str("_id").unwrap_or_default() == name
+                    && d.get_bool("relation").unwrap_or(false)
+            }))
     }
 
     /// Every composite as `(schema, bare_name, oid, fields)`. `schema` defaults
@@ -1502,6 +1851,31 @@ impl PgHandler {
         None
     }
 
+    /// Mint an enum / composite oid the way PostgreSQL mints an OID: from a
+    /// counter OUTSIDE the user's transaction, under one process-wide lock.
+    /// Advanced inside the block, the counter row was one key that two open
+    /// `CREATE TYPE` blocks both rewrote, and the second failed with a
+    /// WiredTiger write conflict where PostgreSQL runs them independently
+    /// (2026-09-09). An oid minted by a block that rolls back is simply
+    /// skipped, as PostgreSQL skips one. The lock makes the read-rewrite of
+    /// the counter atomic across connections.
+    fn mint_oid_outside_transaction(
+        &self,
+        mint: impl FnOnce() -> PgWireResult<i64>,
+    ) -> PgWireResult<i64> {
+        static OID_MINT: Mutex<()> = Mutex::new(());
+        let _serial = OID_MINT.lock().unwrap_or_else(|e| e.into_inner());
+        self.storage.outside_user_transaction(mint)
+    }
+
+    fn mint_enum_oid(&self) -> PgWireResult<i64> {
+        self.mint_oid_outside_transaction(|| self.mint_enum_oid_in_session())
+    }
+
+    fn mint_composite_oid(&self) -> PgWireResult<i64> {
+        self.mint_oid_outside_transaction(|| self.mint_composite_oid_in_session())
+    }
+
     /// Mint the next range-type oid -- the enum minting rule, base 69000.
     fn mint_range_oid(&self) -> PgWireResult<i64> {
         let existing = self.ranges()?;
@@ -1514,12 +1888,12 @@ impl PgHandler {
 
     /// Mint the next composite oid -- the enum minting rule, own counter and
     /// base 67000, monotonic and never reused.
-    fn mint_composite_oid(&self) -> PgWireResult<i64> {
+    fn mint_composite_oid_in_session(&self) -> PgWireResult<i64> {
         let key = "composite_oid_counter";
         let counter = self
             .storage
             .find_matching(
-                &self.db,
+                self.db(),
                 Self::ENUM_META_COLLECTION,
                 &bson::doc! {"_id": key},
             )
@@ -1541,7 +1915,7 @@ impl PgHandler {
         };
         self.storage
             .delete_matching(
-                &self.db,
+                self.db(),
                 Self::ENUM_META_COLLECTION,
                 &bson::doc! {"_id": key},
                 0,
@@ -1553,7 +1927,7 @@ impl PgHandler {
         let bytes = bson::to_vec(&doc)
             .map_err(|e| Self::storage_err("could not encode the oid counter", e))?;
         self.storage
-            .insert(&self.db, Self::ENUM_META_COLLECTION, vec![bytes], true)
+            .insert(self.db(), Self::ENUM_META_COLLECTION, vec![bytes], true)
             .map_err(|e| Self::storage_err("could not advance the oid counter", e))?;
         Ok(oid)
     }
@@ -1615,11 +1989,11 @@ impl PgHandler {
     /// counter, else start above everything already taken; rewrite the counter
     /// as `next = oid + 1`. Monotonic and never reused -- positional minting
     /// would renumber types under a client that registered loaders by oid.
-    fn mint_enum_oid(&self) -> PgWireResult<i64> {
+    fn mint_enum_oid_in_session(&self) -> PgWireResult<i64> {
         let counter = self
             .storage
             .find_matching(
-                &self.db,
+                self.db(),
                 Self::ENUM_META_COLLECTION,
                 &bson::doc! {"_id": "oid_counter"},
             )
@@ -1641,7 +2015,7 @@ impl PgHandler {
         };
         self.storage
             .delete_matching(
-                &self.db,
+                self.db(),
                 Self::ENUM_META_COLLECTION,
                 &bson::doc! {"_id": "oid_counter"},
                 0,
@@ -1653,7 +2027,7 @@ impl PgHandler {
         let bytes = bson::to_vec(&doc)
             .map_err(|e| Self::storage_err("could not encode the oid counter", e))?;
         self.storage
-            .insert(&self.db, Self::ENUM_META_COLLECTION, vec![bytes], true)
+            .insert(self.db(), Self::ENUM_META_COLLECTION, vec![bytes], true)
             .map_err(|e| Self::storage_err("could not advance the oid counter", e))?;
         Ok(oid)
     }
@@ -1731,6 +2105,58 @@ impl PgHandler {
             // name = ...`) to check a cursor exists before closing one it did
             // not declare, and the suite queries it directly to prove a cursor
             // is gone after close.
+            // Every live backend of this server, PostgreSQL 16's column set
+            // in its order; the columns a single-node server has no value
+            // for (client address, wait events, xids, query_id) are NULL.
+            "pg_database" => Some(TableDef::new(
+                "pg_database",
+                vec![
+                    secantus_pgcatalog::Column::new("oid", "oid", false),
+                    secantus_pgcatalog::Column::new("datname", "name", false),
+                    secantus_pgcatalog::Column::new("datdba", "oid", false),
+                    secantus_pgcatalog::Column::new("encoding", "int4", false),
+                    secantus_pgcatalog::Column::new("datlocprovider", "char", false),
+                    secantus_pgcatalog::Column::new("datistemplate", "bool", false),
+                    secantus_pgcatalog::Column::new("datallowconn", "bool", false),
+                    secantus_pgcatalog::Column::new("datconnlimit", "int4", false),
+                    secantus_pgcatalog::Column::new("datfrozenxid", "xid", false),
+                    secantus_pgcatalog::Column::new("datminmxid", "xid", false),
+                    secantus_pgcatalog::Column::new("dattablespace", "oid", false),
+                    secantus_pgcatalog::Column::new("datcollate", "text", false),
+                    secantus_pgcatalog::Column::new("datctype", "text", false),
+                    secantus_pgcatalog::Column::new("daticulocale", "text", false),
+                    secantus_pgcatalog::Column::new("daticurules", "text", false),
+                    secantus_pgcatalog::Column::new("datcollversion", "text", false),
+                    secantus_pgcatalog::Column::new("datacl", "text", false),
+                ],
+            )),
+            "pg_stat_activity" => Some(TableDef::new(
+                "pg_stat_activity",
+                vec![
+                    secantus_pgcatalog::Column::new("datid", "oid", false),
+                    secantus_pgcatalog::Column::new("datname", "name", false),
+                    secantus_pgcatalog::Column::new("pid", "int4", false),
+                    secantus_pgcatalog::Column::new("leader_pid", "int4", false),
+                    secantus_pgcatalog::Column::new("usesysid", "oid", false),
+                    secantus_pgcatalog::Column::new("usename", "name", false),
+                    secantus_pgcatalog::Column::new("application_name", "text", false),
+                    secantus_pgcatalog::Column::new("client_addr", "inet", false),
+                    secantus_pgcatalog::Column::new("client_hostname", "text", false),
+                    secantus_pgcatalog::Column::new("client_port", "int4", false),
+                    secantus_pgcatalog::Column::new("backend_start", "timestamptz", false),
+                    secantus_pgcatalog::Column::new("xact_start", "timestamptz", false),
+                    secantus_pgcatalog::Column::new("query_start", "timestamptz", false),
+                    secantus_pgcatalog::Column::new("state_change", "timestamptz", false),
+                    secantus_pgcatalog::Column::new("wait_event_type", "text", false),
+                    secantus_pgcatalog::Column::new("wait_event", "text", false),
+                    secantus_pgcatalog::Column::new("state", "text", false),
+                    secantus_pgcatalog::Column::new("backend_xid", "xid", false),
+                    secantus_pgcatalog::Column::new("backend_xmin", "xid", false),
+                    secantus_pgcatalog::Column::new("query_id", "int8", false),
+                    secantus_pgcatalog::Column::new("query", "text", false),
+                    secantus_pgcatalog::Column::new("backend_type", "text", false),
+                ],
+            )),
             "pg_cursors" => Some(TableDef::new(
                 "pg_cursors",
                 vec![
@@ -1991,7 +2417,79 @@ impl PgHandler {
                     })
                     .collect()
             }
-            // One row per open cursor on this connection.
+            // One row per database the server accepts a connection to. The
+            // constant columns are what `initdb` writes (probed PG 16).
+            "pg_database" => {
+                let field = |name: &str| def.field_of(name).expect("column");
+                self.databases
+                    .all(&self.storage)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|info| {
+                        let mut d = Document::new();
+                        d.insert(field("oid"), Bson::Int64(info.oid));
+                        d.insert(field("datname"), info.name);
+                        d.insert(field("datdba"), Bson::Int64(10));
+                        d.insert(field("encoding"), Bson::Int32(6));
+                        d.insert(field("datlocprovider"), "c");
+                        d.insert(field("datistemplate"), info.is_template);
+                        d.insert(field("datallowconn"), info.allow_conn);
+                        d.insert(field("datconnlimit"), Bson::Int32(-1));
+                        d.insert(field("datfrozenxid"), Bson::Int64(722));
+                        d.insert(field("datminmxid"), Bson::Int64(1));
+                        d.insert(field("dattablespace"), Bson::Int64(1663));
+                        d.insert(field("datcollate"), "C");
+                        d.insert(field("datctype"), "C");
+                        d.insert(field("daticulocale"), Bson::Null);
+                        d.insert(field("daticurules"), Bson::Null);
+                        d.insert(field("datcollversion"), Bson::Null);
+                        d.insert(field("datacl"), Bson::Null);
+                        d
+                    })
+                    .collect()
+            }
+            "pg_stat_activity" => {
+                let backends: Vec<(i32, BackendActivity)> = backend_registry()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .map(|(pid, entry)| {
+                        let activity = entry.activity.lock().unwrap_or_else(|e| e.into_inner());
+                        (*pid, activity.clone())
+                    })
+                    .collect();
+                let field = |name: &str| def.field_of(name).expect("column");
+                let opt_time = |t: Option<bson::DateTime>| t.map_or(Bson::Null, Bson::DateTime);
+                backends
+                    .into_iter()
+                    .map(|(pid, a)| {
+                        let mut d = Document::new();
+                        d.insert(field("datid"), Bson::Int64(0));
+                        d.insert(field("datname"), a.datname);
+                        d.insert(field("pid"), Bson::Int32(pid));
+                        d.insert(field("leader_pid"), Bson::Null);
+                        d.insert(field("usesysid"), Bson::Int64(10));
+                        d.insert(field("usename"), a.usename);
+                        d.insert(field("application_name"), a.application_name);
+                        d.insert(field("client_addr"), Bson::Null);
+                        d.insert(field("client_hostname"), Bson::Null);
+                        d.insert(field("client_port"), Bson::Null);
+                        d.insert(field("backend_start"), Bson::DateTime(a.backend_start));
+                        d.insert(field("xact_start"), Bson::Null);
+                        d.insert(field("query_start"), opt_time(a.query_start));
+                        d.insert(field("state_change"), opt_time(a.state_change));
+                        d.insert(field("wait_event_type"), Bson::Null);
+                        d.insert(field("wait_event"), Bson::Null);
+                        d.insert(field("state"), a.state);
+                        d.insert(field("backend_xid"), Bson::Null);
+                        d.insert(field("backend_xmin"), Bson::Null);
+                        d.insert(field("query_id"), Bson::Null);
+                        d.insert(field("query"), a.query);
+                        d.insert(field("backend_type"), "client backend");
+                        d
+                    })
+                    .collect()
+            }
             "pg_cursors" => {
                 let cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
                 cursors
@@ -2055,7 +2553,7 @@ impl PgHandler {
         let filter = bson::doc! { "_id": name };
         let rows = self
             .storage
-            .find_matching(&self.db, CATALOG_COLLECTION, &filter)
+            .find_matching(self.db(), CATALOG_COLLECTION, &filter)
             .ok()?;
         let raw = rows.first()?;
         let d: Document = bson::from_slice(raw).ok()?;
@@ -2063,8 +2561,20 @@ impl PgHandler {
     }
 
     fn err(e: &PlanError) -> PgWireError {
-        let mut info = ErrorInfo::new("ERROR".into(), e.sqlstate().into(), e.to_string());
-        info.hint = e.hint().map(str::to_string);
+        // A planner message may carry PostgreSQL's DETAIL / HINT line after
+        // the primary one; each travels in its own field, not the message.
+        let text = e.to_string();
+        let (message, hint) = match text.split_once("\nHint: ") {
+            Some((m, h)) => (m.to_string(), Some(h.to_string())),
+            None => (text, None),
+        };
+        let (message, detail) = match message.split_once("\nDetail: ") {
+            Some((m, d)) => (m.to_string(), Some(d.to_string())),
+            None => (message, None),
+        };
+        let mut info = ErrorInfo::new("ERROR".into(), e.sqlstate().into(), message);
+        info.detail = detail;
+        info.hint = hint.or_else(|| e.hint().map(str::to_string));
         PgWireError::UserError(Box::new(info))
     }
 
@@ -2184,7 +2694,7 @@ impl PgHandler {
                 };
                 let hit = self
                     .storage
-                    .find_matching(&self.db, table, &filter)
+                    .find_matching(self.db(), table, &filter)
                     .map_err(|e| Self::storage_err("could not check the primary key", e))?;
                 if !hit.is_empty() {
                     return Ok(Some(id.clone()));
@@ -2219,6 +2729,134 @@ fn canonical_setting(name: &str) -> String {
     }
 }
 
+/// The two session-idle GUCs this server enforces (PostgreSQL 16 semantics:
+/// milliseconds, `0` disables), with the FATAL error each one ends the
+/// connection with.
+const IDLE_TIMEOUT_GUCS: [(&str, &str, &str); 2] = [
+    (
+        "idle_in_transaction_session_timeout",
+        "25P03",
+        "terminating connection due to idle-in-transaction timeout",
+    ),
+    (
+        "idle_session_timeout",
+        "57P05",
+        "terminating connection due to idle-session timeout",
+    ),
+];
+
+/// Parse a millisecond GUC the way PostgreSQL does: a number (integer, or a
+/// float such as `1.5s` / `1e3`) with an optional unit (`us`, `ms`, `s`,
+/// `min`, `h`, `d`), whitespace allowed between the two, rounded to the
+/// nearest millisecond. `None` when the text is not a duration at all.
+fn parse_ms_guc(text: &str) -> Option<i64> {
+    let text = text.trim();
+    // The unit starts at a letter -- but so does the exponent of `1e3`, so
+    // try every letter as the split and take the first that parses.
+    let splits = text
+        .char_indices()
+        .filter(|(_, c)| c.is_ascii_alphabetic())
+        .map(|(i, _)| i)
+        .chain(std::iter::once(text.len()));
+    for at in splits {
+        let (number, unit) = text.split_at(at);
+        let factor: f64 = match unit.trim() {
+            "" | "ms" => 1.0,
+            "us" => 0.001,
+            "s" => 1_000.0,
+            "min" => 60_000.0,
+            "h" => 3_600_000.0,
+            "d" => 86_400_000.0,
+            _ => continue,
+        };
+        let number = number.trim();
+        if let Ok(n) = number.parse::<i64>() {
+            return if factor >= 1.0 {
+                n.checked_mul(factor as i64)
+            } else {
+                Some((n as f64 * factor).round_ties_even() as i64)
+            };
+        }
+        if let Ok(f) = number.parse::<f64>() {
+            let ms = (f * factor).round_ties_even();
+            return ms.is_finite().then_some(ms as i64);
+        }
+    }
+    None
+}
+
+/// Render a millisecond GUC as `SHOW` does: the largest unit that divides
+/// the value evenly (`1500` -> `1500ms`, `60000` -> `1min`), and a bare `0`.
+fn render_ms_guc(ms: i64) -> String {
+    if ms == 0 {
+        return "0".to_string();
+    }
+    for (unit, factor) in [
+        ("d", 86_400_000),
+        ("h", 3_600_000),
+        ("min", 60_000),
+        ("s", 1_000),
+    ] {
+        if ms % factor == 0 {
+            return format!("{}{unit}", ms / factor);
+        }
+    }
+    format!("{ms}ms")
+}
+
+/// Validate and canonicalise a `SET <ms-guc>` value, answering PostgreSQL's
+/// two `22023` refusals: text that is not a duration (or exceeds the integer
+/// range) is an invalid value, and a negative one is out of range.
+fn canonical_ms_guc(name: &str, value: &str) -> PgWireResult<String> {
+    let invalid = |msg: String| {
+        PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".into(),
+            "22023".into(),
+            msg,
+        )))
+    };
+    match parse_ms_guc(value) {
+        Some(ms) if ms < 0 => Err(invalid(format!(
+            "{ms} ms is outside the valid range for parameter \"{name}\" (0 .. 2147483647)"
+        ))),
+        Some(ms) if ms <= i32::MAX as i64 => Ok(render_ms_guc(ms)),
+        _ => Err(invalid(format!(
+            "invalid value for parameter \"{name}\": \"{value}\""
+        ))),
+    }
+}
+
+/// The boolean GUCs whose value this server OBEYS, so `SET` validates them as
+/// PostgreSQL does (`22023 parameter "x" requires a Boolean value`) and
+/// stores the canonical `on` / `off` a client reads back.
+const BOOL_GUCS: [&str; 2] = ["standard_conforming_strings", "escape_string_warning"];
+
+/// PostgreSQL's `parse_bool`: `on` / `off` / `true` / `false` / `yes` / `no`
+/// / `1` / `0`, case-insensitively, and any unambiguous prefix of the words
+/// (`t`, `of`, `n`; measured on 16).
+fn canonical_bool_guc(name: &str, value: &str) -> PgWireResult<String> {
+    let v = value.trim().to_ascii_lowercase();
+    let prefix_of = |word: &str| !v.is_empty() && word.starts_with(&v);
+    let parsed = if v == "1" || prefix_of("true") || prefix_of("yes") || v == "on" {
+        Some("on")
+    } else if v == "0"
+        || prefix_of("false")
+        || prefix_of("no")
+        || (v.len() >= 2 && prefix_of("off"))
+    {
+        Some("off")
+    } else {
+        None
+    };
+    parsed.map(str::to_string).ok_or_else(|| {
+        PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".into(),
+            "22023".into(),
+            format!("parameter \"{name}\" requires a Boolean value"),
+        )))
+    })
+}
+
 /// The settings a fresh connection starts with, matching what a client expects
 /// to read back before it has set anything.
 fn default_settings() -> HashMap<String, String> {
@@ -2228,6 +2866,7 @@ fn default_settings() -> HashMap<String, String> {
         ("TimeZone", "UTC"),
         ("IntervalStyle", "postgres"),
         ("standard_conforming_strings", "on"),
+        ("escape_string_warning", "on"),
         ("integer_datetimes", "on"),
         ("transaction_read_only", "off"),
         // Transaction GUCs psycopg reads to learn the connection's defaults.
@@ -2241,6 +2880,8 @@ fn default_settings() -> HashMap<String, String> {
         ("default_transaction_read_only", "off"),
         ("default_transaction_deferrable", "off"),
         ("search_path", "\"$user\", public"),
+        ("idle_in_transaction_session_timeout", "0"),
+        ("idle_session_timeout", "0"),
         ("application_name", ""),
         ("server_encoding", "UTF8"),
         ("server_version", "15.0"),
@@ -2271,6 +2912,7 @@ fn internal_type_name(ty: &Type) -> Option<String> {
             17 => "bytea",
             869 => "inet",
             650 => "cidr",
+            1033 => "aclitem",
             603 => "box",
             1043 => "varchar",
             1042 => "bpchar",
@@ -2297,6 +2939,7 @@ fn internal_type_name(ty: &Type) -> Option<String> {
             1009 => "text[]",
             1015 => "varchar[]",
             1001 => "bytea[]",
+            1034 => "aclitem[]",
             1041 => "inet[]",
             651 => "cidr[]",
             1020 => "box[]",
@@ -2363,6 +3006,7 @@ fn wire_type(pg_type: &str) -> Type {
         "bytea" => Type::BYTEA,
         "inet" => Type::INET,
         "cidr" => Type::CIDR,
+        "aclitem" => Type::ACLITEM,
         "box" => Type::BOX,
         "varchar" | "character varying" => Type::VARCHAR,
         "bpchar" | "char" | "character" => Type::BPCHAR,
@@ -2456,6 +3100,7 @@ fn wire_type(pg_type: &str) -> Type {
         "bytea[]" => Type::BYTEA_ARRAY,
         "inet[]" => Type::INET_ARRAY,
         "cidr[]" => Type::CIDR_ARRAY,
+        "aclitem[]" => Type::ACLITEM_ARRAY,
         "box[]" => Type::BOX_ARRAY,
         "uuid[]" => Type::UUID_ARRAY,
         "bpchar[]" | "char[]" | "character[]" => Type::BPCHAR_ARRAY,
@@ -2472,9 +3117,107 @@ fn wire_type(pg_type: &str) -> Type {
     }
 }
 
+static PID_GENERATOR: std::sync::LazyLock<RandomPidSecretKeyGenerator> =
+    std::sync::LazyLock::new(RandomPidSecretKeyGenerator::default);
+
 #[async_trait]
-impl NoopStartupHandler for PgHandler {
-    async fn post_startup<C>(&self, _c: &mut C, _m: PgWireFrontendMessage) -> PgWireResult<()>
+impl StartupHandler for PgHandler {
+    /// pgwire's no-authentication startup, with the `database` check in the
+    /// place PostgreSQL makes it: BEFORE `AuthenticationOk`. An unknown name
+    /// (or `template0`, which never accepts connections) is a FATAL
+    /// `ErrorResponse` and the socket closes, with no `ReadyForQuery` -- what
+    /// libpq reads as a failed connect rather than a failed first query.
+    async fn on_startup<C>(
+        &self,
+        client: &mut C,
+        message: PgWireFrontendMessage,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let PgWireFrontendMessage::Startup(ref startup) = message else {
+            return Ok(());
+        };
+        pgwire::api::auth::protocol_negotiation(client, startup).await?;
+        pgwire::api::auth::save_startup_parameters_to_metadata(client, startup);
+
+        // libpq defaults `database` to the user name; a startup packet with
+        // neither gets the server's default (PostgreSQL would look for a
+        // database named after the user, which is not this server's model).
+        let requested = client
+            .metadata()
+            .get("database")
+            .cloned()
+            .unwrap_or_else(|| self.databases.default_db().to_string());
+        if let Err(e) = self.select_database(&requested) {
+            let info: ErrorInfo = e.into();
+            client
+                .send(PgWireBackendMessage::ErrorResponse(info.into()))
+                .await?;
+            client.close().await?;
+            return Ok(());
+        }
+
+        let (pid, secret_key) = PID_GENERATOR.generate(client);
+        client.set_pid_and_secret_key(pid, secret_key);
+        // The startup ParameterStatus values are the SESSION's settings, so
+        // what a client reads from `parameter_status("TimeZone")` is what
+        // `SHOW timezone` answers -- pgwire's own defaults (`Etc/UTC`, `ISO,
+        // YMD`) disagreed with the session's `UTC` / `ISO, MDY`.
+        let mut provider = DefaultServerParameterProvider::default();
+        let defaults = default_settings();
+        if let Some(tz) = defaults.get("TimeZone") {
+            provider.time_zone = tz.clone();
+        }
+        if let Some(ds) = defaults.get("DateStyle") {
+            provider.date_style = ds.clone();
+        }
+        pgwire::api::auth::finish_authentication0(client, &provider).await?;
+        self.post_startup(client).await?;
+        client
+            .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                pgwire::messages::response::TransactionStatus::Idle,
+            )))
+            .await?;
+        client.set_state(pgwire::api::PgWireConnectionState::ReadyForQuery);
+        Ok(())
+    }
+}
+
+impl PgHandler {
+    /// Binds this connection to the database the startup packet named.
+    fn select_database(&self, name: &str) -> PgWireResult<()> {
+        let fatal = |code: &str, message: String| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".into(),
+                code.into(),
+                message,
+            )))
+        };
+        let Some(info) = self.databases.lookup(&self.storage, name)? else {
+            return Err(fatal(
+                "3D000", // invalid_catalog_name
+                format!("database \"{name}\" does not exist"),
+            ));
+        };
+        if !info.allow_conn {
+            return Err(fatal(
+                "55000", // object_not_in_prerequisite_state
+                format!("database \"{name}\" is not currently accepting connections"),
+            ));
+        }
+        let _ = self.db.set(info.name.clone());
+        self.backend
+            .activity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .datname = info.name;
+        Ok(())
+    }
+
+    async fn post_startup<C>(&self, _c: &mut C) -> PgWireResult<()>
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
         C::Error: std::fmt::Debug,
@@ -2483,13 +3226,27 @@ impl NoopStartupHandler for PgHandler {
         // pgwire has assigned and already sent the BackendKeyData PID by now;
         // record it so `pg_backend_pid()` / `pg_terminate_backend()` can see
         // it, and register this connection so another backend can terminate it.
-        let (pid, _) = _c.pid_and_secret_key();
+        let (pid, secret) = _c.pid_and_secret_key();
         self.backend_pid
             .store(pid, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.backend.secret.set(secret.to_bytes());
+        {
+            let mut activity = self
+                .backend
+                .activity
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            activity.usename = _c.metadata().get("user").cloned().unwrap_or_default();
+            activity.application_name = _c
+                .metadata()
+                .get("application_name")
+                .cloned()
+                .unwrap_or_default();
+        }
         backend_registry()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(pid, self.terminate.clone());
+            .insert(pid, self.backend.clone());
         if let Some(user) = _c.metadata().get("user") {
             *self.session_user.lock().unwrap_or_else(|e| e.into_inner()) = user.clone();
         }
@@ -2578,17 +3335,42 @@ impl SimpleQueryHandler for PgHandler {
         // other error, so the next statement gets `25P02`. Recording it here
         // is the simple-protocol twin of the `Describe` note in
         // `describe_fields`.
-        let stmts = secantus_pgplan::split_statements(query)
-            .map_err(|e| Self::err(&e))
-            .inspect_err(|_| self.note_failure())?;
+        // The text is read under the session's string syntax first (see
+        // `apply_string_syntax`); an error there is a syntax error like any
+        // other, and the scanner's warnings precede the error they led up to.
+        let query = match self.apply_string_syntax(query) {
+            Ok(query) => query,
+            Err(e) => {
+                self.note_failure();
+                self.flush_notices(_c).await?;
+                return Err(e);
+            }
+        };
+        let query = query.as_str();
+        let stmts = match secantus_pgplan::split_statements(query) {
+            Ok(stmts) => stmts,
+            Err(e) => {
+                self.note_failure();
+                self.flush_notices(_c).await?;
+                return Err(Self::err(&e));
+            }
+        };
         let out = if stmts.len() <= 1 {
             self.run(query, &[], 0).await
         } else {
             self.run_batch(&stmts).await
         };
+        // A simple query inside an extended-protocol statement group runs in
+        // the group's transaction and ends it, as PostgreSQL's does
+        // (`exec_simple_query` finishes the transaction command).
+        let out = match self.close_extended_group(out.is_err()) {
+            Ok(()) => out,
+            Err(e) => out.and(Err(e)),
+        };
         self.flush_notices(_c).await?;
         // Report any GUC change (TimeZone, ...) so the client tracks it.
         self.report_pending_params(_c).await?;
+        self.settle_failed_commit(_c);
         // A FATAL error (`pg_terminate_backend` on this backend) ends the
         // connection. pgwire's own error path would send a `ReadyForQuery`
         // after the `ErrorResponse` and leave the socket open, so the client
@@ -2965,17 +3747,20 @@ impl PgHandler {
             Statement::Update(u) => vec![u.table.clone()],
             Statement::Delete(d) => vec![d.table.clone()],
             Statement::CopyFrom(c) => vec![c.table.clone()],
+            // A table's ROW TYPE is a composite, so its catalog moves too.
             Statement::CreateTable(def, _) => {
                 vec![
                     def.name.clone(),
                     CATALOG_COLLECTION.to_string(),
                     SEQUENCE_COLLECTION.to_string(),
+                    Self::COMPOSITE_COLLECTION.to_string(),
                 ]
             }
             Statement::DropTable(d) => {
                 let mut v = d.tables.clone();
                 v.push(CATALOG_COLLECTION.to_string());
                 v.push(SEQUENCE_COLLECTION.to_string());
+                v.push(Self::COMPOSITE_COLLECTION.to_string());
                 v
             }
             // CREATE/DROP TYPE writes a type-catalog row; a `ROLLBACK TO`
@@ -3023,10 +3808,10 @@ impl PgHandler {
             for table in tables {
                 // A table that does not exist is captured as `None`, which is not
                 // the same as an empty one: rolling back has to DROP it.
-                let docs = match self.storage.collection_exists(&self.db, &table) {
+                let docs = match self.storage.collection_exists(self.db(), &table) {
                     Ok(true) => Some(
                         self.storage
-                            .find_matching(&self.db, &table, &Document::new())
+                            .find_matching(self.db(), &table, &Document::new())
                             .map_err(|e| Self::storage_err("could not read for a savepoint", e))?,
                     ),
                     Ok(false) => None,
@@ -3051,29 +3836,36 @@ impl PgHandler {
     fn restore_table(&self, table: &str, docs: Option<&Vec<Vec<u8>>>) -> PgWireResult<()> {
         let exists = self
             .storage
-            .collection_exists(&self.db, table)
+            .collection_exists(self.db(), table)
             .map_err(|e| Self::storage_err("could not check a table", e))?;
         match docs {
             // It did not exist at the savepoint, so rolling back drops it.
             None => {
                 if exists {
                     self.storage
-                        .drop_collection(&self.db, table)
+                        .drop_collection(self.db(), table)
                         .map_err(|e| Self::storage_err("could not drop the table", e))?;
                 }
             }
             Some(docs) => {
                 if !exists {
                     self.storage
-                        .create_collection(&self.db, table)
+                        .create_collection(self.db(), table)
                         .map_err(|e| Self::storage_err("could not create the table", e))?;
                 }
                 self.storage
-                    .delete_matching(&self.db, table, &Document::new(), 0, &Document::new(), None)
+                    .delete_matching(
+                        self.db(),
+                        table,
+                        &Document::new(),
+                        0,
+                        &Document::new(),
+                        None,
+                    )
                     .map_err(|e| Self::storage_err("could not clear the table", e))?;
                 if !docs.is_empty() {
                     self.storage
-                        .insert(&self.db, table, docs.clone(), true)
+                        .insert(self.db(), table, docs.clone(), true)
                         .map_err(|e| Self::storage_err("could not restore the table", e))?;
                 }
             }
@@ -3082,10 +3874,7 @@ impl PgHandler {
     }
 
     fn note_uncommitted(&self, name: &str, def: Option<TableDef>) {
-        if !self
-            .in_transaction
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if !self.transaction_handle_open() {
             return;
         }
         self.uncommitted
@@ -3112,6 +3901,10 @@ impl PgHandler {
             "TimeZone" => (true, value.to_string()),
             "DateStyle" => (true, secantus_pgplan::DateStyle::parse(value).canonical()),
             "client_encoding" => (true, value.to_string()),
+            //  - standard_conforming_strings: the statement text is read under
+            //    it (`apply_string_syntax`), so libpq's `PQescapeString` may
+            //    follow the report -- it switches its own escaping on it.
+            "standard_conforming_strings" => (true, value.to_string()),
             _ => (false, String::new()),
         };
         if report {
@@ -3247,13 +4040,81 @@ impl PgHandler {
     }
 
     fn begin_implicit(&self) -> PgWireResult<()> {
-        let handle = self
-            .storage
-            .begin_user_transaction()
-            .map_err(|e| Self::storage_err("could not begin a transaction", e))?;
+        let handle = self.open_transaction_handle()?;
         *self.txn.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
         self.in_transaction
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// A transaction handle is open -- a block, or an extended-protocol
+    /// statement group. Catalog writes inside either are invisible to the
+    /// planner's committed-catalog reads until the handle commits, so the
+    /// `uncommitted` overlays must record them for both.
+    fn transaction_handle_open(&self) -> bool {
+        self.in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed)
+            || self
+                .implicit_extended
+                .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Open the extended-protocol statement group if no transaction handle is
+    /// open: the first `Execute` since the last `Sync` outside a block.
+    fn open_extended_group(&self) -> PgWireResult<()> {
+        let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_some() {
+            return Ok(());
+        }
+        let handle = self.open_transaction_handle()?;
+        *guard = Some(handle);
+        self.group_failed
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.implicit_extended
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// End the extended-protocol statement group, if one is open: commit it
+    /// (deferred constraints checked first, as at any commit) unless a
+    /// statement in it failed, in which case roll the whole group back.
+    /// No-op when the handle belongs to a block -- a `BEGIN` in the group
+    /// made it one, and only `COMMIT` / `ROLLBACK` end that.
+    fn close_extended_group(&self, failed: bool) -> PgWireResult<()> {
+        if !self
+            .implicit_extended
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(());
+        }
+        let failed = failed
+            | self
+                .group_failed
+                .swap(false, std::sync::atomic::Ordering::Relaxed);
+        if !failed {
+            return self.commit_implicit();
+        }
+        // Not `rollback_implicit`: that closes every cursor, holdable ones
+        // included, and a `WITH HOLD` cursor from an earlier, committed
+        // transaction survives a failed statement in PostgreSQL. The group
+        // itself declared none -- `DECLARE` is refused outside a block.
+        self.uncommitted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.uncommitted_types
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.deferred_fks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        if let Some(mut handle) = self.txn.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            self.storage
+                .rollback_user_transaction(&mut handle)
+                .map_err(|e| Self::storage_err("could not roll back a transaction", e))?;
+        }
         Ok(())
     }
 
@@ -3279,6 +4140,17 @@ impl PgHandler {
         self.in_transaction
             .store(false, std::sync::atomic::Ordering::Relaxed);
         if let Some(mut handle) = self.txn.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let checked = self
+                .storage
+                .with_user_transaction(&mut handle, || self.run_deferred_checks())
+                .map_err(|e| Self::storage_err("transaction failed", e))
+                .and_then(|r| r);
+            if let Err(e) = checked {
+                self.storage
+                    .rollback_user_transaction(&mut handle)
+                    .map_err(|e| Self::storage_err("could not roll back a transaction", e))?;
+                return Err(e);
+            }
             self.storage
                 .commit_user_transaction(&mut handle)
                 .map_err(|e| Self::storage_err("could not commit a transaction", e))?;
@@ -3307,6 +4179,10 @@ impl PgHandler {
             .clear();
         self.in_transaction
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.deferred_fks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         if let Some(mut handle) = self.txn.lock().unwrap_or_else(|e| e.into_inner()).take() {
             self.storage
                 .rollback_user_transaction(&mut handle)
@@ -3345,10 +4221,113 @@ impl PgHandler {
         // notices at its next statement -- COMMIT and ROLLBACK included, since
         // a terminated backend cannot honour them either -- and ends with a
         // FATAL 57P01 that closes the socket.
-        if self.terminate.load(std::sync::atomic::Ordering::Relaxed) {
+        if self
+            .backend
+            .terminate
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return Err(Self::admin_shutdown());
         }
+        // A cancel that arrived while this backend was idle is dropped, as
+        // PostgreSQL drops one: it targets the statement that is running,
+        // and none was.
+        self.backend
+            .cancel
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        // A COPY OUT cancelled mid-stream failed after its statement had
+        // answered; the block is poisoned from here, as it is on PostgreSQL.
+        if self
+            .backend
+            .stream_failed
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            self.note_failure();
+        }
+        self.note_activity("active", Some(query));
+        let result = self
+            .run_typed_inner(query, params, param_types, max_rows)
+            .await;
+        self.note_activity(
+            if self
+                .in_transaction
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                if self.txn_failed.load(std::sync::atomic::Ordering::Relaxed) || result.is_err() {
+                    "idle in transaction (aborted)"
+                } else {
+                    "idle in transaction"
+                }
+            } else {
+                "idle"
+            },
+            None,
+        );
+        result
+    }
 
+    /// Record what `pg_stat_activity` shows for this backend: the state, and
+    /// -- at a statement's start -- its text and `query_start`.
+    fn note_activity(&self, state: &'static str, query: Option<&str>) {
+        let mut activity = self
+            .backend
+            .activity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let now = bson::DateTime::now();
+        activity.state = state;
+        activity.state_change = Some(now);
+        if let Some(query) = query {
+            activity.query = query.to_string();
+            activity.query_start = Some(now);
+        }
+    }
+
+    /// The deadline for the next wait for a frontend message, per PostgreSQL's
+    /// idle timeouts: `idle_in_transaction_session_timeout` applies while a
+    /// transaction block is open (aborted or not), `idle_session_timeout`
+    /// otherwise; `0` (the default) disables each. The wire loop sends the
+    /// FATAL error and closes the connection when the deadline passes.
+    pub fn idle_timeout(&self) -> Option<(std::time::Duration, ErrorInfo)> {
+        let in_txn = self
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let (guc, code, message) = IDLE_TIMEOUT_GUCS[if in_txn { 0 } else { 1 }];
+        let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+        let ms = settings.get(guc).and_then(|v| parse_ms_guc(v)).unwrap_or(0);
+        if ms <= 0 {
+            return None;
+        }
+        Some((
+            std::time::Duration::from_millis(ms as u64),
+            ErrorInfo::new("FATAL".into(), code.into(), message.into()),
+        ))
+    }
+
+    /// PostgreSQL's answer to a statement interrupted by a `CancelRequest`.
+    fn query_canceled() -> PgWireError {
+        PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".into(),
+            "57014".into(), // query_canceled
+            "canceling statement due to user request".into(),
+        )))
+    }
+
+    /// A cancellation point: `57014` if a `CancelRequest` for this backend
+    /// has arrived since the running statement started.
+    fn check_cancel(&self) -> PgWireResult<()> {
+        if self.backend.cancelled() {
+            return Err(Self::query_canceled());
+        }
+        Ok(())
+    }
+
+    async fn run_typed_inner(
+        &self,
+        query: &str,
+        params: &[Bson],
+        param_types: &[Option<String>],
+        max_rows: usize,
+    ) -> PgWireResult<Vec<Response>> {
         let sql = query.trim().trim_end_matches(';').trim();
         if sql.is_empty() {
             return Ok(vec![Response::EmptyQuery]);
@@ -3367,6 +4346,7 @@ impl PgHandler {
             param_types,
             &tz,
         );
+        self.collect_planner_warnings();
         if self.txn_failed.load(std::sync::atomic::Ordering::Relaxed) {
             let ends_the_block = matches!(
                 &planned,
@@ -3435,7 +4415,12 @@ impl PgHandler {
             binary: is_binary_cursor,
         } = stmt
         {
-            if self.txn.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+            // The BLOCK, not the handle: an extended-protocol statement group
+            // holds a handle too, and PostgreSQL refuses a cursor there.
+            if !self
+                .in_transaction
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".into(),
                     "25P01".into(), // no_active_sql_transaction
@@ -3516,19 +4501,85 @@ impl PgHandler {
 
         // Everything else runs INSIDE the open transaction when there is one,
         // so a later ROLLBACK really discards it.
+        //
+        // The statement runs synchronously, so it runs under
+        // `block_in_place`: a worker that blocks in a long statement
+        // (`pg_sleep`, a big scan) would otherwise take the runtime's I/O
+        // driver down with it — no other connection is served, and the
+        // `CancelRequest` meant to interrupt the statement never arrives.
         let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
-        let out = match guard.as_mut() {
+        let out = tokio::task::block_in_place(|| match guard.as_mut() {
             Some(handle) => self
                 .storage
                 .with_user_transaction(handle, || self.execute(stmt, max_rows))
                 .map_err(|e| Self::storage_err("transaction failed", e))
                 .and_then(|r| r),
             None => self.execute(stmt, max_rows),
-        };
+        });
+        self.collect_planner_warnings();
         if out.is_err() {
             self.note_failure();
         }
         out
+    }
+
+    /// Queue the WARNINGs the planner raised on this thread (an `aclitem`
+    /// with no grantor) as NoticeResponses for the statement in flight.
+    /// Read statement text the way the session's `standard_conforming_strings`
+    /// says to. The parser only knows the setting ON, so when it is off every
+    /// plain literal is rewritten to the `E'...'` it means, and the scanner's
+    /// `escape_string_warning` notices are queued (see
+    /// `secantus_pgplan::escape_strings`). This runs where the text ARRIVES
+    /// -- the simple `Query` and the extended `Parse` -- because that is when
+    /// PostgreSQL's scanner reads it: a statement prepared under one setting
+    /// keeps its meaning when the setting later changes.
+    fn apply_string_syntax(&self, sql: &str) -> PgWireResult<String> {
+        let (conforming, warn) = {
+            let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                settings
+                    .get("standard_conforming_strings")
+                    .is_none_or(|v| v != "off"),
+                settings
+                    .get("escape_string_warning")
+                    .is_none_or(|v| v != "off"),
+            )
+        };
+        if conforming {
+            return Ok(sql.to_string());
+        }
+        let (rewritten, warnings) = secantus_pgplan::escape_strings::rewrite(sql, warn);
+        if !warnings.is_empty() {
+            let mut pending = self
+                .pending_notices
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for w in warnings {
+                let mut info = ErrorInfo::new(
+                    "WARNING".into(),
+                    secantus_pgplan::escape_strings::SQLSTATE.into(),
+                    w.message,
+                );
+                info.hint = Some(w.hint);
+                info.position = Some(w.position.to_string());
+                pending.push(info);
+            }
+        }
+        rewritten.map_err(|e| Self::err(&e))
+    }
+
+    fn collect_planner_warnings(&self) {
+        let warnings = secantus_pgplan::take_warnings();
+        if warnings.is_empty() {
+            return;
+        }
+        let mut pending = self
+            .pending_notices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (sqlstate, message) in warnings {
+            pending.push(ErrorInfo::new("WARNING".into(), sqlstate, message));
+        }
     }
 
     /// Mark the open transaction failed, if there is one.
@@ -3541,6 +4592,16 @@ impl PgHandler {
             .load(std::sync::atomic::Ordering::Relaxed)
         {
             self.txn_failed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        // An error anywhere in an extended-protocol statement group -- a
+        // `Describe` that cannot resolve the statement as much as an
+        // `Execute` -- rolls the group back at `Sync`.
+        if self
+            .implicit_extended
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.group_failed
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -3596,6 +4657,8 @@ impl PgHandler {
                     // the client's loader).
                     let text = if key == "DateStyle" {
                         secantus_pgplan::DateStyle::parse(&text).canonical()
+                    } else if BOOL_GUCS.contains(&key.as_str()) {
+                        canonical_bool_guc(&key, &text)?
                     } else {
                         text
                     };
@@ -3615,6 +4678,7 @@ impl PgHandler {
                     .unwrap_or_else(|e| e.into_inner())
                     .clone(),
             )),
+            ConstCol::CurrentDatabase => Ok(Bson::String(self.db().to_string())),
             // `pg_sleep(NULL)` is NULL (strict); zero or negative seconds
             // return at once; otherwise the wait is the given fraction of a
             // second. The `void` result renders as `''` (probed PG 16).
@@ -3627,7 +4691,18 @@ impl PgHandler {
                     _ => 0.0,
                 };
                 if secs > 0.0 && secs.is_finite() {
-                    std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+                    // In slices, so a `CancelRequest` interrupts the sleep:
+                    // `pg_sleep` is the statement every cancel test cancels.
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs_f64(secs);
+                    loop {
+                        self.check_cancel()?;
+                        let left = deadline.saturating_duration_since(std::time::Instant::now());
+                        if left.is_zero() {
+                            break;
+                        }
+                        std::thread::sleep(left.min(std::time::Duration::from_millis(5)));
+                    }
                 }
                 Ok(Bson::String(String::new()))
             }
@@ -3662,7 +4737,11 @@ impl PgHandler {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .get(&target)
-                    .map(|flag| flag.store(true, std::sync::atomic::Ordering::Relaxed))
+                    .map(|entry| {
+                        entry
+                            .terminate
+                            .store(true, std::sync::atomic::Ordering::Relaxed)
+                    })
                     .is_some();
                 Ok(Bson::Boolean(armed))
             }
@@ -3684,6 +4763,22 @@ impl PgHandler {
                 .map_err(|e| Self::storage_err("transaction failed", e))?,
             None => f(),
         }
+    }
+
+    /// `25001` for the statements PostgreSQL refuses inside a block
+    /// (`CREATE DATABASE`, `DROP DATABASE`, ...).
+    fn refuse_in_transaction_block(&self, what: &str) -> PgWireResult<()> {
+        if self
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "25001".into(), // active_sql_transaction
+                format!("{what} cannot run inside a transaction block"),
+            ))));
+        }
+        Ok(())
     }
 
     /// PostgreSQL's answer to any statement in a block that has already failed.
@@ -3920,11 +5015,20 @@ impl PgHandler {
         };
 
         let begin = |guard: &mut Option<UserTransactionHandle>| -> PgWireResult<()> {
+            // A BEGIN inside an extended-protocol statement group makes the
+            // group's transaction the block: same handle, now explicit.
+            if self
+                .implicit_extended
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                self.in_transaction
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.txn_failed
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                return Ok(());
+            }
             if guard.is_none() {
-                let handle = self
-                    .storage
-                    .begin_user_transaction()
-                    .map_err(|e| Self::storage_err("could not begin a transaction", e))?;
+                let handle = self.open_transaction_handle()?;
                 *guard = Some(handle);
                 self.in_transaction
                     .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -3951,12 +5055,32 @@ impl PgHandler {
             }
             TransactionControl::Commit { chain } => {
                 self.reset_transaction_gucs();
+                // A COMMIT with no BEGIN commits the statement group so far;
+                // what follows before the Sync starts a new one.
+                self.implicit_extended
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 // A COMMIT closes every non-holdable cursor; `WITH HOLD`
                 // survives with its rows already materialised.
                 self.close_cursors_on_txn_end(true);
                 if let Some(mut handle) = guard.take() {
                     self.in_transaction
                         .store(false, std::sync::atomic::Ordering::Relaxed);
+                    // INITIALLY DEFERRED constraints are checked now, inside
+                    // the transaction; a violation rolls it back and the
+                    // error is the COMMIT's answer, with the connection IDLE.
+                    let checked = self
+                        .storage
+                        .with_user_transaction(&mut handle, || self.run_deferred_checks())
+                        .map_err(|e| Self::storage_err("transaction failed", e))
+                        .and_then(|r| r);
+                    if let Err(e) = checked {
+                        self.storage
+                            .rollback_user_transaction(&mut handle)
+                            .map_err(|e| Self::storage_err("could not roll back", e))?;
+                        self.commit_failed
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        return Err(e);
+                    }
                     self.storage
                         .commit_user_transaction(&mut handle)
                         .map_err(|e| Self::storage_err("could not commit", e))?;
@@ -3965,8 +5089,14 @@ impl PgHandler {
             }
             TransactionControl::Rollback { chain } => {
                 self.reset_transaction_gucs();
+                self.implicit_extended
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 // A ROLLBACK closes ALL cursors, holdable included.
                 self.close_cursors_on_txn_end(false);
+                self.deferred_fks
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
                 if let Some(mut handle) = guard.take() {
                     self.in_transaction
                         .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -4014,7 +5144,7 @@ impl PgHandler {
         let filter = bson::doc! { "_id": name };
         let raw = self
             .storage
-            .find_matching(&self.db, SEQUENCE_COLLECTION, &filter)
+            .find_matching(self.db(), SEQUENCE_COLLECTION, &filter)
             .map_err(|e| Self::storage_err("could not read the sequence", e))?;
         let Some(raw) = raw.first() else {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -4051,7 +5181,7 @@ impl PgHandler {
         if !values.is_empty() {
             self.storage
                 .update_matching(
-                    &self.db,
+                    self.db(),
                     SEQUENCE_COLLECTION,
                     &filter,
                     &bson::doc! { "$set": { "last_value": last, "is_called": true } },
@@ -4205,7 +5335,7 @@ impl PgHandler {
             (None, _) => {
                 let raw = self
                     .storage
-                    .find_matching(&self.db, &sel.table, &sel.filter)
+                    .find_matching(self.db(), &sel.table, &sel.filter)
                     .map_err(|e| Self::storage_err("could not read", e))?;
                 let def = self
                     .lookup(&sel.table)
@@ -4220,6 +5350,9 @@ impl PgHandler {
                 (docs, def)
             }
         };
+        // A cancellation point between the scan and the sort: cooperative,
+        // like the storage layer's own `maxTimeMS` polling.
+        self.check_cancel()?;
 
         if !sel.order.is_empty() {
             sort_rows(&mut docs, &sel.order);
@@ -4426,7 +5559,7 @@ impl PgHandler {
             // Handled in `run`, which can await the row stream.
             Statement::DeclareCursor { .. } => unreachable!("handled before execute"),
             Statement::Do { .. } => unreachable!("handled before execute"),
-            Statement::CreateTable(def, if_not_exists) => {
+            Statement::CreateTable(mut def, if_not_exists) => {
                 if self.lookup(&def.name).is_some() {
                     // `IF NOT EXISTS` is a NO-OP on an existing table, tag and
                     // all -- PostgreSQL only adds a notice. Raising here made
@@ -4441,13 +5574,51 @@ impl PgHandler {
                         format!("relation \"{}\" already exists", def.name),
                     ))));
                 }
+                // The table's name is also its ROW TYPE's, so it must be free
+                // as a type. Measured on 16: over a composite (which is a
+                // relation too) it is 42P07; over an enum, a range or a
+                // builtin it is 42710 with the hint.
+                if self.composites()?.iter().any(|(n, _, _)| *n == def.name) {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42P07".into(),
+                        format!("relation \"{}\" already exists", def.name),
+                    ))));
+                }
+                if self.enums()?.iter().any(|(n, _, _)| *n == def.name)
+                    || self.ranges()?.iter().any(|(n, _, _)| *n == def.name)
+                    || secantus_pgplan::pgtypes::oid_of_name(&def.name).is_some()
+                {
+                    let mut info = ErrorInfo::new(
+                        "ERROR".into(),
+                        "42710".into(),
+                        format!("type \"{}\" already exists", def.name),
+                    );
+                    info.hint = Some(
+                        "A relation has an associated type of the same name, so you must \
+                         use a name that doesn't conflict with any existing type."
+                            .into(),
+                    );
+                    return Err(PgWireError::UserError(Box::new(info)));
+                }
+                // A FOREIGN KEY to another table names its PRIMARY KEY (the
+                // planner settled self-references, which need no lookup).
+                for fk in &mut def.foreign_keys {
+                    if fk.ref_table == def.name {
+                        continue;
+                    }
+                    let target = self.lookup(&fk.ref_table).ok_or_else(|| {
+                        Self::err(&PlanError::UndefinedTable(fk.ref_table.clone()))
+                    })?;
+                    secantus_pgplan::resolve_fk_target(fk, &target).map_err(|e| Self::err(&e))?;
+                }
                 self.storage
-                    .create_collection(&self.db, &def.name)
+                    .create_collection(self.db(), &def.name)
                     .map_err(|e| Self::storage_err("could not create the table", e))?;
                 let bytes = bson::to_vec(&def.to_document())
                     .map_err(|e| Self::storage_err("could not encode the catalog entry", e))?;
                 self.storage
-                    .insert(&self.db, CATALOG_COLLECTION, vec![bytes], true)
+                    .insert(self.db(), CATALOG_COLLECTION, vec![bytes], true)
                     .map_err(|e| Self::storage_err("could not record the table", e))?;
                 // Each serial column's sequence, owned by the column so the
                 // table's DROP takes it along.
@@ -4476,7 +5647,7 @@ impl PgHandler {
                     for seq in def.columns.iter().filter_map(|c| c.sequence.as_deref()) {
                         self.storage
                             .delete_matching(
-                                &self.db,
+                                self.db(),
                                 SEQUENCE_COLLECTION,
                                 &bson::doc! { "_id": seq },
                                 0,
@@ -4486,9 +5657,41 @@ impl PgHandler {
                             .map_err(|e| Self::storage_err("could not reset a sequence", e))?;
                     }
                     self.storage
-                        .insert(&self.db, SEQUENCE_COLLECTION, sequences, true)
+                        .insert(self.db(), SEQUENCE_COLLECTION, sequences, true)
                         .map_err(|e| Self::storage_err("could not record a sequence", e))?;
                 }
+                // The table's ROW TYPE: a composite of its columns, in the
+                // type catalog like any other so `'(foo)'::mytype`,
+                // `mytype[]`, `pg_type` and `to_regtype` all find it. Marked
+                // `relation` so DROP TYPE refuses it and DROP TABLE takes it.
+                self.ensure_collection(Self::COMPOSITE_COLLECTION)?;
+                self.ensure_collection(Self::ENUM_META_COLLECTION)?;
+                let oid = self.mint_composite_oid()?;
+                let field_docs: Vec<Bson> = def
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        Bson::Array(vec![
+                            Bson::String(c.name.clone()),
+                            Bson::String(c.pg_type.clone()),
+                            Bson::Null,
+                        ])
+                    })
+                    .collect();
+                let row_type = bson::doc! {
+                    "_id": &def.name,
+                    "composite": &def.name,
+                    "schema": "public",
+                    "fields": field_docs,
+                    "oid": oid,
+                    "relation": true,
+                };
+                let bytes = bson::to_vec(&row_type)
+                    .map_err(|e| Self::storage_err("could not encode the row type", e))?;
+                self.storage
+                    .insert(self.db(), Self::COMPOSITE_COLLECTION, vec![bytes], true)
+                    .map_err(|e| Self::storage_err("could not record the row type", e))?;
+                self.note_uncommitted_type(Self::COMPOSITE_COLLECTION, &def.name, Some(row_type));
                 // Remember it for the rest of this transaction: the catalog row
                 // above is not committed yet, so a plain read cannot see it.
                 self.note_uncommitted(&def.name, Some(def.clone()));
@@ -4519,6 +5722,11 @@ impl PgHandler {
                 }
                 self.apply_serial_defaults(&def, &mut ins.rows)?;
                 apply_column_defaults(&def, &mut ins.rows);
+                // Every constraint is checked BEFORE the first write, so a
+                // violation on any row leaves none of them inserted.
+                for row in &ins.rows {
+                    self.check_row_constraints(&def, row)?;
+                }
                 if let Some(dup) = self.wide_numeric_pk_conflict(&ins.table, &def, &ins.rows)? {
                     return Err(Self::write_error(
                         &ins.table,
@@ -4526,6 +5734,7 @@ impl PgHandler {
                         &bson::doc! { "code": 11000, "keyValue": { "_id": dup } },
                     ));
                 }
+                self.check_foreign_keys(&def, &ins.rows)?;
                 let n = ins.rows.len();
                 let docs = ins
                     .rows
@@ -4535,7 +5744,7 @@ impl PgHandler {
                     .map_err(|e| Self::storage_err("could not encode a row", e))?;
                 let (written, errors) = self
                     .storage
-                    .insert(&self.db, &ins.table, docs, true)
+                    .insert(self.db(), &ins.table, docs, true)
                     .map_err(|e| Self::storage_err("could not insert", e))?;
                 if let Some(first) = errors.first() {
                     return Err(Self::write_error(&ins.table, &def, first));
@@ -4581,6 +5790,57 @@ impl PgHandler {
                 )?)])
             }
 
+            Statement::CreateDatabase { name } => {
+                self.refuse_in_transaction_block("CREATE DATABASE")?;
+                if self.databases.lookup(&self.storage, &name)?.is_some() {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42P04".into(), // duplicate_database
+                        format!("database \"{name}\" already exists"),
+                    ))));
+                }
+                self.databases.create(&self.storage, &name)?;
+                Ok(vec![Response::Execution(Tag::new("CREATE DATABASE"))])
+            }
+
+            Statement::DropDatabase { name, if_exists } => {
+                self.refuse_in_transaction_block("DROP DATABASE")?;
+                let Some(info) = self.databases.lookup(&self.storage, &name)? else {
+                    if if_exists {
+                        self.pending_notices
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(ErrorInfo::new(
+                                "NOTICE".into(),
+                                "00000".into(),
+                                format!("database \"{name}\" does not exist, skipping"),
+                            ));
+                        return Ok(vec![Response::Execution(Tag::new("DROP DATABASE"))]);
+                    }
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "3D000".into(), // invalid_catalog_name
+                        format!("database \"{name}\" does not exist"),
+                    ))));
+                };
+                if info.is_template {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42809".into(), // wrong_object_type
+                        "cannot drop a template database".into(),
+                    ))));
+                }
+                if info.name == self.db() {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "55006".into(), // object_in_use
+                        "cannot drop the currently open database".into(),
+                    ))));
+                }
+                self.databases.remove(&self.storage, &info.name)?;
+                Ok(vec![Response::Execution(Tag::new("DROP DATABASE"))])
+            }
+
             Statement::CreateSchema {
                 name,
                 if_not_exists,
@@ -4589,7 +5849,7 @@ impl PgHandler {
                 let exists = !self
                     .storage
                     .find_matching(
-                        &self.db,
+                        self.db(),
                         Self::SCHEMA_COLLECTION,
                         &bson::doc! {"_id": &name},
                     )
@@ -4610,7 +5870,7 @@ impl PgHandler {
                 let bytes = bson::to_vec(&doc)
                     .map_err(|e| Self::storage_err("could not encode the schema", e))?;
                 self.storage
-                    .insert(&self.db, Self::SCHEMA_COLLECTION, vec![bytes], true)
+                    .insert(self.db(), Self::SCHEMA_COLLECTION, vec![bytes], true)
                     .map_err(|e| Self::storage_err("could not record the schema", e))?;
                 Ok(vec![Response::Execution(Tag::new("CREATE SCHEMA"))])
             }
@@ -4631,7 +5891,7 @@ impl PgHandler {
                     let removed = self
                         .storage
                         .delete_matching(
-                            &self.db,
+                            self.db(),
                             Self::SCHEMA_COLLECTION,
                             &bson::doc! {"_id": name},
                             0,
@@ -4710,7 +5970,7 @@ impl PgHandler {
                 let bytes = bson::to_vec(&doc)
                     .map_err(|e| Self::storage_err("could not encode the type", e))?;
                 self.storage
-                    .insert(&self.db, Self::COMPOSITE_COLLECTION, vec![bytes], true)
+                    .insert(self.db(), Self::COMPOSITE_COLLECTION, vec![bytes], true)
                     .map_err(|e| Self::storage_err("could not record the type", e))?;
                 self.note_uncommitted_type(Self::COMPOSITE_COLLECTION, &id_key, Some(doc));
                 Ok(vec![Response::Execution(Tag::new("CREATE TYPE"))])
@@ -4761,7 +6021,7 @@ impl PgHandler {
                 let bytes = bson::to_vec(&doc)
                     .map_err(|e| Self::storage_err("could not encode the type", e))?;
                 self.storage
-                    .insert(&self.db, Self::RANGE_COLLECTION, vec![bytes], true)
+                    .insert(self.db(), Self::RANGE_COLLECTION, vec![bytes], true)
                     .map_err(|e| Self::storage_err("could not record the type", e))?;
                 self.note_uncommitted_type(Self::RANGE_COLLECTION, &id_key, Some(doc));
                 Ok(vec![Response::Execution(Tag::new("CREATE TYPE"))])
@@ -4785,7 +6045,10 @@ impl PgHandler {
                     .iter()
                     .any(|(s, n, _, _)| *s == schema_name && *n == name);
                 let exists = enum_dup
-                    || (unqualified && secantus_pgplan::pgtypes::oid_of_name(&name).is_some());
+                    || (unqualified
+                        && (secantus_pgplan::pgtypes::oid_of_name(&name).is_some()
+                            || self.composites()?.iter().any(|(n, _, _)| *n == name)
+                            || self.ranges()?.iter().any(|(n, _, _)| *n == name)));
                 if exists {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
@@ -4807,7 +6070,7 @@ impl PgHandler {
                 let bytes = bson::to_vec(&doc)
                     .map_err(|e| Self::storage_err("could not encode the type", e))?;
                 self.storage
-                    .insert(&self.db, Self::ENUM_COLLECTION, vec![bytes], true)
+                    .insert(self.db(), Self::ENUM_COLLECTION, vec![bytes], true)
                     .map_err(|e| Self::storage_err("could not record the type", e))?;
                 self.note_uncommitted_type(Self::ENUM_COLLECTION, &id_key, Some(doc));
                 Ok(vec![Response::Execution(Tag::new("CREATE TYPE"))])
@@ -4818,11 +6081,22 @@ impl PgHandler {
                 self.ensure_collection(Self::COMPOSITE_COLLECTION)?;
                 self.ensure_collection(Self::RANGE_COLLECTION)?;
                 for name in &names {
+                    // A table's row type goes with the table, not on its own
+                    // (measured on 16).
+                    if self.row_type_of_table(name)? {
+                        let mut info = ErrorInfo::new(
+                            "ERROR".into(),
+                            "2BP01".into(), // dependent_objects_still_exist
+                            format!("cannot drop type {name} because table {name} requires it"),
+                        );
+                        info.hint = Some(format!("You can drop table {name} instead."));
+                        return Err(PgWireError::UserError(Box::new(info)));
+                    }
                     let filter = bson::doc! {"_id": name};
                     let from_enum = self
                         .storage
                         .delete_matching(
-                            &self.db,
+                            self.db(),
                             Self::ENUM_COLLECTION,
                             &filter,
                             0,
@@ -4833,7 +6107,7 @@ impl PgHandler {
                     let from_comp = self
                         .storage
                         .delete_matching(
-                            &self.db,
+                            self.db(),
                             Self::COMPOSITE_COLLECTION,
                             &filter,
                             0,
@@ -4844,7 +6118,7 @@ impl PgHandler {
                     let from_range = self
                         .storage
                         .delete_matching(
-                            &self.db,
+                            self.db(),
                             Self::RANGE_COLLECTION,
                             &filter,
                             0,
@@ -4898,7 +6172,7 @@ impl PgHandler {
                     for seq in def.columns.iter().filter_map(|c| c.sequence.as_deref()) {
                         self.storage
                             .delete_matching(
-                                &self.db,
+                                self.db(),
                                 SEQUENCE_COLLECTION,
                                 &bson::doc! { "_id": seq },
                                 0,
@@ -4912,11 +6186,11 @@ impl PgHandler {
                     // recoverable, whereas a catalog row pointing at a
                     // collection that no longer exists is not.
                     self.storage
-                        .drop_collection(&self.db, table)
+                        .drop_collection(self.db(), table)
                         .map_err(|e| Self::storage_err("could not drop the table", e))?;
                     self.storage
                         .delete_matching(
-                            &self.db,
+                            self.db(),
                             CATALOG_COLLECTION,
                             &bson::doc! { "_id": table },
                             0,
@@ -4924,6 +6198,23 @@ impl PgHandler {
                             None,
                         )
                         .map_err(|e| Self::storage_err("could not drop the catalog entry", e))?;
+                    // And its ROW TYPE (a table created before row types were
+                    // recorded has none to drop).
+                    self.ensure_collection(Self::COMPOSITE_COLLECTION)?;
+                    let dropped = self
+                        .storage
+                        .delete_matching(
+                            self.db(),
+                            Self::COMPOSITE_COLLECTION,
+                            &bson::doc! { "_id": table, "relation": true },
+                            0,
+                            &Document::new(),
+                            None,
+                        )
+                        .map_err(|e| Self::storage_err("could not drop the row type", e))?;
+                    if dropped > 0 {
+                        self.note_uncommitted_type(Self::COMPOSITE_COLLECTION, table, None);
+                    }
                     // A tombstone: the catalog row is deleted but not
                     // committed, so a plain read would still find it.
                     self.note_uncommitted(table, None);
@@ -5007,7 +6298,7 @@ impl PgHandler {
                             let fields: Vec<String> = cols.iter().map(|c| c.field()).collect();
                             let raw = self
                                 .storage
-                                .find_matching(&self.db, &ct.table, &Document::new())
+                                .find_matching(self.db(), &ct.table, &Document::new())
                                 .map_err(|e| Self::storage_err("could not read", e))?;
                             let docs: Vec<Document> = raw
                                 .iter()
@@ -5058,7 +6349,18 @@ impl PgHandler {
                     schema.clone()
                 };
                 let mut header_written = false;
+                let backend = self.backend.clone();
                 let data = stream::iter(rows).map(move |row| {
+                    // The rows stream out AFTER this statement has answered,
+                    // so a `CancelRequest` mid-COPY is noticed here: the
+                    // stream ends in the `57014` and the block is poisoned
+                    // for the next statement.
+                    if backend.cancelled() {
+                        backend
+                            .stream_failed
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        return Err(Self::query_canceled());
+                    }
                     // The two TEXTUAL formats are written here rather than
                     // through an encoder. Their null handling asks the value
                     // whether it is null, and an `Option` of the wrong type
@@ -5216,6 +6518,10 @@ impl PgHandler {
                     // the stored value and the reported ParameterStatus agree.
                     let value = if key == "DateStyle" {
                         secantus_pgplan::DateStyle::parse(&value).canonical()
+                    } else if IDLE_TIMEOUT_GUCS.iter().any(|(guc, _, _)| *guc == key) {
+                        canonical_ms_guc(&key, &value)?
+                    } else if BOOL_GUCS.contains(&key.as_str()) {
+                        canonical_bool_guc(&key, &value)?
                     } else {
                         value
                     };
@@ -5387,33 +6693,15 @@ impl PgHandler {
                 // accumulation below work on documents and do not care where
                 // they came from.
                 let groups = self.aggregate_groups(&agg, max_rows)?;
-
-                // A generated source has no table to look up; its one column
-                // is an int4.
-                let def = match (&agg.series, &agg.join) {
-                    (Some(series), _) => series_table_def(series),
-                    // A join's output def: each projected column with its
-                    // source (or cast) type.
-                    (None, Some(join)) => {
-                        secantus_pgplan::join_output_def(join, &|n| self.lookup(n))
-                            .map_err(|e| Self::err(&e))?
-                    }
-                    (None, None) => self
-                        .lookup(&agg.table)
-                        .ok_or_else(|| Self::err(&PlanError::UndefinedTable(agg.table.clone())))?,
-                };
                 let schema = Arc::new(
                     agg.select
                         .iter()
                         .map(|(name, col)| {
                             let ty = match col {
-                                OutputCol::Group(i) => def
-                                    .column(&agg.group_by[*i].0)
-                                    .map(|c| {
-                                        self.user_wire_type(&c.pg_type)
-                                            .unwrap_or_else(|| wire_type(&c.pg_type))
-                                    })
-                                    .unwrap_or(Type::VARCHAR),
+                                OutputCol::Group(i) => {
+                                    let t = &agg.group_by[*i].pg_type;
+                                    self.user_wire_type(t).unwrap_or_else(|| wire_type(t))
+                                }
                                 OutputCol::Agg(i) => aggregate_wire_type(&agg.items[*i]),
                             };
                             self.field(name.clone(), ty)
@@ -5445,7 +6733,9 @@ impl PgHandler {
             }
 
             Statement::Update(upd) => {
-                let matched = if upd.set_exprs.is_empty() {
+                let def = self.lookup(&upd.table);
+                let constrained = def.as_ref().is_some_and(table_has_row_constraints);
+                let matched = if upd.set_exprs.is_empty() && !constrained {
                     self.update_rows(&upd.table, &upd.filter, &upd.set, &upd.unset)?
                 } else {
                     // A SET list that reads the row (`num = num * 2`) is
@@ -5454,16 +6744,35 @@ impl PgHandler {
                     // expression that fails on one row leaves none updated.
                     let raw = self
                         .storage
-                        .find_matching(&self.db, &upd.table, &upd.filter)
+                        .find_matching(self.db(), &upd.table, &upd.filter)
                         .map_err(|e| Self::storage_err("could not read", e))?;
                     let mut writes = Vec::with_capacity(raw.len());
+                    let mut new_rows = Vec::with_capacity(raw.len());
                     for bytes in &raw {
                         let row: Document = bson::from_slice(bytes)
                             .map_err(|e| Self::storage_err("could not decode a row", e))?;
-                        let (set, unset) = secantus_pgplan::update_row_sets(&upd, &row)
-                            .map_err(|e| Self::err(&e))?;
+                        let (set, unset) = if upd.set_exprs.is_empty() {
+                            (upd.set.clone(), upd.unset.clone())
+                        } else {
+                            secantus_pgplan::update_row_sets(&upd, &row)
+                                .map_err(|e| Self::err(&e))?
+                        };
+                        if let Some(def) = def.as_ref() {
+                            let mut after = row.clone();
+                            for (k, v) in &set {
+                                after.insert(k.clone(), v.clone());
+                            }
+                            for k in &unset {
+                                after.remove(k);
+                            }
+                            self.check_row_constraints(def, &after)?;
+                            new_rows.push(after);
+                        }
                         let id = row.get("_id").cloned().unwrap_or(Bson::Null);
                         writes.push((id, set, unset));
+                    }
+                    if let Some(def) = def.as_ref() {
+                        self.check_foreign_keys(def, &new_rows)?;
                     }
                     let mut matched = 0usize;
                     for (id, set, unset) in writes {
@@ -5481,9 +6790,19 @@ impl PgHandler {
             }
 
             Statement::Delete(del) => {
+                if let Some(def) = self.lookup(&del.table) {
+                    self.check_referencing_rows(&def, &del.filter)?;
+                }
                 let deleted = self
                     .storage
-                    .delete_matching(&self.db, &del.table, &del.filter, 0, &Document::new(), None)
+                    .delete_matching(
+                        self.db(),
+                        &del.table,
+                        &del.filter,
+                        0,
+                        &Document::new(),
+                        None,
+                    )
                     .map_err(|e| Self::storage_err("could not delete", e))?;
                 Ok(vec![Response::Execution(
                     Tag::new("DELETE").with_rows(deleted),
@@ -5514,7 +6833,7 @@ impl PgHandler {
         let outcome = self
             .storage
             .update_matching(
-                &self.db,
+                self.db(),
                 table,
                 filter,
                 &ops,
@@ -5528,6 +6847,402 @@ impl PgHandler {
             )
             .map_err(|e| Self::storage_err("could not update", e))?;
         Ok(outcome.matched)
+    }
+}
+
+/// Whether an UPDATE of `def` must look at each row it writes: a NOT NULL
+/// column, a CHECK, or a FOREIGN KEY can all be violated by the new value.
+fn table_has_row_constraints(def: &TableDef) -> bool {
+    def.columns.iter().any(|c| !c.nullable && !c.pk)
+        || !def.check_constraints.is_empty()
+        || !def.foreign_keys.is_empty()
+}
+
+/// Two stored values equal as PostgreSQL compares a key: numerics by value
+/// across the integer / float widths, everything else structurally.
+fn key_values_equal(a: &Bson, b: &Bson) -> bool {
+    fn num(v: &Bson) -> Option<f64> {
+        match v {
+            Bson::Int32(i) => Some(f64::from(*i)),
+            Bson::Int64(i) => Some(*i as f64),
+            Bson::Double(d) => Some(*d),
+            _ => None,
+        }
+    }
+    match (num(a), num(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+impl PgHandler {
+    /// The schema a table's error diagnostics name: a TEMP table lives in the
+    /// session's `pg_temp_N` namespace.
+    fn schema_of(def: &TableDef) -> String {
+        if def.temp {
+            "pg_temp_1".to_string()
+        } else {
+            "public".to_string()
+        }
+    }
+
+    /// PostgreSQL's `Failing row contains (...)` detail: every column in
+    /// declaration order, each as its text output, NULL as `null`.
+    fn failing_row_detail(def: &TableDef, row: &Document) -> String {
+        let cells: Vec<String> = def
+            .columns
+            .iter()
+            .map(|c| match row.get(c.field()) {
+                None | Some(Bson::Null) => "null".to_string(),
+                Some(v) => secantus_pgplan::value_text(v),
+            })
+            .collect();
+        format!("Failing row contains ({}).", cells.join(", "))
+    }
+
+    /// An integrity-constraint error (class 23) with the diagnostic fields
+    /// PostgreSQL attaches: schema and table always, the constraint or the
+    /// column as the kind of violation names it.
+    fn constraint_error(
+        code: &str,
+        message: String,
+        detail: String,
+        def: &TableDef,
+        constraint: Option<&str>,
+        column: Option<&str>,
+    ) -> PgWireError {
+        let mut info = ErrorInfo::new("ERROR".into(), code.into(), message);
+        info.detail = Some(detail);
+        info.schema = Some(Self::schema_of(def));
+        info.table = Some(def.name.clone());
+        info.constraint = constraint.map(str::to_string);
+        info.column = column.map(str::to_string);
+        PgWireError::UserError(Box::new(info))
+    }
+
+    /// NOT NULL and CHECK over one row about to be written, in PostgreSQL's
+    /// order: every NOT NULL column first, then the CHECK constraints by
+    /// name. A CHECK that evaluates to NULL passes (SQL's rule).
+    fn check_row_constraints(&self, def: &TableDef, row: &Document) -> PgWireResult<()> {
+        for c in &def.columns {
+            if c.nullable || c.pk {
+                continue;
+            }
+            if matches!(row.get(c.field()), None | Some(Bson::Null)) {
+                return Err(Self::constraint_error(
+                    "23502",
+                    format!(
+                        "null value in column \"{}\" of relation \"{}\" violates not-null constraint",
+                        c.name, def.name
+                    ),
+                    Self::failing_row_detail(def, row),
+                    def,
+                    None,
+                    Some(&c.name),
+                ));
+            }
+        }
+        for check in &def.check_constraints {
+            let expr = secantus_pgplan::plan_check_expression(&check.expression, def)
+                .map_err(|e| Self::err(&e))?;
+            let verdict = secantus_pgplan::apply_row_expr(&expr, row).map_err(|e| Self::err(&e))?;
+            if verdict == Bson::Boolean(false) {
+                return Err(Self::constraint_error(
+                    "23514",
+                    format!(
+                        "new row for relation \"{}\" violates check constraint \"{}\"",
+                        def.name, check.name
+                    ),
+                    Self::failing_row_detail(def, row),
+                    def,
+                    Some(&check.name),
+                    None,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `value` is present in the referenced column of `parent` --
+    /// among its stored rows, or among `pending` rows the same statement is
+    /// about to write when the key refers back to its own table.
+    fn referenced_key_exists(
+        &self,
+        parent: &TableDef,
+        ref_field: &str,
+        value: &Bson,
+        pending: &[Document],
+    ) -> PgWireResult<bool> {
+        if pending
+            .iter()
+            .any(|r| r.get(ref_field).is_some_and(|v| key_values_equal(v, value)))
+        {
+            return Ok(true);
+        }
+        let found = self
+            .storage
+            .find_matching(
+                self.db(),
+                &parent.name,
+                &bson::doc! { ref_field: value.clone() },
+            )
+            .map_err(|e| Self::storage_err("could not read", e))?;
+        Ok(!found.is_empty())
+    }
+
+    /// The child side of every FOREIGN KEY on `def`, over the rows a
+    /// statement is about to write. An INITIALLY DEFERRED key inside a
+    /// transaction is queued for COMMIT instead.
+    fn check_foreign_keys(&self, def: &TableDef, rows: &[Document]) -> PgWireResult<()> {
+        for fk in &def.foreign_keys {
+            if fk.initially_deferred
+                && self
+                    .in_transaction
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                self.defer_fk(&def.name, &fk.name);
+                continue;
+            }
+            self.check_fk_child_side(def, fk, rows)?;
+        }
+        Ok(())
+    }
+
+    fn defer_fk(&self, table: &str, name: &str) {
+        let mut q = self.deferred_fks.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (table.to_string(), name.to_string());
+        if !q.contains(&key) {
+            q.push(key);
+        }
+    }
+
+    /// `rows` of `def` (the referencing table) must each find their key in
+    /// the referenced table; a NULL key passes. When the key refers back to
+    /// `def` itself, the rows being written count as present -- PostgreSQL
+    /// checks at the end of the statement, so `(1, 2), (2, 1)` inserts.
+    fn check_fk_child_side(
+        &self,
+        def: &TableDef,
+        fk: &secantus_pgcatalog::ForeignKey,
+        rows: &[Document],
+    ) -> PgWireResult<()> {
+        let (Some(col), Some(ref_col)) = (fk.columns.first(), fk.ref_columns.first()) else {
+            return Ok(());
+        };
+        let Some(field) = def.field_of(col) else {
+            return Ok(());
+        };
+        let parent = if fk.ref_table == def.name {
+            def.clone()
+        } else {
+            self.lookup(&fk.ref_table)
+                .ok_or_else(|| Self::err(&PlanError::UndefinedTable(fk.ref_table.clone())))?
+        };
+        let Some(ref_field) = parent.field_of(ref_col) else {
+            return Ok(());
+        };
+        let pending: &[Document] = if fk.ref_table == def.name { rows } else { &[] };
+        for row in rows {
+            let value = match row.get(&field) {
+                None | Some(Bson::Null) => continue,
+                Some(v) => v,
+            };
+            if !self.referenced_key_exists(&parent, &ref_field, value, pending)? {
+                return Err(Self::constraint_error(
+                    "23503",
+                    format!(
+                        "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
+                        def.name, fk.name
+                    ),
+                    format!(
+                        "Key ({})=({}) is not present in table \"{}\".",
+                        col,
+                        secantus_pgplan::value_text(value),
+                        fk.ref_table
+                    ),
+                    def,
+                    Some(&fk.name),
+                    None,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Every table whose FOREIGN KEYs reference `parent`, with those keys.
+    fn referencing_keys(
+        &self,
+        parent: &str,
+    ) -> PgWireResult<Vec<(TableDef, secantus_pgcatalog::ForeignKey)>> {
+        let raw = self
+            .storage
+            .find_matching(self.db(), CATALOG_COLLECTION, &Document::new())
+            .map_err(|e| Self::storage_err("could not read the catalog", e))?;
+        let mut defs: Vec<TableDef> = raw
+            .iter()
+            .filter_map(|b| bson::from_slice::<Document>(b).ok())
+            .filter_map(|d| TableDef::from_document(&d))
+            .collect();
+        // What this transaction created or dropped overlays the catalog.
+        {
+            let pending = self.uncommitted.lock().unwrap_or_else(|e| e.into_inner());
+            defs.retain(|d| !pending.contains_key(&d.name));
+            defs.extend(pending.values().filter_map(|d| d.clone()));
+        }
+        Ok(defs
+            .into_iter()
+            .flat_map(|d| {
+                let fks: Vec<_> = d
+                    .foreign_keys
+                    .iter()
+                    .filter(|fk| fk.ref_table == parent)
+                    .cloned()
+                    .collect();
+                fks.into_iter().map(move |fk| (d.clone(), fk))
+            })
+            .collect())
+    }
+
+    /// The parent side of a DELETE from `def`: a row another table's row
+    /// still references cannot go (NO ACTION / RESTRICT), is followed by its
+    /// dependants (CASCADE), or leaves them keyless (SET NULL). Applied
+    /// BEFORE the delete, so a refusal leaves the table untouched.
+    fn check_referencing_rows(&self, def: &TableDef, filter: &Document) -> PgWireResult<()> {
+        let referencing = self.referencing_keys(&def.name)?;
+        if referencing.is_empty() {
+            return Ok(());
+        }
+        let raw = self
+            .storage
+            .find_matching(self.db(), &def.name, filter)
+            .map_err(|e| Self::storage_err("could not read", e))?;
+        let going: Vec<Document> = raw
+            .iter()
+            .filter_map(|b| bson::from_slice::<Document>(b).ok())
+            .collect();
+        for (child, fk) in referencing {
+            let (Some(col), Some(ref_col)) = (fk.columns.first(), fk.ref_columns.first()) else {
+                continue;
+            };
+            let (Some(field), Some(ref_field)) = (child.field_of(col), def.field_of(ref_col))
+            else {
+                continue;
+            };
+            for row in &going {
+                let Some(key) = row.get(&ref_field).filter(|v| **v != Bson::Null) else {
+                    continue;
+                };
+                // A self-referencing row that is itself going does not hold
+                // its own parent; only rows that STAY count.
+                let mut child_filter = bson::doc! { &field: key.clone() };
+                if child.name == def.name {
+                    let going_ids: Vec<Bson> =
+                        going.iter().filter_map(|r| r.get("_id").cloned()).collect();
+                    child_filter.insert("_id", bson::doc! { "$nin": going_ids });
+                }
+                let dependants = self
+                    .storage
+                    .find_matching(self.db(), &child.name, &child_filter)
+                    .map_err(|e| Self::storage_err("could not read", e))?;
+                if dependants.is_empty() {
+                    continue;
+                }
+                match fk.on_delete.as_deref() {
+                    Some("CASCADE") => {
+                        self.check_referencing_rows(&child, &child_filter)?;
+                        self.storage
+                            .delete_matching(
+                                self.db(),
+                                &child.name,
+                                &child_filter,
+                                0,
+                                &Document::new(),
+                                None,
+                            )
+                            .map_err(|e| Self::storage_err("could not delete", e))?;
+                    }
+                    Some("SET NULL") => {
+                        let mut after = Vec::new();
+                        for b in &dependants {
+                            let mut r: Document = bson::from_slice(b)
+                                .map_err(|e| Self::storage_err("could not decode a row", e))?;
+                            r.insert(field.clone(), Bson::Null);
+                            self.check_row_constraints(&child, &r)?;
+                            after.push(r);
+                        }
+                        self.update_rows(
+                            &child.name,
+                            &child_filter,
+                            &bson::doc! { &field: Bson::Null },
+                            &[],
+                        )?;
+                    }
+                    _ if fk.initially_deferred
+                        && self
+                            .in_transaction
+                            .load(std::sync::atomic::Ordering::Relaxed) =>
+                    {
+                        self.defer_fk(&child.name, &fk.name);
+                    }
+                    _ => {
+                        return Err(Self::constraint_error(
+                            "23503",
+                            format!(
+                                "update or delete on table \"{}\" violates foreign key constraint \"{}\" on table \"{}\"",
+                                def.name, fk.name, child.name
+                            ),
+                            format!(
+                                "Key ({})=({}) is still referenced from table \"{}\".",
+                                ref_col,
+                                secantus_pgplan::value_text(key),
+                                child.name
+                            ),
+                            &child,
+                            Some(&fk.name),
+                            None,
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-check every deferred FOREIGN KEY over the whole referencing table,
+    /// as COMMIT does. Runs inside the transaction, so it sees its writes.
+    fn run_deferred_checks(&self) -> PgWireResult<()> {
+        let queued: Vec<(String, String)> =
+            std::mem::take(&mut *self.deferred_fks.lock().unwrap_or_else(|e| e.into_inner()));
+        for (table, name) in queued {
+            let Some(def) = self.lookup(&table) else {
+                continue;
+            };
+            let Some(fk) = def.foreign_keys.iter().find(|f| f.name == name) else {
+                continue;
+            };
+            let raw = self
+                .storage
+                .find_matching(self.db(), &table, &Document::new())
+                .map_err(|e| Self::storage_err("could not read", e))?;
+            let rows: Vec<Document> = raw
+                .iter()
+                .filter_map(|b| bson::from_slice::<Document>(b).ok())
+                .collect();
+            self.check_fk_child_side(&def, fk, &rows)?;
+        }
+        Ok(())
+    }
+
+    /// After a COMMIT whose deferred checks failed, the transaction is
+    /// already rolled back: the `ReadyForQuery` that follows the error must
+    /// say IDLE, not "in a failed transaction".
+    fn settle_failed_commit<C: ClientInfo>(&self, client: &mut C) {
+        if self
+            .commit_failed
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            client.set_transaction_status(pgwire::messages::response::TransactionStatus::Idle);
+        }
     }
 }
 
@@ -7538,6 +9253,7 @@ fn element_of_array_oid(oid: u32) -> Option<&'static str> {
         1001 => "bytea",
         1041 => "inet",
         651 => "cidr",
+        1034 => "aclitem",
         1020 => "box",
         2951 => "uuid",
         // `oid[]` sent as text (`{1,2}`, psycopg's `[Oid(1), Oid(2)]`) used to
@@ -7654,14 +9370,14 @@ fn binary_range(
 /// A one-column table definition standing in for a generated series, so the
 /// row encoder and the describe path can treat it like any other source.
 fn series_table_def(series: &secantus_pgplan::Series) -> TableDef {
-    TableDef {
-        name: "generate_series".to_string(),
-        columns: vec![secantus_pgcatalog::Column::new(
+    TableDef::new(
+        "generate_series",
+        vec![secantus_pgcatalog::Column::new(
             &series.column,
             "int4",
             false,
         )],
-    }
+    )
 }
 
 /// Parse COPY text or CSV input into rows of optional fields, where `None` is
@@ -8209,6 +9925,9 @@ fn decode_parameter(
         Some(650) => secantus_pgplan::net::normalize_cidr(&text)
             .map(Bson::String)
             .map_err(|e| PgHandler::err(&e)),
+        Some(1033) => {
+            secantus_pgplan::cast_text_to(&text, "aclitem", tz).map_err(|e| PgHandler::err(&e))
+        }
         Some(603) => {
             secantus_pgplan::cast_text_to(&text, "box", tz).map_err(|e| PgHandler::err(&e))
         }
@@ -8635,31 +10354,20 @@ impl PgHandler {
                     self.field(name.clone(), ty)
                 })
                 .collect(),
-            Statement::Aggregate(agg) => {
-                let def = match &agg.join {
-                    Some(join) => secantus_pgplan::join_output_def(join, &|n| self.lookup(n))
-                        .map_err(|e| Self::err(&e))?,
-                    None => self
-                        .lookup(&agg.table)
-                        .ok_or_else(|| Self::err(&PlanError::UndefinedTable(agg.table.clone())))?,
-                };
-                agg.select
-                    .iter()
-                    .map(|(name, col)| {
-                        let ty = match col {
-                            OutputCol::Group(i) => def
-                                .column(&agg.group_by[*i].0)
-                                .map(|c| {
-                                    self.user_wire_type(&c.pg_type)
-                                        .unwrap_or_else(|| wire_type(&c.pg_type))
-                                })
-                                .unwrap_or(Type::VARCHAR),
-                            OutputCol::Agg(i) => aggregate_wire_type(&agg.items[*i]),
-                        };
-                        self.field(name.clone(), ty)
-                    })
-                    .collect()
-            }
+            Statement::Aggregate(agg) => agg
+                .select
+                .iter()
+                .map(|(name, col)| {
+                    let ty = match col {
+                        OutputCol::Group(i) => {
+                            let t = &agg.group_by[*i].pg_type;
+                            self.user_wire_type(t).unwrap_or_else(|| wire_type(t))
+                        }
+                        OutputCol::Agg(i) => aggregate_wire_type(&agg.items[*i]),
+                    };
+                    self.field(name.clone(), ty)
+                })
+                .collect(),
             Statement::Show(name) => vec![self.field(canonical_setting(&name), Type::TEXT)],
             Statement::SelectConstant(sc) => sc
                 .columns
@@ -8714,7 +10422,14 @@ impl ExtendedQueryHandler for PgHandler {
     {
         let parser = <Self as ExtendedQueryHandler>::query_parser(self);
         let mut message = message;
-        message.query = <Self as ExtendedQueryHandler>::decode_query_text(self, client, &message)?;
+        let decoded = <Self as ExtendedQueryHandler>::decode_query_text(self, client, &message)?;
+        // Read under the session's string syntax at Parse time, when
+        // PostgreSQL's scanner reads it; the scanner's warnings
+        // (`escape_string_warning`) go out with the Parse they belong to, and
+        // before its error when the text is unterminated.
+        let rewritten = self.apply_string_syntax(&decoded);
+        self.flush_notices(client).await?;
+        message.query = rewritten?;
         let stmt = StoredStatement::parse(client, &message, parser).await?;
         // The message's own name, not `stmt.id`: the wire store files the
         // unnamed statement under its `DEFAULT_NAME` placeholder.
@@ -8820,6 +10535,34 @@ impl ExtendedQueryHandler for PgHandler {
     /// columns -- before it ever sends a `FETCH`. This server's cursors are
     /// its own, not pgwire portals, so the describe found nothing and every
     /// server cursor died on its first row with "portal not found".
+    /// `Sync` ends the statement group the `Execute`s since the last one
+    /// opened: commit it, or roll it back if any of them failed. A commit
+    /// that fails (a deferred constraint) is the `Sync`'s error, and the
+    /// `ReadyForQuery` after it says IDLE, as PostgreSQL's does.
+    async fn on_sync<C>(&self, client: &mut C, _message: PgSync) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: pgwire::api::store::PortalStore<Statement = Self::Statement>,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        if let Err(e) = self.close_extended_group(false) {
+            let info: ErrorInfo = e.into();
+            client
+                .send(PgWireBackendMessage::ErrorResponse(info.into()))
+                .await?;
+            client.set_transaction_status(pgwire::messages::response::TransactionStatus::Idle);
+        }
+        pgwire::api::store::PortalStore::rm_portal(client.portal_store(), DEFAULT_NAME);
+        client
+            .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                client.transaction_status(),
+            )))
+            .await?;
+        client.flush().await?;
+        Ok(())
+    }
+
     async fn on_describe<C>(&self, client: &mut C, message: Describe) -> PgWireResult<()>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
@@ -8889,7 +10632,14 @@ impl ExtendedQueryHandler for PgHandler {
             &self.param_type_names(portal.statement.as_ref()),
         );
         self.type_untyped_binary_params(portal, &mut param_types);
-        let params = self.portal_params(portal, &param_types)?;
+        // Every statement between two `Sync`s runs in ONE transaction that
+        // the `Sync` commits -- or rolls back, if any of them failed. A
+        // pipelining client counts on the rollback: after an error, nothing
+        // before it in the pipeline may have landed either.
+        self.open_extended_group()?;
+        let params = self
+            .portal_params(portal, &param_types)
+            .inspect_err(|_| self.note_failure())?;
         let result = self
             .run_typed(
                 &portal.statement.statement.sql,
@@ -8897,9 +10647,11 @@ impl ExtendedQueryHandler for PgHandler {
                 &param_types,
                 max_rows,
             )
-            .await;
+            .await
+            .inspect_err(|_| self.note_failure());
         // Notices go out before the result -- or the error -- they preceded.
         self.flush_notices(_c).await?;
+        self.settle_failed_commit(_c);
         let mut responses = result?;
         // Report any GUC change (TimeZone, DateStyle, ...) the statement made.
         self.report_pending_params(_c).await?;
@@ -9101,7 +10853,7 @@ impl CopyHandler for PgHandler {
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| Self::storage_err("could not encode a COPY row", e))?;
                 self.storage
-                    .insert(&self.db, &state.table, docs, true)
+                    .insert(self.db(), &state.table, docs, true)
                     .map_err(|e| Self::storage_err("could not insert COPY rows", e))
             };
             let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
@@ -9153,6 +10905,9 @@ impl PgWireServerHandlers for HandlerFactory {
     fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
         self.0.clone()
     }
+    fn cancel_handler(&self) -> Arc<impl pgwire::api::cancel::CancelHandler> {
+        Arc::new(CancelBackend)
+    }
     fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
         self.0.clone()
     }
@@ -9161,6 +10916,9 @@ impl PgWireServerHandlers for HandlerFactory {
     }
     fn startup_handler(&self) -> Arc<impl pgwire::api::auth::StartupHandler> {
         self.0.clone()
+    }
+    fn idle_timeout(&self) -> Option<(std::time::Duration, ErrorInfo)> {
+        self.0.idle_timeout()
     }
 }
 
@@ -9261,6 +11019,68 @@ mod wire_format_tests {
         assert_eq!(
             hex(&element_binary(&Bson::String("{\"a\": 1}".into()), &Type::JSONB).unwrap()),
             "017b2261223a20317d"
+        );
+    }
+}
+
+#[cfg(test)]
+mod idle_timeout_guc_tests {
+    //! `SET idle_in_transaction_session_timeout` parsing and `SHOW` rendering,
+    //! pinned to PostgreSQL 16 (probed 2026-09-09).
+    use super::*;
+
+    #[test]
+    fn parses_units_floats_and_whitespace() {
+        assert_eq!(parse_ms_guc("250"), Some(250));
+        assert_eq!(parse_ms_guc("1min"), Some(60_000));
+        assert_eq!(parse_ms_guc("1.5s"), Some(1_500));
+        assert_eq!(parse_ms_guc("0.5min"), Some(30_000));
+        assert_eq!(parse_ms_guc("1.2345s"), Some(1_234));
+        assert_eq!(parse_ms_guc("  7  ms "), Some(7));
+        assert_eq!(parse_ms_guc("1e3"), Some(1_000));
+        assert_eq!(parse_ms_guc("100us"), Some(0));
+        assert_eq!(parse_ms_guc("abc"), None);
+        assert_eq!(parse_ms_guc("5 fortnights"), None);
+    }
+
+    #[test]
+    fn renders_like_show() {
+        assert_eq!(render_ms_guc(0), "0");
+        assert_eq!(render_ms_guc(250), "250ms");
+        assert_eq!(render_ms_guc(1_500), "1500ms");
+        assert_eq!(render_ms_guc(2_000), "2s");
+        assert_eq!(render_ms_guc(60_000), "1min");
+        assert_eq!(render_ms_guc(7_200_000), "2h");
+    }
+
+    fn refusal(value: &str) -> String {
+        match canonical_ms_guc("idle_in_transaction_session_timeout", value) {
+            Err(PgWireError::UserError(info)) => {
+                assert_eq!(info.code, "22023");
+                info.message.clone()
+            }
+            other => panic!("expected a 22023 refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refuses_what_postgres_refuses() {
+        assert_eq!(
+            refusal("abc"),
+            "invalid value for parameter \"idle_in_transaction_session_timeout\": \"abc\""
+        );
+        assert_eq!(
+            refusal("-1"),
+            "-1 ms is outside the valid range for parameter \
+             \"idle_in_transaction_session_timeout\" (0 .. 2147483647)"
+        );
+        assert_eq!(
+            refusal("2147483648"),
+            "invalid value for parameter \"idle_in_transaction_session_timeout\": \"2147483648\""
+        );
+        assert_eq!(
+            canonical_ms_guc("idle_session_timeout", "60000").unwrap(),
+            "1min"
         );
     }
 }

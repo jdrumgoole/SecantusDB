@@ -358,7 +358,10 @@ fn order_by_a_non_grouped_column_is_refused() {
 fn group_by_resolves_order_by_index() {
     match plan_ok("SELECT count(*) FROM t GROUP BY name ORDER BY name DESC") {
         Statement::Aggregate(a) => {
-            assert_eq!(a.group_by, vec![("name".to_string(), "name".to_string())]);
+            assert_eq!(a.group_by.len(), 1);
+            assert_eq!(a.group_by[0].name, "name");
+            assert_eq!(a.group_by[0].field, "name");
+            assert!(a.group_by[0].expr.is_none());
             // `name` is grouped but NOT projected; only the aggregate is.
             assert_eq!(a.select, vec![("count".to_string(), OutputCol::Agg(0))]);
             assert_eq!(a.order.len(), 1);
@@ -366,6 +369,131 @@ fn group_by_resolves_order_by_index() {
             assert!(!a.order[0].ascending);
             // DESC defaults to NULLS FIRST.
             assert_eq!(a.order[0].nulls, Nulls::First);
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+}
+
+/// `GROUP BY <expression>` and `GROUP BY <position>` both key on the
+/// expression, evaluated per row; a projected copy of the same expression is
+/// the group column, matched by structure. Types and names probed on PG 16:
+/// `length(data)` is `int4` named `length`, `x is null` is `bool` named
+/// `?column?`.
+#[test]
+fn group_by_an_expression_or_a_position_keys_on_the_expression() {
+    for sql in [
+        "SELECT length(name), name IS NULL, count(*) FROM t GROUP BY length(name), name IS NULL",
+        "SELECT length(name), name IS NULL, count(*) FROM t GROUP BY 1, 2",
+        "SELECT length(name) AS length, name IS NULL, count(*) FROM t GROUP BY length, 2",
+    ] {
+        match plan(sql, &lookup).unwrap_or_else(|e| panic!("{sql}: {e:?}")) {
+            Statement::Aggregate(a) => {
+                assert_eq!(a.group_by.len(), 2, "{sql}");
+                assert_eq!(a.group_by[0].name, "length");
+                assert_eq!(a.group_by[0].pg_type, "int4");
+                assert_eq!(a.group_by[1].name, "?column?");
+                assert_eq!(a.group_by[1].pg_type, "bool");
+                let row = doc! { "_id": 1, "name": "ab", "n": 3 };
+                let key0 = a.group_by[0].expr.as_ref().expect("an expression key");
+                assert_eq!(apply_row_expr(key0, &row).unwrap(), Bson::Int32(2));
+                let key1 = a.group_by[1].expr.as_ref().expect("an expression key");
+                assert_eq!(apply_row_expr(key1, &row).unwrap(), Bson::Boolean(false));
+                assert_eq!(
+                    a.select,
+                    vec![
+                        ("length".to_string(), OutputCol::Group(0)),
+                        ("?column?".to_string(), OutputCol::Group(1)),
+                        ("count".to_string(), OutputCol::Agg(0)),
+                    ],
+                    "{sql}"
+                );
+            }
+            other => panic!("wrong statement: {other:?}"),
+        }
+    }
+    // A position past the select list is 42P10, worded as PostgreSQL words it.
+    let err =
+        plan("SELECT length(name), count(*) FROM t GROUP BY 3", &lookup).expect_err("must refuse");
+    assert_eq!(err.sqlstate(), "42P10");
+    assert!(err
+        .to_string()
+        .contains("GROUP BY position 3 is not in select list"));
+    // ORDER BY may name the key by position, alias, or expression.
+    for sql in [
+        "SELECT length(name) AS len, count(*) FROM t GROUP BY 1 ORDER BY 1 DESC",
+        "SELECT length(name) AS len, count(*) FROM t GROUP BY len ORDER BY len DESC",
+        "SELECT length(name) AS len, count(*) FROM t GROUP BY length(name) ORDER BY length(name) DESC",
+    ] {
+        match plan(sql, &lookup).unwrap_or_else(|e| panic!("{sql}: {e:?}")) {
+            Statement::Aggregate(a) => {
+                assert_eq!(a.order.len(), 1, "{sql}");
+                assert_eq!(a.order[0].group_index, 0);
+                assert!(!a.order[0].ascending);
+            }
+            other => panic!("wrong statement: {other:?}"),
+        }
+    }
+}
+
+/// `IS [NOT] NULL` over a constant, including PostgreSQL's row rule: a row is
+/// null only when every field is, and not null only when none is.
+#[test]
+fn is_null_over_constants_matches_postgresql() {
+    let sql = "SELECT row(null, null) IS NULL, row(null, null) IS NOT NULL, \
+               row(1, null) IS NULL, row(1, null) IS NOT NULL, null IS NULL, \
+               1 IS NOT NULL, '{}'::int[] IS NULL";
+    match plan_ok(sql) {
+        Statement::SelectConstant(sc) => {
+            let values: Vec<Bson> = sc
+                .columns
+                .iter()
+                .map(|(name, col, ty, _)| {
+                    assert_eq!(name, "?column?");
+                    assert_eq!(ty, "bool");
+                    match col {
+                        ConstCol::Value(v) => v.clone(),
+                        other => panic!("not a value: {other:?}"),
+                    }
+                })
+                .collect();
+            assert_eq!(
+                values,
+                [true, false, false, false, true, true, false]
+                    .map(Bson::Boolean)
+                    .to_vec()
+            );
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+}
+
+/// A FROM-less `select unnest(array)` is one row per element in a column
+/// named `unnest` of the element type; a NULL array is no rows at all. The
+/// elements arrive as a text[] LITERAL, so the literal parser must keep the
+/// quoted characters (`"`, `\`, `,`, `{`, `}`) intact.
+#[test]
+fn from_less_unnest_is_one_row_per_element() {
+    match plan_ok(r#"SELECT unnest('{a,"b",",","\\","{","}",€}'::text[])"#) {
+        Statement::ValuesConstant(vc) => {
+            assert_eq!(vc.names, vec!["unnest".to_string()]);
+            assert_eq!(vc.types, vec!["text".to_string()]);
+            let got: Vec<&str> = vc.rows.iter().map(|r| r[0].as_str().unwrap()).collect();
+            assert_eq!(got, ["a", "b", ",", "\\", "{", "}", "€"]);
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    match plan_ok("SELECT unnest('{1,2}'::int[]) AS u") {
+        Statement::ValuesConstant(vc) => {
+            assert_eq!(vc.names, vec!["u".to_string()]);
+            assert_eq!(vc.types, vec!["int4".to_string()]);
+            assert_eq!(vc.rows, vec![vec![Bson::Int32(1)], vec![Bson::Int32(2)]]);
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    match plan_ok("SELECT unnest(null::text[])") {
+        Statement::ValuesConstant(vc) => {
+            assert_eq!(vc.types, vec!["text".to_string()]);
+            assert!(vc.rows.is_empty());
         }
         other => panic!("wrong statement: {other:?}"),
     }
@@ -612,8 +740,8 @@ fn select_without_from_answers_session_functions() {
                 sc.columns[1],
                 (
                     "current_database".to_string(),
-                    ConstCol::Value(Bson::String("postgres".into())),
-                    "text".to_string(),
+                    ConstCol::CurrentDatabase,
+                    "name".to_string(),
                     -1
                 )
             );
@@ -2512,4 +2640,264 @@ fn datetime_arith_type_maps_the_operand_combinations() {
     // Not a datetime combination.
     assert_eq!(t("+", "int4", "int4"), None);
     assert_eq!(t("/", "int4", "interval"), None);
+}
+
+// -- constraints: names and shapes measured on PostgreSQL 16 (2026-09-09) --
+
+#[test]
+fn create_table_records_not_null_check_and_foreign_key_constraints() {
+    let sql = "CREATE TEMP TABLE nm_t (a int not null, b serial, c int check (c > 0), \
+               x int, check (a < b), check (x > 0), check (b*2 > a + c), \
+               z int references t on delete cascade, \
+               w int constraint fkw references t (id) deferrable initially deferred, \
+               check (true))";
+    let Statement::CreateTable(def, _) = plan_ok(sql) else {
+        panic!("not a CREATE TABLE");
+    };
+    assert!(def.temp);
+    assert!(!def.column("a").unwrap().nullable);
+    assert!(!def.column("b").unwrap().nullable, "serial is NOT NULL");
+    assert!(def.column("c").unwrap().nullable);
+    let names: Vec<(&str, &str)> = def
+        .check_constraints
+        .iter()
+        .map(|c| (c.name.as_str(), c.expression.as_str()))
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            ("nm_t_c_check", "(c > 0)"),
+            ("nm_t_check", "(a < b)"),
+            ("nm_t_check1", "((b * 2) > (a + c))"),
+            ("nm_t_check2", "true"),
+            ("nm_t_x_check", "(x > 0)"),
+        ]
+    );
+    let fks: Vec<_> = def
+        .foreign_keys
+        .iter()
+        .map(|f| {
+            (
+                f.name.as_str(),
+                f.columns.clone(),
+                f.ref_table.as_str(),
+                f.ref_columns.clone(),
+                f.on_delete.as_deref(),
+                f.deferrable,
+                f.initially_deferred,
+            )
+        })
+        .collect();
+    assert_eq!(
+        fks,
+        vec![
+            (
+                "nm_t_z_fkey",
+                vec!["z".to_string()],
+                "t",
+                vec![],
+                Some("CASCADE"),
+                false,
+                false
+            ),
+            (
+                "fkw",
+                vec!["w".to_string()],
+                "t",
+                vec!["id".to_string()],
+                None,
+                true,
+                true
+            ),
+        ]
+    );
+}
+
+#[test]
+fn create_table_self_referencing_foreign_key_resolves_to_the_pk() {
+    let Statement::CreateTable(def, _) = plan_ok(
+        "create table selfref (x serial primary key, y int references selfref (x) \
+         deferrable initially deferred)",
+    ) else {
+        panic!("not a CREATE TABLE");
+    };
+    let fk = &def.foreign_keys[0];
+    assert_eq!(fk.name, "selfref_y_fkey");
+    assert_eq!(fk.ref_columns, vec!["x".to_string()]);
+    assert!(fk.deferrable && fk.initially_deferred);
+    let err = plan(
+        "create table s2 (x int primary key, u int, y int references s2 (u))",
+        &lookup,
+    )
+    .unwrap_err();
+    assert_eq!(err.sqlstate(), "42830");
+    assert_eq!(
+        err.to_string(),
+        "there is no unique constraint matching given keys for referenced table \"s2\""
+    );
+}
+
+#[test]
+fn create_table_check_naming_a_missing_column_is_42703_at_create() {
+    let err = plan("create table bad (a int, check (nope > 0))", &lookup).unwrap_err();
+    assert_eq!(err.sqlstate(), "42703");
+}
+
+#[test]
+fn check_expression_evaluates_false_true_and_null() {
+    let def = t();
+    let expr = plan_check_expression("(n > 0)", &def).unwrap();
+    let row = |n: Bson| {
+        let mut d = Document::new();
+        d.insert("_id", 1);
+        d.insert("n", n);
+        d
+    };
+    assert_eq!(
+        apply_row_expr(&expr, &row(Bson::Int32(1))).unwrap(),
+        Bson::Boolean(true)
+    );
+    assert_eq!(
+        apply_row_expr(&expr, &row(Bson::Int32(0))).unwrap(),
+        Bson::Boolean(false)
+    );
+    assert_eq!(apply_row_expr(&expr, &row(Bson::Null)).unwrap(), Bson::Null);
+}
+
+#[test]
+fn insert_with_untyped_parameters_takes_the_column_types() {
+    // libpq's `PQprepare` with `nParams = 0` declares nothing; the values
+    // still bind. Failed "there is no parameter $1" (2026-09-09).
+    let stmt = plan_with_session_types(
+        "insert into t values ($1, $2, $3)",
+        &lookup,
+        &[Bson::Int64(1), Bson::String("a".into()), Bson::Int64(2)],
+        &[None, None, None],
+        &TimeZoneSetting::default(),
+    )
+    .expect("should plan");
+    match stmt {
+        Statement::Insert(i) => assert_eq!(i.rows[0].get("_id"), Some(&Bson::Int32(1))),
+        other => panic!("wrong statement: {other:?}"),
+    }
+}
+
+/// An assignment needs an assignment cast: a `text`-declared parameter into
+/// an `int4` column is 42804 with PostgreSQL's hint, on INSERT and UPDATE
+/// alike, while into `text` it stores and an `int8`-declared one into `int4`
+/// stores too (measured on 16).
+#[test]
+fn assigning_a_text_typed_expression_to_a_non_text_column_is_42804() {
+    let plan_typed = |sql: &str, types: &[Option<String>]| {
+        plan_with_session_types(
+            sql,
+            &lookup,
+            &[Bson::String("1".into())],
+            types,
+            &TimeZoneSetting::default(),
+        )
+    };
+    let text = [Some("text".to_string())];
+    for sql in ["insert into t (n) values ($1)", "update t set n = $1"] {
+        let err = plan_typed(sql, &text).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), "42804");
+        assert_eq!(
+            err.to_string(),
+            "column \"n\" is of type integer but expression is of type text"
+        );
+        assert_eq!(
+            err.hint(),
+            Some("You will need to rewrite or cast the expression.")
+        );
+    }
+    let err = plan_ok_err("update t set n = '1'::varchar");
+    assert_eq!(
+        err.to_string(),
+        "column \"n\" is of type integer but expression is of type character varying"
+    );
+    plan_typed("insert into t (name) values ($1)", &text).expect("text into text");
+    plan_typed("insert into t (n) values ($1)", &[Some("int8".to_string())])
+        .expect("bigint into integer");
+    plan_typed("insert into t (n) values ($1)", &[None]).expect("untyped coerces");
+}
+
+fn plan_ok_err(sql: &str) -> Error {
+    plan(sql, &lookup).expect_err("should refuse")
+}
+
+#[test]
+fn max_param_number_sees_the_values_of_an_insert() {
+    assert_eq!(max_param_number("insert into t values ($1, $2)"), 2);
+    assert_eq!(
+        max_param_number("insert into t values ($1, $2) returning id"),
+        2
+    );
+    assert_eq!(max_param_number("insert into t (id) select $3"), 3);
+    assert_eq!(max_param_number("update t set n = $2 where id = $1"), 2);
+    assert_eq!(max_param_number("select '$9' -- $8"), 0);
+}
+
+#[test]
+fn create_and_drop_database_plan() {
+    match plan_ok("CREATE DATABASE mydb WITH OWNER = joe") {
+        Statement::CreateDatabase { name } => assert_eq!(name, "mydb"),
+        other => panic!("wrong statement: {other:?}"),
+    }
+    match plan_ok("DROP DATABASE IF EXISTS mydb") {
+        Statement::DropDatabase { name, if_exists } => {
+            assert_eq!(name, "mydb");
+            assert!(if_exists);
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    match plan_ok("SELECT current_catalog AS c") {
+        Statement::SelectConstant(sc) => assert_eq!(
+            sc.columns[0],
+            (
+                "c".to_string(),
+                ConstCol::CurrentDatabase,
+                "name".to_string(),
+                -1
+            )
+        ),
+        other => panic!("wrong statement: {other:?}"),
+    }
+}
+
+/// `to_regtype` resolves a user type's ARRAY -- `mood[]`, `rt1[]` for a
+/// table's row type, or PostgreSQL's internal `_rt1` spelling -- to the
+/// element's oid plus the array offset, and renders it back as `name[]`.
+/// Measured on PostgreSQL 16: `to_regtype('_rt1')::text` is `rt1[]`; an
+/// unknown element stays NULL.
+#[test]
+fn to_regtype_resolves_user_type_arrays() {
+    set_user_types(vec![("mood".into(), 65_001, vec!["a".into()])]);
+    set_user_composites(vec![(
+        "rt1".into(),
+        67_002,
+        vec![("data".into(), "text".into())],
+    )]);
+    let regtype = |sql: &str| match plan_ok(sql) {
+        Statement::SelectConstant(sc) => match &sc.columns[0].1 {
+            ConstCol::Value(Bson::Null) => None,
+            ConstCol::Value(v) => Some(regtype_text(regtype_oid(v).expect("a regtype"))),
+            other => panic!("not a value for {sql}: {other:?}"),
+        },
+        other => panic!("wrong statement for {sql}: {other:?}"),
+    };
+    for (sql, want) in [
+        ("SELECT to_regtype('mood')", Some("mood")),
+        ("SELECT to_regtype('mood[]')", Some("mood[]")),
+        ("SELECT to_regtype('MOOD []')", Some("mood[]")),
+        ("SELECT to_regtype('_mood')", Some("mood[]")),
+        ("SELECT to_regtype('rt1')", Some("rt1")),
+        ("SELECT to_regtype('rt1[]')", Some("rt1[]")),
+        ("SELECT to_regtype('_rt1')", Some("rt1[]")),
+        ("SELECT to_regtype('nope[]')", None),
+        ("SELECT to_regtype('_nope')", None),
+    ] {
+        assert_eq!(regtype(sql).as_deref(), want, "for {sql}");
+    }
+    set_user_types(Vec::new());
+    set_user_composites(Vec::new());
 }

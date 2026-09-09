@@ -50,10 +50,11 @@ def _free_port() -> int:
 class _Server:
     """A `secantusd-pg` subprocess over one storage home."""
 
-    def __init__(self, home: Path) -> None:
+    def __init__(self, home: Path, *, databases: tuple[str, ...] = ()) -> None:
         self.home = home
         self.port = _free_port()
         self.proc: subprocess.Popen[str] | None = None
+        self.databases = databases
 
     def __enter__(self) -> _Server:
         # `_free_port()` reports a port the OS *had* free, but closes its probe
@@ -65,7 +66,12 @@ class _Server:
         last_out = ""
         for _ in range(5):
             self.proc = subprocess.Popen(
-                [str(BINARY), str(self.home), f"127.0.0.1:{self.port}"],
+                [
+                    str(BINARY),
+                    str(self.home),
+                    f"127.0.0.1:{self.port}",
+                    *(f"--database={name}" for name in self.databases),
+                ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -97,9 +103,9 @@ class _Server:
                 self.proc.kill()
                 self.proc.wait(timeout=10)
 
-    def connect(self, *, autocommit: bool = True) -> psycopg.Connection:
+    def connect(self, *, autocommit: bool = True, dbname: str = "postgres") -> psycopg.Connection:
         return psycopg.connect(
-            f"host=127.0.0.1 port={self.port} dbname=postgres user=test",
+            f"host=127.0.0.1 port={self.port} dbname={dbname} user=test",
             autocommit=autocommit,
             connect_timeout=10,
         )
@@ -6733,3 +6739,910 @@ def test_numeric_wider_than_decimal128_compares_and_sorts_exactly(home: Path) ->
         assert cur.rowcount == 1
         cur.execute("select count(*) from wpk")
         assert cur.fetchone() == (4,)
+
+
+def _diag(exc: psycopg.Error) -> tuple:
+    d = exc.diag
+    return (
+        d.sqlstate,
+        d.message_primary,
+        d.message_detail,
+        d.schema_name,
+        d.table_name,
+        d.column_name,
+        d.constraint_name,
+    )
+
+
+def test_not_null_and_check_constraints_report_what_postgres_reports(home: Path) -> None:
+    """NOT NULL (23502) and CHECK (23514) are enforced on INSERT and UPDATE
+    with PostgreSQL 16's message, `Failing row contains (...)` detail
+    (every column in declaration order, NULL as `null`), and diagnostic
+    fields. Unnamed CHECKs take PG's names: `<table>_<col>_check` when the
+    expression names one column, `<table>_check` (then `_check1`, ...) otherwise.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table nn (a int not null, b text)")
+        with pytest.raises(psycopg.errors.NotNullViolation) as exc:
+            conn.execute("insert into nn (b) values ('x')")
+        assert _diag(exc.value) == (
+            "23502",
+            'null value in column "a" of relation "nn" violates not-null constraint',
+            "Failing row contains (null, x).",
+            "public",
+            "nn",
+            "a",
+            None,
+        )
+        conn.execute("insert into nn values (1, 'z')")
+        with pytest.raises(psycopg.errors.NotNullViolation):
+            conn.execute("update nn set a = null")
+        assert conn.execute("select a from nn").fetchall() == [(1,)]
+
+        conn.execute("create table ck (a int check (a > 0), b int, c int check (a < b))")
+        with pytest.raises(psycopg.errors.CheckViolation) as exc:
+            conn.execute("insert into ck values (-1, 2, 3)")
+        assert _diag(exc.value) == (
+            "23514",
+            'new row for relation "ck" violates check constraint "ck_a_check"',
+            "Failing row contains (-1, 2, 3).",
+            "public",
+            "ck",
+            None,
+            "ck_a_check",
+        )
+        with pytest.raises(psycopg.errors.CheckViolation) as exc:
+            conn.execute("insert into ck values (5, 2, 3)")
+        assert exc.value.diag.constraint_name == "ck_check"
+        # A CHECK that evaluates to NULL passes (SQL's rule), and a violation
+        # on a later row inserts none of them.
+        conn.execute("insert into ck values (null, 2, 3)")
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute("insert into ck values (1, 2, 3), (0, 1, 1)")
+        assert conn.execute("select count(*) from ck").fetchone() == (1,)
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute("update ck set a = 9")
+
+        # A TEMP table's schema is the session's pg_temp namespace.
+        conn.execute("create temp table tt (data int constraint chk_eq1 check (data = 1))")
+        with pytest.raises(psycopg.errors.CheckViolation) as exc:
+            conn.execute("insert into tt values (2)")
+        assert exc.value.diag.schema_name.startswith("pg_temp")
+        assert exc.value.diag.constraint_name == "chk_eq1"
+        assert exc.value.diag.severity_nonlocalized == "ERROR"
+
+
+def test_foreign_keys_are_enforced_on_both_sides(home: Path) -> None:
+    """FOREIGN KEY (23503): the child side on INSERT / UPDATE, the parent side
+    on DELETE with NO ACTION, CASCADE and SET NULL, NULL keys pass, and a
+    self-reference sees the rows of its own statement. Messages and fields
+    probed against PostgreSQL 16.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table p (id int primary key)")
+        conn.execute("create table c (id serial primary key, p int references p)")
+        with pytest.raises(psycopg.errors.ForeignKeyViolation) as exc:
+            conn.execute("insert into c (p) values (7)")
+        assert _diag(exc.value) == (
+            "23503",
+            'insert or update on table "c" violates foreign key constraint "c_p_fkey"',
+            'Key (p)=(7) is not present in table "p".',
+            "public",
+            "c",
+            None,
+            "c_p_fkey",
+        )
+        conn.execute("insert into c (p) values (null)")
+        conn.execute("insert into p values (1)")
+        conn.execute("insert into c (p) values (1)")
+        with pytest.raises(psycopg.errors.ForeignKeyViolation) as exc:
+            conn.execute("delete from p where id = 1")
+        assert _diag(exc.value) == (
+            "23503",
+            'update or delete on table "p" violates foreign key constraint "c_p_fkey" on table "c"',
+            'Key (id)=(1) is still referenced from table "c".',
+            "public",
+            "c",
+            None,
+            "c_p_fkey",
+        )
+        assert conn.execute("select count(*) from p").fetchone() == (1,)
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):
+            conn.execute("update c set p = 99 where p = 1")
+        with pytest.raises(psycopg.errors.UndefinedTable):
+            conn.execute("create table bad (p int references nosuch)")
+
+        conn.execute("create table p2 (id int primary key)")
+        conn.execute(
+            "create table c2 (id serial primary key, p int references p2 on delete cascade)"
+        )
+        conn.execute("insert into p2 values (1), (2)")
+        conn.execute("insert into c2 (p) values (1), (1), (2)")
+        conn.execute("delete from p2 where id = 1")
+        assert conn.execute("select p from c2").fetchall() == [(2,)]
+
+        conn.execute("create table p3 (id int primary key)")
+        conn.execute(
+            "create table c3 (id serial primary key, p int references p3 on delete set null)"
+        )
+        conn.execute("insert into p3 values (1)")
+        conn.execute("insert into c3 (p) values (1)")
+        conn.execute("delete from p3 where id = 1")
+        assert conn.execute("select p from c3").fetchall() == [(None,)]
+
+        conn.execute("create table s (id int primary key, r int references s)")
+        conn.execute("insert into s values (1, 2), (2, 1)")
+        assert conn.execute("select count(*) from s").fetchone() == (2,)
+
+
+def test_deferred_foreign_key_fails_at_commit_and_leaves_the_connection_idle(
+    home: Path,
+) -> None:
+    """`DEFERRABLE INITIALLY DEFERRED` is checked at COMMIT inside a
+    transaction (and at the statement in autocommit). The COMMIT answers the
+    23503, the transaction is rolled back, and the connection is IDLE -- not
+    "in a failed transaction" -- so the next statement runs. PostgreSQL 16.
+    """
+    from psycopg.pq import TransactionStatus
+
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute(
+            "create table selfref (x serial primary key, "
+            "y int references selfref (x) deferrable initially deferred)"
+        )
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):
+            conn.execute("insert into selfref (y) values (-1)")
+        assert conn.execute("select count(*) from selfref").fetchone() == (0,)
+    with _Server(home) as server, server.connect(autocommit=False) as conn:
+        conn.execute("insert into selfref (y) values (-1)")
+        assert conn.info.transaction_status == TransactionStatus.INTRANS
+        with pytest.raises(psycopg.errors.ForeignKeyViolation) as exc:
+            conn.commit()
+        assert exc.value.diag.constraint_name == "selfref_y_fkey"
+        assert conn.info.transaction_status == TransactionStatus.IDLE
+        assert conn.execute("select count(*) from selfref").fetchone() == (0,)
+        conn.rollback()
+        # The catalog carries the constraints for the Python server too.
+    assert _python_sql(home, "select count(*) from selfref") == [(0,)]
+
+
+def test_a_pipeline_error_rolls_back_the_statements_before_it(home: Path) -> None:
+    """Every extended-protocol statement between two Syncs runs in one
+    transaction that the Sync commits, so an error in the pipeline rolls
+    back the earlier statements of its group and libpq skips the later ones
+    (`PIPELINE_ABORTED`); after the Sync the connection is IDLE and the next
+    group commits on its own. A `BEGIN` inside a group makes it a block, and
+    `DECLARE` in a group is still refused (`25P01`). PostgreSQL 16.
+    """
+    from psycopg.pq import TransactionStatus
+
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table pipe (n int primary key)")
+        with pytest.raises(psycopg.errors.DivisionByZero), conn.pipeline():
+            conn.execute("insert into pipe values (1)")
+            conn.execute("select 1/0")
+            conn.execute("insert into pipe values (2)")
+        assert conn.info.transaction_status == TransactionStatus.IDLE
+        conn.execute("insert into pipe values (3)")
+        assert conn.execute("select n from pipe order by n").fetchall() == [(3,)]
+        # The group is NOT a transaction block.
+        with pytest.raises(psycopg.errors.NoActiveSqlTransaction), conn.pipeline():
+            conn.execute("declare c cursor for select 1")
+        # Unless a BEGIN inside it makes it one: the status after the Sync
+        # is INTRANS, and the rows wait for the COMMIT.
+        with conn.pipeline():
+            conn.execute("begin")
+            conn.execute("insert into pipe values (4)")
+        assert conn.info.transaction_status == TransactionStatus.INTRANS
+        conn.execute("commit")
+        assert conn.execute("select count(*) from pipe").fetchone() == (2,)
+        # A CREATE TABLE and an INSERT into it in one group see each other.
+        with conn.pipeline():
+            conn.execute("create table pipe2 (n int)")
+            conn.execute("insert into pipe2 values (5)")
+        assert conn.execute("select n from pipe2").fetchall() == [(5,)]
+
+
+def test_an_insert_prepared_without_parameter_types_takes_the_column_types(
+    home: Path,
+) -> None:
+    """libpq's `PQprepare` with `nParams = 0` leaves every `$n` for the server
+    to type from the column it lands in. The parameters live in the VALUES
+    list, which pg_query's node walk skips -- so the statement used to be
+    sized at zero parameters and fail with `there is no parameter $1`.
+    """
+    from psycopg import pq
+
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table typed (n int, t text, when_ timestamp)")
+        pgconn = conn.pgconn
+        pgconn.send_prepare(b"ins", b"insert into typed values ($1, $2, $3)")
+        assert pgconn.get_result().status == pq.ExecStatus.COMMAND_OK
+        pgconn.get_result()
+        pgconn.send_query_prepared(b"ins", [b"7", b"seven", b"2024-01-02 03:04:05"])
+        res = pgconn.get_result()
+        assert res.status == pq.ExecStatus.COMMAND_OK, res.error_message
+        pgconn.get_result()
+        assert conn.execute("select * from typed").fetchall() == [
+            (7, "seven", dt.datetime(2024, 1, 2, 3, 4, 5))
+        ]
+
+
+def test_a_cancel_request_interrupts_the_running_statement(home: Path) -> None:
+    """`conn.cancel_safe()` opens a second connection carrying the backend's
+    pid and secret key; the server matches it against the backend it
+    handed out at startup and interrupts the statement with `57014`. The
+    connection then goes back to IDLE and keeps working. While the sleep
+    runs, `pg_stat_activity` shows it as the backend's active query -- and
+    the cancel connection is served DURING the sleep, which needs the
+    synchronous statement to run off the async runtime's I/O thread.
+    PostgreSQL 16.
+    """
+    import threading
+
+    from psycopg.pq import TransactionStatus
+
+    with _Server(home) as server, server.connect() as conn, server.connect() as other:
+        pid = conn.info.backend_pid
+        seen: list[tuple] = []
+
+        def cancel_after_activity() -> None:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                rows = other.execute(
+                    "select state, query, backend_type from pg_stat_activity where pid = %s",
+                    (pid,),
+                ).fetchall()
+                if rows and rows[0][0] == "active":
+                    seen.extend(rows)
+                    break
+                time.sleep(0.02)
+            conn.cancel_safe()
+
+        t = threading.Thread(target=cancel_after_activity)
+        t.start()
+        with pytest.raises(psycopg.errors.QueryCanceled) as info:
+            conn.execute("select pg_sleep(30)")
+        t.join()
+        assert _diag(info.value) == (
+            "57014",
+            "canceling statement due to user request",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        assert info.value.diag.severity == "ERROR"
+        assert seen == [("active", "select pg_sleep(30)", "client backend")]
+        assert conn.info.transaction_status == TransactionStatus.IDLE
+        assert conn.execute("select 1").fetchone() == (1,)
+        assert other.execute(
+            "select state from pg_stat_activity where pid = %s", (pid,)
+        ).fetchone() == ("idle",)
+
+
+def test_idle_timeouts_end_the_session_with_a_fatal_error(home: Path) -> None:
+    """`idle_in_transaction_session_timeout` fires while a block is open
+    (aborted or not) and `idle_session_timeout` while none is; each sends a
+    FATAL error and closes the connection, which the client sees on its next
+    round trip. Neither fires in the other state, `0` disables them, and
+    the values are validated and rendered like PostgreSQL's (`60000` shows
+    as `1min`). PostgreSQL 16.
+    """
+    with _Server(home) as server:
+        with server.connect(autocommit=False) as conn:
+            conn.execute("set session idle_in_transaction_session_timeout = 150")
+            assert conn.execute("show idle_in_transaction_session_timeout").fetchone() == ("150ms",)
+            time.sleep(0.5)
+            with pytest.raises(psycopg.errors.IdleInTransactionSessionTimeout) as info:
+                conn.execute("select 1")
+            assert info.value.diag.severity == "FATAL"
+            assert _diag(info.value)[:2] == (
+                "25P03",
+                "terminating connection due to idle-in-transaction timeout",
+            )
+            assert conn.closed and conn.broken
+        with server.connect(autocommit=False) as conn:
+            conn.execute("set idle_in_transaction_session_timeout = '150ms'")
+            conn.commit()
+            with pytest.raises(psycopg.errors.DivisionByZero):
+                conn.execute("select 1/0")
+            time.sleep(0.5)
+            with pytest.raises(psycopg.errors.IdleInTransactionSessionTimeout):
+                conn.execute("select 1")
+        with server.connect() as conn:
+            conn.execute("set idle_in_transaction_session_timeout = 100")
+            time.sleep(0.3)
+            assert conn.execute("select 1").fetchone() == (1,)
+            conn.execute("set idle_session_timeout = 60000")
+            assert conn.execute("show idle_session_timeout").fetchone() == ("1min",)
+            for value, message in [
+                ("'abc'", 'invalid value for parameter "idle_session_timeout": "abc"'),
+                (
+                    "-1",
+                    '-1 ms is outside the valid range for parameter "idle_session_timeout" '
+                    "(0 .. 2147483647)",
+                ),
+            ]:
+                with pytest.raises(psycopg.errors.InvalidParameterValue) as info:
+                    conn.execute(f"set idle_session_timeout = {value}")
+                assert info.value.diag.message_primary == message
+            conn.execute("set idle_session_timeout = 200")
+            time.sleep(0.5)
+            with pytest.raises(psycopg.errors.IdleSessionTimeout) as info:
+                conn.execute("select 1")
+            assert info.value.diag.severity == "FATAL"
+            assert _diag(info.value)[:2] == (
+                "57P05",
+                "terminating connection due to idle-session timeout",
+            )
+            assert conn.closed
+
+
+def test_connecting_to_an_unknown_database_fails_at_startup(home: Path) -> None:
+    """`dbname=nosuchdb` is FATAL 3D000 BEFORE AuthenticationOk, as PostgreSQL's.
+
+    libpq reports it as a failed connect (`OperationalError` with the FATAL
+    line in the message and no diag), which is what psycopg's
+    `test_connect_bad` / `test_pgconn_error` assert. `template0` is a database
+    but never accepts connections (55000); `template1` and the daemon's
+    `--database` names do, and `pg_database` lists exactly that set.
+    """
+    with _Server(home, databases=("gauge_db",)) as server:
+        with pytest.raises(psycopg.OperationalError) as info:
+            server.connect(dbname="nosuchdb")
+        assert 'FATAL:  database "nosuchdb" does not exist' in str(info.value)
+        with pytest.raises(psycopg.OperationalError) as info:
+            server.connect(dbname="template0")
+        assert 'FATAL:  database "template0" is not currently accepting connections' in str(
+            info.value
+        )
+        for name in ("postgres", "template1", "gauge_db"):
+            with server.connect(dbname=name) as conn:
+                assert conn.execute("select current_database(), current_catalog").fetchone() == (
+                    name,
+                    name,
+                )
+                (pid,) = conn.execute("select pg_backend_pid()").fetchone()
+                assert conn.execute(
+                    "select datname from pg_stat_activity where pid = %s", (pid,)
+                ).fetchone() == (name,)
+        with server.connect() as conn:
+            rows = conn.execute(
+                "select oid, datname, datistemplate, datallowconn, datdba, encoding"
+                " from pg_database order by oid"
+            ).fetchall()
+            assert rows == [
+                (1, "template1", True, True, 10, 6),
+                (4, "template0", True, False, 10, 6),
+                (5, "postgres", False, True, 10, 6),
+                (16385, "gauge_db", False, True, 10, 6),
+            ]
+
+
+def test_create_and_drop_database(home: Path) -> None:
+    """CREATE / DROP DATABASE with PostgreSQL's errors, and a dropped database's
+    data is gone when the name is created again (probed PG 16)."""
+    with _Server(home) as server:
+        with server.connect() as conn:
+            with pytest.raises(psycopg.errors.InvalidCatalogName) as info:
+                conn.execute("drop database probe_x")
+            assert _diag(info.value)[:2] == ("3D000", 'database "probe_x" does not exist')
+            notices: list[str] = []
+            conn.add_notice_handler(lambda d: notices.append(d.message_primary))
+            conn.execute("drop database if exists probe_x")
+            assert notices == ['database "probe_x" does not exist, skipping']
+
+            conn.execute("begin")
+            with pytest.raises(psycopg.errors.ActiveSqlTransaction) as info:
+                conn.execute("create database probe_x")
+            assert _diag(info.value)[:2] == (
+                "25001",
+                "CREATE DATABASE cannot run inside a transaction block",
+            )
+            conn.execute("rollback")
+
+            conn.execute("create database probe_x")
+            with pytest.raises(psycopg.errors.DuplicateDatabase) as info:
+                conn.execute("create database probe_x")
+            assert _diag(info.value)[:2] == ("42P04", 'database "probe_x" already exists')
+            with pytest.raises(psycopg.errors.ObjectInUse) as info:
+                conn.execute("drop database postgres")
+            assert _diag(info.value)[:2] == ("55006", "cannot drop the currently open database")
+            with pytest.raises(psycopg.errors.WrongObjectType) as info:
+                conn.execute("drop database template1")
+            assert _diag(info.value)[:2] == ("42809", "cannot drop a template database")
+            assert conn.execute(
+                "select oid >= 16384 from pg_database where datname = 'probe_x'"
+            ).fetchone() == (True,)
+
+        with server.connect(dbname="probe_x") as conn:
+            conn.execute("create table t (a int)")
+            conn.execute("insert into t values (1)")
+            assert conn.execute("select a from t").fetchall() == [(1,)]
+
+        with server.connect() as conn:
+            conn.execute("drop database probe_x")
+            assert conn.execute(
+                "select count(*) from pg_database where datname = 'probe_x'"
+            ).fetchone() == (0,)
+            conn.execute("create database probe_x")
+        with (
+            server.connect(dbname="probe_x") as conn,
+            pytest.raises(psycopg.errors.UndefinedTable),
+        ):
+            conn.execute("select a from t")
+
+    # The registry is persisted: the database survives a restart.
+    with _Server(home) as server, server.connect(dbname="probe_x") as conn:
+        assert conn.execute("select current_database()").fetchone() == ("probe_x",)
+
+
+def test_the_first_ddl_on_a_fresh_store_does_not_block_a_second_connection(home: Path) -> None:
+    """Two connections may both create objects on a store nobody has written to.
+
+    The catalog collections (`__sql_catalog__`, `__sql_schemas__`,
+    `__sql_enum_meta__`) were created lazily, on the transaction session of
+    whichever statement first needed them. Inside an open transaction that
+    row stayed uncommitted, and a second connection's identical lazy create
+    then hit WiredTiger's WriteConflict -- so `test_copy_table_across`, which
+    creates a table on a fresh store from one connection and then a second
+    table from another, failed with an internal error that PostgreSQL never
+    raises. The collections are now created OUTSIDE the user transaction
+    (measured 2026-09-09).
+    """
+    with _Server(home) as server:
+        with (
+            server.connect(autocommit=False) as first,
+            server.connect(autocommit=False) as second,
+        ):
+            first.execute("create table t1 (a int)")
+            first.execute("insert into t1 values (1)")
+            second.execute("create table t2 (b text)")
+            second.execute("insert into t2 values ('x')")
+            first.commit()
+            second.commit()
+        with server.connect() as conn:
+            assert conn.execute("select a from t1").fetchall() == [(1,)]
+            assert conn.execute("select b from t2").fetchall() == [("x",)]
+
+        # The same shape for the schema and type catalogs, which are separate
+        # collections and so still unwritten at this point.
+        with (
+            server.connect(autocommit=False) as first,
+            server.connect(autocommit=False) as second,
+        ):
+            first.execute("create schema s1")
+            second.execute("create schema s2")
+            # The type oid counter is minted OUTSIDE the block like
+            # PostgreSQL's OID counter: two open blocks advance it
+            # independently, and one that rolls back just skips an oid.
+            first.execute("create type e1 as enum ('a')")
+            second.execute("create type e2 as enum ('b')")
+            first.execute("create type c1 as (x int)")
+            second.execute("create type c2 as (y int)")
+            first.commit()
+            second.rollback()
+        with server.connect() as conn:
+            conn.execute("create type e3 as enum ('c')")
+            assert conn.execute("select 'a'::e1, 'c'::e3").fetchone() == ("a", "c")
+            oids = conn.execute(
+                "select typname, oid from pg_type where typname in ('e1', 'e2', 'e3', 'c1', 'c2')"
+                " order by typname"
+            ).fetchall()
+            assert [n for n, _ in oids] == ["c1", "e1", "e3"]
+            assert len({o for _, o in oids}) == 3
+
+
+def test_group_by_an_expression_or_a_position(home: Path) -> None:
+    """``GROUP BY length(data)`` / ``GROUP BY 1, 2, 3`` key on the expression.
+
+    Every answer here was measured on PostgreSQL 16 (2026-09-09), including the
+    output column names (``length``, ``?column?``), the ``int4`` / ``bool``
+    types, and the 42P10 for a position past the select list. This is the
+    shape psycopg's ``test_copy_in_allchars`` checks its 256 rows with.
+    """
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        conn.execute("create table gp (id int primary key, data text, col2 text)")
+        conn.execute(
+            "insert into gp values (1, 'a', null), (2, 'bb', null), (3, 'cc', null),"
+            " (4, null, null), (5, 'a', null)"
+        )
+        cur = conn.execute("select length(data), count(*) from gp group by length(data) order by 1")
+        assert [(d.name, d.type_code) for d in cur.description] == [("length", 23), ("count", 20)]
+        assert cur.fetchall() == [(1, 2), (2, 2), (None, 1)]
+        cur = conn.execute(
+            "select col2 is null, ascii(data), count(*) from gp group by 1, 2 order by 2"
+        )
+        assert [(d.name, d.type_code) for d in cur.description] == [
+            ("?column?", 16),
+            ("ascii", 23),
+            ("count", 20),
+        ]
+        assert cur.fetchall() == [(True, 97, 2), (True, 98, 1), (True, 99, 1), (True, None, 1)]
+        assert conn.execute(
+            "select length(data) as len, count(*) from gp group by len order by len desc"
+        ).fetchall() == [(None, 1), (2, 2), (1, 2)]
+        assert conn.execute(
+            "select length(data) + 1, count(*) from gp group by length(data) + 1 order by 1"
+        ).fetchall() == [(2, 2), (3, 2), (None, 1)]
+        # psycopg's allchars check, verbatim.
+        assert conn.execute(
+            "select 97 = ascii(data), col2 is null, length(data), count(*) from gp"
+            " where data = 'a' group by 1, 2, 3"
+        ).fetchall() == [(True, True, 1, 2)]
+        with pytest.raises(psycopg.errors.InvalidColumnReference) as ex:
+            conn.execute("select length(data), count(*) from gp group by 3")
+        assert _diag(ex.value)[:2] == ("42P10", "GROUP BY position 3 is not in select list")
+
+
+def test_is_null_over_a_constant_and_a_from_less_unnest(home: Path) -> None:
+    """``x IS [NOT] NULL`` as a value, and ``select unnest(array)`` as rows.
+
+    Measured on PostgreSQL 16: a row is null only when EVERY field is, and not
+    null only when NONE is, so ``row(1, null)`` answers false to both. The
+    unnest literal carries the characters psycopg's ``test_copy_out_allchars``
+    sends -- a quote, a backslash, a comma, both braces -- through the array
+    literal parser.
+    """
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        cur = conn.execute(
+            "select row(null, null) is null, row(null, null) is not null,"
+            " row(1, null) is null, row(1, null) is not null, null is null,"
+            " 1 is not null, '{}'::int[] is null, 1 is null as x"
+        )
+        assert [(d.name, d.type_code) for d in cur.description] == [("?column?", 16)] * 7 + [
+            ("x", 16)
+        ]
+        assert cur.fetchall() == [(True, False, False, False, True, True, False, False)]
+        cur = conn.execute("""select unnest('{a,"b",",","\\\\","{","}",€}'::text[])""")
+        assert [(d.name, d.type_code) for d in cur.description] == [("unnest", 25)]
+        assert [r[0] for r in cur.fetchall()] == ["a", "b", ",", "\\", "{", "}", "€"]
+        cur = conn.execute("select unnest('{1,2}'::int[]) as u")
+        assert [(d.name, d.type_code) for d in cur.description] == [("u", 23)]
+        assert cur.fetchall() == [(1,), (2,)]
+        assert conn.execute("select unnest(null::text[])").fetchall() == []
+
+
+def test_assignment_needs_an_assignment_cast(home: Path) -> None:
+    """A typed expression assigned to a column with no assignment cast is 42804.
+
+    Measured on PostgreSQL 16: psycopg's binary-format string is declared
+    ``text`` (its text-format one is untyped), and ``text`` has no assignment
+    cast to ``jsonb`` / ``integer`` -- ``column "data" is of type jsonb but
+    expression is of type text`` with PostgreSQL's hint, on INSERT and UPDATE
+    alike. Into a string column any type stores (an I/O cast), an untyped
+    string still coerces through the column's parser, and ``bigint`` into
+    ``integer`` is a plain assignment cast. Before this the server coerced the
+    text through the column's parser whatever the client declared.
+    """
+    hint = "You will need to rewrite or cast the expression."
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        conn.execute("create table testjson(id int, data jsonb, n int, s text)")
+        conn.execute("insert into testjson (id, data) values (1, %t)", ["{}"])
+        assert conn.execute("select data from testjson").fetchone() == ({},)
+        for sql, args in [
+            ("insert into testjson (data) values (%b)", ["{}"]),
+            ("update testjson set data = %b", ["{}"]),
+            ("insert into testjson (data) values (%s::text)", ["{}"]),
+        ]:
+            with pytest.raises(psycopg.errors.DatatypeMismatch) as ex:
+                conn.execute(sql, args)
+            assert ex.value.diag.message_primary == (
+                'column "data" is of type jsonb but expression is of type text'
+            )
+            assert ex.value.diag.message_hint == hint
+        with pytest.raises(psycopg.errors.DatatypeMismatch) as ex:
+            conn.execute("update testjson set n = %s::varchar", ["1"])
+        assert ex.value.diag.message_primary == (
+            'column "n" is of type integer but expression is of type character varying'
+        )
+        with pytest.raises(psycopg.errors.DatatypeMismatch) as ex:
+            conn.execute("update testjson set n = true")
+        assert ex.value.diag.message_primary == (
+            'column "n" is of type integer but expression is of type boolean'
+        )
+        conn.execute("update testjson set s = %b, n = %s::bigint where id = 1", ["x", 7])
+        conn.execute("update testjson set s = 5::int where id = 1")
+        assert conn.execute("select s, n from testjson").fetchone() == ("5", 7)
+
+
+def test_startup_parameter_status_matches_show(home: Path) -> None:
+    """The ``ParameterStatus`` sent at startup is what ``SHOW`` then reports.
+
+    psycopg's ``test_parameter_status`` compares the two; the startup value
+    came from the wire library's defaults (``Etc/UTC``) while ``SHOW
+    TimeZone`` answered the session's ``UTC``.
+    """
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        for name in ("TimeZone", "DateStyle"):
+            shown = conn.execute(f"show {name}").fetchone()[0]
+            assert conn.info.parameter_status(name) == shown
+
+
+def test_a_table_is_also_its_row_type(home: Path) -> None:
+    """``CREATE TABLE t`` also creates the composite type ``t``.
+
+    psycopg's ``test_array_register`` casts to a table's row type and its
+    array; everything below is measured on PostgreSQL 16.
+    """
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        conn.execute("create table rtt (a int, b text)")
+        conn.execute("create type rten as enum ('a')")
+        assert conn.execute(
+            """select '(1,foo)'::rtt, ('(1,foo)'::rtt).b,
+                      '{"(1,foo)","(2,bar)"}'::rtt[], row(1,'x')::rtt"""
+        ).fetchone() == ("(1,foo)", "foo", '{"(1,foo)","(2,bar)"}', "(1,x)")
+        assert conn.execute(
+            """select pg_typeof('(1,foo)'::rtt)::text, to_regtype('rtt')::text,
+                      to_regtype('rtt[]')::text, to_regtype('_rtt')::text,
+                      to_regtype('rten[]')::text"""
+        ).fetchone() == ("rtt", "rtt", "rtt[]", "rtt[]", "rten[]")
+
+        for sql, sqlstate, message, detail in [
+            (
+                "select '(1,foo,extra)'::rtt",
+                "22P02",
+                'malformed record literal: "(1,foo,extra)"',
+                "Too many columns.",
+            ),
+            ("select '(1)'::rtt", "22P02", 'malformed record literal: "(1)"', "Too few columns."),
+            (
+                "select row(1)::rtt",
+                "42846",
+                "cannot cast type record to rtt",
+                "Input has too few columns.",
+            ),
+            (
+                "select row(1,2,3)::rtt",
+                "42846",
+                "cannot cast type record to rtt",
+                "Input has too many columns.",
+            ),
+        ]:
+            with pytest.raises(psycopg.Error) as exc:
+                conn.execute(sql)
+            assert _diag(exc.value)[:3] == (sqlstate, message, detail), sql
+
+        for sql, sqlstate, message, hint in [
+            (
+                "drop type rtt",
+                "2BP01",
+                "cannot drop type rtt because table rtt requires it",
+                "You can drop table rtt instead.",
+            ),
+            ("create type rtt as enum ('a')", "42710", 'type "rtt" already exists', None),
+            ("create type rtt as (x int)", "42710", 'type "rtt" already exists', None),
+            (
+                "create table rten (x int)",
+                "42710",
+                'type "rten" already exists',
+                "A relation has an associated type of the same name, so you must use "
+                "a name that doesn't conflict with any existing type.",
+            ),
+        ]:
+            with pytest.raises(psycopg.Error) as exc:
+                conn.execute(sql)
+            assert (exc.value.sqlstate, exc.value.diag.message_primary) == (sqlstate, message), sql
+            assert exc.value.diag.message_hint == hint, sql
+
+        # Dropping the table takes its row type with it.
+        conn.execute("drop table rtt")
+        assert conn.execute("select to_regtype('rtt')").fetchone() == (None,)
+        conn.execute("create type rtt as (x int)")
+        with pytest.raises(psycopg.Error) as exc:
+            conn.execute("create table rtt (x int)")
+        assert (exc.value.sqlstate, exc.value.diag.message_primary) == (
+            "42P07",
+            'relation "rtt" already exists',
+        )
+
+
+def test_aclitem_parses_and_renders_as_postgresql(home: Path) -> None:
+    """``aclitem`` — oid 1033 / array 1034 — with PostgreSQL 16's parser.
+
+    psycopg's ``test_array_of_unknown_builtin`` reads the session user's
+    grant back through both. The grantee and grantor are roles: the one this
+    server knows is the session user.
+    """
+    from psycopg.types import TypeInfo
+
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        notices: list[tuple[str, str, str]] = []
+        conn.add_notice_handler(
+            lambda d: notices.append((d.severity, d.sqlstate, d.message_primary))
+        )
+        user = conn.execute("select user").fetchone()[0]
+        assert user == "test"
+        info = TypeInfo.fetch(conn, "aclitem")
+        assert (info.oid, info.array_oid) == (1033, 1034)
+
+        cur = conn.execute(
+            "select 'test=arwdDxt/test'::aclitem, array['test=arwdDxt/test']::aclitem[],"
+            " '{test=r/test, \"\\\"test\\\"=w*a/test\"}'::aclitem[], '=r/test'::aclitem,"
+            " pg_typeof('test=r/test'::aclitem)::text, %s::aclitem, %s::aclitem[]",
+            ("group test=r/test", "{user test=wr/test}"),
+        )
+        assert cur.fetchone() == (
+            "test=arwdDxt/test",
+            ["test=arwdDxt/test"],
+            ["test=r/test", "test=aw*/test"],
+            "=r/test",
+            "aclitem",
+            "test=r/test",
+            ["test=rw/test"],
+        )
+        assert [d.type_code for d in cur.description[:2]] == [1033, 1034]
+
+        # An omitted grantor defaults to the superuser, with PostgreSQL's WARNING.
+        assert conn.execute("select 'test=r'::aclitem").fetchone() == ("test=r/test",)
+        assert notices == [("WARNING", "0L000", "defaulting grantor to user ID 10")]
+
+        for sql, sqlstate, message, hint in [
+            ("select 'nobody=r/test'::aclitem", "42704", 'role "nobody" does not exist', None),
+            ("select 'test=r/nobody'::aclitem", "42704", 'role "nobody" does not exist', None),
+            (
+                "select 'test=q/test'::aclitem",
+                "22P02",
+                'invalid mode character: must be one of "arwdDxtXUCTcsA"',
+                None,
+            ),
+            (
+                "select 'junk'::aclitem",
+                "22P02",
+                'unrecognized key word: "junk"',
+                'ACL key word must be "group" or "user".',
+            ),
+            ("select 'test=r/'::aclitem", "22P02", 'a name must follow the "/" sign', None),
+            (
+                "select 'test=r/test extra'::aclitem",
+                "22P02",
+                "extra garbage at the end of the ACL specification",
+                None,
+            ),
+        ]:
+            with pytest.raises(psycopg.Error) as exc:
+                conn.execute(sql)
+            assert (exc.value.sqlstate, exc.value.diag.message_primary) == (sqlstate, message), sql
+            assert exc.value.diag.message_hint == hint, sql
+
+
+def test_standard_conforming_strings_off_is_honoured_and_reported(home: Path) -> None:
+    """``SET standard_conforming_strings TO off`` changes how the server READS
+    a plain string literal, and is reported to the client only because it does.
+
+    psycopg's ``test_quote_stable_despite_deranged_libpq`` flips the setting
+    and checks libpq's ``PQescapeString`` follows the report. Every message
+    and position here was measured on PostgreSQL 16.
+    """
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        notices: list[tuple[str, str | None, str, str | None, str | None]] = []
+        conn.add_notice_handler(
+            lambda d: notices.append(
+                (
+                    d.severity or "",
+                    d.sqlstate,
+                    d.message_primary or "",
+                    d.message_hint,
+                    d.statement_position,
+                )
+            )
+        )
+        assert conn.info.parameter_status("standard_conforming_strings") == "on"
+        assert conn.execute("select 'a\\nb', '\\\\'").fetchone() == ("a\\nb", "\\\\")
+        assert notices == []
+
+        conn.execute("set standard_conforming_strings to off")
+        assert conn.info.parameter_status("standard_conforming_strings") == "off"
+        assert conn.execute("show standard_conforming_strings").fetchone() == ("off",)
+        cur = conn.execute(
+            "select 'a\\'b', 'x\\\\y', 'p\\nq', 'r\\101s', 'c''d', E'\\\\', $$e\\f$$, %s",
+            ["z"],
+        )
+        assert cur.fetchone() == ("a'b", "x\\y", "p\nq", "rAs", "c'd", "\\", "e\\f", "z")
+        # One WARNING per literal, for its FIRST escape, worded by that escape
+        # and positioned at the literal.
+        assert notices == [
+            (
+                "WARNING",
+                "22P06",
+                "nonstandard use of \\' in a string literal",
+                "Use '' to write quotes in strings, or use the escape string syntax (E'...').",
+                "8",
+            ),
+            (
+                "WARNING",
+                "22P06",
+                "nonstandard use of \\\\ in a string literal",
+                "Use the escape string syntax for backslashes, e.g., E'\\\\'.",
+                "16",
+            ),
+            (
+                "WARNING",
+                "22P06",
+                "nonstandard use of escape in a string literal",
+                "Use the escape string syntax for escapes, e.g., E'\\r\\n'.",
+                "24",
+            ),
+            (
+                "WARNING",
+                "22P06",
+                "nonstandard use of escape in a string literal",
+                "Use the escape string syntax for escapes, e.g., E'\\r\\n'.",
+                "32",
+            ),
+        ]
+        notices.clear()
+
+        # A literal continued over a newline is one literal; comments, quoted
+        # identifiers and dollar-quoted bodies are not literals.
+        sql = "select 'a\\'b'\n'\\\\' as \"c'\\\" /* '\\' */ -- 'x\\'"
+        assert conn.execute(sql).fetchone() == ("a'b\\",)
+        assert [n[2] for n in notices] == ["nonstandard use of \\' in a string literal"]
+        notices.clear()
+
+        # The warnings precede the error of an unterminated literal, which is
+        # named as written, not as rewritten.
+        with pytest.raises(psycopg.errors.SyntaxError) as exc:
+            conn.execute("select 'q\\'")
+        assert _diag(exc.value)[:2] == ("42601", "unterminated quoted string at or near \"'q\\'\"")
+        assert [n[2] for n in notices] == ["nonstandard use of \\' in a string literal"]
+        notices.clear()
+
+        with pytest.raises(psycopg.errors.FeatureNotSupported) as exc:
+            conn.execute("select U&'d\\0061t'")
+        assert _diag(exc.value)[:3] == (
+            "0A000",
+            "unsafe use of string constant with Unicode escapes",
+            "String constants with Unicode escapes cannot be used when"
+            " standard_conforming_strings is off.",
+        )
+
+        # `escape_string_warning` silences the notices, not the reading.
+        conn.execute("set escape_string_warning to off")
+        assert conn.execute("select 'a\\nb'").fetchone() == ("a\nb",)
+        assert notices == []
+        conn.execute("reset escape_string_warning")
+
+        # A statement is read under the setting in force when it is PREPARED.
+        cur = conn.cursor()
+        assert cur.execute("select 'a\\nb' || %s", ["!"], prepare=True).fetchone() == ("a\nb!",)
+        conn.execute("set standard_conforming_strings to on")
+        assert conn.info.parameter_status("standard_conforming_strings") == "on"
+        assert cur.execute("select 'a\\nb' || %s", ["!"], prepare=True).fetchone() == ("a\nb!",)
+        assert conn.execute("select 'a\\nb'").fetchone() == ("a\\nb",)
+
+        # `set_config` reports it too; the value is a Boolean in any spelling.
+        assert conn.execute(
+            "select set_config('standard_conforming_strings', 'of', false)"
+        ).fetchone() == ("off",)
+        assert conn.info.parameter_status("standard_conforming_strings") == "off"
+        for spelling, value in [("yes", "on"), ("0", "off"), ("TRUE", "on"), ("n", "off")]:
+            conn.execute(f"set standard_conforming_strings to {spelling}")
+            assert conn.execute("show standard_conforming_strings").fetchone() == (value,)
+        for guc in ["standard_conforming_strings", "escape_string_warning"]:
+            with pytest.raises(psycopg.errors.InvalidParameterValue) as exc:
+                conn.execute(f"set {guc} to bogus")
+            assert _diag(exc.value)[:2] == ("22023", f'parameter "{guc}" requires a Boolean value')
+        conn.execute("reset standard_conforming_strings")
+        assert conn.info.parameter_status("standard_conforming_strings") == "on"
+
+
+def test_syntax_errors_carry_postgresqls_message_only(home: Path) -> None:
+    """A syntax error's ``message_primary`` is PostgreSQL's text, without the
+    ``Error splitting: `` label libpg_query's Rust binding prefixes it with."""
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        for sql, message in [
+            ("selct 1", 'syntax error at or near "selct"'),
+            ("select 1 from", "syntax error at end of input"),
+            ("select 'q", 'unterminated quoted string at or near "\'q"'),
+            ("select $$x", 'unterminated dollar-quoted string at or near "$$x"'),
+            ('select "q', 'unterminated quoted identifier at or near ""q"'),
+        ]:
+            with pytest.raises(psycopg.errors.SyntaxError) as exc:
+                conn.execute(sql)
+            assert _diag(exc.value)[:2] == ("42601", message)
+            with pytest.raises(psycopg.errors.SyntaxError) as exc:
+                conn.execute(sql, prepare=True)
+            assert _diag(exc.value)[:2] == ("42601", message)
