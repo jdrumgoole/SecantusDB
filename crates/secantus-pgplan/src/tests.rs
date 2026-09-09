@@ -358,7 +358,10 @@ fn order_by_a_non_grouped_column_is_refused() {
 fn group_by_resolves_order_by_index() {
     match plan_ok("SELECT count(*) FROM t GROUP BY name ORDER BY name DESC") {
         Statement::Aggregate(a) => {
-            assert_eq!(a.group_by, vec![("name".to_string(), "name".to_string())]);
+            assert_eq!(a.group_by.len(), 1);
+            assert_eq!(a.group_by[0].name, "name");
+            assert_eq!(a.group_by[0].field, "name");
+            assert!(a.group_by[0].expr.is_none());
             // `name` is grouped but NOT projected; only the aggregate is.
             assert_eq!(a.select, vec![("count".to_string(), OutputCol::Agg(0))]);
             assert_eq!(a.order.len(), 1);
@@ -366,6 +369,131 @@ fn group_by_resolves_order_by_index() {
             assert!(!a.order[0].ascending);
             // DESC defaults to NULLS FIRST.
             assert_eq!(a.order[0].nulls, Nulls::First);
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+}
+
+/// `GROUP BY <expression>` and `GROUP BY <position>` both key on the
+/// expression, evaluated per row; a projected copy of the same expression is
+/// the group column, matched by structure. Types and names probed on PG 16:
+/// `length(data)` is `int4` named `length`, `x is null` is `bool` named
+/// `?column?`.
+#[test]
+fn group_by_an_expression_or_a_position_keys_on_the_expression() {
+    for sql in [
+        "SELECT length(name), name IS NULL, count(*) FROM t GROUP BY length(name), name IS NULL",
+        "SELECT length(name), name IS NULL, count(*) FROM t GROUP BY 1, 2",
+        "SELECT length(name) AS length, name IS NULL, count(*) FROM t GROUP BY length, 2",
+    ] {
+        match plan(sql, &lookup).unwrap_or_else(|e| panic!("{sql}: {e:?}")) {
+            Statement::Aggregate(a) => {
+                assert_eq!(a.group_by.len(), 2, "{sql}");
+                assert_eq!(a.group_by[0].name, "length");
+                assert_eq!(a.group_by[0].pg_type, "int4");
+                assert_eq!(a.group_by[1].name, "?column?");
+                assert_eq!(a.group_by[1].pg_type, "bool");
+                let row = doc! { "_id": 1, "name": "ab", "n": 3 };
+                let key0 = a.group_by[0].expr.as_ref().expect("an expression key");
+                assert_eq!(apply_row_expr(key0, &row).unwrap(), Bson::Int32(2));
+                let key1 = a.group_by[1].expr.as_ref().expect("an expression key");
+                assert_eq!(apply_row_expr(key1, &row).unwrap(), Bson::Boolean(false));
+                assert_eq!(
+                    a.select,
+                    vec![
+                        ("length".to_string(), OutputCol::Group(0)),
+                        ("?column?".to_string(), OutputCol::Group(1)),
+                        ("count".to_string(), OutputCol::Agg(0)),
+                    ],
+                    "{sql}"
+                );
+            }
+            other => panic!("wrong statement: {other:?}"),
+        }
+    }
+    // A position past the select list is 42P10, worded as PostgreSQL words it.
+    let err =
+        plan("SELECT length(name), count(*) FROM t GROUP BY 3", &lookup).expect_err("must refuse");
+    assert_eq!(err.sqlstate(), "42P10");
+    assert!(err
+        .to_string()
+        .contains("GROUP BY position 3 is not in select list"));
+    // ORDER BY may name the key by position, alias, or expression.
+    for sql in [
+        "SELECT length(name) AS len, count(*) FROM t GROUP BY 1 ORDER BY 1 DESC",
+        "SELECT length(name) AS len, count(*) FROM t GROUP BY len ORDER BY len DESC",
+        "SELECT length(name) AS len, count(*) FROM t GROUP BY length(name) ORDER BY length(name) DESC",
+    ] {
+        match plan(sql, &lookup).unwrap_or_else(|e| panic!("{sql}: {e:?}")) {
+            Statement::Aggregate(a) => {
+                assert_eq!(a.order.len(), 1, "{sql}");
+                assert_eq!(a.order[0].group_index, 0);
+                assert!(!a.order[0].ascending);
+            }
+            other => panic!("wrong statement: {other:?}"),
+        }
+    }
+}
+
+/// `IS [NOT] NULL` over a constant, including PostgreSQL's row rule: a row is
+/// null only when every field is, and not null only when none is.
+#[test]
+fn is_null_over_constants_matches_postgresql() {
+    let sql = "SELECT row(null, null) IS NULL, row(null, null) IS NOT NULL, \
+               row(1, null) IS NULL, row(1, null) IS NOT NULL, null IS NULL, \
+               1 IS NOT NULL, '{}'::int[] IS NULL";
+    match plan_ok(sql) {
+        Statement::SelectConstant(sc) => {
+            let values: Vec<Bson> = sc
+                .columns
+                .iter()
+                .map(|(name, col, ty, _)| {
+                    assert_eq!(name, "?column?");
+                    assert_eq!(ty, "bool");
+                    match col {
+                        ConstCol::Value(v) => v.clone(),
+                        other => panic!("not a value: {other:?}"),
+                    }
+                })
+                .collect();
+            assert_eq!(
+                values,
+                [true, false, false, false, true, true, false]
+                    .map(Bson::Boolean)
+                    .to_vec()
+            );
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+}
+
+/// A FROM-less `select unnest(array)` is one row per element in a column
+/// named `unnest` of the element type; a NULL array is no rows at all. The
+/// elements arrive as a text[] LITERAL, so the literal parser must keep the
+/// quoted characters (`"`, `\`, `,`, `{`, `}`) intact.
+#[test]
+fn from_less_unnest_is_one_row_per_element() {
+    match plan_ok(r#"SELECT unnest('{a,"b",",","\\","{","}",€}'::text[])"#) {
+        Statement::ValuesConstant(vc) => {
+            assert_eq!(vc.names, vec!["unnest".to_string()]);
+            assert_eq!(vc.types, vec!["text".to_string()]);
+            let got: Vec<&str> = vc.rows.iter().map(|r| r[0].as_str().unwrap()).collect();
+            assert_eq!(got, ["a", "b", ",", "\\", "{", "}", "€"]);
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    match plan_ok("SELECT unnest('{1,2}'::int[]) AS u") {
+        Statement::ValuesConstant(vc) => {
+            assert_eq!(vc.names, vec!["u".to_string()]);
+            assert_eq!(vc.types, vec!["int4".to_string()]);
+            assert_eq!(vc.rows, vec![vec![Bson::Int32(1)], vec![Bson::Int32(2)]]);
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    match plan_ok("SELECT unnest(null::text[])") {
+        Statement::ValuesConstant(vc) => {
+            assert_eq!(vc.types, vec!["text".to_string()]);
+            assert!(vc.rows.is_empty());
         }
         other => panic!("wrong statement: {other:?}"),
     }

@@ -39,6 +39,14 @@ refused at CREATE (`42703`, `42830`).
   notice, `55006` and `42809`) drops the data too; `pg_database` lists the
   set and `current_database()` / `current_catalog` name the connected one.
 
+- Rust PostgreSQL server: `GROUP BY` over an expression (`length(data)`,
+  `col is null`, `n + 1`) or a select-list position (`GROUP BY 1, 2`), with
+  the key matched to the projected expression by structure and to `ORDER BY`
+  by position, alias or expression; `IS [NOT] NULL` as a value, including
+  PostgreSQL's row rule (`row(1, null)` is neither null nor not null); and a
+  FROM-less `select unnest(array)` as one row per element in a column named
+  `unnest` of the element type.
+
 #### Fixed
 
 - Rust PostgreSQL server: a long statement no longer stalls every other

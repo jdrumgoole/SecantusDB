@@ -1251,14 +1251,19 @@ impl PgHandler {
             for d in docs {
                 // NULL forms its OWN group in PostgreSQL, so a missing
                 // or null key is a real key rather than a skip.
-                let key: Vec<Option<Bson>> = agg
-                    .group_by
-                    .iter()
-                    .map(|(_, f)| match d.get(f) {
-                        None | Some(Bson::Null) => None,
-                        Some(v) => Some(v.clone()),
-                    })
-                    .collect();
+                let mut key: Vec<Option<Bson>> = Vec::with_capacity(agg.group_by.len());
+                for k in &agg.group_by {
+                    let v = match &k.expr {
+                        Some(expr) => {
+                            secantus_pgplan::apply_row_expr(expr, &d).map_err(|e| Self::err(&e))?
+                        }
+                        None => d.get(&k.field).cloned().unwrap_or(Bson::Null),
+                    };
+                    key.push(match v {
+                        Bson::Null => None,
+                        v => Some(v),
+                    });
+                }
                 match keys.iter().position(|k| *k == key) {
                     Some(i) => buckets[i].push(d),
                     None => {
@@ -6435,33 +6440,15 @@ impl PgHandler {
                 // accumulation below work on documents and do not care where
                 // they came from.
                 let groups = self.aggregate_groups(&agg, max_rows)?;
-
-                // A generated source has no table to look up; its one column
-                // is an int4.
-                let def = match (&agg.series, &agg.join) {
-                    (Some(series), _) => series_table_def(series),
-                    // A join's output def: each projected column with its
-                    // source (or cast) type.
-                    (None, Some(join)) => {
-                        secantus_pgplan::join_output_def(join, &|n| self.lookup(n))
-                            .map_err(|e| Self::err(&e))?
-                    }
-                    (None, None) => self
-                        .lookup(&agg.table)
-                        .ok_or_else(|| Self::err(&PlanError::UndefinedTable(agg.table.clone())))?,
-                };
                 let schema = Arc::new(
                     agg.select
                         .iter()
                         .map(|(name, col)| {
                             let ty = match col {
-                                OutputCol::Group(i) => def
-                                    .column(&agg.group_by[*i].0)
-                                    .map(|c| {
-                                        self.user_wire_type(&c.pg_type)
-                                            .unwrap_or_else(|| wire_type(&c.pg_type))
-                                    })
-                                    .unwrap_or(Type::VARCHAR),
+                                OutputCol::Group(i) => {
+                                    let t = &agg.group_by[*i].pg_type;
+                                    self.user_wire_type(t).unwrap_or_else(|| wire_type(t))
+                                }
                                 OutputCol::Agg(i) => aggregate_wire_type(&agg.items[*i]),
                             };
                             self.field(name.clone(), ty)
@@ -10110,31 +10097,20 @@ impl PgHandler {
                     self.field(name.clone(), ty)
                 })
                 .collect(),
-            Statement::Aggregate(agg) => {
-                let def = match &agg.join {
-                    Some(join) => secantus_pgplan::join_output_def(join, &|n| self.lookup(n))
-                        .map_err(|e| Self::err(&e))?,
-                    None => self
-                        .lookup(&agg.table)
-                        .ok_or_else(|| Self::err(&PlanError::UndefinedTable(agg.table.clone())))?,
-                };
-                agg.select
-                    .iter()
-                    .map(|(name, col)| {
-                        let ty = match col {
-                            OutputCol::Group(i) => def
-                                .column(&agg.group_by[*i].0)
-                                .map(|c| {
-                                    self.user_wire_type(&c.pg_type)
-                                        .unwrap_or_else(|| wire_type(&c.pg_type))
-                                })
-                                .unwrap_or(Type::VARCHAR),
-                            OutputCol::Agg(i) => aggregate_wire_type(&agg.items[*i]),
-                        };
-                        self.field(name.clone(), ty)
-                    })
-                    .collect()
-            }
+            Statement::Aggregate(agg) => agg
+                .select
+                .iter()
+                .map(|(name, col)| {
+                    let ty = match col {
+                        OutputCol::Group(i) => {
+                            let t = &agg.group_by[*i].pg_type;
+                            self.user_wire_type(t).unwrap_or_else(|| wire_type(t))
+                        }
+                        OutputCol::Agg(i) => aggregate_wire_type(&agg.items[*i]),
+                    };
+                    self.field(name.clone(), ty)
+                })
+                .collect(),
             Statement::Show(name) => vec![self.field(canonical_setting(&name), Type::TEXT)],
             Statement::SelectConstant(sc) => sc
                 .columns

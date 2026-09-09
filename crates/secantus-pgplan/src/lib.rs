@@ -519,6 +519,20 @@ pub struct AggOrderKey {
     pub nulls: Nulls,
 }
 
+/// One GROUP BY key: a bare column, or an expression over the row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupKey {
+    /// The name PostgreSQL gives the key when it is projected.
+    pub name: String,
+    /// The stored field a bare column key reads.
+    pub field: String,
+    /// An expression key -- `GROUP BY length(data)`, or `GROUP BY 2` naming
+    /// such a target -- evaluated per row; `None` for a bare column.
+    pub expr: Option<ColumnExpr>,
+    /// The key's declared PostgreSQL type, for the row description.
+    pub pg_type: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Aggregate {
     pub table: String,
@@ -529,10 +543,9 @@ pub struct Aggregate {
     /// catalog. The rows are materialised by the executor and then grouped
     /// exactly as a table's would be.
     pub join: Option<Box<JoinSelect>>,
-    /// EVERY GROUP BY column as (name, stored field), in declared order --
-    /// including ones the SELECT list does not project, because ORDER BY may
-    /// still reference them.
-    pub group_by: Vec<(String, String)>,
+    /// EVERY GROUP BY key, in declared order -- including ones the SELECT
+    /// list does not project, because ORDER BY may still reference them.
+    pub group_by: Vec<GroupKey>,
     pub items: Vec<AggItem>,
     /// The output columns, in order, each pointing at a group or an aggregate.
     pub select: Vec<(String, OutputCol)>,
@@ -3322,25 +3335,12 @@ fn cast_chain_over_column_qualified(
 /// The OUTPUT schema of an aggregate, derived WITHOUT executing it, so a join
 /// with an aggregate subquery side can be typed at Describe time. A `count` /
 /// `sum` is `int8`, `min` / `max` keep the input type, `array_agg` is the input
-/// type's array; a group column takes its type from the aggregate's source.
-pub fn aggregate_output_def(
-    agg: &Aggregate,
-    lookup: &dyn Fn(&str) -> Option<TableDef>,
-) -> Result<TableDef> {
-    let source_def = if let Some(join) = &agg.join {
-        join_output_def(join, lookup)?
-    } else if !agg.table.is_empty() {
-        lookup(&agg.table).ok_or_else(|| Error::UndefinedTable(agg.table.clone()))?
-    } else {
-        TableDef::new("", Vec::new())
-    };
+/// type's array; a group key carries its own type from planning.
+pub fn aggregate_output_def(agg: &Aggregate) -> Result<TableDef> {
     let mut columns = Vec::new();
     for (out, col) in &agg.select {
         let ty = match col {
-            OutputCol::Group(i) => source_def
-                .column(&agg.group_by[*i].0)
-                .map(|c| c.pg_type.clone())
-                .unwrap_or_else(|| "text".to_string()),
+            OutputCol::Group(i) => agg.group_by[*i].pg_type.clone(),
             OutputCol::Agg(i) => {
                 let item = &agg.items[*i];
                 match item.func {
@@ -3368,9 +3368,9 @@ pub fn aggregate_output_def(
 /// The output def of a planned join SIDE that is a subquery (`... JOIN (SELECT
 /// ...) a`). Only an aggregate subquery is reproduced -- that is the shape
 /// psycopg's `CompositeInfo.fetch` uses -- so anything else is refused.
-fn sub_plan_def(stmt: &Statement, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Result<TableDef> {
+fn sub_plan_def(stmt: &Statement) -> Result<TableDef> {
     match stmt {
-        Statement::Aggregate(agg) => aggregate_output_def(agg, lookup),
+        Statement::Aggregate(agg) => aggregate_output_def(agg),
         _ => Err(Error::Unsupported("this JOIN subquery shape".into())),
     }
 }
@@ -3380,11 +3380,11 @@ pub fn join_output_def(
     lookup: &dyn Fn(&str) -> Option<TableDef>,
 ) -> Result<TableDef> {
     let left_def = match &join.left_sub {
-        Some(stmt) => sub_plan_def(stmt, lookup)?,
+        Some(stmt) => sub_plan_def(stmt)?,
         None => lookup(&join.left.0).ok_or_else(|| Error::UndefinedTable(join.left.0.clone()))?,
     };
     let right_def = match &join.right_sub {
-        Some(stmt) => sub_plan_def(stmt, lookup)?,
+        Some(stmt) => sub_plan_def(stmt)?,
         None => lookup(&join.right.0).ok_or_else(|| Error::UndefinedTable(join.right.0.clone()))?,
     };
     let mut columns = Vec::new();
@@ -3426,25 +3426,100 @@ fn finish_aggregate(
     def: TableDef,
     params: &[Bson],
 ) -> Result<Statement> {
-    // GROUP BY columns, in declared order.
-    let mut group_by: Vec<(String, String)> = Vec::new();
+    // GROUP BY keys, in declared order. A bare integer is a POSITION in the
+    // select list (`GROUP BY 1, 2`); anything but a column reference is an
+    // expression over the row, evaluated per row and matched against the
+    // targets by structure -- PostgreSQL's `equal()`, which ignores where in
+    // the query text each was written.
+    let fields: Vec<RowField> = def
+        .columns
+        .iter()
+        .map(|c| (c.name.clone(), c.field(), c.pg_type.clone()))
+        .collect();
+    let mut sample = Document::new();
+    for c in &def.columns {
+        sample.insert(c.field(), sample_value_for_type(&c.pg_type));
+    }
+    let mut group_by: Vec<GroupKey> = Vec::new();
+    let mut group_prints: Vec<String> = Vec::new();
     for g in &s.group_clause {
-        let name = match g.node.as_ref() {
-            Some(N::ColumnRef(c)) => c
-                .fields
-                .first()
-                .and_then(|f| f.node.as_ref())
-                .and_then(|n| match n {
-                    N::String(st) => Some(st.sval.clone()),
+        let node = match g.node.as_ref() {
+            Some(N::AConst(c)) if matches!(c.val, Some(a_const::Val::Ival(_))) => {
+                let Some(a_const::Val::Ival(i)) = &c.val else {
+                    unreachable!()
+                };
+                let position = usize::try_from(i.ival).unwrap_or(0);
+                let target = position
+                    .checked_sub(1)
+                    .and_then(|k| s.target_list.get(k))
+                    .ok_or_else(|| {
+                        Error::InvalidColumnReference(format!(
+                            "GROUP BY position {} is not in select list",
+                            i.ival
+                        ))
+                    })?;
+                match target.node.as_ref() {
+                    Some(N::ResTarget(rt)) => rt.val.as_deref(),
                     _ => None,
-                })
-                .ok_or_else(|| Error::Unsupported("this GROUP BY expression".into()))?,
-            _ => return Err(Error::Unsupported("GROUP BY over an expression".into())),
+                }
+                .ok_or_else(|| Error::Unsupported("this GROUP BY position".into()))?
+            }
+            Some(_) => g,
+            None => return Err(Error::Unsupported("an empty GROUP BY key".into())),
         };
-        let field = def
-            .field_of(&name)
-            .ok_or_else(|| Error::UndefinedColumn(name.clone()))?;
-        group_by.push((name, field));
+        // A name that is no column of the source but IS an output alias
+        // names that target (`select length(data) as n ... group by n`);
+        // an input column wins the tie, as PostgreSQL resolves it.
+        let node = match node.node.as_ref() {
+            Some(N::ColumnRef(c)) => match column_ref_name(c) {
+                Some(name) if def.column(&name).is_none() => s
+                    .target_list
+                    .iter()
+                    .find_map(|t| match t.node.as_ref() {
+                        Some(N::ResTarget(rt)) if rt.name == name => rt.val.as_deref(),
+                        _ => None,
+                    })
+                    .unwrap_or(node),
+                _ => node,
+            },
+            _ => node,
+        };
+        let key = match node.node.as_ref() {
+            Some(N::ColumnRef(c)) => {
+                let name = column_ref_name(c)
+                    .ok_or_else(|| Error::Unsupported("this GROUP BY expression".into()))?;
+                let column = def
+                    .column(&name)
+                    .ok_or_else(|| Error::UndefinedColumn(name.clone()))?;
+                GroupKey {
+                    name,
+                    field: column.field(),
+                    expr: None,
+                    pg_type: column.pg_type.clone(),
+                }
+            }
+            Some(N::FuncCall(f)) if is_aggregate_call(f) => {
+                return Err(Error::Grouping(
+                    "aggregate functions are not allowed in GROUP BY".into(),
+                ));
+            }
+            Some(_) => {
+                let expr = row_column_expr(node, &fields, params, &sample)?;
+                let pg_type = match &expr {
+                    ColumnExpr::Row { result_type, .. } => result_type.clone(),
+                    _ => "text".to_string(),
+                };
+                GroupKey {
+                    name: expression_column_name(node),
+                    field: String::new(),
+                    expr: Some(expr),
+                    pg_type,
+                }
+            }
+            None => return Err(Error::Unsupported("an empty GROUP BY key".into())),
+        };
+        group_prints.push(node_print(node));
+        group_by.push(key);
     }
 
     let mut items: Vec<AggItem> = Vec::new();
@@ -3454,16 +3529,8 @@ fn finish_aggregate(
             return Err(Error::Unsupported("this target".into()));
         };
         match rt.val.as_ref().and_then(|v| v.node.as_ref()) {
-            Some(N::FuncCall(f)) => {
-                let name = f
-                    .funcname
-                    .iter()
-                    .filter_map(|n| match n.node.as_ref()? {
-                        N::String(st) => Some(st.sval.clone()),
-                        _ => None,
-                    })
-                    .next_back()
-                    .unwrap_or_default();
+            Some(N::FuncCall(f)) if is_aggregate_call(f) => {
+                let name = func_name(f).unwrap_or_default();
                 if f.agg_distinct {
                     return Err(Error::Unsupported("DISTINCT inside an aggregate".into()));
                 }
@@ -3536,7 +3603,7 @@ fn finish_aggregate(
                 // PostgreSQL errors 42803 otherwise, and so do we.
                 let idx = group_by
                     .iter()
-                    .position(|(name, _)| *name == col)
+                    .position(|k| k.expr.is_none() && k.name == col)
                     .ok_or_else(|| {
                         Error::Grouping(format!(
                             "column \"{col}\" must appear in the GROUP BY clause \
@@ -3550,7 +3617,23 @@ fn finish_aggregate(
                 };
                 select.push((out, OutputCol::Group(idx)));
             }
-            Some(other) => return Err(Error::Unsupported(disc(other))),
+            // Any other expression must BE a GROUP BY key, matched by
+            // structure; one that merely references a grouped column is
+            // more than this slice lowers.
+            Some(_) => {
+                let val = rt.val.as_deref().expect("ResTarget has a val");
+                let print = node_print(val);
+                let idx = group_prints
+                    .iter()
+                    .position(|p| *p == print)
+                    .ok_or_else(|| Error::Unsupported("this target".into()))?;
+                let out = if rt.name.is_empty() {
+                    group_by[idx].name.clone()
+                } else {
+                    rt.name.clone()
+                };
+                select.push((out, OutputCol::Group(idx)));
+            }
             None => return Err(Error::Unsupported("an empty target".into())),
         }
     }
@@ -3567,22 +3650,64 @@ fn finish_aggregate(
         let Some(N::SortBy(sb)) = item.node.as_ref() else {
             return Err(Error::Unsupported("this ORDER BY item".into()));
         };
-        let col = match sb.node.as_ref().and_then(|n| n.node.as_ref()) {
-            Some(N::ColumnRef(c)) => c
-                .fields
-                .first()
-                .and_then(|f| f.node.as_ref())
-                .and_then(|n| match n {
-                    N::String(st) => Some(st.sval.clone()),
-                    _ => None,
-                })
-                .ok_or_else(|| Error::Unsupported("this ORDER BY expression".into()))?,
-            _ => return Err(Error::Unsupported("ORDER BY over an expression".into())),
+        let sort_node = sb
+            .node
+            .as_ref()
+            .ok_or_else(|| Error::Unsupported("this ORDER BY item".into()))?;
+        let group_index = match sort_node.node.as_ref() {
+            // An OUTPUT alias first (`... as n ... order by n`), then a
+            // grouped source column -- PostgreSQL's order for ORDER BY.
+            Some(N::ColumnRef(c)) => {
+                let col = column_ref_name(c)
+                    .ok_or_else(|| Error::Unsupported("this ORDER BY expression".into()))?;
+                match select.iter().find(|(out, _)| *out == col).map(|(_, o)| *o) {
+                    Some(OutputCol::Group(i)) => i,
+                    Some(OutputCol::Agg(_)) => {
+                        return Err(Error::Unsupported(
+                            "ORDER BY over an aggregate result".into(),
+                        ))
+                    }
+                    None => group_by
+                        .iter()
+                        .position(|k| k.expr.is_none() && k.name == col)
+                        .ok_or_else(|| {
+                            Error::Unsupported("ORDER BY over an aggregate result".into())
+                        })?,
+                }
+            }
+            // `ORDER BY 2` is the second OUTPUT column.
+            Some(N::AConst(c)) if matches!(c.val, Some(a_const::Val::Ival(_))) => {
+                let Some(a_const::Val::Ival(i)) = &c.val else {
+                    unreachable!()
+                };
+                let col = usize::try_from(i.ival)
+                    .ok()
+                    .and_then(|n| n.checked_sub(1))
+                    .and_then(|k| select.get(k))
+                    .ok_or_else(|| {
+                        Error::InvalidColumnReference(format!(
+                            "ORDER BY position {} is not in select list",
+                            i.ival
+                        ))
+                    })?;
+                match col.1 {
+                    OutputCol::Group(i) => i,
+                    OutputCol::Agg(_) => {
+                        return Err(Error::Unsupported(
+                            "ORDER BY over an aggregate result".into(),
+                        ))
+                    }
+                }
+            }
+            Some(_) => {
+                let print = node_print(sort_node);
+                group_prints
+                    .iter()
+                    .position(|p| *p == print)
+                    .ok_or_else(|| Error::Unsupported("ORDER BY over an expression".into()))?
+            }
+            None => return Err(Error::Unsupported("this ORDER BY item".into())),
         };
-        let group_index = group_by
-            .iter()
-            .position(|(name, _)| *name == col)
-            .ok_or_else(|| Error::Unsupported("ORDER BY over an aggregate result".into()))?;
         let ascending = match SortByDir::try_from(sb.sortby_dir) {
             Ok(SortByDir::SortbyDesc) => false,
             Ok(SortByDir::SortbyDefault | SortByDir::SortbyAsc) => true,
@@ -3632,6 +3757,27 @@ fn finish_aggregate(
         limit,
         offset,
     }))
+}
+
+/// A parse node printed WITHOUT its source positions, so two spellings of the
+/// same expression compare equal wherever they sat in the query text --
+/// PostgreSQL's `equal()` for the purpose of matching a target to a GROUP BY
+/// key.
+fn node_print(node: &pg_query::protobuf::Node) -> String {
+    static LOCATION: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    LOCATION
+        .get_or_init(|| regex::Regex::new(r"location: -?\d+").expect("a fixed pattern"))
+        .replace_all(&format!("{node:?}"), "location: _")
+        .into_owned()
+}
+
+/// Is this call one of the aggregates this planner lowers?
+fn is_aggregate_call(f: &pg_query::protobuf::FuncCall) -> bool {
+    f.agg_star
+        || matches!(
+            func_name(f).as_deref(),
+            Some("count" | "sum" | "min" | "max" | "array_agg" | "avg")
+        )
 }
 
 /// The session functions a connecting client asks for.
@@ -3741,7 +3887,7 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
             let (element, _, _) = range_accessor(f).unwrap_or_default();
             range::accessor_result_type(&func_name(f).unwrap_or_default(), &element)
         }
-        Some(N::BoolExpr(_)) => "bool".to_string(),
+        Some(N::BoolExpr(_)) | Some(N::NullTest(_)) => "bool".to_string(),
         // These pick one of their arguments, so they report its type.
         Some(N::RowExpr(_)) => "record".to_string(),
         // `(expr).field` reports the SELECTED field's declared type, taken from
@@ -4175,6 +4321,62 @@ fn plan_select_srf(
     })))
 }
 
+/// `select unnest(<array>)` with no FROM: one row per element, in a column
+/// named `unnest` of the array's element type. A NULL array is zero rows.
+/// The array is a constant here (a literal or a bound parameter), so the rows
+/// are materialised at planning like a `VALUES` list's.
+fn plan_select_unnest(
+    s: &pg_query::protobuf::SelectStmt,
+    params: &[Bson],
+) -> Result<Option<Statement>> {
+    let [target] = s.target_list.as_slice() else {
+        return Ok(None);
+    };
+    let Some(N::ResTarget(rt)) = target.node.as_ref() else {
+        return Ok(None);
+    };
+    let Some(N::FuncCall(f)) = rt.val.as_ref().and_then(|v| v.node.as_ref()) else {
+        return Ok(None);
+    };
+    if func_name(f).as_deref() != Some("unnest") {
+        return Ok(None);
+    }
+    if f.args.len() != 1 {
+        return Err(Error::Unsupported(
+            "unnest() with this argument list".into(),
+        ));
+    }
+    if s.where_clause.is_some()
+        || !s.sort_clause.is_empty()
+        || s.limit_count.is_some()
+        || s.limit_offset.is_some()
+    {
+        return Err(Error::Unsupported(
+            "a clause over a set-returning unnest()".into(),
+        ));
+    }
+    let value = const_value(&f.args[0], params)?;
+    let element_type = static_type(&f.args[0], &value)
+        .strip_suffix("[]")
+        .map(str::to_owned)
+        .ok_or_else(|| Error::Unsupported("unnest() over a non-array".into()))?;
+    let rows = match value {
+        Bson::Array(items) => items.into_iter().map(|v| vec![v]).collect(),
+        Bson::Null => Vec::new(),
+        _ => return Err(Error::Unsupported("unnest() over a non-array".into())),
+    };
+    let name = if rt.name.is_empty() {
+        "unnest".to_string()
+    } else {
+        rt.name.clone()
+    };
+    Ok(Some(Statement::ValuesConstant(ValuesConstant {
+        names: vec![name],
+        types: vec![element_type],
+        rows,
+    })))
+}
+
 /// Plan a bare `VALUES (...), (...)` query into a `ValuesConstant`.
 ///
 /// Each row's cells are resolved to values, and every column's declared type
@@ -4237,6 +4439,9 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
     // `FROM generate_series(...)` form already produces -- so ORDER BY, LIMIT
     // and OFFSET keep working without a second implementation.
     if let Some(stmt) = plan_select_srf(s, params)? {
+        return Ok(stmt);
+    }
+    if let Some(stmt) = plan_select_unnest(s, params)? {
         return Ok(stmt);
     }
     // With no FROM there is nothing for a WHERE to range over: it is a
@@ -4584,7 +4789,8 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 | N::RowExpr(_)
                 | N::AIndirection(_)
                 | N::CoalesceExpr(_)
-                | N::MinMaxExpr(_)),
+                | N::MinMaxExpr(_)
+                | N::NullTest(_)),
             ) => {
                 let val = rt.val.as_ref().expect("checked");
                 let v = const_value(val, params)?;
@@ -9597,6 +9803,28 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             }
         }
         return Ok(Bson::Null);
+    }
+    // `x IS [NOT] NULL` over a value. A row is null when EVERY field is
+    // null and not null when NO field is -- so `row(1, null)` answers false
+    // to both (measured on PG 16).
+    if let Some(N::NullTest(t)) = node.node.as_ref() {
+        let arg = t
+            .arg
+            .as_ref()
+            .ok_or_else(|| Error::Parse("IS NULL with no operand".into()))?;
+        let value = const_value(arg, params)?;
+        let (all_null, none_null) = match record_fields(&value) {
+            Some(fields) => (
+                fields.iter().all(|f| *f == Bson::Null),
+                fields.iter().all(|f| *f != Bson::Null),
+            ),
+            None => (value == Bson::Null, value != Bson::Null),
+        };
+        return match NullTestType::try_from(t.nulltesttype) {
+            Ok(NullTestType::IsNull) => Ok(Bson::Boolean(all_null)),
+            Ok(NullTestType::IsNotNull) => Ok(Bson::Boolean(none_null)),
+            _ => Err(Error::Unsupported("this IS [NOT] NULL form".into())),
+        };
     }
     if let Some(N::MinMaxExpr(m)) = node.node.as_ref() {
         let args = m

@@ -7233,3 +7233,73 @@ def test_the_first_ddl_on_a_fresh_store_does_not_block_a_second_connection(home:
             ).fetchall()
             assert [n for n, _ in oids] == ["c1", "e1", "e3"]
             assert len({o for _, o in oids}) == 3
+
+
+def test_group_by_an_expression_or_a_position(home: Path) -> None:
+    """``GROUP BY length(data)`` / ``GROUP BY 1, 2, 3`` key on the expression.
+
+    Every answer here was measured on PostgreSQL 16 (2026-09-09), including the
+    output column names (``length``, ``?column?``), the ``int4`` / ``bool``
+    types, and the 42P10 for a position past the select list. This is the
+    shape psycopg's ``test_copy_in_allchars`` checks its 256 rows with.
+    """
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        conn.execute("create table gp (id int primary key, data text, col2 text)")
+        conn.execute(
+            "insert into gp values (1, 'a', null), (2, 'bb', null), (3, 'cc', null),"
+            " (4, null, null), (5, 'a', null)"
+        )
+        cur = conn.execute("select length(data), count(*) from gp group by length(data) order by 1")
+        assert [(d.name, d.type_code) for d in cur.description] == [("length", 23), ("count", 20)]
+        assert cur.fetchall() == [(1, 2), (2, 2), (None, 1)]
+        cur = conn.execute(
+            "select col2 is null, ascii(data), count(*) from gp group by 1, 2 order by 2"
+        )
+        assert [(d.name, d.type_code) for d in cur.description] == [
+            ("?column?", 16),
+            ("ascii", 23),
+            ("count", 20),
+        ]
+        assert cur.fetchall() == [(True, 97, 2), (True, 98, 1), (True, 99, 1), (True, None, 1)]
+        assert conn.execute(
+            "select length(data) as len, count(*) from gp group by len order by len desc"
+        ).fetchall() == [(None, 1), (2, 2), (1, 2)]
+        assert conn.execute(
+            "select length(data) + 1, count(*) from gp group by length(data) + 1 order by 1"
+        ).fetchall() == [(2, 2), (3, 2), (None, 1)]
+        # psycopg's allchars check, verbatim.
+        assert conn.execute(
+            "select 97 = ascii(data), col2 is null, length(data), count(*) from gp"
+            " where data = 'a' group by 1, 2, 3"
+        ).fetchall() == [(True, True, 1, 2)]
+        with pytest.raises(psycopg.errors.InvalidColumnReference) as ex:
+            conn.execute("select length(data), count(*) from gp group by 3")
+        assert _diag(ex.value)[:2] == ("42P10", "GROUP BY position 3 is not in select list")
+
+
+def test_is_null_over_a_constant_and_a_from_less_unnest(home: Path) -> None:
+    """``x IS [NOT] NULL`` as a value, and ``select unnest(array)`` as rows.
+
+    Measured on PostgreSQL 16: a row is null only when EVERY field is, and not
+    null only when NONE is, so ``row(1, null)`` answers false to both. The
+    unnest literal carries the characters psycopg's ``test_copy_out_allchars``
+    sends -- a quote, a backslash, a comma, both braces -- through the array
+    literal parser.
+    """
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        cur = conn.execute(
+            "select row(null, null) is null, row(null, null) is not null,"
+            " row(1, null) is null, row(1, null) is not null, null is null,"
+            " 1 is not null, '{}'::int[] is null, 1 is null as x"
+        )
+        assert [(d.name, d.type_code) for d in cur.description] == [("?column?", 16)] * 7 + [
+            ("x", 16)
+        ]
+        assert cur.fetchall() == [(True, False, False, False, True, True, False, False)]
+        cur = conn.execute("""select unnest('{a,"b",",","\\\\","{","}",€}'::text[])""")
+        assert [(d.name, d.type_code) for d in cur.description] == [("unnest", 25)]
+        assert [r[0] for r in cur.fetchall()] == ["a", "b", ",", "\\", "{", "}", "€"]
+        cur = conn.execute("select unnest('{1,2}'::int[]) as u")
+        assert [(d.name, d.type_code) for d in cur.description] == [("u", 23)]
+        assert cur.fetchall() == [(1,), (2,)]
+        assert conn.execute("select unnest(null::text[])").fetchall() == []

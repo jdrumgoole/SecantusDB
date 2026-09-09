@@ -444,11 +444,10 @@ of `uuid` / `json` / `jsonb` / `inet` / `cidr` / range columns are all fixed
 and byte-identical to PostgreSQL 16 (`test_copy_in_empty`,
 `test_copy_in_records_binary`, `test_copy_to_leaks`, `test_copy_from_leaks`
 pass; the leak tests still hit the 34-digit `numeric` limit on some draws).
-STILL OPEN:
-  - **SQL-helper gaps unrelated to COPY** (`test_copy_*_allchars`,
-    `test_copy_out_server_error`): `unnest()`, `GROUP BY` over an expression, and
-    a bare `AExpr` (`1/n`) in the COPY source query are unsupported SQL, not COPY
-    bugs.
+**2026-09-09:** the SQL-helper gaps behind `test_copy_*_allchars` are closed
+too — `GROUP BY` over an expression or a select-list position, `IS [NOT] NULL`
+as a value, and a FROM-less `select unnest(array)` — so all three pass, as does
+`test_copy_out_server_error`.
 
 **Rust pgserver composite PARAMETERS — LANDED 2026-09-08 (psycopg's
 `vendor/psycopg/tests/types/test_composite.py`, oracle PostgreSQL 14; 24 → 18
