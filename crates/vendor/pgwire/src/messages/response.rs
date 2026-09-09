@@ -164,7 +164,12 @@ impl Message for ErrorResponse {
     }
 
     fn message_length(&self) -> usize {
-        4 + self.fields.iter().map(|f| 1 + f.1.len() + 1).sum::<usize>() + 1
+        4 + self
+            .fields
+            .iter()
+            .map(|f| 1 + codec::cstring_body_len(&f.1) + 1)
+            .sum::<usize>()
+            + 1
     }
 
     fn encode_body(&self, buf: &mut BytesMut) -> PgWireResult<()> {
@@ -215,7 +220,12 @@ impl Message for NoticeResponse {
     }
 
     fn message_length(&self) -> usize {
-        4 + self.fields.iter().map(|f| 1 + f.1.len() + 1).sum::<usize>() + 1
+        4 + self
+            .fields
+            .iter()
+            .map(|f| 1 + codec::cstring_body_len(&f.1) + 1)
+            .sum::<usize>()
+            + 1
     }
 
     fn encode_body(&self, buf: &mut BytesMut) -> PgWireResult<()> {

@@ -73,6 +73,10 @@ pub enum Error {
     /// A NULL where the operation cannot take one -> 22004
     /// (`format('%I', NULL)`).
     NullValueNotAllowed(String),
+    /// A character the target representation cannot hold -> 22P05
+    /// (`'"\u0000"'::jsonb`: jsonb stores decoded text and text cannot
+    /// carry a NUL).
+    UntranslatableCharacter(String),
     /// A function call whose ARGUMENT TYPES match no overload -> 42883.
     ///
     /// Distinct from `Unsupported`: PostgreSQL has no such function either, so
@@ -121,6 +125,7 @@ impl std::fmt::Display for Error {
             Error::NumericOutOfRange(m) => write!(f, "{m}"),
             Error::DataException(m) | Error::InvalidParameter(m) => write!(f, "{m}"),
             Error::NullValueNotAllowed(m) => write!(f, "{m}"),
+            Error::UntranslatableCharacter(m) => write!(f, "{m}"),
             Error::InvalidColumnReference(m)
             | Error::UndefinedFunction(m)
             | Error::IndeterminateDatatype(m)
@@ -169,6 +174,7 @@ impl Error {
             Error::DataException(_) => "22000",     // data_exception
             Error::InvalidParameter(_) => "22023",  // invalid_parameter_value
             Error::NullValueNotAllowed(_) => "22004", // null_value_not_allowed
+            Error::UntranslatableCharacter(_) => "22P05", // untranslatable_character
             Error::InvalidColumnReference(_) => "42P10", // invalid_column_reference
             Error::UndefinedFunction(_) => "42883", // undefined_function
             Error::MultipleCommands => "42601",     // syntax_error, as PostgreSQL reports it
@@ -6453,15 +6459,104 @@ pub fn render_timestamp_from_pg_micros(micros: i64) -> String {
 /// with an era suffix); the caller then errors rather than sending wrong bytes,
 /// exactly as `encode_binary` does for any type it cannot render.
 pub fn date_to_pg_days(text: &str) -> Option<i32> {
-    let d = NaiveDate::parse_from_str(text.trim(), "%Y-%m-%d").ok()?;
+    // `date_send` sends the two infinities as the extreme day counts, and a
+    // BC date as a negative count (the proleptic year `1 - y`).
+    let t = text.trim();
+    match t.to_ascii_lowercase().as_str() {
+        "infinity" => return Some(i32::MAX),
+        "-infinity" => return Some(i32::MIN),
+        _ => {}
+    }
+    let d = parse_date_era(t)?;
     let epoch = NaiveDate::from_ymd_opt(2000, 1, 1)?;
     i32::try_from(d.signed_duration_since(epoch).num_days()).ok()
+}
+
+/// A `YYYY-MM-DD` or `YYYY-MM-DD BC` date as a chrono date (BC through the
+/// proleptic year `1 - y`, which is how chrono counts before year 1).
+fn parse_date_era(t: &str) -> Option<NaiveDate> {
+    let (body, bc) = match t.strip_suffix(" BC").or_else(|| t.strip_suffix(" bc")) {
+        Some(body) => (body.trim_end(), true),
+        None => (t, false),
+    };
+    let mut parts = body.splitn(3, '-');
+    let y: i32 = parts.next()?.parse().ok()?;
+    let m: u32 = parts.next()?.parse().ok()?;
+    let d: u32 = parts.next()?.parse().ok()?;
+    NaiveDate::from_ymd_opt(if bc { 1 - y } else { y }, m, d)
+}
+
+/// PostgreSQL's `timetz` binary form from the canonical text: microseconds
+/// since midnight, and the zone as seconds WEST of UTC (`timetz_send` sends
+/// the stored `zone`, whose sign is the reverse of the printed offset:
+/// `12:00:00+05:30` carries `-19800`).
+pub fn timetz_to_pg_wire(text: &str) -> Option<(i64, i32)> {
+    let (body, offset) = split_trailing_offset(text);
+    let micros = time_to_pg_micros(&body)?;
+    Some((micros, -offset.unwrap_or(0)))
+}
+
+/// PostgreSQL's `timestamp` / `timestamptz` binary form from CANONICAL TEXT:
+/// microseconds since 2000-01-01, the naive text read as UTC (which is how a
+/// range bound is stored: a `tstzrange` keeps its bounds as the naive UTC
+/// wall clock). `infinity` / `-infinity` are the wire sentinels, a `... BC`
+/// timestamp counts back through the proleptic calendar, a wide year
+/// (`10000-01-01 12:00:00`) counts forward past what chrono's `%Y` parses,
+/// and a trailing offset (`+00:00`, the pass-through text a wide/BC
+/// `timestamptz` keeps) is applied -- PostgreSQL sends every one of these in
+/// binary, and the client's loader is what decides it cannot hold them.
+pub fn timestamp_text_to_pg_micros(text: &str) -> Option<i64> {
+    const EPOCH_2000_US: i64 = 946_684_800 * 1_000_000;
+    let t = text.trim();
+    match t.to_ascii_lowercase().as_str() {
+        "infinity" => return Some(i64::MAX),
+        "-infinity" => return Some(i64::MIN),
+        _ => {}
+    }
+    let (body, bc) = match t.strip_suffix(" BC").or_else(|| t.strip_suffix(" bc")) {
+        Some(body) => (body.trim_end(), true),
+        None => (t, false),
+    };
+    let (body, offset) = split_trailing_offset(body);
+    let (date, time) = body
+        .trim()
+        .split_once([' ', 'T'])
+        .unwrap_or((body.trim(), "00:00:00"));
+    let d = parse_date_era(&format!("{date}{}", if bc { " BC" } else { "" }))?;
+    let us = time_to_pg_micros(time)?;
+    let midnight = d.and_hms_opt(0, 0, 0)?.and_utc().timestamp_micros();
+    midnight
+        .checked_add(us)?
+        .checked_sub(i64::from(offset.unwrap_or(0)) * 1_000_000)?
+        .checked_sub(EPOCH_2000_US)
+}
+
+/// A stored `tstzrange` bound (naive UTC text) as PostgreSQL prints it: the
+/// wall clock in the session zone with that zone's offset. The infinities
+/// pass through unchanged.
+pub fn utc_text_in_zone(text: &str, tz: &TimeZoneSetting) -> Option<String> {
+    let t = text.trim();
+    if matches!(t.to_ascii_lowercase().as_str(), "infinity" | "-infinity") {
+        return Some(t.to_ascii_lowercase());
+    }
+    if t.to_ascii_lowercase().ends_with(" bc") {
+        return None;
+    }
+    Some(render_timestamptz(parse_timestamp(t).ok()?, tz))
 }
 
 /// PostgreSQL's `time` binary form: microseconds since midnight.
 ///
 /// The inverse of `render_time_from_micros`.
 pub fn time_to_pg_micros(text: &str) -> Option<i64> {
+    // `24:00:00` is a valid end-of-day `time` (86_400_000_000 on the wire,
+    // measured on 16); chrono has no hour 24, so it is the one clock reading
+    // spelled out here.
+    if let Some(rest) = text.trim().strip_prefix("24:") {
+        if rest.chars().all(|c| c == '0' || c == ':' || c == '.') {
+            return Some(86_400_000_000);
+        }
+    }
     let t = NaiveTime::parse_from_str(text.trim(), "%H:%M:%S%.f")
         .or_else(|_| NaiveTime::parse_from_str(text.trim(), "%H:%M"))
         .ok()?;
@@ -6734,7 +6829,15 @@ fn render_array_element(v: &Bson) -> String {
         // array-quoting below wraps it (it has parens and commas), so
         // `array[row('a',1)::t]` becomes `{"(a,1)"}` as PostgreSQL renders it.
         _ if record_fields(v).is_some() => record_text(record_fields(v).expect("checked")),
-        other => format!("{other:?}"),
+        // A timestamp (a BSON date, or the sub-millisecond composite) and an
+        // interval (its three-part document) render as the text their scalar
+        // cast produces: `{"2020-01-01 00:00:00.5"}`, `{"1 day"}`. These
+        // used to fall through to the Debug form (`DateTime(2020-01-01
+        // 0:00:00.5 +00:00:00)`), which no PostgreSQL client can read.
+        other => match cast_value(other.clone(), "text") {
+            Ok(Bson::String(s)) => s,
+            _ => format!("{other:?}"),
+        },
     };
     let needs_quotes = raw.is_empty()
         || raw.eq_ignore_ascii_case("null")
@@ -7392,16 +7495,22 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
         }
         "json" | "jsonb" => {
             let text = as_text(&value);
-            let parsed = json::parse(&text).map_err(|_| {
-                Error::InvalidText(format!(
-                    "invalid input syntax for type {target}: \"{}\"",
-                    text.trim()
-                ))
-            })?;
-            Ok(Bson::String(if target == "json" {
-                text
-            } else {
-                json::render_jsonb(&parsed)
+            // `json` keeps the input verbatim, so a `\uXXXX` escape it
+            // cannot decode -- a lone surrogate, or `\u0000` -- is fine;
+            // `jsonb` stores the decoded text and must reject both, with
+            // PostgreSQL's two distinct codes.
+            let parsed = match json::parse(&text) {
+                Ok(v) => Some(v),
+                Err(json::ParseError::UnpairedSurrogate | json::ParseError::NulEscape)
+                    if target == "json" =>
+                {
+                    None
+                }
+                Err(e) => return Err(json_parse_error(e)),
+            };
+            Ok(Bson::String(match parsed {
+                Some(parsed) if target == "jsonb" => json::render_jsonb(&parsed),
+                _ => text,
             }))
         }
         "interval" => match Interval::from_bson(&value) {
@@ -7798,8 +7907,34 @@ pub fn max_param_number(sql: &str) -> usize {
 pub fn catalog_param_types(
     sql: &str,
     declared: &[Option<String>],
-    column_type: &dyn Fn(&str, &str) -> Option<String>,
+    column_type: &dyn Fn(&str, ColumnRef<'_>) -> Option<String>,
 ) -> Vec<String> {
+    catalog_param_types_opt(sql, declared, column_type)
+        .into_iter()
+        .map(|t| t.unwrap_or_else(|| "text".to_string()))
+        .collect()
+}
+
+/// How `catalog_param_types` names the column an INSERT puts a parameter in:
+/// by name when the statement lists its columns (`insert into t (a, b)
+/// values ($1, $2)`), by position when it does not (`insert into t values
+/// ($1, $2)` puts `$2` in the table's second column).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnRef<'a> {
+    Name(&'a str),
+    Position(usize),
+}
+
+/// `catalog_param_types` before the text default: a slot nothing in the
+/// statement types stays `None`. Bind uses this for a parameter the client
+/// left untyped but sent in BINARY format -- there the type decides how the
+/// bytes are read, and psycopg sends an empty `Multirange([])` that way (oid
+/// 0, four zero bytes) because no element exists to name the type from.
+pub fn catalog_param_types_opt(
+    sql: &str,
+    declared: &[Option<String>],
+    column_type: &dyn Fn(&str, ColumnRef<'_>) -> Option<String>,
+) -> Vec<Option<String>> {
     let n = declared.len().max(max_param_number(sql));
     let mut padded = declared.to_vec();
     padded.resize(n, None);
@@ -7850,8 +7985,13 @@ pub fn catalog_param_types(
                             let Some(i) = param_index(item) else {
                                 continue;
                             };
-                            let Some(column) = columns.get(pos) else {
-                                continue;
+                            let column = if columns.is_empty() {
+                                ColumnRef::Position(pos)
+                            } else {
+                                match columns.get(pos) {
+                                    Some(name) => ColumnRef::Name(name),
+                                    None => continue,
+                                }
                             };
                             if let Some(slot @ None) = inferred.get_mut(i) {
                                 *slot = column_type(&table, column);
@@ -7864,9 +8004,6 @@ pub fn catalog_param_types(
         }
     }
     inferred
-        .into_iter()
-        .map(|t| t.unwrap_or_else(|| "text".to_string()))
-        .collect()
 }
 
 /// The functions whose arguments are `"any"` / VARIADIC `"any"`: nothing
@@ -7915,6 +8052,18 @@ fn is_range_family(name: &str) -> bool {
     range::is_range_type(element) || range::is_multirange_type(element)
 }
 
+/// PostgreSQL's error for JSON text that does not parse. The type is named
+/// `json` whether the input was json or jsonb, and the value is not quoted
+/// in the message (it goes in the CONTEXT line, which is not carried).
+fn json_parse_error(e: json::ParseError) -> Error {
+    match e {
+        json::ParseError::NulEscape => {
+            Error::UntranslatableCharacter("unsupported Unicode escape sequence".into())
+        }
+        _ => Error::InvalidText("invalid input syntax for type json".into()),
+    }
+}
+
 /// The JSON operators: `->`, `->>`, `#>`, `#>>` and `?`.
 ///
 /// A json value is carried as its TEXT, so by the time two operands are values
@@ -7927,12 +8076,7 @@ fn is_range_family(name: &str) -> bool {
 /// PostgreSQL's rule and the reason these operators are usable at all.
 fn json_operator(op: &str, target: &str, lhs: &Bson, rhs: &Bson) -> Result<Bson> {
     let text = value_text(lhs);
-    let parsed = json::parse(&text).map_err(|_| {
-        Error::InvalidText(format!(
-            "invalid input syntax for type {target}: \"{}\"",
-            text.trim()
-        ))
-    })?;
+    let parsed = json::parse(&text).map_err(json_parse_error)?;
     // `#>` and `#>>` take a PATH; the others take one key.
     let steps: Vec<String> = if op.starts_with('#') && op != "#" {
         match rhs {
@@ -7970,12 +8114,7 @@ fn json_operator(op: &str, target: &str, lhs: &Bson, rhs: &Bson) -> Result<Bson>
     // Containment compares by VALUE, so key order and whitespace do not count.
     if op == "@>" || op == "<@" {
         let other = value_text(rhs);
-        let other = json::parse(&other).map_err(|_| {
-            Error::InvalidText(format!(
-                "invalid input syntax for type {target}: \"{}\"",
-                other.trim()
-            ))
-        })?;
+        let other = json::parse(&other).map_err(json_parse_error)?;
         return Ok(Bson::Boolean(if op == "@>" {
             json::contains(&parsed, &other)
         } else {
@@ -8729,9 +8868,11 @@ pub(crate) fn compare_constants(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering
         _ => {
             // Decimals compare on their DIGITS: an f64 holds 15 significant
             // digits where a numeric holds 34, so a float comparison can call
-            // two different numbers equal.
+            // two different numbers equal. Rendered PLAIN first: Decimal128
+            // writes `-8.34184E-7` for a small magnitude, and the digit
+            // comparison has no notion of an exponent.
             let dec = |v: &Bson| match v {
-                Bson::Decimal128(d) => Some(d.to_string()),
+                Bson::Decimal128(d) => Some(plain_numeric_text(&d.to_string())),
                 Bson::Int32(i) => Some(i.to_string()),
                 Bson::Int64(i) => Some(i.to_string()),
                 _ => None,

@@ -657,6 +657,48 @@ fn a_cast_declares_the_column_type() {
     );
 }
 
+/// An INSERT types an undeclared parameter from the column it goes into --
+/// named when the statement lists columns, positional when it does not.
+/// psycopg sends an empty `Multirange([])` untyped, so `insert into mr
+/// values ($1, $2)` is the only thing that can say `$2` is an int4multirange.
+#[test]
+fn an_insert_types_a_parameter_from_its_column_by_name_or_position() {
+    let column_type = |table: &str, column: ColumnRef<'_>| {
+        assert_eq!(table, "mr");
+        match column {
+            ColumnRef::Name("id") | ColumnRef::Position(0) => Some("int4".to_string()),
+            ColumnRef::Name("m") | ColumnRef::Position(1) => Some("int4multirange".to_string()),
+            _ => None,
+        }
+    };
+    let none = [None, None];
+    assert_eq!(
+        catalog_param_types_opt(
+            "insert into mr (m, id) values ($1, $2)",
+            &none,
+            &column_type
+        ),
+        vec![Some("int4multirange".to_string()), Some("int4".to_string())]
+    );
+    assert_eq!(
+        catalog_param_types_opt("insert into mr values ($1, $2)", &none, &column_type),
+        vec![Some("int4".to_string()), Some("int4multirange".to_string())]
+    );
+    // A column the table does not have types nothing.
+    assert_eq!(
+        catalog_param_types_opt(
+            "insert into mr values ($1, $2, $3)",
+            &[None, None, None],
+            &column_type
+        ),
+        vec![
+            Some("int4".to_string()),
+            Some("int4multirange".to_string()),
+            None
+        ]
+    );
+}
+
 #[test]
 fn drop_table_is_planned() {
     match plan_ok("DROP TABLE t") {
@@ -884,6 +926,91 @@ fn numeric_refuses_rather_than_rounds() {
                                          // Not a number at all is a different code.
     let err = plan("SELECT 'x'::numeric", &lookup).expect_err("not numeric");
     assert_eq!(err.sqlstate(), "22P02");
+}
+
+/// A datetime / interval ARRAY element renders as its scalar text, not as the
+/// BSON value's Debug form. PostgreSQL 16: `array['2020-01-01 00:00:00.5'
+/// ::timestamp]::text` is `{"2020-01-01 00:00:00.5"}`, `array['1 day'::
+/// interval]::text` is `{"1 day"}`, `array['12:00'::time]::text` is
+/// `{12:00:00}`. Before this the first two were `{"DateTime(2020-01-01
+/// 0:00:00.5 +00:00:00)"}` and `{"Document({\"__ivl_mon\": ...})"}`.
+#[test]
+fn datetime_array_elements_render_as_their_scalar_text() {
+    for (sql, want) in [
+        (
+            "SELECT ARRAY['2020-01-01 00:00:00.5'::timestamp]",
+            "{\"2020-01-01 00:00:00.5\"}",
+        ),
+        ("SELECT ARRAY['1 day'::interval]", "{\"1 day\"}"),
+        ("SELECT ARRAY['12:00'::time]", "{12:00:00}"),
+        ("SELECT ARRAY['2020-01-01'::date]", "{2020-01-01}"),
+    ] {
+        match plan_ok(sql) {
+            Statement::SelectConstant(sc) => {
+                let ConstCol::Value(Bson::Array(items)) = &sc.columns[0].1 else {
+                    panic!("{sql} should be an array, got {:?}", sc.columns[0].1);
+                };
+                assert_eq!(render_array(items), want, "for {sql}");
+            }
+            other => panic!("wrong statement for {sql}: {other:?}"),
+        }
+    }
+}
+
+/// The binary-wire helpers behind the datetime family, pinned to the bytes
+/// PostgreSQL 16 sends (`binpin.py`, 2026-09-09): `date_send` is i32 days
+/// since 2000-01-01 with the infinities at the i32 extremes and a BC date
+/// counted back through the proleptic calendar; `timetz_send` is micros since
+/// midnight plus the zone as seconds WEST of UTC; `timestamp_send` is i64
+/// micros since 2000-01-01 with the infinities at the i64 extremes.
+#[test]
+fn datetime_binary_helpers_match_postgres() {
+    assert_eq!(date_to_pg_days("2000-01-02"), Some(1));
+    assert_eq!(date_to_pg_days("infinity"), Some(i32::MAX));
+    assert_eq!(date_to_pg_days("-infinity"), Some(i32::MIN));
+    assert_eq!(date_to_pg_days("0001-01-01 BC"), Some(-0x000b_2575)); // fff4da8b
+    assert_eq!(date_to_pg_days("4713-01-01 BC"), Some(-0x0025_6833)); // ffda97cd
+    assert_eq!(date_to_pg_days("not a date"), None);
+
+    assert_eq!(
+        timetz_to_pg_wire("12:00:00+05:30"),
+        Some((43_200_000_000, -19_800))
+    );
+    assert_eq!(
+        timetz_to_pg_wire("23:59:59.5-08"),
+        Some((86_399_500_000, 28_800))
+    );
+    assert_eq!(timetz_to_pg_wire("12:00:00"), Some((43_200_000_000, 0)));
+
+    assert_eq!(
+        timestamp_text_to_pg_micros("2000-01-01 00:00:01"),
+        Some(1_000_000)
+    );
+    // The values PostgreSQL sends in binary and psycopg's loader then refuses
+    // ("timestamp too large" / "too small", hour 24): a wide year, a BC
+    // timestamptz with its pass-through offset, and the end-of-day time.
+    assert_eq!(
+        timestamp_text_to_pg_micros("10000-01-01 12:00:00"),
+        Some(0x0380_e715_a027_3000)
+    );
+    assert_eq!(
+        timestamp_text_to_pg_micros("1000-01-01 12:00+00:00 BC"),
+        Some(-0x0150_39e1_ac8b_1000)
+    );
+    assert_eq!(
+        timestamp_text_to_pg_micros("2000-01-01 01:00:00+01"),
+        Some(0)
+    );
+    assert_eq!(time_to_pg_micros("24:00:00"), Some(86_400_000_000));
+    assert_eq!(time_to_pg_micros("24:00"), Some(86_400_000_000));
+    assert_eq!(time_to_pg_micros("24:00:01"), None);
+    assert_eq!(timestamp_text_to_pg_micros("infinity"), Some(i64::MAX));
+    assert_eq!(timestamp_text_to_pg_micros("-infinity"), Some(i64::MIN));
+    assert_eq!(
+        timestamp_text_to_pg_micros("0001-01-01 00:00:00 BC"),
+        Some(-0x00e0_39c2_e44e_e000) // ff1fc63d1bb12000
+    );
+    assert_eq!(timestamp_text_to_pg_micros("garbage"), None);
 }
 
 /// Array text form: `{...}`, nested, with the quoting PostgreSQL uses.
@@ -1383,6 +1510,26 @@ fn decimals_compare_exactly() {
         super::compare_constants(&d("-1.5"), &d("-1.4")),
         Some(Ordering::Less)
     );
+    // A magnitude Decimal128 renders in exponent form (`-8.34184E-7`) is
+    // still a number: the digit comparison used to see the `E` and give up,
+    // which reached psycopg as "comparing numeric range bounds is not
+    // supported yet" on any `numrange` with a small enough bound.
+    assert_eq!(
+        super::compare_constants(&d("-8.34184E-7"), &d("1")),
+        Some(Ordering::Less)
+    );
+    assert_eq!(
+        super::compare_constants(&d("1.5E+20"), &d("150000000000000000000")),
+        Some(Ordering::Equal)
+    );
+    assert_eq!(
+        super::compare_constants(&d("8.34184E-7"), &d("0.000000834184")),
+        Some(Ordering::Equal)
+    );
+    assert_eq!(
+        super::compare_constants(&d("8.34184E-7"), &d("0.000000834185")),
+        Some(Ordering::Less)
+    );
 }
 
 /// PostgreSQL gives NaN a place in a TOTAL order, which IEEE does not: NaN
@@ -1497,6 +1644,51 @@ fn malformed_json_is_refused() {
     ] {
         assert!(crate::json::parse(bad).is_err(), "{bad:?} should not parse");
     }
+}
+
+/// `\uXXXX` escapes, measured against PostgreSQL 16's `jsonb` input: a
+/// surrogate PAIR is one character, either half alone is a 22P02, and
+/// `\u0000` is the distinct 22P05 (it decodes, but to a NUL text cannot
+/// hold). The `json` type keeps every escape verbatim, which the cast
+/// handles by tolerating the last two errors.
+#[test]
+fn json_unicode_escapes_match_postgres() {
+    use crate::json::{parse, Json, ParseError};
+    assert_eq!(
+        parse(r#""\ud83d\ude00""#),
+        Ok(Json::Str("\u{1F600}".into()))
+    );
+    assert_eq!(parse(r#""\u00e9""#), Ok(Json::Str("\u{e9}".into())));
+    assert_eq!(parse(r#""\u0041\u00000""#), Err(ParseError::NulEscape));
+    assert_eq!(parse(r#""\u0000""#), Err(ParseError::NulEscape));
+    for lone in [
+        r#""\ud83d""#,
+        r#""\ude00""#,
+        r#""\ud83dx""#,
+        r#""\ud83d\ud83d""#,
+        r#"{"a":"\ud83d"}"#,
+    ] {
+        assert_eq!(parse(lone), Err(ParseError::UnpairedSurrogate), "{lone}");
+    }
+    assert_eq!(parse(r#""\u12g4""#), Err(ParseError::Syntax));
+    assert_eq!(parse(r#""\u12""#), Err(ParseError::Syntax));
+
+    let cast = |t: &str, lit: &str| match plan_ok(&format!("SELECT '{lit}'::{t}::text")) {
+        Statement::SelectConstant(sc) => match &sc.columns[0].1 {
+            ConstCol::Value(Bson::String(s)) => s.clone(),
+            other => panic!("{lit} -> {other:?}"),
+        },
+        other => panic!("wrong statement for {lit}: {other:?}"),
+    };
+    assert_eq!(cast("jsonb", r#""\ud83d\ude00""#), "\"\u{1F600}\"");
+    assert_eq!(cast("json", r#""\ud83d""#), r#""\ud83d""#);
+    assert_eq!(cast("json", r#""\u0000""#), r#""\u0000""#);
+    let err = plan(r#"SELECT '"\ud83d"'::jsonb"#, &lookup).unwrap_err();
+    assert_eq!(err.sqlstate(), "22P02");
+    assert_eq!(err.to_string(), "invalid input syntax for type json");
+    let err = plan(r#"SELECT '"\u0000"'::jsonb"#, &lookup).unwrap_err();
+    assert_eq!(err.sqlstate(), "22P05");
+    assert_eq!(err.to_string(), "unsupported Unicode escape sequence");
 }
 
 /// The scalar built-ins, every case measured against PostgreSQL 14.

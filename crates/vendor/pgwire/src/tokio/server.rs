@@ -284,7 +284,16 @@ where
                                 // If the copy was initiated from a simple protocol
                                 // query, notify the client that we are not ready
                                 // for the next query.
-                                send_ready_for_query(socket, TransactionStatus::Idle).await?
+                                //
+                                // SecantusDB patch: the status is the one the
+                                // connection already carries, not a hard-wired
+                                // `Idle`. A COPY inside an open transaction
+                                // used to answer `I`, so psycopg believed the
+                                // transaction had ended, and its `rollback()`
+                                // -- which sends nothing when it believes the
+                                // connection is idle -- silently kept the rows.
+                                let status = socket.transaction_status();
+                                send_ready_for_query(socket, status).await?
                             } else {
                                 // In the extended protocol (at least as
                                 // implemented by rust-postgres) we get a Sync

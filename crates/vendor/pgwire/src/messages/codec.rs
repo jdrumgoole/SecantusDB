@@ -58,9 +58,24 @@ pub(crate) fn get_cstring_raw(buf: &mut BytesMut) -> Option<Bytes> {
 /// Put null-termianted string
 ///
 /// You can put empty string by giving `""` as input.
+///
+/// SecantusDB patch: the string is written up to its first NUL, as a C
+/// string is. A NUL inside (an error message quoting a binary parameter that
+/// was read as text) used to be written verbatim, and the receiver -- which
+/// reads C strings -- then found bytes left over after the message's fields
+/// and dropped the connection with "message contents do not agree with
+/// length in message type E".
 pub(crate) fn put_cstring(buf: &mut BytesMut, input: &str) {
-    buf.put_slice(input.as_bytes());
+    buf.put_slice(&input.as_bytes()[..cstring_body_len(input)]);
     buf.put_u8(b'\0');
+}
+
+/// The number of bytes `put_cstring` writes BEFORE the terminator: the input
+/// up to its first NUL. A message's `message_length` must count a string the
+/// way `put_cstring` writes it, or the frame's length disagrees with its
+/// body. (SecantusDB local patch, with `put_cstring`.)
+pub(crate) fn cstring_body_len(input: &str) -> usize {
+    input.find('\0').unwrap_or(input.len())
 }
 
 pub(crate) fn put_option_cstring(buf: &mut BytesMut, input: &Option<String>) {
@@ -134,8 +149,26 @@ pub(crate) fn option_string_len(s: &Option<String>) -> usize {
 
 #[cfg(test)]
 mod test {
-    use super::get_cstring;
+    use super::{cstring_body_len, get_cstring, put_cstring};
     use bytes::{BufMut, BytesMut};
+
+    #[test]
+    fn put_cstring_stops_at_the_first_nul() {
+        // A C string ends at its first NUL; bytes after it would be read by
+        // the receiver as the NEXT field and break the message's length.
+        let mut buf = BytesMut::new();
+        put_cstring(&mut buf, "abc\0def");
+        assert_eq!(&buf[..], b"abc\0");
+        let mut buf = BytesMut::new();
+        put_cstring(&mut buf, "");
+        assert_eq!(&buf[..], b"\0");
+        let mut buf = BytesMut::new();
+        put_cstring(&mut buf, "plain");
+        assert_eq!(&buf[..], b"plain\0");
+        assert_eq!(cstring_body_len("abc\0def"), 3);
+        assert_eq!(cstring_body_len(""), 0);
+        assert_eq!(cstring_body_len("plain"), 5);
+    }
 
     #[test]
     fn get_cstring_valid() {
