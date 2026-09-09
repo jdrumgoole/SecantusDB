@@ -2563,8 +2563,24 @@ fn create_table_records_not_null_check_and_foreign_key_constraints() {
     assert_eq!(
         fks,
         vec![
-            ("nm_t_z_fkey", vec!["z".to_string()], "t", vec![], Some("CASCADE"), false, false),
-            ("fkw", vec!["w".to_string()], "t", vec!["id".to_string()], None, true, true),
+            (
+                "nm_t_z_fkey",
+                vec!["z".to_string()],
+                "t",
+                vec![],
+                Some("CASCADE"),
+                false,
+                false
+            ),
+            (
+                "fkw",
+                vec!["w".to_string()],
+                "t",
+                vec!["id".to_string()],
+                None,
+                true,
+                true
+            ),
         ]
     );
 }
@@ -2581,8 +2597,11 @@ fn create_table_self_referencing_foreign_key_resolves_to_the_pk() {
     assert_eq!(fk.name, "selfref_y_fkey");
     assert_eq!(fk.ref_columns, vec!["x".to_string()]);
     assert!(fk.deferrable && fk.initially_deferred);
-    let err = plan("create table s2 (x int primary key, u int, y int references s2 (u))", &lookup)
-        .unwrap_err();
+    let err = plan(
+        "create table s2 (x int primary key, u int, y int references s2 (u))",
+        &lookup,
+    )
+    .unwrap_err();
     assert_eq!(err.sqlstate(), "42830");
     assert_eq!(
         err.to_string(),
@@ -2606,8 +2625,14 @@ fn check_expression_evaluates_false_true_and_null() {
         d.insert("n", n);
         d
     };
-    assert_eq!(apply_row_expr(&expr, &row(Bson::Int32(1))).unwrap(), Bson::Boolean(true));
-    assert_eq!(apply_row_expr(&expr, &row(Bson::Int32(0))).unwrap(), Bson::Boolean(false));
+    assert_eq!(
+        apply_row_expr(&expr, &row(Bson::Int32(1))).unwrap(),
+        Bson::Boolean(true)
+    );
+    assert_eq!(
+        apply_row_expr(&expr, &row(Bson::Int32(0))).unwrap(),
+        Bson::Boolean(false)
+    );
     assert_eq!(apply_row_expr(&expr, &row(Bson::Null)).unwrap(), Bson::Null);
 }
 
@@ -2632,7 +2657,10 @@ fn insert_with_untyped_parameters_takes_the_column_types() {
 #[test]
 fn max_param_number_sees_the_values_of_an_insert() {
     assert_eq!(max_param_number("insert into t values ($1, $2)"), 2);
-    assert_eq!(max_param_number("insert into t values ($1, $2) returning id"), 2);
+    assert_eq!(
+        max_param_number("insert into t values ($1, $2) returning id"),
+        2
+    );
     assert_eq!(max_param_number("insert into t (id) select $3"), 3);
     assert_eq!(max_param_number("update t set n = $2 where id = $1"), 2);
     assert_eq!(max_param_number("select '$9' -- $8"), 0);

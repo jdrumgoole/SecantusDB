@@ -6912,18 +6912,16 @@ def test_a_pipeline_error_rolls_back_the_statements_before_it(home: Path) -> Non
 
     with _Server(home) as server, server.connect() as conn:
         conn.execute("create table pipe (n int primary key)")
-        with pytest.raises(psycopg.errors.DivisionByZero):
-            with conn.pipeline():
-                conn.execute("insert into pipe values (1)")
-                conn.execute("select 1/0")
-                conn.execute("insert into pipe values (2)")
+        with pytest.raises(psycopg.errors.DivisionByZero), conn.pipeline():
+            conn.execute("insert into pipe values (1)")
+            conn.execute("select 1/0")
+            conn.execute("insert into pipe values (2)")
         assert conn.info.transaction_status == TransactionStatus.IDLE
         conn.execute("insert into pipe values (3)")
         assert conn.execute("select n from pipe order by n").fetchall() == [(3,)]
         # The group is NOT a transaction block.
-        with pytest.raises(psycopg.errors.NoActiveSqlTransaction):
-            with conn.pipeline():
-                conn.execute("declare c cursor for select 1")
+        with pytest.raises(psycopg.errors.NoActiveSqlTransaction), conn.pipeline():
+            conn.execute("declare c cursor for select 1")
         # Unless a BEGIN inside it makes it one: the status after the Sync
         # is INTRANS, and the rows wait for the COMMIT.
         with conn.pipeline():
@@ -6962,3 +6960,115 @@ def test_an_insert_prepared_without_parameter_types_takes_the_column_types(
         assert conn.execute("select * from typed").fetchall() == [
             (7, "seven", dt.datetime(2024, 1, 2, 3, 4, 5))
         ]
+
+
+def test_a_cancel_request_interrupts_the_running_statement(home: Path) -> None:
+    """`conn.cancel_safe()` opens a second connection carrying the backend's
+    pid and secret key; the server matches it against the backend it
+    handed out at startup and interrupts the statement with `57014`. The
+    connection then goes back to IDLE and keeps working. While the sleep
+    runs, `pg_stat_activity` shows it as the backend's active query -- and
+    the cancel connection is served DURING the sleep, which needs the
+    synchronous statement to run off the async runtime's I/O thread.
+    PostgreSQL 16.
+    """
+    import threading
+
+    from psycopg.pq import TransactionStatus
+
+    with _Server(home) as server, server.connect() as conn, server.connect() as other:
+        pid = conn.info.backend_pid
+        seen: list[tuple] = []
+
+        def cancel_after_activity() -> None:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                rows = other.execute(
+                    "select state, query, backend_type from pg_stat_activity where pid = %s",
+                    (pid,),
+                ).fetchall()
+                if rows and rows[0][0] == "active":
+                    seen.extend(rows)
+                    break
+                time.sleep(0.02)
+            conn.cancel_safe()
+
+        t = threading.Thread(target=cancel_after_activity)
+        t.start()
+        with pytest.raises(psycopg.errors.QueryCanceled) as info:
+            conn.execute("select pg_sleep(30)")
+        t.join()
+        assert _diag(info.value) == (
+            "57014",
+            "canceling statement due to user request",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        assert info.value.diag.severity == "ERROR"
+        assert seen == [("active", "select pg_sleep(30)", "client backend")]
+        assert conn.info.transaction_status == TransactionStatus.IDLE
+        assert conn.execute("select 1").fetchone() == (1,)
+        assert other.execute(
+            "select state from pg_stat_activity where pid = %s", (pid,)
+        ).fetchone() == ("idle",)
+
+
+def test_idle_timeouts_end_the_session_with_a_fatal_error(home: Path) -> None:
+    """`idle_in_transaction_session_timeout` fires while a block is open
+    (aborted or not) and `idle_session_timeout` while none is; each sends a
+    FATAL error and closes the connection, which the client sees on its next
+    round trip. Neither fires in the other state, `0` disables them, and
+    the values are validated and rendered like PostgreSQL's (`60000` shows
+    as `1min`). PostgreSQL 16.
+    """
+    with _Server(home) as server:
+        with server.connect(autocommit=False) as conn:
+            conn.execute("set session idle_in_transaction_session_timeout = 150")
+            assert conn.execute("show idle_in_transaction_session_timeout").fetchone() == ("150ms",)
+            time.sleep(0.5)
+            with pytest.raises(psycopg.errors.IdleInTransactionSessionTimeout) as info:
+                conn.execute("select 1")
+            assert info.value.diag.severity == "FATAL"
+            assert _diag(info.value)[:2] == (
+                "25P03",
+                "terminating connection due to idle-in-transaction timeout",
+            )
+            assert conn.closed and conn.broken
+        with server.connect(autocommit=False) as conn:
+            conn.execute("set idle_in_transaction_session_timeout = '150ms'")
+            conn.commit()
+            with pytest.raises(psycopg.errors.DivisionByZero):
+                conn.execute("select 1/0")
+            time.sleep(0.5)
+            with pytest.raises(psycopg.errors.IdleInTransactionSessionTimeout):
+                conn.execute("select 1")
+        with server.connect() as conn:
+            conn.execute("set idle_in_transaction_session_timeout = 100")
+            time.sleep(0.3)
+            assert conn.execute("select 1").fetchone() == (1,)
+            conn.execute("set idle_session_timeout = 60000")
+            assert conn.execute("show idle_session_timeout").fetchone() == ("1min",)
+            for value, message in [
+                ("'abc'", 'invalid value for parameter "idle_session_timeout": "abc"'),
+                (
+                    "-1",
+                    '-1 ms is outside the valid range for parameter "idle_session_timeout" '
+                    "(0 .. 2147483647)",
+                ),
+            ]:
+                with pytest.raises(psycopg.errors.InvalidParameterValue) as info:
+                    conn.execute(f"set idle_session_timeout = {value}")
+                assert info.value.diag.message_primary == message
+            conn.execute("set idle_session_timeout = 200")
+            time.sleep(0.5)
+            with pytest.raises(psycopg.errors.IdleSessionTimeout) as info:
+                conn.execute("select 1")
+            assert info.value.diag.severity == "FATAL"
+            assert _diag(info.value)[:2] == (
+                "57P05",
+                "terminating connection due to idle-session timeout",
+            )
+            assert conn.closed

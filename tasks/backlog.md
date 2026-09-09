@@ -570,13 +570,29 @@ A FATAL over the simple query protocol now closes the socket without a trailing
 `test_context_inerror_rollback_no_clobber`, `test_auto_transaction_fail`. Six
 remain open:
 
-- [ ] **OPEN — RUST pgserver: `test_cancel_safe_error` / `test_cancel_safe_timeout`
-      need real query cancellation.** These drive `conn.cancel_safe()` through a
-      `pproxy` man-in-the-middle (also not installed) and expect the
-      CancelRequest backend protocol. The server assigns a secret key at startup
-      (pgwire) but does not act on a CancelRequest. Sized as a protocol slice
-      (wire the pgwire CancellationManager to interrupt an in-flight query),
-      deferred from this batch. Marked `slow`/`timing`.
+- [ ] **OPEN — RUST pgserver: `test_generators.py::test_cancel` hangs on macOS
+      in a libpq CLIENT race, and `test_cancel_safe_error` /
+      `test_cancel_safe_timeout` need the `pproxy` package (2026-09-09).**
+      CancelRequest itself SHIPPED that day: the backend registry matches the
+      pid / secret key, sets a per-backend flag polled by `pg_sleep`, row scans
+      and the COPY OUT stream, the statement answers `57014`, and the
+      synchronous execution runs under `tokio::task::block_in_place` so the
+      cancel connection is served DURING the statement (before that the
+      runtime's I/O driver was never polled while a statement ran, so every
+      other connection stalled too). `test_copy_out_error_with_copy_not_finished`
+      passes. `test_cancel` still hangs, and it is not the server: psycopg's
+      `waiting.wait_conn(gen, interval=0.0)` drives `PQcancelPoll` before the
+      non-blocking loopback `connect()` has completed; on macOS libpq reads
+      `SO_ERROR == 0` mid-connect, goes STARTED→MADE, `send()`s the SSLRequest
+      and gets `ENOTCONN`, swallows it (`connection to server at "127.0.0.1",
+      port N failed: ` with an empty reason), and waits in `SSL_STARTUP` for
+      an `N` that can never arrive. Instrumented pgwire showed the server
+      never received a byte on that socket. The same test lost 9 of 10 rounds
+      against NATIVE PostgreSQL 16 over TCP on this box, so it is a client
+      timing race (Linux loopback connect is synchronous, which is why psycopg
+      CI never sees it). The `cancel_safe_*` pair import `pproxy`
+      (`tests/fix_proxy.py`), which the venv does not carry. Nothing to do
+      server-side; count the three as harness failures on macOS.
 - [ ] **OPEN — RUST pgserver: `test_connect_bad` — connecting with a nonexistent
       database is accepted, not rejected with `3D000`.** The server hardcodes the
       `postgres` namespace (`PgHandler::new(storage, "postgres")`) and ignores the
@@ -680,11 +696,6 @@ remain open:
       plans as a plain column — a second equal value inserts where PG 16
       answers `23505` — and `pg_constraint` queries answer `42P01`. Multi-
       column FOREIGN KEYs and `ON DELETE SET DEFAULT` are refused `0A000`.
-- [ ] **OPEN — RUST pgserver: `test_right_exception_on_session_timeout` needs
-      `idle_in_transaction_session_timeout`.** Expects an idle transaction to be
-      killed with `25P03` (`IdleInTransactionSessionTimeout`) after the GUC's
-      window. The GUC is accepted but not enforced (no idle timer). Deferred —
-      needs a per-connection idle timer wired to the accept loop.
 
 **Rust server errors where Python defers — MEASURED 2026-08-26, and the five
 entries describing it are largely stale.** A three-way probe of 45
@@ -2363,10 +2374,6 @@ These are explicit non-goals. Don't add them without a reason.
     statement (psycopg never does this — it re-prepares).
   - `information_schema.columns` for a catalog VIEW (`where table_name =
     'pg_prepared_statements'`) is `relation "columns" does not exist`.
-  - `test_copy_out_error_with_copy_not_finished`: after a COPY OUT is
-    abandoned mid-stream psycopg sends CancelRequest and drains; PG ends the
-    transaction `INERROR` (57014), ours stays `INTRANS` — the CancelRequest
-    item below.
 
 - [ ] **OPEN — RUST pgserver `DROP SCHEMA ... CASCADE` drops only the schema
   record (measured 2026-09-09).** Types created in the schema (range, enum,

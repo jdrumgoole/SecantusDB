@@ -23,7 +23,19 @@ refused at CREATE (`42703`, `42830`).
 - `secantus-pgcatalog`: `TableDef` carries `temp`, `check_constraints` and
   `foreign_keys` in the Python server's document shape.
 
+- Rust PostgreSQL server: `CancelRequest` interrupts the running statement
+  (`57014 canceling statement due to user request`, connection left idle);
+  `pg_stat_activity` shows each backend's state and running query; and
+  `idle_in_transaction_session_timeout` / `idle_session_timeout` are
+  validated, rendered (`60000` shows as `1min`) and enforced — the session
+  ends with FATAL `25P03` / `57P05` and the connection closes, as on
+  PostgreSQL 16.
+
 #### Fixed
+
+- Rust PostgreSQL server: a long statement no longer stalls every other
+  connection — execution runs off the async runtime's I/O thread, so a
+  cancel request (or any other client) is served while `pg_sleep` runs.
 
 - Rust PostgreSQL server: every extended-protocol statement between two
   `Sync`s runs in one transaction that the `Sync` commits, as on PostgreSQL —

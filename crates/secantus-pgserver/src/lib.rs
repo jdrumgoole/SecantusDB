@@ -50,17 +50,97 @@ use secantus_pgplan::{
 };
 use secantus_storage::{Storage, UserTransactionHandle};
 
-/// Process-wide map of every live backend's PID to its "please terminate"
-/// flag.
+/// One live backend as the OTHER backends -- and a `CancelRequest` -- see it.
 ///
-/// `pg_terminate_backend(pid)` on ANOTHER connection sets that connection's
-/// flag; the target notices at the top of its next statement and ends with a
-/// `57P01`, exactly as a real backend torn down by an administrator would.
-/// One handler per connection registers here at startup and deregisters on
-/// drop, so a stale PID is never signalled.
-fn backend_registry() -> &'static Mutex<HashMap<i32, Arc<AtomicBool>>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<i32, Arc<AtomicBool>>>> = OnceLock::new();
+/// `pg_terminate_backend(pid)` on another connection sets `terminate`; the
+/// target notices at the top of its next statement and ends with a `57P01`,
+/// exactly as a real backend torn down by an administrator would. A
+/// `CancelRequest` carrying this backend's PID and secret sets `cancel`; the
+/// running statement's cancellation points (`pg_sleep`, the row scan, the
+/// COPY OUT stream) notice it and answer `57014`. `activity` is the row
+/// `pg_stat_activity` shows for this backend.
+pub struct BackendEntry {
+    /// The `BackendKeyData` secret, set once startup has assigned it. A
+    /// `CancelRequest` with the wrong secret is ignored, as PostgreSQL's is.
+    secret: OnceLock<Bytes>,
+    terminate: AtomicBool,
+    cancel: AtomicBool,
+    /// A result streamed AFTER its statement answered (COPY OUT) failed --
+    /// a cancel mid-stream. The next statement sees it and poisons the block
+    /// the way the failed statement itself would have.
+    stream_failed: AtomicBool,
+    activity: Mutex<BackendActivity>,
+}
+
+/// What `pg_stat_activity` reports for one backend.
+#[derive(Clone)]
+struct BackendActivity {
+    datname: String,
+    usename: String,
+    application_name: String,
+    backend_start: bson::DateTime,
+    query_start: Option<bson::DateTime>,
+    state_change: Option<bson::DateTime>,
+    /// `active`, `idle`, `idle in transaction`, `idle in transaction (aborted)`.
+    state: &'static str,
+    query: String,
+}
+
+impl BackendEntry {
+    fn new(datname: &str) -> Self {
+        Self {
+            secret: OnceLock::new(),
+            terminate: AtomicBool::new(false),
+            cancel: AtomicBool::new(false),
+            stream_failed: AtomicBool::new(false),
+            activity: Mutex::new(BackendActivity {
+                datname: datname.to_string(),
+                usename: String::new(),
+                application_name: String::new(),
+                backend_start: bson::DateTime::now(),
+                query_start: None,
+                state_change: None,
+                state: "idle",
+                query: String::new(),
+            }),
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Process-wide map of every live backend's PID to its entry. One handler
+/// per connection registers here at startup and deregisters on drop, so a
+/// stale PID is never signalled.
+fn backend_registry() -> &'static Mutex<HashMap<i32, Arc<BackendEntry>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<i32, Arc<BackendEntry>>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The `CancelRequest` handler: a cancel connection names a `(pid, secret)`,
+/// and the matching live backend's `cancel` flag is raised. An unknown PID
+/// or a wrong secret is silently ignored, as PostgreSQL ignores it -- the
+/// cancel connection gets no answer either way.
+pub struct CancelBackend;
+
+#[async_trait]
+impl pgwire::api::cancel::CancelHandler for CancelBackend {
+    async fn on_cancel_request(&self, request: pgwire::messages::cancel::CancelRequest) {
+        let entry = backend_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&request.pid)
+            .cloned();
+        if let Some(entry) = entry {
+            if entry.secret.get() == Some(&request.secret_key.to_bytes()) {
+                entry
+                    .cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 /// A composite type's fields: `(field name, field type name)`, in order.
@@ -194,10 +274,10 @@ pub struct PgHandler {
     /// PostgreSQL reports the real role; a fixed name was a wrong answer for
     /// every client not connecting as that name.
     session_user: Mutex<String>,
-    /// This connection's entry in [`backend_registry`]: another backend's
-    /// `pg_terminate_backend` sets it, and `run_typed` checks it before every
-    /// statement so the connection ends with a `57P01`.
-    terminate: Arc<AtomicBool>,
+    /// This connection's entry in [`backend_registry`]: what another
+    /// backend's `pg_terminate_backend`, a `CancelRequest`, and every
+    /// `pg_stat_activity` read see of it.
+    backend: Arc<BackendEntry>,
     /// `(table, constraint name)` of every INITIALLY DEFERRED foreign key a
     /// write in the open transaction touched; re-checked at COMMIT.
     deferred_fks: Mutex<Vec<(String, String)>>,
@@ -321,7 +401,7 @@ impl PgHandler {
             cursor_capture: std::sync::Arc::new(Mutex::new(None)),
             backend_pid: AtomicI32::new(0),
             session_user: Mutex::new(String::new()),
-            terminate: Arc::new(AtomicBool::new(false)),
+            backend: Arc::new(BackendEntry::new(db)),
             deferred_fks: Mutex::new(Vec::new()),
             commit_failed: AtomicBool::new(false),
             implicit_extended: AtomicBool::new(false),
@@ -1750,6 +1830,36 @@ impl PgHandler {
             // name = ...`) to check a cursor exists before closing one it did
             // not declare, and the suite queries it directly to prove a cursor
             // is gone after close.
+            // Every live backend of this server, PostgreSQL 16's column set
+            // in its order; the columns a single-node server has no value
+            // for (client address, wait events, xids, query_id) are NULL.
+            "pg_stat_activity" => Some(TableDef::new(
+                "pg_stat_activity",
+                vec![
+                    secantus_pgcatalog::Column::new("datid", "oid", false),
+                    secantus_pgcatalog::Column::new("datname", "name", false),
+                    secantus_pgcatalog::Column::new("pid", "int4", false),
+                    secantus_pgcatalog::Column::new("leader_pid", "int4", false),
+                    secantus_pgcatalog::Column::new("usesysid", "oid", false),
+                    secantus_pgcatalog::Column::new("usename", "name", false),
+                    secantus_pgcatalog::Column::new("application_name", "text", false),
+                    secantus_pgcatalog::Column::new("client_addr", "inet", false),
+                    secantus_pgcatalog::Column::new("client_hostname", "text", false),
+                    secantus_pgcatalog::Column::new("client_port", "int4", false),
+                    secantus_pgcatalog::Column::new("backend_start", "timestamptz", false),
+                    secantus_pgcatalog::Column::new("xact_start", "timestamptz", false),
+                    secantus_pgcatalog::Column::new("query_start", "timestamptz", false),
+                    secantus_pgcatalog::Column::new("state_change", "timestamptz", false),
+                    secantus_pgcatalog::Column::new("wait_event_type", "text", false),
+                    secantus_pgcatalog::Column::new("wait_event", "text", false),
+                    secantus_pgcatalog::Column::new("state", "text", false),
+                    secantus_pgcatalog::Column::new("backend_xid", "xid", false),
+                    secantus_pgcatalog::Column::new("backend_xmin", "xid", false),
+                    secantus_pgcatalog::Column::new("query_id", "int8", false),
+                    secantus_pgcatalog::Column::new("query", "text", false),
+                    secantus_pgcatalog::Column::new("backend_type", "text", false),
+                ],
+            )),
             "pg_cursors" => Some(TableDef::new(
                 "pg_cursors",
                 vec![
@@ -2011,6 +2121,48 @@ impl PgHandler {
                     .collect()
             }
             // One row per open cursor on this connection.
+            "pg_stat_activity" => {
+                let backends: Vec<(i32, BackendActivity)> = backend_registry()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .map(|(pid, entry)| {
+                        let activity = entry.activity.lock().unwrap_or_else(|e| e.into_inner());
+                        (*pid, activity.clone())
+                    })
+                    .collect();
+                let field = |name: &str| def.field_of(name).expect("column");
+                let opt_time = |t: Option<bson::DateTime>| t.map_or(Bson::Null, Bson::DateTime);
+                backends
+                    .into_iter()
+                    .map(|(pid, a)| {
+                        let mut d = Document::new();
+                        d.insert(field("datid"), Bson::Int64(0));
+                        d.insert(field("datname"), a.datname);
+                        d.insert(field("pid"), Bson::Int32(pid));
+                        d.insert(field("leader_pid"), Bson::Null);
+                        d.insert(field("usesysid"), Bson::Int64(10));
+                        d.insert(field("usename"), a.usename);
+                        d.insert(field("application_name"), a.application_name);
+                        d.insert(field("client_addr"), Bson::Null);
+                        d.insert(field("client_hostname"), Bson::Null);
+                        d.insert(field("client_port"), Bson::Null);
+                        d.insert(field("backend_start"), Bson::DateTime(a.backend_start));
+                        d.insert(field("xact_start"), Bson::Null);
+                        d.insert(field("query_start"), opt_time(a.query_start));
+                        d.insert(field("state_change"), opt_time(a.state_change));
+                        d.insert(field("wait_event_type"), Bson::Null);
+                        d.insert(field("wait_event"), Bson::Null);
+                        d.insert(field("state"), a.state);
+                        d.insert(field("backend_xid"), Bson::Null);
+                        d.insert(field("backend_xmin"), Bson::Null);
+                        d.insert(field("query_id"), Bson::Null);
+                        d.insert(field("query"), a.query);
+                        d.insert(field("backend_type"), "client backend");
+                        d
+                    })
+                    .collect()
+            }
             "pg_cursors" => {
                 let cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
                 cursors
@@ -2238,6 +2390,103 @@ fn canonical_setting(name: &str) -> String {
     }
 }
 
+/// The two session-idle GUCs this server enforces (PostgreSQL 16 semantics:
+/// milliseconds, `0` disables), with the FATAL error each one ends the
+/// connection with.
+const IDLE_TIMEOUT_GUCS: [(&str, &str, &str); 2] = [
+    (
+        "idle_in_transaction_session_timeout",
+        "25P03",
+        "terminating connection due to idle-in-transaction timeout",
+    ),
+    (
+        "idle_session_timeout",
+        "57P05",
+        "terminating connection due to idle-session timeout",
+    ),
+];
+
+/// Parse a millisecond GUC the way PostgreSQL does: a number (integer, or a
+/// float such as `1.5s` / `1e3`) with an optional unit (`us`, `ms`, `s`,
+/// `min`, `h`, `d`), whitespace allowed between the two, rounded to the
+/// nearest millisecond. `None` when the text is not a duration at all.
+fn parse_ms_guc(text: &str) -> Option<i64> {
+    let text = text.trim();
+    // The unit starts at a letter -- but so does the exponent of `1e3`, so
+    // try every letter as the split and take the first that parses.
+    let splits = text
+        .char_indices()
+        .filter(|(_, c)| c.is_ascii_alphabetic())
+        .map(|(i, _)| i)
+        .chain(std::iter::once(text.len()));
+    for at in splits {
+        let (number, unit) = text.split_at(at);
+        let factor: f64 = match unit.trim() {
+            "" | "ms" => 1.0,
+            "us" => 0.001,
+            "s" => 1_000.0,
+            "min" => 60_000.0,
+            "h" => 3_600_000.0,
+            "d" => 86_400_000.0,
+            _ => continue,
+        };
+        let number = number.trim();
+        if let Ok(n) = number.parse::<i64>() {
+            return if factor >= 1.0 {
+                n.checked_mul(factor as i64)
+            } else {
+                Some((n as f64 * factor).round_ties_even() as i64)
+            };
+        }
+        if let Ok(f) = number.parse::<f64>() {
+            let ms = (f * factor).round_ties_even();
+            return ms.is_finite().then_some(ms as i64);
+        }
+    }
+    None
+}
+
+/// Render a millisecond GUC as `SHOW` does: the largest unit that divides
+/// the value evenly (`1500` -> `1500ms`, `60000` -> `1min`), and a bare `0`.
+fn render_ms_guc(ms: i64) -> String {
+    if ms == 0 {
+        return "0".to_string();
+    }
+    for (unit, factor) in [
+        ("d", 86_400_000),
+        ("h", 3_600_000),
+        ("min", 60_000),
+        ("s", 1_000),
+    ] {
+        if ms % factor == 0 {
+            return format!("{}{unit}", ms / factor);
+        }
+    }
+    format!("{ms}ms")
+}
+
+/// Validate and canonicalise a `SET <ms-guc>` value, answering PostgreSQL's
+/// two `22023` refusals: text that is not a duration (or exceeds the integer
+/// range) is an invalid value, and a negative one is out of range.
+fn canonical_ms_guc(name: &str, value: &str) -> PgWireResult<String> {
+    let invalid = |msg: String| {
+        PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".into(),
+            "22023".into(),
+            msg,
+        )))
+    };
+    match parse_ms_guc(value) {
+        Some(ms) if ms < 0 => Err(invalid(format!(
+            "{ms} ms is outside the valid range for parameter \"{name}\" (0 .. 2147483647)"
+        ))),
+        Some(ms) if ms <= i32::MAX as i64 => Ok(render_ms_guc(ms)),
+        _ => Err(invalid(format!(
+            "invalid value for parameter \"{name}\": \"{value}\""
+        ))),
+    }
+}
+
 /// The settings a fresh connection starts with, matching what a client expects
 /// to read back before it has set anything.
 fn default_settings() -> HashMap<String, String> {
@@ -2260,6 +2509,8 @@ fn default_settings() -> HashMap<String, String> {
         ("default_transaction_read_only", "off"),
         ("default_transaction_deferrable", "off"),
         ("search_path", "\"$user\", public"),
+        ("idle_in_transaction_session_timeout", "0"),
+        ("idle_session_timeout", "0"),
         ("application_name", ""),
         ("server_encoding", "UTF8"),
         ("server_version", "15.0"),
@@ -2502,13 +2753,27 @@ impl NoopStartupHandler for PgHandler {
         // pgwire has assigned and already sent the BackendKeyData PID by now;
         // record it so `pg_backend_pid()` / `pg_terminate_backend()` can see
         // it, and register this connection so another backend can terminate it.
-        let (pid, _) = _c.pid_and_secret_key();
+        let (pid, secret) = _c.pid_and_secret_key();
         self.backend_pid
             .store(pid, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.backend.secret.set(secret.to_bytes());
+        {
+            let mut activity = self
+                .backend
+                .activity
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            activity.usename = _c.metadata().get("user").cloned().unwrap_or_default();
+            activity.application_name = _c
+                .metadata()
+                .get("application_name")
+                .cloned()
+                .unwrap_or_default();
+        }
         backend_registry()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(pid, self.terminate.clone());
+            .insert(pid, self.backend.clone());
         if let Some(user) = _c.metadata().get("user") {
             *self.session_user.lock().unwrap_or_else(|e| e.into_inner()) = user.clone();
         }
@@ -3458,10 +3723,113 @@ impl PgHandler {
         // notices at its next statement -- COMMIT and ROLLBACK included, since
         // a terminated backend cannot honour them either -- and ends with a
         // FATAL 57P01 that closes the socket.
-        if self.terminate.load(std::sync::atomic::Ordering::Relaxed) {
+        if self
+            .backend
+            .terminate
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return Err(Self::admin_shutdown());
         }
+        // A cancel that arrived while this backend was idle is dropped, as
+        // PostgreSQL drops one: it targets the statement that is running,
+        // and none was.
+        self.backend
+            .cancel
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        // A COPY OUT cancelled mid-stream failed after its statement had
+        // answered; the block is poisoned from here, as it is on PostgreSQL.
+        if self
+            .backend
+            .stream_failed
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            self.note_failure();
+        }
+        self.note_activity("active", Some(query));
+        let result = self
+            .run_typed_inner(query, params, param_types, max_rows)
+            .await;
+        self.note_activity(
+            if self
+                .in_transaction
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                if self.txn_failed.load(std::sync::atomic::Ordering::Relaxed) || result.is_err() {
+                    "idle in transaction (aborted)"
+                } else {
+                    "idle in transaction"
+                }
+            } else {
+                "idle"
+            },
+            None,
+        );
+        result
+    }
 
+    /// Record what `pg_stat_activity` shows for this backend: the state, and
+    /// -- at a statement's start -- its text and `query_start`.
+    fn note_activity(&self, state: &'static str, query: Option<&str>) {
+        let mut activity = self
+            .backend
+            .activity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let now = bson::DateTime::now();
+        activity.state = state;
+        activity.state_change = Some(now);
+        if let Some(query) = query {
+            activity.query = query.to_string();
+            activity.query_start = Some(now);
+        }
+    }
+
+    /// The deadline for the next wait for a frontend message, per PostgreSQL's
+    /// idle timeouts: `idle_in_transaction_session_timeout` applies while a
+    /// transaction block is open (aborted or not), `idle_session_timeout`
+    /// otherwise; `0` (the default) disables each. The wire loop sends the
+    /// FATAL error and closes the connection when the deadline passes.
+    pub fn idle_timeout(&self) -> Option<(std::time::Duration, ErrorInfo)> {
+        let in_txn = self
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let (guc, code, message) = IDLE_TIMEOUT_GUCS[if in_txn { 0 } else { 1 }];
+        let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+        let ms = settings.get(guc).and_then(|v| parse_ms_guc(v)).unwrap_or(0);
+        if ms <= 0 {
+            return None;
+        }
+        Some((
+            std::time::Duration::from_millis(ms as u64),
+            ErrorInfo::new("FATAL".into(), code.into(), message.into()),
+        ))
+    }
+
+    /// PostgreSQL's answer to a statement interrupted by a `CancelRequest`.
+    fn query_canceled() -> PgWireError {
+        PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".into(),
+            "57014".into(), // query_canceled
+            "canceling statement due to user request".into(),
+        )))
+    }
+
+    /// A cancellation point: `57014` if a `CancelRequest` for this backend
+    /// has arrived since the running statement started.
+    fn check_cancel(&self) -> PgWireResult<()> {
+        if self.backend.cancelled() {
+            return Err(Self::query_canceled());
+        }
+        Ok(())
+    }
+
+    async fn run_typed_inner(
+        &self,
+        query: &str,
+        params: &[Bson],
+        param_types: &[Option<String>],
+        max_rows: usize,
+    ) -> PgWireResult<Vec<Response>> {
         let sql = query.trim().trim_end_matches(';').trim();
         if sql.is_empty() {
             return Ok(vec![Response::EmptyQuery]);
@@ -3634,15 +4002,21 @@ impl PgHandler {
 
         // Everything else runs INSIDE the open transaction when there is one,
         // so a later ROLLBACK really discards it.
+        //
+        // The statement runs synchronously, so it runs under
+        // `block_in_place`: a worker that blocks in a long statement
+        // (`pg_sleep`, a big scan) would otherwise take the runtime's I/O
+        // driver down with it — no other connection is served, and the
+        // `CancelRequest` meant to interrupt the statement never arrives.
         let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
-        let out = match guard.as_mut() {
+        let out = tokio::task::block_in_place(|| match guard.as_mut() {
             Some(handle) => self
                 .storage
                 .with_user_transaction(handle, || self.execute(stmt, max_rows))
                 .map_err(|e| Self::storage_err("transaction failed", e))
                 .and_then(|r| r),
             None => self.execute(stmt, max_rows),
-        };
+        });
         if out.is_err() {
             self.note_failure();
         }
@@ -3755,7 +4129,18 @@ impl PgHandler {
                     _ => 0.0,
                 };
                 if secs > 0.0 && secs.is_finite() {
-                    std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+                    // In slices, so a `CancelRequest` interrupts the sleep:
+                    // `pg_sleep` is the statement every cancel test cancels.
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs_f64(secs);
+                    loop {
+                        self.check_cancel()?;
+                        let left = deadline.saturating_duration_since(std::time::Instant::now());
+                        if left.is_zero() {
+                            break;
+                        }
+                        std::thread::sleep(left.min(std::time::Duration::from_millis(5)));
+                    }
                 }
                 Ok(Bson::String(String::new()))
             }
@@ -3790,7 +4175,11 @@ impl PgHandler {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .get(&target)
-                    .map(|flag| flag.store(true, std::sync::atomic::Ordering::Relaxed))
+                    .map(|entry| {
+                        entry
+                            .terminate
+                            .store(true, std::sync::atomic::Ordering::Relaxed)
+                    })
                     .is_some();
                 Ok(Bson::Boolean(armed))
             }
@@ -4113,7 +4502,8 @@ impl PgHandler {
                         self.storage
                             .rollback_user_transaction(&mut handle)
                             .map_err(|e| Self::storage_err("could not roll back", e))?;
-                        self.commit_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                        self.commit_failed
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
                         return Err(e);
                     }
                     self.storage
@@ -4385,6 +4775,9 @@ impl PgHandler {
                 (docs, def)
             }
         };
+        // A cancellation point between the scan and the sort: cooperative,
+        // like the storage layer's own `maxTimeMS` polling.
+        self.check_cancel()?;
 
         if !sel.order.is_empty() {
             sort_rows(&mut docs, &sel.order);
@@ -4612,9 +5005,9 @@ impl PgHandler {
                     if fk.ref_table == def.name {
                         continue;
                     }
-                    let target = self
-                        .lookup(&fk.ref_table)
-                        .ok_or_else(|| Self::err(&PlanError::UndefinedTable(fk.ref_table.clone())))?;
+                    let target = self.lookup(&fk.ref_table).ok_or_else(|| {
+                        Self::err(&PlanError::UndefinedTable(fk.ref_table.clone()))
+                    })?;
                     secantus_pgplan::resolve_fk_target(fk, &target).map_err(|e| Self::err(&e))?;
                 }
                 self.storage
@@ -5240,7 +5633,18 @@ impl PgHandler {
                     schema.clone()
                 };
                 let mut header_written = false;
+                let backend = self.backend.clone();
                 let data = stream::iter(rows).map(move |row| {
+                    // The rows stream out AFTER this statement has answered,
+                    // so a `CancelRequest` mid-COPY is noticed here: the
+                    // stream ends in the `57014` and the block is poisoned
+                    // for the next statement.
+                    if backend.cancelled() {
+                        backend
+                            .stream_failed
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        return Err(Self::query_canceled());
+                    }
                     // The two TEXTUAL formats are written here rather than
                     // through an encoder. Their null handling asks the value
                     // whether it is null, and an `Option` of the wrong type
@@ -5398,6 +5802,8 @@ impl PgHandler {
                     // the stored value and the reported ParameterStatus agree.
                     let value = if key == "DateStyle" {
                         secantus_pgplan::DateStyle::parse(&value).canonical()
+                    } else if IDLE_TIMEOUT_GUCS.iter().any(|(guc, _, _)| *guc == key) {
+                        canonical_ms_guc(&key, &value)?
                     } else {
                         value
                     };
@@ -5868,7 +6274,11 @@ impl PgHandler {
         }
         let found = self
             .storage
-            .find_matching(&self.db, &parent.name, &bson::doc! { ref_field: value.clone() })
+            .find_matching(
+                &self.db,
+                &parent.name,
+                &bson::doc! { ref_field: value.clone() },
+            )
             .map_err(|e| Self::storage_err("could not read", e))?;
         Ok(!found.is_empty())
     }
@@ -5878,7 +6288,11 @@ impl PgHandler {
     /// transaction is queued for COMMIT instead.
     fn check_foreign_keys(&self, def: &TableDef, rows: &[Document]) -> PgWireResult<()> {
         for fk in &def.foreign_keys {
-            if fk.initially_deferred && self.in_transaction.load(std::sync::atomic::Ordering::Relaxed) {
+            if fk.initially_deferred
+                && self
+                    .in_transaction
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 self.defer_fk(&def.name, &fk.name);
                 continue;
             }
@@ -6056,7 +6470,11 @@ impl PgHandler {
                             &[],
                         )?;
                     }
-                    _ if fk.initially_deferred && self.in_transaction.load(std::sync::atomic::Ordering::Relaxed) => {
+                    _ if fk.initially_deferred
+                        && self
+                            .in_transaction
+                            .load(std::sync::atomic::Ordering::Relaxed) =>
+                    {
                         self.defer_fk(&child.name, &fk.name);
                     }
                     _ => {
@@ -6086,9 +6504,8 @@ impl PgHandler {
     /// Re-check every deferred FOREIGN KEY over the whole referencing table,
     /// as COMMIT does. Runs inside the transaction, so it sees its writes.
     fn run_deferred_checks(&self) -> PgWireResult<()> {
-        let queued: Vec<(String, String)> = std::mem::take(
-            &mut *self.deferred_fks.lock().unwrap_or_else(|e| e.into_inner()),
-        );
+        let queued: Vec<(String, String)> =
+            std::mem::take(&mut *self.deferred_fks.lock().unwrap_or_else(|e| e.into_inner()));
         for (table, name) in queued {
             let Some(def) = self.lookup(&table) else {
                 continue;
@@ -6113,7 +6530,10 @@ impl PgHandler {
     /// already rolled back: the `ReadyForQuery` that follows the error must
     /// say IDLE, not "in a failed transaction".
     fn settle_failed_commit<C: ClientInfo>(&self, client: &mut C) {
-        if self.commit_failed.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        if self
+            .commit_failed
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
             client.set_transaction_status(pgwire::messages::response::TransactionStatus::Idle);
         }
     }
@@ -9778,6 +10198,9 @@ impl PgWireServerHandlers for HandlerFactory {
     fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
         self.0.clone()
     }
+    fn cancel_handler(&self) -> Arc<impl pgwire::api::cancel::CancelHandler> {
+        Arc::new(CancelBackend)
+    }
     fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
         self.0.clone()
     }
@@ -9786,6 +10209,9 @@ impl PgWireServerHandlers for HandlerFactory {
     }
     fn startup_handler(&self) -> Arc<impl pgwire::api::auth::StartupHandler> {
         self.0.clone()
+    }
+    fn idle_timeout(&self) -> Option<(std::time::Duration, ErrorInfo)> {
+        self.0.idle_timeout()
     }
 }
 
@@ -9886,6 +10312,68 @@ mod wire_format_tests {
         assert_eq!(
             hex(&element_binary(&Bson::String("{\"a\": 1}".into()), &Type::JSONB).unwrap()),
             "017b2261223a20317d"
+        );
+    }
+}
+
+#[cfg(test)]
+mod idle_timeout_guc_tests {
+    //! `SET idle_in_transaction_session_timeout` parsing and `SHOW` rendering,
+    //! pinned to PostgreSQL 16 (probed 2026-09-09).
+    use super::*;
+
+    #[test]
+    fn parses_units_floats_and_whitespace() {
+        assert_eq!(parse_ms_guc("250"), Some(250));
+        assert_eq!(parse_ms_guc("1min"), Some(60_000));
+        assert_eq!(parse_ms_guc("1.5s"), Some(1_500));
+        assert_eq!(parse_ms_guc("0.5min"), Some(30_000));
+        assert_eq!(parse_ms_guc("1.2345s"), Some(1_234));
+        assert_eq!(parse_ms_guc("  7  ms "), Some(7));
+        assert_eq!(parse_ms_guc("1e3"), Some(1_000));
+        assert_eq!(parse_ms_guc("100us"), Some(0));
+        assert_eq!(parse_ms_guc("abc"), None);
+        assert_eq!(parse_ms_guc("5 fortnights"), None);
+    }
+
+    #[test]
+    fn renders_like_show() {
+        assert_eq!(render_ms_guc(0), "0");
+        assert_eq!(render_ms_guc(250), "250ms");
+        assert_eq!(render_ms_guc(1_500), "1500ms");
+        assert_eq!(render_ms_guc(2_000), "2s");
+        assert_eq!(render_ms_guc(60_000), "1min");
+        assert_eq!(render_ms_guc(7_200_000), "2h");
+    }
+
+    fn refusal(value: &str) -> String {
+        match canonical_ms_guc("idle_in_transaction_session_timeout", value) {
+            Err(PgWireError::UserError(info)) => {
+                assert_eq!(info.code, "22023");
+                info.message.clone()
+            }
+            other => panic!("expected a 22023 refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refuses_what_postgres_refuses() {
+        assert_eq!(
+            refusal("abc"),
+            "invalid value for parameter \"idle_in_transaction_session_timeout\": \"abc\""
+        );
+        assert_eq!(
+            refusal("-1"),
+            "-1 ms is outside the valid range for parameter \
+             \"idle_in_transaction_session_timeout\" (0 .. 2147483647)"
+        );
+        assert_eq!(
+            refusal("2147483648"),
+            "invalid value for parameter \"idle_in_transaction_session_timeout\": \"2147483648\""
+        );
+        assert_eq!(
+            canonical_ms_guc("idle_session_timeout", "60000").unwrap(),
+            "1min"
         );
     }
 }

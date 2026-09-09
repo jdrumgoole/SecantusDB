@@ -1620,7 +1620,8 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
             conname
         };
         check_names.push(name.clone());
-        def.check_constraints.push(CheckConstraint { name, expression });
+        def.check_constraints
+            .push(CheckConstraint { name, expression });
     }
     // PostgreSQL evaluates CHECK constraints in name order.
     def.check_constraints.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1720,7 +1721,11 @@ fn foreign_key_of(
             "c" => Some("CASCADE".to_string()),
             "n" => Some("SET NULL".to_string()),
             "d" => return Err(Error::Unsupported("a FOREIGN KEY with SET DEFAULT".into())),
-            other => return Err(Error::Parse(format!("unknown referential action {other:?}"))),
+            other => {
+                return Err(Error::Parse(format!(
+                    "unknown referential action {other:?}"
+                )))
+            }
         })
     };
     let on_delete = action(&k.fk_del_action)?;
