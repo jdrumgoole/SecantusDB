@@ -53,32 +53,41 @@ fn rename_same_path(a: &str, b: &str) -> bool {
     ap[..n] == bp[..n]
 }
 
-/// True if walking `path` against `doc` passes through an array element — mongod
-/// forbids a `$rename` source/destination from being an array element (this
-/// previously silently corrupted the array). Mirrors
-/// `update._rename_traverses_array`.
-fn rename_traverses_array(doc: &Document, path: &str) -> bool {
+/// The name of the array `path` indexes into, or `None`.
+///
+/// `deep.n.0.a` over `{deep: {n: [{a: 1}]}}` answers `"n"` -- mongod's message
+/// names the field that HOLDS the array, not the whole path. This is the "array
+/// element" it forbids in a `$rename` source / destination (it previously
+/// silently corrupted the array here).
+///
+/// Caller-gated on the source path resolving: mongod treats a `$rename` whose
+/// source is absent as a no-op and never runs either array check, so
+/// `{$rename: {"v.9.a": "q"}}` succeeds while `{$rename: {"v.0.a": "q"}}` is
+/// refused (measured 8.2.11, 2026-09-09). Mirrors
+/// `update._rename_array_field`.
+fn rename_array_field<'a>(doc: &'a Document, path: &'a str) -> Option<&'a str> {
     let mut parts = path.split('.');
-    let Some(first) = parts.next() else {
-        return false;
-    };
-    let Some(mut cur) = doc.get(first) else {
-        return false;
-    };
+    let first = parts.next()?;
+    let mut cur = doc.get(first)?;
+    let mut holder = first;
     for part in parts {
         match cur {
-            // Only a numeric index into an array is the forbidden "array
-            // element"; a positional token ($ / $[] / $[id]) is not (and is
-            // already deferred above via has_positional).
-            Bson::Array(_) => return !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()),
-            Bson::Document(d) => match d.get(part) {
-                Some(v) => cur = v,
-                None => return false,
-            },
-            _ => return false,
+            Bson::Array(_) => {
+                return if !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()) {
+                    Some(holder)
+                } else {
+                    None
+                };
+            }
+            Bson::Document(d) => {
+                let v = d.get(part)?;
+                holder = part;
+                cur = v;
+            }
+            _ => return None,
         }
     }
-    false
+    None
 }
 
 // --- positional / arrayFilters path expansion ---------------------------
@@ -827,11 +836,6 @@ fn apply_op(
                         ));
                     }
                 };
-                // $rename doesn't support positional tokens (mongod rejects);
-                // defer the rare case to keep semantics exact.
-                if has_positional(old) || has_positional(new) {
-                    return Err(Fallback::Defer);
-                }
                 if old.is_empty() || new.is_empty() {
                     return Err(Fallback::mongo(56, "An empty update path is not valid."));
                 }
@@ -855,14 +859,65 @@ fn apply_op(
                         ),
                     ));
                 }
-                if rename_traverses_array(result, old) || rename_traverses_array(result, new) {
-                    return Err(Fallback::Defer); // array element -> Python raises 2
+                // Parse-time, and BEFORE the array checks below: a dynamic
+                // source outranks a dynamic destination, and a dynamic
+                // destination outranks an array-element SOURCE (measured
+                // 8.2.11, 2026-09-09). mongod raises these without looking at
+                // the document, so an absent source field still errors.
+                if has_positional(old) {
+                    return Err(Fallback::mongo(
+                        2,
+                        format!("The source field for $rename may not be dynamic: {old}"),
+                    ));
+                }
+                if has_positional(new) {
+                    return Err(Fallback::mongo(
+                        2,
+                        format!("The destination field for $rename may not be dynamic: {new}"),
+                    ));
+                }
+                // Execution-time: mongod discovers these while applying the
+                // rename to a particular document, so they carry the executor
+                // wrapper -- and it skips both when the source field is absent,
+                // because then the `$rename` is a no-op.
+                let source_indexes_array = rename_array_field(result, old).is_some();
+                if has_path(result, old) {
+                    if let Some(field) = rename_array_field(result, old) {
+                        return Err(Fallback::mongo(
+                            2,
+                            format!(
+                                "The source field cannot be an array element, '{old}' in doc \
+                                 with _id: {} has an array field called '{field}'",
+                                crate::query::bson_value_repr(
+                                    result.get("_id").unwrap_or(&Bson::Null)
+                                )
+                            ),
+                        )
+                        .exec());
+                    }
+                    if let Some(field) = rename_array_field(result, new) {
+                        return Err(Fallback::mongo(
+                            2,
+                            format!(
+                                "The destination field cannot be an array element, '{new}' in \
+                                 doc with _id: {} has an array field called '{field}'",
+                                crate::query::bson_value_repr(
+                                    result.get("_id").unwrap_or(&Bson::Null)
+                                )
+                            ),
+                        )
+                        .exec());
+                    }
                 }
                 // A source path that cannot be TRAVERSED is an error, not a
                 // silent skip -- `has_path` cannot tell "absent" from "blocked
-                // by a non-document".
-                // Only for a STATIC path -- see the note on the Python side.
-                if !old.contains('$') {
+                // by a non-document". Every path reaching here is STATIC.
+                //
+                // Skipped for a path that indexes into an ARRAY: mongod refuses
+                // that outright when the source resolves (above) and treats it
+                // as a plain no-op when it does not, so `{$rename: {"v.9.a":
+                // "q"}}` succeeds rather than reporting a 28 traverse failure.
+                if !source_indexes_array {
                     if let Some(problem) = traverse_problem(result, old) {
                         return Err(problem);
                     }

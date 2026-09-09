@@ -285,6 +285,31 @@ pub(crate) fn write_error(index: usize, err: StorageError, command: &str) -> Doc
     }
 }
 
+/// A READ command's execution-time refusal, under mongod's namespace-naming
+/// wrapper.
+///
+/// mongod has two executor wrappers and they are not interchangeable: an
+/// update-side failure gets `Plan executor error during <command> :: caused by
+/// ::` ([`exec_wrapped`]) while a read-side one gets `Executor error during
+/// <command> command: <db>.<coll> :: caused by ::`. The ambiguous-sort-path
+/// refusal (16746) is the read-side kind -- mongod discovers it per document --
+/// and it reached the client under the update wrapper with an EMPTY command
+/// name, because `command_error` assumed reads never carry an execution error.
+pub(crate) fn read_exec_error(err: StorageError, command: &str, ns: &str) -> CommandError {
+    match err {
+        StorageError::WriteError {
+            code,
+            errmsg,
+            exec: true,
+        } => CommandError::new(
+            code,
+            code_name_for(code),
+            format!("Executor error during {command} command: {ns} :: caused by :: {errmsg}"),
+        ),
+        other => command_error(other),
+    }
+}
+
 /// Map a storage error to a command-level `CommandError` (for non-batch
 /// commands like `count` / `find`). Read commands never carry an
 /// execution-time update error, so this drops the flag; `findAndModify`, which

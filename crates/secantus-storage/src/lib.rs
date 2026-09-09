@@ -2535,6 +2535,11 @@ fn sort_key(
 ) -> Result<Vec<Vec<u8>>> {
     let mut parts = Vec::with_capacity(spec.len());
     for (f, d) in spec {
+        // mongod refuses a sort path whose component names both an array index
+        // and a key of that array's elements -- per document, at execution time.
+        if let Some(err) = ambiguous_sort_path(doc, f) {
+            return Err(err);
+        }
         // `sort_field_value` resolves the path AND picks the representative
         // element (mongod sorts an array-valued field by its minimum ascending,
         // its maximum descending). Applying `array_sort_value` again here
@@ -2561,10 +2566,24 @@ fn sort_key(
     Ok(parts)
 }
 
+/// The refusal mongod raises when a sort path component names BOTH an array
+/// index and a key of that array's elements -- see
+/// [`secantus_core::ambiguous_sort_path`] for the measured rule. Shared
+/// with the aggregation `$sort` stage so the two sort paths cannot drift.
+fn ambiguous_sort_path(doc: &Document, field: &str) -> Option<StorageError> {
+    let (part, items) = secantus_core::ambiguous_sort_path(doc, field)?;
+    Some(StorageError::QueryError {
+        code: 16746,
+        errmsg: secantus_core::ambiguous_sort_message(part, items),
+        exec: true,
+    })
+}
+
 /// The value a document sorts by for one field of the sort spec.
 ///
-/// Resolved with `get_path_values`, which walks a dotted path THROUGH an array
-/// exactly one level, rather than `get_path`, which does not walk one at all.
+/// Resolved with `secantus_core::sort_path_values`, which walks a dotted
+/// path THROUGH an array exactly one level, rather than `get_path`, which does
+/// not walk one at all.
 /// mongod ranks `x: [{y: 1}]` among the documents that HAVE an `x.y` -- by 1 --
 /// and both servers ranked it with those that have none, so a
 /// `sort({"x.y": 1})` over array-of-subdocument data came back in the wrong
@@ -2572,7 +2591,7 @@ fn sort_key(
 /// (probed 8.2.11, 2026-09-06).
 ///
 /// One level, not any: `x: [[{y: 5}]]` has no `x.y` on mongod either, and
-/// `get_path_values` already stops there. Using it also makes the in-memory
+/// `sort_path_values` already stops there. Using it also makes the in-memory
 /// sort agree with the INDEX path, which generates its multikey entries from
 /// the same resolver -- an index must change speed, never results.
 ///
@@ -2582,7 +2601,7 @@ fn sort_key(
 ///
 /// Mirrors `ordering._sort_value`.
 fn sort_field_value(doc: &Document, field: &str, reverse: bool) -> Bson {
-    let (values, _descended) = get_path_values(doc, field);
+    let values = secantus_core::sort_path_values(doc, field);
     if values.is_empty() {
         // Absent: `get_path` returned `None` here before and this still ranks
         // with null.
@@ -2590,9 +2609,17 @@ fn sort_field_value(doc: &Document, field: &str, reverse: bool) -> Bson {
     }
     let mut best: Option<Vec<u8>> = None;
     let mut best_val = Bson::Null;
-    for v in values {
-        let Some(rep) = order::array_sort_value(v.clone(), reverse) else {
-            continue;
+    for (v, indexed) in values {
+        // An array reached by an explicit INDEX is the sort value as it stands;
+        // one reached by a field name is descended a level. See
+        // `secantus_core::sort_path_values`.
+        let rep = if indexed {
+            v.clone()
+        } else {
+            match order::array_sort_value(v.clone(), reverse) {
+                Some(rep) => rep,
+                None => continue,
+            }
         };
         // Compare candidates on the ASCENDING encoding and pick the max for a
         // descending column -- never the inverted bytes, which do not reverse a
@@ -10876,8 +10903,21 @@ impl Storage {
                     // e.g. a compound `_id`) is a real predicate and must be seeded —
                     // dropping it would mint a fresh ObjectId instead of using it.
                     let mut seed = Document::new();
-                    for (k, v) in filter {
-                        if !k.starts_with('$') && !is_op_doc(v) {
+                    let mut implied: Vec<(String, Bson)> = Vec::new();
+                    let mut seen = std::collections::HashSet::new();
+                    if let Err(path) = collect_upsert_seed(filter, &mut implied, &mut seen) {
+                        // mongod's own text and code, as an EXECUTION-time error.
+                        return Err(StorageError::QueryError {
+                            code: 54,
+                            errmsg: format!(
+                                "cannot infer query fields to set, path '{path}' is matched twice"
+                            ),
+                            exec: true,
+                        });
+                    }
+                    implied.sort_by(|a, b| a.0.cmp(&b.0));
+                    for (k, v) in &implied {
+                        {
                             // A DOTTED equality names a nested path, and mongod
                             // builds the nesting: `{"a.b.c": 5}` upserts
                             // `{a: {b: {c: 5}}}`. A plain `insert` stored a
@@ -12832,6 +12872,84 @@ fn doc_was_modified(new: &Document, old: &Document, update_spec: Option<&Documen
 /// `[m, c, z]` on the next three). Sorting them is the approximation the Python
 /// server already makes, and matching it is what keeps the two servers
 /// byte-identical to each other.
+/// The single equality a field clause implies, or `None`.
+///
+/// mongod seeds an upserted document from the query and reads more than bare
+/// equality. Measured against 8.2.11 on 2026-09-08 across twenty clause shapes:
+/// `{$eq: 5}`, a ONE-element `$in`, and a ONE-element `$all` each seed `5`; a
+/// longer `$in`, and `$gt` / `$ne` / `$exists` / `$type` / `$not` /
+/// `$elemMatch`, seed nothing. Seeding only bare equality lost the field
+/// entirely -- a silently wrong INSERT.
+fn implied_equality(value: &Bson) -> Option<Bson> {
+    if !is_op_doc(value) {
+        return Some(value.clone()); // bare equality, literal subdocument included
+    }
+    let Bson::Document(d) = value else {
+        return Some(value.clone());
+    };
+    if let Some(v) = d.get("$eq") {
+        return Some(v.clone());
+    }
+    for op in ["$in", "$all"] {
+        if let Some(Bson::Array(items)) = d.get(op) {
+            if items.len() == 1 {
+                return Some(items[0].clone());
+            }
+        }
+    }
+    None
+}
+
+/// Walk `query` and record every equality it implies.
+///
+/// `$and` recurses into every branch and `$or` into a SINGLE branch -- with two
+/// or more nothing is implied, and `$nor` never seeds. Two clauses implying the
+/// same path give `Err(path)`, which the caller turns into mongod's
+/// `54 cannot infer query fields to set, path 'a' is matched twice`
+/// (`{$all: [1, 2]}` and `{$and: [{a: 1}, {a: 1}]}` both hit it).
+fn collect_upsert_seed(
+    query: &Document,
+    into: &mut Vec<(String, Bson)>,
+    seen: &mut std::collections::HashSet<String>,
+) -> std::result::Result<(), String> {
+    for (key, value) in query {
+        if key == "$and" || key == "$or" {
+            let Bson::Array(branches) = value else {
+                continue;
+            };
+            if key == "$or" && branches.len() != 1 {
+                continue;
+            }
+            for branch in branches {
+                if let Bson::Document(d) = branch {
+                    collect_upsert_seed(d, into, seen)?;
+                }
+            }
+            continue;
+        }
+        if key.starts_with('$') {
+            continue; // $nor, $expr, $where, ... imply nothing
+        }
+        if let Bson::Document(d) = value {
+            if is_op_doc(value) {
+                if let Some(Bson::Array(items)) = d.get("$all") {
+                    if items.len() > 1 {
+                        return Err(key.clone());
+                    }
+                }
+            }
+        }
+        let Some(seed_value) = implied_equality(value) else {
+            continue;
+        };
+        if !seen.insert(key.clone()) {
+            return Err(key.clone());
+        }
+        into.push((key.clone(), seed_value));
+    }
+    Ok(())
+}
+
 fn order_upserted_doc(new: Document, seeded: &[String]) -> Document {
     let mut from_query: Vec<&String> = Vec::new();
     let mut from_update: Vec<&String> = Vec::new();

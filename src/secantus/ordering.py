@@ -18,8 +18,7 @@ from typing import Any
 import bson
 from bson import Binary, Code, Decimal128, MaxKey, MinKey, ObjectId, Regex, Timestamp
 
-from secantus.bsontypes import regex_options_string
-from secantus.paths import get_path_values
+from secantus.bsontypes import bson_value_repr, regex_options_string
 
 
 def _to_decimal(value: Any) -> Decimal:
@@ -309,6 +308,11 @@ def sort_docs(
     if not sort_spec:
         return docs
     fields = [(f, int(d) == -1) for f, d in sort_spec.items()]
+    # mongod refuses the whole sort when any document makes a numeric path
+    # component ambiguous; it does not silently pick a reading.
+    for d in docs:
+        for f, _ in fields:
+            _check_sort_path_ambiguity(d, f)
     # Single sort over a precomputed tuple key rather than N stable passes:
     # one pass through Timsort, the path resolved once per field per doc.
     return sorted(
@@ -319,10 +323,82 @@ def sort_docs(
     )
 
 
+class AmbiguousSortPathError(Exception):
+    """A sort path whose numeric component is BOTH an index and a field name.
+
+    ``{x: [{"0": 5}]}`` sorted by ``x.0``: the index reading gives the element
+    ``{"0": 5}`` and the field reading gives ``5``, and mongod refuses rather
+    than choosing -- ``16746 Ambiguous field name found in array``. It refuses
+    only for a SORT: the same path in a ``find`` filter, a ``$group`` ``_id`` or
+    a projection resolves happily to both readings (measured 8.2.11,
+    2026-09-08).
+    """
+
+    def __init__(self, field: str, array: list[Any]) -> None:
+        rendered = ", ".join(f"{i}: {bson_value_repr(v)}" for i, v in enumerate(array))
+        self.field = field
+        super().__init__(
+            "Ambiguous field name found in array (do not use numeric field "
+            "names in embedded elements in an array), field: "
+            f"'{field}' for array: {{ {rendered} }}"
+        )
+
+
+def _index_component(part: str) -> int | None:
+    """The array index ``part`` names, or None when it names no index at all.
+
+    Canonical digits only: mongod reads ``x.0`` as an index and ``x.00`` as a
+    field name, so ``"00"`` gets no index reading and can never be ambiguous.
+    """
+    if not part.isdigit() or (len(part) > 1 and part[0] == "0"):
+        return None
+    return int(part)
+
+
+def _check_sort_path_ambiguity(doc: Any, field: str) -> None:
+    """Raise when a component of ``field`` names both an index and a key.
+
+    The rule, measured over 19 shapes on 8.2.11 (2026-09-09): a component is
+    ambiguous when it is a VALID INDEX of the array it is applied to *and* some
+    element of that array is a document carrying that exact key. Both halves
+    are load-bearing --
+
+    * ``x.1`` over ``[{"1": 5}]`` is fine (index 1 is past the end, so only the
+      field reading exists), and
+    * ``x.0`` over ``[{"00": 5}]`` is fine (``"00"`` is not the key ``"0"``).
+
+    The element carrying the key need not be the one at that index:
+    ``[{a: 5}, {"0": 6}]`` sorted by ``x.0`` is refused.
+    """
+    _check_ambiguity(doc, field.split("."))
+
+
+def _check_ambiguity(current: Any, parts: list[str]) -> None:
+    if not parts:
+        return
+    part, rest = parts[0], parts[1:]
+    if isinstance(current, Mapping):
+        if part in current:
+            _check_ambiguity(current[part], rest)
+        return
+    if isinstance(current, list):
+        index = _index_component(part)
+        in_range = index is not None and index < len(current)
+        # The FIELD reading walks every element, which is also how a
+        # non-numeric component descends through an array.
+        named = [e[part] for e in current if isinstance(e, Mapping) and part in e]
+        if in_range and named:
+            raise AmbiguousSortPathError(part, current)
+        if in_range:
+            _check_ambiguity(current[index], rest)  # type: ignore[index]
+        for value in named:
+            _check_ambiguity(value, rest)
+
+
 def _sort_value(doc: Any, field: str, reverse: bool) -> Any:
     """The value a document sorts by for one field of the sort spec.
 
-    Resolved with ``paths.get_path_values``, which walks a dotted path THROUGH
+    Resolved with :func:`_sort_path_values`, which walks a dotted path THROUGH
     an array exactly one level, rather than ``get_path``, which does not walk
     one at all. mongod ranks ``x: [{y: 1}]`` among the documents that HAVE an
     ``x.y`` -- by 1 -- and both servers ranked it with those that have none, so
@@ -331,7 +407,7 @@ def _sort_value(doc: Any, field: str, reverse: bool) -> Any:
     (probed 8.2.11, 2026-09-06).
 
     One level, not any: ``x: [[{y: 5}]]`` has no ``x.y`` on mongod either, and
-    `get_path_values` already stops there. Using it also makes the in-memory
+    `_sort_path_values` already stops there. Using it also makes the in-memory
     sort agree with the INDEX path, which generates its multikey entries from
     the same resolver -- an index must change speed, never results.
 
@@ -339,13 +415,51 @@ def _sort_value(doc: Any, field: str, reverse: bool) -> Any:
     representative element the direction asks for, the same rule
     :func:`_array_sort_value` applies within one array value.
     """
-    values, _descended = get_path_values(doc, field)
+    values = _sort_path_values(doc, field)
     if not values:
         # Absent: `get_path` returned None here before and still should, so a
         # missing path keeps ranking with null.
         return None
-    keyed = [_SortKey(_array_sort_value(v, reverse)) for v in values]
+    # An array reached by an explicit INDEX is the sort value as it stands;
+    # one reached by a field name is descended a level. See
+    # :func:`_sort_path_values` for the measurement.
+    keyed = [_SortKey(v if indexed else _array_sort_value(v, reverse)) for v, indexed in values]
     return (max(keyed) if reverse else min(keyed)).val
+
+
+def _sort_path_values(doc: Any, field: str) -> list[tuple[Any, bool]]:
+    """``(value, indexed)`` pairs for a sort path, ``indexed`` per value.
+
+    Same walk as :func:`paths.get_path_values` -- both readings of a numeric
+    component over an array -- but it reports, per value, whether the LAST
+    component was consumed as an array INDEX. mongod descends one level into an
+    array-valued sort key reached by a field name and does NOT descend one
+    reached by an index, so ``{x: [[5]]}`` sorted by ``x.0`` ranks among the
+    ARRAYS (its key is ``[5]``) while the same document sorted by ``x`` also
+    ranks among the arrays (``[[5]]`` descended once is ``[5]``) -- and
+    ``{x: [{y: [1, 2]}]}`` sorted by ``x.y`` ranks by ``1``.
+
+    Both servers descended in every case, so ``x.0`` over ``[[5]]`` sorted as
+    the NUMBER 5: wrong order, and wrong RESULTS under a ``limit``. Measured
+    against 8.2.11 over seven shapes, 2026-09-09.
+    """
+    current: list[tuple[Any, bool]] = [(doc, False)]
+    for part in field.split("."):
+        nxt: list[tuple[Any, bool]] = []
+        for cur, _ in current:
+            if isinstance(cur, Mapping):
+                if part in cur:
+                    nxt.append((cur[part], False))
+            elif isinstance(cur, list):
+                if part.isdigit():
+                    idx = int(part)
+                    if 0 <= idx < len(cur):
+                        nxt.append((cur[idx], True))
+                for elem in cur:
+                    if isinstance(elem, Mapping) and part in elem:
+                        nxt.append((elem[part], False))
+        current = nxt
+    return current
 
 
 def _array_sort_value(v: Any, reverse: bool) -> Any:

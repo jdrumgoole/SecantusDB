@@ -2893,6 +2893,150 @@ DECIMAL_SPECIAL_CASES: list[tuple[str, list[dict], Callable[[Database], object]]
     for name, value in _DECIMAL_SPECIALS
 ]
 
+# --- sort-path resolution -------------------------------------------------
+#
+# Two rules about the SORT walk, both measured 2026-09-09 and neither
+# reproducible from a filter. The wider sweep is
+# `tools/probes/sort_path_resolution.py`.
+
+#: A probe document ranked against sentinels whose value AT THE SAME PATH is a
+#: number, a string and an array, so its position names the type bracket its
+#: sort key landed in.
+SORTPATH_INDEXED: list[dict] = [
+    {"_id": 0, "x": [[5]]},
+    {"_id": 1, "x": [6]},
+    {"_id": 2, "x": ["zz"]},
+    {"_id": 3, "x": [[4]]},
+]
+SORTPATH_NAMED: list[dict] = [
+    {"_id": 0, "x": [{"y": [1, 2]}]},
+    {"_id": 1, "x": {"y": 6}},
+    {"_id": 2, "x": {"y": "zz"}},
+    {"_id": 3, "x": {"y": [4]}},
+]
+SORTPATH_TOP: list[dict] = [
+    {"_id": 0, "x": [[5]]},
+    {"_id": 1, "x": 6},
+    {"_id": 2, "x": "zz"},
+    {"_id": 3, "x": [4]},
+]
+
+#: The ambiguity rule: a component that is a valid INDEX of the array *and* a
+#: key of some element document. Both halves matter -- `x.1` over `[{"1": 5}]`
+#: is allowed because index 1 is past the end, and `x.0` over `[{"00": 5}]`
+#: because "00" is not the key "0".
+SORTPATH_AMBIG: list[dict] = [{"_id": 1, "x": [{"0": 5}]}]
+SORTPATH_AMBIG_SPLIT: list[dict] = [{"_id": 1, "x": [{"a": 5}, {"0": 6}]}]
+SORTPATH_PAST_END: list[dict] = [{"_id": 1, "x": [{"1": 5}]}]
+SORTPATH_NONCANON: list[dict] = [{"_id": 1, "x": [{"00": 5}]}]
+
+
+def _sort_err(db: Database, spec: list, agg: bool = False) -> object:
+    """The sorted ids, or the refusal -- whichever mongod gives."""
+    from pymongo.errors import OperationFailure
+
+    try:
+        if agg:
+            rows = db.c.aggregate([{"$sort": dict([*spec, ("_id", 1)])}, {"$project": {"_id": 1}}])
+        else:
+            rows = db.c.find({}, {"_id": 1}).sort([*spec, ("_id", 1)])
+        return [d["_id"] for d in rows]
+    except OperationFailure as exc:
+        return (exc.code, exc.details.get("errmsg"))
+
+
+def _sorts(spec: list, agg: bool = False) -> Callable[[Database], object]:
+    return lambda db: _sort_err(db, spec, agg)
+
+
+SORTPATH_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    # An array reached by an explicit INDEX is the sort key as it stands; both
+    # servers descended it and ranked `[[5]]` among the NUMBERS.
+    ("index-no-descend", SORTPATH_INDEXED, _sorts([("x.0", 1)])),
+    ("index-no-descend-desc", SORTPATH_INDEXED, _sorts([("x.0", -1)])),
+    ("index-no-descend-agg", SORTPATH_INDEXED, _sorts([("x.0", 1)], agg=True)),
+    # One reached by a FIELD NAME is descended a level.
+    ("named-descends", SORTPATH_NAMED, _sorts([("x.y", 1)])),
+    ("named-descends-desc", SORTPATH_NAMED, _sorts([("x.y", -1)])),
+    ("named-descends-agg", SORTPATH_NAMED, _sorts([("x.y", 1)], agg=True)),
+    # One level, not any.
+    ("top-level-one-level", SORTPATH_TOP, _sorts([("x", 1)])),
+    ("top-level-one-level-agg", SORTPATH_TOP, _sorts([("x", 1)], agg=True)),
+    # The ambiguity refusal, and its two boundaries.
+    ("ambiguous-refused", SORTPATH_AMBIG, _sorts([("x.0", 1)])),
+    ("ambiguous-refused-agg", SORTPATH_AMBIG, _sorts([("x.0", 1)], agg=True)),
+    ("ambiguous-elsewhere-in-array", SORTPATH_AMBIG_SPLIT, _sorts([("x.0", 1)])),
+    ("index-past-end-allowed", SORTPATH_PAST_END, _sorts([("x.1", 1)])),
+    ("noncanonical-key-allowed", SORTPATH_NONCANON, _sorts([("x.0", 1)])),
+    # ...and the same path in a FILTER is not refused at all.
+    ("ambiguous-path-in-filter", SORTPATH_AMBIG, lambda db: _ids(db, {"x.0": 5})),
+]
+
+
+# --- $rename path refusals ------------------------------------------------
+#
+# mongod separates a DYNAMIC component (parse time, bare, decided without the
+# document) from an ARRAY-element path (execution time, wrapped, skipped when
+# the source is absent). Precedence measured 2026-09-09; wider sweep in
+# `tools/probes/rename_paths.py`.
+
+RENAME_SEED: list[dict] = [
+    {
+        "_id": 1,
+        "v": [{"a": 1}, {"a": 2}],
+        "w": {"a": 1},
+        "z": 5,
+        "deep": {"n": [{"a": 1}]},
+        "s": "x",
+    }
+]
+
+
+def _upd(update: dict, **kwargs) -> Callable[[Database], object]:
+    from pymongo.errors import OperationFailure
+
+    def run(db: Database) -> object:
+        try:
+            db.c.update_one({"_id": 1}, update, **kwargs)
+        except OperationFailure as exc:
+            return (type(exc).__name__, exc.code, exc.details.get("errmsg"))
+        return db.c.find_one({"_id": 1})
+
+    return run
+
+
+RENAME_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    ("src-dynamic-all", RENAME_SEED, _upd({"$rename": {"v.$[].a": "q"}})),
+    ("src-dynamic-dollar", RENAME_SEED, _upd({"$rename": {"v.$.a": "q"}})),
+    ("dst-dynamic", RENAME_SEED, _upd({"$rename": {"z": "v.$[].b"}})),
+    # Precedence: source-dynamic > destination-dynamic > source-array.
+    ("both-dynamic-source-wins", RENAME_SEED, _upd({"$rename": {"v.$[].a": "v.$[].b"}})),
+    ("dst-dynamic-beats-src-array", RENAME_SEED, _upd({"$rename": {"v.0.a": "v.$[].b"}})),
+    # Decided without the document: the source field does not exist.
+    ("dynamic-on-absent-source", RENAME_SEED, _upd({"$rename": {"nope.$[].x": "q"}})),
+    # ...but a missing arrayFilter identifier is reported ahead of all of them,
+    # and as a per-statement write error, not a command failure.
+    ("missing-array-filter-first", RENAME_SEED, _upd({"$rename": {"v.$[e].a": "q"}})),
+    (
+        "identified-with-filter-is-dynamic",
+        RENAME_SEED,
+        _upd({"$rename": {"v.$[e].a": "q"}}, array_filters=[{"e.a": 1}]),
+    ),
+    # Array elements, under the executor wrapper, naming the HOLDING field.
+    ("src-array-element", RENAME_SEED, _upd({"$rename": {"v.0.a": "v.0.b"}})),
+    ("src-array-element-bare", RENAME_SEED, _upd({"$rename": {"v.0": "q"}})),
+    ("src-array-element-deep", RENAME_SEED, _upd({"$rename": {"deep.n.0.a": "q"}})),
+    ("dst-array-element", RENAME_SEED, _upd({"$rename": {"z": "v.0.b"}})),
+    # An unresolvable source is a plain no-op -- no array check, no 28.
+    ("src-index-past-end", RENAME_SEED, _upd({"$rename": {"v.9.a": "q"}})),
+    ("src-leaf-missing-under-array", RENAME_SEED, _upd({"$rename": {"v.0.zz": "q"}})),
+    ("absent-source-array-dest", RENAME_SEED, _upd({"$rename": {"nope": "v.0.b"}})),
+    # ...and a path blocked by a SCALAR is the wrapped 28, which we sent bare.
+    ("traverse-through-scalar", RENAME_SEED, _upd({"$rename": {"s.a": "q"}})),
+    ("numeric-key-on-document", RENAME_SEED, _upd({"$rename": {"w.0": "w.1"}})),
+]
+
+
 ALL_CASES = (
     [("query", c) for c in QUERY_CASES]
     + [("readpath", c) for c in READPATH_CASES]
@@ -2922,6 +3066,8 @@ ALL_CASES = (
     + [("decspecial", c) for c in DECIMAL_SPECIAL_CASES]
     + [("deczero", c) for c in DECIMAL_ZERO_CASES]
     + [("avgdiv", c) for c in AVG_CASES]
+    + [("sortpath", c) for c in SORTPATH_CASES]
+    + [("rename", c) for c in RENAME_CASES]
 )
 
 

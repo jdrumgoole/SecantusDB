@@ -56,6 +56,7 @@ from secantus.sortkey import (
     encode_value_directed,
 )
 from secantus.update import (
+    UpdateError,
     apply_update,
     arith_wrote_nan,
     find_positional_matches,
@@ -625,6 +626,84 @@ def _is_operator_expr(v: Any) -> bool:
     a literal subdocument equality value (``{f: 1, f2: 2}``). Used by the
     upsert seed extraction to tell the two apart."""
     return isinstance(v, dict) and len(v) > 0 and all(k.startswith("$") for k in v)
+
+
+class UpsertSeedConflict(Exception):
+    """Two clauses imply an equality for the same path (mongod's code 54)."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        super().__init__(path)
+
+
+def _implied_equality(value: Any) -> tuple[bool, Any]:
+    """The single equality a field clause implies, as ``(implies, value)``.
+
+    mongod seeds an upserted document from the query, and it reads more than
+    bare equality. Measured against 8.2.11 on 2026-09-08 across twenty clause
+    shapes:
+
+    ============================  ==================================
+    clause                        seeds
+    ============================  ==================================
+    ``5`` (bare)                  ``5``
+    ``{$eq: 5}``                  ``5``
+    ``{$in: [5]}`` (exactly one)  ``5``
+    ``{$all: [5]}`` (exactly one) ``5``
+    ``{$in: [5, 6]}``             nothing
+    ``$gt`` / ``$ne`` / ``$exists`` / ``$type`` / ``$not`` / ``$elemMatch``  nothing
+    ============================  ==================================
+
+    A clause carrying several operators seeds from whichever one implies an
+    equality (``{$in: [1], $gt: 0}`` seeds ``1``).
+    """
+    if not _is_operator_expr(value):
+        return True, value  # bare equality, including a literal subdocument
+    if "$eq" in value:
+        return True, value["$eq"]
+    for op in ("$in", "$all"):
+        candidate = value.get(op)
+        if isinstance(candidate, list) and len(candidate) == 1:
+            return True, candidate[0]
+    return False, None
+
+
+def _collect_upsert_seed(query: Mapping[str, Any], into: dict[str, Any], seen: set[str]) -> None:
+    """Walk ``query`` and record every equality it implies into ``into``.
+
+    ``$and`` recurses into every branch and ``$or`` into a SINGLE branch --
+    with two or more branches nothing is implied. ``$nor`` never seeds.
+    Two clauses implying the same path raise `UpsertSeedConflict`, which is
+    mongod's ``54 cannot infer query fields to set, path 'a' is matched twice``
+    (``{$all: [1, 2]}`` and ``{$and: [{a: 1}, {a: 1}]}`` both hit it).
+    """
+    for key, value in query.items():
+        if key in ("$and", "$or"):
+            if not isinstance(value, list):
+                continue
+            # `$or` implies its branch only when there is exactly one.
+            if key == "$or" and len(value) != 1:
+                continue
+            for branch in value:
+                if isinstance(branch, Mapping):
+                    _collect_upsert_seed(branch, into, seen)
+            continue
+        if key.startswith("$"):
+            continue  # $nor, $expr, $where, ... imply nothing
+        if (
+            _is_operator_expr(value)
+            and isinstance(value.get("$all"), list)
+            and len(value["$all"]) > 1
+        ):
+            # `{$all: [1, 2]}` names one path twice, which mongod refuses.
+            raise UpsertSeedConflict(key)
+        implies, seed_value = _implied_equality(value)
+        if not implies:
+            continue
+        if key in seen:
+            raise UpsertSeedConflict(key)
+        seen.add(key)
+        into[key] = seed_value
 
 
 def _order_upserted_doc(new: dict[str, Any], seeded: list[str]) -> dict[str, Any]:
@@ -6269,24 +6348,32 @@ class Storage:
                 # {z: 3, a: 4}`` upserts ``{_id, m, n, a, z}``). BSON field
                 # order is on the wire, so a client comparing raw bytes --
                 # mongo-php-library's codec tests do -- sees the difference.
-                for k in sorted(filter):
-                    v = filter[k]
-                    # Seed bare-equality predicates into the upserted doc.
-                    # A dict value is only skipped when it's an OPERATOR
-                    # expression ({$gt: 5}); a literal subdocument value
-                    # ({f: ..., f2: ...}, e.g. a compound ``_id``) is a
-                    # real equality and must be seeded — Python's
-                    # ``isinstance(v, dict)`` alone wrongly drops it,
-                    # generating a fresh ObjectId instead.
-                    if k.startswith("$") or _is_operator_expr(v):
-                        continue
+                # Every equality the query IMPLIES, not just the bare ones:
+                # `{a: {$eq: 1}}`, a single-element `$in` / `$all`, `$and`
+                # branches and a lone `$or` branch all seed on mongod, and
+                # seeding only bare equality lost the field entirely -- a
+                # silently wrong INSERT (measured 8.2.11, 2026-09-08; 24 of 120
+                # cells).
+                implied: dict[str, Any] = {}
+                try:
+                    _collect_upsert_seed(filter, implied, set())
+                except UpsertSeedConflict as conflict:
+                    # mongod's own text and code, and an EXECUTION-time error --
+                    # it wraps as "Plan executor error during update".
+                    raise UpdateError(
+                        "cannot infer query fields to set, path "
+                        f"'{conflict.path}' is matched twice",
+                        code=54,
+                        exec_error=True,
+                    ) from None
+                for k in sorted(implied):
                     # A DOTTED equality names a nested path, and mongod
                     # builds the nesting: ``{"a.b.c": 5}`` upserts
                     # ``{a: {b: {c: 5}}}``. Assigning ``seed[k] = v`` stored a
                     # literal key with dots in it — a document mongod cannot
                     # produce and most drivers refuse to send, which then
                     # never matched the very query that created it.
-                    set_path(seed, k, v)
+                    set_path(seed, k, implied[k])
                 seeded = list(seed)
                 new = apply_update(seed, update, is_upsert=True, array_filters=array_filters)
                 if "_id" not in new:
