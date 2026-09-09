@@ -86,6 +86,9 @@ pub enum Error {
     InvalidRegex(String),
     /// A byte/array index out of range -> 2202E (array_subscript_error).
     ArraySubscript(String),
+    /// An operand of the wrong type where the SYNTAX is fine -> 42804
+    /// (datatype_mismatch): `1 AND 2`.
+    DatatypeMismatch(String),
 }
 
 impl std::fmt::Display for Error {
@@ -109,7 +112,8 @@ impl std::fmt::Display for Error {
             | Error::IndeterminateDatatype(m)
             | Error::UndefinedObject(m)
             | Error::InvalidRegex(m)
-            | Error::ArraySubscript(m) => write!(f, "{m}"),
+            | Error::ArraySubscript(m)
+            | Error::DatatypeMismatch(m) => write!(f, "{m}"),
             Error::MultipleCommands => {
                 write!(
                     f,
@@ -144,6 +148,7 @@ impl Error {
             Error::UndefinedObject(_) => "42704",   // undefined_object
             Error::InvalidRegex(_) => "2201B",      // invalid_regular_expression
             Error::ArraySubscript(_) => "2202E",    // array_subscript_error
+            Error::DatatypeMismatch(_) => "42804",  // datatype_mismatch
         }
     }
 }
@@ -781,6 +786,98 @@ fn func_name(f: &pg_query::protobuf::FuncCall) -> Option<String> {
         .next_back()
 }
 
+/// The range or multirange type a CONSTRUCTOR call names, when it names one:
+/// `int4range(1,5)`, `testrange('a','b')`, `testschema.testrange(1.5,2.5)`.
+///
+/// Schema-qualified as the call is, because `testschema.testrange` and a bare
+/// `testrange` are two types with two subtypes; `func_name` keeps only the
+/// last part and would resolve both to the public one.
+fn range_constructor_type(f: &pg_query::protobuf::FuncCall) -> Option<String> {
+    let parts: Vec<&str> = f
+        .funcname
+        .iter()
+        .filter_map(|n| match n.node.as_ref()? {
+            N::String(st) => Some(st.sval.as_str()),
+            _ => None,
+        })
+        .collect();
+    let name = match parts.as_slice() {
+        [n] | ["pg_catalog", n] => (*n).to_string(),
+        [schema, n] => canonical_type_ref(&format!("{schema}.{n}")),
+        _ => return None,
+    };
+    (range::is_range_type(&name) || range::is_multirange_type(&name)).then_some(name)
+}
+
+/// `int4range('[1,3)')` / `int4multirange('{[1,3)}')`: a constructor called
+/// with ONE string literal is the function-style cast of that literal, not a
+/// lower bound -- PostgreSQL parses it as a range literal and reports a bad
+/// one as `malformed range literal`. Only a LITERAL: a typed argument goes
+/// through the constructor.
+fn sole_literal_string_arg(f: &pg_query::protobuf::FuncCall) -> Option<String> {
+    let [only] = f.args.as_slice() else {
+        return None;
+    };
+    match only.node.as_ref()? {
+        N::AConst(c) => match c.val.as_ref()? {
+            a_const::Val::Sval(sv) => Some(sv.sval.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// A range bound accessor over an operand that is STATICALLY a range or a
+/// multirange: `lower('[1,5)'::int4range)`, `upper($1)` with `$1` declared
+/// `testrange`, `isempty(int4range(1,1))`.
+///
+/// A range is carried as its rendered text, and `lower` / `upper` are ALSO
+/// the string case functions -- so without the expression's type,
+/// `lower('[a,b)'::testrange)` lower-cased the text instead of answering the
+/// bound. This is the same PostgreSQL rule the constructor path follows: the
+/// operand's type picks the overload. Answers `(element type, range type,
+/// is multirange)`, or `None` when the call is not an accessor over a typed
+/// range operand, in which case the scalar path takes it.
+fn range_accessor(f: &pg_query::protobuf::FuncCall) -> Option<(String, String, bool)> {
+    let name = func_name(f)?;
+    if !range::is_accessor(&name) || f.args.len() != 1 {
+        return None;
+    }
+    let type_name = static_range_type(f.args.first())?;
+    if let Some(member) = range::multirange_member(&type_name) {
+        let (element, _) = range::range_element(&member)?;
+        return Some((element, type_name, true));
+    }
+    let (element, _) = range::range_element(&type_name)?;
+    Some((element, type_name, false))
+}
+
+/// Evaluate a range accessor call (see `range_accessor`) to its value and
+/// its result type.
+fn range_accessor_value(
+    f: &pg_query::protobuf::FuncCall,
+    params: &[Bson],
+) -> Option<Result<(Bson, String)>> {
+    let (element, type_name, multi) = range_accessor(f)?;
+    let name = func_name(f)?;
+    let result_type = range::accessor_result_type(&name, &element);
+    let arg = f.args.first()?;
+    Some((|| {
+        let value = const_value(arg, params)?;
+        if value == Bson::Null {
+            return Ok((Bson::Null, result_type));
+        }
+        let text = render_value_text(&value);
+        let out = if multi {
+            let members = range::multirange_from_text(&text, &type_name)?;
+            range::multirange_accessor(&name, &members, &element)?
+        } else {
+            range::accessor(&name, &range::from_text(&text, &type_name)?, &element)?
+        };
+        Ok((out, result_type))
+    })())
+}
+
 /// Split a multi-command string into its individual commands.
 ///
 /// PostgreSQL's SIMPLE query protocol takes any number of commands separated by
@@ -1152,15 +1249,22 @@ fn type_name_of_node(node: &pg_query::protobuf::Node) -> Option<String> {
 
 fn type_name(names: &[pg_query::protobuf::Node]) -> String {
     // libpg_query qualifies built-ins as pg_catalog.<name>; the catalog stores
-    // the bare PostgreSQL name (`int4`, `text`), matching the Python server.
-    names
+    // the bare PostgreSQL name (`int4`, `text`). A USER schema stays on the
+    // name -- `testschema.testrange` is a different type from `testrange`,
+    // and the registries key it in `canonical_type_ref` form.
+    let parts: Vec<&str> = names
         .iter()
         .filter_map(|n| match n.node.as_ref()? {
-            N::String(s) => Some(s.sval.clone()),
+            N::String(s) => Some(s.sval.as_str()),
             _ => None,
         })
-        .next_back()
-        .unwrap_or_default()
+        .collect();
+    match parts.as_slice() {
+        [] => String::new(),
+        [n] | ["pg_catalog" | "public", n] => (*n).to_string(),
+        [schema, n] => canonical_type_ref(&format!("{schema}.{n}")),
+        other => other.join("."),
+    }
 }
 
 fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
@@ -2659,9 +2763,15 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
             "regtype".to_string()
         }
         // `int4range(1,5)` is an `int4range`, not the text it renders as.
-        Some(N::FuncCall(f)) if func_name(f).as_deref().is_some_and(range::is_range_type) => {
-            func_name(f).unwrap_or_default()
+        Some(N::FuncCall(f)) if range_constructor_type(f).is_some() => {
+            range_constructor_type(f).unwrap_or_default()
         }
+        // `lower(int4range(1,5))` is an `int4`; `isempty(...)` a bool.
+        Some(N::FuncCall(f)) if range_accessor(f).is_some() => {
+            let (element, _, _) = range_accessor(f).unwrap_or_default();
+            range::accessor_result_type(&func_name(f).unwrap_or_default(), &element)
+        }
+        Some(N::BoolExpr(_)) => "bool".to_string(),
         // These pick one of their arguments, so they report its type.
         Some(N::RowExpr(_)) => "record".to_string(),
         Some(N::CoalesceExpr(_)) | Some(N::MinMaxExpr(_)) => inferred_type(value).to_string(),
@@ -3181,14 +3291,31 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 // worked, because only the cast route goes through
                 // `const_value` -- and a probe whose every case carried a cast
                 // would never notice.
-                if range::is_multirange_type(&name) {
+                let type_name = range_constructor_type(f).unwrap_or_default();
+                if let (true, Some(text)) = (
+                    range::is_range_type(&type_name) || range::is_multirange_type(&type_name),
+                    sole_literal_string_arg(f),
+                ) {
+                    columns.push((
+                        if rt.name.is_empty() {
+                            name.clone()
+                        } else {
+                            rt.name.clone()
+                        },
+                        ConstCol::Value(cast_value(Bson::String(text), &type_name)?),
+                        type_name.clone(),
+                        -1,
+                    ));
+                    continue;
+                }
+                if range::is_multirange_type(&type_name) {
                     let args = f
                         .args
                         .iter()
                         .map(|a| const_value(a, params))
                         .collect::<Result<Vec<_>>>()?;
                     let value =
-                        range::render_multirange(&range::multirange_from_args(&args, &name)?);
+                        range::render_multirange(&range::multirange_from_args(&args, &type_name)?);
                     columns.push((
                         if rt.name.is_empty() {
                             name.clone()
@@ -3196,12 +3323,12 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                             rt.name.clone()
                         },
                         ConstCol::Value(Bson::String(value)),
-                        name.clone(),
+                        type_name.clone(),
                         -1,
                     ));
                     continue;
                 }
-                if range::is_range_type(&name) {
+                if range::is_range_type(&type_name) {
                     let args = f
                         .args
                         .iter()
@@ -3211,7 +3338,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                         f.args.get(2).and_then(|a| a.node.as_ref()),
                         Some(N::ParamRef(_))
                     );
-                    let value = range::render(&range::from_args(&args, &name, literal_flags)?);
+                    let value = range::render(&range::from_args(&args, &type_name, literal_flags)?);
                     columns.push((
                         if rt.name.is_empty() {
                             name.clone()
@@ -3219,7 +3346,21 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                             rt.name.clone()
                         },
                         ConstCol::Value(Bson::String(value)),
-                        name.clone(),
+                        type_name.clone(),
+                        -1,
+                    ));
+                    continue;
+                }
+                if let Some(result) = range_accessor_value(f, params) {
+                    let (value, t) = result?;
+                    columns.push((
+                        if rt.name.is_empty() {
+                            name.clone()
+                        } else {
+                            rt.name.clone()
+                        },
+                        ConstCol::Value(value),
+                        t,
                         -1,
                     ));
                     continue;
@@ -3232,7 +3373,16 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                         .collect::<Result<Vec<_>>>()?;
                     if let Some(result) = scalar::call(&name, &args) {
                         let value = result?;
-                        let t = inferred_type(&value).to_string();
+                        // A NULL result cannot say its type -- and at DESCRIBE
+                        // time every parameter IS null, so `ascii($1)` typed
+                        // as text and the executed `91` went out as `'91'`
+                        // under oid 25. The function's declared result type
+                        // is what PostgreSQL reports there.
+                        let t = if value == Bson::Null {
+                            scalar::static_result_type(&name).to_string()
+                        } else {
+                            inferred_type(&value).to_string()
+                        };
                         columns.push((
                             if rt.name.is_empty() {
                                 name.clone()
@@ -3356,6 +3506,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 | N::ParamRef(_)
                 | N::TypeCast(_)
                 | N::AExpr(_)
+                | N::BoolExpr(_)
                 | N::AArrayExpr(_)
                 | N::RowExpr(_)
                 | N::CoalesceExpr(_)
@@ -4515,7 +4666,7 @@ thread_local! {
     /// otherwise, so `to_regtype('testmultirange')` reaches the public one and
     /// `to_regtype('testschema.testmultirange')` the schema one -- exactly like
     /// ranges. Installed per statement by the wire layer.
-    static PLAN_USER_MULTIRANGES: std::cell::RefCell<Vec<(String, i64)>> =
+    static PLAN_USER_MULTIRANGES: std::cell::RefCell<Vec<(String, i64, String)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -4550,9 +4701,21 @@ pub fn user_composite_oid(name: &str) -> Option<i64> {
     user_composite(name).map(|(oid, _)| oid)
 }
 
-/// Custom multirange types: `(resolution name, multirange oid)`.
-pub fn set_user_multiranges(multiranges: Vec<(String, i64)>) {
+/// Custom multirange types: `(resolution name, multirange oid, member range
+/// name)`.
+pub fn set_user_multiranges(multiranges: Vec<(String, i64, String)>) {
     PLAN_USER_MULTIRANGES.with(|t| *t.borrow_mut() = multiranges);
+}
+
+/// The custom RANGE a custom multirange is built from, by resolution name.
+pub fn user_multirange_member(name: &str) -> Option<String> {
+    let n = canonical_type_ref(name);
+    PLAN_USER_MULTIRANGES.with(|t| {
+        t.borrow()
+            .iter()
+            .find(|(rn, _, _)| *rn == n)
+            .map(|(_, _, member)| member.clone())
+    })
 }
 
 /// A custom multirange type's oid by name, for regtype resolution.
@@ -4561,8 +4724,8 @@ fn user_multirange_oid(name: &str) -> Option<i64> {
     PLAN_USER_MULTIRANGES.with(|t| {
         t.borrow()
             .iter()
-            .find(|(rn, _)| *rn == n)
-            .map(|(_, oid)| *oid)
+            .find(|(rn, _, _)| *rn == n)
+            .map(|(_, oid, _)| *oid)
     })
 }
 
@@ -4572,8 +4735,8 @@ fn user_multirange_name(oid: i64) -> Option<String> {
     PLAN_USER_MULTIRANGES.with(|t| {
         t.borrow()
             .iter()
-            .find(|(_, o)| *o == oid)
-            .map(|(n, _)| n.clone())
+            .find(|(_, o, _)| *o == oid)
+            .map(|(n, _, _)| n.clone())
     })
 }
 
@@ -4682,10 +4845,11 @@ fn user_enum(name: &str) -> Option<(i64, Vec<String>)> {
     })
 }
 
-/// A user type's NAME by oid -- the reverse door, for rendering a regtype.
+/// A user type's NAME by oid -- the reverse door, for rendering a regtype
+/// or naming the type behind a custom oid on a binary parameter.
 /// Consults enums / composites first, then custom multiranges (a multirange oid
 /// is not in `PLAN_USER_TYPES`), so `mr_oid::regtype::text` renders its name.
-fn user_type_name(oid: i64) -> Option<String> {
+pub fn user_type_name(oid: i64) -> Option<String> {
     PLAN_USER_TYPES
         .with(|t| {
             t.borrow()
@@ -4693,7 +4857,19 @@ fn user_type_name(oid: i64) -> Option<String> {
                 .find(|(_, o, _)| *o == oid)
                 .map(|(n, _, _)| n.clone())
         })
+        .or_else(|| user_range_name(oid))
         .or_else(|| user_multirange_name(oid))
+}
+
+/// A custom range type's resolution NAME by oid -- for rendering `pg_typeof`
+/// of a custom range, which is its oid until this door names it.
+fn user_range_name(oid: i64) -> Option<String> {
+    PLAN_USER_RANGES.with(|t| {
+        t.borrow()
+            .iter()
+            .find(|(_, _, o)| *o == oid)
+            .map(|(n, _, _)| n.clone())
+    })
 }
 
 /// The declared type of `$n`, when the client gave one.
@@ -6170,17 +6346,6 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
             let text = as_text(&value);
             Ok(Bson::String(range::render(&range::from_text(&text, t)?)))
         }
-        // A custom `CREATE TYPE ... AS RANGE`: resolve its subtype element and
-        // parse/render like the builtin range over that element, but WITHOUT
-        // canonicalisation -- a user range has no canonical function, so
-        // `[1,4]` stays `[1,4]` (verified against PostgreSQL).
-        t if user_range_subtype(t).is_some() => {
-            let element = user_range_subtype(t).expect("checked");
-            let text = as_text(&value);
-            Ok(Bson::String(range::render(&range::from_text_element(
-                &text, &element, false,
-            )?)))
-        }
         t if range::is_multirange_type(t) => {
             let text = as_text(&value);
             Ok(Bson::String(range::render_multirange(
@@ -6392,7 +6557,7 @@ fn instant_micros(v: &Bson) -> Option<i64> {
 fn static_range_type(n: Option<&pg_query::protobuf::Node>) -> Option<String> {
     let named = |name: String| is_range_family(&name).then_some(name);
     match n.and_then(|x| x.node.as_ref()) {
-        Some(N::FuncCall(f)) => named(func_name(f)?),
+        Some(N::FuncCall(f)) => range_constructor_type(f),
         Some(N::TypeCast(tc)) => named(type_name_of(tc.type_name.as_ref()?)),
         // A parameter the client DECLARED as a range, a multirange, or an
         // array of either (psycopg sends `[Int4Range(...)]` as `_int4range`).
@@ -6426,6 +6591,27 @@ pub fn infer_param_types(sql: &str, declared: &[Option<String>]) -> Vec<Option<S
     };
     let previous_types = PLAN_PARAM_TYPES.with(|t| t.replace(declared.to_vec()));
     for (node, _, _, _) in parsed.protobuf.nodes() {
+        // `$1::int4range`: a cast names the parameter's type outright, which
+        // is how PostgreSQL types an unknown parameter under a cast. Only a
+        // range-family target: that is the one family psycopg sends untyped.
+        if let pg_query::NodeRef::TypeCast(tc) = node {
+            let target = tc.type_name.as_ref().map(type_name_of).unwrap_or_default();
+            if let (Some(N::ParamRef(p)), true) = (
+                tc.arg.as_deref().and_then(|a| a.node.as_ref()),
+                is_range_family(&target),
+            ) {
+                if let Some(slot) = usize::try_from(p.number)
+                    .ok()
+                    .and_then(|n| n.checked_sub(1))
+                    .and_then(|i| inferred.get_mut(i))
+                {
+                    if slot.is_none() {
+                        *slot = Some(target);
+                    }
+                }
+            }
+            continue;
+        }
         let pg_query::NodeRef::AExpr(e) = node else {
             continue;
         };
@@ -7712,19 +7898,26 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             });
         }
         if let Some(name) = func_name(f) {
+            let type_name = range_constructor_type(f).unwrap_or_default();
+            if let (true, Some(text)) = (
+                range::is_range_type(&type_name) || range::is_multirange_type(&type_name),
+                sole_literal_string_arg(f),
+            ) {
+                return cast_value(Bson::String(text), &type_name);
+            }
             // `int4multirange(int4range(1,5), ...)`: each argument is a range.
-            if range::is_multirange_type(&name) {
+            if range::is_multirange_type(&type_name) {
                 let args = f
                     .args
                     .iter()
                     .map(|a| const_value(a, params))
                     .collect::<Result<Vec<_>>>()?;
                 return Ok(Bson::String(range::render_multirange(
-                    &range::multirange_from_args(&args, &name)?,
+                    &range::multirange_from_args(&args, &type_name)?,
                 )));
             }
             // `int4range(1,5)` and friends: a constructor named for its type.
-            if range::is_range_type(&name) {
+            if range::is_range_type(&type_name) {
                 let args = f
                     .args
                     .iter()
@@ -7739,9 +7932,12 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 );
                 return Ok(Bson::String(range::render(&range::from_args(
                     &args,
-                    &name,
+                    &type_name,
                     literal_flags,
                 )?)));
+            }
+            if let Some(result) = range_accessor_value(f, params) {
+                return result.map(|(value, _)| value);
             }
             if scalar::is_scalar(&name) {
                 let args = f
@@ -7801,6 +7997,71 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             ));
         }
         return Ok(Bson::Array(items));
+    }
+    // `a AND b`, `a OR b`, `NOT a` as a VALUE (`select 1 = 1 and 2 = 2`),
+    // in SQL's three-valued logic: AND is false if any operand is false,
+    // else NULL if any is NULL; OR is true if any is true, else NULL if any
+    // is NULL; NOT NULL is NULL.
+    if let Some(N::BoolExpr(b)) = node.node.as_ref() {
+        let truth = |n: &pg_query::protobuf::Node| -> Result<Option<bool>> {
+            let value = const_value(n, params)?;
+            // An UNTYPED string literal is read as a boolean, so `not 'x'`
+            // is the 22P02 of a bad boolean rather than a type mismatch.
+            let value = match n.node.as_ref() {
+                Some(N::AConst(c)) if matches!(c.val, Some(a_const::Val::Sval(_))) => {
+                    cast_value(value, "bool")?
+                }
+                _ => value,
+            };
+            match value {
+                Bson::Null => Ok(None),
+                Bson::Boolean(v) => Ok(Some(v)),
+                other => Err(Error::DatatypeMismatch(format!(
+                    "argument of {} must be type boolean, not type {}",
+                    match BoolExprType::try_from(b.boolop) {
+                        Ok(BoolExprType::AndExpr) => "AND",
+                        Ok(BoolExprType::OrExpr) => "OR",
+                        _ => "NOT",
+                    },
+                    display_type(inferred_type(&other))
+                ))),
+            }
+        };
+        let out = match BoolExprType::try_from(b.boolop) {
+            Ok(BoolExprType::AndExpr) => {
+                let mut acc = Some(true);
+                for a in &b.args {
+                    match truth(a)? {
+                        Some(false) => {
+                            acc = Some(false);
+                            break;
+                        }
+                        None => acc = None,
+                        Some(true) => {}
+                    }
+                }
+                acc
+            }
+            Ok(BoolExprType::OrExpr) => {
+                let mut acc = Some(false);
+                for a in &b.args {
+                    match truth(a)? {
+                        Some(true) => {
+                            acc = Some(true);
+                            break;
+                        }
+                        None => acc = None,
+                        Some(false) => {}
+                    }
+                }
+                acc
+            }
+            Ok(BoolExprType::NotExpr) => {
+                b.args.first().map(truth).transpose()?.flatten().map(|v| !v)
+            }
+            _ => return Err(Error::Unsupported("this boolean operator".into())),
+        };
+        return Ok(out.map_or(Bson::Null, Bson::Boolean));
     }
     if let Some(N::AExpr(e)) = node.node.as_ref() {
         // `NULLIF(a, b)` is an operator node, not a function call: it is `a`
