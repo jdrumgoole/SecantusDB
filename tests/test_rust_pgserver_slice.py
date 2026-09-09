@@ -7359,3 +7359,81 @@ def test_startup_parameter_status_matches_show(home: Path) -> None:
         for name in ("TimeZone", "DateStyle"):
             shown = conn.execute(f"show {name}").fetchone()[0]
             assert conn.info.parameter_status(name) == shown
+
+
+def test_a_table_is_also_its_row_type(home: Path) -> None:
+    """``CREATE TABLE t`` also creates the composite type ``t``.
+
+    psycopg's ``test_array_register`` casts to a table's row type and its
+    array; everything below is measured on PostgreSQL 16.
+    """
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        conn.execute("create table rtt (a int, b text)")
+        conn.execute("create type rten as enum ('a')")
+        assert conn.execute(
+            """select '(1,foo)'::rtt, ('(1,foo)'::rtt).b,
+                      '{"(1,foo)","(2,bar)"}'::rtt[], row(1,'x')::rtt"""
+        ).fetchone() == ("(1,foo)", "foo", '{"(1,foo)","(2,bar)"}', "(1,x)")
+        assert conn.execute(
+            """select pg_typeof('(1,foo)'::rtt)::text, to_regtype('rtt')::text,
+                      to_regtype('rtt[]')::text, to_regtype('_rtt')::text,
+                      to_regtype('rten[]')::text"""
+        ).fetchone() == ("rtt", "rtt", "rtt[]", "rtt[]", "rten[]")
+
+        for sql, sqlstate, message, detail in [
+            (
+                "select '(1,foo,extra)'::rtt",
+                "22P02",
+                'malformed record literal: "(1,foo,extra)"',
+                "Too many columns.",
+            ),
+            ("select '(1)'::rtt", "22P02", 'malformed record literal: "(1)"', "Too few columns."),
+            (
+                "select row(1)::rtt",
+                "42846",
+                "cannot cast type record to rtt",
+                "Input has too few columns.",
+            ),
+            (
+                "select row(1,2,3)::rtt",
+                "42846",
+                "cannot cast type record to rtt",
+                "Input has too many columns.",
+            ),
+        ]:
+            with pytest.raises(psycopg.Error) as exc:
+                conn.execute(sql)
+            assert _diag(exc.value)[:3] == (sqlstate, message, detail), sql
+
+        for sql, sqlstate, message, hint in [
+            (
+                "drop type rtt",
+                "2BP01",
+                "cannot drop type rtt because table rtt requires it",
+                "You can drop table rtt instead.",
+            ),
+            ("create type rtt as enum ('a')", "42710", 'type "rtt" already exists', None),
+            ("create type rtt as (x int)", "42710", 'type "rtt" already exists', None),
+            (
+                "create table rten (x int)",
+                "42710",
+                'type "rten" already exists',
+                "A relation has an associated type of the same name, so you must use "
+                "a name that doesn't conflict with any existing type.",
+            ),
+        ]:
+            with pytest.raises(psycopg.Error) as exc:
+                conn.execute(sql)
+            assert (exc.value.sqlstate, exc.value.diag.message_primary) == (sqlstate, message), sql
+            assert exc.value.diag.message_hint == hint, sql
+
+        # Dropping the table takes its row type with it.
+        conn.execute("drop table rtt")
+        assert conn.execute("select to_regtype('rtt')").fetchone() == (None,)
+        conn.execute("create type rtt as (x int)")
+        with pytest.raises(psycopg.Error) as exc:
+            conn.execute("create table rtt (x int)")
+        assert (exc.value.sqlstate, exc.value.diag.message_primary) == (
+            "42P07",
+            'relation "rtt" already exists',
+        )

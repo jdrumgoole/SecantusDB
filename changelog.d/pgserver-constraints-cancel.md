@@ -46,6 +46,17 @@ refused at CREATE (`42703`, `42830`).
   PostgreSQL's row rule (`row(1, null)` is neither null nor not null); and a
   FROM-less `select unnest(array)` as one row per element in a column named
   `unnest` of the element type.
+- Rust PostgreSQL server: a table is also its row type, as on PostgreSQL —
+  `CREATE TABLE rtt (...)` registers the composite `rtt`, so `'(1,foo)'::rtt`,
+  `'{"(1,foo)"}'::rtt[]`, `row(1,'x')::rtt`, `pg_typeof`, `to_regtype('rtt')`
+  and the `pg_type` / `pg_attribute` rows psycopg's `TypeInfo.fetch` reads all
+  see it; `DROP TABLE` removes it; `DROP TYPE rtt` is `2BP01 cannot drop type
+  rtt because table rtt requires it` with the `You can drop table rtt
+  instead.` hint; and a `CREATE TYPE` / `CREATE TABLE` over an existing type
+  or relation is `42710 type "x" already exists` (with PostgreSQL's hint when
+  a relation collides with a type) or `42P07 relation "x" already exists`.
+  `to_regtype` also resolves a user type's array — `mood[]`, `rtt[]` or the
+  internal `_rtt` spelling — which was NULL for every enum and composite.
 
 #### Fixed
 
@@ -82,3 +93,9 @@ refused at CREATE (`42703`, `42830`).
   at startup now carries the session's values (`UTC`, `ISO, MDY`) rather than
   the wire library's defaults, so what a client caches at connect is what
   `SHOW` reports.
+- Rust PostgreSQL server: a record literal of the wrong width reports
+  PostgreSQL's message and detail — `22P02 malformed record literal: "(1)"`
+  with `Too few columns.` / `Too many columns.`, and `row(1)::rtt` is `42846
+  cannot cast type record to rtt` with `Input has too few columns.` /
+  `Input has too many columns.`; a planner error's `Detail:` line now travels
+  in the error's detail field rather than its message.

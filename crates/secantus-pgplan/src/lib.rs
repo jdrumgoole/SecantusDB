@@ -5571,16 +5571,19 @@ fn parse_composite_text(input: &str) -> Result<Vec<Option<String>>> {
 /// record (`row(1,'x')` / a bound tuple). A field count that disagrees with the
 /// composite's declaration is the 22P02 PostgreSQL reports.
 fn composite_value(value: Bson, target: &str, fields: &[(String, String)]) -> Result<Bson> {
-    let raw: Vec<Bson> = match value {
-        Bson::String(text) => parse_composite_text(&text)?
-            .into_iter()
-            .map(|f| match f {
-                Some(s) => Bson::String(s),
-                None => Bson::Null,
-            })
-            .collect(),
+    let (raw, literal): (Vec<Bson>, Option<String>) = match value {
+        Bson::String(text) => (
+            parse_composite_text(&text)?
+                .into_iter()
+                .map(|f| match f {
+                    Some(s) => Bson::String(s),
+                    None => Bson::Null,
+                })
+                .collect(),
+            Some(text),
+        ),
         other => match record_fields(&other) {
-            Some(items) => items.clone(),
+            Some(items) => (items.clone(), None),
             None => {
                 return Err(Error::Unsupported(format!(
                     "a cast of {} to {target}",
@@ -5589,12 +5592,30 @@ fn composite_value(value: Bson, target: &str, fields: &[(String, String)]) -> Re
             }
         },
     };
+    // Measured on 16: a TEXT literal of the wrong width is 22P02 `malformed
+    // record literal: "(1)"` with `Too few columns.` / `Too many columns.`;
+    // a RECORD (`row(1)::ct`) is 42846 `cannot cast type record to ct` with
+    // `Input has too few columns.` / `Input has too many columns.`.
     if raw.len() != fields.len() {
-        return Err(Error::InvalidText(format!(
-            "malformed record literal: has {} columns, {target} has {}",
-            raw.len(),
-            fields.len()
-        )));
+        let few = raw.len() < fields.len();
+        return Err(match literal {
+            Some(input) => Error::InvalidText(format!(
+                "malformed record literal: \"{input}\"\nDetail: {}",
+                if few {
+                    "Too few columns."
+                } else {
+                    "Too many columns."
+                }
+            )),
+            None => Error::CannotCoerce(format!(
+                "cannot cast type record to {target}\nDetail: {}",
+                if few {
+                    "Input has too few columns."
+                } else {
+                    "Input has too many columns."
+                }
+            )),
+        });
     }
     let mut out = Vec::with_capacity(raw.len());
     for (v, (_, ty)) in raw.into_iter().zip(fields.iter()) {
@@ -5624,18 +5645,37 @@ pub fn regtype_text(oid: i64) -> String {
     {
         return format!("{}[]", display_type(name));
     }
-    if let Some(name) = user_type_name(oid) {
+    let user_name = |oid: i64| user_type_name(oid).or_else(|| user_composite_name(oid));
+    if let Some(name) = user_name(oid) {
         // PostgreSQL renders a regtype per IDENTIFIER PART: a schema-qualified
         // `testschema.testcomp` prints unquoted as `schema.name` (each part
         // quoted by `quote_identifier`'s rule -- measured: `"CamelCase"` and
         // `"order"`, but `mood`), NOT as one quoted `"schema.name"`.
-        return name
-            .split('.')
-            .map(scalar::quote_identifier)
-            .collect::<Vec<_>>()
-            .join(".");
+        return quote_type_path(&name);
+    }
+    // A user type's array: `mood[]`, the element rendered as above.
+    if let Some(name) = user_name(oid - USER_TYPE_ARRAY_OID_OFFSET) {
+        return format!("{}[]", quote_type_path(&name));
     }
     oid.to_string()
+}
+
+fn quote_type_path(name: &str) -> String {
+    name.split('.')
+        .map(scalar::quote_identifier)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// A composite type's resolution NAME by oid -- the reverse of
+/// `user_composite_oid`, for rendering its regtype.
+fn user_composite_name(oid: i64) -> Option<String> {
+    PLAN_USER_COMPOSITES.with(|t| {
+        t.borrow()
+            .iter()
+            .find(|(_, o, _)| *o == oid)
+            .map(|(n, _, _)| n.clone())
+    })
 }
 
 /// Keys of the composite `cast_value` returns for a timestamp that carries
@@ -6262,6 +6302,32 @@ fn canonical_type_ref(name: &str) -> String {
         [schema, name] if schema == "public" => name.clone(),
         [schema, name] => format!("{schema}.{name}"),
         _ => norm.join("."),
+    }
+}
+
+/// A user type's ARRAY type is `element oid + this`, the rule the wire layer
+/// mints `typarray` by for every enum / composite / range / multirange, so the
+/// planner can resolve `to_regtype('mood[]')` without a catalog read.
+pub const USER_TYPE_ARRAY_OID_OFFSET: i64 = 100_000;
+
+/// `to_regtype` on a user type name: `mood`, `mood[]`, or the internal `_mood`
+/// spelling PostgreSQL accepts for an array type (`to_regtype('_rt1')` renders
+/// `rt1[]`). Composites (a table's row type included) resolve through their own
+/// registry because they are not in `PLAN_USER_TYPES`.
+fn user_type_or_array_oid(name: &str) -> Option<i64> {
+    let trimmed = name.trim();
+    let element = if let Some(e) = trimmed.strip_suffix("[]") {
+        Some(e.trim_end())
+    } else if !trimmed.starts_with('"') && trimmed.starts_with('_') {
+        Some(&trimmed[1..])
+    } else {
+        None
+    };
+    match element {
+        Some(e) => user_type_oid(e)
+            .or_else(|| user_composite_oid(e))
+            .map(|oid| oid + USER_TYPE_ARRAY_OID_OFFSET),
+        None => user_type_oid(trimmed).or_else(|| user_composite_oid(trimmed)),
     }
 }
 
@@ -7824,7 +7890,7 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
             // `'text'::regtype` -- unlike `to_regtype`, an unknown NAME is an
             // error here, which is why psycopg prefers the function.
             Bson::String(name) => {
-                match pgtypes::oid_of_name(&name).or_else(|| user_type_oid(&name)) {
+                match pgtypes::oid_of_name(&name).or_else(|| user_type_or_array_oid(&name)) {
                     Some(oid) => Ok(regtype_value(oid)),
                     None => Err(Error::UndefinedObject(format!(
                         "type \"{}\" does not exist",
@@ -9804,7 +9870,7 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             }
             return Ok(match const_value(&f.args[0], params)? {
                 Bson::String(name) => {
-                    match pgtypes::oid_of_name(&name).or_else(|| user_type_oid(&name)) {
+                    match pgtypes::oid_of_name(&name).or_else(|| user_type_or_array_oid(&name)) {
                         Some(oid) => regtype_value(oid),
                         None => Bson::Null,
                     }

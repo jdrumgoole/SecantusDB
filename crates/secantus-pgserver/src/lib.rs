@@ -691,7 +691,7 @@ impl PgHandler {
     const ENUM_TYPE_OID_BASE: i64 = 65_000;
     const RANGE_COLLECTION: &'static str = "__sql_ranges__";
     const RANGE_TYPE_OID_BASE: i64 = 69_000;
-    const USER_TYPE_ARRAY_OID_OFFSET: i64 = 100_000;
+    const USER_TYPE_ARRAY_OID_OFFSET: i64 = secantus_pgplan::USER_TYPE_ARRAY_OID_OFFSET;
     /// A custom range's auto-created multirange type gets `range_oid + this`,
     /// and the multirange's own array type `multirange_oid + array offset`.
     /// Range oids live in the 69_000 band, their arrays at +100_000, so
@@ -1733,6 +1733,18 @@ impl PgHandler {
         Ok(out)
     }
 
+    /// Is `name` the ROW TYPE of a table (a composite recorded by CREATE
+    /// TABLE, `relation: true`) rather than a CREATE TYPE composite?
+    fn row_type_of_table(&self, name: &str) -> PgWireResult<bool> {
+        Ok(self
+            .type_catalog_docs(Self::COMPOSITE_COLLECTION)?
+            .iter()
+            .any(|d| {
+                d.get_str("_id").unwrap_or_default() == name
+                    && d.get_bool("relation").unwrap_or(false)
+            }))
+    }
+
     /// Every composite as `(schema, bare_name, oid, fields)`. `schema` defaults
     /// to `public` for a composite stored before schema qualification (no
     /// `schema` field), so the bare-name resolution is unchanged for those.
@@ -2543,7 +2555,15 @@ impl PgHandler {
     }
 
     fn err(e: &PlanError) -> PgWireError {
-        let mut info = ErrorInfo::new("ERROR".into(), e.sqlstate().into(), e.to_string());
+        // A planner message may carry PostgreSQL's DETAIL line after the
+        // primary one; it travels in the `D` field, not the message.
+        let text = e.to_string();
+        let (message, detail) = match text.split_once("\nDetail: ") {
+            Some((m, d)) => (m.to_string(), Some(d.to_string())),
+            None => (text, None),
+        };
+        let mut info = ErrorInfo::new("ERROR".into(), e.sqlstate().into(), message);
+        info.detail = detail;
         info.hint = e.hint().map(str::to_string);
         PgWireError::UserError(Box::new(info))
     }
@@ -3664,17 +3684,20 @@ impl PgHandler {
             Statement::Update(u) => vec![u.table.clone()],
             Statement::Delete(d) => vec![d.table.clone()],
             Statement::CopyFrom(c) => vec![c.table.clone()],
+            // A table's ROW TYPE is a composite, so its catalog moves too.
             Statement::CreateTable(def, _) => {
                 vec![
                     def.name.clone(),
                     CATALOG_COLLECTION.to_string(),
                     SEQUENCE_COLLECTION.to_string(),
+                    Self::COMPOSITE_COLLECTION.to_string(),
                 ]
             }
             Statement::DropTable(d) => {
                 let mut v = d.tables.clone();
                 v.push(CATALOG_COLLECTION.to_string());
                 v.push(SEQUENCE_COLLECTION.to_string());
+                v.push(Self::COMPOSITE_COLLECTION.to_string());
                 v
             }
             // CREATE/DROP TYPE writes a type-catalog row; a `ROLLBACK TO`
@@ -5421,6 +5444,33 @@ impl PgHandler {
                         format!("relation \"{}\" already exists", def.name),
                     ))));
                 }
+                // The table's name is also its ROW TYPE's, so it must be free
+                // as a type. Measured on 16: over a composite (which is a
+                // relation too) it is 42P07; over an enum, a range or a
+                // builtin it is 42710 with the hint.
+                if self.composites()?.iter().any(|(n, _, _)| *n == def.name) {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42P07".into(),
+                        format!("relation \"{}\" already exists", def.name),
+                    ))));
+                }
+                if self.enums()?.iter().any(|(n, _, _)| *n == def.name)
+                    || self.ranges()?.iter().any(|(n, _, _)| *n == def.name)
+                    || secantus_pgplan::pgtypes::oid_of_name(&def.name).is_some()
+                {
+                    let mut info = ErrorInfo::new(
+                        "ERROR".into(),
+                        "42710".into(),
+                        format!("type \"{}\" already exists", def.name),
+                    );
+                    info.hint = Some(
+                        "A relation has an associated type of the same name, so you must \
+                         use a name that doesn't conflict with any existing type."
+                            .into(),
+                    );
+                    return Err(PgWireError::UserError(Box::new(info)));
+                }
                 // A FOREIGN KEY to another table names its PRIMARY KEY (the
                 // planner settled self-references, which need no lookup).
                 for fk in &mut def.foreign_keys {
@@ -5480,6 +5530,38 @@ impl PgHandler {
                         .insert(self.db(), SEQUENCE_COLLECTION, sequences, true)
                         .map_err(|e| Self::storage_err("could not record a sequence", e))?;
                 }
+                // The table's ROW TYPE: a composite of its columns, in the
+                // type catalog like any other so `'(foo)'::mytype`,
+                // `mytype[]`, `pg_type` and `to_regtype` all find it. Marked
+                // `relation` so DROP TYPE refuses it and DROP TABLE takes it.
+                self.ensure_collection(Self::COMPOSITE_COLLECTION)?;
+                self.ensure_collection(Self::ENUM_META_COLLECTION)?;
+                let oid = self.mint_composite_oid()?;
+                let field_docs: Vec<Bson> = def
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        Bson::Array(vec![
+                            Bson::String(c.name.clone()),
+                            Bson::String(c.pg_type.clone()),
+                            Bson::Null,
+                        ])
+                    })
+                    .collect();
+                let row_type = bson::doc! {
+                    "_id": &def.name,
+                    "composite": &def.name,
+                    "schema": "public",
+                    "fields": field_docs,
+                    "oid": oid,
+                    "relation": true,
+                };
+                let bytes = bson::to_vec(&row_type)
+                    .map_err(|e| Self::storage_err("could not encode the row type", e))?;
+                self.storage
+                    .insert(self.db(), Self::COMPOSITE_COLLECTION, vec![bytes], true)
+                    .map_err(|e| Self::storage_err("could not record the row type", e))?;
+                self.note_uncommitted_type(Self::COMPOSITE_COLLECTION, &def.name, Some(row_type));
                 // Remember it for the rest of this transaction: the catalog row
                 // above is not committed yet, so a plain read cannot see it.
                 self.note_uncommitted(&def.name, Some(def.clone()));
@@ -5833,7 +5915,10 @@ impl PgHandler {
                     .iter()
                     .any(|(s, n, _, _)| *s == schema_name && *n == name);
                 let exists = enum_dup
-                    || (unqualified && secantus_pgplan::pgtypes::oid_of_name(&name).is_some());
+                    || (unqualified
+                        && (secantus_pgplan::pgtypes::oid_of_name(&name).is_some()
+                            || self.composites()?.iter().any(|(n, _, _)| *n == name)
+                            || self.ranges()?.iter().any(|(n, _, _)| *n == name)));
                 if exists {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
@@ -5866,6 +5951,17 @@ impl PgHandler {
                 self.ensure_collection(Self::COMPOSITE_COLLECTION)?;
                 self.ensure_collection(Self::RANGE_COLLECTION)?;
                 for name in &names {
+                    // A table's row type goes with the table, not on its own
+                    // (measured on 16).
+                    if self.row_type_of_table(name)? {
+                        let mut info = ErrorInfo::new(
+                            "ERROR".into(),
+                            "2BP01".into(), // dependent_objects_still_exist
+                            format!("cannot drop type {name} because table {name} requires it"),
+                        );
+                        info.hint = Some(format!("You can drop table {name} instead."));
+                        return Err(PgWireError::UserError(Box::new(info)));
+                    }
                     let filter = bson::doc! {"_id": name};
                     let from_enum = self
                         .storage
@@ -5972,6 +6068,23 @@ impl PgHandler {
                             None,
                         )
                         .map_err(|e| Self::storage_err("could not drop the catalog entry", e))?;
+                    // And its ROW TYPE (a table created before row types were
+                    // recorded has none to drop).
+                    self.ensure_collection(Self::COMPOSITE_COLLECTION)?;
+                    let dropped = self
+                        .storage
+                        .delete_matching(
+                            self.db(),
+                            Self::COMPOSITE_COLLECTION,
+                            &bson::doc! { "_id": table, "relation": true },
+                            0,
+                            &Document::new(),
+                            None,
+                        )
+                        .map_err(|e| Self::storage_err("could not drop the row type", e))?;
+                    if dropped > 0 {
+                        self.note_uncommitted_type(Self::COMPOSITE_COLLECTION, table, None);
+                    }
                     // A tombstone: the catalog row is deleted but not
                     // committed, so a plain read would still find it.
                     self.note_uncommitted(table, None);

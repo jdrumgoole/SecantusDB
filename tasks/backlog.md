@@ -5662,15 +5662,6 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   is supported; the named form would need the wire layer's prepared-statement
   store, and PostgreSQL answers `26000` for a name that does not exist, so
   accepting it as a no-op would be a wrong answer.
-- [ ] **OPEN — Rust PG server: a table's row type is not a composite type
-  (2026-09-09).** `create table mytype (data text); select '(foo)'::mytype`
-  is `a cast to mytype is not supported yet` (0A000); PostgreSQL 16 answers
-  `(foo)`, and `TypeInfo.fetch(conn, "mytype")` finds a `pg_type` row with
-  `typrelid` = the table's `pg_class` oid. There is no `pg_class` and no
-  per-table oid anywhere in the shared catalog, so this needs an oid minted
-  at `CREATE TABLE` (a contract with the Python server's `__sql_*__` docs),
-  a `pg_type` row per table, and `composites_with_schema` folding tables in
-  with their columns as the field list. psycopg `test_array_register`.
 - [ ] **OPEN — Rust PG server: the `aclitem` type (2026-09-09).**
   `select '{postgres=r/postgres}'::aclitem[]` is `a cast to aclitem is not
   supported yet`; on PostgreSQL 16 it is oid 1033 / array 1034, and its
@@ -5744,12 +5735,12 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   goes through ryu, so `1e20::float4` is `1e20` where PostgreSQL 16 prints
   `1e+20`. Same fix as `geo::float8_text`, with float4's 6-digit shortest
   round-trip.
-- **Rust PG server: psycopg's `test_array.py` is 156/158 (2026-09-09).**
+- **Rust PG server: psycopg's `test_array.py` is 157/158 (2026-09-09).**
   Multidimensional arrays round-trip in text and binary both ways,
   `INSERT … RETURNING`, the `box` type and its `;` array separator all
-  land; what is left is a table's row type as a composite
-  (`test_array_register`) and `test_array_of_unknown_builtin` (`aclitem`),
-  both above.
+  land, and a table's row type is a composite (`test_array_register`,
+  2026-09-09); what is left is `test_array_of_unknown_builtin` (`aclitem`),
+  above.
 
 - [x] **Five probes never compared the Rust server — instrumented 2026-09-02.**
   `tools/probes/_servers.py` is now the shared `probe_targets()` helper, and

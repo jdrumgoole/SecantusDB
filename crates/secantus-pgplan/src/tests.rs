@@ -2863,3 +2863,41 @@ fn create_and_drop_database_plan() {
         other => panic!("wrong statement: {other:?}"),
     }
 }
+
+/// `to_regtype` resolves a user type's ARRAY -- `mood[]`, `rt1[]` for a
+/// table's row type, or PostgreSQL's internal `_rt1` spelling -- to the
+/// element's oid plus the array offset, and renders it back as `name[]`.
+/// Measured on PostgreSQL 16: `to_regtype('_rt1')::text` is `rt1[]`; an
+/// unknown element stays NULL.
+#[test]
+fn to_regtype_resolves_user_type_arrays() {
+    set_user_types(vec![("mood".into(), 65_001, vec!["a".into()])]);
+    set_user_composites(vec![(
+        "rt1".into(),
+        67_002,
+        vec![("data".into(), "text".into())],
+    )]);
+    let regtype = |sql: &str| match plan_ok(sql) {
+        Statement::SelectConstant(sc) => match &sc.columns[0].1 {
+            ConstCol::Value(Bson::Null) => None,
+            ConstCol::Value(v) => Some(regtype_text(regtype_oid(v).expect("a regtype"))),
+            other => panic!("not a value for {sql}: {other:?}"),
+        },
+        other => panic!("wrong statement for {sql}: {other:?}"),
+    };
+    for (sql, want) in [
+        ("SELECT to_regtype('mood')", Some("mood")),
+        ("SELECT to_regtype('mood[]')", Some("mood[]")),
+        ("SELECT to_regtype('MOOD []')", Some("mood[]")),
+        ("SELECT to_regtype('_mood')", Some("mood[]")),
+        ("SELECT to_regtype('rt1')", Some("rt1")),
+        ("SELECT to_regtype('rt1[]')", Some("rt1[]")),
+        ("SELECT to_regtype('_rt1')", Some("rt1[]")),
+        ("SELECT to_regtype('nope[]')", None),
+        ("SELECT to_regtype('_nope')", None),
+    ] {
+        assert_eq!(regtype(sql).as_deref(), want, "for {sql}");
+    }
+    set_user_types(Vec::new());
+    set_user_composites(Vec::new());
+}
