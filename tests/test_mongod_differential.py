@@ -3079,6 +3079,68 @@ NAN_EXPR_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
 ]
 
 
+# --- $toDate string formats -----------------------------------------------
+#
+# mongod runs timelib, not an ISO-8601 parser. Measured 2026-09-09; wider sweep
+# in `tools/probes/todate_string_formats.py`. The REJECTIONS matter as much as
+# the acceptances -- a parser that takes too much is as wrong as one that takes
+# too little.
+
+TODATE_STRINGS = [
+    "12/31/2020",
+    "1/2/2020",
+    "12/31/2020 10:30",
+    "2020/12/31",
+    "2020-1-1",
+    "Dec 31 2020",
+    "31 December 2020",
+    "Dec 31, 2020",
+    "@1577836800",
+    "@-1",
+    "@1577836800.5",
+    "20200101",
+    "20200101T120000",
+    "2020-W01-1",
+    "2020-01-01T00",
+    "2020-01-01 ",
+    "  2020-01-01",
+    # A trailing letter is a MILITARY zone: `T` is UTC-7, `J` is invalid.
+    "2020-01-01T",
+    "2020-01-01t",
+    "2020-01-01A",
+    "2020-01-01Z",
+    "2020-01-01J",
+    # Refusals.
+    "31/12/2020",
+    "13/01/2020",
+    "12/32/2020",
+    "2020-02-30",
+    "2020",
+    "",
+]
+
+
+def _todate(text: str) -> Callable[[Database], object]:
+    def run(db: Database) -> object:
+        from pymongo.errors import OperationFailure
+
+        db.c.delete_many({})
+        db.c.insert_one({"_id": 1, "s": text})
+        try:
+            return list(db.c.aggregate([{"$project": {"v": {"$toDate": "$s"}}}]))[0].get("v")
+        except OperationFailure as exc:
+            # The per-position timelib diagnostic is deliberately out of scope,
+            # so this compares the CODE rather than mongod's scanner text.
+            return ("ERR", exc.code)
+
+    return run
+
+
+TODATE_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    (f"s{i}", ONE, _todate(text)) for i, text in enumerate(TODATE_STRINGS)
+]
+
+
 ALL_CASES = (
     [("query", c) for c in QUERY_CASES]
     + [("readpath", c) for c in READPATH_CASES]
@@ -3111,6 +3173,7 @@ ALL_CASES = (
     + [("sortpath", c) for c in SORTPATH_CASES]
     + [("rename", c) for c in RENAME_CASES]
     + [("nanexpr", c) for c in NAN_EXPR_CASES]
+    + [("todate", c) for c in TODATE_CASES]
 )
 
 

@@ -4337,6 +4337,311 @@ fn render_date_at(millis: i64, fmt: &str, offset_ms: i64) -> Result<String, Fall
 /// forms treated as UTC, plus a full datetime with a trailing `Z` or a fixed
 /// `±HH:MM` offset (`utc = wall - offset`). Fractional seconds / other shapes →
 /// `None` (defer).
+/// timelib's MILITARY timezone letters, which mongod inherits: `A`-`I` are
+/// UTC+1..+9, `J` is invalid ("local"), `K`-`M` are +10..+12, `N`-`Y` are
+/// -1..-12 and `Z` is UTC.
+///
+/// This is why `{$toDate: "2020-01-01T"}` answers `07:00:00` rather than
+/// midnight: the trailing `T` is not the ISO date/time separator there, it is
+/// the zone UTC-7. Deterministic, and NOT host-local -- a `TZ=UTC` mongod
+/// answers the same (measured 8.2.11, 2026-09-09, across ten letters).
+fn military_zone_hours(c: char) -> Option<i64> {
+    let up = c.to_ascii_uppercase();
+    match up {
+        'A'..='I' => Some(up as i64 - 'A' as i64 + 1),
+        'K'..='M' => Some(up as i64 - 'K' as i64 + 10),
+        'N'..='Y' => Some(-(up as i64 - 'N' as i64 + 1)),
+        'Z' => Some(0),
+        _ => None, // 'J' is deliberately absent -- mongod rejects it too.
+    }
+}
+
+const MONTH_NAMES: [&str; 12] = [
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+];
+
+fn month_from_name(name: &str) -> Option<i64> {
+    let lower = name.to_ascii_lowercase();
+    MONTH_NAMES
+        .iter()
+        .position(|full| *full == lower || (lower.len() == 3 && full.starts_with(&lower)))
+        .map(|i| i as i64 + 1)
+}
+
+/// Assemble epoch milliseconds, rejecting an out-of-range month or day.
+///
+/// mongod REFUSES `13/01/2020` and `12/32/2020`, so this is a parse failure
+/// rather than a rollover.
+fn civil_millis(y: i64, m: i64, d: i64, hh: i64, mi: i64, se: i64, ms: i64) -> Option<i128> {
+    if !(1..=12).contains(&m) || d < 1 {
+        return None;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let dim = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    if d > dim[(m - 1) as usize] {
+        return None;
+    }
+    if !(0..24).contains(&hh) || !(0..60).contains(&mi) || !(0..=60).contains(&se) {
+        return None;
+    }
+    let days = days_from_civil(y, m, d);
+    Some((days as i128) * 86_400_000 + (hh * 3_600_000 + mi * 60_000 + se * 1_000 + ms) as i128)
+}
+
+/// `HH[:MM[:SS[.frac]]]` -> `(h, m, s, ms)`.
+fn parse_clock(text: &str) -> Option<(i64, i64, i64, i64)> {
+    let (main, ms) = match text.split_once('.') {
+        Some((head, frac)) => {
+            let digits: String = frac.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if digits.is_empty() || digits.len() != frac.len() {
+                return None;
+            }
+            let mut three = digits.clone();
+            three.truncate(3);
+            while three.len() < 3 {
+                three.push('0');
+            }
+            (head, three.parse::<i64>().ok()?)
+        }
+        None => (text, 0),
+    };
+    let mut it = main.split(':');
+    let h = it.next()?.parse::<i64>().ok()?;
+    let m = it
+        .next()
+        .map(str::parse::<i64>)
+        .transpose()
+        .ok()?
+        .unwrap_or(0);
+    let s = it
+        .next()
+        .map(str::parse::<i64>)
+        .transpose()
+        .ok()?
+        .unwrap_or(0);
+    if it.next().is_some() {
+        return None;
+    }
+    Some((h, m, s, ms))
+}
+
+/// The non-ISO date shapes mongod accepts, or `None` if this is not one.
+///
+/// mongod's `$toDate` runs **timelib's** parser, not an ISO-8601 one, and takes
+/// a whole format table this server used to reject: the US `MM/DD/YYYY` slash
+/// form (`31/12/2020` is REFUSED, so it is a locale rule and not
+/// ambiguity-resolution), `YYYY/MM/DD`, month NAMES in either order, non-padded
+/// ISO components, and `@<unix seconds>`. Measured against 8.2.11, 2026-09-09;
+/// mirrors `secantus.expressions._parse_timelib_forms`.
+///
+/// The month-NAME forms are matched before any split on whitespace, because
+/// their date part contains spaces.
+fn parse_timelib_forms(text: &str) -> Option<i128> {
+    if let Some(rest) = text.strip_prefix('@') {
+        let (whole, frac) = match rest.split_once('.') {
+            Some((w, f)) => (w, Some(f)),
+            None => (rest, None),
+        };
+        let secs = whole.parse::<i64>().ok()?;
+        let mut ms = 0i64;
+        if let Some(f) = frac {
+            if f.is_empty() || !f.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            let mut three = f.to_string();
+            three.truncate(3);
+            while three.len() < 3 {
+                three.push('0');
+            }
+            ms = three.parse::<i64>().ok()?;
+        }
+        return Some((secs as i128) * 1000 + ms as i128);
+    }
+    // Month-name forms, either order, with an optional comma.
+    let cleaned = text.replace(',', " ");
+    let words: Vec<&str> = cleaned.split_whitespace().collect();
+    if words.len() == 3 {
+        let numeric = |w: &str| w.parse::<i64>().ok();
+        if let (Some(month), Some(day), Some(year)) = (
+            month_from_name(words[0]),
+            numeric(words[1]),
+            numeric(words[2]),
+        ) {
+            return civil_millis(year, month, day, 0, 0, 0, 0);
+        }
+        if let (Some(day), Some(month), Some(year)) = (
+            numeric(words[0]),
+            month_from_name(words[1]),
+            numeric(words[2]),
+        ) {
+            return civil_millis(year, month, day, 0, 0, 0, 0);
+        }
+    }
+    // Numeric forms, with an optional trailing clock.
+    let (body, clock) = match text.split_once(' ') {
+        Some((b, c)) => (b, c.trim()),
+        None => (text, ""),
+    };
+    let (hh, mi, se, ms) = if clock.is_empty() {
+        (0, 0, 0, 0)
+    } else {
+        parse_clock(clock)?
+    };
+    let nums: Vec<&str> = if body.contains('/') {
+        body.split('/').collect()
+    } else if body.matches('-').count() == 2 {
+        body.split('-').collect()
+    } else {
+        return None;
+    };
+    if nums.len() != 3
+        || !nums
+            .iter()
+            .all(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+    {
+        return None;
+    }
+    let a = nums[0].parse::<i64>().ok()?;
+    let b = nums[1].parse::<i64>().ok()?;
+    let c = nums[2].parse::<i64>().ok()?;
+    if nums[0].len() == 4 {
+        // Year first: `YYYY/MM/DD` and non-padded `YYYY-M-D`.
+        civil_millis(a, b, c, hh, mi, se, ms)
+    } else if body.contains('/') && nums[2].len() == 4 {
+        // US month-first slash form.
+        civil_millis(c, a, b, hh, mi, se, ms)
+    } else {
+        None
+    }
+}
+
+/// `YYYY-Www-D` -- the ISO week date. Week 1 contains the first Thursday of the
+/// year and day 1 is Monday, so `2020-W01-1` is 2019-12-30.
+fn parse_iso_week(text: &str) -> Option<i128> {
+    let bytes = text.as_bytes();
+    if text.len() != 10 || bytes[4] != b'-' || !(bytes[5] == b'W' || bytes[5] == b'w') {
+        return None;
+    }
+    if bytes[8] != b'-' {
+        return None;
+    }
+    let year = text[0..4].parse::<i64>().ok()?;
+    let week = text[6..8].parse::<i64>().ok()?;
+    let day = text[9..10].parse::<i64>().ok()?;
+    if !(1..=53).contains(&week) || !(1..=7).contains(&day) {
+        return None;
+    }
+    // The Monday of ISO week 1: back up from Jan 4th, which is always in it.
+    let jan4 = days_from_civil(year, 1, 4);
+    // `days_from_civil(1970,1,1)` is 0, a Thursday, so weekday = (days+3) mod 7
+    // with Monday = 0.
+    let jan4_dow = (jan4 + 3).rem_euclid(7);
+    let week1_monday = jan4 - jan4_dow;
+    let days = week1_monday + (week - 1) * 7 + (day - 1);
+    Some((days as i128) * 86_400_000)
+}
+
+/// Every string shape `$toDate` accepts: ISO-8601, a trailing MILITARY zone
+/// letter, then timelib's other forms. Mirrors
+/// `secantus.expressions._parse_date_string`'s order.
+fn parse_date_text(text: &str) -> Option<i128> {
+    if let Some(ms) = parse_iso(text) {
+        return Some(ms);
+    }
+    // Surrounding whitespace is tolerated. A whitespace-ONLY string trims to
+    // empty and still fails, which is what mongod does with it.
+    let trimmed = text.trim();
+    if trimmed != text && !trimmed.is_empty() {
+        return parse_date_text(trimmed);
+    }
+    // `YYYY-MM-DDTHH` -- an hour with no minutes, which `parse_iso`'s
+    // fixed-length forms do not cover.
+    if let Some((date, hour)) = text.split_once(['T', 't']) {
+        if hour.len() == 2 && hour.chars().all(|c| c.is_ascii_digit()) {
+            for filled in [format!("{date}T{hour}:00:00"), format!("{date}T{hour}:00")] {
+                if let Some(ms) = parse_date_text(&filled) {
+                    return Some(ms);
+                }
+            }
+        }
+    }
+    // Compact `YYYYMMDDTHHMMSS` -- the basic-format ISO timestamp, which the
+    // fixed-length forms in `parse_iso` do not cover.
+    if text.len() == 15 {
+        let (date, rest) = text.split_at(8);
+        if let Some(time) = rest.strip_prefix(['T', 't']) {
+            if date.chars().all(|c| c.is_ascii_digit()) && time.chars().all(|c| c.is_ascii_digit())
+            {
+                let hh = time[0..2].parse::<i64>().ok();
+                let mi = time[2..4].parse::<i64>().ok();
+                let se = time[4..6].parse::<i64>().ok();
+                if let (Some(hh), Some(mi), Some(se)) = (hh, mi, se) {
+                    let y = date[0..4].parse::<i64>().ok();
+                    let m = date[4..6].parse::<i64>().ok();
+                    let d = date[6..8].parse::<i64>().ok();
+                    if let (Some(y), Some(m), Some(d)) = (y, m, d) {
+                        if let Some(ms) = civil_millis(y, m, d, hh, mi, se, 0) {
+                            return Some(ms);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Compact `YYYYMMDD`.
+    if text.len() == 8 && text.chars().all(|c| c.is_ascii_digit()) {
+        let y = text[0..4].parse::<i64>().ok()?;
+        let m = text[4..6].parse::<i64>().ok()?;
+        let d = text[6..8].parse::<i64>().ok()?;
+        if let Some(ms) = civil_millis(y, m, d, 0, 0, 0, 0) {
+            return Some(ms);
+        }
+    }
+    // ISO WEEK date, `YYYY-Www-D`: week 1 is the one holding the first
+    // Thursday, and day 1 is Monday -- so `2020-W01-1` is 2019-12-30.
+    if let Some(ms) = parse_iso_week(text) {
+        return Some(ms);
+    }
+    // A trailing military zone letter -- see `military_zone_hours`.
+    if text.chars().count() > 1 {
+        if let Some(last) = text.chars().last() {
+            if let Some(hours) = military_zone_hours(last) {
+                let head = text[..text.len() - last.len_utf8()].trim_end();
+                if !head.is_empty() {
+                    if let Some(ms) = parse_date_text(head) {
+                        return Some(ms - (hours as i128) * 3_600_000);
+                    }
+                }
+            }
+        }
+    }
+    parse_timelib_forms(text)
+}
+
 fn parse_iso(s: &str) -> Option<i128> {
     // A FRACTIONAL second is truncated to milliseconds and then removed, so the
     // exact-length checks below still see the plain forms. mongod takes 1..n
@@ -5835,7 +6140,7 @@ fn convert_value(value: &Bson, code: i32) -> Conv {
             // abbreviation tables and its per-position error accumulation. This
             // matches `secantus.expressions._parse_date_string`, so the two
             // servers agree; the shared gap is documented in `tasks/backlog.md`.
-            Bson::String(text) => match parse_iso(text) {
+            Bson::String(text) => match parse_date_text(text) {
                 Some(ms) => Conv::Ok(Bson::DateTime(bson::DateTime::from_millis(ms as i64))),
                 None => Conv::Named(date_string_parse_error(text)),
             },
