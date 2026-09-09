@@ -39,6 +39,11 @@ pub enum Error {
     Unsupported(String),
     /// A column the table does not have -> 42703.
     UndefinedColumn(String),
+    /// A field a composite or record value does not have -> 42703. Carries
+    /// the whole message, because PostgreSQL words it by the SOURCE type:
+    /// `column "x" not found in data type t` for a named composite and
+    /// `could not identify column "x" in record data type` for a bare record.
+    UndefinedField(String),
     /// A table the catalog does not have -> 42P01.
     UndefinedTable(String),
     /// A bare column beside an aggregate, not in GROUP BY -> 42803.
@@ -94,6 +99,7 @@ impl std::fmt::Display for Error {
             Error::Parse(m) => write!(f, "{m}"),
             Error::Unsupported(m) => write!(f, "{m} is not supported yet"),
             Error::UndefinedColumn(c) => write!(f, "column \"{c}\" does not exist"),
+            Error::UndefinedField(m) => write!(f, "{m}"),
             Error::UndefinedTable(t) => write!(f, "relation \"{t}\" does not exist"),
             Error::Grouping(m) => write!(f, "{m}"),
             Error::Parameter(m) => write!(f, "{m}"),
@@ -126,7 +132,7 @@ impl Error {
         match self {
             Error::Parse(_) => "42601",       // syntax_error
             Error::Unsupported(_) => "0A000", // feature_not_supported
-            Error::UndefinedColumn(_) => "42703",
+            Error::UndefinedColumn(_) | Error::UndefinedField(_) => "42703",
             Error::UndefinedTable(_) => "42P01",
             Error::Grouping(_) => "42803",    // grouping_error
             Error::Parameter(_) => "42P02",   // undefined_parameter
@@ -7737,8 +7743,12 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 format!("could not identify column \"{field}\" in record data type"),
             )
         };
-        let idx = idx.ok_or(Error::UndefinedColumn(err))?;
-        return Ok(fields.get(idx).cloned().unwrap_or(Bson::Null));
+        // A position past the end is the same error as an unknown name: an
+        // anonymous record has exactly as many `fN` fields as it has values.
+        return fields
+            .get(idx.ok_or_else(|| Error::UndefinedField(err.clone()))?)
+            .cloned()
+            .ok_or(Error::UndefinedField(err));
     }
     if let Some(N::FuncCall(f)) = node.node.as_ref() {
         if func_name(f).as_deref() == Some("pg_typeof") {

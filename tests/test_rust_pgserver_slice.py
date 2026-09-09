@@ -4098,9 +4098,21 @@ def test_field_selection_from_record_and_composite(home: Path) -> None:
         cur.execute("SELECT (NULL::fc).bar")
         assert cur.fetchone()[0] is None
 
-        # An unknown field is a 42703 UndefinedColumn.
-        with pytest.raises(psycopg.errors.UndefinedColumn):
+        # An unknown field is a 42703 UndefinedColumn, worded by the SOURCE
+        # type: PostgreSQL names the composite for a named type and says
+        # "record data type" for an anonymous row.
+        with pytest.raises(psycopg.errors.UndefinedColumn) as exc:
             cur.execute("SELECT (row('x', 42, 3.5)::fc).nope").fetchone()
+        assert exc.value.diag.message_primary == 'column "nope" not found in data type fc'
+        # An anonymous record has exactly as many fN fields as values: a
+        # position past the end, f0, and a non-positional name are all the
+        # same error -- a NULL for `.f3` here was a silent divergence.
+        for field in ("f3", "f0", "zz"):
+            with pytest.raises(psycopg.errors.UndefinedColumn) as exc:
+                cur.execute(f"SELECT (row(1, 'x')).{field}").fetchone()
+            assert exc.value.diag.message_primary == (
+                f'could not identify column "{field}" in record data type'
+            )
 
 
 def test_composite_value_equality_is_null_blind(home: Path) -> None:
