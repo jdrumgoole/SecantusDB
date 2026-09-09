@@ -90,13 +90,12 @@ where
                     client.feed(PgWireBackendMessage::CopyData(data)).await?;
                 }
             }
-            Err(e) => {
-                let copy_fail = CopyFail::new(format!("{}", e));
-                client
-                    .send(PgWireBackendMessage::CopyFail(copy_fail))
-                    .await?;
-                return Err(e);
-            }
+            // SecantusDB local patch: `CopyFail` is a FRONTEND message -- a
+            // backend that sends one mid-COPY makes libpq drop the connection
+            // ("unexpected response from server; first received character was
+            // 'f'"). PostgreSQL ends a failed COPY OUT with the ErrorResponse
+            // alone, which the caller sends for the returned error.
+            Err(e) => return Err(e),
         }
     }
 
@@ -144,13 +143,12 @@ where
                     client.feed(PgWireBackendMessage::CopyData(data)).await?;
                 }
             }
-            Err(e) => {
-                let copy_fail = CopyFail::new(format!("{}", e));
-                client
-                    .send(PgWireBackendMessage::CopyFail(copy_fail))
-                    .await?;
-                return Err(e);
-            }
+            // SecantusDB local patch: `CopyFail` is a FRONTEND message -- a
+            // backend that sends one mid-COPY makes libpq drop the connection
+            // ("unexpected response from server; first received character was
+            // 'f'"). PostgreSQL ends a failed COPY OUT with the ErrorResponse
+            // alone, which the caller sends for the returned error.
+            Err(e) => return Err(e),
         }
     }
 

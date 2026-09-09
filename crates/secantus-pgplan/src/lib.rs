@@ -279,10 +279,14 @@ pub enum Statement {
     /// Only the ALL form. The prepared-statement store belongs to the wire
     /// layer here, not to the planner, so this is a no-op that answers with
     /// PostgreSQL's tag — which is what a client asking to reset its cache
-    /// needs. `DEALLOCATE <name>` is still refused rather than treated as a
-    /// no-op: PostgreSQL answers 26000 for a name that does not exist, and
-    /// silently succeeding there would be a wrong answer.
+    /// needs.
     DeallocateAll,
+    /// `DEALLOCATE <name>`: the wire layer drops that one prepared statement,
+    /// answering 26000 when no statement of the name exists.
+    Deallocate(String),
+    /// `NOTIFY channel [, payload]`, completing with the `NOTIFY` tag. No
+    /// LISTEN exists here, so there is no delivery.
+    Notify,
     /// `COPY <table> [(cols)] FROM STDIN`.
     CopyFrom(CopyFrom),
     /// `COPY <table> [(cols)] TO STDOUT`.
@@ -808,6 +812,11 @@ pub struct Update {
     /// timestamp must clear any remainder the row already carried, or it
     /// reports a time that was never stored.
     pub unset: Vec<String>,
+    /// SET values that read the row -- `num = num * 2`, `s = upper(s)`.
+    /// Each is (stored field, declared column type, expression); the server
+    /// evaluates them per matched row with `update_row_sets` and writes the
+    /// result by `_id`, because a constant `$set` cannot express them.
+    pub set_exprs: Vec<(String, String, ColumnExpr)>,
     pub filter: Document,
 }
 
@@ -1127,7 +1136,12 @@ pub fn plan_with_params(
         N::ClosePortalStmt(c) => Ok(Statement::CloseCursor(c.portalname.clone())),
         // `DEALLOCATE ALL` carries no name; `DEALLOCATE x` names one.
         N::DeallocateStmt(d) if d.name.is_empty() => Ok(Statement::DeallocateAll),
-        N::DeallocateStmt(_) => Err(Error::Unsupported("DEALLOCATE <name>".into())),
+        N::DeallocateStmt(d) => Ok(Statement::Deallocate(d.name.clone())),
+        // `NOTIFY channel [, payload]`: nothing LISTENs on this server, so
+        // there is nobody to deliver to, and PostgreSQL's answer to a NOTIFY
+        // with no listener is the bare `NOTIFY` tag -- which is all a client
+        // preparing the statement (psycopg's `test_misc_statement`) sees.
+        N::NotifyStmt(_) => Ok(Statement::Notify),
         N::VariableSetStmt(v) => plan_set(&v),
         N::TransactionStmt(t) => {
             // Named enum, not the wire integer -- twice bitten already.
@@ -3455,10 +3469,16 @@ fn inferred_type(v: &Bson) -> &'static str {
             Some(Bson::Double(_)) => "float8[]",
             Some(Bson::Decimal128(_)) => "numeric[]",
             Some(Bson::Boolean(_)) => "bool[]",
+            Some(Bson::Binary(_)) => "bytea[]",
             Some(other) if geo::is_box(other) => "box[]",
             _ => "text[]",
         },
         Bson::Boolean(_) => "bool",
+        // A bytea value is stored as BSON binary. Typing it as text made a
+        // BINARY-format `set_byte(...)` result hit the text encoder ("cannot
+        // send this value as a binary text") while the same query in text
+        // format rendered `\x..` under oid 17.
+        Bson::Binary(_) => "bytea",
         other if geo::is_box(other) => "box",
         _ => "text",
     }
@@ -3782,6 +3802,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
             .and_then(|v| v.node.as_ref())
         {
             Some(N::FuncCall(f)) => {
+                refuse_untyped_any_args(f)?;
                 let name = f
                     .funcname
                     .iter()
@@ -7350,11 +7371,25 @@ pub fn uuid_from_wire(bytes: &[u8]) -> Option<String> {
     ))
 }
 
+/// A UUID's 16-byte BINARY wire form (`uuid_send`) from its text, in any
+/// spelling `uuid_in` accepts; `None` when the text is not a uuid.
+pub fn uuid_to_wire(text: &str) -> Option<Vec<u8>> {
+    let canonical = parse_uuid(text)?;
+    let hex: String = canonical.chars().filter(|c| *c != '-').collect();
+    (0..16)
+        .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok())
+        .collect()
+}
+
 /// Parse a UUID the way PostgreSQL's `uuid_in` does and return its canonical
-/// lowercase `8-4-4-4-12` text. Optional surrounding braces, and a hyphen is
-/// tolerated only at the four standard group boundaries (after 8, 12, 16 and
-/// 20 hex digits); a hyphen anywhere else, any non-hex character, whitespace,
-/// or a count other than 32 hex digits is rejected (`22P02`).
+/// lowercase `8-4-4-4-12` text. Optional surrounding braces, and a single
+/// hyphen is tolerated after ANY complete group of four hex digits (`uuid_in`
+/// consumes a byte pair at a time and skips one `-` after each), not only at
+/// the four standard boundaries -- PostgreSQL 16 accepts
+/// `{a0eebc99-9c0b4ef8-bb6d6bb9-bd380a11}` and `a0ee-bc99-...`, which is what
+/// psycopg's uuid suite sends. A hyphen inside a group, two in a row, one
+/// before the first digit or after the last, any non-hex character,
+/// whitespace, or a count other than 32 hex digits is rejected (`22P02`).
 fn parse_uuid(s: &str) -> Option<String> {
     let inner = match (s.strip_prefix('{'), s.strip_suffix('}')) {
         (Some(_), Some(_)) => &s[1..s.len() - 1],
@@ -7362,13 +7397,16 @@ fn parse_uuid(s: &str) -> Option<String> {
         _ => return None,
     };
     let mut hex = String::with_capacity(32);
+    let mut after_hyphen = false;
     for ch in inner.chars() {
         if ch == '-' {
-            if matches!(hex.len(), 8 | 12 | 16 | 20) {
+            if !after_hyphen && hex.len().is_multiple_of(4) && !hex.is_empty() && hex.len() < 32 {
+                after_hyphen = true;
                 continue;
             }
             return None;
         }
+        after_hyphen = false;
         if !ch.is_ascii_hexdigit() || hex.len() == 32 {
             return None;
         }
@@ -7526,11 +7564,220 @@ pub fn infer_param_types(sql: &str, declared: &[Option<String>]) -> Vec<Option<S
             }
             if let (Some(slot), Some(name)) = (inferred.get_mut(i), static_range_type(other)) {
                 *slot = Some(name);
+            } else if let (Some(slot), Some(name)) = (inferred.get_mut(i), static_text_type(other))
+            {
+                *slot = Some(name);
             }
         }
     }
     PLAN_PARAM_TYPES.with(|t| *t.borrow_mut() = previous_types);
     inferred
+}
+
+/// The text-family type an UNDECLARED parameter takes from the operand it is
+/// compared against, when that operand is STATICALLY text: a string literal
+/// (`$1 = 'a'` resolves both unknowns to text), a cast to a text type, or a
+/// call of a function that returns text (`$1 = chr($2)`).
+///
+/// Without this the parameter's text was SNIFFED into whatever it looked like
+/// -- psycopg's `test_dump_1char` sends `chr(49)`, the string `"1"`, and the
+/// sniff made it an integer beside a text value ("comparing int32 with
+/// string using = is not supported yet"). PostgreSQL 16 answers `true`.
+fn static_text_type(n: Option<&pg_query::protobuf::Node>) -> Option<String> {
+    const TEXT_FUNCTIONS: &[&str] = &[
+        "chr",
+        "lower",
+        "upper",
+        "initcap",
+        "concat",
+        "concat_ws",
+        "ltrim",
+        "rtrim",
+        "btrim",
+        "trim",
+        "substr",
+        "substring",
+        "left",
+        "right",
+        "repeat",
+        "replace",
+        "reverse",
+        "translate",
+        "lpad",
+        "rpad",
+        "md5",
+        "to_char",
+        "quote_literal",
+        "quote_ident",
+        "regexp_replace",
+        "split_part",
+        "encode",
+    ];
+    match n.and_then(|x| x.node.as_ref()) {
+        Some(N::AConst(c)) if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) => {
+            Some("text".to_string())
+        }
+        Some(N::TypeCast(tc)) => {
+            let name = type_name_of(tc.type_name.as_ref()?);
+            matches!(
+                name.as_str(),
+                "text" | "varchar" | "bpchar" | "name" | "character varying" | "character"
+            )
+            .then_some(name)
+        }
+        Some(N::FuncCall(f)) => {
+            let name = func_name(f)?;
+            TEXT_FUNCTIONS
+                .contains(&name.as_str())
+                .then(|| "text".to_string())
+        }
+        _ => None,
+    }
+}
+
+/// The highest `$n` the SQL references, or 0 when it has no parameters.
+///
+/// A client may `Parse` with NO parameter oids at all and leave every type to
+/// the server (libpq's `PQprepare` with `nParams = 0`, `send_query_params`
+/// with an empty type list). The wire layer sized its placeholders from the
+/// oid list, so a describe of `select $1::uuid` answered "there is no
+/// parameter $1" -- PostgreSQL infers the parameter from the SQL.
+pub fn max_param_number(sql: &str) -> usize {
+    let Ok(parsed) = pg_query::parse(sql) else {
+        return 0;
+    };
+    parsed
+        .protobuf
+        .nodes()
+        .into_iter()
+        .filter_map(|(node, _, _, _)| match node {
+            pg_query::NodeRef::ParamRef(p) => usize::try_from(p.number).ok(),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// The type of each parameter as `pg_prepared_statements.parameter_types`
+/// reports it: what the client declared, else what the statement itself
+/// says -- a cast on the parameter (`$1::int`), a comparison with a typed
+/// operand, or the column an INSERT puts it in (`column_type(table, column)`
+/// resolves that) -- else `text`, which is what PostgreSQL 16 resolves an
+/// unconstrained `unknown` parameter to. Catalog reporting only: execution
+/// still decodes an undeclared parameter from its context, and widening that
+/// is a separate change.
+pub fn catalog_param_types(
+    sql: &str,
+    declared: &[Option<String>],
+    column_type: &dyn Fn(&str, &str) -> Option<String>,
+) -> Vec<String> {
+    let n = declared.len().max(max_param_number(sql));
+    let mut padded = declared.to_vec();
+    padded.resize(n, None);
+    let mut inferred = infer_param_types(sql, &padded);
+    let param_index = |node: &pg_query::protobuf::Node| match node.node.as_ref() {
+        Some(N::ParamRef(p)) => usize::try_from(p.number).ok()?.checked_sub(1),
+        _ => None,
+    };
+    if let Ok(parsed) = pg_query::parse(sql) {
+        for (node, _, _, _) in parsed.protobuf.nodes() {
+            match node {
+                pg_query::NodeRef::TypeCast(tc) => {
+                    let Some(i) = tc.arg.as_deref().and_then(param_index) else {
+                        continue;
+                    };
+                    if let (Some(slot @ None), Some(tn)) =
+                        (inferred.get_mut(i), tc.type_name.as_ref())
+                    {
+                        *slot = Some(type_name_of(tn));
+                    }
+                }
+                pg_query::NodeRef::InsertStmt(ins) => {
+                    let table = ins
+                        .relation
+                        .as_ref()
+                        .map(|r| r.relname.clone())
+                        .unwrap_or_default();
+                    let columns: Vec<String> = ins
+                        .cols
+                        .iter()
+                        .filter_map(|c| match c.node.as_ref() {
+                            Some(N::ResTarget(rt)) => Some(rt.name.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    let Some(select) = ins.select_stmt.as_deref().and_then(|s| s.node.as_ref())
+                    else {
+                        continue;
+                    };
+                    let N::SelectStmt(sel) = select else {
+                        continue;
+                    };
+                    for row in &sel.values_lists {
+                        let Some(N::List(items)) = row.node.as_ref() else {
+                            continue;
+                        };
+                        for (pos, item) in items.items.iter().enumerate() {
+                            let Some(i) = param_index(item) else {
+                                continue;
+                            };
+                            let Some(column) = columns.get(pos) else {
+                                continue;
+                            };
+                            if let Some(slot @ None) = inferred.get_mut(i) {
+                                *slot = column_type(&table, column);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    inferred
+        .into_iter()
+        .map(|t| t.unwrap_or_else(|| "text".to_string()))
+        .collect()
+}
+
+/// The functions whose arguments are `"any"` / VARIADIC `"any"`: nothing
+/// there gives an UNDECLARED parameter a type, so PostgreSQL refuses the
+/// statement outright (`42P18`, "could not determine data type of parameter
+/// $n") rather than guess text. psycopg's `test_dump_text_oid` expects
+/// exactly that for `concat($1, $2)`.
+fn refuse_untyped_any_args(f: &pg_query::protobuf::FuncCall) -> Result<()> {
+    const ANY_ARG_FUNCTIONS: &[&str] = &[
+        "concat",
+        "concat_ws",
+        "format",
+        "num_nulls",
+        "num_nonnulls",
+        "json_build_array",
+        "json_build_object",
+        "jsonb_build_array",
+        "jsonb_build_object",
+    ];
+    let Some(name) = func_name(f) else {
+        return Ok(());
+    };
+    if !ANY_ARG_FUNCTIONS.contains(&name.as_str()) {
+        return Ok(());
+    }
+    // `format`'s first argument is the `text` format string, and `concat_ws`'s
+    // the `text` separator: a parameter there resolves as text, so PG names
+    // the first VARIADIC parameter (`format($1, $2)` faults `$2`).
+    let leading_text = usize::from(matches!(name.as_str(), "format" | "concat_ws"));
+    for arg in f.args.iter().skip(leading_text) {
+        if let Some(N::ParamRef(p)) = arg.node.as_ref() {
+            let n = usize::try_from(p.number).unwrap_or(0);
+            if declared_param_type(n).is_none() {
+                return Err(Error::IndeterminateDatatype(format!(
+                    "could not determine data type of parameter ${n}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A range, a multirange, or an array of either.
@@ -8677,6 +8924,7 @@ fn plan_update(
 
     let mut set = Document::new();
     let mut unset: Vec<String> = Vec::new();
+    let mut set_exprs: Vec<(String, String, ColumnExpr)> = Vec::new();
     for t in &u.target_list {
         let Some(N::ResTarget(rt)) = t.node.as_ref() else {
             return Err(Error::Unsupported("this SET target".into()));
@@ -8690,29 +8938,30 @@ fn plan_update(
             return Err(Error::Unsupported("UPDATE of a PRIMARY KEY column".into()));
         }
         let field = column.field();
-        let value = cast_value(
-            const_value(
-                rt.val
-                    .as_ref()
-                    .ok_or_else(|| Error::Parse("SET without a value".into()))?,
-                params,
-            )?,
-            &column.pg_type,
-        )?;
-        // `carry_subms` writes the companion into a scratch document; a
-        // remainder becomes another `$set`, its absence an explicit `$unset`.
-        let mut scratch = Document::new();
-        let stored = carry_subms(&mut scratch, &field, value);
-        let companion = companion_field(&field);
-        match scratch.get(&companion) {
-            Some(rem) => {
-                set.insert(companion, rem.clone());
+        let val = rt
+            .val
+            .as_ref()
+            .ok_or_else(|| Error::Parse("SET without a value".into()))?;
+        // A value that reads the row (`num * 2`) has no constant to store;
+        // it is planned as a row expression and evaluated per matched row.
+        if references_columns(val) {
+            let fields: Vec<RowField> = def
+                .columns
+                .iter()
+                .map(|c| (c.name.clone(), c.field(), c.pg_type.clone()))
+                .collect();
+            let mut sample = Document::new();
+            for c in &def.columns {
+                sample.insert(c.field(), sample_value_for_type(&c.pg_type));
             }
-            None => unset.push(companion),
+            let row = row_column_expr(val, &fields, params, &sample)?;
+            set_exprs.push((field, column.pg_type.clone(), row));
+            continue;
         }
-        set.insert(field, stored);
+        let value = cast_value(const_value(val, params)?, &column.pg_type)?;
+        set_stored_value(&mut set, &mut unset, field, value);
     }
-    if set.is_empty() {
+    if set.is_empty() && set_exprs.is_empty() {
         return Err(Error::Parse("UPDATE without a SET list".into()));
     }
     let filter = match u.where_clause.as_ref() {
@@ -8723,8 +8972,51 @@ fn plan_update(
         table,
         set,
         unset,
+        set_exprs,
         filter,
     }))
+}
+
+/// Record one column's new value in an UPDATE's `$set` / `$unset` lists.
+///
+/// `carry_subms` writes the companion into a scratch document; a remainder
+/// becomes another `$set`, its absence an explicit `$unset`, so an update to
+/// a whole-millisecond timestamp clears any remainder the row carried.
+fn set_stored_value(set: &mut Document, unset: &mut Vec<String>, field: String, value: Bson) {
+    let mut scratch = Document::new();
+    let stored = carry_subms(&mut scratch, &field, value);
+    let companion = companion_field(&field);
+    match scratch.get(&companion) {
+        Some(rem) => {
+            set.insert(companion, rem.clone());
+        }
+        None => unset.push(companion),
+    }
+    set.insert(field, stored);
+}
+
+/// The `$set` / `$unset` lists for one matched row of an UPDATE whose SET
+/// list reads the row: the constant assignments plus each row expression
+/// evaluated over `row` and cast to its column's declared type.
+pub fn update_row_sets(upd: &Update, row: &Document) -> Result<(Document, Vec<String>)> {
+    let mut set = upd.set.clone();
+    let mut unset = upd.unset.clone();
+    for (field, pg_type, expr) in &upd.set_exprs {
+        let value = cast_value(apply_row_expr(expr, row)?, pg_type)?;
+        set_stored_value(&mut set, &mut unset, field.clone(), value);
+    }
+    Ok((set, unset))
+}
+
+/// Whether `node` reads a column anywhere beneath it.
+fn references_columns(node: &pg_query::protobuf::Node) -> bool {
+    let mut probe = node.clone();
+    // Rewriting against NO fields turns the first column reference into an
+    // `UndefinedColumn`; a node with none rewrites cleanly.
+    matches!(
+        rewrite_column_refs(&mut probe, &[], 0),
+        Err(Error::UndefinedColumn(_))
+    )
 }
 
 fn plan_delete(
@@ -8905,6 +9197,7 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             .ok_or(Error::UndefinedField(err));
     }
     if let Some(N::FuncCall(f)) = node.node.as_ref() {
+        refuse_untyped_any_args(f)?;
         if func_name(f).as_deref() == Some("pg_typeof") {
             return pg_typeof(f, params);
         }

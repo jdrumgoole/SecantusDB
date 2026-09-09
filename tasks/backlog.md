@@ -2233,6 +2233,63 @@ These are explicit non-goals. Don't add them without a reason.
   - `RangeSubselect` (`from (select ...)`) is unsupported in the range
     corpus's few subquery shapes — a general planner gap, not a range one.
 
+- [ ] **OPEN — RUST pgserver prepared-statement / uuid / string campaign, what
+  is left (measured 2026-09-09).** psycopg's `tests/test_prepared.py` +
+  `tests/types/test_uuid.py` + `tests/types/test_string.py` are at 190
+  passed / 0 failed against the Rust PG server (was 45 failed). Shipped:
+  `pg_prepared_statements` (session registry of NAMED Parse statements —
+  `parameter_types` / `result_types` as regtype display names, `prepare_time`
+  timestamptz, `from_sql` false, generic / custom plan counts; protocol
+  `Close`, `DEALLOCATE <name>` (26000 when missing) and `DEALLOCATE ALL`
+  remove rows), `NOTIFY` as a no-op tag, a zero-oid Parse of `$1::uuid`
+  described from the cast, `uuid_in`'s hyphen-after-any-hex-group and brace
+  forms, uuid / bytea / `uuid[]` / `bytea[]` BINARY results, a NUL byte in a
+  binary text parameter as 22021, `inet` / `cidr` and their arrays as BINARY
+  results too (psycopg decodes a whole row with column 0's format, so one text
+  column in a binary row was "unexpected number of dimensions"), `inet[]` text
+  dropping a host address's full mask (`{::1}`, not `{::1/128}` — PG's
+  `inet_out` per element), `format` / `concat` / `concat_ws` /
+  `num_nulls` / `num_nonnulls` / `json(b)_build_*` with an untyped parameter
+  as 42P18 naming PG's parameter, COPY OUT mid-stream errors no longer
+  followed by a CopyFail (the client then said "you cannot mix COPY with
+  other operations"), `UPDATE … SET col = <row expression>` (`num * 2`,
+  `upper(s)`, `s || 'x'`, `coalesce(num, 0)`, `num::text`), and savepoint
+  restore of a CREATE TYPE on a store with no committed tables (the restore
+  read the catalog through a fresh WT session blind to the transaction's own
+  collection creation). Still open, all pre-existing and measured against PG
+  16:
+  - `select $1 is null` with an untyped parameter: PG `42P18 could not
+    determine data type of parameter $1`; ours `NullTest is not supported
+    yet` / 0A000 (the same `NullTest` gap as the `pg_sleep` item).
+  - `select $1 = 1` bound with `'a'`: PG resolves `$1` as integer and fails
+    22P02 `invalid input syntax for type integer: "a"`; ours 0A000
+    `comparing string with int32`.
+  - `to_json($1)` / `to_jsonb($1)` untyped: PG 42804 `could not determine
+    polymorphic type because input has type unknown`; ours 0A000 (`to_json`
+    is not implemented at all — `select to_json('a'::text)` is 0A000 too).
+  - `format($1, 'b')`: PG evaluates (`'x'`); ours 0A000 — `format()` is
+    unimplemented, only its untyped-parameter refusal is in place.
+  - `text * integer` (`update ut set num = s * 2`, `select s * 2 from ut`):
+    PG 42883 `operator does not exist: text * integer`; ours 0A000.
+  - A row expression over a `timestamp` column loses the sub-millisecond
+    remainder: `select ts + interval '1 hour' from ut` and `ts::text` over a
+    stored `00:00:00.123456` answer `.123`; `apply_row_expr` reads the bare
+    BSON date, not the companion field. Same for UPDATE SET.
+  - `UPDATE ut SET id = id + 1` on the primary-key column: PG performs it
+    (`UPDATE 1`); ours 0A000 `UPDATE of a PRIMARY KEY column is not supported yet`.
+  - `DEALLOCATE` clears the handler's registry but not pgwire's statement
+    store, so a later `EXECUTE`-by-name over the protocol still finds the
+    statement (psycopg never does this — it re-prepares).
+  - `information_schema.columns` for a catalog VIEW (`where table_name =
+    'pg_prepared_statements'`) is `relation "columns" does not exist`.
+  - `test_copy.py::test_copy_table_across[block]` / `[binary]` fail on the
+    random faker schema with `comparing numeric range bounds is not
+    supported yet` (`[row]` passes) — the range item's known gap, not COPY.
+  - `test_copy_out_error_with_copy_not_finished`: after a COPY OUT is
+    abandoned mid-stream psycopg sends CancelRequest and drains; PG ends the
+    transaction `INERROR` (57014), ours stays `INTRANS` — the CancelRequest
+    item below.
+
 - [ ] **OPEN — RUST pgserver `DROP SCHEMA ... CASCADE` drops only the schema
   record (measured 2026-09-09).** Types created in the schema (range, enum,
   composite — all three probed) survive it, so a following
@@ -5397,10 +5454,11 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `Select`); widening them to scalar calls is the natural next step.
 - **Rust PG server: `pg_type` is 37 builtin rows and nothing else.** No user
   types (the enum campaign needs `pg_enum` and CREATE TYPE), no `typtype` /
-  `typnamespace` / `typrelid` columns, and `pg_prepared_statements` is always
-  empty (the statement store lives in pgwire's portal layer, which the executor
-  cannot see). The Python server's `sql/virtual.py` (3.5k lines) is the
-  reference for how far this eventually goes.
+  `typnamespace` / `typrelid` columns. (`pg_prepared_statements` lists the
+  session's named protocol-level statements as of 2026-09-09 — the handler
+  keeps its own registry beside pgwire's statement store.) The Python
+  server's `sql/virtual.py` (3.5k lines) is the reference for how far this
+  eventually goes.
 - **Rust PG server: no regtype has a BINARY encoding.** A binary-format cursor
   reading any regtype column (including `pg_typeof`, which answers a real
   regtype as of 2026-09-06) gets text bytes where PostgreSQL sends the 4-byte
