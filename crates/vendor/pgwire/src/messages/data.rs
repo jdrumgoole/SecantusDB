@@ -1,4 +1,4 @@
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use super::{DecodeContext, Message, codec};
 use crate::error::PgWireResult;
@@ -26,6 +26,27 @@ pub struct FieldDescription {
     pub type_modifier: i32,
     // the format code being used for the filed, will be 0 or 1 for now
     pub format_code: i16,
+    /// The name's wire bytes when they differ from `name`'s UTF-8 (the name in
+    /// a non-UTF-8 `client_encoding`). `None` sends `name`. (SecantusDB local
+    /// patch.)
+    #[new(default)]
+    pub name_raw: Option<Bytes>,
+}
+
+impl FieldDescription {
+    /// Send these bytes as the name instead of `name`'s UTF-8.
+    pub fn with_name_raw(mut self, name_raw: Option<Bytes>) -> Self {
+        self.name_raw = name_raw;
+        self
+    }
+
+    /// The bytes the name is sent as.
+    fn name_bytes(&self) -> &[u8] {
+        match &self.name_raw {
+            Some(raw) => raw,
+            None => self.name.as_bytes(),
+        }
+    }
 }
 
 /// Describes the fields returned by a query
@@ -54,7 +75,7 @@ impl Message for RowDescription {
             + self
                 .fields
                 .iter()
-                .map(|f| f.name.len() + 1 + 4 + 2 + 4 + 2 + 4 + 2)
+                .map(|f| f.name_bytes().len() + 1 + 4 + 2 + 4 + 2 + 4 + 2)
                 .sum::<usize>()
     }
 
@@ -62,7 +83,8 @@ impl Message for RowDescription {
         buf.put_i16(self.fields.len() as i16);
 
         for field in &self.fields {
-            codec::put_cstring(buf, &field.name);
+            buf.put_slice(field.name_bytes());
+            buf.put_u8(b'\0');
             buf.put_i32(field.table_id);
             buf.put_i16(field.column_id);
             buf.put_u32(field.type_id);
@@ -89,6 +111,7 @@ impl Message for RowDescription {
                 type_size: buf.get_i16(),
                 type_modifier: buf.get_i32(),
                 format_code: buf.get_i16(),
+                name_raw: None,
             };
 
             fields.push(field);

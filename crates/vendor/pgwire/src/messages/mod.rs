@@ -718,6 +718,7 @@ mod test {
             type_size: 4,
             type_modifier: -1,
             format_code: FORMAT_CODE_TEXT,
+            name_raw: None,
         };
         row_description.fields.push(f1);
 
@@ -729,6 +730,7 @@ mod test {
             type_size: -1,
             type_modifier: -1,
             format_code: FORMAT_CODE_TEXT,
+            name_raw: None,
         };
         row_description.fields.push(f2);
 

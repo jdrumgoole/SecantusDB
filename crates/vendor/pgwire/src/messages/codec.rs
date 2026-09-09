@@ -1,6 +1,6 @@
 use std::str;
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::error::{PgWireError, PgWireResult};
 
@@ -30,6 +30,28 @@ pub(crate) fn get_cstring(buf: &mut BytesMut) -> Option<String> {
         None
     } else {
         Some(String::from_utf8_lossy(&string_buf[..i]).into_owned())
+    }
+}
+
+/// Get the RAW bytes of a null-terminated string, without any character
+/// decoding. Same cursor / empty-string semantics as `get_cstring`. Needed
+/// because the query text of `Query` and `Parse` is in the client's
+/// `client_encoding`, which is not necessarily UTF-8: `get_cstring`'s lossy
+/// UTF-8 decode replaces every non-UTF-8 byte with U+FFFD before a backend can
+/// see it. (SecantusDB local patch.)
+pub(crate) fn get_cstring_raw(buf: &mut BytesMut) -> Option<Bytes> {
+    let mut i = 0;
+    while i < buf.remaining() && buf[i] != b'\0' {
+        i += 1;
+    }
+    if i == buf.remaining() {
+        return None;
+    }
+    let string_buf = buf.split_to(i + 1);
+    if i == 0 {
+        None
+    } else {
+        Some(string_buf.freeze().slice(..i))
     }
 }
 

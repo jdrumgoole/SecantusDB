@@ -196,7 +196,7 @@ fn handle_declare(
         ))));
     }
 
-    let statement = StoredStatement::new(cursor_name.to_string(), inner_query.to_string(), vec![]);
+    let statement = StoredStatement::new(cursor_name.to_string(), inner_query.to_string(), vec![], vec![]);
     let portal = Portal::new_cursor(cursor_name.to_string(), Arc::new(statement));
     portal_store.put_portal(Arc::new(portal));
 

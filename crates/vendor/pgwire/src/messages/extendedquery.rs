@@ -5,11 +5,30 @@ use crate::error::PgWireResult;
 
 /// Request from frontend to parse a prepared query string
 #[non_exhaustive]
-#[derive(PartialEq, Eq, Debug, new)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct Parse {
     pub name: Option<String>,
+    /// The query text decoded as UTF-8 (lossily: a byte that is not valid
+    /// UTF-8 becomes U+FFFD).
     pub query: String,
     pub type_oids: Vec<u32>,
+    /// The query text EXACTLY as it arrived on the wire, in the client's
+    /// `client_encoding`. A backend that honours a non-UTF-8 client encoding
+    /// decodes this instead of `query` -- see
+    /// `ExtendedQueryHandler::decode_query_text`. (SecantusDB local patch.)
+    pub query_raw: Bytes,
+}
+
+impl Parse {
+    pub fn new(name: Option<String>, query: String, type_oids: Vec<u32>) -> Parse {
+        let query_raw = Bytes::copy_from_slice(query.as_bytes());
+        Parse {
+            name,
+            query,
+            type_oids,
+            query_raw,
+        }
+    }
 }
 
 /// Message type byte for Parse
@@ -50,7 +69,8 @@ impl Message for Parse {
         _ctx: &DecodeContext,
     ) -> PgWireResult<Self> {
         let name = codec::get_cstring(buf);
-        let query = codec::get_cstring(buf).unwrap_or_else(|| "".to_owned());
+        let query_raw = codec::get_cstring_raw(buf).unwrap_or_default();
+        let query = String::from_utf8_lossy(&query_raw).into_owned();
         let type_oid_count = buf.get_u16();
 
         let mut type_oids = Vec::with_capacity(type_oid_count as usize);
@@ -62,6 +82,7 @@ impl Message for Parse {
             name,
             query,
             type_oids,
+            query_raw,
         })
     }
 }
