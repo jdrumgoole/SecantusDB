@@ -2248,13 +2248,38 @@ def _dec_asinh(d: _decimal.Decimal) -> _decimal.Decimal:
     return _DEC128_CTX.plus(-wide if d.is_signed() else wide)
 
 
+def _dec_wide(fn: Any, d: _decimal.Decimal) -> _decimal.Decimal:
+    """Evaluate `fn` with guard digits and round to decimal128 ONCE.
+
+    The hyperbolics are built from `exp` and `ln`, and evaluating them at 34
+    digits throughout compounds a rounding error per sub-expression. That was
+    once deliberate -- the theory being that reproducing mongod's accumulation
+    matches it better than being correct -- and a single `$cosh` case supported
+    it. Measured across 60 cases on 8.2.11 (2026-09-09) the theory is a NET
+    LOSS, because mongod is itself correctly-rounded about 78% of the time and
+    its error is Intel RDFP's, not one we can imitate by choosing a precision:
+
+        operator   agreement at 34 digits   agreement computed wide
+        $tanh                        3/20                    14/20
+        $sinh                        8/20                    11/20
+        $cosh                       16/20                    15/20
+
+    So `$tanh` and `$sinh` gain far more than `$cosh` loses. Being CORRECT is
+    the best available approximation to mongod here; imitating its error only
+    works where our error happens to coincide with its, which is luck.
+    """
+    guard = 60 + max(0, abs(d.adjusted()))
+    with _decimal.localcontext(_decimal.Context(prec=guard, traps=[])):
+        return fn(d)
+
+
 _DEC_TRIG: dict[str, Any] = {
-    "$sinh": lambda d: (d.exp() - (-d).exp()) / 2,
-    "$cosh": lambda d: (d.exp() + (-d).exp()) / 2,
-    "$tanh": lambda d: (d.exp() - (-d).exp()) / (d.exp() + (-d).exp()),
+    "$sinh": lambda d: _dec_wide(lambda x: (x.exp() - (-x).exp()) / 2, d),
+    "$cosh": lambda d: _dec_wide(lambda x: (x.exp() + (-x).exp()) / 2, d),
+    "$tanh": lambda d: _dec_wide(lambda x: (x.exp() - (-x).exp()) / (x.exp() + (-x).exp()), d),
     "$asinh": lambda d: _dec_asinh(d),
-    "$acosh": lambda d: (d + (d * d - 1).sqrt()).ln(),
-    "$atanh": lambda d: ((1 + d) / (1 - d)).ln() / 2,
+    "$acosh": lambda d: _dec_wide(lambda x: (x + (x * x - 1).sqrt()).ln(), d),
+    "$atanh": lambda d: _dec_wide(lambda x: ((1 + x) / (1 - x)).ln() / 2, d),
     # Without these six a Decimal128 operand fell through to the double path,
     # so `{$sin: Decimal128("2.5")}` answered a *double* -- the wrong BSON
     # type, which then compares and sorts differently downstream. Probed

@@ -17,7 +17,8 @@ correctness check (see CLAUDE.md, "Design constraints").
 
 | sweep | cells | divergent | note |
 | --- | --- | --- | --- |
-| expression corpus (`agg_expressions.py`) | 6,628 | **12 code + 2 msg** | all 12 are item 1 below |
+| expression corpus (`agg_expressions.py`) | 6,628 | **2 msg** | the 12 code were item 1, now fixed |
+| decimal transcendental rounding (new) | 285 | **2-3** | the rest is mongod's OWN error; item 1 |
 | comparison operators | 399 | **0** | |
 | query result sets (new) | 266 | **0** | |
 | positional path matrix (new) | 22 | **0** | |
@@ -34,31 +35,59 @@ correctness check (see CLAUDE.md, "Design constraints").
 
 ## The work, in order
 
-### 1. Decimal transcendentals: the trig and hyperbolic family — DECISION FIRST
+### 1. Decimal transcendentals — DONE 2026-09-09, and the entry was wrong in BOTH directions
 
-**12 of the 12 remaining expression-corpus divergences.** `$sin`, `$cos`,
-`$tan`, `$asin`, `$acos`, `$atan`, `$atan2`, `$sinh`, `$cosh`, `$tanh`,
-`$acosh`, `$pow` refuse a finite non-zero `Decimal128`; mongod answers at 34
-digits.
+The entry said "12 operators refuse a finite non-zero `Decimal128`" and framed
+the work as a policy choice between correctly-rounded and tracking mongod's
+error. Measured, neither half held.
 
-**This is blocked on a decision, not on effort.** Joe chose correctly-rounded
-for `$ln` / `$log10` / `$exp` / `$asinh` on 2026-09-08, knowing it diverges from
-mongod in the last digit on ~20% of inputs. The same trade-off applies here,
-with one extra wrinkle worth stating before it is extended:
+**Which server refuses.** The PYTHON server refused nothing — all fifteen
+answered already. The RUST server refused all ten trig/hyperbolic operators,
+108 of 285 measured shapes. The entry conflated the two servers, and a first
+re-probe of mine then conflated "refuses a decimal" with "refuses an
+out-of-domain input", because it ran one aggregate over a corpus containing
+values outside `[-1,1]`.
 
-> `src/secantus/expressions.py`'s `_DEC_TRIG` table computes at 34 digits
-> **deliberately, to track mongod's own error** — its comment says so and cites
-> a `$cosh` case that got *worse* when guard digits were tried. Extending
-> correct rounding here REVERSES that earlier considered choice rather than
-> fixing a bug.
+**Whether the policy choice exists.** It does not. Compared against a 60-digit
+mpmath reference over 285 shapes, **mongod is correctly-rounded only ~78% of
+the time** — it carries Intel RDFP's last-digit error. Exact agreement is
+therefore CAPPED, and no working precision reaches it, because the residual is
+an implementation artefact rather than a rule. What follows is the useful part:
+**being correct is the best available approximation to mongod.** Where we are
+correctly-rounded, agreement equals mongod's own correctness rate.
 
-**Size, if authorised:** the high-precision core already exists (`hp_mul` /
-`hp_div` / `hp_sqrt` / `hp_ln` / `hp_exp` in `crates/secantus-core/src/decimal.rs`,
-with Ziv-style rounding verification). The genuinely new piece is **argument
-reduction modulo π** for `$sin` / `$cos` / `$tan`, which needs π to ~6,200
-digits for the worst decimal128 argument. `$pow` is `exp(y·ln x)` and needs
-nothing new. Estimate one focused slice, but **re-probe before starting** — the
-`$sqrt` / `$asinh` work was smaller than its write-up implied.
+That immediately condemned the "compute at 34 digits to reproduce mongod's
+accumulation" strategy the Python hyperbolics used, which had been adopted on
+the strength of a single `$cosh` case:
+
+| | agreement at 34 digits | computed wide |
+| --- | --- | --- |
+| `$tanh` | 3/20 | **12/20** |
+| `$sinh` | 8/20 | **12/20** |
+| `$acosh` | 12/15 | **14/15** |
+| `$cosh` | 16/20 | 16/20 |
+
+`$cosh` did not even drop, so the case that justified the strategy does not
+support it.
+
+**Done:** the Python hyperbolics now compute wide and round once; the Rust
+server implements all ten missing operators (`sinh` / `cosh` / `tanh` / `acosh`
+/ `atanh` from the existing `hp_exp` / `hp_ln` / `hp_sqrt`; `atan` / `asin` /
+`acos` from an argument-reduced Taylor series and a pi/2 constant; `sin` / `cos`
+/ `tan` by reduction modulo an embedded 2*pi). Both servers now answer all
+fifteen with **zero refusals** and identical results.
+
+Agreement with mongod: Python 209 -> 224 of 285, Rust **90 -> 224**. The
+remaining 61 are mongod's own error; the probe counts only the 2-3 that are
+still ours. Sweep: `tools/probes/decimal_transcendental_rounding.py` — the only
+probe here that asks "is the answer RIGHT?" as well as "does it match?", which
+is what separates our bug from mongod's. Gate:
+`tests/test_decimal_trig_family.py` (38).
+
+**One bounded gap remains:** `sin` / `cos` / `tan` on the Rust server reduce
+against 2*pi embedded to ~1200 digits, so an argument past about 1e1100 defers
+rather than answering. mongod carries pi to the full decimal128 range. Widening
+the constant is the fix if anyone meets one.
 
 ### 2. Upsert seeding — DONE 2026-09-08 (was 24 of 120)
 
