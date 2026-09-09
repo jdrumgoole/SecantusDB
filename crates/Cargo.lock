@@ -1325,6 +1325,8 @@ dependencies = [
  "bson",
  "chrono",
  "chrono-tz",
+ "num-bigint",
+ "num-traits",
  "pg_query",
  "regex",
  "secantus-pgcatalog",

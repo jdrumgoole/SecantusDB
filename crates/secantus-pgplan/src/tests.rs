@@ -910,22 +910,248 @@ fn numeric_preserves_scale() {
     }
 }
 
-/// Beyond 34 significant digits we REFUSE rather than round.
+/// Beyond 34 significant digits a numeric is stored as the wide-numeric
+/// document, exactly -- never rounded -- and comes back as the same text.
 ///
-/// PostgreSQL's `numeric` is arbitrary precision and Decimal128 is not, so
-/// there are values PostgreSQL accepts that this server cannot store. Quietly
-/// rounding one would be a wrong answer; an error is a missing feature.
+/// PostgreSQL's `numeric` is arbitrary precision and Decimal128 is not; a
+/// 35-digit value used to be refused (22003), and one whose EXTRA digit was a
+/// trailing zero was silently rounded by `Decimal128::from_str`
+/// (`100000000000000000.00000000000000000` lost a place of scale). Probed on
+/// PostgreSQL 16, 2026-09-09.
 #[test]
-fn numeric_refuses_rather_than_rounds() {
-    let err = plan(
-        "SELECT '1.2345678901234567890123456789012345'::numeric",
-        &lookup,
-    )
-    .expect_err("35 significant digits");
-    assert_eq!(err.sqlstate(), "22003"); // numeric_value_out_of_range
-                                         // Not a number at all is a different code.
+fn numeric_wider_than_decimal128_is_stored_exactly() {
+    let value = |sql: &str| match plan_ok(sql) {
+        Statement::SelectConstant(sc) => match &sc.columns[0].1 {
+            ConstCol::Value(v) => v.clone(),
+            other => panic!("{sql} should be a value, got {other:?}"),
+        },
+        other => panic!("wrong statement for {sql}: {other:?}"),
+    };
+    for (sql, want) in [
+        (
+            "SELECT '1.2345678901234567890123456789012345'::numeric",
+            "1.2345678901234567890123456789012345",
+        ),
+        (
+            "SELECT '999999999999999999.99999999999999999'::numeric",
+            "999999999999999999.99999999999999999",
+        ),
+        (
+            "SELECT '100000000000000000.00000000000000000'::numeric",
+            "100000000000000000.00000000000000000",
+        ),
+        ("SELECT 1e40", "10000000000000000000000000000000000000000"),
+        ("SELECT 1e40 + 0.5", "10000000000000000000000000000000000000000.5"),
+    ] {
+        let v = value(sql);
+        assert_eq!(numeric_text(&v).as_deref(), Some(want), "for {sql}");
+    }
+    assert_eq!(
+        value("SELECT (1e40 + 0.5)::text"),
+        Bson::String("10000000000000000000000000000000000000000.5".into())
+    );
+    // The wide form is the marker-key document; a value that fits stays a
+    // Decimal128 (an integer with trailing zeros fits as `1E+40`).
+    assert!(is_wide_numeric(&value(
+        "SELECT '1.2345678901234567890123456789012345'::numeric"
+    )));
+    assert!(matches!(value("SELECT 1e40"), Bson::Decimal128(_)));
+    // Not a number at all is a different code.
     let err = plan("SELECT 'x'::numeric", &lookup).expect_err("not numeric");
     assert_eq!(err.sqlstate(), "22P02");
+    // Past PostgreSQL's own limits is its error, not a rounding.
+    let err = plan("SELECT 1e131072", &lookup).expect_err("overflows numeric");
+    assert_eq!(err.sqlstate(), "22003");
+}
+
+/// The canonical text rules, probed on PostgreSQL 16.
+#[test]
+fn numeric_canonical_text_matches_postgres() {
+    for (input, want) in [
+        ("0001.10", "1.10"),
+        ("-0.0", "0.0"),
+        ("-0.00e2", "0"),
+        ("0.00e3", "0"),
+        ("1.1e5", "110000"),
+        ("1.1e-5", "0.000011"),
+        ("100e-1", "10.0"),
+        ("1.0e-3", "0.0010"),
+        ("1.50e1", "15.0"),
+        ("  12  ", "12"),
+        ("1_000", "1000"),
+        ("1_000.5", "1000.5"),
+        ("+5", "5"),
+        (".5", "0.5"),
+        ("5.", "5"),
+        ("nan", "NaN"),
+        ("-inf", "-Infinity"),
+        ("Infinity", "Infinity"),
+    ] {
+        assert_eq!(canonical_numeric_text(input).unwrap(), want, "for {input:?}");
+    }
+    for bad in ["", "x", "1_", "_1", "1__0", "1e", "1.2.3", "--1"] {
+        assert!(canonical_numeric_text(bad).is_err(), "{bad:?} should be invalid");
+    }
+}
+
+/// The sort key orders bytewise as the numbers order, across widths.
+#[test]
+fn numeric_sort_key_orders_like_the_numbers() {
+    let texts = [
+        "-Infinity",
+        "-100000000000000000000000000000000000000",
+        "-100",
+        "-99.5",
+        "-0.51",
+        "-0.5",
+        "-0.000000000000000000000000000000000000001",
+        "0",
+        "0.000000000000000000000000000000000000001",
+        "0.5",
+        "0.51",
+        "99.5",
+        "100",
+        "100.0000000000000000000000000000000000001",
+        "100000000000000000000000000000000000000",
+        "Infinity",
+        "NaN",
+    ];
+    let keys: Vec<String> = texts.iter().map(|t| numeric::numeric_sort_key(t)).collect();
+    for w in keys.windows(2) {
+        assert!(w[0] < w[1], "{} should sort before {}", w[0], w[1]);
+    }
+    // Scale is not part of the key: equal values share one key.
+    assert_eq!(numeric::numeric_sort_key("1.50"), numeric::numeric_sort_key("1.5"));
+    assert_eq!(numeric::numeric_sort_key("0.00"), numeric::numeric_sort_key("0"));
+}
+
+/// A wide constant lowers to an exact two-arm filter: the Decimal128 rows
+/// compare against the constant's Decimal128 bracket, the wide rows against
+/// the sort key.
+#[test]
+fn wide_numeric_where_lowers_to_bracket_and_key() {
+    use numeric::{decimal128_bracket, Bracket};
+    let def = TableDef::new(
+        "w",
+        vec![
+            Column::new("id", "int4", true),
+            Column::new("n", "numeric", false),
+        ],
+    );
+    let lookup = |name: &str| (name == "w").then(|| def.clone());
+    let filter = |sql: &str| match plan(sql, &lookup).expect("should plan") {
+        Statement::Select(s) => s.filter,
+        other => panic!("wrong statement for {sql}: {other:?}"),
+    };
+    // 35 digits: no Decimal128 equals it, so `=` has only the wide arm.
+    let f = filter("SELECT id FROM w WHERE n = 1.2345678901234567890123456789012345");
+    assert_eq!(
+        f,
+        doc! { "n.__numkey": { "$eq": numeric::numeric_sort_key("1.2345678901234567890123456789012345") } }
+    );
+    // `>` on a wide constant: every Decimal128 at or above the bracket's
+    // upper neighbour, or a wide row above the key.
+    let f = filter("SELECT id FROM w WHERE n > 1.2345678901234567890123456789012345");
+    let Bracket::Between(lo, hi) = decimal128_bracket("1.2345678901234567890123456789012345").unwrap()
+    else {
+        panic!("35 digits should not be exact");
+    };
+    assert_eq!(lo.to_string(), "1.234567890123456789012345678901234");
+    assert_eq!(hi.to_string(), "1.234567890123456789012345678901235");
+    assert_eq!(
+        f,
+        doc! { "$or": [
+            { "n": { "$gte": hi } },
+            { "n.__numkey": { "$gt": numeric::numeric_sort_key("1.2345678901234567890123456789012345") } },
+        ]}
+    );
+    // A narrow constant on a numeric column still gets the wide arm, because
+    // the column may hold wide rows.
+    let f = filter("SELECT id FROM w WHERE n < 5");
+    assert_eq!(
+        f,
+        doc! { "$or": [
+            { "n": { "$lt": Bson::Decimal128("5".parse().unwrap()) } },
+            { "n.__numkey": { "$lt": numeric::numeric_sort_key("5") } },
+        ]}
+    );
+    // A non-numeric column is lowered as before.
+    assert_eq!(filter("SELECT id FROM w WHERE id = 5"), doc! { "_id": 5 });
+    // The bracket of a value that fits by VALUE but not by scale is exact.
+    assert!(matches!(
+        decimal128_bracket("1.0000000000000000000000000000000000000000").unwrap(),
+        Bracket::Exact(_)
+    ));
+    // Beyond Decimal128's exponent range the bracket is the finite ceiling.
+    let Bracket::Between(lo, hi) = decimal128_bracket(&format!("1{}", "0".repeat(7000))).unwrap()
+    else {
+        panic!("1e7000 is not a Decimal128");
+    };
+    assert_eq!(lo.to_string(), "9.999999999999999999999999999999999E+6144");
+    assert_eq!(hi.to_string(), "Infinity");
+}
+
+/// Arithmetic on wide numerics is exact, with PostgreSQL's result scales
+/// (probed on 16, 2026-09-09) -- including division, which used to be
+/// refused.
+#[test]
+fn wide_numeric_arithmetic_is_exact() {
+    let calc = |sql: &str| match plan_ok(sql) {
+        Statement::SelectConstant(sc) => match &sc.columns[0].1 {
+            ConstCol::Value(v) => {
+                numeric::numeric_operand_text(v).unwrap_or_else(|| panic!("{sql}: {v:?}"))
+            }
+            other => panic!("{sql} should be a value, got {other:?}"),
+        },
+        other => panic!("wrong statement for {sql}: {other:?}"),
+    };
+    for (sql, want) in [
+        (
+            "SELECT 99999999999999999999999999999999999 + 1",
+            "100000000000000000000000000000000000",
+        ),
+        (
+            "SELECT 1.2345678901234567890123456789012345 * 2",
+            "2.4691357802469135780246913578024690",
+        ),
+        ("SELECT 1.50 / 3", "0.50000000000000000000"),
+        ("SELECT 10.0 / 4", "2.5000000000000000"),
+        ("SELECT 1 / 3.0", "0.33333333333333333333"),
+        ("SELECT 2::numeric / 7", "0.28571428571428571429"),
+        ("SELECT 0 / 3.0", "0.00000000000000000000"),
+        ("SELECT 1000000 / 3.0", "333333.333333333333"),
+        ("SELECT 1 / 8.0", "0.12500000000000000000"),
+        ("SELECT 0.001 / 3", "0.00033333333333333333"),
+        (
+            "SELECT 123456789012345678901234567890123456789012345678901234567890 / 7",
+            "17636684144620811271604938270017636684144620811271604938270",
+        ),
+        ("SELECT -1.2345678901234567890123456789012345", "-1.2345678901234567890123456789012345"),
+        ("SELECT abs(-1.2345678901234567890123456789012345)", "1.2345678901234567890123456789012345"),
+        ("SELECT round(1.2345678901234567890123456789012345, 2)", "1.23"),
+        ("SELECT 'NaN'::numeric + 1", "NaN"),
+        ("SELECT 'Infinity'::numeric * 0", "NaN"),
+        ("SELECT 'Infinity'::numeric * -2", "-Infinity"),
+        ("SELECT 10 / 4", "2"),
+    ] {
+        assert_eq!(calc(sql), want, "for {sql}");
+    }
+    let err = plan("SELECT 1.5 / 0", &lookup).expect_err("division by zero");
+    assert_eq!(err.sqlstate(), "22012");
+    // Wide values compare exactly, across widths and against integers.
+    use std::cmp::Ordering;
+    let v = |t: &str| numeric_bson(t);
+    assert_eq!(
+        compare_constants(
+            &v("100000000000000000000000000000000000000"),
+            &v("100000000000000000000000000000000000000.0000000000000000000000000000001")
+        ),
+        Some(Ordering::Less)
+    );
+    assert_eq!(
+        compare_constants(&v("1.0000000000000000000000000000000000000000"), &Bson::Int32(1)),
+        Some(Ordering::Equal)
+    );
 }
 
 /// A datetime / interval ARRAY element renders as its scalar text, not as the
