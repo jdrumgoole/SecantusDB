@@ -3156,6 +3156,31 @@ def _hashable_scalar(value: Any) -> Any:
     # recursion, so `{a: [NaN]}` and `{a: {k: NaN}}` group correctly too.
     if _is_nan_key(value):
         return _NAN_KEY
+    # A bool is NOT a number to mongod, but `hash(True) == hash(1)` and
+    # `True == 1` in Python, so `$group: {_id: "$v"}` merged them into one
+    # bucket where mongod keeps two. Measured 8.2.11 (2026-09-09):
+    #
+    #     _id=0      <- 0, 0.0, -0.0     (signed zeros DO merge)
+    #     _id=False  <- False            (its own bucket)
+    #     _id=True   <- True             (its own bucket)
+    #     _id=1      <- 1, 1.0           (the numeric types DO merge)
+    #
+    # so only bool has to be separated out -- exactly the rule
+    # `ordering.bson_equal` already carries for the same reason, and the sixth
+    # instance of Python's `==` / `hash()` standing in for a BSON semantic.
+    if isinstance(value, bool):
+        return ("\x00bool", value)
+    # A Decimal128 buckets with the OTHER numerics: mongod merges int `1`,
+    # double `1.0`, `Decimal128("1")` and `Decimal128("1.0")` into one bucket
+    # keyed `1` (measured 8.2.11, 2026-09-09). `Decimal128` is hashable, so it
+    # fell through below and got a bucket of its own. Python's `decimal.Decimal`
+    # hashes consistently with `int` and `float` for the same numeric value,
+    # which is exactly the merge rule needed here.
+    if isinstance(value, Decimal128):
+        try:
+            return value.to_decimal()
+        except (_decimal.InvalidOperation, ValueError):
+            return value
     try:
         hash(value)
     except TypeError:

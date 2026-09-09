@@ -97,55 +97,35 @@ pub fn array_sort_value(v: Bson, reverse: bool) -> Option<Bson> {
     Some(best.unwrap_or(Bson::Null))
 }
 
-/// True if every value in `v` is one we can sort *faithfully* — meaning Python
-/// `==` agrees with `cmp(...) == Equal` for it.
+/// Whether the SORT engines can order this value.
 ///
-/// This gate is what makes the multi-field comparator correct. `sort_docs`
-/// wraps keys in `_SortKey` whose `__eq__` is Python `==` but whose `__lt__` is
-/// rank-based `_bson_lt`; a tuple sort advances to the next field only when `==`
-/// is True. For the types below the two relations coincide, so the comparator
-/// is a consistent total preorder and a stable sort reproduces Python exactly.
-/// The types where they *diverge* — `bool` (`False == 0`, `True == 1`, but a
-/// different BSON rank), `NaN` (`nan != nan`), and the `==`-False-but-`<`-both-
-/// False cases (Binary w/ subtype, Timestamp, Regex, Min/MaxKey) — make the
-/// comparator non-transitive, so we defer the whole `$sort` to pure Python
-/// rather than risk diverging from its Timsort. Decimal128 and exotic types
-/// defer too.
+/// Now the same predicate as [`is_comparable`], and deliberately so. It used to
+/// be much narrower -- excluding NaN, Min/MaxKey, Binary, Timestamp, Regex and
+/// Code -- to protect the sort engines from a type with no transitive same-type
+/// arm in [`cmp`]. Every one of those arms now EXISTS (NaN ranks below the
+/// numbers, two MinKeys are equal, regexes compare by pattern then options,
+/// Binary by bytes, Code by source), so the narrow gate no longer protected
+/// anything: it just made `Fallback::Defer` fire, and a defer on the standalone
+/// Rust server is an ERROR.
+///
+/// The cost of leaving it stale was a plain `{$sort: {v: 1}}` answering
+/// `2 aggregation pipeline uses a stage or operator not supported` for any
+/// collection holding a NaN, a MinKey or a MaxKey (measured 8.2.11,
+/// 2026-09-09, by `tools/probes/aggregation_stage_results.py`). Ordinary data,
+/// ordinary query, whole pipeline refused -- and it took `$group`, `$bucket`
+/// and `$topN` down with it, since they sort too.
+///
+/// `cmp` is total over everything this admits: same-rank pairs all have an arm,
+/// cross-rank pairs go through `type_rank`, and the fallback answers `Equal`,
+/// which is transitive. That matters more than usual here -- Rust's sort
+/// PANICS on a comparator that is not a total order.
 pub fn is_sortable(v: &Bson) -> bool {
-    match v {
-        Bson::Null
-        | Bson::Int32(_)
-        | Bson::Int64(_)
-        | Bson::String(_)
-        | Bson::ObjectId(_)
-        | Bson::DateTime(_)
-        // Booleans ARE ordered (`type_rank` has always placed them at 90, and
-        // `cmp` has always had the same-type arm) -- excluding them here made
-        // every comparison involving one defer, which on a server with no
-        // Python is a generic BadValue. `{$gt: [true, 1]}` is true on mongod.
-        | Bson::Boolean(_) => true,
-        Bson::Double(d) => !d.is_nan(),
-        // Decimal128 is part of the unified NUMERIC type -- `type_rank` has
-        // always put it at rank 3 with the others, and `cmp` has always routed
-        // it through `numeric::classify`. Only this predicate excluded it, so
-        // every comparison involving a decimal DEFERRED, which on a server with
-        // no Python is a generic BadValue: `{$gt: [Decimal128("2.5"), 2]}` is
-        // true on mongod and answered "not supported" here. NaN is excluded for
-        // the same reason a double NaN is -- it has no place in a total order.
-        Bson::Decimal128(_) => !crate::query::is_nan_bson(v),
-        Bson::Document(d) => d.values().all(is_sortable),
-        Bson::Array(a) => a.iter().all(is_sortable),
-        // NaN, Binary, Timestamp, Regex, Min/MaxKey, exotic.
-        _ => false,
-    }
+    is_comparable(v)
 }
 
-/// Whether [`cmp`] can order this value -- the gate for the comparison
-/// OPERATORS, which is wider than [`is_sortable`].
+/// Whether [`cmp`] can order this value.
 ///
-/// `is_sortable` is deliberately narrow: it guards the SORT engines, where a
-/// type without a transitive same-type arm would corrupt an ordering. The
-/// comparison operators need no transitivity -- one pair, one answer -- and
+/// The comparison OPERATORS need no transitivity -- one pair, one answer -- and
 /// mongod compares every BSON type by its canonical rank. Gating them on
 /// `is_sortable` made `{$gt: [BinData(...), 0]}` a `2 query uses a construct
 /// the Rust server does not support`, and one Binary / Timestamp / Regex /
@@ -417,15 +397,25 @@ mod tests {
     /// The comparison OPERATORS accept every type `cmp` ranks, which is wider
     /// than the sort engines' `is_sortable`.
     #[test]
-    fn comparable_is_wider_than_sortable() {
-        assert!(is_comparable(&b(bson!(f64::NAN))));
-        assert!(is_comparable(&Bson::MinKey));
-        assert!(is_comparable(&Bson::MaxKey));
-        assert!(is_comparable(&Bson::Timestamp(bson::Timestamp {
-            time: 1,
-            increment: 1
-        })));
-        assert!(!is_sortable(&b(bson!(f64::NAN))));
+    fn sortable_and_comparable_admit_the_same_values() {
+        // These two were once different predicates, `is_sortable` being the
+        // narrower one. They are the same now: every type it excluded has a
+        // transitive same-type arm in `cmp`, so the narrow gate protected
+        // nothing and only made `Fallback::Defer` fire -- which on the
+        // standalone Rust server is an error. See `is_sortable`.
+        for v in [
+            b(bson!(f64::NAN)),
+            Bson::MinKey,
+            Bson::MaxKey,
+            Bson::Timestamp(bson::Timestamp {
+                time: 1,
+                increment: 1,
+            }),
+            Bson::Decimal128("NaN".parse().unwrap()),
+        ] {
+            assert!(is_comparable(&v), "{v:?} should be comparable");
+            assert!(is_sortable(&v), "{v:?} should be sortable");
+        }
     }
 
     #[test]
@@ -436,7 +426,13 @@ mod tests {
         // and `{$gt: [true, 1]}` is true. This asserted the opposite, pinning a
         // gating decision rather than a behaviour.
         assert!(is_sortable(&b(bson!(true))));
-        assert!(!is_sortable(&b(bson!(f64::NAN))));
+        // NaN IS sortable, for the third time in this test's history and for
+        // the same reason bools and Decimal128 turned out to be: it asserted a
+        // gating decision, not a behaviour. mongod sorts a collection holding a
+        // NaN without complaint and ranks it below every other number, and
+        // refusing it here made a plain `{$sort: {v: 1}}` fail outright
+        // (measured 8.2.11, 2026-09-09).
+        assert!(is_sortable(&b(bson!(f64::NAN))));
         // An array of sortable elements is sortable, and a bool is now one of
         // them; this case existed only because bools were excluded.
         assert!(is_sortable(&b(bson!([1, "x", true]))));
@@ -450,7 +446,7 @@ mod tests {
         assert!(is_sortable(&b(
             bson!({"a": Bson::Decimal128("1".parse().unwrap())})
         )));
-        // ... except NaN, excluded exactly as a double NaN is.
-        assert!(!is_sortable(&Bson::Decimal128("NaN".parse().unwrap())));
+        // ... and a decimal NaN alongside the double one.
+        assert!(is_sortable(&Bson::Decimal128("NaN".parse().unwrap())));
     }
 }
