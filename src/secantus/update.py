@@ -382,6 +382,11 @@ def _traverse_problem(doc: Mapping[str, Any], path: str) -> UpdateError | None:
     ``cannot use the part (v of v.k) to traverse the element ({v: 1})``. Both
     servers silently no-opped, so an invalid update reported success. Measured
     8.2.11, 2026-09-08.
+
+    Execution-time -- mongod can only find it in a particular document, so it
+    carries the `Plan executor error during <command> :: caused by ::` wrapper.
+    Every code-28 traverse failure does (`$set` / `$inc` / `$push` measured
+    alongside it, 2026-09-09); ours reached the client bare.
     """
     parts = path.split(".")
     current: Any = doc
@@ -397,6 +402,7 @@ def _traverse_problem(doc: Mapping[str, Any], path: str) -> UpdateError | None:
                 f"cannot use the part ({part} of {path}) to traverse the element "
                 f"({{{part}: {bson_value_repr(current)}}})",
                 code=28,
+                exec_error=True,
             )
     return None
 
@@ -896,14 +902,29 @@ def _expand_path(
     parts = path.split(".")
     if not any(_is_positional_token(p) for p in parts):
         return [path]
-    # An identifier with no matching arrayFilter is a PARSE error for mongod,
-    # decided from the update document alone: ``No array filter found for
-    # identifier 'e' in path 'arr.$[e]'``, BadValue (2). Checked here rather
-    # than mid-walk so the message can name the ORIGINAL dotted path -- and so
-    # it fires even when the field isn't an array, as mongod's does. We used to
-    # raise a hand-written "arrayFilters has no entry for identifier 'e'" with
-    # code 9 from inside the walk: wrong code, wrong words, no path.
-    for part in parts:
+    _check_array_filter_identifiers(path, array_filters)
+    out: list[str] = []
+    _walk_positional(doc, parts, [], out, array_filters, positional_matches)
+    return out
+
+
+def _check_array_filter_identifiers(
+    path: str, array_filters: Mapping[str, Mapping[str, Any]]
+) -> None:
+    """Raise mongod's parse error for a `$[id]` with no matching arrayFilter.
+
+    ``No array filter found for identifier 'e' in path 'arr.$[e]'``, BadValue
+    (2). mongod decides it from the update document ALONE, so it is checked
+    before any walk -- which is what lets the message name the ORIGINAL dotted
+    path, and what makes it fire even when the field is not an array. We used
+    to raise a hand-written "arrayFilters has no entry for identifier 'e'" with
+    code 9 from inside the walk: wrong code, wrong words, no path.
+
+    Split out of :func:`_expand_path` so `$rename` can run it before its own
+    checks: mongod reports the missing identifier before it reports the path as
+    dynamic (measured 8.2.11, 2026-09-09).
+    """
+    for part in path.split("."):
         if part.startswith("$[") and part.endswith("]"):
             name = part[2:-1]
             if name and name not in array_filters:
@@ -911,9 +932,6 @@ def _expand_path(
                     f"No array filter found for identifier '{name}' in path '{path}'",
                     code=2,
                 )
-    out: list[str] = []
-    _walk_positional(doc, parts, [], out, array_filters, positional_matches)
-    return out
 
 
 def _is_positional_token(part: str) -> bool:
@@ -1052,21 +1070,48 @@ def _rename_same_path(a: str, b: str) -> bool:
     return ap[:n] == bp[:n]
 
 
-def _rename_traverses_array(doc: dict[str, Any], path: str) -> bool:
-    """True if the *literal* `path` indexes into an array with a numeric index
-    (e.g. `arr.0`) — the "array element" mongod forbids in a $rename source /
-    destination (it silently corrupted the array here). A positional token
-    (`$` / `$[]` / `$[id]`) into an array is NOT flagged: those are a SecantusDB
-    $rename extension resolved element-wise elsewhere."""
+def _is_dynamic_component(part: str) -> bool:
+    """True for `$`, `$[]` and `$[id]` -- mongod's "dynamic" path components."""
+    return part == "$" or (part.startswith("$[") and part.endswith("]"))
+
+
+def _rename_dynamic_path(path: str) -> bool:
+    """True if any component of `path` is dynamic.
+
+    mongod refuses a dynamic component in a `$rename` source or destination at
+    PARSE time -- before it looks at the document, so an absent source field
+    still raises (`{$rename: {"nope.$[].x": "q"}}` errors even though there is
+    no `nope`). Measured 8.2.11, 2026-09-09. The identified form `$[e]` is
+    refused too, but only once its array filter EXISTS: without one, the
+    general `No array filter found for identifier 'e'` check fires first.
+    """
+    return any(_is_dynamic_component(part) for part in path.split("."))
+
+
+def _rename_array_field(doc: dict[str, Any], path: str) -> str | None:
+    """The name of the array `path` indexes into, or None.
+
+    `deep.n.0.a` over `{deep: {n: [{a: 1}]}}` answers `"n"` -- mongod's message
+    names the field that HOLDS the array, not the whole path. This is the
+    "array element" it forbids in a `$rename` source / destination (it silently
+    corrupted the array here).
+
+    Caller-gated on the source path resolving: mongod treats a `$rename` whose
+    source is absent as a no-op and never runs either array check, so
+    `{$rename: {"v.9.a": "q"}}` and `{$rename: {"v.0.zz": "q"}}` succeed while
+    `{$rename: {"v.0.a": "q"}}` is refused (measured 8.2.11, 2026-09-09).
+    """
     cur: Any = doc
+    holder: str | None = None
     for part in path.split("."):
         if isinstance(cur, list):
-            return part.isdigit()
+            return holder if part.isdigit() else None
         if isinstance(cur, Mapping) and part in cur:
+            holder = part
             cur = cur[part]
         else:
-            return False
-    return False
+            return None
+    return None
 
 
 def _apply_op(
@@ -1348,18 +1393,43 @@ def _apply_op(
                     f'path: {old}: "{new}"',
                     code=2,
                 )
-            if _rename_traverses_array(doc, old):
+            # An identifier with no arrayFilter is reported FIRST -- that check
+            # is not specific to `$rename`, and mongod runs it before deciding
+            # the path is dynamic (measured 8.2.11, 2026-09-09).
+            for rename_path in (old, new):
+                _check_array_filter_identifiers(rename_path, array_filters)
+            # Parse-time, and BEFORE the array checks below: a dynamic source
+            # outranks a dynamic destination, and a dynamic destination
+            # outranks an array-element SOURCE (measured 8.2.11, 2026-09-09).
+            if _rename_dynamic_path(old):
+                raise UpdateError(f"The source field for $rename may not be dynamic: {old}", code=2)
+            if _rename_dynamic_path(new):
                 raise UpdateError(
-                    f"The source field cannot be an array element, '{old}' in doc "
-                    f"with _id: {doc.get('_id')} has an array field",
-                    code=2,
+                    f"The destination field for $rename may not be dynamic: {new}", code=2
                 )
-            if _rename_traverses_array(doc, new):
-                raise UpdateError(
-                    f"The destination field cannot be an array element, '{new}' in doc "
-                    f"with _id: {doc.get('_id')} has an array field",
-                    code=2,
-                )
+            # Execution-time: mongod discovers these while applying the rename
+            # to a particular document, so they carry the executor wrapper --
+            # and it skips both when the source field is absent, because then
+            # the `$rename` is a no-op.
+            source_array_field = _rename_array_field(doc, old)
+            if has_path(doc, old):
+                if source_array_field is not None:
+                    raise UpdateError(
+                        f"The source field cannot be an array element, '{old}' in doc "
+                        f"with _id: {bson_value_repr(doc.get('_id'))} has an array "
+                        f"field called '{source_array_field}'",
+                        code=2,
+                        exec_error=True,
+                    )
+                array_field = _rename_array_field(doc, new)
+                if array_field is not None:
+                    raise UpdateError(
+                        f"The destination field cannot be an array element, '{new}' in "
+                        f"doc with _id: {bson_value_repr(doc.get('_id'))} has an array "
+                        f"field called '{array_field}'",
+                        code=2,
+                        exec_error=True,
+                    )
             old_paths = _expand(doc, old, array_filters, positional_matches)
             new_paths = _expand(doc, new, array_filters, positional_matches)
             if len(old_paths) != len(new_paths):
@@ -1371,13 +1441,16 @@ def _apply_op(
                 # A source path that cannot be TRAVERSED is an error, not a
                 # silent skip -- checked before `has_path`, which cannot tell
                 # "absent" from "blocked by a non-document".
-                # Only for a STATIC path. A positional form (`$`, `$[]`,
-                # `$[id]`) expands to a concrete path whose array step this
-                # predicate cannot tell from a blocked one -- and mongod refuses
-                # those outright for a different reason anyway (`2 The source
-                # field for $rename may not be dynamic`), which neither server
-                # implements yet. See tasks/backlog.md.
-                if "$" not in old:
+                # Every path reaching here is STATIC -- the dynamic forms were
+                # refused above -- so the predicate cannot mistake a positional
+                # expansion's array step for a blocked one.
+                #
+                # Skipped for a path that indexes into an ARRAY: mongod refuses
+                # that outright when the source resolves (above) and treats it
+                # as a plain no-op when it does not, so `{$rename: {"v.9.a":
+                # "q"}}` and `{$rename: {"v.0.zz": "q"}}` both succeed rather
+                # than reporting a 28 traverse failure.
+                if source_array_field is None:
                     problem = _traverse_problem(doc, op_path)
                     if problem is not None:
                         raise problem

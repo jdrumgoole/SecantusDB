@@ -46,6 +46,136 @@ pub fn has_path(doc: &Document, path: &str) -> bool {
     get_path(doc, path).is_some()
 }
 
+/// The array index `part` names, or `None` when it names no index at all.
+///
+/// Canonical digits only: mongod reads `x.0` as an index and `x.00` as a field
+/// name, so `"00"` gets no index reading.
+pub fn index_component(part: &str) -> Option<usize> {
+    if !is_digits(part) || (part.len() > 1 && part.starts_with('0')) {
+        return None;
+    }
+    part.parse::<usize>().ok()
+}
+
+/// `(value, indexed)` pairs for a SORT path, `indexed` per value.
+///
+/// The same walk as [`get_path_values`] -- both readings of a numeric component
+/// over an array -- but it reports, per value, whether the LAST component was
+/// consumed as an array INDEX. mongod descends one level into an array-valued
+/// sort key reached by a field name and does NOT descend one reached by an
+/// index, so `{x: [[5]]}` sorted by `x.0` ranks among the ARRAYS (its key is
+/// `[5]`) while `{x: [{y: [1, 2]}]}` sorted by `x.y` ranks by `1`.
+///
+/// Both servers descended in every case, so `x.0` over `[[5]]` sorted as the
+/// NUMBER 5: wrong order, and wrong RESULTS under a `limit`. Measured against
+/// 8.2.11 over twelve shapes in both sort directions, 2026-09-09.
+///
+/// Mirrors `secantus.ordering._sort_path_values`.
+pub fn sort_path_values<'a>(doc: &'a Document, path: &str) -> Vec<(&'a Bson, bool)> {
+    let mut current: Vec<(&Bson, bool)> = Vec::new();
+    let mut first = true;
+    for part in path.split('.') {
+        let mut next: Vec<(&Bson, bool)> = Vec::new();
+        if first {
+            if let Some(v) = doc.get(part) {
+                next.push((v, false));
+            }
+            first = false;
+        } else {
+            for (cur, _) in &current {
+                match cur {
+                    Bson::Document(d) => {
+                        if let Some(v) = d.get(part) {
+                            next.push((v, false));
+                        }
+                    }
+                    Bson::Array(arr) => {
+                        if is_digits(part) {
+                            if let Some(v) = part.parse::<usize>().ok().and_then(|i| arr.get(i)) {
+                                next.push((v, true));
+                            }
+                        }
+                        for elem in arr {
+                            if let Bson::Document(d) = elem {
+                                if let Some(v) = d.get(part) {
+                                    next.push((v, false));
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        current = next;
+    }
+    current
+}
+
+/// The `(component, array)` mongod refuses to sort by, or `None`.
+///
+/// A component is ambiguous when it is a VALID INDEX of the array it is applied
+/// to *and* some element of that array is a document carrying that exact key.
+/// Both halves are load-bearing -- `x.1` over `[{"1": 5}]` is fine (index 1 is
+/// past the end, so only the field reading exists) and `x.0` over `[{"00": 5}]`
+/// is fine (`"00"` is not the key `"0"`). The element carrying the key need not
+/// be the one at that index: `[{a: 5}, {"0": 6}]` sorted by `x.0` is refused.
+/// Measured over 19 shapes on 8.2.11, 2026-09-09.
+///
+/// mongod refuses only for a SORT -- the same path in a `find` filter, a
+/// `$group` `_id` or a projection resolves to both readings happily.
+/// Mirrors `secantus.ordering._check_sort_path_ambiguity`.
+pub fn ambiguous_sort_path<'a>(
+    doc: &'a Document,
+    path: &'a str,
+) -> Option<(&'a str, &'a Vec<Bson>)> {
+    let parts: Vec<&str> = path.split('.').collect();
+    ambiguity_walk(doc.get(parts[0])?, &parts[1..])
+}
+
+fn ambiguity_walk<'a>(current: &'a Bson, rest: &[&'a str]) -> Option<(&'a str, &'a Vec<Bson>)> {
+    let (part, tail) = rest.split_first()?;
+    match current {
+        Bson::Document(d) => d.get(*part).and_then(|v| ambiguity_walk(v, tail)),
+        Bson::Array(items) => {
+            let index = index_component(part).filter(|i| *i < items.len());
+            // The FIELD reading walks every element, which is also how a
+            // non-numeric component descends through an array.
+            let named: Vec<&Bson> = items
+                .iter()
+                .filter_map(|e| match e {
+                    Bson::Document(d) => d.get(*part),
+                    _ => None,
+                })
+                .collect();
+            if index.is_some() && !named.is_empty() {
+                return Some((part, items));
+            }
+            if let Some(i) = index {
+                if let Some(hit) = ambiguity_walk(&items[i], tail) {
+                    return Some(hit);
+                }
+            }
+            named.into_iter().find_map(|v| ambiguity_walk(v, tail))
+        }
+        _ => None,
+    }
+}
+
+/// mongod's message for the refusal [`ambiguous_sort_path`] detects.
+pub fn ambiguous_sort_message(part: &str, items: &[Bson]) -> String {
+    let rendered: Vec<String> = items
+        .iter()
+        .enumerate()
+        .map(|(i, v)| format!("{i}: {}", crate::query::bson_value_repr(v)))
+        .collect();
+    format!(
+        "Ambiguous field name found in array (do not use numeric field names in \
+         embedded elements in an array), field: '{part}' for array: {{ {} }}",
+        rendered.join(", ")
+    )
+}
+
 /// Every value reachable at `path`, descending into arrays, plus whether any
 /// component was resolved by walking array elements.
 ///

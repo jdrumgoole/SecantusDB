@@ -414,7 +414,9 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             collation.as_ref(),
             &let_vars,
         )
-        .map_err(command_error)?;
+        .map_err(|e| {
+            crate::util::read_exec_error(e, "find", &format!("{}.{}", &ctx.db_name, &coll))
+        })?;
 
     // Validate the filter even when nothing matched: against a non-empty
     // collection the storage scan evaluates the filter per doc and an

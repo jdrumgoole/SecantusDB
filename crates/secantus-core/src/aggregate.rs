@@ -879,13 +879,51 @@ fn sort_stage(docs: Vec<Document>, spec: &Bson) -> R<Vec<Document>> {
     for d in docs {
         let mut keys = Vec::with_capacity(fields.len());
         for (path, rev) in &fields {
-            let v = paths::get_path(&d, path).cloned().unwrap_or(Bson::Null);
-            if !order::is_sortable(&v) {
-                return Err(Fallback::Defer);
+            // mongod refuses a sort path whose component names both an array
+            // index and a key of that array's elements -- per document, at
+            // execution time, so it belongs under the executor wrapper.
+            if let Some((part, items)) = paths::ambiguous_sort_path(&d, path) {
+                return Err(
+                    Fallback::mongo(16746, paths::ambiguous_sort_message(part, items))
+                        .with_folded(false),
+                );
             }
-            // mongod sorts an array-valued field by one representative element:
-            // its minimum ascending, its maximum descending.
-            keys.push(order::array_sort_value(v, *rev).ok_or(Fallback::Defer)?);
+            // `sort_path_values` walks THROUGH arrays the way mongod's sort-key
+            // generation does; `get_path` reads a numeric component only as an
+            // index and never descends, which ranked `x: [{y: 1}]` with the
+            // documents that have no `x.y` at all.
+            let resolved = paths::sort_path_values(&d, path);
+            let mut best: Option<Bson> = None;
+            for (v, indexed) in resolved {
+                if !order::is_sortable(v) {
+                    return Err(Fallback::Defer);
+                }
+                // An array reached by an explicit INDEX is the sort value as it
+                // stands; one reached by a field name is descended a level.
+                let rep = if indexed {
+                    v.clone()
+                } else {
+                    order::array_sort_value(v.clone(), *rev).ok_or(Fallback::Defer)?
+                };
+                best = Some(match best {
+                    None => rep,
+                    Some(cur) => {
+                        let c = order::cmp(&rep, &cur);
+                        let take = if *rev {
+                            c == Ordering::Greater
+                        } else {
+                            c == Ordering::Less
+                        };
+                        if take {
+                            rep
+                        } else {
+                            cur
+                        }
+                    }
+                });
+            }
+            // A path that resolves nowhere ranks with null, as `get_path` did.
+            keys.push(best.unwrap_or(Bson::Null));
         }
         keyed.push((keys, d));
     }

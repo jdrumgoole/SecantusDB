@@ -59,6 +59,7 @@ from secantus.failpoints import FailPointRegistry, is_resumable_change_stream_co
 from secantus.geo import GeoError
 from secantus.logbuf import LogBuffer
 from secantus.metrics import TOP_SECTIONS, Metrics
+from secantus.ordering import AmbiguousSortPathError
 from secantus.projection import ProjectionError, apply_projection
 from secantus.query import QueryError, matches
 from secantus.rbac import (
@@ -2546,6 +2547,17 @@ def _find(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         return {"ok": 0.0, "errmsg": str(exc), "code": 2, "codeName": "BadValue"}
     except MinMaxKeyError as exc:
         return {"ok": 0.0, "errmsg": str(exc), "code": 51174, "codeName": "Location51174"}
+    except AmbiguousSortPathError as exc:
+        # An EXECUTION-time refusal: mongod discovers it per document, so it
+        # carries the executor wrapper naming the command and namespace.
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                f"Executor error during find command: {ctx.db_name}.{coll} :: caused by :: {exc}"
+            ),
+            "code": 16746,
+            "codeName": "Location16746",
+        }
     except QueryError as exc:
         return {"ok": 0.0, "errmsg": str(exc), "code": exc.code, "codeName": exc.code_name}
     except ExpressionError as exc:
@@ -6992,6 +7004,18 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     )
     try:
         docs = apply_pipeline(docs, pipeline, pipeline_ctx)
+    except AmbiguousSortPathError as exc:
+        # Same per-document refusal as ``find``'s, under this command's own
+        # executor wrapper. Without this clause it escaped as a bare code 1.
+        return {
+            "ok": 0.0,
+            "errmsg": (
+                f"Executor error during aggregate command on namespace: "
+                f"{ctx.db_name}.{coll} :: caused by :: {exc}"
+            ),
+            "code": 16746,
+            "codeName": "Location16746",
+        }
     except (AggregateError, ExpressionError) as exc:
         # Only EXECUTION-time failures take the executor prefix; parse errors
         # stay bare (probed 8.2.1 -- see AggregateError.exec_error).

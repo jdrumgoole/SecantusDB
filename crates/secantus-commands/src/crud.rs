@@ -940,8 +940,21 @@ pub fn update(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 .and_then(Bson::as_array)
                 .map(|a| a.iter().filter_map(|b| b.as_document().cloned()).collect())
                 .unwrap_or_default();
+            // PER-STATEMENT, not command-level: mongod reports this in
+            // `writeErrors` with `ok: 1`, so an unordered batch's other
+            // statements still apply. It used to fail the whole command, which
+            // a driver sees as a different exception class entirely
+            // (`OperationFailure` rather than `WriteError`).
             if let Some(e) = argtypes::array_filter_identifier_error(&u, &array_filters) {
-                return Ok(e.into_reply());
+                write_errors.push(Bson::Document(doc! {
+                    "index": index as i32,
+                    "code": e.code,
+                    "errmsg": e.errmsg.clone(),
+                }));
+                if ordered {
+                    break;
+                }
+                continue;
             }
             storage.update_matching_array_filters(
                 &ctx.db_name,

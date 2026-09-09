@@ -2313,17 +2313,46 @@ all still open. Probe: `scratchpad/readsweep.py` + `readsweep_lib.py`.
   check `git diff origin/main -- tasks/backlog.md` for removed lines you did not
   intend. The same mistake then recurred once while repairing it.
 
-- [ ] **OPEN, and this entry was WRONG until 2026-09-08 — `sort: {"x.0": 1}`
-  over an AMBIGUOUS positional path.** The claim above was that mongod ranks
-  `x: [[5]]` after `x: [{y: 5}]` and "ours puts it before". **Not reproducible**:
-  five isolated subsets, including that exact pair, agree on mongod, the Rust
-  server and the Python one.
+- [x] **RESOLVED 2026-09-09 — `sort: {"x.0": 1}` over an AMBIGUOUS positional
+  path, and the DESCENT rule underneath it.** This entry was WRONG twice before
+  it was right, which is the reusable part.
 
-  What actually happens: `{x: [{"0": 5}]}` is the one document where BOTH
-  readings of `x.0` resolve -- the index gives `{"0": 5}`, the field name gives
-  `5` -- and sorting by `x.0` over a collection containing it is
-  **`16746 Ambiguous field name`** on mongod. Both servers sort it happily. One
-  shape; measured 8.2.11, 2026-09-08.
+  Its first claim was that mongod ranks `x: [[5]]` after `x: [{y: 5}]` and "ours
+  puts it before". Not reproducible — five isolated subsets, including that
+  exact pair, agreed on all three servers.
+
+  Its second was that the whole item is one shape: `{x: [{"0": 5}]}` resolves
+  `x.0` BOTH ways, so mongod answers `16746 Ambiguous field name`. True, but the
+  rule is narrower than "the component is numeric and some element has that
+  key" — a first implementation of exactly that **over-fired**, refusing
+  `find x.1` over a corpus mongod answers. Measured over 19 shapes: a component
+  is ambiguous only when it is a **valid index** of the array *and* some element
+  document carries that **exact key**. So `x.1` over `[{"1": 5}]` is allowed
+  (index 1 is past the end) and `x.0` over `[{"00": 5}]` is allowed (`"00"` is
+  not the key `"0"`); the element carrying the key need not sit at that index.
+
+  And underneath it, unprobed by anything until now: **mongod descends one level
+  into an array-valued sort key reached by a FIELD NAME and does not descend one
+  reached by an INDEX.** Both servers descended in every case, so `{x: [[5]]}`
+  sorted by `x.0` ranked among the NUMBERS instead of the arrays — wrong order,
+  and wrong RESULTS under a `limit`. Parity could not see it (both engines were
+  wrong together) and `index_result_sets` could not either (it compares `_id`
+  SETS on purpose, to keep ordering out).
+
+  Two more fell out of the same probe: the Rust aggregation `$sort` stage
+  resolved keys with `get_path` — no array descent at all — disagreeing with its
+  own server's `find` on 9 of 48 shapes; and the Rust `find` handler reported
+  this refusal under the UPDATE executor wrapper with an empty command name
+  (`Plan executor error during  ::`), because `command_error` assumed a read
+  command never carries an execution-time error. Both servers now share one copy
+  of the walk (`secantus_core::paths::sort_path_values` / `ambiguous_sort_path`,
+  `secantus.ordering._sort_path_values` / `_check_sort_path_ambiguity`).
+
+  0 of 204 (ambiguity) and 0 of 48 (resolution) across mongod, Rust and Python.
+  Sweep `tools/probes/sort_path_resolution.py` — the only probe here that
+  compares ORDER, which is what the descent bug needed. Gates:
+  `tests/test_mongod_differential.py -k sortpath` and
+  `tests/test_sort_path_resolution.py`.
 
 - [x] **RESOLVED 2026-09-08 (see the positional-path entry above) — a dotted
   POSITIONAL component is AMBIGUOUS, and we implemented only half of it
@@ -6406,29 +6435,69 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `findAndModify` over the same corpus is 0 of 160 -- the fixes reach it
   through the shared update path, and it introduces nothing of its own.
 
-- [ ] **OPEN — `$rename` into an ARRAY ELEMENT is refused by mongod and
-  accepted by both servers (measured 2026-09-08).** Four shapes, all code 2 or
-  28 on 8.2.11 and all succeeding here:
+- [ ] **OPEN — `$toDate` string ACCEPTANCE, 3 shapes, and one is the two servers
+  disagreeing with each other (measured 8.2.11, 2026-09-09).** Distinct from the
+  "`$toDate` of an UNPARSEABLE string -- WON'T FIX" note further down, which is
+  about mongod's per-position timelib DIAGNOSTIC. This is about which strings it
+  parses at all, and a wrong answer outranks a wrong message:
 
-  | update over `{v: [{a: 1}, {a: 2}]}` | mongod |
-  | --- | --- |
-  | `{$rename: {"v.0.a": "v.0.b"}}` | `2 The source field cannot be an array element, 'v.0.a' ...` |
-  | `{$rename: {"v.$[].a": "v.$[].b"}}` | `2 The source field for $rename may not be dynamic: v.$[].a` |
-  | `{$rename: {"v.a": "v.b"}}` | `28 cannot use the part (v of v.a) to traverse the element (...)` |
-  | `{$rename: {"v.0.0.a": "v.0.0.b"}}` (nested) | `2 The source field cannot be an array element ...` |
+  | string | mongod | ours |
+  | --- | --- | --- |
+  | `"12/31/2020"` | parses to 2020-12-31 | both servers reject |
+  | `"2020-01-01T"` | parses | both servers reject |
+  | `"2020-01-01 "` (trailing space) | parses | **Rust rejects, Python accepts** |
 
-  **`tests/test_crud.py::test_rename_with_positional_via_pymongo` asserts the
-  `$[]` case SUCCEEDS** and produces `[{b: 1}, {b: 2}]` -- pinning behaviour
-  mongod refuses outright. It was written from what this server did, not from a
-  probe. Fix the servers and the test together; until then the static-path
-  traverse check added on 2026-09-08 deliberately skips any path containing
-  `$`, so it does not half-implement this.
+  mongod's parser accepts US `MM/DD/YYYY`, a bare trailing `T`, and trailing
+  whitespace. The third row is an intra-project inconsistency as well as a
+  divergence, so it is the one to fix first.
 
-  The codebase already has `_rename_traverses_array` and two "cannot be an array
-  element" messages, so part of the machinery exists -- check what it covers
-  before writing more.
+  **Caution before pinning any expectation:** `"2020-01-01T"` parses to
+  **07:00:00** on this box, which is host-local-time leakage of the same kind as
+  the `$toLower`/`$toUpper`-of-a-Timestamp item. Measure on a `TZ=UTC` server.
 
-- [ ] **OPEN — new probe: UPSERT SEEDING, 24 of 120 divergent (2026-09-08).**
+  Sweep: the 12-string corpus in `tasks/mongo-fidelity-plan.md` item 6.
+
+- [x] **RESOLVED 2026-09-09 — `$rename` path refusals, plus two the entry did
+  not know about.** Filed as four shapes. The four were right; what was missing
+  is that mongod separates the two refusals by WHEN it can decide them, and
+  reports them differently:
+
+  * a **dynamic** component (`$`, `$[]`, `$[id]`) in either path is a PARSE
+    error -- raised without looking at the document, so an absent source field
+    still errors (`{$rename: {"nope.$[].x": "q"}}` does), and sent bare;
+  * a path indexing into an **array** is an EXECUTION error -- discovered per
+    document, sent under `Plan executor error during update :: caused by ::`,
+    and skipped entirely when the source is absent, because then the `$rename`
+    is a no-op (`v.9.a` and `v.0.zz` both succeed).
+
+  Precedence: source-dynamic > destination-dynamic > source-array >
+  destination-array, with the general `No array filter found for identifier`
+  check ahead of all four. The message names the field HOLDING the array
+  (`deep.n.0.a` -> `'n'`) and renders `_id` with mongod's VALUE repr -- a string
+  `_id` quoted, an ObjectId wrapped -- where the Python server used `str()`.
+
+  **Two more came out of the same probe:**
+
+  - the Python server sent the code-28 `cannot use the part (s of s.a) to
+    traverse the element` **bare**; mongod wraps every code-28 traverse failure
+    (`$set` / `$inc` / `$push` measured alongside). The Rust twin already had
+    `.exec()` -- single-server drift, the shape CLAUDE.md says to grep for;
+  - the Rust server reported `No array filter found for identifier` as a
+    **command failure** rather than a per-statement `writeErrors` entry, which a
+    driver sees as a different exception class (`OperationFailure` rather than
+    `WriteError`) and which fails a whole unordered batch instead of one
+    statement.
+
+  `tests/test_crud.py::test_rename_with_positional_via_pymongo` asserted that
+  `items.$[].a` renames element-wise -- behaviour mongod refuses, written from
+  what this server did rather than from a probe. It is now
+  `test_rename_rejects_a_positional_path_via_pymongo`.
+
+  0 of 35 across mongod, Rust and Python. Sweep `tools/probes/rename_paths.py`;
+  gates `tests/test_mongod_differential.py -k rename` and
+  `tests/test_rename_array_and_dynamic_paths.py`.
+
+- [x] **RESOLVED 2026-09-08 — UPSERT SEEDING, was 24 of 120 divergent.**
   When an upsert inserts, mongod seeds the new document from the QUERY. Both
   servers seed only bare equality, so five query forms lose their fields
   entirely -- a silently wrong WRITE, since the inserted document is missing a
@@ -6447,13 +6516,21 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   implication question `_query_implies_partial` answers for partial indexes,
   and worth checking whether that helper can be reused.
 
-  **Also measured, and NOT understood: the seeded field ORDER.** For a query
-  `{a: 1, b: 2}` mongod emits `b, a`; for `{a: 1, b: 2, c: 3}` it emits
-  `b, a, c`. Stable across five runs and identical for every update operator
-  tried, so it is not noise -- but it is neither the query's order nor sorted,
-  and no rule is apparent from three data points. CLAUDE.md's own note records
-  that this ordering CHANGED between 6.0.16 (sorted) and newer servers, so
-  measure a wider set of key names before pinning anything.
+  Fixed on both servers by seeding every IMPLIED equality
+  (`_collect_upsert_seed` / `collect_upsert_seed`), with mongod's
+  `54 cannot infer query fields to set` when two clauses name one path. Values
+  are 0 of 120 on all three servers. Pinned by
+  `tests/test_upsert_seed_from_query.py` (26 cases).
+
+  **The seeded field ORDER is mongod's HASH-TABLE order and is deliberately NOT
+  reproduced.** Twelve key sets measured: `{a, b}` -> `b, a`; `{aa, ab}` ->
+  `aa, ab`; `{z, a}` -> `a, z`; `{one, two, three}` -> `three, one, two`;
+  `{b, a, d, c}` -> `c, a, b, d`. It ignores the query's own order and is
+  neither sorted nor reversed, so it is an implementation detail, not a
+  contract -- and CLAUDE.md already records that it CHANGED between 6.0.16
+  (sorted) and newer. Both servers keep the sorted order and the tests compare
+  field/value pairs. Reproducing it would mean reimplementing mongod's string
+  hash and table growth.
 
 - [ ] **The other decimal transcendentals still refuse (2026-09-08).** The six
   trig and the remaining hyperbolics (`$sin`, `$cos`, `$tan`, `$asin`, `$acos`,

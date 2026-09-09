@@ -3566,11 +3566,25 @@ def test_bucket_auto_via_pymongo(coll) -> None:
     assert sum(b["count"] for b in out) == 10
 
 
-def test_rename_with_positional_via_pymongo(coll) -> None:
+def test_rename_rejects_a_positional_path_via_pymongo(coll) -> None:
+    """mongod refuses a dynamic component in a `$rename` path -- it does not
+    apply it element-wise.
+
+    This test asserted the opposite for months: that `items.$[].a` renames every
+    element. Nothing here could have caught that -- it drives our own server,
+    the only one it can reach -- and the server was simply doing what the test
+    said. mongod answers `2 The source field for $rename may not be dynamic`
+    (measured 8.2.11, 2026-09-09), and the document is left untouched.
+    """
     coll.insert_one({"_id": 1, "items": [{"a": 1}, {"a": 2}]})
-    coll.update_one({"_id": 1}, {"$rename": {"items.$[].a": "items.$[].b"}})
-    out = coll.find_one({"_id": 1})
-    assert out["items"] == [{"b": 1}, {"b": 2}]
+    with pytest.raises(pymongo.errors.WriteError) as excinfo:
+        coll.update_one({"_id": 1}, {"$rename": {"items.$[].a": "items.$[].b"}})
+    assert excinfo.value.code == 2
+    assert (
+        excinfo.value.details["errmsg"]
+        == "The source field for $rename may not be dynamic: items.$[].a"
+    )
+    assert coll.find_one({"_id": 1})["items"] == [{"a": 1}, {"a": 2}]
 
 
 def test_lookup_pipeline_form_with_let(client: MongoClient) -> None:

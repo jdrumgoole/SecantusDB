@@ -1401,6 +1401,7 @@ dependencies = [
  "rand",
  "regex",
  "unicode-normalization",
+ "unicode-properties",
 ]
 
 [[package]]

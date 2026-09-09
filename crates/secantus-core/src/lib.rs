@@ -50,7 +50,10 @@ mod windowfields;
 // how `secantus.storage` imports from `secantus.paths`. The module itself stays
 // private — its `set_path` / `unset_path` use deliberate `Result<_, ()>` "defer"
 // signals that shouldn't become public API (clippy::result_unit_err).
-pub use paths::{get_path, get_path_values, has_path};
+pub use paths::{
+    ambiguous_sort_message, ambiguous_sort_path, get_path, get_path_values, has_path,
+    sort_path_values,
+};
 // mongod's two double renderings, needed by the command layer's stage
 // echo as well as by this crate's value messages. The module stays
 // private; only the two formatters are public.
