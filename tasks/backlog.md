@@ -557,10 +557,13 @@ rather than silently dropped. Two of the sixteen remain open — see below.
 
 **Rust pgserver connection error / lifecycle — LANDED 2026-09-08 (psycopg's
 `vendor/psycopg/tests/test_connection.py`, oracle PostgreSQL 16; 11 → 6
-failures).** `pg_backend_pid()` and `pg_terminate_backend(pid)` are implemented
-(self-termination raises a FATAL `57P01` and closes the socket; cross-connection
-arms a per-backend flag the victim honours at its next statement; unknown PID →
-`false`). An error inside a transaction now poisons the block from every path
+failures).** `pg_backend_pid()`, `pg_terminate_backend(pid)` and `pg_cancel_backend(pid)`
+are implemented (self-termination raises a FATAL `57P01` and closes the socket;
+cross-connection wakes the victim through its backend entry — a running
+statement is interrupted within milliseconds, `57014` for cancel and FATAL
+`57P01` for terminate, and an idle session is ended from the idle loop so the
+socket closes without waiting for client input; unknown PID → `false` with a
+`01000` WARNING, NULL → NULL; re-measured 2026-09-09, ~3 ms on both servers). An error inside a transaction now poisons the block from every path
 that can raise it — the simple protocol's `split_statements` and the extended
 protocol's `Describe`, not only `Execute` — so the next statement gets `25P02`.
 A FATAL over the simple query protocol now closes the socket without a trailing
@@ -696,6 +699,53 @@ remain open:
       plans as a plain column — a second equal value inserts where PG 16
       answers `23505` — and `pg_constraint` queries answer `42P01`. Multi-
       column FOREIGN KEYs and `ON DELETE SET DEFAULT` are refused `0A000`.
+- [ ] **OPEN — RUST pgserver: no two-phase commit — `PREPARE TRANSACTION` /
+      `COMMIT PREPARED` / `ROLLBACK PREPARED` / `pg_prepared_xacts`
+      (2026-09-09).** 38 skips in the widened psycopg gauge
+      (`tests/test_tpc.py`, `tests/test_tpc_async.py`, the dbapi20 tpc
+      cases): the suite skips itself when `max_prepared_transactions` is
+      0, which is what the server reports. The Python server has it
+      (b180); the Rust server does not. Note the oracle on this box also
+      runs with `max_prepared_transactions = 0`, so measuring it needs the
+      setting raised on PG first.
+- [ ] **OPEN — RUST pgserver: `CREATE ROLE` (2026-09-09).** 1 skip in the
+      psycopg gauge (`test_connection.py` role switching). Users are
+      constructor config, not catalog rows, on both servers.
+- [ ] **OPEN — RUST pgserver: `CREATE EXTENSION hstore` (2026-09-09).** 16
+      skips in the psycopg gauge (`tests/types/test_hstore.py`): the fixture
+      creates the extension and skips when that fails. The Python server
+      carries the hstore type (b153); the Rust server has neither the
+      extension statement nor the type.
+- [ ] **OPEN — RUST pgserver: postgis types (2026-09-09).** 26 skips in the
+      psycopg gauge (`tests/types/test_shapely.py`, `CREATE EXTENSION
+      postgis`). Out of scope — PostGIS is a third-party extension, not
+      PostgreSQL.
+- [ ] **OPEN — RUST pgserver: `tests/pq/test_pgresult.py::test_ftable_and_col`
+      (2026-09-09).** Needs three things at once: the comma cross join
+      `select * from t1, t2` (two sources with no JOIN keyword),
+      `'t1'::regclass::oid` resolving a table name to its oid, and the
+      RowDescription's `ftable` / `ftablecol` fields carrying that oid and
+      the 1-based column number for a column that came from a table (both
+      0 today). PostgreSQL 16 answers the table's `pg_class.oid` and the
+      attribute number.
+- [ ] **OPEN — RUST pgserver: a cast to an unknown type is 0A000, not 42704
+      (2026-09-09).** `select 1::no_such_type` is `0A000 a cast to
+      no_such_type is not supported yet`; PostgreSQL 16 is `42704 type
+      "no_such_type" does not exist`. The cast dispatcher falls through to
+      "unsupported" for every name it has no arm for, so a real unknown type
+      and a real-but-unimplemented type are indistinguishable to the client.
+- [ ] **OPEN — RUST pgserver: a session inside a transaction block does not
+      see a table another connection committed AFTER the block opened
+      (2026-09-09).** `a: begin; ... b: create table t; ... a: select * from
+      t` is `42P01` on the Rust server (the block's WiredTiger snapshot
+      predates the commit) where PostgreSQL 16 answers the rows (catalog
+      reads take a fresh snapshot per statement in READ COMMITTED). The
+      process-wide catalog cache added 2026-09-09 deliberately does not
+      publish such a stale read (`may_fill_catalog_cache`), so the
+      divergence stays confined to the session that opened the block.
+      `tests/test_rust_pgserver_slice.py::
+      test_catalog_changes_are_visible_across_connections` pins what does
+      match.
 
 **Rust server errors where Python defers — MEASURED 2026-08-26, and the five
 entries describing it are largely stale.** A three-way probe of 45
@@ -2360,7 +2410,10 @@ These are explicit non-goals. Don't add them without a reason.
   `parameter_types` / `result_types` as regtype display names, `prepare_time`
   timestamptz, `from_sql` false, generic / custom plan counts; protocol
   `Close`, `DEALLOCATE <name>` (26000 when missing) and `DEALLOCATE ALL`
-  remove rows), `NOTIFY` as a no-op tag, a zero-oid Parse of `$1::uuid`
+  remove rows), `NOTIFY` (a no-op tag then; since 2026-09-09 LISTEN / UNLISTEN /
+  NOTIFY / `pg_notify` deliver asynchronously across connections — before the
+  statement's ReadyForQuery outside a block, at COMMIT inside one, unprompted
+  to an idle listener), a zero-oid Parse of `$1::uuid`
   described from the cast, `uuid_in`'s hyphen-after-any-hex-group and brace
   forms, uuid / bytea / `uuid[]` / `bytea[]` BINARY results, a NUL byte in a
   binary text parameter as 22021, `inet` / `cidr` and their arrays as BINARY
@@ -5456,9 +5509,11 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   A WHERE clause over it now works (2026-09-09: a constant predicate —
   `where false` / `where true` / `where 1` → `42804` — and a comparison on
   the series column, `select count(*) from generate_series(1,5) i where i >
-  2` → `3`, all as PG 16.15 answers). `unnest`, `generate_subscripts` and
-  function calls in FROM other than `generate_series` are still
-  unsupported. In the SELECT LIST it works
+  2` → `3`, all as PG 16.15 answers). `unnest` and `generate_subscripts` are still
+  unsupported; a scalar function in FROM (`select 'ok' from pg_sleep(0.5)`,
+  `select * from pg_listening_channels()`) is one row per result since
+  2026-09-09, but only for the functions the planner names, not a general
+  `RangeFunction`. In the SELECT LIST it works
   (`select generate_series(1, 10)`, with alias / ORDER BY / LIMIT / OFFSET), but
   only as the SOLE target: `select 1, generate_series(1,3)` — which repeats the
   other columns across the generated rows — is refused, as is more than one
@@ -5724,12 +5779,16 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `current_user` / `session_user` / `current_role` / `current_catalog` /
   `current_schema` work; `select pg_typeof(user)` (the function nested in
   an argument) is `SqlvalueFunction is not supported yet`, and every
-  date/time one — `current_date`, `current_time`, `current_timestamp`,
-  `localtime`, `localtimestamp` (with or without a precision) — is
-  `current_date is not supported yet`. `now()` is also unsupported
-  (`function now() is not supported yet`). PostgreSQL 16: `current_date`
-  is a `date` (1082), `current_timestamp` a `timestamptz` (1184) named
-  after its keyword.
+  date/time one except `current_timestamp` — `current_date`,
+  `current_time`, `localtime`, `localtimestamp` (with or without a
+  precision) — is `current_date is not supported yet`. Landed 2026-09-09:
+  `now()` / `transaction_timestamp()` / `statement_timestamp()` /
+  `clock_timestamp()` and `current_timestamp` (bare and inside an
+  expression, `current_timestamp::text`), typed `timestamptz` and rendered
+  with the session-zone offset; all four `now`-family functions answer the
+  STATEMENT time where PG's `now()` is the transaction start.
+  PostgreSQL 16: `current_date` is a `date` (1082), `current_timestamp` a
+  `timestamptz` (1184) named after its keyword.
 - [ ] **OPEN — Rust PG server: subscripting a constant array (2026-09-09).**
   `select (array[1,2])[1]` and `select ('{1,2}'::int[])[2]` are `this field
   selection is not supported yet` (0A000); PostgreSQL 16 answers `1` / `2`,
@@ -5757,10 +5816,16 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   millisecond `Bson::DateTime` on the arithmetic path where the literal
   path keeps its micros.
 - [ ] **OPEN — Rust PG server: column DEFAULT expressions (2026-09-09).**
-  Only a literal DEFAULT is stored and applied. `create table t (n int
-  default now())` is refused 0A000 where PostgreSQL 16 is `42804 column "n"
-  is of type integer but default expression is of type timestamp with time
-  zone`; `ts timestamptz default now()` is accepted there and refused here;
+  Only a literal DEFAULT is stored and applied — the planner evaluates the
+  DEFAULT once at CREATE time and stores the VALUE, so a volatile function
+  is refused on purpose (`default_is_volatile`): accepting `ts timestamptz
+  default now()` would freeze the table's creation instant into every later
+  row where PostgreSQL 16 stamps each INSERT. Fixing this means storing the
+  expression and evaluating it per INSERT. `create table t (n int default
+  now())` is refused 0A000 where PostgreSQL 16 is `42804 column "n" is of
+  type integer but default expression is of type timestamp with time zone`;
+  `ts timestamptz default now()` / `n text default now()` are accepted there
+  and refused here (re-measured 2026-09-09);
   `insert into t values (default)` and `insert into t default values` are
   both unsupported (`SetToDefault` / an empty VALUES); DEFAULTs are not
   applied to columns omitted by `COPY … FROM STDIN`; and a `default_expr`
