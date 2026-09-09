@@ -435,34 +435,20 @@ companion reassembly. Verified byte-for-byte against PostgreSQL 16 for
 `date`, `time`, `timestamp`, `timestamptz`, `bytea`, and `int4[]`/`float8[]`/
 `text[]` arrays (arrays already had a binary path in `encode_binary`; the fix
 was routing COPY through it). `test_read_rows[*-1]` (2 binary array tests) now
-pass. STILL OPEN, mapped for a follow-up:
-  - **Transaction status after a simple-protocol COPY** (`test_copy_in_empty`
-    ×2, `test_copy_out_error_with_copy_not_finished`): psycopg drives COPY over
-    the *simple* query protocol, and vendored `pgwire` 0.40's process loop
-    hardcodes `ReadyForQuery(TransactionStatus::Idle)` after a simple-protocol
-    CopyDone, ignoring the open transaction. Not fixable from our `CopyHandler`
-    — needs a pgwire change / patch.
-  - **`serial` implicit sequence** (`test_copy_in_records_binary` ×2): the Rust
-    server has no `nextval` default, so a COPY that omits the serial column
-    can't auto-fill `1, 2, ...` the way the Python server does.
-  - **Faker exotic-type round-trips** (`test_copy_to_leaks`/`from_leaks`/
-    `table_across`): numeric-range/multirange comparison, high-precision
-    `numeric`, `inet`/`cidr` binary, `ObjectId` leaking into an integer column —
-    broad type-support work overlapping the type-catalog area, out of COPY scope.
+pass. **2026-09-09 (binary-faker batch):** the simple-protocol COPY
+transaction status (vendored pgwire's CopyDone now answers with the socket's
+real status), the omitted-`serial` / default fill on COPY (run inside the
+open transaction, so it no longer conflicts with the transaction's own
+earlier INSERT), the query-source sub-millisecond timestamp, and COPY BINARY
+of `uuid` / `json` / `jsonb` / `inet` / `cidr` / range columns are all fixed
+and byte-identical to PostgreSQL 16 (`test_copy_in_empty`,
+`test_copy_in_records_binary`, `test_copy_to_leaks`, `test_copy_from_leaks`
+pass; the leak tests still hit the 34-digit `numeric` limit on some draws).
+STILL OPEN:
   - **SQL-helper gaps unrelated to COPY** (`test_copy_*_allchars`,
     `test_copy_out_server_error`): `unnest()`, `GROUP BY` over an expression, and
     a bare `AExpr` (`1/n`) in the COPY source query are unsupported SQL, not COPY
     bugs.
-  - **OPEN — COPY BINARY residual type/path gaps** (not exercised by the
-    deterministic `test_copy.py` failures; deferred as balloons): `COPY (SELECT
-    ...) TO STDOUT` reads values via `copy_query_rows`, which does not reassemble
-    a `timestamp`'s sub-millisecond `__us_` companion, so a fractional-second
-    timestamp read through a *query* source (not a table) loses its last three
-    digits in BOTH text and binary — pre-existing, orthogonal to wire format.
-    COPY BINARY of `uuid` / `json` / `jsonb` / `inet` / `cidr` / range columns
-    now ERRORS ("cannot send … as a binary …") rather than emitting text bytes —
-    `encode_binary` has no arm for them (the FROM-side `decode_parameter` does),
-    so these are the faker exotic types and are out of the common-scalar scope.
 
 **Rust pgserver composite PARAMETERS — LANDED 2026-09-08 (psycopg's
 `vendor/psycopg/tests/types/test_composite.py`, oracle PostgreSQL 14; 24 → 18
@@ -1522,10 +1508,18 @@ Specific items that were left out of the slice that introduced their feature are
   unproven. `special_timestamp_text` / `canonical_wide_timestamp` in
   `secantus-pgplan/src/lib.rs` are where it would land. Also NOT handled: the
   clock-dependent input keywords `now` / `today` / `tomorrow` / `yesterday`
-  (only the constant `epoch` is).
+  (only the constant `epoch` is). **2026-09-09:** the BINARY form of a
+  wide/BC `timestamptz` is now byte-identical to PostgreSQL 16
+  (`10000-01-01 12:00:00` → `0380e715a0273000`, `1000-01-01 12:00+00:00 BC` →
+  `feafc61e5374f000`; `timestamp_text_to_pg_micros`), so binary cursors read
+  them correctly; only the TEXT offset is still open — re-measured: PG renders
+  `10000-01-01 12:00:00+00` (UTC) / `+01` (Europe/Rome) and the BC one as
+  `1000-01-01 12:00:00+00:49:56 BC` under Rome; ours has no offset on either.
 
-- [ ] **OPEN — RUST pgserver: named-zone `timestamptz` LOADING needs an IANA
-  time-zone database (noted 2026-09-08; 6 `test_datetime.py` failures remain).**
+- [ ] **OPEN — RUST pgserver: named-zone `timestamptz` LOADING — the 6
+  `test_load_datetimetz_tz[Europe/Rome ...]` failures noted 2026-09-08 PASS as
+  of 2026-09-09 (binary-faker batch); what remains is the array-DateStyle
+  note at the end.**
   The `pgserver-dtfeat` batch closed 38 of the 44 remaining `test_datetime.py`
   failures — datetime arithmetic (`date +/- int`, `date - date`, `timestamp +
   interval`, `interval + interval`, `interval * n`) now evaluates AND is typed
@@ -1541,7 +1535,10 @@ Specific items that were left out of the slice that introduced their feature are
   `render_timestamptz` / the `TimeZoneSetting`). NOTE: a date/timestamp ARRAY
   under a non-ISO DateStyle still renders its elements in ISO (the array text
   path does not thread the style yet) — no failing test exercises it today, but
-  it is a known divergence. Measured against a real PG 14.
+  it is a known divergence. Measured against a real PG 14. (The named-zone
+  offset resolution described above landed with `utc_text_in_zone` in
+  `secantus-pgplan`, which threads the session zone through the result
+  render; the paragraph is kept for the array-DateStyle gap only.)
 
 - [ ] **OPEN — RUST pgserver column metadata (`typmod` / `typlen`): landed
   for constant SELECTs, deferred for table columns and computed expressions
@@ -2306,10 +2303,6 @@ These are explicit non-goals. Don't add them without a reason.
     isempty(unknown) is not unique`; ours is `0A000`.
   - A malformed range literal error carries only the first line; PG adds the
     `LINE 1:` context and, for a bad bound, a `DETAIL:` line.
-  - A binary-format cursor fetching a custom range that psycopg has NOT
-    registered gets PG's raw binary bytes; ours sends the text rendering
-    (builtin and user ranges are not `binary_encodable`). psycopg's own tests
-    never hit this shape.
   - `RangeSubselect` (`from (select ...)`) is unsupported in the range
     corpus's few subquery shapes — a general planner gap, not a range one.
 
@@ -2362,9 +2355,10 @@ These are explicit non-goals. Don't add them without a reason.
     statement (psycopg never does this — it re-prepares).
   - `information_schema.columns` for a catalog VIEW (`where table_name =
     'pg_prepared_statements'`) is `relation "columns" does not exist`.
-  - `test_copy.py::test_copy_table_across[block]` / `[binary]` fail on the
-    random faker schema with `comparing numeric range bounds is not
-    supported yet` (`[row]` passes) — the range item's known gap, not COPY.
+  - `test_copy.py::test_copy_table_across[*]` fail on some faker draws with
+    `numeric value out of range: ... exceeds the 34 significant digits this
+    server stores` — the 34-digit `numeric` item, not COPY (the numeric range
+    bound comparison they used to fail on is fixed, 2026-09-09).
   - `test_copy_out_error_with_copy_not_finished`: after a COPY OUT is
     abandoned mid-stream psycopg sends CancelRequest and drains; PG ends the
     transaction `INERROR` (57014), ours stays `INTRANS` — the CancelRequest
@@ -5555,16 +5549,19 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `overlaps` (`&&`); none are ported to the Rust `scalar.rs` yet. Add only what
   the psycopg gauge exercises — probe first. The type itself (cast, column,
   `::text`, binary parameter + result) is done and gauged at 0 divergences.
-- **Rust PG server: a result column is only sent in the BINARY format when its
-  type is one this server can encode exactly.** `bool`, `int2`/`int4`/`int8`,
-  `float4`/`float8`, `text`/`varchar`/`bpchar`/`name`/`char`, `numeric` and
-  arrays of those honour the client's request; every other type is described as
-  TEXT even when binary was asked for. PostgreSQL honours the request for every
-  type. The client still reads the value correctly — the format travels per
-  column in the `RowDescription` — so this is a fidelity gap, not a wrong
-  answer, and the missing half is `date` / `time` / `timestamp` / `timestamptz`
-  / `interval` / ranges / multiranges / `json`, each needing its own binary
-  encoder.
+- [ ] **OPEN — RUST pgserver: `box` and `regtype` result columns are
+  described as TEXT when the client asks for BINARY.** Every other type the
+  psycopg faker draws — the datetime family, `interval`, ranges, multiranges,
+  `json`/`jsonb` and their arrays, empty arrays — is binary and byte-identical
+  to PostgreSQL 16 as of 2026-09-09 (`test_binary_results_cover_every_faker_type`
+  pins the bytes). Only `box` (`select '(1,2),(3,4)'::box` → PG sends four
+  float8s) and `regtype` (`select pg_typeof(1)` → PG sends the 4-byte oid
+  `00000017`; ours `696e7465676572`) still come back as text. The client reads
+  them correctly — the format travels per column — so this is a fidelity gap,
+  and it matters because psycopg reads EVERY column of a row in column 0's
+  format: a text `pg_typeof` in column 0 makes it run text loaders over the
+  binary columns after it. `test_a_type_without_a_binary_encoding_stays_text`
+  pins the `box` half.
 
   A MIXED request (some columns binary, some text in one `Bind`) is answered
   entirely in text. No measured client sends one.
@@ -5588,15 +5585,77 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   way (every dimension is sent with lower bound 1). psycopg's loaders ignore
   bounds, so no gauge test sees this.
 - [ ] **OPEN — Rust PG server: a composite RESULT column in BINARY format
-  with a range / date / array field fails with `cannot send this value as a
-  binary <comp>`.** `element_binary` has no range / date / array arms, so
-  `conn.cursor(binary=True).execute("select row(int4range(1,2))")` is refused
-  where PostgreSQL sends the record.
-- **Rust PG server: an array of MIXED non-numeric types keeps the
-  value-derived type where PostgreSQL coerces and often errors.** `array[1,
-  'a']` is `22P02` on PostgreSQL (the unknown literal is coerced to `integer`
-  and fails); here it answers a text array. Mixed NUMERIC types are handled --
-  they widen in PostgreSQL's order (2026-09-05 probe).
+  with an ARRAY field fails with `cannot send this value as a binary
+  record`.** `element_binary` has no array arm, so
+  `conn.cursor(binary=True).execute("select row(array[1,2])")` is refused
+  where PostgreSQL 16 sends
+  `00000001000003ef00000024000000010000000000000017000000020000000100000004000000010000000400000002`.
+  (The range / date fields it also used to refuse match PostgreSQL as of
+  2026-09-09.)
+- [ ] **OPEN — RUST pgserver: an ARRAY constructor mixing a typed element
+  and an unknown literal keeps the value-derived type where PostgreSQL
+  coerces the literal to the typed element's type.** Measured 2026-09-09
+  against PostgreSQL 16: `array[1, '2']` is `{1,2}` of `int4[]`;
+  `array['2020-01-01'::date, '2000-01-01']` is a `date[]`; `array[1, 'a']` is
+  `22P02` (the literal is coerced to `integer` and fails). Ours answers a
+  `text[]` for all three, and in one shape LOSES DATA: `array[1, '2']` came
+  back `{1,NULL}` through a text cursor and `cannot send this value as a
+  binary text` through a binary one. Mixed NUMERIC types are handled -- they
+  widen in PostgreSQL's order (2026-09-05 probe). Repro:
+  `conn.cursor(binary=True).execute("select array['2020-01-01'::date, '2000-01-01']")`
+  → PG `00000001000000000000043a00000002000000010000000400001c890000000400000000`.
+- [ ] **OPEN — RUST pgserver: the INSERT half of the assignment rule is not
+  checked — a typed non-json expression is accepted into a `jsonb` column.**
+  Measured 2026-09-09 against PostgreSQL 16 with `create table testjson(data
+  jsonb)`: `insert into testjson (data) values (42)` and `... values
+  ('{}'::text)` are `42804 column "data" is of type jsonb but expression is of
+  type integer` / `... of type text`, and so is psycopg's binary `%b` with a
+  `str` (it declares oid 25). Ours inserts all three. The untyped `%t` / `%s`
+  (oid 0) forms succeed on both, correctly. This is what fails
+  `tests/test_adapt.py::test_return_untyped[b]` on the Rust server (the
+  Python server fixed its copy on 2026-09-01, see §9525); it never passed on
+  the Rust side — there is no assignment typecheck in `secantus-pgplan` or
+  `secantus-pgserver` at all (grep `is of type` finds nothing). The binary
+  parameter typing added 2026-09-09 (`type_untyped_binary_params`) only fires
+  for oid-0 binary parameters, so it is not what admits the typed ones.
+- [ ] **OPEN — RUST pgserver: a `bytea`-typed parameter cast to another type
+  leaks the Rust `Debug` rendering into a `22P02` where PostgreSQL refuses the
+  CAST with `42846`.** `cur.execute("select %b::int4range", [b"\x00"])` is
+  `42846 cannot cast type bytea to int4range` on PostgreSQL 16 and
+  `select %b::int + 1` is `42846 cannot cast type bytea to integer`; ours
+  answers `22P02 malformed range literal: "Binary { subtype: Generic, bytes:
+  [0] }"` / `invalid input syntax for type integer: "Binary { ... }"`. Two
+  bugs: the cast should fail on the declared TYPE before any parse, and a
+  binary value must never be rendered with `{:?}`. The `Bson::Binary` →
+  text path in `cast_value` is where both land.
+- [ ] **OPEN — RUST pgserver: an UNTYPED binary parameter in a bare `select
+  %b` is echoed as text bytes where PostgreSQL rejects it as non-UTF-8.**
+  `cur.execute("select %b", [Multirange([])])` (oid 0, binary, payload
+  `00000000`) is `22021 invalid byte sequence for encoding "UTF8": 0x00` on
+  PostgreSQL 16 — an oid-0 parameter is `unknown`, resolved as `text`, and a
+  binary `text` must be valid UTF-8. Ours returns `'\x00\x00\x00\x00'`. Only the
+  select-list shape is open; the same parameter in `insert ... values (%b)`
+  is typed from its column on both servers as of 2026-09-09
+  (`test_an_empty_multirange_binary_parameter_is_typed_from_its_column`).
+- [ ] **OPEN — RUST pgserver: an explicit `::text` CAST of a `tstzrange` /
+  `tstzmultirange` / `timestamptz[]` renders the bounds in UTC WITHOUT an
+  offset; the same value uncasted renders correctly.** Under `set timezone to
+  'Europe/Rome'`, PostgreSQL 16 gives
+  `["2020-01-01 01:00:00+01","2020-06-01 12:00:00+02")` for
+  `tstzrange('2020-01-01 00:00+00','2020-06-01 10:00+00')::text` and
+  `{"2020-01-01 12:00:00+01"}` for `array['2020-01-01 12:00'::timestamptz]::text`;
+  ours gives `["2020-01-01 00:00:00","2020-06-01 10:00:00")` and
+  `{"2020-01-01 11:00:00"}`. Without the `::text` both servers agree
+  (`test_tstz_ranges_and_arrays_render_in_the_session_zone` pins that). The
+  cast goes through `cast_value(_, "text")` which has no session zone; the
+  result-render path does.
+- [ ] **OPEN — CHORE, RUST pgserver: two vendored `pgwire` unit tests need
+  TLS fixtures that are gitignored.** `cd crates/vendor/pgwire && cargo test
+  --lib` fails `tokio::tls::...` ×2 for a missing `examples/ssl/server.key`
+  (`*.key` is in `.gitignore`). Nothing else in that crate fails; either
+  generate a throwaway self-signed pair in the test or `#[ignore]` the two
+  until one exists. Noted 2026-09-09 while running the crate's tests after
+  the `put_cstring` / `cstring_body_len` patch.
 - **Rust PG server: `DROP` of anything but a table leaks Rust debug
   formatting into the client-facing message** — `DROP of Ok(ObjectType) is not
   supported yet`. Whatever the eventual support, the MESSAGE is a bug on its

@@ -2745,14 +2745,15 @@ def test_a_type_without_a_binary_encoding_stays_text(home: Path) -> None:
     PostgreSQL honours the request for every type. This one honours it for the
     types it can encode exactly and describes the rest as text, which the
     client reads correctly because the format travels per column -- the gap is
-    in `tasks/backlog.md`, not hidden behind a wrong answer.
+    in `tasks/backlog.md`, not hidden behind a wrong answer. (`box` and
+    `regtype` are what is left; the datetime family moved to binary, see
+    `test_binary_results_cover_every_faker_type`.)
     """
     with _Server(home) as server, server.connect() as conn:
-        conn.cursor().execute("set timezone to 'UTC'")
         cur = conn.cursor(binary=True)
-        cur.execute("select '2026-01-01 12:00'::timestamp")
+        cur.execute("select '(1,2),(3,4)'::box")
         assert cur.pgresult.fformat(0) == 0
-        assert cur.fetchone()[0] == dt.datetime(2026, 1, 1, 12, 0)
+        assert cur.pgresult.get_value(0, 0) == b"(3,4),(1,2)"
 
 
 def test_a_server_cursor_describes_its_portal(home: Path) -> None:
@@ -6250,3 +6251,340 @@ def test_anonymous_record_binary_result_carries_field_types(home: Path) -> None:
             assert cur.pgresult.get_value(0, 0) == raw, query
             assert cur.fetchone() == row, query
         assert conn.execute("select row(42, 'foo', 'ba,r')").fetchone() == (("42", "foo", "ba,r"),)
+
+
+def test_binary_results_cover_every_faker_type(home: Path) -> None:
+    """Every type psycopg's faker generates has a BINARY result form.
+
+    psycopg reads EVERY column of a result in the format of column 0
+    (`Transformer.set_pgresult` looks only at `PQfformat(res, 0)`, because
+    PostgreSQL never mixes formats in one reply), so one text-described column
+    in an otherwise binary row made the client run text loaders over binary
+    bytes -- `decimal.InvalidOperation`, garbage dates, `UnicodeDecodeError` --
+    which is what failed `test_leak` / `test_copy_to_leaks` / `test_random`.
+    The bytes below are PostgreSQL 16's (`scratchpad/binpin.py`), so this is
+    byte fidelity, not just "psycopg could decode it".
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("set timezone to 'UTC'")
+        cases: list[tuple[str, str, object]] = [
+            ("'2000-01-02'::date", "00000001", dt.date(2000, 1, 2)),
+            ("'12:00:00+05:30'::timetz", "0000000a0eebb000ffffb2a8", None),
+            (
+                "'2000-01-01 00:00:01'::timestamp",
+                "00000000000f4240",
+                dt.datetime(2000, 1, 1, 0, 0, 1),
+            ),
+            (
+                "'2000-01-01 00:00:01+00'::timestamptz",
+                "00000000000f4240",
+                dt.datetime(2000, 1, 1, 0, 0, 1, tzinfo=dt.timezone.utc),
+            ),
+            (
+                "'1 day 2 hours'::interval",
+                "00000001ad2748000000000100000000",
+                dt.timedelta(days=1, hours=2),
+            ),
+            ("'-1 mon -3 days'::interval", "0000000000000000fffffffdffffffff", None),
+            (
+                "'[2000-01-01,2000-01-02)'::tsrange",
+                "0200000008000000000000000000000008000000141dd76000",
+                Range(dt.datetime(2000, 1, 1), dt.datetime(2000, 1, 2), "[)"),
+            ),
+            (
+                "'[-infinity,infinity]'::tsrange",
+                "06000000088000000000000000000000087fffffffffffffff",
+                None,
+            ),
+            ("'empty'::int4range", "01", Range(empty=True)),
+            ("'(,5]'::int8range", "08000000080000000000000006", Range(None, 6, "[)")),
+            ("'{}'::int4[]", "000000000000000000000017", []),
+            ("'{}'::text[]", "000000000000000000000019", []),
+            (
+                "'{[1,3),[5,7)}'::int4multirange",
+                "00000002000000110200000004000000010000000400000003"
+                "000000110200000004000000050000000400000007",
+                Multirange([Range(1, 3, "[)"), Range(5, 7, "[)")]),
+            ),
+            ("'{}'::int4multirange", "00000000", Multirange([])),
+            (
+                "array['{\"a\":1}'::jsonb, null]",
+                "000000010000000100000eda000000020000000100000009017b2261223a20317dffffffff",
+                [{"a": 1}, None],
+            ),
+            (
+                "array['{\"a\":1}'::json]",
+                "0000000100000000000000720000000100000001000000077b2261223a317d",
+                [{"a": 1}],
+            ),
+            (
+                "array['2020-01-01'::date, '2000-01-01'::date]",
+                "00000001000000000000043a00000002000000010000000400001c890000000400000000",
+                [dt.date(2020, 1, 1), dt.date(2000, 1, 1)],
+            ),
+        ]
+        for expr, want_hex, want in cases:
+            cur = conn.cursor(binary=True)
+            cur.execute(f"select {expr}")
+            assert cur.pgresult.fformat(0) == 1, expr
+            assert cur.pgresult.get_value(0, 0).hex() == want_hex, expr
+            if want is not None:
+                assert cur.fetchone()[0] == want, expr
+
+        # The same types read back from a TABLE (the faker's real shape), all
+        # columns binary in one row -- the shape psycopg cannot mix formats in.
+        cur = conn.cursor()
+        cur.execute(
+            "create table fk (d date, t time, tz timetz, ts timestamp, tstz timestamptz, "
+            "iv interval, r int4range, mr int4multirange, j json[], jb jsonb[], e int4[])"
+        )
+        cur.execute(
+            "insert into fk values ('2020-02-03', '01:02:03.5', '01:02:03+02', "
+            "'2020-02-03 04:05:06.789', '2020-02-03 04:05:06+00', '3 mons 2 days 1 hour', "
+            "'[1,10)', '{[1,2),[5,9)}', array['[1, 2]'::json], array['{\"b\": true}'::jsonb], '{}')"
+        )
+        cur = conn.cursor(binary=True)
+        cur.execute("select * from fk")
+        assert all(cur.pgresult.fformat(i) == 1 for i in range(11))
+        assert cur.fetchone() == (
+            dt.date(2020, 2, 3),
+            dt.time(1, 2, 3, 500000),
+            dt.time(1, 2, 3, tzinfo=dt.timezone(dt.timedelta(hours=2))),
+            dt.datetime(2020, 2, 3, 4, 5, 6, 789000),
+            dt.datetime(2020, 2, 3, 4, 5, 6, tzinfo=dt.timezone.utc),
+            dt.timedelta(days=92, hours=1),
+            Range(1, 10, "[)"),
+            Multirange([Range(1, 2, "[)"), Range(5, 9, "[)")]),
+            [[1, 2]],
+            [{"b": True}],
+            [],
+        )
+
+
+def test_tstz_ranges_and_arrays_render_in_the_session_zone(home: Path) -> None:
+    """A `tstzrange` / `tstzmultirange` / `timestamptz[]` column's TEXT form
+    renders each bound in the session zone with its offset, as PostgreSQL
+    16 does: `["2020-01-01 01:00:00+01","2020-06-01 12:00:00+02")` under
+    Europe/Rome. The bounds are stored as naive UTC and used to go out that
+    way, so a client under any zone but UTC read the wrong instants.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("set timezone to 'UTC'")
+        conn.execute(
+            "create table tzr (r tstzrange, m tstzmultirange, a timestamptz[]); "
+            "insert into tzr values ('[2020-01-01 00:00+00,2020-06-01 10:00+00)', "
+            "'{[2020-01-01 00:00+00,2020-01-02 00:00+00)}', "
+            "array['2020-01-01 00:00+00'::timestamptz])"
+        )
+        rome = dt.datetime(2020, 1, 1, 1, tzinfo=dt.timezone(dt.timedelta(hours=1)))
+        for zone, raw in (
+            (
+                "UTC",
+                (
+                    b'["2020-01-01 00:00:00+00","2020-06-01 10:00:00+00")',
+                    b'{["2020-01-01 00:00:00+00","2020-01-02 00:00:00+00")}',
+                    b'{"2020-01-01 00:00:00+00"}',
+                ),
+            ),
+            (
+                "Europe/Rome",
+                (
+                    b'["2020-01-01 01:00:00+01","2020-06-01 12:00:00+02")',
+                    b'{["2020-01-01 01:00:00+01","2020-01-02 01:00:00+01")}',
+                    b'{"2020-01-01 01:00:00+01"}',
+                ),
+            ),
+        ):
+            conn.execute(f"set timezone to '{zone}'")
+            cur = conn.cursor()
+            cur.execute("select r, m, a from tzr")
+            assert tuple(cur.pgresult.get_value(0, i) for i in range(3)) == raw, zone
+            row = cur.fetchone()
+            assert row[0].lower == rome and row[2] == [rome], zone
+            # And the binary form is the same UTC instant whatever the zone.
+            cur = conn.cursor(binary=True)
+            cur.execute("select r, m, a from tzr")
+            assert cur.pgresult.get_value(0, 0).hex() == (
+                "020000000800023e0786c260000000000800024a01a067c800"
+            )
+            assert cur.pgresult.get_value(0, 2).hex() == (
+                "0000000100000000000004a000000001000000010000000800023e0786c26000"
+            )
+
+
+def test_set_config_reports_the_time_zone_like_set_does(home: Path) -> None:
+    """`set_config('TimeZone', ...)` sends the same ParameterStatus as `SET
+    TimeZone` (PostgreSQL 16). psycopg builds a timestamptz's tzinfo from that
+    report, so without it a zone change through `set_config` was invisible to
+    the client's loader and every timestamptz came back in the old zone."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("set timezone to 'UTC'")
+        assert conn.info.parameter_status("TimeZone") == "UTC"
+        conn.execute("select set_config('TimeZone', 'Europe/Rome', false)")
+        assert conn.info.parameter_status("TimeZone") == "Europe/Rome"
+        got = conn.execute("select '2020-07-01 12:00+00'::timestamptz").fetchone()[0]
+        assert got.utcoffset() == dt.timedelta(hours=2)
+
+
+def test_jsonb_unicode_escapes_match_postgres(home: Path) -> None:
+    """PostgreSQL 16's `jsonb` input: a surrogate PAIR becomes the character,
+    a lone surrogate is `22P02 invalid input syntax for type json` (no value
+    suffix), and `\\u0000` is `22P05 unsupported Unicode escape sequence`.
+    `json` keeps every escape verbatim and only refuses `\\u0000` through an
+    operator. The faker emits such strings, and the old parser combined a
+    pair into two U+FFFD replacement characters.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("""select '"\\ud83d\\ude00"'::jsonb::text, '"\\u00e9"'::jsonb::text""")
+        assert cur.fetchone() == ('"\U0001f600"', '"\u00e9"')
+        for lone in ('"\\ud83d"', '"\\ude00"', '"\\ud83dx"', '"\\ud83d\\ud83d"', '{"a":"\\ud83d"}'):
+            with pytest.raises(psycopg.errors.InvalidTextRepresentation) as exc:
+                cur.execute(f"select '{lone}'::jsonb")
+            assert str(exc.value).startswith("invalid input syntax for type json"), lone
+            assert exc.value.diag.sqlstate == "22P02"
+        with pytest.raises(psycopg.errors.UntranslatableCharacter) as exc:
+            cur.execute("""select '"\\u0000"'::jsonb""")
+        assert exc.value.diag.sqlstate == "22P05"
+        assert str(exc.value).startswith("unsupported Unicode escape sequence")
+        # `json` is verbatim, escapes and all.
+        cur.execute("""select '"\\ud83d"'::json::text, '"\\u0000"'::json::text""")
+        assert cur.fetchone() == ('"\\ud83d"', '"\\u0000"')
+        with pytest.raises(psycopg.errors.InvalidTextRepresentation):
+            cur.execute("""select '"\\ud83d"'::json ->> 0""")
+        with pytest.raises(psycopg.errors.UntranslatableCharacter):
+            cur.execute("""select '"\\u0000"'::json ->> 0""")
+
+
+def test_copy_inside_a_transaction_stays_in_it(home: Path) -> None:
+    """A simple-protocol COPY inside a transaction leaves the connection
+    INTRANS, and a COPY of NO rows too (PostgreSQL 16: status 2, rowcount 0).
+
+    The vendored pgwire answered CopyDone with `ReadyForQuery(Idle)` whatever
+    the transaction state; psycopg then believed the connection idle, its
+    `rollback()` sent nothing, and the COPY'd rows survived the rollback.
+    """
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        conn.execute("create table cp (id int, s text)")
+    with _Server(home) as server, server.connect(autocommit=False) as conn:
+        cur = conn.cursor()
+        with cur.copy("copy cp from stdin") as cp:
+            pass
+        assert conn.info.transaction_status == psycopg.pq.TransactionStatus.INTRANS
+        assert cur.rowcount == 0
+        with cur.copy("copy cp from stdin") as cp:
+            cp.write("1\ta\n2\tb\n")
+        assert conn.info.transaction_status == psycopg.pq.TransactionStatus.INTRANS
+        assert cur.rowcount == 2
+        assert conn.execute("select count(*) from cp").fetchone() == (2,)
+        conn.rollback()
+        assert conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
+        assert conn.execute("select count(*) from cp").fetchone() == (0,)
+        conn.rollback()
+        # A COPY that fails leaves the transaction in error, as any statement.
+        with (
+            pytest.raises(psycopg.errors.InvalidTextRepresentation),
+            cur.copy("copy cp from stdin") as cp,
+        ):
+            cp.write("x\ta\n")
+        assert conn.info.transaction_status == psycopg.pq.TransactionStatus.INERROR
+        conn.rollback()
+
+
+def test_copy_fills_the_columns_it_omits_from_their_defaults(home: Path) -> None:
+    """A COPY with a column list fills the omitted columns like an INSERT
+    does -- a `serial` from its sequence (PostgreSQL 16: `(1, None, 'hello'),
+    (2, None, 'world')`), a literal default from its expression. The rows
+    used to be stored with those columns NULL. And the fill runs INSIDE the
+    open transaction: done outside, its `nextval` conflicted with the
+    transaction's own earlier INSERT and spun on the write-conflict retry
+    until the client gave up.
+    """
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        conn.execute(
+            "create table ci (id serial primary key, n int, data text, k text default 'dflt')"
+        )
+        with conn.cursor().copy("copy ci (n, data) from stdin") as cp:
+            cp.write("\\N\thello\n\\N\tworld\n")
+        assert conn.execute("select * from ci order by id").fetchall() == [
+            (1, None, "hello", "dflt"),
+            (2, None, "world", "dflt"),
+        ]
+        conn.execute("create table ct (id serial primary key, n int, data text)")
+    with _Server(home) as server, server.connect(autocommit=False) as conn:
+        conn.execute("insert into ct (data) values ('a')")
+        with conn.cursor().copy("copy ct (data) from stdin") as cp:
+            cp.write("hello\n")
+        conn.execute("insert into ct (data) values ('b')")
+        assert conn.execute("select * from ct order by id").fetchall() == [
+            (1, None, "a"),
+            (2, None, "hello"),
+            (3, None, "b"),
+        ]
+        assert conn.info.transaction_status == psycopg.pq.TransactionStatus.INTRANS
+        conn.rollback()
+        assert conn.execute("select count(*) from ct").fetchone() == (0,)
+
+
+def test_copy_in_parses_arrays_and_binary_reads_stored_timestamps(home: Path) -> None:
+    """A COPY'd `text[]` is stored as the array it is (it was one raw string,
+    and read back as `{"{ab,cd}"}`, which psycopg reports as "malformed
+    array: hit the end of the buffer"), a COPY'd date in its canonical text;
+    and a stored `timestamp` read by a BINARY cursor is the i64 instant, not
+    its text bytes (psycopg read `2020-01-01 00:00:00` as an integer:
+    "timestamp too large").
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table ca (id int, a text[], d date, ts timestamp, tz timestamptz)")
+        with conn.cursor().copy("copy ca from stdin") as cp:
+            cp.write("1\t{ab,cd}\t2020-01-05\t2020-01-01 00:00:00.25\t2020-01-01 00:00:00+00\n")
+        conn.execute("set timezone to 'UTC'")
+        for binary in (False, True):
+            cur = conn.cursor(binary=binary)
+            cur.execute("select a, d, ts, tz from ca")
+            assert cur.pgresult.fformat(2) == int(binary)
+            assert cur.fetchone() == (
+                ["ab", "cd"],
+                dt.date(2020, 1, 5),
+                dt.datetime(2020, 1, 1, 0, 0, 0, 250000),
+                dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc),
+            )
+        with conn.cursor().copy("copy ca (a) to stdout") as cp:
+            assert b"".join(cp) == b"{ab,cd}\n"
+
+
+def test_an_empty_multirange_binary_parameter_is_typed_from_its_column(home: Path) -> None:
+    """psycopg sends `Multirange([])` UNTYPED (no element to name the type
+    from) and, in binary, as four zero bytes. Read as text those were
+    `malformed multirange literal: "\\0\\0\\0\\0"` -- and that message carried
+    the NULs onto the wire, where the client found bytes after the message's
+    fields and dropped the connection. PostgreSQL resolves the parameter's
+    type from the column it goes into, and so does this server now.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table mr (id int, m int4multirange)")
+        cur = conn.cursor()
+        cur.execute("insert into mr values (%s, %b)", (1, Multirange([])))
+        cur.execute("insert into mr values (%s, %b)", (2, Multirange([Range(1, 3, "[)")])))
+        assert conn.execute("select m from mr order by id").fetchall() == [
+            (Multirange([]),),
+            (Multirange([Range(1, 3, "[)")]),),
+        ]
+        # The connection survived every step.
+        assert conn.execute("select 1").fetchone() == (1,)
+
+
+def test_datetime_array_text_is_not_a_debug_dump(home: Path) -> None:
+    """`timestamp[]::text` / `interval[]::text` render each element as its
+    scalar text (PostgreSQL 16: `{"2020-01-01 00:00:00.5"}`, `{"1 day"}`).
+    They rendered the BSON value's Rust Debug form, `{"DateTime(2020-01-01
+    0:00:00.5 +00:00:00)"}`, which no client can read.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("set timezone to 'UTC'")
+        cur = conn.cursor()
+        cur.execute(
+            "select array['2020-01-01 00:00:00.5'::timestamp]::text, "
+            "array['1 day'::interval]::text, array['12:00'::time]::text"
+        )
+        assert cur.fetchone() == ('{"2020-01-01 00:00:00.5"}', '{"1 day"}', "{12:00:00}")

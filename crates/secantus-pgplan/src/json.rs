@@ -30,8 +30,18 @@ pub enum Json {
     Object(Vec<(String, Json)>),
 }
 
-#[derive(Debug)]
-pub struct ParseError;
+#[derive(Debug, PartialEq, Eq)]
+pub enum ParseError {
+    /// Not JSON at all.
+    Syntax,
+    /// A `\uD800`..`\uDFFF` escape with no partner: one half of a UTF-16
+    /// pair, which decodes to no character. PostgreSQL's `json` type keeps
+    /// the escape as written; `jsonb` rejects it (22P02).
+    UnpairedSurrogate,
+    /// `\u0000`: decodes to a character text cannot hold. `json` keeps the
+    /// escape; `jsonb` rejects it with 22P05.
+    NulEscape,
+}
 
 /// Parse a complete JSON document. Trailing non-whitespace is an error, so
 /// `{"a":1} x` is rejected the way PostgreSQL rejects it.
@@ -41,7 +51,7 @@ pub fn parse(text: &str) -> Result<Json, ParseError> {
     let value = parse_value(bytes, &mut pos)?;
     skip_ws(bytes, &mut pos);
     if pos != bytes.len() {
-        return Err(ParseError);
+        return Err(ParseError::Syntax);
     }
     Ok(value)
 }
@@ -55,7 +65,7 @@ fn skip_ws(b: &[u8], pos: &mut usize) {
 fn parse_value(b: &[u8], pos: &mut usize) -> Result<Json, ParseError> {
     skip_ws(b, pos);
     let Some(&c) = b.get(*pos) else {
-        return Err(ParseError);
+        return Err(ParseError::Syntax);
     };
     match c {
         b'{' => parse_object(b, pos),
@@ -70,7 +80,7 @@ fn parse_value(b: &[u8], pos: &mut usize) -> Result<Json, ParseError> {
 
 fn literal(b: &[u8], pos: &mut usize, word: &str) -> Result<(), ParseError> {
     if b.len() < *pos + word.len() || &b[*pos..*pos + word.len()] != word.as_bytes() {
-        return Err(ParseError);
+        return Err(ParseError::Syntax);
     }
     *pos += word.len();
     Ok(())
@@ -86,11 +96,11 @@ fn parse_number(b: &[u8], pos: &mut usize) -> Result<Json, ParseError> {
         *pos += 1;
     }
     if *pos == int_start {
-        return Err(ParseError);
+        return Err(ParseError::Syntax);
     }
     // A leading zero may not be followed by another digit: `01` is not JSON.
     if b[int_start] == b'0' && *pos - int_start > 1 {
-        return Err(ParseError);
+        return Err(ParseError::Syntax);
     }
     if b.get(*pos) == Some(&b'.') {
         *pos += 1;
@@ -99,7 +109,7 @@ fn parse_number(b: &[u8], pos: &mut usize) -> Result<Json, ParseError> {
             *pos += 1;
         }
         if *pos == frac_start {
-            return Err(ParseError);
+            return Err(ParseError::Syntax);
         }
     }
     if matches!(b.get(*pos), Some(b'e' | b'E')) {
@@ -112,22 +122,34 @@ fn parse_number(b: &[u8], pos: &mut usize) -> Result<Json, ParseError> {
             *pos += 1;
         }
         if *pos == exp_start {
-            return Err(ParseError);
+            return Err(ParseError::Syntax);
         }
     }
-    let text = std::str::from_utf8(&b[start..*pos]).map_err(|_| ParseError)?;
+    let text = std::str::from_utf8(&b[start..*pos]).map_err(|_| ParseError::Syntax)?;
     Ok(Json::Number(text.to_string()))
+}
+
+/// The four hex digits after `\\u`, cursor advanced past them.
+fn parse_hex4(b: &[u8], pos: &mut usize) -> Result<u32, ParseError> {
+    let hex = b.get(*pos..*pos + 4).ok_or(ParseError::Syntax)?;
+    let hex = std::str::from_utf8(hex).map_err(|_| ParseError::Syntax)?;
+    if !hex.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ParseError::Syntax);
+    }
+    let n = u32::from_str_radix(hex, 16).map_err(|_| ParseError::Syntax)?;
+    *pos += 4;
+    Ok(n)
 }
 
 fn parse_string(b: &[u8], pos: &mut usize) -> Result<String, ParseError> {
     if b.get(*pos) != Some(&b'"') {
-        return Err(ParseError);
+        return Err(ParseError::Syntax);
     }
     *pos += 1;
     let mut out = String::new();
     loop {
         let Some(&c) = b.get(*pos) else {
-            return Err(ParseError);
+            return Err(ParseError::Syntax);
         };
         match c {
             b'"' => {
@@ -137,7 +159,7 @@ fn parse_string(b: &[u8], pos: &mut usize) -> Result<String, ParseError> {
             b'\\' => {
                 *pos += 1;
                 let Some(&e) = b.get(*pos) else {
-                    return Err(ParseError);
+                    return Err(ParseError::Syntax);
                 };
                 *pos += 1;
                 match e {
@@ -150,24 +172,36 @@ fn parse_string(b: &[u8], pos: &mut usize) -> Result<String, ParseError> {
                     b'r' => out.push('\r'),
                     b't' => out.push('\t'),
                     b'u' => {
-                        let hex = b.get(*pos..*pos + 4).ok_or(ParseError)?;
-                        let hex = std::str::from_utf8(hex).map_err(|_| ParseError)?;
-                        let n = u32::from_str_radix(hex, 16).map_err(|_| ParseError)?;
-                        *pos += 4;
-                        // A surrogate pair is two escapes; anything unpaired is
-                        // left as the replacement character rather than failing,
-                        // which is what a lone surrogate can only become in
-                        // UTF-8 text.
-                        out.push(char::from_u32(n).unwrap_or('\u{fffd}'));
+                        let n = parse_hex4(b, pos)?;
+                        // A surrogate pair is two escapes -- `\ud83d\ude00` is
+                        // one character -- and either half on its own is no
+                        // character at all.
+                        let n = match n {
+                            0xD800..=0xDBFF => {
+                                if b.get(*pos..*pos + 2) != Some(b"\\u") {
+                                    return Err(ParseError::UnpairedSurrogate);
+                                }
+                                *pos += 2;
+                                let lo = parse_hex4(b, pos)?;
+                                if !(0xDC00..=0xDFFF).contains(&lo) {
+                                    return Err(ParseError::UnpairedSurrogate);
+                                }
+                                0x10000 + ((n - 0xD800) << 10) + (lo - 0xDC00)
+                            }
+                            0xDC00..=0xDFFF => return Err(ParseError::UnpairedSurrogate),
+                            0 => return Err(ParseError::NulEscape),
+                            n => n,
+                        };
+                        out.push(char::from_u32(n).ok_or(ParseError::Syntax)?);
                     }
-                    _ => return Err(ParseError),
+                    _ => return Err(ParseError::Syntax),
                 }
             }
             // A raw control character is not valid inside a JSON string.
-            0x00..=0x1f => return Err(ParseError),
+            0x00..=0x1f => return Err(ParseError::Syntax),
             _ => {
-                let rest = std::str::from_utf8(&b[*pos..]).map_err(|_| ParseError)?;
-                let ch = rest.chars().next().ok_or(ParseError)?;
+                let rest = std::str::from_utf8(&b[*pos..]).map_err(|_| ParseError::Syntax)?;
+                let ch = rest.chars().next().ok_or(ParseError::Syntax)?;
                 out.push(ch);
                 *pos += ch.len_utf8();
             }
@@ -192,7 +226,7 @@ fn parse_array(b: &[u8], pos: &mut usize) -> Result<Json, ParseError> {
                 *pos += 1;
                 return Ok(Json::Array(items));
             }
-            _ => return Err(ParseError),
+            _ => return Err(ParseError::Syntax),
         }
     }
 }
@@ -210,7 +244,7 @@ fn parse_object(b: &[u8], pos: &mut usize) -> Result<Json, ParseError> {
         let key = parse_string(b, pos)?;
         skip_ws(b, pos);
         if b.get(*pos) != Some(&b':') {
-            return Err(ParseError);
+            return Err(ParseError::Syntax);
         }
         *pos += 1;
         let value = parse_value(b, pos)?;
@@ -222,7 +256,7 @@ fn parse_object(b: &[u8], pos: &mut usize) -> Result<Json, ParseError> {
                 *pos += 1;
                 return Ok(Json::Object(pairs));
             }
-            _ => return Err(ParseError),
+            _ => return Err(ParseError::Syntax),
         }
     }
 }

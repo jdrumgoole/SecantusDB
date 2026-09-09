@@ -730,9 +730,14 @@ impl PgHandler {
     fn prepared_record(&self, stmt: &StoredStatement<ParsedStatement>) -> PreparedRecord {
         let sql = stmt.statement.sql.clone();
         let declared = self.param_type_names(stmt);
-        let column_type = |table: &str, column: &str| {
-            self.lookup(table)
-                .and_then(|def| def.column(column).map(|c| c.pg_type.clone()))
+        let column_type = |table: &str, column: secantus_pgplan::ColumnRef<'_>| {
+            self.lookup(table).and_then(|def| {
+                let col = match column {
+                    secantus_pgplan::ColumnRef::Name(name) => def.column(name),
+                    secantus_pgplan::ColumnRef::Position(pos) => def.columns.get(pos),
+                };
+                col.map(|c| c.pg_type.clone())
+            })
         };
         let parameter_types = secantus_pgplan::catalog_param_types(&sql, &declared, &column_type)
             .into_iter()
@@ -3524,8 +3529,21 @@ impl PgHandler {
                         .unwrap_or(text);
                     Ok(Bson::String(stored))
                 } else {
+                    // The same canonicalisation and ParameterStatus report as
+                    // `SET`: PostgreSQL reports `set_config('TimeZone', ...)`
+                    // exactly as it reports `SET TimeZone` (measured on 16 --
+                    // psycopg builds a timestamptz's tzinfo from that report,
+                    // so without it a session-zone change was invisible to
+                    // the client's loader).
+                    let text = if key == "DateStyle" {
+                        secantus_pgplan::DateStyle::parse(&text).canonical()
+                    } else {
+                        text
+                    };
                     let mut settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
-                    settings.insert(key, text.clone());
+                    settings.insert(key.clone(), text.clone());
+                    drop(settings);
+                    self.note_reportable_guc(&key, &text);
                     Ok(Bson::String(text))
                 }
             }
@@ -4280,7 +4298,15 @@ impl PgHandler {
                 // instant; a `timestamp` renders naively, a `timestamptz`
                 // renders in the SESSION zone. A special value (infinity)
                 // is a String and falls to encode_field_value.
-                let reassembled = if *schema_ref[i].datatype() == Type::TIMESTAMPTZ {
+                // In BINARY format the text is not wanted: the instant is
+                // reassembled as the composite carrier (`copy_reassemble`) and
+                // encoded as an i64, the way a constant or a COPY row already
+                // is. Emitting the text into a binary column made psycopg
+                // read `2020-01-01 00:00:00` as an integer ("timestamp too
+                // large").
+                let reassembled = if schema_ref[i].format() == FieldFormat::Binary {
+                    None
+                } else if *schema_ref[i].datatype() == Type::TIMESTAMPTZ {
                     timestamptz_text(&d, f, &row_tz)
                 } else {
                     timestamp_text(&d, f)
@@ -4296,17 +4322,17 @@ impl PgHandler {
                         }
                     }
                     None => {
-                        let cell = d.get(f);
+                        let cell = copy_reassemble(&d, f, schema_ref[i].datatype());
                         encode_field_value(
                             &mut enc,
                             &schema_ref[i],
-                            cell,
+                            cell.as_ref(),
                             &row_tz,
                             &row_ds,
                             row_cenc,
                         )?;
                         if let Some(row) = captured.as_mut() {
-                            row.push(cell.cloned());
+                            row.push(cell);
                         }
                     }
                 }
@@ -5567,8 +5593,10 @@ fn copy_reassemble(d: &Document, field: &str, ty: &Type) -> Option<Bson> {
 /// every type, and the gap is recorded in `tasks/backlog.md` rather than
 /// hidden.
 fn binary_encodable(ty: &Type) -> bool {
-    const OK: [Type; 33] = [
+    const OK: [Type; 35] = [
         Type::OID,
+        Type::JSON_ARRAY,
+        Type::JSONB_ARRAY,
         Type::OID_ARRAY,
         Type::BYTEA,
         Type::UUID,
@@ -5624,7 +5652,43 @@ fn binary_encodable(ty: &Type) -> bool {
             return true;
         }
     }
+    // The datetime family, every range / multirange (builtin or user-defined),
+    // and arrays of any of them: PostgreSQL sends them all in binary when
+    // asked, and so must this server. psycopg reads EVERY column of a result
+    // in the format of column 0 (`Transformer.set_pgresult` looks at
+    // `PQfformat(res, 0)` only, because PostgreSQL never mixes formats within
+    // one request), so a single text column in an otherwise-binary row made
+    // the client decode binary bytes with text loaders -- garbage dates,
+    // `could not convert string to float`, `UnicodeDecodeError` -- or vice
+    // versa. Measured on 16: `select date, float4` with a binary result comes
+    // back with both columns in format 1.
+    if datetime_or_range_kind(ty) {
+        return true;
+    }
     OK.contains(ty)
+}
+
+/// A date / time / timetz / timestamp / timestamptz / interval, a range or
+/// multirange (builtin or user-defined), or an ARRAY of one of those.
+fn datetime_or_range_kind(ty: &Type) -> bool {
+    let scalar = |t: &Type| {
+        matches!(
+            *t,
+            Type::DATE
+                | Type::TIME
+                | Type::TIMETZ
+                | Type::TIMESTAMP
+                | Type::TIMESTAMPTZ
+                | Type::INTERVAL
+        ) || matches!(
+            t.kind(),
+            postgres_types::Kind::Range(_) | postgres_types::Kind::Multirange(_)
+        )
+    };
+    match ty.kind() {
+        postgres_types::Kind::Array(inner) => scalar(inner),
+        _ => scalar(ty),
+    }
 }
 
 /// A `numeric` in both wire formats.
@@ -5947,9 +6011,22 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
         return enc.encode_field(&Some(micros));
     }
     if *ty == Type::TIMESTAMP || *ty == Type::TIMESTAMPTZ {
-        let micros =
-            secantus_pgplan::timestamp_bson_to_pg_micros(v).ok_or_else(|| bad("this value"))?;
+        let micros = timestamp_pg_micros(v).ok_or_else(|| bad("this value"))?;
         return enc.encode_field(&Some(micros));
+    }
+    // timetz, interval, and every range / multirange: hand-built layouts
+    // (`element_binary` holds them, shared with the array encoder), emitted
+    // verbatim through RawField.
+    if *ty == Type::TIMETZ
+        || *ty == Type::INTERVAL
+        || matches!(
+            ty.kind(),
+            postgres_types::Kind::Range(_) | postgres_types::Kind::Multirange(_)
+        )
+    {
+        let binary = element_binary(v, ty).ok_or_else(|| bad("this value"))?;
+        let text = secantus_pgplan::value_text(v);
+        return enc.encode_field(&RawField { binary, text });
     }
     // A user ENUM's binary format is its label's UTF-8 -- the same bytes as
     // text -- so it rides the text-family arm. So does `void`, whose binary
@@ -5974,11 +6051,18 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
     let Bson::Array(items) = v else {
         return Err(bad("this value"));
     };
+    // An EMPTY array: `array_send` writes it with ZERO dimensions (no
+    // dimension pair at all), where postgres_types' `Vec<T>` encoder writes
+    // one dimension of length 0. psycopg reads both, but the bytes are what a
+    // binary COPY or a byte-comparing client sees -- so it takes the
+    // hand-built path, which knows the zero-dimension form.
     // A multidimensional array: hand-build its binary wire form (postgres_types
     // has no ToSql for one) and emit it verbatim through RawField.
-    if items.iter().any(|x| matches!(x, Bson::Array(_))) {
-        let elem_name = element_of_array_oid(ty.oid()).ok_or_else(|| bad("this value"))?;
-        let elem = wire_type(elem_name);
+    if items.is_empty() || items.iter().any(|x| matches!(x, Bson::Array(_))) {
+        let elem = match ty.kind() {
+            postgres_types::Kind::Array(inner) => inner.clone(),
+            _ => wire_type(element_of_array_oid(ty.oid()).ok_or_else(|| bad("this value"))?),
+        };
         let binary = array_binary(items, &elem).ok_or_else(|| bad("this value"))?;
         let text = secantus_pgplan::value_text(v);
         return enc.encode_field(&RawField { binary, text });
@@ -6045,21 +6129,119 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
         let v: Vec<Option<String>> = items.iter().map(&as_text).collect();
         return enc.encode_field(&v);
     }
-    // bytea[] / uuid[] / inet[] / cidr[]: elements through `element_binary`,
+    // bytea[] / uuid[] / inet[] / cidr[] / json[] / jsonb[]: elements through `element_binary`,
     // the array framing hand-built (postgres_types has no ToSql for a
     // `Vec<Option<Vec<u8>>>` typed as any of them).
+    // The same door serves a datetime / interval / range / multirange array
+    // (`datetime_or_range_kind`), whose elements `element_binary` also knows.
     if let Some(elem) = match *ty {
         Type::BYTEA_ARRAY => Some(Type::BYTEA),
         Type::UUID_ARRAY => Some(Type::UUID),
         Type::INET_ARRAY => Some(Type::INET),
         Type::CIDR_ARRAY => Some(Type::CIDR),
-        _ => None,
+        Type::JSON_ARRAY => Some(Type::JSON),
+        Type::JSONB_ARRAY => Some(Type::JSONB),
+        _ => match ty.kind() {
+            postgres_types::Kind::Array(inner) if datetime_or_range_kind(inner) => {
+                Some(inner.clone())
+            }
+            _ => None,
+        },
     } {
         let binary = array_binary(items, &elem).ok_or_else(|| bad("this value"))?;
         let text = secantus_pgplan::value_text(v);
         return enc.encode_field(&RawField { binary, text });
     }
     Err(bad("this value"))
+}
+
+/// A timestamp / timestamptz value's binary form: the stored instant carrier
+/// through `timestamp_bson_to_pg_micros`, or -- for a value kept as TEXT
+/// (`infinity`, a BC or wide-year timestamp) -- the canonical text through
+/// `timestamp_text_to_pg_micros`, which knows the wire sentinels and counts a
+/// BC year back through the proleptic calendar as `timestamp_send` does.
+fn timestamp_pg_micros(v: &Bson) -> Option<i64> {
+    match v {
+        Bson::String(s) => secantus_pgplan::timestamp_text_to_pg_micros(s),
+        other => secantus_pgplan::timestamp_bson_to_pg_micros(other),
+    }
+}
+
+/// A range's binary form (`range_send`): a flags byte, then each PRESENT
+/// bound as `[i32 len][element binary]`. The flag bits are PostgreSQL's:
+/// 0x01 empty, 0x02 lower inclusive, 0x04 upper inclusive, 0x08 lower
+/// infinite, 0x10 upper infinite. An `infinity` timestamp / date bound is a
+/// PRESENT bound holding the wire sentinel, not an infinite-bound flag --
+/// measured on 16: `'[-infinity,infinity]'::tsrange` sends flags 0x06 with
+/// two 8-byte bounds.
+fn range_binary(text: &str, type_name: &str) -> Option<Vec<u8>> {
+    let r = secantus_pgplan::range::parse_stored(text).ok()?;
+    if r.empty {
+        return Some(vec![0x01]);
+    }
+    let (element, _) = secantus_pgplan::range::range_element(type_name)?;
+    let mut flags = 0u8;
+    if r.lower_inc {
+        flags |= 0x02;
+    }
+    if r.upper_inc {
+        flags |= 0x04;
+    }
+    if r.lower.is_none() {
+        flags |= 0x08;
+    }
+    if r.upper.is_none() {
+        flags |= 0x10;
+    }
+    let mut out = vec![flags];
+    for bound in [&r.lower, &r.upper].into_iter().flatten() {
+        let bytes = range_bound_binary(bound, &element)?;
+        out.extend_from_slice(&(i32::try_from(bytes.len()).ok()?).to_be_bytes());
+        out.extend_from_slice(&bytes);
+    }
+    Some(out)
+}
+
+/// One stored range bound (the element's canonical text) in the element's
+/// binary form. A timestamp bound is read as the naive UTC text it is stored
+/// as -- a `tstzrange` keeps its bounds in UTC, so no session zone applies;
+/// everything else is cast back to a value and encoded as a scalar would be.
+fn range_bound_binary(text: &str, element: &str) -> Option<Vec<u8>> {
+    match element {
+        "timestamp" | "timestamptz" => Some(
+            secantus_pgplan::timestamp_text_to_pg_micros(text)?
+                .to_be_bytes()
+                .to_vec(),
+        ),
+        "numeric" => numeric_binary(text),
+        "int4" => Some(text.trim().parse::<i32>().ok()?.to_be_bytes().to_vec()),
+        "int8" => Some(text.trim().parse::<i64>().ok()?.to_be_bytes().to_vec()),
+        "date" => Some(
+            secantus_pgplan::date_to_pg_days(text)?
+                .to_be_bytes()
+                .to_vec(),
+        ),
+        other => {
+            let value =
+                secantus_pgplan::cast_text_to(text, other, &secantus_pgplan::TimeZoneSetting::Utc)
+                    .ok()?;
+            element_binary(&value, &wire_type(other))
+        }
+    }
+}
+
+/// A multirange's binary form (`multirange_send`): an i32 member count, then
+/// each member range as `[i32 len][range binary]`.
+fn multirange_binary(text: &str, type_name: &str) -> Option<Vec<u8>> {
+    let member = secantus_pgplan::range::multirange_member(type_name)?;
+    let members = secantus_pgplan::range::split_members(text).ok()?;
+    let mut out = (i32::try_from(members.len()).ok()?).to_be_bytes().to_vec();
+    for m in &members {
+        let bytes = range_binary(m, &member)?;
+        out.extend_from_slice(&(i32::try_from(bytes.len()).ok()?).to_be_bytes());
+        out.extend_from_slice(&bytes);
+    }
+    Some(out)
 }
 
 /// One value in whichever format the column was described in.
@@ -6322,13 +6504,27 @@ fn encode_field_value_inner(
                 .collect();
             return enc.encode_field(&rendered);
         }
-        if binary_encodable(field.datatype()) {
+        // A datetime / range array in TEXT keeps the per-element text
+        // rendering below (a timestamptz / tstzrange element in the SESSION
+        // zone); everything else the typed encoder knows goes through it.
+        if binary_encodable(field.datatype()) && !datetime_or_range_kind(field.datatype()) {
             return encode_binary(enc, field.datatype(), v);
+        }
+        // A `timestamptz[]` / `tstzrange[]` / `tstzmultirange[]` element is a
+        // stored UTC instant (or UTC bounds); PostgreSQL renders each in the
+        // session zone with its offset: `{"2020-01-01 01:00:00+01"}`.
+        if matches!(element, "timestamptz" | "tstzrange" | "tstzmultirange") {
+            let rendered: Vec<Option<String>> = items
+                .iter()
+                .map(|x| match x {
+                    Bson::Null => None,
+                    other => Some(session_zone_text(other, element, tz, ds)),
+                })
+                .collect();
+            return enc.encode_field(&rendered);
         }
         // A date, timestamp or interval array: those are carried as canonical
         // TEXT here, so the elements go out as the strings they already are.
-        // (`encode_binary` refuses them on purpose -- their BINARY layouts are
-        // not implemented, and this arm only runs for a text column.)
         // A `box[]` joins its elements with `;`, which the element-wise
         // encoder cannot do; its whole text is rendered here instead.
         // Sent as plain TEXT: the `&str` encoder quotes a value that holds
@@ -6375,6 +6571,21 @@ fn encode_field_value_inner(
             }
         }
     }
+    // A tstzrange / tstzmultirange is stored with its bounds as naive UTC
+    // text; PostgreSQL renders each bound in the session zone with its offset
+    // (`["2020-01-01 01:00:00+01","2020-06-01 12:00:00+02")` under
+    // Europe/Rome). A bound that will not parse goes out as stored.
+    if matches!(*field.datatype(), Type::TSTZ_RANGE | Type::TSTZMULTI_RANGE) {
+        if let Some(Bson::String(text)) = v {
+            let name = if *field.datatype() == Type::TSTZ_RANGE {
+                "tstzrange"
+            } else {
+                "tstzmultirange"
+            };
+            let out = session_zone_text(&Bson::String(text.clone()), name, tz, ds);
+            return enc.encode_field(&Some(out.as_str()));
+        }
+    }
     // A DATE is stored as its canonical ISO text; restyle it for the session
     // DateStyle. ISO passes through unchanged.
     if *field.datatype() == Type::DATE {
@@ -6393,6 +6604,30 @@ fn encode_field_value_inner(
         }
     }
     encode_value(enc, v)
+}
+
+/// The TEXT rendering of one stored timestamptz / tstzrange / tstzmultirange
+/// value in the session zone. A value this cannot re-render (a bound that
+/// will not parse) goes out as the text it is stored as.
+fn session_zone_text(
+    v: &Bson,
+    type_name: &str,
+    tz: &secantus_pgplan::TimeZoneSetting,
+    ds: &secantus_pgplan::DateStyle,
+) -> String {
+    match (type_name, v) {
+        ("tstzrange", Bson::String(text)) => {
+            secantus_pgplan::range::render_in_zone(text, tz).unwrap_or_else(|_| text.clone())
+        }
+        ("tstzmultirange", Bson::String(text)) => {
+            secantus_pgplan::range::render_multirange_in_zone(text, tz)
+                .unwrap_or_else(|_| text.clone())
+        }
+        ("timestamptz", Bson::String(text)) => secantus_pgplan::render_timestamp_styled(text, ds),
+        ("timestamptz", value) => secantus_pgplan::timestamptz_value_text_styled(value, tz, ds)
+            .unwrap_or_else(|| secantus_pgplan::value_text(value)),
+        (_, value) => secantus_pgplan::value_text(value),
+    }
 }
 
 fn encode_value(enc: &mut DataRowEncoder, v: Option<&Bson>) -> PgWireResult<()> {
@@ -6933,6 +7168,29 @@ fn element_binary(v: &Bson, elem: &Type) -> Option<Vec<u8>> {
             _ => None,
         };
     }
+    // A range or multirange, builtin (by oid) or user-defined (by the name the
+    // registry minted its oid from): stored as canonical text, encoded from it.
+    let range_name = secantus_pgplan::range::range_oid_name(elem.oid())
+        .map(str::to_string)
+        .or_else(|| secantus_pgplan::range::multirange_oid_name(elem.oid()).map(str::to_string))
+        .or_else(|| {
+            matches!(
+                elem.kind(),
+                postgres_types::Kind::Range(_) | postgres_types::Kind::Multirange(_)
+            )
+            .then(|| secantus_pgplan::user_type_name(i64::from(elem.oid())))
+            .flatten()
+        });
+    if let Some(name) = range_name {
+        let Bson::String(text) = v else {
+            return None;
+        };
+        return if secantus_pgplan::range::is_multirange_type(&name) {
+            multirange_binary(text, &name)
+        } else {
+            range_binary(text, &name)
+        };
+    }
     let int = |v: &Bson| -> Option<i64> {
         match v {
             Bson::Int32(x) => Some(i64::from(*x)),
@@ -6996,6 +7254,41 @@ fn element_binary(v: &Bson, elem: &Type) -> Option<Vec<u8>> {
             Bson::String(x) => Some(json_binary(x, elem.oid() == 3802)),
             _ => None,
         },
+        // date: i32 days since 2000-01-01 (`date_send`).
+        1082 => match v {
+            Bson::String(t) => Some(secantus_pgplan::date_to_pg_days(t)?.to_be_bytes().to_vec()),
+            _ => None,
+        },
+        // time: i64 microseconds since midnight (`time_send`).
+        1083 => match v {
+            Bson::String(t) => Some(
+                secantus_pgplan::time_to_pg_micros(t)?
+                    .to_be_bytes()
+                    .to_vec(),
+            ),
+            _ => None,
+        },
+        // timetz: i64 microseconds since midnight, then the zone as i32
+        // seconds WEST of UTC (`timetz_send`; `+05:30` is sent as -19800).
+        1266 => match v {
+            Bson::String(t) => {
+                let (micros, west) = secantus_pgplan::timetz_to_pg_wire(t)?;
+                let mut out = micros.to_be_bytes().to_vec();
+                out.extend_from_slice(&west.to_be_bytes());
+                Some(out)
+            }
+            _ => None,
+        },
+        // timestamp / timestamptz: i64 microseconds since 2000-01-01 UTC.
+        1114 | 1184 => Some(timestamp_pg_micros(v)?.to_be_bytes().to_vec()),
+        // interval: i64 microseconds, i32 days, i32 months (`interval_send`).
+        1186 => {
+            let iv = secantus_pgplan::Interval::from_bson(v)?;
+            let mut out = iv.micros.to_be_bytes().to_vec();
+            out.extend_from_slice(&iv.days.to_be_bytes());
+            out.extend_from_slice(&iv.months.to_be_bytes());
+            Some(out)
+        }
         _ => None,
     }
 }
@@ -7057,9 +7350,11 @@ fn record_field_type(v: &Bson) -> Type {
 /// ragged (mongod's stored values are rectangular, so this is a guard).
 fn array_binary(items: &[Bson], elem: &Type) -> Option<Vec<u8>> {
     // Dimension sizes: walk the first-element chain down to the leaves.
+    // An empty array has NO dimensions (`array_send` writes ndim 0 and no
+    // dimension pair), not one dimension of length zero.
     let mut dims: Vec<usize> = Vec::new();
     let mut level: &[Bson] = items;
-    loop {
+    while !level.is_empty() {
         dims.push(level.len());
         match level.first() {
             Some(Bson::Array(inner)) => level = inner,
@@ -7932,6 +8227,67 @@ impl PgHandler {
     /// as the single flag byte `\x01`, which read as text is a control
     /// character and not a range at all. Only the inferred name can route it
     /// to the range decoder.
+    /// Give an UNTYPED parameter sent in BINARY format the type the catalog
+    /// implies for it (the column an `insert ... values ($1)` puts it in).
+    ///
+    /// A text parameter can stay untyped until the planner casts it, but a
+    /// binary one cannot: the bytes only mean something under a type.
+    /// psycopg sends an empty `Multirange([])` untyped (oid 0 -- no element to
+    /// name the type from) and in binary as four zero bytes, and read as text
+    /// those were `malformed multirange literal: "\0\0\0\0"`. PostgreSQL
+    /// resolves the parameter's type from the target column at Parse, so the
+    /// same statement inserts an empty multirange there. Text-format slots
+    /// are left alone so their path is unchanged.
+    fn type_untyped_binary_params(
+        &self,
+        portal: &Portal<ParsedStatement>,
+        param_types: &mut [Option<String>],
+    ) {
+        let binary_at = |i: usize| match &portal.parameter_format {
+            Format::UnifiedText => false,
+            Format::UnifiedBinary => true,
+            Format::Individual(codes) => codes.get(i).copied().unwrap_or(0) == 1,
+        };
+        let untyped_binary: Vec<usize> = (0..portal.parameters.len())
+            .filter(|&i| {
+                binary_at(i)
+                    && portal
+                        .statement
+                        .parameter_types
+                        .get(i)
+                        .is_none_or(Option::is_none)
+                    && portal
+                        .statement
+                        .parameter_oids
+                        .get(i)
+                        .is_none_or(|o| *o == 0)
+                    && param_types.get(i).is_none_or(Option::is_none)
+            })
+            .collect();
+        if untyped_binary.is_empty() {
+            return;
+        }
+        let column_type = |table: &str, column: secantus_pgplan::ColumnRef<'_>| {
+            self.lookup(table).and_then(|def| {
+                let col = match column {
+                    secantus_pgplan::ColumnRef::Name(name) => def.column(name),
+                    secantus_pgplan::ColumnRef::Position(pos) => def.columns.get(pos),
+                };
+                col.map(|c| c.pg_type.clone())
+            })
+        };
+        let inferred = secantus_pgplan::catalog_param_types_opt(
+            &portal.statement.statement.sql,
+            param_types,
+            &column_type,
+        );
+        for i in untyped_binary {
+            if let (Some(slot), Some(Some(name))) = (param_types.get_mut(i), inferred.get(i)) {
+                *slot = Some(name.clone());
+            }
+        }
+    }
+
     fn portal_params<S>(
         &self,
         portal: &Portal<S>,
@@ -8442,10 +8798,11 @@ impl ExtendedQueryHandler for PgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         self.note_result_format(&portal.result_column_format);
-        let param_types = secantus_pgplan::infer_param_types(
+        let mut param_types = secantus_pgplan::infer_param_types(
             &portal.statement.statement.sql,
             &self.param_type_names(portal.statement.as_ref()),
         );
+        self.type_untyped_binary_params(portal, &mut param_types);
         let params = self.portal_params(portal, &param_types)?;
         let result = self
             .run_typed(
@@ -8472,10 +8829,27 @@ impl ExtendedQueryHandler for PgHandler {
 fn copy_field(
     raw: &str,
     pg_type: &str,
+    wire: &Type,
     tz: &secantus_pgplan::TimeZoneSetting,
 ) -> PgWireResult<Bson> {
     if raw == "\\N" {
         return Ok(Bson::Null);
+    }
+    // An ARRAY, and every other type whose text form a bound parameter is
+    // parsed from (bytea, uuid, inet / cidr, box, the datetime family, json /
+    // jsonb): the SAME decoder a text-format Bind parameter goes through, so
+    // a COPY'd `{a,b}` is stored as the array it is and a COPY'd date in its
+    // canonical text. Stored as one raw string, a `text[]` column's `{ab}`
+    // went back out as `"{ab}"` -- an array holding the literal -- which
+    // psycopg reads as "malformed array: hit the end of the buffer".
+    if matches!(wire.kind(), postgres_types::Kind::Array(_))
+        || matches!(
+            wire.oid(),
+            17 | 2950 | 869 | 650 | 603 | 1082 | 1083 | 1114 | 1184 | 1266 | 1186 | 114 | 3802
+        )
+    {
+        let bytes = Bytes::from(raw.to_string());
+        return decode_parameter(Some(&bytes), Some(wire), false, tz, ClientEncoding::Utf8);
     }
     // A range or multirange is stored in its CANONICAL text, the same as a
     // literal or a bound parameter -- `{empty}` is `{}` and `[1,5]` over int4
@@ -8583,7 +8957,8 @@ impl CopyHandler for PgHandler {
                             None => None,
                             Some(text) => {
                                 let ty = state.types.get(i).map(String::as_str).unwrap_or("text");
-                                Some(copy_field(&text, ty, &tz)?)
+                                let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
+                                Some(copy_field(&text, ty, &wire, &tz)?)
                             }
                         });
                     }
@@ -8593,7 +8968,7 @@ impl CopyHandler for PgHandler {
             }
         };
 
-        let mut docs = Vec::new();
+        let mut parsed_rows = Vec::with_capacity(rows.len());
         for raw in rows {
             if raw.len() != state.fields.len() {
                 return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -8610,34 +8985,49 @@ impl CopyHandler for PgHandler {
             for (field, value) in state.fields.iter().zip(raw) {
                 doc.insert(field.clone(), value.unwrap_or(Bson::Null));
             }
-            docs.push(
-                bson::to_vec(&doc)
-                    .map_err(|e| Self::storage_err("could not encode a COPY row", e))?,
-            );
+            parsed_rows.push(doc);
         }
-
-        let written = docs.len();
-        if !docs.is_empty() {
+        let written = parsed_rows.len();
+        if !parsed_rows.is_empty() {
+            let def = self
+                .lookup(&state.table)
+                .ok_or_else(|| Self::err(&PlanError::UndefinedTable(state.table.clone())))?;
             // INSIDE the open transaction, as every other write is. A COPY
             // whose rows were written outside it blocked against the
             // transaction's own locks and hung the connection -- which nobody
             // had seen, because resolving the table failed first whenever a
             // transaction was open.
+            //
+            // The DEFAULT fill is inside too: a column the COPY's column list
+            // leaves out takes its default exactly as an INSERT's omitted
+            // column does (`copy copy_in (col2, data)` fills a `serial` col1
+            // from its sequence -- measured on 16), and advancing the
+            // sequence is a write. Done outside the transaction it conflicted
+            // with the transaction's own earlier `nextval` and spun on the
+            // write-conflict retry until the client gave up.
+            let load = || -> PgWireResult<_> {
+                let mut rows = parsed_rows;
+                self.apply_serial_defaults(&def, &mut rows)?;
+                apply_column_defaults(&def, &mut rows);
+                let docs = rows
+                    .iter()
+                    .map(bson::to_vec)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| Self::storage_err("could not encode a COPY row", e))?;
+                self.storage
+                    .insert(&self.db, &state.table, docs, true)
+                    .map_err(|e| Self::storage_err("could not insert COPY rows", e))
+            };
             let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
-            let insert = || self.storage.insert(&self.db, &state.table, docs, true);
             let (_, errors) = match guard.as_mut() {
                 Some(handle) => self
                     .storage
-                    .with_user_transaction(handle, insert)
+                    .with_user_transaction(handle, load)
                     .map_err(|e| Self::storage_err("transaction failed", e))?,
-                None => insert(),
-            }
-            .map_err(|e| Self::storage_err("could not insert COPY rows", e))?;
+                None => load(),
+            }?;
             drop(guard);
             if let Some(first) = errors.first() {
-                let def = self
-                    .lookup(&state.table)
-                    .ok_or_else(|| Self::err(&PlanError::UndefinedTable(state.table.clone())))?;
                 return Err(Self::write_error(&state.table, &def, first));
             }
         }
@@ -8685,5 +9075,106 @@ impl PgWireServerHandlers for HandlerFactory {
     }
     fn startup_handler(&self) -> Arc<impl pgwire::api::auth::StartupHandler> {
         self.0.clone()
+    }
+}
+
+#[cfg(test)]
+mod wire_format_tests {
+    //! The hand-built binary layouts, pinned to the bytes PostgreSQL 16 sends
+    //! (`scratchpad/binpin.py`, 2026-09-09, byte-identical on both servers).
+    use super::*;
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn range_binary_matches_range_send() {
+        // flags 0x02 (lower inclusive), two 8-byte timestamp bounds. The
+        // input is the STORED text (a bound with a space is quoted), which
+        // is what `range_binary` is handed.
+        assert_eq!(
+            hex(&range_binary(
+                "[\"2000-01-01 00:00:00\",\"2000-01-02 00:00:00\")",
+                "tsrange"
+            )
+            .unwrap()),
+            "0200000008000000000000000000000008000000141dd76000"
+        );
+        // An `infinity` timestamp bound is a PRESENT bound holding the wire
+        // sentinel (flags 0x06), not an infinite-bound flag.
+        assert_eq!(
+            hex(&range_binary("[-infinity,infinity]", "tsrange").unwrap()),
+            "06000000088000000000000000000000087fffffffffffffff"
+        );
+        assert_eq!(hex(&range_binary("empty", "int4range").unwrap()), "01");
+        // Lower infinite (0x08) + upper inclusive (0x04) — the stored
+        // canonical form of `(,5]` over int8 is `(,6)`, so flags are 0x08.
+        assert_eq!(
+            hex(&range_binary("(,6)", "int8range").unwrap()),
+            "08000000080000000000000006"
+        );
+    }
+
+    #[test]
+    fn multirange_binary_matches_multirange_send() {
+        assert_eq!(
+            hex(&multirange_binary("{[1,3),[5,7)}", "int4multirange").unwrap()),
+            "00000002000000110200000004000000010000000400000003\
+             000000110200000004000000050000000400000007"
+        );
+        assert_eq!(
+            hex(&multirange_binary("{}", "int4multirange").unwrap()),
+            "00000000"
+        );
+    }
+
+    #[test]
+    fn an_empty_array_has_zero_dimensions() {
+        // `array_send` writes ndim 0, no dimension pair: 12 bytes in all.
+        assert_eq!(
+            hex(&array_binary(&[], &Type::INT4).unwrap()),
+            "000000000000000000000017"
+        );
+        assert_eq!(
+            hex(&array_binary(&[], &Type::TEXT).unwrap()),
+            "000000000000000000000019"
+        );
+        // A non-empty one still carries its dimension pair.
+        assert_eq!(
+            hex(&array_binary(&[Bson::Int32(1), Bson::Int32(2)], &Type::INT4).unwrap()),
+            "000000010000000000000017000000020000000100000004000000010000000400000002"
+        );
+    }
+
+    #[test]
+    fn datetime_elements_match_their_send_functions() {
+        assert_eq!(
+            hex(&element_binary(&Bson::String("12:00:00+05:30".into()), &Type::TIMETZ).unwrap()),
+            "0000000a0eebb000ffffb2a8"
+        );
+        assert_eq!(
+            hex(&element_binary(&Bson::String("2000-01-02".into()), &Type::DATE).unwrap()),
+            "00000001"
+        );
+        let one_day_two_hours = secantus_pgplan::Interval {
+            months: 0,
+            days: 1,
+            micros: 7_200_000_000,
+        }
+        .to_bson();
+        assert_eq!(
+            hex(&element_binary(&one_day_two_hours, &Type::INTERVAL).unwrap()),
+            "00000001ad2748000000000100000000"
+        );
+        // json[] / jsonb[] elements: the text verbatim, and `\x01` + the text.
+        assert_eq!(
+            hex(&element_binary(&Bson::String("{\"a\":1}".into()), &Type::JSON).unwrap()),
+            "7b2261223a317d"
+        );
+        assert_eq!(
+            hex(&element_binary(&Bson::String("{\"a\": 1}".into()), &Type::JSONB).unwrap()),
+            "017b2261223a20317d"
+        );
     }
 }

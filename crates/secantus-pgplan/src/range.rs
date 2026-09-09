@@ -106,6 +106,35 @@ fn quote_bound(b: Option<&str>) -> String {
     out
 }
 
+/// A STORED range's text back into its parts, with no canonicalisation: the
+/// bounds are already the element's canonical text, and re-casting them would
+/// read a `tstzrange`'s naive-UTC bounds in the session zone.
+pub fn parse_stored(text: &str) -> Result<Range> {
+    parse_literal(text)
+}
+
+/// A stored `tstzrange` as PostgreSQL prints it in the session zone: each
+/// bound is the naive-UTC wall clock the store keeps, rendered with the
+/// zone's offset (`["2020-01-01 01:00:00+01","2020-06-01 12:00:00+02")`
+/// under `Europe/Rome`).
+pub fn render_in_zone(text: &str, tz: &crate::TimeZoneSetting) -> Result<String> {
+    let mut r = parse_literal(text)?;
+    for t in [&mut r.lower, &mut r.upper].into_iter().flatten() {
+        *t = crate::utc_text_in_zone(t, tz).ok_or_else(|| bad_range(text))?;
+    }
+    Ok(render(&r))
+}
+
+/// `render_in_zone` for a stored `tstzmultirange`.
+pub fn render_multirange_in_zone(text: &str, tz: &crate::TimeZoneSetting) -> Result<String> {
+    let parts = split_members(text)?;
+    let members = parts
+        .iter()
+        .map(|p| render_in_zone(p, tz))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(format!("{{{}}}", members.join(",")))
+}
+
 /// Parse a range literal: `[1,5)`, `(,5]`, `empty`, with optional quoting
 /// around a bound that contains a comma or a quote.
 fn parse_literal(text: &str) -> Result<Range> {
@@ -497,7 +526,7 @@ pub fn multirange_oid_name(oid: u32) -> Option<&'static str> {
 
 /// Split `{r1,r2}` into its members. A range contains commas of its own, so the
 /// split has to track brackets and quoting rather than cutting on every comma.
-fn split_members(text: &str) -> Result<Vec<String>> {
+pub fn split_members(text: &str) -> Result<Vec<String>> {
     let t = text.trim();
     if !t.starts_with('{') || !t.ends_with('}') {
         return Err(bad_multirange(text));
