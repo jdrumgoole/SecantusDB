@@ -63,5 +63,12 @@ because psycopg's tests asked for them, each measured against PostgreSQL 16.
   the session-zone offset like every other `timestamptz`.
 - `current_timestamp` inside an expression (`current_timestamp::text`) was
   refused; it evaluates.
+- Per-statement cost grew with every table the store had ever held: each
+  statement re-decoded every row type from BSON for the planner and again per
+  described column, so a used store ran `select 1` twice as slowly as a fresh
+  one and `test_type_error_shadow` overran its 20 s budget late in the gauge.
+  The type catalog is now shared by reference, the planner's tables are
+  published once per thread per catalog version, and a described column decodes
+  only the one composite it names.
 - `password_encryption` reports `scram-sha-256`; `ALTER ROLE` of a role
   other than the session user is `42704`.

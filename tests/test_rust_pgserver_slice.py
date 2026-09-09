@@ -8343,6 +8343,20 @@ def test_catalog_changes_are_visible_across_connections(home: Path) -> None:
             b.execute("create table cc_s (id int, v text)")
             a.commit()
             assert outcome(a, "select * from cc_s") == []
+
+            # 6. A composite REDEFINED on a is resolved in its new shape by
+            # b's very next statement. The planner's type tables are
+            # published per thread and skipped while the catalog version
+            # stands still, so this is the case that would serve the old
+            # shape if a redefinition ever failed to move the version.
+            a.commit()
+            a.autocommit = True
+            a.execute("create type cc_pt as (a int)")
+            assert outcome(b, "select '(1)'::cc_pt") == [("(1)",)]
+            a.execute("drop type cc_pt")
+            a.execute("create type cc_pt as (a int, b text)")
+            assert outcome(b, "select '(1,x)'::cc_pt") == [("(1,x)",)]
+            assert outcome(b, "select '(1)'::cc_pt") == "22P02"
         finally:
             a.close()
             b.close()

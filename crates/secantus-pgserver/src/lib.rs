@@ -187,6 +187,15 @@ struct CatalogCache {
     tables: VersionedMap<String, Option<TableDef>>,
 }
 
+thread_local! {
+    /// The `(storage, db, catalog version)` whose user types this thread's
+    /// planner tables hold, or `None` when they hold something that must
+    /// not be reused: a session's uncommitted overlay, or a read taken
+    /// under a snapshot the catalog has since moved past.
+    static INSTALLED_USER_TYPES: std::cell::RefCell<Option<(usize, String, u64)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn catalog_cache() -> &'static CatalogCache {
     static CACHE: OnceLock<CatalogCache> = OnceLock::new();
     CACHE.get_or_init(|| CatalogCache {
@@ -843,9 +852,48 @@ impl PgHandler {
     /// +200_000 (multirange) and +300_000 (multirange array) never collide.
     const MULTIRANGE_TYPE_OID_OFFSET: i64 = 200_000;
 
-    /// Hand the planner this database's user types, fresh from the store --
-    /// which the other server may have written to since the last statement.
+    /// Hand the planner this database's user types, at the current catalog
+    /// version. The planner's type tables are thread-local, so this runs
+    /// before every plan -- but it publishes only when the calling thread
+    /// does not already hold this `(storage, db, version)`, or when this
+    /// session has an uncommitted type overlay (a per-session view, which
+    /// must be re-published every statement and never recorded as held).
+    /// Before the skip, every statement rebuilt every table's row type
+    /// from BSON, and a used store made `select 1` twice as slow.
     fn install_user_types(&self) {
+        secantus_pgplan::set_session_user(Some(
+            self.session_user
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        ));
+        let overlay_empty = self
+            .uncommitted_types
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty();
+        let version = catalog_cache()
+            .version
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let held = (
+            Arc::as_ptr(&self.storage) as usize,
+            self.db().to_string(),
+            version,
+        );
+        if overlay_empty && INSTALLED_USER_TYPES.with(|c| c.borrow().as_ref() == Some(&held)) {
+            return;
+        }
+        self.publish_user_types();
+        // A read under a transaction snapshot that predates a catalog bump
+        // is not the committed truth at `version` (see
+        // `may_fill_catalog_cache`): publish it, but do not record it.
+        let record = overlay_empty && self.may_fill_catalog_cache(version);
+        INSTALLED_USER_TYPES.with(|c| *c.borrow_mut() = record.then_some(held));
+    }
+
+    /// Build the planner's user-type tables from the catalog and publish
+    /// them to this thread. `install_user_types` is the gate in front.
+    fn publish_user_types(&self) {
         // Enums resolve by name too. A `public` enum resolves by its bare name
         // (public is on the default search_path); a schema-qualified one
         // resolves only as `schema.name`, exactly like composites and ranges.
@@ -871,12 +919,6 @@ impl PgHandler {
         }
         secantus_pgplan::set_user_types(types);
         secantus_pgplan::set_user_composites(composites);
-        secantus_pgplan::set_session_user(Some(
-            self.session_user
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone(),
-        ));
         // Custom ranges resolve their subtype at cast time and their oid for
         // regtype -- but they are NOT enums, so they stay OUT of set_user_types.
         // A schema-qualified range resolves as `schema.name`, so
@@ -980,26 +1022,21 @@ impl PgHandler {
         // `Kind::Composite` (its declared fields, resolved to their own wire
         // types), so the value goes out as PostgreSQL composite TEXT `(...)`
         // in a text cursor and as the binary record format in a binary one.
-        let composites = self.composites_with_schema().ok()?;
         // A composite ARRAY: `testcomp[]` reports the derived typarray oid with
         // `Kind::Array(composite)` so a client that registered the array
         // decodes each element as the composite rather than reading varchar.
         if let Some(element) = pg_type.strip_suffix("[]") {
-            let (schema, bare, oid, fields) = composites
-                .iter()
-                .find(|(schema, name, _, _)| Self::type_resolution(schema, name) == element)?;
-            let elem_ty = self.composite_type(schema, bare, *oid, fields)?;
+            let (schema, bare, oid, fields) = self.composite_with_schema_named(element).ok()??;
+            let elem_ty = self.composite_type(&schema, &bare, oid, &fields)?;
             return Some(Type::new(
                 format!("_{bare}"),
-                u32::try_from(*oid + Self::USER_TYPE_ARRAY_OID_OFFSET).ok()?,
+                u32::try_from(oid + Self::USER_TYPE_ARRAY_OID_OFFSET).ok()?,
                 postgres_types::Kind::Array(elem_ty),
-                schema.clone(),
+                schema,
             ));
         }
-        let (schema, bare, oid, fields) = composites
-            .iter()
-            .find(|(schema, name, _, _)| Self::type_resolution(schema, name) == pg_type)?;
-        self.composite_type(schema, bare, *oid, fields)
+        let (schema, bare, oid, fields) = self.composite_with_schema_named(pg_type).ok()??;
+        self.composite_type(&schema, &bare, oid, &fields)
     }
 
     /// The wire `Type` for a DEFINED base type or its array, by resolution
@@ -1877,14 +1914,21 @@ impl PgHandler {
     /// SELECT 't'::regtype` in one transaction resolve `t`, since planning
     /// reads the catalog OUTSIDE the transaction and a plain read misses the
     /// uncommitted write.
-    fn type_catalog_docs(&self, collection: &'static str) -> PgWireResult<Vec<Document>> {
+    ///
+    /// Shared, not copied: with no overlay this is the cache's own `Arc`, so
+    /// a statement that consults the catalog several times (the planner
+    /// install, then one wire-type lookup per described column) decodes and
+    /// clones nothing. The per-statement cost used to grow with every table
+    /// the session had ever created -- each one leaves a row type here --
+    /// until a plain `select 1` ran twice as slowly on a used store.
+    fn type_catalog_docs(&self, collection: &'static str) -> PgWireResult<Arc<Vec<Document>>> {
         let committed = self.committed_type_catalog_docs(collection)?;
         let overlay = self
             .uncommitted_types
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if overlay.is_empty() {
-            return Ok(committed.as_ref().clone());
+            return Ok(committed);
         }
         let mut by_id: std::collections::BTreeMap<String, Document> = committed
             .iter()
@@ -1903,7 +1947,7 @@ impl PgHandler {
                 }
             }
         }
-        Ok(by_id.into_values().collect())
+        Ok(Arc::new(by_id.into_values().collect()))
     }
 
     /// The COMMITTED rows of one type-catalog collection, `_id`-sorted, from
@@ -1990,32 +2034,64 @@ impl PgHandler {
     /// name and `sub` is a nested composite's fields (unused here).
     fn composites(&self) -> PgWireResult<Vec<(String, i64, CompositeFields)>> {
         let mut out = Vec::new();
-        for d in self.type_catalog_docs(Self::COMPOSITE_COLLECTION)? {
+        for d in self.type_catalog_docs(Self::COMPOSITE_COLLECTION)?.iter() {
             let name = d.get_str("composite").unwrap_or_default().to_string();
             let oid = d
                 .get_i64("oid")
                 .or_else(|_| d.get_i32("oid").map(i64::from))
                 .unwrap_or(0);
-            let fields = d
-                .get_array("fields")
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|f| match f {
-                            Bson::Array(pair) => {
-                                let n = pair.first()?.as_str()?.to_string();
-                                let t = pair.get(1)?.as_str()?.to_string();
-                                Some((n, t))
-                            }
-                            _ => None,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            let fields = Self::composite_fields(d);
             out.push((name, oid, fields));
         }
         out.sort();
         Ok(out)
+    }
+
+    /// A composite catalog doc's `fields`: `[[name, type, sub], ...]` as
+    /// `(name, type)` pairs.
+    fn composite_fields(d: &Document) -> CompositeFields {
+        d.get_array("fields")
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|f| match f {
+                        Bson::Array(pair) => {
+                            let n = pair.first()?.as_str()?.to_string();
+                            let t = pair.get(1)?.as_str()?.to_string();
+                            Some((n, t))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// One composite by its resolution name (`name` in public, else
+    /// `schema.name`), as `composites_with_schema` would list it -- decoding
+    /// only that one, since a described column asks for exactly one type.
+    fn composite_with_schema_named(
+        &self,
+        resolution: &str,
+    ) -> PgWireResult<Option<(String, String, i64, CompositeFields)>> {
+        for d in self.type_catalog_docs(Self::COMPOSITE_COLLECTION)?.iter() {
+            let name = d.get_str("composite").unwrap_or_default();
+            let schema = d.get_str("schema").unwrap_or("public");
+            if Self::type_resolution(schema, name) != resolution {
+                continue;
+            }
+            let oid = d
+                .get_i64("oid")
+                .or_else(|_| d.get_i32("oid").map(i64::from))
+                .unwrap_or(0);
+            return Ok(Some((
+                schema.to_string(),
+                name.to_string(),
+                oid,
+                Self::composite_fields(d),
+            )));
+        }
+        Ok(None)
     }
 
     /// Is `name` the ROW TYPE of a table (a composite recorded by CREATE
@@ -2037,29 +2113,14 @@ impl PgHandler {
     /// duplicate-checking and `to_regtype` resolution consult the schema.
     fn composites_with_schema(&self) -> PgWireResult<Vec<(String, String, i64, CompositeFields)>> {
         let mut out = Vec::new();
-        for d in self.type_catalog_docs(Self::COMPOSITE_COLLECTION)? {
+        for d in self.type_catalog_docs(Self::COMPOSITE_COLLECTION)?.iter() {
             let name = d.get_str("composite").unwrap_or_default().to_string();
             let schema = d.get_str("schema").unwrap_or("public").to_string();
             let oid = d
                 .get_i64("oid")
                 .or_else(|_| d.get_i32("oid").map(i64::from))
                 .unwrap_or(0);
-            let fields = d
-                .get_array("fields")
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|f| match f {
-                            Bson::Array(pair) => {
-                                let n = pair.first()?.as_str()?.to_string();
-                                let t = pair.get(1)?.as_str()?.to_string();
-                                Some((n, t))
-                            }
-                            _ => None,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            let fields = Self::composite_fields(d);
             out.push((schema, name, oid, fields));
         }
         out.sort();
@@ -2070,7 +2131,7 @@ impl PgHandler {
     /// range type. `subtype` is the element type name (e.g. `int4`).
     fn ranges(&self) -> PgWireResult<Vec<(String, i64, String)>> {
         let mut out = Vec::new();
-        for d in self.type_catalog_docs(Self::RANGE_COLLECTION)? {
+        for d in self.type_catalog_docs(Self::RANGE_COLLECTION)?.iter() {
             let name = d.get_str("range").unwrap_or_default().to_string();
             let oid = d
                 .get_i64("oid")
@@ -2090,7 +2151,7 @@ impl PgHandler {
     /// duplicate-checking and `to_regtype` resolution consult the schema.
     fn ranges_with_schema(&self) -> PgWireResult<Vec<(String, String, i64, String)>> {
         let mut out = Vec::new();
-        for d in self.type_catalog_docs(Self::RANGE_COLLECTION)? {
+        for d in self.type_catalog_docs(Self::RANGE_COLLECTION)?.iter() {
             let name = d.get_str("range").unwrap_or_default().to_string();
             let schema = d.get_str("schema").unwrap_or("public").to_string();
             let oid = d
@@ -2107,7 +2168,7 @@ impl PgHandler {
     /// The `__sql_base_types__` catalog, name-sorted. See the constant.
     fn base_types(&self) -> PgWireResult<Vec<BaseType>> {
         let mut out = Vec::new();
-        for d in self.type_catalog_docs(Self::BASE_TYPE_COLLECTION)? {
+        for d in self.type_catalog_docs(Self::BASE_TYPE_COLLECTION)?.iter() {
             out.push(BaseType {
                 name: d.get_str("base").unwrap_or_default().to_string(),
                 schema: d.get_str("schema").unwrap_or("public").to_string(),
@@ -2128,7 +2189,7 @@ impl PgHandler {
     /// constant), name-sorted.
     fn functions(&self) -> PgWireResult<Vec<UserFunction>> {
         let mut out = Vec::new();
-        for d in self.type_catalog_docs(Self::FUNCTION_COLLECTION)? {
+        for d in self.type_catalog_docs(Self::FUNCTION_COLLECTION)?.iter() {
             let strings = |key: &str| -> Vec<String> {
                 d.get_array(key)
                     .map(|items| {
@@ -2428,7 +2489,7 @@ impl PgHandler {
     /// Every enum type: `(name, oid, labels)`, name-sorted for stable output.
     fn enums(&self) -> PgWireResult<Vec<(String, i64, Vec<String>)>> {
         let mut out = Vec::new();
-        for d in self.type_catalog_docs(Self::ENUM_COLLECTION)? {
+        for d in self.type_catalog_docs(Self::ENUM_COLLECTION)?.iter() {
             let name = d.get_str("enum").unwrap_or_default().to_string();
             let oid = d
                 .get_i64("oid")
@@ -2456,7 +2517,7 @@ impl PgHandler {
     /// schema.
     fn enums_with_schema(&self) -> PgWireResult<Vec<EnumWithSchema>> {
         let mut out = Vec::new();
-        for d in self.type_catalog_docs(Self::ENUM_COLLECTION)? {
+        for d in self.type_catalog_docs(Self::ENUM_COLLECTION)?.iter() {
             let name = d.get_str("enum").unwrap_or_default().to_string();
             let schema = d.get_str("schema").unwrap_or("public").to_string();
             let oid = d
