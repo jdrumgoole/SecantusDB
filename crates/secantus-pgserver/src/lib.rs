@@ -5145,7 +5145,13 @@ impl PgHandler {
                 "0A000".into(), // feature_not_supported
                 "pg_listening_channels() beside other columns is not supported yet".into(),
             )))),
-            ConstCol::TerminateBackend(inner) => {
+            ConstCol::TerminateBackend(inner) | ConstCol::CancelBackend(inner) => {
+                let terminate = matches!(col, ConstCol::TerminateBackend(_));
+                let name = if terminate {
+                    "pg_terminate_backend"
+                } else {
+                    "pg_cancel_backend"
+                };
                 let target = match self.resolve_const_col(inner)? {
                     Bson::Int32(i) => i64::from(i),
                     Bson::Int64(i) => i,
@@ -5158,33 +5164,58 @@ impl PgHandler {
                         return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                             "ERROR".into(),
                             "22023".into(), // invalid_parameter_value
-                            format!("pg_terminate_backend() PID must be an integer, not {other}"),
+                            format!("{name}() PID must be an integer, not {other}"),
                         ))));
                     }
                 };
                 let my_pid = i64::from(self.backend_pid.load(std::sync::atomic::Ordering::Relaxed));
                 if target == my_pid {
-                    // Terminating our own backend: the CURRENT statement is the
-                    // one that dies, so raise the FATAL now rather than arming
-                    // the flag for a next statement that will never come.
-                    return Err(Self::admin_shutdown());
+                    // Our own backend: the CURRENT statement is the one that
+                    // dies (or is cancelled), so raise it now rather than
+                    // arming a flag for a next statement that will never come.
+                    return Err(if terminate {
+                        Self::admin_shutdown()
+                    } else {
+                        Self::query_canceled()
+                    });
                 }
                 // Another backend: arm its flag if it is live. PostgreSQL
-                // returns true when the signal was sent, false otherwise.
+                // returns true when the signal was sent, false -- with a
+                // WARNING -- when no such backend exists (probed 16).
                 let target = i32::try_from(target).unwrap_or(0);
                 let armed = backend_registry()
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .get(&target)
                     .map(|entry| {
-                        entry
-                            .terminate
-                            .store(true, std::sync::atomic::Ordering::Relaxed);
-                        // An idle target hears it from its idle wait; an
-                        // active one from its next cancellation point.
+                        if terminate {
+                            entry
+                                .terminate
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                        } else {
+                            entry
+                                .cancel
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        // An idle target hears a terminate from its idle
+                        // wait; an active one from its next cancellation
+                        // point (a cancel to an idle backend is dropped, as
+                        // PostgreSQL drops one).
                         entry.wake.notify_one();
                     })
                     .is_some();
+                if !armed {
+                    let mut info = ErrorInfo::new(
+                        "WARNING".into(),
+                        "01000".into(), // warning
+                        format!("PID {target} is not a PostgreSQL backend process"),
+                    );
+                    info.routine = Some("pg_signal_backend".into());
+                    self.pending_notices
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(info);
+                }
                 Ok(Bson::Boolean(armed))
             }
         }

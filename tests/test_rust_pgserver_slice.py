@@ -8046,3 +8046,76 @@ def test_listen_notify_delivers_to_every_listener_at_commit(home: Path) -> None:
         assert a.execute("select pg_listening_channels()").fetchall() == []
         b.execute("notify foo, 'nobody'")
         assert list(a.notifies(timeout=0.2)) == []
+
+
+def test_pg_cancel_and_terminate_backend_signal_a_running_statement(home: Path) -> None:
+    """`pg_cancel_backend(pid)` interrupts the victim's statement with
+    `57014` and leaves the session usable; `pg_terminate_backend(pid)`
+    ends it with FATAL `57P01` and closes the socket -- both within a few
+    milliseconds of the signal, even while the victim is inside
+    `pg_sleep`, and also while the victim is idle (a terminated idle
+    session fails on its next statement). Both answer `true` for a known
+    pid, `false` plus a `01000` WARNING for an unknown one, and NULL for
+    NULL. PostgreSQL 16.
+    """
+    import threading
+
+    from psycopg.pq import TransactionStatus
+
+    with _Server(home) as server, server.connect() as conn, server.connect() as other:
+        pid = conn.info.backend_pid
+
+        def signal(fn: str, delay: float) -> None:
+            time.sleep(delay)
+            assert other.execute(f"select {fn}(%s)", (pid,)).fetchone() == (True,)
+
+        t = threading.Thread(target=signal, args=("pg_cancel_backend", 0.2))
+        t0 = time.monotonic()
+        t.start()
+        with pytest.raises(psycopg.errors.QueryCanceled) as info:
+            conn.execute("select pg_sleep(5)")
+        t.join()
+        assert time.monotonic() - t0 < 1.0
+        assert info.value.sqlstate == "57014"
+        assert conn.info.transaction_status == TransactionStatus.IDLE
+        assert conn.execute("select 1").fetchone() == (1,)
+
+        # An idle cancel is a no-op the next statement does not see.
+        assert other.execute("select pg_cancel_backend(%s)", (pid,)).fetchone() == (True,)
+        time.sleep(0.05)
+        assert conn.execute("select 2").fetchone() == (2,)
+
+        notices = _notice_diags(other)
+        assert other.execute("select pg_cancel_backend(999999)").fetchone() == (False,)
+        assert other.execute("select pg_terminate_backend(999999)").fetchone() == (False,)
+        assert other.execute("select pg_terminate_backend(NULL::int)").fetchone() == (None,)
+        assert notices == [
+            ("WARNING", "01000", "PID 999999 is not a PostgreSQL backend process", None),
+            ("WARNING", "01000", "PID 999999 is not a PostgreSQL backend process", None),
+        ]
+
+        t = threading.Thread(target=signal, args=("pg_terminate_backend", 0.2))
+        t0 = time.monotonic()
+        t.start()
+        with pytest.raises(psycopg.errors.AdminShutdown) as info:
+            conn.execute("select pg_sleep(5)")
+        t.join()
+        assert time.monotonic() - t0 < 1.0
+        assert info.value.sqlstate == "57P01"
+        assert info.value.diag.severity == "FATAL"
+        assert conn.closed
+
+        # Terminating an IDLE session: it dies on its next statement.
+        with server.connect() as idle:
+            idle_pid = idle.info.backend_pid
+            assert other.execute("select pg_terminate_backend(%s)", (idle_pid,)).fetchone() == (
+                True,
+            )
+            time.sleep(0.1)
+            with pytest.raises(psycopg.errors.AdminShutdown) as info:
+                idle.execute("select 1")
+            assert info.value.sqlstate == "57P01"
+            assert idle.closed
+            assert other.execute(
+                "select count(*) from pg_stat_activity where pid = %s", (idle_pid,)
+            ).fetchone() == (0,)

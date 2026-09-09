@@ -848,6 +848,9 @@ pub enum ConstCol {
     /// pg_terminate_backend(pg_backend_pid())`), all of which the server
     /// resolves at execution.
     TerminateBackend(Box<ConstCol>),
+    /// `pg_cancel_backend(pid)` -- cancel that backend's running statement.
+    /// Same argument shapes as `TerminateBackend`.
+    CancelBackend(Box<ConstCol>),
     /// `current_user` / `session_user` / `user` / `current_role` -- the role
     /// the client connected as, which only the server's session knows.
     SessionUser,
@@ -5000,10 +5003,11 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                     ));
                     continue;
                 }
-                if name == "pg_terminate_backend" {
-                    let arg = f.args.first().ok_or_else(|| {
-                        Error::Unsupported("pg_terminate_backend() without a PID".into())
-                    })?;
+                if name == "pg_terminate_backend" || name == "pg_cancel_backend" {
+                    let arg = f
+                        .args
+                        .first()
+                        .ok_or_else(|| Error::Unsupported(format!("{name}() without a PID")))?;
                     // The PID may itself be `pg_backend_pid()` -- resolve that
                     // nesting into a `BackendPid` the server fills in, so the
                     // idiomatic `pg_terminate_backend(pg_backend_pid())` works.
@@ -5026,11 +5030,15 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                     };
                     columns.push((
                         if rt.name.is_empty() {
-                            "pg_terminate_backend".to_string()
+                            name.clone()
                         } else {
                             rt.name.clone()
                         },
-                        ConstCol::TerminateBackend(Box::new(inner)),
+                        if name == "pg_cancel_backend" {
+                            ConstCol::CancelBackend(Box::new(inner))
+                        } else {
+                            ConstCol::TerminateBackend(Box::new(inner))
+                        },
                         "bool".to_string(),
                         -1,
                     ));
