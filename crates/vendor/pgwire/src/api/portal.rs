@@ -214,6 +214,7 @@ impl<S: Clone> Portal<S> {
             }),
             PortalExecutionState::Suspended(response) => {
                 let command_tag = response.command_tag().to_owned();
+                let tag_counts_rows = response.tag_counts_rows;
                 let row_schema = response.row_schema();
                 let data_rows = response.data_rows();
 
@@ -234,6 +235,7 @@ impl<S: Clone> Portal<S> {
 
                 let result_response = QueryResponse {
                     command_tag,
+                    tag_counts_rows,
                     row_schema,
                     data_rows: Box::pin(futures::stream::iter(rows.into_iter().map(Ok))),
                 };

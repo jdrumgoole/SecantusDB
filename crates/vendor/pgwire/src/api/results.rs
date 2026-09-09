@@ -292,6 +292,10 @@ pub type SendableCopyDataStream = Pin<Box<dyn Stream<Item = PgWireResult<CopyDat
 #[non_exhaustive]
 pub struct QueryResponse {
     pub command_tag: String,
+    /// Whether the CommandComplete tag carries the row count. `SELECT n`,
+    /// `INSERT 0 n` and `FETCH n` do; PostgreSQL's `SHOW` is bare even though
+    /// it returns a row.
+    pub tag_counts_rows: bool,
     pub row_schema: Arc<Vec<FieldInfo>>,
     pub data_rows: SendableRowStream,
 }
@@ -314,6 +318,7 @@ impl QueryResponse {
     {
         QueryResponse {
             command_tag: "SELECT".to_owned(),
+            tag_counts_rows: true,
             row_schema: field_defs,
             data_rows: Box::pin(row_stream),
         }
@@ -327,6 +332,22 @@ impl QueryResponse {
     /// Set the command tag
     pub fn set_command_tag(&mut self, command_tag: &str) {
         command_tag.clone_into(&mut self.command_tag);
+    }
+
+    /// Set a command tag that is sent WITHOUT the row count appended.
+    pub fn set_bare_command_tag(&mut self, command_tag: &str) {
+        self.set_command_tag(command_tag);
+        self.tag_counts_rows = false;
+    }
+
+    /// The CommandComplete tag for `rows` rows sent.
+    pub fn complete_tag(command_tag: &str, tag_counts_rows: bool, rows: usize) -> Tag {
+        let tag = Tag::new(command_tag);
+        if tag_counts_rows {
+            tag.with_rows(rows)
+        } else {
+            tag
+        }
     }
 
     /// Get schema of columns
@@ -742,11 +763,39 @@ pub trait DescribeResponse {
 }
 
 /// Response for frontend describe statement requests.
+///
+/// `no_data` is an explicit flag rather than "no fields": a statement that
+/// produces no result set (INSERT, CREATE, ...) answers `NoData`, while a
+/// SELECT with zero output columns (`select`) answers a `RowDescription` of
+/// zero fields -- PostgreSQL distinguishes the two, and psycopg's `stream()`
+/// only iterates the second.
 #[non_exhaustive]
-#[derive(Debug, new)]
+#[derive(Debug)]
 pub struct DescribeStatementResponse {
     pub parameters: Vec<Type>,
     pub fields: Vec<FieldInfo>,
+    pub no_data: bool,
+}
+
+impl DescribeStatementResponse {
+    /// A statement that produces a result set with these fields (possibly
+    /// none).
+    pub fn new(parameters: Vec<Type>, fields: Vec<FieldInfo>) -> Self {
+        DescribeStatementResponse {
+            parameters,
+            fields,
+            no_data: false,
+        }
+    }
+
+    /// A statement with these parameters that produces no result set.
+    pub fn no_data_with_parameters(parameters: Vec<Type>) -> Self {
+        DescribeStatementResponse {
+            parameters,
+            fields: vec![],
+            no_data: true,
+        }
+    }
 }
 
 impl DescribeResponse for DescribeStatementResponse {
@@ -761,23 +810,31 @@ impl DescribeResponse for DescribeStatementResponse {
     /// Create an no_data instance of `DescribeStatementResponse`. This is typically used
     /// when client tries to describe an empty query.
     fn no_data() -> Self {
-        DescribeStatementResponse {
-            parameters: vec![],
-            fields: vec![],
-        }
+        Self::no_data_with_parameters(vec![])
     }
 
     /// Return true if the `DescribeStatementResponse` is empty/nodata
     fn is_no_data(&self) -> bool {
-        self.parameters.is_empty() && self.fields.is_empty()
+        self.no_data
     }
 }
 
 /// Response for frontend describe portal requests.
 #[non_exhaustive]
-#[derive(Debug, new)]
+#[derive(Debug)]
 pub struct DescribePortalResponse {
     pub fields: Vec<FieldInfo>,
+    pub no_data: bool,
+}
+
+impl DescribePortalResponse {
+    /// A portal that produces a result set with these fields (possibly none).
+    pub fn new(fields: Vec<FieldInfo>) -> Self {
+        DescribePortalResponse {
+            fields,
+            no_data: false,
+        }
+    }
 }
 
 impl DescribeResponse for DescribePortalResponse {
@@ -792,12 +849,15 @@ impl DescribeResponse for DescribePortalResponse {
     /// Create an no_data instance of `DescribePortalResponse`. This is typically used
     /// when client tries to describe an empty query.
     fn no_data() -> Self {
-        DescribePortalResponse { fields: vec![] }
+        DescribePortalResponse {
+            fields: vec![],
+            no_data: true,
+        }
     }
 
     /// Return true if the `DescribePortalResponse` is empty/nodata
     fn is_no_data(&self) -> bool {
-        self.fields.is_empty()
+        self.no_data
     }
 }
 

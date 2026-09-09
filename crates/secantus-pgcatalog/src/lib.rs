@@ -16,6 +16,28 @@
 use bson::{doc, Bson, Document};
 
 pub const CATALOG_COLLECTION: &str = "__sql_catalog__";
+/// Where sequence state lives: one document per sequence, keyed by name, in
+/// the shape the Python server writes (`last_value` / `is_called` are the two
+/// `nextval` reads and moves).
+pub const SEQUENCE_COLLECTION: &str = "__sql_sequences__";
+
+/// The sequence document for a fresh `serial` column, owned by `owned_by`
+/// (`table.column`, so dropping the table drops it). `max_value` is the
+/// column type's ceiling, as PostgreSQL sizes a serial's sequence.
+pub fn sequence_document(name: &str, owned_by: &str, max_value: i64) -> Document {
+    doc! {
+        "_id": name,
+        "sequence": name,
+        "last_value": 1i64,
+        "start": 1i64,
+        "increment": 1i64,
+        "min_value": 1i64,
+        "max_value": max_value,
+        "cycle": false,
+        "is_called": false,
+        "owned_by": owned_by,
+    }
+}
 
 /// Where a column's value lives inside the stored document.
 ///
@@ -37,6 +59,12 @@ pub struct Column {
     pub pg_type: String,
     pub pk: bool,
     pub nullable: bool,
+    /// The sequence a `serial` column draws its default from, by name.
+    pub sequence: Option<String>,
+    /// A LITERAL column DEFAULT, already cast to the column's type, applied
+    /// when an INSERT omits the column. `Some(Bson::Null)` is an explicit
+    /// `DEFAULT NULL`; `None` is no default at all.
+    pub default: Option<Bson>,
 }
 
 impl Column {
@@ -47,6 +75,8 @@ impl Column {
             pk,
             // A PRIMARY KEY column is NOT NULL by definition.
             nullable: !pk,
+            sequence: None,
+            default: None,
         }
     }
 
@@ -66,11 +96,11 @@ impl Column {
             "field": self.field(),
             "pk": self.pk,
             "nullable": self.nullable,
-            "has_default": false,
-            "default": Bson::Null,
+            "has_default": self.default.is_some(),
+            "default": self.default.clone().unwrap_or(Bson::Null),
             "default_expr": Bson::Null,
             "comment": Bson::Null,
-            "sequence": Bson::Null,
+            "sequence": self.sequence.as_deref().map_or(Bson::Null, Bson::from),
             "identity": Bson::Null,
             "enum_type": Bson::Null,
             "domain_type": Bson::Null,
@@ -89,6 +119,11 @@ impl Column {
             pg_type: d.get_str("type").ok()?.to_string(),
             pk: d.get_bool("pk").unwrap_or(false),
             nullable: d.get_bool("nullable").unwrap_or(true),
+            sequence: d.get_str("sequence").ok().map(str::to_string),
+            default: d
+                .get_bool("has_default")
+                .unwrap_or(false)
+                .then(|| d.get("default").cloned().unwrap_or(Bson::Null)),
         })
     }
 }

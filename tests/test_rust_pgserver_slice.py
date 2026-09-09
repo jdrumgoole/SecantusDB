@@ -4924,3 +4924,673 @@ def test_error_inside_transaction_poisons_the_block(home: Path) -> None:
         cur.execute("commit")
         cur.execute("select count(*) from foo")
         assert cur.fetchone() == (0,)
+
+
+def test_array_literal_keeps_unicode_whitespace_elements(home: Path) -> None:
+    """The array scanner trims only PostgreSQL's `array_isspace` set (space,
+    tab, newline, CR, VT, FF) -- never U+0085 / U+00A0, which Rust's
+    `char::is_whitespace` strips. `select %s::text[]` with `['\\x85']` used
+    to come back as the EMPTY array. Probed against PG 16."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        for fmt in ("s", "t", "b"):
+            for ch in ("\x85", "\xa0", " a "):
+                cur.execute(f"select %{fmt}::text[]", ([ch],))
+                assert cur.fetchone() == ([ch],), (fmt, ch)
+        cur.execute("select '{ a , b }'::text[]")
+        assert cur.fetchone() == (["a", "b"],)
+        cur.execute("select E'{\\ta\\t,\\nb\\v\\f}'::text[]")
+        assert cur.fetchone() == (["a", "b"],)
+        cur.execute("select E'{\\u0085a}'::text[]")
+        assert cur.fetchone() == (["\x85a"],)
+        cur.execute('select \'{a b, "c d", " e ", NULL, "null"}\'::text[]')
+        assert cur.fetchone() == (["a b", "c d", " e ", None, "null"],)
+        cur.execute("select '{ { NULL } }'::text[]")
+        assert cur.fetchone() == ([[None]],)
+
+
+def test_array_literal_grammar_matches_postgresql(home: Path) -> None:
+    """The literal forms PostgreSQL accepts and rejects (probed against PG 16):
+    unquoted `NULL` is the null element while `"null"` is a string, a
+    backslash escapes in and out of quotes, and each malformed shape is 22P02."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cases = {
+            "{a b}": ["a b"],
+            '{ NULL , "null", NuLl}': [None, "null", None],
+            '{a\\,b, \\a, "a\\"b"}': ["a,b", "a", 'a"b'],
+            "{}": [],
+        }
+        for literal, expected in cases.items():
+            cur.execute("select %s::text[]", (literal,))
+            assert cur.fetchone() == (expected,), literal
+        for bad in ("{a,}", "{,a}", "{{}}", "{a}x", '{"a"b}', "{a", "a}", "{{a},{b,c}}", "{{a},b}"):
+            with pytest.raises(psycopg.errors.InvalidTextRepresentation) as exc:
+                cur.execute("select %s::text[]", (bad,))
+            assert exc.value.sqlstate == "22P02", bad
+
+
+def test_array_literal_dimension_decoration(home: Path) -> None:
+    """`[lo:hi]...={...}` is accepted, checked against the contents, and
+    otherwise discarded -- the value has no lower bounds. Probed against PG
+    16."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("select '[0:1]={a,b}'::text[]")
+        assert cur.fetchone() == (["a", "b"],)
+        cur.execute("select '[1:1][-2:-1][3:5]={{{1,2,3},{4,5,6}}}'::int[]")
+        assert cur.fetchone() == ([[[1, 2, 3], [4, 5, 6]]],)
+        cur.execute("select '[0:1]={a,b}'::text[] || %s::text[]", (["c"],))
+        assert cur.fetchone() == (["a", "b", "c"],)
+        for bad in ("[0:0]={a,b}", "[1:2={a,b}", "[1:2]{a,b}"):
+            with pytest.raises(psycopg.errors.InvalidTextRepresentation):
+                cur.execute("select %s::text[]", (bad,))
+
+
+NESTED_TEXT = [[["fo{o", "ba}r"], ['ba"z', "qu'x"], ["qu ux", " "]]]
+
+
+def test_nested_arrays_round_trip_in_every_format(home: Path) -> None:
+    """A multidimensional array parses to nested lists from its text literal,
+    from a text parameter, and from a BINARY parameter (whose decoder used to
+    refuse `ndim > 1`), and renders back the same way. Probed against PG 16."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("select '{{{{{{\"NULL\"}}}}}}'::text[]")
+        assert cur.fetchone() == ([[[[[["NULL"]]]]]],)
+        for fmt in ("s", "t", "b"):
+            cur.execute(f"select %{fmt}::text[]", (NESTED_TEXT,))
+            assert cur.fetchone() == (NESTED_TEXT,), fmt
+            cur.execute(f"select %{fmt}::int[]", ([[1, 2], [3, 4]],))
+            assert cur.fetchone() == ([[1, 2], [3, 4]],), fmt
+            cur.execute(f"select %{fmt}::text[]", ([[[[[["NULL"]]]]]],))
+            assert cur.fetchone() == ([[[[[["NULL"]]]]]],), fmt
+        bcur = conn.cursor(binary=True)
+        bcur.execute("select %b::int[]", ([[1, None], [3, 4]],))
+        assert bcur.fetchone() == ([[1, None], [3, 4]],)
+
+
+def test_array_concatenation_follows_array_cat(home: Path) -> None:
+    """`||` on arrays is `array_cat` / `array_append` / `array_prepend`: same
+    dimensionality appends, an (N-1)-dim side becomes a new slice, a NULL side
+    yields the other, and the result is typed as the array. Probed against PG
+    16."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cases = [
+            ("select array[1] || null", [1]),
+            ("select null || array[1]", [1]),
+            ("select array[1] || 2", [1, 2]),
+            ("select 0 || array[1]", [0, 1]),
+            ("select array[[1,2]] || array[3,4]", [[1, 2], [3, 4]]),
+            ("select array[3,4] || array[[1,2]]", [[3, 4], [1, 2]]),
+            ("select array[[1,2]] || array[[3,4]]", [[1, 2], [3, 4]]),
+            ("select '{}'::int[] || array[1]", [1]),
+            ("select '{{1,2},{3,4}}'::int[] || '{5,6}'", [[1, 2], [3, 4], [5, 6]]),
+        ]
+        for sql, expected in cases:
+            cur.execute(sql)
+            assert cur.fetchone() == (expected,), sql
+        cur.execute("select pg_typeof(array[1] || 2)")
+        assert cur.fetchone() == ("integer[]",)
+        with pytest.raises(psycopg.errors.InvalidTextRepresentation):
+            cur.execute("select array['a'] || 'b'")
+
+
+def test_expressions_over_generate_series_rows(home: Path) -> None:
+    """A select-list expression over a `generate_series` row -- arithmetic, a
+    cast, a scalar call, date arithmetic, a comparison -- evaluates per row,
+    is named as PostgreSQL names it, and is typed from the row's declared
+    column type. Every value, name and `pg_typeof` here is PG 16's."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "select i, i + 1, i::int8 as j, i * 2.5, abs(-i), "
+            "'2021-01-01'::date + i, i > 1 from generate_series(1, 2) as i"
+        )
+        assert [d.name for d in cur.description] == [
+            "i",
+            "?column?",
+            "j",
+            "?column?",
+            "abs",
+            "?column?",
+            "?column?",
+        ]
+        assert cur.fetchall() == [
+            (1, 2, 1, Decimal("2.5"), 1, dt.date(2021, 1, 2), False),
+            (2, 3, 2, Decimal("5.0"), 2, dt.date(2021, 1, 3), True),
+        ]
+        cur.execute(
+            "select pg_typeof(abs(-i)), pg_typeof(i + 1), pg_typeof(i * 2.5), "
+            "pg_typeof(i::int8), pg_typeof('2021-01-01'::date + i), "
+            "pg_typeof(i > 1), pg_typeof(i) from generate_series(1, 1) as i"
+        )
+        assert cur.fetchone() == (
+            "integer",
+            "integer",
+            "numeric",
+            "bigint",
+            "date",
+            "boolean",
+            "integer",
+        )
+        # The stream path (Execute with a row limit) takes the same route.
+        rows = list(
+            cur.stream(
+                "select i, '2021-01-01'::date + i from generate_series(1, %s) as i",
+                [2],
+            )
+        )
+        assert rows == [(1, dt.date(2021, 1, 2)), (2, dt.date(2021, 1, 3))]
+
+
+def test_describe_distinguishes_no_columns_from_no_rows(home: Path) -> None:
+    """Describe answers `NoData` only for a statement that returns no rows at
+    all; a `select` with an empty target list is a RowDescription of zero
+    fields and yields one empty row. psycopg's `stream()` reads the difference:
+    a NoData select raised `the last operation didn't produce a result`.
+    Probed against PG 16 at the protocol level."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        assert list(cur.stream("select")) == [()]
+        assert cur.description == []
+        cur.execute("create table if not exists nodata_t (a int)")
+        assert cur.description is None
+        assert list(cur.stream("select %s::int", [1], binary=True)) == [(1,)]
+        with conn.cursor(binary=True) as bcur:
+            assert list(bcur.stream("select %s::int", [1])) == [(1,)]
+
+
+def test_serial_columns_and_insert_returning(home: Path) -> None:
+    """`serial` / `bigserial` draw from a `<table>_<column>_seq` sequence, an
+    empty bound list binds as an empty array, and `RETURNING` answers named,
+    computed and `*` columns typed from the row. Every value here is PG 16's
+    (a fresh store, so the first id is 1)."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("create table fp_test (id serial primary key, data date[])")
+        for fmt in ("s", "t", "b"):
+            cur.execute(f"insert into fp_test (data) values (%{fmt}) returning id", ([],))
+            assert (cur.rowcount, cur.statusmessage) == (1, "INSERT 0 1")
+            assert [d.type_code for d in cur.description] == [23]
+        assert cur.fetchone() == (3,)
+        cur.execute("insert into fp_test (data) values (%s), (%s)", (["2021-01-01"], []))
+        assert (cur.rowcount, cur.statusmessage) == (2, "INSERT 0 2")
+        cur.execute("select id, data from fp_test order by id")
+        assert cur.fetchall() == [
+            (1, []),
+            (2, []),
+            (3, []),
+            (4, [dt.date(2021, 1, 1)]),
+            (5, []),
+        ]
+        cur.execute("select data from fp_test where id = any(%s)", ([1],))
+        assert cur.fetchall() == [([],)]
+        cur.execute("select data from fp_test where id = any(%s)", ([],))
+        assert cur.fetchall() == []
+        # An explicit id neither draws from nor advances the sequence.
+        cur.execute("insert into fp_test (id, data) values (100, null) returning id")
+        assert cur.fetchone() == (100,)
+        cur.execute(
+            "insert into fp_test (data) values (null) "
+            "returning id, data, id * 2, pg_typeof(id)::text"
+        )
+        assert [(d.name, d.type_code) for d in cur.description] == [
+            ("id", 23),
+            ("data", 1182),
+            ("?column?", 23),
+            ("pg_typeof", 25),
+        ]
+        assert cur.fetchone() == (6, None, 12, "integer")
+        cur.execute("insert into fp_test (data) values (null) returning *")
+        assert [d.name for d in cur.description] == ["id", "data"]
+        assert cur.fetchone() == (7, None)
+        # A cast of a column keeps the column's name; a cast of an expression
+        # is named after the type.
+        cur.execute("insert into fp_test (data) values (null) returning id::int8, (1+2)::int8")
+        assert [(d.name, d.type_code) for d in cur.description] == [("id", 20), ("int8", 20)]
+        assert cur.fetchone() == (8, 3)
+        with pytest.raises(psycopg.errors.UndefinedColumn) as ei:
+            cur.execute("insert into fp_test (data) values (null) returning nope")
+        assert str(ei.value).startswith('column "nope" does not exist')
+
+        cur.execute("create table fp_big (id bigserial, n int)")
+        cur.execute("insert into fp_big (n) values (1) returning id, pg_typeof(id)::text")
+        assert [d.type_code for d in cur.description] == [20, 25]
+        assert cur.fetchone() == (1, "bigint")
+        cur.execute("insert into fp_big (n) values (2), (3) returning id")
+        assert cur.fetchall() == [(2,), (3,)]
+        cur.executemany(
+            "insert into fp_big (n) values (%s) returning n, id",
+            [(10,), (20,)],
+            returning=True,
+        )
+        assert (cur.rowcount, cur.statusmessage, cur.fetchone()) == (1, "INSERT 0 1", (10, 4))
+        assert cur.nextset() is True
+        assert (cur.rowcount, cur.fetchone(), cur.nextset()) == (1, (20, 5), None)
+
+        # Dropping the table drops its sequence: a re-created table starts
+        # over at 1.
+        cur.execute("drop table fp_test")
+        cur.execute("create table fp_test (id serial primary key, data date[])")
+        cur.execute("insert into fp_test (data) values (null) returning id")
+        assert cur.fetchone() == (1,)
+
+
+def test_show_and_insert_select_rowcounts(home: Path) -> None:
+    """`SHOW` completes with a bare `SHOW` tag and one row; `INSERT ... SELECT`
+    inserts the query's rows (it used to write nothing and say `INSERT 0 0`),
+    with PostgreSQL's width errors and default-filled trailing columns.
+    Probed PG 16."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("show timezone")
+        assert (cur.rowcount, cur.statusmessage) == (1, "SHOW")
+        assert [(d.name, d.type_code) for d in cur.description] == [("TimeZone", 25)]
+        cur.execute("create table fp_trc (id int primary key, n int default 7)")
+        assert (cur.rowcount, cur.statusmessage) == (-1, "CREATE TABLE")
+        cur.execute("insert into fp_trc select generate_series(1, 42)")
+        assert (cur.rowcount, cur.statusmessage) == (42, "INSERT 0 42")
+        cur.execute("select count(*), min(n), max(n) from fp_trc")
+        assert cur.fetchone() == (42, 7, 7)
+        cur.execute(
+            "insert into fp_trc (id, n) select i * 100, i + 1 "
+            "from generate_series(1, 3) as i returning id, n"
+        )
+        assert (cur.rowcount, cur.statusmessage) == (3, "INSERT 0 3")
+        assert cur.fetchall() == [(100, 2), (200, 3), (300, 4)]
+        cur.execute("insert into fp_trc select 700 where false")
+        assert (cur.rowcount, cur.statusmessage) == (0, "INSERT 0 0")
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            cur.execute("insert into fp_trc select 1")
+        with pytest.raises(psycopg.errors.InvalidTextRepresentation) as ei:
+            cur.execute("insert into fp_trc select 'a'")
+        assert str(ei.value).startswith('invalid input syntax for type integer: "a"')
+        for sql in (
+            "insert into fp_trc select 200, 1, 2",
+            "insert into fp_trc (id) select 300, 1",
+            "insert into fp_trc values (600, 1, 2)",
+        ):
+            with pytest.raises(psycopg.errors.SyntaxError) as ei:
+                cur.execute(sql)
+            assert str(ei.value).startswith("INSERT has more expressions than target columns")
+        for sql in (
+            "insert into fp_trc (id, n) select 400",
+            "insert into fp_trc (id, n) values (500)",
+        ):
+            with pytest.raises(psycopg.errors.SyntaxError) as ei:
+                cur.execute(sql)
+            assert str(ei.value).startswith("INSERT has more target columns than expressions")
+        # COPY of a query evaluates its expressions rather than reading the
+        # bare columns.
+        with cur.copy(
+            "copy (select id + 1, n::text || 'x' from fp_trc where id <= 2 order by id) to stdout"
+        ) as cp:
+            assert b"".join(cp) == b"2\t7x\n3\t7x\n"
+
+
+def test_literal_column_defaults(home: Path) -> None:
+    """A literal DEFAULT is applied to every column an INSERT omits, whatever
+    the INSERT's shape; an explicit NULL is kept; a DEFAULT that will not
+    parse as the column's type fails at CREATE. An expression default is
+    refused (0A000) rather than silently dropped. Values are PG 16's."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "create table fp_d (id int primary key, n int default 7, t text default 'x', "
+            "d date default '2021-01-02', z int default null, f float8 default 1.5, "
+            "b bool default true)"
+        )
+        cur.execute("insert into fp_d (id) values (1)")
+        cur.execute("insert into fp_d values (2)")
+        cur.execute("insert into fp_d (id, n, t) values (3, null, 'y')")
+        cur.execute("insert into fp_d select 4")
+        cur.execute("insert into fp_d (id, t) select 5, 'q' returning *")
+        assert cur.fetchone() == (5, 7, "q", dt.date(2021, 1, 2), None, 1.5, True)
+        cur.execute("select * from fp_d order by id")
+        assert cur.fetchall() == [
+            (1, 7, "x", dt.date(2021, 1, 2), None, 1.5, True),
+            (2, 7, "x", dt.date(2021, 1, 2), None, 1.5, True),
+            (3, None, "y", dt.date(2021, 1, 2), None, 1.5, True),
+            (4, 7, "x", dt.date(2021, 1, 2), None, 1.5, True),
+            (5, 7, "q", dt.date(2021, 1, 2), None, 1.5, True),
+        ]
+        with pytest.raises(psycopg.errors.InvalidTextRepresentation) as ei:
+            cur.execute("create table fp_e (id int, n int default 'a')")
+        assert str(ei.value).startswith('invalid input syntax for type integer: "a"')
+        with pytest.raises(psycopg.errors.FeatureNotSupported):
+            cur.execute("create table fp_e (id int, n text default now())")
+    # The default survives a restart: it is in the catalog, not the session.
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("insert into fp_d (id) values (6) returning n, t")
+        assert cur.fetchone() == (7, "x")
+
+
+def test_constant_where_on_a_from_less_select(home: Path) -> None:
+    """With no FROM, a WHERE is a constant predicate on the one row: false or
+    NULL is zero rows (the predicate used to be ignored), a non-boolean is
+    42804, and an unknown literal is read as a boolean. Probed PG 16."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        for sql, args in (
+            ("select 1 where false", None),
+            ("select 1 where null", None),
+            ("select 1 where %s", (False,)),
+            ("select %s where %s", (5, False)),
+            ("select 1 where 1 < 2 and false", None),
+        ):
+            cur.execute(sql, args)
+            assert (cur.fetchall(), cur.statusmessage) == ([], "SELECT 0"), sql
+        for sql, args, row in (
+            ("select 1, 'a' where true", None, (1, "a")),
+            ("select 1 where 1 = 1", None, (1,)),
+            ("select 1 where %s", (True,), (1,)),
+            ("select 1 where 't'", None, (1,)),
+        ):
+            cur.execute(sql, args)
+            assert (cur.fetchall(), cur.statusmessage) == ([row], "SELECT 1"), sql
+        with pytest.raises(psycopg.errors.DatatypeMismatch) as ei:
+            cur.execute("select 1 where 1")
+        assert str(ei.value).startswith("argument of WHERE must be type boolean, not type integer")
+        with pytest.raises(psycopg.errors.InvalidTextRepresentation) as ei:
+            cur.execute("select 1 where 'x'")
+        assert str(ei.value).startswith('invalid input syntax for type boolean: "x"')
+
+
+def test_pg_sleep_waits_and_returns_void(home: Path) -> None:
+    """`pg_sleep(seconds)` waits on the connection's thread and answers a
+    `void` (oid 2278) column rendered as the empty string in both formats;
+    zero or negative seconds return at once, NULL is NULL, and a bad literal
+    is 22P02 for double precision. psycopg's `test_executemany_lock` needs
+    it. Probed PG 16."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        started = time.monotonic()
+        cur.execute("select pg_sleep(0.2)")
+        assert time.monotonic() - started >= 0.2
+        assert [(d.name, d.type_code) for d in cur.description] == [("pg_sleep", 2278)]
+        assert (cur.fetchall(), cur.statusmessage) == ([("",)], "SELECT 1")
+        cur.execute("select pg_sleep(%s)", (0,))
+        assert cur.fetchall() == [("",)]
+        cur.execute("select pg_sleep(-1), 1")
+        assert [(d.name, d.type_code) for d in cur.description] == [
+            ("pg_sleep", 2278),
+            ("?column?", 23),
+        ]
+        assert cur.fetchall() == [("", 1)]
+        cur.execute("select pg_sleep(null)")
+        assert cur.fetchall() == [(None,)]
+        with pytest.raises(psycopg.errors.InvalidTextRepresentation) as ei:
+            cur.execute("select pg_sleep('x')")
+        assert str(ei.value).startswith('invalid input syntax for type double precision: "x"')
+        with conn.cursor(binary=True) as bcur:
+            bcur.execute("select pg_sleep(0)")
+            assert bcur.fetchall() == [(b"",)]
+        # A false WHERE drops the row without waiting.
+        started = time.monotonic()
+        cur.execute("select pg_sleep(5) where false")
+        assert cur.fetchall() == []
+        assert time.monotonic() - started < 1
+
+
+def test_crossed_range_inside_an_array_literal_is_a_data_error(home: Path) -> None:
+    """A range element whose bounds cross is 22000 from the range parser, not
+    a malformed-array 22P02: the array literal's structure is fine. Probed
+    PG 16."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        with pytest.raises(psycopg.errors.DataException) as ei:
+            cur.execute("select '{\"[5,1]\"}'::int4range[]")
+        assert str(ei.value).startswith(
+            "range lower bound must be less than or equal to range upper bound"
+        )
+
+
+def test_session_user_value_functions(home: Path) -> None:
+    """`user` / `current_user` / `session_user` / `current_role` answer the
+    role the client connected as (this fixture connects as `test`),
+    `current_catalog` / `current_schema` are `postgres` / `public`, every
+    column is typed `name` (oid 19) and named after its keyword, and the
+    QUOTED form `"user"` is an ordinary (missing) column. Probed PG 16."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "select user, current_user, session_user, current_catalog, current_schema, current_role"
+        )
+        assert [(d.name, d.type_code) for d in cur.description] == [
+            ("user", 19),
+            ("current_user", 19),
+            ("session_user", 19),
+            ("current_catalog", 19),
+            ("current_schema", 19),
+            ("current_role", 19),
+        ]
+        assert cur.fetchall() == [("test", "test", "test", "postgres", "public", "test")]
+        cur.execute("select user as u")
+        assert [(d.name, d.type_code) for d in cur.description] == [("u", 19)]
+        assert cur.fetchall() == [("test",)]
+        with pytest.raises(psycopg.errors.UndefinedColumn) as ei:
+            cur.execute('select "user"')
+        assert str(ei.value).startswith('column "user" does not exist')
+
+
+def test_box_type_casts_and_arrays(home: Path) -> None:
+    """`box` (oid 603, array 1020): every input spelling normalises to
+    `(high),(low)` with the corners re-ordered per coordinate, a NaN lands in
+    the high corner, `box[]` is delimited by `;` rather than `,` (so its
+    elements are never quoted), a text-typed array of boxes IS quoted, a
+    bound text parameter casts, and the errors are PostgreSQL's: 22P02 for
+    a malformed box, 22003 for a coordinate out of float8 range, 42846 for
+    the casts PostgreSQL does not have. Every value probed on PG 16."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "select '(1,2),(3,4)'::box, '((1,2),(3,4))'::box, '1,2,3,4'::box, "
+            "'(1,4),(3,2)'::box, '(1.5,2),(3,4e2)'::box, '(2,3),(nan,1)'::box, "
+            "'(1,2),(3,4)'::box::text, pg_typeof('(1,2),(3,4)'::box)"
+        )
+        assert [(d.name, d.type_code) for d in cur.description] == [
+            ("box", 603),
+            ("box", 603),
+            ("box", 603),
+            ("box", 603),
+            ("box", 603),
+            ("box", 603),
+            ("text", 25),
+            ("pg_typeof", 2206),
+        ]
+        assert cur.fetchall() == [
+            (
+                "(3,4),(1,2)",
+                "(3,4),(1,2)",
+                "(3,4),(1,2)",
+                "(3,4),(1,2)",
+                "(3,400),(1.5,2)",
+                "(NaN,3),(2,1)",
+                "(3,4),(1,2)",
+                "box",
+            )
+        ]
+        cur.execute(
+            "select array['(1,2),(3,4)'::box, '(5,6),(7,8)'::box], "
+            "array['(1,2),(3,4)'::box, null], "
+            "'{(1,2),(3,4);(5,6),(7,8)}'::box[], '{\"(1,2),(3,4)\"}'::box[], "
+            "array['(1,2),(3,4)'::box]::text[], pg_typeof(array['(1,2),(3,4)'::box])"
+        )
+        assert [(d.name, d.type_code) for d in cur.description] == [
+            ("array", 1020),
+            ("array", 1020),
+            ("box", 1020),
+            ("box", 1020),
+            ("array", 1009),
+            ("pg_typeof", 2206),
+        ]
+        assert cur.fetchall() == [
+            (
+                ["(3,4),(1,2)", "(7,8),(5,6)"],
+                ["(3,4),(1,2)", None],
+                ["(3,4),(1,2)", "(7,8),(5,6)"],
+                ["(3,4),(1,2)"],
+                ["(3,4),(1,2)"],
+                "box[]",
+            )
+        ]
+        # The raw wire text of a box[] uses the `;` delimiter, unquoted.
+        cur.execute("select '{(1,2),(3,4);(5,6),(7,8)}'::box[]::text")
+        assert cur.fetchall() == [("{(3,4),(1,2);(7,8),(5,6)}",)]
+        cur.execute("select %s::box", ("(1,2),(3,4)",))
+        assert [(d.name, d.type_code) for d in cur.description] == [("box", 603)]
+        assert cur.fetchall() == [("(3,4),(1,2)",)]
+        # psycopg dumps a text list with `,` -- which is not box[]'s
+        # delimiter -- so the literal is malformed, on PostgreSQL too.
+        with pytest.raises(psycopg.errors.InvalidTextRepresentation) as ei:
+            cur.execute("select %s::box[]", (["(1,2),(3,4)", "(5,6),(7,8)"],))
+        assert str(ei.value).startswith('malformed array literal: "{"(1,2),(3,4)","(5,6),(7,8)"}"')
+        for bad in ("(1,2),(3)", "(1,2),(3,4),(5,6)", "x", "(1,2)", "((1,2),(3,4)"):
+            with pytest.raises(psycopg.errors.InvalidTextRepresentation) as ei:
+                cur.execute("select %s::box", (bad,))
+            assert str(ei.value).startswith(f'invalid input syntax for type box: "{bad}"')
+        with pytest.raises(psycopg.errors.NumericValueOutOfRange) as ei:
+            cur.execute("select '(1e400,2),(3,4)'::box")
+        assert str(ei.value).startswith('"1e400" is out of range for type double precision')
+        with pytest.raises(psycopg.errors.CannotCoerce) as ei:
+            cur.execute("select 5::box")
+        assert str(ei.value).startswith("cannot cast type integer to box")
+        with pytest.raises(psycopg.errors.CannotCoerce) as ei:
+            cur.execute("select '(1,2),(3,4)'::box::float8")
+        assert str(ei.value).startswith("cannot cast type box to double precision")
+
+
+def test_float8_text_is_float8out(home: Path) -> None:
+    """A double's text form is PostgreSQL's `float8out` -- shortest round-trip
+    digits, exponent form outside 1e-4..1e15 with a two-digit signed
+    exponent, `Infinity` / `-Infinity` / `NaN`, a signed `-0` -- in a column,
+    in a cast and inside a `float8[]`. A `float8` with a numeric operand is
+    float8 arithmetic, unary minus keeps a double's signed zero, and numeric
+    has no negative zero at all. Every value probed on PG 16."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "select 1e20::float8::text, 1e-7::float8::text, 1e15::float8::text, "
+            "1e14::float8::text, 0.00001::float8::text, 0.0001::float8::text, "
+            "'inf'::float8::text, '-inf'::float8::text, 'nan'::float8::text, "
+            "1.5::float8::text, 2::float8::text, 123456789012345678::float8::text, "
+            "(0.1::float8 + 0.2)::text"
+        )
+        assert cur.fetchall() == [
+            (
+                "1e+20",
+                "1e-07",
+                "1e+15",
+                "100000000000000",
+                "1e-05",
+                "0.0001",
+                "Infinity",
+                "-Infinity",
+                "NaN",
+                "1.5",
+                "2",
+                "1.2345678901234568e+17",
+                "0.30000000000000004",
+            )
+        ]
+        cur.execute(
+            "select array[1e20::float8, 0.5]::text, array[1.5::float8, 2]::text, "
+            "array[1e20::float8, 0.5], array[1.5::float8, 2]"
+        )
+        assert [(d.name, d.type_code) for d in cur.description] == [
+            ("array", 25),
+            ("array", 25),
+            ("array", 1022),
+            ("array", 1022),
+        ]
+        assert cur.fetchall() == [("{1e+20,0.5}", "{1.5,2}", [1e20, 0.5], [1.5, 2.0])]
+        cur.execute(
+            "select 0.1::float8 + 0.2, 1.5::numeric + 1::float8, 2::float8 * 1.5, 1.5 / 2::float8"
+        )
+        assert [(d.name, d.type_code) for d in cur.description] == [
+            ("?column?", 701),
+            ("?column?", 701),
+            ("?column?", 701),
+            ("?column?", 701),
+        ]
+        assert cur.fetchall() == [(0.30000000000000004, 2.5, 3.0, 0.75)]
+        cur.execute(
+            "select (-(0.0::float8))::text, (-0.0::float8)::text, ('-0'::float8)::text, "
+            "(- 0.0)::text, (-0.00e3)::text, (0.0 - 0.0)::text, 0.00e3::text"
+        )
+        assert cur.fetchall() == [("-0", "-0", "-0", "0.0", "0", "0.0", "0")]
+
+
+def test_constant_select_columns_are_named_as_postgresql_names_them(home: Path) -> None:
+    """A FROM-less select names an unaliased cast after its target type's
+    catalog name (`int4`, `float8`, `bpchar`, `numeric`, `char`), a nested
+    cast after the OUTER type, the constructor keywords after themselves
+    (`array`, `row`, `coalesce`, `greatest`, `least`, `nullif`), a cast of a
+    call after the call, and everything else `?column?`. Probed PG 16."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "select array[1], row(1), coalesce(1), greatest(1,2), least(1), "
+            "('1'::text)::int8, -1::int, 1 + 1, nullif(1,2), not true, "
+            "true and false, 1 = any(array[1]), (1), ((1::int)), "
+            "1::double precision, 'a'::char(2), 1::decimal, '1'::\"char\", "
+            "cast(1 as int), abs(-1)::int8"
+        )
+        assert [d.name for d in cur.description] == [
+            "array",
+            "row",
+            "coalesce",
+            "greatest",
+            "least",
+            "int8",
+            "?column?",
+            "?column?",
+            "nullif",
+            "?column?",
+            "?column?",
+            "?column?",
+            "?column?",
+            "int4",
+            "float8",
+            "bpchar",
+            "numeric",
+            "char",
+            "int4",
+            "abs",
+        ]
+
+
+def test_boolean_casts_exist_only_for_integer_and_text(home: Path) -> None:
+    """`boolean` has casts from `integer` and text and to `integer`; every
+    other numeric, temporal or integer-width pairing is 42846 `cannot cast
+    type X to Y` (a `1.5::bool` used to be a 22P02 parse failure). The source
+    type is what decides -- `'2021-01-01'::bool` is the 22P02 text failure
+    while `'2021-01-01'::date::bool` is 42846 -- and a NULL casts through the
+    same rules. Probed PG 16."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "select 1::bool, 0::bool, 2::bool, 'yes'::bool, 't'::bool::int, "
+            "1::bool::int, false::int, true::int4"
+        )
+        assert cur.fetchone() == (True, False, True, True, 1, 1, 0, 1)
+        assert [d.type_code for d in cur.description] == [16, 16, 16, 16, 23, 23, 23, 23]
+        for sql, message in [
+            ("select 1.5::bool", "cannot cast type numeric to boolean"),
+            ("select 1::int8::bool", "cannot cast type bigint to boolean"),
+            ("select 1::int2::bool", "cannot cast type smallint to boolean"),
+            ("select 1.5::float8::bool", "cannot cast type double precision to boolean"),
+            ("select '2021-01-01'::date::bool", "cannot cast type date to boolean"),
+            ("select null::date::bool", "cannot cast type date to boolean"),
+            ("select true::int8", "cannot cast type boolean to bigint"),
+            ("select true::int2", "cannot cast type boolean to smallint"),
+        ]:
+            with pytest.raises(psycopg.errors.CannotCoerce) as ei:
+                cur.execute(sql)
+            assert str(ei.value).startswith(message), sql
+        with pytest.raises(psycopg.errors.InvalidTextRepresentation) as ei:
+            cur.execute("select '2021-01-01'::bool")
+        assert str(ei.value).startswith('invalid input syntax for type boolean: "2021-01-01"')

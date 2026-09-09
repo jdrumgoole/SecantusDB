@@ -376,6 +376,7 @@ pub trait ExtendedQueryHandler: Send + Sync {
             let fetch_result = portal.fetch(max_rows).await?;
             let mut response = fetch_result.response;
             let command_tag = response.command_tag().to_owned();
+            let tag_counts_rows = response.tag_counts_rows;
             let mut row_count = 0;
             while let Some(row) = response.data_rows().next().await {
                 client.feed(PgWireBackendMessage::DataRow(row?)).await?;
@@ -386,7 +387,7 @@ pub trait ExtendedQueryHandler: Send + Sync {
                     .send(PgWireBackendMessage::PortalSuspended(PortalSuspended))
                     .await?;
             } else {
-                let tag = Tag::new(&command_tag).with_rows(row_count);
+                let tag = QueryResponse::complete_tag(&command_tag, tag_counts_rows, row_count);
                 client
                     .send(PgWireBackendMessage::CommandComplete(tag.into()))
                     .await?;
@@ -541,6 +542,13 @@ pub trait ExtendedQueryHandler: Send + Sync {
             })
             .collect::<Vec<Type>>();
 
+        // The default parser cannot tell "no result set" from "no columns";
+        // keep the historical reading, where no fields means NoData.
+        if result_schema.is_empty() {
+            return Ok(DescribeStatementResponse::no_data_with_parameters(
+                param_types,
+            ));
+        }
         Ok(DescribeStatementResponse::new(param_types, result_schema))
     }
 
@@ -561,6 +569,9 @@ pub trait ExtendedQueryHandler: Send + Sync {
 
         let result_schema =
             query_parser.get_result_schema(stmt, Some(&target.result_column_format))?;
+        if result_schema.is_empty() {
+            return Ok(DescribePortalResponse::no_data());
+        }
         Ok(DescribePortalResponse::new(result_schema))
     }
 
@@ -600,6 +611,7 @@ where
 {
     let QueryResponse {
         command_tag,
+        tag_counts_rows,
         row_schema,
         mut data_rows,
     } = results;
@@ -625,7 +637,7 @@ where
         client.feed(PgWireBackendMessage::DataRow(row)).await?;
     }
 
-    let tag = Tag::new(&command_tag).with_rows(rows);
+    let tag = QueryResponse::complete_tag(&command_tag, tag_counts_rows, rows);
     client
         .feed(PgWireBackendMessage::CommandComplete(tag.into()))
         .await?;
@@ -645,6 +657,7 @@ where
     PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
 {
     let command_tag = results.command_tag().to_string();
+    let tag_counts_rows = results.tag_counts_rows;
     let data_rows = results.data_rows();
 
     let mut rows = 0;
@@ -665,7 +678,7 @@ where
             .send(PgWireBackendMessage::PortalSuspended(PortalSuspended))
             .await?;
     } else {
-        let tag = Tag::new(&command_tag).with_rows(rows);
+        let tag = QueryResponse::complete_tag(&command_tag, tag_counts_rows, rows);
         client
             .send(PgWireBackendMessage::CommandComplete(tag.into()))
             .await?;
