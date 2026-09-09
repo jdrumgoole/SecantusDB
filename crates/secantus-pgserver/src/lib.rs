@@ -549,6 +549,36 @@ struct PreparedRecord {
     result_types: Option<Vec<String>>,
 }
 
+/// A base type as the `__sql_base_types__` catalog holds it.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct BaseType {
+    name: String,
+    schema: String,
+    oid: i64,
+    /// False while the type is a SHELL (`CREATE TYPE name` with no body).
+    defined: bool,
+    input: Option<String>,
+    output: Option<String>,
+}
+
+/// A user function as the `__sql_functions__` catalog holds it -- the fields
+/// this server reads, which is the signature and the language.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct UserFunction {
+    name: String,
+    param_types: Vec<String>,
+    return_type: String,
+    language: String,
+}
+
+/// What a type name resolves to when a function declares it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TypeKind {
+    Unknown,
+    Shell,
+    Defined,
+}
+
 struct CopyInState {
     format: secantus_pgplan::CopyFormat,
     table: String,
@@ -691,6 +721,24 @@ impl PgHandler {
     const ENUM_TYPE_OID_BASE: i64 = 65_000;
     const RANGE_COLLECTION: &'static str = "__sql_ranges__";
     const RANGE_TYPE_OID_BASE: i64 = 69_000;
+    /// Base types (`CREATE TYPE name` shells and the `(input = ..., output =
+    /// ...)` types that complete them): a doc `{_id, base, schema, oid,
+    /// defined, input, output}` per type. `_id` is the resolution name, `base`
+    /// the bare name (`pg_type.typname`), `defined` false while it is a shell,
+    /// `input` / `output` the I/O function names once defined. Rust-server
+    /// only: the Python server has no base-type support and does not read
+    /// this collection. Oids in their own band; `typarray` derived as
+    /// `oid + 100_000` like every other user type, and 0 while a shell
+    /// (PostgreSQL mints the array type only at completion).
+    const BASE_TYPE_COLLECTION: &'static str = "__sql_base_types__";
+    const BASE_TYPE_OID_BASE: i64 = 71_000;
+    /// User functions, in the PYTHON server's `__sql_functions__` shape (a
+    /// shared-store contract): `_id: "name/nargs"`, `name`, `nargs`, `params`
+    /// (declared names, `null` when unnamed), `param_types` (type tags),
+    /// `return_tag`, `is_table`, `body`, `language`, `returns_trigger`. The
+    /// Rust server writes only `language: "internal"` wrappers here (a base
+    /// type's I/O functions) and never runs them.
+    const FUNCTION_COLLECTION: &'static str = "__sql_functions__";
     const USER_TYPE_ARRAY_OID_OFFSET: i64 = secantus_pgplan::USER_TYPE_ARRAY_OID_OFFSET;
     /// A custom range's auto-created multirange type gets `range_oid + this`,
     /// and the multirange's own array type `multirange_oid + array offset`.
@@ -761,6 +809,15 @@ impl PgHandler {
             })
             .collect();
         secantus_pgplan::set_user_multiranges(multiranges);
+        // Base types (shell or defined) resolve by name for casts and regtype;
+        // the planner refuses a cast to a shell and hides it from to_regtype.
+        let base_types: Vec<(String, i64, bool)> = self
+            .base_types()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|b| (Self::type_resolution(&b.schema, &b.name), b.oid, b.defined))
+            .collect();
+        secantus_pgplan::set_user_base_types(base_types);
     }
 
     /// The name a user type resolves under: its bare name in `public` (on the
@@ -814,6 +871,13 @@ impl PgHandler {
         if let Some(ty) = self.user_range_wire_type(pg_type) {
             return Some(ty);
         }
+        // A base type reports its own oid (and its array the derived typarray
+        // oid, `Kind::Array(element)`), so a client that registered a dumper /
+        // loader on `TypeInfo.fetch`'s oid sees it come back. The value goes
+        // out as its text form in either cursor format.
+        if let Some(ty) = self.user_base_wire_type(pg_type) {
+            return Some(ty);
+        }
         // A composite type reports its own oid so a client that ran
         // `register_composite` fires its loader. The type carries
         // `Kind::Composite` (its declared fields, resolved to their own wire
@@ -839,6 +903,35 @@ impl PgHandler {
             .iter()
             .find(|(schema, name, _, _)| Self::type_resolution(schema, name) == pg_type)?;
         self.composite_type(schema, bare, *oid, fields)
+    }
+
+    /// The wire `Type` for a DEFINED base type or its array, by resolution
+    /// name (`a-b`, `a-b[]`). A shell has no values, so it has no wire type.
+    fn user_base_wire_type(&self, pg_type: &str) -> Option<Type> {
+        let (element, is_array) = match pg_type.strip_suffix("[]") {
+            Some(e) => (e, true),
+            None => (pg_type, false),
+        };
+        let base = self
+            .base_types()
+            .ok()?
+            .into_iter()
+            .find(|b| b.defined && Self::type_resolution(&b.schema, &b.name) == element)?;
+        let scalar = Type::new(
+            base.name.clone(),
+            u32::try_from(base.oid).ok()?,
+            postgres_types::Kind::Simple,
+            base.schema.clone(),
+        );
+        if !is_array {
+            return Some(scalar);
+        }
+        Some(Type::new(
+            format!("_{}", base.name),
+            u32::try_from(base.oid + Self::USER_TYPE_ARRAY_OID_OFFSET).ok()?,
+            postgres_types::Kind::Array(scalar),
+            base.schema,
+        ))
     }
 
     /// The wire `Type` for a custom range, its multirange companion, or an
@@ -954,6 +1047,17 @@ impl PgHandler {
                 .find(|(_, _, o, _)| *o + Self::USER_TYPE_ARRAY_OID_OFFSET == oid_i)
             {
                 return Some(format!("{}[]", Self::type_resolution(schema, name)));
+            }
+        }
+        if let Ok(bs) = self.base_types() {
+            for b in &bs {
+                let resolution = Self::type_resolution(&b.schema, &b.name);
+                if b.oid == oid_i {
+                    return Some(resolution);
+                }
+                if b.oid + Self::USER_TYPE_ARRAY_OID_OFFSET == oid_i {
+                    return Some(format!("{resolution}[]"));
+                }
             }
         }
         // A custom range, its multirange companion, and their arrays: the
@@ -1825,6 +1929,76 @@ impl PgHandler {
         Ok(out)
     }
 
+    /// The `__sql_base_types__` catalog, name-sorted. See the constant.
+    fn base_types(&self) -> PgWireResult<Vec<BaseType>> {
+        let mut out = Vec::new();
+        for d in self.type_catalog_docs(Self::BASE_TYPE_COLLECTION)? {
+            out.push(BaseType {
+                name: d.get_str("base").unwrap_or_default().to_string(),
+                schema: d.get_str("schema").unwrap_or("public").to_string(),
+                oid: d
+                    .get_i64("oid")
+                    .or_else(|_| d.get_i32("oid").map(i64::from))
+                    .unwrap_or(0),
+                defined: d.get_bool("defined").unwrap_or(false),
+                input: d.get_str("input").ok().map(str::to_string),
+                output: d.get_str("output").ok().map(str::to_string),
+            });
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// The `__sql_functions__` catalog (the Python server's shape, see the
+    /// constant), name-sorted.
+    fn functions(&self) -> PgWireResult<Vec<UserFunction>> {
+        let mut out = Vec::new();
+        for d in self.type_catalog_docs(Self::FUNCTION_COLLECTION)? {
+            let strings = |key: &str| -> Vec<String> {
+                d.get_array(key)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .map(|v| v.as_str().unwrap_or_default().to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            out.push(UserFunction {
+                name: d.get_str("name").unwrap_or_default().to_string(),
+                param_types: strings("param_types"),
+                return_type: d.get_str("return_tag").unwrap_or_default().to_string(),
+                language: d.get_str("language").unwrap_or_default().to_string(),
+            });
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// A function's signature as PostgreSQL prints it in messages:
+    /// `invin(cstring)`, `invout("a-b")` -- each argument type by its display
+    /// name, a user type quoted as an identifier.
+    fn function_signature(&self, f: &UserFunction) -> String {
+        let args: Vec<String> = f
+            .param_types
+            .iter()
+            .map(|t| self.display_type_name(t))
+            .collect();
+        format!("{}({})", f.name, args.join(", "))
+    }
+
+    /// A type name as PostgreSQL displays it: a builtin by its display name
+    /// (`integer`), a user type quoted when its spelling needs it (`"a-b"`).
+    fn display_type_name(&self, name: &str) -> String {
+        if secantus_pgplan::pgtypes::oid_of_name(name).is_some()
+            || name == "cstring"
+            || name.ends_with("[]")
+        {
+            return secantus_pgplan::display_type(name);
+        }
+        secantus_pgplan::scalar::quote_identifier(name)
+    }
+
     /// A type name's oid, resolving BUILTINS first, then user types
     /// (composites, enums, ranges). A composite field whose type is itself a
     /// user type -- `CREATE TYPE t AS (sub other_composite)` -- resolves here;
@@ -1848,7 +2022,151 @@ impl PgHandler {
                 return Some(*oid);
             }
         }
+        if let Ok(bs) = self.base_types() {
+            if let Some(b) = bs.iter().find(|b| b.name == name) {
+                return Some(b.oid);
+            }
+        }
         None
+    }
+
+    /// Mint the next base-type oid -- the range minting rule, base 71000.
+    fn mint_base_type_oid(&self) -> PgWireResult<i64> {
+        self.mint_oid_outside_transaction(|| {
+            let existing = self.base_types()?;
+            Ok(match existing.iter().map(|b| b.oid).max() {
+                Some(taken) => {
+                    (Self::BASE_TYPE_OID_BASE + existing.len() as i64 - 1).max(taken) + 1
+                }
+                None => Self::BASE_TYPE_OID_BASE,
+            })
+        })
+    }
+
+    /// Is `name` taken by ANY type in the default search_path -- an enum, a
+    /// composite, a range, a base type (shell or not), or a builtin? The
+    /// 42710 `type "x" already exists` gate every CREATE TYPE shares.
+    fn type_name_taken(&self, name: &str) -> PgWireResult<bool> {
+        Ok(self.composites()?.iter().any(|(n, _, _)| n == name)
+            || self.enums()?.iter().any(|(n, _, _)| n == name)
+            || self.ranges()?.iter().any(|(n, _, _)| n == name)
+            || self.base_types()?.iter().any(|b| b.name == name)
+            || secantus_pgplan::pgtypes::oid_of_name(name).is_some())
+    }
+
+    /// Queue a NOTICE for the statement in flight.
+    fn notice(&self, sqlstate: &str, message: String, detail: Option<String>) {
+        let mut info = ErrorInfo::new("NOTICE".into(), sqlstate.into(), message);
+        info.detail = detail;
+        self.pending_notices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(info);
+    }
+
+    /// PostgreSQL's CASCADE notice: one dependent is named in the message
+    /// (`drop cascades to function shin(cstring)`); two or more are counted
+    /// there and listed one per DETAIL line (measured on 16).
+    fn cascade_notice(&self, descs: &[String]) {
+        match descs {
+            [] => {}
+            [one] => self.notice("00000", format!("drop cascades to {one}"), None),
+            many => {
+                let lines: Vec<String> = many
+                    .iter()
+                    .map(|d| format!("drop cascades to {d}"))
+                    .collect();
+                self.notice(
+                    "00000",
+                    format!("drop cascades to {} other objects", many.len()),
+                    Some(lines.join("\n")),
+                );
+            }
+        }
+    }
+
+    /// The base type (shell or defined) resolving under `key`
+    /// (`type_resolution` form), if any.
+    fn base_type_named(&self, key: &str) -> PgWireResult<Option<BaseType>> {
+        Ok(self
+            .base_types()?
+            .into_iter()
+            .find(|b| Self::type_resolution(&b.schema, &b.name) == key))
+    }
+
+    /// The catalog key a function's declared parameter / return type is
+    /// recorded under: the planner's canonical spelling, with an array
+    /// suffix kept as written.
+    fn function_type_key(&self, declared: &str) -> PgWireResult<String> {
+        Ok(declared.to_string())
+    }
+
+    /// Whether a type name is defined, a shell, or nothing at all. An array
+    /// (`t[]`) is as defined as its element type.
+    fn type_kind(&self, key: &str) -> PgWireResult<TypeKind> {
+        let element = key.strip_suffix("[]").unwrap_or(key);
+        if element == "cstring"
+            || element == "void"
+            || element == "trigger"
+            || element == "record"
+            || secantus_pgplan::pgtypes::oid_of_name(element).is_some()
+        {
+            return Ok(TypeKind::Defined);
+        }
+        if let Some(b) = self.base_type_named(element)? {
+            return Ok(if b.defined {
+                TypeKind::Defined
+            } else {
+                TypeKind::Shell
+            });
+        }
+        if self.composites()?.iter().any(|(n, _, _)| n == element)
+            || self.enums()?.iter().any(|(n, _, _)| n == element)
+            || self.ranges()?.iter().any(|(n, _, _)| n == element)
+        {
+            return Ok(TypeKind::Defined);
+        }
+        Ok(TypeKind::Unknown)
+    }
+
+    /// The built-ins a `LANGUAGE internal` wrapper may name: every builtin
+    /// type's `<name>in` / `<name>out` pair plus the array pair. Anything
+    /// else is PostgreSQL's 42883 `there is no built-in function named`.
+    fn is_builtin_function(body: &str) -> bool {
+        if body == "array_in" || body == "array_out" {
+            return true;
+        }
+        secantus_pgplan::pgtypes::BUILTIN_TYPES
+            .iter()
+            .any(|(name, _, _)| body == format!("{name}in") || body == format!("{name}out"))
+    }
+
+    /// Insert one catalog doc and note it for the open transaction.
+    fn insert_type_doc(
+        &self,
+        collection: &'static str,
+        id: &str,
+        doc: Document,
+    ) -> PgWireResult<()> {
+        let bytes =
+            bson::to_vec(&doc).map_err(|e| Self::storage_err("could not encode the catalog", e))?;
+        self.storage
+            .insert(self.db(), collection, vec![bytes], true)
+            .map_err(|e| Self::storage_err("could not record the catalog", e))?;
+        self.note_uncommitted_type(collection, id, Some(doc));
+        Ok(())
+    }
+
+    /// Delete one catalog doc by `_id` and tombstone it for the open
+    /// transaction.
+    fn delete_type_doc(&self, collection: &'static str, id: &str) -> PgWireResult<()> {
+        self.ensure_collection(collection)?;
+        let filter = bson::doc! {"_id": id};
+        self.storage
+            .delete_matching(self.db(), collection, &filter, 0, &Document::new(), None)
+            .map_err(|e| Self::storage_err("could not drop the catalog row", e))?;
+        self.note_uncommitted_type(collection, id, None);
+        Ok(())
     }
 
     /// Mint an enum / composite oid the way PostgreSQL mints an OID: from a
@@ -2258,6 +2576,26 @@ impl PgHandler {
                     mr.insert(def.field_of("typdelim").expect("column"), ",");
                     mr.insert(def.field_of("typrelid").expect("column"), Bson::Int64(0));
                     rows.push(mr);
+                }
+                // Base types: `typarray` is 0 while the type is a SHELL --
+                // PostgreSQL mints the array type only when the full CREATE
+                // TYPE completes it (measured on 16) -- and derived after.
+                for b in self.base_types().ok()? {
+                    let mut d = Document::new();
+                    d.insert(def.field_of("typname").expect("column"), b.name);
+                    d.insert(def.field_of("oid").expect("column"), Bson::Int64(b.oid));
+                    let typarray = if b.defined {
+                        b.oid + Self::USER_TYPE_ARRAY_OID_OFFSET
+                    } else {
+                        0
+                    };
+                    d.insert(
+                        def.field_of("typarray").expect("column"),
+                        Bson::Int64(typarray),
+                    );
+                    d.insert(def.field_of("typdelim").expect("column"), ",");
+                    d.insert(def.field_of("typrelid").expect("column"), Bson::Int64(0));
+                    rows.push(d);
                 }
                 rows
             }
@@ -3770,10 +4108,20 @@ impl PgHandler {
             Statement::CreateComposite { .. } => vec![Self::COMPOSITE_COLLECTION.to_string()],
             Statement::CreateEnum { .. } => vec![Self::ENUM_COLLECTION.to_string()],
             Statement::CreateRange { .. } => vec![Self::RANGE_COLLECTION.to_string()],
+            Statement::CreateShellType { .. } | Statement::CreateBaseType { .. } => {
+                vec![Self::BASE_TYPE_COLLECTION.to_string()]
+            }
+            Statement::CreateFunction { .. } => vec![Self::FUNCTION_COLLECTION.to_string()],
+            Statement::DropFunction { .. } => vec![
+                Self::FUNCTION_COLLECTION.to_string(),
+                Self::BASE_TYPE_COLLECTION.to_string(),
+            ],
             Statement::DropType { .. } => vec![
                 Self::ENUM_COLLECTION.to_string(),
                 Self::COMPOSITE_COLLECTION.to_string(),
                 Self::RANGE_COLLECTION.to_string(),
+                Self::BASE_TYPE_COLLECTION.to_string(),
+                Self::FUNCTION_COLLECTION.to_string(),
             ],
             _ => Vec::new(),
         };
@@ -5601,6 +5949,20 @@ impl PgHandler {
                     );
                     return Err(PgWireError::UserError(Box::new(info)));
                 }
+                // A column may not be typed as a SHELL: 42704 `is only a
+                // shell` (measured on 16), the same refusal a cast gets.
+                for col in &def.columns {
+                    let element = col.pg_type.strip_suffix("[]").unwrap_or(&col.pg_type);
+                    if let Some(base) = self.base_type_named(element)? {
+                        if !base.defined {
+                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".into(),
+                                "42704".into(), // undefined_object
+                                format!("type \"{}\" is only a shell", base.name),
+                            ))));
+                        }
+                    }
+                }
                 // A FOREIGN KEY to another table names its PRIMARY KEY (the
                 // planner settled self-references, which need no lookup).
                 for fk in &mut def.foreign_keys {
@@ -6027,6 +6389,427 @@ impl PgHandler {
                 Ok(vec![Response::Execution(Tag::new("CREATE TYPE"))])
             }
 
+            Statement::CreateShellType { name, schema } => {
+                // `CREATE TYPE "a-b";` -- a shell: a pg_type row with
+                // typisdefined false, typtype `p`, typarray 0 (measured on
+                // 16). It exists so `CREATE FUNCTION ... RETURNS "a-b"` can
+                // name it; a value cannot be cast to it until the full
+                // CREATE TYPE completes it.
+                let schema_name = schema.clone().unwrap_or_else(|| "public".to_string());
+                let id_key = Self::type_resolution(&schema_name, &name);
+                let taken = self.base_type_named(&id_key)?.is_some()
+                    || (schema.is_none() && self.type_name_taken(&name)?);
+                if taken {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42710".into(), // duplicate_object
+                        format!("type \"{name}\" already exists"),
+                    ))));
+                }
+                self.ensure_collection(Self::BASE_TYPE_COLLECTION)?;
+                let oid = self.mint_base_type_oid()?;
+                let doc = bson::doc! {
+                    "_id": &id_key,
+                    "base": &name,
+                    "schema": &schema_name,
+                    "oid": oid,
+                    "defined": false,
+                };
+                self.insert_type_doc(Self::BASE_TYPE_COLLECTION, &id_key, doc)?;
+                Ok(vec![Response::Execution(Tag::new("CREATE TYPE"))])
+            }
+
+            Statement::CreateBaseType {
+                name,
+                schema,
+                input,
+                output,
+            } => {
+                // The full form completes a shell. Every refusal below is
+                // PostgreSQL 16's, in its order: the shell must exist
+                // (42710 + hint), both I/O functions must be named (42P17),
+                // each must exist with the exact signature (42883), and each
+                // must return the right type (42P17).
+                let schema_name = schema.clone().unwrap_or_else(|| "public".to_string());
+                let id_key = Self::type_resolution(&schema_name, &name);
+                let quoted = secantus_pgplan::scalar::quote_identifier(&name);
+                let shell = match self.base_type_named(&id_key)? {
+                    Some(b) if b.defined => {
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".into(),
+                            "42710".into(),
+                            format!("type \"{name}\" already exists"),
+                        ))));
+                    }
+                    Some(b) => b,
+                    None => {
+                        if schema.is_none() && self.type_name_taken(&name)? {
+                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".into(),
+                                "42710".into(),
+                                format!("type \"{name}\" already exists"),
+                            ))));
+                        }
+                        // 42710 (not 42704) with a hint: measured on 16.
+                        let mut info = ErrorInfo::new(
+                            "ERROR".into(),
+                            "42710".into(),
+                            format!("type \"{name}\" does not exist"),
+                        );
+                        info.hint = Some(
+                            "Create the type as a shell type, then create its I/O \
+                             functions, then do a full CREATE TYPE."
+                                .to_string(),
+                        );
+                        return Err(PgWireError::UserError(Box::new(info)));
+                    }
+                };
+                let Some(input) = input else {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42P17".into(), // invalid_object_definition
+                        "type input function must be specified".into(),
+                    ))));
+                };
+                let Some(output) = output else {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42P17".into(),
+                        "type output function must be specified".into(),
+                    ))));
+                };
+                let functions = self.functions()?;
+                let Some(input_fn) = functions
+                    .iter()
+                    .find(|f| f.name == input && f.param_types == ["cstring"])
+                else {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42883".into(), // undefined_function
+                        format!("function {input}(cstring) does not exist"),
+                    ))));
+                };
+                if input_fn.return_type != id_key {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42P17".into(),
+                        format!("type input function {input} must return type {quoted}"),
+                    ))));
+                }
+                let Some(output_fn) = functions
+                    .iter()
+                    .find(|f| f.name == output && f.param_types == [id_key.clone()])
+                else {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42883".into(),
+                        format!("function {output}({quoted}) does not exist"),
+                    ))));
+                };
+                if output_fn.return_type != "cstring" {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42P17".into(),
+                        format!("type output function {output} must return type cstring"),
+                    ))));
+                }
+                let doc = bson::doc! {
+                    "_id": &id_key,
+                    "base": &name,
+                    "schema": &schema_name,
+                    "oid": shell.oid,
+                    "defined": true,
+                    "input": &input,
+                    "output": &output,
+                };
+                self.delete_type_doc(Self::BASE_TYPE_COLLECTION, &id_key)?;
+                self.insert_type_doc(Self::BASE_TYPE_COLLECTION, &id_key, doc)?;
+                Ok(vec![Response::Execution(Tag::new("CREATE TYPE"))])
+            }
+
+            Statement::CreateFunction {
+                name,
+                replace,
+                arg_types,
+                return_type,
+                body,
+                volatility: _,
+            } => {
+                // A `LANGUAGE internal` wrapper over a built-in: a catalog
+                // row only, which is all a base type's `input = ` / `output =`
+                // options resolve against. Nothing here ever CALLS it -- a
+                // real PostgreSQL 16 crashed its backend when a wrapper
+                // declared over the wrong C signature was called, so
+                // callability is not something to imitate.
+                if !Self::is_builtin_function(&body) {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42883".into(), // undefined_function
+                        format!("there is no built-in function named \"{body}\""),
+                    ))));
+                }
+                // The return type: an unknown name becomes a new shell with
+                // a notice (how PostgreSQL lets `RETURNS newtype` precede
+                // `CREATE TYPE newtype`); a shell is accepted with a notice.
+                // Both notices name the type UNQUOTED (TypeNameToString on
+                // 16), unlike the 42704 message which quotes it.
+                let return_key = self.function_type_key(&return_type)?;
+                match self.type_kind(&return_key)? {
+                    TypeKind::Unknown => {
+                        self.ensure_collection(Self::BASE_TYPE_COLLECTION)?;
+                        let oid = self.mint_base_type_oid()?;
+                        let (schema_name, bare) = match return_type.split_once('.') {
+                            Some((s, n)) => (s.to_string(), n.to_string()),
+                            None => ("public".to_string(), return_type.clone()),
+                        };
+                        let doc = bson::doc! {
+                            "_id": &return_key,
+                            "base": &bare,
+                            "schema": &schema_name,
+                            "oid": oid,
+                            "defined": false,
+                        };
+                        self.insert_type_doc(Self::BASE_TYPE_COLLECTION, &return_key, doc)?;
+                        self.notice(
+                            "42704",
+                            format!("type \"{return_type}\" is not yet defined"),
+                            Some("Creating a shell type definition.".to_string()),
+                        );
+                    }
+                    TypeKind::Shell => self.notice(
+                        "42809",
+                        format!("return type {return_type} is only a shell"),
+                        None,
+                    ),
+                    TypeKind::Defined => {}
+                }
+                let mut param_types = Vec::with_capacity(arg_types.len());
+                for t in &arg_types {
+                    let key = self.function_type_key(t)?;
+                    match self.type_kind(&key)? {
+                        TypeKind::Unknown => {
+                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".into(),
+                                "42704".into(), // undefined_object
+                                format!("type {t} does not exist"),
+                            ))));
+                        }
+                        TypeKind::Shell => {
+                            self.notice("42809", format!("argument type {t} is only a shell"), None)
+                        }
+                        TypeKind::Defined => {}
+                    }
+                    param_types.push(key);
+                }
+                let id_key = format!("{name}/{}", param_types.len());
+                let functions = self.functions()?;
+                if let Some(existing) = functions.iter().find(|f| f.name == name) {
+                    if existing.param_types == param_types {
+                        if replace {
+                            self.delete_type_doc(Self::FUNCTION_COLLECTION, &id_key)?;
+                        } else {
+                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".into(),
+                                "42723".into(), // duplicate_function
+                                format!(
+                                    "function \"{name}\" already exists with same argument types"
+                                ),
+                            ))));
+                        }
+                    } else if existing.param_types.len() == param_types.len() {
+                        // The shared catalog keys a function on name/arity
+                        // (the Python server's shape), so two overloads at one
+                        // arity cannot both be recorded.
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".into(),
+                            "0A000".into(), // feature_not_supported
+                            format!(
+                                "overloading function \"{name}\" at the same number of \
+                                 arguments is not supported yet"
+                            ),
+                        ))));
+                    }
+                }
+                self.ensure_collection(Self::FUNCTION_COLLECTION)?;
+                let nargs = param_types.len() as i64;
+                let doc = bson::doc! {
+                    "_id": &id_key,
+                    "name": &name,
+                    "nargs": nargs,
+                    "params": vec![Bson::Null; param_types.len()],
+                    "param_types": &param_types,
+                    "return_tag": &return_key,
+                    "is_table": false,
+                    "body": &body,
+                    "language": "internal",
+                    "returns_trigger": false,
+                };
+                self.insert_type_doc(Self::FUNCTION_COLLECTION, &id_key, doc)?;
+                Ok(vec![Response::Execution(Tag::new("CREATE FUNCTION"))])
+            }
+
+            Statement::DropFunction {
+                name,
+                arg_types,
+                if_exists,
+                cascade,
+            } => {
+                let tag = || Ok(vec![Response::Execution(Tag::new("DROP FUNCTION"))]);
+                // Every named argument type must resolve first (measured on
+                // 16: `drop function invout("a-b")` after the type is gone is
+                // 42704 on the TYPE, not 42883 on the function).
+                let mut wanted = None;
+                if let Some(types) = &arg_types {
+                    let mut keys = Vec::with_capacity(types.len());
+                    for t in types {
+                        let key = self.function_type_key(t)?;
+                        if self.type_kind(&key)? == TypeKind::Unknown {
+                            if if_exists {
+                                self.notice(
+                                    "00000",
+                                    format!("type \"{t}\" does not exist, skipping"),
+                                    None,
+                                );
+                                return tag();
+                            }
+                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".into(),
+                                "42704".into(),
+                                format!("type \"{t}\" does not exist"),
+                            ))));
+                        }
+                        keys.push(key);
+                    }
+                    wanted = Some(keys);
+                }
+                let functions = self.functions()?;
+                let candidates: Vec<&UserFunction> =
+                    functions.iter().filter(|f| f.name == name).collect();
+                let target = match &wanted {
+                    Some(keys) => {
+                        let Some(f) = candidates.iter().find(|f| f.param_types == *keys) else {
+                            let probe = UserFunction {
+                                name: name.clone(),
+                                param_types: keys.clone(),
+                                return_type: String::new(),
+                                language: String::new(),
+                            };
+                            let sig = self.function_signature(&probe);
+                            if if_exists {
+                                self.notice(
+                                    "00000",
+                                    format!("function {sig} does not exist, skipping"),
+                                    None,
+                                );
+                                return tag();
+                            }
+                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".into(),
+                                "42883".into(),
+                                format!("function {sig} does not exist"),
+                            ))));
+                        };
+                        (*f).clone()
+                    }
+                    None => match candidates.as_slice() {
+                        [] => {
+                            if if_exists {
+                                self.notice(
+                                    "00000",
+                                    format!("function {name}() does not exist, skipping"),
+                                    None,
+                                );
+                                return tag();
+                            }
+                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".into(),
+                                "42883".into(),
+                                format!("could not find a function named \"{name}\""),
+                            ))));
+                        }
+                        [one] => (*one).clone(),
+                        _ => {
+                            let mut info = ErrorInfo::new(
+                                "ERROR".into(),
+                                "42725".into(), // ambiguous_function
+                                format!("function name \"{name}\" is not unique"),
+                            );
+                            info.hint = Some(
+                                "Specify the argument list to select the function \
+                                 unambiguously."
+                                    .to_string(),
+                            );
+                            return Err(PgWireError::UserError(Box::new(info)));
+                        }
+                    },
+                };
+                let sig = self.function_signature(&target);
+                // A DEFINED base type depends on its I/O functions; and the
+                // type's other I/O function depends on the type, so it goes
+                // too. (A shell has no such dependency: dropping the function
+                // that returns it is plain.)
+                let dependents: Vec<BaseType> = self
+                    .base_types()?
+                    .into_iter()
+                    .filter(|b| {
+                        b.defined
+                            && (b.input.as_deref() == Some(&name)
+                                || b.output.as_deref() == Some(&name))
+                    })
+                    .collect();
+                let mut cascade_descs: Vec<String> = Vec::new();
+                let mut cascade_functions: Vec<String> = Vec::new();
+                for b in &dependents {
+                    let key = Self::type_resolution(&b.schema, &b.name);
+                    let quoted = secantus_pgplan::scalar::quote_identifier(&b.name);
+                    cascade_descs.push(format!("type {quoted}"));
+                    for f in functions.iter().filter(|f| {
+                        f.name != name && (f.param_types.contains(&key) || f.return_type == key)
+                    }) {
+                        cascade_descs.push(format!("function {}", self.function_signature(f)));
+                        cascade_functions.push(format!("{}/{}", f.name, f.param_types.len()));
+                    }
+                }
+                if !dependents.is_empty() && !cascade {
+                    let mut lines = Vec::new();
+                    for b in &dependents {
+                        let key = Self::type_resolution(&b.schema, &b.name);
+                        let quoted = secantus_pgplan::scalar::quote_identifier(&b.name);
+                        lines.push(format!("type {quoted} depends on function {sig}"));
+                        for f in functions.iter().filter(|f| {
+                            f.name != name && (f.param_types.contains(&key) || f.return_type == key)
+                        }) {
+                            lines.push(format!(
+                                "function {} depends on type {quoted}",
+                                self.function_signature(f)
+                            ));
+                        }
+                    }
+                    let mut info = ErrorInfo::new(
+                        "ERROR".into(),
+                        "2BP01".into(), // dependent_objects_still_exist
+                        format!("cannot drop function {sig} because other objects depend on it"),
+                    );
+                    info.detail = Some(lines.join("\n"));
+                    info.hint =
+                        Some("Use DROP ... CASCADE to drop the dependent objects too.".to_string());
+                    return Err(PgWireError::UserError(Box::new(info)));
+                }
+                if !cascade_descs.is_empty() {
+                    self.cascade_notice(&cascade_descs);
+                    for b in &dependents {
+                        let key = Self::type_resolution(&b.schema, &b.name);
+                        self.delete_type_doc(Self::BASE_TYPE_COLLECTION, &key)?;
+                    }
+                    for id in &cascade_functions {
+                        self.delete_type_doc(Self::FUNCTION_COLLECTION, id)?;
+                    }
+                }
+                let id_key = format!("{}/{}", target.name, target.param_types.len());
+                self.delete_type_doc(Self::FUNCTION_COLLECTION, &id_key)?;
+                tag()
+            }
+
             Statement::CreateEnum {
                 name,
                 schema,
@@ -6076,11 +6859,65 @@ impl PgHandler {
                 Ok(vec![Response::Execution(Tag::new("CREATE TYPE"))])
             }
 
-            Statement::DropType { names, if_exists } => {
+            Statement::DropType {
+                names,
+                if_exists,
+                cascade,
+            } => {
                 self.ensure_collection(Self::ENUM_COLLECTION)?;
                 self.ensure_collection(Self::COMPOSITE_COLLECTION)?;
                 self.ensure_collection(Self::RANGE_COLLECTION)?;
                 for name in &names {
+                    // A base type (shell or defined): its I/O functions depend
+                    // on it, so RESTRICT refuses with 2BP01 while any exist
+                    // and CASCADE drops them with a notice (measured on 16).
+                    if let Some(base) = self.base_type_named(name)? {
+                        let quoted = secantus_pgplan::scalar::quote_identifier(&base.name);
+                        let functions = self.functions()?;
+                        let dependents: Vec<&UserFunction> = functions
+                            .iter()
+                            .filter(|f| {
+                                f.param_types.iter().any(|t| t == name) || f.return_type == *name
+                            })
+                            .collect();
+                        if !dependents.is_empty() && !cascade {
+                            let lines: Vec<String> = dependents
+                                .iter()
+                                .map(|f| {
+                                    format!(
+                                        "function {} depends on type {quoted}",
+                                        self.function_signature(f)
+                                    )
+                                })
+                                .collect();
+                            let mut info = ErrorInfo::new(
+                                "ERROR".into(),
+                                "2BP01".into(), // dependent_objects_still_exist
+                                format!(
+                                    "cannot drop type {quoted} because other objects depend on it"
+                                ),
+                            );
+                            info.detail = Some(lines.join("\n"));
+                            info.hint = Some(
+                                "Use DROP ... CASCADE to drop the dependent objects too."
+                                    .to_string(),
+                            );
+                            return Err(PgWireError::UserError(Box::new(info)));
+                        }
+                        if !dependents.is_empty() {
+                            let descs: Vec<String> = dependents
+                                .iter()
+                                .map(|f| format!("function {}", self.function_signature(f)))
+                                .collect();
+                            self.cascade_notice(&descs);
+                            for f in &dependents {
+                                let id = format!("{}/{}", f.name, f.param_types.len());
+                                self.delete_type_doc(Self::FUNCTION_COLLECTION, &id)?;
+                            }
+                        }
+                        self.delete_type_doc(Self::BASE_TYPE_COLLECTION, name)?;
+                        continue;
+                    }
                     // A table's row type goes with the table, not on its own
                     // (measured on 16).
                     if self.row_type_of_table(name)? {
@@ -6142,7 +6979,15 @@ impl PgHandler {
                         self.note_uncommitted_type(Self::RANGE_COLLECTION, name, None);
                     }
                     let removed = from_enum + from_comp + from_range;
-                    if removed == 0 && !if_exists {
+                    if removed == 0 {
+                        if if_exists {
+                            self.notice(
+                                "00000",
+                                format!("type \"{name}\" does not exist, skipping"),
+                                None,
+                            );
+                            continue;
+                        }
                         return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                             "ERROR".into(),
                             "42704".into(), // undefined_object
