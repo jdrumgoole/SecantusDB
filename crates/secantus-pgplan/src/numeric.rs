@@ -245,7 +245,8 @@ fn exact_decimal128(canonical: &str) -> Option<Decimal128> {
     if coefficient.is_empty() {
         coefficient = "0";
     }
-    if coefficient.len() > DECIMAL128_DIGITS || !(DECIMAL128_MIN_EXP..=DECIMAL128_MAX_EXP).contains(&exp)
+    if coefficient.len() > DECIMAL128_DIGITS
+        || !(DECIMAL128_MIN_EXP..=DECIMAL128_MAX_EXP).contains(&exp)
     {
         return None;
     }
@@ -682,8 +683,7 @@ fn div_scale(a: &Dec, b: &Dec) -> u32 {
     let rscale = (16 - qweight * 4)
         .max(i64::from(a.scale))
         .max(i64::from(b.scale))
-        .max(0)
-        .min(1000);
+        .clamp(0, 1000);
     rscale as u32
 }
 

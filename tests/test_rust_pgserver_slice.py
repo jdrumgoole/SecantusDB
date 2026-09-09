@@ -1142,11 +1142,9 @@ def test_numeric_keeps_its_scale(home: Path) -> None:
         assert cur.fetchall() == [(1, Decimal("1.50")), (2, Decimal("0.1"))]
         assert cur.description[1].type_code == 1700
 
-        # Beyond 34 significant digits we refuse rather than round: a quietly
-        # rounded number is a wrong answer, an error is a missing feature.
-        with pytest.raises(psycopg.Error) as exc:
-            cur.execute("SELECT '1.2345678901234567890123456789012345'::numeric")
-        assert exc.value.diag.sqlstate == "22003"
+        # Beyond 34 significant digits is kept exactly, never rounded.
+        cur.execute("SELECT '1.2345678901234567890123456789012345'::numeric")
+        assert cur.fetchone()[0] == Decimal("1.2345678901234567890123456789012345")
 
 
 def test_arrays_round_trip_with_their_own_oids(home: Path) -> None:
@@ -1668,10 +1666,16 @@ def test_decimal_arithmetic_works_and_stays_exact(home: Path) -> None:
         cur.execute("select '12345678901234567890.1'::numeric < '12345678901234567890.2'::numeric")
         assert cur.fetchone()[0] is True
 
-        # Division is refused rather than guessed at: its result scale depends
-        # on the operands' weights in a way this server has not measured.
-        with pytest.raises(psycopg.Error):
-            cur.execute("select 1.5::numeric / 3")
+        # Division follows PostgreSQL's result-scale rule (measured on 16):
+        # at least 16 fractional digits, more when the operands carry them.
+        for expr, want in [
+            ("1.5::numeric / 3", "0.50000000000000000000"),
+            ("1::numeric / 3", "0.33333333333333333333"),
+            ("10::numeric / 4", "2.5000000000000000"),
+            ("100::numeric / 7", "14.2857142857142857"),
+        ]:
+            cur.execute(f"select ({expr})::text")
+            assert cur.fetchone()[0] == want, expr
 
 
 def test_nan_has_a_place_in_the_order(home: Path) -> None:
@@ -6588,3 +6592,144 @@ def test_datetime_array_text_is_not_a_debug_dump(home: Path) -> None:
             "array['1 day'::interval]::text, array['12:00'::time]::text"
         )
         assert cur.fetchone() == ('{"2020-01-01 00:00:00.5"}', '{"1 day"}', "{12:00:00}")
+
+
+_WIDE = Decimal("1.2345678901234567890123456789012345")  # 35 significant digits
+_HUGE = Decimal("1e40")
+
+
+@pytest.mark.parametrize("binary", [False, True], ids=["text", "binary"])
+def test_numeric_wider_than_decimal128_round_trips(home: Path, binary: bool) -> None:
+    """A `numeric` with more than 34 significant digits, or beyond
+    Decimal128's exponent range, round-trips EXACTLY with its display scale
+    -- in the text and the binary formats -- where it used to be refused
+    (22003). Every expectation is PostgreSQL 16's own rendering.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor(binary=binary)
+        conn.execute("create table wn (id int primary key, n numeric)")
+        rows = [
+            (1, _WIDE),
+            (2, _HUGE),
+            (3, Decimal("-99999999999999999999999999999999999.5")),
+            (4, Decimal("123456789012345678901234567890.123456789012345678901234567890")),
+            (5, Decimal("1.000000000000000000000000000000000000000000")),
+            (6, Decimal("1E-7000")),
+            (7, Decimal("1.50")),
+        ]
+        cur.executemany("insert into wn values (%s, %s)", rows)
+        cur.execute("select id, n from wn order by id")
+        assert cur.fetchall() == rows
+        cur.execute("select n::text from wn where id = 5")
+        assert cur.fetchone() == ("1.000000000000000000000000000000000000000000",)
+        cur.execute("select n * 2, n + 0.5, -n, abs(n), round(n, 3) from wn where id = 1")
+        assert cur.fetchone() == (
+            Decimal("2.4691357802469135780246913578024690"),
+            Decimal("1.7345678901234567890123456789012345"),
+            Decimal("-1.2345678901234567890123456789012345"),
+            _WIDE,
+            Decimal("1.235"),
+        )
+        # PostgreSQL's division scale rule, on a wide dividend.
+        cur.execute("select n / 3 from wn where id = 1")
+        assert cur.fetchone() == (Decimal("0.4115226300411522630041152263004115"),)
+        # A computed numeric column is DESCRIBED as numeric (oid 1700), even
+        # when the value is small: `n * 2` was typed int4 and the client's
+        # int loader choked on `3.0`.
+        assert cur.description[0].type_code == 1700
+        # Beyond PostgreSQL's own limits is still refused, never rounded.
+        with pytest.raises(psycopg.errors.NumericValueOutOfRange):
+            cur.execute("select 1e131072::numeric")
+
+
+def test_numeric_wider_than_decimal128_compares_and_sorts_exactly(home: Path) -> None:
+    """Mixed-width rows compare by VALUE in every WHERE operator and in ORDER
+    BY (`1.50` ties `1.5`; the tie breaks on `id`), through a plain column and
+    through a numeric PRIMARY KEY -- the `_id` index -- alike. NaN takes
+    PostgreSQL's place, above infinity. Expectations were produced by
+    PostgreSQL 16 from the same script.
+    """
+    vals = [
+        "-1e40", "-99999999999999999999999999999999999.5", "-100", "-0.5", "0", "0.00",
+        "0.5", "1.50", "1.5", "99999999999999999999999999999999999",
+        "100000000000000000000000000000000000", "1.2345678901234567890123456789012345",
+        "1.234567890123456789012345678901234", "1e40", "NaN", "Infinity", "-Infinity", "42",
+    ]  # fmt: skip
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table wn (id int primary key, n numeric)")
+        cur = conn.cursor()
+        for i, v in enumerate(vals):
+            cur.execute("insert into wn values (%s, %s)", (i, Decimal(v)))
+        cur.execute("insert into wn values (99, null)")
+
+        def ids(sql: str, *args: object) -> list[int]:
+            cur.execute(sql, args)
+            return [r[0] for r in cur.fetchall()]
+
+        assert ids("select id from wn order by n, id") == [
+            16, 0, 1, 2, 3, 4, 5, 6, 12, 11, 7, 8, 17, 9, 10, 13, 15, 14, 99,
+        ]  # fmt: skip
+        assert ids("select id from wn order by n desc, id") == [
+            99, 14, 15, 13, 10, 9, 17, 7, 8, 11, 12, 6, 4, 5, 3, 2, 1, 0, 16,
+        ]  # fmt: skip
+        assert ids("select id from wn where n = %s order by id", _WIDE) == [11]
+        assert ids("select id from wn where n = %s order by id", _HUGE) == [13]
+        assert ids("select id from wn where n = %s order by id", Decimal("1.50")) == [7, 8]
+        assert ids("select id from wn where n > %s order by id", _WIDE) == [
+            7, 8, 9, 10, 13, 14, 15, 17,
+        ]  # fmt: skip
+        assert ids("select id from wn where n < %s order by id", _WIDE) == [
+            0, 1, 2, 3, 4, 5, 6, 12, 16,
+        ]  # fmt: skip
+        assert ids("select id from wn where n >= %s order by id", _HUGE) == [13, 14, 15]
+        assert ids("select id from wn where n <> %s order by id", _HUGE) == [
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17,
+        ]  # fmt: skip
+        assert ids(
+            "select id from wn where n in (%s, %s, %s) order by id",
+            Decimal("1.5"), _HUGE, _WIDE,
+        ) == [7, 8, 11, 13]  # fmt: skip
+        assert ids(
+            "select id from wn where n between %s and %s order by id", Decimal("0"), _WIDE
+        ) == [4, 5, 6, 11, 12]
+        # NaN: equal to itself, above infinity; `> NaN` is no row.
+        nan = Decimal("NaN")
+        assert ids("select id from wn where n = %s", nan) == [14]
+        assert ids("select id from wn where n > %s", nan) == []
+        assert ids("select id from wn where n > %s order by id", Decimal("Infinity")) == [14]
+        assert ids("select id from wn where n < %s order by id", nan) == [
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17,
+        ]  # fmt: skip
+        # `sum(numeric)` is exact and keeps the widest input scale.
+        cur.execute("select sum(n), min(n), max(n) from wn where n < 1e100 and n > -1e100")
+        assert cur.fetchone() == (
+            Decimal("99999999999999999999999999999999946.9691357802469135780246913578024685"),
+            Decimal("-1e40"),
+            Decimal("1e40"),
+        )
+        assert cur.description[0].type_code == 1700
+
+        # The same through a numeric PRIMARY KEY, where a wide `_id` is a
+        # document the index keys by its text: equality, range, update and
+        # delete resolve by value, and a duplicate that differs only in its
+        # display scale is still a 23505.
+        conn.execute("create table wpk (n numeric primary key, tag text)")
+        for i, v in enumerate(["-1e40", "1.5", "1e40", str(_WIDE), "NaN"]):
+            cur.execute("insert into wpk values (%s, %s)", (Decimal(v), f"t{i}"))
+        for dup in ("1.50", "1e40", "10000000000000000000000000000000000000000.0", "NaN"):
+            with pytest.raises(psycopg.errors.UniqueViolation):
+                cur.execute("insert into wpk values (%s, 'dup')", (Decimal(dup),))
+        cur.execute("select tag from wpk order by n")
+        assert [r[0] for r in cur.fetchall()] == ["t0", "t3", "t1", "t2", "t4"]
+        cur.execute("select tag from wpk where n = %s", (_HUGE,))
+        assert cur.fetchall() == [("t2",)]
+        cur.execute("select tag from wpk where n > %s order by tag", (Decimal("1.5"),))
+        assert cur.fetchall() == [("t2",), ("t4",)]
+        cur.execute("select tag from wpk where n < %s order by tag", (Decimal("1.5"),))
+        assert cur.fetchall() == [("t0",), ("t3",)]
+        cur.execute("update wpk set tag = 'upd' where n = %s", (_HUGE,))
+        assert cur.rowcount == 1
+        cur.execute("delete from wpk where n = %s", (_WIDE,))
+        assert cur.rowcount == 1
+        cur.execute("select count(*) from wpk")
+        assert cur.fetchone() == (4,)

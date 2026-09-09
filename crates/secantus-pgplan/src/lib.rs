@@ -7282,10 +7282,7 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
                 .and_then(|n| i32::try_from(n).ok())
                 .map(Bson::Int32)
                 .ok_or_else(|| {
-                    Error::NumericOutOfRange(format!(
-                        "integer out of range: \"{}\"",
-                        as_text(v)
-                    ))
+                    Error::NumericOutOfRange(format!("integer out of range: \"{}\"", as_text(v)))
                 }),
             Bson::String(s) => s
                 .trim()
@@ -8572,7 +8569,9 @@ pub(crate) fn compare_constants(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering
                 Bson::Int32(i) => Some(f64::from(*i)),
                 Bson::Int64(i) => Some(*i as f64),
                 Bson::Double(d) => Some(*d),
-                v if is_numeric(v) => numeric_text(v).and_then(|t| numeric::numeric_text_to_f64(&t)),
+                v if is_numeric(v) => {
+                    numeric_text(v).and_then(|t| numeric::numeric_text_to_f64(&t))
+                }
                 _ => None,
             };
             let (x, y) = (f(a)?, f(b)?);
@@ -9672,10 +9671,7 @@ fn needs_numeric_filter(def: &TableDef, field: &str, value: &Bson) -> bool {
         .find(|c| c.field() == field || c.name == field)
         .map(|c| c.pg_type.as_str());
     matches!(declared, Some("numeric" | "decimal"))
-        && matches!(
-            value,
-            Bson::Int32(_) | Bson::Int64(_) | Bson::Decimal128(_)
-        )
+        && matches!(value, Bson::Int32(_) | Bson::Int64(_) | Bson::Decimal128(_))
 }
 
 /// `field <mql_op> value`, exact for a numeric column of either width, or the
@@ -9771,8 +9767,7 @@ fn lower_aexpr(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     // MQL's `$ne` matches a missing-or-null field, so `n <> 1` returned the
     // row whose `n` is NULL. SQL says `NULL <> 1` is NULL, so PostgreSQL
     // excludes it (probed 14). The explicit not-null guard restores that.
-    let mongo_op =
-        op_to_mql(op).ok_or_else(|| Error::Unsupported(format!("operator {op}")))?;
+    let mongo_op = op_to_mql(op).ok_or_else(|| Error::Unsupported(format!("operator {op}")))?;
     Ok(scalar_filter(def, &field, mongo_op, value))
 }
 
@@ -9903,9 +9898,7 @@ fn lower_scalar_array(
         if nonnull.is_empty() {
             return Ok(match_nothing());
         }
-        let numeric = nonnull
-            .iter()
-            .any(|v| needs_numeric_filter(def, &field, v));
+        let numeric = nonnull.iter().any(|v| needs_numeric_filter(def, &field, v));
         if op == "=" && !numeric {
             // Index-friendly and NULL-correct: `$in` excludes a NULL column.
             return Ok(doc! { &field: { "$in": nonnull } });
@@ -9931,9 +9924,7 @@ fn lower_scalar_array(
     if nonnull.is_empty() {
         return Ok(Document::new());
     }
-    let numeric = nonnull
-        .iter()
-        .any(|v| needs_numeric_filter(def, &field, v));
+    let numeric = nonnull.iter().any(|v| needs_numeric_filter(def, &field, v));
     if op == "<>" && !numeric {
         return Ok(doc! { "$and": [
             doc! { &field: { "$nin": nonnull } },
@@ -9965,9 +9956,7 @@ fn lower_in(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
             values.push(v);
         }
     }
-    let numeric = values
-        .iter()
-        .any(|v| needs_numeric_filter(def, &field, v));
+    let numeric = values.iter().any(|v| needs_numeric_filter(def, &field, v));
     if negated {
         if saw_null {
             // `NOT IN` over a list containing NULL is never true.

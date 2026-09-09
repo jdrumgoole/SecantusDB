@@ -2163,7 +2163,7 @@ impl PgHandler {
         }
         let mut seen: Vec<String> = Vec::new();
         for row in rows {
-            let Some(id) = row.get(&pk.field()) else {
+            let Some(id) = row.get(pk.field()) else {
                 continue;
             };
             if !secantus_pgplan::is_numeric(id) {
@@ -2178,8 +2178,7 @@ impl PgHandler {
                 return Ok(Some(id.clone()));
             }
             if wide {
-                let Some(filter) =
-                    secantus_pgplan::numeric::numeric_filter(&pk.field(), "$eq", id)
+                let Some(filter) = secantus_pgplan::numeric::numeric_filter(&pk.field(), "$eq", id)
                 else {
                     continue;
                 };
@@ -6746,7 +6745,9 @@ fn encode_value(enc: &mut DataRowEncoder, v: Option<&Bson>) -> PgWireResult<()> 
         // A numeric wider than Decimal128 is stored as its canonical text
         // inside a marker document (`secantus_pgplan::numeric`).
         Some(v) if secantus_pgplan::is_wide_numeric(v) => enc.encode_field(&Some(
-            secantus_pgplan::numeric_text(v).unwrap_or_default().as_str(),
+            secantus_pgplan::numeric_text(v)
+                .unwrap_or_default()
+                .as_str(),
         )),
         // An array must be handed over as a TYPED vector, not as pre-rendered
         // text: `encode_field` encodes against the column's declared type, so
@@ -6877,9 +6878,9 @@ fn compute_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
                     .filter_map(|v| secantus_pgplan::numeric::numeric_operand_text(v))
                     .collect();
                 if texts.len() == values.len() {
-                    if let Some(total) =
-                        secantus_pgplan::numeric::sum_numeric_texts(texts.iter().map(String::as_str))
-                    {
+                    if let Some(total) = secantus_pgplan::numeric::sum_numeric_texts(
+                        texts.iter().map(String::as_str),
+                    ) {
                         return total;
                     }
                 }

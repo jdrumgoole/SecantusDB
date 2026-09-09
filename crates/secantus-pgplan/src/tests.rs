@@ -941,7 +941,10 @@ fn numeric_wider_than_decimal128_is_stored_exactly() {
             "100000000000000000.00000000000000000",
         ),
         ("SELECT 1e40", "10000000000000000000000000000000000000000"),
-        ("SELECT 1e40 + 0.5", "10000000000000000000000000000000000000000.5"),
+        (
+            "SELECT 1e40 + 0.5",
+            "10000000000000000000000000000000000000000.5",
+        ),
     ] {
         let v = value(sql);
         assert_eq!(numeric_text(&v).as_deref(), Some(want), "for {sql}");
@@ -987,10 +990,17 @@ fn numeric_canonical_text_matches_postgres() {
         ("-inf", "-Infinity"),
         ("Infinity", "Infinity"),
     ] {
-        assert_eq!(canonical_numeric_text(input).unwrap(), want, "for {input:?}");
+        assert_eq!(
+            canonical_numeric_text(input).unwrap(),
+            want,
+            "for {input:?}"
+        );
     }
     for bad in ["", "x", "1_", "_1", "1__0", "1e", "1.2.3", "--1"] {
-        assert!(canonical_numeric_text(bad).is_err(), "{bad:?} should be invalid");
+        assert!(
+            canonical_numeric_text(bad).is_err(),
+            "{bad:?} should be invalid"
+        );
     }
 }
 
@@ -1021,8 +1031,14 @@ fn numeric_sort_key_orders_like_the_numbers() {
         assert!(w[0] < w[1], "{} should sort before {}", w[0], w[1]);
     }
     // Scale is not part of the key: equal values share one key.
-    assert_eq!(numeric::numeric_sort_key("1.50"), numeric::numeric_sort_key("1.5"));
-    assert_eq!(numeric::numeric_sort_key("0.00"), numeric::numeric_sort_key("0"));
+    assert_eq!(
+        numeric::numeric_sort_key("1.50"),
+        numeric::numeric_sort_key("1.5")
+    );
+    assert_eq!(
+        numeric::numeric_sort_key("0.00"),
+        numeric::numeric_sort_key("0")
+    );
 }
 
 /// A wide constant lowers to an exact two-arm filter: the Decimal128 rows
@@ -1052,7 +1068,8 @@ fn wide_numeric_where_lowers_to_bracket_and_key() {
     // `>` on a wide constant: every Decimal128 at or above the bracket's
     // upper neighbour, or a wide row above the key.
     let f = filter("SELECT id FROM w WHERE n > 1.2345678901234567890123456789012345");
-    let Bracket::Between(lo, hi) = decimal128_bracket("1.2345678901234567890123456789012345").unwrap()
+    let Bracket::Between(lo, hi) =
+        decimal128_bracket("1.2345678901234567890123456789012345").unwrap()
     else {
         panic!("35 digits should not be exact");
     };
@@ -1073,8 +1090,14 @@ fn wide_numeric_where_lowers_to_bracket_and_key() {
         filter("SELECT id FROM w WHERE n < 'NaN'::numeric"),
         doc! { "$and": [ { "n": { "$ne": &nan } }, { "n": { "$ne": Bson::Null } } ] }
     );
-    assert_eq!(filter("SELECT id FROM w WHERE n > 'NaN'::numeric"), doc! { "n": { "$in": [] } });
-    assert_eq!(filter("SELECT id FROM w WHERE n >= 'NaN'::numeric"), doc! { "n": &nan });
+    assert_eq!(
+        filter("SELECT id FROM w WHERE n > 'NaN'::numeric"),
+        doc! { "n": { "$in": [] } }
+    );
+    assert_eq!(
+        filter("SELECT id FROM w WHERE n >= 'NaN'::numeric"),
+        doc! { "n": &nan }
+    );
     // A narrow constant on a numeric column still gets the wide arm, because
     // the column may hold wide rows.
     let f = filter("SELECT id FROM w WHERE n < 5");
@@ -1136,9 +1159,18 @@ fn wide_numeric_arithmetic_is_exact() {
             "SELECT 123456789012345678901234567890123456789012345678901234567890 / 7",
             "17636684144620811271604938270017636684144620811271604938270",
         ),
-        ("SELECT -1.2345678901234567890123456789012345", "-1.2345678901234567890123456789012345"),
-        ("SELECT abs(-1.2345678901234567890123456789012345)", "1.2345678901234567890123456789012345"),
-        ("SELECT round(1.2345678901234567890123456789012345, 2)", "1.23"),
+        (
+            "SELECT -1.2345678901234567890123456789012345",
+            "-1.2345678901234567890123456789012345",
+        ),
+        (
+            "SELECT abs(-1.2345678901234567890123456789012345)",
+            "1.2345678901234567890123456789012345",
+        ),
+        (
+            "SELECT round(1.2345678901234567890123456789012345, 2)",
+            "1.23",
+        ),
         ("SELECT 'NaN'::numeric + 1", "NaN"),
         ("SELECT 'Infinity'::numeric * 0", "NaN"),
         ("SELECT 'Infinity'::numeric * -2", "-Infinity"),
@@ -1159,7 +1191,10 @@ fn wide_numeric_arithmetic_is_exact() {
         Some(Ordering::Less)
     );
     assert_eq!(
-        compare_constants(&v("1.0000000000000000000000000000000000000000"), &Bson::Int32(1)),
+        compare_constants(
+            &v("1.0000000000000000000000000000000000000000"),
+            &Bson::Int32(1)
+        ),
         Some(Ordering::Equal)
     );
 }
