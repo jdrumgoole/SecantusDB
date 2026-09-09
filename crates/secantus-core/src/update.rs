@@ -79,13 +79,11 @@ fn rename_array_field<'a>(doc: &'a Document, path: &'a str) -> Option<&'a str> {
                     None
                 };
             }
-            Bson::Document(d) => match d.get(part) {
-                Some(v) => {
-                    holder = part;
-                    cur = v;
-                }
-                None => return None,
-            },
+            Bson::Document(d) => {
+                let v = d.get(part)?;
+                holder = part;
+                cur = v;
+            }
             _ => return None,
         }
     }

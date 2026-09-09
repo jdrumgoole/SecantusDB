@@ -6435,27 +6435,44 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `findAndModify` over the same corpus is 0 of 160 -- the fixes reach it
   through the shared update path, and it introduces nothing of its own.
 
-- [ ] **OPEN — `$toDate` string ACCEPTANCE, 3 shapes, and one is the two servers
-  disagreeing with each other (measured 8.2.11, 2026-09-09).** Distinct from the
-  "`$toDate` of an UNPARSEABLE string -- WON'T FIX" note further down, which is
-  about mongod's per-position timelib DIAGNOSTIC. This is about which strings it
-  parses at all, and a wrong answer outranks a wrong message:
+- [ ] **OPEN — `$toDate` ACCEPTANCE: mongod runs timelib's FULL date parser and
+  we implement a small ISO-8601 subset (measured 8.2.11, 2026-09-09).** Distinct
+  from the "`$toDate` of an UNPARSEABLE string -- WON'T FIX" note further down,
+  which is about the per-position DIAGNOSTIC. This is about which strings parse
+  at all, and a wrong answer outranks a wrong message.
 
   | string | mongod | ours |
   | --- | --- | --- |
-  | `"12/31/2020"` | parses to 2020-12-31 | both servers reject |
-  | `"2020-01-01T"` | parses | both servers reject |
-  | `"2020-01-01 "` (trailing space) | parses | **Rust rejects, Python accepts** |
+  | `"12/31/2020"` | 2020-12-31 | reject |
+  | `"1/2/2020"` | 2020-01-02 | reject |
+  | `"12/31/2020 10:30"` | 2020-12-31 10:30 | reject |
+  | `"2020/12/31"` | 2020-12-31 | reject |
+  | `"Dec 31 2020"` | 2020-12-31 | reject |
+  | `"31 Dec 2020"` | 2020-12-31 | reject |
+  | `"20200101"` | 2020-01-01 | reject |
+  | `"2020-1-1"` | 2020-01-01 | reject |
+  | `"@1577836800"` | 2020-01-01 | reject |
+  | `"2020-W01-1"` | 2019-12-30 | reject |
+  | `"2020-01-01T"` / `"...t"` | 2020-01-01 **07:00:00** | reject |
 
-  mongod's parser accepts US `MM/DD/YYYY`, a bare trailing `T`, and trailing
-  whitespace. The third row is an intra-project inconsistency as well as a
-  divergence, so it is the one to fix first.
+  **This entry replaces one written EARLIER THE SAME DAY that said "3 shapes",
+  and that entry was wrong twice over.** It undercounted (an 18-string sweep
+  found a whole format table, not three strings), and it claimed "Rust rejects
+  a trailing space where Python and mongod accept" -- which came from a 12-string
+  sweep run against a STALE Rust binary. All three servers accept
+  `"2020-01-01 "`, `"  2020-01-01"`, `"2020-01-01\t"`, `"2020-01-01T00"` and
+  `"2020-01-01T10:00:00.5"` today. Rebuild the binary before believing a
+  Rust-vs-Python difference.
 
-  **Caution before pinning any expectation:** `"2020-01-01T"` parses to
-  **07:00:00** on this box, which is host-local-time leakage of the same kind as
-  the `$toLower`/`$toUpper`-of-a-Timestamp item. Measure on a `TZ=UTC` server.
+  **Sizing: this is porting timelib's format repertoire, not three fixes.** Two
+  sub-decisions before starting:
 
-  Sweep: the 12-string corpus in `tasks/mongo-fidelity-plan.md` item 6.
+  1. The slash form is US-first and that is deliberate, not incidental --
+     `"31/12/2020"` is REFUSED (`241 0: Unexpected character '3'`), so
+     `MM/DD/YYYY` wins over `DD/MM/YYYY` by locale rule.
+  2. `"2020-01-01T"` answering **07:00:00** looks host-dependent. Measure on a
+     `TZ=UTC` server before pinning it -- same caution as the
+     `$toLower`-of-a-Timestamp item.
 
 - [x] **RESOLVED 2026-09-09 — `$rename` path refusals, plus two the entry did
   not know about.** Filed as four shapes. The four were right; what was missing

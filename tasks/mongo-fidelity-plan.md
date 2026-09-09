@@ -189,36 +189,50 @@ accept a type `$toString` refuses. **Measure on a `TZ=UTC` server before
 implementing**, and decide whether a host-timezone-dependent answer is wanted at
 all.
 
-### 6. `$toDate` string parsing — RE-SIZED 2026-09-09, and the old entry undersold it
+### 6. `$toDate` string parsing — RE-SIZED TWICE on 2026-09-09, and it is a FEATURE
 
-The entry said "2 shapes, messages only, lowest value of anything here". A
-12-string sweep says otherwise: **8 of 12 diverge, and three are wrong ANSWERS
-rather than wrong messages.**
+The original entry said "2 shapes, messages only, lowest value of anything
+here". A 12-string sweep made that "8 of 12, three of them wrong ANSWERS". An
+18-string sweep then made *that* wrong too: mongod's `$toDate` is **timelib's
+full date parser**, and we implement a small ISO-8601 subset.
 
 | string | mongod | ours |
 | --- | --- | --- |
-| `"12/31/2020"` | parses to 2020-12-31 | **both servers reject** |
-| `"2020-01-01T"` | parses | **both servers reject** |
-| `"2020-01-01 "` (trailing space) | parses | **Rust rejects, Python accepts** |
-| `"2020-13-01"` | `6: Unexpected character '3'` | generic "incomplete date/time string" |
-| `"2020-01-32"` | `9: Unexpected character '2'` | generic |
-| `"2020-01-01T25:00:00Z"` | `12: Double time specification '5'` | generic |
-| `"not a date"` | three positioned diagnostics | generic |
-| `"2020-01-01T00:00:00+99:00"` | three positioned diagnostics | generic |
+| `"12/31/2020"` | 2020-12-31 | reject |
+| `"1/2/2020"` | 2020-01-02 | reject |
+| `"12/31/2020 10:30"` | 2020-12-31 10:30 | reject |
+| `"2020/12/31"` | 2020-12-31 | reject |
+| `"Dec 31 2020"` | 2020-12-31 | reject |
+| `"31 Dec 2020"` | 2020-12-31 | reject |
+| `"20200101"` | 2020-01-01 | reject |
+| `"2020-1-1"` | 2020-01-01 | reject |
+| `"@1577836800"` | 2020-01-01 | reject |
+| `"2020-W01-1"` | 2019-12-30 | reject |
+| `"2020-01-01T"` / `"...t"` | 2020-01-01 **07:00:00** | reject |
 
-Two separable halves, and they should be worked separately:
+Accepted on all three already: `"2020-01-01 "`, `"  2020-01-01"`,
+`"2020-01-01\t"`, `"2020-01-01T00"`, `"2020-01-01T10:00:00.5"` — so the
+12-string sweep's "Rust rejects a trailing space" finding was an artefact of a
+**stale Rust binary**, not a divergence. Rebuild before trusting a
+Rust-vs-Python difference; that is the third time in this campaign a stale
+artefact produced a confident wrong reading.
 
-- **Acceptance** (the first three rows) is a wrong answer, and the third is the
-  two servers disagreeing with EACH OTHER. mongod's parser accepts US
-  `MM/DD/YYYY`, a bare trailing `T`, and trailing whitespace. This half is worth
-  doing and is not blocked on anything.
-- **The positioned diagnostics** (the rest) still need timelib's own lexer,
-  timezone-abbreviation tables and per-position error accumulation. Inventing a
-  position would look authoritative and be wrong. This half stays deferred.
+**Two halves, and only one is worth doing:**
 
-One caution before starting the acceptance half: `"2020-01-01T"` parses to
-**07:00:00** on this box, which is host-local-time leakage of the same kind as
-item 5. Measure on a `TZ=UTC` server before pinning any expectation.
+- **Acceptance** is a real feature — porting timelib's format repertoire.
+  Not blocked on anything, but it is a slice of its own, not a fix. Two
+  sub-decisions first: the slash form is US-first *by rule* (`"31/12/2020"` is
+  refused outright, so this is not ambiguity-resolution), and `"2020-01-01T"`
+  answering **07:00:00** must be re-measured on a `TZ=UTC` server before
+  anything is pinned.
+- **The positioned diagnostics** still need timelib's own lexer, timezone
+  abbreviation tables and per-position error accumulation. Inventing a position
+  would look authoritative and be wrong. Stays deferred.
+
+**The reusable lesson is the entry itself.** It was re-sized three times in one
+day, each time by widening the corpus, and each earlier version was written with
+confidence. A 2-shape claim from a 2-shape probe is not a measurement of the
+area — it is a measurement of the probe.
 
 ---
 
