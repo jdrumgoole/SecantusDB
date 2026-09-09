@@ -6493,9 +6493,12 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   1. The slash form is US-first and that is deliberate, not incidental --
      `"31/12/2020"` is REFUSED (`241 0: Unexpected character '3'`), so
      `MM/DD/YYYY` wins over `DD/MM/YYYY` by locale rule.
-  2. `"2020-01-01T"` answering **07:00:00** looks host-dependent. Measure on a
-     `TZ=UTC` server before pinning it -- same caution as the
-     `$toLower`-of-a-Timestamp item.
+  2. ~~`"2020-01-01T"` answering **07:00:00** looks host-dependent.~~
+     **Measured and WITHDRAWN (2026-09-09):** a `TZ=UTC` mongod answers
+     07:00:00 too, so it is deterministic timelib behaviour for a bare trailing
+     `T`, not host-local leakage. Unlike the `$toLower`-of-a-Timestamp item,
+     which the same probe confirmed IS host-dependent, nothing here is blocked
+     on a timezone decision.
 
 - [x] **RESOLVED 2026-09-09 — a `Decimal128("NaN")` CRASHED `$expr`, and
   `{$eq: [NaN, NaN]}` was false.** Two bugs, one probe run.
