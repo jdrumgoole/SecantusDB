@@ -481,26 +481,45 @@ produces — TEXT `(a,b)` and binary RECORD forms, recursing for composite-typed
 fields. Fixed `test_dump_composite_all_chars` (×3) and
 `test_dump_builtin_empty_range` (×3). The remaining `test_composite.py` failures
 are NOT the Parse wall — each is a separate, pre-existing PLANNER gap the wall
-had been masking:
-  - **OPEN — composite field selection `(expr).field` (`AIndirection`) is
-    unimplemented** (`test_type_dumper_registered` ×3, `test_dump_no_sequence`
-    ×3): the planner rejects `(%s).bar` with "AIndirection is not supported yet".
-    A `secantus-pgplan` feature (extract a named field from a record value),
-    independent of parameter decode.
-  - **OPEN — composite `=` uses three-valued NULL logic, not `record_eq`'s
-    NULL-equality** (`test_dump_composite_null` ×3): `row('foo',1,NULL)::t = $1`
-    returns NULL where PostgreSQL returns TRUE, because `record_compare` in
-    `secantus-pgplan` treats a NULL field with three-valued rules; composite
-    equality (`record_eq`) compares two NULLs in the same position as equal.
-  - **OPEN — nested record `=` errors "comparing document with document"**
-    (`test_dump_recursive_composite` ×3): a composite whose field is itself a
-    composite is not recognised by `record_fields` on both sides, so the compare
-    falls through to the scalar path. A `record_compare` recursion gap.
+had been masking. The three planner-comparison gaps below **LANDED 2026-09-08
+(18 → 6 failures)** in `secantus-pgplan`; the two that remain are result-encoding
+and identifier-quoting, not comparison:
+  - **LANDED 2026-09-08 — composite field selection `(expr).field`
+    (`AIndirection`)** (`test_type_dumper_registered` ×3, `test_dump_no_sequence`
+    ×3): the scalar evaluator and the const-column projection allow-list now
+    handle `AIndirection`. A named composite resolves the field name through its
+    declared field list (reporting the field's declared type); an anonymous
+    record names its fields `f1`, `f2`, … by position; a NULL composite's field
+    is NULL; an unknown field is `42703` with PostgreSQL's message.
+  - **LANDED 2026-09-08 — composite `=` NULL-equality** (`test_dump_composite_null`
+    ×3): `record_compare` now takes a `composite` flag. Composite VALUES compare
+    two NULL fields as equal (a NULL sorts larger than any non-NULL, result always
+    true/false); only a bare `ROW(...) = ROW(...)` (both sides `N::RowExpr`, seen
+    from the AST) keeps the three-valued rule.
+  - **LANDED 2026-09-08 — nested record `=`** (`test_dump_recursive_composite`
+    ×3): `record_compare` recurses into a field that is itself a record, so
+    comparing composites whose fields are composites no longer errors "comparing
+    document with document".
   - **OPEN — binary anonymous-record RESULT columns emit text-typed fields**
-    (`test_load_record_binary` several): `select row(42,'foo',...)` read in a
-    BINARY cursor encodes each field as text rather than its typed binary — a
-    result-ENCODING gap (named-composite binary results already work), unrelated
-    to parameter decode.
+    (`test_load_record_binary` ×5): `select row(42,'foo','bar'::bytea,...)` read
+    in a BINARY cursor encodes each field as text rather than its typed binary,
+    and a single-NULL record decodes as empty. The record VALUE
+    (`{__record: [...]}`) carries only values, no per-field oids, so binary
+    encoding has to guess the field type — and a value-based guess regresses
+    `test_load_different_records`. The real fix is planner `RowExpr` field-type
+    tracking (attach each field's static type to the record value at build time
+    and encode with those oids); named-composite binary results already work
+    because the catalog supplies the field types. Deferred as deep RowExpr
+    type-tracking.
+  - **OPEN — reserved-keyword quoting in `regtype::text` output**
+    (`test_literal_invalid_name[order]` ×1): a composite type named after a
+    reserved keyword (`order`) renders `oid::regtype::text` as `order`, where
+    PostgreSQL quotes it (`"order"`) — psycopg then builds `'(hello)'::order`
+    instead of `'(hello)'::"order"`. `regtype_text`'s `quote_part` in
+    `secantus-pgplan` quotes a part only when it is not a plain lower-case
+    identifier; it must ALSO quote a reserved SQL keyword. Needs a
+    reserved-keyword table matching PostgreSQL's `quote_all_identifiers=off`
+    rule. Independent of the composite comparison/selection work.
 
 **Rust pgserver transaction characteristics — LANDED 2026-09-08 (psycopg's
 `vendor/psycopg/tests/test_connection.py::test_set_transaction_param_*`, oracle

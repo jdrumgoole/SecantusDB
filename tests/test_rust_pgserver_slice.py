@@ -4073,6 +4073,92 @@ def test_row_expressions_are_records(home: Path) -> None:
         assert cur.fetchone()[0] == "record"
 
 
+def test_field_selection_from_record_and_composite(home: Path) -> None:
+    """`(expr).field` selects a named field from a record or composite value.
+
+    An anonymous record names its fields `f1`, `f2`, ... by position; a named
+    composite carries its own field names, and the selected field reports the
+    field's declared type in the row description (so `pg_typeof` reads it back).
+    An unknown field is 42703; a field of a NULL composite is NULL.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        # Anonymous record: positional f1, f2, ...
+        cur.execute("SELECT (ROW('a'::text, 'b'::text)).f1, (ROW('a'::text, 'b'::text)).f2")
+        assert cur.fetchone() == ("a", "b")
+
+        # Named composite: field by name, with the field's declared type.
+        cur.execute("create type fc as (foo text, bar int8, baz float8)")
+        cur.execute("SELECT (row('x', 42, 3.5)::fc).bar, (row('x', 42, 3.5)::fc).foo")
+        assert cur.fetchone() == (42, "x")
+        cur.execute("SELECT pg_typeof((row('x', 42, 3.5)::fc).bar)::text")
+        assert cur.fetchone()[0] == "bigint"
+
+        # A field of a NULL composite is NULL.
+        cur.execute("SELECT (NULL::fc).bar")
+        assert cur.fetchone()[0] is None
+
+        # An unknown field is a 42703 UndefinedColumn, worded by the SOURCE
+        # type: PostgreSQL names the composite for a named type and says
+        # "record data type" for an anonymous row.
+        with pytest.raises(psycopg.errors.UndefinedColumn) as exc:
+            cur.execute("SELECT (row('x', 42, 3.5)::fc).nope").fetchone()
+        assert exc.value.diag.message_primary == 'column "nope" not found in data type fc'
+        # An anonymous record has exactly as many fN fields as values: a
+        # position past the end, f0, and a non-positional name are all the
+        # same error -- a NULL for `.f3` here was a silent divergence.
+        for field in ("f3", "f0", "zz"):
+            with pytest.raises(psycopg.errors.UndefinedColumn) as exc:
+                cur.execute(f"SELECT (row(1, 'x')).{field}").fetchone()
+            assert exc.value.diag.message_primary == (
+                f'could not identify column "{field}" in record data type'
+            )
+
+
+def test_composite_value_equality_is_null_blind(home: Path) -> None:
+    """Comparing composite VALUES treats NULL fields as equal (unlike a bare
+    ROW constructor, which is three-valued).
+
+    PostgreSQL: for composite-type values two NULL fields are equal and a NULL
+    sorts larger than any non-NULL, so the comparison always resolves to
+    true/false; a bare `ROW(...) = ROW(...)` with a NULL is still NULL. Nested
+    composite fields compare by the same rule, recursively.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("create type ce as (foo text, bar int8, baz float8)")
+        cur.execute("create type ce2 as (qux int8, quux ce)")
+
+        # Two composite values with a NULL field are EQUAL (not NULL).
+        cur.execute(
+            "SELECT row('foo', 1, NULL)::ce = row('foo', 1, NULL)::ce,"
+            "       row('foo', 1, NULL)::ce <> row('foo', 1, NULL)::ce"
+        )
+        assert cur.fetchone() == (True, False)
+
+        # A NULL beside a non-NULL is UNEQUAL, and NULL sorts larger.
+        cur.execute(
+            "SELECT row('foo', 1, NULL)::ce = row('foo', 1, 3.0)::ce,"
+            "       row('foo', 1, NULL)::ce < row('foo', 1, 3.0)::ce"
+        )
+        assert cur.fetchone() == (False, False)
+
+        # A decided inequality in a non-NULL field still wins.
+        cur.execute("SELECT row('foo', 2, NULL)::ce = row('foo', 1, NULL)::ce")
+        assert cur.fetchone()[0] is False
+
+        # Nested composite fields compare by the same NULL-blind rule.
+        cur.execute(
+            "SELECT row(42, row('foo', 1, NULL)::ce)::ce2"
+            "     = row(42, row('foo', 1, NULL)::ce)::ce2"
+        )
+        assert cur.fetchone()[0] is True
+
+        # A bare ROW constructor stays three-valued: NULL, not True.
+        cur.execute("SELECT ROW('foo', 1, NULL) = ROW('foo', 1, NULL)")
+        assert cur.fetchone()[0] is None
+
+
 def test_timestamptz_columns_render_in_session_zone(home: Path) -> None:
     """A `timestamptz` column stores a UTC INSTANT and renders in the session zone.
 
