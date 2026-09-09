@@ -39,11 +39,14 @@ pub enum PgWireError {
     UnsupportedSASLAuthMethod(String),
     #[error(transparent)]
     IoError(#[from] std::io::Error),
-    #[error("Portal not found for name: {0}")]
+    // PostgreSQL's own wording and SQLSTATEs (measured on 16): a missing
+    // portal is 34000 invalid_cursor_name, a missing statement 26000
+    // invalid_sql_statement_name.
+    #[error("portal \"{0}\" does not exist")]
     PortalNotFound(String),
     #[error("Cannot fetch portal in its Initial state, call start() first")]
     PortalNotStarted,
-    #[error("Statement not found for name: {0}")]
+    #[error("prepared statement \"{0}\" does not exist")]
     StatementNotFound(String),
     #[error("Parameter index out of bound: {0}")]
     ParameterIndexOutOfBound(usize),
@@ -365,7 +368,7 @@ impl From<PgWireError> for ErrorInfo {
                 ErrorInfo::new("FATAL".to_owned(), "58030".to_owned(), error.to_string())
             }
             PgWireError::PortalNotFound(_) => {
-                ErrorInfo::new("ERROR".to_owned(), "26000".to_owned(), error.to_string())
+                ErrorInfo::new("ERROR".to_owned(), "34000".to_owned(), error.to_string())
             }
             PgWireError::PortalNotStarted => {
                 ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), error.to_string())

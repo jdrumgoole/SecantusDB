@@ -326,6 +326,10 @@ pub enum Statement {
     },
     /// `SHOW name` -- one row, one text column named canonically.
     Show(String),
+    /// `ALTER ROLE / USER name ...` -- the role it names. This server has
+    /// exactly one role (the session user), so the executor answers 42704
+    /// `role "x" does not exist` for any other name, as PostgreSQL 16 does.
+    AlterRole(String),
     /// `SET name = value`.
     Set {
         name: String,
@@ -1310,6 +1314,12 @@ pub fn plan_with_params(
         N::CreateFunctionStmt(f) => plan_create_function(&f),
         N::CopyStmt(c) => plan_copy(&c, lookup, params),
         N::VariableShowStmt(v) => Ok(Statement::Show(v.name.clone())),
+        N::AlterRoleStmt(a) => Ok(Statement::AlterRole(
+            a.role
+                .as_ref()
+                .map(|r| r.rolename.clone())
+                .unwrap_or_default(),
+        )),
         N::DeclareCursorStmt(d) => {
             let inner_node = d.query.as_ref().and_then(|q| q.node.as_ref());
             let inner = match inner_node {
@@ -4359,6 +4369,13 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
                         if matches!(op, "+" | "-" | "*" | "/") {
                             if let Some(t) = wider_numeric(&lt, &rt) {
                                 if t == "numeric" || t == "float8" || t == "float4" {
+                                    return t;
+                                }
+                                // Integer arithmetic with no value to look at
+                                // (DESCRIBE time) types from the operands too:
+                                // `$1::int8 + $2::int8` is int8 on PostgreSQL 16,
+                                // not the int4 the NULL placeholder implied.
+                                if *value == Bson::Null {
                                     return t;
                                 }
                             }

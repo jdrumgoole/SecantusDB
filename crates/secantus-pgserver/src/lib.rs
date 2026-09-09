@@ -3340,6 +3340,9 @@ fn default_settings() -> HashMap<String, String> {
         ("application_name", ""),
         ("server_encoding", "UTF8"),
         ("server_version", "15.0"),
+        // Read by a client before `ALTER USER ... PASSWORD` to pick the hash
+        // (libpq's `PQchangePassword`); PostgreSQL 16's default.
+        ("password_encryption", "scram-sha-256"),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -3876,7 +3879,7 @@ impl PgHandler {
     /// takes the handle. After a mid-batch COMMIT a fresh implicit transaction
     /// is opened for the commands that follow, which is what PostgreSQL does.
     async fn run_batch(&self, stmts: &[String]) -> PgWireResult<Vec<Response>> {
-        let implicit = self.txn.lock().unwrap_or_else(|e| e.into_inner()).is_none();
+        let mut implicit = self.txn.lock().unwrap_or_else(|e| e.into_inner()).is_none();
         if implicit {
             self.begin_implicit()?;
         }
@@ -3884,7 +3887,22 @@ impl PgHandler {
         let mut out = Vec::with_capacity(stmts.len());
         for (i, sql) in stmts.iter().enumerate() {
             match self.run(sql, &[], 0).await {
-                Ok(responses) => out.extend(responses),
+                Ok(responses) => {
+                    // A BEGIN inside the batch makes the implicit transaction
+                    // the BLOCK: it stays open past the batch's end, and so
+                    // does a cursor declared after it. Measured on 16:
+                    // `begin; declare cur cursor for select 1;` leaves the
+                    // session in a transaction with `cur` fetchable.
+                    // Committing it here closed the cursor and left the
+                    // client believing in a block the server had ended.
+                    if responses
+                        .iter()
+                        .any(|r| matches!(r, Response::TransactionStart(_)))
+                    {
+                        implicit = false;
+                    }
+                    out.extend(responses);
+                }
                 Err(e) => {
                     if implicit {
                         // Roll back whatever this batch opened. A failure to
@@ -3896,10 +3914,8 @@ impl PgHandler {
             }
             // An explicit COMMIT or ROLLBACK inside the batch closed the
             // transaction; PostgreSQL starts another for what follows.
-            if implicit
-                && i + 1 < stmts.len()
-                && self.txn.lock().unwrap_or_else(|e| e.into_inner()).is_none()
-            {
+            if i + 1 < stmts.len() && self.txn.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+                implicit = true;
                 self.begin_implicit()?;
             }
         }
@@ -7759,6 +7775,22 @@ impl PgHandler {
                     0
                 };
                 Ok(vec![Response::CopyOut(CopyResponse::new(code, n, data))])
+            }
+
+            Statement::AlterRole(role) => {
+                let me = self
+                    .session_user
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                if role != me {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42704".into(), // undefined_object
+                        format!("role \"{role}\" does not exist"),
+                    ))));
+                }
+                Ok(vec![Response::Execution(Tag::new("ALTER ROLE"))])
             }
 
             Statement::Show(name) => {
@@ -11836,6 +11868,15 @@ impl ExtendedQueryHandler for PgHandler {
             }
             pgwire::messages::extendedquery::TARGET_TYPE_BYTE_PORTAL => {
                 pgwire::api::store::PortalStore::rm_portal(client.portal_store(), name);
+                // A DECLAREd cursor IS a portal of that name on PostgreSQL, so
+                // a wire `Close` of it closes the cursor (libpq 17's
+                // `PQclosePortal`); the next Describe of it is `34000`.
+                if !name.is_empty() {
+                    self.cursors
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(name);
+                }
             }
             _ => {}
         }
@@ -11863,10 +11904,25 @@ impl ExtendedQueryHandler for PgHandler {
         let fields =
             self.describe_fields(&target.statement.sql, param_types.len(), &param_types)?;
         // A parameter with no mapped builtin type reports its user-type oid
-        // when the raw Parse oid named one (a composite / enum), else `unknown`
-        // -- which is what PostgreSQL does when it cannot infer. A parameter
-        // the client did not list at all (`$1` in the SQL, no oids in the
-        // Parse) is `unknown` too.
+        // when the raw Parse oid named one (a composite / enum); otherwise
+        // the type the STATEMENT gives it -- `$1::int4` describes as int4 and
+        // `$1 = 'a'` as text on PostgreSQL 16 -- and `unknown` only when
+        // nothing in the statement types it, which is what PostgreSQL does
+        // when it cannot infer.
+        let column_type = |table: &str, column: secantus_pgplan::ColumnRef<'_>| {
+            self.lookup(table).and_then(|def| {
+                let col = match column {
+                    secantus_pgplan::ColumnRef::Name(name) => def.column(name),
+                    secantus_pgplan::ColumnRef::Position(pos) => def.columns.get(pos),
+                };
+                col.map(|c| c.pg_type.clone())
+            })
+        };
+        let inferred = secantus_pgplan::catalog_param_types_opt(
+            &target.statement.sql,
+            &param_types,
+            &column_type,
+        );
         let types: Vec<Type> = (0..param_types.len())
             .map(|i| {
                 declared.get(i).cloned().flatten().unwrap_or_else(|| {
@@ -11876,6 +11932,14 @@ impl ExtendedQueryHandler for PgHandler {
                         .copied()
                         .filter(|o| *o != 0)
                         .and_then(|oid| self.user_wire_type_for_oid(oid))
+                        .or_else(|| {
+                            let name = inferred.get(i)?.as_deref()?;
+                            let t = wire_type(name);
+                            // `wire_type` answers varchar for a name it does
+                            // not know; only a real varchar keeps that.
+                            (t != Type::VARCHAR || matches!(name, "varchar" | "character varying"))
+                                .then_some(t)
+                        })
                         .unwrap_or(Type::UNKNOWN)
                 })
             })

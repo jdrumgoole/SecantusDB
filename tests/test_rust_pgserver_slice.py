@@ -8203,3 +8203,77 @@ def test_create_table_as_function_sources_and_expression_aggregates(home: Path) 
         assert conn.execute(
             "select col2 % 2, max(length(data)) from copy_in group by 1 order by 1"
         ).fetchall() == [(0, 3), (1, 2)]
+
+
+def test_describe_shapes_and_cursor_portals_match_postgres(home: Path) -> None:
+    """The libpq-level Describe shapes psycopg's `tests/pq` checks, on PG 16.
+
+    `Describe` of a statement reports a parameter's type from the CAST over
+    it (`$1::int4, $2::text` is 23 / 25; nothing types it -> 705), and an
+    integer expression over cast parameters types from its operands
+    (`$1::int8 + $2::int8` is int8, not int4). A `begin; declare ...` simple
+    query leaves the session IN a transaction with the cursor open; the
+    cursor is a PORTAL of its name, so `Describe portal` sees its columns and
+    a wire `Close portal` closes it (the next Describe is 34000). The
+    `password_encryption` GUC is `scram-sha-256`, and `ALTER USER` of a role
+    that does not exist is 42704.
+    """
+    from psycopg import pq
+
+    with _Server(home) as server:
+        conn = pq.PGconn.connect(
+            f"host=127.0.0.1 port={server.port} dbname=postgres user=test".encode()
+        )
+        assert conn.status == pq.ConnStatus.OK, conn.error_message
+        try:
+            assert (
+                conn.prepare(b"", b"select $1::int4, $2::text").status == pq.ExecStatus.COMMAND_OK
+            )
+            res = conn.describe_prepared(b"")
+            assert [res.param_type(i) for i in range(res.nparams)] == [23, 25]
+            assert [(res.fname(i), res.ftype(i)) for i in range(res.nfields)] == [
+                (b"int4", 23),
+                (b"text", 25),
+            ]
+            conn.prepare(b"p2", b"select $1::int8 + $2::int8 as fld")
+            res = conn.describe_prepared(b"p2")
+            assert [res.param_type(i) for i in range(res.nparams)] == [20, 20]
+            assert [(res.fname(i), res.ftype(i)) for i in range(res.nfields)] == [(b"fld", 20)]
+            conn.prepare(b"p3", b"select $1")
+            res = conn.describe_prepared(b"p3")
+            assert [res.param_type(i) for i in range(res.nparams)] == [705]
+
+            res = conn.exec_(
+                b"begin; declare cur cursor for select * from generate_series(1,10) foo;"
+            )
+            assert res.status == pq.ExecStatus.COMMAND_OK, res.error_message
+            assert conn.transaction_status == pq.TransactionStatus.INTRANS
+            res = conn.describe_portal(b"cur")
+            assert res.status == pq.ExecStatus.COMMAND_OK, res.error_message
+            assert [(res.fname(i), res.ftype(i)) for i in range(res.nfields)] == [(b"foo", 23)]
+            res = conn.exec_(b"fetch 2 from cur")
+            assert [res.get_value(r, 0) for r in range(res.ntuples)] == [b"1", b"2"]
+            res = conn.close_portal(b"cur")
+            assert res.status == pq.ExecStatus.COMMAND_OK, res.error_message
+            res = conn.describe_portal(b"cur")
+            assert res.status == pq.ExecStatus.FATAL_ERROR
+            assert res.error_field(pq.DiagnosticField.SQLSTATE) == b"34000"
+            assert conn.exec_(b"rollback").status == pq.ExecStatus.COMMAND_OK
+            res = conn.exec_(b"begin; select 1; commit; select 2")
+            assert res.status == pq.ExecStatus.TUPLES_OK
+            assert conn.transaction_status == pq.TransactionStatus.IDLE
+
+            res = conn.exec_(b"show password_encryption")
+            assert (res.ftype(0), res.get_value(0, 0)) == (25, b"scram-sha-256")
+            res = conn.exec_(b"alter user \"ashesh\" password 'x'")
+            assert res.status == pq.ExecStatus.FATAL_ERROR
+            assert res.error_field(pq.DiagnosticField.SQLSTATE) == b"42704"
+            assert (
+                res.error_field(pq.DiagnosticField.MESSAGE_PRIMARY)
+                == b'role "ashesh" does not exist'
+            )
+            res = conn.exec_(b"alter user test password 'x'")
+            assert res.status == pq.ExecStatus.COMMAND_OK, res.error_message
+            assert res.command_status == b"ALTER ROLE"
+        finally:
+            conn.finish()

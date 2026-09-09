@@ -3082,3 +3082,36 @@ fn now_is_a_timestamptz() {
     }
     assert_eq!(scalar::static_result_type("now"), "timestamptz");
 }
+
+/// PostgreSQL 16 describes `$1::int8 + $2::int8` as int8 (and `$1::int2 +
+/// $2::int2` as int2): integer arithmetic types from its operands when the
+/// values are still NULL placeholders, not from the int4 default.
+#[test]
+fn integer_arithmetic_over_casts_types_from_the_operands() {
+    for (sql, want) in [
+        ("SELECT $1::int8 + $2::int8 AS fld", "int8"),
+        ("SELECT $1::int2 * $2::int2", "int2"),
+        ("SELECT $1::int4 - $2::int8", "int8"),
+        ("SELECT $1 + 1", "int4"),
+    ] {
+        match plan_with_params(sql, &lookup, &[Bson::Null, Bson::Null]).unwrap() {
+            Statement::SelectConstant(sc) => assert_eq!(sc.columns[0].2, want, "{sql}"),
+            other => panic!("{sql}: {other:?}"),
+        }
+    }
+}
+
+/// `ALTER ROLE` / `ALTER USER` plan to the role they name; whether it exists
+/// is the executor's question.
+#[test]
+fn alter_role_names_its_role() {
+    for sql in [
+        "ALTER USER \"ashesh\" PASSWORD 'x'",
+        "ALTER ROLE ashesh WITH LOGIN",
+    ] {
+        match plan_ok(sql) {
+            Statement::AlterRole(name) => assert_eq!(name, "ashesh", "{sql}"),
+            other => panic!("{sql}: {other:?}"),
+        }
+    }
+}
