@@ -752,6 +752,20 @@ impl PgHandler {
     /// `display_size` / `internal_size`. They describe the column, never the
     /// value bytes, so this is description metadata only.
     fn field_mod(&self, name: String, ty: Type, type_modifier: i32) -> FieldInfo {
+        self.field_sourced(name, ty, type_modifier, None)
+    }
+
+    /// Like [`Self::field_mod`], but naming the base-table column the values
+    /// are read from as `(relation oid, 1-based attnum)` -- the
+    /// RowDescription's `ftable` / `ftablecol`. `None` describes a computed
+    /// column, which PostgreSQL reports as `0` / `0`.
+    fn field_sourced(
+        &self,
+        name: String,
+        ty: Type,
+        type_modifier: i32,
+        source: Option<(i64, i16)>,
+    ) -> FieldInfo {
         let binary = self
             .binary_results
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -767,7 +781,11 @@ impl PgHandler {
         // (PostgreSQL raises 22P05 there; `field_mod` is infallible and the
         // case needs a non-Latin alias under a Latin client encoding).
         let name_raw = transcoded_name(self.client_encoding(), &name);
-        FieldInfo::new(name, None, None, ty.clone(), format)
+        let (table_id, column_id) = match source {
+            Some((oid, attnum)) => (i32::try_from(oid).ok(), Some(attnum)),
+            None => (None, None),
+        };
+        FieldInfo::new(name, table_id, column_id, ty.clone(), format)
             .with_type_size(type_size(&ty))
             .with_type_modifier(type_modifier)
             .with_name_raw(name_raw)
@@ -957,6 +975,7 @@ impl PgHandler {
             .map(|b| (Self::type_resolution(&b.schema, &b.name), b.oid, b.defined))
             .collect();
         secantus_pgplan::set_user_base_types(base_types);
+        secantus_pgplan::set_user_relations(self.relations());
     }
 
     /// The name a user type resolves under: its bare name in `public` (on the
@@ -1641,11 +1660,13 @@ impl PgHandler {
     ) -> PgWireResult<Vec<Document>> {
         let eq = |a: &Bson, b: &Bson| -> bool {
             let num = |v: &Bson| -> Option<i64> {
-                secantus_pgplan::regtype_oid(v).or(match v {
-                    Bson::Int32(x) => Some(i64::from(*x)),
-                    Bson::Int64(x) => Some(*x),
-                    _ => None,
-                })
+                secantus_pgplan::regtype_oid(v)
+                    .or_else(|| secantus_pgplan::regclass_oid(v))
+                    .or(match v {
+                        Bson::Int32(x) => Some(i64::from(*x)),
+                        Bson::Int64(x) => Some(*x),
+                        _ => None,
+                    })
             };
             match (num(a), num(b)) {
                 (Some(x), Some(y)) => x == y,
@@ -1728,24 +1749,27 @@ impl PgHandler {
             }
         }
 
-        // The ON columns, resolved to each side's stored field.
-        let (l_on, r_on) = {
-            let (a, b) = (&join.on.0, &join.on.1);
-            if a.0 == join.left.1 {
-                (lfield(&a.1)?, rfield(&b.1)?)
-            } else {
-                (lfield(&b.1)?, rfield(&a.1)?)
-            }
+        // The ON columns, resolved to each side's stored field; `None` is a
+        // CROSS join (`FROM t1, t2`), where every right row pairs with every
+        // left row.
+        let on = match &join.on {
+            Some((a, b)) if a.0 == join.left.1 => Some((lfield(&a.1)?, rfield(&b.1)?)),
+            Some((a, b)) => Some((lfield(&b.1)?, rfield(&a.1)?)),
+            None => None,
         };
 
         let tz = self.session_timezone();
+        let keys = secantus_pgplan::join_output_keys(join);
         let mut out = Vec::new();
         for l in &left_rows {
             let matches: Vec<&Document> = right_rows
                 .iter()
-                .filter(|r| match (l.get(&l_on), r.get(&r_on)) {
-                    (Some(a), Some(b)) => eq(a, b),
-                    _ => false,
+                .filter(|r| match &on {
+                    Some((l_on, r_on)) => match (l.get(l_on), r.get(r_on)) {
+                        (Some(a), Some(b)) => eq(a, b),
+                        _ => false,
+                    },
+                    None => true,
                 })
                 .collect();
             let rights: Vec<Option<&Document>> = if matches.is_empty() {
@@ -1759,7 +1783,17 @@ impl PgHandler {
             };
             for r in rights {
                 let mut doc = Document::new();
-                for (i, (out_name, alias, col)) in join.columns.iter().enumerate() {
+                for (i, (_, alias, col)) in join.columns.iter().enumerate() {
+                    let out_name = &keys[i];
+                    let expr = join.exprs.get(i).and_then(|e| e.as_ref());
+                    // A constant target (`'t1'::regclass::oid` in a join's
+                    // list) reads no side at all.
+                    if let Some(expr @ secantus_pgplan::ColumnExpr::Const { .. }) = expr {
+                        let value = secantus_pgplan::apply_column_expr(expr, Bson::Null, &tz)
+                            .map_err(|e| PgHandler::err(&e))?;
+                        doc.insert(out_name.clone(), value);
+                        continue;
+                    }
                     let on_left = if *alias == join.left.1 {
                         true
                     } else if *alias == join.right.1 || left_is_sub {
@@ -1786,7 +1820,7 @@ impl PgHandler {
                     // Most column exprs (cast chains, scalar calls) no-op on a
                     // NULL and are skipped; COALESCE is the exception -- a
                     // LEFT-JOIN miss is exactly the NULL it must replace.
-                    let value = match join.exprs.get(i).and_then(|e| e.as_ref()) {
+                    let value = match expr {
                         Some(expr)
                             if value != Bson::Null
                                 || matches!(expr, secantus_pgplan::ColumnExpr::Coalesce { .. }) =>
@@ -2104,6 +2138,65 @@ impl PgHandler {
                 d.get_str("_id").unwrap_or_default() == name
                     && d.get_bool("relation").unwrap_or(false)
             }))
+    }
+
+    /// The oid of a table's ROW TYPE, which doubles as the relation's oid:
+    /// `pg_type.typrelid` and `pg_attribute.attrelid` already key on it, so
+    /// it is what `'t'::regclass::oid` and the RowDescription's `ftable`
+    /// report. A table created before row types were recorded has none.
+    fn relation_oid(&self, name: &str) -> Option<i64> {
+        self.type_catalog_docs(Self::COMPOSITE_COLLECTION)
+            .ok()?
+            .iter()
+            .find(|d| {
+                d.get_str("_id").unwrap_or_default() == name
+                    && d.get_bool("relation").unwrap_or(false)
+            })
+            .and_then(|d| {
+                d.get_i64("oid")
+                    .or_else(|_| d.get_i32("oid").map(i64::from))
+                    .ok()
+            })
+    }
+
+    /// Every table with a relation oid, as `(stored name, oid, temp)`, for
+    /// the planner's `regclass` resolution.
+    fn relations(&self) -> Vec<(String, i64, bool)> {
+        let docs = match self.type_catalog_docs(Self::COMPOSITE_COLLECTION) {
+            Ok(docs) => docs,
+            Err(_) => return Vec::new(),
+        };
+        let temps: std::collections::HashSet<String> = self
+            .all_table_defs()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|d| d.temp)
+            .map(|d| d.name)
+            .collect();
+        docs.iter()
+            .filter(|d| d.get_bool("relation").unwrap_or(false))
+            .filter_map(|d| {
+                let name = d.get_str("_id").ok()?.to_string();
+                let oid = d
+                    .get_i64("oid")
+                    .or_else(|_| d.get_i32("oid").map(i64::from))
+                    .ok()?;
+                let temp = temps.contains(&name);
+                Some((name, oid, temp))
+            })
+            .collect()
+    }
+
+    /// Stamp each column of `def` with where it is read from, for the
+    /// RowDescription's `ftable` / `ftablecol`: the table's relation oid and
+    /// the column's 1-based position.
+    fn with_column_sources(def: TableDef, oid: Option<i64>) -> TableDef {
+        let Some(oid) = oid else { return def };
+        let mut def = def;
+        for (i, column) in def.columns.iter_mut().enumerate() {
+            column.source = i16::try_from(i + 1).ok().map(|attnum| (oid, attnum));
+        }
+        def
     }
 
     /// Every composite as `(schema, bare_name, oid, fields)`. `schema` defaults
@@ -3218,7 +3311,8 @@ impl PgHandler {
             .ok()?;
         let def = rows.first().and_then(|raw| {
             let d: Document = bson::from_slice(raw).ok()?;
-            TableDef::from_document(&d)
+            let def = TableDef::from_document(&d)?;
+            Some(Self::with_column_sources(def, self.relation_oid(name)))
         });
         if self.may_fill_catalog_cache(version) {
             cache
@@ -3648,7 +3742,7 @@ fn type_size(ty: &Type) -> i16 {
     match *ty {
         Type::BOOL | Type::CHAR => 1,
         Type::INT2 => 2,
-        Type::INT4 | Type::FLOAT4 | Type::DATE | Type::OID | Type::REGTYPE => 4,
+        Type::INT4 | Type::FLOAT4 | Type::DATE | Type::OID | Type::REGTYPE | Type::REGCLASS => 4,
         Type::INT8 | Type::FLOAT8 | Type::TIME | Type::TIMESTAMP | Type::TIMESTAMPTZ => 8,
         Type::TIMETZ => 12,
         Type::INTERVAL | Type::UUID => 16,
@@ -3721,6 +3815,7 @@ fn wire_type(pg_type: &str) -> Type {
         // `pg_typeof` answers a `regtype` (2206), not text: a client reading
         // 25 would print the same characters but compare unequal to a regtype.
         "regtype" => Type::REGTYPE,
+        "regclass" => Type::REGCLASS,
         // A real oid column type: psycopg's numeric tests read the oid back
         // and check `ftype(0) == 26`.
         "oid" => Type::OID,
@@ -3785,6 +3880,7 @@ fn wire_type(pg_type: &str) -> Type {
         // `pg_prepared_statements.parameter_types`: a client reads 2211 back as
         // a list of type names.
         "regtype[]" => Type::REGTYPE_ARRAY,
+        "regclass[]" => Type::REGCLASS_ARRAY,
         // Everything else renders as text for now; P4 owns the real type map.
         _ => Type::VARCHAR,
     }
@@ -6216,18 +6312,21 @@ impl PgHandler {
             .iter()
             .enumerate()
             .map(|(i, (out, field))| {
-                let ty = match casts.get(i).and_then(|c| c.as_ref()) {
-                    Some(expr) => wire_type(secantus_pgplan::column_expr_type(expr)),
+                let (ty, source) = match casts.get(i).and_then(|c| c.as_ref()) {
+                    Some(expr) => (wire_type(secantus_pgplan::column_expr_type(expr)), None),
                     None => def
                         .column(field)
                         .or_else(|| def.column(out))
                         .map(|c| {
-                            self.user_wire_type(&c.pg_type)
-                                .unwrap_or_else(|| wire_type(&c.pg_type))
+                            (
+                                self.user_wire_type(&c.pg_type)
+                                    .unwrap_or_else(|| wire_type(&c.pg_type)),
+                                c.source,
+                            )
                         })
-                        .unwrap_or(Type::VARCHAR),
+                        .unwrap_or((Type::VARCHAR, None)),
                 };
-                self.field(out.clone(), ty)
+                self.field_sourced(out.clone(), ty, -1, source)
             })
             .collect()
     }
@@ -6729,7 +6828,8 @@ impl PgHandler {
                 self.note_uncommitted_type(Self::COMPOSITE_COLLECTION, &def.name, Some(row_type));
                 // Remember it for the rest of this transaction: the catalog row
                 // above is not committed yet, so a plain read cannot see it.
-                self.note_uncommitted(&def.name, Some(def.clone()));
+                let name = def.name.clone();
+                self.note_uncommitted(&name, Some(Self::with_column_sources(def, Some(oid))));
                 Ok(vec![Response::Execution(Tag::new("CREATE TABLE"))])
             }
 
@@ -9702,8 +9802,8 @@ fn rebind_field_format(field: &FieldInfo, binary: bool) -> FieldInfo {
     };
     FieldInfo::new(
         field.name().to_string(),
-        None,
-        None,
+        field.table_id(),
+        field.column_id(),
         field.datatype().clone(),
         format,
     )
@@ -10089,6 +10189,10 @@ fn encode_value(enc: &mut DataRowEncoder, v: Option<&Bson>) -> PgWireResult<()> 
         // A regtype is an oid in a document; the wire wants its display name.
         if let Some(oid) = secantus_pgplan::regtype_oid(value) {
             return enc.encode_field(&Some(secantus_pgplan::regtype_text(oid).as_str()));
+        }
+        // A regclass likewise: an oid whose text is the relation's name.
+        if let Some(oid) = secantus_pgplan::regclass_oid(value) {
+            return enc.encode_field(&Some(secantus_pgplan::regclass_text(oid).as_str()));
         }
         // A record is a tagged field list; the wire wants its `(...)` text.
         if let Some(text) = secantus_pgplan::record_value_text(value) {

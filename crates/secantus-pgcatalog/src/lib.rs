@@ -65,6 +65,12 @@ pub struct Column {
     /// when an INSERT omits the column. `Some(Bson::Null)` is an explicit
     /// `DEFAULT NULL`; `None` is no default at all.
     pub default: Option<Bson>,
+    /// Where this column's values are READ from, for the RowDescription's
+    /// `ftable` / `ftablecol`: `(relation oid, 1-based attnum)` for a column
+    /// that passes a base table's column straight through, `None` for a
+    /// computed one. Never stored: the wire layer stamps it when it reads
+    /// the catalog, and a projection's output columns inherit it.
+    pub source: Option<(i64, i16)>,
 }
 
 impl Column {
@@ -77,6 +83,7 @@ impl Column {
             nullable: !pk,
             sequence: None,
             default: None,
+            source: None,
         }
     }
 
@@ -124,6 +131,7 @@ impl Column {
                 .get_bool("has_default")
                 .unwrap_or(false)
                 .then(|| d.get("default").cloned().unwrap_or(Bson::Null)),
+            source: None,
         })
     }
 }
