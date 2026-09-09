@@ -62,6 +62,7 @@ dev = [
     "anyio>=4.0",
     "pytest-cov>=3.0",
     "pytest-randomly>=3.5",
+    "pproxy>=2.7",  # the `proxy` fixture behind test_cancel_safe_* (Linux; see psycopg_validation.include_paths)
     # psycopg's tests/test_typing.py shells out to a bare `mypy` (125 tests) —
     # uv run puts .venv/bin on PATH, so carrying mypy here makes them count.
     "mypy>=1.14",
