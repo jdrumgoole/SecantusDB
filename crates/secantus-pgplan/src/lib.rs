@@ -237,10 +237,53 @@ pub enum Statement {
         schema: Option<String>,
         labels: Vec<String>,
     },
-    /// `DROP TYPE [IF EXISTS] <names>`.
+    /// `DROP TYPE [IF EXISTS] <names> [CASCADE]`.
     DropType {
         names: Vec<String>,
         if_exists: bool,
+        /// `CASCADE`: drop the functions that depend on the type too (a base
+        /// type's I/O functions). RESTRICT -- the default -- refuses with
+        /// 2BP01 while any exist.
+        cascade: bool,
+    },
+    /// `CREATE TYPE <name>` with nothing after the name -- a SHELL type: a
+    /// placeholder that exists only so I/O functions can name it before the
+    /// full `CREATE TYPE <name> (input = ..., output = ...)` completes it.
+    /// (pg_query parses both forms as a `DefineStmt` of kind `OBJECT_TYPE`.)
+    CreateShellType {
+        name: String,
+        schema: Option<String>,
+    },
+    /// `CREATE TYPE <name> (input = f, output = g [, like = t])` -- the full
+    /// form that turns a shell into a base type. Only `input`, `output` and
+    /// `like` are accepted; any other option is refused at plan time.
+    CreateBaseType {
+        name: String,
+        schema: Option<String>,
+        input: Option<String>,
+        output: Option<String>,
+    },
+    /// `CREATE [OR REPLACE] FUNCTION name(args) RETURNS t LANGUAGE internal AS
+    /// '<builtin>'` -- a catalog registration of an internal-language wrapper,
+    /// which is how a base type's I/O functions are declared. Other languages
+    /// are refused at plan time.
+    CreateFunction {
+        name: String,
+        replace: bool,
+        /// Declared argument types, in order (`cstring`, `a-b`).
+        arg_types: Vec<String>,
+        return_type: String,
+        /// The built-in the wrapper names (`textin`).
+        body: String,
+        volatility: String,
+    },
+    /// `DROP FUNCTION [IF EXISTS] name[(args)] [CASCADE]`.
+    DropFunction {
+        name: String,
+        /// `None` when the signature was left off (`DROP FUNCTION f`).
+        arg_types: Option<Vec<String>>,
+        if_exists: bool,
+        cascade: bool,
     },
     /// `CREATE SCHEMA [IF NOT EXISTS] <name>`.
     CreateSchema {
@@ -1207,6 +1250,13 @@ pub fn plan_with_params(
                 subtype,
             })
         }
+        // `CREATE TYPE name` (shell) and `CREATE TYPE name (input = ..., output
+        // = ...)` (base type) are both a DefineStmt of kind OBJECT_TYPE; the
+        // other kinds (aggregate, operator, collation, ...) stay unsupported.
+        N::DefineStmt(d) if ObjectType::try_from(d.kind) == Ok(ObjectType::ObjectType) => {
+            plan_define_type(&d)
+        }
+        N::CreateFunctionStmt(f) => plan_create_function(&f),
         N::CopyStmt(c) => plan_copy(&c, lookup, params),
         N::VariableShowStmt(v) => Ok(Statement::Show(v.name.clone())),
         N::DeclareCursorStmt(d) => {
@@ -1352,6 +1402,109 @@ fn split_qualified_type_name(
             Ok(((schema != "public").then_some(schema), name))
         }
     }
+}
+
+/// `CREATE TYPE name` (a shell) or `CREATE TYPE name (input = f, output = g,
+/// like = t)` (a base type over its shell). Both arrive as a `DefineStmt` of
+/// kind OBJECT_TYPE; an empty option list is the shell form.
+fn plan_define_type(d: &pg_query::protobuf::DefineStmt) -> Result<Statement> {
+    let (schema, name) = split_qualified_type_name(&d.defnames)?;
+    if d.definition.is_empty() {
+        return Ok(Statement::CreateShellType { name, schema });
+    }
+    let mut input = None;
+    let mut output = None;
+    for opt in &d.definition {
+        let Some(N::DefElem(e)) = opt.node.as_ref() else {
+            return Err(Error::Parse("malformed CREATE TYPE option".into()));
+        };
+        let value = e.arg.as_ref().and_then(|a| type_name_of_node(a));
+        match e.defname.to_ascii_lowercase().as_str() {
+            "input" => input = value,
+            "output" => output = value,
+            // `like = text` copies the representation (typlen / alignment /
+            // storage), none of which this server surfaces: a base type is
+            // carried as its text form whatever it is `like`.
+            "like" => {}
+            other => {
+                return Err(Error::Unsupported(format!(
+                    "the CREATE TYPE option \"{other}\""
+                )))
+            }
+        }
+    }
+    Ok(Statement::CreateBaseType {
+        name,
+        schema,
+        input,
+        output,
+    })
+}
+
+/// `CREATE FUNCTION name(args) RETURNS t LANGUAGE internal AS '<builtin>'`.
+/// Only the internal language is planned -- the catalog registration is what a
+/// base type's `input = ` / `output = ` options resolve against. A function
+/// in any other language is refused, since nothing here could run it.
+fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<Statement> {
+    if f.is_procedure {
+        return Err(Error::Unsupported("CREATE PROCEDURE".into()));
+    }
+    let name = f
+        .funcname
+        .iter()
+        .filter_map(|n| match n.node.as_ref()? {
+            N::String(s) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .next_back()
+        .ok_or_else(|| Error::Parse("CREATE FUNCTION without a name".into()))?;
+    let mut arg_types = Vec::new();
+    for p in &f.parameters {
+        let Some(N::FunctionParameter(fp)) = p.node.as_ref() else {
+            return Err(Error::Parse("malformed CREATE FUNCTION parameter".into()));
+        };
+        let ty = fp
+            .arg_type
+            .as_ref()
+            .map(type_name_of)
+            .ok_or_else(|| Error::Parse("CREATE FUNCTION parameter without a type".into()))?;
+        arg_types.push(ty);
+    }
+    let return_type = f
+        .return_type
+        .as_ref()
+        .map(type_name_of)
+        .ok_or_else(|| Error::Unsupported("CREATE FUNCTION without RETURNS".into()))?;
+    let mut language = None;
+    let mut body = None;
+    let mut volatility = "volatile".to_string();
+    for opt in &f.options {
+        let Some(N::DefElem(e)) = opt.node.as_ref() else {
+            continue;
+        };
+        let text = e.arg.as_ref().and_then(|a| type_name_of_node(a));
+        match e.defname.to_ascii_lowercase().as_str() {
+            "language" => language = text,
+            "as" => body = text,
+            "volatility" => volatility = text.unwrap_or(volatility),
+            _ => {}
+        }
+    }
+    let language = language.unwrap_or_default();
+    if !language.eq_ignore_ascii_case("internal") {
+        return Err(Error::Unsupported(format!(
+            "CREATE FUNCTION in language \"{language}\""
+        )));
+    }
+    let body = body.ok_or_else(|| Error::Parse("no function body specified".into()))?;
+    Ok(Statement::CreateFunction {
+        name,
+        replace: f.replace,
+        arg_types,
+        return_type,
+        body,
+        volatility,
+    })
 }
 
 /// Resolve a `serial` pseudo-type to its underlying integer type.
@@ -6248,6 +6401,62 @@ pub fn set_user_multiranges(multiranges: Vec<(String, i64, String)>) {
     PLAN_USER_MULTIRANGES.with(|t| *t.borrow_mut() = multiranges);
 }
 
+thread_local! {
+    /// Base types from `CREATE TYPE name` / `CREATE TYPE name (input = ...,
+    /// output = ...)`: `(resolution name, oid, defined)`. `defined` is false
+    /// while the type is still a SHELL -- a name with no representation yet,
+    /// which PostgreSQL lets I/O functions refer to but nothing else use.
+    /// Installed per statement by the wire layer.
+    static PLAN_USER_BASE_TYPES: std::cell::RefCell<Vec<(String, i64, bool)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Base types: `(resolution name, oid, defined)`.
+pub fn set_user_base_types(types: Vec<(String, i64, bool)>) {
+    PLAN_USER_BASE_TYPES.with(|t| *t.borrow_mut() = types);
+}
+
+/// A base type's `(registered name, oid, defined)` by name, folded exactly as
+/// `user_composite`: a quoted name keeps its case, a bare one folds to lower.
+/// The registered name is the one to print -- the fold has lowercased the
+/// caller's spelling.
+fn user_base_type(name: &str) -> Option<(String, i64, bool)> {
+    let target = canonical_type_ref(name);
+    let trimmed = name.trim();
+    let fold = !(trimmed.starts_with('"') || trimmed.contains('"'));
+    PLAN_USER_BASE_TYPES.with(|t| {
+        t.borrow()
+            .iter()
+            .find(|(n, _, _)| *n == target || (fold && n.eq_ignore_ascii_case(&target)))
+            .map(|(n, oid, defined)| (n.clone(), *oid, *defined))
+    })
+}
+
+/// A base type's resolution NAME by oid -- the reverse door, for rendering
+/// `oid::regtype::text` (which PostgreSQL renders for a shell too).
+fn user_base_type_name(oid: i64) -> Option<String> {
+    PLAN_USER_BASE_TYPES.with(|t| {
+        t.borrow()
+            .iter()
+            .find(|(_, o, _)| *o == oid)
+            .map(|(n, _, _)| n.clone())
+    })
+}
+
+/// Is `name` -- or the element of `name[]` -- a SHELL type? The bare name,
+/// for the `type "x" is only a shell` message.
+fn shell_type_named(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    let element = trimmed
+        .strip_suffix("[]")
+        .map(str::trim_end)
+        .unwrap_or(trimmed);
+    match user_base_type(element) {
+        Some((name, _, false)) => Some(name),
+        _ => None,
+    }
+}
+
 /// The custom RANGE a custom multirange is built from, by resolution name.
 pub fn user_multirange_member(name: &str) -> Option<String> {
     let n = canonical_type_ref(name);
@@ -6389,6 +6598,13 @@ fn user_type_oid(name: &str) -> Option<i64> {
         })
         .or_else(|| user_range_oid(name))
         .or_else(|| user_multirange_oid(name))
+        // A shell has an oid but no representation: `to_regtype` answers NULL
+        // for it and `::regtype` refuses it (measured on 16), so only a
+        // DEFINED base type resolves here.
+        .or_else(|| match user_base_type(name) {
+            Some((_, oid, true)) => Some(oid),
+            _ => None,
+        })
 }
 
 /// A user ENUM's `(oid, labels)` by name, same folding rule.
@@ -6426,6 +6642,7 @@ pub fn user_type_name(oid: i64) -> Option<String> {
         })
         .or_else(|| user_range_name(oid))
         .or_else(|| user_multirange_name(oid))
+        .or_else(|| user_base_type_name(oid))
 }
 
 /// A custom range type's resolution NAME by oid -- for rendering `pg_typeof`
@@ -7816,6 +8033,27 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
     if value == Bson::Null {
         return Ok(Bson::Null);
     }
+    // A cast to a user BASE type (`'hello'::"a-b"`). The value is carried as
+    // the text its input function would have read -- every base type this
+    // server can hold is declared over text I/O -- so a text source passes
+    // through unchanged and any other source has no cast (42846), exactly
+    // PostgreSQL's answer for a type with no cast paths. A SHELL has no
+    // representation at all: 42704 `is only a shell` (both measured on 16).
+    if let Some((name, _, defined)) = user_base_type(target) {
+        if !defined {
+            return Err(Error::UndefinedObject(format!(
+                "type \"{name}\" is only a shell"
+            )));
+        }
+        return match value {
+            Bson::String(text) => Ok(Bson::String(text)),
+            other => Err(Error::CannotCoerce(format!(
+                "cannot cast type {} to {}",
+                display_type(inferred_type(&other)),
+                quote_type_path(&name)
+            ))),
+        };
+    }
     // A cast to a user COMPOSITE type -- `'(1,x)'::testcomp` (text input) or
     // `row(1,'x')::testcomp` (a record). Handled before the bare-record and
     // enum arms below: a composite carries an empty label list in the enum
@@ -7939,10 +8177,15 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
             Bson::String(name) => {
                 match pgtypes::oid_of_name(&name).or_else(|| user_type_or_array_oid(&name)) {
                     Some(oid) => Ok(regtype_value(oid)),
-                    None => Err(Error::UndefinedObject(format!(
-                        "type \"{}\" does not exist",
-                        name.trim()
-                    ))),
+                    None => Err(match shell_type_named(&name) {
+                        Some(shell) => {
+                            Error::UndefinedObject(format!("type \"{shell}\" is only a shell"))
+                        }
+                        None => Error::UndefinedObject(format!(
+                            "type \"{}\" does not exist",
+                            name.trim()
+                        )),
+                    }),
                 }
             }
             other => Err(Error::Unsupported(format!(
@@ -9568,6 +9811,47 @@ fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
         return Ok(Statement::DropType {
             names,
             if_exists: d.missing_ok,
+            cascade: DropBehavior::try_from(d.behavior) == Ok(DropBehavior::DropCascade),
+        });
+    }
+    // `DROP FUNCTION`: each object is an ObjectWithArgs -- the name parts plus
+    // the declared argument types, which PostgreSQL needs to pick one overload.
+    if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectFunction) {
+        if d.objects.len() != 1 {
+            return Err(Error::Unsupported(
+                "DROP FUNCTION of more than one function".into(),
+            ));
+        }
+        let Some(N::ObjectWithArgs(o)) = d.objects[0].node.as_ref() else {
+            return Err(Error::Unsupported("this DROP FUNCTION target".into()));
+        };
+        let name = o
+            .objname
+            .iter()
+            .filter_map(|n| match n.node.as_ref()? {
+                N::String(s) => Some(s.sval.clone()),
+                _ => None,
+            })
+            .next_back()
+            .ok_or_else(|| Error::Parse("DROP FUNCTION without a name".into()))?;
+        let arg_types = if o.args_unspecified {
+            None
+        } else {
+            Some(
+                o.objargs
+                    .iter()
+                    .filter_map(|n| match n.node.as_ref()? {
+                        N::TypeName(tn) => Some(type_name_of(tn)),
+                        _ => None,
+                    })
+                    .collect(),
+            )
+        };
+        return Ok(Statement::DropFunction {
+            name,
+            arg_types,
+            if_exists: d.missing_ok,
+            cascade: DropBehavior::try_from(d.behavior) == Ok(DropBehavior::DropCascade),
         });
     }
     if ObjectType::try_from(d.remove_type) != Ok(ObjectType::ObjectTable) {

@@ -7646,3 +7646,323 @@ def test_syntax_errors_carry_postgresqls_message_only(home: Path) -> None:
             with pytest.raises(psycopg.errors.SyntaxError) as exc:
                 conn.execute(sql, prepare=True)
             assert _diag(exc.value)[:2] == ("42601", message)
+
+
+# ---------------------------------------------------------------------------
+# Shell types, base types and their LANGUAGE internal I/O functions -- the
+# `CREATE TYPE "a-b"; CREATE FUNCTION invin(cstring) RETURNS "a-b" ...;
+# CREATE TYPE "a-b" (input=invin, output=invout, like=text)` sequence that
+# psycopg's `TestLiteral::test_invalid_name` runs. Every value below was
+# measured on PostgreSQL 16.15 (2026-09-09).
+# ---------------------------------------------------------------------------
+
+_SHELL_TYPE_DDL = """
+create type "{name}";
+create function invin(cstring) returns "{name}" language internal immutable strict as 'textin';
+create function invout("{name}") returns cstring language internal immutable strict as 'textout';
+create type "{name}" (input=invin, output=invout, like=text);
+"""
+
+
+def _notice_diags(conn: psycopg.Connection) -> list[tuple[str, str | None, str, str | None]]:
+    seen: list[tuple[str, str | None, str, str | None]] = []
+    conn.add_notice_handler(
+        lambda d: seen.append(
+            (d.severity or "", d.sqlstate, d.message_primary or "", d.message_detail)
+        )
+    )
+    return seen
+
+
+@pytest.mark.parametrize("name", ["a-b", "€", "order", "foo bar", "FooBar"])
+def test_base_type_over_a_shell_round_trips_text_and_arrays(home: Path, name: str) -> None:
+    """The full shell -> I/O functions -> base type sequence, then values.
+
+    A completed base type casts a string literal to itself and to its array
+    type, both described with the type's OWN oids: `pg_type` reports the
+    scalar row (typarray = oid + 100_000, the shared-store rule) and regtype
+    renders the name quoted whenever its spelling needs it -- which is what
+    the five spellings here exercise (measured on 16: `"a-b"`, `"€"`,
+    `"order"`, `"foo bar"`, `"FooBar"`).
+    """
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        cur = conn.cursor()
+        cur.execute(_SHELL_TYPE_DDL.format(name=name))
+        assert cur.statusmessage == "CREATE TYPE"
+        cur.execute("select oid, typarray from pg_type where typname = %s", (name,))
+        oid, typarray = cur.fetchone()
+        assert typarray == oid + 100_000
+        cur.execute(f"""select '{name}'::regtype::text""".replace(name, f'"{name}"'))
+        assert cur.fetchone()[0] == f'"{name}"'
+
+        cur.execute(f"""select 'hello-inv'::"{name}" """)
+        assert cur.fetchone() == ("hello-inv",)
+        assert cur.description[0].type_code == oid
+        # Unregistered, the array oid has no loader and the text stays text
+        # (as with PostgreSQL); psycopg's TypeInfo.fetch is what the gauge
+        # test registers, and it reads pg_type's typarray.
+        cur.execute(f"""select '{{hello-inv}}'::"{name}"[]""")
+        assert cur.fetchone() == ("{hello-inv}",)
+        assert cur.description[0].type_code == typarray
+        info = psycopg.types.TypeInfo.fetch(conn, f'"{name}"')
+        assert (info.oid, info.array_oid, info.name) == (oid, typarray, name)
+        info.register(conn)
+        # (A cursor snapshots the adapters at creation: a fresh one sees it.)
+        assert conn.execute(f"""select '{{hello-inv}}'::"{name}"[]""").fetchone() == (
+            ["hello-inv"],
+        )
+
+        with pytest.raises(psycopg.errors.CannotCoerce) as exc:
+            cur.execute(f"""select 1::"{name}" """)
+        assert _diag(exc.value)[:2] == ("42846", f'cannot cast type integer to "{name}"')
+
+
+def test_shell_type_is_only_a_shell_until_completed(home: Path) -> None:
+    """A bare `CREATE TYPE t` is a shell: nothing can be cast to it, regtype
+    refuses it, to_regtype hides it, `pg_type` shows no array type, and a
+    second shell of the same name is a duplicate (all measured on 16)."""
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        cur = conn.cursor()
+        cur.execute('create type "a-b"')
+        assert cur.statusmessage == "CREATE TYPE"
+        cur.execute("select typarray from pg_type where typname = 'a-b'")
+        assert cur.fetchone() == (0,)
+        cur.execute("""select to_regtype('"a-b"')""")
+        assert cur.fetchone() == (None,)
+        for sql in ["""select 'x'::"a-b" """, """select '"a-b"'::regtype"""]:
+            with pytest.raises(psycopg.errors.UndefinedObject) as exc:
+                cur.execute(sql)
+            assert _diag(exc.value)[:2] == ("42704", 'type "a-b" is only a shell')
+        with pytest.raises(psycopg.errors.DuplicateObject) as exc:
+            cur.execute('create type "a-b"')
+        assert _diag(exc.value)[:2] == ("42710", 'type "a-b" already exists')
+        with pytest.raises(psycopg.errors.UndefinedObject) as exc:
+            cur.execute('create table tt (c "a-b")')
+        assert _diag(exc.value)[:2] == ("42704", 'type "a-b" is only a shell')
+
+
+def test_full_create_type_checks_its_shell_and_io_functions(home: Path) -> None:
+    """Each refusal of the full `CREATE TYPE name (input=, output=)` form, in
+    PostgreSQL 16's order and words: no shell first (42710 -- not 42704 --
+    with the shell hint), then each I/O option missing (42P17), each function
+    missing with its exact signature (42883), and each returning the wrong
+    type (42P17). Once completed the type is a duplicate."""
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        cur = conn.cursor()
+        with pytest.raises(psycopg.errors.DuplicateObject) as exc:
+            cur.execute('create type "c-d" (input=invin, output=invout)')
+        assert _diag(exc.value)[:2] == ("42710", 'type "c-d" does not exist')
+        assert exc.value.diag.message_hint == (
+            "Create the type as a shell type, then create its I/O functions, "
+            "then do a full CREATE TYPE."
+        )
+        cur.execute('create type "a-b"')
+        for sql, message in [
+            ('create type "a-b" (output=invout)', "type input function must be specified"),
+            ('create type "a-b" (input=invin)', "type output function must be specified"),
+        ]:
+            with pytest.raises(psycopg.errors.InvalidObjectDefinition) as exc:
+                cur.execute(sql)
+            assert _diag(exc.value)[:2] == ("42P17", message)
+        with pytest.raises(psycopg.errors.UndefinedFunction) as exc:
+            cur.execute('create type "a-b" (input=invin, output=invout)')
+        assert _diag(exc.value)[:2] == ("42883", "function invin(cstring) does not exist")
+
+        cur.execute(
+            """create function invin(cstring) returns "a-b" language internal as 'textin'"""
+        )
+        with pytest.raises(psycopg.errors.UndefinedFunction) as exc:
+            cur.execute('create type "a-b" (input=invin, output=invout)')
+        assert _diag(exc.value)[:2] == ("42883", 'function invout("a-b") does not exist')
+        cur.execute("create function textin2(cstring) returns text language internal as 'textin'")
+        with pytest.raises(psycopg.errors.InvalidObjectDefinition) as exc:
+            cur.execute('create type "a-b" (input=textin2, output=invout)')
+        assert _diag(exc.value)[:2] == (
+            "42P17",
+            'type input function textin2 must return type "a-b"',
+        )
+        cur.execute("""create function badout("a-b") returns text language internal as 'textout'""")
+        with pytest.raises(psycopg.errors.InvalidObjectDefinition) as exc:
+            cur.execute('create type "a-b" (input=invin, output=badout)')
+        assert _diag(exc.value)[:2] == (
+            "42P17",
+            "type output function badout must return type cstring",
+        )
+        cur.execute(
+            """create function invout("a-b") returns cstring language internal as 'textout'"""
+        )
+        cur.execute('create type "a-b" (input=invin, output=invout)')
+        with pytest.raises(psycopg.errors.DuplicateObject) as exc:
+            cur.execute('create type "a-b" (input=invin, output=invout)')
+        assert _diag(exc.value)[:2] == ("42710", 'type "a-b" already exists')
+
+
+def test_internal_function_ddl_notices_and_errors(home: Path) -> None:
+    """`CREATE FUNCTION ... LANGUAGE internal`: a shell argument / return
+    type is accepted with a 42809 NOTICE naming the type UNQUOTED; an
+    unknown return type becomes a new shell with a 42704 NOTICE (and its
+    `Creating a shell type definition.` detail); an unknown argument type is
+    a 42704 error (unquoted); an unknown built-in is 42883; a duplicate
+    signature is 42723 unless OR REPLACE. All measured on 16."""
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        notices = _notice_diags(conn)
+        cur = conn.cursor()
+        cur.execute('create type "a-b"')
+        cur.execute(
+            """create function invin(cstring) returns "a-b" language internal as 'textin'"""
+        )
+        assert cur.statusmessage == "CREATE FUNCTION"
+        assert notices == [("NOTICE", "42809", "return type a-b is only a shell", None)]
+        notices.clear()
+        cur.execute(
+            """create function invout("a-b") returns cstring language internal as 'textout'"""
+        )
+        assert notices == [("NOTICE", "42809", "argument type a-b is only a shell", None)]
+        notices.clear()
+
+        cur.execute("""create function f3(cstring) returns nosuch language internal as 'textin'""")
+        assert notices == [
+            (
+                "NOTICE",
+                "42704",
+                'type "nosuch" is not yet defined',
+                "Creating a shell type definition.",
+            )
+        ]
+        cur.execute("select typarray from pg_type where typname = 'nosuch'")
+        assert cur.fetchone() == (0,)
+
+        with pytest.raises(psycopg.errors.UndefinedObject) as exc:
+            cur.execute("""create function f2(nosuch2) returns int language internal as 'int4in'""")
+        assert _diag(exc.value)[:2] == ("42704", "type nosuch2 does not exist")
+        with pytest.raises(psycopg.errors.UndefinedFunction) as exc:
+            cur.execute("""create function f4(cstring) returns text language internal as 'nope'""")
+        assert _diag(exc.value)[:2] == ("42883", 'there is no built-in function named "nope"')
+        with pytest.raises(psycopg.errors.DuplicateFunction) as exc:
+            cur.execute(
+                """create function invin(cstring) returns "a-b" language internal as 'textin'"""
+            )
+        assert _diag(exc.value)[:2] == (
+            "42723",
+            'function "invin" already exists with same argument types',
+        )
+        cur.execute(
+            'create or replace function invin(cstring) returns "a-b" '
+            "language internal as 'textin'"
+        )
+        assert cur.statusmessage == "CREATE FUNCTION"
+
+
+def test_drop_type_restricts_on_its_io_functions_and_cascades_with_a_notice(
+    home: Path,
+) -> None:
+    """A base type's I/O functions depend on it: plain DROP TYPE is 2BP01
+    with one DETAIL line per function and the CASCADE hint; CASCADE drops
+    them with `drop cascades to N other objects` (one dependent is named in
+    the message itself instead); IF EXISTS on a missing type is a NOTICE.
+    Inside a transaction the cascade rolls back. Measured on 16."""
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        notices = _notice_diags(conn)
+        cur = conn.cursor()
+        cur.execute(_SHELL_TYPE_DDL.format(name="a-b"))
+        with pytest.raises(psycopg.errors.DependentObjectsStillExist) as exc:
+            cur.execute('drop type "a-b"')
+        assert _diag(exc.value)[:3] == (
+            "2BP01",
+            'cannot drop type "a-b" because other objects depend on it',
+            'function invin(cstring) depends on type "a-b"\n'
+            'function invout("a-b") depends on type "a-b"',
+        )
+        assert exc.value.diag.message_hint == (
+            "Use DROP ... CASCADE to drop the dependent objects too."
+        )
+
+        conn.autocommit = False
+        notices.clear()
+        cur.execute('drop type "a-b" cascade')
+        assert notices == [
+            (
+                "NOTICE",
+                "00000",
+                "drop cascades to 2 other objects",
+                'drop cascades to function invin(cstring)\ndrop cascades to function invout("a-b")',
+            )
+        ]
+        conn.rollback()
+        conn.autocommit = True
+        cur.execute("""select 'still'::"a-b" """)
+        assert cur.fetchone() == ("still",)
+
+        notices.clear()
+        cur.execute('drop type "a-b" cascade')
+        cur.execute("select count(*) from pg_type where typname = 'a-b'")
+        assert cur.fetchone() == (0,)
+        with pytest.raises(psycopg.errors.UndefinedObject) as exc:
+            cur.execute('drop type "a-b"')
+        assert _diag(exc.value)[:2] == ("42704", 'type "a-b" does not exist')
+        notices.clear()
+        cur.execute('drop type if exists "a-b"')
+        assert cur.statusmessage == "DROP TYPE"
+        assert notices == [("NOTICE", "00000", 'type "a-b" does not exist, skipping', None)]
+
+        # A shell with ONE dependent: the function is named in the message.
+        cur.execute("create type sh")
+        cur.execute("create function shin(cstring) returns sh language internal as 'textin'")
+        notices.clear()
+        cur.execute("drop type sh cascade")
+        assert notices == [("NOTICE", "00000", "drop cascades to function shin(cstring)", None)]
+
+
+def test_drop_function_resolves_signature_types_and_dependents(home: Path) -> None:
+    """DROP FUNCTION: an argument type that does not exist is the TYPE's
+    42704 (quoted), a missing signature 42883 with the signature, a bare name
+    that matches nothing `could not find a function named`, and IF EXISTS
+    turns each into a `... does not exist, skipping` NOTICE. A defined base
+    type depends on its I/O functions: 2BP01 lists the type and the type's
+    other function; CASCADE drops both and says so. Measured on 16."""
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        notices = _notice_diags(conn)
+        cur = conn.cursor()
+        cur.execute(_SHELL_TYPE_DDL.format(name="a-b"))
+        with pytest.raises(psycopg.errors.DependentObjectsStillExist) as exc:
+            cur.execute("drop function invin(cstring)")
+        assert _diag(exc.value)[:3] == (
+            "2BP01",
+            "cannot drop function invin(cstring) because other objects depend on it",
+            'type "a-b" depends on function invin(cstring)\n'
+            'function invout("a-b") depends on type "a-b"',
+        )
+        with pytest.raises(psycopg.errors.UndefinedFunction) as exc:
+            cur.execute("drop function invout(cstring)")
+        assert _diag(exc.value)[:2] == ("42883", "function invout(cstring) does not exist")
+        with pytest.raises(psycopg.errors.UndefinedFunction) as exc:
+            cur.execute("drop function nosuch")
+        assert _diag(exc.value)[:2] == ("42883", 'could not find a function named "nosuch"')
+        notices.clear()
+        cur.execute("drop function if exists invout(cstring)")
+        cur.execute("drop function if exists nosuch")
+        assert cur.statusmessage == "DROP FUNCTION"
+        assert notices == [
+            ("NOTICE", "00000", "function invout(cstring) does not exist, skipping", None),
+            ("NOTICE", "00000", "function nosuch() does not exist, skipping", None),
+        ]
+
+        notices.clear()
+        cur.execute('drop function invout("a-b") cascade')
+        assert notices == [
+            (
+                "NOTICE",
+                "00000",
+                "drop cascades to 2 other objects",
+                'drop cascades to type "a-b"\ndrop cascades to function invin(cstring)',
+            )
+        ]
+        cur.execute("select count(*) from pg_type where typname = 'a-b'")
+        assert cur.fetchone() == (0,)
+        # The type is gone, so its name in a signature fails as a TYPE.
+        with pytest.raises(psycopg.errors.UndefinedObject) as exc:
+            cur.execute('drop function invout("a-b")')
+        assert _diag(exc.value)[:2] == ("42704", 'type "a-b" does not exist')
+        notices.clear()
+        cur.execute('drop function if exists invout("a-b")')
+        assert notices == [("NOTICE", "00000", 'type "a-b" does not exist, skipping', None)]

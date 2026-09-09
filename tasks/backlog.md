@@ -603,15 +603,27 @@ remain open:
   `escape_string_warning` notices; `N'...'` literals are not rewritten (they
   keep the conforming reading), and `backslash_quote` is not a setting
   (2026-09-09).
-- [ ] **OPEN — RUST pgserver: `test_sql.py::TestLiteral::test_invalid_name[*]`
-      needs shell types + `CREATE FUNCTION ... LANGUAGE internal` + `CREATE
-      TYPE (input=..., output=...)` (`DefineStmt`, 2026-09-09).** The test
-      defines a base type named `a-b` / `€` / `order` / `foo bar` / `FooBar`
-      with `int4in`/`int4out` and then casts a literal to it; PG 16.15 accepts
-      the DDL and renders the cast as `'1'::"a-b"` etc. The Rust planner
-      answers `0A000 DefineStmt is not supported yet` on the `CREATE TYPE`.
-      The `regtype` quoting half (reserved keyword `order` → `"order"`) landed
-      2026-09-09; only the DDL is missing.
+- [ ] **OPEN — RUST pgserver: a user BASE type is carried as text, so a
+      cast OUT of it never fails and its values compare (2026-09-09).** A
+      base type completed by `CREATE TYPE t (input=, output=)` stores and
+      returns its text form; `'a'::"a-b"::int` is 42846 `cannot cast type
+      "a-b" to integer` on PG 16.15 but parses the text here, and `=` /
+      `ORDER BY` on the type answer where PG says 42883 `operator does not
+      exist: "a-b" = "a-b"` / `could not identify an ordering operator for
+      type "a-b"`. Values carry no type tag on the way out of storage, which
+      is what a faithful refusal needs.
+- [ ] **OPEN — RUST pgserver: `CREATE FUNCTION` plans only `LANGUAGE
+      internal`, as a catalog row that is never callable (2026-09-09).** The
+      registration exists so a base type's `input = ` / `output = ` resolve
+      (PG 16.15 crashed its backend when a mis-declared internal wrapper was
+      called, so calling one is not imitated); `LANGUAGE sql` / `plpgsql`
+      are 0A000, and PG's `WARNING: type input function f should not be
+      volatile` is not emitted (the shared `__sql_functions__` doc has no
+      volatility field). Two overloads at one arity are refused with 0A000
+      because the shared catalog keys a function on `name/nargs`. The
+      `CREATE TYPE` options other than `input` / `output` / `like`
+      (`internallength`, `category`, `receive`, ...) are 0A000 rather than
+      applied.
 - [ ] **OPEN — RUST pgserver: `DO` blocks cover a SUBSET of PL/pgSQL
       (2026-09-09).** `plpgsql_do.rs` parses `BEGIN ... END` with `RAISE`
       (all levels, `USING errcode / message / detail / hint / column /
