@@ -381,9 +381,16 @@ pub enum Statement {
     /// `DEALLOCATE <name>`: the wire layer drops that one prepared statement,
     /// answering 26000 when no statement of the name exists.
     Deallocate(String),
-    /// `NOTIFY channel [, payload]`, completing with the `NOTIFY` tag. No
-    /// LISTEN exists here, so there is no delivery.
-    Notify,
+    /// `NOTIFY channel [, payload]`: queued for the transaction, delivered
+    /// to every backend LISTENing on the channel when it commits.
+    Notify {
+        channel: String,
+        payload: String,
+    },
+    /// `LISTEN channel`: takes effect at commit, like the NOTIFY it pairs with.
+    Listen(String),
+    /// `UNLISTEN channel` (`Some`) or `UNLISTEN *` (`None`).
+    Unlisten(Option<String>),
     /// `DO [LANGUAGE lang] 'body'`: an inline code block. The planner only
     /// carries the body and the language (default `plpgsql`); the wire layer
     /// interprets the small RAISE / EXECUTE subset it supports.
@@ -851,6 +858,17 @@ pub enum ConstCol {
     /// NULL). The sleep happens at execution, on the connection's own thread,
     /// so it costs the caller exactly the wait PostgreSQL would.
     Sleep(Bson),
+    /// `pg_notify(channel, payload)` -- a NOTIFY as a function, queued for
+    /// the transaction like the statement. Either argument may be NULL; the
+    /// server applies PostgreSQL's rules (an empty channel is 22023, a NULL
+    /// payload is the empty string).
+    PgNotify {
+        channel: Bson,
+        payload: Bson,
+    },
+    /// `pg_listening_channels()` -- one row per channel this session
+    /// LISTENs on, which only the server's session knows.
+    ListeningChannels,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1307,11 +1325,19 @@ pub fn plan_with_params(
         // `DEALLOCATE ALL` carries no name; `DEALLOCATE x` names one.
         N::DeallocateStmt(d) if d.name.is_empty() => Ok(Statement::DeallocateAll),
         N::DeallocateStmt(d) => Ok(Statement::Deallocate(d.name.clone())),
-        // `NOTIFY channel [, payload]`: nothing LISTENs on this server, so
-        // there is nobody to deliver to, and PostgreSQL's answer to a NOTIFY
-        // with no listener is the bare `NOTIFY` tag -- which is all a client
-        // preparing the statement (psycopg's `test_misc_statement`) sees.
-        N::NotifyStmt(_) => Ok(Statement::Notify),
+        // LISTEN / UNLISTEN / NOTIFY: the parser has already folded the
+        // channel to lower case unless it was quoted, and `UNLISTEN *` comes
+        // through as the literal name `*`.
+        N::NotifyStmt(n) => Ok(Statement::Notify {
+            channel: n.conditionname.clone(),
+            payload: n.payload.clone(),
+        }),
+        N::ListenStmt(l) => Ok(Statement::Listen(l.conditionname.clone())),
+        // `UNLISTEN *` carries no name at all in the parse tree.
+        N::UnlistenStmt(u) if u.conditionname.is_empty() || u.conditionname == "*" => {
+            Ok(Statement::Unlisten(None))
+        }
+        N::UnlistenStmt(u) => Ok(Statement::Unlisten(Some(u.conditionname.clone()))),
         N::DoStmt(d) => {
             let mut language = "plpgsql".to_string();
             let mut body = None;
@@ -4918,6 +4944,42 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                         },
                         ConstCol::Sleep(seconds),
                         "void".to_string(),
+                        -1,
+                    ));
+                    continue;
+                }
+                // `pg_notify(channel, payload)` and `pg_listening_channels()`
+                // belong to the session, which only the server has.
+                if name == "pg_notify" {
+                    if f.args.len() != 2 {
+                        return Err(Error::Unsupported(format!(
+                            "pg_notify() with {} arguments",
+                            f.args.len()
+                        )));
+                    }
+                    let channel = const_value(&f.args[0], params)?;
+                    let payload = const_value(&f.args[1], params)?;
+                    columns.push((
+                        if rt.name.is_empty() {
+                            "pg_notify".to_string()
+                        } else {
+                            rt.name.clone()
+                        },
+                        ConstCol::PgNotify { channel, payload },
+                        "void".to_string(),
+                        -1,
+                    ));
+                    continue;
+                }
+                if name == "pg_listening_channels" {
+                    columns.push((
+                        if rt.name.is_empty() {
+                            "pg_listening_channels".to_string()
+                        } else {
+                            rt.name.clone()
+                        },
+                        ConstCol::ListeningChannels,
+                        "text".to_string(),
                         -1,
                     ));
                     continue;

@@ -597,7 +597,29 @@ pub trait PgWireServerHandlers: 'static {
     fn idle_timeout(&self) -> Option<(std::time::Duration, crate::error::ErrorInfo)> {
         None
     }
+
+    /// Out-of-band work for an idle connection (SecantusDB local patch): a
+    /// future that resolves when the backend has something to send the client
+    /// that no frontend message asked for -- a `NotificationResponse` from
+    /// another session's NOTIFY, or the FATAL that `pg_terminate_backend`
+    /// ends the session with. The connection loop races it against the next
+    /// frontend message; `None` means the handler has no such work, ever.
+    fn idle_event(&self) -> Option<IdleEventFuture<'_>> {
+        None
+    }
 }
+
+/// What an [`PgWireServerHandlers::idle_event`] future resolves to.
+pub enum IdleEvent {
+    /// Send these messages and keep waiting for the client.
+    Send(Vec<crate::messages::PgWireBackendMessage>),
+    /// Send this (FATAL) error and close the connection.
+    Fatal(crate::error::ErrorInfo),
+}
+
+/// The boxed future an [`PgWireServerHandlers::idle_event`] returns.
+pub type IdleEventFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = IdleEvent> + Send + 'a>>;
 
 impl<T> PgWireServerHandlers for Arc<T>
 where
@@ -629,6 +651,10 @@ where
 
     fn idle_timeout(&self) -> Option<(std::time::Duration, crate::error::ErrorInfo)> {
         (**self).idle_timeout()
+    }
+
+    fn idle_event(&self) -> Option<IdleEventFuture<'_>> {
+        (**self).idle_event()
     }
 }
 

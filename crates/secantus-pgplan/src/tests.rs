@@ -307,17 +307,69 @@ fn update_and_delete_are_planned() {
 
 #[test]
 fn shapes_sqlglot_mis_parses_reach_us_as_real_statements() {
-    // `DROP TABLE a, b, c`, `BEGIN ...`, `MOVE FORWARD 2 IN c` and
-    // `NOTIFY chan, 'payload'` used to live here too; all four now EXECUTE
-    // rather than merely parsing, which is the stronger result.
-    for sql in ["LISTEN chan", "COPY t FROM stdin WITH (freeze on)"] {
+    // `DROP TABLE a, b, c`, `BEGIN ...`, `MOVE FORWARD 2 IN c`,
+    // `NOTIFY chan, 'payload'` and `LISTEN chan` used to live here too; all
+    // five now EXECUTE rather than merely parsing, which is the stronger
+    // result.
+    for sql in ["COPY t FROM stdin WITH (freeze on)"] {
         let err = plan(sql, &lookup).expect_err(sql);
         assert_eq!(err.sqlstate(), "0A000", "for {sql} (got {err})");
     }
-    assert!(matches!(
+    assert_eq!(
         plan_ok("NOTIFY chan, 'payload'"),
-        Statement::Notify
-    ));
+        Statement::Notify {
+            channel: "chan".into(),
+            payload: "payload".into()
+        }
+    );
+}
+
+/// LISTEN / UNLISTEN / NOTIFY carry the channel with the parser's case fold
+/// applied (`FOO` is `foo`, `"Foo"` is `Foo`), and `UNLISTEN *` is the
+/// name-less form.
+#[test]
+fn listen_notify_statements_carry_their_channel() {
+    assert_eq!(plan_ok("LISTEN Foo"), Statement::Listen("foo".into()));
+    assert_eq!(plan_ok("LISTEN \"Foo\""), Statement::Listen("Foo".into()));
+    assert_eq!(
+        plan_ok("UNLISTEN foo"),
+        Statement::Unlisten(Some("foo".into()))
+    );
+    assert_eq!(plan_ok("UNLISTEN *"), Statement::Unlisten(None));
+    assert_eq!(
+        plan_ok("NOTIFY foo"),
+        Statement::Notify {
+            channel: "foo".into(),
+            payload: String::new()
+        }
+    );
+    match plan_ok("SELECT pg_notify('foo', 'p')") {
+        Statement::SelectConstant(sc) => assert_eq!(
+            sc.columns,
+            vec![(
+                "pg_notify".to_string(),
+                ConstCol::PgNotify {
+                    channel: Bson::String("foo".into()),
+                    payload: Bson::String("p".into())
+                },
+                "void".to_string(),
+                -1
+            )]
+        ),
+        other => panic!("{other:?}"),
+    }
+    match plan_ok("SELECT pg_listening_channels()") {
+        Statement::SelectConstant(sc) => assert_eq!(
+            sc.columns,
+            vec![(
+                "pg_listening_channels".to_string(),
+                ConstCol::ListeningChannels,
+                "text".to_string(),
+                -1
+            )]
+        ),
+        other => panic!("{other:?}"),
+    }
 }
 
 /// Aggregates plan to POSITIONAL output columns.

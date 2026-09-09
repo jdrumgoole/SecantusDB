@@ -14,7 +14,7 @@ mod encoding;
 mod plpgsql_do;
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI32};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -37,7 +37,7 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
 use pgwire::messages::data::DataRow;
 use pgwire::messages::extendedquery::{Describe, Parse, Sync as PgSync, TARGET_TYPE_BYTE_PORTAL};
-use pgwire::messages::response::{CommandComplete, ReadyForQuery};
+use pgwire::messages::response::{CommandComplete, NotificationResponse, ReadyForQuery};
 use pgwire::messages::simplequery::Query;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::types::format::FormatOptions;
@@ -71,6 +71,32 @@ pub struct BackendEntry {
     /// the way the failed statement itself would have.
     stream_failed: AtomicBool,
     activity: Mutex<BackendActivity>,
+    /// The channels this backend LISTENs on -- read by every other backend's
+    /// NOTIFY, which is why they live here and not on the handler.
+    listening: Mutex<Vec<String>>,
+    /// Notifications addressed to this backend and not yet sent: the
+    /// `NotificationResponse`s it delivers before its next `ReadyForQuery`,
+    /// or straight away when it is idle.
+    inbox: Mutex<VecDeque<Notification>>,
+    /// Wakes the connection's idle wait when the inbox fills or `terminate`
+    /// is set, so an idle client hears without sending anything.
+    wake: tokio::sync::Notify,
+}
+
+/// One queued `NotificationResponse`.
+#[derive(Clone, Debug)]
+struct Notification {
+    pid: i32,
+    channel: String,
+    payload: String,
+}
+
+/// A LISTEN / UNLISTEN waiting for its transaction to commit.
+#[derive(Clone, Debug)]
+enum ListenOp {
+    Listen(String),
+    Unlisten(String),
+    UnlistenAll,
 }
 
 /// What `pg_stat_activity` reports for one backend.
@@ -94,6 +120,9 @@ impl BackendEntry {
             terminate: AtomicBool::new(false),
             cancel: AtomicBool::new(false),
             stream_failed: AtomicBool::new(false),
+            listening: Mutex::new(Vec::new()),
+            inbox: Mutex::new(VecDeque::new()),
+            wake: tokio::sync::Notify::new(),
             activity: Mutex::new(BackendActivity {
                 datname: datname.to_string(),
                 usename: String::new(),
@@ -475,6 +504,12 @@ pub struct PgHandler {
     implicit_extended: AtomicBool,
     /// A statement in the open group failed: the group rolls back at `Sync`.
     group_failed: AtomicBool,
+    /// NOTIFYs of the open transaction, `(channel, payload)` in first-issue
+    /// order with duplicates dropped, as PostgreSQL queues them: delivered
+    /// at commit, discarded at rollback.
+    pending_notifies: Mutex<Vec<(String, String)>>,
+    /// LISTEN / UNLISTENs of the open transaction, applied at commit.
+    pending_listens: Mutex<Vec<ListenOp>>,
 }
 
 /// A user type created (`Some(doc)`) or dropped (`None`) in the open
@@ -616,6 +651,8 @@ impl PgHandler {
             commit_failed: AtomicBool::new(false),
             implicit_extended: AtomicBool::new(false),
             group_failed: AtomicBool::new(false),
+            pending_notifies: Mutex::new(Vec::new()),
+            pending_listens: Mutex::new(Vec::new()),
         }
     }
 
@@ -3645,6 +3682,14 @@ impl Drop for PgHandler {
 
 #[async_trait]
 impl SimpleQueryHandler for PgHandler {
+    async fn before_ready_for_query<C>(&self, client: &mut C) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        self.flush_notifications(client).await
+    }
+
     /// The query text arrives in the client's `client_encoding`, not
     /// necessarily UTF-8: decode the raw wire bytes from the session's
     /// encoding (a LATIN9 `select '\u{20ac}'` is the single byte 0xA4, which
@@ -4442,6 +4487,7 @@ impl PgHandler {
         if !failed {
             return self.commit_implicit();
         }
+        self.settle_notifies(false);
         // Not `rollback_implicit`: that closes every cursor, holdable ones
         // included, and a `WITH HOLD` cursor from an earlier, committed
         // transaction survives a failed statement in PostgreSQL. The group
@@ -4497,16 +4543,19 @@ impl PgHandler {
                 self.storage
                     .rollback_user_transaction(&mut handle)
                     .map_err(|e| Self::storage_err("could not roll back a transaction", e))?;
+                self.settle_notifies(false);
                 return Err(e);
             }
             self.storage
                 .commit_user_transaction(&mut handle)
                 .map_err(|e| Self::storage_err("could not commit a transaction", e))?;
         }
+        self.settle_notifies(true);
         Ok(())
     }
 
     fn rollback_implicit(&self) -> PgWireResult<()> {
+        self.settle_notifies(false);
         self.close_cursors_on_txn_end(false);
         self.savepoints
             .lock()
@@ -4595,6 +4644,18 @@ impl PgHandler {
         let result = self
             .run_typed_inner(query, params, param_types, max_rows)
             .await;
+        // Outside a block the statement was its own transaction: its NOTIFYs
+        // go out now, or nowhere if it failed. Inside a block (or an
+        // extended-protocol statement group) they wait for the COMMIT.
+        if !self
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && !self
+                .implicit_extended
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.settle_notifies(result.is_ok());
+        }
         self.note_activity(
             if self
                 .in_transaction
@@ -4663,6 +4724,16 @@ impl PgHandler {
     /// A cancellation point: `57014` if a `CancelRequest` for this backend
     /// has arrived since the running statement started.
     fn check_cancel(&self) -> PgWireResult<()> {
+        // A `pg_terminate_backend` aimed at a RUNNING statement ends it, and
+        // the session, at the statement's next cancellation point -- the
+        // client sees the FATAL within the wait, not after it.
+        if self
+            .backend
+            .terminate
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(Self::admin_shutdown());
+        }
         if self.backend.cancelled() {
             return Err(Self::query_canceled());
         }
@@ -5054,6 +5125,26 @@ impl PgHandler {
                 }
                 Ok(Bson::String(String::new()))
             }
+            ConstCol::PgNotify { channel, payload } => {
+                // `pg_notify(NULL, ...)` and `pg_notify('', ...)` are the same
+                // 22023; a NULL payload is the empty string. Probed PG 16.
+                let channel = match channel {
+                    Bson::String(c) => c.clone(),
+                    _ => String::new(),
+                };
+                let payload = match payload {
+                    Bson::String(p) => p.clone(),
+                    Bson::Null => String::new(),
+                    other => other.to_string(),
+                };
+                self.queue_notify(&channel, &payload)?;
+                Ok(Bson::String(String::new()))
+            }
+            ConstCol::ListeningChannels => Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "0A000".into(), // feature_not_supported
+                "pg_listening_channels() beside other columns is not supported yet".into(),
+            )))),
             ConstCol::TerminateBackend(inner) => {
                 let target = match self.resolve_const_col(inner)? {
                     Bson::Int32(i) => i64::from(i),
@@ -5088,7 +5179,10 @@ impl PgHandler {
                     .map(|entry| {
                         entry
                             .terminate
-                            .store(true, std::sync::atomic::Ordering::Relaxed)
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        // An idle target hears it from its idle wait; an
+                        // active one from its next cancellation point.
+                        entry.wake.notify_one();
                     })
                     .is_some();
                 Ok(Bson::Boolean(armed))
@@ -5151,6 +5245,160 @@ impl PgHandler {
             "57P01".into(), // admin_shutdown
             "terminating connection due to administrator command".into(),
         )))
+    }
+
+    /// Queue a NOTIFY for the open transaction.
+    ///
+    /// PostgreSQL's rules, probed on 16: the channel must be non-empty
+    /// (22023), the payload is capped at 7999 bytes (22023), and a
+    /// `(channel, payload)` pair already queued in this transaction is not
+    /// queued again -- the listener gets it once, in first-issue order.
+    fn queue_notify(&self, channel: &str, payload: &str) -> PgWireResult<()> {
+        if channel.is_empty() {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "22023".into(), // invalid_parameter_value
+                "channel name cannot be empty".into(),
+            ))));
+        }
+        if payload.len() >= 8000 {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "22023".into(), // invalid_parameter_value
+                "payload string too long".into(),
+            ))));
+        }
+        let mut pending = self
+            .pending_notifies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !pending.iter().any(|(c, p)| c == channel && p == payload) {
+            pending.push((channel.to_string(), payload.to_string()));
+        }
+        Ok(())
+    }
+
+    /// The transaction ended: apply its LISTEN / UNLISTENs and deliver its
+    /// NOTIFYs to every listening backend's inbox (this one's included) on
+    /// commit; drop both on rollback.
+    fn settle_notifies(&self, commit: bool) {
+        let listens = std::mem::take(
+            &mut *self
+                .pending_listens
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        let notifies = std::mem::take(
+            &mut *self
+                .pending_notifies
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        if !commit {
+            return;
+        }
+        if !listens.is_empty() {
+            let mut listening = self
+                .backend
+                .listening
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for op in listens {
+                match op {
+                    ListenOp::Listen(c) => {
+                        if !listening.contains(&c) {
+                            listening.push(c);
+                        }
+                    }
+                    ListenOp::Unlisten(c) => listening.retain(|l| *l != c),
+                    ListenOp::UnlistenAll => listening.clear(),
+                }
+            }
+        }
+        if notifies.is_empty() {
+            return;
+        }
+        let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
+        let registry = backend_registry().lock().unwrap_or_else(|e| e.into_inner());
+        for entry in registry.values() {
+            let mut delivered = false;
+            {
+                let listening = entry.listening.lock().unwrap_or_else(|e| e.into_inner());
+                let mut inbox = entry.inbox.lock().unwrap_or_else(|e| e.into_inner());
+                for (channel, payload) in &notifies {
+                    if listening.contains(channel) {
+                        inbox.push_back(Notification {
+                            pid,
+                            channel: channel.clone(),
+                            payload: payload.clone(),
+                        });
+                        delivered = true;
+                    }
+                }
+            }
+            if delivered {
+                entry.wake.notify_one();
+            }
+        }
+    }
+
+    /// The `NotificationResponse`s this backend owes its client right now:
+    /// everything in the inbox, unless a transaction block is open --
+    /// PostgreSQL holds them until the block ends (probed 16: a listener
+    /// idle in a block hears nothing until its COMMIT).
+    fn drain_notifications(&self) -> Vec<PgWireBackendMessage> {
+        if self
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Vec::new();
+        }
+        let mut inbox = self.backend.inbox.lock().unwrap_or_else(|e| e.into_inner());
+        inbox
+            .drain(..)
+            .map(|n| {
+                PgWireBackendMessage::NotificationResponse(NotificationResponse::new(
+                    n.pid, n.channel, n.payload,
+                ))
+            })
+            .collect()
+    }
+
+    /// The rows of a FROM-less SELECT: one, of its resolved columns -- or
+    /// none under a false WHERE (and nothing resolved, so a `pg_sleep()`
+    /// behind it does not wait) -- or, for `SELECT pg_listening_channels()`,
+    /// one per channel in LISTEN order, the set-returning shape.
+    fn const_rows(&self, sc: &secantus_pgplan::SelectConstant) -> PgWireResult<Vec<Vec<Bson>>> {
+        if !sc.where_true {
+            return Ok(Vec::new());
+        }
+        if let [(_, ConstCol::ListeningChannels, _, _)] = sc.columns.as_slice() {
+            return Ok(self
+                .backend
+                .listening
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .map(|c| vec![Bson::String(c.clone())])
+                .collect());
+        }
+        Ok(vec![sc
+            .columns
+            .iter()
+            .map(|(_, c, _, _)| self.resolve_const_col(c))
+            .collect::<PgWireResult<Vec<_>>>()?])
+    }
+
+    /// Send the owed `NotificationResponse`s, before a `ReadyForQuery`.
+    async fn flush_notifications<C>(&self, client: &mut C) -> PgWireResult<()>
+    where
+        C: Sink<PgWireBackendMessage> + Unpin + Send,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        for message in self.drain_notifications() {
+            client.feed(message).await?;
+        }
+        Ok(())
     }
 
     /// SAVEPOINT / RELEASE / ROLLBACK TO.
@@ -5433,6 +5681,7 @@ impl PgHandler {
                         .commit_user_transaction(&mut handle)
                         .map_err(|e| Self::storage_err("could not commit", e))?;
                 }
+                self.settle_notifies(true);
                 ("COMMIT", chain)
             }
             TransactionControl::Rollback { chain } => {
@@ -5452,6 +5701,7 @@ impl PgHandler {
                         .rollback_user_transaction(&mut handle)
                         .map_err(|e| Self::storage_err("could not roll back", e))?;
                 }
+                self.settle_notifies(false);
                 ("ROLLBACK", chain)
             }
             // Handled before this, in `run`: they are statements INSIDE a
@@ -5731,16 +5981,11 @@ impl PgHandler {
     /// read the bare column and write `id`.
     fn query_rows(&self, inner: &Statement) -> PgWireResult<Vec<Vec<Option<Bson>>>> {
         match inner {
-            Statement::SelectConstant(sc) => {
-                if !sc.where_true {
-                    return Ok(Vec::new());
-                }
-                let mut row = Vec::with_capacity(sc.columns.len());
-                for (_, col, _, _) in &sc.columns {
-                    row.push(Some(self.resolve_const_col(col)?));
-                }
-                Ok(vec![row])
-            }
+            Statement::SelectConstant(sc) => Ok(self
+                .const_rows(sc)?
+                .into_iter()
+                .map(|row| row.into_iter().map(Some).collect())
+                .collect()),
             Statement::ValuesConstant(vc) => Ok(vc
                 .rows
                 .iter()
@@ -7348,7 +7593,27 @@ impl PgHandler {
                 prepared.remove(idx);
                 Ok(vec![Response::Execution(Tag::new("DEALLOCATE"))])
             }
-            Statement::Notify => Ok(vec![Response::Execution(Tag::new("NOTIFY"))]),
+            Statement::Notify { channel, payload } => {
+                self.queue_notify(&channel, &payload)?;
+                Ok(vec![Response::Execution(Tag::new("NOTIFY"))])
+            }
+            Statement::Listen(channel) => {
+                self.pending_listens
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(ListenOp::Listen(channel));
+                Ok(vec![Response::Execution(Tag::new("LISTEN"))])
+            }
+            Statement::Unlisten(channel) => {
+                self.pending_listens
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(match channel {
+                        Some(channel) => ListenOp::Unlisten(channel),
+                        None => ListenOp::UnlistenAll,
+                    });
+                Ok(vec![Response::Execution(Tag::new("UNLISTEN"))])
+            }
 
             Statement::Set { name, value } => {
                 let key = canonical_setting(&name);
@@ -7476,15 +7741,7 @@ impl PgHandler {
                 );
                 // A false WHERE means no row -- and nothing to resolve, so a
                 // `pg_sleep()` behind it does not wait either.
-                let values: Option<Vec<Bson>> = sc
-                    .where_true
-                    .then(|| {
-                        sc.columns
-                            .iter()
-                            .map(|(_, c, _, _)| self.resolve_const_col(c))
-                            .collect::<PgWireResult<Vec<_>>>()
-                    })
-                    .transpose()?;
+                let values = self.const_rows(&sc)?;
                 let schema_ref = schema.clone();
                 let rows = stream::iter(values).map(move |vals| {
                     let mut enc = DataRowEncoder::new(schema_ref.clone());
@@ -11399,6 +11656,7 @@ impl ExtendedQueryHandler for PgHandler {
             client.set_transaction_status(pgwire::messages::response::TransactionStatus::Idle);
         }
         pgwire::api::store::PortalStore::rm_portal(client.portal_store(), DEFAULT_NAME);
+        self.flush_notifications(client).await?;
         client
             .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
                 client.transaction_status(),
@@ -11764,6 +12022,27 @@ impl PgWireServerHandlers for HandlerFactory {
     }
     fn idle_timeout(&self) -> Option<(std::time::Duration, ErrorInfo)> {
         self.0.idle_timeout()
+    }
+
+    fn idle_event(&self) -> Option<pgwire::api::IdleEventFuture<'_>> {
+        let handler = &self.0;
+        Some(Box::pin(async move {
+            loop {
+                if handler
+                    .backend
+                    .terminate
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    let info: ErrorInfo = PgHandler::admin_shutdown().into();
+                    return pgwire::api::IdleEvent::Fatal(info);
+                }
+                let messages = handler.drain_notifications();
+                if !messages.is_empty() {
+                    return pgwire::api::IdleEvent::Send(messages);
+                }
+                handler.backend.wake.notified().await;
+            }
+        }))
     }
 }
 

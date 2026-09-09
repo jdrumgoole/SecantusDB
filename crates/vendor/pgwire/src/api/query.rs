@@ -167,9 +167,24 @@ pub trait SimpleQueryHandler: Send + Sync {
             // `on_copy_done` / `on_copy_fail`.
             client.set_state(super::PgWireConnectionState::ReadyForQuery);
             client.set_transaction_status(transaction_status);
+            self.before_ready_for_query(client).await?;
             send_ready_for_query(client, transaction_status).await?;
         };
 
+        Ok(())
+    }
+
+    /// Called after a query's responses are sent and before its
+    /// `ReadyForQuery` (SecantusDB local patch). PostgreSQL delivers the
+    /// `NotificationResponse`s a statement (or its transaction's COMMIT)
+    /// made deliverable exactly here -- after the command tags, before the
+    /// `ReadyForQuery` -- and a client counts on seeing them before it is
+    /// told the statement is over.
+    async fn before_ready_for_query<C>(&self, _client: &mut C) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
         Ok(())
     }
 

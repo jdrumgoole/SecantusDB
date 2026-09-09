@@ -7966,3 +7966,83 @@ def test_drop_function_resolves_signature_types_and_dependents(home: Path) -> No
         notices.clear()
         cur.execute('drop function if exists invout("a-b")')
         assert notices == [("NOTICE", "00000", 'type "a-b" does not exist, skipping', None)]
+
+
+def test_listen_notify_delivers_to_every_listener_at_commit(home: Path) -> None:
+    """LISTEN / NOTIFY / `pg_notify()` / UNLISTEN / `pg_listening_channels()`.
+
+    Every shape here was measured on PostgreSQL 16 over the raw wire: a
+    NOTIFY outside a block reaches the listeners -- the sender included --
+    as a `NotificationResponse` BEFORE the statement's `ReadyForQuery`; inside
+    a block the NOTIFYs queue, duplicates of one `(channel, payload)` collapse
+    to the first, and they go out after the COMMIT's tag (or nowhere on
+    ROLLBACK); an idle listener hears without asking, a listener idle in its
+    own block hears at its COMMIT; an unquoted channel folds to lower case;
+    `pg_notify` refuses an empty or NULL channel with 22023 and takes a NULL
+    payload as the empty string; a payload of 8000 bytes is 22023 too.
+    """
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        a_pid, b_pid = a.info.backend_pid, b.info.backend_pid
+        a.execute("listen foo")
+        assert a.execute("select pg_listening_channels()").fetchall() == [("foo",)]
+
+        # The sender hears its own NOTIFY, before the statement returns.
+        a.execute("notify FOO, 'self'")
+        assert [(n.pid, n.channel, n.payload) for n in a.notifies(timeout=0, stop_after=1)] == [
+            (a_pid, "foo", "self")
+        ]
+
+        # An idle listener hears a NOTIFY from another session unprompted.
+        b.execute("notify foo, 'idle'")
+        assert [(n.pid, n.channel, n.payload) for n in a.notifies(timeout=2, stop_after=1)] == [
+            (b_pid, "foo", "idle")
+        ]
+
+        # Queued in a block, deduplicated, delivered at COMMIT; not on ROLLBACK.
+        with b.transaction():
+            b.execute("notify foo, 'a'")
+            b.execute("select pg_notify('foo', 'b')")
+            b.execute("notify foo, 'a'")
+            assert list(a.notifies(timeout=0.2)) == []
+        assert [n.payload for n in a.notifies(timeout=2, stop_after=2)] == ["a", "b"]
+        with contextlib.suppress(ZeroDivisionError), b.transaction():
+            b.execute("notify foo, 'lost'")
+            raise ZeroDivisionError
+        assert list(a.notifies(timeout=0.2)) == []
+
+        # A listener idle in its own block hears nothing until it commits.
+        with a.transaction():
+            b.execute("notify foo, 'held'")
+            assert list(a.notifies(timeout=0.2)) == []
+        assert [n.payload for n in a.notifies(timeout=2, stop_after=1)] == ["held"]
+
+        # NULL payload is the empty string; empty / NULL channel is 22023.
+        b.execute("select pg_notify('foo', NULL)")
+        assert [n.payload for n in a.notifies(timeout=2, stop_after=1)] == [""]
+        for sql in ["select pg_notify('', 'x')", "select pg_notify(NULL, 'x')"]:
+            with pytest.raises(psycopg.errors.InvalidParameterValue) as info:
+                b.execute(sql)
+            assert info.value.diag.message_primary == "channel name cannot be empty"
+        with pytest.raises(psycopg.errors.InvalidParameterValue) as info:
+            b.execute("select pg_notify('foo', %s)", ("x" * 8000,))
+        assert info.value.diag.message_primary == "payload string too long"
+        b.execute("select pg_notify('foo', %s)", ("x" * 7999,))
+        assert [len(n.payload) for n in a.notifies(timeout=2, stop_after=1)] == [7999]
+
+        # UNLISTEN one, then all; LISTEN in a rolled-back block never lands.
+        a.execute("listen bar")
+        assert a.execute("select pg_listening_channels()").fetchall() == [("foo",), ("bar",)]
+        a.execute("unlisten foo")
+        b.execute("notify foo, 'gone'")
+        b.execute("notify bar, 'still'")
+        assert [(n.channel, n.payload) for n in a.notifies(timeout=2, stop_after=1)] == [
+            ("bar", "still")
+        ]
+        a.execute("unlisten *")
+        assert a.execute("select pg_listening_channels()").fetchall() == []
+        with contextlib.suppress(ZeroDivisionError), a.transaction():
+            a.execute("listen foo")
+            raise ZeroDivisionError
+        assert a.execute("select pg_listening_channels()").fetchall() == []
+        b.execute("notify foo, 'nobody'")
+        assert list(a.notifies(timeout=0.2)) == []
