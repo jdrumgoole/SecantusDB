@@ -297,6 +297,15 @@ CURATED = [
     ({"$toUpper": "$a"}, {"a": "hi"}),
     ({"$toLower": "HELLO"}, {}),
     ({"$toUpper": "$a"}, {"a": 123}),  # non-string passes through
+    # A Timestamp renders through mongod's legacy asctime-like path in the
+    # process's LOCAL time. Both engines read the same process zone, so these
+    # agree wherever they run; `tests/test_tolower_timestamp_local_time.py`
+    # is what pins the rendering itself to measured mongod answers.
+    ({"$toLower": Timestamp(1700000000, 3)}, {}),
+    ({"$toUpper": Timestamp(1700000000, 3)}, {}),
+    ({"$toLower": Timestamp(1720000000, 0)}, {}),  # zero increment, not dropped
+    ({"$toUpper": Timestamp(1, 12)}, {}),  # epoch, two-digit increment
+    ({"$toLower": "$a"}, {"a": Timestamp(1767225600, 7)}),  # via a field path
     ({"$strLenCP": "hello"}, {}),
     ({"$split": ["a,b,c", ","]}, {}),
     ({"$split": ["$a", "-"]}, {"a": "1-2-3"}),
