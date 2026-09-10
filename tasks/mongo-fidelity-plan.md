@@ -206,7 +206,7 @@ plus the document being left untouched.
 `tools/probes/rename_paths.py`; gates `tests/test_mongod_differential.py -k
 rename` (17 cases) and `tests/test_rename_array_and_dynamic_paths.py` (25).
 
-### 5. `$toLower` / `$toUpper` of a `Timestamp` — PYTHON DONE, Rust needs a DEPENDENCY decision
+### 5. `$toLower` / `$toUpper` of a `Timestamp` — DONE 2026-09-10 (the blocker did not exist)
 
 mongod renders a `Timestamp` through a legacy `asctime`-like path in **local
 time**, measured by running a second mongod 8.2.11 under `TZ=UTC` beside the
@@ -224,13 +224,31 @@ one-shape probe would have concluded "not TZ-dependent" and been wrong.
 in the process's local timezone via `time.localtime`. Like item 1, the entry
 described a gap that was Rust-only.
 
-**The Rust server still answers `16007`, and closing it is a DEPENDENCY
-decision, not a coding one.** `secantus-core` is deliberately dependency-light
-and Rust's `std` exposes no timezone database, so local-time rendering needs
-`chrono` (or an equivalent) added to the crate the whole Rust server builds on.
-That is worth deciding deliberately rather than smuggling in behind two
-operators. The format itself is settled: `%b %e %H:%M:%S:<increment>`, the
-increment unpadded, then ASCII-cased.
+**The dependency decision this entry reserved was not a real one** — the
+entry was written from a reading, and the reading was wrong. `secantus-core`
+already depends on `chrono` **and** `chrono-tz`, the latter bundling the whole
+IANA database for `$dateToString`'s named timezones. Nothing had to be added.
+The actual change was one feature flag: `chrono` was configured
+`default-features = false, features = ["alloc"]`, and `clock` is what supplies
+`chrono::Local`. Enabling it pulls `iana-time-zone` (plus `core-foundation-sys`
+on macOS) — the crates chrono itself uses to read the system zone.
+
+A fixed offset would NOT have worked, which the original two-row table could
+not show. Re-probed across three zones (8.2.11, 2026-09-10), mongod is
+DST-correct: `America/New_York` is 5h behind in November and 4h in July. It
+resolves a real timezone database at the instant.
+
+Verified end-to-end, not just in the engine: the standalone `secantusd-rs`
+answers all eight measured values over the wire under both `TZ=UTC` and
+`TZ=America/New_York`, matching mongod and the Python server exactly.
+
+Format, as before: `%b %e %H:%M:%S:<increment>` — `%e` space-pads the day
+(`jul  3`, two spaces), the increment is unpadded (`:0`, `:12`), then the
+operator ASCII-cases the whole string.
+
+Pinned by `tests/test_tolower_timestamp_local_time.py`, which runs each case in
+a SUBPROCESS with `TZ` set — the rendering depends on the process zone, so a
+test using the host's would pass in Dublin and fail in CI's UTC.
 
 ### 6. `$toDate` string parsing — DONE 2026-09-09 (was re-sized three times)
 
