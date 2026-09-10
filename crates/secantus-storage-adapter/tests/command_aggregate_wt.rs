@@ -562,10 +562,20 @@ fn aggregate_explain_option_returns_plan_without_running() {
 
 #[test]
 fn bucket_auto_chunks_by_count() {
-    // php-lib Builder{Collection,Database}FunctionalTest::testAggregate. Pure
-    // count-chunking (Python parity): 3 docs / 2 buckets → chunks of 1 then 2.
+    // php-lib Builder{Collection,Database}FunctionalTest::testAggregate.
+    //
+    // This asserted "pure count-chunking (Python parity): 3 docs / 2 buckets ->
+    // chunks of 1 then 2", and both halves were wrong. mongod never splits
+    // EQUAL values across buckets, and it gives the remainder to the EARLIER
+    // bucket (measured 8.2.11, 2026-09-09):
+    //
+    //     x: [10, 10, 10], buckets 2 -> ONE bucket of 3
+    //     x: [1, 2, 3],    buckets 2 -> counts 2 then 1
+    //
+    // The citation is the tell: "Python parity" describes the other engine, not
+    // the server this project imitates, and the other engine was wrong too.
     with_wt(|c| {
-        // Collection variant: 3 identical values still split into 2 buckets.
+        // Three identical values collapse into ONE bucket.
         seed(c, "c", vec![doc! {"x": 10}, doc! {"x": 10}, doc! {"x": 10}]);
         let r = dispatch(
             &doc! {"aggregate": "c", "pipeline": [
@@ -574,7 +584,9 @@ fn bucket_auto_chunks_by_count() {
             c,
         );
         assert_eq!(r.get_f64("ok").unwrap(), 1.0);
-        assert_eq!(docs_of(&r).len(), 2);
+        let out = docs_of(&r);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].get_i32("count").unwrap(), 3);
 
         // Database variant: $documents source + $bucketAuto over distinct values.
         let r = dispatch(
@@ -586,11 +598,17 @@ fn bucket_auto_chunks_by_count() {
         );
         let out = docs_of(&r);
         assert_eq!(out.len(), 2);
-        assert_eq!(out[0].get_i32("count").unwrap(), 1);
-        assert_eq!(out[1].get_i32("count").unwrap(), 2);
+        // The remainder goes to the EARLIER bucket: 2 then 1, not 1 then 2.
+        assert_eq!(out[0].get_i32("count").unwrap(), 2);
+        assert_eq!(out[1].get_i32("count").unwrap(), 1);
         assert_eq!(
             out[0].get_document("_id").unwrap().get_i32("min").unwrap(),
             1
+        );
+        // `max` is the first value of the NEXT bucket.
+        assert_eq!(
+            out[0].get_document("_id").unwrap().get_i32("max").unwrap(),
+            3
         );
     });
 }

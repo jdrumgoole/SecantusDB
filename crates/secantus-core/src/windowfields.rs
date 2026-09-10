@@ -186,9 +186,17 @@ pub fn set_window_fields_stage(
     }
 
     let mut out_docs: Vec<Document> = docs.clone();
+    // mongod emits PARTITION BY PARTITION, in first-seen partition order, and
+    // within each partition in `sortBy` order -- not the input order. Measured
+    // 8.2.11 (2026-09-09) across five specs. Wrong order is wrong RESULTS as
+    // soon as a `$limit` follows, so this is not cosmetic. `sorted_slots`
+    // already yields exactly that sequence, so recording it costs nothing.
+    // Mirrors `aggregate._stage_set_window_fields`.
+    let mut emit_order: Vec<usize> = Vec::with_capacity(docs.len());
 
     for part in &partitions {
         let slots = sorted_slots(part, &docs, sort_by)?;
+        emit_order.extend(slots.iter().copied());
         let n = slots.len();
         let ranks = if needs_rank {
             Some(compute_ranks(&slots, &docs, sort_by))
@@ -295,7 +303,10 @@ pub fn set_window_fields_stage(
         }
     }
 
-    Ok(out_docs)
+    Ok(emit_order
+        .into_iter()
+        .map(|i| out_docs[i].clone())
+        .collect())
 }
 
 /// The partition's original indices, reordered by `sortBy` (BSON order, stable,

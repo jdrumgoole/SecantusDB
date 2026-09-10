@@ -36,8 +36,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let storage = Arc::new(Storage::open(&home)?);
     let listener = TcpListener::bind(&addr).await?;
-    // One line, flushed, so a harness can wait for readiness.
-    println!("secantusd-pg listening on {addr} storage={home}");
+    // One line, flushed, so a harness can wait for readiness. It reports the
+    // address the listener actually BOUND, not the one requested, so that
+    // `127.0.0.1:0` is usable: the kernel names the port and this line is how
+    // the caller learns it. A harness that instead probes for a free port and
+    // passes it in cannot be made race-free -- the probe socket must close
+    // before the child binds.
+    let bound = listener.local_addr()?;
+    println!("secantusd-pg listening on {bound} storage={home}");
 
     // Serve until a signal arrives. The accept loop runs as a task so the main
     // task can wait on the signal and then close storage.

@@ -85,6 +85,17 @@ pub enum GKey {
     Num(NumVal), // int / int64 / double, normalised (1 == 1.0)
     /// A bool is NOT a number to mongod, so it never shares a numeric bucket.
     Bool(bool),
+    /// The types that used to `Defer` -- which on the standalone Rust server is
+    /// an ERROR, so ONE MinKey (or Timestamp, Binary, Regex, Code) anywhere in
+    /// the grouped field failed the whole `$group`. Each buckets by exact
+    /// value, with no special rule: two equal values share a bucket and a
+    /// different one does not (measured 8.2.11, 2026-09-09 across all six).
+    MinKey,
+    MaxKey,
+    Timestamp(u32, u32),
+    Binary(u8, Vec<u8>),
+    Regex(String, String),
+    Code(String),
     Str(String),
     Date(i64),
     Oid([u8; 12]),
@@ -142,7 +153,14 @@ pub fn gkey(v: &Bson) -> R<GKey> {
             }
             Ok(GKey::Arr(items))
         }
-        // Decimal128, Binary, Timestamp, Regex, Min/MaxKey, exotic -> Python.
+        Bson::MinKey => Ok(GKey::MinKey),
+        Bson::MaxKey => Ok(GKey::MaxKey),
+        Bson::Timestamp(t) => Ok(GKey::Timestamp(t.time, t.increment)),
+        Bson::Binary(b) => Ok(GKey::Binary(b.subtype.into(), b.bytes.clone())),
+        Bson::RegularExpression(r) => Ok(GKey::Regex(r.pattern.clone(), r.options.clone())),
+        Bson::JavaScriptCode(c) => Ok(GKey::Code(c.clone())),
+        // Undefined / DbPointer / Symbol / CodeWithScope remain unbucketed --
+        // nobody has measured them.
         _ => Err(Fallback::Defer),
     }
 }
@@ -1157,10 +1175,9 @@ fn accumulate_into(
 }
 
 /// `$bucket` — place each doc into the half-open boundary range
-/// `boundaries[i] <= value < boundaries[i+1]` (Python's native `<=`/`<` via
-/// `expressions::py_order`, so cross-type / Decimal128 / array-doc boundaries
-/// defer rather than guess), falling to `default` when unplaced, then run the
-/// `output` accumulators per bucket.
+/// `boundaries[i] <= value < boundaries[i+1]`, compared in mongod's BSON order
+/// so the numeric types interoperate, falling to `default` when unplaced, then
+/// run the `output` accumulators per bucket.
 /// Canonical type name for a `$bucket` boundary — the numeric BSON types collapse
 /// to one bracket (mongod requires all boundaries the same type).
 fn bucket_ctype(v: &Bson) -> &'static str {
@@ -1252,20 +1269,19 @@ pub fn bucket_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<Vec<Do
         let v = eval(&group_by, d, vars)?;
         let mut put = false;
         for i in 0..nb - 1 {
-            // `boundaries[i] <= v` (skip this bucket on TypeError / NaN-False).
-            match expressions::py_order(&boundaries[i], &v)? {
-                None => continue,
-                Some(Ordering::Greater) => continue, // lo > v
-                Some(_) => {}
+            // mongod's BSON order, NOT `py_order`'s emulation of Python's
+            // operators. `py_order` DEFERS on a Decimal128 -- and a defer on
+            // the standalone server is an error -- so one decimal anywhere in
+            // the grouped field failed the whole `$bucket`, where mongod places
+            // it with the other numerics (measured 8.2.11, 2026-09-09).
+            // Mirrors the same switch in `aggregate._stage_bucket`.
+            if crate::order::cmp(&boundaries[i], &v) == Ordering::Greater {
+                continue; // lo > v
             }
-            // `v < boundaries[i+1]`.
-            match expressions::py_order(&v, &boundaries[i + 1])? {
-                Some(Ordering::Less) => {
-                    placed[i].push(d);
-                    put = true;
-                    break;
-                }
-                _ => continue, // >= hi, or TypeError/NaN -> not this bucket
+            if crate::order::cmp(&v, &boundaries[i + 1]) == Ordering::Less {
+                placed[i].push(d);
+                put = true;
+                break;
             }
         }
         if !put {
@@ -1299,9 +1315,9 @@ pub fn bucket_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<Vec<Do
 /// cross-type order matches mongod / storage) and split them into at most
 /// `buckets` chunks of roughly equal count, then run the `output` accumulators
 /// (default `{count: {$sum: 1}}`) per chunk with `_id: {min, max}`. Mirrors
-/// `aggregate._stage_bucket_auto`: a pure count-chunking — documents that share a
-/// boundary value are *not* coalesced into one bucket (so N equal values still
-/// split across buckets), matching the Python server.
+/// `aggregate._stage_bucket_auto`. Documents that share a boundary value ARE
+/// coalesced into one bucket -- mongod never splits equal values -- and the
+/// remainder goes to the EARLIER buckets.
 // mongod's preferred-number rounding series for $bucketAuto `granularity`,
 // stored exactly as mongod stores them (integer-valued doubles) so that
 // `series_element * multiplier` reproduces mongod's f64 boundaries bit-for-bit.
@@ -1626,24 +1642,40 @@ pub fn bucket_auto_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<V
         return bucket_auto_granular(&keyed, n_buckets, gran, output_spec, vars);
     }
 
-    let bucket_size = std::cmp::max(1, keyed.len() / n_buckets);
     let mut out: Vec<Document> = Vec::new();
     let mut i = 0usize;
     while i < keyed.len() && out.len() < n_buckets {
         let is_last = out.len() == n_buckets - 1;
-        let end = if is_last {
+        // The REMAINDER goes to the earlier buckets: 8 values into 3 buckets is
+        // 3/3/2, not 2/3/3. Recomputed each time from what is left, so a bucket
+        // that grew to keep equal values together does not distort the ones
+        // after it (measured 8.2.11, 2026-09-09, at 2 / 3 / 4 buckets).
+        let remaining_buckets = n_buckets - out.len();
+        let bucket_size = std::cmp::max(1, (keyed.len() - i).div_ceil(remaining_buckets));
+        let mut end = if is_last {
             keyed.len()
         } else {
             std::cmp::min(i + bucket_size, keyed.len())
         };
-        let chunk = &keyed[i..end];
-        if chunk.is_empty() {
+        if end == i {
             break;
         }
-        // Upper bound: the next chunk's first value when there is one, else this
-        // chunk's last value (mirrors Python's `pairs[i + bucket_size]` lookahead).
-        let upper = if !is_last && i + bucket_size < keyed.len() {
-            keyed[i + bucket_size].1.clone()
+        // Documents sharing a value NEVER straddle a bucket boundary. `keyed` is
+        // sorted by the byte-sortable encoding, so two entries are the SAME
+        // value exactly when those bytes match -- which is the point: `1.5` and
+        // `Decimal128("1.5")` encode identically and are equal to mongod, while
+        // Rust's `==` on the `Bson` would call them different. The doc comment
+        // above used to say equal values are NOT coalesced, "matching the Python
+        // server" -- and both servers were wrong.
+        while end < keyed.len() && keyed[end - 1].0 == keyed[end].0 {
+            end += 1;
+        }
+        let chunk = &keyed[i..end];
+        // Upper bound: the first value of the NEXT bucket, taken from the
+        // EXTENDED chunk -- a bucket that grew to keep equal values together
+        // would otherwise report the value it had just absorbed.
+        let upper = if !is_last && end < keyed.len() {
+            keyed[end].1.clone()
         } else {
             chunk[chunk.len() - 1].1.clone()
         };

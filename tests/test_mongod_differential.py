@@ -137,6 +137,23 @@ def mongod_uri() -> Iterator[str]:
                 time.sleep(0.25)
         else:
             pytest.skip("mongod did not become ready")
+        # A ping that succeeds is NOT proof it reached the mongod spawned above.
+        # `_free_port()` closes its probe socket before this child binds, so
+        # under `-n auto` another worker can take the port; ours then exits
+        # "address already in use" while the ping lands on THEIRS. This gate
+        # would go on measuring a server it does not own -- and, being a
+        # differential gate, would report agreement it never actually tested.
+        # A child that lost the race is long gone by the time a ping succeeds,
+        # so its exit is the reliable tell. Fail loudly rather than measure the
+        # wrong server. (The same race broke `pg-oracle` on 2026-09-09; the
+        # `secantusd-pg` harness fixed it properly by binding :0 and reading the
+        # port back, which mongod gives us no way to do.)
+        if proc.poll() is not None:
+            raise RuntimeError(
+                f"mongod on port {port} exited during startup; the ping that "
+                "succeeded reached a DIFFERENT server, so this gate would have "
+                "compared against a mongod it does not own"
+            )
         yield uri
     finally:
         proc.terminate()

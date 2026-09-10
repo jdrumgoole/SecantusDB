@@ -453,6 +453,20 @@ def wrap_expression_problem(message: str, stage: str, *, in_update: str = "") ->
     return f"Invalid {stage} :: caused by :: {message}" if stage else message
 
 
+def _contains_accumulator_only(expr: Any) -> bool:
+    """Does `expr` mention an accumulator-only operator anywhere?
+
+    Those names (`$count`, `$topN`, `$bottomN`) are legal only in an
+    accumulator POSITION and are not expressions, so the constant folder must
+    leave them alone -- see `_ACCUMULATOR_ONLY`.
+    """
+    if isinstance(expr, Mapping):
+        return any(k in _ACCUMULATOR_ONLY or _contains_accumulator_only(v) for k, v in expr.items())
+    if isinstance(expr, list):
+        return any(_contains_accumulator_only(e) for e in expr)
+    return False
+
+
 def _contains_switch(expr: Any) -> bool:
     if isinstance(expr, Mapping):
         return "$switch" in expr or any(_contains_switch(v) for v in expr.values())
@@ -494,6 +508,15 @@ def _fold_problem(
     # models that. Folding it here would report the execution-time error under
     # the optimization-time prefix, which is neither answer.
     if _contains_switch(expr):
+        return None
+    # An ACCUMULATOR is not an expression, so mongod never folds one. `{$count:
+    # {}}` reads no field and therefore looked constant, so it was handed to
+    # `evaluate`, which does not know `$count` as an expression and answered
+    # `168 Unrecognized expression` -- under the OPTIMIZER's prefix, which is
+    # how this was distinguishable from the parse-time walker's gate. The
+    # accumulator itself existed and evaluated correctly all along; nothing
+    # ever reached it.
+    if _contains_accumulator_only(expr):
         return None
     # The REAL `let` values, not placeholders: mongod folds `$$cv` to what the
     # command bound, so `{$abs: "$$cv"}` with `cv: "x"` fails at optimization
@@ -611,7 +634,13 @@ def expression_problem_in_pipeline(
         # (`Invalid $addFields :: caused by ::`) and not the optimizer's. We
         # were folding them first and reporting "Failed to optimize pipeline",
         # so 279 shapes had both the wrong wrapper and the wrong code.
-        if not found:
+        if not found and name != "$facet":
+            # NOT for `$facet`: its values are PIPELINES, already walked as such
+            # by the branch above. Walking them again as EXPRESSIONS treats each
+            # sub-stage document as an operator, so `{$facet: {t: [{$count:
+            # "n"}]}}` -- an ordinary `$count` STAGE -- was rejected as an
+            # accumulator used outside an accumulator position. The name check
+            # is right; running it in a pipeline position was not.
             found = _expression_shape_problem(spec, name)
         if found:
             return (found[0], found[1], wrapper)
@@ -706,7 +735,20 @@ _OBJECT_SPEC_ACCUMULATORS: dict[str, int] = {
 #: Accumulator-only operators: in EXPRESSION position mongod does not know them
 #: at all, so the complaint is "Unrecognized expression" rather than anything
 #: about their spec. The other six in the table above ARE expressions.
-_ACCUMULATOR_ONLY = frozenset({"$topN", "$bottomN"})
+_ACCUMULATOR_ONLY = frozenset({"$topN", "$bottomN", "$count"})
+
+#: The stages whose values are ACCUMULATOR positions, where the names in
+#: `_ACCUMULATOR_ONLY` are legal. Everywhere else they are not expressions at
+#: all and mongod does not recognise the name.
+#:
+#: `$setWindowFields` belongs here as much as `$group` does -- measured on
+#: 8.2.11 (2026-09-09), `{$count: {}}` and `$topN` both work in its `output`
+#: and both are refused in `$project` (31325) and `$addFields` (168). The gate
+#: named only `$group`, which is why `$count` in a `$group` was reported as
+#: `168 Unrecognized expression` even though the accumulator exists and the
+#: engine evaluates it correctly: the PARSE-time walker rejected the pipeline
+#: before the engine ever saw it.
+_ACCUMULATOR_STAGES = frozenset({"$group", "$setWindowFields"})
 
 
 def _percentile_field_problem(op: str, spec: Any) -> tuple[int, str] | None:
@@ -1024,12 +1066,12 @@ def _expression_shape_problem(spec: Any, stage: str = "") -> tuple[int, str] | N
                 for field in value:
                     if field not in fields:
                         return (code, f"Unrecognized argument to {key}: {field}{tail}")
-            # `$topN` / `$bottomN` are ACCUMULATOR-only: reached as an
-            # expression, mongod does not recognise the name at all and never
-            # looks at the spec. Inside `$group` they ARE accumulators, and the
-            # stage's own branch has already validated them -- without this gate
-            # every valid `{$group: {x: {$topN: {...}}}}` was rejected.
-            if key in _ACCUMULATOR_ONLY and stage != "$group":
+            # `$topN` / `$bottomN` / `$count` are ACCUMULATOR-only: reached as
+            # an expression, mongod does not recognise the name at all and never
+            # looks at the spec. In an ACCUMULATOR POSITION they are valid, and
+            # the stage's own branch has already validated them -- without this
+            # gate every valid `{$group: {x: {$topN: {...}}}}` was rejected.
+            if key in _ACCUMULATOR_ONLY and stage not in _ACCUMULATOR_STAGES:
                 return (168, f"Unrecognized expression '{key}'")
             if (code := _OBJECT_SPEC_EXPRESSIONS.get(key)) is not None and not isinstance(
                 value, Mapping
@@ -1467,10 +1509,26 @@ def _project_one(
         result: dict[str, Any] = {}
         if id_handling != 0 and "_id" in doc:
             result["_id"] = copy.deepcopy(doc["_id"])
-        for path in inclusions:
-            value = get_path(doc, path)
-            if value is not None or _path_present(doc, path):
-                set_path(result, path, copy.deepcopy(value))
+        if inclusions:
+            from secantus.projection import apply_projection
+
+            # DELEGATED to `find`'s projection, which already implements
+            # mongod's rules for a dotted inclusion exactly: a parent that is a
+            # document survives as `{}` when the leaf is absent
+            # (`{$project: {"sub.k": 1}}` over `{sub: {}}` and over
+            # `{sub: {j: 2}}` both give `sub: {}`), an array of documents is
+            # pruned element-wise (`[{k: 1}, {}]`), an array of scalars becomes
+            # `[]`, and a scalar / null / missing parent drops the field.
+            # Measured 8.2.11 (2026-09-09) -- and `$project` agrees with `find`
+            # on every one of them.
+            #
+            # This loop used to re-implement the rule and only checked the LEAF,
+            # so every surviving parent vanished. Two implementations of one
+            # rule, one of them wrong, is the shape this repo keeps finding; the
+            # fix is to have one.
+            included = apply_projection(dict(doc), {p: 1 for p in inclusions} | {"_id": 0})
+            for key, value in included.items():
+                result[key] = value
         for key, expr in computed.items():
             # `evaluate_or_missing`, not `evaluate`: a *direct field path* that
             # doesn't exist (`{z: "$nope"}`) evaluates to MISSING in mongod and
@@ -3808,15 +3866,24 @@ def _stage_bucket(
     for d in docs:
         value = evaluate(group_by, d, ctx.vars)
         placed = False
+        # `_SortKey`, not Python's `<` -- the same comparison the boundary
+        # VALIDATION above already uses. The raw operators have no ordering
+        # between a `Decimal128` and an `int`, so `1 <= Decimal128("1.5")`
+        # raised `TypeError`, which the `except` below swallowed and dropped the
+        # document into `default`: `{$bucket: {boundaries: [0, 1, 2, 100]}}`
+        # put `Decimal128("1.5")` in `other` where mongod puts it in bucket `1`
+        # alongside `1` and `1.5` (measured 8.2.11, 2026-09-09). A swallowed
+        # comparison error is exactly how a value ends up in the wrong bucket
+        # rather than erroring.
+        vk = _SortKey(value)
         for i in range(len(boundaries) - 1):
             lo, hi = boundaries[i], boundaries[i + 1]
-            try:
-                if lo <= value < hi:
-                    buckets[lo].append(d)
-                    placed = True
-                    break
-            except TypeError:
-                continue
+            # `_SortKey` defines only `__lt__`, so `lo <= value` is spelled as
+            # "value is not below lo".
+            if not (vk < _SortKey(lo)) and vk < _SortKey(hi):
+                buckets[lo].append(d)
+                placed = True
+                break
         if not placed:
             if default is None:
                 raise AggregateError(
@@ -4861,6 +4928,18 @@ def _validate_bucket_auto_granularity(granularity: Any) -> None:
         )
 
 
+def _bucket_values_differ(a: Any, b: Any) -> bool:
+    """Do two already-sorted `$bucketAuto` values belong to different buckets?
+
+    BSON equality, not Python's: the numeric types compare across themselves, so
+    `1.5` and `Decimal128("1.5")` are the SAME value here.
+    """
+    from secantus.storage import _SortKey
+
+    ka, kb = _SortKey(a), _SortKey(b)
+    return bool(ka < kb) or bool(kb < ka)
+
+
 def _bucket_auto_granular(
     pairs: list[tuple[Any, dict[str, Any]]],
     n_buckets: int,
@@ -5001,18 +5080,38 @@ def _stage_bucket_auto(
         return []
     if granularity is not None:
         return _bucket_auto_granular(pairs, n_buckets, granularity, output_spec, ctx)
-    bucket_size = max(1, len(pairs) // n_buckets)
     out: list[dict[str, Any]] = []
     i = 0
     while i < len(pairs) and len(out) < n_buckets:
         is_last = len(out) == n_buckets - 1
+        # mongod gives the REMAINDER to the earlier buckets: 8 values into 3
+        # buckets is 3/3/2, not 2/3/3. Recomputed each time from what is left,
+        # so a bucket that grew to keep equal values together does not distort
+        # the ones after it (measured 8.2.11, 2026-09-09, at 2 / 3 / 4 buckets).
+        # A single floor-divided `bucket_size` gave 2/3/3.
+        remaining_buckets = n_buckets - len(out)
+        bucket_size = max(1, -(-(len(pairs) - i) // remaining_buckets))
         chunk = pairs[i:] if is_last else pairs[i : i + bucket_size]
         if not chunk:
             break
-        if not is_last and i + bucket_size < len(pairs):
-            upper = pairs[i + bucket_size][0]
-        else:
-            upper = chunk[-1][0]
+        # Documents sharing a value NEVER straddle a bucket boundary, so the
+        # chunk grows until the next value differs. `pairs` is already sorted,
+        # so equality here is "neither is below the other" under the BSON order
+        # -- which is the point: `1.5` and `Decimal128("1.5")` are equal to
+        # mongod and NOT equal to Python's `==`, so a naive check split them and
+        # the first bucket came back one document short with the decimal as its
+        # `max` (mongod: `{min: NaN, max: 2}, count: 5`; ours:
+        # `{min: NaN, max: Decimal128("1.5")}, count: 4`. Measured 8.2.11,
+        # 2026-09-09).
+        j = i + len(chunk)
+        while j < len(pairs) and not _bucket_values_differ(pairs[j - 1][0], pairs[j][0]):
+            chunk = pairs[i : j + 1]
+            j += 1
+        # `max` is the first value of the NEXT bucket -- computed from the
+        # EXTENDED chunk, not the nominal `bucket_size`, or a bucket that grew
+        # to keep equal values together reports the value it just absorbed.
+        next_i = i + len(chunk)
+        upper = pairs[next_i][0] if not is_last and next_i < len(pairs) else chunk[-1][0]
         bucket: dict[str, Any] = {"_id": {"min": chunk[0][0], "max": upper}}
         for field_name, accumulator in output_spec.items():
             for _, d in chunk:
@@ -5306,9 +5405,16 @@ def _stage_set_window_fields(
     that row's window (within the row's partition, in the partition's
     sorted order). Window bounds are integer offsets relative to the
     current row, or the strings ``"current"`` / ``"unbounded"``.
-    Missing ``window`` defaults to the whole partition. Original input
-    order is preserved in the result — the partition / sort dance
-    happens only to compute the new fields.
+    Missing ``window`` defaults to the whole partition.
+
+    **The result comes back in PARTITION then SORT order**, not the input
+    order: partitions in first-seen order, and within each the ``sortBy``
+    sequence (stable, so ties keep their input order). This docstring used to
+    claim the opposite -- "original input order is preserved, the partition /
+    sort dance happens only to compute the new fields" -- and the code
+    implemented that. Measured against 8.2.11 (2026-09-09) across five specs,
+    including a partition with no ``sortBy`` (input order WITHIN the partition,
+    partitions still grouped) and a ``sortBy`` with no partition (pure sort).
 
     Supported output functions:
 
@@ -5472,6 +5578,13 @@ def _stage_set_window_fields(
         partitions[hkey].append((i, doc))
 
     out_docs: list[dict[str, Any]] = [dict(d) for d in docs_list]
+    # mongod emits PARTITION BY PARTITION, in first-seen partition order, and
+    # within each partition in `sortBy` order -- not the input order. Measured
+    # 8.2.11 (2026-09-09) across five specs; the docstring above used to claim
+    # the opposite. Wrong order is wrong RESULTS as soon as a `$limit` follows,
+    # so this is not cosmetic. The loop below already walks members in exactly
+    # that sequence, so recording it as it goes costs nothing.
+    emit_order: list[int] = []
 
     for pkey in partition_order:
         members = partitions[pkey]
@@ -5479,6 +5592,7 @@ def _stage_set_window_fields(
             sorted_docs = _sort_docs([doc for _, doc in members], sort_by)
             idx_lookup = {id(doc): orig_i for orig_i, doc in members}
             members = [(idx_lookup[id(doc)], doc) for doc in sorted_docs]
+        emit_order.extend(orig_i for orig_i, _ in members)
         partition_docs = [doc for _, doc in members]
         n = len(partition_docs)
         # Precompute per-partition rank vectors only when a rank function
@@ -5534,7 +5648,7 @@ def _stage_set_window_fields(
                     handler(bucket, field, arg, wdoc, ctx.vars)
                 _finalize(bucket)
                 target[field] = bucket.get(field, _empty_window_value(op))
-    return out_docs
+    return [out_docs[i] for i in emit_order]
 
 
 def _compute_rank_state(

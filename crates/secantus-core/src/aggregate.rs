@@ -1208,21 +1208,6 @@ fn is_zero(v: &Bson) -> bool {
         || matches!(v, Bson::Double(d) if *d == 0.0)
 }
 
-/// Mapping-only path presence (matches `_path_present`, which does NOT walk
-/// into arrays — unlike `paths::get_path`).
-fn path_present(doc: &Document, path: &str) -> bool {
-    let mut cur = doc;
-    let mut parts = path.split('.').peekable();
-    while let Some(part) = parts.next() {
-        match cur.get(part) {
-            Some(Bson::Document(d)) => cur = d,
-            Some(_) => return parts.peek().is_none(),
-            None => return false,
-        }
-    }
-    true
-}
-
 fn project_one(doc: &Document, spec: &Document, vars: &Document) -> R<Document> {
     let mut inclusions: Vec<&str> = Vec::new();
     let mut exclusions: Vec<&str> = Vec::new();
@@ -1263,13 +1248,28 @@ fn project_one(doc: &Document, spec: &Document, vars: &Document) -> R<Document> 
                 result.insert("_id".to_string(), id.clone());
             }
         }
-        for path in inclusions {
-            let gp = paths::get_path(doc, path);
-            let present =
-                matches!(gp, Some(v) if !matches!(v, Bson::Null)) || path_present(doc, path);
-            if present {
-                let v = gp.cloned().unwrap_or(Bson::Null);
-                paths::set_path(&mut result, path, v).map_err(|_| Fallback::Defer)?;
+        if !inclusions.is_empty() {
+            // DELEGATED to `find`'s projection, which already implements
+            // mongod's rules for a dotted inclusion exactly: a parent that is a
+            // document survives as `{}` when the leaf is absent
+            // (`{$project: {"sub.k": 1}}` over `{sub: {}}` and over
+            // `{sub: {j: 2}}` both give `sub: {}`), an array of documents is
+            // pruned element-wise (`[{k: 1}, {}]`), an array of scalars becomes
+            // `[]`, and a scalar / null / missing parent drops the field.
+            // Measured 8.2.11 (2026-09-09) -- `$project` agrees with `find` on
+            // every one of them.
+            //
+            // This loop used to re-implement the rule and only checked the
+            // LEAF, so every surviving parent vanished. Mirrors the same
+            // delegation in `aggregate._stage_project`.
+            let mut spec = Document::new();
+            for path in &inclusions {
+                spec.insert((*path).to_string(), Bson::Int32(1));
+            }
+            spec.insert("_id".to_string(), Bson::Int32(0));
+            let included = crate::projection::apply_projection(doc, &spec, None)?;
+            for (k, v) in included {
+                result.insert(k, v);
             }
         }
         for (key, expr) in computed {
