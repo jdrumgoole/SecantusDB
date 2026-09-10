@@ -50,5 +50,12 @@ rand = "0.9"
 # stays on post-2007 dates in decade-stable major zones to stay clear of tzdb
 # release skew). `chrono` is the trait provider; default features off — no
 # `clock` / `std::time::SystemTime` needed.
-chrono = { version = "0.4", default-features = false, features = ["alloc"] }
+# `clock` is enabled for ONE behaviour: `$toLower`/`$toUpper` of a Timestamp,
+# which mongod renders in the server process's LOCAL time (see
+# `expressions::coerce_to_string`). mongod resolves a real tz database at the
+# instant -- DST included -- so a fixed offset or a UTC render is simply wrong,
+# and Rust's `std` exposes no timezone database. `clock` is what supplies
+# `chrono::Local`; without it the standalone Rust server had to error 16007 on
+# an operator the Python server has always answered.
+chrono = { version = "0.4", default-features = false, features = ["alloc", "clock"] }
 chrono-tz = { version = "0.10", default-features = false }
