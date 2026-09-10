@@ -32,6 +32,7 @@ pub const BUILTIN_TYPES: &[(&str, i64, i64)] = &[
     ("interval", 1186, 1187),
     ("timetz", 1266, 1270),
     ("numeric", 1700, 1231),
+    ("regclass", 2205, 2210),
     ("regtype", 2206, 2211),
     ("uuid", 2950, 2951),
     ("jsonb", 3802, 3807),

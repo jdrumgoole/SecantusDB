@@ -54,6 +54,9 @@ pub enum Error {
     UndefinedField(String),
     /// A table the catalog does not have -> 42P01.
     UndefinedTable(String),
+    /// A name that cannot be an identifier at all (`'a b'::regclass`, an
+    /// empty name) -> 42602.
+    InvalidName(String),
     /// A bare column beside an aggregate, not in GROUP BY -> 42803.
     Grouping(String),
     /// A `$N` with no bound value -> 42P02.
@@ -130,6 +133,7 @@ impl std::fmt::Display for Error {
             Error::UndefinedColumn(c) => write!(f, "column \"{c}\" does not exist"),
             Error::UndefinedField(m) => write!(f, "{m}"),
             Error::UndefinedTable(t) => write!(f, "relation \"{t}\" does not exist"),
+            Error::InvalidName(m) => write!(f, "{m}"),
             Error::Grouping(m) => write!(f, "{m}"),
             Error::Parameter(m) => write!(f, "{m}"),
             Error::InvalidText(m) => write!(f, "{m}"),
@@ -185,6 +189,7 @@ impl Error {
             Error::Unsupported(_) | Error::FeatureNotSupported(_) => "0A000", // feature_not_supported
             Error::UndefinedColumn(_) | Error::UndefinedField(_) => "42703",
             Error::UndefinedTable(_) => "42P01",
+            Error::InvalidName(_) => "42602", // invalid_name
             Error::Grouping(_) => "42803",    // grouping_error
             Error::Parameter(_) => "42P02",   // undefined_parameter
             Error::InvalidText(_) => "22P02", // invalid_text_representation
@@ -678,8 +683,9 @@ pub struct JoinSelect {
     pub right: (String, String),
     /// LEFT OUTER when true, INNER when false.
     pub left_join: bool,
-    /// The ON equality: (alias, column) on each side, either order.
-    pub on: ((String, String), (String, String)),
+    /// The ON equality: (alias, column) on each side, either order. `None`
+    /// is a CROSS join (`FROM a, b`): every left row against every right.
+    pub on: Option<((String, String), (String, String))>,
     /// Output columns: (output name, side alias, column).
     pub columns: Vec<(String, String, String)>,
     /// A computed expression per output column (cast chains, mostly:
@@ -3144,6 +3150,12 @@ fn plan_select(
     if !s.group_clause.is_empty() || has_aggregate(s) {
         return plan_aggregate(s, lookup, params);
     }
+    // `FROM a, b` -- a CROSS join, the comma form of `a CROSS JOIN b`. It
+    // rides the JOIN path with no ON predicate.
+    if s.from_clause.len() == 2 {
+        let join = plan_join_select(s, lookup, params)?;
+        return plan_join_plain_select(s, join, lookup, params);
+    }
     if s.from_clause.len() != 1 {
         return Err(Error::Unsupported(
             "a SELECT that is not from one table".into(),
@@ -3393,7 +3405,8 @@ fn plan_join_plain_select(
     let columns: Vec<(String, String)> = join
         .columns
         .iter()
-        .map(|(out, _, _)| (out.clone(), out.clone()))
+        .zip(join_output_keys(&join))
+        .map(|((out, _, _), key)| (out.clone(), key))
         .collect();
     let casts = vec![None; columns.len()];
     let limit = match s.limit_count.as_ref() {
@@ -3508,16 +3521,30 @@ fn plan_join_select(
     params: &[Bson],
 ) -> Result<JoinSelect> {
     use pg_query::protobuf::JoinType;
-    if s.from_clause.len() != 1 {
-        return Err(Error::Unsupported("this subquery's FROM".into()));
-    }
-    let Some(N::JoinExpr(j)) = s.from_clause[0].node.as_ref() else {
-        return Err(Error::Unsupported("a subquery without a JOIN".into()));
-    };
-    let left_join = match JoinType::try_from(j.jointype) {
-        Ok(JoinType::JoinLeft) => true,
-        Ok(JoinType::JoinInner) => false,
-        _ => return Err(Error::Unsupported("this JOIN kind".into())),
+    // The two sides, the kind, and the ON clause: from a `JoinExpr`, or from
+    // the two items of a comma-separated FROM (a CROSS join, no ON).
+    let (larg, rarg, left_join, quals) = match s.from_clause.as_slice() {
+        [one] => {
+            let Some(N::JoinExpr(j)) = one.node.as_ref() else {
+                return Err(Error::Unsupported("a subquery without a JOIN".into()));
+            };
+            let left_join = match JoinType::try_from(j.jointype) {
+                Ok(JoinType::JoinLeft) => true,
+                Ok(JoinType::JoinInner) => false,
+                _ => return Err(Error::Unsupported("this JOIN kind".into())),
+            };
+            if j.is_natural || !j.using_clause.is_empty() {
+                return Err(Error::Unsupported("this JOIN kind".into()));
+            }
+            (
+                j.larg.as_deref(),
+                j.rarg.as_deref(),
+                left_join,
+                j.quals.as_deref(),
+            )
+        }
+        [a, b] => (Some(a), Some(b), false, None),
+        _ => return Err(Error::Unsupported("this subquery's FROM".into())),
     };
     #[allow(clippy::type_complexity)]
     let side = |n: Option<&pg_query::protobuf::Node>| -> Result<((String, String), Option<Box<Statement>>)> {
@@ -3548,8 +3575,8 @@ fn plan_join_select(
             _ => Err(Error::Unsupported("this JOIN side".into())),
         }
     };
-    let (left, left_sub) = side(j.larg.as_deref())?;
-    let (right, right_sub) = side(j.rarg.as_deref())?;
+    let (left, left_sub) = side(larg)?;
+    let (right, right_sub) = side(rarg)?;
     // Only a TABLE side needs a catalog lookup; a subquery side is planned.
     if left_sub.is_none() {
         lookup(&left.0).ok_or_else(|| Error::UndefinedTable(left.0.clone()))?;
@@ -3571,14 +3598,16 @@ fn plan_join_select(
             _ => None,
         }
     };
-    let on = match j.quals.as_ref().and_then(|q| q.node.as_ref()) {
+    let on = match quals.and_then(|q| q.node.as_ref()) {
         Some(N::AExpr(e)) if operator_name(e) == Ok("=") => {
             let l = qualified(e.lexpr.as_deref())
                 .ok_or_else(|| Error::Unsupported("this ON clause".into()))?;
             let r = qualified(e.rexpr.as_deref())
                 .ok_or_else(|| Error::Unsupported("this ON clause".into()))?;
-            (l, r)
+            Some((l, r))
         }
+        // No ON at all: `FROM a, b` or `a CROSS JOIN b`.
+        None => None,
         _ => return Err(Error::Unsupported("this ON clause".into())),
     };
 
@@ -3606,9 +3635,10 @@ fn plan_join_select(
                 columns.push((out, alias, col));
                 exprs.push(None);
             }
-            Some(N::TypeCast(tc)) => {
-                // `t.oid::regtype::text AS regtype` -- the cast chain rides
-                // beside the column, same as a plain select's.
+            // `t.oid::regtype::text AS regtype` -- the cast chain rides
+            // beside the column, same as a plain select's. A cast over a
+            // CONSTANT (`'t1'::regclass::oid`) is a constant target, below.
+            Some(N::TypeCast(tc)) if cast_chain_over_column_qualified(tc).is_ok() => {
                 let (col_name, chain) = cast_chain_over_column_qualified(tc)?;
                 let out = if rt.name.is_empty() {
                     chain
@@ -3659,7 +3689,24 @@ fn plan_join_select(
                 columns.push((out, alias, col));
                 exprs.push(Some(ColumnExpr::Coalesce { args }));
             }
-            _ => return Err(Error::Unsupported("this subquery target".into())),
+            // A CONSTANT beside the join's columns -- `'t1'::regclass::oid`,
+            // `1` -- reads no side at all: the value is fixed at plan time and
+            // repeated per row. Anything that is not constant (an expression
+            // over a column) stays unsupported.
+            Some(_) => {
+                let val = rt.val.as_ref().expect("ResTarget has a val");
+                let value = const_value(val, params)
+                    .map_err(|_| Error::Unsupported("this subquery target".into()))?;
+                let out = if rt.name.is_empty() {
+                    expression_column_name(val)
+                } else {
+                    rt.name.clone()
+                };
+                let result_type = static_type(val, &value);
+                columns.push((out, String::new(), String::new()));
+                exprs.push(Some(ColumnExpr::Const { value, result_type }));
+            }
+            None => return Err(Error::Unsupported("this subquery target".into())),
         }
     }
 
@@ -3789,13 +3836,20 @@ pub fn join_output_def(
         None => lookup(&join.right.0).ok_or_else(|| Error::UndefinedTable(join.right.0.clone()))?,
     };
     let mut columns = Vec::new();
-    for (i, (out, alias, col)) in join.columns.iter().enumerate() {
+    let keys = join_output_keys(join);
+    for (i, (_, alias, col)) in join.columns.iter().enumerate() {
         // A coalesce keeps its column's type, so it resolves against the side
-        // like a plain column; a cast chain / scalar call uses its fixed type.
+        // like a plain column; a cast chain / scalar call / constant uses its
+        // fixed type. Only a column read straight through keeps its SOURCE
+        // (the RowDescription's `ftable` / `ftablecol`): a cast, a call, a
+        // coalesce and a constant are computed, which PostgreSQL reports as
+        // table 0 / column 0 (measured 16).
         let expr = join.exprs.get(i).and_then(|e| e.as_ref());
-        let ty = match expr {
-            Some(ColumnExpr::Casts(_)) | Some(ColumnExpr::Call { .. }) => {
-                column_expr_type(expr.expect("some")).to_string()
+        let (ty, source) = match expr {
+            Some(ColumnExpr::Casts(_))
+            | Some(ColumnExpr::Call { .. })
+            | Some(ColumnExpr::Const { .. }) => {
+                (column_expr_type(expr.expect("some")).to_string(), None)
             }
             _ => {
                 let side_def = if *alias == join.left.1 {
@@ -3807,15 +3861,41 @@ pub fn join_output_def(
                 } else {
                     &right_def
                 };
-                side_def
+                let c = side_def
                     .column(col)
-                    .map(|c| c.pg_type.clone())
-                    .ok_or_else(|| Error::UndefinedColumn(col.clone()))?
+                    .ok_or_else(|| Error::UndefinedColumn(col.clone()))?;
+                (
+                    c.pg_type.clone(),
+                    expr.is_none().then_some(c.source).flatten(),
+                )
             }
         };
-        columns.push(Column::new(out, &ty, false));
+        let mut column = Column::new(&keys[i], &ty, false);
+        column.source = source;
+        columns.push(column);
     }
     Ok(TableDef::new("", columns))
+}
+
+/// The key each of a join's output columns is stored under in its row
+/// documents, parallel to `columns`. Two outputs may share a NAME (`select
+/// 't1'::regclass::oid, 't2'::regclass::oid from t1, t2` has two `oid`s, and
+/// PostgreSQL keeps both); a repeat gets a suffix no identifier carries so the
+/// second does not overwrite the first.
+pub fn join_output_keys(join: &JoinSelect) -> Vec<String> {
+    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    join.columns
+        .iter()
+        .map(|(out, _, _)| {
+            let n = seen.entry(out.as_str()).or_insert(0);
+            *n += 1;
+            if *n == 1 {
+                out.clone()
+            } else {
+                format!("{out}\u{1}{n}")
+            }
+        })
+        .collect()
 }
 
 /// The shared tail of `plan_aggregate`, over whichever SOURCE the FROM named:
@@ -4548,6 +4628,7 @@ fn inferred_type(v: &Bson) -> &'static str {
         Bson::Double(_) => "float8",
         Bson::Decimal128(_) => "numeric",
         Bson::Document(d) if d.contains_key(WIDE_NUMERIC_KEY) => "numeric",
+        Bson::Document(d) if d.len() == 1 && d.contains_key(REGCLASS_KEY) => "regclass",
         Bson::Array(items) => match items.first() {
             Some(Bson::Int32(_)) | None => "int4[]",
             Some(Bson::Int64(_)) => "int8[]",
@@ -6270,6 +6351,196 @@ fn user_composite_name(oid: i64) -> Option<String> {
             .iter()
             .find(|(_, o, _)| *o == oid)
             .map(|(n, _, _)| n.clone())
+    })
+}
+
+/// The key of the one-field document a `regclass` VALUE is carried as -- the
+/// `regtype` convention: an oid that RENDERS as the relation's name.
+/// `select 't1'::regclass` prints `t1` under oid 2205; `::oid` reads the
+/// number; `where attrelid = 't1'::regclass` compares it.
+pub const REGCLASS_KEY: &str = "__regclass_oid";
+
+pub(crate) fn regclass_value(oid: i64) -> Bson {
+    let mut d = Document::new();
+    d.insert(REGCLASS_KEY, Bson::Int64(oid));
+    Bson::Document(d)
+}
+
+/// The oid inside a regclass value, or `None` for any other value.
+pub fn regclass_oid(v: &Bson) -> Option<i64> {
+    match v {
+        Bson::Document(d) if d.len() == 1 => d.get_i64(REGCLASS_KEY).ok(),
+        _ => None,
+    }
+}
+
+thread_local! {
+    /// The relations of the current database: `(name, oid, temp)`, installed
+    /// per statement by the wire layer so a `'t1'::regclass` cast resolves
+    /// and a regclass value renders without a catalog read. The oid is the
+    /// table's `pg_class` oid -- the same number `pg_attribute.attrelid` and
+    /// the RowDescription's `ftable` carry.
+    static PLAN_USER_RELATIONS: std::cell::RefCell<Vec<(String, i64, bool)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Relations: `(name, oid, temp)`.
+pub fn set_user_relations(relations: Vec<(String, i64, bool)>) {
+    PLAN_USER_RELATIONS.with(|t| *t.borrow_mut() = relations);
+}
+
+/// The system catalogs this server answers for, under PostgreSQL's own fixed
+/// oids (`'pg_class'::regclass::oid` is 1259 on every install; measured 16).
+const CATALOG_RELATIONS: &[(&str, i64)] = &[
+    ("pg_type", 1247),
+    ("pg_attribute", 1249),
+    ("pg_proc", 1255),
+    ("pg_class", 1259),
+    ("pg_database", 1262),
+    ("pg_index", 2610),
+    ("pg_constraint", 2606),
+    ("pg_namespace", 2615),
+    ("pg_enum", 3501),
+    ("pg_range", 3541),
+];
+
+/// The display rendering of a regclass value: the relation's name, quoted
+/// where an identifier needs it (`"Order"`, `"order"`), bare for a catalog
+/// relation, `-` for oid 0, and the bare number for an oid nothing has.
+/// A user relation prints WITHOUT its schema: `public` and `pg_temp` are
+/// both on the default search_path, so it is visible by its bare name.
+pub fn regclass_text(oid: i64) -> String {
+    if oid == 0 {
+        return "-".to_string();
+    }
+    if let Some(name) = PLAN_USER_RELATIONS.with(|t| {
+        t.borrow()
+            .iter()
+            .find(|(_, o, _)| *o == oid)
+            .map(|(n, _, _)| n.clone())
+    }) {
+        // A schema-qualified table is stored as `schema.name`; each part
+        // quotes on its own (`"Order"`, `testschema."Order"`).
+        return name
+            .split('.')
+            .map(scalar::quote_identifier)
+            .collect::<Vec<_>>()
+            .join(".");
+    }
+    if let Some((name, _)) = CATALOG_RELATIONS.iter().find(|(_, o)| *o == oid) {
+        return (*name).to_string();
+    }
+    oid.to_string()
+}
+
+/// Split a relation reference the way PostgreSQL's `SplitIdentifierString`
+/// does for `regclassin`: whitespace around a part is ignored, an unquoted
+/// part folds to lower case, a quoted one keeps its case (a doubled quote is
+/// one), and anything else -- an empty name, a bare dot, an unquoted part
+/// with a space inside, an unterminated quote -- is 42602 `invalid name
+/// syntax` (measured 16: `'a b'`, `'.t1'`, `'t1.'`, `'  '`).
+fn split_relation_name(text: &str) -> Result<Vec<String>> {
+    let invalid = || Error::InvalidName("invalid name syntax".into());
+    let mut parts = Vec::new();
+    let mut chars = text.trim().chars().peekable();
+    if chars.peek().is_none() {
+        return Err(invalid());
+    }
+    loop {
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        let mut part = String::new();
+        match chars.peek() {
+            Some('"') => {
+                chars.next();
+                loop {
+                    match chars.next() {
+                        Some('"') if chars.peek() == Some(&'"') => {
+                            part.push('"');
+                            chars.next();
+                        }
+                        Some('"') => break,
+                        Some(c) => part.push(c),
+                        None => return Err(invalid()),
+                    }
+                }
+            }
+            Some(_) => {
+                while let Some(&c) = chars.peek() {
+                    if c == '.' || c.is_whitespace() {
+                        break;
+                    }
+                    part.push(c.to_ascii_lowercase());
+                    chars.next();
+                }
+                if part.is_empty() {
+                    return Err(invalid());
+                }
+            }
+            None => return Err(invalid()),
+        }
+        parts.push(part);
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        match chars.next() {
+            None => return Ok(parts),
+            Some('.') => continue,
+            Some(_) => return Err(invalid()),
+        }
+    }
+}
+
+/// `'t1'::regclass` -- the oid of the relation a text names. Resolves an
+/// unqualified name as PostgreSQL's search_path does (temp tables first,
+/// then `public`, then the catalogs), `public.x` / `pg_temp.x` /
+/// `pg_catalog.x` by that schema alone, and a database-qualified
+/// `db.schema.x` by its last two parts. Unknown is 42P01 with the PARSED
+/// name (`relation "nope.t1" does not exist`, `relation "t1"` for a
+/// case-folded `'T1'`); four or more parts is PostgreSQL's 42601.
+fn resolve_regclass(text: &str) -> Result<i64> {
+    let parts = split_relation_name(text)?;
+    let (schema, name) = match parts.as_slice() {
+        [name] => (None, name.as_str()),
+        [schema, name] => (Some(schema.as_str()), name.as_str()),
+        [_, schema, name] => (Some(schema.as_str()), name.as_str()),
+        _ => {
+            return Err(Error::Parse(format!(
+                "improper relation name (too many dotted names): {}",
+                text.trim()
+            )))
+        }
+    };
+    let user = |stored: &str, temp: Option<bool>| -> Option<i64> {
+        PLAN_USER_RELATIONS.with(|t| {
+            t.borrow()
+                .iter()
+                .find(|(n, _, is_temp)| n == stored && temp.is_none_or(|want| want == *is_temp))
+                .map(|(_, oid, _)| *oid)
+        })
+    };
+    let catalog = || {
+        CATALOG_RELATIONS
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, oid)| *oid)
+    };
+    let found = match schema {
+        None => user(name, Some(true))
+            .or_else(|| user(name, Some(false)))
+            .or_else(catalog),
+        Some("public") => user(name, Some(false)),
+        Some(s) if s == "pg_temp" || s.starts_with("pg_temp_") => user(name, Some(true)),
+        Some("pg_catalog") => catalog(),
+        // A table in another schema is stored under `schema.name`.
+        Some(s) => user(&format!("{s}.{name}"), Some(false)),
+    };
+    found.ok_or_else(|| {
+        Error::UndefinedTable(match schema {
+            Some(s) => format!("{s}.{name}"),
+            None => name.to_string(),
+        })
     })
 }
 
@@ -8527,6 +8798,21 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
             _ => Err(Error::Unsupported(format!("a regtype cast to {target}"))),
         };
     }
+    // A regclass value likewise: to text as the relation's NAME, to `oid` /
+    // the two integer widths as its oid; anything else has no cast path
+    // (measured 16: `::int2`, `::numeric`, `::float8`, `::regtype` are all
+    // 42846 `cannot cast type regclass to ...`).
+    if let Some(oid) = regclass_oid(&value) {
+        return match target {
+            "regclass" => Ok(value),
+            "text" | "varchar" | "name" | "bpchar" => Ok(Bson::String(regclass_text(oid))),
+            "int4" | "int8" | "oid" | "integer" | "int" | "bigint" => Ok(Bson::Int64(oid)),
+            _ => Err(Error::CannotCoerce(format!(
+                "cannot cast type regclass to {}",
+                display_type(target)
+            ))),
+        };
+    }
     // An anonymous record renders to text as `(f1,f2,...)`; a cast to record is
     // a no-op. Other targets are not defined for a bare record.
     if let Some(fields) = record_fields(&value) {
@@ -8589,6 +8875,23 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
             other => Err(Error::Unsupported(format!(
                 "a cast of {} to {target}",
                 bson_kind(&other)
+            ))),
+        };
+    }
+    // `'t1'::regclass` names a relation; a number is taken as an oid as it
+    // stands (`12345::regclass` renders `12345`, `0::regclass` renders `-`),
+    // and so is a string that is all digits (measured 16).
+    if target == "regclass" {
+        return match value {
+            Bson::Int32(oid) => Ok(regclass_value(i64::from(oid))),
+            Bson::Int64(oid) => Ok(regclass_value(oid)),
+            Bson::String(name) => match name.trim().parse::<i64>() {
+                Ok(oid) if (0..(1i64 << 32)).contains(&oid) => Ok(regclass_value(oid)),
+                _ => resolve_regclass(&name).map(regclass_value),
+            },
+            other => Err(Error::CannotCoerce(format!(
+                "cannot cast type {} to regclass",
+                display_type(inferred_type(&other))
             ))),
         };
     }
@@ -9939,10 +10242,16 @@ pub(crate) fn compare_constants(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering
             Some(x.len().cmp(&y.len()))
         }
         (Bson::Boolean(x), Bson::Boolean(y)) => Some(x.cmp(y)),
-        // A regtype compares as its OID: `where t.oid = to_regtype('text')`.
-        (a2, b2) if regtype_oid(a2).is_some() || regtype_oid(b2).is_some() => {
+        // A regtype compares as its OID: `where t.oid = to_regtype('text')`;
+        // a regclass the same (`where attrelid = 't1'::regclass`).
+        (a2, b2)
+            if regtype_oid(a2).is_some()
+                || regtype_oid(b2).is_some()
+                || regclass_oid(a2).is_some()
+                || regclass_oid(b2).is_some() =>
+        {
             let num = |v: &Bson| -> Option<i64> {
-                regtype_oid(v).or(match v {
+                regtype_oid(v).or_else(|| regclass_oid(v)).or(match v {
                     Bson::Int32(x) => Some(i64::from(*x)),
                     Bson::Int64(x) => Some(*x),
                     _ => None,
@@ -11245,8 +11554,9 @@ fn lower_aexpr(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
             )));
         }
     }
-    // A regtype value filters by its OID -- the stored column is a number.
-    let value = match regtype_oid(&value) {
+    // A regtype / regclass value filters by its OID -- the stored column is
+    // a number.
+    let value = match regtype_oid(&value).or_else(|| regclass_oid(&value)) {
         Some(oid) => Bson::Int64(oid),
         None => value,
     };

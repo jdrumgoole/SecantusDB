@@ -720,14 +720,14 @@ remain open:
       psycopg gauge (`tests/types/test_shapely.py`, `CREATE EXTENSION
       postgis`). Out of scope — PostGIS is a third-party extension, not
       PostgreSQL.
-- [ ] **OPEN — RUST pgserver: `tests/pq/test_pgresult.py::test_ftable_and_col`
-      (2026-09-09).** Needs three things at once: the comma cross join
-      `select * from t1, t2` (two sources with no JOIN keyword),
-      `'t1'::regclass::oid` resolving a table name to its oid, and the
-      RowDescription's `ftable` / `ftablecol` fields carrying that oid and
-      the 1-based column number for a column that came from a table (both
-      0 today). PostgreSQL 16 answers the table's `pg_class.oid` and the
-      attribute number.
+- [ ] **OPEN — RUST pgserver: `SELECT *` / `t.*` over a JOIN or a comma
+      FROM (2026-09-10).** `select * from t1, t2` and `select t1.*, t2.f3
+      from t1 join t2 on ...` are 0A000 `this subquery target`; the join
+      planner expands only named targets. (The comma FROM itself, `regclass`
+      and the RowDescription's `ftable` / `ftablecol` landed with
+      `test_ftable_and_col`; a table created before row types were recorded
+      has no relation oid and still reports 0 / 0, and aggregate outputs
+      report 0 / 0 without measuring PostgreSQL.)
 - [ ] **OPEN — RUST pgserver: a cast to an unknown type is 0A000, not 42704
       (2026-09-09).** `select 1::no_such_type` is `0A000 a cast to
       no_such_type is not supported yet`; PostgreSQL 16 is `42704 type

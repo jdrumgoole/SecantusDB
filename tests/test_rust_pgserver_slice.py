@@ -1480,6 +1480,85 @@ def test_regtype_names_a_type(home: Path) -> None:
             assert cur.fetchone()[0] == want
 
 
+def test_regclass_names_a_relation(home: Path) -> None:
+    """`'t'::regclass` is the relation's oid, printed as its name.
+
+    Measured against PostgreSQL 16: the oid is `pg_class.oid` -- the same
+    number `pg_type.oid` carries for the table's row type and `pg_attribute
+    .attrelid` keys on -- so `'t1'::regclass::oid` equals both; `::text`
+    renders the name (quoted when it needs quoting); a catalog relation has
+    its fixed oid (`pg_class` is 1259); an unknown name is 42P01 with the
+    PARSED name, a malformed one 42602, and a cast to `regtype` 42846.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("create table t1 as select 1 as f1")
+        cur.execute('create table "Order" (x int)')
+        cur.execute("select 't1'::regclass, 't1'::regclass::oid, 'public.t1'::regclass::text")
+        assert cur.description[0].type_code == 2205
+        name, oid, qualified = cur.fetchone()
+        assert (name, qualified) == ("t1", "t1")
+        assert isinstance(oid, int) and oid > 0
+        cur.execute("select oid from pg_type where typname = 't1'")
+        assert cur.fetchone()[0] == oid
+        cur.execute("select attname from pg_attribute where attrelid = 't1'::regclass")
+        assert cur.fetchall() == [("f1",)]
+        cur.execute("select 't1'::regclass = 't1'::regclass::oid, %s::regclass::oid", (str(oid),))
+        assert cur.fetchone() == (True, oid)
+        cur.execute("select 'pg_class'::regclass::oid, '\"Order\"'::regclass::text")
+        assert cur.fetchone() == (1259, '"Order"')
+        for sql, sqlstate, message in [
+            ("select 'nope'::regclass", "42P01", 'relation "nope" does not exist'),
+            ("select 'Nope.T1'::regclass", "42P01", 'relation "nope.t1" does not exist'),
+            ("select 'Order'::regclass", "42P01", 'relation "order" does not exist'),
+            ("select 'a b'::regclass", "42602", "invalid name syntax"),
+            ("select 't1'::regclass::regtype", "42846", "cannot cast type regclass to regtype"),
+            ("select 1.5::regclass", "42846", "cannot cast type numeric to regclass"),
+        ]:
+            with pytest.raises(psycopg.Error) as info:
+                cur.execute(sql)
+            assert info.value.sqlstate == sqlstate, sql
+            assert message in str(info.value), sql
+
+
+def test_row_description_names_each_columns_source_table(home: Path) -> None:
+    """`RowDescription` carries the table oid and attnum a column is read
+    from (`PQftable` / `PQftablecol`); a computed column reports 0 / 0.
+
+    Measured against PostgreSQL 16 through an alias, a two-table FROM,
+    `SELECT *`, `INSERT ... RETURNING` and the extended protocol alike.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("create table t1 as select 1 as f1")
+        cur.execute("create table t2 as select 2 as f2, 3 as f3")
+        cur.execute("select 't1'::regclass::oid, 't2'::regclass::oid")
+        t1, t2 = cur.fetchone()
+
+        def sources(pgresult) -> list[tuple[int, int]]:
+            return [(pgresult.ftable(i), pgresult.ftablecol(i)) for i in range(pgresult.nfields)]
+
+        # The simple protocol, exactly psycopg's own test_ftable_and_col.
+        res = conn.pgconn.exec_(
+            b"select f1, f3, 't1'::regclass::oid, 't2'::regclass::oid from t1, t2"
+        )
+        assert sources(res) == [(t1, 1), (t2, 2), (0, 0), (0, 0)]
+        assert [res.get_value(0, i) for i in range(4)] == [
+            b"1",
+            b"3",
+            str(t1).encode(),
+            str(t2).encode(),
+        ]
+
+        # The extended protocol describes the same fields.
+        cur.execute("select a.f1 as x, f1 + 1, f1::int, * from t1 a")
+        assert sources(cur.pgresult) == [(t1, 1), (0, 0), (0, 0), (t1, 1)]
+        cur.execute("select t2.f3, t1.f1 from t1 left join t2 on t1.f1 = t2.f2")
+        assert sources(cur.pgresult) == [(t2, 2), (t1, 1)]
+        cur.execute("insert into t1 values (2) returning f1, f1 + 1")
+        assert sources(cur.pgresult) == [(t1, 1), (0, 0)]
+
+
 def test_timetz_columns_are_session_independent(home: Path) -> None:
     """A `timetz` column stores its LITERAL offset, stable under any zone.
 
