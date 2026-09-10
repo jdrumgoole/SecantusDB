@@ -19,8 +19,8 @@ import decimal as dc
 import ipaddress
 import re
 import shutil
-import socket
 import subprocess
+import threading
 import time
 import uuid
 from collections.abc import Iterator
@@ -42,58 +42,59 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
-
-
 class _Server:
     """A `secantusd-pg` subprocess over one storage home."""
 
     def __init__(self, home: Path, *, databases: tuple[str, ...] = ()) -> None:
         self.home = home
-        self.port = _free_port()
+        self.port = 0
         self.proc: subprocess.Popen[str] | None = None
         self.databases = databases
 
     def __enter__(self) -> _Server:
-        # `_free_port()` reports a port the OS *had* free, but closes its probe
-        # socket before the child binds -- so under `-n auto` a parallel worker
-        # can claim the same port in the gap, and the child then exits with
-        # "address already in use". That is the ONLY early exit worth retrying
-        # (with a fresh port); any other early exit is a genuine startup crash
-        # and must surface, not be masked. See the port-race note in CLAUDE.md.
-        last_out = ""
-        for _ in range(5):
-            self.proc = subprocess.Popen(
-                [
-                    str(BINARY),
-                    str(self.home),
-                    f"127.0.0.1:{self.port}",
-                    *(f"--database={name}" for name in self.databases),
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-            deadline = time.monotonic() + 30
-            while time.monotonic() < deadline:
-                if self.proc.poll() is not None:
-                    last_out = self.proc.stdout.read() if self.proc.stdout else ""
-                    break
-                try:
-                    with socket.create_connection(("127.0.0.1", self.port), timeout=0.25):
-                        return self
-                except OSError:
-                    time.sleep(0.05)
-            else:
-                raise RuntimeError("secantusd-pg did not start")
-            if "address" in last_out.lower() and "use" in last_out.lower():
-                self.port = _free_port()
-                continue
-            raise RuntimeError(f"secantusd-pg exited: {last_out}")
-        raise RuntimeError(f"secantusd-pg could not bind a free port: {last_out}")
+        # Bind port 0 and let the KERNEL name the port, then read it back from
+        # the server's readiness line. Probing for a free port and passing it to
+        # the child cannot be made safe: the probe socket has to close before the
+        # child binds, so under `-n auto` two workers can be handed the same
+        # port. The loser's child exits with "address already in use" -- but a
+        # liveness probe fired in that gap CONNECTS TO THE WINNER'S SERVER, and
+        # the harness then hands the test a connection to another worker's
+        # database, which dies when that worker finishes. That is the
+        # "server closed the connection unexpectedly" on a `CREATE TABLE` that
+        # CI hit on 2026-09-09. Binding 0 removes the gap entirely -- the port
+        # is never unbound between being chosen and being listened on.
+        self.proc = subprocess.Popen(
+            [
+                str(BINARY),
+                str(self.home),
+                "127.0.0.1:0",
+                *(f"--database={name}" for name in self.databases),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        line = self._readline(timeout=30)
+        match = re.search(r"listening on \S+:(\d+)", line)
+        if not match:
+            self.__exit__()
+            rest = ""
+            with contextlib.suppress(Exception):
+                rest = self.proc.stdout.read() if self.proc.stdout else ""
+            raise RuntimeError(f"secantusd-pg did not start: {line!r}{rest!r}")
+        self.port = int(match.group(1))
+        return self
+
+    def _readline(self, *, timeout: float) -> str:
+        """The child's first stdout line, or "" if it dies or stalls."""
+        out: list[str] = []
+        reader = threading.Thread(
+            target=lambda: out.append(self.proc.stdout.readline() if self.proc.stdout else ""),
+            daemon=True,
+        )
+        reader.start()
+        reader.join(timeout)
+        return out[0] if out else ""
 
     def __exit__(self, *exc: object) -> None:
         if self.proc is not None:
