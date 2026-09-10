@@ -15159,3 +15159,33 @@ evaluated plan shapes — a feature, not a patch.
 input order where PostgreSQL sorts keys (shorter first, then bytewise). Note
 `json` is CORRECT to keep the input order — only `jsonb` sorts, so a fix must
 not apply to both.
+
+## Probe-a-free-port race in test harnesses (2026-09-10) — two fixed, one left
+
+`_free_port()` binds a socket, reads the port, and closes it — so the port is
+unbound between being chosen and being used. Under `pytest -n auto` two workers
+get the same number; one child binds it, the other exits "address already in
+use". The damage is not the failed child, it is that a readiness probe fired in
+that window **succeeds against the other worker's server**, and the test then
+runs against a database it does not own until that worker tears it down.
+
+Seen for real: `pg-oracle` failed on 2026-09-09 with
+`server closed the connection unexpectedly` on the `CREATE TABLE` that opens
+`test_refusals_carry_the_right_sqlstate` — before the SQL under test ran.
+
+- `tests/test_rust_pgserver_slice.py` (`_Server`, also used by
+  `test_rust_pgserver_differential.py`) — **fixed properly**: `secantusd-pg`
+  now prints the address it actually bound, so the harness starts it on
+  `127.0.0.1:0` and reads the port back. No window at all.
+- `tests/test_mongod_differential.py` — **guarded, not eliminated**: mongod
+  offers no way to report a kernel-assigned port, so the fixture instead
+  asserts its own child is still alive once the ping succeeds. A child that
+  lost the race has exited by then, so the gate fails loudly instead of
+  silently comparing against a mongod it does not own.
+- `tests/test_concurrency.py` — **still exposed**, deliberately left. It is
+  `perf`-marked, so the default suite excludes it and only one test uses the
+  port; the same alive-after-ready guard would apply if it ever bites.
+
+The general rule: **have the server report the port it bound; never hand it
+one you probed.** Any scheme that probes and passes the number has this
+window by construction.
