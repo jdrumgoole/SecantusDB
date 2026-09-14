@@ -2634,8 +2634,7 @@ pub fn format_double_roundtrip(d: f64) -> String {
 /// mirrors `expressions.coerce_to_string`.
 ///
 /// Defers on every type mongod rejects (the error needs a code this engine
-/// can't name) and on a timestamp, whose rendering mongod does in *local*
-/// time -- `chrono` is built here without its clock feature.
+/// can't name).
 /// Whether [`coerce_to_string`] has a rendering for this type.
 ///
 /// Deliberately NOT the `$convert`-to-string set: `$toLower` of a bool is
@@ -2654,10 +2653,13 @@ fn is_case_convertible(v: &Bson) -> bool {
             | Bson::Decimal128(_)
             | Bson::DateTime(_)
             | Bson::JavaScriptCode(_)
+            | Bson::Timestamp(_)
     )
 }
 
 fn coerce_to_string(v: &Bson) -> Result<String, Fallback> {
+    use chrono::TimeZone;
+
     Ok(match v {
         Bson::Null | Bson::Undefined => String::new(),
         Bson::String(s) => s.clone(),
@@ -2667,6 +2669,30 @@ fn coerce_to_string(v: &Bson) -> Result<String, Fallback> {
         Bson::Decimal128(d) => d.to_string(),
         Bson::DateTime(dt) => render_date(dt.timestamp_millis(), "%Y-%m-%dT%H:%M:%S.%LZ")?,
         Bson::JavaScriptCode(c) => c.clone(),
+        // A Timestamp goes through a legacy asctime-like path, in the server
+        // process's LOCAL time -- not UTC, and not the `$dateToString` format
+        // language. Measured against 8.2.11 (2026-09-10) by running mongod
+        // under three zones:
+        //
+        //     TZ                 $toLower: Timestamp(1700000000, 3)
+        //     Europe/Dublin      nov 14 22:13:20:3
+        //     UTC                nov 14 22:13:20:3
+        //     America/New_York   nov 14 17:13:20:3
+        //
+        // The first two agree only because Ireland is on UTC in November; a
+        // one-shape probe would have concluded "not TZ-dependent" and been
+        // wrong. New York moves by 5h in November and 4h in July, so mongod is
+        // resolving a real tz database at the instant, DST and all -- a fixed
+        // offset cannot reproduce it. `%e` space-pads the day, the increment is
+        // appended after a colon UNPADDED, and the caller ASCII-cases the lot.
+        Bson::Timestamp(ts) => {
+            let secs = i64::from(ts.time);
+            let local = chrono::Local
+                .timestamp_opt(secs, 0)
+                .single()
+                .ok_or(Fallback::Defer)?;
+            format!("{}:{}", local.format("%b %e %H:%M:%S"), ts.increment)
+        }
         _ => return Err(Fallback::Defer),
     })
 }
