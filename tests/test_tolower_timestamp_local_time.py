@@ -35,16 +35,40 @@ import pytest
 bson = pytest.importorskip("bson")
 
 # (TZ, timestamp seconds, increment) -> exactly what mongod 8.2.11 answered.
-MEASURED = [
+#
+# `TZ` is a POSIX mechanism and setting it to an IANA name is a Unix-only
+# device. Windows' CRT reads `TZ` as `tzn[+|-]hh[:mm[:ss]][dzn]`, so it parses
+# "America/New_York" as a zone NAME with no numeric offset -- offset zero -- and
+# then enables US daylight rules because a trailing daylight name is present.
+# CI measured exactly that on `windows-latest` (2026-09-10): the three winter
+# cases came back UTC and the July one came back UTC+1, which is a wrong answer
+# arrived at by a plausible route, and would read as a product bug rather than a
+# test device that does not travel.
+#
+# So the zone-shifting cases are Unix-only. They are the ones that prove the
+# rendering is DST-correct rather than a fixed offset, and that claim is about
+# the server, not about the platform's `TZ` syntax.
+_ZONE_SHIFTED = [
     ("America/New_York", 1, 1, "dec 31 19:00:01:1"),
     ("America/New_York", 1700000000, 3, "nov 14 17:13:20:3"),
     ("America/New_York", 1720000000, 0, "jul  3 05:46:40:0"),
     ("America/New_York", 1767225600, 12, "dec 31 19:00:00:12"),
+]
+
+# `TZ=UTC` is spelled the same on both platforms, so these run everywhere.
+_UTC = [
     ("UTC", 1, 1, "jan  1 00:00:01:1"),
     ("UTC", 1700000000, 3, "nov 14 22:13:20:3"),
     ("UTC", 1720000000, 0, "jul  3 09:46:40:0"),
     ("UTC", 1767225600, 12, "jan  1 00:00:00:12"),
 ]
+
+_WINDOWS_TZ = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="TZ=<IANA name> is a Unix device; Windows' CRT reads TZ as tzn[+-]hh[dzn]",
+)
+
+MEASURED = [*_UTC, *[pytest.param(*case, marks=_WINDOWS_TZ) for case in _ZONE_SHIFTED]]
 
 _PURE = """
 import sys
