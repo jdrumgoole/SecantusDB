@@ -668,6 +668,9 @@ struct BaseType {
     defined: bool,
     input: Option<String>,
     output: Option<String>,
+    /// The extension that owns the type (`hstore`, `postgis`), when one does:
+    /// it goes with the extension, and DROP TYPE refuses it.
+    extension: Option<String>,
 }
 
 /// A user function as the `__sql_functions__` catalog holds it -- the fields
@@ -864,6 +867,13 @@ impl PgHandler {
     /// (PostgreSQL mints the array type only at completion).
     const BASE_TYPE_COLLECTION: &'static str = "__sql_base_types__";
     const BASE_TYPE_OID_BASE: i64 = 71_000;
+    /// Installed extensions: `{_id: name, version, relocatable}` per
+    /// `CREATE EXTENSION`. The two this server can install (`hstore`,
+    /// `postgis`) each bring one base type, recorded in
+    /// `__sql_base_types__` with `extension: <name>` so the type goes with
+    /// the extension and `DROP TYPE` refuses it, as on PostgreSQL. Rust-server
+    /// only.
+    const EXTENSION_COLLECTION: &'static str = "__sql_extensions__";
     /// User functions, in the PYTHON server's `__sql_functions__` shape (a
     /// shared-store contract): `_id: "name/nargs"`, `name`, `nargs`, `params`
     /// (declared names, `null` when unnamed), `param_types` (type tags),
@@ -983,6 +993,16 @@ impl PgHandler {
             .map(|b| (Self::type_resolution(&b.schema, &b.name), b.oid, b.defined))
             .collect();
         secantus_pgplan::set_user_base_types(base_types);
+        // The extension types among them (`hstore`, `geometry`): the planner
+        // parses and renders their text forms itself.
+        let extension_types: Vec<String> = self
+            .base_types()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|b| b.extension.is_some())
+            .map(|b| Self::type_resolution(&b.schema, &b.name))
+            .collect();
+        secantus_pgplan::set_extension_types(extension_types);
         secantus_pgplan::set_user_relations(self.relations());
     }
 
@@ -2280,10 +2300,38 @@ impl PgHandler {
                 defined: d.get_bool("defined").unwrap_or(false),
                 input: d.get_str("input").ok().map(str::to_string),
                 output: d.get_str("output").ok().map(str::to_string),
+                extension: d.get_str("extension").ok().map(str::to_string),
             });
         }
         out.sort();
         Ok(out)
+    }
+
+    /// The installed extensions as `(name, version, relocatable)`:
+    /// `plpgsql` first, always present as on PostgreSQL, then the installed
+    /// ones by name.
+    fn extensions(&self) -> PgWireResult<Vec<(String, String, bool)>> {
+        let mut out = vec![("plpgsql".to_string(), "1.0".to_string(), false)];
+        for d in self.type_catalog_docs(Self::EXTENSION_COLLECTION)?.iter() {
+            out.push((
+                d.get_str("_id").unwrap_or_default().to_string(),
+                d.get_str("version").unwrap_or_default().to_string(),
+                d.get_bool("relocatable").unwrap_or(false),
+            ));
+        }
+        Ok(out)
+    }
+
+    /// What `CREATE EXTENSION name` installs: `(version, relocatable, the
+    /// base types it brings)`. Anything else is PostgreSQL's 0A000 `is not
+    /// available`. Versions are the ones measured on 16 (hstore 1.8, PostGIS
+    /// 3.4.6).
+    fn available_extension(name: &str) -> Option<(&'static str, bool, &'static [&'static str])> {
+        match name {
+            "hstore" => Some(("1.8", true, &["hstore"])),
+            "postgis" => Some(("3.4.6", false, &["geometry"])),
+            _ => None,
+        }
     }
 
     /// The `__sql_functions__` catalog (the Python server's shape, see the
@@ -2706,6 +2754,15 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("typrelid", "oid", false),
                 ],
             )),
+            "pg_extension" => Some(TableDef::new(
+                "pg_extension",
+                vec![
+                    secantus_pgcatalog::Column::new("oid", "oid", false),
+                    secantus_pgcatalog::Column::new("extname", "name", false),
+                    secantus_pgcatalog::Column::new("extversion", "text", false),
+                    secantus_pgcatalog::Column::new("extrelocatable", "bool", false),
+                ],
+            )),
             "pg_attribute" => Some(TableDef::new(
                 "pg_attribute",
                 vec![
@@ -2949,7 +3006,7 @@ impl PgHandler {
                 // TYPE completes it (measured on 16) -- and derived after.
                 for b in self.base_types().ok()? {
                     let mut d = Document::new();
-                    d.insert(def.field_of("typname").expect("column"), b.name);
+                    d.insert(def.field_of("typname").expect("column"), b.name.clone());
                     d.insert(def.field_of("oid").expect("column"), Bson::Int64(b.oid));
                     let typarray = if b.defined {
                         b.oid + Self::USER_TYPE_ARRAY_OID_OFFSET
@@ -2960,8 +3017,35 @@ impl PgHandler {
                         def.field_of("typarray").expect("column"),
                         Bson::Int64(typarray),
                     );
-                    d.insert(def.field_of("typdelim").expect("column"), ",");
+                    // PostGIS declares `geometry` with `DELIMITER = ':'`
+                    // (measured on 3.4.6); every other base type is `,`.
+                    let delim = if b.extension.is_some() && b.name == "geometry" {
+                        ":"
+                    } else {
+                        ","
+                    };
+                    d.insert(def.field_of("typdelim").expect("column"), delim);
                     d.insert(def.field_of("typrelid").expect("column"), Bson::Int64(0));
+                    rows.push(d);
+                }
+                rows
+            }
+            "pg_extension" => {
+                let mut rows = Vec::new();
+                for (i, (name, version, relocatable)) in
+                    self.extensions().ok()?.into_iter().enumerate()
+                {
+                    let mut d = Document::new();
+                    d.insert(
+                        def.field_of("oid").expect("column"),
+                        Bson::Int64(13_826 + i as i64),
+                    );
+                    d.insert(def.field_of("extname").expect("column"), name);
+                    d.insert(def.field_of("extversion").expect("column"), version);
+                    d.insert(
+                        def.field_of("extrelocatable").expect("column"),
+                        Bson::Boolean(relocatable),
+                    );
                     rows.push(d);
                 }
                 rows
@@ -3227,6 +3311,7 @@ impl PgHandler {
                     "pg_attribute",
                     "pg_range",
                     "pg_enum",
+                    "pg_extension",
                     "pg_database",
                     "pg_class",
                     "pg_namespace",
@@ -4641,6 +4726,10 @@ impl PgHandler {
             Statement::CreateShellType { .. } | Statement::CreateBaseType { .. } => {
                 vec![Self::BASE_TYPE_COLLECTION.to_string()]
             }
+            Statement::CreateExtension { .. } | Statement::DropExtension { .. } => vec![
+                Self::EXTENSION_COLLECTION.to_string(),
+                Self::BASE_TYPE_COLLECTION.to_string(),
+            ],
             Statement::CreateFunction { .. } => vec![Self::FUNCTION_COLLECTION.to_string()],
             Statement::DropFunction { .. } => vec![
                 Self::FUNCTION_COLLECTION.to_string(),
@@ -8064,6 +8153,20 @@ impl PgHandler {
                     // on it, so RESTRICT refuses with 2BP01 while any exist
                     // and CASCADE drops them with a notice (measured on 16).
                     if let Some(base) = self.base_type_named(name)? {
+                        // An extension's type goes with the extension:
+                        // 2BP01 `extension hstore requires it` (measured 16).
+                        if let Some(ext) = &base.extension {
+                            let mut info = ErrorInfo::new(
+                                "ERROR".into(),
+                                "2BP01".into(), // dependent_objects_still_exist
+                                format!(
+                                    "cannot drop type {} because extension {ext} requires it",
+                                    base.name
+                                ),
+                            );
+                            info.hint = Some(format!("You can drop extension {ext} instead."));
+                            return Err(PgWireError::UserError(Box::new(info)));
+                        }
                         let quoted = secantus_pgplan::scalar::quote_identifier(&base.name);
                         let functions = self.functions()?;
                         let dependents: Vec<&UserFunction> = functions
@@ -8460,20 +8563,194 @@ impl PgHandler {
                 Ok(vec![Response::CopyOut(CopyResponse::new(code, n, data))])
             }
 
-            Statement::AlterRole(role) => {
+            Statement::CreateExtension {
+                name,
+                if_not_exists,
+            } => {
+                // Only the extensions this server carries an implementation
+                // of can be installed; the rest are PostgreSQL's 0A000 `is
+                // not available`, with its control-file detail and hint
+                // (measured on 16).
+                let Some((version, relocatable, types)) = Self::available_extension(&name) else {
+                    let mut info = ErrorInfo::new(
+                        "ERROR".into(),
+                        "0A000".into(), // feature_not_supported
+                        format!("extension \"{name}\" is not available"),
+                    );
+                    info.detail = Some(format!(
+                        "Could not open extension control file \
+                         \"/usr/share/postgresql/16/extension/{name}.control\": \
+                         No such file or directory."
+                    ));
+                    info.hint = Some(
+                        "The extension must first be installed on the system where \
+                         PostgreSQL is running."
+                            .into(),
+                    );
+                    return Err(PgWireError::UserError(Box::new(info)));
+                };
+                if self.extensions()?.iter().any(|(n, _, _)| *n == name) {
+                    if if_not_exists {
+                        self.notice(
+                            "42710",
+                            format!("extension \"{name}\" already exists, skipping"),
+                            None,
+                        );
+                        return Ok(vec![Response::Execution(Tag::new("CREATE EXTENSION"))]);
+                    }
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42710".into(), // duplicate_object
+                        format!("extension \"{name}\" already exists"),
+                    ))));
+                }
+                // The extension's types must not collide with anything the
+                // user already made: PostgreSQL's script fails on the first
+                // `CREATE TYPE` with the ordinary 42710.
+                for ty in types {
+                    if self.type_name_taken(ty)? {
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".into(),
+                            "42710".into(), // duplicate_object
+                            format!("type \"{ty}\" already exists"),
+                        ))));
+                    }
+                }
+                self.ensure_collection(Self::EXTENSION_COLLECTION)?;
+                self.ensure_collection(Self::BASE_TYPE_COLLECTION)?;
+                for ty in types {
+                    let oid = self.mint_base_type_oid()?;
+                    let doc = bson::doc! {
+                        "_id": *ty,
+                        "base": *ty,
+                        "schema": "public",
+                        "oid": oid,
+                        "defined": true,
+                        "input": format!("{ty}_in"),
+                        "output": format!("{ty}_out"),
+                        "extension": &name,
+                    };
+                    self.insert_type_doc(Self::BASE_TYPE_COLLECTION, ty, doc)?;
+                }
+                let doc = bson::doc! {
+                    "_id": &name,
+                    "version": version,
+                    "relocatable": relocatable,
+                };
+                self.insert_type_doc(Self::EXTENSION_COLLECTION, &name, doc)?;
+                Ok(vec![Response::Execution(Tag::new("CREATE EXTENSION"))])
+            }
+
+            Statement::DropExtension {
+                names,
+                if_exists,
+                cascade,
+            } => {
+                self.ensure_collection(Self::EXTENSION_COLLECTION)?;
+                self.ensure_collection(Self::BASE_TYPE_COLLECTION)?;
+                for name in &names {
+                    let installed = self.extensions()?.iter().any(|(n, _, _)| n == name);
+                    if !installed || name == "plpgsql" {
+                        if installed {
+                            // plpgsql is not this server's to drop.
+                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".into(),
+                                "0A000".into(), // feature_not_supported
+                                "cannot drop extension plpgsql".into(),
+                            ))));
+                        }
+                        if if_exists {
+                            self.notice(
+                                "00000",
+                                format!("extension \"{name}\" does not exist, skipping"),
+                                None,
+                            );
+                            continue;
+                        }
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".into(),
+                            "42704".into(), // undefined_object
+                            format!("extension \"{name}\" does not exist"),
+                        ))));
+                    }
+                    // A column typed with one of the extension's types
+                    // depends on it: RESTRICT refuses with 2BP01, one DETAIL
+                    // line per column (measured on 16). CASCADE would drop
+                    // the columns, which this server cannot do yet.
+                    let owned: Vec<BaseType> = self
+                        .base_types()?
+                        .into_iter()
+                        .filter(|b| b.extension.as_deref() == Some(name))
+                        .collect();
+                    let mut dependents = Vec::new();
+                    for def in self.all_table_defs()? {
+                        for col in &def.columns {
+                            let element = col.pg_type.strip_suffix("[]").unwrap_or(&col.pg_type);
+                            if owned
+                                .iter()
+                                .any(|b| Self::type_resolution(&b.schema, &b.name) == element)
+                            {
+                                dependents
+                                    .push(format!("column {} of table {}", col.name, def.name));
+                            }
+                        }
+                    }
+                    if !dependents.is_empty() {
+                        if cascade {
+                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".into(),
+                                "0A000".into(), // feature_not_supported
+                                format!(
+                                    "DROP EXTENSION {name} CASCADE is not supported while a \
+                                     column depends on it; drop the table first"
+                                ),
+                            ))));
+                        }
+                        let mut info = ErrorInfo::new(
+                            "ERROR".into(),
+                            "2BP01".into(), // dependent_objects_still_exist
+                            format!(
+                                "cannot drop extension {name} because other objects depend on it"
+                            ),
+                        );
+                        info.detail = Some(
+                            dependents
+                                .iter()
+                                .map(|d| format!("{d} depends on type {}", owned[0].name))
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        );
+                        info.hint = Some(
+                            "Use DROP ... CASCADE to drop the dependent objects too.".to_string(),
+                        );
+                        return Err(PgWireError::UserError(Box::new(info)));
+                    }
+                    for b in &owned {
+                        let key = Self::type_resolution(&b.schema, &b.name);
+                        self.delete_type_doc(Self::BASE_TYPE_COLLECTION, &key)?;
+                    }
+                    self.delete_type_doc(Self::EXTENSION_COLLECTION, name)?;
+                }
+                Ok(vec![Response::Execution(Tag::new("DROP EXTENSION"))])
+            }
+
+            Statement::AlterRole { name, .. } => {
                 let me = self
                     .session_user
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone();
-                if role != me {
+                if name != me {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
                         "42704".into(), // undefined_object
-                        format!("role \"{role}\" does not exist"),
+                        format!("role \"{name}\" does not exist"),
                     ))));
                 }
                 Ok(vec![Response::Execution(Tag::new("ALTER ROLE"))])
+            }
+            Statement::CreateRole { .. } | Statement::DropRole { .. } => {
+                Err(Self::err(&PlanError::Unsupported("roles".into())))
             }
 
             Statement::Show(name) => {
@@ -9629,7 +9906,60 @@ fn binary_encodable(ty: &Type) -> bool {
     if datetime_or_range_kind(ty) {
         return true;
     }
+    // An extension type (`hstore`, `geometry`) has its own send function,
+    // and so does its array.
+    if extension_of_type(ty).is_some() || extension_element_of_array(ty).is_some() {
+        return true;
+    }
     OK.contains(ty)
+}
+
+/// The extension behind a wire `Type` that is one of the extension types
+/// (`hstore`, `geometry`) -- a user base type by oid, named for the type the
+/// installed extension brings. Nothing else has these names AND a user oid.
+fn extension_of_type(ty: &Type) -> Option<secantus_pgplan::ExtensionType> {
+    if !matches!(ty.kind(), postgres_types::Kind::Simple) {
+        return None;
+    }
+    if i64::from(ty.oid()) < PgHandler::BASE_TYPE_OID_BASE {
+        return None;
+    }
+    secantus_pgplan::extension_type(ty.name())
+}
+
+/// The extension behind an ARRAY wire type's element, when the element is an
+/// extension type.
+fn extension_element_of_array(ty: &Type) -> Option<secantus_pgplan::ExtensionType> {
+    match ty.kind() {
+        postgres_types::Kind::Array(inner) => extension_of_type(inner),
+        _ => None,
+    }
+}
+
+/// An extension value's binary send form, from the canonical text this
+/// server stores: `hstore_send` (count + length-prefixed pairs) and PostGIS's
+/// EWKB (the stored hex, decoded).
+fn extension_binary(ext: secantus_pgplan::ExtensionType, text: &str) -> Option<Vec<u8>> {
+    match ext {
+        secantus_pgplan::ExtensionType::Hstore => secantus_pgplan::hstore::parse(text)
+            .ok()
+            .map(|pairs| secantus_pgplan::hstore::to_binary(&pairs)),
+        secantus_pgplan::ExtensionType::Geometry => secantus_pgplan::geometry::unhex(text),
+    }
+}
+
+/// An extension value from its binary recv form, to the canonical text this
+/// server stores.
+fn extension_from_binary(
+    ext: secantus_pgplan::ExtensionType,
+    bytes: &[u8],
+) -> Result<String, secantus_pgplan::Error> {
+    match ext {
+        secantus_pgplan::ExtensionType::Hstore => secantus_pgplan::hstore::from_binary(bytes)
+            .map(|pairs| secantus_pgplan::hstore::render(&secantus_pgplan::hstore::unique(pairs))),
+        secantus_pgplan::ExtensionType::Geometry => secantus_pgplan::geometry::from_ewkb(bytes)
+            .map(|g| secantus_pgplan::geometry::to_hex(&g)),
+    }
 }
 
 /// A date / time / timetz / timestamp / timestamptz / interval, a range or
@@ -9892,6 +10222,22 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
         let binary = element_binary(v, ty).ok_or_else(|| bad("this value"))?;
         let text = secantus_pgplan::value_text(v);
         return enc.encode_field(&RawField { binary, text });
+    }
+    // An extension type: its own send function, from the stored text.
+    if let Some(ext) = extension_of_type(ty) {
+        let text = as_text(v).ok_or_else(|| bad("this value"))?;
+        let binary = extension_binary(ext, &text).ok_or_else(|| bad("this value"))?;
+        return enc.encode_field(&RawField { binary, text });
+    }
+    if let postgres_types::Kind::Array(inner) = ty.kind() {
+        if extension_of_type(inner).is_some() {
+            let Bson::Array(items) = v else {
+                return Err(bad("this value"));
+            };
+            let binary = array_binary(items, inner).ok_or_else(|| bad("this value"))?;
+            let text = secantus_pgplan::value_text(v);
+            return enc.encode_field(&RawField { binary, text });
+        }
     }
     // json's binary form is its text verbatim; jsonb's is a one-byte format
     // version (`1`) followed by the same text (PostgreSQL 16 `jsonb_send`).
@@ -11018,6 +11364,7 @@ fn binary_array(
     bytes: &[u8],
     tz: &secantus_pgplan::TimeZoneSetting,
     cenc: ClientEncoding,
+    element: Option<&Type>,
 ) -> PgWireResult<Bson> {
     if bytes.len() < 12 {
         return Err(unsupported_binary_oid(None));
@@ -11040,7 +11387,9 @@ fn binary_array(
     let count: usize = dims.iter().product();
     let mut pos = 12 + 8 * ndim;
     let mut flat = Vec::with_capacity(count);
-    let ty = Type::from_oid(elem_oid);
+    // A builtin element by its oid; a user element (whose oid
+    // `Type::from_oid` does not know) by the declared type handed down.
+    let ty = Type::from_oid(elem_oid).or_else(|| element.cloned());
     for _ in 0..count {
         if pos + 4 > bytes.len() {
             return Err(unsupported_binary_oid(None));
@@ -11149,6 +11498,13 @@ fn element_binary(v: &Bson, elem: &Type) -> Option<Vec<u8>> {
             },
         };
         return record_binary(fields, &field_types);
+    }
+    // An extension element: its own send form.
+    if let Some(ext) = extension_of_type(elem) {
+        return match v {
+            Bson::String(text) => extension_binary(ext, text),
+            _ => None,
+        };
     }
     // A user ENUM element: its label's bytes, as the scalar arm sends them.
     if matches!(elem.kind(), postgres_types::Kind::Enum(_)) {
@@ -12033,7 +12389,7 @@ fn decode_parameter(
             )),
             // Every array oid this server knows, decoded through the element's
             // own binary decoder rather than a per-type array reader.
-            Some(oid) if element_of_array_oid(oid).is_some() => binary_array(bytes, tz, cenc),
+            Some(oid) if element_of_array_oid(oid).is_some() => binary_array(bytes, tz, cenc, None),
             // A user ENUM ARRAY (the declared type names it): the same array
             // layout, whose element oid `Type::from_oid` does not know -- so
             // each element takes the user-type arm below and decodes to its
@@ -12044,7 +12400,24 @@ fn decode_parameter(
                         if matches!(inner.kind(), postgres_types::Kind::Enum(_)))
                 }) =>
             {
-                binary_array(bytes, tz, cenc)
+                binary_array(bytes, tz, cenc, None)
+            }
+            // An extension type (`hstore`, `geometry`): its recv function,
+            // to the canonical text this server stores. Its ARRAY carries
+            // the element oid `Type::from_oid` does not know, so the
+            // declared element type is handed down.
+            Some(_) if ty.and_then(extension_of_type).is_some() => {
+                let ext = ty.and_then(extension_of_type).expect("checked");
+                extension_from_binary(ext, bytes)
+                    .map(Bson::String)
+                    .map_err(|e| PgHandler::err(&e))
+            }
+            Some(_) if ty.and_then(extension_element_of_array).is_some() => {
+                let inner = match ty.map(Type::kind) {
+                    Some(postgres_types::Kind::Array(inner)) => inner,
+                    _ => unreachable!("checked"),
+                };
+                binary_array(bytes, tz, cenc, Some(inner))
             }
             // An oid this server has no decoder for is a USER type -- the
             // known builtins all matched above. A user ENUM's binary format is
@@ -12138,6 +12511,20 @@ fn decode_parameter(
                 _ => "interval",
             };
             secantus_pgplan::cast_text_to(&text, target, tz).map_err(|e| PgHandler::err(&e))
+        }
+        // An extension type's text form, canonicalised (`a => b` is stored
+        // as `"a"=>"b"`; a WKT geometry as hex EWKB), or an ARRAY of one.
+        Some(_) if ty.and_then(extension_of_type).is_some() => {
+            let ty = ty.expect("checked");
+            secantus_pgplan::cast_text_to(&text, ty.name(), tz).map_err(|e| PgHandler::err(&e))
+        }
+        Some(_) if ty.and_then(extension_element_of_array).is_some() => {
+            let inner = match ty.map(Type::kind) {
+                Some(postgres_types::Kind::Array(inner)) => inner,
+                _ => unreachable!("checked"),
+            };
+            secantus_pgplan::cast_text_to(&text, &format!("{}[]", inner.name()), tz)
+                .map_err(|e| PgHandler::err(&e))
         }
         Some(oid) if element_of_array_oid(oid).is_some() => {
             let element = element_of_array_oid(oid).expect("checked");
@@ -12363,6 +12750,8 @@ impl PgHandler {
                             matches!(t.kind(), postgres_types::Kind::Enum(_))
                                 || matches!(t.kind(), postgres_types::Kind::Array(inner)
                                     if matches!(inner.kind(), postgres_types::Kind::Enum(_)))
+                                || extension_of_type(t).is_some()
+                                || extension_element_of_array(t).is_some()
                         }),
                     Some(_) => None,
                 };

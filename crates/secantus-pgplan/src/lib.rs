@@ -17,6 +17,8 @@ pub mod acl;
 pub mod bytea;
 pub mod escape_strings;
 pub mod geo;
+pub mod geometry;
+pub mod hstore;
 pub mod json;
 pub mod net;
 pub mod numeric;
@@ -122,6 +124,10 @@ pub enum Error {
     /// as it words it. Distinct from `Unsupported`, which is a gap in THIS
     /// server and says so.
     FeatureNotSupported(String),
+    /// An error PostgreSQL reports under the internal class -> XX000. The
+    /// PostGIS parsers do this for malformed geometry text and GeoJSON,
+    /// so a client matching on `InternalError` sees the same class.
+    Internal(String),
 }
 
 impl std::fmt::Display for Error {
@@ -153,7 +159,8 @@ impl std::fmt::Display for Error {
             | Error::ArraySubscript(m)
             | Error::DatatypeMismatch(m)
             | Error::CannotCoerce(m)
-            | Error::InvalidForeignKey(m) => write!(f, "{m}"),
+            | Error::InvalidForeignKey(m)
+            | Error::Internal(m) => write!(f, "{m}"),
             Error::MultipleCommands => {
                 write!(
                     f,
@@ -211,6 +218,7 @@ impl Error {
             Error::DatatypeMismatch(_) => "42804",  // datatype_mismatch
             Error::CannotCoerce(_) => "42846",      // cannot_coerce
             Error::InvalidForeignKey(_) => "42830", // invalid_foreign_key
+            Error::Internal(_) => "XX000",          // internal_error
         }
     }
 }
@@ -331,10 +339,36 @@ pub enum Statement {
     },
     /// `SHOW name` -- one row, one text column named canonically.
     Show(String),
-    /// `ALTER ROLE / USER name ...` -- the role it names. This server has
-    /// exactly one role (the session user), so the executor answers 42704
-    /// `role "x" does not exist` for any other name, as PostgreSQL 16 does.
-    AlterRole(String),
+    /// `CREATE ROLE / USER / GROUP name [WITH options]`. `CREATE USER`
+    /// differs from `CREATE ROLE` only in defaulting `LOGIN` to true.
+    CreateRole {
+        name: String,
+        options: RoleOptions,
+    },
+    /// `ALTER ROLE / USER name [WITH options]` -- the role it names and the
+    /// attributes to change. Options not given are left as they are.
+    AlterRole {
+        name: String,
+        options: RoleOptions,
+    },
+    /// `DROP ROLE / USER / GROUP [IF EXISTS] names`.
+    DropRole {
+        names: Vec<String>,
+        if_exists: bool,
+    },
+    /// `CREATE EXTENSION [IF NOT EXISTS] name [...]`. The options (`SCHEMA`,
+    /// `VERSION`, `CASCADE`) are accepted and ignored: the two extensions
+    /// this server carries have one version each and live in `public`.
+    CreateExtension {
+        name: String,
+        if_not_exists: bool,
+    },
+    /// `DROP EXTENSION [IF EXISTS] names [CASCADE]`.
+    DropExtension {
+        names: Vec<String>,
+        if_exists: bool,
+        cascade: bool,
+    },
     /// `SET name = value`.
     Set {
         name: String,
@@ -797,6 +831,90 @@ fn parse_transaction_modes(nodes: &[pg_query::protobuf::Node]) -> TransactionMod
         }
     }
     modes
+}
+
+/// The attributes `CREATE ROLE` / `ALTER ROLE` can set. `None` means the
+/// statement did not mention the attribute. `password` is `Some(None)` for
+/// `PASSWORD NULL`, which clears a stored one.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RoleOptions {
+    pub login: Option<bool>,
+    pub superuser: Option<bool>,
+    pub createdb: Option<bool>,
+    pub createrole: Option<bool>,
+    pub inherit: Option<bool>,
+    pub replication: Option<bool>,
+    pub bypassrls: Option<bool>,
+    pub connection_limit: Option<i64>,
+    pub password: Option<Option<String>>,
+    pub valid_until: Option<String>,
+}
+
+/// The role option list of a CREATE / ALTER ROLE: `DefElem`s named by
+/// gram.y (`canlogin`, `superuser`, `password`, ...). `PASSWORD NULL`
+/// arrives as a `password` element with no argument.
+fn role_options(options: &[pg_query::protobuf::Node]) -> Result<RoleOptions> {
+    let mut out = RoleOptions::default();
+    for node in options {
+        let Some(N::DefElem(d)) = node.node.as_ref() else {
+            continue;
+        };
+        let flag = || -> bool {
+            match d.arg.as_ref().and_then(|a| a.node.as_ref()) {
+                Some(N::Boolean(b)) => b.boolval,
+                Some(N::Integer(i)) => i.ival != 0,
+                Some(N::AConst(c)) => {
+                    matches!(
+                        c.val.as_ref(),
+                        Some(pg_query::protobuf::a_const::Val::Boolval(b)) if b.boolval
+                    ) || matches!(
+                        c.val.as_ref(),
+                        Some(pg_query::protobuf::a_const::Val::Ival(v)) if v.ival != 0
+                    )
+                }
+                _ => true,
+            }
+        };
+        let text = || -> Option<String> {
+            match d.arg.as_ref().and_then(|a| a.node.as_ref()) {
+                Some(N::String(sv)) => Some(sv.sval.clone()),
+                Some(N::AConst(c)) => match c.val.as_ref() {
+                    Some(pg_query::protobuf::a_const::Val::Sval(sv)) => Some(sv.sval.clone()),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        match d.defname.as_str() {
+            "canlogin" => out.login = Some(flag()),
+            "superuser" => out.superuser = Some(flag()),
+            "createdb" => out.createdb = Some(flag()),
+            "createrole" => out.createrole = Some(flag()),
+            "inherit" => out.inherit = Some(flag()),
+            "isreplication" => out.replication = Some(flag()),
+            "bypassrls" => out.bypassrls = Some(flag()),
+            "password" => out.password = Some(text()),
+            "validUntil" => out.valid_until = text(),
+            "connectionlimit" => {
+                out.connection_limit = match d.arg.as_ref().and_then(|a| a.node.as_ref()) {
+                    Some(N::Integer(i)) => Some(i64::from(i.ival)),
+                    _ => Some(-1),
+                }
+            }
+            // Membership and SYSID options: parsed by PostgreSQL, but this
+            // server has no role graph to record them in.
+            "addroleto" | "rolemembers" | "adminmembers" | "sysid" | "encrypted"
+            | "unencrypted" => {
+                return Err(Error::Unsupported(format!("the {} role option", d.defname)))
+            }
+            other => {
+                return Err(Error::Parse(format!(
+                    "unrecognized role option \"{other}\""
+                )))
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// A `DefElem` whose arg is an `A_Const` integer used as a boolean
@@ -1362,12 +1480,43 @@ pub fn plan_with_params(
         N::CreateFunctionStmt(f) => plan_create_function(&f),
         N::CopyStmt(c) => plan_copy(&c, lookup, params),
         N::VariableShowStmt(v) => Ok(Statement::Show(v.name.clone())),
-        N::AlterRoleStmt(a) => Ok(Statement::AlterRole(
-            a.role
+        N::AlterRoleStmt(a) => Ok(Statement::AlterRole {
+            name: a
+                .role
                 .as_ref()
                 .map(|r| r.rolename.clone())
                 .unwrap_or_default(),
-        )),
+            options: role_options(&a.options)?,
+        }),
+        N::CreateRoleStmt(c) => {
+            let mut options = role_options(&c.options)?;
+            // CREATE USER is CREATE ROLE with LOGIN on by default.
+            if options.login.is_none()
+                && pg_query::protobuf::RoleStmtType::try_from(c.stmt_type)
+                    == Ok(pg_query::protobuf::RoleStmtType::RolestmtUser)
+            {
+                options.login = Some(true);
+            }
+            Ok(Statement::CreateRole {
+                name: c.role.clone(),
+                options,
+            })
+        }
+        N::DropRoleStmt(d) => Ok(Statement::DropRole {
+            names: d
+                .roles
+                .iter()
+                .filter_map(|n| match n.node.as_ref()? {
+                    N::RoleSpec(r) => Some(r.rolename.clone()),
+                    _ => None,
+                })
+                .collect(),
+            if_exists: d.missing_ok,
+        }),
+        N::CreateExtensionStmt(c) => Ok(Statement::CreateExtension {
+            name: c.extname.clone(),
+            if_not_exists: c.if_not_exists,
+        }),
         N::DeclareCursorStmt(d) => {
             let inner_node = d.query.as_ref().and_then(|q| q.node.as_ref());
             let inner = match inner_node {
@@ -4489,6 +4638,13 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
                 };
             }
             let op = operator_name(e).unwrap_or("");
+            // The hstore operators type from the operator and, for `->`,
+            // from whether the RIGHT operand is a key or a key list.
+            if static_hstore_operand(e.lexpr.as_deref(), &Bson::Null) {
+                if let Some(t) = static_hstore_result(op, e.rexpr.as_deref()) {
+                    return t;
+                }
+            }
             // A json operator's result type comes from the operator and the
             // LEFT operand: `->` keeps the json flavour, `->>` is text, `?` is
             // a boolean.
@@ -6427,6 +6583,7 @@ const CATALOG_RELATIONS: &[(&str, i64)] = &[
     ("pg_namespace", 2615),
     ("pg_enum", 3501),
     ("pg_range", 3541),
+    ("pg_extension", 3079),
 ];
 
 /// The display rendering of a regclass value: the relation's name, quoted
@@ -7134,6 +7291,75 @@ thread_local! {
 /// Base types: `(resolution name, oid, defined)`.
 pub fn set_user_base_types(types: Vec<(String, i64, bool)>) {
     PLAN_USER_BASE_TYPES.with(|t| *t.borrow_mut() = types);
+}
+
+/// The base types an EXTENSION owns, whose values this server parses and
+/// renders itself rather than passing text through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtensionType {
+    /// `hstore`'s key/value map.
+    Hstore,
+    /// PostGIS's `geometry`.
+    Geometry,
+}
+
+impl ExtensionType {
+    /// The type's name in `pg_type`.
+    pub fn type_name(self) -> &'static str {
+        match self {
+            ExtensionType::Hstore => "hstore",
+            ExtensionType::Geometry => "geometry",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "hstore" => Some(ExtensionType::Hstore),
+            "geometry" => Some(ExtensionType::Geometry),
+            _ => None,
+        }
+    }
+}
+
+thread_local! {
+    /// The names of the base types installed by `CREATE EXTENSION`, a subset
+    /// of `PLAN_USER_BASE_TYPES`. Only these get the extension's parser: a
+    /// user's own `CREATE TYPE hstore (...)` stays a text pass-through.
+    static PLAN_EXTENSION_TYPES: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The base types owned by installed extensions, by resolution name.
+pub fn set_extension_types(names: Vec<String>) {
+    PLAN_EXTENSION_TYPES.with(|t| *t.borrow_mut() = names);
+}
+
+/// The extension behind a type name (`hstore`, `public.geometry`,
+/// `hstore[]`'s element), if that extension's type is installed.
+pub fn extension_type(name: &str) -> Option<ExtensionType> {
+    let trimmed = name.trim();
+    let element = trimmed
+        .strip_suffix("[]")
+        .map(str::trim_end)
+        .unwrap_or(trimmed);
+    let (registered, _, defined) = user_base_type(element)?;
+    if !defined {
+        return None;
+    }
+    let installed = PLAN_EXTENSION_TYPES.with(|t| t.borrow().iter().any(|n| *n == registered));
+    if !installed {
+        return None;
+    }
+    ExtensionType::from_name(registered.rsplit('.').next().unwrap_or(&registered))
+}
+
+/// An extension type's input function: any accepted text form to the
+/// canonical text this server stores.
+pub fn extension_canonical(ty: ExtensionType, text: &str) -> Result<String> {
+    match ty {
+        ExtensionType::Hstore => hstore::canonical(text),
+        ExtensionType::Geometry => geometry::canonical(text),
+    }
 }
 
 /// A base type's `(registered name, oid, defined)` by name, folded exactly as
@@ -8766,7 +8992,12 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
             )));
         }
         return match value {
-            Bson::String(text) => Ok(Bson::String(text)),
+            // An extension's type parses the text and stores its canonical
+            // form, which is what its output function prints.
+            Bson::String(text) => match extension_type(&name) {
+                Some(ext) => extension_canonical(ext, &text).map(Bson::String),
+                None => Ok(Bson::String(text)),
+            },
             other => Err(Error::CannotCoerce(format!(
                 "cannot cast type {} to {}",
                 display_type(inferred_type(&other)),
@@ -9798,6 +10029,95 @@ fn static_json_type(n: Option<&pg_query::protobuf::Node>, value: &Bson) -> Optio
     (t == "json" || t == "jsonb").then_some(t)
 }
 
+/// Whether an operand is statically an `hstore` -- which needs the extension
+/// to be installed, since without it the name is just a name.
+fn static_hstore_operand(n: Option<&pg_query::protobuf::Node>, value: &Bson) -> bool {
+    let Some(n) = n else {
+        return false;
+    };
+    static_type(n, value) == "hstore" && extension_type("hstore") == Some(ExtensionType::Hstore)
+}
+
+/// The result type of an hstore operator, or `None` for an operator this
+/// server does not know on hstore.
+fn static_hstore_result(op: &str, rhs: Option<&pg_query::protobuf::Node>) -> Option<String> {
+    let rhs_is_array = rhs.is_some_and(|n| static_type(n, &Bson::Null).ends_with("[]"));
+    Some(match op {
+        "->" if rhs_is_array => "text[]".to_string(),
+        "->" => "text".to_string(),
+        "?" | "?|" | "?&" | "@>" | "<@" => "bool".to_string(),
+        "||" | "-" => "hstore".to_string(),
+        _ => return None,
+    })
+}
+
+/// The hstore operators: `->` (a key, or a key list answering `text[]`),
+/// `?` / `?|` / `?&` (key tests), `||` (concatenation, right side wins),
+/// `-` (delete a key, a key list, or every matching pair of another hstore),
+/// `@>` / `<@` (containment). An hstore value travels as its canonical text.
+fn hstore_operator(op: &str, lhs: &Bson, rhs: &Bson, rhs_hstore: bool) -> Result<Bson> {
+    let left = hstore::parse(&value_text(lhs))?;
+    let keys = |v: &Bson| -> Result<Vec<String>> {
+        match v {
+            Bson::Array(items) => Ok(items.iter().map(value_text).collect()),
+            other => match cast_value(other.clone(), "text[]")? {
+                Bson::Array(items) => Ok(items.iter().map(value_text).collect()),
+                _ => Err(Error::Unsupported(format!("a {op} key list of this shape"))),
+            },
+        }
+    };
+    let contains = |outer: &hstore::Pairs, inner: &hstore::Pairs| {
+        inner
+            .iter()
+            .all(|(k, v)| outer.iter().any(|(ok, ov)| ok == k && ov == v))
+    };
+    Ok(match op {
+        "->" => match rhs {
+            Bson::Array(items) => Bson::Array(
+                items
+                    .iter()
+                    .map(|k| hstore::get(&left, &value_text(k)).map_or(Bson::Null, Bson::String))
+                    .collect(),
+            ),
+            other => hstore::get(&left, &value_text(other)).map_or(Bson::Null, Bson::String),
+        },
+        "?" => Bson::Boolean(hstore::has_key(&left, &value_text(rhs))),
+        "?|" => Bson::Boolean(keys(rhs)?.iter().any(|k| hstore::has_key(&left, k))),
+        "?&" => Bson::Boolean(keys(rhs)?.iter().all(|k| hstore::has_key(&left, k))),
+        "||" => {
+            let right = hstore::parse(&value_text(rhs))?;
+            Bson::String(hstore::render(&hstore::concat(&left, &right)))
+        }
+        "-" => {
+            let kept: hstore::Pairs = match rhs {
+                Bson::Array(_) => {
+                    let drop = keys(rhs)?;
+                    left.into_iter()
+                        .filter(|(k, _)| !drop.contains(k))
+                        .collect()
+                }
+                other => {
+                    let text = value_text(other);
+                    // `hstore - hstore` removes the pairs present in the right
+                    // side with the same value; `hstore - text` removes a key.
+                    if rhs_hstore {
+                        let right = hstore::parse(&text)?;
+                        left.into_iter()
+                            .filter(|(k, v)| !right.iter().any(|(rk, rv)| rk == k && rv == v))
+                            .collect()
+                    } else {
+                        left.into_iter().filter(|(k, _)| *k != text).collect()
+                    }
+                }
+            };
+            Bson::String(hstore::render(&kept))
+        }
+        "@>" => Bson::Boolean(contains(&left, &hstore::parse(&value_text(rhs))?)),
+        "<@" => Bson::Boolean(contains(&hstore::parse(&value_text(rhs))?, &left)),
+        _ => return Err(Error::Unsupported(format!("operator {op} on hstore"))),
+    })
+}
+
 fn coerce_unknown_operand(
     e: &pg_query::protobuf::AExpr,
     lhs: Bson,
@@ -10559,6 +10879,25 @@ fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
             cascade: DropBehavior::try_from(d.behavior) == Ok(DropBehavior::DropCascade),
         });
     }
+    // `DROP EXTENSION`: each object is a bare String.
+    if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectExtension) {
+        let names = d
+            .objects
+            .iter()
+            .filter_map(|obj| match obj.node.as_ref()? {
+                N::String(s) => Some(s.sval.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            return Err(Error::Unsupported("this DROP EXTENSION target".into()));
+        }
+        return Ok(Statement::DropExtension {
+            names,
+            if_exists: d.missing_ok,
+            cascade: DropBehavior::try_from(d.behavior) == Ok(DropBehavior::DropCascade),
+        });
+    }
     // `DROP TYPE`: the object is a TypeName, not a List of name parts.
     if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectType) {
         let mut names = Vec::new();
@@ -11284,6 +11623,30 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                     !(is_row_ctor(e.lexpr.as_deref()) && is_row_ctor(e.rexpr.as_deref()));
                 return record_compare(&op, a, b, composite);
             }
+        }
+        // The hstore operators, like the json ones below, are told apart
+        // from everything else by the left operand's STATIC type.
+        if matches!(
+            op.as_str(),
+            "->" | "?" | "?|" | "?&" | "||" | "-" | "@>" | "<@"
+        ) && static_hstore_operand(e.lexpr.as_deref(), &lhs)
+        {
+            if lhs == Bson::Null || rhs == Bson::Null {
+                return Ok(Bson::Null);
+            }
+            // An UNKNOWN right operand (a bare literal, an untyped
+            // parameter) takes the LEFT operand's type, as PostgreSQL's
+            // operator resolution does -- so `h - 'a'` is `hstore - hstore`
+            // and only `h - 'a'::text` deletes a key.
+            let rhs_unknown = match e.rexpr.as_deref().and_then(|x| x.node.as_ref()) {
+                Some(N::AConst(c)) => matches!(c.val.as_ref(), Some(a_const::Val::Sval(_))),
+                Some(N::ParamRef(p)) => {
+                    declared_param_type(usize::try_from(p.number).unwrap_or(0)).is_none()
+                }
+                _ => false,
+            };
+            let rhs_hstore = rhs_unknown || static_hstore_operand(e.rexpr.as_deref(), &rhs);
+            return hstore_operator(&op, &lhs, &rhs, rhs_hstore);
         }
         // The JSON operators need the left operand's STATIC type, which the
         // values no longer carry.

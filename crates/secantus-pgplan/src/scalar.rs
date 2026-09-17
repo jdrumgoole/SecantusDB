@@ -12,7 +12,25 @@ use bson::Bson;
 
 /// Is this a scalar built-in this server implements?
 pub fn is_scalar(name: &str) -> bool {
-    SCALAR_NAMES.contains(&name)
+    SCALAR_NAMES.contains(&name) || extension_scalar(name).is_some()
+}
+
+/// The extension a function belongs to, when that extension's type is
+/// installed. Without the extension PostgreSQL has no such function, and
+/// neither does this server.
+fn extension_scalar(name: &str) -> Option<crate::ExtensionType> {
+    let owner = match name {
+        "st_geomfromgeojson" | "st_srid" | "st_astext" | "st_asewkt" | "st_geomfromtext"
+        | "st_geomfromewkt" => crate::ExtensionType::Geometry,
+        "hstore" | "akeys" | "avals" | "skeys" | "svals" | "exist" | "defined"
+        | "hstore_to_json" | "hstore_to_jsonb" | "delete" => crate::ExtensionType::Hstore,
+        _ => return None,
+    };
+    let installed = match owner {
+        crate::ExtensionType::Geometry => crate::extension_type("geometry"),
+        crate::ExtensionType::Hstore => crate::extension_type("hstore"),
+    };
+    installed.filter(|i| *i == owner)
 }
 
 const SCALAR_NAMES: &[&str] = &[
@@ -185,6 +203,120 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp" => {
             need(0)?;
             Ok(now_value())
+        }
+        "st_geomfromgeojson" => {
+            need(1)?;
+            let g = crate::geometry::from_geojson(&s(0))?;
+            Ok(Bson::String(crate::geometry::to_hex(&g)))
+        }
+        "st_geomfromtext" | "st_geomfromewkt" => {
+            let mut g = crate::geometry::from_wkt(&s(0))?;
+            if let Some(srid) = args.get(1) {
+                let srid = match srid {
+                    Bson::Int32(n) => i64::from(*n),
+                    Bson::Int64(n) => *n,
+                    Bson::Double(n) => *n as i64,
+                    _ => 0,
+                };
+                g.srid = i32::try_from(srid).unwrap_or(0);
+            }
+            Ok(Bson::String(crate::geometry::to_hex(&g)))
+        }
+        "st_srid" => {
+            need(1)?;
+            let g = crate::geometry::from_text(&s(0))?;
+            Ok(Bson::Int32(g.srid))
+        }
+        "st_astext" | "st_asewkt" => {
+            need(1)?;
+            let g = crate::geometry::from_text(&s(0))?;
+            Ok(Bson::String(crate::geometry::to_wkt(
+                &g,
+                name == "st_asewkt",
+            )))
+        }
+        "hstore" => {
+            need(2)?;
+            let pairs = match (&args[0], &args[1]) {
+                (Bson::Array(keys), Bson::Array(vals)) => {
+                    if keys.len() != vals.len() {
+                        return Err(Error::DataException("arrays must have same bounds".into()));
+                    }
+                    keys.iter()
+                        .zip(vals)
+                        .map(|(k, v)| {
+                            (
+                                text(k),
+                                if *v == Bson::Null {
+                                    None
+                                } else {
+                                    Some(text(v))
+                                },
+                            )
+                        })
+                        .collect()
+                }
+                (Bson::Array(_), _) | (_, Bson::Array(_)) => return Err(wrong_args(name)),
+                _ => vec![(s(0), Some(s(1)))],
+            };
+            Ok(Bson::String(crate::hstore::render(&crate::hstore::unique(
+                pairs,
+            ))))
+        }
+        "akeys" | "skeys" => {
+            need(1)?;
+            let pairs = crate::hstore::parse(&s(0))?;
+            Ok(Bson::Array(
+                pairs.into_iter().map(|(k, _)| Bson::String(k)).collect(),
+            ))
+        }
+        "avals" | "svals" => {
+            need(1)?;
+            let pairs = crate::hstore::parse(&s(0))?;
+            Ok(Bson::Array(
+                pairs
+                    .into_iter()
+                    .map(|(_, v)| v.map(Bson::String).unwrap_or(Bson::Null))
+                    .collect(),
+            ))
+        }
+        "exist" => {
+            need(2)?;
+            let pairs = crate::hstore::parse(&s(0))?;
+            Ok(Bson::Boolean(crate::hstore::has_key(&pairs, &s(1))))
+        }
+        "defined" => {
+            need(2)?;
+            let pairs = crate::hstore::parse(&s(0))?;
+            Ok(Bson::Boolean(crate::hstore::get(&pairs, &s(1)).is_some()))
+        }
+        "delete" => {
+            need(2)?;
+            let mut pairs = crate::hstore::parse(&s(0))?;
+            let key = s(1);
+            pairs.retain(|(k, _)| *k != key);
+            Ok(Bson::String(crate::hstore::render(&pairs)))
+        }
+        "hstore_to_json" | "hstore_to_jsonb" => {
+            need(1)?;
+            let pairs = crate::hstore::parse(&s(0))?;
+            let obj = crate::json::Json::Object(
+                pairs
+                    .into_iter()
+                    .map(|(k, v)| {
+                        (
+                            k,
+                            v.map(crate::json::Json::Str)
+                                .unwrap_or(crate::json::Json::Null),
+                        )
+                    })
+                    .collect(),
+            );
+            Ok(Bson::String(if name == "hstore_to_json" {
+                crate::json::render_json(&obj)
+            } else {
+                crate::json::render_jsonb(&obj)
+            }))
         }
         "upper" => {
             need(1)?;
@@ -882,6 +1014,13 @@ pub fn static_result_type(name: &str) -> &'static str {
         "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp" => {
             "timestamptz"
         }
+        "st_geomfromgeojson" | "st_geomfromtext" | "st_geomfromewkt" => "geometry",
+        "st_srid" => "int4",
+        "hstore" | "delete" => "hstore",
+        "akeys" | "avals" => "text[]",
+        "exist" | "defined" => "bool",
+        "hstore_to_json" => "json",
+        "hstore_to_jsonb" => "jsonb",
         _ => "text",
     }
 }

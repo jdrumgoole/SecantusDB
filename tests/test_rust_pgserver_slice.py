@@ -8719,3 +8719,179 @@ def test_truncate_matches_postgres(home: Path) -> None:
         assert conn.execute("truncate tp cascade").statusmessage == "TRUNCATE TABLE"
         assert notices == ['truncate cascades to table "tc"']
         assert conn.execute("select count(*) from tc").fetchone() == (0,)
+def test_create_extension_hstore_installs_the_type_and_its_io(home: Path) -> None:
+    """`CREATE EXTENSION hstore` brings the `hstore` type with PostgreSQL's
+    text I/O and binary send/recv, a `pg_extension` row, and refusals shaped
+    as 16's: an unknown extension is 0A000, a repeat 42710 (a NOTICE under IF
+    NOT EXISTS), the type cannot be dropped on its own (2BP01, "extension
+    hstore requires it"), and the extension cannot be dropped while a column
+    uses it (2BP01 with the column in DETAIL). All measured on 16 / hstore 1.8.
+    """
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        cur = conn.cursor()
+        notices = _notices(conn)
+        with pytest.raises(psycopg.errors.FeatureNotSupported) as exc:
+            cur.execute("create extension nosuch")
+        assert _diag(exc.value)[:2] == ("0A000", 'extension "nosuch" is not available')
+        cur.execute("create extension hstore")
+        assert cur.statusmessage == "CREATE EXTENSION"
+        with pytest.raises(psycopg.errors.DuplicateObject) as exc:
+            cur.execute("create extension hstore")
+        assert _diag(exc.value)[:2] == ("42710", 'extension "hstore" already exists')
+        cur.execute("create extension if not exists hstore")
+        assert notices[-1][2] == 'extension "hstore" already exists, skipping'
+        cur.execute("select extname, extversion from pg_extension order by extname")
+        assert cur.fetchall() == [("hstore", "1.8"), ("plpgsql", "1.0")]
+
+        # Text I/O: PostgreSQL's canonical `"k"=>"v"` rendering, duplicate
+        # keys resolved first-wins, keys ordered by length then bytes.
+        cur.execute(
+            "select null::hstore, ''::hstore, 'a => b'::hstore,"
+            """ 'bb=>1, a=>2, a=>3, "x y"=>NULL'::hstore"""
+        )
+        assert cur.fetchone() == (None, "", '"a"=>"b"', '"a"=>"2", "bb"=>"1", "x y"=>NULL')
+        with pytest.raises(psycopg.errors.SyntaxError) as exc:
+            cur.execute("select 'a=>'::hstore")
+        assert _diag(exc.value)[1] == "syntax error in hstore: unexpected end of string"
+
+        # psycopg's own adapter over TypeInfo.fetch, in both formats.
+        info = psycopg.types.TypeInfo.fetch(conn, "hstore")
+        assert info.name == "hstore"
+        assert info.array_oid == info.oid + 100_000
+        from psycopg.types.hstore import register_hstore
+
+        register_hstore(info, conn)
+        for fmt in (psycopg.pq.Format.TEXT, psycopg.pq.Format.BINARY):
+            c = conn.cursor(binary=fmt)
+            sample = {"a": "1", "b": None, "c d": '"q"'}
+            c.execute("select %s, %s", (sample, [sample, {}]))
+            assert c.fetchone() == (sample, [sample, {}])
+            c.execute("select pg_typeof(%s)::text", (sample,))
+            assert c.fetchone() == ("hstore",)
+        cur.execute("select hstore('k', 'v'), akeys('b=>1, a=>2'), 'a=>1'::hstore -> 'a'")
+        assert cur.fetchone() == ('"k"=>"v"', ["a", "b"], "1")
+        # The operators, measured against PostgreSQL 16 / hstore 1.8. A bare
+        # literal beside an hstore IS an hstore (`h - 'a=>1'`), a key needs
+        # `::text`.
+        cur.execute("create table hs_ops (h hstore)")
+        cur.execute("insert into hs_ops values ('a=>1, b=>NULL')")
+        cur.execute(
+            "select h ? 'a', h ?| array['zz','b'], h ?& array['a','zz'], h @> 'a=>1',"
+            " 'a=>1'::hstore <@ h, h - array['a'], h - 'a=>1'::hstore, h - 'b=>9'::hstore,"
+            " h - 'a'::text, h || 'c=>3, a=>7', h -> array['b','zz'],"
+            " pg_typeof(h - 'a'::text)::text, pg_typeof(h || h)::text, h - 'a=>1',"
+            " h -> 'zz', h -> 'a'"
+            " from hs_ops"
+        )
+        assert cur.fetchone() == (
+            True,
+            True,
+            False,
+            True,
+            True,
+            '"b"=>NULL',
+            '"b"=>NULL',
+            '"a"=>"1", "b"=>NULL',
+            '"b"=>NULL',
+            '"a"=>"7", "b"=>NULL, "c"=>"3"',
+            [None, None],
+            "hstore",
+            "hstore",
+            '"b"=>NULL',
+            None,
+            "1",
+        )
+        cur.execute("drop table hs_ops")
+
+        with pytest.raises(psycopg.errors.DependentObjectsStillExist) as exc:
+            cur.execute("drop type hstore")
+        assert _diag(exc.value)[:2] == (
+            "2BP01",
+            "cannot drop type hstore because extension hstore requires it",
+        )
+        cur.execute("create table hs_t (h hstore)")
+        cur.execute("""insert into hs_t values ('x=>y')""")
+        with pytest.raises(psycopg.errors.DependentObjectsStillExist) as exc:
+            cur.execute("drop extension hstore")
+        assert _diag(exc.value)[:2] == (
+            "2BP01",
+            "cannot drop extension hstore because other objects depend on it",
+        )
+        assert exc.value.diag.message_detail == "column h of table hs_t depends on type hstore"
+        cur.execute("drop table hs_t")
+        cur.execute("drop extension hstore")
+        assert cur.statusmessage == "DROP EXTENSION"
+        with pytest.raises(psycopg.errors.UndefinedObject) as exc:
+            cur.execute("drop extension hstore")
+        assert _diag(exc.value)[:2] == ("42704", 'extension "hstore" does not exist')
+        cur.execute("drop extension if exists hstore")
+        assert notices[-1][2] == 'extension "hstore" does not exist, skipping'
+        # Without the extension the type and its functions are gone.
+        with pytest.raises(psycopg.errors.Error):
+            cur.execute("select 'a=>b'::hstore")
+        with pytest.raises(psycopg.errors.Error):
+            cur.execute("select hstore('a', 'b')")
+
+
+def test_create_extension_postgis_brings_geometry_as_ewkb(home: Path) -> None:
+    """`CREATE EXTENSION postgis` brings `geometry`: hex-EWKB text (what
+    PostGIS 3.4.6 renders), EWKB binary in both directions, WKT / EWKT input,
+    `ST_GeomFromGeoJSON` (SRID 4326 unless the JSON names a CRS), `ST_AsText`
+    / `ST_AsEWKT` / `ST_SRID` / `ST_GeomFromText`, and a geometry column that
+    round-trips through a table. Storage is the EWKB, opaque to the planner.
+    """
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        cur = conn.cursor()
+        cur.execute("create extension postgis")
+        cur.execute("select typname, typdelim from pg_type where typname = 'geometry'")
+        assert cur.fetchone() == ("geometry", ":")
+        cur.execute(
+            "select 'POINT(1 2)'::geometry, 'SRID=4326;POINT(1 2)'::geometry, "
+            "ST_AsText('0101000000000000000000F03F0000000000000040'::geometry), "
+            "ST_AsEWKT(ST_GeomFromText('LINESTRING(0 0, 1 1)', 4326)), "
+            'ST_SRID(ST_GeomFromGeoJSON(\'{"type":"Point","coordinates":[1,2]}\')), '
+            "ST_AsEWKT(ST_GeomFromGeoJSON("
+            '\'{"type":"MultiPolygon","coordinates":[[[[0,0],[1,0],[1,1],[0,0]]]]}\')), '
+            "pg_typeof('POINT(1 2)'::geometry)::text"
+        )
+        assert cur.fetchone() == (
+            "0101000000000000000000F03F0000000000000040",
+            "0101000020E6100000000000000000F03F0000000000000040",
+            "POINT(1 2)",
+            "SRID=4326;LINESTRING(0 0,1 1)",
+            4326,
+            "SRID=4326;MULTIPOLYGON(((0 0,1 0,1 1,0 0)))",
+            "geometry",
+        )
+        with pytest.raises(psycopg.errors.InternalError_) as exc:
+            cur.execute("select 'POINT(1)'::geometry")
+        assert _diag(exc.value)[:2] == ("XX000", "parse error - invalid geometry")
+
+        cur.execute("create table sample_geoms (id serial primary key, geom geometry)")
+        cur.execute("insert into sample_geoms (geom) values ('POINT(0 0)'), (null)")
+        info = psycopg.types.TypeInfo.fetch(conn, "geometry")
+        assert info.name == "geometry"
+        from psycopg.types.shapely import register_shapely
+        from shapely.geometry import Point
+
+        register_shapely(info, conn)
+        for fmt in (psycopg.pq.Format.TEXT, psycopg.pq.Format.BINARY):
+            c = conn.cursor(binary=fmt)
+            c.execute(
+                "insert into sample_geoms (geom) values (%s) returning geom", (Point(1.5, 2),)
+            )
+            assert c.fetchone()[0] == Point(1.5, 2)
+            c.execute("select geom from sample_geoms order by id")
+            rows = [r[0] for r in c.fetchall()]
+            assert rows[0] == Point(0, 0)
+            assert rows[1] is None
+            assert rows[-1] == Point(1.5, 2)
+        with pytest.raises(psycopg.errors.DependentObjectsStillExist) as exc:
+            cur.execute("drop extension postgis")
+        assert exc.value.diag.message_detail == (
+            "column geom of table sample_geoms depends on type geometry"
+        )
+        cur.execute("drop table sample_geoms")
+        cur.execute("drop extension postgis")
+        cur.execute("select extname from pg_extension")
+        assert cur.fetchall() == [("plpgsql",)]
