@@ -6953,15 +6953,28 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   Gate: `tests/test_mongod_differential.py -k unknownexpr` (7 shapes, including
   a `$literal` case — see the next entry for why that one is load-bearing).
 
-- [ ] **OPEN — the Rust server does not name an unknown expression operator
-  (2026-09-17).** 9 of the 13 shapes in
-  `tools/probes/unknown_expression_errors.py` come back as
-  `2 BadValue "aggregation pipeline uses a stage or operator not supported by
-  the Rust server"`. mongod names the operator and its code (168 or 31325). The
-  four `$project` top-level shapes already answer correctly, so the gap is the
-  generic expression parser rather than the projection one. A `Defer` is an
-  ERROR on the standalone server, so this is a user-visible refusal with the
-  wrong code, message and codeName — not a silent wrong answer.
+- [x] **RESOLVED 2026-09-17 — the Rust server names an unknown expression
+  operator.** Both servers are now 0 of 13 divergent on
+  `tools/probes/unknown_expression_errors.py`. Two separate defects, and the
+  first was the MIRROR IMAGE of the Python bug fixed hours earlier:
+
+  - `validate_project_exprs` used the RECURSIVE `first_unknown_expr_operator`,
+    so a nested unknown inside `$project` also got `31325` — where mongod says
+    `168`. Python was 168-everywhere and Rust was 31325-everywhere-in-`$project`;
+    both missed that the rule is positional. Now uses a new non-recursive
+    `expressions::top_level_unknown_expr_operator`.
+  - Every position OUTSIDE `$project` had no check at all and fell through to
+    the blanket `2 BadValue "… not supported by the Rust server"` — which told
+    the client the server could not do `$addFields` when the operator inside it
+    was the problem. `validate_unknown_exprs` now answers `168` with the
+    envelope that position carries, and `util::code_name_for` gained the `168 →
+    InvalidPipelineOperator` entry (the same table miss the Python server had).
+
+  Only `$group`'s `_id` is walked: its other fields are ACCUMULATOR position,
+  where `$push` / `$topN` / `$count` are valid and are deliberately absent from
+  `KNOWN_EXPR_OPS`. Pinned by `accumulators_and_literal_are_not_unknown_expressions`
+  in `crates/secantus-storage-adapter/tests/command_aggregate_wt.rs`, because
+  rejecting a valid pipeline is the failure mode that matters here.
 
 - [x] **RESOLVED 2026-09-09 — a `Decimal128("NaN")` CRASHED `$expr`, and
   `{$eq: [NaN, NaN]}` was false.** Two bugs, one probe run.
