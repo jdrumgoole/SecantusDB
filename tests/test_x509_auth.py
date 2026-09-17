@@ -31,6 +31,7 @@ from pymongo.errors import OperationFailure
 
 from secantus import SecantusDBServer
 from secantus.auth import subject_dn_from_peercert
+from tests.net_timeouts import SERVER_SELECTION_TIMEOUT_MS
 
 # ---------------------------------------------------------------------------
 # DN extraction (no server, no TLS)
@@ -160,7 +161,7 @@ def auth_server(wt_home, tls_files, alice_cert):
     bootstrap.start()
     try:
         boot_uri = f"mongodb://127.0.0.1:{bootstrap.port}/?tls=true&tlsCAFile={ca_path}"
-        boot_client = MongoClient(boot_uri, serverSelectionTimeoutMS=3000)
+        boot_client = MongoClient(boot_uri, serverSelectionTimeoutMS=SERVER_SELECTION_TIMEOUT_MS)
         try:
             boot_client["$external"].command(
                 "createUser",
@@ -200,7 +201,7 @@ def test_x509_authenticates_with_matching_cert(auth_server, alice_cert) -> None:
         f"tls=true&tlsCAFile={ca_path}&tlsCertificateKeyFile={alice_pem}"
         "&authMechanism=MONGODB-X509&authSource=$external"
     )
-    client = MongoClient(uri, serverSelectionTimeoutMS=5000)
+    client = MongoClient(uri, serverSelectionTimeoutMS=SERVER_SELECTION_TIMEOUT_MS)
     try:
         client["x509db"]["coll"].insert_one({"_id": 1, "v": "hello from alice"})
         assert client["x509db"]["coll"].find_one({"_id": 1})["v"] == "hello from alice"
@@ -235,7 +236,7 @@ def test_x509_refused_when_no_matching_user(tmp_path, wt_home, tls_files, ca) ->
             f"tls=true&tlsCAFile={ca_path}&tlsCertificateKeyFile={stranger_pem}"
             "&authMechanism=MONGODB-X509&authSource=$external"
         )
-        client = MongoClient(uri, serverSelectionTimeoutMS=3000)
+        client = MongoClient(uri, serverSelectionTimeoutMS=SERVER_SELECTION_TIMEOUT_MS)
         with pytest.raises(OperationFailure, match="no user found"):
             client.admin.command("ping")
         client.close()
@@ -272,7 +273,7 @@ def test_x509_refused_for_scram_only_user(tmp_path, wt_home, tls_files, ca) -> N
     try:
         boot = MongoClient(
             f"mongodb://127.0.0.1:{bootstrap.port}/?tls=true&tlsCAFile={ca_path}",
-            serverSelectionTimeoutMS=3000,
+            serverSelectionTimeoutMS=SERVER_SELECTION_TIMEOUT_MS,
         )
         try:
             boot["$external"].command(
@@ -303,7 +304,7 @@ def test_x509_refused_for_scram_only_user(tmp_path, wt_home, tls_files, ca) -> N
             f"tls=true&tlsCAFile={ca_path}&tlsCertificateKeyFile={alice_pem}"
             "&authMechanism=MONGODB-X509&authSource=$external"
         )
-        client = MongoClient(uri, serverSelectionTimeoutMS=3000)
+        client = MongoClient(uri, serverSelectionTimeoutMS=SERVER_SELECTION_TIMEOUT_MS)
         with pytest.raises(OperationFailure, match="not configured for X509"):
             client.admin.command("ping")
         client.close()
@@ -329,7 +330,7 @@ def test_scram_still_works_on_mtls_server(tmp_path, wt_home, tls_files, ca) -> N
     try:
         boot = MongoClient(
             f"mongodb://127.0.0.1:{bootstrap.port}/?tls=true&tlsCAFile={ca_path}",
-            serverSelectionTimeoutMS=3000,
+            serverSelectionTimeoutMS=SERVER_SELECTION_TIMEOUT_MS,
         )
         try:
             boot["admin"].command(
@@ -368,7 +369,7 @@ def test_scram_still_works_on_mtls_server(tmp_path, wt_home, tls_files, ca) -> N
             f"tls=true&tlsCAFile={ca_path}&tlsCertificateKeyFile={pem}"
             "&authMechanism=SCRAM-SHA-256"
         )
-        client = MongoClient(uri, serverSelectionTimeoutMS=3000)
+        client = MongoClient(uri, serverSelectionTimeoutMS=SERVER_SELECTION_TIMEOUT_MS)
         try:
             client["t"]["c"].insert_one({"_id": 1})
             assert client["t"]["c"].find_one({"_id": 1}) == {"_id": 1}
@@ -388,7 +389,7 @@ def test_x509_refused_without_tls(wt_home) -> None:
     )
     bootstrap.start()
     try:
-        boot = MongoClient(bootstrap.uri, serverSelectionTimeoutMS=3000)
+        boot = MongoClient(bootstrap.uri, serverSelectionTimeoutMS=SERVER_SELECTION_TIMEOUT_MS)
         try:
             boot["$external"].command(
                 "createUser",
@@ -412,7 +413,7 @@ def test_x509_refused_without_tls(wt_home) -> None:
         # authMechanism=MONGODB-X509 would also try this, but the
         # URI parser would reject the missing TLS first — drive the
         # raw command path).
-        client = MongoClient(server.uri, serverSelectionTimeoutMS=3000)
+        client = MongoClient(server.uri, serverSelectionTimeoutMS=SERVER_SELECTION_TIMEOUT_MS)
         with pytest.raises(OperationFailure, match="MONGODB-X509 requires"):
             client["$external"].command(
                 "saslStart",

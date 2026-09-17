@@ -25,6 +25,8 @@ import subprocess
 
 import pytest
 
+from tests.net_timeouts import REJECTED_SELECTION_TIMEOUT_MS, SERVER_SELECTION_TIMEOUT_MS
+
 _server = pytest.importorskip("_secantus_server")
 pymongo = pytest.importorskip("pymongo")
 bson = pytest.importorskip("bson")
@@ -36,7 +38,7 @@ def _client(srv):
         host,
         port,
         directConnection=True,
-        serverSelectionTimeoutMS=5000,
+        serverSelectionTimeoutMS=SERVER_SELECTION_TIMEOUT_MS,
     )
 
 
@@ -184,7 +186,7 @@ def test_scram_auth_roundtrip_against_rust_server(tmp_path) -> None:
             authSource="admin",
             authMechanism="SCRAM-SHA-256",
             directConnection=True,
-            serverSelectionTimeoutMS=5000,
+            serverSelectionTimeoutMS=SERVER_SELECTION_TIMEOUT_MS,
         )
         try:
             assert good.admin.command("ping")["ok"] == 1.0
@@ -202,7 +204,7 @@ def test_scram_auth_roundtrip_against_rust_server(tmp_path) -> None:
             authSource="admin",
             authMechanism="SCRAM-SHA-256",
             directConnection=True,
-            serverSelectionTimeoutMS=5000,
+            serverSelectionTimeoutMS=SERVER_SELECTION_TIMEOUT_MS,
         )
         try:
             with pytest.raises(pymongo.errors.OperationFailure):
@@ -316,7 +318,7 @@ def test_tls_against_rust_server(tmp_path) -> None:
             tls=True,
             tlsCAFile=str(cert),
             directConnection=True,
-            serverSelectionTimeoutMS=5000,
+            serverSelectionTimeoutMS=SERVER_SELECTION_TIMEOUT_MS,
         )
         try:
             assert client.admin.command("ping")["ok"] == 1.0
@@ -1067,7 +1069,7 @@ def test_tls_and_x509_auth_end_to_end(tmp_path) -> None:
         host, port = srv.address
         boot = pymongo.MongoClient(
             f"mongodb://{host}:{port}/?tls=true&tlsCAFile={ca_path}",
-            serverSelectionTimeoutMS=5000,
+            serverSelectionTimeoutMS=SERVER_SELECTION_TIMEOUT_MS,
         )
         boot["$external"].command(
             "createUser",
@@ -1095,7 +1097,7 @@ def test_tls_and_x509_auth_end_to_end(tmp_path) -> None:
             f"mongodb://{host}:{port}/?tls=true&tlsCAFile={ca_path}"
             f"&tlsCertificateKeyFile={alice_pem}"
             "&authMechanism=MONGODB-X509&authSource=$external",
-            serverSelectionTimeoutMS=5000,
+            serverSelectionTimeoutMS=SERVER_SELECTION_TIMEOUT_MS,
         )
         client["x509db"]["c"].insert_one({"_id": 1, "v": "hello from alice"})
         assert client["x509db"]["c"].find_one({"_id": 1})["v"] == "hello from alice"
@@ -1104,7 +1106,7 @@ def test_tls_and_x509_auth_end_to_end(tmp_path) -> None:
         # Negative: a client presenting no cert is refused at the TLS layer.
         bad = pymongo.MongoClient(
             f"mongodb://{host}:{port}/?tls=true&tlsCAFile={ca_path}",
-            serverSelectionTimeoutMS=2000,
+            serverSelectionTimeoutMS=REJECTED_SELECTION_TIMEOUT_MS,
         )
         with pytest.raises(pymongo.errors.PyMongoError):
             bad.admin.command("ping")

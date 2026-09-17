@@ -1728,24 +1728,33 @@ Specific items that were left out of the slice that introduced their feature are
     not a server defect. Its `--all-targets` clippy also reports upstream
     `field_reassign_with_default` lints in test code the fork never touched.
 
-- [ ] **OPEN — `test_tls_against_rust_server` flakes on the Windows runner
-  (first seen 2026-08-29, PR #1089).** `storage-engine (windows-latest)` failed
-  ONE of 86 tests with `ServerSelectionTimeoutError: No servers found yet,
-  Timeout: 5.0s` while pinging a TLS-enabled `RustServer`; a rerun of the same
-  job on the same commit passed. The PR that surfaced it changed only
-  `sql/planner.py` and its tests, so there is no causal path to the Rust
-  server's TLS listener.
+- [x] **RESOLVED 2026-09-18 — the TLS timeout budgets, in every suite that has
+  one.** `test_tls_against_rust_server` (`storage-engine (windows-latest)`,
+  first seen 2026-08-29 on PR #1089) and
+  `test_pgserver_auth.py::test_tls_request_accepted_and_query_over_tls`
+  (2026-09-17 on PR #1461, `_ssl.c:990: The handshake operation timed out`)
+  were the same bug in two suites, and this entry was filed twice.
 
-  **Not the known Windows `storage-engine` pattern** — that one is disk
-  exhaustion and shows `WT_PANIC` + `No space left on device` across a burst of
-  tests. This is a single test, no panic, no ENOSPC.
+  **Not a bind race.** `SecantusPGServer.start()` calls `bind()` and `listen()`
+  before returning, so a connect lands in the backlog whether or not the accept
+  thread has run; "wait for the listener" was not available as a fix because the
+  readiness signal IS the handshake. The 5-second budget simply had to cover, on
+  the slowest runner under a fully parallel suite: accept-thread scheduling, a
+  handler thread, an `SSLRequest` round trip, and an RSA-2048 handshake.
 
-  Most likely a genuinely tight budget: the test allows **5s** for a TLS
-  handshake against a freshly-spawned server on the slowest runner in the
-  matrix, and `tests/test_rust_server_smoke.py` uses the same 5000ms in seven
-  places. Per this repo's rule a flake is a bug, not noise — the fix is to give
-  the TLS case a budget matched to Windows (or wait for the listener rather than
-  race it), not to rerun it away. Recorded here because reruns hide it.
+  `tests/net_timeouts.py` now holds one budget per DIRECTION, because the two
+  kinds move opposite ways: a path expected to SUCCEED needs a generous budget
+  (free when it passes -- `CONNECT_TIMEOUT_S` 30s,
+  `SERVER_SELECTION_TIMEOUT_MS` 30s), and a path expected to be REFUSED needs a
+  short one (the test pays all of it -- `REJECTED_SELECTION_TIMEOUT_MS` 2s).
+  Applied across `test_rust_server_smoke.py`, `test_pgserver_auth.py`,
+  `test_tls.py`, `test_x509_auth.py`, `test_pgserver_pg8000.py`.
+  `test_tls.py` had already reached 15s/2s on its own, which is the same
+  distinction found independently. Note the two x509 `pytest.raises` cases are
+  `OperationFailure` AFTER connecting, so their selection is a success path.
+
+  Plaintext budgets elsewhere (the `serverSelectionTimeoutMS=2000` population in
+  the admin suites) were left alone: no TLS handshake, and no flake recorded.
 
 - [x] **RESOLVED 2026-08-29 — wrong-typed command arguments on the RUST SERVER:
   78 of 87 divergences -> 87/87 clean.** First swept the same day (the Python
@@ -1803,24 +1812,6 @@ Specific items that were left out of the slice that introduced their feature are
   Python server, meaningless on a server with no Python, where the deferral
   became a generic BadValue.
 
-- [ ] **OPEN — `test_tls_against_rust_server` flakes on the Windows runner
-  (first seen 2026-08-29, PR #1089).** `storage-engine (windows-latest)` failed
-  ONE of 86 tests with `ServerSelectionTimeoutError: No servers found yet,
-  Timeout: 5.0s` while pinging a TLS-enabled `RustServer`; a rerun of the same
-  job on the same commit passed. The PR that surfaced it changed only
-  `sql/planner.py` and its tests, so there is no causal path to the Rust
-  server's TLS listener.
-
-  **Not the known Windows `storage-engine` pattern** — that one is disk
-  exhaustion and shows `WT_PANIC` + `No space left on device` across a burst of
-  tests. This is a single test, no panic, no ENOSPC.
-
-  Most likely a genuinely tight budget: the test allows **5s** for a TLS
-  handshake against a freshly-spawned server on the slowest runner in the
-  matrix, and `tests/test_rust_server_smoke.py` uses the same 5000ms in seven
-  places. Per this repo's rule a flake is a bug, not noise — the fix is to give
-  the TLS case a budget matched to Windows (or wait for the listener rather than
-  race it), not to rerun it away. Recorded here because reruns hide it.
 
 
 - [x] **RESOLVED 2026-08-31 — the wrong-typed-argument sweep, widened from CODES

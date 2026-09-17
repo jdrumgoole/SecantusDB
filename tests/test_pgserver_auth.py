@@ -23,6 +23,7 @@ from secantus.auth import saslprep
 from secantus.sql import pgwire
 from secantus.sql.pgserver import SecantusPGServer
 from secantus.storage import Storage
+from tests.net_timeouts import CONNECT_TIMEOUT_S
 
 
 def _read_until_ready(sock) -> list[pgwire.Message]:
@@ -82,7 +83,7 @@ def auth_server(tmp_path):
 
 def test_scram_auth_success_then_query(auth_server):
     host, port = auth_server.address
-    s = socket.create_connection((host, port), timeout=5)
+    s = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT_S)
     try:
         _startup(s)
         req = pgwire.read_message(s)
@@ -101,7 +102,7 @@ def test_scram_auth_success_then_query(auth_server):
 
 def test_scram_wrong_password_rejected(auth_server):
     host, port = auth_server.address
-    s = socket.create_connection((host, port), timeout=5)
+    s = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT_S)
     try:
         _startup(s)
         pgwire.read_message(s)  # AuthenticationSASL
@@ -114,7 +115,7 @@ def test_scram_wrong_password_rejected(auth_server):
 
 def test_scram_unknown_user_rejected(auth_server):
     host, port = auth_server.address
-    s = socket.create_connection((host, port), timeout=5)
+    s = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT_S)
     try:
         _startup(s, user="nobody")
         pgwire.read_message(s)  # AuthenticationSASL
@@ -131,7 +132,7 @@ def test_no_auth_required_stays_trust(tmp_path):
     srv.start()
     try:
         host, port = srv.address
-        s = socket.create_connection((host, port), timeout=5)
+        s = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT_S)
         _startup(s)
         # First reply is AuthenticationOk (subtype 0), not a SASL challenge.
         first = pgwire.read_message(s)
@@ -168,7 +169,7 @@ def tls_server(tmp_path):
 def test_tls_request_accepted_and_query_over_tls(tls_server):
     srv, ca = tls_server
     host, port = srv.address
-    raw = socket.create_connection((host, port), timeout=5)
+    raw = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT_S)
     try:
         # SSLRequest -> server answers 'S', then we wrap the socket.
         raw.sendall(struct.pack("!ii", 8, pgwire.SSL_REQUEST_CODE))
@@ -195,7 +196,7 @@ def test_tls_declined_when_not_configured(tmp_path):
     srv.start()
     try:
         host, port = srv.address
-        s = socket.create_connection((host, port), timeout=5)
+        s = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT_S)
         s.sendall(struct.pack("!ii", 8, pgwire.SSL_REQUEST_CODE))
         assert s.recv(1) == b"N"  # declined; client may continue in plaintext
         s.close()
@@ -214,7 +215,7 @@ def test_tls_declined_when_not_configured(tmp_path):
 def _authenticated_socket(server, user, password, database="db"):
     """Connect, run SCRAM to completion, and drain to ReadyForQuery."""
     host, port = server.address
-    s = socket.create_connection((host, port), timeout=5)
+    s = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT_S)
     _startup(s, user=user, database=database)
     pgwire.read_message(s)  # AuthenticationSASL
     final = scram_authenticate(s, user, password)

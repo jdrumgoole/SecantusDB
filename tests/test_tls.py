@@ -23,6 +23,7 @@ import trustme
 from pymongo import MongoClient
 
 from secantus import SecantusDBServer
+from tests.net_timeouts import REJECTED_SELECTION_TIMEOUT_MS, SERVER_SELECTION_TIMEOUT_MS
 
 
 @pytest.fixture(scope="module")
@@ -91,7 +92,7 @@ def test_tls_round_trip_insert_find(wt_home, tls_files) -> None:
         # pymongo URI: ?tls=true is the modern flag; tlsCAFile points
         # at the CA we used so the server cert verifies.
         uri = f"mongodb://127.0.0.1:{srv.port}/?tls=true&tlsCAFile={ca_path}"
-        client = MongoClient(uri, serverSelectionTimeoutMS=15000)
+        client = MongoClient(uri, serverSelectionTimeoutMS=SERVER_SELECTION_TIMEOUT_MS)
         try:
             client["tlsdb"]["coll"].insert_one({"_id": 1, "v": "encrypted-hi"})
             rows = list(client["tlsdb"]["coll"].find())
@@ -129,7 +130,7 @@ def test_tls_server_rejects_plaintext_client(wt_home, tls_files) -> None:
         s.close()
         # Server still serving normal TLS clients after the bad-handshake.
         uri = f"mongodb://127.0.0.1:{srv.port}/?tls=true&tlsCAFile={ca_path}"
-        client = MongoClient(uri, serverSelectionTimeoutMS=15000)
+        client = MongoClient(uri, serverSelectionTimeoutMS=SERVER_SELECTION_TIMEOUT_MS)
         try:
             client.admin.command("ping")
         finally:
@@ -145,7 +146,7 @@ def test_no_tls_args_keeps_plaintext_behavior(wt_home) -> None:
     assert srv._ssl_context is None  # noqa: SLF001
     srv.start()
     try:
-        client = MongoClient(srv.uri, serverSelectionTimeoutMS=15000)
+        client = MongoClient(srv.uri, serverSelectionTimeoutMS=SERVER_SELECTION_TIMEOUT_MS)
         try:
             client["d"]["c"].insert_one({"_id": 1})
             assert list(client["d"]["c"].find()) == [{"_id": 1}]
@@ -213,7 +214,7 @@ def test_tls_handshake_failure_doesnt_consume_connection_slot(wt_home, tls_files
         )
         # A legit TLS client still works.
         uri = f"mongodb://127.0.0.1:{srv.port}/?tls=true&tlsCAFile={ca_path}"
-        client = MongoClient(uri, serverSelectionTimeoutMS=15000)
+        client = MongoClient(uri, serverSelectionTimeoutMS=SERVER_SELECTION_TIMEOUT_MS)
         try:
             client.admin.command("ping")
         finally:
@@ -249,7 +250,7 @@ def test_mtls_required_accepts_client_with_valid_cert(
             f"mongodb://127.0.0.1:{srv.port}/?tls=true&tlsCAFile={ca_path}"
             f"&tlsCertificateKeyFile={client_cert_combined}"
         )
-        client = MongoClient(uri, serverSelectionTimeoutMS=15000)
+        client = MongoClient(uri, serverSelectionTimeoutMS=SERVER_SELECTION_TIMEOUT_MS)
         try:
             client["mtlsdb"]["coll"].insert_one({"_id": 1, "v": "mtls"})
             assert list(client["mtlsdb"]["coll"].find()) == [{"_id": 1, "v": "mtls"}]
@@ -277,7 +278,7 @@ def test_mtls_required_rejects_client_without_cert(wt_home, tls_files) -> None:
     try:
         # No tlsCertificateKeyFile — server should reject during handshake.
         uri = f"mongodb://127.0.0.1:{srv.port}/?tls=true&tlsCAFile={ca_path}"
-        client = MongoClient(uri, serverSelectionTimeoutMS=2000)
+        client = MongoClient(uri, serverSelectionTimeoutMS=REJECTED_SELECTION_TIMEOUT_MS)
         with pytest.raises((ServerSelectionTimeoutError, Exception)):
             client.admin.command("ping")
         client.close()
@@ -305,7 +306,7 @@ def test_mtls_required_rejects_foreign_ca_client(wt_home, tls_files, foreign_cli
             f"mongodb://127.0.0.1:{srv.port}/?tls=true&tlsCAFile={ca_path}"
             f"&tlsCertificateKeyFile={foreign_client_cert}"
         )
-        client = MongoClient(uri, serverSelectionTimeoutMS=2000)
+        client = MongoClient(uri, serverSelectionTimeoutMS=REJECTED_SELECTION_TIMEOUT_MS)
         with pytest.raises((ServerSelectionTimeoutError, Exception)):
             client.admin.command("ping")
         client.close()
@@ -335,14 +336,14 @@ def test_mtls_optional_accepts_with_or_without_cert(
             f"mongodb://127.0.0.1:{srv.port}/?tls=true&tlsCAFile={ca_path}"
             f"&tlsCertificateKeyFile={client_cert_combined}"
         )
-        c1 = MongoClient(uri_with, serverSelectionTimeoutMS=15000)
+        c1 = MongoClient(uri_with, serverSelectionTimeoutMS=SERVER_SELECTION_TIMEOUT_MS)
         try:
             c1.admin.command("ping")
         finally:
             c1.close()
         # 2. Client without cert: also works (CERT_OPTIONAL).
         uri_without = f"mongodb://127.0.0.1:{srv.port}/?tls=true&tlsCAFile={ca_path}"
-        c2 = MongoClient(uri_without, serverSelectionTimeoutMS=15000)
+        c2 = MongoClient(uri_without, serverSelectionTimeoutMS=SERVER_SELECTION_TIMEOUT_MS)
         try:
             c2.admin.command("ping")
         finally:
