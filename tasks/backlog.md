@@ -723,18 +723,28 @@ remain open:
       deletion is detected at the next `COMMIT PREPARED` by the first
       minted seq being readable (`prepared_already_committed`), not by a
       commit record.
-- [ ] **OPEN — RUST pgserver: `CREATE ROLE` (2026-09-09).** 1 skip in the
-      psycopg gauge (`test_connection.py` role switching). Users are
-      constructor config, not catalog rows, on both servers.
-- [ ] **OPEN — RUST pgserver: `CREATE EXTENSION hstore` (2026-09-09).** 16
-      skips in the psycopg gauge (`tests/types/test_hstore.py`): the fixture
-      creates the extension and skips when that fails. The Python server
-      carries the hstore type (b153); the Rust server has neither the
-      extension statement nor the type.
-- [ ] **OPEN — RUST pgserver: postgis types (2026-09-09).** 26 skips in the
-      psycopg gauge (`tests/types/test_shapely.py`, `CREATE EXTENSION
-      postgis`). Out of scope — PostGIS is a third-party extension, not
-      PostgreSQL.
+- [ ] **OPEN — RUST pgserver: role passwords are stored, never verified
+      (2026-09-17).** `CREATE / ALTER ROLE ... PASSWORD` records a
+      SCRAM-SHA-256 verifier in `pg_authid`, but the server still trusts
+      every connection (the startup handshake never challenges). Turning on
+      verification would break every gauge that connects as `user=postgres`
+      with no password, so it needs a `pg_hba`-style trust/scram switch
+      first; pgwire's SASL hooks make the SCRAM exchange itself cheap once
+      the policy exists. Role membership (`IN ROLE` / `ROLE` / `ADMIN`) and
+      `SYSID` are refused `0A000`.
+- [ ] **OPEN — RUST pgserver: `DROP EXTENSION ... CASCADE` over a column of
+      the extension's type (2026-09-17).** PG drops the dependent columns
+      (`select h from hdep` is then `42703`); this server has no `ALTER
+      TABLE DROP COLUMN` to drop them with, so the CASCADE form is refused
+      `0A000` ("drop the table first"). Without CASCADE the dependency is
+      refused `2BP01` as PG does.
+- [ ] **OPEN — RUST pgserver: `timestamptz::timestamp` keeps the UTC clock
+      (2026-09-17).** PG converts the instant to the SESSION zone's wall
+      clock (`'2030-01-01 12:00:00+02'::timestamptz::timestamp` is
+      `11:00:00` under `Europe/Berlin`); this server answers `10:00:00`,
+      both for a constant and for a stored column. The `::text` twin was
+      fixed with the role catalog (the cast chain now carries the source
+      type); the `timestamp` target still sees only the UTC carrier.
 - [ ] **OPEN — RUST pgserver: `SELECT *` / `t.*` over a JOIN or a comma
       FROM (2026-09-10).** `select * from t1, t2` and `select t1.*, t2.f3
       from t1 join t2 on ...` are 0A000 `this subquery target`; the join
