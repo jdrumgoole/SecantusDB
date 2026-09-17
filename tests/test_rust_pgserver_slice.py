@@ -8726,6 +8726,8 @@ def test_truncate_matches_postgres(home: Path) -> None:
         assert conn.execute("truncate tp cascade").statusmessage == "TRUNCATE TABLE"
         assert notices == ['truncate cascades to table "tc"']
         assert conn.execute("select count(*) from tc").fetchone() == (0,)
+
+
 def test_create_extension_hstore_installs_the_type_and_its_io(home: Path) -> None:
     """`CREATE EXTENSION hstore` brings the `hstore` type with PostgreSQL's
     text I/O and binary send/recv, a `pg_extension` row, and refusals shaped
