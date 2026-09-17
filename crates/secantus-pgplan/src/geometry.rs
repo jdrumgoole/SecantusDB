@@ -255,7 +255,7 @@ fn shape_wkt(shape: &Shape, dim: &str) -> String {
                     } else {
                         let full = shape_wkt(item, "");
                         let body = full
-                            .split_once(|c: char| c == '(' || c == 'E')
+                            .split_once(['(', 'E'])
                             .map(|(_, rest)| rest)
                             .unwrap_or("");
                         if full.ends_with("EMPTY") {
@@ -420,7 +420,7 @@ pub fn from_ewkb(bytes: &[u8]) -> Result<Geometry> {
 /// Hex text to bytes, `None` if not hex.
 pub fn unhex(text: &str) -> Option<Vec<u8>> {
     let b = text.as_bytes();
-    if b.is_empty() || b.len() % 2 != 0 {
+    if b.is_empty() || !b.len().is_multiple_of(2) {
         return None;
     }
     let nibble = |c: u8| (c as char).to_digit(16).map(|d| d as u8);

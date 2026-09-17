@@ -7374,7 +7374,7 @@ pub fn extension_type(name: &str) -> Option<ExtensionType> {
     if !defined {
         return None;
     }
-    let installed = PLAN_EXTENSION_TYPES.with(|t| t.borrow().iter().any(|n| *n == registered));
+    let installed = PLAN_EXTENSION_TYPES.with(|t| t.borrow().contains(&registered));
     if !installed {
         return None;
     }
