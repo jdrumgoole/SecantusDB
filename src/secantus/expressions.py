@@ -6313,6 +6313,26 @@ def _percentile_expr(arg: Any, ctx: _Ctx, *, op: str) -> Any:
     return [_percentile_rank(values, p) for p in ps]
 
 
+#: Operator names the evaluator intercepts BEFORE the `_OPS` dispatch, so they
+#: never appear in that table. `$literal`'s argument is data rather than an
+#: expression, which is why it is handled early.
+_PRE_DISPATCH_OPS = frozenset({"$literal"})
+
+
+def is_known_expression_operator(op: str) -> bool:
+    """Will the evaluator dispatch `op`, rather than reject it as unknown?
+
+    `_OPS` is ALMOST the answer and asking it directly is a trap: `$literal` is
+    intercepted before the dispatch above and so is absent from the table. A
+    parse-time check built on `_OPS` alone therefore calls `$literal` unknown
+    and REJECTS A VALID PIPELINE -- `{$project: {n: {$literal: 5}}}` started
+    answering `31325 Unknown expression $literal` when exactly that was tried
+    on 2026-09-17. Ask this instead, and add any future pre-dispatch name to
+    `_PRE_DISPATCH_OPS` beside it.
+    """
+    return op in _OPS or op in _PRE_DISPATCH_OPS
+
+
 _OPS["$median"] = _op_median_expr
 _OPS["$percentile"] = _op_percentile_expr
 

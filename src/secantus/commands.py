@@ -201,6 +201,12 @@ _ERROR_CODE_NAMES: dict[int, str] = {
     66: "ImmutableField",
     100: "UnsatisfiableWriteConcern",
     136: "CappedPositionLost",
+    # Every unknown-expression error carries this one, and a table miss renders
+    # the generic `Location168` instead -- measured 8.2.11 (2026-09-17) across
+    # 13 shapes in `tools/probes/unknown_expression_errors.py`, where it was
+    # the ONLY thing wrong in four of them. `expressions._CODE_NAMES` already
+    # knew the name; errors raised as `AggregateError` never reached it.
+    168: "InvalidPipelineOperator",
 }
 
 

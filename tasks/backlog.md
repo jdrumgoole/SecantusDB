@@ -6890,13 +6890,63 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   operator. Parity does not say which side is right, but it does say they must
   move together.
 
-- [ ] **OPEN — `$project` reports `168` where mongod reports `31325` for an
-  unknown expression (2026-09-09).** `{$project: {n: {$count: {}}}}` is
-  `31325 Invalid $project :: caused by :: Unknown expression $count` on mongod
-  and `168 ... Unrecognized expression '$count'` here; `$addFields` uses 168 in
-  BOTH. So `$project` carries its own code and wording for this family, and it
-  applies to `$topN` / `$bottomN` too. The ACCEPT/REJECT behaviour matches; only
-  the code and message differ.
+- [x] **RESOLVED 2026-09-17 — the unknown-expression error surface. The entry
+  below was right about the symptom and wrong about the rule, and it MISSED two
+  larger divergences sitting beside it.**
+
+  As filed: "`$project` carries its own code and wording for this family". The
+  real discriminator is POSITION, and the same `$project` gives BOTH codes --
+  measured across 13 shapes on 8.2.11 by the new
+  `tools/probes/unknown_expression_errors.py`:
+
+  | shape | mongod |
+  | --- | --- |
+  | `{$project: {n: {$nosuch: 1}}}` | `31325 ... Unknown expression $nosuch` |
+  | `{$project: {n: {$add: [{$nosuch: 1}, 1]}}}` | `168 ... Unrecognized expression '$nosuch'` |
+  | `{$addFields: {n: {$nosuch: 1}}}` | `168 Invalid $addFields :: caused by :: ...` |
+  | `{$group: {_id: {$nosuch: 1}}}` | `168 ...` — no envelope at all |
+
+  The top-level value of a `$project` field is parsed by the PROJECTION parser,
+  which has its own code and its own wording ("Unknown", operator UNQUOTED);
+  anywhere deeper the generic expression parser answers 168 with it quoted.
+
+  Two things the entry never mentioned, both found only by running the probe:
+
+  - **`codeName` was wrong on ALL 13 shapes.** We rendered `Location168` where
+    mongod says `InvalidPipelineOperator`. 168 is below 10000, so it is a NAMED
+    code; `expressions._CODE_NAMES` already knew the name, but errors raised as
+    `AggregateError` never reached it and `commands._ERROR_CODE_NAMES` had no
+    168 entry.
+  - **The ENVELOPE was wrong on 7 shapes.** A truly unknown operator was caught
+    by the constant FOLDER, which stamps `Failed to optimize pipeline :: caused
+    by ::`, where mongod names the stage or uses no envelope. Fixed by
+    detecting an unknown operator at PARSE time so `wrap_expression_problem`
+    applies the right one.
+
+  "The ACCEPT/REJECT behaviour matches; only the code and message differ" is
+  the sentence that kept this closed-looking for eight days. It was true and it
+  was not a reason to leave it: the code, the codeName and the envelope are all
+  things a client branches on.
+
+  Python is now 0 of 13 divergent. **The Rust server is 9 of 13** — it answers a
+  blanket `2 BadValue "aggregation pipeline uses a stage or operator not
+  supported by the Rust server"` instead of naming the operator, because a
+  `Fallback::Defer` has no Python behind it on the standalone server. It does
+  get the four `$project` top-level shapes right. That half is open; see the
+  entry below.
+
+  Gate: `tests/test_mongod_differential.py -k unknownexpr` (7 shapes, including
+  a `$literal` case — see the next entry for why that one is load-bearing).
+
+- [ ] **OPEN — the Rust server does not name an unknown expression operator
+  (2026-09-17).** 9 of the 13 shapes in
+  `tools/probes/unknown_expression_errors.py` come back as
+  `2 BadValue "aggregation pipeline uses a stage or operator not supported by
+  the Rust server"`. mongod names the operator and its code (168 or 31325). The
+  four `$project` top-level shapes already answer correctly, so the gap is the
+  generic expression parser rather than the projection one. A `Defer` is an
+  ERROR on the standalone server, so this is a user-visible refusal with the
+  wrong code, message and codeName — not a silent wrong answer.
 
 - [x] **RESOLVED 2026-09-09 — a `Decimal128("NaN")` CRASHED `$expr`, and
   `{$eq: [NaN, NaN]}` was false.** Two bugs, one probe run.

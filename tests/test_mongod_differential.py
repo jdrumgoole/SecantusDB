@@ -3188,6 +3188,53 @@ def _proj(projection: dict) -> Callable[[Database], object]:
     return run
 
 
+#: An unknown expression operator. mongod does NOT answer this one way -- the
+#: discriminator is POSITION, so the same `$project` gives two different codes
+#: depending on how deep the operator sits. `$literal` is in here because a
+#: parse-time check built on the evaluator's dispatch table alone calls it
+#: unknown and rejects a VALID pipeline; it is the case that catches that.
+UNKNOWN_EXPR_DOCS = [{"_id": 1, "a": 1}]
+UNKNOWN_EXPR_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    (
+        "project-top",
+        UNKNOWN_EXPR_DOCS,
+        lambda db: _agg_err_full(db, [{"$project": {"n": {"$nosuch": 1}}}]),
+    ),
+    (
+        "project-top-count",
+        UNKNOWN_EXPR_DOCS,
+        lambda db: _agg_err_full(db, [{"$project": {"n": {"$count": {}}}}]),
+    ),
+    (
+        "project-top-topn",
+        UNKNOWN_EXPR_DOCS,
+        lambda db: _agg_err_full(
+            db, [{"$project": {"n": {"$topN": {"n": 1, "sortBy": {"a": 1}, "output": "$a"}}}}]
+        ),
+    ),
+    (
+        "project-nested",
+        UNKNOWN_EXPR_DOCS,
+        lambda db: _agg_err_full(db, [{"$project": {"n": {"$add": [{"$nosuch": 1}, 1]}}}]),
+    ),
+    (
+        "project-literal-ok",
+        UNKNOWN_EXPR_DOCS,
+        lambda db: _agg_err_full(db, [{"$project": {"n": {"$literal": 5}}}]),
+    ),
+    (
+        "addfields-top",
+        UNKNOWN_EXPR_DOCS,
+        lambda db: _agg_err_full(db, [{"$addFields": {"n": {"$count": {}}}}]),
+    ),
+    (
+        "group-id",
+        UNKNOWN_EXPR_DOCS,
+        lambda db: _agg_err_full(db, [{"$group": {"_id": {"$nosuch": 1}}}]),
+    ),
+]
+
+
 PROJECTION_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
     # Field ORDER: the document's own, not the spec's, with computed appended.
     ("order-include", PROJ_DOCS, _proj({"a": 1, "b": 1})),
@@ -3246,6 +3293,7 @@ ALL_CASES = (
     + [("nanexpr", c) for c in NAN_EXPR_CASES]
     + [("todate", c) for c in TODATE_CASES]
     + [("projection", c) for c in PROJECTION_CASES]
+    + [("unknownexpr", c) for c in UNKNOWN_EXPR_CASES]
 )
 
 
