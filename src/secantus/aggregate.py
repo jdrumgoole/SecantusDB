@@ -35,6 +35,7 @@ from secantus.expressions import (
     evaluate,
     evaluate_or_missing,
     is_constant_expression,
+    is_known_expression_operator,
 )
 from secantus.numerics import bson_sum
 from secantus.paths import get_path, has_path, set_path, unset_path
@@ -342,6 +343,33 @@ def _expression_problem(expr: Any, bound: frozenset[str]) -> tuple[int, str] | N
         return None
     if not isinstance(expr, Mapping):
         return None
+    # An unknown operator, reported at PARSE time. It is otherwise found by the
+    # constant FOLDER, which stamps `Failed to optimize pipeline :: caused by ::`
+    # on it -- where mongod names the stage (`Invalid $addFields :: caused by ::`)
+    # or uses no wrapper at all in `$group` / `$replaceWith` / `$expr`. Same code
+    # and message either way; only the envelope was wrong (probed 8.2.11).
+    #
+    # Single-key only, like `_project_unknown_expression`: a document mixing an
+    # unknown `$key` with others gets a different mongod error that nobody has
+    # measured, and a false positive here would reject a VALID pipeline.
+    #
+    # ACCUMULATORS are excluded, and that exclusion is not cosmetic: whether
+    # `$push` is legal depends on POSITION, not on the name. It is valid in a
+    # `$group` output field and unknown in a `$project`, and the position-aware
+    # gates already decide that. Without this clause `_expression_problem` sees
+    # `{$group: {_id: "$g", p: {$push: "$s"}}}` -- the plainest valid pipeline
+    # there is -- and rejects it; the full suite caught exactly that in four
+    # tests, which is why this walker's docstring calls a false positive far
+    # worse than a wrong error message.
+    if len(expr) == 1:
+        (only,) = expr
+        if (
+            isinstance(only, str)
+            and only.startswith("$")
+            and not is_known_expression_operator(only)
+            and only not in _ACC_DISPATCH
+        ):
+            return (168, f"Unrecognized expression '{only}'")
     for op, arg in expr.items():
         # `$literal`'s argument is data, not an expression: `{$literal: "$$x"}`
         # is the STRING, and mongod does not resolve it. Its ARITY is still
@@ -550,6 +578,39 @@ def _fold_problem(
     return None
 
 
+def _project_unknown_expression(value: Any) -> tuple[int, str] | None:
+    """`$project`'s OWN code for an unknown operator at the top of a field.
+
+    mongod does not answer this one way -- the discriminator is POSITION, and
+    the same `$project` gives both codes (probed 8.2.11, 2026-09-17,
+    `tools/probes/unknown_expression_errors.py`):
+
+        {$project: {n: {$nosuch: 1}}}             31325 Unknown expression $nosuch
+        {$project: {n: {$add: [{$nosuch: 1}, 1]}}}  168 Unrecognized expression '$nosuch'
+
+    The top-level value of a `$project` field is parsed by the PROJECTION
+    parser, which has its own code and its own wording -- "Unknown", and the
+    operator UNQUOTED. Anywhere deeper the generic expression parser answers
+    168 with the operator quoted. `$addFields` / `$set` use 168 in both
+    positions, so this is `$project` alone.
+
+    Accumulator-only names land here too: `$count` / `$topN` / `$bottomN` are
+    not expressions at all, so the projection parser does not know them either.
+
+    Conservative like the rest of this walker: a single `$`-key document only.
+    A multi-key one has not been measured, and a false positive would reject a
+    valid pipeline.
+    """
+    if not isinstance(value, Mapping) or len(value) != 1:
+        return None
+    key = next(iter(value))
+    if not isinstance(key, str) or not key.startswith("$"):
+        return None
+    if is_known_expression_operator(key):
+        return None
+    return (31325, f"Unknown expression {key}")
+
+
 def expression_problem_in_pipeline(
     pipeline: Any, bound: frozenset[str], fold_vars: Mapping[str, Any] | None = None
 ) -> tuple[int, str, str] | None:
@@ -594,6 +655,10 @@ def expression_problem_in_pipeline(
                             if found:
                                 break
                             continue
+                    if name == "$project":
+                        found = _project_unknown_expression(value)
+                        if found:
+                            break
                     found = _expression_problem(value, bound)
                     if found:
                         break

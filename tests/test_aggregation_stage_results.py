@@ -167,12 +167,26 @@ def test_count_is_an_accumulator_in_group_and_setwindowfields(coll):
     assert [r["n"] for r in windowed] == [2, 2]
 
 
-@pytest.mark.parametrize("stage", ["$project", "$addFields"])
-def test_count_is_not_an_expression(coll, stage):
+@pytest.mark.parametrize(
+    ("stage", "code", "message"),
+    [
+        # NOT the same code, which this test asserted (as a flat 168 for both)
+        # until it was checked against the server on 2026-09-17. The top-level
+        # value of a `$project` field is parsed by the PROJECTION parser, which
+        # has its own code and says "Unknown expression" with the operator
+        # UNQUOTED; `$addFields` uses the generic expression parser's 168 and
+        # quotes it. Both measured on 8.2.11 --
+        # `tools/probes/unknown_expression_errors.py`.
+        ("$project", 31325, "Invalid $project :: caused by :: Unknown expression $count"),
+        ("$addFields", 168, "Invalid $addFields :: caused by :: Unrecognized expression '$count'"),
+    ],
+)
+def test_count_is_not_an_expression(coll, stage, code, message):
     coll.insert_one({"_id": 1, "g": "a"})
     with pytest.raises(pymongo.errors.OperationFailure) as excinfo:
         list(coll.aggregate([{stage: {"n": {"$count": {}}}}]))
-    assert excinfo.value.code == 168
+    assert excinfo.value.code == code
+    assert excinfo.value.details["errmsg"] == message
 
 
 def test_the_count_stage_still_works_including_inside_facet(coll):
