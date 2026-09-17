@@ -710,6 +710,20 @@ fn transaction_statements_are_planned() {
             "ROLLBACK TO SAVEPOINT s1",
             TransactionControl::RollbackTo("s1".into()),
         ),
+        // Two-phase commit: the gid is a string literal that survives
+        // byte-for-byte -- spaces, quotes and case included.
+        (
+            "PREPARE TRANSACTION 'My Gid '",
+            TransactionControl::Prepare("My Gid ".into()),
+        ),
+        (
+            "COMMIT PREPARED 'it''s'",
+            TransactionControl::CommitPrepared("it's".into()),
+        ),
+        (
+            "ROLLBACK PREPARED ''",
+            TransactionControl::RollbackPrepared(String::new()),
+        ),
     ] {
         match plan_ok(sql) {
             Statement::Transaction(c) => assert_eq!(c, want, "for {sql}"),

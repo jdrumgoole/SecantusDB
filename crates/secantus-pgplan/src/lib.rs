@@ -414,6 +414,14 @@ pub enum Statement {
     Aggregate(Aggregate),
     Update(Update),
     Delete(Delete),
+    /// `TRUNCATE [TABLE] name [, ...] [RESTART IDENTITY] [CASCADE]`: every
+    /// row of every named table goes. `cascade` widens the list to the
+    /// tables whose foreign keys reference one being truncated.
+    Truncate {
+        tables: Vec<String>,
+        restart_identity: bool,
+        cascade: bool,
+    },
     /// `CREATE [TEMP] TABLE name [(cols)] AS query [WITH [NO] DATA]`.
     ///
     /// The table's columns are the query's output columns -- names and
@@ -706,9 +714,9 @@ pub struct JoinSelect {
     pub right_sub: Option<Box<Statement>>,
 }
 
-/// Transaction control. Prepared transactions (two-phase commit) are
-/// deliberately absent -- they need machinery this server does not have, and
-/// pretending would silently lose the semantics a client is relying on.
+/// Transaction control, two-phase commit included: `PREPARE TRANSACTION`
+/// carries the block's write set into the storage so `COMMIT PREPARED` /
+/// `ROLLBACK PREPARED` can resolve it from any connection, restart included.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransactionControl {
     /// `modes` are the transaction characteristics tacked onto the statement
@@ -726,6 +734,13 @@ pub enum TransactionControl {
     Rollback {
         chain: bool,
     },
+    /// `PREPARE TRANSACTION '<gid>'`: end the block with its work durably
+    /// parked under `gid`, neither committed nor discarded.
+    Prepare(String),
+    /// `COMMIT PREPARED '<gid>'`.
+    CommitPrepared(String),
+    /// `ROLLBACK PREPARED '<gid>'`.
+    RollbackPrepared(String),
     /// `SAVEPOINT <name>`: a point inside the block to come back to.
     Savepoint(String),
     /// `RELEASE [SAVEPOINT] <name>`: destroy it, KEEPING its writes.
@@ -1467,12 +1482,22 @@ pub fn plan_with_params(
                 Ok(TransactionStmtKind::TransStmtRollbackTo) => Ok(Statement::Transaction(
                     TransactionControl::RollbackTo(t.savepoint_name.clone()),
                 )),
+                Ok(TransactionStmtKind::TransStmtPrepare) => Ok(Statement::Transaction(
+                    TransactionControl::Prepare(t.gid.clone()),
+                )),
+                Ok(TransactionStmtKind::TransStmtCommitPrepared) => Ok(Statement::Transaction(
+                    TransactionControl::CommitPrepared(t.gid.clone()),
+                )),
+                Ok(TransactionStmtKind::TransStmtRollbackPrepared) => Ok(
+                    Statement::Transaction(TransactionControl::RollbackPrepared(t.gid.clone())),
+                ),
                 Ok(other) => Err(Error::Unsupported(format!("{other:?}"))),
                 Err(_) => Err(Error::Unsupported("this transaction statement".into())),
             }
         }
         N::UpdateStmt(u) => plan_update(&u, lookup, params),
         N::DeleteStmt(d) => plan_delete(&d, lookup, params),
+        N::TruncateStmt(t) => plan_truncate(&t, lookup),
         other => Err(Error::Unsupported(disc(&other))),
     }
 }
@@ -10777,6 +10802,27 @@ fn plan_delete(
         Some(w) => lower_where(w, &def, params)?,
     };
     Ok(Statement::Delete(Delete { table, filter }))
+}
+
+fn plan_truncate(
+    t: &pg_query::protobuf::TruncateStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Result<Statement> {
+    let mut tables = Vec::with_capacity(t.relations.len());
+    for rel in &t.relations {
+        let Some(N::RangeVar(r)) = rel.node.as_ref() else {
+            return Err(Error::Parse("TRUNCATE without a relation".into()));
+        };
+        lookup(&r.relname).ok_or_else(|| Error::UndefinedTable(r.relname.clone()))?;
+        if !tables.contains(&r.relname) {
+            tables.push(r.relname.clone());
+        }
+    }
+    Ok(Statement::Truncate {
+        tables,
+        restart_identity: t.restart_seqs,
+        cascade: DropBehavior::try_from(t.behavior) == Ok(DropBehavior::DropCascade),
+    })
 }
 
 /// A WHERE predicate as a Mongo filter over STORED FIELDS.

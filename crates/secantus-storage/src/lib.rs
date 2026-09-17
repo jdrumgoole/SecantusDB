@@ -189,6 +189,38 @@ impl Drop for UserTransactionHandle {
     }
 }
 
+/// One row of `pg_prepared_xacts`: a transaction parked by `PREPARE
+/// TRANSACTION`, as recorded in [`PREPARED_XACT_TABLE`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedXact {
+    pub gid: String,
+    pub owner: String,
+    pub database: String,
+    pub prepared: bson::DateTime,
+    pub xid: i64,
+}
+
+impl PreparedXact {
+    fn from_row(row: &Document) -> Result<Self> {
+        let text = |k: &str| {
+            row.get_str(k).map(str::to_string).map_err(|_| {
+                StorageError::Internal(format!("prepared transaction record lacks {k}"))
+            })
+        };
+        Ok(Self {
+            gid: text("gid")?,
+            owner: text("owner")?,
+            database: text("database")?,
+            prepared: row.get_datetime("prepared").copied().map_err(|_| {
+                StorageError::Internal("prepared transaction record lacks prepared".into())
+            })?,
+            xid: row.get_i64("xid").map_err(|_| {
+                StorageError::Internal("prepared transaction record lacks xid".into())
+            })?,
+        })
+    }
+}
+
 /// mongod's per-document BSON size limit (16 MiB). A document whose encoded size
 /// exceeds this is rejected with `BSONObjectTooLarge` (10334). Mirrors
 /// `storage.py`'s `MAX_BSON_OBJECT_SIZE`.
@@ -1410,7 +1442,15 @@ const BOOTSTRAP: &[(&str, &str)] = &[
         "table:secantus_profile_settings",
         "key_format=S,value_format=u",
     ),
+    (PREPARED_XACT_TABLE, "key_format=S,value_format=u"),
 ];
+
+/// Durable record of every prepared (two-phase) transaction: `gid -> BSON
+/// {gid, owner, database, prepared, xid, minted, ops}`. Written at `PREPARE
+/// TRANSACTION`, removed at `COMMIT PREPARED` / `ROLLBACK PREPARED`; the
+/// `ops` are the transaction's oplog entries, replayed when the commit comes
+/// after a restart. See [`Storage::prepare_user_transaction`].
+const PREPARED_XACT_TABLE: &str = "table:secantus_prepared_xacts";
 
 #[derive(Debug)]
 pub enum StorageError {
@@ -1494,6 +1534,12 @@ pub enum StorageError {
     /// An update would modify the immutable `_id` field. Surfaces as mongod's
     /// `ImmutableField` (66).
     ImmutableField,
+    /// `PREPARE TRANSACTION` named a gid that is already prepared (PostgreSQL
+    /// 42710).
+    PreparedTransactionExists(String),
+    /// `COMMIT PREPARED` / `ROLLBACK PREPARED` named a gid nothing prepared
+    /// (PostgreSQL 42704).
+    PreparedTransactionNotFound(String),
 }
 
 /// Map a query-engine fault to a storage error, keeping mongod's code and
@@ -1540,6 +1586,12 @@ impl std::fmt::Display for StorageError {
                 f,
                 "Performing an update on the path '_id' would modify the immutable field '_id'"
             ),
+            StorageError::PreparedTransactionExists(gid) => {
+                write!(f, "transaction identifier \"{gid}\" is already in use")
+            }
+            StorageError::PreparedTransactionNotFound(gid) => {
+                write!(f, "prepared transaction with identifier \"{gid}\" does not exist")
+            }
             StorageError::BadHint(m) => write!(f, "{m}"),
             StorageError::ChangeStreamFatal(m) => write!(f, "{m}"),
             StorageError::Internal(m) => write!(f, "{m}"),
@@ -2825,6 +2877,14 @@ pub struct Storage {
     /// `timeseries_doc_suffix`). Wraps at 16 bits; combined with a nanosecond
     /// timestamp it keeps duplicate-`_id` rows distinct across reopens.
     ts_suffix_counter: AtomicU64,
+    /// Prepared (two-phase) transactions whose WiredTiger transaction is still
+    /// open in THIS process, by gid: the handle keeps the writes invisible and
+    /// the row locks held until `COMMIT PREPARED` / `ROLLBACK PREPARED`, from
+    /// whichever connection sends it. Every entry has a durable twin in
+    /// [`PREPARED_XACT_TABLE`]; a handle lost to a restart is resolved from
+    /// that row instead. Cleared (rolled back) first thing on `Drop`, before
+    /// the connection closes under its sessions.
+    prepared_xacts: Mutex<HashMap<String, UserTransactionHandle>>,
     /// Whether to force a WiredTiger checkpoint on close (`Drop`). Mirrors the
     /// Python `Storage._durable` flag. WT's connection close does NOT implicitly
     /// checkpoint while logging is enabled, so without a close-time checkpoint a
@@ -3928,6 +3988,13 @@ impl Drop for Storage {
     /// logged, never silent: in a database a close-time write error is a
     /// durability signal.
     fn drop(&mut self) {
+        // Prepared transactions still open in this process roll back here
+        // (their sessions must close before the connection does); each keeps
+        // its durable row, so the next open resolves it by replay.
+        self.prepared_xacts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         // Stop the background oplog pruner first: it opens WT sessions, so it
         // must be gone before the connection closes below. A parked pruner
         // wakes on the notify; a mid-sweep one finishes its bounded sweep.
@@ -4225,6 +4292,7 @@ impl Storage {
             prune_ctx,
             prune_join,
             ts_suffix_counter: AtomicU64::new(0),
+            prepared_xacts: Mutex::new(HashMap::new()),
             // Unlogged data tables are only as durable as their last
             // checkpoint, so the close-time checkpoint is NOT optional in this
             // mode — a fast-storage (durable=false) clean close would lose
@@ -6119,14 +6187,56 @@ impl Storage {
     /// rewrote, and the second hit a WiredTiger write conflict. Nested /
     /// re-entrant use is safe: the previous state is restored on return,
     /// panic included.
+    ///
+    /// The enclosing statement's per-thread oplog bookkeeping is stashed for
+    /// the duration and restored afterwards. Without that, the autocommit
+    /// statements `f` runs inside `with_statement_txn` scopes whose exit
+    /// guard drains EVERYTHING in `PENDING_MINTED` (and, in async mode, whose
+    /// entry clears `PENDING_OPLOG`) — the enclosing transaction's own
+    /// minted ranges included. Found 2026-09-17: `CREATE TABLE` mints its
+    /// composite oid this way between its catalog writes, and the seqs those
+    /// writes had parked vanished from the handle, so `PREPARE TRANSACTION`
+    /// recorded a write set with no table in it and `COMMIT PREPARED` after
+    /// a restart replayed the row into a table that did not exist.
     pub fn outside_user_transaction<T>(&self, f: impl FnOnce() -> T) -> T {
-        struct Restore(*const Session);
+        struct Restore {
+            session: *const Session,
+            minted: Vec<(i64, i64)>,
+            dirty: u64,
+            in_sync: bool,
+            oplog: Vec<(OplogEntry, Option<Vec<u8>>)>,
+            in_async: bool,
+        }
         impl Drop for Restore {
             fn drop(&mut self) {
-                ACTIVE_TXN_SESSION.with(|c| c.set(self.0));
+                ACTIVE_TXN_SESSION.with(|c| c.set(self.session));
+                IN_SYNC_STMT.with(|f| f.set(self.in_sync));
+                IN_ASYNC_STMT.with(|f| f.set(self.in_async));
+                // The inner scopes drain what they park, so these are empty
+                // in practice; prepend the outer state either way.
+                PENDING_MINTED.with(|p| {
+                    let mut p = p.borrow_mut();
+                    let inner = std::mem::take(&mut *p);
+                    *p = std::mem::take(&mut self.minted);
+                    p.extend(inner);
+                });
+                PENDING_DIRTY_BYTES.with(|c| c.set(c.get() + self.dirty));
+                PENDING_OPLOG.with(|p| {
+                    let mut p = p.borrow_mut();
+                    let inner = std::mem::take(&mut *p);
+                    *p = std::mem::take(&mut self.oplog);
+                    p.extend(inner);
+                });
             }
         }
-        let _restore = Restore(ACTIVE_TXN_SESSION.with(|c| c.replace(std::ptr::null())));
+        let _restore = Restore {
+            session: ACTIVE_TXN_SESSION.with(|c| c.replace(std::ptr::null())),
+            minted: PENDING_MINTED.with(|p| std::mem::take(&mut *p.borrow_mut())),
+            dirty: PENDING_DIRTY_BYTES.with(|c| c.replace(0)),
+            in_sync: IN_SYNC_STMT.with(|f| f.replace(false)),
+            oplog: PENDING_OPLOG.with(|p| std::mem::take(&mut *p.borrow_mut())),
+            in_async: IN_ASYNC_STMT.with(|f| f.replace(false)),
+        };
         f()
     }
 
@@ -6300,6 +6410,260 @@ impl Storage {
             // `session` drops here → the dedicated WT session is closed.
         }
         Ok(())
+    }
+
+    // -- prepared (two-phase) transactions ----------------------------------
+    //
+    // PostgreSQL's PREPARE TRANSACTION parks a block's work under a gid so a
+    // later COMMIT PREPARED / ROLLBACK PREPARED -- from any connection, after
+    // the preparing one is gone, after a server restart -- resolves it. Two
+    // halves carry that here. The handle's WiredTiger transaction stays open
+    // in `prepared_xacts`, so while this process lives the writes are exactly
+    // as invisible and as locked as they were before the PREPARE, and the
+    // commit is the ordinary one. For the restart case the transaction's
+    // oplog entries -- its complete write set, DDL included -- are copied out
+    // of its own session (they are its uncommitted rows) into a durable row
+    // written on an autocommit session, and a commit that finds no live handle
+    // replays them through the ordinary write paths.
+
+    /// Park `handle`'s transaction under `gid`. Consumes the handle: the
+    /// caller's block is over, the work is neither committed nor discarded.
+    pub fn prepare_user_transaction(
+        &self,
+        mut handle: UserTransactionHandle,
+        gid: &str,
+        owner: &str,
+        database: &str,
+    ) -> Result<PreparedXact> {
+        let mut live = self.prepared_xacts.lock().unwrap_or_else(|e| e.into_inner());
+        if live.contains_key(gid) || self.read_prepared_row(gid)?.is_some() {
+            // The preparing transaction dies with the error, as it does in
+            // PostgreSQL: dropping the handle rolls it back.
+            return Err(StorageError::PreparedTransactionExists(gid.to_string()));
+        }
+        let ops = self.transaction_write_set(&mut handle)?;
+        // A transaction id for `pg_prepared_xacts.transaction`: one oplog seq,
+        // monotonic across restarts, never written (the merge tolerates the
+        // hole exactly as it does a rolled-back mint's).
+        let (xid, _) = self.mint_seq_and_ts(1, false);
+        let minted: Vec<Bson> = handle
+            .minted_ranges
+            .iter()
+            .flat_map(|(start, end)| [Bson::Int64(*start), Bson::Int64(*end)])
+            .collect();
+        let record = PreparedXact {
+            gid: gid.to_string(),
+            owner: owner.to_string(),
+            database: database.to_string(),
+            prepared: bson::DateTime::from_millis(now_millis()),
+            xid,
+        };
+        let row = bson::doc! {
+            "gid": gid,
+            "owner": owner,
+            "database": database,
+            "prepared": record.prepared,
+            "xid": xid,
+            "minted": minted,
+            "ops": ops
+                .into_iter()
+                .map(|blob| Bson::Binary(Binary { subtype: BinarySubtype::Generic, bytes: blob }))
+                .collect::<Vec<Bson>>(),
+        };
+        let session = self.conn.open_session()?;
+        let cur = session.open_cursor(PREPARED_XACT_TABLE, None)?;
+        cur.set_key_s(gid);
+        cur.set_value_u(&encode_doc(&row)?);
+        cur.insert()?;
+        drop(cur);
+        live.insert(gid.to_string(), handle);
+        Ok(record)
+    }
+
+    /// The transaction's oplog entries, in emit order, read back through its
+    /// own session (the rows are uncommitted, so no other session can see
+    /// them). Async oplog mode buffers them on the handle instead.
+    fn transaction_write_set(&self, handle: &mut UserTransactionHandle) -> Result<Vec<Vec<u8>>> {
+        if self.async_oplog.is_some() {
+            let mut out = Vec::with_capacity(handle.pending_async.len());
+            for (entry, _pre) in &handle.pending_async {
+                out.push(match entry {
+                    OplogEntry::Doc(d) => encode_doc(d)?,
+                    OplogEntry::Raw(buf) => buf.as_bytes().to_vec(),
+                });
+            }
+            return Ok(out);
+        }
+        let Some(session) = handle.session.as_ref() else {
+            return Err(StorageError::Internal("transaction already closed".into()));
+        };
+        let mut ranges = handle.minted_ranges.clone();
+        ranges.sort_unstable();
+        let mut out = Vec::new();
+        for (start, end) in ranges {
+            // Same routing as the emit: a batch lives whole in the shard its
+            // first seq selects.
+            let shard = oplog_shard_name(start.rem_euclid(oplog_route_shards()));
+            let cur = session.open_cursor(&shard, None)?;
+            for seq in start..end {
+                cur.reset()?;
+                cur.set_key_q(seq);
+                // Every seq of a minted range was written by the emit that
+                // minted it, so a miss is corruption, not a hole.
+                cur.search().map_err(|e| {
+                    StorageError::Internal(format!(
+                        "prepared transaction: oplog seq {seq} missing from {shard}: {e}"
+                    ))
+                })?;
+                out.push(cur.get_value_u()?);
+            }
+        }
+        Ok(out)
+    }
+
+    fn read_prepared_row(&self, gid: &str) -> Result<Option<Document>> {
+        let session = self.conn.open_session()?;
+        let cur = session.open_cursor(PREPARED_XACT_TABLE, None)?;
+        cur.set_key_s(gid);
+        match cur.search() {
+            Ok(()) => Ok(Some(decode_doc(&cur.get_value_u()?)?)),
+            Err(e) if e.is_not_found() => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn delete_prepared_row(session: &Session, gid: &str) -> Result<()> {
+        let cur = session.open_cursor(PREPARED_XACT_TABLE, None)?;
+        cur.set_key_s(gid);
+        match cur.remove() {
+            Ok(()) => Ok(()),
+            Err(e) if e.is_not_found() => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Every prepared transaction, oldest first -- `pg_prepared_xacts`.
+    pub fn list_prepared_xacts(&self) -> Result<Vec<PreparedXact>> {
+        let session = self.conn.open_session()?;
+        let cur = session.open_cursor(PREPARED_XACT_TABLE, None)?;
+        let mut out = Vec::new();
+        while cur.next()? {
+            let row = decode_doc(&cur.get_value_u()?)?;
+            out.push(PreparedXact::from_row(&row)?);
+        }
+        out.sort_by_key(|x| x.xid);
+        Ok(out)
+    }
+
+    /// Whether any of the sync-mode oplog seqs a prepared transaction minted
+    /// is readable: its rows commit with its data, so a visible one means the
+    /// transaction committed (a crash landed between that commit and the
+    /// row's removal).
+    fn prepared_already_committed(&self, row: &Document) -> Result<bool> {
+        if self.async_oplog.is_some() {
+            return Ok(false);
+        }
+        let Ok(minted) = row.get_array("minted") else {
+            return Ok(false);
+        };
+        let Some(Bson::Int64(start)) = minted.first() else {
+            return Ok(false);
+        };
+        let session = self.conn.open_session()?;
+        let shard = oplog_shard_name(start.rem_euclid(oplog_route_shards()));
+        let cur = match session.open_cursor(&shard, None) {
+            Ok(c) => c,
+            Err(e) if e.is_not_found() => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        cur.set_key_q(*start);
+        match cur.search() {
+            Ok(()) => Ok(true),
+            Err(e) if e.is_not_found() => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// `COMMIT PREPARED`. A transaction still open in this process commits as
+    /// it stands; one from a previous run of the process is rebuilt by
+    /// replaying its recorded write set inside a fresh transaction (which
+    /// removes the record in the same WiredTiger transaction, so the two land
+    /// or fail together).
+    pub fn commit_prepared(&self, gid: &str) -> Result<()> {
+        let live = self
+            .prepared_xacts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(gid);
+        if let Some(mut handle) = live {
+            // A failed commit is the transaction's death (see
+            // `commit_user_transaction`); the record stays, and the next
+            // COMMIT PREPARED replays it from there.
+            self.commit_user_transaction(&mut handle)?;
+            let session = self.conn.open_session()?;
+            return Self::delete_prepared_row(&session, gid);
+        }
+        let Some(row) = self.read_prepared_row(gid)? else {
+            return Err(StorageError::PreparedTransactionNotFound(gid.to_string()));
+        };
+        if self.prepared_already_committed(&row)? {
+            let session = self.conn.open_session()?;
+            return Self::delete_prepared_row(&session, gid);
+        }
+        let ops: Vec<Document> = row
+            .get_array("ops")
+            .map_err(|_| StorageError::Internal("prepared transaction record lacks ops".into()))?
+            .iter()
+            .map(|b| match b {
+                Bson::Binary(bin) => decode_doc(&bin.bytes),
+                _ => Err(StorageError::Internal(
+                    "prepared transaction record: malformed op".into(),
+                )),
+            })
+            .collect::<Result<_>>()?;
+        let mut handle = self.begin_user_transaction()?;
+        let applied = self.with_user_transaction(&mut handle, || -> Result<()> {
+            for op in &ops {
+                replay::apply_entry(self, op)?;
+            }
+            // Same transaction as the replayed writes: the row goes when they
+            // do, never before, never without them.
+            match self.op_session()? {
+                OpSession::Txn(session) => Self::delete_prepared_row(session, gid),
+                OpSession::Fresh(session) => Self::delete_prepared_row(&session, gid),
+            }
+        });
+        match applied.and_then(|r| r) {
+            Ok(()) => self.commit_user_transaction(&mut handle),
+            Err(e) => {
+                self.rollback_user_transaction(&mut handle)?;
+                Err(e)
+            }
+        }
+    }
+
+    /// `ROLLBACK PREPARED`: discard the transaction, live or recorded.
+    pub fn rollback_prepared(&self, gid: &str) -> Result<()> {
+        let live = self
+            .prepared_xacts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(gid);
+        let session = self.conn.open_session()?;
+        if let Some(mut handle) = live {
+            self.rollback_user_transaction(&mut handle)?;
+            return Self::delete_prepared_row(&session, gid);
+        }
+        let Some(row) = self.read_prepared_row(gid)? else {
+            return Err(StorageError::PreparedTransactionNotFound(gid.to_string()));
+        };
+        if self.prepared_already_committed(&row)? {
+            return Err(StorageError::Internal(format!(
+                "prepared transaction \"{gid}\" already committed before the last shutdown; \
+                 COMMIT PREPARED clears it"
+            )));
+        }
+        Self::delete_prepared_row(&session, gid)
     }
 
     /// Insert one BSON-encoded document. Assigns an `ObjectId` `_id` if absent.
