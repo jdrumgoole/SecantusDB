@@ -362,6 +362,11 @@ fn code_name_for(code: i32) -> &'static str {
         10334 => "BSONObjectTooLarge",
         11000 => "DuplicateKey",
         66 => "ImmutableField",
+        // Every unknown-expression error carries this, and a table miss renders
+        // the generic `Location168`. Measured 8.2.11 (2026-09-17) across 13
+        // shapes in `tools/probes/unknown_expression_errors.py`, where it was
+        // the only remaining difference on nine of them.
+        168 => "InvalidPipelineOperator",
         _ => "Location",
     }
 }

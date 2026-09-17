@@ -119,6 +119,13 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     if let Err(e) = validate_project_exprs(&pipeline) {
         return Ok(e.into_reply());
     }
+    // Everywhere the projection parser does NOT own, an unknown operator is
+    // mongod's 168 with that position's envelope -- not the blanket "not
+    // supported by the Rust server", which told the client the server cannot do
+    // `$addFields` when the operator inside it was the problem.
+    if let Err(e) = validate_unknown_exprs(&pipeline) {
+        return Ok(e.into_reply());
+    }
     // An undefined `$$variable` is a PARSE error for mongod: it fires on an
     // EMPTY collection, where nothing is ever evaluated, so no amount of engine
     // work could produce it. Checked here, once, before the pipeline runs.
@@ -556,7 +563,12 @@ fn validate_project_exprs(pipeline: &[Bson]) -> Result<(), CommandError> {
                     }
                 }
             }
-            if let Some(op) = secantus_core::expressions::first_unknown_expr_operator(value) {
+            // TOP LEVEL only. This used to recurse, which gave 31325 to a
+            // nested unknown as well -- mongod answers 168 there, because the
+            // projection parser owns only the field's own value and anything
+            // deeper belongs to the generic expression parser. Measured 8.2.11,
+            // 2026-09-17; `validate_unknown_exprs` picks up the nested case.
+            if let Some(op) = secantus_core::expressions::top_level_unknown_expr_operator(value) {
                 return Err(CommandError::new(
                     31325,
                     "Location31325",
@@ -566,6 +578,72 @@ fn validate_project_exprs(pipeline: &[Bson]) -> Result<(), CommandError> {
         }
     }
     Ok(())
+}
+
+/// An unknown expression operator anywhere the PROJECTION parser does not own,
+/// reported as mongod's `168` with the envelope that position carries.
+///
+/// Runs after [`validate_project_exprs`], which takes the top-level value of a
+/// `$project` field (its own `31325`). Everything else is the generic
+/// expression parser's, and mongod's envelope depends on the stage (probed
+/// 8.2.11, 2026-09-17):
+///
+/// ```text
+/// $project / $addFields / $set   Invalid $<stage> :: caused by :: Unrecognized expression '$x'
+/// $group / $replaceWith / $expr  Unrecognized expression '$x'        -- no envelope at all
+/// ```
+///
+/// Only `$group`'s `_id` is walked. Its other fields are ACCUMULATOR position,
+/// where `$push` / `$topN` / `$count` are valid and are absent from
+/// `KNOWN_EXPR_OPS` precisely because they are not expressions -- walking them
+/// would reject `{$group: {_id: "$g", p: {$push: "$s"}}}`, the plainest valid
+/// pipeline there is. The Python server hit exactly that; see
+/// `aggregate._expression_problem`.
+fn validate_unknown_exprs(pipeline: &[Bson]) -> Result<(), CommandError> {
+    const WRAPPED: [&str; 3] = ["$project", "$addFields", "$set"];
+    for stage in pipeline {
+        let Some(d) = stage.as_document() else {
+            continue;
+        };
+
+        for name in WRAPPED {
+            let Some(spec) = d.get(name).and_then(Bson::as_document) else {
+                continue;
+            };
+            for (_field, value) in spec.iter() {
+                if let Some(op) = secantus_core::expressions::first_unknown_expr_operator(value) {
+                    return Err(unknown_expr_error(Some(name), &op));
+                }
+            }
+        }
+
+        // Bare positions: the message goes to the client with no wrapper.
+        let bare = [
+            d.get("$group")
+                .and_then(Bson::as_document)
+                .and_then(|g| g.get("_id")),
+            d.get("$replaceWith"),
+            d.get("$match")
+                .and_then(Bson::as_document)
+                .and_then(|m| m.get("$expr")),
+        ];
+        for value in bare.into_iter().flatten() {
+            if let Some(op) = secantus_core::expressions::first_unknown_expr_operator(value) {
+                return Err(unknown_expr_error(None, &op));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// mongod's unknown-expression error, with `stage`'s envelope when it has one.
+fn unknown_expr_error(stage: Option<&str>, op: &str) -> CommandError {
+    let message = format!("Unrecognized expression '{op}'");
+    let message = match stage {
+        Some(name) => format!("Invalid {name} :: caused by :: {message}"),
+        None => message,
+    };
+    CommandError::new(168, crate::util::error_code_name(168), message)
 }
 
 fn validate_stage_names(pipeline: &[Bson]) -> Result<(), CommandError> {

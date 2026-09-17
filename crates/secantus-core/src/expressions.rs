@@ -1103,6 +1103,33 @@ pub const KNOWN_EXPR_OPS: &[&str] = &[
     "$rand",
 ];
 
+/// An unknown `$`-operator at the TOP LEVEL of `expr`, without recursing.
+///
+/// The position matters because mongod answers two different codes for the
+/// same `$project` (probed 8.2.11, 2026-09-17):
+///
+/// ```text
+/// {$project: {n: {$nosuch: 1}}}               31325 ... Unknown expression $nosuch
+/// {$project: {n: {$add: [{$nosuch: 1}, 1]}}}    168 ... Unrecognized expression '$nosuch'
+/// ```
+///
+/// The top-level value of a `$project` field is parsed by the PROJECTION
+/// parser, which owns 31325; anything deeper belongs to the generic expression
+/// parser and its 168. [`first_unknown_expr_operator`] recurses and so cannot
+/// tell those apart -- using it for the 31325 check labelled the nested case
+/// 31325 as well, which is what this exists to stop.
+pub fn top_level_unknown_expr_operator(expr: &Bson) -> Option<String> {
+    let d = expr.as_document()?;
+    if d.len() != 1 {
+        return None;
+    }
+    let (key, _) = d.iter().next()?;
+    if !key.starts_with('$') || KNOWN_EXPR_OPS.contains(&key.as_str()) {
+        return None;
+    }
+    Some(key.clone())
+}
+
 /// The first `$`-prefixed expression operator in `expr` (recursing through
 /// arrays and nested single-key operator documents) that this engine does not
 /// recognise, e.g. `$notreal` for `{$notreal: [1, 2]}`. mongod rejects an
