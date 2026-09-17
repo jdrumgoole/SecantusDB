@@ -4626,6 +4626,13 @@ def test_timestamptz_columns_render_in_session_zone(home: Path) -> None:
             cur.execute("select t from tz where id = 1")
             assert cur.fetchone()[0].isoformat() == iso, zone
 
+        # `t::text` renders the instant in the session zone WITH its offset --
+        # the column's declared type drives the cast, not the stored carrier
+        # (a UTC instant, the same as a `timestamp`'s). Measured PG 16.
+        cur.execute("set timezone = 'Europe/Berlin'")
+        cur.execute("select t::text from tz where id = 1")
+        assert cur.fetchone() == ("2026-01-01 13:00:00+01",)
+
         # Sub-millisecond precision survives the instant round-trip.
         cur.execute("set timezone = 'UTC'")
         cur.execute("select t from tz where id = 2")
@@ -8719,3 +8726,312 @@ def test_truncate_matches_postgres(home: Path) -> None:
         assert conn.execute("truncate tp cascade").statusmessage == "TRUNCATE TABLE"
         assert notices == ['truncate cascades to table "tc"']
         assert conn.execute("select count(*) from tc").fetchone() == (0,)
+
+
+def test_create_extension_hstore_installs_the_type_and_its_io(home: Path) -> None:
+    """`CREATE EXTENSION hstore` brings the `hstore` type with PostgreSQL's
+    text I/O and binary send/recv, a `pg_extension` row, and refusals shaped
+    as 16's: an unknown extension is 0A000, a repeat 42710 (a NOTICE under IF
+    NOT EXISTS), the type cannot be dropped on its own (2BP01, "extension
+    hstore requires it"), and the extension cannot be dropped while a column
+    uses it (2BP01 with the column in DETAIL). All measured on 16 / hstore 1.8.
+    """
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        cur = conn.cursor()
+        notices = _notices(conn)
+        with pytest.raises(psycopg.errors.FeatureNotSupported) as exc:
+            cur.execute("create extension nosuch")
+        assert _diag(exc.value)[:2] == ("0A000", 'extension "nosuch" is not available')
+        cur.execute("create extension hstore")
+        assert cur.statusmessage == "CREATE EXTENSION"
+        with pytest.raises(psycopg.errors.DuplicateObject) as exc:
+            cur.execute("create extension hstore")
+        assert _diag(exc.value)[:2] == ("42710", 'extension "hstore" already exists')
+        cur.execute("create extension if not exists hstore")
+        assert notices[-1][2] == 'extension "hstore" already exists, skipping'
+        cur.execute("select extname, extversion from pg_extension order by extname")
+        assert cur.fetchall() == [("hstore", "1.8"), ("plpgsql", "1.0")]
+
+        # Text I/O: PostgreSQL's canonical `"k"=>"v"` rendering, duplicate
+        # keys resolved first-wins, keys ordered by length then bytes.
+        cur.execute(
+            "select null::hstore, ''::hstore, 'a => b'::hstore,"
+            """ 'bb=>1, a=>2, a=>3, "x y"=>NULL'::hstore"""
+        )
+        assert cur.fetchone() == (None, "", '"a"=>"b"', '"a"=>"2", "bb"=>"1", "x y"=>NULL')
+        with pytest.raises(psycopg.errors.SyntaxError) as exc:
+            cur.execute("select 'a=>'::hstore")
+        assert _diag(exc.value)[1] == "syntax error in hstore: unexpected end of string"
+
+        # psycopg's own adapter over TypeInfo.fetch, in both formats.
+        info = psycopg.types.TypeInfo.fetch(conn, "hstore")
+        assert info.name == "hstore"
+        assert info.array_oid == info.oid + 100_000
+        from psycopg.types.hstore import register_hstore
+
+        register_hstore(info, conn)
+        for fmt in (psycopg.pq.Format.TEXT, psycopg.pq.Format.BINARY):
+            c = conn.cursor(binary=fmt)
+            sample = {"a": "1", "b": None, "c d": '"q"'}
+            c.execute("select %s, %s", (sample, [sample, {}]))
+            assert c.fetchone() == (sample, [sample, {}])
+            c.execute("select pg_typeof(%s)::text", (sample,))
+            assert c.fetchone() == ("hstore",)
+        cur.execute("select hstore('k', 'v'), akeys('b=>1, a=>2'), 'a=>1'::hstore -> 'a'")
+        assert cur.fetchone() == ('"k"=>"v"', ["a", "b"], "1")
+        # The operators, measured against PostgreSQL 16 / hstore 1.8. A bare
+        # literal beside an hstore IS an hstore (`h - 'a=>1'`), a key needs
+        # `::text`.
+        cur.execute("create table hs_ops (h hstore)")
+        cur.execute("insert into hs_ops values ('a=>1, b=>NULL')")
+        cur.execute(
+            "select h ? 'a', h ?| array['zz','b'], h ?& array['a','zz'], h @> 'a=>1',"
+            " 'a=>1'::hstore <@ h, h - array['a'], h - 'a=>1'::hstore, h - 'b=>9'::hstore,"
+            " h - 'a'::text, h || 'c=>3, a=>7', h -> array['b','zz'],"
+            " pg_typeof(h - 'a'::text)::text, pg_typeof(h || h)::text, h - 'a=>1',"
+            " h -> 'zz', h -> 'a'"
+            " from hs_ops"
+        )
+        assert cur.fetchone() == (
+            True,
+            True,
+            False,
+            True,
+            True,
+            '"b"=>NULL',
+            '"b"=>NULL',
+            '"a"=>"1", "b"=>NULL',
+            '"b"=>NULL',
+            '"a"=>"7", "b"=>NULL, "c"=>"3"',
+            [None, None],
+            "hstore",
+            "hstore",
+            '"b"=>NULL',
+            None,
+            "1",
+        )
+        cur.execute("drop table hs_ops")
+
+        with pytest.raises(psycopg.errors.DependentObjectsStillExist) as exc:
+            cur.execute("drop type hstore")
+        assert _diag(exc.value)[:2] == (
+            "2BP01",
+            "cannot drop type hstore because extension hstore requires it",
+        )
+        cur.execute("create table hs_t (h hstore)")
+        cur.execute("""insert into hs_t values ('x=>y')""")
+        with pytest.raises(psycopg.errors.DependentObjectsStillExist) as exc:
+            cur.execute("drop extension hstore")
+        assert _diag(exc.value)[:2] == (
+            "2BP01",
+            "cannot drop extension hstore because other objects depend on it",
+        )
+        assert exc.value.diag.message_detail == "column h of table hs_t depends on type hstore"
+        cur.execute("drop table hs_t")
+        cur.execute("drop extension hstore")
+        assert cur.statusmessage == "DROP EXTENSION"
+        with pytest.raises(psycopg.errors.UndefinedObject) as exc:
+            cur.execute("drop extension hstore")
+        assert _diag(exc.value)[:2] == ("42704", 'extension "hstore" does not exist')
+        cur.execute("drop extension if exists hstore")
+        assert notices[-1][2] == 'extension "hstore" does not exist, skipping'
+        # Without the extension the type and its functions are gone.
+        with pytest.raises(psycopg.errors.Error):
+            cur.execute("select 'a=>b'::hstore")
+        with pytest.raises(psycopg.errors.Error):
+            cur.execute("select hstore('a', 'b')")
+
+
+def test_create_extension_postgis_brings_geometry_as_ewkb(home: Path) -> None:
+    """`CREATE EXTENSION postgis` brings `geometry`: hex-EWKB text (what
+    PostGIS 3.4.6 renders), EWKB binary in both directions, WKT / EWKT input,
+    `ST_GeomFromGeoJSON` (SRID 4326 unless the JSON names a CRS), `ST_AsText`
+    / `ST_AsEWKT` / `ST_SRID` / `ST_GeomFromText`, and a geometry column that
+    round-trips through a table. Storage is the EWKB, opaque to the planner.
+    """
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        cur = conn.cursor()
+        cur.execute("create extension postgis")
+        cur.execute("select typname, typdelim from pg_type where typname = 'geometry'")
+        assert cur.fetchone() == ("geometry", ":")
+        cur.execute(
+            "select 'POINT(1 2)'::geometry, 'SRID=4326;POINT(1 2)'::geometry, "
+            "ST_AsText('0101000000000000000000F03F0000000000000040'::geometry), "
+            "ST_AsEWKT(ST_GeomFromText('LINESTRING(0 0, 1 1)', 4326)), "
+            'ST_SRID(ST_GeomFromGeoJSON(\'{"type":"Point","coordinates":[1,2]}\')), '
+            "ST_AsEWKT(ST_GeomFromGeoJSON("
+            '\'{"type":"MultiPolygon","coordinates":[[[[0,0],[1,0],[1,1],[0,0]]]]}\')), '
+            "pg_typeof('POINT(1 2)'::geometry)::text"
+        )
+        assert cur.fetchone() == (
+            "0101000000000000000000F03F0000000000000040",
+            "0101000020E6100000000000000000F03F0000000000000040",
+            "POINT(1 2)",
+            "SRID=4326;LINESTRING(0 0,1 1)",
+            4326,
+            "SRID=4326;MULTIPOLYGON(((0 0,1 0,1 1,0 0)))",
+            "geometry",
+        )
+        with pytest.raises(psycopg.errors.InternalError_) as exc:
+            cur.execute("select 'POINT(1)'::geometry")
+        assert _diag(exc.value)[:2] == ("XX000", "parse error - invalid geometry")
+
+        cur.execute("create table sample_geoms (id serial primary key, geom geometry)")
+        cur.execute("insert into sample_geoms (geom) values ('POINT(0 0)'), (null)")
+        info = psycopg.types.TypeInfo.fetch(conn, "geometry")
+        assert info.name == "geometry"
+        from psycopg.types.shapely import register_shapely
+        from shapely.geometry import Point
+
+        register_shapely(info, conn)
+        for fmt in (psycopg.pq.Format.TEXT, psycopg.pq.Format.BINARY):
+            c = conn.cursor(binary=fmt)
+            c.execute(
+                "insert into sample_geoms (geom) values (%s) returning geom", (Point(1.5, 2),)
+            )
+            assert c.fetchone()[0] == Point(1.5, 2)
+            c.execute("select geom from sample_geoms order by id")
+            rows = [r[0] for r in c.fetchall()]
+            assert rows[0] == Point(0, 0)
+            assert rows[1] is None
+            assert rows[-1] == Point(1.5, 2)
+        with pytest.raises(psycopg.errors.DependentObjectsStillExist) as exc:
+            cur.execute("drop extension postgis")
+        assert exc.value.diag.message_detail == (
+            "column geom of table sample_geoms depends on type geometry"
+        )
+        cur.execute("drop table sample_geoms")
+        cur.execute("drop extension postgis")
+        cur.execute("select extname from pg_extension")
+        assert cur.fetchall() == [("plpgsql",)]
+
+
+def test_create_role_records_the_role_and_its_verifier(home: Path) -> None:
+    """`CREATE / ALTER / DROP ROLE` (and their `USER` spellings) keep a
+    cluster-wide role catalog: `pg_roles` / `pg_user` mask every password as
+    `********`, `pg_authid` carries the SCRAM-SHA-256 verifier a plaintext
+    `PASSWORD` derives (4096 iterations, as `password_encryption =
+    scram-sha-256` does) or the verifier a client sent verbatim, `PASSWORD
+    NULL` clears it, and the errors and notices are PostgreSQL 16's: 42710,
+    42704 (and the IF EXISTS notice), 2BP01 for the bootstrap superuser,
+    55006 for the session's own user, 22007 for a bad `VALID UNTIL`. A
+    multi-name DROP is all or nothing. Passwords are recorded, never checked:
+    every connection is still trusted.
+    """
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        cur = conn.cursor()
+        notices = _notices(conn)
+        cur.execute("create user ashesh login password 'psycopg2'")
+        assert cur.statusmessage == "CREATE ROLE"
+        with pytest.raises(psycopg.errors.DuplicateObject) as exc:
+            cur.execute("create role ashesh")
+        assert _diag(exc.value)[:2] == ("42710", 'role "ashesh" already exists')
+        cur.execute(
+            "create role r2 superuser createdb createrole noinherit"
+            " connection limit 3 valid until '2030-01-01'"
+        )
+        cur.execute(
+            "select oid, rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb,"
+            " rolcanlogin, rolreplication, rolconnlimit, rolpassword, rolvaliduntil::text,"
+            " rolbypassrls, rolconfig from pg_roles order by oid"
+        )
+        rows = cur.fetchall()
+        assert rows[0] == (
+            10,
+            "postgres",
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            -1,
+            "********",
+            None,
+            True,
+            None,
+        )
+        assert [r[1:] for r in rows[1:]] == [
+            ("ashesh", False, True, False, False, True, False, -1, "********", None, False, None),
+            (
+                "r2",
+                True,
+                False,
+                True,
+                True,
+                False,
+                False,
+                3,
+                "********",
+                "2030-01-01 00:00:00+00",
+                False,
+                None,
+            ),
+        ]
+        assert rows[1][0] > 16384 and rows[2][0] > rows[1][0]
+        cur.execute("select usename, usesuper, passwd from pg_user order by usesysid")
+        assert cur.fetchall() == [("postgres", True, "********"), ("ashesh", False, "********")]
+
+        cur.execute("select rolpassword from pg_authid where rolname = 'ashesh'")
+        verifier = cur.fetchone()[0]
+        assert verifier.startswith("SCRAM-SHA-256$4096:")
+        cur.execute("alter user ashesh password NULL")
+        assert cur.statusmessage == "ALTER ROLE"
+        cur.execute("select rolpassword from pg_authid where rolname = 'ashesh'")
+        assert cur.fetchone() == (None,)
+        # What libpq's PQchangePassword sends: a client-side verifier, kept.
+        # It is inlined as a literal -- `PASSWORD $1` is a syntax error on
+        # PostgreSQL (gram.y takes only a string constant there).
+        sent = "SCRAM-SHA-256$4096:c2FsdA==$c3RvcmVk:c2VydmVy"
+        with pytest.raises(psycopg.errors.SyntaxError) as exc:
+            cur.execute("alter user ashesh password %s", (sent,))
+        assert _diag(exc.value)[:2] == ("42601", 'syntax error at or near "$1"')
+        from psycopg import sql
+
+        cur.execute(sql.SQL("alter user ashesh password {}").format(sql.Literal(sent)))
+        cur.execute("select rolpassword from pg_authid where rolname = 'ashesh'")
+        assert cur.fetchone() == (sent,)
+        cur.execute("create role emptypw password ''")
+        assert notices[-1][2] == "empty string is not a valid password, clearing password"
+        cur.execute("alter role r2 valid until 'infinity' nocreatedb")
+        cur.execute("select rolvaliduntil::text, rolcreatedb from pg_roles where rolname = 'r2'")
+        assert cur.fetchone() == ("infinity", False)
+        with pytest.raises(psycopg.errors.InvalidDatetimeFormat) as exc:
+            cur.execute("create role badvu valid until 'nonsense'")
+        assert _diag(exc.value)[:2] == (
+            "22007",
+            'invalid input syntax for type timestamp with time zone: "nonsense"',
+        )
+
+        with pytest.raises(psycopg.errors.UndefinedObject) as exc:
+            cur.execute("alter user nosuch password 'x'")
+        assert _diag(exc.value)[:2] == ("42704", 'role "nosuch" does not exist')
+        with pytest.raises(psycopg.errors.UndefinedObject):
+            cur.execute("drop user nosuch")
+        cur.execute("drop user if exists nosuch")
+        assert notices[-1][2] == 'role "nosuch" does not exist, skipping'
+        with pytest.raises(psycopg.errors.DependentObjectsStillExist) as exc:
+            cur.execute("drop role postgres")
+        assert _diag(exc.value)[:2] == (
+            "2BP01",
+            "cannot drop role postgres because it is required by the database system",
+        )
+        # The session's own user exists (it connected) even with no record.
+        cur.execute("alter user test password 'x'")
+        with pytest.raises(psycopg.errors.ObjectInUse) as exc:
+            cur.execute("drop role test")
+        assert _diag(exc.value)[:2] == ("55006", "current user cannot be dropped")
+        with pytest.raises(psycopg.errors.UndefinedObject):
+            cur.execute("drop role ashesh, nosuch")
+        cur.execute("select count(*) from pg_roles where rolname = 'ashesh'")
+        assert cur.fetchone() == (1,)
+        cur.execute("drop role ashesh, r2, emptypw")
+        assert cur.statusmessage == "DROP ROLE"
+        # Another session's user can drop it: 55006 is about the CURRENT user.
+        with psycopg.connect(
+            f"host=127.0.0.1 port={server.port} dbname=postgres user=postgres",
+            autocommit=True,
+        ) as other:
+            other.execute("drop role test")
+        cur.execute("select rolname from pg_roles")
+        assert cur.fetchall() == [("postgres",)]

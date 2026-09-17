@@ -25,6 +25,10 @@ secantus-core = { path = "../secantus-core" }
 secantus-pgcatalog = { path = "../secantus-pgcatalog" }
 secantus-pgplan = { path = "../secantus-pgplan" }
 secantus-storage = { path = "../secantus-storage" }
+# The SCRAM-SHA-256 verifier `CREATE ROLE ... PASSWORD` stores, derived as
+# PostgreSQL derives it. Recorded, not checked: every connection is trusted.
+secantus-auth = { path = "../secantus-auth" }
+rand = "0.9"
 # "termination" so SIGTERM is caught too, not just SIGINT: a supervisor or a
 # test harness stops the daemon with SIGTERM, and an uncaught one skips the
 # WiredTiger close entirely -- which loses acknowledged writes.

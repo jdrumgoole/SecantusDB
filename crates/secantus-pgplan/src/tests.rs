@@ -3114,17 +3114,86 @@ fn integer_arithmetic_over_casts_types_from_the_operands() {
     }
 }
 
-/// `ALTER ROLE` / `ALTER USER` plan to the role they name; whether it exists
-/// is the executor's question.
+/// `ALTER ROLE` / `ALTER USER` plan to the role they name and the options
+/// given; whether the role exists is the executor's question.
 #[test]
 fn alter_role_names_its_role() {
-    for sql in [
-        "ALTER USER \"ashesh\" PASSWORD 'x'",
-        "ALTER ROLE ashesh WITH LOGIN",
-    ] {
-        match plan_ok(sql) {
-            Statement::AlterRole(name) => assert_eq!(name, "ashesh", "{sql}"),
-            other => panic!("{sql}: {other:?}"),
+    match plan_ok("ALTER USER \"ashesh\" PASSWORD 'x'") {
+        Statement::AlterRole { name, options } => {
+            assert_eq!(name, "ashesh");
+            assert_eq!(options.password, Some(Some("x".into())));
+            assert_eq!(options.login, None);
         }
+        other => panic!("{other:?}"),
+    }
+    match plan_ok("ALTER ROLE ashesh WITH LOGIN PASSWORD NULL") {
+        Statement::AlterRole { name, options } => {
+            assert_eq!(name, "ashesh");
+            assert_eq!(options.login, Some(true));
+            assert_eq!(options.password, Some(None));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// `CREATE USER` is `CREATE ROLE` with LOGIN on; `NOLOGIN` and the other
+/// attribute words set their flags; DROP takes several names and IF EXISTS.
+#[test]
+fn role_statements_plan() {
+    match plan_ok("CREATE USER ashesh LOGIN PASSWORD 'psycopg2'") {
+        Statement::CreateRole { name, options } => {
+            assert_eq!(name, "ashesh");
+            assert_eq!(options.login, Some(true));
+            assert_eq!(options.password, Some(Some("psycopg2".into())));
+        }
+        other => panic!("{other:?}"),
+    }
+    match plan_ok("CREATE USER u2") {
+        Statement::CreateRole { options, .. } => assert_eq!(options.login, Some(true)),
+        other => panic!("{other:?}"),
+    }
+    match plan_ok("CREATE ROLE r1 SUPERUSER CREATEDB NOINHERIT CONNECTION LIMIT 5") {
+        Statement::CreateRole { options, .. } => {
+            assert_eq!(options.login, None);
+            assert_eq!(options.superuser, Some(true));
+            assert_eq!(options.createdb, Some(true));
+            assert_eq!(options.inherit, Some(false));
+            assert_eq!(options.connection_limit, Some(5));
+        }
+        other => panic!("{other:?}"),
+    }
+    match plan_ok("DROP USER IF EXISTS a, \"B\"") {
+        Statement::DropRole { names, if_exists } => {
+            assert_eq!(names, vec!["a".to_string(), "B".to_string()]);
+            assert!(if_exists);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// `CREATE / DROP EXTENSION` carry the name and the IF [NOT] EXISTS flag.
+#[test]
+fn extension_statements_plan() {
+    match plan_ok("CREATE EXTENSION IF NOT EXISTS hstore") {
+        Statement::CreateExtension {
+            name,
+            if_not_exists,
+        } => {
+            assert_eq!(name, "hstore");
+            assert!(if_not_exists);
+        }
+        other => panic!("{other:?}"),
+    }
+    match plan_ok("DROP EXTENSION postgis CASCADE") {
+        Statement::DropExtension {
+            names,
+            if_exists,
+            cascade,
+        } => {
+            assert_eq!(names, vec!["postgis".to_string()]);
+            assert!(!if_exists);
+            assert!(cascade);
+        }
+        other => panic!("{other:?}"),
     }
 }
