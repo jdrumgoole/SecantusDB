@@ -26,17 +26,18 @@ See ``docs/concurrency.md`` for the full architectural ceiling story.
 from __future__ import annotations
 
 import contextlib
+import re
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
 import pytest
-from bench.concurrency import _parse_writer_log, _wait_listen
+from bench.concurrency import _parse_writer_log
 
 # Single-writer floor we expect per-writer when scaling is healthy.
 # A writer that gets shut out completely by lock contention will
@@ -49,14 +50,19 @@ _MIN_SCALING_RATIO = 0.7
 _DURATION_S = 5.0
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+def _spawn_server(storage: Path) -> tuple[subprocess.Popen[str], int]:
+    """Start a server on a KERNEL-assigned port and read the port back.
 
-
-def _spawn_server(port: int, storage: Path) -> subprocess.Popen[bytes]:
-    return subprocess.Popen(
+    Probing for a free port and passing it to the child cannot be made safe:
+    the probe socket has to close before the child binds, so under `-n auto`
+    two workers can be handed the same port. The loser's child exits "address
+    already in use" -- but a liveness probe fired in that gap connects to the
+    WINNER'S server, and the caller then measures a server it does not own.
+    That race broke `pg-oracle` on 2026-09-09; it is fixed there by binding 0
+    and reading the port back, and this is the same fix. The server logs the
+    address it bound at INFO, which is where the port comes from.
+    """
+    proc = subprocess.Popen(
         [
             sys.executable,
             "-m",
@@ -64,16 +70,29 @@ def _spawn_server(port: int, storage: Path) -> subprocess.Popen[bytes]:
             "--host",
             "127.0.0.1",
             "--port",
-            str(port),
+            "0",
             "--storage-path",
             str(storage),
             "--log-level",
-            "WARNING",
+            "INFO",
         ],
         stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
     )
+    line: list[str] = []
+    reader = threading.Thread(
+        target=lambda: line.append(proc.stdout.readline() if proc.stdout else ""),
+        daemon=True,
+    )
+    reader.start()
+    reader.join(30)
+    match = re.search(r"listening on \S+:(\d+)", line[0] if line else "")
+    if not match:
+        proc.terminate()
+        raise RuntimeError(f"server didn't come up: {line!r}")
+    return proc, int(match.group(1))
 
 
 def _spawn_writers(uri: str, n: int, batch: int) -> list[tuple[subprocess.Popen[bytes], Path]]:
@@ -159,10 +178,8 @@ def test_two_writers_scale_above_single_writer(tmp_path) -> None:
     fail the suite, but the surprise is worth investigating.
     """
     storage = tmp_path / "wt"
-    port = _free_port()
-    server = _spawn_server(port, storage)
+    server, port = _spawn_server(storage)
     try:
-        assert _wait_listen("127.0.0.1", port, timeout=30), "server didn't come up"
         uri = f"mongodb://127.0.0.1:{port}/"
 
         rate_1 = _measure(uri, n=1)
