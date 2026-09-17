@@ -15160,7 +15160,7 @@ input order where PostgreSQL sorts keys (shorter first, then bytewise). Note
 `json` is CORRECT to keep the input order — only `jsonb` sorts, so a fix must
 not apply to both.
 
-## Probe-a-free-port race in test harnesses (2026-09-10) — two fixed, one left
+## Probe-a-free-port race in test harnesses (2026-09-10) — FIXED
 
 `_free_port()` binds a socket, reads the port, and closes it — so the port is
 unbound between being chosen and being used. Under `pytest -n auto` two workers
@@ -15182,9 +15182,11 @@ Seen for real: `pg-oracle` failed on 2026-09-09 with
   asserts its own child is still alive once the ping succeeds. A child that
   lost the race has exited by then, so the gate fails loudly instead of
   silently comparing against a mongod it does not own.
-- `tests/test_concurrency.py` — **still exposed**, deliberately left. It is
-  `perf`-marked, so the default suite excludes it and only one test uses the
-  port; the same alive-after-ready guard would apply if it ever bites.
+- `tests/test_concurrency.py` — **fixed the same way** as the pgserver one.
+  The Python server logs the address it bound at INFO, so the harness starts it
+  on `--port 0` and reads the port back; no product change was needed. (It is
+  `slow`-marked, not `perf` as first recorded here, so `-m perf` deselects it —
+  run it with `-o addopts=`. Verified: it runs and reports a scaling ratio.)
 
 The general rule: **have the server report the port it bound; never hand it
 one you probed.** Any scheme that probes and passes the number has this
