@@ -939,6 +939,15 @@ fn map_err(e: WtError) -> StorageError {
             exec: false,
         },
         // Change-stream faults don't arise on the CRUD path; map to internal.
+        // Two-phase commit is a PostgreSQL-server concept; the MongoDB-facing
+        // adapter never prepares a transaction, so these can only arrive as an
+        // internal inconsistency. Carry the message rather than losing it.
+        WtError::PreparedTransactionExists(gid) => StorageError::Internal(format!(
+            "transaction identifier \"{gid}\" is already in use"
+        )),
+        WtError::PreparedTransactionNotFound(gid) => StorageError::Internal(format!(
+            "prepared transaction with identifier \"{gid}\" does not exist"
+        )),
         WtError::ChangeStreamFatal(m) | WtError::Internal(m) => StorageError::Internal(m),
         WtError::Wt(err) => StorageError::Internal(format!("WiredTiger error: {err:?}")),
         WtError::Bson(m) => StorageError::Internal(format!("BSON error: {m}")),
