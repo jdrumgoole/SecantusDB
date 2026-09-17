@@ -128,3 +128,6 @@ faulthandler-dumps/
 # results can still be force-added; ad-hoc runs stay out of the tree.
 bench/.do-state/
 bench/results/do/
+
+# Detached long-run state (scripts/detached_run.py)
+.detached-runs/
