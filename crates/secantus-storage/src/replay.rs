@@ -115,6 +115,18 @@ fn apply_command(storage: &Storage, db: &str, o: &Document) -> Result<()> {
 /// Apply one oplog entry to `storage`. Returns `Ok(true)` if it mutated state.
 /// `storage` must have oplog emission disabled so the write paths don't re-emit.
 pub fn apply_entry(storage: &Storage, entry: &Document) -> Result<bool> {
+    apply_entry_with(storage, entry, false)
+}
+
+/// `apply_entry` for a `COMMIT PREPARED` replay, where a write the live
+/// transaction could not have made is an error, not something to tolerate:
+/// an insert whose key now exists fails the commit (the record stays for a
+/// `ROLLBACK PREPARED`). The PITR replay above keeps its tolerant shape.
+pub fn apply_entry_strict(storage: &Storage, entry: &Document) -> Result<bool> {
+    apply_entry_with(storage, entry, true)
+}
+
+fn apply_entry_with(storage: &Storage, entry: &Document, strict: bool) -> Result<bool> {
     let op = entry.get_str("op").unwrap_or("");
     if op == "n" {
         return Ok(false); // periodic noop — changes nothing
@@ -136,7 +148,11 @@ pub fn apply_entry(storage: &Storage, entry: &Document) -> Result<bool> {
             let mut buf = Vec::new();
             o.to_writer(&mut buf)
                 .map_err(|e| StorageError::Bson(e.to_string()))?;
-            storage.insert(&db, &coll, vec![buf], true)?;
+            if strict {
+                storage.insert_one(&db, &coll, &buf)?;
+            } else {
+                storage.insert(&db, &coll, vec![buf], true)?;
+            }
             Ok(true)
         }
         "u" => {

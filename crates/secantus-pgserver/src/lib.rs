@@ -49,7 +49,7 @@ use secantus_pgplan::{
     Error as PlanError, Nulls, OrderKey, OutputCol, Statement, TransactionControl,
     TransactionModes,
 };
-use secantus_storage::{Storage, UserTransactionHandle};
+use secantus_storage::{Storage, StorageError, UserTransactionHandle};
 
 /// One live backend as the OTHER backends -- and a `CancelRequest` -- see it.
 ///
@@ -578,6 +578,12 @@ pub struct PgHandler {
     pending_notifies: Mutex<Vec<(String, String)>>,
     /// LISTEN / UNLISTENs of the open transaction, applied at commit.
     pending_listens: Mutex<Vec<ListenOp>>,
+    /// The open block touched a temporary table (any access, a SELECT
+    /// included): PostgreSQL refuses to PREPARE such a transaction.
+    touched_temp: AtomicBool,
+    /// The open block declared a `WITH HOLD` cursor: another thing
+    /// PostgreSQL refuses to PREPARE.
+    holdable_declared: AtomicBool,
 }
 
 /// A user type created (`Some(doc)`) or dropped (`None`) in the open
@@ -722,6 +728,8 @@ impl PgHandler {
             group_failed: AtomicBool::new(false),
             pending_notifies: Mutex::new(Vec::new()),
             pending_listens: Mutex::new(Vec::new()),
+            touched_temp: AtomicBool::new(false),
+            holdable_declared: AtomicBool::new(false),
         }
     }
 
@@ -2822,6 +2830,18 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("rowsecurity", "bool", false),
                 ],
             )),
+            // PostgreSQL 16's `pg_prepared_xacts` view: every transaction a
+            // `PREPARE TRANSACTION` parked and nothing has resolved yet.
+            "pg_prepared_xacts" => Some(TableDef::new(
+                "pg_prepared_xacts",
+                vec![
+                    secantus_pgcatalog::Column::new("transaction", "xid", false),
+                    secantus_pgcatalog::Column::new("gid", "text", false),
+                    secantus_pgcatalog::Column::new("prepared", "timestamptz", false),
+                    secantus_pgcatalog::Column::new("owner", "name", false),
+                    secantus_pgcatalog::Column::new("database", "name", false),
+                ],
+            )),
             "pg_cursors" => Some(TableDef::new(
                 "pg_cursors",
                 vec![
@@ -3224,6 +3244,23 @@ impl PgHandler {
                 }
                 rows
             }
+            "pg_prepared_xacts" => {
+                let field = |c: &str| def.field_of(c).expect("column");
+                self.storage
+                    .list_prepared_xacts()
+                    .ok()?
+                    .into_iter()
+                    .map(|x| {
+                        let mut d = Document::new();
+                        d.insert(field("transaction"), Bson::Int64(x.xid));
+                        d.insert(field("gid"), x.gid);
+                        d.insert(field("prepared"), Bson::DateTime(x.prepared));
+                        d.insert(field("owner"), x.owner);
+                        d.insert(field("database"), x.database);
+                        d
+                    })
+                    .collect()
+            }
             "pg_cursors" => {
                 let cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
                 cursors
@@ -3271,6 +3308,22 @@ impl PgHandler {
     /// store is this process's alone -- WiredTiger locks the directory -- so
     /// every write to the catalog passes through `run` and bumps the version.
     fn lookup(&self, name: &str) -> Option<TableDef> {
+        let def = self.lookup_inner(name);
+        // PostgreSQL flags the transaction on ANY open of a temporary
+        // relation (`XACT_FLAGS_ACCESSEDTEMPNAMESPACE`), and refuses to
+        // PREPARE it afterwards.
+        if def.as_ref().is_some_and(|d| d.temp)
+            && self
+                .in_transaction
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.touched_temp
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        def
+    }
+
+    fn lookup_inner(&self, name: &str) -> Option<TableDef> {
         if let Some(def) = Self::virtual_table(name) {
             return Some(def);
         }
@@ -3595,6 +3648,13 @@ fn canonical_ms_guc(name: &str, value: &str) -> PgWireResult<String> {
 /// stores the canonical `on` / `off` a client reads back.
 const BOOL_GUCS: [&str; 2] = ["standard_conforming_strings", "escape_string_warning"];
 
+/// The `max_prepared_transactions` this server runs with: how many
+/// `PREPARE TRANSACTION`s may be outstanding at once (53200 past it).
+const MAX_PREPARED_TRANSACTIONS: usize = 100;
+const MAX_PREPARED_TRANSACTIONS_TEXT: &str = "100";
+/// PostgreSQL's `GIDSIZE`: a transaction identifier is at most 199 BYTES.
+const MAX_GID_BYTES: usize = 200;
+
 /// PostgreSQL's `parse_bool`: `on` / `off` / `true` / `false` / `yes` / `no`
 /// / `1` / `0`, case-insensitively, and any unambiguous prefix of the words
 /// (`t`, `of`, `n`; measured on 16).
@@ -3634,10 +3694,11 @@ fn default_settings() -> HashMap<String, String> {
         ("integer_datetimes", "on"),
         ("transaction_read_only", "off"),
         // Transaction GUCs psycopg reads to learn the connection's defaults.
-        // This server runs one un-prepared transaction at a time at READ
-        // COMMITTED, so these are the fixed values a real single-node server
-        // reports; `max_prepared_transactions` is 0 because 2PC is not offered.
-        ("max_prepared_transactions", "0"),
+        // This server runs one transaction per connection at READ COMMITTED,
+        // so these are the fixed values a real single-node server reports.
+        // `max_prepared_transactions` is the cap `PREPARE TRANSACTION`
+        // enforces (53200 past it); a client reads it to learn 2PC is on.
+        ("max_prepared_transactions", MAX_PREPARED_TRANSACTIONS_TEXT),
         ("transaction_isolation", "read committed"),
         ("default_transaction_isolation", "read committed"),
         ("transaction_deferrable", "off"),
@@ -4536,6 +4597,15 @@ impl PgHandler {
             Statement::Insert(i) => vec![i.table.clone(), SEQUENCE_COLLECTION.to_string()],
             Statement::Update(u) => vec![u.table.clone()],
             Statement::Delete(d) => vec![d.table.clone()],
+            // CASCADE can widen the list to referencing tables, and RESTART
+            // IDENTITY moves sequences: capture every table (the widening
+            // is computed here again, before any row goes) plus the
+            // sequence store.
+            Statement::Truncate { tables, .. } => {
+                let mut v = tables.clone();
+                v.push(SEQUENCE_COLLECTION.to_string());
+                v
+            }
             Statement::CopyFrom(c) => vec![c.table.clone()],
             // A table's ROW TYPE is a composite, so its catalog moves too.
             Statement::CreateTable(def, _) => {
@@ -5188,6 +5258,7 @@ impl PgHandler {
                     TransactionControl::Commit { .. }
                         | TransactionControl::Rollback { .. }
                         | TransactionControl::RollbackTo(_)
+                        | TransactionControl::Prepare(_)
                 ))
             );
             let syntax_error = matches!(&planned, Err(e) if e.sqlstate() == "42601");
@@ -5335,6 +5406,10 @@ impl PgHandler {
                         tz,
                     },
                 );
+            if holdable {
+                self.holdable_declared
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             return Ok(vec![Response::Execution(Tag::new("DECLARE CURSOR"))]);
         }
 
@@ -6049,10 +6124,37 @@ impl PgHandler {
     }
 
     fn transaction_control(&self, control: TransactionControl) -> PgWireResult<Vec<Response>> {
+        // COMMIT PREPARED / ROLLBACK PREPARED resolve ANOTHER transaction:
+        // this connection's block state is not theirs to touch.
+        match &control {
+            TransactionControl::CommitPrepared(gid) => return self.finish_prepared(gid, true),
+            TransactionControl::RollbackPrepared(gid) => return self.finish_prepared(gid, false),
+            // PREPARE TRANSACTION with no block to prepare: a WARNING and a
+            // `ROLLBACK` tag, exactly as PostgreSQL answers it. Nothing to
+            // roll back, nothing to reset.
+            TransactionControl::Prepare(_)
+                if !self
+                    .in_transaction
+                    .load(std::sync::atomic::Ordering::Relaxed) =>
+            {
+                self.warning("25P01", "there is no transaction in progress".into());
+                return Ok(vec![Response::TransactionEnd(Tag::new("ROLLBACK"))]);
+            }
+            _ => {}
+        }
         let opens = matches!(
             control,
             TransactionControl::Begin(_) | TransactionControl::Start(_)
         );
+        // What the block did to temporary tables and holdable cursors only
+        // matters to a PREPARE of THIS block; a new block starts clean. The
+        // reset is on the OPEN, not on every control: a PREPARE reads them.
+        if opens {
+            self.touched_temp
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            self.holdable_declared
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
         // Whatever the transaction did to the catalog is either committed or
         // discarded once it ends, so the pending map stops being the truth.
         if !opens {
@@ -6080,6 +6182,10 @@ impl PgHandler {
         let control = match control {
             TransactionControl::Commit { chain } if failed => {
                 TransactionControl::Rollback { chain }
+            }
+            // A PREPARE of a failed block is a ROLLBACK too, tag included.
+            TransactionControl::Prepare(_) if failed => {
+                TransactionControl::Rollback { chain: false }
             }
             other => other,
         };
@@ -6178,12 +6284,41 @@ impl PgHandler {
                 self.settle_notifies(false);
                 ("ROLLBACK", chain)
             }
+            TransactionControl::Prepare(gid) => {
+                self.reset_transaction_gucs();
+                self.implicit_extended
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                // A PREPARE ends the block the way a COMMIT does: non-holdable
+                // cursors close (a holdable one declared in it refused the
+                // PREPARE below).
+                self.close_cursors_on_txn_end(true);
+                self.in_transaction
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                let handle = guard.take().ok_or_else(|| {
+                    Self::storage_err(
+                        "could not prepare the transaction",
+                        "no transaction handle for the open block",
+                    )
+                })?;
+                if let Err(e) = self.prepare_block(handle, &gid) {
+                    // The refused transaction is rolled back and over: the
+                    // `ReadyForQuery` after the error says IDLE.
+                    self.settle_notifies(false);
+                    self.commit_failed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Err(e);
+                }
+                ("PREPARE TRANSACTION", false)
+            }
             // Handled before this, in `run`: they are statements INSIDE a
             // block rather than ways of starting or ending one.
             TransactionControl::Savepoint(_)
             | TransactionControl::Release(_)
             | TransactionControl::RollbackTo(_) => {
                 unreachable!("savepoint statements are handled by savepoint_control")
+            }
+            TransactionControl::CommitPrepared(_) | TransactionControl::RollbackPrepared(_) => {
+                unreachable!("prepared-transaction statements are handled by finish_prepared")
             }
         };
         // `AND CHAIN` ends the block and opens another one immediately, so the
@@ -6203,6 +6338,167 @@ impl PgHandler {
         } else {
             Response::TransactionEnd(Tag::new(tag))
         }])
+    }
+
+    /// Queue a WARNING for the statement in flight.
+    fn warning(&self, sqlstate: &str, message: String) {
+        self.pending_notices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(ErrorInfo::new("WARNING".into(), sqlstate.into(), message));
+    }
+
+    /// The block's `PREPARE TRANSACTION '<gid>'`: every refusal PostgreSQL 16
+    /// makes, in its order, then the storage parks the transaction. On any
+    /// error the transaction is rolled back -- a refused PREPARE ends the
+    /// block just as an accepted one does.
+    fn prepare_block(&self, mut handle: UserTransactionHandle, gid: &str) -> PgWireResult<()> {
+        if let Err(e) = self.prepare_gate(&mut handle, gid) {
+            self.storage
+                .rollback_user_transaction(&mut handle)
+                .map_err(|e| Self::storage_err("could not roll back", e))?;
+            return Err(e);
+        }
+        let owner = self
+            .session_user
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        match self
+            .storage
+            .prepare_user_transaction(handle, gid, &owner, self.db())
+        {
+            Ok(_) => Ok(()),
+            Err(StorageError::PreparedTransactionExists(gid)) => Err(Self::user_error(
+                "42710", // duplicate_object
+                format!("transaction identifier \"{gid}\" is already in use"),
+            )),
+            Err(e) => Err(Self::storage_err("could not prepare the transaction", e)),
+        }
+    }
+
+    /// What stops a block from being prepared, in the order PostgreSQL's
+    /// `PrepareTransaction` / `MarkAsPreparing` discover them: a deferred
+    /// constraint violation, a `WITH HOLD` cursor, LISTEN / NOTIFY, a
+    /// temporary table, an over-long gid, a gid in use, the cap.
+    fn prepare_gate(&self, handle: &mut UserTransactionHandle, gid: &str) -> PgWireResult<()> {
+        // INITIALLY DEFERRED constraints are checked now, inside the
+        // transaction, as at a COMMIT.
+        self.storage
+            .with_user_transaction(handle, || self.run_deferred_checks())
+            .map_err(|e| Self::storage_err("transaction failed", e))
+            .and_then(|r| r)?;
+        let unsupported = |what: &str| {
+            Self::user_error(
+                "0A000", // feature_not_supported
+                format!("cannot PREPARE a transaction that has {what}"),
+            )
+        };
+        if self
+            .holdable_declared
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(unsupported("created a cursor WITH HOLD"));
+        }
+        let notified = !self
+            .pending_listens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+            || !self
+                .pending_notifies
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty();
+        if notified {
+            return Err(unsupported("executed LISTEN, UNLISTEN, or NOTIFY"));
+        }
+        if self.touched_temp.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(unsupported("operated on temporary objects"));
+        }
+        if gid.len() >= MAX_GID_BYTES {
+            return Err(Self::user_error(
+                "22023", // invalid_parameter_value
+                format!("transaction identifier \"{gid}\" is too long"),
+            ));
+        }
+        let outstanding = self
+            .storage
+            .list_prepared_xacts()
+            .map_err(|e| Self::storage_err("could not read the prepared transactions", e))?;
+        if outstanding.iter().any(|x| x.gid == gid) {
+            return Err(Self::user_error(
+                "42710", // duplicate_object
+                format!("transaction identifier \"{gid}\" is already in use"),
+            ));
+        }
+        if outstanding.len() >= MAX_PREPARED_TRANSACTIONS {
+            return Err(Self::user_error(
+                "53200", // out_of_memory
+                "maximum number of prepared transactions reached".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// `COMMIT PREPARED` / `ROLLBACK PREPARED`: resolve a parked transaction
+    /// from this connection, whichever one prepared it.
+    fn finish_prepared(&self, gid: &str, commit: bool) -> PgWireResult<Vec<Response>> {
+        let word = if commit {
+            "COMMIT PREPARED"
+        } else {
+            "ROLLBACK PREPARED"
+        };
+        if self
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            // Inside a block it is an error, and the block is failed by it.
+            self.note_failure();
+            return Err(Self::user_error(
+                "25001", // active_sql_transaction
+                format!("{word} cannot run inside a transaction block"),
+            ));
+        }
+        let done = if commit {
+            self.storage.commit_prepared(gid)
+        } else {
+            self.storage.rollback_prepared(gid)
+        };
+        match done {
+            Ok(()) => Ok(vec![Response::TransactionEnd(Tag::new(word))]),
+            Err(StorageError::PreparedTransactionNotFound(gid)) => Err(Self::user_error(
+                "42704", // undefined_object
+                format!("prepared transaction with identifier \"{gid}\" does not exist"),
+            )),
+            // A transaction recovered from disk holds no row locks (see
+            // `tasks/backlog.md`), so a write since the restart can have
+            // taken a key its replay needs. PostgreSQL cannot reach this
+            // state; the refusal is the unique violation it would have
+            // given the OTHER writer, and the record stays for a ROLLBACK
+            // PREPARED.
+            Err(e @ (StorageError::DuplicateKey(_) | StorageError::DuplicateId)) => {
+                Err(Self::user_error(
+                    "23505", // unique_violation
+                    format!(
+                        "could not commit prepared transaction \"{gid}\": a row written \
+                         since it was prepared has a key it inserts ({e})"
+                    ),
+                ))
+            }
+            Err(e) => Err(Self::storage_err(
+                "could not finish the prepared transaction",
+                e,
+            )),
+        }
+    }
+
+    fn user_error(sqlstate: &str, message: String) -> PgWireError {
+        PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".into(),
+            sqlstate.into(),
+            message,
+        )))
     }
 
     /// Draw the next `count` values of sequence `name` and move it past them.
@@ -6624,6 +6920,7 @@ impl PgHandler {
                 | Statement::Insert(_)
                 | Statement::Update(_)
                 | Statement::Delete(_)
+                | Statement::Truncate { .. }
                 | Statement::Aggregate(_)
                 | Statement::CopyFrom(_)
                 | Statement::CopyTo(_)
@@ -6653,6 +6950,22 @@ impl PgHandler {
     /// CTAS itself cached a moment earlier (see `CatalogCache`).
     fn execute(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response>> {
         let may_change_catalog = Self::may_change_catalog(&stmt);
+        // Creating a temporary relation touches the temp namespace as
+        // surely as opening one does (`lookup` covers the latter); PREPARE
+        // refuses both.
+        let creates_temp = match &stmt {
+            Statement::CreateTable(def, _) => def.temp,
+            Statement::CreateTableAs { temp, .. } => *temp,
+            _ => false,
+        };
+        if creates_temp
+            && self
+                .in_transaction
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.touched_temp
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         let out = self.execute_inner(stmt, max_rows);
         if may_change_catalog {
             bump_catalog_version();
@@ -8560,7 +8873,119 @@ impl PgHandler {
                     Tag::new("DELETE").with_rows(deleted),
                 )])
             }
+
+            Statement::Truncate {
+                tables,
+                restart_identity,
+                cascade,
+            } => {
+                let tables = self.truncate_set(&tables, cascade)?;
+                for table in &tables {
+                    self.storage
+                        .delete_matching(
+                            self.db(),
+                            table,
+                            &Document::new(),
+                            0,
+                            &Document::new(),
+                            None,
+                        )
+                        .map_err(|e| Self::storage_err("could not truncate", e))?;
+                }
+                if restart_identity {
+                    self.restart_owned_sequences(&tables)?;
+                }
+                Ok(vec![Response::Execution(Tag::new("TRUNCATE TABLE"))])
+            }
         }
+    }
+}
+
+impl PgHandler {
+    /// The tables a TRUNCATE empties: the named ones, widened under CASCADE
+    /// to every table whose foreign key references one of them (and so on).
+    /// Without CASCADE a referencing table outside the list is 0A000, as
+    /// PostgreSQL refuses it -- a static check on the constraint, whether
+    /// or not any row currently references.
+    fn truncate_set(&self, named: &[String], cascade: bool) -> PgWireResult<Vec<String>> {
+        let defs = self.all_table_defs()?;
+        let mut set: Vec<String> = named.to_vec();
+        let mut i = 0;
+        while i < set.len() {
+            let parent = set[i].clone();
+            for def in &defs {
+                if set.contains(&def.name) {
+                    continue;
+                }
+                if !def.foreign_keys.iter().any(|fk| fk.ref_table == parent) {
+                    continue;
+                }
+                if cascade {
+                    self.notice(
+                        "00000",
+                        format!("truncate cascades to table \"{}\"", def.name),
+                        None,
+                    );
+                    set.push(def.name.clone());
+                } else {
+                    let mut info = ErrorInfo::new(
+                        "ERROR".into(),
+                        "0A000".into(), // feature_not_supported
+                        "cannot truncate a table referenced in a foreign key constraint".into(),
+                    );
+                    info.detail = Some(format!("Table \"{}\" references \"{parent}\".", def.name));
+                    info.hint = Some(format!(
+                        "Truncate table \"{}\" at the same time, or use TRUNCATE ... CASCADE.",
+                        def.name
+                    ));
+                    return Err(PgWireError::UserError(Box::new(info)));
+                }
+            }
+            i += 1;
+        }
+        Ok(set)
+    }
+
+    /// `RESTART IDENTITY`: every sequence a truncated table's column owns
+    /// goes back to its start, as if never drawn.
+    fn restart_owned_sequences(&self, tables: &[String]) -> PgWireResult<()> {
+        for table in tables {
+            let Some(def) = self.lookup(table) else {
+                continue;
+            };
+            for col in &def.columns {
+                let Some(seq) = col.sequence.as_deref() else {
+                    continue;
+                };
+                let filter = bson::doc! { "_id": seq };
+                let raw = self
+                    .storage
+                    .find_matching(self.db(), SEQUENCE_COLLECTION, &filter)
+                    .map_err(|e| Self::storage_err("could not read the sequence", e))?;
+                let Some(raw) = raw.first() else {
+                    continue;
+                };
+                let doc: Document = bson::from_slice(raw)
+                    .map_err(|e| Self::storage_err("could not decode the sequence", e))?;
+                let start = doc.get("start").and_then(bson_i64).unwrap_or(1);
+                self.storage
+                    .update_matching(
+                        self.db(),
+                        SEQUENCE_COLLECTION,
+                        &filter,
+                        &bson::doc! { "$set": { "last_value": start, "is_called": false } },
+                        false,
+                        false,
+                        &[],
+                        &Document::new(),
+                        None,
+                        None,
+                        false,
+                    )
+                    .map_err(|e| Self::storage_err("could not restart the sequence", e))?;
+            }
+        }
+        Ok(())
     }
 }
 
