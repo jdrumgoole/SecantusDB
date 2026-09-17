@@ -99,20 +99,26 @@ def cmd_start(args: argparse.Namespace) -> int:
     exit_file = state_dir / f"{args.name}.exit"
     exit_file.unlink(missing_ok=True)
 
-    # A tiny wrapper records the exit code, which the caller cannot waitpid()
-    # for once this launcher process has gone away.
-    quoted = " ".join(_shell_quote(part) for part in args.command)
-    wrapper = f'{quoted}; printf "%s" "$?" > {_shell_quote(str(exit_file.resolve()))}'
-
-    with log.open("wb") as handle:
-        proc = subprocess.Popen(
-            ["/bin/sh", "-c", wrapper],
-            cwd=str(args.cwd.resolve()),
-            stdout=handle,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,  # the whole point: our own process group
-        )
+    # The supervisor is a PYTHON process, never `sh -c`. An intervening shell
+    # breaks macOS's permission association for the whole subtree: with
+    # `/bin/sh` in the middle, every child's connection to a Postgres.app
+    # server times out, which silently skipped 825 differential tests behind a
+    # green run. Measured 2026-09-17 -- direct exec connects, `sh -c` does not.
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "_supervise",
+            str(exit_file),
+            *args.command,
+        ],
+        cwd=str(args.cwd.resolve()),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,  # our own process group: a group kill misses us
+        env={**os.environ, "_DETACHED_RUN_LOG": str(log.resolve())},
+    )
 
     _write_state(
         state_dir,
@@ -129,12 +135,6 @@ def cmd_start(args: argparse.Namespace) -> int:
     )
     print(f"started {args.name!r} pid {proc.pid}; log {log}")
     return 0
-
-
-def _shell_quote(part: str) -> str:
-    if part and all(c.isalnum() or c in "-_./=:" for c in part):
-        return part
-    return "'" + part.replace("'", "'\\''") + "'"
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -184,6 +184,24 @@ def cmd_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def _supervise(argv: list[str]) -> int:
+    """Run the real command and record its exit code.
+
+    Exists so the launcher can exit while something still knows the child's
+    fate: once a process is reparented, the caller can no longer waitpid() it.
+    A Python supervisor rather than a shell one -- see the note in cmd_start.
+    """
+    exit_file = Path(argv[0])
+    log_path = os.environ.get("_DETACHED_RUN_LOG")
+    with open(log_path, "wb") if log_path else open(os.devnull, "wb") as handle:
+        proc = subprocess.Popen(
+            argv[1:], stdout=handle, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL
+        )
+        code = proc.wait()
+    exit_file.write_text(str(code))
+    return code
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -212,6 +230,9 @@ def main(argv: list[str] | None = None) -> int:
     stop.add_argument("--name", required=True)
     stop.set_defaults(func=cmd_stop)
 
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if raw and raw[0] == "_supervise":
+        return _supervise(raw[1:])
     args = parser.parse_args(argv)
     if args.action == "start" and args.command and args.command[0] == "--":
         args.command = args.command[1:]

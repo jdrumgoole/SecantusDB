@@ -13,6 +13,12 @@ it, wait on it, or stop it; the pid, the command line, the log and the eventual
 exit code live in `.detached-runs/<name>.json` beside `<name>.log`, which is
 what makes the exit code readable at all once the launching process is gone.
 
+The exit code is recorded by a small Python supervisor rather than a `sh -c`
+wrapper, and that detail is load-bearing on macOS: with a shell in the middle
+of the process tree, every child's connection to a Postgres.app server timed
+out, so the 825 PostgreSQL differential tests reported themselves as skipped
+behind an otherwise green run. A test pins the absence of the shell.
+
 #### Added
 
 - `scripts/detached_run.py` with `start` / `status` / `wait` / `stop`

@@ -109,3 +109,31 @@ def test_a_second_start_under_a_live_name_is_refused(tmp_path: Path) -> None:
         assert "still running" in again.stderr
     finally:
         _run(state, "stop", "--name", "dup")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process inspection is POSIX")
+def test_no_shell_is_interposed_before_the_command(tmp_path: Path) -> None:
+    """The run's parent must be python, never `/bin/sh`.
+
+    macOS attributes a permission decision to the process tree, and an
+    intervening `sh -c` loses the association: with one in the middle, every
+    child's connection to a Postgres.app server timed out, so 825 differential
+    tests SKIPPED behind a green run instead of failing (measured 2026-09-17).
+    Exit-code capture is therefore done by a python supervisor, and this test
+    is what stops a future 'simplification' putting the shell back.
+    """
+    state = tmp_path / "runs"
+    out = tmp_path / "parent.txt"
+    script = tmp_path / "who.py"
+    script.write_text(
+        "import os, pathlib, sys\n"
+        f"pathlib.Path({str(out)!r}).write_text(open(f'/proc/{{os.getppid()}}/comm').read()"
+        " if os.path.exists(f'/proc/{os.getppid()}/comm') else"
+        " __import__('subprocess').run(['ps','-o','comm=','-p',str(os.getppid())],"
+        " capture_output=True, text=True).stdout)\n"
+    )
+    assert _run(state, "start", "--name", "who", "--", sys.executable, str(script)).returncode == 0
+    assert _wait_for(out.exists), "child never ran"
+    parent = out.read_text().strip()
+    assert Path(parent).name != "sh", f"a shell was interposed: {parent!r}"
+    assert "python" in parent.lower(), f"unexpected supervisor: {parent!r}"
