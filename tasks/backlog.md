@@ -699,15 +699,30 @@ remain open:
       plans as a plain column — a second equal value inserts where PG 16
       answers `23505` — and `pg_constraint` queries answer `42P01`. Multi-
       column FOREIGN KEYs and `ON DELETE SET DEFAULT` are refused `0A000`.
-- [ ] **OPEN — RUST pgserver: no two-phase commit — `PREPARE TRANSACTION` /
-      `COMMIT PREPARED` / `ROLLBACK PREPARED` / `pg_prepared_xacts`
-      (2026-09-09).** 38 skips in the widened psycopg gauge
-      (`tests/test_tpc.py`, `tests/test_tpc_async.py`, the dbapi20 tpc
-      cases): the suite skips itself when `max_prepared_transactions` is
-      0, which is what the server reports. The Python server has it
-      (b180); the Rust server does not. Note the oracle on this box also
-      runs with `max_prepared_transactions = 0`, so measuring it needs the
-      setting raised on PG first.
+- [ ] **OPEN — RUST pgserver: a write that conflicts with a prepared
+      transaction is not a lock wait (2026-09-17).** Two-phase commit landed
+      (`PREPARE TRANSACTION` / `COMMIT PREPARED` / `ROLLBACK PREPARED` /
+      `pg_prepared_xacts`, resolvable from any connection, after a
+      disconnect and after a restart; differential probe of 34 scenarios
+      matches PG 16.15 on all but this one). A prepared transaction keeps
+      its WiredTiger transaction open, so a second writer touching one of
+      its rows hits a WT write conflict where PostgreSQL waits on the row
+      lock. In autocommit the storage layer's unbounded retry makes it
+      BLOCK until the prepared transaction resolves — the PG shape — but
+      the wait is uninterruptible (no `statement_timeout` / `lock_timeout`
+      `57014`; the daemon in that loop also ignores SIGTERM, use
+      `kill -9`). Inside an explicit block it surfaces at once as `XX000`
+      `WriteConflict` and fails the block, where PG blocks. Two smaller
+      narrowings: after a restart a recovered prepared transaction is a
+      replay record, not an open WT transaction, so it holds NO row locks
+      (a conflicting write goes through; the later `COMMIT PREPARED`
+      replays its updates over it, and an insert whose unique key was
+      taken meanwhile fails the commit with `23505`, record retained for
+      `ROLLBACK PREPARED` — PG keeps the locks, so neither can happen); and a
+      crash between a live `COMMIT PREPARED`'s WT commit and the record's
+      deletion is detected at the next `COMMIT PREPARED` by the first
+      minted seq being readable (`prepared_already_committed`), not by a
+      commit record.
 - [ ] **OPEN — RUST pgserver: `CREATE ROLE` (2026-09-09).** 1 skip in the
       psycopg gauge (`test_connection.py` role switching). Users are
       constructor config, not catalog rows, on both servers.

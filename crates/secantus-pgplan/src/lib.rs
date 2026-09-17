@@ -1488,9 +1488,9 @@ pub fn plan_with_params(
                 Ok(TransactionStmtKind::TransStmtCommitPrepared) => Ok(Statement::Transaction(
                     TransactionControl::CommitPrepared(t.gid.clone()),
                 )),
-                Ok(TransactionStmtKind::TransStmtRollbackPrepared) => Ok(
-                    Statement::Transaction(TransactionControl::RollbackPrepared(t.gid.clone())),
-                ),
+                Ok(TransactionStmtKind::TransStmtRollbackPrepared) => Ok(Statement::Transaction(
+                    TransactionControl::RollbackPrepared(t.gid.clone()),
+                )),
                 Ok(other) => Err(Error::Unsupported(format!("{other:?}"))),
                 Err(_) => Err(Error::Unsupported("this transaction statement".into())),
             }

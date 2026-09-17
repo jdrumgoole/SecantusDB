@@ -633,9 +633,10 @@ def test_session_settings(home: Path) -> None:
         assert cur.description[0].name == "DateStyle"
 
         # Transaction GUCs psycopg reads to learn the connection's defaults.
-        # A single-node server with no 2PC reports these fixed values.
+        # `max_prepared_transactions` is the two-phase-commit slot count
+        # (psycopg's tpc tests skip when it is 0).
         for name, want in (
-            ("max_prepared_transactions", "0"),
+            ("max_prepared_transactions", "100"),
             ("transaction_isolation", "read committed"),
             ("default_transaction_isolation", "read committed"),
             ("transaction_deferrable", "off"),
@@ -8461,3 +8462,260 @@ def test_now_casts_to_text_in_session_zone(home: Path) -> None:
         cur.execute("set timezone to 'Europe/Dublin'")
         cur.execute("select now()::text")
         assert re.search(r"\+0[01]$", cur.fetchone()[0])
+
+
+# --- Two-phase commit --------------------------------------------------------
+#
+# Every expectation below was measured on PostgreSQL 16.15 with
+# `max_prepared_transactions = 100` (2026-09-10 / 2026-09-17).
+
+
+def _sqlstate(conn: psycopg.Connection, sql: str) -> str | None:
+    """The SQLSTATE `sql` fails with, or None when it succeeds."""
+    try:
+        conn.execute(sql)
+    except psycopg.Error as e:
+        return e.sqlstate
+    return None
+
+
+def test_two_phase_commit_resolves_from_another_connection(home: Path) -> None:
+    """PREPARE ends the block, the work stays invisible, and ANY connection
+    may COMMIT PREPARED or ROLLBACK PREPARED it -- including after the
+    preparing connection has gone away."""
+    with _Server(home) as server:
+        setup = server.connect()
+        setup.execute("create table tpc (a int primary key, b int)")
+        setup.execute("insert into tpc values (1, 10)")
+        assert setup.execute("show max_prepared_transactions").fetchone() == ("100",)
+
+        a = server.connect()
+        a.execute("begin")
+        a.execute("insert into tpc values (2, 20)")
+        a.execute("update tpc set b = 11 where a = 1")
+        a.execute("prepare transaction 'gid-commit'")
+        # The block is over: this connection is IDLE, not in a transaction.
+        assert a.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
+        # Neither the preparer nor anyone else sees the prepared writes.
+        assert a.execute("select a, b from tpc order by a").fetchall() == [(1, 10)]
+        assert setup.execute("select a, b from tpc order by a").fetchall() == [(1, 10)]
+        a.close()
+
+        b = server.connect()
+        b.execute("begin")
+        b.execute("insert into tpc values (3, 30)")
+        b.execute("prepare transaction 'gid-rollback'")
+        b.close()
+
+        row = setup.execute(
+            "select gid, owner, database, transaction > 0, prepared is not null "
+            "from pg_prepared_xacts order by gid"
+        ).fetchall()
+        assert row == [
+            ("gid-commit", "test", "postgres", True, True),
+            ("gid-rollback", "test", "postgres", True, True),
+        ]
+
+        setup.execute("commit prepared 'gid-commit'")
+        setup.execute("rollback prepared 'gid-rollback'")
+        assert setup.execute("select a, b from tpc order by a").fetchall() == [(1, 11), (2, 20)]
+        assert setup.execute("select count(*) from pg_prepared_xacts").fetchone() == (0,)
+        setup.close()
+
+
+def test_prepared_transaction_survives_a_restart(home: Path) -> None:
+    """The prepared write set -- DDL included -- outlives the process.
+
+    The daemon is stopped with the transaction prepared and started again on
+    the same store; the gid is still listed, its rows and its table are still
+    invisible, and COMMIT PREPARED then applies all of it.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table tpc_r (a int primary key, b int)")
+        conn.execute("insert into tpc_r values (1, 10)")
+        conn.execute("begin")
+        conn.execute("create table tpc_made (x int)")
+        conn.execute("insert into tpc_made values (9)")
+        conn.execute("insert into tpc_r values (2, 20)")
+        conn.execute("update tpc_r set b = 11 where a = 1")
+        conn.execute("prepare transaction 'p-restart'")
+        conn.execute("begin")
+        conn.execute("insert into tpc_r values (3, 30)")
+        conn.execute("prepare transaction 'p-discard'")
+
+    with _Server(home) as server, server.connect() as conn:
+        assert conn.execute("select gid from pg_prepared_xacts order by gid").fetchall() == [
+            ("p-discard",),
+            ("p-restart",),
+        ]
+        assert conn.execute("select a, b from tpc_r order by a").fetchall() == [(1, 10)]
+        assert _sqlstate(conn, "select * from tpc_made") == "42P01"
+        conn.execute("commit prepared 'p-restart'")
+        conn.execute("rollback prepared 'p-discard'")
+        assert conn.execute("select a, b from tpc_r order by a").fetchall() == [(1, 11), (2, 20)]
+        assert conn.execute("select x from tpc_made").fetchall() == [(9,)]
+        assert conn.execute("select count(*) from pg_prepared_xacts").fetchone() == (0,)
+
+    # And the resolution itself is durable.
+    with _Server(home) as server, server.connect() as conn:
+        assert conn.execute("select a, b from tpc_r order by a").fetchall() == [(1, 11), (2, 20)]
+        assert conn.execute("select x from tpc_made").fetchall() == [(9,)]
+        assert conn.execute("select count(*) from pg_prepared_xacts").fetchone() == (0,)
+
+
+def test_prepared_gid_is_byte_exact(home: Path) -> None:
+    """A gid is an arbitrary string up to 199 bytes: quotes, unicode and the
+    empty string all round-trip through pg_prepared_xacts unchanged, and the
+    200-byte one is `22023`."""
+    from psycopg import sql
+
+    gids = ["", "it's", 'say "hi"', "üñíçødé", "a" * 199]
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table tpc_g (a int)")
+        for gid in gids:
+            conn.execute("begin")
+            conn.execute("insert into tpc_g values (1)")
+            conn.execute(sql.SQL("prepare transaction {}").format(sql.Literal(gid)))
+        listed = conn.execute("select gid from pg_prepared_xacts order by gid").fetchall()
+        assert sorted(g for (g,) in listed) == sorted(gids)
+        conn.execute("begin")
+        conn.execute("insert into tpc_g values (1)")
+        with pytest.raises(psycopg.Error) as info:
+            conn.execute(sql.SQL("prepare transaction {}").format(sql.Literal("a" * 200)))
+        assert info.value.sqlstate == "22023"
+        assert conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
+        for gid in gids:
+            conn.execute(sql.SQL("commit prepared {}").format(sql.Literal(gid)))
+        assert conn.execute("select count(*) from tpc_g").fetchone() == (len(gids),)
+
+
+def test_two_phase_commit_refusals_match_postgres(home: Path) -> None:
+    """The error surface, as PostgreSQL 16 answers it."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table tpc_e (a int)")
+        conn.execute("begin")
+        conn.execute("insert into tpc_e values (1)")
+        conn.execute("prepare transaction 'dup'")
+
+        # PREPARE outside a block: a WARNING and a ROLLBACK tag, no error.
+        notices: list[tuple[str, str]] = []
+        conn.add_notice_handler(lambda d: notices.append((d.severity, d.sqlstate)))
+        cur = conn.execute("prepare transaction 'nowhere'")
+        assert cur.statusmessage == "ROLLBACK"
+        assert notices == [("WARNING", "25P01")]
+
+        # Every PREPARE failure ends the block.
+        conn.execute("begin")
+        conn.execute("insert into tpc_e values (2)")
+        assert _sqlstate(conn, "prepare transaction 'dup'") == "42710"
+        assert conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
+        assert conn.execute("select count(*) from tpc_e").fetchone() == (0,)
+
+        # PREPARE in a failed block is a plain ROLLBACK.
+        conn.execute("begin")
+        assert _sqlstate(conn, "select nosuch") == "42703"
+        assert conn.execute("prepare transaction 'failed'").statusmessage == "ROLLBACK"
+        assert conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
+
+        # Temporary tables, holdable cursors and LISTEN/NOTIFY are 0A000.
+        for body in (
+            "create temp table tpc_tmp (x int)",
+            "declare tpc_c cursor with hold for select 1",
+            "listen tpc_chan",
+            "notify tpc_chan",
+        ):
+            conn.execute("begin")
+            conn.execute(body)
+            assert _sqlstate(conn, "prepare transaction 'feature'") == "0A000", body
+            assert conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
+        # ... but a plain (non-holdable) cursor is allowed.
+        conn.execute("begin")
+        conn.execute("declare tpc_plain cursor for select 1")
+        conn.execute("prepare transaction 'cursor-ok'")
+        conn.execute("rollback prepared 'cursor-ok'")
+
+        # COMMIT / ROLLBACK PREPARED inside a block fail the block (25001).
+        conn.execute("begin")
+        assert _sqlstate(conn, "commit prepared 'dup'") == "25001"
+        assert conn.info.transaction_status == psycopg.pq.TransactionStatus.INERROR
+        conn.execute("rollback")
+
+        # An unknown gid is 42704, and resolving one twice is the same.
+        assert _sqlstate(conn, "commit prepared 'nope'") == "42704"
+        conn.execute("commit prepared 'dup'")
+        assert _sqlstate(conn, "rollback prepared 'dup'") == "42704"
+        assert conn.execute("select a from tpc_e").fetchall() == [(1,)]
+
+
+def test_prepared_ddl_is_invisible_until_committed(home: Path) -> None:
+    """A table created in a prepared transaction does not exist for anyone
+    until COMMIT PREPARED, and ROLLBACK PREPARED makes it never have existed."""
+    with _Server(home) as server:
+        a = server.connect()
+        b = server.connect()
+        try:
+            a.execute("begin")
+            a.execute("create table tpc_ddl (x int)")
+            a.execute("insert into tpc_ddl values (1)")
+            a.execute("prepare transaction 'ddl'")
+            assert _sqlstate(a, "select * from tpc_ddl") == "42P01"
+            assert _sqlstate(b, "select * from tpc_ddl") == "42P01"
+            b.execute("commit prepared 'ddl'")
+            assert a.execute("select x from tpc_ddl").fetchall() == [(1,)]
+
+            a.execute("begin")
+            a.execute("create table tpc_gone (x int)")
+            a.execute("prepare transaction 'gone'")
+            b.execute("rollback prepared 'gone'")
+            assert _sqlstate(a, "select * from tpc_gone") == "42P01"
+            # The name is free again.
+            a.execute("create table tpc_gone (y int)")
+        finally:
+            a.close()
+            b.close()
+
+
+def test_truncate_matches_postgres(home: Path) -> None:
+    """`TRUNCATE` empties tables, refuses an FK parent without CASCADE
+    (0A000, PostgreSQL's detail and hint), cascades with a NOTICE per table,
+    and RESTART IDENTITY rewinds the serials."""
+    with _Server(home) as server, server.connect() as conn:
+        notices: list[str] = []
+        conn.add_notice_handler(lambda d: notices.append(d.message_primary))
+        conn.execute("create table tp (id serial primary key, n int)")
+        conn.execute("create table tc (id int primary key, p int references tp(id))")
+        conn.execute("insert into tp (n) values (1), (2)")
+        conn.execute("insert into tc values (1, 1)")
+        assert _sqlstate(conn, "truncate nosuch") == "42P01"
+
+        with pytest.raises(psycopg.Error) as info:
+            conn.execute("truncate tp")
+        assert info.value.sqlstate == "0A000"
+        assert info.value.diag.message_primary == (
+            "cannot truncate a table referenced in a foreign key constraint"
+        )
+        assert info.value.diag.message_detail == 'Table "tc" references "tp".'
+        assert info.value.diag.message_hint == (
+            'Truncate table "tc" at the same time, or use TRUNCATE ... CASCADE.'
+        )
+        assert conn.execute("select count(*) from tp").fetchone() == (2,)
+
+        # Both at once is fine, and the tag is TRUNCATE TABLE.
+        assert conn.execute("truncate table tp, tc").statusmessage == "TRUNCATE TABLE"
+        assert conn.execute("select count(*) from tp").fetchone() == (0,)
+        assert conn.execute("select count(*) from tc").fetchone() == (0,)
+        # The serial carries on where it was ...
+        conn.execute("insert into tp (n) values (3)")
+        assert conn.execute("select id from tp").fetchall() == [(3,)]
+        # ... unless RESTART IDENTITY rewinds it.
+        conn.execute("truncate tp restart identity cascade")
+        conn.execute("insert into tp (n) values (4)")
+        assert conn.execute("select id from tp").fetchall() == [(1,)]
+
+        assert notices == ['truncate cascades to table "tc"']
+
+        conn.execute("insert into tc values (7, 1)")
+        notices.clear()
+        assert conn.execute("truncate tp cascade").statusmessage == "TRUNCATE TABLE"
+        assert notices == ['truncate cascades to table "tc"']
+        assert conn.execute("select count(*) from tc").fetchone() == (0,)

@@ -6435,7 +6435,10 @@ impl Storage {
         owner: &str,
         database: &str,
     ) -> Result<PreparedXact> {
-        let mut live = self.prepared_xacts.lock().unwrap_or_else(|e| e.into_inner());
+        let mut live = self
+            .prepared_xacts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if live.contains_key(gid) || self.read_prepared_row(gid)?.is_some() {
             // The preparing transaction dies with the error, as it does in
             // PostgreSQL: dropping the handle rolls it back.
@@ -6624,7 +6627,7 @@ impl Storage {
         let mut handle = self.begin_user_transaction()?;
         let applied = self.with_user_transaction(&mut handle, || -> Result<()> {
             for op in &ops {
-                replay::apply_entry(self, op)?;
+                replay::apply_entry_strict(self, op)?;
             }
             // Same transaction as the replayed writes: the row goes when they
             // do, never before, never without them.

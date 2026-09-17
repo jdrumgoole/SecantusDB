@@ -3655,7 +3655,6 @@ const MAX_PREPARED_TRANSACTIONS_TEXT: &str = "100";
 /// PostgreSQL's `GIDSIZE`: a transaction identifier is at most 199 BYTES.
 const MAX_GID_BYTES: usize = 200;
 
-
 /// PostgreSQL's `parse_bool`: `on` / `off` / `true` / `false` / `yes` / `no`
 /// / `1` / `0`, case-insensitively, and any unambiguous prefix of the words
 /// (`t`, `of`, `n`; measured on 16).
@@ -6129,9 +6128,7 @@ impl PgHandler {
         // this connection's block state is not theirs to touch.
         match &control {
             TransactionControl::CommitPrepared(gid) => return self.finish_prepared(gid, true),
-            TransactionControl::RollbackPrepared(gid) => {
-                return self.finish_prepared(gid, false)
-            }
+            TransactionControl::RollbackPrepared(gid) => return self.finish_prepared(gid, false),
             // PREPARE TRANSACTION with no block to prepare: a WARNING and a
             // `ROLLBACK` tag, exactly as PostgreSQL answers it. Nothing to
             // roll back, nothing to reset.
@@ -6187,7 +6184,9 @@ impl PgHandler {
                 TransactionControl::Rollback { chain }
             }
             // A PREPARE of a failed block is a ROLLBACK too, tag included.
-            TransactionControl::Prepare(_) if failed => TransactionControl::Rollback { chain: false },
+            TransactionControl::Prepare(_) if failed => {
+                TransactionControl::Rollback { chain: false }
+            }
             other => other,
         };
 
@@ -6414,10 +6413,7 @@ impl PgHandler {
         if notified {
             return Err(unsupported("executed LISTEN, UNLISTEN, or NOTIFY"));
         }
-        if self
-            .touched_temp
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if self.touched_temp.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(unsupported("operated on temporary objects"));
         }
         if gid.len() >= MAX_GID_BYTES {
@@ -6475,7 +6471,25 @@ impl PgHandler {
                 "42704", // undefined_object
                 format!("prepared transaction with identifier \"{gid}\" does not exist"),
             )),
-            Err(e) => Err(Self::storage_err("could not finish the prepared transaction", e)),
+            // A transaction recovered from disk holds no row locks (see
+            // `tasks/backlog.md`), so a write since the restart can have
+            // taken a key its replay needs. PostgreSQL cannot reach this
+            // state; the refusal is the unique violation it would have
+            // given the OTHER writer, and the record stays for a ROLLBACK
+            // PREPARED.
+            Err(e @ (StorageError::DuplicateKey(_) | StorageError::DuplicateId)) => {
+                Err(Self::user_error(
+                    "23505", // unique_violation
+                    format!(
+                        "could not commit prepared transaction \"{gid}\": a row written \
+                         since it was prepared has a key it inserts ({e})"
+                    ),
+                ))
+            }
+            Err(e) => Err(Self::storage_err(
+                "could not finish the prepared transaction",
+                e,
+            )),
         }
     }
 
@@ -8868,7 +8882,14 @@ impl PgHandler {
                 let tables = self.truncate_set(&tables, cascade)?;
                 for table in &tables {
                     self.storage
-                        .delete_matching(self.db(), table, &Document::new(), 0, &Document::new(), None)
+                        .delete_matching(
+                            self.db(),
+                            table,
+                            &Document::new(),
+                            0,
+                            &Document::new(),
+                            None,
+                        )
                         .map_err(|e| Self::storage_err("could not truncate", e))?;
                 }
                 if restart_identity {

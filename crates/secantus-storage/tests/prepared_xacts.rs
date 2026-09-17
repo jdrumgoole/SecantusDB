@@ -89,7 +89,11 @@ fn assert_untouched(st: &Storage) {
         rows(st, "t"),
         vec![doc! {"_id": 1, "b": "base"}, doc! {"_id": 3, "b": "going"}]
     );
-    assert!(!st.list_collections("app").unwrap().iter().any(|c| c == "made"));
+    assert!(!st
+        .list_collections("app")
+        .unwrap()
+        .iter()
+        .any(|c| c == "made"));
 }
 
 fn assert_applied(st: &Storage) {
@@ -176,7 +180,9 @@ fn prepared_transaction_survives_reopen_and_commits() {
     st.rollback_prepared("g4").unwrap();
     assert!(gids(&st).is_empty());
     // g4's row (id 5) never landed.
-    assert!(rows(&st, "t").iter().all(|d| d.get_i32("_id").unwrap() != 5));
+    assert!(rows(&st, "t")
+        .iter()
+        .all(|d| d.get_i32("_id").unwrap() != 5));
     drop(st);
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -224,7 +230,11 @@ fn ddl_first_prepared_transaction_replays_after_reopen() {
     }
     let st = Storage::open(home.to_str().unwrap()).unwrap();
     assert_eq!(gids(&st), vec!["ddl".to_string()]);
-    assert!(!st.list_collections("app").unwrap().iter().any(|c| c == "made"));
+    assert!(!st
+        .list_collections("app")
+        .unwrap()
+        .iter()
+        .any(|c| c == "made"));
     st.commit_prepared("ddl").unwrap();
     assert_eq!(rows(&st, "made"), vec![doc! {"_id": 9}]);
     drop(st);
@@ -260,9 +270,52 @@ fn bookkeeping_outside_the_block_keeps_the_prepared_write_set_whole() {
         assert_eq!(rows(&st, "counter"), vec![doc! {"_id": "next", "n": 1}]);
     }
     let st = Storage::open(home.to_str().unwrap()).unwrap();
-    assert!(!st.list_collections("app").unwrap().iter().any(|c| c == "made"));
+    assert!(!st
+        .list_collections("app")
+        .unwrap()
+        .iter()
+        .any(|c| c == "made"));
     st.commit_prepared("mid").unwrap();
     assert_eq!(rows(&st, "made"), vec![doc! {"_id": 1}, doc! {"_id": 2}]);
+    drop(st);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A recovered prepared transaction holds no row locks (it is a record, not
+/// an open WiredTiger transaction), so a write can slip in under it. The
+/// replay must not paper over that: an insert whose unique key now exists
+/// fails the COMMIT PREPARED, nothing of the replay lands, and the record
+/// stays for a ROLLBACK PREPARED.
+#[test]
+fn replay_refuses_a_key_taken_since_the_prepare() {
+    let home = temp_home();
+    {
+        let st = Storage::open(home.to_str().unwrap()).unwrap();
+        st.create_collection("app", "t").unwrap();
+        st.create_index("app", "t", "a_1", &doc! {"a": 1}, &doc! {"unique": true})
+            .unwrap();
+        let mut txn = st.begin_user_transaction().unwrap();
+        st.with_user_transaction(&mut txn, || {
+            st.insert_one("app", "t", &enc(&doc! {"_id": 1, "a": 1}))?;
+            st.insert_one("app", "t", &enc(&doc! {"_id": 2, "a": 2}))
+        })
+        .unwrap()
+        .unwrap();
+        st.prepare_user_transaction(txn, "taken", "postgres", "postgres")
+            .unwrap();
+    }
+    let st = Storage::open(home.to_str().unwrap()).unwrap();
+    st.insert_one("app", "t", &enc(&doc! {"_id": 9, "a": 2}))
+        .unwrap();
+    let err = st.commit_prepared("taken").unwrap_err();
+    assert!(
+        matches!(err, StorageError::DuplicateKey(_)),
+        "expected a duplicate-key refusal, got {err:?}"
+    );
+    assert_eq!(rows(&st, "t"), vec![doc! {"_id": 9, "a": 2}]);
+    assert_eq!(gids(&st), vec!["taken".to_string()]);
+    st.rollback_prepared("taken").unwrap();
+    assert!(gids(&st).is_empty());
     drop(st);
     let _ = std::fs::remove_dir_all(&home);
 }
