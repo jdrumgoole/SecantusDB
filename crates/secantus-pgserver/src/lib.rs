@@ -435,6 +435,283 @@ impl DatabaseRegistry {
     }
 }
 
+/// One role, as `pg_roles` / `pg_authid` show it. Roles are cluster-wide,
+/// so they live beside the database registry in the `__secantus_pg__`
+/// namespace, where dropping any user database cannot take them along.
+///
+/// A password is stored as PostgreSQL stores it -- the SCRAM-SHA-256
+/// verifier `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>`,
+/// derived here from a plaintext `PASSWORD`, or kept verbatim when the
+/// client already sent a verifier (libpq's `PQchangePassword` does). It is
+/// recorded and never checked: every connection is trusted.
+#[derive(Clone, Debug)]
+struct RoleInfo {
+    oid: i64,
+    name: String,
+    superuser: bool,
+    inherit: bool,
+    createrole: bool,
+    createdb: bool,
+    canlogin: bool,
+    replication: bool,
+    bypassrls: bool,
+    connlimit: i64,
+    password: Option<String>,
+    /// A `timestamptz` value (`Bson::DateTime`, or the text `infinity`),
+    /// `Bson::Null` when unset.
+    valid_until: Bson,
+}
+
+impl RoleInfo {
+    /// The bootstrap superuser `initdb` creates, oid 10.
+    const BOOTSTRAP_OID: i64 = 10;
+
+    fn bootstrap() -> Self {
+        RoleInfo {
+            oid: Self::BOOTSTRAP_OID,
+            name: "postgres".to_string(),
+            superuser: true,
+            inherit: true,
+            createrole: true,
+            createdb: true,
+            canlogin: true,
+            replication: true,
+            bypassrls: true,
+            connlimit: -1,
+            password: None,
+            valid_until: Bson::Null,
+        }
+    }
+
+    /// `CREATE ROLE`'s defaults: no attributes, no login, inheriting.
+    fn new(oid: i64, name: &str) -> Self {
+        RoleInfo {
+            oid,
+            name: name.to_string(),
+            superuser: false,
+            inherit: true,
+            createrole: false,
+            createdb: false,
+            canlogin: false,
+            replication: false,
+            bypassrls: false,
+            connlimit: -1,
+            password: None,
+            valid_until: Bson::Null,
+        }
+    }
+
+    fn from_doc(d: &Document) -> Option<Self> {
+        let flag = |k: &str| d.get_bool(k).unwrap_or(false);
+        Some(RoleInfo {
+            oid: d.get("oid").and_then(bson_i64)?,
+            name: d.get_str("_id").ok()?.to_string(),
+            superuser: flag("superuser"),
+            inherit: flag("inherit"),
+            createrole: flag("createrole"),
+            createdb: flag("createdb"),
+            canlogin: flag("canlogin"),
+            replication: flag("replication"),
+            bypassrls: flag("bypassrls"),
+            connlimit: d.get("connlimit").and_then(bson_i64).unwrap_or(-1),
+            password: d.get_str("password").ok().map(str::to_string),
+            valid_until: d.get("valid_until").cloned().unwrap_or(Bson::Null),
+        })
+    }
+
+    fn to_doc(&self) -> Document {
+        let mut d = bson::doc! {
+            "_id": &self.name,
+            "oid": self.oid,
+            "superuser": self.superuser,
+            "inherit": self.inherit,
+            "createrole": self.createrole,
+            "createdb": self.createdb,
+            "canlogin": self.canlogin,
+            "replication": self.replication,
+            "bypassrls": self.bypassrls,
+            "connlimit": self.connlimit,
+            "valid_until": self.valid_until.clone(),
+        };
+        if let Some(pw) = &self.password {
+            d.insert("password", pw.clone());
+        }
+        d
+    }
+
+    /// The verifier PostgreSQL stores for a plaintext password under
+    /// `password_encryption = scram-sha-256`: 4096 iterations, a 16-byte
+    /// salt. A value that already IS a verifier (SCRAM or md5) is kept as
+    /// sent, which is how `PQchangePassword` and a dump/restore work.
+    fn verifier(password: &str) -> PgWireResult<String> {
+        if password.starts_with("SCRAM-SHA-256$")
+            || (password.len() == 35
+                && password.starts_with("md5")
+                && password[3..].bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            return Ok(password.to_string());
+        }
+        let salt: [u8; 16] = rand::random();
+        let creds = secantus_auth::derive_credentials(password, Some(4096), Some(salt.to_vec()))
+            .map_err(|e| {
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".into(),
+                    "22021".into(), // character_not_in_repertoire
+                    format!("invalid password: {e}"),
+                )))
+            })?;
+        Ok(format!(
+            "SCRAM-SHA-256${}:{}${}:{}",
+            creds.iteration_count,
+            creds.salt_b64(),
+            creds.stored_key_b64(),
+            creds.server_key_b64()
+        ))
+    }
+}
+
+impl PgHandler {
+    /// Where the `CREATE ROLE` records live: the cluster-wide namespace.
+    const ROLE_COLLECTION: &'static str = "roles";
+
+    /// Every role in `pg_roles` order: the bootstrap superuser, then the
+    /// recorded ones by oid.
+    fn roles(&self) -> PgWireResult<Vec<RoleInfo>> {
+        let ns = DatabaseRegistry::NAMESPACE;
+        let mut out = vec![RoleInfo::bootstrap()];
+        let exists = self
+            .storage
+            .collection_exists(ns, Self::ROLE_COLLECTION)
+            .map_err(|e| Self::storage_err("could not read the roles", e))?;
+        if !exists {
+            return Ok(out);
+        }
+        let mut stored: Vec<RoleInfo> = self
+            .storage
+            .find_matching(ns, Self::ROLE_COLLECTION, &Document::new())
+            .map_err(|e| Self::storage_err("could not read the roles", e))?
+            .iter()
+            .filter_map(|bytes| bson::from_slice::<Document>(bytes).ok())
+            .filter_map(|d| RoleInfo::from_doc(&d))
+            .filter(|r| r.oid != RoleInfo::BOOTSTRAP_OID)
+            .collect();
+        stored.sort_by_key(|r| r.oid);
+        out.extend(stored);
+        Ok(out)
+    }
+
+    fn role(&self, name: &str) -> PgWireResult<Option<RoleInfo>> {
+        Ok(self.roles()?.into_iter().find(|r| r.name == name))
+    }
+
+    /// Records a role, new or changed. A new one gets the next oid past every
+    /// role and database, as PostgreSQL mints from one counter.
+    fn write_role(&self, info: &RoleInfo, new: bool) -> PgWireResult<()> {
+        let ns = DatabaseRegistry::NAMESPACE;
+        let exists = self
+            .storage
+            .collection_exists(ns, Self::ROLE_COLLECTION)
+            .map_err(|e| Self::storage_err("could not record the role", e))?;
+        if !exists {
+            self.storage
+                .create_collection(ns, Self::ROLE_COLLECTION)
+                .map_err(|e| Self::storage_err("could not record the role", e))?;
+        }
+        let bytes = bson::to_vec(&info.to_doc())
+            .map_err(|e| Self::storage_err("could not encode the role", e))?;
+        if new {
+            self.storage
+                .insert(ns, Self::ROLE_COLLECTION, vec![bytes], true)
+                .map_err(|e| Self::storage_err("could not record the role", e))?;
+        } else {
+            self.storage
+                .replace_by_id(
+                    ns,
+                    Self::ROLE_COLLECTION,
+                    &Bson::String(info.name.clone()),
+                    &bytes,
+                )
+                .map_err(|e| Self::storage_err("could not record the role", e))?;
+        }
+        Ok(())
+    }
+
+    fn next_role_oid(&self) -> PgWireResult<i64> {
+        let roles = self.roles()?.iter().map(|r| r.oid).max().unwrap_or(0);
+        let dbs = self
+            .databases
+            .all(&self.storage)?
+            .iter()
+            .map(|d| d.oid)
+            .max()
+            .unwrap_or(0);
+        Ok(roles.max(dbs).max(DatabaseRegistry::FIRST_USER_OID) + 1)
+    }
+
+    fn delete_role(&self, name: &str) -> PgWireResult<()> {
+        self.storage
+            .delete_matching(
+                DatabaseRegistry::NAMESPACE,
+                Self::ROLE_COLLECTION,
+                &bson::doc! {"_id": name},
+                0,
+                &Document::new(),
+                None,
+            )
+            .map_err(|e| Self::storage_err("could not drop the role", e))?;
+        Ok(())
+    }
+
+    /// Apply a `CREATE / ALTER ROLE` option list to a role.
+    fn apply_role_options(
+        &self,
+        info: &mut RoleInfo,
+        options: &secantus_pgplan::RoleOptions,
+    ) -> PgWireResult<()> {
+        let set = |slot: &mut bool, v: Option<bool>| {
+            if let Some(v) = v {
+                *slot = v;
+            }
+        };
+        set(&mut info.canlogin, options.login);
+        set(&mut info.superuser, options.superuser);
+        set(&mut info.createdb, options.createdb);
+        set(&mut info.createrole, options.createrole);
+        set(&mut info.inherit, options.inherit);
+        set(&mut info.replication, options.replication);
+        set(&mut info.bypassrls, options.bypassrls);
+        if let Some(n) = options.connection_limit {
+            info.connlimit = n;
+        }
+        match &options.password {
+            Some(Some(pw)) if pw.is_empty() => {
+                self.notice(
+                    "00000",
+                    "empty string is not a valid password, clearing password".to_string(),
+                    None,
+                );
+                info.password = None;
+            }
+            Some(Some(pw)) => info.password = Some(RoleInfo::verifier(pw)?),
+            Some(None) => info.password = None,
+            None => {}
+        }
+        if let Some(text) = &options.valid_until {
+            let tz = self.session_timezone();
+            info.valid_until = secantus_pgplan::cast_text_to(text, "timestamptz", &tz)
+                .map_err(|e| Self::err(&e))?;
+        }
+        Ok(())
+    }
+
+    fn session_user_name(&self) -> String {
+        self.session_user
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
 /// One database's worth of SQL over a shared `Storage`.
 pub struct PgHandler {
     storage: Arc<Storage>,
@@ -2763,6 +3040,40 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("extrelocatable", "bool", false),
                 ],
             )),
+            // `pg_roles` is PostgreSQL's view over `pg_authid` with the
+            // password masked; `pg_user` the older view over LOGIN roles.
+            "pg_roles" | "pg_authid" => Some(TableDef::new(
+                name,
+                vec![
+                    secantus_pgcatalog::Column::new("oid", "oid", false),
+                    secantus_pgcatalog::Column::new("rolname", "name", false),
+                    secantus_pgcatalog::Column::new("rolsuper", "bool", false),
+                    secantus_pgcatalog::Column::new("rolinherit", "bool", false),
+                    secantus_pgcatalog::Column::new("rolcreaterole", "bool", false),
+                    secantus_pgcatalog::Column::new("rolcreatedb", "bool", false),
+                    secantus_pgcatalog::Column::new("rolcanlogin", "bool", false),
+                    secantus_pgcatalog::Column::new("rolreplication", "bool", false),
+                    secantus_pgcatalog::Column::new("rolconnlimit", "int4", false),
+                    secantus_pgcatalog::Column::new("rolpassword", "text", false),
+                    secantus_pgcatalog::Column::new("rolvaliduntil", "timestamptz", false),
+                    secantus_pgcatalog::Column::new("rolbypassrls", "bool", false),
+                    secantus_pgcatalog::Column::new("rolconfig", "text[]", false),
+                ],
+            )),
+            "pg_user" => Some(TableDef::new(
+                "pg_user",
+                vec![
+                    secantus_pgcatalog::Column::new("usename", "name", false),
+                    secantus_pgcatalog::Column::new("usesysid", "oid", false),
+                    secantus_pgcatalog::Column::new("usecreatedb", "bool", false),
+                    secantus_pgcatalog::Column::new("usesuper", "bool", false),
+                    secantus_pgcatalog::Column::new("userepl", "bool", false),
+                    secantus_pgcatalog::Column::new("usebypassrls", "bool", false),
+                    secantus_pgcatalog::Column::new("passwd", "text", false),
+                    secantus_pgcatalog::Column::new("valuntil", "timestamptz", false),
+                    secantus_pgcatalog::Column::new("useconfig", "text[]", false),
+                ],
+            )),
             "pg_attribute" => Some(TableDef::new(
                 "pg_attribute",
                 vec![
@@ -3029,6 +3340,64 @@ impl PgHandler {
                     rows.push(d);
                 }
                 rows
+            }
+            "pg_roles" | "pg_authid" => {
+                let field = |n: &str| def.field_of(n).expect("column");
+                // `pg_roles` masks every password as `********` whether or
+                // not one is set; `pg_authid` carries the verifier.
+                let masked = name == "pg_roles";
+                self.roles()
+                    .ok()?
+                    .into_iter()
+                    .map(|r| {
+                        let mut d = Document::new();
+                        d.insert(field("oid"), Bson::Int64(r.oid));
+                        d.insert(field("rolname"), r.name);
+                        d.insert(field("rolsuper"), Bson::Boolean(r.superuser));
+                        d.insert(field("rolinherit"), Bson::Boolean(r.inherit));
+                        d.insert(field("rolcreaterole"), Bson::Boolean(r.createrole));
+                        d.insert(field("rolcreatedb"), Bson::Boolean(r.createdb));
+                        d.insert(field("rolcanlogin"), Bson::Boolean(r.canlogin));
+                        d.insert(field("rolreplication"), Bson::Boolean(r.replication));
+                        d.insert(
+                            field("rolconnlimit"),
+                            Bson::Int32(i32::try_from(r.connlimit).unwrap_or(-1)),
+                        );
+                        d.insert(
+                            field("rolpassword"),
+                            if masked {
+                                Bson::String("********".to_string())
+                            } else {
+                                r.password.map_or(Bson::Null, Bson::String)
+                            },
+                        );
+                        d.insert(field("rolvaliduntil"), r.valid_until);
+                        d.insert(field("rolbypassrls"), Bson::Boolean(r.bypassrls));
+                        d.insert(field("rolconfig"), Bson::Null);
+                        d
+                    })
+                    .collect()
+            }
+            "pg_user" => {
+                let field = |n: &str| def.field_of(n).expect("column");
+                self.roles()
+                    .ok()?
+                    .into_iter()
+                    .filter(|r| r.canlogin)
+                    .map(|r| {
+                        let mut d = Document::new();
+                        d.insert(field("usename"), r.name);
+                        d.insert(field("usesysid"), Bson::Int64(r.oid));
+                        d.insert(field("usecreatedb"), Bson::Boolean(r.createdb));
+                        d.insert(field("usesuper"), Bson::Boolean(r.superuser));
+                        d.insert(field("userepl"), Bson::Boolean(r.replication));
+                        d.insert(field("usebypassrls"), Bson::Boolean(r.bypassrls));
+                        d.insert(field("passwd"), Bson::String("********".to_string()));
+                        d.insert(field("valuntil"), r.valid_until);
+                        d.insert(field("useconfig"), Bson::Null);
+                        d
+                    })
+                    .collect()
             }
             "pg_extension" => {
                 let mut rows = Vec::new();
@@ -3315,6 +3684,7 @@ impl PgHandler {
                     "pg_database",
                     "pg_class",
                     "pg_namespace",
+                    "pg_authid",
                 ] {
                     let mut d = Document::new();
                     d.insert(field("schemaname"), "pg_catalog");
@@ -8734,23 +9104,86 @@ impl PgHandler {
                 Ok(vec![Response::Execution(Tag::new("DROP EXTENSION"))])
             }
 
-            Statement::AlterRole { name, .. } => {
-                let me = self
-                    .session_user
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
-                if name != me {
+            Statement::CreateRole { name, options } => {
+                // Every connection is trusted, so the session's own user is a
+                // role that exists whether or not a record says so.
+                if self.role(&name)?.is_some() || name == self.session_user_name() {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
-                        "42704".into(), // undefined_object
-                        format!("role \"{name}\" does not exist"),
+                        "42710".into(), // duplicate_object
+                        format!("role \"{name}\" already exists"),
                     ))));
                 }
+                let mut info = RoleInfo::new(self.next_role_oid()?, &name);
+                self.apply_role_options(&mut info, &options)?;
+                self.write_role(&info, true)?;
+                Ok(vec![Response::Execution(Tag::new("CREATE ROLE"))])
+            }
+            Statement::AlterRole { name, options } => {
+                let (mut info, new) = match self.role(&name)? {
+                    Some(info) => (info, false),
+                    // The session's user connected without a record (trust
+                    // authentication): its first ALTER writes one, as a
+                    // LOGIN role.
+                    None if name == self.session_user_name() => {
+                        let mut info = RoleInfo::new(self.next_role_oid()?, &name);
+                        info.canlogin = true;
+                        (info, true)
+                    }
+                    None => {
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".into(),
+                            "42704".into(), // undefined_object
+                            format!("role \"{name}\" does not exist"),
+                        ))));
+                    }
+                };
+                self.apply_role_options(&mut info, &options)?;
+                self.write_role(&info, new)?;
                 Ok(vec![Response::Execution(Tag::new("ALTER ROLE"))])
             }
-            Statement::CreateRole { .. } | Statement::DropRole { .. } => {
-                Err(Self::err(&PlanError::Unsupported("roles".into())))
+            Statement::DropRole { names, if_exists } => {
+                // Every name is checked before any is dropped: PostgreSQL's
+                // DROP ROLE of a list is all or nothing.
+                let me = self.session_user_name();
+                let mut to_drop = Vec::new();
+                for name in &names {
+                    if name == "postgres" {
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".into(),
+                            "2BP01".into(), // dependent_objects_still_exist
+                            format!(
+                                "cannot drop role {name} because it is required by the database system"
+                            ),
+                        ))));
+                    }
+                    if *name == me {
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".into(),
+                            "55006".into(), // object_in_use
+                            "current user cannot be dropped".to_string(),
+                        ))));
+                    }
+                    if self.role(name)?.is_some() {
+                        to_drop.push(name.clone());
+                    } else if if_exists {
+                        self.notice(
+                            "00000",
+                            format!("role \"{name}\" does not exist, skipping"),
+                            None,
+                        );
+                    } else {
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".into(),
+                            "42704".into(), // undefined_object
+                            format!("role \"{name}\" does not exist"),
+                        ))));
+                    }
+                }
+                for name in &to_drop {
+                    self.delete_role(name)?;
+                }
+                Ok(vec![Response::Execution(Tag::new("DROP ROLE"))])
             }
 
             Statement::Show(name) => {

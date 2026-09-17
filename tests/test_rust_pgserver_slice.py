@@ -4626,6 +4626,13 @@ def test_timestamptz_columns_render_in_session_zone(home: Path) -> None:
             cur.execute("select t from tz where id = 1")
             assert cur.fetchone()[0].isoformat() == iso, zone
 
+        # `t::text` renders the instant in the session zone WITH its offset --
+        # the column's declared type drives the cast, not the stored carrier
+        # (a UTC instant, the same as a `timestamp`'s). Measured PG 16.
+        cur.execute("set timezone = 'Europe/Berlin'")
+        cur.execute("select t::text from tz where id = 1")
+        assert cur.fetchone() == ("2026-01-01 13:00:00+01",)
+
         # Sub-millisecond precision survives the instant round-trip.
         cur.execute("set timezone = 'UTC'")
         cur.execute("select t from tz where id = 2")
@@ -8895,3 +8902,134 @@ def test_create_extension_postgis_brings_geometry_as_ewkb(home: Path) -> None:
         cur.execute("drop extension postgis")
         cur.execute("select extname from pg_extension")
         assert cur.fetchall() == [("plpgsql",)]
+
+
+def test_create_role_records_the_role_and_its_verifier(home: Path) -> None:
+    """`CREATE / ALTER / DROP ROLE` (and their `USER` spellings) keep a
+    cluster-wide role catalog: `pg_roles` / `pg_user` mask every password as
+    `********`, `pg_authid` carries the SCRAM-SHA-256 verifier a plaintext
+    `PASSWORD` derives (4096 iterations, as `password_encryption =
+    scram-sha-256` does) or the verifier a client sent verbatim, `PASSWORD
+    NULL` clears it, and the errors and notices are PostgreSQL 16's: 42710,
+    42704 (and the IF EXISTS notice), 2BP01 for the bootstrap superuser,
+    55006 for the session's own user, 22007 for a bad `VALID UNTIL`. A
+    multi-name DROP is all or nothing. Passwords are recorded, never checked:
+    every connection is still trusted.
+    """
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        cur = conn.cursor()
+        notices = _notices(conn)
+        cur.execute("create user ashesh login password 'psycopg2'")
+        assert cur.statusmessage == "CREATE ROLE"
+        with pytest.raises(psycopg.errors.DuplicateObject) as exc:
+            cur.execute("create role ashesh")
+        assert _diag(exc.value)[:2] == ("42710", 'role "ashesh" already exists')
+        cur.execute(
+            "create role r2 superuser createdb createrole noinherit"
+            " connection limit 3 valid until '2030-01-01'"
+        )
+        cur.execute(
+            "select oid, rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb,"
+            " rolcanlogin, rolreplication, rolconnlimit, rolpassword, rolvaliduntil::text,"
+            " rolbypassrls, rolconfig from pg_roles order by oid"
+        )
+        rows = cur.fetchall()
+        assert rows[0] == (
+            10,
+            "postgres",
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            -1,
+            "********",
+            None,
+            True,
+            None,
+        )
+        assert [r[1:] for r in rows[1:]] == [
+            ("ashesh", False, True, False, False, True, False, -1, "********", None, False, None),
+            (
+                "r2",
+                True,
+                False,
+                True,
+                True,
+                False,
+                False,
+                3,
+                "********",
+                "2030-01-01 00:00:00+00",
+                False,
+                None,
+            ),
+        ]
+        assert rows[1][0] > 16384 and rows[2][0] > rows[1][0]
+        cur.execute("select usename, usesuper, passwd from pg_user order by usesysid")
+        assert cur.fetchall() == [("postgres", True, "********"), ("ashesh", False, "********")]
+
+        cur.execute("select rolpassword from pg_authid where rolname = 'ashesh'")
+        verifier = cur.fetchone()[0]
+        assert verifier.startswith("SCRAM-SHA-256$4096:")
+        cur.execute("alter user ashesh password NULL")
+        assert cur.statusmessage == "ALTER ROLE"
+        cur.execute("select rolpassword from pg_authid where rolname = 'ashesh'")
+        assert cur.fetchone() == (None,)
+        # What libpq's PQchangePassword sends: a client-side verifier, kept.
+        # It is inlined as a literal -- `PASSWORD $1` is a syntax error on
+        # PostgreSQL (gram.y takes only a string constant there).
+        sent = "SCRAM-SHA-256$4096:c2FsdA==$c3RvcmVk:c2VydmVy"
+        with pytest.raises(psycopg.errors.SyntaxError) as exc:
+            cur.execute("alter user ashesh password %s", (sent,))
+        assert _diag(exc.value)[:2] == ("42601", 'syntax error at or near "$1"')
+        from psycopg import sql
+
+        cur.execute(sql.SQL("alter user ashesh password {}").format(sql.Literal(sent)))
+        cur.execute("select rolpassword from pg_authid where rolname = 'ashesh'")
+        assert cur.fetchone() == (sent,)
+        cur.execute("create role emptypw password ''")
+        assert notices[-1][2] == "empty string is not a valid password, clearing password"
+        cur.execute("alter role r2 valid until 'infinity' nocreatedb")
+        cur.execute("select rolvaliduntil::text, rolcreatedb from pg_roles where rolname = 'r2'")
+        assert cur.fetchone() == ("infinity", False)
+        with pytest.raises(psycopg.errors.InvalidDatetimeFormat) as exc:
+            cur.execute("create role badvu valid until 'nonsense'")
+        assert _diag(exc.value)[:2] == (
+            "22007",
+            'invalid input syntax for type timestamp with time zone: "nonsense"',
+        )
+
+        with pytest.raises(psycopg.errors.UndefinedObject) as exc:
+            cur.execute("alter user nosuch password 'x'")
+        assert _diag(exc.value)[:2] == ("42704", 'role "nosuch" does not exist')
+        with pytest.raises(psycopg.errors.UndefinedObject):
+            cur.execute("drop user nosuch")
+        cur.execute("drop user if exists nosuch")
+        assert notices[-1][2] == 'role "nosuch" does not exist, skipping'
+        with pytest.raises(psycopg.errors.DependentObjectsStillExist) as exc:
+            cur.execute("drop role postgres")
+        assert _diag(exc.value)[:2] == (
+            "2BP01",
+            "cannot drop role postgres because it is required by the database system",
+        )
+        # The session's own user exists (it connected) even with no record.
+        cur.execute("alter user test password 'x'")
+        with pytest.raises(psycopg.errors.ObjectInUse) as exc:
+            cur.execute("drop role test")
+        assert _diag(exc.value)[:2] == ("55006", "current user cannot be dropped")
+        with pytest.raises(psycopg.errors.UndefinedObject):
+            cur.execute("drop role ashesh, nosuch")
+        cur.execute("select count(*) from pg_roles where rolname = 'ashesh'")
+        assert cur.fetchone() == (1,)
+        cur.execute("drop role ashesh, r2, emptypw")
+        assert cur.statusmessage == "DROP ROLE"
+        # Another session's user can drop it: 55006 is about the CURRENT user.
+        with psycopg.connect(
+            f"host=127.0.0.1 port={server.port} dbname=postgres user=postgres",
+            autocommit=True,
+        ) as other:
+            other.execute("drop role test")
+        cur.execute("select rolname from pg_roles")
+        assert cur.fetchall() == [("postgres",)]

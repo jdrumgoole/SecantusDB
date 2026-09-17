@@ -893,7 +893,19 @@ fn role_options(options: &[pg_query::protobuf::Node]) -> Result<RoleOptions> {
             "inherit" => out.inherit = Some(flag()),
             "isreplication" => out.replication = Some(flag()),
             "bypassrls" => out.bypassrls = Some(flag()),
-            "password" => out.password = Some(text()),
+            // `PASSWORD $1` parses here but is a syntax error on PostgreSQL
+            // (gram.y takes only `PASSWORD Sconst` / `PASSWORD NULL`; probed
+            // 16): a client that wants a bound password must inline it, as
+            // libpq's PQchangePassword does.
+            "password" => {
+                if let Some(N::ParamRef(p)) = d.arg.as_ref().and_then(|a| a.node.as_ref()) {
+                    return Err(Error::Parse(format!(
+                        "syntax error at or near \"${}\"",
+                        p.number
+                    )));
+                }
+                out.password = Some(text())
+            }
             "validUntil" => out.valid_until = text(),
             "connectionlimit" => {
                 out.connection_limit = match d.arg.as_ref().and_then(|a| a.node.as_ref()) {
@@ -943,8 +955,14 @@ fn def_elem_bool(d: &pg_query::protobuf::DefElem) -> bool {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColumnExpr {
     /// A chain of casts, innermost first: `oid::regtype::text` is
-    /// `["regtype", "text"]`.
-    Casts(Vec<String>),
+    /// `["regtype", "text"]`. `source` is the column's DECLARED type when the
+    /// planner knows it: a stored `timestamptz` renders `::text` in the
+    /// session zone, which the value alone (a UTC instant, the same carrier
+    /// as `timestamp`) cannot tell the executor.
+    Casts {
+        source: Option<String>,
+        chain: Vec<String>,
+    },
     /// A scalar call with the COLUMN somewhere among constant arguments --
     /// `regexp_replace(statement, 'pat', '', 'i')`. `None` marks the column's
     /// position; `result_type` is fixed at plan time so the DESCRIBE pass,
@@ -3166,7 +3184,10 @@ fn plan_table_targets(
                     rt.name.clone()
                 };
                 columns.push((out, field));
-                casts.push(Some(ColumnExpr::Casts(chain)));
+                casts.push(Some(ColumnExpr::Casts {
+                    source: def.column(&col_name).map(|c| c.pg_type.clone()),
+                    chain,
+                }));
                 continue;
             }
             // `regexp_replace(statement, 'pat', '', 'i') AS statement` -- a
@@ -3824,7 +3845,10 @@ fn plan_join_select(
                     rt.name.clone()
                 };
                 columns.push((out, col_name.0, col_name.1));
-                exprs.push(Some(ColumnExpr::Casts(chain.1)));
+                exprs.push(Some(ColumnExpr::Casts {
+                    source: None,
+                    chain: chain.1,
+                }));
             }
             // `coalesce(a.col, <fallback>) AS out` -- one column argument, the
             // rest constants. A LEFT-JOIN miss makes the column NULL and the
@@ -4020,7 +4044,7 @@ pub fn join_output_def(
         // table 0 / column 0 (measured 16).
         let expr = join.exprs.get(i).and_then(|e| e.as_ref());
         let (ty, source) = match expr {
-            Some(ColumnExpr::Casts(_))
+            Some(ColumnExpr::Casts { .. })
             | Some(ColumnExpr::Call { .. })
             | Some(ColumnExpr::Const { .. }) => {
                 (column_expr_type(expr.expect("some")).to_string(), None)
@@ -4913,7 +4937,7 @@ pub fn display_type(internal: &str) -> String {
 /// casts (`generate_series(1, 2)::int4`, `...::int4::text`).
 ///
 /// Returns the underlying `FuncCall` plus the cast chain, innermost-first, so
-/// `apply_column_expr(ColumnExpr::Casts(chain))` reproduces PostgreSQL's
+/// `apply_column_expr(ColumnExpr::Casts { chain, .. })` reproduces PostgreSQL's
 /// left-to-right cast application over each generated value. `None` when the
 /// node is not a series (or is a series beside some other expression a cast
 /// can't strip).
@@ -5032,7 +5056,10 @@ fn plan_select_srf(
     let cast = if cast_chain.is_empty() {
         None
     } else {
-        Some(ColumnExpr::Casts(cast_chain))
+        Some(ColumnExpr::Casts {
+            source: None,
+            chain: cast_chain,
+        })
     };
     Ok(Some(Statement::Select(Select {
         table: String::new(),
@@ -6584,6 +6611,7 @@ const CATALOG_RELATIONS: &[(&str, i64)] = &[
     ("pg_enum", 3501),
     ("pg_range", 3541),
     ("pg_extension", 3079),
+    ("pg_authid", 1260),
 ];
 
 /// The display rendering of a regclass value: the relation's name, quoted
@@ -7684,9 +7712,12 @@ fn regexp_replace(args: &[Bson]) -> Result<Bson> {
 /// layer's door: the executor holds rows and this holds the evaluators.
 pub fn apply_column_expr(expr: &ColumnExpr, value: Bson, tz: &TimeZoneSetting) -> Result<Bson> {
     match expr {
-        ColumnExpr::Casts(chain) => {
+        ColumnExpr::Casts { source, chain } => {
             let mut v = value;
-            let mut prev: Option<&str> = None;
+            let mut prev: Option<&str> = match source.as_deref() {
+                Some("timestamptz") | Some("timestamp with time zone") => Some("timestamptz"),
+                _ => None,
+            };
             for target in chain {
                 // timestamptz -> text renders the instant in the session zone.
                 if target == "text" && prev == Some("timestamptz") {
@@ -7741,7 +7772,7 @@ pub fn apply_column_expr(expr: &ColumnExpr, value: Bson, tz: &TimeZoneSetting) -
 /// The type a ColumnExpr's column reads back as.
 pub fn column_expr_type(expr: &ColumnExpr) -> &str {
     match expr {
-        ColumnExpr::Casts(chain) => chain.last().map(String::as_str).unwrap_or("text"),
+        ColumnExpr::Casts { chain, .. } => chain.last().map(String::as_str).unwrap_or("text"),
         ColumnExpr::Call { result_type, .. } => result_type,
         // A coalesce keeps its column's type; join_output_def resolves that
         // from the side column, so this fallback is not used for typing.
