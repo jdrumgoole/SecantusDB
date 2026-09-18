@@ -2211,6 +2211,22 @@ jobs:
           cargo build --manifest-path crates/secantusdb/Cargo.toml --bin secantusd-rs
           test -x crates/secantusdb/target/debug/secantusd-rs
 
+      # The embedded serve path (`bind` / `RunningPgServer::stop`) and, most of
+      # all, its DURABILITY property: start, write over the wire, stop, reopen
+      # the same home, and the rows are still there. Without a checkpoint on
+      # stop those writes are gone while the client was told they succeeded, so
+      # this is gated in CI rather than left to whoever remembers to run
+      # `cargo test` locally. `cargo build --bin` above does not build tests.
+      - name: Run the embedded pgserver tests
+        shell: bash
+        run: |
+          WT="$PWD/$(ls -d build/*/wt-build | head -1)"
+          export SECANTUS_WT_INCLUDE="$WT/include" SECANTUS_WT_LIB="$WT"
+          lc="$(find /usr/lib /usr/lib64 -name 'libclang*.so*' 2>/dev/null | head -1)"
+          test -n "$lc" || { echo "libclang not found" >&2; exit 1; }
+          export LIBCLANG_PATH="$(dirname "$lc")"
+          (cd crates/secantus-pgserver && cargo test --test embedded)
+
       - name: Verify the reference server is reachable
         # Fail CLOSED. The whole point of this job is that these suites stop
         # skipping, and a skip is invisible in a green pytest summary — so
