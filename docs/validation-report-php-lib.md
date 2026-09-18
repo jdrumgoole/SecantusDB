@@ -1,32 +1,30 @@
 # mongo-php-library Validation Report
 
-Generated 2026-09-18 — SecantusDB 0.6.0b16 vs mongo-php-library 12e56461166d (`vendor/mongo-php-library/`).
+Generated 2026-09-18 — SecantusDB 0.6.0b16 vs mongo-php-library unknown (`vendor/mongo-php-library/`).
 
 Run `uv run python -m invoke validate-php-lib` to refresh. The pass rate is the analogue of the pymongo / mongo-go-driver / mongo-node-driver / mongo-java-driver / mongo-ruby-driver gauges for the official high-level PHP library — the `mongodb/mongodb` package Laravel + Symfony applications build on.
 
 ## Summary by category
 
-| Category | Passed | Failed | Skipped | Total | Pass rate |
-|---|---:|---:|---:|---:|---:|
-| `tests/Builder` | 732 | 0 | 0 | 732 | 100.0% |
-| `tests/Collection` | 159 | 0 | 1 | 160 | 100.0% |
-| `tests/Command` | 53 | 0 | 0 | 53 | 100.0% |
-| `tests/Comparator` | 31 | 0 | 0 | 31 | 100.0% |
-| `tests/Database` | 70 | 0 | 0 | 70 | 100.0% |
-| `tests/Functions` | 0 | 0 | 4 | 4 | — |
-| `tests/Model` | 141 | 1 | 0 | 142 | 99.2% |
-| `tests/Operation` | 1903 | 0 | 35 | 1938 | 100.0% |
-| **Overall** | **3089** | **1** | **40** | **3130** | **99.9%** |
+| Category | Passed | Failed | Expected | Skipped | Total | Pass rate | Adjusted |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `tests/Builder` | 732 | 0 | 0 | 0 | 732 | 100.0% | 100.0% |
+| `tests/Collection` | 159 | 0 | 0 | 1 | 160 | 100.0% | 100.0% |
+| `tests/Command` | 53 | 0 | 0 | 0 | 53 | 100.0% | 100.0% |
+| `tests/Comparator` | 31 | 0 | 0 | 0 | 31 | 100.0% | 100.0% |
+| `tests/Database` | 70 | 0 | 0 | 0 | 70 | 100.0% | 100.0% |
+| `tests/Functions` | 0 | 0 | 0 | 4 | 4 | — | — |
+| `tests/Model` | 141 | 0 | 1 | 0 | 142 | 99.2% | 100.0% |
+| `tests/Operation` | 1903 | 0 | 0 | 35 | 1938 | 100.0% | 100.0% |
+| **Overall** | **3089** | **0** | **1** | **40** | **3130** | **99.9%** | **100.0%** |
 
 Run time: 4.85s.
 
-## Failures (1)
+## Expected failures (1)
 
-First 30 failed cases for triage:
+Documented gaps, declared in `validation_summary/expected_failures.py`. They still FAILED — the gauge is not told to skip them — and they are counted in the plain pass rate. The adjusted column is the same number with them removed from the denominator.
 
-```
-tests/Model :: MongoDB\Tests\Model\IndexInfoFunctionalTest::testIsText
-```
+- `tests/Model :: MongoDB\Tests\Model\IndexInfoFunctionalTest::testIsText` — Text indexes (`$text`, `$meta: textScore`, text-index creation) are intentionally out of scope per CLAUDE.md — would require a full-text index implementation. The driver's own error names it: `text indexes are not supported by SecantusDB`. Documented in tasks/backlog.md §4. The SAME gap is already declared for the node and pymongo gauges; php-library was the one left reading as an unexplained failure.
 
 ## How this is generated
 

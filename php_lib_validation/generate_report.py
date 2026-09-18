@@ -18,6 +18,7 @@ import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
 
+from validation_summary.expected_failures import PHP_LIB, find_match
 from validation_summary.rates import pass_rate
 
 import secantus
@@ -58,9 +59,10 @@ def render(xml_path: Path, out_path: Path) -> None:
     root = ET.parse(xml_path).getroot()
 
     by_cat: dict[str, dict[str, int]] = defaultdict(
-        lambda: {"passed": 0, "failed": 0, "skipped": 0}
+        lambda: {"passed": 0, "failed": 0, "expected": 0, "skipped": 0}
     )
     failures: list[tuple[str, str]] = []
+    expected: list[tuple[str, str]] = []
     duration = 0.0
 
     for suite in root.iter("testsuite"):
@@ -78,27 +80,41 @@ def render(xml_path: Path, out_path: Path) -> None:
         cat = _category_for(case)
         name = f"{case.attrib.get('class', '?')}::{case.attrib.get('name', '?')}"
         if case.find("failure") is not None or case.find("error") is not None:
-            by_cat[cat]["failed"] += 1
-            failures.append((cat, name))
+            # A documented out-of-scope gap counts separately, so the rate is
+            # neither gamed by dropping the test nor dragged down by one whose
+            # outcome this server cannot influence. BOTH columns ship: the plain
+            # rate keeps the failure visible, the adjusted one answers "how much
+            # of the conformable surface conforms".
+            match = find_match(PHP_LIB, name)
+            if match is not None:
+                by_cat[cat]["expected"] += 1
+                expected.append((f"tests/{cat} :: {name}", match.rationale))
+            else:
+                by_cat[cat]["failed"] += 1
+                failures.append((cat, name))
         elif case.find("skipped") is not None:
             by_cat[cat]["skipped"] += 1
         else:
             by_cat[cat]["passed"] += 1
 
-    rows: list[tuple[str, int, int, int, int, str]] = []
-    totals = {"passed": 0, "failed": 0, "skipped": 0}
+    rows: list[tuple[str, int, int, int, int, int, str, str]] = []
+    totals = {"passed": 0, "failed": 0, "expected": 0, "skipped": 0}
     for cat in sorted(by_cat):
         b = by_cat[cat]
-        total = b["passed"] + b["failed"] + b["skipped"]
-        ran = b["passed"] + b["failed"]
+        total = b["passed"] + b["failed"] + b["expected"] + b["skipped"]
+        ran = b["passed"] + b["failed"] + b["expected"]
         rate = pass_rate(b["passed"], ran)
-        rows.append((cat, b["passed"], b["failed"], b["skipped"], total, rate))
+        adjusted = pass_rate(b["passed"], ran - b["expected"])
+        rows.append(
+            (cat, b["passed"], b["failed"], b["expected"], b["skipped"], total, rate, adjusted)
+        )
         for k in totals:
             totals[k] += b[k]
 
     grand_total = sum(totals.values())
-    grand_ran = totals["passed"] + totals["failed"]
+    grand_ran = totals["passed"] + totals["failed"] + totals["expected"]
     grand_rate = pass_rate(totals["passed"], grand_ran)
+    grand_adjusted = pass_rate(totals["passed"], grand_ran - totals["expected"])
 
     md: list[str] = []
     md.append("# mongo-php-library Validation Report")
@@ -119,13 +135,14 @@ def render(xml_path: Path, out_path: Path) -> None:
     md.append("")
     md.append("## Summary by category")
     md.append("")
-    md.append("| Category | Passed | Failed | Skipped | Total | Pass rate |")
-    md.append("|---|---:|---:|---:|---:|---:|")
-    for cat, p, f, sk, t, r in rows:
-        md.append(f"| `tests/{cat}` | {p} | {f} | {sk} | {t} | {r} |")
+    md.append("| Category | Passed | Failed | Expected | Skipped | Total | Pass rate | Adjusted |")
+    md.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+    for cat, p, f, e, sk, t, r, adj in rows:
+        md.append(f"| `tests/{cat}` | {p} | {f} | {e} | {sk} | {t} | {r} | {adj} |")
     md.append(
         f"| **Overall** | **{totals['passed']}** | **{totals['failed']}** | "
-        f"**{totals['skipped']}** | **{grand_total}** | **{grand_rate}** |"
+        f"**{totals['expected']}** | **{totals['skipped']}** | **{grand_total}** | "
+        f"**{grand_rate}** | **{grand_adjusted}** |"
     )
     md.append("")
     md.append(f"Run time: {duration:.2f}s.")
@@ -142,6 +159,20 @@ def render(xml_path: Path, out_path: Path) -> None:
         md.append("```")
         if len(failures) > 30:
             md.append(f"... and {len(failures) - 30} more (see JUnit XML).")
+        md.append("")
+
+    if expected:
+        md.append(f"## Expected failures ({len(expected)})")
+        md.append("")
+        md.append(
+            "Documented gaps, declared in `validation_summary/expected_failures.py`. "
+            "They still FAILED — the gauge is not told to skip them — and they are "
+            "counted in the plain pass rate. The adjusted column is the same number "
+            "with them removed from the denominator."
+        )
+        md.append("")
+        for title, rationale in expected:
+            md.append(f"- `{title}` — {rationale}")
         md.append("")
 
     md.append("## How this is generated")
