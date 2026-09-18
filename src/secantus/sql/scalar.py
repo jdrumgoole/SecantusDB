@@ -33,6 +33,7 @@ from sqlglot import exp
 
 from secantus.paths import get_path
 from secantus.sql import errors, typemap
+from secantus.sql import ranges as _ranges
 
 # jsonb navigation (->, ->>, #>, #>>); the scalar (->> / #>>) variants render text.
 _JSONB_NAV = (exp.JSONExtract, exp.JSONExtractScalar, exp.JSONBExtract, exp.JSONBExtractScalar)
@@ -2619,8 +2620,12 @@ def _eval_json_strip_nulls(node: exp.Expression, scope: Scope, ctx: ScalarContex
 _SCALAR_FUNC_NODES: dict[type, Callable[[exp.Expression, Scope, ScalarContext], Any]] = {
     # ``upper`` / ``lower`` are overloaded: a range operand yields its bound, any
     # other operand is the string case-shift.
-    exp.Upper: _unary(lambda v: v.get("upper") if isinstance(v, dict) else _as_text(v).upper()),
-    exp.Lower: _unary(lambda v: v.get("lower") if isinstance(v, dict) else _as_text(v).lower()),
+    exp.Upper: _unary(
+        lambda v: _ranges.upper_bound(v) if isinstance(v, dict) else _as_text(v).upper()
+    ),
+    exp.Lower: _unary(
+        lambda v: _ranges.lower_bound(v) if isinstance(v, dict) else _as_text(v).lower()
+    ),
     # ``length()`` — a bytea's byte count, else the string's character length.
     exp.Length: _unary(_length_of),
     exp.Trim: lambda n, s, c: _eval_trim(n, s, c),
