@@ -12,7 +12,7 @@
     <span class="engine-tag">Rust &middot; PostgreSQL wire</span>
     <span class="engine-tag tag-early">Early access</span>
     <h1>SecantusDB Rust PostgreSQL server</h1>
-    <p class="section-lead">The same Rust storage as the MongoDB server, answering the <strong>PostgreSQL wire protocol</strong> instead. <code>psql</code>, psycopg, SQLAlchemy and any other stock PostgreSQL client connect and run real SQL &mdash; against the same WiredTiger home a MongoDB driver writes to. It is the newest of SecantusDB's servers: you build it from source today, and it is scored by psycopg's own test suite rather than by our own expectations.</p>
+    <p class="section-lead">The same Rust storage as the MongoDB server, answering the <strong>PostgreSQL wire protocol</strong> instead. <code>psql</code>, psycopg, SQLAlchemy and any other stock PostgreSQL client connect and run real SQL &mdash; against the same WiredTiger home a MongoDB driver writes to. It is the newest of SecantusDB's servers: you build it from source until the next tagged release publishes binaries, and it is scored by psycopg's own test suite rather than by our own expectations.</p>
     <div class="ctas">
       <a class="btn btn-primary" href="#get-it">Build it from source &rarr;</a>
       <a class="btn btn-ghost" href="{{ SECANTUS_DOCS_URL }}sql.html" rel="noopener">Read the SQL docs</a>
@@ -24,7 +24,7 @@
   <div class="wrap">
     <div class="callout">
       <span class="badge">Early access</span>
-      <span>The Rust PostgreSQL server is the youngest thing in the project. There is <strong>no prebuilt binary yet</strong> &mdash; <code>cargo build</code> is the only way to get it &mdash; and it does not verify passwords: a role's SCRAM verifier is stored, never checked, so <strong>every connection is trusted</strong>. Keep it on loopback, and keep production data out of it.</span>
+      <span>The Rust PostgreSQL server is the youngest thing in the project. <strong>Prebuilt binaries land with the next tagged release</strong>; until then you build it from source. Two things to know before you trust it with anything: it <strong>does not verify passwords</strong> &mdash; a role's SCRAM verifier is stored and never checked, so every connection is trusted &mdash; and a column-level <code>UNIQUE</code> is <strong>accepted and then not enforced</strong>, so a duplicate goes in silently where PostgreSQL would answer <code>23505</code>. That second one is a data-integrity gap rather than a missing feature, which is why it is here and not in the table below. Keep it on loopback, and keep production data out of it.</span>
     </div>
   </div>
 </div>
@@ -56,7 +56,7 @@
       </div>
       <div class="benefit">
         <h3><span class="pip"></span>Scored by someone else's tests</h3>
-        <p>All 4,238 of psycopg 3's own tests run against it unmodified &mdash; the same suite that scores the Python SQL server. It passes <strong>73.8%</strong> of them today. That number is published rather than buried, and it is the one that moves.</p>
+        <p>All <strong>5,729</strong> of psycopg 3's own tests run against it unmodified. It passes every one that exercises the server: <strong>5,545 pass, one fails</strong>, and that one is a static-typing check on psycopg's own class hierarchy rather than anything this server answers.</p>
       </div>
     </div>
   </div>
@@ -74,14 +74,14 @@
         <tbody>
           <tr><th>DDL</th><td><code>CREATE</code> / <code>DROP TABLE</code>, <code>CREATE TABLE AS</code>, <code>TRUNCATE</code>, constraints, <code>CREATE TYPE</code> (enum, composite, range, base and shell types), <code>CREATE EXTENSION</code> for <code>hstore</code> and <code>postgis</code></td></tr>
           <tr><th>DML &amp; queries</th><td><code>INSERT</code> (with <code>RETURNING</code>), <code>UPDATE</code>, <code>DELETE</code>, <code>SELECT</code> with <code>WHERE</code> / <code>ORDER BY</code> / <code>LIMIT</code> / <code>OFFSET</code> / <code>GROUP BY</code>, the <code>count</code> / <code>sum</code> / <code>min</code> / <code>max</code> aggregates, three-valued logic, and <code>SELECT</code> with no table at all</td></tr>
-          <tr><th>Types</th><td><code>numeric</code> exact past 34 digits, <code>bytea</code>, arrays including multidimensional, composites, ranges and multiranges, enums, <code>regclass</code>, dates and <code>timestamptz</code> honouring the session zone &mdash; answered in text <em>and</em> binary, checked against PostgreSQL 16</td></tr>
+          <tr><th>Types</th><td><code>numeric</code> exact past 34 digits, <code>uuid</code>, <code>bytea</code>, <code>inet</code> / <code>cidr</code>, arrays including multidimensional, composites, ranges and multiranges, enums, <code>regclass</code>, dates and <code>timestamptz</code> honouring the session zone &mdash; each answered in text <em>and</em> binary, checked against PostgreSQL 16. psycopg's suites for every one of those pass in full</td></tr>
           <tr><th>Sessions</th><td>GUCs with <code>GUC_REPORT</code> (<code>DateStyle</code>, <code>client_encoding</code> with LATIN1 / LATIN9 transcoding, <code>standard_conforming_strings</code>), <code>CancelRequest</code>, <code>pg_cancel_backend</code> and <code>pg_terminate_backend</code> that reach an idle session</td></tr>
           <tr><th>Beyond the basics</th><td><code>COPY</code> in and out, server-side cursors (<code>DECLARE</code> / <code>FETCH</code> / <code>MOVE</code>), <code>LISTEN</code> / <code>NOTIFY</code> with PostgreSQL's delivery and transaction semantics, <code>DO</code> blocks over a subset of PL/pgSQL, roles and the <code>pg_roles</code> / <code>pg_authid</code> / <code>pg_user</code> catalogs</td></tr>
-          <tr><th>Not yet</th><td>Secondary indexes (<code>CREATE INDEX</code> is refused outright rather than faked) and password verification. <code>uuid</code> and <code>inet</code> / <code>cidr</code> exist as column types, but a cast to them and binary parameters of them are still refused &mdash; psycopg's uuid and network suites fail end to end on that alone. A column-level <code>UNIQUE</code> is currently accepted without being enforced. The project's rule is a faithful &ldquo;not supported&rdquo; over a half-implemented feature that diverges quietly &mdash; where something slips through that rule, as <code>UNIQUE</code> has, it is written down in the open backlog rather than left for you to discover</td></tr>
+          <tr><th>Not yet</th><td>Secondary indexes &mdash; <code>CREATE INDEX</code> is refused outright (<code>IndexStmt is not supported yet</code>) rather than faked &mdash; <code>pg_constraint</code>, and password verification. Note the difference between a refusal and the unenforced <code>UNIQUE</code> in the notice above: a refusal is honest and you find it in one run. The project's rule is a faithful &ldquo;not supported&rdquo; over a half-implemented feature that diverges quietly &mdash; where something slips through that rule, as <code>UNIQUE</code> has, it is written down in the open backlog rather than left for you to discover</td></tr>
         </tbody>
       </table>
     </div>
-    <p class="perf-note" style="margin-top: 24px;">Where that leaves it, measured rather than estimated: of psycopg 3's 4,238 tests the Rust server passes <strong>3,056 &mdash; 73.8%</strong>, against the mature Python SQL server's <strong>98.6%</strong> on the identical suite. The gap is the honest measure of how young this server is. What the gap is <em>made of</em> matters more than its size: <strong>654 of the 1,084 failures are the server refusing outright</strong> &mdash; <code>FeatureNotSupported: a cast to uuid is not supported yet</code>, <code>binary parameters of type oid 869 are not supported yet</code> &mdash; rather than returning something wrong. A refusal is a gap you find in one run; a quiet divergence is one you find in production. The Rust figures were measured on 2026-09-18 against the current build; the Python server's comes from its <a href="{{ SECANTUS_DOCS_URL }}validation-report-psycopg.html" rel="noopener">published report</a>, which is the same suite under the same accounting.</p>
+    <p class="perf-note" style="margin-top: 24px;">Where that leaves it, measured on 2026-09-18 against the current build: of psycopg 3's <strong>5,729</strong> tests the server passes <strong>5,545</strong>, fails <strong>one</strong>, and skips 183 that need something out of scope. The single failure is <code>test_typing.py::test_generic_connect</code> &mdash; a check on psycopg's own generic classes that never reaches the wire. Whole type suites that a real client leans on &mdash; <code>uuid</code>, <code>inet</code>, enums, composites, ranges, <code>COPY</code>, server cursors &mdash; pass end to end. We are not publishing a head-to-head against the Python SQL server here: its last report predates the widening of this gauge, so the two ran different suites and the comparison would flatter one of them by accident.</p>
   </div>
 </section>
 
@@ -111,7 +111,7 @@
 <section class="section alt" id="get-it">
   <div class="wrap">
     <h2>Get it</h2>
-    <p class="section-lead">Source only for now. It is a Cargo crate in the SecantusDB repository; nothing but a Rust toolchain and the repository's usual build prerequisites is needed.</p>
+    <p class="section-lead">From source until the next tagged release publishes prebuilt archives. It is a Cargo crate in the SecantusDB repository; nothing but a Rust toolchain and the repository's usual build prerequisites is needed.</p>
     <div class="install-cols">
       <div class="install-col">
         <h3>Build and run</h3>
