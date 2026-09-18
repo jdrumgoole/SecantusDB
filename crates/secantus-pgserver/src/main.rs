@@ -17,7 +17,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut databases: Vec<String> = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        if arg == "--database" {
+        // `--version` / `--help` BEFORE the positional fallthrough. Without
+        // them, `--version` fell through to `home` and the server tried to open
+        // a WiredTiger database in a directory called `--version`, reporting
+        // `WT_TRY_SALVAGE: database corruption detected` -- an alarming answer
+        // to a question every binary is expected to answer. The release
+        // workflow sanity-checks the artifact with `--version`, so this is load
+        // bearing rather than a nicety.
+        if arg == "--version" || arg == "-V" {
+            println!("secantusd-pg {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        } else if arg == "--help" || arg == "-h" {
+            println!(
+                "secantusd-pg {} -- standalone PostgreSQL-wire server (SecantusDB)\n\
+                 \n\
+                 USAGE:\n    \
+                 secantusd-pg [<storage-path> [<host:port>]] [--database NAME]...\n\
+                 \n\
+                 ARGS:\n    \
+                 <storage-path>  WiredTiger home directory (default: ./secantus-pg-data)\n    \
+                 <host:port>     Bind address (default: 127.0.0.1:25434). Port 0 picks\n                    \
+                 an ephemeral port and prints the one it bound.\n\
+                 \n\
+                 OPTIONS:\n    \
+                 --database NAME  A database a client may connect to without CREATE\n                     \
+                 DATABASE first. Repeatable. `postgres` and `template1`\n                     \
+                 always exist.\n    \
+                 -V, --version    Print version and exit\n    \
+                 -h, --help       Print this help and exit",
+                env!("CARGO_PKG_VERSION")
+            );
+            return Ok(());
+        } else if arg == "--database" {
             let name = args.next().ok_or("--database needs a name")?;
             databases.push(name);
         } else if let Some(name) = arg.strip_prefix("--database=") {
@@ -34,6 +65,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = addr.unwrap_or_else(|| "127.0.0.1:25434".into());
     let databases = Arc::new(DatabaseRegistry::new("postgres", databases));
 
+    // Create the home if it is missing, which is what `secantusd-rs` does
+    // (`--storage-path … created if missing`). Without it a first run against a
+    // fresh path failed inside WiredTiger with
+    // `WiredTiger.lock: handle-open: open: No such file or directory` and a
+    // `WT_TRY_SALVAGE: database corruption detected` -- a frightening answer to
+    // "I pointed it at a new directory". Found by the release smoke test, which
+    // is the first thing to drive this binary the way a new user would.
+    std::fs::create_dir_all(&home)
+        .map_err(|e| format!("could not create storage path {home}: {e}"))?;
     let storage = Arc::new(Storage::open(&home)?);
     let listener = TcpListener::bind(&addr).await?;
     // One line, flushed, so a harness can wait for readiness. It reports the

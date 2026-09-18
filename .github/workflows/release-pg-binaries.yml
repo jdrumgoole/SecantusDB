@@ -1,0 +1,223 @@
+# Release the standalone `secantusd-pg` Rust PostgreSQL-wire server binary as
+# prebuilt, static-WiredTiger archives attached to a GitHub Release.
+#
+# The PostgreSQL-side twin of `release-binaries.yml`, which ships `secantusd-rs`.
+# Same shape deliberately: build the vendored WiredTiger static lib through the
+# wheel path CI already proves green, link the binary against it, smoke the exact
+# artifact, then attach `tar.gz` + `.sha256` to a GitHub Release. Read that file
+# first — the reasoning behind the WT staging and the toolchain steps lives there
+# and is not repeated here.
+#
+# TAG SCHEME — a THIRD, distinct namespace:
+#   publish.yml          fires on `vX.Y.Z` / `vX.Y.ZbN`   (the PyPI package)
+#   release-binaries.yml fires on `secantusdb-v*`          (the Rust MongoDB server)
+#   THIS file            fires on `secantusd-pg-v*`        (the Rust PG server)
+#
+# The PG server is NOT in the MongoDB crates' lockstep version: it sits at
+# `0.1.0-beta.0` while `crates/secantusdb` is at `0.5.3-beta.163`. Folding it
+# into that lockstep to simplify tagging would tie a 0.1 server's version to an
+# unrelated one, so it keeps its own line and its own tag prefix. The version
+# assertion below reads `crates/secantus-pgserver/Cargo.toml` and nothing else.
+#
+#     git tag secantusd-pg-v0.1.0-beta.0 && git push origin secantusd-pg-v0.1.0-beta.0
+#
+# SCOPE: two targets to start — x86_64 glibc Linux and arm64 macOS, the pair
+# whose static-WiredTiger build this repo exercises most. Windows and PGO are
+# follow-ons at the bottom with their blockers; shipping correct beats shipping
+# everywhere, and an unverified target in a release matrix is a red run at tag
+# time rather than a caught mistake.
+
+name: Release secantusd-pg binary
+
+on:
+  push:
+    tags:
+      - "secantusd-pg-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing secantusd-pg-v* tag to (re)build binaries for"
+        required: true
+
+permissions:
+  contents: write # create / upload assets to the GitHub Release
+
+concurrency:
+  group: release-pg-binaries-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            os: linux
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            os: macos
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # The vendored WiredTiger lives in a submodule — without it the wheel
+          # build (and thus the static lib) can't be produced.
+          submodules: recursive
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Resolve tag + assert it matches the crate version
+        shell: bash
+        # The dispatch input goes through the environment rather than being
+        # expanded inline, so a tag containing shell metacharacters cannot be
+        # interpolated into the script (Actions script-injection hygiene).
+        # github.event_name is a GitHub-set enum, not user input.
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${INPUT_TAG}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          ver="${tag#secantusd-pg-v}"
+          crate=$(grep -m1 '^version' crates/secantus-pgserver/Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          if [ "$ver" != "$crate" ]; then
+            echo "::error::tag version ($ver) != crates/secantus-pgserver Cargo.toml version ($crate)"
+            exit 1
+          fi
+          {
+            echo "TAG=$tag"
+            echo "VERSION=$ver"
+          } >> "$GITHUB_ENV"
+
+      - name: Install toolchain (Linux)
+        if: matrix.os == 'linux'
+        uses: ./.github/actions/apt-install
+        with:
+          packages: swig clang libclang-dev llvm-dev ninja-build liblz4-dev
+
+      - name: Install toolchain (macOS)
+        if: matrix.os == 'macos'
+        run: brew install swig ninja lz4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Build vendored WiredTiger (static) via the storage-engine wheel build
+        # scikit-build-core forwards SKBUILD_CMAKE_DEFINE as a -D define, flipping
+        # the storage-engine CMake option ON for this build only. Side effect we
+        # want: libwiredtiger.a + include/wiredtiger.h under build/*/wt-build.
+        env:
+          SKBUILD_CMAKE_DEFINE: SECANTUS_BUILD_STORAGE_ENGINE=ON
+        run: uv build --wheel --out-dir dist-storage
+
+      - name: Build the static-WiredTiger secantusd-pg binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          wt=$(ls -d "$PWD"/build/*/wt-build 2>/dev/null | head -1)
+          if [ -z "$wt" ] || [ ! -f "$wt/include/wiredtiger.h" ]; then
+            echo "::error::vendored WiredTiger not found under build/*/wt-build"
+            exit 1
+          fi
+          export SECANTUS_WT_INCLUDE="$wt/include" SECANTUS_WT_LIB="$wt"
+          target=${{ matrix.target }}
+          cargo build --release --locked --target "$target" \
+            --manifest-path crates/secantus-pgserver/Cargo.toml
+          bin="crates/secantus-pgserver/target/$target/release/secantusd-pg"
+          strip "$bin" || true
+          echo "BIN=$bin" >> "$GITHUB_ENV"
+          # Also the first check that the artifact runs at all. `--version` used
+          # to fall through to the positional storage-path argument and try to
+          # open a WiredTiger database called `--version`.
+          "$bin" --version
+
+      - name: Smoke the release binary (psycopg → secantusd-pg → WiredTiger)
+        # SECANTUSD_PG_BIN points the smoke test at the exact artifact we ship,
+        # not a freshly-rebuilt debug binary. The test treats an unresolvable
+        # path as fatal rather than a skip, so a mis-set variable cannot leave
+        # this step green over an unexercised binary.
+        shell: bash
+        env:
+          SECANTUSD_PG_BIN: ${{ env.BIN }}
+        run: >-
+          uv run --no-project --with "psycopg[binary]" --with pytest
+          python -m pytest tests/test_rust_pg_binary_smoke.py
+          -o addopts= -p no:cacheprovider -q
+
+      - name: Package the archive + checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          stem="secantusd-pg-${VERSION}-${{ matrix.target }}"
+          mkdir -p "$stem"
+          cp "$BIN" "$stem/secantusd-pg"
+          cp LICENSE README.md "$stem/"
+          if command -v shasum >/dev/null 2>&1; then
+            sha() { shasum -a 256 "$1"; }
+          else
+            sha() { sha256sum "$1"; }
+          fi
+          tar -czf "$stem.tar.gz" "$stem"
+          sha "$stem.tar.gz" > "$stem.tar.gz.sha256"
+          ls -l "$stem".*
+
+      # Keep the artifacts on the run too, so a workflow_dispatch dry-run can be
+      # inspected without (or before) touching a Release.
+      - name: Upload run artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: secantusd-pg-${{ matrix.target }}
+          path: |
+            secantusd-pg-*.tar.gz
+            secantusd-pg-*.tar.gz.sha256
+          if-no-files-found: error
+
+      - name: Attach to the GitHub Release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228  # v3.0.2
+        with:
+          tag_name: ${{ env.TAG }}
+          # A SemVer pre-release (the `-beta.N` suffix has a hyphen) ⇒ mark the
+          # Release as a pre-release.
+          prerelease: ${{ contains(env.VERSION, '-') }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            secantusd-pg-*.tar.gz
+            secantusd-pg-*.tar.gz.sha256
+
+# ---------------------------------------------------------------------------
+# Follow-ons (NOT enabled — each needs verifying before it goes in the matrix):
+#
+#   - x86_64-pc-windows-msvc
+#       `release-binaries.yml` ships it for the MongoDB binary and its two
+#       requirements are known: `+crt-static` to match WiredTiger's static CRT
+#       (mixing CRTs means two heaps in one process, which for a database is
+#       undefined behaviour rather than a warning), and choco swig/ninja/llvm
+#       plus an explicit LIBCLANG_PATH for bindgen. Left out here only because
+#       nothing has yet built THIS binary on Windows; copy that target's matrix
+#       entry and toolchain steps once a run proves it.
+#   - PGO (two-stage, on-target)
+#       The MongoDB binary gets ~12-19% on write/aggregate paths from it, driven
+#       by `bench/pgo_workload.py`. There is no PostgreSQL-side equivalent
+#       workload script, so the profile would have nothing representative to
+#       collect. Write that first; PGO is a hint, so its absence costs speed and
+#       nothing else.
+#   - musl-static / aarch64 Linux
+#       Same blockers and the same appeal as for the MongoDB binary.
+# ---------------------------------------------------------------------------
