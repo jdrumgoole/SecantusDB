@@ -2005,11 +2005,19 @@ jobs:
         # file that is not listed here does not run anywhere: it skips in every
         # other job (no extension) and is never invoked in this one. Add new
         # Rust-server files to this list, or they are dead weight.
+        #
+        # `psycopg` is here for tests/test_pgserver_embedded.py, which drives the
+        # embedded PostgreSQL-wire server (`_secantus_server.PgServer`) with a
+        # real client. Without it that file `importorskip`s and this lane would
+        # report a pass having run none of it -- the exact failure mode this
+        # step's list exists to prevent.
         shell: bash
         run: >-
           uv run --no-project --with pymongo --with pytest
+          --with "psycopg[binary]"
           --with "$(ls dist-storage/*.whl)"
           python -m pytest tests/test_rust_storage_smoke.py tests/test_rust_server_smoke.py
+          tests/test_pgserver_embedded.py
           tests/test_rust_agg_runtime_errors.py tests/test_crash_recovery.py
           tests/test_rust_arg_types_sweep.py tests/test_rust_pitr_cross_server.py
           tests/test_getmore_batching.py tests/test_rbac_pipeline.py
