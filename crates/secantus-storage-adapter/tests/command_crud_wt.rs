@@ -610,3 +610,75 @@ fn update_valid_pipeline_applies_via_storage() {
         }
     });
 }
+
+/// `bulkWrite` takes `bypassEmptyTsReplacement`, and still refuses a real
+/// unknown field.
+///
+/// mongod 8.2.11 accepts this on `bulkWrite`, `insert` AND `update` (probed
+/// 2026-09-18). Both servers already took it on `insert` / `update`; only
+/// `bulkWrite` refused, which failed all 17 of the Go driver's
+/// `TestClient_BulkWrite_AddCommandFields` cases -- the driver appends the
+/// field by default on 8.x, so this was a refusal of an ordinary command.
+///
+/// The second half matters as much as the first: the fix widened the
+/// known-field list, and must not have disabled the gate that rejects a
+/// genuinely unknown field.
+#[test]
+fn bulk_write_accepts_bypass_empty_ts_replacement() {
+    with_wt(|c| {
+        c.db_name = "admin".into();
+        for value in [true, false] {
+            let reply = dispatch(
+                &doc! {
+                    "bulkWrite": 1,
+                    "nsInfo": [{"ns": "t.c"}],
+                    "ops": [{"insert": 0, "document": {}}],
+                    "bypassEmptyTsReplacement": value,
+                },
+                c,
+            );
+            assert_eq!(
+                reply.get_f64("ok").unwrap(),
+                1.0,
+                "value={value} -> {reply:?}"
+            );
+        }
+
+        let reply = dispatch(
+            &doc! {
+                "bulkWrite": 1,
+                "nsInfo": [{"ns": "t.c"}],
+                "ops": [{"insert": 0, "document": {}}],
+                "totallyBogusField": true,
+            },
+            c,
+        );
+        assert_eq!(reply.get_i32("code").unwrap(), 40415);
+    });
+}
+
+/// A cursor id is an int64 on the wire, and the TYPE is the whole assertion.
+///
+/// The Python server sent a bare `0` here, which BSON encodes as a 32-bit
+/// integer; the Go driver type-checks it and refused. Rust's `0i64` is already
+/// right, so this test is a TRIPWIRE rather than a fix -- `doc! {"id": 0}`
+/// would compile perfectly well and silently reintroduce the bug.
+#[test]
+fn bulk_write_reply_cursor_id_is_int64() {
+    with_wt(|c| {
+        c.db_name = "admin".into();
+        let reply = dispatch(
+            &doc! {
+                "bulkWrite": 1,
+                "nsInfo": [{"ns": "t.c"}],
+                "ops": [{"insert": 0, "document": {"_id": 1}}],
+            },
+            c,
+        );
+        let id = reply.get_document("cursor").unwrap().get("id").unwrap();
+        assert!(
+            matches!(id, Bson::Int64(0)),
+            "cursor.id must be Int64, got {id:?}"
+        );
+    });
+}

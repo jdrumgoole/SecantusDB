@@ -21,6 +21,14 @@ const KNOWN_FIELDS: &[&str] = &[
     "nsInfo",
     "ordered",
     "bypassDocumentValidation",
+    // Accepted by mongod 8.2.11 on `bulkWrite`, `insert` AND `update` (probed
+    // 2026-09-18). Both servers already took it on `insert` / `update` and only
+    // `bulkWrite` refused it, which failed all 17 of the Go driver's
+    // `TestClient_BulkWrite_AddCommandFields` cases. Accepted and IGNORED: the
+    // flag governs whether an empty `Timestamp()` is replaced with the current
+    // cluster time, and neither server implements that substitution -- the go
+    // gauge deselects `TestBypassEmptyTsReplacement` for exactly that reason.
+    "bypassEmptyTsReplacement",
     "let",
     "errorsOnly",
     "comment",
