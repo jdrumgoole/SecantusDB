@@ -1144,10 +1144,73 @@ Specific items that were left out of the slice that introduced their feature are
       host; until that is done, "we plateau at N~4" is UNPROVEN as a server
       property, while "we cost ~5x PG per statement" is measured.
 
-      Where to look first for the 66us, none of it yet attributed: every
-      statement re-parses (there is a `pg_query` parse memo, so confirm whether
-      it hits), the per-statement catalog lookup, `block_in_place` hand-off, WT
-      session acquisition, and wire encode. Attribute before optimising.
+      **ATTRIBUTED 2026-09-18 — it is per-statement CATALOG bookkeeping, by two
+      different mechanisms depending on whether a transaction block is open.
+      Neither has anything to do with the query.** Measured by layer bisect
+      (`select 1` vs a bare protocol round trip vs a row read) plus `/usr/bin/
+      sample` call trees; a `select 1` touches no table, so everything below is
+      pure overhead.
+
+      Layer bisect, single client, microseconds per statement (ours / PG 16.15):
+
+      | stage | ours | PG | what the step adds |
+      | --- | --- | --- | --- |
+      | protocol round trip, no SQL | 21.8 | 20.2 | **+1.6 — the wire layer and the tokio hand-off are FINE** |
+      | `select 1` | 76.3 | 29.4 | +54.5 vs +9.1 — **this is the gap** |
+      | one row by primary key | 89.2 | 34.8 | +12.9 vs +5.5 — storage is small |
+
+      So ~55 of the ~66us is spent BEFORE any table is touched, and the wire
+      layer is not it.
+
+      **Autocommit path:** `open_extended_group` -> `open_transaction_handle` ->
+      `ensure_collection` -> `Storage::collection_exists` -> `op_session()` ->
+      `Connection::open_session`. `open_transaction_handle` walks all **7**
+      `CATALOG_COLLECTIONS`, and `op_session()` returns `OpSession::Fresh` when
+      no transaction session is installed yet — which is exactly the case there,
+      because the handle has not begun. So every autocommit statement opens
+      **seven fresh WiredTiger sessions**, each with a cursor open/search/close,
+      to re-confirm that catalog collections which are created once and never
+      dropped still exist. The sample is dominated by `__conn_open_session`,
+      `__wt_open_cursor`, `__session_close_cursors`, `__wt_session_get_dhandle`.
+
+      **In-transaction path is WORSE, not better: 115.5–118.0us vs 77.0–78.4us
+      for the same `select 1`, over three runs** (PG: 30.0–31.3 vs 30.5–32.8,
+      i.e. flat). Opening a block does NOT
+      amortise the catalog work — it swaps it for a bigger cost. Under a block
+      the sample is dominated by `Storage::find_matching` /
+      `scan_blobs_natural` (a full natural-order scan) instead of session opens,
+      which is `may_fill_catalog_cache` refusing the process-wide catalog cache
+      whenever a handle is open and the version has moved, so each statement
+      re-reads the catalog from storage. **This also means the amortisation
+      hypothesis that "7 probes = the 54us" is NOT confirmed** — it was derived
+      by reading, and the block measurement contradicts it. Both mechanisms are
+      real and hot; the microsecond split between them is not yet apportioned.
+
+      **A "prepared statements are a pessimisation" finding was RETRACTED — it
+      did not reproduce.** One run showed a prepared row read at 165.9us against
+      89.2us unprepared, which looked like a large extended-protocol penalty.
+      Four further runs put prepared and unprepared within noise of each other
+      (75.4–76.3 prepared vs 76.3–82.4 unprepared for `select 1`; 89.6–89.9 vs
+      87.9–88.5 for the row read). The first number was an artifact. Recorded so
+      nobody re-discovers the phantom: **preparing neither helps nor hurts
+      measurably here**, on either server — which is itself mildly odd for PG
+      and not worth chasing.
+
+      **Where to go, in order** (all measured above, none implemented):
+      1. Do not re-probe the 7 catalog collections per statement. They are
+         created once and never dropped; a process-wide "already ensured"
+         verdict, or doing it only on a catalog WRITE, removes seven session
+         opens per statement.
+      2. Make the catalog readable inside a transaction without a full scan —
+         the correctness reason `may_fill_catalog_cache` exists (uncommitted DDL
+         must be visible to its own transaction) does not require re-scanning
+         for statements that did no DDL.
+      3. Then re-measure the extended-protocol penalty.
+
+      Reproduce with `uv run python -m bench.pg_statement_cost` (add
+      `--in-transaction` for the block path), against a RELEASE `secantusd-pg`.
+      Every figure above is the median of 5 batches; repeat before quoting one,
+      because the retracted finding above came from trusting a single run.
 
       **Do NOT "lift the global lock" as a concurrency fix** — it does not guard
       the row paths, and touching it risks the two invariants it does protect:
