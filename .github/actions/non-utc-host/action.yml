@@ -26,43 +26,30 @@ description: >
 # zone. Changing `/etc/localtime` (tzutil on Windows) is what a real non-UTC
 # server looks like.
 #
-# Use it right after checkout, before any step starts a long-lived process
+# The Linux / macOS work lives in set-zone.sh so a cibuildwheel container
+# can run the SAME code (see that file). Use this action right after checkout, before any step starts a long-lived process
 # that would cache the old zone.
 
 runs:
   using: composite
   steps:
-    - name: Set the host zone (Linux)
-      if: runner.os == 'Linux'
+    - name: Set the host zone and check it (Linux / macOS)
+      if: runner.os != 'Windows'
       shell: bash
-      run: |
-        sudo ln -sf /usr/share/zoneinfo/America/St_Johns /etc/localtime
-        echo America/St_Johns | sudo tee /etc/timezone >/dev/null
-
-    - name: Set the host zone (macOS)
-      if: runner.os == 'macOS'
-      shell: bash
-      run: |
-        # macOS keeps its zoneinfo under /var/db/timezone; /usr/share/zoneinfo
-        # is the fallback on images that lack it.
-        z=/var/db/timezone/zoneinfo/America/St_Johns
-        [ -e "$z" ] || z=/usr/share/zoneinfo/America/St_Johns
-        sudo ln -sf "$z" /etc/localtime
+      run: sh "$GITHUB_ACTION_PATH/set-zone.sh"
 
     - name: Set the host zone (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
       run: tzutil /s "Newfoundland Standard Time"
 
-    - name: Assert the host zone moved
+    - name: Check the host zone moved (Windows)
       # The self-check: if the change silently did not take, every test below
-      # would pass vacuously on a UTC host again. Uses the runner's own Python,
-      # which reads the host zone the same way the servers under test do.
+      # would pass vacuously on a UTC host again. `python`, not `python3`: on
+      # Windows the latter can resolve to the Microsoft Store stub.
       # `time.timezone` is the STANDARD (non-DST) offset in seconds west of UTC.
+      if: runner.os == 'Windows'
       shell: bash
       run: |
         unset TZ
-        # On Windows `python3` can resolve to the Microsoft Store stub.
-        if [ "$RUNNER_OS" = "Windows" ]; then py=python; else py=python3; fi
-        "$py" -c "import time; assert time.timezone == 12600, ('host zone did not move', time.timezone, time.tzname); print('host zone OK:', time.tzname, -time.timezone / 3600, 'h')"
-        if [ "$RUNNER_OS" != "Windows" ]; then date; fi
+        python -c "import time; assert time.timezone == 12600, ('host zone did not move', time.timezone, time.tzname); print('host zone OK:', time.tzname, -time.timezone / 3600, 'h')"
