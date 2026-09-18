@@ -1,7 +1,7 @@
 {% extends 'base.html' %}
 
-{% block title %}Python DB — {{ SITENAME }}{% endblock %}
-{% block description %}SecantusDB's pure-Python server: the reference implementation — embeddable in two lines, the broadest feature surface, plus the SQL/PostgreSQL frontend.{% endblock %}
+{% block title %}The Python reference implementation — {{ SITENAME }}{% endblock %}
+{% block description %}SecantusDB's pure-Python servers: the reference implementation the Rust servers are held to — embeddable in two lines, and the specification for everything the project does.{% endblock %}
 {% block canonical_path %}python-db.html{% endblock %}
 
 {% block top_banner %}{% endblock %}
@@ -9,11 +9,12 @@
 {% block content %}
 <section class="section engines-section page-hero-engine">
   <div class="wrap">
-    <span class="engine-tag">Python</span>
-    <h1>SecantusDB Python DB</h1>
-    <p class="section-lead">The reference implementation &mdash; a real MongoDB server in pure Python, embeddable in two lines from any test or app, with the broadest feature surface and the SQL/PostgreSQL frontend. Backed by the same <strong>WiredTiger</strong> engine MongoDB uses.</p>
+    <span class="engine-tag">Python &middot; the reference</span>
+    <h1>The Python reference implementation</h1>
+    <p class="section-lead">Where SecantusDB started, and still the specification everything else is measured against. A real MongoDB server and a real PostgreSQL server in pure Python, on the same <strong>WiredTiger</strong> engine &mdash; readable end to end, embeddable in two lines, and the place every operator, stage and error message lands first. <strong>If you are looking for something to run, you want the Rust servers</strong>; this is the one you read.</p>
     <div class="ctas">
-      <a class="btn btn-primary" href="{{ SECANTUS_PYPI_URL }}" rel="noopener"><code>pip install SecantusDB</code></a>
+      <a class="btn btn-primary" href="/rust-db.html">Rust MongoDB server &rarr;</a>
+      <a class="btn btn-primary" href="/rust-pg.html">Rust PostgreSQL server &rarr;</a>
       <a class="btn btn-ghost" href="{{ SECANTUS_DOCS_URL }}index.html" rel="noopener">Read the Python docs</a>
     </div>
   </div>
@@ -35,20 +36,21 @@
 
 <section class="section alt">
   <div class="wrap">
-    <h2>Why the Python DB</h2>
-    <p class="section-lead">Production-grade engineering &mdash; real wire protocol, real WiredTiger storage &mdash; scoped today to test and dev environments. Each panel links to the reference docs.</p>
+    <h2>What the reference gives you</h2>
+    <p class="section-lead">Everything below is implemented here first and ported to Rust second, with parity suites that fail the build the moment the two engines disagree on a single byte. Reading this list is reading what SecantusDB does &mdash; on either runtime. Each panel links to the reference docs.</p>
     {% include 'partials/benefits_grid.html' %}
     <h3 class="perf-heading">Performance</h3>
-    <p class="perf-note">A like-for-like benchmark currently has the Python DB <strong>~4&times;&ndash;17&times; slower per operation</strong> than <code>mongod</code> &mdash; the storage engine is the same WiredTiger C library, but the layers above it are Python. CRUD reads sit near the low end; bulk update / delete and aggregation at the high end. The trade is conformance and WiredTiger durability over per-op latency &mdash; for ephemeral test and dev data, the wall-clock difference rarely matters. Need raw speed? That's what <a href="/rust-db.html">Rust DB</a> is for. <a href="/performance.html">Three-way benchmarks &rarr;</a></p>
+    <p class="perf-note">Said plainly: a like-for-like benchmark has the Python server <strong>2.0&times;&ndash;23.4&times; slower per operation</strong> than <code>mongod</code>, and losing throughput rather than gaining it as writers are added &mdash; down to ~0.6&times; its own single-writer rate at eight. The storage engine is the same WiredTiger C library; the layers above it are Python, and the GIL is where the throughput goes. It degrades <em>gracefully</em> &mdash; write conflicts retry server-side exactly as mongod's <code>writeConflictRetry</code> does, and a client never sees an error &mdash; which is what makes it fine for ephemeral test and dev data, and not fine for anything under load. The <a href="/rust-db.html">Rust MongoDB server</a> runs the same workloads 1.9&times;&ndash;13.3&times; faster and scales with writers. <a href="/performance.html">Three-way benchmarks &rarr;</a></p>
   </div>
 </section>
 
 <section class="section">
   <div class="wrap">
-    <h2>It speaks SQL too</h2>
-    <p class="section-lead">The Python DB is the home of the <strong>SQL/PostgreSQL frontend</strong>: the same WiredTiger data is reachable over the PostgreSQL wire protocol &mdash; <code>psql</code>, psycopg, SQLAlchemy &mdash; and a document written with <code>pymongo</code> reads back as a row. Validated against psycopg 3's own unmodified test suite and the sqllogictest corpus.</p>
+    <h2>It speaks SQL too &mdash; and that is where the Rust one came from</h2>
+    <p class="section-lead">The Python <strong>SQL/PostgreSQL frontend</strong> came first: the same WiredTiger data reachable over the PostgreSQL wire protocol &mdash; <code>psql</code>, psycopg, SQLAlchemy &mdash; where a document written with <code>pymongo</code> reads back as a row. It is validated against psycopg 3's own unmodified test suite, the sqllogictest corpus and SQLAlchemy's dialect-compliance suite, and it is the most complete SQL surface the project has. The <a href="/rust-pg.html">Rust PostgreSQL server</a> is its port &mdash; younger, faster, and still catching up on surface area.</p>
     <div class="ctas">
       <a class="btn btn-secondary" href="{{ SECANTUS_DOCS_URL }}sql.html" rel="noopener">SQL / PostgreSQL interface &rarr;</a>
+      <a class="btn btn-secondary" href="/rust-pg.html">The Rust PostgreSQL server &rarr;</a>
     </div>
   </div>
 </section>
@@ -71,7 +73,7 @@ with SecantusDBServer(port=0) as server:
 secantusd-py-pg --port 5432 --storage-path ./data</code></pre>
       </div>
     </div>
-    <p class="section-lead" style="margin-top: 24px;">Python DB documentation:
+    <p class="section-lead" style="margin-top: 24px;">Python reference documentation:
       <a href="{{ SECANTUS_DOCS_URL }}quickstart.html" rel="noopener">Quickstart</a> &middot;
       <a href="{{ SECANTUS_DOCS_URL }}servers.html" rel="noopener">The two servers</a> &middot;
       <a href="{{ SECANTUS_DOCS_URL }}sql.html" rel="noopener">SQL interface</a> &middot;

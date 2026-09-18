@@ -1,26 +1,38 @@
 <div class="engines">
-  <article class="engine">
-    <span class="engine-tag">Python</span>
-    <h3>Python DB</h3>
-    <p>The reference implementation &mdash; the broadest feature surface, easy to read and patch, and embeddable in two lines from any test or app.</p>
+  <article class="engine engine-accent">
+    <span class="engine-tag">Rust &middot; MongoDB wire</span>
+    <h3>Rust MongoDB server</h3>
+    <p>The flagship. Wire, dispatch, cursors, change streams and WiredTiger storage, all in Rust &mdash; shipped as one static binary with nothing else to install.</p>
     <ul class="engine-points">
-      <li>Pure-Python request path &mdash; hackable and extensible</li>
-      <li><code>pip install SecantusDB</code> &rarr; <code>SecantusDBServer(...)</code></li>
-      <li>Where every new operator and stage lands first</li>
-      <li>SQL/PostgreSQL frontend &mdash; the same data over <code>psql</code></li>
+      <li>One dependency-free executable: <code>secantusd-rs</code></li>
+      <li>Prebuilt for Linux, macOS and Windows &mdash; no Python at all</li>
+      <li>Twelve unmodified driver suites score it, not us</li>
+      <li>Measured at <strong>0.9&times;&ndash;2.4&times; of mongod</strong> per operation</li>
     </ul>
-    <p class="install-cta"><a href="/python-db.html">Meet the Python DB &rarr;</a></p>
+    <p class="install-cta"><a href="/rust-db.html">Meet the Rust MongoDB server &rarr;</a></p>
   </article>
   <article class="engine engine-accent">
-    <span class="engine-tag">Rust</span>
-    <h3>Rust DB</h3>
-    <p>A whole second server written in Rust &mdash; wire, dispatch, cursors, and WiredTiger storage &mdash; for raw speed and a single standalone binary with no Python in the request path.</p>
+    <span class="engine-tag">Rust &middot; PostgreSQL wire</span>
+    <h3>Rust PostgreSQL server</h3>
+    <p>The same Rust storage answering the PostgreSQL wire protocol instead &mdash; real SQL, real transactions, over the same WiredTiger home a MongoDB client writes to.</p>
     <ul class="engine-points">
-      <li>Ships as one static-WiredTiger binary: <code>secantusd-rs</code></li>
-      <li>No Python required &mdash; built for CI, containers, any stack</li>
-      <li>GIL-free accept loop &mdash; and still embeddable from Python</li>
-      <li>Measured at <strong>~0.8&times;&ndash;2.1&times; of mongod</strong> per op &mdash; ~4&ndash;14&times; faster than the Python DB</li>
+      <li><code>psql</code>, psycopg, SQLAlchemy, JDBC &mdash; stock clients</li>
+      <li>PostgreSQL's own parser, so the SQL is parsed the way PG parses it</li>
+      <li>Transactions, two-phase commit, <code>COPY</code>, <code>LISTEN</code>/<code>NOTIFY</code>, server cursors</li>
+      <li>Scored by psycopg 3's own test suite, unmodified</li>
     </ul>
-    <p class="install-cta"><a href="/rust-db.html">Meet the Rust DB &rarr;</a></p>
+    <p class="install-cta"><a href="/rust-pg.html">Meet the Rust PostgreSQL server &rarr;</a></p>
+  </article>
+  <article class="engine">
+    <span class="engine-tag">Python &middot; the reference</span>
+    <h3>The Python servers</h3>
+    <p>Where SecantusDB started, and still the specification the Rust servers are held to &mdash; every operator landed here first, and the Rust ports are pinned to it byte-for-byte.</p>
+    <ul class="engine-points">
+      <li>Pure-Python request path &mdash; readable, hackable, patchable</li>
+      <li><code>pip install SecantusDB</code> &rarr; a server in two lines</li>
+      <li>Reach for it to read or change the engine</li>
+      <li>Reach for Rust to run it</li>
+    </ul>
+    <p class="install-cta"><a href="/python-db.html">The reference implementation &rarr;</a></p>
   </article>
 </div>
