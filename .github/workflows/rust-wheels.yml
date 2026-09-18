@@ -64,6 +64,11 @@ jobs:
           || '[{"os":"ubuntu-22.04","platform":"linux-x86_64","target":"x86_64-unknown-linux-gnu","manylinux":"2014"},{"os":"ubuntu-22.04-arm","platform":"linux-aarch64","target":"aarch64-unknown-linux-gnu","manylinux":"2014"},{"os":"windows-2022","platform":"windows-x86_64","target":"x86_64-pc-windows-msvc","manylinux":""}]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Move the host time zone off UTC
+        # Every hosted runner is UTC, which hides any code that wrongly uses
+        # the host's local time. See .github/actions/non-utc-host for why
+        # Newfoundland, and why the host zone rather than TZ.
+        uses: ./.github/actions/non-utc-host
 
       - name: Build abi3 wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b  # v1

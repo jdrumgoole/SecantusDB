@@ -67,6 +67,11 @@ jobs:
           || '[{"os":"ubuntu-22.04","platform":"linux-x86_64","cibw_archs":"x86_64"},{"os":"ubuntu-22.04-arm","platform":"linux-aarch64","cibw_archs":"aarch64"},{"os":"windows-2022","platform":"windows-x86_64","cibw_archs":"AMD64"}]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Move the host time zone off UTC
+        # Every hosted runner is UTC, which hides any code that wrongly uses
+        # the host's local time. See .github/actions/non-utc-host for why
+        # Newfoundland, and why the host zone rather than TZ.
+        uses: ./.github/actions/non-utc-host
       - name: Checkout the WiredTiger submodule
         # Only vendor/wiredtiger feeds the build. ``submodules: recursive``
         # cloned all 12 vendored submodules — 11 of them driver-gauge repos
@@ -121,6 +126,12 @@ jobs:
               printf '#!/bin/sh\nexec "$@"\n' > /usr/bin/ccache
               chmod +x /usr/bin/ccache
             fi
+          # The wheel smoke tests run INSIDE the manylinux / musllinux
+          # container, which does not inherit the runner's /etc/localtime --
+          # so the host step above leaves them on UTC. Move the container's
+          # zone too, with the same script (it self-checks, and installs
+          # tzdata on images that lack it). macOS and Windows test natively.
+          CIBW_BEFORE_TEST_LINUX: sh {project}/.github/actions/non-utc-host/set-zone.sh
           CIBW_CONTAINER_ENGINE: 'docker; create_args: -v /home/runner/.cache/ccache:/host_ccache'
           # SECANTUS_BUILD_STORAGE_ENGINE=ON bundles the Rust extensions +
           # secantusd-rs into the wheel. $HOME/.cargo/bin is on PATH so the
