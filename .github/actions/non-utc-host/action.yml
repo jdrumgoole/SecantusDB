@@ -1,0 +1,68 @@
+name: non-utc-host
+description: >
+  Move the runner's HOST time zone off UTC (to America/St_Johns, Newfoundland)
+  on Linux, macOS and Windows, and fail the job if the change did not take.
+
+# WHY THIS EXISTS
+#
+# Every GitHub-hosted runner is UTC. On a UTC host, code that wrongly uses the
+# host's local time gives the same answer as code that correctly uses UTC, so a
+# whole class of bug is invisible to CI. Two have been found this way:
+#
+#   - #1468: the Rust engine read the HOST zone instead of `TZ` on Windows;
+#     "honours TZ=UTC" and "ignores TZ" render identically on a UTC host.
+#   - #1474: the Python server's `$toDouble` of a date read the naive BSON
+#     datetime as local time -- the first thing a non-UTC lane caught.
+#
+# WHY NEWFOUNDLAND. It is never UTC at any instant, it observes DST (so a
+# fixed-offset shortcut is caught too), and its half-hour offset (-3:30 /
+# -2:30) catches whole-hour assumptions. London would not do: it IS UTC in
+# winter, which is exactly how the #1474 bug survived a London dev box (the
+# test's date is in January).
+#
+# WHY THE HOST ZONE AND NOT `TZ`. Exporting `TZ` for the job would make every
+# process agree with whatever a test sets or clears, so the "`TZ` unset -> host
+# zone" paths would still see UTC. mongod and PostgreSQL also read the host
+# zone. Changing `/etc/localtime` (tzutil on Windows) is what a real non-UTC
+# server looks like.
+#
+# Use it right after checkout, before any step starts a long-lived process
+# that would cache the old zone.
+
+runs:
+  using: composite
+  steps:
+    - name: Set the host zone (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo ln -sf /usr/share/zoneinfo/America/St_Johns /etc/localtime
+        echo America/St_Johns | sudo tee /etc/timezone >/dev/null
+
+    - name: Set the host zone (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        # macOS keeps its zoneinfo under /var/db/timezone; /usr/share/zoneinfo
+        # is the fallback on images that lack it.
+        z=/var/db/timezone/zoneinfo/America/St_Johns
+        [ -e "$z" ] || z=/usr/share/zoneinfo/America/St_Johns
+        sudo ln -sf "$z" /etc/localtime
+
+    - name: Set the host zone (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: tzutil /s "Newfoundland Standard Time"
+
+    - name: Assert the host zone moved
+      # The self-check: if the change silently did not take, every test below
+      # would pass vacuously on a UTC host again. Uses the runner's own Python,
+      # which reads the host zone the same way the servers under test do.
+      # `time.timezone` is the STANDARD (non-DST) offset in seconds west of UTC.
+      shell: bash
+      run: |
+        unset TZ
+        # On Windows `python3` can resolve to the Microsoft Store stub.
+        if [ "$RUNNER_OS" = "Windows" ]; then py=python; else py=python3; fi
+        "$py" -c "import time; assert time.timezone == 12600, ('host zone did not move', time.timezone, time.tzname); print('host zone OK:', time.tzname, -time.timezone / 3600, 'h')"
+        if [ "$RUNNER_OS" != "Windows" ]; then date; fi
