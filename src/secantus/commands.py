@@ -3205,6 +3205,55 @@ _BULK_WRITE_MAX_OPS = 100000
 _NS_INFO_KNOWN_FIELDS = frozenset({"ns", "collectionUUID", "encryptionInformation"})
 
 
+#: `bulkWrite` results live under the admin command namespace, which is also
+#: what `getMore`'s `collection: "$cmd.bulkWrite"` resolves to.
+_BULK_WRITE_NS = "admin.$cmd.bulkWrite"
+
+
+def _bulk_write_batch_size(doc: Mapping[str, Any]) -> int | None:
+    """`cursor.batchSize`, or `None` for "return everything in one batch".
+
+    Absent `cursor` -- or an absent `batchSize` within it -- means unbounded on
+    mongod: five results come back in `firstBatch` with id 0. `batchSize: 0` is
+    NOT unbounded and is not the same as absent; it means "open the cursor and
+    send nothing yet", which is why this returns `None` and `0` distinctly.
+    """
+    spec = doc.get("cursor")
+    if not isinstance(spec, Mapping):
+        return None
+    size = spec.get("batchSize")
+    if isinstance(size, bool) or not isinstance(size, int):
+        return None
+    return max(0, size)
+
+
+def _bulk_write_first_batch_len(results: list[dict[str, Any]], batch_size: int | None) -> int:
+    """How many results fit the first batch: a COUNT limit and a SIZE limit.
+
+    `batchSize` is the obvious half. The other half is why the Go driver's
+    prose test 7 still failed with count-only batching: it sets NO batchSize and
+    sends two upserts whose `_id`s are each `maxBsonObjectSize / 2` bytes, so
+    the two RESULT documents cannot share one reply. mongod answers
+    `firstBatch: 1` plus a cursor, and the driver asserts it made exactly one
+    `getMore` (probed 8.2.11, 2026-09-18). A count-only rule returns both and
+    the driver sees zero getMores.
+
+    An upserted `_id` is the only unbounded field a result carries, which is
+    what makes this reachable at all. At least one result is always taken --
+    mongod does not answer an empty first batch just because the single result
+    is large, and a zero here would mean no progress is ever possible.
+    """
+    budget = MAX_BSON_OBJECT_SIZE
+    used = 0
+    for i, entry in enumerate(results):
+        if batch_size is not None and i >= batch_size:
+            return i
+        used += len(bson.encode(entry))
+        if used > budget:
+            return max(1, i)
+    return len(results)
+
+
 def _bulk_write_missing(field: str) -> dict[str, Any]:
     """mongod's ``IDLFailedToParse`` for a required op field that is absent."""
     return {
@@ -3463,6 +3512,27 @@ def _bulk_write(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         if not errors_only:
             results.append(entry_out)
 
+    # The results are a real CURSOR when they do not fit the requested batch,
+    # exactly like `find` / `aggregate`. Measured against mongod 8.2.11
+    # (2026-09-18) -- the boundary is STRICTLY "more remain", not ">=":
+    #
+    #     no `cursor` option        id 0, every result in firstBatch
+    #     batchSize 2, 5 results    id SET, firstBatch 2, getMore -> 3
+    #     batchSize 2, 2 results    id 0   (an exact fit keeps no cursor)
+    #     batchSize 5, 2 results    id 0
+    #     batchSize 0, 5 results    id SET, firstBatch EMPTY, getMore -> 5
+    #     errorsOnly, no errors     id 0   (nothing to return, so nothing to page)
+    #
+    # `getMore` addresses it as `{getMore: <id>, collection: "$cmd.bulkWrite"}`
+    # against ADMIN, so the namespace registered here is what `_get_more`
+    # rebuilds from `ctx.db_name` + that collection name.
+    take = _bulk_write_first_batch_len(results, _bulk_write_batch_size(doc))
+    cursor_id = bson.Int64(0)
+    first_batch = results
+    if take < len(results):
+        first_batch = results[:take]
+        cursor_id = bson.Int64(ctx.cursors.register(_BULK_WRITE_NS, results[take:], bounded=True))
+
     # Field order is mongod's: the cursor first, then the counters, then ``ok``.
     return {
         # `bson.Int64`, not a bare `0`. A cursor id is an int64 on the wire and
@@ -3473,9 +3543,9 @@ def _bulk_write(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         # 30 of its `bulkWrite` tests. Every other cursor reply in this file was
         # already wrapped; this was the one that was not.
         "cursor": {
-            "id": bson.Int64(0),
-            "firstBatch": results,
-            "ns": "admin.$cmd.bulkWrite",
+            "id": cursor_id,
+            "firstBatch": first_batch,
+            "ns": _BULK_WRITE_NS,
         },
         "nErrors": n_errors,
         "nInserted": counts["nInserted"],

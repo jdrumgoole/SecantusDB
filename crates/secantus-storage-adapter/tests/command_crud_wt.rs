@@ -6,7 +6,7 @@
 mod common;
 
 use bson::{doc, Bson, Document};
-use common::with_wt;
+use common::{dispatch_full, with_wt};
 use secantus_commands::{dispatch, CommandContext};
 
 fn count(c: &mut CommandContext) -> i32 {
@@ -680,5 +680,75 @@ fn bulk_write_reply_cursor_id_is_int64() {
             matches!(id, Bson::Int64(0)),
             "cursor.id must be Int64, got {id:?}"
         );
+    });
+}
+
+/// `bulkWrite`'s results are a real cursor when they do not fit one batch.
+///
+/// Measured against mongod 8.2.11 (2026-09-18). The boundary is strictly "more
+/// remain" -- an exact fit keeps NO cursor, which is where this differs from
+/// `find` (hence `bounded: true` at the call site).
+#[test]
+fn bulk_write_results_page_through_a_cursor() {
+    with_wt(|c| {
+        c.db_name = "admin".into();
+        let bulk = |c: &mut CommandContext, n: i32, extra: Document| {
+            let ops: Vec<Bson> = (0..n)
+                .map(|i| Bson::Document(doc! {"insert": 0, "document": {"i": i}}))
+                .collect();
+            let mut cmd = doc! {"bulkWrite": 1, "nsInfo": [{"ns": "t.c"}], "ops": ops};
+            for (k, v) in extra {
+                cmd.insert(k, v);
+            }
+            dispatch(&cmd, c)
+        };
+
+        // (label, ops, extra, cursor expected, firstBatch len)
+        let cases: Vec<(&str, i32, Document, bool, usize)> = vec![
+            ("no cursor option", 5, doc! {}, false, 5),
+            (
+                "batchSize under count",
+                5,
+                doc! {"cursor": {"batchSize": 2}},
+                true,
+                2,
+            ),
+            ("batchSize 0", 5, doc! {"cursor": {"batchSize": 0}}, true, 0),
+            ("exact fit", 2, doc! {"cursor": {"batchSize": 2}}, false, 2),
+            (
+                "room to spare",
+                2,
+                doc! {"cursor": {"batchSize": 5}},
+                false,
+                2,
+            ),
+            ("errorsOnly", 5, doc! {"errorsOnly": true}, false, 0),
+        ];
+        for (label, n, extra, want_cursor, want_first) in cases {
+            let reply = bulk(c, n, extra);
+            let cur = reply.get_document("cursor").unwrap();
+            let id = cur.get_i64("id").unwrap();
+            assert_eq!(id != 0, want_cursor, "{label}: id={id}");
+            assert_eq!(
+                cur.get_array("firstBatch").unwrap().len(),
+                want_first,
+                "{label}"
+            );
+        }
+
+        // The remainder pages out through `getMore`, addressed by the command
+        // namespace, and the cursor closes once drained.
+        // `dispatch_full`, not `dispatch`: the batch is handed back out of band
+        // through `ctx.pending_batch` (the real server streams it), so bare
+        // `dispatch` returns the cursor envelope with no `nextBatch` at all --
+        // which reads exactly like an empty cursor if you assert on it.
+        let reply = bulk(c, 5, doc! {"cursor": {"batchSize": 2}});
+        let id = reply.get_document("cursor").unwrap().get_i64("id").unwrap();
+        let more = dispatch_full(&doc! {"getMore": id, "collection": "$cmd.bulkWrite"}, c);
+        let cur = more
+            .get_document("cursor")
+            .unwrap_or_else(|_| panic!("getMore reply: {more:?}"));
+        assert_eq!(cur.get_array("nextBatch").unwrap().len(), 3);
+        assert_eq!(cur.get_i64("id").unwrap(), 0, "drained, so it closes");
     });
 }

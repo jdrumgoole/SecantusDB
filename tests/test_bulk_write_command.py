@@ -447,3 +447,97 @@ def test_bypass_empty_ts_replacement_is_accepted(client: MongoClient) -> None:
             }
         )
     assert getattr(exc.value, "code", None) == 40415
+
+
+# --- the result cursor -----------------------------------------------------
+#
+# Every expectation below is a measured mongod 8.2.11 answer (2026-09-18,
+# `/tmp` probe run against a live server). The boundary is strictly "more
+# remain": an exact fit keeps NO cursor, which is where `find` differs.
+
+CURSOR_SHAPES = [
+    # (label, n_ops, extra command fields, cursor expected?, len(firstBatch))
+    ("no cursor option means unbounded", 5, {}, False, 5),
+    ("batchSize under the count", 5, {"cursor": {"batchSize": 2}}, True, 2),
+    ("batchSize 0 opens an EMPTY batch", 5, {"cursor": {"batchSize": 0}}, True, 0),
+    ("an exact fit keeps no cursor", 2, {"cursor": {"batchSize": 2}}, False, 2),
+    ("room to spare", 2, {"cursor": {"batchSize": 5}}, False, 2),
+    ("errorsOnly has nothing to page", 5, {"errorsOnly": True}, False, 0),
+    (
+        "errorsOnly outranks batchSize",
+        5,
+        {"cursor": {"batchSize": 2}, "errorsOnly": True},
+        False,
+        0,
+    ),
+]
+
+
+def _bulk(client: MongoClient, n_ops: int, **extra):
+    ops = [{"insert": 0, "document": {"i": i}} for i in range(n_ops)]
+    return client.admin.command({"bulkWrite": 1, "nsInfo": [{"ns": "db.c"}], "ops": ops, **extra})
+
+
+@pytest.mark.parametrize(("label", "n_ops", "extra", "want_cursor", "want_first"), CURSOR_SHAPES)
+def test_result_cursor_shapes(client, label, n_ops, extra, want_cursor, want_first) -> None:
+    cursor = _bulk(client, n_ops, **extra)["cursor"]
+    assert bool(cursor["id"]) is want_cursor, label
+    assert len(cursor["firstBatch"]) == want_first, label
+
+
+def test_get_more_pages_the_rest_and_then_closes(client: MongoClient) -> None:
+    """`getMore` addresses it as `collection: "$cmd.bulkWrite"` against admin."""
+    reply = _bulk(client, 5, cursor={"batchSize": 2})
+    got = c = client.admin.command(
+        {"getMore": reply["cursor"]["id"], "collection": "$cmd.bulkWrite"}
+    )
+    assert len(got["cursor"]["nextBatch"]) == 3
+    assert c["cursor"]["id"] == 0  # drained, so the cursor closes
+
+
+def test_get_more_honours_its_own_batch_size(client: MongoClient) -> None:
+    reply = _bulk(client, 5, cursor={"batchSize": 1})
+    got = client.admin.command(
+        {"getMore": reply["cursor"]["id"], "collection": "$cmd.bulkWrite", "batchSize": 1}
+    )
+    assert len(got["cursor"]["nextBatch"]) == 1
+    assert got["cursor"]["id"] != 0  # three still to come
+
+
+def test_kill_cursors_closes_a_live_result_cursor(client: MongoClient) -> None:
+    reply = _bulk(client, 5, cursor={"batchSize": 1})
+    killed = client.admin.command(
+        {"killCursors": "$cmd.bulkWrite", "cursors": [reply["cursor"]["id"]]}
+    )
+    assert killed["cursorsKilled"] == [reply["cursor"]["id"]]
+    assert killed["cursorsNotFound"] == []
+
+
+def test_a_batch_too_BIG_for_one_reply_also_opens_a_cursor(client: MongoClient) -> None:
+    """The size limit, with NO batchSize set -- the half a count-only rule misses.
+
+    Two upserts whose `_id`s are each `maxBsonObjectSize / 2` bytes produce two
+    result documents that cannot share one 16MB reply. mongod answers
+    `firstBatch: 1` plus a cursor; the Go driver's prose test 7 asserts it made
+    exactly one `getMore`, and count-only batching returns both and shows it
+    none. An upserted `_id` is the only unbounded field a result carries, which
+    is what makes this reachable at all.
+    """
+    half = client.db.command("hello")["maxBsonObjectSize"] // 2
+    ops = [
+        {
+            "update": 0,
+            "filter": {"_id": ch * half},
+            "updateMods": {"$set": {"x": 1}},
+            "upsert": True,
+            "multi": False,
+        }
+        for ch in ("a", "b")
+    ]
+    reply = client.admin.command({"bulkWrite": 1, "nsInfo": [{"ns": "db.coll"}], "ops": ops})
+    assert reply["nUpserted"] == 2
+    assert len(reply["cursor"]["firstBatch"]) == 1, "both results cannot fit one reply"
+    assert reply["cursor"]["id"] != 0
+
+    rest = client.admin.command({"getMore": reply["cursor"]["id"], "collection": "$cmd.bulkWrite"})
+    assert len(rest["cursor"]["nextBatch"]) == 1
