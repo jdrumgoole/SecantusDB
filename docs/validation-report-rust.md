@@ -1,6 +1,6 @@
 # mongo-rust-driver Validation Report
 
-Generated 2026-09-14 — SecantusDB 0.6.0b16 vs mongo-rust-driver 12dd49b (`vendor/mongo-rust-driver/`).
+Generated 2026-09-18 — SecantusDB 0.6.0b16 vs mongo-rust-driver 12dd49b (`vendor/mongo-rust-driver/`).
 
 Run `uv run python -m invoke validate-rust` to refresh. The Rust-driver analogue of the pymongo / mongo-go-driver / mongo-node-driver / mongo-java-driver / mongo-ruby-driver gauges — the language MongoDB consumers reach for when they want native performance + async.
 
@@ -15,20 +15,16 @@ Run `uv run python -m invoke validate-rust` to refresh. The Rust-driver analogue
 | `db` | 12 | 0 | 0 | 12 | 100.0% |
 | `error` | 5 | 0 | 0 | 5 | 100.0% |
 | `index_management` | 7 | 0 | 0 | 7 | 100.0% |
-| `spec` | 20 | 2 | 0 | 22 | 90.9% |
-| **Overall** | **103** | **3** | **0** | **106** | **97.2%** |
+| `spec` | 21 | 0 | 0 | 21 | 100.0% |
+| **Overall** | **104** | **1** | **0** | **105** | **99.0%** |
 
-## Failures (3)
+## Failures (1)
 
 First 30 failed tests for triage:
 
 ```
 test::coll::find_one_and_delete_hint_server_version
-    thread 'test::coll::find_one_and_delete_hint_server_version' (10405) panicked at driver/src/test/coll.rs:663:9:
-test::spec::crud::generated_id_first_field
-    thread 'test::spec::crud::generated_id_first_field' (11036) panicked at driver/src/test/spec/crud.rs:68:53:
-test::spec::crud::run_unified
-    thread 'test::spec::crud::run_unified' (11051) panicked at driver/src/test/spec/unified_runner/operation.rs:202:29:
+    thread 'test::coll::find_one_and_delete_hint_server_version' (6614) panicked at driver/src/test/coll.rs:663:9:
 ```
 
 ## How this is generated

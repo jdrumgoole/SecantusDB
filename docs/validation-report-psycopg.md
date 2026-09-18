@@ -2,7 +2,7 @@
 
 - SecantusDB (Python server) 0.6.0b16
 - psycopg suite: vendor/psycopg @ unknown
-- generated: 2026-09-14 06:50 UTC
+- generated: 2026-09-18 18:12 UTC
 
 | category | passed | failed | skipped | total | pass rate |
 |---|---|---|---|---|---|
@@ -16,19 +16,19 @@
 | pq/test_pgresult.py | 26 | 0 | 0 | 26 | 100.0% |
 | pq/test_pipeline.py | 4 | 0 | 1 | 5 | 100.0% |
 | pq/test_pq.py | 4 | 0 | 3 | 7 | 100.0% |
-| test_adapt.py | 55 | 4 | 0 | 59 | 93.2% |
+| test_adapt.py | 53 | 6 | 0 | 59 | 89.8% |
 | test_capabilities.py | 12 | 0 | 9 | 21 | 100.0% |
 | test_column.py | 53 | 0 | 0 | 53 | 100.0% |
 | test_concurrency.py | 14 | 2 | 0 | 16 | 87.5% |
 | test_concurrency_async.py | 11 | 2 | 0 | 13 | 84.6% |
-| test_connection.py | 99 | 2 | 2 | 103 | 98.0% |
-| test_connection_async.py | 100 | 2 | 5 | 107 | 98.0% |
+| test_connection.py | 100 | 2 | 2 | 104 | 98.0% |
+| test_connection_async.py | 101 | 2 | 5 | 108 | 98.1% |
 | test_connection_info.py | 37 | 0 | 3 | 40 | 100.0% |
 | test_conninfo.py | 38 | 0 | 0 | 38 | 100.0% |
 | test_conninfo_attempts.py | 27 | 0 | 0 | 27 | 100.0% |
 | test_conninfo_attempts_async.py | 27 | 0 | 0 | 27 | 100.0% |
-| test_copy.py | 105 | 7 | 0 | 112 | 93.8% |
-| test_copy_async.py | 107 | 5 | 0 | 112 | 95.5% |
+| test_copy.py | 106 | 6 | 0 | 112 | 94.6% |
+| test_copy_async.py | 106 | 6 | 0 | 112 | 94.6% |
 | test_cursor.py | 78 | 0 | 0 | 78 | 100.0% |
 | test_cursor_async.py | 78 | 0 | 0 | 78 | 100.0% |
 | test_cursor_client.py | 28 | 0 | 0 | 28 | 100.0% |
@@ -46,7 +46,7 @@
 | test_notify.py | 9 | 6 | 0 | 15 | 60.0% |
 | test_notify_async.py | 9 | 6 | 0 | 15 | 60.0% |
 | test_pipeline.py | 45 | 0 | 0 | 45 | 100.0% |
-| test_pipeline_async.py | 44 | 1 | 0 | 45 | 97.8% |
+| test_pipeline_async.py | 43 | 2 | 0 | 45 | 95.6% |
 | test_prepared.py | 30 | 0 | 1 | 31 | 100.0% |
 | test_prepared_async.py | 30 | 0 | 1 | 31 | 100.0% |
 | test_psycopg_dbapi20.py | 80 | 0 | 0 | 80 | 100.0% |
@@ -78,9 +78,9 @@
 | types/test_shapely.py | 2 | 0 | 26 | 28 | 100.0% |
 | types/test_string.py | 134 | 0 | 1 | 135 | 100.0% |
 | types/test_uuid.py | 26 | 0 | 0 | 26 | 100.0% |
-| **total** | **5537** | **101** | **148** | **5786** | **98.2%** |
+| **total** | **5536** | **104** | **148** | **5788** | **98.2%** |
 
-## Failures (101)
+## Failures (104)
 
 - `tests/pq/test_pgconn.py::test_change_password`
 - `tests/pq/test_pgconn.py::test_change_password_error`
@@ -88,6 +88,8 @@
 - `tests/pq/test_pgconn.py::test_connectdb_error`
 - `tests/test_adapt.py::test_random[0-b]`
 - `tests/test_adapt.py::test_random[0-s]`
+- `tests/test_adapt.py::test_random[0-t]`
+- `tests/test_adapt.py::test_random[1-b]`
 - `tests/test_adapt.py::test_random[1-s]`
 - `tests/test_adapt.py::test_random[1-t]`
 - `tests/test_concurrency.py::test_cancel_stream`
@@ -103,12 +105,12 @@
 - `tests/test_copy.py::test_copy_from_leaks[1-True]`
 - `tests/test_copy.py::test_copy_table_across[binary]`
 - `tests/test_copy.py::test_copy_table_across[block]`
-- `tests/test_copy.py::test_copy_table_across[row]`
 - `tests/test_copy.py::test_set_custom_type`
-- `tests/test_copy_async.py::test_copy_from_leaks[asyncio-0-False]`
+- `tests/test_copy_async.py::test_copy_from_leaks[asyncio-0-True]`
 - `tests/test_copy_async.py::test_copy_from_leaks[asyncio-1-True]`
 - `tests/test_copy_async.py::test_copy_table_across[asyncio-binary]`
 - `tests/test_copy_async.py::test_copy_table_across[asyncio-block]`
+- `tests/test_copy_async.py::test_copy_table_across[asyncio-row]`
 - `tests/test_copy_async.py::test_set_custom_type[asyncio]`
 - `tests/test_cursor_common.py::test_executemany_lock[asyncio-Cursor]`
 - `tests/test_cursor_common.py::test_executemany_lock[asyncio-RawCursor]`
@@ -128,6 +130,7 @@
 - `tests/test_notify_async.py::test_notify_timeout[asyncio]`
 - `tests/test_notify_async.py::test_notify_timeout_0[asyncio]`
 - `tests/test_notify_async.py::test_stop_after[asyncio]`
+- `tests/test_pipeline_async.py::test_executemany_trace[asyncio]`
 - `tests/test_pipeline_async.py::test_executemany_trace_returning[asyncio]`
 - `tests/test_tpc.py::TestTPC::test_recovered_xids`
 - `tests/test_tpc_async.py::TestTPC::test_recovered_xids[asyncio]`

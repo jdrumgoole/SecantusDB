@@ -1,6 +1,6 @@
 # pymongo async Validation Report
 
-Generated 2026-09-14 — SecantusDB 0.6.0b16 vs pymongo f2103a95870a (`vendor/pymongo-tests/test/asynchronous/`).
+Generated 2026-09-18 — SecantusDB 0.6.0b16 vs pymongo f2103a95870a (`vendor/pymongo-tests/test/asynchronous/`).
 
 Run `uv run python -m invoke validate-pymongo-async` to refresh. This is the async sibling of the headline pymongo gauge: it drives pymongo's native `AsyncMongoClient` API (the async/await wire path that replaced Motor) over the same in-scope CRUD / cursor / change-stream / command-monitoring surface. A gap versus `docs/validation-report.md` means the async code path exercises something the sync path doesn't.
 
@@ -28,7 +28,7 @@ Run `uv run python -m invoke validate-pymongo-async` to refresh. This is the asy
 | `test_run_command.py` | 16 | 0 | 0 | 5 | 21 | 100.0% |
 | `test_transactions_unified.py` | 95 | 0 | 0 | 169 | 264 | 100.0% |
 | `test_versioned_api_integration.py` | 39 | 0 | 0 | 4 | 43 | 100.0% |
-| **Overall** | **977** | **6** | **0** | **440** | **1423** | **99.4%** |
+| **Overall** | **977** | **6** | **0** | **440** | **1423** | **99.3%** |
 
 ## Failures (6)
 
