@@ -7,6 +7,15 @@ use secantus_pgserver::{DatabaseRegistry, HandlerFactory, PgHandler};
 use secantus_storage::Storage;
 use tokio::net::TcpListener;
 
+/// `--version` output: the version, and the source tree it was built from.
+fn version_text() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    match option_env!("SECANTUS_SOURCE_TREE").unwrap_or("") {
+        "" => format!("secantusd-pg {version}\n"),
+        tree => format!("secantusd-pg {version}\ntree: {tree}\n"),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `secantusd-pg [<home> [<addr>]] [--database NAME]...`: every
@@ -25,7 +34,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // workflow sanity-checks the artifact with `--version`, so this is load
         // bearing rather than a nicety.
         if arg == "--version" || arg == "-V" {
-            println!("secantusd-pg {}", env!("CARGO_PKG_VERSION"));
+            // Two lines: the version for "what did I install?", and the source
+            // tree for a bug report. The crate version moves at release
+            // cadence, so hundreds of commits share one string and it cannot
+            // identify a build on its own. The tree line is OMITTED, not
+            // blank, when built without git.
+            print!("{}", version_text());
             return Ok(());
         } else if arg == "--help" || arg == "-h" {
             println!(

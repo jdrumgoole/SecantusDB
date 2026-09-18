@@ -187,3 +187,60 @@ def test_help_exits_zero() -> None:
     res = subprocess.run([str(_BIN), "--help"], capture_output=True, text=True, timeout=30)
     assert res.returncode == 0
     assert "--storage-path" in res.stdout
+
+
+def _source_tree_of(binary: pathlib.Path) -> str | None:
+    """The tree hash the binary was stamped with, or None if it carries none."""
+    out = subprocess.run([str(binary), "--version"], capture_output=True, text=True, timeout=60)
+    for line in out.stdout.splitlines():
+        if line.startswith("tree: "):
+            return line[len("tree: ") :].strip()
+    return None
+
+
+def _tree_at_head() -> str | None:
+    out = subprocess.run(
+        ["git", "rev-parse", "HEAD:crates"],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+def test_binary_was_built_from_this_tree() -> None:
+    """A stale binary must not be smoked as though it were the release artifact.
+
+    Reading the stamp means SPAWNING the binary, which is a different mechanism
+    from importing a module attribute the way the `_secantus_core` check does —
+    verified here rather than assumed, since the process boundary was the part
+    nobody had looked at.
+
+    HARD failure only when ``SECANTUSDB_BIN`` is set. That variable means "smoke THIS
+    artifact", which is how the release workflow points the suite at the binary
+    it is about to publish — exactly when staleness would ship. A locally
+    discovered binary only reports, because failing someone who built an hour
+    ago and has since edited an unrelated crate is how a check gets disabled.
+
+    Compared against HEAD, not the working copy, so an uncommitted edit does not
+    fail anyone mid-change.
+    """
+    assert _BIN is not None
+    stamped = _source_tree_of(_BIN)
+    head = _tree_at_head()
+    if stamped is None:
+        pytest.skip("binary carries no source stamp (built without git, or pre-stamp)")
+    if head is None:
+        pytest.skip("no git here to compare against")
+    if stamped == head:
+        return
+    message = (
+        f"{_BIN.name} was built from crates tree {stamped[:12]}, but HEAD has "
+        f"{head[:12]} — the binary is stale. Rebuild it:\n"
+        f"    cargo build --manifest-path crates/secantusdb/Cargo.toml\n"
+        f"Smoking a stale binary proves only that OLD code works."
+    )
+    if os.environ.get("SECANTUSDB_BIN"):
+        pytest.fail(message)
+    print(f"\nNOTE: {message}")
