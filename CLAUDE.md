@@ -12,7 +12,7 @@ product; the Python pair is the reference implementation they are held to.
 | server | binary / entry point | wire | role |
 | --- | --- | --- | --- |
 | **Rust MongoDB server** | `secantusd-rs` (`crates/secantusdb`) | MongoDB | **the flagship.** Prebuilt binaries per platform, and bundled in the wheel |
-| **Rust PostgreSQL server** | `secantusd-pg` (`crates/secantus-pgserver`) | PostgreSQL | **the newest.** Builds from its own directory; no shipped binary yet |
+| **Rust PostgreSQL server** | `secantusd-pg` (`crates/secantus-pgserver`) | PostgreSQL | **the newest.** Builds from its own directory; prebuilt binaries await a pushed `secantusd-pg-v*` tag |
 | Python MongoDB server | `SecantusDBServer` / `secantusd-py` | MongoDB | the reference — every operator, stage and error message lands here first |
 | Python PostgreSQL server | `secantusd-py-pg` (`secantus.sql.pgserver`) | PostgreSQL | the reference for the SQL surface, and still the most complete one |
 
@@ -258,18 +258,28 @@ one request path:
   the catalog in `secantus-pgcatalog`. Plan: `tasks/rust-pgserver-plan.md` — but
   that file's status header predates most of the work; **reproduce before
   believing it**. Current shape, measured 2026-09-18 rather than read:
-  - Scored by psycopg 3's own unmodified suite: **3,056 of 4,238 (73.8%)**,
-    against the Python PG server's 98.6% on the same suite. Run it with
+  - Scored by psycopg 3's own unmodified suite: **5,545 of 5,729 pass, one fails**
+    (183 skipped), measured 2026-09-18 against a build of current `main`. The one
+    failure is `test_typing.py::test_generic_connect`, a static-typing check on
+    psycopg's own classes that never reaches the wire. Run it with
     `SECANTUS_GAUGE_SERVER=rust uv run --no-sync python -m psycopg_validation.runner`
-    (it writes `.validation/psycopg-raw-rust.json`, a *different* file from the
-    Python server's — do not use `invoke validate-psycopg`, which hardcodes the
-    Python path and would overwrite the Python report).
-  - 654 of the 1,084 failures are faithful `FeatureNotSupported` refusals rather
-    than wrong answers — which is the project's stated preference working.
-  - Not there yet: `CREATE INDEX` (refused outright), password verification
-    (every connection is trusted — a role's SCRAM verifier is stored, never
-    checked), a column-level `UNIQUE` accepted without being enforced, and casts
-    to / binary parameters of `uuid` and `inet`.
+    (~17 min; it writes `.validation/psycopg-raw-rust.json`, a *different* file
+    from the Python server's — do not use `invoke validate-psycopg`, which
+    hardcodes the Python path and would overwrite the Python report).
+  - **Do not compare that to the Python PG server's published 98.6%.** That report
+    predates the widening of this gauge: it covers 39 modules / 4,238 tests, this
+    run covers 72 / 5,729. Re-run both before putting them in one sentence.
+  - **MEASURE IT, DO NOT INHERIT THE NUMBER.** The first figure published here was
+    73.8%, taken by a sub-agent against a checkout sitting 116 commits behind
+    `origin/main` — 50 of them touching this crate. It went on the live website
+    before anyone checked `git log`. The tell was mundane: an *existing* test
+    started failing with `invalid port number: "0"`, because the old binary printed
+    its requested address rather than its bound one. **Before quoting a gauge
+    number, confirm the tree it was built from.**
+  - Not there yet: `CREATE INDEX` (refused outright), password verification (a
+    role's SCRAM verifier is stored and never checked — a wrong password and no
+    password both connect, re-probed 2026-09-18), and a column-level `UNIQUE`
+    that is accepted without being enforced.
   - Builds from **its own directory** (`cd crates/secantus-pgserver && cargo build
     --release`), because it links WiredTiger and is excluded from the clean
     workspace. `./inv rust-pgserver-build` (the task lives in `rust_tasks.py`, not
