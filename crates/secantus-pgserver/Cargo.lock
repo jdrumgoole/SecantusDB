@@ -1590,6 +1590,7 @@ dependencies = [
  "chrono-tz",
  "fancy-regex",
  "geo",
+ "libc",
  "rand 0.9.5",
  "regex",
  "unicode-normalization",

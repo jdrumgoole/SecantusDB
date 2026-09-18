@@ -2685,8 +2685,6 @@ fn is_case_convertible(v: &Bson) -> bool {
 }
 
 fn coerce_to_string(v: &Bson) -> Result<String, Fallback> {
-    use chrono::TimeZone;
-
     Ok(match v {
         Bson::Null | Bson::Undefined => String::new(),
         Bson::String(s) => s.clone(),
@@ -2714,14 +2712,92 @@ fn coerce_to_string(v: &Bson) -> Result<String, Fallback> {
         // appended after a colon UNPADDED, and the caller ASCII-cases the lot.
         Bson::Timestamp(ts) => {
             let secs = i64::from(ts.time);
-            let local = chrono::Local
-                .timestamp_opt(secs, 0)
-                .single()
-                .ok_or(Fallback::Defer)?;
-            format!("{}:{}", local.format("%b %e %H:%M:%S"), ts.increment)
+            format!("{}:{}", render_local_asctime(secs)?, ts.increment)
         }
         _ => return Err(Fallback::Defer),
     })
+}
+
+/// `%b %e %H:%M:%S` in the server process's LOCAL time -- the legacy
+/// asctime-like path mongod puts a `Timestamp` through (see `coerce_to_string`).
+///
+/// Split per platform because "the process's local timezone" is resolved by a
+/// DIFFERENT mechanism on each, and mongod uses whichever one the platform
+/// provides:
+///
+/// * Unix -- `chrono::Local`, which honours `TZ` and falls back to the system
+///   zone. Matches mongod, measured 2026-09-10.
+/// * Windows -- the MSVC CRT (`_tzset` + `_localtime64_s`). `chrono::Local`
+///   resolves the zone through `GetDynamicTimeZoneInformation` there and
+///   **ignores `TZ` entirely**, which is a real divergence and not a test
+///   artifact: measured against a real mongod 8.2.11 on Windows 11
+///   (2026-09-18), a server run with `TZ=UTC` renders
+///   `Timestamp(1720000000, 0)` as `jul  3 09:46:40`, while `chrono::Local` on
+///   a `Europe/London` host answered `jul  3 10:46:40` -- BST, an hour out. The
+///   three winter cases in the corpus agree either way, so a probe that skipped
+///   the July one would have concluded "no divergence" and been wrong.
+///
+/// Calling the CRT is exact BY CONSTRUCTION rather than an emulation of its
+/// `tzn[+|-]hh[:mm[:ss]][dzn]` grammar -- it is the same function mongod and
+/// CPython's `time.localtime` reach (which is why the pure-Python evaluator was
+/// already right on Windows). That grammar is not the IANA one and the gap is
+/// observable: the same probe found `TZ=America/New_York` makes
+/// mongod-on-Windows answer `jul  3 10:46:40`, i.e. the name parses as a zone
+/// with offset ZERO plus a trailing daylight name, so US DST rules apply and it
+/// lands on UTC+1 -- not New York's UTC-4. Emulating that was the alternative
+/// and it is exactly the kind of thing to get subtly wrong.
+#[cfg(not(windows))]
+fn render_local_asctime(secs: i64) -> Result<String, Fallback> {
+    use chrono::TimeZone;
+
+    let local = chrono::Local
+        .timestamp_opt(secs, 0)
+        .single()
+        .ok_or(Fallback::Defer)?;
+    Ok(local.format("%b %e %H:%M:%S").to_string())
+}
+
+#[cfg(windows)]
+fn render_local_asctime(secs: i64) -> Result<String, Fallback> {
+    use std::sync::Once;
+
+    // `_tzset` parses `TZ` into the CRT's global zone state. The UCRT does this
+    // lazily on first use anyway, so this is belt-and-braces -- but it names the
+    // dependency, and `Once` keeps it off the per-call path and away from any
+    // cross-thread race on that global state.
+    static TZSET: Once = Once::new();
+    // SAFETY: `_tzset` takes no arguments and only mutates CRT-internal zone
+    // state; `Once` guarantees the single call.
+    TZSET.call_once(|| unsafe { libc::tzset() });
+
+    // `time_t` is 64-bit on the targets we ship, but narrowing is checked rather
+    // than assumed: `ts.time` is a u32, whose top half does not fit a 32-bit
+    // `time_t`.
+    let t = libc::time_t::try_from(secs).map_err(|_| Fallback::Defer)?;
+    // SAFETY: `libc::tm` is nine `c_int`s -- plain old data, for which an
+    // all-zero bit pattern is a valid (and in-range) value.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: `_localtime64_s` reads one `__time64_t` and writes one `struct tm`
+    // through the out-pointer; both are live, correctly typed locals. Out-of-range
+    // inputs return a non-zero errno instead of writing, which is the branch below.
+    if unsafe { libc::localtime_s(&mut tm, &t) } != 0 {
+        return Err(Fallback::Defer);
+    }
+
+    // The English abbreviations, NOT the CRT's `strftime("%b")`: that one is
+    // locale-dependent and mongod's rendering is not. `%e` is the space-padded
+    // day, and H:M:S are zero-padded.
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let mon = usize::try_from(tm.tm_mon)
+        .ok()
+        .and_then(|m| MONTHS.get(m))
+        .ok_or(Fallback::Defer)?;
+    Ok(format!(
+        "{} {:2} {:02}:{:02}:{:02}",
+        mon, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec
+    ))
 }
 
 /// `$toUpper` / `$toLower`. The case mapping is **ASCII ONLY**, which is what

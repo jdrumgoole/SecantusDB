@@ -15280,33 +15280,6 @@ The general rule: **have the server report the port it bound; never hand it
 one you probed.** Any scheme that probes and passes the number has this
 window by construction.
 
-## Local-time rendering on Windows is UNMEASURED (2026-09-10)
-
-`$toLower` / `$toUpper` of a `Timestamp` render in the server process's local
-time (see the entry above and `tests/test_tolower_timestamp_local_time.py`).
-The two servers reach "local" by different routes, and only the Unix side has
-been measured:
-
-- the **Python** server calls `time.localtime`, i.e. the platform C runtime, so
-  on Windows it follows the CRT's `TZ` syntax (`tzn[+|-]hh[:mm[:ss]][dzn]`);
-- the **Rust** server calls `chrono::Local`, which on Windows goes to the
-  Win32 timezone API rather than the CRT.
-
-Whether those two agree on Windows — with `TZ` set, or unset — has NOT been
-probed, and neither has what a Windows `mongod` answers. It is not obviously a
-divergence; it is simply unknown, and saying so beats implying the Unix
-measurement covers it.
-
-What IS measured: CI's `windows-latest` lane showed that `TZ=America/New_York`
-there yields a **zero offset with US daylight rules applied** (three winter
-cases came back UTC, the July one UTC+1) — a wrong answer reached by a
-plausible route. That is why the zone-shifting cases in that test file are
-Unix-only; the `TZ=UTC` cases still run everywhere.
-
-Probing it needs a Windows box with both servers and a Windows mongod, which
-this project has never had. Low priority: the affected surface is two operators
-on a BSON `Timestamp`, and setting `TZ` on Windows is unusual.
-
 ## `bulkWrite` returns every result in `firstBatch` (2026-09-18)
 
 `bulkWrite`'s reply cursor is always `{id: 0, firstBatch: [...everything...]}` on

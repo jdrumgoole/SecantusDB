@@ -56,6 +56,15 @@ rand = "0.9"
 # instant -- DST included -- so a fixed offset or a UTC render is simply wrong,
 # and Rust's `std` exposes no timezone database. `clock` is what supplies
 # `chrono::Local`; without it the standalone Rust server had to error 16007 on
-# an operator the Python server has always answered.
+# an operator the Python server has always answered. On WINDOWS that same render
+# goes through the CRT instead (see the `libc` edge below) -- `chrono::Local`
+# ignores `TZ` there -- so `clock` carries the Unix half only.
 chrono = { version = "0.4", default-features = false, features = ["alloc", "clock"] }
 chrono-tz = { version = "0.10", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+# `_tzset` + `_localtime64_s`, the MSVC CRT's local-time resolution -- the same
+# pair mongod and CPython's `time.localtime` reach on Windows, and the only way
+# to honour `TZ` there. See `expressions::render_local_asctime` for the measured
+# mongod 8.2.11 divergence that put it here.
+libc = "0.2"
