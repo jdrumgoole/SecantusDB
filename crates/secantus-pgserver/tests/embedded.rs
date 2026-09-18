@@ -128,6 +128,51 @@ fn acknowledged_writes_survive_stop_and_reopen() {
     drop(reopened);
 }
 
+/// A pooled PostgreSQL connection never hangs up on its own, so `stop()` has to
+/// TELL it to finish rather than wait for it. Before the shutdown watch, an
+/// open connection made every `stop()` block for the full drain timeout --
+/// measured at 10.8s from Python, which is not a one-or-two-line ergonomic.
+#[test]
+fn stop_does_not_wait_on_an_idle_connection() {
+    let dir = TempDir::new().expect("tempdir");
+    let rt = Runtime::new().expect("runtime");
+    let mut server = start(dir.path());
+
+    // A connection deliberately left OPEN across the stop.
+    let client = rt.block_on(async {
+        let (client, connection) = tokio_postgres::connect(&server.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .simple_query("CREATE TABLE held (n int)")
+            .await
+            .expect("create");
+        client
+            .simple_query("INSERT INTO held VALUES (1)")
+            .await
+            .expect("insert");
+        client
+    });
+
+    let started = std::time::Instant::now();
+    server.stop();
+    let elapsed = started.elapsed();
+    drop(client);
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "stop() waited {elapsed:?} on an idle connection"
+    );
+
+    // And it still checkpointed on the way out.
+    let reopened = start(dir.path());
+    let rows = query_i32_column(&rt, &reopened, "SELECT n FROM held");
+    assert_eq!(rows, vec![1]);
+    drop(reopened);
+}
+
 #[test]
 fn stop_is_idempotent_and_drop_is_safe() {
     let dir = TempDir::new().expect("tempdir");

@@ -22,6 +22,7 @@ the (default-on) ``pgserver`` cargo feature:
 from __future__ import annotations
 
 import contextlib
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -130,6 +131,33 @@ def test_context_manager_stops_the_server_on_an_exception(tmp_path: Path) -> Non
     # The store was released and checkpointed on the way out.
     with _server(home) as reopened, _connect(reopened) as conn:
         assert conn.execute("SELECT n FROM boom").fetchall() == [(1,)]
+
+
+def test_stop_does_not_wait_on_an_open_connection(tmp_path: Path) -> None:
+    """Leaving a connection open must not make `stop()` crawl.
+
+    A pooled PostgreSQL connection never hangs up on its own -- a real backend
+    does not close an idle one -- so `stop()` has to TELL its connections to
+    finish rather than wait for them. Before it did, an open connection made
+    every stop block for the whole drain timeout: measured at 10.8s here, which
+    is not a one-or-two-line ergonomic, and forgetting to close a connection is
+    the common case in a test.
+    """
+    home = tmp_path / "home"
+    server = _secantus_server.PgServer(str(home))
+    conn = _connect(server)  # deliberately left OPEN across the stop
+    conn.execute("CREATE TABLE held (n int)")
+    conn.execute("INSERT INTO held VALUES (1)")
+
+    started = time.monotonic()
+    server.stop()
+    elapsed = time.monotonic() - started
+    conn.close()
+    assert elapsed < 3.0, f"stop() waited {elapsed:.1f}s on an open connection"
+
+    # And it still checkpointed on the way out.
+    with _server(home) as reopened, _connect(reopened) as check:
+        assert check.execute("SELECT n FROM held").fetchall() == [(1,)]
 
 
 def test_stop_is_idempotent(tmp_path: Path) -> None:

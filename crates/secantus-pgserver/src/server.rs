@@ -20,12 +20,23 @@
 //! makes "stopping the server checkpoints the store" a property of the type
 //! rather than a rule someone has to remember.
 //!
-//! [`RunningPgServer::stop`] therefore: stops accepting, drains the connection
-//! tasks (each holds an `Arc<Storage>` clone), shuts the tokio runtime down so
-//! any stragglers are dropped, and only then drops the last `Arc` — which is
-//! where the checkpoint happens. If a wedged task still holds a reference when
-//! the bounded drain gives up, the checkpoint cannot run, and `stop` says so
-//! loudly on stderr rather than returning as though the data were safe.
+//! [`RunningPgServer::stop`] therefore: tells the accept loop and every live
+//! connection to finish, drains them (each holds an `Arc<Storage>` clone), shuts
+//! the tokio runtime down so any straggler is dropped, and only then drops the
+//! last `Arc` — which is where the checkpoint happens. If a wedged task still
+//! holds a reference when the bounded drain gives up, the checkpoint cannot
+//! run, and `stop` says so loudly on stderr rather than returning as though the
+//! data were safe.
+//!
+//! The connections have to be TOLD, not just waited for. A pooled PostgreSQL
+//! connection sits idle in `process_socket` indefinitely -- a real backend never
+//! hangs up on one -- so a `stop()` that only waited would block for the whole
+//! drain timeout every time a caller left a connection open, which in an
+//! embedded test is most of the time (measured: 10.8s). Each connection task
+//! therefore selects its socket against a shutdown watch, and drops the
+//! connection when it fires. Cancelling there is safe: storage calls are
+//! synchronous, so a task is never cancelled part-way through a write, and an
+//! open transaction rolls back with its handle.
 
 use std::io;
 use std::net::SocketAddr;
@@ -36,12 +47,14 @@ use std::time::{Duration, Instant};
 use secantus_storage::Storage;
 use tokio::net::TcpListener;
 use tokio::runtime::{Builder, Runtime};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::{DatabaseRegistry, HandlerFactory, PgHandler};
 
 /// How long `stop` waits for live connection tasks to finish before giving up
-/// on a clean drain and tearing the runtime down anyway.
+/// on a clean drain and tearing the runtime down anyway. A backstop, not the
+/// expected path: the shutdown watch ends idle connections immediately.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// Poll interval for that drain.
 const DRAIN_POLL: Duration = Duration::from_millis(10);
@@ -82,6 +95,9 @@ pub struct RunningPgServer {
     runtime: Option<Runtime>,
     accept: Option<JoinHandle<()>>,
     stop_flag: Arc<AtomicBool>,
+    /// Broadcast to the accept loop and every live connection task. Sending
+    /// `true` is what makes an idle pooled connection let go promptly.
+    shutdown: watch::Sender<bool>,
     active: Arc<AtomicUsize>,
     /// The last `Arc` to the store. `stop` drops it — that is the checkpoint.
     storage: Option<Arc<Storage>>,
@@ -114,12 +130,14 @@ impl RunningPgServer {
     /// Must not be called from inside a tokio runtime: it drops one.
     pub fn stop(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
+        // Tell the accept loop and every live connection to finish. Ignore a
+        // send error: it only means every receiver is already gone.
+        let _ = self.shutdown.send(true);
         if let Some(handle) = self.accept.take() {
             handle.abort();
         }
-        // Give live connections a bounded chance to finish on their own; each
-        // holds an `Arc<Storage>` clone and the checkpoint below cannot run
-        // while one is outstanding.
+        // Then wait for them, bounded. Each holds an `Arc<Storage>` clone and
+        // the checkpoint below cannot run while one is outstanding.
         let deadline = Instant::now() + DRAIN_TIMEOUT;
         while self.active.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
             std::thread::sleep(DRAIN_POLL);
@@ -183,12 +201,20 @@ pub fn bind(
     let storage = Arc::new(storage);
     let stop_flag = Arc::new(AtomicBool::new(false));
     let active = Arc::new(AtomicUsize::new(0));
+    let (shutdown, shutdown_rx) = watch::channel(false);
 
     let accept = {
         let storage = storage.clone();
         let stop_flag = stop_flag.clone();
         let active = active.clone();
-        runtime.spawn(accept_loop(listener, storage, databases, stop_flag, active))
+        runtime.spawn(accept_loop(
+            listener,
+            storage,
+            databases,
+            stop_flag,
+            active,
+            shutdown_rx,
+        ))
     };
 
     Ok(RunningPgServer {
@@ -196,6 +222,7 @@ pub fn bind(
         runtime: Some(runtime),
         accept: Some(accept),
         stop_flag,
+        shutdown,
         active,
         storage: Some(storage),
     })
@@ -207,18 +234,32 @@ async fn accept_loop(
     databases: Arc<DatabaseRegistry>,
     stop_flag: Arc<AtomicBool>,
     active: Arc<AtomicUsize>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     while !stop_flag.load(Ordering::SeqCst) {
-        let (sock, _) = match listener.accept().await {
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            _ = shutdown.changed() => return,
+        };
+        let (sock, _) = match accepted {
             Ok(v) => v,
             Err(_) => continue,
         };
         let handler = Arc::new(PgHandler::new(storage.clone(), databases.clone()));
         let active = active.clone();
+        let mut conn_shutdown = shutdown.clone();
         tokio::spawn(async move {
             let _guard = ConnGuard::new(active);
-            let _ =
-                pgwire::tokio::process_socket(sock, None, Arc::new(HandlerFactory(handler))).await;
+            tokio::select! {
+                _ = pgwire::tokio::process_socket(
+                    sock,
+                    None,
+                    Arc::new(HandlerFactory(handler)),
+                ) => {}
+                // The server is stopping: drop this connection rather than wait
+                // for a client that may never hang up.
+                _ = conn_shutdown.changed() => {}
+            }
         });
     }
 }

@@ -24,6 +24,14 @@ runtime, and drops the last reference, which is where the checkpoint happens.
 someone has to remember, and if a wedged connection ever defeats the drain,
 `stop` says so on stderr instead of returning as though the data were safe.
 
+Shutdown also had to learn to tell the connections, not just wait for them. A
+pooled PostgreSQL connection sits idle indefinitely — a real backend never hangs
+up on one — so a stop that only drained blocked for its full timeout whenever a
+caller left a connection open, which in an embedded test is most of the time:
+10.8 seconds, measured. Every connection now selects its socket against a
+shutdown signal and lets go when it fires, which brings the same stop to 0.11
+seconds with the writes still landing on disk.
+
 `secantusd-pg` is now a thin CLI wrapper around the same `bind` — same readiness
 line, same `--database` handling, same clean SIGINT/SIGTERM shutdown — so there
 is one serve path instead of two, and a durability or shutdown fix lands in both
@@ -43,6 +51,11 @@ the binary and the embedded handle by construction.
 
 #### Changed
 
+- Stopping the PostgreSQL server now signals its live connections instead of
+  only waiting for them, so an open client connection no longer holds the
+  shutdown for the full drain timeout (10.8s → 0.11s). The old binary aborted
+  the accept task and dropped a still-shared `Arc<Storage>`, which skipped the
+  close-checkpoint silently in exactly that case.
 - `secantusd-pg` is a CLI wrapper over `secantus_pgserver::bind` rather than
   carrying its own accept loop. Observable behaviour — the
   `secantusd-pg listening on {bound} storage={home}` readiness line, the
