@@ -48,7 +48,11 @@ fn stamp_source_tree() {
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         })
         .collect();
-    let stamp = if trees.len() == 2 { trees.join("-") } else { String::new() };
+    let stamp = if trees.len() == 2 {
+        trees.join("-")
+    } else {
+        String::new()
+    };
     println!("cargo:rustc-env=SECANTUS_SOURCE_TREE={stamp}");
 }
 
