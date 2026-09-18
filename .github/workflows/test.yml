@@ -608,6 +608,24 @@ jobs:
           try { Set-MpPreference -DisableRealtimeMonitoring $true }
           catch { Write-Warning "could not disable Defender real-time scanning: $_" }
 
+      - name: Move the host time zone off UTC
+        # GitHub's Windows runners are UTC, which hid a real bug: the Rust
+        # engine ignored `TZ` and read the HOST zone, and on a UTC host
+        # "honours TZ=UTC" and "ignores TZ" render the same string. It only
+        # showed on a non-UTC Windows box (#1468). Newfoundland is never UTC at
+        # any instant, observes DST, and its half-hour offset also catches
+        # whole-hour assumptions -- London would not do, it IS UTC in winter.
+        # Here it runs the whole Python suite under a non-UTC host; the
+        # `storage-engine` job's twin step does the same for the Rust server.
+        #
+        # The assertion is the self-check: if the zone change silently did not
+        # take, every test below would pass vacuously on a UTC host again.
+        shell: pwsh
+        run: |
+          tzutil /s "Newfoundland Standard Time"
+          tzutil /g
+          python -c "import time; assert time.timezone == 12600, time.timezone; print('host zone offset OK:', -time.timezone / 3600, 'h')"
+
       - name: Put temp files on the runner work disk
         # pytest's tmp_path (→ every WT home) follows TMP/TEMP, which points at
         # the small OS-disk profile temp dir; RUNNER_TEMP lives on the runner's
@@ -1730,6 +1748,21 @@ jobs:
           try { Set-MpPreference -DisableRealtimeMonitoring $true }
           catch { Write-Warning "could not disable Defender real-time scanning: $_" }
 
+      - name: Move the host time zone off UTC (Windows)
+        # See the `test-windows` job's twin step for why, and why Newfoundland.
+        # This is the lane that matters for the Rust half: it is the only
+        # Windows job that builds the Rust server, and
+        # tests/test_rust_server_timestamp_local_time.py (in the smoke list
+        # below) fails against the pre-#1468 server on any host whose zone is
+        # not UTC -- measured on a Europe/London box in September, where it
+        # rendered TZ=UTC an hour late. The assertion is the self-check.
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          tzutil /s "Newfoundland Standard Time"
+          tzutil /g
+          python -c "import time; assert time.timezone == 12600, time.timezone; print('host zone offset OK:', -time.timezone / 3600, 'h')"
+
       - name: Reclaim disk (Windows)
         if: runner.os == 'Windows'
         # This job keeps a WiredTiger home per test for the whole session --
@@ -2000,6 +2033,7 @@ jobs:
           tests/test_rust_hint_error_message.py
           tests/test_rust_decimal_extremes.py
           tests/test_comparison_operand_types.py
+          tests/test_rust_server_timestamp_local_time.py
           -o addopts= -p no:cacheprovider -q
 
       - name: Rust-server concurrency invariants (#451 stress suite)
