@@ -9035,3 +9035,56 @@ def test_create_role_records_the_role_and_its_verifier(home: Path) -> None:
             other.execute("drop role test")
         cur.execute("select rolname from pg_roles")
         assert cur.fetchall() == [("postgres",)]
+
+
+def test_catalog_collections_are_created_in_a_store_that_has_none(home: Path) -> None:
+    """A brand-new store must still get its catalog collections created.
+
+    `ensure_collection` caches its verdict per connection, so the seven
+    `CATALOG_COLLECTIONS` are probed once rather than before every statement
+    (measured 2026-09-18: that probing was ~20us of a 54.5us per-statement
+    overhead -- seven fresh WiredTiger sessions, each opening and closing a
+    cursor). The cache must never let the FIRST caller skip the creation: a
+    catalog write against a collection nobody created is a WiredTiger ENOENT,
+    not a no-op. The store here is empty, so every write below lands on a
+    catalog that did not exist when the connection opened.
+    """
+    with _Server(home) as server:
+        conn = server.connect()
+        cur = conn.cursor()
+
+        # A table writes CATALOG_COLLECTION -- the one catalog write with no
+        # `ensure_collection` of its own beside it, so the blanket ensure in
+        # `open_transaction_handle` is what it relies on.
+        cur.execute("create table fresh_t (k int primary key, v text)")
+        cur.execute("insert into fresh_t values (1, 'a')")
+        assert cur.execute("select v from fresh_t where k = 1").fetchone() == ("a",)
+
+        # A serial column writes SEQUENCE_COLLECTION.
+        cur.execute("create table fresh_s (id serial primary key, v text)")
+        cur.execute("insert into fresh_s (v) values ('x')")
+        assert cur.execute("select id from fresh_s").fetchall() == [(1,)]
+
+        # A composite type writes COMPOSITE_COLLECTION + ENUM_META_COLLECTION.
+        cur.execute("create type fresh_c as (a int, b text)")
+        assert cur.execute("select '(1,z)'::fresh_c").fetchone() is not None
+
+        # A schema writes SCHEMA_COLLECTION.
+        cur.execute("create schema fresh_sch")
+        cur.execute("create table fresh_sch.t (k int)")
+        cur.execute("insert into fresh_sch.t values (7)")
+        assert cur.execute("select k from fresh_sch.t").fetchall() == [(7,)]
+
+
+def test_a_second_connection_re_probes_the_catalog(home: Path) -> None:
+    """The cache is per connection, so a second connection must re-probe rather
+    than inherit a verdict -- and must find what the first one created."""
+    with _Server(home) as server:
+        first = server.connect()
+        first.execute("create table shared_t (k int primary key)")
+        first.execute("insert into shared_t values (1)")
+
+        second = server.connect()
+        assert second.execute("select k from shared_t").fetchall() == [(1,)]
+        second.execute("insert into shared_t values (2)")
+        assert second.execute("select count(*) from shared_t").fetchone() == (2,)

@@ -14,7 +14,7 @@ mod encoding;
 mod plpgsql_do;
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI32};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -796,6 +796,24 @@ pub struct PgHandler {
     /// a catalog read may fill the process-wide cache only while the version
     /// still equals it (see `CatalogCache`).
     txn_catalog_version: std::sync::atomic::AtomicU64,
+    /// Catalog collections this CONNECTION has already seen exist.
+    ///
+    /// `open_transaction_handle` ensures all seven `CATALOG_COLLECTIONS`
+    /// before every statement, and `ensure_collection` opens a fresh
+    /// WiredTiger session per check (`op_session` has no transaction session
+    /// installed yet at that point), so an autocommit `select 1` -- which
+    /// touches no table -- was paying seven session open/cursor/search/close
+    /// cycles. Measured 2026-09-18: 54.5us above a bare protocol round trip,
+    /// against PostgreSQL's 9.1us.
+    ///
+    /// Per CONNECTION, not process-wide, and that is deliberate: the tests
+    /// build many servers over many storage paths that all use the database
+    /// name `postgres`, so a process-wide verdict would claim a collection
+    /// exists in a store that has never had one. A connection serves one
+    /// database (`db` is a `OnceLock`), so the collection name alone is a
+    /// sufficient key, and a catalog collection is only removed by dropping
+    /// the whole database -- which this connection could not survive anyway.
+    ensured_catalog: Mutex<HashSet<String>>,
     /// The open savepoints, oldest first.
     ///
     /// WiredTiger has no savepoint of its own, so one is a set of PRE-IMAGES:
@@ -997,6 +1015,7 @@ impl PgHandler {
             binary_results: std::sync::atomic::AtomicBool::new(false),
             txn_failed: std::sync::atomic::AtomicBool::new(false),
             txn_catalog_version: std::sync::atomic::AtomicU64::new(0),
+            ensured_catalog: Mutex::new(HashSet::new()),
             savepoints: Mutex::new(Vec::new()),
             cursor_capture: std::sync::Arc::new(Mutex::new(None)),
             backend_pid: AtomicI32::new(0),
@@ -2234,6 +2253,17 @@ impl PgHandler {
     /// insert against a collection nobody created yet is a WiredTiger ENOENT,
     /// not a no-op. Reads tolerate the absence; writes must not.
     fn ensure_collection(&self, coll: &str) -> PgWireResult<()> {
+        // Fast path: this connection has already established that the
+        // collection exists, and nothing short of dropping the database can
+        // undo that. See `ensured_catalog` for why the cache is per-connection.
+        if self
+            .ensured_catalog
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(coll)
+        {
+            return Ok(());
+        }
         let exists = self
             .storage
             .collection_exists(self.db(), coll)
@@ -2243,6 +2273,10 @@ impl PgHandler {
                 .create_collection(self.db(), coll)
                 .map_err(|e| Self::storage_err("could not create a catalog collection", e))?;
         }
+        self.ensured_catalog
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(coll.to_string());
         Ok(())
     }
 
