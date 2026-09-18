@@ -294,6 +294,46 @@ def concurrency(
 
 
 @task(
+    help={
+        "duration": "Wall-clock seconds per client count per trial (default: 5).",
+        "clients": 'Comma-separated client counts (default: "1,2,4,8").',
+        "workload": "insert | update | select (default: insert).",
+        "shared-table": "All clients hit one table (row contention) instead of one each.",
+        "repeat": "Trials per client count; the median is reported (default: 3).",
+        "server": "rust | postgres | both (default: both).",
+    }
+)
+def pg_concurrency(
+    c: Context,
+    duration: float = 5.0,
+    clients: str = "1,2,4,8",
+    workload: str = "insert",
+    shared_table: bool = False,
+    repeat: int = 3,
+    server: str = "both",
+) -> None:
+    """N-connection scaling benchmark for the Rust PG server vs PostgreSQL 16.
+
+    The PG-side counterpart of ``invoke concurrency``. Needs a local
+    PostgreSQL for the comparison rows and, for any number worth
+    quoting, a RELEASE ``secantusd-pg`` (``cd crates/secantus-pgserver
+    && cargo build --release``) -- a debug binary is ~2.3x slower, which
+    is enough to invert a conclusion about per-operation cost.
+    """
+    cmd = (
+        "uv run --no-sync python -m bench.pg_concurrency"
+        f" --seconds {float(duration)}"
+        f" --clients {shlex.quote(clients)}"
+        f" --workload {shlex.quote(workload)}"
+        f" --repeat {int(repeat)}"
+        f" --server {shlex.quote(server)}"
+    )
+    if shared_table:
+        cmd += " --mode shared"
+    c.run(cmd, pty=True)
+
+
+@task(
     name="concurrency-refresh",
     help={
         "duration": "Wall-clock seconds per writer count (default: 30).",
@@ -1264,7 +1304,9 @@ def validate_psycopg(c: Context) -> None:
         module="psycopg_validation.runner",
         raw=".validation/psycopg-raw.json",
         report="docs/validation-report-psycopg.md",
-        hint="A missing `vendor/psycopg` submodule or PG-server startup failure is the usual cause.",
+        hint=(
+            "A missing `vendor/psycopg` submodule or PG-server startup failure is the usual cause."
+        ),
     )
     c.run(
         "uv run --no-sync python -m psycopg_validation.generate_report "
@@ -1372,7 +1414,10 @@ def validate_pgjdbc(c: Context, shard: str = "") -> None:
         module="pgjdbc_validation.runner",
         raw=".validation/pgjdbc-raw.json",
         report="docs/validation-report-pgjdbc.md",
-        hint="A missing `vendor/pgjdbc` submodule, no JDK 21, or a PG-server startup failure is the usual cause.",
+        hint=(
+            "A missing `vendor/pgjdbc` submodule, no JDK 21, or a PG-server startup failure is the "
+            "usual cause."
+        ),
     )
     c.run(
         "uv run --no-sync python -m pgjdbc_validation.generate_report "
@@ -1425,7 +1470,10 @@ def validate_pgtest(c: Context) -> None:
         module="pgtest_validation.runner",
         raw=".validation/pgtest-raw.json",
         report="docs/validation-report-pgtest.md",
-        hint="Missing `go`, no network for the pinned cockroach fetch, or a PG-server startup failure is the usual cause.",
+        hint=(
+            "Missing `go`, no network for the pinned cockroach fetch, or a "
+            "PG-server startup failure is the usual cause."
+        ),
     )
     c.run(
         "uv run --no-sync python -m pgtest_validation.generate_report "
@@ -1453,7 +1501,10 @@ def validate_pgx(c: Context) -> None:
         module="pgx_validation.runner",
         raw=".validation/pgx-raw.json",
         report="docs/validation-report-pgx.md",
-        hint="A missing `vendor/pgx` submodule, missing `go`, or PG-server startup failure is the usual cause.",
+        hint=(
+            "A missing `vendor/pgx` submodule, missing `go`, or a PG-server "
+            "startup failure is the usual cause."
+        ),
     )
     c.run(
         "uv run --no-sync python -m pgx_validation.generate_report "
@@ -1482,7 +1533,10 @@ def validate_slt(c: Context) -> None:
         module="slt_validation.runner",
         raw=".validation/slt-raw.json",
         report="docs/validation-report-slt.md",
-        hint="A missing `vendor/sqllogictest` submodule or PG-server startup failure is the usual cause.",
+        hint=(
+            "A missing `vendor/sqllogictest` submodule or PG-server startup failure is the usual "
+            "cause."
+        ),
     )
     c.run(
         "uv run --no-sync python -m slt_validation.generate_report "
@@ -1866,7 +1920,9 @@ def validate_dotnet(c: Context, server: str = "python") -> None:
         raw=f".validation/dotnet-raw{suffix}.trx",
         report=f"docs/validation-report-dotnet{suffix}.md",
         server=server,
-        hint="The .NET SDK (and gpg, for the Encryption project's libmongocrypt check) is required.",
+        hint=(
+            "The .NET SDK (and gpg, for the Encryption project's libmongocrypt check) is required."
+        ),
     )
     c.run(
         "uv run --no-sync python -m dotnet_validation.generate_report "

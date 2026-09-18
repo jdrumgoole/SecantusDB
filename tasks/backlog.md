@@ -1061,33 +1061,103 @@ These work end-to-end but cut corners.
 
 Specific items that were left out of the slice that introduced their feature area.
 
-- [ ] **OPEN — Rust PostgreSQL server: storage concurrency for PG-grade scaling
-      (queued by Joe 2026-09-08, to start now that the psycopg gauge is clean).**
-      The psycopg gauge against `secantusd-pg` reached **4114 passed / 0 failed /
-      0 errors** on 2026-09-09 (`main` `446f59a9`; 3 macOS-only harness deselects
-      documented in `psycopg_validation/include_paths.py`). The next headline item
-      for the Rust PG server is throughput under real connection concurrency,
-      measured against native PostgreSQL 16 — the reference is PG's behaviour AND
-      performance, not parity with the Python server.
-      **What is there now** (`crates/secantus-storage/src/lib.rs`): a global
-      `lock: Mutex<()>` taken on the write paths (22 sites), per-collection
-      `coll_locks` so writes to different namespaces already run in parallel,
-      lock-free multi-row reads guarded by `ddl_generation`, optional
-      `write_tickets` admission, and one WT session per thread. The PG server
-      runs each statement under `tokio::task::block_in_place` with a
-      per-connection `txn` guard, so the runtime is not the bottleneck; whatever
-      serialises is inside `Storage`.
-      **The work — measure before building.** (1) A stress harness: N psycopg
-      connections doing conflicting and non-conflicting INSERT/UPDATE/SELECT
-      against `secantusd-pg` and against PG 16 on the same box, reporting
-      throughput vs N. (2) From the profile, lift what serialises: real WT
-      transactions per statement / per `BEGIN` block on the connection's own
-      session, snapshot-isolated readers, writers contending only on actual key
-      conflicts with a bounded `WT_ROLLBACK` retry. (3) Keep the two things the
-      serial model protects: the oplog's strictly-monotonic `seq` / event order
-      (a small dedicated critical section) and the durable-close / checkpoint
-      path (no data-loss regression — this is a database). Sizable, own branch;
-      not a cluster PR.
+- [ ] **OPEN — Rust PostgreSQL server: per-statement COST, and a read-path
+      ceiling at N≈4 (measured 2026-09-18; supersedes the "lift the global
+      write lock" framing this entry used to carry).**
+
+      **The premise of the old entry was wrong, and measuring cost minutes
+      settled it.** It said a global `Mutex<()>` was "taken on the write paths
+      (22 sites)" and that lifting it was the work. Those 22 sites are
+      `checkpoint`, `create_archive`, `set_collection_options`, `coll_mod`,
+      `import_oplog_segment`, `emit_noop_heartbeat`, `prune_ttl_all_collections`,
+      `create_collection_with_options`, `drop_collection`, `drop_database`,
+      `rename_collection`, `set_profile`, the four `*_ss_record` catalog
+      helpers, and the index create/drop family — **DDL and admin**. No row
+      insert/update/delete takes it. The one site near a write path,
+      `begin_user_transaction`, holds it only long enough to open a WT session
+      and drops it on return; WT's `begin_transaction` is already deferred to
+      the first `with_user_transaction`, so per-connection WT transactions —
+      item (2) of the old plan — already exist.
+
+      **Measured** with `invoke pg-concurrency` (`bench/pg_concurrency.py`), a
+      RELEASE `secantusd-pg` against PostgreSQL 16.15 on the same box, 5s per
+      trial, median of 3, spread 1–5%:
+
+      | workload | N | PG 16 ops/s | ours ops/s | PG scaling | our scaling |
+      | --- | --- | --- | --- | --- | --- |
+      | insert, one table each | 1 | 17,421 | 9,937 | 1.00x | 1.00x |
+      | | 4 | 41,145 | 21,263 | 2.36x | 2.14x |
+      | | 8 | 45,544 | 22,678 | 2.61x | 2.28x |
+      | insert, shared table | 4 | 43,563 | 20,596 | 2.44x | 2.07x |
+      | | 8 | 46,118 | 20,531 | 2.58x | 2.07x |
+      | select | 1 | 27,492 | 11,075 | 1.00x | 1.00x |
+      | | 8 | 83,092 | 23,898 | 3.02x | 2.16x |
+
+      **There is no serialisation collapse.** Write scaling tracks PG's closely
+      (2.14x vs 2.36x at N=4 on distinct tables), and a SHARED table costs us
+      almost nothing extra where it costs PG a little — the opposite of a global
+      write lock. For contrast, the Python server's baseline in
+      `tasks/wt-concurrency-plan.md` is 0.38x at N=2 and 0.18x at N=8; the Rust
+      storage does not have that problem.
+
+      **What is actually open, in priority order:**
+      1. **Per-statement cost.** We are 1.75x slower than PG on a single-client
+         INSERT and **2.48x on a single-client SELECT**, before any concurrency
+         is involved. Profile one statement end to end — parse/plan, catalog
+         lookup, the WT calls, wire encode — and attack whatever dominates.
+         This is the whole gap at N=1 and most of it at N=8.
+      2. **A read-path ceiling at N≈4.** SELECT plateaus at 2.16x where PG
+         reaches 3.02x, and reads take **no** storage lock at all (lock-free,
+         `ddl_generation`-guarded), so the write lock cannot explain it. Suspects
+         not yet separated: the `tokio::task::block_in_place` blocking pool's
+         width, per-thread WT session acquisition, and the absence of a plan
+         cache making every statement re-parse. Measure which before changing
+         any of them.
+
+      **Profile (2026-09-18, SELECT, daemon CPU sampled with `ps` while the
+      load ran).** CPU per operation is the number that reframes this item:
+
+      | N | ours ops/s | our CPU% | our us CPU/op | PG ops/s | PG CPU% | PG us CPU/op | ratio |
+      | --- | --- | --- | --- | --- | --- | --- | --- |
+      | 1 | 11,284 | 75% | **66** | 26,842 | 36% | **13.4** | 4.9x |
+      | 4 | 23,098 | 240% | 104 | 67,534 | 118% | 17.5 | 5.9x |
+      | 8 | 23,578 | 480% | 203 | 85,282 | 215% | 25.2 | 8.1x |
+
+      We burn about **five times more CPU per SELECT than PostgreSQL** on an
+      uncontended single connection. That single figure is the whole story: it
+      is not a lock, it is the cost of executing one statement.
+
+      It also rules a lock out directly. From N=4 to N=8 the daemon's CPU rises
+      240% -> 480% while throughput does not move (23.1k -> 23.6k). A thread
+      blocked on a mutex consumes NO CPU; burning an extra 2.4 cores for no
+      extra work is overhead amplification, not serialisation. CPU per op
+      triples (66 -> 203 us) across the same range, where PostgreSQL's not-quite
+      doubles (13.4 -> 25.2).
+
+      **Confound to respect before reading the N>=4 rows as a server property:**
+      the benchmark clients are Python processes on the SAME box, which has only
+      **4 performance cores** (plus 4 efficiency). At N=4 the clients and the
+      daemon already want more than 4 P-cores between them, so part of the
+      plateau — and part of the CPU-per-op inflation — is scheduler thrash and
+      slow-core spillover, not the server. The N=1 row has no such confound and
+      is the one to trust. Separating them needs the load generator on another
+      host; until that is done, "we plateau at N~4" is UNPROVEN as a server
+      property, while "we cost ~5x PG per statement" is measured.
+
+      Where to look first for the 66us, none of it yet attributed: every
+      statement re-parses (there is a `pg_query` parse memo, so confirm whether
+      it hits), the per-statement catalog lookup, `block_in_place` hand-off, WT
+      session acquisition, and wire encode. Attribute before optimising.
+
+      **Do NOT "lift the global lock" as a concurrency fix** — it does not guard
+      the row paths, and touching it risks the two invariants it does protect:
+      the oplog's strictly-monotonic `seq` / event order, and the durable-close /
+      checkpoint path. This is a database.
+
+      Caveats on the numbers above: single box (M-series, local loopback), 5s
+      windows, autocommit single-statement clients, no pipelining, `--repeat 3`.
+      Re-measure with `invoke pg-concurrency` rather than quoting these.
+
 - [x] **find/aggregate firstBatch is byte-capped — FIXED 2026-08-22 (both servers).**
   `getMore` had mongod's 16MB reply budget; a FIRST batch was capped on document
   count alone, so `find` with `batchSize: 25` over 1MB documents assembled a 25MB
