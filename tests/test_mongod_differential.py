@@ -20,6 +20,7 @@ Run explicitly with `pytest -m differential`.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shutil
@@ -132,15 +133,40 @@ def _start_mongod(env: Mapping[str, str] | None = None) -> tuple[subprocess.Pope
         env=None if env is None else dict(env),
     )
     uri = f"mongodb://127.0.0.1:{port}/"
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        try:
-            MongoClient(uri, serverSelectionTimeoutMS=500).admin.command("ping")
-            break
-        except Exception:  # noqa: BLE001 - polling for readiness
-            time.sleep(0.25)
-    else:
-        pytest.skip("mongod did not become ready")
+    # Everything from here to the `return` runs under `_reap_on_failure`: the
+    # caller only gets a `finally` to clean up with once it HOLDS the handle, so
+    # any exit before the return -- the skip below, the race guard's raise, a
+    # KeyboardInterrupt -- would otherwise leave a live mongod and its dbpath
+    # behind. `pytest.skip` raises `Skipped`, which is a `BaseException` and not
+    # an `Exception`, so the guard has to catch the wider one.
+    with _reap_on_failure(proc, tmp):
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            try:
+                MongoClient(uri, serverSelectionTimeoutMS=500).admin.command("ping")
+                break
+            except Exception:  # noqa: BLE001 - polling for readiness
+                time.sleep(0.25)
+        else:
+            pytest.skip("mongod did not become ready")
+        _assert_owns_port(proc, port)
+    return proc, uri, tmp
+
+
+@contextlib.contextmanager
+def _reap_on_failure(proc: subprocess.Popen, dbpath: str) -> Iterator[None]:
+    """Terminate `proc` and drop `dbpath` if the body doesn't complete."""
+    try:
+        yield
+    except BaseException:
+        proc.terminate()
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=30)
+        shutil.rmtree(dbpath, ignore_errors=True)
+        raise
+
+
+def _assert_owns_port(proc: subprocess.Popen, port: int) -> None:
     # A ping that succeeds is NOT proof it reached the mongod spawned above.
     # `_free_port()` closes its probe socket before this child binds, so
     # under `-n auto` another worker can take the port; ours then exits
@@ -158,7 +184,6 @@ def _start_mongod(env: Mapping[str, str] | None = None) -> tuple[subprocess.Pope
             "succeeded reached a DIFFERENT server, so this gate would have "
             "compared against a mongod it does not own"
         )
-    return proc, uri, tmp
 
 
 @pytest.fixture(scope="module")
