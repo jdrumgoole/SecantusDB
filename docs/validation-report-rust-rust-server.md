@@ -1,6 +1,6 @@
 # mongo-rust-driver Validation Report
 
-Generated 2026-09-14 — SecantusDB 0.6.0b16 vs mongo-rust-driver 12dd49b (`vendor/mongo-rust-driver/`).
+Generated 2026-09-18 — SecantusDB 0.6.0b16 vs mongo-rust-driver 12dd49b (`vendor/mongo-rust-driver/`).
 
 Run `uv run python -m invoke validate-rust` to refresh. The Rust-driver analogue of the pymongo / mongo-go-driver / mongo-node-driver / mongo-java-driver / mongo-ruby-driver gauges — the language MongoDB consumers reach for when they want native performance + async.
 
@@ -24,7 +24,7 @@ First 30 failed tests for triage:
 
 ```
 test::coll::find_one_and_delete_hint_server_version
-    thread 'test::coll::find_one_and_delete_hint_server_version' (15003) panicked at driver/src/test/coll.rs:663:9:
+    thread 'test::coll::find_one_and_delete_hint_server_version' (18839) panicked at driver/src/test/coll.rs:663:9:
 ```
 
 ## How this is generated

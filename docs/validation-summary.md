@@ -1,6 +1,6 @@
 # Cross-Driver Conformance Summary
 
-Generated 2026-09-14 — SecantusDB 0.6.0b16. Each per-driver gauge runs the driver vendor's own integration test suite (unmodified) against a SecantusDB daemon and emits its raw output to `.validation/`. This summary normalises on **test count** so the 12 gauges compare like for like — every row counts one assertion outcome, whether it landed as a JUnit `<testcase>`, a Mocha test, an RSpec example, a `go test` event, or a pytest collected item.
+Generated 2026-09-18 — SecantusDB 0.6.0b16. Each per-driver gauge runs the driver vendor's own integration test suite (unmodified) against a SecantusDB daemon and emits its raw output to `.validation/`. This summary normalises on **test count** so the 13 gauges compare like for like — every row counts one assertion outcome, whether it landed as a JUnit `<testcase>`, a Mocha test, an RSpec example, a `go test` event, or a pytest collected item.
 
 **Failures split into two columns**: *Failed* counts tests that actually need a fix on SecantusDB; *Expected* counts tests with a documented reason for failing (driver-side cascade, out-of-scope feature, single-node-topology assumption, known intermittent flake). The expected list lives in `validation_summary/expected_failures.py` and each entry carries a rationale. Adjusted pass rate = passes ÷ (passes + actual failures).
 
@@ -9,18 +9,19 @@ Generated 2026-09-14 — SecantusDB 0.6.0b16. Each per-driver gauge runs the dri
 | Driver | Language | Driver version | Tests run | Passed | Failed | Expected | Skipped | Pass rate | Adjusted |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|
 | `pymongo` | Python | `f2103a95870a` | 1501 | 1072 | 0 | 5 | 424 | 99.5% | 100.0% |
-| `pymongo (async)` | Python | `f2103a95870a` | 1423 | 977 | 0 | 6 | 440 | 99.4% | 100.0% |
-| `mongo-java-driver` | Java | `cb45be6bb147` | 900 | 493 | 1 | 1 | 405 | 99.6% | 99.8% |
+| `pymongo (async)` | Python | `f2103a95870a` | 1423 | 977 | 0 | 6 | 440 | 99.3% | 100.0% |
+| `mongo-java-driver` | Java | `cb45be6bb147` | 900 | 494 | 0 | 1 | 405 | 99.7% | 100.0% |
 | `mongo-kotlin-driver` | Kotlin | `cb45be6bb147` | 538 | 340 | 0 | 0 | 198 | 100.0% | 100.0% |
-| `mongo-go-driver` | Go | `fd85a834c40e` | 476 | 409 | 30 | 0 | 37 | 93.2% | 93.2% |
+| `mongo-go-driver` | Go | `fd85a834c40e` | 476 | 439 | 0 | 0 | 37 | 100.0% | 100.0% |
 | `mongo-node-driver` | Node.js | `7e53685952f2` | 364 | 357 | 0 | 1 | 6 | 99.7% | 100.0% |
 | `mongo-ruby-driver` | Ruby | `f68d676643c1` | 283 | 258 | 0 | 1 | 24 | 99.6% | 100.0% |
-| `mongo-rust-driver` | Rust | `12dd49bf18bb` | 106 | 103 | 3 | 0 | 0 | 97.2% | 97.2% |
+| `mongo-rust-driver` | Rust | `12dd49bf18bb` | 105 | 104 | 1 | 0 | 0 | 99.0% | 99.0% |
 | `mongo-php-library` | PHP | `12e56461166d` | 2221 | 2185 | 0 | 0 | 36 | 100.0% | 100.0% |
 | `mongo-php-driver` | PHP | `e81b318a33dc` | 270 | 248 | 0 | 0 | 22 | 100.0% | 100.0% |
-| `mongo-c-driver` | C | `57dba9c04991` | 841 | 780 | 5 | 6 | 50 | 98.6% | 99.4% |
+| `mongo-c-driver` | C | `57dba9c04991` | 841 | 784 | 1 | 6 | 50 | 99.1% | 99.8% |
 | `mongo-cxx-driver` | C++ | `24852b68a3d1` | 899 | 890 | 0 | 0 | 9 | 100.0% | 100.0% |
-| **All drivers** | — | — | **9822** | **8112** | **39** | **20** | **1651** | **99.3%** | **99.5%** |
+| `mongo-csharp-driver` | C# | `8297e62d7f2b` | 228 | 228 | 0 | 0 | 0 | 100.0% | 100.0% |
+| **All drivers** | — | — | **10049** | **8376** | **2** | **20** | **1651** | **99.7%** | **99.9%** |
 
 ## Per-driver scope
 
@@ -36,6 +37,7 @@ Generated 2026-09-14 — SecantusDB 0.6.0b16. Each per-driver gauge runs the dri
 - **`mongo-php-driver`** — curated .phpt wire-protocol tests (bson serialization units excluded).
 - **`mongo-c-driver`** — curated test-libmongoc wire-protocol suites (CRUD / cursor / aggregate / command).
 - **`mongo-cxx-driver`** — curated mongocxx test_driver Catch2 suite (CRUD / cursor / aggregate / gridfs).
+- **`mongo-csharp-driver`** — curated MongoDB.Driver.Tests CRUD specification suite (xUnit).
 
 ## Expected failures
 
@@ -93,10 +95,11 @@ Each gauge ships its own detailed report — per-category breakdown, named failu
 - [mongo-php-driver](./validation-report-php-ext.md)
 - [mongo-c-driver](./validation-report-c.md)
 - [mongo-cxx-driver](./validation-report-cxx.md)
+- [mongo-csharp-driver](./validation-report-dotnet.md)
 
 ## Refreshing
 
-Run all 12 gauges plus this summary:
+Run all 13 gauges plus this summary:
 
 ```
 uv run python -m invoke validate-all

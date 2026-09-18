@@ -8,20 +8,9 @@ Run `uv run python -m invoke validate-go` to refresh. The pass rate is the analo
 
 | Package | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
-| `internal/integration` | 393 | 4 | 37 | 434 | 99.0% |
+| `internal/integration` | 397 | 0 | 37 | 434 | 100.0% |
 | `internal/integration/unified` | 42 | 0 | 0 | 42 | 100.0% |
-| **Overall** | **435** | **4** | **37** | **476** | **99.1%** |
-
-## Failures (4)
-
-First 30 failed tests for triage:
-
-```
-internal/integration :: TestClientBulkWriteProse/7._MongoClient.bulkWrite_handles_a_cursor_requiring_a_getMore
-internal/integration :: TestClientBulkWriteProse/8._MongoClient.bulkWrite_handles_a_cursor_requiring_getMore_within_a_transaction
-internal/integration :: TestClientBulkWriteProse/9._MongoClient.bulkWrite_handles_a_getMore_error
-internal/integration :: TestClientBulkWriteProse
-```
+| **Overall** | **439** | **0** | **37** | **476** | **100.0%** |
 
 ## How this is generated
 

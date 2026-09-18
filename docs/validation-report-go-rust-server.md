@@ -1,6 +1,6 @@
 # mongo-go-driver Validation Report
 
-Generated 2026-09-14 — SecantusDB 0.6.0b16 vs mongo-go-driver fd85a834c40e (`vendor/mongo-go-driver/`).
+Generated 2026-09-18 — SecantusDB 0.6.0b16 vs mongo-go-driver fd85a834c40e (`vendor/mongo-go-driver/`).
 
 Run `uv run python -m invoke validate-go` to refresh. The pass rate is the analogue of the pymongo conformance gauge for the official Go driver — same shape, different wire-protocol pickiness. Type-strict bugs (int32 vs int64) that pymongo accepts silently fail loudly here.
 
@@ -8,33 +8,9 @@ Run `uv run python -m invoke validate-go` to refresh. The pass rate is the analo
 
 | Package | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
-| `internal/integration` | 380 | 17 | 37 | 434 | 95.7% |
+| `internal/integration` | 397 | 0 | 37 | 434 | 100.0% |
 | `internal/integration/unified` | 42 | 0 | 0 | 42 | 100.0% |
-| **Overall** | **422** | **17** | **37** | **476** | **96.1%** |
-
-## Failures (17)
-
-First 30 failed tests for triage:
-
-```
-internal/integration :: TestClient_BulkWrite_AddCommandFields/insert_one_empty
-internal/integration :: TestClient_BulkWrite_AddCommandFields/replace_one_true
-internal/integration :: TestClient_BulkWrite_AddCommandFields/replace_one_empty
-internal/integration :: TestClient_BulkWrite_AddCommandFields/update_many_false
-internal/integration :: TestClient_BulkWrite_AddCommandFields/update_many_empty
-internal/integration :: TestClient_BulkWrite_AddCommandFields/update_one_false
-internal/integration :: TestClient_BulkWrite_AddCommandFields/update_one_true
-internal/integration :: TestClient_BulkWrite_AddCommandFields/update_one_empty
-internal/integration :: TestClient_BulkWrite_AddCommandFields/update_many_true
-internal/integration :: TestClient_BulkWrite_AddCommandFields/replace_one_false
-internal/integration :: TestClient_BulkWrite_AddCommandFields/insert_one_false
-internal/integration :: TestClient_BulkWrite_AddCommandFields/insert_one_true
-internal/integration :: TestClient_BulkWrite_AddCommandFields
-internal/integration :: TestClientBulkWriteProse/7._MongoClient.bulkWrite_handles_a_cursor_requiring_a_getMore
-internal/integration :: TestClientBulkWriteProse/8._MongoClient.bulkWrite_handles_a_cursor_requiring_getMore_within_a_transaction
-internal/integration :: TestClientBulkWriteProse/9._MongoClient.bulkWrite_handles_a_getMore_error
-internal/integration :: TestClientBulkWriteProse
-```
+| **Overall** | **439** | **0** | **37** | **476** | **100.0%** |
 
 ## How this is generated
 
