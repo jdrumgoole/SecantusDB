@@ -412,7 +412,16 @@ if(SECANTUS_BUILD_STORAGE_ENGINE)
     # lifecycle handle over the standalone Rust server. It links the SAME
     # vendored WiredTiger (transitively via secantus-storage-adapter →
     # secantus-storage), so it builds under the same flag, the same way as
-    # `_secantus_storage` above. `import _secantus_server` → `RustServer`.
+    # `_secantus_storage` above. `import _secantus_server` → `RustServer`
+    # (MongoDB wire) and `PgServer` (PostgreSQL wire).
+    #
+    # No `--features` flag: the crate's DEFAULT features are what ship, and
+    # `pgserver` is one of them -- which is what pulls in pgwire + libpg_query
+    # (a full PostgreSQL parser, compiled from C by `pg_query`'s build script
+    # using the same libclang the WiredTiger bindings already need). Drop it
+    # with `--no-default-features` here if a platform's wheel lane cannot build
+    # it; the only loss is `PgServer`, and `_secantus_server.HAS_PGSERVER`
+    # reports which way the build went.
     # -------------------------------------------------------------------------
     set(SERVER_CRATE_DIR  ${CMAKE_CURRENT_SOURCE_DIR}/crates/secantus-server-py)
     set(SERVER_TARGET_DIR ${CARGO_TARGET_ROOT}/server-target)
