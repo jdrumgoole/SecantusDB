@@ -56,7 +56,7 @@
       </div>
       <div class="benefit">
         <h3><span class="pip"></span>Scored by someone else's tests</h3>
-        <p>psycopg 3's own test suite runs against it unmodified &mdash; the same suite that scores the Python SQL server. The ranked list of what it still trips over is published, not buried.</p>
+        <p>All 4,238 of psycopg 3's own tests run against it unmodified &mdash; the same suite that scores the Python SQL server. It passes <strong>73.8%</strong> of them today. That number is published rather than buried, and it is the one that moves.</p>
       </div>
     </div>
   </div>
@@ -74,13 +74,14 @@
         <tbody>
           <tr><th>DDL</th><td><code>CREATE</code> / <code>DROP TABLE</code>, <code>CREATE TABLE AS</code>, <code>TRUNCATE</code>, constraints, <code>CREATE TYPE</code> (enum, composite, range, base and shell types), <code>CREATE EXTENSION</code> for <code>hstore</code> and <code>postgis</code></td></tr>
           <tr><th>DML &amp; queries</th><td><code>INSERT</code> (with <code>RETURNING</code>), <code>UPDATE</code>, <code>DELETE</code>, <code>SELECT</code> with <code>WHERE</code> / <code>ORDER BY</code> / <code>LIMIT</code> / <code>OFFSET</code> / <code>GROUP BY</code>, the <code>count</code> / <code>sum</code> / <code>min</code> / <code>max</code> aggregates, three-valued logic, and <code>SELECT</code> with no table at all</td></tr>
-          <tr><th>Types</th><td><code>numeric</code> exact past 34 digits, <code>uuid</code>, <code>bytea</code>, <code>inet</code> / <code>cidr</code>, arrays including multidimensional, composites, ranges and multiranges, enums, <code>regclass</code>, dates and <code>timestamptz</code> honouring the session zone &mdash; each answered in text <em>and</em> binary, checked against PostgreSQL 16</td></tr>
+          <tr><th>Types</th><td><code>numeric</code> exact past 34 digits, <code>bytea</code>, arrays including multidimensional, composites, ranges and multiranges, enums, <code>regclass</code>, dates and <code>timestamptz</code> honouring the session zone &mdash; answered in text <em>and</em> binary, checked against PostgreSQL 16</td></tr>
           <tr><th>Sessions</th><td>GUCs with <code>GUC_REPORT</code> (<code>DateStyle</code>, <code>client_encoding</code> with LATIN1 / LATIN9 transcoding, <code>standard_conforming_strings</code>), <code>CancelRequest</code>, <code>pg_cancel_backend</code> and <code>pg_terminate_backend</code> that reach an idle session</td></tr>
           <tr><th>Beyond the basics</th><td><code>COPY</code> in and out, server-side cursors (<code>DECLARE</code> / <code>FETCH</code> / <code>MOVE</code>), <code>LISTEN</code> / <code>NOTIFY</code> with PostgreSQL's delivery and transaction semantics, <code>DO</code> blocks over a subset of PL/pgSQL, roles and the <code>pg_roles</code> / <code>pg_authid</code> / <code>pg_user</code> catalogs</td></tr>
-          <tr><th>Not yet</th><td>Secondary indexes (<code>CREATE INDEX</code> is refused outright rather than faked), password verification, and a column-level <code>UNIQUE</code> that is currently accepted without being enforced. The project's rule is a faithful &ldquo;not supported&rdquo; over a half-implemented feature that diverges quietly &mdash; where something slips through that rule, as <code>UNIQUE</code> has, it is written down in the open backlog rather than left for you to discover</td></tr>
+          <tr><th>Not yet</th><td>Secondary indexes (<code>CREATE INDEX</code> is refused outright rather than faked) and password verification. <code>uuid</code> and <code>inet</code> / <code>cidr</code> exist as column types, but a cast to them and binary parameters of them are still refused &mdash; psycopg's uuid and network suites fail end to end on that alone. A column-level <code>UNIQUE</code> is currently accepted without being enforced. The project's rule is a faithful &ldquo;not supported&rdquo; over a half-implemented feature that diverges quietly &mdash; where something slips through that rule, as <code>UNIQUE</code> has, it is written down in the open backlog rather than left for you to discover</td></tr>
         </tbody>
       </table>
     </div>
+    <p class="perf-note" style="margin-top: 24px;">Where that leaves it, measured rather than estimated: of psycopg 3's 4,238 tests the Rust server passes <strong>3,056 &mdash; 73.8%</strong>, against the mature Python SQL server's <strong>98.6%</strong> on the identical suite. The gap is the honest measure of how young this server is. What the gap is <em>made of</em> matters more than its size: <strong>654 of the 1,084 failures are the server refusing outright</strong> &mdash; <code>FeatureNotSupported: a cast to uuid is not supported yet</code>, <code>binary parameters of type oid 869 are not supported yet</code> &mdash; rather than returning something wrong. A refusal is a gap you find in one run; a quiet divergence is one you find in production. Measured 2026-09-18 against the current build.</p>
   </div>
 </section>
 
