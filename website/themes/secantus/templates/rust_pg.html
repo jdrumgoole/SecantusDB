@@ -1,0 +1,143 @@
+{% extends 'base.html' %}
+
+{% block title %}Rust PostgreSQL server — {{ SITENAME }}{% endblock %}
+{% block description %}SecantusDB's Rust PostgreSQL server: real SQL over the PostgreSQL wire protocol, on the same WiredTiger store the MongoDB server writes to.{% endblock %}
+{% block canonical_path %}rust-pg.html{% endblock %}
+
+{% block top_banner %}{% endblock %}
+
+{% block content %}
+<section class="section engines-section page-hero-engine">
+  <div class="wrap">
+    <span class="engine-tag">Rust &middot; PostgreSQL wire</span>
+    <span class="engine-tag tag-early">Early access</span>
+    <h1>SecantusDB Rust PostgreSQL server</h1>
+    <p class="section-lead">The same Rust storage as the MongoDB server, answering the <strong>PostgreSQL wire protocol</strong> instead. <code>psql</code>, psycopg, SQLAlchemy and any other stock PostgreSQL client connect and run real SQL &mdash; against the same WiredTiger home a MongoDB driver writes to. It is the newest of SecantusDB's servers: you build it from source today, and it is scored by psycopg's own test suite rather than by our own expectations.</p>
+    <div class="ctas">
+      <a class="btn btn-primary" href="#get-it">Build it from source &rarr;</a>
+      <a class="btn btn-ghost" href="{{ SECANTUS_DOCS_URL }}sql.html" rel="noopener">Read the SQL docs</a>
+    </div>
+  </div>
+</section>
+
+<div class="beta-banner">
+  <div class="wrap">
+    <div class="callout">
+      <span class="badge">Early access</span>
+      <span>The Rust PostgreSQL server is the youngest thing in the project. There is <strong>no prebuilt binary yet</strong> &mdash; <code>cargo build</code> is the only way to get it &mdash; and it does not verify passwords: a role's SCRAM verifier is stored, never checked, so <strong>every connection is trusted</strong>. Keep it on loopback, and keep production data out of it.</span>
+    </div>
+  </div>
+</div>
+
+<section class="section">
+  <div class="wrap">
+    <h2>Why a PostgreSQL server in a document database</h2>
+    <p class="section-lead">Because the store underneath was never document-shaped by necessity &mdash; it is WiredTiger, the same B-tree engine MongoDB ships, and a row is as natural in it as a document. SecantusDB has served both protocols over one store since the Python implementation, where a <code>pymongo</code>-written collection is queryable as a table with no <code>CREATE TABLE</code> at all; this is that idea with a Rust server under it.</p>
+    <div class="benefits">
+      <div class="benefit">
+        <h3><span class="pip"></span>PostgreSQL's own parser</h3>
+        <p>SQL is parsed by <code>libpg_query</code> &mdash; the real PostgreSQL grammar, vendored and compiled in &mdash; so a statement means here what it means there. No approximation layer inventing its own dialect.</p>
+      </div>
+      <div class="benefit">
+        <h3><span class="pip"></span>One storage format</h3>
+        <p>Tables live in the same WiredTiger home, in the same on-disk format every SecantusDB server uses. The Rust and Python PostgreSQL servers read and write each other's store &mdash; pinned in both directions by a regression test, because getting it wrong would be silent corruption rather than an error.</p>
+      </div>
+      <div class="benefit">
+        <h3><span class="pip"></span>The extended protocol, properly</h3>
+        <p>Parse / Bind / Describe / Execute, prepared statements, portals, and binary parameter <em>and</em> result formats. Not a simple-query shim &mdash; it is what every real driver actually speaks.</p>
+      </div>
+      <div class="benefit">
+        <h3><span class="pip"></span>Real transactions</h3>
+        <p><code>BEGIN</code> / <code>COMMIT</code> / <code>ROLLBACK</code> backed by storage transactions, savepoints, and two-phase commit: <code>PREPARE TRANSACTION</code> makes the work durable and invisible, and a prepared transaction found on disk at startup is replayed when it is committed.</p>
+      </div>
+      <div class="benefit">
+        <h3><span class="pip"></span>Error codes measured, not guessed</h3>
+        <p>Every SQLSTATE, notice and detail line on the supported surface was measured against a live PostgreSQL 16 and matched &mdash; down to the <code>DETAIL: Key (id)=(1) already exists.</code> on a unique violation.</p>
+      </div>
+      <div class="benefit">
+        <h3><span class="pip"></span>Scored by someone else's tests</h3>
+        <p>All 4,238 of psycopg 3's own tests run against it unmodified &mdash; the same suite that scores the Python SQL server. It passes <strong>73.8%</strong> of them today. That number is published rather than buried, and it is the one that moves.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section alt">
+  <div class="wrap">
+    <h2>What it speaks today</h2>
+    <p class="section-lead">The surface grew by chasing a real client's test suite rather than a feature list, so what is here is what psycopg actually asks for.</p>
+    <div class="compare-wrap">
+      <table class="compare-table">
+        <thead>
+          <tr><th>Area</th><th>What works</th></tr>
+        </thead>
+        <tbody>
+          <tr><th>DDL</th><td><code>CREATE</code> / <code>DROP TABLE</code>, <code>CREATE TABLE AS</code>, <code>TRUNCATE</code>, constraints, <code>CREATE TYPE</code> (enum, composite, range, base and shell types), <code>CREATE EXTENSION</code> for <code>hstore</code> and <code>postgis</code></td></tr>
+          <tr><th>DML &amp; queries</th><td><code>INSERT</code> (with <code>RETURNING</code>), <code>UPDATE</code>, <code>DELETE</code>, <code>SELECT</code> with <code>WHERE</code> / <code>ORDER BY</code> / <code>LIMIT</code> / <code>OFFSET</code> / <code>GROUP BY</code>, the <code>count</code> / <code>sum</code> / <code>min</code> / <code>max</code> aggregates, three-valued logic, and <code>SELECT</code> with no table at all</td></tr>
+          <tr><th>Types</th><td><code>numeric</code> exact past 34 digits, <code>bytea</code>, arrays including multidimensional, composites, ranges and multiranges, enums, <code>regclass</code>, dates and <code>timestamptz</code> honouring the session zone &mdash; answered in text <em>and</em> binary, checked against PostgreSQL 16</td></tr>
+          <tr><th>Sessions</th><td>GUCs with <code>GUC_REPORT</code> (<code>DateStyle</code>, <code>client_encoding</code> with LATIN1 / LATIN9 transcoding, <code>standard_conforming_strings</code>), <code>CancelRequest</code>, <code>pg_cancel_backend</code> and <code>pg_terminate_backend</code> that reach an idle session</td></tr>
+          <tr><th>Beyond the basics</th><td><code>COPY</code> in and out, server-side cursors (<code>DECLARE</code> / <code>FETCH</code> / <code>MOVE</code>), <code>LISTEN</code> / <code>NOTIFY</code> with PostgreSQL's delivery and transaction semantics, <code>DO</code> blocks over a subset of PL/pgSQL, roles and the <code>pg_roles</code> / <code>pg_authid</code> / <code>pg_user</code> catalogs</td></tr>
+          <tr><th>Not yet</th><td>Secondary indexes (<code>CREATE INDEX</code> is refused outright rather than faked) and password verification. <code>uuid</code> and <code>inet</code> / <code>cidr</code> exist as column types, but a cast to them and binary parameters of them are still refused &mdash; psycopg's uuid and network suites fail end to end on that alone. A column-level <code>UNIQUE</code> is currently accepted without being enforced. The project's rule is a faithful &ldquo;not supported&rdquo; over a half-implemented feature that diverges quietly &mdash; where something slips through that rule, as <code>UNIQUE</code> has, it is written down in the open backlog rather than left for you to discover</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="perf-note" style="margin-top: 24px;">Where that leaves it, measured rather than estimated: of psycopg 3's 4,238 tests the Rust server passes <strong>3,056 &mdash; 73.8%</strong>, against the mature Python SQL server's <strong>98.6%</strong> on the identical suite. The gap is the honest measure of how young this server is. What the gap is <em>made of</em> matters more than its size: <strong>654 of the 1,084 failures are the server refusing outright</strong> &mdash; <code>FeatureNotSupported: a cast to uuid is not supported yet</code>, <code>binary parameters of type oid 869 are not supported yet</code> &mdash; rather than returning something wrong. A refusal is a gap you find in one run; a quiet divergence is one you find in production. The Rust figures were measured on 2026-09-18 against the current build; the Python server's comes from its <a href="{{ SECANTUS_DOCS_URL }}validation-report-psycopg.html" rel="noopener">published report</a>, which is the same suite under the same accounting.</p>
+  </div>
+</section>
+
+<section class="section">
+  <div class="wrap">
+    <h2>Measured against PostgreSQL itself</h2>
+    <p class="section-lead">Not against our own expectations: a release build of <code>secantusd-pg</code> and <strong>PostgreSQL 16.15</strong> on the same box, 5&nbsp;s per trial, median of three, 1&ndash;5% spread.</p>
+    <div class="compare-wrap">
+      <table class="compare-table">
+        <thead>
+          <tr><th>Workload</th><th>Clients</th><th>PostgreSQL 16</th><th>Rust PG server</th><th>PG scaling</th><th>Our scaling</th></tr>
+        </thead>
+        <tbody>
+          <tr><th>insert, one table each</th><td>1</td><td>17,421 ops/s</td><td>9,937 ops/s</td><td>1.00<span class="unit-x">x</span></td><td>1.00<span class="unit-x">x</span></td></tr>
+          <tr><th></th><td>4</td><td>41,145 ops/s</td><td>21,263 ops/s</td><td>2.36<span class="unit-x">x</span></td><td>2.14<span class="unit-x">x</span></td></tr>
+          <tr><th></th><td>8</td><td>45,544 ops/s</td><td>22,678 ops/s</td><td>2.61<span class="unit-x">x</span></td><td>2.28<span class="unit-x">x</span></td></tr>
+          <tr><th>insert, shared table</th><td>8</td><td>46,118 ops/s</td><td>20,531 ops/s</td><td>2.58<span class="unit-x">x</span></td><td>2.07<span class="unit-x">x</span></td></tr>
+          <tr><th>select</th><td>1</td><td>27,492 ops/s</td><td>11,075 ops/s</td><td>1.00<span class="unit-x">x</span></td><td>1.00<span class="unit-x">x</span></td></tr>
+          <tr><th></th><td>8</td><td>83,092 ops/s</td><td>23,898 ops/s</td><td>3.02<span class="unit-x">x</span></td><td>2.16<span class="unit-x">x</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="perf-note" style="margin-top: 20px;">Read it honestly: we are <strong>1.75<span class="unit-x">x</span> slower than PostgreSQL on a single-client insert and 2.48<span class="unit-x">x</span> on a single-client select</strong>, and that per-statement cost &mdash; not a lock &mdash; is the whole gap. Concurrency is the good news: write scaling tracks PostgreSQL's closely (2.14<span class="unit-x">x</span> against its 2.36<span class="unit-x">x</span> at four clients), and a <em>shared</em> table costs us almost nothing extra where it costs PostgreSQL a little. There is no serialisation collapse. Reads flatten earlier than PostgreSQL's do (2.16<span class="unit-x">x</span> against 3.02<span class="unit-x">x</span> at eight clients) and closing that is the next piece of work, tracked in the open backlog with the CPU-per-operation profile that rules the alternatives out.</p>
+  </div>
+</section>
+
+<section class="section alt" id="get-it">
+  <div class="wrap">
+    <h2>Get it</h2>
+    <p class="section-lead">Source only for now. It is a Cargo crate in the SecantusDB repository; nothing but a Rust toolchain and the repository's usual build prerequisites is needed.</p>
+    <div class="install-cols">
+      <div class="install-col">
+        <h3>Build and run</h3>
+        <p>The crate links the vendored WiredTiger, so clone with submodules; it sits outside the clean Cargo workspace and builds from its own directory. The binary takes a storage directory and an address.</p>
+        <pre class="install-code"><code>git clone --recurse-submodules {{ SECANTUS_GITHUB_URL }}.git
+cd SecantusDB/crates/secantus-pgserver
+cargo build --release
+
+./target/release/secantusd-pg ./data 127.0.0.1:5432</code></pre>
+      </div>
+      <div class="install-col">
+        <h3>Connect</h3>
+        <p>Any stock PostgreSQL client. There is no password to supply &mdash; and that is the caveat above, not a convenience.</p>
+        <pre class="install-code"><code>psql -h 127.0.0.1 -p 5432 -U postgres
+
+# or from Python
+import psycopg
+psycopg.connect("host=127.0.0.1 port=5432 user=postgres")</code></pre>
+      </div>
+    </div>
+    <p class="section-lead" style="margin-top: 24px;">Related reading:
+      <a href="{{ SECANTUS_DOCS_URL }}sql.html" rel="noopener">The SQL interface</a> &middot;
+      <a href="{{ SECANTUS_DOCS_URL }}validation-report-psycopg.html" rel="noopener">psycopg conformance report (Python SQL server)</a> &middot;
+      <a href="/rust-db.html">The Rust MongoDB server</a> &middot;
+      <a href="/python-db.html">The Python reference implementation</a>
+    </p>
+  </div>
+</section>
+{% endblock %}

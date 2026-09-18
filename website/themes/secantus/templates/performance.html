@@ -34,7 +34,7 @@
 <section class="section">
   <div class="wrap">
     <h2>Per-operation latency</h2>
-    <p class="section-lead">Bar length is how many times slower than <code>mongod</code> each server is — median of five runs per workload, 10,000-document dataset, end-to-end through the wire protocol and driver.</p>
+    <p class="section-lead">&ldquo;Rust DB&rdquo; here is the <a href="/rust-db.html">Rust MongoDB server</a> &mdash; these harnesses drive the MongoDB wire protocol, so the <a href="/rust-pg.html">Rust PostgreSQL server</a> is measured separately, against PostgreSQL. Bar length is how many times slower than <code>mongod</code> each server is — median of five runs per workload, 10,000-document dataset, end-to-end through the wire protocol and driver.</p>
     <div class="viz-wrap"><div class="viz-legend">
       <span><span class="chip" style="background: var(--viz-rust)"></span>Rust DB</span>
       <span><span class="chip" style="background: var(--viz-py)"></span>Python DB</span>
@@ -60,7 +60,7 @@
       </table>
     </div>
     </details>
-    <p class="perf-note" style="margin-top: 20px;">The short version: the <strong>Rust DB runs at 0.7<span class="unit-x">x</span>&ndash;2.2<span class="unit-x">x</span> of mongod</strong> per operation &mdash; delete, single-stage <code>$group</code>, and the change-stream drain now beat mongod outright &mdash; and it is roughly 1.9<span class="unit-x">x</span>&ndash;18<span class="unit-x">x</span> faster than the Python DB workload-for-workload. All three sit on the identical WiredTiger C library; the gaps are the layers above it. (&#42;&nbsp;The change-stream row's mongod reference is a single-node replica set &mdash; mongod's change streams require one.) <a href="{{ SECANTUS_DOCS_URL }}benchmark.html" rel="noopener">Methodology &amp; how to reproduce &rarr;</a></p>
+    <p class="perf-note" style="margin-top: 20px;">The short version: the <strong>Rust DB runs at 0.9<span class="unit-x">x</span>&ndash;2.4<span class="unit-x">x</span> of mongod</strong> per operation &mdash; the indexed range read beats mongod outright, and full scan, filtered scan and the change-stream drain sit at parity &mdash; and it is roughly 1.9<span class="unit-x">x</span>&ndash;13.3<span class="unit-x">x</span> faster than the Python DB workload-for-workload. All three sit on the identical WiredTiger C library; the gaps are the layers above it. (&#42;&nbsp;The change-stream row's mongod reference is a single-node replica set &mdash; mongod's change streams require one.) <a href="{{ SECANTUS_DOCS_URL }}benchmark.html" rel="noopener">Methodology &amp; how to reproduce &rarr;</a></p>
   </div>
 </section>
 
@@ -95,8 +95,8 @@
 <section class="section">
   <div class="wrap">
     <h2>What to make of it</h2>
-    <p class="section-lead">SecantusDB's trade is deliberate: <strong>conformance and WiredTiger durability over raw speed</strong>. For its home turf &mdash; embedded test and dev databases, single-node prototypes, CI &mdash; per-operation latency in the milliseconds and single-writer throughput in the thousands of documents per second rarely matter. When they do, the Rust DB is the answer within the family, and a real <code>mongod</code> is the answer beyond it &mdash; and because the wire protocol is identical, moving between all three is a connection-string change.</p>
-    <p class="perf-note">Caveats that apply to every number here: one machine (Apple Silicon), no network, no concurrent readers mixed with writers, dataset that fits in cache. The harnesses (<code>bench.compare_servers</code>, <code>bench.concurrency</code>) ship in the repository &mdash; run them on your own hardware and workload before drawing conclusions that matter.</p>
+    <p class="section-lead">The trade SecantusDB started from was <strong>conformance and WiredTiger durability over raw speed</strong>, and on the Python implementation that is still the trade. The Rust server is what closed it: at 0.9<span class="unit-x">x</span>&ndash;2.4<span class="unit-x">x</span> of <code>mongod</code> per operation and scaling monotonically with writers, per-op latency has stopped being the reason to reach for a real <code>mongod</code> instead. What remains a reason is everything single-node scope excludes &mdash; replica sets, sharding, a cluster to fail over. And because the wire protocol is identical across all three, moving between them is a connection-string change.</p>
+    <p class="perf-note">Caveats that apply to every number here: one machine (a dedicated 8-vCPU cloud instance, not a laptop &mdash; a laptop moves every column at once and nothing in the output says so), no network, no concurrent readers mixed with writers, dataset that fits in cache. The harnesses (<code>bench.compare_servers</code>, <code>bench.concurrency</code>) ship in the repository &mdash; run them on your own hardware and workload before drawing conclusions that matter.</p>
     <div class="ctas" style="margin-top: 28px;">
       <a class="btn btn-primary" href="{{ SECANTUS_DOCS_URL }}benchmark.html" rel="noopener">Latency benchmark</a>
       <a class="btn btn-primary" href="{{ SECANTUS_DOCS_URL }}concurrency.html" rel="noopener">Concurrency deep-dive</a>

@@ -672,6 +672,19 @@ article.post .body h3 { font-size: 19px; margin: 28px 0 10px; font-weight: 600; 
   color: var(--slate-300);
 }
 .engine-accent .engine-tag { background: var(--cyan-500); color: var(--slate-950); }
+/* Outlined variant for a maturity label sitting next to the protocol tag —
+   deliberately not a new brand hue, just the accent as an outline. */
+.engine-tag.tag-early,
+.engine-accent .engine-tag.tag-early {
+  background: transparent;
+  border: 1px solid var(--cyan-500);
+  color: var(--cyan-300);
+  margin-left: 8px;
+}
+/* The `x` in a "2.4x mongod" figure, set smaller than the number it follows.
+   performance.html carries its own copy for the inline chart styles; this is
+   the one every other page uses. */
+.unit-x { font-size: 0.82em; opacity: 0.75; }
 .engine h3 {
   font-size: 19px;
   font-weight: 600;
@@ -701,6 +714,13 @@ article.post .body h3 { font-size: 19px; margin: 28px 0 10px; font-weight: 600; 
   padding: 1px 6px;
   border-radius: 4px;
   font-size: 13px;
+}
+
+/* Same treatment for prose sitting directly on a dark band (a page hero's
+   lead), which would otherwise get the light `p code` chip. */
+.engines-section .section-lead code {
+  background: rgba(148, 163, 184, 0.16);
+  color: var(--cyan-300);
 }
 
 .btn-ghost {

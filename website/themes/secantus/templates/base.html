@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}{{ SITENAME }} — {{ SITESUBTITLE }}{% endblock %}</title>
-  <meta name="description" content="{% block description %}Embeddable Document Database compatible with MongoDB.{% endblock %}">
+  <meta name="description" content="{% block description %}Two Rust database servers over one embedded WiredTiger store &mdash; MongoDB wire protocol and PostgreSQL wire protocol.{% endblock %}">
   <link rel="icon" type="image/svg+xml" href="/{{ THEME_STATIC_DIR }}/img/favicon.svg">
   <link rel="canonical" href="{{ FEED_DOMAIN }}/{% block canonical_path %}{% endblock %}">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -15,19 +15,19 @@
 
   <meta property="og:type" content="website">
   <meta property="og:title" content="SecantusDB — the SQLite of document databases">
-  <meta property="og:description" content="Embeddable document database compatible with MongoDB.">
+  <meta property="og:description" content="Two Rust database servers over one embedded WiredTiger store — the MongoDB wire protocol and the PostgreSQL wire protocol.">
   <meta property="og:url" content="{{ FEED_DOMAIN }}/{{ self.canonical_path() }}">
   <meta property="og:image" content="{{ FEED_DOMAIN }}/{{ THEME_STATIC_DIR }}/img/og-image.png">
   <meta property="og:image:type" content="image/png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
-  <meta property="og:image:alt" content="SecantusDB — Embeddable Document Database compatible with MongoDB.">
+  <meta property="og:image:alt" content="SecantusDB — two Rust database servers over one embedded WiredTiger store.">
   <meta property="og:site_name" content="{{ SITENAME }}">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="SecantusDB — the SQLite of document databases">
-  <meta name="twitter:description" content="Embeddable document database compatible with MongoDB.">
+  <meta name="twitter:description" content="Two Rust database servers over one embedded WiredTiger store — the MongoDB wire protocol and the PostgreSQL wire protocol.">
   <meta name="twitter:image" content="{{ FEED_DOMAIN }}/{{ THEME_STATIC_DIR }}/img/og-image.png">
-  <meta name="twitter:image:alt" content="SecantusDB — Embeddable Document Database compatible with MongoDB.">
+  <meta name="twitter:image:alt" content="SecantusDB — two Rust database servers over one embedded WiredTiger store.">
   <script data-goatcounter="https://secantusdb.goatcounter.com/count"
           async src="//gc.zgo.at/count.js"></script>
 </head>
@@ -41,8 +41,8 @@
     </a>
     <nav class="site-nav">
       <a href="/">Home</a>
-      <a href="/python-db.html">Python DB</a>
-      <a href="/rust-db.html">Rust DB</a>
+      <a href="/rust-db.html">Rust MongoDB</a>
+      <a href="/rust-pg.html">Rust PostgreSQL</a>
       <a href="/performance.html">Performance</a>
       <a href="/blog.html">Blog</a>
       <a class="external" href="{{ SECANTUS_DOCS_URL }}index.html" rel="noopener">Docs</a>

@@ -4,15 +4,64 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-SecantusDB is a **surrogate single-node MongoDB server** written in Python. It speaks the MongoDB wire protocol well enough to satisfy the `pymongo` driver, so application tests can run against it instead of standing up a real `mongod`. The package is `secantus`; the public class is `SecantusDBServer`. "Surrogate" rather than "fake" — it really is a MongoDB server, just intentionally scoped to single-node operation.
+SecantusDB is a **surrogate single-node database**. It speaks real wire protocols on a real TCP socket over the same **WiredTiger** storage engine MongoDB ships, so an application's tests can run against it instead of standing up a real `mongod` or `postgres`. "Surrogate" rather than "fake" — these really are database servers, just intentionally scoped to single-node operation.
+
+**Four servers, two wire protocols, one storage format.** The Rust pair is the
+product; the Python pair is the reference implementation they are held to.
+
+| server | binary / entry point | wire | role |
+| --- | --- | --- | --- |
+| **Rust MongoDB server** | `secantusd-rs` (`crates/secantusdb`) | MongoDB | **the flagship.** Prebuilt binaries per platform, and bundled in the wheel |
+| **Rust PostgreSQL server** | `secantusd-pg` (`crates/secantus-pgserver`) | PostgreSQL | **the newest.** Builds from its own directory; no shipped binary yet |
+| Python MongoDB server | `SecantusDBServer` / `secantusd-py` | MongoDB | the reference — every operator, stage and error message lands here first |
+| Python PostgreSQL server | `secantusd-py-pg` (`secantus.sql.pgserver`) | PostgreSQL | the reference for the SQL surface, and still the most complete one |
+
+**Reach for Rust to RUN it; reach for Python to READ it.** That is the whole
+division of labour, and it is what the marketing site now says too (the two Rust
+servers are the focus; the Python pair is presented as the reference behind
+them). Do not "restore" a Python-first framing in docs or on the site.
+
+All four share **one on-disk format**, and that contract is a compatibility
+promise rather than an accident — breaking it is silent data loss. Be precise
+about which half of it is actually pinned by a test, because they are different
+claims and it is easy to cite one as evidence for the other:
+
+- **Cross-LANGUAGE, same protocol — proven.** The Rust PG server and the Python
+  PG server read and write each other's store (`tests/test_rust_pgserver_slice.py`,
+  e.g. `test_python_server_reads_rust_timestamps`, which exists because getting
+  it wrong is silent corruption rather than an error).
+- **Cross-PROTOCOL, Python pair — proven.** A `pymongo`-written collection is
+  queryable as a table, `JOIN`s and all, with no `CREATE TABLE` (`docs/sql.md`).
+- **Cross-PROTOCOL, RUST pair — NOT established.** `secantusd-rs` and
+  `secantusd-pg` sit on the same `secantus-storage`, so it ought to follow, but
+  no test or probe demonstrates a MongoDB client reading a table the Rust PG
+  server wrote. **Do not state it as fact** — probe it first, and if it holds,
+  pin it with a test and delete this bullet.
+
+The import package is `secantus`; the public Python class is `SecantusDBServer`.
 
 The name was chosen to dodge brand-clash risk: an early prototype was called "fongo", a follow-on was called "fongodb", and the current name avoids both the existing "Fongo" brand and any confusion with MongoDB itself. Internal references to `fongo` or `fongodb` are stale — flag and rename to `secantus` (or `SecantusDB` for the brand form).
 
 **In scope:** the subset of the MongoDB wire protocol that `pymongo` actually emits — connection handshake, CRUD, cursors, aggregation, findAndModify, and **change streams** (single-node, oplog-backed; collection / db / cluster scope; resume tokens; `fullDocument: "updateLookup"`; `fullDocumentBeforeChange` pre-images; `awaitData` blocking; `splitLargeChangeStreamEvents` envelope — events are never large enough to actually split, so every fragment is `{fragment: 1, of: 1}`, but the field is present when the user opts in).
 
-**Explicitly out of scope:** real replica sets, sharding, multi-node consistency. SecantusDB advertises itself as a single-node `secantus` replica-set primary in the `hello` reply (so `pymongo`'s topology machinery accepts change streams), but the topology is fictional — there are no other members, no elections, no cross-node oplog. If a feature only makes sense in a multi-node deployment, SecantusDB does not implement it.
+**In scope on the SQL side:** the subset of the PostgreSQL wire protocol real
+clients emit — the extended query protocol (Parse / Bind / Describe / Execute),
+prepared statements and portals, text *and* binary formats, transactions with
+savepoints and two-phase commit, `COPY`, server-side cursors, `LISTEN` / `NOTIFY`,
+and the catalog tables a client introspects. The scope is set by what psycopg's
+own test suite reaches for, not by a feature list.
 
-The audience is developers who want fast, ephemeral, in-process MongoDB behaviour for tests — not a production-grade emulator.
+**Explicitly out of scope:** real replica sets, sharding, multi-node consistency —
+and their SQL equivalents (streaming replication, hot standby). SecantusDB advertises itself as a single-node `secantus` replica-set primary in the `hello` reply (so `pymongo`'s topology machinery accepts change streams), but the topology is fictional — there are no other members, no elections, no cross-node oplog. If a feature only makes sense in a multi-node deployment, SecantusDB does not implement it.
+
+The audience is developers who want fast, ephemeral, single-node MongoDB or
+PostgreSQL behaviour — in a test, in CI, in a container — without running the
+real thing. Not a production-grade emulator.
+
+**Performance work belongs to the Rust servers.** The Python pair is a
+correctness and readability target, not a throughput one; a benchmark that shows
+it slow is reporting the design, not a regression. Route latency / throughput /
+concurrency work to `crates/`.
 
 ## Design constraints
 
@@ -96,6 +145,11 @@ SecantusDB stores data. In a database, an error is a **correctness and durabilit
 - **Surface errors faithfully.** Don't downgrade a storage error to a generic message, don't `let _ =` away a `Result` on a write/commit/close path, and don't report "done" while an error was logged. If a write, checkpoint, or connection close errored, that is the headline, not a footnote.
 
 ## Architecture
+
+**This section describes the PYTHON reference implementation** (`src/secantus/`).
+The Rust servers mirror these layers in `crates/` — see "Engines" below for the
+crate map. Read this to learn what SecantusDB *does*; read the crates to see what
+a user actually runs.
 
 Layers, roughly outermost-in:
 
@@ -184,22 +238,50 @@ Documents are stored as **opaque BSON blobs**. All filtering, projection, sortin
 
 When secondary indexes land they will be WT indexes over typed sort-key columns derived from BSON values — not JSON, not coerced numerics.
 
-### Engines: pure-Python and Rust both ship → as TWO SEPARATE SERVERS
+### Engines: FOUR SEPARATE SERVERS across two wire protocols
 
-**Direction (current):** SecantusDB ships **two completely separate servers**,
-and a user runs **one or the other** — never a per-operator/per-`Storage`
-selection inside one request path:
+**Direction (current):** SecantusDB ships **completely separate servers**, and a
+user runs **one of them** — never a per-operator/per-`Storage` selection inside
+one request path:
 
-- **The Python server** — the *original* `SecantusDBServer` (pure-Python `server` /
-  `wire` / `commands` / `Storage` / operator engines). No Rust in the request path.
-- **The Rust server** — a whole, self-contained Rust server (its own wire /
-  dispatch / cursors / accept loop over the pure-Rust `secantus-core` +
-  `secantus-storage` + `secantus-wt` crates). No Python in the request path. Its
-  Python ergonomic is a **thin embedded lifecycle handle** (`start`/`stop`/
-  `address`) — the accept loop runs on a GIL-released Rust thread in-process and
-  `pymongo` connects over real TCP; Python is only the launcher, never an operator.
+- **The Rust MongoDB server** (`secantusd-rs`, `crates/secantusdb`) — a whole,
+  self-contained Rust server (its own wire / dispatch / cursors / accept loop over
+  the pure-Rust `secantus-core` + `secantus-storage` + `secantus-wt` crates). No
+  Python in the request path. Its Python ergonomic is a **thin embedded lifecycle
+  handle** (`start`/`stop`/`address`) — the accept loop runs on a GIL-released Rust
+  thread in-process and `pymongo` connects over real TCP; Python is only the
+  launcher, never an operator. **This is the server the project leads with.**
+- **The Rust PostgreSQL server** (`secantusd-pg`, `crates/secantus-pgserver`) —
+  the PostgreSQL wire protocol over the same `secantus-storage`. SQL is parsed by
+  **`libpg_query`** (the real PostgreSQL grammar via `pg_query`), lowered by
+  `secantus-pgplan` to the MQL filters `secantus-core` already evaluates, against
+  the catalog in `secantus-pgcatalog`. Plan: `tasks/rust-pgserver-plan.md` — but
+  that file's status header predates most of the work; **reproduce before
+  believing it**. Current shape, measured 2026-09-18 rather than read:
+  - Scored by psycopg 3's own unmodified suite: **3,056 of 4,238 (73.8%)**,
+    against the Python PG server's 98.6% on the same suite. Run it with
+    `SECANTUS_GAUGE_SERVER=rust uv run --no-sync python -m psycopg_validation.runner`
+    (it writes `.validation/psycopg-raw-rust.json`, a *different* file from the
+    Python server's — do not use `invoke validate-psycopg`, which hardcodes the
+    Python path and would overwrite the Python report).
+  - 654 of the 1,084 failures are faithful `FeatureNotSupported` refusals rather
+    than wrong answers — which is the project's stated preference working.
+  - Not there yet: `CREATE INDEX` (refused outright), password verification
+    (every connection is trusted — a role's SCRAM verifier is stored, never
+    checked), a column-level `UNIQUE` accepted without being enforced, and casts
+    to / binary parameters of `uuid` and `inet`.
+  - Builds from **its own directory** (`cd crates/secantus-pgserver && cargo build
+    --release`), because it links WiredTiger and is excluded from the clean
+    workspace. `./inv rust-pgserver-build` (the task lives in `rust_tasks.py`, not
+    `tasks.py`) does the debug build the gauge expects.
+- **The Python MongoDB server** — the *original* `SecantusDBServer` (pure-Python
+  `server` / `wire` / `commands` / `Storage` / operator engines). No Rust in the
+  request path.
+- **The Python PostgreSQL server** (`secantus.sql.pgserver`) — the PostgreSQL wire
+  over the same Python `Storage`. The older and **more complete** SQL surface of
+  the two; the Rust one is its port, not its replacement.
 
-#### Versioning: the two servers version independently
+#### Versioning: the servers version independently
 
 The Python server and the Rust server are **separate deliverables with separate
 version lines** — they **diverged at `0.5.2`** (Python `0.5.2b33` / Rust crates
@@ -216,17 +298,23 @@ one server bumps only that server's version:
   (many parallel SQL sessions all bumping `pyproject.toml`). Leaving the version to
   the release makes concurrent feature PRs independent. Between releases `main`
   simply carries the last released version.
-- **Rust server version** — the `version` field in **every** `crates/*/Cargo.toml`,
-  kept in **lockstep** across all crates (`0.MAJOR.PATCH-beta.N`, SemVer
-  pre-release). **Feature PRs do NOT bump it** either — like the Python version, it
+- **Rust server version** — the `version` field in the **thirteen** MongoDB-side
+  `crates/*/Cargo.toml`, kept in **lockstep** across them (`0.MAJOR.PATCH-beta.N`,
+  SemVer pre-release). **NOT every crate under `crates/`:** the three PostgreSQL
+  crates (`secantus-pgcatalog` / `secantus-pgplan` / `secantus-pgserver`) carry
+  their own line, at `0.1.0-beta.0` as of 2026-09-18, and are a **third
+  deliverable that is not bumped with the Rust MongoDB server**. The sweep recipe
+  below is safe only because it substitutes one exact version string — a blanket
+  "bump every Cargo.toml under crates/" would fold the PG crates into the MongoDB
+  server's line, which is wrong. **Feature PRs do NOT bump it** either — like the Python version, it
   is assigned when a Rust release is cut (the `secantusdb-v<crate-version>` tag),
   not per-PR. **Bumping the patch (or minor/major) component resets the beta label
   to 0** — e.g. `0.5.2-beta.20` → `0.5.3-beta.0`, never `0.5.3-beta.21`. There is no
   single `[workspace.package]` source because the WiredTiger-linked crates
   (`secantus-storage` / `-wt` / `-storage-adapter` / `-server-py` / `-storage-py` /
   `secantusdb`) are **excluded** from the clean workspace and can't inherit a
-  workspace version — so at release all twelve `Cargo.toml` (and their `Cargo.lock`)
-  carry the number and are bumped together (e.g. `find crates -maxdepth 2 -name
+  workspace version — so at release all thirteen MongoDB-side `Cargo.toml` (and
+  their `Cargo.lock`) carry the number and are bumped together (e.g. `find crates -maxdepth 2 -name
   Cargo.toml -o -name Cargo.lock | xargs sed -i '' 's/0.5.2-beta.N/0.5.2-beta.N+1/'`).
   The canonical embedded value is `secantus_server::VERSION`
   (`env!("CARGO_PKG_VERSION")`); the Rust server **embeds and surfaces** it in
@@ -329,6 +417,25 @@ Both procedures are managed by skills — they auto-fire on the relevant trigger
   Details in `bench/DO_CLUSTER.md` "At release time".
 - **`secantusdb-release`** — the two-phase pipeline (`release-prepare` once in foreground, `release-finalize` in a foreground retry loop), the sub-agent contract, foreground-only constraints, the 8-step pipeline (pre-flight → pytest → perf gates → changelog collation → bump → tag/push → GitHub Release → PyPI workflow + listing), and the hard prohibitions against manual `git tag`/`uv publish`. Docs are **self-hosted at secantusdb.com/docs/** (main tree) and **/docs/rust/** (Rust server) — they deploy with the post-release website publish, not the release pipeline; the readthedocs.io copies are legacy, kept alive with a moved banner.
 - **`secantusdb-website`** — **website content lives on `main`** (the retired `SecantusDB-website` / `website-dev` worktree pattern is gone; Pelican builds the live site from `main`). Edit `website/` on a short feature branch and land via PR (website-only commits skip the full pytest run — only `website/`, this `CLAUDE.md`, and `.gitignore` qualify), then `invoke deploy` from `main` to build + `aws s3 sync` + invalidate CloudFront. Also covers the driver-panel regeneration and the per-release blog-post template (descriptive title + prose body + link bar — never a stub linking out to GitHub).
+
+  **The site leads with the two Rust servers** (nav: Home / Rust MongoDB / Rust
+  PostgreSQL / Performance / Blog). `rust-db.html`, `rust-pg.html` and
+  `python-db.html` are template-only pages — the content is in
+  `website/themes/secantus/templates/`, not in the near-empty `content/pages/*.md`
+  that select them. Two traps when editing:
+  - **Performance prose goes stale silently and independently of its own table.**
+    Three published claims were wrong in 2026-09 — one contradicted the data table
+    directly below it. The measured source of truth is `docs/benchmark.md`
+    (generated, gated by `tests/test_benchmark_table_fresh.py`); the concurrency
+    chart blocks are generated too, between `<!-- concurrency-viz/-table -->`
+    markers, and `tests/test_concurrency_chart.py` fails if you hand-edit them.
+    When you touch a number on the site, re-derive it from those files.
+  - **The driver panels report the PYTHON server's runs.** `drivers_grid.html` is
+    generated by `validation_summary/driver_panels.py`, whose collectors hardcode
+    the Python artifact names; the `-rust-server` artifacts exist but nothing
+    reads them into the panels yet. The page prose says so. Teaching the collectors
+    the Rust names is a `validation_summary/` change — *not* website-only, so it
+    does not get the pytest skip.
 
 ## Backlog of stubs and stopgaps
 
