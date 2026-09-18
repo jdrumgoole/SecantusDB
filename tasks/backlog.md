@@ -1059,6 +1059,31 @@ These work end-to-end but cut corners.
 
 ## 3. Deferred work (skipped from a slice, ready to come back)
 
+
+- [ ] **OPEN — `test_connect_error_multi_hosts_each_message_preserved` failed
+      twice in a full psycopg-gauge run and the cause is UNKNOWN
+      (2026-09-18).** The test connects to two RFC 5737 reserved addresses and
+      requires both attempts to fail with `connection timeout expired`. It
+      never touches this server.
+
+      It was deselected on 2026-09-17 with a reason that blamed the host's
+      network stack for answering the unroutable address immediately. **That
+      explanation was never measured and is now contradicted**: a standalone
+      loop connects 6/6 in 4.04s with exactly the expected error, and a full
+      gauge run with the test re-enabled passed both the sync and async twin
+      (4.05s / 4.11s) while the box was under a concurrent xdist suite. The
+      deselect has been removed — a test that passes should not be excluded,
+      and excluding it with a wrong reason hides the real fault forever.
+
+      What is actually known: two full runs on 2026-09-17 failed it in 0.04s.
+      A 0.04s failure means `connect()` returned an error immediately instead
+      of timing out, so the assertion on the message text failed. The cause of
+      THAT is open. **If it recurs, capture the actual exception text before
+      theorising** — the error names the errno, which distinguishes a routing
+      answer from resource exhaustion (a leaked-socket / fd-exhaustion story in
+      our own harness is the hypothesis that was never checked, and is the one
+      that would be our bug).
+
 Specific items that were left out of the slice that introduced their feature area.
 
 - [ ] **OPEN — Rust PostgreSQL server: per-statement COST, and a read-path
