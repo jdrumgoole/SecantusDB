@@ -49,8 +49,8 @@
         <p>A thin lifecycle handle (<code>start</code> / <code>stop</code> / <code>address</code>) runs the Rust accept loop in-process on a GIL-released thread; <code>pymongo</code> connects over real TCP. Launch it from a test, get a Rust server.</p>
       </div>
       <div class="benefit">
-        <h3><span class="pip"></span>SQL on the same data</h3>
-        <p>Point the Rust PostgreSQL server at the same storage directory and <code>psql</code>, psycopg or SQLAlchemy read what a MongoDB driver wrote. Two protocols, one store, no ETL.</p>
+        <h3><span class="pip"></span>There is a SQL server too</h3>
+        <p>The same Rust storage answers the PostgreSQL wire protocol in a second binary, so <code>psql</code>, psycopg and SQLAlchemy are an option on the same on-disk format. Newer, and early access.</p>
         <p class="benefit-cta"><a href="/rust-pg.html">The Rust PostgreSQL server &rarr;</a></p>
       </div>
     </div>

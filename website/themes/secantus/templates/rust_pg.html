@@ -32,15 +32,15 @@
 <section class="section">
   <div class="wrap">
     <h2>Why a PostgreSQL server in a document database</h2>
-    <p class="section-lead">Because the store underneath was never document-shaped by necessity &mdash; it is WiredTiger, the same B-tree engine MongoDB ships, and a row is as natural in it as a document. Putting a PostgreSQL front end on it means one embedded process can serve both the application that speaks MongoDB and the reporting tool that speaks SQL, with no ETL between them.</p>
+    <p class="section-lead">Because the store underneath was never document-shaped by necessity &mdash; it is WiredTiger, the same B-tree engine MongoDB ships, and a row is as natural in it as a document. SecantusDB has served both protocols over one store since the Python implementation, where a <code>pymongo</code>-written collection is queryable as a table with no <code>CREATE TABLE</code> at all; this is that idea with a Rust server under it.</p>
     <div class="benefits">
       <div class="benefit">
         <h3><span class="pip"></span>PostgreSQL's own parser</h3>
         <p>SQL is parsed by <code>libpg_query</code> &mdash; the real PostgreSQL grammar, vendored and compiled in &mdash; so a statement means here what it means there. No approximation layer inventing its own dialect.</p>
       </div>
       <div class="benefit">
-        <h3><span class="pip"></span>One store, two wire protocols</h3>
-        <p>A table created over SQL lives in the same WiredTiger home as a collection created over the MongoDB wire, and either server reads what the other wrote. Proven in both directions, with a regression test on the seam.</p>
+        <h3><span class="pip"></span>One storage format</h3>
+        <p>Tables live in the same WiredTiger home, in the same on-disk format every SecantusDB server uses. The Rust and Python PostgreSQL servers read and write each other's store &mdash; pinned in both directions by a regression test, because getting it wrong would be silent corruption rather than an error.</p>
       </div>
       <div class="benefit">
         <h3><span class="pip"></span>The extended protocol, properly</h3>
@@ -115,7 +115,7 @@
     <div class="install-cols">
       <div class="install-col">
         <h3>Build and run</h3>
-        <p>The crate links the vendored WiredTiger, so clone with submodules; it sits outside the clean Cargo workspace and builds from its own directory. The binary takes a storage directory and an address &mdash; point <code>secantusd-rs</code> at that same directory and both protocols serve the same data.</p>
+        <p>The crate links the vendored WiredTiger, so clone with submodules; it sits outside the clean Cargo workspace and builds from its own directory. The binary takes a storage directory and an address.</p>
         <pre class="install-code"><code>git clone --recurse-submodules {{ SECANTUS_GITHUB_URL }}.git
 cd SecantusDB/crates/secantus-pgserver
 cargo build --release
