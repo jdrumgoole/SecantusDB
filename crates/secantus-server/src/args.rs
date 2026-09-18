@@ -180,6 +180,26 @@ fn build_tls(
 
 /// Outcome of parsing: run the server (with the raw CLI overrides + config
 /// path), or print a text and exit cleanly.
+/// `--version` output: the version, and the source tree it was built from.
+///
+/// Two lines on purpose. Line 1 is what almost everyone wants — "what did I
+/// install?" — and welding a 40-character hash onto it would punish that
+/// common case. Line 2 is for a bug report, where "0.1.0-beta.0" is nearly
+/// useless on its own: this repo forbids version bumps in feature PRs, so
+/// hundreds of commits share one version string. The tree hash answers
+/// "which source produced this binary" exactly.
+///
+/// The second line is OMITTED, not blank, when the binary was built without
+/// git (an sdist, a release tarball) — a `tree:` label with nothing after it
+/// would read as a bug rather than an absence.
+pub fn version_text(binary: &str) -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    match option_env!("SECANTUS_SOURCE_TREE").unwrap_or("") {
+        "" => format!("{binary} {version}\n"),
+        tree => format!("{binary} {version}\ntree: {tree}\n"),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Parsed {
     Run(Box<ParsedRun>),
@@ -227,12 +247,7 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
 
         match flag {
             "--help" | "-h" => return Ok(Parsed::Help(usage())),
-            "--version" => {
-                return Ok(Parsed::Version(format!(
-                    "secantusd-rs {}",
-                    env!("CARGO_PKG_VERSION")
-                )))
-            }
+            "--version" => return Ok(Parsed::Version(version_text("secantusd-rs"))),
             "--config" => config_path = Some(PathBuf::from(take_value("--config")?)),
             "--host" => o.host = Some(take_value("--host")?),
             "--port" => {
