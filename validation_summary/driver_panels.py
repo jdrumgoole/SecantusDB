@@ -35,6 +35,7 @@ import sys
 from html import escape
 from pathlib import Path
 
+from validation_summary import rates
 from validation_summary.generate import (
     GaugeStats,
     _apply_expected_failures,
@@ -182,9 +183,7 @@ PANEL_PROSE: dict[str, dict[str, str]] = {
             "BSON-comparator units are run but not counted here, since they "
             "never touch the server."
         ),
-        "report_url": (
-            "https://secantusdb.com/docs/validation-report-php-lib.html"
-        ),
+        "report_url": ("https://secantusdb.com/docs/validation-report-php-lib.html"),
     },
     "mongo-php-driver": {
         "title": "mongo-php-driver",
@@ -198,9 +197,7 @@ PANEL_PROSE: dict[str, dict[str, str]] = {
             "not counted). Alongside Go, the strictest wire-shape check we "
             "run &mdash; type divergences pymongo accepts silently fail here."
         ),
-        "report_url": (
-            "https://secantusdb.com/docs/validation-report-php-ext.html"
-        ),
+        "report_url": ("https://secantusdb.com/docs/validation-report-php-ext.html"),
     },
     "mongo-c-driver": {
         "title": "mongo-c-driver",
@@ -241,9 +238,7 @@ PANEL_PROSE: dict[str, dict[str, str]] = {
             "<code>[RequireServer]</code> attribute self-skips version- and "
             "topology-gated cases."
         ),
-        "report_url": (
-            "https://secantusdb.com/docs/validation-report-dotnet.html"
-        ),
+        "report_url": ("https://secantusdb.com/docs/validation-report-dotnet.html"),
     },
 }
 
@@ -286,8 +281,7 @@ def _format_rate(stats: GaugeStats) -> str:
     """
     if stats.ran <= 0:
         return "&mdash;"
-    pct = stats.passed / stats.ran * 100
-    return f"{pct:.1f}%"
+    return rates.pass_rate(stats.passed, stats.ran)
 
 
 def _render_validation_panel(name: str, stats: GaugeStats) -> str:

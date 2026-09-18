@@ -17,6 +17,8 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
+from validation_summary.rates import pass_rate
+
 import secantus
 
 TEST_PREFIX = "test/"
@@ -70,14 +72,14 @@ def render(raw_path: Path, out_path: Path) -> None:
         b = by_cat[cat]
         total = b["passed"] + b["failed"] + b["pending"]
         ran = b["passed"] + b["failed"]
-        rate = f"{(b['passed'] / ran * 100):.1f}%" if ran else "—"
+        rate = pass_rate(b["passed"], ran)
         rows.append((cat, b["passed"], b["failed"], b["pending"], total, rate))
         for k in totals:
             totals[k] += b[k]
 
     grand_total = sum(totals.values())
     grand_ran = totals["passed"] + totals["failed"]
-    grand_rate = f"{(totals['passed'] / grand_ran * 100):.1f}%" if grand_ran else "—"
+    grand_rate = pass_rate(totals["passed"], grand_ran)
 
     md: list[str] = []
     md.append("# mongo-node-driver Validation Report")

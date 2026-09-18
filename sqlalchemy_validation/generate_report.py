@@ -18,6 +18,8 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
+from validation_summary.rates import pass_rate
+
 
 def _secantus_version() -> str:
     try:
@@ -92,13 +94,13 @@ def main() -> None:
         for k in totals:
             totals[k] += c[k]
         run = c["passed"] + c["failed"]
-        rate = f"{c['passed'] / run * 100:.1f}%" if run else "—"
+        rate = pass_rate(c["passed"], run)
         lines.append(
             f"| {cat} | {c['passed']} | {c['failed']} | {c['skipped']} "
             f"| {sum(c.values())} | {rate} |"
         )
     run = totals["passed"] + totals["failed"]
-    rate = f"{totals['passed'] / run * 100:.1f}%" if run else "—"
+    rate = pass_rate(totals["passed"], run)
     lines.append(
         f"| **total** | **{totals['passed']}** | **{totals['failed']}** "
         f"| **{totals['skipped']}** | **{sum(totals.values())}** | **{rate}** |"

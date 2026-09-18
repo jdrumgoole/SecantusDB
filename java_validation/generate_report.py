@@ -17,6 +17,8 @@ import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
 
+from validation_summary.rates import pass_rate
+
 import secantus
 
 
@@ -90,14 +92,14 @@ def render(xml_dir: Path, out_path: Path) -> None:
         b = by_mod[mod]
         total = b["passed"] + b["failed"] + b["skipped"]
         ran = b["passed"] + b["failed"]
-        rate = f"{(b['passed'] / ran * 100):.1f}%" if ran else "—"
+        rate = pass_rate(b["passed"], ran)
         rows.append((mod, b["passed"], b["failed"], b["skipped"], total, rate))
         for k in totals:
             totals[k] += b[k]
 
     grand_total = sum(totals.values())
     grand_ran = totals["passed"] + totals["failed"]
-    grand_rate = f"{(totals['passed'] / grand_ran * 100):.1f}%" if grand_ran else "—"
+    grand_rate = pass_rate(totals["passed"], grand_ran)
 
     rust = "-rust-server" in out_path.name
     md: list[str] = []

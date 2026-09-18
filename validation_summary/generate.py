@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from validation_summary import expected_failures as ef_module
+from validation_summary import rates
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -84,7 +85,7 @@ class GaugeStats:
 
     @property
     def pass_rate(self) -> str:
-        return f"{(self.passed / self.ran * 100):.1f}%" if self.ran else "—"
+        return rates.pass_rate(self.passed, self.ran)
 
     @property
     def adjusted_pass_rate(self) -> str:
@@ -95,7 +96,7 @@ class GaugeStats:
         adj_ran = self.ran - self.expected_failures
         if adj_ran <= 0:
             return "—"
-        return f"{(self.passed / adj_ran * 100):.1f}%"
+        return rates.pass_rate(self.passed, adj_ran)
 
 
 def _gitlink_sha(rel: str) -> str:
@@ -765,9 +766,9 @@ def render(raw_dir: Path, out_path: Path) -> None:
     total_expected = sum(g.expected_failures for g in gauges)
     total_actionable = total_failed - total_expected
     total_ran = total_passed + total_failed
-    grand_rate = f"{(total_passed / total_ran * 100):.1f}%" if total_ran else "—"
+    grand_rate = rates.pass_rate(total_passed, total_ran)
     adj_ran = total_ran - total_expected
-    adj_rate = f"{(total_passed / adj_ran * 100):.1f}%" if adj_ran > 0 else "—"
+    adj_rate = rates.pass_rate(total_passed, adj_ran) if adj_ran > 0 else "—"
 
     md: list[str] = []
     md.append("# Cross-Driver Conformance Summary")
