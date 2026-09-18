@@ -15271,32 +15271,27 @@ The general rule: **have the server report the port it bound; never hand it
 one you probed.** Any scheme that probes and passes the number has this
 window by construction.
 
-## Local-time rendering on Windows is UNMEASURED (2026-09-10)
+## The macOS `test` lane wedges for its whole 30-minute cap, rarely (2026-09-18)
 
-`$toLower` / `$toUpper` of a `Timestamp` render in the server process's local
-time (see the entry above and `tests/test_tolower_timestamp_local_time.py`).
-The two servers reach "local" by different routes, and only the Unix side has
-been measured:
+`test (macos-14, 3.12, 4)` on PR #1468 ran 35 minutes and was killed by the
+job's `timeout-minutes` cap, having normally taken **3-5 minutes** on the six
+preceding `main` runs. A re-run of that job on the **identical commit** passed
+in 4 minutes, and `test-durable (macos-14, 3.12, 4)` -- the same shard, same
+OS, same test selection -- passed first time on the same commit. So it is not
+caused by the code under test; it is an intermittent wedge in that lane.
 
-- the **Python** server calls `time.localtime`, i.e. the platform C runtime, so
-  on Windows it follows the CRT's `TZ` syntax (`tzn[+|-]hh[:mm[:ss]][dzn]`);
-- the **Rust** server calls `chrono::Local`, which on Windows goes to the
-  Win32 timezone API rather than the CRT.
+Nothing was diagnosable after the fact: GitHub keeps **no log for a cancelled
+job** (`/logs` answers `BlobNotFound`), and the job's own "Upload faulthandler
+crash dumps" step never runs because the cap kills the job before it. That is
+the actual gap -- the wedge is invisible by construction, so the next
+occurrence will be just as opaque.
 
-Whether those two agree on Windows — with `TZ` set, or unset — has NOT been
-probed, and neither has what a Windows `mongod` answers. It is not obviously a
-divergence; it is simply unknown, and saying so beats implying the Unix
-measurement covers it.
-
-What IS measured: CI's `windows-latest` lane showed that `TZ=America/New_York`
-there yields a **zero offset with US daylight rules applied** (three winter
-cases came back UTC, the July one UTC+1) — a wrong answer reached by a
-plausible route. That is why the zone-shifting cases in that test file are
-Unix-only; the `TZ=UTC` cases still run everywhere.
-
-Probing it needs a Windows box with both servers and a Windows mongod, which
-this project has never had. Low priority: the affected surface is two operators
-on a BSON `Timestamp`, and setting `TZ` on Windows is unusual.
+The shape matches the one `test.yml` already names as the reason for the cap: a
+daemon or thread not reaped (historically a rust-server `stop()` or a
+change-stream tail), which `tests/conftest.py`'s faulthandler watchdog exists to
+dump. Worth checking whether that watchdog's timeout actually fires INSIDE the
+30-minute job cap on macOS; if it fires later than the cap, it can never
+produce the dump it exists for.
 
 ## `bulkWrite` returns every result in `firstBatch` (2026-09-18)
 

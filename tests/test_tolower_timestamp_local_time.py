@@ -41,9 +41,17 @@ bson = pytest.importorskip("bson")
 # "America/New_York" as a zone NAME with no numeric offset -- offset zero -- and
 # then enables US daylight rules because a trailing daylight name is present.
 # CI measured exactly that on `windows-latest` (2026-09-10): the three winter
-# cases came back UTC and the July one came back UTC+1, which is a wrong answer
-# arrived at by a plausible route, and would read as a product bug rather than a
-# test device that does not travel.
+# cases came back UTC and the July one came back UTC+1.
+#
+# That is NOT a wrong answer, which is what this comment used to claim. A real
+# mongod 8.2.11 on Windows 11 was finally put next to it (2026-09-18) and gives
+# the SAME UTC+1 -- mongod resolves the zone through the same CRT, so the
+# platform's `TZ` grammar *is* the server's. What does not travel is the
+# EXPECTATIONS below, which are Unix measurements; the behaviour is faithful on
+# both. `tests/test_mongod_differential.py::test_timestamp_local_render_matches_mongod`
+# asserts that directly against whatever mongod the host has, so it needs no
+# platform skip at all -- and it is what caught the Rust engine ignoring `TZ`
+# on Windows, which this file could not see.
 #
 # So the zone-shifting cases are Unix-only. They are the ones that prove the
 # rendering is DST-correct rather than a fixed offset, and that claim is about

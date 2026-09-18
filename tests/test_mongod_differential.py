@@ -20,10 +20,13 @@ Run explicitly with `pytest -m differential`.
 
 from __future__ import annotations
 
+import contextlib
+import os
 import re
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -114,20 +117,29 @@ def _free_port() -> int:
         return int(s.getsockname()[1])
 
 
-@pytest.fixture(scope="module")
-def mongod_uri() -> Iterator[str]:
-    """A throwaway standalone mongod. Module-scoped: startup dominates runtime."""
-    if MONGOD is None:
-        pytest.skip("no mongod on PATH")
+def _start_mongod(env: Mapping[str, str] | None = None) -> tuple[subprocess.Popen, str, str]:
+    """Spawn a throwaway standalone mongod; return ``(proc, uri, dbpath)``.
+
+    Shared by the module fixture below and by the per-zone local-time cases at
+    the end of this file, which need identical readiness handling but a
+    DIFFERENT process environment. The caller owns the teardown.
+    """
     tmp = tempfile.mkdtemp(prefix="differential-mongod-")
     port = _free_port()
     proc = subprocess.Popen(
         [MONGOD, "--port", str(port), "--dbpath", tmp, "--quiet"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        env=None if env is None else dict(env),
     )
     uri = f"mongodb://127.0.0.1:{port}/"
-    try:
+    # Everything from here to the `return` runs under `_reap_on_failure`: the
+    # caller only gets a `finally` to clean up with once it HOLDS the handle, so
+    # any exit before the return -- the skip below, the race guard's raise, a
+    # KeyboardInterrupt -- would otherwise leave a live mongod and its dbpath
+    # behind. `pytest.skip` raises `Skipped`, which is a `BaseException` and not
+    # an `Exception`, so the guard has to catch the wider one.
+    with _reap_on_failure(proc, tmp):
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             try:
@@ -137,23 +149,50 @@ def mongod_uri() -> Iterator[str]:
                 time.sleep(0.25)
         else:
             pytest.skip("mongod did not become ready")
-        # A ping that succeeds is NOT proof it reached the mongod spawned above.
-        # `_free_port()` closes its probe socket before this child binds, so
-        # under `-n auto` another worker can take the port; ours then exits
-        # "address already in use" while the ping lands on THEIRS. This gate
-        # would go on measuring a server it does not own -- and, being a
-        # differential gate, would report agreement it never actually tested.
-        # A child that lost the race is long gone by the time a ping succeeds,
-        # so its exit is the reliable tell. Fail loudly rather than measure the
-        # wrong server. (The same race broke `pg-oracle` on 2026-09-09; the
-        # `secantusd-pg` harness fixed it properly by binding :0 and reading the
-        # port back, which mongod gives us no way to do.)
-        if proc.poll() is not None:
-            raise RuntimeError(
-                f"mongod on port {port} exited during startup; the ping that "
-                "succeeded reached a DIFFERENT server, so this gate would have "
-                "compared against a mongod it does not own"
-            )
+        _assert_owns_port(proc, port)
+    return proc, uri, tmp
+
+
+@contextlib.contextmanager
+def _reap_on_failure(proc: subprocess.Popen, dbpath: str) -> Iterator[None]:
+    """Terminate `proc` and drop `dbpath` if the body doesn't complete."""
+    try:
+        yield
+    except BaseException:
+        proc.terminate()
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=30)
+        shutil.rmtree(dbpath, ignore_errors=True)
+        raise
+
+
+def _assert_owns_port(proc: subprocess.Popen, port: int) -> None:
+    # A ping that succeeds is NOT proof it reached the mongod spawned above.
+    # `_free_port()` closes its probe socket before this child binds, so
+    # under `-n auto` another worker can take the port; ours then exits
+    # "address already in use" while the ping lands on THEIRS. This gate
+    # would go on measuring a server it does not own -- and, being a
+    # differential gate, would report agreement it never actually tested.
+    # A child that lost the race is long gone by the time a ping succeeds,
+    # so its exit is the reliable tell. Fail loudly rather than measure the
+    # wrong server. (The same race broke `pg-oracle` on 2026-09-09; the
+    # `secantusd-pg` harness fixed it properly by binding :0 and reading the
+    # port back, which mongod gives us no way to do.)
+    if proc.poll() is not None:
+        raise RuntimeError(
+            f"mongod on port {port} exited during startup; the ping that "
+            "succeeded reached a DIFFERENT server, so this gate would have "
+            "compared against a mongod it does not own"
+        )
+
+
+@pytest.fixture(scope="module")
+def mongod_uri() -> Iterator[str]:
+    """A throwaway standalone mongod. Module-scoped: startup dominates runtime."""
+    if MONGOD is None:
+        pytest.skip("no mongod on PATH")
+    proc, uri, tmp = _start_mongod()
+    try:
         yield uri
     finally:
         proc.terminate()
@@ -3316,3 +3355,148 @@ def test_matches_mongod(
     ours = _run(secantus_uri, db_name, seed, op)
     theirs = _run(mongod_uri, db_name, seed, op)
     assert ours == theirs, f"{name}: mongod={theirs} ours={ours}"
+
+
+# ------------------------------------- local-time rendering, under a zone
+#
+# `$toLower` / `$toUpper` of a Timestamp is the ONE conversion mongod renders in
+# the server process's LOCAL time -- a legacy asctime-like path, not the
+# `$dateToString` format language. The zone is therefore part of the input, and
+# the module-scoped `mongod_uri` fixture cannot express it: a process inherits
+# its zone at startup, so a case that varies the zone has to vary the process.
+# Each case below spawns its own mongod and asks each engine in its own
+# subprocess, both under the same `TZ`.
+#
+# EVALUATOR-LEVEL on our side, not server-level like the rest of this file. The
+# rendering lives entirely in the expression evaluator, and the Rust engine --
+# the half that had the bug -- is reachable as `_secantus_core` without the
+# storage-engine build a Rust *server* would need. Parametrising the engine
+# keeps the Rust half a VISIBLE skip where that extension is absent, rather than
+# a silent one folded into a passing Python assertion.
+#
+# NOTHING HERE IS A HARDCODED EXPECTATION, and that is the point. The sibling
+# `tests/test_tolower_timestamp_local_time.py` pins values measured on Unix, so
+# it must skip the zone-shifted cases on Windows -- `TZ=<IANA name>` is a POSIX
+# device, and the MSVC CRT reads `TZ` as a different grammar entirely. Asking
+# the mongod that is running, on the box that is running it, needs no such skip.
+#
+# This is what caught the real divergence (2026-09-18, mongod 8.2.11 on Windows
+# 11): the Rust engine resolved the zone through `chrono::Local`, which on
+# Windows reads `GetDynamicTimeZoneInformation` and IGNORES `TZ`. On a
+# `Europe/London` host a `TZ=UTC` server rendered the July instant an hour late
+# while mongod and the Python evaluator both said UTC. Note which instants
+# separate them: London IS UTC in winter, so three of the four below agree even
+# when the zone handling is broken. A corpus without the July case proves
+# nothing.
+
+#: `(seconds, increment)`. Chosen to straddle a northern-hemisphere DST
+#: boundary: a zone that is UTC in winter but not in summer agrees on the three
+#: winter instants and disagrees only on the July one.
+TZ_RENDER_INSTANTS = [(1, 1), (1700000000, 3), (1720000000, 0), (1767225600, 12)]
+
+#: `None` means "leave `TZ` unset" -- the host's own zone, which is what a real
+#: deployment runs in. The named zones are passed through verbatim on both
+#: platforms; what each one MEANS differs (POSIX resolves the IANA name, while
+#: the MSVC CRT reads it as a zone name with a zero offset plus a daylight
+#: rule, which lands `America/New_York` on UTC+1 in July rather than UTC-4).
+#: That difference is precisely why the expected value comes from mongod.
+TZ_RENDER_ZONES = ["UTC", "America/New_York", None]
+
+_PY_RENDER = (
+    "import sys\n"
+    "from bson import Timestamp\n"
+    "from secantus.expressions import evaluate\n"
+    "print(evaluate({'$toLower': Timestamp(int(sys.argv[1]), int(sys.argv[2]))}, {}))\n"
+)
+
+_RUST_RENDER = (
+    "import sys\n"
+    "import bson\n"
+    "import _secantus_core as rust\n"
+    "from bson import Timestamp\n"
+    "expr = {'e': {'$toLower': Timestamp(int(sys.argv[1]), int(sys.argv[2]))}}\n"
+    "res = rust.evaluate(bson.encode({}), bson.encode(expr), bson.encode({}))\n"
+    "print('<DEFER>' if res is None else bson.decode(res)['r'])\n"
+)
+
+_ENGINE_RENDERERS = {"python": _PY_RENDER, "rust": _RUST_RENDER}
+
+#: mongod's answers per zone, so the engine parametrisation below costs one
+#: mongod per ZONE rather than one per (zone, engine). Worker-local under
+#: xdist, which is what we want -- each worker spawns its own servers anyway.
+_TZ_MONGOD_CACHE: dict[str | None, list[str]] = {}
+
+
+def _env_with_tz(tz: str | None) -> dict[str, str]:
+    """This process's environment with `TZ` set to `tz`, or removed for `None`."""
+    env = dict(os.environ)
+    if tz is None:
+        env.pop("TZ", None)
+    else:
+        env["TZ"] = tz
+    return env
+
+
+def _mongod_renders_under_tz(tz: str | None) -> list[str]:
+    """What a mongod whose process environment carries `tz` answers, per instant."""
+    if tz in _TZ_MONGOD_CACHE:
+        return _TZ_MONGOD_CACHE[tz]
+    proc, uri, tmp = _start_mongod(_env_with_tz(tz))
+    try:
+        client = MongoClient(uri, serverSelectionTimeoutMS=10000)
+        try:
+            coll = client.diff_tzrender.c
+            coll.drop()
+            coll.insert_one({"_id": 1})
+            rendered = [
+                coll.aggregate([{"$project": {"r": {"$toLower": Timestamp(secs, inc)}}}]).next()[
+                    "r"
+                ]
+                for secs, inc in TZ_RENDER_INSTANTS
+            ]
+        finally:
+            client.close()
+    finally:
+        proc.terminate()
+        proc.wait(timeout=30)
+        shutil.rmtree(tmp, ignore_errors=True)
+    _TZ_MONGOD_CACHE[tz] = rendered
+    return rendered
+
+
+def _engine_renders_under_tz(script: str, tz: str | None, secs: int, inc: int) -> str:
+    """What one engine answers, in a fresh process whose environment carries `tz`."""
+    out = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        [sys.executable, "-c", script, str(secs), str(inc)],
+        capture_output=True,
+        text=True,
+        env=_env_with_tz(tz),
+        check=True,
+    )
+    return out.stdout.strip()
+
+
+@requires_mongod
+@pytest.mark.parametrize("engine", sorted(_ENGINE_RENDERERS))
+@pytest.mark.parametrize("tz", TZ_RENDER_ZONES, ids=[z or "host-zone" for z in TZ_RENDER_ZONES])
+def test_timestamp_local_render_matches_mongod(
+    tz: str | None, engine: str, mongod_version: tuple[int, int]
+) -> None:
+    """Both engines must render a Timestamp exactly as mongod does, in any zone."""
+    if mongod_version[0] != PROBED_MONGOD_MAJOR:
+        found = ".".join(str(p) for p in mongod_version)
+        pytest.skip(
+            f"this gate asserts an exact match against mongod "
+            f"{PROBED_MONGOD_MAJOR}.x (probed {PROBED_MONGOD_VERSION}), and this "
+            f"box has mongod {found}; across majors its error surface differs in "
+            f"ways that are not SecantusDB divergences. See PROBED_MONGOD_MAJOR."
+        )
+    if engine == "rust":
+        pytest.importorskip("_secantus_core")
+
+    theirs = _mongod_renders_under_tz(tz)
+    for (secs, inc), expected in zip(TZ_RENDER_INSTANTS, theirs, strict=True):
+        ours = _engine_renders_under_tz(_ENGINE_RENDERERS[engine], tz, secs, inc)
+        assert ours == expected, (
+            f"TZ={tz or '<unset>'} Timestamp({secs}, {inc}): mongod={expected!r} {engine}={ours!r}"
+        )
