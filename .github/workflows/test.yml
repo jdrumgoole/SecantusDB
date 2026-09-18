@@ -2191,6 +2191,11 @@ jobs:
           # to fit this lane's budget and is already run locally against a real
           # PostgreSQL before every pgserver change lands, so it stays local.
           files="$files tests/test_rust_pgserver_slice.py"
+          # The release smoke test, in the one lane that already builds the
+          # binary it needs. It is `skipif`-gated on that binary existing, so
+          # anywhere else it silently collects nothing -- a release gate that
+          # runs in no lane is not a gate.
+          files="$files tests/test_rust_pg_binary_smoke.py"
           echo "oracle suites: $files"
           test -n "$files"
           PYTHONPATH=tests uv run python -m pytest $files -q -n auto \
