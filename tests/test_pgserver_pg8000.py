@@ -23,6 +23,7 @@ import trustme
 from secantus.sql import pgwire
 from secantus.sql.pgserver import SecantusPGServer
 from secantus.storage import Storage
+from tests.net_timeouts import CONNECT_TIMEOUT_S
 
 pg8000 = pytest.importorskip("pg8000.dbapi")
 
@@ -2396,7 +2397,7 @@ def test_string_agg_and_bool_aggregates_via_driver(server):
 def test_ssl_request_declined_without_tls(server):
     # Sanity: a raw SSLRequest is declined when TLS isn't configured.
     host, port = server.address
-    s = socket.create_connection((host, port), timeout=5)
+    s = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT_S)
     s.sendall(struct.pack("!ii", 8, pgwire.SSL_REQUEST_CODE))
     assert s.recv(1) == b"N"
     s.close()
