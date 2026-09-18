@@ -591,6 +591,11 @@ fn _secantus_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
          expressions, projection, diff) plus the storage-independent aggregation \
          pipeline, behind the BSON byte seam.",
     )?;
+    // The git tree hash of the sources this extension was built from; empty
+    // when built without git history. `tests/conftest.py` compares it against
+    // the checkout to catch a stale build before it produces confusing
+    // failures. See `build.rs`.
+    m.add("__source_tree__", env!("SECANTUS_SOURCE_TREE"))?;
     m.add_function(wrap_pyfunction!(sortkey_encode_value, m)?)?;
     m.add_function(wrap_pyfunction!(sortkey_encode_value_directed, m)?)?;
     m.add_function(wrap_pyfunction!(query_matches, m)?)?;
