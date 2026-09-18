@@ -2196,6 +2196,21 @@ jobs:
           (cd crates/secantus-pgserver && cargo build --bin secantusd-pg)
           test -x crates/secantus-pgserver/target/debug/secantusd-pg
 
+      # The cross-protocol tests in test_rust_pgserver_slice.py need the
+      # MongoDB binary as well: they have the PG server write a table, stop it,
+      # and then read it back as a collection through `secantusd-rs`. Without
+      # this step they skip -- and since this is the only lane that runs that
+      # suite, skipping here means they run in NO lane at all, which is worse
+      # than not having them (a green summary that proves nothing). Same
+      # reasoning as the secantusd-pg build above.
+      - name: Build secantusd-rs (for the cross-protocol tests)
+        shell: bash
+        run: |
+          WT="$PWD/$(ls -d build/*/wt-build | head -1)"
+          export SECANTUS_WT_INCLUDE="$WT/include" SECANTUS_WT_LIB="$WT"
+          cargo build --manifest-path crates/secantusdb/Cargo.toml --bin secantusd-rs
+          test -x crates/secantusdb/target/debug/secantusd-rs
+
       - name: Verify the reference server is reachable
         # Fail CLOSED. The whole point of this job is that these suites stop
         # skipping, and a skip is invisible in a green pytest summary — so

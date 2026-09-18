@@ -17,6 +17,9 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
+from validation_summary.expected_failures import PSYCOPG, find_match
+from validation_summary.rates import pass_rate
+
 
 def _secantus_version() -> str:
     """The Python-server version, without importing the WT-linked package
@@ -77,16 +80,26 @@ def main() -> None:
 
     data = json.loads(Path(args.raw_json).read_text())
     per_cat: dict[str, dict[str, int]] = defaultdict(
-        lambda: {"passed": 0, "failed": 0, "skipped": 0}
+        lambda: {"passed": 0, "failed": 0, "expected": 0, "skipped": 0}
     )
     failures: list[str] = []
+    expected: list[tuple[str, str]] = []
     for t in data.get("tests", []):
         bucket = _OUTCOME_BUCKETS.get(t.get("outcome", ""), "failed")
-        per_cat[_category_for(t["nodeid"])][bucket] += 1
+        nodeid = t["nodeid"]
         if bucket == "failed":
-            failures.append(t["nodeid"])
+            # A documented non-server failure counts separately, so the pass
+            # rate is neither gamed by dropping it nor dragged down by a test
+            # whose outcome this server cannot influence. Both columns ship.
+            match = find_match(PSYCOPG, nodeid)
+            if match is not None:
+                bucket = "expected"
+                expected.append((nodeid, match.rationale))
+            else:
+                failures.append(nodeid)
+        per_cat[_category_for(nodeid)][bucket] += 1
 
-    totals = {"passed": 0, "failed": 0, "skipped": 0}
+    totals = {"passed": 0, "failed": 0, "expected": 0, "skipped": 0}
     lines = [
         "# psycopg conformance report",
         "",
@@ -94,25 +107,40 @@ def main() -> None:
         f"- psycopg suite: vendor/psycopg @ {_read_psycopg_version()}",
         f"- generated: {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
         "",
-        "| category | passed | failed | skipped | total | pass rate |",
-        "|---|---|---|---|---|---|",
+        "| category | passed | failed | expected | skipped | total | pass rate | adjusted |",
+        "|---|---|---|---|---|---|---|---|",
     ]
     for cat in sorted(per_cat):
         c = per_cat[cat]
         for k in totals:
             totals[k] += c[k]
-        run = c["passed"] + c["failed"]
-        rate = f"{c['passed'] / run * 100:.1f}%" if run else "—"
+        run = c["passed"] + c["failed"] + c["expected"]
+        rate = pass_rate(c["passed"], run)
+        adj = pass_rate(c["passed"], c["passed"] + c["failed"])
         lines.append(
-            f"| {cat} | {c['passed']} | {c['failed']} | {c['skipped']} "
-            f"| {sum(c.values())} | {rate} |"
+            f"| {cat} | {c['passed']} | {c['failed']} | {c['expected']} | {c['skipped']} "
+            f"| {sum(c.values())} | {rate} | {adj} |"
         )
-    run = totals["passed"] + totals["failed"]
-    rate = f"{totals['passed'] / run * 100:.1f}%" if run else "—"
+    run = totals["passed"] + totals["failed"] + totals["expected"]
+    rate = pass_rate(totals["passed"], run)
+    adj = pass_rate(totals["passed"], totals["passed"] + totals["failed"])
     lines.append(
         f"| **total** | **{totals['passed']}** | **{totals['failed']}** "
-        f"| **{totals['skipped']}** | **{sum(totals.values())}** | **{rate}** |"
+        f"| **{totals['expected']}** | **{totals['skipped']}** "
+        f"| **{sum(totals.values())}** | **{rate}** | **{adj}** |"
     )
+
+    if expected:
+        lines += [
+            "",
+            f"## Expected failures ({len(expected)})",
+            "",
+            "Documented non-server failures. They are excluded from the *adjusted* "
+            "rate and counted in the plain one, so neither number hides them. Each "
+            "entry's rationale lives in `validation_summary/expected_failures.py`.",
+            "",
+        ]
+        lines += [f"- `{n}` — {r}" for n, r in sorted(expected)]
 
     if failures:
         lines += ["", f"## Failures ({len(failures)})", ""]
@@ -121,7 +149,8 @@ def main() -> None:
     Path(args.output_md).write_text("\n".join(lines) + "\n")
     print(
         f"psycopg gauge: {totals['passed']} passed / {totals['failed']} failed "
-        f"/ {totals['skipped']} skipped ({rate})"
+        f"/ {totals['expected']} expected / {totals['skipped']} skipped "
+        f"({rate}, adjusted {adj})"
     )
 
 

@@ -9088,3 +9088,261 @@ def test_a_second_connection_re_probes_the_catalog(home: Path) -> None:
         assert second.execute("select k from shared_t").fetchall() == [(1,)]
         second.execute("insert into shared_t values (2)")
         assert second.execute("select count(*) from shared_t").fetchone() == (2,)
+
+
+# ---------------------------------------------------------------------------
+# UNIQUE constraints. Before 2026-09-18 a `unique` column constraint planned as
+# a plain column: the server ACCEPTED the declaration and then let a duplicate
+# in, which is silent data corruption rather than a missing feature. The error
+# surface below was probed against PostgreSQL 14.13, not copied from the
+# backlog entry, which cited a PG 16 that is not installed on this box.
+# ---------------------------------------------------------------------------
+
+
+def test_column_unique_rejects_a_duplicate(home: Path) -> None:
+    """The headline: the second equal value must not be stored.
+
+    PostgreSQL 14.13 answers 23505 naming the constraint it generated,
+    `<table>_<column>_key`, with the offending value in DETAIL.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE u1 (id int PRIMARY KEY, tag text UNIQUE)")
+        cur.execute("INSERT INTO u1 VALUES (1,'dup')")
+
+        with pytest.raises(psycopg.errors.UniqueViolation) as exc:
+            cur.execute("INSERT INTO u1 VALUES (2,'dup')")
+        diag = exc.value.diag
+        assert diag.sqlstate == "23505"
+        assert diag.constraint_name == "u1_tag_key"
+        assert diag.message_primary == (
+            'duplicate key value violates unique constraint "u1_tag_key"'
+        )
+        assert diag.message_detail == "Key (tag)=(dup) already exists."
+
+        # ... and the row really is not there.
+        cur.execute("SELECT count(*) FROM u1")
+        assert cur.fetchone() == (1,)
+
+
+def test_unique_allows_many_nulls(home: Path) -> None:
+    """SQL NULLs are DISTINCT, so any number of them satisfy a UNIQUE.
+
+    This is the case a Mongo unique index gets wrong by default, and the reason
+    the backing index carries a partial filter rather than `sparse`: a SQL NULL
+    is stored as an explicit null, not a missing field, so a sparse index would
+    still index it and still collide.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE u2 (id int PRIMARY KEY, tag text UNIQUE)")
+        cur.execute("INSERT INTO u2 VALUES (1, NULL), (2, NULL), (3, NULL)")
+        cur.execute("SELECT count(*) FROM u2")
+        assert cur.fetchone() == (3,)
+
+
+def test_multi_column_unique_and_its_generated_name(home: Path) -> None:
+    """`UNIQUE (a,b)` -> `<table>_a_b_key`, and only the whole tuple collides."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE u3 (a int, b int, UNIQUE (a,b))")
+        cur.execute("INSERT INTO u3 VALUES (1,2)")
+        cur.execute("INSERT INTO u3 VALUES (1,3)")  # same a, different b: fine
+
+        with pytest.raises(psycopg.errors.UniqueViolation) as exc:
+            cur.execute("INSERT INTO u3 VALUES (1,2)")
+        assert exc.value.diag.constraint_name == "u3_a_b_key"
+        assert exc.value.diag.message_detail == "Key (a, b)=(1, 2) already exists."
+
+
+def test_named_unique_constraint_keeps_its_name(home: Path) -> None:
+    """`CONSTRAINT my_uq UNIQUE` reports `my_uq`, not a generated name."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE u4 (a int CONSTRAINT my_uq UNIQUE)")
+        cur.execute("INSERT INTO u4 VALUES (7)")
+        with pytest.raises(psycopg.errors.UniqueViolation) as exc:
+            cur.execute("INSERT INTO u4 VALUES (7)")
+        assert exc.value.diag.constraint_name == "my_uq"
+
+
+def test_update_into_a_duplicate_is_rejected(home: Path) -> None:
+    """Enforcement is on every write, not just INSERT."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE u5 (id int PRIMARY KEY, tag text UNIQUE)")
+        cur.execute("INSERT INTO u5 VALUES (1,'a'), (2,'b')")
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            cur.execute("UPDATE u5 SET tag='a' WHERE id=2")
+        cur.execute("SELECT tag FROM u5 WHERE id=2")
+        assert cur.fetchone() == ("b",)
+
+
+def test_the_python_server_sees_the_unique_constraint(home: Path) -> None:
+    """The catalog shape is a cross-server contract.
+
+    A table the Rust server created with a UNIQUE must read back in the Python
+    server with that constraint intact — dropping the key would silently
+    rewrite the other server's catalog, and a later duplicate would land.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.cursor().execute("CREATE TABLE u6 (id int PRIMARY KEY, tag text UNIQUE)")
+
+    from secantus.sql.catalog import Catalog
+    from secantus.storage import Storage
+
+    storage = Storage(str(home))
+    try:
+        table = Catalog(storage).get("postgres", "u6")
+        assert table is not None
+        assert [(u.name, tuple(u.columns)) for u in table.unique_constraints] == [
+            ("u6_tag_key", ("tag",))
+        ]
+    finally:
+        storage.close()
+
+
+# Cross-PROTOCOL contract: the Rust PG server and the Rust MongoDB server over
+# one store. Measured 2026-09-18; before that it was asserted on the website and
+# in CLAUDE.md on the strength of "same secantus-storage, so it must follow",
+# which is reasoning rather than evidence. It holds in one direction only, and
+# the asymmetry is the whole reason these two tests exist.
+# ---------------------------------------------------------------------------
+
+_MONGO_BANNER = re.compile(r"secantusd-rs listening on (\S+):(\d+)")
+
+
+def _mongo_binary() -> Path | None:
+    """The standalone `secantusd-rs`, the way test_rust_binary_smoke finds it."""
+    import os
+
+    env = os.environ.get("SECANTUSDB_BIN")
+    if env:
+        p = Path(env)
+        return p if p.exists() else None
+    for profile in ("release", "debug"):
+        p = REPO / "crates" / "secantusdb" / "target" / profile / "secantusd-rs"
+        if p.exists():
+            return p
+    return None
+
+
+_MONGO_BIN = _mongo_binary()
+_needs_mongo_binary = pytest.mark.skipif(
+    _MONGO_BIN is None,
+    reason=(
+        "secantusd-rs not built (cargo build --manifest-path "
+        "crates/secantusdb/Cargo.toml, or set SECANTUSDB_BIN)"
+    ),
+)
+
+
+@contextlib.contextmanager
+def _mongo_server(home: Path) -> Iterator[tuple[str, int]]:
+    """Serve `home` over the MongoDB wire. Nothing else may hold it."""
+    assert _MONGO_BIN is not None
+    proc = subprocess.Popen(
+        [str(_MONGO_BIN), "--port", "0", "--storage-path", str(home)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        assert proc.stdout is not None
+        line = proc.stdout.readline()
+        m = _MONGO_BANNER.search(line)
+        assert m, f"no listening banner in first stdout line: {line!r}"
+        yield m.group(1), int(m.group(2))
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
+
+
+@_needs_mongo_binary
+def test_a_mongodb_client_reads_a_table_the_rust_sql_server_wrote(home: Path) -> None:
+    """SQL in, BSON out: one store, both Rust servers, sequentially.
+
+    A table written over the PostgreSQL wire is a collection over the MongoDB
+    wire, in the database the SQL session was connected to, with the PRIMARY KEY
+    landing as `_id`. Measured 2026-09-18 -- the shape below is what a pymongo
+    client actually saw, not what the storage layer was assumed to imply.
+
+    Sequential by necessity: WiredTiger's exclusive lock means the PG server has
+    to stop before the MongoDB server can open the same home (see the `home`
+    fixture, and the companion test below).
+    """
+    pymongo = pytest.importorskip("pymongo")
+
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE widgets (id int PRIMARY KEY, name text, qty int)")
+        cur.execute("INSERT INTO widgets VALUES (1,'bolt',40),(2,'nut',75)")
+
+    with _mongo_server(home) as (host, port):
+        client = pymongo.MongoClient(f"mongodb://{host}:{port}", serverSelectionTimeoutMS=15_000)
+        try:
+            assert "widgets" in client["postgres"].list_collection_names()
+            docs = sorted(client["postgres"]["widgets"].find({}), key=lambda d: d["_id"])
+            assert docs == [
+                {"_id": 1, "name": "bolt", "qty": 40},
+                {"_id": 2, "name": "nut", "qty": 75},
+            ]
+        finally:
+            client.close()
+
+
+@_needs_mongo_binary
+def test_the_two_rust_servers_cannot_hold_one_store_at_the_same_time(home: Path) -> None:
+    """The contract is SEQUENTIAL, and saying otherwise would mislead.
+
+    WiredTiger takes an exclusive file lock, so "point both servers at one
+    directory" is a hand-off, never concurrent serving. This is pinned because
+    the claim is tempting to write on a marketing page -- it was, briefly.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.cursor().execute("CREATE TABLE held (id int PRIMARY KEY)")
+
+        assert _MONGO_BIN is not None
+        clash = subprocess.run(
+            [str(_MONGO_BIN), "--port", "0", "--storage-path", str(home)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert clash.returncode != 0, "the MongoDB server opened a store the PG server holds"
+        assert "WiredTiger.lock" in (clash.stdout + clash.stderr)
+
+
+@_needs_mongo_binary
+def test_a_pymongo_written_collection_is_not_yet_a_table(home: Path) -> None:
+    """The reverse direction does NOT work on the Rust pair, unlike the Python one.
+
+    The Python SQL layer samples an uncatalogued collection and serves it as a
+    table (`docs/sql.md`); the Rust PG server resolves names through
+    `__sql_catalog__`, which only `CREATE TABLE` writes, so a pymongo-written
+    collection is invisible to it.
+
+    If this test starts failing, schema inference has landed on the Rust side --
+    that is an improvement, not a regression. Turn it into the positive
+    assertion, and update the cross-protocol bullet in CLAUDE.md's Project
+    section, which currently records this asymmetry.
+    """
+    pymongo = pytest.importorskip("pymongo")
+
+    with _mongo_server(home) as (host, port):
+        client = pymongo.MongoClient(f"mongodb://{host}:{port}", serverSelectionTimeoutMS=15_000)
+        try:
+            client["postgres"]["gadgets"].insert_many([{"_id": 1, "name": "cog"}])
+        finally:
+            client.close()
+
+    with (
+        _Server(home) as server,
+        server.connect() as conn,
+        pytest.raises(psycopg.errors.UndefinedTable),
+    ):
+        conn.cursor().execute("SELECT * FROM gadgets")

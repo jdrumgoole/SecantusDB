@@ -32,7 +32,7 @@ use pg_query::protobuf::{
     a_const, AExpr, AExprKind, BoolExprType, DropBehavior, NullTestType, ObjectType, SortByDir,
     SortByNulls, TransactionStmtKind, VariableSetKind,
 };
-use secantus_pgcatalog::{CheckConstraint, Column, ForeignKey, TableDef};
+use secantus_pgcatalog::{CheckConstraint, Column, ForeignKey, TableDef, UniqueConstraint};
 
 pub use numeric::{
     canonical_numeric_text, compare_decimal_text, is_numeric, is_wide_numeric, numeric_bson,
@@ -1984,6 +1984,14 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
     // column-level CHECK may read a column declared after it.
     let mut checks: Vec<(String, pg_query::protobuf::Node)> = Vec::new();
     let mut fks: Vec<ForeignKey> = Vec::new();
+    let mut uniques: Vec<UniqueConstraint> = Vec::new();
+    // DEFERRABLE / INITIALLY DEFERRED arrive as separate attribute constraints
+    // AFTER the constraint they qualify, so they have to be applied to whichever
+    // one was pushed last. Before UNIQUE existed here that was always the FK,
+    // and the attribute handlers below reached straight for `fks.last_mut()`;
+    // with two kinds in play that would silently attach `UNIQUE ... DEFERRABLE`
+    // to an unrelated foreign key earlier in the same table.
+    let mut last_deferrable: Option<DeferTarget> = None;
     let mut table_pk: Vec<String> = Vec::new();
     for el in &c.table_elts {
         match el.node.as_ref() {
@@ -2057,37 +2065,40 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                         }
                         Ok(CT::ConstrForeign) => {
                             fks.push(foreign_key_of(k, &table, vec![cd.colname.clone()])?);
+                            last_deferrable = Some(DeferTarget::ForeignKey);
                         }
                         // A column constraint's DEFERRABLE / INITIALLY
                         // DEFERRED arrive as separate attribute constraints
                         // after the constraint they qualify.
                         Ok(CT::ConstrAttrDeferrable) => {
-                            if let Some(fk) = fks.last_mut() {
-                                fk.deferrable = true;
-                            }
+                            apply_defer(&mut fks, &mut uniques, last_deferrable, true, None);
                         }
                         Ok(CT::ConstrAttrNotDeferrable) => {
-                            if let Some(fk) = fks.last_mut() {
-                                fk.deferrable = false;
-                                fk.initially_deferred = false;
-                            }
+                            apply_defer(
+                                &mut fks,
+                                &mut uniques,
+                                last_deferrable,
+                                false,
+                                Some(false),
+                            );
                         }
                         Ok(CT::ConstrAttrDeferred) => {
-                            if let Some(fk) = fks.last_mut() {
-                                fk.deferrable = true;
-                                fk.initially_deferred = true;
-                            }
+                            apply_defer(&mut fks, &mut uniques, last_deferrable, true, Some(true));
                         }
                         Ok(CT::ConstrAttrImmediate) => {
-                            if let Some(fk) = fks.last_mut() {
-                                fk.initially_deferred = false;
-                            }
+                            apply_defer_initial(&mut fks, &mut uniques, last_deferrable, false);
                         }
-                        // A column-level UNIQUE has never been enforced by
-                        // this server; keep accepting it (a recorded gap)
-                        // rather than start refusing tables that used to
-                        // create.
-                        Ok(CT::ConstrUnique) => {}
+                        Ok(CT::ConstrUnique) => {
+                            // PostgreSQL names an unnamed one
+                            // `<table>_<column>_key` (probed 14.13).
+                            let name = if k.conname.is_empty() {
+                                format!("{table}_{}_key", cd.colname)
+                            } else {
+                                k.conname.clone()
+                            };
+                            uniques.push(UniqueConstraint::new(&name, vec![cd.colname.clone()]));
+                            last_deferrable = Some(DeferTarget::Unique);
+                        }
                         _ => {
                             return Err(Error::Unsupported(format!(
                                 "constraint kind {} on column \"{}\"",
@@ -2108,6 +2119,20 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                 Ok(CT::ConstrForeign) => {
                     let cols = string_list(&k.fk_attrs);
                     fks.push(foreign_key_of(k, &table, cols)?);
+                }
+                Ok(CT::ConstrUnique) => {
+                    let cols = string_list(&k.keys);
+                    // `<table>_<col>_<col>_key` for a multi-column one
+                    // (probed 14.13: `UNIQUE (a,b)` -> `u3_a_b_key`).
+                    let name = if k.conname.is_empty() {
+                        format!("{table}_{}_key", cols.join("_"))
+                    } else {
+                        k.conname.clone()
+                    };
+                    let mut uq = UniqueConstraint::new(&name, cols);
+                    uq.deferrable = k.deferrable;
+                    uq.initially_deferred = k.initdeferred;
+                    uniques.push(uq);
                 }
                 Ok(CT::ConstrPrimary) => table_pk = string_list(&k.keys),
                 _ => return Err(Error::Unsupported(disc(el.node.as_ref().unwrap()))),
@@ -2175,7 +2200,86 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
     // PostgreSQL evaluates CHECK constraints in name order.
     def.check_constraints.sort_by(|a, b| a.name.cmp(&b.name));
     def.foreign_keys = fks;
+    // A UNIQUE over the PRIMARY KEY column is already enforced by the `_id`
+    // index, and backing it with a second storage index would report the
+    // wrong constraint name on a duplicate. PostgreSQL keeps both constraints
+    // but only one index; dropping ours is the same observable behaviour.
+    let pk_col = def.columns.iter().find(|c| c.pk).map(|c| c.name.clone());
+    uniques.retain(|u| match (&pk_col, u.columns.as_slice()) {
+        (Some(pk), [only]) => only != pk,
+        _ => true,
+    });
+    for uq in &uniques {
+        for col in &uq.columns {
+            if def.column(col).is_none() {
+                return Err(Error::UndefinedColumn(col.clone()));
+            }
+        }
+    }
+    def.unique_constraints = uniques;
     Ok(Statement::CreateTable(def, c.if_not_exists))
+}
+
+/// Which constraint a trailing DEFERRABLE / INITIALLY DEFERRED qualifies.
+///
+/// PostgreSQL emits these as separate attribute constraints following the one
+/// they modify, so the parser has to remember what it last pushed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DeferTarget {
+    ForeignKey,
+    Unique,
+}
+
+/// Apply a DEFERRABLE-family attribute to whichever constraint was pushed last.
+/// `initial` of `None` leaves `initially_deferred` alone (plain `DEFERRABLE`).
+fn apply_defer(
+    fks: &mut [ForeignKey],
+    uniques: &mut [UniqueConstraint],
+    target: Option<DeferTarget>,
+    deferrable: bool,
+    initial: Option<bool>,
+) {
+    match target {
+        Some(DeferTarget::ForeignKey) => {
+            if let Some(fk) = fks.last_mut() {
+                fk.deferrable = deferrable;
+                if let Some(v) = initial {
+                    fk.initially_deferred = v;
+                }
+            }
+        }
+        Some(DeferTarget::Unique) => {
+            if let Some(uq) = uniques.last_mut() {
+                uq.deferrable = deferrable;
+                if let Some(v) = initial {
+                    uq.initially_deferred = v;
+                }
+            }
+        }
+        None => {}
+    }
+}
+
+/// `INITIALLY IMMEDIATE`: only the initial-deferred flag moves.
+fn apply_defer_initial(
+    fks: &mut [ForeignKey],
+    uniques: &mut [UniqueConstraint],
+    target: Option<DeferTarget>,
+    initially_deferred: bool,
+) {
+    match target {
+        Some(DeferTarget::ForeignKey) => {
+            if let Some(fk) = fks.last_mut() {
+                fk.initially_deferred = initially_deferred;
+            }
+        }
+        Some(DeferTarget::Unique) => {
+            if let Some(uq) = uniques.last_mut() {
+                uq.initially_deferred = initially_deferred;
+            }
+        }
+        None => {}
+    }
 }
 
 /// The SQL text of a CHECK predicate, as `pg_get_constraintdef` renders it:

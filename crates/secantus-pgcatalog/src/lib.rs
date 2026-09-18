@@ -145,6 +145,66 @@ pub struct CheckConstraint {
     pub expression: String,
 }
 
+/// A declared UNIQUE constraint, in the Python server's on-disk shape
+/// (`src/secantus/sql/catalog.py`'s `UniqueConstraint`). Every key that side
+/// writes is round-tripped here, including the ones this server does not act
+/// on yet, so a table created by one server reads back intact in the other —
+/// dropping an unknown key would silently rewrite the other server's catalog.
+///
+/// `deferrable` constraints are judged at COMMIT rather than per write, so they
+/// are deliberately NOT backed by a storage index; `exclusion` marks an
+/// `EXCLUDE (col WITH =)`, which is unique enforcement reported as `23P01`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UniqueConstraint {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub deferrable: bool,
+    pub initially_deferred: bool,
+    pub comment: Option<String>,
+    pub exclusion: bool,
+}
+
+impl UniqueConstraint {
+    pub fn new(name: &str, columns: Vec<String>) -> Self {
+        Self {
+            name: name.to_string(),
+            columns,
+            deferrable: false,
+            initially_deferred: false,
+            comment: None,
+            exclusion: false,
+        }
+    }
+
+    pub fn to_document(&self) -> Document {
+        doc! {
+            "name": &self.name,
+            "columns": self.columns.iter().map(|c| Bson::String(c.clone()))
+                .collect::<Vec<_>>(),
+            "deferrable": self.deferrable,
+            "initially_deferred": self.initially_deferred,
+            "comment": self.comment.clone().map(Bson::String).unwrap_or(Bson::Null),
+            "exclusion": self.exclusion,
+        }
+    }
+
+    pub fn from_document(d: &Document) -> Option<Self> {
+        Some(Self {
+            name: d.get_str("name").ok()?.to_string(),
+            columns: d
+                .get_array("columns")
+                .ok()?
+                .iter()
+                .filter_map(|b| b.as_str().map(str::to_string))
+                .collect(),
+            deferrable: d.get_bool("deferrable").unwrap_or(false),
+            initially_deferred: d.get_bool("initially_deferred").unwrap_or(false),
+            comment: d.get_str("comment").ok().map(str::to_string),
+            exclusion: d.get_bool("exclusion").unwrap_or(false),
+        })
+    }
+}
+
 /// A declared FOREIGN KEY constraint, in the Python server's on-disk shape.
 /// `on_delete` / `on_update` are the referential action keywords as PostgreSQL
 /// spells them (`NO ACTION`, `RESTRICT`, `CASCADE`, `SET NULL`, `SET DEFAULT`);
@@ -224,6 +284,7 @@ pub struct TableDef {
     pub temp: bool,
     pub check_constraints: Vec<CheckConstraint>,
     pub foreign_keys: Vec<ForeignKey>,
+    pub unique_constraints: Vec<UniqueConstraint>,
 }
 
 impl TableDef {
@@ -234,6 +295,7 @@ impl TableDef {
             temp: false,
             check_constraints: Vec::new(),
             foreign_keys: Vec::new(),
+            unique_constraints: Vec::new(),
         }
     }
 
@@ -265,7 +327,9 @@ impl TableDef {
             "check_constraints": self.check_constraints.iter()
                 .map(|c| Bson::Document(c.to_document()))
                 .collect::<Vec<_>>(),
-            "unique_constraints": Vec::<Bson>::new(),
+            "unique_constraints": self.unique_constraints.iter()
+                .map(|u| Bson::Document(u.to_document()))
+                .collect::<Vec<_>>(),
             "expr_indexes": Vec::<Bson>::new(),
         }
     }
@@ -295,6 +359,15 @@ impl TableDef {
                     a.iter()
                         .filter_map(|b| b.as_document())
                         .filter_map(ForeignKey::from_document)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            unique_constraints: d
+                .get_array("unique_constraints")
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|b| b.as_document())
+                        .filter_map(UniqueConstraint::from_document)
                         .collect()
                 })
                 .unwrap_or_default(),

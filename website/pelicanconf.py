@@ -34,6 +34,12 @@ SECANTUS_GITHUB_URL: str = "https://github.com/jdrumgoole/SecantusDB"
 # the bare /releases listing leads with the source-only PyPI release.
 SECANTUS_RUST_BINARY_TAG: str = "secantusdb-v0.5.3-beta.160"
 SECANTUS_RUST_BINARY_URL: str = f"{SECANTUS_GITHUB_URL}/releases/tag/{SECANTUS_RUST_BINARY_TAG}"
+# The Rust PostgreSQL server's binary release tag, pinned for the same reason as
+# the MongoDB one above: these are GitHub PRE-releases, so they never become
+# "Latest" and the bare /releases listing leads with the source-only PyPI
+# release instead. Bump it when a new `secantusd-pg-v*` tag publishes assets.
+SECANTUS_PG_BINARY_TAG: str = "secantusd-pg-v0.1.0-beta.0"
+SECANTUS_PG_BINARY_URL: str = f"{SECANTUS_GITHUB_URL}/releases/tag/{SECANTUS_PG_BINARY_TAG}"
 SECANTUS_RUST_RELEASES_URL: str = f"{SECANTUS_GITHUB_URL}/releases?q=secantusdb-v&expanded=true"
 SECANTUS_TAGLINE: str = "THE SQLITE OF DOCUMENT DATABASES"
 
@@ -103,6 +109,8 @@ JINJA_GLOBALS = {
     "SECANTUS_DOCS_URL": SECANTUS_DOCS_URL,
     "SECANTUS_RUST_DOCS_URL": SECANTUS_RUST_DOCS_URL,
     "SECANTUS_RUST_BINARY_TAG": SECANTUS_RUST_BINARY_TAG,
+    "SECANTUS_PG_BINARY_TAG": SECANTUS_PG_BINARY_TAG,
+    "SECANTUS_PG_BINARY_URL": SECANTUS_PG_BINARY_URL,
     "SECANTUS_RUST_BINARY_URL": SECANTUS_RUST_BINARY_URL,
     "SECANTUS_RUST_RELEASES_URL": SECANTUS_RUST_RELEASES_URL,
     "SECANTUS_PYPI_URL": SECANTUS_PYPI_URL,

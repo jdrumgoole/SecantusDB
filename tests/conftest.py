@@ -19,6 +19,7 @@ import faulthandler
 import importlib.machinery
 import importlib.util
 import os
+import pathlib
 import sys
 import threading
 import time
@@ -196,6 +197,137 @@ def wt_home_module(_wt_template: str, tmp_path_factory: pytest.TempPathFactory) 
     return str(dest)
 
 
+#: The repository this checkout is, for asking git about it.
+_REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+_REBUILD_CORE_CMD = "uv run python -m invoke sync"
+
+#: Crates whose content the `_secantus_core` extension is built from. Both
+#: matter: the engines live in one, the PyO3 bindings in the other.
+_CORE_CRATES = ("crates/secantus-core", "crates/secantus-core-py")
+
+
+def _committed_source_tree() -> str:
+    """The checkout's tree hash for the core crates, or "" if git can't say.
+
+    HEAD, deliberately, not the working copy: someone mid-edit in
+    ``crates/secantus-core/src`` has an extension that legitimately differs
+    from their uncommitted changes, and failing their whole run for that
+    teaches people to disable the check — which is worse than not having one.
+    """
+    import subprocess
+
+    hashes = []
+    for path in _CORE_CRATES:
+        try:
+            out = subprocess.run(
+                ["git", "rev-parse", f"HEAD:{path}"],
+                cwd=_REPO_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        if out.returncode != 0:
+            return ""
+        hashes.append(out.stdout.strip())
+    return "-".join(hashes)
+
+
+def _check_core_build_provenance() -> None:
+    """Fail loudly when the installed `_secantus_core` predates the checkout.
+
+    **Why this exists.** On 2026-09-18, eight separate incidents in one day came
+    from a built artifact being older than the tree it was tested against. Every
+    one presented as somebody else's regression, because the *tests* were
+    current and only the artifact was old:
+
+    - a psycopg gauge reported 1,084 failures and a 73.8% pass rate from a
+      binary 50 crate-commits behind; the real figure was 5,545 of 5,546, and
+      the wrong one reached the public website;
+    - a full suite produced 174 parity failures that were all fictional — the
+      same files passed 207/207 after a rebuild, with no code change;
+    - three failures landed in a colleague's new test file, which read as their
+      bug and was a binary built 33 minutes before the fix those tests assert.
+
+    Reading the diff cannot catch this: the evidence is not in the diff. Only
+    comparing what you built against what you are testing can.
+
+    **Loud, not a warning.** A warning inside a 15,000-test run is invisible,
+    and the dangerous version of this failure is silent — a suite that passes
+    over a stale artifact tells you nothing is wrong.
+
+    Stays quiet when it cannot be sure: no extension (the ~1,700 parity tests
+    `importorskip` it by design, and whole CI lanes run without it), no stamp
+    (an sdist or a build container without git history), or no git.
+    """
+    try:
+        import _secantus_core  # type: ignore[import-not-found]
+    except ImportError:
+        return
+
+    message = stale_core_message(
+        getattr(_secantus_core, "__source_tree__", ""), _committed_source_tree()
+    )
+    if message is not None:
+        raise pytest.UsageError(message)
+
+
+def stale_core_message(built: str, current: str) -> str | None:
+    """The failure text when `built` and `current` disagree, else ``None``.
+
+    Split out from the check so its decisions are testable without arranging a
+    genuinely stale build (see ``tests/test_build_provenance.py``). Silence when
+    either side is unknown is the important half: an unstamped extension or a
+    checkout git cannot read must not fail anybody's run.
+    """
+    if not built or not current or built == current:
+        return None
+    return (
+        "the installed `_secantus_core` was built from different sources than "
+        f"this checkout:\n"
+        f"    extension: {built}\n"
+        f"    checkout:  {current}\n"
+        "Running against a stale extension produces failures that look like "
+        "real regressions and are not — on 2026-09-18 this cost 174 fictional "
+        "parity failures and a wrong conformance number published to the "
+        "website. Rebuild it:\n"
+        f"    {_REBUILD_CORE_CMD}\n"
+        "(`uv sync` alone will NOT do it: secantus-core is a path dependency "
+        "and uv reuses the cached build. Pull first — syncing a checkout that "
+        "is behind rebuilds the staleness and looks like it worked.)"
+    )
+
+
+def pytest_report_header() -> str | None:
+    """Say so when the staleness check is DORMANT.
+
+    An extension built before this check existed carries no stamp, so the check
+    abstains — correctly, since it cannot judge. But abstaining silently means
+    the check is installed, doing nothing, and nobody knows: exactly the "the
+    fix is applied and changes no output" failure this check was written to
+    stop, one level up. Anyone who never rebuilds keeps that state forever.
+
+    The header is the right place: a warning is invisible inside a
+    15,000-test run, while this prints at the top of every one. Only the
+    unknown case is reported — a matching build says nothing, and a mismatch
+    has already aborted the run in `pytest_configure`.
+    """
+    try:
+        import _secantus_core  # type: ignore[import-not-found]
+    except ImportError:
+        # No extension at all is a normal, deliberate configuration.
+        return None
+    if getattr(_secantus_core, "__source_tree__", ""):
+        return None
+    return (
+        "core build provenance: UNKNOWN — the installed `_secantus_core` "
+        "carries no source stamp, so staleness cannot be detected. Rebuild it "
+        f"({_REBUILD_CORE_CMD}) to arm the check."
+    )
+
+
 def pytest_configure(config: pytest.Config) -> None:
     """Refuse to run under a ``tmp_path_retention_policy`` that deletes tmp
     dirs mid-session.
@@ -218,6 +350,8 @@ def pytest_configure(config: pytest.Config) -> None:
     aggressive cleanup, run it in its own pytest invocation instead of
     flipping this policy globally.
     """
+    _check_core_build_provenance()
+
     if os.environ.get("SECANTUS_SIGTRACE") == "1":
         _install_sigtrace()
     # Start the session stall watcher (see the block below). Done here rather
