@@ -691,14 +691,25 @@ remain open:
   - `float4` / `float8` columns keep MQL's NaN placement (below every
     number) in WHERE; PG puts NaN above infinity for floats too. Only
     `numeric` was moved in this slice.
-- [ ] **OPEN — RUST pgserver: column-level `UNIQUE` is accepted and silently
-      not enforced, and there is no `pg_constraint` virtual table
-      (2026-09-09).** NOT NULL / CHECK / FOREIGN KEY landed (catalog + per-row
-      checks + a deferred-check list run at COMMIT; the same catalog document
-      shape the Python server writes). A `unique` column constraint still
-      plans as a plain column — a second equal value inserts where PG 16
-      answers `23505` — and `pg_constraint` queries answer `42P01`. Multi-
-      column FOREIGN KEYs and `ON DELETE SET DEFAULT` are refused `0A000`.
+- [ ] **OPEN — RUST pgserver: no `pg_constraint` virtual table, and multi-column
+      FOREIGN KEYs / `ON DELETE SET DEFAULT` are refused `0A000` (2026-09-09).**
+      NOT NULL / CHECK / FOREIGN KEY / UNIQUE all landed (catalog + enforcement;
+      the same catalog document shape the Python server writes). `pg_constraint`
+      queries still answer `42P01`.
+
+      **The column-level `UNIQUE` half of this entry was FIXED 2026-09-18.** It
+      had been accepted and silently not enforced — a second equal value
+      inserted where PostgreSQL answers `23505`, which is silent data
+      corruption rather than a missing feature. It is now backed by a storage
+      unique index carrying a partial filter that excludes NULL from every
+      column (SQL NULLs are distinct; `sparse` would NOT do it, because a SQL
+      NULL is stored as an explicit null rather than a missing field). Error
+      surface probed against **PostgreSQL 14.13**, not the PG 16 this entry
+      used to cite — 16 is not installed on this box. Two adjacent bugs went
+      with it: `DEFERRABLE` attached to the most recent FOREIGN KEY whatever it
+      actually qualified, and the UPDATE path never reached the PostgreSQL
+      error renderer at all, so any unique violation there (the PRIMARY KEY one
+      included) leaked `E11000` with no SQLSTATE.
 - [ ] **OPEN — RUST pgserver: a write that conflicts with a prepared
       transaction is not a lock wait (2026-09-17).** Two-phase commit landed
       (`PREPARE TRANSACTION` / `COMMIT PREPARED` / `ROLLBACK PREPARED` /
