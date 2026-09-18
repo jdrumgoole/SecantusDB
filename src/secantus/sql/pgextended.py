@@ -565,7 +565,9 @@ def _encode_range(value: Any, range_oid: int) -> bytes:
         flags |= _RANGE_LB_INC
     if value.get("upper_inc"):
         flags |= _RANGE_UB_INC
-    lo, hi = value.get("lower"), value.get("upper")
+    from secantus.sql import ranges as _ranges
+
+    lo, hi = _ranges.lower_bound(value), _ranges.upper_bound(value)
     if lo is None:
         flags |= _RANGE_LB_INF
     if hi is None:
@@ -1051,7 +1053,9 @@ def _encode_range_generic(rng: dict, encoding: str | None = "utf-8") -> bytes:
     if rng.get("empty"):
         return bytes([_RANGE_EMPTY])
     flags = 0
-    lo, hi = rng.get("lower"), rng.get("upper")
+    from secantus.sql import ranges as _ranges
+
+    lo, hi = _ranges.lower_bound(rng), _ranges.upper_bound(rng)
     if rng.get("lower_inc"):
         flags |= _RANGE_LB_INC
     if rng.get("upper_inc"):
@@ -1428,7 +1432,7 @@ class ExtendedSession:
             return bytes(out) + pgwire.ready_for_query(self.session.txn_status())
         if self.skip_until_sync:
             return b""  # discard everything until the next Sync
-        if msg_type == "H":  # Flush — we send eagerly, nothing to flush
+        if msg_type == "H":  # Flush — no reply; the caller flushes its buffer
             return b""
         if (
             msg_type in ("P", "B", "D", "E")

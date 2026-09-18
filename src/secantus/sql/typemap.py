@@ -806,7 +806,9 @@ def _range_key(value: Mapping) -> tuple:
     14.13: `empty < (,3) < [0,3) < [1,5) < [1,9) < [1,) < [2,4)`."""
     if value.get("empty"):
         return (0,)
-    lower, upper = value.get("lower"), value.get("upper")
+    from secantus.sql import ranges as _ranges
+
+    lower, upper = _ranges.lower_bound(value), _ranges.upper_bound(value)
     return (
         1,
         (0,) if lower is None else (1, _jsonb_key(lower)),
@@ -1386,21 +1388,25 @@ def coerce(value: Any, tag: str) -> Any:
         return value
     if tag in _RANGE_TAGS:
         # Already-built subdocument (from a range constructor) passes through; a
-        # text literal (``'[1,10)'``) is parsed to the subdocument form.
-        if isinstance(value, dict):
-            return value
+        # text literal (``'[1,10)'``) is parsed to the subdocument form. Either
+        # way it is `pack`ed: a timestamp bound's sub-millisecond remainder rides
+        # inside the subdocument, because BSON dates hold whole milliseconds.
         from secantus.sql import ranges as _ranges
 
+        if isinstance(value, dict):
+            return _ranges.pack(value)
         elem, _discrete = _ranges.RANGE_TYPES[tag]
-        return _ranges.parse_literal(str(value), tag, lambda tok: coerce(tok, elem))
+        return _ranges.pack(_ranges.parse_literal(str(value), tag, lambda tok: coerce(tok, elem)))
     if tag in _MULTIRANGE_TAGS:
-        if isinstance(value, dict):
-            return value
         from secantus.sql import ranges as _ranges
 
+        if isinstance(value, dict):
+            return _ranges.pack_multirange(value)
         range_tag = _ranges.MULTIRANGE_TYPES[tag]
         elem, _discrete = _ranges.RANGE_TYPES[range_tag]
-        return _ranges.parse_multirange(str(value), tag, lambda tok: coerce(tok, elem))
+        return _ranges.pack_multirange(
+            _ranges.parse_multirange(str(value), tag, lambda tok: coerce(tok, elem))
+        )
     if tag in _FTS_TAGS:
         if isinstance(value, dict):
             return value

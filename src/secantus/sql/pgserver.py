@@ -169,6 +169,11 @@ def _tune_client_socket(conn: socket.socket) -> None:
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
 
+#: PostgreSQL's backend send-buffer size (PqSendBuffer): it flushes early once
+#: this much output is pending, and otherwise waits for Sync / Flush.
+_PG_SEND_BUFFER = 8192
+
+
 class SecantusPGServer:
     def __init__(
         self,
@@ -631,6 +636,21 @@ class SecantusPGServer:
     def _query_loop(self, conn: socket.socket, session: Session) -> None:
         # Per-connection extended-protocol state (prepared statements + portals).
         ext = ExtendedSession(self.storage, session)
+        # Extended-protocol replies are BUFFERED until Sync or Flush, as
+        # PostgreSQL buffers them (its backend flushes only at ReadyForQuery,
+        # on Flush, or when its 8 KB send buffer fills). Sending each reply
+        # as it was produced split a client's pipeline into extra round trips
+        # -- psycopg's test_executemany_trace saw `F B F B` for one Sync, and
+        # only when the server's early ParseComplete happened to race the
+        # client's remaining writes. Anything this loop sends directly must
+        # `flush()` first, or the buffered replies would arrive out of order.
+        pending = bytearray()
+
+        def flush() -> None:
+            if pending:
+                conn.sendall(bytes(pending))
+                pending.clear()
+
         while not self._stop_event.is_set():
             # idle_in_transaction_session_timeout: while a transaction is open,
             # bound the wait for the next command; exceeding it aborts the
@@ -649,6 +669,8 @@ class SecantusPGServer:
             try:
                 msg = self._read_next_message(conn, session, txn_deadline)
             except TimeoutError:
+                with contextlib.suppress(OSError):
+                    flush()
                 if session.txn_handle is not None:
                     with contextlib.suppress(Exception):
                         self.storage.abort_user_transaction(session.txn_handle)
@@ -691,6 +713,8 @@ class SecantusPGServer:
                 # "the SELECT 1 queries should be ignored and should not
                 # return ReadyForQuery").
                 continue
+            if msg.type in ("F", "Q"):
+                flush()
             if msg.type == "F":  # Fastpath FunctionCall (pgjdbc large objects)
                 conn.sendall(self._handle_fastpath(session, msg.payload))
                 continue
@@ -731,9 +755,17 @@ class SecantusPGServer:
             # (Parse/Bind/Describe/Execute/Close/Sync/Flush). Async LISTEN/NOTIFY
             # deliveries ride out ahead of the reply (message boundaries).
             reply = ext.process(msg.type, msg.payload)
-            notifications = self._pending_notification_bytes(session)
-            if notifications or reply:
-                conn.sendall(notifications + (reply or b""))
+            pending += self._pending_notification_bytes(session) + (reply or b"")
+            # Flush at Sync (its ReadyForQuery ends the batch) and Flush, on an
+            # error (kept eager: the client stops reading its pipeline at the
+            # first ErrorResponse either way), and past PG's 8 KB send buffer
+            # so a large result is not held whole in memory.
+            if (
+                msg.type in ("S", "H")
+                or (reply or b"")[:1] == b"E"
+                or len(pending) >= _PG_SEND_BUFFER
+            ):
+                flush()
 
     def _authorize_lo_write(self, session: Session) -> None:
         """Gate a mutating Fastpath large-object call with the same RBAC +

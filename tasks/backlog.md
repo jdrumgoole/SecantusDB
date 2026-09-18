@@ -9863,6 +9863,30 @@ slice). The remaining ~22 failures fall into these buckets, which are the
 honest edge of what the Postgres front-end can reach WITHOUT changing the
 shared storage engine or building large new protocol subsystems:
 
+- [x] **RANGE BOUNDS FIXED 2026-09-18 — the "resolved" note below measured
+  SCALARS only.** The original entry named "(and ts/tstz ranges)", but the
+  re-measurement that closed it tried `timestamp` / `timestamptz` columns and
+  never a range, and range bounds were still cut to the millisecond: a range is
+  a subdocument, its bounds are BSON dates, and the top-level `__us_`
+  companion never reached them. Found by the 2026-09-18 validate run
+  (psycopg `test_random[1-b]`, `test_copy_*`), whose random draws flap on
+  whether the microseconds land on a whole millisecond. Fixed by carrying each
+  bound's remainder INSIDE the range subdocument (`ranges.pack` on write,
+  `ranges._bound` on every read), with two pre-existing range bugs found
+  alongside: `stored && tsrange(…)` was an XX000 (naive vs aware bound), and
+  `WHERE r = '<literal>'` compared BSON subdocuments and so missed equal rows
+  (now per-row, via `ranges.canonical`). `tests/test_pg_range_subms.py`,
+  including a real-PostgreSQL comparison in the `pg-oracle` lane. The Rust
+  pgserver stores ranges as text and was never affected.
+- [ ] **`lower()` / `upper()` of a `tsrange` are typed `timestamptz`**
+  (measured 2026-09-18; Postgres: `timestamp`). `RANGE_TYPES["tsrange"]`
+  declares its element `timestamptz`, so the bound carries a zone and its
+  `::text` grows `+00`. Python pgserver; not probed on the Rust one.
+- [ ] **A failing `Parse` is accepted and the error deferred to `Execute`**
+  (measured 2026-09-18). `Parse` of `this is not sql`, or of a query naming a
+  missing table, answers `ParseComplete`; Postgres answers `42601` / `42P01`
+  at Parse. A client that Parses once and Executes later sees the error on the
+  wrong message. Python pgserver.
 - [x] **RESOLVED — STALE (re-measured 2026-09-01). Sub-millisecond timestamps
   round-trip exactly.** The entry below says `timestamp`/`timestamptz`
   "truncate to milliseconds"; that stopped being true when the `__us_`
@@ -9905,7 +9929,15 @@ shared storage engine or building large new protocol subsystems:
   comparison and sort paths also use. **The RUST pgserver did exactly that on
   2026-09-09** (`secantus-pgplan/src/numeric.rs`: `__numeric` text +
   `__numkey` sort key, used by WHERE lowering, ORDER BY, arithmetic and the
-  `_id` index) — the ceiling below is now the PYTHON server's only. Original
+  `_id` index) — the ceiling below is now the PYTHON server's only.
+
+  **`numrange` bounds inherit it, in the EXPRESSION path too** (measured
+  2026-09-18): a bound is coerced to Decimal128 when the range is built, so
+  `select %s::numrange` rounds a 36-digit bound even though `select %s::numeric`
+  does not. That is the same deliberate one-representation choice
+  (`typemap.number_literal`: literals are Decimal128 too), so it was left
+  alone; it is what psycopg's `test_random[0-t]` hits on a wide draw. Porting
+  the Rust server's text + sort-key representation would close both. Original
   entry:
 
 - **`numeric` beyond 34 significant digits.** Stored as Decimal128, which

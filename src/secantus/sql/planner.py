@@ -2669,6 +2669,12 @@ def _set_doc_field(doc: dict[str, Any], field: str, value: Any, tag: str | None 
     resolved on EVERY write, never left stale."""
     if tag in subms.SUBMS_TAGS and "." not in field:
         value = subms.carry_subms(doc, field, value)
+    elif tag is not None and ranges.is_range_tag(tag):
+        # The range twin of the companion: a timestamp BOUND's remainder rides
+        # inside the range subdocument itself (`ranges.pack`, idempotent).
+        value = ranges.pack(value)
+    elif tag is not None and ranges.is_multirange_tag(tag):
+        value = ranges.pack_multirange(value)
     if "." in field:
         set_path(doc, field, value)
     else:
@@ -4131,8 +4137,17 @@ _RANGE_LIKE_TAGS = typemap._RANGE_TAGS | typemap._MULTIRANGE_TAGS
 def _where_has_range_predicate(node: exp.Expression, table: TableDef) -> bool:
     """True if ``node`` contains an ``@>`` / ``<@`` / ``&&`` whose operand is a
     range- / multirange-typed column or constructor — those need per-row
-    evaluation (COLLSCAN + residual), not a jsonb-containment pushdown."""
-    for op in node.find_all(exp.ArrayContainsAll, exp.ArrayContainedBy, exp.ArrayOverlaps):
+    evaluation (COLLSCAN + residual), not a jsonb-containment pushdown.
+
+    ``=`` / ``<>`` too. Pushed down, a range equality is a whole-subdocument
+    BSON match, which compares REPRESENTATIONS: key order, a naive-vs-aware
+    bound, and a timestamp bound's sub-millisecond remainder all made equal
+    ranges miss (``WHERE r = '[…123456,…)'`` matched nothing, even against a
+    row holding exactly that value). Per row, `ranges.canonical` compares the
+    bound VALUES, which is what Postgres compares."""
+    for op in node.find_all(
+        exp.ArrayContainsAll, exp.ArrayContainedBy, exp.ArrayOverlaps, exp.EQ, exp.NEQ
+    ):
         for operand in (op.this, op.expression):
             if isinstance(operand, exp.Column):
                 col = table.column(_column_name(operand))
