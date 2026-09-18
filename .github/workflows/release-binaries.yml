@@ -101,6 +101,17 @@ jobs:
           # build (and thus the static lib) can't be produced.
           submodules: recursive
           ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: Move the host time zone off UTC
+        # Every hosted runner is UTC, which hides any code that wrongly uses
+        # the host's local time. See .github/actions/non-utc-host for why
+        # Newfoundland, and why the host zone rather than TZ.
+        #
+        # Guarded because this workflow can be dispatched to REBUILD an
+        # existing tag, and it checks out that tag: one cut before the action
+        # existed has no ./.github/actions/non-utc-host, and a missing local
+        # action fails the job.
+        if: hashFiles('.github/actions/non-utc-host/action.yml') != ''
+        uses: ./.github/actions/non-utc-host
 
       - name: Resolve tag + assert it matches the crate version
         shell: bash

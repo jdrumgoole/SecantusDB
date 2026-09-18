@@ -102,13 +102,13 @@ jobs:
         driver: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          submodules: recursive   # vendor/wiredtiger + the per-driver vendored submodule
       - name: Move the host time zone off UTC
         # Every hosted runner is UTC, which hides any code that wrongly uses
         # the host's local time. See .github/actions/non-utc-host for why
         # Newfoundland, and why the host zone rather than TZ.
         uses: ./.github/actions/non-utc-host
-        with:
-          submodules: recursive   # vendor/wiredtiger + the per-driver vendored submodule
 
       - name: Install swig
         uses: ./.github/actions/apt-install

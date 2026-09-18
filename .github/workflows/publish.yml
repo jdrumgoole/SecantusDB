@@ -74,6 +74,11 @@ jobs:
       # which is the bulk of the runner's wall-clock. wheels.yml shares
       # the same key so main-branch CI runs warm the cache for the
       # next tag-triggered publish run.
+      - name: Move the host time zone off UTC
+        # Every hosted runner is UTC, which hides any code that wrongly uses
+        # the host's local time. See .github/actions/non-utc-host for why
+        # Newfoundland, and why the host zone rather than TZ.
+        uses: ./.github/actions/non-utc-host
       - name: Compute WT submodule SHA
         id: wt-sha
         shell: bash
@@ -111,6 +116,12 @@ jobs:
               printf '#!/bin/sh\nexec "$@"\n' > /usr/bin/ccache
               chmod +x /usr/bin/ccache
             fi
+          # The wheel smoke tests run INSIDE the manylinux / musllinux
+          # container, which does not inherit the runner's /etc/localtime --
+          # so the host step above leaves them on UTC. Move the container's
+          # zone too (kept in sync with wheels.yml, which proves it on every
+          # push to main -- this file only runs at tag time).
+          CIBW_BEFORE_TEST_LINUX: sh {project}/.github/actions/non-utc-host/set-zone.sh
           CIBW_CONTAINER_ENGINE: 'docker; create_args: -v /home/runner/.cache/ccache:/host_ccache'
           # SECANTUS_BUILD_STORAGE_ENGINE=ON bundles the Rust extensions +
           # secantusd-rs into the published wheel (kept in sync with
