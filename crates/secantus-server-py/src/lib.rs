@@ -330,6 +330,9 @@ impl PgServer {
         slf
     }
 
+    // No explicit `__del__` / `Drop`: dropping the handle drops the
+    // `RunningPgServer`, whose own `Drop` runs the same shutdown (and the
+    // close-checkpoint). Same arrangement as `RustServer`.
     fn __exit__(
         &mut self,
         py: Python<'_>,
@@ -339,18 +342,6 @@ impl PgServer {
     ) -> bool {
         self.stop(py);
         false // don't suppress exceptions
-    }
-}
-
-#[cfg(feature = "pgserver")]
-impl Drop for PgServer {
-    fn drop(&mut self) {
-        // Not `stop(py)`: `Drop` has no GIL token, and `RunningPgServer::drop`
-        // would run the same shutdown anyway. Taking it here keeps the
-        // "stop exactly once" invariant explicit.
-        if let Some(mut running) = self.running.take() {
-            running.stop();
-        }
     }
 }
 
