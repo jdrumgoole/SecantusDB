@@ -171,6 +171,19 @@ def test_stored_range_against_a_constructed_one(conn) -> None:
     assert inter == Range(dt.datetime(2020, 1, 2), dt.datetime(2020, 1, 3), "[)")
 
 
+def test_a_constructed_tsrange_renders_without_a_zone(conn) -> None:
+    """A tsrange is timestamp WITHOUT time zone. The intersection keeps the
+    constructed operand's bounds, which rendered `+00:00` (the pg-oracle
+    comparison below caught it; Postgres renders no offset)."""
+    conn.execute("insert into t (id, r) values (1, '[2020-01-01,2020-01-05)')")
+    text, built = conn.execute(
+        "select (r * tsrange('2020-01-02', '2020-01-03'))::text,"
+        " tsrange('2020-01-02', '2020-01-03')::text from t"
+    ).fetchone()
+    assert text == '["2020-01-02 00:00:00","2020-01-03 00:00:00")'
+    assert built == '["2020-01-02 00:00:00","2020-01-03 00:00:00")'
+
+
 # The same statements against the Python server and a real PostgreSQL.
 # `import pg_oracle` above is what puts this file in CI's `pg-oracle` lane.
 _ORACLE_SCRIPT = [

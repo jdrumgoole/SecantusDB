@@ -75,6 +75,13 @@ def make_range(
         lower = _typemap.coerce(lower, _elem)
     if upper is not None:
         upper = _typemap.coerce(upper, _elem)
+    if tag == "tsrange":
+        # A tsrange holds timestamp WITHOUT time zone. Its element coerces
+        # through timestamptz (aware, UTC), so a constructed bound was aware
+        # while a stored one decodes naive -- and an intersection that kept a
+        # constructed bound rendered `2020-01-02 00:00:00+00:00` where Postgres
+        # renders `2020-01-02 00:00:00` (caught by the pg-oracle comparison).
+        lower, upper = _naive_utc(lower), _naive_utc(upper)
     if discrete:
         # Canonicalise to [): a lower exclusive bound steps up; an upper inclusive
         # bound steps up (so [1,10] -> [1,11), (1,10] -> [2,11)).
@@ -93,6 +100,13 @@ def make_range(
     ):
         return {"empty": True}
     return {"lower": lower, "upper": upper, "lower_inc": lower_inc, "upper_inc": upper_inc}
+
+
+def _naive_utc(v: Any) -> Any:
+    """An aware datetime as naive UTC (a tsrange bound's form); else unchanged."""
+    if isinstance(v, _dt.datetime) and v.tzinfo is not None:
+        return v.astimezone(_dt.timezone.utc).replace(tzinfo=None)
+    return v
 
 
 def is_empty(rng: Any) -> bool:
