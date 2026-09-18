@@ -5363,7 +5363,10 @@ def _convert_value(value: Any, target: Any) -> Any:
         if is_bson_string(value):
             return _parse_float_string(value)
         if isinstance(value, _dt.datetime):
-            return value.timestamp() * 1000.0
+            # A BSON date decodes NAIVE, and a naive `.timestamp()` reads it
+            # as the host's LOCAL time -- so this was off by the host's UTC
+            # offset on any non-UTC server. Pin UTC, as `$toLong` below does.
+            return float(int(value.replace(tzinfo=_dt.timezone.utc).timestamp() * 1000))
     elif code == 2:
         # ``str()`` is Python's rendering, not BSON's: it prints ``True`` for a
         # bool and ``inf`` / ``nan`` for the non-finite doubles, and it happily
