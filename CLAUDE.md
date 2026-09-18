@@ -32,11 +32,22 @@ claims and it is easy to cite one as evidence for the other:
   it wrong is silent corruption rather than an error).
 - **Cross-PROTOCOL, Python pair — proven.** A `pymongo`-written collection is
   queryable as a table, `JOIN`s and all, with no `CREATE TABLE` (`docs/sql.md`).
-- **Cross-PROTOCOL, RUST pair — NOT established.** `secantusd-rs` and
-  `secantusd-pg` sit on the same `secantus-storage`, so it ought to follow, but
-  no test or probe demonstrates a MongoDB client reading a table the Rust PG
-  server wrote. **Do not state it as fact** — probe it first, and if it holds,
-  pin it with a test and delete this bullet.
+- **Cross-PROTOCOL, Rust pair — proven in ONE direction, and never
+  concurrently** (measured 2026-09-18, pinned by three tests in
+  `tests/test_rust_pgserver_slice.py`):
+  - SQL → MongoDB **works**: a table written by `secantusd-pg` reads back
+    through `secantusd-rs` as a collection in the database the SQL session used,
+    with the `PRIMARY KEY` as `_id`.
+  - MongoDB → SQL **does not**: the Rust PG server resolves names through
+    `__sql_catalog__`, which only `CREATE TABLE` writes, so a `pymongo`-written
+    collection is `relation "..." does not exist`. The PYTHON SQL layer samples
+    an uncatalogued collection and serves it; the Rust one does not. Do not
+    carry the Python behaviour across in your head — that is how this bullet
+    got written wrong the first time.
+  - **Not at the same time.** WiredTiger takes an exclusive file lock, so the
+    second server exits rather than opening the store. "Point both at one
+    directory" is a HAND-OFF, never concurrent serving — do not write it on a
+    page as though both can serve at once.
 
 The import package is `secantus`; the public Python class is `SecantusDBServer`.
 

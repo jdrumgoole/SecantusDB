@@ -264,6 +264,20 @@ C: list[ExpectedFailure] = [
 ]
 
 
+PSYCOPG: list[ExpectedFailure] = [
+    ExpectedFailure(
+        pattern="test_typing.py::test_generic_connect",
+        rationale=(
+            "psycopg's own static-typing check: it runs mypy over a source "
+            "STRING and compares `reveal_type` output, opening no connection "
+            "and executing no database code (vendor/psycopg/tests/"
+            "test_typing.py:386). Its outcome depends on the installed mypy "
+            "and psycopg's type stubs; no server behaviour can change it."
+        ),
+    ),
+]
+
+
 def find_match(failures: list[ExpectedFailure], description: str) -> ExpectedFailure | None:
     """Return the first expected-failure entry whose pattern is a substring
     of ``description``. Returns ``None`` if no entry matches.
