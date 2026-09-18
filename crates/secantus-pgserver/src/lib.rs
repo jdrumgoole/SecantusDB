@@ -3897,6 +3897,63 @@ impl PgHandler {
         out
     }
 
+    /// Back each UNIQUE constraint with a storage unique index.
+    ///
+    /// A probe-read-before-write cannot uphold a constraint: it cannot see a
+    /// value another transaction committed after the writer's snapshot, nor one
+    /// a second writer is inserting right now. Making WiredTiger the arbiter is
+    /// how the Python server does it (`src/secantus/sql/executor.py`'s
+    /// `_create_unique_index`), and matching it keeps one behaviour across both.
+    ///
+    /// **NULLs are distinct in SQL** — any number of them satisfy a UNIQUE
+    /// constraint, and a multi-column one is unconstrained if ANY column is
+    /// NULL — whereas a Mongo unique index collides them. A partial filter
+    /// excluding NULL from every column reproduces the SQL rule. `sparse` would
+    /// NOT: a SQL NULL is stored as an explicit null, not a missing field, so a
+    /// sparse index still indexes it and still collides.
+    ///
+    /// The index takes the CONSTRAINT's name, which is also what PostgreSQL
+    /// calls the index it builds for one, so reflection reports a single object
+    /// rather than the constraint plus a differently-named implementation
+    /// detail — and a duplicate can name the constraint the user declared.
+    fn create_unique_indexes(
+        storage: &Arc<Storage>,
+        db: &str,
+        def: &TableDef,
+    ) -> Result<(), PgWireError> {
+        for uq in &def.unique_constraints {
+            if uq.deferrable {
+                // A DEFERRABLE constraint may be violated transiently inside a
+                // transaction and is judged at COMMIT — swapping two values is
+                // the classic case. An index enforcing on every write would
+                // reject the intermediate state.
+                continue;
+            }
+            let fields: Vec<String> = uq.columns.iter().filter_map(|c| def.field_of(c)).collect();
+            if fields.len() != uq.columns.len() {
+                continue;
+            }
+            let mut key_spec = Document::new();
+            for f in &fields {
+                key_spec.insert(f.clone(), 1_i32);
+            }
+            let clauses: Vec<Bson> = fields
+                .iter()
+                .map(|f| Bson::Document(bson::doc! { f.clone(): { "$ne": Bson::Null } }))
+                .collect();
+            let partial = if clauses.len() == 1 {
+                clauses[0].as_document().cloned().unwrap_or_default()
+            } else {
+                bson::doc! { "$and": clauses }
+            };
+            let options = bson::doc! { "unique": true, "partialFilterExpression": partial };
+            storage
+                .create_index(db, &def.name, &uq.name, &key_spec, &options)
+                .map_err(|e| Self::storage_err("could not create the unique index", e))?;
+        }
+        Ok(())
+    }
+
     /// A storage write error, rendered as PostgreSQL renders it.
     ///
     /// The storage layer speaks MongoDB: a duplicate `_id` comes back as
@@ -3912,49 +3969,93 @@ impl PgHandler {
     fn write_error(table: &str, def: &TableDef, err: &Document) -> PgWireError {
         let msg = err.get_str("errmsg").unwrap_or_default();
         if err.get_i32("code").unwrap_or(0) == 11000 || msg.starts_with("E11000") {
-            let pk = def.columns.iter().find(|c| c.pk);
-            let detail = pk.map(|c| {
-                // `keyValue` carries the offending value under the STORED field.
-                let v = err
-                    .get_document("keyValue")
-                    .ok()
-                    .and_then(|kv| kv.get(c.field()).cloned());
-                match v {
-                    Some(Bson::String(s)) => format!("Key ({})=({}) already exists.", c.name, s),
-                    Some(ref b) if secantus_pgplan::is_numeric(b) => format!(
-                        "Key ({})=({}) already exists.",
-                        c.name,
-                        secantus_pgplan::numeric_text(b).unwrap_or_default()
-                    ),
-                    Some(b) => format!(
-                        "Key ({})=({}) already exists.",
-                        c.name,
-                        b.to_string().trim_matches('"')
-                    ),
-                    None => format!("Key ({}) already exists.", c.name),
-                }
-            });
-            let mut info = ErrorInfo::new(
-                "ERROR".into(),
-                "23505".into(),
-                format!("duplicate key value violates unique constraint \"{table}_pkey\""),
-            );
-            info.detail = detail;
-            // pgwire 0.39 added the protocol's schema/table/column/constraint
-            // fields (they were absent in 0.31, which is why this used to be a
-            // recorded limitation). Real PostgreSQL sends them on a 23505, and
-            // pgjdbc surfaces them as
-            // `PSQLException.getServerErrorMessage().getConstraint()`.
-            info.table = Some(table.to_string());
-            info.schema = Some("public".to_string());
-            info.constraint = Some(format!("{table}_pkey"));
-            // `column` stays UNSET: PostgreSQL identifies the offending column
-            // through the constraint on a 23505, not through this field
-            // (probed 14 -- it sends None). Populating it looked more helpful
-            // and was simply wrong.
-            return PgWireError::UserError(Box::new(info));
+            let empty = Document::new();
+            let key_pattern = err.get_document("keyPattern").unwrap_or(&empty);
+            let key_value = err.get_document("keyValue").unwrap_or(&empty);
+            return Self::unique_violation(table, def, key_pattern, key_value);
         }
         Self::storage_err("could not insert", msg)
+    }
+
+    /// PostgreSQL's 23505 for a violation of ANY unique constraint.
+    ///
+    /// Which constraint is decided by the index's key fields rather than by
+    /// parsing the storage layer's message: `keyPattern`'s keys are the STORED
+    /// fields, which map back to columns, and a UNIQUE constraint's backing
+    /// index is named after the constraint. The PK is the `_id` case.
+    ///
+    /// Probed against PostgreSQL 14.13:
+    ///
+    /// ```text
+    /// ERROR:  duplicate key value violates unique constraint "u1_tag_key"
+    /// DETAIL:  Key (tag)=(dup) already exists.
+    /// ```
+    ///
+    /// and for a multi-column one, `Key (a, b)=(1, 2) already exists.`
+    fn unique_violation(
+        table: &str,
+        def: &TableDef,
+        key_pattern: &Document,
+        key_value: &Document,
+    ) -> PgWireError {
+        // Stored field -> column name.
+        let columns: Vec<String> = key_pattern
+            .keys()
+            .map(|f| {
+                def.columns
+                    .iter()
+                    .find(|c| &c.field() == f)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| f.clone())
+            })
+            .collect();
+        // The constraint whose columns these are; the `_id` index is the PK.
+        let is_pk = key_pattern.keys().any(|f| f == "_id");
+        let name = if is_pk {
+            format!("{table}_pkey")
+        } else {
+            def.unique_constraints
+                .iter()
+                .find(|u| u.columns == columns)
+                .map(|u| u.name.clone())
+                .unwrap_or_else(|| format!("{table}_{}_key", columns.join("_")))
+        };
+        let values: Vec<String> = key_pattern
+            .keys()
+            .map(|f| match key_value.get(f) {
+                Some(Bson::String(v)) => v.clone(),
+                Some(b) if secantus_pgplan::is_numeric(b) => {
+                    secantus_pgplan::numeric_text(b).unwrap_or_default()
+                }
+                Some(Bson::Null) | None => "null".to_string(),
+                Some(b) => b.to_string().trim_matches('"').to_string(),
+            })
+            .collect();
+        let mut info = ErrorInfo::new(
+            "ERROR".into(),
+            "23505".into(),
+            format!("duplicate key value violates unique constraint \"{name}\""),
+        );
+        if !columns.is_empty() {
+            info.detail = Some(format!(
+                "Key ({})=({}) already exists.",
+                columns.join(", "),
+                values.join(", ")
+            ));
+        }
+        // pgwire 0.39 added the protocol's schema/table/column/constraint
+        // fields (they were absent in 0.31, which is why this used to be a
+        // recorded limitation). Real PostgreSQL sends them on a 23505, and
+        // pgjdbc surfaces them as
+        // `PSQLException.getServerErrorMessage().getConstraint()`.
+        info.table = Some(table.to_string());
+        info.schema = Some("public".to_string());
+        info.constraint = Some(name);
+        // `column` stays UNSET: PostgreSQL identifies the offending column
+        // through the constraint on a 23505, not through this field
+        // (probed 14 -- it sends None). Populating it looked more helpful
+        // and was simply wrong.
+        PgWireError::UserError(Box::new(info))
     }
 
     /// The first row whose numeric PRIMARY KEY is wider than Decimal128 and
@@ -7555,6 +7656,7 @@ impl PgHandler {
                 self.storage
                     .create_collection(self.db(), &def.name)
                     .map_err(|e| Self::storage_err("could not create the table", e))?;
+                Self::create_unique_indexes(&self.storage, self.db(), &def)?;
                 let bytes = bson::to_vec(&def.to_document())
                     .map_err(|e| Self::storage_err("could not encode the catalog entry", e))?;
                 self.storage
@@ -9766,7 +9868,19 @@ impl PgHandler {
                 None,
                 false,
             )
-            .map_err(|e| Self::storage_err("could not update", e))?;
+            .map_err(|e| match &e {
+                // An UPDATE that collides with a unique constraint is the same
+                // 23505 an INSERT gets. Before this it fell through to the
+                // generic wrapper and reached the client as `could not update:
+                // E11000 duplicate key error on index ...` -- the MongoDB
+                // persona leaking through the PostgreSQL one, with no SQLSTATE
+                // a client could branch on.
+                secantus_storage::StorageError::DuplicateKey(c) => match self.lookup(table) {
+                    Some(def) => Self::unique_violation(table, &def, &c.key_pattern, &c.key_value),
+                    None => Self::storage_err("could not update", e),
+                },
+                _ => Self::storage_err("could not update", e),
+            })?;
         Ok(outcome.matched)
     }
 }
