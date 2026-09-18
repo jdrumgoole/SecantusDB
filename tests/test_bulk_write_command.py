@@ -380,3 +380,70 @@ def test_insert_document_must_be_an_object(client: MongoClient) -> None:
         err.details["errmsg"]
         == "BSON field 'bulkWrite.ops.document' is the wrong type 'int', expected type 'object'"
     )
+
+
+def test_the_reply_cursor_id_is_an_int64_not_an_int32(client: MongoClient) -> None:
+    """A cursor id is an int64 on the wire, and its TYPE is the whole test.
+
+    `id` was a bare Python `0`, which BSON encodes as a 32-bit integer. Nothing
+    in a value comparison can see that -- `0 == Int64(0)` in Python, and pymongo
+    accepts either, which is why the 99.6% pymongo gauge never noticed. The Go
+    driver type-checks the field and answered `id should be an int64 but it is a
+    BSON 32-bit integer`, failing all 30 of its `bulkWrite` tests (found
+    2026-09-18 by the go gauge).
+
+    Asserted through `bson.decode` on the RAW reply rather than the driver's
+    view, because the driver is the layer that hides the difference.
+    """
+    import bson
+
+    reply = client.admin.command(
+        {
+            "bulkWrite": 1,
+            "nsInfo": [{"ns": "db.c"}],
+            "ops": [{"insert": 0, "document": {"_id": 1}}],
+        }
+    )
+    cursor_id = reply["cursor"]["id"]
+    assert isinstance(cursor_id, bson.Int64), (
+        f"cursor.id is {type(cursor_id).__name__}, must be bson.Int64 -- a "
+        f"strict driver refuses a 32-bit cursor id"
+    )
+    assert cursor_id == 0
+
+
+def test_bypass_empty_ts_replacement_is_accepted(client: MongoClient) -> None:
+    """mongod 8.2.11 takes this on `bulkWrite`, `insert` and `update` alike.
+
+    Probed 2026-09-18: all three accept it, while a genuinely unknown field
+    still answers `40415 ... is an unknown field`. `insert` / `update` already
+    took it here and only `bulkWrite` refused, which failed all 17 of the Go
+    driver's `TestClient_BulkWrite_AddCommandFields` cases -- the driver appends
+    the field by default on 8.x.
+
+    Accepted and IGNORED: the flag governs whether an empty `Timestamp()` is
+    replaced with the current cluster time, which neither server implements.
+    """
+    for value in (True, False):
+        reply = client.admin.command(
+            {
+                "bulkWrite": 1,
+                "nsInfo": [{"ns": "db.c"}],
+                "ops": [{"insert": 0, "document": {}}],
+                "bypassEmptyTsReplacement": value,
+            }
+        )
+        assert reply["ok"] == 1.0
+
+    # The unknown-field check still works -- this fix widened the list, it did
+    # not disable the gate.
+    with pytest.raises(Exception) as exc:
+        client.admin.command(
+            {
+                "bulkWrite": 1,
+                "nsInfo": [{"ns": "db.c"}],
+                "ops": [{"insert": 0, "document": {}}],
+                "totallyBogusField": True,
+            }
+        )
+    assert getattr(exc.value, "code", None) == 40415

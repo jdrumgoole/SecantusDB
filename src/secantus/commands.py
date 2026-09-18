@@ -3166,6 +3166,17 @@ _BULK_WRITE_KNOWN_FIELDS = frozenset(
         "nsInfo",
         "ordered",
         "bypassDocumentValidation",
+        # Accepted by mongod 8.2.11 on `bulkWrite`, `insert` AND `update`
+        # (probed 2026-09-18); `insert` / `update` already took it here and only
+        # `bulkWrite` refused, which failed all 17 of the Go driver's
+        # `TestClient_BulkWrite_AddCommandFields` cases. Accepted and IGNORED:
+        # the flag governs whether an empty `Timestamp()` is replaced with the
+        # current cluster time, and that substitution is not implemented on
+        # either server -- the go gauge deselects `TestBypassEmptyTsReplacement`
+        # for exactly that reason. Accepting a field whose semantics we do not
+        # honour is the lesser divergence: the alternative refuses a command
+        # every 8.x driver sends by default.
+        "bypassEmptyTsReplacement",
         "let",
         "errorsOnly",
         "comment",
@@ -3454,7 +3465,18 @@ def _bulk_write(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
 
     # Field order is mongod's: the cursor first, then the counters, then ``ok``.
     return {
-        "cursor": {"id": 0, "firstBatch": results, "ns": "admin.$cmd.bulkWrite"},
+        # `bson.Int64`, not a bare `0`. A cursor id is an int64 on the wire and
+        # a permissive driver does not notice the difference -- pymongo accepts
+        # the int32 silently, so the 99.6% pymongo gauge never saw this. The Go
+        # driver type-checks it and answered
+        # `id should be an int64 but it is a BSON 32-bit integer`, failing all
+        # 30 of its `bulkWrite` tests. Every other cursor reply in this file was
+        # already wrapped; this was the one that was not.
+        "cursor": {
+            "id": bson.Int64(0),
+            "firstBatch": results,
+            "ns": "admin.$cmd.bulkWrite",
+        },
         "nErrors": n_errors,
         "nInserted": counts["nInserted"],
         "nMatched": counts["nMatched"],

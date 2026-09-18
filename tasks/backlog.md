@@ -15306,3 +15306,30 @@ Unix-only; the `TZ=UTC` cases still run everywhere.
 Probing it needs a Windows box with both servers and a Windows mongod, which
 this project has never had. Low priority: the affected surface is two operators
 on a BSON `Timestamp`, and setting `TZ` on Windows is unusual.
+
+## `bulkWrite` returns every result in `firstBatch` (2026-09-18)
+
+`bulkWrite`'s reply cursor is always `{id: 0, firstBatch: [...everything...]}` on
+both servers. mongod returns a REAL cursor when the results do not fit the
+requested `cursor.batchSize`, and the driver then issues a `getMore`.
+
+Three mongo-go-driver tests fail on exactly this, and only this:
+
+```
+TestClientBulkWriteProse/7._MongoClient.bulkWrite_handles_a_cursor_requiring_a_getMore
+TestClientBulkWriteProse/8._MongoClient.bulkWrite_handles_a_cursor_requiring_getMore_within_a_transaction
+TestClientBulkWriteProse/9._MongoClient.bulkWrite_handles_a_getMore_error
+```
+
+with `expected 1 getMore call, got: 0` — the driver never issues one because
+the cursor is already exhausted.
+
+Closing it means honouring `cursor: {batchSize: N}` on `bulkWrite` and
+registering a real cursor in the `CursorRegistry` (the machinery `find` and
+`aggregate` already use), on BOTH servers. Deliberately NOT attempted with the
+two fixes that landed beside it (the int32 cursor id and the rejected
+`bypassEmptyTsReplacement` field) — those are wire-shape bugs of a line each,
+this is a feature.
+
+Found by the go gauge, which went 30 → 4 failures once the other two were
+fixed. It is the only remaining `bulkWrite` divergence.
