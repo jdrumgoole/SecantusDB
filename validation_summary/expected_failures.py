@@ -153,6 +153,21 @@ NODE: list[ExpectedFailure] = [
     ),
 ]
 
+PHP_LIB: list[ExpectedFailure] = [
+    ExpectedFailure(
+        pattern="IndexInfoFunctionalTest::testIsText",
+        rationale=(
+            "Text indexes (`$text`, `$meta: textScore`, text-index creation) "
+            "are intentionally out of scope per CLAUDE.md — would require a "
+            "full-text index implementation. The driver's own error names it: "
+            "`text indexes are not supported by SecantusDB`. Documented in "
+            "tasks/backlog.md §4. The SAME gap is already declared for the "
+            "node and pymongo gauges; php-library was the one left reading as "
+            "an unexplained failure."
+        ),
+    ),
+]
+
 RUBY: list[ExpectedFailure] = [
     ExpectedFailure(
         pattern=(
