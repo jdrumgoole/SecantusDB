@@ -15363,29 +15363,30 @@ dump. Worth checking whether that watchdog's timeout actually fires INSIDE the
 30-minute job cap on macOS; if it fires later than the cap, it can never
 produce the dump it exists for.
 
-## `bulkWrite` returns every result in `firstBatch` (2026-09-18)
+## `bulkWrite` result cursor (2026-09-18) — FIXED
 
-`bulkWrite`'s reply cursor is always `{id: 0, firstBatch: [...everything...]}` on
-both servers. mongod returns a REAL cursor when the results do not fit the
-requested `cursor.batchSize`, and the driver then issues a `getMore`.
+`bulkWrite`'s reply cursor was always `{id: 0, firstBatch: [...everything...]}`,
+so a driver never issued a `getMore`. Both servers now page the results like
+`find` / `aggregate` do, and the three mongo-go-driver prose tests that wanted
+it pass. Measured boundaries (mongod 8.2.11):
 
-Three mongo-go-driver tests fail on exactly this, and only this:
+| shape | result |
+| --- | --- |
+| no `cursor` option | id 0, everything in `firstBatch` |
+| `batchSize` under the count | cursor, remainder via `getMore` |
+| `batchSize` equal to the count | **id 0** — an exact fit keeps no cursor |
+| `batchSize: 0` | cursor with an EMPTY first batch |
+| `errorsOnly`, no errors | id 0 — nothing to page |
 
-```
-TestClientBulkWriteProse/7._MongoClient.bulkWrite_handles_a_cursor_requiring_a_getMore
-TestClientBulkWriteProse/8._MongoClient.bulkWrite_handles_a_cursor_requiring_getMore_within_a_transaction
-TestClientBulkWriteProse/9._MongoClient.bulkWrite_handles_a_getMore_error
-```
+Two things worth keeping:
 
-with `expected 1 getMore call, got: 0` — the driver never issues one because
-the cursor is already exhausted.
-
-Closing it means honouring `cursor: {batchSize: N}` on `bulkWrite` and
-registering a real cursor in the `CursorRegistry` (the machinery `find` and
-`aggregate` already use), on BOTH servers. Deliberately NOT attempted with the
-two fixes that landed beside it (the int32 cursor id and the rejected
-`bypassEmptyTsReplacement` field) — those are wire-shape bugs of a line each,
-this is a feature.
-
-Found by the go gauge, which went 30 → 4 failures once the other two were
-fixed. It is the only remaining `bulkWrite` divergence.
+- **The exact-fit rule is why the call passes `bounded: true`.** An unbounded
+  cursor deliberately stays open after filling a batch exactly — that is
+  `find`'s behaviour and NOT this one.
+- **Count is only half of it.** The Go driver's prose test 7 sets NO batchSize
+  and sends two upserts whose `_id`s are each `maxBsonObjectSize / 2` bytes, so
+  the two RESULT documents cannot share one 16MB reply; mongod answers
+  `firstBatch: 1` plus a cursor. Count-only batching returned both and the
+  driver saw zero getMores — the fix looked complete and the test still failed.
+  An upserted `_id` is the only unbounded field a result carries, which is what
+  makes the size limit reachable at all.
