@@ -19,6 +19,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from validation_summary.rates import pass_rate
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "mongo-rust-driver"
 
@@ -67,7 +69,7 @@ def _render(raw: dict) -> str:
         bucket[t["outcome"]] += 1
     overall = raw["summary"]
     total_overall = overall["passed"] + overall["failed"] + overall["ignored"]
-    pass_rate_overall = 100.0 * overall["passed"] / max(1, overall["passed"] + overall["failed"])
+    pass_rate_overall = pass_rate(overall["passed"], overall["passed"] + overall["failed"])
 
     lines: list[str] = []
     lines.append("# mongo-rust-driver Validation Report")
@@ -94,14 +96,14 @@ def _render(raw: dict) -> str:
         b = by_module[mod]
         total = b["passed"] + b["failed"] + b["ignored"]
         denom = b["passed"] + b["failed"]
-        rate = 100.0 * b["passed"] / max(1, denom) if denom else 100.0
+        rate = pass_rate(b["passed"], denom)
         lines.append(
-            f"| `{mod}` | {b['passed']} | {b['failed']} | {b['ignored']} | {total} | {rate:.1f}% |"
+            f"| `{mod}` | {b['passed']} | {b['failed']} | {b['ignored']} | {total} | {rate} |"
         )
     lines.append(
         f"| **Overall** | **{overall['passed']}** | "
         f"**{overall['failed']}** | **{overall['ignored']}** | "
-        f"**{total_overall}** | **{pass_rate_overall:.1f}%** |"
+        f"**{total_overall}** | **{pass_rate_overall}** |"
     )
     lines.append("")
     if overall["failed"]:

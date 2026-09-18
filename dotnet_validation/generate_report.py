@@ -25,6 +25,8 @@ import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
 
+from validation_summary.rates import pass_rate
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "mongo-csharp-driver"
 _TRX_NS = "{http://microsoft.com/schemas/VisualStudio/TeamTest/2010}"
@@ -100,7 +102,7 @@ def render(trx_path: Path, out_path: Path) -> None:
             totals[k] += b[k]
     grand_total = sum(totals.values())
     grand_ran = totals["passed"] + totals["failed"]
-    grand_rate = f"{(totals['passed'] / grand_ran * 100):.1f}%" if grand_ran else "—"
+    grand_rate = pass_rate(totals["passed"], grand_ran)
 
     md: list[str] = []
     md.append("# mongo-csharp-driver Validation Report")
@@ -126,8 +128,10 @@ def render(trx_path: Path, out_path: Path) -> None:
         b = by_group[group]
         total = b["passed"] + b["failed"] + b["skipped"]
         ran = b["passed"] + b["failed"]
-        rate = f"{(b['passed'] / ran * 100):.1f}%" if ran else "—"
-        md.append(f"| `{group}` | {b['passed']} | {b['failed']} | {b['skipped']} | {total} | {rate} |")
+        rate = pass_rate(b["passed"], ran)
+        md.append(
+            f"| `{group}` | {b['passed']} | {b['failed']} | {b['skipped']} | {total} | {rate} |"
+        )
     md.append(
         f"| **Overall** | **{totals['passed']}** | **{totals['failed']}** | "
         f"**{totals['skipped']}** | **{grand_total}** | **{grand_rate}** |"

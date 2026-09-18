@@ -17,6 +17,8 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
+from validation_summary.rates import pass_rate
+
 import secantus
 
 SPEC_PREFIX = "./spec/"
@@ -72,14 +74,14 @@ def render(raw_path: Path, out_path: Path) -> None:
         b = by_cat[cat]
         total = b["passed"] + b["failed"] + b["pending"]
         ran = b["passed"] + b["failed"]
-        rate = f"{(b['passed'] / ran * 100):.1f}%" if ran else "—"
+        rate = pass_rate(b["passed"], ran)
         rows.append((cat, b["passed"], b["failed"], b["pending"], total, rate))
         for k in totals:
             totals[k] += b[k]
 
     grand_total = sum(totals.values())
     grand_ran = totals["passed"] + totals["failed"]
-    grand_rate = f"{(totals['passed'] / grand_ran * 100):.1f}%" if grand_ran else "—"
+    grand_rate = pass_rate(totals["passed"], grand_ran)
 
     summary = raw.get("summary", {})
     duration = float(summary.get("duration", 0.0))
@@ -174,7 +176,7 @@ def render(raw_path: Path, out_path: Path) -> None:
         "4.6 — we report 7.0.0). Resolving them would require running "
         "additional gauge configurations rather than fixing SecantusDB "
         "behaviour. The pending number is therefore a lower bound on "
-        "tests SecantusDB \"could pass\" if the runner spun up "
+        'tests SecantusDB "could pass" if the runner spun up '
         "alternate daemons; the failed number is the only signal that "
         "matters for conformance."
     )

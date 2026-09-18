@@ -13,6 +13,8 @@ import json
 import re
 from pathlib import Path
 
+from validation_summary.rates import pass_rate
+
 
 def _secantus_version() -> str:
     try:
@@ -108,7 +110,7 @@ def main() -> None:
             totals[k] += c[k] if k != "failures" else c["failures"]
         passed = c["tests"] - c["failures"] - c["skipped"]
         run = passed + c["failures"]
-        rate = f"{passed / run * 100:.1f}%" if run else "—"
+        rate = pass_rate(passed, run)
         short = c["class"].removeprefix("org.postgresql.test.")
         lines.append(
             f"| {short} | {passed} | {c['failures']} | {c['skipped']} | {c['tests']} | {rate} |"
@@ -116,7 +118,7 @@ def main() -> None:
         failures += [f"{short} :: {t}" for t in c["failed_tests"]]
     passed = totals["tests"] - totals["failures"] - totals["skipped"]
     run = passed + totals["failures"]
-    rate = f"{passed / run * 100:.1f}%" if run else "—"
+    rate = pass_rate(passed, run)
     lines.append(
         f"| **total** | **{passed}** | **{totals['failures']}** | **{totals['skipped']}** "
         f"| **{totals['tests']}** | **{rate}** |"

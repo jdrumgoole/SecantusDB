@@ -16,6 +16,8 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
+from validation_summary.rates import pass_rate
+
 import secantus
 
 VENDOR_PREFIX = "go.mongodb.org/mongo-driver/v2/"
@@ -72,14 +74,14 @@ def render(ndjson_path: Path, out_path: Path) -> None:
         b = by_pkg[pkg]
         total = b["passed"] + b["failed"] + b["skipped"]
         ran = b["passed"] + b["failed"]
-        rate = f"{(b['passed'] / ran * 100):.1f}%" if ran else "—"
+        rate = pass_rate(b["passed"], ran)
         rows.append((_shorten(pkg), b["passed"], b["failed"], b["skipped"], total, rate))
         for k in totals:
             totals[k] += b[k]
 
     grand_total = sum(totals.values())
     grand_ran = totals["passed"] + totals["failed"]
-    grand_rate = f"{(totals['passed'] / grand_ran * 100):.1f}%" if grand_ran else "—"
+    grand_rate = pass_rate(totals["passed"], grand_ran)
 
     md: list[str] = []
     md.append("# mongo-go-driver Validation Report")

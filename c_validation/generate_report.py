@@ -23,6 +23,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from validation_summary.rates import pass_rate
+
 from c_validation import load_results
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -64,9 +66,7 @@ def _render(raw: dict) -> str:
     for t in results:
         status = (t.get("status") or "").lower()
         name = t.get("test_file", "")
-        bucket = by_suite.setdefault(
-            _suite_of(name), {"passed": 0, "failed": 0, "skipped": 0}
-        )
+        bucket = by_suite.setdefault(_suite_of(name), {"passed": 0, "failed": 0, "skipped": 0})
         if status == "pass":
             bucket["passed"] += 1
             tot["passed"] += 1
@@ -79,7 +79,7 @@ def _render(raw: dict) -> str:
             tot["skipped"] += 1
     total_overall = tot["passed"] + tot["failed"] + tot["skipped"]
     denom_overall = tot["passed"] + tot["failed"]
-    rate_overall = 100.0 * tot["passed"] / max(1, denom_overall) if denom_overall else 100.0
+    rate_overall = pass_rate(tot["passed"], denom_overall)
 
     lines: list[str] = []
     lines.append("# mongo-c-driver Validation Report")
@@ -105,14 +105,13 @@ def _render(raw: dict) -> str:
         b = by_suite[suite]
         total = b["passed"] + b["failed"] + b["skipped"]
         denom = b["passed"] + b["failed"]
-        rate = 100.0 * b["passed"] / max(1, denom) if denom else 100.0
+        rate = pass_rate(b["passed"], denom)
         lines.append(
-            f"| `/{suite}` | {b['passed']} | {b['failed']} | "
-            f"{b['skipped']} | {total} | {rate:.1f}% |"
+            f"| `/{suite}` | {b['passed']} | {b['failed']} | {b['skipped']} | {total} | {rate} |"
         )
     lines.append(
         f"| **Overall** | **{tot['passed']}** | **{tot['failed']}** | "
-        f"**{tot['skipped']}** | **{total_overall}** | **{rate_overall:.1f}%** |"
+        f"**{tot['skipped']}** | **{total_overall}** | **{rate_overall}** |"
     )
     lines.append("")
     if failures:

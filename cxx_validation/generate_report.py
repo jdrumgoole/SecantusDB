@@ -22,6 +22,8 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from validation_summary.rates import pass_rate
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "mongo-cxx-driver"
 
@@ -73,7 +75,7 @@ def render(xml_path: Path, out_path: Path) -> None:
 
     grand_total = sum(totals.values())
     grand_ran = totals["passed"] + totals["failed"]
-    grand_rate = f"{(totals['passed'] / grand_ran * 100):.1f}%" if grand_ran else "—"
+    grand_rate = pass_rate(totals["passed"], grand_ran)
 
     md: list[str] = []
     md.append("# mongo-cxx-driver Validation Report")
