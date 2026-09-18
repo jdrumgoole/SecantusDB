@@ -272,10 +272,21 @@ one request path:
   - **MEASURE IT, DO NOT INHERIT THE NUMBER.** The first figure published here was
     73.8%, taken by a sub-agent against a checkout sitting 116 commits behind
     `origin/main` — 50 of them touching this crate. It went on the live website
-    before anyone checked `git log`. The tell was mundane: an *existing* test
-    started failing with `invalid port number: "0"`, because the old binary printed
-    its requested address rather than its bound one. **Before quoting a gauge
-    number, confirm the tree it was built from.**
+    before anyone checked `git log`. **Before quoting a gauge number, confirm the
+    tree the artifact was built from** — `git rev-parse HEAD`, then
+    `git log HEAD..origin/main -- <the crate you measured>`.
+
+    **The cheapest tell is WALL CLOCK, and it needs no canary.** The stale run
+    finished in 82s; the honest one takes 1041s. A gauge that finishes 12x too
+    fast did not get faster — it stopped reaching the code. That check works for
+    any measurement, including the dangerous case where a stale artifact runs to
+    completion and merely answers differently; **treat an implausibly fast run as
+    stale until proven otherwise.** (What actually caught it here was narrower: an
+    *existing* test failing with `invalid port number: "0"`, because the old binary
+    printed its requested address rather than its bound one. Had that parsed, the
+    wrong number would have stood.) This is the same rule the pinned-worktree
+    requirement already imposes on *timing* runs, applied to every other number:
+    gauge rates, validation reports, benchmark tables.
   - Not there yet: `CREATE INDEX` (refused outright), password verification (a
     role's SCRAM verifier is stored and never checked — a wrong password and no
     password both connect, re-probed 2026-09-18), and a column-level `UNIQUE`
