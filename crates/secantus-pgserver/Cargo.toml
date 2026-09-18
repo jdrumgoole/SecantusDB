@@ -38,6 +38,13 @@ bytes = "1.12.1"
 # or the `ToSql` we implement is a different trait from the one it calls.
 postgres-types = "0.2.14"
 
+[dev-dependencies]
+# A real PostgreSQL client for the embedded-server tests: the durability test
+# has to prove that writes the SERVER acknowledged over the wire survive
+# `stop()`, which a direct `Storage` call would not show.
+tokio-postgres = "0.7"
+tempfile = "3"
+
 [[bin]]
 name = "secantusd-pg"
 path = "src/main.rs"
