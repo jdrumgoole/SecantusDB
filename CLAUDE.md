@@ -12,7 +12,7 @@ product; the Python pair is the reference implementation they are held to.
 | server | binary / entry point | wire | role |
 | --- | --- | --- | --- |
 | **Rust MongoDB server** | `secantusd-rs` (`crates/secantusdb`) | MongoDB | **the flagship.** Prebuilt binaries per platform, and bundled in the wheel |
-| **Rust PostgreSQL server** | `secantusd-pg` (`crates/secantus-pgserver`) | PostgreSQL | **the newest.** Builds from its own directory; prebuilt binaries await a pushed `secantusd-pg-v*` tag |
+| **Rust PostgreSQL server** | `secantusd-pg` (`crates/secantus-pgserver`) | PostgreSQL | **the newest.** Prebuilt binaries from `secantusd-pg-v*` (linux-x86_64, macos-arm64 — no Windows build yet); builds from its own directory |
 | Python MongoDB server | `SecantusDBServer` / `secantusd-py` | MongoDB | the reference — every operator, stage and error message lands here first |
 | Python PostgreSQL server | `secantusd-py-pg` (`secantus.sql.pgserver`) | PostgreSQL | the reference for the SQL surface, and still the most complete one |
 
@@ -334,7 +334,7 @@ one server bumps only that server's version:
   `crates/*/Cargo.toml`, kept in **lockstep** across them (`0.MAJOR.PATCH-beta.N`,
   SemVer pre-release). **NOT every crate under `crates/`:** the three PostgreSQL
   crates (`secantus-pgcatalog` / `secantus-pgplan` / `secantus-pgserver`) carry
-  their own line, at `0.1.0-beta.0` as of 2026-09-18, and are a **third
+  their own line, at `0.1.0-beta.1` as of 2026-09-19, and are a **third
   deliverable that is not bumped with the Rust MongoDB server**. The sweep recipe
   below is safe only because it substitutes one exact version string — a blanket
   "bump every Cargo.toml under crates/" would fold the PG crates into the MongoDB
