@@ -3564,7 +3564,6 @@ def _eval_cast_impl(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
     if rng_type is not None:
         if value is None or isinstance(value, dict):
             return value
-        from secantus.sql import ranges as _ranges
         from secantus.sql.catalog import fold_type_name
 
         doc, elem_tag = rng_type
@@ -3736,6 +3735,15 @@ def _eval_cast_impl(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
             probe = getattr(scope, "column_tag", None)
             if probe is not None:
                 src_tag = probe(inner)
+        elif isinstance(inner, (exp.Lower, exp.Upper)) and isinstance(inner.this, exp.Column):
+            # ``lower(tz)::text`` -- a stored tstzrange bound decodes naive,
+            # so without the range column's type it lost its ``+00``.
+            probe = getattr(scope, "column_tag", None)
+            range_tag = probe(inner.this) if probe is not None else None
+            if range_tag in typemap._RANGE_TAGS:
+                src_tag = _ranges.bound_result_tag(range_tag)
+        if src_tag == "date":
+            return value.date().isoformat()
         if value.tzinfo is not None or src_tag == "timestamptz":
             if value.tzinfo is None:
                 value = value.replace(tzinfo=_dt.timezone.utc)
@@ -4047,8 +4055,6 @@ def _eval_cast_impl(node: exp.Cast, scope: Scope, ctx: ScalarContext) -> Any:
             return rendered.decode() if isinstance(rendered, bytes) else rendered
         shape = _range_value_shape(value)
         if shape is not None:
-            from secantus.sql import ranges as _ranges
-
             if shape == "multirange":
                 return _ranges.render_multirange(value)
             return _ranges.render(value)

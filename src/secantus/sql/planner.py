@@ -6370,6 +6370,39 @@ def _lookup_table_def(
     return None
 
 
+def missing_relation(
+    stmt: exp.Expression, catalog: Any, db: str, storage: Any = None
+) -> str | None:
+    """The first relation ``stmt`` names that does not resolve, as written; or None.
+
+    For Parse-time analysis: Postgres resolves every relation when it parses a
+    statement, so a missing one is a 42P01 in reply to Parse, not Execute. The
+    resolution is `_lookup_table_def` -- the one planning uses -- so this never
+    rejects what Execute would accept. CTE names and table functions are not
+    relations and are skipped. Run on a statement already qualified from the
+    search path (temp tables)."""
+    ctes = {c.alias_or_name.lower() for c in stmt.find_all(exp.CTE) if c.alias_or_name}
+    for node in stmt.find_all(exp.Table):
+        if not isinstance(node.this, exp.Identifier):
+            continue  # a function in FROM, not a relation
+        if node.args.get("db") is None and node.name.lower() in ctes:
+            continue
+        if _lookup_table_def(catalog, db, node, storage) is not None:
+            continue
+        # Views are expanded before planning and sequences answer SELECT on
+        # their own path, so neither reaches `_lookup_table_def` -- measured:
+        # without these two checks a SELECT from either was a false 42P01.
+        name = qualified_table_name(node)
+        get_view = getattr(catalog, "get_view", None)
+        if get_view is not None and get_view(db, name) is not None:
+            continue
+        seq_exists = getattr(catalog, "sequence_exists", None)
+        if seq_exists is not None and seq_exists(db, name):
+            continue
+        return written_table_name(node)
+    return None
+
+
 def expand_using_star(stmt: exp.Select, catalog: Any, db: str) -> None:
     """Expand a lone ``SELECT *`` over USING joins into Postgres' merged list.
 
@@ -12973,7 +13006,7 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
     if isinstance(node, (exp.Lower, exp.Upper)) and node.this is not None:
         operand_tag = _infer_scalar_tag(node.this, resolve)
         if operand_tag in typemap._RANGE_TAGS:
-            return ranges.RANGE_TYPES[operand_tag][0]
+            return ranges.bound_result_tag(operand_tag)
     # Interval literal / negation / arithmetic. ``interval ± interval`` and
     # ``interval * n`` -> interval; ``date ± interval`` -> the date type; and
     # ``timestamp - timestamp`` -> interval.
@@ -14806,7 +14839,7 @@ def parse(sql: str) -> list[exp.Expression]:
             _PARSE_CACHE.move_to_end(sql)
     if entry is not None:
         return [s.copy() for s in entry]
-    stmts = _parse_uncached(sql)
+    stmts = [_abort_as_rollback(s) for s in _parse_uncached(sql)]
     seen_before = False
     with _PARSE_CACHE_LOCK:
         seen_before = sql in _PARSE_CACHE
@@ -14823,6 +14856,27 @@ def parse(sql: str) -> list[exp.Expression]:
             while len(_PARSE_CACHE) > _PARSE_CACHE_MAX:
                 _PARSE_CACHE.popitem(last=False)
     return stmts
+
+
+def _abort_as_rollback(stmt: exp.Expression) -> exp.Expression:
+    """``ABORT [WORK | TRANSACTION] [AND [NO] CHAIN]`` is Postgres' synonym for
+    ``ROLLBACK``; sqlglot has no such statement and reads it as a bare column
+    (``abort``), an alias (``abort AS work``) or an ``And``. It was a 42601 --
+    and inside a failed transaction block the rejected ABORT left the session
+    stuck at 25P02, since the one statement meant to end the block could not
+    run. Rewritten here, every path sees an ordinary ROLLBACK (including the
+    aborted-transaction carve-out that admits it). ``AND CHAIN`` is carried as
+    far as ROLLBACK's own parse carries it."""
+    head = stmt
+    if isinstance(head, exp.And):
+        head = head.this
+    if isinstance(head, exp.Alias):
+        if head.alias.upper() not in ("WORK", "TRANSACTION"):
+            return stmt
+        head = head.this
+    if isinstance(head, exp.Column) and not head.table and head.name.upper() == "ABORT":
+        return exp.Rollback()
+    return stmt
 
 
 def _reject_unparenthesised_in(stmt: exp.Expression) -> None:

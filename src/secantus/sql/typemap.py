@@ -1817,6 +1817,11 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
         return b"t" if value else b"f"
     if isinstance(value, (bytes, bytearray)):
         return b"\\x" + bytes(value).hex().encode("ascii")
+    if isinstance(value, _dt.datetime) and tag == "date":
+        # A ``daterange`` bound is stored as a datetime (BSON has no date-only
+        # value), so ``lower(daterange)`` -- typed ``date`` -- arrives as one.
+        # Render the date, not a midnight timestamp.
+        return to_pg_text(value.date().isoformat(), "date")
     if isinstance(value, _dt.datetime):
         # Postgres renders timestamptz space-separated with a UTC offset. A stored
         # timestamptz decodes tz-naive UTC from BSON, so tag it UTC before

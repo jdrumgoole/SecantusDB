@@ -3011,7 +3011,7 @@ def _run_statement(
         # NotSupportedError). The expression-shaped COMMANDS sqlglot
         # mis-parses the same way (CLOSE / DISCARD / DEALLOCATE) were
         # already handled above and are exempted by the predicate.
-        raise errors.SQLError("42601", f'syntax error at or near "{stmt.sql()[:40]}"')
+        raise errors.SQLError("42601", f'syntax error at or near "{_leading_token(stmt)[:40]}"')
     if isinstance(stmt, exp.Copy):
         # COPY reaching the generic dispatcher means it wasn't the sole
         # statement of a wire-level copy() (a multi-statement string) or came
@@ -3023,7 +3023,10 @@ def _run_statement(
     raise errors.feature_not_supported(f"unsupported statement: {type(stmt).__name__}")
 
 
-_NOOP_WORDS = {"DISCARD"}
+# CHECKPOINT: Postgres forces a WAL checkpoint; SecantusDB has no user-driven
+# checkpoint to force (durability is the storage engine's), so it answers
+# the command tag, as DISCARD does. Was a 42601.
+_NOOP_WORDS = {"DISCARD", "CHECKPOINT"}
 
 #: Commands sqlglot mis-parses as bare Alias/Column expressions but that ARE
 #: real statements with handlers in this engine. Anything else expression-
@@ -3031,7 +3034,7 @@ _NOOP_WORDS = {"DISCARD"}
 # SAVEPOINT / RELEASE also parse as a bare Alias ("SAVEPOINT AS sp1") and are
 # rescued by dispatch's _savepoint_command — the Parse-time garbage guard
 # (#876) must not reject them (pgjdbc's setSavepoint broke exactly that way).
-_EXPRESSION_COMMAND_WORDS = {"CLOSE", "DISCARD", "DEALLOCATE", "SAVEPOINT", "RELEASE"}
+_EXPRESSION_COMMAND_WORDS = {"CLOSE", "DISCARD", "DEALLOCATE", "SAVEPOINT", "RELEASE", "CHECKPOINT"}
 
 
 def is_nonstatement_expression(stmt: exp.Expression) -> bool:
@@ -3041,10 +3044,26 @@ def is_nonstatement_expression(stmt: exp.Expression) -> bool:
     Parse uses this predicate so pgx's Prepare("SYNTAX ERROR") errors there,
     not silently at Execute."""
     if not isinstance(stmt, (exp.Column, exp.Identifier, exp.Literal, exp.Anonymous, exp.Alias)):
-        return False
+        # Any other bare expression -- ``this is not sql`` parses as
+        # ``NOT (this IS sql)`` -- is garbage too. Measured: no valid statement
+        # parses to a `Condition` other than the bare-column command words
+        # handled below, so the class is a safe test. It answered 0A000
+        # "unsupported statement: Not" at Execute; Postgres says 42601 at Parse.
+        return isinstance(stmt, exp.Condition)
     head = stmt.this if isinstance(stmt, exp.Alias) else stmt
     name = head.name if isinstance(head, exp.Column) else None
     return not (name is not None and name.upper() in _EXPRESSION_COMMAND_WORDS)
+
+
+def _leading_token(stmt: exp.Expression) -> str:
+    """The input token a syntax error points at: the leftmost leaf of the
+    garbage expression. Regenerating SQL from the whole AST reorders it --
+    ``this is not sql`` renders ``NOT this IS sql`` -- where Postgres names the
+    first token it could not use (``"this"``)."""
+    node: exp.Expression = stmt
+    while isinstance(node.args.get("this"), exp.Expression):
+        node = node.args["this"]
+    return node.sql(dialect="postgres") or stmt.sql(dialect="postgres")
 
 
 def _noop_command_word(stmt: exp.Expression) -> str | None:

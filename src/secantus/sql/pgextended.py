@@ -1529,7 +1529,10 @@ class ExtendedSession:
             # Garbage input ("SYNTAX ERROR") parses as a bare expression;
             # real PG rejects it AT PARSE TIME — pgx's Prepare and pipelined
             # SendPrepare both expect the ErrorResponse here, not at Execute.
-            near = stmt.sql(dialect="postgres").split(None, 1)[0]
+            # The first token of what the CLIENT wrote: regenerating SQL from
+            # the AST reorders it (``this is not sql`` renders ``NOT this IS
+            # sql``), and Postgres points at the input.
+            near = (query.split(None, 1) or [stmt.sql(dialect="postgres")])[0]
             raise errors.syntax_error(f'syntax error at or near "{near[:40]}"')
         count = planner.parameter_count(stmt) if stmt is not None else 0
         # Checked on the RAW statement, before the pg_typeof rewrite below
@@ -1597,6 +1600,21 @@ class ExtendedSession:
             raise errors.SQLError(
                 "42P02", f"there is no parameter ${first.group(1) if first else 1}"
             )
+        if isinstance(stmt, (exp.Select, exp.Insert, exp.Update, exp.Delete)):
+            # Postgres' parse analysis resolves every relation AT PARSE, so a
+            # missing table is a 42P01 in reply to Parse -- pgx's Prepare, or
+            # any client that prepares now and executes later, sees it there.
+            # This server deferred it to Execute. Resolved with planning's own
+            # resolver, on a copy (search-path qualification rewrites the AST).
+            probe = stmt.copy()
+            planner.qualify_from_search_path(
+                probe, self.catalog, self.session.database, self.session
+            )
+            missing = planner.missing_relation(
+                probe, self.catalog, self.session.database, self.storage
+            )
+            if missing is not None:
+                raise errors.undefined_table(missing)
         if isinstance(stmt, exp.Copy):
             # PG's parse analysis gives COPY zero parameters — placeholders
             # inside the query survive to Execute, where an unbound one is

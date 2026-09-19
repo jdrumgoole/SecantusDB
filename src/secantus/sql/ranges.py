@@ -102,6 +102,18 @@ def make_range(
     return {"lower": lower, "upper": upper, "lower_inc": lower_inc, "upper_inc": upper_inc}
 
 
+# The TYPE a bound has, as ``lower()`` / ``upper()`` report it. Not the storage
+# element: tsrange and daterange bounds coerce through timestamptz for storage,
+# but Postgres types ``lower(tsrange)`` as timestamp WITHOUT time zone and
+# ``lower(daterange)`` as date (measured: both were reported timestamptz).
+_BOUND_RESULT_TAG = {"tsrange": "timestamp", "tstzrange": "timestamptz", "daterange": "date"}
+
+
+def bound_result_tag(tag: str) -> str:
+    """The SQL type of ``lower(<tag>)`` / ``upper(<tag>)``."""
+    return _BOUND_RESULT_TAG.get(tag, RANGE_TYPES[tag][0])
+
+
 def _naive_utc(v: Any) -> Any:
     """An aware datetime as naive UTC (a tsrange bound's form); else unchanged."""
     if isinstance(v, _dt.datetime) and v.tzinfo is not None:

@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -54,7 +55,12 @@ def _write_state(state_dir: Path, name: str, state: dict[str, object]) -> None:
     _state_path(state_dir, name).write_text(json.dumps(state, indent=2) + "\n")
 
 
+_WINDOWS = os.name == "nt"
+
+
 def _alive(pid: int) -> bool:
+    if _WINDOWS:
+        return _alive_windows(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -62,6 +68,58 @@ def _alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _alive_windows(pid: int) -> bool:
+    """`os.kill(pid, 0)` is not a liveness probe on Windows -- it raises
+    ``OSError [WinError 87]`` for a live process -- so ask the kernel."""
+    import ctypes
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    still_active = 259
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        return False
+    try:
+        code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return False
+        return code.value == still_active
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _detach_kwargs() -> dict[str, object]:
+    """How to start the supervisor outside the launcher's reach.
+
+    POSIX: a new session, so a process-GROUP kill misses it. Windows has no
+    process groups in that sense (`start_new_session` is ignored there): a new
+    process group plus DETACHED_PROCESS leaves the console, and breaking away
+    from the launcher's job object is what survives a job-wide kill -- when
+    the job permits it, which the caller learns by trying.
+    """
+    if not _WINDOWS:
+        return {"start_new_session": True}
+    flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+    return {"creationflags": flags | subprocess.CREATE_BREAKAWAY_FROM_JOB, "_fallback": flags}
+
+
+def _resolve_command(argv: list[str]) -> list[str]:
+    """``argv`` with its program resolved through PATH.
+
+    On Windows, CreateProcess looks in the directory of the PARENT's own
+    executable before PATH -- and under a venv the parent is the base
+    interpreter the venv launcher re-executes, so a bare `python` ran the
+    interpreter WITHOUT the venv's packages ("No module named pytest").
+    `shutil.which` searches PATH, which `uv run` puts the venv at the front of.
+    """
+    if not argv:
+        return argv
+    found = shutil.which(argv[0])
+    return [found, *argv[1:]] if found else argv
 
 
 def _reap(state_dir: Path, name: str, state: dict[str, object]) -> dict[str, object]:
@@ -104,21 +162,29 @@ def cmd_start(args: argparse.Namespace) -> int:
     # `/bin/sh` in the middle, every child's connection to a Postgres.app
     # server times out, which silently skipped 825 differential tests behind a
     # green run. Measured 2026-09-17 -- direct exec connects, `sh -c` does not.
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            str(Path(__file__).resolve()),
-            "_supervise",
-            str(exit_file),
-            *args.command,
-        ],
-        cwd=str(args.cwd.resolve()),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,  # our own process group: a group kill misses us
-        env={**os.environ, "_DETACHED_RUN_LOG": str(log.resolve())},
-    )
+    popen_args = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "_supervise",
+        str(exit_file),
+        *_resolve_command(args.command),
+    ]
+    detach = _detach_kwargs()
+    fallback = detach.pop("_fallback", None)
+    common: dict[str, object] = {
+        "cwd": str(args.cwd.resolve()),
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "stdin": subprocess.DEVNULL,
+        "env": {**os.environ, "_DETACHED_RUN_LOG": str(log.resolve())},
+    }
+    try:
+        proc = subprocess.Popen(popen_args, **common, **detach)  # type: ignore[call-overload]
+    except OSError:
+        if fallback is None:
+            raise
+        # The launcher's job forbids breakaway; detach as far as it allows.
+        proc = subprocess.Popen(popen_args, **common, creationflags=fallback)  # type: ignore[call-overload]
 
     _write_state(
         state_dir,
@@ -173,13 +239,23 @@ def cmd_stop(args: argparse.Namespace) -> int:
     if not _alive(pid):
         print(f"{args.name} is not running")
         return 0
-    os.killpg(os.getpgid(pid), signal.SIGTERM)
+    if _WINDOWS:
+        # No process groups to signal: end the supervisor and its whole tree.
+        subprocess.run(
+            ["taskkill", "/T", "/F", "/PID", str(pid)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    else:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
     for _ in range(50):
         if not _alive(pid):
             break
         time.sleep(0.2)
     else:
-        os.killpg(os.getpgid(pid), signal.SIGKILL)
+        if not _WINDOWS:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
     print(f"stopped {args.name} (pid {pid})")
     return 0
 
