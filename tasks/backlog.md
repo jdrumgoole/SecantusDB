@@ -9878,15 +9878,6 @@ shared storage engine or building large new protocol subsystems:
   (now per-row, via `ranges.canonical`). `tests/test_pg_range_subms.py`,
   including a real-PostgreSQL comparison in the `pg-oracle` lane. The Rust
   pgserver stores ranges as text and was never affected.
-- [ ] **`lower()` / `upper()` of a `tsrange` are typed `timestamptz`**
-  (measured 2026-09-18; Postgres: `timestamp`). `RANGE_TYPES["tsrange"]`
-  declares its element `timestamptz`, so the bound carries a zone and its
-  `::text` grows `+00`. Python pgserver; not probed on the Rust one.
-- [ ] **A failing `Parse` is accepted and the error deferred to `Execute`**
-  (measured 2026-09-18). `Parse` of `this is not sql`, or of a query naming a
-  missing table, answers `ParseComplete`; Postgres answers `42601` / `42P01`
-  at Parse. A client that Parses once and Executes later sees the error on the
-  wrong message. Python pgserver.
 - [x] **RESOLVED — STALE (re-measured 2026-09-01). Sub-millisecond timestamps
   round-trip exactly.** The entry below says `timestamp`/`timestamptz`
   "truncate to milliseconds"; that stopped being true when the `__us_`

@@ -137,3 +137,66 @@ def test_no_shell_is_interposed_before_the_command(tmp_path: Path) -> None:
     parent = out.read_text().strip()
     assert Path(parent).name != "sh", f"a shell was interposed: {parent!r}"
     assert "python" in parent.lower(), f"unexpected supervisor: {parent!r}"
+
+
+# --- Every platform. The tests above are POSIX-only by nature (process
+# groups), which is how the helper shipped broken on Windows: `_alive` used
+# `os.kill(pid, 0)` (WinError 87 there), `stop` used `os.killpg`, and a bare
+# `python` resolved to the base interpreter instead of the venv's. None of
+# that had a test that could run where it failed.
+
+
+def _run_env(state_dir: Path, env: dict[str, str], *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), "--state-dir", str(state_dir), *args],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def _venv_first_env() -> dict[str, str]:
+    """PATH with this interpreter's directory first, the way `uv run` sets it."""
+    here = str(Path(sys.executable).parent)
+    return {**os.environ, "PATH": here + os.pathsep + os.environ.get("PATH", "")}
+
+
+def test_exit_code_is_recorded_on_every_platform(tmp_path: Path) -> None:
+    state = tmp_path / "runs"
+    env = _venv_first_env()
+    start = _run_env(
+        state, env, "start", "--name", "rc", "--", sys.executable, "-c", "raise SystemExit(7)"
+    )
+    assert start.returncode == 0, start.stderr
+    wait = _run_env(state, env, "wait", "--name", "rc", "--timeout", "60", "--interval", "0.2")
+    assert "rc=7" in wait.stdout, (wait.stdout, wait.stderr)
+    assert wait.returncode == 1
+
+
+def test_a_bare_python_is_the_venv_interpreter(tmp_path: Path) -> None:
+    """`-- python -m pytest` must run the venv's python, found through PATH.
+
+    On Windows a bare name is looked up in the PARENT's executable directory
+    first, and under a venv that parent is the base interpreter -- so the run
+    failed at once with "No module named pytest" (2026-09-18)."""
+    state = tmp_path / "runs"
+    env = _venv_first_env()
+    code = "import sys; print('PREFIX=' + sys.prefix)"
+    assert _run_env(state, env, "start", "--name", "py", "--", "python", "-c", code).returncode == 0
+    _run_env(state, env, "wait", "--name", "py", "--timeout", "60", "--interval", "0.2")
+    log = (state / "py.log").read_text()
+    assert f"PREFIX={sys.prefix}" in log, log
+
+
+def test_stop_ends_a_running_command(tmp_path: Path) -> None:
+    state = tmp_path / "runs"
+    env = _venv_first_env()
+    sleeper = [sys.executable, "-c", "import time; time.sleep(120)"]
+    assert _run_env(state, env, "start", "--name", "nap", "--", *sleeper).returncode == 0
+    running = _run_env(state, env, "status", "--name", "nap")
+    assert "running" in running.stdout, (running.stdout, running.stderr)
+    stop = _run_env(state, env, "stop", "--name", "nap")
+    assert stop.returncode == 0, stop.stderr
+    assert _wait_for(
+        lambda: "finished" in _run_env(state, env, "status", "--name", "nap").stdout, timeout=30
+    )
