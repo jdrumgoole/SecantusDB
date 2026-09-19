@@ -46,3 +46,10 @@ The Rust Postgres server was checked for the same defect and does not carry it:
 its `BUILTIN_TYPES` already lists `varchar` (1043) and `bpchar` (1042) with the
 same array oids measured here, and it has no `pg_proc` function reflection at
 all. This one is Python-server-only.
+
+Measured against pgjdbc's `DatabaseMetaDataTest` (jdbc2 + jdbc4 + jdbc42, 194
+tests), by diffing a run with and without this change: **42 failures → 36**,
+26 distinct → 23, **no regressions**. `functionColumns`,
+`getColumnsCharOctetLength` and `informationAboutArrayTypes` all go green —
+the latter two because a `varchar` column now resolves to a real `pg_type`
+row, which is what the driver's own type lookup needs.

@@ -3118,10 +3118,15 @@ all match, and so do CREATE INDEX / VIEW and their error surface. What is open:
       **`character_maximum_length` / `character_octet_length` are missing the
       same way** (`42703`, measured 2026-09-19) — PostgreSQL 14 reports
       `(10, 40)` for `varchar(10)`, `(5, 20)` for `char(5)` and
-      `(NULL, 1073741824)` for `text` / bare `varchar`. This is what pgjdbc's
-      `DatabaseMetaDataTest::getColumnsCharOctetLength` reads. Distinct from
-      the declared-char-type slice, which fixed `data_type` on the same view:
-      that one had the data and ignored it, these columns do not exist.
+      `(NULL, 1073741824)` for `text` / bare `varchar`. Distinct from the
+      declared-char-type slice, which fixed `data_type` on the same view: that
+      one had the data and ignored it, these columns do not exist.
+      **NOT what pgjdbc's `getColumnsCharOctetLength` reads** — that was
+      asserted here from the name and is false: the test went green when
+      `pg_type` gained its `varchar` row, because JDBC's `getColumns()`
+      computes the octet length from `pg_attribute.atttypmod` and never
+      touches `information_schema`. Measured 2026-09-19 by diffing the gauge
+      with and without that change. No test currently known to read these.
 - [ ] **`information_schema.table_constraints` omits the CHECK rows Postgres
       synthesizes for NOT NULL.** We report only the PRIMARY KEY where PG
       reports two CHECKs beside it.
