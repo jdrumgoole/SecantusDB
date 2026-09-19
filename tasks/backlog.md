@@ -1072,30 +1072,40 @@ These work end-to-end but cut corners.
 
 
 - [ ] **OPEN — `test_connect_error_multi_hosts_each_message_preserved` failed
-      twice in a full psycopg-gauge run and the cause is UNKNOWN
-      (2026-09-18).** The test connects to two RFC 5737 reserved addresses and
-      requires both attempts to fail with `connection timeout expired`. It
-      never touches this server.
+      twice in a full psycopg-gauge run; cause UNKNOWN, and socket exhaustion
+      is now RULED OUT (measured 2026-09-19).** The test connects to two RFC
+      5737 reserved addresses and requires both attempts to fail with
+      `connection timeout expired`. It never touches this server.
 
-      It was deselected on 2026-09-17 with a reason that blamed the host's
-      network stack for answering the unroutable address immediately. **That
-      explanation was never measured and is now contradicted**: a standalone
-      loop connects 6/6 in 4.04s with exactly the expected error, and a full
-      gauge run with the test re-enabled passed both the sync and async twin
-      (4.05s / 4.11s) while the box was under a concurrent xdist suite. The
-      deselect has been removed — a test that passes should not be excluded,
-      and excluding it with a wrong reason hides the real fault forever.
+      It was deselected on 2026-09-17 with a reason blaming the host's network
+      stack, which was never measured and was wrong: standalone it connects 6/6
+      in 4.04s with the expected error, and re-enabled in a full gauge run both
+      twins pass (PR #1484). The unexplained part is that two runs failed it in
+      **0.04s** — an immediate `connect()` error rather than a timeout.
 
-      What is actually known: two full runs on 2026-09-17 failed it in 0.04s.
-      A 0.04s failure means `connect()` returned an error immediately instead
-      of timing out, so the assertion on the message text failed. The cause of
-      THAT is open. **If it recurs, capture the actual exception text before
-      theorising** — the error names the errno, which distinguishes a routing
-      answer from resource exhaustion (a leaked-socket / fd-exhaustion story in
-      our own harness is the hypothesis that was never checked, and is the one
-      that would be our bug).
+      **The hypothesis worth testing was ours, not the network's:** that the
+      harness exhausts a finite socket resource late in a run, so a later
+      connect fails at once (`EADDRNOTAVAIL` / `EMFILE` return immediately,
+      which is exactly the 40ms signature). **Measured during a full gauge run
+      and refuted**:
 
-Specific items that were left out of the slice that introduced their feature area.
+      | | observed | limit |
+      | --- | --- | --- |
+      | ephemeral ports in use (127.0.0.1, 49152-65535) | peak **1,155** | 16,384 |
+      | sockets in TIME_WAIT | sawtooth 66 -> 1,153 | — |
+      | descriptors held by the runner | flat | `ulimit -n` = 1,048,576 |
+
+      Port use peaks at ~7% of the range and SAWTOOTHS rather than climbing, so
+      there is no leak and no exhaustion; `ulimit -n` alone makes descriptor
+      exhaustion implausible. Caveat on that last row: the fd sample followed
+      the runner process, not the pytest child it spawns, so it is weak
+      evidence — the port measurement is system-wide and is the decisive one
+      for an immediate-failure signature.
+
+      So: still unexplained, one strong candidate eliminated with evidence.
+      **If it recurs, capture the exception text and errno before theorising** —
+      that names the failure and distinguishes the remaining possibilities.
+      Probe: `scratchpad/sockwatch.py` in the session that measured this.
 
 - [ ] **OPEN — Rust PostgreSQL server: per-statement COST, and a read-path
       ceiling at N≈4 (measured 2026-09-18; supersedes the "lift the global
