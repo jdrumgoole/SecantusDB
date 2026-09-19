@@ -30,6 +30,7 @@ import bson
 from sqlglot import exp
 
 from secantus.sql import copyfmt, engine, errors, pggeo, pgwire, planner, typemap
+from secantus.sql import numeric as _numeric
 from secantus.sql.catalog import ENUM_TYPE_OID_BASE, USER_TYPE_ARRAY_OID_OFFSET, Catalog
 from secantus.sql.session import Session
 
@@ -592,8 +593,15 @@ def _encode_multirange(value: Any, mr_oid: int) -> bytes:
 
 
 def _encode_numeric(value: Any) -> bytes:
-    """Encode a Decimal as Postgres' binary ``numeric`` (base-10000 digits)."""
-    d = value if isinstance(value, Decimal) else Decimal(str(value))
+    """Encode a Decimal as Postgres' binary ``numeric`` (base-10000 digits).
+
+    Accepts a stored numeric of EITHER form (`secantus.sql.numeric`): a wide
+    one is a document, and ``Decimal(str(<dict>))`` raised ConversionSyntax --
+    an XX000 for a ``numrange`` / ``nummultirange`` with a wide bound in the
+    binary format, which psycopg's random-data leak tests hit."""
+    d = _numeric.to_decimal(value)
+    if d is None:
+        d = Decimal(str(value))
     if d.is_nan():
         return struct.pack("!HhHH", 0, 0, 0xC000, 0)
     if d.is_infinite():
