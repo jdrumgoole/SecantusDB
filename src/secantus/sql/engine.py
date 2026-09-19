@@ -4982,6 +4982,45 @@ def _function_param_types(udf: exp.Expression) -> list[str | None]:
     return types
 
 
+def _function_param_decl_oids(udf: exp.Expression) -> list[int | None]:
+    """Declared pg_type oids of a ``CREATE FUNCTION`` signature (positional),
+    where the DECLARED type differs from the storage tag's oid — i.e. the
+    ``varchar`` / ``bpchar`` family, which folds to the ``text`` tag.
+
+    Columns already carry this distinction as ``decl_oid``; parameters did not,
+    so ``CREATE FUNCTION f1(int, varchar)`` recorded ``proargtypes = '23 25'``
+    where PostgreSQL 14 records ``'23 1043'`` (measured 2026-09-19). A client
+    reading the argument back was told the parameter was ``text``.
+
+    None where the declared type IS the tag's own type, so a consumer can fall
+    back to the tag and nothing else changes.
+    """
+    oids: list[int | None] = []
+    for p in udf.expressions or []:
+        dt = p.args.get("kind") if isinstance(p, exp.ColumnDef) else p
+        if not isinstance(dt, exp.DataType) and dt is not None:
+            # The bare-Identifier case: re-parse the spelling as a type so the
+            # same identity helper applies to `f(varchar)` and `f(a varchar)`.
+            dt = _datatype_from_name(dt.sql(dialect="postgres"))
+        if isinstance(dt, exp.DataType):
+            ident = typemap.cast_type_identity(dt)
+            oids.append(ident[0] if ident is not None else None)
+        else:
+            oids.append(None)
+    return oids
+
+
+def _datatype_from_name(spelling: str) -> exp.DataType | None:
+    """Parse a bare type spelling (``varchar``, ``double precision``) into a
+    DataType, or None when it isn't one."""
+    try:
+        parsed = sqlglot.parse_one(f"CAST(NULL AS {spelling})", read="postgres")
+    except Exception:
+        return None
+    target = parsed.args.get("to") if isinstance(parsed, exp.Cast) else None
+    return target if isinstance(target, exp.DataType) else None
+
+
 def _create_function(
     stmt: exp.Create, db: str, catalog: Catalog, session: Session | None = None
 ) -> SQLResult:
@@ -5000,6 +5039,10 @@ def _create_function(
 
     language = "sql"
     return_tag = None
+    # The DECLARED return oid, where it differs from the tag's — `RETURNS
+    # varchar` recorded prorettype 25 where PostgreSQL 14 records 1043
+    # (measured 2026-09-19). Mirror of the parameter-side gap.
+    return_decl_oid = None
     is_table = False
     returns_trigger = False
     for prop in stmt.args.get("properties").expressions if stmt.args.get("properties") else []:
@@ -5019,6 +5062,8 @@ def _create_function(
                     returns_trigger = True
                 else:
                     return_tag = typemap.type_tag_for_sql(prop.this)
+                    ident = typemap.cast_type_identity(prop.this)
+                    return_decl_oid = ident[0] if ident is not None else None
 
     if language == "c" and stmt.this.this.name.lower() == "lo_manage":
         # contrib/lo's orphan-cleanup trigger function, created verbatim by
@@ -5053,7 +5098,9 @@ def _create_function(
             "nargs": nargs,
             "params": params,
             "param_types": _function_param_types(udf),
+            "param_decl_oids": _function_param_decl_oids(udf),
             "return_tag": return_tag,
+            "return_decl_oid": return_decl_oid,
             "is_table": is_table,
             "body": body,
             "language": language,
@@ -5067,7 +5114,7 @@ _PROC_MODE_KW = {"in", "out", "inout", "variadic"}
 
 
 def _parse_proc_params(params_text: str) -> list[dict]:
-    """Parse a procedure parameter list into ``[{name, mode, type_tag}]``.
+    """Parse a procedure parameter list into ``[{name, mode, type_tag, decl_oid}]``.
     Postgres accepts the argmode before OR after the name (``a INOUT int`` and
     ``INOUT a int`` are both valid); a bare ``type`` is an unnamed IN param."""
     out: list[dict] = []
@@ -5088,14 +5135,26 @@ def _parse_proc_params(params_text: str) -> list[dict]:
         if len(kept) >= 2:
             name, type_toks = kept[0], kept[1:]
         tag = None
+        # The DECLARED oid, where it differs from the tag's — `varchar` and
+        # `bpchar` fold to the `text` tag, so a procedure's `proargtypes` read
+        # 25 where PostgreSQL 14 records 1043 (measured 2026-09-19). Same gap
+        # the function path had, on the same catalog surface.
+        decl_oid = None
         if type_toks:
             try:
                 dt = sqlglot.parse_one(f"CAST(NULL AS {' '.join(type_toks)})", read="postgres").to
                 tag = typemap.type_tag_for_sql(dt)
+                ident = typemap.cast_type_identity(dt)
+                decl_oid = ident[0] if ident is not None else None
             except Exception:  # noqa: BLE001 — unknown type spelling → text
                 tag = None
         out.append(
-            {"name": name.strip('"') if name else None, "mode": mode, "type_tag": tag or "text"}
+            {
+                "name": name.strip('"') if name else None,
+                "mode": mode,
+                "type_tag": tag or "text",
+                "decl_oid": decl_oid,
+            }
         )
     return out
 
@@ -5153,6 +5212,7 @@ def _create_procedure(raw: str, db: str, catalog: Catalog, session: Session | No
             "nargs": nargs,
             "params": [p["name"] for p in params],
             "param_types": [p["type_tag"] for p in params],
+            "param_decl_oids": [p.get("decl_oid") for p in params],
             "param_modes": [p["mode"] for p in params],
             "return_tag": None,
             "is_table": False,
@@ -5228,11 +5288,22 @@ def _procedure_out_columns(func: dict) -> list[ColumnDesc]:
     params = func.get("params") or []
     modes = func.get("param_modes") or []
     types = func.get("param_types") or []
-    return [
-        ColumnDesc(pname or "?column?", tag, typemap.PG_OID.get(tag, 25))
-        for pname, mode, tag in zip(params, modes, types, strict=False)
-        if mode in ("OUT", "INOUT")
-    ]
+    # The DECLARED oid wins over the tag's: an INOUT `varchar` describes its
+    # result column as 1043 on PostgreSQL 14 (measured 2026-09-19), where the
+    # `text` tag it folds to would say 25. This one is WIRE-visible — it is the
+    # RowDescription a client reads for `CALL`.
+    decls = func.get("param_decl_oids") or []
+    out = []
+    for i, (pname, mode, tag) in enumerate(zip(params, modes, types, strict=False)):
+        if mode not in ("OUT", "INOUT"):
+            continue
+        decl = decls[i] if i < len(decls) else None
+        out.append(
+            ColumnDesc(
+                pname or "?column?", tag, decl if decl is not None else typemap.PG_OID.get(tag, 25)
+            )
+        )
+    return out
 
 
 def _call_out_columns(tail: str, db: str, catalog: Catalog) -> list[ColumnDesc] | None:

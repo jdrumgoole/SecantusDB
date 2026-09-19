@@ -147,3 +147,28 @@ def test_drop_procedure(storage, session):
     assert e.value.sqlstate == "42883"
     # IF EXISTS silences the missing-procedure error.
     assert q(storage, session, "DROP PROCEDURE IF EXISTS d").command_tag == "DROP PROCEDURE"
+
+
+def test_procedure_records_the_declared_char_type(storage, session):
+    """A procedure's `varchar` parameter is 1043 in the catalog AND on the wire.
+
+    `varchar` / `bpchar` fold to the `text` storage tag, so a procedure's
+    `pg_proc.proargtypes` read 25 where PostgreSQL 14 records 1043, and the
+    RowDescription for an INOUT parameter described the result column as 25
+    where PostgreSQL 14 sends 1043. Both measured 2026-09-19.
+
+    The wire half is asserted separately because it is what a client actually
+    decodes — a catalog row it never reads cannot mislead it, a column oid can.
+    """
+    q(
+        storage,
+        session,
+        "CREATE PROCEDURE pvc(a INT, b INOUT VARCHAR) LANGUAGE plpgsql AS "
+        "$$ BEGIN b := 'x'; END; $$",
+    )
+    res = q(storage, session, "SELECT proargtypes FROM pg_proc WHERE proname='pvc'")
+    assert res.rows[0][0] == "23 1043", "declared varchar is 1043, not the text tag's 25"
+
+    r = q(storage, session, "CALL pvc(1, 'a')")
+    assert [c.name for c in r.columns] == ["b"]
+    assert [c.pg_oid for c in r.columns] == [1043], "INOUT varchar describes as 1043"

@@ -507,16 +507,29 @@ def _info_columns(db: str, session: Session, storage: Any, catalog: Catalog) -> 
                     "table_name": t.name,
                     "column_name": col.name,
                     "ordinal_position": i,
-                    "data_type": (
-                        "ARRAY"
-                        if typemap.is_array_tag(col.type_tag)
-                        else typemap.SQL_TYPE_NAME.get(col.type_tag, "text")
-                    ),
+                    "data_type": _column_data_type_name(col),
                     "is_nullable": "NO" if not col.nullable else "YES",
                     "column_default": _column_default_text(col),
                 }
             )
     return rows
+
+
+def _column_data_type_name(col: Any) -> str:
+    """``information_schema.columns.data_type`` for a column.
+
+    Prefers the DECLARED type over the storage tag: `varchar` and `char(n)`
+    fold to the `text` tag, so every such column reported ``text`` where
+    PostgreSQL 14 reports ``character varying`` / ``character`` (measured
+    2026-09-19). The column already carried the declared oid for
+    ``pg_attribute.atttypid``; only this render ignored it.
+    """
+    if typemap.is_array_tag(col.type_tag):
+        return "ARRAY"
+    decl = getattr(col, "decl_oid", None)
+    if decl is not None and decl in _DECL_OID_SQL_NAME:
+        return _DECL_OID_SQL_NAME[decl]
+    return typemap.SQL_TYPE_NAME.get(col.type_tag, "text")
 
 
 def _column_default_text(col: Any) -> str | None:
@@ -1194,7 +1207,7 @@ def function_result_for_oid(db: str, catalog: Catalog, oid: int) -> str | None:
     fn = _function_by_oid(db, catalog, oid)
     if fn is None:
         return None
-    result = _type_name(fn.get("return_tag"))
+    result = _return_type_name(fn)
     return f"SETOF {result}" if fn.get("is_table") else result
 
 
@@ -1592,16 +1605,64 @@ def _type_name(tag: str | None) -> str:
     return typemap.SQL_TYPE_NAME.get(tag, tag)
 
 
+#: SQL name of a declared-only type oid, for the contexts that render a type
+#: NAME rather than its oid (``pg_get_function_arguments``,
+#: ``information_schema.parameters.data_type``). PostgreSQL 14 renders
+#: ``character varying`` / ``character`` there, not the ``pg_type.typname``
+#: spelling (``varchar`` / ``bpchar``) — measured 2026-09-19.
+_DECL_OID_SQL_NAME = {
+    typemap.VARCHAR_OID: "character varying",
+    typemap.BPCHAR_OID: "character",
+}
+
+
+def _function_argtype_oids(fn: dict) -> list[int]:
+    """``proargtypes`` oids for a stored function — the DECLARED oid where the
+    signature named a type whose identity differs from its storage tag's
+    (``varchar``/``bpchar`` fold to the ``text`` tag), else the tag's own oid."""
+    tags = fn.get("param_types") or []
+    decls = fn.get("param_decl_oids") or []
+    out = []
+    for i, tag in enumerate(tags):
+        decl = decls[i] if i < len(decls) else None
+        out.append(decl if decl is not None else _type_oid(tag))
+    return out
+
+
+def _return_type_oid(fn: dict) -> int:
+    """``prorettype`` for a stored function — the declared oid where it differs
+    from the storage tag's, else the tag's own."""
+    decl = fn.get("return_decl_oid")
+    return decl if decl is not None else _type_oid(fn.get("return_tag"))
+
+
+def _return_type_name(fn: dict) -> str:
+    """The rendered return-type name, preferring the declared type."""
+    decl = fn.get("return_decl_oid")
+    if decl is not None and decl in _DECL_OID_SQL_NAME:
+        return _DECL_OID_SQL_NAME[decl]
+    return _type_name(fn.get("return_tag"))
+
+
+def _param_type_name(fn: dict, i: int) -> str:
+    """The rendered type name of a stored function's i-th parameter, preferring
+    the declared type over the storage tag."""
+    tags = fn.get("param_types") or []
+    decls = fn.get("param_decl_oids") or []
+    decl = decls[i] if i < len(decls) else None
+    if decl is not None and decl in _DECL_OID_SQL_NAME:
+        return _DECL_OID_SQL_NAME[decl]
+    return _type_name(tags[i] if i < len(tags) else None)
+
+
 def _function_signature(fn: dict) -> str:
     """The ``(argname argtype, …)`` argument list for pg_get_function_arguments /
     a CREATE FUNCTION reconstruction."""
     names = fn.get("params") or []
-    types = fn.get("param_types") or []
     parts = []
     for i in range(fn.get("nargs", 0)):
         nm = names[i] if i < len(names) else None
-        tt = types[i] if i < len(types) else None
-        typ = _type_name(tt)
+        typ = _param_type_name(fn, i)
         parts.append(f"{nm} {typ}" if nm else typ)
     return ", ".join(parts)
 
@@ -1654,7 +1715,7 @@ def _pg_proc(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
     ]
     for fn in _functions(db, catalog):
         key = f"{fn['name']}/{fn['nargs']}"
-        argtypes = " ".join(str(_type_oid(t)) for t in (fn.get("param_types") or []))
+        argtypes = " ".join(str(o) for o in _function_argtype_oids(fn))
         names = [n for n in (fn.get("params") or []) if n is not None]
         rows.append(
             {
@@ -1663,7 +1724,7 @@ def _pg_proc(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
                 "pronamespace": _NS_OIDS["public"],
                 "proowner": 10,
                 "prolang": _SQL_LANG_OID,
-                "prorettype": _type_oid(fn.get("return_tag")),
+                "prorettype": _return_type_oid(fn),
                 "pronargs": fn.get("nargs", 0),
                 "pronargdefaults": 0,
                 "proargtypes": argtypes,
@@ -1699,7 +1760,7 @@ def _info_routines(db: str, session: Session, storage: Any, catalog: Catalog) ->
                 "routine_schema": "public",
                 "routine_name": fn["name"],
                 "routine_type": "FUNCTION",
-                "data_type": _type_name(fn.get("return_tag")),
+                "data_type": _return_type_name(fn),
                 "routine_body": "EXTERNAL",
                 "routine_definition": fn.get("body"),
                 "external_language": str(fn.get("language", "sql")).upper(),
@@ -1716,7 +1777,6 @@ def _info_parameters(db: str, session: Session, storage: Any, catalog: Catalog) 
     for fn in _functions(db, catalog):
         specific = _specific_name(fn, oids)
         names = fn.get("params") or []
-        types = fn.get("param_types") or []
         for i in range(fn.get("nargs", 0)):
             rows.append(
                 {
@@ -1726,7 +1786,7 @@ def _info_parameters(db: str, session: Session, storage: Any, catalog: Catalog) 
                     "ordinal_position": i + 1,
                     "parameter_mode": "IN",
                     "parameter_name": names[i] if i < len(names) else None,
-                    "data_type": _type_name(types[i] if i < len(types) else None),
+                    "data_type": _param_type_name(fn, i),
                 }
             )
     return rows
@@ -2086,6 +2146,25 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
         }
         for tag, typname in typemap.PG_TYPENAME.items()
     ]
+    # Declared types with no storage tag of their own (``varchar``, ``bpchar``).
+    # Their tag folds to ``text``, so the tag-keyed comprehension above can't
+    # name them and columns declared that way pointed at an oid with no row.
+    rows.extend(
+        {
+            "oid": oid,
+            "typname": typname,
+            "typcollation": 0,
+            "typnamespace": _NS_OIDS["pg_catalog"],
+            "typbasetype": 0,
+            "typtypmod": -1,
+            "typnotnull": False,
+            "typdefault": None,
+            "typtype": "b",
+            "typarray": array_oid,
+            "typdelim": ",",
+        }
+        for oid, typname, array_oid in typemap.DECLARED_ONLY_TYPES
+    )
     # Every table has a composite row type (typtype 'c') like real Postgres —
     # psycopg's ``TypeInfo.fetch(conn, "<table>")`` resolves it (and its
     # ``typarray``) to register the table-row array loader.

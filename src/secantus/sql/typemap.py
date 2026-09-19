@@ -1693,6 +1693,27 @@ BPCHAR_OID = 1042
 VARCHAR_OID = 1043
 
 
+#: Declared types that have no storage tag of their own, as
+#: ``(oid, typname, array_oid)``.
+#:
+#: ``varchar`` and ``bpchar`` both fold to the ``text`` tag for storage, so the
+#: tag-keyed ``PG_TYPENAME`` — which is what ``pg_type`` is built from — can
+#: only ever name ONE of the three. Columns still record the declared oid
+#: (``decl_oid``, 1043/1042), so before this table every ``varchar`` and
+#: ``char(n)`` column in the catalog pointed at an oid with NO ``pg_type`` row:
+#: a dangling reference that a client joining ``pg_attribute`` to ``pg_type``
+#: resolves to nothing.
+#:
+#: Values measured against PostgreSQL 14 on 2026-09-19. Array rows are
+#: deliberately absent — this catalog emits no ``_<type>`` rows for ANY type
+#: while still populating ``typarray``, and these two follow that convention
+#: rather than becoming the only array types in the table.
+DECLARED_ONLY_TYPES: tuple[tuple[int, str, int], ...] = (
+    (VARCHAR_OID, "varchar", 1015),
+    (BPCHAR_OID, "bpchar", 1014),
+)
+
+
 def enforce_declared_length(value: Any, pg_oid: int | None, typmod: int, column: str = "") -> Any:
     """Apply a ``char(n)`` / ``varchar(n)`` declared length, Postgres-style.
 
