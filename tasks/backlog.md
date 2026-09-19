@@ -9928,6 +9928,13 @@ shared storage engine or building large new protocol subsystems:
   be the value (e.g. `__numkey` for a wide one) with the display value carried
   beside it. Only values past 34 digits that differ only in scale are
   affected; ordinary numerics group correctly.
+- [ ] **`invoke sync` fails on Windows** (2026-09-19): the task runs `uv sync`
+  with `pty=True`, and Windows has no `pty` module ("your platform doesn't
+  support the 'pty' module"), so the stale-`_secantus_core` guard's own advice
+  cannot be followed there. Workaround: run
+  `uv sync --all-extras --reinstall-package secantus-core` directly. Same class
+  as the `detached_run.py` Windows fixes in #1497: `pty=True` should be
+  `pty=not WINDOWS` (grep `tasks.py` for other `pty=True` calls).
 - [ ] **HAVING on a numeric aggregate compares at Decimal128 precision**
   (Python pgserver, 2026-09-19). The select-list `sum` / `min` / `max` over a
   numeric are exact (pushed and folded in Python), but a HAVING term compares
