@@ -257,13 +257,30 @@ SELECT price, at FROM m;
 -- price -> Decimal('19.99'),  at -> datetime(2020, 1, 2, 3, 4, 5, tzinfo=UTC)
 ```
 
-One **precision ceiling** follows from the BSON storage forms and is a
-permanent divergence from real Postgres:
+#### Exact `numeric`
 
-- **`numeric` holds at most 34 significant digits.** Values are stored
-  as IEEE 754-2008 Decimal128, so a wider `numeric` rounds to 34
-  significant digits where real Postgres keeps arbitrary precision.
-  (pgjdbc's `NumericTransfer2Test` asserts wider round-trips.)
+`numeric` is exact at any width Postgres allows (131072 integer digits,
+16383 fraction digits), with its display scale. A value that an IEEE
+754-2008 Decimal128 holds exactly -- digits *and* scale -- is stored as that
+Decimal128, which is what a Mongo client reading the same collection sees for
+ordinary values. Anything wider, or with an exponent below Decimal128's
+`-6176`, is stored in the column as a document:
+
+```
+{"__numeric": "<Postgres' text for the value>", "__numkey": "<sort key>"}
+```
+
+`__numkey` is a string whose byte order is the numeric order (NaN highest, as
+in Postgres), so a `WHERE` on a numeric column stays a Mongo filter that is
+exact for both forms. This is the same representation the Rust server uses.
+Sums, `min` / `max`, `avg` and arithmetic are computed exactly; an `ORDER BY`
+on a numeric is done by the server after the pipeline, since no Mongo sort
+orders a Decimal128 against a document.
+
+Two limits remain, shared with the Rust server: `GROUP BY` / `DISTINCT` / a
+join key treat two WIDE values that differ only in trailing zeros (`1e40` and
+`1e40.0`) as different, and a `HAVING` on a numeric aggregate compares at
+Decimal128 precision.
 
 #### Sub-millisecond timestamps
 

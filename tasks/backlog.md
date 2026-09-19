@@ -9901,42 +9901,33 @@ shared storage engine or building large new protocol subsystems:
   faker suites (`test_adapt::test_random`, `test_copy::test_copy_from_leaks`/
   `test_copy_table_across`) that assert exact round-trips, so they flap on
   whether a random draw's microseconds land on a whole millisecond.
-- [x] **CONFIRMED REAL, and a DOCUMENTED PERMANENT CEILING (re-measured
-  2026-09-01) — not an open task.** Unlike the sub-millisecond entry above,
-  this one still reproduces: a 39-digit value stores as
-  `123456789012345678901234567890123500000` and a 50-digit one rounds at digit
-  34. That is IEEE 754-2008 Decimal128 doing what it does, and `docs/sql.md`
-  already lists it under "precision ceilings" as *a permanent divergence from
-  real Postgres*, so it is recorded in the place a user looks rather than
-  pending here.
-
-  **Deliberately not "fixed" with a companion field**, though the sub-ms work
-  proves the pattern would store the exact digits: reads would then return the
-  exact value while predicates and ORDER BY still compared the ROUNDED
-  Decimal128, so two values differing beyond digit 34 could sort inconsistently
-  with what they display. Today both sides are rounded and therefore agree.
-  Trading a consistent ceiling for an inconsistent one is the worse deal;
-  closing this properly means a text/dual representation for `numeric` that the
-  comparison and sort paths also use. **The RUST pgserver did exactly that on
-  2026-09-09** (`secantus-pgplan/src/numeric.rs`: `__numeric` text +
-  `__numkey` sort key, used by WHERE lowering, ORDER BY, arithmetic and the
-  `_id` index) — the ceiling below is now the PYTHON server's only.
-
-  **`numrange` bounds inherit it, in the EXPRESSION path too** (measured
-  2026-09-18): a bound is coerced to Decimal128 when the range is built, so
-  `select %s::numrange` rounds a 36-digit bound even though `select %s::numeric`
-  does not. That is the same deliberate one-representation choice
-  (`typemap.number_literal`: literals are Decimal128 too), so it was left
-  alone; it is what psycopg's `test_random[0-t]` hits on a wide draw. Porting
-  the Rust server's text + sort-key representation would close both. Original
-  entry:
-
-- **`numeric` beyond 34 significant digits.** Stored as Decimal128, which
-  caps at 34 digits (same shared constraint); wider *stored* values round.
-  The binary wire codec now round-trips arbitrarily wide values (PR #564), so
-  the param-only `test_dump_numeric_exhaustive` passes; only values that
-  actually persist through Decimal128 storage lose precision. Exact wide
-  storage would need a text/dual representation for `numeric`.
+- [ ] **Wide `numeric` values equal but for trailing zeros split in GROUP BY /
+  DISTINCT / a join key** (both servers, measured 2026-09-19). `1e40` and
+  `1e40.0` are one group in Postgres. Both are stored as the wide
+  `{__numeric, __numkey}` document when wider than Decimal128, and `$group` /
+  `$lookup` compare the whole document, text included. Needs the group key to
+  be the value (e.g. `__numkey` for a wide one) with the display value carried
+  beside it. Only values past 34 digits that differ only in scale are
+  affected; ordinary numerics group correctly.
+- [ ] **HAVING on a numeric aggregate compares at Decimal128 precision**
+  (Python pgserver, 2026-09-19). The select-list `sum` / `min` / `max` over a
+  numeric are exact (pushed and folded in Python), but a HAVING term compares
+  its accumulator inside the pipeline, so it keeps the native `$sum` (which
+  also skips a wide value).
+- [ ] **RUST pgserver: `decimal128_bracket` is wrong for tiny wide values**
+  (found 2026-09-19 porting it). For a value like `1.2…(35 digits)E-6150` it
+  truncates to 34 digits, the exponent falls below -6176, and it falls back to
+  `(0, 1E-6176)` -- a bracket that does not contain the value, so a range
+  filter against such a constant selects wrong Decimal128 rows. The Python
+  port snaps to the real Decimal128 grid instead (`numeric._bracket`,
+  `step_exp = max(adjusted - 33, -6176)`); verified 0 violations over 20,000
+  values including that band. Port the same to `crates/secantus-pgplan/src/numeric.rs`
+  and probe against PostgreSQL.
+- [ ] **`$convert` string -> decimal raises `Inexact` out of the engine**
+  (Python Mongo engine, 2026-09-19). `{$convert: {input: "<35-digit string>",
+  to: "decimal", onError: …}}` raises a raw `decimal.Inexact` instead of
+  answering or honouring `onError`. Probe mongod for the right answer (it may
+  round) before fixing.
 - [x] **RESOLVED — STALE (measured 2026-09-01). Pipeline abort works.** Ran the
   test's own body through libpq's `PGconn` pipeline API against both servers:
 

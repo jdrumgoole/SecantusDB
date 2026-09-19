@@ -34,6 +34,7 @@ from sqlglot import exp
 
 from secantus.paths import set_path
 from secantus.sql import errors, ranges, subms, typemap
+from secantus.sql import numeric as _numeric
 from secantus.sql.catalog import (
     CheckConstraint,
     Column,
@@ -656,6 +657,29 @@ def _subms_cmp(field: str, op: str, value: Any, tag: str | None) -> dict[str, An
     if tag not in subms.SUBMS_TAGS or "." in field:
         return None
     return subms.cmp_filter(field, op, value)
+
+
+def _numeric_cmp(field: str, op: str, value: Any, tag: str | None) -> dict[str, Any] | None:
+    """An exact ``numeric`` comparison filter, or None to use the plain one.
+
+    A numeric column holds a Decimal128 or, past what one holds exactly, a
+    ``{__numeric, __numkey}`` document (`secantus.sql.numeric`). A plain Mongo
+    comparison is wrong for both kinds at once -- a document sorts above every
+    number in BSON order -- and puts NaN below the numbers where Postgres puts
+    it above. `numeric.filter_for` is exact for either form."""
+    if tag != "numeric" or value is None:
+        return None
+    d = _numeric.to_decimal(value)
+    return None if d is None else _numeric.filter_for(field, op, d)
+
+
+def _numeric_in(field: str, values: list[Any]) -> dict[str, Any]:
+    """``field IN (…)`` over a numeric column: one exact equality per value."""
+    arms = [_numeric_cmp(field, "$eq", v, "numeric") for v in values if v is not None]
+    arms = [a for a in arms if a is not None]
+    if not arms:
+        return {field: {"$in": []}}
+    return arms[0] if len(arms) == 1 else {"$or": arms}
 
 
 _CMP_OPS: dict[type, tuple[str, str]] = {
@@ -1431,8 +1455,13 @@ def _expr_to_filter(
                 value = _scalar.evaluate(inner, _const_scope, ctx)
                 if not isinstance(value, (list, tuple)):
                     raise errors.feature_not_supported(f"unsupported ANY operand: {inner.sql()}")
-                return {field: {"$in": [typemap.coerce(v, tag) for v in value]}}
+                coerced = [typemap.coerce(v, tag) for v in value]
+                if tag == "numeric":
+                    return _numeric_in(field, coerced)
+                return {field: {"$in": coerced}}
             values = [typemap.coerce(_literal(e), tag) for e in elements]
+            if tag == "numeric":
+                return _numeric_in(field, values)
             return {field: {"$in": values}}
         pair = _field_literal_pair(left, right)
         if pair is not None:
@@ -1440,7 +1469,7 @@ def _expr_to_filter(
             if tag == "citext":
                 return _citext_cmp_filter(field, "$eq", _literal(pair[1]))
             value = typemap.coerce(_literal(pair[1]), tag)
-            sub = _subms_cmp(field, "$eq", value, tag)
+            sub = _subms_cmp(field, "$eq", value, tag) or _numeric_cmp(field, "$eq", value, tag)
             return sub if sub is not None else {field: value}
         return _null_guarded_expr_cmp("$eq", left, right, resolve)
 
@@ -1454,7 +1483,7 @@ def _expr_to_filter(
             # SQL ``<>`` is unknown (not true) for a NULL operand; Mongo's bare
             # ``$ne`` would match NULL/missing rows, so guard the field non-null.
             value = typemap.coerce(_literal(pair[1]), tag)
-            sub = _subms_cmp(field, "$ne", value, tag)
+            sub = _subms_cmp(field, "$ne", value, tag) or _numeric_cmp(field, "$ne", value, tag)
             negated = sub if sub is not None else {field: {"$ne": value}}
             return {"$and": [negated, {field: {"$ne": None}}]}
         return _null_guarded_expr_cmp("$ne", left, right, resolve)
@@ -1467,14 +1496,16 @@ def _expr_to_filter(
                 if tag == "citext":
                     return _citext_cmp_filter(field, op, _literal(right))
                 value = typemap.coerce(_literal(right), tag)
-                sub = _subms_cmp(field, op, value, tag)
+                sub = _subms_cmp(field, op, value, tag) or _numeric_cmp(field, op, value, tag)
                 return sub if sub is not None else {field: {op: value}}
             if _is_field_node(right) and _is_literalish(left):
                 field, tag = _field(right, resolve)
                 if tag == "citext":
                     return _citext_cmp_filter(field, flipped, _literal(left))
                 value = typemap.coerce(_literal(left), tag)
-                sub = _subms_cmp(field, flipped, value, tag)
+                sub = _subms_cmp(field, flipped, value, tag) or _numeric_cmp(
+                    field, flipped, value, tag
+                )
                 return sub if sub is not None else {field: {flipped: value}}
             return _null_guarded_expr_cmp(_EXPR_CMP[cls], left, right, resolve)
 
@@ -1498,6 +1529,8 @@ def _expr_to_filter(
         # A NULL candidate can only turn a non-match unknown — and unknown never
         # satisfies a WHERE — so drop it; Mongo's ``$in`` with ``None`` would
         # instead match NULL rows.
+        if tag == "numeric":
+            return _numeric_in(field, values)
         return {field: {"$in": [v for v in values if v is not None]}}
 
     if isinstance(node, exp.Between):
@@ -1508,6 +1541,9 @@ def _expr_to_filter(
             return _merge_and([low, high])
         low = typemap.coerce(_literal(node.args["low"]), tag)
         high = typemap.coerce(_literal(node.args["high"]), tag)
+        lo_f, hi_f = _numeric_cmp(field, "$gte", low, tag), _numeric_cmp(field, "$lte", high, tag)
+        if lo_f is not None and hi_f is not None:
+            return {"$and": [lo_f, hi_f]}
         return {field: {"$gte": low, "$lte": high}}
 
     if isinstance(node, exp.Operator):
@@ -6790,8 +6826,11 @@ def _plan_plain_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
         project[nm] = f"${path}"
         out_columns.append((nm, tag))
     pipeline: list[dict[str, Any]] = [{"$project": project}]
-    _append_sort_limit(pipeline, stmt, out_columns, table)
-    return PipelineSelectPlan(table.collection, base_filter, pipeline, out_columns)
+    post_aggregates: list[tuple[str, str, Any]] = []
+    _append_sort_limit(pipeline, stmt, out_columns, table, post_aggregates=post_aggregates)
+    return PipelineSelectPlan(
+        table.collection, base_filter, pipeline, out_columns, post_aggregates=post_aggregates
+    )
 
 
 def _build_evaluated_single(stmt: exp.Select, table: TableDef) -> EvaluatedSelectPlan:
@@ -6948,9 +6987,15 @@ def _plan_distinct_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPl
         out_columns.append((nm, tag))
     pipeline: list[dict[str, Any]] = [{"$project": project}]
     _append_distinct(pipeline, out_columns)
-    _append_sort_limit(pipeline, stmt, out_columns, table)
+    post_aggregates: list[tuple[str, str, Any]] = []
+    _append_sort_limit(pipeline, stmt, out_columns, table, post_aggregates=post_aggregates)
     return PipelineSelectPlan(
-        table.collection, base_filter, pipeline, out_columns, out_enum_types=out_enum_types
+        table.collection,
+        base_filter,
+        pipeline,
+        out_columns,
+        out_enum_types=out_enum_types,
+        post_aggregates=post_aggregates,
     )
 
 
@@ -7137,8 +7182,13 @@ def _register_numeric_avg(
     accumulators: dict[str, Any],
     project: dict[str, Any] | None,
     post_aggregates: list[tuple[str, str, Any]],
+    *,
+    numeric: bool = False,
 ) -> tuple[str, ...]:
     """Accumulate sum(X) and a non-null count for an exact-typed `avg`.
+
+    Over a ``numeric`` argument the sum is the pushed marker list
+    (`numeric.fold`), since `$sum` skips a wide value and rounds at 34 digits.
 
     Postgres divides those two as numerics, so the answer carries
     `select_div_scale`'s scale — `avg(i)` over 1, 2, 4 is
@@ -7147,7 +7197,7 @@ def _register_numeric_avg(
     digit and a value with no scale at all."""
     n_f, sx_f = f"{fname}__n", f"{fname}__sx"
     accumulators[n_f] = {"$sum": {"$cond": [{"$ne": [{"$ifNull": [val, None]}, None]}, 1, 0]}}
-    accumulators[sx_f] = {"$sum": val}
+    accumulators[sx_f] = {"$push": {_numeric.AGG_MARKERS["sum"]: val}} if numeric else {"$sum": val}
     if project is not None:
         project[n_f] = f"${n_f}"
         project[sx_f] = f"${sx_f}"
@@ -7156,7 +7206,12 @@ def _register_numeric_avg(
 
 
 def _accumulator_for(
-    func: str, field: str | None, tag: str | None, filter_cond: Any = None
+    func: str,
+    field: str | None,
+    tag: str | None,
+    filter_cond: Any = None,
+    *,
+    exact_numeric: bool = True,
 ) -> tuple[dict[str, Any], str]:
     """Build a ``$group`` accumulator from an already-resolved field path + tag.
 
@@ -7181,6 +7236,14 @@ def _accumulator_for(
         matched = {"$ne": [{"$ifNull": [val, None]}, None]}
         cond = {"$and": [filter_cond, matched]} if filter_cond is not None else matched
         return {"$sum": {"$cond": [cond, 1, 0]}}, "int8"
+    if exact_numeric and tag == "numeric" and func in _numeric.AGG_MARKERS:
+        # Mongo cannot fold a numeric exactly: `$sum` skips a wide document
+        # and rounds at 34 digits, `$min` / `$max` put a document above every
+        # number. Push marked values; the executor folds them in Python
+        # (`numeric.fold`). HAVING opts out (`exact_numeric=False`): it
+        # compares the accumulator inside the pipeline.
+        body = {"$cond": [filter_cond, val, None]} if filter_cond is not None else val
+        return {"$push": {_numeric.AGG_MARKERS[func]: body}}, "numeric"
     if func == "sum":
         body = {"$cond": [filter_cond, val, 0]} if filter_cond is not None else val
         return {"$sum": body}, _sum_tag(tag)
@@ -7208,6 +7271,8 @@ def _accumulator(
     table: TableDef,
     filter_cond: Any = None,
     arg_node: exp.Expression | None = None,
+    *,
+    exact_numeric: bool = True,
 ) -> tuple[dict[str, Any], str]:
     if (
         col is None
@@ -7239,7 +7304,13 @@ def _accumulator(
         return {f"${func}": body}, tag
     if col is None:
         return _accumulator_for(func, None, None, filter_cond)
-    return _accumulator_for(func, table.field_for(col), table.type_for(col), filter_cond)
+    return _accumulator_for(
+        func,
+        table.field_for(col),
+        table.type_for(col),
+        filter_cond,
+        exact_numeric=exact_numeric,
+    )
 
 
 # DISTINCT changes the result only for these — MIN/MAX of a set equal MIN/MAX of
@@ -7718,7 +7789,12 @@ def _grouping_set_branch(
             # last digit, and no scale at all.
             fname = names.fresh(alias or "avg")
             _register_numeric_avg(
-                f"${table.field_for(agg[1])}", fname, accumulators, project, post_aggregates
+                f"${table.field_for(agg[1])}",
+                fname,
+                accumulators,
+                project,
+                post_aggregates,
+                numeric=table.type_for(agg[1]) == "numeric",
             )
             out_columns.append((fname, "numeric"))
         elif agg is not None and agg[0] in (_STAT_FUNCS | _BIT_AGG_FUNCS):
@@ -7863,7 +7939,7 @@ def _plan_grouping_sets_select(
         pipeline.append(
             {"$unionWith": {"coll": table.collection, "pipeline": prefix + add_stage + sub}}
         )
-    _append_sort_limit(pipeline, stmt, out_columns, table)
+    _append_sort_limit(pipeline, stmt, out_columns, table, post_aggregates=post_aggregates)
     return PipelineSelectPlan(
         table.collection, base_filter, pipeline, out_columns, post_aggregates=post_aggregates
     )
@@ -7999,7 +8075,12 @@ def _plan_grouping_sets_window_select(
             if agg[0] == "avg" and _is_exact_agg_arg(agg[1], table.type_for):
                 fname = names.fresh("avg")
                 helpers = _register_numeric_avg(
-                    f"${table.field_for(agg[1])}", fname, accumulators, None, post_aggregates
+                    f"${table.field_for(agg[1])}",
+                    fname,
+                    accumulators,
+                    None,
+                    post_aggregates,
+                    numeric=table.type_for(agg[1]) == "numeric",
                 )
                 field_tags[fname] = "numeric"
                 _keep_agg_helpers(helpers, field_tags, agg_field_names)
@@ -8251,7 +8332,12 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
             # last digit, and no scale at all.
             fname = names.fresh(alias or "avg")
             _register_numeric_avg(
-                f"${table.field_for(agg[1])}", fname, accumulators, project, post_aggregates
+                f"${table.field_for(agg[1])}",
+                fname,
+                accumulators,
+                project,
+                post_aggregates,
+                numeric=table.type_for(agg[1]) == "numeric",
             )
             out_columns.append((fname, "numeric"))
         elif agg is not None and agg[0] in (_STAT_FUNCS | _BIT_AGG_FUNCS):
@@ -8403,7 +8489,9 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
         dedup_id = {name: f"${name}" for name, _tag in out_columns}
         pipeline.append({"$group": {"_id": dedup_id}})
         pipeline.append({"$project": {"_id": 0, **{n: f"$_id.{n}" for n in dedup_id}}})
-    _append_sort_limit(pipeline, stmt, out_columns, table, order_aggs=order_aggs)
+    _append_sort_limit(
+        pipeline, stmt, out_columns, table, order_aggs=order_aggs, post_aggregates=post_aggregates
+    )
     return PipelineSelectPlan(
         table.collection,
         base_filter,
@@ -8756,7 +8844,12 @@ def _plan_group_window_select(stmt: exp.Select, table: TableDef) -> EvaluatedSel
             if agg[0] == "avg" and _is_exact_agg_arg(agg[1], table.type_for):
                 fname = names.fresh("avg")
                 helpers = _register_numeric_avg(
-                    f"${table.field_for(agg[1])}", fname, accumulators, None, post_aggregates
+                    f"${table.field_for(agg[1])}",
+                    fname,
+                    accumulators,
+                    None,
+                    post_aggregates,
+                    numeric=table.type_for(agg[1]) == "numeric",
                 )
                 field_tags[fname] = "numeric"
                 _keep_agg_helpers(helpers, field_tags, agg_field_names)
@@ -9036,7 +9129,9 @@ def _having_to_match(
             )
             agg_fields[agg] = fname
             return fname, tag
-        acc, tag = _accumulator(func, col, table, fcond, arg_node=_agg_expr_arg(term))
+        acc, tag = _accumulator(
+            func, col, table, fcond, arg_node=_agg_expr_arg(term), exact_numeric=False
+        )
         if agg not in agg_fields:
             fname = f"__having_{len(agg_fields)}"
             accumulators[fname] = acc
@@ -10945,7 +11040,10 @@ def _plan_join_select(
             out_enum_types[len(out_columns)] = src_col.enum_type
         out_columns.append((name, tag))
         out_sources.append(_source_table_attnum(inner, amap))
-    _append_join_tail(pipeline, stmt, resolve, project, out_columns, amap)
+    post_aggregates: list[tuple[str, str, Any]] = []
+    _append_join_tail(
+        pipeline, stmt, resolve, project, out_columns, amap, post_aggregates=post_aggregates
+    )
     return PipelineSelectPlan(
         base.collection,
         {},
@@ -10954,6 +11052,7 @@ def _plan_join_select(
         out_enum_types=out_enum_types,
         derived=derived,
         out_sources=out_sources,
+        post_aggregates=post_aggregates,
     )
 
 
@@ -10984,7 +11083,12 @@ def _join_aggregate_of(
 
 
 def _join_accumulator(
-    func: str, arg: exp.Expression | None, resolve: Resolve, filter_cond: Any = None
+    func: str,
+    arg: exp.Expression | None,
+    resolve: Resolve,
+    filter_cond: Any = None,
+    *,
+    exact_numeric: bool = True,
 ) -> tuple[dict[str, Any], str]:
     if arg is None:
         return _accumulator_for(func, None, None, filter_cond)
@@ -11001,7 +11105,7 @@ def _join_accumulator(
             body = {"$cond": [filter_cond, body, 0 if func == "sum" else None]}
         return {f"${func}": body}, _agg_out_tag(func, _infer_scalar_tag(arg, resolve))
     path, tag = resolve(arg)
-    return _accumulator_for(func, path, tag, filter_cond)
+    return _accumulator_for(func, path, tag, filter_cond, exact_numeric=exact_numeric)
 
 
 def _agg_key(
@@ -11153,7 +11257,12 @@ def _plan_join_group_select(
             # last digit, and no scale at all.
             fname = names.fresh(alias or "avg")
             _register_numeric_avg(
-                f"${resolve(agg[1])[0]}", fname, accumulators, project, post_aggregates
+                f"${resolve(agg[1])[0]}",
+                fname,
+                accumulators,
+                project,
+                post_aggregates,
+                numeric=resolve(agg[1])[1] == "numeric",
             )
             out_columns.append((fname, "numeric"))
         elif agg is not None and agg[0] in (_STAT_FUNCS | _BIT_AGG_FUNCS):
@@ -11296,7 +11405,14 @@ def _plan_join_group_select(
         dedup_id = {name: f"${name}" for name, _tag in out_columns}
         pipeline.append({"$group": {"_id": dedup_id}})
         pipeline.append({"$project": {"_id": 0, **{n: f"$_id.{n}" for n in dedup_id}}})
-    _append_sort_limit(pipeline, stmt, out_columns, amap=amap, order_aggs=order_aggs)
+    _append_sort_limit(
+        pipeline,
+        stmt,
+        out_columns,
+        amap=amap,
+        order_aggs=order_aggs,
+        post_aggregates=post_aggregates,
+    )
     return PipelineSelectPlan(
         base.collection,
         {},
@@ -11422,7 +11538,12 @@ def _join_grouping_set_branch(
             # last digit, and no scale at all.
             fname = names.fresh(alias or "avg")
             _register_numeric_avg(
-                f"${resolve(agg[1])[0]}", fname, accumulators, project, post_aggregates
+                f"${resolve(agg[1])[0]}",
+                fname,
+                accumulators,
+                project,
+                post_aggregates,
+                numeric=resolve(agg[1])[1] == "numeric",
             )
             out_columns.append((fname, "numeric"))
         elif agg is not None and agg[0] in (_STAT_FUNCS | _BIT_AGG_FUNCS):
@@ -11596,7 +11717,7 @@ def _plan_join_grouping_sets_select(
         pipeline.append(
             {"$unionWith": {"coll": base.collection, "pipeline": list(join_prefix) + sub}}
         )
-    _append_sort_limit(pipeline, stmt, out_columns, amap=amap)
+    _append_sort_limit(pipeline, stmt, out_columns, amap=amap, post_aggregates=post_aggregates)
     return PipelineSelectPlan(
         base.collection, {}, pipeline, out_columns, derived=derived, post_aggregates=post_aggregates
     )
@@ -11712,7 +11833,12 @@ def _plan_join_grouping_sets_window_select(
             if agg[0] == "avg" and _is_exact_agg_arg(agg[1], _tag_of):
                 fname = names.fresh("avg")
                 helpers = _register_numeric_avg(
-                    f"${resolve(agg[1])[0]}", fname, accumulators, None, post_aggregates
+                    f"${resolve(agg[1])[0]}",
+                    fname,
+                    accumulators,
+                    None,
+                    post_aggregates,
+                    numeric=resolve(agg[1])[1] == "numeric",
                 )
                 field_tags[fname] = "numeric"
                 _keep_agg_helpers(helpers, field_tags, agg_field_names)
@@ -11944,7 +12070,12 @@ def _plan_join_group_window_select(
             if agg[0] == "avg" and _is_exact_agg_arg(agg[1], _tag_of):
                 fname = names.fresh("avg")
                 helpers = _register_numeric_avg(
-                    f"${resolve(agg[1])[0]}", fname, accumulators, None, post_aggregates
+                    f"${resolve(agg[1])[0]}",
+                    fname,
+                    accumulators,
+                    None,
+                    post_aggregates,
+                    numeric=resolve(agg[1])[1] == "numeric",
                 )
                 field_tags[fname] = "numeric"
                 _keep_agg_helpers(helpers, field_tags, agg_field_names)
@@ -12115,7 +12246,7 @@ def _join_having_to_match(
             )
             agg_fields[key] = fname
             return fname, tag
-        acc, tag = _join_accumulator(func, arg, resolve, fcond)
+        acc, tag = _join_accumulator(func, arg, resolve, fcond, exact_numeric=False)
         if key not in agg_fields:
             fname = f"__having_{len(agg_fields)}"
             accumulators[fname] = acc
@@ -13845,6 +13976,7 @@ def _append_join_tail(
     project: dict[str, Any],
     out_columns: list[tuple[str, str]],
     amap: dict[str, tuple[str, TableDef]] | None = None,
+    post_aggregates: list[tuple[str, str, Any]] | None = None,
 ) -> None:
     """Project, optionally dedup (DISTINCT), then sort/skip/limit for a join.
 
@@ -13859,6 +13991,7 @@ def _append_join_tail(
     terms: list[tuple[str, int, bool]] = []
     enum_labels: dict[str, list[str]] = {}
     hidden: list[str] = []
+    hidden_tags: dict[str, Any] = {}
     if order is not None:
         for o in order.expressions:
             direction = -1 if o.args.get("desc") else 1
@@ -13875,10 +14008,11 @@ def _append_join_tail(
             if key is None:
                 if distinct:
                     raise errors.undefined_column(name)
-                path, _ = resolve(o.this)
+                path, hidden_tag = resolve(o.this)
                 key = f"__ord_{len(hidden)}"
                 project[key] = f"${path}"
                 hidden.append(key)
+                hidden_tags[key] = hidden_tag
             terms.append((key, direction, _nulls_first(o)))
             if amap is not None:
                 labels = _enum_labels_for_column(_column_for_order_node(o.this, amap))
@@ -13887,6 +14021,15 @@ def _append_join_tail(
     pipeline.append({"$project": project})
     if distinct:
         _append_distinct(pipeline, out_columns)
+    if _defer_numeric_sort(
+        terms,
+        {**dict(out_columns), **hidden_tags},
+        enum_labels,
+        _limit_skip(stmt),
+        post_aggregates,
+        drop=hidden,
+    ):
+        return
     _emit_pipeline_sort(pipeline, terms, enum_labels)
     limit, skip = _limit_skip(stmt)
     if skip:
@@ -13947,6 +14090,33 @@ def _resolve_order_output(
     return _column_name(node)
 
 
+def _defer_numeric_sort(
+    terms: list[tuple[str, int, bool]],
+    tags: dict[str, Any],
+    enum_labels: dict[str, list[str]],
+    limit_skip: tuple[int | None, int],
+    post_aggregates: list[tuple[str, str, Any]] | None,
+    *,
+    drop: list[str],
+) -> bool:
+    """Hand ORDER BY (and the LIMIT / OFFSET after it) to the executor when a
+    sort term is a ``numeric``; True when it did.
+
+    A numeric column holds a Decimal128 or a wide ``{__numeric, __numkey}``
+    document (`secantus.sql.numeric`), and no MQL sort orders the two forms
+    together -- BSON puts every document above every number -- nor places NaN
+    where Postgres does. A numeric AGGREGATE is worse: it is still a pushed
+    marker list during the pipeline, folded only afterwards. So the sort runs
+    in Python, last (``py_sort``, in `executor._apply_post_aggregates`), the
+    way the Rust server sorts every result. Only when the plan has a
+    post-aggregate list to carry it; otherwise the pipeline sort stays."""
+    if post_aggregates is None or not any(tags.get(name) == "numeric" for name, _, _ in terms):
+        return False
+    limit, skip = limit_skip
+    post_aggregates.append(("", "py_sort", (terms, dict(enum_labels), skip, limit, drop)))
+    return True
+
+
 def _append_sort_limit(
     pipeline: list[dict[str, Any]],
     stmt: exp.Expression,
@@ -13954,6 +14124,7 @@ def _append_sort_limit(
     table: TableDef | None = None,
     amap: dict[str, tuple[str, TableDef]] | None = None,
     order_aggs: dict[str, str] | None = None,
+    post_aggregates: list[tuple[str, str, Any]] | None = None,
 ) -> None:
     valid_names = {n for n, _ in out_columns}
     if order_aggs:
@@ -13977,6 +14148,10 @@ def _append_sort_limit(
                 labels = _enum_labels_for_column(src)
                 if labels is not None:
                     enum_labels[col] = labels
+        if _defer_numeric_sort(
+            terms, dict(out_columns), enum_labels, _limit_skip(stmt), post_aggregates, drop=[]
+        ):
+            return
         _emit_pipeline_sort(pipeline, terms, enum_labels)
     limit, skip = _limit_skip(stmt)
     if skip:

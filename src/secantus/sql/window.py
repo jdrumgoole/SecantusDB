@@ -35,6 +35,7 @@ from sqlglot import exp
 
 from secantus.paths import get_path
 from secantus.sql import errors, typemap
+from secantus.sql import numeric as _numeric
 
 # func node -> aggregate name, for the aggregate windows.
 _AGG_WINDOWS: dict[type, str] = {
@@ -194,7 +195,9 @@ def _window_comparable(values: list[Any]) -> list[Any]:
 
     Returns bare values, not sort keys — these also serve as the PEER and frame
     keys, where a RANGE offset does arithmetic on them."""
-    if any(isinstance(v, (Mapping, list)) for v in values):
+    # A wide `numeric` is a document too (`secantus.sql.numeric`), but it is a
+    # NUMBER: routed through the jsonb order it ranked below every Decimal128.
+    if any(isinstance(v, (Mapping, list)) and not _numeric.is_wide(v) for v in values):
         return [None if v is None else typemap.total_order_key(v) for v in values]
     return [typemap.sort_key_value(v) for v in values]
 
