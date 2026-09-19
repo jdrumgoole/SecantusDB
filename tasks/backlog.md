@@ -9914,15 +9914,6 @@ shared storage engine or building large new protocol subsystems:
   numeric are exact (pushed and folded in Python), but a HAVING term compares
   its accumulator inside the pipeline, so it keeps the native `$sum` (which
   also skips a wide value).
-- [ ] **RUST pgserver: `decimal128_bracket` is wrong for tiny wide values**
-  (found 2026-09-19 porting it). For a value like `1.2…(35 digits)E-6150` it
-  truncates to 34 digits, the exponent falls below -6176, and it falls back to
-  `(0, 1E-6176)` -- a bracket that does not contain the value, so a range
-  filter against such a constant selects wrong Decimal128 rows. The Python
-  port snaps to the real Decimal128 grid instead (`numeric._bracket`,
-  `step_exp = max(adjusted - 33, -6176)`); verified 0 violations over 20,000
-  values including that band. Port the same to `crates/secantus-pgplan/src/numeric.rs`
-  and probe against PostgreSQL.
 - [ ] **`$convert` string -> decimal raises `Inexact` out of the engine**
   (Python Mongo engine, 2026-09-19). `{$convert: {input: "<35-digit string>",
   to: "decimal", onError: …}}` raises a raw `decimal.Inexact` instead of
