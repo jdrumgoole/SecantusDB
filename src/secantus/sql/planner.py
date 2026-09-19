@@ -13810,8 +13810,26 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
             return "text"
         if fname in ("has_table_privilege", "has_column_privilege"):
             return "bool"
-        # Advisory locks (#135): pg_try_* / pg_advisory_unlock* -> bool; the
-        # void-returning pg_advisory_lock* fall through to the "text" default.
+        # PostgreSQL types these as void (2278). Describe reports void for
+        # them without running them (engine._VOLATILE_FN_TAGS), so Execute
+        # must too: once a driver prepares the statement, a Bind whose
+        # described shape differs from the executed one is rejected with
+        # 0A000 "cached plan must not change result type".
+        if fname in (
+            "pg_sleep",
+            "pg_notify",
+            "pg_advisory_lock",
+            "pg_advisory_lock_shared",
+            "pg_advisory_xact_lock",
+            "pg_advisory_xact_lock_shared",
+            "pg_advisory_unlock_all",
+        ):
+            return "void"
+        if fname in ("lo_creat", "lo_create"):
+            return "oid"
+        if fname == "lo_unlink":
+            return "int4"
+        # Advisory locks (#135): pg_try_* / pg_advisory_unlock* -> bool.
         if fname in (
             "pg_try_advisory_lock",
             "pg_try_advisory_lock_shared",
