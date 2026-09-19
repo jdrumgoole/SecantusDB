@@ -240,3 +240,19 @@ def test_exact_arithmetic_and_ranges(tmp_path) -> None:
         assert cur.fetchone() == (
             "[1.2345678901234567890123456789012345,10000000000000000000000000000000000000000)",
         )
+
+
+def test_wide_range_bounds_in_the_binary_format(tmp_path) -> None:
+    """The binary numeric encoder did `Decimal(str(value))` on the wide
+    document: XX000 for any numrange / nummultirange with a wide bound read in
+    the binary format (psycopg's random-data leak tests, 9 internal errors)."""
+    from psycopg.types.multirange import Multirange
+    from psycopg.types.range import Range
+
+    with _server(tmp_path) as conn:
+        conn.execute("create table r (id int primary key, nr numrange, nm nummultirange)")
+        rng = Range(_WIDE, _HUGE, "[)")
+        cur = conn.cursor(binary=True)
+        cur.execute("insert into r values (1, %s, %s)", (rng, Multirange([rng])))
+        cur.execute("select nr, nm from r")
+        assert cur.fetchone() == (rng, Multirange([rng]))
