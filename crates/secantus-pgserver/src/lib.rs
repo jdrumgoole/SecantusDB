@@ -12,6 +12,9 @@
 mod do_block;
 mod encoding;
 mod plpgsql_do;
+mod server;
+
+pub use server::{bind, RunningPgServer};
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};

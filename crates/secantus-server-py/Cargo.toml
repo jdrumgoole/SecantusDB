@@ -18,12 +18,23 @@ publish = false
 name = "_secantus_server"
 crate-type = ["cdylib"]
 
+[features]
+default = ["pgserver"]
+# Builds `PgServer` (the embedded PostgreSQL-wire server) into the extension.
+pgserver = ["dep:secantus-pgserver"]
+
 [dependencies]
 pyo3 = { version = "0.29", features = ["extension-module", "abi3-py310"] }
 secantus-storage = { path = "../secantus-storage" }
 secantus-storage-adapter = { path = "../secantus-storage-adapter" }
 secantus-commands = { path = "../secantus-commands" }
 secantus-server = { path = "../secantus-server" }
+# The PostgreSQL-wire server, behind a default-on feature so the whole
+# libpg_query / pgwire tree can be dropped from a build that does not want it
+# (`--no-default-features`) without touching this file. It is default-ON because
+# the wheel's `PgServer` is the point of the crate's PG half: a test that has to
+# spawn a subprocess is exactly the ergonomic this replaces.
+secantus-pgserver = { path = "../secantus-pgserver", optional = true }
 # Fast allocator: profiling (tasks/rust-perf-findings.md, Finding 1) put
 # malloc/realloc/free churn from BSON materialization among the top CPU costs on
 # every read/aggregate path. mimalloc replaces the system allocator process-wide
@@ -32,7 +43,21 @@ secantus-server = { path = "../secantus-server" }
 # malloc/realloc/free churn from BSON materialization among the top CPU costs on
 # every read/aggregate path. mimalloc replaces the system allocator process-wide
 # for the extension.
-mimalloc = "0.1"
+# `local_dynamic_tls` is REQUIRED, not a tuning knob. mimalloc's build script
+# otherwise compiles with `-ftls-model=initial-exec`, whose thread-locals must
+# fit in the fixed static TLS surplus glibc reserves at process start. This
+# extension is `dlopen`ed by CPython, and once the `pgserver` feature pulled in
+# libpg_query (which has thread-locals of its own) the total no longer fit:
+# Linux CI failed with
+#   ImportError: _secantus_server.abi3.so: cannot allocate memory in static TLS
+#   block
+# on a wheel that BUILT cleanly on every platform -- building a shared library
+# and being able to load it are different questions, and only the import test
+# asks the second one. `local_dynamic_tls` switches mimalloc to
+# `-ftls-model=local-dynamic`, which allocates on first use instead of
+# reserving. The trade is a slightly costlier TLS access on allocator paths,
+# which is not a trade at all against an extension that cannot be imported.
+mimalloc = { version = "0.1", features = ["local_dynamic_tls"] }
 
 # Cross-crate inlining of the hot serde/matcher/aggregate paths that span
 # secantus-server-py → secantus-storage → secantus-core → bson. Build-time cost
@@ -40,3 +65,12 @@ mimalloc = "0.1"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Vendored, locally-patched pgwire (crates/vendor/pgwire) -- the same patch
+# `crates/secantus-pgserver/Cargo.toml` applies. `[patch.crates-io]` is honoured
+# only from a WORKSPACE ROOT manifest, and this crate is its own workspace, so
+# secantus-pgserver's patch does NOT reach it: without this stanza the
+# extension would silently link the unpatched upstream pgwire and lose
+# `StoredStatement::parameter_oids`.
+[patch.crates-io]
+pgwire = { path = "../vendor/pgwire" }

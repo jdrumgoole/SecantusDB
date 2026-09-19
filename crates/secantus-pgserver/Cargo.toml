@@ -18,7 +18,10 @@ bson = "2"
 async-trait = "0.1"
 futures = "0.3"
 pgwire = { version = "0.40", default-features = false, features = ["server-api"] }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
+# "sync" is for the shutdown `watch` channel the accept loop and every
+# connection task select on -- do not rely on another crate's feature
+# unification to supply it.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync"] }
 # The pure query engine, for filtering VIRTUAL tables' computed rows --
 # storage filters real tables, but a virtual row never reaches storage.
 secantus-core = { path = "../secantus-core" }
@@ -37,6 +40,13 @@ bytes = "1.12.1"
 # The trait pgwire encodes BINARY values through -- same version as its own,
 # or the `ToSql` we implement is a different trait from the one it calls.
 postgres-types = "0.2.14"
+
+[dev-dependencies]
+# A real PostgreSQL client for the embedded-server tests: the durability test
+# has to prove that writes the SERVER acknowledged over the wire survive
+# `stop()`, which a direct `Storage` call would not show.
+tokio-postgres = "0.7"
+tempfile = "3"
 
 [[bin]]
 name = "secantusd-pg"

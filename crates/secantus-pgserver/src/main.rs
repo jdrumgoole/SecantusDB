@@ -1,11 +1,16 @@
 //! `secantusd-pg` -- the standalone PostgreSQL-wire server (P1 slice).
+//!
+//! A CLI wrapper, nothing more: argument parsing, the readiness line, and the
+//! signal wait. The accept loop, the shutdown drain, and the storage ownership
+//! that makes the close-checkpoint run all live in `secantus_pgserver::bind`,
+//! which the embedded Python handle (`_secantus_server`'s `PgServer`) calls
+//! too -- so there is one serve path, not two.
 
 use std::sync::mpsc;
 use std::sync::Arc;
 
-use secantus_pgserver::{DatabaseRegistry, HandlerFactory, PgHandler};
+use secantus_pgserver::{bind, DatabaseRegistry};
 use secantus_storage::Storage;
-use tokio::net::TcpListener;
 
 /// `--version` output: the version, and the source tree it was built from.
 fn version_text() -> String {
@@ -16,8 +21,10 @@ fn version_text() -> String {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+// NOT `#[tokio::main]`: `bind` owns the runtime, and `RunningPgServer::stop`
+// drops it -- which panics if it happens inside a runtime context. `main` is a
+// plain blocking function that waits on a signal.
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `secantusd-pg [<home> [<addr>]] [--database NAME]...`: every
     // `--database` is one more name a client may connect to without a
     // `CREATE DATABASE` first; the builtin `postgres` / `template1` always are.
@@ -88,58 +95,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // is the first thing to drive this binary the way a new user would.
     std::fs::create_dir_all(&home)
         .map_err(|e| format!("could not create storage path {home}: {e}"))?;
-    let storage = Arc::new(Storage::open(&home)?);
-    let listener = TcpListener::bind(&addr).await?;
+    let storage = Storage::open(&home)?;
+    let mut server = bind(&addr, storage, databases)?;
+
     // One line, flushed, so a harness can wait for readiness. It reports the
     // address the listener actually BOUND, not the one requested, so that
     // `127.0.0.1:0` is usable: the kernel names the port and this line is how
     // the caller learns it. A harness that instead probes for a free port and
     // passes it in cannot be made race-free -- the probe socket must close
     // before the child binds.
-    let bound = listener.local_addr()?;
-    println!("secantusd-pg listening on {bound} storage={home}");
+    println!(
+        "secantusd-pg listening on {} storage={home}",
+        server.address()
+    );
 
-    // Serve until a signal arrives. The accept loop runs as a task so the main
-    // task can wait on the signal and then close storage.
-    let serving = {
-        let storage = storage.clone();
-        tokio::spawn(async move {
-            loop {
-                let (sock, _) = match listener.accept().await {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                let handler = Arc::new(PgHandler::new(storage.clone(), databases.clone()));
-                tokio::spawn(async move {
-                    let _ = pgwire::tokio::process_socket(
-                        sock,
-                        None,
-                        Arc::new(HandlerFactory(handler)),
-                    )
-                    .await;
-                });
-            }
-        })
-    };
-
-    // Block until SIGINT or SIGTERM, then stop cleanly so WiredTiger closes via
-    // drop. WITHOUT THIS the process dies with no checkpoint and every
-    // acknowledged write since the last one is lost -- measured 2026-08-31:
-    // a SIGTERM after CREATE TABLE + INSERT left the catalog document and the
-    // rows both gone, while the client had been told the writes succeeded.
+    // Block until SIGINT or SIGTERM, then stop cleanly so WiredTiger closes.
+    // WITHOUT THIS the process dies with no checkpoint and every acknowledged
+    // write since the last one is lost -- measured 2026-08-31: a SIGTERM after
+    // CREATE TABLE + INSERT left the catalog document and the rows both gone,
+    // while the client had been told the writes succeeded. `stop` drains the
+    // connections and drops the last `Arc<Storage>`, which is where the
+    // close-checkpoint runs.
     let (tx, rx) = mpsc::channel::<()>();
     ctrlc::set_handler(move || {
         let _ = tx.send(());
     })?;
-    let _ = tokio::task::spawn_blocking(move || rx.recv()).await;
+    let _ = rx.recv();
 
-    serving.abort();
-    // Drop the last `Arc` so `Storage`'s own close (and its checkpoint) runs
-    // before the process exits.
-    drop(serving);
-    match Arc::try_unwrap(storage) {
-        Ok(s) => drop(s),
-        Err(still_shared) => drop(still_shared),
-    }
+    server.stop();
     Ok(())
 }
