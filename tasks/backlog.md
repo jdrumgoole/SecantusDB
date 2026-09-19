@@ -15527,15 +15527,24 @@ Two things worth keeping:
 
 ## pgjdbc `DatabaseMetaDataTest`: 35 failures in 156 tests (2026-09-19)
 
-The Python SQL server fails 35 of `org.postgresql.test.jdbc2.DatabaseMetaDataTest`'s
-156 tests. **21 share one signature** — `AssertionFailedError: expected: <true>
+The Python SQL server fails **33** of `org.postgresql.test.jdbc2.DatabaseMetaDataTest`'s
+156 tests (was 35 — `funcWithoutNames()` was fixed 2026-09-19 by
+`_function_param_types` resolving UNNAMED parameter types, which had been
+recording `void`). Most of the rest **share one signature** — `AssertionFailedError: expected: <true>
 but was: <false>`, which is `rs.next()` returning false: the metadata query ran
 and returned NO ROWS.
 
 Affected methods include `functionColumns`, `informationAboutArrayTypes`,
 `ascDescIndexInfo`, `columnPrivileges`, `droppedColumns`, `escaping`,
 `foreignKeysToUniqueIndexes`, `funcReturningComposite`, `funcReturningTable`,
-`funcWithDirection`, `funcWithoutNames`, `getSQLTypeQueryCache`.
+`funcWithDirection`, `getSQLTypeQueryCache`.
+
+**One cause is now known and fixed**, which is evidence the cluster has several
+rather than one: `funcWithoutNames()` failed because `CREATE FUNCTION f(int,
+int)` recorded its argument types as `2278` (void) — sqlglot parses an unnamed
+parameter as a bare `Identifier`, not a `ColumnDef` carrying a `DataType`. That
+resolved 1 test (2 instances, it runs under both protocols) and nothing else,
+so do not expect a single remaining explanation for the other 33.
 
 **What it is NOT** — six hypotheses tested and eliminated by measurement, so the
 next person does not re-run them:
