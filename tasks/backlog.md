@@ -15489,3 +15489,43 @@ Two things worth keeping:
   driver saw zero getMores — the fix looked complete and the test still failed.
   An upserted `_id` is the only unbounded field a result carries, which is what
   makes the size limit reachable at all.
+
+## pgjdbc `DatabaseMetaDataTest`: 35 failures in 156 tests (2026-09-19)
+
+The Python SQL server fails 35 of `org.postgresql.test.jdbc2.DatabaseMetaDataTest`'s
+156 tests. **21 share one signature** — `AssertionFailedError: expected: <true>
+but was: <false>`, which is `rs.next()` returning false: the metadata query ran
+and returned NO ROWS.
+
+Affected methods include `functionColumns`, `informationAboutArrayTypes`,
+`ascDescIndexInfo`, `columnPrivileges`, `droppedColumns`, `escaping`,
+`foreignKeysToUniqueIndexes`, `funcReturningComposite`, `funcReturningTable`,
+`funcWithDirection`, `funcWithoutNames`, `getSQLTypeQueryCache`.
+
+**What it is NOT** — six hypotheses tested and eliminated by measurement, so the
+next person does not re-run them:
+
+| hypothesis | measurement |
+| --- | --- |
+| catalogs empty | populated: `pg_class` 2, `pg_type` 95, `pg_proc` 13, `pg_namespace` 4 |
+| the tests' setUp DDL fails | `CREATE FUNCTION` / `INDEX` / `SCHEMA` / `ALTER … DROP COLUMN` / `COMMENT ON` all succeed |
+| catalog lookups regressed | **identical** between the 2026-08-16 server (`c07b9487`) and current, across proc-by-name, attrs-of-table, index-of-table, array-elem-type, class-by-name |
+| vendored driver moved | `vendor/pgjdbc` unchanged since 2026-08-01 |
+| include set widened | only `NotifyTest` was re-enabled (`2d15316d`) |
+| JDK mismatch | the runner selects JDK 21 (`_find_jdk21`) and one is installed, same as CI |
+| advertised version changed | `15.0` / `150000` on both old and current servers |
+
+So the objects exist, the catalogs hold rows, and the direct lookups behave as
+they did a month ago — yet the driver's own metadata calls come back empty. The
+gap is somewhere between the catalog contents and what `getFunctionColumns` /
+`getIndexInfo` / `getColumns` actually query, not in the server having lost data.
+
+**Do not call these "regressions".** They were surfaced by a baseline comparison
+whose populations do not match: today's run executes **5,819** tests against the
+baseline's **5,570** — 249 more, with the same driver, include set and server
+version. Where those 249 came from is itself unexplained and worth a look. A
+delta computed across different populations is not evidence in either direction.
+
+The baseline was regenerated on 2026-09-19 (82 failures / 49 entries) so the
+regression check compares like with like again; that is why these failures are
+recorded here rather than left implied by a permanently noisy check.
