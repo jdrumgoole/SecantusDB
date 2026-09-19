@@ -9966,6 +9966,14 @@ shared storage engine or building large new protocol subsystems:
   runner is the likely cause, but a 2.4x overhead on a trivial query is worth
   measuring (time `select 1, pg_sleep(0.25)` end to end on a loaded runner)
   before calling it environmental.
+  **Measured 2026-09-19 (Windows dev box, idle, psycopg, 20 runs):** median
+  264.6 ms, max 266.2 ms, so the server adds ~15 ms to a 250 ms sleep, not
+  2.4x. `select 1` alone is 0.5 ms. The CI failure therefore needs a stall of
+  more than ~330 ms somewhere on the runner. Not yet measured on a loaded CI
+  runner; leave open until it recurs or a CI timing run rules the server out.
+  Separately, the same query failed with 0A000 on its 7th run under psycopg's
+  auto-prepare (Describe typed `pg_sleep` as text, Execute as void). That is
+  fixed in #1514 and is not this flake: pgx does not revalidate the plan.
 - [ ] **HAVING on a numeric aggregate compares at Decimal128 precision**
   (Python pgserver, 2026-09-19). The select-list `sum` / `min` / `max` over a
   numeric are exact (pushed and folded in Python), but a HAVING term compares
