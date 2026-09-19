@@ -2550,7 +2550,6 @@ def copy_extract(
     storage: Any, db: str, catalog: Catalog, session: Session, plan: CopyPlan
 ) -> list[list]:
     """Read the target's rows as copy-stream cells (string / None) for COPY TO."""
-    from secantus.paths import get_path
 
     if plan.query_rows is not None:  # COPY (SELECT …) TO — already rendered
         return plan.query_rows
@@ -2564,7 +2563,7 @@ def copy_extract(
             tag = col.type_tag if col is not None else "any"
             if col is not None and getattr(col, "json_plain", False):
                 tag = "json_plain"  # plain json renders compact
-            value = get_path(doc, field)
+            value = _copy_cell(doc, col, field)
             if value is None:
                 cells.append(None)
             else:
@@ -2577,7 +2576,6 @@ def copy_extract(
 def copy_extract_raw(storage: Any, db: str, plan: CopyPlan) -> list[list]:
     """Read the COPY TO source as raw (unrendered) values for binary COPY —
     the per-type binary encoders need native values, not text cells."""
-    from secantus.paths import get_path
 
     if plan.query_raw_rows is not None:  # COPY (SELECT …) TO
         return [list(row) for row in plan.query_raw_rows]
@@ -2587,9 +2585,25 @@ def copy_extract_raw(storage: Any, db: str, plan: CopyPlan) -> list[list]:
         for name in plan.columns:
             col = plan.table.column(name)
             field = col.field if col is not None else name
-            cells.append(get_path(doc, field))
+            cells.append(_copy_cell(doc, col, field))
         out.append(cells)
     return out
+
+
+def _copy_cell(doc: dict[str, Any], col: Any, field: str) -> Any:
+    """One stored value for ``COPY <table> TO``, as SELECT would read it.
+
+    A ``timestamp`` keeps its sub-millisecond remainder in a hidden companion
+    field (`secantus.sql.subms`), which SELECT merges back and COPY did not --
+    so ``COPY t TO`` exported ``…00.412`` for a stored ``…00.412661``, in the
+    text AND the binary format, while ``COPY (SELECT …) TO`` was exact. COPY TO
+    is how a table is exported or backed up, so every export was truncated."""
+    from secantus.paths import get_path
+    from secantus.sql import executor as _executor
+
+    if col is None:
+        return get_path(doc, field)
+    return _executor._with_subms(doc, col)
 
 
 def _run_create_table_as(
