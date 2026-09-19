@@ -2667,7 +2667,7 @@ def _set_doc_field(doc: dict[str, Any], field: str, value: Any, tag: str | None 
     sub-millisecond remainder is split off into a hidden companion field — see
     `secantus.sql.subms`, and note the invariant there: the companion is
     resolved on EVERY write, never left stale."""
-    if tag in subms.SUBMS_TAGS and "." not in field:
+    if subms.carries_subms(tag) and "." not in field:
         value = subms.carry_subms(doc, field, value)
     elif tag is not None and ranges.is_range_tag(tag):
         # The range twin of the companion: a timestamp BOUND's remainder rides
@@ -4317,7 +4317,7 @@ def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
             set_doc[col.field] = typemap.enforce_declared_length(
                 typemap.coerce(raw, col.type_tag), col.decl_oid, col.typmod, col.name
             )
-        elif col.type_tag in subms.SUBMS_TAGS:
+        elif subms.carries_subms(col.type_tag):
             stored, companion, remainder = subms.subms_update_ops(
                 col.field, typemap.coerce(raw, col.type_tag)
             )

@@ -39,6 +39,17 @@ from typing import Any
 
 #: Type tags whose values are BSON dates and therefore lose microseconds.
 SUBMS_TAGS = frozenset({"timestamp", "timestamptz"})
+#: ...and the array forms, whose ELEMENTS are BSON dates. Only the write and
+#: whole-document read paths carry these (`carries_subms`); predicates, sorts
+#: and grouping stay scalar-only.
+SUBMS_ARRAY_TAGS = frozenset({"timestamp[]", "timestamptz[]"})
+
+
+def carries_subms(tag: str | None) -> bool:
+    """Whether a column of ``tag`` keeps a sub-millisecond companion on write
+    and merges it on read: a timestamp, or an array of them."""
+    return tag in SUBMS_TAGS or tag in SUBMS_ARRAY_TAGS
+
 
 #: Prefix for the hidden companion field. `__`-prefixed keys are the project's
 #: convention for storage fields that are not table columns.
@@ -128,7 +139,18 @@ def split(value: Any) -> tuple[Any, int]:
     The stored value is truncated to whole milliseconds — what BSON would do
     anyway — and the remainder is the 0-999 microseconds that would be lost.
     Anything that is not a datetime passes through with remainder 0.
+
+    An ARRAY of timestamps (a list, nested for more dimensions) splits element
+    by element: the remainder is the parallel list, or 0 when every element is
+    a whole millisecond. Each element is a BSON date too, so without this a
+    ``timestamp[]`` column lost every element's microseconds on storage.
     """
+    if isinstance(value, list):
+        parts = [split(v) for v in value]
+        remainders = [r for _, r in parts]
+        if not any(remainders):
+            return value, 0
+        return [v for v, _ in parts], remainders
     if not isinstance(value, _dt.datetime):
         return value, 0
     remainder = value.microsecond % 1000
@@ -142,8 +164,13 @@ def merge(value: Any, remainder: Any) -> Any:
 
     Defensive about the stored remainder: a value that is not an int in 0-999 is
     ignored rather than trusted, so a hand-edited or foreign document cannot
-    produce a nonsensical time.
+    produce a nonsensical time. An array merges element by element against a
+    remainder list of the same length (anything else is ignored).
     """
+    if isinstance(value, list):
+        if not isinstance(remainder, list) or len(remainder) != len(value):
+            return value
+        return [merge(v, r) for v, r in zip(value, remainder, strict=True)]
     if not isinstance(value, _dt.datetime) or not isinstance(remainder, int):
         return value
     if isinstance(remainder, bool) or not 0 < remainder < 1000:
