@@ -4939,11 +4939,32 @@ def _function_input_nargs(udf: exp.Expression) -> int:
 
 def _function_param_types(udf: exp.Expression) -> list[str | None]:
     """Parameter type tags of a ``CREATE FUNCTION`` signature (positional), for
-    ``pg_proc`` / ``information_schema.parameters`` reflection. Unknown → None."""
+    ``pg_proc`` / ``information_schema.parameters`` reflection. Unknown → None.
+
+    An UNNAMED parameter needs its own branch. sqlglot parses ``f(a int)`` as a
+    `ColumnDef` carrying a `DataType`, but bare ``f(int, int)`` as a plain
+    `Identifier` whose name is the type spelling — so the `DataType` test below
+    fails and the tag was `None`, which `_type_oid` maps to **2278 (void)**.
+    `pg_proc.proargtypes` then read ``'2278 2278'`` for ``f1(int, int)``: not
+    merely unknown but an OID this catalog does not even define, so a client
+    resolving it found nothing. Named parameters were unaffected, which is why
+    it survived — `CREATE FUNCTION g(a int, b text)` recorded ``'23 25'``
+    correctly all along.
+
+    Found 2026-09-19 from pgjdbc's `DatabaseMetaDataTest::functionColumns`,
+    which creates `f1(int, int)` and reads the argument rows back.
+    """
     types: list[str | None] = []
     for p in udf.expressions or []:
         dt = p.args.get("kind") if isinstance(p, exp.ColumnDef) else p
-        types.append(typemap.type_tag_for_sql(dt) if isinstance(dt, exp.DataType) else None)
+        if isinstance(dt, exp.DataType):
+            types.append(typemap.type_tag_for_sql(dt))
+        elif dt is not None:
+            # The bare-Identifier case: resolve the spelling as a type name.
+            # Handles multi-word builtins (`double precision` → `float8`).
+            types.append(typemap.builtin_tag_for_name(dt.sql(dialect="postgres")))
+        else:
+            types.append(None)
     return types
 
 
