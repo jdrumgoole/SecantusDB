@@ -8486,7 +8486,14 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
     having = stmt.args.get("having")
     having_match = (
         _having_to_match(
-            having.this, table, accumulators, agg_fields, group_cols, names, reductions
+            having.this,
+            table,
+            accumulators,
+            agg_fields,
+            group_cols,
+            names,
+            reductions,
+            defer_exact_numeric=True,
         )
         if having is not None
         else None
@@ -8956,7 +8963,14 @@ def _plan_group_window_select(stmt: exp.Select, table: TableDef) -> EvaluatedSel
         else:
             try:
                 having_match = _having_to_match(
-                    having.this, table, accumulators, agg_fields, group_cols, names, reductions
+                    having.this,
+                    table,
+                    accumulators,
+                    agg_fields,
+                    group_cols,
+                    names,
+                    reductions,
+                    defer_exact_numeric=True,
                 )
             except errors.SQLError as exc:
                 # Only "we can't lower this shape" (0A000) falls back — a real
@@ -9102,9 +9116,26 @@ def _having_to_match(
     group_cols: list[str],
     names: Any = None,
     reductions: Any = None,
+    *,
+    defer_exact_numeric: bool = False,
 ) -> dict[str, Any]:
+    """Lower HAVING to a ``$match`` on the grouped document.
+
+    ``defer_exact_numeric``: the caller can evaluate HAVING per grouped row
+    after the pipeline (it turns 0A000 into a residual), so a numeric sum /
+    min / max term raises 0A000 to get there. See ``field_tag``."""
+
     def rec(n: exp.Expression) -> dict[str, Any]:
-        return _having_to_match(n, table, accumulators, agg_fields, group_cols, names, reductions)
+        return _having_to_match(
+            n,
+            table,
+            accumulators,
+            agg_fields,
+            group_cols,
+            names,
+            reductions,
+            defer_exact_numeric=defer_exact_numeric,
+        )
 
     const = _constant_predicate_filter(node)
     if const is not None:
@@ -9130,6 +9161,20 @@ def _having_to_match(
         if agg is None:
             raise errors.feature_not_supported(f"unsupported HAVING term: {term.sql()}")
         func, col, distinct = agg
+        if (
+            defer_exact_numeric
+            and func in _numeric.AGG_MARKERS
+            and col is not None
+            and table.type_for(col) == "numeric"
+            and not isinstance(term, exp.Filter)
+        ):
+            # A numeric sum / min / max is exact only once folded in Python
+            # (`numeric.fold`); inside the pipeline `$sum` rounds at 34 digits
+            # and skips a wide value, so `HAVING sum(v) = <exact sum>` matched
+            # nothing. 0A000 sends the predicate to the per-grouped-row
+            # residual, which sees the folded value. Not for a FILTER term:
+            # the residual cannot evaluate `sum(v) FILTER (...)`.
+            raise errors.feature_not_supported("exact numeric aggregate in HAVING")
         agg = _single_agg_key(term, agg)
         where = _agg_filter_where(term)
         fcond = _filter_cond_to_agg(where, _table_resolve(table)) if where is not None else None
