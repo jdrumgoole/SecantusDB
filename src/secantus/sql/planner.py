@@ -539,7 +539,11 @@ def _enum_type_name(datatype: exp.Expression) -> str | None:
     """The user-defined type name of a column declared with a non-builtin type
     (a candidate ``CREATE TYPE … AS ENUM``), or None. Existence is verified at
     execution time (the planner is storage-free)."""
-    if isinstance(datatype, exp.DataType) and datatype.this and datatype.this.name == "USERDEFINED":
+    # `this` is a plain STRING for the keyword types sqlglot keeps unparsed
+    # (`REGCLASS`, `OID`) -- see `_serial_tag` -- and `.name` on it made
+    # `CREATE TABLE t (c regclass)` an XX000.
+    this = datatype.this if isinstance(datatype, exp.DataType) else None
+    if getattr(this, "name", None) == "USERDEFINED":
         return datatype.sql(dialect="postgres").strip('"')
     return None
 
@@ -549,8 +553,7 @@ def _enum_array_element_name(datatype: exp.Expression) -> str | None:
     (``mood[]`` — a candidate enum-array column), or None."""
     if (
         isinstance(datatype, exp.DataType)
-        and datatype.this
-        and datatype.this.name == "ARRAY"
+        and getattr(datatype.this, "name", None) == "ARRAY"  # `this` may be a str
         and datatype.expressions
     ):
         return _enum_type_name(datatype.expressions[0])
@@ -14338,6 +14341,87 @@ _COPY_BARE_OPTIONS_RE = re.compile(
 # A ``::numeric(p,-s)`` cast — the only spot Postgres syntax allows a negative
 # scale. Anchored on the ``::`` cast so a matching text inside a string literal
 # isn't touched.
+#: The OID-alias types sqlglot parses as an ``ObjectIdentifier`` rather than a
+#: data type -- which it cannot follow with ``[]``.
+_OID_ARRAY_NAMES = frozenset({"oid", "regclass", "regproc", "regtype"})
+_OID_ARRAY_SENTINEL = "secantus_oidarr_"
+
+
+def _rewrite_oid_array_types(sql: str) -> str:
+    """Replace ``oid[]`` / ``regclass[]`` / ``regproc[]`` / ``regtype[]`` in a
+    TYPE position with a sentinel sqlglot parses, before parse.
+
+    sqlglot reads those four names as an ``ObjectIdentifier``, not a data type,
+    and has no rule for one followed by ``[]``: ``'{1,2}'::oid[]`` was
+    ``Required keyword: 'expressions' missing for ... Bracket`` -- a syntax
+    error for SQL Postgres accepts, including any ``oid[]`` column in a CREATE
+    TABLE. psycopg renders an ``oid[]`` parameter exactly this way on a
+    client-side-binding cursor, which is how its random-data leak tests hit it
+    (47 of 3,000 random schemas). `_restore_oid_array_types` puts the real
+    type back after parse. Token-context aware, like
+    `_rewrite_quoted_char_types`: only after ``::``, after ``AS`` (a CAST
+    target), or as a column's type in CREATE / ALTER -- never a string literal
+    or an identifier. ``oid[][]`` is the same type as ``oid[]`` in Postgres,
+    so extra dimensions fold."""
+    from sqlglot.tokens import TokenType
+
+    try:
+        tokens = sqlglot.tokenize(sql, read="postgres")
+    except Exception:
+        return sql
+    is_ddl = bool(tokens) and tokens[0].token_type in (TokenType.CREATE, TokenType.ALTER)
+    spans: list[tuple[int, int, str]] = []
+    i = 1
+    while i < len(tokens) - 2:
+        tok = tokens[i]
+        name = tok.text.lower()
+        if (
+            name in _OID_ARRAY_NAMES
+            and tokens[i + 1].token_type == TokenType.L_BRACKET
+            and tokens[i + 2].token_type == TokenType.R_BRACKET
+        ):
+            ptt = tokens[i - 1].token_type
+            if ptt in (TokenType.DCOLON, TokenType.ALIAS) or (
+                is_ddl and ptt in (TokenType.VAR, TokenType.IDENTIFIER)
+            ):
+                end = i + 2
+                while (
+                    end + 2 < len(tokens)
+                    and tokens[end + 1].token_type == TokenType.L_BRACKET
+                    and tokens[end + 2].token_type == TokenType.R_BRACKET
+                ):
+                    end += 2
+                spans.append((tok.start, tokens[end].end + 1, name))
+                i = end + 1
+                continue
+        i += 1
+    for start, end, name in reversed(spans):
+        sql = sql[:start] + _OID_ARRAY_SENTINEL + name + sql[end:]
+    return sql
+
+
+def _restore_oid_array_types(stmt: exp.Expression) -> exp.Expression:
+    """Undo `_rewrite_oid_array_types`: the sentinel type becomes an ARRAY of
+    the ``ObjectIdentifier`` sqlglot gives the scalar form, which
+    `typemap.type_tag_for_sql` already maps to ``oid[]`` and friends."""
+    for dt in list(stmt.find_all(exp.DataType)):
+        if dt.this != exp.DataType.Type.USERDEFINED:
+            continue
+        kind = dt.args.get("kind")
+        name = (kind.name if isinstance(kind, exp.Expression) else str(kind or "")).lower()
+        if not name.startswith(_OID_ARRAY_SENTINEL):
+            continue
+        base = name[len(_OID_ARRAY_SENTINEL) :].upper()
+        dt.replace(
+            exp.DataType(
+                this=exp.DataType.Type.ARRAY,
+                expressions=[exp.ObjectIdentifier(this=base)],
+                nested=True,
+            )
+        )
+    return stmt
+
+
 def _rewrite_quoted_char_types(sql: str) -> str:
     """Replace the QUOTED ``"char"`` type spelling (PG's internal one-byte
     type, oid 18) with the ``pg_char_1`` sentinel before parse — sqlglot
@@ -15014,7 +15098,7 @@ def parse(sql: str) -> list[exp.Expression]:
             _PARSE_CACHE.move_to_end(sql)
     if entry is not None:
         return [s.copy() for s in entry]
-    stmts = [_abort_as_rollback(s) for s in _parse_uncached(sql)]
+    stmts = [_restore_oid_array_types(_abort_as_rollback(s)) for s in _parse_uncached(sql)]
     seen_before = False
     with _PARSE_CACHE_LOCK:
         seen_before = sql in _PARSE_CACHE
@@ -15168,6 +15252,8 @@ def _parse_uncached(sql: str) -> list[exp.Expression]:
     )
     if '"char"' in sql:
         sql = _rewrite_quoted_char_types(sql)
+    if "[" in sql and any(n in sql.lower() for n in _OID_ARRAY_NAMES):
+        sql = _rewrite_oid_array_types(sql)
     if "visible" in sql.lower():
         sql = _NOT_VISIBLE_RE.sub(r"\1", sql)
     # Decode E'…' escape strings ourselves — sqlglot's half-decoding is lossy.
