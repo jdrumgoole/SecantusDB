@@ -6,6 +6,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -25,6 +26,11 @@ from invoke.tasks import task
 from python_tasks import *  # noqa: E402,F401,F403
 from rust_tasks import *  # noqa: E402,F401,F403
 from rust_tasks import _rust_env  # noqa: E402  (underscore name: explicit import)
+
+#: `pty=True` makes invoke allocate a pseudo-terminal, which Windows does not
+#: have: every task using it failed there with "your platform doesn't support
+#: the 'pty' module" (`invoke sync` included, 2026-09-19). Off on Windows only.
+PTY = sys.platform != "win32"
 
 
 @task(
@@ -136,7 +142,7 @@ def load(
         cmd += f" --count {int(count)}"
     if drop:
         cmd += " --drop"
-    c.run(cmd, pty=True)
+    c.run(cmd, pty=PTY)
 
 
 @task(
@@ -187,7 +193,7 @@ def chaos(
         cmd += f" --seed {int(seed)}"
     if batch_size > 1:
         cmd += f" --batch-size {int(batch_size)}"
-    c.run(cmd, pty=True)
+    c.run(cmd, pty=PTY)
 
 
 @task(
@@ -224,7 +230,7 @@ def compare_servers(
         cmd += f" --mongo-uri {shlex.quote(mongo_uri)}"
     if no_mongod:
         cmd += " --no-mongod"
-    c.run(cmd, pty=True)
+    c.run(cmd, pty=PTY)
 
 
 @task(
@@ -256,7 +262,7 @@ def startup_times(
         cmd += " --no-mongod"
     if json:
         cmd += " --json"
-    c.run(cmd, pty=True)
+    c.run(cmd, pty=PTY)
 
 
 @task(
@@ -290,7 +296,7 @@ def concurrency(
     )
     if shared_collection:
         cmd += " --shared-collection"
-    c.run(cmd, pty=True)
+    c.run(cmd, pty=PTY)
 
 
 @task(
@@ -330,7 +336,7 @@ def pg_concurrency(
     )
     if shared_table:
         cmd += " --mode shared"
-    c.run(cmd, pty=True)
+    c.run(cmd, pty=PTY)
 
 
 @task(
@@ -370,11 +376,11 @@ def concurrency_refresh(
             f" --writers {shlex.quote(writers)}"
             f" --runs {int(runs)}"
             f" --json {results}",
-            pty=True,
+            pty=PTY,
         )
     c.run(
         f"uv run --no-sync python -m bench.concurrency_chart --results {results}",
-        pty=True,
+        pty=PTY,
     )
 
 
@@ -424,7 +430,7 @@ def rw_harness(
         cmd += f" --uri {shlex.quote(uri)}"
     if sync_on_commit:
         cmd += " --sync-on-commit"
-    c.run(cmd, pty=True)
+    c.run(cmd, pty=PTY)
 
 
 # The harness is Rust (crates/secantus-bench): a `do-cluster` orchestrator and a
@@ -511,7 +517,7 @@ def do_bench(
     )
     if no_suspend:
         cmd += " --no-suspend"
-    c.run(cmd, pty=True)
+    c.run(cmd, pty=PTY)
 
 
 @task(
@@ -571,7 +577,7 @@ def release_benchmark(
         "documents. Copy the comparison table into docs/benchmark.md's\n"
         '"Over a real network, against a real MongoDB" section when it finishes.\n'
     )
-    c.run(cmd, pty=True)
+    c.run(cmd, pty=PTY)
 
 
 @task(
@@ -658,7 +664,7 @@ def do_perf(
         "Droplet perf run: per-operation latency + concurrent-writer scaling on\n"
         "dedicated hardware. mongod is measured alongside as the control.\n"
     )
-    c.run(cmd, pty=True)
+    c.run(cmd, pty=PTY)
 
 
 @task(
@@ -670,7 +676,7 @@ def do_up(c: Context, region: str = "lon1", fresh: bool = False) -> None:
     cmd = f"{_DO_CLUSTER} up --region {shlex.quote(region)}"
     if fresh:
         cmd += " --fresh"
-    c.run(cmd, pty=True)
+    c.run(cmd, pty=PTY)
 
 
 @task(
@@ -700,7 +706,7 @@ def do_deploy(
     )
     if ref:
         cmd += f" --server-ref {shlex.quote(ref)}"
-    c.run(cmd, pty=True)
+    c.run(cmd, pty=PTY)
 
 
 @task(
@@ -737,7 +743,7 @@ def do_run(
     )
     if sync_on_commit:
         cmd += " --sync-on-commit"
-    c.run(cmd, pty=True)
+    c.run(cmd, pty=PTY)
 
 
 @task(
@@ -753,14 +759,14 @@ def do_suspend(c: Context, mode: str = "destroy") -> None:
     """
     c.run(
         f"{_DO_CLUSTER} suspend --mode {shlex.quote(mode)}",
-        pty=True,
+        pty=PTY,
     )
 
 
 @task(name="do-status")
 def do_status(c: Context) -> None:
     """Show which benchmark droplets exist, their state, and the live hourly cost."""
-    c.run(f"{_DO_CLUSTER} status", pty=True)
+    c.run(f"{_DO_CLUSTER} status", pty=PTY)
 
 
 @task(
@@ -799,7 +805,7 @@ def admin(
         cmd.append("--no-window")
     if token:
         cmd.extend(["--token", token])
-    c.run(" ".join(cmd), pty=True)
+    c.run(" ".join(cmd), pty=PTY)
 
 
 @task(
@@ -851,7 +857,7 @@ def admin_screenshots(
     cmd.extend(["--scale", str(scale)])
     if headed:
         cmd.append("--headed")
-    c.run(" ".join(cmd), pty=True)
+    c.run(" ".join(cmd), pty=PTY)
 
 
 @task(
@@ -894,7 +900,7 @@ def opsboard(
         cmd.extend(["--config", config])
     if save:
         cmd.append("--save")
-    c.run(" ".join(cmd), pty=True)
+    c.run(" ".join(cmd), pty=PTY)
 
 
 def _run_gauge(
@@ -946,7 +952,7 @@ def _run_gauge(
     selector = f"SECANTUS_GAUGE_SERVER={server} " if server is not None else ""
     c.run(
         f"{selector}PYTHONPATH=. uv run --no-sync python -m {module}",
-        pty=True,
+        pty=PTY,
         warn=True,  # a failing gauge still owes us a report
     )
 
@@ -1035,7 +1041,7 @@ def validate(c: Context, server: str = "python", jobs: int = 1) -> None:
         raise SystemExit(f"--server must be 'python' or 'rust', got {server!r}")
 
     if not pathlib.Path("vendor/pymongo-tests/test").exists():
-        c.run("git submodule update --init --recursive", pty=True)
+        c.run("git submodule update --init --recursive", pty=PTY)
 
     pathlib.Path(".validation").mkdir(exist_ok=True)
     paths = " ".join(INCLUDE)
@@ -1090,13 +1096,13 @@ def validate(c: Context, server: str = "python", jobs: int = 1) -> None:
         "--continue-on-collection-errors "
         f"--json-report --json-report-file={raw_json} "
         f"--no-header --tb=no -q {deselect} {paths}",
-        pty=True,
+        pty=PTY,
         warn=True,
     )
     c.run(
         "uv run --no-sync python -m pymongo_validation.generate_report "
         f"--server {server} {raw_json} {report}",
-        pty=True,
+        pty=PTY,
     )
     print(f"\nWrote {report}")
 
@@ -1130,7 +1136,7 @@ def validate_one(c: Context, nodeid: str, server: str = "python") -> None:
         "-c pyproject.toml -o addopts= -o testpaths= -o timeout=120 -n1 "
         "-p no:cacheprovider -p no:randomly -p pymongo_validation.plugin "
         f"{ids}",
-        pty=True,
+        pty=PTY,
         env=_rust_env(),
     )
 
@@ -1166,7 +1172,7 @@ def validate_pymongo_async(c: Context, server: str = "python", jobs: int = 1) ->
         raise SystemExit(f"--server must be 'python' or 'rust', got {server!r}")
 
     if not pathlib.Path("vendor/pymongo-tests/test/asynchronous").exists():
-        c.run("git submodule update --init --recursive", pty=True)
+        c.run("git submodule update --init --recursive", pty=PTY)
 
     pathlib.Path(".validation").mkdir(exist_ok=True)
     paths = " ".join(INCLUDE)
@@ -1194,13 +1200,13 @@ def validate_pymongo_async(c: Context, server: str = "python", jobs: int = 1) ->
         "--continue-on-collection-errors "
         f"--json-report --json-report-file={raw_json} "
         f"--no-header --tb=no -q {deselect} {paths}",
-        pty=True,
+        pty=PTY,
         warn=True,
     )
     c.run(
         "uv run --no-sync python -m pymongo_async_validation.generate_report "
         f"--server {server} {raw_json} {report}",
-        pty=True,
+        pty=PTY,
     )
     print(f"\nWrote {report}")
 
@@ -1229,7 +1235,7 @@ def validate_go(c: Context, server: str = "python") -> None:
         not pathlib.Path("vendor/mongo-go-driver/go.mod").exists()
         or not pathlib.Path("vendor/mongo-go-driver/testdata/specifications/source").is_dir()
     ):
-        c.run("git submodule update --init --recursive", pty=True)
+        c.run("git submodule update --init --recursive", pty=PTY)
 
     _run_gauge(
         c,
@@ -1242,7 +1248,7 @@ def validate_go(c: Context, server: str = "python") -> None:
     c.run(
         "uv run --no-sync python -m go_validation.generate_report "
         f".validation/go-raw{suffix}.ndjson docs/validation-report-go{suffix}.md",
-        pty=True,
+        pty=PTY,
     )
     print(f"\nWrote docs/validation-report-go{suffix}.md")
 
@@ -1267,7 +1273,7 @@ def validate_node(c: Context, server: str = "python") -> None:
     suffix = "" if server == "python" else "-rust-server"
 
     if not pathlib.Path("vendor/node-mongodb-native/package.json").exists():
-        c.run("git submodule update --init --recursive", pty=True)
+        c.run("git submodule update --init --recursive", pty=PTY)
 
     _run_gauge(
         c,
@@ -1280,7 +1286,7 @@ def validate_node(c: Context, server: str = "python") -> None:
     c.run(
         "uv run --no-sync python -m node_validation.generate_report "
         f".validation/node-raw{suffix}.json docs/validation-report-node{suffix}.md",
-        pty=True,
+        pty=PTY,
     )
     print(f"\nWrote docs/validation-report-node{suffix}.md")
 
@@ -1298,7 +1304,7 @@ def validate_psycopg(c: Context) -> None:
     import pathlib
 
     if not pathlib.Path("vendor/psycopg/tests").exists():
-        c.run("git submodule update --init vendor/psycopg", pty=True)
+        c.run("git submodule update --init vendor/psycopg", pty=PTY)
     _run_gauge(
         c,
         module="psycopg_validation.runner",
@@ -1311,7 +1317,7 @@ def validate_psycopg(c: Context) -> None:
     c.run(
         "uv run --no-sync python -m psycopg_validation.generate_report "
         ".validation/psycopg-raw.json docs/validation-report-psycopg.md",
-        pty=True,
+        pty=PTY,
     )
     print("\nWrote docs/validation-report-psycopg.md")
 
@@ -1338,7 +1344,7 @@ def validate_sqlalchemy(c: Context) -> None:
     c.run(
         "uv run --no-sync python -m sqlalchemy_validation.generate_report "
         ".validation/sqlalchemy-raw.json docs/validation-report-sqlalchemy.md",
-        pty=True,
+        pty=PTY,
     )
     print("\nWrote docs/validation-report-sqlalchemy.md")
 
@@ -1363,7 +1369,7 @@ def sql_stress(c: Context) -> None:
     c.run(
         "uv run --no-sync python -m sqlstress_validation.generate_report "
         ".validation/sqlstress-raw.json docs/validation-report-sqlstress.md",
-        pty=True,
+        pty=PTY,
     )
     print("\nWrote docs/validation-report-sqlstress.md")
 
@@ -1386,14 +1392,14 @@ def validate_pgjdbc(c: Context, shard: str = "") -> None:
     import pathlib
 
     if not pathlib.Path("vendor/pgjdbc/gradlew").exists():
-        c.run("git submodule update --init vendor/pgjdbc", pty=True)
+        c.run("git submodule update --init vendor/pgjdbc", pty=PTY)
     if shard:
         k = shard.split("/", 1)[0]
         raw = pathlib.Path(f".validation/pgjdbc-raw-shard-{k}.json")
         raw.unlink(missing_ok=True)  # same freshness discipline as _run_gauge
         c.run(
             f"SECANTUS_PGJDBC_SHARD={shard} uv run --no-sync python -m pgjdbc_validation.runner",
-            pty=True,
+            pty=PTY,
             warn=True,  # failing tests still produce the raw artifact — the deliverable
         )
         from invoke.exceptions import Exit
@@ -1422,7 +1428,7 @@ def validate_pgjdbc(c: Context, shard: str = "") -> None:
     c.run(
         "uv run --no-sync python -m pgjdbc_validation.generate_report "
         ".validation/pgjdbc-raw.json docs/validation-report-pgjdbc.md",
-        pty=True,
+        pty=PTY,
     )
     print("\nWrote docs/validation-report-pgjdbc.md")
 
@@ -1447,7 +1453,7 @@ def validate_pgjdbc_report(c: Context) -> None:
     c.run(
         "uv run --no-sync python -m pgjdbc_validation.generate_report "
         ".validation/pgjdbc-raw-shard-*.json docs/validation-report-pgjdbc.md",
-        pty=True,
+        pty=PTY,
     )
     for consumed in glob.glob(".validation/pgjdbc-raw-shard-*.json"):
         pathlib.Path(consumed).unlink()
@@ -1478,7 +1484,7 @@ def validate_pgtest(c: Context) -> None:
     c.run(
         "uv run --no-sync python -m pgtest_validation.generate_report "
         ".validation/pgtest-raw.json docs/validation-report-pgtest.md",
-        pty=True,
+        pty=PTY,
     )
     print("\nWrote docs/validation-report-pgtest.md")
 
@@ -1495,7 +1501,7 @@ def validate_pgx(c: Context) -> None:
     import pathlib
 
     if not pathlib.Path("vendor/pgx/pgconn").exists():
-        c.run("git submodule update --init vendor/pgx", pty=True)
+        c.run("git submodule update --init vendor/pgx", pty=PTY)
     _run_gauge(
         c,
         module="pgx_validation.runner",
@@ -1509,7 +1515,7 @@ def validate_pgx(c: Context) -> None:
     c.run(
         "uv run --no-sync python -m pgx_validation.generate_report "
         ".validation/pgx-raw.json docs/validation-report-pgx.md",
-        pty=True,
+        pty=PTY,
     )
     print("\nWrote docs/validation-report-pgx.md")
 
@@ -1527,7 +1533,7 @@ def validate_slt(c: Context) -> None:
     import pathlib
 
     if not pathlib.Path("vendor/sqllogictest/test").exists():
-        c.run("git submodule update --init vendor/sqllogictest", pty=True)
+        c.run("git submodule update --init vendor/sqllogictest", pty=PTY)
     _run_gauge(
         c,
         module="slt_validation.runner",
@@ -1541,7 +1547,7 @@ def validate_slt(c: Context) -> None:
     c.run(
         "uv run --no-sync python -m slt_validation.generate_report "
         ".validation/slt-raw.json docs/validation-report-slt.md",
-        pty=True,
+        pty=PTY,
     )
     print("\nWrote docs/validation-report-slt.md")
 
@@ -1567,7 +1573,7 @@ def validate_ruby(c: Context, server: str = "python") -> None:
     suffix = "" if server == "python" else "-rust-server"
 
     if not pathlib.Path("vendor/mongo-ruby-driver/mongo.gemspec").exists():
-        c.run("git submodule update --init --recursive", pty=True)
+        c.run("git submodule update --init --recursive", pty=PTY)
 
     _run_gauge(
         c,
@@ -1580,7 +1586,7 @@ def validate_ruby(c: Context, server: str = "python") -> None:
     c.run(
         "uv run --no-sync python -m ruby_validation.generate_report "
         f".validation/ruby-raw{suffix}.json docs/validation-report-ruby{suffix}.md",
-        pty=True,
+        pty=PTY,
     )
     print(f"\nWrote docs/validation-report-ruby{suffix}.md")
 
@@ -1615,7 +1621,7 @@ def validate_java(c: Context, server: str = "python") -> None:
             "vendor/mongo-java-driver/testing/resources/specifications/source"
         ).is_dir()
     ):
-        c.run("git submodule update --init --recursive", pty=True)
+        c.run("git submodule update --init --recursive", pty=PTY)
 
     pathlib.Path(".validation").mkdir(exist_ok=True)
     _run_gauge(
@@ -1629,7 +1635,7 @@ def validate_java(c: Context, server: str = "python") -> None:
     c.run(
         "uv run --no-sync python -m java_validation.generate_report "
         f".validation/java-results{suffix} docs/validation-report-java{suffix}.md",
-        pty=True,
+        pty=PTY,
     )
     print(f"\nWrote docs/validation-report-java{suffix}.md")
 
@@ -1663,7 +1669,7 @@ def validate_kotlin(c: Context, server: str = "python") -> None:
             "vendor/mongo-java-driver/testing/resources/specifications/source"
         ).is_dir()
     ):
-        c.run("git submodule update --init --recursive", pty=True)
+        c.run("git submodule update --init --recursive", pty=PTY)
 
     _run_gauge(
         c,
@@ -1676,7 +1682,7 @@ def validate_kotlin(c: Context, server: str = "python") -> None:
     c.run(
         "uv run --no-sync python -m kotlin_validation.generate_report "
         f".validation/kotlin-results{suffix} docs/validation-report-kotlin{suffix}.md",
-        pty=True,
+        pty=PTY,
     )
     print(f"\nWrote docs/validation-report-kotlin{suffix}.md")
 
@@ -1703,7 +1709,7 @@ def validate_rust(c: Context, server: str = "python") -> None:
     suffix = "" if server == "python" else "-rust-server"
 
     if not pathlib.Path("vendor/mongo-rust-driver/Cargo.toml").exists():
-        c.run("git submodule update --init --recursive", pty=True)
+        c.run("git submodule update --init --recursive", pty=PTY)
 
     _run_gauge(
         c,
@@ -1716,7 +1722,7 @@ def validate_rust(c: Context, server: str = "python") -> None:
     c.run(
         "uv run --no-sync python -m rust_validation.generate_report "
         f".validation/rust-raw{suffix}.json docs/validation-report-rust{suffix}.md",
-        pty=True,
+        pty=PTY,
     )
     print(f"\nWrote docs/validation-report-rust{suffix}.md")
 
@@ -1742,7 +1748,7 @@ def validate_php_lib(c: Context, server: str = "python") -> None:
     suffix = "" if server == "python" else "-rust-server"
 
     if not pathlib.Path("vendor/mongo-php-library/composer.json").exists():
-        c.run("git submodule update --init vendor/mongo-php-library", pty=True)
+        c.run("git submodule update --init vendor/mongo-php-library", pty=PTY)
 
     _run_gauge(
         c,
@@ -1755,7 +1761,7 @@ def validate_php_lib(c: Context, server: str = "python") -> None:
     c.run(
         "uv run --no-sync python -m php_lib_validation.generate_report "
         f".validation/php-lib-junit{suffix}.xml docs/validation-report-php-lib{suffix}.md",
-        pty=True,
+        pty=PTY,
     )
     print(f"\nWrote docs/validation-report-php-lib{suffix}.md")
 
@@ -1782,7 +1788,7 @@ def validate_php_ext(c: Context, server: str = "python") -> None:
     suffix = "" if server == "python" else "-rust-server"
 
     if not pathlib.Path("vendor/mongo-php-driver/tests/utils/basic.inc").exists():
-        c.run("git submodule update --init vendor/mongo-php-driver", pty=True)
+        c.run("git submodule update --init vendor/mongo-php-driver", pty=PTY)
 
     _run_gauge(
         c,
@@ -1795,7 +1801,7 @@ def validate_php_ext(c: Context, server: str = "python") -> None:
     c.run(
         "uv run --no-sync python -m php_ext_validation.generate_report "
         f".validation/php-ext-junit{suffix}.xml docs/validation-report-php-ext{suffix}.md",
-        pty=True,
+        pty=PTY,
     )
     print(f"\nWrote docs/validation-report-php-ext{suffix}.md")
 
@@ -1823,7 +1829,7 @@ def validate_c(c: Context, server: str = "python") -> None:
     suffix = "" if server == "python" else "-rust-server"
 
     if not pathlib.Path("vendor/mongo-c-driver/CMakeLists.txt").exists():
-        c.run("git submodule update --init vendor/mongo-c-driver", pty=True)
+        c.run("git submodule update --init vendor/mongo-c-driver", pty=PTY)
 
     _run_gauge(
         c,
@@ -1836,7 +1842,7 @@ def validate_c(c: Context, server: str = "python") -> None:
     c.run(
         "uv run --no-sync python -m c_validation.generate_report "
         f".validation/c-raw{suffix}.json docs/validation-report-c{suffix}.md",
-        pty=True,
+        pty=PTY,
     )
     print(f"\nWrote docs/validation-report-c{suffix}.md")
 
@@ -1867,9 +1873,9 @@ def validate_cxx(c: Context, server: str = "python") -> None:
     suffix = "" if server == "python" else "-rust-server"
 
     if not pathlib.Path("vendor/mongo-cxx-driver/CMakeLists.txt").exists():
-        c.run("git submodule update --init vendor/mongo-cxx-driver", pty=True)
+        c.run("git submodule update --init vendor/mongo-cxx-driver", pty=PTY)
     if not pathlib.Path("vendor/mongo-c-driver/CMakeLists.txt").exists():
-        c.run("git submodule update --init vendor/mongo-c-driver", pty=True)
+        c.run("git submodule update --init vendor/mongo-c-driver", pty=PTY)
 
     _run_gauge(
         c,
@@ -1883,7 +1889,7 @@ def validate_cxx(c: Context, server: str = "python") -> None:
     c.run(
         "uv run --no-sync python -m cxx_validation.generate_report "
         f".validation/cxx-raw{suffix}.xml docs/validation-report-cxx{suffix}.md",
-        pty=True,
+        pty=PTY,
     )
     print(f"\nWrote docs/validation-report-cxx{suffix}.md")
 
@@ -1912,7 +1918,7 @@ def validate_dotnet(c: Context, server: str = "python") -> None:
     if not pathlib.Path(
         "vendor/mongo-csharp-driver/tests/MongoDB.Driver.Tests/MongoDB.Driver.Tests.csproj"
     ).exists():
-        c.run("git submodule update --init vendor/mongo-csharp-driver", pty=True)
+        c.run("git submodule update --init vendor/mongo-csharp-driver", pty=PTY)
 
     _run_gauge(
         c,
@@ -1927,7 +1933,7 @@ def validate_dotnet(c: Context, server: str = "python") -> None:
     c.run(
         "uv run --no-sync python -m dotnet_validation.generate_report "
         f".validation/dotnet-raw{suffix}.trx docs/validation-report-dotnet{suffix}.md",
-        pty=True,
+        pty=PTY,
     )
     print(f"\nWrote docs/validation-report-dotnet{suffix}.md")
 
@@ -2097,7 +2103,7 @@ def validate_summary(c: Context) -> None:
     omitted from the table. Run ``invoke validate-all`` first if you
     want a complete snapshot.
     """
-    c.run("uv run --no-sync python -m validation_summary.generate", pty=True)
+    c.run("uv run --no-sync python -m validation_summary.generate", pty=PTY)
 
 
 @task(name="validate-readme")
@@ -2119,7 +2125,7 @@ def validate_readme(c: Context) -> None:
         "uv run --no-sync python -m pytest "
         "-p no:xdist -o addopts= -m online -v "
         "tests/test_pypi_readme_links.py",
-        pty=True,
+        pty=PTY,
     )
 
 
@@ -2196,11 +2202,11 @@ def release_prepare(c: Context, version: str) -> None:
     _ensure_tag_unused(version)
 
     print("==> [1/6] Full default test suite")
-    c.run("uv run python -m pytest", pty=True)
+    c.run("uv run python -m pytest", pty=PTY)
     print("==> [2/6] Perf regression gates")
     c.run(
         "uv run python -m pytest -p no:xdist -o addopts= -m perf tests/test_perf_regression.py",
-        pty=True,
+        pty=PTY,
     )
 
     print("==> [3/6] Collating changelog fragments")
@@ -2212,12 +2218,12 @@ def release_prepare(c: Context, version: str) -> None:
 
     print(f"==> [4/6] Bumping version files to {version}")
     _bump_version_files(version)
-    c.run("uv lock", pty=True)
+    c.run("uv lock", pty=PTY)
 
     print(f"==> [5/6] Committing + tagging v{version}")
     c.run(
         "git add pyproject.toml src/secantus/__init__.py uv.lock docs/changelog.md changelog.d",
-        pty=True,
+        pty=PTY,
     )
     # If the version is already at ``version`` on HEAD (e.g. because a
     # parallel-session merge bumped it), the ``git add`` stages nothing
@@ -2228,12 +2234,12 @@ def release_prepare(c: Context, version: str) -> None:
     if staged.return_code == 0:
         print(f"    version already at {version} on HEAD; skipping release commit")
     else:
-        c.run(f'git commit -m "Release v{version}"', pty=True)
-    c.run(f'git tag -a v{version} -m "Release v{version}"', pty=True)
+        c.run(f'git commit -m "Release v{version}"', pty=PTY)
+    c.run(f'git tag -a v{version} -m "Release v{version}"', pty=PTY)
     # Combine the branch and tag pushes into one network round-trip.
     # The publish workflow still fires on the tag ref; nothing else
     # depends on the order of branch-then-tag.
-    c.run(f"git push origin main v{version}", pty=True)
+    c.run(f"git push origin main v{version}", pty=PTY)
 
     print(f"==> [6/6] Creating GitHub Release v{version}")
     # Pre-release if the version has an `aN` / `bN` / `rcN` suffix.
@@ -2246,7 +2252,7 @@ def release_prepare(c: Context, version: str) -> None:
     )
     if is_prerelease:
         cmd += " --prerelease"
-    c.run(cmd, pty=True)
+    c.run(cmd, pty=PTY)
 
     print(
         f"\nv{version} prepared, tag pushed, GitHub Release created.\n"
