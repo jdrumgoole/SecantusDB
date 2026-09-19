@@ -6325,10 +6325,99 @@ fn wrap_int(n: i128, code: i32) -> Conv {
 }
 
 fn decimal_conv(s: &str) -> Conv {
-    match s.parse::<bson::Decimal128>() {
-        Ok(d) => Conv::Ok(Bson::Decimal128(d)),
-        Err(_) => Conv::Failed,
+    match decimal128_from_str(s) {
+        Ok(Some(d)) => Conv::Ok(Bson::Decimal128(d)),
+        Ok(None) => Conv::Failed,
+        Err(reason) => Conv::Named(number_parse_error(s, reason)),
     }
+}
+
+/// A numeric string as mongod's `$convert` makes it a Decimal128.
+///
+/// mongod ROUNDS TOWARD ZERO to 34 significant digits (`1.23…12345|9` is
+/// `…1234`, `-9999…9|9.5` is `-9.999…E+34`) and fails only on IEEE 754's two
+/// range conditions: OVERFLOW past an adjusted exponent of 6144, and UNDERFLOW
+/// for a SUBNORMAL result (adjusted exponent below -6143) that is also
+/// inexact -- so `1E-6176` parses where `1E-6177` and a 35-digit
+/// `1.23…E-6150` do not. Measured on 8.2.11, 2026-09-19. `str::parse` on the
+/// bson type rejected every string past 34 digits, which mongod accepts.
+///
+/// `Ok(None)` for input this does not model (non-finite spellings the
+/// syntax gate let through that the bson parser also refuses).
+fn decimal128_from_str(s: &str) -> Result<Option<bson::Decimal128>, &'static str> {
+    const DIGITS: usize = 34;
+    const EMIN: i64 = -6143;
+    const EMAX: i64 = 6144;
+    const ETINY: i64 = -6176;
+    const EXP_MAX: i64 = 6111; // largest stored exponent (clamped form)
+    let t = s.trim();
+    let (neg, body) = match t.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let (mantissa, exp_part) = match body.find(['e', 'E']) {
+        Some(p) => (&body[..p], Some(&body[p + 1..])),
+        None => (body, None),
+    };
+    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if !int_part
+        .bytes()
+        .chain(frac_part.bytes())
+        .all(|b| b.is_ascii_digit())
+        || (int_part.is_empty() && frac_part.is_empty())
+    {
+        // NaN / Infinity spellings: the bson parser already handles them.
+        return Ok(t.parse::<bson::Decimal128>().ok());
+    }
+    let written_exp: i64 = match exp_part {
+        Some(e) => match e.parse::<i64>() {
+            Ok(v) => v,
+            // An exponent too large for i64 overflows or underflows outright.
+            Err(_) if e.starts_with('-') => {
+                return Err("Conversion from string to decimal would underflow")
+            }
+            Err(_) => return Err("Conversion from string to decimal would overflow"),
+        },
+        None => 0,
+    };
+    let all = format!("{int_part}{frac_part}");
+    let digits = all.trim_start_matches('0');
+    let mut exp = written_exp - frac_part.len() as i64;
+    let sign = if neg { "-" } else { "" };
+    if digits.is_empty() {
+        // Zero keeps its sign and its exponent, clamped into range.
+        let e = exp.clamp(ETINY, EXP_MAX);
+        return Ok(format!("{sign}0E{e}").parse().ok());
+    }
+    let mut coef = digits.to_string();
+    let mut inexact = false;
+    let adjusted = exp + coef.len() as i64 - 1;
+    if adjusted > EMAX {
+        return Err("Conversion from string to decimal would overflow");
+    }
+    // Truncate to 34 digits, then to the exponent floor.
+    let mut keep = coef.len().min(DIGITS) as i64;
+    if exp + (coef.len() as i64 - keep) < ETINY {
+        keep = (coef.len() as i64 - (ETINY - exp)).max(0);
+    }
+    let keep = keep as usize;
+    if keep < coef.len() {
+        inexact = coef.as_bytes()[keep..].iter().any(|b| *b != b'0');
+        exp += (coef.len() - keep) as i64;
+        coef.truncate(keep);
+    }
+    if adjusted < EMIN && inexact {
+        return Err("Conversion from string to decimal would underflow");
+    }
+    if coef.is_empty() {
+        coef.push('0');
+    }
+    if exp > EXP_MAX {
+        // Clamped form: fold the excess exponent into trailing zeros.
+        coef.push_str(&"0".repeat((exp - EXP_MAX) as usize));
+        exp = EXP_MAX;
+    }
+    Ok(format!("{sign}{coef}E{exp}").parse().ok())
 }
 
 /// `$toString` -- mongod's `$convert` to string. See `coerce_to_string` for
@@ -9365,6 +9454,93 @@ mod decimal_conversion_tests {
                 "$convert": {"input": dec("NaN"), "to": "int", "onError": "nope"}
             })),
             Bson::String("nope".into())
+        );
+    }
+}
+
+#[cfg(test)]
+mod decimal_string_tests {
+    //! `$toDecimal` / `$convert` to decimal of a numeric string, against mongod
+    //! 8.2.11 (probed 2026-09-19). mongod truncates toward zero to 34 digits
+    //! and fails only on IEEE overflow / subnormal-and-inexact underflow.
+
+    use super::*;
+
+    fn conv(s: &str) -> Result<String, String> {
+        match decimal128_from_str(s) {
+            Ok(Some(d)) => Ok(d.to_string()),
+            Ok(None) => Err("unmodelled".into()),
+            Err(reason) => Err(reason.into()),
+        }
+    }
+
+    #[test]
+    fn the_bson_parser_alone_rejected_what_mongod_accepts() {
+        // Why this conversion is hand-rolled: the bson crate refuses a 35th
+        // digit that mongod simply truncates away.
+        assert!("1.2345678901234567890123456789012345"
+            .parse::<bson::Decimal128>()
+            .is_err());
+    }
+
+    #[test]
+    fn truncates_toward_zero_to_34_digits() {
+        let cases = [
+            (
+                "1.2345678901234567890123456789012345",
+                "1.234567890123456789012345678901234",
+            ),
+            (
+                "1.23456789012345678901234567890123459",
+                "1.234567890123456789012345678901234",
+            ),
+            (
+                "1.99999999999999999999999999999999999",
+                "1.999999999999999999999999999999999",
+            ),
+            (
+                "-1.99999999999999999999999999999999999",
+                "-1.999999999999999999999999999999999",
+            ),
+            (
+                "-99999999999999999999999999999999999.5",
+                "-9.999999999999999999999999999999999E+34",
+            ),
+            (
+                "0.1234567890123456789012345678901234567",
+                "0.1234567890123456789012345678901234",
+            ),
+            (
+                "9999999999999999999999999999999999.9",
+                "9999999999999999999999999999999999",
+            ),
+            (
+                "1.000000000000000000000000000000000000000000",
+                "1.000000000000000000000000000000000",
+            ),
+        ];
+        for (input, want) in cases {
+            assert_eq!(conv(input), Ok(want.to_string()), "{input}");
+        }
+    }
+
+    #[test]
+    fn range_limits_are_ieee() {
+        let under = Err("Conversion from string to decimal would underflow".to_string());
+        let over = Err("Conversion from string to decimal would overflow".to_string());
+        assert_eq!(conv("1E-6176"), Ok("1E-6176".into()));
+        assert_eq!(conv("1E-6177"), under);
+        assert_eq!(conv("1.5E-6180"), under);
+        assert_eq!(conv("1E-7000"), under);
+        assert_eq!(conv("1.2345678901234567890123456789012345E-6150"), under);
+        // Normal range: inexact is fine, only a SUBNORMAL inexact underflows.
+        assert!(conv("1.2345678901234567890123456789012345E-6140").is_ok());
+        assert_eq!(conv("1E+6145"), over);
+        assert_eq!(conv("1E+7000"), over);
+        assert_eq!(conv("1234567890123456789012345678901234567E+6120"), over);
+        assert_eq!(
+            conv("9.999999999999999999999999999999999E+6144"),
+            Ok("9.999999999999999999999999999999999E+6144".into())
         );
     }
 }

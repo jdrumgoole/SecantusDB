@@ -2736,6 +2736,44 @@ STRCONV_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
     ("tostring-object-rejected", STR_SEED, _tv({"$toString": "$o"})),
     # the same `%g` rendering inside an error message
     ("acos-message-renders-wide-double", STR_SEED, _tv({"$acos": "$d"})),
+    # A decimal string past what Decimal128 holds. mongod ROUNDS TOWARD ZERO to
+    # 34 digits and fails only on IEEE overflow / subnormal-and-inexact
+    # underflow (8.2.11, 2026-09-19); both engines raised an internal error.
+    ("todecimal-35-digits", STR_SEED, _tv({"$toDecimal": "1.2345678901234567890123456789012345"})),
+    ("todecimal-truncates", STR_SEED, _tv({"$toDecimal": "1.99999999999999999999999999999999999"})),
+    (
+        "todecimal-truncates-neg",
+        STR_SEED,
+        _tv({"$toDecimal": "-99999999999999999999999999999999999.5"}),
+    ),
+    ("todecimal-50-digits", STR_SEED, _tv({"$toDecimal": "1234567890" * 5})),
+    ("todecimal-underflow", STR_SEED, _tv({"$toDecimal": "1E-6177"})),
+    (
+        "todecimal-underflow-35",
+        STR_SEED,
+        _tv({"$toDecimal": "1.2345678901234567890123456789012345E-6150"}),
+    ),
+    ("todecimal-floor-exact", STR_SEED, _tv({"$toDecimal": "1E-6176"})),
+    ("todecimal-overflow", STR_SEED, _tv({"$toDecimal": "1E+6145"})),
+    ("todecimal-max", STR_SEED, _tv({"$toDecimal": "9.999999999999999999999999999999999E+6144"})),
+    (
+        "convert-decimal-overflow-onerror",
+        STR_SEED,
+        _tv({"$convert": {"input": "1E+7000", "to": "decimal", "onError": "E"}}),
+    ),
+    (
+        "convert-decimal-35-onerror",
+        STR_SEED,
+        _tv(
+            {
+                "$convert": {
+                    "input": "0.1234567890123456789012345678901234567",
+                    "to": "decimal",
+                    "onError": "E",
+                }
+            }
+        ),
+    ),
 ]
 
 # `$inc` / `$mul` past int64 FAIL the write -- they do not saturate to a double
