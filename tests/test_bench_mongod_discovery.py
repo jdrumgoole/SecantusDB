@@ -88,6 +88,19 @@ def test_non_executable_file_is_skipped(tmp_path):
     assert discover_mongods([str(plain)], probe=lambda _r: "8.3.4") == {}
 
 
+def _symlink_or_skip(link, target) -> None:
+    """Create ``link`` -> ``target``, or skip where the OS will not let this
+    user create one: Windows without Developer Mode or admin rights refuses
+    with ERROR_PRIVILEGE_NOT_HELD (1314). CI's Windows runners are admin, so
+    the test still runs there."""
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip("creating a symlink needs a privilege this Windows user lacks")
+        raise
+
+
 def test_symlink_to_the_same_binary_is_not_a_second_arm(tmp_path):
     """The original bug's shape: /opt/homebrew/bin/mongod -> Cellar/.../mongod.
 
@@ -97,7 +110,7 @@ def test_symlink_to_the_same_binary_is_not_a_second_arm(tmp_path):
     real = touch(tmp_path / "cellar" / "mongod")
     link = tmp_path / "bin" / "mongod"
     link.parent.mkdir(parents=True, exist_ok=True)
-    link.symlink_to(real)
+    _symlink_or_skip(link, real)
     arms = discover_mongods([str(link), str(real)], probe=probe_from({str(real): "6.0.16"}))
     assert list(arms) == ["mongod-6.0.16"]
     assert arms["mongod-6.0.16"][1] == str(real.resolve())
