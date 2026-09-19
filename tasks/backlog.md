@@ -9974,11 +9974,23 @@ shared storage engine or building large new protocol subsystems:
   Separately, the same query failed with 0A000 on its 7th run under psycopg's
   auto-prepare (Describe typed `pg_sleep` as text, Execute as void). That is
   fixed in #1514 and is not this flake: pgx does not revalidate the plan.
-- [ ] **HAVING on a numeric aggregate compares at Decimal128 precision**
-  (Python pgserver, 2026-09-19). The select-list `sum` / `min` / `max` over a
-  numeric are exact (pushed and folded in Python), but a HAVING term compares
-  its accumulator inside the pipeline, so it keeps the native `$sum` (which
-  also skips a wide value).
+- [ ] **HAVING on a numeric aggregate compares at Decimal128 precision: joins,
+  grouping sets and FILTER only** (Python pgserver, 2026-09-19). The select-list
+  `sum` / `min` / `max` over a numeric are exact (pushed and folded in Python),
+  but HAVING compared its accumulator inside the pipeline, where `$sum` rounds
+  at 34 digits and skips a wide value. For a single-table GROUP BY (with or
+  without windows) and for an aggregate with no GROUP BY, HAVING now takes the
+  per-grouped-row residual and sees the folded value
+  (`tests/test_pg_having_exact_numeric.py`). Still in-pipeline, and still
+  wrong for wide or 35+-digit values:
+  - JOIN + GROUP BY (`_join_having_to_match`): there is no residual on the join
+    paths.
+  - GROUPING SETS / ROLLUP / CUBE: nothing catches the 0A000 there.
+  - `sum(v) FILTER (WHERE ...)` in HAVING: the residual evaluator rejects a
+    FILTER term (0A000 "unsupported scalar expression"), so the lowerer keeps
+    it in the pipeline.
+  A Python post-filter after the fold would cover all three. Each path would
+  need to carry its hidden `__having_*` fields through the `$project`.
 - [x] **RESOLVED — STALE (measured 2026-09-01). Pipeline abort works.** Ran the
   test's own body through libpq's `PGconn` pipeline API against both servers:
 
