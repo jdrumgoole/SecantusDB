@@ -10030,6 +10030,15 @@ shared storage engine or building large new protocol subsystems:
   be the value (e.g. `__numkey` for a wide one) with the display value carried
   beside it. Only values past 34 digits that differ only in scale are
   affected; ordinary numerics group correctly.
+  **Re-measured 2026-09-19:** the entry understated the join half. An
+  ORDINARY numeric join was broken too: `1.5` did not join `1.500`, and a
+  numeric `2.0` did not join an int `2`. That was the `$lookup` hash join
+  keying on the `Decimal128` representation (a MongoDB-side bug on both
+  servers), now fixed. UNION / INTERSECT / EXCEPT / DISTINCT ON / PARTITION BY
+  keyed rows on `repr()` and split `1.5` / `1.50`; also fixed
+  (`numeric.eq_key`). Still open, wide values only: pipeline `GROUP BY`,
+  `DISTINCT`, `count(DISTINCT)`, and a join on a wide key (the wide document
+  reaches `$lookup` as a document, compared whole).
 - [ ] **pgx `TestDeadlineContextWatcherHandler/DeadlineExceeded_with_DeadlineDelay`
   failed once on CI** (2026-09-19, #1509's gauge run; passed on an immediate
   re-run of the same commit). The test runs `select 1, pg_sleep(0.250)` under
@@ -10044,9 +10053,31 @@ shared storage engine or building large new protocol subsystems:
   2.4x. `select 1` alone is 0.5 ms. The CI failure therefore needs a stall of
   more than ~330 ms somewhere on the runner. Not yet measured on a loaded CI
   runner; leave open until it recurs or a CI timing run rules the server out.
+  **Recurred 2026-09-19** on #1518's gauge run (a change that does not touch
+  this path; #1514's and #1516's runs passed it): the Exec at
+  `pgconn_test.go:4726` failed 1.4 s in against the ~600 ms budget, while the
+  parallel `TestCancelRequestContextWatcherHandler` subtests and
+  `TestConnExecBatchHuge` were running. Ruled out locally by probes: a sleep on
+  another connection does not serialize with it (257 ms beside a concurrent
+  `pg_sleep(1)`, 266 ms after an abandoned one), and three connections running
+  2,000-statement pipelines raise the max only to 309 ms. So the stall is not
+  reproduced off CI. Next step is a timing trace on the runner itself: log
+  per-statement server-side start/end in the pgx lane.
   Separately, the same query failed with 0A000 on its 7th run under psycopg's
   auto-prepare (Describe typed `pg_sleep` as text, Execute as void). That is
   fixed in #1514 and is not this flake: pgx does not revalidate the plan.
+- [ ] **Rust PG server: a terminated victim can lose its 57P01** (CI pg-oracle
+  lane, 2026-09-19, #1518's run; that PR does not touch the Rust PG server).
+  `test_rust_pgserver_slice.py::test_pg_terminate_backend_across_connections`:
+  the victim's next `select 1` raised `OperationalError('connection socket
+  closed')` with no SQLSTATE instead of `57P01`, and the 57P01 surfaced only
+  afterwards, in psycopg's rollback warning. The idle-event loop
+  (`HandlerFactory::idle_event`) sends the FATAL and closes the socket as soon
+  as `terminate` is set. A client write that lands after the close draws a TCP
+  RST, and on Linux an RST can discard the client's unread receive buffer,
+  FATAL included. A graceful close (shut down the write half, then drain reads
+  briefly before closing) would keep the RST from racing the message. Not
+  built or fixed on the Windows dev box (no libclang for `pg_query`).
 - [ ] **HAVING on a numeric aggregate compares at Decimal128 precision: joins,
   grouping sets and FILTER only** (Python pgserver, 2026-09-19). The select-list
   `sum` / `min` / `max` over a numeric are exact (pushed and folded in Python),

@@ -2299,7 +2299,7 @@ def _evaluated_value_rows(
         # DISTINCT ON key (row-level, evaluated before any SRF expansion —
         # deliberately NOT resolved against the expanded tuple).
         don_key = (
-            tuple(repr(scalar.evaluate(e, scope, sctx)) for e in plan.distinct_on)
+            tuple(_numeric.eq_key(scalar.evaluate(e, scope, sctx)) for e in plan.distinct_on)
             if plan.distinct_on
             else ()
         )
@@ -2329,7 +2329,7 @@ def _evaluated_value_rows(
             seen: set = set()
             deduped: list[tuple[Any, ...]] = []
             for row in rows:
-                key = tuple(repr(v) for v in row)
+                key = tuple(_numeric.eq_key(v) for v in row)
                 if key not in seen:
                     seen.add(key)
                     deduped.append(row)

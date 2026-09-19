@@ -2038,6 +2038,7 @@ jobs:
           tests/test_rust_hint_error_message.py
           tests/test_rust_decimal_extremes.py
           tests/test_comparison_operand_types.py
+          tests/test_lookup_numeric_equality.py
           tests/test_rust_server_timestamp_local_time.py
           -o addopts= -p no:cacheprovider -q
 

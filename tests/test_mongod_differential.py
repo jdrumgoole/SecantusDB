@@ -1653,6 +1653,40 @@ LOOKUP_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
         ),
     ),
     (
+        # Equality by VALUE across numeric types and Decimal128 scale. The
+        # hash join keyed on the raw value (Python) / derived `==` (Rust) and
+        # joined none of these; the indexed path always did.
+        "lookup-numeric-equality-by-value",
+        [
+            {"_id": 1, "v": Decimal128("1.5")},
+            {"_id": 2, "v": 2},
+            {"_id": 3, "v": 2.0},
+            {"_id": 4, "v": [Int64(7)]},
+            {"_id": 5, "v": float("nan")},
+            {"_id": 6, "v": True},
+        ],
+        lambda db: _join(
+            db,
+            [
+                {"_id": 10, "v": Decimal128("1.500")},
+                {"_id": 11, "v": Decimal128("2.0")},
+                {"_id": 12, "v": [7.0, 8]},
+                {"_id": 13, "v": Decimal128("NaN")},
+                {"_id": 14, "v": 1},
+            ],
+            [
+                {
+                    "$lookup": {
+                        "from": "stock",
+                        "localField": "v",
+                        "foreignField": "v",
+                        "as": "s",
+                    }
+                }
+            ],
+        ),
+    ),
+    (
         "lookup-dotted-as-nests",
         [{"_id": 1, "sku": "a"}],
         lambda db: _join(

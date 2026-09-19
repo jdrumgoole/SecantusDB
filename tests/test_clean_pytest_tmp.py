@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
 import python_tasks
 
 
@@ -93,12 +94,25 @@ def test_unreadable_lock_is_treated_as_alive(tmp_path: Path) -> None:
     assert weird.exists()
 
 
+def _symlink_or_skip(link, target) -> None:
+    """Create ``link`` -> ``target``, or skip where the OS will not let this
+    user create one: Windows without Developer Mode or admin rights refuses
+    with ERROR_PRIVILEGE_NOT_HELD (1314). CI's Windows runners are admin, so
+    the test still runs there."""
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip("creating a symlink needs a privilege this Windows user lacks")
+        raise
+
+
 def test_symlinks_and_foreign_names_are_left_alone(tmp_path: Path) -> None:
     root = tmp_path / f"pytest-of-{__import__('getpass').getuser()}"
     root.mkdir()
     for n in range(1, 6):
         _make_run(root, n, lock_pid=None)
-    (root / "pytest-current").symlink_to(root / "pytest-5")
+    _symlink_or_skip(root / "pytest-current", root / "pytest-5")
     keep_me = root / "not-a-pytest-dir"
     keep_me.mkdir()
 

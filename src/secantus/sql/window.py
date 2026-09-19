@@ -138,6 +138,7 @@ def _eval_window(w: exp.Window, docs: list[dict[str, Any]], scope_of: Any, sctx:
 def _partitions(
     docs: list[dict[str, Any]], partition_by: list[exp.Expression], scope_of: Any, sctx: Any
 ) -> list[list[dict[str, Any]]]:
+    from secantus.sql import numeric as _numeric
     from secantus.sql import scalar
 
     if not partition_by:
@@ -146,7 +147,7 @@ def _partitions(
     order: list[tuple] = []
     for doc in docs:
         scope = scope_of(doc)
-        key = tuple(repr(scalar.evaluate(p, scope, sctx)) for p in partition_by)
+        key = tuple(_numeric.eq_key(scalar.evaluate(p, scope, sctx)) for p in partition_by)
         if key not in groups:
             groups[key] = []
             order.append(key)

@@ -3641,6 +3641,24 @@ class _LookupIndex:
         self.unhashable: list[dict[str, Any]] = []
 
 
+def _lookup_key(value: Any) -> Any:
+    """The hash-join key for one scalar ``localField`` / ``foreignField`` value.
+
+    mongod joins by BSON equality, not Python's: ``Decimal128("1.5")`` matches
+    ``Decimal128("1.500")``, and ``2``, ``2.0`` and ``Decimal128("2.0")`` all
+    match each other (measured 8.2.11, 2026-09-19). ``Decimal128`` hashes and
+    compares by its REPRESENTATION, so keying on the raw value joined none of
+    those -- silently, and only when the foreign field had no index (the
+    indexed path goes through the query engine and was right). The ``$group``
+    bucket key already encodes this rule (numerics by value, one NaN, bool
+    apart from 1). A container raises TypeError so the caller keeps it on the
+    unhashable path.
+    """
+    if isinstance(value, (Mapping, list)):
+        raise TypeError("container lookup key")
+    return _hashable_scalar(value)
+
+
 def _build_lookup_index(foreign_docs: list[dict[str, Any]], foreign_field: str) -> _LookupIndex:
     idx = _LookupIndex()
     for fd in foreign_docs:
@@ -3649,7 +3667,7 @@ def _build_lookup_index(foreign_docs: list[dict[str, Any]], foreign_field: str) 
         added = False
         for k in keys:
             try:
-                idx.hashable.setdefault(k, []).append(fd)
+                idx.hashable.setdefault(_lookup_key(k), []).append(fd)
                 added = True
             except TypeError:
                 continue
@@ -3675,7 +3693,7 @@ def _hash_join_lookup(
     local_unhashable = False
     for lv in lookups:
         try:
-            hits = idx.hashable.get(lv)
+            hits = idx.hashable.get(_lookup_key(lv))
         except TypeError:
             local_unhashable = True
             continue
@@ -3704,12 +3722,20 @@ def _hash_join_lookup(
 
 def _lookup_match(local: Any, foreign: Any) -> bool:
     if isinstance(local, list) and isinstance(foreign, list):
-        return any(le == fe for le in local for fe in foreign)
+        return any(_lookup_eq(le, fe) for le in local for fe in foreign)
     if isinstance(local, list):
-        return foreign in local
+        return any(_lookup_eq(le, foreign) for le in local)
     if isinstance(foreign, list):
-        return local in foreign
-    return local == foreign
+        return any(_lookup_eq(local, fe) for fe in foreign)
+    return _lookup_eq(local, foreign)
+
+
+def _lookup_eq(a: Any, b: Any) -> bool:
+    """One pair under the hash join's equality (`_lookup_key`)."""
+    try:
+        return bool(_lookup_key(a) == _lookup_key(b))
+    except TypeError:
+        return bool(a == b)
 
 
 # Optional deterministic RNG for ``$sample``. The env var
