@@ -24,7 +24,7 @@
   <div class="wrap">
     <div class="callout">
       <span class="badge">Early access</span>
-      <span>The Rust PostgreSQL server is the youngest thing in the project. Two things to know before you trust it with anything: it <strong>does not verify passwords</strong> &mdash; a role's SCRAM verifier is stored and never checked, so every connection is trusted &mdash; and a column-level <code>UNIQUE</code> is <strong>accepted and then not enforced</strong>, so a duplicate goes in silently where PostgreSQL would answer <code>23505</code>. That second one is a data-integrity gap rather than a missing feature, which is why it is here and not in the table below. Keep it on loopback, and keep production data out of it.</span>
+      <span>The Rust PostgreSQL server is the youngest thing in the project. One thing to know before you trust it with anything: it <strong>does not verify passwords</strong> &mdash; a role's SCRAM verifier is stored and never checked, so a wrong password and no password both connect. That is an access-control gap rather than a missing feature, which is why it is here and not in the table below. Keep it on loopback, and keep production data out of it.</span>
     </div>
   </div>
 </div>
@@ -72,12 +72,12 @@
           <tr><th>Area</th><th>What works</th></tr>
         </thead>
         <tbody>
-          <tr><th>DDL</th><td><code>CREATE</code> / <code>DROP TABLE</code>, <code>CREATE TABLE AS</code>, <code>TRUNCATE</code>, constraints, <code>CREATE TYPE</code> (enum, composite, range, base and shell types), <code>CREATE EXTENSION</code> for <code>hstore</code> and <code>postgis</code></td></tr>
+          <tr><th>DDL</th><td><code>CREATE</code> / <code>DROP TABLE</code>, <code>CREATE TABLE AS</code>, <code>TRUNCATE</code>, constraints enforced (<code>NOT NULL</code>, <code>CHECK</code>, <code>FOREIGN KEY</code>, <code>PRIMARY KEY</code> and <code>UNIQUE</code> &mdash; a duplicate answers <code>23505</code> with PostgreSQL's <code>DETAIL</code> line), <code>CREATE TYPE</code> (enum, composite, range, base and shell types), <code>CREATE EXTENSION</code> for <code>hstore</code> and <code>postgis</code></td></tr>
           <tr><th>DML &amp; queries</th><td><code>INSERT</code> (with <code>RETURNING</code>), <code>UPDATE</code>, <code>DELETE</code>, <code>SELECT</code> with <code>WHERE</code> / <code>ORDER BY</code> / <code>LIMIT</code> / <code>OFFSET</code> / <code>GROUP BY</code>, the <code>count</code> / <code>sum</code> / <code>min</code> / <code>max</code> aggregates, three-valued logic, and <code>SELECT</code> with no table at all</td></tr>
           <tr><th>Types</th><td><code>numeric</code> exact past 34 digits, <code>uuid</code>, <code>bytea</code>, <code>inet</code> / <code>cidr</code>, arrays including multidimensional, composites, ranges and multiranges, enums, <code>regclass</code>, dates and <code>timestamptz</code> honouring the session zone &mdash; each answered in text <em>and</em> binary, checked against PostgreSQL 16. psycopg's suites for every one of those pass in full</td></tr>
           <tr><th>Sessions</th><td>GUCs with <code>GUC_REPORT</code> (<code>DateStyle</code>, <code>client_encoding</code> with LATIN1 / LATIN9 transcoding, <code>standard_conforming_strings</code>), <code>CancelRequest</code>, <code>pg_cancel_backend</code> and <code>pg_terminate_backend</code> that reach an idle session</td></tr>
           <tr><th>Beyond the basics</th><td><code>COPY</code> in and out, server-side cursors (<code>DECLARE</code> / <code>FETCH</code> / <code>MOVE</code>), <code>LISTEN</code> / <code>NOTIFY</code> with PostgreSQL's delivery and transaction semantics, <code>DO</code> blocks over a subset of PL/pgSQL, roles and the <code>pg_roles</code> / <code>pg_authid</code> / <code>pg_user</code> catalogs</td></tr>
-          <tr><th>Not yet</th><td>Secondary indexes &mdash; <code>CREATE INDEX</code> is refused outright (<code>IndexStmt is not supported yet</code>) rather than faked &mdash; <code>pg_constraint</code>, and password verification. Note the difference between a refusal and the unenforced <code>UNIQUE</code> in the notice above: a refusal is honest and you find it in one run. The project's rule is a faithful &ldquo;not supported&rdquo; over a half-implemented feature that diverges quietly &mdash; where something slips through that rule, as <code>UNIQUE</code> has, it is written down in the open backlog rather than left for you to discover</td></tr>
+          <tr><th>Not yet</th><td>Secondary indexes &mdash; <code>CREATE INDEX</code> is refused outright (<code>IndexStmt is not supported yet</code>) rather than faked &mdash; <code>pg_constraint</code>, multi-column <code>FOREIGN KEY</code>s, and password verification. A refusal is the project's rule working: a faithful &ldquo;not supported&rdquo; over a half-implemented feature that diverges quietly, and you find it in one run rather than in your data. Where something has slipped through that rule it is written down in the open backlog rather than left for you to discover &mdash; a column-level <code>UNIQUE</code> did, accepted and never enforced, and was fixed on 2026-09-18</td></tr>
         </tbody>
       </table>
     </div>
@@ -115,7 +115,7 @@
     <div class="install-cols">
       <div class="install-col">
         <h3>Prebuilt binary</h3>
-        <p>Download, extract, run. No Rust toolchain, no Python, nothing to install.</p>
+        <p>Download, extract, run. No Rust toolchain and no Python &mdash; on Linux it links the system <code>zlib</code> and <code>lz4</code>, WiredTiger's block compressors.</p>
         <pre class="install-code"><code># from the release page, then:
 ./secantusd-pg ./data 127.0.0.1:5432</code></pre>
         <p class="install-cta"><a href="{{ SECANTUS_PG_BINARY_URL }}" rel="noopener">Current binary release ({{ SECANTUS_PG_BINARY_TAG | replace("secantusd-pg-v", "") }}) &rarr;</a></p>
