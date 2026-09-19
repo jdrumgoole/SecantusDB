@@ -34,6 +34,8 @@ from typing import Any
 import bson
 from sqlglot import exp
 
+from secantus.sql import numeric as _numeric
+
 # Internal type tags -> Postgres type OID. Stable across the codebase; the wire
 # layer reads these for RowDescription.
 PG_OID: dict[str, int] = {
@@ -659,7 +661,10 @@ def number_literal(text: str) -> Any:
             with _decimal.localcontext() as ctx:
                 ctx.prec = 40
                 d = d.quantize(Decimal(1))
-        return to_decimal128(d)
+        # Exact: a Decimal128 when one holds it, else the wide form (see
+        # `secantus.sql.numeric`). Was `to_decimal128`, which rounded a literal
+        # past 34 digits before any expression saw it.
+        return _numeric.stored(d)
     return int(text)
 
 
@@ -757,7 +762,11 @@ def unwrap_numeric(value: Any) -> Any:
     / arithmetic / comparison all reject it. Any code that takes a value which
     might be a ``numeric`` and does arithmetic on it needs this first.
     """
-    return value.to_decimal() if isinstance(value, bson.Decimal128) else value
+    if isinstance(value, bson.Decimal128):
+        return value.to_decimal()
+    if isinstance(value, dict) and _numeric.WIDE_KEY in value:
+        return Decimal(value[_numeric.WIDE_KEY])
+    return value
 
 
 #: Postgres' jsonb btree type order (`Object > Array > Boolean > Number >
@@ -854,8 +863,13 @@ def sort_key_value(value: Any) -> Any:
     types, both of which ride as subdocuments. Postgres has a documented total
     order over each, and reproducing it is a slice of its own rather than a
     coercion — see `tasks/backlog.md`."""
-    if isinstance(value, bson.Decimal128):
-        return value.to_decimal()
+    d = _numeric.to_decimal(value) if not isinstance(value, Decimal) else value
+    if d is not None:
+        # A plain Decimal (callers such as percentile_cont use the result as the
+        # VALUE too), except NaN: `Decimal('NaN') < x` raises, so a NaN gets a
+        # key in Postgres' total order -- equal to itself, above every number.
+        # Decimal-vs-SortKey comparisons fall through to SortKey's reflection.
+        return _numeric.SortKey(d) if d.is_nan() else d
     from secantus.sql import intervals as _intervals
 
     if _intervals.is_interval(value):
@@ -866,8 +880,12 @@ def sort_key_value(value: Any) -> Any:
 def negate(value: Any) -> Any:
     """Arithmetic negation that also handles BSON ``Decimal128`` (which has no
     Python operators of its own)."""
-    if isinstance(value, bson.Decimal128):
-        return bson.Decimal128(-value.to_decimal())
+    if isinstance(value, bson.Decimal128) or _numeric.is_wide(value):
+        # copy_negate, never unary minus: `-d` rounds in Python's default
+        # 28-digit context, which cut even a 34-digit Decimal128 short.
+        return _numeric.stored(_numeric.to_decimal(value).copy_negate())
+    if isinstance(value, Decimal):
+        return value.copy_negate()
     return -value
 
 
@@ -1466,23 +1484,18 @@ def coerce(value: Any, tag: str) -> Any:
         except (TypeError, ValueError) as e:
             raise _coercion_error(tag, value) from e
     if tag == "numeric":
-        try:
-            d = value if isinstance(value, Decimal) else Decimal(str(value))
-        except (_decimal.DecimalException, TypeError, ValueError) as e:
-            # `Decimal("abc")` raises InvalidOperation, which was OUTSIDE the
-            # try below and reached the wire as a raw
-            # `[<class 'decimal.ConversionSyntax'>]`.
-            raise _coercion_error(tag, value) from e
-        try:
-            return bson.Decimal128(d)
-        except _decimal.DecimalException:
-            # Decimal128 holds 34 significant digits; a longer Decimal (from a
-            # binary numeric parameter) rounds into range rather than erroring —
-            # see tasks/backlog.md (numeric precision beyond Decimal128).
-            from bson.decimal128 import create_decimal128_context
-
-            with _decimal.localcontext(create_decimal128_context()) as ctx:
-                return bson.Decimal128(ctx.create_decimal(d))
+        d = _numeric.to_decimal(value)  # already a numeric of either form
+        if d is None:
+            try:
+                d = Decimal(str(value).strip())
+            except (_decimal.DecimalException, TypeError, ValueError) as e:
+                # `Decimal("abc")` raises InvalidOperation, which reached the
+                # wire as a raw `[<class 'decimal.ConversionSyntax'>]`.
+                raise _coercion_error(tag, value) from e
+        # Exact at any width: a Decimal128 when one holds the value exactly,
+        # else the wide form. This used to ROUND past 34 significant digits
+        # and clamp an exponent below -6176 to a different number.
+        return _numeric.stored(d)
     if tag in ("text", "citext"):
         # citext stores the original text verbatim (case preserved for display);
         # the case-insensitivity is applied by the query planner, not on write.
@@ -1784,6 +1797,10 @@ def to_pg_text(value: Any, tag: str | None = None) -> bytes | None:
     """
     if value is None:
         return None
+    if _numeric.is_wide(value):
+        # FIRST: a wide numeric is a document, and every dict branch below
+        # (json, ranges, the generic JSON fallback) would claim it.
+        return value[_numeric.WIDE_KEY].encode("utf-8")
     if isinstance(value, RegClassValue):
         return value.relname.encode("utf-8")
     if tag == "float4" and isinstance(value, float):
@@ -2089,6 +2106,8 @@ def to_py(value: Any, tag: str) -> Any:
         return int(value)
     if isinstance(value, bson.Decimal128):
         return value.to_decimal()
+    if _numeric.is_wide(value):
+        return Decimal(value[_numeric.WIDE_KEY])
     if isinstance(value, bson.ObjectId):
         return str(value)
     if isinstance(value, bson.Binary):

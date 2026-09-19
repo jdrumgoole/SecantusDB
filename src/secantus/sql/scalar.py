@@ -33,6 +33,7 @@ from sqlglot import exp
 
 from secantus.paths import get_path
 from secantus.sql import errors, typemap
+from secantus.sql import numeric as _numeric
 from secantus.sql import ranges as _ranges
 
 # jsonb navigation (->, ->>, #>, #>>); the scalar (->> / #>>) variants render text.
@@ -579,14 +580,45 @@ def _pg_mod(left: Any, right: Any) -> Any:
     # Postgres mod takes the sign of the dividend (unlike Python ``%``).
     if right == 0:
         raise errors.SQLError("22012", "division by zero")
+    if isinstance(left, Decimal) or isinstance(right, Decimal):
+        # Exact, and the dividend's sign (Decimal.remainder's rule too).
+        # `math.fmod` converted a numeric to FLOAT, so `n % m` was wrong for
+        # any value a double cannot hold, not merely imprecise.
+        try:
+            return _numeric.EXACT.remainder(Decimal(left), Decimal(right))
+        except (TypeError, decimal.InvalidOperation):
+            pass
     r = math.fmod(left, right)
     return int(r) if isinstance(left, int) and isinstance(right, int) else r
 
 
+def _exact_arith(op: str) -> Callable[[Any, Any], Any]:
+    """``+`` / ``-`` / ``*`` that never round a ``numeric``.
+
+    A bare ``a + b`` on two ``Decimal``s runs in Python's DEFAULT context,
+    which rounds at 28 significant digits -- below even Decimal128's 34, and
+    far below Postgres' exact numeric. Measured:
+    ``1234567890123456789012345678901234567890 + 1`` came back as
+    ``1.234567890123456789012345679E+39``. Any other operand pair (ints,
+    floats, intervals, dates) keeps its own operator."""
+    method = {"+": "add", "-": "subtract", "*": "multiply"}[op]
+    plain = {"+": lambda a, b: a + b, "-": lambda a, b: a - b, "*": lambda a, b: a * b}[op]
+
+    def exactable(v: Any) -> bool:
+        return isinstance(v, Decimal) or (isinstance(v, int) and not isinstance(v, bool))
+
+    def apply(a: Any, b: Any) -> Any:
+        if (isinstance(a, Decimal) or isinstance(b, Decimal)) and exactable(a) and exactable(b):
+            return getattr(_numeric.EXACT, method)(Decimal(a), Decimal(b))
+        return plain(a, b)
+
+    return apply
+
+
 _ARITH: dict[type, Callable[[Any, Any], Any]] = {
-    exp.Add: lambda a, b: a + b,
-    exp.Sub: lambda a, b: a - b,
-    exp.Mul: lambda a, b: a * b,
+    exp.Add: _exact_arith("+"),
+    exp.Sub: _exact_arith("-"),
+    exp.Mul: _exact_arith("*"),
     exp.Div: _pg_div,
     exp.Mod: _pg_mod,
 }
@@ -1129,7 +1161,13 @@ def _eval_round(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
     if isinstance(v, decimal.Decimal):
         # PG rounds numeric half-away-from-zero; Python's round() is
         # banker's rounding, wrong for e.g. round(2.5) and round(3.125, 2).
-        return v.quantize(decimal.Decimal(1).scaleb(-ndigits), rounding=decimal.ROUND_HALF_UP)
+        # Under the exact context: the default one refuses a result wider
+        # than 28 digits (InvalidOperation).
+        return v.quantize(
+            decimal.Decimal(1).scaleb(-ndigits),
+            rounding=decimal.ROUND_HALF_UP,
+            context=_numeric.EXACT,
+        )
     return round(v, ndigits)
 
 
@@ -2688,7 +2726,10 @@ _SCALAR_FUNC_NODES: dict[type, Callable[[exp.Expression, Scope, ScalarContext], 
             if n.args.get(k) is not None
         ],
     ),
-    exp.Abs: _unary(abs, check_int_range=True),
+    # copy_abs for a numeric: builtin abs() rounds a Decimal to 28 digits.
+    exp.Abs: _unary(
+        lambda v: v.copy_abs() if isinstance(v, Decimal) else abs(v), check_int_range=True
+    ),
     exp.Ceil: _unary(lambda v: math.ceil(v)),
     exp.Floor: _unary(lambda v: math.floor(v)),
     exp.Round: _eval_round,

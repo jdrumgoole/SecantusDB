@@ -22,6 +22,7 @@ import bson
 from secantus import collation as _collation
 from secantus.paths import get_path, has_path
 from secantus.sql import errors, planner, subms, typemap
+from secantus.sql import numeric as _numeric
 from secantus.sql.catalog import USER_TYPE_ARRAY_OID_OFFSET, Catalog
 from secantus.sql.result import ColumnDesc, SQLResult
 
@@ -1285,6 +1286,7 @@ def execute_insert(
         for doc in plan.docs:
             doc.setdefault("_id", bson.ObjectId())
     enforce_insert_rows(plan.docs, plan.table, storage, db, catalog, session)
+    _check_numeric_pk_values(plan.docs, plan.table, storage, db)
     inserted, write_errors = storage.insert(db, plan.table.collection, plan.docs)
     if write_errors:
         _raise_write_error(write_errors[0], plan.table)
@@ -1301,6 +1303,43 @@ def execute_insert(
             session,
         )
     return SQLResult(command_tag=f"INSERT 0 {inserted}", rowcount=inserted)
+
+
+def _check_numeric_pk_values(
+    docs: list[dict[str, Any]], table: planner.TableDef, storage: Any, db: str
+) -> None:
+    """Raise 23505 when a numeric PRIMARY KEY duplicates one by VALUE.
+
+    A numeric wider than Decimal128 is stored as a ``{__numeric, __numkey}``
+    document (`secantus.sql.numeric`), and the ``_id`` index compares documents
+    field by field -- so ``1e40`` and ``1e40.0``, equal in Postgres, looked
+    distinct, and so did a wide ``1.5000…0`` beside a plain ``1.5``. The index
+    still catches every duplicate between two Decimal128s; this only runs a
+    value probe when a wide key is involved (the new one, or one already
+    stored), so an ordinary numeric-keyed bulk insert pays one extra query.
+    Ported from the Rust server's ``wide_numeric_pk_conflict``."""
+    pk = table.pk_columns
+    if len(pk) != 1 or pk[0].type_tag != "numeric" or pk[0].field != "_id":
+        return
+    keys = [_numeric.to_decimal(d.get("_id")) for d in docs]
+    new_wide = any(_numeric.is_wide(d.get("_id")) for d in docs)
+    stored_wide = new_wide or bool(
+        storage.find_matching(
+            db, table.collection, {f"_id.{_numeric.SORT_KEY}": {"$exists": True}}, limit=1
+        )
+    )
+    if not stored_wide:
+        return
+    seen: set[tuple] = set()
+    for key in keys:
+        if key is None:
+            continue
+        ident = _numeric.order_key(key.normalize(_numeric.EXACT) if key.is_finite() else key)
+        if ident in seen or storage.find_matching(
+            db, table.collection, _numeric.filter_for("_id", "$eq", key), limit=1
+        ):
+            _raise_write_error({"code": 11000, "errmsg": "index: _id_ dup key"}, table)
+        seen.add(ident)
 
 
 def _raise_write_error(err: dict[str, Any], table: planner.TableDef) -> None:
@@ -1686,7 +1725,14 @@ def enforce_parent_delete(
 def _hashable_id(value: Any) -> Any:
     """A hashable key for an ``_id`` value. A composite PK's ``_id`` is a
     subdocument (dict) — unhashable — so canonicalize it to a sorted tuple of
-    items; a scalar ``_id`` passes through."""
+    items; a scalar ``_id`` passes through.
+
+    A ``numeric`` key hashes by VALUE, through its sort key: a Decimal128 is
+    not hashable at all (``UPDATE pk SET n = n + 10`` on a numeric PRIMARY KEY
+    was an XX000), and a wide one is a document whose text carries its scale,
+    so ``1e40`` and ``1e40.0`` -- the same key in Postgres -- differed."""
+    if isinstance(value, bson.Decimal128) or _numeric.is_wide(value):
+        return ("__numeric", _numeric.sort_key(_numeric.canonical(_numeric.to_decimal(value))))
     if isinstance(value, dict):
         return tuple(sorted((k, _hashable_id(v)) for k, v in value.items()))
     if isinstance(value, list):
@@ -1836,9 +1882,15 @@ def _find_conflict(
     # subdocument, so probe with has_path / get_path, not flat dict access.
     if not oc.conflict_fields or any(not has_path(doc, f) for f in oc.conflict_fields):
         return None
-    found = storage.find_matching(
-        db, coll, {f: get_path(doc, f) for f in oc.conflict_fields}, limit=1
-    )
+    parts: list[dict[str, Any]] = []
+    for f in oc.conflict_fields:
+        v = get_path(doc, f)
+        d = _numeric.to_decimal(v) if isinstance(v, (bson.Decimal128, dict)) else None
+        # A numeric key is equal by VALUE (`1e40` = `1e40.0`), which a stored
+        # wide document's field-by-field equality cannot see.
+        parts.append(_numeric.filter_for(f, "$eq", d) if d is not None else {f: v})
+    flt = parts[0] if len(parts) == 1 else {"$and": parts}
+    found = storage.find_matching(db, coll, flt, limit=1)
     return found[0] if found else None
 
 
@@ -2518,6 +2570,13 @@ def _apply_post_aggregates(plan: Any, result: list[dict[str, Any]]) -> list[dict
     # downstream sees it.
     for doc in result:
         for key, value in doc.items():
+            # An exact numeric sum / min / max arrives as a pushed marker list
+            # (`numeric.AGG_MARKERS`); fold it before anything reads it --
+            # `numeric_avg` below divides the folded sum.
+            numeric_func = _numeric.marked_func(value)
+            if numeric_func is not None:
+                doc[key] = _numeric.fold(numeric_func, value)
+                continue
             if not isinstance(value, dict):
                 continue
             if subms.COMPOSITE_DATE in value:
@@ -2530,6 +2589,11 @@ def _apply_post_aggregates(plan: Any, result: list[dict[str, Any]]) -> list[dict
                 if isinstance(inner, dict) and subms.COMPOSITE_DATE in inner:
                     value[inner_key] = subms.unwrap_composite(inner)
     for field_name, kind, payload in getattr(plan, "post_aggregates", ()) or ():
+        if kind == "py_sort":
+            # Last: ORDER BY / OFFSET / LIMIT deferred from the pipeline because
+            # a sort term is a numeric (`planner._defer_numeric_sort`).
+            result = _py_sort(result, payload)
+            continue
         for doc in result:
             if kind in ("sorted_array", "sorted_string"):
                 doc[field_name] = _sorted_agg_value(kind, payload, doc.get(field_name))
@@ -2575,6 +2639,31 @@ def _apply_post_aggregates(plan: Any, result: list[dict[str, Any]]) -> list[dict
                     else _ordered_set_value(kind, payload, doc.get(field_name))
                 )
     return result
+
+
+def _py_sort(result: list[dict[str, Any]], payload: Any) -> list[dict[str, Any]]:
+    """Postgres ORDER BY over pipeline output, then OFFSET / LIMIT, then drop
+    the hidden sort-only fields. An enum term sorts by its declared order."""
+    terms, enum_labels, skip, limit, drop = payload
+
+    def key_of(doc: dict[str, Any]) -> tuple[Any, ...]:
+        out = []
+        for name, _direction, _nulls_first in terms:
+            v = doc.get(name)
+            labels = enum_labels.get(name)
+            out.append(labels.index(v) if labels is not None and v in labels else v)
+        return tuple(out)
+
+    rows = list(result)
+    _pg_sort(rows, key_of, [(direction, nf) for _name, direction, nf in terms])
+    if skip:
+        rows = rows[skip:]
+    if limit is not None:
+        rows = rows[:limit]
+    for doc in rows:
+        for name in drop:
+            doc.pop(name, None)
+    return rows
 
 
 def _as_exact(value: Any) -> Decimal:

@@ -11,9 +11,12 @@ range types, and range GiST indexes are out of scope.
 from __future__ import annotations
 
 import datetime as _dt
+from decimal import Decimal
 from typing import Any
 
 import bson
+
+from secantus.sql import numeric as _numeric
 
 # type tag -> (element tag, is_discrete). Discrete ranges canonicalise to ``[)``.
 RANGE_TYPES: dict[str, tuple[str, bool]] = {
@@ -33,8 +36,9 @@ def _cv(v: Any) -> Any:
     constructed one (``tsrange(a, b)``) is aware, and Python refuses to order
     the two -- so ``stored && tsrange(…)`` was an XX000. `_canonical_bound`
     already applied the same UTC rule for equality."""
-    if isinstance(v, bson.Decimal128):
-        return v.to_decimal()
+    if isinstance(v, bson.Decimal128) or _numeric.is_wide(v):
+        # A numrange bound past Decimal128 is the wide numeric document.
+        return _numeric.to_decimal(v)
     if isinstance(v, _dt.datetime) and v.tzinfo is None:
         return v.replace(tzinfo=_dt.timezone.utc)
     return v
@@ -250,8 +254,10 @@ def _after_lower(hi_side: dict, lo_side: dict) -> bool:
 def _fmt(value: Any, tag: str | None = None) -> str:
     if value is None:
         return ""
-    if isinstance(value, bson.Decimal128):
-        return str(value.to_decimal())
+    if isinstance(value, (bson.Decimal128, Decimal)) or _numeric.is_wide(value):
+        # Postgres' plain notation: `str(Decimal)` switches to exponent form
+        # (`1E+40`) where Postgres prints every digit.
+        return _numeric.canonical(_numeric.to_decimal(value))
     if isinstance(value, _dt.datetime):
         # A ``daterange`` bound is stored as a datetime (BSON has no date-only
         # value) but renders as its date, the way Postgres prints it.
@@ -599,8 +605,8 @@ def _canonical_bound(v: Any) -> Any:
     """A comparison-stable form of a range bound: ``Decimal128`` unwraps to
     ``Decimal`` (so int / Decimal / Decimal128 spellings of the same number
     compare equal), naive datetimes read as UTC, date objects as ISO text."""
-    if isinstance(v, bson.Decimal128):
-        return v.to_decimal()
+    if isinstance(v, bson.Decimal128) or _numeric.is_wide(v):
+        return _numeric.to_decimal(v)
     if isinstance(v, _dt.datetime):
         return v.replace(tzinfo=_dt.timezone.utc) if v.tzinfo is None else v
     if isinstance(v, _dt.date):

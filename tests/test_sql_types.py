@@ -66,10 +66,22 @@ def test_json_scalar_renders_as_json_text():
     assert typemap.to_pg_text(Decimal(10) ** 20, "json") == b"100000000000000000000"
 
 
-def test_coerce_numeric_beyond_decimal128_rounds():
+def test_coerce_numeric_beyond_decimal128_is_exact():
+    """Was `…_rounds`, pinning the old ceiling: 40 digits came back as 34. A
+    numeric Decimal128 cannot hold exactly is now stored in the wide form
+    (`secantus.sql.numeric`) and reads back digit for digit."""
     d = Decimal("1" * 40)  # 40 significant digits — Decimal128 holds 34
-    got = typemap.coerce(d, "numeric").to_decimal()
-    assert got == Decimal("1.111111111111111111111111111111111E+39")
+    stored = typemap.coerce(d, "numeric")
+    assert stored == {"__numeric": "1" * 40, "__numkey": "3" + "1000040" + "1" * 40}
+    assert typemap.unwrap_numeric(stored) == d
+
+
+def test_coerce_numeric_that_fits_stays_decimal128():
+    """What a Mongo client reading the collection sees for ordinary values is
+    unchanged: a plain Decimal128, display scale included."""
+    import bson
+
+    assert typemap.coerce(Decimal("1.50"), "numeric") == bson.Decimal128("1.50")
 
 
 # --------------------------------------------------------------------------- #
