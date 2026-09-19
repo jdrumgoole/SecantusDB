@@ -391,11 +391,25 @@ pub fn decimal128_bracket(canonical: &str) -> Option<Bracket> {
             return Some(Bracket::Exact(d));
         }
     }
-    // Magnitudes: truncated to 34 digits, and one unit above that. Neither
-    // parses only when the exponent is beyond Decimal128's range.
-    let head = &significant[..significant.len().min(DECIMAL128_DIGITS)];
-    let tail_exp = exponent - head.len() as i64;
-    let lo: BigInt = head.parse().ok()?;
+    // Magnitudes: truncated to the digits Decimal128 can hold HERE, and one
+    // unit above that. That is 34 digits -- unless the value sits so close to
+    // Decimal128's exponent floor that 34 digits would put the last one below
+    // 10^-6176, in which case only the digits down to 10^-6176 fit. (Truncating
+    // to 34 regardless made `mk` fail and fall back to `(0, 1E-6176)`, a
+    // bracket that does not CONTAIN a value like 1.23…E-6150, so a range
+    // filter on it selected wrong Decimal128 rows.) With no digit left the
+    // value is below 1E-6176, and that fallback is then exactly right.
+    let mut take = significant.len().min(DECIMAL128_DIGITS);
+    if exponent - (take as i64) < DECIMAL128_MIN_EXP {
+        take = (exponent - DECIMAL128_MIN_EXP).clamp(0, take as i64) as usize;
+    }
+    let head = &significant[..take];
+    let tail_exp = exponent - take as i64;
+    let lo: BigInt = if head.is_empty() {
+        BigInt::zero()
+    } else {
+        head.parse().ok()?
+    };
     let hi = &lo + BigInt::one();
     let mk = |n: &BigInt| Decimal128::from_str(&format!("{n}E{tail_exp}")).ok();
     let (below, above) = match (mk(&lo), mk(&hi)) {

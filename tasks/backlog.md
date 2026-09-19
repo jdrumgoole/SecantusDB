@@ -9909,20 +9909,22 @@ shared storage engine or building large new protocol subsystems:
   be the value (e.g. `__numkey` for a wide one) with the display value carried
   beside it. Only values past 34 digits that differ only in scale are
   affected; ordinary numerics group correctly.
+- [ ] **A random psycopg query is rejected by sqlglot: `Required keyword:
+  'expressions' missing for <class 'sqlglot.expressions.core.Bracket'>`**
+  (Python pgserver, seen 2026-09-19 in two gauge runs:
+  `test_cursor_client_async.py::test_leak[asyncio-namedtuple_row-iter]` on
+  #1497's run, `test_cursor_client.py::test_leak[asyncio-tuple_row-iter]` on
+  #1502's). Both are CLIENT-side-binding cursors, so the rejected SQL has the
+  random faker values inlined -- most likely an empty or nested array literal
+  sqlglot cannot parse. Not reproduced in 288 local runs, and the server does
+  not log the SQL of a query it rejects at parse time, so the text was never
+  captured: logging the statement on a 42601 would make the next occurrence
+  diagnosable.
 - [ ] **HAVING on a numeric aggregate compares at Decimal128 precision**
   (Python pgserver, 2026-09-19). The select-list `sum` / `min` / `max` over a
   numeric are exact (pushed and folded in Python), but a HAVING term compares
   its accumulator inside the pipeline, so it keeps the native `$sum` (which
   also skips a wide value).
-- [ ] **RUST pgserver: `decimal128_bracket` is wrong for tiny wide values**
-  (found 2026-09-19 porting it). For a value like `1.2…(35 digits)E-6150` it
-  truncates to 34 digits, the exponent falls below -6176, and it falls back to
-  `(0, 1E-6176)` -- a bracket that does not contain the value, so a range
-  filter against such a constant selects wrong Decimal128 rows. The Python
-  port snaps to the real Decimal128 grid instead (`numeric._bracket`,
-  `step_exp = max(adjusted - 33, -6176)`); verified 0 violations over 20,000
-  values including that band. Port the same to `crates/secantus-pgplan/src/numeric.rs`
-  and probe against PostgreSQL.
 - [ ] **`$convert` string -> decimal raises `Inexact` out of the engine**
   (Python Mongo engine, 2026-09-19). `{$convert: {input: "<35-digit string>",
   to: "decimal", onError: …}}` raises a raw `decimal.Inexact` instead of

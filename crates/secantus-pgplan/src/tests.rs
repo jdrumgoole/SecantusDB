@@ -1317,6 +1317,81 @@ fn wide_numeric_where_lowers_to_bracket_and_key() {
     assert_eq!(hi.to_string(), "Infinity");
 }
 
+/// The bracket CONTAINS its value: `below < v < above`, for every exponent
+/// Decimal128 can reach -- including just above its floor. Truncating a
+/// 35-digit value to 34 digits there pushes the exponent below -6176, and the
+/// old fallback answered `(0, 1E-6176)`, a bracket that does not contain
+/// `1.23…E-6150` at all, so a range filter on such a constant selected wrong
+/// Decimal128 rows. Found porting this function to the Python server.
+#[test]
+fn wide_numeric_bracket_contains_its_value_down_to_the_exponent_floor() {
+    use numeric::{
+        canonical_numeric_text, compare_decimal_text, decimal128_bracket, plain_numeric_text,
+        Bracket,
+    };
+    use std::cmp::Ordering;
+    let mut checked = 0;
+    for sign in ["", "-"] {
+        for exp in (-6180..=-6100).chain(-40..=40).chain(6100..=6112) {
+            let text = canonical_numeric_text(&format!(
+                "{sign}1.2345678901234567890123456789012345E{exp}"
+            ))
+            .unwrap();
+            let Bracket::Between(lo, hi) = decimal128_bracket(&text).unwrap() else {
+                panic!("35 significant digits cannot be exact: {text}");
+            };
+            let (lo, hi) = (
+                plain_numeric_text(&lo.to_string()),
+                plain_numeric_text(&hi.to_string()),
+            );
+            let below =
+                hi == "Infinity" || compare_decimal_text(&text, &hi) == Some(Ordering::Less);
+            let above =
+                lo == "-Infinity" || compare_decimal_text(&lo, &text) == Some(Ordering::Less);
+            assert!(
+                below && above,
+                "E{exp}{sign}: bracket ({lo}, {hi}) does not contain the value"
+            );
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 2 * (81 + 81 + 13));
+    // Short values at and past the floor: exact where a Decimal128 holds the
+    // value, else a bracket that still contains it.
+    for text in [
+        "1.5E-6176",
+        "1.5E-6177",
+        "1.5E-6180",
+        "-1.5E-6177",
+        "9E-6177",
+    ] {
+        let text = canonical_numeric_text(text).unwrap();
+        match decimal128_bracket(&text).unwrap() {
+            Bracket::Exact(d) => assert_eq!(
+                compare_decimal_text(&plain_numeric_text(&d.to_string()), &text),
+                Some(Ordering::Equal),
+                "{text} bracketed exactly by a different value {d}"
+            ),
+            Bracket::Between(lo, hi) => {
+                let (lo, hi) = (
+                    plain_numeric_text(&lo.to_string()),
+                    plain_numeric_text(&hi.to_string()),
+                );
+                assert_eq!(
+                    compare_decimal_text(&lo, &text),
+                    Some(Ordering::Less),
+                    "{text}: lo {lo}"
+                );
+                assert_eq!(
+                    compare_decimal_text(&text, &hi),
+                    Some(Ordering::Less),
+                    "{text}: hi {hi}"
+                );
+            }
+        }
+    }
+}
+
 /// Arithmetic on wide numerics is exact, with PostgreSQL's result scales
 /// (probed on 16, 2026-09-09) -- including division, which used to be
 /// refused.
