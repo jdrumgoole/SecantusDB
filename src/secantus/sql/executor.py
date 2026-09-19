@@ -1000,7 +1000,7 @@ def _with_subms(doc: dict[str, Any], col: Any) -> Any:
     projected through the aggregation pipeline has lost the companion.
     """
     value = get_path(doc, col.field)
-    if getattr(col, "type_tag", None) not in subms.SUBMS_TAGS:
+    if not subms.carries_subms(getattr(col, "type_tag", None)):
         return value
     return subms.merge(value, doc.get(subms.companion_field(col.field)))
 
