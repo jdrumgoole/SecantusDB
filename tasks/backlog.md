@@ -9957,13 +9957,15 @@ shared storage engine or building large new protocol subsystems:
   be the value (e.g. `__numkey` for a wide one) with the display value carried
   beside it. Only values past 34 digits that differ only in scale are
   affected; ordinary numerics group correctly.
-- [ ] **`invoke sync` fails on Windows** (2026-09-19): the task runs `uv sync`
-  with `pty=True`, and Windows has no `pty` module ("your platform doesn't
-  support the 'pty' module"), so the stale-`_secantus_core` guard's own advice
-  cannot be followed there. Workaround: run
-  `uv sync --all-extras --reinstall-package secantus-core` directly. Same class
-  as the `detached_run.py` Windows fixes in #1497: `pty=True` should be
-  `pty=not WINDOWS` (grep `tasks.py` for other `pty=True` calls).
+- [ ] **pgx `TestDeadlineContextWatcherHandler/DeadlineExceeded_with_DeadlineDelay`
+  failed once on CI** (2026-09-19, #1509's gauge run; passed on an immediate
+  re-run of the same commit). The test runs `select 1, pg_sleep(0.250)` under
+  a 100 ms context deadline plus a 500 ms `DeadlineDelay`, so it fails when the
+  Python pgserver takes more than ~600 ms to answer a 250 ms sleep: `timeout:
+  context deadline exceeded`. Nothing in that PR touches the path. A slow
+  runner is the likely cause, but a 2.4x overhead on a trivial query is worth
+  measuring (time `select 1, pg_sleep(0.25)` end to end on a loaded runner)
+  before calling it environmental.
 - [ ] **HAVING on a numeric aggregate compares at Decimal128 precision**
   (Python pgserver, 2026-09-19). The select-list `sum` / `min` / `max` over a
   numeric are exact (pushed and folded in Python), but a HAVING term compares
