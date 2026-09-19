@@ -573,6 +573,118 @@ def test_pg_proc_argtypes_resolve_multiword_type_names(storage, session):
     assert res.rows[0][0] == "701", "double precision is float8 (701)"
 
 
+def test_declared_char_types_have_pg_type_rows(storage, session):
+    """A ``varchar`` / ``char(n)`` column must point at a type that EXISTS.
+
+    Both spellings fold to the ``text`` storage tag, but a column still records
+    the declared oid (1043 / 1042). ``pg_type`` is built from the tag-keyed
+    ``PG_TYPENAME``, which can name only one of the three — so every such
+    column pointed at an oid with NO ``pg_type`` row, and a client joining
+    ``pg_attribute`` to ``pg_type`` (which is what a JDBC/psycopg metadata call
+    does) resolved it to nothing.
+
+    Asserted as the join a driver actually performs, not as a row count, so it
+    fails if either half regresses. ``text`` is asserted beside them to pin
+    that the fold still works.
+    """
+    q(storage, session, "CREATE TABLE ct (a varchar(10), b char(5), c text)")
+    res = q(
+        storage,
+        session,
+        "SELECT a.attname, a.atttypid, t.typname "
+        "FROM pg_attribute a JOIN pg_class c ON a.attrelid = c.oid "
+        "LEFT JOIN pg_type t ON t.oid = a.atttypid "
+        "WHERE c.relname = 'ct' ORDER BY a.attnum",
+    )
+    assert res.rows == [
+        ("a", 1043, "varchar"),
+        ("b", 1042, "bpchar"),
+        ("c", 25, "text"),
+    ]
+
+
+def test_columns_data_type_renders_the_declared_char_type(storage, session):
+    """``information_schema.columns.data_type`` names the DECLARED type.
+
+    A column already carried the declared oid for ``pg_attribute.atttypid``;
+    only this render ignored it and reported the ``text`` storage tag for every
+    string column. PostgreSQL 14 reports ``character varying`` / ``character``
+    (measured 2026-09-19), and a bare ``varchar`` renders the same as a
+    length-qualified one.
+    """
+    q(storage, session, "CREATE TABLE cd (a varchar(10), b char(5), c text, d varchar)")
+    res = q(
+        storage,
+        session,
+        "SELECT data_type FROM information_schema.columns "
+        "WHERE table_name = 'cd' ORDER BY ordinal_position",
+    )
+    assert [r[0] for r in res.rows] == [
+        "character varying",
+        "character",
+        "text",
+        "character varying",
+    ]
+
+
+def test_pg_proc_argtypes_record_the_declared_char_type(storage, session):
+    """``f(int, varchar)`` records 1043, not the ``text`` tag's 25.
+
+    Parameters had no equivalent of a column's ``decl_oid``, so the declared
+    spelling was lost and ``proargtypes`` read ``'23 25'`` where PostgreSQL 14
+    records ``'23 1043'`` (measured 2026-09-19). Both the unnamed and the named
+    form are asserted: the two take different parse branches, and the previous
+    bug in this area lived in only one of them.
+    """
+    q(storage, session, "CREATE FUNCTION fv(int, varchar) RETURNS int AS 'SELECT 1' LANGUAGE sql")
+    q(
+        storage,
+        session,
+        "CREATE FUNCTION fw(a int, b varchar, c char(3), d text) "
+        "RETURNS int AS 'SELECT 1' LANGUAGE sql",
+    )
+    q(storage, session, "CREATE FUNCTION fb(bpchar) RETURNS int AS 'SELECT 1' LANGUAGE sql")
+
+    def argtypes(name: str) -> str:
+        res = q(storage, session, f"SELECT proargtypes FROM pg_proc WHERE proname='{name}'")
+        return res.rows[0][0]
+
+    assert argtypes("fv") == "23 1043", "bare varchar is 1043, not text's 25"
+    assert argtypes("fw") == "23 1043 1042 25"
+    # Bare `bpchar` is the worse half of the same family: it has no storage tag
+    # at all, so it recorded 2278 (void) rather than merely the wrong string
+    # type.
+    assert argtypes("fb") == "1042", "bare bpchar is 1042, not void (2278)"
+
+
+def test_parameters_data_type_renders_the_declared_char_type(storage, session):
+    """``information_schema.parameters.data_type`` renders the SQL name.
+
+    PostgreSQL 14 renders ``character varying`` / ``character`` there — the SQL
+    spelling, NOT the ``pg_type.typname`` (``varchar`` / ``bpchar``) the same
+    type reports elsewhere. Measured 2026-09-19; the two surfaces disagreeing
+    is why this is asserted separately from ``proargtypes``.
+    """
+    q(
+        storage,
+        session,
+        "CREATE FUNCTION fp(a int, b varchar, c char(3), d text) "
+        "RETURNS int AS 'SELECT 1' LANGUAGE sql",
+    )
+    res = q(
+        storage,
+        session,
+        "SELECT data_type FROM information_schema.parameters "
+        "WHERE specific_name LIKE 'fp%' ORDER BY ordinal_position",
+    )
+    assert [r[0] for r in res.rows] == [
+        "integer",
+        "character varying",
+        "character",
+        "text",
+    ]
+
+
 def test_pg_class_reltuples(storage, session):
     # pgjdbc's getIndexInfo reads ci.reltuples as CARDINALITY; -1 is PG's
     # "no estimate yet" initial value.

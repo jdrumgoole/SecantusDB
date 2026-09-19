@@ -3115,6 +3115,18 @@ all match, and so do CREATE INDEX / VIEW and their error surface. What is open:
 - [ ] **`information_schema.columns` has no `numeric_precision` /
       `numeric_scale`** (`42703`). ORM reflection reads these to recover a
       `numeric(p, s)` declaration; without them the scale is invisible.
+      **`character_maximum_length` / `character_octet_length` are missing the
+      same way** (`42703`, measured 2026-09-19) — PostgreSQL 14 reports
+      `(10, 40)` for `varchar(10)`, `(5, 20)` for `char(5)` and
+      `(NULL, 1073741824)` for `text` / bare `varchar`. Distinct from the
+      declared-char-type slice, which fixed `data_type` on the same view: that
+      one had the data and ignored it, these columns do not exist.
+      **NOT what pgjdbc's `getColumnsCharOctetLength` reads** — that was
+      asserted here from the name and is false: the test went green when
+      `pg_type` gained its `varchar` row, because JDBC's `getColumns()`
+      computes the octet length from `pg_attribute.atttypmod` and never
+      touches `information_schema`. Measured 2026-09-19 by diffing the gauge
+      with and without that change. No test currently known to read these.
 - [ ] **`information_schema.table_constraints` omits the CHECK rows Postgres
       synthesizes for NOT NULL.** We report only the PRIMARY KEY where PG
       reports two CHECKs beside it.
@@ -3129,6 +3141,13 @@ all match, and so do CREATE INDEX / VIEW and their error surface. What is open:
       Postgres raises `42704 role "nosuchuser" does not exist`.
 - [ ] **`CREATE OR REPLACE VIEW` may drop columns.** Postgres refuses with
       `42P16 cannot drop columns from view`; we replace the definition happily.
+- [ ] **`pg_type.typcollation` is 0 for every type**, including the collatable
+      string types. PostgreSQL 14 reports **100** for `text` / `varchar` /
+      `bpchar` (measured 2026-09-19). Left alone deliberately when the
+      declared-char-type rows landed: the 0 is uniform across all eight row
+      builders in `virtual.py`, so correcting it is its own slice with its own
+      blast radius, not a rider on a two-row addition. Nothing measured yet
+      reads it — the pgjdbc metadata tests that drove that slice do not.
 
 ### 2026-09-03: the RUST pgserver on the same functions — grepped, not assumed
 
