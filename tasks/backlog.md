@@ -1070,6 +1070,34 @@ These work end-to-end but cut corners.
 
 ## 3. Deferred work (skipped from a slice, ready to come back)
 
+- [ ] **OPEN — RUST pgserver: `may_fill_catalog_cache` is defence whose
+      necessity is unproven (2026-09-19).** The gate refuses to publish a
+      catalog read taken on the transaction's own WiredTiger session into the
+      process-wide cache. Two things were measured rather than argued:
+
+      - **It is reached.** A block that has written rows (`CREATE TABLE` then
+        `CREATE TYPE`) does take catalog reads inside `with_user_transaction`.
+        A narrower probe saw `in_user_txn()` false at all 16 publishes and
+        concluded the gate was unreachable; a temporary `debug_assert` on that
+        "invariant" panicked the server on the first test that opens a block
+        containing a table. The narrow probe was wrong.
+      - **Forcing it to `true` leaks nothing observable.** Tried: casts,
+        `pg_type`, `pg_enum`, a pre-warmed cache, after ROLLBACK, and
+        `test_uncommitted_types_stay_private_and_stay_current`. A block's own
+        view of its uncommitted types comes from the per-connection
+        `uncommitted_types` overlay, which never reaches this cache, so the
+        overlay appears to carry the isolation by itself today.
+
+      So it is kept as defence, not removed: "no exploit was built" is not "no
+      exploit exists", and publishing one connection's uncommitted DDL to all
+      of them is not a risk worth a few microseconds. **What is pinned is the
+      BEHAVIOUR, not the gate**:
+      `test_an_open_blocks_uncommitted_type_is_invisible_to_other_connections`
+      and `test_a_rolled_back_type_never_becomes_visible` fail if the isolation
+      breaks, whichever mechanism was holding it up. Closing this item means
+      either building the leak (then the gate is load-bearing and should say
+      so) or proving the overlay is sufficient (then the gate can go).
+
 
 - [ ] **OPEN — `test_connect_error_multi_hosts_each_message_preserved` failed
       twice in a full psycopg-gauge run; cause UNKNOWN, and socket exhaustion
