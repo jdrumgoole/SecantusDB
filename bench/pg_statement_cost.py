@@ -22,16 +22,25 @@ above the protocol floor is overhead. Measured 2026-09-18 it cost 54.5us against
 PostgreSQL's 9.1us, which is the whole gap.
 
 Add `--in-transaction` to run the same statements inside one explicit block.
-That is NOT faster here -- it was 117us against 78us in autocommit -- because a
-block makes `may_fill_catalog_cache` refuse the catalog cache and each statement
-re-scans the catalog instead. See `tasks/backlog.md` for the attribution.
+Note what that flag really varies: the harness creates its table inside the
+block too, so it measures a block THAT HAS DONE DDL, not a bare block. That
+distinction was the whole of a 2026-09-19 investigation -- a block on its own
+cost slightly LESS than autocommit, while a block holding uncommitted DDL cost
+three times as much, because the uncommitted-type overlay disabled both the
+process-wide catalog cache and the planner's type-table skip. Run it both ways
+(`conn.commit()` after the DDL) before attributing anything to "being in a
+transaction".
 
 **Release binary only.** A debug build is ~2.3x slower and will mislead you.
+Set `SECANTUSD_PG` to measure a binary other than the main checkout's: a
+worktree builds its own, and the hardcoded path below would silently measure
+`main` instead of the branch under test.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import socket
 import statistics
 import subprocess
@@ -40,7 +49,9 @@ import time
 from pathlib import Path
 
 REPO = Path("/Users/jdrumgoole/GIT/SecantusDB")
-RUST = REPO / "crates/secantus-pgserver/target/release/secantusd-pg"
+RUST = Path(
+    os.environ.get("SECANTUSD_PG", REPO / "crates/secantus-pgserver/target/release/secantusd-pg")
+)
 
 
 def _free_port() -> int:

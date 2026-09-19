@@ -1219,37 +1219,77 @@ These work end-to-end but cut corners.
       dropped still exist. The sample is dominated by `__conn_open_session`,
       `__wt_open_cursor`, `__session_close_cursors`, `__wt_session_get_dhandle`.
 
-      **In-transaction path is WORSE, not better: ~126us vs ~56us for the same
-      `select 1`** (PostgreSQL is flat: ~30us either way). Re-measured
-      2026-09-19 after the autocommit fix landed, so the gap is now the
-      dominant per-statement cost.
+      **RESOLVED 2026-09-19 — "a transaction block costs twice as much" was
+      never true. A block holding UNCOMMITTED DDL costs three times as much;
+      a bare block costs slightly LESS than autocommit.** The entry below
+      used to say the in-block path was ~126us against ~56us for the same
+      `select 1` and call it the dominant per-statement cost. The
+      confounding variable was in the harness: `bench/pg_statement_cost.py`
+      creates its table INSIDE the block when given `--in-transaction`, so
+      every measured statement ran with an uncommitted-DDL overlay open.
+      Committing that DDL before timing put the block at 50us against
+      autocommit's 56us — flat, like PostgreSQL. **Vary one ingredient at a
+      time before naming a cause; two sampled profiles had already failed to
+      find this because the hot symbol was never the question.**
 
-      **One cause found and fixed; it is NOT the bulk of the gap, and an
-      earlier version of this entry said otherwise.** `open_transaction_handle`
-      records the catalog version it saw, and the caller bumps that version
-      immediately afterwards for EVERY transaction-control statement --
-      including `BEGIN`, which cannot change a catalog. So from the first
-      statement of a block the recorded and live versions disagreed
-      permanently, `may_fill_catalog_cache` was false for the life of the
-      block, and the process-wide catalog cache could never be refilled.
-      Instrumented: **2 hits / 50 misses** inside a block, **26 / 8** after
-      re-anchoring the recorded version to the bump. A cache built precisely to
-      avoid re-reading the catalog was switched off inside every transaction.
+      **The real mechanism, counted rather than sampled** (temporary
+      `eprintln!` counters, per statement, `select 1`):
 
-      **But fixing it recovers only ~3us of the ~70us penalty** (129.4 ->
-      125.8). `type_catalog_docs` -> `find_matching` -> `scan_blobs_natural`
-      topped the sampled profile, and that made it look like the cost; it was
-      the most VISIBLE symbol, not the dominant one. After the fix the profile
-      is flat -- pgwire message decode, `session_timezone`, the cached catalog
-      path -- with no single hotspot, and the wall time barely moved. **So what
-      makes a statement inside a transaction block cost twice what the same
-      statement costs outside one is still UNKNOWN.** Do not re-tell the
-      catalog-scan story; it has now been measured and is worth 3us.
+      | per statement | autocommit | in a block that did DDL |
+      | --- | --- | --- |
+      | `install_user_types` | 2 | 2 |
+      | `publish_user_types` | **0** | **2** |
+      | `type_catalog_docs` | 8 | **20** |
+      | catalog cache HITS | 8 | **0** |
+      | catalog reads from STORAGE | **0** | **20** |
+      | of those, on the txn's own WT session | 0 | 4 |
+      | `open_transaction_handle` | 1 | 0 |
 
-      (A first attempt at the re-anchor appeared to change nothing, which
-      nearly buried the finding. The binary was stale. Rebuild before
-      concluding a fix does not work -- and prefer instrumenting the mechanism,
-      which is what actually settled it, over timing a whole path.)
+      Two caches, one root cause. A session that has done DDL in an open
+      block carries an `uncommitted_types` overlay, and both the
+      process-wide catalog cache (`may_fill_catalog_cache`) and the
+      planner's thread-local type tables (`INSTALLED_USER_TYPES`) refused it
+      — correctly in intent, since one session's uncommitted view must not
+      reach another, but both expressed that intent as a CATALOG VERSION
+      COMPARISON, which cannot tell "someone else moved the catalog" from "I
+      moved it myself". The block's own first DDL bumps the version, so the
+      comparison could never succeed again and both caches stayed off for
+      the rest of the block. (PR #1505 re-anchored the version at the
+      transaction-control statement, which is why it recovered 3us and no
+      more: the DDL statement's own bump, in `execute`, re-broke it.)
+
+      **Fixed by saying what each cache actually meant:**
+      - `may_fill_catalog_cache` now asks whether the read ran on the
+        transaction's own WiredTiger session (`Storage::in_user_txn`). That
+        session holds the block's pinned snapshot and its uncommitted
+        writes; a fresh autocommit session sees exactly the committed
+        catalog and is publishable wherever it was issued. 16 of the 20
+        reads per statement were already on a fresh session.
+      - `INSTALLED_USER_TYPES` gained an OWNER in its key — 0 for the shared
+        committed view, the connection's serial for a view carrying that
+        session's overlay. This one is load-bearing for CORRECTNESS, not
+        just speed: two connections share tokio worker threads, and with the
+        owner dropped a reader connection could cast to a type the writer
+        had not committed, on the first alternation
+        (`test_uncommitted_types_stay_private_and_stay_current` pins it).
+
+      **Measured, release binaries, interleaved, quiet box** (3 runs, spread
+      under 3%; `bench/pg_statement_cost.py --iters 1200`):
+
+      | | before | after | PG 16.15 |
+      | --- | --- | --- | --- |
+      | `select 1` autocommit | 54.5 | 54.7 | 30.1 |
+      | `select 1` in a block that created a table | **125.0** | **51.3** | 29.3 |
+      | row by PK, autocommit | 66.7 | 66.3 | 32.0 |
+      | row by PK, in such a block | **134.0** | **61.6** | 30.9 |
+
+      A statement in a block is now marginally CHEAPER than the same
+      statement outside one, which is the shape PostgreSQL has.
+
+      **What this does NOT fix.** The remaining ~25us over PostgreSQL on
+      `select 1` is the same gap the autocommit path always had, and item 1
+      below (the seven `ensure_collection` probes) is still the named
+      suspect. Nothing here touched it.
 
       **A "prepared statements are a pessimisation" finding was RETRACTED — it
       did not reproduce.** One run showed a prepared row read at 165.9us against
@@ -1261,21 +1301,26 @@ These work end-to-end but cut corners.
       measurably here**, on either server — which is itself mildly odd for PG
       and not worth chasing.
 
-      **Where to go, in order** (all measured above, none implemented):
+      **Where to go, in order:**
       1. Do not re-probe the 7 catalog collections per statement. They are
          created once and never dropped; a process-wide "already ensured"
          verdict, or doing it only on a catalog WRITE, removes seven session
-         opens per statement.
-      2. Make the catalog readable inside a transaction without a full scan —
-         the correctness reason `may_fill_catalog_cache` exists (uncommitted DDL
-         must be visible to its own transaction) does not require re-scanning
-         for statements that did no DDL.
+         opens per statement. **Still open** — the only remaining item from
+         the original list, and the named suspect for the ~25us that
+         separates our autocommit `select 1` from PostgreSQL's.
+      2. ~~Make the catalog readable inside a transaction without a full
+         scan~~ — done 2026-09-19, see above.
       3. Then re-measure the extended-protocol penalty.
 
       Reproduce with `uv run python -m bench.pg_statement_cost` (add
       `--in-transaction` for the block path), against a RELEASE `secantusd-pg`.
-      Every figure above is the median of 5 batches; repeat before quoting one,
-      because the retracted finding above came from trusting a single run.
+      Set `SECANTUSD_PG` when measuring from a worktree: the harness otherwise
+      hardcodes the MAIN checkout's binary, which is the stale-binary trap in
+      another costume. Every figure above is the median of 5 batches; repeat
+      before quoting one, because the retracted finding above came from
+      trusting a single run. Take no timing while another session's suite is
+      running — `pgrep -f pytest | wc -l` must be 0 or 1, or per-statement
+      figures inflate 2-3x.
 
       **Do NOT "lift the global lock" as a concurrency fix** — it does not guard
       the row paths, and touching it risks the two invariants it does protect:
