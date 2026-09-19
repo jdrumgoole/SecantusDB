@@ -4,6 +4,50 @@ A living list of things SecantusDB does not yet implement faithfully. Update whe
 
 Each item should have enough context for a future session to pick it up cold: what's there now, what's missing, why it was deferred.
 
+---
+
+## ⚠ IN FLIGHT — the 0.6.0b17 PyPI release is PREPARED BUT NOT CUT (2026-09-19)
+
+`main` currently claims a release that does not exist. Read this before doing
+anything version-shaped.
+
+| | says |
+| --- | --- |
+| `docs/changelog.md` | `## [0.6.0b17] — 2026-09-19` (promoted, 341 fragments collated) |
+| `pyproject.toml` | `0.6.0b16` |
+| tag `v0.6.0b17` | does not exist |
+| PyPI | `0.6.0b16` |
+
+That is not drift to be "fixed" by editing the changelog back — it is a release
+stopped mid-pipeline, deliberately, at the end of a session. `release-prepare`
+assigns the version; the changelog was promoted first because the blog generator
+reads that dated entry and it must exist before the tag.
+
+**Done:**
+- 341 `changelog.d/` fragments collated and promoted, with a written headline and
+  lede (the lede becomes the blog body verbatim).
+- Crate bumps merged (#1498): MongoDB crates `0.5.3-beta.164`, PG crates
+  `0.1.0-beta.1`.
+- **Both binary releases are CUT and live** — `secantusdb-v0.5.3-beta.164`
+  (linux-x86_64, macos-arm64, windows-msvc) and `secantusd-pg-v0.1.0-beta.1`
+  (linux-x86_64, macos-arm64), each with `.sha256`, both pre-releases.
+- All three benchmark artifacts re-measured on droplets; PR #1506.
+
+**Remaining, in order:**
+1. Merge #1506 (benchmarks + the prose that cites them).
+2. `invoke release-prepare 0.6.0b17` — its `changelog-collate` is a no-op now,
+   and the promotion step is already done. Then the `release-finalize` retry loop.
+3. Website: blog post from the changelog entry (`changelog.blog 0.6.0b17`),
+   regenerate the driver panels, pin `SECANTUS_RUST_BINARY_TAG` →
+   `secantusdb-v0.5.3-beta.164` and `SECANTUS_PG_BINARY_TAG` →
+   `secantusd-pg-v0.1.0-beta.1` in `website/pelicanconf.py`, land via PR, then
+   `invoke deploy` from `main`.
+
+**The website is un-deployed and behind `main` by several merged PRs** — the Rust
+PostgreSQL download CTA (#1485), the refreshed driver panels (#1493) and the new
+benchmark prose are all committed and none is live.
+
+
 **Markers are load-bearing — `- [ ]` means open work, `- [x]` means a finished
 record kept for its detail.** When a slice lands, flip its box in the same commit.
 An audit on 2026-08-20 found 107 of 178 open-marked items were finished work whose
