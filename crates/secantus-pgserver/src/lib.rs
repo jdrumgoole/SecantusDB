@@ -169,13 +169,13 @@ fn backend_registry() -> &'static Mutex<HashMap<i32, Arc<BackendEntry>>> {
 /// after every rollback to a savepoint. An extra bump costs one re-read; a
 /// missed one is a stale catalog, so the classification errs on bumping.
 ///
-/// A session fills the cache from its own read only when nothing can have
-/// moved the catalog since its transaction's snapshot: the version now must
-/// equal the one captured when its transaction handle opened (autocommit
-/// statements in the extended protocol run under a handle too). Otherwise
-/// the read is served but not kept -- a snapshot taken before another
-/// connection's `CREATE TABLE` committed must not be published as current,
-/// and a block's own uncommitted `CREATE TYPE` must not be seen by others.
+/// A session fills the cache from its own read only when that read did not
+/// run on an open transaction's WiredTiger session (see
+/// `may_fill_catalog_cache`). Such a read is the block's private view -- it
+/// can see a `CREATE TYPE` nobody has committed, and miss one another
+/// connection committed after the block began -- so it is served but not
+/// kept. A read on a fresh autocommit session sees exactly the committed
+/// catalog and is kept wherever it was issued, inside a block or not.
 /// A cache map keyed on `(storage, db, name)`, each value tagged with the
 /// catalog version it was read under.
 type VersionedMap<K, V> = Mutex<HashMap<(usize, String, K), (u64, V)>>;
@@ -191,11 +191,24 @@ struct CatalogCache {
 }
 
 thread_local! {
-    /// The `(storage, db, catalog version)` whose user types this thread's
-    /// planner tables hold, or `None` when they hold something that must
-    /// not be reused: a session's uncommitted overlay, or a read taken
-    /// under a snapshot the catalog has since moved past.
-    static INSTALLED_USER_TYPES: std::cell::RefCell<Option<(usize, String, u64)>> =
+    /// The `(storage, db, catalog version, owner)` whose user types this
+    /// thread's planner tables hold, or `None` when they hold something that
+    /// must not be reused.
+    ///
+    /// `owner` is 0 for the committed view every session shares, and the
+    /// session's serial for a view that carries that session's UNCOMMITTED
+    /// type overlay -- the two must never be confused, since two connections
+    /// can be at the same catalog version with different overlays.
+    ///
+    /// An overlay view is safe to record against a catalog version because
+    /// every mutation of `uncommitted_types` happens in a statement that
+    /// bumps the version: a DDL statement (`may_change_catalog`), a
+    /// transaction-control statement, or a rollback to a savepoint. The
+    /// version therefore moves whenever the overlay does. Recording it
+    /// matters: an overlay is open for the whole of a block that created a
+    /// table, and republishing every planner type table on every statement
+    /// of that block cost ~40us each (measured 2026-09-19).
+    static INSTALLED_USER_TYPES: std::cell::RefCell<Option<(usize, String, u64, u64)>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -795,10 +808,6 @@ pub struct PgHandler {
     /// than a missing feature. Lock-free for the same reason as
     /// `in_transaction`.
     txn_failed: std::sync::atomic::AtomicBool,
-    /// The catalog version when this session's transaction handle opened;
-    /// a catalog read may fill the process-wide cache only while the version
-    /// still equals it (see `CatalogCache`).
-    txn_catalog_version: std::sync::atomic::AtomicU64,
     /// Catalog collections this CONNECTION has already seen exist.
     ///
     /// `open_transaction_handle` ensures all seven `CATALOG_COLLECTIONS`
@@ -837,6 +846,11 @@ pub struct PgHandler {
     /// rows stream is drained, and re-encodes them in the FETCH's format. `None`
     /// except during a DECLARE, so a plain SELECT pays only a cheap flag check.
     cursor_capture: std::sync::Arc<Mutex<Option<CapturedRows>>>,
+    /// A serial unique to this connection for the life of the process,
+    /// naming the owner of an uncommitted-type view in
+    /// [`INSTALLED_USER_TYPES`]. Distinct from `backend_pid`, which is
+    /// assigned later (0 until `post_startup`) and is reusable.
+    session_serial: u64,
     /// This connection's backend PID, as pgwire assigned it during startup.
     ///
     /// `pg_backend_pid()` returns it, and `pg_terminate_backend(pid)` compares
@@ -1017,10 +1031,13 @@ impl PgHandler {
             in_transaction: std::sync::atomic::AtomicBool::new(false),
             binary_results: std::sync::atomic::AtomicBool::new(false),
             txn_failed: std::sync::atomic::AtomicBool::new(false),
-            txn_catalog_version: std::sync::atomic::AtomicU64::new(0),
             ensured_catalog: Mutex::new(HashSet::new()),
             savepoints: Mutex::new(Vec::new()),
             cursor_capture: std::sync::Arc::new(Mutex::new(None)),
+            session_serial: {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
             backend_pid: AtomicI32::new(0),
             session_user: Mutex::new(String::new()),
             backend: Arc::new(BackendEntry::new("")),
@@ -1214,15 +1231,20 @@ impl PgHandler {
             Arc::as_ptr(&self.storage) as usize,
             self.db().to_string(),
             version,
+            if overlay_empty {
+                0
+            } else {
+                self.session_serial
+            },
         );
-        if overlay_empty && INSTALLED_USER_TYPES.with(|c| c.borrow().as_ref() == Some(&held)) {
+        if INSTALLED_USER_TYPES.with(|c| c.borrow().as_ref() == Some(&held)) {
             return;
         }
         self.publish_user_types();
-        // A read under a transaction snapshot that predates a catalog bump
-        // is not the committed truth at `version` (see
+        // A view assembled from reads taken under a transaction's own
+        // snapshot is that block's private one and is not reusable (see
         // `may_fill_catalog_cache`): publish it, but do not record it.
-        let record = overlay_empty && self.may_fill_catalog_cache(version);
+        let record = self.may_fill_catalog_cache(version);
         INSTALLED_USER_TYPES.with(|c| *c.borrow_mut() = record.then_some(held));
     }
 
@@ -2241,12 +2263,6 @@ impl PgHandler {
         for coll in Self::CATALOG_COLLECTIONS {
             self.ensure_collection(coll)?;
         }
-        self.txn_catalog_version.store(
-            catalog_cache()
-                .version
-                .load(std::sync::atomic::Ordering::SeqCst),
-            std::sync::atomic::Ordering::SeqCst,
-        );
         self.storage
             .begin_user_transaction()
             .map_err(|e| Self::storage_err("could not begin a transaction", e))
@@ -2376,17 +2392,60 @@ impl PgHandler {
         Ok(docs)
     }
 
-    /// May a catalog row this session just read at `version` be published
-    /// as the committed truth? Outside a transaction handle, always; under
-    /// one, only while the catalog has not moved since the handle opened --
-    /// by this block (its own uncommitted DDL) or by anyone else (a commit
-    /// this block's snapshot may predate). See `CatalogCache`.
-    fn may_fill_catalog_cache(&self, version: u64) -> bool {
-        !self.transaction_handle_open()
-            || self
-                .txn_catalog_version
-                .load(std::sync::atomic::Ordering::SeqCst)
-                == version
+    /// May a catalog row this session just read be published as the
+    /// committed truth for every connection? Only when the read did NOT run
+    /// on the open transaction's WiredTiger session.
+    ///
+    /// That session holds the block's pinned snapshot and its own
+    /// uncommitted writes, so a read taken on it is this block's private
+    /// view: it can see a `CREATE TYPE` nobody has committed, and miss a
+    /// `CREATE TYPE` another connection committed after the block began.
+    /// Neither may reach a process-wide cache. A read on a fresh autocommit
+    /// session has neither problem -- it sees exactly the committed catalog
+    /// -- so it is publishable wherever it was issued, inside a block or
+    /// not. Planning runs outside the transaction by design -- that is why
+    /// `note_uncommitted_type` keeps an overlay at all -- so that is most of
+    /// them.
+    ///
+    /// This used to compare the live catalog version against the one
+    /// recorded when the transaction handle opened, which conflated "someone
+    /// changed the catalog" with "I cannot trust my own read". A block's
+    /// FIRST DDL statement bumps the version itself, so from that statement
+    /// on the two never matched again and the cache was dead for the rest of
+    /// the block -- 20 full catalog scans per statement where autocommit did
+    /// none, which cost ~65us on every statement of a block that had created
+    /// a table (measured 2026-09-19, `bench/pg_statement_cost.py`).
+    fn may_fill_catalog_cache(&self, _version: u64) -> bool {
+        // Refuse to publish a read that ran on the transaction's own
+        // WiredTiger session: such a read can see the block's uncommitted
+        // writes, and the cache it would fill is process-wide.
+        //
+        // **Reached, but its necessity is NOT demonstrated, and both halves of
+        // that were measured on 2026-09-19 rather than assumed.**
+        //
+        // Reached: a block that has written rows (`CREATE TABLE` then `CREATE
+        // TYPE`) does take catalog reads inside `with_user_transaction`. An
+        // earlier reading of this concluded the opposite -- a narrower probe
+        // saw `in_user_txn()` false at all 16 publishes and called the gate
+        // unreachable. A temporary `debug_assert` on that "invariant" panicked
+        // the server on the first test that opens a block with a table in it.
+        //
+        // Not demonstrated: forcing this function to `true` leaked nothing
+        // observable -- not through casts, `pg_type`, `pg_enum`, a pre-warmed
+        // cache, a ROLLBACK, nor `tests/...::test_uncommitted_types_stay_
+        // private_and_stay_current`. A block's own view of its uncommitted
+        // types comes from the per-connection `uncommitted_types` overlay,
+        // which never reaches this cache, so the overlay appears to carry the
+        // isolation on its own today.
+        //
+        // It stays because "I could not build the exploit" is not "the exploit
+        // cannot exist", and publishing one connection's uncommitted DDL to
+        // every other one is the kind of wrong answer a database must not
+        // risk for a few microseconds. What IS pinned is the behaviour:
+        // `test_an_open_blocks_uncommitted_type_is_invisible_to_other_
+        // connections` and `test_a_rolled_back_type_never_becomes_visible`
+        // fail if that isolation ever breaks, whatever holds it up.
+        !self.storage.in_user_txn()
     }
 
     /// Record that the open transaction created (`Some(doc)`) or dropped
@@ -5900,14 +5959,6 @@ impl PgHandler {
             // a ROLLBACK (to a savepoint or of the block) restores rows the
             // cache may have read past. See `CatalogCache`.
             bump_catalog_version();
-            if self.transaction_handle_open() {
-                self.txn_catalog_version.store(
-                    catalog_cache()
-                        .version
-                        .load(std::sync::atomic::Ordering::SeqCst),
-                    std::sync::atomic::Ordering::SeqCst,
-                );
-            }
             return out;
         }
 

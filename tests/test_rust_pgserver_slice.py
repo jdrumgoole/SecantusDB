@@ -9346,3 +9346,146 @@ def test_a_pymongo_written_collection_is_not_yet_a_table(home: Path) -> None:
         pytest.raises(psycopg.errors.UndefinedTable),
     ):
         conn.cursor().execute("SELECT * FROM gadgets")
+
+
+def test_uncommitted_types_stay_private_and_stay_current(home: Path) -> None:
+    """A block's uncommitted types are its own, and its own view keeps up.
+
+    Two invariants that one caching decision holds up between. The catalog is
+    cached process-wide, and the planner's user-type tables are cached per
+    thread, so both caches face the same question inside a transaction that
+    has done DDL: whose view is this?
+
+    - **Private.** A type created in an open block must be invisible to every
+      other connection until COMMIT. The process-wide catalog cache may be
+      filled only from a read that did NOT run on the block's own WiredTiger
+      session, because that session sees the block's uncommitted writes.
+    - **Current.** The block's own view must track its own later DDL. The
+      planner's per-thread type tables are keyed by catalog version and by the
+      session that owns an uncommitted overlay; a stale key would leave a
+      dropped-and-recreated type resolving to its old definition.
+
+    Before 2026-09-19 the second was paid for by republishing everything on
+    every statement of the block and re-reading the catalog 20 times per
+    statement (~115us each), because the version the gate compared against
+    could never match again once the block's own DDL had bumped it.
+    """
+    with (
+        _Server(home) as server,
+        server.connect(autocommit=False) as writer,
+        server.connect() as reader,
+    ):
+        w = writer.cursor()
+        w.execute("CREATE TABLE anchor (id int PRIMARY KEY)")
+        w.execute("CREATE TYPE mood AS ENUM ('ok')")
+        w.execute("SELECT 'ok'::mood::text")
+        assert w.fetchone() == ("ok",)
+
+        # Private: the other connection cannot see it before COMMIT --
+        # neither by name nor, the sharper question, as a CAST TARGET. The
+        # planner's type tables are a THREAD-LOCAL, and two connections share
+        # worker threads, so a view recorded without naming the session that
+        # owns it leaks straight across: with the owner dropped from the key
+        # this cast returned 'ok' on the first alternation while
+        # `to_regtype` still (correctly) said the type did not exist.
+        r = reader.cursor()
+        r.execute("SELECT to_regtype('mood')")
+        assert r.fetchone() == (None,)
+        for _ in range(8):
+            w.execute("SELECT 'ok'::mood::text")
+            r.execute("SELECT to_regtype('mood')")
+            assert r.fetchone() == (None,)
+            # Any error will do: what matters is that the cast does NOT
+            # resolve. (We answer `0A000 a cast to mood is not supported
+            # yet` where PostgreSQL 16.15 answers `42704 type "mood" does
+            # not exist` -- a separate fidelity gap, deliberately not pinned
+            # here.)
+            with pytest.raises(psycopg.Error):
+                r.execute("SELECT 'ok'::mood")
+
+        # Current: the block's own view follows its own later DDL.
+        w.execute("DROP TYPE mood")
+        w.execute("CREATE TYPE mood AS ENUM ('sad')")
+        w.execute("SELECT 'sad'::mood::text")
+        assert w.fetchone() == ("sad",)
+        with pytest.raises(psycopg.errors.InvalidTextRepresentation):
+            w.execute("SELECT 'ok'::mood")
+        writer.rollback()
+
+        # Still private after the rollback discarded it.
+        r.execute("SELECT to_regtype('mood')")
+        assert r.fetchone() == (None,)
+
+        # And published on COMMIT.
+        w = writer.cursor()
+        w.execute("CREATE TYPE mood AS ENUM ('fine')")
+        writer.commit()
+        r.execute("SELECT to_regtype('mood')::text")
+        assert r.fetchone() == ("mood",)
+
+
+def test_an_open_blocks_uncommitted_type_is_invisible_to_other_connections(
+    home: Path,
+) -> None:
+    """The isolation `may_fill_catalog_cache` is written to defend.
+
+    That gate refuses to publish a catalog read taken on the transaction's own
+    WiredTiger session, because such a read can see the block's uncommitted
+    writes and the cache it would fill is process-wide. Measured 2026-09-19,
+    the gate never actually fires -- catalog reads happen while planning,
+    outside the user transaction -- so forcing it open leaks nothing, and the
+    property below is held up by the per-connection `uncommitted_types`
+    overlay instead.
+
+    Which is exactly why this test exists. The gate is unfalsifiable on its
+    own; the BEHAVIOUR it protects is not. If some future change routes a
+    catalog read through the transaction's session, the `debug_assert` in that
+    gate fires first, and if the assert is ever removed this test is what
+    still notices.
+    """
+    with _Server(home) as server:
+        writer = server.connect(autocommit=False)
+        w = writer.cursor()
+        w.execute("CREATE TYPE mood AS ENUM ('ok')")
+
+        # The writer's own view: its uncommitted type resolves, both as a cast
+        # and in the catalog.
+        assert w.execute("SELECT 'ok'::mood").fetchone() == ("ok",)
+        assert w.execute("SELECT typname FROM pg_type WHERE typname = 'mood'").fetchall() == [
+            ("mood",)
+        ]
+
+        # Every other connection must see nothing of it until COMMIT.
+        reader = server.connect()
+        assert reader.execute("SELECT typname FROM pg_type WHERE typname = 'mood'").fetchall() == []
+        with pytest.raises(psycopg.errors.Error):
+            reader.execute("SELECT 'ok'::mood")
+
+        writer.commit()
+
+        # And see it immediately afterwards -- the cache must not have pinned
+        # the pre-commit answer either.
+        fresh = server.connect()
+        assert fresh.execute("SELECT typname FROM pg_type WHERE typname = 'mood'").fetchall() == [
+            ("mood",)
+        ]
+        assert fresh.execute("SELECT 'ok'::mood").fetchone() == ("ok",)
+
+
+def test_a_rolled_back_type_never_becomes_visible(home: Path) -> None:
+    """The same property on the failure path: ROLLBACK must leave no trace.
+
+    A cache filled from the block's own session would survive the rollback and
+    hand every later connection a type that no longer exists.
+    """
+    with _Server(home) as server:
+        writer = server.connect(autocommit=False)
+        w = writer.cursor()
+        w.execute("CREATE TYPE ghost AS ENUM ('x')")
+        assert w.execute("SELECT 'x'::ghost").fetchone() == ("x",)
+        writer.rollback()
+
+        after = server.connect()
+        assert after.execute("SELECT typname FROM pg_type WHERE typname = 'ghost'").fetchall() == []
+        with pytest.raises(psycopg.errors.Error):
+            after.execute("SELECT 'x'::ghost")

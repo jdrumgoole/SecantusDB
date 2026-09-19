@@ -4370,7 +4370,7 @@ impl Storage {
 
     /// Whether the calling thread is inside a user (multi-document)
     /// transaction (its session installed by `with_user_transaction`).
-    fn in_user_txn(&self) -> bool {
+    pub fn in_user_txn(&self) -> bool {
         !ACTIVE_TXN_SESSION.with(|c| c.get()).is_null()
     }
 
