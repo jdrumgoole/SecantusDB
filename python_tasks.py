@@ -21,9 +21,16 @@ import os
 import re
 import shlex
 import shutil
+import sys
 
 from invoke.context import Context
 from invoke.tasks import task
+
+#: `pty=True` makes invoke allocate a pseudo-terminal, which Windows does not
+#: have: every task using it failed there with "your platform doesn't support
+#: the 'pty' module" (`invoke sync` included, 2026-09-19). Off on Windows only.
+PTY = sys.platform != "win32"
+
 
 # Ruff is a pure-Python static check that needs neither the compiled `secantus`
 # extension nor a synced project env, so `lint` / `fmt` run it through `uvx`
@@ -77,7 +84,7 @@ def sync(c: Context) -> None:
     """
     c.run(
         "uv sync --all-extras --reinstall-package secantus-core",
-        pty=True,
+        pty=PTY,
     )
 
 
@@ -91,7 +98,7 @@ def test(c: Context, k: str = "", verbose: bool = False) -> None:
         # single quotes but doesn't escape embedded single quotes,
         # leaving a shell-injection hole on a CLI-supplied filter.
         cmd += f" -k {shlex.quote(k)}"
-    c.run(cmd, pty=True)
+    c.run(cmd, pty=PTY)
 
 
 @task(name="test-one")
@@ -103,7 +110,7 @@ def test_one(c: Context, nodeid: str) -> None:
     c.run(
         "uv run --no-sync python -m pytest -n0 -o addopts= -p no:cacheprovider "
         f"{shlex.quote(nodeid)}",
-        pty=True,
+        pty=PTY,
     )
 
 
@@ -125,27 +132,27 @@ def perf_task(c: Context) -> None:
         "-o addopts= -m perf "
         "--benchmark-columns=min,median,max -v "
         "tests/test_perf_regression.py",
-        pty=True,
+        pty=PTY,
     )
 
 
 @task
 def lint(c: Context) -> None:
-    c.run(f"uvx {_RUFF} check src tests", pty=True)
-    c.run(f"uvx {_RUFF} format --check src tests", pty=True)
+    c.run(f"uvx {_RUFF} check src tests", pty=PTY)
+    c.run(f"uvx {_RUFF} format --check src tests", pty=PTY)
 
 
 @task
 def fmt(c: Context) -> None:
-    c.run(f"uvx {_RUFF} format src tests", pty=True)
-    c.run(f"uvx {_RUFF} check --fix src tests", pty=True)
+    c.run(f"uvx {_RUFF} format src tests", pty=PTY)
+    c.run(f"uvx {_RUFF} check --fix src tests", pty=PTY)
 
 
 @task
 def serve(c: Context, host: str = "127.0.0.1", port: int = 27017) -> None:
     c.run(
         f"uv run python -m secantus --host {shlex.quote(host)} --port {int(port)}",
-        pty=True,
+        pty=PTY,
     )
 
 
@@ -158,12 +165,12 @@ def docs(c: Context, builder: str = "html", clean: bool = False) -> None:
     # that never ran a project build. `_DOCS_DEPS` overlays the doc toolchain
     # plus secantus's pure-Python runtime deps.
     if clean:
-        c.run("rm -rf docs/_build", pty=True)
+        c.run("rm -rf docs/_build", pty=PTY)
     qb = shlex.quote(builder)
     c.run(
         f"uv run --no-project {_DOCS_DEPS} "
         f"sphinx-build -W --keep-going -b {qb} docs docs/_build/{qb}",
-        pty=True,
+        pty=PTY,
     )
 
 
@@ -176,12 +183,12 @@ def docs_rust(c: Context, builder: str = "html", clean: bool = False) -> None:
     bare worktree with no build at all.
     """
     if clean:
-        c.run("rm -rf docs-rust/_build", pty=True)
+        c.run("rm -rf docs-rust/_build", pty=PTY)
     qb = shlex.quote(builder)
     c.run(
         f"uv run --no-project {_DOCS_DEPS} "
         f"sphinx-build -W --keep-going -b {qb} docs-rust docs-rust/_build/{qb}",
-        pty=True,
+        pty=PTY,
     )
 
 
@@ -190,7 +197,7 @@ def docs_serve(c: Context, port: int = 8000) -> None:
     docs(c)
     c.run(
         f"uv run --no-sync python -m http.server {port} --directory docs/_build/html",
-        pty=True,
+        pty=PTY,
     )
 
 
@@ -198,7 +205,7 @@ def docs_serve(c: Context, port: int = 8000) -> None:
 def clean(c: Context) -> None:
     c.run(
         "rm -rf build dist *.egg-info .pytest_cache .ruff_cache .coverage htmlcov docs/_build",
-        pty=True,
+        pty=PTY,
     )
     # Sweep leaked gauge tempdirs. Aborted runs of ``invoke validate-*``
     # leave ``secantus-<driver>-gauge-XXXXXX`` directories under the
@@ -388,7 +395,7 @@ def py_gate(c: Context, perf: bool = True, deselect: str = _LOCAL_DESELECT) -> N
     cmd = "uv run python -m pytest -q"
     for nodeid in (d for d in deselect.split(",") if d.strip()):
         cmd += f" --deselect {shlex.quote(nodeid.strip())}"
-    c.run(cmd, pty=True)
+    c.run(cmd, pty=PTY)
     if perf:
         print(f"==> [3/{steps}] Perf", flush=True)
         perf_task(c)
@@ -424,8 +431,8 @@ def py_ship(
         "':(exclude)vendor' "
         "':(exclude)secantus-data' "
         "':(exclude,glob)docs/validation-report-*-rust-server.md'",
-        pty=True,
+        pty=PTY,
     )
-    c.run(f"git commit -m {shlex.quote(message)}", pty=True)
+    c.run(f"git commit -m {shlex.quote(message)}", pty=PTY)
     if push:
-        c.run("git push origin HEAD:main", pty=True)
+        c.run("git push origin HEAD:main", pty=PTY)

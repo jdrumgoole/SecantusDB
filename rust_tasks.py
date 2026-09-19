@@ -24,9 +24,16 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 
 from invoke.context import Context
 from invoke.tasks import task
+
+#: `pty=True` makes invoke allocate a pseudo-terminal, which Windows does not
+#: have: every task using it failed there with "your platform doesn't support
+#: the 'pty' module" (`invoke sync` included, 2026-09-19). Off on Windows only.
+PTY = sys.platform != "win32"
+
 
 _RUST_WORKSPACE_DIR = "crates"
 _RUST_BINDINGS_DIR = "crates/secantus-core-py"
@@ -429,9 +436,9 @@ def rust_test(c: Context) -> None:
     its own directory with ``SECANTUS_WT_INCLUDE`` / ``SECANTUS_WT_LIB`` set —
     see ``_rust_env``.
     """
-    c.run(f"cd {_RUST_WORKSPACE_DIR} && cargo fmt --check", pty=True)
-    c.run(f"cd {_RUST_WORKSPACE_DIR} && cargo clippy --all-targets -- -D warnings", pty=True)
-    c.run(f"cd {_RUST_WORKSPACE_DIR} && cargo test", pty=True)
+    c.run(f"cd {_RUST_WORKSPACE_DIR} && cargo fmt --check", pty=PTY)
+    c.run(f"cd {_RUST_WORKSPACE_DIR} && cargo clippy --all-targets -- -D warnings", pty=PTY)
+    c.run(f"cd {_RUST_WORKSPACE_DIR} && cargo test", pty=PTY)
 
 
 @task(name="rust-build")
@@ -439,7 +446,7 @@ def rust_build(c: Context) -> None:
     """Build the abi3 wheel for the Rust core into target/wheels/."""
     c.run(
         f"cd {_RUST_BINDINGS_DIR} && uv tool run maturin build --release",
-        pty=True,
+        pty=PTY,
         env={"VIRTUAL_ENV": ""},
     )
 
@@ -459,7 +466,7 @@ def rust_parity(c: Context) -> None:
     """
     c.run(
         f"cd {_RUST_BINDINGS_DIR} && uv tool run maturin build --release --out dist",
-        pty=True,
+        pty=PTY,
     )
     wheels = sorted(glob.glob(f"{_RUST_BINDINGS_DIR}/dist/*.whl"))
     if not wheels:
@@ -477,7 +484,7 @@ def rust_parity(c: Context) -> None:
         "tests/test_rust_aggregate_parity.py "
         "tests/test_rust_group_field_pushdown.py "
         "-o addopts= -p no:cacheprovider -q",
-        pty=True,
+        pty=PTY,
     )
 
 
@@ -491,9 +498,9 @@ def rust_wt_test(c: Context) -> None:
     fills in the conventional values when unset).
     """
     env = _rust_env()
-    c.run(f"cd {_RUST_WT_DIR} && cargo fmt --check", pty=True, env=env)
-    c.run(f"cd {_RUST_WT_DIR} && cargo clippy --all-targets -- -D warnings", pty=True, env=env)
-    c.run(f"cd {_RUST_WT_DIR} && cargo test", pty=True, env=env)
+    c.run(f"cd {_RUST_WT_DIR} && cargo fmt --check", pty=PTY, env=env)
+    c.run(f"cd {_RUST_WT_DIR} && cargo clippy --all-targets -- -D warnings", pty=PTY, env=env)
+    c.run(f"cd {_RUST_WT_DIR} && cargo test", pty=PTY, env=env)
 
 
 @task(name="rust-storage-test")
@@ -504,9 +511,9 @@ def rust_storage_test(c: Context) -> None:
     WiredTiger transitively through secantus-wt).
     """
     env = _rust_env()
-    c.run(f"cd {_RUST_STORAGE_DIR} && cargo fmt --check", pty=True, env=env)
-    c.run(f"cd {_RUST_STORAGE_DIR} && cargo clippy --all-targets -- -D warnings", pty=True, env=env)
-    c.run(f"cd {_RUST_STORAGE_DIR} && cargo test", pty=True, env=env)
+    c.run(f"cd {_RUST_STORAGE_DIR} && cargo fmt --check", pty=PTY, env=env)
+    c.run(f"cd {_RUST_STORAGE_DIR} && cargo clippy --all-targets -- -D warnings", pty=PTY, env=env)
+    c.run(f"cd {_RUST_STORAGE_DIR} && cargo test", pty=PTY, env=env)
 
 
 @task(name="rust-adapter-test")
@@ -518,9 +525,9 @@ def rust_adapter_test(c: Context) -> None:
     changes. Same WiredTiger / libclang prerequisites as ``rust-wt-test``.
     """
     env = _rust_env()
-    c.run(f"cd {_RUST_ADAPTER_DIR} && cargo fmt --check", pty=True, env=env)
-    c.run(f"cd {_RUST_ADAPTER_DIR} && cargo clippy --all-targets -- -D warnings", pty=True, env=env)
-    c.run(f"cd {_RUST_ADAPTER_DIR} && cargo test", pty=True, env=env)
+    c.run(f"cd {_RUST_ADAPTER_DIR} && cargo fmt --check", pty=PTY, env=env)
+    c.run(f"cd {_RUST_ADAPTER_DIR} && cargo clippy --all-targets -- -D warnings", pty=PTY, env=env)
+    c.run(f"cd {_RUST_ADAPTER_DIR} && cargo test", pty=PTY, env=env)
 
 
 @task(name="rust-pgserver-test")
@@ -537,13 +544,13 @@ def rust_pgserver_test(c: Context) -> None:
     the clean workspace and are covered by ``rust-test``.
     """
     env = _rust_env()
-    c.run(f"cd {_RUST_PGSERVER_DIR} && cargo fmt --check", pty=True, env=env)
+    c.run(f"cd {_RUST_PGSERVER_DIR} && cargo fmt --check", pty=PTY, env=env)
     c.run(
         f"cd {_RUST_PGSERVER_DIR} && cargo clippy --all-targets -- -D warnings",
-        pty=True,
+        pty=PTY,
         env=env,
     )
-    c.run(f"cd {_RUST_PGSERVER_DIR} && cargo test", pty=True, env=env)
+    c.run(f"cd {_RUST_PGSERVER_DIR} && cargo test", pty=PTY, env=env)
 
 
 @task(name="rust-pgserver-build")
@@ -556,7 +563,7 @@ def rust_pgserver_build(c: Context, release: bool = False) -> None:
     """
     env = _rust_env()
     flag = " --release" if release else ""
-    c.run(f"cd {_RUST_PGSERVER_DIR} && cargo build{flag}", pty=True, env=env)
+    c.run(f"cd {_RUST_PGSERVER_DIR} && cargo build{flag}", pty=PTY, env=env)
 
 
 @task(name="rust-test-one")
@@ -588,7 +595,7 @@ def rust_test_one(
         cmd += f" {shlex.quote(name)}"
     if nocapture:
         cmd += " -- --nocapture"
-    c.run(cmd, pty=True, env=_rust_env())
+    c.run(cmd, pty=PTY, env=_rust_env())
 
 
 @task(name="rust-fmt")
@@ -601,9 +608,9 @@ def rust_fmt(c: Context) -> None:
     prerequisites as ``rust-wt-test`` (auto-filled).
     """
     env = _rust_env()
-    c.run(f"cd {_RUST_WORKSPACE_DIR} && cargo fmt", pty=True, env=env)
+    c.run(f"cd {_RUST_WORKSPACE_DIR} && cargo fmt", pty=PTY, env=env)
     for d in (_RUST_WT_DIR, _RUST_STORAGE_DIR, _RUST_ADAPTER_DIR):
-        c.run(f"cd {d} && cargo fmt", pty=True, env=env)
+        c.run(f"cd {d} && cargo fmt", pty=PTY, env=env)
 
 
 @task(name="rust-storage-py")
@@ -617,7 +624,7 @@ def rust_storage_py(c: Context) -> None:
     """
     c.run(
         f"cd {_RUST_STORAGE_PY_DIR} && uv tool run maturin build --release --out dist",
-        pty=True,
+        pty=PTY,
         env=_rust_env(),
     )
     wheels = sorted(glob.glob(f"{_RUST_STORAGE_PY_DIR}/dist/*.whl"))
@@ -628,7 +635,7 @@ def rust_storage_py(c: Context) -> None:
         f"--with pymongo --with pytest --with {shlex.quote(wheels[-1])} "
         "python -m pytest tests/test_rust_storage_smoke.py "
         "-o addopts= -p no:cacheprovider -q",
-        pty=True,
+        pty=PTY,
     )
 
 
@@ -783,7 +790,7 @@ def rust_pgo_refresh(c: Context) -> None:
         c.run(
             "SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON "
             "uv sync --inexact --extra dev --extra admin --reinstall-package secantusdb",
-            pty=True,
+            pty=PTY,
             env=env1,
         )
 
@@ -792,7 +799,7 @@ def rust_pgo_refresh(c: Context) -> None:
         env2["LLVM_PROFILE_FILE"] = str(prof_dir / "pgo-%p-%m.profraw")
         c.run(
             "uv run --no-sync python -m bench.compare_servers --n 10000 --reps 5 --no-mongod",
-            pty=True,
+            pty=PTY,
             env=env2,
         )
 
@@ -832,7 +839,7 @@ def rust_stress(c: Context, workers: int = 16, iters: int = 5) -> None:
     """
     c.run(
         f"uv run --no-sync python -m bench.wt_stress --workers {int(workers)} --iters {int(iters)}",
-        pty=True,
+        pty=PTY,
         env=_rust_env(),
     )
 
@@ -918,15 +925,15 @@ def rust_gate(c: Context, pytest: bool = True, deselect: str = "") -> None:
     # test (e.g. a too-long line) would pass the gate and red CI. Mirror CI's
     # `Lint` / `Format check` steps so it's caught before push.
     print(f"==> [6/{steps}] ruff check", flush=True)
-    c.run("uv run ruff check src tests", pty=True)
+    c.run("uv run ruff check src tests", pty=PTY)
     print(f"==> [7/{steps}] ruff format", flush=True)
-    c.run("uv run ruff format --check src tests", pty=True)
+    c.run("uv run ruff format --check src tests", pty=PTY)
     if pytest:
         print(f"==> [8/{steps}] pytest", flush=True)
         cmd = "uv run --no-sync --extra dev --extra admin python -m pytest -q"
         for nodeid in (d for d in deselect.split(",") if d.strip()):
             cmd += f" --deselect {shlex.quote(nodeid.strip())}"
-        c.run(cmd, pty=True, env=_rust_env())
+        c.run(cmd, pty=PTY, env=_rust_env())
 
 
 @task(
@@ -962,11 +969,11 @@ def rust_ship(
         "':(exclude)vendor' "
         "':(exclude)secantus-data' "
         "':(exclude,glob)docs/validation-report-*-rust-server.md'",
-        pty=True,
+        pty=PTY,
     )
-    c.run(f"git commit -m {shlex.quote(message)}", pty=True)
+    c.run(f"git commit -m {shlex.quote(message)}", pty=PTY)
     if push:
-        c.run("git push origin HEAD:main", pty=True)
+        c.run("git push origin HEAD:main", pty=PTY)
 
 
 # --- Canonical repro + PR-lifecycle tasks ---------------------------------
@@ -992,16 +999,16 @@ def rust_repro(c: Context, script: str, release: bool = True) -> None:
     editor, then ``./inv rust-repro <script>`` — no bespoke ``uv run python …``."""
     sub = "release" if release else "debug"
     flag = " --release" if release else ""
-    c.run(f"cd {_RUST_BINARY_DIR} && cargo build{flag}", pty=True, env=_rust_env())
+    c.run(f"cd {_RUST_BINARY_DIR} && cargo build{flag}", pty=PTY, env=_rust_env())
     binpath = f"{_RUST_BINARY_DIR}/target/{sub}/secantusd-rs"
-    c.run(f"uv run python {shlex.quote(script)} --binary {binpath}", pty=True, env=_rust_env())
+    c.run(f"uv run python {shlex.quote(script)} --binary {binpath}", pty=PTY, env=_rust_env())
 
 
 @task(name="gh-watch", help={"pr": "PR number"})
 def gh_watch(c: Context, pr: str) -> None:
     """Watch a PR's CI checks to completion, then print the final states."""
-    c.run(f"gh pr checks {shlex.quote(str(pr))} --watch --interval 30", pty=True, warn=True)
-    c.run(f"gh pr checks {shlex.quote(str(pr))}", pty=True, warn=True)
+    c.run(f"gh pr checks {shlex.quote(str(pr))} --watch --interval 30", pty=PTY, warn=True)
+    c.run(f"gh pr checks {shlex.quote(str(pr))}", pty=PTY, warn=True)
 
 
 @task(
@@ -1012,11 +1019,11 @@ def gh_merge(c: Context, pr: str, sync_branch: str = "rust-tasks") -> None:
     """Squash-merge a PR (keeping the remote branch), then fast-sync the local
     working branch to the new ``origin/main``. Replaces the bespoke
     ``gh pr merge … ; git fetch ; git checkout ; git reset --hard`` sequence."""
-    c.run(f"gh pr merge {shlex.quote(str(pr))} --squash --delete-branch=false", pty=True)
-    c.run("git fetch origin -q", pty=True)
-    c.run(f"git checkout {shlex.quote(sync_branch)}", pty=True, warn=True)
-    c.run("git reset --hard origin/main", pty=True)
-    c.run("git log --oneline -2", pty=True)
+    c.run(f"gh pr merge {shlex.quote(str(pr))} --squash --delete-branch=false", pty=PTY)
+    c.run("git fetch origin -q", pty=PTY)
+    c.run(f"git checkout {shlex.quote(sync_branch)}", pty=PTY, warn=True)
+    c.run("git reset --hard origin/main", pty=PTY)
+    c.run("git log --oneline -2", pty=PTY)
 
 
 @task(
@@ -1049,20 +1056,20 @@ def gh_ship(
     sibling test/backlog changes)."""
     title = pathlib.Path(msg_file).read_text().splitlines()[0]
     if paths:
-        c.run(f"git add {paths}", pty=True)
+        c.run(f"git add {paths}", pty=PTY)
     else:
         c.run(
             "git add -A -- . "
             "':(exclude)vendor' "
             "':(exclude)secantus-data' "
             "':(exclude,glob)docs/validation-report-*-rust-server.md'",
-            pty=True,
+            pty=PTY,
         )
-    c.run(f"git commit -F {shlex.quote(msg_file)}", pty=True)
-    c.run(f"git push -u origin {shlex.quote(branch)}", pty=True)
+    c.run(f"git commit -F {shlex.quote(msg_file)}", pty=PTY)
+    c.run(f"git push -u origin {shlex.quote(branch)}", pty=PTY)
     if pathlib.Path(body_file).exists():
         c.run(
             f"gh pr create --base {shlex.quote(base)} --head {shlex.quote(branch)} "
             f"--title {shlex.quote(title)} --body-file {shlex.quote(body_file)}",
-            pty=True,
+            pty=PTY,
         )
