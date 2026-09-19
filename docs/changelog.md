@@ -19,6 +19,12309 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
+## [0.6.0b17] — 2026-09-19
+
+### The errors are the feature
+
+For three weeks the work was almost entirely about what SecantusDB says when
+something is wrong. Rejecting a malformed command is easy; rejecting it *the way
+`mongod` does* — same code, same message, validated in the same order, so a
+driver's own error handling behaves identically — is what makes a surrogate
+usable rather than merely available. Three hundred and forty-one slices landed
+in this release, and the largest group of them move an error from "generic" to
+"mongod's".
+
+Fourteen were worse than a wrong message. A null argument to `createIndexes`,
+malformed cursor arguments, non-numeric input to `$stdDevPop`, a NaN in `$expr`,
+an integer overflow in the update path — these **crashed the server** rather
+than raising. They are fixed, and the wrong-type sweep across the command
+surface now reports zero divergences. A crash is not a bad error message; it is
+the absence of one, and in a database it takes the connection with it.
+
+The Rust PostgreSQL server grew up over the same period — `client_encoding`,
+composite types over the binary wire, column precision and scale, backend
+termination and cancellation, two-phase commit — and a column-level `UNIQUE`
+that had been accepted and then silently not enforced, which is data corruption
+rather than a missing feature. Both Rust binaries now stamp the git tree they
+were built from and report it in `--version`, because an artifact older than the
+tree it is tested against produces failures that look like somebody else's
+regression, and the evidence is never in the diff.
+
+### Accumulator spec errors depend on WHERE the operator appears
+
+`$firstN`, `$lastN`, `$minN`, `$maxN`, `$median`, `$percentile`, `$topN` and
+`$bottomN` all take a document spec. Given something else, mongod's code depends
+on the operator's position — a `$group` output field is *accumulator* position
+and an `$addFields` value is *expression* position, and they do not agree:
+
+```
+{$group:     {x: {$median: 5}}}   ->  7436100
+{$addFields: {x: {$median: 5}}}   ->  7436201
+```
+
+Both servers carried one table and applied it in both positions, which was right
+for four of the eight operators and wrong for four. Measured across all eight ×
+{scalar, array} × {accumulator, expression} against mongod 8.2.11: **16 of 32
+cells diverged**, now 0.
+
+#### Fixed
+
+- **Accumulator position has its own codes** — `$median` 7436100, `$percentile`
+  7429703, `$topN` / `$bottomN` 5788001, where the expression table says 7436201
+  / 7436200 / 168.
+- **An array spec in accumulator position is one message for all eight**:
+  `40237 The <op> accumulator is a unary operator`, not the per-operator
+  "specification must be an object".
+- **`$topN` / `$bottomN` are accumulator-only.** As an expression mongod does
+  not recognise the name and never looks at the spec, so it answers
+  `Unrecognized expression '$topN'`. A unit test had asserted the object-spec
+  wording here and passed, because "Unrecognized expression" carries code 168
+  too and only the code was ever checked.
+- **`$median` / `$percentile` are validated in mongod's IDL field order** —
+  `input`, then `p`, then `method`. Checking `method` first made `{$median: {}}`
+  name `method` where mongod names `input`, and let a bad `method` outrank a bad
+  `p`. The Python side's ordering came from a 7.0.12 probe.
+- **The bad-method message was missing an article**: mongod says "used as **a**
+  percentile 'method'".
+- **`$percentile`'s `p` has three distinct codes, not one.** A non-array or an
+  EMPTY array is 7750301 naming the array, a non-number element is 7750302, and
+  a number outside `[0, 1]` is 7750303. An empty `p` was accepted outright and
+  produced an empty result; elements rendered as `a` and `None` rather than
+  mongod's `"a"` and `null`.
+- **On the Rust server the whole family deferred**, which surfaces as
+  `2 aggregation pipeline uses a stage or operator not supported by the Rust
+  server` — blaming the operator for a bad argument. Its `$median` /
+  `$percentile` accumulator and expression forms now share one validator.
+- **These errors are raised at PARSE time, which is what fixes the wrapper.**
+  mongod reports them while parsing, so `$addFields` prefixes
+  `Invalid $addFields :: caused by ::` and `$group` prefixes nothing at all.
+  Raising them from the evaluator instead produced `Failed to optimize pipeline`
+  on one server and `Executor error during aggregate command` on the other —
+  right code, right sentence, wrong wrapper, which no code comparison can see.
+
+#### Note
+
+Adding the accumulator-only rule to the shared expression walker initially
+rejected every valid `{$group: {x: {$topN: {…}}}}` — the walker recursed into
+the accumulator and did not know which stage it was in. The stage name is now
+threaded through the whole walk rather than passed only at the top.
+
+### A failing `$expr` in a pipeline's first `$match` lost its error prefix
+
+MongoDB wraps an aggregation's runtime failures in `Executor error during
+aggregate command on namespace: <ns> :: caused by ::`. SecantusDB did too —
+except for the very first stage. A leading `$match` is lifted into the initial
+fetch so it can use an index, which put it outside the block that adds the
+prefix, so `{$match: {$expr: {$divide: ["$a", 0]}}}` reported a bare
+`can't $divide by zero` as the first stage and the full wrapped message
+anywhere else in the same pipeline.
+
+`$sqrt`'s domain error also carried a `, but is -1` suffix that MongoDB does not
+emit — the one operator in that family that omits it, where `$ln` and `$log10`
+keep it.
+
+Of twelve probed runtime-error shapes, eleven now match MongoDB 8.2.11 exactly.
+The twelfth is MongoDB re-coding an error raised inside a `$group` accumulator
+(`4848401` for a division by zero, `7157706` for `$ln`) — its execution engine
+substituting its own code per operator, with no rule derivable short of probing
+every accumulator, and deliberately not guessed at.
+
+#### Fixed
+
+- `commands.py`: the lifted leading `$match` gets the executor prefix.
+- `expressions.py`: `$sqrt`'s domain message matches MongoDB.
+
+### Aggregation no longer invents fields or empty buckets
+
+Two aggregation results carried data MongoDB never sends.
+
+A field path that doesn't resolve — `{$project: {z: "$nope"}}`, or `"$n.k"`
+where `n` has no `k` — came back as `z: null`. MongoDB omits the key entirely.
+The difference is invisible until code asks whether a field is present: `"z" in
+doc` answered yes where a real server answers no, and every document in the
+result carried an extra key. `$addFields` did the same, and a document literal
+went further, turning `{$project: {z: {w: "$nope"}}}` into `{z: {w: null}}`
+where MongoDB gives `{z: {}}`.
+
+The rule being restored is narrower than "missing means null", which is why the
+bug survived: a missing path *is* null when it's an argument to an operator —
+`{$add: ["$nope", 1]}` is 1, not an error — and only *missing* when it's the
+value of a projected field. Both behaviours are now pinned by tests so a future
+fix to one can't quietly break the other.
+
+Separately, `$bucket` emitted buckets that nothing landed in. An unused
+`default` came back as a bare `{_id: "other"}` with no `count` field at all,
+and empty boundary buckets were emitted too. MongoDB omits any empty bucket.
+
+Both fixes landed on the Python and Rust engines together, checked against a
+live `mongod`.
+
+#### Fixed
+
+- A field path that resolves to nothing is omitted from `$project` /
+  `$addFields` output rather than emitted as `null`, including through nested
+  document literals. Missing paths remain `null` as operator arguments, matching
+  MongoDB.
+- `$bucket` emits a bucket only when at least one document falls in it —
+  boundary buckets and the `default` bucket alike.
+
+### A `$switch` that can never match is now rejected, not silently ignored
+
+An aggregation whose `$switch` had no matching branch and no `default` was
+supposed to fail. When every one of its cases was a constant — `{case: false}`,
+or `{$gt: [1, 99]}` — MongoDB rejects the pipeline while optimizing it, before
+a single document is read, so the error arrives even over an empty collection.
+SecantusDB instead waited until execution found a document to fail on. Over an
+empty collection there was none, so the pipeline reported success and returned
+an empty cursor: a query that could not possibly have done what was asked came
+back looking like it had. Adding one document to the same collection surfaced
+the error, which made the behaviour depend on the data rather than the query.
+
+`$replaceRoot` was a second case of the same kind of drift. When `newRoot`
+evaluated to something other than a document it reported the generic type
+error, code 14, with a message no real server emits. MongoDB answers a specific
+code — 40228 — and a message that names the offending value, its BSON type and
+the input document that produced it. That last part is not the stored document
+but the *pruned* one, narrowed to just the fields the expression reads, which is
+what MongoDB's dependency analysis hands the stage; `$replaceWith` shares the
+shape but names a different subject.
+
+All of it was found by running the operations against a live MongoDB 8.2.11 and
+comparing the replies verbatim, and the thirty cases that pin it are now part of
+the differential gate.
+
+#### Fixed
+
+- `$switch` with only constant cases and no `default` is rejected during
+  pipeline optimization (`40069`), matching MongoDB — including over an empty
+  collection, where SecantusDB previously returned an empty cursor and `ok: 1`.
+  A single field-referencing case, or a `default`, correctly prevents folding.
+- `$switch` that finds no matching branch at execution time now reports
+  MongoDB's `40066` and its wording, rather than a generic `14 TypeMismatch`.
+- `$replaceRoot` / `$replaceWith` whose expression does not evaluate to a
+  document now report MongoDB's `40228` and its full message, including the
+  value, its BSON type, and the dependency-pruned input document.
+- `$bucket`'s out-of-range-value error (`7158303`) is now wrapped in MongoDB's
+  `Executor error during aggregate command on namespace: … :: caused by ::`
+  prefix, which marks it as an execution failure rather than a parse error.
+
+### Malformed aggregation stages report MongoDB's error, not a generic one
+
+A malformed `$sample`, `$unwind`, `$bucket`, `$densify` or `$fill` spec reported
+`BadValue` on the Rust server, whatever was actually wrong with it. The engine
+signals "cannot do this" without a code, so a *typo* was indistinguishable from
+an unimplemented feature — a driver matching on the code saw the wrong error,
+and a caller could not tell which of the two had happened.
+
+All five now report MongoDB's own code and message: a negative `$sample` size is
+`28747`, an unprefixed `$unwind` path is `28818`, a one-element `$bucket`
+boundary list is `40192`, a zero or negative `$densify` step is `5733401`, and an
+unknown `$fill` method is `6050202`.
+
+Validation happens before the pipeline runs, which is where `$facet` already
+validated its own spec, so the engine's error type did not have to widen.
+
+Two of these were wrong on the Python server too, in a way that only a
+message-level comparison shows: `$sample` said "must not be negative" where
+MongoDB says "must be a positive integer", and `$bucket` reported "found 1."
+instead of "found 1 value(s)." The codes had always matched, which is why an
+earlier comparison of codes alone reported them as correct.
+
+### Expression arity and spec shape are PARSE errors, not fold errors
+
+`tools/probes/agg_expressions.py` had never been reported on. Running it found **551 wrong error codes** across 58 operators on a 3,968-case corpus — the largest unaddressed surface left. It is now **50**.
+
+#### The systematic cause
+
+mongod builds the expression tree *before* it folds anything, so an argument-count or spec-shape mistake is a **parse** error, reported under the stage's wrapper (`Invalid $addFields :: caused by ::`). We folded first and reported the optimizer's (`Failed to optimize pipeline`), so 279 shapes carried both the wrong wrapper *and* the wrong code. `aggregate._expression_shape_problem` is the new pre-pass, alongside the literal-timezone one.
+
+#### Fixed — a wrong answer
+
+- **An ObjectId or Timestamp IS a date.** mongod accepts every BSON type carrying a timestamp, so `{$year: ObjectId("64b7f9a2…")}` answers 2023; we raised 16006 and refused the document. A one-element array is also the argument itself — `{$year: [<date>]}` — which we rejected too.
+
+#### Fixed — codes and messages
+
+- **Arity** (`$indexOfArray` / `$indexOfBytes` / `$indexOfCP` / `$range` / `$slice`): 28667, naming the bounds and the count.
+- **Date extractors given an array** of any length but one: 40536.
+- **Object-spec expressions** (`$firstN`, `$lastN`, `$minN`, `$maxN`, `$median`, `$percentile`, `$topN`, `$bottomN`): each carries its **own** Location code — 5787801, 5787900, 7436201, 7436200, 168 — not one shared code.
+- **Unrecognised date-spec arguments**: eight operators, eight different codes, and only three append what they expected.
+- `$rand`, `$getField`, `$indexOfCP`, `$bitNot`, `$setEquals` each answer mongod's codes now. `$getField` with an unknown argument, and `$rand` with a non-container spec, previously answered `ok`.
+
+#### The families that look uniform and are not
+
+Two fixes had to be narrowed after they made things worse:
+
+- `$bitNot` splits its message by whether the operand is a **number at all** (28765 vs a bare 14). Its three siblings `$bitAnd` / `$bitOr` / `$bitXor` name no type whatsoever and always answer 14.
+- `$setEquals` checks arity before types and **numbers** the offending argument (`2-th argument`). `$setUnion` and `$setIntersection` accept a single array and say "One argument", with their own codes.
+
+Applying either rule to the family cost 46 shapes before the probe caught it.
+
+#### Also
+
+`agg_expressions.py` no longer compares `$rand`'s **value** — two correct servers disagree by design, and the moment `$rand` started succeeding the probe reported it as a wrong answer.
+
+#### And a panic
+
+Pointing the probe at the **Rust** server for the first time crashed a request thread: `{$setEquals: []}` reached `&arrays[1..]` on a zero-length slice. `arrays.first()` handled the empty case; the next line did not. Any client could take a thread down with a two-character argument. Fixed with mongod's arity check (17045), which is also what makes the slice safe.
+
+That measurement also put a number on the Rust server's expression error surface for the first time — **1,376 of 3,968**, with **zero wrong values**, almost all of it the engine deferring. Recorded in `tasks/backlog.md`.
+
+### Six aggregation stages answered differently from MongoDB
+
+Follow-up to the aggregation-results probe: **both servers now match MongoDB on
+all 48 stages it measures**, up from 42 (Python) and 41 (Rust).
+
+#### Fixed
+
+- **`$setWindowFields` returned rows in the wrong order.** MongoDB emits
+  partition by partition, in first-seen partition order, and within each
+  partition in `sortBy` order. Both servers preserved the *input* order — the
+  docstring even claimed that was correct. Wrong order is wrong results as soon
+  as a `$limit` follows.
+- **`{$count: {}}` failed in a `$group`** with *"Unrecognized expression
+  '$count'"*. The accumulator existed and evaluated correctly all along;
+  nothing ever reached it. The constant folder got there first — `{$count: {}}`
+  reads no field, so it looked like a constant expression and was handed to the
+  expression evaluator, which doesn't know `$count`. It now works in `$group`
+  and `$setWindowFields`, the two accumulator positions, and is still refused
+  as an expression elsewhere. The `$count` **stage** (`{$count: "<field>"}`) is
+  unaffected, including inside `$facet`.
+- **A dotted `$project` dropped the surviving parent.** `{$project: {"sub.k":
+  1}}` over `{sub: {}}` emits `sub: {}` on MongoDB, and an array of documents
+  is pruned element-wise. `find`'s projection had this right; the `$project`
+  stage was a second implementation that only checked the leaf. It now
+  delegates, so there is one implementation of the rule.
+- **`$bucket` put a `Decimal128` in the `default` bucket.** The placement used
+  Python's comparison operators, which have no ordering between a `Decimal128`
+  and an `int` — and the resulting `TypeError` was silently swallowed. It now
+  uses the same BSON ordering the boundary validation already used.
+- **`$bucketAuto` split equal values across buckets and misreported `max`.**
+  `1.5` and `Decimal128("1.5")` are the same value to MongoDB, which never puts
+  equal values in different buckets; and the remainder goes to the *earlier*
+  buckets (8 values into 3 is 3/3/2, not 2/3/3).
+- **`$bucket` and `$bucketAuto` were fixed on the Rust server too**, and had to
+  be: fixing only the Python half turned six engine-parity cases red, because
+  the two servers then genuinely disagreed. Parity doesn't say which side is
+  right, but it does say they move together.
+- On the Rust server: **`$max` over `{NaN, Infinity}` answered `NaN`** — its
+  `bson_lt` treated NaN as unordered, following Python's `<` rather than
+  MongoDB's order, so the accumulator never moved off the first NaN it saw. And
+  **a `$group` keyed on a `MinKey`, `Timestamp`, `Binary`, `Regex` or `Code`
+  failed the whole stage**; each of those buckets by exact value.
+
+Measured against mongod 8.2.11.
+
+### A sort no longer fails on a NaN, and `true` no longer groups with `1`
+
+`aggregation_stage_specs` and its tests cover the errors aggregation stages
+*reject*. Nothing covered the documents they *emit* — which is where a silently
+wrong answer lives: the pipeline succeeds, the shape looks right, and the rows
+are wrong. A new probe found real divergences on its first run, as the same gap
+did twice before for queries and updates.
+
+#### Fixed
+
+- **A plain `{$sort: {v: 1}}` failed outright on the Rust server** for any
+  collection holding a `NaN`, a `MinKey` or a `MaxKey` — ordinary data, ordinary
+  query, whole pipeline refused with *"aggregation pipeline uses a stage or
+  operator not supported"*. It took `$group`, `$bucket` and `$topN` down with
+  it, since those sort too. The sort gate had been kept deliberately narrow to
+  protect the comparator from types with no ordering arm; every one of those
+  arms now exists, so the gate was only firing a refusal.
+- **`true` shared a `$group` bucket with `1`.** MongoDB keeps them apart — a
+  bool is not a number to it — while merging `1` with `1.0`, and merging the
+  signed zeros:
+
+  | bucket | members |
+  | --- | --- |
+  | `0` | `0`, `0.0`, `-0.0` |
+  | `false` | `false` |
+  | `true` | `true` |
+  | `1` | `1`, `1.0` |
+
+  The Python server merged `true` into the numbers; the Rust server was worse,
+  keying by **truthiness**, so six documents collapsed into two buckets.
+- **A `Decimal128` group key sat in its own bucket** on the Python server, where
+  MongoDB merges `Decimal128("1")` and `Decimal128("1.0")` with `1` and `1.0`.
+  On the Rust server it failed the whole `$group` instead.
+
+#### Added
+
+- `tools/probes/aggregation_stage_results.py` — 48 stages, comparing emitted
+  documents and **field order**, which content comparison silently drops.
+
+Measured against mongod 8.2.11.
+
+### Aggregation stages validate their specs, and four BSON types became queryable again
+
+A sweep of every aggregation **stage** crossed with every pathological argument —
+725 shapes, a surface no earlier sweep covered — found 167 divergences against
+mongod 8.2.11. It is now 22, and everything left is a message or
+validation-order difference rather than a wrong answer.
+
+#### Fixed
+
+- **`$unset` validated nothing.** A non-string, non-array spec raised a bare
+  `TypeError` and reached the client as `internal server error`; an empty string
+  and an empty array were accepted and did nothing; a document spec silently
+  iterated its *keys*. mongod has four distinct codes for those.
+- **`$out: ""` and `$merge: ""` were accepted**, writing to a nameless
+  collection. Both are `InvalidNamespace` on mongod. Neither stage validated its
+  field names either, so a typo was silently ignored — and `$out` takes
+  `{db, coll}` where `$merge` takes `{into: ...}`.
+- **`$documents` is a collection-less stage.** Run against a collection, mongod
+  refuses it before looking at the argument at all; we ran it happily.
+- **Four BSON types were unreachable by `$type`.** `javascript`,
+  `javascriptWithScope`, `timestamp`, `minKey` and `maxKey` all validated as
+  aliases but had no predicate, so the query silently matched nothing — and
+  `$type: "string"` matched JavaScript values.
+- **`$group` on a field holding a `bson.Code` crashed**, as did `$count`, `$out`
+  and `$merge` given one as their spec, and `$unset` silently accepted one.
+  `Code` subclasses `str` and defines `__eq__` without `__hash__`;
+  `bsontypes.is_bson_string` is now the check to use where the distinction is a
+  BSON one.
+- `$set` reported itself as `$addFields`, whose handler it shares.
+
+#### Changed
+
+- mongod has **two** value renderings and they are not interchangeable: they
+  differ in six places (`[ 1 ]` vs `[1]`, `BinData(0, 7A)` vs
+  `BinData(0, "7A")`, `ObjectId('…')` vs bare hex, `new Date(ms)` vs ISO-8601,
+  and two more). Everything else is identical, which is what made the difference
+  easy to miss. `bsontypes` now holds one function per family, retiring four
+  more partial copies.
+
+### Aggregation stage specs: mongod's validation ORDER
+
+`tools/probes/aggregation_stage_specs.py` is now **0 of 725** on the Python server, down from 22 (and 167 when the probe was written).
+
+#### Fixed
+
+mongod parses a stage spec field by field, so an **unknown or specifically-missing field is reported before** the generic "requires X and Y" — `{$bucket: {a: 1}}` names `a` rather than listing what is absent. Each stage has its own code and wording: `$sample` 28748, `$bucket` 40197 *with* a trailing period, `$bucketAuto` 40245 *without* one, and the IDL's 40415 for `$replaceRoot` / `$densify` / `$fill` / `$unionWith`.
+
+Three stages invert the rule:
+
+- **`$lookup`** reports a missing `from` first (`must specify 'pipeline' when 'from' is empty`), and only checks unknown fields once `from` is present.
+- **`$graphLookup`** does the same, and its message echoes the whole spec in mongod's *spaced* document rendering — `{ a: 1 }`, not the value renderer's `{a: 1}`.
+- **`$geoNear`** reports a missing `near` before objecting to the spec's own type. An array is a document in BSON, so `{$geoNear: []}` gets the `near` message while a scalar gets the type error.
+
+Two were not message differences at all:
+
+- **`{$unionWith: ""}` returned the outer documents unchanged** — a wrong answer — where mongod rejects the empty namespace with 73.
+- **`{$documents: {}}`** is rejected while the stage is desugared into a projection, so it answers 51270 even against a collection, where every other argument gets the namespace error.
+
+#### Changed
+
+- The probe grew a `PROBE_SERVER` column so it measures the **Rust** server too. It had only ever compared the Python one, which is why the Rust server was **219 of 725** divergent on the same corpus with nobody the wiser. That is now **0** as well.
+
+#### Fixed — Rust server
+
+Three of them were wrong answers: `$out` and `$merge` with an empty target namespace returned `ok` and wrote to a nameless collection — a `$out` that silently did nothing — and `$unionWith: ""` and `$unset: ""` likewise reported success having done nothing.
+
+The rest were three families:
+
+- **A third value renderer.** Both `render_stage_value` and `render_value_compact` ended in `other => format!("{other:?}")`, so every type without an explicit arm reached the client as Rust `Debug` — `Regex { pattern: "a", options: "" }` where mongod says `/a/`. And the two are not interchangeable: the 40228 / 17053 family quotes binary (`BinData(0, "7A")`) and wraps code as `Code("x=1")` where `$limit`'s renders `BinData(0, 7A)` and the code text bare.
+- **`map_err(|_| Fallback::Defer)`** on seven stage dispatches discarded the real error — the same shape as the storage layer's `map_err(|_| QueryUnsupported)`. On the standalone server that reads as "the *stage* is unsupported" for what is a bad *argument* to a supported one.
+- **Validation order**, the same rule as above, ported stage by stage.
+
+`$set` also reported its errors as `$addFields`, because the two share an implementation and the message was hard-coded to the alias.
+
+### Numeric and cursor command arguments no longer crash the server
+
+Extending the wrong-type sweep past document-valued arguments found 24 more
+slots that crashed with `internal server error` instead of returning a parse
+error: `find`'s `limit` / `skip` / `batchSize`, `aggregate`'s `cursor` and
+`cursor.batchSize`, `listIndexes.cursor`, `createIndexes.indexes`, and a `$match`
+stage whose spec isn't a document.
+
+**mongod's strictness here is per-slot, not per-class.** `find.limit: {}` is a
+type error, while `delete.deletes.limit: {}` is *accepted* and means "no limit" —
+so a blanket "validate every numeric argument" rule would have fixed one and
+broken the other. Every slot was probed individually.
+
+#### Fixed
+
+- `find.limit` / `.skip` / `.batchSize` and `cursor.batchSize` return mongod's
+  `BSON field '<path>' is the wrong type '<t>', expected types
+  '[long, int, decimal, double']`. `find`'s are reported under mongod's internal
+  IDL name — `FindCommandRequest.limit`, not `find.limit`. Booleans are rejected
+  explicitly, since Python otherwise reads `true` as `1`.
+- `aggregate`'s `cursor` uses its own wording, `cursor field must be missing or
+  an object`; `listIndexes.cursor` and `createIndexes.indexes` use the BSON-field
+  form with `'object'` and `'array'` respectively.
+- A `$match` stage whose spec isn't a document returns `15959` /
+  `the match filter must be an expression in an object`.
+- `delete`'s `limit` is deliberately *not* type-checked: anything that isn't a
+  numeric `1` means "no limit", matching mongod — including `true`, which mongod
+  does not treat as `1`. We used to call `int()` on it and crash.
+
+Verified against mongod 6.0.16 and 8.3.4: zero crashes on both, and the same
+behaviour on both.
+
+### Wrong-typed command arguments are no longer accepted in silence
+
+Nine argument slots took a value of the wrong type without complaint and
+reported success. `find` accepted `collation: 5` and `let: "x"`, `create`
+accepted `storageEngine: true`, `collMod` accepted `index: 5`, `aggregate`
+accepted `let: 5`, and the boolean slots — `find`'s `singleBatch`,
+`findAndModify`'s `upsert`, `update`'s `multi` — took objects and arrays. A
+driver sending a malformed command was told the operation had succeeded, which
+is the worst of the three ways this class of bug shows up: the earlier tranches
+either crashed the command or answered the wrong error code, and both of those
+are at least visible.
+
+All nine now answer what MongoDB answers, and `find`'s `maxTimeMS` — the one
+slot in the sweep that is not a type error at all — answers its three distinct
+`BadValue` messages for a non-number, a non-integral number, and a negative one.
+The `let` option on `update`, `delete` and `findAndModify` is validated too.
+
+Two related divergences turned up while probing and are fixed with them: an
+explicit `null` was accepted for `find`'s `filter`, `sort` and `projection`, and
+for `aggregate`'s `cursor`, where MongoDB rejects it. An *absent* option is
+still fine — the two cases had been indistinguishable in the code.
+
+Nine slots needed six different message families, because MongoDB's strictness
+here is per-slot rather than per-class. `findAndModify.upsert` accepts a bool or
+any number, so `upsert: 1` and even `upsert: 1.5` are valid, while the adjacent
+`update.multi` is a strict bool that rejects `multi: 1`. `find.let` is reported
+under MongoDB's internal name `FindCommandRequest.let` while the same option on
+every other command uses the command's own name. Six slots accept an explicit
+`null` and three reject it. Every one of these was measured against a live
+`mongod` rather than inferred from its neighbour, and `delete`'s `limit` — which
+MongoDB genuinely does not type-check — is pinned by a test so a future tidy-up
+can't sweep it in.
+
+### Malformed pipeline stages report MongoDB's error code
+
+A `$lookup`, `$group`, `$sort` or `$unwind` stage whose specification was the
+wrong type returned an error — just not the one MongoDB returns. `$lookup`
+answered TypeMismatch where MongoDB answers FailedToParse; `$group` and `$sort`
+answered generic codes in place of their own; `$unwind` answered a message about
+a path when the problem was that the specification was not a path at all. Codes
+are what a driver branches on, so a client checking for a parse failure saw a
+type error instead.
+
+`find`'s `min` and `max` cursor bounds had the same shape: a wrong-typed bound
+reached the index bound-checker and came back as an index error, where MongoDB
+type-checks the argument first and never gets that far.
+
+Two of these were one condition doing two jobs. `$sort` used a single test for
+"not an object, or empty", so a spec of `5` was reported as "must have at least
+one sort key" — true of `{}`, meaningless for a number. `$unwind` reported
+"expected a string as the path" for a spec with no `path` key at all, and the
+missing-`$` message for an empty one, where both are "no path specified".
+Splitting them means an empty `$sort` and a missing `$unwind` path keep their
+own distinct codes, which is why both are now pinned by tests.
+
+Also fixed while separating those cases: `{$unwind: {other: 1}}` now reports the
+unrecognized option rather than complaining about the path it also lacks.
+
+With this the wrong-typed-argument sweep reports **87 of 87 cases clean**, from
+24 crashes and 44 divergences when it started.
+
+### A null command argument no longer crashes `createIndexes`
+
+`createIndexes` with `indexes: null` returned an internal server error instead of
+rejecting the argument. Several neighbouring slots were wrong in quieter ways:
+`distinct` reported a null key as the wrong type where MongoDB reports it as a
+missing required field, and on the Rust server a null was accepted in places
+MongoDB rejects it and rejected in two places MongoDB allows it.
+
+These were found by widening the differential test corpus. It had been feeding
+three values per argument slot, none of them null — so a sweep reporting every
+case clean was accurate and, at the same time, silent about an entire class of
+input. The corpus now also covers fractional and negative numbers, decimals,
+ObjectIds and dates, and both servers match MongoDB across all 244 resulting
+shapes.
+
+Worth knowing if you rely on this behaviour: null is not uniform. MongoDB
+accepts it for `find`'s `let` and `listIndexes`' `cursor`, rejects it for
+`find`'s `min` and `max` and `aggregate`'s `cursor`, and gives `createIndexes` a
+different error code for a null list than for a wrong-typed one.
+
+### The wrong-type sweep reaches zero code divergences
+
+The last of the Python server's wrong-typed-argument work. Across the 685-shape
+corpus measured against mongod 8.2.11, **code divergences are now zero** (from
+36 at the start of this slice), and message divergences are down to six.
+
+#### Fixed
+
+- **`create`'s capped options were four separate defects.** `size` or `max`
+  present without `capped: true` was **silently accepted** where mongod answers
+  72; our "the 'size' field is required" message carried a trailing clause
+  mongod does not have; a negative `size` answered 72 where mongod answers
+  `2 BSON field 'size' value must be >= 1` (a floor of one, not zero); and
+  `max` has **no lower bound at all** — 0, -1 and 2.5 are all accepted — where
+  we rejected anything at or below zero. Two tests pinned the old behaviour and
+  were rewritten.
+- **`dropIndexes` could not drop an index by key pattern.** Every non-string
+  `index` was rejected as a type error, so `{index: {a: 1}}` never worked.
+  mongod resolves the key pattern, and answers `27 can't find index with key:
+  { z: 1 }` when nothing matches. Dropping the `_id` index is **72**, not the
+  67 both arms returned.
+- **An explicit `hint: null` was accepted** on all six commands that take a
+  hint, where mongod answers `9 Hint must be a string or an object`. An absent
+  hint remains fine — the two are now distinguished.
+- **A null in a required field is "missing", not "wrong type"** —
+  `getMore.collection` and `renameCollection.to` answer `40414`. An optional
+  typed field is the other way round: `renameCollection.dropTarget: null` is a
+  `14`.
+- **An empty write batch was accepted** on `update` and `delete` (`updates: []`
+  or `{}`), where mongod answers `16 Write batch sizes must be between 1 and
+  100000. Got 0 operations.`
+- **`bypassDocumentValidation` was unchecked** on `insert`, `update` and
+  `findAndModify`, and `listIndexes.cursor.batchSize` accepted a boolean
+  through a bare `int()`.
+- **Message families corrected** to mongod's own text: `insert.writeConcern`
+  (was "writeConcern must be a document"), `distinct` (the IDL struct name,
+  `distinctCommandRequest.query`), `aggregate.pipeline` ("A pipeline must be an
+  array of objects"), `renameCollection.to`, `dropIndexes.index` (whose
+  expected-type list differs for an array), and `$facet`, which rendered its
+  spec with Python's `repr`.
+
+#### Known gap
+
+The message for a `hint` naming an index that does not exist is mongod's
+multi-line **planner dump**, which renders its parsed match-expression tree
+(`{a: 1}` becomes `Tree: a $eq 1`). Reproducing it in general means porting
+mongod's `MatchExpression::debugString`; the error code already matches, and a
+partial renderer would be wrong on anything nested. Recorded rather than
+approximated.
+
+### A change-stream test asserted which 1-second window an event arrived in
+
+`test_absent_max_time_ms_still_waits_and_delivers` inserted after 150 ms and
+asserted that **one** `getMore` came back with the event. That holds only while
+the inserting thread is scheduled inside the server's 1 s default tailable
+wait. On a loaded runner it isn't: the window closes empty and the test fails
+with `[] == ['insert']`. Seen on macOS CI, and reproduced here by delaying the
+insert past 1 s.
+
+Delivering the event on the **next** `getMore` is correct behaviour, not a bug —
+so the test was asserting something the server never promised. The property it
+exists to protect is "an absent `maxTimeMS` waits for an event and delivers it",
+and that is now pinned as two separate assertions instead of one race:
+
+1. **It waits.** With nothing pending, an absent `maxTimeMS` must block rather
+   than poll once — the inverse of the explicit `maxTimeMS: 0` pinned by the
+   test above it.
+2. **It delivers.** An insert issued while a `getMore` is blocking comes back,
+   in that window or the one after it.
+
+**The guard was checked both ways**, because a flake "fixed" by loosening an
+assertion is worse than the flake:
+
+- with the insert delayed to 1.4 s — the exact CI failure — the test now passes;
+- with the server not blocking (simulated by sending `maxTimeMS: 0`), it still
+  **fails**: `an absent maxTimeMS returned after 0ms; it must WAIT`.
+
+Its siblings were checked for the same shape: `test_change_streams.py` already
+polls to a deadline, so this single-window assumption was unique to this test.
+
+#### Fixed
+
+- `tests/test_getmore_maxtimems_zero.py`: assert the blocking property directly
+  and let delivery span more than one window.
+
+### `--version` says which source a binary was built from
+
+`secantusd-rs --version` and `secantusd-pg --version` reported only a crate
+version — and this repo forbids version bumps in feature PRs, so hundreds of
+commits share one string. A user reporting "0.1.0-beta.0" had told you almost
+nothing about which code they were running.
+
+#### Added
+
+- Both binaries now print the git tree hash of the `crates/` sources they were
+  built from, on a second line:
+
+  ```
+  $ secantusd-pg --version
+  secantusd-pg 0.1.0-beta.0
+  tree: 30bfc40839ab7200307814e7b38a5267d6f73bbd
+  ```
+
+  Line 1 stays short for the common "what did I install?"; line 2 is what makes
+  a bug report actionable. The `tree:` line is **omitted, not blank**, when the
+  binary was built without git (an sdist, a release tarball).
+- The binary smoke tests compare that stamp against `HEAD:crates` and **fail**
+  when `SECANTUSDB_BIN` / `SECANTUSD_PG_BIN` is set — the variable the release
+  workflow uses to say "smoke THIS artifact", which is exactly when a stale
+  binary would ship. A locally discovered binary only reports, because failing
+  someone mid-edit is how a check gets switched off.
+
+  This extends the `_secantus_core` provenance check to the two distributed
+  artifacts, which accounted for the majority of the day's staleness incidents.
+
+#### Fixed
+
+- `secantusd-rs --version` printed without a trailing newline, so its output ran
+  into the next shell prompt.
+
+A **tree** hash, not the commit SHA: `HEAD:crates` changes only when a crate's
+content changes — measured stable across three consecutive commits touching
+only docs and tests — whereas a commit SHA moves constantly and a check built on
+it would be disabled within a week.
+
+### A stale build no longer looks like a regression
+
+On 2026-09-18 eight separate incidents came from a built artifact being older
+than the tree it was tested against. Every one presented as somebody else's
+regression, because the tests were current and only the artifact was old: a
+conformance gauge reported 1,084 failures and a 73.8% pass rate from a binary
+50 crate-commits behind, and that wrong number reached the public website; a
+full suite produced 174 parity failures that were all fictional, the same files
+passing 207 of 207 after a rebuild with no code change; and three failures
+landed in a colleague's new test file, reading as their bug, from a binary
+built 33 minutes before the fix those tests assert.
+
+Reading the diff cannot catch this, because the evidence is not in the diff.
+The suite now checks at collection whether the installed `_secantus_core` was
+built from the sources in the checkout, and stops with the rebuild command if
+it was not.
+
+The identifier is the git TREE hash of the crates, not the commit SHA and not
+the package version. The commit SHA moves on every commit, so that check would
+report stale constantly and be switched off; the version moves at release
+cadence, and was measured reporting `beta.163` for an extension stale enough to
+need rebuilding twice in a day — green for exactly the builds that were wrong.
+A tree hash changes if and only if the crate's content changes.
+
+#### Added
+- `secantus-core-py`: `build.rs` stamps the source tree hash, exposed as
+  `_secantus_core.__source_tree__`. Absent without git history (an sdist, a
+  build container), in which case the check abstains.
+- `tests/conftest.py`: the collection-time check, and `tests/test_build_provenance.py`
+  pinning its decisions — weighted toward the cases where it must stay SILENT,
+  since a false positive is how a check gets disabled.
+
+### `bulkWrite`, `sort` on updates, and an honest 8.x version
+
+SecantusDB advertised itself as MongoDB 7.0 while its error surface had already
+been retargeted to 8.x. That gap was not cosmetic: the advertised version is a
+capability contract, and drivers gate features on it. `client.bulk_write()` —
+MongoDB 8.0's command for writing across several collections at once — was
+simply unavailable, and had a caller sent the command by hand they would have
+got `CommandNotFound`.
+
+Three things landed together, because they cannot land apart. The driver spec
+suites assert in *both* directions: that a pre-8.0 server rejects `sort` on an
+update, and that an 8.0 one honours it. Implementing without advertising fails
+the first set; advertising without implementing fails the second.
+
+#### Added
+
+- **`bulkWrite`** — inserts, updates and deletes across multiple namespaces in
+  one command, with MongoDB's cursor-shaped reply and summary counters. Ordered
+  batches stop at the first failing operation and unordered ones continue;
+  upserts report the generated `_id`; `errorsOnly` suppresses successful
+  results. A failing operation is reported against that operation, leaving the
+  rest of the batch to run — an early version let it fail the whole command, so
+  a driver saw no partial result at all.
+- **`sort` on `updateOne` / `replaceOne`** — matches in sort order and updates
+  the first. Rejected in combination with `multi`, as MongoDB rejects it, and an
+  upsert that matches nothing still upserts.
+- **`nsType` on change-stream `create` events** — `collection`, `timeseries` or
+  `view`.
+
+#### Changed
+
+- The advertised server version moves from 7.0.0 (wire 17) to **8.2.11 (wire
+  27)**, matching the MongoDB the project targets and tests against.
+
+Every shape was measured against a live MongoDB 8.2.11 rather than derived from
+documentation: the command's reply layout, its five rejection codes, the
+ordered/unordered split, and the three `nsType` values.
+
+### `bulkWrite` reports mongod's errors for a malformed command
+
+A differential sweep of 47 `bulkWrite` shapes against mongod 8.2.11 found five
+divergences, all of them error *shape* — the command's behaviour on well-formed
+input already matched.
+
+#### Fixed
+
+- **A missing `nsInfo` was reported as a wrong type** (`2`) rather than a
+  missing required field (`40414`), and an explicit `null` was not recognised
+  as missing at all.
+- **A non-array `nsInfo` reported a batch-size problem.** mongod validates
+  `nsInfo` *before* the operation count, so `{ops: [], nsInfo: 5}` is a type
+  error and not "Got 0 operations" — our check order had it the other way
+  round.
+- **`nsInfo` entries were unvalidated**: a non-document entry, an unknown field
+  inside one, and a non-string `ns` now answer mongod's codes. The entry error
+  carries its index (`bulkWrite.nsInfo.0`) while the field errors do not
+  (`bulkWrite.nsInfo.x`) — mongod's own inconsistency, reproduced.
+- **An invalid namespace** (`"nodot"`, `""`, `"."`) answered "invalid nsInfo
+  index" instead of `73 Invalid namespace specified for bulkWrite: '<db>'`.
+- **A negative namespace index** answered our own wording instead of
+  `2 BSON field 'insert' value must be >= 0` — which names the bare op kind,
+  not the IDL path — and a wrong-typed index is now a `14` rather than a
+  generic index error. A double index (`0.0`) is valid and still accepted.
+- **An unknown op kind** now names the offending key
+  (`BSON field 'bulkWrite.frobnicate' is an unknown field.`).
+- **`filter` is required on `update` and `delete`.** It defaulted to `{}`,
+  silently turning a malformed operation into a match-all — the only one of
+  these that could change which documents a write touched.
+
+### `bulkWrite` sent a 32-bit cursor id, and refused a field every 8.x driver sends
+
+The Go driver refused every `bulkWrite` reply with
+`id should be an int64 but it is a BSON 32-bit integer`. A cursor id is an
+int64 on the wire; this one was a bare `0`, which BSON encodes as a 32-bit
+integer. A permissive driver cannot see the difference — pymongo accepts either,
+so the pymongo gauge had never noticed — but a type-strict one refuses outright.
+
+#### Fixed
+
+- `bulkWrite`'s reply cursor id is now `Int64`. Every other cursor reply in the
+  codebase was already wrapped; this was the one that was not.
+- `bulkWrite` now accepts `bypassEmptyTsReplacement`, which mongod 8.2.11 takes
+  on `bulkWrite`, `insert` and `update` alike, and which the 8.x drivers append
+  by default. `insert` and `update` already accepted it here; only `bulkWrite`
+  refused, answering `40415 ... is an unknown field`. It is accepted and
+  ignored — the flag governs a `Timestamp()` substitution neither server
+  implements. A genuinely unknown field is still refused with 40415.
+
+Both fixes apply to the Python server; the Rust server shared the
+`bypassEmptyTsReplacement` refusal and already had a correctly typed cursor id,
+now pinned by a test so it cannot regress. The mongo-go-driver gauge goes from
+30 `bulkWrite` failures to 3, the remainder being a genuine feature gap recorded
+in `tasks/backlog.md`.
+
+### `bulkWrite` results page through a real cursor
+
+The reply cursor was always `{id: 0, firstBatch: [...everything...]}`, so a
+driver never issued a `getMore` — three of the mongo-go-driver's CRUD prose
+tests assert that it does, and the C driver fails the same three numbered cases.
+
+#### Added
+
+- `bulkWrite` now returns a real cursor when its results do not fit one batch,
+  on both servers. `cursor.batchSize` is honoured, the remainder pages out
+  through `{getMore: <id>, collection: "$cmd.bulkWrite"}` against `admin`, and
+  `killCursors` closes it.
+- The first batch is limited by **size** as well as count: two upserts with
+  8MB `_id`s produce results that cannot share one 16MB reply, so one comes back
+  and the rest follow — which is what mongod does and what a count-only rule
+  misses.
+
+Boundaries match mongod 8.2.11 exactly, including the ones that are easy to get
+backwards: a batch filled *exactly* keeps no cursor (unlike `find`),
+`batchSize: 0` opens a cursor with an empty first batch, and `errorsOnly` with
+no errors pages nothing.
+
+### Change streams: two fatal errors that shared one wrong code, and events whose fields came out in the wrong order
+
+Change streams had never been compared against a real MongoDB, because mongod
+refuses them on a standalone server and the differential harness spawns a
+standalone. Run against a single-node replica set, 14 of 41 cases disagreed.
+
+#### Fixed
+
+- A change stream configured with `fullDocument: "required"` or
+  `fullDocumentBeforeChange: "required"` failed with code 280
+  `ChangeStreamFatalError` when the image was not available. MongoDB answers
+  that with code **47 `NoMatchingDocument`** and no error labels — a different
+  condition, and a different code, from the 280 it uses when a pipeline strips
+  the resume token. Both now match, message included. The two used to share one
+  exception class, which is why one wrong code covered both; 280 is still
+  correct for the stripped-token case and is asserted there by the driver spec
+  suite.
+- The stripped-token error itself was missing MongoDB's `Executor error during
+  getMore :: caused by ::` prefix and the trailing `Expected: … but found: …`,
+  which names the resume token that was expected and what the pipeline left
+  behind. Dropping the token, rewriting it with `$literal`, and rewriting it
+  with `$addFields` all now produce MongoDB's message exactly.
+- Change events emitted their fields in the wrong order: `wallTime` came after
+  `documentKey` instead of directly after `clusterTime`, and `fullDocument` was
+  hoisted ahead of `_id` — so `_id` was not the first field. Field order is
+  invisible to a document comparison, which is how nine event-construction
+  sites drifted out of it without any test noticing. Events are now assembled in
+  MongoDB's order in one place rather than nine, which took the ordering
+  divergences from 28 cases to 5 — and the five that remain are all explained by
+  a missing field that is recorded in the backlog, not by ordering.
+
+All three are fixed on **both** servers, and both now diverge from MongoDB on
+exactly the same remaining cases.
+
+#### Known, recorded, not fixed
+
+`updateDescription` still reports array edits in a shape MongoDB never
+produces: we emit `truncatedArrays` where MongoDB reports either the whole new
+array or the positional path of an appended element. This is measured across
+eight mutations and four array sizes in the backlog. It is not fixed here
+because the diff walk is mirrored in both engines and roughly nineteen
+assertions pin the current behaviour — that is its own change, not a tail-end
+addition to this one.
+
+#### Added
+
+- `tools/probes/change_streams.py`, the probe behind all of the above. It
+  compares event contents *and* field order, and documents the replica-set
+  requirement that kept this area unprobed.
+
+### A change stream could quietly ignore the options you asked it for
+
+Phase 2 of `tasks/remaining-work-plan.md`, fifth and last surface: 13
+change-stream shapes against a real replica-set mongod 6.0.16. **All 13
+diverged.**
+
+The dominant failure was arguments **accepted and ignored**, which is a worse
+shape here than almost anywhere else in the server, because the caller believes
+they asked for something. `parse_spec` guarded every field with `isinstance`
+and silently skipped a wrong-typed value, so a client that asked for
+`fullDocument: "updateLookup"` — or to resume from a token — got a stream that
+did neither and reported success.
+
+#### Fixed
+
+- **A crash.** A resume token that is valid hex but not valid BSON
+  (`{"_data": "aa"}` — two hex digits, one byte) raised `InvalidBSON` straight
+  out of the handler and escaped as `internal server error` (code 1).
+- **An unknown `fullDocument` or `fullDocumentBeforeChange` value** is rejected
+  (`BadValue`) instead of falling back to the default. Misspelling
+  `updateLookup` used to give you a stream without lookups and no indication.
+- **An unknown `$changeStream` field** is rejected (`Location40415`).
+- **A wrong-typed `resumeAfter` / `startAfter` / `startAtOperationTime`** is
+  rejected (`TypeMismatch`). These were the most consequential of the ignored
+  arguments: the stream started from the beginning rather than the requested
+  position, and said it had succeeded.
+- **`$changeStream` anywhere but the first stage** is rejected
+  (`Location40602`). We built an ordinary aggregation and answered an exhausted
+  cursor — a "stream" that never yields an event and never says why.
+- **`$changeStream: 5`** answers mongod's `Location6188500` rather than a
+  generic `BadValue`, and a non-hex resume token reports mongod's own wording
+  instead of our prefix wrapping Python's `fromhex()` complaint.
+- **Event field order.** `fullDocument` now sits immediately after
+  `operationType`, where mongod puts it, rather than being appended at the end.
+  The event *contents* already matched exactly; only the order differed, and
+  the event's field order is the contract drivers read off the wire.
+
+#### Known gap
+
+The `$project`-drops-`_id` fatal error carries the right code (280) and message
+body but not mongod's `Executor error during getMore :: caused by ::` prefix —
+the same wrapper-prefix class already tracked for aggregation errors.
+
+The differential cases for this surface are deliberately **not** added to
+`tests/test_mongod_differential.py` in this PR: another session is editing that
+file to generalise the mongod-version gating, and the coverage here lives in a
+dedicated test file instead so the two do not collide.
+
+### Change streams report array edits the way MongoDB does
+
+An update that changed an array produced an `updateDescription` MongoDB would
+never send. Popping one element reported a `truncatedArrays` truncation;
+pushing one reported the entire array. MongoDB does the opposite of both: it
+resends the whole array for a `$pop`, and reports `arr.5` for a `$push`.
+
+The reason it was wrong in both directions is that the shape depends on the
+**operation**, not on what changed. `$set: {arr: [1,2,3,4,5,6,7]}` and
+`$push: {arr: {$each: [6,7]}}` produce an identical document, and MongoDB
+reports the first as a whole-array replacement and the second as two indexed
+appends. No comparison of the before and after documents can tell those apart,
+so the update itself is now an input to the diff.
+
+Measured against MongoDB 8.2.11 and applied to both servers:
+
+- `$push` / `$addToSet` report `arr.<i>` for each appended index;
+- `$set`, `$unset`, `$inc`, `$mul`, `$min` and `$max` of an indexed path report
+  exactly that path — `$set: {"arr.7": 77}` on a five-element array reports
+  `arr.7` and not the two nulls it silently creates;
+- `$pop`, `$pull`, `$pullAll`, a sliced or sorted `$push`, and a whole-field
+  `$set` report the whole array;
+- an aggregation-pipeline update is diffed by value, and that is the one shape
+  where `truncatedArrays` really is emitted.
+
+That last point corrects a claim made when this was filed. The earlier sweep
+concluded MongoDB "never" emits `truncatedArrays`, having probed only operator
+updates; it emits it for pipeline updates, which is what the driver spec suite
+had been asserting.
+
+Ten of the fourteen remaining differences in the change-stream sweep close with
+this. The four that remain are a separate, recorded gap in expanded events.
+
+### The Windows storage-engine job filled a small drive while a 147 GB one sat idle
+
+`storage-engine (windows-latest)` failed with `No space left on device` and
+`WinError 112` on a change that added no storage at all — the second Windows
+disk exhaustion on this job.
+
+The suite genuinely needs the room. `tests/conftest.py` **refuses** a
+`tmp_path_retention_policy` that deletes a passed test's directory mid-session,
+because one was tried and raced WiredTiger's background threads into a
+`WT_PANIC` cascade, so every test's WiredTiger home stays on disk for the whole
+session by design. Both engines already ship `prealloc=false`, the lever that
+tripwire names, and Rust's larger `file_max` is a documented production-throughput
+choice — none of that is the problem.
+
+**The problem was which drive it needed the room on.** Python's `tempfile` reads
+`TMP`/`TEMP`, which on this image default to
+`C:\Users\runneradmin\AppData\Local\Temp`. `RUNNER_TEMP` is `D:\a\_temp`,
+and D: has ~147 GB free. The job filled C: while D: sat at 3 GB used of 150.
+
+That was found by adding the reporting first — and the first version of that
+reporting was itself wrong, running `df -h .`, which measures the *workspace*
+drive (D: on Windows) and would cheerfully have shown 147 GB free on the run
+that died of a full C:. It now reports the directory the tests actually write
+to.
+
+#### Fixed
+
+- `.github/workflows/test.yml`, `storage-engine` job: `TMP` / `TEMP` / `TMPDIR`
+  point at `RUNNER_TEMP` on Windows, so the per-test WiredTiger homes land on
+  the drive with the space.
+
+#### Changed
+
+- Reclaim the Android SDK on Windows, mirroring the reclaim the `test` job
+  already has on Linux (MSVC / CMake / Python / LLVM all live elsewhere).
+- Report free space for the **test temp directory** before and after the storage
+  tests, so the delta sizes the suite's real appetite. The "after" step is
+  `if: always()`, because a report that runs only on success never prints on the
+  run that needs it.
+
+### The Rust PostgreSQL server honours `client_encoding`
+
+`secantusd-pg` stores and evaluates everything in UTF-8, but until now it
+ignored `SET client_encoding` and hard-coded `client_encoding = UTF8` in its
+startup reply. A client that asked for `LATIN9` still received UTF-8 bytes,
+and — worse — nothing told the client its request had been dropped, so the two
+sides silently disagreed about the wire encoding. The one thing the server was
+careful *not* to do was report a `client_encoding` it did not actually honour:
+a `ParameterStatus` for an unhonoured GUC makes libpq switch its own codec and
+mis-decode every value, which is how a comparable `DateStyle` change once
+regressed 160 tests.
+
+The server now transcodes result text to the client encoding and decodes
+incoming text parameters from it, in both the text and binary wire formats,
+for `LATIN1` and `LATIN9`; `UTF8` and `SQL_ASCII` (and every other accepted
+name) keep the internal UTF-8 bytes exactly as before, so a UTF-8 client is
+byte-for-byte unaffected. A character with no representation in the target
+encoding raises PostgreSQL's `22P05` untranslatable-character error, with the
+same message text a real server emits. `SET client_encoding` (and
+`set_config('client_encoding', …)`) now validates the name against
+PostgreSQL's encoding table — an unknown name is `22023`, `MULE_INTERNAL` is
+`0A000` — stores the canonical spelling, and reports it via `ParameterStatus`
+only once output genuinely respects it.
+
+The encoding is honoured on the way in as well. The query text itself — a
+literal `select 'café €'` or an alias `as "prix €"` typed by a LATIN9 client —
+used to be decoded as UTF-8 and reach the planner as U+FFFD mojibake, because
+the wire library discarded the original bytes before the server saw them. The
+vendored `pgwire` now keeps the raw `Query` / `Parse` bytes and lets the
+server decode them in the session encoding, and RowDescription column names
+travel back in that encoding too. A `client_encoding` in the startup packet
+(libpq's `PGCLIENTENCODING`, psycopg's `client_encoding=` option) is applied
+before the first query and re-reported under its canonical name; an unknown
+one fails the connection with PostgreSQL's FATAL `22023`.
+
+#### Added
+
+- `crates/secantus-pgserver/src/encoding.rs`: client-encoding name
+  canonicalisation (PostgreSQL's `clean_encoding_name` rules plus the
+  `ISO-8859-N` / `UNICODE` aliases) and LATIN1 / LATIN9 byte transcoding, with
+  unit tests.
+
+#### Fixed
+
+- `crates/secantus-pgserver/src/lib.rs`: track `client_encoding` per session
+  from `SET` / `set_config` / (validated, canonicalised); transcode text output
+  in `encode_field_value` and COPY-OUT text, decode text parameters in
+  `decode_parameter`, and report `client_encoding` via `ParameterStatus` now
+  that output honours it.
+- `crates/secantus-pgserver/src/lib.rs`: decode the simple-query and `Parse`
+  SQL text in the session `client_encoding` (`decode_query_text`), send
+  RowDescription column names in it (`transcoded_name`), and apply a startup
+  `client_encoding` parameter in `post_startup`. `SHOW <guc>` no longer holds
+  the settings lock while building its result column (a deadlock once that
+  column name went through the encoding lookup).
+- `crates/vendor/pgwire`: `Query` / `Parse` carry `query_raw` (the undecoded
+  C-string bytes) and both query handlers gain a `decode_query_text` hook;
+  `FieldInfo` / `FieldDescription` gain `name_raw` so a handler can send a
+  column name in a non-UTF-8 client encoding. The `cursor` example is updated
+  for the earlier `parameter_oids` patch.
+- `crates/secantus-pgserver/src/lib.rs`: `json` and `jsonb` gain their
+  PostgreSQL binary wire form (the text verbatim; jsonb behind its one-byte
+  format version), transcoded to the client encoding like text. Before this a
+  binary-format `COPY ... TO STDOUT` of a json column failed with `22P03`
+  after the CopyOutResponse had gone out, which psycopg reported as "you
+  cannot mix COPY with other operations". A binary-format json / jsonb
+  PARAMETER now takes the same cast as a text one, so a jsonb sent as
+  psycopg's ASCII-escaped dump is normalised to the character rather than
+  stored escaped.
+
+### `$strLenCP` measured a JavaScript value, and the `$to*` family parsed one
+
+`bson.Code` subclasses `str`. A previous fix addressed the surfaces that NAME a
+type — `$type` and the shared type-name helper — and stopped there. Naming a
+type correctly and DISPATCHING on it correctly are different things, and the
+operators that *consume* a string still admitted a JavaScript value:
+
+- `$strLenBytes`, `$strLenCP` and `$binarySize` returned **3** — the length of
+  `x=1` — where mongod refuses the argument outright. Wrong values, not wrong
+  messages. Each already had an error branch naming the type correctly; the
+  guard `isinstance(s, str)` meant it was never reached.
+- `$toInt` / `$toLong` / `$toDouble` / `$toDecimal` / `$toDate` / `$toObjectId`
+  fed the JavaScript source text to string *parsers*, so `$toInt` complained
+  "Did not consume whole string" and `$toDate` tried to read `x=1` as a date,
+  where mongod answers `241 Unsupported conversion from javascript to <target>`.
+
+`$toString` had been fixed for `Code` already — at one site, with the type name
+hardcoded as the literal `"javascript"`. That is the second one-site fix for
+this root cause, and it is why a scoped `Code` was still misnamed there.
+
+**`$toBool` is the measured exception.** `{$toBool: Code("x=1")}` is `true` on
+mongod; every other target refuses. A single uniform "reject Code in $convert"
+guard would have been simpler, wrong, and would have looked correct against
+seven of the eight targets. All eight were probed (8.2.11, 2026-09-04/05)
+rather than assumed.
+
+Against mongod the probe goes from 31 wrong codes and 148 message differences
+to **28 and 142** — exactly the nine attributable to this cause. The three
+`Code` cases that remain (`$ifNull`, `$rand`, `$setEquals`) are stage-wrapper
+differences that diverge for any value.
+
+The Rust engine was already correct on all eleven: its `Bson` enum has a
+distinct `JavaScriptCode` variant, so the subclass trap cannot occur there.
+
+#### Fixed
+
+- `expressions.py`: `$strLenBytes` / `$strLenCP` / `$binarySize` test
+  `is_bson_string`; the five non-bool arms of `_convert_value` do too, so a
+  `Code` falls through to the ConversionFailure the function already raised;
+  `$toString`'s rejection derives the type name instead of hardcoding it.
+
+#### Changed
+
+- `tests/test_bson_code_type_and_signed_zero.py`: 22 more cases covering both
+  surfaces, scoped and unscoped, including the `$toBool` exception and why the
+  fix is per-arm.
+
+### `$type` called JavaScript a string, and signed zero was dropped by five operators
+
+Six defects, found by classifying the wrong-value bucket of
+`tools/probes/agg_expressions.py` instead of trusting the backlog's summary of
+it. That summary said "5 wrong values, all a documented `Decimal128` precision
+limitation"; the probe reported 24, so nineteen were uncharacterised.
+
+**`bson.Code` read as a string.** `Code` subclasses `str`, so anything
+dispatching on `isinstance(v, str)` classifies a JavaScript value as a string.
+`expressions._type_name` was a FOURTH partial copy of mongod's type vocabulary
+— the exact drift `bsontypes.py` was created to end — and it had the two bugs a
+hand-rolled copy gets: `$type` of a `Code` answered `"string"`, and a compiled
+pattern answered `"object"`. It is now deleted and delegated.
+
+**A scoped `Code` is a different BSON type.** `Code("x", {})` is type 15,
+`javascriptWithScope`, not type 13. The query language already drew this line;
+the shared helper did not, so every error message naming a scoped `Code`'s type
+was wrong. That one change closed 25 message divergences.
+
+**Signed zero.** IEEE keeps the sign when a rounding lands on zero, and mongod
+does too. `math.ceil` returns an `int`, which has no `-0.0`, so
+`$ceil` / `$floor` / `$trunc` answered `0.0` where mongod answers `-0.0` — and
+more than the probe showed, since its corpus held only a literal `-0.0` while
+`-0.5` is an ordinary input that was equally wrong.
+
+**The accumulator asymmetry.** `$add` / `$sum` / `$avg` fold from a ZERO
+accumulator, so `+0 + -0` makes a lone `-0` come back POSITIVE; `$multiply`
+folds from ONE and keeps the sign. Both engines returned `-0.0` from
+`{$add: [-0.0]}`, and the Rust shortcut justified itself with a comment citing
+the Python engine rather than the server. Neither `$add` bug was in the probe's
+list — both were found by re-probing the neighbouring operators after the first
+hit.
+
+Against mongod 8.2.11 the probe goes from 24 wrong values and 173 message
+differences to **20 and 148**. All 20 remaining are the documented
+`Decimal128`-computed-in-`float` limitation, which is what the backlog now says.
+
+#### Fixed
+
+- `expressions.py`: `_type_name` delegates to `bsontypes.bson_type_name`;
+  `$ceil` / `$floor` / `$trunc` keep IEEE signed zero; `$add` and `$avg` fold
+  from a zero accumulator.
+- `bsontypes.py`: a `Code` carrying a scope is `javascriptWithScope`.
+- `crates/secantus-core`: the `$add` single-operand shortcut folds instead of
+  returning the operand unchanged.
+
+#### Changed
+
+- `tests/test_rust_expressions_parity.py`: `_same` distinguishes signed zeros
+  and recurses into arrays and documents, and all sixteen assertion sites go
+  through it — twelve used a bare `==`, under which `-0.0 == 0.0`. The suite had
+  `-0.0` in its fuzz pool and exercised `$ceil` 5,000 times a run without ever
+  being able to see the difference. The remaining seven parity files still
+  compare with `==`; filed in `tasks/backlog.md` §7.
+
+### Collated sorting now orders the way MongoDB orders
+
+Collation was implemented for *matching* and only for matching. Each string was
+folded down to a single value, and anything the fold did not distinguish fell
+back to comparing whole codepoints — so a collated sort put every accented word
+after `z` instead of beside its base letter, had no tertiary case order at all,
+and accepted `caseFirst`, `backwards` and `numericOrdering` while ignoring them.
+Sorting `["a", "á", "ä", "az", "b"]` under `{locale: "en"}` gave `a az b á ä`
+where MongoDB gives `a á ä az b`.
+
+Sorting is a different problem from matching, and it now has its own key: three
+levels in the shape ICU uses. The primary level is the base letters with accents
+removed and case folded (or split into digit runs when `numericOrdering` is on,
+so `a2` sorts before `a10`). The secondary level is the accents, one entry per
+base character, weighted by an order measured against MongoDB rather than by
+codepoint — acute sorts before grave even though the codepoints run the other
+way — and reversed when `backwards` is set, which is what makes French `cote <
+côte < coté`. The tertiary level is case, flipped by `caseFirst`. `strength`
+truncates the key and `caseLevel` re-adds the case rank.
+
+Measuring it turned up something worse than wrong order: a collated sort
+returned a **different** order depending on whether a collated index existed,
+because the index's byte order is the single-level normalisation and could never
+express the levels. The index is still used to fetch — `explain` still reports
+IXSCAN and the scan stays narrow — but it no longer counts as having satisfied
+the sort. An index must change speed, never results.
+
+Seventeen of nineteen cases in the new sweep now match MongoDB 8.2.11 exactly.
+The two that do not are locale-specific: Swedish sorts `ä` after `z` and Danish
+sorts `å` last, which is CLDR data rather than something decomposition can
+derive, and needs an ICU dependency.
+
+#### Fixed
+
+- `collation.py`: `sort_levels` builds the three-level ordering key; `Collation`
+  gained `caseFirst` and `backwards`.
+- `ordering.py`: `sort_docs` takes a collation and uses it for string
+  comparison.
+- `storage.py`: `find_matching` sorts with the query's collation, and no longer
+  treats a collated index walk as already sorted.
+- `aggregate.py`: the `$sort` stage sorts with the pipeline's collation.
+
+#### Added
+
+- `tools/probes/collation_order.py`: the standing sweep, run with and without a
+  collated index so the two can never diverge again.
+
+### Invalid `collation` specs are rejected instead of silently ignored
+
+Every malformed collation spec was accepted: a missing `locale`, `strength: 9`,
+`strength: "x"`, a misspelled field name. The query then ran under a *different*
+collation than the caller asked for and reported success — so a typo in a
+collation silently changed which documents matched.
+
+#### Fixed
+
+- `find`, `aggregate`, `count`, `distinct` and `findAndModify` now validate the
+  collation spec's contents, matching mongod 8.2.11 exactly across 28 spec
+  shapes: a required `locale` (an explicit `null` counts as missing, 40414),
+  its type, `strength`'s type and range, strict-bool `caseLevel` /
+  `normalization` / `numericOrdering` / `backwards`, the `caseFirst` /
+  `alternate` / `maxVariable` enumerations, and unknown fields (40415).
+
+  The rules are not symmetric and each was probed rather than inferred: an
+  empty `{}` is accepted while `{strength: 2}` is not; `strength: 0` is an
+  *enumeration* error where `6` is a *range* error; `strength: 2.5` is accepted
+  but `strength: true` is not; and `backwards` uses a different wrong-type
+  message from the boolean fields beside it.
+
+- `update` and `delete` deliberately still accept **any** spec contents,
+  because mongod does — validating them for consistency would reject specs a
+  real server runs.
+
+#### Known gaps
+
+Collation *matching* is correct at every strength; collation **ordering** is
+not ICU — accents sort after `z` rather than beside their base letter, and
+`caseFirst`, `numericOrdering`, `backwards` and locale-specific rules are
+ignored. An invalid `locale` name is also still accepted. Both are measured and
+recorded in `tasks/backlog.md` §5, with the reason each was left rather than
+approximated.
+
+### The Rust PostgreSQL server reports column precision, scale and size
+
+`cursor.description` on the Rust `secantusd-pg` server left `precision`, `scale`,
+`display_size` and `internal_size` blank (or, for `internal_size`, a bogus `0`)
+for every column. psycopg derives those four attributes from two fields the
+server sends in each `RowDescription` — the type modifier (`atttypmod`) and the
+fixed byte width (`typlen`) — and the server was sending the pgwire defaults
+(`type_modifier = -1`, `type_size = 0`) for all of them. So a `numeric(10,2)`
+column reported no precision, a `varchar(42)` no display size, and an `int4` an
+internal size of `0` rather than `4`.
+
+The server now emits the real `typlen` for every wire type from a per-type table
+(`int4` -> 4, `time` -> 8, `timetz` -> 12, `interval` -> 16, every varlena type
+-> -1), and threads the declared modifier of a `select null::type(mod)` cast
+through to the wire: `numeric(p,s)`, `varchar(n)` / `char(n)`, `bit(n)` /
+`varbit(n)`, and `time` / `timestamp` / `interval` precision are all encoded
+exactly as PostgreSQL encodes them (measured field-for-field against PostgreSQL
+16). `bit` and `varbit` also now carry their own oids (1560 / 1562) instead of
+falling through to `varchar`. This is description metadata only — no value is
+decoded any differently.
+
+The whole of psycopg's `test_column.py` now passes against the Rust server (53
+of 53, up from 7); the fix clears all 46 previously-failing cases, including the
+30 `test_details` and 15 `test_details_time` parametrisations.
+
+#### Fixed
+
+- `secantus-pgserver`: `RowDescription` now sends a per-type `typlen`
+  (`type_size`) and a declared `atttypmod` (`type_modifier`); `bit` / `varbit`
+  map to their own oids.
+- `secantus-pgplan`: a `::type(mod)` cast in a constant SELECT carries its type
+  modifier through to the column description.
+
+### Wrong-typed command arguments are parse errors, not crashes
+
+Twice in one session a caller-supplied scalar reached code that assumed a
+document and crashed as `internal server error`: `pipeline: [42]` called `len()`
+on an int, `update: 5` called `.keys()` on one. Sweeping that shape across every
+document-valued command argument showed the pattern was systemic — **45 of 56
+probed argument slots crashed**, where mongod returns a parse error.
+
+A crash is worse than a wrong answer here: the client learns nothing about what
+it got wrong, and a bare `internal server error` is indistinguishable from a
+genuine server fault.
+
+#### Fixed
+
+Wrong-typed arguments now return mongod's parse errors, matching its per-command
+message families rather than one blanket check:
+
+- `find` — `filter` / `sort` / `projection` return
+  `Expected field filterto be of type object` (mongod's own missing space,
+  reproduced deliberately).
+- `count.query`, `distinct.query`, `delete.deletes.q`, `update.updates.q`,
+  `findAndModify.query` / `.sort` / `.fields` return
+  `BSON field '<path>' is the wrong type '<type>', expected type 'object'`.
+- `aggregate.pipeline` returns `'pipeline' option must be specified as an array`.
+- `update`'s `u` accepts an object *or* an array: a scalar is `9 FailedToParse`
+  (`Update argument must be either an object or an array`), while an array of
+  non-documents gets the pipeline-element error (14), since an array `u` is a
+  pipeline.
+
+Verified 56/56 against mongod 6.0.16 — the version the live differential gate
+spawns — and cross-checked identical on 8.3.4.
+
+### Comparison operators accept every BSON type
+
+`$cmp` / `$gt` / `$gte` / `$lt` / `$lte` / `$eq` / `$ne` — and `$expr`, which
+routes through them — were gated on the Rust engine's `order::is_sortable`. That
+predicate guards the **sort** engines, where a type lacking a transitive
+same-type arm would corrupt an ordering, and it deliberately excludes NaN,
+Binary, Timestamp, Regex, JavaScript and Min/MaxKey.
+
+A single comparison needs no transitivity, and mongod compares every BSON type
+by its canonical rank. Gating on the narrow predicate turned each of those types
+into `2 … not supported by the Rust server`, so **one `BinData` document made an
+entire `$expr` query fail**.
+
+Measured against mongod 8.2.11 over 19 value classes × 3 operands × 7 operators:
+**120 of 399 cells diverged**, now 0.
+
+#### Fixed
+
+- The comparison operators use a new `order::is_comparable`, which admits every
+  type `order::cmp` ranks. `is_sortable` is unchanged, so the sort engines keep
+  their narrower guarantee.
+- **`order::cmp` placed NaN *equal* to every other number.** mongod ranks it
+  below them — `{$cmp: [NaN, 5]}` is `-1` — and this project's own storage sort
+  already did, so the comparison operators and the sort disagreed with each
+  other. A unit test had pinned the `Equal` behaviour; it asserted Python's
+  `<`-is-false-both-ways rather than anything measured.
+- `order::cmp` gained the missing same-type arms for JavaScript code, which
+  previously fell through to the numeric branch and compared equal.
+
+The Python server was already correct here — its `_bson_lt` covers the wider set
+— so this was a Rust-only gap, and it was found by sweeping the Rust server
+against mongod rather than against the other engine.
+
+### Composite field selection and NULL-blind composite equality on the Rust PostgreSQL server
+
+The Rust PostgreSQL server (`secantusd-pg`) now understands `(expr).field` — the
+field-selection syntax psycopg emits when a composite is registered — and it now
+compares composite VALUES the way PostgreSQL does, which is not the same as
+comparing two row constructors. A composite with a NULL field, compared for
+equality against another composite, is equal when their NULL fields line up;
+only a bare `ROW(...) = ROW(...)` keeps SQL's three-valued rule where a NULL
+makes the result NULL. Composite fields that are themselves composites compare
+by the same rule, recursively.
+
+Together these close the composite-planner half of psycopg's `test_composite.py`
+gauge: field selection (`(mycol).foo`, `(ROW(1,2)).f1`), composite `=`/`<>`/`<`
+with NULL fields, and comparison of nested records all now match a real
+PostgreSQL 16 oracle. What remains — binary anonymous-record result encoding and
+reserved-keyword quoting in `regtype::text` output — is tracked in the backlog;
+neither is a planner-comparison gap.
+
+#### Added
+
+- `secantus-pgplan`: `(expr).field` field selection (`AIndirection`) in the
+  scalar expression evaluator and the const-column projection allow-list. A
+  named composite resolves the field name through its declared field list (and
+  reports the field's declared type in the row description); an anonymous record
+  names its fields `f1`, `f2`, … by position. A field of a NULL composite is
+  NULL; an unknown field is `42703`, with PostgreSQL's own message
+  (`column "x" not found in data type t` / `could not identify column "x" in
+  record data type`).
+
+#### Fixed
+
+- `secantus-pgplan`: `record_compare` now takes the operand kind into account.
+  Comparing composite VALUES treats two NULL fields as equal and a NULL as
+  sorting larger than any non-NULL (so the result is always true/false), while a
+  bare row constructor keeps the three-valued NULL rule. The row-constructor case
+  is detected from the AST (`N::RowExpr` on both sides) in the expression
+  evaluator; every other record comparison is a value comparison.
+- `secantus-pgplan`: `record_compare` recurses into a field that is itself a
+  record, so comparing composites whose fields are composites (`ce2 = ce2`) no
+  longer fails with "comparing document with document using =".
+
+### Composite values in the binary wire format, and arrays of composites
+
+The Rust PostgreSQL server (`secantusd-pg`) now hands a composite value back the
+way PostgreSQL does when a client asks for it in binary. A `SELECT
+row('hi', 10, 20)::mytype` on a binary cursor used to come back as the text
+`(hi,10,20)` — every field a string — because the composite had no binary
+encoder. It now goes out in PostgreSQL's binary record format (a field count,
+then each field's oid, length and bytes), so psycopg's binary composite loader
+decodes each field to its real Python type: the `float8` is a `float`, the
+`int8` an `int`. Nested composites recurse, so a composite whose field is itself
+a composite round-trips in binary too.
+
+An array of composites — `SELECT array[row('hi', 10, 30)::mytype]` — now reports
+the composite's array oid rather than falling back to varchar. Before, the whole
+array arrived as the 17-character string `{"(hi,10,30)"}`; now a registered
+client parses it into a one-element list of composites, in both the text and the
+binary wire formats.
+
+#### Added
+
+- `secantus-pgserver`: composite / composite-array binary result encoding
+  (`encode_binary` / `element_binary` / a new `record_binary` helper) and a
+  composite ARRAY arm in `user_wire_type` reporting the derived `typarray` oid.
+  Composite wire types now carry `Kind::Composite` with their declared field
+  types, so the binary encoder knows each field's oid.
+
+#### Fixed
+
+- `secantus-pgserver`: a composite-array result in a TEXT cursor was
+  double-escaped (its element oid is a user oid the generic array path does not
+  know, so it hit the catch-all) — it now renders each element's `(...)` text
+  and escapes once, matching PostgreSQL.
+
+### Composite VALUES round-trip on the Rust PostgreSQL server
+
+With `CompositeInfo.fetch` already reading the catalog, the Rust PostgreSQL
+server can now round-trip a composite VALUE on the wire. A `'(1,x)'::testcomp`
+text cast and a `row(1,'x')::testcomp` record cast — the first used to answer
+`invalid input value for enum testcomp`, the second `a record cast to testcomp
+is not supported yet` — both parse into a composite datum whose result column
+carries the composite type's own oid, so psycopg's `register_composite` loader
+fires and hands back the registered namedtuple. A composite param cast on the
+wire (`%s::testcomp`), an `INSERT`/`SELECT` through a column of the composite
+type, and an array of composites all round-trip, with field escaping (NULL, the
+empty string, and fields carrying commas, quotes, backslashes, parentheses or
+whitespace) matching PostgreSQL exactly across all 255 single-byte characters.
+
+On psycopg's own composite test suite this moves the Rust server from 25 to 45
+of 79 passing. The remaining families — the composite BINARY wire format, a
+composite parameter typed with its own oid (rather than explicitly cast),
+`pg_typeof` / field access of such a parameter, and per-element loading of an
+array of composites — are tracked in `tasks/backlog.md`.
+
+#### Added
+
+- `secantus-pgplan`: a composite arm in `cast_value` that parses PostgreSQL
+  composite TEXT (`parse_composite_text`) or coerces a record's fields into a
+  composite value (`composite_value`), plus a `PLAN_USER_COMPOSITES` thread-local
+  (`set_user_composites` / `user_composite` / `user_composite_oid`) carrying each
+  composite's field metadata to the planner.
+- `secantus-pgserver`: `install_user_types` now pushes composite field metadata,
+  and `user_wire_type` reports a composite result column under its own oid so a
+  client that ran `register_composite` decodes it.
+
+#### Fixed
+
+- `secantus-pgplan`: an array element that is a record / composite now renders as
+  its `(...)` text instead of leaking Rust's `{:?}` debug form
+  (`{"Document({...})"}`) into the array literal.
+
+### `find` evaluates a computed projection field, instead of dropping it
+
+`find({}, {total: {$multiply: ["$price", "$qty"]}})` returned documents with no
+`total` in them — and reported success. The client asked for a computed field,
+was told `ok: 1`, and got documents without it.
+
+Computed projections are now evaluated per document. Almost every rule involved
+had to be measured against a real server rather than reasoned about, and the
+ones that were reasoned about first were all wrong:
+
+- **Only a BSON number or bool is an include/exclude flag.** A string, `null`,
+  an array, a date, an ObjectId, BinData, a regex, a Timestamp, MinKey/MaxKey
+  are *literal constants* that replace the field on every document.
+  `Decimal128("1.5")` includes a field and `Decimal128("0")` excludes one —
+  `bool()` of either is `True` in Python, so the obvious test is backwards.
+- **A plain sub-document is a sub-projection, classified per leaf.**
+  `{o: {p: 1, z: "$b"}}` returns the *stored* `o.p` alongside the computed
+  `o.z`, so the sub-document cannot be classified as a whole.
+- **A computed `_id` replaces the stored one and moves to the end**:
+  `{_id: "$b", a: 1}` gives `{a: …, _id: …}`.
+- A bare field **reference** that resolves to nothing **omits** the output
+  field, while an **expression** over a missing field yields **null**.
+- An evaluation failure is an execution-time error carrying the namespace, the
+  way mongod reports a per-document failure: `$size` on a non-array is
+  `Executor error during find command: <db>.<coll> :: caused by :: …`.
+
+Mixing a computed field with an exclusion has **three** different errors,
+picked by the first offending field in spec order: `31253` for an inclusion
+flag, `31310` for a literal (with the value rendered as a BSON debug string,
+`n: [ 1, 2 ]`), and `31252` for an operator expression. Swapping two fields in
+the spec swaps which code comes back. An empty sub-document is its own error,
+`51270`, naming the leaf.
+
+A test in `tests/test_projection.py` asserted that `{_id: None}` and `{_id: ""}`
+were *includes*, under a docstring reading "Oracle-pinned against real mongod".
+Nothing in that file can reach a mongod, so the claim had never been run — the
+server returns the constant. Corrected in place. The Rust engine carried the
+same wrong rule, with the same comment, and the projection parity suite had been
+green throughout because the two engines agreed with each other on the wrong
+answer — the "parity is not correctness" shape, caught here by the parity suite
+turning red only *after* the Python side was corrected.
+
+Unchanged, and deliberately: the Rust server still answers `2 BadValue:
+projection is not supported by the Rust server`. Refusing is the better of the
+two behaviours when the feature is absent, and the two servers are now
+honest-refusal versus correct rather than honest-refusal versus silently wrong.
+The Rust half is filed with the same measured semantics.
+
+#### Fixed
+
+- `secantus.projection`: an expression-valued projection field is evaluated per
+  document; the spec is flattened to dotted leaves so a sub-document is
+  classified per leaf and errors name the field mongod names; the flag/literal
+  split follows the BSON type rather than Python truthiness.
+- `secantus-core`'s projection engine defers a non-numeric `_id` spec value
+  instead of returning the stored `_id`, so the two engines agree on mongod's
+  answer rather than on each other's.
+- `secantus.commands`: a computed projection's evaluation failure is wrapped as
+  `Executor error during find command: <ns> :: caused by :: …`, which needs the
+  namespace only this layer knows.
+
+### The Rust PostgreSQL server terminates and aborts like a real backend
+
+The Rust `secantusd-pg` server now speaks the connection-lifecycle side of the
+wire protocol the way a real PostgreSQL backend does: it can tell you its own
+process ID, terminate a backend, and — crucially — surface the failure of a
+statement inside a transaction so that the block is poisoned until it ends. A
+`pymongo`-style permissive client never noticed the gaps here, but `psycopg`
+does, and five of its `test_connection.py` lifecycle checks now pass against the
+Rust server.
+
+`pg_terminate_backend(pid)` behaves as it should on both sides of a connection.
+Called on your own backend it ends the connection with a FATAL `57P01`
+(`AdminShutdown`) and closes the socket, so the client learns the connection is
+gone rather than believing it is still usable — a distinction that only shows up
+over the simple query protocol, where PostgreSQL sends no `ReadyForQuery` after a
+FATAL. Called on another backend it arms a flag that the victim notices at its
+next statement and ends with the same `57P01`; terminating a PID that is not a
+live backend returns `false`. `pg_backend_pid()` reports the PID pgwire assigned
+during startup.
+
+The other half is the aborted-transaction rule. A statement that fails inside a
+transaction — whether it fails while the simple protocol splits it or while the
+extended protocol describes it — now poisons the block, so every later statement
+gets `25P02` (`InFailedSqlTransaction`) until `COMMIT`/`ROLLBACK`, and a `COMMIT`
+of a failed block rolls back. Previously the failure went unrecorded and the
+aborted block kept accepting commands.
+
+#### Added
+
+- `crates/secantus-pgplan` / `crates/secantus-pgserver`: `pg_backend_pid()` and
+  `pg_terminate_backend(pid)` (self- and cross-connection), resolved from
+  per-connection state through two new `ConstCol` variants and a process-wide
+  backend registry.
+
+#### Fixed
+
+- `crates/secantus-pgserver`: an error inside a transaction now poisons the
+  block from every path that can raise it — the simple protocol's statement
+  split and the extended protocol's `Describe`, not only `Execute` — so the next
+  statement correctly gets `25P02`.
+- `crates/secantus-pgserver`: a FATAL error over the simple query protocol now
+  closes the socket without a trailing `ReadyForQuery`, so the client sees the
+  connection break instead of thinking it is still open.
+
+### An error in a constant expression says so — `Failed to optimize pipeline`, not `Executor error`
+
+mongod carries an expression error under one of two prefixes, chosen by **when**
+it failed. A **constant** expression is folded at optimization time and reports
+`Failed to optimize pipeline :: caused by ::`; one that reads the document fails
+per document under `Executor error during aggregate command on namespace: … ::
+caused by ::`.
+
+Both servers always used the executor form. That was **618 of the Python
+server's message-only differences and 148 of the Rust server's** — the single
+largest item left in the expression sweep, and a plan entry deferred three times
+as "modelling constant folding".
+
+#### The rule, measured
+
+It is statically decidable, which is what made this cheap. Probed on mongod
+8.2.11, the predicate is simply *does the expression read the document*:
+
+| folds | does not fold |
+|---|---|
+| literals, `$literal` | a field path (`$s`) |
+| `$$NOW`, `$$CLUSTER_TIME` | `$$ROOT`, `$$CURRENT` |
+| the command's own `let` values | a variable bound from the input (`$$this` in `$map`) |
+| `$let` whose bindings are constant | `$let` bound from a field |
+| nested constants | `$rand` |
+
+#### Fixed
+
+Both servers now fold constant sub-expressions before running the pipeline —
+which is what mongod's optimizer does — and report an error in one under its own
+prefix. Python's message-only differences fall **669 → 143**, and the Rust
+server's **148 → 4**.
+
+The predicate is conservative: anything unrecognised counts as non-constant,
+which keeps the previous behaviour rather than risking the wrong prefix.
+
+Two stages are deliberately not folded, both found by the differential gate:
+
+- **`$switch`** folds to a *different error* than it raises at execution — 40069
+  `Cannot execute a switch statement where all the cases evaluate to false
+  without a default`, not 40066 — and a dedicated path already models that.
+  Folding it here reported the execution-time error under the optimization-time
+  prefix, which is neither answer.
+- **`$redact`**, whose decision variables are bound by the stage itself with
+  marker values the folding evaluator does not hold; it reads the document
+  anyway, so there is nothing to fold.
+
+#### What is left of the message-only residue
+
+The remaining 143 on Python are a different family: **number rendering inside
+the message**. mongod prints `1.09951e+12` where we print `1099511627776`, and
+`0` where we print `0.0`. Recorded.
+
+17 cases added to `tests/test_mongod_differential.py`, each a pair — the same
+error reached both ways, so the two prefixes are pinned against each other.
+
+### `$convert` and the `$toX` operators now agree with MongoDB on 480 shapes
+
+`$toInt: " 5 "` returned `5`. Python's `int()` strips surrounding whitespace and
+accepts PEP-515 underscores, so `"1_0"` became `10` — MongoDB's parser accepts
+neither, and both are wrong *values*, not wrong messages. `$toDate: 1` returned
+an epoch date where MongoDB refuses an int32 outright, and `$convert` of an
+empty string to `bool` returned `false` where every BSON string is true. And
+`Decimal128("Infinity")` to an integer target reached `int(Decimal("Infinity"))`,
+whose `OverflowError` escaped the handler and reached the client as
+`1 internal server error`.
+
+Underneath all of it was the same shape: two implementations of one conversion.
+`$toInt` / `$toLong` / `$toDouble` / `$toDecimal` each carried their own copy of
+the logic alongside `$convert`'s, and the copies had drifted — different
+overflow messages, different unsupported-type errors, and none of them knew
+MongoDB separates NaN from infinity from merely out of range. The shorthands now
+delegate to `$convert`, so they cannot drift again.
+
+String parsing is strict and reports MongoDB's reason for refusing: `No digits`,
+`Did not consume whole string.`, `Overflow`, `Leading whitespace`, `Empty
+string`, `Did not consume any digits`, `Failed to parse string to decimal` —
+which are not the same set for integers, doubles and decimals, and are not
+interchangeable. Hexadecimal input gets MongoDB's other message shape entirely.
+`$toObjectId`, which did not exist, now does. And the conversion shorthands
+accept the single-element array form (`{$toInt: ["$field"]}` — the way a field
+reference is naturally written) with MongoDB's own wrong-arity error for
+anything else.
+
+A sweep of 480 `$convert` and `$toX` shapes plus 51 date and objectId shapes
+against MongoDB 8.2.11 is now at zero divergences.
+
+#### Fixed
+
+- `expressions.py`: strict string→number parsing with MongoDB's per-target
+  reasons; NaN / infinity / overflow separated; unsupported source types answer
+  `ConversionFailure` naming both ends; `$toString` uses BSON spellings
+  (`true`, `Infinity`, `NaN`); every string converts to `true`.
+- `expressions.py`: `to: "date"` accepts a long / double / decimal / ObjectId /
+  Timestamp and rejects an int32, and returns a naive UTC datetime that compares
+  with a stored date instead of raising `TypeError` against one.
+- `expressions.py`: the four `$toX` numeric shorthands delegate to `$convert`.
+
+#### Added
+
+- `expressions.py`: the `$toObjectId` operator, which did not exist.
+- `expressions.py`: `$stdDevPop` and `$stdDevSamp` in EXPRESSION position — over
+  an array argument in `$project` / `$addFields`. The accumulator forms shipped
+  long ago; the expression forms answered `Unknown expression`. They share the
+  accumulator's fold, so the two forms cannot disagree. Found by the same sweep,
+  which also confirmed that most of the "missing operators" list in
+  `docs/feature-comparison.md` had quietly started working.
+
+#### Fixed (Rust engine, to keep the two in step)
+
+- `secantus-core`: `$convert: {to: "bool"}` returns true for every string. The
+  `$toBool` shorthand already did — the two copies had drifted *inside one
+  engine*, the same shape as the Python split this change collapses.
+- `secantus-core`: `to: "date"` refuses an int32, matching MongoDB; it used to
+  read one as epoch milliseconds.
+
+### COPY BINARY on the Rust PostgreSQL server encodes real binary, not text bytes
+
+The Rust `secantusd-pg` server accepted `COPY ... (FORMAT BINARY)` in both
+directions, but on the way *out* it only knew how to write the four types whose
+value happens to encode the same in text and binary — `int4`, `int8`, `float8`,
+`bool`, `text`. Every other column was handed to the binary encoder as its
+PostgreSQL *text* rendering, so a `smallint` went out four bytes wide, a
+`numeric` / `date` / `time` / `timestamp` / `bytea` / array column went out as
+ASCII digits behind a binary length prefix, and a strict client reading the
+stream back mis-parsed it (psycopg's binary array loader read a garbage
+dimension count and raised `DataError`). A round-trip only survived because our
+own decoder read the same wrong bytes back.
+
+COPY binary out now goes through the exact `encode_binary` codec the `SELECT`
+binary path uses — a `DataRowEncoder` over a binary-format schema produces the
+`[i32 len][bytes]` layout a COPY field wants byte-for-byte — extended with the
+three temporal encoders (`date` as an i32 day count, `time` as i64 microseconds
+since midnight, `timestamp` / `timestamptz` as i64 microseconds since 2000). A
+timestamp column's hidden sub-millisecond companion is folded back before
+encoding, so `.ffffff` fractional seconds survive the round-trip. Measured
+against PostgreSQL 16 as the oracle, every common scalar and array type
+(`int2`/`int4`/`int8`, `float4`/`float8`, `bool`, `text`/`varchar`, `numeric`,
+`date`, `time`, `timestamp`, `timestamptz`, `bytea`, and `int4[]` / `float8[]` /
+`text[]`) now emits bytes identical to the real server's.
+
+#### Fixed
+
+- `crates/secantus-pgserver`: `COPY ... TO STDOUT (FORMAT BINARY)` now routes
+  every field through `encode_binary` (the shared SELECT-binary codec) instead
+  of a text fallback, fixing the wire form for `int2`, `float4`, `numeric`,
+  `date`, `time`, `timestamp`, `timestamptz`, `bytea`, and array columns. The
+  psycopg `test_read_rows[*-1]` binary cases (a `float8[]` COPY read) now pass.
+- `crates/secantus-pgserver`: a `timestamp` / `timestamptz` column's `__us_`
+  sub-millisecond companion is reassembled into the value COPY reads, so
+  microsecond-precision timestamps no longer lose their last three digits.
+
+#### Added
+
+- `crates/secantus-pgplan`: `date_to_pg_days`, `time_to_pg_micros`, and
+  `timestamp_bson_to_pg_micros` — the inverses of the existing
+  `render_date_from_pg_days` / `render_time_from_micros` /
+  `render_timestamp_from_pg_micros` decoders, used by the binary COPY encoder.
+
+### The Rust PostgreSQL server closes three COPY gaps
+
+`secantusd-pg` (the Rust PostgreSQL server) gained three fixes that psycopg's
+own `test_copy.py` suite was catching, taking that gauge from 54 failures to 24
+against a live PostgreSQL 14 oracle.
+
+A `serial` column now stores integers. `serial` is a PostgreSQL pseudo-type
+that resolves to `int4`; the catalog was keeping it typed `serial`, so a COPY
+field parsed as text and `40010` came back as the string `"40010"` — the shape
+the whole `test_copy_in_*` cluster hit. `smallserial`/`serial2`,
+`serial`/`serial4`, and `bigserial`/`serial8` now normalise to `int2`/`int4`/
+`int8` at `CREATE TABLE` time. (The implicit sequence default a real `serial`
+carries is still a separate, unimplemented feature.)
+
+`COPY (VALUES ...) TO STDOUT` reads every row. A bare multi-row `VALUES` list
+was planned through the single-row constant path and produced no rows at all, so
+`copy (values (1),(2)) to stdout` returned an empty body; it is now planned as a
+`ValuesConstant` that both COPY and a directly-executed `VALUES` query read.
+
+Text COPY stopped corrupting control characters. The unescaper handled only
+`\t \n \r \\`, so PostgreSQL's `\b`/`\f`/`\v` escapes were read back as literal
+`b`/`f`/`v` — and a second, redundant unescape pass also halved an escaped
+backslash twice, dropping it from a value like `\end`. The path now decodes the
+full `\b \f \n \r \t \v \\` set plus octal (`\ooo`) and hex (`\xHH`) byte
+escapes, over bytes, once. Silent data loss for any text carrying those bytes.
+
+#### Fixed
+
+- `secantus-pgplan`: `serial`/`bigserial`/`smallserial` (and the `serialN`
+  aliases) normalise to their integer type at `CREATE TABLE` time.
+- `secantus-pgplan`: a bare `VALUES (...), (...)` query plans as a new
+  `ValuesConstant` statement instead of an empty single-row constant.
+- `secantus-pgserver`: text COPY unescaping is complete (`\b \f \v`, octal, hex)
+  and no longer runs twice, ending control-character and backslash corruption on
+  COPY FROM; the text COPY-TO encoder escapes `\b \f \v` to match.
+
+### Wrong-typed `createIndexes` and `collMod` options
+
+The second half of the Python server's wrong-type sweep, measured the same way
+against mongod 8.2.11: 97 code divergences down to 37, with every
+`createIndexes.*` and `collMod.*` case now matching mongod byte-for-byte.
+
+#### Fixed
+
+- **`collMod` silently accepted a wrong-typed `validator`,
+  `changeStreamPreAndPostImages` or `viewOn`** — a `viewOn: 5` reached the
+  catalog. All three now answer `14 TypeMismatch` under mongod's IDL path, and
+  all three still accept an explicit `null`.
+- **Wrong-typed per-index options on `createIndexes` were ignored** —
+  `collation`, `partialFilterExpression`, `expireAfterSeconds`, `unique` and
+  `sparse`. These do not use the plain `BSON field '<path>'` form: mongod
+  echoes the offending index spec and appends the reason after
+  `:: caused by ::`, in three distinct shapes (14 for the object slots, 67 for
+  the TTL one, 14 with a different wording for the bool ones). Each is now
+  reproduced verbatim — including the two unbalanced quotes that are mongod's
+  own, and the fact that `unique` / `sparse` accept a double.
+- **`wildcardProjection` reported one error where mongod reports three.** All
+  three arms answered `67 CannotCreateIndex`; mongod answers `14` for a wrong
+  type, `9` for an empty object (with its own wording, "can't be an empty
+  object"), and `2` for a non-wildcard base index. The spec in those messages
+  was also rendered with Python's `repr` (`{'a': 1}`) instead of mongod's
+  shell syntax, and omitted the index name.
+
+#### Added
+
+- `secantus.bsontypes.render_bson`, which renders a value the way mongod
+  echoes it inside an error message — inner spaces on non-empty documents and
+  arrays but not empty ones, unescaped strings, `new Date(<ms>)`,
+  `BinData(0, ABCD)`, `UUID("...")` for subtype 4, `/pattern/flags`,
+  `Timestamp(t, i)`, `MinKey` / `MaxKey`. Every rule probed, not inferred.
+
+### A slow npm registry failed CI where the test harness says it should skip
+
+Every `_ensure_*` helper in the cross-driver smokes is documented as returning
+`False` when its toolchain cannot be provisioned — offline, no registry, a cold
+cache — so that the smoke needing it **skips**. They only ever checked the exit
+code, while `_run` passes `timeout` straight to `subprocess.run`, which
+**raises** `TimeoutExpired`. So a registry that merely responded slowly failed
+the build, which is not what any of those helpers claim to do.
+
+Four CI shards went red on `npm install` exceeding its 300s budget, across two
+test files and both Linux and macOS, on a commit that touched nothing near
+them. A rerun cleared three and not the fourth — it is not a coin-flip flake,
+the macOS runner is simply slower than the budget.
+
+Provisioning subprocesses now go through `_run_provision`, which reports a
+timeout the same way it reports a non-zero exit: no usable toolchain right now.
+This is deliberately **not** folded into `_run` — inside a test body a timeout
+is a real failure and stays one. All eight call sites are inside `_ensure_*`
+helpers; no test body changed.
+
+#### Fixed
+
+- `tests/test_cross_driver_features.py`, `tests/test_geo_cross_driver.py`:
+  `_run_provision` returns `None` on timeout, and every provisioning helper
+  treats that as "toolchain unavailable" and skips.
+
+### Malformed cursor arguments crashed the server instead of being rejected
+
+Phase 2 of `tasks/remaining-work-plan.md`, second surface: 51 cursor /
+`getMore` / `killCursors` shapes run against a live mongod 6.0.16. **22
+diverged, four of them crash-class** — a malformed argument reached a bare
+`int()` and the `ValueError` / `TypeError` escaped as `internal server error`
+(code 1), which is the shape that tells a client nothing and looks like a
+server fault rather than their own bad request.
+
+#### Fixed
+
+- **Four crashes.** `getMore` with a string cursor id or a string `batchSize`,
+  and `killCursors` with a non-array `cursors` or a wrong-typed element, all
+  answered code 1. They now answer mongod's `TypeMismatch` (14) naming the
+  field and both types.
+- **`getMore` answered `CursorNotFound` (43) for parse errors** — for a cursor
+  that existed. A missing `collection` (mongod: `40414`), a non-string one
+  (`14`), an unknown top-level field (`40415`) and an int32 cursor id (`14`;
+  mongod requires a long, the same int64 strictness the Go and C drivers
+  enforce on the reply side) all reported a plausible-looking lie about the
+  cursor instead of the parse error mongod reports before it looks a cursor up.
+- **Negative `batchSize` / `limit` / `skip` were silently accepted** on `find`,
+  `getMore` and `aggregate`'s cursor spec. A negative `batchSize` fell through
+  `or DEFAULT` and quietly became the default; a negative `limit` returned the
+  whole collection. mongod answers `Location51024`, and — unlike the type error
+  on the same slot — names the field bare rather than by its IDL path.
+- **`maxTimeMS` on a getMore for a non-awaitData cursor was accepted and
+  ignored.** It is the awaitData wait budget, so mongod refuses it on a cursor
+  that cannot wait, tailable-but-not-awaitData included (probed both ways).
+  Accepting it hides a client bug: a caller who believes it has bounded a
+  blocking read has bounded nothing.
+- **`aggregate` ran without a `cursor` option**, which mongod requires except
+  with `explain`. A client that forgot the option never learned it had.
+  Unknown keys inside the cursor spec are now `40415` too.
+- **`killCursors` with no `cursors` field returned a cheerful all-empty success
+  reply**; mongod requires the field (`40414`). A `null` element is skipped,
+  and a `null` `cursors` takes mongod's older `Location10065` — both probed
+  rather than assumed.
+- **`awaitData` without `tailable` was accepted** and ran an ordinary find, so
+  a client that asked to block got a plain batch back with no indication its
+  option had been dropped.
+
+The accepted-type matrix is unchanged and was re-verified against mongod while
+adding the range check: int, long, double, decimal and null are all taken, and
+a fractional double truncates toward zero (`batchSize: 2.5` yields two
+documents).
+
+#### Changed
+
+- `tests/test_crud.py::test_tailable_drop_closes_pymongo_cursor_cleanly` no
+  longer calls `max_await_time_ms` on a plain `TAILABLE` cursor. It passed only
+  because we accepted `maxTimeMS` there; the same code against a real mongod
+  raises. pymongo sends the option despite documenting it as ignored for
+  non-await cursors, because its guard is a bitmask test
+  (`_query_flags & CursorType.TAILABLE_AWAIT` is `2 & 6 == 2`, truthy, for a
+  plain `TAILABLE` cursor).
+
+`tests/test_mongod_differential.py` grew 29 cases (93 → 122).
+
+### Cursor round-trip counts now match mongod
+
+A cursor whose result count was an exact multiple of `batchSize` closed one
+`getMore` early. mongod closes a cursor only when it *knows* the result is
+finished — a batch that exactly fills the requested size proves nothing about
+what follows, so mongod keeps the cursor open and the client spends one more
+`getMore` to see an empty batch. SecantusDB buffers the whole result and so could
+close early: fewer round trips, but a count drivers observe directly.
+
+The rule was probed against a real mongod rather than inferred, and it is **not
+uniform across commands**. `find` and `aggregate` keep the cursor open on an
+exact-fill batch; `listIndexes` and `listCollections` close, because they
+enumerate a catalog whose size is known up front. A `find` with `limit` or
+`singleBatch` is bounded again and closes without the extra trip, and a
+`getMore` with no `batchSize` means "server default", where mongod drains and
+closes.
+
+#### Fixed
+
+- `find` and `aggregate` cursors stay open past a batch that exactly drains the
+  result, matching mongod's round-trip count. Verified across 12 shapes against
+  mongod 8.3.4, on both the Python and Rust servers.
+- `limit` / `singleBatch` still close immediately, with no trailing empty batch.
+- `listIndexes` / `listCollections` still close on an exact-fill batch.
+- A `getMore` with a non-positive `batchSize` drains the cursor and closes it.
+
+### The Rust PostgreSQL server exposes `pg_cursors` and constant select-list columns
+
+psycopg's server cursor (`ServerCursor` / `RawServerCursor`) does two things the
+Rust `secantusd-pg` server could not answer. It reads the `pg_cursors` catalog —
+directly, to confirm a cursor is gone after `CLOSE`, and internally as
+`SELECT 1 FROM pg_catalog.pg_cursors WHERE name = ...` before closing a cursor it
+did not declare — and every server-cursor test seeds its rows with a bare
+literal, `SELECT 1 FROM generate_series(...)`. The first raised
+`relation "pg_cursors" does not exist`; the second raised `AConst is not
+supported yet`, because the select-list planner accepted a column, a cast, or a
+scalar call but not a plain constant.
+
+`pg_cursors` is now a virtual catalog table over the connection's open cursors,
+with PostgreSQL's columns (`name`, `statement`, `is_holdable`, `is_binary`,
+`is_scrollable`, `creation_time`); a `CLOSE` removes the row, and a cursor
+declared `NO SCROLL` / `WITH HOLD` / `BINARY` reports it faithfully. A literal in
+the select list — `SELECT 1 FROM t`, over a table or a `generate_series` — is now
+a constant column named `?column?` (or its alias), one value per row, which is
+how a client counts a source's rows through `cursor.rowcount` without reading
+their values.
+
+Measured against psycopg 3's own cursor suite (`test_cursor*.py`), the change
+turns 38 previously-failing cases green, among them `test_context`, `test_close`,
+`test_stolen_cursor_close`, `test_init_params`, `test_rownumber`, and
+`test_scrollable`.
+
+#### Added
+
+- `secantus-pgserver`: a `pg_cursors` virtual catalog table backed by the
+  connection's open-cursor map; `CursorState` now carries the catalog columns,
+  captured at `DECLARE` from the cursor's options.
+- `secantus-pgplan`: a `ColumnExpr::Const` select-list column, planned from an
+  `AConst` target over a table or a `generate_series` source.
+
+### Date operators honour their `timezone`
+
+The backlog carried this as one Rust-only gap in `$dateFromString` that "genuinely needs a timezone database — a dependency decision, not an afternoon's port". Measuring it found all three parts wrong: `chrono-tz` is **already** a dependency with the IANA database bundled (which is why `$hour` with a named zone already worked), it is `$dateFromParts` too, and the sweep turned up **three silent wrong answers on BOTH servers** that the entry never mentioned.
+
+New standing probe `tools/probes/date_timezones.py` — 409 shapes across the whole date family, every zone kind, and both DST directions.
+
+| | Before | After |
+| --- | --- | --- |
+| Python server | 142 divergent | **0** |
+| Rust server | 191 divergent | **0** |
+
+#### Fixed — silent wrong answers
+
+- **`$dateTrunc` ignored `timezone` entirely**, bucketing on UTC boundaries. A daily rollup for `America/New_York` bucketed at 00:00Z instead of 04:00Z, quietly attributing four hours of every day to the wrong bucket. It also binned from year 1 rather than mongod's **2000-01-01** reference, and defaulted weeks to Monday where mongod uses **Sunday**.
+- **`$dateDiff` ignored it too**, and computed "whole units elapsed" where mongod counts **boundary crossings**: 02:00Z→23:00Z is 1 day in New York and 0 in UTC. Both operators now share one bin-index function so they cannot drift apart.
+- **`$dateAdd` / `$dateSubtract` ignored it as well.** A calendar shift moves the *local wall clock*: noon Eastern plus one day is noon Eastern — 23 real hours across a spring-forward — while `+24 hour` is 24. Every calendar shift across a DST boundary was an hour out (30 minutes for `Australia/Lord_Howe`).
+
+Two arithmetics, both mongod's, probed across the 2026-03-08 spring-forward: **calendar** units land on a local wall-clock boundary; **sub-day** units bin by real elapsed time, so `binSize: 5` hours stays 5 real hours apart rather than re-aligning.
+
+#### Fixed — Rust capability
+
+- `$dateFromString` and `$dateFromParts` accept **named IANA zones**. Only the instant→wall-clock direction had been wired up; these two need the reverse, which is now `tz_instant_from_local_ms`.
+- An unusable zone answers mongod's `40485` instead of deferring — which on the standalone server reported the *operator* as unsupported for what is a bad *argument*.
+
+#### Fixed — error surface
+
+- Zone names are **case-sensitive**. `zoneinfo` resolves through the filesystem, so `America/new_york` loaded on macOS and failed on Linux — the answer depended on the host.
+- A literal `timezone` is validated at pipeline **optimization** time, which is where mongod reports it, and `$dateTrunc` / `$dateDiff` name the parameter in the message as mongod does.
+
+### Correction: mongod's decimal transcendentals are largely reproducible after all
+
+An earlier entry concluded from one measurement that mongod is "not correctly
+rounded, so no independent implementation can match it". That was **too strong**,
+and probing further found the actual rule:
+
+- **`$sqrt` is plain correctly-rounded decimal128** — IEEE 754 requires it for
+  square root — and matches on 6 of 6 inputs. Exactly reproducible today, with no
+  dependency.
+- **`$exp` / `$ln` go through binary128**: rounding the true value to a 113-bit
+  significand and converting back to 34 decimal digits reproduces mongod where
+  correct *decimal* rounding does not.
+- It is **not one uniform rule** — across 24 covered pairs the binary128 route
+  matched 20 and missed 4, and the trig/hyperbolic family was not covered.
+
+So there is a real pure-Rust path that needs no C dependency, though it needs a
+high-precision core and per-operator verification. The backlog entry now records
+the rule, the counter-examples, and the exact next step, instead of a blocker
+that was not one.
+
+### Decimal128 transcendentals, measured over 96 pairs instead of guessed
+
+This backlog entry was rewritten three times in one day, and the first two
+rewrites were wrong because each inferred a *mechanism* from four or five data
+points. A 96-pair sweep (12 operators × 8 inputs) settles it:
+
+| rule | pairs |
+| --- | --- |
+| correctly-rounded **decimal128** | **76** |
+| matches a **binary128** round-trip instead | 7 |
+| neither — mongod 1–2 ULP off the correctly-rounded value | 13 |
+
+`$sqrt` and `$asinh` are correctly-rounded decimal on **8 of 8** — IEEE 754
+requires it for square root — so those are exactly reproducible today with no
+dependency. Everything else is mixed.
+
+The strays are real, not harness error; the reference series is stable at 60, 130
+and 190 digits (`sin(2.5)` is 1 ULP low, `tan(2.5)` 2 ULP, `cos(2.5)` exact).
+
+So implementing correctly-rounded decimal transcendentals in pure Rust is a
+legitimate option — ~79% exact, `$sqrt`/`$asinh` fully exact — rather than the
+trap an earlier write-up called it. The alternatives (link Intel RDFP; keep
+refusing) are unchanged.
+
+The sweep is kept as `tools/probes/decimal_transcendental_rule.py` so the next
+session measures rather than re-theorises.
+
+### Decimal128 transcendentals: one of the three options is now ruled out
+
+The previous write-up costed three options for the finite-operand transcendentals
+and flagged "add a pure-Rust decimal crate" as the risky one. A further
+measurement rules it out entirely.
+
+Computing at 60 digits and rounding correctly to 34 matches mongod for `$sqrt`
+and `$exp` — and **does not** for `$ln` or `$log10`:
+
+```
+ln(2.5)    = 0.9162907318741550651835272117680110|714501…
+             correctly rounded → …680111      mongod → …680110   (below)
+
+log10(2.5) = 0.3979400086720376095725222105510139|464636…
+             correctly rounded → …510139      mongod → …510140   (above)
+```
+
+mongod lands *below* the true value for one and *above* it for the other, so it
+is neither correctly rounded nor consistently truncated — it carries Intel RDFP's
+own approximation error. Matching it means reproducing that error, which a more
+accurate library cannot do at any precision.
+
+So the choice is now binary: link Intel RDFP (bit-identical, at the cost of a C
+dependency across five wheel platforms), or keep refusing (today's behaviour).
+The backlog entry records the evidence.
+
+### The last two Rust-server backlog items, measured and decided
+
+Neither is a coding task. Both entries asserted a blocker; probing replaced the
+assertions with data, and in both cases the data changed the conclusion.
+
+**`Decimal128` transcendentals — a decision, not a dependency gap.** The entry
+said this "needs a 34-digit decimal library" and suggested tabling the zero
+column as a cheap partial win. Measured against mongod 8.2.11:
+
+- The **zero column is already done** — 0 divergent of 18, as are all six error
+  cases. There was nothing to win.
+- The library is **not the blocker**. The Python server already has one (stdlib
+  `decimal` at full precision) and still differs from mongod by exactly one unit
+  in the last place on `$ln`, `$log10` and `$sin`, while matching on six others.
+  mongod uses Intel's RDFP, whose transcendental rounding differs from every
+  other implementation in the final digit.
+
+So the real choice is: link Intel RDFP (exact, but a C dependency across five
+wheel platforms), add a pure-Rust decimal crate (cheap, but silently wrong in
+the last digit), or keep refusing. The middle option is the one to resist without
+an explicit decision — it trades a visible refusal for an invisible wrong answer.
+
+**`$toDate` of an unparseable string — won't fix.** mongod's message is
+`timelib`'s re2c scanner talking. Across 25 measured strings there is no small
+rule: `'a1'` errors at position 1 while `'1a'` errors at position 0, `'123'`
+emits one error *per position*, `'junk here'` emits two with a "Double timezone
+specification", and `'2020-01-01X'` **parses** because `X` is the military
+timezone UTC+11. Reproducing it means reproducing the lexer, its timezone
+abbreviation tables and its per-position error accumulation; a partial job would
+emit messages mongod never sends.
+
+Both entries are rewritten with the measurements so the next session inherits
+evidence instead of an assertion.
+
+### The Rust server answers decimal trigonometry instead of refusing it
+
+Ask the Rust server for `{$sin: <Decimal128>}` — or `$cos`, `$tan`, `$asin`,
+`$acos`, `$atan`, `$sinh`, `$cosh`, `$tanh`, `$acosh` — and it used to reply
+"a construct the Rust server does not support". MongoDB returns a number. That
+is the least faithful outcome available, and it covered 108 of 285 measured
+shapes. All ten now answer, sharing the Python engine's results.
+
+Getting there settled a question that had been treated as a matter of taste.
+Compared against a 60-digit reference, **MongoDB is correctly-rounded only about
+78% of the time** for these operators — it carries Intel's decimal-library error
+in the last digit. Exact agreement is therefore capped, and no choice of working
+precision reaches it. What follows is the practical part: being *correct* is the
+closest we can get to MongoDB, because wherever we round correctly our agreement
+equals MongoDB's own accuracy.
+
+That condemned an older strategy in the Python engine, which computed the
+hyperbolics at 34 digits throughout in order to reproduce MongoDB's
+accumulation. It had been adopted on the strength of one `$cosh` case:
+
+| | agreement at 34 digits | computed wide |
+| --- | --- | --- |
+| `$tanh` | 3/20 | **12/20** |
+| `$sinh` | 8/20 | **12/20** |
+| `$acosh` | 12/15 | **14/15** |
+| `$cosh` | 16/20 | 16/20 |
+
+`$cosh` did not even lose, so the case behind the strategy did not support it.
+
+#### Fixed
+
+- **The Rust server implements the whole decimal trig and hyperbolic family.**
+  `sinh` / `cosh` / `tanh` / `acosh` / `atanh` from the existing high-precision
+  `exp` / `ln` / `sqrt`; `atan` / `asin` / `acos` from an argument-reduced Taylor
+  series; `sin` / `cos` / `tan` by reduction modulo an embedded 2π. Zero
+  refusals, and identical to the Python server throughout.
+- **The Python hyperbolics compute with guard digits and round once.**
+  `$tanh`, `$sinh` and `$acosh` were losing accuracy — and agreement — to
+  compounded 34-digit rounding.
+
+Agreement with mongod 8.2.11 rose from 209 to 224 of 285 on the Python server
+and from **90 to 224** on the Rust server. The remaining 61 are MongoDB's own
+last-digit error.
+
+#### Added
+
+- `tools/probes/decimal_transcendental_rounding.py` — the only probe here that
+  asks "is the answer *right*?" alongside "does it match MongoDB?", against an
+  mpmath reference. That pairing is what distinguishes our bug from MongoDB's
+  error, and it fails the run only on the former.
+
+#### Known gap
+
+`sin` / `cos` / `tan` on the Rust server reduce against 2π embedded to ~1200
+digits, so an argument beyond about 1e1100 still defers. MongoDB carries π to
+the full decimal128 range.
+
+### `$ln`, `$log10`, `$exp` and `$asinh` compute on a finite Decimal128
+
+These four used to refuse a finite non-zero decimal outright. On the Rust server
+that is a `BadValue` — a deferral has no Python behind it there — so a
+collection holding `Decimal128` values could not take a logarithm at all. They
+now compute at decimal128's 34 significant digits, on both servers, from a new
+arbitrary-precision layer in `secantus-core`.
+
+#### Added
+
+- A high-precision decimal core (`hp_mul` / `hp_add` / `hp_div` / `hp_sqrt`)
+  that does the same arithmetic as the 34-digit operators at a caller-chosen
+  width. The existing `add` / `mul` round to 34 digits at every step, which is
+  right for arithmetic and useless for a series: an argument reduction can
+  cancel thirty digits away and leave nothing behind.
+- `ln` by argument reduction (`x = m·10^k`, `m = r·2^j`) onto an `atanh` series;
+  `exp` by reduction onto a power of ten and a Taylor series; `log10` from
+  `ln`, except for an exact power of ten, which answers the integer with no
+  series at all — the only way `$log10` of `1E+400` comes out as `400`.
+- Rounding is verified rather than assumed: the working precision widens
+  (80 → 140 → 260 digits) until the guard digits actually decide the 34-digit
+  answer, instead of trusting a fixed guard.
+
+#### Fixed
+
+- **`$asinh` of a small argument lost most of its digits on both engines.**
+  `asinh(x) = ln(x + sqrt(x²+1))` cancels to `1 + x` for small `x`, so at any
+  fixed precision the answer collapses: the Rust server returned `0` for
+  `Decimal128("1E-100")` and the Python engine had eleven digits of error at
+  `1E-10`. Below `1E-18` the correction term falls past all 34 digits and the
+  answer is the argument itself; above it, Python now widens its working
+  precision with the exponent.
+
+#### Changed
+
+- **These four are correctly rounded, which means they differ from mongod on
+  about a fifth of finite inputs.** Over 290 measured pairs mongod is correctly
+  rounded on 231; it carries Intel RDFP's approximation error in the last digit
+  on the rest, and matching that would mean linking RDFP. `$ln` of
+  `Decimal128("2.5")` is now `…117680111` where 8.2.11 answers `…117680110` —
+  the true value is `…1176801107145…`. Measured, deliberate, and recorded in
+  `tasks/backlog.md`.
+
+### `$avg` gave a wrong number, and a decimal zero got the wrong quantum
+
+Two families that both looked like "needs 34-digit decimal math" and were not.
+
+**`$avg` was a wrong answer on the Python server.** mongod converts the integer
+total to a double and *then* divides — it does not do exact integer division.
+The two agree until the total passes 2⁵³, and then they do not:
+
+```
+$avg: [2**53+1, 2**53+3, 2**53+5]
+    mongod  9007199254740994.0     (float(sum) / n)
+    before  9007199254740996.0     (sum / n, correctly rounded)
+```
+
+Python's `int / int` is correctly rounded over the exact quotient — a *better*
+answer, and the wrong one, because the conformance target is mongod's
+arithmetic rather than the most accurate arithmetic. The Rust engine deferred
+above 2⁵³ with a comment reading "defer to Python int/int divide", so it was
+deferring **to that wrong answer** — a comment justifying behaviour by the
+other engine instead of by the oracle.
+
+**A decimal zero answers a constant, and the quantum is load-bearing.** No
+series has to run, which is exactly what separates these from the finite
+decimals in the same operators. Both the per-operator quantum and the sign rule
+are unguessable:
+
+| | mongod | Rust before | Python before |
+| --- | --- | --- | --- |
+| `$tan(0)` | `0E-40` | *deferred* | `0` |
+| `$asinh(0)` | `0E-6176` | *deferred* | `0` |
+| `$cos(0)` | `1.000000000000000000000000000000000` | *deferred* | `1` |
+| `$sin(-0)` | `-0` | *deferred* | `0` — sign lost |
+| `$degreesToRadians(0)` | `0E-35` | *deferred* | `0E-50` |
+
+The odd functions carry `-0` through and the even ones drop it. Every cell was
+generated from mongod 8.2.11 rather than derived.
+
+Triaging the family by measurement rather than by its label is what found this:
+of the 35 shapes where mongod answered and the Rust engine deferred, **19**
+genuinely needed decimal transcendentals and **16 did not**. Rust refusals in
+this corpus go 35 → 19, and the remaining 19 are now exclusively the finite
+transcendentals — the one genuine dependency question.
+
+#### Fixed
+
+- `secantus.expressions`: `$avg` divides the way mongod does; the trig,
+  hyperbolic and angle-conversion operators answer a decimal zero from a
+  measured table instead of running their series.
+- `secantus-core`: the same table, plus `$sqrt` and `$exp` at zero; the `$avg`
+  precision guard is gone.
+
+### Decimal128 through the math operators: 13 crashes, and half the digits
+
+`Decimal128` is one of the types this project keeps documents as opaque BSON to
+preserve. The aggregation math operators were converting it to `float`, or
+failing outright: **13 of them crashed** the Python server with `internal server
+error`, because `math` rejects a `Decimal128` and the `TypeError` escaped.
+The rest silently narrowed 34 significant digits to 17.
+
+Measured against mongod 8.2.11: **21 of 49 shapes correct before, 38 after.**
+
+#### Fixed
+
+- **The 13 crashes are gone.** `$abs`, `$ceil`, `$floor`, `$trunc`, `$round`,
+  `$exp`, `$ln`, `$log10`, `$sqrt`, `$mod`, `$pow`, `$log` and `$avg` now compute
+  in `decimal` at decimal128's 34-digit precision and return a `Decimal128`.
+- **The hyperbolics keep full precision** — `$sinh`, `$cosh`, `$tanh`, `$asinh`,
+  `$acosh`, `$atanh` are exact identities over `exp` / `ln` / `sqrt`, which
+  `decimal` provides.
+- `$degreesToRadians` / `$radiansToDegrees` use a decimal π instead of the
+  float one.
+- `$mod` uses `Decimal`'s truncate-toward-zero, which is mongod's rule; Python's
+  `%` floors, so widening the existing expression would have been wrong for
+  negative operands.
+- `$pow` computes `exp(e * ln(b))`, not `b ** e`. That looks like the worse
+  choice and is the right one: `2.5 ** 2` is exactly `6.25`, and mongod answers
+  `6.249999999999999999999999999999999`.
+
+#### A finding worth keeping: do not be more accurate than the reference
+
+Computing the hyperbolic identities with **guard digits** — wide, then rounded
+back to 34 — is more accurate and matched mongod **less**, moving `$cosh` from
+agreeing to differing in the final digit. mongod accumulates its own rounding at
+decimal128 precision throughout, so fidelity means reproducing that arithmetic
+rather than improving on it. The extra precision was reverted.
+
+#### Still open (recorded)
+
+The **circular** functions — `$sin`, `$cos`, `$tan`, `$asin`, `$acos`, `$atan`,
+`$atan2` — have no identity over the operations `decimal` provides and would need
+series expansions; they still narrow to `float`. `$acosh` agrees to 33 of 34
+digits. And `cmp(string, Decimal128)` is still inverted in the cross-type order.
+
+27 cases added to `tests/test_mongod_differential.py`.
+
+### `Decimal128` NaN and infinity now answer in the math operators
+
+`$sqrt`, `$exp`, `$ln`, `$log10`, `$degreesToRadians` and `$radiansToDegrees`
+refused a `Decimal128` NaN or ±Infinity on the **Rust server** — `2 BadValue:
+aggregation pipeline uses a stage or operator not supported by the Rust server`
+— where mongod answers. The **Python server** answered, but wrongly in five
+places.
+
+These values carry no precision, so they need none of the 34-digit decimal math
+a *finite* decimal would; that is what makes them separable from the rest of the
+family, which still defers on the Rust server.
+
+Four of the rules defeat a guess, and all were measured against 8.2.11:
+
+- `$ceil` / `$floor` of a Decimal **infinity** are `NaN`, not the infinity;
+- `$ln` / `$log10` of a Decimal **NaN** come back as a **double** `nan` — the
+  one place in this family where the argument's type is not kept;
+- `$cosh(-Infinity)` is `+Infinity`;
+- `$abs(-0)` is `0` while `$trunc(-0)` is `-0`.
+
+The Python engine's bug was one shape repeated: its domain guards tested
+`isinstance(v, (int, float))`, so a `Decimal128` slipped past them into the
+decimal path and came back `NaN` — `$sqrt(Decimal128("-Infinity"))` returned
+`NaN` where mongod raises `28714`, and `$ln` / `$log10` of a Decimal
+`-Infinity` returned `NaN` where mongod raises `28766` / `28761`.
+
+**The parity suite was green throughout.** Neither engine's corpus contained
+these shapes, so the two engines were pinned to each other while one deferred
+and the other answered wrongly. Only comparing against a real mongod separated
+them — the "parity is not correctness" case, again.
+
+#### Fixed
+
+- `secantus.expressions`: `$sqrt` / `$ln` / `$log10` apply their domain checks
+  to a `Decimal128` as mongod does, instead of letting it reach the decimal
+  path and return `NaN`.
+- `secantus-core`: the same six operators answer a special `Decimal128` rather
+  than deferring, keeping the argument's type.
+
+### `$densify` no longer crashes on a null or missing field
+
+Running `$densify` over a collection where any document's target field was
+`null` or absent returned an internal server error. The stage sorted documents
+by that field without checking it existed, so Python's own comparison raised —
+`'<' not supported between instances of 'NoneType' and 'int'` — and the failure
+escaped as a generic "internal server error" rather than anything actionable. A
+single document with a missing field was enough to take down the whole
+aggregation.
+
+MongoDB simply doesn't densify those documents: they pass through unchanged, in
+their normal sort position ahead of the numbers, and the remaining values
+densify as usual. A field holding something that is neither a number nor a date
+is rejected outright with a specific error rather than a crash.
+
+Both servers now behave that way. The Rust server had been declining the stage
+entirely whenever such a document was present — its code carried a comment
+explaining that it deferred because the Python side raised — so it inherited the
+bug as an error rather than a crash. Both are fixed together.
+
+#### Fixed
+
+- `$densify` emits a document whose target field is `null` or missing unchanged
+  instead of failing the aggregation, and densifies only the documents that have
+  a usable value.
+- A non-numeric, non-date value in the densify field is rejected with MongoDB's
+  `5733201` (`Densify field type must be numeric or a date`) instead of an
+  internal error.
+
+### Long runs survive the shell that launched them
+
+A multi-minute test or gauge run started in a background shell died three
+times in one session — twice at about ninety per cent, once at a third of the
+way through — with no failing test, no out-of-memory kill and nothing in the
+log but the word `killed`. The cause was not the run: a supervisor reaping the
+shell it had spawned signalled the entire process group, and the work shared
+that group.
+
+`scripts/detached_run.py` gives the work its own session and process group, so
+reaping the launcher leaves it running. Start a command under a name, then poll
+it, wait on it, or stop it; the pid, the command line, the log and the eventual
+exit code live in `.detached-runs/<name>.json` beside `<name>.log`, which is
+what makes the exit code readable at all once the launching process is gone.
+
+The exit code is recorded by a small Python supervisor rather than a `sh -c`
+wrapper, and that detail is load-bearing on macOS: with a shell in the middle
+of the process tree, every child's connection to a Postgres.app server timed
+out, so the 825 PostgreSQL differential tests reported themselves as skipped
+behind an otherwise green run. A test pins the absence of the shell.
+
+#### Added
+
+- `scripts/detached_run.py` with `start` / `status` / `wait` / `stop`
+  subcommands for long-running commands that must outlive their launcher.
+- `tests/test_detached_run.py`, which pins the property that matters by
+  signalling the launcher's own process group and asserting the child is
+  untouched, plus exit-code capture and the refusal to reuse a live name.
+
+### The gate that compares us against a real mongod now runs in CI
+
+`tests/test_mongod_differential.py` runs every supported operation against a real `mongod` and asserts an exact match. It gates on `shutil.which("mongod")` — and the CI lanes installed `mongosh` and the Database Tools but no **server**, so it skipped everywhere except whichever dev box happened to run it.
+
+That is a load-bearing gap rather than a cosmetic one: for any change to the error surface, a green CI was **no evidence at all**. The 908-divergence operand campaign that landed immediately before this rewrote error text across ~40 operators, and nothing in CI could have judged a single one of them.
+
+The Linux lanes now install `mongodb-org-server`. **614 tests that were skipping now run.**
+
+#### Changed
+
+- `test`, `test-durable` and `record-durations` install `mongodb-org-server`, and their apt repo moves from **8.0 to 8.2**.
+
+8.2 because that is the series every expectation in the file was measured from (8.2.1 / 8.2.11). The gate compares only the MAJOR, so 8.0 *would* have run — and this file has already been bitten by a **patch**-level difference, an expected-type list whose order changed between 8.2.1 and 8.2.11 and needed `_sort_type_lists`. Pointing CI at a series the expectations were never taken from would manufacture exactly the false failures the file's whole-file skip exists to avoid.
+
+No separate step was needed: the suite's `addopts` excludes `perf` / `online` / `slow` but not `differential`, and the file's `mongod` fixture is module-scoped, so it spawns one server for the whole file.
+
+#### Two things worth knowing, both found by checking rather than assuming
+
+- **There is no `server-8.2.asc` key.** It 404s at both `mongodb.org` and `pgp.mongodb.com`. MongoDB signs both series with one packaging key — verified by fingerprint, not by hope: 8.2's `InRelease` is signed by `4B0752C1BCA238C0B4EE14DC41DE058A4E7DCA05`, which is exactly what `server-8.0.asc` serves. The keyring file is now named `mongodb-server.gpg` rather than `-8.0`, so the two do not have to agree; a plausible-looking "fix" to a versioned 8.2 URL will 404 the job.
+- **The patch CI installs is verified, not assumed.** The repo tracks the newest patch (8.2.12 today) while the expectations came from 8.2.11. All 614 cases were run against **both** before landing this, so the version CI actually gets is known-clean. If patch churn ever becomes noise rather than signal, the answer is to pin `mongodb-org-server=8.2.11` — not to loosen the gate.
+
+#### Not changed
+
+macOS and Windows install no server and still skip. macOS runs only on the cron cell, and the Homebrew route for a server is the messier half of an already-awkward tap; Windows has no packaging story worth the flake. The value is in the PR lane, and the PR lane is Linux.
+
+### The mongod comparison suite runs on any 8.x server, not just one
+
+The suite that compares SecantusDB against a real MongoDB server, operation by
+operation, was pinned to the exact release its expectations were taken from. That
+was deliberate caution when the expectations came from a server two majors behind,
+but it meant a developer running any other build got the whole suite skipped and
+no signal at all. MongoDB's error surface is stable within a major version, so the
+suite now runs against any 8.x server and only skips across a major boundary.
+
+The practical effect is that a difference on a nearby release now shows up as a
+failure to investigate rather than a silent skip — which is the right default,
+since a mismatch there is far more likely to be a real divergence than version
+drift.
+
+#### Changed
+- The differential gate keys on the mongod major version rather than
+  major-and-minor.
+
+### A double in an error message was rendered the wrong way — in both servers
+
+mongod has **two** renderings for a double inside an error message, and they
+are not interchangeable. Measured one value at a time against 8.2.11:
+
+| value | value form | spec form |
+| --- | --- | --- |
+| `-0.0` | `-0` | `-0.0` |
+| `-1.0` | `-1` | `-1.0` |
+| `1234567.0` | `1.23457e+06` | `1234567.0` |
+| `-2147483648.0` | `-2.14748e+09` | `-2147483648.0` |
+| `0.000123456789` | `0.000123457` | `0.000123456789` |
+
+The **value** form (`Value::toString`) is C's `%g` at precision 6 and is what
+`$mergeObjects`, `$replaceRoot`, `$ln`, `$log` and `$log10` echo. The **spec**
+form is `%.16g` with a `.0` appended when that leaves no `.` or `e`, and is what
+a stage's echoed specification uses — `$firstN`/`$lastN`/`$maxN`/`$median`'s
+"specification must be an object" and `$graphLookup`'s missing-`from` message.
+
+The spec form is **not** the shortest round-trip form, though the two agree for
+every ordinary value, which is why it was written that way first and why the
+unit tests — written from the same assumption — passed. They part company at the
+bottom of the range, where the shortest string that round-trips is shorter than
+sixteen significant digits: `1e-308` echoes as `9.999999999999999e-309` and
+`5e-324` as `4.940656458412465e-324`. Only the differential gate against a real
+mongod caught that, which is the argument for putting a finding there rather
+than in a test that drives our own servers.
+
+A single renderer was serving both, so every value message rendered a double
+the spec way. Switching that renderer is not enough on its own: it fixes
+`$mergeObjects` and `$replaceRoot` and silently **breaks** `$graphLookup`, which
+is a spec echo that happened to share the function. `$graphLookup` now takes the
+spec renderer explicitly.
+
+The Rust server was wrong in a louder way. Its value renderer cast an integral
+double to `i64`, which lost the sign of `-0.0` (printing `0`) and **saturated**
+past `i64::MAX` — so `1e308` came back as `9223372036854775807`, a flatly wrong
+number shown to the user. Its spec renderer used `{:.1}`, which expanded `1e308`
+into its full 309-digit decimal value; Rust has no `%g` at all, so both
+precisions are now reproduced by one routine.
+
+Across the expression corpus this takes the Rust server's message-only
+divergences from 13 to 1 and the Python server's from 173 to 9.
+
+Note `$ln` renders its operand as a **double** whatever its BSON type: an Int32
+`-2147483648` comes back as `-2.14748e+09`, not as itself.
+
+`tests/test_mongod_differential.py` gains 52 cases covering both vocabularies,
+so a future simplification that collapses the two renderers fails on one side or
+the other. `tools/probes/double_error_rendering.py` is the three-server harness.
+
+#### Fixed
+
+- `secantus.bsontypes`: new `fmt_double_value` (C's `%g`); `fmt_double_parse`
+  becomes `%.16g` rather than `repr`, which fixes the denormal end of the range;
+  `bson_value_repr_stage` renders a double the value way.
+- `secantus.aggregate`: `$graphLookup`'s missing-`from` echo uses the spec
+  renderer, which also removes the manual brace re-spacing it needed.
+- `secantus.expressions`: `$ln` / `$log` / `$log10` domain messages render the
+  operand as a double in the value form.
+- `secantus-core`: new `format_double_g` / `format_double_spec`;
+  `render_value_compact` and the three log-family messages use the first, and
+  the command layer's `render_stage_value` uses the second.
+
+### `$elemMatch` traversed an array twice
+
+mongod applies implicit array traversal **once per path step**, and
+`$elemMatch` spends that step choosing the element — so inside it the element is
+a terminal value and nothing descends into it again. Both servers got that
+wrong, in opposite directions.
+
+The **operator** form matched *through* an element that was itself an array, so
+`{$elemMatch: {$gt: 1}}` returned documents holding `[[5]]` and `[1, [2, [3]]]`;
+mongod returns neither, because an array is not greater than 1. The **criteria**
+form had the mirror-image gap: it considered only document elements, so
+`{$elemMatch: {}}` — a criteria that imposes no field requirement — missed every
+document whose array holds an array element, which mongod returns.
+
+The fix is a `descend` flag threaded through the operator dispatch, off for the
+element match, so one rule covers every operator rather than each one growing
+its own special case. Three operators needed reaching individually because they
+recurse or iterate the array themselves, and each was a separate miss in the
+first version of the fix — `$in` has its own candidate path, `$not` re-enters
+the field matcher, and `$all` walks the array. Two were caught by writing the
+test and one by probing before believing the fix was complete.
+
+Two neighbouring divergences from the same 8.2.11 sweep are **not** fixed here
+and are filed with their measured rules, because they live in path resolution
+rather than in matching: a dotted POSITIONAL path (`x.0`) descends one level too
+far, and a dotted sort key does not descend at all.
+
+#### Fixed
+
+- `secantus.query` / `secantus-core`: `$elemMatch`'s operator form treats the
+  element as terminal, so it no longer matches through a nested array. Applies
+  to every operator it can carry — comparison, `$in` / `$nin`, `$type`,
+  `$regex`, the `$bits*` family — via one flag rather than per-operator logic.
+- `secantus.query` / `secantus-core`: `$elemMatch`'s criteria form reaches array
+  elements when the criteria names no field, so `{$elemMatch: {}}` returns what
+  mongod returns. A non-empty criteria still requires a document element.
+- `secantus.query` / `secantus-core`: `$not`, `$in` / `$nin` and `$all` carry
+  the flag through their own recursion, so `{$elemMatch: {$not: {$gt: 1}}}` no
+  longer inverts a descended match and `{$elemMatch: {$all: [5]}}` no longer
+  matches a nested array. `$size` and a nested `$elemMatch` were already right
+  and are pinned so they stay that way.
+
+### Expanded change events were missing the collection UUID
+
+With `showExpandedEvents`, MongoDB puts `collectionUUID` on every event that has
+a collection. SecantusDB set it only on inserts, updates and deletes, so a
+consumer watching DDL — `create`, `createIndexes`, `dropIndexes`, `collMod`,
+`drop`, `rename` — could not tell which collection a UUID-keyed event belonged
+to without a second lookup.
+
+`invalidate` is the deliberate exception: it derives from an event that does
+carry a UUID, and MongoDB still omits it there. That exclusion is pinned by a
+test, because it is exactly the sort of asymmetry a later refactor would tidy
+away.
+
+`collMod` events also gained `stateBeforeChange` — the collection's options as
+they stood before the modification, which is what lets a consumer see what a
+`collMod` actually replaced rather than only what it set.
+
+With these, the change-stream differential sweep is at **zero divergences from
+MongoDB 8.2.11 across all 41 cases, on both servers**. The one remaining
+difference is a field-order quirk in MongoDB's own `rename` event, recorded and
+deliberately not copied.
+
+### `explain` reports the stage tree and the query MongoDB actually parsed
+
+`explain` answered with a single flat node — `COLLSCAN`, or `FETCH` wrapping
+`IXSCAN` — and echoed your filter back verbatim as `parsedQuery`. MongoDB does
+neither. It wraps the scan in the stages that describe the rest of the query,
+and it reports the match expression *after* normalisation. The practical cost of
+the flat node was that a client running `explain` to ask "is my sort served by
+an index?" could not tell, because the blocking `SORT` stage that answers the
+question was never emitted.
+
+Both halves now match. `winningPlan` carries `SORT` (with `sortPattern`,
+`memLimit`, and the limit it absorbed), `SKIP`, `LIMIT` and
+`PROJECTION_SIMPLE` / `PROJECTION_DEFAULT` in MongoDB's nesting, which is not
+the order the command's fields are written in. The `IXSCAN` node carries
+`multiKeyPaths`, `isUnique`, `isSparse`, `isPartial` and `indexVersion`;
+`COLLSCAN` carries `direction`; `FETCH` carries only the residual filter and
+omits the key entirely when the index bounds already cover the predicate, which
+is how you tell a fully index-served query from one that re-checks documents.
+
+`parsedQuery` is now the normalised match expression: bare equality grows an
+explicit `$eq`, several clauses fold into an `$and` whose children are sorted,
+`$ne` becomes `$not`/`$eq`, `$type` becomes numeric BSON codes, `$bitsAllSet`
+becomes a bit-position list, and so on. The child order inside `$and` is the
+part with nothing documented behind it — it is MongoDB's internal match-type
+ordinal, and it disagrees with the enum in MongoDB's own source about where
+`$not` sits, so it was derived from ninety-one pairwise probes instead. All
+fifty-six filters in the sweep now agree.
+
+What is left out is left out on purpose. `indexBounds`, `rejectedPlans` and the
+specialised `IDHACK` / `COUNT_SCAN` / `DISTINCT_SCAN` executors describe
+MongoDB's cost model and its plan cache, neither of which this project has ever
+claimed to reproduce; and the stage tree is emitted for `find` only, because
+`count` and `distinct` use a vocabulary that has not been measured and inventing
+one would be worse than the flat node they get today.
+
+#### Added
+
+- `secantus/explain.py`: `canonical_match` and `build_stage_tree`, both pure
+  functions over parsed input.
+- `tools/probes/explain_shapes.py`: the sweep, including the pairwise derivation
+  of the match-type ordering.
+
+#### Fixed
+
+- `commands.py`: `explain` emits the stage tree, the normalised query, the full
+  IXSCAN metadata, `COLLSCAN` direction, `isCached` and `explainVersion`.
+- `storage.py`: `explain_plan` reports `sorted_by_index`, which is what decides
+  whether a blocking `SORT` appears.
+
+### The expression language's comparisons and truthiness, measured operator by operator
+
+The first sweep of the aggregation **expression** operators —
+`tools/probes/agg_expressions.py`, 143 operators against mongod 8.2.11. The
+argument, change-stream, update and findAndModify surfaces had all been swept;
+this one, the largest operator family in the server, never had.
+
+It found four defects that produce **silent wrong answers**, all on both servers.
+
+#### Fixed
+
+- **Every cross-type comparison answered false.** `$gt` / `$gte` / `$lt` / `$lte`
+  compared with the host language's own operators and swallowed the error a
+  cross-type pair raises:
+
+      try:
+          return bool(a > b)
+      except TypeError:
+          return False
+
+  So `{$gt: ["abc", 1]}` was false where mongod says true — a string sorts after
+  a number in BSON's canonical order — and `{$lt: [null, 1]}` likewise. `$cmp`,
+  two thousand lines away, had used the correct comparator all along. The four
+  now share it. This reaches rows: the expression language drives `$expr`,
+  `$cond`, `$filter`, `$switch` and `$bucket`.
+- **`$and` / `$or` iterated a non-array argument.** `{$and: "$s"}` is a
+  one-element list to mongod; iterating it directly walked the string character
+  by character, so `"$s"` became `'$'` and `'s'` and the first parsed as an empty
+  field path. Short-circuiting is preserved — mongod does short-circuit at
+  runtime, so a false `$and` operand hides a later error.
+- **Truthiness.** Only null, missing, `false` and zero are false. Every string is
+  true, the **empty one included** (`{$or: ""}`, `{$toBool: ""}`), as are empty
+  arrays and documents. Missing was reading as true.
+- **A bool is not a number.** `{$eq: [true, 1]}` is false on mongod; the host
+  language's `True == 1` made it true. The same root cause was collapsing
+  `$addToSet`'s `0` and `false` into one element, making `{$in: [false, [0]]}`
+  true, and — in the oplog **update-diff** — reporting a field that changed from
+  `true` to `1` as no change at all, so a change stream never saw it.
+
+#### Also fixed, uncovered by the above
+
+- **`decimal.Decimal` was not ranked as a number** in the BSON order. The SQL
+  layer's numerics are native Decimals, so once the relational operators started
+  using that order, `price < cost * 1.5` compared by TYPE and returned rows where
+  the comparison is false. Caught by the SQL suite.
+- **Booleans were excluded from the Rust engine's sortable set**, so every
+  comparison involving one deferred — a generic `BadValue` on a server with no
+  Python. `type_rank` had ranked them all along.
+
+#### Notes
+
+Two tests asserted the limitation rather than the behaviour (`is_sortable(true)`
+is false; `$maxN` over booleans errors) and were rewritten against mongod, which
+handles both.
+
+The engine-parity fuzz caught two mistakes mid-change: a lost short-circuit, and
+the bool-equality rule landing in Rust before Python. One definition of BSON
+equality now lives in `ordering.bson_equal` and is used by both the expression
+language and the diff.
+
+30 cases added to `tests/test_mongod_differential.py`. **The sweep is not
+finished** — its remaining findings are recorded in `tasks/backlog.md`.
+
+### Conversions, decimal `$divide` / `$mod`, and missing-parameter errors
+
+Re-running the 6,628-case expression corpus against the Rust server found 28
+shapes answering a different code from mongod. Extending the same cases to the
+pure Python engine found the same family plus three of its own. The grid of
+mongod × Rust server × Python engine over these 76 cases is now 0 divergent.
+
+#### Fixed
+
+- **`$dateFromString`, `$dateToParts`, `$dateTrunc` and `$dateDiff` answered
+  `null` for a missing required parameter** where mongod raises. `{$dateTrunc:
+  {}}` was `null`, not an error — a wrong value, not a wrong message. The codes
+  share no pattern (40542 / 40522 / 5439009 / 5166303) so they are a measured
+  table, not a rule.
+- **`$getField` named the wrong missing field.** mongod checks `field` before
+  `input`, the reverse of the order it reads them in, so `{$getField: {}}` is
+  `3041702` and not `3041703`.
+- **`$divide` by a decimal zero raised `decimal.DivisionByZero` out of the
+  Python evaluator** — an internal server error. `b == 0` is `False` for
+  `Decimal128("0")`, since the BSON wrapper defines no comparison against `int`,
+  so a decimal zero divisor walked past the guard.
+- **`$mod` of `Decimal128("1E+6144")` by `7` answered `NaN`.** The quotient
+  needs 6,145 digits and `Decimal.__mod__` raises `InvalidOperation` past the
+  working precision. It is now computed at whatever width the quotient needs,
+  and the Rust side does it as an exact integer remainder.
+- **`$mod` by zero used the wrong code with a decimal operand**: 16610 is for
+  int / double, and it is 5733415 once a decimal is on either side.
+- **`$toDate` of a fractional value did not truncate.** A BSON date holds whole
+  milliseconds, so `{$toDate: 1.5}` is 1ms; the Python engine built a datetime
+  with 1500 microseconds, a value BSON cannot hold.
+
+#### Added
+
+- **`$divide` and `$mod` accept `Decimal128` on the Rust server**, which
+  refused them outright. `$divide` carries the decimal spec's ideal exponent, so
+  `100 / 10` is `10`, `2.50 / 1.0` is `2.5` and `1 / 8` is `0.125`; `$mod` takes
+  its sign from the dividend and its quantum from `min(e1, e2)`, so `7.5 % 2.5`
+  is `0.0`.
+- **binData conversions on both servers.** `$toInt` / `$toLong` reinterpret the
+  bytes as a *little-endian* integer (`BinData(0, "01020304")` is `67305985`,
+  not `16909060`), `$toDouble` reinterprets 4 bytes as an IEEE single and 8 as a
+  double, and `$toString` is base64. Each target accepts its own set of lengths
+  and names the rest.
+- **`$toDecimal` of `inf` / `-inf` / `nan`**, which was a `241`.
+
+#### Fixed (regression from this session)
+
+- **`$asinh` of a decimal below `1E-4966` returned the value where mongod
+  underflows to a bare `0`.** mongod's own implementation gives up there — and
+  gives progressively wrong answers for a decade above it, `$asinh(1E-4965)`
+  being `1.295…E-4965` where the true value is `1E-4965`. This server had been
+  changed to answer the mathematically correct value because the two engines
+  were compared to *each other* rather than to mongod. The Rust server's
+  exemplar is mongod; the threshold is bisected from 8.2.11 and both servers now
+  follow it.
+
+### A NaN no longer crashes `$expr`, and it now equals itself
+
+`find({"$expr": {"$gt": ["$v", 0]}})` over a collection holding a
+`Decimal128("NaN")` answered **`internal server error`** on the Python server.
+The expression language widens a `Decimal128` to a Python `Decimal` before
+comparing, and `Decimal("NaN") < 0` raises `decimal.InvalidOperation` — not the
+`TypeError` the comparison fallback was catching. One such document made an
+ordinary query fail.
+
+The same probe found a second, quieter one: `{$eq: [NaN, NaN]}` is **true** on
+MongoDB, whose canonical order ranks the two as equal — which is also why
+`find({a: NaN})` matches a stored NaN. Both servers said false. The Rust
+server's `Decimal128` path had it right and its plain-`double` path did not, so
+the operator's answer depended on which numeric type happened to hold the NaN.
+
+Both were found by `tools/probes/query_result_sets.py` the first time it ran
+with a **Python column** — the throwaway original had compared MongoDB against
+the Rust server only, and promoting it to the shared two-server harness surfaced
+a crash on the first run.
+
+#### Fixed
+
+- **`$gt` / `$gte` / `$lt` / `$lte` / `$cmp` against a `Decimal128("NaN")` no
+  longer error.** NaN ranks below every number, so `$lt` is true and `$gt` is
+  false, matching the plain-`double` NaN that already worked.
+- **`{$eq: [NaN, NaN]}` is true and `$ne` false**, for all four pairings of
+  `double` and `Decimal128` NaN, on both servers.
+- The neighbouring rules are unchanged and now pinned: a bool is still not a
+  number (`{$eq: [true, 1]}` is false), signed zeros are still equal, and
+  **change detection still answers differently from equality** — `$set` of a NaN
+  over the same-typed NaN reports `modifiedCount: 0`, while a `double` NaN
+  replaced by a `Decimal128` NaN reports `1`.
+
+#### Added
+
+- `tools/probes/query_result_sets.py`, `tools/probes/update_result_documents.py`
+  and `tools/probes/upsert_seeding.py` — three sweeps that had been throwaway
+  scripts, now comparing both servers against MongoDB (266, 527 and 120 shapes;
+  0 divergent).
+
+Measured against mongod 8.2.11.
+
+### Aggregation operators answered the wrong BSON type, and an integer overflow crashed the update path
+
+A sweep of all 143 aggregation expression operators against a real mongod 8.2.11
+found 42 cases where both servers returned a value and the value was wrong.
+Nearly all of them were one of three rules the engines did not implement.
+
+#### Fixed
+
+- **The rounding operators are type-preserving.** `$ceil` / `$floor` / `$trunc`
+  / `$round` answered a Python `int` for a double operand, so `{$ceil: 1.5}`
+  returned `2` where mongod returns `2.0` — a different BSON type, which then
+  compares and sorts differently downstream.
+- **`long` is contagious through arithmetic.** `$add` / `$subtract` /
+  `$multiply` / `$mod` / `$pow` / `$abs` and the four rounding operators all
+  narrowed a 64-bit operand back to `int` when the result happened to fit in 32
+  bits, so `Int64(1) + 1` answered an int where mongod answers a long. An int32
+  result that outgrows its width now widens to long on its own, as mongod's
+  does (`{$abs: -2147483648}`).
+- **An integral result past int64 no longer fails the command.** It saturates
+  to a double in an aggregation (`{$pow: [2, 64]}`), matching mongod. It
+  previously reached `bson.encode` as an unbounded Python int, whose
+  `OverflowError` surfaced to the client as `internal server error`.
+- **`$inc` / `$mul` past int64 now fail the write with mongod's error** (code
+  2, `Failed to apply $inc operations to current value ((NumberLong)…) for
+  document {_id: …}`) rather than crashing. The same unencodable int was
+  reaching `bson.encode` from *inside* the storage layer's update transaction.
+- **`$mod` truncates toward zero.** It used Python's flooring `%`, which gives
+  the wrong sign whenever an operand is negative — `{$mod: [-5, 2]}` answered
+  `1` where mongod answers `-1`. Three of the four sign combinations were wrong.
+- **`$toLower` / `$toUpper` coerce their operand to a string first.** They
+  passed a non-string straight through, so `{$toLower: 1.5}` answered the
+  number `1.5` rather than the string `"1.5"`. That conversion is deliberately
+  *not* `$toString`'s: it accepts a javascript value but rejects a bool and an
+  ObjectId (Location16007), renders a double with six significant digits where
+  `$toString` round-trips it, and turns null and missing into `""` where
+  `$toString` gives null.
+- **`$toString` renders mongod's forms**, not Python's `str()`: `true` / `false`
+  for a bool (it answered `True` / `False`), ISO-8601 for a date, base64 for
+  binary, and `ConversionFailure` (241) for the types mongod refuses.
+- **Doubles inside error messages** use mongod's six-significant-digit
+  rendering, so `{$acos: 1099511627776}` names `1.09951e+12` rather than
+  `1099511627776.0`.
+- **`$degreesToRadians` / `$radiansToDegrees`** multiply by a single
+  precomputed constant the way mongod does; computing `x * pi / 180` differed
+  in the last bit. They also now report a non-numeric operand as Location28765
+  like the rest of the math operators.
+- **`$sin` / `$cos` / `$tan` / `$asin` / `$acos` / `$atan` / `$atan2` keep a
+  Decimal128 operand's type.** `decimal` has no circular functions, so these
+  fell through to the double path and narrowed a 34-digit operand to 17 digits.
+
+After the change the Rust server has **no** value differences left across the
+3,884-case sweep (was 33) and the Python server has five (was 42), all of them
+a last-digit disagreement on a Decimal128 transcendental where mongod's own
+answer is 1-2 ulp below the correctly-rounded value.
+
+### 25 operators that require a document argument, and the last of the sweep's crashes
+
+The largest uniform block left in the expression sweep: **25 operators, 675
+shapes** where mongod says the argument must be a document and the Rust server
+answered its generic `BadValue` (2) `aggregation pipeline uses a stage or
+operator not supported by the Rust server`.
+
+#### Fixed
+
+- **`$convert`, `$dateAdd`, `$dateDiff`, `$dateFromParts`, `$dateFromString`,
+  `$dateSubtract`, `$dateToParts`, `$dateToString`, `$dateTrunc`, `$filter`,
+  `$let`, `$ltrim`, `$map`, `$reduce`, `$regexFind`, `$regexFindAll`,
+  `$regexMatch`, `$replaceAll`, `$replaceOne`, `$rtrim`, `$setField`,
+  `$sortArray`, `$switch`, `$trim`, `$zip`** now answer mongod's own code and
+  wording on both servers. It is a table because the wording is **five different
+  phrasings** that are not interchangeable — `found: <type>` versus
+  `found <type>` versus no type at all — and the codes range from 9 to 5439007.
+- **The last of the sweep's crashes.** `{$trunc: []}` reached `arg[0]`
+  (IndexError); an unrecognised key in `$cond` / `$dateToString` was a bare
+  KeyError; and `$exp` / `$sinh` / `$cosh` of a large value raised
+  `OverflowError` where mongod saturates to **infinity**. Each surfaced as
+  `internal server error`.
+
+  **That takes the Python server from 274 crashes to zero** across this sweep.
+- `$trunc` / `$round` have a ranged arity (1–2 arguments) with mongod's own
+  28667, distinct from the fixed-arity 16020.
+- An unrecognised key is reported at **parse** time, so it takes mongod's
+  `Invalid $<stage> :: caused by ::` wrapper rather than the executor prefix.
+
+#### Also fixed
+
+Code **9 is `FailedToParse`**, not `Location9`. The parse-time checks were
+naming every code `Location<n>`; the codes they return are a mix, and the
+differential gate caught it. Both servers now use their existing
+code-name tables.
+
+#### Where the sweep stands
+
+| | start | now |
+|---|---|---|
+| Python crashes | 274 | **0** |
+| Python code differences | 2288 | 682 |
+| Rust code differences | 2288 | 1556 |
+| Rust message-only | 689 | **0** |
+
+32 cases added to `tests/test_mongod_differential.py`.
+
+### Fixed-arity expression operators answer mongod's 16020 — and a one-element list is one argument
+
+The largest block left by the expression sweep: **~907 shapes** where mongod
+answers `16020 Expression $x takes exactly N arguments. M were passed in.` and we
+answered a mix of 14 / 28765 / 51044 / 51276 — **233 of them by crashing** with
+`internal server error`, an operator indexing `arg[0], arg[1]` on a scalar.
+
+#### Fixed
+
+- **65 fixed-arity operators now check their argument count**, with mongod's own
+  code and wording, on both servers. It is a PARSE error: an empty or missing
+  collection reports it, as mongod does.
+- **A one-element list is ONE argument** — and getting this wrong was producing
+  silent **wrong values**, not merely wrong errors:
+
+  | expression | mongod | before |
+  |---|---|---|
+  | `{$size: [[1, 2]]}` | `2` | `1` (counted the outer list) |
+  | `{$size: ["$arr"]}` | `2` | `1` |
+  | `{$toUpper: ["a"]}` | `"A"` | `["a"]` |
+  | `{$type: [5]}` | `"int"` | `"array"` |
+  | `{$first: ["$arr"]}` | `1` | the whole array |
+  | `{$abs: [5]}` | `5` | an error |
+
+  This was found by a test written for the arity fix, not by the sweep — the
+  sweep's corpus never paired an operator with a single-element list.
+
+#### How the table was built
+
+**By asking mongod**, not from documentation: each of the 143 operators was
+called with 0-4 arguments and the arity read out of its own error message. That
+also surfaced the three rules a table alone would have missed — `$cond`'s object
+form (`{if, then, else}`) carries all three arguments and is exempt; `$substr` is
+reported under its canonical name `$substrBytes`; and the count is `len` for a
+list but 1 for anything else, including a nested expression document.
+
+The table lives in the engine rather than the command layer, because the
+evaluator needs it for the unwrap as well as the command layer for the error.
+
+#### Result
+
+| | crashes | wrong 16020 | message-only |
+|---|---|---|---|
+| Python before / after | 274 → **21** | ~907 → **0** | 689 → 669 |
+| Rust before / after | 274 → **1** | ~907 → **0** | 689 → **0** |
+
+The remaining Python crashes are the Decimal128 family, already recorded. The
+remaining Rust code differences are the engine's per-operator operand-type
+errors — a separate family, also recorded.
+
+21 cases added to `tests/test_mongod_differential.py`, including the exempt
+forms and the parse-time (missing-collection) case.
+
+### 83 expression errors carried the wrong wrapper, with the right message inside
+
+mongod has three wrappers for an expression that fails inside `$addFields` /
+`$project` / `$set`: `Invalid $addFields :: caused by ::` for a **parse** error,
+`Failed to optimize pipeline :: caused by ::` for a constant-fold failure, and
+`Executor error during aggregate command on namespace: … :: caused by ::` for a
+runtime one.
+
+Eighty-three shapes carried the wrong one — and their message **body was
+byte-identical** to mongod's, so only the prefix was wrong. Nothing that
+compared error codes could see it, which is why they survived every earlier
+sweep of this surface.
+
+Seventy-six of the eighty-three were two operators. `$ifNull` and `$setEquals`
+have their own arity code and their own wording, so they could not ride the
+generic arity table and were reaching the *evaluator* instead of the parser.
+The rest were missing required keys in a spec document (`$convert` without
+`input`, `$dateDiff` without `startDate`, `$dateFromParts` without a year, and
+the `n`-operator family without `n`).
+
+**The ordering is load-bearing.** mongod reports an *unrecognised* key before a
+*missing* required one, so `{$firstN: {k: 1}}` is "Unknown argument for 'n'
+operator: k" and only `{$firstN: {}}` is "Missing value for 'n'". A first
+version of this change ran the missing-key checks first, which fixed the
+wrapper on all 83 and silently changed the CODE on six shapes that were already
+correct. Both checks fire on the same document, so only their order separates
+them; `tests/test_expression_parse_time_wrappers.py` pins it.
+
+Against mongod 8.2.11 the probe goes from 142 message differences to **59**,
+with the wrong-code set byte-identical to before.
+
+The Rust server has the same defect and worse — it never emits the stage
+wrapper at all. Filed in `tasks/backlog.md` §7 rather than guessed at, since a
+fresh worktree cannot build its binary.
+
+#### Fixed
+
+- `aggregate.py`: `_expression_shape_problem` recognises the per-operator
+  minimums (`$ifNull`, `$setEquals`) and the required-key specs, so they are
+  classified as parse errors and take the stage's wrapper. Both mongod wordings
+  are reproduced verbatim, including the comma `$ifNull` has and `$setEquals`
+  does not.
+
+#### Changed
+
+- `tools/probes/agg_expressions.py`, `findandmodify_shapes.py`,
+  `update_operators.py`: a `__main__` guard, so the corpus can be imported by a
+  focused harness instead of the import running the whole sweep.
+- `tests/test_expression_parse_time_wrappers.py` (new): 19 cases covering the
+  classification, the unknown-before-missing ordering, and valid specs that must
+  fall through to folding.
+
+### A second differential pass over `findAndModify` — 14 of 49 option combinations diverged from mongod
+
+Phase 2 of `tasks/remaining-work-plan.md` asks for the differential harness to be
+pointed at surfaces it has never covered. `findAndModify` was one of them: 49
+option combinations run against a live mongod 6.0.16, comparing the **raw
+command reply** rather than the driver wrapper, so `lastErrorObject`'s shape and
+the field order of an upserted document were compared too.
+
+Fourteen diverged. Two were silent wrong data, and both turned out to be shared
+with the plain `update` command:
+
+#### Fixed
+
+- **An empty update document silently kept every field.** `update: {}` is a
+  *replacement with an empty document* — mongod reduces the stored document to
+  its `_id` and reports `nModified: 1`. Both write commands short-circuited on a
+  falsy update and returned the document untouched, with `ok: 1` and no error,
+  so every field the caller asked to drop stayed. An empty **pipeline** (`[]`)
+  is the genuine no-op and remains one.
+- **An upsert from a dotted query stored a literal dotted key.** `{"sub.k": 77}`
+  upserted a document with a key that has a dot *in* it — one mongod cannot
+  produce, most drivers refuse to send, and which then never matched the very
+  query that created it. It now builds the nesting mongod builds, at any depth,
+  merging with any dotted paths the update itself sets.
+- **An update that would create a field under a non-document did nothing at
+  all.** `$set: {"n.x": 1}` against `{n: 5}` reported success and wrote no
+  change. mongod answers `PathNotViable` (28) with `Cannot create field 'x' in
+  element {n: 5}`. Creation only: `$unset` down the same path is still a no-op,
+  and an out-of-range array index still pads with nulls.
+- **`findAndModify` reported every update failure as `14 TypeMismatch`.** The
+  errors escaped to the generic dispatch handler, so an unknown modifier
+  (mongod: 9), a changed `_id` (66), a path conflict (40) and a non-viable path
+  (28) all arrived under one wrong code, and the drivers' canonical handling
+  keyed on those codes never fired. `findAndModify` also — uniquely on 6.0.16 —
+  wraps its *execution* errors in `Plan executor error during findAndModify ::
+  caused by ::` while leaving parse errors bare; both halves now match.
+- **`codeName` no longer contradicts `code`.** Any user-facing exception that
+  named its own code was reported with that code and `codeName: "TypeMismatch"`
+  — a pair mongod never sends. The name now follows the code.
+- **`findAndModify.new` was never type-checked.** A string went through Python's
+  truthiness, so `new: "no"` returned the *post*-image. It now takes the same
+  bool-or-number rule as `upsert` and `remove` (numbers and `null` accepted,
+  arrays / documents / strings rejected), and a zero-valued `Decimal128` is
+  false rather than truthy.
+- **An unknown top-level `findAndModify` field is rejected** with
+  `Location40415`, as mongod does. A misspelled option — `field` for `fields`,
+  `returnNew` for `new` — was silently dropped, and the caller got a
+  correct-looking reply computed under options they had not asked for.
+- **`findAndModify.hint` was accepted and ignored**, so hinting an index that
+  does not exist got a silent collection scan and an `ok: 1` reply. It is now
+  honoured, an unresolvable hint is `BadValue` (2), a non-string / non-object
+  one is `FailedToParse` (9), and `$natural` — which mongod does not accept on
+  this command, unlike `find` — is refused.
+- **`arrayFilters` type errors named a field path that does not exist** on this
+  command (`update.updates.arrayFilters.0`), with the wrong type. They now name
+  `findAndModify.arrayFilters`, and an explicit `null` takes mongod's older
+  `Location10065`.
+- **An update path referencing an undeclared array filter** answered
+  `9 FailedToParse` with hand-written wording; mongod answers `2 BadValue` with
+  `No array filter found for identifier 'e' in path 'arr.$[e]'`, naming the
+  path.
+- **The "unknown modifier" message is mongod's**, and there is one of it.
+  Unknown `$`-operators and documents mixing operators with replacement fields
+  are the same complaint to mongod, which names the offending key —
+  `Unknown modifier: z` for a bare field. We had two different sentences, and
+  neither is one any real server emits.
+- **Field order matches on the wire.** An upserted document leads with `_id`,
+  then the query-seeded fields, then the update's, each group in field-name
+  order; the `update` reply puts `upserted` / `writeErrors` before `nModified`.
+  BSON keeps field order, and drivers do compare raw reply bytes.
+
+The Rust side carries the same fixes: the core engine's empty-update
+short-circuit is gone, its "unknown modifier" wording matches, and a non-viable
+path now defers with a named `PathNotViable` validator wired to code 28 for the
+standalone server, mirroring the `arith_type_error` template.
+
+`tests/test_mongod_differential.py` grew 36 cases (57 → 93) so none of this can
+drift back.
+
+### `findAndModify` argument validation and reply shape match mongod
+
+Differential-probing 18 `findAndModify` shapes against a real mongod found six
+divergences: a crash, two commands mongod rejects that we silently performed, and
+a reply that described a delete as an update.
+
+`findAndModify` with a non-document `update` — `{update: 5}` — reached the update
+engine, which called `.keys()` on it and raised `AttributeError`. That surfaced as
+a bare `internal server error` (code 1) rather than mongod's parse error.
+
+`remove: true` combined with `new: true` or with `upsert: true` was accepted and
+the document removed. mongod rejects both: a remove has no "after" document to
+return, and upserting while removing is contradictory.
+
+`lastErrorObject` for a remove carried `updatedExisting`, which describes an
+update. mongod omits it, so a driver reading that field saw an update-shaped
+reply for a delete.
+
+#### Fixed
+
+- A non-document, non-array `update` returns `9 FailedToParse`
+  (`Update argument must be either an object or an array`) instead of crashing.
+- `remove` + `new` and `remove` + `upsert` are rejected with `9 FailedToParse`,
+  and the document is left in place.
+- A remove's `lastErrorObject` is `{n: 1}` (or `{n: 0}` when nothing matched).
+  Update and upsert replies keep `updatedExisting` and `upserted` as before.
+- `Cannot specify both an update and remove=true` gains the article mongod uses.
+
+Probed on mongod 6.0.16 — the version the live differential gate spawns — and
+cross-checked on 8.3.4. Every behaviour above is identical on both; only the
+error wording differs (8.3 quotes the field names), and SecantusDB advertises 7.0,
+so 6.0's wording ships.
+
+### The pymongo gauge measured the two servers against different `bson` versions
+
+The gauge is the project's headline MongoDB-compatibility number and it is
+routinely used to compare the two servers. It was not comparing like with like:
+
+```
+python mode   pymongo -> vendor/pymongo-tests/pymongo   (4.17.0)
+              bson    -> site-packages/bson             (4.18.0)   <- MIXED
+rust mode     pymongo -> vendor/pymongo-tests/pymongo
+              bson    -> vendor/pymongo-tests/bson
+```
+
+The split is import **order**, not configuration. `_start_server("python")` does
+`from secantus import SecantusDBServer`, and `secantus` imports `bson` — at a
+point before pytest has inserted the vendored tree into `sys.path`, so the name
+binds to site-packages and stays bound for the rest of the run. Rust mode never
+imports Python `bson` at that moment (`_secantus_server` is a compiled
+extension), so `bson` resolves later, to the vendored copy.
+
+That produced a **phantom server difference**: `test_default_exports::test_bson`
+failed on the Python server and passed on the Rust one, because vendored `bson`
+takes `Generator` from `typing` (which the test skips) and site-packages `bson`
+takes it from `collections.abc` (which it does not). Nothing to do with either
+server.
+
+The plugin now puts `vendor/pymongo-tests` on `sys.path` in its
+`pytest_load_initial_conftests` hook, before the server import. Both modes load
+the same vendored `bson` / `pymongo` pair, and the two servers' numbers became
+identical:
+
+| server | before | after |
+| --- | --- | --- |
+| rust | 1277 passed / 5 failed | 1277 / 5 (unchanged — it already used the vendored pair) |
+| python | 1276 passed / **6** failed | 1277 / **5** |
+
+Both failure lists are now byte-identical and are exactly the five
+known-standing ones (`test_index_hashed`, `test_index_text`, `test_where`, all
+out of scope; `test_maxtime_ms_message` / `test_to_list_csot_applied`, pymongo's
+client-side CSOT formatting). The Python server's headline figure moves 99.53%
+to 99.61% by removing a harness artifact, not by any change in behaviour.
+
+#### Fixed
+
+- `pymongo_validation/plugin.py`: the vendored test tree goes on `sys.path`
+  before the embedded server is imported, so `bson` cannot bind to
+  site-packages first.
+
+### A test was excluded for a reason that turned out not to be true
+
+Two psycopg tests that connect to reserved, unroutable addresses failed twice
+during full gauge runs, and were excluded with a note explaining that the host's
+network stack had answered the address immediately instead of letting the
+attempt time out. That explanation was plausible, was written as though it were
+a measurement, and was never checked.
+
+It does not hold. Connecting to those addresses in a loop fails six times out of
+six after four seconds with exactly the error the test expects, and re-enabling
+both tests in a full gauge run — with the machine simultaneously busy running
+another test suite — passed them. The exclusion has been removed.
+
+What remains true is that the two failures happened, took forty milliseconds
+rather than four seconds, and are unexplained. That is now an open question with
+a note on how to answer it: capture the exception text, because the errno
+distinguishes a routing answer from resource exhaustion, and resource exhaustion
+would make it a defect in this project's own test harness rather than a property
+of the machine it ran on.
+
+#### Fixed
+
+- `test_connect_error_multi_hosts_each_message_preserved` and its async twin run
+  in the psycopg gauge again.
+
+#### Changed
+
+- The unexplained failures are recorded as an open backlog item rather than an
+  exclusion, with instructions to capture the error before forming a theory.
+
+### A failing gauge run could print a perfect pass rate
+
+`docs/validation-report-php-lib.md` published this, live:
+
+```
+| **Overall** | **3089** | **1** | **40** | **3130** | **100.0%** |
+```
+
+3089 passed, **one failed**, scored 100.0%. Every report formatted its rate with
+`f"{...:.1f}%"`, which rounds — and 3089/3090 is 99.9676%. The website's driver
+panels are generated from those reports, so the claim was on the public site.
+
+The threshold is one failure in ~2000 tests, which is exactly where the healthy
+gauges now sit: the better the servers get, the likelier their own reports are
+to overstate them.
+
+#### Fixed
+
+- One shared `validation_summary.rates.pass_rate` that **floors** to the
+  displayed precision, so only a genuinely clean run can print `100.0%`. Raising
+  the precision was considered and rejected — `99.98%` still reads as "perfect"
+  to someone skimming, whereas `99.9%` beside a visible failure count does not.
+- Adopted across 16 per-gauge report generators, the cross-driver summary
+  (`validation_summary/generate.py`, including its adjusted rate) and the
+  website panels (`driver_panels.py`), replacing nineteen copies of the same
+  rounding idiom.
+- `tests/test_validation_pass_rate.py` pins both halves: the arithmetic, and
+  that a real generator actually *uses* it — verified by reverting one
+  generator and watching the test fail.
+
+### `$group` gave every NaN its own bucket
+
+Two documents with `a: NaN` grouped as **two buckets of one** where mongod
+reports one bucket of two. A wrong aggregation result rather than an error, so
+nothing surfaced it — the kind that gets absorbed into a report and never
+questioned.
+
+Python dicts key a NaN by IDENTITY: `hash(nan)` is 0 so it *is* hashable, but
+`nan != nan`, so it never matches itself on lookup. The group-key
+canonicaliser returned hashable values unchanged, and every NaN became its own
+key.
+
+**Both engines were wrong, differently, and both cited the other as their
+authority.** The Rust side *deferred* on NaN — safe while the pure engine is
+behind it, but the standalone Rust server has no Python behind a defer, so
+`$group` by a NaN could not group at all there. Its comment justified this with
+"NaN never equals itself in a dict probe", and the key type's doc header
+described itself as mirroring "Python dict equality". Both describe Python, not
+the server.
+
+mongod's rule is simpler than either implementation assumed (probed 8.2.11,
+2026-09-05): **every NaN is one key**, a `Decimal128` NaN merges with a double
+NaN into that same key, and the rule applies inside arrays and subdocuments.
+
+Neighbours on the same key path were checked: `$sortByCount` and compound group
+keys had it too and are fixed with it. `$addToSet`, `$setUnion` and sorting were
+already correct, which is why nothing had surfaced this.
+
+#### Fixed
+
+- `aggregate.py`: `_hashable_scalar` maps every NaN — float or `Decimal128` —
+  to one canonical bucket key, before the plain-hashable path that returned it
+  unchanged.
+- `crates/secantus-core/src/group.rs`: `GKey::Nan` replaces the defer, so the
+  standalone Rust server groups a NaN instead of failing on it. A non-NaN
+  `Decimal128` still defers, which is a separate gap.
+
+### The published benchmark table is generated, not pasted
+
+`docs/benchmark.md`'s "Over a real network" head-to-head table was the last
+benchmark surface a human had to update by hand.
+
+#### Added
+
+- `bench.head_to_head_chart` rewrites it from
+  `bench/results/do/<run>/comparison.md`, the artifact `release-benchmark`
+  already writes, and `--check` exits non-zero when the page is stale.
+- `tests/test_benchmark_table_fresh.py` runs that check, so a forgotten refresh
+  fails the suite instead of silently publishing old numbers. It went stale
+  twice: once leaving a post-lz4 droplet section above a pre-lz4 latency table,
+  and once running two releases behind while the header directly above it named
+  a different mongod version.
+
+### `delete` and `update` performed the write when the hint named no index
+
+Phase 2 of `tasks/remaining-work-plan.md`, third surface: index and query
+planning, probed against a live mongod 6.0.16. The headline is not a missing
+error message — it is **an operation MongoDB declines to run being executed**.
+
+#### Fixed
+
+- **`delete` and `update` ignored their per-statement `hint` entirely.** mongod
+  refuses the statement when a hint names no index — `n: 0` plus a writeError —
+  rather than falling back to a collection scan. Both commands dropped the
+  field and performed the write, so a caller who hinted a typo'd index name had
+  their delete applied. Now a per-statement writeError (code 2), with the batch
+  stopping or continuing per `ordered`, exactly like the other per-statement
+  errors on those commands.
+- **`explain` did not validate a hint** — and `explain` is what you run to
+  *check* one. `find`, `count` and `aggregate` all rejected an unresolvable
+  hint already; `explain` alone reported a `COLLSCAN`, which tells the caller
+  their hint is fine and that it is being ignored, in the same breath.
+- **`explain` fabricated plans for commands that do not exist.**
+  `{explain: {nosuchcmd: "c"}}` answered a plausible `COLLSCAN` with `ok: 1`;
+  so did `{explain: {}}` and a non-document `explain` argument, the latter
+  inventing a namespace (`<db>.$cmd`) to report it against. They now answer
+  mongod's `CommandNotFound` (59) and `TypeMismatch` (14). Confidently wrong is
+  worse than absent here: a client explaining a mistyped command got an answer
+  about a query that could never run.
+- **`{$natural: -1}` did not reverse the scan.** Both directions resolved to
+  the same `"$natural"` token, dropping the sign, so a caller asking for
+  reverse insertion order silently got forward order.
+- **`distinct` accepted any field and ignored it**, so a misspelled option was
+  silently dropped. Unknown fields now answer `Location40415`.
+- **`explain.verbosity` conflated two errors.** mongod separates a wrong *type*
+  (`TypeMismatch`, 14) from an invalid *enum value* (`BadValue`, 2, with its
+  own wording); we emitted one hand-written message for both.
+
+#### Known divergences, recorded rather than changed
+
+Both are deliberate and are described in `tasks/backlog.md`:
+
+- `hint: "$natural"` **as a string** is accepted here and rejected by mongod,
+  which takes only the document form. It is a documented SecantusDB
+  convenience with existing tests, and pymongo's `.hint("$natural")` produces
+  exactly that string.
+- `distinct.hint` is accepted although 6.0.16 rejects it, because a later
+  MongoDB release added the option — accepting is the safe direction for a
+  field whose status changed between versions.
+
+The `explain` **stage vocabulary** (`SORT` / `LIMIT` / `SKIP` /
+`PROJECTION_SIMPLE` wrappers, `COLLSCAN`'s `direction`, `IDHACK`,
+`COUNT_SCAN`, `DISTINCT_SCAN`, populated `rejectedPlans`, `explainVersion`) is
+a separate and much larger piece of work, now scoped as one backlog item rather
+than half-built — a partial stage tree would be more misleading than an
+honestly flat one.
+
+### Every command that takes a `hint` now resolves it, on both servers
+
+A hint tells MongoDB which index to use, and MongoDB refuses a command whose
+hint names no index rather than quietly scanning instead. SecantusDB got that
+right for six of the seven commands that accept one. `distinct` was the
+exception: it accepted the field and then ignored it, so a typo'd index name
+returned a full result set where a real server returns an error.
+
+Probing that gap across all seven commands turned up three more divergences,
+two of them on the Rust server only — the kind that a Python-versus-Rust parity
+test cannot see, because both servers were consistent with each other and both
+were wrong. One of them returned **wrong data rather than an error**: the Rust
+server ignored the direction in `{$natural: -1}` and walked the collection
+forwards.
+
+The hint surface now matches mongod 8.2.11 exactly on all eleven shapes
+probed, on the Python server, the Rust server, and a real `mongod`
+side-by-side.
+
+#### Fixed
+
+- `distinct` resolves its `hint` like every other read. A valid index name or
+  key spec is honoured (including a sparse index's reduced document set); one
+  naming no index answers `BadValue` (code 2) instead of returning every value.
+- The `$natural` **string** is rejected on both servers. MongoDB accepts
+  `$natural` only in the document form, and `findAndModify` already enforced
+  that here while `find` did not.
+- **Rust server:** `{$natural: -1}` walks the collection backwards. It
+  previously resolved to the same token as `{$natural: 1}` and returned forward
+  insertion order — the Python server had fixed this and the port had not.
+- **Rust server:** an unresolvable `hint` on `delete` / `update` is a
+  per-statement `writeErrors` entry with `ok: 1`, matching mongod, instead of
+  failing the whole batch command.
+
+#### Changed
+
+- **`hint="$natural"` is now an error.** This is a behaviour change for anyone
+  passing the string, including `pymongo`'s `.hint("$natural")` — but it is the
+  same error a real MongoDB server gives, which is the point. Use
+  `.hint([("$natural", 1)])` or `hint={"$natural": 1}`; both work against
+  SecantusDB and MongoDB alike. `docs/indexes.md` and
+  `docs/feature-comparison.md` record the document form.
+
+### `invoke sync` now produces a environment that can actually run the suite
+
+The task that sets up a development environment installed only the base test
+dependencies. That left out the compiled Rust engine, and because the ~1700 tests
+that compare the Rust and Python engines skip themselves when it is missing — on
+purpose, so the pure-Python parts still work anywhere — the suite would run to
+completion, report success, and be about 1700 tests short. Nothing failed; the
+tests simply were not there.
+
+It also never rebuilt that engine when its source changed, so pulling a change to
+the Rust side left the comparison running against a stale build. That surfaced as
+31 failures on a perfectly healthy main branch, which looks exactly like someone
+broke something.
+
+Both are fixed, and the reasoning is written down next to the task and in the
+project guide so the next person does not have to rediscover it.
+
+#### Fixed
+- `invoke sync` installs all extras and forces a rebuild of the Rust engine.
+
+### Merging two jsonb objects with `||` produces JSON again
+
+`'{"x":1}'::jsonb || '{"y":2}'::jsonb` returned `{'x': 1}{'y': 2}` — the two
+values rendered as Python dictionaries and glued together as text. Single
+quotes, no merge, and not valid JSON. Nothing errored; the wrong value simply
+came back, and any code parsing the result failed somewhere further along.
+
+Two objects now merge, with the right-hand operand winning on conflicting keys,
+as PostgreSQL does.
+
+Concatenations where either side is an array or a scalar are unchanged and
+still differ from PostgreSQL in how the result is *typed* — the values are
+right but render as an array literal rather than JSON. That is tracked
+separately.
+
+#### Fixed
+
+- `jsonb || jsonb` merges two objects instead of concatenating their Python
+  representations as text.
+
+### Two internal server errors replaced with real answers
+
+Deleting a key from a jsonb value — `data - 'key'` — returned "internal server
+error". The operator fell through to Python's subtraction, which has no meaning
+for a dictionary, and the resulting failure surfaced with no indication of what
+had gone wrong. It now deletes the key, along with the rest of PostgreSQL's
+rules for the operator: removing a key that isn't there changes nothing,
+deleting from an array works by index (counting from the end for a negative
+one), a list of keys deletes each, and the combinations PostgreSQL rejects —
+an integer index into an object, or deleting from a scalar — are rejected the
+same way.
+
+Separately, an arithmetic expression whose operands have no matching operator
+(`'\x01'::bytea + 1`) also returned "internal server error", for the same
+underlying reason: the raw Python operation was attempted and its failure
+escaped. It now reports `operator does not exist: bytea + integer`, naming both
+operand types the way PostgreSQL does.
+
+#### Fixed
+
+- `jsonb - key`, `jsonb - index` and `jsonb - key[]` work instead of returning
+  an internal server error.
+- An arithmetic operation with no operator for its operand types reports
+  `42883 operator does not exist` instead of an internal server error.
+
+### Opening a database no longer builds two tables nothing uses
+
+Every time a SecantusDB store opened, it created two WiredTiger tables that no
+current code ever writes to: the single documents table that predates
+per-collection sharding, and the old forward index that insertion order replaced.
+They existed only so a one-time migration and the collection-drop paths could
+look at them and find nothing. Each table costs about ten milliseconds to create,
+on every open, forever.
+
+They are no longer created. A store that already has them still migrates and
+drops from them correctly — every reader treats a missing table as an empty one —
+so existing databases are unaffected and remain readable by both servers. Opening
+a store is about 9% faster, which shows up wherever a server is started: tests,
+short-lived tools, and anything that opens a database per operation.
+
+#### Changed
+- The legacy `secantus_documents` and `secantus_natural` tables are no longer
+  created when a store is opened, on either server.
+
+#### Fixed
+- A pre-existing clippy warning in `secantus-storage`, which sits outside the
+  clean-workspace lint gate and so had gone unreported.
+
+### `listIndexes` can be paginated again
+
+A `listIndexes` cursor was registered under a `db.$cmd.listIndexes.<coll>`
+pseudo-namespace, but drivers put the plain collection name in the follow-up
+`getMore`'s `collection` field. The `getMore` ownership check — which compares
+the caller's claimed namespace against the cursor's stored one, and is right to
+exist — therefore rejected every continuation with `CursorNotFound`. In practice
+any collection with more indexes than the batch size could not have its index
+list read to the end.
+
+Real mongod reports that cursor under the plain `db.coll` namespace. Note this
+is not a blanket "drop the `$cmd` prefix": probed on mongod 8.3.4,
+`listCollections` really is `db.$cmd.listCollections` and the collectionless
+`aggregate: 1` form really is `db.$cmd.aggregate`. Both were already correct;
+only `listIndexes` was wrong.
+
+#### Fixed
+
+- `listIndexes` cursors are registered and reported under `db.coll`, so a
+  `getMore` continuation succeeds and every index is returned. Fixed on both the
+  Python and Rust servers.
+- The `getMore` cross-namespace ownership check is unchanged — a continuation
+  claiming a different collection is still rejected with `CursorNotFound`.
+
+### `$graphLookup` stopped following a chain at the first null link
+
+Phase 2 of `tasks/remaining-work-plan.md`, fourth surface: 27 `$lookup` /
+`$graphLookup` shapes against a live mongod 6.0.16. **20 diverged.**
+
+The worst was a **short answer with no error**. `$graphLookup` treated a null
+`connectFromField` as "no further links", so a four-document chain came back
+with one document in it. Nothing failed; the traversal simply stopped early,
+which is the hardest kind of wrong to notice.
+
+#### Fixed
+
+- **A null link no longer ends the traversal.** mongod follows it to documents
+  whose `connectToField` is explicitly null; only a *missing* link stops the
+  walk. Both halves were wrong in the same place, because the value was tested
+  for `None` — which conflated missing with null.
+- **A null link no longer reaches documents that lack the field.** Missing and
+  null are different values here; comparing `get_path`'s `None` for both made
+  every field-less document reachable from a null.
+- **An empty-array `localField` matches null.** mongod unwinds the local array
+  for matching and an empty one still joins against the null-valued foreign
+  rows; we produced no lookup keys at all and matched nothing. **Both** join
+  paths had it — the hash join and the index-driven one — and the index path
+  carried a comment asserting mongod's `$in: []` semantics that the oracle
+  contradicts. A `$lookup`'s `localField` is not an `$in`.
+- **`as` is a path, not a key.** `as: "a.b"` now produces `{a: {b: [...]}}`
+  instead of a literal key with a dot in it — the same bug, and the same fix,
+  as the dotted-equality upsert seed fixed earlier in this campaign. Wherever a
+  user-supplied path is used as a key, it has to go through `set_path`.
+- **Two crashes.** `$lookup` with `let: 5` reached `.items()` and with
+  `pipeline: 5` was iterated; both raised bare exceptions that escaped as
+  `internal server error` (code 1).
+- **Argument errors name the argument.** mongod answers `FailedToParse` (9)
+  with a per-argument message; we answered `TypeMismatch` (14) with one of two
+  generic sentences that named neither the field nor the problem. Which message
+  applies to a half-specified field pair depends on whether a `pipeline` is
+  present — probed both ways.
+- **Unknown arguments are rejected** on both stages (`$lookup` → 9,
+  `$graphLookup` → `Location40104`). They were accepted and ignored, so a
+  misspelled `foreignFeild` silently became a join over the whole foreign
+  collection.
+- **A negative `maxDepth` is rejected** (`Location40101`). It was accepted and
+  matched nothing, so every document got an empty array — which reads as "no
+  connections" rather than "bad option".
+
+#### Correction
+
+`$graphLookup` was first reported here as "does not recurse at all". It does.
+The original fixture happened to put a null link on the very first hop, so one
+narrow bug looked like a missing feature; a chain with no nulls showed the
+traversal, the `maxDepth` cut-off and an array `startWith` all working. The fix
+is a guard, not an implementation.
+
+### Malformed aggregation pipeline elements now fail like mongod
+
+A `pipeline` array element that isn't a document — `pipeline: [42]` — crashed the
+Python server. `_apply_stage` called `len()` on the raw element, so a scalar
+raised `TypeError: object of type 'int' has no len()` and the client got a bare
+`internal server error` (code 1) with no indication of what was wrong. Real
+mongod answers `14 TypeMismatch` with a specific message, and libmongoc's
+`/change_stream/accepts_array` asserts on it verbatim.
+
+Chasing that surfaced two further divergences in the same area. Our arity error
+for a stage that *is* a document but isn't a single `{operator: spec}` pair used
+the generic code 14 and our own wording, where mongod uses a dedicated
+`Location40323`. Worse, the leading-`$match` optimisation matched on
+`"$match" in stage` alone: a malformed two-key stage such as
+`{"$match": {...}, "$count": "n"}` had its filter hoisted into the initial fetch
+and the stage dropped, so the `$count` was silently discarded and the aggregate
+returned wrong results instead of an error.
+
+All the malformed-pipeline responses are now byte-identical to mongod, verified
+by differential probe against 6.0.16 and 8.3.4 (which agree with each other).
+
+#### Fixed
+
+- `aggregate` with a non-document pipeline element (`42`, `"str"`, `[...]`,
+  `null`, a bool, a double) returns mongod's `14 TypeMismatch` /
+  *"Each element of the 'pipeline' array must be an object"* instead of crashing
+  with an unhandled `TypeError` behind a generic `internal server error`.
+- A stage document with the wrong number of fields — an empty `{}` or a
+  multi-key stage — returns mongod's `40323 Location40323` /
+  *"A pipeline stage specification object must contain exactly one field."*,
+  replacing our own code-14 wording.
+- The leading-`$match` initial-filter lift now requires a single-key stage, so a
+  malformed multi-key stage is rejected rather than partially applied and
+  dropped.
+- The Rust server had the same gaps on its plain-`aggregate` path, where both
+  malformed shapes were skipped by `continue` during validation, and had no
+  arity check on its change-stream path (an empty stage was misreported as
+  `40324` *"Unrecognized pipeline stage name: ''"*). Both now match mongod and
+  share the message constants with the change-stream path, which already had the
+  element-type error right.
+
+### `maxTimeMS` actually times operations out
+
+`maxTimeMS` was parsed and validated exactly the way MongoDB validates it — and
+then ignored. The operation ran to completion and answered `ok` where MongoDB
+aborts it with `MaxTimeMSExpired`. That is invisible on a fast operation, which
+is why it survived: a sweep at a one-second budget shows nothing, because
+nothing takes a second. At a two-millisecond budget it shows up everywhere.
+
+A deadline cannot be a parse-time check, because the thing being bounded is
+elapsed time inside the handler. It is now a thread-local budget armed around
+the command and polled from the loops whose length tracks the data: the storage
+scan and its predicate pass, `count`'s own scan, the write commands' candidate
+selection, the index build, and the aggregation pipeline between stages. An
+expired budget answers `50 MaxTimeMSExpired`, and `createIndexes` wraps it in
+MongoDB's index-build envelope, both reproduced from a probe of 8.2.11.
+
+Enforcement is cooperative and polls once every 64 documents, so an operation
+can overrun by up to that many — MongoDB's own enforcement is interrupt-point
+based and has the same property. `getMore` is deliberately excluded: there
+`maxTimeMS` is the `awaitData` wait budget, and arming a deadline would make
+every tailable poll report a timeout the moment it waited out its budget.
+
+The write path polls candidate *selection* only, which happens before anything
+is written, so an expired budget leaves nothing half-applied.
+
+#### Added
+
+- `secantus/deadline.py`: the thread-local budget, armed by `dispatch`.
+
+#### Fixed
+
+- `commands.py` / `storage.py` / `aggregate.py`: `maxTimeMS` is enforced on
+  `find`, `count`, `distinct`, `aggregate`, `update`, `delete` and
+  `createIndexes`.
+
+### `maxTimeMS` is checked on every command, not just `find`
+
+`maxTimeMS` is a generic command field — MongoDB's IDL validates it on
+everything from `find` to `ping` — but SecantusDB checked it in `find` alone.
+On the other twenty-three commands that accept it, a wrong-typed value was
+taken without complaint: `db.command({"aggregate": "c", "pipeline": [],
+"cursor": {}, "maxTimeMS": "x"})` ran the pipeline and reported success. That is
+the silently-accepted failure mode, where a driver bug reaches the application
+as a correct-looking answer. The check now runs once in `dispatch`, beside the
+`readConcern` and `apiVersion` checks, so every command gets it.
+
+The four behaviours it checked were also still the MongoDB 6.0 ones, and 8.x
+honours none of them. A wrong type is now a `TypeMismatch` (14) naming the IDL
+struct, not a `BadValue` (2); a fractional value is `FailedToParse` (9); the
+negative and out-of-range messages changed wording and gained an upper bound of
+2147483647; and an explicit `null` is now accepted, meaning the field was not
+sent. The old code's own docstring described the slot as "the only one in this
+sweep that is not a TypeMismatch", which is exactly what stopped being true.
+
+Three of the rules would have been wrong if reasoned about rather than
+measured, so all of them were probed across 24 commands against a live
+`mongod` 8.2.1 — 436 cases, matching exactly. The IDL struct name in the type
+error is the command's own name for all twenty-four *except* `find`, which
+reports `FindCommandRequest`. The check order matters: `-1.5` is both
+non-integral and negative, and MongoDB answers the integral error rather than
+the range one. And a fractional `Decimal128` gets different wording from a
+fractional `double` for the same numeric value. Where the check sits in dispatch
+was measured too — `CommandNotFound` takes precedence over it, while it takes
+precedence over the authorization check.
+
+Separately, `createIndexes` with an explicit `indexes: null` answered MongoDB
+6.0's `10065` where 8.x treats an explicit null as the field being absent and
+answers `40414`, identical to omitting it — the same null-means-absent rule
+already applied to `findAndModify`'s `arrayFilters` and `killCursors`'
+`cursors`.
+
+Both fixes land on **both servers**. The Rust server had ported the same 6.0
+contract, comment and all, and called it from three commands rather than one —
+so it shared the bug in a slightly milder form. Neither the engine-parity suites
+nor the driver gauges would have caught the drift, because this is command-layer
+behaviour that no parity suite covers.
+
+#### Fixed
+
+- `maxTimeMS` is validated on every command that accepts it, not only `find`;
+  `aggregate`, `count`, `distinct`, `insert`, `update`, `delete` and 17 others
+  previously accepted a wrong-typed value silently.
+- `maxTimeMS` follows the MongoDB 8.x contract: `TypeMismatch` (14) with the IDL
+  struct name for a wrong type, `FailedToParse` (9) for a non-integral or
+  unrepresentable number, `BadValue` (2) for a value below 0 or above
+  2147483647, and an explicit `null` accepted as absent.
+- `createIndexes` with `indexes: null` answers `40414 IDLFailedToParse`, the
+  same reply as omitting the field, instead of `10065`.
+- The Rust server gets both fixes, having carried the same MongoDB 6.0 contract
+  and validated `maxTimeMS` on three commands rather than all of them.
+
+### A `$meta` projection no longer discards the document
+
+Asking for a metadata field — `find({}, {score: {$meta: "recordId"}})` — came
+back with just `_id`. Every other field was gone. The projection was being
+treated as an inclusion list, so naming one metadata field silently excluded
+everything else.
+
+MongoDB treats `$meta` the way it treats `$slice`: as something that reshapes a
+value, not as an instruction about which fields to keep. A projection
+containing only `$meta` returns the whole document; combining it with a real
+inclusion or exclusion field lets that field decide, and `_id: 0` still drops
+the identifier.
+
+The metadata value itself is still not computed, so the requested field is
+absent from the result — but the document it was asked about now comes back
+intact.
+
+#### Fixed
+
+- A `$meta` projection returns the document instead of reducing it to `_id`.
+  `{_id: 0}`, and combining `$meta` with an ordinary inclusion or exclusion
+  field, all behave as MongoDB does.
+
+### `$meta` projections return real values
+
+`{$meta: "recordId"}`, `"sortKey"` and `"indexKey"` validated cleanly and then
+produced nothing — the field was simply absent from every document. MongoDB
+returns real metadata for all three, and SecantusDB has the data behind each of
+them (a RecordId per row, the sort specification, the index the query chose); it
+was never plumbed through to the projection.
+
+All three now compute. `sortKey` reports the sort fields in order, taking the
+same representative element for an array-valued field that the sort itself took,
+and `null` for a missing one. `indexKey` reports the indexed fields' values, and
+only for a real secondary-index scan — a collection scan and the `_id` fast path
+both omit the field, as MongoDB does. Asking for `sortKey` without a sort is now
+the error MongoDB gives rather than a silently missing field, and an unrecognised
+`$meta` argument reports MongoDB's wording (`Unsupported $meta field: zzz`) in
+place of our own paraphrase, which a test had been pinning.
+
+One deliberate difference: SecantusDB's RecordId is a store-wide insertion
+counter where MongoDB restarts it per collection, so the numbers differ for a
+second collection in the same store. The properties a caller can use — unique
+per row, ascending in insertion order, unchanged by sorting the output — hold.
+Matching the numbers would mean a per-collection counter, and that counter is
+the document table's key, shared byte-for-byte with the Rust server.
+
+The metadata SecantusDB has no machinery for at all — text scoring, Atlas Search,
+`$geoNear` distances — still validates and then omits its field, which is
+graceful degradation rather than a wrong value.
+
+#### Fixed
+
+- `projection.py` / `storage.py`: `$meta` values are computed for `recordId`,
+  `sortKey` and `indexKey`; `sortKey` without a sort is rejected; the unknown-
+  argument message matches MongoDB.
+
+### A `MinKey` / `MaxKey` bound skipped documents that had no such field
+
+`$gt` / `$gte` / `$lt` / `$lte` are **type-bracketed** — `{x: {$gt: 3}}` matches
+numbers greater than 3 and nothing else. `MinKey` and `MaxKey` are the two
+bounds that escape that bracketing, because mongod compares them against every
+type, and an **absent** field is one of the things they must reach: mongod's
+query language treats a missing field as `null`, which ranks above `MinKey` and
+below `MaxKey`.
+
+Both servers skipped an absent field outright in the range comparison, so
+`{x: {$gt: MinKey()}}` and `{x: {$lt: MaxKey()}}` — the idiomatic "match
+everything" bounds — left out every document that lacked the field entirely.
+
+The fix is to compare an absent field as `null` rather than skip it, which is
+safe for the ordinary bounds precisely *because* they are bracketed: `{x: {$gt:
+3}}` then compares `null` against a number, the brackets differ, and the
+document is dropped exactly as before. Both halves are pinned, along with the
+null bounds, whose own rule (`$gte` / `$lte` match null and missing, `$gt` /
+`$lt` match nothing) is unchanged.
+
+#### Fixed
+
+- `secantus.query` / `secantus-core`: a range comparison treats an absent field
+  as `null`, so a `MinKey` / `MaxKey` bound returns the documents that have no
+  such field, as mongod does.
+
+Filed while probing the same surface, and materially worse than the entry that
+described it: computed projections (`{lit: {$literal: 7}}`) are unimplemented,
+and the Python server drops the field **silently** — `ok: 1`, and a document
+without the field the client asked for. The Rust server refuses honestly, which
+is the better of the two behaviours. Eleven measured shapes are in the backlog
+with the two semantics that are easy to get wrong.
+
+### "Missing" now propagates through `$cond`, `$switch`, `$let` and `$ifNull`
+
+mongod distinguishes a *missing* value from an explicit `null`, and the operators
+whose result **is** one of their sub-expressions pass that missing-ness along. A
+`$cond` whose taken branch is missing is itself missing — so `$addFields` omits
+the field rather than writing a null. Both servers wrote the null.
+
+Measured against mongod 8.2.11: **1 of 7** shapes were correct before this
+(`$getField` alone).
+
+#### Fixed
+
+- `$cond`, `$switch`, `$let` (its `in`) and `$ifNull` now return the missing
+  marker when the sub-expression they select is missing, on **both** servers.
+  `{"$addFields": {"z": {"$cond": [true, "$nosuch", 1]}}}` omits `z`, as mongod
+  does, instead of writing `z: null`.
+- **It matters in operator position too, not just as a field value.**
+  `{"$eq": [{"$cond": [true, "$nosuch", 1]}, null]}` is **false** on mongod,
+  because the result is missing rather than null — we answered true. The
+  comparison operators already distinguished the two for a bare field path; now
+  a value reaching them *through* a control-flow operator is distinguished as
+  well.
+- `$ifNull` skips a missing argument exactly as it skips a null one, and returns
+  missing when every argument is.
+
+The operators that **compute** a value — `$add`, `$concat`, `$arrayElemAt`,
+`$first` — still collapse missing to null, which both engines already had right.
+That split is the whole rule: *return* a sub-expression and missing-ness travels,
+*compute* one and it does not.
+
+#### Notes
+
+- `expressions.evaluate_or_missing` was a second copy of the field-value rule,
+  and the copies had already drifted once: the `$$REMOVE` fix had to be written
+  twice. It now delegates to the single implementation, so this change did not
+  need writing twice too.
+- The engine-parity fuzz suite caught the mid-port state (Python propagating,
+  Rust not) on a seeded expression — exactly what it is for. Worth recording that
+  the expression it failed on is one mongod itself rejects, so the parity gate is
+  pinning the two engines to each other there, not to the reference server; the
+  isolated question it raised was then settled against mongod directly.
+
+25 cases added to `tests/test_mongod_differential.py`, covering both positions
+and both families (propagating and computing), so the split cannot quietly move.
+
+### A missing field compared equal to null in every aggregation comparison
+
+A targeted sweep, motivated by the Phase 2 differential campaign: `get_path`
+returns `None` for both an absent field and an explicit null, so anywhere the
+code tested a resolved value for `is None` it had conflated them. That
+confusion produced both `$graphLookup` bugs and the `$lookup` `let` gap found
+earlier in the campaign, so the question was how far it spread.
+
+25 shapes probed against mongod 6.0.16. **22 were already right** — the *query*
+language deliberately does treat them alike (`{a: null}` matches a missing
+field, and that is mongod's behaviour too). The divergence was confined to the
+**comparison operators**.
+
+#### Fixed
+
+- **`$eq: ["$absent", null]` answered true**; mongod answers false, while
+  `$eq: ["$explicitNull", null]` is true. Every comparison against null matched
+  documents that did not have the field at all, and `$cond` built on `$eq`
+  inherited it.
+- **A missing field now ranks below every real value**, MinKey included
+  (`$cmp: ["$absent", MinKey]` is `-1`), and equals only another missing field.
+  `$ne` / `$lt` / `$lte` / `$gt` / `$gte` / `$cmp` all follow.
+- **`$let` bound a missing field as null.** A var bound from an absent field
+  now stays missing, so `$eq: ["$$v", null]` is false the way mongod's is.
+- **`$lookup`'s `let` had the same bug**, which is how it was found: a document
+  without the local field joined foreign rows mongod excludes. This closes the
+  gap recorded when `$lookup` was swept.
+
+The Rust engine carries the identical rule — the parity fuzz caught the
+divergence within seconds of the Python change, which is exactly its job.
+
+#### Corrected
+
+`_eval_field_value`'s docstring (and its Rust mirror) claimed
+`{$add: ["$nope", 1]}` is `1`. mongod answers `null`; arithmetic over null is
+null. The *behaviour* was already right — only the note about it was wrong, and
+a test written from that comment failed against the real server. That is the
+sixth instance in this campaign of a comment asserting something the oracle
+contradicts.
+
+### Eight more test files share a server
+
+The same treatment as the previous two rounds, applied to files that build their
+server, client and database in a single fixture: one server per file instead of
+one per test, with each test dropping what it created so the next sees a clean
+server. Their combined runtime falls from 26 seconds to 3.5.
+
+Five otherwise-eligible files were deliberately left alone because their fixture
+inserts seed data. Sharing the fixture would run that seed once and the per-test
+cleanup would then delete it out from under every later test — the tests would
+still pass individually and fail together, which is the worst kind of change to
+make casually.
+
+#### Changed
+- Eight further test modules share a module-scoped server.
+
+### The seeded test files share a server too, without sharing their data
+
+Five test files were held back from the previous rounds because their fixture
+inserts seed data before each test. Sharing that fixture would have seeded once
+and then let one test's writes reach the next.
+
+They now split the difference: the server is created once per file, but each test
+still gets its own client, its own fresh seed, and drops its database on the way
+out. Only the cost is shared, never the state. Their combined runtime falls from
+40 seconds to 3.
+
+#### Changed
+- Five further test modules share a module-scoped server while keeping their
+  per-test seeding and isolation.
+
+### Nine test files share one database server instead of standing up dozens
+
+Most test files start a fresh database server for every single test, which is the
+safe default but costs about a quarter of a second each time. Where a file's tests
+already write to separate collections, none of that isolation is actually being
+used — the tests cannot see each other regardless.
+
+Nine such files now start one server per file. Their combined runtime drops from
+101 seconds to 14. The selection was made by checking that every collection name
+in the file is unique and that nothing in it depends on a private server, rather
+than by judgement, so files involving change streams, the oplog, reopening a
+store, capped collections, TTL clocks or authentication are untouched.
+
+#### Changed
+- Nine test modules take a module-scoped server fixture.
+
+#### Fixed
+- `invoke rust-test`'s description claimed it tested the whole Rust workspace. It
+  tests the *clean* workspace, which excludes the six WiredTiger-linked crates —
+  the entire storage layer and the shipped binary — so it could report success
+  having never compiled them.
+
+### Nine more test files share a server, by cleaning up after themselves
+
+A previous change let test files share one database server, but only where every
+test happened to use a differently-named collection. That ruled out most files —
+not because they genuinely needed their own server, but because two tests
+happened to pick the same collection name.
+
+Those files now share a server too, and get their clean slate a cheaper way: each
+test drops the databases it created when it finishes, so the next test sees a
+server that looks new. That turns out to cost far less than starting a fresh
+server, and it needed no changes to any test's body. The nine files run in 6
+seconds instead of 23.
+
+The cleanup runs after the test rather than before, so a failing test leaves its
+data in place to be inspected.
+
+#### Changed
+- Nine further test modules share a module-scoped server, with a per-test
+  database reset providing isolation.
+
+### Error messages and codes now match a current MongoDB server
+
+SecantusDB's job is to be indistinguishable from a real MongoDB server, and that
+includes being wrong in the same places it is. Its error surface had been matched
+against MongoDB 6.0 — closely enough to reproduce a genuine quirk where 6.0 put a
+closing quote inside a bracket in one of its type-mismatch messages. MongoDB has
+moved on since, and the differences had quietly accumulated: negative batch sizes
+reported a different code, update failures were missing the wrapper newer servers
+put around execution errors, an explicitly null argument was rejected where a
+current server treats it as simply absent, and `$lookup` and `distinct` had both
+switched to generated argument parsing with a different family of messages.
+
+The surface is now matched against MongoDB 8.2, verified case by case against a
+real server rather than transcribed. Applications that key on error codes will
+see the current server's codes: a negative `limit`, `skip` or `batchSize` now
+reports `BadValue` rather than the old internal location code, and malformed
+`$lookup` arguments report the same missing-field and unknown-field codes a real
+server sends. The differential test suite that compares the two servers
+operation-by-operation passes in full, and the same changes have landed in the
+Rust server so both stay in step.
+
+#### Changed
+- Negative cursor-sizing values report `2 BadValue` instead of `51024`.
+- Type-mismatch messages carry the current server's per-field type lists.
+- Execution-time `update` and `aggregate` failures are wrapped in the server's
+  executor-error prefixes; parse-time failures are not.
+- An explicit `null` for `findAndModify.arrayFilters` / `killCursors.cursors` is
+  treated as an absent field.
+- `$lookup` and `distinct` argument errors use the generated-parser messages and
+  codes (`40414` / `40415` / `14`), with `IDLFailedToParse` / `IDLUnknownField`
+  code names.
+
+### Custom range types expose their auto-created multirange companion
+
+`CREATE TYPE testrange AS RANGE (...)` on the Rust PostgreSQL server now creates
+the companion MULTIRANGE type that PostgreSQL auto-creates alongside every range
+type, and psycopg's `MultirangeInfo.fetch` resolves it. Previously the companion
+was entirely absent: `MultirangeInfo.fetch(conn, "testmultirange")` errored
+`column "rngmultitypid" does not exist`, because `pg_range` had no
+`rngmultitypid` column, no per-range multirange oid was minted, and no
+multirange `pg_type` row existed.
+
+The multirange's name follows PostgreSQL's rule — substitute `multirange` for
+the first `range` in the range's name (`testrange` → `testmultirange`,
+`int4range` → `int4multirange`, `rangetest` → `multirangetest`), or append
+`_multirange` when the name contains no `range` (`foo` → `foo_multirange`). Each
+custom range mints a multirange oid and a multirange array oid, gets a
+multirange row in `pg_type` (its `typname` bare, as in PostgreSQL), and a
+`pg_range.rngmultitypid` pointing back at it. `to_regtype` resolves the
+multirange name in bare, `schema.name`, and quoted `sql.Identifier` forms, and a
+schema-qualified range's multirange is distinct from the public one's — mirroring
+the range schema-qualification from the previous release. All four
+`MultirangeInfo.fetch` forms resolve to the right oid and subtype, verified
+against a live PostgreSQL 14 oracle.
+
+#### Added
+
+- `pg_range` carries a `rngmultitypid` column, populated for both builtin ranges
+  (pointing at the builtin `int4multirange`/etc. types) and custom ranges
+  (pointing at a minted multirange oid, `range_oid + 200_000`; its array type
+  `+ 300_000`).
+- A multirange `pg_type` row is synthesized for every custom range, with a bare
+  `typname` derived by PostgreSQL's `range`→`multirange` naming rule and its own
+  array oid, so `MultirangeInfo.fetch` finds it after resolving `to_regtype` and
+  joining `pg_range`.
+- `to_regtype` resolves a custom multirange name (bare in `public`,
+  `schema.name` otherwise), distinct per schema; the reverse `oid::regtype::text`
+  rendering resolves a multirange oid back to its name.
+
+### A partial index hid every NaN row, and `$min`/`$max` ranked NaN by IEEE rules
+
+Widening two probe corpora to include values no earlier sweep had ever
+contained — NaN, the infinities, `Decimal128`, `MinKey`/`MaxKey`, `-0.0` — found
+two defects, present identically on both servers.
+
+**A partial index silently dropped rows.** A partial index on
+`{b: {$lte: 1.5}}` made `find({b: NaN})` return nothing; the same query on the
+same documents returned the row with no index, and MongoDB returns it in both
+cases. The implication check decides whether a user's query is narrow enough to
+be answered from a partial index, and it compared encoded sort keys — where NaN
+orders below every number — concluding that a NaN equality was covered by a
+`$lte: 1.5` filter that in fact excludes it. NaN is the value that separates the
+two orderings MongoDB maintains: sort places it below `-Infinity`, but every
+range operator excludes it while equality matches it. The type-bracket gate
+added for the previous instance of this bug class cannot catch it, because NaN
+is *inside* the numeric bracket.
+
+**`$min`/`$max` used the wrong comparison.** Both compared with IEEE semantics,
+under which every NaN comparison is false, so `{$min: {a: NaN}}` over `a: 5`
+left the field at `5`. MongoDB ranks the operands by sort order, where NaN is
+below `-Infinity`, and writes the NaN. Both engines now compare through the
+sort-key encoder they already had — the operators were simply bypassing it.
+
+`index_result_sets.py` is 0 of 1,803 on both servers after the fix (it found the
+first defect at 1 of 1,788), and `update_operators.py` closes the Python column
+at 0 of 70 shapes.
+
+#### Fixed
+
+- `storage.py`, `crates/secantus-storage`: the partial-index implication check
+  refuses any non-equality bound involving a NaN on either side.
+- `update.py`, `crates/secantus-core`: `$min`/`$max` rank operands by sort
+  order, not IEEE comparison.
+
+#### Changed
+
+- `tools/probes/index_result_sets.py`: 11 more values in the corpus (NaN, the
+  infinities, `Decimal128`, `MinKey`/`MaxKey`, `ObjectId`, a date, an `Int64`),
+  and `PROBE_SEED` / `PROBE_TRIALS` overrides so a sweep can be re-run at a
+  different seed rather than only deeper.
+- `tools/probes/update_operators.py`: 34 more shapes, 36 → 70, covering the
+  same value classes across `$inc`/`$mul`/`$min`/`$max`/`$set` — including the
+  NaN-versus-infinity `$min`/`$max` pairs, which a test had asserted against our
+  own servers only.
+
+### `$near` distance bounds are validated like mongod's
+
+`{$near: {..., $minDistance: null}}` ran as an unbounded query instead of being
+rejected, and negative bounds were accepted outright. The bound parser could not
+distinguish *key absent* from *key present with null*, so an explicit null was
+silently treated as "no bound". Strings and bools were already refused, which is
+why the gap looked covered.
+
+Found by differential-probing `$near` against a real mongod: 4 of 8 cases
+diverged.
+
+While fixing it, a rationale recorded in the Rust engine turned out to be false.
+A comment there justified accepting null by claiming the Java driver "sends
+`$minDistance: null` when the caller passes no minimum". The driver source
+disproves that — it omits the field entirely, in both serialisation paths
+(`Filters.java`, `if (minDistance != null) { ... }`). So null-tolerance was never
+needed for the Java gauge, and it made both servers silently run a query mongod
+errors on. The comment and its three tests have been corrected.
+
+#### Fixed
+
+- `$near` / `$nearSphere` reject a null or negative `$minDistance` /
+  `$maxDistance`, matching mongod's messages (`must be a number`,
+  `must be non-negative`).
+- The codes match per form, which differ: the nested GeoJSON form uses BadValue
+  (2), while the legacy sibling form (`{geo: {$near: [x, y], $maxDistance: …}}`)
+  uses mongod's dedicated 16895 (`$maxDistance`) and 16893 (`$minDistance`).
+- An *absent* bound still means unbounded — the fix distinguishes it from an
+  explicit null rather than rejecting both.
+
+### A document holding a NaN was rewritten by updates that touched nothing
+
+The write guard asked "did this document change" with a value comparison, and
+`NaN != NaN`. So an update that changed nothing at all — an `$unset` of a
+missing field, a `$rename` of a missing source, a `$pull` that matched nothing —
+looked like a change on any document containing a NaN *anywhere*, nested in a
+subdocument or inside an array included. The document was rewritten, an oplog
+entry emitted, a change-stream event delivered to every watcher, and
+`nModified` came back 1. mongod reports 0 and writes nothing.
+
+The Rust server carried this in full. The Python server was hidden from it by an
+accident — container equality short-circuits on object identity, so an untouched
+value compared equal — which was never a safe thing to rely on and is now gone
+from both. Both servers compare the encoded BSON, which sees a signed zero and a
+numeric type change while treating two identical NaNs as identical.
+
+The encoding is not quite all of mongod's rule, and the remainder is the
+interesting part. mongod counts an *arithmetic* write whose result is a NaN:
+`{$inc: {a: 1}}` over `a: NaN` reports 1, while `{$min: {a: 5}}` over the same
+document reports 0 because `$min` declined to write, and `{$set: {a: NaN}}`
+reports 0 because it wrote an equal value. All five have byte-identical before
+and after images, so no document comparison can separate them — the
+discriminator is exactly "an arithmetic operator produced a NaN", and that is
+now its own narrow check rather than a side effect of how `!=` treats NaN.
+
+#### Fixed
+
+- `secantus.storage` / `secantus-core`: the write guard compares the encoded
+  BSON, so an update that touches nothing no longer rewrites a NaN-holding
+  document, emits an oplog entry, or fires a change-stream event.
+- `secantus.update` / `secantus-core`: `arith_wrote_nan` carries mongod's
+  per-operator half of `nModified`, so `$inc` / `$mul` over a NaN still count as
+  modifications while `$min` / `$max` that decline to write, and `$set` of an
+  equal value, do not.
+- `secantus-core`: `diff::same_encoding`'s catch-all compares values rather than
+  BSON variant discriminants, which was only sound while it was called behind an
+  equality check.
+- `secantus.update`: `arith_wrote_nan` accepts a pipeline update (a list) rather
+  than raising, which had turned `findAndModify` with `update: []` into an
+  InternalError. Caught by the mongod differential gate.
+
+### Query and update operators answer mongod's errors — and `$bits*` answers the right documents
+
+A systematic sweep crossed every query and update operator with every
+pathological argument — 2,226 shapes — against mongod 8.2.11. 583 disagreed. A
+hand-picked sample of 32 had found only 12 of those, and had missed `$bits*`
+entirely; `$bits*` turned out to be returning the wrong **documents**, not the
+wrong message.
+
+#### Fixed
+
+- **`$bitsAllSet` / `$bitsAnySet` / `$bitsAllClear` / `$bitsAnyClear` took a
+  plain integer and nothing else.** They silently skipped array elements (which
+  mongod matches element-wise, like every other multikey operator), doubles,
+  `Decimal128`, and BinData values — and rejected BinData masks outright. A
+  document holding `[1, 4]` or `5.0` was invisible to a query that should match
+  it. 35 of 44 probed shapes were wrong; now none.
+- **Two arguments crashed with `internal server error`.**
+  `{v: {$regex: BinData}}` compiled as a *bytes* regex and then raised on a
+  string subject, and `{v: {$type: Code(...)}}` hit an unhashable-key set test.
+  Both now report mongod's error.
+- **`{v: {$not: {a: 1}}}` matched.** An ordinary field name inside `$not`
+  degraded to an equality test which `$not` then negated, returning the
+  document; mongod refuses the query. Every key inside `$not` must be an
+  operator.
+- **`$rename` applied when its target was a `bson.Code`**, because `Code`
+  subclasses `str` and passed the type check.
+- **`{v: {$type: []}}` answered an empty result set** where mongod refuses an
+  empty alias list, and `Decimal128` is a valid numeric type code.
+- **`$currentDate` reported the wrong problem** for an unrecognized option key:
+  mongod names the key before it looks at `$type`, so `{$type: "date", a: 1}`
+  names `a`.
+- **A whole `Decimal128` is a valid `$pop` direction, `$size` and `$bits*`
+  mask.** All three rejected it.
+
+#### Changed
+
+- The value renderer mongod uses to echo an offending argument had drifted into
+  **five** partial copies. `$inc` / `$mul` / `$pop` / `$rename` all used the
+  scalar-only one, so an array printed `[1]` where mongod prints `[ 1 ]` and a
+  sub-document printed `{'a': 1}` where mongod prints `{ a: 1 }`. There is now
+  one, in `bsontypes`, alongside the type-name helper that had already been
+  consolidated for the same reason.
+- `$pop`, `$size` and the `$bits*` mask share mongod's numeric-argument
+  ladder — NaN, out of range, fractional and non-integral `Decimal128` each get
+  their own sentence — extracted as one helper.
+- Message wording now matches mongod throughout: `$and argument must be an
+  array`, `unknown operator: $x`, `malformed mod, needs to be an array` (which
+  mongod distinguishes from a too-short array), and the `$bit` family's four
+  distinct texts.
+
+`tools/probes/operator_error_surface.py` is the standing cover.
+
+### Projected fields came back in the wrong order — in both engines, differently
+
+mongod emits projected fields in the **stored document's** order and ignores the
+projection spec's order entirely. Neither engine did that:
+
+| | order emitted |
+|---|---|
+| mongod | document |
+| pure Python | **spec** |
+| Rust | **alphabetical** (its spec trie is a `BTreeMap`) |
+
+So `find({}, {"c": 1, "b": 1})` returned fields in an order no mongod produces.
+Field order is behaviour — a driver renders it, and a wire-level test can assert
+it — and this was wrong on every projection either engine has ever done.
+
+**Why it survived.** The parity suites compare the two engines, and `==` on a
+dict ignores key order, so the dimension was invisible. The Rust variant was
+invisible even to a probe for a subtler reason: alphabetical order *coincides*
+with document order for any document whose keys happen to be sorted, and the
+fuzz corpus was keyed `a, b, c`. Only a document keyed `z, a, m` separates the
+three orderings, and nothing had one.
+
+**The comparator is now shared.** `tests/parity_compare.py` holds the one
+`same()` — NaN equals NaN, signed zeros are distinct, key order compared,
+recursing into arrays and documents — and all eight `test_rust_*_parity.py`
+suites use it. Previously only the expressions suite had a sharpened comparator,
+and the other seven compared with `==`. Routing them through it is what surfaced
+the projection bug within seconds.
+
+#### Fixed
+
+- `projection.py`, `crates/secantus-core/src/projection.rs`: `_include_doc` /
+  `include_doc` iterate the DOCUMENT, not the spec trie. Nested levels follow
+  their own sub-document's order. `exclude_doc` needed no change — it removes
+  keys in place and so preserves order already.
+
+#### Changed
+
+- `tests/parity_compare.py` (new): the shared parity comparator.
+- All eight parity suites route their value comparisons through it — 39 sites
+  that used a bare `==`.
+- Signed zero added to the update, projection and aggregate corpora, and the
+  measured field-order cases to the projection corpus.
+- `tests/test_projection_field_order.py` (new): pins the measured mongod order
+  and explicitly excludes BOTH wrong answers, using documents that are not
+  already alphabetical — the only shape that can tell them apart.
+
+### `secantusd-pg` can be released
+
+The Rust PostgreSQL server was a headline product with no way to ship it:
+`release-binaries.yml` builds the MongoDB binary only, no workflow referenced
+the crate, and no tag scheme existed for it.
+
+#### Added
+
+- `release-pg-binaries.yml` — a tag-triggered track for `secantusd-pg`,
+  modelled on the MongoDB binary's. Builds static-WiredTiger archives for
+  `x86_64-unknown-linux-gnu` and `aarch64-apple-darwin`, smokes the exact
+  artifact it is about to publish, and attaches `tar.gz` + `.sha256` to a GitHub
+  pre-release. Triggered by `secantusd-pg-v<crate-version>` — a third tag
+  namespace, verified disjoint from the PyPI `v[0-9]+…` and the MongoDB
+  `secantusdb-v*` patterns.
+- `tests/test_rust_pg_binary_smoke.py` — psycopg → `secantusd-pg` → WiredTiger
+  against the release artifact, including a restart to prove the data is on
+  disk. Registered in CI's `pg-oracle` lane, the only lane that builds the
+  binary.
+
+#### Fixed
+
+- `secantusd-pg --version` and `--help` now answer. `--version` previously fell
+  through to the positional storage-path argument, so the server tried to open a
+  WiredTiger database in a directory called `--version` and reported
+  `WT_TRY_SALVAGE: database corruption detected`.
+- `secantusd-pg` creates its storage directory when missing, which
+  `secantusd-rs` already did. A first run against a fresh path failed inside
+  WiredTiger with `WiredTiger.lock: handle-open: open: No such file or
+  directory` — an alarming answer to pointing it at a new directory.
+
+The PG server is **not** on the MongoDB crates' lockstep version (`0.1.0-beta.0`
+against `0.5.3-beta.163`), so its tag carries its own number and the workflow
+asserts against `crates/secantus-pgserver/Cargo.toml` alone.
+
+### The Rust PostgreSQL server's scaling problem was not the one on the list
+
+A backlog item had stood for over a week saying the Rust PostgreSQL server
+serialised its writes behind a global mutex, and that removing it was the next
+piece of performance work. Reading the twenty-two places that mutex is taken
+shows what it actually guards: checkpoints, archives, collection options,
+renames, index builds and catalog records. Not one row insert, update or delete
+takes it. The single site near a write path holds it just long enough to open a
+storage session, and per-connection transactions — the thing the entry proposed
+building — were already there.
+
+Measuring says the same. Against PostgreSQL 16 on the same machine, write
+throughput scales at 2.14x on four connections where PostgreSQL manages 2.36x,
+and putting every client on one contended table costs this server almost
+nothing extra. The read path, which takes no lock at all, behaves the same way.
+There is no collapse to fix.
+
+What the measurements do show is a statement that costs too much. A single
+uncontended connection spends about sixty-six microseconds of server CPU on a
+`SELECT` that PostgreSQL serves in thirteen — roughly five times the cost,
+before any concurrency is involved, and that ratio is most of the gap at every
+connection count. It is a profiling problem, not a locking one, and the item
+now says so. The benchmark that settled it ships as `invoke pg-concurrency` so
+the next person re-measures rather than re-reasons.
+
+#### Added
+
+- `bench/pg_concurrency.py` and `invoke pg-concurrency`: statement throughput
+  versus connection count for `secantusd-pg` and PostgreSQL 16, with repeated
+  trials, a median, and the run-to-run spread that says whether two rows differ.
+- `tests/test_pg_concurrency_bench.py`, covering the summary arithmetic and the
+  release-binary assumption a debug build would quietly invalidate.
+
+#### Changed
+
+- The storage-concurrency backlog entry now records what the lock guards, the
+  measured scaling and CPU-per-operation figures, the confound that makes the
+  high-connection rows untrustworthy on a four-performance-core box, and an
+  explicit warning not to touch the lock as a concurrency fix.
+- Six over-length `hint=` strings in `tasks.py` wrapped.
+
+### A skipped test now says why it skipped
+
+Six test suites diff SecantusDB's SQL against a live PostgreSQL. When that
+server is unreachable they skip — and until now they skipped with the words
+`no local PostgreSQL oracle`, which is indistinguishable from *PostgreSQL is
+not installed*. A suite disabled by a transient connection failure looked
+exactly like a suite deliberately switched off, so nobody could tell whether
+~109 tests were reporting green because they passed or because they never ran.
+Answering that question required a full 20-minute suite run.
+
+The six suites now share one probe, `tests/pg_oracle.py`, and its skips name
+the DSN and the underlying exception. They also stop drifting: the copies had
+grown three different default DSNs between them, one of which omitted the user.
+
+For the record, the suites are not skipping — a full run executes all 195 of
+those tests. The backlog entry claiming otherwise described a Postgres.app
+permission gate on a box that runs Homebrew's PostgreSQL, and has been
+corrected. The documented location of this machine's `mongod` builds was
+corrected the same way: the reference-server notes named a version that is not
+installed and called two that are "gone".
+
+#### Fixed
+
+- The PostgreSQL reference-server suites (`test_sql_search_path`,
+  `test_sql_subms_timestamps`, `test_sql_operator_types`,
+  `test_sql_result_type_tags`, `test_sql_float_rendering`,
+  `test_sql_isolation_level`) skip with the DSN and the connection error
+  instead of a bare "no local PostgreSQL oracle".
+- Three drifted default DSNs collapsed into one; the probe is cached, so a
+  worker opens one connection rather than nine. That bounds collection-time
+  cost at one `connect_timeout` when the server hangs rather than refuses.
+
+#### Changed
+
+- `CLAUDE.md` and `tasks/remaining-work-plan.md` record the three `mongod`
+  builds actually installed (6.0.16, 8.2.11 on `PATH`, 8.3.4) with `Cellar`
+  paths, replacing claims that `PATH` gives 8.2.1 — which is installed nowhere
+  — and that 6.0.16 and 8.3.4 "are gone". Version-difference probing described
+  by older entries is reproducible on this box today.
+- A docstring in `tests/test_rust_pgserver_differential.py` asserted that the
+  old `skipif` shape leaked a connection per worker. Measured: it does not —
+  CPython collects the unreferenced connection immediately. The claim is
+  corrected rather than repeated.
+
+### Timestamp ranges keep their microseconds, and pipelined replies wait for Sync
+
+The PostgreSQL server stored `tsrange` and `tstzrange` bounds to the
+millisecond, so a range written as `[…49.338943, …)` read back as
+`[…49.338000, …)`, with no error. Plain `timestamp` columns were fixed for this
+some time ago; range bounds live inside the range value and never got the fix.
+They now round-trip exactly on every write path: `INSERT`, bound parameters,
+`INSERT … SELECT`, `UPDATE`, `COPY` (text and binary), multiranges and arrays of
+ranges.
+
+Two older range bugs turned up along the way. Comparing a stored range with a
+constructed one (`r && tsrange(…)`, `r * tsrange(…)`) failed with an internal
+error, and `WHERE r = '<range literal>'` could miss a row holding exactly that
+range. Both work now.
+
+The server also sent each extended-protocol reply as soon as it had it. Real
+PostgreSQL holds them until the client's `Sync` or `Flush`, so a client counting
+round trips could see one pipeline turn into two. Replies are now buffered the
+same way.
+
+All three were found by re-running the driver conformance gauges with the CI
+runners moved off UTC; none of them is time-zone related.
+
+#### Fixed
+
+- `sql/ranges.py`, `sql/typemap.py`, `sql/planner.py`: a timestamp range bound's
+  sub-millisecond remainder is stored inside the range subdocument
+  (`ranges.pack`) and restored on every read (`ranges._bound`, and the
+  `lower_bound` / `upper_bound` accessors now used by the binary wire encoders,
+  the range sort key and SQL `lower()` / `upper()`).
+- `sql/ranges.py`: a naive (stored) bound orders as UTC against an aware
+  (constructed) one; `stored && tsrange(…)` and `*` were `XX000`.
+- `sql/planner.py`: range `=` / `<>` is evaluated per row via
+  `ranges.canonical` rather than pushed down as a whole-subdocument BSON match.
+- `sql/pgserver.py`: extended-protocol replies are buffered until `Sync` or
+  `Flush`, or past PostgreSQL's 8 KB send buffer; an `ErrorResponse` is still
+  sent at once.
+
+#### Testing
+
+- `tests/test_pg_range_subms.py`: every write path, containment and equality
+  within one millisecond, the naive-vs-aware crash, and a comparison against a
+  real PostgreSQL that runs in the `pg-oracle` CI lane.
+- `tests/test_pg_pipeline_flush.py`: wire-level; nothing before `Sync`, `Flush`
+  delivers without `Sync`, errors are not held back, and a large result streams.
+
+### Where the Rust PostgreSQL server's statement time actually goes
+
+The previous release established that this server costs roughly five times more
+CPU per statement than PostgreSQL, and that no lock was responsible. It could
+not say which layer owned the time. It can now, and the answer is that almost
+none of it belongs to the query.
+
+A statement that touches no table at all — `select 1` — costs fifty-five
+microseconds more than a bare protocol round trip, where PostgreSQL pays nine.
+The wire layer is not to blame: an empty round trip is within two microseconds
+of PostgreSQL's. Reading one row by primary key adds only twelve more, so
+storage is not to blame either. The overhead sits in catalog bookkeeping done
+once per statement, by two different mechanisms. Outside a transaction, every
+statement opens seven fresh WiredTiger sessions to re-confirm that catalog
+collections which are created once and never dropped still exist. Inside a
+transaction block it is worse rather than better — around forty microseconds
+worse — because holding a block makes the catalog cache ineligible and each
+statement re-scans the catalog from storage instead.
+
+One finding from this work has been retracted rather than shipped. A single run
+suggested prepared statements cost seventy-seven microseconds more than
+unprepared ones, which would have been a serious and surprising defect; four
+further runs put the two within noise of each other. The number was an
+artifact, and the backlog now says so explicitly, because a plausible phantom
+that nobody can reproduce is more expensive than no finding at all.
+
+#### Added
+
+- `bench/pg_statement_cost.py`: a layer bisect from a bare protocol round trip
+  up to a prepared row read, run against both servers, with `--in-transaction`
+  for the block path.
+- `tests/test_pg_statement_cost_bench.py`, pinning the stage set the
+  attribution is a difference between.
+
+#### Changed
+
+- The backlog entry now carries the measured per-layer figures, the two call
+  paths behind them, the retraction above, and the instruction to repeat a
+  measurement before quoting it.
+
+### The Rust PostgreSQL server passes psycopg's array and cursor suites
+
+psycopg's `tests/types/test_array.py` and `tests/test_cursor_common.py` went
+from 52 failures to 2 against the Rust PG server (`secantusd-pg`), every
+change measured against PostgreSQL 16 first. The array literal scanner is now
+a port of `array_in` (only the six `array_isspace` characters are trimmed,
+quotes and backslashes are handled at the level they occur, the `[lo:hi]=`
+decoration is validated, and each malformed shape is the 22P02 PostgreSQL
+gives it); multidimensional arrays round-trip in text and binary both ways;
+`||` beside an array follows `array_cat` / `array_append` / `array_prepend`.
+`INSERT … RETURNING` returns named, computed and `*` columns typed from the
+row — including `executemany(..., returning=True)` — and `serial` /
+`bigserial` columns draw from a real `<table>_<column>_seq` sequence.
+`INSERT … SELECT` writes the query's rows (it used to answer `INSERT 0 0`
+with nothing written), literal column DEFAULTs are stored and applied, and
+`cur.stream()` works because Describe now distinguishes a zero-field
+RowDescription from NoData.
+
+The `box` type landed with its `;` array delimiter — `'{(1,2),(3,4);(5,6),
+(7,8)}'::box[]` parses and renders as PostgreSQL does, corners re-ordered
+per coordinate — and `pg_type` reports `typdelim` per type. Doubles now
+render as `float8out` (`1e+20`, `1e-07`, `Infinity`, `{1.5,2}`) instead of
+Rust's shortest form (`1e20`, `inf`, `{1.5,2.0}`), a `float8` with a numeric
+operand is float8 arithmetic, unary minus keeps a double's signed zero and
+numeric has none. `user` / `current_user` / `session_user` / `current_role`
+answer the role the client connected as, and an unaliased cast, `array[…]`,
+`row(…)`, `coalesce`, `greatest` / `least` and `nullif` column is named as
+PostgreSQL names it (`int4`, `float8`, `bpchar`, `array`, `row`, …) rather
+than `?column?`. A cast PostgreSQL has no definition for (`5::box`,
+`1.5::bool`, `true::int8`) is 42846 `cannot cast type …`, not a 22P02 parse
+failure.
+
+#### Fixed
+
+- `crates/secantus-pgplan`: `parse_array` is a port of PostgreSQL's
+  `array_in` — whitespace set, nested quoting, unquoted `NULL`, the
+  `[lo:hi]=` prefix, per-element delimiter (`;` for `box`), and every 22P02
+  message; `array_concat` follows `array_cat`; nested arrays typed by depth.
+- `crates/secantus-pgserver`: binary array parameters with `ndim > 1` are
+  reshaped into nested arrays; binary array results nest likewise.
+- `crates/secantus-pgplan` / `-pgserver`: `INSERT … RETURNING` (named,
+  computed, `*`), `executemany(..., returning=True)`, an empty bound list
+  binds as an empty array; `serial` / `bigserial` sequences in
+  `__sql_sequences__` (the Python server's shape), dropped with the table;
+  `INSERT … SELECT`; literal column DEFAULTs in the catalog, applied to every
+  omitted column; an expression DEFAULT is refused (0A000) instead of dropped.
+- `crates/secantus-pgserver`: `SHOW` completes with a bare `SHOW` tag; a
+  FROM-less `select … where <const>` honours the predicate (false / NULL is
+  zero rows, a non-boolean is 42804, `'x'` is 22P02).
+- `crates/secantus-pgplan`: `pg_sleep(seconds)` — a `void` (2278) column,
+  waits on the connection thread; `copy (select <expr> …) to stdout`
+  evaluates its expressions; a crossed range inside an array literal is
+  22000 from the range parser.
+- `crates/secantus-pgplan`: expressions over `generate_series` rows
+  (arithmetic, casts, calls, date arithmetic, comparisons) evaluate per row
+  and are named / typed as PostgreSQL does.
+- `crates/secantus-pgserver` / `crates/vendor/pgwire`: Describe answers
+  NoData only for statements that return no rows; a zero-field
+  RowDescription (`select`) yields one empty row, so `cur.stream()` works.
+- `crates/secantus-pgplan/src/geo.rs` (new): the `box` type — `parse_box`
+  (every input spelling, per-coordinate corner ordering, NaN to the high
+  corner, `"1e400" is out of range for type double precision` 22003),
+  `box_text`, `float8_text` (PostgreSQL's `float8out`); `pgtypes::typdelim`.
+  `pg_type` rows carry the real `typdelim`; oid 603 / 1020; a bound text
+  parameter of oid 603 casts.
+- `crates/secantus-pgplan`: `float8` text rendering is `float8out`
+  everywhere (column, `::text`, `float8[]`); a `float8` with a numeric
+  operand is float8 arithmetic (`0.1::float8 + 0.2`); unary minus negates a
+  double outright (`-(0.0::float8)` is `-0`); numeric has no negative zero
+  (`- 0.0` is `0.0`) and a zero mantissa with an exponent renders `0`
+  (`0.00e3`).
+- `crates/secantus-pgplan`: `user` / `current_user` / `session_user` /
+  `current_role` are the connecting role (`name`, oid 19); `current_catalog`
+  / `current_schema`; `"user"` is an ordinary missing column (42703).
+- `crates/secantus-pgplan`: FROM-less select columns are named as
+  PostgreSQL's `FigureColname`: a cast after its target type (`int4`,
+  `float8`, `bpchar`, `numeric`, `char`, `box`), a nested cast after the
+  outer type, `array` / `row` / `coalesce` / `greatest` / `least` / `nullif`
+  after the keyword, and a cast of any of those keeps the inner name.
+- `crates/secantus-pgplan`: `Error::CannotCoerce` (42846) for casts
+  PostgreSQL does not define — `5::box`, `box::float8`, `1.5::bool`,
+  `1::int8::bool`, `1::int2::bool`, `'2021-01-01'::date::bool`, `true::int8`,
+  `true::int2`; `true::int` is `1`. The cast site's source type decides, so
+  `'2021-01-01'::bool` stays the 22P02 text failure.
+
+### The Rust PG server answers every type psycopg draws in binary, byte-for-byte
+
+psycopg reads every column of a row in the format of column 0, so a result set
+that mixes one text-only type in with binary ones makes the client run text
+loaders over binary payloads. The psycopg gauge's randomised "faker" tests —
+`test_leak`, `test_copy_to_leaks`, `test_random` and their async twins — draw a
+random assortment of types per run and were failing on roughly ninety
+parameterisations for exactly that reason. The Rust PG server now encodes the
+whole faker family in binary — the date / time / timetz / timestamp /
+timestamptz family (including `24:00:00`, years past 9999 and the BC era),
+`interval`, every range and multirange, `json` / `jsonb` and their arrays, and
+empty arrays — and each layout was pinned against PostgreSQL 16 by comparing
+the raw bytes, not by asking whether the client could decode them. A dozen
+smaller things fell out of the same runs: a `timestamptz` result in a named
+session zone (`Europe/Rome`) now carries the right offset; `set_config` reports
+the zone the way `SET` does; `jsonb` renders Unicode escapes as PostgreSQL
+does; COPY inside a transaction leaves the session in it, fills omitted
+`serial` / default columns, and parses array literals; and an empty-multirange
+binary parameter with no declared type is typed from the column it is inserted
+into. The remaining faker failures are all the documented 34-significant-digit
+`numeric` limit.
+
+#### Fixed
+
+- `secantus-pgserver`: binary result encoders for the datetime family,
+  `interval`, ranges, multiranges, `json`/`jsonb` and their arrays, and empty
+  arrays, each pinned to PostgreSQL 16's bytes
+  (`test_binary_results_cover_every_faker_type`).
+- `secantus-pgplan`: `timestamp_text_to_pg_micros` handles wide years, the BC
+  era and an explicit offset; `time_to_pg_micros` accepts `24:00`; a
+  `timestamptz` result is rendered in the session's named zone
+  (`utc_text_in_zone`); datetime array text is PostgreSQL's, not a debug dump.
+- `secantus-pgplan`: `catalog_param_types` infers an INSERT's parameter type
+  by column position when the statement has no column list (`ColumnRef`), so
+  an untyped binary parameter is typed from its target column either way.
+- `secantus-pgserver`: COPY inside a transaction keeps `INTRANS`; COPY with a
+  column list fills the omitted columns from their defaults and sequences;
+  COPY FROM parses array literals; `set_config('TimeZone', ...)` reports the
+  new zone; `jsonb` text uses PostgreSQL's Unicode escaping.
+- vendored `pgwire`: `put_cstring` stops at the first NUL and `ErrorResponse`
+  / `NoticeResponse` length their fields the same way, so an error message
+  that quotes a binary parameter no longer drops the connection with "message
+  contents do not agree with length".
+
+### `secantusd-pg` reports the address it actually bound
+
+The readiness line exists so a harness can wait for the server and then connect,
+but it echoed the address that was *requested* rather than the one the listener
+ended up on. That made `127.0.0.1:0` useless: the kernel picks the port and
+nothing told the caller which one, so callers had to probe for a free port
+themselves and pass it in — a race no caller can win, because the probe socket
+must be closed before the child can bind it.
+
+#### Fixed
+
+- `secantusd-pg`'s `listening on …` line now reports `local_addr()`, so
+  `127.0.0.1:0` is a supported way to start the server and read back its port.
+- The test harness now starts every `secantusd-pg` that way instead of guessing
+  a port. Under `pytest -n auto` two workers could be handed the same port; the
+  loser's child exited, but a liveness probe fired in that window connected to
+  the *winner's* server, and the test then ran against another worker's database
+  until that worker shut it down — surfacing as
+  `server closed the connection unexpectedly` on an opening `CREATE TABLE`.
+
+### The Rust PostgreSQL server enforces NOT NULL, CHECK and FOREIGN KEY
+
+`CREATE TABLE` on the Rust PostgreSQL server now records its NOT NULL, CHECK
+and FOREIGN KEY constraints in the shared catalog and enforces them on every
+INSERT, UPDATE and DELETE, answering what PostgreSQL 16 answers: `23502` with
+the failing column, `23514` with the constraint's name, `23503` on the child
+side and — for NO ACTION / CASCADE / SET NULL — the parent side, each with the
+`Failing row contains (...)` / `Key (...)=(...)` detail and the schema, table,
+column and constraint diagnostic fields a driver reads. A `DEFERRABLE
+INITIALLY DEFERRED` key is checked at COMMIT: the COMMIT reports the
+violation, the transaction rolls back and the connection is left idle, as it
+is on PostgreSQL. Unnamed constraints take PostgreSQL's generated names
+(`<table>_<column>_check`, `<table>_check1`, `<table>_<column>_fkey`), and a
+CHECK naming a missing column or a foreign key without a unique target is
+refused at CREATE (`42703`, `42830`).
+
+#### Added
+
+- Rust PostgreSQL server: NOT NULL (`23502`), CHECK (`23514`) and FOREIGN KEY
+  (`23503`, immediate and `INITIALLY DEFERRED` to COMMIT) enforcement with
+  PostgreSQL's messages, details and diagnostic fields; `ON DELETE CASCADE` /
+  `SET NULL`; temp tables report a `pg_temp` schema in diagnostics.
+- `secantus-pgcatalog`: `TableDef` carries `temp`, `check_constraints` and
+  `foreign_keys` in the Python server's document shape.
+
+- Rust PostgreSQL server: `CancelRequest` interrupts the running statement
+  (`57014 canceling statement due to user request`, connection left idle);
+  `pg_stat_activity` shows each backend's state and running query; and
+  `idle_in_transaction_session_timeout` / `idle_session_timeout` are
+  validated, rendered (`60000` shows as `1min`) and enforced — the session
+  ends with FATAL `25P03` / `57P05` and the connection closes, as on
+  PostgreSQL 16.
+- Rust PostgreSQL server: databases. The startup packet's `dbname` is checked
+  before `AuthenticationOk` — an unknown name is FATAL `3D000 database "x"
+  does not exist` (a failed connect in libpq, not a failed first query) and
+  `template0` is `55000` — against a registry of `postgres` / `template1` /
+  `template0`, the daemon's `--database NAME` flags and `CREATE DATABASE`;
+  `DROP DATABASE` (with PostgreSQL's `25001`, `42P04`, `3D000` / `IF EXISTS`
+  notice, `55006` and `42809`) drops the data too; `pg_database` lists the
+  set and `current_database()` / `current_catalog` name the connected one.
+
+- Rust PostgreSQL server: `GROUP BY` over an expression (`length(data)`,
+  `col is null`, `n + 1`) or a select-list position (`GROUP BY 1, 2`), with
+  the key matched to the projected expression by structure and to `ORDER BY`
+  by position, alias or expression; `IS [NOT] NULL` as a value, including
+  PostgreSQL's row rule (`row(1, null)` is neither null nor not null); and a
+  FROM-less `select unnest(array)` as one row per element in a column named
+  `unnest` of the element type.
+- Rust PostgreSQL server: a table is also its row type, as on PostgreSQL —
+  `CREATE TABLE rtt (...)` registers the composite `rtt`, so `'(1,foo)'::rtt`,
+  `'{"(1,foo)"}'::rtt[]`, `row(1,'x')::rtt`, `pg_typeof`, `to_regtype('rtt')`
+  and the `pg_type` / `pg_attribute` rows psycopg's `TypeInfo.fetch` reads all
+  see it; `DROP TABLE` removes it; `DROP TYPE rtt` is `2BP01 cannot drop type
+  rtt because table rtt requires it` with the `You can drop table rtt
+  instead.` hint; and a `CREATE TYPE` / `CREATE TABLE` over an existing type
+  or relation is `42710 type "x" already exists` (with PostgreSQL's hint when
+  a relation collides with a type) or `42P07 relation "x" already exists`.
+  `to_regtype` also resolves a user type's array — `mood[]`, `rtt[]` or the
+  internal `_rtt` spelling — which was NULL for every enum and composite.
+- Rust PostgreSQL server: the `aclitem` type (oid 1033, array 1034) with
+  PostgreSQL 16's parser and renderer — `grantee=privileges/grantor` with
+  the `group` / `user` key words, quoted names, `*` grant options and the
+  canonical `arwdDxtXUCTcsA` order — and its errors (`role "x" does not
+  exist`, `invalid mode character`, `unrecognized key word` with its hint,
+  `extra garbage at the end of the ACL specification`). The roles it knows
+  are the session user (there is no role catalog); an omitted grantor
+  defaults to it with PostgreSQL's `defaulting grantor to user ID 10`
+  WARNING, and a planner WARNING now reaches the client as a
+  NoticeResponse.
+- Rust PostgreSQL server: `SET standard_conforming_strings TO off` is
+  honoured and reported. A plain `'...'` literal is then read with the
+  pre-9.1 backslash escapes (`'a\'b'`, `'p\nq'`, `'\\'`), `E'...'`,
+  `B'...'`, `X'...'` and `$$...$$` keep their own rules, a statement is read
+  under the setting in force when it is prepared, and `U&'...'` is refused
+  as PostgreSQL refuses it (`0A000 unsafe use of string constant with
+  Unicode escapes`). `escape_string_warning` (default on) raises PostgreSQL's
+  `22P06 nonstandard use of \' / \\ / escape in a string literal` WARNING
+  per literal, with its hint and position. Both GUCs are validated as
+  Booleans in every spelling PostgreSQL accepts (`22023 parameter "x"
+  requires a Boolean value`), and the `standard_conforming_strings` value is
+  sent as a `ParameterStatus` — which is what libpq's `PQescapeString`
+  follows — because the server now obeys it.
+
+#### Fixed
+
+- Rust PostgreSQL server: a long statement no longer stalls every other
+  connection — execution runs off the async runtime's I/O thread, so a
+  cancel request (or any other client) is served while `pg_sleep` runs.
+
+- Rust PostgreSQL server: every extended-protocol statement between two
+  `Sync`s runs in one transaction that the `Sync` commits, as on PostgreSQL —
+  an error in a pipeline now rolls back the earlier statements of its group
+  (libpq's `PIPELINE_ABORTED` batch is all-or-nothing), `BEGIN` inside a
+  group turns it into a block, and `DECLARE` in a group is still `25P01`.
+- Rust PostgreSQL server: a statement prepared without parameter types
+  (libpq `PQprepare` with `nParams = 0`) sizes its parameters from the lexer,
+  so `insert into t values ($1, $2)` no longer fails with `there is no
+  parameter $1` — pg_query's node walk skips a VALUES list.
+- Rust PostgreSQL server: the first DDL on a fresh store no longer fails a
+  second connection with a WiredTiger `WriteConflict`. The `__sql_*` catalog
+  collections were registered lazily inside whichever block first needed one,
+  and a block that began before the row landed could not see it; they are
+  now created before a transaction handle opens. The enum / composite type
+  oid counter is likewise advanced outside the block, like PostgreSQL's OID
+  counter, so two open `CREATE TYPE` blocks no longer conflict (a rolled-back
+  block just skips an oid).
+- Rust PostgreSQL server: an assignment with no assignment cast is refused
+  as PostgreSQL refuses it — a `text` / `varchar`-typed expression (an
+  explicit cast, or a parameter the client declared, which is how psycopg
+  sends a binary-format string) into a `jsonb`, `integer`, `date`, ... column,
+  or `boolean` into an integer column, is `42804 column "data" is of type
+  jsonb but expression is of type text` with the `You will need to rewrite
+  or cast the expression.` hint, on INSERT and UPDATE. Before this the value
+  was coerced through the column's parser and stored.
+- Rust PostgreSQL server: the `TimeZone` / `DateStyle` `ParameterStatus` sent
+  at startup now carries the session's values (`UTC`, `ISO, MDY`) rather than
+  the wire library's defaults, so what a client caches at connect is what
+  `SHOW` reports.
+- Rust PostgreSQL server: a record literal of the wrong width reports
+  PostgreSQL's message and detail — `22P02 malformed record literal: "(1)"`
+  with `Too few columns.` / `Too many columns.`, and `row(1)::rtt` is `42846
+  cannot cast type record to rtt` with `Input has too few columns.` /
+  `Input has too many columns.`; a planner error's `Detail:` line now travels
+  in the error's detail field rather than its message.
+- Rust PostgreSQL server: a syntax error's message is PostgreSQL's alone —
+  `syntax error at or near "selct"`, `unterminated quoted string at or near
+  "'q"` — without the `Error splitting: ` / `Invalid statement: ` label the
+  libpg_query Rust binding prefixes it with, which reached the client's
+  `message_primary` on every syntax error.
+
+### Datetime arithmetic and special values on the Rust PostgreSQL server
+
+The Rust `secantusd-pg` server now speaks the everyday datetime idioms a
+PostgreSQL client reaches for. `date + int`, `date - date`, `timestamp +
+interval`, `interval + interval` and `interval * n` all evaluate — and, just as
+importantly, describe their result column with PostgreSQL's own type, so a
+client that picks its loader from the row description (psycopg does) decodes a
+`timestamp + interval` as a timestamp rather than as text. The `epoch` special
+literal is accepted on `date` and `timestamptz` alongside the `timestamp` it
+already handled, and `24:00:00` is recognised as PostgreSQL's valid end-of-day
+`time`.
+
+Out-of-range results are rendered in PostgreSQL's own text — a year past 9999,
+or the `BC` era — so the client's own loader is what rejects a value it cannot
+hold, exactly as it does against a real server. This closes 38 of the remaining
+cases in psycopg's vendored `test_datetime.py` suite; the only ones left need a
+full IANA time-zone database (named-zone DST result loading), which stays out of
+scope.
+
+#### Added
+
+- `crates/secantus-pgplan`: `date +/- int`, `int + date`, and `date - date`
+  (→ `int4`) arithmetic; the `epoch` literal on `date` and `timestamptz`; and
+  `24:00:00` as a valid end-of-day `time`.
+
+#### Fixed
+
+- `crates/secantus-pgplan`: datetime arithmetic (`timestamp + interval`,
+  `interval + interval`, `interval * n`, …) is now typed from its operands, so
+  the result column is described with the correct OID even at DESCRIBE time when
+  every value is NULL — previously it was described as `text`/`int4` and clients
+  decoded it wrongly, and interval / timestamp / date overflow was never
+  surfaced to the client's loader.
+
+### The Rust PostgreSQL server runs `DO` blocks and speaks more of the wire
+
+psycopg's own test suite exercises corners of the protocol that no application
+reaches on purpose: a `DO $$ ... $$` block that raises a notice, a connection
+set to `latin9` reading an error message with a euro sign in it, a `ROW(...)`
+fetched in binary, an enum array sent as bytes. Each of those now answers the
+way PostgreSQL 16 does, measured against it. The largest piece is a small
+executor for inline `plpgsql` blocks — `RAISE` at every level with `USING`
+options and `%` formatting, `PERFORM`, `EXECUTE`, `NULL` and plain SQL — with
+the context, position and `internal_query` fields a client sees on failure.
+It is deliberately a subset: variables, control flow and `EXCEPTION` handlers
+are still refused with `0A000` rather than half-run.
+
+Around it, a cluster of smaller fidelity fixes: an anonymous record's binary
+form now carries each field's real type (an untyped literal is `unknown`, a
+cast one its cast type), `quote_ident` and `regtype` quote reserved keywords,
+`format()` arrives with its `%s` / `%I` / `%L` specifiers, a `WHERE` clause
+works over `generate_series`, `inet` values drop their host mask on `COPY TO`,
+and `oid`, `oid[]` and enum-array parameters resolve to their own types in both
+text and binary.
+
+#### Fixed
+
+- `secantus-pgserver`: `DO [LANGUAGE plpgsql] $$ ... $$` inline blocks
+  (`plpgsql_do.rs` parser + `do_block.rs` executor). `RAISE` notices reach the
+  client as `NoticeResponse` with `PL/pgSQL function inline_code_block line N
+  at RAISE` context; `RAISE EXCEPTION` carries `P0001` / a named condition /
+  an `errcode`, plus `detail` / `hint` / `column` / `constraint` / `datatype` /
+  `table` / `schema`; an error inside `PERFORM` stacks the SQL statement under
+  the block frame, and one inside `EXECUTE` carries the executed text in
+  `internal_query` / `internal_position`; a bad body is `42601` positioned
+  inside the statement; an unknown condition name is `42704` with the
+  compilation context; `LANGUAGE sql` is `0A000`.
+- `secantus-pgserver` / `pgwire`: every error and notice now carries the `V`
+  (`severity_nonlocalized`) field; `42P01` for an undefined table carries the
+  `P` position of the relation's first mention; error messages are re-encoded
+  in the client's encoding (`latin9` reads `bad €`).
+- `secantus-pgplan`: `ROW(...)` records each field's type, so a binary
+  anonymous-record result is byte-identical to PostgreSQL (`unknown` 705 for a
+  bare literal, the cast type otherwise); `-'NaN'::numeric` and the infinities
+  negate; `regtype` and `quote_ident` quote reserved keywords (`"order"`);
+  `format()` with `%s` / `%I` / `%L` / `%%` / positional `%n$`, NULL handling,
+  and the `22023` / `22004` errors (with PostgreSQL's hint); `concat(true)` is
+  `t`; a `WHERE` over `generate_series` — constant or on the series column —
+  filters the rows, and a non-boolean constant is `42804`.
+- `secantus-pgserver`: `COPY ... TO STDOUT` renders `inet` without a `/32` /
+  `/128` host mask (`::ffff:102:300/128` → `::ffff:1.2.3.0`) while `cidr`
+  keeps its mask; `COPY FROM` stores numeric text at its written scale.
+- `secantus-pgserver`: an `Oid` parameter keeps type 26 (`pg_typeof` is
+  `oid`), an `oid[]` sent as text comes back binary as 1028; a parameter
+  typed with a user enum's oid is checked against its labels (`22P02 invalid
+  input value for enum ...` with the `unnamed portal parameter $1` context);
+  enum ARRAY parameters parse in text and binary, and a binary enum-array
+  result carries the array oid with each element as its label.
+
+### Seven session opens per statement, for catalogs that were already there
+
+Profiling the Rust PostgreSQL server found that a `SELECT 1` — a statement that
+touches no table at all — cost fifty-five microseconds more than an empty
+protocol round trip, against PostgreSQL's nine. The call tree put most of that
+somewhere unexpected: before running anything, every statement opened seven
+fresh WiredTiger sessions, each with a cursor to open, search and close, to
+re-confirm that the seven catalog collections still existed. They are created
+once and never dropped except with the whole database.
+
+The check itself has to stay. One catalog write — the row recording a new
+table — has no guard of its own and relies on that blanket pass; removing it
+would turn a `CREATE TABLE` in a fresh database into a storage error rather
+than a no-op. What can go is the repetition. A connection that has established
+a collection exists cannot subsequently be wrong about it, so the verdict is
+now remembered for the life of the connection.
+
+Deliberately per connection rather than process-wide: the test suite builds
+many servers over many storage paths that all call their database `postgres`,
+and a process-wide verdict would cheerfully report a collection as present in a
+store that had never seen one.
+
+A `SELECT 1` now costs 55.9 microseconds where it cost 76.3, and a single-row
+primary-key read 68.0 where it cost 89.2 — about a fifth off every statement,
+with the conformance suite unchanged at 5542 passing.
+
+#### Changed
+
+- `ensure_collection` on the Rust PostgreSQL server caches its verdict per
+  connection instead of re-probing storage before every statement.
+
+### Rust pgserver: extensions (hstore, postgis) and a role catalog
+
+The Rust PG server now takes `CREATE EXTENSION` for the two extensions the
+psycopg test-suite reaches for. `hstore` brings the key/value map type with
+PostgreSQL's operator set — `->`, `?`, `?|`, `?&`, `@>`, `<@`, `||`, `-` —
+and `postgis` brings a `geometry` type whose EWKB round-trips through
+`ST_GeomFromEWKB` / `ST_AsEWKB` and shapely. Each extension registers its
+type under the oid a client discovers through `pg_type` / `pg_extension`,
+and `DROP EXTENSION` removes it again; forty-three gauge tests that skipped
+on "extension unavailable" now run.
+
+Roles landed alongside: `CREATE / ALTER / DROP ROLE` (and the `USER`
+spellings) keep a cluster-wide catalog. `pg_roles` and `pg_user` mask every
+password as `********`, `pg_authid` carries the SCRAM-SHA-256 verifier — the
+one derived from a plaintext `PASSWORD` (4096 iterations, a fresh 16-byte
+salt, exactly what `password_encryption = scram-sha-256` produces) or the one
+libpq's `PQchangePassword` sends ready-made — and every error and notice was
+measured on PostgreSQL 16: `42710`, `42704` and the `IF EXISTS` notice,
+`2BP01` for the bootstrap superuser, `55006` for the session's own user,
+`22007` for a bad `VALID UNTIL`, the empty-password notice, and a multi-name
+`DROP ROLE` that is all or nothing. Passwords are recorded, never checked:
+every connection is still trusted, which is what keeps the gauges connecting
+as `user=postgres` with no password.
+
+#### Added
+- `secantus-pgplan` / `secantus-pgserver`: `CREATE EXTENSION [IF NOT EXISTS]`
+  / `DROP EXTENSION [IF EXISTS]` for `hstore` and `postgis`, the
+  `pg_extension` catalog, the `hstore` type and operators (`hstore.rs`), the
+  `geometry` type over EWKB (`geometry.rs`).
+- `secantus-pgserver`: `CREATE / ALTER / DROP ROLE|USER` with a persisted
+  role catalog; `pg_roles`, `pg_authid`, `pg_user` virtual tables;
+  SCRAM-SHA-256 verifier derivation via `secantus-auth`.
+
+#### Fixed
+- `secantus-pgplan`: a stored `timestamptz` column's `::text` dropped the
+  offset and rendered in UTC regardless of the session zone — the cast chain
+  now carries the column's declared type, so `t::text` renders
+  `2026-01-01 13:00:00+01` under `Europe/Berlin` as PostgreSQL does.
+- `secantus-pgplan`: `ALTER ROLE ... PASSWORD $1` is the `42601` syntax error
+  PostgreSQL raises (its grammar takes only a string constant there) instead
+  of silently clearing the password.
+
+### The Rust PostgreSQL server delivers notifications, terminates backends, and runs the whole psycopg suite
+
+The psycopg gauge measured a third of psycopg's test suite against the Rust
+PostgreSQL server: the synchronous modules, with the asynchronous twins,
+notifications, pipelining, two-phase commit, concurrency and the libpq-level
+tests left for "a later lane". This release runs all of them, and the server
+was fixed until the widened gauge is clean.
+
+The largest piece is `LISTEN` / `NOTIFY`. A notification is delivered the way
+PostgreSQL delivers it: to every listening connection, the sender included,
+before the statement's ReadyForQuery outside a transaction block, at `COMMIT`
+inside one (queued, deduplicated, dropped on `ROLLBACK`), and unprompted to a
+connection sitting idle. That idle path is what `pg_terminate_backend` needed
+too — it used to set a flag the victim noticed on its next statement, so a
+session asleep in `pg_sleep` or idle never went away. Both it and the new
+`pg_cancel_backend` now reach the victim within milliseconds, whether it is
+running a statement or waiting for one.
+
+The rest is throughput and shape. One psycopg test timed out because every
+statement re-read the type catalog from storage, re-looked-up its table and
+re-parsed its SQL up to four times; a process-wide catalog cache and a parse
+memo bring a trivial statement from 0.86 ms to under 0.2 ms and a 20,000-row
+`executemany` from 15 s to 3.4 s. `CREATE TABLE AS`, functions in `FROM`,
+aggregates over expressions, `pg_tables`, `now()` and its siblings, and the
+extended protocol's Describe replies for undeclared parameters all landed
+because psycopg's tests asked for them, each measured against PostgreSQL 16.
+
+#### Added
+
+- `LISTEN` / `UNLISTEN [*]` / `NOTIFY` / `pg_notify()` / `pg_listening_channels()`
+  with asynchronous cross-connection delivery on the Rust PG server. The
+  vendored pgwire gains an `idle_event` hook the connection loop races against
+  the next frontend message, and a `before_ready_for_query` hook.
+- `pg_cancel_backend(pid)`; `pg_terminate_backend(pid)` now ends an idle or
+  sleeping session immediately, and an unknown pid answers `false` with
+  PostgreSQL's `01000` warning.
+- `CREATE [TEMP] TABLE [IF NOT EXISTS] t [(cols)] AS query [WITH [NO] DATA]`.
+- A function call as the row source in `FROM` (`select 'ok' from pg_sleep(0.5)`,
+  `select * from pg_listening_channels()`).
+- Aggregates over expressions (`max(length(data))`, `sum(col1 * 2)`).
+- The `pg_tables` catalog view.
+- `now()` / `transaction_timestamp()` / `statement_timestamp()` /
+  `clock_timestamp()` and `current_timestamp`, typed `timestamptz` and
+  rendered with the session-zone offset.
+- A process-wide catalog cache (type-catalog documents and table lookups,
+  versioned by every catalog-changing statement and transaction control) and
+  a memo of `pg_query` parse trees and parameter counts.
+- The psycopg gauge now includes every `test_*_async.py` twin, `test_notify`,
+  `test_pipeline`, `test_concurrency`, `test_tpc`, `test_xid`,
+  `test_conninfo_attempts`, `test_waiting`, `test_module` and `tests/pq`, with
+  a per-platform pytest marker filter (`MARKER_EXPR`) that excludes psycopg's
+  `proxy` and `timing` markers on macOS as psycopg's own CI does. Three tests
+  are deselected with their reasons recorded in `include_paths.py`: one reads
+  a foreign libpq's `PGconn` and two connect to RFC 5737 unroutable addresses
+  and depend on the host network timing out rather than answering at once.
+
+#### Fixed
+
+- Describe of a prepared statement reports each undeclared parameter's type
+  from the statement instead of `unknown`, and integer arithmetic over
+  parameters describes as the operands' type.
+- `begin; declare cur ...` in one simple-query batch keeps the transaction
+  and the cursor open; a wire Close of a portal closes the `DECLARE`d cursor
+  of that name; a missing portal is `34000`, a missing statement `26000`.
+- `now()::text` rendered the wall clock with no zone suffix; it now carries
+  the session-zone offset like every other `timestamptz`.
+- `current_timestamp` inside an expression (`current_timestamp::text`) was
+  refused; it evaluates.
+- Per-statement cost grew with every table the store had ever held: each
+  statement re-decoded every row type from BSON for the planner and again per
+  described column, so a used store ran `select 1` twice as slowly as a fresh
+  one and `test_type_error_shadow` overran its 20 s budget late in the gauge.
+  The type catalog is now shared by reference, the planner's tables are
+  published once per thread per catalog version, and a described column decodes
+  only the one composite it names.
+- `password_encryption` reports `scram-sha-256`; `ALTER ROLE` of a role
+  other than the session user is `42704`.
+
+### The Rust PostgreSQL server passes psycopg's prepared-statement, uuid and string suites
+
+psycopg's `tests/test_prepared.py`, `tests/types/test_uuid.py` and
+`tests/types/test_string.py` went from 45 failures to none against the Rust PG
+server (`secantusd-pg`), every change measured against PostgreSQL 16 first.
+`pg_prepared_statements` now lists the connection's named protocol-level
+statements — statement text, `prepare_time`, `parameter_types` and
+`result_types` as regtype names, and the generic / custom plan counts psycopg's
+tests read — and a protocol `Close`, `DEALLOCATE <name>` or `DEALLOCATE ALL`
+removes the row. A COPY TO STDOUT that fails mid-stream no longer follows its
+error with a CopyFail, which had left the client believing a COPY was still in
+progress ("you cannot mix COPY with other operations") for the rest of the
+connection.
+
+`uuid_in` accepts every spelling PostgreSQL does (braces, upper case, a hyphen
+after any group of four hex digits), a text parameter bound to a `$n::uuid` is
+canonicalised, and `uuid`, `bytea`, `inet`, `cidr` and their arrays are sent in
+binary when the client asks for it — psycopg decodes a whole row with the first
+column's format, so a single text column in an otherwise binary row was
+undecodable. A NUL byte inside a binary text parameter is the 22021
+PostgreSQL gives it, and the `any`-typed builtins (`concat`, `concat_ws`,
+`format`, `num_nulls`, `json_build_*`, …) refuse an untyped parameter with
+42P18, naming the parameter PostgreSQL names. `UPDATE … SET col = <expression
+over the row>` — `num = num * 2`, `s = upper(s)`, `num = coalesce(num, 0)` —
+evaluates per matched row, and ROLLBACK TO a savepoint on a store with no
+committed tables now undoes a CREATE TYPE issued after it.
+
+#### Fixed
+
+- `crates/secantus-pgserver`: a `pg_prepared_statements` registry of named
+  Parse statements (name, statement, `prepare_time` timestamptz,
+  `parameter_types` / `result_types` `regtype[]`, `from_sql`, `generic_plans`,
+  `custom_plans`), maintained by `on_parse` / `on_close`, `DEALLOCATE <name>`
+  (26000 when missing) and `DEALLOCATE ALL`; `NOTIFY` completes with its tag.
+- `crates/secantus-pgserver`: Describe of a zero-oid Parse sizes the parameter
+  list from the highest `$n` in the text, so `select $1::uuid` describes
+  instead of "there is no parameter $1".
+- `crates/vendor/pgwire`: a COPY OUT / COPY BOTH handler error is returned as
+  the error alone — no trailing CopyFail (local patch in `api/copy.rs`).
+- `crates/secantus-pgplan`: `parse_uuid` accepts a hyphen after any group of
+  four hex digits and the brace form; `uuid_to_wire` for the binary encoding;
+  `catalog_param_types` / `max_param_number` / `static_text_type` for the
+  registry; `refuse_untyped_any_args` (42P18, skipping `format`'s and
+  `concat_ws`'s leading `text` argument).
+- `crates/secantus-pgserver`: `uuid`, `bytea`, `inet`, `cidr` and their array
+  types are binary-encodable; an `inet[]` / `cidr[]` in text renders each
+  element through `inet_out` (a host address drops its full mask); a text
+  parameter for a `uuid` target casts through `uuid_in`; a NUL byte in a binary
+  text-family parameter is 22021.
+- `crates/secantus-pgplan` / `-pgserver`: `UPDATE … SET` values that read
+  the row are planned as row expressions (`Update::set_exprs`) and evaluated
+  per matched row before the first write (`update_row_sets`).
+- `crates/secantus-storage`: `collection_exists` reads on the active user
+  transaction's session, so a savepoint restore sees a collection the same
+  transaction created.
+
+### The Rust PostgreSQL server names each result column's source table
+
+A `RowDescription` now says where each column came from: the relation oid and
+1-based attribute number libpq exposes as `PQftable` / `PQftablecol`, through
+an alias, a two-table `FROM`, a `JOIN`, `SELECT *` and `INSERT ... RETURNING`,
+over the simple and the extended protocol alike. A computed column reports
+`0` / `0`, exactly as PostgreSQL 16 does. The relation oid is the one the
+table's row type already carried in `pg_type` and `pg_attribute.attrelid`, so
+the three agree.
+
+The `regclass` type arrives with it: `'t1'::regclass` resolves a relation name
+to that oid (unquoted parts fold to lower case, quoted ones keep theirs, a
+`public.` / `pg_temp.` / `pg_catalog.` prefix is honoured, the fixed catalog
+relations such as `pg_class` answer their PostgreSQL oids), renders as the
+name, casts to `oid` / `int` / `text`, and refuses what PostgreSQL refuses
+with the same codes -- `42P01` for an unknown relation, `42602` for a
+malformed name, `42846` for a cast to `regtype`. A comma-separated `FROM t1,
+t2` plans as a CROSS join, and a select list may repeat an output name.
+
+#### Added
+
+- `crates/secantus-pgplan`: the `regclass` type (oid 2205) -- resolution
+  against the session's published relations, text rendering, casts to and
+  from it, and PostgreSQL's error surface; comma-FROM cross joins; constant
+  targets in a join's select list.
+- `crates/secantus-pgserver`: `RowDescription` `ftable` / `ftablecol` for
+  pass-through base-table columns; each table's columns carry their source
+  from the catalog lookup and from `CREATE TABLE` within the transaction.
+
+#### Fixed
+
+- `crates/secantus-pgserver`: two join outputs with the same name (`select
+  'a'::regclass::oid, 'b'::regclass::oid from t1, t2`) no longer collapse to
+  one value.
+
+### Shell types and base types on the Rust PostgreSQL server
+
+`CREATE TYPE "a-b";` used to be refused outright (`DefineStmt is not supported
+yet`), which closed the door on the sequence psycopg's own suite uses to build
+a custom base type: a shell type, two `LANGUAGE internal` I/O functions that
+name it, and the full `CREATE TYPE "a-b" (input=invin, output=invout,
+like=text)` that completes it. The Rust server now runs that sequence the way
+PostgreSQL 16 does. A shell is a `pg_type` row with no array type that nothing
+can be cast to (`type "a-b" is only a shell`), `CREATE FUNCTION ... LANGUAGE
+internal` registers the wrapper with PostgreSQL's notices for a shell argument
+or return type (and creates a shell for an unknown return type), and the full
+`CREATE TYPE` checks its shell and both I/O functions — existence, exact
+signature, return type — with PostgreSQL's messages before completing the type.
+
+A completed type carries its values as text: `'hello-inv'::"a-b"` and
+`'{hello-inv}'::"a-b"[]` come back described with the type's own oid and its
+`typarray`, `TypeInfo.fetch` finds both, and a name that needs quoting (`€`,
+`order`, `foo bar`, `FooBar`) renders quoted through `regtype`. `DROP TYPE`
+and `DROP FUNCTION` know the dependency between a type and its I/O functions:
+RESTRICT refuses with `2BP01` and PostgreSQL's per-dependent DETAIL lines,
+CASCADE drops them with the `drop cascades to ...` notice, and both roll back
+inside a transaction. `DROP TYPE IF EXISTS` on a missing type is now the
+`does not exist, skipping` notice rather than silence.
+
+#### Added
+
+- `secantus-pgplan`: plans `DefineStmt` of kind TYPE (shell and full forms),
+  `CreateFunctionStmt` (`LANGUAGE internal` only) and `DROP FUNCTION`;
+  `DropType` carries `CASCADE`; a base type registry beside the enum /
+  composite / range ones, with a defined type casting text to itself and a
+  shell refused as `is only a shell`.
+- `secantus-pgserver`: the `__sql_base_types__` catalog (oid band 71000,
+  `typarray` = oid + 100000), `CREATE FUNCTION` rows in the shared
+  `__sql_functions__` shape, `pg_type` rows for shells and base types, and
+  the dependency-aware `DROP TYPE` / `DROP FUNCTION` with PostgreSQL 16's
+  errors and notices. A table column typed as a shell is refused.
+- psycopg gauge: `test_sql.py::TestLiteral::test_invalid_name` passes for all
+  five spellings.
+
+### The Rust PostgreSQL server prepares transactions
+
+Two-phase commit is how a transaction manager coordinates one commit across
+several databases: each participant is asked to `PREPARE TRANSACTION 'gid'`,
+which must make the work durable without making it visible, and only once
+every participant has said yes does the manager `COMMIT PREPARED 'gid'` on
+each of them — from whichever connection it happens to hold at the time,
+possibly after the original one has gone, possibly after the server has been
+restarted in between. The Rust PostgreSQL server now does all of that.
+`PREPARE TRANSACTION` records the block's write set durably and ends the
+block; the writes stay invisible to everyone; `COMMIT PREPARED` and
+`ROLLBACK PREPARED` resolve the transaction from any connection, and a
+prepared transaction found on disk at startup — data and DDL alike — is
+listed in `pg_prepared_xacts` and replayed when it is committed.
+`max_prepared_transactions` reports 100, so psycopg's two-phase-commit suite,
+which had skipped itself against the server, now runs: 38 tests pass.
+
+The error surface is PostgreSQL 16's, each case measured: a `PREPARE`
+outside a block is a warning and a `ROLLBACK`, every failed `PREPARE` ends
+the block, a duplicate identifier is `42710`, one of 200 bytes or more is
+`22023`, a block that created a temporary table, opened a `WITH HOLD` cursor
+or used `LISTEN` / `NOTIFY` cannot be prepared (`0A000`), and `COMMIT
+PREPARED` inside a block is `25001`. `TRUNCATE` landed on the way, because
+psycopg's fixture uses it: `TRUNCATE [TABLE] a, b [RESTART IDENTITY]
+[CASCADE]`, with PostgreSQL's refusal of a foreign-key parent (detail and hint
+included) and its per-table cascade notices.
+
+#### Added
+
+- `PREPARE TRANSACTION` / `COMMIT PREPARED` / `ROLLBACK PREPARED` and the
+  `pg_prepared_xacts` view on the Rust PG server; `max_prepared_transactions`
+  is 100. `secantus-storage` gains a `secantus_prepared_xacts` table,
+  `prepare_user_transaction` / `commit_prepared` / `rollback_prepared` /
+  `list_prepared_xacts`, and a replay of a recorded write set for a
+  transaction prepared before a restart.
+- `TRUNCATE [TABLE] name [, ...] [RESTART IDENTITY] [CASCADE]`.
+
+#### Fixed
+
+- `Storage::outside_user_transaction` (the oid counter a `CREATE TABLE` mints
+  mid-block) let its inner autocommit statement drain the enclosing block's
+  parked oplog seq ranges — and, in async oplog mode, clear its buffered
+  entries — so the block's earlier writes were lost to the in-flight window
+  and to the prepared write set. It now stashes and restores the thread's
+  oplog bookkeeping around the bookkeeping call.
+
+### The Rust PostgreSQL server keeps `numeric` exact past 34 digits
+
+PostgreSQL's `numeric` is arbitrary precision; the Rust PostgreSQL server
+stored it as Decimal128, which holds 34 significant digits and an exponent no
+wider than ±6144. A value beyond that was refused with a `22003` where
+PostgreSQL simply returns it — a loud refusal, but psycopg's exhaustive numeric
+round-trip tests, and any application that keeps a 40-digit key or a
+1000-digit constant, could not run at all.
+
+Wide values now persist as their canonical PostgreSQL text alongside a
+byte-sortable key, and everything that fits Decimal128 stays Decimal128. The
+two forms compare and sort by value — `1.50` still ties `1.5`, a 40-digit
+value still lands after a 35-digit one, and `NaN` takes PostgreSQL's place
+above infinity — in every WHERE operator, in ORDER BY, through a numeric
+PRIMARY KEY, and inside `sum` / `min` / `max`. Arithmetic is exact at any
+width, with PostgreSQL's division-scale rule, and a computed numeric column
+is described as `numeric` rather than as an integer. Every expectation was
+measured on PostgreSQL 16.
+
+#### Fixed
+
+- `secantus-pgplan/src/numeric.rs` (new): canonical-text parsing and
+  rendering, the `{__numeric, __numkey}` wide representation, `Decimal128`
+  bracketing, `numeric_filter` WHERE lowering (Decimal128 arm + key arm + NaN
+  arm), exact `BigInt`-backed `+ - * /`, `sum_numeric_texts`, and a value
+  comparison that ranks `NaN` above `Infinity` as PostgreSQL does.
+- `secantus-pgplan`: `sum(numeric)` is typed `numeric`; a computed numeric
+  column (`n * 2`) is `numeric` (oid 1700), not `int4` — the client's integer
+  loader used to choke on `3.0`.
+- `secantus-pgserver`: text and binary encoders, array elements, record
+  fields, parameter decoding and casts all accept and emit wide values; `sum`
+  over numeric is exact; ORDER BY and every comparison use the value order; a
+  numeric PRIMARY KEY rejects a duplicate that differs only in display scale
+  (`1e40` vs `1e40.0`) with `23505`, and resolves equality / range / UPDATE /
+  DELETE by value through the `_id` index.
+
+### Composite values bound as parameters over the Rust PG server's extended protocol
+
+The Rust PostgreSQL server can now accept a user `CREATE TYPE ... AS (...)`
+composite bound as a query PARAMETER. When psycopg's `register_composite` sends
+a composite value it puts the type's OID in the `Parse` message and the value in
+the `Bind` — but pgwire's `StoredStatement::parse` maps every parameter OID
+through `Type::from_oid`, which only knows builtins and returns `None` for a
+composite. The raw OID was gone before our parser ran, so a bound composite had
+no resolvable type and every such query failed with `could not determine data
+type of parameter $1`.
+
+The fix vendors pgwire 0.40.7 into the tree (`crates/vendor/pgwire`, wired in
+through `secantus-pgserver`'s own `[patch.crates-io]`) with a single-field
+addition: `StoredStatement::parameter_oids` preserves the raw `Parse` OIDs
+alongside the mapped types. The vendored copy is byte-identical to upstream but
+for that one patch to `src/api/stmt.rs`; its licenses travel with it. The
+server then resolves a parameter's raw OID against its own composite catalog,
+gives the parameter a declared type (so `pg_typeof($1)` answers the type name),
+and decodes the value into the same record BSON a `'(..)'::type` literal
+produces — from the TEXT `(a,b)` form and the binary RECORD form alike,
+recursing for a composite-typed field.
+
+#### Added
+
+- `crates/vendor/pgwire`: a locally-patched copy of pgwire 0.40.7 whose
+  `StoredStatement` carries `parameter_oids: Vec<u32>` (the raw `Parse` OIDs),
+  wired in via `secantus-pgserver`'s `[patch.crates-io]`.
+
+#### Fixed
+
+- `secantus-pgserver`: a user composite bound as a parameter now resolves its
+  type from the raw `Parse` OID and decodes to the correct record value, so
+  `register_composite` round-trips (text and binary) instead of failing with
+  `could not determine data type of parameter $1`.
+
+### php-library's text-index failure reads as the declared gap it is
+
+`IndexInfoFunctionalTest::testIsText` fails with the server's own
+`text indexes are not supported by SecantusDB`. Text indexes are permanently
+out of scope, and the same gap was already declared for the node and pymongo
+gauges — php-library was the one left reading as an unexplained failure, which
+is what made its report look like it had something to chase.
+
+#### Changed
+
+- `docs/validation-report-php-lib.md` now carries **Expected** and **Adjusted**
+  columns, and an "Expected failures" section naming the test and why it fails:
+  3089 passed / 0 failed / 1 expected — **99.9% plain, 100.0% adjusted**.
+
+  Both columns ship. The plain rate still counts the failure, so it stays
+  visible; the adjusted one answers "how much of the conformable surface
+  conforms". Declaring a gap is not the same as hiding it, and the gauge is
+  never told to skip the test.
+
+### A numeric path component over an array matched the wrong documents
+
+mongod reads `{"v.0": …}` **both** ways and matches on either:
+
+- the **element at that index** — and having spent the path step on the index,
+  it does *not* re-apply the implicit array traversal, so `{"v.0": 1}` does
+  **not** match `{v: [[1, 2]]}` even though `1` is inside `v.0`;
+- the **field of that name** in each element, so `{"v.0": 9}` *does* match
+  `{v: [{"0": 9}]}`.
+
+Both servers had both halves wrong, in opposite directions — they applied
+membership after the index and never tried the field reading — so a query could
+both return documents mongod would not **and** miss ones it would, silently and
+with no error.
+
+Measured against mongod 8.2.11 over 22 filters × a 14-document corpus:
+**11 of 22 diverged**, now 0.
+
+#### Fixed
+
+- The matcher's path resolver now produces both readings, and marks a value
+  reached positionally so the implicit one-level traversal skips it. In Python
+  that is a `list` subclass, so the value is still an array for `$size`,
+  `$type`, `$elemMatch` and whole-array equality; in Rust it is a `Cand`
+  carrying the flag beside the borrowed value.
+- The Rust **raw-BSON fast lane** carries the same provenance. Without it the
+  two lanes would answer the same query differently depending on which ran.
+
+Combining the two readings with a plain OR would have been wrong: `$ne` and
+`$nin` mean *no candidate matches*, over the combined set, not *either reading's
+negation holds*. The flag travels with each candidate for that reason.
+
+### Four probes were only ever asking half the question
+
+Every differential probe here asks "does SecantusDB match mongod?" — and SecantusDB is two servers. Five probes only ever asked the Python one. That is how the aggregation stage corpus came to hide 219 Rust divergences until a `PROBE_SERVER` column was added to it last week.
+
+`tools/probes/_servers.py` is now the shared `probe_targets()` helper, and `update_operators`, `arg_types_documents`, `update_path_conflicts` and `findandmodify_shapes` all compare both servers. It found **21 divergences on the Rust server, 0 on the Python one**.
+
+#### Fixed — the Rust server accepted malformed writes and reported success
+
+- **A non-document `q`, or a non-document/array `u`, on `update` / `delete`** fell through every match arm: the statement applied nothing and answered `ok`. mongod refuses the command (14 for a bad filter, 9 for a bad update, 40414 for an absent one, and 14 for a non-document element inside a pipeline-form `u`). 12 shapes.
+- **`findAndModify` with `remove` alongside `new` or `upsert`**, or with an `update` that is neither a document nor a pipeline, **ran the delete** where mongod refuses the command outright.
+
+#### Fixed — reply shape
+
+- A remove's `lastErrorObject` carried **`updatedExisting`**, which mongod reports only for an update. Drivers read that field by field.
+- `findAndModify`'s remove+update message said "both update and remove=true"; mongod says "both an update and remove=true".
+
+#### Fixed — a defer that should have been an answer
+
+- `$rename` with the same source and target deferred, which on the standalone Rust server reports "a construct the Rust server does not support" for an ordinary bad argument. It now names it, as mongod does.
+
+Two shapes remain, recorded in `tasks/backlog.md`: the Rust update path has no parse-time / execution-time distinction, so it omits mongod's `Plan executor error during update :: caused by ::` wrapper. Code and message body already match.
+
+### Widening the probe corpus found thirteen crashes and six wrong values
+
+`tools/probes/agg_expressions.py` had run tens of thousands of times against both servers. Its value list contained no infinity, no NaN, no signed zero, no numeric boundary, and none of MinKey / MaxKey / Binary / Timestamp / Regex / Code.
+
+A value **class** that is absent is invisible in exactly the way a passing test is: it costs nothing and it proves nothing. Adding those classes took the sweep from 3,968 cases to 6,628 and immediately surfaced **thirteen crash-class bugs** — each an `internal server error` reachable from any query — plus six wrong values on a server the campaign had held at zero for days.
+
+| | Before | After |
+| --- | --- | --- |
+| Crash-class bugs, Python server | 13 | **0** |
+| Wrong values, Rust server | 6 | **0** |
+| `agg_expressions.py` cases | 3,968 | **6,628** |
+
+#### The crashes, by root cause
+
+Two causes, both closed at the class level rather than per instance:
+
+- **Python's decimal contexts trapped `InvalidOperation`** instead of producing a value. decimal128's own answer for `Inf + -Inf` is NaN, and for the trig series on a non-finite operand it is the operator's limit. Both `_DEC128_CTX` and `_DEC_TRIG_CTX` now trap nothing.
+- **`math.ceil` / `math.trunc` / `datetime.fromtimestamp` raise on values BSON accepts.** `$ceil` of a double infinity, `$trunc` of NaN, and `$toDate` of `Int64(2**63 - 1)` (year 292278994, outside Python's `datetime`) all escaped as internal errors where mongod answers.
+
+#### Wrong values
+
+- **The accumulators did not unwrap a one-element array.** `{$sum: [[1]]}` answered 0 where mongod answers 1 and `{$max: [[1]]}` answered `[1]` where mongod answers 1 — five shapes across `$sum` / `$avg` / `$min` / `$max` / `$stdDevPop`, on *both* engines. `{$sum: [[1, 2]]}` sums the inner array; `{$sum: [[1], [2]]}` has two operands, both arrays, both ignored.
+- **Integer rounding went through `f64`**, so `$trunc` and `$round` lost `9223372036854775807` entirely. Both now compute in integers.
+
+#### Rules probed, not derived
+
+- **NaN is never a domain error** — it answers NaN for every trig operator in both numeric types, including the range-limited ones where `-1 <= nan <= 1` is trivially false.
+- **A decimal infinity takes the operator's limit**, which is a table rather than a series: `$atan` is pi/2 to all 34 digits, `$tanh` is exactly 1, `$cosh` is `Infinity` from either side. So the Rust server can answer these exactly despite having no decimal transcendentals.
+- **Rounding up out of int64 is an error** (`51080`), not a widening to double.
+- **A date outside int64 is `241`**, not a saturation — which is what Rust's `as i64` was silently doing for `{$toDate: 1e308}`.
+- **Python's `%` is floor-based where Rust's truncates.** The identical `n - (n % scale)` truncates toward zero in Rust and away from it in Python, so `$trunc` of `-12345` at place -1 differed by 10 between the engines.
+
+#### A mongod bug, deliberately not reproduced
+
+`{$round: [-2147483648, -1]}` answers **positive** `2147483646` on mongod — an exact int32 wrap of the correct `-2147483650`. The same overflow is handled three different ways: *widened* for a positive int32, *wrapped* for a negative one, and *detected* (`51080`) at int64 width. `$trunc` on the same input is correct.
+
+Both servers answer `-2147483650`. Reproducing the wrap would mean writing arithmetic known to be wrong to match a defect, and it is recorded in `tasks/backlog.md` §7 with the arithmetic rather than chased.
+
+#### Also
+
+The probe's clients now use `datetime_conversion="DATETIME_AUTO"`. Without it the default codec raises `InvalidBSON` while *decoding* a legitimate out-of-range date, killing the probe rather than reporting a divergence — and it did so identically for mongod, so it is the client that cannot cope, not either server.
+
+### Projections come back in MongoDB's field order, and refuse what MongoDB refuses
+
+`apply_projection` sits on the read path of every `find` and had never been
+compared against MongoDB. A new probe found three divergences on its first run,
+all shared by both servers.
+
+#### Fixed
+
+- **Projected fields came back in the wrong order** when `$slice` or
+  `$elemMatch` was involved. MongoDB emits `_id` first, then the *document's*
+  own key order — not the projection spec's — with computed fields appended.
+  Those two operators were applied after the plain inclusions, so their fields
+  landed at the end. Field order is what a driver renders, and comparing
+  documents for equality ignores it entirely, so nothing else could see this.
+- **`{$elemMatch: {$gt: 2}}` failed with *"unknown top level operator: $gt"***
+  whenever the array held documents. A criterion of only `$`-operators is an
+  element-*value* predicate — each element tested as a value — and the code
+  branched on the element's type instead of the criterion's shape. The value
+  predicate also suppresses the implicit one-level array traversal, so a nested
+  array is not descended:
+
+  | array | criterion | result |
+  | --- | --- | --- |
+  | `[1, 2, 3]` | `{$gt: 2}` | `[3]` |
+  | `[1, [3, 4], 5]` | `{$gt: 2}` | `[5]` |
+  | `[[1, 2], [3, 4]]` | `{$gt: 2}` | field omitted |
+  | `[[1, 2], [3]]` | `{$size: 2}` | `[[1, 2]]` |
+
+- **A projection naming both a path and its ancestor was accepted** and returned
+  a truncated document. MongoDB refuses the pair, with the code depending on the
+  order: `{a: 1, "a.x": 1}` is `31249 Path collision at a.x remaining portion
+  x`, and `{"a.x": 1, a: 1}` is `31250 Path collision at a`. Siblings, a shared
+  string prefix that isn't a path component, and the same path twice remain
+  legal.
+- On the Rust server, a **named** projection error is no longer rewritten to a
+  generic `BadValue` — only the positional cases whose exact code it cannot
+  reproduce still fall back.
+
+#### Added
+
+- `tools/probes/projection_results.py` — 37 shapes, comparing field order as
+  well as content. 0 divergent on both servers.
+
+Measured against mongod 8.2.11.
+
+### Wrong-typed command arguments on the Python server: the message sweep
+
+The wrong-type sweep that closed the Rust server compared error CODES only.
+Comparing MESSAGES over the same 685 shapes against mongod 8.2.11 found the
+Python server divergent on 409 of them, including **18 that answered
+`internal server error`** — an `int()` or an iteration over a value whose type
+was never checked. This closes 311 of the code divergences and 31 of the
+message-only ones; `createIndexes` and `collMod` are the measured remainder.
+
+#### Fixed
+
+- **A wrong-typed `count.limit`, `count.skip`, `listCollections.cursor.batchSize`
+  or `update.updates.arrayFilters` crashed the command handler** and answered
+  `1 internal server error`. All 18 crashing shapes now answer mongod's code.
+  `count`'s two slots are deliberately not symmetric: `limit` answers
+  `2 limit value is not a valid number` (and `9 Expected an integer` for a
+  non-integral double), `skip` answers `14` with the IDL expected-types list —
+  which is what mongod does.
+- **A negative `count` limit was ignored** where mongod counts its absolute
+  value, so `limit: -3` returned the whole collection instead of 3.
+- **Python class names leaked into error messages** — `'ObjectId'` for
+  `objectId`, `'datetime'` for `date`, `'bytes'` for `binData`. Three partial
+  copies of the type-name mapper have been collapsed into `secantus.bsontypes`,
+  probed against mongod and matching the Rust engine's existing vocabulary. This
+  corrects the type name in roughly 90 message sites across every engine.
+- **Wrong-typed `hint` answered `2 invalid hint type: int`** instead of mongod's
+  `9 Hint must be a string or an object`, on `find` / `count` / `aggregate` /
+  `update` / `delete`. On the batch commands it is a command-level error, so
+  nothing is written.
+- **Wrong-typed document options were silently accepted** — `collation`,
+  `readConcern`, `validator`, `timeseries`, `filter` and `cursor` across
+  `find` / `aggregate` / `update` / `delete` / `findAndModify` / `create` /
+  `distinct` / `listCollections` now answer `14` under mongod's own IDL path.
+- **Aggregation stages reported a generic `14` for a non-document spec.** Each
+  now answers mongod's own code and wording: `$project` 15969, `$addFields`
+  40272, `$replaceRoot` 40229, `$bucket` 40201, `$bucketAuto` 40240, `$sample`
+  28745, `$geoNear` 10065, `$redact` 17053 (a runtime executor error, with the
+  wrapper), and `$densify` / `$fill` / `$setWindowFields` / `$unionWith` 9.
+- **Boolean options were ignored or misreported** — `find`'s `tailable`,
+  `awaitData`, `returnKey`, `showRecordId` and `allowDiskUse`,
+  `aggregate.allowDiskUse`, `ordered` on all three write commands, and
+  `renameCollection.dropTarget`. A string `tailable` used to reach the cursor
+  machinery and answer "tailable cursor requested on non capped collection".
+
+### Every wrong argument to `$rand` carried the wrong wrapper
+
+`$rand` takes no arguments, and both ways of getting that wrong are PARSE
+errors on mongod, so they take the stage's wrapper (`Invalid $addFields ::
+caused by ::`) rather than the executor's. The pure engine already produced the
+right code and the right sentence for all of them — only the routing was wrong,
+on 45 shapes, which is 76% of every remaining message difference on this
+surface.
+
+The rule has a shape worth stating, because a single "must be a document" check
+gets it wrong three ways (measured against mongod 8.2.11, 2026-09-05):
+
+| argument | mongod |
+|---|---|
+| `{}` **or `[]`** | valid — returns a double |
+| non-empty document or array | `3040501` "$rand does not currently accept arguments" |
+| any scalar | `10065` "invalid parameter: expected an object ($rand)" |
+
+An empty *array* being accepted is the easy one to miss, and the two wrong
+arguments get two different codes for what reads as one mistake.
+
+The Rust engine already had all of this in its parse-time scanner, correctly,
+from an earlier pass — this brings the pure engine to it.
+
+With this, the probe's message differences fall from 59 to **14**, and the
+wrong-code set is byte-identical to before. What remains on this surface is a
+flat tail: 28 codes across 28 different operators with one shape each, and 14
+messages likewise. No further rule-shaped win is visible.
+
+#### Fixed
+
+- `aggregate.py`: `_expression_shape_problem` classifies both `$rand` argument
+  errors as parse errors.
+
+#### Changed
+
+- `tests/test_expression_parse_time_wrappers.py`: 10 more cases covering every
+  measured `$rand` shape, including the two valid ones.
+
+### A read-path sweep: queries that returned the wrong documents
+
+A 385-case differential sweep of `find` filters, projections and sorts against
+mongod 8.2.11 — comparing full **result sets**, not counts, so a missing
+document is visible rather than a wrong tally. It found 27 divergences on the
+Python server and 20 on the Rust one. This release fixes thirteen of them, in
+four families, and every one was a wrong answer rather than a wrong message.
+
+A **NaN range bound matched nothing**. mongod's comparison order treats NaN as
+equal to NaN — which is why `find({x: NaN})` works — so an inclusive bound
+matches it: `{$gte: NaN}` and `{$lte: NaN}` return the NaN document while
+`{$gt: NaN}` and `{$lt: NaN}` return nothing. IEEE says every NaN comparison is
+false, so both servers returned nothing for all four.
+
+**Decimal128 could not be compared with an infinity.** The numeric bridge bailed
+out whenever either operand was non-finite, and only NaN needed excluding —
+`Decimal` orders ±Infinity perfectly well. The bail-out left `float > Decimal128`
+to raise `TypeError`, which the caller swallows into a silent no-match, so
+`{x: {$gt: Decimal128("5")}}` skipped a document holding `Infinity` and
+`{x: {$lt: Infinity}}` skipped one holding `Decimal128("5")`. `$all` had the
+same shape from a different cause: it compared elements with a bare `==`, so
+`{$all: [5]}` missed a stored `Decimal128("5")` that `$eq: 5` matched.
+
+**NaN had no place in the sort order.** The comparator answered "not less" in
+both directions, so a sort left a NaN wherever the algorithm happened to put it —
+between `5.5` and `Infinity` in a measured case. mongod ranks it below every
+other number, `-Infinity` included. BinData was mis-ordered too: mongod compares
+by length first and then by bytes, so `b"\x02"` sorts before `b"\x01\x02"`.
+
+**`$type` accepted eight aliases it could never match.** On the Rust server
+`javascript`, `minKey`, `maxKey`, `timestamp`, `undefined`, `symbol`,
+`dbPointer` and `javascriptWithScope` all validated as arguments and then
+matched no document, because the type table had no arm for them. Argument
+validation passing is what made the gap invisible.
+
+#### Fixed
+
+- `secantus.query` / `secantus-core`: `$gte` / `$lte` with a NaN bound match the
+  NaN document; `$gt` / `$lt` still match nothing.
+- `secantus.query`: the numeric bridge admits ±Infinity, so Decimal128 compares
+  against them under every range operator instead of silently matching nothing.
+- `secantus.query`: `$all` compares elements with the same numeric-bridging
+  equality `$eq` uses.
+- `secantus.ordering`: NaN sorts below every other number and ties with another
+  NaN; BinData sorts by length, then bytes.
+- `secantus-core`: `$type` matches the eight BSON types its alias table already
+  accepted.
+
+### The test suite reclaims its own disk
+
+Every test in this suite builds a real WiredTiger database — never a mock — so
+every run leaves a few gigabytes of per-test stores behind. pytest normally
+sweeps old runs itself, but it stops the moment a run dies without running its
+exit hooks: the dead run's lock file makes pytest treat the directory as live
+for three days. The backlog then compounds, because the bigger it gets the
+longer each run's exit-time cleanup takes, so more runs get killed mid-cleanup,
+each leaving another stale lock. One machine reached 241 directories and
+391 GiB that way; another reached 48 GiB in a day.
+
+`invoke clean` has been able to fix this for a while. The problem was that it
+only ran when somebody remembered, so the backlog kept coming back. The sweep
+now also runs automatically when a pytest session starts.
+
+It deletes only directories whose owning pytest process is **gone**, decided
+from the PID in the lock file, and never the newest few. A live run is
+protected twice over: its directory is the newest, and its lock names a running
+process.
+
+#### Added
+
+- `tests/conftest.py` reaps abandoned pytest temp trees at session start. It
+  runs on the xdist controller only, skips the byte-counting walk that
+  `invoke clean` does for its summary line, and swallows every error —
+  reclaiming disk must never fail a test run. Set `SECANTUS_NO_TMP_REAP=1` to
+  turn it off.
+- `_sweep_stale_pytest_tmp` takes `measure=False` for callers that want the
+  deletion without sizing every tree first.
+
+#### Note
+
+Deleting a *passed test's* own `tmp_path` mid-session is a different thing and
+remains forbidden — it races WiredTiger's background threads into `WT_PANIC`,
+and `tests/conftest.py` refuses to start under a retention policy that does it.
+This sweep only ever touches trees from runs that have already exited.
+
+### `$redact` returned data it exists to withhold — three defects, both servers
+
+`$redact` is MongoDB's content-based access-control stage: an expression decides,
+per document and per sub-document, whether to keep it, drop it, or recurse. Three
+separate defects made it hand back documents mongod withholds. All three were
+present on **both** servers, and all three were found by running the stage against
+mongod 8.2.11 rather than by reading the code — which had described the decisions
+as "sentinel strings", the assumption the first two bugs rest on.
+
+#### Fixed
+
+- **A stored string could impersonate a decision.** The stage compared the
+  evaluated result against the *string* `"$$KEEP"`, so a document whose own field
+  held that string satisfied the test: `{"$redact": "$tag"}` over caller-supplied
+  content kept a document — with its secrets — that mongod refuses to keep.
+  `$$KEEP` / `$$PRUNE` / `$$DESCEND` are now variables bound only while
+  `$redact`'s expression is evaluated, and the stage dispatches on the bound
+  marker, so no value carried in a document can be mistaken for a decision.
+- **Redaction skipped nested arrays.** The descent walked documents and
+  arrays-of-documents but passed a *nested* array through untouched, so a
+  sub-document one array deeper — `[[{level: 9}]]` — was returned in full where
+  mongod prunes it and leaves the emptied inner array in place.
+- **The decision names leaked outside `$redact`.** `{"$project": {"x": "$$KEEP"}}`
+  returned the marker string as ordinary data. mongod binds these three names only
+  inside `$redact` and answers `Use of undefined variable: KEEP` (17276) anywhere
+  else, which both servers now do.
+- **A non-decision result now answers mongod's error.** 17053 with its own
+  wording, wrapped in `Executor error during aggregate command on namespace: … ::
+  caused by ::`, and the offending value rendered mongod's compact way — the
+  Python server answered a generic TypeMismatch (14) with its own text, and the
+  Rust server reported the stage as unsupported.
+- **An undefined variable takes the wrapper mongod gives it.** `Invalid $<stage>
+  :: caused by ::` inside `$project` / `$addFields` / `$set`, and a bare message
+  in every other stage; the Python server applied the executor prefix to both.
+
+#### Notes
+
+- `$redact` was never missing: it worked on both servers for every valid pipeline,
+  which is why only its error path had been noticed. The backlog entry calling it
+  "unimplemented on the Rust server" was wrong and has been corrected.
+- The 17053 value rendering is mongod's compact `Value::toString` (`{k: 1}`,
+  `[1, "a"]`, a bare ObjectId, an ISO-8601 date) — **a different renderer** from
+  the shell form other messages use (`{ k: 1 }`, `ObjectId('…')`,
+  `new Date(<ms>)`). Both are mongod's; they are not interchangeable.
+- The Rust server had no executor wrapper at all. It now applies one where mongod
+  does, via a standalone validator that names the error the engine could only
+  signal as `Fallback` — the `update::arith_type_error` template, so `Fallback`
+  itself is untouched.
+- 21 cases added to `tests/test_mongod_differential.py`, so this is measured
+  against a real `mongod` from now on rather than pinned to our own belief.
+
+### A regex is a value, not only a pattern — and `$addToSet` dedups by BSON equality
+
+Continues the measure-against-mongod-8.2.11 sweep, taking the last Rust-engine
+capability defers. Two new standing probes cover the ground:
+`tools/probes/regex_value_semantics.py` (104 shapes) and
+`tools/probes/addtoset_membership.py` (30).
+
+Three of the fixes are silent WRONG ANSWERS on the Python server, not errors —
+found while reproducing a Rust-only backlog item, which is the whole argument
+for running a probe against both servers rather than reading either one.
+
+#### Fixed
+
+- **A bare regex filter never matched a stored regex.** mongod matches `/ab/i`
+  against a *string* by pattern and against a stored *regex* by equality, so
+  `find({v: /ab/i})` returns `{v: /ab/i}`. Both servers returned nothing.
+  Equality is exact-pattern plus options-as-a-SET: `/ab/im` is `/ab/mi`, and
+  `/ab/i` is not `/ab/mi`. `$in`, `$nin` and `$regex` carry the same rule.
+- **A regex was applied to JavaScript.** `bson.Code` subclasses `str`, so
+  `find({v: /ab/})` matched `{v: Code("ab")}`. mongod never regex-matches code.
+- **`$max` / `$min` over two regexes never moved.** `bson.Regex` defines no
+  `__lt__`, so the comparison fell to a type-name fallback that reported every
+  pair EQUAL — and both Rust arms had that accident written in as a comment
+  citing what Python did. mongod orders by pattern, then option string.
+- **`$eq` with a regex operand errored on the Rust server** for every document
+  in the collection. On mongod `$eq` with a regex is equality *only* — the
+  opposite of a bare regex, which matches — and a defer is an error on the
+  standalone server.
+- **`$addToSet` of a bool, a document, or a `Code` errored on the Rust server.**
+  It deferred on the strength of a stale comment; `py_eq` had since grown the
+  bool and `Code` rules, leaving only document field ORDER to add.
+- **A `Code` value made `$set` fail on the Rust server** — the oplog update-diff
+  walks every field through `py_eq`, which deferred on a JavaScript value paired
+  with anything else.
+- **`$pop`'s error quoted the argument as written**, so `Decimal128("-0")` read
+  `found: -0`. mongod reports the coerced integer (`1E+2` is `found: 100`).
+
+#### Changed
+
+- The regex option-character table is now shared (`bsontypes.REGEX_OPTION_CHARS`
+  / `regex_options_string`) between the in-memory sort and the index-entry
+  encoder, on both servers. Two functions disagreeing about a sort key is how an
+  index comes to change the sort answer. No `entryFormat` bump: the index
+  encoder was the half that was already right.
+
+### `$$REMOVE` is the missing value, not a marker of its own
+
+Probed 9-for-9 against mongod 8.2.11: in every position — a projected field, an
+array element, a nested document, `$ifNull`, `$type`, `$eq`, `$cond`, `$concat`,
+`$sum`, a `$group` `_id` — `$$REMOVE` answers exactly what the equivalent
+**absent field path** answers. Both engines instead gave it a marker of its own,
+which then escaped the places that knew about it.
+
+#### Fixed
+
+- **A crash.** `{"$addFields": {"arr": [1, "$$REMOVE", 2]}}` put the marker
+  object into the result, where `bson.encode` failed and the command returned
+  `internal server error` (code 1). mongod returns `[1, null, 2]`.
+- `$type: "$$REMOVE"` answered `"object"` — the marker's own Python type —
+  where mongod says `"missing"`.
+- `$concat` with `$$REMOVE` raised 16702; mongod returns null.
+- `$ifNull: ["$$REMOVE", 9]` omitted the field instead of returning `9`.
+- **The Rust engine deferred the variable entirely**, which on a server with no
+  Python surfaced as a generic `BadValue` (2) for all 15 shapes probed.
+
+`$$REMOVE` now follows the same two-position rule the engines already apply to
+an absent path: the missing marker in field-value position (so `$project` /
+`$addFields` omit the key), `null` as an operator argument.
+
+#### Also fixed, found next door
+
+- **`$setField` with an absent path wrote a null where mongod removes the
+  field.** It evaluated its `value` in operator position, so only the literal
+  `$$REMOVE` removed anything; `{"value": "$nosuch"}` set null. mongod treats
+  both the same — probed.
+- **`$setField` rejected `value: null` outright** (`$setField requires field,
+  input, value`) because a present-but-null argument was tested with `is None`
+  and read as absent. That is the one form that distinguishes *write a null*
+  from *remove the field*.
+
+#### Notes
+
+The two names for the marker are now one: `MISSING` was already an alias of the
+`$$REMOVE` sentinel, which is what made the conflation easy to miss.
+
+23 cases added to `tests/test_mongod_differential.py`, five of them **twins** that
+pair a `$$REMOVE` shape with its absent-path equivalent — the two must answer
+identically, which is the claim this change rests on.
+
+### `$rename` no longer rewrites paths MongoDB refuses
+
+`$rename` will not move a field into or out of an array element, and it will not
+accept a positional token in either path. Both servers accepted several of those
+updates and applied them — and one of them, `{$rename: {"items.$[].a":
+"items.$[].b"}}`, was renaming every element of the array, which MongoDB does
+not do at all.
+
+That last one had a test asserting it worked. The test drove our own server, the
+only server it could reach, so it recorded what the code did rather than what
+MongoDB does; it has been corrected along with the behaviour.
+
+The two refusals differ in when MongoDB can decide them, and that changes how
+they arrive: a **dynamic** component (`$`, `$[]`, `$[id]`) is a parse error,
+raised without looking at the document and sent bare, while a path that
+**indexes into an array** is discovered per document, arrives under `Plan
+executor error during update :: caused by ::`, and is skipped altogether when
+the source field is absent — because then the rename is simply a no-op.
+
+#### Fixed
+
+- **A dynamic component in a `$rename` path is refused** — `The source field for
+  $rename may not be dynamic: <path>`, or its `destination` twin. Raised before
+  the document is read, so an absent source still errors. Precedence, measured:
+  source-dynamic before destination-dynamic, and both before an array-element
+  path; the general `No array filter found for identifier` check comes first
+  of all.
+- **The array-element messages name the field holding the array and carry
+  MongoDB's executor wrapper.** `deep.n.0.a` reports `'n'`, not the whole path,
+  and the `_id` in the message uses MongoDB's value rendering — a string `_id`
+  is quoted, an ObjectId is wrapped — where the Python server printed it raw.
+- **A `$rename` whose source does not resolve is a no-op again**, so
+  `{"v.9.a": "q"}` and `{"v.0.zz": "q"}` succeed rather than reporting a
+  traverse failure.
+- **`cannot use the part (…) to traverse the element` was sent bare by the
+  Python server.** Every code-28 traverse failure carries the executor wrapper;
+  the Rust server already did.
+- **The Rust server failed the whole `update` command** when an `arrayFilters`
+  identifier was missing, instead of recording one entry in `writeErrors`. A
+  driver saw the wrong exception class, and an unordered batch lost the
+  statements that had nothing wrong with them.
+
+Measured against mongod 8.2.11 over 35 shapes: 0 divergent on both servers.
+
+### A `rename` change event now leads with `to`, as MongoDB's does
+
+MongoDB puts `to` first on a `rename` change event — before `_id`, the only
+event where the resume token is not the leading field. SecantusDB put it after
+`ns`.
+
+This was measured earlier and deliberately left alone, on the reasoning that
+leading with `to` looked like an artifact of how MongoDB assembles that event
+and might not survive a version change. Re-measured against MongoDB 8.2.11, the
+version SecantusDB targets, it is identical — with and without
+`showExpandedEvents`. Stable across two major versions is a contract, not an
+artifact, so it is now replicated.
+
+With this, the change-stream differential sweep is at **zero divergences across
+all 41 cases and zero field-order differences**, on both servers, against a live
+MongoDB 8.2.11.
+
+### A retryable write's retry no longer replays the original attempt's error
+
+A `writeConcernError` describes one attempt: the write itself succeeded and only
+its durability acknowledgement failed. The retryable-write replay cache stored
+the reply verbatim — deliberately, so a replay would be byte-identical — which
+meant a driver's retry was handed the very error it retried because of. The
+operation then surfaced as an error even though the write was safely applied.
+
+Separately, the failpoint-configured `writeConcernError` was being embellished
+with a synthesised `errmsg` and `codeName`. Real mongod echoes the failpoint's
+document verbatim, and the synthesised `codeName` was wrong anyway: it rendered
+91 as `Location91` where 91 is `ShutdownInProgress`.
+
+Together these were the last genuine failure in the `mongo-c-driver` gauge,
+`/command_monitoring/unified/writeConcernError`, which now passes. The remaining
+C-gauge failures are the documented inherent ones (IPv6 listener, and server
+selection asserting a standalone/secondary that a single-node surrogate has not
+got).
+
+#### Fixed
+
+- The retryable-write replay drops `writeConcernError` and `errorLabels`, so a
+  retry reports the write's actual outcome. Byte-identical replay is right for
+  the write result and wrong for the attempt's own condition. Fixed on both the
+  Python and Rust servers.
+- A failpoint's `writeConcernError` is echoed exactly as configured — `{code: 91}`
+  stays `{code: 91}` — matching mongod. The Rust server was already correct here.
+- A non-retryable write (no `lsid`/`txnNumber`) still reports its
+  `writeConcernError` as before; only the replay is stripped.
+
+### The Rust server gains the MongoDB 8.0 features and an honest version
+
+The Python server advertised MongoDB 8.2.11 and supported `bulkWrite`, `sort` on
+`updateOne` / `replaceOne`, and change-event `nsType`. The Rust server had none
+of them and still advertised 7.0, so which features you got depended on which
+server you started. It now has all three and advertises the same version.
+
+The sequencing is the same as the Python side's, and it is the point: the
+advertised version is a capability contract, so it moved only once the features
+it promises existed. Raising it first would have made drivers send `bulkWrite`
+and receive `CommandNotFound`.
+
+Each operation in a `bulkWrite` runs through the ordinary insert / update /
+delete handler with the database rebound to that operation's namespace, so bulk
+semantics cannot drift from single-write semantics — the same structure the
+Python implementation uses.
+
+Verified against a live MongoDB 8.2.11: the twelve-shape `bulkWrite`
+differential agrees exactly, as it does for the Python server, and the pymongo
+conformance gauge run against the Rust server sits at 99.4% with the same five
+out-of-scope failures the Python server has.
+
+### Runtime aggregation errors on the Rust server report mongod's codes
+
+A pipeline that fails while *processing documents* — as opposed to failing its
+spec, which the command layer already validates — answered a single generic
+`2 BadValue` on the Rust server, because the engine can only signal such a
+failure as "defer to Python" and the Rust server has no Python to defer to.
+Measured against mongod 8.2.11, six of seven probed cases were divergent.
+
+#### Fixed
+
+- **`$densify` over a non-numeric, non-date field** now answers
+  `5733201 Densify field type must be numeric or a date`.
+- **`$bucket` with a value outside every boundary and no `default`** now
+  answers `7158303`. mongod implements `$bucket` over `$switch`, so it reports
+  the `$switch` sentence under `$bucket`'s own code — reproduced.
+- **`$switch` with no matching branch and no `default`** now answers `40066`.
+
+All three carry mongod's executor wrapper
+(`Executor error during aggregate command on namespace: <ns> :: caused by ::`).
+
+#### Known gaps
+
+Three cases still answer the generic message, each needing machinery this
+pattern does not provide, and each recorded in `tasks/remaining-work-plan.md`:
+
+- `$replaceRoot` with a scalar `newRoot` (40228), whose message quotes the
+  input document **pruned to the fields the expression reads** — mongod runs
+  dependency analysis before the stage.
+- `$arrayToObject` (40386) and `$concatArrays` (28664), which are expression
+  type errors rather than stage errors, and are the head of a per-operator
+  long tail.
+
+The Python server already matched mongod on all seven cases; this release
+changes the Rust server only.
+
+### The last of the deferred operand errors, and three renderings that look like one
+
+The operand-error campaign took the Rust server's `agg_expressions` sweep from 908 divergences to 117. This closes it to **32** — and the remaining 32 are two deliberate deferrals, not defers standing in for ordinary argument complaints. That class is gone.
+
+| | Campaign start | After the first pass | **Now** |
+| --- | --- | --- | --- |
+| `agg_expressions.py`, Rust server | 902 code + 6 message | 117 + 0 | **32 + 0** |
+| `agg_expressions.py`, Python server | 50 code + 212 message | 28 + 80 | **0 + 71** |
+| Wrong values, either server | 0 | 0 | 0 |
+
+**The Python server now has zero code divergences on this sweep**, down from 50.
+
+#### Fixed
+
+- **The trigonometric domain errors** (`50989`) across `$acos` / `$asin` / `$atanh` / `$acosh` / `$sin` / `$cos` / `$tan`, each with its own range string.
+- **`$mergeObjects`** names the offending value, and flattens an evaluated array: a field path resolving to an array *is* the operand list, so `{$mergeObjects: "$arr"}` over `[3, 1, 2]` reports "input 3" rather than naming the whole array.
+- **Six arithmetic type guards**, no two alike — `$add` and `$multiply` name the first offender, `$divide` and `$mod` name both operands, `$subtract` inverts them into `can't $subtract X from Y`, and `$atan2` carries a different code per position (`51044` / `51045`).
+- **The unknown-argument family** — eighteen operators, two sentences, eighteen codes that share nothing, plus the `n`-operator family and `$median` / `$percentile`'s IDL wording.
+- **`$round` and `$trunc` had no arity check at all**: `{$round: [3, 1, 2]}` answered `3`.
+- **`$range` was checking 64 bits, not 32** — it accepted a long and built a range of a trillion elements, answering `[]`.
+- **`$substr*` and `$strcasecmp` coerce their operands** rather than requiring a string, using the same rule `$toLower` does.
+
+#### Rules a reasonable guess gets wrong
+
+- **NaN is not a domain error.** `{$tan: NaN}` answers NaN, for all three of sin/cos/tan; only the infinities are refused. Both engines spelled the guard `not isfinite(x)` — which rejects NaN, and no probe corpus had asked.
+- **Three value renderings that look like one.** `$acos` converts to double first (`1.09951e+12`), `$range` keeps the integer (`1099511627776`), and a `Decimal128` keeps its own representation in both — `2.50` does not become `2.5`.
+- **`$subtract`'s `Date` capitalisation is positional**, not per-type: `can't $subtract string from Date` but `can't $subtract date from int`.
+- **A `Decimal128` is numeric.** Reporting a type error for it would be wrong; both engines defer on it for a different reason, and the guards had to be written to let it through.
+
+#### The test that was right all along
+
+Capitalising `Date` on both sides of `$subtract` was caught by `test_arithmetic_date_semantics`, which held the second-operand case. Three times this session an old expectation turned out to be a stale citation and the new measurement won; here both were right, for different positions. Re-probing rather than pattern-matching on "old test, new measurement" is the only thing that told them apart.
+
+#### Also
+
+The parity fuzz called `_rust_eval` bare and let a named error escape as an exception — it was written when the engine could only answer or defer, and *naming* mongod's error is a third outcome it had no branch for. It now compares the named error against the pure engine, which is what the rest of the suite already did.
+
+### The wrong-typed-argument sweep, widened from codes to messages — 76 slots on the Rust server
+
+The existing sweep compared error **codes** over 244 argument shapes, and both
+servers read 244/244 clean. Comparing **messages** as well, over 685 shapes,
+against mongod 8.2.11, found the Rust server diverging on **76 argument slots**.
+Almost all of them were *silently accepted*: the wrong-typed value did not
+merely return the wrong status, it made the server do something other than what
+the caller asked and report success.
+
+The probe's reach is exactly its case list, which is the recurring lesson here —
+"244/244 clean" only ever meant "these 244 shapes are".
+
+#### Fixed
+
+- **Argument slots that took a wrong-typed value and ran anyway** — `hint`,
+  `collation`, `readConcern`, `writeConcern`, `arrayFilters`, `ordered`,
+  `bypassDocumentValidation`, `let`, `fields`, `sort`, `new`, `remove`,
+  `filter`, `cursor` / `cursor.batchSize`, `validator`, `timeseries`,
+  `capped` / `size` / `max`, `viewOn`, `changeStreamPreAndPostImages`,
+  `partialFilterExpression`, `unique`, `sparse`, `expireAfterSeconds`,
+  `dropTarget` and `tailable` / `awaitData` / `returnKey` / `showRecordId` /
+  `allowDiskUse`, across `find`, `count`, `distinct`, `aggregate`, `insert`,
+  `update`, `delete`, `findAndModify`, `create`, `collMod`, `createIndexes`,
+  `dropIndexes`, `renameCollection`, `listCollections`, `listIndexes`,
+  `getMore` and `killCursors`. Each now answers mongod's own code and wording.
+- **Thirteen aggregation stages whose spec type was never checked** —
+  `$addFields` / `$set` (40272), `$project` (15969), `$replaceRoot` /
+  `$replaceWith` (40229), `$facet` (40169), `$bucket` (40201), `$sortByCount`
+  (40147 / 40148 / 40149), `$geoNear` (10065), `$graphLookup`, `$unionWith`,
+  `$setWindowFields`, `$densify`, `$fill` (9) and `$sample` (28745).
+- **`aggregate` with a non-array `pipeline`** ran the whole collection through
+  no stages and answered ok. Now `A pipeline must be an array of objects` (14).
+- **An empty `updates` / `deletes` batch answered ok:1 with `n: 0`**, telling
+  the caller a batch it never sent had been applied. Now InvalidLength, like
+  `insert`.
+- **`killCursors` with a non-array `cursors`** reported the named cursors
+  killed while killing none.
+- **A `hint` naming no index was ignored by `update` / `delete` /
+  `findAndModify`**, so the write ran unhinted where mongod fails the command.
+- **`$[identifier]` with no matching `arrayFilters` entry** was accepted when
+  the target field was not an array — the engine's walk returns early for a
+  non-array, so `{$set: {"a.$[e]": 1}}` against `{a: 1}` wrote nothing and
+  reported success. mongod decides this from the update document alone.
+- **`dropIndexes` by key pattern answered code 1 (InternalError)** — the crash
+  code — for a shape mongod handles routinely. It now drops the matching index,
+  or answers IndexNotFound (27).
+- **`findAndModify: {remove: 1}`** was rejected: `remove` accepts a bool *or* a
+  number, and a nonzero number is true.
+- **`InvalidLength` is code 16, not 4** (4 is `NoSuchKey`) — on **both
+  servers**. `insert` had carried the wrong code under a comment asserting that
+  driver tests gate on "this exact code/codeName combo"; they gate on the
+  codeName, and `bulkWrite` in the same codebase already answered 16.
+
+#### Added
+
+- `tools/probes/arg_types_messages.py` — the wide sweep, comparing `(code,
+  errmsg)` rather than codes alone. It normalises the ORDER of mongod's
+  expected-type lists, which differ between 8.2.1 and 8.2.11 (a patch bump) and
+  so pin a build rather than a behaviour.
+- `tests/test_rust_arg_types_sweep.py` (42 tests) and nine Rust unit tests,
+  pinning the per-slot asymmetries: `count.limit` rejects an explicit null while
+  `count.skip` beside it accepts one, `getMore.collection` reads null as absent
+  (40414) rather than wrong-typed, `createIndexes`' `unique` accepts `1.5` and
+  quotes the spec back with mongod's own unclosed quote, and `$densify`
+  capitalises "The" where `$setWindowFields` does not.
+
+### The Rust server validates command arguments
+
+A wrong-typed command argument was accepted without complaint, and the server
+then did the wrong thing and reported success. `createIndexes` with a non-array
+`indexes` answered `ok: 1` and created no index — a driver was told an index
+existed that did not. An `update` whose `multi` was a document updated a single
+document instead of all matches. A `findAndModify` whose `upsert` was an array
+skipped the upsert. A `find` with a non-numeric `limit` returned everything.
+
+Measured against a real MongoDB across 87 argument shapes, the server diverged
+on 78 of them; it now matches on all 87, as the Python server already did.
+
+A second group answered a generic `BadValue` where MongoDB has a specific code
+for the stage in question — `$lookup`, `$group`, `$match`, `$sort`, `$limit`,
+`$skip`, `$count` and `$unwind` each report their own code and message now. That
+one had a structural cause worth naming: the shared engine signals "this
+construct needs the Python implementation", which the Python server honours by
+running it, and this server — having no Python — was reporting as a generic
+error. Stages it can identify are now named before that point is reached.
+
+Both servers are now at 87 of 87 on this sweep.
+
+### The Rust server errored on case-insensitive queries, and had no collated order
+
+`tools/probes/collation_order.py` was the one Rust-aware probe never swept
+against the Rust server. Sweeping it found two things, the first of them a hard
+failure on ordinary input.
+
+**A case-insensitive query or sort over any non-ASCII text errored.**
+
+```
+find().sort("v", 1).collation({locale: "en", strength: 1})   over ["a","A","á","B","b"]
+    mongod / python  ['a', 'A', 'á', 'B', 'b']
+    rust             2 BadValue: an indexed value is of a type the
+                     Rust server does not support
+```
+
+Not only accents — `ß` and `日` triggered it too, on match filters as well as
+sorts. `normalize_index_bytes` had `if !s.is_ascii() { return None }`, meaning
+"defer to the pure engine"; that is right on the Python server and wrong on the
+Rust one, which has no Python behind a defer. It now folds properly: NFKD, drop
+the combining marks, full case fold.
+
+There were **two** such bails, not one. Fixing the index encoder left the query
+path — `normalize`, behind `collation::equal` / `compare` — still deferring, so
+collated equality and range queries on non-ASCII text kept answering `2 BadValue:
+query uses a construct the Rust server does not support` after the sort was
+fixed. Both now share one fold helper so they cannot drift apart again.
+
+The fold has to be *case folding*, not `to_lowercase`: folding maps `ß` to `ss`,
+and mongod sorts `["ß","s","t"]` as `["s","ß","t"]` — which only comes out right
+if `ß` compares as `ss`.
+
+**Collated ordering was not implemented at all** — strings sorted by codepoint,
+so every accented word landed after `z`. `collation.py`'s `sort_levels` is now
+ported to `collation::sort_level_bytes` as a byte-comparable three-level key:
+the measured `MARK_ORDER` table (acute before grave, which is *not* codepoint
+order), the `backwards` reversal that makes `cote < côte < coté`, the
+`caseFirst` flip, and `numericOrdering` digit runs so `a2 < a10`.
+
+The probe goes from dying at case 10 to **0 unexpected divergences of 19** — the
+2 remaining are the documented Swedish / Danish locale gaps that need CLDR data.
+A wider three-way sweep across every collation option shape is **0 of 64**
+against mongod.
+
+**Nothing on disk changes**, and the encoders are now split so that stays true
+by construction. `sortkey::encode_value` remains the INDEX encoder — single-level
+fold, byte-identical to Python's `encode_value(collation=)`, which is what the
+entries table holds and what the other server reads back. The three-level
+ordering key lives in a new `encode_sort_value`, used only by the in-memory
+sort-key builder. Collapsing both roles into `encode_value` is what broke
+`test_collation_encoding_parity`: the same function name means index bytes in
+Python and had come to mean the sort key in Rust. The probe's own invariant
+confirms the result — index and non-index results agree on every case, so an
+index still changes speed and never results.
+
+**Mark filtering uses the predicate Python uses, per site.** These are three
+different sets and the difference is measurable: `_strip_accents` filters general
+category `Mn` alone, while `sort_levels` filters on a nonzero canonical combining
+class. `unicode_normalization::char::is_combining_mark` is neither — it is true
+for all of `M*`, so using it for the accent strip dropped a Devanagari vowel sign
+(U+093E, category `Mc`) that the Python engine keeps. Measured 2026-09-07.
+
+Adds direct `unicode-normalization` and `unicode-properties` dependencies to
+`secantus-core`; both were already in the lock tree transitively.
+
+Filed, not fixed: the **Python** server orders ligatures wrongly under a
+collation (`["ﬁ","fi","fj"]`), which this port surfaced. `sort_levels`
+decomposes with NFD, which does not split a compatibility ligature, so the
+secondary level compares a one-group key against a two-group one. The obvious
+fixes are unmeasured — see `tasks/backlog.md`.
+
+#### Fixed
+
+- `secantus-core`: `normalize_index_bytes` and the query-path `normalize` both
+  fold non-ASCII instead of deferring; new `sort_level_bytes` three-level
+  ordering key behind a new `encode_sort_value`, keeping the on-disk
+  `encode_value` untouched; accent stripping filters category `Mn` (not all of
+  `M*`); `Collation` carries `caseFirst` and `backwards`.
+
+### The Rust server refused every computed projection
+
+`find` and `findAndModify` answered `2 BadValue: projection is not supported by
+the Rust server` for any projection whose value was an EXPRESSION rather than an
+include/exclude flag:
+
+```
+find({}, {x: {$add: ["$a", "$b"]}})
+    mongod  {_id: 1, x: 5}
+    rust    2 BadValue: projection is not supported by the Rust server
+```
+
+Not just operator expressions — a bare rename `{x: "$a"}` failed too, as did a
+string literal, a `null`, an array, and a `Decimal128` flag. The engine deferred
+those shapes to the pure evaluator, and a defer has no Python behind it on this
+server, so the refusal reached the client. The backlog had recorded this as a
+deliberate "honest refusal"; it is now implemented instead.
+
+#### The semantics, all measured against mongod 8.2.11
+
+- **Only a number or a bool is a FLAG.** Everything else is a value:
+  `{x: "plain"}` writes the string on every document, and `{x: {$literal: 0}}`
+  yields `0` rather than excluding. A `Decimal128` *is* a BSON number, so
+  `Decimal128("1.5")` includes and `Decimal128("0")` excludes.
+- **A sub-document is classified PER LEAF.** `{n: {p: 1, z: "$b"}}` includes
+  `n.p` *and* computes `n.z`, so the spec is flattened to dotted leaves before
+  anything is decided. An empty sub-document at any depth is `51270`.
+- **A bare reference and an expression differ on a missing field.**
+  `{x: "$absent"}` omits `x` entirely; `{x: {$add: ["$absent", 1]}}` yields
+  `null`. The field-value evaluator is what draws that line.
+- **A computed field forces inclusion mode**, so a companion `b: 0` is the
+  `31254` mix, and `_id: 0` still just drops `_id`.
+- Dotted output keys build nesting through `set_path` — never a key with a
+  literal dot in it, the shape `CLAUDE.md` warns about.
+
+A projection error carrying a mongod code is now surfaced verbatim instead of
+being flattened to `BadValue`; only a bare defer becomes the generic refusal.
+
+Sweep: `42` shapes at **0 divergences** against mongod 8.2.11, comparing the raw
+`find` reply including FIELD ORDER, plus `7` shapes on `findAndModify` — the
+sibling command shares the engine and carried the same refusal.
+
+#### Fixed
+
+- `secantus-core`: computed projections implemented (`is_flag_value` /
+  `is_computed_spec` / `flatten_projection_spec` / `with_computed`);
+  `spec_truthy` accepts `Decimal128`.
+- `secantus-commands`: `find` and `findAndModify` no longer refuse them, and a
+  coded projection error keeps its code and message.
+
+### Decimal128 arithmetic and rounding on the Rust server, and five crash-class bugs on the Python one
+
+`decimal.rs` already had `add`, `mul` and `div_int` — the primitives `$sum` and `$avg` accumulate with. They were never wired into the **expression** path, so `{$add: [Decimal128("2.5"), 1]}` told the client the Rust server could not do `$add`, while `{$sum: …}` over the same values answered. The backlog had this filed as "a dependency decision"; sizing it from a probe rather than the text showed most of it needed no new numerics at all.
+
+| | Before | After |
+| --- | --- | --- |
+| `agg_expressions.py`, Rust server | 32 code + 0 message | **22 + 0** |
+| Wrong values, either server | 0 | 0 |
+
+#### Fixed on the Rust server
+
+- **`$add` / `$subtract` / `$multiply`** over a Decimal128, at 34 digits, with the quantum preserved: `2.5 * 2` is `5.0` and not `5`, and `Decimal128("2.50") + 2` is `4.50`.
+- **`$ceil` / `$floor` / `$trunc` / `$round`**, including the place argument. New `decimal::round_to_exp` with the four modes.
+- **`$log` validates its base before deferring a decimal argument** — the four checks run argument-type, base-type, argument-domain, base-domain, so a bad base is named even when the argument is one this engine cannot compute with.
+
+#### Five crash-class bugs on the Python server
+
+Each reached the client as `internal server error`, from any query:
+
+- `{$add: [Decimal128("-Infinity"), Decimal128("Infinity")]}` — Python's decimal context **traps** `InvalidOperation`; decimal128's own answer is NaN. The context now traps nothing, which closes the class rather than the instance.
+- `$trunc` / `$round` of a decimal infinity — `quantize` refuses a non-finite operand by IEEE rule.
+- `$ceil` / `$floor` / `$trunc` of a **double** infinity or NaN — `math.ceil(inf)` raises `OverflowError` and `math.trunc(nan)` raises `ValueError`.
+
+The last of those was caught by this change's own **control** assertion — a line included only to contrast the double case with the decimal one. The probe corpus contains no infinities, so none of this surface had ever been asked about.
+
+#### Two more Python defects
+
+- The decimal fold ran in Python's **default** context: 28 digits, so six of decimal128's 34 were silently lost. `1.000000000000000000000000000000001 + 1` answered `2.000000000000000000000000000`.
+- It converted a double with `Decimal(v)`, giving `4.5` where mongod gives `4.50000000000000`. Arithmetic takes a double at **15 significant digits**, and that precision enters the quantum — a different conversion from the one the accumulators use.
+
+#### Rules probed, not derived
+
+- **The place sets the quantum whether or not it changed the value**: `{$round: [Decimal128("2.5"), 2]}` is `2.50`. Returning it unchanged was wrong on 40 of 210 shapes.
+- **When the whole value sits below the target place**, the deciding digit is an implicit leading zero, not the coefficient's first digit — `{$round: [Decimal128("9.995"), -3]}` is `0E+3`, not `1E+3`.
+- **`$ceil` / `$floor` of a decimal infinity is NaN**, while `$trunc` / `$round` pass it through and a *double* infinity passes through all four. An asymmetry, measured rather than reasoned.
+
+#### Why the transcendentals are still deferred
+
+Not for want of an implementation: the Python engine computes them at 60 digits. It **still disagrees with mongod in the last digit** on 5 shapes, because mongod uses Intel's decimal library — and a prior session verified at 80 digits that our value is the correctly-rounded one and mongod's is 1–2 ULP low.
+
+The operations landed here are the ones IEEE 754-2008 defines as *correctly rounded*, which is exactly why they match exactly. Porting series to Rust would trade 16 loud "unsupported" errors for silent last-digit-wrong values, and this campaign has held wrong values at zero throughout. `tasks/backlog.md` §7 records the decision with the measurement.
+
+### `$abs` and the `$toX` conversions accept Decimal128 on the Rust server
+
+`$abs`, `$toBool`, `$toInt`, `$toLong` and `$toDouble` all deferred on a `Decimal128` operand — and a defer on the standalone server is an error, so a collection holding decimals could not be converted or absolute-valued at all.
+
+**70 conversion shapes now match mongod on both servers** (the probe corpus counts 5 of them: `agg_expressions.py` Rust **907 → 902**, zero wrong values).
+
+#### Rules that would have been wrong by assumption
+
+Every one of these was probed against mongod 8.2.11 rather than derived:
+
+- **`$toBool` of `NaN` is `true`** — not an error, and not false. So is `Infinity`.
+- **`-0` is false**, so zero-ness ignores the sign.
+- **`$abs` preserves the quantum**: `Decimal128("-2.50")` gives `2.50`, not `2.5`. No arithmetic happens, so it is implemented as a sign-strip and re-parse rather than a trip through the decimal engine.
+- **Three distinct messages under code 241** — NaN, infinity, and overflow are not one failure — and the overflow message **echoes the decimal's own rendering** (`…no onError value: 1E+30`), not a normalised form.
+- `$toInt` of `2147483648` overflows where `$toLong` succeeds.
+
+#### Not in this change
+
+`$add` / `$subtract` / `$multiply` / `$divide` / `$mod` on decimals still defer. Those go through the decimal engine where the quantum is load-bearing — `2.5 × 2` is `5.0`, and `Decimal + double` yields `4.50000000000000`, not `4.5` — and that deserves its own pass. `tasks/backlog.md` carries the probed semantics so it starts from measurement.
+
+### Decimal128 values outside `f64`'s range no longer take the wrong branch
+
+decimal128 spans `1E-6176` to `9.999…E+6144`; `f64` spans about `1E-308` to
+`1E+308`. Eight operators on the Rust server asked their classifying questions —
+*is this infinite? is this zero?* — of an `f64` rendering of the argument, and
+that rendering saturates: a finite `Decimal128("1E+6144")` reads back as
+`f64::INFINITY` and a finite `Decimal128("1E-6176")` as `0.0`. Each took the
+branch for a special value and answered confidently.
+
+Measured against mongod 8.2.11: the Rust server diverged on **79 of 180** cells
+(18 operators × 10 extreme inputs) and the Python engine on **64 of 364**
+(14 × 26). Both grids are now 0 apart from `$exp` in its middle range on the
+Rust server, which needs a decimal exponential series.
+
+#### Fixed
+
+- **`$sqrt` of a large finite decimal answered `Infinity`.** It now computes in
+  decimal — correctly rounded, which IEEE 754 requires of square root, with the
+  decimal spec's ideal exponent so `$sqrt` of `4` is `2` and of `1E+6144` is
+  `1.00000000000000000E+3072`. Verified against mongod on 75 values.
+- **`$toDouble` of an out-of-range decimal returned `inf` / `0.0`** where mongod
+  raises `241 ConversionFailure`. A decimal converts only when the double is
+  normal; the boundary is IEEE's tininess-after-rounding cut at
+  `2^-1022 − 2^-1076`, a quarter of a subnormal ULP below `f64::MIN_POSITIVE`
+  (bisected against 8.2.11), so a value representable as a *subnormal* double is
+  still a `241`.
+- **`$toBool` of a decimal below `f64`'s range was `false`.** `1E-6176` is not
+  zero, and is now `true`.
+- **`$floor` / `$ceil` of a decimal needing more than 34 integer digits**
+  returned the value; they are the decimal spec's `quantize`, so mongod answers
+  `NaN`. `$trunc` / `$round` deliberately do not share the rule.
+- **`$degreesToRadians` / `$radiansToDegrees` answered `Infinity` above
+  `1E+309` and a zero below `1E-324`.** Both are now one correctly-rounded
+  decimal multiply by mongod's own 34-digit constant, reaching the subnormal
+  range: `1E-6176` radians is `5.7E-6175`.
+- **`$exp` in the two regions that need no series**: `|x| ≥ 1E+5` is decided by
+  sign alone (`Infinity`, or `0E-6176` at the minimum quantum), and `|x| ≤
+  1E-40` is exactly `1`.
+- **Arithmetic results outside decimal128's exponent range were refused**
+  rather than clamped. They now follow the format's rules — overflow to
+  `±Infinity`, and rounding to the minimum quantum on the way down, which is
+  where subnormal results come from.
+
+#### Fixed (Python server)
+
+The same sweep run against the pure Python engine found the same family, plus
+three of its own:
+
+- **Three crashes.** `$degreesToRadians` / `$radiansToDegrees` of a decimal
+  whose exact product falls outside decimal128's range raised a raw
+  `decimal.Inexact` or `decimal.Overflow` out of the evaluator — an internal
+  server error where mongod returns a value (`5.7E-6175`, `Infinity`).
+  Constructing a `Decimal128` now clamps to the format instead of refusing.
+- **The angle conversions computed `x * pi / 180`**, two roundings where mongod
+  does one — the association the double path's own comment warns against. They
+  now use mongod's 34-digit constants, which fixes results that came back with
+  32 significant digits.
+- **`$trunc` / `$round` of a decimal past 34 integer digits answered `NaN`.**
+  They do not quantize; mongod expresses the value at the finest quantum that
+  fits.
+- Plus the shared items above: `$sqrt` of a negative decimal too small for
+  `float` to keep the sign, `$toBool`, `$toDouble`, and `$floor` / `$ceil`.
+
+### Decimal128 takes part in the numeric order on the Rust server
+
+mongod treats `Decimal128` as one of the numeric types for comparison and sorting: a mixed field sorts `Decimal128("1") < 2 < Decimal128("2.5") < 3.0`, and `{$gt: [Decimal128("2.5"), 2]}` is true.
+
+`order::cmp` had always handled that — rank 3 routes through `numeric::classify`, which understands decimals. Only `order::is_sortable` excluded them, and that one predicate is what every comparison consults first. So on the Rust server **every comparison involving a decimal deferred**, and a defer there is a generic `BadValue` with no Python behind it.
+
+The practical effect was larger than the probe count suggests: `$gt` / `$lt` / `$cmp`, `sort()`, and range queries like `find({v: {$gt: 2}})` were all unusable on a collection holding decimals.
+
+| | Before | After |
+| --- | --- | --- |
+| `agg_expressions.py` codes, Rust | 912 | **907** |
+| Decimal sort / compare / range query | deferred | matches mongod |
+
+Five corpus shapes; a whole capability in practice. `tests/test_decimal128_ordering.py` pins it against **both** servers, because the defect was on the Rust one and a Python-only test would have proved nothing about it.
+
+#### A note on the test that had to change
+
+`order::tests::sortable_gating` asserted `!is_sortable(Decimal128)` — pinning a *gating decision* rather than a behaviour. Its own comment records the same thing having happened with bools, which were excluded for the same wrong reason. mongod's actual sort order was probed before the assertion was changed.
+
+### A collection holding a `Decimal128` was un-updatable on the Rust server
+
+`{$set: {z: 1}}` against a document containing a `Decimal128` anywhere — a
+top-level field, a nested one, an array element, or the `_id` — failed with
+`query uses a construct the Rust server does not support`. Nothing about the
+update touched the decimal.
+
+The oplog update-diff walks every field of the old and new document through
+`py_eq` to work out what changed, and `py_eq` deferred on `Decimal128`. On the
+Python server that defer is a real fallback; on the standalone Rust server there
+is no Python behind it, so the whole update failed. `replace_one` and `$unset`
+worked, which is what made it look like an obscure edge rather than "this
+collection is read-only".
+
+`numeric::classify` has handled `Decimal128` all along — only the fast-path
+comparison declines it — so the comparison was already available and equality
+simply was not asking for it.
+
+### A descending sort put every prefix chain in ascending order
+
+`sort({x: -1})` over `["", "a", "ab", "abc", "b"]` came back from the Rust
+server as `["", "b", "a", "ab", "abc"]` — the empty string first, and the whole
+`a`/`ab`/`abc` chain ascending, inside a descending result. mongod answers
+`["b", "abc", "ab", "a", ""]`.
+
+The cause is a good idea used one step too far. A descending column is stored in
+the B-tree by **inverting its key bytes**, which is the only way to express a
+direction where the storage engine sorts by raw bytes. The Rust server reused
+that trick to build an in-memory sort key — and inversion is not a descending
+comparator, because it does not reverse a **prefix** relationship. `""` encodes
+to a strict prefix of `"a"`'s key, and a shorter byte string sorts first both
+before and after inversion.
+
+Direction is now applied when the keys are **compared** rather than by inverting
+them, which needs no trick at all: prefix-shorter-first is exactly right
+ascending, and its reverse is exactly right descending. Nothing persisted
+changes, so no stored index is affected — a descending index gives the same
+answer it always did, and the same answer as no index at all.
+
+The Python server was never affected, because its in-memory sort goes through
+`ordering.sort_docs` rather than the encoder. It shares the encoder, though, so
+both definitions now carry the warning that the inverted form is for B-tree
+placement only and must never be used to order values.
+
+#### Fixed
+
+- `secantus-storage`: `sort_key` emits ascending per-field parts and
+  `compare_sort_keys` applies each field's direction, so a descending sort
+  orders prefix chains correctly. Per-field direction in a compound sort is
+  unchanged, as is `[]`'s place between MinKey and null.
+- `secantus-commands`: the `min` / `max` cursor-bound comparison compared
+  inverted keys and had the same flaw; it now compares ascending encodings and
+  negates.
+- `secantus.sortkey` / `secantus-core`: `encode_value_directed` documents that
+  it is for physical B-tree placement only, with the measurement that shows why.
+
+### The Rust server answers mongod's argument errors
+
+`tools/probes/operator_error_surface.py` crosses every query and update operator
+with every pathological argument. Against the Rust server it reported **1,053
+divergent shapes, 999 of which answered `BadValue: "query uses a construct the
+Rust server does not support"`** for an argument mongod names precisely —
+`Unknown type name alias: x`, `Expected a number in: n: "x"`, and so on. It is
+now **17**, on a corpus that grew 38% during the work.
+
+840 of those 999 had the right *code* by accident, because mongod's parse errors
+are `BadValue` and so is the generic refusal. A code-only comparison had made
+this look like 159 problems.
+
+#### Fixed
+
+- Every query operator names its own argument errors: `$mod`, `$size`, `$type`,
+  `$in` / `$nin`, `$all`, `$elemMatch`, `$regex`, `$not`, and
+  `$and` / `$or` / `$nor`.
+- Every update operator likewise: `$pop`, `$rename`, `$bit`, `$currentDate`,
+  `$push`, `$pull`, `$pullAll`, `$addToSet`.
+- **The storage layer's update path threw the named error away** with
+  `map_err(|_| QueryUnsupported)` — the same erasure the query path had before
+  it gained `query_fault`. That one line was why the engine's messages could not
+  reach a client.
+- `$exists` read every `Decimal128` as truthy, so `{v: {$exists:
+  Decimal128("0")}}` matched where mongod matches nothing. **This was wrong on
+  both servers**, and the sweep missed it until the corpus gained a zero
+  `Decimal128` — a value that is falsy in one BSON type and truthy in another is
+  exactly what such a corpus needs.
+- `{v: {$type: NaN}}` crashed the Rust server with `internal server error`.
+- `Decimal128("-0")` was rejected as unrepresentable everywhere it appeared,
+  because whole-ness was tested by comparing parsed forms structurally and `-0`
+  is not structurally `0`.
+- `bson_type_name` reported `object` for MinKey, MaxKey, Timestamp, Undefined,
+  Symbol, DbPointer and JavaScript — everything its match arms did not name.
+
+### The Rust server's `explain` echoed the filter instead of normalising it
+
+mongod does not echo the filter you sent back in `queryPlanner.parsedQuery` — it
+echoes the `MatchExpression` tree **after normalisation**. A bare equality grows
+an explicit `$eq`, several top-level fields become an `$and` whose children are
+sorted by mongod's internal match-type ordinal, `$ne` becomes `$not`/`$eq`, an
+`$in` of one collapses to `$eq`, an `$in` of none becomes `$alwaysFalse`, `$all`
+splits into equalities, `$type` becomes numeric BSON codes, a bitmask becomes a
+bit-position array, and `$comment` disappears.
+
+The Rust server answered with the filter as sent, so a client reading
+`parsedQuery` — the usual way to ask "how did the server understand my query?" —
+got its own input back. It diverged from mongod on **44 of the 56 shapes** in
+`tools/probes/explain_shapes.py`; the Python server matched all 56, because only
+it had `secantus.explain.canonical_match`.
+
+`secantus-core::explain` is now the port of that module, rule for rule, and the
+Rust server is at **0 of 56**.
+
+This was found by sweeping the sixteen Rust-aware probes against a server built
+from `main`. Twelve of them are completely clean — 740 aggregation-stage shapes,
+3,074 operator-error shapes, 409 date/timezone shapes, 244 extended argument
+types with no crashes, and more — which is what made the explain result stand
+out rather than blend into a general noise level.
+
+Still open, and filed with its measurement: the `winningPlan` plan-node FIELDS.
+mongod's `COLLSCAN` carries `direction` and `isCached`, and its `IXSCAN` carries
+nine keys where the Rust server emits four. The Python server reproduces those
+and sits at its documented floor of 7 of 25 (four `indexBounds`, which this
+project deliberately does not reproduce, and three genuine cost-model
+differences); the Rust server is at 25 of 25.
+
+#### Fixed
+
+- `secantus-core`: new `explain` module — a port of `secantus.explain`'s
+  `canonical_match`, including the match-type rank table, `$type` alias codes
+  and the `$nor` decomposition rule.
+- `secantus-commands`: `explain`'s `parsedQuery` and the `COLLSCAN` stage
+  `filter` report the normalised expression.
+
+### The Rust server's `explain` plan nodes were missing most of mongod's fields
+
+mongod reports a fixed set of keys on each plan node, and a client reads them to
+answer real questions. The Rust server's `IXSCAN` emitted four of the nine:
+
+| key | what it answers | Rust before |
+| --- | --- | --- |
+| `isUnique` | can a reader assume one document per key? | absent |
+| `isSparse` | does the index omit documents? | absent |
+| `isPartial` | does a filter restrict what it holds? | only when true |
+| `multiKeyPaths` | which fields made it multikey? | absent |
+| `indexVersion` | the index format | absent |
+
+Three more shapes were wrong rather than missing:
+
+- **`FETCH` echoed the whole filter.** mongod carries only the RESIDUAL
+  predicate there and omits the key entirely when the index bounds covered the
+  query — which is exactly how a reader tells a fully-index-served query from
+  one that re-checks every document. Echoing the whole filter erased that
+  signal.
+- **`COLLSCAN` had no `direction`** and emitted an empty `filter` where mongod
+  omits the key.
+- **`isCached` was never set.** It is a whole-plan property, so it belongs on
+  the outermost node only, as its first key.
+
+The Rust server's IXSCAN node is now identical to the Python server's, and the
+probe's `winningPlan` count drops from 25 of 25 to 22 of 25.
+
+Still open, and filed with the shapes that show it: the `SORT` / `SKIP` /
+`LIMIT` / `PROJECTION_SIMPLE`|`PROJECTION_DEFAULT` stage tree
+(`secantus.explain.build_stage_tree`), which the Rust server does not build at
+all — so `{filter: …, limit: 3}` reports a bare `COLLSCAN` where mongod reports
+`LIMIT` above one. That is what the remaining 22 are, and the blocking-`SORT`
+half of it needs a `sorted_by_index` flag that `ExplainPlan` does not currently
+carry.
+
+#### Fixed
+
+- `secantus-commands`: `explain`'s `IXSCAN` node carries mongod's nine keys in
+  mongod's order; `FETCH` carries only the residual filter; `COLLSCAN` reports
+  `direction` and omits an empty `filter`; `isCached` leads the outermost node.
+
+### The Rust server's `explain` now builds mongod's stage tree
+
+mongod wraps the scan in the stages that describe the rest of the query. The
+Rust server reported the bare scan node, so a client got:
+
+| query | mongod | Rust before |
+| --- | --- | --- |
+| `limit: 3` | `LIMIT` → `COLLSCAN` | `COLLSCAN` |
+| `skip: 3` | `SKIP` → `COLLSCAN` | `COLLSCAN` |
+| `limit: 3, skip: 2` | `LIMIT` → `SKIP` → `COLLSCAN` | `COLLSCAN` |
+| `projection: {a: 1}` | `PROJECTION_SIMPLE` → `COLLSCAN` | `COLLSCAN` |
+| `sort: {zzz: 1}` | `SORT` → `COLLSCAN` | `COLLSCAN` |
+
+The most useful consequence of getting this right: **a client asking "is my
+sort served by an index?" reads the answer off the presence of a blocking
+`SORT`**, which is the question `explain` is usually run to answer. Without the
+tree there was nothing to read.
+
+The nesting is mongod's own and is not the order the command's fields are
+written in — a blocking `SORT` sits directly above the scan and ABSORBS the
+limit (as `limitAmount`, counting the documents the skip will later discard, so
+no separate `LIMIT` appears); `SKIP` sits above that; the projection above the
+skip; an unabsorbed `LIMIT` outermost.
+
+Deciding whether a sort needs a blocking stage takes a `sorted_by_index` flag,
+which `ExplainPlan::IxScan` did not carry — the walk comes out in sort order
+only when the index's LEADING field is the one being sorted on. It is now
+plumbed from `make_ixscan_plan` and both hint branches through the storage
+adapter.
+
+**The Rust server now diverges from mongod on exactly the same seven shapes as
+the Python server**, which are that server's documented floor: four are
+`indexBounds` (which this project deliberately does not reproduce, along with
+`rejectedPlans` and the IDHACK / EXPRESS_IXSCAN / COUNT_SCAN / DISTINCT_SCAN
+executors) and three are a genuine cost-model difference where mongod picks an
+IXSCAN and we pick COLLSCAN + SORT, returning identical documents. `explain` is
+at parity between the two servers.
+
+#### Fixed
+
+- `secantus-core`: `build_stage_tree` and `projection_stage_name`, ported from
+  `secantus.explain`.
+- `secantus-storage`: `ExplainPlan::IxScan` carries `sorted_by_index`, set at
+  every construction site; the storage adapter surfaces it.
+- `secantus-commands`: `explain` wraps the scan node in the stage tree for
+  `find` (`count` / `distinct` keep their flat node — their `COUNT_SCAN` /
+  `DISTINCT_SCAN` vocabulary has not been measured).
+
+### Expression parse errors on the Rust server
+
+`aggregate._expression_shape_problem` — the parse-time pass that fixed 279 shapes on the Python server — ported to the Rust command layer. Arity and spec shape are errors mongod raises while *building* the expression tree, before it folds anything, so they carry the stage's wrapper rather than the optimizer's.
+
+| `tools/probes/agg_expressions.py` (3,968 cases) | Before | After |
+| --- | --- | --- |
+| Wrong error codes | 1,376 | **981** |
+| Message-only differences | 4 | **6** |
+| Wrong values | 0 | 0 |
+
+#### Fixed
+
+- **Arity** (`$indexOfArray` / `$indexOfBytes` / `$indexOfCP` / `$range` / `$slice`): 28667, with each operator's own bounds.
+- **Date extractors given an array** of any length but one: 40536.
+- **Object-spec expressions**: `$firstN`/`$lastN` 5787801, `$minN`/`$maxN` 5787900, `$median` 7436201, `$percentile` 7436200, `$topN`/`$bottomN` 168.
+- **Unrecognised date-spec arguments** across eight operators, eight codes — several of which the Rust server had been **silently ignoring**, answering `ok` for a spec mongod refuses.
+
+#### Left
+
+946 of the remaining 981 are the engine deferring on a bad **argument** — "operator not supported by the Rust server" for what is a bad operand. They are spread across ~120 operators and driven by the operand type, so they are a per-operator campaign rather than another systematic pass. Recorded in `tasks/backlog.md` with the operand-type breakdown.
+
+### The Rust server leaked Rust type names into the bad-hint error
+
+A hint that names no index came back with Rust's `Debug` formatting, so a
+MongoDB client was shown Rust's own type names:
+
+```
+hint String("x") does not correspond to an existing index
+hint Document({"nope": Int32(1)}) does not correspond to an existing index
+```
+
+`String(…)`, `Document(…)` and `Int32(…)` mean nothing to a client. Both now
+name the value: `hint "x"` and `hint { nope: 1 }`. The string form leaked from
+the command layer (`update` / `delete` / `findAndModify`) and the key-spec form
+from the storage layer (every command that takes a hint).
+
+The rest of this message is a **deliberate** difference and is unchanged: mongod
+answers a bad hint with a multi-line planner diagnostic that names the whole
+query plan, and this project reproduces the CODE and names the hint instead —
+the wording moved between 6.0.16 and 8.2.11, so the gate asserts the rejection
+rather than the text. That decision is why the divergence stays in the probe's
+message-only column on **both** servers; what was not deliberate was leaking
+Rust's internals into it.
+
+#### Fixed
+
+- `secantus-commands`: the bad-hint error renders the hint value, not
+  `format!("{hint:?}")` on a `Bson`.
+- `secantus-storage`: the key-spec branch of `resolve_hint` likewise.
+
+### The Rust server had the same four index defects
+
+The index-layer fixes that landed for the Python server — a sparse index
+answering queries that match a *missing* field, a compound sparse index that
+under-indexed, a partial index whose implication check compared across BSON type
+brackets, and a query naming only a partial filter's own fields — were fixes to
+`storage.py`. The Rust server has its own storage layer with its own port of
+those helpers, and it still had all four. Three are silent data loss: the query
+succeeds, the shape is right, and rows are simply missing.
+
+Nothing would have caught them. The engine-parity suites that keep the two
+engines honest pin `query`, `update`, `expressions`, `projection`, `sortkey`,
+`diff` and `aggregate` — the pure operator engines. None of that is the storage
+layer, so a divergence there is invisible to the one mechanism built to catch
+divergence.
+
+One of the four behaves differently on this side and worse. Where the Python
+server raised `IndexError` out of the command handler for a query covering only
+a partial filter's own fields — loud, and visible as an internal error — Rust
+built an empty key prefix and scanned for the bare separator, which matches no
+key. It returned nothing, quietly.
+
+#### Added
+
+- `tools/probes/index_result_sets.py`: the sweep, which compares the server
+  against **itself** with and without the index rather than only against
+  MongoDB. That isolates the index from the sort engine, and it is what makes
+  the output diagnostic: `indexed=[1] no-index=[1,2] mongod=[1,2]` names the
+  dropped row. Against the pre-fix Rust server it reports 12 of 15 curated and
+  53 of 1692 randomised; after, zero on both servers.
+
+#### Fixed
+
+- `secantus-storage`: `sparse_covers` (at least one indexed field present),
+  `sparse_index_usable` / `predicate_may_match_missing` (a sparse index is
+  unusable for a query that could match a missing field — including any
+  comparison against `null`, not just `$eq`), `type_bracket` on the partial
+  implication check, and a whole-index scan where there is no key prefix to pin.
+
+### `$abs only supports numeric types, not string` — the Rust engine's largest error family
+
+The biggest single block left in the expression sweep: **24 unary operators, 220
+shapes** where mongod answers `28765 $OP only supports numeric types, not
+<type>` (or `51081` for `$round` / `$trunc`) and the Rust server answered its
+generic `BadValue` (2).
+
+The Python server already had these right, so this is a Rust-side gap: its
+operators know the operand's type when they evaluate it, but their only failure
+signal is `Fallback`, which carries no code — the comment on `op_abs` read
+"Python raises 28765 -> defer", which is true on a server that has Python and
+useless on one that does not.
+
+#### Fixed
+
+`$abs`, `$acos`, `$acosh`, `$asin`, `$asinh`, `$atan`, `$atanh`, `$bitNot`,
+`$ceil`, `$cos`, `$cosh`, `$degreesToRadians`, `$exp`, `$floor`, `$ln`,
+`$log10`, `$radiansToDegrees`, `$round`, `$sin`, `$sinh`, `$sqrt`, `$tan`,
+`$tanh`, `$trunc` now answer mongod's code and sentence on the Rust server, for
+a constant operand and for a field reference alike.
+
+It works by re-evaluating just the **argument** — not the operator — against the
+documents the stage sees, which is enough to name the error without widening
+`Fallback`. That is the `update::arith_type_error` template the other validators
+in this module use. A null operand is not an error, and `Decimal128` is numeric:
+it defers for a different reason, so reporting a type guard for it would be wrong.
+
+#### A note on the gate
+
+`may_name_runtime_error` decides whether to keep a copy of the input documents
+for this naming pass, and it is deliberately narrow because the copy is taken on
+the success path too. It now also fires when a numeric-guard operator appears
+anywhere in a stage — a spec scan, so it costs nothing for a pipeline without one.
+
+#### Sweep status, and one thing that got *more* visible
+
+Rust code differences **1556 → 1336**. Rust message-only went 0 → 148, which is
+these same cases moving from "wrong code" to "right code, wrong wrapper": for a
+**constant** operand mongod folds at optimization time and says
+`Failed to optimize pipeline :: caused by ::` where we say
+`Executor error during aggregate command on namespace: … :: caused by ::`.
+
+That is the long-deferred constant-folding item — but it is now measured rather
+than guessed, and the rule turns out to be **statically decidable**: mongod folds
+exactly when the argument contains no field-path reference (`$$NOW` folds too).
+Recorded in `tasks/backlog.md` with the probe, since it is a much cheaper
+proposition than "modelling constant folding" implied.
+
+14 differential cases added.
+
+### A wrong-typed operand names mongod's error instead of "not supported"
+
+An aggregation operator that had to *refuse* an argument had only one way to say so in the Rust engine — `Fallback::Defer` — and a defer on the standalone Rust server has no Python behind it. It surfaces as `2 BadValue`, "aggregation pipeline uses a stage or operator not supported by the Rust server". So `{$size: 1}` told the client this server cannot do `$size`. It can; `1` is not an array.
+
+`tools/probes/agg_expressions.py` measured **908 such divergences** against mongod 8.2.11 across ~120 operators, with **zero wrong values** — the whole surface was error-shaped. Roughly 900 of them were one defer standing in for an ordinary argument complaint.
+
+| | Before | After |
+| --- | --- | --- |
+| `agg_expressions.py`, Rust server | 902 code + 6 message | **117 code + 0 message** |
+| `agg_expressions.py`, Python server | 50 code + 212 message | **28 code + 80 message** |
+| Wrong values, either server | 0 | 0 |
+
+Every expectation was measured against 8.2.11 rather than derived, and several defeat a reasonable guess.
+
+#### Fixed
+
+- **The thirteen date extractors** (`$year` / `$month` / `$hour` / …) report `16006 can't convert from BSON type <T> to Date` instead of deferring — 169 shapes from one helper. Their `{date, timezone}` options form is now validated too: an unrecognised key is `40535` and reports the first offender *even when `date` is present and valid*, and a spec with no `date` is `40539`, echoing the document back.
+- **The eight `$convert` shorthands.** An array of any length but one is `50723 $toInt requires a single argument, got 3`; an unsupported pair is `241 Unsupported conversion from objectId to int`; overflow, NaN and infinity each carry their own sentence under that same code. `{$toInt: [1]}` now unwraps to the single argument mongod reads.
+- **Fourteen type-guarded operators** — `$size`, `$first`/`$last`, `$strLenCP`/`$strLenBytes`, `$reverseArray`, `$arrayToObject`/`$objectToArray`, `$bsonSize`, `$binarySize`, `$tsSecond`/`$tsIncrement`, `$allElementsTrue`/`$anyElementTrue` — plus `$concat`, `$concatArrays`, `$in`, `$arrayElemAt`, `$slice`, `$indexOfArray`, `$indexOfBytes`, `$indexOfCP`, `$split`, `$toLower`/`$toUpper` and the `$bit*` family.
+- **`$ifNull`, `$setEquals`, `$rand` and `$getField`** are refused at parse time, under the stage's `Invalid $addFields ::` wrapper rather than a pipeline one.
+
+#### Capabilities the Rust server was missing
+
+Four conversions mongod performs were reported as unsupported: `$toDate` of a **date string**, an **ObjectId** or a **Timestamp**, and `$toLong` / `$toDouble` / `$toDecimal` of a **date** (`$toInt` of a date really is refused — the arms are not interchangeable). `$convert`'s `onError` now catches an unsupported *pair*, which it previously ignored; the one form that exists to survive a bad conversion was the one that could not.
+
+#### Bugs this found on the Python server too
+
+These sit outside the probe corpus, so nothing had ever compared them:
+
+- `$setUnion` / `$setIntersection` / `$setDifference` answer **null** for a null operand; both servers raised. Operands are scanned left to right, so `{$setUnion: [null, 1]}` is null while `{$setUnion: [1, null]}` raises on the int. `$setEquals` and `$setIsSubset` refuse null instead — two rules, not one.
+- `$setDifference` and `$setIsSubset` carry a **different code per position** (17048/17049 and 17046/17042); both reported the first-argument code either way.
+- `$getField`'s bare form is an **expression**, not a literal field name. A plain string still evaluates to itself, so `{$getField: "s"}` is unchanged, but `{$getField: "$n"}` resolves the path and then refuses the int — where taking it literally looked for a field named `$n` and answered *missing*. A literally-dollared name goes through `$literal`, which both engines had been reading as the options form and rejecting as an unknown argument. The object form requires `input` and does not fall back to `$$CURRENT`.
+- `$toDecimal` of a date, `$tsSecond`/`$tsIncrement`'s wording, and `$slice`'s "but is of type:" phrasing.
+- `$split`'s **second** argument is `10503900` on 8.2.11, not the `40086` recorded here; the first keeps `40085`. Only one of the pair moved.
+- The four `$bit*` operators do not agree on how to refuse a bool: `{$bitOr: [1, true]}` is the fold family's bare `14 ... only supports int and long operands.` with **no type named**, while `$bitNot` calls a bool non-numeric (`28765`). One sentence had been standing in for both.
+- **One value renderer was standing in for two mongod serializers.** `specification must be an object; found $firstN: [ 3, 1, 2 ]` renders in mongod's *shell* form — inner spaces, `ObjectId('…')`, `new Date(1767323045000)`, `BinData(0, 7A)` — while `$replaceRoot`'s `Input document: {n: 1}` uses the compact form with none of those. Both call sites went through `bson_value_repr_stage`, so one of them was always wrong — and neither wholesale choice works: rendering everything compact leaves 66 shapes wrong, rendering everything shell-form leaves 13. Probing the two families side by side is what separated them.
+
+#### Rules worth recording
+
+- mongod says `missing` for an absent field path where it says `null` for an explicit null. One `eval` collapses both, so the distinction is recovered when a message is built rather than threaded through evaluation.
+- Null-tolerance is **per operator**: `$size` and `$strLenCP` refuse null; `$first` and `$reverseArray` answer null.
+- `$bitNot` uses **two** codes — `28765` for a non-numeric operand, `14` for a numeric one it cannot use — where `$bitAnd` / `$bitOr` / `$bitXor` use one sentence for both.
+- `$getField` **never folds**, not even with a wholly literal `input`, because it reads `$$CURRENT`. That now lives in `is_constant_expression`, which both engines consult.
+- The wordings are not interchangeable: "found: {}" vs "but is {}" vs "but was of type: {}", `$setEquals`'s literal "1-th argument", and `$tsSecond`'s verbatim **leading space**.
+
+#### Caught by the parity suite
+
+Two of these were found by `tests/test_rust_expressions_parity.py` after the Rust half moved and the Python half had not — which is what that suite is for. It also caught a defect in this change: a **finite** double too large for the target (`{$toLong: 1e30}`) fell into the non-finite arm and was reported as "Attempt to convert infinity value", where mongod says it overflowed and echoes `1e+30`. Parity flagged the drift within seconds; the oracle said which side to move.
+
+Two parity tests asserted the Rust engine `raw is None` for these operators — pinning the gating *decision* rather than the behaviour, so they broke the moment the operators learned to name their own errors. They now assert what actually matters: defer or name it, but the client sees mongod's code either way.
+
+#### A stale citation, not a regression
+
+`$split`'s second-argument code was recorded as `40086` in three places, one of them a test whose docstring read "mongod 7.0.12-verified." It *was* right for 7.0.12 — 8.2.11 answers `10503900`, while the first argument keeps `40085` — and the expectation survived the 8.x retarget unchecked. Re-probed and re-dated. This is the shape `CLAUDE.md` warns about: a version citation records when something was measured, not what the server does now.
+
+`tests/test_ci_runs_rust_server_tests.py` also did its job — the new test file is gated on `importorskip("_secantus_server")`, so it would have run **nowhere** until named in the `storage-engine` job. Now wired in.
+
+And wiring it in immediately found the next thing: a server per test is ~380 WiredTiger stores across this file, which **filled the disk on the Windows runner**. Nothing here needs a private server, so it takes one per engine per module and re-seeds the collection between tests — 192 cases in 1.6s rather than 82s, and two stores rather than 380.
+
+#### Also fixed
+
+`Conv::Failed` was serving three different mongod messages at once — overflow, non-finite, and unsupported-pair — which was invisible while all three deferred. One of its own comments already described a case as "Unsupported conversion" while the code classified it as a failure.
+
+`tests/test_expression_operand_errors.py` pins all of it against **both** servers.
+
+Two existing claims turned out to be untested rather than wrong-by-regression. Three tests asserted `$getField`'s non-string `field` was `5654602`; mongod answers `3041704`. And `{$getField: 0}` was listed as a *parse* error, which nothing could check — it only reached the parse pass because the constant-fold pre-pass happened to evaluate it and surface the exception. On an empty collection mongod returns no documents and no error, so it is a runtime error; that test now drives the evaluator.
+
+#### Still open
+
+117 shapes, characterised in `tasks/backlog.md`: Decimal128 arithmetic and the transcendentals (the deliberately deferred half), `$mergeObjects` and the trigonometric domain errors (both need mongod's value rendering), and a handful of value gaps in `$substr*` / `$strcasecmp` / `$range`.
+
+### The Rust server reported four spec errors under the wrong wrapper
+
+mongod uses `Invalid $addFields :: caused by ::` for an expression that fails at
+PARSE time, and the optimizer's or executor's prefix otherwise. The Rust
+server's parse-time scanner already classified most of that correctly — but a
+spec document missing a REQUIRED key fell through it, so `{$convert: {to:
+"int"}}` and its siblings were reported as fold or runtime failures instead.
+
+Now covered: `$convert` without `input`, `$dateDiff` without `startDate`, the
+`n`-operator family (`$firstN` / `$lastN` / `$maxN` / `$minN`) without `n`, and
+`$dateFromParts` with neither `year` nor `isoWeekYear`. The Python engine got
+the same set in the preceding change.
+
+**Ordering matters and is pinned by its own test.** mongod reports an
+*unrecognised* key before a *missing* required one, so `{$firstN: {k: 1}}` is
+"Unknown argument for 'n' operator: k" while only `{$firstN: {}}` is "Missing
+value for 'n'". Both checks fire on the same document, so only their order
+separates them — and getting it backwards changes the CODE on shapes that are
+already correct, which is what happened on the Python side before it was
+corrected.
+
+**A note on how this was sized.** The backlog entry this closes claimed the Rust
+server "never emits the stage wrapper at all", from a `grep` over two files. It
+does: the wrapper, the wrapping-stage list, and a parse-time scanner covering
+`$ifNull` and `$setEquals` — 76 of the 83 shapes the Python fix was worth — were
+all already there. Running the scanner in a throwaway `#[test]` (possible
+because `secantus-commands` is a clean-workspace crate needing no WiredTiger)
+showed the true gap in one command. The entry has been corrected in place rather
+than left beside a newer one.
+
+#### Fixed
+
+- `crates/secantus-commands/src/argtypes.rs`: `REQUIRED_SPEC_KEY` and the
+  `$dateFromParts` year check, evaluated after every unknown-key table.
+
+#### Changed
+
+- Three tests in `argtypes`: the classification, the unknown-before-missing
+  ordering, and valid specs that must fall through to folding.
+
+### Rust pgserver: `ANY` / `ALL` array operators
+
+`scalar <op> ANY(array)` and `scalar <op> ALL(array)` work now — the form
+psycopg renders an `IN`-list into (`col = ANY(%s)`), so a whole family of cursor
+and array tests turned on it. All six comparison operators are supported, in
+both a `SELECT` expression and a `WHERE` clause, with PostgreSQL's exact
+three-valued logic: `ANY` is true on the first match, `ALL` false on the first
+mismatch, a NULL element or NULL scalar yields NULL, an empty array is false for
+`ANY` and true for `ALL`. An untyped array parameter (which arrives as array
+literal text) is coerced to the column's element type, matching how PostgreSQL
+resolves an unknown `ANY` operand. A scalar compared to an array with no
+`ANY`/`ALL` is `42883` (no such operator), as on PostgreSQL — an array-to-array
+comparison is unaffected.
+
+#### Added
+- `= / <> / < / <= / > / >=` with `ANY(array)` and `ALL(array)`, in `SELECT`
+  and `WHERE`, over array literals and array parameters (including untyped ones).
+
+#### Fixed
+- A scalar compared to an array without `ANY`/`ALL` now raises `42883` instead
+  of silently matching nothing (WHERE) or reporting a wrong operand type.
+
+### An array takes its type from its elements
+
+`array[%s::float4]` came back as an array of *strings*. So did `array[%s]`, and
+so did every array built over a parameter. The values were computed correctly
+and then described wrongly: the array's type was read off the values it held,
+and the pass that describes a statement to the client sees no values at all —
+every parameter is NULL there — so it settled on `text[]`, and the client
+decoded floats as text because the row description is what it believes.
+
+An array's type now comes from its elements' *expressions*, which are the same
+whether or not there are values to hand. Mixed numerics widen in PostgreSQL's
+own order (`array[1, 1.5]` is `numeric[]`, `array[1::float4, 1.5]` is
+`float4[]`), a bare NULL contributes no type at all, and the element conversion
+on the way out follows the column's type rather than the first element's — which
+is what turned the `1.5` in `array[1, 1.5]` into a NULL.
+
+Two smaller things fell out. An array of dates was described as `varchar`, so a
+client read back strings where PostgreSQL hands it dates; the remaining array
+types now have their real oids. And a *quoted* brace was being treated as the
+start of a nested array, so `'{"{"}'::text[]` answered "malformed array
+literal" — only an unquoted `{` opens a sub-array, and `{` is an ordinary
+member of any corpus that walks the ASCII range.
+
+A third: two characters disappeared from any text array that carried them.
+`U+0085` and `U+00A0` are whitespace to Rust's `trim` and not to PostgreSQL, so
+an unquoted element that was one of them came back as the empty string — a
+character in, nothing out, and invisible to any test whose alphabet is ASCII.
+
+#### Fixed
+
+- An array built over a parameter was described as `text[]` and its values
+  handed back as strings.
+- `array[1, 1.5]` turned its decimal element into a NULL.
+- An array of dates, timestamps, intervals or json was described as `varchar`.
+- A quoted `{` inside an array literal was read as a nested array.
+- `U+0085` and `U+00A0` were trimmed out of array elements entirely.
+
+### Arrays on the Rust PostgreSQL server, and the bug that correct types exposed
+
+`int[]` is a different type from `int`, and the difference is easy to lose:
+PostgreSQL's own parser keeps the array-ness of a declared type in a separate
+`array_bounds` field rather than in the type's name, so code that reads only the
+name types every array column — and every array cast — as its element type.
+
+That mistake is quiet in a way worth recording. While a cast to `text[]` was
+degrading to `text`, comparing two arrays rendered both sides to their text form
+and compared the resulting strings, which agrees with PostgreSQL often enough to
+look correct. Typing the casts properly is what revealed that array comparison
+had never been implemented at all — so the feature that looked like a regression
+was really a gap that the wrong types had been hiding.
+
+Array NULLs then turn out not to follow scalar NULL rules, and all four rules
+here were probed against a live PostgreSQL rather than reasoned out: inside an
+array two NULLs compare equal, a NULL sorts after every non-NULL, a shared
+prefix makes the shorter array the smaller one, and empty equals empty. Scalar
+`NULL = NULL` is NULL, so an elementwise comparison written by analogy with the
+scalar path gets every one of them wrong.
+
+Multidimensional arrays are refused rather than answered. The encoder beneath
+this handles a single dimension, and the flattening it produced turned
+`{{1,2},{3,4}}` into two elements whose text read `{1,2}` and `{3,4}` — an
+answer a client has no way to tell apart from a real one.
+
+#### Added
+
+- Arrays as column types, cast targets and literals: PostgreSQL's text form with
+  its quoting rules, `NULL` elements, empty arrays, and the array type oids, so
+  a client reads a list rather than a string.
+- Array comparison and ordering, including the four NULL and length rules above.
+
+#### Fixed
+
+- An array cast lost its brackets, so `%s::text[]` was planned as `%s::text`.
+- Array values were reported under their element type's oid, so `ARRAY[1,2,3]`
+  arrived at the client as the string `{1,2,3}`.
+- Comparing two arrays raised "comparing these operands" instead of comparing
+  them.
+
+#### Changed
+
+- A multidimensional array now raises `0A000` instead of being silently
+  flattened into its rendered inner literals.
+
+### Rust pgserver: binary array parameters for bytea/inet/cidr/uuid
+
+`bytea[]`, `inet[]`, `cidr[]`, and `uuid[]` now round-trip as BINARY array
+parameters (oids 1001 / 651 / 1041 / 2951) and as array columns read in either
+wire format. The per-element decode reuses the scalar bytea / inet / cidr /
+uuid decoders, and the array types report their own oid instead of falling
+through to `varchar` (which had made a binary result hit the binary-varchar
+encoder and a text result hand back strings). A `bytea` array element also
+renders as `\x…` hex in the array text form.
+
+#### Added
+- Binary array-parameter decode and correct result typing for `bytea[]`,
+  `inet[]`, `cidr[]`, `uuid[]`.
+
+#### Fixed
+- A `bytea[]` cast to text rendered each element as Rust debug output; it now
+  renders `\x…` hex like PostgreSQL.
+
+### Bound parameters in the binary format
+
+Client libraries do not send parameters as text. psycopg, like most modern
+drivers, sends numbers, dates, timestamps and arrays in PostgreSQL's binary
+format by default, and falls back to text only where it must. The Rust
+PostgreSQL server decoded integers, floats, booleans and strings that way and
+refused everything else — so binding a `Decimal`, a `date`, a `datetime` or a
+list failed, even though the same values written as SQL literals worked.
+
+Binary decoding now covers `numeric`, `date`, `time`, `timestamp`, and arrays
+of every element type the server knows. Each one decodes to the same canonical
+text a literal would have, so a bound value takes exactly the same path through
+the planner as a written one; the alternative — a second, parallel set of
+conversions for the binary format — is how the two formats drift apart and
+start disagreeing about the same value.
+
+The text format had a bug of its own that this work surfaced. A `numeric`
+parameter was being parsed as a floating-point number, so a client binding
+`1.50` got back a float that had already lost both the exactness and the scale
+that make it a different value from `1.5`.
+
+Separately, a timestamp *constant* answered NULL. A stored timestamp is
+reassembled from its column plus a hidden field carrying sub-millisecond digits,
+and a constant never passes through a row — so it reached the encoder in a shape
+nothing matched, while the identical value read from a column, or cast to text,
+came back correctly. Three routes to the same value, one of them silently empty.
+
+#### Added
+
+- Binary-format decoding for bound `numeric`, `date`, `time`, `timestamp` and
+  array parameters, including NULL elements and empty arrays.
+
+#### Fixed
+
+- A `numeric` parameter sent as text was parsed as a float, losing exactness and
+  scale.
+- `SELECT '2026-01-01 12:00'::timestamp` answered NULL, though the same value
+  through a table column or cast to text was correct.
+
+#### Changed
+
+- A multidimensional array sent as a binary parameter is refused with `0A000`
+  rather than decoded, matching what the server does when returning one.
+
+### Binary means binary, and a cursor is a portal
+
+Two things a client asks for and this server quietly answered differently.
+
+A cursor opened for binary results got its rows in text. The values were right
+— the format travels per column in the row description, so the client dutifully
+decoded text and handed back the right Python objects — which is exactly why it
+went unnoticed: nothing was ever wrong except the thing the client asked for.
+Result columns now go out in the requested format for the types this server can
+render exactly in PostgreSQL's binary layout: booleans, the integer and float
+widths, the string types, `numeric`, and arrays of those. A column outside that
+set is still described as text, which the client reads correctly, and the gap is
+written down rather than hidden.
+
+The other is server cursors. PostgreSQL exposes a declared cursor as a portal of
+the same name, and psycopg describes that portal straight after the `DECLARE` —
+before it fetches anything — to learn the columns. This server's cursors were
+its own, so the describe found nothing and every server cursor died on its first
+row with "portal not found". They now answer for the cursor of that name.
+
+`numeric` was the interesting half of the format work: its binary layout is
+base-10000 groups aligned on the decimal point rather than on the digit string,
+so `0.00001` is a single group of `1000` two places below the point, not a group
+that straddles it.
+
+#### Added
+
+- Binary result columns for `bool`, `int2`/`int4`/`int8`, `float4`/`float8`,
+  `text`/`varchar`/`bpchar`/`name`/`char`, `numeric`, and arrays of those.
+- An answer for `Describe portal` naming a declared cursor, which is how
+  psycopg's server cursors learn their columns.
+
+#### Fixed
+
+- A cursor asking for binary results received text.
+- Every psycopg server cursor failed with "portal not found".
+
+### Rust pgserver: bytea comparison operators
+
+`bytea` values could be stored, concatenated and sliced but not COMPARED — the
+Rust PostgreSQL server answered `0A000` for `bytea = bytea` and its siblings,
+which failed the psycopg tests that filter or order by a `bytea`. The
+comparison operators (`=`, `<>`, `<`, `<=`, `>`, `>=`) now work, ordering by
+unsigned byte value lexicographically exactly as PostgreSQL does (a prefix
+sorts before the longer value).
+
+#### Added
+- `bytea` comparison operators, ordering by unsigned byte value.
+
+### Rust pgserver: the bytea type
+
+The Rust PostgreSQL server now supports `bytea` — as a cast, a bound parameter
+(text or binary wire format), and a real column type (oid 17). A value is
+stored as a `Binary` (the representation the Python server uses, since the two
+share one store), accepts both PostgreSQL input forms (the `\x…` hex form and
+the octal-`\ooo` escape form), and renders back as the `\x…` hex text a modern
+server emits. Because psycopg sends and reads a `bytea` in the binary format by
+default, both the binary parameter decoder and the binary result encoder handle
+it.
+
+The byte-level functions come with it: `length` / `octet_length` / `bit_length`
+count bytes, `get_byte` / `set_byte` read and replace a byte, `encode` /
+`decode` convert to and from `hex` / `base64` / `escape`, and `bytea || bytea`
+concatenates. The error surface matches PostgreSQL: a bad hex digit or odd
+length is `22023`, a malformed escape is `22P02`, and a byte index out of range
+is `2202E`.
+
+#### Added
+- `bytea` cast, column type (oid 17), and text/binary parameter and result
+  wire formats.
+- `get_byte`, `set_byte`, `encode`, `decode`, `bytea || bytea`, and
+  bytea-aware `length` / `octet_length` / `bit_length`.
+
+### Exact decimals, NaN's place in the order, and one message hiding five bugs
+
+The Rust PostgreSQL server could not compare a great many pairs of values, and
+said so with a single message — "comparing these operands" — that named neither
+of them. Making that message name the types turned one entry on the failure list
+into five distinct causes, four of which were the same rule and none of which
+were guessable from the text.
+
+**Arithmetic on decimals had stopped working entirely.** When decimal literals
+became exact numerics rather than floating-point numbers in the previous
+release, every arithmetic operator on them began refusing outright: `1.5 + 1.5`
+was an error. It is fixed here, and fixed exactly — `0.1 + 0.2` is `0.3`, and the
+result's *scale* is part of the answer, so `1.50 + 1.5` is `3.00` where
+`1.5 + 1.5` is `3.0`. Division stays refused rather than guessed at, because its
+result scale depends on the operands in a way that has not been measured.
+
+**Comparing decimals no longer goes through a floating-point number.** A numeric
+carries 34 significant digits and a float holds about 15, so two visibly
+different twenty-digit numbers were the same float — and compared equal.
+
+**NaN has a place in PostgreSQL's ordering**, which the IEEE rules it inherits
+from do not give it: NaN equals itself and sorts above every number, infinity
+included. The underlying comparison reports "no answer" for each of those, which
+this server passed on to the client as an error where PostgreSQL has a result.
+
+**An unknown literal takes the type of the operand beside it** — in comparisons
+just as in arithmetic. That type then decides both the parse and the error, which
+is why comparing an interval to `'2020-01-01'` reports a bad interval rather than
+`false`. Implementing this rule for arithmetic alone in the previous release left
+four of the five failures above.
+
+#### Added
+
+- Exact `+`, `-` and `*` on decimals, with PostgreSQL's result scales.
+- Comparison of decimals (on their digits), timestamps, and NaN / infinity.
+
+#### Fixed
+
+- Arithmetic on decimal literals refused outright since they became exact.
+- Two different numerics with more digits than a float can hold compared equal.
+- An unknown literal beside a typed operand was not resolved for comparison.
+- The "cannot compare" error now names both operand types.
+
+### Composite types: the DDL and the catalog
+
+`CREATE TYPE name AS (field type, ...)` and `DROP TYPE` work now, written in the
+same `__sql_composites__` catalog the Python server uses — a doc per type with
+its ordered fields and a monotonically minted oid (base 67000, the enum rule),
+so an enum created by one server resolves on the other under the same oid.
+
+Composites appear in `pg_type` (with `typrelid` set to their own oid),
+`to_regtype` and `regtype`, and a new `pg_attribute` virtual table exposes each
+composite's fields keyed on that oid — `attname`, `atttypid`, `attnum`. This is
+the catalog `CompositeInfo.fetch` reads; its query's nested-subquery join is a
+separate slice (a JOIN whose right arm is itself an aggregate subquery), so the
+fetch itself does not resolve yet.
+
+#### Added
+
+- `CREATE TYPE … AS (…)`, `DROP TYPE` for composites, composites in
+  `pg_type`/`to_regtype`/`regtype`, and the `pg_attribute` virtual table.
+
+### psycopg can read composite types back (`CompositeInfo.fetch`)
+
+Registering a composite type with psycopg — `CompositeInfo.fetch(conn, name)` —
+now returns its fields against the Rust PostgreSQL server, matching a real
+PostgreSQL server exactly. The query psycopg emits is the most demanding
+catalog read the server has faced: `pg_type LEFT JOIN (SELECT
+array_agg(attname), array_agg(atttypid) FROM (pg_attribute JOIN pg_type) GROUP
+BY attrelid)`, with a `coalesce(..., '{}')` around each aggregate column. It
+combines four things the server could not previously do at once — a JOIN whose
+side is a subquery materialised from an aggregate, an `oid[]` array column, a
+`coalesce` projected as an output column, and a base type surviving the LEFT
+JOIN with no matching fields.
+
+Three of those were silent wrong answers rather than errors. `array_agg(atttypid)`
+came back tagged as text, so psycopg read the field-type list as the raw string
+`"{23,25}"` instead of a list of oids. A base type with no fields (or any type
+whose composite subquery found nothing) dropped out of the result entirely, or
+returned `None` for `field_names`/`field_types` where PostgreSQL returns two
+empty arrays — because the `coalesce` fallback never ran on a LEFT-JOIN miss,
+which is the one case it exists for. And a composite field whose type is itself
+a user type (`CREATE TYPE t AS (sub other_composite)`) was silently dropped from
+`pg_attribute`, since the field-type-to-oid lookup consulted only builtin types.
+
+#### Added
+
+- `CompositeInfo.fetch` is supported: the aggregate-subquery join side, the
+  `oid[]` (`_oid`, 1028) array column type, the coalesce-as-output-column, and
+  the coalesce-fills-`'{}'`-as-an-empty-array-on-a-LEFT-JOIN-miss all work
+  together.
+
+#### Fixed
+
+- `array_agg(atttypid)` (and any `oid[]` column) carries the `_oid` array oid
+  instead of falling through to `varchar`, so a client parses it as a list of
+  oids rather than a string.
+- A composite field whose type is itself a composite, enum, or range type
+  appears in `pg_attribute` with that type's own oid, instead of being dropped.
+- A `coalesce(col, '{}')` over a LEFT-JOIN miss yields an empty array, not
+  `NULL` and not the text `"{}"`.
+
+### COPY in every format, and where NULL hides
+
+`COPY` now works in all three of PostgreSQL's formats, in both directions, and
+from a query as well as a table.
+
+The three formats differ in more than punctuation. They differ in how they spell
+NULL, and that is where every bug in this work turned out to live. Text writes
+`\N` for NULL, so an empty field is an empty string. CSV writes NULL as an
+*unquoted* empty field, which forces it to quote the empty string as `""` to
+keep the two apart. Binary writes a length of minus one, where an empty string
+is a length of zero. Each of those distinctions was broken at some point while
+writing this, and each broke the same way — NULL and empty string became
+indistinguishable, which is silent, survives a round trip in one format, and
+corrupts data in another.
+
+The binary case is worth recording because the cause was ordinary and easy to
+repeat: a catch-all match arm sat above the NULL arm and swallowed it, rendering
+NULL as text and so writing a zero-length field. Match arms are tried in order,
+and a catch-all has to come after every case it must not absorb.
+
+`COPY (query) TO STDOUT` reuses the ordinary query path rather than reading rows
+a second way, so anything a select can do — ordering, limits, a generated series
+— works inside a COPY too. That includes a query with no `FROM` at all: clients
+use `copy (select 1) to stdout` to check how a server reports a bad query, so
+refusing it failed a whole file of tests that were not about COPY.
+
+Binary input decodes each value with the same code that decodes a bound binary
+parameter. The bytes on the wire are identical, so a second implementation could
+only drift from the first.
+
+#### Added
+
+- `COPY ... TO STDOUT` and `FROM STDIN` in text, CSV and binary formats.
+- `COPY (query) TO STDOUT`, including queries with no `FROM`.
+
+#### Fixed
+
+- `COPY ... TO STDOUT` in text format wrote an empty field for NULL instead of
+  `\N`, losing the distinction between NULL and the empty string.
+
+### COPY FROM STDIN on the Rust PostgreSQL server
+
+Bulk loading with `COPY table FROM STDIN` now works, in PostgreSQL's text
+format. This is how `pgbench` populates its tables and how most bulk-load
+tooling gets data in, so it matters out of proportion to the number of tests it
+moves.
+
+The escaping is the substance of the format rather than a detail of it. A null
+value arrives as `\N`, which has to stay distinct from an empty string, and a
+tab inside a value arrives escaped so that it is not mistaken for the separator
+between fields. Data also arrives in chunks whose boundaries fall wherever the
+client's buffer happened to end, including halfway through a row, so nothing can
+be parsed until the client says it has finished sending.
+
+`COPY TO STDOUT` was still refused when this was written; it landed shortly
+afterwards, along with the CSV and binary formats — see the companion entry.
+
+#### Added
+
+- `COPY <table> [(columns)] FROM STDIN`, with `\N` nulls, escaped tabs,
+  newlines and backslashes, an optional column list, and chunk boundaries that
+  fall mid-row.
+- PostgreSQL's `COPY n` completion tag, and its errors for a row with the wrong
+  number of columns or a value that will not parse.
+
+### Rust pgserver: CREATE TYPE AS RANGE
+
+Custom range types work now: `CREATE TYPE name AS RANGE (subtype = int4)`
+registers the type in the catalog (a `__sql_ranges__` collection paralleling
+the enum and composite catalogs), and a value casts, renders, and compares
+using the subtype's own machinery — `'[1,5)'::myrange`. psycopg's
+`RangeInfo.fetch` resolves the subtype through the existing `pg_type` /
+`pg_range` join, and `DROP TYPE` removes it. Unlike a builtin `int4range`, a
+custom range with no canonical function is not auto-canonicalised, matching
+PostgreSQL (`'[1,4]'` stays `[1,4]`).
+
+#### Added
+- `CREATE TYPE … AS RANGE (subtype = …)` DDL, catalog, and `DROP TYPE`.
+- Casts, rendering, and comparison for custom range types over int/numeric/
+  date/timestamp subtypes; `RangeInfo.fetch` support via `pg_range`.
+
+### Cursors, and reading one in a loop
+
+`DECLARE`, `FETCH`, `MOVE` and `CLOSE` now work on the Rust PostgreSQL server.
+A cursor is declared inside a transaction — outside one it would be closed again
+the moment the statement ended, and PostgreSQL refuses it for that reason — and
+its result is read at declaration time, which is what makes it scrollable in
+both directions afterwards.
+
+PostgreSQL's idea of where a cursor *is* has two positions that are easy to
+overlook, and both change the answers. The cursor sits on a numbered row, but it
+can also sit before the first one or after the last. Fetching past the end parks
+it after the last row rather than on it, so backing up two from there lands on
+the last row and not the one before it. Getting that wrong is off by exactly
+one, in the case people are most likely to try.
+
+Three more rules that only a real server tells you: a backward fetch returns its
+rows nearest-first rather than in table order; `RELATIVE` and `ABSOLUTE` fetch a
+single row — the n-th from here, or the n-th from the start — where `FORWARD`
+and `BACKWARD` fetch a run of them; and `FETCH ALL` arrives as a count so large
+that any arithmetic on it has to be written not to overflow.
+
+The bug worth naming is not in cursors at all. Clients prepare a statement they
+run repeatedly — psycopg after five times — and a prepared statement is
+described once and then executed. The describe path had no answer for `FETCH`,
+so it reported that the statement returned no columns; the sixth read in a loop
+then sent rows the client had no description for, which is a protocol violation
+rather than a wrong answer. Reading a cursor in a loop is the ordinary way to
+use one, so this was the normal case rather than an edge of it.
+
+#### Added
+
+- `DECLARE ... CURSOR FOR`, `FETCH`, `MOVE` and `CLOSE`, with PostgreSQL's
+  position model, reverse-order backward fetches, and the `FORWARD` /
+  `BACKWARD` / `ABSOLUTE` / `RELATIVE` directions.
+
+#### Fixed
+
+- A prepared `FETCH` described no columns, so reading a cursor in a loop broke
+  once the client prepared the statement.
+
+### Date, time and timestamp columns on the Rust PostgreSQL server
+
+`date` and `time` now work as column types and as casts. They are stored in the
+same canonical text form the Python server uses — the two servers share one
+database, so the representation is a contract rather than a choice — but are
+reported over the wire with their real type identifiers, which is what lets a
+client hand back a date object rather than a string.
+
+Writing a test that used `date` as a column type, rather than only as a cast,
+turned up something larger and unrelated to dates. A value assigned to a column
+was stored exactly as written instead of being converted to the column's type,
+so `INSERT INTO t (d) VALUES ('2026-9-1')` stored `2026-9-1` and a client
+reading it back could not parse it. PostgreSQL converts on assignment; now so do
+we, for `INSERT` and `UPDATE` alike and for every type, not just dates.
+
+Two error codes that are easy to conflate are kept apart, because PostgreSQL
+keeps them apart: a value that is not a date at all is one error, and a
+well-formed date naming a day that does not exist — the thirtieth of February —
+is another.
+
+Timestamps needed more care than the other two. PostgreSQL keeps microseconds;
+the underlying document format keeps only milliseconds. The Python server
+already solved this by storing the truncated time and keeping the lost
+microseconds in a hidden companion field beside it, and this server now writes
+exactly the same thing — so a timestamp written by one is read back at full
+precision by the other. The rule that makes it safe is that every write must
+either set that companion or remove it: leaving a stale one behind would report
+a time nobody ever stored, which is worse than losing the precision would have
+been. Overwriting a precise time with a whole-millisecond one, and back again,
+is covered by a test for exactly that reason.
+
+#### Added
+
+- `date`, `time` and `timestamp` as column types and cast targets, accepting the
+  spellings PostgreSQL accepts and storing the single canonical form it stores.
+- Microsecond precision for timestamps, stored compatibly with the Python
+  server so a value written by either is read correctly by both.
+
+#### Fixed
+
+- Values assigned by `INSERT` or `UPDATE` were stored as written rather than
+  converted to the column's declared type.
+
+### Rust pgserver: honour DateStyle in date/time text output
+
+The Rust PostgreSQL server (`secantusd-pg`) now renders `date`, `timestamp` and
+`timestamptz` values in the session's `DateStyle` — the four display formats
+(`ISO`, `Postgres`, `SQL`, `German`) crossed with the `YMD` / `MDY` / `DMY`
+field order — instead of always rendering ISO. A `SET datestyle = SQL, DMY`
+followed by `SELECT '2026-09-08'::timestamp` now answers `08/09/2026 12:34:56`,
+byte-for-byte what PostgreSQL 14 answers, and `Postgres` style gains the
+spelled-out day-of-week and month (`Tue Sep 08 12:34:56.789 2026`) it requires.
+
+Because the output now genuinely respects the style, the server once again
+reports `DateStyle` over `ParameterStatus` (in PostgreSQL's canonical spelling)
+— which a previous change had to disable, since reporting a style the output
+ignored made psycopg switch its parser to a layout the server never produced and
+mis-parse every datetime. Reporting is safe now that the two agree: psycopg's
+loaders and the server's output speak the same style. Binary datetime output is
+DateStyle-independent and is left untouched.
+
+#### Added
+- `secantus-pgplan`: `DateStyle` (format + field order) with `parse` /
+  `canonical`, and `render_date_styled` / `render_timestamp_styled` /
+  `render_timestamptz_styled` (plus the `*_value_text_styled` Bson helpers).
+
+#### Fixed
+- `secantus-pgserver`: `date` / `timestamp` / `timestamptz` TEXT output renders
+  in the session `DateStyle`; `SET datestyle` is stored and reported in
+  canonical form. Fixes the 12 psycopg `test_overflow_message[timestamptz-*]`
+  cases (a non-ISO style must make the driver's timestamptz loader raise
+  `NotImplementedError`).
+
+### A table you have just created, in a transaction that has not ended
+
+Creating a table and then using it, without committing in between, reported that
+the relation did not exist. That is the ordinary shape of a test fixture and of
+a migration, and it accounted for 184 failures in psycopg's suite by itself.
+
+The cause is worth stating because of what hid it. Resolving a table name is
+part of *planning*, planning reads the catalogue, and the catalogue is an
+ordinary table — so a `CREATE TABLE` that had not committed was invisible to it.
+Execution already ran inside the transaction, so anything that used a table
+which already existed worked perfectly. Only the combination failed, and only
+for a client that had not committed.
+
+Fixing it exposed a second problem underneath, which had never been reachable:
+`COPY` inside a transaction wrote its rows outside that transaction, where they
+blocked against its own locks and hung the connection outright. Rows from a
+`COPY` now go through the transaction like every other write.
+
+`ORDER BY 1` also works now. It means the first output *column* — an ordinal
+into the select list, so `select b, a from t order by 1` orders by `b` — rather
+than the constant one, and a position with no such column gets PostgreSQL's own
+error for it.
+
+One thing this does not fix, and it is worth being plain about: rolling back
+does not undo the `CREATE`. DDL is not transactional on this server, where in
+PostgreSQL it is. That needs schema operations to participate in the
+transaction down in the storage layer, and it is recorded as an open divergence
+rather than quietly left to be discovered.
+
+#### Fixed
+
+- A table created in a transaction was invisible to later statements in the same
+  transaction, and one dropped in a transaction was still found.
+- `COPY` inside a transaction deadlocked the connection.
+
+#### Added
+
+- `ORDER BY <position>`, with PostgreSQL's error for a position that is not in
+  the select list.
+
+### DROP TABLE and type casts on the Rust PostgreSQL server
+
+`DROP TABLE`, `DROP TABLE IF EXISTS` and casts (`'1'::int`, `1::text`,
+`$1::float8`) now work. Both came straight off the ranked list that psycopg's
+test suite produced when it was first pointed at the Rust server — measuring
+against someone else's tests turns out to be a much better guide to what to
+build next than deciding for oneself.
+
+Casts brought a subtler problem than converting values. A client asks what
+columns a query returns *before* it supplies any parameter values, so a
+column's type cannot be read off the value it happens to hold — at that point
+`$1::int` has no value at all. Inferring from the value typed that column as
+text, and the client then decoded a perfectly good integer as a string. Types
+now come from the cast that declares them. The same fix corrected `text`
+columns, which were being reported as `varchar`: PostgreSQL treats those as
+different types, and while Python clients decode both to strings, the Java and
+Go drivers do not.
+
+The gauge moved from 694 to 746 of psycopg's 4,238 tests. The modest jump is
+itself informative: a test that was blocked by a missing `DROP TABLE` usually
+needs several other things too, so removing one obstacle mostly reveals the
+next. Expressions in a `SELECT` list are now the single largest blocker.
+
+#### Added
+
+- `DROP TABLE`, including `IF EXISTS` and multiple tables in one statement.
+- Casts to the integer, floating-point, boolean and text types, with
+  PostgreSQL's `invalid input syntax` error for values that cannot convert.
+
+#### Fixed
+
+- `text` columns were reported over the wire as `varchar`.
+
+### Rust pgserver: enum columns report their own oid
+
+A SELECT of an enum COLUMN was described over the wire as `varchar` (oid 1043)
+instead of the enum's own type oid. psycopg reads that oid to decide whether to
+apply a registered enum loader, so with `varchar` it handed back a bare string
+where a `register_enum`'d client expected the Python enum member — the enum
+value-mismatch and non-ASCII case-fold failures. The column-description paths
+now consult the user-type catalog (as the parameter path already did), so an
+enum column — scalar or array — carries the enum's minted oid, and the label is
+returned verbatim.
+
+#### Fixed
+- Enum columns (and enum-array columns) are described with the enum type's oid,
+  not `varchar`, so psycopg's registered enum loader applies and returns the
+  enum member.
+
+### Types you make yourself
+
+`CREATE TYPE ... AS ENUM` and `DROP TYPE` work on the Rust PostgreSQL server —
+which matters more than it sounds, because psycopg's entire enum test file (207
+tests) died in one session fixture running exactly that DDL, and nothing behind
+it was even measurable.
+
+The enum catalog is written in the Python server's representation, because the
+two servers share one store and the doc shapes, collection names and
+oid-minting rule are a contract, not an implementation choice: oids are minted
+monotonically from a shared counter and never reused (renumbering types would
+strand any client that registered a decoder by oid), and a type's array oid is
+derived — its own oid plus 100 000 — never stored. An enum created by one
+server resolves on the other under the same oid, and the next type minted by
+either continues the same sequence.
+
+Enum values work too: `'sad'::mood` validates the label with PostgreSQL's own
+error for a miss (`invalid input value for enum mood: "nope"`), the column
+carries the enum's minted oid so a client that registered the type decodes it,
+`pg_typeof` answers the type, and a case-sensitive name renders quoted through
+`regtype` (`"CamelCase"`), exactly as measured. The catalog reads behind
+psycopg's `TypeInfo.fetch` see user enums beside the builtins.
+
+`DROP` of an unsupported object kind also stopped leaking Rust debug formatting
+into its message — "DROP of Ok(ObjectType)" is now "DROP of a schema" and
+friends, naming the kind.
+
+#### Added
+
+- `CREATE TYPE ... AS ENUM`, `DROP TYPE [IF EXISTS]`, enum value casts, enum
+  rows in `pg_type` / `to_regtype` / `regtype`, cross-server with shared oids.
+
+#### Fixed
+
+- `DROP` of a non-table leaked a protobuf enum's debug form into the message.
+
+### Registering an enum, end to end
+
+`EnumInfo.fetch` works now — psycopg's own enum-discovery API, unmodified — and
+with it the whole slice of the driver that hangs off it: fetching a type's
+labels, registering a Python enum against it, casting values in and out.
+
+The query it sends is the reason this took a batch of its own: a `FROM`
+subquery whose body is a `LEFT JOIN` of `pg_type` to `pg_enum`, with
+`array_agg` and `GROUP BY` on the outside. So this adds a joined subquery as an
+aggregate source, a two-table join (inner or left, one ON equality, an optional
+filter and one ORDER BY — the shape every catalog query actually uses, nothing
+more), the `pg_enum` virtual table, and `array_agg` — which keeps NULLs, the
+way a left-join miss surfaces as `[None]` rather than `[]` and lets a client
+tell a non-enum apart from an empty one.
+
+Enum values round-trip in both wire formats: a label's binary form is just its
+UTF-8, so binary cursors get the format they asked for, and an unspecified-oid
+parameter carrying an enum label decodes as that label. An enum array reports
+its own derived array oid rather than `varchar`, so a client that registered
+the array type decodes it.
+
+#### Added
+
+- `EnumInfo.fetch`: a joined subquery as an aggregate source, `pg_enum`,
+  `array_agg`, and a two-table `LEFT`/`INNER` join limited to the catalog
+  query shape.
+- Enum values in both wire formats, and enum arrays with their real oid.
+
+### Arithmetic and string expressions in the Rust PostgreSQL server
+
+`SELECT 1+1`, `SELECT 'a'||'b'`, `SELECT 7/2` and their relatives now work.
+Expressions in a select list were the single largest thing standing between the
+Rust PostgreSQL server and psycopg's test suite, and the score moved from 746 to
+853 of 4,238 — the largest jump so far.
+
+The corners were measured against a real PostgreSQL rather than assumed, and
+two of them are easy to get wrong. Integer division truncates, so `7/2` is 3
+rather than 3.5, and dividing by zero is an error rather than a null or an
+infinity. Adding anything to NULL gives NULL, and concatenating a number to a
+string converts the number.
+
+Arithmetic on decimals is deliberately still refused. PostgreSQL treats `1 +
+1.5` as its `numeric` type with particular scale rules, not as a floating-point
+number; returning a double would give the right value under the wrong type, and
+that is exactly the class of bug that recently made a correctly-converted
+integer arrive at the client as a string. Explicit floating-point casts work,
+because then the type genuinely is floating point.
+
+#### Added
+
+- Arithmetic (`+ - * / %`), string concatenation (`||`), comparison operators
+  and unary minus in a `SELECT` list, including over bound parameters.
+- PostgreSQL's `division by zero` and `integer out of range` errors.
+
+### Rust pgserver: only report the TimeZone GUC, not DateStyle
+
+The timestamptz-columns change began emitting a `ParameterStatus` for several
+GUC_REPORT variables on `SET`, including `DateStyle`. But this server always
+renders dates in ISO regardless of `DateStyle`, so reporting a `DateStyle`
+change made the client (psycopg) switch its date parser to a style our output
+never uses — mis-parsing every datetime. Reporting is now limited to
+`TimeZone`, the one GUC whose change the output actually honours (a timestamptz
+renders in it).
+
+#### Fixed
+- `SET datestyle` no longer breaks datetime parsing: the server reports only
+  `TimeZone` via `ParameterStatus`, not GUCs it does not honour in output.
+
+### The Rust PostgreSQL server can be scored against psycopg's own test suite
+
+SecantusDB's conformance gauges run real client libraries' own test suites,
+unmodified, against the server. Until now the SQL gauges could only measure the
+Python PostgreSQL server; setting `SECANTUS_GAUGE_SERVER=rust` now points the
+psycopg gauge at the Rust one instead, so the same tests score both.
+
+Getting there needed two things that only a real client asks for. Clients check
+which server they have connected to before doing anything else, and the gauge
+refuses to score a server that does not identify itself — so `SELECT version()`
+and the other session functions had to work, which meant supporting a `SELECT`
+with no table at all. Clients also wrap their work in transactions, so
+`BEGIN`, `COMMIT` and `ROLLBACK` had to work, backed by real storage
+transactions rather than accepted and ignored: a `ROLLBACK` that quietly kept
+the changes would be worse than refusing the statement.
+
+The first score is low, and deliberately published rather than buried: 694 of
+psycopg's 4,238 tests pass. Every measurement before this compared the server
+against expectations written alongside it; this is the first one where someone
+else's tests decide. The ranked list of what they trip over is the useful part.
+
+#### Added
+
+- `SELECT` without a `FROM` clause, and the `version()`, `current_database()`,
+  `current_schema()` and `current_user` session functions.
+- `BEGIN` / `COMMIT` / `ROLLBACK`, backed by real storage transactions.
+- `SECANTUS_GAUGE_SERVER=rust` support in the psycopg gauge, writing its
+  results to a separate file so the two servers' scores cannot overwrite
+  each other.
+
+### generate_series, and the rows a cursor needs to scroll over
+
+`generate_series(start, stop)` — with an optional step, which may count
+downwards — now works as a source in `FROM`. It is a *source* rather than a
+statement of its own, and that is the whole design: `ORDER BY`, `LIMIT`,
+`OFFSET` and the aggregates all operate on the generated rows without knowing
+where they came from, so nothing had to be reimplemented for them.
+
+Two rules are worth stating because they read the other way round. Counting up
+towards a smaller stop produces *nothing* — `generate_series(5, 1)` is empty
+rather than reversed, and counting down needs a negative step. And a step of
+zero is refused rather than looped over, with the code PostgreSQL uses for an
+argument whose value cannot work, which it keeps distinct from its general
+data-error class.
+
+The reason this was worth doing now is not the function itself. Cursors landed
+in the previous release, complete and matching PostgreSQL across every operation
+probed — and almost every test that used one still failed, because the usual way
+to give a cursor rows to scroll over, without inventing a table first, is to
+select from a generated series. A feature can be finished and still be
+unreachable.
+
+A `WHERE` clause over a generated source is refused rather than ignored. The
+filter machinery here is built against stored columns, and quietly dropping a
+predicate would return rows the client asked to exclude.
+
+#### Added
+
+- `generate_series` as a `FROM` source, with an optional and possibly negative
+  step, column aliases (`AS g`, `AS g(x)`), `ORDER BY`, `LIMIT`, `OFFSET`, and
+  `count` / `sum` / `min` / `max` over it.
+
+### Rust pgserver: inet and cidr
+
+The Rust PostgreSQL server now supports the network address types `inet` (oid
+869) and `cidr` (oid 650) — as casts, bound values, and real column types.
+Both are carried as the canonical `addr/masklen` text the Python server stores,
+so the two servers share one representation. `inet` keeps its host bits; `cidr`
+is strict and rejects any host bit set below the netmask. IPv4 and IPv6 are
+both handled, with IPv6 compressed to its canonical form.
+
+psycopg sends and reads these types in the binary wire format, so the round
+trip goes through PostgreSQL's `[family][bits][is_cidr][nb][addr]` layout in
+both directions: a `/32` (or `/128`) host comes back as an `IPv4Address` /
+`IPv6Address`, a shorter prefix as an `Interface`, and a `cidr` as a `Network`,
+exactly as against a real server. The `::text` cast keeps the mask
+(`network_show`), while an inet column read in text drops a full-host mask
+(`inet_out`).
+
+#### Added
+- `inet` (869) and `cidr` (650) casts, bound values (text + binary), and column
+  types; malformed input is `22P02`, and a `cidr` with host bits set is `22P02
+  invalid cidr value`.
+
+### Intervals, and why they refuse to be one number
+
+An interval is a duration, and PostgreSQL keeps it as three separate numbers:
+months, days and microseconds. That looks like an implementation detail until
+you try to collapse it. A month is 28 to 31 days depending on where you start,
+and a day is 23, 24 or 25 hours across a daylight-saving boundary — so
+`2026-01-31` plus one month is `2026-02-28`, a result no fixed count of
+microseconds can express. Adding thirty days to the same date lands on March 2nd
+instead, and both answers are correct for what was asked.
+
+Comparison is the exception, and it goes the other way: PostgreSQL flattens the
+parts using thirty-day months and twenty-four-hour days, so `'1 mon'` and
+`'30 days'` compare *equal* while adding them takes you to different dates. The
+Rust PostgreSQL server now does both — ordering through the flattened value,
+arithmetic through the parts.
+
+Intervals arrive in three written forms, all of which are now accepted: the
+verbose one (`1 year 2 months`, with abbreviations and a `week` that becomes
+seven days), a bare time (`02:03:04.5`, which carries its own sign and may run
+past twenty-four hours), and ISO 8601 (`P1Y2M3D`, where `M` means months before
+the `T` and minutes after it). They combine, and each part keeps its own sign:
+`1 day -02:03:04` is a positive day and a negative time.
+
+The output is PostgreSQL's, including the spelling that looks wrong: a value
+pluralises whenever it is not exactly one, so `-1 day` prints as `-1 days`.
+
+#### Added
+
+- `interval` as a cast target, a literal and a bound parameter in both wire
+  formats, with its own type oid.
+- Interval comparison and ordering, flattened as PostgreSQL flattens it.
+- `timestamp ± interval` with end-of-month clamping, `interval ± interval`, and
+  scaling an interval by a number, where a fractional result spills from months
+  into days and from days into time.
+
+#### Fixed
+
+- Beside an interval, a bare unquoted-type literal now resolves to an interval
+  rather than to a timestamp, as PostgreSQL resolves it — so
+  `'2020-01-01' + interval '1 day'` reports a bad interval instead of quietly
+  doing date arithmetic, and `'1 day' + interval '1 day'` is two days.
+
+### User types are visible in the transaction that creates them
+
+A user type created on the Rust PostgreSQL server is now visible to later
+statements in the same transaction, before it is committed. Previously
+`CREATE TYPE t AS (...); SELECT 't'::regtype` in one transaction failed with
+`42704 type "t" does not exist`, because planning resolves type names against
+the catalog and reads it OUTSIDE the open transaction, so an uncommitted
+`CREATE TYPE` was invisible to the read that needed it.
+
+This is the transaction-visibility gap that tables already closed, now closed
+for types. It mattered far beyond one statement: psycopg's composite, enum, and
+range test fixtures run on a non-autocommit connection and create a type then
+immediately use it — `CompositeInfo.fetch`, `EnumInfo.fetch`, and
+`RangeInfo.fetch` all query the catalog in that same transaction — so the
+invisible type returned `None` and cascaded into `TypeError: no info passed` and
+`FeatureNotSupported` across the whole composite/enum/range gauge surface. A
+per-connection overlay of the transaction's uncommitted type creates and drops,
+consulted before the committed catalog exactly as the table one is, makes the
+type resolve, cast, and fetch inside its own transaction; `ROLLBACK` discards
+it, `COMMIT` persists it, and `ROLLBACK TO SAVEPOINT` undoes a type created
+after the savepoint. Wrapping the catalog read in the transaction was rejected
+for the same reason the table fix rejected it — it deadlocks `COPY`, which opens
+its own transaction context.
+
+#### Fixed
+
+- A `CREATE TYPE` (composite, enum, or range) issued inside a transaction is now
+  visible to later statements in that transaction: `to_regtype`, a value cast to
+  the type, and psycopg's `CompositeInfo` / `EnumInfo` / `RangeInfo` `.fetch`
+  helpers all resolve it before it is committed.
+- `DROP TYPE` inside a transaction hides the type from later statements in the
+  same transaction, before the drop is committed.
+- `ROLLBACK` and `ROLLBACK TO SAVEPOINT` correctly discard a type created in the
+  rolled-back span, and `COMMIT` persists one; the type-catalog collections are
+  captured by savepoint pre-images so a rolled-back create cannot survive a later
+  commit.
+
+### Rust pgserver: multi-predicate JOIN/subquery WHERE
+
+A JOIN (or aggregate-subquery) WHERE clause now accepts several ANDed
+predicates on either side — `WHERE t.oid = $1 AND a.attnum > 0 AND NOT
+a.attisdropped` — with the operators `=`, `>`, `>=`, `<`, `<=`, and `NOT
+<boolcol>`, where before only a single left-side equality was allowed. A
+right-side predicate now filters the right rows (correct for the INNER joins
+these catalog queries use) rather than being refused.
+
+This is the first piece of the composite `CompositeInfo.fetch` campaign (its
+inner subquery joins `pg_attribute` to `pg_type` with exactly this
+multi-predicate WHERE); the remaining piece — a subquery as a LEFT-JOIN side —
+is tracked in `tasks/backlog.md`.
+
+#### Added
+- `=` / `>` / `>=` / `<` / `<=` / `NOT <bool>` predicates, ANDed, on either
+  side of a JOIN's WHERE (`JoinSelect.filter` is now a `Vec<JoinPred>`).
+
+### Reaching into a json document
+
+`'{"a": 1}'::json ->> 'a'` was an error. So was every other way of getting at
+part of a json value: the Rust PostgreSQL server could parse json, store it,
+cast it and hand it back whole, and could not reach inside it.
+
+All of the navigation and key operators work now — `->` and `->>` by name or by
+array index, `#>` and `#>>` down a path, `?`, `?|` and `?&` for keys, and `@>` /
+`<@` for containment. A negative index counts from the end, which is
+PostgreSQL's rule and not most JSON libraries'; a lookup that does not apply — a
+missing key, an index past the end, a name against an array — is SQL NULL rather
+than an error, which is the whole reason these operators are usable; and `->>`
+reads a json string without its quotes while a json *null* becomes a SQL NULL.
+
+Containment compares by value rather than by text, so key order and whitespace
+do not count, and neither does a number's scale: `{"a": 1.0}` contains
+`{"a": 1}`.
+
+A json value is carried here as its text, so by the time two operands reach the
+evaluator there is nothing to tell `{"a": 1}` from any other string. The left
+operand's static type is what makes these json operators at all — the same
+mechanism that resolves a range parameter from the operand beside it.
+
+#### Added
+
+- `->`, `->>`, `#>`, `#>>`, `?`, `?|`, `?&`, `@>` and `<@` over `json` and
+  `jsonb`, with their result types (`->` keeps the json flavour, `->>` is text,
+  the key and containment tests are boolean).
+
+### json and jsonb, and the number that gives the difference away
+
+`json` and `jsonb` look interchangeable and are not. `json` validates its input
+and stores the text it was given, so whitespace, key order and even duplicate
+keys all survive a round trip. `jsonb` stores a parsed structure, so what comes
+back is normalised: keys sorted, the last of any duplicate pair kept, one
+canonical spacing throughout.
+
+Key order is the part worth knowing. `jsonb` sorts keys by **byte length**
+first and only then bytewise, so `z` comes before `é` — one byte against two —
+and `b` comes before `aa`. It is neither alphabetical nor by character count,
+and no amount of reasoning gets you there; it was measured.
+
+Numbers are where a shortcut would have shown. A `jsonb` number is a `numeric`,
+and prints as one: an exponent expands, so `-1.5e10` comes back as
+`-15000000000`, while a trailing zero written in the literal survives, so
+`1.10` stays `1.10` rather than becoming `1.1`. That second half is what rules
+out reading numbers into floating-point values, which every general-purpose JSON
+parser does by default — it gets the exponent right and silently drops the zero.
+Number text is therefore kept as written and normalised the way `numeric` is.
+
+One related fix came out of testing this. A bound parameter whose type the client
+leaves unspecified is guessed from its text, and the guess used to accept `01` as
+the number 1 — so `'01'::json`, which PostgreSQL rejects, was quietly turned into
+valid JSON before the cast ever ran. A guess made on the client's behalf must
+never make a value more acceptable than the client wrote it, so a number is now
+only inferred when it round-trips to the same text.
+
+#### Added
+
+- `json` and `jsonb` as cast targets, literals and bound parameters in both wire
+  formats, with their own type oids.
+
+#### Fixed
+
+- An unspecified-type parameter was inferred as a number even when the text was
+  not how that number is written, which could turn invalid input valid.
+
+### Rust pgserver: multidimensional arrays
+
+Multidimensional arrays now cross the wire. They already stored and text-
+rendered, but returning a nested array to a client was refused — so
+`SELECT ARRAY[[1,2],[3,4]]`, reading a 2-D `int[]` column, and casting a nested
+text literal all failed. The server now builds PostgreSQL's multidimensional
+array binary wire form by hand (an `ndims` header, per-dimension bounds, and
+the leaves in row-major order) and also emits the `{{1,2},{3,4}}` text form, so
+a column reaches the client correctly whether the cursor asked for text (the
+psycopg default) or binary. A nested `ARRAY[...]` constructor now reports the
+array type (oid 1007), not `varchar`; the array cast recurses through the
+nesting; and a ragged array is rejected exactly as PostgreSQL rejects it —
+`2202E` from a constructor, `22P02` from a text literal.
+
+#### Added
+- Multidimensional array results (2-D, 3-D, …) in both the text and binary wire
+  formats, for `int` / `bigint` / `smallint` / `float` / `numeric` / `bool` /
+  `text` element types.
+- A nested array constructor is typed as its array type (oid 1007), and the
+  array cast handles nested elements.
+
+#### Fixed
+- A ragged multidimensional array is now rejected (`2202E` / `22P02`) instead of
+  being silently accepted.
+
+### Multiranges, and the difference between touching and overlapping
+
+A multirange is a set of ranges, and PostgreSQL keeps it in one normal form:
+members sorted, empty ones dropped, and any two that meet folded into a single
+member. So `{[10,20),[1,5)}` comes back sorted, `{empty}` comes back as `{}`,
+and `{[1,5),[3,8)}` comes back as `{[1,8)}`.
+
+The interesting rule is the last one, and it is not quite "overlapping".
+`{[1,5),[5,8)}` also collapses to `{[1,8)}` — the two do not overlap at all,
+but nothing lies between them either, so they are one continuous stretch.
+`{[1,5),[6,8)}` stays two members, because 5 is missing from it. The test is
+whether the next member starts at or before the previous one ends, and at the
+exact meeting point it comes down to the bounds: over a continuous type,
+`[1.0,2.0)` and `[2.0,3.0)` join, while `[1.0,2.0)` and `(2.0,3.0)` do not,
+because the second leaves 2.0 out.
+
+Members are canonicalised before any of this happens, so `{[1,5]}` is stored as
+`{[1,6)}` and merging sees the same bounds a client would.
+
+All six multirange types are supported as literals, constructors, cast targets
+and bound parameters, each with its own type oid.
+
+#### Added
+
+- `int4multirange`, `int8multirange`, `nummultirange`, `datemultirange`,
+  `tsmultirange` and `tstzmultirange`, with sorting, empty-member removal,
+  merging of overlapping and adjacent members, and their own type oids.
+
+### Several commands in one query, and a flake that was a missing feature
+
+PostgreSQL's simple query protocol takes any number of commands separated by
+semicolons and answers with one result each — `create table ...; insert ...;
+select ...` in a single round trip. The Rust PostgreSQL server refused the whole
+string, which is why so much client code failed before reaching the query it
+cared about: the setup was the batch.
+
+The part that cannot be added later is the transaction. A multi-command batch
+runs as one implicit transaction, so a failure in the third command discards
+what the first two wrote — and an explicit `COMMIT` inside the batch ends that
+transaction, so whatever it committed survives a later failure. Both rules were
+measured against a live PostgreSQL rather than assumed, and both fall out of
+reusing the session's own transaction slot instead of tracking a second one.
+
+`DEALLOCATE ALL` is now accepted too, and it is worth saying why it mattered.
+Clients issue it to reset their prepared-statement cache, but only when the
+connection happens to have one — so refusing it failed a scattered handful of
+tests that varied from run to run. That looked exactly like flakiness, and it
+was a missing feature the whole time.
+
+`pg_typeof(x)` answers the type's display name — `integer` rather than `int4`,
+`timestamp without time zone` rather than `timestamp` — reported as a `regtype`.
+It reports the type the server would give the expression, not one read off the
+value, which is why `pg_typeof(NULL)` is `unknown`.
+
+#### Added
+
+- Multi-command simple queries, one result per command, run as a single
+  implicit transaction with PostgreSQL's commit and rollback behaviour.
+- `DEALLOCATE ALL`.
+- `pg_typeof()`, and the type display names behind it.
+
+#### Fixed
+
+- Casting a decimal to a float failed outright (`1.5::float8` raised "invalid
+  input syntax"), and casting one to an integer failed the same way. Decimal
+  literals became exact numerics in the previous release and these two cast
+  paths were never taught about them.
+- `2.5::float8::int` answered 3. PostgreSQL rounds float-to-integer half to
+  even and numeric-to-integer half away from zero; one rule was being used for
+  both. A large numeric is now rounded on its digits rather than through a
+  float, which cannot represent every value a numeric can hold.
+
+#### Changed
+
+- Several commands in one *prepared* statement now raise PostgreSQL's own
+  `42601` "cannot insert multiple commands into a prepared statement" instead
+  of reporting the batch as an unsupported feature. The extended protocol has
+  one parameter list and one row description, so this is a real error rather
+  than a gap.
+- An unsupported function now names itself (`function chr() is not supported
+  yet`), where every one of them used to report the same `FuncCall`.
+
+### Exact decimal numbers on the Rust PostgreSQL server
+
+PostgreSQL's `numeric` type is for numbers that must be exact — money,
+quantities, anything where a rounding error is a bug rather than a rounding
+error. It is not a floating-point type, and the difference shows in two ways
+that matter to a client: `1.50` and `1.5` are different values, and reading one
+back gives a decimal rather than a float.
+
+The Rust PostgreSQL server had been refusing decimals rather than storing them
+as floats, on the grounds that returning the right magnitude under the wrong
+type is worse than declining — the same reasoning that had a cast integer
+arriving at a client as text earlier in this work. That refusal can now be
+lifted: decimals are stored in a format that keeps the exact digits and the
+trailing zeros, and are reported as the type they are.
+
+There is a limit. PostgreSQL's decimals have no fixed size; the storage format
+here holds 34 significant digits. A number needing more is refused rather than
+quietly rounded, because a silently shortened number is indistinguishable from
+a correct one.
+
+#### Added
+
+- `numeric` as a column type, a cast target, and the type of a decimal literal,
+  keeping exact digits and trailing zeros (`1.50` stays `1.50`).
+
+#### Fixed
+
+- A decimal literal such as `1.5` was reported as a floating-point number.
+  PostgreSQL reports it as `numeric`, and clients read that to decide whether
+  they get an exact decimal or a float.
+
+### A PostgreSQL server written in Rust, sharing one database with the Python one
+
+SecantusDB already speaks the PostgreSQL wire protocol, and it already has a
+Rust server for the MongoDB side. This is the first slice of the third: a
+PostgreSQL server written entirely in Rust, with no Python anywhere in the
+request path. It handles `CREATE TABLE`, `INSERT` and single-table `SELECT`
+today — a deliberately thin slice, because the point of it is to prove the
+architecture end to end rather than to be useful yet.
+
+The part that matters is that the two servers share one database. A table
+created by the Rust server can be read and written by the Python server, and a
+table created by the Python server can be read by the Rust one, because both
+write the same catalog documents into the same WiredTiger store. That contract
+is pinned by golden vectors captured from the Python server, since a catalog
+written subtly wrong by one server is not an error the other reports — it is a
+table with the wrong columns.
+
+SQL is parsed by PostgreSQL's own parser, statically linked, rather than by a
+general-purpose SQL parser. That is a correctness decision as much as a
+performance one: the shapes SecantusDB currently has to work around, like
+`COPY … WITH (freeze on)`, parse correctly by construction. Anything the new
+server cannot yet handle answers the PostgreSQL error code for "feature not
+supported" rather than guessing, so an unsupported query is always a refusal
+and never a wrong answer.
+
+#### Added
+
+- `secantus-pgcatalog`, `secantus-pgplan` and `secantus-pgserver` crates, plus
+  the standalone `secantusd-pg` binary.
+- `invoke rust-pgserver-build` and `invoke rust-pgserver-test`; the latter is
+  now part of `invoke rust-gate`.
+- Cross-server round-trip tests covering both directions, PostgreSQL-oracle
+  checked predicates, and the error codes for unknown columns, unknown tables,
+  duplicate tables, duplicate keys and unsupported constructs.
+
+#### Fixed
+
+- A duplicate primary key reported MongoDB's `E11000 duplicate key error`
+  through the PostgreSQL connection. It now reports what PostgreSQL reports,
+  down to the `DETAIL: Key (id)=(1) already exists.` line.
+
+### The Rust PostgreSQL server learns ORDER BY, aggregates, UPDATE, DELETE and SQL's three-valued logic
+
+The Rust PostgreSQL server now handles `ORDER BY` (with `LIMIT` and `OFFSET`),
+`UPDATE`, `DELETE`, and the predicates that make SQL SQL: `IS NULL`, `IN`,
+`NOT IN`, `BETWEEN` and `NOT`. All of it is checked against a real PostgreSQL
+rather than against our own idea of what PostgreSQL does — a new differential
+suite runs 83 identical statements against both and compares the answers.
+
+That comparison earned its keep immediately, because SQL and MongoDB disagree
+about NULL in ways that are easy to miss and produce wrong rows rather than
+errors. PostgreSQL sorts NULLs last when ascending and first when descending,
+while MongoDB sorts them low; pushing a sort down to the storage engine would
+have quietly reordered every nullable column. `n <> 1` must not return a row
+whose `n` is NULL, because comparing anything to NULL yields NULL rather than
+true — but MongoDB's equivalent operator matches it. `x NOT IN (1, NULL)`
+returns nothing at all, for the same reason. Each of those is now handled
+explicitly, and each has a test that would have caught it.
+
+`NOT` is pushed down into the individual comparisons rather than wrapped around
+them, since MongoDB has no operator that means what SQL's `NOT` means. De
+Morgan's laws hold in SQL's three-valued logic, so the transformation is exact.
+Anything the server still cannot express — joins, aggregates, `LIKE`, sorting
+by an expression — continues to answer PostgreSQL's "feature not supported"
+rather than guessing at an answer.
+
+Aggregates arrived with the same care. `count(*)` counts rows including those
+whose columns are all NULL, while `count(col)`, `sum`, `min` and `max` skip
+NULLs — and over an empty result every one of them except `count` returns NULL
+rather than zero. A NULL forms its own `GROUP BY` group. `avg` is deliberately
+absent: PostgreSQL returns it as `numeric` with particular scale rules, and a
+close-enough answer would be worse than an honest refusal.
+
+#### Added
+
+- `count(*)`, `count`, `sum`, `min` and `max`, with or without `GROUP BY`,
+  including PostgreSQL's result types (`count` and `sum` are `bigint`; `min`
+  and `max` take the column's own type).
+- `ORDER BY` with per-column direction and `NULLS FIRST` / `NULLS LAST`,
+  including PostgreSQL's direction-dependent defaults; `LIMIT` and `OFFSET`.
+- `UPDATE` and `DELETE`, with PostgreSQL's row counts (`UPDATE` reports rows
+  matched, not rows whose value changed).
+- `IS NULL`, `IS NOT NULL`, `IN`, `NOT IN`, `BETWEEN`, `NOT BETWEEN` and `NOT`.
+- A differential test suite comparing 109 statements against a live PostgreSQL.
+
+#### Fixed
+
+- `<>` returned rows whose column was NULL, where PostgreSQL excludes them.
+- Selecting the same aggregate name twice (`SELECT count(*), count(n)`) reported
+  the second result in both columns.
+
+### Parameterised queries work against the Rust PostgreSQL server
+
+Client libraries switch to PostgreSQL's extended query protocol the moment a
+query carries a parameter — `WHERE n > %s` rather than `WHERE n > 5`. The Rust
+PostgreSQL server only implemented the simple protocol, so those queries were
+answered with a success status and **no rows at all**. That is worse than an
+unimplemented feature: an application would have seen an empty result for a
+query that should have returned data, with nothing to indicate anything had gone
+wrong. Prepared statements, portals, parameter binding and `Describe` are now
+implemented, so parameterised queries, prepared statements and the row limits
+that clients set on execution all behave.
+
+Adding them immediately exposed a second, quieter bug that had nothing to do
+with parameters. Comparing anything to NULL in SQL is never true — `WHERE n =
+NULL` returns no rows, even for rows where `n` really is NULL, because only `IS
+NULL` tests for it. The server was treating that comparison as a match. It went
+unnoticed because every existing test wrote its comparisons as literals, and it
+took binding a NULL parameter to make the case obvious enough to write down.
+
+Both protocols now run through one shared execution path, so they cannot drift
+apart, and the differential suite that compares the server against a real
+PostgreSQL grew to 141 statements — 28 of them over the extended protocol.
+
+#### Added
+
+- The PostgreSQL extended query protocol: `Parse`, `Bind`, `Describe`,
+  `Execute` and `Close`, with parameters in both text and binary form, and
+  support for the row limit a client can set on execution.
+
+#### Fixed
+
+- Comparing a column to NULL (`= NULL`, `<> NULL`, `> NULL`) returned rows
+  where PostgreSQL returns none. Affected literal SQL as well as parameters.
+
+### The type a parameter was sent as
+
+A bound parameter carries a type the client declared, and this server was
+throwing it away — reading each parameter's meaning back out of its decoded
+value instead. Most of the time the two agree. Where they don't, the answers
+were wrong in ways that print correctly.
+
+`pg_typeof(%s)` with a small integer said `integer`, because that is what the
+value looks like; PostgreSQL says `smallint`, because that is what psycopg
+declared. And a parameter with no declared type at all has no type to report:
+PostgreSQL answers an error rather than guessing, where this server guessed
+`text`. The declared types now reach the planner, on the describe path as well
+as the execute one — the describe runs first, so a describe that did not know
+them answered for the whole statement.
+
+Ranges had a sharper version of the same problem. A range over a discrete
+element type has one true spelling — PostgreSQL rewrites every bound, so
+`[10,20]` is stored and printed as `[10,21)` — and a range parameter kept
+whatever the client wrote. `int4range(10, 20, '[]') = %s` with that very range
+bound was **false**, while both sides printed identically. Two routes needed
+fixing: a range parameter that arrives with its type now decodes through the
+same cast a literal takes, and one that arrives untyped takes its type from the
+operand beside it, which is what PostgreSQL does at analysis time.
+
+#### Added
+
+- Declared parameter types reach the planner, so `pg_typeof` reports them.
+- `42P18` for a parameter whose type neither the client nor the context gives.
+
+#### Fixed
+
+- A range or multirange bound as a parameter compared unequal to the same range
+  written any other way.
+
+### A catalog to ask about types
+
+psycopg discovers a type by sending one query — `pg_type` joined to
+`to_regtype()`, with a `::regtype::text` cast in the select list — and the Rust
+PostgreSQL server had none of its five ingredients: no `pg_type`, no
+`to_regtype`, no `regtype` cast worth the name, no table aliases and no cast of
+a column in a select list. Type discovery failed wholesale, and with it the
+whole family of client features built on it — registering an enum, a composite,
+a custom range.
+
+`pg_type` is now a virtual table: a definition and rows computed on read from
+the same builtin-type catalog that names oids everywhere else, so the two can
+never disagree. `to_regtype()` resolves either spelling of a name (`int4` or
+`integer`) and answers NULL — not an error — for one it does not know, which is
+the whole reason clients prefer it to the `::regtype` cast, which errors.
+
+A `regtype` value itself carries two natures no single scalar holds: it prints
+as the type's display name while comparing as its oid. `select
+to_regtype('text')` shows `text`; `where t.oid = to_regtype('text')` compares
+25. Casting one onward follows the same split — to text as the name, to an
+integer as the oid.
+
+The vehicle for the `oid::regtype::text` select item — a chain of casts applied
+per column of a table read — works for any casts, not just these, and the
+described column type follows the last cast in the chain, so a client decodes
+the rows it was promised. `pg_prepared_statements` rides along as an empty
+virtual table, which is what psycopg's pipeline tests count rows in.
+
+The `oid` type came with it — psycopg's numeric tests cast to it constantly —
+with PostgreSQL's own edges: a negative literal wraps (`(-1)::oid` is
+4294967295), a value past 2³²−1 is out of range rather than wrapped, and the
+binary format is the 4-byte unsigned form.
+
+#### Added
+
+- The `pg_type` and `pg_prepared_statements` virtual catalog tables.
+- The `oid` type: casts from integers and text, both wire formats, unsigned
+  wrap-around and range errors as PostgreSQL reports them.
+- `to_regtype()`, a real `regtype` (prints as a name, compares as an oid), and
+  cast chains over columns in a table select list.
+- Table aliases (`FROM pg_type t ... WHERE t.oid`).
+
+### The Rust PostgreSQL server moves to a current wire-protocol library
+
+The library that speaks the PostgreSQL wire protocol was pinned to a version
+from nine releases ago. Two limitations that had been written down as costs of
+using that library — errors that could not carry the name of the constraint they
+violated, and no way to send data for `COPY ... TO STDOUT` — turned out to have
+been fixed upstream months earlier. They were costs of the pin, not of the
+library.
+
+With the upgrade, both are closed. A duplicate key error now carries the same
+constraint, table and schema names PostgreSQL sends, which is what the Java
+driver reads when an application asks which constraint failed. `COPY table TO
+STDOUT` produces output byte-identical to PostgreSQL's, so data copied out of
+one server loads straight into the other.
+
+The lesson is worth more than the features: a dependency pinned below 1.0 stops
+receiving even compatible updates, and nothing announces that. Checking for a
+newer release takes seconds and should happen before limitations get written
+down as permanent.
+
+#### Added
+
+- `COPY <table> TO STDOUT` in text format, round-tripping with `COPY FROM`.
+- Constraint, table and schema names on duplicate-key errors.
+
+#### Changed
+
+- The wire-protocol library moves from 0.31 to 0.40, clearing its deprecated
+  calls at the same time.
+
+### Rust pgserver: multirange arrays report their element type
+
+An `ARRAY` of multiranges was typed as `varchar` on the Rust PostgreSQL server,
+where an array of ranges already carried its real element type. That broke the
+value in BOTH wire formats: in text the client read back a bare string like
+`{{[1,5)},{}}` instead of parsing it into `Multirange` objects, and in binary a
+`varchar` column stays on the binary path — where an array value cannot be sent
+as a binary `varchar` at all (`22P03`). The six multirange array types now
+report their own array oids (`int4multirange[]` is 6150, and so on), which keeps
+them, like range arrays, on the text-format path the row description already
+downgrades a non-binary-encodable type onto — so the client parses them.
+
+The scalar range/multirange binary wire codec was already correct: typed empty,
+unbounded and populated range/multirange values round-trip in binary against a
+real server; the only remaining range gaps are `CREATE TYPE ... AS RANGE`
+(custom range types) and array-of-range element comparison, both separate work.
+
+#### Fixed
+- `ARRAY`-of-multirange results now report the multirange's array type
+  (`int4multirange[]` = 6150, `int8multirange[]` = 6157, `nummultirange[]` =
+  6151, `datemultirange[]` = 6155, `tsmultirange[]` = 6152, `tstzmultirange[]` =
+  6153) instead of `varchar`, in both wire formats.
+- Binary parameters of those array oids decode through the multirange element
+  decoder.
+
+### RangeInfo.fetch, and a plain join
+
+`RangeInfo.fetch` works now — psycopg's range-type discovery, unmodified. Its
+query is `pg_type` joined to `pg_range` on `rngtypid`, but *without* the
+aggregate wrapper `EnumInfo` uses: a plain top-level JOIN in an ordinary
+SELECT. So the join source, which the enum work put on the aggregate planner,
+now lives on plain selects too, and `pg_range` joins the virtual catalog — six
+rows, each builtin range type paired with its element type's oid, read from the
+same table the range casts use so the two can never disagree.
+
+#### Added
+
+- The `pg_range` virtual table (`rngtypid`, `rngsubtype`).
+- A top-level two-table JOIN in a plain (non-aggregate) SELECT, so
+  `RangeInfo.fetch` resolves.
+
+### The Rust PostgreSQL server passes psycopg's range and multirange suites
+
+psycopg's `test_range.py` and `test_multirange.py` drive the whole range
+family through the wire in every parameter format: lists of ranges bound as
+`int4range[]`, untyped `Range(empty=True)` values that arrive as a single
+binary flag byte, custom `CREATE TYPE ... AS RANGE` types registered through
+`RangeInfo.fetch`, and a quoting sweep over every awkward bound character. The
+Rust PG server failed 72 of those tests; it now fails one, a reserved-keyword
+quoting nit that is not about ranges at all. Every behaviour was measured
+against PostgreSQL 16 and matched exactly — values, canonical renderings,
+error messages and SQLSTATEs.
+
+Four things were wrong. A range-array parameter had no name for its oid, so a
+literal beside it was compared as a string against an array. An untyped range
+parameter bound in binary was read as text because nothing inferred its type
+from the operand it was compared with (or from a `$1::int4range` cast).
+Custom range types could be created but their values could not travel: the
+constructor, the binary codec, and the schema-qualified name each resolved to
+the wrong type or to `text`. And the literal parser and renderer disagreed
+with PostgreSQL's `range_out` on doubled quotes, backslashes, non-ASCII
+whitespace, and the always-exclusive infinite bound.
+
+#### Added
+
+- `secantus-pgplan`: `lower` / `upper` / `lower_inc` / `upper_inc` /
+  `lower_inf` / `upper_inf` / `isempty` over ranges and multiranges, statically
+  typed by the subtype (`lower(NULL::int4range)` describes as `integer`).
+- `secantus-pgplan`: `AND` / `OR` / `NOT` in a FROM-less `SELECT`, three-valued,
+  with PostgreSQL's `42804 argument of AND must be type boolean, not type
+  integer` and `22P02` for an untyped literal that is not a boolean.
+- `secantus-pgplan`: `infer_param_types` gives an undeclared parameter the type
+  of a `$1::<range type>` cast, as it already did for a comparison operand.
+- `secantus-pgserver`: binary decoding of custom range and multirange
+  parameters (`binary_multirange` factored out of the builtin arm).
+
+#### Fixed
+
+- `secantus-pgplan`: a literal beside a range / multirange / range-array
+  parameter is cast to the parameter's declared type
+  (`'{empty,"(,)"}' = [Int4Range(...)]` was `text = text[]`, 42883).
+- `secantus-pgserver`: an untyped binary range / multirange parameter takes its
+  type from context before decoding (the `\x01` empty flag was read as text and
+  every comparison answered False).
+- `secantus-pgplan`: custom range constructors resolve their own type
+  (`testrange('a', 'c')`, `testschema.testrange(1.5, 2.5)`), the one-argument
+  form is the literal cast (`testrange('a')` is `22P02 malformed range literal`),
+  and a schema-qualified type name keeps its schema (`'[1.5,2.5)'::testschema.testrange`
+  reported the oid of `public.testrange`).
+- `secantus-pgplan` `range.rs`: `""` inside a quoted bound is a literal quote;
+  `"` and `\` are doubled on output; only C `isspace` characters are
+  whitespace (U+0085 / U+00A0 are bound text); an infinite bound is exclusive
+  in canonical form for every subtype (`'[,foo)'::testrange` is `(,foo)`).
+- `secantus-pgserver`: `COPY ... FROM STDIN` stores ranges in canonical form
+  (`{empty}` → `{}`, `[1,5]` → `[1,6)`), and `ascii(%s)` describes as `int4`.
+
+### Range types, and the rewrite that makes two of them the same range
+
+A range like `[1,5)` has bounds that may each be inclusive or exclusive, or
+absent entirely. Over a type whose values are *discrete* — integers, dates —
+that leaves several ways to write the same thing, so PostgreSQL picks one:
+every bound is rewritten to `[)`. `[1,5]` becomes `[1,6)`, `(1,5)` becomes
+`[2,5)`, and the two compare equal because they are, in fact, the same range.
+
+Over a *continuous* type there is no such rewrite, because there is no next
+number to move a bound to: `[1.0,2.0]::numrange` stays inclusive at both ends.
+The Rust PostgreSQL server now supports both families — `int4range`,
+`int8range` and `daterange` on the discrete side, `numrange`, `tsrange` and
+`tstzrange` on the other — as literals, constructors and cast targets, each with
+its own type oid so a client builds a range object rather than reading text.
+
+Some details that only a real server tells you. An absent bound prints as
+nothing at all, so an unbounded range is `(,5)` rather than anything spelled
+with infinity. A range whose bounds meet without including each other contains
+nothing and *is* the empty range, so `int4range(1,1)` prints as `empty`. And a
+bound gets quoted when its own text would be ambiguous between the brackets,
+which a timestamp always is, because it has a space in the middle.
+
+Three different mistakes get three different error classes, which is worth
+keeping distinct even though all three refuse the query: a crossed bound is a
+data error, a malformed literal is an invalid-text one, and unrecognised bound
+flags are a syntax error.
+
+#### Added
+
+- `int4range`, `int8range`, `daterange`, `numrange`, `tsrange` and `tstzrange`
+  as literals, constructors and cast targets, with canonicalisation, empty
+  ranges, unbounded ends, bound quoting and their own type oids.
+
+### Rust pgserver: ROW / record expressions
+
+`ROW(...)` and the bare parenthesised list `(a, b, ...)` build an anonymous
+record in the Rust PostgreSQL server now — reported as oid 2249, which psycopg
+decodes to a Python tuple. The text form follows PostgreSQL's composite rules
+(`(a,b,c)`, a NULL field empty, a field with a comma/quote/backslash/space
+double-quoted, a bool printed `t`/`f`), and record comparison is exactly
+PostgreSQL's three-valued logic: `=`/`<>` examine every field (a non-null
+unequal field decides, else a NULL field makes the result NULL) while the
+ordering operators short-circuit left to right on the first NULL or unequal
+field.
+
+#### Added
+- `ROW(...)` / `(a, b, ...)` record construction (oid 2249), its `::text`
+  render, and the `=`/`<>`/`<`/`<=`/`>`/`>=` record comparison operators.
+
+### Savepoints, and the nested blocks built on them
+
+The Rust PostgreSQL server refused `SAVEPOINT` outright, and that refusal was
+quietly expensive: every client builds a *nested* transaction block out of
+savepoints, so `with conn.transaction():` inside another one failed even though
+nothing in the user's code mentions the word.
+
+They work now — `SAVEPOINT`, `RELEASE`, and `ROLLBACK TO`, with PostgreSQL's
+rules: a repeated name shadows rather than replaces, rolling back to an outer
+savepoint discards the ones nested inside it, releasing one keeps its writes
+while leaving the enclosing savepoint still able to undo them, and rolling back
+to a savepoint recovers a block that an error had aborted.
+
+WiredTiger has no savepoint of its own, so one here is a set of pre-images:
+before a statement writes a table, every open savepoint that has not yet
+captured that table captures it, and rolling back puts the captured contents
+back. Capturing lazily is what keeps it affordable — a savepoint nobody writes
+through costs nothing at all.
+
+Two more things fell out of the work. `CREATE TABLE IF NOT EXISTS` on an
+existing table raised `42P07` instead of doing nothing, so the ordinary "create
+it if it is missing" fixture failed the second time a session ran it. And the
+aborted-block check now runs *before* the planner's answer, as PostgreSQL's
+does: in an aborted block `select nosuchcolumn` is `25P02`, not `42703` — though
+a syntax error is still reported as itself, because the parser runs first there
+too.
+
+#### Added
+
+- `SAVEPOINT`, `RELEASE [SAVEPOINT]` and `ROLLBACK TO [SAVEPOINT]`, and so
+  nested client transaction blocks.
+
+#### Fixed
+
+- `CREATE TABLE IF NOT EXISTS` raised `42P07` on an existing table.
+- A statement in an aborted block reported its own error rather than `25P02`.
+
+### Scalar functions, of which the Rust PostgreSQL server had none
+
+`upper`, `length`, `abs`, `round`, `coalesce` — none of these worked. Not a gap
+in a corner: the Rust PostgreSQL server had no scalar function table at all, so
+every built-in taking an argument answered "not supported yet". A survey of
+thirty-seven common ones found thirty-seven missing.
+
+They are here now, along with `COALESCE`, `NULLIF`, `GREATEST` and `LEAST`,
+which a user writes like functions but which arrive as their own kinds of
+expression and so needed handling of their own.
+
+The result *type* turns out to be as much of the answer as the value, and it is
+where the surprises live. `sign` answers a floating-point number even when given
+an integer. `div` answers an exact numeric, because that is the type it is
+defined on, not the integer its arithmetic suggests. `round` splits by argument
+type exactly as casting does — half away from zero for an exact numeric, half to
+even for a floating-point one — so `round(2.5)` is 3 and `round(2.5::float8)`
+is 2. And a handful of functions ignore NULL arguments rather than propagating
+them: `concat` skips them, and `greatest` and `least` pick the extreme of
+whatever is left, so `greatest(1, NULL)` is 1.
+
+`nullif` deserves its own note. It answers the type of its left argument even
+when the answer itself is NULL — and a NULL cannot tell you what type it is, so
+reading the type from the value gave `text` where PostgreSQL gives `integer`. A
+literal carries its type in the query, and that is where it is now read from.
+
+#### Added
+
+- Forty-odd scalar built-ins: string, numeric, and the conditional expressions.
+
+#### Fixed
+
+- A literal's type was inferred from its value, so an expression producing NULL
+  reported `text` regardless of what it was computed from.
+
+### A function of a column, and the error that hid the gap
+
+`regexp_replace(statement, 'prepare _pg3_\d+ as ', '', 'i')` in a select list —
+how psycopg reads back its own prepared statements — failed with *"column
+"name" must appear in the GROUP BY clause"*. The gap was real but the error was
+wrong twice over: the router treated **any** function call in a target list as
+an aggregate, sent the statement to the aggregate planner, and the planner's
+refusal came out wearing a grouping error's clothes.
+
+The router now names the aggregates it means (`count`, `sum`, `avg`, `min`,
+`max`), and a scalar call over a column is a real computed column: the value is
+worked out per row by the executor, and the type is fixed at plan time — the
+describe pass sees no rows and has to name the column's type anyway. This is
+the same machinery the catalog work built for cast chains, widened from casts
+to calls.
+
+`regexp_replace` itself came with it, with PostgreSQL's rules rather than a
+regex library's defaults: only the **first** match is replaced unless the `g`
+flag is given, `\1` references capture groups, `i` folds case, and a malformed
+pattern is `2201B` — its own error class, because the pattern is broken, not
+the value being matched. And `current_setting(NULL)` answers NULL rather than
+refusing the argument.
+
+#### Added
+
+- Scalar calls over columns in a table select list, typed at plan time.
+- `regexp_replace`, constant or over a column, with `g` / `i` flags and group
+  references.
+
+`pg_typeof` now answers a real regtype value rather than a display-name
+string, so `pg_typeof(x)::oid` reads the type's oid and `::text` its name —
+psycopg's wrapper tests read the oid form for every numeric wrapper, and a name
+is not a number. And a range array carries its own oid (`int4range[]` is 3905,
+not `varchar`), so a client builds Range objects from it in either format.
+
+#### Fixed
+
+- Any function call in a select list was routed to the aggregate planner, so a
+  plain gap surfaced as a grouping error.
+- `current_setting(NULL)` refused the argument instead of answering NULL.
+- `pg_typeof(x)::oid` failed trying to parse a type name as a number.
+- A range array was described as `varchar`.
+
+### Schema-qualified composite types are distinct types
+
+`CREATE TYPE testschema.testcomp AS (...)` on the Rust PostgreSQL server now
+creates a type that is genuinely distinct from a bare `testcomp` in `public`,
+matching PostgreSQL. Previously a qualified type name was resolved to its last
+part, so `testschema.testcomp` collided with `testcomp` and the second `CREATE`
+failed with `42710 type already exists`.
+
+This mattered far beyond one CREATE: psycopg's composite-type test fixture is
+session-scoped and creates `testschema.testcomp` beside a bare `testcomp` in one
+script, so the collision failed the fixture and cascaded to every composite
+test. With the two types now coexisting, `CompositeInfo.fetch` resolves each
+name to its own type — bare `testcomp`, `testschema.testcomp`, and the quoted
+`"testschema"."testcomp"` form a `sql.Identifier` renders all reach the right
+oid, while `typname` stays unqualified as PostgreSQL keeps it. `DROP TYPE
+testschema.testcomp` is schema-aware and leaves the bare type standing.
+
+#### Added
+
+- Schema-qualified composite type names (`CREATE TYPE schema.name AS (...)`) are
+  stored and resolved per `(schema, name)`; a bare name and a schema-qualified
+  one with the same last part are distinct types.
+- `to_regtype` resolves a schema-qualified type reference in bare,
+  `schema.name`, and quoted `"schema"."name"` forms; a bare name resolves only
+  the `public` type (matching the default search_path).
+- `DROP TYPE schema.name` targets the schema-qualified type; `public.name`
+  normalises to the bare name.
+
+### CREATE SCHEMA
+
+`CREATE SCHEMA` and `DROP SCHEMA` are accepted now, tracked in the same
+`__sql_schemas__` catalog the Python server uses so the two agree on which
+schemas exist. Schema-qualified names already resolved by their last part —
+`s2.t` finds table `t` — so a table or type living in a schema works the moment
+the schema DDL is allowed.
+
+A duplicate is `42P06` (distinct from a table's `42P07` and a type's `42710`),
+a missing `DROP SCHEMA` is `3F000`, `IF NOT EXISTS` / `IF EXISTS` are no-ops on
+the wrong-existence case, and `CASCADE` is accepted (this server does not track
+which objects belong to a schema — names carry none — so it drops the schema
+record; the objects are dropped by name elsewhere).
+
+#### Added
+
+- `CREATE SCHEMA [IF NOT EXISTS]`, `DROP SCHEMA [IF EXISTS] … [CASCADE]`, with
+  PostgreSQL's error classes.
+
+### A series whose bounds are parameters
+
+`select * from generate_series(1, %s)` — the way clients actually write a series
+— was refused outright by the Rust PostgreSQL server. A bound parameter with no
+declared type arrives as text, and PostgreSQL resolves it against the function's
+own signature; this server saw text where it wanted an integer and said the
+feature was unsupported. Every parameterised series failed, which is most of
+them, and an explicit `%s::int4` failed too.
+
+A NULL bound is now an empty result rather than an error, matching PostgreSQL,
+where a series with any NULL bound produces no rows at all.
+
+The probe that established those two also caught the server being *more*
+permissive than PostgreSQL in one place: `generate_series(1, 3::float8)` has no
+matching overload there and is refused with `42883`, while this server truncated
+the bound to an integer and answered rows. Truncating an argument a real server
+rejects is a wrong answer, so it is now the same refusal.
+
+#### Added
+
+- Series bounds given as parameters, in every position, including a NULL bound.
+
+#### Fixed
+
+- `generate_series` with a `float8` bound truncated it instead of refusing.
+
+### Session settings on the Rust PostgreSQL server
+
+`SET`, `SHOW`, `RESET` and the `current_setting()` / `set_config()` functions
+now work, with the settings held per connection as PostgreSQL holds them. This
+was the largest remaining thing psycopg's test suite asked for, and the score
+moved from 853 to 899 of 4,238.
+
+Small details decide whether a client is satisfied here. `SHOW datestyle`
+answers a column named `DateStyle`, not `datestyle` — lookups ignore case but
+the reported name does not, and clients match on it. Asking for a setting that
+does not exist is an error, while asking with the "missing is fine" flag returns
+null instead. `RESET` restores a setting to its default rather than deleting it,
+so a client reading it back afterwards sees the default rather than an error.
+A fresh connection starts from the defaults, not from whatever the last one did.
+
+#### Added
+
+- `SET` / `SET LOCAL`, `SHOW`, `RESET`, `RESET ALL`.
+- `current_setting(name [, missing_ok])` and `set_config(name, value, is_local)`.
+- The settings a client expects to read before it has set anything:
+  `client_encoding`, `DateStyle`, `TimeZone`, `IntervalStyle`,
+  `standard_conforming_strings`, `integer_datetimes`, `transaction_read_only`,
+  `search_path`, `application_name`, `server_encoding`, `server_version`.
+
+### Set-returning functions where clients actually put them
+
+`select generate_series(1, 10)` — the function in the select list, with no
+`FROM` at all — now returns ten rows rather than an error. It is the shortest
+way to conjure rows without a table, and it is what client test suites reach for
+constantly; a server cursor over exactly that form was the single most common
+use in psycopg's.
+
+It is planned as an ordinary select over a generated source, which is the same
+shape the `FROM generate_series(...)` form already produced. That means ordering,
+limits and offsets came along for free rather than being written a second time
+for a second syntax that means the same thing.
+
+A set-returning function *beside* another output column — `select 1,
+generate_series(1,3)`, which repeats the constant across the generated rows — is
+refused rather than half-supported. It needs the other columns carried into each
+generated row, and a shape that silently dropped one would be worse than an
+honest refusal.
+
+Multiranges can also be sent as bound parameters in the binary format now. The
+layout is a count of ranges followed by each one in the *range's* own binary
+form, so it reuses the range decoder rather than restating the flags-and-bounds
+layout a second time and risking the two drifting apart.
+
+#### Added
+
+- `generate_series` in the select list of a `FROM`-less query, with aliases,
+  `ORDER BY`, `LIMIT` and `OFFSET`.
+- Multirange bound parameters in the binary wire format.
+
+### A parameter should not mean different things in different wire formats
+
+A client may send each parameter as text or in PostgreSQL's binary format, and
+picks per value — psycopg sends most things binary and falls back to text. The
+two are decoded by separate code here, and only the binary side had learned
+arrays, intervals and timestamps. Sent as text, those values fell through to a
+plain string, so `array[...] = %s` compared an array against a string and
+reported that it could not compare them. The message pointed at comparison; the
+cause was one layer earlier, in decoding.
+
+Both formats now produce the same value for the same declared type, and the
+mapping from an array type to its element type is shared between them, so they
+cannot drift apart again.
+
+The other half is subtler. A client may leave a parameter's type *unspecified*
+and let the server work it out — psycopg does this for lists and datetimes — and
+PostgreSQL then resolves it from whatever it is being compared to, exactly as it
+resolves an unquoted literal. That rule was already implemented for literals;
+extending it to parameters is what makes `'2026-01-01 12:00'::timestamp = %s`
+answer true rather than complain about comparing a timestamp to a string.
+
+#### Fixed
+
+- Array, interval, date, time and timestamp parameters sent in the text format
+  decoded to plain strings, so comparing one to a value of its own type failed.
+- A parameter whose type the client left unspecified was not resolved from the
+  operand beside it, though a literal in the same position was.
+
+### Rust pgserver: a timestamp drops a trailing time-zone offset
+
+PostgreSQL's `timestamp` (WITHOUT time zone) input accepts a trailing offset
+and drops it, keeping the wall-clock reading — `'2000-01-01 03:02:03+02'` is
+`2000-01-01 03:02:03`. The Rust server rejected the offset (`22007` / `22008`),
+which surfaced when psycopg dumps a tz-aware datetime that reaches the naive
+timestamp parser (its offset now reflects the session zone, so it can even be a
+second-precision `-01:02:03`).
+
+#### Fixed
+- `timestamp` input now accepts and drops a trailing `±HH[:MM[:SS]]` offset,
+  matching PostgreSQL.
+
+### Rust pgserver: infinity, epoch and out-of-range dates
+
+PostgreSQL's date and timestamp domain is far wider than a Python `date` or
+`datetime`: `infinity` / `-infinity` are real values, and so are years past
+9999 and dates BC. The Rust PostgreSQL server now accepts all of them —
+storing the canonical text and letting the client's loader decide what it can
+hold, exactly as a real server does (psycopg's overflow tests want the "date
+too large" the loader raises, not a server error). A wide-year or BC plain
+`timestamp` is rendered the way PostgreSQL renders it, with the time
+canonicalised to `HH:MM:SS`. The one constant special input keyword, `epoch`,
+now resolves to `1970-01-01 00:00:00`.
+
+#### Added
+- `infinity` / `-infinity`, years > 9999, and BC dates are accepted on `::date`
+  and `::timestamp` casts and passed through as canonical text.
+- `'epoch'::timestamp` resolves to `1970-01-01 00:00:00`.
+
+#### Fixed
+- A wide-year (> 9999) or BC date no longer errors on the Rust pgserver; a
+  datetime-shaped value with an impossible field is `22008` and a non-date is
+  `22007`, matching PostgreSQL.
+
+### Rust pgserver: timestamptz columns
+
+`timestamptz` is a real column type now. It is stored as a UTC INSTANT — the
+same date-plus-microsecond-companion carrier a `timestamp` uses — and rendered
+in the session's zone on the way out, so the same stored instant reads back
+correctly under any `SET timezone` rather than in whichever zone happened to
+write it. This closes a deliberate refusal that had stood because storing
+session-rendered text was a wrong answer for every other session.
+
+Making it correct end to end also meant the server now reports GUC changes:
+after a `SET`, it emits a `ParameterStatus` for the variables PostgreSQL marks
+GUC_REPORT (`TimeZone`, `DateStyle`, `client_encoding`, …). libpq and psycopg
+track the session `TimeZone` from that message and re-express a timestamptz in
+it — without the report a stored instant displayed in the client's stale
+startup zone.
+
+#### Added
+- `timestamptz` column type (oid 1184): UTC-instant storage, session-zone
+  rendering, sub-millisecond precision, and the `::timestamptz::text` cast.
+- `ParameterStatus` reports for GUC_REPORT variables on `SET` / `RESET`.
+
+### Timestamps that know their time zone
+
+`timestamptz` is not a timestamp with an offset stapled to it. It is an instant,
+and what you see is the session's view of that instant — so the same stored
+value prints as `12:00+01` in Rome and `06:00-05` in Chicago, and the same
+literal read under two zones names two different moments. The Rust PostgreSQL
+server now supports it, along with `timetz`, `SET TimeZone` for both fixed
+offsets and named IANA zones, and the `regtype` that `pg_typeof` had already
+been answering with.
+
+Two sign conventions meet in this type and they run in opposite directions.
+In `SET TimeZone TO '+02:00'` the sign is POSIX: positive means *west* of
+Greenwich, so that setting renders timestamps as `-02`. In a literal like
+`'2026-01-01 12:00+02'` the sign is the ordinary one, two hours *east*. Both
+were measured against a live PostgreSQL rather than reasoned out, because
+getting either backwards is completely invisible under UTC and wrong by hours
+everywhere else.
+
+Named zones carry their daylight-saving rules, so `2026-01-01 12:00` and
+`2026-07-01 12:00` resolve to different offsets in `Europe/Rome` and to the same
+one under a fixed `+02:00`. Offsets may also carry minutes and seconds:
+`+01:02:03` is a real offset that appears in client test suites, and a comment
+in this work asserting otherwise was contradicted by the first probe that looked.
+
+#### Added
+
+- `timestamptz` and `timetz`, as casts, literals and bound parameters in both
+  wire formats, with their own type oids.
+- `SET TimeZone` for fixed offsets (`'+02:00'`) and named IANA zones
+  (`'Europe/Rome'`), including daylight-saving rules.
+- `regtype` as a cast target: `'int4'::regtype` is `integer`.
+- Offsets with minute and second precision.
+
+#### Fixed
+
+- A doc comment that had come adrift from the function it described.
+
+#### Changed
+
+- A `timestamptz` or `timetz` *column* is now refused rather than accepted. The
+  types are stored as canonical text, and a timestamptz renders in the session's
+  zone — so a row written under UTC read back under another zone showed the right
+  instant with the wrong wall clock and the wrong offset, which no client could
+  detect. They remain available everywhere they are a value rather than storage.
+
+### A transaction you can see, and a failed one that says no
+
+Every connection to the Rust PostgreSQL server reported itself as idle. Inside a
+transaction, after a failed statement, in the middle of a block — always idle.
+The status rides on the message that ends every statement rather than being
+something a client selects, so nothing in a row comparison could ever see it,
+and clients that steer on it were steering blind.
+
+The half that was more than cosmetic: PostgreSQL aborts a transaction block at
+the first error and refuses everything after it until the block ends. This
+server carried on. A client that shrugged off a mid-transaction error went on
+writing and committed work PostgreSQL would have discarded — a wrong answer,
+not a missing feature. Statements after an error in a block now get `25P02`
+until the block ends, and a `COMMIT` there is a rollback that says `ROLLBACK` in
+its command tag, exactly as PostgreSQL's does.
+
+Two smaller spellings came along: `START TRANSACTION` answers with its own
+command tag rather than `BEGIN`'s, and `COMMIT AND CHAIN` / `ROLLBACK AND CHAIN`
+open the next block immediately instead of leaving the connection idle — a
+client that chained was previously left autocommitting its next statements one
+at a time.
+
+#### Added
+
+- `AND CHAIN` on `COMMIT` and `ROLLBACK`.
+- `START TRANSACTION`'s own command tag.
+
+#### Fixed
+
+- Every connection reported `IDLE` whatever the transaction state.
+- Statements after an error inside a transaction were executed rather than
+  refused with `25P02`, and a `COMMIT` of a failed block reported `COMMIT`.
+
+### Rust pgserver: transaction settings psycopg reads
+
+psycopg reads a handful of transaction GUCs to learn a connection's defaults,
+and the Rust PostgreSQL server answered `42704` (unrecognized parameter) for
+all of them, which failed a swathe of cursor and connection tests before they
+could begin. The server now reports the fixed values a single-node server
+gives: `max_prepared_transactions` is `0` (no two-phase commit),
+`transaction_isolation` / `default_transaction_isolation` are `read committed`,
+and `transaction_deferrable` / `default_transaction_read_only` are `off`.
+
+#### Added
+- `SHOW` / `SET` recognise `max_prepared_transactions`,
+  `transaction_isolation`, `default_transaction_isolation`,
+  `transaction_deferrable` and `default_transaction_read_only`.
+
+### The Rust PostgreSQL server enforces UNIQUE
+
+`CREATE TABLE t (tag text UNIQUE)` was accepted and then ignored: the
+constraint was recorded nowhere and a second equal value inserted where
+PostgreSQL answers `23505`. That is worse than a missing feature. A refusal
+is honest and you meet it on the first run; this let a user believe a
+uniqueness guarantee the server was not providing, and the duplicates were
+already stored by the time anyone noticed.
+
+Enforcement is a storage unique index rather than a check before each write,
+because a probe read cannot see a value another transaction committed after
+the writer's snapshot, nor one a second writer is inserting right now — so
+WiredTiger arbitrates instead. SQL NULLs stay distinct, as SQL requires: the
+index carries a partial filter excluding NULL from every column, which a
+`sparse` index would not achieve, because a SQL NULL is stored as an explicit
+null rather than a missing field.
+
+The error surface was measured against PostgreSQL 14.13 — the constraint
+PostgreSQL would have generated (`<table>_<column>_key`, or the declared name),
+and `DETAIL: Key (a, b)=(1, 2) already exists.` for a multi-column one.
+
+#### Added
+- `secantus-pgplan`: column-level and table-level `UNIQUE`, with PostgreSQL's
+  constraint-name generation and `DEFERRABLE` / `INITIALLY DEFERRED`.
+- `secantus-pgcatalog`: `UniqueConstraint`, in the Python server's on-disk
+  shape key for key, so a table created by one server reads back in the other.
+
+#### Fixed
+- `secantus-pgserver`: an `UPDATE` that violated any unique constraint —
+  including the pre-existing `PRIMARY KEY` one — surfaced as `could not
+  update: E11000 duplicate key error on index ...`, leaking the MongoDB
+  persona through the PostgreSQL one with no SQLSTATE a client could branch
+  on. Both write paths now render PostgreSQL's `23505`.
+- `secantus-pgplan`: `DEFERRABLE` attached to the most recent FOREIGN KEY
+  regardless of what it actually qualified, so `UNIQUE ... DEFERRABLE` would
+  have marked an unrelated foreign key deferrable.
+
+### Rust pgserver: uuid binary parameters
+
+A `uuid` sent as a BINARY parameter (16 raw bytes, oid 2950 — psycopg's default
+for a Python `UUID`) is now decoded to its canonical lowercase text, the same
+value the text path stores. Previously only the text form was accepted, so a
+bound `UUID` failed with `binary parameters of type oid Some(2950) are not
+supported`.
+
+#### Added
+- Binary decode of `uuid` (oid 2950) parameters.
+
+### Rust pgserver: uuid, and timetz columns
+
+The Rust PostgreSQL server now supports `uuid` — as a cast, a bound value, and
+a real column type. Any spelling PostgreSQL accepts (uppercase, surrounding
+braces, no hyphens, or hyphens at the standard group boundaries) canonicalises
+to lowercase `8-4-4-4-12`, and the column reports its true oid (2950) so a
+client hands back a `UUID` object rather than a string. A malformed uuid is
+`22P02`, matching PostgreSQL.
+
+`timetz` also works as a column now. Unlike `timestamptz` — whose text is
+session-relative and which stays refused until its stored form is an instant —
+a `timetz` offset is literal (`12:34:56+02` renders the same under any zone),
+so its canonical text is a safe column.
+
+#### Added
+- `uuid` cast, bound value, and column type (oid 2950), with PostgreSQL's
+  input leniency and `22P02` on malformed input.
+- `timetz` as a column type (oid 1266), stored as canonical text.
+
+### Errors the Rust server lost, or answered as a value, inside a pipeline
+
+Four defects, found by probing outward from the required-argument fix and all
+measured against mongod 8.2.11.
+
+**`$group` and friends discarded every named error.** `group.rs`, `fill.rs`,
+`densify.rs` and `windowfields.rs` typed their errors as `Result<T, ()>`, so an
+error the expression engine had already named was thrown away at the module
+boundary and the client got the generic refusal instead:
+
+```
+{$group: {_id: null, x: {$first: {$ln: 0}}}}
+    mongod  28766 $ln's argument must be a positive number ...
+    before  2     aggregation pipeline uses a stage or operator not supported
+```
+
+Carrying `Fallback` lets a named error through; `Fallback::Defer` is the same
+"cannot reproduce this" signal the unit `()` was, so all 57 existing sites keep
+their exact behaviour. A parse error is reported **bare** here, which mongod does
+inside `$group` / `$expr` / `$redact` and which the new `Fallback::bare()` marks.
+
+**`$sortByCount` rejected every expression.** An unconditional early match arm
+answered 40147 for any document argument, shadowing a later arm seventy lines
+below that already implemented mongod's three codes correctly.
+`{$sortByCount: {$add: ["$n", 1]}}` is valid and now works.
+
+Removing the shadowing arm was only half the rule, and the 740-shape stage-spec
+probe caught the other half: a document is an EXPRESSION only when its **first
+key is `$`-prefixed**, so `{a: 1}` and `{a: {$add: [...]}}` are literal documents
+and get 40147 like `{}` does. Without that they fell through to the engine and
+deferred.
+
+**`$arrayElemAt` answered `null` for a non-numeric index** — a silent wrong
+value. Only `bool` was checked, so `{$arrayElemAt: [[1, 2], "x"]}` came back as
+`null` where mongod raises 28690 naming the type. Measured across 19 index
+shapes: `null` and a missing field really are null, every numeric works
+(**including `Decimal128`**, which was rejected), and everything else is 28690.
+"Representable as a 32-bit integer" is also enforced now, so a whole `1e40` is
+28691 rather than a missing field.
+
+**`$divide` and `$mod` by zero deferred**, each with a comment justifying it by
+what "Python raises" — the shape `CLAUDE.md` catalogues, and wrong here because a
+defer has no Python behind it. They now answer mongod's `2 can't $divide by zero`
+and `16610 can't $mod by zero`.
+
+#### Measured
+
+`$group` / `$bucket` / `$sortByCount` over twelve named-error expressions plus
+four valid `$sortByCount` forms: **31 of 40 matching, from 18 of 36**.
+`$arrayElemAt` index types: **0 divergences of 19**, and the 740-shape
+aggregation stage-spec probe goes to **0 divergent** (it was the only probe of
+twelve still reporting one). The 6,628-case expression
+corpus is unchanged at 38 different-code divergences with 0 wrong values and no
+regressions (it does not cover these shapes, which is why they survived so long).
+
+#### Fixed
+
+- `secantus-core`: `group` / `fill` / `densify` / `windowfields` carry `Fallback`;
+  `Fallback::bare()` for parse errors mongod sends unwrapped; `$arrayElemAt`
+  index typing and int32 range; `$divide` / `$mod` by zero named.
+- `secantus-commands`: the shadowing `$sortByCount` arm removed; a bare error is
+  no longer given a pipeline wrapper.
+- `secantus` (the PYTHON server): the same `$arrayElemAt` index rules — it had
+  the identical silent-null defect, and rejected a decimal index too.
+
+### BOTH servers answered a value where mongod rejects the expression
+
+`{$regexMatch: {}}` returned **`false`**. `{$filter: {}}` returned `null`. So did
+`{$trim: {}}`, `{$reduce: {}}`, `{$map: {}}` and `{$dateAdd: {}}` — cases where an
+operator was missing a REQUIRED argument and the server answered a value a caller
+can branch on, from an expression mongod refuses to run at all.
+
+**Both servers had it**, and the PYTHON one was worse: 31 of its 57 cases were
+silently wrong against the Rust server's 25. That only came to light because the
+Rust fix turned the parity suite red — parity is equally satisfied by both
+engines being wrong, and here they had been. The fix moves both to mongod's
+answer rather than moving either to the other.
+
+The cause is the missing-vs-null conflation `CLAUDE.md` catalogues: the
+operators read their required fields with the evaluator's optional-field helper,
+which reports an absent key as null. `{$trim: {input: null}}` really is legal and
+really does yield null — only an ABSENT key is an error — so the fix tests key
+presence, never the value.
+
+A further thirty-two cases answered the generic
+`2 BadValue: aggregation pipeline uses a stage or operator not supported by the
+Rust server`, which blamed the operator when the argument was at fault.
+
+#### The rules, all measured against mongod 8.2.11
+
+- Every `(operator, missing field)` pair has its **own** code and wording, and
+  they are not derivable from a pattern: `$filter` says
+  `Missing 'input' parameter to $filter` (28648) where `$reduce` says
+  `$reduce requires 'input' to be specified` (40077), and `$replaceAll`'s three
+  fields descend 51749 / 51748 / 51747 as you read them left to right. Hence a
+  table of 40 measured pairs.
+- **An UNKNOWN argument outranks a missing one.** `{$trim: {k: 1}}` is
+  `50694 $trim found an unknown argument: k`, and so is
+  `{$trim: {input: "a", k: 1}}`. The operators already emit those correctly, so
+  the new check stands aside whenever a key is unrecognised. The corpus caught
+  this: a first version got the precedence backwards and traded twenty fixed
+  cases for twenty broken ones at an unchanged total.
+- **The stage decides the wrapper.** A parse error from `$addFields` /
+  `$project` / `$set` is wrapped `Invalid <stage> :: caused by :: …`; the same
+  error inside `$match`'s `$expr` is BARE. So validation runs per stage, where
+  the stage name is known, mirroring mongod's own parse-time check.
+- `$switch` with `branches: []` and `$zip` with `inputs: []` get the same code
+  as omitting the field entirely.
+
+#### Measured
+
+Both servers at **0 divergences of 57** — from 57 with 25 silently wrong (Rust)
+and 57 with 31 silently wrong (Python). The 6,628-case expression corpus improves
+from 58 different-code divergences to **38**, with 0 wrong values and no
+regressions. Parity: 730 tests, and the `$zip` fuzz now asserts that a named
+error matches between engines rather than tripping over one.
+
+#### Fixed
+
+- `secantus-core`: `check_required_fields` + `validate_expression_args`, gated
+  on `all_fields_recognised` so unknown-argument errors keep precedence. The
+  field-value dispatch path (`$cond` / `$switch` / `$let` / `$ifNull`, which
+  bypasses `apply_op`) validates too.
+- `secantus-commands`: `validate_stage_expr_args` applies mongod's per-stage
+  wrapper at parse time.
+- `secantus` (the PYTHON server): the same table in `expressions.py`, reported
+  through `aggregate.py`'s existing parse-time scanner so it picks up the
+  `Invalid $<stage> :: caused by ::` wrapper that machinery already knew about.
+
+#### Known gap
+
+`$group` still answers the generic refusal for these and for errors that were
+already named elsewhere (`$ln: 0`'s 28766): `group.rs` types its module as
+`Result<T, ()>` and discards the error. Pre-existing and independent; filed in
+`tasks/backlog.md`.
+
+### Both servers answer mongod's argument errors, and the range operators bracket by type
+
+A measured sweep of both servers against mongod 8.2.11 found the same shape of
+bug over and over: an operator that works perfectly well was refusing, or
+silently mis-answering, a *bad argument*. The Rust server had the worse version
+of it — with no Python engine behind it, any refusal it could not name reached
+the client as "not supported by the Rust server", so `{$round: ["$n", 1.5]}`
+reported that the server cannot do `$round`.
+
+#### Fixed
+
+- **Range operators are type-bracketed.** `{v: {$gt: 3}}` matches numbers
+  greater than 3 and nothing else. Only three brackets were enforced, so a
+  collection holding a `MaxKey` returned that document for *every* `$gt` query.
+  96 of 112 probed (bound, operator, collation) shapes disagreed with mongod;
+  all 112 now agree. A `MinKey` / `MaxKey` **bound** remains the one exception
+  and compares across every type.
+- **A JavaScript value is not a string.** `bson.Code` subclasses `str`, so it
+  took the string type rank, sorted among the strings, and matched a string
+  bound. Being unhashable, it also crashed the cached collation key, so an
+  ordinary collated sort over a collection holding one answered `internal
+  server error`. mongod ranks JavaScript between Regex and MaxKey, and it now
+  sorts there — in the in-memory comparator *and* in the persisted index-key
+  encoder, which had to move together or an index would change the sort answer.
+
+#### Storage format
+
+- **Index entries are `entryFormat` 3.** Giving JavaScript its own type rank
+  shifts MaxKey's rank byte from 13 to 14, so every index key for a JavaScript
+  or MaxKey value changes. A store written by an earlier build is refused at
+  open rather than read back in the old order; there is no migration, as with
+  the two format bumps before it. Start from a fresh data directory, or drop and
+  recreate the indexes.
+- **`$round` / `$trunc` validate their precision** the way mongod does — three
+  ordered checks with three different codes. A fractional `Decimal128`, an
+  out-of-int32 integer, a string and a bool were all silently accepted:
+  `{$round: ["$n", -25]}` answered `0.0`.
+- **`$indexOfArray` has its own error codes** (9711600 / 9711601), and a
+  negative index is an error rather than a clamp — `{$indexOfArray: [[1,2,3],
+  3, -1]}` answered `2`.
+- **`$toDouble` follows C's `strtod`.** It accepts the hexadecimal spellings
+  mongod accepts (`"0X1f"` is 31.0) and reports an unrepresentable magnitude as
+  an error rather than saturating (`"1e400"` answered `inf`). The `"0x"` gate is
+  the literal lower-case prefix mongod uses, not a case- and sign-insensitive
+  one.
+- **`$toObjectId`** names the offending character when the length is right,
+  instead of reporting "expected 24 but found 24".
+- **`$dateToString`'s format language is not `strftime`.** mongod accepts
+  exactly `%b %d %j %m %u %w %z %B %G %H %L %M %S %U %V %Y %%` and refuses the
+  rest; a typo'd `%a` used to render a value instead of erroring. `%z` and `%Z`
+  were empty and are now the offset (`+0000`) and the offset in minutes (`0`),
+  and month names no longer come from the machine's locale.
+- **`$toUpper` / `$toLower` / `$strcasecmp` map ASCII only**, and `$trim`'s
+  default strips mongod's fixed 20-code-point table. Python's Unicode case
+  folding turned `"straße"` into `"STRASSE"` where mongod answers `"STRAßE"`.
+- **A regex as the bound of a range operator or `$ne`** is refused at parse
+  time, where an empty result set used to hide the malformed query.
+- **`$range` with a zero step**, and the domain guards on `$sqrt` / `$ln` /
+  `$log10` / `$log` / `$pow`, carry mongod's codes.
+
+#### Changed
+
+- The Rust engines share one `Fallback` type that can carry a mongod error, so
+  a refusal reaches the client verbatim instead of collapsing into a generic
+  "not supported". The command layer picks mongod's constant-folding wrapper by
+  where the failure came from, and `StorageError` gained the matching variant
+  for query-side refusals.
+- The six `$toX` conversion shorthands now route through one `$convert`
+  implementation on the Rust side, as they already did in Python. They had
+  drifted: `$toBool` and `$convert {to: "bool"}` disagreed on the empty string
+  inside a single engine, `$toObjectId` was not registered at all, and the
+  numeric ones still deferred on a string source.
+
+### `$stdDevPop` / `$stdDevSamp` work in expression position on the Rust server
+
+The `$group` **accumulator** forms shipped long ago; the **expression** forms — over an array argument in `$project` / `$addFields` — never did. All 56 shapes in the probe corpus answered "operator not supported by the Rust server" where mongod computes a number, and on the standalone server that is an error, not a fallback.
+
+They share `group::std_dev` with the accumulators, so the two forms cannot answer different numbers, and drop non-numeric members exactly as the accumulators do: mongod counts int / long / double / decimal and silently skips bool, null, string, array and document.
+
+`tools/probes/agg_expressions.py` against the Rust server: **981 → 925**, still zero wrong values.
+
+#### Also recorded
+
+Analysing the remaining defers turned up that **116 of them were valid input being refused** — mongod answers and the Rust server errors. 56 were these; the other 60 are almost all a **Decimal128 operand reaching a math operator**, declined with comments reading "→ Python" on a server that has no Python. In practice a collection holding Decimal128 values cannot use most math operators there. Recorded in `tasks/backlog.md` with what a fix would need.
+
+### An ObjectId or Timestamp is a date on the Rust server too
+
+mongod accepts every BSON type that **carries** a timestamp wherever a date is expected — a Date, an ObjectId (its 4-byte generation time) or a Timestamp (its seconds field) — and treats a one-element array as the argument itself. So `{$year: ObjectId("64b7f9a2…")}` answers `2023`.
+
+The Rust engine deferred on all of them, and a defer on the standalone server is an **error**: 13 shapes refused input mongod answers. The Python engine took this fix in the previous change; this is the port.
+
+`tools/probes/agg_expressions.py` against the Rust server: **925 → 912**, still zero wrong values.
+
+#### Also scoped
+
+The remaining valid-input refusals are **38 operators declining a `Decimal128` operand** — the whole math, comparison and conversion family — each with a comment reading "→ Python" on a server that has no Python. In practice a collection holding `Decimal128` values cannot use most math operators there.
+
+`tasks/backlog.md` now carries the scoping rather than a guess: `decimal.rs` already represents sign / coefficient / exponent with `add`, `mul`, `div_int` and `trunc_to_i64`, so about **19 of the 38 are reachable with what exists** (`$abs` is a sign flip, `$subtract` is `add` negated, the comparisons need one `cmp`). The other ~17 are transcendental and need real decimal math. It is 19 individually-probed operators, not one change — result type, precision and overflow all differ per operator.
+
+### The Rust engine ignored `TZ` on Windows, and no CI lane could see it
+
+`$toLower` / `$toUpper` of a `Timestamp` is the one conversion mongod renders in
+the server process's *local* time. The Rust engine resolved that zone through
+`chrono::Local`, which on Windows reads `GetDynamicTimeZoneInformation` and
+ignores the `TZ` environment variable entirely — so a server started with
+`TZ=UTC` on a `Europe/London` host rendered summer instants an hour late, while
+mongod and the pure-Python evaluator both answered UTC. The two SecantusDB
+servers disagreed with each other and one of them disagreed with mongod.
+
+Three independent things hid it. GitHub's Windows runners are UTC, where the
+host zone and `TZ=UTC` coincide; the Windows test lane has no `_secantus_core`,
+so the test that would have caught it skipped; and the `storage-engine` job runs
+only three smoke files. It took building and running on a non-UTC Windows box in
+July to surface — London *is* UTC in winter, so three of the four instants in
+the existing corpus agree even with the bug present.
+
+The fix routes the Windows render through the MSVC CRT (`_tzset` +
+`_localtime64_s`), which is the same function mongod and CPython's
+`time.localtime` reach. That is exact by construction rather than an emulation
+of the CRT's `tzn[+|-]hh[:mm[:ss]][dzn]` grammar — a grammar that is *not* the
+IANA one, and observably so: measured against mongod 8.2.11 on Windows 11,
+`TZ=America/New_York` parses as a zone name with a zero offset plus a daylight
+rule, so mongod answers UTC+1 in July, not New York's UTC-4. Unix keeps
+`chrono::Local`, which already matched.
+
+#### Fixed
+
+- `crates/secantus-core`: `$toLower` / `$toUpper` of a `Timestamp` now honours
+  `TZ` on Windows, matching mongod and the Python engine. New
+  `expressions::render_local_asctime` splits the render per platform; the
+  Windows half calls the CRT via a `cfg(windows)` `libc` dependency.
+
+#### Added
+
+- `tests/test_mongod_differential.py`: `test_timestamp_local_render_matches_mongod`
+  spawns a mongod per zone and compares both engines against it, with no
+  hardcoded expectations — so unlike the sibling unit test, which pins
+  Unix-measured values and must skip zone-shifted cases on Windows, it needs no
+  platform skip and asserts whatever the local mongod actually does. The engine
+  is a parameter, so the Rust half is a visible skip where that extension is
+  absent rather than a silent one.
+- `tests/test_mongod_differential.py`: `_start_mongod` factors the spawn,
+  readiness poll and port-race guard out of the module fixture, so cases that
+  need a differently-configured server reuse them instead of re-deriving them.
+
+### `$toDate` rejected every timestamp carrying milliseconds
+
+Chasing the error *message* for an unparseable date string turned up a much
+larger bug behind it: `parse_iso` required exactly 19 characters before a `Z`, so
+**every ISO timestamp with a fractional second failed** — `2020-01-01T00:00:00.123Z`,
+the ordinary form for a BSON date. It came back as an error on the Rust server
+where mongod parses it.
+
+Measured against mongod 8.2.11 and now reproduced: a fractional second takes 1..n
+digits and is **truncated to milliseconds** (`.1` is 100 ms, `.1234567` is 123),
+with or without a `Z` or a `±HH:MM` offset. `YYYY-MM` is the first of that month;
+a bare `YYYY` is not a date at all.
+
+#### The error surface, too
+
+A failed parse used to return `Conv::Failed`, which on this server surfaces as
+`2 BadValue: aggregation pipeline uses a stage or operator not supported by the
+Rust server` — **false**, since `$toDate` is supported and the string was at
+fault, and a different code from mongod's `241 ConversionFailure`. It now carries
+241 always, with mongod's exact text for the two reproducible shapes: an empty
+string names a literal NUL, everything else gets the incomplete-string message.
+
+**Whitespace-only is not empty** for mongod — `''` is "Empty string" but `'  '`
+is the incomplete message — which the Python server had backwards because it
+tested the *stripped* text. Fixed on both servers.
+
+#### Still not reproduced, and now shared rather than divergent
+
+mongod's per-position timelib diagnostic (`'abc'` names the offending character
+and where its scanner stopped) needs timelib's own lexer, its timezone
+abbreviation tables and its per-position error accumulation. Both servers give
+the same message instead, so they agree with each other while the gap stays
+documented.
+
+#### Measured
+
+34 strings: **18 exact, 16 message-only, 0 with a wrong value or code** — from 0
+exact with all 25 failure cases carrying the wrong code. Rust and Python agree on
+23 of 23 failure strings.
+
+### The Rust server names an unknown expression operator
+
+Nine of thirteen measured shapes came back as
+`2 BadValue "aggregation pipeline uses a stage or operator not supported by the
+Rust server"` — which told the client the server could not do `$addFields`, when
+what it could not do was the unrecognised operator inside it. A `Fallback::Defer`
+has no Python behind it on the standalone server, so it reaches the client as
+that blanket refusal.
+
+#### Fixed
+
+- An unknown operator in `$addFields` / `$set` / a nested `$project` position
+  now answers `168 Invalid $<stage> :: caused by :: Unrecognized expression
+  '$x'`, and in `$group` / `$replaceWith` / `$match`'s `$expr` the same `168`
+  with no envelope — both mongod's.
+- A nested unknown inside `$project` answered `31325` (the projection parser's
+  code) because the check recursed. mongod uses `31325` only for the top-level
+  value of a `$project` field; anything deeper is `168`.
+- `codeName` for code 168 is now `InvalidPipelineOperator` rather than
+  `Location168`.
+
+Both servers are now 0 of 13 divergent on
+`tools/probes/unknown_expression_errors.py`.
+
+### Update errors the Rust server named wrongly, or not at all
+
+Two defects, measured against mongod 8.2.11.
+
+**`$inc` / `$mul` with a non-numeric operand carried a wrapper mongod does not
+send.** mongod has two shapes for the same code 14 and wraps only one:
+
+```
+{$inc: {n: "x"}}    operand bad, readable from the spec
+    mongod  Cannot increment with non-numeric argument: {n: "x"}
+    before  Plan executor error during update :: caused by :: Cannot increment ...
+
+{$inc: {s: 1}}      stored field bad, needs the document
+    mongod  Plan executor error during update :: caused by :: Cannot apply $inc ...
+```
+
+`arith_type_error` now returns `(message, exec)` and the storage layer threads
+it through, instead of hard-coding every code 14 as execution-time.
+
+**`$position` / `$slice` / `$bit` with a bool argument answered the generic
+refusal.** The guards were already there and the code (2) was already right —
+they simply deferred, which on this server reads as "the operator is not
+supported" when the argument was at fault. `$position` and `$slice` are worded
+*differently* by mongod ("not of type:" vs "but was given type:"), so each is
+measured rather than shared.
+
+#### Also: two backlog entries were stale
+
+The query matcher's three "still deferred where faithful" residuals — an
+exotic-text value under a collation, an exotic type range-compared inside an
+array, and a `Decimal128`-valued `$mod` field — all **match mongod now** (0 of 6
+shapes). Both entries are marked resolved rather than left advertising finished
+work as remaining.
+
+#### Fixed
+
+- `secantus-core`: `arith_type_error` reports which of mongod's two wrappers
+  applies; `$position` / `$slice` / `$bit` bool arguments carry mongod's text.
+- `secantus-storage` / `-storage-adapter`: the `exec` flag is threaded instead of
+  assumed.
+
+### The Rust server stores the zero you asked it to store
+
+`{$set: {a: -0.0}}` over a stored `0.0` was silently dropped by the Rust
+server. Its storage write guard asked `new != doc`, and Rust's `f64 ==` calls
+the two zeros equal, so the write was skipped: `nModified` came back 0, no
+oplog entry was emitted, no change-stream event fired, and reading the document
+back gave the old zero. The value the caller asked to store was never stored,
+and nothing reported a problem. The Python server was fixed for this a release
+ago; the Rust storage layer kept the bare comparison, and nothing covered it —
+the parity suites pin the pure operator engines, not storage.
+
+The same batch closes the two ways the Rust server misdescribed an update it
+refused. An `$inc` or `$mul` past int64 could only defer, and a defer has no
+Python engine behind it on the Rust server, so five real overflow shapes told
+the client `query uses a construct the Rust server does not support` — which
+says the server cannot do `$inc`, when it can and it was the result that did
+not fit. Separately, every execution-time update error came back bare: mongod
+reports the failures that depend on the stored document under
+`Plan executor error during <command> :: caused by ::` and leaves the parse
+errors readable from the update spec alone unwrapped, and the Rust server had
+the message bodies right and the wrapper on none of them.
+
+All three were measured against mongod 8.2.11, and the Rust server now matches
+it on every shape in the sweep that the Python server matches.
+
+#### Fixed
+
+- `secantus-storage`: an update whose only difference is the sign of a zero is
+  stored and counted, instead of being silently skipped. The write guard is now
+  `secantus_core::diff::doc_changed`, which falls back to the encoded BSON when
+  `==` says the documents match — the same rule `storage._doc_changed` applies
+  on the Python server, rather than a third copy of it.
+- `secantus-core`: an `$inc` / `$mul` that overflows int64 reports mongod's
+  `Failed to apply $inc operations to current value ((NumberLong)…) for
+  document {_id: …}` (code 2) instead of a generic "not supported".
+- `secantus-core` / `secantus-storage` / `secantus-commands`: execution-time
+  update errors carry mongod's `Plan executor error during <command> :: caused
+  by ::` wrapper, with the command name interpolated (`update` and
+  `findAndModify` report their own), and parse-time errors stay bare. Ten
+  wrapped and seven bare shapes probed against 8.2.11.
+
+### The same upsert, run twice, inserted two documents
+
+On the Rust server, an upsert whose filter used a **dotted equality** stored a
+document with a literal dotted key. `update({"a.b": 5}, {$set: {z: 1}},
+upsert: true)` inserted `{"a.b": 5, "z": 1}` — a document mongod cannot produce,
+and one that does not match the query that created it. So running the *same*
+upsert again inserted a *second* document. An idempotent upsert is the canonical
+use of the feature, and it was silently broken: no error, just a growing pile of
+near-duplicate rows. mongod builds the nesting, storing `{a: {b: 5}}`, and
+matches it on the next call.
+
+The Python server has used a path-aware seed here since it hit the same bug; the
+Rust port kept a plain insert. This is the "user-supplied path used as a dict
+key" shape the project's own notes call out, and it is the third instance of it.
+
+The same batch gives the Rust upsert mongod's field order. mongod emits `_id`
+first, then the fields seeded from the query, then the fields the update added,
+sorted by name; the Rust path had no ordering at all and emitted them in
+insertion order. BSON field order travels on the wire and drivers compare raw
+bytes, so this was visible to clients. Deliberately *not* imitated: mongod's
+order for the query-seeded fields is an internal hash order that varies between
+runs for identical input, so both servers sort those instead — an approximation
+the Python server already made, and one the two servers now share exactly.
+
+#### Fixed
+
+- `secantus-storage`: an upsert seeded from a dotted equality builds the nested
+  document mongod builds, so the upserted document matches its own filter and the
+  operation is idempotent again.
+- `secantus-storage`: an operator upsert emits mongod's field order (`_id`, the
+  query-seeded fields, then the update-added ones sorted by name); a replacement
+  upsert keeps the document's own order.
+- `secantus-storage`: the leftover `any(k.starts_with('$'))` form test that
+  selects the oplog entry's shape now uses the shared `is_operator_form`
+  predicate, so it cannot drift from the engine's rule.
+- `secantus-core`: `update::set_document_path` is the public, properly-typed way
+  to build a dotted path, replacing a bare `Result<(), ()>` on the crate surface.
+
+### `rustls` bumped past RUSTSEC-2026-0285
+
+#### Fixed
+
+- `rustls` moved to 0.23.45 (from 0.23.40 / 0.23.43, depending on the lockfile)
+  across all four Cargo lockfiles that carry it, clearing RUSTSEC-2026-0285 —
+  TLS 1.3 handshake messages incorrectly accepted across encryption level
+  boundaries, medium severity, fixed in 0.23.45. `rustls-webpki` came along to
+  0.103.15.
+
+### Schema-qualified RANGE and ENUM types are distinct types
+
+`CREATE TYPE testschema.testrange AS RANGE (...)` on the Rust PostgreSQL server
+now creates a type genuinely distinct from a bare `testrange` in `public`,
+matching PostgreSQL. Previously a schema-qualified `CREATE TYPE ... AS RANGE`
+(and `AS ENUM`) resolved to its last name part, so `testschema.testrange`
+collided with `testrange` and the second `CREATE` failed `42710 type already
+exists`.
+
+This mattered beyond one CREATE: psycopg's session-scoped range fixture creates
+`testschema.testrange` beside a bare `testrange` in one script, so the collision
+failed the fixture and cascaded to every range test. With the two types now
+coexisting, `RangeInfo.fetch` resolves each name to its own type — bare
+`testrange`, `testschema.testrange`, and the quoted `"testschema"."testrange"`
+form a `sql.Identifier` renders all reach the right oid, each carrying its own
+subtype, while `typname` stays unqualified. `DROP TYPE testschema.testrange` is
+schema-aware and leaves the bare type standing. The same fix is applied to
+`CREATE TYPE ... AS ENUM`, which had the identical last-part-only bug.
+
+#### Fixed
+
+- Schema-qualified `CREATE TYPE s.t AS RANGE` / `AS ENUM` no longer collides
+  with a bare `t`; the two are distinct types, stored and duplicate-checked per
+  `(schema, name)` with a schema-qualified catalog `_id`. `CreateRange` and
+  `CreateEnum` thread the schema qualifier through the planner instead of
+  dropping it, mirroring the composite-type template.
+- `to_regtype` resolves a schema-qualified range or enum reference in bare,
+  `schema.name`, and quoted `"schema"."name"` forms; a bare name resolves only
+  the `public` type (matching the default search_path). `DROP TYPE schema.name`
+  targets the schema-qualified type; `public.name` normalises to the bare name.
+
+### Rust PostgreSQL server: WITH HOLD / NO SCROLL enforcement and binary server cursors
+
+The Rust `secantusd-pg` server now enforces the two cursor contracts a psycopg
+`ServerCursor` leans on. A cursor declared `WITHOUT HOLD` is closed at COMMIT
+(a later `FETCH` answers `34000 cursor does not exist`), a `WITH HOLD` cursor
+survives it with its position intact, and ROLLBACK closes every cursor,
+holdable included — where before all cursors silently outlived the transaction
+that made them. A `NO SCROLL` cursor now rejects any backward `FETCH`/`MOVE`
+with `55000 cursor can only scan forward`, matching the server it emulates.
+
+Binary server cursors return real binary rows. A server cursor materialises its
+rows once, in text, at DECLARE — but psycopg requests BINARY on the FETCH, not
+on the DECLARE, and the frozen text bytes cannot be turned back into binary. The
+server now keeps the resolved per-column values behind a `SELECT`-sourced cursor
+and re-encodes them in the FETCH's format through the same codec the live query
+path uses, so a binary `FETCH FORWARD` decodes correctly (before it handed the
+client text bytes tagged as binary, which decoded to garbage). The FETCH's
+row description reports the binary format to match.
+
+Along the way `select generate_series(1, 2)::int4` — a cast applied to a
+set-returning function in a FROM-less target list — is planned instead of
+refused, carried as an ordinary per-row cast with the described column type
+taken from the cast. A WHERE clause over such a series is now refused rather
+than silently dropped, the same contract the `FROM generate_series(...)` form
+already held.
+
+#### Added
+
+- `crates/secantus-pgserver`: server cursors keep the resolved typed values of a
+  `SELECT` source so a BINARY `FETCH` re-encodes them in binary; the FETCH's
+  `RowDescription` reports the requested format.
+- `crates/secantus-pgplan`: `select generate_series(...)::type` (a cast over a
+  FROM-less set-returning target) is planned as a per-row cast.
+
+#### Fixed
+
+- `crates/secantus-pgserver`: COMMIT closes non-holdable cursors and ROLLBACK
+  closes all cursors, so a `WITHOUT HOLD` cursor is correctly invalid after
+  COMMIT (`34000`) and cannot read discarded rows.
+- `crates/secantus-pgserver`: a `NO SCROLL` cursor rejects a backward
+  `FETCH`/`MOVE` with `55000 cursor can only scan forward`.
+- `crates/secantus-pgplan`: a WHERE clause over a FROM-less `generate_series`
+  target is refused (`0A000`) instead of being silently ignored, which had
+  returned rows the client asked to exclude.
+
+### The Rust PostgreSQL server honours transaction characteristics
+
+psycopg exposes a connection's `isolation_level`, `read_only` and `deferrable`
+as first-class attributes, and applies them by tacking the transaction
+characteristics onto the `BEGIN` it emits before each block
+(`BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE`), reading them back
+through `current_setting('transaction_isolation')` and friends. The Rust
+`secantusd-pg` server refused those characteristics, so sixteen of psycopg's
+`test_set_transaction_param_*` conformance tests failed on the very first
+statement.
+
+The server now parses the characteristics on `BEGIN` / `START TRANSACTION`,
+`SET TRANSACTION`, and `SET SESSION CHARACTERISTICS AS TRANSACTION`, and reflects
+them in the `transaction_*` / `default_transaction_*` GUCs a client reads back.
+SecantusDB is single-node, so the isolation level is accepted and reported but
+not enforced — every level behaves as the one snapshot the storage engine
+offers, which is exactly what a single-node PostgreSQL does. Opening a block
+resets `transaction_*` to the session default and overlays the named modes;
+ending it reverts to the default, matching PostgreSQL 14 exactly. A companion
+fix lets `set_config($1, $2, false)` plan over the extended protocol, where the
+name parameter is still unbound at DESCRIBE time.
+
+All sixteen `test_set_transaction_param_*` tests now pass.
+
+#### Added
+
+- `secantus-pgplan`: `TransactionModes` on `BEGIN` / `START TRANSACTION`, and the
+  `SetTransaction` / `SetSessionCharacteristics` statements for the two `SET`
+  forms (`SET TRANSACTION`, `SET SESSION CHARACTERISTICS AS TRANSACTION`).
+- `secantus-pgserver`: applies the modes to the `transaction_*` GUCs for the life
+  of a block and reverts on commit / rollback; a `default_transaction_deferrable`
+  default GUC.
+
+#### Fixed
+
+- `secantus-pgplan`: `set_config(name, value, is_local)` folds a NULL name to
+  NULL during a DESCRIBE instead of erroring, mirroring `current_setting`, so a
+  fully-parameterised `set_config` round-trips over the extended protocol.
+
+### `$setWindowFields` rejects options it used to ignore
+
+An unknown field in a `$setWindowFields` stage was accepted and dropped. A
+caller who misspelled `partitionBy` got their accumulators computed over the
+whole collection as a single partition, and one who wrote `range` at the top
+level — where it looks plausible, but belongs inside a window — silently got the
+default window covering the entire partition. Both returned `ok` with a wrong
+answer rather than an error, which is the worst shape for an option: the caller
+believes they asked for something.
+
+The same silence applied one level down, to unknown keys inside `window`, where
+a misspelled `documents` widened the window without saying so.
+
+Both now match MongoDB: an unknown top-level field is `40415`, a missing
+`output` is `40414`, and an unknown `window` key is `9`. Fixed on both servers.
+
+Found by probing aggregation validation errors against MongoDB 8.2.11 while
+working a filed item about error *codes* — the silent acceptance was the more
+serious problem sitting next to it.
+
+### A `$set` of `-0.0` over `0.0` was silently not stored
+
+`update_one({...}, {"$set": {"a": -0.0}})` on a stored `0.0` did nothing:
+`modifiedCount: 0`, no change-stream event, and a read-back of `0.0`. The value
+the caller asked to store was never stored. mongod stores it and reports the
+update (probed 8.2.11, 2026-09-05).
+
+`storage.py` guarded the write with `if new != doc`, and Python's `==` treats
+`-0.0` and `0.0` as equal — and an `int` `0` as equal to a `float` `-0.0`, so a
+numeric **type** change was dropped the same way.
+
+**Fixing it un-masked a second bug that had been cancelling it.** Our `$mul`
+computed `-0.0` for `0.0 * -1` where mongod keeps `0.0`; the wrong product was
+previously discarded by the very comparison being fixed. mongod's rule, measured
+across 15 shapes: a stored double or decimal zero keeps its own sign whatever
+the multiplier, while a non-zero result (`0.0 * inf` is NaN) writes normally and
+an `int` zero promotes and follows IEEE.
+
+**The change-stream diff was blind the same way**, in two places: a `$set` of
+`-0.0` over `0.0` produced an update event with an EMPTY `updatedFields` — the
+consumer was told the document changed and never told which field — and so did
+a numeric type change.
+
+**Equality and change detection are different questions**, which is why this is
+not a one-line fix to the shared helper. mongod calls `0.0` and `-0.0` the same
+value for `$eq` (`$cmp` is 0, `find({a: -0.0})` matches a stored `0.0`) and
+different for change detection. Folding the rule into `bson_equal` /
+`expressions::py_eq` would have broken `$eq` and query matching; both engines
+get a separate change-detection predicate instead.
+
+A Rust test had **canonised the bug as the specification**:
+`numeric_bridge_no_change` asserted that `{a: 1}` -> `{a: 1.0}` emits nothing,
+justified by the comment `1 == 1.0 -> no update emitted` — Python's equality
+rule cited as though it were the server's. It is replaced by tests asserting the
+measured behaviour, plus a guard that an unchanged value still emits nothing.
+
+Remaining and deliberately untouched: `$set` of a NaN over the same NaN emits a
+spurious event here where mongod emits none. That is the per-OPERATOR
+`nModified` rule (mongod's `$set` skips a byte-identical NaN while `$inc: 1` on
+that same NaN writes, the stored bit pattern `000000000000f87f` either way),
+already tracked in `tasks/backlog.md`.
+
+#### Fixed
+
+- `storage.py`: the write guard counts a difference in the ENCODED BSON as a
+  change, so signed zero and numeric type changes are stored.
+- `update.py`, `crates/secantus-core/src/update.rs`: `$mul` leaves a stored
+  double / decimal zero's sign alone.
+- `ordering.py` (`bson_same_stored_value`), `diff.py`,
+  `crates/secantus-core/src/diff.rs` (`same_stored_value`): change detection
+  distinguishes signed zero and numeric type, recursing into arrays and
+  subdocuments so the array fast path sees them too.
+
+### A dotted sort key skipped the documents it should have ranked
+
+`sort({"x.y": 1})` over array-of-subdocument data came back in the wrong order.
+mongod ranks `x: [{y: 1}]` among the documents that **have** an `x.y` — by 1,
+its representative element — and both servers ranked it with the documents that
+have none. Wrong order becomes wrong *results* as soon as a `limit` is
+involved.
+
+The sort was resolving the path with a resolver that deliberately does not walk
+through an array; that behaviour is right for `$set` and projection and wrong
+here. The array-descending resolver already existed for index-key generation
+and already has mongod's semantics, including stopping at one level —
+`x: [[{y: 5}]]` has no `x.y` on mongod either. Using it for the sort makes the
+in-memory order agree with an index walk by construction, which is the property
+that matters: an index must change speed, never results.
+
+Nearly shipped with a regression, caught by re-measuring the *undotted* sort
+against the pre-change binary rather than assuming only the dotted case had
+moved: the representative-element rule was briefly applied twice, which put
+`x: [[5]]` among the numbers instead of the arrays.
+
+Still divergent and filed: a dotted **positional** component (`x.0`) is
+ambiguous. mongod tries it as an array index *and* as a literal field name,
+descends only for the second reading, and raises
+`16746 Ambiguous field name found in array` when a sort hits both. That is a
+separate piece of work in path resolution.
+
+#### Fixed
+
+- `secantus.ordering` / `secantus-storage`: a dotted sort key walks one array
+  level, so `sort({"x.y": 1})` ranks array-of-subdocument values by their
+  representative element — the minimum ascending, the maximum descending — and
+  a two-level path still counts as absent. The undotted sort is unchanged, and
+  a unit test pins that it descends exactly once.
+
+### A sort by `x.0` no longer reads an array as a number
+
+When MongoDB sorts by a dotted path, it walks that path through arrays — and
+what it does at the last step depends on how that step got there. An
+array-valued key reached by a **field name** is descended one level; one reached
+by an **index** is used exactly as it stands. Both servers descended in every
+case, so `{x: [[5]]}` sorted by `x.0` ranked with the *numbers* (as `5`) instead
+of with the *arrays* (as `[5]`). That is the wrong order — and, the moment a
+`limit` is involved, the wrong documents.
+
+Nothing had probed it. The engine-parity suites pin the Rust and Python engines
+to each other, and here they were wrong together; the standing index probe
+compares `_id` sets on purpose, so ordering stays out of its way. It took a
+probe that compares ORDER against a real `mongod` — now
+`tools/probes/sort_path_resolution.py` — to see it.
+
+The same probe settled a second rule: mongod refuses, rather than guesses, a
+sort path whose numeric component names both an array index and a key of that
+array's elements.
+
+#### Fixed
+
+- **A sort key reached by an array INDEX is no longer descended.** `{x: [[5]]}`
+  sorted by `x.0` sorts by `[5]`; `{x: [{y: [1, 2]}]}` sorted by `x.y` still
+  sorts by `1`, because that step is a field name. Both servers, `find` and
+  `$sort`, ascending and descending.
+- **An ambiguous sort path is now the `16746` refusal mongod gives.** A
+  component is ambiguous when it is a valid index of the array *and* some
+  element document carries that exact key — so `{x: [{"0": 5}]}` sorted by `x.0`
+  is refused, while `x.1` over `[{"1": 5}]` (index past the end) and `x.0` over
+  `[{"00": 5}]` (`"00"` is not the key `"0"`) are answered normally. The
+  element carrying the key need not be the one at that index. The same paths in
+  a *filter* are still resolved both ways, as mongod resolves them.
+- **The Rust aggregation `$sort` stage resolved its keys without walking
+  arrays at all**, so it disagreed with the same server's `find` on 9 of 48
+  measured shapes. Both Rust sort paths now share one resolver with the storage
+  layer.
+- **The Rust `find` handler reported this refusal under the update-side
+  executor wrapper with an empty command name** (`Plan executor error during
+  ::`). Read commands now get mongod's own `Executor error during find command:
+  <db>.<coll> :: caused by ::`.
+
+Measured against mongod 8.2.11 over 204 ambiguity shapes and 48 resolution
+shapes: 0 divergent on both servers.
+
+### An index could change which documents a query returned
+
+Four defects in the index layer, three of them silent data loss: the query came
+back with fewer documents than the collection held, no error, and the same query
+on the same data returned everything as soon as you dropped the index. All four
+were found by running SecantusDB and MongoDB 8.2.11 side by side over randomised
+documents and diffing the result sets, and all four are now covered by that
+sweep plus a regression suite.
+
+A **sparse index** omits documents that are missing the indexed field — but a
+query for `null` MATCHES them, because MongoDB's query language treats an absent
+field as null. The planner used the index anyway, so `find({a: null})` on a
+collection with a sparse index on `a` skipped every document that had no `a` at
+all. The same applied to `$in` lists containing null, and to any sort: a sort
+walks the whole index, so a sparse one truncated the result set outright. A
+sparse index is now only used when some indexed field carries a predicate that
+guarantees the field is present — and "could match a missing field" covers any
+comparison against `null`, not only `$eq`: `{a: {$lte: null}}` matches an absent
+field too, which the first version of the gate missed.
+
+A **compound sparse index** was under-populated. MongoDB indexes a document that
+has *at least one* of the indexed fields, keying the missing ones as null; we
+required *all* of them, so `{a: 1}` (no `b`) never reached a sparse `{a: 1, b:
+1}` index and `find({a: 1})` lost it.
+
+A **partial index**'s "does this query imply the filter?" check compared values
+in BSON sort order, where a string sorts above every number. MongoDB's range
+operators are type-bracketed — `{$gt: 0}` matches numbers and nothing else — so
+the check concluded that `{b: "x"}` implied `{b: {$gt: 0}}`, used an index that
+does not contain those documents, and `find({a: 5, b: "x"})` returned nothing.
+
+Finally, a query naming only fields covered by a partial index's filter (`{b:
+5}` against an index on `a` partial on `{b: {$gt: 0}}`) left no key prefix to
+pin, built an empty lookup key and raised `IndexError` out of the command
+handler — which reached the client as an internal error rather than an answer.
+
+#### Fixed
+
+- `storage.py`: a sparse index holds an entry for any document with at least one
+  of its indexed fields (`_sparse_covers`), matching MongoDB's compound-sparse
+  rule. An index built before this change under-indexes until it is dropped and
+  recreated; nothing rewrites existing entries.
+- `storage.py`: the index pickers refuse a sparse index for a query whose
+  predicates could match a missing field (`_sparse_index_usable` /
+  `_predicate_may_match_missing`), including the sort-acceleration pickers.
+- `storage.py`: partial-filter implication is type-bracketed
+  (`_op_implies_bound`), so a cross-type comparison no longer claims coverage
+  the index does not have.
+- `storage.py`: a query fully covered by a partial index's filter scans that
+  index instead of crashing.
+
+### Arithmetic and casts that overflow now say so
+
+Python's `int` is unbounded and its `float` saturates to infinity, so a result
+that no Postgres type can hold was computed **silently**. `i + 1` on an `int`
+column answered 2147483648 — and sent it under oid 23, four bytes that cannot
+carry it — where PostgreSQL answers `22003 integer out of range`.
+
+The width has to come from the declared operand types, not from the value:
+`s + 1` on a `smallint` is `int4` arithmetic in PostgreSQL, so 32768 is a
+correct answer there, while `32767::smallint * 2::smallint` overflows. The two
+are indistinguishable by value alone. The planner already implements
+PostgreSQL's promotion table for the RowDescription, so it now stamps that
+width on each arithmetic node and the evaluator checks against it.
+
+`1e39::float4` was worse than wrong: `struct.pack('!f', …)` raised
+`OverflowError` and reached the wire as an `XX000` internal error.
+
+#### Fixed
+
+- `22003` for integer overflow at `int2` / `int4` / `int8` — through `+`, `-`,
+  `*`, `/`, `abs()` and unary minus, and in every clause that reaches the
+  scalar evaluator: projections, `INSERT`, `UPDATE`, subqueries, CTEs,
+  `GROUP BY`, `HAVING` and `ORDER BY`, with or without a `FROM`.
+- `22003` for `float8` overflow and underflow, following PostgreSQL's
+  `CHECKFLOATVAL` rule — an infinite result is an error unless an operand was
+  already infinite, and a zero result is an error unless zero was a legal
+  answer.
+- `22003` instead of `XX000` for a float cast out of range, in both spellings
+  PostgreSQL uses: casting from numeric or text quotes the input, while
+  narrowing an existing double reports `value out of range: overflow`.
+
+#### Still divergent
+
+Arithmetic inside a `WHERE` clause. It lowers to a Mongo `$expr` evaluated by
+the operator engine the MongoDB server shares, and teaching that engine
+PostgreSQL's integer widths would break the layer boundary.
+
+### array_agg told "no rows" and "a row with no value" apart
+
+#### Fixed
+
+- `array_agg` over zero contributing rows is NULL, not `{}` — which a caller
+  could not recover from, since `{}` is itself a legal value. The same applies
+  to `json_agg` and to a `FILTER` that matches nothing.
+- An unmatched outer-join row contributes a NULL element, so
+  `array_agg(k.v)` over a `LEFT JOIN` gives `{NULL}` rather than `{}`.
+
+Both halves had to land together: `$push` of a missing field pushes nothing, so
+the pushed array could not tell the two cases apart until the value was wrapped
+to leave an explicit null behind. The wrap is per-aggregate — `array_agg`,
+`json_agg` and `jsonb_agg` keep null elements while `string_agg` skips them and
+is correct to answer NULL for a group of nothing but nulls.
+
+- `array_agg` over a JOIN reports its element's array type, where it had
+  reported `jsonb`; the same call over a single table already did.
+
+### `UPDATE … SET col = value` rejects a value PostgreSQL would not assign
+
+`UPDATE t SET int_col = text_col` and `UPDATE t SET bool_col = 1` were silently
+coerced. PostgreSQL rejects both with `42804 column "…" is of type … but
+expression is of type …`, because assignment goes through *assignment casts* —
+a different, more permissive rule than the implicit casts a comparison gets,
+which is why this needed its own analysis rather than reusing the existing
+cross-category comparison check.
+
+The rule is the one PostgreSQL actually applies, measured across 25 shapes: a
+string target accepts anything (there is an assignment cast to `text` /
+`varchar` / `char` from every type involved), an expression whose type is not
+statically certain is left alone so a bad value still fails at runtime where
+PostgreSQL fails it, and otherwise a type-category mismatch is the error. That
+keeps `bigint_col = int_col`, `int_col = real_col` and `int_col = 1.7` working
+while rejecting `int_col = text_col`.
+
+Two coercion errors turned up in the same probe run and are fixed with it.
+
+#### Fixed
+
+- `UPDATE t SET numeric_col = 'abc'` reached the client as a raw
+  `[<class 'decimal.ConversionSyntax'>]` — a Python exception on the wire. It
+  now reports `22P02 invalid input syntax for type numeric: "abc"`.
+- Date, time and timestamp values that cannot be parsed now report
+  PostgreSQL's `22007 invalid input syntax for type date: "nope"` rather than
+  an internal message, and `timestamp` coercion uses `22007` rather than
+  `22P02`.
+
+#### Changed
+
+- The `SERIALIZABLE` isolation-level divergence is now named in the SQL
+  capability matrix, not only in the transactions section, and the
+  documentation records why accepting the level and documenting it was chosen
+  over rejecting it or reporting `repeatable read`.
+
+#### Infrastructure
+
+- CI now runs the PostgreSQL-oracle suites against a real PostgreSQL. They
+  compare SecantusDB's answers against a live server, and until now only ever
+  executed on a developer machine that happened to have one — in CI they
+  skipped silently. A Linux-only job stands up a pinned `postgres:14.13` and
+  fails if the server is unreachable, so the suites cannot go back to skipping
+  unnoticed.
+
+### `AT TIME ZONE`, `LIKE ALL/ANY`, and the `timezone_*` extract fields
+
+Three features the sixth sweep found refused, taking that sweep from 20 of 33
+matching PostgreSQL 14.13 to 30.
+
+#### Added
+
+- **`AT TIME ZONE`** — the SQL operator, not a function. It reads both ways,
+  and which way depends on the operand: a *naive* timestamp is interpreted as
+  being in the zone and becomes an instant, while an *aware* one is converted
+  into the zone and loses it. So `'2020-06-15 12:00'::timestamp AT TIME ZONE
+  'America/New_York'` is 16:00 UTC, and the same instant back through it is
+  08:00. An unknown zone is `22023`.
+- **`LIKE ALL(<array>)` / `LIKE ANY(<array>)`**, and their `ILIKE` and
+  `NOT LIKE` spellings. The scalar `LIKE` worked; the quantified form was
+  `0A000 unsupported scalar expression`.
+- **`extract(timezone …)` / `timezone_hour` / `timezone_minute`**, reporting
+  the **session** zone's offset. PostgreSQL normalises a timestamptz into the
+  session zone before extracting, so `'…+05'::timestamptz` gives 0 under a UTC
+  session rather than 5.
+
+#### Fixed
+
+- The identity and generated-column insert errors put their explanation in
+  **DETAIL**, as PostgreSQL does, instead of folding it into the message —
+  which had made a message no client could match on. The `HINT` matches too.
+
+#### Still divergent
+
+`to_ascii()` and `IS NORMALIZED` (which parses as a column reference), and
+`regexp_count` / `regexp_instr`, which PostgreSQL 14 does not have either —
+only the error differs.
+
+### `WHERE id IN %s` is a syntax error, not zero rows
+
+`IN` takes a parenthesised list or a subquery. Given a bare right-hand side —
+`WHERE id IN %s`, which is a common slip in psycopg where the working spelling
+is `= ANY(%s)` — SecantusDB compared against it and quietly matched nothing.
+PostgreSQL rejects it outright.
+
+Returning no rows is the worst available answer for this: it looks like data
+rather than a mistake, so the query silently reports that nothing matched.
+
+#### Fixed
+
+- `x IN <expr>` without parentheses reports `42601 syntax error`, as
+  PostgreSQL does. Lists, single-element lists, `NOT IN`, subqueries and
+  `= ANY(…)` are unaffected.
+
+### `character(n)` now pads the way PostgreSQL does
+
+`char(n)` is the one string type whose stored form differs from its form in an
+expression: PostgreSQL stores it blank-padded but strips those blanks on every
+conversion to text. SecantusDB got the two halves from two different models —
+the column path stored unpadded and padded at the wire, while a `::char(n)`
+cast padded eagerly into the value — so everything downstream of a cast saw
+blanks PostgreSQL had already removed.
+
+#### Fixed
+
+- `::char(n)` no longer pads into the value, so `'a'::char(3) || '|'` is `'a|'`
+  and `length('a'::char(3))` is 1. A bare cast still reaches the client padded;
+  the padding is applied at the wire, as it already was for columns.
+- A cast of a non-string to `char(n)` applies the length limit:
+  `123::char(2)` is `'12'`, not `'123'`. A `char(n)` target's type tag is plain
+  `text`, so the number-to-text conversion returned before the char-length
+  check ever ran.
+- `LIKE`, `ILIKE`, `SIMILAR TO` and `~` against a `char(n)` column match the
+  blank-padded value, as PostgreSQL does. They are not blank-insensitive the
+  way `=` is, so a `char(5)` holding `'ab'` does not match `LIKE 'ab'` —
+  SecantusDB was **returning a row PostgreSQL excludes**, in the `WHERE` clause
+  as well as the select list.
+- `octet_length`, `concat`, `concat_ws`, `format`, `to_json`, `to_jsonb` and a
+  cast to `bytea` see the padded value, because they take it through the type's
+  output function rather than as text. `length`, `upper`, `md5`, `left` and
+  `position` continue to see the stripped value.
+
+### `ORDER BY … COLLATE "en_US.UTF-8"` actually collates
+
+A `COLLATE` clause on `ORDER BY` was accepted and then ignored — the rows came
+back in byte order, so a query that asked for a locale ordering silently got a
+different one. An unknown collation name was accepted too, where PostgreSQL
+rejects it.
+
+The default ordering is **unchanged and was never wrong**: SecantusDB sorts
+text by bytes, which is exactly what a PostgreSQL database created with the `C`
+collation does. It now says so, rather than reporting an empty collation name.
+
+Naming a locale gives the ordering you would expect — case and punctuation
+stop dominating, and accented letters sort beside their base letter instead of
+after `z`:
+
+```
+default / COLLATE "C"     ABC, Abc, ZZZ, a b, a-b, aBc, ab, abc, zzz
+COLLATE "en_US.UTF-8"     a b, a-b, ab, abc, aBc, Abc, ABC, zzz, ZZZ
+```
+
+This needs no ICU library: it reuses the collation ordering already built for
+the MongoDB side. Two differences from PostgreSQL remain and are documented in
+the tests — `ß` is not expanded to `ss`, and `-` and `_` take different
+relative weights.
+
+#### Fixed
+
+- `ORDER BY … COLLATE "<locale>"` orders by that collation instead of by bytes.
+- An unknown collation reports `42704 collation "…" for encoding "UTF8" does
+  not exist`, as PostgreSQL does.
+- `SHOW lc_collate` and `SHOW lc_ctype` report `C` instead of an empty string.
+- `pg_collation` lists the collations that can be used, instead of being empty.
+
+### An abandoned `COPY … TO STDOUT` aborts the transaction, and `INSERT` checks its value types
+
+A client that started a large `COPY … TO STDOUT`, read one row and gave up left
+the transaction usable. PostgreSQL leaves it in the aborted state, so the next
+statement gets "current transaction is aborted" — SecantusDB ran it instead.
+The copy sent its whole result in one write, so there was no moment at which it
+could notice the client had gone. It now sends in batches and checks for a
+cancelled statement between them.
+
+The row count is why this went unnoticed: a small copy fits in the buffer and
+finishes before the client can abandon it, on PostgreSQL too. The difference
+only shows on a copy large enough that the server is still sending.
+
+`INSERT INTO t (col) VALUES (…)` also now rejects a value PostgreSQL would not
+assign, the way `UPDATE … SET` already did — `INSERT INTO t (jsonb_col) VALUES
+(42)` is an error rather than a silent coercion. `json` and `jsonb` columns are
+type-checked at all for the first time, so comparing one against text is now
+reported instead of quietly answering false.
+
+#### Fixed
+
+- `COPY … TO STDOUT` is a cancellation point: abandoning one aborts the
+  enclosing transaction block, as PostgreSQL does. A copy that completes still
+  returns every row in text, CSV and binary formats.
+- `INSERT` applies PostgreSQL's assignment-cast rules, reporting `42804` for a
+  value that cannot be assigned to the target column.
+- A `json` / `jsonb` column compared against text or a number now reports
+  `operator does not exist`, matching PostgreSQL, instead of silently
+  evaluating to false.
+
+#### Notes
+
+Three long-standing entries turned out to be **already fixed** and were closed
+by measurement rather than code: sub-millisecond timestamps round-trip exactly
+(200 random values, zero loss) since the companion-field work; query-pipeline
+aborts already discard the rest of the batch and match PostgreSQL's statuses
+and rows exactly; and index changes are already undone by `ROLLBACK TO
+SAVEPOINT`.
+
+`numeric` beyond 34 significant digits was re-checked and **does** still round
+— that one is a real, permanent storage ceiling, already documented as such.
+
+### COPY learns FORCE_QUOTE, FORCE_NULL and FORCE_NOT_NULL
+
+#### Added
+
+- `FORCE_QUOTE (col, ...)` and `FORCE_QUOTE *` on `COPY ... TO` in CSV mode
+  quote the named columns even where quoting is not required. A NULL is not
+  force-quoted, which is what keeps it distinguishable from the empty string
+  under `FORCE_QUOTE *`, and the `HEADER` line is not force-quoted either.
+- `FORCE_NULL (col, ...)` on `COPY ... FROM` in CSV mode reads a quoted empty
+  field as NULL; `FORCE_NOT_NULL (col, ...)` reads an unquoted empty field as
+  the empty string rather than NULL.
+
+Each option is valid in exactly one direction, and they disagree about which:
+`FORCE_QUOTE` is `COPY TO` only, `FORCE_NULL` and `FORCE_NOT_NULL` are
+`COPY FROM` only. All three are CSV-only, and an unknown column raises `42703`.
+
+sqlglot cannot parse any of them — it raises a hard error on the whole
+statement — so they are lifted out of the SQL text before parsing and
+re-attached to the syntax tree. That rewrite applies only to a statement
+beginning with `COPY`, and never inside a string literal.
+
+#### Fixed
+
+- `DELIMITER '"'` in CSV mode is refused with `22023 COPY delimiter and quote
+  must be different`, as PostgreSQL does. It was accepted, and produced CSV
+  that cannot be parsed back.
+
+### `to_char` on an interval crashed, and day names ignored their case and padding
+
+`to_char(interval '3 days', 'DD')` reported an internal error — `to_char`
+assumed a date, and an interval is stored differently, so it fell through to
+the date parser. Interval templates now work: `DD`, `HH24`, `MI`, `SS`, `MM`,
+`YYYY` and combinations of them. Calendar-name templates like `Day` are
+rejected with PostgreSQL's own message, since an interval is not tied to a
+calendar date.
+
+`to_char(date, 'Day')` returned `Thursday` where PostgreSQL returns
+`Thursday ` — the full day and month names are padded to nine characters — and
+`DY` returned `Thu` rather than `THU`. The token's own spelling decides both
+the padding and the capitalisation, and neither survived the conversion the
+formatter was doing.
+
+#### Added
+
+- `to_date()` and `to_timestamp()`, in both the format-string and
+  epoch-seconds forms. They previously reported that a function called
+  `str_to_date` was unsupported — a name the query never used.
+- `extract(century …)`, `extract(millennium …)` and `extract(decade …)`.
+
+#### Fixed
+
+- `to_char()` on an interval.
+- Day and month names pad to nine characters, and follow the case of the
+  template (`DAY` upper, `Day` capitalised); `FM` suppresses the padding.
+- `to_date()` reports a date and `to_timestamp()` a timestamp, rather than
+  text.
+
+#### Known limitation
+
+An all-lower-case `day` or `dy` template renders capitalised. The parser maps
+the leading `D` before we see it, so `day` and `Day` are indistinguishable by
+then; `DAY` and `DY` are unaffected.
+
+### `ALTER TABLE` works outside `public`, and DDL errors name the right relation
+
+`ALTER TABLE` never looked at the schema. It read the bare relation name and
+threw away the qualifier — whether that qualifier came from `search_path` or
+was written out as `schema.table` — so **every** form of the statement
+(`ADD COLUMN`, `DROP COLUMN`, `RENAME COLUMN`, `RENAME TO`, `ALTER COLUMN`,
+`ADD CONSTRAINT`, `ADD PRIMARY KEY`) answered `relation "…" does not exist`
+for any table outside `public`. `TRUNCATE`, `CREATE INDEX`, `DROP TABLE` and
+`COMMENT ON` had always resolved correctly, which is what kept it hidden.
+
+Behind that sat a second defect: because the rename target was also read bare,
+a successful `ALTER TABLE s.a RENAME TO b` would have written the table back as
+`public.b` — moving it out of its schema.
+
+The same probe run turned up three more, all found by running each shape
+against PostgreSQL 14.13 rather than reading the code. `DROP SCHEMA … CASCADE`
+dropped a schema's tables and types but left its views, materialized views and
+sequences behind, and a bare `DROP SCHEMA` did not count them as dependants —
+so they outlived the schema and then collided with a later `CREATE`. A bare
+`CREATE SEQUENCE` ignored `search_path` and always created in `public`, so a
+following `CREATE SEQUENCE schema.s` saw a free name and quietly made a second
+sequence where PostgreSQL raises `42P07`. And an error naming a relation
+reported the resolved catalog key instead of what the statement said, so a
+missing `onlypub` under `SET search_path TO sa` came back as
+`relation "sa.onlypub" does not exist` — naming a schema the user never typed.
+
+#### Fixed
+
+- `ALTER TABLE` resolves its target through `search_path` and honours an
+  explicit `schema.table` qualifier, across all seven statement forms.
+- `ALTER TABLE … RENAME TO` keeps the relation in its own schema, rejects a
+  schema-qualified new name with `42601` (as PostgreSQL does), and answers
+  `42P07` when the new name is already taken — including a rename to the
+  relation's current name.
+- `DROP SCHEMA … CASCADE` drops the schema's views, materialized views and
+  sequences; without `CASCADE` those objects now raise `2BP01` like any other
+  dependant.
+- A bare `CREATE SEQUENCE` is created in the first schema on `search_path`.
+- A "does not exist" error names the relation as the statement wrote it, and
+  keeps an explicit `public.` qualifier.
+- `DROP TABLE` on a missing relation says `table "x" does not exist` rather
+  than `relation "x"`, matching the noun PostgreSQL uses for each `DROP` verb.
+- A `DROP` naming a relation that exists under a different kind answers
+  `42809 "x" is not a table` instead of claiming the object is absent — which
+  had made `DROP TABLE IF EXISTS <a view>` succeed silently while the view
+  survived.
+- `42P07 relation "…" already exists` names the bare relation, as PostgreSQL
+  does, instead of the schema-qualified catalog key.
+- Materialized views are schema-aware. Every matview path read the bare name,
+  so a matview was created, catalogued and stored unqualified whatever schema
+  the statement gave — `SELECT … FROM schema.mv` raised `42P01`, and two
+  schemas could not hold same-named matviews. `CREATE` / `DROP` / `REFRESH` /
+  `ALTER … RENAME TO` and the not-populated check all resolve properly now, and
+  `DROP VIEW` and `DROP MATERIALIZED VIEW` no longer reach each other's
+  relations.
+- `SELECT … INTO t` works. PostgreSQL's older spelling of `CREATE TABLE t AS
+  SELECT …` was not dispatched at all: the target was resolved as if it were a
+  source table, so every such statement failed with `relation "t" does not
+  exist`.
+- A sequence can be read as a relation — `SELECT last_value, is_called FROM s`
+  — as it can in PostgreSQL. `last_value` reports the value actually handed
+  out; reading the stored counter would have shown the pre-allocated batch's
+  high-water mark, which runs ahead of the sequence's real position. (`log_cnt`
+  is reported as 0: it counts values PostgreSQL has pre-logged to WAL and has
+  no counterpart here.)
+
+#### Changed
+
+- `CREATE TABLE AS`, `SELECT INTO` and `CREATE MATERIALIZED VIEW` now report
+  the number of rows they wrote as the driver's row count, and send no row
+  description. They carry a `SELECT n` command tag, and the wire layer took
+  that tag alone as meaning "rows follow" — so each sent an empty row
+  description and clients read the row count as 0.
+
+### Finishing the enum story
+
+The previous batch fixed enum comparisons in a `WHERE` clause by rewriting a
+range comparison into the set of labels that satisfy it. A comparison in the
+SELECT **list** has to yield a boolean instead, and is evaluated by the scalar
+evaluator, which has no catalog — so `SELECT m > 'ok'` still answered by
+*spelling* while `WHERE m > 'ok'` did not. Two halves of one operator
+disagreeing is a worse state than either being wrong on its own.
+
+#### Fixed
+
+- An enum comparison in a projection. The planner stamps the declared label
+  list on the comparison node for the evaluator to read, at the umbrella
+  planner so every single-table shape it dispatches to is covered.
+- `enum_range()`, `enum_first()` and `enum_last()`. They take their enum type
+  from the **argument's cast** — the argument is a NULL — so they cannot go
+  through the value-only builtin table and were `0A000`. An unknown type is
+  `42704`.
+
+A plain `text` column still compares by spelling, which is what PostgreSQL
+does; only a column whose declared type is an enum is reordered.
+
+### Extended query protocol: three error-surface fixes
+
+The Parse/Bind/Describe/Execute path is what psycopg, JDBC and most ORMs
+actually speak, and it is a different server path from the interpolated SQL a
+literal test corpus produces. Its value surface came back clean — every scalar
+type through Bind, parameters in predicates, select lists, `LIMIT` and
+`RETURNING`, and server-side cursors — but three statements were accepted that
+PostgreSQL refuses.
+
+#### Fixed
+
+- `EXPLAIN` with a parameter no longer violates the wire protocol. It described
+  itself as returning no rows and then sent rows anyway, which clients report as
+  `server sent data ("D" message) without prior row description`. Only a
+  parameterised `EXPLAIN` reaches this path, because a parameter is what makes a
+  driver switch away from the simple protocol.
+- `DECLARE CURSOR` outside a transaction block now raises `25P01`, as PostgreSQL
+  does, instead of being accepted and then failing the following `FETCH` with
+  `34000` — which reported the problem one statement late and blamed the wrong
+  statement. `DECLARE ... WITH HOLD` is still allowed, since a holdable cursor
+  survives the commit. The check applies to wire sessions only: the embedded
+  `run_sql` API has no implicit commit, so a cursor declared there without a
+  transaction stays usable, and the rule's rationale does not reach it.
+- Parameters in DDL now raise `42P02 there is no parameter $1`. PostgreSQL binds
+  parameters only into statements whose body is planned, so `CREATE TABLE t AS
+  SELECT $1` is accepted while `CREATE VIEW v AS SELECT $1`, `CREATE INDEX`,
+  `ALTER TABLE` and a `DEFAULT` or `CHECK` holding a placeholder are not.
+
+#### Changed
+
+- `tests/test_tmp_retention_guard.py` gives its nested `pytest` subprocesses
+  their own `--basetemp` and a timeout. Without a basetemp a nested pytest
+  registers an exit-time cleanup of every stale `pytest-of-<user>` directory,
+  which can run for minutes after its tests have all passed; under `-n auto`
+  the outer worker is killed waiting and xdist reports only `node down: Not
+  properly terminated`, naming no test. Same diagnosis and same fix as the
+  nested runs in `tests/test_crash_stall_watchdog.py`.
+
+### Floats picked the wrong notation, on both float types
+
+`SELECT CAST(80 AS REAL)` put `8e+01` on the wire where PostgreSQL puts `80`.
+The value was never wrong — only its spelling — which is exactly why it survived
+so long: a driver decodes `80` and `8e+01` to the same Python float, so a
+value-level comparison cannot see it at all. It took registering a raw text
+loader and comparing the bytes.
+
+Underneath was one confusion in two places. Emitting a float is *two* decisions —
+how many significant digits round-trip, and whether to print fixed or scientific
+— and both renderers derived the second from the first. PostgreSQL derives it
+from the **exponent alone**: scientific iff `exp < -4` or `exp >= 6` for
+`float4`, `>= 15` for `float8`.
+
+#### Fixed
+
+- **`float4` went scientific far too early.** The renderer searched for the
+  shortest round-trip with `f"{value:.{p}g}"` and returned that string, but `%g`
+  switches to exponent form whenever `exp >= precision` — so 80, which
+  round-trips on a single digit, printed as `8e+01`. Values needing more digits
+  (`3`, `64`, `123.456`) were unaffected, which is why this looked value-specific
+  rather than systematic.
+- **`float8` went scientific too late.** It used Python's `repr`, whose
+  threshold is 16 where PostgreSQL's is 15, so `1e15` printed as
+  `1000000000000000` and `9007199254740992` as itself, where PG gives `1e+15`
+  and `9.007199254740992e+15`. Found by sweeping `float8` after fixing `float4`,
+  on the suspicion that the same conflation lived there too.
+
+Both now share `typemap._shortest_round_trip`, so the digit search and the
+notation rule cannot drift apart again. Verified against a live PostgreSQL 14
+over 637 `float4` and 620 `float8` values — 400 of each random bit patterns
+across the whole range — with zero mismatches.
+
+This also closes a sqllogictest gauge failure: `random/select/slt_good_1.test`
+compares raw text and now passes, taking that lane back to the committed 52/60.
+
+#### Also
+
+Two backlog corrections, both found by re-probing rather than reading:
+`_pg_expandarray(...).x` was still filed as returning TEXT but was fixed on
+2026-08-29 (value *and* OID match PG for int, text and numeric arrays), and
+`pg_typeof()` over a set-returning function returns one row where PostgreSQL
+returns N — pre-existing, now recorded with its cause.
+
+### Full-text search: tsvector and tsquery stop leaking as JSON
+
+A `tsvector` and a `tsquery` are dictionaries internally, so every path that
+did not know their type treated them as JSON and sent the internal
+representation to the client.
+
+#### Fixed
+
+- `tsvector::text` and `tsquery::text` render PostgreSQL's form (`'fat':2`,
+  `'fat' & 'cat'`) instead of `{"tsvector": {"fat": [2]}}`.
+- `length(tsvector)` counts distinct lexemes. It was measuring the internal
+  dictionary's JSON — 45 for a two-lexeme vector.
+- `tsvector || tsvector` concatenates. It fell into the hstore merge branch and
+  returned only the right operand, silently dropping half the document; the
+  second operand's positions are now shifted past the first's, as PostgreSQL
+  does, so phrase queries over the result stay correct.
+- `&&` on two tsqueries is tsquery AND rather than array overlap, and
+  `tsquery || tsquery` is OR.
+- `to_tsvector('simple', ...)` honours its configuration and keeps stop-words.
+  It dropped them under every configuration, losing tokens the caller had
+  explicitly asked to index.
+
+#### Added
+
+- `strip`, `numnode`, `querytree`, `tsvector_to_array`, `array_to_tsvector`.
+  `querytree` returns `T` for a query with no positive term, as PostgreSQL
+  does.
+
+### The hypothetical-set aggregates
+
+#### Added
+
+- `rank`, `dense_rank`, `percent_rank` and `cume_dist` in their
+  `f(value) WITHIN GROUP (ORDER BY expr)` form — what `value` would rank if it
+  were inserted into the group. All four were `0A000`.
+
+They share the ordered-set plumbing `percentile_cont` / `percentile_disc` /
+`mode` already used, and needed a different payload and finish rather than new
+machinery.
+
+The sort direction is part of the answer and NULLs take part in the ordering,
+so `rank(20) WITHIN GROUP (ORDER BY v)` and `... ORDER BY v DESC` give
+different results on the same data — `ASC` defaults to `NULLS LAST` and `DESC`
+to `NULLS FIRST`. `percent_rank` and `cume_dist` use different denominators
+(`N` and `N + 1`), and only `cume_dist` counts the hypothetical row itself. On
+an empty group the four answer 1, 1, 0.0 and 1.0 rather than NULL.
+
+The multi-column form (one argument per `ORDER BY` expression) is refused with
+`0A000` rather than answered approximately.
+
+### `ROLLBACK TO SAVEPOINT` now undoes index changes
+
+An index created after a savepoint survived a rollback to it, and an index
+dropped after one stayed dropped. Everything else already behaved: tables,
+columns and views created or dropped after a savepoint were all reverted
+correctly, as was a full `ROLLBACK` of any index change. Indexes were the gap,
+because savepoints work by snapshotting table contents and an index is not
+stored as table contents.
+
+Restored indexes keep what they were declared with — a unique index comes back
+still rejecting duplicates, and a partial index keeps its filter — rather than
+returning as a plain index of the same name.
+
+The SQL guide previously stated the opposite, that DDL in general is not undone
+by `ROLLBACK TO SAVEPOINT` and gave `CREATE TABLE` as the example. That was
+wrong for every case it named and right only for the one it didn't; it now
+describes the measured behaviour.
+
+### Integer columns accepted values they cannot hold
+
+`INSERT INTO t (i) VALUES (2147483648)` into an `int` column succeeded and
+stored the value. The column's declared type and its contents then disagreed,
+and the row description still advertised a four-byte integer for it. `smallint`
+and `bigint` behaved the same way, and `1e10::int` returned a ten-digit number
+instead of failing.
+
+PostgreSQL rejects all of these with "integer out of range", and now so does
+SecantusDB — on `INSERT`, on `UPDATE`, and on an explicit cast. An expression
+that overflows cannot reach a column by any of those routes. Values at the
+exact boundaries are still accepted.
+
+#### Fixed
+
+- `smallint`, `integer` and `bigint` reject out-of-range values with
+  `22003 … out of range`, instead of storing them.
+
+#### Known limitation
+
+Arithmetic that overflows *without* being stored — `SELECT 2147483647 + 1` —
+still returns the wide result rather than failing. Storing it anywhere is
+rejected.
+
+### `sum(interval)` answered `0` and `avg(interval)` answered NULL
+
+An interval rides as a subdocument, and Mongo's `$sum` over subdocuments is
+`0` while its `$avg` is NULL — so both came back as **silently wrong data**
+rather than an error. PostgreSQL gives `3 days` and `1 day 12:00:00`.
+
+`min` / `max` were unaffected: Mongo's BSON order over the subdocument happens
+to agree with duration order.
+
+#### Fixed
+
+- `sum(interval)` and `avg(interval)`, whole-table and grouped, on the join
+  planners as well as the single-table ones, and whether the aggregate stands
+  alone or sits inside a computed projection. NULLs are skipped and zero
+  contributing rows is NULL, as every SQL aggregate is. The fold is
+  componentwise for the sum (PostgreSQL's `interval_pl`) and carries months
+  into days and days into micros for the average, which a per-field divide
+  would get wrong.
+- An interval **inside an array** rendered as its raw subdocument —
+  `ARRAY[interval '1 day']::text` gave `{"{\"interval\": {\"months\": 0, …}}"}`
+  where PostgreSQL gives `{"1 day"}`. The text cast defaulted every array
+  element to `text` rather than inferring the element type from the values;
+  the two shapes that carry real element identity (an inner array cast, an
+  array of element casts) still take precedence.
+
+### The isolation level the SQL server provides is now documented and tested
+
+No behaviour changes here — this records what the engine actually does, because
+it does not match what it reports.
+
+Every explicit transaction runs on snapshot isolation, which is what PostgreSQL
+calls REPEATABLE READ, while `BEGIN ISOLATION LEVEL` echoes back whichever level
+was asked for. Measured against a real PostgreSQL, that lands differently for
+each level:
+
+- **Autocommit statements match PostgreSQL exactly.** Two clients updating the
+  same row both land their write; the second waits for the first and re-reads.
+  This is the common path and it was already correct.
+- **READ COMMITTED inside an explicit transaction diverges.** PostgreSQL blocks
+  the second writer and completes it; we report a serialization failure, so a
+  client that does not retry loses its write.
+- **SERIALIZABLE is over-claimed.** We accept it and report it, but provide
+  snapshot isolation, which permits write skew — two transactions can each read
+  what the other is about to change and both commit. PostgreSQL aborts one.
+
+All four cases are now pinned by tests, with the two divergent ones named so
+they read as known divergences rather than as conformance. Closing the READ
+COMMITTED gap needs a fresh snapshot per statement, which the storage engine
+does not offer within one transaction; what to do about SERIALIZABLE is a
+decision about what the server should promise, and is recorded rather than
+quietly chosen.
+
+### The jsonb function family: four no-ops and a family of wrong renderings
+
+`jsonb_set('{"a":1}','{b}','2')` returned its input **unchanged**. So did
+`jsonb_strip_nulls`. Both are implemented — they only ever worked when the
+argument carried an explicit `::jsonb` cast. A bare `'{"a":1}'` literal is
+PostgreSQL's `unknown`, and there the function's declared parameter type
+resolves it; here it stayed a Python `str`, the navigation had nothing to walk,
+and the call returned the input. A no-op that looks like a success.
+
+#### Fixed
+
+- `jsonb_set`, `jsonb_insert`, `jsonb_strip_nulls`, `jsonb_typeof`,
+  `jsonb_pretty` and `jsonb_array_length` coerce an untyped string argument, as
+  PostgreSQL's parameter types do.
+- `jsonb_build_array(1,'x',true)::text` renders `[1, "x", true]` rather than
+  the PostgreSQL array `{1,x,t}`, and `to_jsonb('x'::text)::text` renders
+  `"x"`. Their values are ordinary Python lists, dicts and strings, so only the
+  **call** says the rendering should be JSON. For `json_agg` the call is no
+  longer visible by the time the cast runs — its operand is a synthetic column
+  — so the planner marks the cast instead.
+- `jsonb_object_keys` yields PostgreSQL's storage order (shorter keys first,
+  then bytewise). `json_object_keys` keeps the input's own order and was right.
+- `jsonb_typeof(v->'arr')` was `0A000 unsupported scalar expression`: inside a
+  function call, `v -> 'arr'` looks like an arrow-**lambda** to sqlglot's
+  parser, and only reaches `JSONExtract` when the left side is something an
+  identifier cannot be. PostgreSQL has no lambda syntax, so a lambda there is
+  always that misparse.
+- `jsonb_array_length(NULL)` is NULL, not an error.
+- `to_char`'s ISO-week tokens `IYYY` / `IW` / `ID` — `'IYYY-IW-ID'` came out as
+  the literal `I20Y-IW-I3`, the lone `Y` and `D` having matched and the `I`s
+  not. `IYY` / `IY` / `I` and `IDDD` have no strftime directive and are
+  recorded rather than guessed at.
+- A `json_agg` inside a computed projection is typed `json` again. It had been
+  typed by its ELEMENT since the nested-`array_agg` fix, which those two share
+  a registrar with.
+
+#### Still divergent
+
+`string_agg(DISTINCT x, sep)` and `jsonb_agg(...)` inside a computed
+projection — sqlglot models the latter as an anonymous call, which the
+aggregate collector does not look for.
+
+### jsonb_path_query returned one row; to_number returned NULL
+
+#### Fixed
+
+- `jsonb_path_query` is set-returning and was not registered as such, so a path
+  matching many values produced a single row —
+  `SELECT count(*) FROM jsonb_path_query('{"a":[1,2,3]}', '$.a[*]')` answered
+  1 where PostgreSQL answers 3. Rows were silently missing, not values wrong.
+- A jsonpath predicate can now be used as a whole path expression, so
+  `jsonb_path_match(j, 'exists($.a)')` works. Note the rule this exposes:
+  a predicate path *yields one boolean item*, so
+  `jsonb_path_exists(doc, 'exists($.zz)')` is true even when `$.zz` is absent,
+  while `jsonb_path_query` of the same path returns `false`.
+- `to_number(text, format)` answered NULL for every input. sqlglot gives it a
+  dedicated node rather than an anonymous call, so the name-keyed dispatch
+  never saw it. It now parses under the format mask: decoration (`,` `G` `L`
+  `$` `%`) is dropped, the sign may lead, trail or be angle brackets, excess
+  decimals are truncated rather than rounded, and input with no digits raises
+  `22P02`.
+
+### LISTEN / NOTIFY: a notification delivered twice
+
+#### Fixed
+
+- `pg_notify()` sent its notification **twice** when the call carried a
+  parameter. Describe evaluates a FROM-less `SELECT` to learn its column shape,
+  and the table that exists so a volatile call's shape is derived statically
+  instead of run — `engine._VOLATILE_FN_TAGS` — was missing `pg_notify`, so
+  Describe sent the notification and Execute sent it again. Only the extended
+  protocol reaches it, because a parameter is what stops a driver using the
+  simple one, so the literal spelling always looked correct. `nextval`,
+  `pg_sleep`, the advisory locks, and `INSERT` with parameters were checked and
+  were already correct.
+- An identical `(channel, payload)` signalled more than once in a transaction
+  is now delivered once, as PostgreSQL does, so a loop that notifies per row
+  wakes a listener once rather than once per row. Distinct payloads on the same
+  channel are still all delivered. Both `NOTIFY` and `pg_notify()` collapse —
+  the two spellings of one operation had different semantics.
+- A payload of 8000 bytes or more raises `22023 payload string too long`
+  instead of being delivered. 7999 is accepted.
+
+### `isfinite`, `scale`, `cbrt` on a numeric, and `justify_*` on a time
+
+Looking for the opposite of the last round — shapes PostgreSQL accepts and
+SecantusDB refused — turned up 21, across five functions.
+
+`isfinite()` and `scale()` were missing entirely. `cbrt()` worked on a whole
+number but not on a decimal one, and `justify_hours()` / `justify_days()`
+refused a `time`, which PostgreSQL reads as an interval of that length.
+
+`cbrt()` was also inaccurate: `cbrt(1000000)` returned `99.99999999999997`
+rather than `100`.
+
+#### Added
+
+- `isfinite()` and `scale()`.
+
+#### Fixed
+
+- `cbrt()` accepts a decimal argument, and is exact for perfect cubes
+  (`math.cbrt` on Python 3.11+, a Newton-refined fallback on 3.10).
+- `justify_hours()`, `justify_days()` and `justify_interval()` accept a time.
+
+#### Still unsupported
+
+`numnode()` and `strip()` (full-text search), and `hashtext()` — PostgreSQL's
+internal hash, whose values cannot be reproduced, so returning a different
+number would be worse than refusing.
+
+### A nested `array_agg` silently dropped its `ORDER BY`
+
+`SELECT array_agg(i ORDER BY i DESC) FROM t` sorted. Wrap it in anything at all
+— a cast, an operator, a subscript, another function — and it returned
+**insertion order instead, with no error**.
+
+`array_to_string(array_agg(x ORDER BY y), ',')` is the shape that makes this
+look like ordinary SQL and get a wrong answer.
+
+The top-level projection path pushed `{v, k}` pairs and sorted them in a
+post-aggregate step. The registrar used for an aggregate nested inside a
+computed projection registered a plain `$push` and never carried the ordering
+at all — and `EvaluatedSelectPlan` had nowhere to carry it, so the fix adds the
+same `post_aggregates` channel the pipeline plan already had.
+
+#### Fixed
+
+- An in-call `ORDER BY` is honoured wherever the `array_agg` appears: under a
+  cast, an operator, a subscript, a function call, alongside other aggregates,
+  grouped or not, and on the join planners as well as the single-table ones.
+  Multi-key and per-key directions included.
+
+#### Still refused
+
+`GROUPING SETS` with any computed projection — `count(*)::text` is rejected
+just as `array_agg(…)::text` is, so this is not about ordering. It stays an
+honest `0A000`.
+
+### A function given the wrong kind of value no longer reports an internal error
+
+`SELECT abs('abc')`, `SELECT date_trunc(1, 2)`, `SELECT repeat(ARRAY[1,2], 'x')`
+and several hundred shapes like them reported `internal error`. A Python error
+from inside the function was reaching the client unchanged.
+
+They now report `function abs(unknown) does not exist`, which is what
+PostgreSQL says for the large majority of them.
+
+This came out of a deliberate hunt rather than another accident: two of these
+had already turned up by chance in consecutive rounds, so every function was
+tried against every value type. **397 shapes reported an internal error; none
+do now.** The guard sits at the two points where functions are evaluated, not
+inside each function — per-function guards are exactly what left the holes.
+
+A function that already reports a proper error keeps it: `to_char` on an
+interval with a day-name template still reports the format error, rather than
+being flattened into a generic one.
+
+#### Fixed
+
+- A scalar function applied to a type it does not support reports
+  `42883 function … does not exist` instead of `internal error`.
+
+### `avg`, `stddev` and `variance` over exact types answered the wrong type
+
+PostgreSQL accumulates N, sum(X) and sum(X²) as numerics and finishes in
+numeric arithmetic, so an integer or numeric input gets an exact `numeric`
+answer whose scale comes from `select_div_scale`. This engine used Mongo's
+float accumulators — `$avg`, `$stdDevSamp` — and squared the stddev for the
+variances. Every one of them came back `float8` where PostgreSQL says
+`numeric`, with the last digits wrong and no scale at all:
+`2.333333333333333` for PostgreSQL's `2.3333333333333333`.
+
+#### Fixed
+
+- `avg`, `stddev`, `stddev_samp`, `stddev_pop`, `variance`, `var_samp` and
+  `var_pop` over `smallint` / `integer` / `bigint` / `numeric` are computed
+  exactly and reported as `numeric`, at PostgreSQL's derived scale — `avg(i)`
+  over 1, 2, 4 is `2.3333333333333333`, and over a single 1 it is
+  `1.00000000000000000000`.
+- A non-positive numerator short-circuits to a plain `0`, as PostgreSQL's
+  `const_zero` does. Dividing instead would have given
+  `0.00000000000000000000` for a constant column.
+- `variance` and `var_pop` inside a computed projection (`variance(i)::text`)
+  work at all; they were `0A000 aggregate variance is not supported`.
+- A float input now reports `float8`, which is what PostgreSQL answers. The
+  variances claimed `numeric` for a value that had been a float all along —
+  an existing test asserted that, and has been corrected against the reference
+  server.
+
+#### Still divergent
+
+`stddev` / `variance` over a **float** input differ in the last bit or two:
+PostgreSQL uses the Youngs-Cramer update there, which is a different rounding
+path from summing the squares. `avg(DISTINCT …)` and an aggregate with a
+`FILTER` clause keep the float path.
+
+### `numeric(p, s)` never applied its declared scale
+
+PostgreSQL **rounds** a stored value to the declared scale: `0.12345` into a
+`numeric(10,3)` column is stored as `0.123`, and a bare `1` as `1.000`. This
+engine kept whatever scale the literal happened to carry, so the *stored value
+itself* was wrong — not merely its rendering — and every `sum`, `min` / `max`,
+`avg` and arithmetic result over the column inherited the error.
+
+`sum(a)` over 1, 2.5 and 0.12345 in a `numeric(10,3)` column answered `3.62345`
+where PostgreSQL answers `3.623`.
+
+#### Fixed
+
+- A declared `numeric(p, s)` rounds to `s` on write — `INSERT`, `UPDATE`,
+  parameterised statements and `COPY` alike — half away from zero, matching
+  PostgreSQL both signs.
+- A value whose integer part does not fit after rounding is `22003 numeric
+  field overflow`, with PostgreSQL's DETAIL line naming the precision, the
+  scale and the limit. The check runs on the **rounded** value, so `9999.999`
+  into a `numeric(6,2)` overflows.
+- `NaN` and NULL are stored untouched, and an unconstrained `numeric` keeps its
+  own scale, as PostgreSQL does.
+
+### Three operator-typing gaps on the PostgreSQL interface, and one sqlglot mis-parse behind them
+
+Follow-on to the result-type work: the three items that fix left recorded rather
+than closed, each measured against a live PostgreSQL 14 before being worked. Two
+turned out to have a different root cause than the note predicted, and one
+uncovered a second bug sitting next to it.
+
+#### Fixed
+
+- **`pg_typeof(...)` wired as `text` (25) instead of `regtype` (2206).**
+  Universal, not specific to any argument: the *value* was right every time and
+  only the declared type was wrong, so nothing that compared values could see it.
+  `regtype` is now a real type tag. The literal `rewrite_pg_typeof` mints is
+  **tagged** rather than wrapped in a `::regtype` cast — the cast is evaluated,
+  and `'int4'::regtype` evaluates to the type's OID *number*, so wrapping changed
+  the answer from `integer` to `23`. An explicit `'int4'::regtype` now wires as
+  regtype too; the `::text` and `::oid` forms are unchanged.
+- **A *typed* text operand in arithmetic answered the wrong code.** Postgres
+  defines no arithmetic operator on text at all, so the content is irrelevant:
+  `'1'::text + 1` errors exactly as `'a'::text + 1` does. We coerced both, so the
+  first silently answered `2` and the second reported the coercion's `22P02`
+  instead of `42883`. An explicit **cast** is decided in `sql/scalar.py` (a cast
+  is unambiguously typed, and a constant-only statement never reaches the
+  plan-time analysis); a text **column** is decided in `sql/typecheck.py`, which
+  owns the exemptions a declared type needs — reflected schema-on-read tables
+  above all, where a column typed `text` from a 50-document sample may hold
+  numbers. Postgres names the declared type, so a `varchar` column reports
+  "character varying".
+- **`interval '1 day' + 1` answered `1 day 00:00:01`.** Not an evaluator bug:
+  **sqlglot** absorbs a following NUMBER into its multi-part interval form
+  (`INTERVAL '1' DAY '2' HOUR`), a syntax Postgres does not have, so the `1` was
+  read as one *second*. The distinction cannot be recovered after parsing —
+  sqlglot rewrites the numeric token into a *string* literal inside the
+  synthesised `Interval`, leaving `+ 1` and `+ '1'` byte-identical in the AST —
+  so it is corrected at the parser, where the token is still visible.
+  `+ 'string'` is deliberately untouched: Postgres resolves the unknown literal
+  to an interval there, which is what the continuation already computed.
+- **`interval '1 day' - 1` answered `22023 cannot delete from scalar`** — a
+  *jsonb* error for an interval. Intervals and ranges ride as tagged
+  subdocuments, so the `jsonb - key` branch claimed them. Found while probing the
+  item above.
+
+`tests/test_sql_operator_types.py` pins the constant forms over the real wire,
+asserting the declared OID and the SQLSTATE alongside the value, and compares 22
+shapes against a live PostgreSQL when one is reachable.
+`tests/test_sql_typecheck.py` grows the column-typed half, including the
+reflected-table exemption.
+
+### `ORDER BY` over a `jsonb` or range column was an internal error
+
+Both ride as bare Python subdocuments, so the sort's `x < y` raised
+`TypeError: '<' not supported between instances of 'dict' and 'dict'` and the
+client saw `XX000`.
+
+PostgreSQL's jsonb order was **measured** against 14.13 rather than taken from
+the manual, which matters: a top-level empty array sorts before everything,
+`null` included. That is not a documented rule but a consequence of storage — a
+top-level scalar is held as a one-element array, so `[]` is simply the shorter
+container. Nested, `[]` is an ordinary array.
+
+The key has to be decided from the **column**, not the value. Keying only the
+values that fail to compare gives an order that is not even transitive, because
+Python compares `False < 1` quite happily — `false` landed between two numbers.
+
+#### Fixed
+
+- `ORDER BY` over `jsonb`, ascending and descending, with either NULL
+  placement: the full type order, arrays by length then element-wise, objects
+  by pair count then key/value pairs walked in PostgreSQL's storage order.
+- `ORDER BY` over a range type: empty first, then by lower bound (unbounded
+  lowest), then by upper (unbounded highest).
+- `OVER (ORDER BY …)` and `array_agg(x ORDER BY x)` over a partition of
+  structured values.
+
+#### Still divergent
+
+`'null'::jsonb` and SQL NULL are both Python `None` here, so a JSON null sorts
+where SQL NULL does rather than inside the jsonb order. And
+`array_agg(x ORDER BY <mixed jsonb>)` builds its sort key inside the pipeline,
+where the column type is not available — it no longer errors, but a column
+mixing scalars with containers is ordered inconsistently there.
+
+### `ORDER BY` on a numeric column was an internal error
+
+`SELECT n FROM t ORDER BY n` answered `XX000 internal error`. Sorting compares
+stored values directly, and `Decimal128` — which is **every** `numeric` and
+`money` value — implements no Python numeric protocol at all, so the comparison
+raised a bare `TypeError`. An interval rides as a subdocument and had the same
+problem.
+
+It reached every sort path that does not delegate to Mongo: a plain
+`ORDER BY`, a window's `OVER (ORDER BY …)`, `array_agg(x ORDER BY x)`,
+`WITHIN GROUP (ORDER BY …)`, and every window aggregate except `count`, the one
+that never looks at the value. `DISTINCT`, `GROUP BY` and `UNION` were
+unaffected, because those sorts do go to Mongo — which is how a bug this plain
+went unnoticed.
+
+Decimal128 was wrong even where it did not raise: its equality compares the BID
+encoding, so `1.0` and `1.00` were different values and `rank()` made two peers
+into two ranks.
+
+#### Fixed
+
+- `ORDER BY` over `numeric`, `money` and `interval`, ascending and descending,
+  with either NULL placement. Intervals order by duration, which is what
+  PostgreSQL compares.
+- `OVER (ORDER BY …)` for every window function, and `rank()` / `dense_rank()`
+  now tie equal-but-differently-scaled numerics as the peers they are.
+- Window `sum` / `avg` / `min` / `max` over `numeric`, `money` and `interval`.
+  `min` and `max` follow PostgreSQL's fold, where an equal value replaces the
+  running one — over 2.5, 1.0, 1.00 the minimum is `1.00`.
+- `array_agg(x ORDER BY x)` and `percentile_cont` / `percentile_disc` / `mode`
+  `WITHIN GROUP (ORDER BY x)` over the same types.
+
+Ordering keys are now computed once per row rather than on every comparison,
+which is where the normalisation lives.
+
+#### Still unsupported
+
+`ORDER BY` over `jsonb` or a range type. Both ride as subdocuments, and
+PostgreSQL's total order over them is a slice of its own rather than a
+coercion.
+
+### `array_agg(t ORDER BY t)` returns the microseconds it stored
+
+An ordered aggregate over a timestamp column sorted by microseconds and then
+returned every element rounded to the millisecond — times that were never
+stored. The sub-millisecond remainder was attached to the sort key but not to
+the value being collected.
+
+This was invisible from the shape that already worked: `array_agg(x ORDER BY
+t)` aggregates a *different* column, so only the key mattered there. It only
+appears when the column being collected is the timestamp itself.
+
+#### Fixed
+
+- `array_agg(t ORDER BY …)` and the ordered-aggregate path generally return
+  microsecond-exact timestamps.
+
+### A partial index reports its `WHERE` clause
+
+`pg_indexes.indexdef` and `pg_get_indexdef()` rendered a partial index as though
+it covered the whole table — the predicate was simply missing from the generated
+`CREATE INDEX` statement. Anything that recreates an index from that string,
+which is the usual reason to read it, built a full index instead of a partial
+one.
+
+The predicate is now reconstructed, matching PostgreSQL's own rendering exactly
+across the comparison operators, `IS NOT NULL`, `AND`/`OR` combinations, and
+string literals with their `::text` cast. `WHERE b <> 5` round-trips too, which
+takes a little care: it is stored internally as "not equal *and* not null", and
+PostgreSQL reports the predicate you wrote.
+
+A predicate shape that cannot be reproduced exactly still renders without the
+`WHERE`, as before. That is deliberate — an approximate predicate in a statement
+meant for recreating an index would build the wrong index quietly, which is
+worse than an obviously incomplete one.
+
+### A record rendered as JSON, and half of strip_nulls
+
+#### Fixed
+
+- `record::text` renders PostgreSQL's record literal — `('a', 1)::text` is
+  `(a,1)`, not `{"f1": "a", "f2": 1}`. The record renderer already existed and
+  is what the wire uses for a composite column; only the cast did not route to
+  it. Field quoting, doubled quotes, NULL and empty-string fields, and a
+  blank-padded `char(n)` field all match.
+- `json_strip_nulls` answered NULL for every input, while `jsonb_strip_nulls`
+  worked. sqlglot gives the non-`b` spelling its own node and leaves the `b`
+  spelling an anonymous call, so the name-keyed dispatch served only one of
+  them.
+
+### `ORDER BY` works over `_pg_expandarray`, and its value column has a type
+
+Selecting the value field of a record set-returning function —
+`(information_schema._pg_expandarray(arr)).x`, the shape JDBC's metadata queries
+use — had two problems.
+
+Ordering the result did not work. `ORDER BY <alias>` and ordering by the
+subscript field both failed outright with "column does not exist", because the
+name only exists in the expanded output, not in the source row. `ORDER BY 1` was
+worse: it was accepted and then ignored, so the query reported success and
+returned the array's own order. All of these now sort, matching PostgreSQL.
+
+The value column also reported no type at all rather than the array's element
+type, so a client asking what it had just selected got nothing usable. It now
+reports `int4` for an integer array, `text` for a text array, `numeric` for a
+numeric one — the subscript field was always correct.
+
+One test that pinned the old ordering behaviour has been rewritten. It was
+named so it could not be mistaken for intended behaviour, and it failed as soon
+as the behaviour improved, which is what it was there for.
+
+### `substring(text from pattern)` crashed, and `LIKE` ignored its default escape
+
+`substring('abc123' from '[0-9]+')` — the pattern-matching form — reported an
+internal error. The pattern was being read as a starting position.
+
+`'a_c' LIKE 'a\_c'` was false. Backslash is PostgreSQL's default escape
+character in `LIKE`, so the backslash should make the `_` match literally;
+SecantusDB only honoured an escape when one was written out with `ESCAPE`.
+`ESCAPE ''`, which genuinely turns escaping off, still does.
+
+Three more expressions reported the wrong type, so their values arrived as
+text: `BETWEEN` and `EXISTS` sent `'t'`/`'f'` instead of booleans, and a
+scalar subquery sent the string `'1'` instead of an integer.
+
+#### Fixed
+
+- `substring(text FROM pattern)` returns the first capture group when the
+  pattern has one, the whole match when it does not, and NULL when it does not
+  match — instead of failing.
+- `LIKE` treats backslash as its escape character by default, as PostgreSQL
+  does.
+- `BETWEEN`, `EXISTS` and scalar subqueries report their real types.
+- `array_replace()` keeps the array's type instead of rendering it as text.
+
+#### Added
+
+- `regexp_match`, `regexp_split_to_array`, `string_to_array`, `array_replace`.
+
+### The two-argument statistical aggregates
+
+#### Added
+
+- `corr`, `covar_pop`, `covar_samp`, and `regr_avgx`, `regr_avgy`,
+  `regr_count`, `regr_intercept`, `regr_r2`, `regr_slope`, `regr_sxx`,
+  `regr_sxy`, `regr_syy` — all previously `0A000`.
+
+They are one feature rather than twelve: every one is derived from the same six
+sums, so they share a single accumulator set and a single post-aggregate, and
+differ only in the finishing arithmetic. A pair contributes only when **both**
+arguments are non-null, which is what makes `regr_count` disagree with
+`count(*)` and what keeps the means over the same population the count reports.
+
+`regr_count` returns `int8` and is the only one defined over an empty input (0,
+where the others are NULL); the rest return `float8`.
+
+### A computed SQL column declared a type its own value could not be decoded as
+
+Seven wire-level divergences on the PostgreSQL interface, all one shape: the
+server computed the **right value**, declared a type taken from the **wrong
+operand**, and the *client* raised while decoding it. Found by probing our PG
+server against a live PostgreSQL 14 and comparing the result OID as well as the
+value — an in-process comparison of the same statements showed nothing, because
+the values were never wrong.
+
+#### Fixed
+
+- **`jsonb || jsonb` and `jsonb - key` lost the jsonb type.** `||` typed as
+  `text` and `-` typed from its right operand (`int4` / `numeric`), so a jsonb
+  payload went out under a numeric OID. Every `jsonb - anything` was a hard
+  client-side failure — psycopg raised
+  `invalid literal for int() with base 10: '{1,3}'` — and `||` answered a PG
+  array literal (`{1,2,3}`) instead of jsonb (`[1, 2, 3]`). `#-`
+  (`JSONBDeleteAtPath`) was already correct. Result: 13 shapes now match PG
+  byte-for-byte, OID included.
+- **An `unknown` literal widened instead of resolving to the other operand's
+  type.** Postgres coerces an untyped literal to the *other* operand's type
+  before choosing an operator, so that type decides both the parse and the
+  error. `'1.5' + 1` is **integer** input and fails `22P02`; we answered `2.5`
+  under the `int4` OID the literal `1` had already fixed, and psycopg raised.
+  The `22P02` message now names the target type, as PG's does.
+- **A date-shaped literal did date arithmetic.** `'2020-01-01' + 1` is integer
+  input in PG (`22P02`); we answered `'2020-01-02'` under an `int4` OID — again
+  a client-side crash. Only a bare *literal* is judged: a `::date` cast or a
+  date column keeps its date arithmetic.
+- **Beside an interval, the unknown literal must become an interval.**
+  `'2020-01-01' + interval '1 day'` is `22007` in PG; we read the literal as a
+  date and answered a timestamp under the *interval* OID, so psycopg raised
+  `can't parse interval '2020-01-02 00:00:00'`. Restricted to `+` / `-`: for
+  `*` / `/` PG resolves the unknown to a number instead, so
+  `interval '1 day' * '2'` is still two days.
+- **Boolean arithmetic was accepted.** Postgres defines no arithmetic operator
+  on `boolean`, but Python's `bool` *is* an `int`, so nothing raised:
+  `true + 1` quietly answered `2` and `true - false` answered `1`. Both now
+  answer `42883`.
+
+`tests/test_sql_result_type_tags.py` pins all of it over the real wire,
+asserting the declared OID alongside the value, and compares 20 shapes against
+a live PostgreSQL when one is reachable.
+
+### Two more internal errors, and three wrong answers, from a second sweep
+
+`(1,2) < (1,3)` was `XX000`. A record rides as a dict of `f1..fN`, and a dict
+has no `<` — equality worked, so only the ordering comparisons failed.
+
+`FETCH FIRST 2 ROWS ONLY` — the SQL-standard spelling of `LIMIT` that
+PostgreSQL accepts — was `XX000` twice over. It parses as `exp.Fetch`, whose
+count lives in `count` rather than `expression`, and the "unsupported" error
+built from that `None` then raised `AttributeError` on `None.sql()`. So the
+query could not even say why it failed.
+
+`3 BETWEEN SYMMETRIC 5 AND 1` answered FALSE: the keyword was parsed and then
+ignored, so every reversed-bound test was wrong.
+
+#### Fixed
+
+- Records compare field by field, left to right.
+- `FETCH FIRST n ROW[S] ONLY`, with or without an `OFFSET`.
+- `BETWEEN SYMMETRIC` orders its bounds first. Plain `BETWEEN` still does not.
+- `jsonb ? 'k'` and its `?|` / `?&` siblings work in a SELECT list — they
+  reported `function jsonb_contains() is not supported`, a name the user never
+  wrote, and for the two-key forms a name mangled out of the node class. They
+  worked inside a `WHERE` all along. An object is asked about its keys, an
+  array about its string elements, and a jsonb string about equality, which is
+  PostgreSQL's rule.
+- Every containment and key-existence operator (`@>`, `<@`, `&&`, `?`, `?|`,
+  `?&`) types as `boolean`. They typed as `text`, so a driver was sent `'t'`
+  under oid 25 where PostgreSQL sends a boolean under oid 16.
+
+### Nine missing functions, and four expressions that reported the wrong type
+
+`md5`, `btrim`, `quote_ident`, `quote_literal`, `quote_nullable`, `concat_ws`,
+`starts_with`, `width_bucket` and `div` were unavailable. The error said the
+function was "not supported in this context", which was misleading — they were
+unreachable in every context.
+
+Four expressions returned the right value with the wrong type, which is the
+worse half because nothing reports it. `coalesce(NULL, NULL, 3)` sent the
+string `'3'` typed as text where PostgreSQL sends `3` as an integer, and
+`IS DISTINCT FROM` sent `'t'` as text where PostgreSQL sends a boolean — so a
+driver reading the column got a string that is always truthy. `power()` and
+`sign()` reported `numeric` where PostgreSQL reports double precision.
+
+#### Added
+
+- `md5`, `btrim`, `quote_ident`, `quote_literal`, `quote_nullable`,
+  `concat_ws`, `starts_with`, `width_bucket` and `div`.
+
+#### Fixed
+
+- `coalesce(…)` reports the type of its arguments instead of text.
+- `IS DISTINCT FROM` / `IS NOT DISTINCT FROM` report boolean instead of text.
+- `power()` and `sign()` report double precision, as PostgreSQL does.
+
+#### Fixed (aggregates)
+
+- `bool_and(n > 0)` and `bool_or(n > 0)` return the right answer instead of
+  NULL. Over a plain boolean column they were always correct; given a
+  comparison they silently returned nothing at all. A row where the comparison
+  is NULL is skipped, as PostgreSQL does, rather than counting as false.
+- `sum(CASE WHEN … THEN … ELSE … END)` — the counting idiom — works.
+- An aggregate argument that cannot be handled now says "unsupported aggregate
+  argument" instead of naming `array_agg` for a `sum()` or `min()` call.
+
+### `SET search_path` now decides which schema a bare table name resolves to
+
+The setting was recorded — `SHOW search_path` returned it — but ignored when
+resolving an unqualified relation. With the same table name in two schemas, the
+answer never moved: `SET search_path TO sa` still read `public.t`, and
+`sa, public` and `public, sa` gave the same result, so the order asked for made
+no difference.
+
+Three behaviours change, each checked against a real PostgreSQL:
+
+- The path is walked in order, and the first schema holding the name wins.
+- A relation in no schema on the path is *invisible* rather than lower
+  priority — selecting a `public`-only table with `search_path` set elsewhere
+  now reports that the relation does not exist, where it previously returned
+  rows.
+- `CREATE TABLE` creates into the path's first schema, so a same-named relation
+  there is now a conflict. Previously the table was created in `public` while
+  every read of that same name resolved to the other schema — writes and reads
+  landing in different places.
+
+Two existing tests asserted the old behaviour and have been rewritten. One of
+them contradicted its own docstring, which described PostgreSQL's rule
+correctly.
+
+One difference remains, recorded rather than silently left: when a bare name
+resolves nowhere, the error names the schema that was tried (`"sa.onlypub"`)
+rather than the name as written (`"onlypub"`). The error code is correct.
+
+### `SERIALIZABLE` is documented as snapshot isolation
+
+The SQL server accepts all three isolation levels and reports back whichever was
+requested, but every explicit transaction runs on the storage engine's snapshot
+isolation — what PostgreSQL calls `REPEATABLE READ`. For `SERIALIZABLE` that
+difference has teeth: snapshot isolation permits write skew, so two transactions
+can each read what the other is about to change and both commit, where
+PostgreSQL aborts one.
+
+The SQL guide now spells this out, with the four-way comparison against a real
+PostgreSQL, a worked write-skew example, and what to use instead when an
+invariant genuinely needs protecting (an explicit lock, or a constraint the
+database can check).
+
+Mapping `SERIALIZABLE` onto snapshot isolation is deliberate and has precedent —
+Oracle has long done the same — and it keeps drivers and ORMs that request the
+level working. Being silent about it was the problem, not the mapping.
+
+### Full-text search now stems
+
+`to_tsvector('english', …)` did not stem, so `cats` did not match `cat` and a
+search for `quick` did not find a row whose title is `Running quickly`. That is
+the worst class of search defect: a query that should match returns nothing,
+with no error.
+
+#### Added
+
+- `secantus.sql.snowball` implements the English (Porter2) algorithm
+  PostgreSQL's `english` configuration uses. It is written out rather than
+  taken from a dependency, since SecantusDB ships self-contained wheels and a
+  stemmer is a closed, fully specified algorithm. It is pinned against **6,094
+  words stemmed by PostgreSQL itself** (`tests/data/english_stems.txt`), and
+  matches on every one.
+
+#### Fixed
+
+- Documents and queries both stem, which is the point — a query's `running` and
+  a document's `runs` meet at `run`. Prefixes stem too, so `running:*` renders
+  as `'run':*`.
+- `to_tsquery` drops stop-words, as the document side always did. Keeping them
+  produced a query that could never match, since no document indexes them.
+- `simple` still neither stems nor drops stop-words.
+
+### Nine divergences a broad sweep against PostgreSQL turned up
+
+A corpus of ordinary SQL run against both servers and diffed — not read off the
+backlog. Three were **silently wrong answers** rather than errors.
+
+`trim(both 'x' from 'xxabxx')` answered `'xxabxx'`: the trim characters and the
+position were both ignored, and every spelling ran a plain `str.strip()`. Only
+the SQL keyword form was affected — `btrim` / `ltrim` / `rtrim` take their
+characters as an ordinary second argument and were always right.
+
+`substr('abcdef', -1, 3)` answered `'abc'`. The start was clamped to 1 and the
+length counted from there; PostgreSQL counts from the *original* start, so
+positions -1, 0 and 1 leave just `'a'`.
+
+`unnest('{1,2,3}'::int[])` handed a driver `'1'`, `'2'`, `'3'` — the elements
+were typed `any` and went out as text.
+
+#### Fixed
+
+- `TRIM([LEADING|TRAILING|BOTH] [chars] FROM string)` honours both the
+  character set and the position.
+- `substr()` counts the length from the original start, and a negative length
+  is `22011 negative substring length not allowed`.
+- `unnest()` without a FROM types its elements: from the cast where there is
+  one, otherwise from the values, with PostgreSQL's own rule that an
+  `ARRAY[…]` of integer literals is `integer` unless one does not fit.
+- A **NULL array** is empty in a `||` concatenation, so `NULL::int[] || 9` is
+  `{9}` where it used to be NULL — while a NULL of any other type still makes
+  the whole `||` NULL, and a NULL *element* stays a NULL element. A column's
+  array-ness comes from the type-checking pass, a cast or `ARRAY[…]` from the
+  node itself.
+- `to_hex()`, `make_date()`, `make_time()` and `make_timestamp()`, each of
+  which was `0A000 function … is not supported` — and two of them under a name
+  the user never wrote, because sqlglot renames them.
+
+#### Still divergent
+
+`SIMILAR TO`; `date_part()` returns `numeric` where PostgreSQL returns
+`float8` (sqlglot parses it and `extract`, which *is* numeric, to the same
+node); and two-argument `log()` returns `float8` where PostgreSQL returns a
+`numeric` whose scale comes from an estimator in `log_var` that has not been
+ported.
+
+### `min()` and `max()` on a timestamp no longer answer a time that was never stored
+
+`min(t)` over a column holding `12:00:00.123456` returned `12:00:00.123000`.
+Not a rounding of the display — the query answered a timestamp that is not in
+the table and never was. `max()` did the same, and `array_agg(x ORDER BY t)` and
+`string_agg(x, ',' ORDER BY t)` ordered their output at millisecond granularity,
+leaving rows that share a millisecond in storage order.
+
+These are computed inside the aggregation pipeline rather than in the SQL layer,
+which is why the read-side fix for `SELECT` and `ORDER BY` never reached them: a
+BSON date holds whole milliseconds and the microseconds live in a separate
+hidden field the accumulator never saw. They now accumulate the two together as
+a single sortable value and recombine it on the way out. `FILTER (WHERE …)`,
+all-NULL groups, and the join form are covered.
+
+`HAVING` moved with them, and it is worth saying why. A clause like `HAVING
+min(t) > '12:00:00.1230'` compares against the accumulator's output, so the
+literal had to be handled in the same representation. Measured against
+PostgreSQL across five operators before and after: three were already wrong,
+one — `min(t) = '…122000'` — was right only because its literal happened to fall
+on a whole millisecond, and all five are right now. Anything that changes this
+area should re-measure `HAVING` rather than assume it follows.
+
+Still not fixed, and recorded: `GROUP BY` on a timestamp merges rows that differ
+only in microseconds, because the group key is still the truncated date.
+
+### `SELECT DISTINCT` on a timestamp keeps rows a microsecond apart
+
+Two rows recorded at `.123100` and `.123500` came back as a single row reading
+`.123000` — collapsed together, and reported as a time neither of them held.
+`DISTINCT` deduplicates on the projected value, and the projection was dropping
+the microseconds before the deduplication ever ran.
+
+`count(DISTINCT t)` was wrong for the same underlying reason but by a different
+route, and answered 2 where PostgreSQL answers 3.
+
+Both are fixed, along with `DISTINCT *`, multi-column `DISTINCT`, and ordering
+over deduplicated output.
+
+This completes the sub-millisecond work: comparisons, reads, `ORDER BY`, `min` /
+`max`, ordered aggregates, `GROUP BY` keys, `HAVING`, `DISTINCT` and
+`count(DISTINCT …)` are now all microsecond-exact, verified across 39 query
+shapes against a live PostgreSQL.
+
+### `GROUP BY` on a timestamp no longer merges rows that differ in microseconds
+
+Grouping by a `timestamp` column used the whole-millisecond value as the key, so
+rows recorded at `.123100` and `.123500` landed in the same group. Three
+distinct times became two groups; `count(*)` answered 3 where PostgreSQL answers
+2 and 1, `sum(id)` answered 6 where PostgreSQL answers 4 and 2, and the group
+key came back as `.123000` — a time none of the rows held.
+
+The aggregate values are the important part. A merged group does not just label
+itself wrongly, it sums and counts rows that belong to different groups, and
+nothing about the result looks suspicious.
+
+`HAVING` over a grouping column moved with it, the same way it did for `min` and
+`max`: the clause compares against the group key, so the literal is handled in
+the same representation. All three `HAVING` shapes measured against PostgreSQL
+were wrong before and are right now.
+
+Still not fixed, and now measured precisely: `SELECT DISTINCT` on a timestamp
+collapses rows the same way *and* returns a truncated value. It takes a third
+route through the planner — a projection that drops the microseconds before the
+deduplication runs — so neither this fix nor the earlier ones reach it.
+
+### A join on a timestamp column returned rows that do not match
+
+`… a JOIN b ON a.t = b.t` compared the stored dates, which hold whole
+milliseconds, so every timestamp inside the same millisecond joined to every
+other. Over four distinct times a self-join returned **ten rows where
+PostgreSQL returns four** — a wrong answer, not a lost digit. Joining now
+compares the microseconds too, and a joined timestamp comes back with the
+microseconds it was stored with rather than rounded to the millisecond.
+
+Two other timestamp routes are fixed with it, both found in the same sweep.
+`string_agg(t::text, …)` rendered the rounded time, even though `t::text` on
+its own was already exact. And a timestamp rendered as text padded the
+fractional seconds to six digits — `00:00:00.123100` where PostgreSQL prints
+`00:00:00.1231` — which also made `concat(t, '')` and `t::text` disagree with
+each other.
+
+#### Fixed
+
+- A join on a timestamp column matches only equal times, and its result keeps
+  microseconds.
+- `string_agg(t::text, …)` keeps microseconds.
+- A timestamp rendered as text prints PostgreSQL's shortest form, and every
+  route that renders one (`::text`, `concat`, `||`) agrees.
+
+### `ORDER BY` on a timestamp is microsecond-exact
+
+Rows whose timestamps differed only below the millisecond came back in storage
+order. Sorting four rows at `.122000`, `.123100`, `.123500` and `.123900` gave
+the first row correctly and then the remaining three in the order they were
+inserted, because the sort key was built from the stored millisecond value and
+the microseconds live in a hidden companion field that the key never consulted.
+
+This is easy to under-rate as a display nit, so it is worth being precise about
+what it affected. `LIMIT` reads off the sorted list, so `ORDER BY t LIMIT 2`
+returned the wrong *rows*. `DISTINCT ON` keeps the first row per group in the
+`ORDER BY` order, so it silently picked a different row than PostgreSQL does.
+Neither looks like a sorting bug from the outside — they look like wrong
+answers.
+
+It was two code paths, not one. Beyond the plain-column sort key, a query
+ordering by an expression or a column ordinal — `SELECT id, t FROM x ORDER BY 2`
+— runs through a separate route that evaluates against the source row, and that
+route never restored the microseconds at all. So that shape both sorted at
+millisecond granularity *and* returned truncated times. Both paths now read
+through one helper.
+
+Verified against a live PostgreSQL 14 across plain, `DESC`, aliased, ordinal,
+`DISTINCT ON` and `LIMIT` shapes.
+
+Not fixed, and now recorded with its measurement: `min()`, `max()` and the
+in-call `array_agg(x ORDER BY t)` form are computed inside the aggregation
+pipeline, which reads the stored date and never sees the companion. `min(t)` and
+`max(t)` therefore still answer a whole-millisecond time for a stored
+microsecond one.
+
+### sum() answered 0 for a group that contributed nothing
+
+`SELECT j.id, sum(k.v) FROM j LEFT JOIN k ON k.jid = j.id GROUP BY j.id`
+answered `0` for a `j` row with no match, where PostgreSQL answers NULL — a
+common reporting query, silently wrong, and one a caller could not defend
+against, since `coalesce(sum(...), -1)` also saw the 0.
+
+#### Fixed
+
+- The NULL guard on `sum` counted contributions with a bare
+  `$ne: [value, null]`, which is **true for a missing field**. An unmatched
+  outer-join row carries no key at all for the non-driving side, so the guard
+  counted a contribution that never happened. It now collapses missing into
+  null first, exactly as `COUNT(col)` does. This is why only the unmatched-row
+  case was wrong while a group holding a genuinely NULL value was already
+  right.
+- `HAVING sum(x) IS NULL` could never be true — neither the single-table nor
+  the join `HAVING` path applied the guard at all. Both now do.
+
+### An eighth SQL sweep: four silently wrong answers, and a whole type that answered NULL
+
+263 statements run against PostgreSQL 14.13 through the same `psycopg` client
+on both sides — so client-side type mapping is identical and every difference
+is the server's. The four worst findings all returned a *plausible* answer
+rather than an error.
+
+**Every navigation over a `json` value answered NULL.** The `json` type keeps
+the client's exact text — whitespace, key order and duplicate keys preserved,
+which is what separates it from `jsonb` — so a `::json` value arrives as a
+`str` subclass. The `->` / `->>` / `#>` / `#>>` walker descends `dict` and
+`list` only, so it fell straight through to "not a container" and answered NULL
+for the entire type. `'{"a":1}'::json -> 'a'` was NULL where PostgreSQL says 1.
+
+**`ORDER BY b.id` sorted by `a.id`.** Two joined tables routinely project
+same-named columns; the order term was resolved by its *bare* name against the
+output list, which finds the first of them. In a `RIGHT JOIN` it also misplaced
+the unmatched rows, because their `a.id` is NULL and NULLs sort to one end.
+
+**`SELECT jsonb_each(x)` returned no rows at all.** The SELECT-list record-SRF
+expansion was written for `_pg_expandarray` and treats the argument as an
+array; `jsonb_each`'s argument is an object, so it expanded to zero elements
+and the statement answered an empty result.
+
+**`ORDER BY 99` was accepted and ignored.** Each planning path gates on
+`1 <= n <= len(select list)` and, when that fails, leaves the literal alone —
+which sorts by a constant, i.e. not at all.
+
+#### Fixed
+
+- **`json` (non-`b`) navigation.** `->`, `->>`, `#>`, `#>>` and
+  `json_extract_path` all descend a `json` value again instead of answering
+  NULL.
+- **`#>` keeps `jsonb`; `#>>` returns `text`.** The type inference named `#>` in
+  its comment but tested only the `JSONExtract` classes — `#>` parses to
+  `JSONBExtract`, which is *not* a subclass — so `#>` went out under oid 25 and
+  `'{"a":{"b":[1,2]}}'::jsonb #> '{a,b}'` rendered the PostgreSQL array literal
+  `{1,2}` instead of the jsonb `[1, 2]`.
+- **`ORDER BY <n>` out of range** raises `42P10` (including `0` and a negative
+  ordinal, which parses as `Neg(Literal)` and never reached the range gate).
+- **A qualified `ORDER BY` term** matches the select list by its full text
+  before falling back to the bare column name, so `ORDER BY b.id` no longer
+  sorts by `a.id`.
+- **`JOIN ... ON a.id = b.id - 1`.** The fast-path "is this a simple equality?"
+  detector *raised* instead of answering no, so any ON term that is not a bare
+  column was a fatal `0A000 ON must compare columns` — even though the general
+  pipeline form lowers arithmetic perfectly well.
+- **`SELECT jsonb_each(x)` / `jsonb_each_text(x)`** expand to one row per
+  member, in the composite and the `(...).key` / `(...).value` field forms; the
+  composite renders a `jsonb` field as JSON (`(b,"x")`, not `(b,x)`).
+- **An incomparable pair** (`ARRAY[1,2] > 1`, `'{"a":1}'::jsonb > 1`) raises
+  `42883` naming the operator, rather than leaking a Python `TypeError` to the
+  client as `XX000 internal error`.
+- **`initcap`** treats a digit as part of a word, as PostgreSQL does:
+  `initcap('a1b c')` is `A1b C`, not `A1B C`.
+- **`quote_ident`** quotes a keyword that is not UNRESERVED
+  (`quote_ident('select')` → `"select"`), and **`format`'s `%I`** is now that
+  same rule instead of always quoting — `format('%I', 'tbl')` is a bare `tbl`.
+  A NULL to `%I` raises `22004`.
+- **`LIKE ... ESCAPE`** types as `boolean`. The ESCAPE clause wraps the
+  predicate in a node that is not itself a boolean class, so adding it to a
+  working `LIKE` flipped its column from oid 16 to oid 25 and sent a `'t'`.
+- **A timestamp literal's fractional seconds, at any width.** The support
+  matrix disagreed with itself in both directions and neither half matched
+  PostgreSQL: before Python 3.11 `fromisoformat` accepted *only* 3 or 6
+  fractional digits, so `TIMESTAMP '2020-01-15 10:30:45.5'` — a perfectly good
+  literal — raised on 3.10 while parsing on 3.12; from 3.11 it accepts any
+  width but *truncates* beyond six digits, where PostgreSQL *rounds*
+  (`.1234567` → `.123457`). Normalising the fraction before the parse makes
+  every supported Python answer the same microseconds, and the same ones
+  PostgreSQL does. Only the CI matrix could show this — a local 3.12 run sees
+  neither half.
+- **An unresolvable function name** answers `42883 function f(...) does not
+  exist` rather than `0A000 ... is not supported in this context`, which
+  claimed the call site was the problem when the name was unreachable
+  everywhere. A *set-returning* function in scalar position keeps `0A000` and
+  now says what the actual limit is.
+
+#### Added
+
+- **`SIMILAR TO` / `NOT SIMILAR TO`**, with `ESCAPE`. SQL's regex flavour is
+  LIKE's wildcards plus `| * + ? {} () []`; every other character is literal,
+  so `'abc' SIMILAR TO 'a.c'` is false.
+- **Quantified comparisons under every operator.** `ANY` / `ALL` worked only
+  under `=` and `<>`; `1 < ALL(ARRAY[2,3])` was an outright error. The set form
+  (`x = ANY (SELECT ...)`) works too, and the three-valued rules match
+  PostgreSQL — including that an empty array settles the answer before the
+  needle is looked at (`NULL = ALL('{}')` is true).
+- **`DISTINCT` inside `array_agg` / `string_agg` / `jsonb_agg`.** PostgreSQL
+  dedupes by *sorting*, so the result comes back ascending even with no
+  `ORDER BY` written; an `ORDER BY` naming anything but the argument raises
+  `42P10`, as it does there.
+- **`jsonb_extract_path`, `jsonb_extract_path_text`, `jsonb_path_query_first`,
+  `array_to_json`, `trim_array`.** `sqlglot` folds only the `json_` spelling of
+  the extract-path pair into a dedicated node, which is why one of each pair
+  worked and the other did not.
+- **`extract`**: `isoyear`, `julian`, `microseconds`, `milliseconds` (the last
+  two fold the seconds in, as PostgreSQL does). **`date_trunc`**: `decade`,
+  `century`, `millennium`, `milliseconds`, `microseconds` — centuries and
+  millennia start at year 1, so 2026 truncates to 2001.
+- **`generate_series` over `date` / `timestamp` bounds with an interval step.**
+  The bounds arrive as canonical text, so the temporal overload was rejecting
+  its own arguments; `date` bounds type as `timestamptz` and `timestamp` bounds
+  as `timestamp`, which is how PostgreSQL resolves the overloads.
+
+### An eleventh SQL sweep: a multidimensional array is one array, not nested ones
+
+Sequences and identity columns came back strong (23 of 26 shapes already
+matching PostgreSQL 14.13). Arrays did not — 20 of 29, with the misses clustered
+on **multidimensional** arrays, which PostgreSQL does not treat as nested arrays
+at all: `int[][]` is ONE array with two dimensions, and every whole-array
+operation walks it flat.
+
+**`array_to_string` leaked Python syntax.** Joining only the top level rendered
+each inner list through `str()`, so `array_to_string(ARRAY[[1,2],[3,4]], ',')`
+answered `[1, 2],[3, 4]` where PostgreSQL says `1,2,3,4`.
+
+**`unnest` of a 2-D array crashed** with a bare `invalid literal for int():
+'{1,2}'` and *no SQLSTATE* — the inner lists went out as elements and the int4
+output coercion died on them.
+
+**Every scalar subquery over a `VALUES` source failed** with `42P01 relation ""
+does not exist`. Not an array bug at all — `IN (SELECT … FROM (VALUES …))`,
+`EXISTS`, `ARRAY(…)` and the bare scalar form were all affected, because a
+VALUES-derived source is not a relation and the inner-table lookup found
+nothing.
+
+#### Fixed
+
+- **`array_to_string` and `unnest` walk a multidimensional array flat**, in
+  row-major order. `unnest` had **three separate copies** of the same one-level
+  logic — the `exp.Unnest` node, the Anonymous spelling, and the select-list
+  expansion — which is why fixing one of them was not enough; they share a
+  helper now.
+- **A `VALUES` source works inside any scalar subquery**, with the row's cells
+  evaluated on reference so an expression in the VALUES list works too, and the
+  alias's column names (or PostgreSQL's default `column1`, `column2` …) both
+  resolve.
+- **A scalar subquery and `ARRAY(subquery)` keep their element type.**
+  Everything came back as `text` before: `(SELECT n FROM (VALUES(7)) t(n))` is
+  `int4`, and `ARRAY(SELECT n …)` is `int4[]`.
+- **`pg_get_serial_sequence`** returns the schema-qualified sequence name
+  instead of NULL. The column already recorded it (`Column.sequence`, which
+  `nextval` and the `information_schema` view both read) — this just never
+  looked, so ORM reflection saw every serial column as plain.
+
+#### Added
+
+- **`ARRAY(SELECT ...)`**, the array-subquery constructor, which parses as an
+  `Array` whose single element is the `Select` and so tried to evaluate a
+  `Select` as a scalar.
+
+### A fifth sweep: a dropped column DEFAULT, and enums compared by spelling
+
+28 of 36 shapes matched PostgreSQL 14.13 across arrays, enums, domains, ranges
+and DDL. Two of the misses were silently wrong rather than refused.
+
+**`ALTER TABLE t ADD COLUMN c text DEFAULT 'z'` dropped the DEFAULT on the
+floor.** Existing rows kept NULL — PostgreSQL backfills — and, worse, a *later*
+insert that omitted the column got NULL too, because the default was never
+recorded in the catalog at all. `NOT NULL DEFAULT 7` therefore left a NOT NULL
+column holding NULL.
+
+**An enum comparison answered by spelling.** An enum's order is its declared
+label order, so `'happy' > 'ok'` is true for `mood AS ENUM ('sad','ok','happy')`
+and false as text — and `WHERE m > 'ok'` returned `sad`. Sorting already knew
+the declared order (`enum_orders`); comparison did not.
+
+#### Fixed
+
+- `ADD COLUMN … DEFAULT` records the default and backfills existing rows. A
+  non-literal default is evaluated once, as PostgreSQL does.
+- Range comparisons on an enum column in `WHERE` (and so in `UPDATE` /
+  `DELETE`), both operand orders. An enum has a finite label set, so a range
+  comparison is exactly a set membership — no ordinal needed at query time.
+- `array_positions()`, and result types for `array_fill()` (an array of its
+  value's type, not text) and `range_merge()` over `::int4range` **casts** —
+  only the range *constructor* was recognised as a range operand.
+- `version()` nested in an expression. It worked as a bare projection through
+  the session-function path but reported `function current_version() is not
+  supported` — sqlglot's node name, not one the user wrote — the moment it was
+  nested.
+
+#### Still divergent
+
+`enum_range()` / `enum_first()` / `enum_last()`, and an enum comparison in the
+SELECT *list* (`SELECT m > 'ok'`) rather than a WHERE — both need the catalog
+inside the scalar evaluator.
+
+### A fourth sweep: two badly wrong answers, three wrong types
+
+25 of 35 shapes matched PostgreSQL 14.13 across windows, aggregates, bytea and
+subqueries.
+
+`substring(b from 1 for 1)` over a `bytea` answered the string `'b'` — the
+first character of the Python repr `b'\x01\x02'` — where PostgreSQL answers the
+byte `\x01`.
+
+`every(n > 5)` answered NULL. `every` is the standard-SQL spelling of
+`bool_and`, and the mapping kept the name but dropped an *expression* argument;
+`bool_and(n > 5)`, the same aggregate, was right all along.
+
+#### Fixed
+
+- `substring` / `substr` over `bytea` slice bytes and report `bytea`.
+- `every(<expression>)`.
+- A scalar subquery takes its projection's type: `(SELECT count(*) FROM t)` is
+  `bigint`, and a correlated aggregate takes its column's type. It was `text`,
+  so a driver was sent the string `'3'` under oid 25.
+- A `::numeric(p, s)` **cast** rounds to its declared scale, as the column path
+  already did — `10::numeric(5,2)` is `10.00`, and a value that no longer fits
+  is `22003`.
+- `round()` / `floor()` / `ceil()` report their argument's numeric type;
+  `round(2.345::float8)` claimed `numeric` for a float result.
+- `GROUPS` window frames, whose offset counts **peer groups** rather than rows.
+  They were not handled at all — they fell through to the `RANGE` branch and
+  reported `RANGE with a numeric offset requires a numeric ORDER BY key`, an
+  error about a clause the user had not written.
+
+#### Still divergent
+
+`sqrt(numeric)` returns `float8` (PostgreSQL returns numeric at a scale its
+`sqrt_var` estimator picks), `corr` / `covar_pop` / `regr_*` are unsupported,
+`min`/`max` accept a `bytea` PostgreSQL rejects, and a scalar subquery under
+`GROUP BY` cannot be typed because the synthetic resolver cannot see the inner
+table.
+
+### A ninth SQL sweep: a named window was evaluated as `OVER ()`
+
+Window functions were the richest surface probed here yet, and four of the
+findings were silent — a plausible number in every row, computed from a window
+that was not the one written.
+
+**A named window lost its whole definition.** sqlglot keeps a `WINDOW w AS
+(...)` definition on the SELECT and leaves the *reference* as a bare alias with
+no partition, no order and no frame — which is exactly what every consumer
+downstream reads. So `sum(v) OVER w` with `w AS (ORDER BY id)` returned the
+whole-partition total on every row instead of a running one, and a
+`PARTITION BY` in the definition was dropped just as quietly.
+
+**`EXCLUDE` was parsed and then ignored.** It rides on the frame spec as
+`args["exclude"]` and nothing read it, so `EXCLUDE CURRENT ROW` answered the
+*unexcluded* frame — a running sum that still counted the current row.
+
+**`NULLS FIRST` in a window `ORDER BY` was ignored.** NULLs were placed by
+direction alone, which happens to reproduce PostgreSQL's defaults (last for
+ASC, first for DESC) — so the flag looked right until somebody wrote it
+explicitly, and then every rank in the partition was wrong.
+
+**`sum` and `avg` were typed by rules the `GROUP BY` path had long since got
+right.** A window `sum(int4)` declared int4 where PostgreSQL promotes to int8,
+and `avg` declared float8 and divided as a float where PostgreSQL answers
+numeric at `select_div_scale`'s scale.
+
+#### Fixed
+
+- **Named windows** (`WINDOW w AS (...)`) are resolved into their references
+  before a planning path is chosen, so the rest of the engine only ever sees a
+  fully specified window. Definitions may chain (`w2 AS (w1 ORDER BY x)`); a
+  reference may add an `ORDER BY` and a frame but not override the definition's
+  `ORDER BY` (`42P20`), and an unknown name is `42704`.
+- **`EXCLUDE CURRENT ROW` / `GROUP` / `TIES` / `NO OTHERS`**, on aggregate and
+  value windows alike. A frame is now an explicit index list, because `EXCLUDE`
+  punches a hole in the middle that an `[lo, hi]` pair cannot express.
+- **`NULLS FIRST` / `NULLS LAST`** in a window `ORDER BY`.
+- **Window `sum` / `avg` result types**, via the same `_sum_tag` / `_avg_tag`
+  helpers the `GROUP BY` path uses, and `avg` over an exact input now finishes
+  in numeric arithmetic rather than float — `avg` over 10, 20, 20 is
+  `16.6666666666666667`, not `16.666666666666668`.
+- **`ntile`** types as int4; it is the one integer window function PostgreSQL
+  does not make bigint.
+- **`agg(...) FILTER (WHERE ...) OVER (...)`** no longer fails with `42803`
+  naming an ordinary column. The `FILTER` node sits between the aggregate and
+  its `Window`, and the "is this a window aggregate?" guard looked only one
+  level up, so the aggregate was mistaken for a grouped one.
+- **A subquery in `RETURNING`** — `INSERT ... RETURNING id, (SELECT count(*)
+  FROM t)` — crashed with `XX000 internal error`: the `RETURNING` scalar context
+  was built with `catalog=None`, so resolving the subquery's table raised
+  `AttributeError`.
+
+- **`COALESCE`, `GREATEST` and `LEAST` resolve a common type** instead of taking
+  the first argument's. `coalesce(1::int, 2.5::numeric)` declared int4 and then
+  coerced the numeric result with `int('2.5')` — a bare Python `ValueError` that
+  reached the client with *no SQLSTATE at all*. The old code carried a comment
+  claiming first-wins "is what PG's common-type resolution amounts to for the
+  shapes we can decide"; it is not, and a probe says so. Note the precedence is
+  **not** arithmetic's: `int + real` is double precision, but
+  `greatest(int, real)` is real.
+
+- **`concat`, `concat_ws` and `format`'s `%s` render a boolean as `t` / `f`.**
+  They go through the type's *output* function, not `::text` — which spells it
+  `true` — so `concat(1, 2.5, true)` answered `12.5true` where PostgreSQL says
+  `12.5t`. Bool is the only type where the two spellings differ.
+- **`format` rejects too few arguments** with `22023` instead of substituting an
+  empty string, positional (`%3$s`) forms included.
+- **`split_part` with an empty delimiter** returns the whole string as field 1;
+  Python's `str.split("")` raises, and the `ValueError` escaped as a confusing
+  `function split_part(unknown) does not exist`. A zero field position is
+  `22023`, as it is there.
+
+- **A compound `INTERVAL` literal lost everything after its first two tokens.**
+  sqlglot parses `INTERVAL '1 day 3:45:00'` as `Interval(this='1', unit=DAY)`
+  and *discards the rest of the string* — it round-trips as `INTERVAL '1 DAY'`,
+  so three hours and forty-five minutes were gone before any of this engine's
+  code ran, and `INTERVAL '2 days ago'` came back **positive**. It only
+  truncates when the text starts `<number> <unit>`; a bare `'3:45:00'` and a
+  many-worded `'1 year 2 mons 3 days 04:05:06'` both survive, which is why it
+  hid. Compound literals are now rewritten to a cast before parsing, beside the
+  other repairs to sqlglot's parsing.
+- **`INTERVAL '1-2'`** (the ISO year-month form) reached the wire as `XX000`;
+  so did the full `'1-2 3 4:05:06'`, whose bare `3` is the days field rather
+  than a value awaiting a unit.
+- **Negating an interval COLUMN** raised a bare `decimal.ConversionSyntax` with
+  no SQLSTATE: `- col` fell through to a `numeric` default for any non-numeric
+  operand, and the output coercion then fed the interval subdocument to
+  `Decimal`. The literal form was always fine.
+- **`time ± interval` is a `time`**, wrapping at midnight, not an interval —
+  `TIME '13:45' - INTERVAL '14 hours'` came back as a 23:45 *duration* under the
+  interval oid.
+- **A `::date` cast compares equal to `CURRENT_DATE`.** The cast yields the
+  canonical text while `CURRENT_DATE` yields a `datetime.date`, so
+  `now()::date = CURRENT_DATE` answered FALSE on a day when both plainly named
+  the same one. Two casts, or two literals, were always fine.
+
+#### Added
+
+- **`string_agg` and `array_agg` as window functions**, including under
+  `FILTER`, with the array typed from its element rather than declared numeric.
+- **`LOCALTIME` and `LOCALTIMESTAMP`**, the tz-naive twins of `CURRENT_TIME` /
+  `CURRENT_TIMESTAMP`; sqlglot gives them their own nodes and neither was
+  handled, so both answered `42883 function localtime() does not exist`.
+- **`min_scale` and `trim_scale`**, beside the `scale` that was already there —
+  `scale` is the digits a numeric *carries*, `min_scale` the smallest that keeps
+  the value exactly, and `trim_scale` the value re-scaled to it.
+- **`UPDATE ... SET (a, b) = (x, y)`**, in all three row-constructor spellings
+  (`(a, b)`, a one-element `(a)`, and `ROW(...)`), expanded to single-column
+  assignments at parse time. An arity mismatch is `42601`. A row *subquery*
+  right-hand side is still unsupported and says so.
+
+### SQL: `char(n)` comparison, `WITH ORDINALITY` aliases, and `greatest`/`least` typing
+
+A seventh differential sweep against PostgreSQL 14.13 — this one over `char(n)`
+semantics, `INSERT … ON CONFLICT`, `GROUPING`/`ROLLUP`/`CUBE`, CTEs, row
+locking and set operations — scored 20 of 24 and turned up four defects, one of
+them a silently wrong answer.
+
+#### Fixed
+
+- `char(n)` columns now compare **blank-insensitively**, as Postgres does.
+  `bpchar` comparison strips trailing spaces from *both* operands, so a
+  `char(5)` holding `'ab'` matches `= 'ab'` **and** `= 'ab   '`. SecantusDB
+  stores the value unpadded, which got the stored side right for free but left
+  the literal side padded — so the second form quietly answered false where
+  Postgres answers true, in `WHERE`, in a projection, and in `IN`. `varchar`
+  is genuinely blank-sensitive and is deliberately left alone.
+- `UNNEST(…) WITH ORDINALITY AS t(v, i)` now names its ordinality column `i`.
+  sqlglot hoists an `UNNEST`'s last alias column into a separate `offset` slot
+  rather than leaving it in the alias list, so the column fell back to the
+  default name `ordinality` and `SELECT i` failed with
+  `42703 column "i" does not exist`.
+- `greatest()` / `least()` now report their arguments' type rather than `text`.
+  `greatest(NULL, 1)` was sent as the *string* `'1'` under oid 25 where
+  Postgres sends the integer `1`.
+
+#### Added
+
+- `num_nonnulls()` and `num_nulls()`.
+
+### A sixth sweep: `age()` borrowed from the wrong month
+
+20 of 33 shapes matched PostgreSQL 14.13 across constraints, identity columns,
+time zones, GUCs and string functions. The important miss was silently wrong
+arithmetic.
+
+`age('2021-03-15', '2020-01-20')` answered `1 year 1 mon 23 days` where
+PostgreSQL answers **26 days**. When the day difference goes negative, the
+borrow takes the length of the **start** date's month — January's 31 here — not
+the month before `end` (February's 28), and not a flat 31. Eight probed cases
+discriminate all three readings, including `age('2020-04-01','2020-01-15')`
+(January's 31, not April's 30) and `age('2020-03-01','2020-02-28')` (February's
+29, not 31).
+
+#### Fixed
+
+- `age()`'s day borrow. Sixteen cases now match, and two existing tests that
+  had recorded the old answer are corrected against the reference server.
+- `format('%1$s-%1$s-%2$s', 'a', 'b')` — positional argument specifiers, which
+  may repeat one. Unrecognised, the whole directive was copied through as
+  literal text, so the format string came back unformatted.
+- `current_setting('nope', true)` is NULL and `current_setting('nope')` is
+  `42704 unrecognized configuration parameter`. Both answered the empty string,
+  which reads as a setting that exists and is blank.
+- `parse_ident()`, `unistr()` and `normalize()`.
+- `localtimestamp` nested in an expression, and in the **session's** time zone.
+  It used the machine's wall clock, a different instant whenever the two zones
+  differ — with the default UTC session on a UTC+1 host,
+  `localtimestamp <= now()` was FALSE.
+
+#### Still divergent
+
+`AT TIME ZONE`, `extract(timezone_hour …)`, `LIKE ALL/ANY(array)`, and
+`to_ascii()`.
+
+### A tenth SQL sweep: a function that was legal at the top of a SELECT and nowhere else
+
+DDL came back strong — 38 of 41 shapes already matched PostgreSQL 14.13, and
+catalog introspection 15 of 22 — so this is a short batch. Three findings.
+
+**A session function stopped being resolvable one level down.**
+`current_setting('x')` worked; `current_setting('x') ~ '…'` answered
+`42883 function current_setting(text) does not exist`. Those functions were only
+ever reached from the constant-SELECT planner, so any operand position, `WHERE`
+clause or wrapping call lost them — the same shape as a set-returning function
+that only works as a row source, but here with no reason for the restriction.
+
+**`has_table_privilege` ignored the owner.** It consulted recorded `GRANT`s
+only, so a table the caller had just created and could plainly read reported
+FALSE. PostgreSQL's owner holds every privilege implicitly — measured on 14.13
+by creating a table, granting `SELECT` to another role, and asking as the
+creator, which answers true.
+
+#### Fixed
+
+- **Session functions are legal wherever an expression is.** `current_setting`,
+  `current_database`, `current_schema`, `current_query`, `version`,
+  `pg_is_in_recovery` and the `inet_server_*` / `pg_postmaster_start_time` pair
+  now resolve in any position. Deliberately *not* on that list: anything with a
+  side effect (`set_config`, the advisory locks, `pg_terminate_backend`), which
+  keeps its existing explicit handling. Widening where they are reachable does
+  not widen what they accept — an unknown setting is still `42704`.
+- **`has_table_privilege` grants the owner everything implicitly**, and honours
+  a `REVOKE` that targets the owner (which materializes the ACL). This is the
+  *reporting* function; the authz gate has its own path and already permitted
+  the owner, which is exactly why the read worked while this denied it. The
+  rule hands nothing to anyone else — a stranger still reports false.
+- **`CREATE TABLE (id int, id int)` is rejected** with `42701 column "id"
+  specified more than once`, instead of creating a relation whose second `id`
+  was unreachable. Names fold, so `(id int, ID int)` collides too.
+- **`ALTER TABLE ... DROP COLUMN`** names the relation in its 42703, as
+  PostgreSQL does: `column "x" of relation "t" does not exist`.
+
+An existing test asserted that the two-argument `has_table_privilege` was false
+for the session user "(default 'secantus', no grant)". That is not the rule, and
+PostgreSQL disagrees; the test now carries the measured value and the reason.
+
+### `to_char(numeric, …)` matched PostgreSQL on 63 of 300 shapes
+
+A sweep of 30 templates × 10 values against PostgreSQL 14.13 found four rules
+the implementation did not have at all, and a fifth problem upstream of it.
+
+* **Overflow prints `#`.** A value too wide for the digit slots fills every one
+  of them — `to_char(1234.5, '999')` is `' ###'`, not `' 1235'`. Printing the
+  number anyway silently violated the template's own declared width.
+* **The sign sits against the digits**, immediately left of the first one, not
+  in front of the padded field: `to_char(-12, '999')` is `' -12'`.
+* **A `0` slot zero-fills everything to its right**: `'0999'` over 12 is
+  `' 0012'`.
+* **An all-`9` integer part renders blank when the value has none** —
+  `to_char(0.5, '999.9')` is `'    .5'`.
+
+And the template never reached the numeric formatter intact: sqlglot's postgres
+dialect part-converts it to strftime first, so `MI999` arrived as `%M999` and
+`9999D99` as `9999%u99` — the tokens the numeric formatter did not recognise
+were simply dropped, which is why `D` produced no decimal point at all.
+
+All 300 shapes now match.
+
+#### Fixed
+
+- `to_char(numeric, …)`: overflow `#` fill, sign placement (`S` / `MI` / `PR`,
+  leading and trailing), `0` zero-fill, blank integer parts, `G` / `D` / `L`
+  locale tokens, `$` in front of the sign, `FM` (which drops trailing
+  fractional zeros but keeps the point), and `RN` Roman numerals.
+- `IN (subquery)` and `NOT IN (subquery)` in `UPDATE` and `DELETE`. The
+  identical predicate has always worked in a `SELECT` — the DML planners simply
+  never published the subquery context the `SELECT` planner does.
+
+#### Corrected tests
+
+Six `to_char` expectations recorded this engine's own output rather than
+PostgreSQL's, and were re-probed against 14.13: `FM` drops trailing fractional
+zeros (`FM$9,999.99` over 1234.5 is `$1,234.5`), a value too wide for its slots
+is `###.##`, and `L` is the *locale* currency symbol — empty here, not `$`.
+
+#### Still divergent
+
+`EXISTS (subquery)` in `UPDATE` / `DELETE`, `UPDATE … FROM (VALUES …)`, and
+`string_agg` / `array_agg` with `DISTINCT`.
+
+### A twelfth SQL sweep: `LIMIT 0` returned every row
+
+Transactions came back **perfect — 40 of 40**: savepoints, the
+aborted-transaction state, isolation levels, `READ ONLY`, and transactional DDL
+rollback all match PostgreSQL 14.13. Two clusters did not.
+
+**`LIMIT 0` returned the whole table.** A sentinel collision: the planner used
+`0` to mean "no `LIMIT`", and every consumer tested the value for truthiness, so
+a real `LIMIT 0` was indistinguishable from its own absence. It matters because
+`LIMIT 0` is how a client asks for a result's column metadata *without* rows —
+ORMs and BI tools do it constantly.
+
+The fix runs deeper than the sentinel. The storage layer reads `limit=0` as "no
+limit" too (Mongo's convention), so a genuine `LIMIT 0` must never reach it; and
+Mongo's `$limit` stage *rejects* zero outright (`54000 the limit must be
+positive`), so the pipeline emits a match-nothing stage instead.
+
+**Rows containing NULL ignored SQL's three-valued rules.** `(1,NULL) =
+(1,NULL)` answered true where PostgreSQL says NULL — Python's `==` treats two
+`None`s as equal — `(NULL,NULL) IS NULL` answered false where it says true, and
+`(1,2) < (1,NULL)` raised `42883` naming `integer[]`, the record having been
+compared as an array.
+
+**`NATURAL JOIN` was a cross join.** sqlglot records it as `args["method"]`
+with no `on` and no `using`, and nothing in join planning read it — so the join
+lost its condition entirely and returned every pair. This is precisely the bug
+`desugar_join_using` was written for one step later in the same chain, which is
+now where the fix lives: NATURAL resolves to the common columns, and that
+function turns them into the ON.
+
+#### Fixed
+
+- **`LIMIT 0` returns no rows**, on every path: the plain scan, the aggregation
+  pipeline, a derived table, and a FROM-less `SELECT`.
+- **`LIMIT NULL` and `LIMIT ALL`** mean no limit, as they do in PostgreSQL; a
+  negative limit is `2201W`; and `FETCH FIRST ROW ONLY` (the standard's optional
+  count, defaulting to one) works instead of returning everything.
+- **A FROM-less `SELECT` honours `LIMIT` / `OFFSET`** at all — `SELECT 1 OFFSET
+  1` is empty.
+- **Row comparison follows the three-valued rule**: fields are compared left to
+  right, the first pair that decides wins, and a NULL pair reached before then
+  makes the whole comparison NULL. `(1,NULL) = (2,3)` is still false, because
+  the *first* pair decided it.
+- **`NATURAL JOIN` / `NATURAL LEFT JOIN`** join on the relations' common
+  columns instead of returning every pair (`NATURAL LEFT JOIN` previously
+  errored outright with "LEFT JOIN requires an ON clause"). A NATURAL join with
+  no common column is a cross join in PostgreSQL too, so that case needs no
+  special handling.
+- **An aggregate's argument may be a function call.** `sum(abs(n))`,
+  `string_agg(coalesce(s,'-'), ',' ORDER BY id)` and `array_agg(upper(s))` all
+  answered `0A000 unsupported aggregate argument` — the lowerer handled columns,
+  literals, comparisons, `CASE` and arithmetic, but no function calls at all
+  (14 of 16 probed shapes failed on it). `upper`, `lower`, `abs`, `floor`,
+  `ceil`, `sqrt`, `length`, `coalesce` and `||` now lower to their Mongo
+  operators, each wrapped in a NULL guard because PostgreSQL's scalar functions
+  are *strict* and Mongo's are not — `$toUpper` maps null to the empty string
+  and `$strLenCP` rejects it outright.
+
+  **`round` is deliberately absent** from that table: Mongo's `$round` rounds
+  half-to-even where PostgreSQL rounds half-away-from-zero, so lowering it would
+  make `sum(round(x))` over 1.5 and 2.5 answer 4 instead of 5 — a silent wrong
+  answer in place of an honest "unsupported argument".
+- **`row IS NULL` / `row IS NOT NULL`** are each true only when *every* field
+  qualifies — so a row with one NULL is false for **both**. They are not
+  negations of each other, and treating them as such made `(1,NULL) IS NOT
+  NULL` true.
+
+### SQL: remove the superseded `to_char` strftime machinery, correct the docs
+
+Follow-up to the datetime template engine. Housekeeping found by reconciling
+the documentation against what the code now does.
+
+#### Changed
+
+- Removed 98 lines of dead `to_char` machinery that the template parser
+  superseded (`_repair_time_format`, `_render_word_token`, `_PG_WORD_TOKENS`,
+  `_WORD_TIME_TOKEN_RE`, `_WORD_TIME_DIRECTIVES`, `_WORD_TIME_PAD`). Nothing
+  referenced it, and its comment still asserted that `IYY` / `IY` / `I` / `IDDD`
+  "have no strftime directive and are not handled" — a limitation that no longer
+  exists, pointing at a backlog entry that is now resolved.
+
+#### Fixed (documentation)
+
+- Three of the four worked `to_char` numeric examples in `docs/sql.md` showed
+  pre-`FM`-fix output: `FM999,999.99` on `1234.5` is `1,234.5`, not `1,234.50`.
+  All examples on the page are now verified against PostgreSQL 14.13.
+- `docs/sql.md` claimed `RN` (Roman numerals) was unimplemented. It is
+  implemented and matches Postgres.
+- Added a `to_char` / `to_date` / `to_timestamp` **datetime** section — the new
+  template engine had no user documentation.
+
+### SQL: a real `to_char` / `to_date` / `to_timestamp` template engine
+
+An eighth differential sweep against PostgreSQL 14.13, over datetime
+formatting, scored **55 of 122**. The datetime half of `to_char` was built by
+converting the template through sqlglot's Postgres `TIME_MAPPING` and handing
+the result to `strftime` — a mapping that knows a handful of tokens and matches
+single letters anywhere they appear. Two sweeps now score **122/122** and
+**190/192**.
+
+#### Fixed
+
+- **Tokens that rendered as their own spelling** now render: `Q`, `W`, `WW`,
+  `CC`, `J`, `MS`, `US`, `SSSS`, `HH`, `RM`, `Y,YYY`, `YYY`, `Y`, `IYY`, `IY`,
+  `I`, `IDDD`, `FF1`–`FF6`, `TZH`, `TZM`, `OF`, quoted `"literals"`, and the
+  `TM` prefix.
+- **Tokens matched inside other tokens.** The `D` in `AD` rendered the weekday,
+  so `to_char(ts, 'AD')` answered `'A3'` and `'A.D.'` answered `'A.3.'`.
+- **Case-sensitive token matching**, which is how Postgres works and is
+  observable: `Ddth` is `D` + `d` + `th` (`'44th'`), not `DD` + `th`
+  (`'02nd'`). `day`/`dy`/`am`/`bc` now render lower-case.
+- **`FM` prefixes one token**, rather than latching on: `FMHH12:MI` is `'2:07'`.
+- **`D` is 1=Sunday..7=Saturday**, not the ISO weekday — it was off by one for
+  every day of the week.
+- **`th` gives the right ordinal** (`'02nd'`, `'01st'`, `'03rd'`), not always
+  `'th'`.
+- **`to_date` / `to_timestamp` parse word templates.** `Mon`, `Month`, `Dy`,
+  `AM`, `MS`, `IYYY IW`, `J` and `DDD` templates raised
+  `22007 invalid input syntax` because the same lossy mapping was used to build
+  a `strptime` directive.
+- **`to_timestamp` returns a `timestamptz`**, not a naive timestamp — it
+  rendered without the `+00` offset Postgres sends.
+
+#### Known limitation
+
+A year-less template defaults to **1 BC** on Postgres. Python's `datetime` has
+no era and a minimum year of 1 AD, so SecantusDB answers 1 AD. Recorded in
+`tasks/backlog.md`; it is the only divergence left in the 314-case sweep.
+
+### `UPDATE … SET col = DEFAULT`
+
+Setting a column back to its default reported `column "default" does not
+exist`. The `DEFAULT` keyword was being read as the name of a column.
+
+A column with no default becomes NULL, as in PostgreSQL, and a quoted
+`"default"` still means a column called `default`.
+
+#### Fixed
+
+- `UPDATE … SET col = DEFAULT` sets the column to its default, for a literal
+  default, an expression default, or NULL where there is none. A `NOT NULL`
+  column with no default reports a not-null violation, as PostgreSQL does.
+- The same mis-reading sat under the guard that decides whether a generated
+  column may be updated, so that check was treating every `SET gen = DEFAULT`
+  as a non-DEFAULT value.
+
+#### Known limitation
+
+`SET serial_col = DEFAULT` is refused rather than guessed at: a serial's
+default draws from its sequence, which the statement planner cannot do.
+
+### A table alias can stand for the whole row
+
+#### Fixed
+
+- `row_to_json(t) FROM (SELECT ...) t` — one of the commonest ways to get a row
+  out as JSON — answered `42703 column "t" does not exist`. So did
+  `to_json(r)`, `row_to_json(<table>)`, `(<table>)::text` and
+  `SELECT t FROM t`. A table or sub-select alias now stands for the whole row,
+  as it does in PostgreSQL.
+
+A real column of the same name still wins, which is what PostgreSQL does.
+
+One gap remains: `SELECT t FROM t` reports the generic `RECORD` oid where
+PostgreSQL reports the table's own rowtype oid. The field values are correct;
+minting per-table rowtype oids is a catalog feature, recorded in
+`tasks/backlog.md`.
+
+### `cume_dist()` and `percent_rank()`
+
+Both window functions were unavailable. Every other window function already
+worked, so these two were the gap.
+
+Both are peer-aware: rows that tie under the `ORDER BY` share a value, so
+`cume_dist()` counts the whole tied group rather than the row's own position.
+
+#### Added
+
+- `cume_dist()` and `percent_rank()`, including partitions, tied rows, and a
+  single-row partition.
+
+### `ORDER BY` works over `unnest`
+
+Sorting the rows produced by `unnest` didn't. `SELECT unnest(ARRAY[9,8,7]) AS u
+FROM src ORDER BY 1` returned the elements in array order, and ordering by the
+column's own name — `ORDER BY u`, the form most queries use — failed outright
+with "feature not supported".
+
+Both came from the same thing: the sort key was computed once per source row,
+before the function expanded it into many. Every expanded row therefore carried
+an identical key, and sorting them left the original order untouched. Keys for a
+set-returning column are now taken from the expanded row.
+
+`DISTINCT ON` is unaffected: its key is deliberately row-level and still
+computed before expansion, which is what PostgreSQL does.
+
+The equivalent field-selection form,
+`(information_schema._pg_expandarray(arr)).x`, plans differently and is not
+covered by this change.
+
+#### Fixed
+
+- `ORDER BY` over `unnest` sorts the expanded rows, by output ordinal or by
+  column name, ascending or descending.
+
+### `$limit` and `$skip` argument errors match MongoDB exactly
+
+A malformed `$limit` or `$skip` reported the right error code with the wrong
+text, and in a few cases the wrong outcome entirely. MongoDB echoes the value it
+rejected in shell form — `"x"`, `true`, `[ 1, "a" ]`, `{ a: 1 }` — where the
+Python server printed a Python representation, and the Rust server printed a
+Rust one.
+
+Probing the two servers against a real MongoDB across the whole value space
+turned up more than the wording. `$skip: 1.5` and `$skip: -1` came back as a
+generic error from the Rust server rather than the specific one; so did
+`$limit: 0`. A decimal argument was rejected by both servers where MongoDB
+accepts it — `$skip: Decimal128("2")` is a valid skip of one document — and a
+fractional decimal has its own message, distinct from a fractional double's.
+
+All 44 shapes now agree across MongoDB, the Python server and the Rust server,
+including ObjectId and date arguments.
+
+### `$stdDevPop` / `$stdDevSamp` no longer crash on non-numeric input
+
+A group containing a value that wasn't a number — a string, an array, a
+document — returned an internal server error. The accumulator added every value
+it was handed, so Python's own arithmetic raised (`unsupported operand type(s)
+for +=: 'float' and 'str'`) and the failure escaped as a generic "internal
+server error". MongoDB simply ignores those values and computes the deviation
+over the numbers that are there.
+
+A quieter problem sat next to it. When a group held *no* numeric value at all,
+both servers omitted the output field entirely; MongoDB always emits it, with
+`null`. Code reading `doc["s"]` got a `KeyError` where a real server hands back
+`None`. Booleans were also being counted as 0 and 1, which MongoDB does not do —
+a group of booleans is `null`, not zero.
+
+#### Fixed
+
+- `$stdDevPop` / `$stdDevSamp` skip non-numeric values (string, array,
+  document, boolean, null) instead of failing the aggregation, matching
+  MongoDB's numeric domain of int / long / double / decimal.
+- The output field is always present, holding `null` when the group contained no
+  numeric value, rather than being omitted.
+- Decimal input answers a double, as MongoDB does.
+
+### Timestamp comparisons are microsecond-exact
+
+A `timestamp` or `timestamptz` holding sub-millisecond precision could not be
+found by a query for it. Comparisons looked only at the stored millisecond, not
+the microsecond remainder kept alongside it, and the results were wrong in both
+directions: a row storing `12:00:00.123456` did **not** match
+`WHERE t = '12:00:00.123456'` — an equality on its own stored value — while it
+**did** match `WHERE t = '12:00:00.123'`, a value it is not equal to. Range
+comparisons inside the same millisecond were wrong the same way.
+
+Reads were always precise, so a value could be inserted, selected back
+correctly, and still be unfindable by a predicate on the value just returned.
+
+Comparisons now consider the remainder: the millisecond is compared first and
+the remainder only within it. Every shape — `=`, `<>`, `<`, `<=`, `>`, `>=` —
+was checked against a live PostgreSQL across 42 predicate/literal combinations
+with no divergence, and that comparison now runs as a test wherever a
+PostgreSQL server is reachable.
+
+`ORDER BY` within a single millisecond is still millisecond-granular; sorting
+needs the remainder as a tiebreaker and is not part of this change.
+
+#### Fixed
+
+- `WHERE` comparisons on `timestamp` / `timestamptz` account for
+  sub-millisecond precision, so a row matches an equality on its own stored
+  value and no longer matches a truncated one it differs from.
+
+### More of the test suite starts from a cloned database
+
+An earlier change had tests copy a prebuilt WiredTiger database instead of
+building a fresh one per test, but it only covered the files that named their
+storage location in one particular way. The most common remaining form was the
+same thing with a subdirectory, so this extends the same treatment to 54 more
+files — cutting their combined runtime from 350 to 253 seconds.
+
+Left alone deliberately: the backup, restore and point-in-time-recovery tests.
+Those stand up several databases with distinct roles, and a restore target in
+particular often needs to start empty, so handing them a pre-populated copy would
+change what they actually prove.
+
+#### Changed
+- 54 further test files take the cloned-home fixture instead of creating a
+  WiredTiger database per test.
+
+### Tests start from a cloned WiredTiger home instead of building one each time
+
+The test suite spent most of its time waiting on WiredTiger rather than running
+Python. Measuring the per-test fixture floor showed that of the ~281 ms it cost
+to stand a server up, ~234 ms was inside WiredTiger's C library — and ~137 ms of
+that was WiredTiger creating the same dozen empty tables over and over, once per
+test, at roughly 9.7 ms per table. That work is identical every time: every test
+begins from the same empty schema.
+
+So each worker now builds one pristine database home at the start of a session
+and copies it per test, rather than asking WiredTiger to construct a new one from
+scratch. Where the filesystem supports copy-on-write the copy is nearly free and
+uses less disk than the old approach did. Across the 22 test files converted so
+far this cut their runtime from 260 s to 195 s, and the equivalence a change like
+this depends on — that a copied database behaves exactly like a freshly built one
+— is pinned by tests that compare the two directly rather than taking it on faith.
+
+#### Added
+- `tests/wt_template.py` (`build_template` / `clone_template`) and the
+  session-scoped `_wt_template` + per-test `wt_home` fixtures in
+  `tests/conftest.py`.
+- `tests/test_wt_template.py`, pinning cloned-vs-created equivalence, clone
+  isolation, and durable close-and-reopen.
+- `tasks/rust-test-harness-investigation.md`, recording the measurements behind
+  this (and why reimplementing the harness in Rust was rejected).
+
+#### Changed
+- 22 test files now take the `wt_home` fixture instead of creating a WiredTiger
+  home in `tmp_path`.
+
+### A tz-aware datetime bound as a `timestamptz` parameter now round-trips
+
+Binding a Python timezone-aware `datetime` as a `timestamptz` parameter on the
+Rust PostgreSQL server (`secantusd-pg`) and comparing it to the same instant
+written as a literal — `'<expr>'::timestamptz = %s`, the shape psycopg's own
+`test_dump_datetimetz` asserts — returned `false`. The binary wire form of a
+`timestamptz` parameter hands the server an absolute instant (i64 microseconds
+since 2000-01-01 UTC), but the decoder rendered it to session-zone TEXT and
+shipped THAT string as the value. The zone offset was then dropped the moment
+anything re-coerced the string as a bare timestamp, so the parameter landed the
+session offset away from the literal it was meant to equal and compared unequal.
+Both `%b` (binary) and psycopg's default `%s` (which sends a datetime in binary)
+were wrong across the corpus — year 0001 through 9999, sub-second fractions, and
+seconds-carrying offsets; `%t` (forced text) was already correct.
+
+The binary decoder now stores the instant directly, on the same carrier a
+`::timestamptz` literal produces (a BSON date, or a sub-millisecond composite),
+so the binary and text paths share one representation. A redundant
+`timestamptz` → `timestamptz` cast (`$1::timestamptz` over a parameter already
+declared `timestamptz`) is now a no-op instead of re-parsing the instant's
+offset-less wall clock and applying the session zone a second time — the
+`timestamp` → `timestamptz` cast still applies the zone, since its source type
+is `timestamp`, not `timestamptz`. The psycopg gauge gains +33 passing tests
+(3557 → 3590) with no regressions; `test_dump_datetimetz` goes from 30 failing
+to fully green.
+
+#### Fixed
+
+- `secantus-pgserver` `decode_parameter`: a binary `timestamptz` parameter
+  (oid 1184) is decoded to the instant carrier, not session-rendered text; the
+  extreme i64 infinities are kept as `infinity` / `-infinity` text.
+- `secantus-pgplan` `const_value`: a `timestamptz` → `timestamptz` cast over a
+  stored instant is a no-op, so it no longer double-applies the session zone.
+- `secantus-pgplan`: new `timestamptz_value_from_micros` builds the stored
+  instant carrier, shared by the binary decoder.
+
+### A network timeout has a direction, and the TLS tests had it backwards
+
+Two tests failed intermittently on the Windows CI runner and nowhere else, three
+weeks apart, in different suites: a pymongo client pinging a TLS-enabled Rust
+server, and a raw socket completing a PostgreSQL TLS handshake. Both were
+recorded as flakes and passed on rerun, which is how they survived — and the
+same entry was filed in the backlog twice, once for each sighting.
+
+Neither was a race against the listener. The server binds and listens before it
+hands back an address, so a connection lands in the accept backlog whether or
+not the accept thread has been scheduled; there is no readiness signal to wait
+for, because the readiness signal is the handshake itself. What both tests
+shared was a five-second budget that had to cover thread scheduling, a protocol
+round trip and an RSA-2048 handshake on the slowest machine in the matrix while
+the rest of the suite ran in parallel.
+
+The fix is a distinction rather than a bigger number. A budget on a path
+expected to succeed should be generous, because it costs nothing when the test
+passes and buys only failures on slow machines; a budget on a path expected to
+be refused must stay short, because the test waits out the whole of it. Those
+are now two named constants, applied across every suite that negotiates TLS —
+one of which had already arrived at the same split on its own.
+
+#### Added
+
+- `tests/net_timeouts.py`: `CONNECT_TIMEOUT_S` and
+  `SERVER_SELECTION_TIMEOUT_MS` for paths expected to connect, and
+  `REJECTED_SELECTION_TIMEOUT_MS` for paths expected to be refused.
+
+#### Fixed
+
+- The intermittent Windows failures of `test_tls_against_rust_server` and
+  `test_pgserver_auth.py::test_tls_request_accepted_and_query_over_tls`.
+- Budgets in `test_tls.py`, `test_x509_auth.py`, `test_pgserver_auth.py`,
+  `test_pgserver_pg8000.py` and `test_rust_server_smoke.py` now come from the
+  shared module instead of five sets of literals.
+
+### `$toDate` parses the dates MongoDB parses
+
+`{$toDate: "12/31/2020"}` is an ordinary call. Both servers answered `241
+ConversionFailure`, because both implemented a small ISO-8601 subset while
+MongoDB runs **timelib** — a parser with a much larger format table. 15 of 19
+measured shapes diverged.
+
+Three of its rules are worth knowing, because none is guessable:
+
+- **The slash form is US-first by rule, not by ambiguity-resolution.**
+  `31/12/2020` is refused outright, so `MM/DD/YYYY` wins and day-first is not a
+  fallback.
+- **A trailing letter is a military timezone, not the ISO separator.**
+  `"2020-01-01T"` is `07:00:00`, because `T` is UTC−7. This is deterministic,
+  not host-local — a `TZ=UTC` server answers the same. `J` is the one letter
+  timelib rejects.
+- **An out-of-range component is a parse failure, not a rollover.**
+  `13/01/2020` and `12/32/2020` are both refused.
+
+#### Added
+
+Both servers now accept, and agree with MongoDB on:
+
+| form | example |
+| --- | --- |
+| US slash, padded or not, optional time | `12/31/2020`, `1/2/2020`, `12/31/2020 10:30` |
+| year-first slash | `2020/12/31` |
+| non-padded ISO | `2020-1-1`, `2020-1-1 10:30` |
+| month names, either order | `Dec 31 2020`, `31 December 2020`, `Dec 31, 2020` |
+| Unix seconds | `@1577836800`, `@-1`, `@1577836800.5` |
+| compact | `20200101`, `20200101T120000` |
+| ISO week date | `2020-W01-1` |
+| hour with no minutes | `2020-01-01T00` |
+| military timezone suffix | `2020-01-01T`, `…A`, `…Z` |
+| surrounding whitespace | `"  2020-01-01"`, `"2020-01-01 "` |
+
+Measured against mongod 8.2.11 over 45 shapes — including the refusals, which
+matter as much as the acceptances: a parser that takes too much is as wrong as
+one that takes too little. 0 divergent on both servers.
+
+#### Still not reproduced
+
+MongoDB's per-position diagnostic for a string its scanner got partway through
+(`'abc'` names the offending character and where it stopped) needs timelib's own
+lexer and timezone-abbreviation tables. Both servers give the same error code
+and a general message rather than inventing a position.
+
+### The Rust server renders `$toLower` / `$toUpper` of a `Timestamp`
+
+mongod puts a `Timestamp` through a legacy `asctime`-like path rather than the
+`$dateToString` format language, and renders it in the **server process's local
+timezone**. The Python server has always matched that; the Rust server answered
+`16007 can't convert from BSON type timestamp to String` instead — a refusal
+where mongod returns a string, and one with no Python behind it on the
+standalone server.
+
+#### Fixed
+
+- `$toLower` / `$toUpper` of a `Timestamp` now render on the Rust server, as
+  `%b %e %H:%M:%S:<increment>` — the day space-padded (`jul  3`), the increment
+  unpadded (`:0`, `:12`), the whole string then ASCII-cased.
+- The rendering is DST-correct, resolved against a real timezone database at the
+  instant rather than a fixed offset: re-probed against mongod 8.2.11 across
+  three zones, `America/New_York` is 5h behind in November and 4h in July.
+  Verified end-to-end over the wire on `secantusd-rs` under both `TZ=UTC` and
+  `TZ=America/New_York`.
+
+### `top` reports real per-namespace operation counters
+
+`top` answered with mongod's shape but every `{time, count}` was a hard zero, so
+`mongotop` rendered an idle server no matter how much load it was under. Both
+servers now instrument per-namespace operation timing and report it.
+
+The section mapping was probed against a real mongod rather than inferred, which
+was worth doing: the obvious mapping is wrong in four places. `aggregate`,
+`count`, `distinct` and `findAndModify` all land in `commands`, not in
+`queries`/`update` — mongod's `queries` section is essentially just `find`.
+Counts are per command rather than per document, so a 50-document `insert` bumps
+the count by one. And a successful `drop` resets a namespace's counters instead
+of carrying its history forward.
+
+#### Added
+
+- `top`'s `total` / `readLock` / `writeLock` and per-operation sections now carry
+  real microsecond times and operation counts, per namespace, on both the Python
+  and Rust servers. Verified against mongod 8.3.4 over a mixed workload: 8 of the
+  9 sections match exactly.
+- The Python server reuses the profiler's existing clock read rather than adding
+  a second one to the dispatch path.
+
+#### Fixed
+
+- A successful `drop` now resets that namespace's counters, matching mongod.
+- Commands that name no collection (`ping`, `hello`, `serverStatus`,
+  `listCollections`) are no longer attributed to a namespace; `explain` is
+  attributed to the namespace of the command it explains.
+
+### `top` reports real timings on Windows
+
+The `top` command measured how long each operation took with a clock whose
+resolution on Windows before Python 3.11 is about 15.6 milliseconds. Anything
+faster than that measured as zero elapsed time, so the reported per-namespace
+timings were almost always `0` on that platform — the counts were right, the
+times were not.
+
+Timing now uses the high-resolution performance counter, which is the correct
+clock for measuring an interval and is precise on every supported platform.
+
+#### Fixed
+
+- `top` reports non-zero operation times on Windows / Python 3.10, where the
+  previous clock's granularity rounded almost every measurement to zero.
+
+### CI broke on a crate nobody here depends on, because two lockfiles were ignored
+
+`tinyvec 1.13.0` shipped a library that does not compile — `TinyVec::Heap(vec![
+...])` with `vec!` not in scope — and took the whole of CI with it on a commit
+that changed no dependency.
+
+`test.yml`'s `rust-storage` job runs `cargo fmt / clippy / test` in each of six
+WT-linked crate directories, which makes every one of them its own **dependency
+resolution root**. Four of the six commit a `Cargo.lock` and were unaffected —
+`secantusdb` among them, which pulls tinyvec and pins 1.11.0. The two whose
+locks were gitignored re-resolved to 1.13.0 and failed, and so did the
+storage-engine wheel build on both Linux and Windows.
+
+The exclusion had a comment justifying it: these crates are "built only by CI's
+CMake path, so a stray per-crate `target/` + `Cargo.lock` should never be
+committed". The first half is not true — the workflow builds them directly —
+and the second conflated a build artifact with a lockfile. The `target/`
+directories stay ignored; the two locks are now tracked, which makes the set of
+six consistent.
+
+Nothing about this was specific to one branch: `main` would have failed on its
+next run.
+
+#### Fixed
+
+- `.gitignore`: `crates/secantus-storage-adapter/Cargo.lock` and
+  `crates/secantus-server-py/Cargo.lock` are no longer ignored, with the reason
+  recorded where the old claim used to be.
+- Both lockfiles committed, pinning `tinyvec 1.12.0`.
+
+### An undefined `$$variable` answers 17276 on every surface, not just aggregation
+
+The parse-time check for an undefined `$$variable` reached the aggregation
+pipeline. Every **other** surface that takes a filter or an update still fell
+through to the storage layer's generic `BadValue` (2) — `query uses a construct
+the Rust server does not support` — on the Rust server, and the Python server
+failed whole write batches that mongod fails one statement of.
+
+Measured on mongod 8.2.11: **the Rust server was wrong on all 8 surfaces, the
+Python server on 4.**
+
+#### Fixed
+
+- **`find`, `count`, `distinct` and `findAndModify`** now answer 17276 for an
+  undefined variable inside a filter's `$expr`, instead of the generic
+  unsupported-construct error.
+- **`update` and `delete` report it per STATEMENT**, in `writeErrors` with code
+  17276 — not as a command error. This matters beyond the code: mongod applies
+  the earlier statements in the batch and fails only the offending one
+  (`n: 1` with the error at `index: 1`), where the Python server failed the
+  whole batch and the Rust server reported code 2.
+- **A pipeline-form update carries the stage wrapper.** `{"u": [{"$set":
+  {"b": "$$NOPE"}}]}` is `Invalid $set :: caused by :: Use of undefined
+  variable: NOPE`; a filter never takes a wrapper.
+
+#### How it is checked
+
+A filter is **query language**, not an expression: `{s: "$$NOPE"}` matches the
+literal string and must not be flagged. Only `$expr` holds an expression, and
+only `$and` / `$or` / `$nor` nest further filters — so the new filter walker
+descends into exactly those and leaves everything else alone, the same
+conservative rule the pipeline walker follows. A false positive would reject a
+valid query, which is worse than the wrong code being fixed.
+
+Command-level `let` binds, and is threaded through on every surface.
+
+14 cases added to `tests/test_mongod_differential.py`, four of them
+false-positive guards (a literal `"$$NOPE"` in a filter, a bound `let`, and two
+ordinary queries), plus the per-statement case that pins `n: 1`.
+
+### An undefined `$$variable` is a parse error, and an empty collection proves it
+
+`{"$project": {"x": "$$NOPE"}}` is rejected by mongod before a single document is
+read — it fails the same way on a collection that is empty, and on one that does
+not exist. Neither server did that, because both only discovered the problem
+while evaluating the expression against a document. With no documents there was
+nothing to evaluate, so both answered `ok: 1` and an empty cursor.
+
+#### Fixed
+
+- **An empty or non-existent collection now reports the undefined variable**
+  (17276) instead of silently succeeding — on **both** servers.
+- **The Rust server answers 17276 at all**, where it previously gave a generic
+  `BadValue` (2) `aggregation pipeline uses a stage or operator not supported by
+  the Rust server` for every one of the seven stages probed. The Python server
+  had the code but, until the previous change, the wrong wrapper.
+- **The wrapper is per stage**, as mongod's is: `Invalid $<stage> :: caused by ::`
+  inside `$project` / `$addFields` / `$set`, and a bare message everywhere else
+  (`$group`, `$redact`, `$replaceRoot`, `$replaceWith`, `$match`'s `$expr`,
+  `$sortByCount`, `$bucket`).
+
+#### How it is checked, and why conservatively
+
+A static walk of the pipeline, run once before it executes — the only design that
+can report a parse-time error, since the engine never evaluates anything when
+there are no documents.
+
+It reports **only** from positions known to hold expressions, and ignores any
+stage it does not recognise. A false negative leaves the previous behaviour; a
+false positive would reject a **valid** pipeline, which is far worse than the
+wrong code it replaces. The rules were probed rather than assumed:
+
+- a `$match` filter is query language, so `{"$match": {"s": "$$NOPE"}}` matches
+  the literal string and must not be flagged — only its `$expr` holds an
+  expression;
+- `$literal`'s argument is data, not an expression;
+- `$let` bindings are evaluated in the **outer** scope (they cannot see each
+  other) and do not escape the `in`;
+- `$map` / `$filter` bind `as`, defaulting to `this`; `$reduce` binds `this` and
+  `value`;
+- `$lookup`'s `let` binds only inside that stage's own sub-pipeline — naming it
+  in a later stage is undefined;
+- `$redact` binds `$$KEEP` / `$$PRUNE` / `$$DESCEND` for its own expression;
+- `$$CLUSTER_TIME`, `$$SEARCH_META` and `$$JS_SCOPE` are *defined* variables that
+  answer their own errors (10071200 / 6347902 / 51144), so they are left to those
+  paths rather than reported as undefined.
+
+#### Testing
+
+29 cases added to `tests/test_mongod_differential.py` — 15 that must error and 14
+false-positive guards that must not — plus 6 Rust unit tests. The full suite
+(9405 tests, many of them valid `$let` / `$map` / `$filter` / `$reduce`
+pipelines) is itself the broadest false-positive check, and stayed green.
+
+### An unknown expression operator gets mongod's code, name and envelope
+
+mongod does not answer this one way, and the discriminator is **position**: the
+top-level value of a `$project` field is parsed by the projection parser, which
+has its own code and wording, while anywhere deeper the generic expression
+parser answers. The same `$project` therefore gives two different codes
+depending on how deep the unknown operator sits.
+
+#### Fixed
+
+- `{$project: {n: {$nosuch: 1}}}` now answers `31325 Invalid $project :: caused
+  by :: Unknown expression $nosuch` — mongod's code and its wording, with the
+  operator unquoted — instead of `168`. Nested deeper, and in `$addFields` /
+  `$set`, it still answers `168 ... Unrecognized expression '$nosuch'`, which is
+  also what mongod does. `$count` / `$topN` / `$bottomN` follow the same rule.
+- `codeName` for code 168 is now `InvalidPipelineOperator` rather than the
+  generic `Location168`. This was wrong for every unknown-expression error.
+- The message envelope is now mongod's: `Invalid $addFields :: caused by ::`
+  where the stage supplies one, and no envelope at all in `$group` /
+  `$replaceWith` / `$expr`. An unknown operator was previously found by the
+  constant folder, which stamped `Failed to optimize pipeline :: caused by ::`
+  on all of them.
+
+Swept by `tools/probes/unknown_expression_errors.py` (13 shapes, Python 0
+divergent, down from 13); gated by `tests/test_mongod_differential.py -k
+unknownexpr`.
+
+### `unnest` over a non-integer array no longer fails the query
+
+`SELECT unnest(ARRAY['a', 'b'])` raised `ValueError: invalid literal for int()
+with base 10: 'a'` in the client. The server described the output column as
+`int4` regardless of what the array actually held, then sent the text `a` — so
+the driver tried to decode a string as an integer and the query died before the
+application saw a row. Text, numeric and boolean arrays were all affected;
+integer arrays worked, and only because the hardcoded guess happened to be
+right.
+
+The column is now described with the array's element type. Subscript-producing
+functions (`generate_subscripts`, and `_pg_expandarray`'s `.n` field) stay
+integers, since a position is an integer whatever the array holds.
+
+Checked against a live PostgreSQL for text, numeric, boolean and integer arrays.
+
+#### Fixed
+
+- `unnest(...)` declares the array's element type instead of always `int4`, so a
+  non-integer array can be unnested at all.
+
+### An update path may not be empty
+
+`{$set: {"": 1}}` used to succeed on both servers and store `{"": 1}` — a
+document mongod cannot produce, and one the very query that created it then
+fails to match. The rule applied uniformly to ten operators: `$set`, `$unset`,
+`$inc`, `$mul`, `$min`, `$max`, `$push`, `$addToSet`, `$pop` and `$bit` all
+either wrote an empty field name or answered the wrong code, twenty shapes in
+all. mongod rejects every one of them with `56`, and it distinguishes a wholly
+empty path (`An empty update path is not valid.`) from one with an empty
+component (`The update path 'a.' contains an empty field name, which is not
+allowed.`).
+
+Getting the code right also meant getting the ORDER right. mongod validates an
+update spec in a single walk in document order — the operator's name, then each
+of its paths for emptiness, then for a conflict with a path claimed earlier —
+and reports the first offender it meets. Both servers had run those checks as
+separate passes, so an unknown modifier anywhere in the spec preempted an empty
+path or a conflict that mongod reports first. All three checks now share one
+walk on both servers, which is also how the Rust command layer stopped keeping
+its own private copy of the modifier list.
+
+Two smaller `$each` fixes ride along, both measured the same day: `$addToSet`
+with a non-array `$each` answers `14` rather than the `2` it had borrowed from
+its `$push` sibling, and on the Rust server a non-array `$each` under `$push`
+now reports mongod's message instead of claiming the server cannot do `$push`.
+
+#### Fixed
+
+- `secantus.update` / `secantus-core`: an empty update path, or a path with an
+  empty component, is rejected with mongod's code 56 and its two messages,
+  across every operator and both ends of a `$rename`. Replacement-style updates
+  are deliberately exempt — mongod really does store an empty field name for
+  `replace_one({_id: 1}, {"": 1})`.
+- `secantus.update` / `secantus-core`: the unknown-modifier, empty-path and
+  path-conflict checks share one document-order walk, so the first offender
+  wins, as mongod's does. These are parse errors: they are reported even when
+  the filter matches nothing, and they come back bare.
+- `secantus.update` / `secantus-core`: `$addToSet` with a non-array `$each`
+  answers `TypeMismatch` (14), not `BadValue` (2).
+- `secantus-core`: `$push` with a non-array `$each` reports
+  `The argument to $each in $push must be an array but it was of type: <type>`
+  instead of deferring, which on the standalone Rust server surfaced as
+  "query uses a construct the Rust server does not support".
+
+### Update errors that depend on the stored document match mongod's
+
+Errors an update raises against a particular stored document — `$inc` on a
+non-numeric field, an array operator on a non-array field — used our own codes
+and wording for `$push` and `$addToSet`. Worst of the set: **`$pop` on a
+non-array was a silent no-op**, reporting `n: 1` with no write error for an
+update mongod refuses.
+
+Found by differential-probing the update operator family against a real mongod.
+
+One note on message shape: mongod 8.3 wraps these in `Plan executor error during
+update :: caused by :: ` and 6.0 does not, while the codes and bodies are
+identical either way. SecantusDB advertises 7.0, and the repo's live differential
+gate runs whatever mongod is on PATH, so the bare body is what ships. The
+classification is kept in the code as a single switch point.
+
+#### Fixed
+
+- `$push` on a non-array returns code 2 with mongod's message
+  (`The field 'a' must be an array but is of type int in document {_id: 1}`),
+  replacing our code 9 and our own wording. `$addToSet` likewise.
+- `$pop` on a *present* non-array now errors with mongod's code 14 and message
+  instead of silently succeeding. A missing field or an empty array remain
+  no-ops, as on mongod.
+- The Rust engine had the same `$pop` gap — a non-array fell through its
+  `if let Some(Bson::Array(..))` — and now defers so the exact error is raised.
+- `$inc` / `$mul` / `$pull` were already correct on codes and bodies and are
+  unchanged.
+
+### Overlapping update operator paths are rejected, as mongod does
+
+An update whose operators target the same path — or where one path is a prefix
+of another — was applied anyway. `{$set: {a: 2}, $inc: {a: 1}}` produced
+`{a: 3}`; real mongod refuses it outright, because `$set` replaces the very
+subtree `$inc` wants to walk into. We accepted 8 of the 12 overlapping shapes
+mongod rejects, returning documents mongod would never produce, with no error to
+notice.
+
+Found by differential-probing the update operator family against a real mongod
+rather than by any failing test.
+
+#### Fixed
+
+- An update whose operators touch equal or prefix-overlapping paths returns
+  mongod's `ConflictingUpdateOperators` (code 40) with its exact message,
+  `Updating the path 'X' would create a conflict at 'Y'`. Verified byte-identical
+  across all six message shapes against mongod 8.3.4, on both servers.
+- Sibling and disjoint paths are unaffected — `{$set: {"a.b": 2}, $inc: {"a.c": 1}}`
+  still applies, as do sibling array indexes.
+- The check splits on dots rather than comparing strings, so `ab` is not treated
+  as overlapping `a`.
+- A `$rename` claims both its source and destination against *other* operators,
+  but its two endpoints are not compared with each other: mongod gives an
+  overlapping pair its own error ("must not be on the same path", code 2), and a
+  self-rename its own too ("must differ").
+
+#### Also fixed
+
+- The Rust server now attaches a failpoint's `errorLabels` alongside its
+  `writeConcernError`. Without `RetryableWriteError` a driver never classifies
+  the write as retryable and never retries, which left
+  `/command_monitoring/unified/writeConcernError` failing on the Rust server even
+  after the replay fix cleared it on the Python one.
+
+### The first key decides whether an update is operators or a replacement
+
+`{z: 2, $set: {a: 1}}` is not an operator update. mongod reads the **first key
+alone** to decide an update's form, so that document is a *replacement* that
+happens to contain a `$`-prefixed field — which it refuses with
+`DollarPrefixedFieldName` (52) and a message pointing at `$replaceWith`. Both
+servers instead asked "does any key start with `$`", called it an operator
+update, and answered `9 Unknown modifier: z`. Reverse the two keys and mongod
+agrees with the old answer, which is what made the difference easy to miss.
+
+The two errors are not just worded differently; they fire at different times,
+and that is observable. The operator-form `9` is a parse error, reported even
+when the filter matches nothing and on an upsert. The replacement-form `52` is
+an *execution* error: with no matching document the statement is a silent no-op
+(`n: 0`), and an upsert **inserts the document verbatim, `$`-key and all**. Both
+servers used to reject all three cases up front, so a legitimate no-match update
+failed and a legitimate upsert never happened.
+
+Only the top level is restricted. mongod 8.x stores `{a: {$bad: 1}}`,
+`{a: [{$bad: 1}]}` and even a literal dotted key `{"a.b": 1}` without
+complaint, and `insert` accepts all of those too — all already correct on both
+servers, and now pinned so they stay that way.
+
+#### Fixed
+
+- `secantus.update` / `secantus-core`: an update's form is decided by its first
+  key, via one shared `is_operator_form` predicate rather than three separate
+  `any(...)` tests.
+- `secantus.update` / `secantus-core`: a `$`-prefixed top-level key in a
+  replacement is mongod's `DollarPrefixedFieldName` (52), raised at execution
+  time and carrying the `Plan executor error during <command> :: caused by ::`
+  wrapper, with the first such key named. A no-match update is a silent no-op
+  and an upsert inserts the document unchanged.
+- `secantus.storage`: an upserted **replacement** keeps the document's own field
+  order (`_id` first, then as sent) instead of being re-sorted by field name,
+  which had put a `$`-prefixed key ahead of a plain one. Operator upserts are
+  unaffected.
+
+### Update operators wrote where mongod refuses
+
+`tools/probes/update_operators.py` compares update *errors*. Nothing compared
+the **document a successful update produces**, which is where a silently wrong
+write hides. A sweep of 31 updates × 17 seed value classes (527 cells) against
+mongod 8.2.11 found **30 divergent** in four families; all 527 now agree.
+
+Most of it is one shape CLAUDE.md already names — **missing conflated with
+null**. `get_path(doc, path, default=None)` returns `None` for a field that is
+absent *and* for one that is present and null, so three operators treated a null
+field as an absence and created a value over it.
+
+#### Fixed — data was being written
+
+- **`$push` / `$addToSet` over a null field created an array.**
+  `{$push: {v: 4}}` over `{v: null}` wrote `{v: [4]}`, destroying the null,
+  where mongod raises `2 The field 'v' must be an array but is of type null`.
+  An *absent* field is still created, which is the half that has to keep
+  working.
+- **`$bit` over a null field wrote a number.** The Python side read the current
+  value as `get_path(..., default=0) or 0`, which turned every *falsy present*
+  value — a null, a `-0.0`, an empty array — into the integer `0` so it passed
+  the integral check. mongod refuses all three.
+- **`$pull` with a scalar emptied arrays of arrays.** `{$pull: {v: 1}}` over
+  `{v: [[1, 2]]}` left `{v: []}`; mongod leaves the document untouched, because
+  `[1, 2]` is not `1`. The scalar criterion was routed through the query engine,
+  which adds implicit array traversal — the same membership-after-nesting family
+  as the positional path fix. An **operator** or **regex** criterion does
+  traverse, and still does: `{$pull: {v: {$gt: 1}}}` empties that same document.
+
+#### Fixed — an invalid update reported success
+
+- **`$rename` through a non-document path silently no-opped.**
+  `{$rename: {"v.k": "v.j"}}` over any non-document `v` is
+  `28 cannot use the part (v of v.k) to traverse the element ({v: 1})` on
+  mongod. A genuinely *absent* path stays a no-op, which is the distinction the
+  check has to preserve.
+- **`$pop` over a null field no-opped on the Python server** where mongod and
+  the Rust server both raise `14 Path 'v' contains an element of non-array
+  type 'null'`.
+
+### An upsert seeds every equality the query implies, not just the bare ones
+
+When an upsert finds no match, mongod builds the new document from the QUERY —
+and it reads more than bare equality. Both servers seeded only bare equality, so
+five query forms lost their fields entirely: a silently wrong **insert**, since
+the document mongod would have written is missing a field.
+
+Measured against mongod 8.2.11 over 20 queries × 6 updates: **24 of 120
+divergent**, now 0.
+
+#### Fixed
+
+| query | mongod seeds | was |
+| --- | --- | --- |
+| `{a: {$eq: 1}}` | `a: 1` | nothing |
+| `{a: {$in: [1]}}` (one element) | `a: 1` | nothing |
+| `{a: {$all: [1]}}` (one element) | `a: 1` | nothing |
+| `{$and: [{a: 1}, {b: 2}]}` | `a: 1, b: 2` | nothing |
+| `{$or: [{a: 1}]}` (one branch) | `a: 1` | nothing |
+
+A longer `$in`, a two-branch `$or`, `$nor`, and the range / `$exists` / `$type`
+/ `$not` / `$elemMatch` operators seed nothing on mongod either, and still seed
+nothing here.
+
+- **Two clauses implying the same path are an error**, not a silent pick:
+  `{$all: [1, 2]}` and `{$and: [{a: 1}, {a: 1}]}` are both
+  `54 cannot infer query fields to set, path 'a' is matched twice`.
+
+#### Deliberately not reproduced
+
+mongod emits the seeded fields in its own **hash-table order** — `{a: 1, b: 2}`
+gives `b, a`, `{aa: 1, ab: 2}` gives `aa, ab`, `{one, two, three}` gives
+`three, one, two`. It ignores the query's own order and is neither sorted nor
+reversed, so it is an implementation detail rather than a contract; CLAUDE.md
+already records that it *changed* between 6.0.16 (sorted) and newer servers.
+Both servers keep emitting the seeded fields sorted, and the tests compare
+field/value pairs rather than order.
+
+### `$toDouble` of a date was off by the server's time zone
+
+The Python server converted a date to a double by reading it as the host's
+local time, so on any server not running in UTC, `$toDouble` of a date came back
+off by the host's UTC offset. `$toLong` and `$toDecimal` were already correct,
+which is how it went unnoticed: every CI runner is UTC, and a London box is UTC
+in winter.
+
+That is now also something CI can see. Both Windows lanes run on a Newfoundland
+host (never UTC, observes DST, a half-hour offset), and this bug is the first
+thing they caught. The same change gives the Rust server a local-time rendering
+test that runs on Windows, where the Rust engine's `TZ` bug (#1468) used to
+hide.
+
+#### Fixed
+
+- `expressions.py`: `$toDouble` / `$convert` to double of a date pins UTC
+  instead of reading the naive BSON date as local time.
+
+#### Testing
+
+- `.github/workflows/test.yml`: the `test-windows` and Windows
+  `storage-engine` lanes set the host zone to Newfoundland and assert the change
+  took.
+- `tests/test_rust_server_timestamp_local_time.py`: drives the real Rust server
+  through pymongo for `$toLower` of a `Timestamp`, with and without `TZ`, and
+  runs in the `storage-engine` job.
+
+### A `let` variable made a pipeline update fail
+
+Passing `let` to `update` or `findAndModify` and referring to it from a pipeline
+update — `{update: "c", let: {x: 5}, updates: [{q: {}, u: [{$set: {v: "$$x"}}]}]}`
+— was refused with `Use of undefined variable: x`, for a variable the command
+itself defines. `update` reported it as a per-statement write error and applied
+nothing; `findAndModify` failed the whole command.
+
+The variable *was* bound. What went wrong is in the parse-time check that
+reproduces MongoDB's constant folding: it decides an expression is constant
+because every `$$name` in it is bound, then evaluates it — and the update path
+passed the bound *names* without the *values*, so the evaluation hit an unbound
+variable and reported that as the query's error. `aggregate` passed both and was
+unaffected, which is why this only ever showed up on writes. The fold now
+declines to fold a variable it has no value for, and both write paths pass the
+values the way `aggregate` does.
+
+Two more differences surfaced alongside it. A statement's own `c` constants map
+was never bound at all, so `{u: [...], c: {y: 7}}` failed the same way — and
+MongoDB rejects `c` outright on a non-pipeline update, which we accepted. And a
+constant that genuinely does fail (`{$abs: "$$cv"}` with `cv: "x"`) takes
+MongoDB's *executor* prefix inside a pipeline update, naming the command, rather
+than `aggregate`'s optimizer prefix.
+
+Finally, neither write command validated its statements' field names. MongoDB
+answers `40415` for anything it does not know inside a `delete` or `update`
+statement — including `$`-prefixed names, which get no envelope carve-out there
+— and refuses the whole command rather than the one statement, because it parses
+every statement before running any.
+
+Found by the pymongo gauge: three `*_with_let_option` tests in
+`test_crud_unified.py`.
+
+#### Fixed
+
+- `aggregate.py`: the constant-fold check no longer reports a bound-but-unvalued
+  variable as undefined, and `wrap_expression_problem` takes the command name
+  for the update-pipeline executor prefix.
+- `commands.py`: `update` and `findAndModify` pass the real `let` values to the
+  fold; a statement's `c` constants are bound (and win over `let`); `c` on a
+  non-pipeline update answers `51198`; unknown fields in a `delete` / `update`
+  statement answer `40415`.
+
+### macOS builds broke when SWIG shipped 4.5.0
+
+Building from source on macOS started failing partway through the vendored
+WiredTiger step, with a wall of errors about calls to undeclared functions
+named `PyInt_AsLong` and `PyString_InternFromString` — names from the Python 2 C
+API, which have not existed since Python 3 was released.
+
+The cause is upstream and outside this project. WiredTiger's own SWIG typemaps
+still call those functions, and it has been getting away with it because SWIG
+used to paper over them: every generated wrapper carried a block of
+compatibility macros redefining the Python 2 spellings in terms of their Python
+3 equivalents. SWIG 4.5.0 removed those macros, so the day Homebrew started
+serving it, the same unchanged source stopped compiling.
+
+It looked intermittent, which is worth explaining. The wrapper is only generated
+when the WiredTiger build is not restored from cache, so a job with a warm cache
+skipped the whole step and passed while a sibling with a cold one failed — the
+same commit, green and red on adjacent machines, drifting redder as caches
+expired.
+
+The typemaps now call the Python 3 functions directly, applied to the vendored
+tree at build time by the same mechanism as the project's other WiredTiger
+patches. That removes the dependency on SWIG's compatibility layer entirely, so
+it no longer matters which version generates the wrapper.
+
+#### Fixed
+
+- Source builds failed against SWIG 4.5.0 with undeclared Python 2 C API
+  functions in WiredTiger's Python bindings.
+
 ## [0.6.0b16] — 2026-08-26
 
 ### The drivers found the bugs this time
