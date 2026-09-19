@@ -3,7 +3,7 @@
  "sources": [
   "pgjdbc-raw.json"
  ],
- "total": 82,
+ "total": 80,
  "failures": {
   "org.postgresql.test.jdbc2.ArrayTest::testNonStandardBounds()": 2,
   "org.postgresql.test.jdbc2.ArrayTest::testUnknownArrayType()": 2,
@@ -23,7 +23,6 @@
   "org.postgresql.test.jdbc2.DatabaseMetaDataTest::funcReturningComposite()": 2,
   "org.postgresql.test.jdbc2.DatabaseMetaDataTest::funcReturningTable()": 2,
   "org.postgresql.test.jdbc2.DatabaseMetaDataTest::funcWithDirection()": 2,
-  "org.postgresql.test.jdbc2.DatabaseMetaDataTest::funcWithoutNames()": 2,
   "org.postgresql.test.jdbc2.DatabaseMetaDataTest::functionColumns()": 2,
   "org.postgresql.test.jdbc2.DatabaseMetaDataTest::getColumnsCharOctetLength()": 2,
   "org.postgresql.test.jdbc2.DatabaseMetaDataTest::indexInfo()": 2,

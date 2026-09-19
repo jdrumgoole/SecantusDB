@@ -531,6 +531,48 @@ def test_pg_proc_arg_mode_columns(storage, session):
     assert res.rows == [(None, None)]
 
 
+def test_pg_proc_argtypes_for_unnamed_parameters(storage, session):
+    """`f(int, int)` must record int4, not void.
+
+    sqlglot parses an UNNAMED parameter as a bare `Identifier` rather than a
+    `ColumnDef` carrying a `DataType`, so the type tag came back `None` and
+    `_type_oid` mapped it to **2278 (void)** — an OID this catalog does not
+    even define, so a client resolving it found nothing. pgjdbc's
+    `DatabaseMetaDataTest::functionColumns` creates exactly `f1(int, int)` and
+    reads the argument rows back.
+
+    The NAMED form is asserted beside it because it was always correct: the
+    bug lived only in the branch that handles parameters without names, which
+    is why it survived a catalog full of working functions.
+    """
+    q(storage, session, "CREATE FUNCTION fu(int, int) RETURNS int AS 'SELECT 1' LANGUAGE sql")
+    q(storage, session, "CREATE FUNCTION fn(a int, b text) RETURNS int AS 'SELECT 1' LANGUAGE sql")
+    q(storage, session, "CREATE FUNCTION fz() RETURNS int AS 'SELECT 1' LANGUAGE sql")
+
+    def argtypes(name: str) -> str:
+        res = q(storage, session, f"SELECT proargtypes FROM pg_proc WHERE proname='{name}'")
+        return res.rows[0][0]
+
+    assert argtypes("fu") == "23 23", "unnamed int params must be int4 (23), not void (2278)"
+    assert argtypes("fn") == "23 25"
+    assert argtypes("fz") == ""
+
+
+def test_pg_proc_argtypes_resolve_multiword_type_names(storage, session):
+    """`double precision` is two words and still one unnamed parameter.
+
+    The Identifier branch resolves the whole spelling, so a multi-word builtin
+    must not fall back to void the way a single-word one used to.
+    """
+    q(
+        storage,
+        session,
+        "CREATE FUNCTION fd(double precision) RETURNS int AS 'SELECT 1' LANGUAGE sql",
+    )
+    res = q(storage, session, "SELECT proargtypes FROM pg_proc WHERE proname='fd'")
+    assert res.rows[0][0] == "701", "double precision is float8 (701)"
+
+
 def test_pg_class_reltuples(storage, session):
     # pgjdbc's getIndexInfo reads ci.reltuples as CARDINALITY; -1 is PG's
     # "no estimate yet" initial value.
