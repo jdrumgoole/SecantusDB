@@ -1291,7 +1291,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "secantus-auth"
-version = "0.5.3-beta.163"
+version = "0.5.3-beta.164"
 dependencies = [
  "base64",
  "hmac",
@@ -1304,7 +1304,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-bench"
-version = "0.5.3-beta.163"
+version = "0.5.3-beta.164"
 dependencies = [
  "bson",
  "rand",
@@ -1315,7 +1315,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-commands"
-version = "0.5.3-beta.163"
+version = "0.5.3-beta.164"
 dependencies = [
  "base64",
  "bson",
@@ -1330,7 +1330,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-core"
-version = "0.5.3-beta.163"
+version = "0.5.3-beta.164"
 dependencies = [
  "bson",
  "chrono",
@@ -1346,7 +1346,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-core-py"
-version = "0.5.3-beta.163"
+version = "0.5.3-beta.164"
 dependencies = [
  "bson",
  "pyo3",
@@ -1355,14 +1355,14 @@ dependencies = [
 
 [[package]]
 name = "secantus-pgcatalog"
-version = "0.1.0-beta.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "bson",
 ]
 
 [[package]]
 name = "secantus-pgplan"
-version = "0.1.0-beta.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "bson",
  "chrono",
@@ -1376,7 +1376,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-server"
-version = "0.5.3-beta.163"
+version = "0.5.3-beta.164"
 dependencies = [
  "bson",
  "rcgen",
@@ -1390,7 +1390,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-wire"
-version = "0.5.3-beta.163"
+version = "0.5.3-beta.164"
 dependencies = [
  "bson",
 ]

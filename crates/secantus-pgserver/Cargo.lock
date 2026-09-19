@@ -1570,7 +1570,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-auth"
-version = "0.5.3-beta.163"
+version = "0.5.3-beta.164"
 dependencies = [
  "base64",
  "hmac 0.12.1",
@@ -1583,7 +1583,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-core"
-version = "0.5.3-beta.163"
+version = "0.5.3-beta.164"
 dependencies = [
  "bson",
  "chrono",
@@ -1599,14 +1599,14 @@ dependencies = [
 
 [[package]]
 name = "secantus-pgcatalog"
-version = "0.1.0-beta.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "bson",
 ]
 
 [[package]]
 name = "secantus-pgplan"
-version = "0.1.0-beta.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "bson",
  "chrono",
@@ -1620,7 +1620,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-pgserver"
-version = "0.1.0-beta.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
  "bson",
@@ -1640,7 +1640,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-storage"
-version = "0.5.3-beta.163"
+version = "0.5.3-beta.164"
 dependencies = [
  "bson",
  "flate2",
@@ -1654,7 +1654,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-wt"
-version = "0.5.3-beta.163"
+version = "0.5.3-beta.164"
 dependencies = [
  "bindgen 0.70.1",
 ]

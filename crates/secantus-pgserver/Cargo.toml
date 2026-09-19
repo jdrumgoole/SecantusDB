@@ -1,6 +1,6 @@
 [package]
 name = "secantus-pgserver"
-version = "0.1.0-beta.0"
+version = "0.1.0-beta.1"
 edition = "2021"
 description = "The SecantusDB PostgreSQL wire server (P1 vertical slice)"
 license = "Apache-2.0"
