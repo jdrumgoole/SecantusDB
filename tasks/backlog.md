@@ -9928,17 +9928,6 @@ shared storage engine or building large new protocol subsystems:
   be the value (e.g. `__numkey` for a wide one) with the display value carried
   beside it. Only values past 34 digits that differ only in scale are
   affected; ordinary numerics group correctly.
-- [ ] **A random psycopg query is rejected by sqlglot: `Required keyword:
-  'expressions' missing for <class 'sqlglot.expressions.core.Bracket'>`**
-  (Python pgserver, seen 2026-09-19 in two gauge runs:
-  `test_cursor_client_async.py::test_leak[asyncio-namedtuple_row-iter]` on
-  #1497's run, `test_cursor_client.py::test_leak[asyncio-tuple_row-iter]` on
-  #1502's). Both are CLIENT-side-binding cursors, so the rejected SQL has the
-  random faker values inlined -- most likely an empty or nested array literal
-  sqlglot cannot parse. Not reproduced in 288 local runs, and the server does
-  not log the SQL of a query it rejects at parse time, so the text was never
-  captured: logging the statement on a 42601 would make the next occurrence
-  diagnosable.
 - [ ] **HAVING on a numeric aggregate compares at Decimal128 precision**
   (Python pgserver, 2026-09-19). The select-list `sum` / `min` / `max` over a
   numeric are exact (pushed and folded in Python), but a HAVING term compares
