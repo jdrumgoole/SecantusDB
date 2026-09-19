@@ -1315,6 +1315,38 @@ def test_enum_ddl_matches_postgres(ours: psycopg.Connection, oracle: psycopg.Con
     assert mine == theirs, f"postgres={theirs}\n  ours    ={mine}"
 
 
+def test_tiny_wide_numeric_filters_match_postgres(
+    ours: psycopg.Connection, oracle: psycopg.Connection
+) -> None:
+    """A range filter on a 35-digit constant just above Decimal128's exponent
+    floor (1.23...E-6150). The Rust bracket truncated it to 34 digits, pushed
+    the exponent below -6176, and fell back to (0, 1E-6176) -- which does not
+    contain the constant, so `n > c` matched the stored Decimal128 5E-6160
+    (smaller than c) and `n < c` missed it. Found porting the bracket to the
+    Python server (2026-09-19)."""
+    _reset_oracle(oracle)
+    c = "1.2345678901234567890123456789012345E-6150"
+    rows = ["5E-6160", "2E-6150", "1E-6176", "0", "-5E-6160", "1"]
+
+    def probe(conn: psycopg.Connection) -> list:
+        cur = conn.cursor()
+        cur.execute("DROP TABLE IF EXISTS tiny_wide")
+        cur.execute("CREATE TABLE tiny_wide (id int PRIMARY KEY, n numeric)")
+        for i, v in enumerate(rows):
+            cur.execute("INSERT INTO tiny_wide VALUES (%s, %s::numeric)", (i, v))
+        out = []
+        for op in ("=", "<>", "<", "<=", ">", ">="):
+            cur.execute(f"SELECT id FROM tiny_wide WHERE n {op} {c}::numeric ORDER BY id")
+            out.append((op, [r[0] for r in cur.fetchall()]))
+        cur.execute("DROP TABLE tiny_wide")
+        return out
+
+    theirs, mine = probe(oracle), probe(ours)
+    # Self-check: the scenario must separate the rows on the reference server.
+    assert dict(theirs)[">"] == [1, 5], theirs
+    assert mine == theirs, f"postgres={theirs}\n  ours    ={mine}"
+
+
 def test_savepoints_match_postgres(ours: psycopg.Connection, oracle: psycopg.Connection) -> None:
     """SAVEPOINT / RELEASE / ROLLBACK TO, against the server that defines them.
 
