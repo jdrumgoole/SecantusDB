@@ -3926,6 +3926,8 @@ def where_needs_per_row(
         return True
     if table is not None and _where_has_range_predicate(node, table):
         return True
+    if table is not None and _where_has_subms_array_column(node, table):
+        return True
     if _where_has_text_cast_comparison(node, table):
         return True
     if table is not None and _where_has_net_predicate(node, table):
@@ -4171,6 +4173,23 @@ def _where_has_jsonb_contained_predicate(node: exp.Expression, table: TableDef) 
 
 
 _RANGE_LIKE_TAGS = typemap._RANGE_TAGS | typemap._MULTIRANGE_TAGS
+
+
+def _where_has_subms_array_column(node: exp.Expression, table: TableDef) -> bool:
+    """True if ``node`` reads a ``timestamp[]`` / ``timestamptz[]`` column.
+
+    Each element is stored as a BSON date (whole milliseconds) with its
+    sub-millisecond remainder in a companion list (`secantus.sql.subms`). A
+    pushed-down filter compares the stored dates alone against a literal that
+    keeps its microseconds, so ``a = ARRAY['…826829']``, ``x = ANY(a)`` and
+    ``a @> …`` matched NOTHING and ``a <> …`` matched the equal row too
+    (measured 2026-09-19, and on the code before the companion existed).
+    Evaluated per row instead, where the column reads with its remainders."""
+    for col_node in node.find_all(exp.Column):
+        col = table.column(_column_name(col_node))
+        if col is not None and col.type_tag in subms.SUBMS_ARRAY_TAGS:
+            return True
+    return False
 
 
 def _where_has_range_predicate(node: exp.Expression, table: TableDef) -> bool:
@@ -7009,9 +7028,10 @@ def _group_key_expr(field: str, tag: str | None) -> Any:
     grouping on the truncated value MERGES rows that differ only in
     microseconds, so the counts and sums over those groups are wrong and the
     emitted key is a time that was never stored. The executor unwraps the key
-    on the way out.
+    on the way out. A timestamp ARRAY groups on the same composite, its
+    companion being the list of remainders -- ``subms.merge`` handles lists.
     """
-    if tag in subms.SUBMS_TAGS:
+    if subms.carries_subms(tag):
         return subms.composite_expr(field)
     return f"${field}"
 

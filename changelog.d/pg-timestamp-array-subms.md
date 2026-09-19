@@ -18,8 +18,7 @@ microseconds inside an array.
 - `sql/subms.py`: `split` / `merge` work element by element on arrays (nested
   arrays too); `carries_subms` names the column types that keep the companion.
 - `sql/planner.py`, `sql/executor.py`: `INSERT`, `COPY FROM`, `UPDATE` and the
-  whole-row read paths (including `COPY TO`) use it for array columns. Filters,
-  sorting and grouping on an array still compare to the millisecond.
+  whole-row read paths (including `COPY TO`) use it for array columns.
 
 #### Testing
 

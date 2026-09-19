@@ -2013,7 +2013,11 @@ def execute_correlated_select(
         # Only outer-table columns reach this scope; a correlated subquery's own
         # inner columns are resolved inside scalar._inner_row_scopes.
         def scope(node: Any) -> Any:
-            return get_path(doc, table.field_for(node.name))
+            # With the sub-millisecond companion merged back (scalar timestamp
+            # AND timestamp-array columns): a bare get_path compared the
+            # truncated stored date, so a per-row WHERE on a timestamp matched
+            # nothing its microseconds distinguished.
+            return _subms(doc, table.field_for(node.name))
 
         return scope
 

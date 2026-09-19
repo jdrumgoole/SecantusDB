@@ -35,6 +35,7 @@ from secantus.paths import get_path
 from secantus.sql import errors, typemap
 from secantus.sql import numeric as _numeric
 from secantus.sql import ranges as _ranges
+from secantus.sql import subms as _subms
 
 # jsonb navigation (->, ->>, #>, #>>); the scalar (->> / #>>) variants render text.
 _JSONB_NAV = (exp.JSONExtract, exp.JSONExtractScalar, exp.JSONBExtract, exp.JSONBExtractScalar)
@@ -6733,7 +6734,11 @@ def _sub_scope(inner_alias: str, tdef: Any, row: dict[str, Any], outer: Scope) -
         alias = node.table or None
         name = node.name
         if alias == inner_alias or (alias is None and tdef.column(name) is not None):
-            return get_path(row, tdef.field_for(name))
+            field = tdef.field_for(name)
+            # With the sub-millisecond companion merged back, as the outer
+            # row's scope has it: otherwise `s2.t = s.t` compared a truncated
+            # inner timestamp against an exact outer one and never matched.
+            return _subms.merge(get_path(row, field), row.get(_subms.companion_field(field)))
         return outer(node)  # correlated reference to the enclosing query
 
     return resolve
