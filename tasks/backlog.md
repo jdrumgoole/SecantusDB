@@ -1209,18 +1209,37 @@ Specific items that were left out of the slice that introduced their feature are
       dropped still exist. The sample is dominated by `__conn_open_session`,
       `__wt_open_cursor`, `__session_close_cursors`, `__wt_session_get_dhandle`.
 
-      **In-transaction path is WORSE, not better: 115.5–118.0us vs 77.0–78.4us
-      for the same `select 1`, over three runs** (PG: 30.0–31.3 vs 30.5–32.8,
-      i.e. flat). Opening a block does NOT
-      amortise the catalog work — it swaps it for a bigger cost. Under a block
-      the sample is dominated by `Storage::find_matching` /
-      `scan_blobs_natural` (a full natural-order scan) instead of session opens,
-      which is `may_fill_catalog_cache` refusing the process-wide catalog cache
-      whenever a handle is open and the version has moved, so each statement
-      re-reads the catalog from storage. **This also means the amortisation
-      hypothesis that "7 probes = the 54us" is NOT confirmed** — it was derived
-      by reading, and the block measurement contradicts it. Both mechanisms are
-      real and hot; the microsecond split between them is not yet apportioned.
+      **In-transaction path is WORSE, not better: ~126us vs ~56us for the same
+      `select 1`** (PostgreSQL is flat: ~30us either way). Re-measured
+      2026-09-19 after the autocommit fix landed, so the gap is now the
+      dominant per-statement cost.
+
+      **One cause found and fixed; it is NOT the bulk of the gap, and an
+      earlier version of this entry said otherwise.** `open_transaction_handle`
+      records the catalog version it saw, and the caller bumps that version
+      immediately afterwards for EVERY transaction-control statement --
+      including `BEGIN`, which cannot change a catalog. So from the first
+      statement of a block the recorded and live versions disagreed
+      permanently, `may_fill_catalog_cache` was false for the life of the
+      block, and the process-wide catalog cache could never be refilled.
+      Instrumented: **2 hits / 50 misses** inside a block, **26 / 8** after
+      re-anchoring the recorded version to the bump. A cache built precisely to
+      avoid re-reading the catalog was switched off inside every transaction.
+
+      **But fixing it recovers only ~3us of the ~70us penalty** (129.4 ->
+      125.8). `type_catalog_docs` -> `find_matching` -> `scan_blobs_natural`
+      topped the sampled profile, and that made it look like the cost; it was
+      the most VISIBLE symbol, not the dominant one. After the fix the profile
+      is flat -- pgwire message decode, `session_timezone`, the cached catalog
+      path -- with no single hotspot, and the wall time barely moved. **So what
+      makes a statement inside a transaction block cost twice what the same
+      statement costs outside one is still UNKNOWN.** Do not re-tell the
+      catalog-scan story; it has now been measured and is worth 3us.
+
+      (A first attempt at the re-anchor appeared to change nothing, which
+      nearly buried the finding. The binary was stale. Rebuild before
+      concluding a fix does not work -- and prefer instrumenting the mechanism,
+      which is what actually settled it, over timing a whole path.)
 
       **A "prepared statements are a pessimisation" finding was RETRACTED — it
       did not reproduce.** One run showed a prepared row read at 165.9us against

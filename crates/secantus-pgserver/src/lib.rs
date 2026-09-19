@@ -5900,6 +5900,14 @@ impl PgHandler {
             // a ROLLBACK (to a savepoint or of the block) restores rows the
             // cache may have read past. See `CatalogCache`.
             bump_catalog_version();
+            if self.transaction_handle_open() {
+                self.txn_catalog_version.store(
+                    catalog_cache()
+                        .version
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }
             return out;
         }
 
