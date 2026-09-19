@@ -9944,11 +9944,6 @@ shared storage engine or building large new protocol subsystems:
   numeric are exact (pushed and folded in Python), but a HAVING term compares
   its accumulator inside the pipeline, so it keeps the native `$sum` (which
   also skips a wide value).
-- [ ] **`$convert` string -> decimal raises `Inexact` out of the engine**
-  (Python Mongo engine, 2026-09-19). `{$convert: {input: "<35-digit string>",
-  to: "decimal", onError: …}}` raises a raw `decimal.Inexact` instead of
-  answering or honouring `onError`. Probe mongod for the right answer (it may
-  round) before fixing.
 - [x] **RESOLVED — STALE (measured 2026-09-01). Pipeline abort works.** Ran the
   test's own body through libpq's `PGconn` pipeline API against both servers:
 

@@ -207,6 +207,11 @@ _ERROR_CODE_NAMES: dict[int, str] = {
     # the ONLY thing wrong in four of them. `expressions._CODE_NAMES` already
     # knew the name; errors raised as `AggregateError` never reached it.
     168: "InvalidPipelineOperator",
+    # A CONSTANT `$convert` / `$toX` failure folds at optimization time and
+    # reaches the client through this table, which lacked it: `{$toInt: "abc"}`
+    # written as a literal said `Location241` where mongod says
+    # `ConversionFailure` (measured 8.2.11, 2026-09-19).
+    241: "ConversionFailure",
 }
 
 

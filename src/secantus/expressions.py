@@ -4834,10 +4834,35 @@ def _parse_decimal_string(value: str) -> Decimal128:
         )
     if not _STRICT_FLOAT_RE.match(value):
         raise _number_parse_error(value, "Failed to parse string to decimal")
+    # mongod ROUNDS TOWARD ZERO to 34 digits (`1.23…12345|9` -> `…1234`,
+    # `-9999…9|9.5` -> `-9.999…E+34`), and fails with IEEE's two range
+    # conditions: overflow past an adjusted exponent of 6144, underflow for a
+    # SUBNORMAL result that is also inexact (`1E-6176` parses, `1E-6177` and a
+    # 35-digit `1.23…E-6150` do not). Measured on 8.2.11, 2026-09-19. This
+    # used `Decimal128(value)`, whose `Inexact` escaped as an internal error for
+    # every string past 34 digits, with or without `onError`.
+    ctx = _D128_STRING_CTX.copy()
     try:
-        return Decimal128(value)
+        d = ctx.create_decimal(value)
     except (InvalidOperation, ValueError) as exc:
         raise _number_parse_error(value, "Failed to parse string to decimal") from exc
+    if ctx.flags[_decimal.Overflow]:
+        raise _number_parse_error(value, "Conversion from string to decimal would overflow")
+    if ctx.flags[_decimal.Underflow]:
+        raise _number_parse_error(value, "Conversion from string to decimal would underflow")
+    return Decimal128(d)
+
+
+#: Decimal128 as IEEE 754-2008 defines it -- 34 digits, adjusted exponents
+#: -6143..6144, clamped -- with mongod's string-conversion rounding.
+_D128_STRING_CTX = _decimal.Context(
+    prec=34,
+    rounding=_decimal.ROUND_DOWN,
+    Emin=-6143,
+    Emax=6144,
+    clamp=1,
+    traps=[],
+)
 
 
 def _op_to_int(arg: Any, ctx: _Ctx) -> Any:
