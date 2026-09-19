@@ -1979,7 +1979,7 @@ def _describe_statement(
 #: evaluating them at Describe time would sleep, draw sequence values, or
 #: take locks. Shapes here mirror what Execute actually returns.
 _VOLATILE_FN_TAGS = {
-    "pg_sleep": "text",
+    "pg_sleep": "void",
     # pg_notify HAS A SIDE EFFECT, so leaving it out of this table did not just
     # cost a wasted call: Describe evaluated it and Execute evaluated it again,
     # and the listener received the notification TWICE. Only through the
@@ -1994,7 +1994,15 @@ _VOLATILE_FN_TAGS = {
     "set_config": "text",
     "pg_terminate_backend": "bool",
     "pg_cancel_backend": "bool",
-    "pg_advisory_lock": "text",
+    "pg_advisory_lock": "void",
+    "pg_advisory_lock_shared": "void",
+    "pg_advisory_xact_lock": "void",
+    "pg_advisory_xact_lock_shared": "void",
+    "pg_advisory_unlock_all": "void",
+    "pg_advisory_unlock_shared": "bool",
+    "pg_try_advisory_lock_shared": "bool",
+    "pg_try_advisory_xact_lock": "bool",
+    "pg_try_advisory_xact_lock_shared": "bool",
     "pg_advisory_unlock": "bool",
     "pg_try_advisory_lock": "bool",
     "lo_creat": "oid",
