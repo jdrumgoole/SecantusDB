@@ -1614,17 +1614,34 @@ fn set_field_path(doc: &mut Document, path: &str, value: Bson) {
     }
 }
 
-/// `$lookup` equality with mongod's array-aware semantics (mirrors
-/// `aggregate._lookup_match`): array↔array → any element equal; one side array →
-/// membership; else plain equality. A missing field is `Null`.
+/// `$lookup` equality with mongod's array-aware semantics: array↔array → any
+/// element equal; one side array → membership; else equality. A missing field
+/// is `Null`.
 fn lookup_match(local: Option<&Bson>, foreign: Option<&Bson>) -> bool {
     let local = local.unwrap_or(&Bson::Null);
     let foreign = foreign.unwrap_or(&Bson::Null);
     match (local, foreign) {
-        (Bson::Array(la), Bson::Array(fa)) => la.iter().any(|le| fa.iter().any(|fe| le == fe)),
-        (Bson::Array(la), f) => la.iter().any(|le| le == f),
-        (l, Bson::Array(fa)) => fa.iter().any(|fe| fe == l),
-        (l, f) => l == f,
+        (Bson::Array(la), Bson::Array(fa)) => {
+            la.iter().any(|le| fa.iter().any(|fe| lookup_eq(le, fe)))
+        }
+        (Bson::Array(la), f) => la.iter().any(|le| lookup_eq(le, f)),
+        (l, Bson::Array(fa)) => fa.iter().any(|fe| lookup_eq(l, fe)),
+        (l, f) => lookup_eq(l, f),
+    }
+}
+
+/// One pair under mongod's BSON equality. The derived `Bson ==` is
+/// structural, so `Int32(2)` and `Double(2.0)` differed, and so did
+/// `Decimal128("1.5")` and `Decimal128("1.500")`: a `localField` /
+/// `foreignField` join with no index on the foreign field matched none of
+/// them, where mongod 8.2.11 joins all three (measured 2026-09-19). The
+/// canonical order compares numerics by value and ranks NaN equal to NaN.
+fn lookup_eq(a: &Bson, b: &Bson) -> bool {
+    use secantus_core::order;
+    if order::is_comparable(a) && order::is_comparable(b) {
+        order::cmp(a, b) == std::cmp::Ordering::Equal
+    } else {
+        a == b
     }
 }
 

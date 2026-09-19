@@ -362,3 +362,33 @@ def fold(func: str, values: list[Any]) -> Decimal | None:
         return total
     pick = min if func == "min" else max
     return pick(nums, key=order_key)
+
+
+_NAN_EQ_KEY = ("\x00nan",)
+
+
+def eq_key(value: Any) -> Any:
+    """A hashable key under which two SQL values collide exactly when
+    Postgres treats them as the same row value (DISTINCT, UNION / INTERSECT /
+    EXCEPT, DISTINCT ON, PARTITION BY).
+
+    Those paths keyed on ``repr()``, and ``repr(Decimal("1.5"))`` is not
+    ``repr(Decimal("1.50"))``: ``select 1.5 union select 1.50`` returned two
+    rows where Postgres returns one, INTERSECT of the pair returned nothing,
+    and ``-0.0`` / ``0.0`` split the same way. Numbers compare by value here
+    (Python's ``int`` / ``float`` / ``Decimal`` already hash and compare that
+    way), every NaN is one value (Postgres' NaN equals NaN), a bool is not a
+    number, and arrays compare element by element. Anything else keeps its
+    ``repr`` identity.
+    """
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, (int, float, Decimal)):
+        if value != value:  # float NaN, Decimal NaN
+            return _NAN_EQ_KEY
+        return ("\x00num", value)
+    if isinstance(value, bson.Decimal128):
+        return eq_key(value.to_decimal())
+    if isinstance(value, (list, tuple)):
+        return ("\x00arr", tuple(eq_key(v) for v in value))
+    return repr(value)

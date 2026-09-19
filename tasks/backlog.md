@@ -9957,6 +9957,15 @@ shared storage engine or building large new protocol subsystems:
   be the value (e.g. `__numkey` for a wide one) with the display value carried
   beside it. Only values past 34 digits that differ only in scale are
   affected; ordinary numerics group correctly.
+  **Re-measured 2026-09-19:** the entry understated the join half. An
+  ORDINARY numeric join was broken too: `1.5` did not join `1.500`, and a
+  numeric `2.0` did not join an int `2`. That was the `$lookup` hash join
+  keying on the `Decimal128` representation (a MongoDB-side bug on both
+  servers), now fixed. UNION / INTERSECT / EXCEPT / DISTINCT ON / PARTITION BY
+  keyed rows on `repr()` and split `1.5` / `1.50`; also fixed
+  (`numeric.eq_key`). Still open, wide values only: pipeline `GROUP BY`,
+  `DISTINCT`, `count(DISTINCT)`, and a join on a wide key (the wide document
+  reaches `$lookup` as a document, compared whole).
 - [ ] **pgx `TestDeadlineContextWatcherHandler/DeadlineExceeded_with_DeadlineDelay`
   failed once on CI** (2026-09-19, #1509's gauge run; passed on an immediate
   re-run of the same commit). The test runs `select 1, pg_sleep(0.250)` under

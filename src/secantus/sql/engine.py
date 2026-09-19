@@ -6279,9 +6279,11 @@ def _run_set_operation(
     )
 
 
-def _setop_key(row: tuple[Any, ...]) -> tuple[str, ...]:
+def _setop_key(row: tuple[Any, ...]) -> tuple[Any, ...]:
     """A hashable identity for a result row (matches the SELECT DISTINCT dedup)."""
-    return tuple(repr(v) for v in row)
+    from secantus.sql import numeric as _numeric
+
+    return tuple(_numeric.eq_key(v) for v in row)
 
 
 def _dedup_rows(rows: list[tuple[Any, ...]]) -> list[tuple[Any, ...]]:
