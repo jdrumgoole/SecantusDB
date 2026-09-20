@@ -10036,9 +10036,23 @@ shared storage engine or building large new protocol subsystems:
   keying on the `Decimal128` representation (a MongoDB-side bug on both
   servers), now fixed. UNION / INTERSECT / EXCEPT / DISTINCT ON / PARTITION BY
   keyed rows on `repr()` and split `1.5` / `1.50`; also fixed
-  (`numeric.eq_key`). Still open, wide values only: pipeline `GROUP BY`,
-  `DISTINCT`, `count(DISTINCT)`, and a join on a wide key (the wide document
-  reaches `$lookup` as a document, compared whole).
+  (`numeric.eq_key`). `GROUP BY`, `DISTINCT` and `count(DISTINCT)` were fixed
+  on 2026-09-20 (`numeric.group_key_expr`; `tests/test_pg_numeric_wide_grouping.py`
+  compares against a live PostgreSQL). Two shapes remain:
+  - **A join whose key is wide.** The wide document reaches `$lookup` as a
+    document and is compared whole. Fixing it means the `let` / `pipeline`
+    form, which runs per outer doc — so every numeric join would pay O(N*M)
+    for a case that needs 35+ digits. Do it only behind a cheap test for
+    whether the column actually holds a wide value.
+  - **A value stored narrow in one row and wide in another.** `1.5` fits a
+    Decimal128; `1.5` written with 39 digits does not, so it stores wide, and
+    PostgreSQL says the two are equal (14.24). The group key keeps the two
+    forms in different key spaces — a scale-free string for wide rows, the
+    number itself for narrow ones — and no MQL expression can derive one from
+    the other (a `$toDecimal` of the wide text would round at 34 digits and
+    merge genuinely different values). A uniform key needs the value computed
+    in Python per row, which the pipeline plan's `pre_eval_fields` hook could
+    do for a single table but not for a join.
 - [ ] **pgx `TestDeadlineContextWatcherHandler/DeadlineExceeded_with_DeadlineDelay`
   failed once on CI** (2026-09-19, #1509's gauge run; passed on an immediate
   re-run of the same commit). The test runs `select 1, pg_sleep(0.250)` under

@@ -392,3 +392,20 @@ def eq_key(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return ("\x00arr", tuple(eq_key(v) for v in value))
     return repr(value)
+
+
+def group_key_expr(field_path: str) -> dict[str, Any]:
+    """The ``$group`` / dedup key for a ``numeric`` column at ``field_path``.
+
+    Two rows equal in value can be stored differently: a value too wide for a
+    Decimal128 keeps its Postgres text, so ``1e40``, ``1e40.0`` and ``1e40.00``
+    are three different documents and grouped as three rows where Postgres has
+    one (measured against 14.24, 2026-09-20). ``__numkey`` is scale-free, so it
+    is the value identity; a Decimal128 row has none and groups as itself,
+    which the engine already merges across the numeric types.
+
+    The key REPLACES the value in ``_id``, so a caller pairing this with a
+    ``$group`` must also restore the display value -- Postgres prints the
+    group's first row, text and all.
+    """
+    return {"$ifNull": [f"${field_path}.{SORT_KEY}", f"${field_path}"]}
