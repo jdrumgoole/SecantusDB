@@ -102,7 +102,23 @@ jobs:
 
       - name: Install toolchain (macOS)
         if: matrix.os == 'macos'
-        run: brew install swig ninja lz4
+        # NOT `brew install lz4`. Homebrew ships liblz4.a and liblz4.dylib side
+        # by side, the linker takes the dylib, and it is recorded by its
+        # absolute Homebrew path — so the archive we publish only runs on a Mac
+        # that happens to have Homebrew lz4 at exactly that path. The wheel
+        # build has always used this script instead (it produces liblz4.a and
+        # no dylib at all); the binaries now use it for the same reason.
+        run: |
+          brew install swig ninja
+          bash tools/build_lz4_macos.sh
+          # Both halves, exactly as wheels.yml sets them for cibuildwheel:
+          # CMAKE_PREFIX_PATH is how WiredTiger's CMake finds <lz4.h> to compile
+          # its builtin lz4 extension, SECANTUS_WT_EXTRA_LIBDIR is how
+          # secantus-wt/build.rs finds liblz4.a to link it.
+          {
+            echo "CMAKE_PREFIX_PATH=$HOME/.secantus-lz4"
+            echo "SECANTUS_WT_EXTRA_LIBDIR=$HOME/.secantus-lz4/lib"
+          } >> "$GITHUB_ENV"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable

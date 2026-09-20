@@ -87,7 +87,11 @@ fn main() {
     // library on macOS (SDK) and Linux (manylinux/musl ship zlib).
     let sys_libs: &[&str] = match target_os.as_str() {
         "linux" => &["pthread", "rt", "dl", "z", "lz4"],
-        "macos" => &["pthread", "dl", "z", "lz4"],
+        // lz4 is absent here on purpose: macOS picks its link KIND below, in
+        // the same place it picks the search path, because it is the only
+        // target where a dylib cannot be assumed to exist on the machine that
+        // runs the binary.
+        "macos" => &["pthread", "dl", "z"],
         "windows" => &[],
         // Other POSIX targets (the BSDs etc.): pthread is the safe baseline.
         _ => &["pthread"],
@@ -108,29 +112,52 @@ fn main() {
     // /opt/homebrew/lib) for any of them.
     println!("cargo:rerun-if-env-changed=SECANTUS_WT_EXTRA_COMPRESSORS");
     println!("cargo:rerun-if-env-changed=SECANTUS_WT_EXTRA_LIBDIR");
-    if let Ok(dir) = env::var("SECANTUS_WT_EXTRA_LIBDIR") {
+    let extra_libdir = env::var("SECANTUS_WT_EXTRA_LIBDIR").ok();
+    if let Some(dir) = extra_libdir.as_deref() {
         println!("cargo:rustc-link-search=native={dir}");
-    } else if target_os == "macos" {
+    }
+    if target_os == "macos" {
         // liblz4 is a default link library now, and Apple ships none in the
-        // SDK, so the search path has to be found rather than assumed.
+        // SDK, so both the search path AND the link kind have to be worked out
+        // rather than assumed.
         //
         // The wheel build supplies its own static liblz4 via
         // SECANTUS_WT_EXTRA_LIBDIR: `brew install lz4` produces a dylib
         // targeting the runner's OS (macOS 14), which `delocate` refuses to
         // bundle into a wheel targeting macOS 11 — see
         // tools/build_lz4_macos.sh. Homebrew's prefixes are the fallback for a
-        // plain developer `cargo build`, where no wheel is produced and the
-        // deployment target does not matter.
-        // The wheel build points SECANTUS_WT_EXTRA_LIBDIR at its own static
-        // build (handled above); these are the developer fallbacks.
-        for prefix in ["/opt/homebrew/lib", "/usr/local/lib"] {
+        // plain developer `cargo build`.
+        //
+        // PREFER THE STATIC ARCHIVE WHEREVER ONE EXISTS. `dylib=lz4` used to be
+        // emitted unconditionally, and because Homebrew ships liblz4.a and
+        // liblz4.dylib side by side the linker always took the dylib — by its
+        // ABSOLUTE Homebrew path. That is invisible on a build machine (which
+        // has Homebrew by definition) and fatal on a user's: both published
+        // macOS binaries, secantusd-rs 0.5.3-beta.164 and secantusd-pg
+        // 0.1.0-beta.1, carry
+        //     /opt/homebrew/opt/lz4/lib/liblz4.1.dylib
+        // and fail to launch on a Mac without Homebrew lz4 installed at exactly
+        // that path. Nothing in the build says so; `otool -L` on the shipped
+        // archive is what says so.
+        let search: Vec<&str> = match extra_libdir.as_deref() {
+            Some(dir) => vec![dir],
+            None => vec!["/opt/homebrew/lib", "/usr/local/lib"],
+        };
+        let mut kind = "dylib";
+        for prefix in search {
             let has_static = std::path::Path::new(&format!("{prefix}/liblz4.a")).exists();
             let has_dylib = std::path::Path::new(&format!("{prefix}/liblz4.dylib")).exists();
             if has_static || has_dylib {
-                println!("cargo:rustc-link-search=native={prefix}");
+                if extra_libdir.is_none() {
+                    println!("cargo:rustc-link-search=native={prefix}");
+                }
+                if has_static {
+                    kind = "static";
+                }
                 break;
             }
         }
+        println!("cargo:rustc-link-lib={kind}=lz4");
     }
     if env::var_os("SECANTUS_WT_EXTRA_COMPRESSORS").is_some() && target_os != "windows" {
         for l in ["snappy", "zstd"] {
