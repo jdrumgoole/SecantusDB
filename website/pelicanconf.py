@@ -76,7 +76,11 @@ CATEGORY_SAVE_AS = "category/{slug}.html"
 AUTHORS_SAVE_AS = "authors.html"
 AUTHOR_URL = "author/{slug}.html"
 AUTHOR_SAVE_AS = "author/{slug}.html"
-DIRECT_TEMPLATES = ["index", "archives"]
+# `sitemap` renders themes/secantus/templates/sitemap.html — Jinja emitting
+# XML, not HTML, despite the extension a direct template requires.
+DIRECT_TEMPLATES = ["index", "archives", "sitemap"]
+SITEMAP_SAVE_AS = "sitemap.xml"
+SITEMAP_URL = "sitemap.xml"
 
 DEFAULT_PAGINATION = 10
 DEFAULT_DATE_FORMAT = "%-d %B %Y"

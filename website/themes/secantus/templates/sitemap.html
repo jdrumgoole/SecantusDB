@@ -1,0 +1,45 @@
+{# Rendered to sitemap.xml by DIRECT_TEMPLATES. Jinja, not HTML, despite the
+   extension Pelican requires for a direct template.
+
+   Deliberately narrow: the canonical marketing pages and every blog post, each
+   at the same .html URL its canonical link declares. Excluded on purpose are
+   the paginated /blogN.html views (duplicate listings of content already
+   listed), the 404 page, the tag / category / author index pages (the site has
+   no meaningful taxonomy), the redirect stub, and /docs/ — the Sphinx trees are
+   grafted into the output AFTER Pelican runs, so Pelican cannot enumerate them
+   and a guess would rot. #}
+{# Every page here carries `Status: hidden` to keep it out of the nav menu, so
+   Pelican files them under `hidden_pages` and `pages` is EMPTY. Iterating
+   `pages` alone yields a sitemap with no product pages in it — which is what
+   the first version of this template did, and the built file is what caught it.
+   404.html is noindex by nature; rust-server.html is the redirect stub. #}
+{%- set skip = ['404.html', 'rust-server.html'] -%}
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url>
+    <loc>{{ SITEURL }}/</loc>
+    <changefreq>weekly</changefreq>
+    <priority>1.0</priority>
+  </url>
+  <url>
+    <loc>{{ SITEURL }}/blog.html</loc>
+    <changefreq>weekly</changefreq>
+    <priority>0.7</priority>
+  </url>
+{% for page in (pages + hidden_pages) | sort(attribute='save_as')
+      if page.save_as and page.save_as not in skip and page.slug != 'home' %}
+  <url>
+    <loc>{{ SITEURL }}/{{ page.save_as }}</loc>
+    <changefreq>weekly</changefreq>
+    <priority>0.8</priority>
+  </url>
+{% endfor %}
+{%- for article in articles %}
+  <url>
+    <loc>{{ SITEURL }}/{{ article.save_as }}</loc>
+    <lastmod>{{ (article.modified or article.date).strftime('%Y-%m-%d') }}</lastmod>
+    <changefreq>yearly</changefreq>
+    <priority>0.5</priority>
+  </url>
+{% endfor %}
+</urlset>
