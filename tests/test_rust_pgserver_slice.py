@@ -9801,3 +9801,60 @@ def test_unsupported_aggregates_refuse_the_same_way_on_an_empty_table(home: Path
             with pytest.raises(psycopg.Error) as filled:
                 conn.execute(sql).fetchall()
             assert filled.value.sqlstate == "0A000", sql
+
+
+def test_char_n_is_blank_padded_and_carries_its_width(home: Path) -> None:
+    """`char(n)` is a blank-padded type, and its width reaches the client.
+
+    The Rust server described `char(4)` as an unsized `bpchar` and sent `ab`
+    where PostgreSQL 14.24 sends `ab  ` with a declared width of 4. The value
+    is STORED unpadded -- `length()` ignores trailing blanks and a cast to
+    text strips them -- so the padding belongs on the way out, which is how
+    the Python server has always done it.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table c (id int primary key, c char(4), v varchar(6))")
+        conn.execute("insert into c values (1, 'ab', 'xy')")
+        cur = conn.execute("select c, v from c")
+        assert cur.fetchall() == [("ab  ", "xy")]
+        assert [(d.type_code, d.display_size) for d in cur.description] == [(1042, 4), (1043, 6)]
+        # A cast to text strips the padding, as PostgreSQL does.
+        assert conn.execute("select c::text from c").fetchall() == [("ab",)]
+
+
+def test_char_n_comparison_ignores_trailing_blanks(home: Path) -> None:
+    """`bpchar` comparison strips trailing blanks from BOTH sides, so a
+    `char(4)` holding `ab` matches `'ab'` and `'ab  '` alike. `varchar` is
+    blank-SENSITIVE and must not be touched (both measured on 14.24)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table c (id int primary key, c char(4), v varchar(4))")
+        conn.execute("insert into c values (1,'ab','ab'),(2,'abcd','abcd')")
+        assert conn.execute("select id from c where c = 'ab'").fetchall() == [(1,)]
+        assert conn.execute("select id from c where c = 'ab  '").fetchall() == [(1,)]
+        assert conn.execute("select id from c where c <> 'ab  '").fetchall() == [(2,)]
+        assert conn.execute("select id from c where v = 'ab  '").fetchall() == []
+
+
+def test_a_declared_width_survives_the_hand_off_to_the_other_server(home: Path) -> None:
+    """The catalog is shared, and so is a column's DECLARED type.
+
+    The Python server writes a `char(n)` column as `type: "text"` with
+    `decl_oid: 1042` and an `atttypmod`; the Rust side modelled neither, so it
+    read such a column as plain `text` (oid 25) with no width -- and wrote
+    `type: "bpchar"`, which the Python side read as text in turn. The values
+    always survived; the declared type did not, in either direction.
+    """
+    from secantus.sql import engine as sql_engine
+    from secantus.storage import Storage as PyStorage
+
+    store = PyStorage(str(home), durable=True)
+    try:
+        sql_engine.run_sql(store, "postgres", "create table c (id int primary key, c char(4))")
+        sql_engine.run_sql(store, "postgres", "insert into c values (1, 'ab')")
+    finally:
+        store.close()
+
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.execute("select c from c")
+        assert cur.fetchall() == [("ab  ",)]
+        assert (cur.description[0].type_code, cur.description[0].display_size) == (1042, 4)

@@ -7348,7 +7348,20 @@ impl PgHandler {
                         })
                         .unwrap_or((Type::VARCHAR, None)),
                 };
-                self.field_sourced(out.clone(), ty, -1, source)
+                // The declared width travels with the type: a `char(4)` is
+                // described as 4, which is also what the output padding below
+                // reads. A computed column (a cast or a call) keeps -1.
+                let typmod = match casts.get(i).and_then(|c| c.as_ref()) {
+                    Some(_) => -1,
+                    None => def
+                        .columns
+                        .iter()
+                        .find(|c| c.field() == *field)
+                        .or_else(|| def.column(field))
+                        .or_else(|| def.column(out))
+                        .map_or(-1, |c| c.typmod),
+                };
+                self.field_sourced(out.clone(), ty, typmod, source)
             })
             .collect()
     }
@@ -11915,6 +11928,32 @@ fn untranslatable_char(ch: char, cenc: ClientEncoding) -> PgWireError {
     )))
 }
 
+/// Blank-pad a `character(n)` value to its declared width, for output.
+///
+/// `char(n)` is a BLANK-PADDED type: PostgreSQL sends `ab` in a `char(4)`
+/// column as `ab  `. The padding belongs on the way OUT rather than in the
+/// stored value, because the semantics that matter internally are the
+/// unpadded ones -- `length()` ignores trailing blanks, comparison ignores
+/// them, and a cast to `text` strips them -- which is how the Python server
+/// has always done it (`typemap.blank_pad`). `atttypmod` is the width plus
+/// the varlena header; a bare `char` has none.
+fn blank_padded<'a>(field: &FieldInfo, v: Option<&'a Bson>) -> Option<std::borrow::Cow<'a, Bson>> {
+    use std::borrow::Cow;
+    let v = v?;
+    if *field.datatype() != Type::BPCHAR || field.type_modifier() <= 4 {
+        return Some(Cow::Borrowed(v));
+    }
+    let width = (field.type_modifier() - 4) as usize;
+    match v {
+        Bson::String(text) if text.chars().count() < width => {
+            let mut padded = text.clone();
+            padded.extend(std::iter::repeat_n(' ', width - text.chars().count()));
+            Some(Cow::Owned(Bson::String(padded)))
+        }
+        other => Some(Cow::Borrowed(other)),
+    }
+}
+
 fn encode_field_value_inner(
     enc: &mut DataRowEncoder,
     field: &FieldInfo,
@@ -11922,6 +11961,8 @@ fn encode_field_value_inner(
     tz: &secantus_pgplan::TimeZoneSetting,
     ds: &secantus_pgplan::DateStyle,
 ) -> PgWireResult<()> {
+    let padded = blank_padded(field, v);
+    let v = padded.as_deref();
     if field.format() == FieldFormat::Binary {
         // Binary datetime output is DateStyle-INDEPENDENT (it is a fixed-width
         // integer, not text), so `ds` is deliberately unused on this path.

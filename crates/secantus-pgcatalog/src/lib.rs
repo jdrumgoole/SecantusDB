@@ -71,6 +71,16 @@ pub struct Column {
     /// computed one. Never stored: the wire layer stamps it when it reads
     /// the catalog, and a projection's output columns inherit it.
     pub source: Option<(i64, i16)>,
+    /// `atttypmod`: a declared width or precision, plus the varlena header
+    /// for the string types -- `char(4)` is 8 -- or -1 for none.
+    ///
+    /// Stored, and shared with the Python server, which writes a `char(n)`
+    /// column as `type: "text"` with `decl_oid: 1042` and this modifier. The
+    /// Rust side modelled neither field, so it read such a column as plain
+    /// `text` (oid 25) with no width -- and wrote `type: "bpchar"`, which the
+    /// Python side reads as text in turn. The VALUES always survived; the
+    /// declared type did not, in either direction.
+    pub typmod: i32,
 }
 
 impl Column {
@@ -84,6 +94,28 @@ impl Column {
             sequence: None,
             default: None,
             source: None,
+            typmod: -1,
+        }
+    }
+
+    /// The `(type, decl_oid)` pair the catalog stores for this column.
+    ///
+    /// The Python server records a declared string type as `text` plus the
+    /// oid it was declared with, so that is what both servers write.
+    fn stored_type(&self) -> (&str, Bson) {
+        match self.pg_type.as_str() {
+            "bpchar" => ("text", Bson::Int32(1042)),
+            "varchar" => ("text", Bson::Int32(1043)),
+            other => (other, Bson::Null),
+        }
+    }
+
+    /// The internal type name for a stored `(type, decl_oid)` pair.
+    fn type_from_stored(pg_type: &str, decl_oid: Option<i32>) -> String {
+        match decl_oid {
+            Some(1042) => "bpchar".to_string(),
+            Some(1043) => "varchar".to_string(),
+            _ => pg_type.to_string(),
         }
     }
 
@@ -97,9 +129,10 @@ impl Column {
     /// on-disk shape, and omitting them would make a Python-side read see a
     /// column with missing keys rather than explicit nulls.
     pub fn to_document(&self) -> Document {
+        let (stored_type, decl_oid) = self.stored_type();
         doc! {
             "name": &self.name,
-            "type": &self.pg_type,
+            "type": stored_type,
             "field": self.field(),
             "pk": self.pk,
             "nullable": self.nullable,
@@ -115,15 +148,16 @@ impl Column {
             "composite_type": Bson::Null,
             "composite_fields": Bson::Null,
             "json_plain": false,
-            "decl_oid": Bson::Null,
-            "typmod": -1i32,
+            "decl_oid": decl_oid,
+            "typmod": self.typmod,
         }
     }
 
     pub fn from_document(d: &Document) -> Option<Self> {
+        let decl_oid = d.get_i32("decl_oid").ok();
         Some(Self {
             name: d.get_str("name").ok()?.to_string(),
-            pg_type: d.get_str("type").ok()?.to_string(),
+            pg_type: Self::type_from_stored(d.get_str("type").ok()?, decl_oid),
             pk: d.get_bool("pk").unwrap_or(false),
             nullable: d.get_bool("nullable").unwrap_or(true),
             sequence: d.get_str("sequence").ok().map(str::to_string),
@@ -132,6 +166,7 @@ impl Column {
                 .unwrap_or(false)
                 .then(|| d.get("default").cloned().unwrap_or(Bson::Null)),
             source: None,
+            typmod: d.get_i32("typmod").unwrap_or(-1),
         })
     }
 }

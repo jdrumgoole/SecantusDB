@@ -10253,14 +10253,27 @@ shared storage engine or building large new protocol subsystems:
   PostgreSQL 14.24 raises `42883 function max(boolean) does not exist`. Being
   permissive where the oracle refuses -- the opposite direction to the rest of
   this list, and harmless to a correct client, but it is a divergence.
-- [ ] **Rust PG server: `char(n)` is not blank-padded** (2026-09-20, ~20 of
-  the sweep's wrong-value divergences). A `char(4)` column holding `ab` reads
-  back as `ab`, so `octet_length` is 2 where PostgreSQL says 4, `concat(c,'|')`
-  is `ab|` not `ab  |`, and `c = 'ab  '` is false where PostgreSQL says true
-  (bpchar comparison ignores trailing blanks). `'abc'::char(2)` is not
-  truncated either. A literal cast DOES pad (`'a'::char(3) || '|'` is right),
-  so it is the column write/read path and the comparison rule that are
-  missing, not the cast.
+- [ ] **Rust PG server: the rest of `char(n)`'s output-form rules**
+  (2026-09-20; the storage, width and comparison halves are done -- a
+  `char(n)` column now carries its `atttypmod` through the shared catalog and
+  onto the wire, its value is blank-padded on output, and a WHERE comparison
+  ignores trailing blanks on both sides). What is left is where PostgreSQL
+  hands a `bpchar` to something through its OUTPUT function, padded, rather
+  than as `text`, stripped. The Python server has all of this and is the map:
+  `planner._pad_bpchar_match_operands` and `_strip_bpchar_literals`.
+  - Functions that see the PADDED form: `octet_length`, `concat`, `concat_ws`,
+    `format`, `to_json`, `to_jsonb` -- while `length`, `upper`, `md5`, `left`
+    and `position` see the stripped one. That list is measured, not inferred.
+  - `LIKE` / `ILIKE` / `SIMILAR TO` / `~` match against the padded form, so a
+    `char(5)` holding `ab` does NOT match `LIKE 'ab'`. The pattern cannot be
+    adjusted instead -- `'ab   ' LIKE 'ab%'` is true and `LIKE 'ab_'` is
+    false -- so the VALUE has to be padded.
+  - A comparison in the SELECT LIST (`select c = 'ab  '`) still answers false:
+    the literal is stripped when lowering a WHERE, and the projection path
+    needs the same.
+  - `'abc'::char(2)` does not truncate. The cast chain carries type NAMES with
+    no modifier, so the width would have to be threaded into the evaluation --
+    today `cast_typmod` is description metadata only.
 - [ ] **Rust PG server: 45 wrong-VALUE divergences across the existing
   `pg_corpora/`** (swept 2026-09-20 with the new
   `tools/probes/pg_differential.py --server=rust`, against PostgreSQL 14.24;
