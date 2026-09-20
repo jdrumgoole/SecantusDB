@@ -115,7 +115,7 @@
     <div class="install-cols">
       <div class="install-col">
         <h3>Prebuilt binary</h3>
-        <p>Download, extract, run. No Rust toolchain and no Python &mdash; on Linux it links the system <code>zlib</code> and <code>lz4</code>, WiredTiger's block compressors.</p>
+        <p>Download, extract, run. No Rust toolchain, no Python, and since 0.1.0-beta.2 nothing but the platform's own C runtime &mdash; zlib and lz4 are linked in.</p>
         <pre class="install-code"><code># from the release page, then:
 ./secantusd-pg ./data 127.0.0.1:5432</code></pre>
         <p class="install-cta"><a href="{{ SECANTUS_PG_BINARY_URL }}" rel="noopener">Current binary release ({{ SECANTUS_PG_BINARY_TAG | replace("secantusd-pg-v", "") }}) &rarr;</a></p>
