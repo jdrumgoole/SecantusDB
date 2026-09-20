@@ -103,16 +103,6 @@ jobs:
           # env step below) so the archive needs nothing but libc at runtime.
           packages: swig clang libclang-dev llvm-dev ninja-build liblz4-dev zlib1g-dev
 
-      - name: Link the compressors statically (Linux)
-        if: matrix.os == 'linux'
-        # WiredTiger builds zlib and lz4 as BUILTIN extensions, so
-        # libwiredtiger_static references both. Left as shared objects the
-        # published archive needs liblz4.so.1 and libz.so.1 present on the
-        # host, which a slim container image may not have. The wheel lanes do
-        # NOT set this: auditwheel bundles the shared objects for them, and
-        # changing that silently is not worth it.
-        run: echo "SECANTUS_WT_STATIC_COMPRESSORS=1" >> "$GITHUB_ENV"
-
       - name: Install toolchain (macOS)
         if: matrix.os == 'macos'
         # NOT `brew install lz4`. Homebrew ships liblz4.a and liblz4.dylib side
@@ -154,6 +144,46 @@ jobs:
         env:
           SKBUILD_CMAKE_DEFINE: SECANTUS_BUILD_STORAGE_ENGINE=ON
         run: uv build --wheel --out-dir dist-storage
+
+      - name: Link the compressors statically (Linux)
+        if: matrix.os == 'linux'
+        # WiredTiger builds zlib and lz4 as BUILTIN extensions, so
+        # libwiredtiger_static references both. Left as shared objects the
+        # published archive needs liblz4.so.1 and libz.so.1 on the host, which
+        # a slim container image may not have.
+        #
+        # THIS STEP'S POSITION IS LOAD-BEARING. It has to sit AFTER the
+        # storage-engine wheel build and BEFORE the binary build, because
+        # $GITHUB_ENV applies to every later step in the job. Setting it up with
+        # the other toolchain steps leaked it into the wheel build, whose
+        # extensions are shared objects that want the shared compressors, and
+        # that build failed with:
+        #     error: could not find native static library `z`
+        # The wheel lanes must never see this variable; auditwheel bundles the
+        # shared objects for them.
+        #
+        # SECANTUS_WT_EXTRA_LIBDIR supplies the -L that rustc's `static=`
+        # lookup needs: unlike the dynamic case it does not consult the default
+        # linker paths, so the multiarch directory has to be named explicitly.
+        run: |
+          set -euo pipefail
+          libdir="/usr/lib/$(cc -print-multiarch)"
+          missing=""
+          for a in libz.a liblz4.a; do
+            [ -f "$libdir/$a" ] || missing="$missing $a"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::static archives missing from $libdir:$missing"
+            echo "Install zlib1g-dev / liblz4-dev, or drop"
+            echo "SECANTUS_WT_STATIC_COMPRESSORS and let the compressors stay shared."
+            exit 1
+          fi
+          echo "static compressors found in $libdir:"
+          ls -l "$libdir/libz.a" "$libdir/liblz4.a"
+          {
+            echo "SECANTUS_WT_STATIC_COMPRESSORS=1"
+            echo "SECANTUS_WT_EXTRA_LIBDIR=$libdir"
+          } >> "$GITHUB_ENV"
 
       - name: Build the static-WiredTiger secantusd-pg binary
         shell: bash
