@@ -1155,12 +1155,29 @@ These work end-to-end but cut corners.
       `begin_transaction` to first use, so the cost is the SESSION open/close
       plus the commit path, not a real transaction.
 
-      **The fix worth trying, not attempted here:** hold one WiredTiger session
-      per CONNECTION and lend it to each statement's handle, instead of opening
-      and closing one per statement. That is a session-lifetime change with
-      durability implications (the close-checkpoint path, and the oplog's
-      session assumptions), so it deserves its own branch and its own
-      measurement rather than being folded into an attribution.
+      **Tried and REVERTED 2026-09-20: deferring the session open to
+      `with_user_transaction` buys nothing.** The obvious cheap fix is to stop
+      `begin_user_transaction` opening a session eagerly and let the first
+      storage use open it -- mirroring how `began` already defers WiredTiger's
+      own `begin_transaction`. Implemented (a `closed` flag to keep "never
+      opened" distinct from "closed", lazy open in `with_user_transaction`,
+      commit/rollback no-op on an unopened handle) and measured: extended
+      `select 1` **54.9us against 55.2us** -- unchanged. A counter says why:
+      still **1.00 lazy open per statement**. `run_typed` enters
+      `with_user_transaction` unconditionally whenever a handle exists, so the
+      open moved later in the statement and was never avoided.
+
+      Reverted rather than shipped: new invariants in a database's storage
+      layer, for no measured gain.
+
+      **What would actually work** is deferring past `with_user_transaction`,
+      to the first real cursor operation. That is harder than it sounds: the
+      wrapper installs `ACTIVE_TXN_SESSION` as a raw pointer to a live
+      `Session`, so a lazily-created session needs that indirection reworked
+      (a cell the storage calls resolve on demand). Alternatively, hold one
+      session per CONNECTION and lend it to each handle -- a session-lifetime
+      change touching the close-checkpoint path and the oplog's session
+      assumptions, and worth its own branch and durability measurement.
 
       `describe_portal`'s 2.83us is the next largest and still unattributed;
       the 8 `type_catalog_docs` calls a statement counted 2026-09-19 live
