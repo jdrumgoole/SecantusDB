@@ -14225,9 +14225,7 @@ def _append_distinct(pipeline: list[dict[str, Any]], out_columns: list[tuple[str
     exactly the selected values (SQL ``DISTINCT`` semantics).
     """
     names = [n for n, _ in out_columns]
-    group_id, numeric_fields = _numeric_group_id(
-        {n: f"${n}" for n in names}, dict(out_columns)
-    )
+    group_id, numeric_fields = _numeric_group_id({n: f"${n}" for n in names}, dict(out_columns))
     project: dict[str, Any] = {"_id": 0}
     for n in names:
         project[n] = f"$_id.{n}"
