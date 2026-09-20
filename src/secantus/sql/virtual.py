@@ -1251,7 +1251,22 @@ def _pg_attribute(db: str, session: Session, storage: Any, catalog: Catalog) -> 
             if col.domain_type is not None:
                 typoid = domain_oids.get(col.domain_type, 25)
             elif col.enum_type is not None:
-                typoid = enum_oids.get(col.enum_type, 25)
+                # An ARRAY of a user enum reports the ARRAY type's oid, not the
+                # element's — the same rule the composite branch below already
+                # applied. Without it a `test_schema.test_enum[]` column
+                # resolved to the enum itself, so getColumns reported TYPE_NAME
+                # `"test_schema"."test_enum"` and DATA_TYPE as the element type
+                # where PostgreSQL 14 reports `"test_schema"."_test_enum"` and
+                # ARRAY (measured 2026-09-20).
+                minted_enum = enum_oids.get(col.enum_type)
+                if minted_enum is not None:
+                    typoid = (
+                        minted_enum + USER_TYPE_ARRAY_OID_OFFSET
+                        if typemap.is_array_tag(col.type_tag)
+                        else minted_enum
+                    )
+                else:
+                    typoid = 25
             elif getattr(col, "composite_type", None) is not None:
                 # A composite (or composite-array) column reports its type's
                 # minted oid, not generic RECORD/2249 — so getColumns' typname
@@ -2378,9 +2393,20 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
     # type is created, so an earlier-created (lower-oid) element claims the
     # shorter name (``custom`` created before ``_custom`` → ``custom``'s array
     # is ``__custom``, ``_custom``'s array is ``___custom``).
-    taken = {r["typname"] for r in rows}
+    # Collisions are resolved PER NAMESPACE, because that is the scope a
+    # PostgreSQL type name is unique in. A single global set made
+    # `test_schema.test_enum`'s array dodge the unrelated `public._test_enum`
+    # and come out as `__test_enum` where PostgreSQL 14 says `_test_enum`
+    # (measured 2026-09-20) — and compounded, so an array in public whose name
+    # was already taken landed on four underscores instead of two.
+    default_ns = _NS_OIDS["pg_catalog"]
+    taken_by_ns: dict[int, set[str]] = {}
+    for r in rows:
+        taken_by_ns.setdefault(r.get("typnamespace", default_ns), set()).add(r["typname"])
     array_name_by_oid: dict[int, str] = {}
     for row in sorted(rows, key=lambda r: r["oid"]):
+        ns = row.get("typnamespace", default_ns)
+        taken = taken_by_ns.setdefault(ns, set())
         name = f"_{row['typname']}"
         while name in taken:
             name = f"_{name}"

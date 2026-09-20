@@ -814,6 +814,72 @@ def test_schema_qualified_function_call_resolution(storage, session):
     assert "does not exist" in str(exc.value)
 
 
+def test_enum_array_column_reports_the_array_type(storage, session):
+    """A ``ts.te[]`` column resolves to the ARRAY type, not the enum itself.
+
+    The enum branch of ``pg_attribute`` had no array handling — the composite
+    branch beside it did — so an array-of-enum column recorded the element's
+    oid. pgjdbc's ``getColumns`` then reported TYPE_NAME
+    ``"test_schema"."test_enum"`` and the element's DATA_TYPE where
+    PostgreSQL 14 reports ``"test_schema"."_test_enum"`` and ARRAY.
+
+    The scalar column is asserted beside it: the fix must not turn every enum
+    column into an array.
+    """
+    q(storage, session, "CREATE SCHEMA ts")
+    q(storage, session, "CREATE TYPE ts.te AS ENUM ('v')")
+    q(storage, session, "CREATE TABLE ea (arr ts.te[], sc ts.te)")
+    res = q(
+        storage,
+        session,
+        "SELECT a.attname, t.typname, t.typtype FROM pg_attribute a "
+        "JOIN pg_class c ON a.attrelid = c.oid "
+        "JOIN pg_type t ON t.oid = a.atttypid "
+        "WHERE c.relname = 'ea' AND a.attnum > 0 ORDER BY a.attnum",
+    )
+    assert res.rows == [("arr", "_te", "b"), ("sc", "te", "e")]
+
+
+def test_array_type_names_collide_per_namespace(storage, session):
+    """An array type name is unique per SCHEMA, not globally.
+
+    PostgreSQL prepends underscores until the name is free **within its own
+    namespace**. A single global set made ``test_schema.test_enum``'s array
+    dodge the unrelated ``public._test_enum`` and come out ``__test_enum``.
+
+    Both halves are pinned because they pull in opposite directions: the
+    schema-scoped array keeps ONE underscore even though ``public._test_enum``
+    exists, while the public array really does need THREE — ``_test_enum`` is
+    taken by the enum itself and ``__test_enum`` by that enum's own array,
+    which is created first because it has the lower oid.
+
+    Every name here was measured against PostgreSQL 14 on 2026-09-20.
+    """
+    q(storage, session, "CREATE SCHEMA test_schema")
+    q(storage, session, "CREATE TYPE test_schema.test_enum AS ENUM ('val')")
+    q(storage, session, "CREATE TYPE _test_enum AS ENUM ('evil')")
+    q(storage, session, "CREATE TYPE test_enum AS ENUM ('other')")
+    q(
+        storage,
+        session,
+        "CREATE TABLE on_path_table (a test_schema.test_enum[], b _test_enum, c test_enum[])",
+    )
+    res = q(
+        storage,
+        session,
+        "SELECT a.attname, n.nspname, t.typname FROM pg_attribute a "
+        "JOIN pg_class c ON a.attrelid = c.oid "
+        "JOIN pg_type t ON t.oid = a.atttypid "
+        "JOIN pg_namespace n ON t.typnamespace = n.oid "
+        "WHERE c.relname = 'on_path_table' AND a.attnum > 0 ORDER BY a.attnum",
+    )
+    assert res.rows == [
+        ("a", "test_schema", "_test_enum"),
+        ("b", "public", "_test_enum"),
+        ("c", "public", "___test_enum"),
+    ]
+
+
 def test_pg_class_reltuples(storage, session):
     # pgjdbc's getIndexInfo reads ci.reltuples as CARDINALITY; -1 is PG's
     # "no estimate yet" initial value.
