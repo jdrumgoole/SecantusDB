@@ -9656,3 +9656,48 @@ def _error_of(conn, sql: str) -> str:
     except psycopg.Error as exc:  # noqa: BLE001 - the message is the assertion
         return str(exc)
     raise AssertionError(f"{sql} did not fail")
+
+
+def test_distinct_inside_an_aggregate(home: Path) -> None:
+    """`count(DISTINCT col)` was `0A000 DISTINCT inside an aggregate`.
+
+    Values measured against PostgreSQL 14.24 (2026-09-20). The group's values
+    are deduped BY VALUE -- `1.5` and `1.50` are one -- with NULLs already
+    dropped, except for `array_agg`, whose DISTINCT keeps NULL as a value and
+    returns the result SORTED rather than in group order.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table t (id int, s text, v numeric, g int)")
+        conn.execute(
+            "insert into t values (1,'a',1.5,1),(2,'a',1.50,1),(3,'b',2,1),(4,null,3,2),(5,'b',2,2)"
+        )
+        assert _rows(conn, "select count(distinct s), count(s), count(*) from t") == [
+            ("2", "4", "5")
+        ]
+        assert _rows(conn, "select count(distinct v) from t") == [("3",)]
+        assert _rows(conn, "select sum(distinct v) from t") == [("6.5",)]
+        assert _rows(conn, "select g, count(distinct s) from t group by g order by g") == [
+            ("1", "2"),
+            ("2", "1"),
+        ]
+        assert _rows(conn, "select array_agg(distinct s) from t") == [("['a', 'b', None]",)]
+        # An empty input still counts zero, not NULL.
+        assert _rows(conn, "select count(distinct s) from t where id > 10") == [("0",)]
+
+
+def test_select_distinct_over_an_aggregate(home: Path) -> None:
+    """`SELECT DISTINCT` over aggregate output: two groups with the same count
+    collapse into one row (PostgreSQL 14.24). `DISTINCT ON` there is refused
+    as unsupported rather than answered wrongly."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table t (id int, g int, s text)")
+        conn.execute("insert into t values (1,1,'a'),(2,1,'b'),(3,2,'a'),(4,2,'b'),(5,3,'c')")
+        assert _rows(conn, "select distinct count(*) from t") == [("5",)]
+        assert _rows(conn, "select distinct g, count(*) from t group by g order by 1") == [
+            ("1", "2"),
+            ("2", "2"),
+            ("3", "1"),
+        ]
+        with pytest.raises(psycopg.Error) as exc:
+            conn.execute("select distinct on (g) g, count(*) from t group by g").fetchall()
+        assert exc.value.sqlstate == "0A000"

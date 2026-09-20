@@ -19,14 +19,20 @@ refuses, and this now says the same thing in the same words —
 `UNION types text and integer cannot be matched` (42804). A count mismatch is
 42601, and an untyped NULL takes the other side's type.
 
+`count(DISTINCT col)` works too, on every aggregate that has one — the group's
+values are deduped by value before the function runs. `array_agg(DISTINCT x)`
+is the one that keeps NULL as a value and returns its result sorted, as
+PostgreSQL does. `SELECT DISTINCT` over aggregate output collapses groups that
+produced the same row.
+
 #### Added
 
 - `crates/secantus-pgplan`: `Distinct` on a planned select, and `SetOpSelect`
   as a statement of its own, with the ORDER BY / LIMIT / OFFSET that belong to
   the combined result.
-- `crates/secantus-pgserver`: dedup for DISTINCT and DISTINCT ON, and
-  `set_op_rows` — both matching rows by value, so numerics that differ only in
-  scale count once.
+- `crates/secantus-pgserver`: dedup for DISTINCT and DISTINCT ON, DISTINCT
+  inside an aggregate, and `set_op_rows` — all matching rows by value, so
+  numerics that differ only in scale count once.
 
 #### Testing
 

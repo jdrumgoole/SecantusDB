@@ -697,6 +697,10 @@ pub struct AggItem {
     /// `sum(n * 2)` -- evaluated per row into `field` (a hidden `__aggN`
     /// slot) before the group is computed. `None` for a bare column.
     pub expr: Option<ColumnExpr>,
+    /// `count(DISTINCT col)` and friends: the group's values are deduped
+    /// before the function runs. `count(DISTINCT)` is by far the common one,
+    /// but PostgreSQL allows it on any aggregate.
+    pub distinct: bool,
 }
 
 /// One output column of an aggregate query, by POSITION.
@@ -755,6 +759,10 @@ pub struct Aggregate {
     pub order: Vec<AggOrderKey>,
     pub limit: Option<i64>,
     pub offset: i64,
+    /// `SELECT DISTINCT count(*) ...` -- dedup on the aggregate's OUTPUT rows,
+    /// after grouping and before the ORDER BY. `DISTINCT ON` over an aggregate
+    /// is still refused rather than approximated.
+    pub distinct: bool,
 }
 
 /// A column reference as `(alias, column)`.
@@ -3656,6 +3664,22 @@ fn plan_set_operation(
     }))
 }
 
+/// `SELECT DISTINCT` over an aggregate: true for a plain DISTINCT.
+///
+/// `DISTINCT ON (...)` needs its keys to resolve against the GROUP BY output
+/// rather than the table, which this slice does not do -- so it is refused as
+/// unsupported. Resolving it against the table instead reported the key as an
+/// undefined column, which is a different and misleading answer.
+fn aggregate_distinct(s: &pg_query::protobuf::SelectStmt) -> Result<bool> {
+    if s.distinct_clause.is_empty() {
+        return Ok(false);
+    }
+    if s.distinct_clause.len() == 1 && s.distinct_clause[0].node.is_none() {
+        return Ok(true);
+    }
+    Err(Error::Unsupported("DISTINCT ON with an aggregate".into()))
+}
+
 fn plan_select(
     s: &pg_query::protobuf::SelectStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
@@ -3831,9 +3855,6 @@ fn plan_aggregate(
         let def = join_output_def(&join, lookup)?;
         return finish_aggregate(s, String::new(), Some(Box::new(join)), def, params);
     }
-    if !s.distinct_clause.is_empty() {
-        return Err(Error::Unsupported("DISTINCT with an aggregate".into()));
-    }
     // An aggregate over a generated source. Only the ungrouped forms are
     // supported: there is one column, so grouping by it would make each row its
     // own group, which nothing in the corpus asks for and would be easy to get
@@ -3887,6 +3908,7 @@ fn plan_aggregate(
                 // `min`/`max` return the input type, which here is always int4.
                 source_type: Some("int4".to_string()),
                 expr: None,
+                distinct: false,
             });
         }
         // The WHERE clause was silently dropped here before: `count(*)
@@ -3903,6 +3925,7 @@ fn plan_aggregate(
             order: Vec::new(),
             limit: None,
             offset: 0,
+            distinct: aggregate_distinct(s)?,
         }));
     }
     let table = match s.from_clause[0].node.as_ref() {
@@ -4546,9 +4569,6 @@ fn finish_aggregate(
         match rt.val.as_ref().and_then(|v| v.node.as_ref()) {
             Some(N::FuncCall(f)) if is_aggregate_call(f) => {
                 let name = func_name(f).unwrap_or_default();
-                if f.agg_distinct {
-                    return Err(Error::Unsupported("DISTINCT inside an aggregate".into()));
-                }
                 if f.agg_filter.is_some() {
                     return Err(Error::Unsupported("FILTER on an aggregate".into()));
                 }
@@ -4599,6 +4619,7 @@ fn finish_aggregate(
                                 out,
                                 source_type: Some(pg_type),
                                 expr: Some(expr),
+                                distinct: f.agg_distinct,
                             });
                             continue;
                         }
@@ -4625,6 +4646,7 @@ fn finish_aggregate(
                     out,
                     source_type,
                     expr: None,
+                    distinct: f.agg_distinct,
                 });
             }
             Some(N::ColumnRef(c)) => {
@@ -4794,6 +4816,7 @@ fn finish_aggregate(
         order,
         limit,
         offset,
+        distinct: aggregate_distinct(s)?,
     }))
 }
 

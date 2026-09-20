@@ -568,7 +568,10 @@ fn aggregate_refusals_carry_the_right_sqlstate() {
         ("SELECT name, count(*) FROM t", "42803"),
         // Deliberately deferred rather than approximated.
         ("SELECT avg(n) FROM t", "0A000"),
-        ("SELECT count(DISTINCT n) FROM t", "0A000"),
+        // `DISTINCT ON` over an aggregate resolves its keys against the GROUP
+        // BY output, which this slice does not do; plain `count(DISTINCT n)`
+        // IS supported (see `count_distinct_plans_a_distinct_aggregate`).
+        ("SELECT DISTINCT ON (n) count(*) FROM t GROUP BY n", "0A000"),
         ("SELECT count(*) FROM t HAVING count(*) > 1", "0A000"),
         ("SELECT count(nope) FROM t", "42703"),
         ("SELECT sum(nope + 1) FROM t", "42703"),
@@ -577,6 +580,26 @@ fn aggregate_refusals_carry_the_right_sqlstate() {
     for (sql, want) in cases {
         let err = plan(sql, &lookup).expect_err(sql);
         assert_eq!(err.sqlstate(), want, "for {sql} (got {err})");
+    }
+}
+
+/// `count(DISTINCT col)` plans as an aggregate that dedups its input.
+#[test]
+fn count_distinct_plans_a_distinct_aggregate() {
+    match plan("SELECT count(DISTINCT n) FROM t", &lookup).unwrap() {
+        Statement::Aggregate(a) => {
+            assert_eq!(a.items.len(), 1);
+            assert!(a.items[0].distinct, "the aggregate is not marked DISTINCT");
+            assert!(!a.distinct, "the SELECT itself is not DISTINCT");
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    match plan("SELECT DISTINCT count(*) FROM t", &lookup).unwrap() {
+        Statement::Aggregate(a) => {
+            assert!(a.distinct, "the SELECT is DISTINCT");
+            assert!(!a.items[0].distinct, "the aggregate itself is not");
+        }
+        other => panic!("wrong statement: {other:?}"),
     }
 }
 

@@ -1983,6 +1983,32 @@ impl PgHandler {
                 Ordering::Equal
             });
         }
+        // `SELECT DISTINCT` over an aggregate dedups the OUTPUT rows -- the
+        // select list, so two groups with the same count collapse into one --
+        // after grouping and before the ORDER BY, as PostgreSQL does.
+        if agg.distinct {
+            use secantus_pgplan::OutputCol;
+            let mut seen: Vec<Vec<Option<Bson>>> = Vec::new();
+            let mut kept = Vec::with_capacity(groups.len());
+            for (key, vals) in groups {
+                let ident: Vec<Option<Bson>> = agg
+                    .select
+                    .iter()
+                    .map(|(_, col)| {
+                        let v = match col {
+                            OutputCol::Group(i) => key.get(*i).cloned().flatten(),
+                            OutputCol::Agg(i) => vals.get(*i).cloned(),
+                        };
+                        group_key_ident(&v)
+                    })
+                    .collect();
+                if !seen.contains(&ident) {
+                    seen.push(ident);
+                    kept.push((key, vals));
+                }
+            }
+            groups = kept;
+        }
         if agg.offset > 0 {
             let skip = usize::try_from(agg.offset).unwrap_or(usize::MAX);
             groups = groups.into_iter().skip(skip).collect();
@@ -7617,10 +7643,7 @@ impl PgHandler {
 
     /// A row-producing statement as `(schema, rows)`: what a set operation
     /// needs from each of its sides.
-    fn rows_with_schema(
-        &self,
-        stmt: &Statement,
-    ) -> PgWireResult<SchemaAndRows> {
+    fn rows_with_schema(&self, stmt: &Statement) -> PgWireResult<SchemaAndRows> {
         match stmt {
             Statement::Select(sel) => {
                 let (docs, def) = self.select_docs(sel, 0)?;
@@ -7694,10 +7717,7 @@ impl PgHandler {
     /// Rows are matched by VALUE (`group_key_ident`), so `1.5` and `1.50` are
     /// one row as PostgreSQL has it. `ALL` keeps duplicates, and for INTERSECT
     /// / EXCEPT it keeps multiplicities -- `min(l, r)` and `l - r` copies.
-    fn set_op_rows(
-        &self,
-        set: &secantus_pgplan::SetOpSelect,
-    ) -> PgWireResult<SchemaAndRows> {
+    fn set_op_rows(&self, set: &secantus_pgplan::SetOpSelect) -> PgWireResult<SchemaAndRows> {
         let (left_schema, left) = self.rows_with_schema(&set.left)?;
         let (right_schema, right) = self.rows_with_schema(&set.right)?;
         let op = match set.kind {
@@ -12176,13 +12196,29 @@ fn compute_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
         // count(*)
         return Bson::Int64(rows.len() as i64);
     };
-    let values: Vec<&Bson> = rows
+    let mut values: Vec<&Bson> = rows
         .iter()
         .filter_map(|d| match d.get(field) {
             None | Some(Bson::Null) => None,
             Some(v) => Some(v),
         })
         .collect();
+    // `count(DISTINCT col)` -- PostgreSQL dedups the group's values, NULLs
+    // already dropped, before the function sees them. By VALUE, so a numeric
+    // spelled `1.5` and `1.50` counts once.
+    if item.distinct {
+        let mut seen: Vec<Option<Bson>> = Vec::new();
+        let mut kept = Vec::with_capacity(values.len());
+        for v in values {
+            let k = group_key_ident(&Some(v.clone()));
+            if !seen.contains(&k) {
+                seen.push(k);
+                kept.push(v);
+            }
+        }
+        values = kept;
+    }
+    let values = values;
 
     match item.func {
         AggFunc::CountStar => Bson::Int64(rows.len() as i64),
@@ -12190,6 +12226,31 @@ fn compute_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
         // Group order, NULLs INCLUDED -- a LEFT-JOIN miss surfaces as `[None]`
         // rather than `[]`, which is what psycopg's EnumInfo distinguishes a
         // non-enum by.
+        // `array_agg(DISTINCT x)` is the one aggregate whose DISTINCT keeps
+        // NULL -- it is a value here, not something to skip -- and PostgreSQL
+        // returns the deduped values SORTED, NULLs last, rather than in group
+        // order (measured on 14.24: `c,a,b,a,NULL` -> `a,b,c,NULL`).
+        AggFunc::ArrayAgg if item.distinct => {
+            let mut seen: Vec<Option<Bson>> = Vec::new();
+            let mut kept: Vec<Bson> = Vec::new();
+            for d in rows {
+                let v = d.get(field).cloned().unwrap_or(Bson::Null);
+                let k = group_key_ident(&Some(v.clone()));
+                if !seen.contains(&k) {
+                    seen.push(k);
+                    kept.push(v);
+                }
+            }
+            kept.sort_by(
+                |a, b| match (matches!(a, Bson::Null), matches!(b, Bson::Null)) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => Ordering::Greater,
+                    (false, true) => Ordering::Less,
+                    (false, false) => compare_values(a, b),
+                },
+            );
+            Bson::Array(kept)
+        }
         AggFunc::ArrayAgg => Bson::Array(
             rows.iter()
                 .map(|d| d.get(field).cloned().unwrap_or(Bson::Null))

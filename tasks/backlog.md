@@ -10179,6 +10179,20 @@ shared storage engine or building large new protocol subsystems:
   Separately, the same query failed with 0A000 on its 7th run under psycopg's
   auto-prepare (Describe typed `pg_sleep` as text, Execute as void). That is
   fixed in #1514 and is not this flake: pgx does not revalidate the plan.
+- [ ] **Rust PG server: `ORDER BY <position>` over a GROUPED aggregate is
+  0A000** (measured 2026-09-20, and PRE-EXISTING -- it fails with or without
+  DISTINCT, so it is not a regression from that work). `select count(*) from t
+  group by g order by 1` is refused where PostgreSQL answers the counts;
+  `order by g` (a grouping column) works. The aggregate planner resolves an
+  ORDER BY term against the table's columns, and a position refers to the
+  OUTPUT list, which for an aggregate is a mix of group keys and aggregate
+  results. `AggOrderKey` would need to name an output column the way
+  `SetOpOrder` now does.
+- [ ] **Rust PG server: `DISTINCT ON` over an aggregate is 0A000**
+  (2026-09-20). `select distinct on (g) g, count(*) from t group by g` is
+  refused -- honestly, with `DISTINCT ON with an aggregate` -- because the
+  keys would have to resolve against the GROUP BY output rather than the
+  table. Plain `SELECT DISTINCT` over an aggregate IS supported.
 - [ ] **Rust PG server: two set-operation type rules still differ from
   PostgreSQL** (2026-09-20, after DISTINCT and the set operations landed;
   every other differential case matches 14.24). Both concern the reported
