@@ -85,12 +85,24 @@ fn main() {
     // (HAVE_BUILTIN_EXTENSION_ZLIB), whose `zlib_compress.c.o` — now inside
     // libwiredtiger_static — references libz's inflate/deflate. libz is a system
     // library on macOS (SDK) and Linux (manylinux/musl ship zlib).
+    // `SECANTUS_WT_STATIC_COMPRESSORS=1` links zlib and lz4 from their static
+    // archives instead of the system shared objects, so the resulting binary
+    // needs nothing but libc. It is OPT-IN rather than the default because the
+    // manylinux / musl WHEEL lanes are happy with shared compressors —
+    // auditwheel bundles them — and flipping the default would silently change
+    // what those wheels contain. The standalone-binary release lanes set it;
+    // see .github/workflows/release-binaries.yml. Requires the `.a` archives
+    // (`zlib1g-dev` + `liblz4-dev` on Debian) to be installed.
+    println!("cargo:rerun-if-env-changed=SECANTUS_WT_STATIC_COMPRESSORS");
+    let static_compressors = env::var_os("SECANTUS_WT_STATIC_COMPRESSORS").is_some();
     let sys_libs: &[&str] = match target_os.as_str() {
-        "linux" => &["pthread", "rt", "dl", "z", "lz4"],
-        // lz4 is absent here on purpose: macOS picks its link KIND below, in
-        // the same place it picks the search path, because it is the only
-        // target where a dylib cannot be assumed to exist on the machine that
-        // runs the binary.
+        // zlib and lz4 are absent here: both are compressors, and their link
+        // KIND is decided below rather than forced to dylib.
+        "linux" => &["pthread", "rt", "dl"],
+        // lz4 is absent here on purpose too: macOS picks its link KIND below,
+        // in the same place it picks the search path, because it is the target
+        // where a dylib cannot be assumed to exist on the machine that runs the
+        // binary. zlib IS a system library there (the macOS SDK ships it).
         "macos" => &["pthread", "dl", "z"],
         "windows" => &[],
         // Other POSIX targets (the BSDs etc.): pthread is the safe baseline.
@@ -98,6 +110,20 @@ fn main() {
     };
     for l in sys_libs {
         println!("cargo:rustc-link-lib=dylib={l}");
+    }
+    if target_os == "linux" {
+        // `z` (zlib) and `lz4`: WT is built with both as BUILTIN block-compressor
+        // extensions (HAVE_BUILTIN_EXTENSION_ZLIB / _LZ4), so `zlib_compress.c.o`
+        // and `lz4_compress.c.o` sit inside libwiredtiger_static and reference
+        // each library's symbols. Which is why they are linked at all.
+        let kind = if static_compressors {
+            "static"
+        } else {
+            "dylib"
+        };
+        for l in ["z", "lz4"] {
+            println!("cargo:rustc-link-lib={kind}={l}");
+        }
     }
 
     // lz4 is in `sys_libs` above because it is the default block compressor and

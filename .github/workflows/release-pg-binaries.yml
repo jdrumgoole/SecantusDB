@@ -98,7 +98,20 @@ jobs:
         if: matrix.os == 'linux'
         uses: ./.github/actions/apt-install
         with:
-          packages: swig clang libclang-dev llvm-dev ninja-build liblz4-dev
+          # zlib1g-dev is here for its libz.a, and liblz4-dev for its liblz4.a:
+          # the standalone binary links both compressors STATICALLY (see the
+          # env step below) so the archive needs nothing but libc at runtime.
+          packages: swig clang libclang-dev llvm-dev ninja-build liblz4-dev zlib1g-dev
+
+      - name: Link the compressors statically (Linux)
+        if: matrix.os == 'linux'
+        # WiredTiger builds zlib and lz4 as BUILTIN extensions, so
+        # libwiredtiger_static references both. Left as shared objects the
+        # published archive needs liblz4.so.1 and libz.so.1 present on the
+        # host, which a slim container image may not have. The wheel lanes do
+        # NOT set this: auditwheel bundles the shared objects for them, and
+        # changing that silently is not worth it.
+        run: echo "SECANTUS_WT_STATIC_COMPRESSORS=1" >> "$GITHUB_ENV"
 
       - name: Install toolchain (macOS)
         if: matrix.os == 'macos'
@@ -175,6 +188,20 @@ jobs:
           uv run --no-project --with "psycopg[binary]" --with pytest
           python -m pytest tests/test_rust_pg_binary_smoke.py
           -o addopts= -p no:cacheprovider -q
+
+      - name: Check the binary's dynamic dependencies
+        # The artifact can be broken in a way nothing else here notices: the
+        # macOS archives of 2026-09-19 linked liblz4 by its absolute Homebrew
+        # path and would not launch on a Mac without Homebrew, while the build
+        # succeeded and the smoke test passed because the RUNNER has Homebrew.
+        # This inspects the binary we are about to package against a
+        # per-platform allowlist. It runs BEFORE packaging so a bad artifact is
+        # never attached to a release.
+        shell: bash
+        run: |
+          # The Windows runner has `python`, not always `python3`.
+          py=python3; command -v "$py" >/dev/null 2>&1 || py=python
+          "$py" .github/scripts/check_binary_deps.py "${{ matrix.os }}" "$BIN"
 
       - name: Package the archive + checksum
         shell: bash
