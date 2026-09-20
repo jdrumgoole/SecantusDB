@@ -1944,6 +1944,11 @@ fn cast_typmod(node: &pg_query::protobuf::Node) -> i32 {
     let Some(tn) = tc.type_name.as_ref() else {
         return -1;
     };
+    declared_typmod(tn)
+}
+
+/// The `atttypmod` a declared type carries, or -1 for an unmodified type.
+fn declared_typmod(tn: &pg_query::protobuf::TypeName) -> i32 {
     let mods: Vec<i32> = tn.typmods.iter().filter_map(typmod_ival).collect();
     // A modifier we could not read as an integer means no faithful typmod.
     if mods.len() != tn.typmods.len() {
@@ -2094,6 +2099,10 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                         if k.contype == CT::ConstrPrimary as i32)
                 });
                 let mut column = Column::new(&cd.colname, &underlying, pk);
+                // The declared width / precision, so `char(4)` describes as
+                // 4 rather than as an unsized `text` -- and so the Python
+                // server, which shares this catalog, reads the same type.
+                column.typmod = cd.type_name.as_ref().map(declared_typmod).unwrap_or(-1);
                 // A serial column draws its default from a sequence named
                 // `<table>_<column>_seq`, as PostgreSQL names it -- and is
                 // NOT NULL, as PostgreSQL declares it.
@@ -12472,6 +12481,17 @@ fn lower_aexpr(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
             )));
         }
     }
+    // Comparison against a `char(n)` column IGNORES TRAILING BLANKS: a
+    // `char(4)` holding `ab` equals both `'ab'` and `'ab  '` (PostgreSQL
+    // 14.24). The stored value is unpadded -- padding happens on output --
+    // so the literal is stripped to match it, rather than padded to a width
+    // the stored side does not carry.
+    let value = match (&value, def.columns.iter().find(|c| c.name == col)) {
+        (Bson::String(text), Some(c)) if c.pg_type == "bpchar" => {
+            Bson::String(text.trim_end_matches(' ').to_string())
+        }
+        _ => value,
+    };
     // A regtype / regclass value filters by its OID -- the stored column is
     // a number.
     let value = match regtype_oid(&value).or_else(|| regclass_oid(&value)) {
