@@ -7328,8 +7328,16 @@ impl PgHandler {
             .map(|(i, (out, field))| {
                 let (ty, source) = match casts.get(i).and_then(|c| c.as_ref()) {
                     Some(expr) => (wire_type(secantus_pgplan::column_expr_type(expr)), None),
+                    // By STORED FIELD first, then by either name. A primary
+                    // key is stored as `_id`, which is not a column name, so
+                    // `id AS k` matched neither the field nor the output name
+                    // and fell through to the varchar default below -- an int
+                    // column described, and decoded by the client, as text.
                     None => def
-                        .column(field)
+                        .columns
+                        .iter()
+                        .find(|c| c.field() == *field)
+                        .or_else(|| def.column(field))
                         .or_else(|| def.column(out))
                         .map(|c| {
                             (
@@ -10169,7 +10177,12 @@ impl PgHandler {
             Statement::Update(upd) => {
                 let def = self.lookup(&upd.table);
                 let constrained = def.as_ref().is_some_and(table_has_row_constraints);
-                let matched = if upd.set_exprs.is_empty() && !constrained {
+                // RETURNING needs each row AFTER the update, which only the
+                // row-by-row path below computes -- the bulk path knows just
+                // how many rows matched.
+                let mut returned: Vec<Document> = Vec::new();
+                let matched = if upd.set_exprs.is_empty() && !constrained && upd.returning.is_none()
+                {
                     self.update_rows(&upd.table, &upd.filter, &upd.set, &upd.unset)?
                 } else {
                     // A SET list that reads the row (`num = num * 2`) is
@@ -10191,7 +10204,7 @@ impl PgHandler {
                             secantus_pgplan::update_row_sets(&upd, &row)
                                 .map_err(|e| Self::err(&e))?
                         };
-                        if let Some(def) = def.as_ref() {
+                        if def.is_some() || upd.returning.is_some() {
                             let mut after = row.clone();
                             for (k, v) in &set {
                                 after.insert(k.clone(), v.clone());
@@ -10199,7 +10212,9 @@ impl PgHandler {
                             for k in &unset {
                                 after.remove(k);
                             }
-                            self.check_row_constraints(def, &after)?;
+                            if let Some(def) = def.as_ref() {
+                                self.check_row_constraints(def, &after)?;
+                            }
                             new_rows.push(after);
                         }
                         let id = row.get("_id").cloned().unwrap_or(Bson::Null);
@@ -10213,8 +10228,28 @@ impl PgHandler {
                         matched +=
                             self.update_rows(&upd.table, &bson::doc! {"_id": id}, &set, &unset)?;
                     }
+                    returned = new_rows;
                     matched
                 };
+                if let Some(returning) = upd.returning.as_ref() {
+                    let def = def
+                        .ok_or_else(|| Self::err(&PlanError::UndefinedTable(upd.table.clone())))?;
+                    let mut response = self.project_rows(
+                        returned,
+                        &def,
+                        &returning.columns,
+                        &returning.casts,
+                        &RowEnv {
+                            tz: row_tz,
+                            ds: row_ds,
+                            cenc: row_cenc,
+                        },
+                    )?;
+                    // pgwire appends the row count, as it does for INSERT.
+                    let _ = matched;
+                    response.set_command_tag("UPDATE");
+                    return Ok(vec![Response::Query(response)]);
+                }
                 // PostgreSQL's UPDATE tag counts rows MATCHED, not rows whose
                 // value actually changed: `UPDATE t SET n = n` reports every
                 // row. `modified` would under-report a no-op assignment.
@@ -10227,6 +10262,19 @@ impl PgHandler {
                 if let Some(def) = self.lookup(&del.table) {
                     self.check_referencing_rows(&def, &del.filter)?;
                 }
+                // RETURNING reports the rows as they were, so they are read
+                // before the delete removes them.
+                let doomed: Vec<Document> = match del.returning.as_ref() {
+                    None => Vec::new(),
+                    Some(_) => self
+                        .storage
+                        .find_matching(self.db(), &del.table, &del.filter)
+                        .map_err(|e| Self::storage_err("could not read", e))?
+                        .iter()
+                        .map(|b| bson::from_slice(b))
+                        .collect::<Result<_, _>>()
+                        .map_err(|e| Self::storage_err("could not decode a row", e))?,
+                };
                 let deleted = self
                     .storage
                     .delete_matching(
@@ -10238,6 +10286,25 @@ impl PgHandler {
                         None,
                     )
                     .map_err(|e| Self::storage_err("could not delete", e))?;
+                if let Some(returning) = del.returning.as_ref() {
+                    let def = self
+                        .lookup(&del.table)
+                        .ok_or_else(|| Self::err(&PlanError::UndefinedTable(del.table.clone())))?;
+                    let mut response = self.project_rows(
+                        doomed,
+                        &def,
+                        &returning.columns,
+                        &returning.casts,
+                        &RowEnv {
+                            tz: row_tz,
+                            ds: row_ds,
+                            cenc: row_cenc,
+                        },
+                    )?;
+                    let _ = deleted;
+                    response.set_command_tag("DELETE");
+                    return Ok(vec![Response::Query(response)]);
+                }
                 Ok(vec![Response::Execution(
                     Tag::new("DELETE").with_rows(deleted),
                 )])
@@ -12169,6 +12236,7 @@ fn encode_value(enc: &mut DataRowEncoder, v: Option<&Bson>) -> PgWireResult<()> 
 fn aggregate_wire_type(item: &AggItem) -> Type {
     match item.func {
         AggFunc::CountStar | AggFunc::Count => Type::INT8,
+        AggFunc::BoolAnd | AggFunc::BoolOr => Type::BOOL,
         AggFunc::Sum => match item.source_type.as_deref() {
             Some("numeric" | "decimal") => Type::NUMERIC,
             _ => Type::INT8,
@@ -12223,6 +12291,18 @@ fn compute_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
     match item.func {
         AggFunc::CountStar => Bson::Int64(rows.len() as i64),
         AggFunc::Count => Bson::Int64(values.len() as i64),
+        // `bool_and` is every non-NULL value true, `bool_or` is any of them;
+        // both are NULL when nothing survives, like `min` / `max`.
+        AggFunc::BoolAnd | AggFunc::BoolOr => {
+            if values.is_empty() {
+                return Bson::Null;
+            }
+            let truthy = |v: &&Bson| matches!(v, Bson::Boolean(true));
+            Bson::Boolean(match item.func {
+                AggFunc::BoolAnd => values.iter().all(truthy),
+                _ => values.iter().any(truthy),
+            })
+        }
         // Group order, NULLs INCLUDED -- a LEFT-JOIN miss surfaces as `[None]`
         // rather than `[]`, which is what psycopg's EnumInfo distinguishes a
         // non-enum by.
@@ -12251,6 +12331,10 @@ fn compute_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
             );
             Bson::Array(kept)
         }
+        // Over an EMPTY input every aggregate but `count` is NULL, and
+        // `array_agg` is no exception -- it answered an empty ARRAY, where
+        // PostgreSQL 14.24 answers NULL.
+        AggFunc::ArrayAgg if rows.is_empty() => Bson::Null,
         AggFunc::ArrayAgg => Bson::Array(
             rows.iter()
                 .map(|d| d.get(field).cloned().unwrap_or(Bson::Null))

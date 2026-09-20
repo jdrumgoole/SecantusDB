@@ -58,12 +58,16 @@ from __future__ import annotations
 import datetime
 import decimal
 import os
+import pathlib
+import re
 import shutil
+import subprocess
 import sys
 import tempfile
 
 import psycopg
 
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
 from secantus.sql.pgserver import SecantusPGServer  # noqa: E402
@@ -170,13 +174,59 @@ def _read(path: str) -> list[str]:
         return [ln.rstrip() for ln in fh if ln.strip() and not ln.lstrip().startswith("#")]
 
 
-def main(setup_path: str, corpus_path: str, *, types: bool, tags: bool) -> int:
-    store_dir = tempfile.mkdtemp(prefix="pgprobe-")
-    store = Storage(store_dir)
-    srv = SecantusPGServer(port=0, storage=store)
-    srv.start()
-    host, port = srv.address
-    sec = psycopg.connect(host=host, port=port, dbname="db", user="probe", autocommit=True)
+class _RustServer:
+    """The Rust `secantusd-pg` as a subprocess, for `--server rust`.
+
+    The binary prints its bound address on the first stdout line, which is how
+    its port is learned -- asking for port 0 and reading it back, rather than
+    picking one and racing another process for it.
+    """
+
+    def __init__(self) -> None:
+        binary = (
+            REPO_ROOT
+            / "crates"
+            / "secantus-pgserver"
+            / "target"
+            / "debug"
+            / ("secantusd-pg.exe" if sys.platform == "win32" else "secantusd-pg")
+        )
+        if not binary.exists():
+            raise SystemExit(f"{binary} is not built -- cd crates/secantus-pgserver && cargo build")
+        self.proc = subprocess.Popen(
+            [str(binary), tempfile.mkdtemp(prefix="pgprobe-rust-"), "127.0.0.1:0"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        line = self.proc.stdout.readline() if self.proc.stdout else ""
+        match = re.search(r"listening on \S+:(\d+)", line)
+        if not match:
+            self.stop()
+            raise SystemExit(f"secantusd-pg did not start: {line!r}")
+        self.address = ("127.0.0.1", int(match.group(1)))
+
+    def stop(self) -> None:
+        self.proc.terminate()
+        self.proc.wait(timeout=10)
+
+
+def main(setup_path: str, corpus_path: str, *, types: bool, tags: bool, server: str) -> int:
+    store = None
+    if server == "rust":
+        # The Rust server names its own database and user.
+        srv = _RustServer()
+        host, port = srv.address
+        sec = psycopg.connect(
+            host=host, port=port, dbname="postgres", user="probe", autocommit=True
+        )
+    else:
+        store_dir = tempfile.mkdtemp(prefix="pgprobe-")
+        store = Storage(store_dir)
+        srv = SecantusPGServer(port=0, storage=store)
+        srv.start()
+        host, port = srv.address
+        sec = psycopg.connect(host=host, port=port, dbname="db", user="probe", autocommit=True)
     ref = psycopg.connect(os.environ.get("SECANTUS_PG_ORACLE_DSN", DEFAULT_DSN), autocommit=True)
     scur, rcur = sec.cursor(), ref.cursor()
 
@@ -213,8 +263,9 @@ def main(setup_path: str, corpus_path: str, *, types: bool, tags: bool) -> int:
     sec.close()
     ref.close()
     srv.stop()
-    store.close()
-    shutil.rmtree(store_dir, ignore_errors=True)
+    if store is not None:
+        store.close()
+        shutil.rmtree(store_dir, ignore_errors=True)
     return 1 if diffs else 0
 
 
@@ -253,4 +304,13 @@ if __name__ == "__main__":
     if len(args) != 2:
         print(__doc__)
         sys.exit(2)
-    sys.exit(main(args[0], args[1], types="--types" in sys.argv, tags="--tag" in sys.argv))
+    server = "rust" if "--server=rust" in sys.argv or "--rust" in sys.argv else "python"
+    sys.exit(
+        main(
+            args[0],
+            args[1],
+            types="--types" in sys.argv,
+            tags="--tag" in sys.argv,
+            server=server,
+        )
+    )

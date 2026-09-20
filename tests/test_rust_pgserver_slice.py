@@ -9701,3 +9701,103 @@ def test_select_distinct_over_an_aggregate(home: Path) -> None:
         with pytest.raises(psycopg.Error) as exc:
             conn.execute("select distinct on (g) g, count(*) from t group by g").fetchall()
         assert exc.value.sqlstate == "0A000"
+
+
+def test_update_and_delete_returning(home: Path) -> None:
+    """`UPDATE ... RETURNING` and `DELETE ... RETURNING` answered NO ROWSET.
+
+    The write happened and the tag was right, so a client that asked which
+    rows it had just changed silently got nothing. UPDATE returns the rows as
+    they are AFTER the update and DELETE as they were before, which is what
+    PostgreSQL 14.24 does.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table d (id int primary key, n int, s text)")
+        conn.execute("insert into d values (1,1,'a'),(2,2,'b'),(3,3,'c')")
+        assert conn.execute("update d set n = n + 100 where id = 1 returning id, n").fetchall() == [
+            (1, 101)
+        ]
+        assert conn.execute("update d set n = n + 1 where id = 2 returning *").fetchall() == [
+            (2, 3, "b")
+        ]
+        assert conn.execute("delete from d where id = 3 returning id, s").fetchall() == [(3, "c")]
+        # The write itself still happened, exactly once.
+        assert conn.execute("select id, n from d order by id").fetchall() == [(1, 101), (2, 3)]
+        # A statement that matches nothing returns no rows, not an error.
+        assert conn.execute("update d set n = 0 where id = 99 returning id").fetchall() == []
+
+
+def test_an_aliased_primary_key_keeps_its_type(home: Path) -> None:
+    """`select id as k` described the column as text.
+
+    A primary key is STORED as `_id`, and the row description looked the
+    column up by its stored field and then by its output name -- neither of
+    which is `id` once an alias renames it -- so it fell through to the
+    varchar default and the client decoded an integer as a string. Only
+    aliased primary keys were affected, which is why it survived this long.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table d (id int primary key, n int, s text)")
+        conn.execute("insert into d values (1, 2, 'a')")
+        for sql in (
+            "select id as k from d",
+            "select id as k, n as m from d",
+            "select id as k, upper(s) from d",
+        ):
+            row = conn.execute(sql).fetchone()
+            assert isinstance(row[0], int), f"{sql} described the key as {type(row[0]).__name__}"
+        assert conn.execute("insert into d values (9,9,'i') returning id as k").fetchall() == [(9,)]
+
+
+def test_bool_and_bool_or(home: Path) -> None:
+    """`bool_and` / `bool_or` were not recognised as aggregates at all, so
+    they reached the per-row scalar evaluator. Values from PostgreSQL 14.24:
+    NULLs are skipped, and an empty input is NULL rather than no row."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table b (id int primary key, ok boolean, g int)")
+        conn.execute("insert into b values (1,true,1),(2,true,1),(3,false,2),(4,null,2)")
+        assert conn.execute("select bool_and(ok), bool_or(ok) from b").fetchall() == [(False, True)]
+        assert conn.execute(
+            "select g, bool_and(ok), bool_or(ok) from b group by g order by g"
+        ).fetchall() == [(1, True, True), (2, False, False)]
+        assert conn.execute("select bool_and(ok) from b where id > 10").fetchall() == [(None,)]
+        assert conn.execute("select bool_and(id > 0) from b").fetchall() == [(True,)]
+
+
+def test_array_agg_over_an_empty_input_is_null(home: Path) -> None:
+    """Every aggregate but `count` is NULL over an empty input; `array_agg`
+    answered an empty ARRAY."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table e (id int primary key, n int)")
+        assert conn.execute("select array_agg(n) from e").fetchall() == [(None,)]
+        assert conn.execute("select count(*), sum(n), min(n) from e").fetchall() == [
+            (0, None, None)
+        ]
+
+
+def test_unsupported_aggregates_refuse_the_same_way_on_an_empty_table(home: Path) -> None:
+    """The silent half of a missing feature.
+
+    `string_agg` and an aggregate wrapped in an expression are not
+    implemented. They used to be planned as a plain SELECT with a computed
+    column, so the refusal came from evaluating a row -- and over an EMPTY
+    table no row was evaluated, so the client got zero rows and no error
+    where PostgreSQL answers one row. Both now refuse while planning, so the
+    answer does not depend on whether the table happens to be empty.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table t (id int primary key, n int, s text)")
+        for sql in (
+            "select string_agg(s, ',') from t",
+            "select sum(n) + 0 from t",
+            "select count(*) + 1 from t",
+            "select coalesce(sum(n), -1) from t",
+        ):
+            with pytest.raises(psycopg.Error) as empty:
+                conn.execute(sql).fetchall()
+            assert empty.value.sqlstate == "0A000", sql
+        conn.execute("insert into t values (1, 1, 'a')")
+        for sql in ("select string_agg(s, ',') from t", "select sum(n) + 0 from t"):
+            with pytest.raises(psycopg.Error) as filled:
+                conn.execute(sql).fetchall()
+            assert filled.value.sqlstate == "0A000", sql

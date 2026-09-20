@@ -10238,6 +10238,66 @@ shared storage engine or building large new protocol subsystems:
   refused -- honestly, with `DISTINCT ON with an aggregate` -- because the
   keys would have to resolve against the GROUP BY output rather than the
   table. Plain `SELECT DISTINCT` over an aggregate IS supported.
+- [ ] **Rust PG server: an aggregate INSIDE an expression is not implemented**
+  (2026-09-20). `select sum(n) + 0`, `count(*) + 1` and `coalesce(sum(n), -1)`
+  refuse with `0A000 an aggregate inside an expression is not supported yet`.
+  The refusal now happens while PLANNING, so it no longer depends on the data
+  -- before, these were planned as a plain SELECT with a computed column, and
+  over an EMPTY table they answered NO ROWS with no error at all. The feature
+  needs an output column that is an expression OVER the aggregate results;
+  `OutputCol` names either a group key or an aggregate, with no room for a
+  computation over them. `string_agg` is missing for the same reason it was
+  invisible (not recognised as an aggregate); it too now refuses at plan time.
+- [ ] **Rust PG server: `min` / `max` of a BOOLEAN are answered, where
+  PostgreSQL refuses** (2026-09-20). `select max(ok) from b` gives `true`;
+  PostgreSQL 14.24 raises `42883 function max(boolean) does not exist`. Being
+  permissive where the oracle refuses -- the opposite direction to the rest of
+  this list, and harmless to a correct client, but it is a divergence.
+- [ ] **Rust PG server: `char(n)` is not blank-padded** (2026-09-20, ~20 of
+  the sweep's wrong-value divergences). A `char(4)` column holding `ab` reads
+  back as `ab`, so `octet_length` is 2 where PostgreSQL says 4, `concat(c,'|')`
+  is `ab|` not `ab  |`, and `c = 'ab  '` is false where PostgreSQL says true
+  (bpchar comparison ignores trailing blanks). `'abc'::char(2)` is not
+  truncated either. A literal cast DOES pad (`'a'::char(3) || '|'` is right),
+  so it is the column write/read path and the comparison rule that are
+  missing, not the cast.
+- [ ] **Rust PG server: 45 wrong-VALUE divergences across the existing
+  `pg_corpora/`** (swept 2026-09-20 with the new
+  `tools/probes/pg_differential.py --server=rust`, against PostgreSQL 14.24;
+  the same sweep found and now excludes the 8 RETURNING cases that were
+  fixed). These are cases where the server ANSWERS, wrongly -- the many
+  `0A000 not supported yet` divergences in the same run are honest and not
+  counted here. Clusters, largest first:
+  - **`char(n)` blank padding (~20 cases, `char_padding.sql`)**: values are
+    not padded to the declared length, so `'a'::char(3)` is `a` rather than
+    `a  `, and everything derived from it (length, concat, equality, casts)
+    follows.
+  - **Aggregates over an EMPTY input (`agg_nulls.sql`, `array_agg_nulls.sql`)**:
+    `array_agg` answers an empty array where PostgreSQL answers NULL, and
+    `string_agg` / `bool_and` / `bool_or` answer NO ROW where an ungrouped
+    aggregate must answer one row of NULL.
+  - **`sum(...)` of a non-integer column is described as an integer**, so the
+    client fails to decode `1.5` (`agg_nulls.sql`; surfaces as a client-side
+    error, not a server error).
+  - Scattered: `array_agg(... ORDER BY ...)`, float4 rendering, `pg_typeof`
+    of a literal, an `int4[]` column read back, `count(*)` after a particular
+    DDL sequence.
+  Reproduce one with:
+  `SECANTUS_PG_ORACLE_DSN=... uv run python tools/probes/pg_differential.py
+  tools/probes/pg_corpora/<name>.setup.sql tools/probes/pg_corpora/<name>.sql
+  --server=rust`. Corpus lines run in sequence, so check a divergence on its
+  own before believing it -- an earlier unsupported statement can change the
+  data the later ones see.
+- [ ] **The Rust PG psycopg gauge does not finish on Windows** (2026-09-20).
+  It hangs in psycopg's own TCP-proxy fixture (`tests/fix_proxy.py`
+  `_wait_listen`), and excluding those tests still times out. Two traps for
+  the next attempt: a killed run leaves a "previous run segfaulted" flag in
+  psycopg's cache that refuses every later run until
+  `vendor/psycopg/.pytest_cache` is removed, and the gauge runner needed the
+  `.exe` suffix to find the binary at all (fixed). Driving psycopg's suite
+  directly works -- 327 tests pass across `test_cursor` / `test_sql` /
+  `test_typing` -- so it is the fixture, not the server. The number CLAUDE.md
+  quotes comes from a Linux run.
 - [ ] **Rust PG server: two set-operation type rules still differ from
   PostgreSQL** (2026-09-20, after DISTINCT and the set operations landed;
   every other differential case matches 14.24). Both concern the reported
