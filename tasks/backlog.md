@@ -3370,6 +3370,12 @@ all match, and so do CREATE INDEX / VIEW and their error surface. What is open:
       server does not implement. Recorded so the next session does not size
       the "function metadata cluster" as tractable without knowing this — two
       of its tests are blocked on a number, not a bug.
+- [ ] **`getColumnPrivileges` on a SYSTEM catalog returns nothing.** pgjdbc's
+      `columnPrivileges` asks for `getColumnPrivileges(null, null,
+      'pg_statistic', null)` and expects at least one row — privileges on a
+      `pg_catalog` relation, which this server does not expose as a grantable
+      relation at all. Distinct from the DROP-clears-privileges fix
+      (2026-09-20), which fixed `tablePrivileges` and left this one failing.
 - [ ] **`pg_type.typcollation` is 0 for every type**, including the collatable
       string types. PostgreSQL 14 reports **100** for `text` / `varchar` /
       `bpchar` (measured 2026-09-19). Left alone deliberately when the

@@ -593,6 +593,21 @@ class Catalog:
         self._storage.insert(db, CATALOG_COLLECTION, [_to_doc(table)])
 
     def drop(self, db: str, table: str) -> bool:
+        """Drop a table AND every per-table record that depends on it.
+
+        Dropping only the table definition left its privilege state behind, so
+        a table dropped and recreated under the same name INHERITED the old
+        one's grants — including grants to other roles. Someone revoking
+        access by dropping the table got a new table that still granted it.
+
+        Measured against PostgreSQL 14 on 2026-09-20: after DROP + CREATE the
+        new table has `relacl` NULL and no grants, column grants or policies.
+        Comments and the RLS-enabled flag were already cleared correctly; the
+        four cleared here were not.
+        """
+        for collection in (GRANT_COLLECTION, COLUMN_GRANT_COLLECTION, POLICY_COLLECTION):
+            self._storage.delete_matching(db, collection, {"table": table})
+        self._storage.delete_matching(db, RELATION_ACL_COLLECTION, {"_id": table})
         return self._storage.delete_matching(db, CATALOG_COLLECTION, {"_id": table}) > 0
 
     def list_tables(self, db: str) -> list[str]:

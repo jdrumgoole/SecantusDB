@@ -250,3 +250,54 @@ class TestRelaclReflection:
         (rolname, acl) = self._priv_join(storage, s, "owned")[0]
         assert rolname == "alice"
         assert acl == "{alice=arwdDxt/alice,bob=r/alice}"
+
+
+def test_dropping_a_table_clears_its_privileges(storage):
+    """A recreated table must NOT inherit the dropped table's grants.
+
+    This is a privilege-escalation shape, not a metadata nit. Dropping a table
+    is how someone revokes all access to it; before this, the table's grants,
+    column grants, ACL state and RLS policies all survived the DROP and were
+    silently reattached to the next table created under the same name. A grant
+    to another role came back with it.
+
+    Measured against PostgreSQL 14 on 2026-09-20: after DROP + CREATE the new
+    table has `relacl` NULL and no grants, column grants or policies.
+
+    Found from pgjdbc's `DatabaseMetaDataTest::tablePrivileges`, which passed
+    or failed depending on whether the REVOKE-ing test in the same class had
+    run first — the fixture drops and recreates the table between every test,
+    so on a real server the revoke could not carry over.
+    """
+    admin = _admin()
+    run_sql(storage, DB, "CREATE ROLE other LOGIN", session=admin)
+    run_sql(storage, DB, "CREATE TABLE dt (id int, secret text)", session=admin)
+    run_sql(storage, DB, "GRANT SELECT ON dt TO other", session=admin)
+    run_sql(storage, DB, "GRANT SELECT (secret) ON dt TO other", session=admin)
+    run_sql(storage, DB, "ALTER TABLE dt ENABLE ROW LEVEL SECURITY", session=admin)
+    run_sql(storage, DB, "CREATE POLICY p1 ON dt USING (true)", session=admin)
+
+    run_sql(storage, DB, "DROP TABLE dt", session=admin)
+    run_sql(storage, DB, "CREATE TABLE dt (id int, secret text)", session=admin)
+
+    def rows(sql: str):
+        return run_sql(storage, DB, sql, session=admin)[-1].rows
+
+    assert rows("SELECT relacl FROM pg_class WHERE relname = 'dt'") == [(None,)], (
+        "a fresh table has no ACL; the dropped table's must not be reattached"
+    )
+    assert (
+        rows(
+            "SELECT grantee FROM information_schema.table_privileges "
+            "WHERE table_name = 'dt' AND grantee = 'other'"
+        )
+        == []
+    )
+    assert (
+        rows(
+            "SELECT grantee FROM information_schema.column_privileges "
+            "WHERE table_name = 'dt' AND grantee = 'other'"
+        )
+        == []
+    )
+    assert rows("SELECT policyname FROM pg_policies WHERE tablename = 'dt'") == []
