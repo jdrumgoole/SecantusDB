@@ -9525,3 +9525,134 @@ def test_group_by_a_numeric_groups_on_the_value(home: Path) -> None:
         ("2", 2, "4.000"),
         (wide, 3, str(int(wide) * 3) + ".00"),
     ]
+
+
+def _rows(conn, sql: str) -> list[tuple]:
+    return [
+        tuple(str(v) if v is not None else None for v in r) for r in conn.execute(sql).fetchall()
+    ]
+
+
+def test_select_distinct_dedups(home: Path) -> None:
+    """`SELECT DISTINCT` was IGNORED -- the duplicates came straight through.
+
+    Values measured against PostgreSQL 14.24 (2026-09-20). `1.5` and `1.50`
+    are ONE value to Postgres, and NULLs are one group.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table t (id int, s text, v numeric, n int)")
+        conn.execute(
+            "insert into t values (1,'a',1.5,10),(2,'a',1.50,10),"
+            "(3,'b',2,null),(4,'b',2.000,null),(5,null,3,7),(6,null,3,7)"
+        )
+        assert _rows(conn, "select distinct s from t order by s") == [("a",), ("b",), (None,)]
+        assert _rows(conn, "select distinct v from t order by v") == [("1.5",), ("2",), ("3",)]
+        assert _rows(conn, "select distinct s, n from t order by s, n") == [
+            ("a", "10"),
+            ("b", None),
+            (None, "7"),
+        ]
+        assert _rows(conn, "select distinct s from t order by s limit 2") == [("a",), ("b",)]
+
+
+def test_select_distinct_on(home: Path) -> None:
+    """`DISTINCT ON (k)` keeps the first row per key IN SORT ORDER, so the
+    `id desc` below picks the larger id of each pair."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table t (id int, s text, n int)")
+        conn.execute("insert into t values (1,'a',1),(2,'a',2),(3,'b',1),(4,null,5),(5,null,6)")
+        assert _rows(conn, "select distinct on (s) s, id from t order by s, id desc") == [
+            ("a", "2"),
+            ("b", "3"),
+            (None, "5"),
+        ]
+        assert _rows(conn, "select distinct on (s, n) s, n, id from t order by s, n, id") == [
+            ("a", "1", "1"),
+            ("a", "2", "2"),
+            ("b", "1", "3"),
+            (None, "5", "4"),
+            (None, "6", "5"),
+        ]
+
+
+def test_union_intersect_except(home: Path) -> None:
+    """Set operations answered a single EMPTY row before 2026-09-20 -- the
+    outer statement has no FROM, so it fell through to the constant planner.
+
+    `ALL` keeps multiplicities: INTERSECT ALL pairs each right row with one
+    left row, EXCEPT ALL subtracts them. All measured against 14.24.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table t (id int, s text, v numeric)")
+        conn.execute("insert into t values (1,'a',1.5),(2,'a',1.50),(3,'b',2),(4,null,3)")
+        conn.execute("create table u (id int, s text, v numeric)")
+        conn.execute("insert into u values (1,'a',1.5),(2,'c',9)")
+        assert _rows(conn, "select s from t union select s from u order by 1") == [
+            ("a",),
+            ("b",),
+            ("c",),
+            (None,),
+        ]
+        assert _rows(conn, "select s from t union all select s from u order by 1") == [
+            ("a",),
+            ("a",),
+            ("a",),
+            ("b",),
+            ("c",),
+            (None,),
+        ]
+        assert _rows(conn, "select s from t intersect select s from u order by 1") == [("a",)]
+        assert _rows(conn, "select s from t intersect all select s from u order by 1") == [("a",)]
+        assert _rows(conn, "select s from t except select s from u order by 1") == [
+            ("b",),
+            (None,),
+        ]
+        assert _rows(conn, "select s from t except all select s from u order by 1") == [
+            ("a",),
+            ("b",),
+            (None,),
+        ]
+        # `1.5` and `1.50` are one value, so the union of the two tables'
+        # numerics is three rows, not four.
+        assert _rows(conn, "select v from t union select v from u order by 1") == [
+            ("1.5",),
+            ("2",),
+            ("3",),
+            ("9",),
+        ]
+        assert _rows(conn, "select s from t union select s from u order by 1 desc limit 2") == [
+            (None,),
+            ("c",),
+        ]
+
+
+def test_set_operation_type_rules(home: Path) -> None:
+    """PostgreSQL unifies the two sides within a type category and refuses
+    across one; an untyped NULL takes the other side's type (14.24)."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.execute("select 1::int4 union select 1::int8")
+        cur.fetchall()
+        assert cur.description[0].type_code == 20  # int8
+        cur = conn.execute("select 1::int4 union select null")
+        cur.fetchall()
+        assert cur.description[0].type_code == 23  # int4, not text
+        for sql, state in [
+            ("select 'x'::text union select 1::int4", "42804"),
+            ("select 1::int4 union select true", "42804"),
+            ("select id, s from t2 union select id from t2", "42601"),
+        ]:
+            conn.execute("create table if not exists t2 (id int, s text)")
+            with pytest.raises(psycopg.Error) as exc:
+                conn.execute(sql).fetchall()
+            assert exc.value.sqlstate == state
+        assert "UNION types text and integer cannot be matched" in str(
+            _error_of(conn, "select 'x'::text union select 1::int4")
+        )
+
+
+def _error_of(conn, sql: str) -> str:
+    try:
+        conn.execute(sql).fetchall()
+    except psycopg.Error as exc:  # noqa: BLE001 - the message is the assertion
+        return str(exc)
+    raise AssertionError(f"{sql} did not fail")
