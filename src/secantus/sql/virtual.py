@@ -1724,15 +1724,22 @@ def _pg_proc(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
         }
         for name, oid, rettype, argtypes in _LO_PROCS
     ]
+    proc_schema_oids = _schema_oids(db, catalog)
     for fn in _functions(db, catalog):
         key = f"{fn['name']}/{fn['nargs']}"
         argtypes = " ".join(str(o) for o in _function_argtype_oids(fn))
         names = [n for n in (fn.get("params") or []) if n is not None]
+        # A routine created in a user schema is stored dotted
+        # ("hasfunctions.addfunction"), the same convention user types use.
+        # Reporting the dotted string as `proname` under a hardcoded `public`
+        # namespace made it invisible to every client that filters by schema —
+        # pgjdbc's getFunctions / getProcedures both do.
+        bare_name, ns_oid = _split_user_type_name(fn["name"], proc_schema_oids)
         rows.append(
             {
                 "oid": oids[key],
-                "proname": fn["name"],
-                "pronamespace": _NS_OIDS["public"],
+                "proname": bare_name,
+                "pronamespace": ns_oid,
                 "proowner": 10,
                 "prolang": _SQL_LANG_OID,
                 "prorettype": _return_type_oid(fn),
@@ -1743,7 +1750,10 @@ def _pg_proc(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
                 "proargmodes": None,
                 "proallargtypes": None,
                 "prosrc": fn.get("body"),
-                "prokind": "f",
+                # 'p' for a PROCEDURE. This was hardcoded 'f', so every
+                # procedure was reported as a function and `getProcedures()`
+                # — which filters on prokind = 'p' — returned nothing at all.
+                "prokind": "p" if fn.get("is_procedure") else "f",
                 "proretset": bool(fn.get("is_table")),
                 "provariadic": 0,
             }

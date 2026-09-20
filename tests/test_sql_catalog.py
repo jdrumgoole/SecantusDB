@@ -764,6 +764,56 @@ def test_pg_type_typlen_for_user_types(storage, session):
     assert res.rows == [("tc", -1), ("te", 4)]
 
 
+def test_schema_qualified_function_reports_its_namespace(storage, session):
+    """`CREATE FUNCTION hf.addf(...)` belongs to `hf`, not `public`.
+
+    Only a `pg_temp_` qualifier was preserved at creation, so any other schema
+    was silently dropped and the function reported `pronamespace = public`. It
+    existed and was invisible in the schema it was created in — pgjdbc's
+    `getFunctions` and `getProcedures` both filter by schema, which is what
+    took out `getFunctionsInSchemaForFunctions`.
+
+    `proname` is asserted bare: the dotted key is storage, not the name a
+    client reads.
+    """
+    q(storage, session, "CREATE SCHEMA hf")
+    q(storage, session, "CREATE FUNCTION hf.addf(int, int) RETURNS int AS 'SELECT 1' LANGUAGE sql")
+    q(storage, session, "CREATE FUNCTION plainf(int) RETURNS int AS 'SELECT 1' LANGUAGE sql")
+    res = q(
+        storage,
+        session,
+        "SELECT p.proname, n.nspname FROM pg_proc p "
+        "JOIN pg_namespace n ON p.pronamespace = n.oid "
+        "WHERE p.proname IN ('addf', 'plainf') ORDER BY p.proname",
+    )
+    assert res.rows == [("addf", "hf"), ("plainf", "public")]
+
+
+def test_schema_qualified_function_call_resolution(storage, session):
+    """A schema-homed function is callable QUALIFIED and not bare.
+
+    Both halves matter. Storing the dotted key without teaching the call path
+    about it made `hf.addf(2, 3)` raise "function addf does not exist" — the
+    namespace would have been right and the function unusable.
+
+    The bare call failing is not a regression but a fidelity fix: PostgreSQL 14
+    raises `function addf(integer, integer) does not exist` for it too
+    (measured 2026-09-19), because `hf` is not on the search_path. This server
+    used to answer it.
+    """
+    q(storage, session, "CREATE SCHEMA hf")
+    q(
+        storage,
+        session,
+        "CREATE FUNCTION hf.addf(int, int) RETURNS int AS 'SELECT $1 + $2' LANGUAGE sql",
+    )
+    assert q(storage, session, "SELECT hf.addf(2, 3)").rows == [(5,)]
+
+    with pytest.raises(errors.SQLError) as exc:
+        q(storage, session, "SELECT addf(2, 3)")
+    assert "does not exist" in str(exc.value)
+
+
 def test_pg_class_reltuples(storage, session):
     # pgjdbc's getIndexInfo reads ci.reltuples as CARDINALITY; -1 is PG's
     # "no estimate yet" initial value.

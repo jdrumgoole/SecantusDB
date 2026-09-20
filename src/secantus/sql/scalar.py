@@ -463,8 +463,11 @@ def evaluate(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
         except (TypeError, ValueError, AttributeError, KeyError, IndexError) as exc:
             raise _no_such_function(node, scope, ctx) from exc
     # Schema-qualified function: pg_catalog.format_type(...) -> the call.
+    # The qualifier is carried through: a user function homed in a schema is
+    # stored under a dotted key, and dropping the schema here made
+    # ``hf.addf(1, 2)`` resolve as bare ``addf`` and raise "does not exist".
     if isinstance(node, exp.Dot) and isinstance(node.expression, exp.Anonymous):
-        return _eval_func(node.expression, scope, ctx)
+        return _eval_func(node.expression, scope, ctx, schema=node.this.name)
     # Composite field access: ``(col).field`` -> Dot(Paren(col), Identifier). The
     # inner expression resolves to a subdocument; return the named field (NULL for
     # a missing field or a NULL composite).
@@ -4274,19 +4277,23 @@ def _func_name(node: exp.Anonymous) -> str:
     return str(name).rsplit(".", 1)[-1].lower()
 
 
-def _eval_func(node: exp.Anonymous, scope: Scope, ctx: ScalarContext) -> Any:
+def _eval_func(
+    node: exp.Anonymous, scope: Scope, ctx: ScalarContext, schema: str | None = None
+) -> Any:
     """A named function call, with the same no-internal-errors guard the typed
     node handlers get — `age(1)` reached the wire as `XX000` because this path
     is separate from `_SCALAR_FUNC_NODES`."""
     try:
-        return _eval_func_impl(node, scope, ctx)
+        return _eval_func_impl(node, scope, ctx, schema)
     except errors.SQLError:
         raise
     except (TypeError, ValueError, AttributeError, KeyError, IndexError) as exc:
         raise _no_such_function(node, scope, ctx) from exc
 
 
-def _eval_func_impl(node: exp.Anonymous, scope: Scope, ctx: ScalarContext) -> Any:
+def _eval_func_impl(
+    node: exp.Anonymous, scope: Scope, ctx: ScalarContext, schema: str | None = None
+) -> Any:
     name = _func_name(node)
     if name == "xmlforest":
         # ``xmlforest(value AS name, …)`` needs the per-arg aliases, which are lost
@@ -4312,7 +4319,7 @@ def _eval_func_impl(node: exp.Anonymous, scope: Scope, ctx: ScalarContext) -> An
         rec = typemap.RecordValue((f"f{i + 1}", v) for i, v in enumerate(padded))
         rec.field_oids = tuple(_row_field_oid(a) for a in node.expressions)
         return rec
-    result = _call_func(name, args, ctx)
+    result = _call_func(name, args, ctx, qualified=f"{schema.lower()}.{name}" if schema else None)
     if result is _ENUM_FUNC_NEEDS_NODE:
         return _eval_enum_func(name, node, ctx)
     return result
@@ -4760,7 +4767,12 @@ PLAIN_SCALAR_TAGS = {
 }
 
 
-def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> Any:
+def _call_func(
+    name: str,
+    args: list[Any],
+    ctx: ScalarContext | None = None,
+    qualified: str | None = None,
+) -> Any:
     plain = _plain_scalar(name, args)
     if plain is not _UNSUPPORTED:
         return plain
@@ -5382,7 +5394,14 @@ def _call_func(name: str, args: list[Any], ctx: ScalarContext | None = None) -> 
         # is that same first-match rule as a scalar function in Postgres.
         return matches[0] if matches else None
     if ctx is not None and getattr(ctx, "catalog", None) is not None:
-        udf = ctx.catalog.get_function(ctx.db, name, len(args))
+        # A schema-qualified call resolves against the DOTTED key first — a
+        # function homed in a user schema is stored that way — then against the
+        # bare name, which is what an unqualified call and every builtin use.
+        udf = None
+        if qualified is not None:
+            udf = ctx.catalog.get_function(ctx.db, qualified, len(args))
+        if udf is None:
+            udf = ctx.catalog.get_function(ctx.db, name, len(args))
         if udf is not None:
             return _invoke_udf(udf, args, ctx)
     if name == "format" and args:

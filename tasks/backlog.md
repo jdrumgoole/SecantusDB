@@ -3239,6 +3239,21 @@ all match, and so do CREATE INDEX / VIEW and their error surface. What is open:
       Postgres raises `42704 role "nosuchuser" does not exist`.
 - [ ] **`CREATE OR REPLACE VIEW` may drop columns.** Postgres refuses with
       `42P16 cannot drop columns from view`; we replace the definition happily.
+- [ ] **`getProcedureColumns` returns nothing for a schema's procedure.**
+      pgjdbc's `getProceduresWithCorrectCatalogAndWithout` asserts
+      `getProcedureColumns(null, 'hasprocedures', null, null)` yields 1 row for
+      a zero-argument procedure. Separate surface from `getProcedures`, which
+      was fixed by the schema-namespace slice (measured 2026-09-19: that slice
+      fixed `getProceduresInSchemaForProcedures` and left this one failing).
+- [ ] **`pg_proc` carries no built-in functions** — 13 rows against
+      PostgreSQL 14's 3,324 (measured 2026-09-19). pgjdbc's
+      `getFunctionsWithNullPatterns` / `getFunctionsWithBlankPatterns` assert
+      `> 1000` functions, so both are unreachable without cataloguing
+      PostgreSQL's builtin set. **Probably should NOT be done**: it is a large
+      data table rather than a fix, and it would advertise functions this
+      server does not implement. Recorded so the next session does not size
+      the "function metadata cluster" as tractable without knowing this — two
+      of its tests are blocked on a number, not a bug.
 - [ ] **`pg_type.typcollation` is 0 for every type**, including the collatable
       string types. PostgreSQL 14 reports **100** for `text` / `varchar` /
       `bpchar` (measured 2026-09-19). Left alone deliberately when the

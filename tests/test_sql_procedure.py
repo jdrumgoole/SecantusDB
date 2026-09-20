@@ -172,3 +172,32 @@ def test_procedure_records_the_declared_char_type(storage, session):
     r = q(storage, session, "CALL pvc(1, 'a')")
     assert [c.name for c in r.columns] == ["b"]
     assert [c.pg_oid for c in r.columns] == [1043], "INOUT varchar describes as 1043"
+
+
+def test_procedure_reports_prokind_p_and_its_schema(storage, session):
+    """A procedure is `prokind = 'p'`, in the schema it was created in.
+
+    `prokind` was hardcoded `'f'`, so every procedure was reported as a
+    function and `getProcedures()` — which filters on `prokind = 'p'` — found
+    nothing at all, whatever schema it looked in. The namespace was the second
+    half: a schema qualifier was dropped at creation, so the row landed in
+    `public`.
+
+    A function is asserted beside it so the discriminator is pinned, not just
+    the procedure's own value.
+    """
+    q(storage, session, "CREATE SCHEMA hp")
+    q(
+        storage,
+        session,
+        "CREATE PROCEDURE hp.addproc() LANGUAGE plpgsql AS $$ BEGIN NULL; END; $$",
+    )
+    q(storage, session, "CREATE FUNCTION plainfn() RETURNS int AS 'SELECT 1' LANGUAGE sql")
+    res = q(
+        storage,
+        session,
+        "SELECT p.proname, p.prokind, n.nspname FROM pg_proc p "
+        "JOIN pg_namespace n ON p.pronamespace = n.oid "
+        "WHERE p.proname IN ('addproc', 'plainfn') ORDER BY p.proname",
+    )
+    assert res.rows == [("addproc", "p", "hp"), ("plainfn", "f", "public")]

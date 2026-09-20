@@ -5036,11 +5036,18 @@ def _create_function(
     LANGUAGE sql`` — store the parsed body for the scalar evaluator to invoke."""
     udf = stmt.this
     name = udf.this.name
-    # A pg_temp-homed function keys under the session's temp namespace (the
-    # qualify pass already rewrote the ``pg_temp`` qualifier on the Table
-    # node) — CREATE TRIGGER resolves ``pg_temp.fn()`` against the same key.
+    # A schema-homed function keys under that schema (the qualify pass already
+    # rewrote a ``pg_temp`` qualifier to the session's ``pg_temp_N``) — CREATE
+    # TRIGGER resolves ``pg_temp.fn()`` against the same key.
+    #
+    # Only ``pg_temp_`` used to qualify here, so ``CREATE FUNCTION
+    # hasfunctions.addfunction(...)`` silently dropped its schema and reported
+    # ``pronamespace = public``. pgjdbc's getFunctions / getProcedures filter by
+    # schema, so the function existed and was invisible in the one it was
+    # created in. ``public`` stays unqualified: it is the default search_path
+    # schema, so its functions must keep resolving from a bare name.
     fn_schema = udf.this.args.get("db")
-    if fn_schema is not None and fn_schema.name.startswith("pg_temp_"):
+    if fn_schema is not None and fn_schema.name not in ("", "public"):
         name = f"{fn_schema.name}.{name}"
     params = _function_params(udf)
     nargs = _function_input_nargs(udf)
