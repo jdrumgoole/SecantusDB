@@ -3220,6 +3220,21 @@ all match, and so do CREATE INDEX / VIEW and their error surface. What is open:
 - [ ] **`ANY(...)` over a CATALOG array column** (`i.indkey`) is `0A000
       unsupported array operand`. The pgjdbc / SQLAlchemy primary-key
       introspection join uses exactly this shape.
+- [ ] **`getIndexInfo`'s ASC/DESC expression needs TWO things, measured
+      2026-09-19 after `relpages` landed and unblocked the query.** pgjdbc
+      sends `tmp.i_indoption[tmp.ordinal_position - 1] & CAST(1 AS SMALLINT)`
+      over a subquery alias. Both halves fail, and neither is what the error
+      text names:
+      1. `0A000 unsupported scalar expression` for `alias[expr] & CAST(..)`
+         — **only through a subquery alias**. The identical expression over a
+         real table (`SELECT a[p - 1] & CAST(1 AS SMALLINT) FROM s`) works, as
+         do subscript-with-computed-index and the bit-and on their own. So it
+         is the combination in an alias context, not any one operator.
+      2. `pg_index.indoption` is served as the STRING `'0'`, not a
+         `smallint[]`, so `indoption[0]` is NULL. Even with the expression
+         parsing, the ASC/DESC answer would be wrong — fixing only the planner
+         half would turn a loud error into a silently wrong result.
+      Blocks `ascDescIndexInfo`, `partialIndexInfo`, `remarkIndexInfo`.
 - [ ] **`has_table_privilege('nosuchuser', 't', 'SELECT')` answers false**;
       Postgres raises `42704 role "nosuchuser" does not exist`.
 - [ ] **`CREATE OR REPLACE VIEW` may drop columns.** Postgres refuses with

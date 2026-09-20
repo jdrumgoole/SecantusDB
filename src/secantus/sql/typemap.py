@@ -1704,14 +1704,94 @@ VARCHAR_OID = 1043
 #: a dangling reference that a client joining ``pg_attribute`` to ``pg_type``
 #: resolves to nothing.
 #:
-#: Values measured against PostgreSQL 14 on 2026-09-19. Array rows are
-#: deliberately absent — this catalog emits no ``_<type>`` rows for ANY type
-#: while still populating ``typarray``, and these two follow that convention
-#: rather than becoming the only array types in the table.
+#: Values measured against PostgreSQL 14 on 2026-09-19. ``typarray`` matters:
+#: ``virtual._pg_type`` synthesises an ``_<typname>`` array row for every row
+#: that carries one, so these two get ``_varchar`` (1015) and ``_bpchar``
+#: (1014) for free.
+#:
+#: (An earlier version of this comment claimed the catalog emits no ``_<type>``
+#: rows at all. That was inferred from ``PG_TYPENAME`` holding no ``_`` names
+#: and is false — the array rows are synthesised from ``typarray``, not listed
+#: here. Checked 2026-09-19: ``_text`` (1009) has always been served.)
 DECLARED_ONLY_TYPES: tuple[tuple[int, str, int], ...] = (
     (VARCHAR_OID, "varchar", 1015),
     (BPCHAR_OID, "bpchar", 1014),
 )
+
+
+#: ``pg_type.typlen`` by TYPNAME: the fixed byte width of a type, or -1 for a
+#: varlena. Keyed by name rather than storage tag because the types that need
+#: it most have no tag — ``varchar`` / ``bpchar`` fold to ``text``, and ``name``
+#: is never stored at all.
+#:
+#: pgjdbc reads this in two places, so an absent column is not cosmetic:
+#: ``getMaxNameLength()`` selects ``typlen`` for ``name`` and raises "Unable to
+#: find name datatype in the system catalogs" without it, and TypeInfoCache's
+#: array lookup filters on ``typlen = -1``.
+#:
+#: Measured against PostgreSQL 14 on 2026-09-19.
+PG_TYPLEN: dict[str, int] = {
+    "bit": -1,
+    "bool": 1,
+    "box": 32,
+    "bpchar": -1,
+    "bytea": -1,
+    "cidr": -1,
+    "circle": 24,
+    "date": 4,
+    "datemultirange": -1,
+    "daterange": -1,
+    "float4": 4,
+    "float8": 8,
+    "inet": -1,
+    "int2": 2,
+    "int4": 4,
+    "int4multirange": -1,
+    "int4range": -1,
+    "int8": 8,
+    "int8multirange": -1,
+    "int8range": -1,
+    "interval": 16,
+    "jsonb": -1,
+    "line": 24,
+    "lseg": 32,
+    "macaddr": 6,
+    "money": 8,
+    "name": 64,
+    "numeric": -1,
+    "nummultirange": -1,
+    "numrange": -1,
+    "oid": 4,
+    "path": -1,
+    "point": 16,
+    "polygon": -1,
+    "record": -1,
+    "text": -1,
+    "time": 8,
+    "timestamp": 8,
+    "timestamptz": 8,
+    "timetz": 12,
+    "tsmultirange": -1,
+    "tsquery": -1,
+    "tsrange": -1,
+    "tstzmultirange": -1,
+    "tstzrange": -1,
+    "tsvector": -1,
+    "uuid": 16,
+    "varbit": -1,
+    "varchar": -1,
+    "xml": -1,
+}
+
+
+#: pg_type rows for types this server never STORES but a client's catalog query
+#: still has to resolve, as ``(oid, typname, array_oid)``. Distinct from
+#: :data:`DECLARED_ONLY_TYPES`, which are types a user really can declare;
+#: nothing here is a column type.
+#:
+#: ``name`` (19) is here because pgjdbc's ``getMaxNameLength()`` looks it up by
+#: name in ``pg_catalog`` and treats a missing row as a fatal error.
+CATALOG_ONLY_TYPES: tuple[tuple[int, str, int], ...] = ((19, "name", 1003),)
 
 
 def enforce_declared_length(value: Any, pg_oid: int | None, typmod: int, column: str = "") -> Any:

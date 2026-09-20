@@ -685,6 +685,85 @@ def test_parameters_data_type_renders_the_declared_char_type(storage, session):
     ]
 
 
+def test_pg_class_relpages(storage, session):
+    """`pg_class.relpages` exists, and an INDEX reports 1 page rather than 0.
+
+    pgjdbc's `getIndexInfo` selects `ci.relpages AS PAGES`, so the column being
+    absent failed the whole query with `column "relpages" does not exist` —
+    taking out `ascDescIndexInfo`, `partialIndexInfo` and `remarkIndexInfo`
+    before any assertion ran.
+
+    A fresh table reports 0 and a fresh index reports 1 on PostgreSQL 14
+    (measured 2026-09-19): an index has its metapage from the moment it
+    exists. The index case is asserted because 0 would be the obvious guess
+    and it is wrong.
+    """
+    q(storage, session, "CREATE TABLE rp (a int PRIMARY KEY, b text)")
+    q(storage, session, "CREATE INDEX rp_b ON rp(b)")
+    res = q(
+        storage,
+        session,
+        "SELECT relname, relpages FROM pg_class WHERE relname IN ('rp', 'rp_b') ORDER BY relname",
+    )
+    assert res.rows == [("rp", 0), ("rp_b", 1)]
+
+
+def test_pg_type_typlen(storage, session):
+    """`pg_type.typlen`, including the `name` row pgjdbc needs to connect well.
+
+    `getMaxNameLength()` selects `typlen` for `typname = 'name'` in
+    `pg_catalog` and raises "Unable to find name datatype in the system
+    catalogs" when the row is missing — which is what broke
+    `getClientInfoProperties`. `name` is not a type this server stores; the row
+    exists only so that lookup resolves.
+
+    The array row is asserted too: TypeInfoCache's array lookup filters on
+    `typlen = -1`, so a wrong value there silently hides every array type.
+    All values measured against PostgreSQL 14 on 2026-09-19.
+    """
+    res = q(
+        storage,
+        session,
+        "SELECT t.typlen FROM pg_catalog.pg_type t, pg_catalog.pg_namespace n "
+        "WHERE t.typnamespace = n.oid AND t.typname = 'name' "
+        "AND n.nspname = 'pg_catalog'",
+    )
+    assert res.rows == [(64,)], "name is 64 bytes; pgjdbc reads it as NAMEDATALEN"
+
+    res = q(
+        storage,
+        session,
+        "SELECT typname, typlen FROM pg_type "
+        "WHERE typname IN ('int4', 'bool', 'uuid', 'text', 'varchar', '_text') "
+        "ORDER BY typname",
+    )
+    assert res.rows == [
+        ("_text", -1),
+        ("bool", 1),
+        ("int4", 4),
+        ("text", -1),
+        ("uuid", 16),
+        ("varchar", -1),
+    ]
+
+
+def test_pg_type_typlen_for_user_types(storage, session):
+    """An enum is 4 bytes; every other user type is varlena.
+
+    Measured on PostgreSQL 14 (2026-09-19). The enum is the one case where the
+    -1 default would be wrong — it is a fixed 4-byte oid reference, not a
+    varlena — so it is set explicitly and pinned here.
+    """
+    q(storage, session, "CREATE TYPE te AS ENUM ('a', 'b')")
+    q(storage, session, "CREATE TYPE tc AS (x int, y text)")
+    res = q(
+        storage,
+        session,
+        "SELECT typname, typlen FROM pg_type WHERE typname IN ('te', 'tc') ORDER BY typname",
+    )
+    assert res.rows == [("tc", -1), ("te", 4)]
+
+
 def test_pg_class_reltuples(storage, session):
     # pgjdbc's getIndexInfo reads ci.reltuples as CARDINALITY; -1 is PG's
     # "no estimate yet" initial value.

@@ -1100,6 +1100,10 @@ def _pg_class(db: str, session: Session, storage: Any, catalog: Catalog) -> list
             "reloptions": None,
             # -1 = "no estimate yet" (PG's initial value; we never analyze).
             "reltuples": -1.0,
+            # 0 pages, PG's initial value for a never-analyzed table. pgjdbc's
+            # getIndexInfo selects this as PAGES; without the column the whole
+            # query errored (`column "relpages" does not exist`).
+            "relpages": 0,
         }
         for t in tables
     ]
@@ -1116,6 +1120,9 @@ def _pg_class(db: str, session: Session, storage: Any, catalog: Catalog) -> list
                 "relam": _BTREE_AM_OID,
                 "reloptions": None,
                 "reltuples": -1.0,
+                # A fresh INDEX reports 1 page on PostgreSQL 14, not 0 -- the
+                # metapage exists the moment the index does (measured).
+                "relpages": 1,
             }
         )
     # Views are pg_class rows too (relkind 'v') — SQLAlchemy's get_view_names
@@ -1169,6 +1176,10 @@ def _pg_class(db: str, session: Session, storage: Any, catalog: Catalog) -> list
         )
     for row in rows:
         row.setdefault("reltype", 0)
+        # Views and sequences have no heap of their own; PG reports 0 pages
+        # for them, which is also the right default for any relation kind
+        # this catalog does not track pages for.
+        row.setdefault("relpages", 0)
     return rows
 
 
@@ -2142,6 +2153,7 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
             # one (drivers treat 0 as "no array type"). psycopg's
             # TypeInfo.fetch reads it as array_oid.
             "typarray": typemap._ARRAY_PG_OID.get(tag, 0),
+            "typlen": typemap.PG_TYPLEN.get(typname, -1),
             "typdelim": ",",
         }
         for tag, typname in typemap.PG_TYPENAME.items()
@@ -2161,9 +2173,31 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
             "typdefault": None,
             "typtype": "b",
             "typarray": array_oid,
+            "typlen": typemap.PG_TYPLEN.get(typname, -1),
             "typdelim": ",",
         }
         for oid, typname, array_oid in typemap.DECLARED_ONLY_TYPES
+    )
+    # Types this server never STORES but a client still resolves by name.
+    # pgjdbc's getMaxNameLength() selects typlen for `name` and treats a
+    # missing row as fatal ("Unable to find name datatype in the system
+    # catalogs"), which took out getClientInfoProperties.
+    rows.extend(
+        {
+            "oid": oid,
+            "typname": typname,
+            "typcollation": 0,
+            "typnamespace": _NS_OIDS["pg_catalog"],
+            "typbasetype": 0,
+            "typtypmod": -1,
+            "typnotnull": False,
+            "typdefault": None,
+            "typtype": "b",
+            "typarray": array_oid,
+            "typlen": typemap.PG_TYPLEN.get(typname, -1),
+            "typdelim": ",",
+        }
+        for oid, typname, array_oid in typemap.CATALOG_ONLY_TYPES
     )
     # Every table has a composite row type (typtype 'c') like real Postgres —
     # psycopg's ``TypeInfo.fetch(conn, "<table>")`` resolves it (and its
@@ -2189,6 +2223,8 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
                 "typtype": "c",
                 "typrelid": table_oids.get(tname, 0),
                 "typarray": rowtype_oid + _ROWTYPE_ARRAY_OID_OFFSET,
+                # A composite is varlena on PostgreSQL 14 (measured).
+                "typlen": -1,
                 "typdelim": ",",
             }
         )
@@ -2213,6 +2249,10 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
                 # paths touch oid 0 = INVALID_OID (its own suite pops the
                 # global unknown-oid fallback loader through array_oid).
                 "typarray": oid + USER_TYPE_ARRAY_OID_OFFSET,
+                # An enum is a fixed 4-byte oid reference, NOT varlena --
+                # measured on PostgreSQL 14, and the one user type where the
+                # default -1 would be wrong.
+                "typlen": 4,
             }
         )
     # User-declared range types (typtype 'r') and their auto-created companion
@@ -2237,6 +2277,8 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
                     "typdefault": None,
                     "typtype": typtype,
                     "typarray": toid + USER_TYPE_ARRAY_OID_OFFSET,
+                    # Ranges and multiranges are varlena (measured).
+                    "typlen": -1,
                 }
             )
     # User-declared domain types (typtype 'd') carry their base type's oid in
@@ -2264,6 +2306,9 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
                 "typdefault": None if default is None else str(default),
                 "typtype": "d",
                 "typarray": oid + USER_TYPE_ARRAY_OID_OFFSET,
+                # A domain INHERITS its base type's typlen -- `d AS int` is 4,
+                # `d AS text` is -1 (measured on PostgreSQL 14).
+                "typlen": typemap.PG_TYPLEN.get(typemap.PG_TYPENAME.get(base_tag or "", ""), -1),
             }
         )
     # User-declared composite types (typtype 'c') live in the public namespace;
@@ -2293,6 +2338,9 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
         row.setdefault("typrelid", 0)
         row.setdefault("typarray", 0)
         row.setdefault("typdelim", ",")
+        # -1 = varlena, which is right for every user type except an enum
+        # (a fixed 4-byte oid reference, set explicitly above).
+        row.setdefault("typlen", -1)
         # Scalar / composite / enum rows are not arrays: no element type.
         row.setdefault("typelem", 0)
         # typinput is the type's input function. Drivers do not call it; they
@@ -2343,6 +2391,9 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
             "typrelid": 0,
             "typarray": 0,
             "typelem": row["oid"],
+            # Every array type is varlena. pgjdbc's TypeInfoCache filters its
+            # array lookup on `typlen = -1`, so this is load-bearing.
+            "typlen": -1,
             "typdelim": ",",
             "typinput": "array_in",
         }
@@ -2984,6 +3035,7 @@ _register(
         ("reloptions", "text"),
         ("reltype", "int4"),
         ("reltuples", "float4"),
+        ("relpages", "int4"),
     ],
     _pg_class,
 )
@@ -3288,6 +3340,7 @@ _register(
         ("typrelid", "int4"),
         ("typarray", "int4"),
         ("typelem", "int4"),
+        ("typlen", "int2"),
         ("typdelim", "text"),
         ("typinput", "text"),
     ],
