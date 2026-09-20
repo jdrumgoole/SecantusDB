@@ -46,7 +46,16 @@ def _raw_out(which: str) -> Path:
 
 RAW_OUT = REPO_ROOT / ".validation" / "psycopg-raw.json"
 #: The Rust PostgreSQL server, driven when SECANTUS_GAUGE_SERVER=rust.
-RUST_BINARY = REPO_ROOT / "crates" / "secantus-pgserver" / "target" / "debug" / "secantusd-pg"
+# `.exe` on Windows, where the bare name never exists -- the gauge could not
+# find a perfectly good build and reported the server as unavailable.
+RUST_BINARY = (
+    REPO_ROOT
+    / "crates"
+    / "secantus-pgserver"
+    / "target"
+    / "debug"
+    / ("secantusd-pg.exe" if sys.platform == "win32" else "secantusd-pg")
+)
 
 #: Wall-clock cap on the pytest invocation. The full sync half is ~28s against
 #: a healthy server; a broken change leaves hung awaits, and per-test
