@@ -1102,10 +1102,33 @@ These work end-to-end but cut corners.
       applies to every statement and is worth a look (8 `type_catalog_docs`
       calls per statement), but it is 3us against the row path's 8.7.
 
-      Next: count what one primary-key read does inside storage -- cursor
-      opens, index lookups, decodes -- and compare against what it must do.
-      Instruments: `tools/probes/pg_protocol_cost.py`,
-      `bench/pg_statement_cost.py`.
+      **COUNTED 2026-09-20: 3.00 WiredTiger cursor opens per single-row read**
+      (`select 1` opens 0.00, so they all belong to the read). That matches
+      the sampled profiles, where `__wt_open_cursor`,
+      `__wt_session_get_dhandle` and `__wt_curfile_open` were the top frames
+      once the catalog hotspot was gone.
+
+      **The Rust storage has no cursor cache; the PYTHON storage does.**
+      `src/secantus/storage.py` keeps cursors per session per table, keyed
+      `(table, overwrite)`, and `reset()`s between uses -- the pattern
+      WiredTiger documents. `crates/secantus-storage` opens a fresh cursor on
+      every call and drops it. Three opens a row read, at roughly the ~2-3us
+      each the profile implies, is most of the 8.7us excess.
+
+      **This is the next major piece of work, and it is a refactor rather
+      than a patch.** `Session::open_cursor` hands back an OWNED `Cursor`, so
+      a cache changes the shape of every storage call site -- they would take
+      a borrow or a guard that returns the cursor. Three constraints to hold:
+      a cached cursor must be `reset()` before reuse (a stale position is a
+      WRONG ROW, not an error), the cache must die with its session, and
+      cursors must close before the session does -- the same ordering the
+      session pool documents in `Storage::drop`. Now that finished sessions
+      are pooled (#1538), a cursor cache would survive across statements,
+      which is what makes it worth the refactor.
+
+      Not started deliberately: a large storage refactor begun late and left
+      half-done is worse than one not begun, and this one can silently return
+      wrong rows if the reset discipline slips.
 
 - [ ] **OPEN — RUST pgserver: the autocommit per-statement gap is in the WIRE
       layer, not the query engine (attributed 2026-09-20).** `select 1` costs
