@@ -1133,11 +1133,39 @@ These work end-to-end but cut corners.
       - **~15.6us in the extended protocol alone** (ours 21.3 over its own
         simple-query cost, PG 5.7). This is the bigger half and is untouched.
 
-      Next: bisect the extended path's own steps -- `infer_param_types`,
-      `describe_fields` (the 8 `type_catalog_docs` calls a statement counted
-      2026-09-19 live here), `portal_params`, `open_extended_group` /
-      `close_extended_group` -- with steady-state windows. A psycopg client
-      uses this path for every statement, so it is what users actually pay.
+      **BISECTED 2026-09-20 -- it is the per-statement TRANSACTION, not the
+      protocol bookkeeping.** Steady-state windows on each extended handler
+      (RAII timers, so every return path counts):
+
+      | handler | us / statement |
+      | --- | --- |
+      | `do_query` (extended) | 8.19 -- of which ~5.1 is the query work already measured |
+      | **`on_sync`** | **5.58** |
+      | `describe_portal` | 2.83 |
+      | total | **~16.6**, against the 15.6us excess measured independently |
+
+      The two halves fit: `do_query` -> `open_transaction_handle` opens a
+      WiredTiger session (counted: exactly 1.00 per autocommit statement, 0.00
+      in a block) and `on_sync` commits and closes it. **For `select 1`, which
+      touches no storage, that whole cycle is waste** -- and every statement a
+      psycopg client sends pays it, because psycopg uses the extended protocol
+      for all of them.
+
+      Note `begin_user_transaction` already defers WiredTiger's own
+      `begin_transaction` to first use, so the cost is the SESSION open/close
+      plus the commit path, not a real transaction.
+
+      **The fix worth trying, not attempted here:** hold one WiredTiger session
+      per CONNECTION and lend it to each statement's handle, instead of opening
+      and closing one per statement. That is a session-lifetime change with
+      durability implications (the close-checkpoint path, and the oplog's
+      session assumptions), so it deserves its own branch and its own
+      measurement rather than being folded into an attribution.
+
+      `describe_portal`'s 2.83us is the next largest and still unattributed;
+      the 8 `type_catalog_docs` calls a statement counted 2026-09-19 live
+      there. Reproduce the split with `tools/probes/pg_protocol_cost.py` plus
+      per-handler timers.
 
 - [ ] **OPEN — RUST pgserver: `may_fill_catalog_cache` is defence whose
       necessity is unproven (2026-09-19).** The gate refuses to publish a
