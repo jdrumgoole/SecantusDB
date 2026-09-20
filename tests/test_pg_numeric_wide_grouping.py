@@ -18,6 +18,9 @@ the cross-form case where one row is narrow and an equal one is wide
 
 from __future__ import annotations
 
+import contextlib
+import uuid
+
 import pytest
 
 import pg_oracle
@@ -111,15 +114,25 @@ def test_matches_real_postgres(run, sql: str, values: str) -> None:
     so a difference in SCALE is a failure rather than a silent pass."""
     pg = pg_oracle.connect()
     assert pg is not None
+    # Every worker shares ONE PostgreSQL, so the table cannot be shared: under
+    # `-n auto` two parametrisations ran `drop table t` / `create table t`
+    # against each other and CI saw both halves of that race -- `relation "t"
+    # does not exist` and a duplicate key on `pg_type_typname_nsp_index`. A
+    # schema per test keeps the case SQL (which names a bare `t`) unchanged.
+    schema = f"wide_{uuid.uuid4().hex[:12]}"
     try:
         with pg.cursor() as cur:
-            cur.execute("drop table if exists t")
+            cur.execute(f"create schema {schema}")
+            cur.execute(f"set search_path to {schema}")
             cur.execute("create table t (id int, v numeric)")
             cur.execute(f"insert into t values {values}")
             cur.execute(sql)
             theirs = [tuple(str(v) for v in row) for row in cur.fetchall()]
         pg.commit()
     finally:
+        with contextlib.suppress(Exception), pg.cursor() as cur:
+            cur.execute(f"drop schema if exists {schema} cascade")
+            pg.commit()
         pg.close()
     _seed(run, values)
     ours = [tuple(str(v) for v in row) for row in run(sql)]
