@@ -1983,6 +1983,12 @@ impl PgHandler {
                 Ordering::Equal
             });
         }
+        // HAVING filters the GROUPS, before DISTINCT, ORDER BY and LIMIT see
+        // them -- and after the aggregates are computed, which is the whole
+        // point of the clause.
+        if let Some(having) = agg.having.as_ref() {
+            groups.retain(|(key, vals)| having_holds(having, key, vals));
+        }
         // `SELECT DISTINCT` over an aggregate dedups the OUTPUT rows -- the
         // select list, so two groups with the same count collapse into one --
         // after grouping and before the ORDER BY, as PostgreSQL does.
@@ -12267,6 +12273,55 @@ fn encode_value(enc: &mut DataRowEncoder, v: Option<&Bson>) -> PgWireResult<()> 
             enc.encode_field(&Some(secantus_pgplan::bytea::render_hex(&b.bytes).as_str()))
         }
         _ => enc.encode_field(&None::<i32>),
+    }
+}
+
+/// Whether one grouped row satisfies a `HAVING` predicate.
+///
+/// The values are the group's: `OutputCol::Group(i)` is its key, `Agg(i)` the
+/// aggregate -- including an aggregate HAVING asked for that the SELECT list
+/// never projects. Comparison goes through `group_key_ident` so a numeric is
+/// matched by VALUE, the same rule the grouping itself uses, and a NULL on
+/// either side makes the comparison UNKNOWN (never true), as SQL has it.
+fn having_holds(having: &secantus_pgplan::Having, key: &[Option<Bson>], vals: &[Bson]) -> bool {
+    use secantus_pgplan::{Having, OutputCol};
+    let value_of = |subject: &OutputCol| -> Option<Bson> {
+        match subject {
+            OutputCol::Group(i) => key.get(*i).cloned().flatten(),
+            OutputCol::Agg(i) => match vals.get(*i) {
+                None | Some(Bson::Null) => None,
+                Some(v) => Some(v.clone()),
+            },
+        }
+    };
+    match having {
+        Having::And(parts) => parts.iter().all(|p| having_holds(p, key, vals)),
+        Having::Or(parts) => parts.iter().any(|p| having_holds(p, key, vals)),
+        Having::Not(inner) => !having_holds(inner, key, vals),
+        Having::IsNull { subject, negated } => value_of(subject).is_none() != *negated,
+        Having::Compare { subject, op, value } => {
+            let Some(have) = value_of(subject) else {
+                return false; // NULL compares UNKNOWN, which is not true
+            };
+            if matches!(value, Bson::Null) {
+                return false;
+            }
+            let ordering =
+                if group_key_ident(&Some(have.clone())) == group_key_ident(&Some(value.clone())) {
+                    Ordering::Equal
+                } else {
+                    compare_values(&have, value)
+                };
+            match op.as_str() {
+                "=" => ordering == Ordering::Equal,
+                "<>" => ordering != Ordering::Equal,
+                ">" => ordering == Ordering::Greater,
+                ">=" => ordering != Ordering::Less,
+                "<" => ordering == Ordering::Less,
+                "<=" => ordering != Ordering::Greater,
+                _ => false,
+            }
+        }
     }
 }
 

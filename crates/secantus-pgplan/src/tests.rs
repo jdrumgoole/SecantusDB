@@ -572,7 +572,6 @@ fn aggregate_refusals_carry_the_right_sqlstate() {
         // BY output, which this slice does not do; plain `count(DISTINCT n)`
         // IS supported (see `count_distinct_plans_a_distinct_aggregate`).
         ("SELECT DISTINCT ON (n) count(*) FROM t GROUP BY n", "0A000"),
-        ("SELECT count(*) FROM t HAVING count(*) > 1", "0A000"),
         ("SELECT count(nope) FROM t", "42703"),
         ("SELECT sum(nope + 1) FROM t", "42703"),
         ("SELECT count(*) FROM t GROUP BY nope", "42703"),
@@ -581,6 +580,30 @@ fn aggregate_refusals_carry_the_right_sqlstate() {
         let err = plan(sql, &lookup).expect_err(sql);
         assert_eq!(err.sqlstate(), want, "for {sql} (got {err})");
     }
+}
+
+/// HAVING plans, including an aggregate the SELECT list never asks for.
+#[test]
+fn having_plans_and_adds_the_aggregates_it_needs() {
+    match plan("SELECT count(*) FROM t HAVING count(*) > 1", &lookup).unwrap() {
+        Statement::Aggregate(a) => {
+            assert!(a.having.is_some());
+            // `count(*)` is already in the select list, so HAVING reuses it.
+            assert_eq!(a.items.len(), 1);
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    match plan("SELECT n FROM t GROUP BY n HAVING count(*) > 1", &lookup).unwrap() {
+        Statement::Aggregate(a) => {
+            // `count(*)` is computed for the test and never projected.
+            assert_eq!(a.items.len(), 1);
+            assert_eq!(a.select.len(), 1);
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    // A shape the lowerer does not cover is refused, not approximated.
+    let err = plan("SELECT count(*) FROM t HAVING count(*) > n", &lookup).expect_err("n in HAVING");
+    assert_eq!(err.sqlstate(), "0A000");
 }
 
 /// `count(DISTINCT col)` plans as an aggregate that dedups its input.
