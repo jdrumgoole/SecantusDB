@@ -12278,10 +12278,12 @@ fn aggregate_wire_type(item: &AggItem) -> Type {
     match item.func {
         AggFunc::CountStar | AggFunc::Count => Type::INT8,
         AggFunc::BoolAnd | AggFunc::BoolOr => Type::BOOL,
-        AggFunc::Sum => match item.source_type.as_deref() {
-            Some("numeric" | "decimal") => Type::NUMERIC,
-            _ => Type::INT8,
-        },
+        // The result type is PostgreSQL's, which is not a uniform widening:
+        // `sum(int4)` is bigint but `sum(int8)` is numeric, and a float sums
+        // as itself (`secantus_pgplan::sum_result_type`).
+        AggFunc::Sum => wire_type(secantus_pgplan::sum_result_type(
+            item.source_type.as_deref(),
+        )),
         AggFunc::Min | AggFunc::Max => item
             .source_type
             .as_deref()

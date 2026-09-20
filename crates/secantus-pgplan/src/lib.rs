@@ -2743,6 +2743,34 @@ pub fn insert_row(
 }
 
 /// Does this target list contain an aggregate call?
+/// The type `sum()` returns for an input type, as PostgreSQL 14.24 answers it
+/// (measured 2026-09-20, not inferred -- the widening is not uniform):
+///
+/// | input | `sum` |
+/// | --- | --- |
+/// | `int2`, `int4` | `int8` |
+/// | `int8` | `numeric` |
+/// | `float4` | `float4` |
+/// | `float8` | `float8` |
+/// | `numeric` | `numeric` |
+/// | `money` | `money` |
+/// | `interval` | `interval` |
+///
+/// Everything used to answer `int8` unless it was a numeric, so `sum(f)` over
+/// a `float8` column was DESCRIBED as an integer while the value `1.5` went
+/// out on the wire -- and the client raised `invalid literal for int()`
+/// rather than getting a number. A wrong type here is not cosmetic.
+pub fn sum_result_type(source: Option<&str>) -> &'static str {
+    match source {
+        Some("float4" | "real") => "float4",
+        Some("float8" | "double precision") => "float8",
+        Some("numeric" | "decimal" | "int8" | "bigint") => "numeric",
+        Some("money") => "money",
+        Some("interval") => "interval",
+        _ => "int8",
+    }
+}
+
 /// Whether an aggregate call appears BELOW the top level of a target -- the
 /// `sum(n)` in `sum(n) + 0`, `count(*) + 1`, or `coalesce(sum(n), -1)`.
 ///
@@ -4445,11 +4473,7 @@ pub fn aggregate_output_def(agg: &Aggregate) -> Result<TableDef> {
                 let item = &agg.items[*i];
                 match item.func {
                     AggFunc::CountStar | AggFunc::Count => "int8".to_string(),
-                    // `sum(numeric)` is numeric; the integer sums are int8.
-                    AggFunc::Sum => match item.source_type.as_deref() {
-                        Some("numeric" | "decimal") => "numeric".to_string(),
-                        _ => "int8".to_string(),
-                    },
+                    AggFunc::Sum => sum_result_type(item.source_type.as_deref()).to_string(),
                     AggFunc::Min | AggFunc::Max => item
                         .source_type
                         .clone()
