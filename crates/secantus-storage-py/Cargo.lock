@@ -1006,7 +1006,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-core"
-version = "0.5.3-beta.164"
+version = "0.5.3-beta.165"
 dependencies = [
  "bson",
  "chrono",
@@ -1022,7 +1022,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-storage"
-version = "0.5.3-beta.164"
+version = "0.5.3-beta.165"
 dependencies = [
  "bson",
  "flate2",
@@ -1036,7 +1036,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-storage-py"
-version = "0.5.3-beta.164"
+version = "0.5.3-beta.165"
 dependencies = [
  "bson",
  "pyo3",
@@ -1045,7 +1045,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-wt"
-version = "0.5.3-beta.164"
+version = "0.5.3-beta.165"
 dependencies = [
  "bindgen",
 ]
