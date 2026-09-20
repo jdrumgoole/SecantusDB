@@ -2824,6 +2824,21 @@ pub struct Storage {
     /// writing must take the appropriate write lock — `collection_uuid`'s
     /// mint path does.
     lock: Mutex<()>,
+    /// Idle WiredTiger sessions kept for the next user transaction.
+    ///
+    /// The PG server opens a transaction handle for EVERY autocommit
+    /// statement -- measured 2026-09-20 at exactly 1.00 session open per
+    /// statement, including `select 1`, which reads no row -- and a session
+    /// open/close costs ~4.5us of a ~25us gap against PostgreSQL. Sessions
+    /// are reusable once their transaction has finished: `commit` / `rollback`
+    /// leave none open, and a `Cursor` closes with its own scope.
+    ///
+    /// Bounded, because a session is a WiredTiger resource governed by
+    /// `session_max`: over the cap the session is dropped instead of parked,
+    /// so the pool can never grow past what concurrent work actually needed.
+    /// A session whose commit FAILED is never returned -- its `Drop` is what
+    /// rolls the dead transaction back.
+    txn_session_pool: Mutex<Vec<crate::Session>>,
     /// Per-collection write locks: CRUD on `(db, coll)` serialises here so
     /// writes to different collections run in parallel. Entries are created
     /// on first reference and never removed — the lock identity for a
@@ -3995,6 +4010,15 @@ impl Drop for Storage {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        // Idle sessions parked for reuse close here for the same reason, and
+        // NOT by field-drop order: `conn` is declared above the pool, so the
+        // connection's `Arc` could reach zero first and leave these sessions
+        // closing against a dead connection. They hold raw WiredTiger
+        // pointers, so that is a use-after-free, not an error return.
+        self.txn_session_pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         // Stop the background oplog pruner first: it opens WT sessions, so it
         // must be gone before the connection closes below. A parked pruner
         // wakes on the notify; a mid-sweep one finishes its bounded sweep.
@@ -4281,6 +4305,7 @@ impl Storage {
             conn,
             home: home.to_string(),
             lock: Mutex::new(()),
+            txn_session_pool: Mutex::new(Vec::new()),
             coll_locks: Mutex::new(HashMap::new()),
             write_tickets: crate::admission::Tickets::new(opts.write_tickets.unwrap_or(0)),
             ddl_generation: AtomicU64::new(0),
@@ -6163,8 +6188,18 @@ impl Storage {
     /// Open a dedicated WT session for a new multi-document transaction. The WT
     /// `begin_transaction` is deferred to the first `with_user_transaction`.
     pub fn begin_user_transaction(&self) -> Result<UserTransactionHandle> {
-        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        let session = self.conn.open_session()?;
+        let pooled = self
+            .txn_session_pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop();
+        let session = match pooled {
+            Some(s) => s,
+            None => {
+                let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+                self.conn.open_session()?
+            }
+        };
         Ok(UserTransactionHandle {
             session: Some(session),
             began: false,
@@ -6387,9 +6422,27 @@ impl Storage {
                 let pending = std::mem::take(&mut handle.pending_async);
                 self.mint_and_enqueue(pending);
             }
-            // `session` drops here → the dedicated WT session is closed.
+            // The transaction is over and the session holds nothing: park it
+            // for the next one rather than closing it. Only reached on a
+            // SUCCESSFUL commit -- every failure path above returns early, so
+            // a session with a dead transaction on it still drops and closes.
+            self.park_txn_session(session);
         }
         Ok(())
+    }
+
+    /// Return a finished transaction's session to the pool, or close it if the
+    /// pool is already at its cap. See `txn_session_pool`.
+    fn park_txn_session(&self, session: crate::Session) {
+        const MAX_IDLE: usize = 64;
+        let mut pool = self
+            .txn_session_pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if pool.len() < MAX_IDLE {
+            pool.push(session);
+        }
+        // else: `session` drops here and WiredTiger closes it.
     }
 
     /// Roll back the transaction's WT session, then **close** it. Idempotent;
