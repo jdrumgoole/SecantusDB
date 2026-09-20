@@ -1070,6 +1070,43 @@ These work end-to-end but cut corners.
 
 ## 3. Deferred work (skipped from a slice, ready to come back)
 
+- [ ] **OPEN — RUST pgserver: reading ONE ROW BY PRIMARY KEY costs ~10.7us
+      where PostgreSQL pays ~2.0us (measured 2026-09-20).** This is the
+      general per-statement target; the protocol work above has taken the
+      extended path as far as it goes cheaply.
+
+      | us / statement | ours | PG 16 | excess |
+      | --- | --- | --- | --- |
+      | `select 1` (extended) | 51.6 | 30.1 | +21.5 |
+      | `select v from t where k = 1` | 62.3 | 32.1 | **+30.2** |
+      | the row read ALONE (difference) | **10.7** | **2.0** | **+8.7** |
+
+      A real query is worse than the constant one, so the remaining gap is
+      NOT mostly protocol: fetching a single row by its primary key is five
+      times PostgreSQL's cost, and every real statement pays it.
+
+      **A tempting fix was rejected as benchmark-gaming.** The extended path
+      opens a transaction group per statement, and `select 1` does not need
+      one. Skipping it for statements that touch no storage
+      (`SelectConstant`, `SHOW`, `SET`) would have improved the headline
+      number by ~3us. But a real `SELECT ... FROM t` still needs the handle --
+      without it each storage call runs in its own autocommit and the
+      statement loses PostgreSQL's statement-level snapshot consistency -- so
+      the change would have moved the benchmark and left every real query
+      exactly where it was. Not worth transaction-semantics risk in a
+      database for a number nobody's workload sees.
+
+      **Where the extended-protocol work ended up** (after the session pool
+      landed, steady-state windows): `do_query` 6.74us, `on_sync` 3.39us
+      (was 5.58 -- the pool), `describe_portal` 3.07us. `describe_portal`
+      applies to every statement and is worth a look (8 `type_catalog_docs`
+      calls per statement), but it is 3us against the row path's 8.7.
+
+      Next: count what one primary-key read does inside storage -- cursor
+      opens, index lookups, decodes -- and compare against what it must do.
+      Instruments: `tools/probes/pg_protocol_cost.py`,
+      `bench/pg_statement_cost.py`.
+
 - [ ] **OPEN — RUST pgserver: the autocommit per-statement gap is in the WIRE
       layer, not the query engine (attributed 2026-09-20).** `select 1` costs
       ~55.8us against PostgreSQL 16's ~30us. Instrumented with steady-state
