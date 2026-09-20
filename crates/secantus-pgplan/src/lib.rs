@@ -1226,12 +1226,18 @@ pub struct Update {
     /// result by `_id`, because a constant `$set` cannot express them.
     pub set_exprs: Vec<(String, String, ColumnExpr)>,
     pub filter: Document,
+    /// `UPDATE ... RETURNING`, over the rows AFTER the update -- which is
+    /// what PostgreSQL returns. Dropped on the floor before 2026-09-20: the
+    /// rows were updated and the client got no rowset at all.
+    pub returning: Option<Returning>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Delete {
     pub table: String,
     pub filter: Document,
+    /// `DELETE ... RETURNING`, over the rows as they were before the delete.
+    pub returning: Option<Returning>,
 }
 
 /// Name an unsupported node in an error message.
@@ -11465,12 +11471,20 @@ fn plan_update(
         None => Document::new(),
         Some(w) => lower_where(w, &def, params)?,
     };
+    let returning = if u.returning_list.is_empty() {
+        None
+    } else {
+        let (columns, casts) = plan_table_targets(&u.returning_list, &def, params)?;
+        Some(Returning { columns, casts })
+    };
+
     Ok(Statement::Update(Update {
         table,
         set,
         unset,
         set_exprs,
         filter,
+        returning,
     }))
 }
 
@@ -11531,7 +11545,18 @@ fn plan_delete(
         None => Document::new(),
         Some(w) => lower_where(w, &def, params)?,
     };
-    Ok(Statement::Delete(Delete { table, filter }))
+    let returning = if d.returning_list.is_empty() {
+        None
+    } else {
+        let (columns, casts) = plan_table_targets(&d.returning_list, &def, params)?;
+        Some(Returning { columns, casts })
+    };
+
+    Ok(Statement::Delete(Delete {
+        table,
+        filter,
+        returning,
+    }))
 }
 
 fn plan_truncate(
