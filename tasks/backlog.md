@@ -1070,6 +1070,50 @@ These work end-to-end but cut corners.
 
 ## 3. Deferred work (skipped from a slice, ready to come back)
 
+- [ ] **OPEN — RUST pgserver: the autocommit per-statement gap is in the WIRE
+      layer, not the query engine (attributed 2026-09-20).** `select 1` costs
+      ~55.8us against PostgreSQL 16's ~30us. Instrumented with steady-state
+      windows (NOT cumulative means -- an earlier reading drifted 144 -> 89us
+      on warmup alone while the truth sat still), release build, quiet box:
+
+      | per statement | us |
+      | --- | --- |
+      | transaction-guard lock | 0.03 |
+      | `execute` (includes the WT session open below) | 3.69 |
+      | planner (`plan_with_session_types`) | 0.60 |
+      | parameter typing | 0.80 |
+      | **total server query work** | **~5.1** |
+
+      Statement processing above the protocol floor is ~34us for us and ~11us
+      for PostgreSQL (`select 1` minus an empty round trip). **So ~29us falls
+      outside every span above** -- it is not planning, not execution, not
+      parameter typing, not the transaction guard. The remaining candidates are
+      the pgwire message codec and response building, which is consistent with
+      the only sampled profile that survived scrutiny: `pgwire::messages::
+      codec::get_cstring` and `Message::decode` among the top frames once the
+      catalog hotspot was gone.
+
+      **Ruled out by counting, not by reading:**
+      - **Parsing** -- the `pg_query` memo hits: 4 misses per ~1000 statements,
+        ~3 cheap lookups per statement.
+      - **The planner** -- 0.60us.
+      - **Parameter typing** -- 0.80us.
+      - **The protocol floor itself** -- an empty round trip is 21.4us against
+        PostgreSQL's 19.8us, so the transport is fine.
+
+      **One structural difference IS confirmed and is worth ~4.5us:** autocommit
+      opens exactly **1.00 WiredTiger session per statement** (counted;
+      in-block is 0.00), because `open_transaction_handle` -> 
+      `begin_user_transaction` opens one unconditionally -- even for `select 1`,
+      which touches no storage. That is why a bare block (50.1us) is CHEAPER
+      than autocommit (54.6us). Not fixed here: the handle is opened before the
+      statement's needs are known, so skipping it needs the plan first.
+
+      Next: measure inside the pgwire codec path before changing anything
+      there, and re-check the vendored crate's encode/decode for per-message
+      allocation. `bench/pg_statement_cost.py` is the instrument; read its
+      docstring first -- its `--in-transaction` flag also does DDL.
+
 - [ ] **OPEN — RUST pgserver: `may_fill_catalog_cache` is defence whose
       necessity is unproven (2026-09-19).** The gate refuses to publish a
       catalog read taken on the transaction's own WiredTiger session into the
