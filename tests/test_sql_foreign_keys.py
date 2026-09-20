@@ -233,3 +233,52 @@ def test_pg_get_constraintdef_renders_fk(storage, session):
         == "FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE"
     )
     assert virtual.constraint_def_for_oid(DB, catalog, 999999) is None
+
+
+def test_fk_conindid_points_at_the_referenced_constraint(storage, session):
+    """`conindid` is the index backing the constraint the FK REFERENCES.
+
+    It was hardcoded to the referenced table's PRIMARY KEY index, and the
+    comment beside it stated that as the rule. A foreign key may reference any
+    UNIQUE constraint, so `REFERENCES pkt(b)` reported `pkt_pk_a` where
+    PostgreSQL 14 reports `pkt_un_b` (measured 2026-09-20).
+
+    pgjdbc's `getImportedKeys` reads PK_NAME by joining `pkic.oid =
+    con.conindid`, so this is the name an ORM sees for the referenced key.
+
+    All three shapes are pinned: the UNIQUE case that was wrong, the PRIMARY
+    KEY case that was right and must stay so, and a COMPOSITE unique — whose
+    columns are matched as a sorted set, because a foreign key may name them
+    in a different order than the constraint declares them.
+    """
+    run_sql(
+        storage,
+        DB,
+        "CREATE TABLE pkt (a int not null, b int not null, e int not null, f int not null, "
+        "CONSTRAINT pkt_pk_a PRIMARY KEY (a), CONSTRAINT pkt_un_b UNIQUE (b), "
+        "CONSTRAINT pkt_un_ef UNIQUE (e, f))",
+        session=session,
+    )
+    for ddl in (
+        "CREATE TABLE fk1 (c int, CONSTRAINT fk1_c FOREIGN KEY (c) REFERENCES pkt(b))",
+        "CREATE TABLE fk2 (c int, CONSTRAINT fk2_c FOREIGN KEY (c) REFERENCES pkt(a))",
+        "CREATE TABLE fk3 (x int, y int, "
+        "CONSTRAINT fk3_xy FOREIGN KEY (x, y) REFERENCES pkt(e, f))",
+    ):
+        run_sql(storage, DB, ddl, session=session)
+
+    res = run_sql(
+        storage,
+        DB,
+        # Scoped to this test's own constraints: the module fixture declares
+        # an FK of its own, and an unscoped query picks it up.
+        "SELECT con.conname, pkic.relname FROM pg_constraint con, pg_class pkic "
+        "WHERE con.contype = 'f' AND pkic.oid = con.conindid "
+        "AND con.conname IN ('fk1_c', 'fk2_c', 'fk3_xy') ORDER BY con.conname",
+        session=session,
+    )[-1]
+    assert res.rows == [
+        ("fk1_c", "pkt_un_b"),
+        ("fk2_c", "pkt_pk_a"),
+        ("fk3_xy", "pkt_un_ef"),
+    ]

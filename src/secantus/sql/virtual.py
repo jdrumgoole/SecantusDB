@@ -2740,14 +2740,37 @@ def _pg_constraint(db: str, session: Session, storage: Any, catalog: Catalog) ->
     # is an index, not a constraint), so contype 'u'/'c' rows are absent.
     rows: list[dict] = []
     oid = _PK_CON_OID_BASE
-    # A foreign key's conindid points at the referenced table's PK index —
-    # pgjdbc's getImportedKeys joins ``pkic.oid = con.conindid`` to read the
-    # PK_NAME, so a 0 here silently empties every FK metadata result.
+    # A foreign key's conindid points at the index backing the constraint the
+    # key actually REFERENCES — which is not always the primary key. pgjdbc's
+    # getImportedKeys joins ``pkic.oid = con.conindid`` to read PK_NAME, so a 0
+    # here silently empties every FK metadata result, and the referenced
+    # table's PK is the wrong answer whenever the FK targets a UNIQUE
+    # constraint instead: `REFERENCES pkt(b)` reported `pkt_pk_a` where
+    # PostgreSQL 14 reports `pkt_un_b` (measured 2026-09-20).
     pk_index_by_rel = {
         ix["indrelid"]: ix["indexrelid"]
         for ix in _index_relations(db, storage, catalog)
         if ix["primary"]
     }
+    # (relid, referenced columns) -> the backing index, for PK and UNIQUE
+    # constraints alike. Keyed on the sorted column list because a foreign key
+    # may name the referenced columns in a different order than the constraint
+    # declares them.
+    index_by_rel_cols: dict[tuple[int, tuple[int, ...]], int] = {}
+    for ix in _index_relations(db, storage, catalog):
+        if ix["primary"]:
+            index_by_rel_cols[(ix["indrelid"], tuple(sorted(ix["indkey"])))] = ix["indexrelid"]
+    for uq in _unique_constraints(db, catalog):
+        index_by_rel_cols.setdefault((uq["conrelid"], tuple(sorted(uq["conkey"]))), uq["conindid"])
+
+    def _fk_conindid(fk: dict) -> int:
+        """The index backing the constraint this foreign key references."""
+        cols = tuple(sorted(fk["confkey"] or []))
+        hit = index_by_rel_cols.get((fk["confrelid"], cols))
+        if hit is not None:
+            return hit
+        return pk_index_by_rel.get(fk["confrelid"], 0)
+
     for ix in _index_relations(db, storage, catalog):
         if not ix["primary"]:
             continue
@@ -2774,7 +2797,7 @@ def _pg_constraint(db: str, session: Session, storage: Any, catalog: Catalog) ->
                 "conname": fk["conname"],
                 "conrelid": fk["conrelid"],
                 "confrelid": fk["confrelid"],
-                "conindid": pk_index_by_rel.get(fk["confrelid"], 0),
+                "conindid": _fk_conindid(fk),
                 "contype": "f",
                 "contypid": 0,
                 "condeferrable": fk["fk"].deferrable,
