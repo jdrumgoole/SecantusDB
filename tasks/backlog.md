@@ -1109,10 +1109,35 @@ These work end-to-end but cut corners.
       than autocommit (54.6us). Not fixed here: the handle is opened before the
       statement's needs are known, so skipping it needs the plan first.
 
-      Next: measure inside the pgwire codec path before changing anything
-      there, and re-check the vendored crate's encode/decode for per-message
-      allocation. `bench/pg_statement_cost.py` is the instrument; read its
-      docstring first -- its `--in-transaction` flag also does DDL.
+      **REFINED 2026-09-20 — it is the EXTENDED-PROTOCOL path, and the codec
+      is NOT the cost.** The paragraph above guessed "the pgwire message codec
+      and response building" from a profile. Measured: `decode` is **0.125us
+      per call** and the per-message `session_extensions().get()` our transcoder
+      patch adds is **~80ns** (~4 messages a statement). Neither is 29us.
+
+      What the earlier arithmetic got wrong was the FLOOR: it compared an
+      extended-protocol `select 1` (Parse/Bind/Describe/Execute/Sync, five
+      frontend messages) against a SIMPLE-query ping (one), and charged the
+      difference to statement processing. Measuring both protocols on both
+      servers separates them:
+
+      | us / statement | ping | simple `select 1` | extended `select 1` | ext - simple |
+      | --- | --- | --- | --- | --- |
+      | ours | 21.2 | 34.0 | 55.2 | **21.3** |
+      | PostgreSQL 16 | 20.8 | 24.3 | 30.0 | **5.7** |
+
+      So the ~25us gap is **two** gaps:
+      - **~9.3us** in basic statement handling (simple minus ping: ours 12.8,
+        PG 3.5). Of which ~5.1us is the server query work already measured, and
+        ~4.5us is the one WiredTiger session autocommit opens per statement.
+      - **~15.6us in the extended protocol alone** (ours 21.3 over its own
+        simple-query cost, PG 5.7). This is the bigger half and is untouched.
+
+      Next: bisect the extended path's own steps -- `infer_param_types`,
+      `describe_fields` (the 8 `type_catalog_docs` calls a statement counted
+      2026-09-19 live here), `portal_params`, `open_extended_group` /
+      `close_extended_group` -- with steady-state windows. A psycopg client
+      uses this path for every statement, so it is what users actually pay.
 
 - [ ] **OPEN — RUST pgserver: `may_fill_catalog_cache` is defence whose
       necessity is unproven (2026-09-19).** The gate refuses to publish a
