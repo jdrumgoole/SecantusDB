@@ -1794,6 +1794,31 @@ PG_TYPLEN: dict[str, int] = {
 CATALOG_ONLY_TYPES: tuple[tuple[int, str, int], ...] = ((19, "name", 1003),)
 
 
+#: ``pg_type.typtype`` by TYPNAME for every built-in that is not a plain base
+#: type ``b``. Ranges are ``r``, multiranges ``m``, and ``record`` is the
+#: pseudo-type ``p``.
+#:
+#: ``typtype`` is not decorative: pgjdbc's ``getProcedureColumns`` decides
+#: whether to emit a ``returnValue`` row by switching on it, so reporting
+#: ``record`` as ``b`` made a function with OUT parameters grow a spurious
+#: leading row. Measured against PostgreSQL 14 on 2026-09-20.
+PG_TYPTYPE: dict[str, str] = {
+    "record": "p",
+    "daterange": "r",
+    "int4range": "r",
+    "int8range": "r",
+    "numrange": "r",
+    "tsrange": "r",
+    "tstzrange": "r",
+    "datemultirange": "m",
+    "int4multirange": "m",
+    "int8multirange": "m",
+    "nummultirange": "m",
+    "tsmultirange": "m",
+    "tstzmultirange": "m",
+}
+
+
 def enforce_declared_length(value: Any, pg_oid: int | None, typmod: int, column: str = "") -> Any:
     """Apply a ``char(n)`` / ``varchar(n)`` declared length, Postgres-style.
 

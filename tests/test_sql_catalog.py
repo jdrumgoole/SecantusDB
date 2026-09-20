@@ -1129,3 +1129,162 @@ def test_comma_join_semantics_preserved(storage, session):
         " WHERE ca.id = cb.aid AND cb.id = cc.bid AND ca.x = 10 ORDER BY cc.id",
     )
     assert res.rows == [(10, 1000)]
+
+
+def test_pg_proc_argmodes_for_in_inout_out(storage, session):
+    """`f(IN a int, INOUT b varchar, OUT c timestamptz)` in full.
+
+    Four separate facts, all measured against PostgreSQL 14 on 2026-09-20 and
+    all previously wrong:
+
+    - `proargmodes` was NULL; it is `{i,b,o}`.
+    - `proallargtypes` was NULL; it is every parameter's type.
+    - `proargtypes` listed all three, but it is the CALL signature — an
+      OUT-only parameter is excluded, so it is `23 1043`.
+    - `prorettype` was 2278 (void, an oid this catalog does not define); with
+      two output columns it is 2249 (`record`).
+    """
+    q(
+        storage,
+        session,
+        "CREATE FUNCTION f3(IN a int, INOUT b varchar, OUT c timestamptz) "
+        "AS $f$ BEGIN b := 'a'; END; $f$ LANGUAGE plpgsql",
+    )
+    res = q(
+        storage,
+        session,
+        "SELECT proargmodes, proallargtypes, proargnames, proargtypes, prorettype "
+        "FROM pg_proc WHERE proname = 'f3'",
+    )
+    modes, allargs, names, argtypes, rettype = res.rows[0]
+    assert list(modes) == ["i", "b", "o"]
+    assert list(allargs) == [23, 1043, 1184]
+    assert list(names) == ["a", "b", "c"]
+    assert argtypes == "23 1043", "proargtypes is the call signature: no OUT-only param"
+    assert rettype == 2249, "two output columns means record, not void"
+
+
+def test_pg_proc_argmodes_are_null_when_every_param_is_in(storage, session):
+    """PostgreSQL leaves both arrays NULL unless some parameter is not plain IN.
+
+    pgjdbc's getProcedureColumns switches on exactly that, so populating them
+    unconditionally would change how it reads every ordinary function.
+    """
+    q(
+        storage,
+        session,
+        "CREATE FUNCTION allin(a int, b text) RETURNS int AS 'SELECT 1' LANGUAGE sql",
+    )
+    res = q(
+        storage,
+        session,
+        "SELECT proargmodes, proallargtypes FROM pg_proc WHERE proname = 'allin'",
+    )
+    assert res.rows == [(None, None)]
+
+
+def test_pg_proc_returns_table(storage, session):
+    """`RETURNS TABLE (i int)` reports its columns as `t`-mode entries.
+
+    The output columns ride the same three arrays as OUT parameters, and a
+    single column makes `prorettype` that column's type — not void, and not
+    `record`. `proargtypes` stays empty because the function takes no input.
+    """
+    q(storage, session, "CREATE FUNCTION f5() RETURNS TABLE (i int) LANGUAGE sql AS 'SELECT 1'")
+    res = q(
+        storage,
+        session,
+        "SELECT proargmodes, proallargtypes, proargnames, proargtypes, prorettype, proretset "
+        "FROM pg_proc WHERE proname = 'f5'",
+    )
+    modes, allargs, names, argtypes, rettype, retset = res.rows[0]
+    assert list(modes) == ["t"]
+    assert list(allargs) == [23]
+    assert list(names) == ["i"]
+    assert argtypes == ""
+    assert rettype == 23
+    assert retset is True
+
+
+def test_pg_proc_composite_return_type(storage, session):
+    """`RETURNS <table>` resolves to that table's row type, not void.
+
+    A user type has no storage tag, so the return type was 2278. The NAME is
+    recorded at CREATE and resolved at reflection time, where the catalog is
+    in scope — asserted against the table's own row-type oid rather than a
+    literal, because these oids are this server's to mint.
+    """
+    q(storage, session, "CREATE TABLE mdt (id int, name text)")
+    q(
+        storage,
+        session,
+        "CREATE FUNCTION f4(int) RETURNS mdt AS $b$ SELECT 1, 'a' $b$ LANGUAGE sql",
+    )
+    rettype = q(storage, session, "SELECT prorettype FROM pg_proc WHERE proname = 'f4'").rows[0][0]
+    rowtype = q(
+        storage,
+        session,
+        "SELECT t.oid FROM pg_type t JOIN pg_class c ON t.typrelid = c.oid WHERE c.relname = 'mdt'",
+    ).rows[0][0]
+    assert rettype == rowtype != 2278
+
+
+def test_pg_type_typtype_for_pseudo_and_multirange(storage, session):
+    """`record` is a pseudo-type `p`; a multirange is `m`.
+
+    Both reported `b`. This is not cosmetic: pgjdbc's getProcedureColumns
+    decides whether to emit a leading `returnValue` row by switching on
+    `typtype`, so `record` reading `b` gave a function with OUT parameters a
+    spurious extra row — which is how this was found, after the argmodes were
+    already correct. Measured on PostgreSQL 14, 2026-09-20.
+    """
+    res = q(
+        storage,
+        session,
+        "SELECT typname, typtype FROM pg_type "
+        "WHERE typname IN ('record', 'int4range', 'int4multirange', 'text') ORDER BY typname",
+    )
+    assert res.rows == [
+        ("int4multirange", "m"),
+        ("int4range", "r"),
+        ("record", "p"),
+        ("text", "b"),
+    ]
+
+
+def test_builtin_return_type_is_not_treated_as_a_user_type(storage, session):
+    """`RETURNS refcursor` keeps its own type; it is not a composite.
+
+    sqlglot parses `refcursor` as a USERDEFINED type name — the same shape as
+    `RETURNS <composite>` — even though `type_tag_for_sql` resolves it
+    perfectly well. A first version of the composite-return fix claimed every
+    USERDEFINED name, which dropped refcursor's tag and made `SELECT getref()`
+    describe its column as text (25) rather than refcursor (1790).
+
+    So the discriminator is whether the type resolves to a storage tag, not
+    whether sqlglot called it USERDEFINED. Both sides are asserted here
+    because the bug was invisible from either one alone.
+    """
+    q(
+        storage,
+        session,
+        "CREATE FUNCTION getref() RETURNS refcursor AS $b$ SELECT 'x'::refcursor $b$ LANGUAGE sql",
+    )
+    q(storage, session, "CREATE TABLE mdt2 (id int)")
+    q(
+        storage,
+        session,
+        "CREATE FUNCTION getcomp() RETURNS mdt2 AS $b$ SELECT 1 $b$ LANGUAGE sql",
+    )
+    ref = q(storage, session, "SELECT prorettype FROM pg_proc WHERE proname = 'getref'").rows[0][0]
+    comp = q(storage, session, "SELECT prorettype FROM pg_proc WHERE proname = 'getcomp'").rows[0][
+        0
+    ]
+    rowtype = q(
+        storage,
+        session,
+        "SELECT t.oid FROM pg_type t JOIN pg_class c ON t.typrelid = c.oid "
+        "WHERE c.relname = 'mdt2'",
+    ).rows[0][0]
+    assert ref == 1790, "refcursor resolves to its own oid, not a user type"
+    assert comp == rowtype, "a real composite still resolves through the catalog"
