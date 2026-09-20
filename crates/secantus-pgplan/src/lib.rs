@@ -3856,7 +3856,7 @@ fn plan_having(
         }
         Some(N::AExpr(e)) => {
             let op = operator_name(e)?;
-            if !matches!(&*op, "=" | "<>" | "!=" | ">" | ">=" | "<" | "<=") {
+            if !matches!(op, "=" | "<>" | "!=" | ">" | ">=" | "<" | "<=") {
                 return Err(Error::Unsupported(format!("HAVING operator {op}")));
             }
             // The constant may be written on either side; a comparison with a
@@ -3872,7 +3872,7 @@ fn plan_having(
             let op = if subject_on_left {
                 op.to_string()
             } else {
-                match &*op {
+                match op {
                     ">" => "<".to_string(),
                     ">=" => "<=".to_string(),
                     "<" => ">".to_string(),
