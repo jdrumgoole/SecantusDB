@@ -7036,6 +7036,68 @@ def _group_key_expr(field: str, tag: str | None) -> Any:
     return f"${field}"
 
 
+def _group_id_and_numeric(
+    cols: list[tuple[str, str, str | None]],
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """``(group_id, numeric_fields)`` for grouping columns ``(name, field, tag)``.
+
+    A ``numeric`` column groups on a value identity rather than the stored
+    value (`numeric.group_key_expr`); ``numeric_fields`` names the field each
+    such key's display value comes from, for `_group_stages`.
+    """
+    group_id: dict[str, Any] = {}
+    numeric_fields: dict[str, str] = {}
+    for name, path, tag in cols:
+        if tag == "numeric":
+            group_id[name] = _numeric.group_key_expr(path)
+            numeric_fields[name] = f"${path}"
+        else:
+            group_id[name] = _group_key_expr(path, tag)
+    return group_id, numeric_fields
+
+
+def _numeric_group_id(group_id: Any, tags: dict[str, str | None]) -> tuple[Any, dict[str, str]]:
+    """Rewrite a built ``_id`` map so every ``numeric`` column groups on its
+    value identity, and name the field each display value comes from.
+
+    The post-pass form, for the planners that assemble ``_id`` themselves.
+    Only a plain field reference is rewritten: anything already lowered to an
+    expression (a timestamp composite, a computed key) is left alone.
+    """
+    if not isinstance(group_id, dict):
+        return group_id, {}
+    out = dict(group_id)
+    numeric_fields: dict[str, str] = {}
+    for name, expr in group_id.items():
+        if tags.get(name) == "numeric" and isinstance(expr, str) and expr.startswith("$"):
+            out[name] = _numeric.group_key_expr(expr[1:])
+            numeric_fields[name] = expr
+    return out, numeric_fields
+
+
+def _group_stages(
+    group_id: Any, accumulators: dict[str, Any], numeric_fields: dict[str, str]
+) -> list[dict[str, Any]]:
+    """The ``$group`` stage, plus the ``$addFields`` that puts a numeric
+    grouping column's DISPLAY value back over its key.
+
+    Postgres prints the group's first row for a numeric -- insert `1e40.00`
+    before `1e40` and `GROUP BY` answers `1e40.00`, and the other order answers
+    `1e40` (14.24, 2026-09-20). So the value rides along in a hidden ``$first``
+    and is written back into ``_id`` before any later stage reads it, which
+    keeps every downstream ``$project`` / ``$match`` / ``$sort`` unchanged.
+    """
+    if not numeric_fields:
+        return [{"$group": {"_id": group_id, **accumulators}}]
+    acc = dict(accumulators)
+    restore: dict[str, Any] = {}
+    for key, field_expr in numeric_fields.items():
+        hidden = f"__gdisp_{key}"
+        acc[hidden] = {"$first": field_expr}
+        restore[f"_id.{key}"] = f"${hidden}"
+    return [{"$group": {"_id": group_id, **acc}}, {"$addFields": restore}]
+
+
 def _minmax_body(val: Any, field: str | None, tag: str | None, filter_cond: Any) -> Any:
     """The value a ``$min`` / ``$max`` accumulates.
 
@@ -7439,7 +7501,19 @@ def _register_distinct_agg(
     # `count(DISTINCT t)` dedups whatever the set collects, so a timestamp has to
     # go in as the sub-millisecond composite -- collecting the truncated date
     # counted two rows a millisecond apart as one value.
-    distinct_value = value if field is None else _group_key_expr(field, tag)
+    # `count(DISTINCT t)` dedups whatever the set collects, so a numeric goes in
+    # as its value identity -- `1e40.0` and `1e40.00` are one value to Postgres
+    # but two stored documents. Only for `count`: `sum` / `avg` reduce the set
+    # by ADDING its members, which a key string cannot serve.
+    distinct_value = (
+        value
+        if field is None
+        else (
+            _numeric.group_key_expr(field)
+            if tag == "numeric" and func == "count"
+            else _group_key_expr(field, tag)
+        )
+    )
     accumulators[set_name] = {"$addToSet": _push_filtered(distinct_value, fcond)}
     fname = names.fresh(alias or func)
     reductions[fname] = _distinct_reduction(func, f"${set_name}")
@@ -7728,7 +7802,10 @@ def _grouping_set_branch(
     ``post_aggregates`` finishes statistical / bitwise aggregates in Python after the
     union (identical across branches, so the planner keeps one copy)."""
     in_set = set(gset)
-    group_id = {c: _group_key_expr(table.field_for(c), table.type_for(c)) for c in gset} or None
+    group_id, group_numeric = _group_id_and_numeric(
+        [(c, table.field_for(c), table.type_for(c)) for c in gset]
+    )
+    group_id = group_id or None
     accumulators: dict[str, Any] = {}
     reductions: dict[str, Any] = {}
     project: dict[str, Any] = {"_id": 0}
@@ -7924,7 +8001,7 @@ def _grouping_set_branch(
         if having is not None
         else None
     )
-    stages: list[dict[str, Any]] = [{"$group": {"_id": group_id, **accumulators}}]
+    stages: list[dict[str, Any]] = _group_stages(group_id, accumulators, group_numeric)
     if reductions:
         # Reduce each DISTINCT set to its scalar value before HAVING / the projection.
         stages.append({"$addFields": reductions})
@@ -8194,7 +8271,10 @@ def _plan_grouping_sets_window_select(
 
     def branch(gset: list[str]) -> list[dict[str, Any]]:
         in_set = set(gset)
-        group_id = {c: _group_key_expr(table.field_for(c), table.type_for(c)) for c in gset} or None
+        group_id, group_numeric = _group_id_and_numeric(
+            [(c, table.field_for(c), table.type_for(c)) for c in gset]
+        )
+        group_id = group_id or None
         project: dict[str, Any] = {"_id": 0}
         for c in group_cols:
             project[c] = f"$_id.{c}" if c in in_set else {"$literal": None}
@@ -8202,7 +8282,7 @@ def _plan_grouping_sets_window_select(
             project[fname] = f"${fname}"
         for gfname, gcols in grouping_specs:
             project[gfname] = {"$literal": _grouping_bitmask(gcols, in_set)}
-        stages: list[dict[str, Any]] = [{"$group": {"_id": group_id, **accumulators}}]
+        stages: list[dict[str, Any]] = _group_stages(group_id, accumulators, group_numeric)
         if reductions:
             stages.append({"$addFields": reductions})
         if having_match is not None:
@@ -8240,9 +8320,10 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
     group_cols = [_column_name(c) for c in group_node.expressions] if group_node else []
     for c in group_cols:
         table.field_for(c)  # validate
-    group_id = {
-        c: _group_key_expr(table.field_for(c), table.type_for(c)) for c in group_cols
-    } or None
+    group_id, group_numeric = _group_id_and_numeric(
+        [(c, table.field_for(c), table.type_for(c)) for c in group_cols]
+    )
+    group_id = group_id or None
 
     accumulators: dict[str, Any] = {}
     reductions: dict[str, Any] = {}
@@ -8503,7 +8584,7 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
     order_aggs = _register_orderby_aggs_single(
         stmt, table, accumulators, reductions, project, names
     )
-    pipeline: list[dict[str, Any]] = [{"$group": {"_id": group_id, **accumulators}}]
+    pipeline: list[dict[str, Any]] = _group_stages(group_id, accumulators, group_numeric)
     # Reduce any DISTINCT sets to their scalar value before HAVING / projection.
     if reductions:
         pipeline.append({"$addFields": reductions})
@@ -8516,8 +8597,10 @@ def _plan_group_select(stmt: exp.Select, table: TableDef) -> PipelineSelectPlan:
         # output column. Skipped when the executor still has to finish
         # post-aggregates (their values aren't final in the pipeline) or when a
         # hidden ORDER BY aggregate must survive to the $sort.
-        dedup_id = {name: f"${name}" for name, _tag in out_columns}
-        pipeline.append({"$group": {"_id": dedup_id}})
+        dedup_id, dedup_numeric = _numeric_group_id(
+            {name: f"${name}" for name, _tag in out_columns}, dict(out_columns)
+        )
+        pipeline.extend(_group_stages(dedup_id, {}, dedup_numeric))
         pipeline.append({"$project": {"_id": 0, **{n: f"$_id.{n}" for n in dedup_id}}})
     _append_sort_limit(
         pipeline, stmt, out_columns, table, order_aggs=order_aggs, post_aggregates=post_aggregates
@@ -8769,9 +8852,10 @@ def _plan_group_window_select(stmt: exp.Select, table: TableDef) -> EvaluatedSel
     group_cols = [_column_name(c) for c in group_node.expressions] if group_node else []
     for c in group_cols:
         table.field_for(c)  # validate
-    group_id = {
-        c: _group_key_expr(table.field_for(c), table.type_for(c)) for c in group_cols
-    } or None
+    group_id, group_numeric = _group_id_and_numeric(
+        [(c, table.field_for(c), table.type_for(c)) for c in group_cols]
+    )
+    group_id = group_id or None
 
     accumulators: dict[str, Any] = {}
     reductions: dict[str, Any] = {}
@@ -8988,7 +9072,7 @@ def _plan_group_window_select(stmt: exp.Select, table: TableDef) -> EvaluatedSel
                 residual_having = having.this
                 having_match = None
 
-    pipeline: list[dict[str, Any]] = [{"$group": {"_id": group_id, **accumulators}}]
+    pipeline: list[dict[str, Any]] = _group_stages(group_id, accumulators, group_numeric)
     if reductions:
         pipeline.append({"$addFields": reductions})
     if having_match is not None:
@@ -11240,7 +11324,7 @@ def _plan_join_group_select(
             qualified_key[(c.table or None, _column_name(c))] = keyname
             group_keys[keyname] = f"${path}"
             key_tag[keyname] = tag
-    group_id = group_keys or None
+    group_id, group_numeric = _numeric_group_id(group_keys or None, key_tag)
 
     accumulators: dict[str, Any] = {}
     reductions: dict[str, Any] = {}
@@ -11460,7 +11544,7 @@ def _plan_join_group_select(
     order_aggs = _register_orderby_aggs_join(
         stmt, resolve, accumulators, reductions, project, names
     )
-    pipeline.append({"$group": {"_id": group_id, **accumulators}})
+    pipeline.extend(_group_stages(group_id, accumulators, group_numeric))
     if reductions:
         pipeline.append({"$addFields": reductions})
     if having_match is not None:
@@ -11470,8 +11554,10 @@ def _plan_join_group_select(
         # SELECT DISTINCT over the grouped join output — same dedup $group as
         # the single-table group planner (skipped when the executor still has
         # post-aggregates to finish or a hidden ORDER BY aggregate must survive).
-        dedup_id = {name: f"${name}" for name, _tag in out_columns}
-        pipeline.append({"$group": {"_id": dedup_id}})
+        dedup_id, dedup_numeric = _numeric_group_id(
+            {name: f"${name}" for name, _tag in out_columns}, dict(out_columns)
+        )
+        pipeline.extend(_group_stages(dedup_id, {}, dedup_numeric))
         pipeline.append({"$project": {"_id": 0, **{n: f"$_id.{n}" for n in dedup_id}}})
     _append_sort_limit(
         pipeline,
@@ -11515,7 +11601,10 @@ def _join_grouping_set_branch(
     ``(stages, out_columns, post_aggregates)`` — statistical / bitwise finishes run
     in Python over the union (identical across branches)."""
     in_set = set(gset)
-    group_id = {c: _group_key_expr(key_path[c], key_tag.get(c)) for c in gset} or None
+    group_id, group_numeric = _group_id_and_numeric(
+        [(c, key_path[c], key_tag.get(c)) for c in gset]
+    )
+    group_id = group_id or None
     accumulators: dict[str, Any] = {}
     reductions: dict[str, Any] = {}
     project: dict[str, Any] = {"_id": 0}
@@ -11710,7 +11799,7 @@ def _join_grouping_set_branch(
         if having is not None
         else None
     )
-    stages: list[dict[str, Any]] = [{"$group": {"_id": group_id, **accumulators}}]
+    stages: list[dict[str, Any]] = _group_stages(group_id, accumulators, group_numeric)
     if reductions:
         stages.append({"$addFields": reductions})
     if having_match is not None:
@@ -11992,7 +12081,10 @@ def _plan_join_grouping_sets_window_select(
 
     def branch(gset: list[str]) -> list[dict[str, Any]]:
         in_set = set(gset)
-        group_id = {c: _group_key_expr(key_path[c], key_tag.get(c)) for c in gset} or None
+        group_id, group_numeric = _group_id_and_numeric(
+            [(c, key_path[c], key_tag.get(c)) for c in gset]
+        )
+        group_id = group_id or None
         project: dict[str, Any] = {"_id": 0}
         for c in group_cols:
             project[c] = f"$_id.{c}" if c in in_set else {"$literal": None}
@@ -12000,7 +12092,7 @@ def _plan_join_grouping_sets_window_select(
             project[fname] = f"${fname}"
         for gfname, gcols in grouping_specs:
             project[gfname] = {"$literal": _grouping_bitmask(gcols, in_set)}
-        stages: list[dict[str, Any]] = [{"$group": {"_id": group_id, **accumulators}}]
+        stages: list[dict[str, Any]] = _group_stages(group_id, accumulators, group_numeric)
         if reductions:
             stages.append({"$addFields": reductions})
         if having_match is not None:
@@ -12072,7 +12164,7 @@ def _plan_join_group_window_select(
             group_keys[keyname] = f"${path}"
             key_tag[keyname] = tag
             field_tags[keyname] = tag
-    group_id = group_keys or None
+    group_id, group_numeric = _numeric_group_id(group_keys or None, key_tag)
 
     accumulators: dict[str, Any] = {}
     reductions: dict[str, Any] = {}
@@ -12230,7 +12322,7 @@ def _plan_join_group_window_select(
         if having is not None
         else None
     )
-    pipeline.append({"$group": {"_id": group_id, **accumulators}})
+    pipeline.extend(_group_stages(group_id, accumulators, group_numeric))
     if reductions:
         pipeline.append({"$addFields": reductions})
     if having_match is not None:
@@ -14133,11 +14225,11 @@ def _append_distinct(pipeline: list[dict[str, Any]], out_columns: list[tuple[str
     exactly the selected values (SQL ``DISTINCT`` semantics).
     """
     names = [n for n, _ in out_columns]
-    group_id = {n: f"${n}" for n in names}
+    group_id, numeric_fields = _numeric_group_id({n: f"${n}" for n in names}, dict(out_columns))
     project: dict[str, Any] = {"_id": 0}
     for n in names:
         project[n] = f"$_id.{n}"
-    pipeline.append({"$group": {"_id": group_id}})
+    pipeline.extend(_group_stages(group_id, {}, numeric_fields))
     pipeline.append({"$project": project})
 
 

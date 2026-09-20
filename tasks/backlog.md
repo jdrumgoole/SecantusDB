@@ -10135,9 +10135,23 @@ shared storage engine or building large new protocol subsystems:
   keying on the `Decimal128` representation (a MongoDB-side bug on both
   servers), now fixed. UNION / INTERSECT / EXCEPT / DISTINCT ON / PARTITION BY
   keyed rows on `repr()` and split `1.5` / `1.50`; also fixed
-  (`numeric.eq_key`). Still open, wide values only: pipeline `GROUP BY`,
-  `DISTINCT`, `count(DISTINCT)`, and a join on a wide key (the wide document
-  reaches `$lookup` as a document, compared whole).
+  (`numeric.eq_key`). `GROUP BY`, `DISTINCT` and `count(DISTINCT)` were fixed
+  on 2026-09-20 (`numeric.group_key_expr`; `tests/test_pg_numeric_wide_grouping.py`
+  compares against a live PostgreSQL). Two shapes remain:
+  - **A join whose key is wide.** The wide document reaches `$lookup` as a
+    document and is compared whole. Fixing it means the `let` / `pipeline`
+    form, which runs per outer doc — so every numeric join would pay O(N*M)
+    for a case that needs 35+ digits. Do it only behind a cheap test for
+    whether the column actually holds a wide value.
+  - **A value stored narrow in one row and wide in another.** `1.5` fits a
+    Decimal128; `1.5` written with 39 digits does not, so it stores wide, and
+    PostgreSQL says the two are equal (14.24). The group key keeps the two
+    forms in different key spaces — a scale-free string for wide rows, the
+    number itself for narrow ones — and no MQL expression can derive one from
+    the other (a `$toDecimal` of the wide text would round at 34 digits and
+    merge genuinely different values). A uniform key needs the value computed
+    in Python per row, which the pipeline plan's `pre_eval_fields` hook could
+    do for a single table but not for a join.
 - [ ] **pgx `TestDeadlineContextWatcherHandler/DeadlineExceeded_with_DeadlineDelay`
   failed once on CI** (2026-09-19, #1509's gauge run; passed on an immediate
   re-run of the same commit). The test runs `select 1, pg_sleep(0.250)` under
@@ -10165,6 +10179,46 @@ shared storage engine or building large new protocol subsystems:
   Separately, the same query failed with 0A000 on its 7th run under psycopg's
   auto-prepare (Describe typed `pg_sleep` as text, Execute as void). That is
   fixed in #1514 and is not this flake: pgx does not revalidate the plan.
+- [ ] **Rust PG server slice tests: 9 fail on a Windows dev box** (measured
+  2026-09-20, the first time they have ever RUN there -- `BINARY` in
+  `tests/test_rust_pgserver_slice.py` lacked the `.exe` suffix, so all 1,194
+  skipped; fixed in the same commit, and 355 now pass locally). **CI is
+  unaffected**: it builds `secantusd-pg` only on the Linux pg-oracle lane, so
+  these never run on the Windows lane. The failures cluster by cause:
+  - **Hand-off tests** (`test_python_server_reads_rust_timestamps`,
+    `..._reads_and_writes_a_rust_created_table`, `..._enum_created_by_one_server...`,
+    `..._composite_created_by_one_server...`): the Python server opens the
+    handed-off store and finds it EMPTY or the relation missing. `_Server.__exit__`
+    stops the server with `proc.terminate()`, which is SIGTERM on POSIX but
+    `TerminateProcess` on Windows -- an immediate kill with no graceful
+    WiredTiger close, so whatever was not checkpointed is gone. Needs a real
+    shutdown path on Windows (a `CTRL_BREAK_EVENT` to its own process group, or
+    a shutdown command) before these can pass.
+  - **Signal / lifecycle tests** (`..._survive_sigterm`,
+    `test_pg_cancel_and_terminate_backend_signal_a_running_statement`,
+    `test_idle_timeouts_end_the_session_with_a_fatal_error`,
+    `test_prepared_transaction_survives_a_restart`): same root, plus Windows
+    reporting a hard socket abort (10053) where the test expects a FATAL.
+  - `test_copy_fills_the_columns_it_omits_from_their_defaults` answers NULL
+    where the default is `67000` -- the only one NOT obviously signal-shaped,
+    so probe it on Linux before assuming it is platform-only.
+- [ ] **Rust PG server: `SELECT DISTINCT` is IGNORED** (measured 2026-09-20
+  against a local build, diffed against PostgreSQL 14.24). `select distinct s
+  from t` over rows `('a'), ('a'), ('b')` returns THREE rows, not two -- the
+  duplicates come straight through. `DISTINCT ON (...)` is ignored the same
+  way. Nothing errors, so a client just gets wrong rows. `distinct_clause` is
+  read in exactly ONE place in the whole workspace
+  (`secantus-pgplan/src/lib.rs`, the aggregate planner, where it raises
+  `Unsupported`); the plain select path never looks at it, so the flag is
+  dropped between parse and plan. Fix is either a real dedup (the row identity
+  wants `group_key_ident`, which already exists for GROUP BY) or, until then, a
+  faithful 0A000 -- silently returning duplicates is the one option the project
+  rules exclude.
+- [ ] **Rust PG server: UNION / INTERSECT / EXCEPT return one EMPTY row**
+  (measured 2026-09-20, same session). `select s from t union select s from t`
+  answers `[()]` -- a single row with no columns -- where PostgreSQL answers
+  the deduped rows; `union all`, `intersect` and `except` do the same. Again
+  silent, and again worse than an error.
 - [ ] **Rust PG server: a terminated victim can lose its 57P01** (CI pg-oracle
   lane, 2026-09-19, #1518's run; that PR does not touch the Rust PG server).
   `test_rust_pgserver_slice.py::test_pg_terminate_backend_across_connections`:

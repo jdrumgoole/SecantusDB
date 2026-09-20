@@ -20,6 +20,7 @@ import ipaddress
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -34,7 +35,16 @@ from psycopg.types.multirange import Multirange  # noqa: E402
 from psycopg.types.range import Range  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
-BINARY = REPO / "crates" / "secantus-pgserver" / "target" / "debug" / "secantusd-pg"
+# `.exe` on Windows, where the bare name never exists -- so every test in this
+# file (1,194 of them) skipped there even with the server built.
+BINARY = (
+    REPO
+    / "crates"
+    / "secantus-pgserver"
+    / "target"
+    / "debug"
+    / ("secantusd-pg.exe" if sys.platform == "win32" else "secantusd-pg")
+)
 
 pytestmark = pytest.mark.skipif(
     not BINARY.exists(),
@@ -9489,3 +9499,29 @@ def test_a_rolled_back_type_never_becomes_visible(home: Path) -> None:
         assert after.execute("SELECT typname FROM pg_type WHERE typname = 'ghost'").fetchall() == []
         with pytest.raises(psycopg.errors.Error):
             after.execute("SELECT 'x'::ghost")
+
+
+def test_group_by_a_numeric_groups_on_the_value(home: Path) -> None:
+    """A `numeric` carries its display scale, so `1.5` and `1.50` are different
+    Decimal128s and a value past 34 significant digits is a DOCUMENT holding
+    its text -- `1e40.0` and `1e40.00` differ there too. Grouping compared
+    those stored forms, so PostgreSQL's three groups came back as seven.
+
+    Expected values measured against PostgreSQL 14.24 (2026-09-20), including
+    the printed text: a group shows its FIRST row, and `sum` keeps the widest
+    scale of its inputs.
+    """
+    wide = "1234567890123456789012345678901234567890"
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table t (id int, v numeric)")
+        conn.execute(
+            "insert into t values "
+            f"(1, {wide}), (2, {wide}.0), (3, {wide}.00), "
+            "(4, 1.5), (5, 1.50), (6, 2), (7, 2.000)"
+        )
+        rows = conn.execute("select v, count(*), sum(v) from t group by v order by v").fetchall()
+    assert [(str(v), n, str(s)) for v, n, s in rows] == [
+        ("1.5", 2, "3.00"),
+        ("2", 2, "4.000"),
+        (wide, 3, str(int(wide) * 3) + ".00"),
+    ]

@@ -276,6 +276,26 @@ fn bson_i64(v: &Bson) -> Option<i64> {
     }
 }
 
+/// One element of a GROUP BY / DISTINCT key, reduced to the value PostgreSQL
+/// groups on.
+///
+/// A `numeric` carries its display scale: `1.5` and `1.50` are different
+/// Decimal128s, and past 34 significant digits the value is stored as a
+/// document holding its text, so `1e40.0` and `1e40.00` differ there too.
+/// PostgreSQL compares numerics by value and prints the group's first row, so
+/// the scale-free sort key is the identity to match on. Every other type keeps
+/// its own equality -- an integer column's values are already exact, and a
+/// `bool` must not meet a number.
+fn group_key_ident(v: &Option<Bson>) -> Option<Bson> {
+    let Some(b) = v else { return None };
+    if secantus_pgplan::numeric::is_numeric(b) {
+        if let Some(text) = secantus_pgplan::numeric::numeric_text(b) {
+            return Some(Bson::String(secantus_pgplan::numeric::numeric_sort_key(&text)));
+        }
+    }
+    Some(b.clone())
+}
+
 /// One row of `pg_database`: a database this server will accept a connection to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DatabaseInfo {
@@ -1868,6 +1888,7 @@ impl PgHandler {
         // Group, preserving first-seen order so output is deterministic
         // even with no ORDER BY.
         let mut keys: Vec<Vec<Option<Bson>>> = Vec::new();
+        let mut idents: Vec<Vec<Option<Bson>>> = Vec::new();
         let mut buckets: Vec<Vec<Document>> = Vec::new();
         if agg.group_by.is_empty() {
             keys.push(Vec::new());
@@ -1889,10 +1910,19 @@ impl PgHandler {
                         v => Some(v),
                     });
                 }
-                match keys.iter().position(|k| *k == key) {
+                // Match on the VALUE, not the stored form. A `numeric` keeps
+                // its PostgreSQL text -- its scale -- so `1.5` and `1.50` are
+                // different Decimal128s and `1e40.0` and `1e40.00` different
+                // documents, and a structural `==` put each in its own group
+                // where PostgreSQL has one (probed against 14.24, 2026-09-20).
+                // The DISPLAY key stays the first row's, which is the text
+                // PostgreSQL prints for the group.
+                let ident: Vec<Option<Bson>> = key.iter().map(group_key_ident).collect();
+                match idents.iter().position(|k| *k == ident) {
                     Some(i) => buckets[i].push(d),
                     None => {
                         keys.push(key);
+                        idents.push(ident);
                         buckets.push(vec![d]);
                     }
                 }
