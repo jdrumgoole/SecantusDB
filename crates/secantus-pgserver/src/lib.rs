@@ -267,6 +267,10 @@ struct RowEnv {
     cenc: ClientEncoding,
 }
 
+/// A row-producing statement's schema and rows -- what each side of a set
+/// operation contributes, and what `rows_with_schema` returns.
+type SchemaAndRows = (Vec<FieldInfo>, Vec<Vec<Option<Bson>>>);
+
 /// An integer sequence field, whichever BSON width it was written at.
 fn bson_i64(v: &Bson) -> Option<i64> {
     match v {
@@ -290,7 +294,9 @@ fn group_key_ident(v: &Option<Bson>) -> Option<Bson> {
     let Some(b) = v else { return None };
     if secantus_pgplan::numeric::is_numeric(b) {
         if let Some(text) = secantus_pgplan::numeric::numeric_text(b) {
-            return Some(Bson::String(secantus_pgplan::numeric::numeric_sort_key(&text)));
+            return Some(Bson::String(secantus_pgplan::numeric::numeric_sort_key(
+                &text,
+            )));
         }
     }
     Some(b.clone())
@@ -1976,6 +1982,32 @@ impl PgHandler {
                 }
                 Ordering::Equal
             });
+        }
+        // `SELECT DISTINCT` over an aggregate dedups the OUTPUT rows -- the
+        // select list, so two groups with the same count collapse into one --
+        // after grouping and before the ORDER BY, as PostgreSQL does.
+        if agg.distinct {
+            use secantus_pgplan::OutputCol;
+            let mut seen: Vec<Vec<Option<Bson>>> = Vec::new();
+            let mut kept = Vec::with_capacity(groups.len());
+            for (key, vals) in groups {
+                let ident: Vec<Option<Bson>> = agg
+                    .select
+                    .iter()
+                    .map(|(_, col)| {
+                        let v = match col {
+                            OutputCol::Group(i) => key.get(*i).cloned().flatten(),
+                            OutputCol::Agg(i) => vals.get(*i).cloned(),
+                        };
+                        group_key_ident(&v)
+                    })
+                    .collect();
+                if !seen.contains(&ident) {
+                    seen.push(ident);
+                    kept.push((key, vals));
+                }
+            }
+            groups = kept;
         }
         if agg.offset > 0 {
             let skip = usize::try_from(agg.offset).unwrap_or(usize::MAX);
@@ -7411,8 +7443,57 @@ impl PgHandler {
         // like the storage layer's own `maxTimeMS` polling.
         self.check_cancel()?;
 
+        // `SELECT DISTINCT` dedups on the OUTPUT row -- the select list after
+        // its casts, not the stored document, so `select distinct left(s, 1)`
+        // compares the computed value. The first row of each group survives,
+        // which is the one PostgreSQL prints when equal values are spelled
+        // differently (`1.5` and `1.50` are one value; probed 14.24).
+        // Before the sort, because PostgreSQL's answer keeps the input's
+        // first, and `ORDER BY` then orders what is left.
+        if sel.distinct == secantus_pgplan::Distinct::All {
+            let schema = self.row_schema(&def, &sel.columns, &sel.casts);
+            let tz = self.session_timezone();
+            let mut seen: Vec<Vec<Option<Bson>>> = Vec::new();
+            let mut kept = Vec::with_capacity(docs.len());
+            for d in docs {
+                let mut ident = Vec::with_capacity(sel.columns.len());
+                for (i, (_, field)) in sel.columns.iter().enumerate() {
+                    let v = resolve_cell(
+                        &d,
+                        field,
+                        sel.casts.get(i).and_then(|c| c.as_ref()),
+                        schema[i].datatype(),
+                        &tz,
+                    )?;
+                    ident.push(group_key_ident(&v));
+                }
+                if !seen.contains(&ident) {
+                    seen.push(ident);
+                    kept.push(d);
+                }
+            }
+            docs = kept;
+        }
+
         if !sel.order.is_empty() {
             sort_rows(&mut docs, &sel.order);
+        }
+        // `DISTINCT ON (keys)` keeps one row per key, the FIRST in the sort
+        // order -- which is why it runs after the sort and DISTINCT does not.
+        if let secantus_pgplan::Distinct::On(keys) = &sel.distinct {
+            let mut seen: Vec<Vec<Option<Bson>>> = Vec::new();
+            let mut kept = Vec::with_capacity(docs.len());
+            for d in docs {
+                let ident: Vec<Option<Bson>> = keys
+                    .iter()
+                    .map(|k| group_key_ident(&d.get(k).cloned()))
+                    .collect();
+                if !seen.contains(&ident) {
+                    seen.push(ident);
+                    kept.push(d);
+                }
+            }
+            docs = kept;
         }
         // OFFSET is applied before LIMIT, as PostgreSQL does.
         if sel.offset > 0 {
@@ -7433,6 +7514,330 @@ impl PgHandler {
         Ok((docs, def))
     }
 
+    /// Which of a set-operation side's columns are a bare constant NULL.
+    ///
+    /// PostgreSQL types an untyped NULL from the OTHER side: `select 1 union
+    /// select null` is `integer`, not an error (14.24). Our planner has
+    /// already given that column a concrete type -- `text`, which is what
+    /// PostgreSQL itself reports for a standalone `select null` -- so the
+    /// set operation has to recognise it again here.
+    fn null_constant_columns(stmt: &Statement) -> Vec<bool> {
+        match stmt {
+            Statement::SelectConstant(sc) => sc
+                .columns
+                .iter()
+                .map(|(_, col, ..)| matches!(col, secantus_pgplan::ConstCol::Value(Bson::Null)))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The result type of one set-operation column, or 42804.
+    ///
+    /// PostgreSQL unifies the two sides within a type CATEGORY and refuses
+    /// across categories -- `text UNION integer` is
+    /// `UNION types text and integer cannot be matched`, while `int4 UNION
+    /// int8` is `bigint` and `numeric UNION float8` is `double precision`
+    /// (all measured on 14.24, 2026-09-20). A NULL-typed side takes the
+    /// other's type.
+    ///
+    /// The numeric and datetime widenings are PostgreSQL's. For two DIFFERENT
+    /// string types it keeps the left's, where PostgreSQL's own choice is
+    /// quirky (`varchar UNION name` is `name`, `bpchar UNION text` is
+    /// `bpchar`); the VALUES are unaffected, only the reported type oid.
+    fn unify_set_op_type(kind: &str, left: &Type, right: &Type) -> PgWireResult<Type> {
+        if left == right {
+            return Ok(left.clone());
+        }
+        if *left == Type::UNKNOWN {
+            return Ok(right.clone());
+        }
+        if *right == Type::UNKNOWN {
+            return Ok(left.clone());
+        }
+        // (category, widening rank) -- a higher rank wins within a category.
+        let rank = |t: &Type| -> Option<(u8, u8)> {
+            Some(match *t {
+                Type::INT2 => (1, 1),
+                Type::INT4 => (1, 2),
+                Type::INT8 => (1, 3),
+                Type::NUMERIC => (1, 4),
+                Type::FLOAT4 => (1, 5),
+                Type::FLOAT8 => (1, 6),
+                Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => (2, 0),
+                Type::DATE => (3, 1),
+                Type::TIMESTAMP => (3, 2),
+                Type::TIMESTAMPTZ => (3, 3),
+                _ => return None,
+            })
+        };
+        match (rank(left), rank(right)) {
+            (Some((lc, lr)), Some((rc, rr))) if lc == rc => {
+                if lc == 2 {
+                    return Ok(left.clone());
+                }
+                Ok(if lr >= rr {
+                    left.clone()
+                } else {
+                    right.clone()
+                })
+            }
+            _ => Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "42804".into(), // datatype_mismatch
+                format!(
+                    "{kind} types {} and {} cannot be matched",
+                    secantus_pgplan::display_type(left.name()),
+                    secantus_pgplan::display_type(right.name()),
+                ),
+            )))),
+        }
+    }
+
+    /// The row description of a set operation, which PostgreSQL takes from the
+    /// LEFT side -- column names and types both.
+    ///
+    /// Separate from `describe_fields`, which plans from SQL and matches
+    /// inline: describing must not RUN either side, so this resolves the
+    /// shapes a set operation can be built from and refuses the rest.
+    fn set_op_fields(&self, stmt: &Statement) -> PgWireResult<Vec<FieldInfo>> {
+        match stmt {
+            Statement::Select(sel) => {
+                let def = match &sel.join {
+                    Some(join) => secantus_pgplan::join_output_def(join, &|n| self.lookup(n))
+                        .map_err(|e| Self::err(&e))?,
+                    None if sel.series.is_some() => {
+                        series_table_def(sel.series.as_ref().expect("checked"))
+                    }
+                    None => self
+                        .lookup(&sel.table)
+                        .ok_or_else(|| Self::err(&PlanError::UndefinedTable(sel.table.clone())))?,
+                };
+                Ok(self.row_schema(&def, &sel.columns, &sel.casts))
+            }
+            Statement::SelectConstant(sc) => Ok(sc
+                .columns
+                .iter()
+                .map(|(name, _, ty, typmod)| {
+                    let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
+                    self.field_mod(name.clone(), wire, *typmod)
+                })
+                .collect()),
+            Statement::ValuesConstant(vc) => Ok(vc
+                .names
+                .iter()
+                .zip(&vc.types)
+                .map(|(name, ty)| {
+                    let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
+                    self.field(name.clone(), wire)
+                })
+                .collect()),
+            Statement::SetOp(inner) => self.set_op_fields(&inner.left),
+            _ => Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "0A000".into(),
+                "this query is not supported on one side of a set operation".into(),
+            )))),
+        }
+    }
+
+    /// A row-producing statement as `(schema, rows)`: what a set operation
+    /// needs from each of its sides.
+    fn rows_with_schema(&self, stmt: &Statement) -> PgWireResult<SchemaAndRows> {
+        match stmt {
+            Statement::Select(sel) => {
+                let (docs, def) = self.select_docs(sel, 0)?;
+                let schema = self.row_schema(&def, &sel.columns, &sel.casts);
+                let tz = self.session_timezone();
+                let rows = docs
+                    .iter()
+                    .map(|d| {
+                        sel.columns
+                            .iter()
+                            .enumerate()
+                            .map(|(i, (_, field))| {
+                                resolve_cell(
+                                    d,
+                                    field,
+                                    sel.casts.get(i).and_then(|c| c.as_ref()),
+                                    schema[i].datatype(),
+                                    &tz,
+                                )
+                            })
+                            .collect::<PgWireResult<Vec<_>>>()
+                    })
+                    .collect::<PgWireResult<Vec<_>>>()?;
+                Ok((schema, rows))
+            }
+            Statement::SelectConstant(sc) => {
+                let schema = sc
+                    .columns
+                    .iter()
+                    .map(|(name, _, ty, typmod)| {
+                        let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
+                        self.field_mod(name.clone(), wire, *typmod)
+                    })
+                    .collect::<Vec<_>>();
+                let rows = self
+                    .const_rows(sc)?
+                    .into_iter()
+                    .map(|r| r.into_iter().map(Some).collect())
+                    .collect();
+                Ok((schema, rows))
+            }
+            Statement::ValuesConstant(vc) => {
+                let schema = vc
+                    .names
+                    .iter()
+                    .zip(&vc.types)
+                    .map(|(name, ty)| {
+                        let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
+                        self.field(name.clone(), wire)
+                    })
+                    .collect::<Vec<_>>();
+                let rows = vc
+                    .rows
+                    .iter()
+                    .map(|r| r.iter().map(|v| Some(v.clone())).collect())
+                    .collect();
+                Ok((schema, rows))
+            }
+            Statement::SetOp(set) => self.set_op_rows(set),
+            _ => Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "0A000".into(),
+                "this query is not supported on one side of a set operation".into(),
+            )))),
+        }
+    }
+
+    /// `UNION` / `INTERSECT` / `EXCEPT`: run both sides, combine, then apply
+    /// the ORDER BY / OFFSET / LIMIT that belong to the whole statement.
+    ///
+    /// Rows are matched by VALUE (`group_key_ident`), so `1.5` and `1.50` are
+    /// one row as PostgreSQL has it. `ALL` keeps duplicates, and for INTERSECT
+    /// / EXCEPT it keeps multiplicities -- `min(l, r)` and `l - r` copies.
+    fn set_op_rows(&self, set: &secantus_pgplan::SetOpSelect) -> PgWireResult<SchemaAndRows> {
+        let (left_schema, left) = self.rows_with_schema(&set.left)?;
+        let (right_schema, right) = self.rows_with_schema(&set.right)?;
+        let op = match set.kind {
+            secantus_pgplan::SetOpKind::Union => "UNION",
+            secantus_pgplan::SetOpKind::Intersect => "INTERSECT",
+            secantus_pgplan::SetOpKind::Except => "EXCEPT",
+        };
+        if left_schema.len() != right_schema.len() {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "42601".into(), // syntax_error
+                format!("each {op} query must have the same number of columns"),
+            ))));
+        }
+        // The column NAMES are the left side's; each TYPE is the two sides
+        // unified, which is also where mismatched types are refused.
+        let left_nulls = Self::null_constant_columns(&set.left);
+        let right_nulls = Self::null_constant_columns(&set.right);
+        let mut schema = Vec::with_capacity(left_schema.len());
+        for (i, (l, r)) in left_schema.iter().zip(&right_schema).enumerate() {
+            let ty = if right_nulls.get(i).copied().unwrap_or(false) {
+                l.datatype().clone()
+            } else if left_nulls.get(i).copied().unwrap_or(false) {
+                r.datatype().clone()
+            } else {
+                Self::unify_set_op_type(op, l.datatype(), r.datatype())?
+            };
+            schema.push(self.field(l.name().to_string(), ty));
+        }
+        let ident = |row: &Vec<Option<Bson>>| -> Vec<Option<Bson>> {
+            row.iter().map(group_key_ident).collect()
+        };
+        let mut out: Vec<Vec<Option<Bson>>> = Vec::new();
+        match set.kind {
+            secantus_pgplan::SetOpKind::Union => {
+                out.extend(left);
+                out.extend(right);
+            }
+            secantus_pgplan::SetOpKind::Intersect => {
+                let mut pool: Vec<Vec<Option<Bson>>> = right.iter().map(ident).collect();
+                for row in left {
+                    let k = ident(&row);
+                    if let Some(i) = pool.iter().position(|p| *p == k) {
+                        // ALL pairs each right-side row with one left-side row.
+                        if set.all {
+                            pool.remove(i);
+                        }
+                        out.push(row);
+                    }
+                }
+            }
+            secantus_pgplan::SetOpKind::Except => {
+                let mut pool: Vec<Vec<Option<Bson>>> = right.iter().map(ident).collect();
+                for row in left {
+                    let k = ident(&row);
+                    match pool.iter().position(|p| *p == k) {
+                        Some(i) if set.all => {
+                            pool.remove(i);
+                        }
+                        Some(_) => {}
+                        None => out.push(row),
+                    }
+                }
+            }
+        }
+        if !set.all {
+            let mut seen: Vec<Vec<Option<Bson>>> = Vec::new();
+            let mut kept = Vec::with_capacity(out.len());
+            for row in out {
+                let k = ident(&row);
+                if !seen.contains(&k) {
+                    seen.push(k);
+                    kept.push(row);
+                }
+            }
+            out = kept;
+        }
+        if !set.order.is_empty() {
+            out.sort_by(|a, b| {
+                for key in &set.order {
+                    let l = a.get(key.index).and_then(|v| v.as_ref());
+                    let r = b.get(key.index).and_then(|v| v.as_ref());
+                    let l_null = matches!(l, None | Some(Bson::Null));
+                    let r_null = matches!(r, None | Some(Bson::Null));
+                    let ord = match (l_null, r_null) {
+                        (true, true) => Ordering::Equal,
+                        (true, false) => match key.nulls {
+                            Nulls::First => Ordering::Less,
+                            Nulls::Last => Ordering::Greater,
+                        },
+                        (false, true) => match key.nulls {
+                            Nulls::First => Ordering::Greater,
+                            Nulls::Last => Ordering::Less,
+                        },
+                        (false, false) => {
+                            let cmp = compare_values(l.expect("not null"), r.expect("not null"));
+                            if key.ascending {
+                                cmp
+                            } else {
+                                cmp.reverse()
+                            }
+                        }
+                    };
+                    if ord != Ordering::Equal {
+                        return ord;
+                    }
+                }
+                Ordering::Equal
+            });
+        }
+        if set.offset > 0 {
+            let skip = usize::try_from(set.offset).unwrap_or(usize::MAX);
+            out = out.into_iter().skip(skip).collect();
+        }
+        if let Some(limit) = set.limit {
+            out.truncate(usize::try_from(limit.max(0)).unwrap_or(usize::MAX));
+        }
+        Ok((schema, out))
+    }
+
     /// Every row of a row-producing statement as resolved values, in output
     /// column order. This is `COPY (query) TO STDOUT` and `INSERT ... SELECT`
     /// reading a query the same way the wire encoder does, casts and
@@ -7450,6 +7855,7 @@ impl PgHandler {
                 .iter()
                 .map(|r| r.iter().map(|v| Some(v.clone())).collect())
                 .collect()),
+            Statement::SetOp(set) => Ok(self.set_op_rows(set)?.1),
             Statement::Select(sel) => {
                 let (docs, def) = self.select_docs(sel, 0)?;
                 let schema = self.row_schema(&def, &sel.columns, &sel.casts);
@@ -8014,6 +8420,31 @@ impl PgHandler {
                         Ok(vec![Response::Query(response)])
                     }
                 }
+            }
+
+            Statement::SetOp(set) => {
+                let (fields, mut values) = self.set_op_rows(&set)?;
+                // `Execute` may cap rows independently of any SQL LIMIT.
+                if max_rows > 0 {
+                    values.truncate(max_rows);
+                }
+                let schema = Arc::new(fields);
+                let schema_ref = schema.clone();
+                let rows = stream::iter(values).map(move |vals| {
+                    let mut enc = DataRowEncoder::new(schema_ref.clone());
+                    for (i, v) in vals.iter().enumerate() {
+                        encode_field_value(
+                            &mut enc,
+                            &schema_ref[i],
+                            v.as_ref(),
+                            &row_tz,
+                            &row_ds,
+                            row_cenc,
+                        )?;
+                    }
+                    Ok(enc.take_row())
+                });
+                Ok(vec![Response::Query(QueryResponse::new(schema, rows))])
             }
 
             Statement::Select(sel) => {
@@ -11765,13 +12196,29 @@ fn compute_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
         // count(*)
         return Bson::Int64(rows.len() as i64);
     };
-    let values: Vec<&Bson> = rows
+    let mut values: Vec<&Bson> = rows
         .iter()
         .filter_map(|d| match d.get(field) {
             None | Some(Bson::Null) => None,
             Some(v) => Some(v),
         })
         .collect();
+    // `count(DISTINCT col)` -- PostgreSQL dedups the group's values, NULLs
+    // already dropped, before the function sees them. By VALUE, so a numeric
+    // spelled `1.5` and `1.50` counts once.
+    if item.distinct {
+        let mut seen: Vec<Option<Bson>> = Vec::new();
+        let mut kept = Vec::with_capacity(values.len());
+        for v in values {
+            let k = group_key_ident(&Some(v.clone()));
+            if !seen.contains(&k) {
+                seen.push(k);
+                kept.push(v);
+            }
+        }
+        values = kept;
+    }
+    let values = values;
 
     match item.func {
         AggFunc::CountStar => Bson::Int64(rows.len() as i64),
@@ -11779,6 +12226,31 @@ fn compute_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
         // Group order, NULLs INCLUDED -- a LEFT-JOIN miss surfaces as `[None]`
         // rather than `[]`, which is what psycopg's EnumInfo distinguishes a
         // non-enum by.
+        // `array_agg(DISTINCT x)` is the one aggregate whose DISTINCT keeps
+        // NULL -- it is a value here, not something to skip -- and PostgreSQL
+        // returns the deduped values SORTED, NULLs last, rather than in group
+        // order (measured on 14.24: `c,a,b,a,NULL` -> `a,b,c,NULL`).
+        AggFunc::ArrayAgg if item.distinct => {
+            let mut seen: Vec<Option<Bson>> = Vec::new();
+            let mut kept: Vec<Bson> = Vec::new();
+            for d in rows {
+                let v = d.get(field).cloned().unwrap_or(Bson::Null);
+                let k = group_key_ident(&Some(v.clone()));
+                if !seen.contains(&k) {
+                    seen.push(k);
+                    kept.push(v);
+                }
+            }
+            kept.sort_by(
+                |a, b| match (matches!(a, Bson::Null), matches!(b, Bson::Null)) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => Ordering::Greater,
+                    (false, true) => Ordering::Less,
+                    (false, false) => compare_values(a, b),
+                },
+            );
+            Bson::Array(kept)
+        }
         AggFunc::ArrayAgg => Bson::Array(
             rows.iter()
                 .map(|d| d.get(field).cloned().unwrap_or(Bson::Null))
@@ -13571,6 +14043,9 @@ impl PgHandler {
                     self.field(out.clone(), ty)
                 })
                 .collect::<Vec<_>>(),
+            // The output columns of a set operation are the LEFT side's, as
+            // PostgreSQL has it -- names and types both.
+            Statement::SetOp(set) => self.set_op_fields(&set.left)?,
             Statement::Select(sel) => {
                 let def = match &sel.join {
                     Some(join) => secantus_pgplan::join_output_def(join, &|n| self.lookup(n))

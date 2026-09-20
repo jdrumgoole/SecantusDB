@@ -10224,6 +10224,34 @@ shared storage engine or building large new protocol subsystems:
   Separately, the same query failed with 0A000 on its 7th run under psycopg's
   auto-prepare (Describe typed `pg_sleep` as text, Execute as void). That is
   fixed in #1514 and is not this flake: pgx does not revalidate the plan.
+- [ ] **Rust PG server: `ORDER BY <position>` over a GROUPED aggregate is
+  0A000** (measured 2026-09-20, and PRE-EXISTING -- it fails with or without
+  DISTINCT, so it is not a regression from that work). `select count(*) from t
+  group by g order by 1` is refused where PostgreSQL answers the counts;
+  `order by g` (a grouping column) works. The aggregate planner resolves an
+  ORDER BY term against the table's columns, and a position refers to the
+  OUTPUT list, which for an aggregate is a mix of group keys and aggregate
+  results. `AggOrderKey` would need to name an output column the way
+  `SetOpOrder` now does.
+- [ ] **Rust PG server: `DISTINCT ON` over an aggregate is 0A000**
+  (2026-09-20). `select distinct on (g) g, count(*) from t group by g` is
+  refused -- honestly, with `DISTINCT ON with an aggregate` -- because the
+  keys would have to resolve against the GROUP BY output rather than the
+  table. Plain `SELECT DISTINCT` over an aggregate IS supported.
+- [ ] **Rust PG server: two set-operation type rules still differ from
+  PostgreSQL** (2026-09-20, after DISTINCT and the set operations landed;
+  every other differential case matches 14.24). Both concern the reported
+  TYPE, never the rows:
+  - Two DIFFERENT string types keep the LEFT side's type, where PostgreSQL's
+    own choice is quirky and not first-wins: `varchar UNION name` is `name`,
+    `bpchar UNION text` is `bpchar` (measured). Every string type encodes the
+    same on the wire, so this is the reported oid only.
+  - An explicitly cast NULL (`select null::text union select 1`) is accepted
+    where PostgreSQL raises 42804. The planner records a bare `null` and
+    `null::text` identically -- a `ConstCol::Value(Bson::Null)` typed `text`
+    -- and the set operation treats a constant NULL column as untyped so that
+    `select 1 union select null` answers `integer`, as PostgreSQL does.
+    Telling the two apart needs the cast to survive planning.
 - [ ] **Rust PG server slice tests: 9 fail on a Windows dev box** (measured
   2026-09-20, the first time they have ever RUN there -- `BINARY` in
   `tests/test_rust_pgserver_slice.py` lacked the `.exe` suffix, so all 1,194
@@ -10247,23 +10275,6 @@ shared storage engine or building large new protocol subsystems:
   - `test_copy_fills_the_columns_it_omits_from_their_defaults` answers NULL
     where the default is `67000` -- the only one NOT obviously signal-shaped,
     so probe it on Linux before assuming it is platform-only.
-- [ ] **Rust PG server: `SELECT DISTINCT` is IGNORED** (measured 2026-09-20
-  against a local build, diffed against PostgreSQL 14.24). `select distinct s
-  from t` over rows `('a'), ('a'), ('b')` returns THREE rows, not two -- the
-  duplicates come straight through. `DISTINCT ON (...)` is ignored the same
-  way. Nothing errors, so a client just gets wrong rows. `distinct_clause` is
-  read in exactly ONE place in the whole workspace
-  (`secantus-pgplan/src/lib.rs`, the aggregate planner, where it raises
-  `Unsupported`); the plain select path never looks at it, so the flag is
-  dropped between parse and plan. Fix is either a real dedup (the row identity
-  wants `group_key_ident`, which already exists for GROUP BY) or, until then, a
-  faithful 0A000 -- silently returning duplicates is the one option the project
-  rules exclude.
-- [ ] **Rust PG server: UNION / INTERSECT / EXCEPT return one EMPTY row**
-  (measured 2026-09-20, same session). `select s from t union select s from t`
-  answers `[()]` -- a single row with no columns -- where PostgreSQL answers
-  the deduped rows; `union all`, `intersect` and `except` do the same. Again
-  silent, and again worse than an error.
 - [ ] **Rust PG server: a terminated victim can lose its 57P01** (CI pg-oracle
   lane, 2026-09-19, #1518's run; that PR does not touch the Rust PG server).
   `test_rust_pgserver_slice.py::test_pg_terminate_backend_across_connections`:

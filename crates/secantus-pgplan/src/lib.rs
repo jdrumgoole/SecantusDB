@@ -233,6 +233,8 @@ pub enum Statement {
     CreateTable(TableDef, bool),
     Insert(Insert),
     Select(Select),
+    /// `UNION` / `INTERSECT` / `EXCEPT`.
+    SetOp(SetOpSelect),
     SelectConstant(SelectConstant),
     /// A bare `VALUES (...), (...)` query -- a fixed set of literal rows with no
     /// FROM. `SelectConstant` is its single-row cousin; this is what a
@@ -536,6 +538,68 @@ pub struct OrderKey {
     pub nulls: Nulls,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Distinct {
+    /// No DISTINCT: every row is its own.
+    #[default]
+    None,
+    /// `SELECT DISTINCT` -- dedup on the whole output row.
+    All,
+    /// `SELECT DISTINCT ON (a, b)` -- one row per key, the first in ORDER BY
+    /// order, which is why it is applied AFTER the sort.
+    On(Vec<String>),
+}
+
+/// `UNION` / `INTERSECT` / `EXCEPT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOpKind {
+    Union,
+    Intersect,
+    Except,
+}
+
+/// `<query> UNION|INTERSECT|EXCEPT [ALL] <query>`, with the ORDER BY / LIMIT
+/// that belong to the whole thing.
+///
+/// Planned as a statement of its own because the two sides are separate
+/// queries: each is planned and run on its own, and the rows are combined
+/// afterwards. Before 2026-09-20 a set operation was not recognised at all --
+/// the outer statement has an empty FROM, so it fell through to the constant
+/// planner and answered one empty row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetOpSelect {
+    pub left: Box<Statement>,
+    pub right: Box<Statement>,
+    pub kind: SetOpKind,
+    /// `ALL` keeps duplicates (and multiplicities, for INTERSECT / EXCEPT).
+    pub all: bool,
+    /// ORDER BY over the OUTPUT columns, by position in the select list.
+    pub order: Vec<SetOpOrder>,
+    pub limit: Option<i64>,
+    pub offset: i64,
+}
+
+impl SetOpSelect {
+    /// The output column names -- the left side's, as PostgreSQL has it.
+    pub fn output_names(&self) -> Vec<String> {
+        match self.left.as_ref() {
+            Statement::Select(sel) => sel.columns.iter().map(|(out, _)| out.clone()).collect(),
+            Statement::SelectConstant(sc) => sc.columns.iter().map(|(n, ..)| n.clone()).collect(),
+            Statement::ValuesConstant(vc) => vc.names.clone(),
+            Statement::SetOp(inner) => inner.output_names(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// One ORDER BY term of a set operation, as an index into the output row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetOpOrder {
+    pub index: usize,
+    pub ascending: bool,
+    pub nulls: Nulls,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
     pub table: String,
@@ -562,6 +626,11 @@ pub struct Select {
     /// `None` = no LIMIT. `LIMIT 0` is a real limit, not an absent one.
     pub limit: Option<i64>,
     pub offset: i64,
+    /// `SELECT DISTINCT` / `DISTINCT ON (...)`. Dropped on the floor before
+    /// 2026-09-20: the clause was read in one place (the aggregate planner,
+    /// which refuses it) and nowhere else, so a plain `SELECT DISTINCT`
+    /// returned its duplicates.
+    pub distinct: Distinct,
 }
 
 /// `generate_series(start, stop [, step])`, the only set-returning function
@@ -628,6 +697,10 @@ pub struct AggItem {
     /// `sum(n * 2)` -- evaluated per row into `field` (a hidden `__aggN`
     /// slot) before the group is computed. `None` for a bare column.
     pub expr: Option<ColumnExpr>,
+    /// `count(DISTINCT col)` and friends: the group's values are deduped
+    /// before the function runs. `count(DISTINCT)` is by far the common one,
+    /// but PostgreSQL allows it on any aggregate.
+    pub distinct: bool,
 }
 
 /// One output column of an aggregate query, by POSITION.
@@ -686,6 +759,10 @@ pub struct Aggregate {
     pub order: Vec<AggOrderKey>,
     pub limit: Option<i64>,
     pub offset: i64,
+    /// `SELECT DISTINCT count(*) ...` -- dedup on the aggregate's OUTPUT rows,
+    /// after grouping and before the ORDER BY. `DISTINCT ON` over an aggregate
+    /// is still refused rather than approximated.
+    pub distinct: bool,
 }
 
 /// A column reference as `(alias, column)`.
@@ -2894,6 +2971,13 @@ fn plan_series_select(
             _ => return Err(Error::Unsupported("this OFFSET".into())),
         },
     };
+    let distinct = plan_distinct(s, &|name| {
+        columns
+            .iter()
+            .find(|(out, _)| out == name)
+            .map(|(_, f)| f.clone())
+    })?;
+
     Ok(Statement::Select(Select {
         table: String::new(),
         series: Some(series),
@@ -2904,6 +2988,7 @@ fn plan_series_select(
         order,
         limit,
         offset,
+        distinct,
     }))
 }
 
@@ -3438,11 +3523,171 @@ fn sample_value_for_type(pg_type: &str) -> Bson {
     }
 }
 
+/// `SELECT DISTINCT` / `SELECT DISTINCT ON (...)` from a parsed select.
+///
+/// PostgreSQL spells a plain `DISTINCT` as a one-element `distinctClause`
+/// whose element is a NULL node; `DISTINCT ON (...)` carries the key
+/// expressions. Each key resolves to a stored field, the same way an ORDER BY
+/// column does -- anything else is refused rather than ignored, because
+/// dropping the clause silently returns duplicate rows.
+fn plan_distinct(
+    s: &pg_query::protobuf::SelectStmt,
+    resolve: &dyn Fn(&str) -> Option<String>,
+) -> Result<Distinct> {
+    if s.distinct_clause.is_empty() {
+        return Ok(Distinct::None);
+    }
+    if s.distinct_clause.len() == 1 && s.distinct_clause[0].node.is_none() {
+        return Ok(Distinct::All);
+    }
+    let mut keys = Vec::with_capacity(s.distinct_clause.len());
+    for item in &s.distinct_clause {
+        let Some(N::ColumnRef(c)) = item.node.as_ref() else {
+            return Err(Error::Unsupported("DISTINCT ON over an expression".into()));
+        };
+        let name =
+            column_ref_name(c).ok_or_else(|| Error::Unsupported("this DISTINCT ON key".into()))?;
+        let field = resolve(&name).ok_or_else(|| Error::UndefinedColumn(name.clone()))?;
+        keys.push(field);
+    }
+    Ok(Distinct::On(keys))
+}
+
+/// `<query> UNION|INTERSECT|EXCEPT [ALL] <query>`.
+///
+/// Each side is planned on its own; the ORDER BY / LIMIT / OFFSET on the
+/// outer statement belong to the combined result, and its sort terms name
+/// OUTPUT columns, which are the left side's.
+fn plan_set_operation(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Result<Statement> {
+    use pg_query::protobuf::SetOperation;
+
+    let kind = match SetOperation::try_from(s.op) {
+        Ok(SetOperation::SetopUnion) => SetOpKind::Union,
+        Ok(SetOperation::SetopIntersect) => SetOpKind::Intersect,
+        Ok(SetOperation::SetopExcept) => SetOpKind::Except,
+        _ => return Err(Error::Unsupported("this set operation".into())),
+    };
+    let (Some(larg), Some(rarg)) = (s.larg.as_ref(), s.rarg.as_ref()) else {
+        return Err(Error::Parse("a set operation without both sides".into()));
+    };
+    let left = plan_select(larg, lookup, params)?;
+    let right = plan_select(rarg, lookup, params)?;
+
+    // The output columns are the left side's, so an ORDER BY term resolves
+    // against them -- by position (`ORDER BY 1`) or by output name.
+    let names: Vec<String> = match &left {
+        Statement::Select(sel) => sel.columns.iter().map(|(out, _)| out.clone()).collect(),
+        Statement::SelectConstant(sc) => sc.columns.iter().map(|(n, ..)| n.clone()).collect(),
+        Statement::ValuesConstant(vc) => vc.names.clone(),
+        Statement::SetOp(inner) => inner.output_names(),
+        _ => Vec::new(),
+    };
+    let mut order = Vec::new();
+    for item in &s.sort_clause {
+        let Some(N::SortBy(sb)) = item.node.as_ref() else {
+            return Err(Error::Unsupported("this ORDER BY item".into()));
+        };
+        let index = match sb.node.as_ref().and_then(|n| n.node.as_ref()) {
+            Some(N::AConst(c)) => {
+                let Some(a_const::Val::Ival(v)) = c.val.as_ref() else {
+                    return Err(Error::Unsupported("ORDER BY over an expression".into()));
+                };
+                usize::try_from(v.ival)
+                    .ok()
+                    .filter(|n| *n >= 1 && *n <= names.len().max(1))
+                    .map(|n| n - 1)
+                    .ok_or_else(|| {
+                        Error::InvalidColumnReference(format!(
+                            "ORDER BY position {} is not in select list",
+                            v.ival
+                        ))
+                    })?
+            }
+            Some(N::ColumnRef(c)) => {
+                let col = column_ref_name(c)
+                    .ok_or_else(|| Error::Unsupported("this ORDER BY expression".into()))?;
+                names
+                    .iter()
+                    .position(|n| *n == col)
+                    .ok_or_else(|| Error::UndefinedColumn(col.clone()))?
+            }
+            _ => return Err(Error::Unsupported("ORDER BY over an expression".into())),
+        };
+        let ascending = match SortByDir::try_from(sb.sortby_dir) {
+            Ok(SortByDir::SortbyDesc) => false,
+            Ok(SortByDir::SortbyDefault | SortByDir::SortbyAsc) => true,
+            _ => return Err(Error::Unsupported("ORDER BY ... USING".into())),
+        };
+        let nulls = match SortByNulls::try_from(sb.sortby_nulls) {
+            Ok(SortByNulls::SortbyNullsFirst) => Nulls::First,
+            Ok(SortByNulls::SortbyNullsLast) => Nulls::Last,
+            _ if ascending => Nulls::Last,
+            _ => Nulls::First,
+        };
+        order.push(SetOpOrder {
+            index,
+            ascending,
+            nulls,
+        });
+    }
+    let limit = match s.limit_count.as_ref() {
+        None => None,
+        Some(n) => match const_value(n, params)? {
+            Bson::Int32(v) => Some(i64::from(v)),
+            Bson::Int64(v) => Some(v),
+            Bson::Null => None,
+            _ => return Err(Error::Unsupported("this LIMIT".into())),
+        },
+    };
+    let offset = match s.limit_offset.as_ref() {
+        None => 0,
+        Some(n) => match const_value(n, params)? {
+            Bson::Int32(v) => i64::from(v),
+            Bson::Int64(v) => v,
+            Bson::Null => 0,
+            _ => return Err(Error::Unsupported("this OFFSET".into())),
+        },
+    };
+
+    Ok(Statement::SetOp(SetOpSelect {
+        left: Box::new(left),
+        right: Box::new(right),
+        kind,
+        all: s.all,
+        order,
+        limit,
+        offset,
+    }))
+}
+
+/// `SELECT DISTINCT` over an aggregate: true for a plain DISTINCT.
+///
+/// `DISTINCT ON (...)` needs its keys to resolve against the GROUP BY output
+/// rather than the table, which this slice does not do -- so it is refused as
+/// unsupported. Resolving it against the table instead reported the key as an
+/// undefined column, which is a different and misleading answer.
+fn aggregate_distinct(s: &pg_query::protobuf::SelectStmt) -> Result<bool> {
+    if s.distinct_clause.is_empty() {
+        return Ok(false);
+    }
+    if s.distinct_clause.len() == 1 && s.distinct_clause[0].node.is_none() {
+        return Ok(true);
+    }
+    Err(Error::Unsupported("DISTINCT ON with an aggregate".into()))
+}
+
 fn plan_select(
     s: &pg_query::protobuf::SelectStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &[Bson],
 ) -> Result<Statement> {
+    if s.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
+        return plan_set_operation(s, lookup, params);
+    }
     if s.from_clause.is_empty() {
         return plan_select_constant(s, params);
     }
@@ -3563,6 +3808,8 @@ fn plan_select(
         },
     };
 
+    let distinct = plan_distinct(s, &|name| def.field_of(name))?;
+
     Ok(Statement::Select(Select {
         series: None,
         join: None,
@@ -3573,6 +3820,7 @@ fn plan_select(
         order,
         limit,
         offset,
+        distinct,
     }))
 }
 
@@ -3606,9 +3854,6 @@ fn plan_aggregate(
         let join = plan_join_select(inner, lookup, params)?;
         let def = join_output_def(&join, lookup)?;
         return finish_aggregate(s, String::new(), Some(Box::new(join)), def, params);
-    }
-    if !s.distinct_clause.is_empty() {
-        return Err(Error::Unsupported("DISTINCT with an aggregate".into()));
     }
     // An aggregate over a generated source. Only the ungrouped forms are
     // supported: there is one column, so grouping by it would make each row its
@@ -3663,6 +3908,7 @@ fn plan_aggregate(
                 // `min`/`max` return the input type, which here is always int4.
                 source_type: Some("int4".to_string()),
                 expr: None,
+                distinct: false,
             });
         }
         // The WHERE clause was silently dropped here before: `count(*)
@@ -3679,6 +3925,7 @@ fn plan_aggregate(
             order: Vec::new(),
             limit: None,
             offset: 0,
+            distinct: aggregate_distinct(s)?,
         }));
     }
     let table = match s.from_clause[0].node.as_ref() {
@@ -3726,6 +3973,13 @@ fn plan_join_plain_select(
             _ => return Err(Error::Unsupported("this OFFSET".into())),
         },
     };
+    let distinct = plan_distinct(s, &|name| {
+        columns
+            .iter()
+            .find(|(out, _)| out == name)
+            .map(|(_, f)| f.clone())
+    })?;
+
     Ok(Statement::Select(Select {
         table: String::new(),
         series: None,
@@ -3736,6 +3990,7 @@ fn plan_join_plain_select(
         order: Vec::new(),
         limit,
         offset,
+        distinct,
     }))
 }
 
@@ -4314,9 +4569,6 @@ fn finish_aggregate(
         match rt.val.as_ref().and_then(|v| v.node.as_ref()) {
             Some(N::FuncCall(f)) if is_aggregate_call(f) => {
                 let name = func_name(f).unwrap_or_default();
-                if f.agg_distinct {
-                    return Err(Error::Unsupported("DISTINCT inside an aggregate".into()));
-                }
                 if f.agg_filter.is_some() {
                     return Err(Error::Unsupported("FILTER on an aggregate".into()));
                 }
@@ -4367,6 +4619,7 @@ fn finish_aggregate(
                                 out,
                                 source_type: Some(pg_type),
                                 expr: Some(expr),
+                                distinct: f.agg_distinct,
                             });
                             continue;
                         }
@@ -4393,6 +4646,7 @@ fn finish_aggregate(
                     out,
                     source_type,
                     expr: None,
+                    distinct: f.agg_distinct,
                 });
             }
             Some(N::ColumnRef(c)) => {
@@ -4562,6 +4816,7 @@ fn finish_aggregate(
         order,
         limit,
         offset,
+        distinct: aggregate_distinct(s)?,
     }))
 }
 
@@ -5175,6 +5430,7 @@ fn plan_select_srf(
         order,
         limit,
         offset,
+        distinct: plan_distinct(s, &|_| None)?,
     })))
 }
 

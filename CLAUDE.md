@@ -298,10 +298,16 @@ one request path:
     wrong number would have stood.) This is the same rule the pinned-worktree
     requirement already imposes on *timing* runs, applied to every other number:
     gauge rates, validation reports, benchmark tables.
-  - Not there yet: `CREATE INDEX` (refused outright), password verification (a
-    role's SCRAM verifier is stored and never checked — a wrong password and no
-    password both connect, re-probed 2026-09-18), and a column-level `UNIQUE`
-    that is accepted without being enforced.
+  - Not there yet: `CREATE INDEX` (refused outright, 0A000) and password
+    verification (a role's SCRAM verifier is stored and never checked — a wrong
+    password and no password both connect, re-probed 2026-09-18).
+    **`UNIQUE` IS enforced** — the earlier claim that it was "accepted without
+    being enforced" was stale when measured against PostgreSQL 14.24 on
+    2026-09-20: a duplicate on a column-level or table-level `UNIQUE` raises
+    23505 on INSERT *and* on UPDATE, and several NULLs coexist, exactly as
+    PostgreSQL has it. `DISTINCT`, `DISTINCT ON`, `count(DISTINCT ...)` and
+    `UNION` / `INTERSECT` / `EXCEPT` were genuinely missing until 2026-09-20
+    and are now implemented.
   - Builds from **its own directory** (`cd crates/secantus-pgserver && cargo build
     --release`), because it links WiredTiger and is excluded from the clean
     workspace. `./inv rust-pgserver-build` (the task lives in `rust_tasks.py`, not
