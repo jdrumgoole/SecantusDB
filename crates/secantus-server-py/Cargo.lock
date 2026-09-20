@@ -1829,14 +1829,14 @@ dependencies = [
 
 [[package]]
 name = "secantus-pgcatalog"
-version = "0.1.0-beta.0"
+version = "0.1.0-beta.2"
 dependencies = [
  "bson",
 ]
 
 [[package]]
 name = "secantus-pgplan"
-version = "0.1.0-beta.0"
+version = "0.1.0-beta.2"
 dependencies = [
  "bson",
  "chrono",
@@ -1850,7 +1850,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-pgserver"
-version = "0.1.0-beta.0"
+version = "0.1.0-beta.2"
 dependencies = [
  "async-trait",
  "bson",
