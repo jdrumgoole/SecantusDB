@@ -9858,3 +9858,33 @@ def test_a_declared_width_survives_the_hand_off_to_the_other_server(home: Path) 
         cur = conn.execute("select c from c")
         assert cur.fetchall() == [("ab  ",)]
         assert (cur.description[0].type_code, cur.description[0].display_size) == (1042, 4)
+
+
+def test_sum_result_types(home: Path) -> None:
+    """`sum()`'s result type is PostgreSQL's, which is not a uniform widening.
+
+    Everything but a numeric was described as `int8`, so `sum(f)` over a
+    `float8` column declared an integer and sent `1.5` -- psycopg raised
+    `invalid literal for int() with base 10: '1.5'` rather than returning a
+    number. The oids below are PostgreSQL 14.24's: int2/int4 sum as bigint,
+    int8 as NUMERIC, and a float sums as itself.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute(
+            "create table a (id int primary key, s2 int2, s4 int4, s8 int8,"
+            " f4 float4, f8 float8, nu numeric)"
+        )
+        conn.execute("insert into a values (1,1,1,1,1.5,1.5,1.5),(2,2,2,2,2.5,2.5,2.5)")
+        for col, oid in [
+            ("s2", 20),
+            ("s4", 20),
+            ("s8", 1700),
+            ("f4", 700),
+            ("f8", 701),
+            ("nu", 1700),
+        ]:
+            cur = conn.execute(f"select sum({col}) from a")
+            rows = cur.fetchall()
+            assert cur.description[0].type_code == oid, f"sum({col})"
+            assert rows[0][0] is not None
+        assert conn.execute("select sum(f8) from a").fetchall() == [(4.0,)]
