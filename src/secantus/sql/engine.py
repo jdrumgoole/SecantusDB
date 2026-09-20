@@ -4944,19 +4944,30 @@ def _function_params(udf: exp.Expression) -> list[str | None]:
     return names
 
 
+def _param_mode(p: exp.Expression) -> str:
+    """A parameter's ``pg_proc.proargmodes`` code: ``i`` IN, ``o`` OUT, ``b``
+    INOUT. An unannotated parameter is IN, which is what PostgreSQL assumes."""
+    for c in p.args.get("constraints") or [] if isinstance(p, exp.ColumnDef) else []:
+        if isinstance(c, exp.InOutColumnConstraint):
+            inp = bool(c.args.get("input_"))
+            out = bool(c.args.get("output"))
+            if inp and out:
+                return "b"
+            if out:
+                return "o"
+    return "i"
+
+
+def _function_param_modes(udf: exp.Expression) -> list[str]:
+    """Per-parameter ``proargmodes`` codes, positional."""
+    return [_param_mode(p) for p in udf.expressions or []]
+
+
 def _function_input_nargs(udf: exp.Expression) -> int:
     """The number of INPUT parameters (IN / INOUT / VARIADIC) — PG's function
     identity excludes OUT-only parameters, so ``f3(IN a int, INOUT b varchar,
     OUT c timestamptz)`` is ``f3(int, varchar)`` to DROP FUNCTION and callers."""
-    n = 0
-    for p in udf.expressions or []:
-        out_only = False
-        for c in p.args.get("constraints") or [] if isinstance(p, exp.ColumnDef) else []:
-            if isinstance(c, exp.InOutColumnConstraint):
-                out_only = bool(c.args.get("output")) and not bool(c.args.get("input_"))
-        if not out_only:
-            n += 1
-    return n
+    return sum(1 for p in udf.expressions or [] if _param_mode(p) != "o")
 
 
 def _function_param_types(udf: exp.Expression) -> list[str | None]:
@@ -5059,12 +5070,37 @@ def _create_function(
     # (measured 2026-09-19). Mirror of the parameter-side gap.
     return_decl_oid = None
     is_table = False
+    table_columns: list[dict] = []
+    return_type_name: str | None = None
     returns_trigger = False
     for prop in stmt.args.get("properties").expressions if stmt.args.get("properties") else []:
         if isinstance(prop, exp.LanguageProperty):
             language = str(prop.this.name if hasattr(prop.this, "name") else prop.this).lower()
         elif isinstance(prop, exp.ReturnsProperty):
             is_table = bool(prop.args.get("is_table"))
+            if is_table and isinstance(prop.this, exp.Schema):
+                # `RETURNS TABLE (i int, ...)`: PostgreSQL records each output
+                # column as a `t`-mode entry in proargmodes / proallargtypes /
+                # proargnames, and prorettype is the single column's type (or
+                # `record` for several). Measured 2026-09-20.
+                for col in prop.this.expressions or []:
+                    if not isinstance(col, exp.ColumnDef):
+                        continue
+                    kind_dt = col.args.get("kind")
+                    ident = (
+                        typemap.cast_type_identity(kind_dt)
+                        if isinstance(kind_dt, exp.DataType)
+                        else None
+                    )
+                    table_columns.append(
+                        {
+                            "name": col.this.name,
+                            "type_tag": typemap.type_tag_for_sql(kind_dt)
+                            if isinstance(kind_dt, exp.DataType)
+                            else None,
+                            "decl_oid": ident[0] if ident is not None else None,
+                        }
+                    )
             if isinstance(prop.this, exp.DataType):
                 kind = prop.this.args.get("kind")
                 if (
@@ -5079,6 +5115,26 @@ def _create_function(
                     return_tag = typemap.type_tag_for_sql(prop.this)
                     ident = typemap.cast_type_identity(prop.this)
                     return_decl_oid = ident[0] if ident is not None else None
+                    if (
+                        return_tag is None
+                        and prop.this.this == exp.DataType.Type.USERDEFINED
+                        and isinstance(kind, exp.Identifier)
+                    ):
+                        # `RETURNS <composite>` / `RETURNS <table>` names a
+                        # user type, which has no storage tag — so prorettype
+                        # read 2278 (void). The NAME is recorded here and
+                        # resolved to the type's oid at reflection time, where
+                        # the catalog is in scope (PostgreSQL 14 reports the
+                        # composite's own oid, measured 2026-09-20).
+                        #
+                        # The `return_tag is None` guard is load-bearing: a
+                        # first version claimed every USERDEFINED name, and
+                        # sqlglot parses `RETURNS refcursor` that way too even
+                        # though `type_tag_for_sql` resolves it perfectly well.
+                        # That dropped refcursor's tag and made `SELECT
+                        # getref()` describe its column as text (25) instead of
+                        # refcursor (1790).
+                        return_type_name = kind.name
 
     if language == "c" and stmt.this.this.name.lower() == "lo_manage":
         # contrib/lo's orphan-cleanup trigger function, created verbatim by
@@ -5114,6 +5170,9 @@ def _create_function(
             "params": params,
             "param_types": _function_param_types(udf),
             "param_decl_oids": _function_param_decl_oids(udf),
+            "param_modes": _function_param_modes(udf),
+            "table_columns": table_columns,
+            "return_type_name": return_type_name,
             "return_tag": return_tag,
             "return_decl_oid": return_decl_oid,
             "is_table": is_table,

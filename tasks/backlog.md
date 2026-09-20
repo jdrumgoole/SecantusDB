@@ -3353,12 +3353,14 @@ all match, and so do CREATE INDEX / VIEW and their error surface. What is open:
       Postgres raises `42704 role "nosuchuser" does not exist`.
 - [ ] **`CREATE OR REPLACE VIEW` may drop columns.** Postgres refuses with
       `42P16 cannot drop columns from view`; we replace the definition happily.
-- [ ] **`getProcedureColumns` returns nothing for a schema's procedure.**
+- [ ] **`getProcedureColumns` returns nothing for a schema's PROCEDURE.**
       pgjdbc's `getProceduresWithCorrectCatalogAndWithout` asserts
       `getProcedureColumns(null, 'hasprocedures', null, null)` yields 1 row for
-      a zero-argument procedure. Separate surface from `getProcedures`, which
-      was fixed by the schema-namespace slice (measured 2026-09-19: that slice
-      fixed `getProceduresInSchemaForProcedures` and left this one failing).
+      a zero-argument procedure. Still open after the argmodes slice
+      (2026-09-20), which fixed the same call for FUNCTIONS — `funcWithDirection`
+      / `funcReturningComposite` / `funcReturningTable` all went green while
+      this one did not, so the remaining gap is procedure-specific rather than
+      shared with the function path.
 - [ ] **`pg_proc` carries no built-in functions** — 13 rows against
       PostgreSQL 14's 3,324 (measured 2026-09-19). pgjdbc's
       `getFunctionsWithNullPatterns` / `getFunctionsWithBlankPatterns` assert

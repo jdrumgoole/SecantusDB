@@ -1655,11 +1655,78 @@ def _function_argtype_oids(fn: dict) -> list[int]:
     return out
 
 
-def _return_type_oid(fn: dict) -> int:
+def _table_column_oid(col: dict) -> int:
+    """The pg_type oid of a ``RETURNS TABLE`` output column."""
+    decl = col.get("decl_oid")
+    return decl if decl is not None else _type_oid(col.get("type_tag"))
+
+
+def _function_arg_modes(fn: dict) -> list[str]:
+    """Per-parameter ``proargmodes`` codes, defaulting to all-IN.
+
+    A routine stored before modes were recorded has no ``param_modes``; every
+    parameter then reads IN, which is what it would have been anyway.
+    """
+    modes = fn.get("param_modes") or []
+    n = len(fn.get("param_types") or [])
+    if len(modes) < n:
+        modes = list(modes) + ["i"] * (n - len(modes))
+    return [m.lower()[:1] or "i" for m in modes[:n]]
+
+
+def _function_input_argtype_oids(fn: dict) -> list[int]:
+    """``proargtypes`` — INPUT parameters only.
+
+    PostgreSQL's ``proargtypes`` is the function's call signature, so an
+    OUT-only parameter is excluded and appears only in ``proallargtypes``. We
+    listed every parameter there, so ``f3(IN a int, INOUT b varchar, OUT c
+    timestamptz)`` advertised a three-argument signature where PostgreSQL 14
+    records ``23 1043`` (measured 2026-09-20).
+    """
+    oids = _function_argtype_oids(fn)
+    modes = _function_arg_modes(fn)
+    return [o for o, m in zip(oids, modes, strict=False) if m != "o"]
+
+
+def _return_type_oid(fn: dict, user_type_oids: dict[str, int] | None = None) -> int:
     """``prorettype`` for a stored function — the declared oid where it differs
-    from the storage tag's, else the tag's own."""
+    from the storage tag's, else the tag's own.
+
+    A function with OUT parameters and no RETURNS clause takes its return type
+    from those outputs: ONE output reports that parameter's own type, TWO OR
+    MORE report 2249 (``record``). Measured on PostgreSQL 14, 2026-09-20 —
+    before this, `f3(IN a int, INOUT b varchar, OUT c timestamptz)` reported
+    2278 (void), an oid this catalog does not even define.
+    """
     decl = fn.get("return_decl_oid")
-    return decl if decl is not None else _type_oid(fn.get("return_tag"))
+    if decl is not None:
+        return decl
+    # `RETURNS <composite>` / `RETURNS <table>` — resolved here rather than at
+    # CREATE time because the type's oid needs the catalog.
+    rtn = fn.get("return_type_name")
+    if rtn and user_type_oids:
+        resolved = user_type_oids.get(rtn) or user_type_oids.get(rtn.lower())
+        if resolved is not None:
+            return resolved
+    tag = fn.get("return_tag")
+    if tag is None:
+        # `RETURNS TABLE (...)` takes its return type from the table columns,
+        # by the same one-versus-many rule as OUT parameters.
+        tcols = fn.get("table_columns") or []
+        if tcols:
+            if len(tcols) == 1:
+                return _table_column_oid(tcols[0])
+            return typemap.PG_OID.get("record", 2249)
+        out_oids = [
+            o
+            for o, m in zip(_function_argtype_oids(fn), _function_arg_modes(fn), strict=False)
+            if m in ("o", "b")
+        ]
+        if len(out_oids) == 1:
+            return out_oids[0]
+        if len(out_oids) > 1:
+            return typemap.PG_OID.get("record", 2249)
+    return _type_oid(tag)
 
 
 def _return_type_name(fn: dict) -> str:
@@ -1740,10 +1807,32 @@ def _pg_proc(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
         for name, oid, rettype, argtypes in _LO_PROCS
     ]
     proc_schema_oids = _schema_oids(db, catalog)
+    # A function may RETURN a composite type or a table's row type; both are
+    # user types whose oid only the catalog knows.
+    user_type_oids: dict[str, int] = {}
+    user_type_oids.update(_table_rowtype_oids(db, catalog))
+    user_type_oids.update(_composite_oids(db, catalog))
     for fn in _functions(db, catalog):
         key = f"{fn['name']}/{fn['nargs']}"
-        argtypes = " ".join(str(o) for o in _function_argtype_oids(fn))
+        argtypes = " ".join(str(o) for o in _function_input_argtype_oids(fn))
+        all_modes = _function_arg_modes(fn)
         names = [n for n in (fn.get("params") or []) if n is not None]
+        # `RETURNS TABLE (...)` columns ride the same three arrays as OUT
+        # parameters, with mode `t`.
+        tcols = fn.get("table_columns") or []
+        if tcols:
+            all_modes = list(all_modes) + ["t"] * len(tcols)
+            names = names + [c.get("name") for c in tcols]
+        # proargmodes / proallargtypes are NULL unless some parameter is not a
+        # plain IN — that is PostgreSQL's own rule, and pgjdbc's
+        # getProcedureColumns switches on exactly it.
+        has_non_in = any(m != "i" for m in all_modes)
+        arg_modes = all_modes if has_non_in else None
+        all_argtypes = (
+            _function_argtype_oids(fn) + [_table_column_oid(c) for c in tcols]
+            if has_non_in
+            else None
+        )
         # A routine created in a user schema is stored dotted
         # ("hasfunctions.addfunction"), the same convention user types use.
         # Reporting the dotted string as `proname` under a hardcoded `public`
@@ -1757,13 +1846,13 @@ def _pg_proc(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
                 "pronamespace": ns_oid,
                 "proowner": 10,
                 "prolang": _SQL_LANG_OID,
-                "prorettype": _return_type_oid(fn),
+                "prorettype": _return_type_oid(fn, user_type_oids),
                 "pronargs": fn.get("nargs", 0),
                 "pronargdefaults": 0,
                 "proargtypes": argtypes,
                 "proargnames": names or None,
-                "proargmodes": None,
-                "proallargtypes": None,
+                "proargmodes": arg_modes,
+                "proallargtypes": all_argtypes,
                 "prosrc": fn.get("body"),
                 # 'p' for a PROCEDURE. This was hardcoded 'f', so every
                 # procedure was reported as a function and `getProcedures()`
@@ -2172,8 +2261,9 @@ def _pg_type(db: str, session: Session, storage: Any, catalog: Catalog) -> list[
             "typtypmod": -1,
             "typnotnull": False,
             "typdefault": None,
-            # Range types report typtype 'r'; everything else is a base type 'b'.
-            "typtype": "r" if tag in typemap._RANGE_TAGS else "b",
+            # Ranges are 'r', multiranges 'm', `record` the pseudo-type 'p';
+            # everything else is a base type 'b'. See typemap.PG_TYPTYPE.
+            "typtype": typemap.PG_TYPTYPE.get(typname, "b"),
             # The paired ``_<type>`` array type's oid — 0 when we don't model
             # one (drivers treat 0 as "no array type"). psycopg's
             # TypeInfo.fetch reads it as array_oid.
@@ -3319,7 +3409,10 @@ _register(
         ("proargtypes", "text"),
         ("proargnames", "text[]"),
         ("proargmodes", "text[]"),
-        ("proallargtypes", "text[]"),
+        # oid[], not text[]: pgjdbc's getProcedureColumns casts this array to
+        # Long[], so a text array throws ClassCastException in the driver
+        # before any assertion runs. PostgreSQL 14 declares it `_oid`.
+        ("proallargtypes", "oid[]"),
         ("prosrc", "text"),
         ("prokind", "text"),
         ("proretset", "bool"),
