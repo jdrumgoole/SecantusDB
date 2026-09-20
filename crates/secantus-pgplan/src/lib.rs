@@ -681,6 +681,10 @@ pub enum AggFunc {
     /// `array_agg(col)` -- every value in group order, NULLs INCLUDED, which
     /// is how a LEFT-JOIN miss surfaces as `[None]` rather than `[]`.
     ArrayAgg,
+    /// `bool_and(cond)` / `bool_or(cond)` -- min and max over booleans, NULLs
+    /// skipped, NULL over an empty input.
+    BoolAnd,
+    BoolOr,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2730,12 +2734,77 @@ pub fn insert_row(
 }
 
 /// Does this target list contain an aggregate call?
+/// Whether an aggregate call appears BELOW the top level of a target -- the
+/// `sum(n)` in `sum(n) + 0`, `count(*) + 1`, or `coalesce(sum(n), -1)`.
+///
+/// `has_aggregate` deliberately matches only a top-level call, so these were
+/// planned as a plain SELECT with a computed column and reached the per-row
+/// scalar evaluator, which has no `sum`. That answered
+/// `0A000 function sum() is not supported yet` -- and over an EMPTY table it
+/// answered NO ROWS AT ALL, because nothing was evaluated and so nothing
+/// refused, where PostgreSQL returns one row. Refusing here makes the answer
+/// the same either way, and names what is actually missing.
+fn contains_nested_aggregate(node: &pg_query::protobuf::Node) -> bool {
+    const AGGREGATES: &[&str] = &[
+        "count",
+        "sum",
+        "avg",
+        "min",
+        "max",
+        "array_agg",
+        "string_agg",
+        "bool_and",
+        "bool_or",
+    ];
+    fn walk(node: Option<&pg_query::protobuf::Node>, depth: usize) -> bool {
+        let Some(node) = node else { return false };
+        match node.node.as_ref() {
+            Some(N::FuncCall(f)) => {
+                if depth > 0
+                    && func_name(f)
+                        .as_deref()
+                        .is_some_and(|n| AGGREGATES.contains(&n))
+                {
+                    return true;
+                }
+                f.args.iter().any(|a| walk(Some(a), depth + 1))
+            }
+            Some(N::AExpr(e)) => {
+                walk(e.lexpr.as_deref(), depth + 1) || walk(e.rexpr.as_deref(), depth + 1)
+            }
+            Some(N::TypeCast(tc)) => walk(tc.arg.as_deref(), depth + 1),
+            Some(N::BoolExpr(b)) => b.args.iter().any(|a| walk(Some(a), depth + 1)),
+            Some(N::CoalesceExpr(c)) => c.args.iter().any(|a| walk(Some(a), depth + 1)),
+            Some(N::CaseExpr(c)) => {
+                c.args.iter().any(|a| walk(Some(a), depth + 1))
+                    || walk(c.defresult.as_deref(), depth + 1)
+            }
+            _ => false,
+        }
+    }
+    walk(Some(node), 0)
+}
+
 fn has_aggregate(s: &pg_query::protobuf::SelectStmt) -> bool {
     // Only the names the aggregate planner actually handles. Any-FuncCall
     // routed a scalar call over a column (`regexp_replace(col, ...)`) into the
     // aggregate planner, whose refusal came out as a GROUPING error -- the
     // wrong error for what was a plain unsupported target.
-    const AGGREGATES: &[&str] = &["count", "sum", "avg", "min", "max", "array_agg"];
+    const AGGREGATES: &[&str] = &[
+        "count",
+        "sum",
+        "avg",
+        "min",
+        "max",
+        "array_agg",
+        "bool_and",
+        "bool_or",
+        // Not implemented, but it IS an aggregate: routed here so it is
+        // refused while PLANNING. Left on the scalar path it answered
+        // `function string_agg() is not supported yet` per row -- and NO ROWS
+        // AT ALL over an empty table, where PostgreSQL answers one.
+        "string_agg",
+    ];
     s.target_list.iter().any(|t| {
         matches!(
             t.node.as_ref(),
@@ -3700,6 +3769,17 @@ fn plan_select(
     if !s.group_clause.is_empty() || has_aggregate(s) {
         return plan_aggregate(s, lookup, params);
     }
+    // An aggregate wrapped in an expression belongs to no planner here yet;
+    // say so rather than letting the scalar path answer it per row (and
+    // answer NOTHING when the table is empty).
+    if s.target_list.iter().any(|t| match t.node.as_ref() {
+        Some(N::ResTarget(rt)) => rt.val.as_deref().is_some_and(contains_nested_aggregate),
+        _ => false,
+    }) {
+        return Err(Error::Unsupported(
+            "an aggregate inside an expression".into(),
+        ));
+    }
     // `FROM a, b` -- a CROSS join, the comma form of `a CROSS JOIN b`. It
     // rides the JOIN path with no ON predicate.
     if s.from_clause.len() == 2 {
@@ -4368,6 +4448,7 @@ pub fn aggregate_output_def(agg: &Aggregate) -> Result<TableDef> {
                     AggFunc::ArrayAgg => {
                         format!("{}[]", item.source_type.as_deref().unwrap_or("text"))
                     }
+                    AggFunc::BoolAnd | AggFunc::BoolOr => "bool".to_string(),
                 }
             }
         };
@@ -4587,6 +4668,8 @@ fn finish_aggregate(
                         "min" => AggFunc::Min,
                         "max" => AggFunc::Max,
                         "array_agg" => AggFunc::ArrayAgg,
+                        "bool_and" => AggFunc::BoolAnd,
+                        "bool_or" => AggFunc::BoolOr,
                         // `avg` returns PostgreSQL `numeric` with its own scale
                         // rules; approximating it would be a wrong answer.
                         other => return Err(Error::Unsupported(format!("aggregate {other}()"))),
@@ -4843,7 +4926,17 @@ fn is_aggregate_call(f: &pg_query::protobuf::FuncCall) -> bool {
     f.agg_star
         || matches!(
             func_name(f).as_deref(),
-            Some("count" | "sum" | "min" | "max" | "array_agg" | "avg")
+            Some(
+                "count"
+                    | "sum"
+                    | "min"
+                    | "max"
+                    | "array_agg"
+                    | "avg"
+                    | "bool_and"
+                    | "bool_or"
+                    | "string_agg"
+            )
         )
 }
 

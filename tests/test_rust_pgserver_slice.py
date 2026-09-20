@@ -9747,3 +9747,57 @@ def test_an_aliased_primary_key_keeps_its_type(home: Path) -> None:
             row = conn.execute(sql).fetchone()
             assert isinstance(row[0], int), f"{sql} described the key as {type(row[0]).__name__}"
         assert conn.execute("insert into d values (9,9,'i') returning id as k").fetchall() == [(9,)]
+
+
+def test_bool_and_bool_or(home: Path) -> None:
+    """`bool_and` / `bool_or` were not recognised as aggregates at all, so
+    they reached the per-row scalar evaluator. Values from PostgreSQL 14.24:
+    NULLs are skipped, and an empty input is NULL rather than no row."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table b (id int primary key, ok boolean, g int)")
+        conn.execute("insert into b values (1,true,1),(2,true,1),(3,false,2),(4,null,2)")
+        assert conn.execute("select bool_and(ok), bool_or(ok) from b").fetchall() == [(False, True)]
+        assert conn.execute(
+            "select g, bool_and(ok), bool_or(ok) from b group by g order by g"
+        ).fetchall() == [(1, True, True), (2, False, False)]
+        assert conn.execute("select bool_and(ok) from b where id > 10").fetchall() == [(None,)]
+        assert conn.execute("select bool_and(id > 0) from b").fetchall() == [(True,)]
+
+
+def test_array_agg_over_an_empty_input_is_null(home: Path) -> None:
+    """Every aggregate but `count` is NULL over an empty input; `array_agg`
+    answered an empty ARRAY."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table e (id int primary key, n int)")
+        assert conn.execute("select array_agg(n) from e").fetchall() == [(None,)]
+        assert conn.execute("select count(*), sum(n), min(n) from e").fetchall() == [
+            (0, None, None)
+        ]
+
+
+def test_unsupported_aggregates_refuse_the_same_way_on_an_empty_table(home: Path) -> None:
+    """The silent half of a missing feature.
+
+    `string_agg` and an aggregate wrapped in an expression are not
+    implemented. They used to be planned as a plain SELECT with a computed
+    column, so the refusal came from evaluating a row -- and over an EMPTY
+    table no row was evaluated, so the client got zero rows and no error
+    where PostgreSQL answers one row. Both now refuse while planning, so the
+    answer does not depend on whether the table happens to be empty.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table t (id int primary key, n int, s text)")
+        for sql in (
+            "select string_agg(s, ',') from t",
+            "select sum(n) + 0 from t",
+            "select count(*) + 1 from t",
+            "select coalesce(sum(n), -1) from t",
+        ):
+            with pytest.raises(psycopg.Error) as empty:
+                conn.execute(sql).fetchall()
+            assert empty.value.sqlstate == "0A000", sql
+        conn.execute("insert into t values (1, 1, 'a')")
+        for sql in ("select string_agg(s, ',') from t", "select sum(n) + 0 from t"):
+            with pytest.raises(psycopg.Error) as filled:
+                conn.execute(sql).fetchall()
+            assert filled.value.sqlstate == "0A000", sql

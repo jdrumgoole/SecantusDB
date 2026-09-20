@@ -10238,28 +10238,21 @@ shared storage engine or building large new protocol subsystems:
   refused -- honestly, with `DISTINCT ON with an aggregate` -- because the
   keys would have to resolve against the GROUP BY output rather than the
   table. Plain `SELECT DISTINCT` over an aggregate IS supported.
-- [ ] **Rust PG server: an aggregate INSIDE an expression is routed to the
-  per-row scalar path** (measured 2026-09-20). `select sum(n) + 0 from t`,
-  `select count(*) + 1 from t` and `select coalesce(sum(n), -1) from t` all
-  answer `0A000 function sum() is not supported yet` -- the scalar evaluator
-  complaining, because `has_aggregate` only recognises an aggregate as a
-  TOP-LEVEL target, so the statement is planned as a plain SELECT with a
-  computed column. Two consequences:
-  - **Over an EMPTY table the same queries silently return NO ROWS**, because
-    nothing is evaluated and so nothing refuses. PostgreSQL answers one row
-    (`NULL`, or `-1` for the coalesce). That is the silent half and should be
-    fixed even if the feature is not: refusing at PLAN time would make the
-    answer consistent and the message accurate.
-  - The feature itself needs an output column that is an expression OVER the
-    aggregate results -- `OutputCol` currently names either a group key or an
-    aggregate, with no room for a computation over them.
-  `string_agg`, `bool_and` and `bool_or` are missing outright (honest 0A000 on
-  a non-empty table, the same silent no-rows on an empty one).
-- [ ] **Rust PG server: `array_agg` over an empty input answers `[]`, not
-  NULL** (2026-09-20). Every other aggregate over an empty input is right
-  (`count` 0, `sum` / `min` / `max` NULL); `array_agg` alone builds an empty
-  array where PostgreSQL 14.24 answers NULL. One branch in
-  `compute_aggregate`.
+- [ ] **Rust PG server: an aggregate INSIDE an expression is not implemented**
+  (2026-09-20). `select sum(n) + 0`, `count(*) + 1` and `coalesce(sum(n), -1)`
+  refuse with `0A000 an aggregate inside an expression is not supported yet`.
+  The refusal now happens while PLANNING, so it no longer depends on the data
+  -- before, these were planned as a plain SELECT with a computed column, and
+  over an EMPTY table they answered NO ROWS with no error at all. The feature
+  needs an output column that is an expression OVER the aggregate results;
+  `OutputCol` names either a group key or an aggregate, with no room for a
+  computation over them. `string_agg` is missing for the same reason it was
+  invisible (not recognised as an aggregate); it too now refuses at plan time.
+- [ ] **Rust PG server: `min` / `max` of a BOOLEAN are answered, where
+  PostgreSQL refuses** (2026-09-20). `select max(ok) from b` gives `true`;
+  PostgreSQL 14.24 raises `42883 function max(boolean) does not exist`. Being
+  permissive where the oracle refuses -- the opposite direction to the rest of
+  this list, and harmless to a correct client, but it is a divergence.
 - [ ] **Rust PG server: `char(n)` is not blank-padded** (2026-09-20, ~20 of
   the sweep's wrong-value divergences). A `char(4)` column holding `ab` reads
   back as `ab`, so `octet_length` is 2 where PostgreSQL says 4, `concat(c,'|')`

@@ -12236,6 +12236,7 @@ fn encode_value(enc: &mut DataRowEncoder, v: Option<&Bson>) -> PgWireResult<()> 
 fn aggregate_wire_type(item: &AggItem) -> Type {
     match item.func {
         AggFunc::CountStar | AggFunc::Count => Type::INT8,
+        AggFunc::BoolAnd | AggFunc::BoolOr => Type::BOOL,
         AggFunc::Sum => match item.source_type.as_deref() {
             Some("numeric" | "decimal") => Type::NUMERIC,
             _ => Type::INT8,
@@ -12290,6 +12291,18 @@ fn compute_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
     match item.func {
         AggFunc::CountStar => Bson::Int64(rows.len() as i64),
         AggFunc::Count => Bson::Int64(values.len() as i64),
+        // `bool_and` is every non-NULL value true, `bool_or` is any of them;
+        // both are NULL when nothing survives, like `min` / `max`.
+        AggFunc::BoolAnd | AggFunc::BoolOr => {
+            if values.is_empty() {
+                return Bson::Null;
+            }
+            let truthy = |v: &&Bson| matches!(v, Bson::Boolean(true));
+            Bson::Boolean(match item.func {
+                AggFunc::BoolAnd => values.iter().all(truthy),
+                _ => values.iter().any(truthy),
+            })
+        }
         // Group order, NULLs INCLUDED -- a LEFT-JOIN miss surfaces as `[None]`
         // rather than `[]`, which is what psycopg's EnumInfo distinguishes a
         // non-enum by.
@@ -12318,6 +12331,10 @@ fn compute_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
             );
             Bson::Array(kept)
         }
+        // Over an EMPTY input every aggregate but `count` is NULL, and
+        // `array_agg` is no exception -- it answered an empty ARRAY, where
+        // PostgreSQL 14.24 answers NULL.
+        AggFunc::ArrayAgg if rows.is_empty() => Bson::Null,
         AggFunc::ArrayAgg => Bson::Array(
             rows.iter()
                 .map(|d| d.get(field).cloned().unwrap_or(Bson::Null))
