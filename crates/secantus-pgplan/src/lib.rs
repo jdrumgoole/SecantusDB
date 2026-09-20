@@ -721,6 +721,30 @@ pub enum OutputCol {
     Agg(usize),
 }
 
+/// A `HAVING` predicate over the grouped rows.
+///
+/// Deliberately a small shape rather than a general expression: a comparison
+/// or NULL test on one grouped value against a constant, combined with
+/// AND / OR / NOT. Anything else is refused while planning, because HAVING
+/// decides which ROWS come back and approximating it would answer wrongly.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Having {
+    /// `<subject> <op> <constant>`, with the constant already evaluated.
+    Compare {
+        subject: OutputCol,
+        op: String,
+        value: Bson,
+    },
+    /// `<subject> IS [NOT] NULL`.
+    IsNull {
+        subject: OutputCol,
+        negated: bool,
+    },
+    And(Vec<Having>),
+    Or(Vec<Having>),
+    Not(Box<Having>),
+}
+
 /// ORDER BY over an aggregate query, by index into `Aggregate::group_by`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AggOrderKey {
@@ -763,6 +787,8 @@ pub struct Aggregate {
     pub order: Vec<AggOrderKey>,
     pub limit: Option<i64>,
     pub offset: i64,
+    /// `HAVING ...`, applied to the grouped rows before ORDER BY and LIMIT.
+    pub having: Option<Having>,
     /// `SELECT DISTINCT count(*) ...` -- dedup on the aggregate's OUTPUT rows,
     /// after grouping and before the ORDER BY. `DISTINCT ON` over an aggregate
     /// is still refused rather than approximated.
@@ -3782,6 +3808,190 @@ fn plan_set_operation(
 /// rather than the table, which this slice does not do -- so it is refused as
 /// unsupported. Resolving it against the table instead reported the key as an
 /// undefined column, which is a different and misleading answer.
+/// Plan a `HAVING` predicate against a query's groups and aggregates.
+///
+/// An aggregate written in HAVING need not be in the SELECT list, so one that
+/// is missing is APPENDED to `items` -- it is computed for the test and never
+/// projected. A matching item is reused rather than computed twice.
+///
+/// The accepted shape is a comparison or NULL test on a grouped value against
+/// a constant, combined with AND / OR / NOT. Anything else is refused: HAVING
+/// decides which rows come back, so a half-understood predicate would answer
+/// wrongly rather than slowly.
+fn plan_having(
+    node: &pg_query::protobuf::Node,
+    def: &TableDef,
+    group_by: &[GroupKey],
+    items: &mut Vec<AggItem>,
+    params: &[Bson],
+) -> Result<Having> {
+    match node.node.as_ref() {
+        Some(N::BoolExpr(b)) => {
+            let parts: Result<Vec<Having>> = b
+                .args
+                .iter()
+                .map(|a| plan_having(a, def, group_by, items, params))
+                .collect();
+            let parts = parts?;
+            match BoolExprType::try_from(b.boolop) {
+                Ok(BoolExprType::AndExpr) => Ok(Having::And(parts)),
+                Ok(BoolExprType::OrExpr) => Ok(Having::Or(parts)),
+                Ok(BoolExprType::NotExpr) => {
+                    let inner = parts
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| Error::Parse("NOT without an operand".into()))?;
+                    Ok(Having::Not(Box::new(inner)))
+                }
+                _ => Err(Error::Unsupported("this HAVING connective".into())),
+            }
+        }
+        Some(N::NullTest(t)) => {
+            let subject = having_subject(t.arg.as_deref(), def, group_by, items, params)?;
+            let negated = matches!(
+                NullTestType::try_from(t.nulltesttype),
+                Ok(NullTestType::IsNotNull)
+            );
+            Ok(Having::IsNull { subject, negated })
+        }
+        Some(N::AExpr(e)) => {
+            let op = operator_name(e)?;
+            if !matches!(&*op, "=" | "<>" | "!=" | ">" | ">=" | "<" | "<=") {
+                return Err(Error::Unsupported(format!("HAVING operator {op}")));
+            }
+            // The constant may be written on either side; a comparison with a
+            // constant on the LEFT flips, so `100 < count(*)` keeps meaning
+            // what it says.
+            let subject_on_left =
+                having_subject(e.lexpr.as_deref(), def, group_by, items, params).is_ok();
+            let (subject_node, value_node) = if subject_on_left {
+                (e.lexpr.as_deref(), e.rexpr.as_deref())
+            } else {
+                (e.rexpr.as_deref(), e.lexpr.as_deref())
+            };
+            let op = if subject_on_left {
+                op.to_string()
+            } else {
+                match &*op {
+                    ">" => "<".to_string(),
+                    ">=" => "<=".to_string(),
+                    "<" => ">".to_string(),
+                    "<=" => ">=".to_string(),
+                    other => other.to_string(),
+                }
+            };
+            let subject = having_subject(subject_node, def, group_by, items, params)?;
+            let value = const_value(
+                value_node.ok_or_else(|| Error::Parse("HAVING without an operand".into()))?,
+                params,
+            )?;
+            Ok(Having::Compare {
+                subject,
+                op: if op == "!=" { "<>".to_string() } else { op },
+                value,
+            })
+        }
+        Some(other) => Err(Error::Unsupported(format!("{} in HAVING", disc(other)))),
+        None => Err(Error::Parse("an empty HAVING".into())),
+    }
+}
+
+/// The grouped value a HAVING term tests: an aggregate (computed for the test
+/// if the SELECT list does not already ask for it) or a GROUP BY key.
+fn having_subject(
+    node: Option<&pg_query::protobuf::Node>,
+    def: &TableDef,
+    group_by: &[GroupKey],
+    items: &mut Vec<AggItem>,
+    _params: &[Bson],
+) -> Result<OutputCol> {
+    let node = node.ok_or_else(|| Error::Parse("a HAVING term without an operand".into()))?;
+    match node.node.as_ref() {
+        Some(N::FuncCall(f)) if is_aggregate_call(f) => {
+            let item = plan_bare_aggregate(f, def, items.len())?;
+            if let Some(i) = items.iter().position(|existing| {
+                existing.func == item.func
+                    && existing.field == item.field
+                    && existing.distinct == item.distinct
+            }) {
+                return Ok(OutputCol::Agg(i));
+            }
+            items.push(item);
+            Ok(OutputCol::Agg(items.len() - 1))
+        }
+        Some(N::ColumnRef(c)) => {
+            let name =
+                column_ref_name(c).ok_or_else(|| Error::Unsupported("this HAVING term".into()))?;
+            group_by
+                .iter()
+                .position(|k| k.expr.is_none() && k.name == name)
+                .map(OutputCol::Group)
+                .ok_or_else(|| {
+                    Error::Grouping(format!(
+                        "column \"{name}\" must appear in the GROUP BY clause \
+                         or be used in an aggregate function"
+                    ))
+                })
+        }
+        _ => Err(Error::Unsupported("this HAVING term".into())),
+    }
+}
+
+/// One aggregate over a bare column (or `count(*)`), as HAVING writes them.
+fn plan_bare_aggregate(
+    f: &pg_query::protobuf::FuncCall,
+    def: &TableDef,
+    index: usize,
+) -> Result<AggItem> {
+    let name = func_name(f).unwrap_or_default();
+    if f.agg_filter.is_some() {
+        return Err(Error::Unsupported("FILTER on an aggregate".into()));
+    }
+    let out = format!("__having{index}");
+    if name == "count" && f.agg_star {
+        return Ok(AggItem {
+            func: AggFunc::CountStar,
+            field: None,
+            out,
+            source_type: None,
+            expr: None,
+            distinct: f.agg_distinct,
+        });
+    }
+    let func = match name.as_str() {
+        "count" => AggFunc::Count,
+        "sum" => AggFunc::Sum,
+        "min" => AggFunc::Min,
+        "max" => AggFunc::Max,
+        "array_agg" => AggFunc::ArrayAgg,
+        "bool_and" => AggFunc::BoolAnd,
+        "bool_or" => AggFunc::BoolOr,
+        other => return Err(Error::Unsupported(format!("aggregate {other}()"))),
+    };
+    if f.args.len() != 1 {
+        return Err(Error::Unsupported(
+            "an aggregate with more than one argument".into(),
+        ));
+    }
+    let Some(N::ColumnRef(c)) = f.args[0].node.as_ref() else {
+        return Err(Error::Unsupported(
+            "this aggregate argument in HAVING".into(),
+        ));
+    };
+    let col = column_ref_name(c).ok_or_else(|| Error::Unsupported("this HAVING term".into()))?;
+    let column = def
+        .column(&col)
+        .ok_or_else(|| Error::UndefinedColumn(col.clone()))?;
+    Ok(AggItem {
+        func,
+        field: Some(column.field()),
+        out,
+        source_type: Some(column.pg_type.clone()),
+        expr: None,
+        distinct: f.agg_distinct,
+    })
+}
+
 fn aggregate_distinct(s: &pg_query::protobuf::SelectStmt) -> Result<bool> {
     if s.distinct_clause.is_empty() {
         return Ok(false);
@@ -3964,9 +4174,6 @@ fn plan_aggregate(
             "an aggregate that is not over one table".into(),
         ));
     }
-    if s.having_clause.is_some() {
-        return Err(Error::Unsupported("HAVING".into()));
-    }
     // `FROM (SELECT ... FROM a JOIN b ON ...) x` -- the joined subquery every
     // psycopg type-registration query is built on.
     if let Some(N::RangeSubselect(rs)) = s.from_clause[0].node.as_ref() {
@@ -4048,6 +4255,7 @@ fn plan_aggregate(
             order: Vec::new(),
             limit: None,
             offset: 0,
+            having: None,
             distinct: aggregate_distinct(s)?,
         }));
     }
@@ -4908,6 +5116,14 @@ fn finish_aggregate(
         });
     }
 
+    // HAVING may name an aggregate the SELECT list does not, so it is planned
+    // here, while `items` can still grow: such an aggregate is computed for
+    // the test and never projected.
+    let having = match s.having_clause.as_deref() {
+        None => None,
+        Some(node) => Some(plan_having(node, &def, &group_by, &mut items, params)?),
+    };
+
     let limit = match s.limit_count.as_ref() {
         None => None,
         Some(n) => match const_value(n, params)? {
@@ -4938,6 +5154,7 @@ fn finish_aggregate(
         order,
         limit,
         offset,
+        having,
         distinct: aggregate_distinct(s)?,
     }))
 }

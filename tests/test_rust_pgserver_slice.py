@@ -9888,3 +9888,44 @@ def test_sum_result_types(home: Path) -> None:
             assert cur.description[0].type_code == oid, f"sum({col})"
             assert rows[0][0] is not None
         assert conn.execute("select sum(f8) from a").fetchall() == [(4.0,)]
+
+
+def test_having(home: Path) -> None:
+    """`HAVING` was refused outright (`0A000 HAVING is not supported yet`).
+
+    Every expectation measured against PostgreSQL 14.24 (2026-09-20). Note
+    `count(s)` and `min(n)`: an aggregate written in HAVING need not be in the
+    SELECT list, so it is computed for the test and never projected. A NULL
+    makes a comparison UNKNOWN, so `sum(n) > 10` drops the group whose sum is
+    NULL rather than keeping it.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table t (id int primary key, g int, n int, s text)")
+        conn.execute(
+            "insert into t values (1,1,10,'a'),(2,1,20,'b'),(3,2,5,'c'),(4,2,null,'d'),(5,3,7,null)"
+        )
+        q = lambda sql: conn.execute(sql).fetchall()  # noqa: E731
+        assert q("select g, count(*) from t group by g having count(*) > 1 order by g") == [
+            (1, 2),
+            (2, 2),
+        ]
+        assert q("select g from t group by g having count(*) = 1 order by g") == [(3,)]
+        assert q("select g, sum(n) from t group by g having sum(n) > 10 order by g") == [(1, 30)]
+        assert q("select g from t group by g having sum(n) is null order by g") == []
+        # An aggregate only HAVING asks for -- `count(s)` skips the NULL `s`,
+        # so the group whose only row has none counts 0.
+        assert q("select g from t group by g having count(s) = 2 order by g") == [(1,), (2,)]
+        assert q("select g from t group by g having count(s) = 0 order by g") == [(3,)]
+        assert q("select g from t group by g having min(n) >= 5 order by g") == [(1,), (2,), (3,)]
+        # A constant on the left, a group key, and the connectives.
+        assert q("select g from t group by g having 1 < count(*) order by g") == [(1,), (2,)]
+        assert q("select g from t group by g having g > 1 order by g") == [(2,), (3,)]
+        assert q("select g from t group by g having count(*) > 1 or g = 3 order by g") == [
+            (1,),
+            (2,),
+            (3,),
+        ]
+        assert q("select g from t group by g having not (count(*) > 1) order by g") == [(3,)]
+        # HAVING with no GROUP BY filters the single row.
+        assert q("select count(*) from t having count(*) > 3") == [(5,)]
+        assert q("select count(*) from t having count(*) > 99") == []
