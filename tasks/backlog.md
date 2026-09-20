@@ -10238,6 +10238,36 @@ shared storage engine or building large new protocol subsystems:
   refused -- honestly, with `DISTINCT ON with an aggregate` -- because the
   keys would have to resolve against the GROUP BY output rather than the
   table. Plain `SELECT DISTINCT` over an aggregate IS supported.
+- [ ] **Rust PG server: an aggregate INSIDE an expression is routed to the
+  per-row scalar path** (measured 2026-09-20). `select sum(n) + 0 from t`,
+  `select count(*) + 1 from t` and `select coalesce(sum(n), -1) from t` all
+  answer `0A000 function sum() is not supported yet` -- the scalar evaluator
+  complaining, because `has_aggregate` only recognises an aggregate as a
+  TOP-LEVEL target, so the statement is planned as a plain SELECT with a
+  computed column. Two consequences:
+  - **Over an EMPTY table the same queries silently return NO ROWS**, because
+    nothing is evaluated and so nothing refuses. PostgreSQL answers one row
+    (`NULL`, or `-1` for the coalesce). That is the silent half and should be
+    fixed even if the feature is not: refusing at PLAN time would make the
+    answer consistent and the message accurate.
+  - The feature itself needs an output column that is an expression OVER the
+    aggregate results -- `OutputCol` currently names either a group key or an
+    aggregate, with no room for a computation over them.
+  `string_agg`, `bool_and` and `bool_or` are missing outright (honest 0A000 on
+  a non-empty table, the same silent no-rows on an empty one).
+- [ ] **Rust PG server: `array_agg` over an empty input answers `[]`, not
+  NULL** (2026-09-20). Every other aggregate over an empty input is right
+  (`count` 0, `sum` / `min` / `max` NULL); `array_agg` alone builds an empty
+  array where PostgreSQL 14.24 answers NULL. One branch in
+  `compute_aggregate`.
+- [ ] **Rust PG server: `char(n)` is not blank-padded** (2026-09-20, ~20 of
+  the sweep's wrong-value divergences). A `char(4)` column holding `ab` reads
+  back as `ab`, so `octet_length` is 2 where PostgreSQL says 4, `concat(c,'|')`
+  is `ab|` not `ab  |`, and `c = 'ab  '` is false where PostgreSQL says true
+  (bpchar comparison ignores trailing blanks). `'abc'::char(2)` is not
+  truncated either. A literal cast DOES pad (`'a'::char(3) || '|'` is right),
+  so it is the column write/read path and the comparison rule that are
+  missing, not the cast.
 - [ ] **Rust PG server: 45 wrong-VALUE divergences across the existing
   `pg_corpora/`** (swept 2026-09-20 with the new
   `tools/probes/pg_differential.py --server=rust`, against PostgreSQL 14.24;
