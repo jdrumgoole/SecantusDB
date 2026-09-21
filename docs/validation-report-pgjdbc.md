@@ -2,7 +2,7 @@
 
 - SecantusDB (Python server) 0.6.0b16
 - suite: vendor/pgjdbc @ unknown (Gradle `:postgresql:test`, unmodified; 60s JUnit default timeout injected)
-- generated: 2026-09-18 18:32 UTC
+- generated: 2026-09-21 07:12 UTC
 
 | test class | passed | failed | skipped | total | pass rate |
 |---|---|---|---|---|---|
@@ -33,7 +33,7 @@
 | jdbc2.DatabaseEncodingTest | 2 | 1 | 0 | 3 | 66.6% |
 | jdbc2.DatabaseMetaDataCacheTest | 2 | 1 | 0 | 3 | 66.6% |
 | jdbc2.DatabaseMetaDataPropertiesTest | 13 | 0 | 0 | 13 | 100.0% |
-| jdbc2.DatabaseMetaDataTest | 121 | 35 | 0 | 156 | 77.5% |
+| jdbc2.DatabaseMetaDataTest | 138 | 18 | 0 | 156 | 88.4% |
 | jdbc2.DatabaseMetaDataTransactionIsolationTest | 14 | 0 | 0 | 14 | 100.0% |
 | jdbc2.DateStyleTest | 4 | 0 | 0 | 4 | 100.0% |
 | jdbc2.DateTest | 178 | 0 | 14 | 192 | 100.0% |
@@ -47,7 +47,7 @@
 | jdbc2.LoginTimeoutInterruptTest | 0 | 1 | 0 | 1 | 0.0% |
 | jdbc2.LoginTimeoutTest | 6 | 0 | 0 | 6 | 100.0% |
 | jdbc2.MiscTest | 4 | 0 | 1 | 5 | 100.0% |
-| jdbc2.NumericTransfer2Test | 152 | 4 | 0 | 156 | 97.4% |
+| jdbc2.NumericTransfer2Test | 156 | 0 | 0 | 156 | 100.0% |
 | jdbc2.NumericTransferTest | 4 | 0 | 0 | 4 | 100.0% |
 | jdbc2.OuterJoinSyntaxTest | 6 | 0 | 0 | 6 | 100.0% |
 | jdbc2.PGObjectGetTest | 60 | 0 | 0 | 60 | 100.0% |
@@ -56,7 +56,7 @@
 | jdbc2.PGTimeTest | 2 | 0 | 0 | 2 | 100.0% |
 | jdbc2.PGTimestampTest | 2 | 0 | 0 | 2 | 100.0% |
 | jdbc2.ParameterStatusTest | 9 | 0 | 0 | 9 | 100.0% |
-| jdbc2.PreparedStatementTest | 96 | 10 | 4 | 110 | 90.5% |
+| jdbc2.PreparedStatementTest | 98 | 8 | 4 | 110 | 92.4% |
 | jdbc2.QuotationTest | 2912 | 0 | 0 | 2912 | 100.0% |
 | jdbc2.RefCursorFetchTest | 0 | 1 | 0 | 1 | 0.0% |
 | jdbc2.RefCursorTest | 8 | 0 | 0 | 8 | 100.0% |
@@ -81,9 +81,9 @@
 | jdbc2.TypeCacheDLLStressTest | 1 | 0 | 0 | 1 | 100.0% |
 | jdbc2.UpdateableResultTest | 34 | 2 | 0 | 36 | 94.4% |
 | jdbc2.UpsertTest | 32 | 0 | 0 | 32 | 100.0% |
-| **total** | **5709** | **82** | **28** | **5819** | **98.5%** |
+| **total** | **5732** | **59** | **28** | **5819** | **98.9%** |
 
-## Failures (82)
+## Failures (59)
 
 - `jdbc2.ArrayTest :: testNonStandardBounds()`
 - `jdbc2.ArrayTest :: testNonStandardBounds()`
@@ -103,35 +103,18 @@
 - `jdbc2.DatabaseMetaDataTest :: ascDescIndexInfo()`
 - `jdbc2.DatabaseMetaDataTest :: columnPrivileges()`
 - `jdbc2.DatabaseMetaDataTest :: columnPrivileges()`
-- `jdbc2.DatabaseMetaDataTest :: droppedColumns()`
-- `jdbc2.DatabaseMetaDataTest :: droppedColumns()`
 - `jdbc2.DatabaseMetaDataTest :: escaping()`
 - `jdbc2.DatabaseMetaDataTest :: escaping()`
 - `jdbc2.DatabaseMetaDataTest :: foreignKeysToUniqueIndexes()`
 - `jdbc2.DatabaseMetaDataTest :: foreignKeysToUniqueIndexes()`
-- `jdbc2.DatabaseMetaDataTest :: funcReturningComposite()`
-- `jdbc2.DatabaseMetaDataTest :: funcReturningComposite()`
-- `jdbc2.DatabaseMetaDataTest :: funcReturningTable()`
-- `jdbc2.DatabaseMetaDataTest :: funcReturningTable()`
-- `jdbc2.DatabaseMetaDataTest :: funcWithDirection()`
-- `jdbc2.DatabaseMetaDataTest :: funcWithDirection()`
-- `jdbc2.DatabaseMetaDataTest :: funcWithoutNames()`
-- `jdbc2.DatabaseMetaDataTest :: funcWithoutNames()`
-- `jdbc2.DatabaseMetaDataTest :: functionColumns()`
-- `jdbc2.DatabaseMetaDataTest :: functionColumns()`
-- `jdbc2.DatabaseMetaDataTest :: getColumnsCharOctetLength()`
-- `jdbc2.DatabaseMetaDataTest :: getColumnsCharOctetLength()`
 - `jdbc2.DatabaseMetaDataTest :: indexInfo()`
 - `jdbc2.DatabaseMetaDataTest :: indexInfo()`
-- `jdbc2.DatabaseMetaDataTest :: informationAboutArrayTypes()`
-- `jdbc2.DatabaseMetaDataTest :: informationAboutArrayTypes()`
 - `jdbc2.DatabaseMetaDataTest :: partialIndexInfo()`
 - `jdbc2.DatabaseMetaDataTest :: partialIndexInfo()`
 - `jdbc2.DatabaseMetaDataTest :: partitionedTables()`
 - `jdbc2.DatabaseMetaDataTest :: partitionedTables()`
 - `jdbc2.DatabaseMetaDataTest :: remarkIndexInfo()`
 - `jdbc2.DatabaseMetaDataTest :: remarkIndexInfo()`
-- `jdbc2.DatabaseMetaDataTest :: tablePrivileges()`
 - `jdbc2.DatabaseMetaDataTest :: types()`
 - `jdbc2.DatabaseMetaDataTest :: types()`
 - `jdbc2.EnumTest :: enumArrayArray()`
@@ -139,16 +122,10 @@
 - `jdbc2.GeometricTest :: testPGline()`
 - `jdbc2.GeometricTest :: testPGline()`
 - `jdbc2.LoginTimeoutInterruptTest :: loginTimeoutInterruptsAuthPluginSleep()`
-- `jdbc2.NumericTransfer2Test :: receiveValue()`
-- `jdbc2.NumericTransfer2Test :: receiveValue()`
-- `jdbc2.NumericTransfer2Test :: receiveValue()`
-- `jdbc2.NumericTransfer2Test :: receiveValue()`
 - `jdbc2.PreparedStatementTest :: testDoubleQuestionMark()`
 - `jdbc2.PreparedStatementTest :: testDoubleQuestionMark()`
 - `jdbc2.PreparedStatementTest :: testNegativeNumericScale()`
 - `jdbc2.PreparedStatementTest :: testNegativeNumericScale()`
-- `jdbc2.PreparedStatementTest :: testNumeric()`
-- `jdbc2.PreparedStatementTest :: testNumeric()`
 - `jdbc2.PreparedStatementTest :: testTrailingSpaces()`
 - `jdbc2.PreparedStatementTest :: testTrailingSpaces()`
 - `jdbc2.PreparedStatementTest :: testUnknownSetObject()`
