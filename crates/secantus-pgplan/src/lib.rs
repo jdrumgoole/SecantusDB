@@ -689,6 +689,9 @@ pub enum AggFunc {
     /// averages as a float; everything else answers `numeric`, at the scale
     /// PostgreSQL's division picks.
     Avg,
+    /// `string_agg(col, sep)` -- the non-NULL values joined, in group order.
+    /// The separator is the item's `sep`.
+    StringAgg,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -714,6 +717,15 @@ pub struct AggItem {
     /// 0 and everything else NULL -- which falls out of feeding the
     /// aggregate an empty row set.
     pub filter: Option<Document>,
+    /// `string_agg`'s separator, already evaluated. `Some(Bson::Null)` is a
+    /// NULL separator, which PostgreSQL joins with nothing between the
+    /// values rather than answering NULL.
+    pub sep: Option<Bson>,
+    /// `agg(x ORDER BY y)` -- the group's rows are sorted by these before the
+    /// values are collected, which is what makes `string_agg` and `array_agg`
+    /// answer in a defined order. Empty for every other aggregate, where the
+    /// order cannot be observed.
+    pub order: Vec<OrderKey>,
 }
 
 /// One output column of an aggregate query, by POSITION.
@@ -3970,6 +3982,17 @@ fn plan_bare_aggregate(
         None => None,
         Some(node) => Some(lower_where(node, def, params)?),
     };
+    let order = plan_aggregate_order(&f.agg_order, def)?;
+    let sep = if name == "string_agg" {
+        if f.args.len() != 2 {
+            return Err(Error::Unsupported(
+                "string_agg takes a value and a separator".into(),
+            ));
+        }
+        Some(const_value(&f.args[1], params)?)
+    } else {
+        None
+    };
     let out = format!("__having{index}");
     if name == "count" && f.agg_star {
         return Ok(AggItem {
@@ -3980,6 +4003,8 @@ fn plan_bare_aggregate(
             expr: None,
             distinct: f.agg_distinct,
             filter,
+            sep: None,
+            order,
         });
     }
     let func = match name.as_str() {
@@ -3991,9 +4016,10 @@ fn plan_bare_aggregate(
         "bool_and" => AggFunc::BoolAnd,
         "bool_or" => AggFunc::BoolOr,
         "avg" => AggFunc::Avg,
+        "string_agg" => AggFunc::StringAgg,
         other => return Err(Error::Unsupported(format!("aggregate {other}()"))),
     };
-    if f.args.len() != 1 {
+    if f.args.len() != usize::from(func == AggFunc::StringAgg) + 1 {
         return Err(Error::Unsupported(
             "an aggregate with more than one argument".into(),
         ));
@@ -4015,7 +4041,57 @@ fn plan_bare_aggregate(
         expr: None,
         distinct: f.agg_distinct,
         filter,
+        sep,
+        order,
     })
+}
+
+/// `ORDER BY` written INSIDE an aggregate call, over the table's columns.
+///
+/// PostgreSQL sorts the group's rows by these before collecting the values,
+/// which is the only thing that makes `string_agg` and `array_agg` answer in
+/// a defined order. The keys are ordinary columns here; an expression is
+/// refused rather than ignored, because ignoring it answers in a DIFFERENT
+/// order and says nothing.
+fn plan_aggregate_order(
+    nodes: &[pg_query::protobuf::Node],
+    def: &TableDef,
+) -> Result<Vec<OrderKey>> {
+    let mut keys = Vec::with_capacity(nodes.len());
+    for item in nodes {
+        let Some(N::SortBy(sb)) = item.node.as_ref() else {
+            return Err(Error::Unsupported(
+                "this ORDER BY inside an aggregate".into(),
+            ));
+        };
+        let Some(N::ColumnRef(c)) = sb.node.as_ref().and_then(|n| n.node.as_ref()) else {
+            return Err(Error::Unsupported(
+                "ORDER BY over an expression inside an aggregate".into(),
+            ));
+        };
+        let name = column_ref_name(c)
+            .ok_or_else(|| Error::Unsupported("this ORDER BY inside an aggregate".into()))?;
+        let field = def
+            .field_of(&name)
+            .ok_or_else(|| Error::UndefinedColumn(name.clone()))?;
+        let ascending = match SortByDir::try_from(sb.sortby_dir) {
+            Ok(SortByDir::SortbyDesc) => false,
+            Ok(SortByDir::SortbyDefault | SortByDir::SortbyAsc) => true,
+            _ => return Err(Error::Unsupported("ORDER BY ... USING".into())),
+        };
+        let nulls = match SortByNulls::try_from(sb.sortby_nulls) {
+            Ok(SortByNulls::SortbyNullsFirst) => Nulls::First,
+            Ok(SortByNulls::SortbyNullsLast) => Nulls::Last,
+            _ if ascending => Nulls::Last,
+            _ => Nulls::First,
+        };
+        keys.push(OrderKey {
+            field,
+            ascending,
+            nulls,
+        });
+    }
+    Ok(keys)
 }
 
 fn aggregate_distinct(s: &pg_query::protobuf::SelectStmt) -> Result<bool> {
@@ -4267,6 +4343,8 @@ fn plan_aggregate(
                 distinct: false,
                 // A generated source has no table for a FILTER to read.
                 filter: None,
+                sep: None,
+                order: Vec::new(),
             });
         }
         // The WHERE clause was silently dropped here before: `count(*)
@@ -4719,6 +4797,7 @@ pub fn aggregate_output_def(agg: &Aggregate) -> Result<TableDef> {
                     }
                     AggFunc::BoolAnd | AggFunc::BoolOr => "bool".to_string(),
                     AggFunc::Avg => avg_result_type(item.source_type.as_deref()).to_string(),
+                    AggFunc::StringAgg => "text".to_string(),
                 }
             }
         };
@@ -4930,6 +5009,16 @@ fn finish_aggregate(
                     None => None,
                     Some(node) => Some(lower_where(node, &def, params)?),
                 };
+                let agg_order = plan_aggregate_order(&f.agg_order, &def)?;
+                let mut agg_sep = None;
+                if name == "string_agg" {
+                    if f.args.len() != 2 {
+                        return Err(Error::Unsupported(
+                            "string_agg takes a value and a separator".into(),
+                        ));
+                    }
+                    agg_sep = Some(const_value(&f.args[1], params)?);
+                }
                 let (func, field, source_type) = if name == "count" && f.agg_star {
                     (AggFunc::CountStar, None, None)
                 } else {
@@ -4942,9 +5031,10 @@ fn finish_aggregate(
                         "bool_and" => AggFunc::BoolAnd,
                         "bool_or" => AggFunc::BoolOr,
                         "avg" => AggFunc::Avg,
+                        "string_agg" => AggFunc::StringAgg,
                         other => return Err(Error::Unsupported(format!("aggregate {other}()"))),
                     };
-                    if f.args.len() != 1 {
+                    if f.args.len() != usize::from(func == AggFunc::StringAgg) + 1 {
                         return Err(Error::Unsupported(
                             "an aggregate with more than one argument".into(),
                         ));
@@ -4980,6 +5070,8 @@ fn finish_aggregate(
                                 expr: Some(expr),
                                 distinct: f.agg_distinct,
                                 filter: agg_filter.clone(),
+                                sep: agg_sep.clone(),
+                                order: agg_order.clone(),
                             });
                             continue;
                         }
@@ -5000,6 +5092,19 @@ fn finish_aggregate(
                     rt.name.clone()
                 };
                 select.push((out.clone(), OutputCol::Agg(items.len())));
+                if func == AggFunc::StringAgg
+                    && !matches!(
+                        source_type.as_deref(),
+                        Some("text" | "varchar" | "bpchar" | "name" | "char")
+                    )
+                {
+                    // PostgreSQL has no `string_agg(integer, ...)`: it is a
+                    // missing FUNCTION, not an unsupported one.
+                    return Err(Error::UndefinedFunction(format!(
+                        "function string_agg({}, unknown) does not exist",
+                        source_type.as_deref().unwrap_or("unknown")
+                    )));
+                }
                 items.push(AggItem {
                     func,
                     field,
@@ -5008,6 +5113,8 @@ fn finish_aggregate(
                     expr: None,
                     distinct: f.agg_distinct,
                     filter: agg_filter,
+                    sep: agg_sep,
+                    order: agg_order,
                 });
             }
             Some(N::ColumnRef(c)) => {

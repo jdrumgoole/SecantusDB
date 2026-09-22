@@ -12336,6 +12336,7 @@ fn aggregate_wire_type(item: &AggItem) -> Type {
         AggFunc::Avg => wire_type(secantus_pgplan::avg_result_type(
             item.source_type.as_deref(),
         )),
+        AggFunc::StringAgg => Type::TEXT,
         // The result type is PostgreSQL's, which is not a uniform widening:
         // `sum(int4)` is bigint but `sum(int8)` is numeric, and a float sums
         // as itself (`secantus_pgplan::sum_result_type`).
@@ -12376,6 +12377,20 @@ fn compute_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
                 .collect();
             &filtered
         }
+    };
+    // `agg(x ORDER BY y)` sorts the group's rows before the values are
+    // collected -- the only thing that gives `string_agg` and `array_agg` a
+    // defined order.
+    let ordered: Vec<Document>;
+    let rows = if item.order.is_empty() {
+        rows
+    } else {
+        ordered = {
+            let mut copy = rows.to_vec();
+            sort_rows(&mut copy, &item.order);
+            copy
+        };
+        &ordered
     };
     let Some(field) = item.field.as_deref() else {
         // count(*)
@@ -12457,6 +12472,33 @@ fn compute_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
                 .map(|d| d.get(field).cloned().unwrap_or(Bson::Null))
                 .collect(),
         ),
+        // `string_agg(x, sep)` joins the non-NULL values in group order. An
+        // empty input is NULL like every aggregate but `count`, a NULL
+        // separator joins with nothing between them, and DISTINCT dedups AND
+        // SORTS -- PostgreSQL implements a DISTINCT aggregate by sorting its
+        // input, the same way `array_agg(DISTINCT ...)` shows (measured
+        // 14.24).
+        AggFunc::StringAgg => {
+            if values.is_empty() {
+                return Bson::Null;
+            }
+            let mut texts: Vec<String> = values
+                .iter()
+                .filter_map(|v| match v {
+                    Bson::String(t) => Some(t.clone()),
+                    _ => None,
+                })
+                .collect();
+            if item.distinct {
+                texts.sort();
+                texts.dedup();
+            }
+            let sep = match item.sep.as_ref() {
+                Some(Bson::String(t)) => t.as_str(),
+                _ => "",
+            };
+            Bson::String(texts.join(sep))
+        }
         // `avg` is the exact sum over the count. A float input averages in
         // floating point; everything else divides as NUMERIC, which is where
         // PostgreSQL's scale for the result comes from -- 16 decimal places
