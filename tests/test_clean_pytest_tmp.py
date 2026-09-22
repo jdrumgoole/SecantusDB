@@ -19,6 +19,7 @@ now instead of in three days.
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -217,22 +218,6 @@ def _make_probe_store(base: Path, pid: int, tag: str = "abcd1234") -> Path:
     return d
 
 
-def test_probe_store_of_a_dead_pid_is_reaped(tmp_path: Path) -> None:
-    """The backstop for a probe that died holding its store open.
-
-    ``probe_store``'s atexit delete cannot cover this: on Windows an open file
-    cannot be deleted at all, so a probe killed while its server is up leaves
-    the home behind with WiredTiger still holding it.
-    """
-    dead = _make_probe_store(tmp_path, 999_999_999)
-
-    reaped, freed = python_tasks._sweep_stale_probe_tmp(str(tmp_path))
-
-    assert reaped == 1, reaped
-    assert freed > 0
-    assert not dead.exists()
-
-
 def test_probe_store_of_a_live_pid_is_never_reaped(tmp_path: Path) -> None:
     """A probe running right now must keep its database."""
     live = _make_probe_store(tmp_path, os.getpid())
@@ -327,3 +312,73 @@ def test_probe_prefix_matches_the_probe_helper() -> None:
         pytest.skip("tools/probes/_servers needs pymongo")
 
     assert _servers.PROBE_TMP_PREFIX == python_tasks._PROBE_TMP_PREFIX
+
+
+# ------------------------------------------------- the store, not just the name
+
+
+def _probe_store(base: Path, pid: int, *, age_seconds: float = 0.0) -> Path:
+    """A probe store named for ``pid``, last modified ``age_seconds`` ago."""
+    d = base / f"{python_tasks._PROBE_TMP_PREFIX}{pid}-tag"
+    d.mkdir(parents=True)
+    (d / "WiredTiger.lock").write_bytes(b"")
+    (d / "WiredTiger.wt").write_bytes(b"x" * 1024)
+    if age_seconds:
+        when = time.time() - age_seconds
+        os.utime(d, (when, when))
+    return d
+
+
+def test_a_recently_written_store_is_never_swept(tmp_path: Path) -> None:
+    """The regression that matters: a LIVE database must keep its files.
+
+    On 2026-09-22 this sweep deleted a running mongod's dbpath. The directory
+    had been named by hand with a shell's ``$$`` instead of the server's pid,
+    so the name pointed at a process that had exited seconds later; the sweep
+    believed it and removed the store underneath a live database, which died
+    on a fatal WiredTiger assertion.
+
+    A name is written by whoever made the directory and can be wrong, so a
+    dead pid is no longer sufficient grounds. A store being served is written
+    to constantly, and that is the evidence used instead.
+    """
+    live = _probe_store(tmp_path, 999_999_999)  # dead pid, fresh mtime
+
+    reaped, _ = python_tasks._sweep_stale_probe_tmp(str(tmp_path))
+
+    assert reaped == 0, "swept a store that was just written to"
+    assert (live / "WiredTiger.wt").exists(), "deleted a live store's files"
+
+
+def test_an_old_abandoned_store_is_still_reaped(tmp_path: Path) -> None:
+    """The guard must not turn the sweep into a no-op.
+
+    Reclaiming abandoned stores is the entire point -- one session left 385 of
+    them, ~50 GiB -- so the grace period has to expire.
+    """
+    old = _probe_store(
+        tmp_path, 999_999_999, age_seconds=python_tasks._PROBE_TMP_GRACE_SECONDS + 60
+    )
+
+    reaped, freed = python_tasks._sweep_stale_probe_tmp(str(tmp_path))
+
+    assert reaped == 1
+    assert freed > 0
+    assert not old.exists()
+
+
+def test_a_live_pid_still_wins_regardless_of_age(tmp_path: Path) -> None:
+    """An old mtime does not license deleting a running process's store."""
+    mine = _probe_store(
+        tmp_path, os.getpid(), age_seconds=python_tasks._PROBE_TMP_GRACE_SECONDS + 60
+    )
+
+    reaped, _ = python_tasks._sweep_stale_probe_tmp(str(tmp_path))
+
+    assert reaped == 0
+    assert mine.exists()
+
+
+def test_wt_home_in_use_on_a_missing_path_fails_safe(tmp_path: Path) -> None:
+    """Ambiguous evidence answers IN USE -- refusing to delete is the safe way."""
+    assert python_tasks._wt_home_in_use(str(tmp_path / "gone")) is True

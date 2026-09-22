@@ -22,6 +22,7 @@ import re
 import shlex
 import shutil
 import sys
+import time
 
 from invoke.context import Context
 from invoke.tasks import task
@@ -360,6 +361,15 @@ def _sweep_stale_probe_tmp(base: str) -> tuple[int, int]:
         owner = name[len(_PROBE_TMP_PREFIX) :].split("-", 1)[0]
         if not owner.isdigit() or _pid_alive(int(owner)):
             continue
+        # The PID in the NAME is a hint, not proof of ownership, and trusting
+        # it alone deleted a RUNNING mongod's dbpath (2026-09-22): the name had
+        # been hand-rolled with a shell's `$$` rather than the server's PID, so
+        # the sweep saw a long-dead shell, reaped the directory, and mongod
+        # died on a fatal WiredTiger assertion -- "log pre-alloc server error
+        # ... the process must exit and restart". Ask the STORE whether it is
+        # in use before believing the name.
+        if _wt_home_in_use(path):
+            continue
         try:
             freed += _dir_size(path)
             shutil.rmtree(path, ignore_errors=True)
@@ -367,6 +377,61 @@ def _sweep_stale_probe_tmp(base: str) -> tuple[int, int]:
         except OSError:
             continue
     return (reaped, freed)
+
+
+#: How long a probe store must sit untouched before a dead pid is believed.
+#:
+#: The pid in the name is not trustworthy on its own -- see `_wt_home_in_use`.
+#: A store in use is written to constantly (WiredTiger checkpoints and rolls
+#: its log), so a recent mtime is strong evidence something is alive even when
+#: the name says otherwise. Half an hour costs nothing: an abandoned store is
+#: reclaimed on the next run after that, and the disk problem this whole sweep
+#: exists for is measured in days, not minutes.
+_PROBE_TMP_GRACE_SECONDS = 1800.0
+
+
+def _wt_home_in_use(path: str) -> bool:
+    """Whether a probe store may still belong to something alive.
+
+    The pid in a store's NAME is written by whoever created the directory, so
+    it can simply be wrong -- and when it is, the cost is a live database
+    losing its files. That happened on 2026-09-22: a name built from a shell's
+    `$$` rather than the server's pid sent this sweep through a running
+    mongod's dbpath, and it died on a fatal WiredTiger assertion.
+
+    **Recent modification is the signal, and it is the only one that works
+    everywhere.** A store being served is written to constantly, so a fresh
+    mtime means hands off. `WiredTiger.lock` looks like the better authority
+    and is not: POSIX advisory locks are held per PROCESS, so a check made
+    from the process that opened the store reports the file as free -- CI
+    failed exactly that way on macOS while Windows passed, because Windows
+    locks mandatorily at the handle. Worse, merely opening and closing a
+    descriptor to a file this process holds an `fcntl` lock on RELEASES that
+    lock, so the "safe" probe can itself break the database it is inspecting.
+
+    On Windows an attempted `os.remove` of the lock IS decisive (measured:
+    opening it `r+b` succeeds while WiredTiger holds it and distinguishes
+    nothing), so that runs as an extra gate there. It is destructive when it
+    answers "free", which is safe only because the caller deletes the whole
+    directory immediately afterwards -- do not reuse it as a predicate.
+
+    Ambiguity answers IN USE. A store left behind costs disk; a store deleted
+    too early costs data.
+    """
+    try:
+        age = time.time() - os.stat(path).st_mtime
+    except OSError:
+        return True
+    if age < _PROBE_TMP_GRACE_SECONDS:
+        return True
+
+    lock = os.path.join(path, "WiredTiger.lock")
+    if os.name == "nt" and os.path.isfile(lock):  # pragma: no cover - Windows
+        try:
+            os.remove(lock)
+        except OSError:
+            return True
+    return False
 
 
 def _pytest_tmp_owner_alive(path: str) -> bool:
