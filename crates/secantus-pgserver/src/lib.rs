@@ -12333,6 +12333,9 @@ fn aggregate_wire_type(item: &AggItem) -> Type {
     match item.func {
         AggFunc::CountStar | AggFunc::Count => Type::INT8,
         AggFunc::BoolAnd | AggFunc::BoolOr => Type::BOOL,
+        AggFunc::Avg => wire_type(secantus_pgplan::avg_result_type(
+            item.source_type.as_deref(),
+        )),
         // The result type is PostgreSQL's, which is not a uniform widening:
         // `sum(int4)` is bigint but `sum(int8)` is numeric, and a float sums
         // as itself (`secantus_pgplan::sum_result_type`).
@@ -12454,6 +12457,52 @@ fn compute_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
                 .map(|d| d.get(field).cloned().unwrap_or(Bson::Null))
                 .collect(),
         ),
+        // `avg` is the exact sum over the count. A float input averages in
+        // floating point; everything else divides as NUMERIC, which is where
+        // PostgreSQL's scale for the result comes from -- 16 decimal places
+        // for a small quotient, more when an input carries more
+        // (`'3.00000000000000000003'::numeric / 2` keeps 20). That rule lives
+        // in `decimal_arith`, which the `/` operator already uses, so avg
+        // does not get a second opinion on it.
+        AggFunc::Avg => {
+            if values.is_empty() {
+                return Bson::Null;
+            }
+            let count = values.len();
+            if values.iter().any(|v| matches!(v, Bson::Double(_))) {
+                let total: f64 = values
+                    .iter()
+                    .map(|v| match v {
+                        Bson::Int32(x) => f64::from(*x),
+                        Bson::Int64(x) => *x as f64,
+                        Bson::Double(x) => *x,
+                        other => secantus_pgplan::numeric::numeric_text(other)
+                            .and_then(|t| t.parse::<f64>().ok())
+                            .unwrap_or(0.0),
+                    })
+                    .sum();
+                return Bson::Double(total / count as f64);
+            }
+            let texts: Vec<String> = values
+                .iter()
+                .filter_map(|v| secantus_pgplan::numeric::numeric_operand_text(v))
+                .collect();
+            if texts.len() != count {
+                return Bson::Null;
+            }
+            let Some(total) =
+                secantus_pgplan::numeric::sum_numeric_texts(texts.iter().map(String::as_str))
+            else {
+                return Bson::Null;
+            };
+            let Some(total_text) = secantus_pgplan::numeric::numeric_operand_text(&total) else {
+                return Bson::Null;
+            };
+            match secantus_pgplan::numeric::decimal_arith("/", &total_text, &count.to_string()) {
+                Some(Ok(v)) => v,
+                _ => Bson::Null,
+            }
+        }
         AggFunc::Sum => {
             if values.is_empty() {
                 return Bson::Null;

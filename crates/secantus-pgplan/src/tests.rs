@@ -567,7 +567,7 @@ fn aggregate_refusals_carry_the_right_sqlstate() {
         // A bare column beside an aggregate must be grouped.
         ("SELECT name, count(*) FROM t", "42803"),
         // Deliberately deferred rather than approximated.
-        ("SELECT avg(n) FROM t", "0A000"),
+        ("SELECT string_agg(s, ',') FROM t", "0A000"),
         // `DISTINCT ON` over an aggregate resolves its keys against the GROUP
         // BY output, which this slice does not do; plain `count(DISTINCT n)`
         // IS supported (see `count_distinct_plans_a_distinct_aggregate`).
