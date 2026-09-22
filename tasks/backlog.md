@@ -1126,9 +1126,35 @@ These work end-to-end but cut corners.
       are pooled (#1538), a cursor cache would survive across statements,
       which is what makes it worth the refactor.
 
-      Not started deliberately: a large storage refactor begun late and left
-      half-done is worse than one not begun, and this one can silently return
-      wrong rows if the reset discipline slips.
+      **TRIED 2026-09-22 and it is NOT the cost -- cursor opens are cheap.**
+      A per-session cursor cache was built (`Session::with_cursor`, keyed
+      `(uri, config)`, reset-before-park so a parked cursor is always clean,
+      cleared in `Session::drop` before the session closes) and wired into the
+      `_id`-index and document-shard reads. Measured: cursor opens per row
+      read **3.00 -> 2.00**, and the row read **62.1us against 62.3us** --
+      no change. If three opens were the 8.7us, removing one should have
+      shown ~2.9us. It showed nothing.
+
+      So a WiredTiger cursor open costs well under a microsecond here, and
+      the count that looked damning was a red herring. **This is the third
+      hypothesis about this gap derived from a sampled profile, and the third
+      to fail under measurement** (`pgwire` codec, the catalog re-scan, now
+      cursor opens). The frames at the top of the profile keep being the most
+      VISIBLE work rather than the most expensive.
+
+      Reverted rather than shipped: an API change across every storage call
+      site, whose failure mode is a wrong row, for no measured gain.
+
+      One structural thing WAS learned and is worth acting on separately:
+      catalog reads run on a FRESH session per call (`op_session` returns
+      `OpSession::Fresh` outside a transaction), so the `secantus_collections`
+      open per read cannot be cached per session at all -- it is a new session
+      every time. That is why 3 went to 2 rather than to 0.
+
+      **The row read's ~8.7us is therefore still unattributed.** Do not open
+      with a profile next time: count and time the storage call itself
+      (`find_by_id` end to end) against what PostgreSQL does for the same
+      fetch, and bisect inside it.
 
 - [ ] **OPEN — RUST pgserver: the autocommit per-statement gap is in the WIRE
       layer, not the query engine (attributed 2026-09-20).** `select 1` costs
