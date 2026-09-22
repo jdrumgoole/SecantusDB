@@ -10337,6 +10337,11 @@ shared storage engine or building large new protocol subsystems:
   `OutputCol` names either a group key or an aggregate, with no room for a
   computation over them. `string_agg` is missing for the same reason it was
   invisible (not recognised as an aggregate); it too now refuses at plan time.
+  The other aggregate gaps from this list have since closed: `bool_and` /
+  `bool_or` on 2026-09-20, and `HAVING`, `FILTER (WHERE ...)` and `avg()` on
+  2026-09-22 -- avg divides the exact sum by the count through the same
+  `decimal_arith` the `/` operator uses, so PostgreSQL's result scale came
+  for free rather than being approximated.
 - [ ] **Rust PG server: `min` / `max` of a BOOLEAN are answered, where
   PostgreSQL refuses** (2026-09-20). `select max(ok) from b` gives `true`;
   PostgreSQL 14.24 raises `42883 function max(boolean) does not exist`. Being

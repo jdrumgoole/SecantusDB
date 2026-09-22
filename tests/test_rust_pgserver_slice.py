@@ -259,7 +259,7 @@ def test_duplicate_key_reports_what_postgres_reports(home: Path) -> None:
         # Unsupported must be an honest 0A000 -- never a wrong row. There is no
         # fallback into Python by design.
         ("SELECT * FROM t JOIN t AS u ON t.id = u.id", "0A000"),
-        ("SELECT avg(n) FROM t", "0A000"),
+        ("SELECT string_agg(name, ',') FROM t", "0A000"),
         ("SELECT n, count(*) FROM t", "42803"),
         ("SELECT * FROM t WHERE n LIKE 'x'", "0A000"),
         ("SELECT * FROM t ORDER BY n + 1", "0A000"),
@@ -9963,3 +9963,39 @@ def test_aggregate_filter(home: Path) -> None:
             "select g from t group by g having count(*) filter (where n > 8) = 2 order by g"
         ) == [(1,)]
         assert q("select count(distinct s) filter (where id < 4) from t") == [(3,)]
+
+
+def test_avg(home: Path) -> None:
+    """`avg()` was deferred because it "returns PostgreSQL numeric with its own
+    scale rules".
+
+    Those rules are the ones numeric DIVISION already follows here: 16 decimal
+    places for a small quotient, more when an input carries more. So `avg` is
+    the exact sum over the count, divided the same way, and gets the scale
+    right without a second opinion. Values measured on PostgreSQL 14.24.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute(
+            "create table t (id int primary key, g int, i4 int4, f8 float8, nu numeric, ns numeric)"
+        )
+        conn.execute(
+            "insert into t values (1,1,1,1.0,1.5,'1.00000000000000000001'),"
+            "(2,1,2,2.0,2.5,'2.00000000000000000002'),(3,2,4,4.0,1.25,3),(4,2,null,null,null,null)"
+        )
+        one = lambda sql: conn.execute(sql).fetchall()[0][0]  # noqa: E731
+        assert str(one("select avg(i4) from t")) == "2.3333333333333333"
+        assert str(one("select avg(nu) from t")) == "1.7500000000000000"
+        # An input with 20 decimals keeps 20, not 16.
+        assert str(one("select avg(ns) from t")) == "2.00000000000000000001"
+        # A float averages as a float, not a numeric.
+        assert one("select avg(f8) from t") == pytest.approx(2.3333333333333335)
+        cur = conn.execute("select avg(i4), avg(f8) from t")
+        cur.fetchall()
+        assert [d.type_code for d in cur.description] == [1700, 701]
+        # Empty input is NULL, and avg composes with the rest.
+        assert one("select avg(i4) from t where id > 99") is None
+        assert str(one("select avg(i4) filter (where id < 3) from t")) == "1.5000000000000000"
+        assert str(one("select avg(distinct i4) from t")) == "2.3333333333333333"
+        assert conn.execute(
+            "select g from t group by g having avg(i4) > 2 order by g"
+        ).fetchall() == [(2,)]

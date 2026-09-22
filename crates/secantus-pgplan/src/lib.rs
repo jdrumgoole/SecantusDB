@@ -685,6 +685,10 @@ pub enum AggFunc {
     /// skipped, NULL over an empty input.
     BoolAnd,
     BoolOr,
+    /// `avg(col)` -- the exact sum divided by the count. A float input
+    /// averages as a float; everything else answers `numeric`, at the scale
+    /// PostgreSQL's division picks.
+    Avg,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2791,6 +2795,17 @@ pub fn insert_row(
 /// a `float8` column was DESCRIBED as an integer while the value `1.5` went
 /// out on the wire -- and the client raised `invalid literal for int()`
 /// rather than getting a number. A wrong type here is not cosmetic.
+/// The type `avg()` returns for an input type (PostgreSQL 14.24, measured
+/// 2026-09-22): a float averages as `float8`, an interval as `interval`, and
+/// everything else -- the integers and `numeric` -- as `numeric`.
+pub fn avg_result_type(source: Option<&str>) -> &'static str {
+    match source {
+        Some("float4" | "real" | "float8" | "double precision") => "float8",
+        Some("interval") => "interval",
+        _ => "numeric",
+    }
+}
+
 pub fn sum_result_type(source: Option<&str>) -> &'static str {
     match source {
         Some("float4" | "real") => "float4",
@@ -3975,6 +3990,7 @@ fn plan_bare_aggregate(
         "array_agg" => AggFunc::ArrayAgg,
         "bool_and" => AggFunc::BoolAnd,
         "bool_or" => AggFunc::BoolOr,
+        "avg" => AggFunc::Avg,
         other => return Err(Error::Unsupported(format!("aggregate {other}()"))),
     };
     if f.args.len() != 1 {
@@ -4702,6 +4718,7 @@ pub fn aggregate_output_def(agg: &Aggregate) -> Result<TableDef> {
                         format!("{}[]", item.source_type.as_deref().unwrap_or("text"))
                     }
                     AggFunc::BoolAnd | AggFunc::BoolOr => "bool".to_string(),
+                    AggFunc::Avg => avg_result_type(item.source_type.as_deref()).to_string(),
                 }
             }
         };
@@ -4924,8 +4941,7 @@ fn finish_aggregate(
                         "array_agg" => AggFunc::ArrayAgg,
                         "bool_and" => AggFunc::BoolAnd,
                         "bool_or" => AggFunc::BoolOr,
-                        // `avg` returns PostgreSQL `numeric` with its own scale
-                        // rules; approximating it would be a wrong answer.
+                        "avg" => AggFunc::Avg,
                         other => return Err(Error::Unsupported(format!("aggregate {other}()"))),
                     };
                     if f.args.len() != 1 {
