@@ -360,6 +360,15 @@ def _sweep_stale_probe_tmp(base: str) -> tuple[int, int]:
         owner = name[len(_PROBE_TMP_PREFIX) :].split("-", 1)[0]
         if not owner.isdigit() or _pid_alive(int(owner)):
             continue
+        # The PID in the NAME is a hint, not proof of ownership, and trusting
+        # it alone deleted a RUNNING mongod's dbpath (2026-09-22): the name had
+        # been hand-rolled with a shell's `$$` rather than the server's PID, so
+        # the sweep saw a long-dead shell, reaped the directory, and mongod
+        # died on a fatal WiredTiger assertion -- "log pre-alloc server error
+        # ... the process must exit and restart". Ask the STORE whether it is
+        # in use before believing the name.
+        if _wt_home_in_use(path):
+            continue
         try:
             freed += _dir_size(path)
             shutil.rmtree(path, ignore_errors=True)
@@ -367,6 +376,55 @@ def _sweep_stale_probe_tmp(base: str) -> tuple[int, int]:
         except OSError:
             continue
     return (reaped, freed)
+
+
+def _wt_home_in_use(path: str) -> bool:
+    """Whether a WiredTiger home still belongs to a live process.
+
+    This is the authority the PID in a store's NAME is not. A name is written
+    by whoever created the directory and can be wrong -- and when it is wrong
+    the cost is a live database losing its files underneath it, which is the
+    one outcome a janitor in this repo must never produce.
+
+    **Windows: the probe CONSUMES the lock file.** Measured on this box --
+    opening `WiredTiger.lock` with `r+b` SUCCEEDS while WiredTiger holds it, so
+    it says nothing; `os.remove` is what raises `PermissionError`. That makes
+    the check destructive when it answers "not in use", which is safe only
+    because the caller rmtrees the whole directory immediately afterwards.
+    Do not reuse this as a general-purpose predicate.
+
+    POSIX takes the non-destructive route: WiredTiger `flock`s the file, so a
+    non-blocking exclusive lock fails exactly when it is held.
+
+    Anything ambiguous -- unreadable, an unexpected error -- answers IN USE.
+    Refusing to delete is the safe direction, and a store left behind costs
+    disk where a store deleted too early costs data.
+    """
+    lock = os.path.join(path, "WiredTiger.lock")
+    if not os.path.isfile(lock):
+        # No lock file: never a WiredTiger home, or one that was closed
+        # cleanly. Either way nothing holds it.
+        return False
+
+    if os.name == "nt":  # pragma: no cover - exercised only on Windows
+        try:
+            os.remove(lock)
+        except OSError:
+            return True
+        return False
+
+    try:
+        import fcntl
+
+        with open(lock, "rb") as fh:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return True
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            return False
+    except OSError:
+        return True
 
 
 def _pytest_tmp_owner_alive(path: str) -> bool:

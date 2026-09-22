@@ -327,3 +327,65 @@ def test_probe_prefix_matches_the_probe_helper() -> None:
         pytest.skip("tools/probes/_servers needs pymongo")
 
     assert _servers.PROBE_TMP_PREFIX == python_tasks._PROBE_TMP_PREFIX
+
+
+# ------------------------------------------------- the store, not just the name
+
+
+def test_a_live_wiredtiger_home_is_never_swept(tmp_path: Path) -> None:
+    """The regression that matters: a RUNNING database must keep its files.
+
+    On 2026-09-22 this sweep deleted a live mongod's dbpath. The directory had
+    been named by hand with a shell's ``$$`` instead of the server's pid, so
+    the name pointed at a long-dead shell; the sweep believed it and rmtree'd
+    the store, and mongod died on a fatal WiredTiger assertion. A name is
+    written by whoever made the directory and can simply be wrong -- so the
+    store itself is asked, and a dead pid is no longer sufficient grounds.
+    """
+    from secantus import SecantusDBServer
+
+    # A real WiredTiger home, open, named for a pid that is definitely gone.
+    home = tmp_path / f"{python_tasks._PROBE_TMP_PREFIX}999999999-live"
+    home.mkdir()
+    server = SecantusDBServer(port=0, storage_path=str(home))
+    server.start()
+    try:
+        assert python_tasks._wt_home_in_use(str(home)), "an open WT home reads as free"
+
+        reaped, _ = python_tasks._sweep_stale_probe_tmp(str(tmp_path))
+
+        assert reaped == 0, "swept a live database"
+        assert (home / "WiredTiger.wt").exists(), "deleted a live store's files"
+    finally:
+        server.stop()
+
+
+def test_a_closed_wiredtiger_home_is_still_reaped(tmp_path: Path) -> None:
+    """The guard must not turn the sweep into a no-op.
+
+    A store whose server has stopped is exactly what this reclaims, and the
+    whole point of the fix is that it keeps doing so.
+    """
+    from secantus import SecantusDBServer
+
+    home = tmp_path / f"{python_tasks._PROBE_TMP_PREFIX}999999999-done"
+    home.mkdir()
+    server = SecantusDBServer(port=0, storage_path=str(home))
+    server.start()
+    server.stop()
+
+    assert not python_tasks._wt_home_in_use(str(home))
+
+    reaped, _ = python_tasks._sweep_stale_probe_tmp(str(tmp_path))
+
+    assert reaped == 1
+    assert not home.exists()
+
+
+def test_wt_home_in_use_is_false_without_a_lock_file(tmp_path: Path) -> None:
+    """A plain directory is not a WiredTiger home and blocks nothing."""
+    d = tmp_path / "plain"
+    d.mkdir()
+    (d / "notes.txt").write_text("x")
+
+    assert python_tasks._wt_home_in_use(str(d)) is False

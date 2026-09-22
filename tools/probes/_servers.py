@@ -51,6 +51,14 @@ DEFAULT_MONGOD = "mongodb://127.0.0.1:27041"
 #: NOT clean -- a probe killed mid-flight, which is routine -- so
 #: ``_sweep_stale_probe_tmp`` can tell an abandoned store from a live one
 #: instead of guessing from mtime.
+#:
+#: **Never hand-roll a name with this prefix.** Call ``probe_store()``, which
+#: fills in ``os.getpid()``. A shell script once built one with ``$$`` -- the
+#: SHELL's pid, not the server it launched -- and handed it to a detached
+#: mongod; the shell exited, a later sweep saw a dead pid, and a RUNNING
+#: database lost its files and died on a fatal WiredTiger assertion. The sweep
+#: now asks the store itself whether it is in use before believing the name
+#: (``python_tasks._wt_home_in_use``), but the name should still be right.
 PROBE_TMP_PREFIX = "secantus-probe-"
 
 
