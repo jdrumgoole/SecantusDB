@@ -259,7 +259,7 @@ def test_duplicate_key_reports_what_postgres_reports(home: Path) -> None:
         # Unsupported must be an honest 0A000 -- never a wrong row. There is no
         # fallback into Python by design.
         ("SELECT * FROM t JOIN t AS u ON t.id = u.id", "0A000"),
-        ("SELECT string_agg(name, ',') FROM t", "0A000"),
+        ("SELECT count(*) + 1 FROM t", "0A000"),
         ("SELECT n, count(*) FROM t", "42803"),
         ("SELECT * FROM t WHERE n LIKE 'x'", "0A000"),
         ("SELECT * FROM t ORDER BY n + 1", "0A000"),
@@ -9778,17 +9778,17 @@ def test_array_agg_over_an_empty_input_is_null(home: Path) -> None:
 def test_unsupported_aggregates_refuse_the_same_way_on_an_empty_table(home: Path) -> None:
     """The silent half of a missing feature.
 
-    `string_agg` and an aggregate wrapped in an expression are not
-    implemented. They used to be planned as a plain SELECT with a computed
-    column, so the refusal came from evaluating a row -- and over an EMPTY
-    table no row was evaluated, so the client got zero rows and no error
-    where PostgreSQL answers one row. Both now refuse while planning, so the
-    answer does not depend on whether the table happens to be empty.
+    An aggregate wrapped in an expression is not implemented. These used to
+    be planned as a plain SELECT with a computed column, so the refusal came
+    from evaluating a row -- and over an EMPTY table no row was evaluated, so
+    the client got zero rows and no error where PostgreSQL answers one row.
+    They now refuse while planning, so the answer does not depend on whether
+    the table happens to be empty. (`string_agg` was here too until it landed
+    on 2026-09-22.)
     """
     with _Server(home) as server, server.connect() as conn:
         conn.execute("create table t (id int primary key, n int, s text)")
         for sql in (
-            "select string_agg(s, ',') from t",
             "select sum(n) + 0 from t",
             "select count(*) + 1 from t",
             "select coalesce(sum(n), -1) from t",
@@ -9797,7 +9797,7 @@ def test_unsupported_aggregates_refuse_the_same_way_on_an_empty_table(home: Path
                 conn.execute(sql).fetchall()
             assert empty.value.sqlstate == "0A000", sql
         conn.execute("insert into t values (1, 1, 'a')")
-        for sql in ("select string_agg(s, ',') from t", "select sum(n) + 0 from t"):
+        for sql in ("select count(*) + 1 from t", "select sum(n) + 0 from t"):
             with pytest.raises(psycopg.Error) as filled:
                 conn.execute(sql).fetchall()
             assert filled.value.sqlstate == "0A000", sql
@@ -9999,3 +9999,61 @@ def test_avg(home: Path) -> None:
         assert conn.execute(
             "select g from t group by g having avg(i4) > 2 order by g"
         ).fetchall() == [(2,)]
+
+
+def test_string_agg(home: Path) -> None:
+    """`string_agg` was refused: it takes TWO arguments, which the aggregate
+    planner rejected outright.
+
+    Measured against PostgreSQL 14.24 (2026-09-22): the non-NULL values are
+    joined in group order, an empty input is NULL, a NULL separator joins with
+    nothing between them, and DISTINCT dedups AND sorts.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table t (id int primary key, g int, s text, n int)")
+        conn.execute(
+            "insert into t values (1,1,'b',2),(2,1,'a',1),(3,2,'c',3),(4,2,null,4),(5,3,'d',5)"
+        )
+        one = lambda sql: conn.execute(sql).fetchall()[0][0]  # noqa: E731
+        assert one("select string_agg(s, ',') from t") == "b,a,c,d"
+        assert conn.execute(
+            "select g, string_agg(s, ',') from t group by g order by g"
+        ).fetchall() == [(1, "b,a"), (2, "c"), (3, "d")]
+        assert one("select string_agg(s, '-') from t where id > 99") is None
+        assert one("select string_agg(s, ',') from t where s is null") is None
+        assert one("select string_agg(distinct s, ',') from t") == "a,b,c,d"
+        assert one("select string_agg(s, null) from t") == "bacd"
+        assert one("select string_agg(s, ',') filter (where id < 3) from t") == "b,a"
+        # A non-text argument is a missing FUNCTION, as PostgreSQL has it.
+        with pytest.raises(psycopg.Error) as exc:
+            conn.execute("select string_agg(n, ',') from t").fetchall()
+        assert exc.value.sqlstate == "42883"
+
+
+def test_order_by_inside_an_aggregate(home: Path) -> None:
+    """`array_agg(x ORDER BY y)` / `string_agg(x, s ORDER BY y)` sort the
+    group's rows before the values are collected -- the only thing that gives
+    either aggregate a defined order. Values from PostgreSQL 14.24."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table t (id int primary key, g int, s text, n int)")
+        conn.execute(
+            "insert into t values (1,1,'b',2),(2,1,'a',1),(3,2,'c',3),(4,2,null,4),(5,3,'d',5)"
+        )
+        one = lambda sql: conn.execute(sql).fetchall()[0][0]  # noqa: E731
+        assert one("select array_agg(s order by s) from t") == ["a", "b", "c", "d", None]
+        assert one("select array_agg(s order by id desc) from t") == ["d", None, "c", "a", "b"]
+        assert one("select array_agg(s order by s nulls first) from t") == [
+            None,
+            "a",
+            "b",
+            "c",
+            "d",
+        ]
+        assert one("select string_agg(s, ',' order by id desc) from t") == "d,c,a,b"
+        assert conn.execute(
+            "select g, array_agg(s order by id desc) from t group by g order by g"
+        ).fetchall() == [(1, ["a", "b"]), (2, [None, "c"]), (3, ["d"])]
+        # An expression key is refused rather than answered in another order.
+        with pytest.raises(psycopg.Error) as exc:
+            conn.execute("select array_agg(s order by length(s)) from t").fetchall()
+        assert exc.value.sqlstate == "0A000"
