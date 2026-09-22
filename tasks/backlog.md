@@ -3413,6 +3413,27 @@ all match, and so do CREATE INDEX / VIEW and their error surface. What is open:
       Postgres raises `42704 role "nosuchuser" does not exist`.
 - [ ] **`CREATE OR REPLACE VIEW` may drop columns.** Postgres refuses with
       `42P16 cannot drop columns from view`; we replace the definition happily.
+- [ ] **The PYTHON server rejects `CREATE FUNCTION ... LANGUAGE internal`**
+      (`only LANGUAGE sql / plpgsql`), where PostgreSQL accepts it and **the
+      RUST pgserver already implements it** — see
+      `tests/test_rust_pgserver_slice.py::test_internal_function_ddl_notices_and_errors`,
+      which pins five behaviours measured against PostgreSQL 16: a shell
+      argument/return type accepted with a 42809 NOTICE naming the type
+      unquoted, an unknown return type becoming a new shell with a 42704
+      NOTICE, an unknown argument type as a 42704 error, an unknown built-in
+      as 42883, and a duplicate signature as 42723 unless OR REPLACE.
+      Blocks pgjdbc's `getSqlTypes`, which creates `public.array_in` purely so
+      `getTypeInfo()` can see it. Deliberately NOT half-built (measured
+      2026-09-20): that Rust test is the specification to port, and a partial
+      version is exactly the "half-implemented feature that silently diverges"
+      this project prefers a clean refusal over.
+- [ ] **`PARALLEL SAFE` / `UNSAFE` / `RESTRICTED` does not parse.** sqlglot
+      falls back to a `Command` node, so the statement surfaces as the generic
+      `command CREATE is not supported` rather than anything about PARALLEL.
+      Fixable in the planner pre-parse beside the `RETURNS trigger` rewrite;
+      the attribute is a no-op here (we model neither `proparallel` nor
+      `provolatile`, and `STABLE` / `STRICT` already parse and are ignored).
+      Measured 2026-09-20.
 - [ ] **`getProcedureColumns` returns nothing for a schema's PROCEDURE.**
       pgjdbc's `getProceduresWithCorrectCatalogAndWithout` asserts
       `getProcedureColumns(null, 'hasprocedures', null, null)` yields 1 row for
