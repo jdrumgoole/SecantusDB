@@ -1151,10 +1151,37 @@ These work end-to-end but cut corners.
       open per read cannot be cached per session at all -- it is a new session
       every time. That is why 3 went to 2 rather than to 0.
 
-      **The row read's ~8.7us is therefore still unattributed.** Do not open
-      with a profile next time: count and time the storage call itself
-      (`find_by_id` end to end) against what PostgreSQL does for the same
-      fetch, and bisect inside it.
+      **ATTRIBUTED 2026-09-22 by timing storage directly, and the thread is
+      at diminishing returns.** The read goes through `find_matching` (not
+      `find_by_id`), which takes **6.0us** steady-state -- most of the ~10.6us
+      a row read adds over `select 1`. PostgreSQL does the whole extra fetch
+      in ~2.0us, so storage is ~3x, not 5x.
+
+      **Verified first that this is not a planning bug**, which would have
+      mattered more than the microseconds: the lookup is CONSTANT TIME across
+      table sizes (62.4us at 1,000 rows and 62.4us at 10,000; PostgreSQL 29.2
+      and 28.8), so the primary-key index is genuinely being used.
+
+      **How the ~30us row-read gap actually decomposes:**
+
+      | part | ours over PG |
+      | --- | --- |
+      | everything a `select 1` already pays (protocol + per-statement transaction) | ~21us |
+      | the row fetch itself, of which `find_matching` is 6.0us | ~9us |
+
+      So the row read is NOT where the gap mostly lives -- it inherits the
+      constant-statement cost and adds a third on top. Closing `find_matching`
+      to PostgreSQL's 2us entirely would win ~4us of ~30.
+
+      **Recommendation: stop optimising here.** What is left is scattered in
+      2-6us pieces across machinery already picked over -- `describe_portal`
+      3.07us, `on_sync` 3.39us, `find_matching` 6.0us -- and three profile-led
+      hypotheses have already cost more than they returned. The remaining
+      structural idea with real headroom is the one this thread keeps
+      circling: a statement that touches no storage should not open a
+      transaction at all, which needs the group's rollback semantics reworked
+      rather than a micro-fix, and is only worth it if someone wants the
+      extended path materially cheaper for ALL statements.
 
 - [ ] **OPEN — RUST pgserver: the autocommit per-statement gap is in the WIRE
       layer, not the query engine (attributed 2026-09-20).** `select 1` costs
