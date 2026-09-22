@@ -2004,6 +2004,9 @@ impl PgHandler {
                         let v = match col {
                             OutputCol::Group(i) => key.get(*i).cloned().flatten(),
                             OutputCol::Agg(i) => vals.get(*i).cloned(),
+                            OutputCol::Expr(i) => {
+                                Self::aggregate_expr_value(agg, *i, &key, &vals).ok()
+                            }
                         };
                         group_key_ident(&v)
                     })
@@ -2041,6 +2044,7 @@ impl PgHandler {
                 let v = match col {
                     OutputCol::Group(i) => key[*i].clone().unwrap_or(Bson::Null),
                     OutputCol::Agg(i) => vals[*i].clone(),
+                    OutputCol::Expr(i) => Self::aggregate_expr_value(agg, *i, &key, &vals)?,
                 };
                 doc.insert(name.clone(), v);
             }
@@ -7668,6 +7672,34 @@ impl PgHandler {
         }
     }
 
+    /// One group's value for an output column that is an EXPRESSION over the
+    /// grouped values -- `count(*) + 1`, `coalesce(sum(n), 0)`.
+    ///
+    /// The aggregates inside it were planned as ordinary items, so the
+    /// expression reads them back from a row built here: each item's value
+    /// under its `__aggval<i>` slot, each grouping column under its own
+    /// field. That row is what the planner typed the expression against.
+    fn aggregate_expr_value(
+        agg: &secantus_pgplan::Aggregate,
+        index: usize,
+        key: &[Option<Bson>],
+        vals: &[Bson],
+    ) -> PgWireResult<Bson> {
+        let mut row = Document::new();
+        for (i, v) in vals.iter().enumerate() {
+            row.insert(format!("__aggval{i}"), v.clone());
+        }
+        for (i, k) in agg.group_by.iter().enumerate() {
+            if k.expr.is_none() {
+                row.insert(
+                    k.field.clone(),
+                    key.get(i).cloned().flatten().unwrap_or(Bson::Null),
+                );
+            }
+        }
+        secantus_pgplan::apply_row_expr(&agg.exprs[index], &row).map_err(|e| Self::err(&e))
+    }
+
     /// A row-producing statement as `(schema, rows)`: what a set operation
     /// needs from each of its sides.
     fn rows_with_schema(&self, stmt: &Statement) -> PgWireResult<SchemaAndRows> {
@@ -10164,13 +10196,27 @@ impl PgHandler {
                                     self.user_wire_type(t).unwrap_or_else(|| wire_type(t))
                                 }
                                 OutputCol::Agg(i) => aggregate_wire_type(&agg.items[*i]),
+                                OutputCol::Expr(i) => {
+                                    let t = secantus_pgplan::column_expr_type(&agg.exprs[*i]);
+                                    self.user_wire_type(t).unwrap_or_else(|| wire_type(t))
+                                }
                             };
-                            self.field(name.clone(), ty)
+                            // `min` / `max` over `char(n)` answer that same
+                            // padded type, and the encoder pads on the way out.
+                            let typmod = match col {
+                                OutputCol::Agg(i) => aggregate_result_typmod(&agg.items[*i]),
+                                _ => -1,
+                            };
+                            self.field_mod(name.clone(), ty, typmod)
                         })
                         .collect::<Vec<_>>(),
                 );
 
                 let select = agg.select.clone();
+                // The closure outlives this scope, so it takes its own copy of
+                // the plan -- the expression outputs read the items and keys
+                // back out of it per group.
+                let expr_agg = agg.clone();
                 let schema_ref = schema.clone();
                 let rows = stream::iter(groups).map(move |(key, vals)| {
                     let mut enc = DataRowEncoder::new(schema_ref.clone());
@@ -10178,6 +10224,10 @@ impl PgHandler {
                         let v = match col {
                             OutputCol::Group(i) => key[*i].clone().unwrap_or(Bson::Null),
                             OutputCol::Agg(i) => vals[*i].clone(),
+                            OutputCol::Expr(i) => {
+                                Self::aggregate_expr_value(&expr_agg, *i, &key, &vals)
+                                    .unwrap_or(Bson::Null)
+                            }
                         };
                         encode_field_value(
                             &mut enc,
@@ -12292,6 +12342,8 @@ fn having_holds(having: &secantus_pgplan::Having, key: &[Option<Bson>], vals: &[
                 None | Some(Bson::Null) => None,
                 Some(v) => Some(v.clone()),
             },
+            // `plan_having` only ever names an aggregate or a grouping key.
+            OutputCol::Expr(_) => None,
         }
     };
     match having {
@@ -12322,6 +12374,17 @@ fn having_holds(having: &secantus_pgplan::Having, key: &[Option<Bson>], vals: &[
                 _ => false,
             }
         }
+    }
+}
+
+/// The `atttypmod` an aggregate's result carries: only `min` / `max` over a
+/// `char(n)` column, which answer that same blank-padded type.
+fn aggregate_result_typmod(item: &AggItem) -> i32 {
+    match item.func {
+        AggFunc::Min | AggFunc::Max if item.source_type.as_deref() == Some("bpchar") => {
+            item.source_typmod
+        }
+        _ => -1,
     }
 }
 
@@ -12395,6 +12458,40 @@ fn compute_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
     let Some(field) = item.field.as_deref() else {
         // count(*)
         return Bson::Int64(rows.len() as i64);
+    };
+    // `array_agg` of a `char(n)` column collects the BLANK-PADDED values: the
+    // array's elements are bpchar and PostgreSQL renders them padded.
+    //
+    // `min` / `max` are deliberately NOT padded here. They answer a bpchar
+    // too, but padding is a property of the OUTPUT rather than of the value:
+    // `select min(c)` displays `ab  ` while `min(c) || '|'` converts to text
+    // first and answers `ab|`. Padding the value would get the concatenation
+    // wrong, so the row description carries the width and the encoder pads.
+    // `string_agg` coerces its argument to text, which strips, and the
+    // counting aggregates cannot tell. (All measured on PostgreSQL 14.24.)
+    let padded_rows: Vec<Document>;
+    let rows = if item.source_typmod > 4
+        && item.source_type.as_deref() == Some("bpchar")
+        && matches!(item.func, AggFunc::ArrayAgg)
+    {
+        let width = (item.source_typmod - 4) as usize;
+        padded_rows = rows
+            .iter()
+            .map(|d| {
+                let mut copy = d.clone();
+                if let Some(Bson::String(text)) = d.get(field) {
+                    if text.chars().count() < width {
+                        let mut wide = text.clone();
+                        wide.extend(std::iter::repeat_n(' ', width - text.chars().count()));
+                        copy.insert(field, Bson::String(wide));
+                    }
+                }
+                copy
+            })
+            .collect();
+        &padded_rows
+    } else {
+        rows
     };
     let mut values: Vec<&Bson> = rows
         .iter()
@@ -14363,6 +14460,10 @@ impl PgHandler {
                     let ty = match col {
                         OutputCol::Agg(i) => aggregate_wire_type(&agg.items[*i]),
                         OutputCol::Group(_) => Type::INT4,
+                        OutputCol::Expr(i) => {
+                            let t = secantus_pgplan::column_expr_type(&agg.exprs[*i]);
+                            self.user_wire_type(t).unwrap_or_else(|| wire_type(t))
+                        }
                     };
                     self.field(name.clone(), ty)
                 })
@@ -14377,6 +14478,10 @@ impl PgHandler {
                             self.user_wire_type(t).unwrap_or_else(|| wire_type(t))
                         }
                         OutputCol::Agg(i) => aggregate_wire_type(&agg.items[*i]),
+                        OutputCol::Expr(i) => {
+                            let t = secantus_pgplan::column_expr_type(&agg.exprs[*i]);
+                            self.user_wire_type(t).unwrap_or_else(|| wire_type(t))
+                        }
                     };
                     self.field(name.clone(), ty)
                 })
