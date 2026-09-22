@@ -193,8 +193,9 @@ class _RustServer:
         )
         if not binary.exists():
             raise SystemExit(f"{binary} is not built -- cd crates/secantus-pgserver && cargo build")
+        self.store_dir = tempfile.mkdtemp(prefix=f"secantus-probe-{os.getpid()}-pg-rust-")
         self.proc = subprocess.Popen(
-            [str(binary), tempfile.mkdtemp(prefix="pgprobe-rust-"), "127.0.0.1:0"],
+            [str(binary), self.store_dir, "127.0.0.1:0"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -209,6 +210,10 @@ class _RustServer:
     def stop(self) -> None:
         self.proc.terminate()
         self.proc.wait(timeout=10)
+        # The server is gone, so its WiredTiger home is ours to delete. It used
+        # to be left behind on every run -- ~130 MB a time, and a probe is run
+        # in a loop.
+        shutil.rmtree(self.store_dir, ignore_errors=True)
 
 
 def main(setup_path: str, corpus_path: str, *, types: bool, tags: bool, server: str) -> int:
@@ -221,7 +226,7 @@ def main(setup_path: str, corpus_path: str, *, types: bool, tags: bool, server: 
             host=host, port=port, dbname="postgres", user="probe", autocommit=True
         )
     else:
-        store_dir = tempfile.mkdtemp(prefix="pgprobe-")
+        store_dir = tempfile.mkdtemp(prefix=f"secantus-probe-{os.getpid()}-pg-")
         store = Storage(store_dir)
         srv = SecantusPGServer(port=0, storage=store)
         srv.start()
@@ -265,6 +270,7 @@ def main(setup_path: str, corpus_path: str, *, types: bool, tags: bool, server: 
     srv.stop()
     if store is not None:
         store.close()
+        shutil.rmtree(store_dir, ignore_errors=True)
         shutil.rmtree(store_dir, ignore_errors=True)
     return 1 if diffs else 0
 

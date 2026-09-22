@@ -14,9 +14,9 @@ encoded that accident as "they are equal".
 
 import os
 import sys
-import tempfile
 
 import pymongo
+from _servers import probe_store
 from bson import Code, Decimal128, Int64, ObjectId, Regex
 
 from secantus import SecantusDBServer
@@ -25,7 +25,7 @@ targets = [
     ("mongod", pymongo.MongoClient(os.environ.get("PROBE_MONGOD", "mongodb://127.0.0.1:27041")))
 ]
 
-_s = SecantusDBServer(port=0, storage_path=tempfile.mkdtemp())
+_s = SecantusDBServer(port=0, storage_path=probe_store())
 _s.start()
 targets.append(("python", pymongo.MongoClient(_s.uri)))
 if os.environ.get("PROBE_SERVER"):

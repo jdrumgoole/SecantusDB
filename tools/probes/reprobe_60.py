@@ -10,10 +10,10 @@ import argparse
 import shutil
 import socket
 import subprocess
-import tempfile
 import time
 
 import pymongo
+from _servers import probe_store
 from bson import Decimal128
 from pymongo import MongoClient
 
@@ -131,14 +131,14 @@ def main() -> int:
     if not mongod:
         print("no mongod on PATH")
         return 2
-    tmp = tempfile.mkdtemp()
+    tmp = probe_store()
     port = _free()
     proc = subprocess.Popen(
         [mongod, "--port", str(port), "--dbpath", tmp, "--quiet"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    home = tempfile.mkdtemp()
+    home = probe_store()
     srv = SecantusDBServer(port=0, storage_path=home)
     srv.start()
     try:

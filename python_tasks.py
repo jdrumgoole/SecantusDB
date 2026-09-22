@@ -240,9 +240,26 @@ def clean(c: Context) -> None:
             f"({freed / 1024**3:.1f} GiB) under {base}"
         )
 
+    reaped, freed = _sweep_stale_probe_tmp(base)
+    if reaped:
+        print(
+            f"clean: reaped {reaped} abandoned probe store(s) "
+            f"({freed / 1024**3:.1f} GiB) under {base}"
+        )
 
-#: How many numbered pytest dirs to keep, mirroring pytest's own retention.
-_PYTEST_TMP_KEEP = 3
+
+#: How many numbered pytest dirs to keep.
+#:
+#: ONE, not pytest's own default of three, because of what a run costs here. The
+#: docstring below used to say "~1.7 GiB a run"; measured on 2026-09-22 a full
+#: 16-worker run leaves **~104 GiB** -- the suite has grown by orders of
+#: magnitude since that number was written, and nothing re-derived it. Three
+#: retained runs is then ~300 GiB of WiredTiger homes, which is how a 935 GiB
+#: box reached 50 MB free with the janitor working exactly as designed.
+#:
+#: Keeping the newest run is what post-mortem of a failure actually needs; the
+#: two behind it have never been the thing anyone looked at.
+_PYTEST_TMP_KEEP = 1
 
 
 def _sweep_stale_pytest_tmp(base: str, *, measure: bool = True) -> tuple[int, int]:
@@ -258,8 +275,10 @@ def _sweep_stale_pytest_tmp(base: str, *, measure: bool = True) -> tuple[int, in
     This suite pins ``tmp_path_retention_policy = "all"`` on purpose — deleting
     a passed test's ``tmp_path`` mid-session races WiredTiger's background
     threads into ``WT_PANIC`` (see ``tests/conftest.py``) — so every run leaves
-    its per-test WiredTiger databases behind, ~1.7 GiB a run. Reclaiming them
-    is pytest's job: it keeps the newest few and ``rmtree``s the rest.
+    its per-test WiredTiger databases behind: **~104 GiB a run** on a
+    16-worker box (measured 2026-09-22; an earlier "~1.7 GiB" here was many
+    thousands of tests out of date). Reclaiming them is pytest's job: it keeps
+    the newest few and ``rmtree``s the rest.
 
     That janitor stops working the moment a run dies abnormally. pytest writes
     the owning PID into a ``.lock`` beside each dir and removes it in an
@@ -295,6 +314,54 @@ def _sweep_stale_pytest_tmp(base: str, *, measure: bool = True) -> tuple[int, in
         try:
             if measure:
                 freed += _dir_size(path)
+            shutil.rmtree(path, ignore_errors=True)
+            reaped += 1
+        except OSError:
+            continue
+    return (reaped, freed)
+
+
+#: Prefix of a probe's throwaway WiredTiger home.
+#:
+#: Duplicated from ``tools/probes/_servers.PROBE_TMP_PREFIX`` rather than
+#: imported: that module imports ``pymongo`` at module scope, and this is
+#: housekeeping that must work in an environment with no probe dependencies
+#: installed (CI's slim ``storage-engine`` env is exactly that). A one-word
+#: constant is a better dependency than a package import here.
+#: ``tests/test_clean_pytest_tmp.py`` pins the two to each other.
+_PROBE_TMP_PREFIX = "secantus-probe-"
+
+
+def _sweep_stale_probe_tmp(base: str) -> tuple[int, int]:
+    """Delete abandoned probe WiredTiger homes; return ``(count, bytes)``.
+
+    A differential probe stands up real servers, so it needs a real WT home,
+    and every one of the ~17 probes under ``tools/probes/`` used to take a bare
+    ``tempfile.mkdtemp()`` that nothing ever deleted. Those are invisible to
+    every janitor here: pytest only manages ``pytest-of-<user>/``, and the
+    gauge sweep above only matches ``secantus-*-gauge-*``. One session left 385
+    of them -- ~50 GiB.
+
+    ``tools/probes/_servers.probe_store`` now deletes its store at exit, but
+    that is best-effort and CANNOT be the whole answer: on Windows an open file
+    cannot be deleted at all, so a probe that dies before stopping its server
+    (the normal outcome when a probe is how you are chasing a bug) leaves the
+    home behind with WiredTiger still holding it. That is why the store carries
+    its creating PID -- liveness is decidable here rather than guessed from an
+    mtime, the same rule the pytest sweep above uses.
+    """
+    reaped = freed = 0
+    for name in os.listdir(base):
+        if not name.startswith(_PROBE_TMP_PREFIX):
+            continue
+        path = os.path.join(base, name)
+        if not os.path.isdir(path) or os.path.islink(path):
+            continue
+        owner = name[len(_PROBE_TMP_PREFIX) :].split("-", 1)[0]
+        if not owner.isdigit() or _pid_alive(int(owner)):
+            continue
+        try:
+            freed += _dir_size(path)
             shutil.rmtree(path, ignore_errors=True)
             reaped += 1
         except OSError:

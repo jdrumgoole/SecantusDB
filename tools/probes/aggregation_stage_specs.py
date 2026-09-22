@@ -33,15 +33,15 @@ import collections
 import datetime
 import os
 import sys
-import tempfile
 
 import pymongo
+from _servers import probe_store
 from bson import Binary, Code, Decimal128, Int64, MaxKey, MinKey, ObjectId, Regex, Timestamp
 
 from secantus import SecantusDBServer
 
 mon = pymongo.MongoClient(os.environ.get("PROBE_MONGOD", "mongodb://127.0.0.1:27041"))
-srv = SecantusDBServer(port=0, storage_path=tempfile.mkdtemp())
+srv = SecantusDBServer(port=0, storage_path=probe_store())
 srv.start()
 py = pymongo.MongoClient(srv.uri)
 # The Rust server has its OWN stage-spec validation, so a fix on the Python

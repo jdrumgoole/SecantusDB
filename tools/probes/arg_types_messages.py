@@ -29,9 +29,9 @@ Findings are bucketed, because they are not all the same kind of thing:
 import datetime
 import os
 import re
-import tempfile
 
 import pymongo
+from _servers import probe_store
 from bson import Decimal128, Int64, ObjectId
 
 from secantus import SecantusDBServer
@@ -350,7 +350,7 @@ def main():
         sec = pymongo.MongoClient(SERVER, directConnection=True, serverSelectionTimeoutMS=8000)
         print(f"  server under test: {SERVER}")
     else:
-        d = tempfile.mkdtemp()
+        d = probe_store()
         srv = SecantusDBServer(port=0, storage_path=d)
         srv.start()
         sec = pymongo.MongoClient(
