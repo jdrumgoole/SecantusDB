@@ -9929,3 +9929,37 @@ def test_having(home: Path) -> None:
         # HAVING with no GROUP BY filters the single row.
         assert q("select count(*) from t having count(*) > 3") == [(5,)]
         assert q("select count(*) from t having count(*) > 99") == []
+
+
+def test_aggregate_filter(home: Path) -> None:
+    """`agg(...) FILTER (WHERE ...)` was `0A000 FILTER on an aggregate`.
+
+    Only the matching rows contribute, and a group where NONE match is the
+    empty input -- `count` is 0, everything else NULL. Measured against
+    PostgreSQL 14.24 (2026-09-22).
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table t (id int primary key, g int, n int, s text)")
+        conn.execute(
+            "insert into t values (1,1,10,'a'),(2,1,20,'b'),(3,2,5,'c'),(4,2,null,'d'),(5,3,7,null)"
+        )
+        q = lambda sql: conn.execute(sql).fetchall()  # noqa: E731
+        assert q("select count(*) filter (where n > 8) from t") == [(2,)]
+        assert q("select g, count(*) filter (where n > 8) from t group by g order by g") == [
+            (1, 2),
+            (2, 0),
+            (3, 0),
+        ]
+        # No matching row is the empty input: count 0, sum NULL.
+        assert q("select count(n) filter (where id > 99) from t") == [(0,)]
+        assert q("select sum(n) filter (where id > 99) from t") == [(None,)]
+        # Two aggregates, different filters, and one with none.
+        assert q("select count(*) filter (where n > 8), count(*) from t") == [(2, 5)]
+        assert q("select min(n) filter (where g = 2), max(n) filter (where g = 1) from t") == [
+            (5, 20)
+        ]
+        # FILTER inside HAVING, and beside DISTINCT.
+        assert q(
+            "select g from t group by g having count(*) filter (where n > 8) = 2 order by g"
+        ) == [(1,)]
+        assert q("select count(distinct s) filter (where id < 4) from t") == [(3,)]

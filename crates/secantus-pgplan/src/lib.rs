@@ -705,6 +705,11 @@ pub struct AggItem {
     /// before the function runs. `count(DISTINCT)` is by far the common one,
     /// but PostgreSQL allows it on any aggregate.
     pub distinct: bool,
+    /// `agg(...) FILTER (WHERE ...)`: only the group's rows matching this
+    /// contribute. A group where NONE match is the empty input -- `count` is
+    /// 0 and everything else NULL -- which falls out of feeding the
+    /// aggregate an empty row set.
+    pub filter: Option<Document>,
 }
 
 /// One output column of an aggregate query, by POSITION.
@@ -3908,11 +3913,12 @@ fn having_subject(
     let node = node.ok_or_else(|| Error::Parse("a HAVING term without an operand".into()))?;
     match node.node.as_ref() {
         Some(N::FuncCall(f)) if is_aggregate_call(f) => {
-            let item = plan_bare_aggregate(f, def, items.len())?;
+            let item = plan_bare_aggregate(f, def, items.len(), _params)?;
             if let Some(i) = items.iter().position(|existing| {
                 existing.func == item.func
                     && existing.field == item.field
                     && existing.distinct == item.distinct
+                    && existing.filter == item.filter
             }) {
                 return Ok(OutputCol::Agg(i));
             }
@@ -3942,11 +3948,13 @@ fn plan_bare_aggregate(
     f: &pg_query::protobuf::FuncCall,
     def: &TableDef,
     index: usize,
+    params: &[Bson],
 ) -> Result<AggItem> {
     let name = func_name(f).unwrap_or_default();
-    if f.agg_filter.is_some() {
-        return Err(Error::Unsupported("FILTER on an aggregate".into()));
-    }
+    let filter = match f.agg_filter.as_deref() {
+        None => None,
+        Some(node) => Some(lower_where(node, def, params)?),
+    };
     let out = format!("__having{index}");
     if name == "count" && f.agg_star {
         return Ok(AggItem {
@@ -3956,6 +3964,7 @@ fn plan_bare_aggregate(
             source_type: None,
             expr: None,
             distinct: f.agg_distinct,
+            filter,
         });
     }
     let func = match name.as_str() {
@@ -3989,6 +3998,7 @@ fn plan_bare_aggregate(
         source_type: Some(column.pg_type.clone()),
         expr: None,
         distinct: f.agg_distinct,
+        filter,
     })
 }
 
@@ -4239,6 +4249,8 @@ fn plan_aggregate(
                 source_type: Some("int4".to_string()),
                 expr: None,
                 distinct: false,
+                // A generated source has no table for a FILTER to read.
+                filter: None,
             });
         }
         // The WHERE clause was silently dropped here before: `count(*)
@@ -4897,9 +4909,10 @@ fn finish_aggregate(
         match rt.val.as_ref().and_then(|v| v.node.as_ref()) {
             Some(N::FuncCall(f)) if is_aggregate_call(f) => {
                 let name = func_name(f).unwrap_or_default();
-                if f.agg_filter.is_some() {
-                    return Err(Error::Unsupported("FILTER on an aggregate".into()));
-                }
+                let agg_filter = match f.agg_filter.as_deref() {
+                    None => None,
+                    Some(node) => Some(lower_where(node, &def, params)?),
+                };
                 let (func, field, source_type) = if name == "count" && f.agg_star {
                     (AggFunc::CountStar, None, None)
                 } else {
@@ -4950,6 +4963,7 @@ fn finish_aggregate(
                                 source_type: Some(pg_type),
                                 expr: Some(expr),
                                 distinct: f.agg_distinct,
+                                filter: agg_filter.clone(),
                             });
                             continue;
                         }
@@ -4977,6 +4991,7 @@ fn finish_aggregate(
                     source_type,
                     expr: None,
                     distinct: f.agg_distinct,
+                    filter: agg_filter,
                 });
             }
             Some(N::ColumnRef(c)) => {
