@@ -1068,6 +1068,13 @@ pub const KNOWN_EXPR_OPS: &[&str] = &[
     "$pow",
     "$round",
     "$trunc",
+    // `apply_op` has dispatched these since the expression forms landed, but
+    // they were never added here -- so `validate_unknown_exprs` rejected them
+    // as unknown before the evaluator ever ran, and `{$stdDevSamp: [1, 2]}`
+    // answered `168 Unrecognized expression` where mongod 8.2.11 answers
+    // 0.7071067811865476. The Python server had them all along.
+    "$stdDevPop",
+    "$stdDevSamp",
     "$sin",
     "$cos",
     "$tan",
@@ -8216,23 +8223,67 @@ mod tests {
     }
 
     #[test]
-    fn known_expr_ops_all_route() {
-        // Every name in KNOWN_EXPR_OPS must dispatch in `apply_op` — i.e. calling
-        // it must NOT hit the `_ => Err(Fallback::Defer)` unknown-operator arm. We can't
-        // observe the arm directly, so we assert `first_unknown_expr_operator`
-        // (which shares the list) agrees the op is recognised, and cross-check
-        // that a made-up name is flagged. This guards the list against drift.
-        for op in KNOWN_EXPR_OPS {
-            let expr = Bson::Document(doc! { *op: Bson::Array(vec![]) });
-            assert_eq!(
-                first_unknown_expr_operator(&expr),
-                None,
-                "{op} should be recognised"
-            );
-        }
+    fn unknown_expr_operator_flags_a_name_off_the_list() {
+        // The only non-tautological half of the old `known_expr_ops_all_route`:
+        // a name absent from the list is reported. Looping over KNOWN_EXPR_OPS
+        // and asserting `first_unknown_expr_operator` accepts each one proved
+        // nothing at all -- that function's entire body is a lookup in
+        // KNOWN_EXPR_OPS, so the assertion was the list agreeing with itself and
+        // could never fail, whatever drifted.
         assert_eq!(
             first_unknown_expr_operator(&bson::bson!({"$definitelyNotAnOp": 1})),
             Some("$definitelyNotAnOp".to_string())
+        );
+        for op in KNOWN_EXPR_OPS {
+            let expr = Bson::Document(doc! { *op: Bson::Array(vec![]) });
+            assert_eq!(first_unknown_expr_operator(&expr), None, "{op}");
+        }
+    }
+
+    #[test]
+    fn every_dispatched_operator_is_on_the_known_list() {
+        // The direction that actually drifted, and the one nothing checked:
+        // an operator `apply_op` handles but KNOWN_EXPR_OPS omits is REJECTED
+        // as unknown before the evaluator runs. `$stdDevPop` / `$stdDevSamp`
+        // sat that way -- implemented, tested, and unreachable through a
+        // pipeline -- until a differential run against mongod 8.2.11 found it.
+        //
+        // Match arms cannot be enumerated at runtime, so this reads the source.
+        // Crude, and that is the point: it needs no cooperation from the code
+        // it guards, so adding an arm without listing the name fails here.
+        let src = include_str!("expressions.rs");
+        let body = match src.find("\nmod tests") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+
+        let mut missing: Vec<&str> = Vec::new();
+        for line in body.lines() {
+            let line = line.trim();
+            // `"$op" => ...` and `"$a" | "$b" => ...`, but not the `_ =>` arm
+            // and not a string that merely contains `=>` elsewhere.
+            let Some(arrow) = line.find("=>") else {
+                continue;
+            };
+            let head = line[..arrow].trim();
+            if !head.starts_with('"') {
+                continue;
+            }
+            for name in head.split('|') {
+                let name = name.trim().trim_matches('"');
+                if name.starts_with('$')
+                    && !KNOWN_EXPR_OPS.contains(&name)
+                    && !missing.contains(&name)
+                {
+                    missing.push(name);
+                }
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "dispatched by apply_op but absent from KNOWN_EXPR_OPS, so a \
+             pipeline using them gets `168 Unrecognized expression`: {missing:?}"
         );
     }
 

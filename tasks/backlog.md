@@ -6763,7 +6763,30 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   **116 of the original 946 defers were valid input being REFUSED** — mongod
   answers, the Rust server errors. Broken down and partly closed:
 
-  - **56 `$stdDev*`** — fixed (the expression forms were never implemented).
+  - **56 `$stdDev*`** — the EVALUATOR was fixed then; the pipeline path was
+    not, and nobody noticed for three weeks. `apply_op` dispatched
+    `$stdDevPop` / `$stdDevSamp` and had unit tests for them, but the names
+    were never added to `KNOWN_EXPR_OPS`, which `validate_unknown_exprs`
+    consults BEFORE the evaluator runs -- so every pipeline using one answered
+    `168 Unrecognized expression` while the engine underneath was correct and
+    green. Found 2026-09-22 by `tools/probes/agg_expressions.py` against
+    mongod 8.2.11 (96 of its divergences were this one cause) and fixed.
+
+    **The lesson is about where the parity suites look.** They exercise the
+    ENGINE directly, so an operator can be implemented, unit-tested, and
+    parity-green while every pipeline that uses it fails -- the server path is
+    not on the route they take. A probe that goes over the WIRE is the only
+    thing that sees it. Worth re-reading any "now implemented" note in this
+    file with that in mind: it may mean the engine only.
+
+    The list's own drift guard was VACUOUS and had been since it was written.
+    `known_expr_ops_all_route` looped over `KNOWN_EXPR_OPS` asserting
+    `first_unknown_expr_operator` accepted each name -- but that function's
+    whole body is a lookup in `KNOWN_EXPR_OPS`, so it was the list agreeing
+    with itself and could not fail whatever drifted. Replaced with
+    `every_dispatched_operator_is_on_the_known_list`, which reads the source
+    for `apply_op`'s match arms and is verified to FAIL when the two names are
+    removed.
   - **13 ObjectId-as-date** — fixed, a straight port of the Python change:
     mongod accepts every BSON type CARRYING a timestamp (Date, ObjectId,
     Timestamp) and a one-element array as the argument.
