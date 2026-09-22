@@ -388,7 +388,7 @@ def pytest_sessionstart(session: pytest.Session) -> None:
 
 
 def _reap_abandoned_pytest_tmp(config: pytest.Config) -> None:
-    """Reclaim earlier runs' abandoned temp trees, once per session.
+    """Reclaim earlier runs' abandoned temp trees.
 
     This suite pins ``tmp_path_retention_policy = "all"`` deliberately --
     deleting a passed test's ``tmp_path`` mid-session races WiredTiger's
@@ -422,11 +422,18 @@ def _reap_abandoned_pytest_tmp(config: pytest.Config) -> None:
 
         import python_tasks
 
-        reaped, _ = python_tasks._sweep_stale_pytest_tmp(tempfile.gettempdir(), measure=False)
+        base = tempfile.gettempdir()
+        reaped, _ = python_tasks._sweep_stale_pytest_tmp(base, measure=False)
+        # Probe stores are invisible to pytest's own janitor -- a different
+        # naming scheme entirely -- and cost ~130 MB a server. See
+        # ``python_tasks._sweep_stale_probe_tmp``.
+        probes, _ = python_tasks._sweep_stale_probe_tmp(base)
     except Exception:  # noqa: BLE001 - never fail a run over housekeeping
         return
     if reaped:
         print(f"\nreaped {reaped} abandoned pytest temp tree(s) from earlier runs")
+    if probes:
+        print(f"\nreaped {probes} abandoned probe store(s) from earlier runs")
 
 
 def _arm_crash_faulthandler(config: pytest.Config) -> None:
@@ -689,10 +696,22 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     The worker-death diagnostics already existed (see ``pytest_testnodedown``
     and ``pytest_handlecrashitem``); what was missing was making the *exit
     status* reflect them.
+
+    It also reclaims disk on the way OUT. Reaping only at session start means a
+    box holds every retained run's WiredTiger homes for as long as nobody runs
+    pytest again -- which is most of the time, because the suite is the thing
+    you run and then go and do other work. Whatever the last run left sits
+    there until the next run starts, and that one may be days away or may be
+    blocked BY the disk usage: this box reached 50 MB free with the
+    start-of-session sweep working exactly as designed, and every
+    server-starting test then failed with "No space left on device". The
+    current run is never at risk -- its dir is the newest and its ``.lock``
+    still names this live PID, so both of the sweep's rules protect it.
     """
     # Controller only -- workers have ``workerinput`` and their own exit path.
     if hasattr(session.config, "workerinput"):
         return
+    _reap_abandoned_pytest_tmp(session.config)
     banner = _lost_test_report(session.testscollected, len(_seen_nodeids), _node_down)
     if banner is None:
         return

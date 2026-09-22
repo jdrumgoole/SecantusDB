@@ -44,10 +44,12 @@ def test_sweeps_abandoned_runs_but_keeps_the_newest(tmp_path: Path) -> None:
 
     reaped, freed = python_tasks._sweep_stale_pytest_tmp(str(tmp_path))
 
-    assert reaped == 3, reaped
+    keep = python_tasks._PYTEST_TMP_KEEP
+    expected = sorted(f"pytest-{n}" for n in range(6, 6 - keep, -1))
+    assert reaped == 6 - keep, reaped
     assert freed > 0
     survivors = sorted(p.name for p in root.iterdir())
-    assert survivors == ["pytest-4", "pytest-5", "pytest-6"], survivors
+    assert survivors == expected, survivors
 
 
 def test_a_live_owner_is_never_swept(tmp_path: Path) -> None:
@@ -141,10 +143,12 @@ def test_measure_false_skips_sizing_but_still_reaps(tmp_path: Path) -> None:
 
     reaped, freed = python_tasks._sweep_stale_pytest_tmp(str(tmp_path), measure=False)
 
-    assert reaped == 3, reaped
+    keep = python_tasks._PYTEST_TMP_KEEP
+    expected = sorted(f"pytest-{n}" for n in range(6, 6 - keep, -1))
+    assert reaped == 6 - keep, reaped
     assert freed == 0, "measure=False must not walk the trees"
     survivors = sorted(p.name for p in root.iterdir())
-    assert survivors == ["pytest-4", "pytest-5", "pytest-6"], survivors
+    assert survivors == expected, survivors
 
 
 def test_session_start_reaper_is_controller_only(monkeypatch) -> None:
@@ -201,3 +205,125 @@ def test_session_start_reaper_respects_the_opt_out(monkeypatch) -> None:
     )
     conftest._reap_abandoned_pytest_tmp(_Cfg())
     assert calls == [], "opt-out did not prevent the sweep"
+
+
+# --------------------------------------------------------------- probe stores
+
+
+def _make_probe_store(base: Path, pid: int, tag: str = "abcd1234") -> Path:
+    d = base / f"secantus-probe-{pid}-{tag}"
+    d.mkdir(parents=True)
+    (d / "WiredTiger.wt").write_bytes(b"x" * 1024)
+    return d
+
+
+def test_probe_store_of_a_dead_pid_is_reaped(tmp_path: Path) -> None:
+    """The backstop for a probe that died holding its store open.
+
+    ``probe_store``'s atexit delete cannot cover this: on Windows an open file
+    cannot be deleted at all, so a probe killed while its server is up leaves
+    the home behind with WiredTiger still holding it.
+    """
+    dead = _make_probe_store(tmp_path, 999_999_999)
+
+    reaped, freed = python_tasks._sweep_stale_probe_tmp(str(tmp_path))
+
+    assert reaped == 1, reaped
+    assert freed > 0
+    assert not dead.exists()
+
+
+def test_probe_store_of_a_live_pid_is_never_reaped(tmp_path: Path) -> None:
+    """A probe running right now must keep its database."""
+    live = _make_probe_store(tmp_path, os.getpid())
+
+    reaped, _ = python_tasks._sweep_stale_probe_tmp(str(tmp_path))
+
+    assert reaped == 0
+    assert live.exists(), "swept the store of a running probe"
+
+
+def test_probe_sweep_leaves_foreign_names_alone(tmp_path: Path) -> None:
+    """The system tempdir is shared; only our own prefix is ours to delete."""
+    (tmp_path / "tmpsomething").mkdir()
+    (tmp_path / "secantus-pymongo-gauge-xyz").mkdir()
+    # A malformed name -- no PID where one belongs -- is ambiguous evidence,
+    # so it fails toward keeping the data like every other check here.
+    (tmp_path / "secantus-probe-notapid-xx").mkdir()
+
+    reaped, _ = python_tasks._sweep_stale_probe_tmp(str(tmp_path))
+
+    assert reaped == 0
+    assert (tmp_path / "tmpsomething").exists()
+    assert (tmp_path / "secantus-pymongo-gauge-xyz").exists()
+    assert (tmp_path / "secantus-probe-notapid-xx").exists()
+
+
+def test_session_finish_reaps_too(monkeypatch, tmp_path: Path) -> None:
+    """Cleanup on the way OUT, not only on the way in.
+
+    Reaping only at session start leaves the last run's WiredTiger homes on
+    disk for as long as nobody runs pytest again -- which is how this box
+    reached 50 MB free with the start-of-session sweep working perfectly.
+
+    The reap is folded into the EXISTING ``pytest_sessionfinish`` (the
+    lost-worker exit-status hook) rather than added as a second definition of
+    the same name: a module can only have one, and the later one silently wins.
+    """
+    import tests.conftest as ct
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        python_tasks,
+        "_sweep_stale_pytest_tmp",
+        lambda *a, **k: (calls.append("pytest"), (0, 0))[1],
+    )
+    monkeypatch.setattr(
+        python_tasks,
+        "_sweep_stale_probe_tmp",
+        lambda *a, **k: (calls.append("probe"), (0, 0))[1],
+    )
+    monkeypatch.setattr(ct, "_lost_test_report", lambda *a, **k: None)
+
+    class _Config:
+        pass
+
+    class _Session:
+        config = _Config()
+        testscollected = 0
+
+    ct.pytest_sessionfinish(_Session(), 0)
+
+    assert calls == ["pytest", "probe"], calls
+
+
+def test_only_one_session_finish_hook_is_defined() -> None:
+    """A second ``def pytest_sessionfinish`` would silently disable the first.
+
+    This was written as a separate hook first, and Python quietly kept only the
+    later definition -- the reap never ran, and nothing failed to say so.
+    """
+    source = (Path(__file__).parent / "conftest.py").read_text(encoding="utf-8")
+
+    assert source.count("def pytest_sessionfinish(") == 1
+    assert source.count("def pytest_sessionstart(") == 1
+
+
+def test_probe_prefix_matches_the_probe_helper() -> None:
+    """The sweeper's prefix and the probe helper's must not drift apart.
+
+    ``python_tasks`` deliberately duplicates the constant instead of importing
+    ``tools/probes/_servers`` -- that module imports ``pymongo`` at module
+    scope, and this sweep has to work where no probe dependency is installed.
+    A duplicated constant needs a test or it silently stops matching, and the
+    failure mode is a sweep that reaps nothing while looking healthy.
+    """
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "probes"))
+    try:
+        import _servers
+    except ImportError:  # pragma: no cover - pymongo absent (slim CI env)
+        pytest.skip("tools/probes/_servers needs pymongo")
+
+    assert _servers.PROBE_TMP_PREFIX == python_tasks._PROBE_TMP_PREFIX

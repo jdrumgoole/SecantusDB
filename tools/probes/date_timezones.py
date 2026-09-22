@@ -27,16 +27,16 @@ satisfied by both being wrong together.
 import datetime as dt
 import os
 import sys
-import tempfile
 
 import pymongo
+from _servers import probe_store
 
 from secantus import SecantusDBServer
 
 targets = [
     ("mongod", pymongo.MongoClient(os.environ.get("PROBE_MONGOD", "mongodb://127.0.0.1:27041")))
 ]
-_s = SecantusDBServer(port=0, storage_path=tempfile.mkdtemp())
+_s = SecantusDBServer(port=0, storage_path=probe_store())
 _s.start()
 targets.append(("python", pymongo.MongoClient(_s.uri)))
 if os.environ.get("PROBE_SERVER"):

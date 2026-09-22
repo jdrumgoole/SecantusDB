@@ -21,10 +21,10 @@ real behavioural difference.
 
 import os
 import re
-import tempfile
 import time
 
 import pymongo
+from _servers import probe_store
 
 MONGOD = os.environ.get("PROBE_MONGOD", "mongodb://127.0.0.1:27045")
 SERVER = os.environ.get("PROBE_SERVER")
@@ -368,7 +368,7 @@ def main():
     else:
         from secantus import SecantusDBServer
 
-        mine = SecantusDBServer(port=0, storage_path=tempfile.mkdtemp())
+        mine = SecantusDBServer(port=0, storage_path=probe_store())
         mine.start()
         host, port = mine.address
         ours = run(f"mongodb://{host}:{port}", "SecantusDB")

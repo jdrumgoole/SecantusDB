@@ -2800,6 +2800,28 @@ unused preinstalled toolchains (android/dotnet/ghc/boost/swift/powershell)
 before the build. If the durable lane keeps growing, the next lever is a smaller
 per-instance footprint (not a mid-session delete — that reintroduces the panic).
 
+**Re-measured 2026-09-22 — the per-run total is much bigger than this entry
+implies, and the LOCAL box is the one that fills.** "~10 MB each" is still right
+per instance, but a full 16-worker run leaves **~104 GiB** of retained homes,
+not the ~1.7 GiB the sweeper's own docstring claimed (that figure was written
+thousands of tests ago and nothing re-derived it). Three retained runs is
+~300 GiB, which took a 935 GiB dev box to 50 MB free with every janitor working
+exactly as designed — after which every server-starting test fails with "No
+space left on device". Fixed on `test-tmp-reclaim`: keep **one** abandoned run
+rather than three, and reap at session **finish** as well as start, because
+reaping only at start means the last run's homes sit there until somebody runs
+pytest again. Both levers are outside the panic — they touch only runs that are
+already over, never a live `tmp_path`.
+
+Separately and larger than it looks: the ~17 differential probes under
+`tools/probes/` each took a bare `tempfile.mkdtemp()` that **nothing ever
+deleted** — invisible to pytest's janitor (which only manages
+`pytest-of-<user>/`) and to the gauge sweep (which only matches
+`secantus-*-gauge-*`). One session left 385 of them, ~50 GiB. They are
+PID-tagged and self-cleaning now, with `_sweep_stale_probe_tmp` as the backstop
+for the case `atexit` cannot cover: on Windows an open file cannot be deleted,
+so a probe killed while its server is up leaves the home behind regardless.
+
 **Shipped — oplog prune is O(deleted), not O(oplog size) (2026-07-24).**
 `_prune_oplog_locked` used to decode every oplog entry on every run (once per
 1000 writes) to find the few to drop; once a workload filled the oplog to the

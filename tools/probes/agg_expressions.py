@@ -21,9 +21,9 @@ is started.
 import datetime
 import os
 import sys
-import tempfile
 
 import pymongo
+from _servers import probe_store
 from bson import Binary, Code, Decimal128, Int64, MaxKey, MinKey, ObjectId, Regex, Timestamp
 
 from secantus import SecantusDBServer
@@ -158,7 +158,7 @@ def main():
         sec = pymongo.MongoClient(SERVER, **_CLIENT_OPTS)
         print(f"  server under test: {SERVER}")
     else:
-        d = tempfile.mkdtemp()
+        d = probe_store()
         srv = SecantusDBServer(port=0, storage_path=d)
         srv.start()
         sec = pymongo.MongoClient(f"mongodb://{srv.address[0]}:{srv.address[1]}", **_CLIENT_OPTS)

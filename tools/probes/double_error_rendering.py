@@ -22,9 +22,9 @@ that has not built the extension is never mistaken for a compared one.
 
 import os
 import sys
-import tempfile
 
 import pymongo
+from _servers import probe_store
 
 REF = os.environ.get("PROBE_MONGOD", "mongodb://127.0.0.1:27041")
 VALS = [-0.0, -1.0, 1.5, 1234567.0, -2147483648.0, 1e308, 0.000123456789, 100.0]
@@ -83,7 +83,7 @@ def targets():
     sys.path.insert(0, "src")
     from secantus import SecantusDBServer
 
-    srv = SecantusDBServer(port=0, storage_path=tempfile.mkdtemp(prefix="drpy"))
+    srv = SecantusDBServer(port=0, storage_path=probe_store())
     srv.start()
     h, p = srv.address
     out.append(("python", pymongo.MongoClient(h, p, directConnection=True)["dr"]["t"]))

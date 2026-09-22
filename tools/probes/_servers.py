@@ -26,8 +26,10 @@ it; the note is there so a clean run is never mistaken for a compared one.
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import os
+import shutil
 import sys
 import tempfile
 from collections.abc import Iterator
@@ -35,6 +37,41 @@ from collections.abc import Iterator
 import pymongo
 
 DEFAULT_MONGOD = "mongodb://127.0.0.1:27041"
+
+#: Prefix for a probe's throwaway WiredTiger home.
+#:
+#: Probe stores used to be bare ``tempfile.mkdtemp()`` dirs that nothing ever
+#: deleted -- the helper below stopped the servers and walked away from their
+#: data. Each run leaked ~260 MB (two servers, a ~130 MB WT home each), and
+#: since a probe is the thing you run in a loop while chasing a divergence, one
+#: session left 385 of them: ~50 GiB, invisible to pytest's numbered-dir
+#: janitor, which only knows about ``pytest-of-<user>/``.
+#:
+#: They are cleaned up on exit now. The PID in the name is for the run that is
+#: NOT clean -- a probe killed mid-flight, which is routine -- so
+#: ``_sweep_stale_probe_tmp`` can tell an abandoned store from a live one
+#: instead of guessing from mtime.
+PROBE_TMP_PREFIX = "secantus-probe-"
+
+
+def probe_store() -> str:
+    """A fresh WiredTiger home for a probe server, deleted when this exits.
+
+    The delete is an ``atexit`` hook rather than a teardown line in each probe
+    on purpose: there are ~17 probes here and they all create their store
+    inline, most at module scope, with no common shutdown path to hang a
+    ``finally`` on. Registering the cleanup with the store itself makes the
+    substitution a one-liner per probe and cannot be forgotten by the next one
+    written.
+
+    ``ignore_errors`` because this is housekeeping running at interpreter
+    shutdown: a probe that left a WiredTiger connection open still holds its
+    files (on Windows an open file cannot be deleted at all), and failing to
+    reclaim disk must never turn a clean probe run into a non-zero exit.
+    """
+    path = tempfile.mkdtemp(prefix=f"{PROBE_TMP_PREFIX}{os.getpid()}-")
+    atexit.register(shutil.rmtree, path, ignore_errors=True)
+    return path
 
 
 @contextlib.contextmanager
@@ -49,8 +86,11 @@ def probe_targets(
         directConnection=True,
         serverSelectionTimeoutMS=8000,
     )
+    stores: list[str] = []
+    python_store = probe_store()
+    stores.append(python_store)
     python_server = SecantusDBServer(
-        port=0, storage_path=tempfile.mkdtemp(), replica_set_name=replica_set
+        port=0, storage_path=python_store, replica_set_name=replica_set
     )
     python_server.start()
     host, port = python_server.address
@@ -72,7 +112,9 @@ def probe_targets(
                 file=sys.stderr,
             )
         else:
-            rust_server = _secantus_server.RustServer(tempfile.mkdtemp(), 0)
+            rust_store = probe_store()
+            stores.append(rust_store)
+            rust_server = _secantus_server.RustServer(rust_store, 0)
             rhost, rport = rust_server.address
             targets.append(("rust", pymongo.MongoClient(rhost, rport, directConnection=True)))
 
@@ -85,6 +127,11 @@ def probe_targets(
         python_server.stop()
         if rust_server is not None:
             rust_server.stop()
+        # The servers are stopped, so nothing holds these open any more and
+        # the delete cannot race WiredTiger's background threads the way a
+        # mid-session tmp_path delete does (see tests/conftest.py).
+        for store in stores:
+            shutil.rmtree(store, ignore_errors=True)
 
 
 def report(name: str, total: int, divergent: dict[str, int]) -> int:

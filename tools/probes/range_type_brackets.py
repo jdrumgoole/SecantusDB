@@ -41,9 +41,9 @@ so deliberately, to match Python).
 import datetime
 import os
 import sys
-import tempfile
 
 import pymongo
+from _servers import probe_store
 from bson import Binary, Code, Decimal128, Int64, MaxKey, MinKey, ObjectId, Regex, Timestamp
 
 MONGOD = os.environ.get("PROBE_MONGOD", "mongodb://127.0.0.1:27041")
@@ -110,7 +110,7 @@ def main() -> int:
     else:
         from secantus import SecantusDBServer
 
-        embedded = SecantusDBServer(port=0, storage_path=tempfile.mkdtemp())
+        embedded = SecantusDBServer(port=0, storage_path=probe_store())
         embedded.start()
         server = pymongo.MongoClient(embedded.uri, serverSelectionTimeoutMS=3000)
     try:

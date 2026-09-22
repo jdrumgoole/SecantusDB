@@ -9,12 +9,12 @@ import pathlib
 import statistics
 import subprocess
 import sys
-import tempfile
 import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 import psycopg  # noqa: E402
+from _servers import probe_store
 from bench.pg_statement_cost import RUST, _free_port, _wait  # noqa: E402
 
 
@@ -51,7 +51,7 @@ def bench(dsn, label):
 
 
 port = _free_port()
-store = tempfile.mkdtemp(prefix="proto-")
+store = probe_store()
 d = subprocess.Popen(
     [str(RUST), store, f"127.0.0.1:{port}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
 )

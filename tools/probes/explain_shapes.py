@@ -21,9 +21,9 @@ is started.
 import itertools
 import os
 import sys
-import tempfile
 
 import pymongo
+from _servers import probe_store
 from bson import SON, json_util
 
 MONGOD = os.environ.get("PROBE_MONGOD", "mongodb://127.0.0.1:27041")
@@ -179,7 +179,7 @@ def main():
     else:
         from secantus import SecantusDBServer
 
-        srv = SecantusDBServer(port=0, storage_path=tempfile.mkdtemp())
+        srv = SecantusDBServer(port=0, storage_path=probe_store())
         srv.start()
         sec = pymongo.MongoClient(f"mongodb://{srv.address[0]}:{srv.address[1]}")
 

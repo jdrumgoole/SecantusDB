@@ -10,9 +10,9 @@ crashes. This widens it two ways:
 
 import datetime
 import os
-import tempfile
 
 import pymongo
+from _servers import probe_store
 from bson import Decimal128, ObjectId
 
 from secantus import SecantusDBServer
@@ -125,7 +125,7 @@ if SERVER:
     sec = pymongo.MongoClient(SERVER, directConnection=True, serverSelectionTimeoutMS=8000)
     print(f"  server under test: {SERVER}")
 else:
-    d = tempfile.mkdtemp()
+    d = probe_store()
     s = SecantusDBServer(port=0, storage_path=d)
     s.start()
     sec = pymongo.MongoClient(f"mongodb://{s.address[0]}:{s.address[1]}", directConnection=True)

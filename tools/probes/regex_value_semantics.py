@@ -20,16 +20,16 @@ suites are satisfied by both being wrong together.
 
 import os
 import sys
-import tempfile
 
 import pymongo
+from _servers import probe_store
 from bson import Code, Regex
 
 from secantus import SecantusDBServer
 
 mon = pymongo.MongoClient(os.environ.get("PROBE_MONGOD", "mongodb://127.0.0.1:27041"))
 
-s = SecantusDBServer(port=0, storage_path=tempfile.mkdtemp())
+s = SecantusDBServer(port=0, storage_path=probe_store())
 s.start()
 py = pymongo.MongoClient(s.uri)
 targets = [("mongod", mon), ("python", py)]
