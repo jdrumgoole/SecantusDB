@@ -1,4 +1,4 @@
-### The probe-store sweep asks the store, not the name, before deleting it
+### The probe-store sweep no longer deletes a database that is still in use
 
 The sweep that reclaims abandoned probe WiredTiger homes deleted a **running**
 mongod's data directory. The directory had been named by hand with a shell's
@@ -8,22 +8,30 @@ and removed the files underneath a live database, which died on a fatal
 WiredTiger assertion: `log pre-alloc server error ... the process must exit and
 restart`.
 
-The pid in a store's name is written by whoever created the directory, so it is
-a hint and not proof of ownership. Nothing else was asked before deleting.
+The pid in a store's name is written by whoever created the directory. It is a
+hint, not proof of ownership, and nothing else was asked before deleting.
 
 #### Fixed
 
-- A store is reaped only when the **store itself** reports it is not in use.
-  `_wt_home_in_use` takes `WiredTiger.lock` as the authority: a non-blocking
-  exclusive `flock` on POSIX, and on Windows an attempted `os.remove`, which is
-  what actually distinguishes the two states there — opening the lock with
-  `r+b` succeeds while WiredTiger holds it and says nothing, measured on this
-  box rather than assumed. Anything ambiguous answers "in use", because a store
-  left behind costs disk and a store deleted too early costs data.
+- A dead pid is no longer sufficient grounds. A store is reaped only once it
+  has also sat **untouched for half an hour** — a store being served is written
+  to constantly, so a recent mtime means hands off, whatever the name claims.
+  An abandoned store is still reclaimed on the next run after that, which is
+  ample for a problem measured in days.
 - `probe_store()` is documented as the only way to name one of these
-  directories, since it fills in `os.getpid()` and cannot point at the wrong
+  directories, since it fills in `os.getpid()` and cannot name the wrong
   process.
 
-The regression test stands up a real `SecantusDBServer` on a store named for a
-dead pid and asserts the sweep leaves its files alone; it was confirmed to fail
-("swept a live database") when the guard is removed.
+`WiredTiger.lock` looks like the better authority and is not, which CI proved
+before this merged: POSIX advisory locks are held per **process**, so a check
+made from the process that opened the store reports the file as free. That
+passed on Windows — which locks mandatorily at the handle — and failed on
+macOS, where the sweep then deleted a live store and took `WT_PANIC` through
+the worker. Worse, merely opening and closing a descriptor to a file the
+process holds an `fcntl` lock on *releases* that lock, so the "safe" probe can
+break the database it is inspecting. The Windows `os.remove` probe is kept as
+an extra gate there, where it is genuinely decisive.
+
+The regression tests build stores directly rather than running a server, so a
+future regression fails an assertion instead of panicking WiredTiger inside the
+test worker. They were confirmed to fail with the guard removed.

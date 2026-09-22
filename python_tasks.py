@@ -22,6 +22,7 @@ import re
 import shlex
 import shutil
 import sys
+import time
 
 from invoke.context import Context
 from invoke.tasks import task
@@ -378,53 +379,59 @@ def _sweep_stale_probe_tmp(base: str) -> tuple[int, int]:
     return (reaped, freed)
 
 
+#: How long a probe store must sit untouched before a dead pid is believed.
+#:
+#: The pid in the name is not trustworthy on its own -- see `_wt_home_in_use`.
+#: A store in use is written to constantly (WiredTiger checkpoints and rolls
+#: its log), so a recent mtime is strong evidence something is alive even when
+#: the name says otherwise. Half an hour costs nothing: an abandoned store is
+#: reclaimed on the next run after that, and the disk problem this whole sweep
+#: exists for is measured in days, not minutes.
+_PROBE_TMP_GRACE_SECONDS = 1800.0
+
+
 def _wt_home_in_use(path: str) -> bool:
-    """Whether a WiredTiger home still belongs to a live process.
+    """Whether a probe store may still belong to something alive.
 
-    This is the authority the PID in a store's NAME is not. A name is written
-    by whoever created the directory and can be wrong -- and when it is wrong
-    the cost is a live database losing its files underneath it, which is the
-    one outcome a janitor in this repo must never produce.
+    The pid in a store's NAME is written by whoever created the directory, so
+    it can simply be wrong -- and when it is, the cost is a live database
+    losing its files. That happened on 2026-09-22: a name built from a shell's
+    `$$` rather than the server's pid sent this sweep through a running
+    mongod's dbpath, and it died on a fatal WiredTiger assertion.
 
-    **Windows: the probe CONSUMES the lock file.** Measured on this box --
-    opening `WiredTiger.lock` with `r+b` SUCCEEDS while WiredTiger holds it, so
-    it says nothing; `os.remove` is what raises `PermissionError`. That makes
-    the check destructive when it answers "not in use", which is safe only
-    because the caller rmtrees the whole directory immediately afterwards.
-    Do not reuse this as a general-purpose predicate.
+    **Recent modification is the signal, and it is the only one that works
+    everywhere.** A store being served is written to constantly, so a fresh
+    mtime means hands off. `WiredTiger.lock` looks like the better authority
+    and is not: POSIX advisory locks are held per PROCESS, so a check made
+    from the process that opened the store reports the file as free -- CI
+    failed exactly that way on macOS while Windows passed, because Windows
+    locks mandatorily at the handle. Worse, merely opening and closing a
+    descriptor to a file this process holds an `fcntl` lock on RELEASES that
+    lock, so the "safe" probe can itself break the database it is inspecting.
 
-    POSIX takes the non-destructive route: WiredTiger `flock`s the file, so a
-    non-blocking exclusive lock fails exactly when it is held.
+    On Windows an attempted `os.remove` of the lock IS decisive (measured:
+    opening it `r+b` succeeds while WiredTiger holds it and distinguishes
+    nothing), so that runs as an extra gate there. It is destructive when it
+    answers "free", which is safe only because the caller deletes the whole
+    directory immediately afterwards -- do not reuse it as a predicate.
 
-    Anything ambiguous -- unreadable, an unexpected error -- answers IN USE.
-    Refusing to delete is the safe direction, and a store left behind costs
-    disk where a store deleted too early costs data.
+    Ambiguity answers IN USE. A store left behind costs disk; a store deleted
+    too early costs data.
     """
-    lock = os.path.join(path, "WiredTiger.lock")
-    if not os.path.isfile(lock):
-        # No lock file: never a WiredTiger home, or one that was closed
-        # cleanly. Either way nothing holds it.
-        return False
+    try:
+        age = time.time() - os.stat(path).st_mtime
+    except OSError:
+        return True
+    if age < _PROBE_TMP_GRACE_SECONDS:
+        return True
 
-    if os.name == "nt":  # pragma: no cover - exercised only on Windows
+    lock = os.path.join(path, "WiredTiger.lock")
+    if os.name == "nt" and os.path.isfile(lock):  # pragma: no cover - Windows
         try:
             os.remove(lock)
         except OSError:
             return True
-        return False
-
-    try:
-        import fcntl
-
-        with open(lock, "rb") as fh:
-            try:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                return True
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-            return False
-    except OSError:
-        return True
+    return False
 
 
 def _pytest_tmp_owner_alive(path: str) -> bool:
