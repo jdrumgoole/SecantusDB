@@ -259,7 +259,7 @@ def test_duplicate_key_reports_what_postgres_reports(home: Path) -> None:
         # Unsupported must be an honest 0A000 -- never a wrong row. There is no
         # fallback into Python by design.
         ("SELECT * FROM t JOIN t AS u ON t.id = u.id", "0A000"),
-        ("SELECT avg(n) FROM t", "0A000"),
+        ("SELECT string_agg(name, ',') FROM t", "0A000"),
         ("SELECT n, count(*) FROM t", "42803"),
         ("SELECT * FROM t WHERE n LIKE 'x'", "0A000"),
         ("SELECT * FROM t ORDER BY n + 1", "0A000"),
