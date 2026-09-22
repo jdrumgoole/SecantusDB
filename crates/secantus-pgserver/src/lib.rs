@@ -12358,6 +12358,22 @@ fn aggregate_wire_type(item: &AggItem) -> Type {
 /// aggregate SKIPS NULLs; and over an empty input `count` is 0 while `sum`,
 /// `min` and `max` are **NULL, not zero**.
 fn compute_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
+    // `FILTER (WHERE ...)`: only the matching rows contribute. A group where
+    // none match becomes the empty input, which is already right for every
+    // aggregate -- `count` 0, the rest NULL.
+    let filtered: Vec<Document>;
+    let rows = match item.filter.as_ref() {
+        None => rows,
+        Some(filter) => {
+            let empty = Document::new();
+            filtered = rows
+                .iter()
+                .filter(|d| secantus_core::query::matches(d, filter, &empty, None).unwrap_or(false))
+                .cloned()
+                .collect();
+            &filtered
+        }
+    };
     let Some(field) = item.field.as_deref() else {
         // count(*)
         return Bson::Int64(rows.len() as i64);
