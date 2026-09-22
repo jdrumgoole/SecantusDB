@@ -259,7 +259,7 @@ def test_duplicate_key_reports_what_postgres_reports(home: Path) -> None:
         # Unsupported must be an honest 0A000 -- never a wrong row. There is no
         # fallback into Python by design.
         ("SELECT * FROM t JOIN t AS u ON t.id = u.id", "0A000"),
-        ("SELECT count(*) + 1 FROM t", "0A000"),
+        ("SELECT array_agg(name ORDER BY length(name)) FROM t", "0A000"),
         ("SELECT n, count(*) FROM t", "42803"),
         ("SELECT * FROM t WHERE n LIKE 'x'", "0A000"),
         ("SELECT * FROM t ORDER BY n + 1", "0A000"),
@@ -9775,32 +9775,29 @@ def test_array_agg_over_an_empty_input_is_null(home: Path) -> None:
         ]
 
 
-def test_unsupported_aggregates_refuse_the_same_way_on_an_empty_table(home: Path) -> None:
+def test_an_unsupported_aggregate_refuses_the_same_way_on_an_empty_table(home: Path) -> None:
     """The silent half of a missing feature.
 
-    An aggregate wrapped in an expression is not implemented. These used to
-    be planned as a plain SELECT with a computed column, so the refusal came
-    from evaluating a row -- and over an EMPTY table no row was evaluated, so
-    the client got zero rows and no error where PostgreSQL answers one row.
-    They now refuse while planning, so the answer does not depend on whether
-    the table happens to be empty. (`string_agg` was here too until it landed
-    on 2026-09-22.)
+    An unimplemented shape used to be planned as a plain SELECT with a
+    computed column, so its refusal came from EVALUATING a row -- and over an
+    empty table no row was evaluated, so the client got zero rows and no error
+    where PostgreSQL answers one. Refusing while planning makes the answer the
+    same either way.
+
+    The shapes that showed this (`string_agg`, `count(*) + 1`) have since been
+    implemented, so the property is pinned here with one that has not:
+    `ORDER BY` over an EXPRESSION inside an aggregate.
     """
+    sql = "select array_agg(s order by length(s)) from t"
     with _Server(home) as server, server.connect() as conn:
         conn.execute("create table t (id int primary key, n int, s text)")
-        for sql in (
-            "select sum(n) + 0 from t",
-            "select count(*) + 1 from t",
-            "select coalesce(sum(n), -1) from t",
-        ):
-            with pytest.raises(psycopg.Error) as empty:
-                conn.execute(sql).fetchall()
-            assert empty.value.sqlstate == "0A000", sql
+        with pytest.raises(psycopg.Error) as empty:
+            conn.execute(sql).fetchall()
+        assert empty.value.sqlstate == "0A000"
         conn.execute("insert into t values (1, 1, 'a')")
-        for sql in ("select count(*) + 1 from t", "select sum(n) + 0 from t"):
-            with pytest.raises(psycopg.Error) as filled:
-                conn.execute(sql).fetchall()
-            assert filled.value.sqlstate == "0A000", sql
+        with pytest.raises(psycopg.Error) as filled:
+            conn.execute(sql).fetchall()
+        assert filled.value.sqlstate == "0A000"
 
 
 def test_char_n_is_blank_padded_and_carries_its_width(home: Path) -> None:
@@ -10057,3 +10054,41 @@ def test_order_by_inside_an_aggregate(home: Path) -> None:
         with pytest.raises(psycopg.Error) as exc:
             conn.execute("select array_agg(s order by length(s)) from t").fetchall()
         assert exc.value.sqlstate == "0A000"
+
+
+def test_aggregates_inside_expressions(home: Path) -> None:
+    """`count(*) + 1` and friends were planned as a plain SELECT with a
+    computed column, so they reached the per-row scalar evaluator -- which has
+    no `sum` -- and over an EMPTY table answered no rows at all.
+
+    The aggregates inside the expression are now ordinary items, computed per
+    group, and the expression runs over their results. Values and oids from
+    PostgreSQL 14.24 (2026-09-22).
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table t (id int primary key, g int, n int)")
+        conn.execute("insert into t values (1,1,10),(2,1,20),(3,2,5),(4,2,null)")
+        one = lambda sql: conn.execute(sql).fetchall()[0][0]  # noqa: E731
+        assert one("select count(*) + 1 from t") == 5
+        assert one("select sum(n) * 2 from t") == 70
+        assert one("select sum(n) + count(*) from t") == 39
+        assert one("select coalesce(sum(n), -1) from t") == 35
+        assert one("select (sum(n))::text from t") == "35"
+        # The empty-table case, which used to answer NO ROWS with no error.
+        assert one("select coalesce(sum(n), 0) from t where id > 99") == 0
+        assert conn.execute("select count(*) + 1 from t where id > 99").fetchall() == [(1,)]
+        # Grouped, mixing a key with an aggregate, and beside plain outputs.
+        assert conn.execute("select g, count(*) + 1 from t group by g order by g").fetchall() == [
+            (1, 3),
+            (2, 3),
+        ]
+        assert sorted(conn.execute("select g + count(*) from t group by g").fetchall()) == [
+            (3,),
+            (4,),
+        ]
+        assert conn.execute(
+            "select g, sum(n), sum(n) * 2 from t group by g order by g"
+        ).fetchall() == [(1, 30, 60), (2, 5, 10)]
+        cur = conn.execute("select count(*) + 1 from t")
+        cur.fetchall()
+        assert cur.description[0].type_code == 20  # int8, as PostgreSQL types it

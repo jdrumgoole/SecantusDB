@@ -569,7 +569,10 @@ fn aggregate_refusals_carry_the_right_sqlstate() {
         // Deliberately deferred rather than approximated. Keep this naming
         // something that IS still refused -- `avg` and `string_agg` each sat
         // here until they landed, and the stale case failed the build.
-        ("SELECT count(*) + 1 FROM t", "0A000"),
+        (
+            "SELECT array_agg(name ORDER BY length(name)) FROM t",
+            "0A000",
+        ),
         // `DISTINCT ON` over an aggregate resolves its keys against the GROUP
         // BY output, which this slice does not do; plain `count(DISTINCT n)`
         // IS supported (see `count_distinct_plans_a_distinct_aggregate`).

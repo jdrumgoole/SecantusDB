@@ -726,6 +726,11 @@ pub struct AggItem {
     /// answer in a defined order. Empty for every other aggregate, where the
     /// order cannot be observed.
     pub order: Vec<OrderKey>,
+    /// The source column's `atttypmod`, which only a blank-padded `char(n)`
+    /// uses: `array_agg`, `min` and `max` see the PADDED value, because they
+    /// take the column's own type. `string_agg` does not -- its argument is
+    /// coerced to `text`, which strips (all measured on 14.24).
+    pub source_typmod: i32,
 }
 
 /// One output column of an aggregate query, by POSITION.
@@ -740,6 +745,11 @@ pub enum OutputCol {
     Group(usize),
     /// Index into `Aggregate::items`.
     Agg(usize),
+    /// An expression OVER the grouped values -- `count(*) + 1`,
+    /// `coalesce(sum(n), 0)` -- by index into `Aggregate::exprs`. Each
+    /// aggregate inside it is an ordinary item, computed once and read back
+    /// by its slot name.
+    Expr(usize),
 }
 
 /// A `HAVING` predicate over the grouped rows.
@@ -810,6 +820,8 @@ pub struct Aggregate {
     pub offset: i64,
     /// `HAVING ...`, applied to the grouped rows before ORDER BY and LIMIT.
     pub having: Option<Having>,
+    /// Expressions over the grouped values, referenced by `OutputCol::Expr`.
+    pub exprs: Vec<ColumnExpr>,
     /// `SELECT DISTINCT count(*) ...` -- dedup on the aggregate's OUTPUT rows,
     /// after grouping and before the ORDER BY. `DISTINCT ON` over an aggregate
     /// is still refused rather than approximated.
@@ -2901,15 +2913,23 @@ fn has_aggregate(s: &pg_query::protobuf::SelectStmt) -> bool {
         "string_agg",
     ];
     s.target_list.iter().any(|t| {
-        matches!(
-            t.node.as_ref(),
-            Some(N::ResTarget(rt))
-                if matches!(
-                    rt.val.as_ref().and_then(|v| v.node.as_ref()),
-                    Some(N::FuncCall(f))
-                        if func_name(f).as_deref().is_some_and(|n| AGGREGATES.contains(&n))
-                )
-        )
+        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+            return false;
+        };
+        match rt.val.as_ref().and_then(|v| v.node.as_ref()) {
+            Some(N::FuncCall(f))
+                if func_name(f)
+                    .as_deref()
+                    .is_some_and(|n| AGGREGATES.contains(&n)) =>
+            {
+                true
+            }
+            // An aggregate WRAPPED in an expression -- `count(*) + 1`,
+            // `coalesce(sum(n), 0)` -- is still an aggregate query. Without
+            // this it was planned as a plain SELECT with a computed column
+            // and reached the per-row scalar evaluator, which has no `sum`.
+            _ => rt.val.as_deref().is_some_and(contains_nested_aggregate),
+        }
     })
 }
 
@@ -4005,6 +4025,7 @@ fn plan_bare_aggregate(
             filter,
             sep: None,
             order,
+            source_typmod: -1,
         });
     }
     let func = match name.as_str() {
@@ -4043,7 +4064,134 @@ fn plan_bare_aggregate(
         filter,
         sep,
         order,
+        source_typmod: column.typmod,
     })
+}
+
+/// Replace every aggregate call inside `node` with a reference to a slot
+/// holding that aggregate's value, registering the aggregate as an item.
+///
+/// This is what lets `count(*) + 1` be planned at all: the aggregates are
+/// computed per group as usual, and the arithmetic runs afterwards over their
+/// results. An identical aggregate already in `items` is reused rather than
+/// computed twice.
+fn extract_aggregates(
+    node: &mut pg_query::protobuf::Node,
+    def: &TableDef,
+    items: &mut Vec<AggItem>,
+    slots: &mut Vec<RowField>,
+    params: &[Bson],
+) -> Result<bool> {
+    let mut found = false;
+    if let Some(N::FuncCall(f)) = node.node.as_ref() {
+        if is_aggregate_call(f) {
+            let f = f.clone();
+            let item = plan_bare_aggregate(&f, def, items.len(), params)?;
+            let index = match items.iter().position(|existing| {
+                existing.func == item.func
+                    && existing.field == item.field
+                    && existing.distinct == item.distinct
+                    && existing.filter == item.filter
+                    && existing.sep == item.sep
+                    && existing.order == item.order
+            }) {
+                Some(i) => i,
+                None => {
+                    items.push(item);
+                    items.len() - 1
+                }
+            };
+            // The slot is named for the item's position, and is BOTH the
+            // column name and the stored field: the row the executor builds
+            // for the expression keys the value by exactly this.
+            let slot = format!("__aggval{index}");
+            let pg_type = aggregate_item_type(&items[index]);
+            if !slots.iter().any(|(name, _, _)| *name == slot) {
+                slots.push((slot.clone(), slot.clone(), pg_type));
+            }
+            *node = column_ref_node(&slot);
+            return Ok(true);
+        }
+    }
+    let Some(inner) = node.node.as_mut() else {
+        return Ok(false);
+    };
+    match inner {
+        N::AExpr(e) => {
+            if let Some(l) = e.lexpr.as_mut() {
+                found |= extract_aggregates(l, def, items, slots, params)?;
+            }
+            if let Some(r) = e.rexpr.as_mut() {
+                found |= extract_aggregates(r, def, items, slots, params)?;
+            }
+        }
+        N::FuncCall(f) => {
+            for a in f.args.iter_mut() {
+                found |= extract_aggregates(a, def, items, slots, params)?;
+            }
+        }
+        N::TypeCast(tc) => {
+            if let Some(a) = tc.arg.as_mut() {
+                found |= extract_aggregates(a, def, items, slots, params)?;
+            }
+        }
+        N::CoalesceExpr(c) => {
+            for a in c.args.iter_mut() {
+                found |= extract_aggregates(a, def, items, slots, params)?;
+            }
+        }
+        N::BoolExpr(b) => {
+            for a in b.args.iter_mut() {
+                found |= extract_aggregates(a, def, items, slots, params)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(found)
+}
+
+/// A `ColumnRef` node naming one column, for the rewriting above.
+fn column_ref_node(name: &str) -> pg_query::protobuf::Node {
+    pg_query::protobuf::Node {
+        node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+            fields: vec![pg_query::protobuf::Node {
+                node: Some(N::String(pg_query::protobuf::String {
+                    sval: name.to_string(),
+                })),
+            }],
+            location: 0,
+        })),
+    }
+}
+
+/// The PostgreSQL type one aggregate item answers.
+fn aggregate_item_type(item: &AggItem) -> String {
+    match item.func {
+        AggFunc::CountStar | AggFunc::Count => "int8".to_string(),
+        AggFunc::Sum => sum_result_type(item.source_type.as_deref()).to_string(),
+        AggFunc::Avg => avg_result_type(item.source_type.as_deref()).to_string(),
+        AggFunc::Min | AggFunc::Max => item
+            .source_type
+            .clone()
+            .unwrap_or_else(|| "text".to_string()),
+        AggFunc::ArrayAgg => format!("{}[]", item.source_type.as_deref().unwrap_or("text")),
+        AggFunc::BoolAnd | AggFunc::BoolOr => "bool".to_string(),
+        AggFunc::StringAgg => "text".to_string(),
+    }
+}
+
+/// A plausible value of `pg_type`, so an expression over the grouped values
+/// can be TYPED without running the query.
+fn sample_for_type(pg_type: &str) -> Bson {
+    match pg_type {
+        "int2" | "int4" => Bson::Int32(1),
+        "int8" => Bson::Int64(1),
+        "float4" | "float8" => Bson::Double(1.0),
+        "numeric" | "decimal" => Bson::String("1".into()),
+        "bool" => Bson::Boolean(true),
+        t if t.ends_with("[]") => Bson::Array(vec![]),
+        _ => Bson::String("x".into()),
+    }
 }
 
 /// `ORDER BY` written INSIDE an aggregate call, over the table's columns.
@@ -4117,17 +4265,6 @@ fn plan_select(
     }
     if !s.group_clause.is_empty() || has_aggregate(s) {
         return plan_aggregate(s, lookup, params);
-    }
-    // An aggregate wrapped in an expression belongs to no planner here yet;
-    // say so rather than letting the scalar path answer it per row (and
-    // answer NOTHING when the table is empty).
-    if s.target_list.iter().any(|t| match t.node.as_ref() {
-        Some(N::ResTarget(rt)) => rt.val.as_deref().is_some_and(contains_nested_aggregate),
-        _ => false,
-    }) {
-        return Err(Error::Unsupported(
-            "an aggregate inside an expression".into(),
-        ));
     }
     // `FROM a, b` -- a CROSS join, the comma form of `a CROSS JOIN b`. It
     // rides the JOIN path with no ON predicate.
@@ -4345,6 +4482,7 @@ fn plan_aggregate(
                 filter: None,
                 sep: None,
                 order: Vec::new(),
+                source_typmod: -1,
             });
         }
         // The WHERE clause was silently dropped here before: `count(*)
@@ -4362,6 +4500,7 @@ fn plan_aggregate(
             limit: None,
             offset: 0,
             having: None,
+            exprs: Vec::new(),
             distinct: aggregate_distinct(s)?,
         }));
     }
@@ -4783,6 +4922,7 @@ pub fn aggregate_output_def(agg: &Aggregate) -> Result<TableDef> {
     for (out, col) in &agg.select {
         let ty = match col {
             OutputCol::Group(i) => agg.group_by[*i].pg_type.clone(),
+            OutputCol::Expr(i) => column_expr_type(&agg.exprs[*i]).to_string(),
             OutputCol::Agg(i) => {
                 let item = &agg.items[*i];
                 match item.func {
@@ -4997,6 +5137,7 @@ fn finish_aggregate(
     }
 
     let mut items: Vec<AggItem> = Vec::new();
+    let mut exprs: Vec<ColumnExpr> = Vec::new();
     let mut select: Vec<(String, OutputCol)> = Vec::new();
     for t in &s.target_list {
         let Some(N::ResTarget(rt)) = t.node.as_ref() else {
@@ -5072,6 +5213,7 @@ fn finish_aggregate(
                                 filter: agg_filter.clone(),
                                 sep: agg_sep.clone(),
                                 order: agg_order.clone(),
+                                source_typmod: -1,
                             });
                             continue;
                         }
@@ -5086,6 +5228,7 @@ fn finish_aggregate(
                         .ok_or_else(|| Error::UndefinedColumn(col.clone()))?;
                     (func, Some(column.field()), Some(column.pg_type.clone()))
                 };
+                let source_field = field.clone();
                 let out = if rt.name.is_empty() {
                     name.clone()
                 } else {
@@ -5115,6 +5258,10 @@ fn finish_aggregate(
                     filter: agg_filter,
                     sep: agg_sep,
                     order: agg_order,
+                    source_typmod: source_field
+                        .as_deref()
+                        .and_then(|f| def.columns.iter().find(|c| c.field() == *f))
+                        .map_or(-1, |c| c.typmod),
                 });
             }
             Some(N::ColumnRef(c)) => {
@@ -5151,6 +5298,38 @@ fn finish_aggregate(
             Some(_) => {
                 let val = rt.val.as_deref().expect("ResTarget has a val");
                 let print = node_print(val);
+                // An expression OVER the grouped values -- `count(*) + 1`,
+                // `coalesce(sum(n), 0)`, `g + count(*)`. Its aggregates become
+                // ordinary items and the arithmetic runs over their results.
+                if group_prints.iter().all(|p| *p != print) {
+                    let mut rewritten = val.clone();
+                    let mut slots: Vec<RowField> = Vec::new();
+                    if extract_aggregates(&mut rewritten, &def, &mut items, &mut slots, params)? {
+                        for (i, key) in group_by.iter().enumerate() {
+                            let _ = i;
+                            if key.expr.is_none() {
+                                slots.push((
+                                    key.name.clone(),
+                                    key.field.clone(),
+                                    key.pg_type.clone(),
+                                ));
+                            }
+                        }
+                        let mut sample = Document::new();
+                        for (_, field, ty) in &slots {
+                            sample.insert(field.clone(), sample_for_type(ty));
+                        }
+                        let expr = row_column_expr(&rewritten, &slots, params, &sample)?;
+                        let out = if rt.name.is_empty() {
+                            expression_column_name(val)
+                        } else {
+                            rt.name.clone()
+                        };
+                        select.push((out, OutputCol::Expr(exprs.len())));
+                        exprs.push(expr);
+                        continue;
+                    }
+                }
                 let idx = group_prints
                     .iter()
                     .position(|p| *p == print)
@@ -5190,7 +5369,7 @@ fn finish_aggregate(
                     .ok_or_else(|| Error::Unsupported("this ORDER BY expression".into()))?;
                 match select.iter().find(|(out, _)| *out == col).map(|(_, o)| *o) {
                     Some(OutputCol::Group(i)) => i,
-                    Some(OutputCol::Agg(_)) => {
+                    Some(OutputCol::Agg(_) | OutputCol::Expr(_)) => {
                         return Err(Error::Unsupported(
                             "ORDER BY over an aggregate result".into(),
                         ))
@@ -5220,7 +5399,7 @@ fn finish_aggregate(
                     })?;
                 match col.1 {
                     OutputCol::Group(i) => i,
-                    OutputCol::Agg(_) => {
+                    OutputCol::Agg(_) | OutputCol::Expr(_) => {
                         return Err(Error::Unsupported(
                             "ORDER BY over an aggregate result".into(),
                         ))
@@ -5293,6 +5472,7 @@ fn finish_aggregate(
         limit,
         offset,
         having,
+        exprs,
         distinct: aggregate_distinct(s)?,
     }))
 }

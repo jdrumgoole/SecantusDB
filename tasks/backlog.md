@@ -10402,23 +10402,19 @@ shared storage engine or building large new protocol subsystems:
   refused -- honestly, with `DISTINCT ON with an aggregate` -- because the
   keys would have to resolve against the GROUP BY output rather than the
   table. Plain `SELECT DISTINCT` over an aggregate IS supported.
-- [ ] **Rust PG server: an aggregate INSIDE an expression is not implemented**
-  (2026-09-20). `select sum(n) + 0`, `count(*) + 1` and `coalesce(sum(n), -1)`
-  refuse with `0A000 an aggregate inside an expression is not supported yet`.
-  The refusal now happens while PLANNING, so it no longer depends on the data
-  -- before, these were planned as a plain SELECT with a computed column, and
-  over an EMPTY table they answered NO ROWS with no error at all. The feature
-  needs an output column that is an expression OVER the aggregate results;
-  `OutputCol` names either a group key or an aggregate, with no room for a
-  computation over them.
-  Every other aggregate gap from this list has since closed: `bool_and` /
-  `bool_or` on 2026-09-20, and `HAVING`, `FILTER (WHERE ...)`, `avg()`,
-  `string_agg()` and `ORDER BY` written inside an aggregate on 2026-09-22.
-  avg divides the exact sum by the count through the same `decimal_arith`
-  the `/` operator uses, so PostgreSQL's result scale came for free rather
-  than being approximated. An in-aggregate `ORDER BY` over an EXPRESSION
-  (`array_agg(s ORDER BY length(s))`) is still refused: the keys resolve
-  against the table's columns.
+- [ ] **Rust PG server: an in-aggregate `ORDER BY` over an EXPRESSION**
+  (2026-09-22). `array_agg(s ORDER BY length(s))` is refused: the sort keys
+  resolve against the table's columns, so a computed key has nowhere to come
+  from. Plain-column keys (`array_agg(s ORDER BY id DESC)`) work.
+  This is the last open item from what was a long aggregate list. The rest
+  closed: `bool_and` / `bool_or` on 2026-09-20; `HAVING`, `FILTER (WHERE ...)`,
+  `avg()`, `string_agg()` and a plain-column `ORDER BY` inside an aggregate on
+  2026-09-22; and **aggregates inside an expression** (`count(*) + 1`,
+  `coalesce(sum(n), 0)`, `sum(n) + 0`) on 2026-09-22 -- `OutputCol` grew an
+  `Expr` arm, the aggregates inside are extracted as ordinary items and the
+  arithmetic runs over their results. `avg` divides the exact sum by the count
+  through the same `decimal_arith` the `/` operator uses, so PostgreSQL's
+  result scale came for free rather than being approximated.
 - [ ] **Rust PG server: `min` / `max` of a BOOLEAN are answered, where
   PostgreSQL refuses** (2026-09-20). `select max(ok) from b` gives `true`;
   PostgreSQL 14.24 raises `42883 function max(boolean) does not exist`. Being
@@ -10445,6 +10441,13 @@ shared storage engine or building large new protocol subsystems:
   - `'abc'::char(2)` does not truncate. The cast chain carries type NAMES with
     no modifier, so the width would have to be threaded into the evaluation --
     today `cast_typmod` is description metadata only.
+  - **DONE 2026-09-22 -- the AGGREGATE half.** `array_agg`, `min` and `max`
+    see the PADDED value, because those take the column's own type;
+    `string_agg` does not (its argument is coerced to `text`, which strips)
+    and the counting aggregates cannot tell. `min`/`max` carry the typmod so
+    the ENCODER pads on output rather than the value being padded in place --
+    padding the value made `min(c) || '|'` answer with the blanks, which
+    PostgreSQL strips through `||`. All measured on 14.24.
 - [ ] **Rust PG server: 45 wrong-VALUE divergences across the existing
   `pg_corpora/`** (swept 2026-09-20 with the new
   `tools/probes/pg_differential.py --server=rust`, against PostgreSQL 14.24;
