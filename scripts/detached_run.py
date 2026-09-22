@@ -233,20 +233,35 @@ def cmd_wait(args: argparse.Namespace) -> int:
         time.sleep(args.interval)
 
 
+def _taskkill(pid: int) -> str:
+    """Windows has no process group to signal, so end the supervisor and its
+    whole tree -- and REPORT what happened.
+
+    The output used to go to DEVNULL with `check=False`, so a kill that failed
+    left no trace at all and `stop` still claimed success. A stop that does not
+    stop anything is exactly the kind of thing that has to be loud.
+    """
+    done = subprocess.run(
+        ["taskkill", "/T", "/F", "/PID", str(pid)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if done.returncode == 0:
+        return ""
+    detail = (done.stderr or done.stdout or "").strip().replace("\n", " ")
+    return f"taskkill exited {done.returncode}: {detail}"
+
+
 def cmd_stop(args: argparse.Namespace) -> int:
     state = _read_state(args.state_dir, args.name)
     pid = int(state["pid"])  # type: ignore[arg-type]
     if not _alive(pid):
         print(f"{args.name} is not running")
         return 0
+    trouble = ""
     if _WINDOWS:
-        # No process groups to signal: end the supervisor and its whole tree.
-        subprocess.run(
-            ["taskkill", "/T", "/F", "/PID", str(pid)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+        trouble = _taskkill(pid)
     else:
         os.killpg(os.getpgid(pid), signal.SIGTERM)
     for _ in range(50):
@@ -254,8 +269,28 @@ def cmd_stop(args: argparse.Namespace) -> int:
             break
         time.sleep(0.2)
     else:
-        if not _WINDOWS:
+        # Still there after ten seconds: escalate, then look again. POSIX has
+        # SIGKILL; Windows has only a second forced kill, which at least
+        # distinguishes "the first one was lost" from "this will not die".
+        if _WINDOWS:
+            trouble = _taskkill(pid) or trouble
+        else:
             os.killpg(os.getpgid(pid), signal.SIGKILL)
+        for _ in range(25):
+            if not _alive(pid):
+                break
+            time.sleep(0.2)
+        else:
+            # Do NOT claim to have stopped it. A caller that believes this and
+            # starts a replacement gets two of whatever it was running.
+            note = f" ({trouble})" if trouble else ""
+            print(f"{args.name} (pid {pid}) did not stop{note}")
+            return 1
+    if trouble:
+        # It died, but the first kill reported something -- say so rather than
+        # leave a failed command silently behind a success.
+        print(f"stopped {args.name} (pid {pid}) after a retry ({trouble})")
+        return 0
     print(f"stopped {args.name} (pid {pid})")
     return 0
 
