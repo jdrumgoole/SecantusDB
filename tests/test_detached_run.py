@@ -196,7 +196,14 @@ def test_stop_ends_a_running_command(tmp_path: Path) -> None:
     running = _run_env(state, env, "status", "--name", "nap")
     assert "running" in running.stdout, (running.stdout, running.stderr)
     stop = _run_env(state, env, "stop", "--name", "nap")
-    assert stop.returncode == 0, stop.stderr
+    assert stop.returncode == 0, (stop.stdout, stop.stderr)
+    # On a failure, say what `stop` reported and what `status` still sees --
+    # this assertion has failed on Windows CI without either, which left
+    # nothing to diagnose.
     assert _wait_for(
         lambda: "finished" in _run_env(state, env, "status", "--name", "nap").stdout, timeout=30
+    ), (
+        stop.stdout,
+        stop.stderr,
+        _run_env(state, env, "status", "--name", "nap").stdout,
     )
