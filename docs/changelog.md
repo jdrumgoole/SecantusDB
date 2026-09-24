@@ -61,6 +61,98 @@ survived every build, test and smoke run for two releases because the machine
 that builds the artifact is the one machine where it works.
 
 
+
+### The probe-store sweep no longer deletes a database that is still in use
+
+The sweep that reclaims abandoned probe WiredTiger homes deleted a **running**
+mongod's data directory. The directory had been named by hand with a shell's
+`$$` — the shell's pid, not the server it launched — so the name pointed at a
+process that had exited seconds later. The sweep saw a dead pid, believed it,
+and removed the files underneath a live database, which died on a fatal
+WiredTiger assertion: `log pre-alloc server error ... the process must exit and
+restart`.
+
+The pid in a store's name is written by whoever created the directory. It is a
+hint, not proof of ownership, and nothing else was asked before deleting.
+
+#### Fixed
+
+- A dead pid is no longer sufficient grounds. A store is reaped only once it
+  has also sat **untouched for half an hour** — a store being served is written
+  to constantly, so a recent mtime means hands off, whatever the name claims.
+  An abandoned store is still reclaimed on the next run after that, which is
+  ample for a problem measured in days.
+- `probe_store()` is documented as the only way to name one of these
+  directories, since it fills in `os.getpid()` and cannot name the wrong
+  process.
+
+`WiredTiger.lock` looks like the better authority and is not, which CI proved
+before this merged: POSIX advisory locks are held per **process**, so a check
+made from the process that opened the store reports the file as free. That
+passed on Windows — which locks mandatorily at the handle — and failed on
+macOS, where the sweep then deleted a live store and took `WT_PANIC` through
+the worker. Worse, merely opening and closing a descriptor to a file the
+process holds an `fcntl` lock on *releases* that lock, so the "safe" probe can
+break the database it is inspecting. The Windows `os.remove` probe is kept as
+an extra gate there, where it is genuinely decisive.
+
+The regression tests build stores directly rather than running a server, so a
+future regression fails an assertion instead of panicking WiredTiger inside the
+test worker. They were confirmed to fail with the guard removed.
+
+### `$stdDevPop` and `$stdDevSamp` work in an expression on the Rust MongoDB server
+
+`{$stdDevSamp: [1, 2]}` in a `$project` / `$addFields` / `$set` answered
+`168 Unrecognized expression` where mongod answers `0.7071067811865476`. The
+`$group` accumulator forms were fine; only the expression forms were affected.
+
+The evaluator had implemented both for three weeks, with unit tests. The names
+were simply absent from `KNOWN_EXPR_OPS`, which the pipeline validator consults
+*before* the evaluator runs — so a correct, tested engine sat behind a gate that
+refused to let any pipeline reach it. The Python server was never affected.
+
+#### Fixed
+
+- Both operators are on the validator's list, so pipelines reach the evaluator
+  that already implemented them. Verified against mongod 8.2.11: `$stdDevPop`
+  over `[1, 2, 3]` is `0.816496580927726` and `$stdDevSamp` over `[1, 2]` is
+  `0.7071067811865476` on both. Across the expression sweep this took the Rust
+  server from 96 code divergences to 2, and those two are the documented
+  Decimal128 `$atan2` / `$pow` deferrals.
+- The list's drift guard actually guards something now. The old test looped
+  over `KNOWN_EXPR_OPS` asserting a function whose entire body is a lookup in
+  `KNOWN_EXPR_OPS` accepted each name — the list agreeing with itself, unable
+  to fail however far the code drifted. The replacement reads `apply_op`'s
+  match arms from the source and asserts every dispatched operator is listed;
+  it was confirmed to fail, naming both operators, when the fix is reverted.
+
+### The Rust PostgreSQL server computes with aggregate results, and pads `char(n)` where PostgreSQL does
+
+`count(*) + 1` was refused. So were `sum(n) + 0` and `coalesce(sum(n), 0)` —
+anything that did arithmetic on what an aggregate returned. The shape of the
+plan was the reason: an output column named either a grouping key or an
+aggregate, with no room for a computation over them.
+
+#### Added
+
+- Aggregates inside an expression. The aggregates within are extracted and
+  planned as ordinary items — computed once per group as usual — and the
+  expression then runs over their results, reading each from its own slot. An
+  identical aggregate written twice in one expression is computed once.
+- `char(n)` reaches `array_agg`, `min` and `max` blank-padded, which is what
+  PostgreSQL does: those take the column's own type. `string_agg` does not, its
+  argument being coerced to `text`, and the counting aggregates cannot tell the
+  difference either way. Measured on PostgreSQL 14.24 rather than reasoned
+  about — the three behave differently and the difference is not guessable.
+
+#### Fixed
+
+- `min(c) || '|'` over a `char(n)` no longer answers with the padding.
+  `min`/`max` carry the column's `atttypmod` so the *encoder* pads on output;
+  padding the stored value instead put blanks through `||`, which PostgreSQL
+  strips. The first implementation did exactly that, and the concatenation
+  case is what caught it.
+
 ### `$toDecimal` of a long numeric string answers what mongod answers
 
 Converting a numeric string with more than 34 significant digits to a decimal,
