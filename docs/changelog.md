@@ -19,7 +19,7 @@ the API surface itself is shaped by Semantic Versioning intent.
 
 ## [Unreleased]
 
-## [0.6.0b17] — 2026-09-19
+## [0.6.0b17] — 2026-09-24
 
 ### The errors are the feature
 
@@ -46,6 +46,1427 @@ rather than a missing feature. Both Rust binaries now stamp the git tree they
 were built from and report it in `--version`, because an artifact older than the
 tree it is tested against produces failures that look like somebody else's
 regression, and the evidence is never in the diff.
+
+The binaries themselves were the last thing to get that treatment, and they
+needed it. Both published macOS archives linked liblz4 by its absolute Homebrew
+path and would not launch on a Mac that did not happen to have Homebrew lz4
+installed there; the Linux archives wanted `liblz4.so.1` and `libz.so.1` from
+the host, which a slim container image often does not carry. Both are fixed —
+every archive now links only its platform's own C runtime — but the more useful
+change is that the release no longer takes anyone's word for it. Before an
+archive is packaged, the workflow reads the binary's real dependency table
+(Mach-O load commands, ELF `DT_NEEDED`, or the PE import directory) and refuses
+to publish one that reaches outside a per-platform allowlist. The macOS bug had
+survived every build, test and smoke run for two releases because the machine
+that builds the artifact is the one machine where it works.
+
+
+### `$toDecimal` of a long numeric string answers what mongod answers
+
+Converting a numeric string with more than 34 significant digits to a decimal,
+through `$toDecimal` or `$convert`, failed with an internal server error on both
+SecantusDB servers, with or without `onError`. `mongod` accepts it: it keeps the
+first 34 digits, dropping the rest without rounding, so
+`"1.99999999999999999999999999999999999"` becomes
+`1.999999999999999999999999999999999`. Both servers now do exactly that.
+
+A string outside the range a decimal can hold now fails the way `mongod` fails,
+as a conversion error that `onError` catches, with `mongod`'s own reason: "would
+overflow" above about `1E+6144`, and "would underflow" for a value too small to
+keep all its digits (`1E-6176` still converts; `1E-6177` does not).
+
+A constant conversion that fails is now reported under the error name
+`ConversionFailure`, as `mongod` reports it, instead of `Location241`.
+
+#### Fixed
+
+- `expressions.py`: `$convert` / `$toDecimal` of a string parse as `mongod` does:
+  34 digits rounded toward zero, IEEE overflow and underflow as conversion
+  failures.
+- `crates/secantus-core`: the same for the Rust engine (`decimal128_from_str`),
+  which relied on a parser that refuses a 35th digit.
+- `commands.py`: error code 241 is named `ConversionFailure`.
+
+#### Testing
+
+- `tests/test_mongod_differential.py`: eleven cases against a real `mongod`
+  8.2.11: truncation, both range failures, the boundaries, and `onError`.
+- `crates/secantus-core`: unit tests with the same `mongod`-measured values.
+- A probe of 66 cases across both engines found no differences from `mongod`.
+
+### `detached_run stop` says when it fails to stop anything
+
+On Windows the stop path ran `taskkill` with its output sent to `DEVNULL` and
+its exit code ignored, then printed `stopped <name>` and returned 0 whatever
+happened. A kill that failed left no trace at all, and a caller that believed
+the success and started a replacement would get two of whatever it was
+running.
+
+`stop` now captures what `taskkill` said, retries once if the process is still
+there after ten seconds, and — if it is still alive after that — reports the
+failure with the diagnostics and exits non-zero instead of claiming success.
+The POSIX path already escalated to `SIGKILL`; it now verifies that worked too.
+
+Prompted by `test_stop_ends_a_running_command` failing once on Windows CI and
+passing on a re-run, with nothing in the log to say why. That test now prints
+what `stop` and `status` reported when it fails.
+
+#### Fixed
+
+- `scripts/detached_run.py`: `cmd_stop` reports a kill that did not work.
+- `tests/test_detached_run.py`: the assertion carries the evidence.
+
+### A dropped table's privileges came back with the next table of that name
+
+Dropping a table removed its definition and left everything that governed
+access to it behind: the table's grants, its column grants, its `relacl` state
+and its RLS policies. Creating a table under the same name silently reattached
+all four — **including grants to other roles**.
+
+That is a privilege-escalation shape rather than a metadata nit. Dropping a
+table is how someone revokes all access to it; before this, the replacement
+table still granted what the old one did.
+
+Measured against PostgreSQL 14 on 2026-09-20: after `DROP TABLE` + `CREATE
+TABLE` the new table reports `relacl` NULL and has no grants, column grants or
+policies. Comments and the RLS-enabled flag were already cleared correctly; the
+other four were not.
+
+#### Fixed
+
+- `DROP TABLE` clears the table's grants, column grants, `relacl` state and RLS
+  policies along with its definition.
+
+Found from pgjdbc's `DatabaseMetaDataTest::tablePrivileges`, which passed or
+failed depending on run order: the class's `noTablePrivileges` test revokes
+everything on `metadatatest`, and the fixture drops and recreates that table
+between every test, so on a real server the revoke cannot carry over. The
+initial diagnosis — "a view's privileges resolve and a table's do not" — was
+wrong, and checking it rather than building on it is what led here: the same
+test was passing in one parameterised run and failing in the other.
+
+Measured on pgjdbc's `DatabaseMetaDataTest` (194 tests): **31 failures → 30**,
+18 distinct → 17, no regressions. `tablePrivileges` goes green. The single-test
+delta understates the change; the leak it exposed is the substance.
+
+A full-suite run here also surfaced a parallel-worker race in
+`test_pg_numeric_wide_grouping.py` (every xdist worker created a table named
+`t` in the shared reference PostgreSQL's `public` schema, so workers raced on
+drop/create). That turned out to be fixed independently in #1536 while this
+branch was in flight, so nothing for it is carried here — #1536's per-case
+schema is what ships.
+
+### An array-of-enum column reported the enum, not the array type
+
+A column declared `test_schema.test_enum[]` recorded the **element** enum's oid.
+`pg_attribute`'s enum branch had no array handling — the composite branch beside
+it already did — so a client resolving the column found a `typtype = 'e'` enum
+where PostgreSQL 14 reports the `typtype = 'b'` array type. pgjdbc's
+`getColumns` returned TYPE_NAME `"test_schema"."test_enum"` and the element's
+DATA_TYPE instead of `"test_schema"."_test_enum"` and `ARRAY`.
+
+Fixing that exposed a second defect underneath it. Array type names were made
+unique against a **single global set** of every type name in the catalog, but a
+PostgreSQL type name is unique only within its own namespace. So
+`test_schema.test_enum`'s array dodged the entirely unrelated
+`public._test_enum` and came out `__test_enum`, and the miscount compounded —
+an array in `public` whose name was already taken landed on four underscores
+where PostgreSQL uses three.
+
+Both fixed, and every name was measured against PostgreSQL 14 on 2026-09-20
+rather than reasoned about — including the three-underscore case, which looks
+like an off-by-one and is not: `_test_enum` is taken by an enum of that literal
+name, and `__test_enum` by *that* enum's own array, which is created first
+because it has the lower oid.
+
+#### Fixed
+
+- An array-of-enum column reports the array type's oid.
+- Array type-name collisions are resolved per namespace.
+
+Measured on pgjdbc's `DatabaseMetaDataTest` (194 tests): **33 failures → 31**,
+20 distinct → 18, no regressions. `getCorrectSQLTypeForOffPathTypes` and
+`getCorrectSQLTypeForShadowedTypes` go green.
+
+### A foreign key reported the wrong referenced constraint
+
+`pg_constraint.conindid` — the index backing the constraint a foreign key
+references — was hardcoded to the referenced table's PRIMARY KEY index, and the
+comment beside it stated that as the rule. A foreign key may reference any
+UNIQUE constraint, so `REFERENCES pkt(b)` reported `pkt_pk_a` where PostgreSQL
+14 reports `pkt_un_b` (measured 2026-09-20).
+
+pgjdbc's `getImportedKeys` reads `PK_NAME` by joining `pkic.oid = con.conindid`,
+so this is the name an ORM sees for the key a foreign key points at — naming the
+wrong constraint misdescribes the relationship rather than merely omitting it.
+
+#### Fixed
+
+- `conindid` resolves from the foreign key's `confkey`, matching whichever
+  PRIMARY KEY or UNIQUE constraint covers those columns, and falling back to the
+  primary key when nothing matches.
+
+Columns are matched as a sorted set, because a foreign key may name the
+referenced columns in a different order than the constraint declares them. All
+three shapes are pinned by the test: the UNIQUE case that was wrong, the PRIMARY
+KEY case that was right and must stay so, and a composite unique.
+
+Measured on pgjdbc's `DatabaseMetaDataTest` (194 tests): **23 failures → 21**,
+14 distinct → 13, no regressions. `foreignKeysToUniqueIndexes` goes green.
+
+### A function created in a schema was invisible in it
+
+`CREATE FUNCTION hasfunctions.addfunction(...)` stored the function and then
+reported it in `public`. Only a `pg_temp_` qualifier was preserved at creation;
+every other schema was dropped. The function existed, worked, and could not be
+found by any client that filters by schema — which pgjdbc's `getFunctions` and
+`getProcedures` both do.
+
+Underneath that were two more defects on the same rows. `pg_proc.proname`
+returned the dotted storage key rather than the bare name, and `prokind` was
+hardcoded `'f'` — so **every procedure was reported as a function**, and
+`getProcedures()`, which filters on `prokind = 'p'`, returned nothing at all
+regardless of schema.
+
+Fixing only the catalog half would have made things worse: the routine is
+stored under a dotted key, so recording the schema without teaching the call
+path about it made `hf.addf(1, 2)` raise "function addf does not exist" — the
+namespace correct and the function unusable. A qualified call now resolves
+against the dotted key first, then the bare name, so builtins
+(`pg_catalog.now()`) and unqualified calls are unaffected.
+
+#### Fixed
+
+- A schema qualifier is preserved for any schema, not just `pg_temp_`.
+  `public` stays unqualified: it is the default search_path schema, so its
+  functions must keep resolving from a bare name.
+- `pg_proc.pronamespace` resolves to the routine's real schema, and `proname`
+  is the bare name.
+- `pg_proc.prokind` is `'p'` for a procedure.
+- A schema-qualified call resolves the dotted key.
+
+#### Changed
+
+- A **bare** call to a function homed in a non-search_path schema now raises
+  `function addf(integer, integer) does not exist`. This server used to answer
+  it; PostgreSQL 14 raises exactly that error (measured 2026-09-19), so the
+  new behaviour is the faithful one.
+
+Measured on pgjdbc's `DatabaseMetaDataTest` (194 tests): **36 failures → 34**,
+23 distinct → 21, no regressions. `getFunctionsInSchemaForFunctions` and
+`getProceduresInSchemaForProcedures` go green.
+
+### `CREATE FUNCTION f(int, int)` recorded its arguments as `void`
+
+`pg_proc.proargtypes` read `'2278 2278'` for a function declared with **unnamed**
+parameters — 2278 is `void`, and an OID this catalog does not even define, so a
+client resolving it found nothing. Named parameters were unaffected:
+`CREATE FUNCTION g(a int, b text)` recorded `'23 25'` correctly all along, which
+is why a catalog full of working functions never showed it.
+
+#### Fixed
+
+- `_function_param_types` now resolves a bare parameter type. sqlglot parses
+  `f(a int)` as a `ColumnDef` carrying a `DataType`, but bare `f(int, int)` as a
+  plain `Identifier` whose name is the type spelling; the `DataType` branch
+  missed it and the tag fell through to `None` → void. Multi-word builtins
+  resolve too (`double precision` → `float8`).
+
+Found from pgjdbc's `DatabaseMetaDataTest::funcWithoutNames()`, which is exactly
+the test for functions declared without parameter names. Measured effect on that
+gauge: 82 → 80 standing failures, and the baseline is tightened to match.
+
+### `$lookup` joins numbers by value, and SQL set operations dedup by value
+
+A `$lookup` with `localField` / `foreignField` returned no match for
+`Decimal128("1.5")` against `Decimal128("1.500")`, or for `2` against
+`Decimal128("2.0")`. On the Rust server it also missed `2` against `2.0`. The
+Python server joined `true` to `1`. mongod 8.2.11 joins all of those pairs by
+value except `true`/`1`. This only happened when the foreign field had no
+index: that path is a hash join, and it keyed on the raw value. Python's
+`Decimal128` hashes by representation, and the Rust server compared with
+structural `Bson` equality. With an index, the query goes through the query
+engine and was already right.
+
+The PostgreSQL server lowers a join to `$lookup`, so the same bug meant
+`select ... from t join u on t.v = u.v` returned no rows for numerics that
+differed only in scale, or for a numeric against an int. Separately,
+UNION / INTERSECT / EXCEPT, recursive-CTE dedup, evaluated DISTINCT, DISTINCT ON
+and window PARTITION BY built each row's identity from `repr()`. So `1.5` and
+`1.50` were different rows, INTERSECT of the pair was empty, and `0.0` / `-0.0`
+split too.
+
+#### Fixed
+
+- `aggregate.py`: the `$lookup` hash join keys on the `$group` bucket key
+  (numerics by value, one NaN, bool apart from numbers).
+- `crates/secantus-commands`: `lookup_match` compares with the canonical BSON
+  order instead of `==`.
+- `sql/numeric.py`: `eq_key`, a by-value row identity, used by the set
+  operations, DISTINCT, DISTINCT ON and PARTITION BY.
+
+#### Testing
+
+- `tests/test_lookup_numeric_equality.py`: both servers, with and without an
+  index on the foreign field.
+- `tests/test_mongod_differential.py`: `lookup-numeric-equality-by-value`.
+- `tests/test_pg_numeric_value_equality.py`: joins, set operations, signed
+  zero, NaN, DISTINCT ON and PARTITION BY.
+
+### The macOS binaries only ran on a machine that had Homebrew
+
+Both published macOS archives — `secantusd-rs` and `secantusd-pg` — linked
+liblz4 by its absolute Homebrew path, `/opt/homebrew/opt/lz4/lib/liblz4.1.dylib`.
+On a Mac without Homebrew lz4 installed at exactly that path, neither binary
+launches at all. Nothing in the build said so: the release runner has Homebrew
+by definition, the smoke test passes there, and `otool -L` on the shipped
+archive is the only thing that ever reported it.
+
+The cause was one word. `secantus-wt`'s build script emitted
+`cargo:rustc-link-lib=dylib=lz4`, and because Homebrew ships `liblz4.a` and
+`liblz4.dylib` side by side in the same directory, `dylib=` meant the linker
+took the dylib every time even though a static archive sat next to it. macOS
+now picks the link kind where it already picks the search path, and prefers the
+static archive wherever one exists.
+
+The fix for the release lanes was already in the tree and only the wheel build
+used it: `tools/build_lz4_macos.sh` builds a static-only liblz4 at the right
+deployment target, which is why the published macOS **wheel** has never had this
+problem. Both binary workflows now build lz4 the same way instead of
+`brew install lz4`. The Linux archives are unaffected — they link `liblz4.so.1`
+and `libz.so.1` through the normal loader path — and the Windows archive was
+already self-contained.
+
+#### Fixed
+- macOS `secantusd-rs` and `secantusd-pg` archives are now self-contained: they
+  link only `/usr/lib` and `/System/Library` system libraries, with liblz4
+  statically linked. Verified with `otool -L` and a 3,000-document round trip
+  through lz4-compressed tables.
+- A plain developer `cargo build` on macOS now produces a portable binary too,
+  rather than one pinned to the builder's Homebrew prefix.
+
+#### Changed
+- `release-binaries.yml` and `release-pg-binaries.yml` build lz4 from source via
+  `tools/build_lz4_macos.sh` and set `CMAKE_PREFIX_PATH` +
+  `SECANTUS_WT_EXTRA_LIBDIR`, matching what `wheels.yml` has always done.
+
+### Wide numerics group by value
+
+On the Python PostgreSQL server, `select v, count(*) from t group by v` over a
+`numeric` column returned one row per stored *text* rather than one per value.
+A number past 34 significant digits does not fit a Decimal128, so it is stored
+with its Postgres text beside a scale-free key — which made `1e40`, `1e40.0`
+and `1e40.00` three documents and therefore three groups where PostgreSQL has
+one. `SELECT DISTINCT` and `count(DISTINCT v)` split the same way.
+
+Such a column now groups on the value, and the group carries the first row's
+value for display, which is what PostgreSQL prints: insert `…890.00` first and
+GROUP BY answers `…890.00`, insert the bare form first and it answers that
+(measured against PostgreSQL 14.24).
+
+Still split, and recorded in `tasks/backlog.md`: a join whose key is wide, and
+a value stored narrow in one row and wide in another (`1.5` against `1.5`
+written with 39 digits).
+
+#### Fixed
+
+- `sql/numeric.py`: `group_key_expr`, the value identity for a numeric column.
+- `sql/planner.py`: every `$group` that keys on a numeric column — plain GROUP
+  BY, GROUPING SETS / ROLLUP / CUBE, the window and join planners, `SELECT
+  DISTINCT` and the DISTINCT-over-grouped-output dedup — keys on that identity
+  and restores the display value.
+
+#### Testing
+
+- `tests/test_pg_numeric_wide_grouping.py`: pinned cases, plus ten that run the
+  same statements against a live PostgreSQL and compare the text, so a
+  difference in scale fails rather than passing silently.
+
+### `pg_class.relpages` and `pg_type.typlen` did not exist
+
+Two catalog columns a JDBC client reads were simply absent, and each failed a
+query outright rather than returning a wrong value.
+
+`pg_class.relpages` is what pgjdbc's `getIndexInfo` selects as `PAGES`, so its
+absence failed that whole query with `column "relpages" does not exist` before
+any row came back. `pg_type.typlen` is read by `getMaxNameLength()`, which
+selects it for `typname = 'name'` and treats a missing row as fatal — and
+`name` is not a type this server stores, so the row had to be added for the
+lookup to resolve at all.
+
+All values measured against PostgreSQL 14 on 2026-09-19.
+
+#### Added
+
+- `pg_class.relpages`. A fresh table reports 0; a fresh **index** reports 1,
+  because an index has its metapage from the moment it exists — 0 would be the
+  obvious guess and is wrong.
+- `pg_type.typlen`, for built-in, array, composite, range, domain and enum
+  rows. An enum is a fixed 4-byte oid reference; everything else user-defined
+  is varlena (-1). A domain inherits its base type's width. TypeInfoCache
+  filters its array lookup on `typlen = -1`, so the array rows' value is
+  load-bearing rather than decorative.
+- a `pg_type` row for `name` (oid 19), a type this server never stores but a
+  client still resolves by name.
+
+#### Fixed
+
+- A comment added with the declared-char-type change claimed this catalog
+  emits no `_<type>` array rows for any type. That was inferred from
+  `PG_TYPENAME` holding no `_` names and is **false** — array rows are
+  synthesised from `typarray`, and `_text` (1009) has always been served.
+
+Measured on pgjdbc's `DatabaseMetaDataTest` (194 tests): **36 failures → 35**,
+23 distinct → 22, no regressions. `getClientInfoProperties` goes green.
+`relpages` also unblocks `getIndexInfo` far enough to reach the *next* blocker
+in the same query, now filed in `tasks/backlog.md` with both of its halves.
+
+### `COPY TO` exports a timestamp's microseconds
+
+`COPY <table> TO` on the Python PostgreSQL server cut every `timestamp` and
+`timestamptz` down to the millisecond: a stored `10:00:00.412661` was exported
+as `10:00:00.412`, in both the text and binary formats. `SELECT` and
+`COPY (SELECT …) TO` were exact. `COPY TO` is how a table is exported or backed
+up, so every export taken that way was quietly less precise than the data.
+
+The server keeps a timestamp's sub-millisecond part beside the stored date, and
+the table form of `COPY TO` read the date without it. It now reads each value
+the way `SELECT` does. Found by psycopg's `test_copy_table_across`, which passed
+or failed depending on whether its random timestamps had microseconds.
+
+#### Fixed
+
+- `sql/engine.py`: `copy_extract` and `copy_extract_raw` read each column through
+  `executor._with_subms`, the same merge `SELECT` uses.
+
+#### Testing
+
+- `tests/test_pg_copy_to_subms.py`: text and binary exports, and a table copied
+  across through `COPY TO` / `COPY FROM` in both formats. All four fail without
+  the fix.
+
+### `varchar` and `char(n)` columns pointed at a type that did not exist
+
+Both spellings fold to the `text` storage tag, but a column still records the
+declared oid — 1043 for `varchar`, 1042 for `bpchar`. `pg_type` is built from a
+tag-keyed table, which can name only one of the three, so every `varchar` and
+`char(n)` column in the catalog referenced an oid with **no `pg_type` row**. A
+client joining `pg_attribute` to `pg_type` — which is what a JDBC or psycopg
+metadata call does — resolved those columns to nothing.
+
+Function AND procedure parameters had the same distinction missing one level
+further in: they carried no equivalent of a column's `decl_oid`, so `CREATE
+FUNCTION f(int, varchar)` recorded `proargtypes = '23 25'` where PostgreSQL 14
+records `'23 1043'`, and a client reading the argument back was told it was
+`text`. For a procedure the same gap reached the **wire**: an `INOUT varchar`
+parameter's `CALL` result column was described as oid 25 where PostgreSQL 14
+sends 1043.
+
+Found from pgjdbc's `DatabaseMetaDataTest::functionColumns`, which asserts a
+bare `varchar` parameter reports as `varchar`. All values here were measured
+against PostgreSQL 14 on 2026-09-19.
+
+#### Fixed
+
+- `pg_type` now carries rows for `varchar` (1043) and `bpchar` (1042), so a
+  declared-char column resolves to a real type row instead of dangling.
+- `pg_proc.proargtypes` records the declared oid for a `varchar` / `char(n)`
+  parameter, in both the named and the unnamed signature form, for functions
+  and procedures alike.
+- A `CALL`'s `RowDescription` reports the declared oid for an `OUT` / `INOUT`
+  `varchar` / `char(n)` parameter — the wire-visible half of the same gap.
+- A bare `bpchar` parameter recorded `2278` (**void**) — it has no storage tag
+  at all, so it was not merely the wrong string type but an oid this catalog
+  does not define. It now records 1042.
+- A function's RETURN type kept the declaration too: `RETURNS varchar` had
+  recorded `prorettype` 25, and `pg_get_function_result` /
+  `information_schema.routines.data_type` both said `text`.
+- `information_schema.columns.data_type` names the declared type for a
+  `varchar` / `char(n)` column instead of reporting the `text` tag for every
+  string column.
+- `pg_get_function_arguments` and `information_schema.parameters.data_type`
+  render `character varying` / `character` for those parameters — the SQL
+  spelling PostgreSQL uses there, which is deliberately *not* the
+  `pg_type.typname` (`varchar` / `bpchar`) the same type reports elsewhere.
+
+The Rust Postgres server was checked for the same defect and does not carry it:
+its `BUILTIN_TYPES` already lists `varchar` (1043) and `bpchar` (1042) with the
+same array oids measured here, and it has no `pg_proc` function reflection at
+all. This one is Python-server-only.
+
+Measured against pgjdbc's `DatabaseMetaDataTest` (jdbc2 + jdbc4 + jdbc42, 194
+tests), by diffing a run with and without this change: **42 failures → 36**,
+26 distinct → 23, **no regressions**. `functionColumns`,
+`getColumnsCharOctetLength` and `informationAboutArrayTypes` all go green —
+the latter two because a `varchar` column now resolves to a real `pg_type`
+row, which is what the driver's own type lookup needs.
+
+### HAVING compares a numeric sum at full precision
+
+On the Python PostgreSQL server, `select g from t group by g having sum(v) =
+<the value the select list returned>` could return no rows. The select list
+sums a `numeric` column exactly. HAVING compared an in-pipeline running total
+instead, which rounds at 34 significant digits and ignores a value too wide
+for a Decimal128. A group whose sum held a 50-digit value compared as if that
+value were not there.
+
+For a single-table GROUP BY, including with window functions, and for an
+aggregate with no GROUP BY, a `numeric` `sum` / `min` / `max` in HAVING is now
+evaluated after the exact fold. Joins, grouping sets and `FILTER` terms still
+compare in the pipeline (tracked in `tasks/backlog.md`).
+
+#### Fixed
+
+- `sql/planner.py`: `_having_to_match` sends a numeric sum / min / max term to
+  the per-grouped-row HAVING residual when the caller has one.
+
+#### Testing
+
+- `tests/test_pg_having_exact_numeric.py`: 37-digit and 50-digit sums,
+  `min` / `max`, `BETWEEN`, `IS NULL`, a mixed `AND`, ORDER BY + LIMIT, a
+  window over the groups, and a whole-table aggregate.
+
+### `numeric` is exact at any width on the Python PostgreSQL server
+
+The Python PostgreSQL server stored every `numeric` as a BSON Decimal128, which
+holds 34 significant digits. A wider value was silently rounded, and a very
+small one was changed to a different number entirely: `1E-7000` was stored as
+`1E-6176`. That was documented as a permanent limit. It is gone: `numeric` now
+holds any value PostgreSQL does, exactly, with its display scale.
+
+It uses the same representation the Rust server adopted, so both servers store
+a numeric the same way. A value that fits a Decimal128 exactly is stored as one,
+so a Mongo client reading the same collection sees exactly what it saw before
+for ordinary numbers. Anything wider is stored in the column as a small document
+holding PostgreSQL's text for the value and a sort key, and every part of the
+server that compares, sorts or adds numbers understands both forms.
+
+Getting there turned up several older bugs, now fixed. `+`, `-` and `*` on a
+`numeric` rounded at 28 digits, below even Decimal128's 34, and `%` converted
+its operands to floating point. `ORDER BY` over a numeric column holding `NaN`
+failed with an internal error, and so did `UPDATE` of a numeric primary key.
+`numrange` bounds printed large values in exponent notation.
+
+#### Fixed
+
+- `sql/numeric.py` (new): the two-form representation, PostgreSQL's canonical
+  text, a byte-sortable key with `NaN` above everything, and exact `WHERE`
+  filters that work for either form. Ported from
+  `crates/secantus-pgplan/src/numeric.rs`, with the Decimal128 neighbour
+  calculation corrected for values near the smallest exponent (recorded for the
+  Rust side in `tasks/backlog.md`).
+- `sql/typemap.py`: writes, literals, typmod enforcement, rendering and sort
+  keys understand the wide form; unary minus no longer rounds.
+- `sql/planner.py`: `=`, `<>`, `<`, `<=`, `>`, `>=`, `IN`, `BETWEEN` and
+  `= ANY(ARRAY[...])` on a numeric column are exact; `sum` / `min` / `max` /
+  `avg` over a numeric are computed exactly after the pipeline; an `ORDER BY` on
+  a numeric in a grouped, distinct or joined query is done after the pipeline.
+- `sql/scalar.py`: `+`, `-`, `*`, `abs`, `round` and `%` are exact.
+- `sql/executor.py`: a numeric primary key rejects a duplicate by value
+  (`1e40` and `1e40.0`), `ON CONFLICT` finds it by value, and an `UPDATE` that
+  changes a numeric key no longer fails.
+- `sql/window.py`: a window `ORDER BY` over a wide numeric no longer orders it
+  as JSON.
+- `sql/ranges.py`: `numrange` bounds accept the wide form and render in plain
+  notation.
+
+#### Testing
+
+- `tests/test_sql_numeric_wide.py`: the Rust server's own wide-numeric tests,
+  whose expectations PostgreSQL 16 produced, running against the Python
+  server: round trips in text and binary, arithmetic, every comparison
+  operator, `NaN` placement, exact aggregates, and numeric primary keys.
+
+### `oid[]` casts parse, and `regclass` columns no longer crash
+
+On the Python PostgreSQL server, a cast to `oid[]`, `regclass[]`, `regproc[]`
+or `regtype[]` (`'{1,2}'::oid[]`) was rejected as a syntax error, for SQL
+PostgreSQL accepts. psycopg writes an `oid[]` value exactly that way when it
+fills parameters in on the client side, so inserting such a value through a
+client-side cursor failed. These casts now work, and a `regtype[]` column can be
+created.
+
+Creating a table with a `regclass` or `regproc` column failed with an internal
+error. The server does not support those column types; it now says so with a
+"not supported" error instead of crashing.
+
+Found by replaying psycopg's own random-data tests through the parser: 47 of
+3,000 random schemas hit it before the fix, none after.
+
+#### Fixed
+
+- `sql/planner.py`: `oid[]` / `regclass[]` / `regproc[]` / `regtype[]` in a type
+  position are rewritten to a form the SQL parser accepts and restored after
+  parsing, using the parser's own tokens so string literals are never touched.
+- `sql/planner.py`: column-type checks no longer assume every parsed type is an
+  enum member (`regclass` is kept as a plain string).
+
+#### Testing
+
+- `tests/test_pg_oid_array_casts.py`: every cast and column shape, a string
+  literal left alone, the array type reported back, a client-side-bound `oid`
+  list, and `regclass` / `regproc` columns failing cleanly. Fifteen of the
+  sixteen tests fail without the fix.
+
+### The wide-numeric oracle tests stop colliding in CI
+
+`tests/test_pg_numeric_wide_grouping.py` compares against a live PostgreSQL,
+and every xdist worker shares that one server. Each test dropped and recreated
+a table named `t`, so two parametrisations raced each other and CI saw both
+halves: `relation "t" does not exist` in one worker and a duplicate key on
+`pg_type_typname_nsp_index` in another.
+
+Each test now works in a schema of its own, which leaves the cases' SQL (which
+names a bare `t`) unchanged and drops the schema afterwards.
+
+#### Fixed
+
+- `tests/test_pg_numeric_wide_grouping.py`: a per-test schema on the oracle
+  side.
+
+### Parse reports errors when it should, and ABORT works
+
+The PostgreSQL server accepted a `Parse` it should have rejected. A statement
+naming a table that does not exist, or input that is not SQL at all, got a
+`ParseComplete`, and the error only came back later, at `Execute`. PostgreSQL
+checks both when it parses, so a client that prepares a statement now and runs
+it later (pgx's `Prepare`, JDBC with server-side prepare) saw the error on the
+wrong message. Both are now reported in reply to `Parse`, and a syntax error
+names the token PostgreSQL names: `this is not sql` is an error "at or near
+`this`".
+
+`ABORT`, PostgreSQL's synonym for `ROLLBACK`, was rejected as a syntax error.
+That was more than cosmetic: inside a transaction that had already failed, the
+`ABORT` meant to end it was itself refused, and the session stayed stuck until
+the client sent `ROLLBACK`. `CHECKPOINT` was rejected the same way and is now
+accepted.
+
+`lower()` and `upper()` of a range now have the type PostgreSQL gives them:
+`timestamp` for a `tsrange` (not `timestamp with time zone`), `date` for a
+`daterange` (not a midnight timestamp), and a `tstzrange` bound keeps its
+`+00` when cast to text.
+
+`scripts/detached_run.py`, the helper for long runs, now works on Windows.
+
+#### Fixed
+
+- `sql/pgextended.py`, `sql/planner.py`: `Parse` resolves every relation with
+  planning's own resolver (`planner.missing_relation`, which also accepts views
+  and sequences) and answers `42P01` for a missing one.
+- `sql/engine.py`: any bare expression that parses in place of a statement is a
+  `42601` (`this is not sql` parsed as `NOT (this IS sql)` and slipped past a
+  list of node types), and the error names the leading input token.
+- `sql/planner.py`: `ABORT [WORK | TRANSACTION]` parses as `ROLLBACK`.
+- `sql/engine.py`: `CHECKPOINT` answers its command tag (SecantusDB has no
+  user-driven checkpoint to force).
+- `sql/ranges.py`, `sql/planner.py`, `sql/scalar.py`, `sql/typemap.py`: the
+  result type of a range bound follows the range type, and `::text` of a
+  `lower()` / `upper()` looks through to the range column's type.
+- `scripts/detached_run.py`: a Windows liveness check (`os.kill(pid, 0)` is not
+  one there), `stop` without process groups, and a bare `python` resolved
+  through `PATH`, so it is the venv's interpreter rather than the base one.
+
+#### Testing
+
+- `tests/test_pg_parse_analysis.py`: missing relations fail the `Parse`; 22
+  valid relation kinds (views, sequences, temp tables, CTEs, catalogs,
+  `UPDATE … FROM`, …) still parse; `ABORT` ends a failed block.
+- `tests/test_pg_range_bound_types.py`: types and text for every range type,
+  plus a real-PostgreSQL comparison in the `pg-oracle` lane.
+- `tests/test_detached_run.py`: three tests that run on every platform (the rest
+  are POSIX-only by nature, which is how the Windows breakage went unnoticed).
+
+### Timestamp arrays keep their microseconds
+
+A `timestamp[]` or `timestamptz[]` column on the Python PostgreSQL server
+stored every element to the millisecond: `10:00:00.826829` came back as
+`10:00:00.826`, with no error. The same array written as an expression was
+exact, so the loss was only in storage.
+
+A plain timestamp column keeps its sub-millisecond part in a hidden field beside
+the stored date. Array columns never had one, and each element of the array is
+stored as a date too. They now keep a parallel list of remainders, written only
+when some element needs one, and cleared when an update no longer does.
+
+Found by psycopg's random-data COPY tests, which failed whenever a draw put
+microseconds inside an array.
+
+#### Fixed
+
+- `sql/subms.py`: `split` / `merge` work element by element on arrays (nested
+  arrays too); `carries_subms` names the column types that keep the companion.
+- `sql/planner.py`, `sql/executor.py`: `INSERT`, `COPY FROM`, `UPDATE` and the
+  whole-row read paths (including `COPY TO`) use it for array columns.
+
+#### Testing
+
+- `tests/test_pg_timestamp_array_subms.py`: parameters with NULL elements, a
+  two-dimensional literal, updates that set and clear remainders, and `COPY`
+  in and out in text and binary.
+
+### Filters and grouping see a timestamp's microseconds
+
+On the Python PostgreSQL server, some queries compared timestamps only to the
+millisecond, and so returned the wrong rows when two values differed only in
+their microseconds:
+
+- A `WHERE` on a `timestamp[]` column (`a = ARRAY[...]`, `x = ANY(a)`,
+  `a @> ...`) found nothing when the literal had microseconds, and `a <> ...`
+  returned the equal row as well.
+- A query with `EXISTS` or a correlated subquery that compared timestamps
+  (`EXISTS (... WHERE s2.t = s.t)`) never matched.
+- `DISTINCT` and `GROUP BY` on a `timestamp[]` column merged arrays that
+  differed only in their microseconds, so counts came out too low.
+
+All three now compare the full value. The data was always stored correctly;
+these paths read it without the stored microseconds.
+
+#### Fixed
+
+- `sql/planner.py`: a `WHERE` that reads a timestamp-array column is evaluated
+  row by row; `DISTINCT` / `GROUP BY` on one groups on the full value.
+- `sql/executor.py`, `sql/scalar.py`: the row-by-row `WHERE` reads columns with
+  their microseconds, for the outer query and for the rows of a subquery.
+
+#### Testing
+
+- `tests/test_pg_timestamp_subms_predicates.py`: the array predicates, a
+  correlated `EXISTS`, and `DISTINCT` / `GROUP BY` counts and values. All six
+  tests fail without the fix.
+
+### Prepared `pg_sleep` / `pg_notify` / advisory-lock / `lo_creat` calls keep working
+
+On the Python PostgreSQL server, `select 1, pg_sleep(0.25)` failed on its
+seventh run with 0A000 "cached plan must not change result type". psycopg
+prepares a statement after five runs. After that, each Bind compares the type
+Describe reported with the type Execute produced, and for these functions the
+two were different.
+
+Describe cannot run a volatile function, so it reads the type from a table.
+Execute types the call through the planner, which fell back to `text`. The two
+disagreed for `pg_sleep`, `pg_notify`, the blocking `pg_advisory_lock*` forms,
+`pg_advisory_unlock_all`, `lo_creat` and `lo_create`. Both now report what
+PostgreSQL reports: `void` for the first four, `oid` for the large-object
+creators.
+
+#### Fixed
+
+- `sql/planner.py`: return types for these functions match `pg_proc`.
+- `sql/engine.py`: the Describe table uses `void` for `pg_sleep` and the
+  advisory locks, and now covers the `_shared` / `_xact` / `try` variants.
+
+#### Testing
+
+- `tests/test_pg_volatile_fn_describe.py`: each function prepared and repeated,
+  asserting PostgreSQL's oid on every run, plus the original
+  `select 1, pg_sleep(0)` shape under psycopg's default prepare threshold.
+
+### pgjdbc gauge re-baselined
+
+The committed baseline dated from 2026-08-16 and was taken over a materially
+different test population: today's run executes 5,819 tests against that
+baseline's 5,570. A regression count computed across different populations is
+not evidence in either direction, and the check had started reporting 23
+"regressions" that were nothing of the sort.
+
+#### Changed
+
+- `pgjdbc_validation/baseline.json` regenerated from a complete current run:
+  **82 standing failures across 49 entries** (was 58 across 36). The verdict is
+  clean again, so a real regression will stand out instead of being lost in a
+  permanent delta.
+
+The largest cluster — 35 failures in `DatabaseMetaDataTest`, 21 of them the same
+`rs.next()`-returned-nothing signature — is recorded in `tasks/backlog.md` with
+the six hypotheses already eliminated, so accepting them into the baseline does
+not quietly retire the question.
+
+### The Rust PostgreSQL server starts in-process now
+
+Starting a SecantusDB server in a test has always been one or two lines with no
+external processes to manage — except for the Rust PostgreSQL server, which
+every test and the psycopg gauge had to spawn as a `secantusd-pg` subprocess,
+wait for a readiness line from, and remember to terminate. That server's accept
+loop lived in its `main.rs`, so nothing else could reach it. The loop has moved
+into the library as `secantus_pgserver::bind`, and `_secantus_server` grows a
+`PgServer` handle over it that mirrors the Mongo server's `RustServer`:
+`PgServer(path)` binds a socket on an OS-assigned port, `.dsn` is handed
+straight to psycopg, and `.stop()` shuts it down. Python is only the launcher —
+no statement ever enters it.
+
+The interesting half of that move is who owns the store. WiredTiger's
+close-checkpoint runs when `Storage` is dropped, and without it every write
+acknowledged since the previous checkpoint is gone — measured last month as a
+`CREATE TABLE` plus `INSERT` that the client had been told succeeded and that
+were not there afterwards. An `Arc<Storage>` parameter would have let a caller
+hold a second reference, skip the checkpoint, and hear nothing about it. So
+`bind` takes the `Storage` **by value** and the returned handle owns it for the
+rest of its life: stopping the server drains the connections, tears down the
+runtime, and drops the last reference, which is where the checkpoint happens.
+"Stopping checkpoints the store" is a property of the type rather than a rule
+someone has to remember, and if a wedged connection ever defeats the drain,
+`stop` says so on stderr instead of returning as though the data were safe.
+
+Shutdown also had to learn to tell the connections, not just wait for them. A
+pooled PostgreSQL connection sits idle indefinitely — a real backend never hangs
+up on one — so a stop that only drained blocked for its full timeout whenever a
+caller left a connection open, which in an embedded test is most of the time:
+10.8 seconds, measured. Every connection now selects its socket against a
+shutdown signal and lets go when it fires, which brings the same stop to 0.11
+seconds with the writes still landing on disk.
+
+`secantusd-pg` is now a thin CLI wrapper around the same `bind` — same readiness
+line, same `--database` handling, same clean SIGINT/SIGTERM shutdown — so there
+is one serve path instead of two, and a durability or shutdown fix lands in both
+the binary and the embedded handle by construction.
+
+#### Added
+
+- `secantus-pgserver`: `bind()` / `RunningPgServer` (`address()`, `dsn()`,
+  idempotent `stop()`, `Drop`) — a synchronous, runtime-free entry point that
+  owns its own tokio runtime and resolves the bound address before returning, so
+  `127.0.0.1:0` works from a plain (non-async) caller.
+- `_secantus_server.PgServer`: the embedded Python lifecycle handle —
+  `PgServer(storage_path, port=0, host="127.0.0.1", databases=None)`, with
+  `address` / `port` / `dsn` / `version` properties, `stop()`, and the
+  context-manager protocol. Behind the default-on `pgserver` cargo feature;
+  `_secantus_server.HAS_PGSERVER` reports whether a build carries it.
+
+#### Changed
+
+- Stopping the PostgreSQL server now signals its live connections instead of
+  only waiting for them, so an open client connection no longer holds the
+  shutdown for the full drain timeout (10.8s → 0.11s). The old binary aborted
+  the accept task and dropped a still-shared `Arc<Storage>`, which skipped the
+  close-checkpoint silently in exactly that case.
+- `secantusd-pg` is a CLI wrapper over `secantus_pgserver::bind` rather than
+  carrying its own accept loop. Observable behaviour — the
+  `secantusd-pg listening on {bound} storage={home}` readiness line, the
+  ephemeral-port form, `--database`, and clean SIGINT/SIGTERM shutdown — is
+  unchanged.
+
+### A WiredTiger session per statement, for statements that never read a row
+
+Every statement the Rust PostgreSQL server runs outside a transaction block
+opened a WiredTiger session and closed it again — measured at exactly one per
+statement, including `SELECT 1`, which touches no data at all. Sessions are
+cheap but not free, and a client such as psycopg sends every statement through
+the path that pays for one.
+
+A session whose transaction has finished holds nothing: the transaction is
+over, and any cursor closed with the scope that opened it. So rather than
+closing them, finished sessions are now parked and handed to the next
+transaction that asks. The pool is bounded, because a session is a WiredTiger
+resource the connection's own limit governs, and over the cap a session is
+closed as before — the pool can never grow beyond what concurrent work actually
+needed. A session whose commit failed is never returned: closing it is what
+rolls its dead transaction back.
+
+An extended-protocol `SELECT 1` now costs 51.4 microseconds where it cost 55.2.
+
+#### Changed
+
+- Finished user-transaction sessions are pooled and reused rather than closed,
+  bounded, with failed commits excluded.
+
+### A cache that switched itself off for the length of every transaction
+
+The Rust PostgreSQL server keeps a process-wide cache of the type catalog so
+that a statement need not re-read and re-decode it. Opening a transaction block
+recorded the catalog version the block had seen; the statement that opened it
+then advanced that version, as every transaction-control statement does. `BEGIN`
+cannot change a catalog, but the bump happened anyway, and from that moment the
+recorded version and the live one disagreed — which is the exact condition under
+which the cache refuses to be refilled, on the reasonable ground that a block
+whose view has diverged should not publish its reads as committed truth.
+
+The consequence was that no statement inside any transaction could ever use the
+cache. Counted directly, a short block took two cache hits and fifty misses,
+re-reading every catalog collection from storage each time; re-anchoring the
+recorded version to the bump that just happened turns that into twenty-six hits
+and eight, the remainder being first-time reads.
+
+Worth being plain about the size of it: this recovers about three microseconds
+of a seventy-microsecond gap between statements inside a block and the same
+statements outside one. The catalog scan sat at the top of the sampled profile
+and looked like the cost; it was the most visible symbol rather than the
+dominant one, and with it gone the profile is flat and the gap is still there.
+What accounts for the rest is not yet known, and the backlog now says so rather
+than repeating the story that turned out to be worth three microseconds.
+
+#### Fixed
+
+- The type-catalog cache is usable inside a transaction block again, instead of
+  being disabled from the block's first statement onward.
+
+### It was never the transaction block; it was the uncommitted CREATE TABLE
+
+For a while the Rust PostgreSQL server looked as though it charged a standing
+tax for working inside a transaction: the same `select 1` cost about 125
+microseconds inside an explicit block against 55 outside one, where PostgreSQL
+16 is flat at 30 either way. Two rounds of profiling had gone looking for the
+hot symbol that owned the difference and had come back with candidates worth a
+few microseconds each. The mistake was in the question. Running the statement
+both ways and varying one ingredient at a time shows that a bare block is
+slightly *cheaper* than autocommit, as it should be — it has no per-statement
+transaction to begin and commit. What costs is a block that is holding
+uncommitted DDL, and the benchmark had been creating its table inside the block
+all along.
+
+Once a block has created a table or a type, the session carries an overlay of
+catalog rows nobody has committed yet. Two separate caches back away from that
+overlay, and counting calls rather than sampling time showed how far: a
+statement in such a block re-read the type catalog from storage twenty times
+where the same statement in autocommit read it zero times, and rebuilt the
+planner's user-type tables twice per statement where autocommit rebuilt them
+never. Both were reacting to the same thing for the same reason — a view that
+carries one session's uncommitted DDL must not be published to the others — and
+both were using the catalog version number to express it, which cannot tell
+"another connection changed the catalog" apart from "I changed it myself". A
+block's own first DDL statement bumps that version, so from then on the test
+could never pass again and both caches stayed off for the life of the block.
+
+The fix says what was actually meant in each case. The process-wide catalog
+cache is filled only from a read that did not run on the transaction's own
+WiredTiger session, since that session is the one that can see the block's
+uncommitted writes; a read on a fresh session sees exactly the committed
+catalog and is publishable wherever it was issued. The planner's per-thread
+type tables now record which session owns a view that carries an overlay, so a
+session can reuse its own and no other session can pick it up — a worthwhile
+distinction, because two connections share worker threads, and dropping the
+owner from that key lets one connection cast to a type another connection has
+not committed. Inside a block that created a table, `select 1` goes from 153 to
+53 microseconds and `select v from t where k = 1` from 134 to 62, with
+autocommit unchanged; a statement in a block is now marginally cheaper than the
+same statement outside one, which is the shape PostgreSQL has.
+
+#### Fixed
+
+- `crates/secantus-pgserver`: a statement inside a transaction block that had
+  done any DDL re-read the whole type catalog twenty times and republished the
+  planner's type tables twice, costing ~100us per statement. Both caches now
+  distinguish a session's own uncommitted view from the committed one instead
+  of switching off for the rest of the block.
+- `crates/secantus-pgserver`: the planner's thread-local user-type tables are
+  keyed by the session that owns an uncommitted-type overlay, so a view holding
+  one connection's uncommitted `CREATE TYPE` can no longer be reused by another
+  connection that lands on the same worker thread.
+
+#### Changed
+
+- `bench/pg_statement_cost.py` honours `SECANTUSD_PG`, so a worktree can
+  measure its own binary instead of silently measuring the main checkout's, and
+  its docstring now says that `--in-transaction` varies "block holding
+  uncommitted DDL", not "block".
+
+### `getProcedureColumns` could not describe a function's arguments
+
+`pg_proc.proargmodes` and `proallargtypes` were always NULL, so nothing recorded
+that a parameter was `OUT` or `INOUT`. Around that sat four more defects on the
+same rows, each of which independently broke a client reading a routine's shape:
+
+- `proargtypes` listed **every** parameter, but it is the function's call
+  signature — an `OUT`-only parameter is excluded. `f3(IN a int, INOUT b
+  varchar, OUT c timestamptz)` advertised a three-argument signature where
+  PostgreSQL 14 records `23 1043`.
+- `prorettype` was `2278` (void, an oid this catalog does not even define) for
+  any function whose return type came from its outputs. With one output column
+  it is that column's type; with two or more it is `2249` (`record`).
+- `RETURNS TABLE (...)` recorded nothing about its columns. PostgreSQL lists
+  them in the same three arrays with mode `t`.
+- `RETURNS <composite>` also reported void: a user type has no storage tag, so
+  the name is now recorded at CREATE and resolved to the type's oid at
+  reflection time, where the catalog is in scope.
+
+`proallargtypes` is declared `oid[]` rather than `text[]` because pgjdbc casts
+that array to `Long[]` — a text array throws `ClassCastException` inside the
+driver before any assertion runs.
+
+#### Fixed
+
+- `proargmodes` / `proallargtypes` are populated when any parameter is not a
+  plain `IN`, and stay NULL otherwise — PostgreSQL's own rule, which the driver
+  switches on.
+- `proargtypes` is the call signature, excluding `OUT`-only parameters.
+- `prorettype` is derived from output parameters, `RETURNS TABLE` columns, or a
+  named composite type.
+- `pg_type.typtype` reports `p` for `record` and `m` for a multirange; both read
+  `b`. Not cosmetic — pgjdbc decides whether to emit a leading `returnValue`
+  row by switching on `typtype`, so `record` reading `b` gave a function with
+  OUT parameters a spurious extra row. That one surfaced only **after** the
+  argmodes were already correct, which is why it is in this change.
+
+All values measured against PostgreSQL 14 on 2026-09-20.
+
+Measured on pgjdbc's `DatabaseMetaDataTest` (194 tests): **33 failures → 25**,
+20 distinct → 16, no regressions. `funcWithDirection`, `funcReturningComposite`,
+`funcReturningTable` and `droppedColumns` go green.
+
+One narrowing worth recording: sqlglot parses `RETURNS refcursor` as a
+USERDEFINED type name — the same shape as `RETURNS <composite>` — even though
+`type_tag_for_sql` resolves it perfectly well. The first version of the
+composite-return fix claimed every USERDEFINED name and so dropped refcursor's
+tag, making `SELECT getref()` describe its column as `text` (25) instead of
+`refcursor` (1790). The discriminator is whether the type resolves to a storage
+tag, not what sqlglot called it. Caught by the full suite, not by the gauge.
+
+### Rust server: numeric filters near the smallest exponent select the right rows
+
+On the Rust PostgreSQL server, comparing a `numeric` column against a constant
+with more than 34 significant digits and a very small exponent (around
+`1E-6150`) could return the wrong rows. For `n > 1.2345678901234567890123456789012345E-6150`,
+a stored `5E-6160` came back even though it is smaller, and `n <` missed it.
+
+To compare a wide constant against the ordinary stored values, the server finds
+the nearest values on either side that the storage format can hold. Near the
+bottom of that format's exponent range, that calculation gave up and answered
+"between 0 and 1E-6176", which does not contain the constant at all. It now
+finds the true neighbours. Found while porting the same code to the Python
+server, which already had the corrected version.
+
+#### Fixed
+
+- `crates/secantus-pgplan/src/numeric.rs`: `decimal128_bracket` keeps only the
+  digits that still fit above Decimal128's exponent floor.
+
+#### Testing
+
+- `crates/secantus-pgplan/src/tests.rs`: the bracket contains its value for a
+  35-digit value at every exponent from -6180 to -6100 (and around 0 and the
+  top), both signs, plus short values at the floor.
+- `tests/test_rust_pgserver_differential.py`: every comparison operator on
+  such a constant, against a real PostgreSQL.
+
+### The Rust PostgreSQL server supports FILTER on an aggregate
+
+`count(*) FILTER (WHERE n > 8)` was `0A000 FILTER on an aggregate is not
+supported yet`. Only the rows matching the filter now contribute, and a group
+where none match is the empty input — `count` is 0 and every other aggregate
+NULL, which is what PostgreSQL answers.
+
+Each aggregate carries its own filter, so `count(*) filter (where n > 8),
+count(*)` computes both from one pass over the group, and a filter works
+inside HAVING and beside DISTINCT.
+
+#### Added
+
+- `crates/secantus-pgplan`: `AggItem.filter`, lowered with the same
+  WHERE-lowering the rest of the planner uses.
+- `crates/secantus-pgserver`: `compute_aggregate` applies it.
+
+#### Testing
+
+- `tests/test_rust_pgserver_slice.py`: grouped and ungrouped, a filter that
+  matches nothing, two aggregates with different filters, one inside HAVING,
+  and one beside `count(DISTINCT ...)` — measured against PostgreSQL 14.24.
+
+### The Rust PostgreSQL server: bool_and, bool_or, and honest refusals
+
+Found by sweeping the existing `pg_corpora/` corpora against the Rust server.
+
+`bool_and` and `bool_or` were not recognised as aggregates at all, so they
+reached the per-row scalar evaluator. They now work — grouped or not, over a
+column or a comparison, skipping NULLs, and answering NULL over an empty input.
+
+`array_agg` over an empty input answered an empty array where PostgreSQL
+answers NULL. Every other aggregate over an empty input was already right.
+
+The rest of that cluster is still missing — `string_agg`, and an aggregate
+wrapped in an expression such as `count(*) + 1` — but they now refuse while
+**planning**. That matters beyond the message: they used to be planned as a
+plain SELECT with a computed column, so the refusal came from evaluating a
+row, and over an EMPTY table nothing was evaluated, nothing refused, and the
+client got zero rows instead of the one row PostgreSQL returns.
+
+#### Fixed
+
+- `crates/secantus-pgplan`: `bool_and` / `bool_or` are aggregates;
+  `string_agg` and a nested aggregate are refused while planning.
+- `crates/secantus-pgserver`: the two boolean aggregates, and `array_agg` over
+  an empty input.
+
+#### Testing
+
+- `tests/test_rust_pgserver_slice.py`: the boolean aggregates, `array_agg`
+  over nothing, and that the unsupported shapes refuse the same way whether
+  the table is empty or not.
+
+### The Rust PostgreSQL server supports avg()
+
+`avg()` was refused with a note that it "returns PostgreSQL numeric with its
+own scale rules; approximating it would be a wrong answer".
+
+Those rules turn out to be the ones numeric DIVISION already follows here: a
+small quotient gets 16 decimal places, and an input carrying more keeps more —
+`avg` of two values with 20 decimals answers 20. So `avg` is the exact sum
+over the count, divided through the same code the `/` operator uses, and the
+scale is right without anyone deciding it twice.
+
+A float input averages as `float8`; the integers and `numeric` answer
+`numeric`; an empty input is NULL. It composes with `DISTINCT`, `FILTER` and
+`HAVING`.
+
+#### Added
+
+- `crates/secantus-pgplan`: `AggFunc::Avg` and `avg_result_type`.
+- `crates/secantus-pgserver`: the computation, over the exact sum.
+
+#### Testing
+
+- `tests/test_rust_pgserver_slice.py`: integer, float and numeric inputs, a
+  20-decimal input, the reported oids, an empty input, and avg beside
+  DISTINCT, FILTER and HAVING — measured against PostgreSQL 14.24.
+
+### The Rust PostgreSQL server keeps a declared width
+
+A `char(4)` column was described to the client as an unsized `bpchar`, and its
+value came back as `ab` where PostgreSQL sends `ab  `. Underneath was a
+sharper problem: the shared catalog records a declared string type as
+`type: "text"` with `decl_oid: 1042` and an `atttypmod`, and the Rust side
+modelled neither field. So a `char(n)` or `varchar(n)` column created by the
+Python server read back as plain `text` with no width — and one created by the
+Rust server was written in a form the Python server read as text in turn. The
+values always survived; the declared type did not, in either direction.
+
+Both servers now agree on what a declared width is and where it lives. A
+`char(n)` value is blank-padded on the way out (it is stored unpadded, so
+`length()` and a cast to `text` keep PostgreSQL's meaning for free), and a
+comparison against one ignores trailing blanks on both sides — `varchar` stays
+blank-sensitive, as PostgreSQL has it.
+
+The remaining `char(n)` rules — the functions that see the padded form,
+pattern matching, and `::char(n)` truncation — are mapped in
+`tasks/backlog.md`.
+
+#### Fixed
+
+- `crates/secantus-pgcatalog`: `Column` carries `typmod`, reads and writes
+  `decl_oid` the way the Python server does.
+- `crates/secantus-pgplan`: `CREATE TABLE` records the declared modifier; a
+  literal compared against a `char(n)` column is stripped.
+- `crates/secantus-pgserver`: the row description carries the width, and
+  `char(n)` output is blank-padded.
+
+#### Testing
+
+- `tests/test_rust_pgserver_slice.py`: padding and the described width,
+  blank-insensitive comparison (with `varchar` unaffected), and a table
+  created by the Python server read back by the Rust one with its declared
+  type intact.
+
+### The Rust PostgreSQL server learns DISTINCT and the set operations
+
+`SELECT DISTINCT` was ignored: `select distinct s from t` returned the
+duplicates, and `DISTINCT ON (...)` was dropped the same way. `UNION`,
+`INTERSECT` and `EXCEPT` were not recognised at all — a set operation has no
+FROM clause of its own, so it fell through to the constant planner and
+answered a single empty row. Both returned wrong results without an error.
+
+All of them now work, matching PostgreSQL 14.24 across 33 differential cases:
+NULLs group as one value, `1.5` and `1.50` are one row, `DISTINCT ON` keeps
+the first row per key in ORDER BY order, and `ALL` keeps multiplicities —
+`INTERSECT ALL` pairs each right-hand row with one left-hand row and `EXCEPT
+ALL` subtracts them.
+
+A set operation's columns take their names from the left side and their types
+from both: within a type category PostgreSQL widens (`int4` with `int8` is
+`bigint`, `numeric` with `float8` is `double precision`), across categories it
+refuses, and this now says the same thing in the same words —
+`UNION types text and integer cannot be matched` (42804). A count mismatch is
+42601, and an untyped NULL takes the other side's type.
+
+`count(DISTINCT col)` works too, on every aggregate that has one — the group's
+values are deduped by value before the function runs. `array_agg(DISTINCT x)`
+is the one that keeps NULL as a value and returns its result sorted, as
+PostgreSQL does. `SELECT DISTINCT` over aggregate output collapses groups that
+produced the same row.
+
+#### Added
+
+- `crates/secantus-pgplan`: `Distinct` on a planned select, and `SetOpSelect`
+  as a statement of its own, with the ORDER BY / LIMIT / OFFSET that belong to
+  the combined result.
+- `crates/secantus-pgserver`: dedup for DISTINCT and DISTINCT ON, DISTINCT
+  inside an aggregate, and `set_op_rows` — all matching rows by value, so
+  numerics that differ only in scale count once.
+
+#### Testing
+
+- `tests/test_rust_pgserver_slice.py`: DISTINCT, DISTINCT ON, every set
+  operation with and without `ALL`, ordering and limits, and the type rules,
+  with values measured against PostgreSQL 14.24.
+
+### The Rust PostgreSQL server supports HAVING
+
+`select g, count(*) from t group by g having count(*) > 1` was refused
+outright with `0A000 HAVING is not supported yet`, which ruled out most
+grouped reporting queries.
+
+HAVING now filters the groups after the aggregates are computed and before
+ORDER BY, DISTINCT and LIMIT see them. An aggregate written only in HAVING is
+computed for the test and never projected, so `group by g having count(s) = 0`
+works without selecting that count. Comparisons match PostgreSQL's rules: a
+NULL on either side makes the test UNKNOWN rather than true, numerics compare
+by value, and a constant may be written on either side of the operator.
+
+The accepted shape is deliberately narrow — a comparison or NULL test on an
+aggregate or grouping key against a constant, combined with AND / OR / NOT.
+Anything else is refused while planning, because HAVING decides which rows
+come back and a half-understood predicate would answer wrongly.
+
+#### Added
+
+- `crates/secantus-pgplan`: a `Having` predicate on the aggregate plan, and
+  the parser that builds it (appending any aggregate the SELECT list omits).
+- `crates/secantus-pgserver`: `having_holds`, applied to the grouped rows.
+
+#### Testing
+
+- `tests/test_rust_pgserver_slice.py`: the connectives, NULL handling, an
+  aggregate only HAVING asks for, a grouping key, a constant on the left, and
+  HAVING with no GROUP BY — all measured against PostgreSQL 14.24.
+- `crates/secantus-pgplan`: the plan reuses an existing aggregate item or adds
+  one, and an unsupported shape is still refused.
+
+### The Rust PostgreSQL server groups numerics by value
+
+`select v, count(*) from t group by v` split a `numeric` column by its stored
+form rather than its value, so `1.5` and `1.50` were different groups — and so
+were `1e40`, `1e40.0` and `1e40.00`. Seven rows came back where PostgreSQL
+returns three, with each group's `sum` wrong to match. Grouping compared the
+BSON values structurally, and a numeric carries its display scale.
+
+A grouping key is now reduced to the value PostgreSQL groups on, while the
+group keeps its first row for display — the text PostgreSQL prints. Integers,
+strings and every other type keep their own equality.
+
+#### Fixed
+
+- `crates/secantus-pgserver`: `group_key_ident` normalises a numeric grouping
+  key; GROUP BY matches on it.
+
+#### Testing
+
+- `tests/test_rust_pgserver_slice.py`: grouping over scale variants and a wide
+  value, with the counts, sums and printed texts PostgreSQL 14.24 returns.
+- That file's server binary is now found on Windows (`.exe`), where all 1,194
+  of its tests silently skipped.
+
+### The Rust PostgreSQL server answers UPDATE and DELETE RETURNING
+
+`update t set ... returning id, n` and `delete from t ... returning *` did the
+write, reported the right tag, and returned **no rowset at all** — a client
+that asked which rows it had just changed got nothing back. The clause was
+parsed and dropped: neither plan carried it. UPDATE now returns each row as it
+is after the update and DELETE as it was before, which is what PostgreSQL does.
+
+Found by sweeping the existing `pg_corpora/` corpora against the Rust server,
+which the differential probe can now drive.
+
+#### Fixed
+
+- `crates/secantus-pgplan`: `Update` and `Delete` carry a `returning` list.
+- `crates/secantus-pgserver`: both project their affected rows.
+- `crates/secantus-pgserver`: an aliased PRIMARY KEY kept its type. A key is
+  stored as `_id`, and the row description looked the column up by its stored
+  field and then by its output name, so `select id as k` matched neither and
+  fell back to `varchar` — the client decoded an integer as a string. Only
+  aliased primary keys were affected.
+
+#### Added
+
+- `tools/probes/pg_differential.py --server=rust` runs any existing corpus
+  against the Rust server instead of the Python one.
+
+#### Testing
+
+- `tests/test_rust_pgserver_slice.py`: UPDATE / DELETE RETURNING including a
+  no-match statement, and an aliased key's type through both SELECT and
+  RETURNING.
+
+### The Rust PostgreSQL server supports string_agg, and ORDER BY inside an aggregate
+
+`string_agg(s, ',')` was refused because it takes TWO arguments and the
+aggregate planner rejected anything but one. It now joins the non-NULL values
+in group order, answers NULL over an empty input, treats a NULL separator as
+joining with nothing between the values, and — under `DISTINCT` — dedups and
+sorts, which is how PostgreSQL implements a DISTINCT aggregate. A non-text
+argument is reported as the missing FUNCTION PostgreSQL calls it (42883),
+not as an unsupported feature.
+
+`ORDER BY` written inside an aggregate now works too: `array_agg(s ORDER BY id
+DESC)` and `string_agg(s, ',' ORDER BY s)` sort the group's rows before the
+values are collected, which is the only thing that gives either aggregate a
+defined order. An ORDER BY over an expression rather than a column is still
+refused, rather than quietly answered in a different order.
+
+#### Added
+
+- `crates/secantus-pgplan`: `AggFunc::StringAgg` with its separator, and
+  `plan_aggregate_order` for the in-call ORDER BY.
+- `crates/secantus-pgserver`: both, over the group's rows.
+
+#### Testing
+
+- `tests/test_rust_pgserver_slice.py`: grouped and ungrouped, empty input, a
+  NULL separator, DISTINCT, FILTER, the 42883 for a non-text argument, and
+  the ordering cases — all measured against PostgreSQL 14.24.
+
+### `sum()` of a float column no longer breaks the client
+
+On the Rust PostgreSQL server, `select sum(f)` over a `float8` column
+described the result as `int8` and then sent `1.5`, so psycopg raised
+`invalid literal for int() with base 10: '1.5'` — an exception, on an
+ordinary query, rather than a number.
+
+`sum()`'s result type was "numeric if the input was numeric, otherwise int8".
+PostgreSQL's widening is not uniform, and now neither is ours (measured
+against 14.24):
+
+| input | `sum` |
+| --- | --- |
+| `int2`, `int4` | `int8` |
+| `int8` | `numeric` |
+| `float4` | `float4` |
+| `float8` | `float8` |
+| `numeric` | `numeric` |
+| `money` | `money` |
+| `interval` | `interval` |
+
+So `sum(int8)` was wrong too: it claimed `int8` where PostgreSQL returns
+`numeric`.
+
+#### Fixed
+
+- `crates/secantus-pgplan`: `sum_result_type`, shared by the planner's output
+  definition and the wire type.
+- `crates/secantus-pgserver`: the row description uses it.
+
+#### Testing
+
+- `tests/test_rust_pgserver_slice.py`: every numeric input type's `sum` oid
+  and value.
+
+### Ruling out the explanation that would have been ours
+
+Two psycopg tests once failed in forty milliseconds where they should have taken
+four seconds, and an earlier note blamed the machine's network for answering an
+unroutable address immediately. That note was wrong and has been withdrawn. The
+question it left behind was better: an immediate `connect()` failure is exactly
+what a harness that has run out of sockets produces, and that would be a defect
+here rather than a property of the machine.
+
+Measured during a full gauge run, it is not what happens. Ephemeral port use
+peaks at eleven hundred of the sixteen thousand available and sawtooths rather
+than climbing, sockets in `TIME_WAIT` rise and fall with the work, and the
+descriptor limit on this platform is a million. Nothing is running out.
+
+The failure is therefore still unexplained, with its most plausible cause
+eliminated by measurement instead of argument, and the backlog now says both
+halves of that. The probe is kept so the next person measures rather than
+reasons.
+
+#### Added
+
+- `tools/probes/socket_pressure.py`: samples descriptors, `TIME_WAIT` sockets
+  and ephemeral-port use while a long run proceeds, and reports whether any of
+  them climbs.
+
+### The standalone binaries need nothing but libc, and CI now proves it
+
+The Linux archives linked `liblz4.so.1` and `libz.so.1` — WiredTiger builds
+both compressors as builtin extensions, so `libwiredtiger_static` references
+them — which meant "download, extract, run" quietly assumed the host already
+had two libraries a slim container image often does not. Both are now linked
+from their static archives on the binary release lanes, so `secantusd-rs` and
+`secantusd-pg` depend on the glibc family and nothing else. The wheel lanes
+deliberately keep the shared objects: auditwheel bundles those, and changing
+what a published wheel contains is not a side effect worth taking.
+
+The larger problem was that nothing in the pipeline could tell. A published
+archive can be broken in a way the build, the tests and the smoke test all
+miss — the macOS binaries of 2026-09-19 linked liblz4 by its absolute Homebrew
+path and would not launch on a Mac without Homebrew, while every stage passed
+because the runner *has* Homebrew. `otool -L` on the artifact was the only
+thing that ever reported it, and nobody ran `otool -L`.
+
+So the release workflows now run it themselves. Before an archive is packaged,
+`.github/scripts/check_binary_deps.py` reads the binary's real dependency table
+— Mach-O load commands, ELF `DT_NEEDED`, or the PE import directory — and fails
+the release if anything falls outside a per-platform allowlist. Checked against
+the four artifacts that matter: it fails the published macOS binary naming the
+Homebrew dylib, fails the published Linux one naming both compressors, and
+passes the Windows archive and the fixed macOS build.
+
+#### Added
+- `.github/scripts/check_binary_deps.py`, run by both binary release workflows
+  before packaging. The allowlist is glibc-family on Linux, `/usr/lib` +
+  `/System/Library` on macOS, and OS DLLs on Windows — so a `VCRUNTIME140`
+  dependency would fail the release too.
+- `SECANTUS_WT_STATIC_COMPRESSORS=1` in `secantus-wt`'s build script, linking
+  zlib and lz4 from their static archives on Linux. Opt-in, set only by the
+  binary release lanes.
+
+#### Changed
+- The Linux release lanes install `zlib1g-dev` alongside `liblz4-dev`, for the
+  `.a` archives.
+
+### Test temp dirs are reclaimed on the way out, and probe stores are reclaimed at all
+
+A dev box filled its disk — 935 GiB, down to 50 MB free — with every janitor in
+the tree working exactly as designed. Three things were wrong at once, and none
+of them was the reaping *rule*.
+
+The retained-run count was set against a suite that no longer exists: the code
+said "~1.7 GiB a run", a measured full run leaves **~104 GiB**, and keeping
+three of those is ~300 GiB of WiredTiger homes. The sweep also ran only at
+session *start*, so whatever the last run left stayed on disk until somebody ran
+pytest again — which may be days, or may be impossible because the disk is
+already full. And the ~17 differential probes under `tools/probes/` each took a
+bare `tempfile.mkdtemp()` that nothing ever deleted: invisible to pytest's
+janitor, which only manages `pytest-of-<user>/`, and to the gauge sweep, which
+only matches `secantus-*-gauge-*`. One session left 385 of them, ~50 GiB.
+
+#### Fixed
+
+- Keep **one** abandoned pytest run instead of three, and re-derive the
+  per-run cost the comment quotes. The newest run is what a post-mortem needs;
+  the two behind it were 200 GiB nobody read.
+- Reap at session **finish** as well as session start, so the common case — run
+  the suite, walk away — leaves the disk as the retention policy intends. The
+  current run is protected by both existing rules (newest dir, live PID in its
+  `.lock`).
+- Probe stores are deleted when the probe exits, and carry their creating PID
+  so an abandoned one can be reaped later. The `atexit` delete cannot be the
+  whole answer — on Windows an open file cannot be deleted, so a probe killed
+  mid-flight leaves its home behind with WiredTiger still holding it — hence
+  `_sweep_stale_probe_tmp`, which applies the same PID-liveness rule the pytest
+  sweep already used, and now runs from both `invoke clean` and pytest.
+
+#### Added
+
+- `tools/probes/_servers.probe_store()`: one self-cleaning, PID-tagged
+  WiredTiger home for a probe, replacing the bare `mkdtemp()` in every probe.
+- A test pinning that `conftest.py` defines `pytest_sessionfinish` and
+  `pytest_sessionstart` exactly once each. The reap was first written as a
+  second `pytest_sessionfinish`; Python silently kept only the later
+  definition, so it never ran and nothing failed to say so.
+
+### secantusdb.com publishes a sitemap
+
+The site had no `sitemap.xml` — `/sitemap.xml` answered 404 — so search engines
+had only in-page links to work from. Pelican now renders one from the content it
+already knows about: the four product pages, the blog index, and all 62 posts,
+each at the same `.html` URL its `rel="canonical"` declares, with `lastmod` taken
+from the post date.
+
+Deliberately narrow. The paginated `/blogN.html` listings are duplicates of
+content already listed; `/docs/` is excluded because the two Sphinx trees are
+grafted into the output *after* Pelican runs, so Pelican cannot enumerate them
+and a hand-written guess would rot silently.
+
+#### Added
+- `sitemap.xml`, generated at build time from the Pelican content tree.
 
 ### Accumulator spec errors depend on WHERE the operator appears
 
