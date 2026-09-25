@@ -29,6 +29,22 @@ test: about 1,080 of its unified-spec tests never ran against SecantusDB.
   (awaitable) heartbeat as a clean end of stream; the Python server also logged
   it as an error. The Rust server's exhaust `getMore` stream ignored it too.
 
+- Rust server: `endSessions`, `killSessions`, `killAllSessions` and
+  `killAllSessionsByPattern` abort the sessions' open transactions, as the
+  Python server's already did. They were no-ops, so a transaction left open
+  kept every later write to its documents in a `WriteConflict` retry loop.
+  Driver test runners call `killAllSessions` between tests for exactly this.
+  Once the failpoint tests ran, this failed 68 pymongo tests and crashed four
+  gauge workers.
+- Both servers: a change stream opened or resumed with events already waiting
+  no longer returns a `postBatchResumeToken` past events it has not sent.
+  - The Rust server took the token from after the whole poll, so when
+    `batchSize` held events back for `getMore`, a driver that resumed after the
+    first batch skipped them silently.
+  - The Python server did the same for `batchSize: 0`.
+  - The token is now the last sent event's `_id`, or the resume point when
+    nothing was sent.
+
 #### Changed
 
 - Both servers: `getParameter` reports `enableTestCommands: true`. Driver test

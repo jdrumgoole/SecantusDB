@@ -444,11 +444,10 @@ fn lookup(name: &str) -> Option<Handler> {
         "validate" => admin::validate,
         "profile" => admin::profile,
         "startSession" => diagnostics::start_session,
-        "endSessions"
-        | "refreshSessions"
-        | "killSessions"
-        | "killAllSessions"
-        | "killAllSessionsByPattern" => diagnostics::ok_session_noop,
+        "endSessions" => end_sessions,
+        "killSessions" => kill_sessions,
+        "killAllSessions" | "killAllSessionsByPattern" => kill_all_sessions,
+        "refreshSessions" => diagnostics::ok_session_noop,
         "commitTransaction" => commit_transaction,
         "abortTransaction" => abort_transaction,
         "saslStart" => auth::sasl_start,
@@ -888,6 +887,43 @@ fn commit_transaction(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         },
         _ => Ok(doc! { "ok": 1.0 }),
     }
+}
+
+/// Abort the in-progress transaction of every session listed under `key`
+/// (`endSessions` / `killSessions`). Mirrors `commands.py::_end_sessions` /
+/// `_kill_sessions`. Ending a session must release its transaction: otherwise
+/// its uncommitted writes keep conflicting with every later write to the same
+/// documents until the transaction lifetime expires.
+fn abort_listed_sessions(doc: &Document, key: &str, ctx: &CommandContext) -> HandlerResult {
+    if let (Some(reg), Ok(entries)) = (&ctx.transactions, doc.get_array(key)) {
+        for entry in entries {
+            if let Some(lsid) = lsid_bytes_from_arg(Some(entry)) {
+                reg.abort_for_session(&lsid);
+            }
+        }
+    }
+    Ok(doc! { "ok": 1.0 })
+}
+
+fn end_sessions(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    abort_listed_sessions(doc, "endSessions", ctx)
+}
+
+fn kill_sessions(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    abort_listed_sessions(doc, "killSessions", ctx)
+}
+
+/// `killAllSessions` / `killAllSessionsByPattern` — abort every open
+/// transaction. Mirrors `commands.py::_kill_all_sessions`, which likewise
+/// ignores the user / pattern filter. Driver test runners call it between
+/// tests precisely to clear a transaction an earlier test left open; as a
+/// no-op it let one leaked transaction turn every later write into a
+/// `WriteConflict` retry storm (pymongo's unified transaction tests, 2026-09-25).
+fn kill_all_sessions(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    if let Some(reg) = &ctx.transactions {
+        reg.abort_all();
+    }
+    Ok(doc! { "ok": 1.0 })
 }
 
 /// `abortTransaction` — roll back the session's transaction via the registry.

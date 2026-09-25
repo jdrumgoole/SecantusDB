@@ -28,8 +28,8 @@ pub fn start_session(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResul
     })
 }
 
-/// `endSessions` / `refreshSessions` / `killSessions` / `killAllSessions` /
-/// `killAllSessionsByPattern` — no-op bookkeeping (no session registry yet).
+/// `refreshSessions` — no-op bookkeeping (no session registry yet). The
+/// session-ENDING commands live in `lib.rs`: they abort open transactions.
 pub fn ok_session_noop(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
     Ok(doc! { "ok": 1.0 })
 }

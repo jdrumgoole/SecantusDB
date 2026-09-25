@@ -7549,6 +7549,12 @@ def _aggregate_change_stream(
             # getMore). PyMongo does not cache the PBRT off a *non-empty*
             # firstBatch, so an uniterated resumed stream still reports
             # resume_token == the token the caller passed (prose test #14).
+            if batch_size == 0:
+                # Nothing is sent, and the cursor doc only re-pins the token
+                # to the last SENT event, so without this the reply's
+                # postBatchResumeToken sat on the last BACKLOG event and a
+                # resume from it skipped the whole backlog (2026-09-25).
+                entry.last_token = initial_token
             return {
                 "cursor": _change_stream_cursor_doc(
                     entry, cursor_id, batch_size, ns, batch_key="firstBatch"

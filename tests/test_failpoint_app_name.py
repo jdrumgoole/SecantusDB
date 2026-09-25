@@ -126,3 +126,34 @@ def test_registry_matches_canonical_name_of_an_alias() -> None:
     assert reg.match("hello") is None
     reg.configure("failCommand", "alwaysOn", {"failCommands": ["findAndModify"], "errorCode": 2})
     assert reg.match("findandmodify") is not None
+
+
+@pytest.mark.parametrize("how", ["killAllSessions", "endSessions", "killSessions"])
+def test_ending_a_session_aborts_its_open_transaction(
+    uri: str, client: MongoClient, how: str
+) -> None:
+    """A transaction left open must not keep blocking other writers.
+
+    Driver test runners call ``killAllSessions`` between tests to clear exactly
+    this. The Rust server answered it (and ``endSessions`` / ``killSessions``)
+    as a no-op, so once a failpoint test left a transaction open, every later
+    write to the same document retried on ``WriteConflict`` -- 68 pymongo
+    unified tests failed that way and four gauge workers died (2026-09-25).
+    """
+    coll = client["fp_sessions"]["c"]
+    coll.insert_one({"_id": 0})  # create the collection outside the transaction
+    session = client.start_session()
+    session.start_transaction()
+    coll.insert_one({"_id": 1}, session=session)  # left uncommitted on purpose
+    if how == "killAllSessions":
+        client.admin.command("killAllSessions", [])
+    else:
+        client.admin.command(how, [session.session_id])
+
+    other = MongoClient(uri, serverSelectionTimeoutMS=3000)
+    try:
+        # With the transaction aborted this insert has nothing to conflict with.
+        other["fp_sessions"]["c"].insert_one({"_id": 1})
+        assert other["fp_sessions"]["c"].count_documents({}) == 2
+    finally:
+        other.close()
