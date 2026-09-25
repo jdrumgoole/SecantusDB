@@ -621,6 +621,11 @@ class SecantusDBServer:
                 return True
             try:
                 doc = dispatch(body, ctx)
+            except CloseConnectionRequested:
+                # ``closeConnection`` failpoint on a streamed heartbeat: the
+                # monitor must see the socket DROP (SDAM "Failing heartbeat"),
+                # not a clean end-of-stream reply -- and it is not an error.
+                return False
             except Exception:
                 # Refresh failed — terminate the stream cleanly rather than
                 # dropping the socket mid-``moreToCome``.

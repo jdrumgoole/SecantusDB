@@ -2915,22 +2915,13 @@ These are explicit non-goals. Don't add them without a reason.
   Go `TestUnifiedSpec` aggregator against the Python server. No `mongod` was
   available in that container, so the label / codeName items below come from the
   driver specs' expectations and still need a `mongod` 8.2 probe before any fix.
-  - **`getParameter` advertises `enableTestCommands: false`** (Python
-    `commands.py` `_get_parameter`, Rust `diagnostics.rs`) although both servers
-    implement `configureFailPoint`. pymongo gates every failpoint test on that
-    flag: **~1,080 of the 2,368 unified-runner tests skip for this reason alone.**
-    Flipping it locally (not committed) took the 18-runner sweep from
-    **909 → 1,772 passing**; 35 of the unlocked tests then fail, and they
-    cluster into the bugs below. Same function reports
-    `featureCompatibilityVersion: "7.0"` against an 8.x target.
-  - **`failCommand` ignores `data.appName`** (Python `FailPointRegistry.match`,
-    Rust `match_command`). An `alwaysOn` failpoint scoped to one client applies
-    to every client, including the runner's cleanup client, so a
-    `closeConnection` on `hello` (SDAM `logging-replicaset.json` "Failing
-    heartbeat") wedges the server for the rest of the run: every later Go
-    unified test died at the 60s server-selection timeout. This is the
-    mechanism the `writeConcernError` watch item further down suspected but
-    could not reproduce.
+  - ~~`enableTestCommands: false`~~ and ~~`failCommand` ignoring `appName`~~
+    **FIXED 2026-09-25** in both servers (plus canonical-name matching, so
+    `isMaster` covers pymongo's legacy `ismaster` handshake). Before the fix,
+    `enableTestCommands: false` made pymongo skip ~1,080 of the 2,368
+    unified-runner tests; flipping it took the 18-runner sweep from 909 to
+    1,772 passing. `getParameter` still reports
+    `featureCompatibilityVersion: "7.0"` against an 8.x target (open).
   - **Failpoint-injected errors carry only explicit `errorLabels`.** mongod
     computes `TransientTransactionError` / `RetryableWriteError` for these
     errors when the failpoint names none (it's what the spec tests expect of
@@ -5853,7 +5844,7 @@ Subtler than the above; these may bite specific test suites.
   - ~~**`collMod` error response** (`/collection-management/modifyCollection-errorResponse`)~~ **FIXED (0.5.4b9)** — `collMod {index: {prepareUnique: true}}` arms an index (new dup writes → 11000 via `prepareUnique` honoured in `storage._unique_conflict`) and `collMod {index: {unique: true}}` over existing duplicates is refused with `CannotConvertIndexToUnique` (359) + a `violations: [{ids:[...]}]` array (`storage.find_index_duplicates` / `set_index_options`).
   - ~~**`writeConcernError` reporting** (`/Client/command_w_write_concern`, `/Database/create_with_write_concern`, `/command_monitoring/unified/writeConcernError`)~~ **FIXED (0.5.4b13)** — per-test triage showed these were the `w: 99` case, resolved by the `w > 50` parse-error fix above. (The grouping was imprecise: the remaining two failures in the original list are unrelated and split out below.)
   - ~~**`/Collection/index_w_write_concern`**~~ **FIXED (0.5.4b14)** — not a write-concern issue at all: after the `w > 50` fix this test fails on its *invalid-index* assertion — it creates `{abc: "hallo thar"}` and expects the server to reject it. `storage.create_index` now rejects an index-key string that isn't a recognised plugin (`2d` / `2dsphere` accepted; `text` / `hashed` out-of-scope) with `CannotCreateIndex` (67) "Unknown index plugin '<value>'". Regression: `tests/test_driver_gaps.py::test_unknown_index_plugin_rejected`.
-  - **`/command_monitoring/unified/writeConcernError`** — **flaky, not deterministic** (0.5.4b15 triage): a fresh full-run repro of the curated C include set has it **passing** (only `/Client/ipv6/single` + `/Collection/tailable/timeout` fail there now), so the earlier gauge report that listed it was a flaky red, not a reproducible state leak. The failpoint registry (`secantus.failpoints`) *is* per-server with no `appName` scoping, so a leaked `failCommand` from a prior test is a plausible mechanism, but it couldn't be reproduced in any isolable subset. Left as a watch item; if it recurs, add per-`appName` failCommand scoping (the mongod-faithful isolation) + audit failpoint teardown. **A real, separate bug found during this triage was fixed in 0.5.4b15**: a malformed `$and`/`$or`/`$nor` (non-array / empty / non-doc element) crashed the query engine into a generic `InternalError` instead of `BadValue` — see `query._match_clause` + the changelog.
+  - **`/command_monitoring/unified/writeConcernError`** — **flaky, not deterministic** (0.5.4b15 triage): a fresh full-run repro of the curated C include set has it **passing** (only `/Client/ipv6/single` + `/Collection/tailable/timeout` fail there now), so the earlier gauge report that listed it was a flaky red, not a reproducible state leak. The failpoint registry (`secantus.failpoints`) *is* per-server with no `appName` scoping, so a leaked `failCommand` from a prior test is a plausible mechanism, but it couldn't be reproduced in any isolable subset. Left as a watch item. Per-`appName` failCommand scoping landed 2026-09-25 (both servers), which removes the cross-client leak mechanism; if it recurs, audit failpoint teardown. **A real, separate bug found during this triage was fixed in 0.5.4b15**: a malformed `$and`/`$or`/`$nor` (non-array / empty / non-doc element) crashed the query engine into a generic `InternalError` instead of `BadValue` — see `query._match_clause` + the changelog.
   - ~~**State-ordering-dependent drop/rename/create** (`/Collection/drop`, `/Collection/rename`, `/Collection/index`, `/Database/drop`)~~ **FIXED (0.5.4b13)** — not state-ordering at all (misdiagnosis): each test ends with a DDL op carrying `writeConcern: {w: 99}` and asserts `assert_wc_oob_error` — for a server >= 4.3.3 (we advertise 7.0) that's `FailedToParse` (9) "w has to be a non-negative number and not greater than 50", because mongod caps numeric `w` at 50. SecantusDB was returning a `CannotSatisfyWriteConcern` (100) writeConcernError on a success instead. `commands._validate_write_concern` now rejects `w` outside `[0, 50]` with code 9 before the command runs (and `_drop_database` / `_rename_collection` now call it). Regression: `tests/test_crud.py::test_write_concern_w_above_50_is_parse_error`.
   - ~~**Atlas Search index management** (`/index-management/{list,drop,update,create}SearchIndex`)~~ **FIXED (0.5.4b18)** — `createSearchIndexes` / `updateSearchIndex` / `dropSearchIndex` commands and the `$listSearchIndexes` aggregation stage (+ `$search` / `$searchMeta` / `$vectorSearch`) are Atlas-only; a non-Atlas mongod fails them with a message naming Atlas. Now rejected with `CommandNotSupported` (115) + the shared `aggregate.SEARCH_INDEX_ATLAS_MSG` (the tests assert `errorContains: "Atlas"`). Regression: `tests/test_crud.py::test_atlas_search_index_commands_rejected` + `tests/test_aggregate.py::test_atlas_only_stage_rejected_with_atlas_message`.
   - ~~**Change streams excluded**~~ **NOW RUNNING (#802, #804)** — `replSetGetStatus` reports the one-member roster `hello` already advertised, so the C fixture no longer skips the suites as standalone. 31 change-stream tests pass; the four defects that surfaced (resume-token error message, pipeline-stage code/message, resume-token *modification* not just removal, and `failGetMoreAfterCursorCheckout` + the `ResumableChangeStreamError` label) are all fixed.

@@ -668,6 +668,32 @@ def _split_into_cursor(
 CommandHandler = Callable[[dict[str, Any], CommandContext], dict[str, Any]]
 
 
+_HANDSHAKE_COMMANDS = frozenset({"hello", "isMaster", "ismaster"})
+
+
+def _failpoint_app_name(name: str, doc: Mapping[str, Any], ctx: CommandContext) -> str | None:
+    """The application name a ``failCommand`` ``appName`` filter compares against.
+
+    A handshake ``hello`` carries ``client.application.name`` itself, and that
+    wins: it is the FIRST command on a new connection, before any metadata is
+    recorded, and the SDAM spec tests fail exactly that command
+    (``minPoolSize-error.json`` skips three ``hello``s, then fails the one a
+    freshly opened pool connection sends). Later commands use what the
+    connection's handshake recorded.
+    """
+    client = doc.get("client") if name in _HANDSHAKE_COMMANDS else None
+    if not isinstance(client, Mapping) and ctx.connections is not None:
+        conn = ctx.connections.get(ctx.connection_id)
+        client = conn.client_metadata if conn is not None else None
+    if not isinstance(client, Mapping):
+        return None
+    application = client.get("application")
+    if not isinstance(application, Mapping):
+        return None
+    name = application.get("name")
+    return name if isinstance(name, str) else None
+
+
 def _hello(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # Per the MongoDB Handshake spec, drivers send their
     # self-identification (name, version, OS, platform) in the
@@ -1768,7 +1794,11 @@ def _get_parameter(doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
     """
     params: dict[str, Any] = {
         "featureCompatibilityVersion": {"version": "7.0"},
-        "enableTestCommands": False,
+        # True because the test commands drivers gate on ARE implemented --
+        # ``configureFailPoint`` above all. pymongo's harness reads this flag
+        # and, while it said False, skipped ~1,080 unified-spec failpoint tests
+        # this server can run (measured 2026-09-25).
+        "enableTestCommands": True,
         "logLevel": 0,
         "quiet": False,
         # Real ``mongod`` exposes the list of enabled auth mechanisms
@@ -9803,7 +9833,7 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     failpoint_wce: dict[str, Any] | None = None
     failpoint_labels: tuple[str, ...] = ()
     if ctx.failpoints is not None and name != "configureFailPoint":
-        match = ctx.failpoints.match(name)
+        match = ctx.failpoints.match(name, _failpoint_app_name(name, doc, ctx))
         if match is not None:
             if match.close_connection:
                 # The failpoint asked us to abruptly drop the TCP

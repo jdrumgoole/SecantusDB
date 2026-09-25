@@ -661,6 +661,14 @@ fn serve<S: Read + Write>(
                 let mut ctx = make_context(conn_id, shared, conn_auth, &peer_cert_dn);
                 ctx.db_name = db_from_namespace(query.full_collection_name);
                 let reply = dispatch(&request, &mut ctx);
+                // A `closeConnection` failpoint drops the socket without
+                // replying -- on the legacy handshake too, which is where the
+                // SDAM spec tests aim it (pymongo's `{ismaster: 1}`). Replying
+                // sent the failpoint's placeholder `{ok: 1}` as a hello, which a
+                // driver rejects as "wire version 0" instead of a network error.
+                if ctx.close_connection {
+                    return Ok(());
+                }
                 write_op_reply(stream, &header, shared, &reply)?;
             }
             Err(e) if e.is_recoverable() => {
@@ -1102,8 +1110,12 @@ fn stream_exhaust_getmore<S: Write>(
         if let Some(mt) = request.get("maxTimeMS") {
             getmore.insert("maxTimeMS", mt.clone());
         }
-        let (reply, _close, p) =
+        let (reply, close, p) =
             run_dispatch(&getmore, None, conn_id, shared, conn_auth, peer_cert_dn);
+        if close {
+            // `closeConnection` failpoint mid-stream: drop, as on the first frame.
+            return Ok(false);
+        }
         doc = reply;
         pending = p;
     }
@@ -1194,8 +1206,13 @@ fn stream_awaitable_hello<S: Read + Write>(
             }
         }
         // Streaming `hello` never sets `pending_batch` (no cursor), so ignore it.
-        let (reply, _close, _pending) =
+        let (reply, close, _pending) =
             run_dispatch(request, None, conn_id, shared, conn_auth, peer_cert_dn);
+        if close {
+            // `closeConnection` failpoint on a streamed heartbeat: the monitor
+            // must see the socket drop (SDAM "Failing heartbeat" tests).
+            return Ok(false);
+        }
         if write_op_msg_flags(stream, header, shared, &reply, OP_MSG_FLAG_MORE_TO_COME).is_err() {
             return Ok(false);
         }

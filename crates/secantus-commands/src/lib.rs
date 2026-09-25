@@ -769,7 +769,15 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
             // it only carries a writeConcernError) let it run and attach the
             // block afterwards. `configureFailPoint` itself is exempt.
             let fp = if name != "configureFailPoint" {
-                ctx.failpoints.as_ref().and_then(|r| r.match_command(name))
+                ctx.failpoints.as_ref().and_then(|r| {
+                    let recorded = ctx
+                        .conn_auth
+                        .as_ref()
+                        .and_then(|a| a.lock().ok())
+                        .and_then(|g| g.client_metadata.clone());
+                    let app = failpoints::failpoint_app_name(name, doc, recorded.as_ref());
+                    r.match_command(name, app.as_deref())
+                })
             } else {
                 None
             };

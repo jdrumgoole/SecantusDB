@@ -16,7 +16,14 @@
 //!   CSOT tests rely on this to trip a client-side timeout).
 //! * `data.closeConnection` → recorded; the server layer drops the socket.
 //!
-//! An optional `failCommands: [...]` filters by command name (empty == any).
+//! An optional `failCommands: [...]` filters by command name (empty == any),
+//! compared against the CANONICAL name (`ismaster` counts as `isMaster`).
+//!
+//! `data.appName` scopes the failpoint to connections whose client metadata
+//! names that application, as mongod does. Spec tests fail ONE client's
+//! `hello` with `closeConnection` and rely on the runner's own client staying
+//! usable; unscoped, that failpoint reached every connection -- including the
+//! one that would switch it off -- and wedged the server.
 
 use std::sync::Mutex;
 
@@ -27,6 +34,8 @@ use crate::util::as_i64;
 /// One configured `failCommand` failpoint.
 struct FailCommand {
     fail_commands: Vec<String>,
+    /// Fire only for connections whose client names this application.
+    app_name: Option<String>,
     /// Configured as `failGetMoreAfterCursorCheckout` rather than
     /// `failCommand`. mongod injects that one *inside* the change-stream
     /// getMore path, where it stamps `ResumableChangeStreamError` on a
@@ -109,6 +118,7 @@ impl FailPointRegistry {
                 })
                 .unwrap_or_default()
         };
+        let app_name = data.get_str("appName").ok().map(String::from);
         let error_code = data.get("errorCode").and_then(as_i64).map(|n| n as i32);
         let server_injected = getmore_only;
         let error_labels = data
@@ -138,6 +148,7 @@ impl FailPointRegistry {
         }
         g.push(FailCommand {
             fail_commands,
+            app_name,
             server_injected,
             error_code,
             error_labels,
@@ -149,12 +160,19 @@ impl FailPointRegistry {
         });
     }
 
-    /// The decision for one incoming command `name`, consuming a `times`/`skip`
-    /// budget. `None` means no failpoint applies.
-    pub fn match_command(&self, name: &str) -> Option<FailPointMatch> {
+    /// The decision for one incoming command `name` from a connection whose
+    /// client names `app_name` (`None` when it sent none), consuming a
+    /// `times`/`skip` budget only when the command is in scope -- another
+    /// client's command must not use up a failpoint meant for this one. `None`
+    /// means no failpoint applies.
+    pub fn match_command(&self, name: &str, app_name: Option<&str>) -> Option<FailPointMatch> {
+        let name = canonical_command_name(name);
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         for fc in g.iter_mut() {
             if !fc.fail_commands.is_empty() && !fc.fail_commands.iter().any(|c| c == name) {
+                continue;
+            }
+            if fc.app_name.is_some() && fc.app_name.as_deref() != app_name {
                 continue;
             }
             if fc.skip_remaining > 0 {
@@ -177,6 +195,39 @@ impl FailPointRegistry {
         }
         None
     }
+}
+
+/// The canonical name mongod registers a lower-case command alias under.
+/// `failCommands` is compared against this, so a failpoint listing `isMaster`
+/// also fires on the legacy `{ismaster: 1}` handshake -- which the SDAM spec
+/// tests' `["hello", "isMaster"]` rely on.
+fn canonical_command_name(name: &str) -> &str {
+    match name {
+        "ismaster" => "isMaster",
+        "findandmodify" => "findAndModify",
+        other => other,
+    }
+}
+
+/// The application name a `failCommand` `appName` filter compares against.
+/// A handshake `hello` carries `client.application.name` itself and that wins:
+/// it is the FIRST command on a new connection, before any metadata is
+/// recorded, and the SDAM spec tests fail exactly that command
+/// (`minPoolSize-error.json`). Later commands use the recorded metadata.
+pub fn failpoint_app_name(
+    name: &str,
+    doc: &Document,
+    recorded: Option<&Document>,
+) -> Option<String> {
+    let in_flight = match name {
+        "hello" | "isMaster" | "ismaster" => doc.get_document("client").ok(),
+        _ => None,
+    };
+    in_flight
+        .or(recorded)
+        .and_then(|c| c.get_document("application").ok())
+        .and_then(|a| a.get_str("name").ok())
+        .map(String::from)
 }
 
 /// A `codeName` for a failpoint-injected error code — the well-known mongod
@@ -250,7 +301,7 @@ mod resume_label_tests {
             &doc! {"errorCode": 6_i32},
         );
         assert!(
-            reg.match_command("find").is_none(),
+            reg.match_command("find", None).is_none(),
             "scoped to getMore only"
         );
 
@@ -260,7 +311,9 @@ mod resume_label_tests {
             &Bson::Document(doc! {"times": 1_i32}),
             &doc! {"errorCode": 6_i32},
         );
-        let m = reg2.match_command("getMore").expect("getMore matches");
+        let m = reg2
+            .match_command("getMore", None)
+            .expect("getMore matches");
         assert_eq!(m.error_code, Some(6));
         assert!(m.server_injected, "must carry the resumable-label marker");
     }
@@ -276,7 +329,7 @@ mod resume_label_tests {
             &Bson::Document(doc! {"times": 1_i32}),
             &doc! {"failCommands": ["getMore"], "errorCode": 6_i32},
         );
-        let m = reg.match_command("getMore").expect("matches");
+        let m = reg.match_command("getMore", None).expect("matches");
         assert_eq!(m.error_code, Some(6));
         assert!(!m.server_injected, "no label ⇒ the driver must not resume");
     }
@@ -304,7 +357,61 @@ mod resume_label_tests {
             &Bson::Document(doc! {"times": 1_i32}),
             &doc! {"errorCode": 6_i32},
         );
-        assert!(reg.match_command("delete").is_none());
-        assert!(reg.match_command("getMore").is_none());
+        assert!(reg.match_command("delete", None).is_none());
+        assert!(reg.match_command("getMore", None).is_none());
+    }
+
+    /// `appName` scopes the failpoint to one client, and another client's
+    /// commands neither fire it nor spend its `times` budget.
+    #[test]
+    fn app_name_scopes_to_one_client_without_spending_its_budget() {
+        let reg = FailPointRegistry::new();
+        reg.configure(
+            "failCommand",
+            &Bson::Document(doc! {"times": 1_i32}),
+            &doc! {"failCommands": ["find"], "errorCode": 2_i32, "appName": "target"},
+        );
+        assert!(reg.match_command("find", None).is_none());
+        assert!(reg.match_command("find", Some("other")).is_none());
+        assert!(reg.match_command("find", Some("target")).is_some());
+        assert!(
+            reg.match_command("find", Some("target")).is_none(),
+            "times: 1 is spent"
+        );
+    }
+
+    /// `failCommands` compares canonical names: `isMaster` covers `ismaster`.
+    #[test]
+    fn fail_commands_match_the_canonical_name_of_an_alias() {
+        let reg = FailPointRegistry::new();
+        reg.configure(
+            "failCommand",
+            &Bson::String("alwaysOn".into()),
+            &doc! {"failCommands": ["isMaster"], "errorCode": 2_i32},
+        );
+        assert!(reg.match_command("ismaster", None).is_some());
+        assert!(reg.match_command("hello", None).is_none());
+    }
+
+    /// The handshake's own `client` document names the app before anything is
+    /// recorded; later commands fall back to the recorded metadata.
+    #[test]
+    fn failpoint_app_name_prefers_the_handshake_client_document() {
+        let hello = doc! {"hello": 1_i32, "client": {"application": {"name": "fresh"}}};
+        let recorded = doc! {"application": {"name": "old"}};
+        assert_eq!(
+            failpoint_app_name("hello", &hello, Some(&recorded)).as_deref(),
+            Some("fresh")
+        );
+        assert_eq!(
+            failpoint_app_name("hello", &hello, None).as_deref(),
+            Some("fresh")
+        );
+        let find = doc! {"find": "c", "client": {"application": {"name": "spoof"}}};
+        assert_eq!(
+            failpoint_app_name("find", &find, Some(&recorded)).as_deref(),
+            Some("old")
+        );
+        assert_eq!(failpoint_app_name("find", &find, None), None);
     }
 }
