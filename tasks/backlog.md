@@ -2909,6 +2909,56 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- **Driver unified-spec coverage audit (2026-09-25, Python server `0.6.0b16`,
+  pymongo tests `f2103a95`, go-driver `fd85a834`).** Measured by running every
+  pymongo unified-format runner (in and out of the gauge's `INCLUDE`) plus the
+  Go `TestUnifiedSpec` aggregator against the Python server. No `mongod` was
+  available in that container, so the label / codeName items below come from the
+  driver specs' expectations and still need a `mongod` 8.2 probe before any fix.
+  - **`getParameter` advertises `enableTestCommands: false`** (Python
+    `commands.py` `_get_parameter`, Rust `diagnostics.rs`) although both servers
+    implement `configureFailPoint`. pymongo gates every failpoint test on that
+    flag: **~1,080 of the 2,368 unified-runner tests skip for this reason alone.**
+    Flipping it locally (not committed) took the 18-runner sweep from
+    **909 → 1,772 passing**; 35 of the unlocked tests then fail, and they
+    cluster into the bugs below. Same function reports
+    `featureCompatibilityVersion: "7.0"` against an 8.x target.
+  - **`failCommand` ignores `data.appName`** (Python `FailPointRegistry.match`,
+    Rust `match_command`). An `alwaysOn` failpoint scoped to one client applies
+    to every client, including the runner's cleanup client, so a
+    `closeConnection` on `hello` (SDAM `logging-replicaset.json` "Failing
+    heartbeat") wedges the server for the rest of the run: every later Go
+    unified test died at the 60s server-selection timeout. This is the
+    mechanism the `writeConcernError` watch item further down suspected but
+    could not reproduce.
+  - **Failpoint-injected errors carry only explicit `errorLabels`.** mongod
+    computes `TransientTransactionError` / `RetryableWriteError` for these
+    errors when the failpoint names none (it's what the spec tests expect of
+    a real server), so `NoSuchTransaction`/`WriteConflict` in a transaction
+    come back unlabelled and drivers do not retry. Accounts for 9
+    `test_transactions_unified`, most of the 22 `test_retryable_writes_unified`
+    failures, and Go `TestConvenientTransactions/retry_timeout_enforced/
+    commit_transient_transaction_error`.
+  - **Failpoint `codeName` falls back to `Location<n>` for well-known codes.**
+    Python's `_ERROR_CODE_NAMES` has 18 entries: 251 → `Location251`
+    (`NoSuchTransaction`), 11601 → `Location11601` (`Interrupted`),
+    91/10107/112/… likewise. Rust's `fail_code_name` is wider but also misses
+    251/11601 and names 100 `CannotSatisfyWriteConcern` where Python says
+    `UnsatisfiableWriteConcern`. The two servers disagree, so probe mongod's
+    registry before picking a side.
+  - **Stale Go gauge skips.** `TestConvenientTransactions` (13/14 pass; the
+    skip comment says abort does not roll back, and it does in both servers),
+    `TestBackpressureProse` (3/3 pass; the comment says failpoints are not
+    implemented) and `TestCausalConsistency_Supported` (29/29 pass). Rust's
+    `diagnostics::ok_transaction` ("no-op commit/abort") is dead code that
+    nothing dispatches to.
+  - **Out-of-gauge runners that already pass cleanly:** `test_gridfs_spec`
+    39/0, `test_unified_format` 58/0 (26 xfail), `test_read_write_concern_spec`
+    50/1. `test_index_management` 9 failures and `test_client_metadata` 11 are
+    harness artifacts (hard-wired `localhost:27017`, MockupDB not installed),
+    not server bugs. `test_sessions_unified` snapshot tests fail 5 (event-count
+    mismatches, not yet diagnosed).
+
 - **Rust PG server: an `inet[]` / `cidr[]` cast to TEXT keeps a max-length
   mask** (`{127.0.0.1/32}`) where PostgreSQL's `inet_out` drops it
   (`{127.0.0.1}`). The array text renderer (`render_array_element`) is
