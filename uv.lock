@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.10"
 resolution-markers = [
     "python_full_version >= '3.15'",
@@ -2417,7 +2417,7 @@ source = { directory = "crates/secantus-core-py" }
 
 [[package]]
 name = "secantusdb"
-version = "0.6.0b16"
+version = "0.6.0b17"
 source = { editable = "." }
 dependencies = [
     { name = "pymongo" },
