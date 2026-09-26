@@ -821,6 +821,10 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
                     return reply;
                 }
             }
+            if max_time_forced_to_expire(name, doc, ctx) {
+                return CommandError::new(50, "MaxTimeMSExpired", "operation exceeded time limit")
+                    .into_reply();
+            }
             // Malformed writeConcern is rejected before a write command runs
             // (mirrors commands.py, which prepends _validate_write_concern to each
             // write handler). Reads don't carry a writeConcern.
@@ -1048,8 +1052,68 @@ fn maybe_record_profile(
 /// Run `handler`, mapping its `Err` into the standard error reply.
 fn run_handler(handler: Handler, doc: &Document, ctx: &mut CommandContext) -> Document {
     match handler(doc, ctx) {
-        Ok(reply) => reply,
+        Ok(reply) => {
+            if max_time_ms_budget(doc) > 0 {
+                mark_time_limited_cursor(&reply, ctx);
+            }
+            reply
+        }
         Err(e) => e.into_reply(),
+    }
+}
+
+/// The command's `maxTimeMS` as a time limit, or 0 for none. A `getMore`'s own
+/// `maxTimeMS` is the awaitData wait, not a limit (`commands.py`'s
+/// `_MAX_TIME_MS_NOT_A_DEADLINE`).
+fn max_time_ms_budget(doc: &Document) -> i64 {
+    if doc.keys().next().map(String::as_str) == Some("getMore") {
+        return 0;
+    }
+    doc.get("maxTimeMS")
+        .and_then(util::as_i64)
+        .unwrap_or(0)
+        .max(0)
+}
+
+/// Whether the `maxTimeAlwaysTimeOut` failpoint expires this operation. Mirrors
+/// `commands.py::_max_time_forced_to_expire`: an operation with a time limit
+/// fails at its first interrupt check; so does a `getMore` on a cursor whose
+/// originating `find` / `aggregate` had one, because mongod bounds a
+/// non-tailable cursor's getMores by it.
+fn max_time_forced_to_expire(name: &str, doc: &Document, ctx: &CommandContext) -> bool {
+    let Some(fp) = ctx.failpoints.as_ref() else {
+        return false;
+    };
+    if !fp.max_time_always_armed() {
+        return false;
+    }
+    if max_time_ms_budget(doc) > 0 {
+        return fp.consume_max_time_always();
+    }
+    if name == "getMore" {
+        if let (Some(id), Some(cursors)) = (doc.get("getMore").and_then(util::as_i64), &ctx.cursors)
+        {
+            if cursors.is_time_limited(id) {
+                return fp.consume_max_time_always();
+            }
+        }
+    }
+    false
+}
+
+/// Remember that the cursor a reply opened carries a `maxTimeMS` (read only by
+/// `max_time_forced_to_expire`).
+fn mark_time_limited_cursor(reply: &Document, ctx: &CommandContext) {
+    let id = reply
+        .get_document("cursor")
+        .ok()
+        .and_then(|c| c.get("id"))
+        .and_then(util::as_i64)
+        .unwrap_or(0);
+    if id != 0 {
+        if let Some(cursors) = &ctx.cursors {
+            cursors.mark_time_limited(id);
+        }
     }
 }
 

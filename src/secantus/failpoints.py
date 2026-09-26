@@ -124,7 +124,8 @@ class CloseConnectionRequested(Exception):
 class FailPointRegistry:
     """Thread-safe per-server registry of active failpoints.
 
-    Only ``failCommand`` is implemented. Other failpoint names are
+    ``failCommand`` (and its ``failGetMoreAfterCursorCheckout`` variant) and
+    ``maxTimeAlwaysTimeOut`` are implemented. Other failpoint names are
     silently accepted (so test setup doesn't break) but never fire —
     real mongod exposes dozens of failpoints, almost all of which only
     a developer with a debug build of the server cares about.
@@ -133,6 +134,9 @@ class FailPointRegistry:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._fail_commands: list[_FailCommand] = []
+        # ``maxTimeAlwaysTimeOut``: None when off, -1 for ``alwaysOn``, else
+        # the number of firings left (``{times: N}``).
+        self._max_time_always_timeout: int | None = None
 
     def configure(self, name: str, mode: Any, data: dict[str, Any]) -> None:
         """Install / replace / disable a named failpoint.
@@ -148,6 +152,9 @@ class FailPointRegistry:
         # Ignoring it meant the getMore succeeded, no error was raised, and no
         # resume ever happened, so the driver sent 2 commands where the spec
         # expects 3 (aggregate / getMore / resume aggregate).
+        if name == "maxTimeAlwaysTimeOut":
+            self._configure_max_time_always_timeout(mode)
+            return
         getmore_only = name == "failGetMoreAfterCursorCheckout"
         if name != "failCommand" and not getmore_only:
             # Accept-but-ignore: lets test setup that configures
@@ -198,6 +205,34 @@ class FailPointRegistry:
                 server_injected=getmore_only,
             )
             self._fail_commands.append(fc)
+
+    def _configure_max_time_always_timeout(self, mode: Any) -> None:
+        """mongod's ``maxTimeAlwaysTimeOut``: every operation that has a time
+        limit expires at its first interrupt check, however large the budget.
+        Driver suites use it to provoke ``MaxTimeMSExpired`` deterministically.
+        """
+        with self._lock:
+            if mode == "alwaysOn":
+                self._max_time_always_timeout = -1
+            elif isinstance(mode, dict) and isinstance(mode.get("times"), int):
+                times = int(mode["times"])
+                self._max_time_always_timeout = times if times > 0 else None
+            else:
+                self._max_time_always_timeout = None
+
+    def max_time_always_times_out_armed(self) -> bool:
+        with self._lock:
+            return self._max_time_always_timeout is not None
+
+    def consume_max_time_always_timeout(self) -> bool:
+        """Fire once if armed, spending one of a ``{times: N}`` budget."""
+        with self._lock:
+            left = self._max_time_always_timeout
+            if left is None:
+                return False
+            if left > 0:
+                self._max_time_always_timeout = left - 1 or None
+            return True
 
     def match(self, command_name: str, app_name: str | None = None) -> FailPointMatch | None:
         """Return the failpoint match for this command, if any.

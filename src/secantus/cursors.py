@@ -81,6 +81,10 @@ class _Entry:
     # their resume position even when no events are visible. None
     # for non-change-stream cursors.
     last_token: dict[str, str] | None = None
+    # The originating ``find`` / ``aggregate`` carried a ``maxTimeMS``. mongod
+    # bounds a non-tailable cursor's getMores by it; here it only decides
+    # whether the ``maxTimeAlwaysTimeOut`` failpoint applies to a getMore.
+    time_limited: bool = False
 
 
 class CursorRegistry:
@@ -271,6 +275,18 @@ class CursorRegistry:
             else:
                 entry.last_access = self._time()
             return batch, exhausted
+
+    def mark_time_limited(self, cursor_id: int) -> None:
+        """Flag a non-tailable cursor as opened under a ``maxTimeMS``."""
+        with self._lock:
+            entry = self._cursors.get(cursor_id)
+            if entry is not None and not entry.tailable:
+                entry.time_limited = True
+
+    def is_time_limited(self, cursor_id: int) -> bool:
+        with self._lock:
+            entry = self._cursors.get(cursor_id)
+            return entry is not None and entry.time_limited
 
     def kill(self, cursor_ids: list[int]) -> tuple[list[int], list[int]]:
         killed: list[int] = []
