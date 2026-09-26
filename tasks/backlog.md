@@ -2926,14 +2926,22 @@ These are explicit non-goals. Don't add them without a reason.
     (98.4%, was 1,071 / 5 = 99.5%); Rust 1,190 / 20 (98.3%). The pass count
     rose by 120; the percentage fell because failpoint tests now RUN. The 14
     new failures on both servers: 9 transaction tests on the missing error
-    labels / `LocationNNN` codeNames below, 4 on the unimplemented
-    `maxTimeAlwaysTimeOut` failpoint (`ExecutionTimeout not raised`), and 1
+    labels / `LocationNNN` codeNames below, 4 on the then-unimplemented
+    `maxTimeAlwaysTimeOut` failpoint (FIXED 2026-09-26, both servers), and 1
     versioned-API strict-mode test (`testVersion2` answers 59 CommandNotFound
     where the test expects the API-version error). Rust-only:
     `test_commit_is_not_retried_after_MaxTimeMSExpired_error` (`Location50`).
     Running these tests also exposed two Rust bugs, both FIXED in the same
     batch: session-ending commands did not abort open transactions, and a
     change stream's open-reply token skipped held-back events.
+  - **`maxTimeAlwaysTimeOut` reply shape is unprobed.** Both servers answer
+    `50 MaxTimeMSExpired` "operation exceeded time limit", which is all
+    pymongo checks. On `createIndexes` the Python server reuses its real-expiry
+    reply, the index-build envelope measured on 8.2.11 for a genuine timeout;
+    the Rust server answers the bare message, having no maxTimeMS enforcement
+    of its own. Whether mongod's FAILPOINT reaches the index-build path or
+    trips an earlier interrupt check is not known -- probe, then align both.
+    The Rust server still does not enforce a real `maxTimeMS` at all (open).
   - **Failpoint-injected errors carry only explicit `errorLabels`.** mongod
     computes `TransientTransactionError` / `RetryableWriteError` for these
     errors when the failpoint names none (it's what the spec tests expect of

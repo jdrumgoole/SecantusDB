@@ -4798,6 +4798,50 @@ def _max_time_ms_budget(doc: Mapping[str, Any], command: str) -> int:
         return 0
 
 
+def _max_time_forced_to_expire(
+    command: str, doc: Mapping[str, Any], budget_ms: int, ctx: CommandContext
+) -> bool:
+    """Whether the ``maxTimeAlwaysTimeOut`` failpoint expires this operation.
+
+    mongod's failpoint makes every operation that HAS a time limit time out at
+    its first interrupt check, whatever the budget; one without a limit runs
+    normally. The limit is the command's own ``maxTimeMS`` -- or, for a
+    ``getMore``, the one its cursor inherited from the originating ``find`` /
+    ``aggregate``, since mongod bounds a non-tailable cursor's getMores by it.
+    (A getMore's own ``maxTimeMS`` is the awaitData wait, not a limit.)
+    """
+    fp = ctx.failpoints
+    if fp is None or not fp.max_time_always_times_out_armed():
+        return False
+    if budget_ms:
+        return fp.consume_max_time_always_timeout()
+    if command == "getMore" and ctx.cursors is not None:
+        cursor_id = doc.get("getMore")
+        if (
+            isinstance(cursor_id, int)
+            and not isinstance(cursor_id, bool)
+            and ctx.cursors.is_time_limited(int(cursor_id))
+        ):
+            return fp.consume_max_time_always_timeout()
+    return False
+
+
+def _mark_time_limited_cursor(result: Mapping[str, Any], ctx: CommandContext) -> None:
+    """Remember that the cursor this reply opened carries a ``maxTimeMS``.
+
+    Only read by ``_max_time_forced_to_expire``: SecantusDB serves a
+    non-tailable cursor's remaining batches from memory, so there is no
+    cumulative budget to enforce on its getMores -- but the failpoint has to
+    know one exists.
+    """
+    cursor = result.get("cursor") if isinstance(result, Mapping) else None
+    if not isinstance(cursor, Mapping):
+        return
+    cursor_id = cursor.get("id")
+    if isinstance(cursor_id, int) and cursor_id and ctx.cursors is not None:
+        ctx.cursors.mark_time_limited(int(cursor_id))
+
+
 def _max_time_expired_reply(
     exc: _deadline.MaxTimeMSExpired,
     command: str,
@@ -9954,11 +9998,16 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         # ``_max_time_ms_budget`` already knows the value is a valid
         # non-negative integer -- the validator ran above -- and returns 0 for
         # the "no limit" encodings mongod uses (absent, or an explicit 0).
-        with _deadline.arm(_max_time_ms_budget(doc, name)):
+        budget_ms = _max_time_ms_budget(doc, name)
+        with _deadline.arm(budget_ms):
+            if _max_time_forced_to_expire(name, doc, budget_ms, ctx):
+                raise _deadline.MaxTimeMSExpired()
             if txn is not None:
                 result = _run_txn_statement(txn, handler, doc, ctx)
             else:
                 result = handler(doc, ctx)
+            if budget_ms and ctx.cursors is not None:
+                _mark_time_limited_cursor(result, ctx)
     except _deadline.MaxTimeMSExpired as exc:
         result = _max_time_expired_reply(exc, name, ctx, doc)
     except WriteConflictError:

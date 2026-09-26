@@ -126,6 +126,10 @@ struct Entry {
     /// A fatal projection error (code 280) the producer hit; once set, the next
     /// getMore returns it as an `ok: 0` reply and the cursor is dropped.
     fatal_error: Option<CommandError>,
+    /// The originating `find` / `aggregate` carried a `maxTimeMS`. mongod bounds
+    /// a non-tailable cursor's getMores by it; here it only decides whether the
+    /// `maxTimeAlwaysTimeOut` failpoint applies to a getMore.
+    time_limited: bool,
 }
 
 /// A read-only snapshot of a cursor's routing state, so the getMore handler can
@@ -241,6 +245,7 @@ impl CursorRegistry {
                 final_event_pending: false,
                 last_token: None,
                 fatal_error: None,
+                time_limited: false,
             },
         );
         Ok(id)
@@ -280,6 +285,7 @@ impl CursorRegistry {
                 final_event_pending: false,
                 last_token: None,
                 fatal_error: None,
+                time_limited: false,
             },
         );
         Ok(id)
@@ -503,6 +509,24 @@ impl CursorRegistry {
     }
 
     /// Whether this cursor was tombstoned by a drop/rename of its collection.
+    /// Flag a non-tailable cursor as opened under a `maxTimeMS`.
+    pub fn mark_time_limited(&self, cursor_id: i64) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = inner.cursors.get_mut(&cursor_id) {
+            if !e.tailable {
+                e.time_limited = true;
+            }
+        }
+    }
+
+    pub fn is_time_limited(&self, cursor_id: i64) -> bool {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner
+            .cursors
+            .get(&cursor_id)
+            .is_some_and(|e| e.time_limited)
+    }
+
     pub fn was_dropped(&self, cursor_id: i64) -> bool {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.cursors.get(&cursor_id).is_some_and(|e| e.dropped)

@@ -70,6 +70,9 @@ pub struct FailPointMatch {
 #[derive(Default)]
 pub struct FailPointRegistry {
     inner: Mutex<Vec<FailCommand>>,
+    /// `maxTimeAlwaysTimeOut`: `None` when off, `Some(-1)` for `alwaysOn`, else
+    /// the firings left under `{times: N}`.
+    max_time_always: Mutex<Option<i64>>,
 }
 
 impl FailPointRegistry {
@@ -80,6 +83,10 @@ impl FailPointRegistry {
     /// Install / replace / disable a named failpoint. `mode` is what mongod
     /// accepts (`"alwaysOn"` / `"off"` / `{times}` / `{skip, times}`).
     pub fn configure(&self, name: &str, mode: &Bson, data: &Document) {
+        if name == "maxTimeAlwaysTimeOut" {
+            self.configure_max_time_always(mode);
+            return;
+        }
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         // A new failpoint replaces any prior one; names we don't model are
         // accept-but-ignore (mongod exposes dozens).
@@ -165,6 +172,44 @@ impl FailPointRegistry {
     /// `times`/`skip` budget only when the command is in scope -- another
     /// client's command must not use up a failpoint meant for this one. `None`
     /// means no failpoint applies.
+    /// mongod's `maxTimeAlwaysTimeOut`: every operation that has a time limit
+    /// expires at its first interrupt check, however large the budget. Mirrors
+    /// `failpoints.py::_configure_max_time_always_timeout`.
+    fn configure_max_time_always(&self, mode: &Bson) {
+        let mut g = self
+            .max_time_always
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *g = match mode {
+            Bson::String(s) if s == "alwaysOn" => Some(-1),
+            Bson::Document(m) => m.get("times").and_then(as_i64).filter(|n| *n > 0),
+            _ => None,
+        };
+    }
+
+    pub fn max_time_always_armed(&self) -> bool {
+        self.max_time_always
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
+    /// Fire once if armed, spending one of a `{times: N}` budget.
+    pub fn consume_max_time_always(&self) -> bool {
+        let mut g = self
+            .max_time_always
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match *g {
+            None => false,
+            Some(n) if n > 0 => {
+                *g = if n == 1 { None } else { Some(n - 1) };
+                true
+            }
+            Some(_) => true,
+        }
+    }
+
     pub fn match_command(&self, name: &str, app_name: Option<&str>) -> Option<FailPointMatch> {
         let name = canonical_command_name(name);
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
