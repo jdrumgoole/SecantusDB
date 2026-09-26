@@ -85,6 +85,60 @@ class TestLikeDefaultEscape:
         assert db(f"SELECT {expr}")[0] == [(value,)]
 
 
+class TestLikeDanglingEscape:
+    """A LIKE pattern ending in an UNESCAPED escape character matches nothing.
+
+    The trailing escape has no character to escape. Falling through to the
+    default branch treated it as a literal backslash, so a pattern of
+    a-backslash matched a value of a-backslash where PostgreSQL returns no rows.
+
+    Measured on PostgreSQL 14 (2026-09-25) with a matching row present and the
+    pattern bound as a parameter: no rows, no error. A dangling escape written
+    as a LITERAL in the SQL text is instead a plan-time error there ("LIKE
+    pattern must not end with escape character"); we do not distinguish the two
+    paths and implement the bound semantics, which is what a client relies on --
+    pgjdbc's getTables binds the pattern. Recorded in tasks/backlog.md.
+
+    Every case builds its SQL with chr(92) rather than a source-level escape.
+    Writing these as literals silently lost backslashes across the Python-source
+    and SQL layers -- pytest reported running `'a' LIKE 'a\'` for a case
+    written to be a-backslash against a doubled one -- so the cases tested
+    something other than what they claimed.
+
+    Found from pgjdbc's DatabaseMetaDataTest::escaping.
+    """
+
+    BS = chr(92)
+
+    @pytest.mark.parametrize(
+        ("value_sql", "pattern_sql", "escape_sql", "expected", "why"),
+        [
+            # A dangling escape matches nothing, even a value that a literal
+            # reading of the backslash WOULD match.
+            ("a" + BS, "a" + BS, "", False, "dangling escape matches nothing"),
+            # An ESCAPED escape is not dangling: the first consumes the second,
+            # so it matches one literal backslash. A first version of the guard
+            # used `endswith` and broke exactly this.
+            ("a" + BS, "a" + BS + BS, "", True, "escaped escape matches a literal"),
+            # The same rule under a custom escape character.
+            ("a#", "a#", "#", False, "dangling custom escape matches nothing"),
+            ("a#", "a##", "#", True, "escaped custom escape matches a literal"),
+            # With escaping DISABLED a trailing backslash is just a character.
+            ("a" + BS, "a" + BS, "DISABLED", True, "ESCAPE '' makes it literal"),
+        ],
+    )
+    def test_dangling(self, db, value_sql, pattern_sql, escape_sql, expected, why):
+        def lit(text: str) -> str:
+            return "'" + text.replace("'", "''") + "'"
+
+        sql = f"SELECT {lit(value_sql)} LIKE {lit(pattern_sql)}"
+        if escape_sql == "DISABLED":
+            sql += " ESCAPE ''"
+        elif escape_sql:
+            sql += f" ESCAPE {lit(escape_sql)}"
+        assert db(sql)[0] == [(expected,)], why
+
+
 class TestBooleanAndSubqueryTypes:
     @pytest.mark.parametrize(
         "expr", ["1 BETWEEN 0 AND 2", "1 NOT BETWEEN 5 AND 9", "EXISTS (SELECT 1 WHERE false)"]
