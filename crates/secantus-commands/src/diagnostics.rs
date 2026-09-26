@@ -28,8 +28,8 @@ pub fn start_session(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResul
     })
 }
 
-/// `endSessions` / `refreshSessions` / `killSessions` / `killAllSessions` /
-/// `killAllSessionsByPattern` — no-op bookkeeping (no session registry yet).
+/// `refreshSessions` — no-op bookkeeping (no session registry yet). The
+/// session-ENDING commands live in `lib.rs`: they abort open transactions.
 pub fn ok_session_noop(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
     Ok(doc! { "ok": 1.0 })
 }
@@ -187,7 +187,11 @@ pub fn get_parameter(doc: &Document, _ctx: &mut CommandContext) -> HandlerResult
 fn known_params() -> Document {
     doc! {
         "featureCompatibilityVersion": { "version": "7.0" },
-        "enableTestCommands": false,
+        // True because the test commands drivers gate on ARE implemented --
+        // `configureFailPoint` above all. pymongo's harness reads this flag and,
+        // while it said false, skipped ~1,080 unified-spec failpoint tests
+        // (measured 2026-09-25 against the Python server, which shares it).
+        "enableTestCommands": true,
         "logLevel": 0_i32,
         "quiet": false,
         // We implement SCRAM-SHA-256 + MONGODB-X509 (R5); advertise just those

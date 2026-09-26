@@ -297,17 +297,15 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
     // "no changes"; mongod and the Python server populate it here too. The
     // producer advances its position past whatever it returns; the overflow
     // beyond `batchSize` is buffered for the first getMore.
+    let start_position = producer.position();
     let mut initial = producer.produce();
     let split = batch_size.min(initial.len());
     let remainder = initial.split_off(split);
     let first_batch_bytes = initial;
     let open_position = producer.position();
 
-    // The high-water-mark resume token at the (post-poll) position — mongod
-    // returns it as the open reply's `postBatchResumeToken` so a client that sees
-    // an empty first batch still has a token to resume from.
-    let open_pbrt = {
-        let bytes = storage.high_water_mark_token(open_position);
+    let hwm_token = |position| {
+        let bytes = storage.high_water_mark_token(position);
         if bytes.is_empty() {
             None
         } else {
@@ -316,7 +314,9 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
                 .map(Bson::Document)
         }
     };
-
+    // Events held back for getMore (`batchSize` trimmed the poll) are NOT yet
+    // delivered, so the token must not move past them.
+    let held_back = !remainder.is_empty();
     let cursors = ctx.cursors()?;
     let cursor_id = cursors
         .register_tailable(
@@ -347,10 +347,28 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
             .map_err(|e| CommandError::new(1, "InternalError", e.to_string()))?;
         first_batch.push(Bson::Document(d));
     }
+    let last_sent_id = match first_batch.last() {
+        Some(Bson::Document(last)) => last.get("_id").cloned(),
+        _ => None,
+    };
     let mut cursor_doc = doc! {
         "firstBatch": Bson::Array(first_batch),
         "id": Bson::Int64(cursor_id),
         "ns": ns,
+    };
+    // `postBatchResumeToken`. With nothing held back it is the high-water mark
+    // at the post-poll position -- mongod returns one even for an empty batch
+    // so a client always has a token to resume from. With events held back it
+    // is the last SENT event's `_id` (every change event's `_id` is its resume
+    // token), or the pre-poll position if nothing was sent. The post-poll mark
+    // pointed PAST the held-back events: a driver that resumed after draining
+    // the first batch skipped them -- pymongo's "Test consecutive resume" lost
+    // two of three inserts (2026-09-25). Mirrors `commands.py`'s rule that a
+    // non-empty batch's token is its last event's `_id`.
+    let open_pbrt = if held_back {
+        last_sent_id.or_else(|| hwm_token(start_position))
+    } else {
+        hwm_token(open_position)
     };
     if let Some(tok) = open_pbrt {
         cursor_doc.insert("postBatchResumeToken", tok);
