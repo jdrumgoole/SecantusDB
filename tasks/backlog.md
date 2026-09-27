@@ -2913,6 +2913,44 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **OPEN — the published writer-scaling chart can only be measured on
+      SHARED CPU, and a DigitalOcean tier ticket is in flight (2026-09-28).**
+      `invoke do-perf` needs >= 8 vCPU (the sweep runs eight writer processes
+      plus the server; on four vCPU it measures core starvation instead — mongod,
+      the control, scales 4.96x on 8 vCPU against 1.78x on a `c-4`). Two separate
+      limits block a dedicated plan, and they were initially conflated:
+
+      * **Account tier.** `c-8` is not merely refused, it is ABSENT from
+        `GET /v2/sizes` for this account, along with the whole `g-` (General
+        Purpose) and `m-` (Memory-Optimized) families. Visible CPU-Optimized
+        stops at `c-4`. Asking for `c-8` returns
+        `422 "This size is currently restricted, please open a ticket to increase
+        your account tier."` Joe raised that ticket on 2026-09-28.
+      * **Region.** Independently, in `lon1` EVERY plan at >= 8 vCPU is `Basic`
+        (shared). The only 8-vCPU non-Basic plans visible are `s5-*`, described
+        as "v5 Shared" — still shared — and only in atl1 / mem1 / mkc1 / ric1.
+        So the tier alone may not be enough.
+
+      When the ticket lands, re-run the check rather than assuming:
+
+          # does a dedicated >=8 vCPU plan now exist, and where?
+          curl -s -H "Authorization: Bearer $DO_TOKEN" \
+            "https://api.digitalocean.com/v2/sizes?per_page=250" \
+          | python3 -c 'import json,sys; [print(s["slug"], s["description"], sorted(s["regions"])) \
+              for s in json.load(sys.stdin)["sizes"] \
+              if s["vcpus"]>=8 and s["description"]!="Basic"]'
+
+      `invoke do-perf --size <plan> --region <slug>` can then use it; the
+      `--region` flag was added for exactly this and forwards to `do-cluster`,
+      which already accepted it. **Re-measure mongod as the control before
+      comparing across a region or plan change** — a different machine class
+      moves every column at once, which is how one run of this sweep already had
+      to be discarded (its two halves disagreed about the machine by 26% vs 4%).
+
+      Why it matters more than tidiness: the concurrency chart's CLAIM is its
+      shape ("monotonic, no cliff"), and a noisy neighbour is exactly what could
+      fake a cliff or hide one.
+
 - [ ] **OPEN — a Java typed-collection round-trip with a custom codec registry
       fails, and it is NOT mapReduce (2026-09-27).**
       `com.mongodb.client.MongoCollectionTest#shouldBeAbleToQueryTypedCollectionAndMapResultsIntoTypedLists`

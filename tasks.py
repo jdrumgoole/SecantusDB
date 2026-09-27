@@ -591,6 +591,14 @@ def release_benchmark(
         "keep": "Leave the droplet running instead of destroying it.",
         "git-ref": "Pushed git ref to build and measure (default: HEAD).",
         "size": "Server droplet plan (default: s-8vcpu-16gb — see the docstring).",
+        "region": (
+            "DigitalOcean region (default: lon1). Worth knowing why this exists: "
+            "lon1 offers NO dedicated-CPU plan at 8 vCPU or above, so the default "
+            "sweep runs on a Basic (shared) plan and inherits its neighbours. If "
+            "the account's tier gains a dedicated >=8 vCPU plan in another region, "
+            "point the sweep there — but a region change moves the baseline, so "
+            "re-measure mongod as the control before comparing to an older run."
+        ),
     },
 )
 def do_perf(
@@ -603,6 +611,7 @@ def do_perf(
     keep: bool = False,
     git_ref: str = "",
     size: str = "s-8vcpu-16gb",
+    region: str = "lon1",
 ) -> None:
     """Measure per-operation latency and writer scaling on a DigitalOcean droplet.
 
@@ -650,6 +659,7 @@ def do_perf(
     """
     cmd = (
         f"{_DO_CLUSTER} perf"
+        f" --region {shlex.quote(region)}"
         f" --server-size {shlex.quote(size)}"
         f" --perf-n {int(count)}"
         f" --perf-reps {int(reps)}"
