@@ -2909,6 +2909,46 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **OPEN — `apiStrict: true` does not reject a command outside the Stable
+      API, and TWO drivers independently say so (2026-09-27).** A full
+      `validate-all` against `0.6.0b17` fails the same behaviour in pymongo
+      (`test_versioned_api_integration.py::TestVersionedApiTestCommandsStrictMode
+      ::test_Running_a_command_that_is_not_part_of_the_versioned_API_results_in_an_error`)
+      and in the Java driver
+      (`com.mongodb.client.unified.VersionedApiTest#Test commands: strict mode`).
+      Two unrelated drivers agreeing is what makes this a real gap rather than a
+      harness artifact — neither is a documented load flake, and both gauges were
+      run on a quiet machine. `mongod` answers `APIStrictError` (code 323) for a
+      command absent from the declared `apiVersion`; we run it. Probe `mongod`
+      8.2.11 for the exact `errmsg` and the command allowlist before fixing, and
+      land it in both servers.
+
+- [ ] **OPEN — multi-document transaction error LABELS are wrong, and the tests
+      are no longer skipped (2026-09-27).** Nine pymongo failures in
+      `test_transactions_unified.py`, all about labels rather than about
+      transactions working: `TransientTransactionError` retry after
+      `commitTransaction` (LockTimeout / NoSuchTransaction / SnapshotUnavailable /
+      WriteConflict / PreparedTransactionInProgress),
+      `TestUnifiedErrorLabels` for `NoSuchTransaction` and `WriteConflict`, and
+      `TestUnifiedRetryableCommit::test_commitTransaction_fails_after_Interrupted`.
+
+      These were **topology-skipped until this release** — the `validate-all` run
+      that found them saw pymongo's skips fall 424 -> 290 on an unchanged total of
+      1500, so 134 tests began executing and 124 of them pass. That is why the
+      headline rate moved 99.5% -> 98.7% while coverage went UP; do not read the
+      rate alone. The single-node scope does not excuse these: the labels are a
+      per-error contract a driver's retry loop reads, and we advertise a
+      replica-set primary specifically so that loop engages.
+
+- [ ] **OPEN — `mapReduce` is not supported, and the Java gauge now reaches it
+      (2026-09-27).** `com.mongodb.client.MongoCollectionTest#testMapReduceWithGenerics`
+      and `#shouldBeAbleToQueryTypedCollectionAndMapResultsIntoTypedLists` fail.
+      The Java include set has widened to `driver-sync` since these were last
+      measured, so these are integration tests rather than the bson unit set.
+      `mapReduce` is deprecated in `mongod` 5.0+ and may belong in section 4
+      (out of scope) rather than here — decide which before spending on it, but
+      decide rather than leaving it as an unexplained gauge failure.
+
 - **Driver unified-spec coverage audit (2026-09-25, Python server `0.6.0b16`,
   pymongo tests `f2103a95`, go-driver `fd85a834`).** Measured by running every
   pymongo unified-format runner (in and out of the gauge's `INCLUDE`) plus the
