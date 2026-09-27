@@ -2934,6 +2934,25 @@ These are explicit non-goals. Don't add them without a reason.
     Running these tests also exposed two Rust bugs, both FIXED in the same
     batch: session-ending commands did not abort open transactions, and a
     change stream's open-reply token skipped held-back events.
+  - **pymongo gauge after `maxTimeAlwaysTimeOut` (2026-09-26, `6c14dbed`, this
+    box):** report Overall Python 1,195 / 15 / 290 skipped (98.7%), Rust
+    1,194 / 16 (98.6%). The 15 common failures: the 9 label / codeName tests
+    and the strict-mode test above, plus 5 older gaps (text + hashed indexes,
+    `$where` x2, `test_to_list_csot_applied`). Rust-only: the `Location50` one.
+  - **The published `docs/validation-report{,-rust-server}.md` are stale.** As
+    of v0.6.0b17 both still read 1,071 / 5 / 424 skipped (99.5%) -- the
+    pre-`enableTestCommands` numbers. #1552 (the bot refresh) merged after
+    #1569 / #1571 but did not touch the pymongo reports, so they were measured
+    on an older tree. A run on current code skips ~290, not 424: that is the
+    tell. The next refresh will show the pass COUNT up ~124 and the RATE down
+    ~0.8 points; the release notes / site should say why before it lands.
+  - **`enableTestCommands: true` is now advertised, but nothing gates it.**
+    `docs/security-reports/2026-08-10.md` recommends mongod's opt-in shape
+    (test commands exist only when a harness asks, default off). Today
+    `configureFailPoint` is always live without `--auth` -- as it was before
+    #1569; the flag only stopped hiding that from drivers. Adding the opt-in
+    would need the embedded test servers to switch it ON, or every driver
+    gauge loses its failpoint tests again. Open; Joe's call.
   - **`maxTimeAlwaysTimeOut` reply shape is unprobed.** Both servers answer
     `50 MaxTimeMSExpired` "operation exceeded time limit", which is all
     pymongo checks. On `createIndexes` the Python server reuses its real-expiry
