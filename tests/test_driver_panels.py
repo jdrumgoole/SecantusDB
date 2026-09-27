@@ -202,3 +202,53 @@ def test_render_missing_artifact_fails_loudly(tmp_path: Path) -> None:
     # user to run validate-all.
     with pytest.raises(SystemExit, match="run `invoke validate-all`"):
         render(tmp_path)
+
+
+def test_counts_line_accounts_for_every_failure_behind_the_rate() -> None:
+    """A card's own numbers must reconcile with its headline rate.
+
+    `_format_counts` used to report `actionable_failures` alone whenever a
+    gauge had any, which dropped the documented divergences from the label
+    while `_format_rate` kept counting them. pymongo shipped a live card
+    reading "1196 tests passed · 10 failed" above a 98.7% rate, when
+    1196/(1196+10) floors to 99.2% — the five documented divergences were in
+    the rate and nowhere in the label, so a reader could not get from the
+    card to the rate.
+    """
+    import math
+    import re
+
+    from validation_summary.driver_panels import _format_counts, _format_rate
+    from validation_summary.generate import GaugeStats
+
+    def stats(passed: int, failed: int, expected: int) -> GaugeStats:
+        s = GaugeStats(
+            name="g",
+            language="L",
+            driver_version="v",
+            passed=passed,
+            failed=failed,
+            skipped=0,
+            failure_descriptions=[],
+        )
+        s.expected_failures = expected
+        return s
+
+    # clean, documented-only, actionable-only, and the mixed case that broke.
+    for passed, failed, expected in [
+        (439, 0, 0),
+        (357, 1, 1),
+        (493, 3, 0),
+        (1196, 15, 5),
+        (783, 7, 6),
+    ]:
+        st = stats(passed, failed, expected)
+        counts = re.sub(r"<[^>]+>", "", _format_counts(st))
+        numbers = [int(n) for n in re.findall(r"\d+", counts)]
+        assert numbers[0] == passed
+        # Every failure behind the rate is named somewhere on the line.
+        assert sum(numbers[1:]) == failed, counts
+        # And the line reconciles with the headline rate the card shows.
+        ran = passed + failed
+        implied = "100.0%" if passed == ran else f"{math.floor(passed / ran * 1000) / 10:.1f}%"
+        assert _format_rate(st) == implied, (counts, _format_rate(st), implied)

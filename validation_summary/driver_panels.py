@@ -284,25 +284,41 @@ def _format_rate(stats: GaugeStats) -> str:
     return rates.pass_rate(stats.passed, stats.ran)
 
 
+def _format_counts(stats: GaugeStats) -> str:
+    """The "N tests passed · ..." line, reconciling with the headline rate.
+
+    EVERY failure behind the rate is named. The previous version reported
+    ``actionable_failures`` alone whenever a gauge had any, which silently
+    dropped the documented ones from the card while ``_format_rate`` kept
+    counting them — pymongo shipped a card reading "1196 tests passed · 10
+    failed" above a 98.7% rate, when 1196/(1196+10) is 99.2%. The five
+    documented divergences were in the rate and nowhere in the label, so the
+    card could not be reconciled from its own numbers.
+
+    It also made the grid look arbitrary: a gauge whose only failure was
+    documented read "1 known divergence" while a gauge with a mix read "N
+    failed", so the same kind of failure was labelled two different ways
+    depending on what else the gauge happened to fail.
+
+    So: name the actionable failures, name the documented ones, and let a
+    reader add them to the passed count and get the denominator behind the
+    rate.
+    """
+    parts = [f"<strong>{stats.passed}</strong> tests passed"]
+    if stats.actionable_failures > 0:
+        parts.append(f"<strong>{stats.actionable_failures}</strong> failed")
+    if stats.expected_failures > 0:
+        word = "known divergence" if stats.expected_failures == 1 else "known divergences"
+        parts.append(f"<strong>{stats.expected_failures}</strong> {word}")
+    if stats.failed == 0:
+        parts.append("<strong>0</strong> failed")
+    return " &middot; ".join(parts)
+
+
 def _render_validation_panel(name: str, stats: GaugeStats) -> str:
     prose = PANEL_PROSE[name]
     rate = _format_rate(stats)
-    if stats.expected_failures > 0 and stats.actionable_failures == 0:
-        # Clean panel with a known, report-documented divergence. Fold it
-        # in plainly ("N known divergence") rather than spelling out the
-        # rate accounting ("0 unexpected failures · ... excluded from the
-        # rate"), which reads defensively on a marketing card — the report
-        # carries the detail.
-        word = "known divergence" if stats.expected_failures == 1 else "known divergences"
-        counts = (
-            f"<strong>{stats.passed}</strong> tests passed &middot; "
-            f"<strong>{stats.expected_failures}</strong> {word}"
-        )
-    else:
-        counts = (
-            f"<strong>{stats.passed}</strong> tests passed &middot; "
-            f"<strong>{stats.actionable_failures}</strong> failed"
-        )
+    counts = _format_counts(stats)
     return (
         f'  <article class="driver">\n'
         f"    <header>\n"
