@@ -3589,6 +3589,15 @@ all match, and so do CREATE INDEX / VIEW and their error surface. What is open:
       the attribute is a no-op here (we model neither `proparallel` nor
       `provolatile`, and `STABLE` / `STRICT` already parse and are ignored).
       Measured 2026-09-20.
+- [ ] **A dangling-escape LIKE pattern written as a SQL LITERAL should be a
+      plan-time ERROR, not an empty result.** PostgreSQL 14 raises `LIKE
+      pattern must not end with escape character` for a literal pattern, and
+      returns no rows for the same pattern BOUND as a parameter (both measured
+      2026-09-25). We do not distinguish the two paths and implement the bound
+      semantics, because that is the path a client uses -- pgjdbc's `getTables`
+      binds it. So a user writing the dangling pattern literally gets an empty
+      result where PostgreSQL would error. Strictly better than before, when we
+      MATCHED in both cases, but still a divergence.
 - [ ] **`getProcedureColumns` returns nothing for a schema's PROCEDURE.**
       pgjdbc's `getProceduresWithCorrectCatalogAndWithout` asserts
       `getProcedureColumns(null, 'hasprocedures', null, null)` yields 1 row for

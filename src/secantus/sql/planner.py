@@ -741,11 +741,31 @@ def _like_to_regex(pattern: str, escape: Any = _ESCAPE_UNSET) -> str:
         raise errors.SQLError("22025", "invalid escape string")
     if not escape:
         escape = None  # ``ESCAPE ''`` disables escaping, like PG
+    # A pattern ENDING in the escape character matches nothing. The trailing
+    # escape has no character to escape, and treating it as a literal — which
+    # is what falling through to the default branch did — made `LIKE 'a\\'`
+    # match a row named `a\\`, where PostgreSQL returns none.
+    #
+    # Measured on PostgreSQL 14, 2026-09-25, with a row present that a literal
+    # reading WOULD match: bound as a parameter the query returns no rows and
+    # no error. (A dangling escape written as a LITERAL in the SQL text is
+    # instead a plan-time error there, `LIKE pattern must not end with escape
+    # character`; we do not distinguish the two paths, and the bound semantics
+    # are what a client actually relies on — pgjdbc's getTables binds the
+    # pattern. The literal difference is recorded in tasks/backlog.md.)
     out = ["^"]
     i = 0
     while i < len(pattern):
         ch = pattern[i]
-        if escape and ch == escape and i + 1 < len(pattern):
+        if escape and ch == escape:
+            if i + 1 >= len(pattern):
+                # Dangling escape: nothing left to escape, so the pattern
+                # matches nothing. Detected DURING the scan, not with
+                # `endswith` -- `a\\` also ends in the escape character, but
+                # there the second backslash is escaped by the first and the
+                # pattern matches a literal `a\` perfectly well. A first
+                # version of this guard used `endswith` and broke exactly that.
+                return "(?!)"
             out.append(re.escape(pattern[i + 1]))
             i += 2
             continue
