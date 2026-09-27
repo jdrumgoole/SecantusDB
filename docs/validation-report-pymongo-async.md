@@ -1,6 +1,6 @@
 # pymongo async Validation Report
 
-Generated 2026-09-21 — SecantusDB 0.6.0b16 vs pymongo f2103a95870a (`vendor/pymongo-tests/test/asynchronous/`).
+Generated 2026-09-27 — SecantusDB 0.6.0b17 vs pymongo f2103a95870a (`vendor/pymongo-tests/test/asynchronous/`).
 
 Run `uv run python -m invoke validate-pymongo-async` to refresh. This is the async sibling of the headline pymongo gauge: it drives pymongo's native `AsyncMongoClient` API (the async/await wire path that replaced Motor) over the same in-scope CRUD / cursor / change-stream / command-monitoring surface. A gap versus `docs/validation-report.md` means the async code path exercises something the sync path doesn't.
 
@@ -9,28 +9,28 @@ Run `uv run python -m invoke validate-pymongo-async` to refresh. This is the asy
 | Test file | Passed | Failed | Errored | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|---:|
 | `test_bulk.py` | 34 | 0 | 0 | 4 | 38 | 100.0% |
-| `test_change_stream.py` | 100 | 0 | 0 | 55 | 155 | 100.0% |
+| `test_change_stream.py` | 122 | 0 | 0 | 33 | 155 | 100.0% |
 | `test_collation.py` | 16 | 0 | 0 | 0 | 16 | 100.0% |
-| `test_collection.py` | 85 | 2 | 0 | 4 | 91 | 97.7% |
+| `test_collection.py` | 86 | 2 | 0 | 3 | 91 | 97.7% |
 | `test_collection_management.py` | 7 | 0 | 0 | 0 | 7 | 100.0% |
-| `test_command_logging.py` | 22 | 0 | 0 | 14 | 36 | 100.0% |
-| `test_command_monitoring.py` | 32 | 0 | 0 | 6 | 38 | 100.0% |
+| `test_command_logging.py` | 27 | 0 | 0 | 9 | 36 | 100.0% |
+| `test_command_monitoring.py` | 33 | 0 | 0 | 5 | 38 | 100.0% |
 | `test_comment.py` | 3 | 0 | 0 | 0 | 3 | 100.0% |
 | `test_common.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
-| `test_crud_unified.py` | 344 | 0 | 0 | 142 | 486 | 100.0% |
-| `test_cursor.py` | 57 | 3 | 0 | 12 | 72 | 95.0% |
+| `test_crud_unified.py` | 353 | 0 | 0 | 133 | 486 | 100.0% |
+| `test_cursor.py` | 62 | 3 | 0 | 7 | 72 | 95.3% |
 | `test_custom_types.py` | 51 | 0 | 0 | 0 | 51 | 100.0% |
-| `test_database.py` | 35 | 0 | 0 | 1 | 36 | 100.0% |
+| `test_database.py` | 36 | 0 | 0 | 0 | 36 | 100.0% |
 | `test_examples.py` | 18 | 0 | 0 | 2 | 20 | 100.0% |
-| `test_logger.py` | 4 | 0 | 0 | 2 | 6 | 100.0% |
+| `test_logger.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
 | `test_read_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
 | `test_read_preferences.py` | 9 | 1 | 0 | 20 | 30 | 90.0% |
-| `test_run_command.py` | 16 | 0 | 0 | 5 | 21 | 100.0% |
-| `test_transactions_unified.py` | 95 | 0 | 0 | 169 | 264 | 100.0% |
-| `test_versioned_api_integration.py` | 39 | 0 | 0 | 4 | 43 | 100.0% |
-| **Overall** | **977** | **6** | **0** | **440** | **1423** | **99.3%** |
+| `test_run_command.py` | 17 | 0 | 0 | 4 | 21 | 100.0% |
+| `test_transactions_unified.py` | 172 | 9 | 0 | 83 | 264 | 95.0% |
+| `test_versioned_api_integration.py` | 39 | 1 | 0 | 3 | 43 | 97.5% |
+| **Overall** | **1101** | **16** | **0** | **306** | **1423** | **98.5%** |
 
-## Failures (6)
+## Failures (16)
 
 First 30 failure node-ids for manual triage:
 
@@ -41,6 +41,16 @@ vendor/pymongo-tests/test/asynchronous/test_cursor.py::TestCursor::test_maxtime_
 vendor/pymongo-tests/test/asynchronous/test_cursor.py::TestCursor::test_to_list_csot_applied
 vendor/pymongo-tests/test/asynchronous/test_cursor.py::TestCursor::test_where
 vendor/pymongo-tests/test/asynchronous/test_read_preferences.py::TestMongosAndReadPreference::test_read_preference_hedge_deprecated
+vendor/pymongo-tests/test/asynchronous/test_transactions_unified.py::TestUnifiedCommitTransienttransactionerror::test_transaction_is_retried_after_commitTransaction_TransientTransactionError_(LockTimeout)
+vendor/pymongo-tests/test/asynchronous/test_transactions_unified.py::TestUnifiedCommitTransienttransactionerror::test_transaction_is_retried_after_commitTransaction_TransientTransactionError_(NoSuchTransaction)
+vendor/pymongo-tests/test/asynchronous/test_transactions_unified.py::TestUnifiedCommitTransienttransactionerror::test_transaction_is_retried_after_commitTransaction_TransientTransactionError_(SnapshotUnavailable)
+vendor/pymongo-tests/test/asynchronous/test_transactions_unified.py::TestUnifiedCommitTransienttransactionerror::test_transaction_is_retried_after_commitTransaction_TransientTransactionError_(WriteConflict)
+vendor/pymongo-tests/test/asynchronous/test_transactions_unified.py::TestUnifiedCommitTransienttransactionerror_4_2::test_transaction_is_retried_after_commitTransaction_TransientTransactionError_(PreparedTransactionInProgress)
+vendor/pymongo-tests/test/asynchronous/test_transactions_unified.py::TestUnifiedErrorLabels::test_NoSuchTransaction_errors_contain_transient_label
+vendor/pymongo-tests/test/asynchronous/test_transactions_unified.py::TestUnifiedErrorLabels::test_NoSuchTransaction_errors_on_commit_contain_transient_label
+vendor/pymongo-tests/test/asynchronous/test_transactions_unified.py::TestUnifiedErrorLabels::test_WriteConflict_errors_contain_transient_label
+vendor/pymongo-tests/test/asynchronous/test_transactions_unified.py::TestUnifiedRetryableCommit::test_commitTransaction_fails_after_Interrupted
+vendor/pymongo-tests/test/asynchronous/test_versioned_api_integration.py::TestVersionedApiTestCommandsStrictMode::test_Running_a_command_that_is_not_part_of_the_versioned_API_results_in_an_error
 ```
 
 ## How this is generated
