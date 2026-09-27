@@ -784,35 +784,45 @@ def _empty_state(page: Any) -> str | None:
 # --------------------------------------------------------------------------
 
 _SCRUB_JS = """
-([replacements]) => {
+([replacements, posixPrefixes]) => {
+  // A prefix rule leaves the REST of a Windows path backslashed, so
+  // `/var/lib/secantus\\\\backups` survives the replace. Re-slash only the
+  // run of path characters immediately following a placeholder we just
+  // wrote — never backslashes elsewhere on the page.
+  const escapeRe = (s) => s.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');
+  const tailRes = (posixPrefixes || []).map(
+    (p) => new RegExp(escapeRe(p) + '[^\\\\s"\\'<>]*', 'g')
+  );
+  const apply = (value) => {
+    let next = value;
+    for (const [from, to] of replacements) {
+      if (next.includes(from)) next = next.split(from).join(to);
+    }
+    for (const re of tailRes) {
+      next = next.replace(re, (m) => m.replace(/\\\\/g, '/'));
+    }
+    return next;
+  };
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
   const nodes = [];
   while (walker.nextNode()) nodes.push(walker.currentNode);
   for (const node of nodes) {
-    let text = node.nodeValue;
-    for (const [from, to] of replacements) {
-      if (text.includes(from)) text = text.split(from).join(to);
-    }
-    if (text !== node.nodeValue) node.nodeValue = text;
+    const next = apply(node.nodeValue);
+    if (next !== node.nodeValue) node.nodeValue = next;
   }
   // Same for attributes that surface paths (title=, value=, placeholder=).
   for (const el of document.querySelectorAll('[title], [value], [placeholder]')) {
     for (const attr of ['title', 'value', 'placeholder']) {
       const cur = el.getAttribute(attr);
       if (!cur) continue;
-      let next = cur;
-      for (const [from, to] of replacements) {
-        if (next.includes(from)) next = next.split(from).join(to);
-      }
+      const next = apply(cur);
       if (next !== cur) el.setAttribute(attr, next);
     }
   }
   // Input elements hold their live value off-attribute.
   for (const el of document.querySelectorAll('input, textarea')) {
-    let next = el.value;
-    for (const [from, to] of replacements) {
-      if (next && next.includes(from)) next = next.split(from).join(to);
-    }
+    if (!el.value) continue;
+    const next = apply(el.value);
     if (next !== el.value) el.value = next;
   }
 }
@@ -833,7 +843,13 @@ def _scrub(page: Any, harness: AdminHarness) -> None:
         [ADMIN_TOKEN, "<token>"],
         [socket.gethostname(), "localhost"],
     ]
-    page.evaluate(_SCRUB_JS, [replacements])
+    # Each rule above rewrites a PREFIX, so on Windows any path segments
+    # *after* the prefix keep their backslashes and a placeholder renders
+    # as ``/var/lib/secantus\backups`` or ``/home/user\.secantus``. Hand
+    # the POSIX placeholders to the scrubber so it can normalise the tail
+    # it just created — without touching backslashes anywhere else.
+    posix_prefixes = [to for _, to in replacements if to.startswith("/")]
+    page.evaluate(_SCRUB_JS, [replacements, posix_prefixes])
 
 
 # --------------------------------------------------------------------------
