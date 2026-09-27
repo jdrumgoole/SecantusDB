@@ -356,6 +356,11 @@ fn _secantus_server(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Module-level `__version__` so `_secantus_server.__version__` reports the
     // embedded Rust server version without having to start a server.
     m.add("__version__", secantus_server::VERSION)?;
+    // The git tree hash of the crates this extension was built from, so a test
+    // run can tell whether the installed `.so` matches the checkout. Empty when
+    // built without git history (an sdist, a build container), in which case the
+    // collection-time check abstains rather than failing the run.
+    m.add("__source_tree__", env!("SECANTUS_SOURCE_TREE"))?;
     m.add_class::<RustServer>()?;
     #[cfg(feature = "pgserver")]
     m.add_class::<PgServer>()?;

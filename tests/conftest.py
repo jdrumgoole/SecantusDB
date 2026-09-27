@@ -235,6 +235,150 @@ def _committed_source_tree() -> str:
     return "-".join(hashes)
 
 
+#: Rebuild commands per artifact — the official invoke tasks, verified against
+#: `rust_tasks.py` rather than guessed. The first draft of this table told
+#: anyone with a stale `secantusd-rs` to run `rust-server-build`, which rebuilds
+#: the embedded EXTENSION instead; a check that prints the wrong remedy sends
+#: people down a ten-minute detour and teaches them to distrust it.
+_REBUILD_SERVER_CMD = "./inv rust-server-build"
+_REBUILD_PGSERVER_CMD = "./inv rust-pgserver-build"
+_REBUILD_RS_CMD = "./inv rust-binary-build"
+
+
+#: The whole `crates` tree, which is what the server extension and both
+#: binaries stamp. Separate from :func:`_committed_source_tree`, which names the
+#: two core crates because that extension only depends on those.
+def _committed_crates_tree() -> str:
+    """The checkout's tree hash for all of `crates/`, or "" if git can't say."""
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD:crates"],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def _binary_source_tree(path: pathlib.Path) -> str:
+    """The tree hash a built binary reports via ``--version``, or "".
+
+    The binaries print a ``tree: <hash>`` line (added so a stale one could be
+    identified at all). An older binary predating that line simply has no stamp,
+    and the check abstains.
+    """
+    import subprocess
+
+    try:
+        out = subprocess.run([str(path), "--version"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if out.returncode != 0:
+        return ""
+    for line in out.stdout.splitlines():
+        if line.startswith("tree:"):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+def stale_artifact_message(
+    artifact: str, built: str, current: str, rebuild: str, cost: str
+) -> str | None:
+    """The failure text when `built` and `current` disagree, else ``None``.
+
+    The generic form of :func:`stale_core_message`, which stays as-is because
+    its wording is load-bearing in its own tests. Silence when either side is
+    unknown is the important half: an unstamped artifact, or a checkout git
+    cannot read, must not fail anybody's run.
+    """
+    if not built or not current or built == current:
+        return None
+    return (
+        f"the installed `{artifact}` was built from different sources than this "
+        f"checkout:\n"
+        f"    artifact: {built}\n"
+        f"    checkout: {current}\n"
+        f"Running against a stale artifact produces failures that look like real "
+        f"regressions and are not. {cost}\nRebuild it:\n"
+        f"    {rebuild}\n"
+        "(A worktree without `vendor/wiredtiger` cannot build the WT-linked "
+        "artifacts at all — `git submodule update --init --depth 1 "
+        "vendor/wiredtiger` first, or delete the stale one, which makes its "
+        "tests skip honestly instead of failing falsely.)"
+    )
+
+
+def _check_artifact_build_provenance() -> None:
+    """Fail loudly when a built artifact other than `_secantus_core` is stale.
+
+    `_secantus_core` has had this check since #1489; the other three artifacts
+    did not, and on 2026-09-27 that cost a full day:
+
+    - a stale `_secantus_server` failed a colleague's whole new failpoint test
+      file (3 failures and a HANG that killed three xdist workers at 99%,
+      surfacing as a bare `rc=70` with no summary line). It was diagnosed as
+      "main is broken" and reported as such before the extension was suspected.
+      13 of 13 passed after a rebuild, no code change.
+    - a stale `secantusd-pg` produced failures on SIX separate occasions in one
+      session, each time reading as somebody else's regression, each time in the
+      test file whose fix the binary predated.
+
+    The binaries already carried the stamp (#1492) and nothing looked at it,
+    which is the worst of both worlds: the evidence was sitting in
+    `--version` output that no automated thing read.
+    """
+    checks: list[tuple[str, str, str, str, str]] = []
+
+    try:
+        import _secantus_server  # type: ignore[import-not-found]
+
+        checks.append(
+            (
+                "_secantus_server",
+                getattr(_secantus_server, "__source_tree__", ""),
+                _committed_crates_tree(),
+                _REBUILD_SERVER_CMD,
+                "On 2026-09-27 a stale one produced 3 failures and a hang in a "
+                "colleague's test file, reported as their bug; 13/13 passed "
+                "after a rebuild with no code change.",
+            )
+        )
+    except ImportError:
+        pass  # No extension at all is a normal, deliberate configuration.
+
+    for name, rel, rebuild in (
+        (
+            "secantusd-pg",
+            "crates/secantus-pgserver/target/debug/secantusd-pg",
+            _REBUILD_PGSERVER_CMD,
+        ),
+        ("secantusd-rs", "crates/secantusdb/target/debug/secantusd-rs", _REBUILD_RS_CMD),
+    ):
+        binary = _REPO_ROOT / rel
+        if not binary.exists():
+            continue  # Its tests skip; nothing to be stale against.
+        checks.append(
+            (
+                name,
+                _binary_source_tree(binary),
+                _committed_crates_tree(),
+                rebuild,
+                "On 2026-09-27 a stale one caused six separate false-regression "
+                "diagnoses in one session.",
+            )
+        )
+
+    for artifact, built, current, rebuild, cost in checks:
+        message = stale_artifact_message(artifact, built, current, rebuild, cost)
+        if message is not None:
+            raise pytest.UsageError(message)
+
+
 def _check_core_build_provenance() -> None:
     """Fail loudly when the installed `_secantus_core` predates the checkout.
 
@@ -351,6 +495,7 @@ def pytest_configure(config: pytest.Config) -> None:
     flipping this policy globally.
     """
     _check_core_build_provenance()
+    _check_artifact_build_provenance()
 
     if os.environ.get("SECANTUS_SIGTRACE") == "1":
         _install_sigtrace()

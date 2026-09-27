@@ -15,7 +15,16 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from conftest import _CORE_CRATES, _committed_source_tree, stale_core_message  # noqa: E402
+from conftest import (  # noqa: E402
+    _CORE_CRATES,
+    _REBUILD_PGSERVER_CMD,
+    _REBUILD_RS_CMD,
+    _REBUILD_SERVER_CMD,
+    _committed_crates_tree,
+    _committed_source_tree,
+    stale_artifact_message,
+    stale_core_message,
+)
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -139,3 +148,90 @@ def test_a_dormant_check_says_so(capsys: pytest.CaptureFixture[str]) -> None:
         assert header is not None
         assert "UNKNOWN" in header
         assert "invoke sync" in header
+
+
+# --------------------------------------------------------------------------- #
+# The generic check, covering the three artifacts beyond `_secantus_core`.
+#
+# `_secantus_core` had this protection from #1489; `_secantus_server`,
+# `secantusd-pg` and `secantusd-rs` did not. On 2026-09-27 that cost nine
+# false-regression diagnoses in one session -- including one reported as "main
+# is broken" from an extension six days behind the checkout, and six separate
+# occasions where a stale `secantusd-pg` read as somebody else's bug.
+#
+# The binaries already CARRIED a source stamp and nothing read it, which is the
+# worst arrangement: the evidence sat in `--version` output that no automated
+# thing looked at.
+# --------------------------------------------------------------------------- #
+
+
+def test_a_generic_mismatch_is_reported() -> None:
+    """The case it exists for, with the artifact named so the reader knows which."""
+    msg = stale_artifact_message("_secantus_server", "aaaa", "bbbb", "./inv x", "cost")
+    assert msg is not None
+    assert "_secantus_server" in msg
+    assert "aaaa" in msg and "bbbb" in msg
+
+
+def test_a_generic_match_is_silent() -> None:
+    assert stale_artifact_message("_secantus_server", "same", "same", "./inv x", "c") is None
+
+
+@pytest.mark.parametrize(
+    ("built", "current"),
+    [
+        ("", "current-tree"),  # unstamped artifact: predates the stamp, or no git at build
+        ("built-tree", ""),  # git cannot answer: an sdist, a container without history
+        ("", ""),  # neither side known
+    ],
+)
+def test_generic_unknown_provenance_is_silent(built: str, current: str) -> None:
+    """Silence when it cannot be sure is the half that keeps the check ALIVE.
+
+    A false positive is how a check gets disabled, and the configurations here
+    are all legitimate: whole CI lanes run without these artifacts, and an sdist
+    build has no git history to stamp from.
+    """
+    assert stale_artifact_message("x", built, current, "./inv x", "c") is None
+
+
+def test_each_rebuild_command_is_a_real_invoke_task() -> None:
+    """A remedy that does not exist, or rebuilds the WRONG artifact, is worse
+    than no remedy: it sends the reader on a detour and teaches them to distrust
+    the check.
+
+    The first draft of this table pointed `secantusd-rs` at `rust-server-build`,
+    which rebuilds the embedded extension instead of the binary. This asserts
+    each command against the task definitions rather than trusting the name.
+    """
+    tasks = (REPO / "rust_tasks.py").read_text()
+    for cmd, expected_task in (
+        (_REBUILD_SERVER_CMD, "rust-server-build"),
+        (_REBUILD_PGSERVER_CMD, "rust-pgserver-build"),
+        (_REBUILD_RS_CMD, "rust-binary-build"),
+    ):
+        assert expected_task in cmd, f"{cmd!r} should invoke {expected_task}"
+        assert f'name="{expected_task}"' in tasks, f"{expected_task} is not a real task"
+    # And the three are DISTINCT: the bug being guarded against was two
+    # artifacts sharing one (wrong) command.
+    assert len({_REBUILD_SERVER_CMD, _REBUILD_PGSERVER_CMD, _REBUILD_RS_CMD}) == 3
+
+
+def test_the_crates_tree_hash_is_real_and_stable() -> None:
+    """The identifier the server extension and both binaries are stamped with."""
+    tree = _committed_crates_tree()
+    assert tree, "git should be able to hash crates/ in a checkout"
+    assert len(tree) == 40 and all(c in "0123456789abcdef" for c in tree)
+    assert _committed_crates_tree() == tree, "must not vary between calls"
+
+
+def test_the_crates_tree_differs_from_the_core_tree() -> None:
+    """They are deliberately different identifiers, not two names for one thing.
+
+    `_secantus_core` is stamped with just its two crates, so an unrelated crate's
+    change does not read as stale there. The server extension links most of the
+    workspace, so it takes the whole tree. Conflating them would either
+    over-report on core or under-report on the server.
+    """
+    assert _committed_crates_tree() != _committed_source_tree()
+    assert len(_CORE_CRATES) == 2
