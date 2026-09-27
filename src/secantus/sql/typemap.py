@@ -1731,6 +1731,11 @@ DECLARED_ONLY_TYPES: tuple[tuple[int, str, int], ...] = (
 #:
 #: Measured against PostgreSQL 14 on 2026-09-19.
 PG_TYPLEN: dict[str, int] = {
+    # Catalog-only types (measured on PostgreSQL 14, 2026-09-27).
+    "char": 1,
+    "json": -1,
+    "pg_lsn": 8,
+    "txid_snapshot": -1,
     "bit": -1,
     "bool": 1,
     "box": 32,
@@ -1791,7 +1796,20 @@ PG_TYPLEN: dict[str, int] = {
 #:
 #: ``name`` (19) is here because pgjdbc's ``getMaxNameLength()`` looks it up by
 #: name in ``pg_catalog`` and treats a missing row as a fatal error.
-CATALOG_ONLY_TYPES: tuple[tuple[int, str, int], ...] = ((19, "name", 1003),)
+CATALOG_ONLY_TYPES: tuple[tuple[int, str, int], ...] = (
+    (19, "name", 1003),
+    # `char` is PostgreSQL's internal ONE-BYTE character type (oid 18), which
+    # is a different type from `bpchar` / `character(n)` (1042). Nothing here
+    # stores it; the row exists so a client enumerating types sees it.
+    (18, "char", 1002),
+    # `json` (114) is a REAL type this server folds onto the `jsonb` tag, so a
+    # `json` column still reports atttypid 3802. The row is correct on its own
+    # terms — PostgreSQL has both — but the fold is a separate divergence,
+    # recorded in tasks/backlog.md.
+    (114, "json", 199),
+    (3220, "pg_lsn", 3221),
+    (2970, "txid_snapshot", 2949),
+)
 
 
 #: ``pg_type.typtype`` by TYPNAME for every built-in that is not a plain base

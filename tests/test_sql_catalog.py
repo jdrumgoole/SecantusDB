@@ -708,6 +708,39 @@ def test_pg_class_relpages(storage, session):
     assert res.rows == [("rp", 0), ("rp_b", 1)]
 
 
+def test_pg_type_has_the_types_a_client_enumerates(storage, session):
+    """`getTypeInfo()` must list the built-in type names a driver expects.
+
+    pgjdbc's `DatabaseMetaDataTest::types` asserts a fixed list of 38 names is
+    present. Four were absent: `char`, `json`, `pg_lsn` and `txid_snapshot`.
+
+    `char` is PostgreSQL's internal ONE-BYTE character type (oid 18) and a
+    different type from `bpchar` / `character(n)` (1042) -- a detail worth
+    pinning, because the names invite conflating them.
+
+    Oids, typarray and typlen all measured against PostgreSQL 14 on 2026-09-27.
+    """
+    res = q(
+        storage,
+        session,
+        "SELECT typname, oid, typarray, typlen FROM pg_type "
+        "WHERE typname IN ('char', 'json', 'pg_lsn', 'txid_snapshot') ORDER BY typname",
+    )
+    assert res.rows == [
+        ("char", 18, 1002, 1),
+        ("json", 114, 199, -1),
+        ("pg_lsn", 3220, 3221, 8),
+        ("txid_snapshot", 2970, 2949, -1),
+    ]
+    # bpchar is a DIFFERENT type from char, and both must be present.
+    res = q(
+        storage,
+        session,
+        "SELECT typname, oid FROM pg_type WHERE typname IN ('char', 'bpchar') ORDER BY typname",
+    )
+    assert res.rows == [("bpchar", 1042), ("char", 18)]
+
+
 def test_pg_type_typlen(storage, session):
     """`pg_type.typlen`, including the `name` row pgjdbc needs to connect well.
 
