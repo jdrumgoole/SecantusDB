@@ -3650,6 +3650,19 @@ all match, and so do CREATE INDEX / VIEW and their error surface. What is open:
       binds it. So a user writing the dangling pattern literally gets an empty
       result where PostgreSQL would error. Strictly better than before, when we
       MATCHED in both cases, but still a divergence.
+- [ ] **A `json` column reports atttypid 3802 (`jsonb`), not 114 (`json`).**
+      The two are distinct types in PostgreSQL — `json` keeps its text verbatim
+      (key order, whitespace, duplicate keys), `jsonb` normalises — and this
+      server folds `json` onto the `jsonb` tag. So `CREATE TABLE t (j json)`
+      reports a jsonb column (measured 2026-09-27).
+      The machinery for the distinction partly exists: a column already carries
+      a `json_plain` flag derived from the declared `(114, -1)` identity, and
+      `_decl_identity` deliberately returns `{}` for it. The declared-char-type
+      slice (#1511) is the shape of the fix — report the DECLARED oid — but the
+      value semantics (verbatim vs normalised) are the harder half and a
+      reported 114 over jsonb storage would be a new kind of lie. The
+      `pg_type` row for `json` (114) is present and correct as of 2026-09-27;
+      only the column identity is wrong.
 - [ ] **`getProcedureColumns` returns nothing for a schema's PROCEDURE.**
       pgjdbc's `getProceduresWithCorrectCatalogAndWithout` asserts
       `getProcedureColumns(null, 'hasprocedures', null, null)` yields 1 row for
