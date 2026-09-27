@@ -10033,6 +10033,27 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                     and "ResumableChangeStreamError" not in labels
                 ):
                     labels.append("ResumableChangeStreamError")
+                # A failpoint-injected error inside a transaction gets the same
+                # ``TransientTransactionError`` treatment a real one does. The
+                # labelling already existed in ``_finish_txn_statement`` -- this
+                # short-circuit simply never reached it, because it returns
+                # before the handler runs and before ``txn`` is even resolved.
+                # That is why the driver specs' error-label tests saw
+                # ``errorLabels: []``: every one of them injects its error with
+                # ``failCommand``, so every one of them took this path.
+                #
+                # ``autocommit: false`` is the signal mongod itself uses -- the
+                # driver sends it on every statement of a transaction, commit and
+                # abort included -- so it works here without moving the failpoint
+                # check below the transaction resolution, which would reorder
+                # failpoint-vs-transaction error precedence with no probe to say
+                # which mongod prefers.
+                if (
+                    doc.get("autocommit") is False
+                    and match.error_code in _TRANSIENT_TXN_CODES
+                    and TRANSIENT_LABEL not in labels
+                ):
+                    labels.append(TRANSIENT_LABEL)
                 if labels:
                     result["errorLabels"] = labels
                 return result

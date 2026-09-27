@@ -2895,6 +2895,8 @@ pain point again:
 These are explicit non-goals. Don't add them without a reason.
 
 - **Real replica sets / sharding** — depend on cluster topology and cross-node consistency. SecantusDB advertises `setName: "secantus"` to satisfy pymongo's change-stream topology check, but the topology is fictional — there are no other members, no elections, no cross-node oplog. Change streams are still in scope (single-node, oplog-backed); see `## 3. Deferred work / Change-stream limitations`.
+
+    **Reading from a secondary is part of that non-goal** (decided 2026-09-27). There is no secondary to read from, so anything whose behaviour is defined by one is out of scope, not deferred. Three driver-gauge tests fail permanently on this and are accepted rather than tracked: `test_transactions_unified.py::TestUnifiedReadPref::test_secondary_readPreference` and the two `TestUnifiedRunCommand` read-preference cases (`test_run_command_fails_with_explicit_secondary_read_preference`, `test_run_command_fails_with_secondary_read_preference`). A permanently-red gauge test with a reason written down beats one quietly deselected — the pymongo pass rate carries the cost honestly.
 - ~~Authentication (SCRAM-SHA-256)~~ — implemented. `--auth` (CLI) / `require_auth=True` (constructor) gates non-handshake commands behind a successful `saslStart`/`saslContinue` round-trip. Provision users via `createUser`; manage with `dropUser` / `usersInfo`. The remaining auth gaps are tracked under `## 3. Deferred work / Authentication` below.
 - ~~TLS / SSL~~ — implemented in b21+b22. `[tls] cert_file` + `[tls] key_file` enable server-side TLS; `[tls] ca_file` + `[tls] require_client_cert` add mTLS (transport-layer client verification). MONGODB-X509 cert-as-username auth landed in a later slice (see `docs/authentication.md`).
 - **`OP_COMPRESSED`** — compression negotiation. Clients can be told the server doesn't support compression; nothing to do.
@@ -2944,22 +2946,25 @@ These are explicit non-goals. Don't add them without a reason.
       8.2.11 for the exact `errmsg` and the command allowlist before fixing, and
       land it in both servers.
 
-- [ ] **OPEN — multi-document transaction error LABELS are wrong, and the tests
-      are no longer skipped (2026-09-27).** Nine pymongo failures in
-      `test_transactions_unified.py`, all about labels rather than about
-      transactions working: `TransientTransactionError` retry after
-      `commitTransaction` (LockTimeout / NoSuchTransaction / SnapshotUnavailable /
-      WriteConflict / PreparedTransactionInProgress),
-      `TestUnifiedErrorLabels` for `NoSuchTransaction` and `WriteConflict`, and
-      `TestUnifiedRetryableCommit::test_commitTransaction_fails_after_Interrupted`.
+- [ ] **OPEN — two `test_transactions_unified` retry-semantics failures, and the
+      two codes want OPPOSITE treatment (2026-09-27).** The label half of this is
+      FIXED (a failpoint-injected error inside a transaction now carries
+      `TransientTransactionError`, closing all of `TestUnifiedErrorLabels`), and
+      the three secondary-read failures are now an explicit non-goal in section 4.
+      What is left:
 
-      These were **topology-skipped until this release** — the `validate-all` run
-      that found them saw pymongo's skips fall 424 -> 290 on an unchanged total of
-      1500, so 134 tests began executing and 124 of them pass. That is why the
-      headline rate moved 99.5% -> 98.7% while coverage went UP; do not read the
-      rate alone. The single-node scope does not excuse these: the labels are a
-      per-error contract a driver's retry loop reads, and we advertise a
-      replica-set primary specifically so that loop engages.
+      * `TestUnifiedRetryableCommit::test_commitTransaction_fails_after_Interrupted`
+        — code 11601 `Interrupted`. The test expects the commit to **fail**.
+      * `TestUnifiedCommitTransienttransactionerror_4_2::test_transaction_is_retried_after_commitTransaction_TransientTransactionError_(PreparedTransactionInProgress)`
+        — code 267. The test expects the transaction to be **retried**.
+
+      Both codes sit outside `_TRANSIENT_TXN_CODES` (which holds 11600 and 11602
+      but not 11601). **Do not just add them.** One wants retry and one wants
+      failure, so the set is the wrong lever for at least one of the two, and a
+      change that makes one green will make the other red. Probe a single-node
+      REPLICA SET mongod — transactions need one, so a standalone cannot answer
+      this — for the labels it returns per code on `commitTransaction`, and size
+      the fix from that rather than from the test names.
 
 - **Driver unified-spec coverage audit (2026-09-25, Python server `0.6.0b16`,
   pymongo tests `f2103a95`, go-driver `fd85a834`).** Measured by running every
