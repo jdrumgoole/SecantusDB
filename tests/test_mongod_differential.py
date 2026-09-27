@@ -3572,3 +3572,86 @@ def test_timestamp_local_render_matches_mongod(
         assert ours == expected, (
             f"TZ={tz or '<unset>'} Timestamp({secs}, {inc}): mongod={expected!r} {engine}={ours!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# apiStrict / Stable API Version 1
+# ---------------------------------------------------------------------------
+
+#: `(label, command)` pairs sent under ``serverApi={version: 1, strict: true}``.
+#: Deliberately WITHOUT ``testVersion2``: that one is a mongod test-only command
+#: gated behind ``enableTestCommands``, so a fixture mongod without it answers 59
+#: where one with it answers 323 — the gate would then be asserting the fixture's
+#: configuration rather than our conformance. The driver-spec gauge covers it.
+API_STRICT_CASES = [
+    # In API Version 1 — must run.
+    ("v1-find", {"find": "apistrict"}),
+    ("v1-count", {"count": "apistrict"}),
+    ("v1-ping", {"ping": 1}),
+    ("v1-listIndexes", {"listIndexes": "apistrict"}),
+    # Present but OUTSIDE v1 — must be 323 APIStrictError. Every one of these
+    # was measured, not assumed: `distinct` and `buildInfo` being outside the
+    # Stable API while `count` is inside it is the kind of thing a reading of
+    # the manual gets wrong.
+    ("nonv1-distinct", {"distinct": "apistrict", "key": "a"}),
+    ("nonv1-buildInfo", {"buildInfo": 1}),
+    ("nonv1-isMaster", {"isMaster": 1}),
+    ("nonv1-serverStatus", {"serverStatus": 1}),
+    ("nonv1-getParameter", {"getParameter": 1, "featureCompatibilityVersion": 1}),
+    # Not a command at all — must stay 59 CommandNotFound even under apiStrict.
+    ("absent", {"definitelyNotACommandAnywhere": 1}),
+    # A stage outside v1 inside an otherwise-allowed aggregate.
+    (
+        "nonv1-stage",
+        {"aggregate": 1, "pipeline": [{"$listLocalSessions": {}}], "cursor": {}},
+    ),
+]
+
+
+@requires_mongod
+@pytest.mark.parametrize("label,command", API_STRICT_CASES, ids=[c[0] for c in API_STRICT_CASES])
+def test_api_strict_matches_mongod(
+    label, command, secantus_uri: str, mongod_uri: str, mongod_version: tuple[int, int]
+) -> None:
+    """``apiStrict: true`` must answer exactly what mongod answers.
+
+    Three branches, all measured against 8.2.11 (2026-09-27) rather than read
+    off the spec, because the spec text implies two:
+
+      * a command the server HAS, outside v1  -> 323 APIStrictError
+      * a command in v1                       -> runs
+      * a command that does not exist at all  -> 59 CommandNotFound
+
+    The third is the one that bites: it means the check cannot simply reject
+    everything it does not recognise.
+    """
+    from pymongo import MongoClient
+    from pymongo.server_api import ServerApi
+
+    if mongod_version[0] != PROBED_MONGOD_MAJOR:
+        found = ".".join(str(p) for p in mongod_version)
+        pytest.skip(
+            f"gate asserts an exact match against mongod {PROBED_MONGOD_MAJOR}.x; found {found}"
+        )
+
+    def answer(uri: str) -> tuple[object, object, str]:
+        client = MongoClient(
+            uri, server_api=ServerApi("1", strict=True), serverSelectionTimeoutMS=10000
+        )
+        try:
+            client.apistrictdb.command(command)
+            return ("OK", None, "")
+        except Exception as exc:  # noqa: BLE001 - comparing the error IS the test
+            details = getattr(exc, "details", {}) or {}
+            return (details.get("codeName"), details.get("code"), details.get("errmsg") or "")
+        finally:
+            client.close()
+
+    mine = answer(secantus_uri)
+    theirs = answer(mongod_uri)
+    assert mine[:2] == theirs[:2], f"{label}: secantus={mine[:2]} mongod={theirs[:2]}"
+    # The message matters: the spec asserts on a substring of it, and drivers
+    # surface it to users verbatim.
+    assert mine[2] == theirs[2], (
+        f"{label} errmsg:\n  secantus={mine[2]!r}\n  mongod  ={theirs[2]!r}"
+    )

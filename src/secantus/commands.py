@@ -212,6 +212,10 @@ _ERROR_CODE_NAMES: dict[int, str] = {
     # written as a literal said `Location241` where mongod says
     # `ConversionFailure` (measured 8.2.11, 2026-09-19).
     241: "ConversionFailure",
+    # `apiStrict: true` against a command outside Stable API Version 1 -- see
+    # `_require_api_version_1`. In the table as well as inline so a handler that
+    # raises 323 directly still renders the name.
+    323: "APIStrictError",
 }
 
 
@@ -9415,7 +9419,6 @@ _API_V1_COMMANDS = frozenset(
 # ``listLocalSessions`` (handshake-adjacent admin commands drivers
 # call on startup), and other internal-but-non-v1 names that aren't
 # the spec's target.
-_API_V1_REJECTED_BY_NAME = frozenset({"distinct"})
 
 
 # Driver tests probe with ``$listLocalSessions`` / ``$listSessions``
@@ -9649,6 +9652,115 @@ def _finish_txn_statement(ctx: CommandContext, txn: Transaction, result: dict[st
             labels.append(TRANSIENT_LABEL)
 
 
+#: The commands in MongoDB's **Stable API Version 1**, measured by sending each
+#: command SecantusDB implements to a real ``mongod`` 8.2.11 under
+#: ``apiStrict: true`` and recording which ones it refused with 323 (2026-09-27).
+#: Measured rather than copied from the manual, because the surprises are the
+#: point: ``distinct``, ``buildInfo``, ``isMaster`` and ``serverStatus`` are all
+#: OUTSIDE v1, while ``hello`` is inside it.
+_API_V1_COMMANDS = frozenset(
+    {
+        "abortTransaction",
+        "aggregate",
+        "authenticate",
+        "bulkWrite",
+        "collMod",
+        "collStats",
+        "commitTransaction",
+        "count",
+        "create",
+        "createIndexes",
+        "createRole",
+        "createSearchIndexes",
+        "createUser",
+        "delete",
+        "drop",
+        "dropDatabase",
+        "dropIndexes",
+        "dropRole",
+        "dropSearchIndex",
+        "dropUser",
+        "endSessions",
+        "explain",
+        "find",
+        "findAndModify",
+        "findandmodify",
+        "getMore",
+        "grantPrivilegesToRole",
+        "grantRolesToRole",
+        "grantRolesToUser",
+        "hello",
+        "insert",
+        "killCursors",
+        "listCollections",
+        "listDatabases",
+        "listIndexes",
+        "ping",
+        "refreshSessions",
+        "renameCollection",
+        "revokePrivilegesFromRole",
+        "revokeRolesFromRole",
+        "revokeRolesFromUser",
+        "saslContinue",
+        "saslStart",
+        "update",
+        "updateRole",
+        "updateSearchIndex",
+        "updateUser",
+    }
+)
+
+#: Commands a real ``mongod`` HAS but SecantusDB does not implement, which are
+#: outside API Version 1. Needed because the ordering matters: ``apiStrict``
+#: rejects a command mongod RECOGNISES with 323, while a command it has never
+#: heard of still answers 59 CommandNotFound. Without this set, the spec's
+#: ``testVersion2`` case would get 59 -- the right answer for a command nobody
+#: has, and the wrong one for a command mongod has outside the API.
+_NON_V1_MONGOD_COMMANDS = frozenset({"testVersion2", "testDeprecationInVersion2"})
+
+#: mongod's own wording, quoted from 8.2.11 (2026-09-27). The dochub link is
+#: part of the message the driver surfaces, so it is reproduced verbatim.
+_API_STRICT_ERRMSG = (
+    "Provided apiStrict:true, but the command {name} is not in API Version 1. "
+    "Information on supported commands and migrations in API Version 1 can be "
+    "found at https://dochub.mongodb.org/core/manual-versioned-api."
+)
+
+
+def _require_api_version_1(doc: dict[str, Any], name: str) -> dict[str, Any] | None:
+    """Reject a non-v1 command when the client declared ``apiStrict: true``.
+
+    Measured against ``mongod`` 8.2.11 (2026-09-27), which has THREE branches
+    rather than the two a reading of the spec suggests:
+
+      * a command it has, outside v1 (``testVersion2``, ``mapReduce``) -> 323
+      * a command in v1 (``find``, ``createIndexes``)                  -> runs
+      * a command it does NOT have                                     -> 59
+
+    That last one is why this sits above the handler lookup but still defers to
+    it: ``{definitelyNotACommand: 1}`` answers 59 under ``apiStrict`` exactly as
+    it does without it.
+
+    NOT probed: whether this wins over authorization when auth is enabled. The
+    neighbouring ``maxTimeMS`` check documents its own auth ordering from a
+    probe; this one has no such evidence and is placed to match ``maxTimeMS``
+    (above auth) rather than on a guess dressed up as a measurement.
+    """
+    if doc.get("apiStrict") is not True or doc.get("apiVersion") != "1":
+        return None
+    if name in _API_V1_COMMANDS:
+        return None
+    if name not in _HANDLERS and name not in _NON_V1_MONGOD_COMMANDS:
+        # mongod has never heard of it either -- CommandNotFound wins.
+        return None
+    return {
+        "ok": 0.0,
+        "errmsg": _API_STRICT_ERRMSG.format(name=name),
+        "code": 323,
+        "codeName": "APIStrictError",
+    }
+
+
 def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     name = command_name(doc)
     # Database-name length limit. mongod rejects any namespace whose
@@ -9730,42 +9842,35 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "codeName": "APIVersionError",
         }
     # ``apiStrict: true`` narrows the allowed surface to the Stable API
-    # contract. Two gates:
+    # contract. The COMMAND-NAME gate lives in ``_require_api_version_1``
+    # above the handler lookup, because it has to fire for a command mongod
+    # has and we do not (``testVersion2``) while still letting a genuinely
+    # unknown command fall through to 59. What remains here is the
+    # aggregation-stage gate: a pipeline stage outside ``_API_V1_AGG_STAGES``
+    # inside an otherwise-allowed ``aggregate``. Drivers probe that with
+    # ``$listLocalSessions``.
     #
-    # * Command-name gate (narrow): reject only the small set in
-    #   ``_API_V1_REJECTED_BY_NAME`` (currently ``distinct``). The
-    #   spec's ``crud-api-version-1-strict.yml`` asserts this rejection
-    #   for ``distinct``; mirroring it makes the test pass. The full
-    #   whitelist invert is intentionally NOT enabled — it'd reject
-    #   ``count`` (used internally by ``estimatedDocumentCount``) and
-    #   a handful of internal admin commands.
-    # * Aggregation-stage gate: reject pipeline stages outside
-    #   ``_API_V1_AGG_STAGES``. Lights up ``versioned-api/aggregate on
-    #   database`` (probes with ``$listLocalSessions``).
-    if doc.get("apiStrict"):
-        if name in _API_V1_REJECTED_BY_NAME:
-            return {
-                "ok": 0.0,
-                "errmsg": f"Provided command {name} is not in API Version 1",
-                "code": 323,
-                "codeName": "APIStrictError",
-            }
-        if name == "aggregate":
-            pipeline = doc.get("pipeline") or []
-            if isinstance(pipeline, list):
-                for stage in pipeline:
-                    if isinstance(stage, Mapping):
-                        stage_name = next(iter(stage), "")
-                        if stage_name and stage_name not in _API_V1_AGG_STAGES:
-                            return {
-                                "ok": 0.0,
-                                "errmsg": (
-                                    f"Provided aggregation pipeline stage "
-                                    f"{stage_name} is not in API Version 1"
-                                ),
-                                "code": 323,
-                                "codeName": "APIStrictError",
-                            }
+    # This block used to carry a second, narrower command gate of its own
+    # (``_API_V1_REJECTED_BY_NAME``, just ``distinct``) whose comment said a
+    # full allowlist "would reject ``count``". Probing mongod 8.2.11 settled
+    # that: ``count`` IS in API Version 1, so the objection was a guess. The
+    # narrow gate is gone; one mechanism now, with a measured allowlist.
+    if doc.get("apiStrict") and name == "aggregate":
+        pipeline = doc.get("pipeline") or []
+        if isinstance(pipeline, list):
+            for stage in pipeline:
+                if isinstance(stage, Mapping):
+                    stage_name = next(iter(stage), "")
+                    if stage_name and stage_name not in _API_V1_AGG_STAGES:
+                        return {
+                            "ok": 0.0,
+                            "errmsg": (
+                                f"{stage_name} is not allowed with "
+                                f"'apiStrict: true' in API Version 1"
+                            ),
+                            "code": 323,
+                            "codeName": "APIStrictError",
+                        }
     # Count every dispatched command — even unknown / unauth-rejected
     # ones — so serverStatus.network.numRequests reflects raw wire
     # traffic, not just the successful subset. Mongod's accounting is
@@ -9783,6 +9888,9 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
         lsid = _lsid_bytes_from_arg(doc.get("lsid"))
         if lsid is not None:
             ctx.sessions.register(lsid)
+    _err = _require_api_version_1(doc, name)
+    if _err is not None:
+        return _err
     handler = _HANDLERS.get(name)
     if handler is None:
         return {

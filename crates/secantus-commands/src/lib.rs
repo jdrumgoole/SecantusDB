@@ -1840,13 +1840,27 @@ fn validate_api(doc: &Document, name: &str) -> Result<(), CommandError> {
         }
     }
     if doc.get("apiStrict").and_then(Bson::as_bool) == Some(true) {
-        // `distinct` is the canary command rejected under apiStrict (mirrors
-        // commands.py's narrow `_API_V1_REJECTED_BY_NAME`).
-        if name == "distinct" {
+        // Command-name gate. Measured against mongod 8.2.11 (2026-09-27), which
+        // has THREE branches, not two:
+        //
+        //   * a command it HAS, outside v1 (`testVersion2`, `distinct`) -> 323
+        //   * a command in v1 (`find`, `count`)                         -> runs
+        //   * a command it does NOT have                                -> 59
+        //
+        // so an unrecognised name deliberately falls through to `lookup`'s
+        // CommandNotFound below. This replaced a `name == "distinct"` canary
+        // whose message ("Provided command ... is not in API Version 1") was
+        // not mongod's either.
+        if !api_v1_command(name) && (lookup(name).is_some() || non_v1_mongod_command(name)) {
             return Err(CommandError::new(
                 323,
                 "APIStrictError",
-                format!("Provided command {name} is not in API Version 1"),
+                format!(
+                    "Provided apiStrict:true, but the command {name} is not in API \
+                     Version 1. Information on supported commands and migrations in \
+                     API Version 1 can be found at \
+                     https://dochub.mongodb.org/core/manual-versioned-api."
+                ),
             ));
         }
         // An aggregate whose pipeline uses a stage outside API Version 1 (e.g.
@@ -1861,7 +1875,7 @@ fn validate_api(doc: &Document, name: &str) -> Result<(), CommandError> {
                                 323,
                                 "APIStrictError",
                                 format!(
-                                    "Provided aggregation pipeline stage {s} is not in API Version 1"
+                                    "{s} is not allowed with 'apiStrict: true' in API Version 1"
                                 ),
                             ));
                         }
@@ -1871,6 +1885,73 @@ fn validate_api(doc: &Document, name: &str) -> Result<(), CommandError> {
         }
     }
     Ok(())
+}
+
+/// Commands inside MongoDB's **Stable API Version 1**, measured by sending each
+/// command the Python server implements to a real `mongod` 8.2.11 under
+/// `apiStrict: true` and recording which it refused with 323 (2026-09-27).
+/// Mirrors `commands.py::_API_V1_COMMANDS`. The surprises are why it was
+/// measured and not copied: `distinct`, `buildInfo`, `isMaster` and
+/// `serverStatus` are OUTSIDE v1, while `hello` and `count` are inside it.
+fn api_v1_command(name: &str) -> bool {
+    matches!(
+        name,
+        "abortTransaction"
+            | "aggregate"
+            | "authenticate"
+            | "bulkWrite"
+            | "collMod"
+            | "collStats"
+            | "commitTransaction"
+            | "count"
+            | "create"
+            | "createIndexes"
+            | "createRole"
+            | "createSearchIndexes"
+            | "createUser"
+            | "delete"
+            | "drop"
+            | "dropDatabase"
+            | "dropIndexes"
+            | "dropRole"
+            | "dropSearchIndex"
+            | "dropUser"
+            | "endSessions"
+            | "explain"
+            | "find"
+            | "findAndModify"
+            | "findandmodify"
+            | "getMore"
+            | "grantPrivilegesToRole"
+            | "grantRolesToRole"
+            | "grantRolesToUser"
+            | "hello"
+            | "insert"
+            | "killCursors"
+            | "listCollections"
+            | "listDatabases"
+            | "listIndexes"
+            | "ping"
+            | "refreshSessions"
+            | "renameCollection"
+            | "revokePrivilegesFromRole"
+            | "revokeRolesFromRole"
+            | "revokeRolesFromUser"
+            | "saslContinue"
+            | "saslStart"
+            | "update"
+            | "updateRole"
+            | "updateSearchIndex"
+            | "updateUser"
+    )
+}
+
+/// Commands a real `mongod` HAS but this server does not implement, which sit
+/// outside API Version 1. Without these, the driver specs' `testVersion2` case
+/// would answer 59 -- correct for a command nobody has, wrong for one mongod has
+/// outside the API. Mirrors `commands.py::_NON_V1_MONGOD_COMMANDS`.
+fn non_v1_mongod_command(name: &str) -> bool {
+    matches!(name, "testVersion2" | "testDeprecationInVersion2")
 }
 
 /// Aggregation stages inside API Version 1 (`commands.py::_API_V1_AGG_STAGES`).
