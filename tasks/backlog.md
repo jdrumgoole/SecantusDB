@@ -2902,12 +2902,33 @@ These are explicit non-goals. Don't add them without a reason.
 - **Geo — complete and shipped.** Operators (`$geoWithin` / `$geoIntersects` / `$near` / `$nearSphere`) + `$geoNear` aggregation stage (auto-infer `key`, `includeLocs`), `2dsphere` (S2 cell coverings + ancestors) and `2d` (bit-interleaved geohash with quadtree-decomposed Z-order range covering) index acceleration, compound geo+scalar indexes (geo cell scan + verifier-step filter on trailing scalars), legacy mongod sibling-form `$maxDistance` / `$minDistance` for `$near` / `$nearSphere`, and write-time input validation (out-of-range coordinates / unparseable shapes reject with mongod's documented code 16572 across insert / update / upsert / createIndex). See `src/secantus/geo.py` + `src/secantus/geo_index.py`. **Validation surface**: 79 in-tree pymongo tests in `tests/test_geo*.py`; 3 cross-driver smoke tests through mongosh, mongo-node-driver, and mongo-go-driver in `tests/test_geo_cross_driver.py` (all pass — wire-protocol geo path is clean across drivers); the pymongo conformance gauge keeps `test_collection.py`'s built-in geo tests at 100%; mongo-java-driver's `GeoJsonFiltersFunctionalSpecification` + `GeoFiltersFunctionalSpecification` upstream specs both pass 10/10 in the java gauge's `:driver-core:test` module. **Out of scope**: exact mongod error-string matching (chase work without a clear payoff unless a driver test pins exact wording).
 - **`$where`** — runs JavaScript. We don't ship a JS runtime.
 - **`$function`, `$accumulator`** (aggregation expressions) — same reason: both evaluate user-supplied JavaScript and need an embedded JS engine + sandbox + BSON↔JS shim layer. Would also require a `--javascriptEnabled` gate (mongod gates JS behind this; many prod deployments disable it). Adding the runtime would let us implement these three operators + `mapReduce` together for ~600–1000 LOC + a heavyweight binary dep (PythonMonkey / QuickJS / V8 — each with maintenance trade-offs). Most pipelines that reach for `$function` can be expressed in the existing aggregation expression library — `$cond` / `$switch` / `$let` / `$map` / `$reduce` / `$filter` / `$regexFind` / `$concat` / `$substrCP` / `$dateToString` / etc. — which is more expressive than people often realise. **`lang: "python"` as a SecantusDB extension was considered and rejected (May 2026)**: would break the conformance contract (CLAUDE.md "pymongo cannot tell SecantusDB apart from mongod" — pipelines that work locally would explode in production with `Unrecognized lang value: 'python'`), and CPython's sandboxing story is actually worse than embedded JS engines (no per-context isolation primitives, no reliable cross-platform CPU-time interrupt, `RestrictedPython` is an AST rewriter not a true sandbox). If a real user need ever surfaces, the right escape hatch is a server-side trusted-plugin registry — `{$secantusFunction: {name: "<pre-registered>", args: [...]}}` — not user code at query time.
-- **`mapReduce`** — same JS-runtime dependency as `$where` / `$function` / `$accumulator`. Also explicitly deprecated by MongoDB (removed from the Stable API in 5.0; recommended migration path is aggregation pipelines). `commands._map_reduce` recognises the canonical `emit(this.<field>, 1)` + `values.length` "count by field" pattern (the shape mongo-java-driver's `testMapReduceWithGenerics` test exercises) and translates it to an equivalent `$group` aggregation. Non-canonical map / reduce bodies return `{results: [], ok: 1}` so wire-shape probes pass, and `out: "<coll>"` (non-inline) is rejected with FailedToParse. Anything that genuinely needs JS evaluation needs a real `mongod`.
+- **`mapReduce`** — same JS-runtime dependency as `$where` / `$function` / `$accumulator`. Also explicitly deprecated by MongoDB (removed from the Stable API in 5.0; recommended migration path is aggregation pipelines). **WILL NOT BUILD** (decided 2026-09-27). `commands._map_reduce` recognises the canonical `emit(this.<field>, 1)` + `values.length` "count by field" pattern and translates it to an equivalent `$group` aggregation; non-canonical map / reduce bodies return `{results: [], ok: 1}` so wire-shape probes pass, and `out: "<coll>"` (non-inline) is rejected with FailedToParse 9 (`mapReduce on this server only supports {out: {inline: 1}}`). Anything that genuinely needs JS evaluation needs a real `mongod`.
+
+    This entry used to claim the canonical translation covered "the shape mongo-java-driver's `testMapReduceWithGenerics` test exercises". It does not: that test writes to a NAMED output collection, which is the branch we refuse, so the claim was wrong in the one place it named a specific test. Probed 2026-09-27 — the inline canonical form does work and returns the right counts; only `out: "<coll>"` fails. The full `validate-all` of that day therefore shows `testMapReduceWithGenerics` FAILING in the Java gauge, and that failure is accepted rather than tracked: supporting it means either a JS runtime or materialising map/reduce output into a collection from a translated pipeline, and MongoDB removed `mapReduce` from the Stable API in 5.0. A permanently-red gauge test with a written reason beats one quietly deselected.
 - ~~Capped collections~~ — implemented. `create capped: true, size, max` accepted; `Storage.insert` and `Storage.update_matching` enforce FIFO eviction by walking the doc table in natural order and evicting oldest non-fresh docs while bounds are exceeded. `listCollections` surfaces `options.{capped,size,max}`. Eviction emits oplog `op:"d"` entries (and pre-images when enabled) so change streams observe the deletes. Both servers now do **true FIFO**: `_enforce_capped_bounds_locked` walks the natural-order index (`_scan_docs_natural`), so the oldest-inserted doc is evicted first regardless of `_id` monotonicity (matching mongod). Rust: beta.92, `scan_docs_natural` — see §7.3.
 - ~~Profiling~~ — implemented. `profile` command (-1 / 0 / 1 / 2 with `slowms` + `sampleRate`) sets per-database state in `secantus_profile_settings`. Dispatch wraps each non-skip command in `time.monotonic_ns` timing; if the per-DB level matches, an entry is inserted into `<db>.system.profile` (auto-created capped 10 MB). Recursion guard skips ops against `system.profile` itself + handshake / cursor-continuation / profile-itself commands. Entry shape mirrors mongod (`ts`, `op`, `ns`, `command`, `millis`, `ok`, `client`, optional `user`, `errMsg` / `errCode` on failure). Out of scope today: `planSummary` / `keysExamined` / `docsExamined` / `nreturned` (would need post-handler stats plumbing).
 - ~~Tailable / awaitData cursors~~ — implemented for change streams (see "In scope" in `CLAUDE.md`) **and** for plain capped collections + `local.oplog.rs` (`commands._find_tailable` / `_find_tailable_oplog`, blocking `getMore` on the oplog condition variable). The producer re-applies the find filter (with `let` vars + collation) to follow-up inserts, advances its watermark by **RecordId** (insertion order — the same order capped eviction uses; an `id_key` watermark dropped and redelivered docs when `_id`s weren't monotonic), and raises `CappedPositionLost` (136) on rollover.
 
 ## 5. Known bugs and edge cases to watch
+
+- [ ] **OPEN — a Java typed-collection round-trip with a custom codec registry
+      fails, and it is NOT mapReduce (2026-09-27).**
+      `com.mongodb.client.MongoCollectionTest#shouldBeAbleToQueryTypedCollectionAndMapResultsIntoTypedLists`
+      fails in the Java gauge. It arrived in the same `validate-all` as the
+      `mapReduce` failure and in the same test class, which is why the first
+      write-up lumped the two together — but reading the source
+      (`AbstractMongoCollectionTest.java`) shows it does no map/reduce at all: it
+      builds a `MongoCollection<Concrete>` with a custom `CodecRegistry`
+      (`ValueCodecProvider` + `DocumentCodecProvider` + `BsonValueCodecProvider` +
+      `ConcreteCodecProvider`), inserts two POJOs and queries them back into a
+      typed list. So the `mapReduce` out-of-scope decision does NOT cover it.
+
+      Undiagnosed. Not yet reproduced outside the gauge, and no `mongod` probe
+      yet, so there is no claim here about what is wrong — only that the failure
+      is real, is not the documented load flake, and is not explained by the
+      neighbouring decision. Reproduce it before sizing it: the Java include set
+      widened to `driver-sync` since these were last measured, so it may be newly
+      reached rather than newly broken.
 
 - [ ] **OPEN — `apiStrict: true` does not reject a command outside the Stable
       API, and TWO drivers independently say so (2026-09-27).** A full
@@ -2939,15 +2960,6 @@ These are explicit non-goals. Don't add them without a reason.
       rate alone. The single-node scope does not excuse these: the labels are a
       per-error contract a driver's retry loop reads, and we advertise a
       replica-set primary specifically so that loop engages.
-
-- [ ] **OPEN — `mapReduce` is not supported, and the Java gauge now reaches it
-      (2026-09-27).** `com.mongodb.client.MongoCollectionTest#testMapReduceWithGenerics`
-      and `#shouldBeAbleToQueryTypedCollectionAndMapResultsIntoTypedLists` fail.
-      The Java include set has widened to `driver-sync` since these were last
-      measured, so these are integration tests rather than the bson unit set.
-      `mapReduce` is deprecated in `mongod` 5.0+ and may belong in section 4
-      (out of scope) rather than here — decide which before spending on it, but
-      decide rather than leaving it as an unexplained gauge failure.
 
 - **Driver unified-spec coverage audit (2026-09-25, Python server `0.6.0b16`,
   pymongo tests `f2103a95`, go-driver `fd85a834`).** Measured by running every
