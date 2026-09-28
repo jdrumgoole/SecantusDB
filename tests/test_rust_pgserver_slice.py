@@ -10801,3 +10801,77 @@ def test_case_nests_inside_a_function(home: Path) -> None:
         cur = conn.cursor()
         cur.execute("select upper(case when n=1 then 'x' else 'y' end) from p order by n")
         assert cur.fetchall() == [("X",), ("Y",), ("Y",), ("Y",)]
+
+
+# --------------------------------------------------------------------------- #
+# `ORDER BY` over an expression, and a WHERE that does not lower to MQL.
+#
+# Both were `0A000`. Measured against PostgreSQL 14.13.
+# --------------------------------------------------------------------------- #
+
+
+def _expr_table(conn) -> None:
+    cur = conn.cursor()
+    cur.execute("create table e (a text, n int)")
+    cur.execute("insert into e values ('abc',1),('ABC',2),(null,3)")
+
+
+def test_order_by_a_computed_expression(home: Path) -> None:
+    """The expression is materialised per row into a synthetic field, so the
+    sort stays one comparison routine rather than growing a second path."""
+    with _Server(home) as server, server.connect() as conn:
+        _expr_table(conn)
+        cur = conn.cursor()
+        cur.execute("select n from e order by n * -1")
+        assert cur.fetchall() == [(3,), (2,), (1,)]
+        cur.execute("select n from e order by upper(a) nulls last")
+        assert cur.fetchall() == [(2,), (1,), (3,)]
+
+
+def test_order_by_two_expressions_do_not_collide(home: Path) -> None:
+    """Synthetic sort fields are named by POSITION, so two of them differ."""
+    with _Server(home) as server, server.connect() as conn:
+        _expr_table(conn)
+        cur = conn.cursor()
+        cur.execute("select n from e order by upper(a) nulls last, n * -1")
+        assert cur.fetchall() == [(2,), (1,), (3,)]
+
+
+def test_a_where_that_does_not_lower_becomes_a_residual(home: Path) -> None:
+    """`where (case ... end)` has no MQL form, so it is evaluated per row."""
+    with _Server(home) as server, server.connect() as conn:
+        _expr_table(conn)
+        cur = conn.cursor()
+        cur.execute("select n from e where (case when n > 1 then true else false end) order by n")
+        assert cur.fetchall() == [(2,), (3,)]
+
+
+def test_a_residual_keeps_only_true(home: Path) -> None:
+    """SQL's three-valued logic: a NULL predicate excludes the row, as a
+    lowered filter would — not the `NULL is falsey so keep it` mistake."""
+    with _Server(home) as server, server.connect() as conn:
+        _expr_table(conn)
+        cur = conn.cursor()
+        cur.execute(
+            "select n from e where (case when a is null then null else true end) order by n"
+        )
+        assert cur.fetchall() == [(1,), (2,)]
+
+
+def test_the_residual_fallback_does_not_swallow_real_errors(home: Path) -> None:
+    """Only `Unsupported` falls back to a residual.
+
+    An undefined column stays `42703`, including INSIDE a CASE predicate —
+    otherwise a typo would become a silent full scan that returns nothing,
+    trading a loud error for a wrong answer.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        _expr_table(conn)
+        cur = conn.cursor()
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute("select * from e where nosuchcol = 1")
+        assert info.value.sqlstate == "42703"
+        conn.rollback()
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute("select * from e where (case when nosuchcol=1 then true else false end)")
+        assert info.value.sqlstate == "42703"

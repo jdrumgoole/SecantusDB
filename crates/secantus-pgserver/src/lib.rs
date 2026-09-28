@@ -7960,7 +7960,21 @@ impl PgHandler {
             docs = kept;
         }
 
+        // A WHERE that could not lower to an MQL filter is applied here, per
+        // row. Only TRUE keeps a row, so SQL's three-valued logic falls out:
+        // a NULL result excludes the row exactly as PostgreSQL does.
+        if let Some(residual) = sel.residual.as_ref() {
+            let mut kept = Vec::with_capacity(docs.len());
+            for d in docs {
+                let v = secantus_pgplan::apply_row_expr(residual, &d).map_err(|e| Self::err(&e))?;
+                if v == Bson::Boolean(true) {
+                    kept.push(d);
+                }
+            }
+            docs = kept;
+        }
         if !sel.order.is_empty() {
+            materialise_order_exprs(&mut docs, &sel.order).map_err(|e| Self::err(&e))?;
             sort_rows(&mut docs, &sel.order);
         }
         // `DISTINCT ON (keys)` keeps one row per key, the FIRST in the sort
@@ -13262,6 +13276,25 @@ fn compute_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
 /// Deliberately NOT pushed into the storage layer's sort: MongoDB orders null
 /// LOW, while PostgreSQL puts NULLs LAST on ASC and FIRST on DESC (probed 14).
 /// Pushing an ASC sort down would silently reorder every nullable column.
+/// Materialise any COMPUTED sort keys into their synthetic fields.
+///
+/// `ORDER BY upper(a)` has no stored field to compare, so the expression is
+/// evaluated once per row into `__orderN` and the comparison below reads that
+/// like any other column — one sort routine rather than two. The extra fields
+/// never reach the client: projection takes the named output columns only.
+fn materialise_order_exprs(docs: &mut [Document], order: &[OrderKey]) -> Result<(), PlanError> {
+    for key in order {
+        let Some(expr) = key.expr.as_ref() else {
+            continue;
+        };
+        for d in docs.iter_mut() {
+            let v = secantus_pgplan::apply_row_expr(expr, d)?;
+            d.insert(key.field.clone(), v);
+        }
+    }
+    Ok(())
+}
+
 fn sort_rows(docs: &mut [Document], order: &[OrderKey]) {
     docs.sort_by(|a, b| {
         for key in order {

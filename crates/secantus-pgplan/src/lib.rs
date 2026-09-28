@@ -597,6 +597,13 @@ pub struct OrderKey {
     pub field: String,
     pub ascending: bool,
     pub nulls: Nulls,
+    /// `ORDER BY` over a COMPUTED expression (`order by n * -1`,
+    /// `order by upper(a)`). The executor evaluates it per row into `field` —
+    /// a synthetic name — just before sorting, so the sort itself stays the
+    /// one comparison routine rather than growing a second path.
+    ///
+    /// `None` is the ordinary case: `field` already names a stored column.
+    pub expr: Option<ColumnExpr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -683,6 +690,14 @@ pub struct Select {
     /// a select list.
     pub casts: Vec<Option<ColumnExpr>>,
     pub filter: Document,
+    /// A predicate that does not lower to an MQL filter -- `where (case ...
+    /// end)`, say. Evaluated per row AFTER the storage filter, so the result
+    /// is correct at the cost of a scan. `None` whenever the whole WHERE
+    /// lowered, which is the ordinary case and is untouched.
+    ///
+    /// SQL's three-valued logic falls out of it: only TRUE keeps a row, so a
+    /// NULL result excludes it exactly as PostgreSQL does.
+    pub residual: Option<ColumnExpr>,
     pub order: Vec<OrderKey>,
     /// `None` = no LIMIT. `LIMIT 0` is a real limit, not an absent one.
     pub limit: Option<i64>,
@@ -3423,6 +3438,7 @@ fn plan_series_select(
             field: series.column.clone(),
             ascending,
             nulls,
+            expr: None,
         });
     }
     let limit = match s.limit_count.as_ref() {
@@ -3457,6 +3473,7 @@ fn plan_series_select(
         columns,
         casts,
         filter,
+        residual: None,
         order,
         limit,
         offset,
@@ -4677,6 +4694,7 @@ fn plan_aggregate_order(
             field,
             ascending,
             nulls,
+            expr: None,
         });
     }
     Ok(keys)
@@ -4741,12 +4759,37 @@ fn plan_select(
 
     let (columns, casts) = plan_table_targets(&s.target_list, &def, params)?;
 
+    // A WHERE that does not lower to an MQL filter -- `where (case ... end)`,
+    // say -- becomes a RESIDUAL evaluated per row instead of a refusal. Only
+    // `Unsupported` falls back: an undefined column or a bad type is a real
+    // error and must stay one, or a typo would become a silent full scan that
+    // quietly returns nothing.
+    let mut residual = None;
     let filter = match s.where_clause.as_ref() {
         None => Document::new(),
-        Some(w) => lower_where(w, &def, params)?,
+        Some(w) => match lower_where(w, &def, params) {
+            Ok(f) => f,
+            Err(Error::Unsupported(_)) => {
+                let fields: Vec<RowField> = def
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.field(), c.pg_type.clone()))
+                    .collect();
+                let mut sample = Document::new();
+                for c in &def.columns {
+                    sample.insert(c.field(), sample_value_for_type(&c.pg_type));
+                }
+                residual = Some(row_column_expr(w, &fields, params, &sample)?);
+                Document::new()
+            }
+            Err(e) => return Err(e),
+        },
     };
 
     let mut order = Vec::new();
+    // Row expressions behind any computed sort keys, indexed by the
+    // `__orderN` synthetic field names that reference them.
+    let mut order_exprs: Vec<ColumnExpr> = Vec::new();
     for item in &s.sort_clause {
         let Some(N::SortBy(sb)) = item.node.as_ref() else {
             return Err(Error::Unsupported("this ORDER BY item".into()));
@@ -4776,9 +4819,28 @@ fn plan_select(
                 def.field_of(&col)
                     .ok_or_else(|| Error::UndefinedColumn(col.clone()))?
             }
-            // ORDER BY over a computed expression still needs machinery this
-            // slice does not have. Refuse, never approximate.
-            _ => return Err(Error::Unsupported("ORDER BY over an expression".into())),
+            // A COMPUTED sort key (`order by n * -1`, `order by upper(a)`).
+            // Planned as a row expression over the table's columns and given a
+            // synthetic field; the executor materialises it per row just
+            // before sorting, so `sort_rows` stays one comparison routine.
+            Some(_) => {
+                let node = sb.node.as_deref().expect("matched Some");
+                let fields: Vec<RowField> = def
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.field(), c.pg_type.clone()))
+                    .collect();
+                let mut sample = Document::new();
+                for c in &def.columns {
+                    sample.insert(c.field(), sample_value_for_type(&c.pg_type));
+                }
+                let expr = row_column_expr(node, &fields, params, &sample)?;
+                // Named by POSITION so two expression keys in one ORDER BY
+                // cannot collide, and prefixed so no real column can.
+                order_exprs.push(expr);
+                format!("__order{}", order_exprs.len() - 1)
+            }
+            None => return Err(Error::Unsupported("an empty ORDER BY key".into())),
         };
         let ascending = match SortByDir::try_from(sb.sortby_dir) {
             Ok(SortByDir::SortbyDesc) => false,
@@ -4793,10 +4855,15 @@ fn plan_select(
             _ if ascending => Nulls::Last,
             _ => Nulls::First,
         };
+        let expr = field
+            .strip_prefix("__order")
+            .and_then(|n| n.parse::<usize>().ok())
+            .map(|i| order_exprs[i].clone());
         order.push(OrderKey {
             field,
             ascending,
             nulls,
+            expr,
         });
     }
 
@@ -4829,6 +4896,7 @@ fn plan_select(
         columns,
         casts,
         filter,
+        residual,
         order,
         limit,
         offset,
@@ -5005,6 +5073,7 @@ fn plan_join_plain_select(
         columns,
         casts,
         filter: Document::new(),
+        residual: None,
         order: Vec::new(),
         limit,
         offset,
@@ -6537,6 +6606,7 @@ fn plan_select_srf(
             field: column.clone(),
             ascending,
             nulls,
+            expr: None,
         });
     }
     let limit = match s.limit_count.as_ref() {
@@ -6576,6 +6646,7 @@ fn plan_select_srf(
         columns: vec![(column.clone(), column)],
         casts: vec![cast],
         filter,
+        residual: None,
         order,
         limit,
         offset,
