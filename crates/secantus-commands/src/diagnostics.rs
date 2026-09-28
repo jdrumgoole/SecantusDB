@@ -16,7 +16,7 @@ use bson::spec::BinarySubtype;
 use bson::{doc, Binary, Bson, Document};
 
 use crate::util::command_error;
-use crate::{CommandContext, HandlerResult, SERVER_VERSION};
+use crate::{CommandContext, HandlerResult, SERVER_VERSION, SERVER_VERSION_ARRAY};
 
 /// `startSession` — mint a logical session id.
 pub fn start_session(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
@@ -184,9 +184,25 @@ pub fn get_parameter(doc: &Document, _ctx: &mut CommandContext) -> HandlerResult
     Ok(out)
 }
 
+/// The `featureCompatibilityVersion` string, derived from the version this
+/// server already advertises rather than written out a second time.
+///
+/// It read `"7.0"` until 2026-09-28 while `buildInfo` reported `8.2.11` — so the
+/// value contradicted the same server's own handshake, not merely mongod.
+/// Measured: a single-node replica-set mongod 8.2.11 answers
+/// `{"version": "8.2"}`, i.e. `<major>.<minor>` of the running binary.
+///
+/// Deriving it is the point. The previous value was a literal, and when the
+/// project retargeted from 6.0 to 8.x every other version surface moved while
+/// this one silently did not. Nothing failed, because the only tests that look
+/// at it assert the KEY is present and never read the value.
+fn feature_compatibility_version() -> String {
+    format!("{}.{}", SERVER_VERSION_ARRAY[0], SERVER_VERSION_ARRAY[1])
+}
+
 fn known_params() -> Document {
     doc! {
-        "featureCompatibilityVersion": { "version": "7.0" },
+        "featureCompatibilityVersion": { "version": feature_compatibility_version() },
         // True because the test commands drivers gate on ARE implemented --
         // `configureFailPoint` above all. pymongo's harness reads this flag and,
         // while it said false, skipped ~1,080 unified-spec failpoint tests
@@ -552,6 +568,19 @@ mod tests {
         assert!(
             reply.get("logLevel").is_none(),
             "only requested param returned"
+        );
+        // Read the VALUE, not just the key. Asserting presence alone is what
+        // let this sit at "7.0" through the retarget to 8.x: mongod 8.2.11
+        // answers major.minor of the running binary, so it must track
+        // SERVER_VERSION_ARRAY and never be a second literal.
+        assert_eq!(
+            reply
+                .get_document("featureCompatibilityVersion")
+                .unwrap()
+                .get_str("version")
+                .unwrap(),
+            format!("{}.{}", SERVER_VERSION_ARRAY[0], SERVER_VERSION_ARRAY[1]),
+            "FCV must be major.minor of the advertised server version"
         );
         // all
         let all = dispatch(&doc! {"getParameter": "*"}, &mut ctx());
