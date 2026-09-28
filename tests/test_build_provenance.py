@@ -15,14 +15,30 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from tools.provenance import (  # noqa: E402
+    REBUILD_PGSERVER_CMD as _REBUILD_PGSERVER_CMD,
+)
+from tools.provenance import (
+    REBUILD_RS_CMD as _REBUILD_RS_CMD,
+)
+from tools.provenance import (
+    REBUILD_SERVER_CMD as _REBUILD_SERVER_CMD,
+)
+from tools.provenance import (
+    binary_staleness,
+    extension_staleness,
+    require_fresh_pgserver,
+    resolve_binary,
+    stale_artifact_message,
+)
+from tools.provenance import (
+    committed_crates_tree as _committed_crates_tree,
+)
+
 from conftest import (  # noqa: E402
     _CORE_CRATES,
-    _REBUILD_PGSERVER_CMD,
-    _REBUILD_RS_CMD,
-    _REBUILD_SERVER_CMD,
-    _committed_crates_tree,
     _committed_source_tree,
-    stale_artifact_message,
     stale_core_message,
 )
 
@@ -235,3 +251,166 @@ def test_the_crates_tree_differs_from_the_core_tree() -> None:
     """
     assert _committed_crates_tree() != _committed_source_tree()
     assert len(_CORE_CRATES) == 2
+
+
+# --------------------------------------------------------------------------- #
+# The check moved out of `conftest.py` on 2026-09-28 so that PROBES, GAUGES and
+# BENCHMARKS can reach it. Before that it ran under pytest and nowhere else,
+# which left the repo's primary bug-finding method — an ad-hoc differential
+# probe — completely unguarded. A probe of `secantusd-pg` duly ran against a
+# binary from a different `crates/` tree, and only a hand-read of `--version`
+# caught it.
+#
+# These pin the part that is easy to regress: the probes must CALL the check.
+# --------------------------------------------------------------------------- #
+
+PROBES = REPO / "tools" / "probes"
+
+
+def test_binary_staleness_abstains_when_the_binary_is_absent() -> None:
+    """A missing build is somebody else's message to write.
+
+    Every caller already has a clearer one ("... is not built -- cargo build"),
+    and a staleness checker that also reports absence makes two different
+    failures share one confusing text.
+    """
+    assert binary_staleness(REPO / "nope" / "secantusd-pg", "secantusd-pg", "./inv x") is None
+
+
+def test_binary_staleness_reports_a_real_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The case it exists for, driven through the binary path rather than the
+    pure message function.
+
+    Both halves are faked because arranging a genuinely stale binary means
+    building one — and the first attempt to verify this by pointing a fresh
+    binary at another worktree proved nothing, because no commit between the two
+    checkouts had touched `crates/`, so the trees were identical and abstaining
+    was CORRECT. A probe that cannot fail is not evidence.
+    """
+    import tools.provenance as provenance
+
+    monkeypatch.setattr(provenance, "binary_source_tree", lambda _p: "built-from-this")
+    monkeypatch.setattr(provenance, "committed_crates_tree", lambda _r=None: "but-tested-that")
+    msg = provenance.binary_staleness(Path(__file__), "secantusd-pg", "./inv rust-pgserver-build")
+    assert msg is not None
+    assert "built-from-this" in msg and "but-tested-that" in msg
+    assert "./inv rust-pgserver-build" in msg
+
+
+def test_require_fresh_pgserver_aborts_rather_than_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A warning is what the last seven incidents proved nobody reads.
+
+    A probe prints hundreds of lines; a warning among them is invisible, and the
+    whole point is that the run must not produce a number at all.
+    """
+    import tools.provenance as provenance
+
+    monkeypatch.setattr(provenance, "binary_source_tree", lambda _p: "old")
+    monkeypatch.setattr(provenance, "committed_crates_tree", lambda _r=None: "new")
+    with pytest.raises(SystemExit) as excinfo:
+        require_fresh_pgserver(Path(__file__))
+    assert "secantusd-pg" in str(excinfo.value)
+
+
+def test_extension_staleness_reads_the_source_stamp() -> None:
+    """The extensions carry `__source_tree__` where the binaries print `tree:`."""
+
+    class Stale:
+        __source_tree__ = "extension-tree"
+
+    msg = extension_staleness(Stale(), "_secantus_server", "./inv x")
+    # Only a real mismatch reports; whether it does depends on the checkout, so
+    # assert the shape of the decision rather than the verdict.
+    if msg is not None:
+        assert "extension-tree" in msg and "_secantus_server" in msg
+
+    class Unstamped:
+        pass
+
+    assert extension_staleness(Unstamped(), "_secantus_server", "./inv x") is None
+
+
+def test_resolve_binary_falls_back_to_the_exe_suffix(tmp_path: Path) -> None:
+    """Cargo emits `.exe` on Windows, so the bare name never exists there.
+
+    That one missing suffix made the pytest guard skip both binaries on the only
+    platform where staleness had already bitten. It lives in one place now so it
+    cannot be forgotten by the fourth caller.
+    """
+    exe = tmp_path / "secantusd-pg.exe"
+    exe.write_text("")
+    assert resolve_binary(tmp_path / "secantusd-pg") == exe
+
+    plain = tmp_path / "secantusd-rs"
+    plain.write_text("")
+    assert resolve_binary(plain) == plain
+
+    missing = tmp_path / "absent"
+    assert resolve_binary(missing) == missing
+
+
+@pytest.mark.parametrize(
+    ("probe", "call"),
+    [
+        ("_servers.py", "require_fresh_server_extension"),
+        ("pg_differential.py", "require_fresh_pgserver"),
+    ],
+)
+def test_each_probe_launcher_checks_provenance(probe: str, call: str) -> None:
+    """The gap this refactor closed, pinned so it cannot quietly reopen.
+
+    A source check rather than a behavioural one: running a probe needs a live
+    mongod or a built binary, neither of which a unit test should demand. What
+    would actually regress is somebody adding a launch path and not calling the
+    check, and that is visible in the source.
+    """
+    text = (PROBES / probe).read_text()
+    assert call in text, f"{probe} launches a server without checking its provenance"
+
+
+def test_the_shared_module_is_importable_without_pytest() -> None:
+    """The whole point: a probe is not a pytest run.
+
+    `tools.provenance` must import with nothing but the repo root on the path —
+    no pytest, no conftest, no `src/` layout assumptions — or the probes cannot
+    use it and the gap reopens.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", "import tools.provenance as p; print(p.PGSERVER_REL)"],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "secantusd-pg" in result.stdout
+
+
+def test_a_copied_conftest_still_loads(tmp_path: Path) -> None:
+    """`conftest.py` must import from a directory that is not the checkout.
+
+    `tests/test_crash_stall_watchdog.py` writes a verbatim copy into a tmp dir so
+    its nested session exercises the real watchdog. When the provenance import
+    moved to a repo-root package, that copy could no longer resolve `tools` and
+    failed to LOAD — which is not one test failing but every test in the lane, on
+    every platform. Ten lanes went red at once.
+
+    So the import is discovered and optional, and this pins it. The assertion is
+    that a nested pytest run gets far enough to report no tests, rather than
+    dying in conftest.
+    """
+    (tmp_path / "conftest.py").write_text((REPO / "tests" / "conftest.py").read_text())
+    (tmp_path / "test_nothing.py").write_text("def test_ok():\n    assert True\n")
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-n0", "-p", "no:randomly", "-q", str(tmp_path)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    combined = result.stdout + result.stderr
+    assert "ImportError while loading conftest" not in combined, combined
+    assert "No module named 'tools'" not in combined, combined
+    assert result.returncode == 0, combined

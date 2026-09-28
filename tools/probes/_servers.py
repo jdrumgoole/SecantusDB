@@ -29,12 +29,21 @@ from __future__ import annotations
 import atexit
 import contextlib
 import os
+import pathlib
 import shutil
 import sys
 import tempfile
 from collections.abc import Iterator
 
 import pymongo
+
+#: A probe runs as `python tools/probes/<name>.py`, which puts `tools/probes` on
+#: the path and NOT the repo root, so `tools.provenance` needs one insert.
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools.provenance import require_fresh_server_extension  # noqa: E402
 
 DEFAULT_MONGOD = "mongodb://127.0.0.1:27041"
 
@@ -120,6 +129,11 @@ def probe_targets(
                 file=sys.stderr,
             )
         else:
+            # A stale extension makes this probe compare the CURRENT Python
+            # engine against an OLD Rust one and report the difference as a
+            # divergence -- a wrong answer dressed as a finding. The pytest
+            # guard cannot help here: a probe is not a pytest run.
+            require_fresh_server_extension(_secantus_server)
             rust_store = probe_store()
             stores.append(rust_store)
             rust_server = _secantus_server.RustServer(rust_store, 0)

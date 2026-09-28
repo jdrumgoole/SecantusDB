@@ -69,6 +69,14 @@ import psycopg
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tools.provenance import (  # noqa: E402
+    PGSERVER_REL,
+    require_fresh_pgserver,
+    resolve_binary,
+)
 
 from secantus.sql.pgserver import SecantusPGServer  # noqa: E402
 from secantus.storage import Storage  # noqa: E402
@@ -183,16 +191,14 @@ class _RustServer:
     """
 
     def __init__(self) -> None:
-        binary = (
-            REPO_ROOT
-            / "crates"
-            / "secantus-pgserver"
-            / "target"
-            / "debug"
-            / ("secantusd-pg.exe" if sys.platform == "win32" else "secantusd-pg")
-        )
+        binary = resolve_binary(REPO_ROOT / PGSERVER_REL)
         if not binary.exists():
             raise SystemExit(f"{binary} is not built -- cd crates/secantus-pgserver && cargo build")
+        # And built from THIS tree. A probe against a stale binary reports
+        # divergences that are the binary's age, not the server's behaviour --
+        # which is what happened on 2026-09-28, caught only by a hand-read of
+        # `--version`. The pytest guard does not cover a probe.
+        require_fresh_pgserver(binary)
         self.store_dir = tempfile.mkdtemp(prefix=f"secantus-probe-{os.getpid()}-pg-rust-")
         self.proc = subprocess.Popen(
             [str(binary), self.store_dir, "127.0.0.1:0"],
