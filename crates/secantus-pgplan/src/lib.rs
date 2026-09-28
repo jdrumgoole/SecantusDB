@@ -61,6 +61,10 @@ pub enum Error {
     InvalidName(String),
     /// A bare column beside an aggregate, not in GROUP BY -> 42803.
     Grouping(String),
+    /// An `ON CONFLICT` target matching no unique constraint -> 42P10.
+    /// Carries the whole message: PostgreSQL words it differently for a
+    /// column list and for a named constraint that does not exist.
+    NoArbiter(String),
     /// A `$N` with no bound value -> 42P02.
     Parameter(String),
     /// A value that cannot be read as its target type -> 22P02.
@@ -141,6 +145,7 @@ impl std::fmt::Display for Error {
             Error::UndefinedTable(t) => write!(f, "relation \"{t}\" does not exist"),
             Error::InvalidName(m) => write!(f, "{m}"),
             Error::Grouping(m) => write!(f, "{m}"),
+            Error::NoArbiter(m) => write!(f, "{m}"),
             Error::Parameter(m) => write!(f, "{m}"),
             Error::InvalidText(m) => write!(f, "{m}"),
             Error::InvalidDatetimeFormat(m) | Error::DatetimeFieldOverflow(m) => {
@@ -198,6 +203,7 @@ impl Error {
             Error::UndefinedTable(_) => "42P01",
             Error::InvalidName(_) => "42602", // invalid_name
             Error::Grouping(_) => "42803",    // grouping_error
+            Error::NoArbiter(_) => "42P10",   // invalid_column_reference
             Error::Parameter(_) => "42P02",   // undefined_parameter
             Error::InvalidText(_) => "22P02", // invalid_text_representation
             Error::InvalidDatetimeFormat(_) => "22007", // invalid_datetime_format
@@ -487,6 +493,58 @@ pub enum FetchDirection {
     Relative,
 }
 
+/// Which unique constraint an `ON CONFLICT` clause arbitrates on.
+///
+/// PostgreSQL calls this the *arbiter*. A bare `ON CONFLICT DO NOTHING` names
+/// none and takes any unique violation; a target names columns or a constraint,
+/// and a violation of a DIFFERENT constraint is still an error.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConflictTarget {
+    /// `ON CONFLICT (a, b)` — matched against the PK and each UNIQUE
+    /// constraint by COLUMN SET, because PostgreSQL infers the index rather
+    /// than requiring the declared order.
+    Columns(Vec<String>),
+    /// `ON CONFLICT ON CONSTRAINT name`.
+    Constraint(String),
+}
+
+/// What to do with a row that violates the arbiter.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConflictAction {
+    /// `DO NOTHING` — the row is skipped, and is not counted in the tag.
+    Nothing,
+    /// `DO UPDATE SET ...` over the existing row.
+    ///
+    /// Every assignment is a row expression, with no constant fast path: a
+    /// literal may sit beside an `excluded.` reference in the same statement,
+    /// and the row an expression reads is assembled per conflict anyway, so a
+    /// second representation would buy nothing and could disagree with this one.
+    Update {
+        /// `(stored field, column type, expression)`, planned over the
+        /// target's columns PLUS the proposed row's under `EXCLUDED_PREFIX`.
+        set_exprs: Vec<(String, String, ColumnExpr)>,
+        /// `WHERE` on the DO UPDATE: the update is skipped when it is false.
+        filter: Option<ColumnExpr>,
+    },
+}
+
+/// `INSERT ... ON CONFLICT ...`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OnConflict {
+    pub target: Option<ConflictTarget>,
+    pub action: ConflictAction,
+}
+
+/// Field prefix under which a `DO UPDATE` expression sees the PROPOSED row.
+///
+/// `excluded.v` and `t.v` both resolve to `"v"` through `column_ref_name`,
+/// which takes the LAST name of a qualified reference — so without a rename the
+/// two are indistinguishable, and `set v = excluded.v` would read the EXISTING
+/// row and make the update a silent no-op. The clause's refs are renamed to
+/// this prefix before resolution; it contains a dot, so no real column can
+/// collide with it.
+pub const EXCLUDED_PREFIX: &str = "__excluded__.";
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Insert {
     pub table: String,
@@ -508,6 +566,9 @@ pub struct Insert {
     /// leaves the trailing columns to their defaults (`insert into t(a, b)
     /// select 1` is an error; `insert into t select 1` writes `b` NULL).
     pub explicit_columns: bool,
+    /// `ON CONFLICT ...`, or `None` when the statement has no such clause,
+    /// which leaves the plain-INSERT path untouched.
+    pub on_conflict: Option<OnConflict>,
 }
 
 /// The projection a `RETURNING` clause applies to each written row.
@@ -2612,6 +2673,215 @@ pub fn plan_check_expression(expression: &str, def: &TableDef) -> Result<ColumnE
     row_column_expr(val, &fields, &[], &sample)
 }
 
+/// The unique constraints a table has, as (name, column set), PK included.
+///
+/// The PK is not in `unique_constraints` — it is a `Column.pk` flag — so it is
+/// synthesised here under PostgreSQL's default name, which is what
+/// `ON CONFLICT ON CONSTRAINT t_pkey` refers to.
+fn arbiters(def: &TableDef) -> Vec<(String, Vec<String>)> {
+    let mut out = Vec::new();
+    let pk: Vec<String> = def
+        .columns
+        .iter()
+        .filter(|c| c.pk)
+        .map(|c| c.name.clone())
+        .collect();
+    if !pk.is_empty() {
+        out.push((format!("{}_pkey", def.name), pk));
+    }
+    for u in &def.unique_constraints {
+        if !u.exclusion {
+            out.push((u.name.clone(), u.columns.clone()));
+        }
+    }
+    out
+}
+
+/// Rename `excluded.x` to a single name under `EXCLUDED_PREFIX`.
+///
+/// Runs BEFORE resolution, so the combined field list can carry the proposed
+/// row's columns alongside the target's. See `EXCLUDED_PREFIX` for why the
+/// rename is needed at all.
+fn rename_excluded_refs(node: &mut pg_query::protobuf::Node) -> Result<()> {
+    walk_column_refs(node, &mut |inner, c| {
+        if c.fields.len() != 2 {
+            return Ok(());
+        }
+        let qualifier = match c.fields[0].node.as_ref() {
+            Some(N::String(st)) => st.sval.clone(),
+            _ => return Ok(()),
+        };
+        if !qualifier.eq_ignore_ascii_case("excluded") {
+            return Ok(());
+        }
+        let column = match c.fields[1].node.as_ref() {
+            Some(N::String(st)) => st.sval.clone(),
+            _ => return Ok(()),
+        };
+        let renamed = pg_query::protobuf::String {
+            sval: format!("{EXCLUDED_PREFIX}{column}"),
+        };
+        *inner = N::ColumnRef(pg_query::protobuf::ColumnRef {
+            fields: vec![pg_query::protobuf::Node {
+                node: Some(N::String(renamed)),
+            }],
+            location: c.location,
+        });
+        Ok(())
+    })
+}
+
+/// The field list a `DO UPDATE` expression resolves against: every column of
+/// the target, then every column again under `EXCLUDED_PREFIX`.
+fn on_conflict_fields(def: &TableDef) -> Vec<RowField> {
+    let mut fields: Vec<RowField> = def
+        .columns
+        .iter()
+        .map(|c| (c.name.clone(), c.field(), c.pg_type.clone()))
+        .collect();
+    for c in &def.columns {
+        fields.push((
+            format!("{EXCLUDED_PREFIX}{}", c.name),
+            format!("{EXCLUDED_PREFIX}{}", c.field()),
+            c.pg_type.clone(),
+        ));
+    }
+    fields
+}
+
+fn plan_on_conflict(
+    clause: &pg_query::protobuf::OnConflictClause,
+    def: &TableDef,
+    params: &[Bson],
+) -> Result<OnConflict> {
+    use pg_query::protobuf::OnConflictAction as A;
+
+    let target = match clause.infer.as_deref() {
+        None => None,
+        Some(infer) => {
+            // A partial-index arbiter (`ON CONFLICT (a) WHERE b`) needs index
+            // inference this server does not have. REFUSED rather than
+            // silently widened to the unconditional index, which would take a
+            // conflict the user's predicate excludes.
+            if infer.where_clause.is_some() {
+                return Err(Error::Unsupported(
+                    "ON CONFLICT with a WHERE on the conflict target".into(),
+                ));
+            }
+            if !infer.conname.is_empty() {
+                Some(ConflictTarget::Constraint(infer.conname.clone()))
+            } else {
+                let mut cols = Vec::new();
+                for e in &infer.index_elems {
+                    match e.node.as_ref() {
+                        Some(N::IndexElem(ie)) if !ie.name.is_empty() => {
+                            cols.push(ie.name.clone());
+                        }
+                        // An expression index (`ON CONFLICT (lower(a))`) is
+                        // inference this server cannot do.
+                        _ => return Err(Error::Unsupported("ON CONFLICT on an expression".into())),
+                    }
+                }
+                Some(ConflictTarget::Columns(cols))
+            }
+        }
+    };
+
+    // PostgreSQL resolves the arbiter at PLAN time: a target matching no
+    // unique constraint is 42P10 before any row is touched, not a dup-key
+    // error when one happens to collide.
+    if let Some(t) = &target {
+        let known = arbiters(def);
+        let matched = match t {
+            ConflictTarget::Constraint(name) => known.iter().any(|(n, _)| n == name),
+            ConflictTarget::Columns(cols) => known
+                .iter()
+                .any(|(_, c)| c.len() == cols.len() && cols.iter().all(|x| c.contains(x))),
+        };
+        if !matched {
+            for col in match t {
+                ConflictTarget::Columns(cols) => cols.clone(),
+                ConflictTarget::Constraint(_) => Vec::new(),
+            } {
+                if def.column(&col).is_none() {
+                    return Err(Error::UndefinedColumn(col));
+                }
+            }
+            // The two halves are DIFFERENT errors in PostgreSQL 14, measured
+            // rather than assumed: a named constraint that does not exist is
+            // `42704 undefined_object`, while a column list matching no unique
+            // index is `42P10 invalid_column_reference`.
+            return Err(match t {
+                ConflictTarget::Constraint(name) => Error::UndefinedObject(format!(
+                    "constraint \"{name}\" for table \"{}\" does not exist",
+                    def.name
+                )),
+                ConflictTarget::Columns(_) => Error::NoArbiter(
+                    "there is no unique or exclusion constraint matching the \
+                     ON CONFLICT specification"
+                        .to_string(),
+                ),
+            });
+        }
+    }
+
+    let action = match A::try_from(clause.action) {
+        Ok(A::OnconflictNothing) => ConflictAction::Nothing,
+        Ok(A::OnconflictUpdate) => {
+            let fields = on_conflict_fields(def);
+            let mut sample = Document::new();
+            for (_, field, ty) in &fields {
+                sample.insert(field.clone(), sample_value_for_type(ty));
+            }
+            let mut set_exprs: Vec<(String, String, ColumnExpr)> = Vec::new();
+            for t in &clause.target_list {
+                let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+                    return Err(Error::Unsupported("this ON CONFLICT SET target".into()));
+                };
+                let column = def
+                    .column(&rt.name)
+                    .ok_or_else(|| Error::UndefinedColumn(rt.name.clone()))?;
+                // The PK is the document `_id`, which storage treats as
+                // immutable — the same refusal `UPDATE` makes.
+                if column.pk {
+                    return Err(Error::Unsupported(
+                        "ON CONFLICT DO UPDATE of a PRIMARY KEY column".into(),
+                    ));
+                }
+                let field = column.field();
+                let val = rt
+                    .val
+                    .as_ref()
+                    .ok_or_else(|| Error::Parse("SET without a value".into()))?;
+                let mut val = (**val).clone();
+                rename_excluded_refs(&mut val)?;
+                // Always planned as a row expression: even a constant may sit
+                // beside an `excluded.` reference, and the row it reads is
+                // assembled per conflict.
+                let expr = row_column_expr(&val, &fields, params, &sample)?;
+                set_exprs.push((field, column.pg_type.clone(), expr));
+            }
+            if set_exprs.is_empty() {
+                return Err(Error::Parse(
+                    "ON CONFLICT DO UPDATE without a SET list".into(),
+                ));
+            }
+            let filter = match clause.where_clause.as_deref() {
+                None => None,
+                Some(w) => {
+                    let mut w = w.clone();
+                    rename_excluded_refs(&mut w)?;
+                    Some(row_column_expr(&w, &fields, params, &sample)?)
+                }
+            };
+            ConflictAction::Update { set_exprs, filter }
+        }
+        _ => return Err(Error::Unsupported("this ON CONFLICT action".into())),
+    };
+
+    Ok(OnConflict { target, action })
+}
+
 fn plan_insert(
     i: &pg_query::protobuf::InsertStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
@@ -2677,6 +2947,10 @@ fn plan_insert(
         let (columns, casts) = plan_table_targets(&i.returning_list, &def, params)?;
         Some(Returning { columns, casts })
     };
+    let on_conflict = match i.on_conflict_clause.as_deref() {
+        None => None,
+        Some(c) => Some(plan_on_conflict(c, &def, params)?),
+    };
     Ok(Statement::Insert(Insert {
         table,
         rows,
@@ -2684,6 +2958,7 @@ fn plan_insert(
         source,
         targets,
         explicit_columns: !i.cols.is_empty(),
+        on_conflict,
     }))
 }
 
@@ -3371,88 +3646,106 @@ fn rewrite_column_refs(
     fields: &[RowField],
     n_params: usize,
 ) -> Result<()> {
+    walk_column_refs(node, &mut |inner, c| {
+        let name = column_ref_name(c).ok_or_else(|| Error::Unsupported("this column".into()))?;
+        let idx = fields
+            .iter()
+            .position(|(f, _, _)| *f == name)
+            .ok_or_else(|| Error::UndefinedColumn(name.clone()))?;
+        let number = i32::try_from(n_params + 1 + idx)
+            .map_err(|_| Error::Unsupported("this many columns".into()))?;
+        *inner = N::ParamRef(pg_query::protobuf::ParamRef {
+            number,
+            location: c.location,
+        });
+        Ok(())
+    })
+}
+
+/// Walk every `ColumnRef` under `node`, letting the caller rewrite it.
+///
+/// Split out of `rewrite_column_refs` so `ON CONFLICT DO UPDATE` can rename
+/// `excluded.x` BEFORE resolution without a second copy of this traversal.
+/// Two walkers over the same twelve node kinds would drift, and the one that
+/// drifted would silently stop seeing columns inside (say) a `CASE`.
+fn walk_column_refs(
+    node: &mut pg_query::protobuf::Node,
+    visit: &mut dyn FnMut(&mut N, &pg_query::protobuf::ColumnRef) -> Result<()>,
+) -> Result<()> {
     let Some(inner) = node.node.as_mut() else {
         return Ok(());
     };
     match inner {
-        N::ColumnRef(c) => {
-            let name =
-                column_ref_name(c).ok_or_else(|| Error::Unsupported("this column".into()))?;
-            let idx = fields
-                .iter()
-                .position(|(f, _, _)| *f == name)
-                .ok_or_else(|| Error::UndefinedColumn(name.clone()))?;
-            let number = i32::try_from(n_params + 1 + idx)
-                .map_err(|_| Error::Unsupported("this many columns".into()))?;
-            *inner = N::ParamRef(pg_query::protobuf::ParamRef {
-                number,
-                location: c.location,
-            });
-            Ok(())
+        N::ColumnRef(_) => {
+            // Cloned so the callback can replace `inner` while reading the ref.
+            let N::ColumnRef(c) = inner.clone() else {
+                unreachable!("matched ColumnRef")
+            };
+            visit(inner, &c)
         }
         N::TypeCast(tc) => tc
             .arg
             .as_deref_mut()
-            .map_or(Ok(()), |a| rewrite_column_refs(a, fields, n_params)),
+            .map_or(Ok(()), |a| walk_column_refs(a, visit)),
         N::AExpr(e) => {
             if let Some(l) = e.lexpr.as_deref_mut() {
-                rewrite_column_refs(l, fields, n_params)?;
+                walk_column_refs(l, visit)?;
             }
             if let Some(r) = e.rexpr.as_deref_mut() {
-                rewrite_column_refs(r, fields, n_params)?;
+                walk_column_refs(r, visit)?;
             }
             Ok(())
         }
         N::FuncCall(f) => f
             .args
             .iter_mut()
-            .try_for_each(|a| rewrite_column_refs(a, fields, n_params)),
+            .try_for_each(|a| walk_column_refs(a, visit)),
         N::BoolExpr(b) => b
             .args
             .iter_mut()
-            .try_for_each(|a| rewrite_column_refs(a, fields, n_params)),
+            .try_for_each(|a| walk_column_refs(a, visit)),
         N::AArrayExpr(a) => a
             .elements
             .iter_mut()
-            .try_for_each(|a| rewrite_column_refs(a, fields, n_params)),
+            .try_for_each(|a| walk_column_refs(a, visit)),
         N::RowExpr(r) => r
             .args
             .iter_mut()
-            .try_for_each(|a| rewrite_column_refs(a, fields, n_params)),
+            .try_for_each(|a| walk_column_refs(a, visit)),
         N::CoalesceExpr(c) => c
             .args
             .iter_mut()
-            .try_for_each(|a| rewrite_column_refs(a, fields, n_params)),
+            .try_for_each(|a| walk_column_refs(a, visit)),
         N::MinMaxExpr(m) => m
             .args
             .iter_mut()
-            .try_for_each(|a| rewrite_column_refs(a, fields, n_params)),
+            .try_for_each(|a| walk_column_refs(a, visit)),
         N::NullTest(t) => t
             .arg
             .as_deref_mut()
-            .map_or(Ok(()), |a| rewrite_column_refs(a, fields, n_params)),
+            .map_or(Ok(()), |a| walk_column_refs(a, visit)),
         N::CaseExpr(c) => {
             if let Some(a) = c.arg.as_deref_mut() {
-                rewrite_column_refs(a, fields, n_params)?;
+                walk_column_refs(a, visit)?;
             }
             for w in &mut c.args {
                 if let Some(N::CaseWhen(cw)) = w.node.as_mut() {
                     if let Some(e) = cw.expr.as_deref_mut() {
-                        rewrite_column_refs(e, fields, n_params)?;
+                        walk_column_refs(e, visit)?;
                     }
                     if let Some(r) = cw.result.as_deref_mut() {
-                        rewrite_column_refs(r, fields, n_params)?;
+                        walk_column_refs(r, visit)?;
                     }
                 }
             }
             c.defresult
                 .as_deref_mut()
-                .map_or(Ok(()), |d| rewrite_column_refs(d, fields, n_params))
+                .map_or(Ok(()), |d| walk_column_refs(d, visit))
         }
         N::AIndirection(a) => a
             .arg
             .as_deref_mut()
-            .map_or(Ok(()), |a| rewrite_column_refs(a, fields, n_params)),
+            .map_or(Ok(()), |a| walk_column_refs(a, visit)),
         _ => Ok(()),
     }
 }
@@ -12170,6 +12463,41 @@ fn set_stored_value(set: &mut Document, unset: &mut Vec<String>, field: String, 
 /// The `$set` / `$unset` lists for one matched row of an UPDATE whose SET
 /// list reads the row: the constant assignments plus each row expression
 /// evaluated over `row` and cast to its column's declared type.
+/// The row a `DO UPDATE` expression sees: the EXISTING row, plus the proposed
+/// row's fields under `EXCLUDED_PREFIX`.
+///
+/// Built per conflict rather than once, because the existing row differs for
+/// every conflicting key.
+pub fn on_conflict_row(existing: &Document, proposed: &Document) -> Document {
+    let mut row = existing.clone();
+    for (k, v) in proposed {
+        row.insert(format!("{EXCLUDED_PREFIX}{k}"), v.clone());
+    }
+    row
+}
+
+/// `update_row_sets` for an `ON CONFLICT DO UPDATE` assignment list.
+pub fn on_conflict_row_sets(
+    set_exprs: &[(String, String, ColumnExpr)],
+    row: &Document,
+) -> Result<(Document, Vec<String>)> {
+    let mut set = Document::new();
+    let mut unset = Vec::new();
+    for (field, pg_type, expr) in set_exprs {
+        let value = cast_value(apply_row_expr(expr, row)?, pg_type)?;
+        set_stored_value(&mut set, &mut unset, field.clone(), value);
+    }
+    Ok((set, unset))
+}
+
+/// Whether a `DO UPDATE ... WHERE` passes for this row.
+///
+/// SQL's three-valued logic: only TRUE runs the update — NULL and FALSE both
+/// skip it, exactly as a `WHERE` on a plain UPDATE matches no row.
+pub fn on_conflict_filter_passes(filter: &ColumnExpr, row: &Document) -> Result<bool> {
+    Ok(matches!(apply_row_expr(filter, row)?, Bson::Boolean(true)))
+}
+
 pub fn update_row_sets(upd: &Update, row: &Document) -> Result<(Document, Vec<String>)> {
     let mut set = upd.set.clone();
     let mut unset = upd.unset.clone();

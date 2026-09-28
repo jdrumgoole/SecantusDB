@@ -323,13 +323,17 @@ one request path:
     `CREATE VIEW`, `CREATE TRIGGER`, `EXPLAIN`, composite `PRIMARY KEY` /
     multi-column `FOREIGN KEY`, and a non-literal column `DEFAULT`.
 
-    **Two clauses are worse than refused — they are parsed and then DROPPED**, so
-    the client gets a confident wrong answer: `ON CONFLICT DO NOTHING` / `DO
-    UPDATE` raises `23505` where PostgreSQL succeeds (it works on the PYTHON
-    server, so this is a divergence between the two, not a shared gap), and
-    `GROUPING SETS` / `ROLLUP` answers a misleading `42803` blaming the user's
-    query. Both violate the wire-fidelity rule below; see `tasks/backlog.md` §5
-    for the full survey and what DOES work.
+    **`GROUPING SETS` / `ROLLUP` is parsed and then DROPPED**, so the client
+    gets a confident wrong answer rather than a refusal: the grouping clause is
+    discarded and the server answers a misleading `42803` blaming the user's
+    own query. That violates the wire-fidelity rule below; see
+    `tasks/backlog.md` §5 for the full survey and what DOES work.
+
+    `ON CONFLICT` was the other one and is **implemented as of 2026-09-28**:
+    `DO NOTHING` and `DO UPDATE SET ... WHERE`, `excluded`, a column /
+    `ON CONSTRAINT` / bare arbiter, `RETURNING`, and PostgreSQL's row counts.
+    Only a partial-index arbiter (`ON CONFLICT (a) WHERE ...`) is still
+    refused, and loudly.
 
     So do not read "96.8% of psycopg passes" as "nearly done". A SQL-shaped gauge
     (`sqllogictest`, the SQLAlchemy dialect suite) would score very differently,
