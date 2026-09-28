@@ -6654,10 +6654,14 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
         integer ~~ unknown` on PostgreSQL. Lowering it to a regex anyway
         returned no rows — silently — which is why the type is checked first.
 
-      **Still refused after that batch**, both honestly: `CASE` used directly as
-      a bare `WHERE` predicate (`where (case ... end)`) — `lower_where` has no
-      CaseExpr arm and a CASE does not lower to an MQL filter — and `ORDER BY`
-      over an expression.
+      ~~**Still refused after that batch**: `CASE` as a bare `WHERE` predicate
+      and `ORDER BY` over an expression.~~ **Both landed 2026-09-28**, taking
+      the corpus to 17/17. `ORDER BY <expr>` materialises the expression per row
+      into a synthetic field before sorting; a `WHERE` that does not lower to an
+      MQL filter becomes a RESIDUAL evaluated per row. Only `Unsupported` falls
+      back to a residual — an undefined column stays `42703`, including inside a
+      CASE predicate, or a typo would become a silent full scan returning
+      nothing.
 
       **TWO CLAUSE-DROPPING BUGS — worse than the refusals above, and these are
       the ones to fix first.** Both parse the clause and then ignore it, so the

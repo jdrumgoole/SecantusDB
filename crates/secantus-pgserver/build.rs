@@ -29,8 +29,26 @@
 fn stamp_source_tree() {
     // Without these, cargo caches build.rs output and the stamp goes stale on
     // its own -- a staleness marker that is itself stale.
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
-    println!("cargo:rerun-if-changed=../../.git/index");
+    // Resolved through git, NOT as `../../.git/HEAD`. In a WORKTREE `.git` is
+    // a FILE pointing elsewhere, so that literal path does not exist, cargo
+    // never sees it change, and the build script is never re-run -- the stamp
+    // then reports the tree of whatever checkout last built it. A staleness
+    // checker that is itself stale, which is the failure this block exists to
+    // prevent. Found 2026-09-28 when a freshly built extension in a worktree
+    // reported the MAIN checkout's tree.
+    for path in ["HEAD", "index"] {
+        if let Some(resolved) = std::process::Command::new("git")
+            .args(["rev-parse", "--git-path", path])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|p| !p.is_empty())
+        {
+            println!("cargo:rerun-if-changed={resolved}");
+        }
+    }
 
     let stamp = std::process::Command::new("git")
         .args(["rev-parse", "HEAD:crates"])
