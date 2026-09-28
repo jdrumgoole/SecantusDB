@@ -33,3 +33,14 @@ sitting in `--version` output that no automated thing read".
 - Eight tests in `tests/test_build_provenance.py`, including two that pin the gap
   this closes: each probe launcher must call the check, and `tools.provenance` must
   import with nothing but the repo root on the path — no pytest, no conftest.
+
+#### Note
+
+`conftest.py` discovers `tools/provenance.py` by walking up from its own
+location and **abstains when it is not there**, rather than importing it
+unconditionally. A verbatim copy of `conftest.py` is loaded from a temp
+directory by `tests/test_crash_stall_watchdog.py` (deliberately, so the nested
+session exercises the real watchdog), where no checkout sits above it — a hard
+module-scope import failed to LOAD the conftest there, which is not one test
+failing but every test in the lane. Pinned by
+`test_a_copied_conftest_still_loads`.

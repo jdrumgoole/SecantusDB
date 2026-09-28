@@ -386,3 +386,31 @@ def test_the_shared_module_is_importable_without_pytest() -> None:
     )
     assert result.returncode == 0, result.stderr
     assert "secantusd-pg" in result.stdout
+
+
+def test_a_copied_conftest_still_loads(tmp_path: Path) -> None:
+    """`conftest.py` must import from a directory that is not the checkout.
+
+    `tests/test_crash_stall_watchdog.py` writes a verbatim copy into a tmp dir so
+    its nested session exercises the real watchdog. When the provenance import
+    moved to a repo-root package, that copy could no longer resolve `tools` and
+    failed to LOAD — which is not one test failing but every test in the lane, on
+    every platform. Ten lanes went red at once.
+
+    So the import is discovered and optional, and this pins it. The assertion is
+    that a nested pytest run gets far enough to report no tests, rather than
+    dying in conftest.
+    """
+    (tmp_path / "conftest.py").write_text((REPO / "tests" / "conftest.py").read_text())
+    (tmp_path / "test_nothing.py").write_text("def test_ok():\n    assert True\n")
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-n0", "-p", "no:randomly", "-q", str(tmp_path)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    combined = result.stdout + result.stderr
+    assert "ImportError while loading conftest" not in combined, combined
+    assert "No module named 'tools'" not in combined, combined
+    assert result.returncode == 0, combined

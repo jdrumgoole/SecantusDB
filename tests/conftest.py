@@ -200,24 +200,40 @@ def wt_home_module(_wt_template: str, tmp_path_factory: pytest.TempPathFactory) 
 #: The repository this checkout is, for asking git about it.
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
-# `tools` is a repo-root package and pytest puts only `tests/` on the path (no
-# `tests/__init__.py`, so `prepend` import mode uses this file's own directory).
-# One insert makes `tools.provenance` importable — see that module for why the
-# staleness comparison lives there rather than here.
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
 
-from tools.provenance import (  # noqa: E402
-    COST_BINARY,
-    COST_SERVER,
-    PGSERVER_REL,
-    REBUILD_PGSERVER_CMD,
-    REBUILD_RS_CMD,
-    REBUILD_SERVER_CMD,
-    RS_REL,
-    binary_staleness,
-    extension_staleness,
-)
+def _find_provenance_root(start: pathlib.Path) -> pathlib.Path | None:
+    """The nearest ancestor holding `tools/provenance.py`, or ``None``.
+
+    `tools` is a repo-root package and pytest puts only `tests/` on the path
+    (there is no `tests/__init__.py`, so `prepend` import mode uses this file's
+    own directory), so it needs one `sys.path` insert to be importable.
+
+    **Why this searches rather than trusting `_REPO_ROOT`.** A verbatim COPY of
+    this file is loaded from a temp directory by
+    `tests/test_crash_stall_watchdog.py`, which writes one out deliberately so
+    the nested session exercises the real watchdog. There, `__file__`'s parent's
+    parent is a pytest tmp dir with no checkout above it and no `tools` to
+    import — and a hard `from tools.provenance import ...` at module scope then
+    fails to load the conftest, which took out every test lane on every platform
+    (2026-09-28). So: find the module, and abstain when it is not there. That is
+    the same "silence when it cannot judge" rule the check follows everywhere
+    else, applied to its own import.
+    """
+    for candidate in (start, *start.parents):
+        if (candidate / "tools" / "provenance.py").is_file():
+            return candidate
+    return None
+
+
+_PROVENANCE_ROOT = _find_provenance_root(_REPO_ROOT)
+
+if _PROVENANCE_ROOT is None:
+    #: No checkout above us: a copied conftest. The staleness check abstains.
+    provenance = None
+else:
+    if str(_PROVENANCE_ROOT) not in sys.path:
+        sys.path.insert(0, str(_PROVENANCE_ROOT))
+    from tools import provenance  # noqa: E402
 
 _REBUILD_CORE_CMD = "uv run python -m invoke sync"
 
@@ -280,6 +296,9 @@ def _check_artifact_build_provenance() -> None:
     which is the worst of both worlds: the evidence was sitting in
     `--version` output that no automated thing read.
     """
+    if provenance is None:
+        return  # A copied conftest with no checkout above it; nothing to judge.
+
     messages: list[str | None] = []
 
     try:
@@ -288,19 +307,26 @@ def _check_artifact_build_provenance() -> None:
         pass  # No extension at all is a normal, deliberate configuration.
     else:
         messages.append(
-            extension_staleness(
-                _secantus_server, "_secantus_server", REBUILD_SERVER_CMD, cost=COST_SERVER
+            provenance.extension_staleness(
+                _secantus_server,
+                "_secantus_server",
+                provenance.REBUILD_SERVER_CMD,
+                cost=provenance.COST_SERVER,
             )
         )
 
     for name, rel, rebuild in (
-        ("secantusd-pg", PGSERVER_REL, REBUILD_PGSERVER_CMD),
-        ("secantusd-rs", RS_REL, REBUILD_RS_CMD),
+        ("secantusd-pg", provenance.PGSERVER_REL, provenance.REBUILD_PGSERVER_CMD),
+        ("secantusd-rs", provenance.RS_REL, provenance.REBUILD_RS_CMD),
     ):
         # `binary_staleness` resolves the Windows `.exe` suffix and abstains on a
         # binary that does not exist -- its tests skip, so there is nothing to be
         # stale against.
-        messages.append(binary_staleness(_REPO_ROOT / rel, name, rebuild, cost=COST_BINARY))
+        messages.append(
+            provenance.binary_staleness(
+                _PROVENANCE_ROOT / rel, name, rebuild, cost=provenance.COST_BINARY
+            )
+        )
 
     for message in messages:
         if message is not None:
