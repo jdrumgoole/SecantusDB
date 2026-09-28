@@ -46,7 +46,7 @@ use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::types::format::FormatOptions;
 use pgwire::types::ToSqlText;
 use postgres_types::{to_sql_checked, IsNull, ToSql};
-use secantus_pgcatalog::{TableDef, CATALOG_COLLECTION, SEQUENCE_COLLECTION};
+use secantus_pgcatalog::{Column, TableDef, CATALOG_COLLECTION, SEQUENCE_COLLECTION};
 use secantus_pgplan::{
     companion_field, render_array_element_text, render_timestamp, AggFunc, AggItem, ConstCol,
     Error as PlanError, Nulls, OrderKey, OutputCol, Statement, TransactionControl,
@@ -7948,6 +7948,21 @@ impl PgHandler {
     /// output columns, the series' one int4 column, the virtual table, or the
     /// catalog entry.
     fn select_def(&self, sel: &secantus_pgplan::Select) -> PgWireResult<TableDef> {
+        let mut def = self.select_source_def(sel)?;
+        // Window functions project into synthetic `__winN` fields that no
+        // table has, so their columns are appended here -- the planner knows
+        // their types and the executor rebuilds the def from the catalog, so
+        // without this the row description fell through to the varchar
+        // default and every window value went over the wire as TEXT.
+        for w in &sel.windows {
+            def.columns
+                .push(Column::new(&w.field, &w.result_type, false));
+        }
+        Ok(def)
+    }
+
+    /// The def of a select's SOURCE, before any computed columns.
+    fn select_source_def(&self, sel: &secantus_pgplan::Select) -> PgWireResult<TableDef> {
         // A FROM-subquery (or an inlined CTE) carries its own output def,
         // computed when it was planned.
         if let Some(sub) = &sel.sub {
@@ -7981,7 +7996,7 @@ impl PgHandler {
         // this point -- ORDER BY, OFFSET, LIMIT, the encoder -- works
         // on documents and does not care where they came from, which is
         // why the series is a SOURCE rather than its own statement.
-        let (mut docs, def): (Vec<Document>, TableDef) = match (&sel.series, &sel.join) {
+        let (mut docs, mut def): (Vec<Document>, TableDef) = match (&sel.series, &sel.join) {
             // A FROM-subquery or inlined CTE: run the inner plan, then treat
             // its output columns as the table. Checked first because such a
             // select carries neither a series nor a join.
@@ -8054,6 +8069,25 @@ impl PgHandler {
         // A cancellation point between the scan and the sort: cooperative,
         // like the storage layer's own `maxTimeMS` polling.
         self.check_cancel()?;
+
+        // Window functions see the rows the WHERE left, and are computed
+        // BEFORE `DISTINCT` / `ORDER BY` / `LIMIT` -- PostgreSQL's evaluation
+        // order, and the reason `select distinct g, sum(v) over (partition by
+        // g)` dedups on the computed value rather than computing it over the
+        // deduped rows.
+        if !sel.windows.is_empty() {
+            materialise_windows(&mut docs, &sel.windows).map_err(|e| Self::err(&e))?;
+            // The synthetic `__winN` columns go into the def HERE rather than
+            // only in `select_def`, because every reader of a select's schema
+            // -- the row encoder, `rows_with_schema`, `COPY (query)` -- takes
+            // the def this function RETURNS. Adding them in one of the other
+            // places left the rest describing a window value as varchar, and
+            // the client decoded an int8 as text.
+            for w in &sel.windows {
+                def.columns
+                    .push(Column::new(&w.field, &w.result_type, false));
+            }
+        }
 
         // `SELECT DISTINCT` dedups on the OUTPUT row -- the select list after
         // its casts, not the stored document, so `select distinct left(s, 1)`
@@ -13413,6 +13447,553 @@ fn compute_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
     }
 }
 
+/// Compute every window function into its synthetic field.
+///
+/// Runs after the WHERE and before `DISTINCT` / `ORDER BY` / `LIMIT`, which is
+/// PostgreSQL's evaluation order. The rows are NOT reordered: a window's own
+/// ordering is internal to it, so the work is done over an index permutation
+/// and the values are written back in place.
+fn materialise_windows(
+    docs: &mut [Document],
+    windows: &[secantus_pgplan::WindowItem],
+) -> Result<(), PlanError> {
+    for w in windows {
+        // A computed PARTITION BY / ORDER BY key has no stored field, so it is
+        // evaluated per row into its own `__wkeyN` first and then read back
+        // like any column -- one comparator rather than two.
+        for key in w.partition_by.iter().chain(w.order_by.iter()) {
+            if let Some(expr) = key.expr.as_ref() {
+                for d in docs.iter_mut() {
+                    let v = secantus_pgplan::apply_row_expr(expr, d)?;
+                    d.insert(key.field.clone(), v);
+                }
+            }
+        }
+        let values: Vec<Bson> = match w.arg.as_ref() {
+            Some(expr) => docs
+                .iter()
+                .map(|d| secantus_pgplan::apply_row_expr(expr, d))
+                .collect::<Result<_, _>>()?,
+            None => vec![Bson::Null; docs.len()],
+        };
+        // `FILTER (WHERE ...)` removes a row from the AGGREGATION, not from
+        // the output: the row still gets a value, computed over the rows that
+        // did pass.
+        let included: Vec<bool> = match w.filter.as_ref() {
+            Some(expr) => docs
+                .iter()
+                .map(|d| {
+                    Ok::<bool, PlanError>(
+                        secantus_pgplan::apply_row_expr(expr, d)? == Bson::Boolean(true),
+                    )
+                })
+                .collect::<Result<_, _>>()?,
+            None => vec![true; docs.len()],
+        };
+
+        for partition in window_partitions(docs, &w.partition_by) {
+            window_partition_values(docs, &partition, w, &values, &included)?;
+        }
+    }
+    Ok(())
+}
+
+/// The row indices of each partition, in the rows' original order.
+///
+/// Grouped by VALUE rather than by a hash of it (`group_key_ident`), because
+/// BSON equality and Rust's `==` disagree about NaN, signed zero and
+/// bool-versus-int, and a partition keyed on the wrong one would split or
+/// merge groups that PostgreSQL keeps together.
+fn window_partitions(docs: &[Document], keys: &[OrderKey]) -> Vec<Vec<usize>> {
+    if keys.is_empty() {
+        return vec![(0..docs.len()).collect()];
+    }
+    let ident = |d: &Document| -> Vec<Option<Bson>> {
+        keys.iter()
+            .map(|k| group_key_ident(&d.get(&k.field).cloned()))
+            .collect()
+    };
+    let mut seen: Vec<Vec<Option<Bson>>> = Vec::new();
+    let mut out: Vec<Vec<usize>> = Vec::new();
+    for (i, d) in docs.iter().enumerate() {
+        let id = ident(d);
+        match seen.iter().position(|s| *s == id) {
+            Some(p) => out[p].push(i),
+            None => {
+                seen.push(id);
+                out.push(vec![i]);
+            }
+        }
+    }
+    out
+}
+
+/// Every row of one partition, valued.
+fn window_partition_values(
+    docs: &mut [Document],
+    partition: &[usize],
+    w: &secantus_pgplan::WindowItem,
+    values: &[Bson],
+    included: &[bool],
+) -> Result<(), PlanError> {
+    // The partition in WINDOW order. Stable, so rows that tie on every key
+    // keep the order they arrived in -- which is what makes `row_number()`
+    // over an ambiguous ORDER BY at least deterministic within a run.
+    let mut ordered: Vec<usize> = partition.to_vec();
+    if !w.order_by.is_empty() {
+        ordered.sort_by(|a, b| compare_rows(&docs[*a], &docs[*b], &w.order_by));
+    }
+    // Peer groups: runs of rows equal on the window's ORDER BY. `peer[i]` is
+    // the index of the first row of position i's peer group, and `peer_end[i]`
+    // one past its last. With NO order clause every row is a peer of every
+    // other, which is exactly what makes the default frame span the whole
+    // partition without a special case for it.
+    let n = ordered.len();
+    let mut peers = Peers {
+        start: vec![0usize; n],
+        end: vec![n; n],
+        group_of: vec![0usize; n],
+        // One group spanning the partition, which is what no ORDER BY means.
+        group_start: vec![0usize],
+    };
+    if !w.order_by.is_empty() {
+        peers.group_start.clear();
+        let mut i = 0;
+        let mut group = 0usize;
+        while i < n {
+            let mut j = i + 1;
+            while j < n
+                && compare_rows(&docs[ordered[i]], &docs[ordered[j]], &w.order_by)
+                    == Ordering::Equal
+            {
+                j += 1;
+            }
+            peers.group_start.push(i);
+            for k in i..j {
+                peers.start[k] = i;
+                peers.end[k] = j;
+                peers.group_of[k] = group;
+            }
+            group += 1;
+            i = j;
+        }
+    }
+    // The ordering VALUES, which a RANGE frame with an offset compares
+    // against. Read once here rather than per row.
+    let order_values: Vec<Option<Bson>> =
+        if w.frame.mode == secantus_pgplan::FrameMode::Range && w.order_by.len() == 1 {
+            ordered
+                .iter()
+                .map(|r| docs[*r].get(&w.order_by[0].field).cloned())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+    for pos in 0..n {
+        let row = ordered[pos];
+        let value = window_value(w, &ordered, pos, &peers, &order_values, values, included)?;
+        docs[row].insert(w.field.clone(), value);
+    }
+    Ok(())
+}
+
+/// Peer-group bookkeeping for one ordered partition.
+///
+/// `start[i]` / `end[i]` bracket position `i`'s peer group -- the rows equal
+/// to it on the window's ORDER BY. `group_of[i]` is that group's index and
+/// `group_start[g]` the position its group begins at, which is what a GROUPS
+/// frame counts in.
+struct Peers {
+    start: Vec<usize>,
+    end: Vec<usize>,
+    group_of: Vec<usize>,
+    group_start: Vec<usize>,
+}
+
+/// One row's window value.
+fn window_value(
+    w: &secantus_pgplan::WindowItem,
+    ordered: &[usize],
+    pos: usize,
+    peers: &Peers,
+    order_values: &[Option<Bson>],
+    values: &[Bson],
+    included: &[bool],
+) -> Result<Bson, PlanError> {
+    let peer_start = &peers.start;
+    let peer_end = &peers.end;
+    use secantus_pgplan::WindowFunc as F;
+    let n = ordered.len();
+    let at = |p: usize| values[ordered[p]].clone();
+
+    // The position-only functions ignore the frame entirely, which is
+    // PostgreSQL's rule -- a frame written beside `rank()` does not change it.
+    match w.func {
+        F::RowNumber => return Ok(Bson::Int64(pos as i64 + 1)),
+        F::Rank => return Ok(Bson::Int64(peer_start[pos] as i64 + 1)),
+        F::DenseRank => {
+            // How many peer groups start at or before this row.
+            let mut rank = 0i64;
+            let mut i = 0usize;
+            while i <= pos {
+                rank += 1;
+                i = peer_end[i];
+            }
+            return Ok(Bson::Int64(rank));
+        }
+        F::PercentRank => {
+            // (rank - 1) / (total rows - 1), and 0 for a single-row partition.
+            let r = peer_start[pos] as f64;
+            return Ok(Bson::Double(if n <= 1 {
+                0.0
+            } else {
+                r / (n as f64 - 1.0)
+            }));
+        }
+        F::CumeDist => {
+            // Rows up to and including the last PEER, over the partition size.
+            return Ok(Bson::Double(peer_end[pos] as f64 / n as f64));
+        }
+        F::Ntile => {
+            let buckets = match w.args.first() {
+                Some(Bson::Int32(v)) => i64::from(*v),
+                Some(Bson::Int64(v)) => *v,
+                _ => return Err(PlanError::Unsupported("this ntile argument".into())),
+            };
+            if buckets < 1 {
+                return Err(PlanError::InvalidNtileArgument(
+                    "argument of ntile must be greater than zero".into(),
+                ));
+            }
+            // PostgreSQL spreads the remainder over the FIRST buckets, so the
+            // early ones are one row larger.
+            let nn = n as i64;
+            let p = pos as i64;
+            let base = nn / buckets;
+            let extra = nn % buckets;
+            let big = extra * (base + 1);
+            let bucket = if p < big {
+                p / (base + 1)
+            } else {
+                extra + (p - big) / base.max(1)
+            };
+            return Ok(Bson::Int32((bucket + 1) as i32));
+        }
+        F::Lag | F::Lead => {
+            let offset = match w.args.first() {
+                None => 1i64,
+                Some(Bson::Int32(v)) => i64::from(*v),
+                Some(Bson::Int64(v)) => *v,
+                Some(Bson::Null) => return Ok(Bson::Null),
+                _ => return Err(PlanError::Unsupported("this lag/lead offset".into())),
+            };
+            let default = w.args.get(1).cloned().unwrap_or(Bson::Null);
+            let target = if w.func == F::Lag {
+                pos as i64 - offset
+            } else {
+                pos as i64 + offset
+            };
+            return Ok(if target < 0 || target >= n as i64 {
+                default
+            } else {
+                at(target as usize)
+            });
+        }
+        _ => {}
+    }
+
+    // Everything else reads the FRAME.
+    let Some((lo, hi)) = window_frame_bounds(w, pos, n, peers, order_values)? else {
+        // An empty frame: the aggregates answer NULL, and `count` answers 0.
+        return Ok(match w.func {
+            F::Count | F::CountStar => Bson::Int64(0),
+            _ => Bson::Null,
+        });
+    };
+    // `EXCLUDE` removes rows from the frame once its bounds are known.
+    // `TIES` is the odd one: it drops the current row's PEERS but keeps the
+    // row itself, so it is not simply a narrower range.
+    use secantus_pgplan::FrameExclude as X;
+    let excluded = |p: usize| match w.frame.exclude {
+        X::NoOthers => false,
+        X::CurrentRow => p == pos,
+        X::Group => p >= peer_start[pos] && p < peer_end[pos],
+        X::Ties => p != pos && p >= peer_start[pos] && p < peer_end[pos],
+    };
+    let frame: Vec<Bson> = (lo..=hi)
+        .filter(|p| !excluded(*p) && included[ordered[*p]])
+        .map(at)
+        .collect();
+    if frame.is_empty() {
+        return Ok(match w.func {
+            F::Count | F::CountStar => Bson::Int64(0),
+            _ => Bson::Null,
+        });
+    }
+
+    Ok(match w.func {
+        F::FirstValue => frame.first().cloned().unwrap_or(Bson::Null),
+        F::LastValue => frame.last().cloned().unwrap_or(Bson::Null),
+        F::NthValue => {
+            let nth = match w.args.first() {
+                Some(Bson::Int32(v)) => i64::from(*v),
+                Some(Bson::Int64(v)) => *v,
+                _ => return Err(PlanError::Unsupported("this nth_value argument".into())),
+            };
+            if nth < 1 {
+                return Err(PlanError::InvalidParameter(
+                    "argument of nth_value must be greater than zero".into(),
+                ));
+            }
+            frame.get((nth - 1) as usize).cloned().unwrap_or(Bson::Null)
+        }
+        _ => window_aggregate(w, &frame),
+    })
+}
+
+/// The aggregate window functions, computed by the ORDINARY aggregate.
+///
+/// A synthesised `AggItem` over one-column rows rather than a second
+/// implementation: `sum` over an int4 column answers int8, over a numeric it
+/// sums exactly, `avg` divides as numeric, and every one of them skips NULLs
+/// but `count(*)`. Those rules were measured once against PostgreSQL and they
+/// belong in one place -- a parallel copy here would be a second set to keep
+/// right, and the one that drifted would be the one nobody was testing.
+fn window_aggregate(w: &secantus_pgplan::WindowItem, frame: &[Bson]) -> Bson {
+    use secantus_pgplan::WindowFunc as F;
+    let func = match w.func {
+        F::Sum => AggFunc::Sum,
+        F::Avg => AggFunc::Avg,
+        F::Min => AggFunc::Min,
+        F::Max => AggFunc::Max,
+        F::Count => AggFunc::Count,
+        F::CountStar => AggFunc::CountStar,
+        F::StringAgg => AggFunc::StringAgg,
+        F::ArrayAgg => AggFunc::ArrayAgg,
+        F::BoolAnd => AggFunc::BoolAnd,
+        F::BoolOr => AggFunc::BoolOr,
+        // Every other variant was answered before the frame was read.
+        _ => return Bson::Null,
+    };
+    let item = AggItem {
+        func,
+        field: (w.func != F::CountStar).then(|| "v".to_string()),
+        out: String::new(),
+        source_type: w.source_type.clone(),
+        expr: None,
+        distinct: false,
+        filter: None,
+        // `string_agg(x, sep)` carries its separator as the first extra arg.
+        sep: w.args.first().cloned(),
+        order: Vec::new(),
+        source_typmod: -1,
+    };
+    let rows: Vec<Document> = frame
+        .iter()
+        .map(|v| {
+            let mut d = Document::new();
+            d.insert("v", v.clone());
+            d
+        })
+        .collect();
+    compute_aggregate(&item, &rows)
+}
+
+/// `[lo, hi]` of the current row's frame, or `None` when it is empty.
+///
+/// Three frame modes, and the difference between them is only what a bound
+/// COUNTS IN: ROWS counts rows, GROUPS counts peer groups, RANGE compares the
+/// ordering column's VALUES.
+fn window_frame_bounds(
+    w: &secantus_pgplan::WindowItem,
+    pos: usize,
+    n: usize,
+    peers: &Peers,
+    order_values: &[Option<Bson>],
+) -> Result<Option<(usize, usize)>, PlanError> {
+    use secantus_pgplan::{FrameBound as B, FrameMode as M};
+    if n == 0 {
+        return Ok(None);
+    }
+    // Under RANGE and GROUPS (and so under the default frame) a bound at
+    // CURRENT ROW means the current row AND ITS PEERS -- the start moves to
+    // the first peer, the end to the last. That one rule is what gives two
+    // tied rows the SAME running total, and what makes the frame span the
+    // whole partition when there is no ORDER BY at all, since then every row
+    // is a peer of every other.
+    let peer_based = w.frame.mode != M::Rows;
+    let ascending = w.order_by.first().map(|k| k.ascending).unwrap_or(true);
+
+    // A RANGE frame with a VALUE offset needs exactly one ordering column to
+    // measure against, which is PostgreSQL's own rule.
+    let range_offset = w.frame.mode == M::Range
+        && (matches!(w.frame.start, B::Preceding(_) | B::Following(_))
+            || matches!(w.frame.end, B::Preceding(_) | B::Following(_)));
+    if range_offset && w.order_by.len() != 1 {
+        return Err(PlanError::Windowing(
+            "RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column".into(),
+        ));
+    }
+
+    let lo = match w.frame.start {
+        B::UnboundedPreceding => 0usize,
+        B::CurrentRow => {
+            if peer_based {
+                peers.start[pos]
+            } else {
+                pos
+            }
+        }
+        B::UnboundedFollowing => return Ok(None),
+        B::Preceding(k) | B::Following(k) => {
+            let signed = if matches!(w.frame.start, B::Preceding(_)) {
+                -k
+            } else {
+                k
+            };
+            match w.frame.mode {
+                M::Rows => {
+                    let v = pos as i64 + signed;
+                    if v >= n as i64 {
+                        return Ok(None);
+                    }
+                    v.max(0) as usize
+                }
+                M::Groups => {
+                    let g = peers.group_of[pos] as i64 + signed;
+                    if g >= peers.group_start.len() as i64 {
+                        return Ok(None);
+                    }
+                    peers.group_start[g.max(0) as usize]
+                }
+                M::Range => match range_bound(order_values, pos, signed, ascending, true, peers)? {
+                    Some(v) => v,
+                    None => return Ok(None),
+                },
+            }
+        }
+    };
+    let hi = match w.frame.end {
+        B::UnboundedFollowing => n - 1,
+        B::CurrentRow => {
+            if peer_based {
+                peers.end[pos] - 1
+            } else {
+                pos
+            }
+        }
+        B::UnboundedPreceding => return Ok(None),
+        B::Preceding(k) | B::Following(k) => {
+            let signed = if matches!(w.frame.end, B::Preceding(_)) {
+                -k
+            } else {
+                k
+            };
+            match w.frame.mode {
+                M::Rows => {
+                    let v = pos as i64 + signed;
+                    if v < 0 {
+                        return Ok(None);
+                    }
+                    (v.min(n as i64 - 1)) as usize
+                }
+                M::Groups => {
+                    let g = peers.group_of[pos] as i64 + signed;
+                    if g < 0 {
+                        return Ok(None);
+                    }
+                    let g = (g as usize).min(peers.group_start.len() - 1);
+                    // The last row of that group: one before the next group
+                    // starts, or the partition's last row.
+                    peers.group_start.get(g + 1).map(|s| s - 1).unwrap_or(n - 1)
+                }
+                M::Range => {
+                    match range_bound(order_values, pos, signed, ascending, false, peers)? {
+                        Some(v) => v,
+                        None => return Ok(None),
+                    }
+                }
+            }
+        }
+    };
+    if lo > hi {
+        return Ok(None);
+    }
+    Ok(Some((lo, hi)))
+}
+
+/// One end of a RANGE frame whose bound is a VALUE offset.
+///
+/// The trick that makes both directions one rule: sort order is monotone in
+/// `key(v)` -- `v` ascending, `-v` descending -- so a bound is ALWAYS
+/// `key(current) + shift`, with `shift` negative for PRECEDING and positive
+/// for FOLLOWING, whichever way the window is ordered. The frame is then the
+/// rows whose key lies between the two bounds, found by scanning the
+/// partition (already in key order) rather than walking outward from the
+/// current row.
+///
+/// Walking outward is what the first version did, and it was wrong for every
+/// frame whose bounds sit on ONE side of the current row -- `RANGE BETWEEN 1
+/// FOLLOWING AND 20 FOLLOWING` returned the whole partition. It read the
+/// scan direction off the OFFSET'S SIGN, when what decides it is which BOUND
+/// is being resolved.
+///
+/// A NULL ordering value has no arithmetic, so PostgreSQL gives such a row a
+/// frame of its peers -- every other NULL -- and NULL rows are outside every
+/// other row's offset frame.
+fn range_bound(
+    order_values: &[Option<Bson>],
+    pos: usize,
+    shift: i64,
+    ascending: bool,
+    start: bool,
+    peers: &Peers,
+) -> Result<Option<usize>, PlanError> {
+    let key = |v: &Bson| -> Option<f64> { numeric_f64(v).map(|x| if ascending { x } else { -x }) };
+    let current = order_values.get(pos).and_then(|v| v.clone());
+    let Some(current) = current.filter(|v| *v != Bson::Null) else {
+        return Ok(Some(if start {
+            peers.start[pos]
+        } else {
+            peers.end[pos] - 1
+        }));
+    };
+    let Some(base) = key(&current) else {
+        return Err(PlanError::FeatureNotSupported(
+            "RANGE with an offset over a non-numeric ORDER BY column".into(),
+        ));
+    };
+    let bound = base + shift as f64;
+    let keyed = |i: usize| -> Option<f64> {
+        order_values
+            .get(i)
+            .and_then(|v| v.as_ref())
+            .filter(|v| **v != Bson::Null)
+            .and_then(key)
+    };
+    let n = order_values.len();
+    if start {
+        // The FIRST row at or past the bound.
+        Ok((0..n).find(|i| keyed(*i).is_some_and(|k| k >= bound)))
+    } else {
+        // The LAST row at or before it.
+        Ok((0..n).rev().find(|i| keyed(*i).is_some_and(|k| k <= bound)))
+    }
+}
+
+/// A BSON number as `f64`, for a RANGE bound's arithmetic. `None` for anything
+/// that is not a number, which the caller refuses by name rather than
+/// comparing wrongly.
+fn numeric_f64(v: &Bson) -> Option<f64> {
+    match v {
+        Bson::Int32(x) => Some(f64::from(*x)),
+        Bson::Int64(x) => Some(*x as f64),
+        Bson::Double(x) => Some(*x),
+        _ => secantus_pgplan::numeric::numeric_text(v).and_then(|t| t.parse::<f64>().ok()),
+    }
+}
+
 /// Sort decoded rows in PostgreSQL's order.
 ///
 /// Deliberately NOT pushed into the storage layer's sort: MongoDB orders null
@@ -13438,36 +14019,44 @@ fn materialise_order_exprs(docs: &mut [Document], order: &[OrderKey]) -> Result<
 }
 
 fn sort_rows(docs: &mut [Document], order: &[OrderKey]) {
-    docs.sort_by(|a, b| {
-        for key in order {
-            let (l, r) = (a.get(&key.field), b.get(&key.field));
-            let l_null = matches!(l, None | Some(Bson::Null));
-            let r_null = matches!(r, None | Some(Bson::Null));
-            let ord = match (l_null, r_null) {
-                (true, true) => Ordering::Equal,
-                (true, false) => match key.nulls {
-                    Nulls::First => Ordering::Less,
-                    Nulls::Last => Ordering::Greater,
-                },
-                (false, true) => match key.nulls {
-                    Nulls::First => Ordering::Greater,
-                    Nulls::Last => Ordering::Less,
-                },
-                (false, false) => {
-                    let cmp = compare_values(l.unwrap(), r.unwrap());
-                    if key.ascending {
-                        cmp
-                    } else {
-                        cmp.reverse()
-                    }
+    docs.sort_by(|a, b| compare_rows(a, b, order));
+}
+
+/// Two rows compared by a sort spec, in PostgreSQL's order.
+///
+/// Shared by the ORDER BY sort and by the window machinery, which orders each
+/// partition by the window's own keys and then needs the SAME comparison
+/// again to find peer groups. Two copies would drift, and the one that drifted
+/// would put a tie in the wrong frame.
+fn compare_rows(a: &Document, b: &Document, order: &[OrderKey]) -> Ordering {
+    for key in order {
+        let (l, r) = (a.get(&key.field), b.get(&key.field));
+        let l_null = matches!(l, None | Some(Bson::Null));
+        let r_null = matches!(r, None | Some(Bson::Null));
+        let ord = match (l_null, r_null) {
+            (true, true) => Ordering::Equal,
+            (true, false) => match key.nulls {
+                Nulls::First => Ordering::Less,
+                Nulls::Last => Ordering::Greater,
+            },
+            (false, true) => match key.nulls {
+                Nulls::First => Ordering::Greater,
+                Nulls::Last => Ordering::Less,
+            },
+            (false, false) => {
+                let cmp = compare_values(l.unwrap(), r.unwrap());
+                if key.ascending {
+                    cmp
+                } else {
+                    cmp.reverse()
                 }
-            };
-            if ord != Ordering::Equal {
-                return ord;
             }
+        };
+        if ord != Ordering::Equal {
+            return ord;
         }
-        Ordering::Equal
-    });
+    }
+    Ordering::Equal
 }
 
 /// Compare two non-null stored values the way PostgreSQL compares the SQL types

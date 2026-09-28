@@ -6801,7 +6801,7 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       | ~~`LIKE` / `ILIKE` / `NOT LIKE`~~ | **DONE 2026-09-28** | with `ESCAPE` |
       | ~~regex `~` / `~*` / `!~` / `!~*`~~ | **DONE 2026-09-28** | |
       | ~~`CASE`~~ | **DONE 2026-09-28** | both forms; still refused inside a bare `WHERE` |
-      | window functions | `row_number() over (order by a)` | `function row_number()` |
+      | ~~window functions~~ | **DONE 2026-09-28** | a window over an AGGREGATE is still refused |
       | ~~`ORDER BY` over an expression~~ | **DONE 2026-09-28** | |
       | `SELECT *` / `t.*` over a JOIN or comma FROM | `select * from t1, t2` | `this subquery target` |
       | array subscripting | `(array[1,2])[1]` | `this field selection` |
@@ -6925,6 +6925,88 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       test_a_correlated_subquery_is_refused_not_answered_wrongly` pins it.
       Anything that makes correlated subqueries WORK must keep that check
       honest, because the qualifier is still ignored everywhere else.
+
+- [ ] **OPEN — RUST pgserver: a window function over an AGGREGATE, which is
+      all that is left of the window work (2026-09-28).** Everything else
+      landed; measured on two corpora against PostgreSQL 14.13,
+      `windows.sql` is 26/27 and `windows2.sql` (48 lines, written for that
+      change) is clean. The one that differs:
+
+      ```
+      select g, sum(sum(v)) over (order by g) from w9 group by g
+        -> 0A000 a window function over an aggregate is not supported yet
+      ```
+
+      **Two more sources refuse a window, for the same structural reason.**
+      Both are honest and named, and both are shapes real SQL uses:
+
+      ```
+      select a.n, row_number() over (order by a.n) from a join b on b.id = a.id
+        -> 0A000 a window function over a JOIN is not supported yet
+      select n, row_number() over (order by n) from generate_series(1,3) as t(n)
+        -> 0A000 a window function over a generated source is not supported yet
+      ```
+
+      `plan_join_plain_select` and `plan_series_select` build their output
+      columns from the SOURCE's columns, and a window target is a column of
+      neither -- so each would need the same "plan the window targets against
+      this def" step `plan_select` grew. The executor half already works on
+      any `Vec<Document>`, so the join's materialised rows need nothing new.
+      (Before this was named, the two answered `this subquery target` and
+      `function row_number() is not supported yet` -- the second flatly false,
+      since `row_number` works everywhere else.)
+
+      The window runs over the GROUPED rows, so `plan_aggregate` would need a
+      window pass of its own — `materialise_windows` already works on any
+      `Vec<Document>`, so the executor half is mostly a call; the planner half
+      has to resolve `sum(v)` as a group value and `sum(...)` as the window's
+      argument over it.
+
+      **Two known limits of the window implementation, neither reached by
+      either corpus:** a `RANGE` frame with a value offset compares through
+      `f64`, so a bound sitting beyond 2^53 on an int8 or a wide numeric
+      column could land a row on the wrong side of it (the non-numeric case
+      is refused by name rather than compared wrongly); and partitioning
+      scans the distinct partition keys linearly, which is O(partitions²) on
+      a query that makes very many of them.
+
+      **A third, and it is the one that nearly shipped a wrong answer.**
+      Two corpora totalling 75 lines agreed with PostgreSQL completely, and a
+      RANGE frame whose bounds sat on ONE SIDE of the current row was wrong
+      on every row — `RANGE BETWEEN 1 FOLLOWING AND 20 FOLLOWING` returned
+      the whole partition. Neither corpus contained such a frame: both had
+      one bound at `CURRENT ROW` or `UNBOUNDED`, which is the shape that
+      happens to work under a walk outward from the current row.
+
+      It was found by writing a THIRD corpus of exactly the shapes the first
+      two did not reach, on the suspicion that the scan direction was keyed
+      off the wrong thing — which it was: the offset's SIGN rather than which
+      BOUND was being resolved. **A corpus that agrees completely is evidence
+      about the shapes it contains and nothing else**, and the cheapest way
+      to find what it is blind to is to enumerate the axes it varies (here:
+      which side each bound falls on) and write the combinations it skipped.
+
+      The rule that replaced it is worth keeping: sort order is monotone in
+      `key(v)` — `v` ascending, `-v` descending — so a bound is ALWAYS
+      `key(current) + shift`, with `shift` negative for PRECEDING and
+      positive for FOLLOWING, whichever way the window is ordered. One rule,
+      both directions, no walking.
+
+      **Two things that cost real time here, both worth not re-deriving:**
+
+      * **The DEFAULT frame is `RANGE UNBOUNDED PRECEDING TO CURRENT ROW`, and
+        it is the SAME whether or not the window has an ORDER BY** (measured:
+        `over ()`, `over (order by id)` and `over (partition by g)` all parse
+        to `frame_options = 0x422`). Under RANGE a bound at CURRENT ROW means
+        the row AND ITS PEERS, so tied rows share a running total and a window
+        with no ORDER BY sees the whole partition — the second is not a
+        special case, it is the first with every row a peer.
+      * **`OVER w` and `OVER (w ORDER BY ...)` put the referenced name in
+        DIFFERENT parser fields** — `name` for the bare form, `refname` for
+        the parenthesised one. Reading only `refname` left `OVER w` with no
+        ORDER BY, so every row became a peer and `sum(v) OVER w` answered the
+        whole-partition total where PostgreSQL gives a running one: a wrong
+        answer, not an error.
 
 - [ ] **WATCH — an uncorrelated subquery runs at PLAN time, so a VOLATILE
       function inside one would fire on a bare `Describe` (2026-09-28).**
