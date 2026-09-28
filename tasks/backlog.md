@@ -2913,6 +2913,54 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **OPEN — a backend-termination test waits with `sleep(0.1)` for a reap it
+      cannot bound, and failed CI once on 2026-09-28.**
+      `tests/test_rust_pgserver_slice.py::test_pg_cancel_and_terminate_backend_signal_a_running_statement`
+      terminates an IDLE session and then asserts the row is gone from
+      `pg_stat_activity`:
+
+      ```python
+      assert other.execute("select pg_terminate_backend(%s)", (idle_pid,)).fetchone() == (True,)
+      time.sleep(0.1)
+      ...
+      assert other.execute(
+          "select count(*) from pg_stat_activity where pid = %s", (idle_pid,)
+      ).fetchone() == (0,)
+      ```
+
+      The failure was the LAST assertion (line 8250 at the time), in the
+      `pg-oracle` lane of
+      [run 36398852755](https://github.com/jdrumgoole/SecantusDB/actions/runs/36398852755/job/108851645826).
+      It passed on a re-run of an otherwise identical tree
+      ([36400966809](https://github.com/jdrumgoole/SecantusDB/actions/runs/36400966809/job/108858465344)).
+
+      **Why this is filed rather than called a flake.** "Flaky" describes a bug
+      here, it does not excuse one — and the shape is a race by construction: a
+      fixed 100ms sleep standing in for "the backend has been reaped", on a
+      shared CI runner. Two readings are open and they want different fixes:
+
+      * **The test is wrong.** Reaping is asynchronous and unbounded, so the
+        assertion should POLL for the count reaching 0 with a deadline (the
+        pattern `_wait_for_listener` already uses in
+        `psycopg_validation/runner.py`) instead of sleeping a guess. Cheap, and
+        correct regardless of the second reading.
+      * **The server is slow to reap, or does not always reap.** If the row can
+        outlive the connection indefinitely, `pg_stat_activity` is lying about
+        live sessions and a client polling it would see a ghost. That is a
+        server bug and the sleep is merely what exposed it.
+
+      **Do the polling fix FIRST and give it a generous deadline, then see
+      whether it ever times out.** A poll that never times out settles the
+      question as a test bug; one that does has caught the server bug with
+      evidence, which a `sleep` cannot produce either way.
+
+      Context worth having: the file was last touched hours earlier by #1589
+      ("stop three harnesses from discarding what the servers were saying") and
+      the neighbouring FATAL-delivery path by #1592, so this may be newly
+      EXPOSED rather than newly broken. Not attributed to either — it was
+      observed from a branch that did not touch this file, and `main` was green
+      on `pg-oracle` across the four runs before it.
+
 - [ ] **OPEN — THE tracker for stale gauge numbers. The committed validation
       reports and the live driver panels are stale in DIFFERENT ways, and the
       one refresh that existed (PR #1595) was closed unmerged rather than
