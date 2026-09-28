@@ -2913,6 +2913,29 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **OPEN — the committed validation reports and the live driver panels
+      PREDATE two fixes that landed the same day (2026-09-28).** The full
+      `validate-all` was run against `0.6.0b17` on 2026-09-27 and its numbers
+      were published; `apiStrict` (#1582) and the transaction label / codeName
+      fixes (#1585, #1597) landed after. The published numbers are not wrong
+      about what was measured — they now UNDERSTATE the server.
+
+      Specifically, these reported failures should flip at the next sweep:
+
+      * `docs/validation-report-java.md` — `VersionedApiTest#Test commands:
+        strict mode` (1 of its 3 failures).
+      * `docs/validation-report.md` — `TestVersionedApiTestCommandsStrictMode`
+        plus the `test_transactions_unified` label cluster; 9 of the 15 listed
+        failures are now addressed, and 3 of the survivors are the secondary-read
+        non-goal in section 4.
+
+      Do NOT hand-edit the reports or the panels to match — they are generated,
+      and a hand-edited number is worse than a stale one because nothing marks it
+      as unmeasured. Re-run `invoke validate` and `invoke validate-java` (the two
+      affected gauges) and regenerate the panels with
+      `validation_summary.driver_panels`, then deploy. The pymongo rate should
+      RISE from 98.7%; the java rate from 99.3%.
+
 - [ ] **OPEN — the published writer-scaling chart can only be measured on
       SHARED CPU, and a DigitalOcean tier ticket is in flight (2026-09-28).**
       `invoke do-perf` needs >= 8 vCPU (the sweep runs eight writer processes
@@ -2970,19 +2993,25 @@ These are explicit non-goals. Don't add them without a reason.
       widened to `driver-sync` since these were last measured, so it may be newly
       reached rather than newly broken.
 
-- [ ] **OPEN — `apiStrict: true` does not reject a command outside the Stable
-      API, and TWO drivers independently say so (2026-09-27).** A full
-      `validate-all` against `0.6.0b17` fails the same behaviour in pymongo
-      (`test_versioned_api_integration.py::TestVersionedApiTestCommandsStrictMode
-      ::test_Running_a_command_that_is_not_part_of_the_versioned_API_results_in_an_error`)
-      and in the Java driver
-      (`com.mongodb.client.unified.VersionedApiTest#Test commands: strict mode`).
-      Two unrelated drivers agreeing is what makes this a real gap rather than a
-      harness artifact — neither is a documented load flake, and both gauges were
-      run on a quiet machine. `mongod` answers `APIStrictError` (code 323) for a
-      command absent from the declared `apiVersion`; we run it. Probe `mongod`
-      8.2.11 for the exact `errmsg` and the command allowlist before fixing, and
-      land it in both servers.
+- [x] ~~**`apiStrict: true` does not reject a command outside the Stable API**~~
+      **FIXED 2026-09-27** in both servers. Probed mongod 8.2.11 rather than
+      reading the spec, and it had THREE branches where the spec's wording implies
+      two: a command mongod HAS but that is outside v1 answers 323, a v1 command
+      runs, and a command that does not exist at all still answers 59
+      CommandNotFound. A gate that refused everything it did not recognise would
+      get that third case wrong.
+
+      The membership allowlist was MEASURED, by sending every command this server
+      implements to mongod under `apiStrict: true` and recording the refusals —
+      which put `distinct`, `buildInfo`, `isMaster` and `serverStatus` OUTSIDE the
+      Stable API and `count` and `hello` inside it. A list assembled from the
+      manual would have had several the wrong way round.
+
+      Two error messages were wrong, not one: the aggregation-stage message said
+      `Provided aggregation pipeline stage $x is not in API Version 1` where mongod
+      says `$x is not allowed with 'apiStrict: true' in API Version 1`. Pinned by
+      11 cases in `tests/test_mongod_differential.py` asserting code, codeName AND
+      errmsg. Closed the failure in both the pymongo and Java gauges.
 
 - [x] ~~**Two `test_transactions_unified` retry-semantics failures**~~ **FIXED
       2026-09-28.** Probed a single-node replica-set mongod 8.2.11 (transactions
