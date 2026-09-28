@@ -216,6 +216,29 @@ _ERROR_CODE_NAMES: dict[int, str] = {
     # `_require_api_version_1`. In the table as well as inline so a handler that
     # raises 323 directly still renders the name.
     323: "APIStrictError",
+    # Transaction / replication-failure codes. A `failCommand` failpoint renders
+    # its injected code through `_code_name_for`, which fell back to
+    # `Location<code>` for all of these -- so the driver specs' `commitTransaction
+    # fails after Interrupted` asserted `errorCodeName: "Interrupted"` and got
+    # `Location11601`. Every name below was read off a single-node replica-set
+    # mongod 8.2.11 (2026-09-28), not transcribed from the error-codes list.
+    6: "HostUnreachable",
+    7: "HostNotFound",
+    24: "LockTimeout",
+    89: "NetworkTimeout",
+    91: "ShutdownInProgress",
+    112: "WriteConflict",
+    189: "PrimarySteppedDown",
+    246: "SnapshotUnavailable",
+    251: "NoSuchTransaction",
+    267: "PreparedTransactionInProgress",
+    9001: "SocketException",
+    10107: "NotWritablePrimary",
+    11600: "InterruptedAtShutdown",
+    11601: "Interrupted",
+    11602: "InterruptedDueToReplStateChange",
+    13435: "NotPrimaryNoSecondaryOk",
+    13436: "NotPrimaryOrSecondary",
 }
 
 
@@ -9550,8 +9573,18 @@ def _retry_identity(doc: Mapping[str, Any]) -> bytes:
     return hashlib.sha1(payload, usedforsecurity=False).digest()
 
 
+#: Codes that carry ``TransientTransactionError`` when they fail a statement
+#: inside a transaction. Probed against a single-node REPLICA SET mongod 8.2.11
+#: on 2026-09-28 -- transactions need one, so the standalone used for most of
+#: this file's probes cannot answer it.
+#:
+#: ``267 PreparedTransactionInProgress`` is in because mongod labels it;
+#: ``11601 Interrupted`` is deliberately OUT because mongod returns NO labels
+#: for it. The two arrived together as driver-gauge failures and it was tempting
+#: to add both -- the probe showed they want opposite treatment, and adding both
+#: would have turned one test green and the other red.
 _TRANSIENT_TXN_CODES = frozenset(
-    {112, 246, 251, 24, 6, 7, 89, 91, 189, 9001, 10107, 11600, 11602, 13435, 13436}
+    {112, 246, 251, 24, 6, 7, 89, 91, 189, 267, 9001, 10107, 11600, 11602, 13435, 13436}
 )
 
 
