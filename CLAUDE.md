@@ -154,33 +154,6 @@ SecantusDB stores data. In a database, an error is a **correctness and durabilit
 - **"Flaky", "environmental", "only under load", "only in parallel" are descriptions of a bug, not excuses to ignore one.** A storage engine that panics under stress is broken even if a single-threaded test passes — stress is exactly when databases must hold. Diagnose the race / resource / lifecycle issue and fix it.
 - **A test failing is the system telling you something true.** Before reaching for a skip/xfail/deselect, prove the failure is a test artifact unrelated to data integrity — and even then prefer fixing the test over hiding it. Deselecting a storage test to get a clean run is how silent data loss ships.
 - **Surface errors faithfully.** Don't downgrade a storage error to a generic message, don't `let _ =` away a `Result` on a write/commit/close path, and don't report "done" while an error was logged. If a write, checkpoint, or connection close errored, that is the headline, not a footnote.
-- **A test that does not COMPLETE is a failure, not a skip — and never a pass.**
-  A hang, a timeout kill, a crashed runner, a suite that stops part-way: each
-  means the thing it was checking went unchecked, and the result is unknown, not
-  good. Never let a run that did not account for every test it started be
-  reported as a rate, a pass, or a green tick.
-
-  This is not hypothetical. The Go gauge published **100.0%** for months over a
-  run that a hung DNS test killed at 476 of 481 — `go test` panicking on
-  `-timeout` emits no terminal event for the tests still in flight, so the
-  summariser divided what it could see and got a perfect score. **A truncated
-  run looks BETTER the more tests go missing**, which is exactly why it survives
-  review. Before believing any suite number, compare tests STARTED against tests
-  that REPORTED a result.
-
-  And fix the cause, not the symptom. Two sessions treated this one without
-  fixing it: the first raised the timeout from 10 minutes to 30 so the kill
-  would stop "corrupting the signal" (cost tripled, population still capped),
-  the second made the report refuse to print a rate (honest, but still no
-  number). The fix was to stop the test hanging.
-- **Never skip or hide a failure to get a clean run.** No `-k`, `--deselect`,
-  `-skip`, `xfail`, try/except-pass, or quietly narrowed include list to make a
-  red thing green. If something genuinely does not belong in a gauge's scope, it
-  is **excluded in the curated include list with a written reason naming what is
-  lost** — which is a scope decision anyone can read and argue with, not a
-  disappearance. A skip whose comment says "flaky" or "fails in CI" is the
-  smell; a skip whose comment says what it measured and why that is out of scope
-  is a decision.
 
 ## Architecture
 

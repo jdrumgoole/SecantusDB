@@ -12,19 +12,17 @@ Run `uv run python -m invoke validate-java --server rust` to refresh. The same u
 
 | Module | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
-| `driver-core__2` | 9 | 1 | 0 | 10 | 90.0% |
-| `driver-sync__0` | 405 | 1 | 354 | 760 | 99.7% |
+| `driver-core__2` | 10 | 0 | 0 | 10 | 100.0% |
+| `driver-sync__0` | 406 | 0 | 354 | 760 | 100.0% |
 | `driver-sync__1` | 79 | 1 | 50 | 130 | 98.7% |
-| **Overall** | **493** | **3** | **404** | **900** | **99.3%** |
+| **Overall** | **495** | **1** | **404** | **900** | **99.7%** |
 
-## Failures (3)
+## Failures (1)
 
 First 30 failed tests for triage:
 
 ```
 driver-sync__1 :: com.mongodb.client.unified.VersionedApiTest#CRUD Api Version 1 (strict): find and getMore append API version
-driver-sync__0 :: com.mongodb.client.MongoCollectionTest#testFindAndUpdateWithGenerics()
-driver-core__2 :: com.mongodb.client.model.GeoJsonFiltersFunctionalSpecification#$geoIntersects
 ```
 
 ## How this is generated

@@ -42,24 +42,32 @@ INCLUDE: list[str] = [
 # are honest gaps not bugs; skipping them keeps the gauge meaningful.
 # Each entry should carry a one-line reason.
 SKIP_PATTERNS: list[str] = [
-    # DNS SRV/TXT resolution against `mongodb.test.build.10gen.cc`. It never
-    # opens a connection to SecantusDB, so it measures nothing about us — and
-    # it HANGS, taking the whole package's 30-minute budget with it.
+    # The SRV/TXT seedlist spec's REPLICA-SET branch only — not the whole spec,
+    # whose `sharded`, `load_balanced` and non-RS cases all run fine.
     #
-    # That hang is why this gauge reported 100.0% for months over an incomplete
-    # run: `go test` killing itself on `-timeout` panics the binary WITHOUT
-    # emitting terminal events for the tests still in flight, so 481 started
-    # and only 476 ever reported. The summariser divided what it could see and
-    # got a perfect score — a truncated run looks BETTER the more tests go
-    # missing. (An earlier session raised the timeout from 10 to 30 minutes to
-    # stop the kill "corrupting the signal"; that treated the cascade and not
-    # the hang, so the cost went from 10 minutes to 30 and the population
-    # stayed capped.)
+    # It hangs FOREVER, and it took the gauge's whole 30-minute budget with it:
+    # `getServerByAddress` (initial_dns_seedlist_discovery_test.go:266) calls
+    # `topo.SelectServer(context.Background(), ...)` — no deadline — waiting for
+    # the SRV-resolved address `localhost...:27017` to appear in the topology.
+    # Our daemon binds an ephemeral port, so that address never appears and the
+    # selection never returns. `go test -timeout` then panics, which kills the
+    # package WITHOUT emitting terminal events for everything else in flight —
+    # so four unrelated tests vanished with it and the summariser scored the
+    # survivors as a clean 100.0%.
     #
-    # Skipping it costs no coverage — SRV discovery is the driver's own
-    # resolver, not our wire protocol — and recovers ~30 minutes per run plus
-    # the four tests that were merely in flight when the killer fired.
-    "TestInitialDNSSeedlistDiscoverySpec",
+    # It is gated on the replica-set persona, which this gauge deliberately
+    # keeps (the change-stream tests need it), so it cannot be dodged with
+    # `--standalone` the way the C gauge's server-selection tests were.
+    #
+    # What is lost: the Go driver's own SRV/TXT resolver. No SecantusDB code
+    # path is exercised by it — it needs a real SRV-addressable replica set on
+    # fixed ports 27017/27018, which a single-node surrogate on an ephemeral
+    # port cannot be.
+    #
+    # Measured 2026-09-28: without this, 803 started / 798 finished / 5 hung,
+    # killed at the timeout. With it, 987 started / 987 finished / 0 hung in
+    # 121 seconds.
+    "TestInitialDNSSeedlistDiscoverySpec/replica_set",
     # Real multi-document transactions (commit/abort with rollback)
     # are out of scope per CLAUDE.md. SecantusDB returns {ok:1} from
     # commitTransaction / abortTransaction but does not actually roll

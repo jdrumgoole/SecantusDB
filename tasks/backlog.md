@@ -2974,6 +2974,63 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **OPEN — the Go gauge's 8 real failures, triaged (2026-09-29).** These were
+      invisible until the truncation fix: the run was killed at 476 of 481 tests
+      and the survivors scored 100.0%, so 16 fail events (8 distinct leaves, the
+      rest parent roll-ups) never reported at all. Now 659 of 659 complete and
+      the gauge reads 97.3%.
+
+      **Two are missing commands, and both are more interesting than "not
+      implemented":**
+
+      * **`setParameter` is not implemented on either server** — mongod has it
+        (verified 8.2.11: `{setParameter: 1, logLevel: 0}` → ok). Needed by
+        `TestConnectionPoolBackpressure` and almost certainly
+        `TestSDAMProse/heartbeats_processed_more_frequently`, which tune server
+        behaviour mid-test. A read-only `getParameter` already exists, so the
+        write side is the gap.
+      * **`replSetStepDown` answers 59 CommandNotFound here; a STANDALONE mongod
+        answers `76 NoReplicationEnabled`.** So this is a divergence, not merely
+        an unimplemented multi-node feature — mongod recognises the command and
+        refuses it with a specific code. Worth probing against a single-node
+        REPLICA SET before choosing our answer, because that is the persona we
+        advertise and it may attempt the step-down rather than refuse.
+        Breaks `TestConnectionsSurvivePrimaryStepDown/getMore_iteration`.
+
+      **Two need a second replica-set member — the documented single-node
+      non-goal:**
+
+      * `TestRetryableReadsProse/retrying_reads_in_a_replica_set/overload_errors_retried_on_a_different_replicaset_server`
+        — retries on a DIFFERENT member; there is no other member.
+
+      **Two are SDAM pool-clearing and want investigation — these are the ones
+      most likely to be real:**
+
+      * `TestSDAMErrorHandling/after_handshake_completes/network_errors/pool_not_cleared_on_timeout_network_error`
+      * `...pool_not_cleared_on_context_cancellation`
+
+        Both assert the connection pool is **not** cleared when a network error
+        is a timeout or a client-side cancellation (as opposed to a real socket
+        failure, which must clear it). Both fail "Should be true". If we clear
+        the pool on a cancelled context, a client that cancels one operation
+        drops every pooled connection — a real and unpleasant behaviour, not a
+        topology nicety. Probe before assuming it is out of scope.
+
+      **Two are mongocryptd:**
+
+      * `TestSessionsMongocryptdProse/18._implicit_session_is_ignored_if_connection_does_not_support_sessions`
+      * `TestSessionsMongocryptdProse/19._explicit_session_raises_an_error_...`
+
+        These need a server that reports NO `logicalSessionTimeoutMinutes` (the
+        mongocryptd shape). Likely out of scope with CSFLE, but the mechanism —
+        how we advertise session support — is ours, so confirm rather than
+        assume.
+
+      Reproduce any of them directly rather than through the gauge:
+      `cd vendor/mongo-go-driver && MONGODB_URI=mongodb://127.0.0.1:<port> go test
+      ./internal/integration/ -run '<TestName>' -timeout 60s -count=1 -v`
+      against a daemon WITHOUT `--standalone` (several are replica-set-gated).
+
 - [ ] **OPEN — three server-side defects found by the 2026-09-28 Rust gauge
       sweep, none of them in pymongo.** The pymongo gauge is at 1,205 / 5 with
       only declared non-goals left, so these came from the other-language
