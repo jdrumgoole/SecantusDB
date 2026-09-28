@@ -2974,6 +2974,41 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **OPEN — seven `-rust-server` reports carry a date weeks newer than the
+      measurement behind them (2026-09-28).** The `Generated <date>` line
+      records when the report GENERATOR ran, not when the tests ran, and for
+      these gauges the two are far apart:
+
+      | report | claims | raw artifact actually dated |
+      | --- | --- | --- |
+      | `validation-report-rust-server.md` (pymongo) | 2026-09-21, 0.6.0b16 | **30 Aug** |
+      | `validation-report-pymongo-async-rust-server.md` | 2026-09-21, 0.6.0b16 | **10 Aug** |
+      | `validation-report-c-rust-server.md` | 2026-09-21, 0.6.0b16 | **19 Aug** |
+      | `validation-report-cxx-rust-server.md` | 2026-09-21, 0.6.0b16 | **19 Aug** |
+      | `validation-report-dotnet-rust-server.md` | 2026-09-21, 0.6.0b16 | **19 Aug** |
+      | `validation-report-php-ext-rust-server.md` | 2026-09-21, 0.6.0b16 | **19 Aug** |
+      | `validation-report-php-lib-rust-server.md` | 2026-09-21, 0.6.0b16 | **19 Aug** |
+
+      Check any of them with
+      `ls -l .validation/*rust-server*` against `sed -n 3p docs/validation-report-<x>-rust-server.md`.
+
+      **Why this is not merely "stale".** A stale report that says so is
+      harmless. These say 2026-09-21 and a current version string over August
+      data, so the usual freshness check — read the Generated line — actively
+      confirms the wrong thing. The mechanism that produced the mismatch is
+      fixed for the two pymongo gauges (they now refuse to regenerate a report
+      from a raw the run did not write), but the OTHER five were regenerated the
+      same way and nothing re-measured them.
+
+      **Do not hand-edit the dates.** Re-run each gauge against the Rust server
+      (`invoke validate-<x> --server rust`) and let it write both artifacts, or
+      delete the report so its absence is honest. A hand-corrected date is worse
+      than a wrong one, because nothing marks it as unmeasured.
+
+      Related: `validation_summary/driver_panels.py` reads only the PYTHON
+      artifacts, so the published panels are unaffected by these seven — but
+      anyone quoting a Rust number from `docs/` is quoting August.
+
 - [ ] **OPEN — the Go gauge reports 100.0% over a population capped by a
       30-minute timeout, and nothing in the report says so (2026-09-28).**
       Every recorded run of this gauge has been truncated at the same point, on
