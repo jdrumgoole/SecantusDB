@@ -282,6 +282,12 @@ def _format_rate(stats: GaugeStats) -> str:
     """
     if stats.ran <= 0:
         return "&mdash;"
+    # A run that did not account for every test it started has no rate to
+    # show. `passed / ran` over the part that finished looks BETTER the more
+    # tests went missing, which is how the Go panel read 100.0% while its run
+    # was being cut short at 476 of 481 by a 30-minute DNS hang.
+    if stats.truncated:
+        return "&mdash;"
     return rates.pass_rate(stats.passed, stats.ran)
 
 
@@ -382,6 +388,19 @@ _GRID_FOOT = """\
 """
 
 
+def _is_empty(path: Path) -> bool:
+    """Does this artifact contain no results at all?
+
+    A directory artifact (the JVM gauges' JUnit XML) is empty when it holds no
+    files; a file artifact is empty when it has no bytes. Both are states a
+    cleared-but-not-refilled gauge run leaves behind, and both keep a fresh
+    mtime, so the age check cannot see them.
+    """
+    if path.is_dir():
+        return not any(f.is_file() and f.stat().st_size > 0 for f in path.rglob("*"))
+    return path.stat().st_size == 0
+
+
 def _refuse_mixed_age(raw_dir: Path, suffix: str, server: str, max_spread_days: float) -> None:
     """Refuse to publish a grid whose panels were measured weeks apart.
 
@@ -396,10 +415,29 @@ def _refuse_mixed_age(raw_dir: Path, suffix: str, server: str, max_spread_days: 
     CONSISTENT sweep is honest, and it is the mixing that misleads.
     """
     ages: dict[str, dt.datetime] = {}
+    empty: list[str] = []
     for name, base in generate.GAUGE_ARTIFACTS.items():
         path = generate._artifact(raw_dir, base, suffix)
-        if path.exists():
-            ages[name] = dt.datetime.fromtimestamp(path.stat().st_mtime)
+        if not path.exists():
+            continue
+        if _is_empty(path):
+            empty.append(name)
+            continue
+        ages[name] = dt.datetime.fromtimestamp(path.stat().st_mtime)
+    if empty:
+        # An EMPTY artifact with a fresh mtime passed the age check and rendered
+        # a blank panel beside twelve real ones — observed 2026-09-28, when a
+        # Java re-run cleared `java-results-rust-server/` and never refilled it,
+        # while the report on disk still described the data that had gone. Age
+        # alone cannot see that: the directory's timestamp was the newest of the
+        # lot.
+        raise SystemExit(
+            f"refusing to render the {server}-server panel grid: these artifacts "
+            f"exist but contain no results, so their panels would render blank "
+            f"beside real ones:\n"
+            + "\n".join(f"    {n}" for n in sorted(empty))
+            + f"\n  Re-run those gauges with `--server {server}`."
+        )
     if len(ages) < 2:
         return
     newest = max(ages.values())

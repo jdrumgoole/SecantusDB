@@ -65,6 +65,12 @@ class GaugeStats:
     skipped: int
     failure_descriptions: list[str]  # the raw failure descriptions, for matching
     note: str = ""  # optional scope note (e.g. "21 of 112 functional classes")
+    #: The run did not account for every test it started, so `passed / ran`
+    #: describes only the part that finished. A truncated gauge must not show a
+    #: rate: the Go gauge published 100.0% for months over a run cut short at
+    #: 476 of 481 tests by a 30-minute DNS hang, and the number looked perfect
+    #: precisely because the missing tests reported nothing at all.
+    truncated: bool = False
 
     # Populated by ``_apply_expected_failures`` below.
     expected_failures: int = 0
@@ -306,14 +312,30 @@ def _collect_go(raw_dir: Path, suffix: str = "") -> GaugeStats | None:
         return None
     passed = failed = skipped = 0
     failure_descs: list[str] = []
+    # Same truncation rule as `go_validation.generate_report`: a `go test`
+    # timeout panics the binary WITHOUT emitting a terminal event for the tests
+    # still running, so the ones that finished look like a clean sweep. The
+    # report refuses to show a rate for that (#1613); the panel published
+    # 100.0% regardless, which is the surface people actually read.
+    started: set[str] = set()
+    finished: set[str] = set()
+    pkg_failed: set[str] = set()
     for line in f.read_text().splitlines():
         try:
             ev = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if not ev.get("Test"):
-            continue
         action = ev.get("Action")
+        if not ev.get("Test"):
+            if action == "fail":
+                pkg_failed.add(ev.get("Package", "?"))
+            continue
+        key = f"{ev.get('Package', '?')}::{ev['Test']}"
+        if action == "run":
+            started.add(key)
+            continue
+        if action in {"pass", "fail", "skip"}:
+            finished.add(key)
         if action == "pass":
             passed += 1
         elif action == "fail":
@@ -321,6 +343,10 @@ def _collect_go(raw_dir: Path, suffix: str = "") -> GaugeStats | None:
             failure_descs.append(ev["Test"])
         elif action == "skip":
             skipped += 1
+    # Two signatures, either of which means the run did not account for its
+    # tests: a test that emitted `run` with no terminal event, or a package
+    # reporting `fail` with no failing test beneath it.
+    truncated = bool(started - finished) or (bool(pkg_failed) and failed == 0)
     return GaugeStats(
         name="mongo-go-driver",
         language="Go",
@@ -330,6 +356,7 @@ def _collect_go(raw_dir: Path, suffix: str = "") -> GaugeStats | None:
         skipped=skipped,
         failure_descriptions=failure_descs,
         note="vendor/mongo-go-driver/internal/integration/...",
+        truncated=truncated,
     )
 
 
