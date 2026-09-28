@@ -924,10 +924,16 @@ def rust_gate(c: Context, pytest: bool = True, deselect: str = "") -> None:
     # fmt/clippy above only cover the Rust workspace, so a ruff slip in a parity
     # test (e.g. a too-long line) would pass the gate and red CI. Mirror CI's
     # `Lint` / `Format check` steps so it's caught before push.
+    #
+    # `.`, matching CI exactly. These said `src tests` until 2026-09-28, and for
+    # a few hours after CI was widened to `.` they did NOT mirror it any more --
+    # so this gate would pass while CI failed, which is the precise failure the
+    # comment above says it exists to prevent. `test_build_provenance.py` now
+    # pins the two to the same scope; change them together.
     print(f"==> [6/{steps}] ruff check", flush=True)
-    c.run("uv run ruff check src tests", pty=PTY)
+    c.run("uv run ruff check .", pty=PTY)
     print(f"==> [7/{steps}] ruff format", flush=True)
-    c.run("uv run ruff format --check src tests", pty=PTY)
+    c.run("uv run ruff format --check .", pty=PTY)
     if pytest:
         print(f"==> [8/{steps}] pytest", flush=True)
         cmd = "uv run --no-sync --extra dev --extra admin python -m pytest -q"

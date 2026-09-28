@@ -298,9 +298,46 @@ one request path:
     wrong number would have stood.) This is the same rule the pinned-worktree
     requirement already imposes on *timing* runs, applied to every other number:
     gauge rates, validation reports, benchmark tables.
-  - Not there yet: `CREATE INDEX` (refused outright, 0A000) and password
-    verification (a role's SCRAM verifier is stored and never checked — a wrong
-    password and no password both connect, re-probed 2026-09-18).
+
+    **Much of this is checked for you now (2026-09-28), but not all of it.**
+    `tools/provenance.py` compares a built artifact's stamped `crates/` tree
+    against `git rev-parse HEAD:crates` and ABORTS, and it is called from the
+    pytest collection hook, both probe launchers, `gauge_common.rust_binary()`,
+    the psycopg gauge runner, and the four `bench/` harnesses that feed published
+    tables. So a stale artifact can no longer silently produce a number from
+    those paths. `SECANTUS_ALLOW_STALE_ARTIFACT=1` overrides it (and still
+    prints), for deliberately measuring an OLD build.
+
+    What is still on you: anything launched by hand, a new harness that does not
+    call it, and an artifact carrying no stamp at all — the check abstains rather
+    than guess, so silence is not proof of freshness. `<binary> --version` prints
+    the tree; compare it yourself when in doubt.
+  - **The gauge number above measures the PROTOCOL and the TYPE SYSTEM, which is
+    this server's strong half. It says very little about the QUERY LANGUAGE.**
+    Surveyed 2026-09-28 against a binary built from `HEAD:crates`, seventeen
+    features are refused outright (`0A000 … is not supported yet`): subqueries in
+    every form (`SubLink`) including `EXISTS` / `IN (select…)` / a scalar
+    `(select 1)`, a subquery in `FROM`, CTEs, `LIKE` / `ILIKE` / regex `~`,
+    `CASE`, window functions, `ORDER BY` over an expression, `SELECT *` over a
+    JOIN, array subscripting, `CREATE INDEX`, `ALTER TABLE` in ANY form,
+    `CREATE VIEW`, `CREATE TRIGGER`, `EXPLAIN`, composite `PRIMARY KEY` /
+    multi-column `FOREIGN KEY`, and a non-literal column `DEFAULT`.
+
+    **Two clauses are worse than refused — they are parsed and then DROPPED**, so
+    the client gets a confident wrong answer: `ON CONFLICT DO NOTHING` / `DO
+    UPDATE` raises `23505` where PostgreSQL succeeds (it works on the PYTHON
+    server, so this is a divergence between the two, not a shared gap), and
+    `GROUPING SETS` / `ROLLUP` answers a misleading `42803` blaming the user's
+    query. Both violate the wire-fidelity rule below; see `tasks/backlog.md` §5
+    for the full survey and what DOES work.
+
+    So do not read "96.8% of psycopg passes" as "nearly done". A SQL-shaped gauge
+    (`sqllogictest`, the SQLAlchemy dialect suite) would score very differently,
+    and the biggest single lever is subqueries and CTEs.
+  - Not there yet, beyond the survey above: password verification (a role's SCRAM
+    verifier is stored and never checked — a wrong password and no password both
+    connect, re-probed 2026-09-18, re-confirmed live 2026-09-28 by connecting
+    with a deliberately wrong one).
     **`UNIQUE` IS enforced** — the earlier claim that it was "accepted without
     being enforced" was stale when measured against PostgreSQL 14.24 on
     2026-09-20: a duplicate on a column-level or table-level `UNIQUE` raises

@@ -569,3 +569,24 @@ def test_ruff_excludes_every_vendored_tree() -> None:
         f"so upstream's style would be reported as our lint failure. Add them to "
         f"`extend-exclude` in pyproject.toml."
     )
+
+
+def test_the_local_gate_lints_the_same_scope_as_ci() -> None:
+    """`./inv rust-gate` exists to catch a ruff slip BEFORE the push.
+
+    It can only do that while it runs the same command CI runs. When CI was
+    widened from `src tests` to `.` on 2026-09-28, this task was left behind for
+    a few hours — so the gate would have passed while CI failed, which is exactly
+    the failure its own comment says it prevents. Found by the documentation pass
+    at session close, not by anything automated, hence this test.
+    """
+    tasks = (REPO / "rust_tasks.py").read_text()
+    ci_check = _ci_ruff_paths("run: uv run ruff check ")
+    ci_format = _ci_ruff_paths("run: uv run ruff format --check ")
+
+    for label, scope in (("check", ci_check), ("format --check", ci_format)):
+        expected = f'c.run("uv run ruff {label} {" ".join(sorted(scope))}", pty=PTY)'
+        assert expected in tasks, (
+            f"rust_tasks.py does not run CI's `ruff {label}` scope. "
+            f"CI uses {sorted(scope)}; the gate must match or it passes while CI fails."
+        )
