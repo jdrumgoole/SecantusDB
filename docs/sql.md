@@ -15,7 +15,7 @@ acceleration, the type system, and transactions for free.
 The SQL interface is an **opt-in extra**. Install it with:
 
 ```console
-$ pip install "secantus[sql]"
+$ pip install "SecantusDB[sql]"
 ```
 
 The core MongoDB server never imports the SQL layer, so the base install stays
@@ -44,7 +44,7 @@ server.start()
 server.stop()
 ```
 
-Or run it straight from the command line — `pip install "secantus[sql]"` puts a
+Or run it straight from the command line — `pip install "SecantusDB[sql]"` puts a
 `secantusd-py-pg` script on your `PATH` (the SQL sibling of the Mongo
 `secantusd-py` daemon):
 

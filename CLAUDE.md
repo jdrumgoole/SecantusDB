@@ -12,7 +12,7 @@ product; the Python pair is the reference implementation they are held to.
 | server | binary / entry point | wire | role |
 | --- | --- | --- | --- |
 | **Rust MongoDB server** | `secantusd-rs` (`crates/secantusdb`) | MongoDB | **the flagship.** Prebuilt binaries per platform, and bundled in the wheel |
-| **Rust PostgreSQL server** | `secantusd-pg` (`crates/secantus-pgserver`) | PostgreSQL | **the newest.** Builds from its own directory; prebuilt binaries await a pushed `secantusd-pg-v*` tag |
+| **Rust PostgreSQL server** | `secantusd-pg` (`crates/secantus-pgserver`) | PostgreSQL | **the newest.** Embedded in the wheel as `_secantus_server.PgServer`; standalone binaries on the `secantusd-pg-v*` releases (Linux x86_64, macOS arm64); builds from its own directory |
 | Python MongoDB server | `SecantusDBServer` / `secantusd-py` | MongoDB | the reference — every operator, stage and error message lands here first |
 | Python PostgreSQL server | `secantusd-py-pg` (`secantus.sql.pgserver`) | PostgreSQL | the reference for the SQL surface, and still the most complete one |
 
