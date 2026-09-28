@@ -1867,6 +1867,11 @@ impl PgHandler {
             // shape and the wrong number, which no error would flag.
             // A joined subquery's rows, already keyed by output name.
             _ if agg.join.is_some() => self.join_docs(agg.join.as_ref().expect("checked"))?,
+            // A FROM-subquery or inlined CTE under the aggregate: materialise
+            // it, then group its rows exactly as a table's.
+            _ if agg.sub.is_some() => {
+                self.sub_source_docs(agg.sub.as_ref().expect("checked"), &agg.filter)?
+            }
             None if Self::virtual_table(&agg.table).is_some() => {
                 self.virtual_rows(&agg.table, &agg.filter).expect("checked")
             }
@@ -2115,11 +2120,99 @@ impl PgHandler {
     /// aggregate subquery today); anything else is a planner/executor mismatch.
     fn sub_plan_rows(&self, stmt: &Statement) -> PgWireResult<Vec<Document>> {
         match stmt {
+            // An aggregate's rows are already keyed by output name, so they
+            // need no positional rebuild.
             Statement::Aggregate(agg) => self.aggregate_rows(agg),
-            _ => Err(Self::err(&PlanError::Unsupported(
-                "this JOIN subquery shape".into(),
-            ))),
+            _ => {
+                let def = secantus_pgplan::sub_plan_def(stmt, &|n| self.lookup(n))
+                    .map_err(|e| Self::err(&e))?;
+                self.materialise_sub(stmt, &def)
+            }
         }
+    }
+
+    /// A subquery's rows for the PLANNER, as values in select-list order.
+    ///
+    /// This is the door the planner is given onto storage, and it is only
+    /// ever handed a SELECT-shaped statement: `resolve_one_sublink` plans the
+    /// subquery's own `SELECT` and passes that, so nothing that writes can
+    /// reach here. The error type is the planner's, because its caller is
+    /// mid-plan and has no wire error to return yet.
+    fn subquery_rows(&self, stmt: &Statement) -> std::result::Result<Vec<Vec<Bson>>, PlanError> {
+        // INSIDE the open transaction, because a WiredTiger transaction reads
+        // its own snapshot and this read happens during PLANNING -- outside
+        // the `with_user_transaction` scope that the statement's execution
+        // runs in. Without this, `insert ...; select count(*) from t where id
+        // in (select id from t)` answered the count from BEFORE the insert,
+        // while the same query without the subquery answered correctly.
+        //
+        // `try_lock` rather than `lock`: a failure means this thread already
+        // holds the guard, which can only happen if we are already running
+        // inside the transaction scope -- and then the plain read is already
+        // the right one. A blocking lock there would deadlock the connection.
+        let read = || self.rows_with_schema(stmt);
+        let rows = match self.txn.try_lock() {
+            Ok(mut guard) => match guard.as_mut() {
+                Some(handle) => self
+                    .storage
+                    .with_user_transaction(handle, read)
+                    .map_err(|e| PlanError::Internal(format!("could not read a subquery: {e}")))?,
+                None => read(),
+            },
+            Err(_) => read(),
+        };
+        let (_, rows) =
+            rows.map_err(|e| PlanError::Internal(format!("could not read a subquery: {e}")))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| r.into_iter().map(|v| v.unwrap_or(Bson::Null)).collect())
+            .collect())
+    }
+
+    /// A subquery's rows as documents keyed the way the outer query reads
+    /// them: by `def`'s column fields, POSITIONALLY.
+    ///
+    /// Positional rather than by name on purpose. `rows_with_schema` returns
+    /// each row as a vector in the inner query's select-list order, and a
+    /// column alias list (`(select ...) s(a, b)`) renames those outputs
+    /// without touching the inner plan -- so matching by name would read the
+    /// pre-rename name and find nothing. Two outputs may also share a name,
+    /// which a name-keyed rebuild would collapse into one.
+    fn materialise_sub(&self, stmt: &Statement, def: &TableDef) -> PgWireResult<Vec<Document>> {
+        let (_, rows) = self.rows_with_schema(stmt)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let mut d = Document::new();
+                for (i, c) in def.columns.iter().enumerate() {
+                    // A NULL cell is stored as an explicit `Bson::Null` rather
+                    // than left out: the outer query's `col IS NULL` and its
+                    // ORDER BY both read the field, and a missing one is not
+                    // the same thing as a null one to an MQL filter.
+                    d.insert(c.field(), r.get(i).cloned().flatten().unwrap_or(Bson::Null));
+                }
+                d
+            })
+            .collect())
+    }
+
+    /// The rows of a `FROM (SELECT ...) s` source, with the outer query's
+    /// WHERE applied. There is no storage to push the filter into, so it runs
+    /// in memory -- the same shape the generated-series source uses.
+    fn sub_source_docs(
+        &self,
+        sub: &secantus_pgplan::SubSource,
+        filter: &Document,
+    ) -> PgWireResult<Vec<Document>> {
+        let docs = self.materialise_sub(&sub.plan, &sub.def)?;
+        if filter.is_empty() {
+            return Ok(docs);
+        }
+        let empty = Document::new();
+        Ok(docs
+            .into_iter()
+            .filter(|d| secantus_core::query::matches(d, filter, &empty, None).unwrap_or(false))
+            .collect())
     }
 
     fn join_docs(&self, join: &secantus_pgplan::JoinSelect) -> PgWireResult<Vec<Document>> {
@@ -2159,6 +2252,21 @@ impl PgHandler {
 
         let left_is_sub = join.left_sub.is_some();
         let right_is_sub = join.right_sub.is_some();
+        // Which columns the LEFT side has, for resolving an UNQUALIFIED
+        // reference. A subquery side's def comes from its own plan: before
+        // that was available this fell back to "assume the right side", which
+        // returned NULL for `select x, y from (select 1 as x) a, (select 2 as
+        // y) b` -- a wrong answer rather than an error, and invisible until a
+        // subquery side other than an aggregate could be planned at all.
+        let left_has = |col: &str| -> bool {
+            match &join.left_sub {
+                Some(stmt) => secantus_pgplan::sub_plan_def(stmt, &|n| self.lookup(n))
+                    .is_ok_and(|d| d.column(col).is_some()),
+                None => self
+                    .lookup(&join.left.0)
+                    .is_some_and(|d| d.column(col).is_some()),
+            }
+        };
         let lfield = |col: &str| -> PgWireResult<String> {
             if left_is_sub {
                 Ok(col.to_string())
@@ -2274,14 +2382,11 @@ impl PgHandler {
                     }
                     let on_left = if *alias == join.left.1 {
                         true
-                    } else if *alias == join.right.1 || left_is_sub {
-                        // A named right alias, or an unaliased column when the
-                        // left side is a subquery (whose columns we cannot probe
-                        // by name), resolves to the right.
+                    } else if *alias == join.right.1 {
                         false
                     } else {
-                        self.lookup(&join.left.0)
-                            .is_some_and(|d| d.column(col).is_some())
+                        // Unqualified: it belongs to whichever side HAS it.
+                        left_has(col)
                     };
                     let value = if on_left {
                         let f = lfield(col)?;
@@ -6425,12 +6530,21 @@ impl PgHandler {
         // runs first there too, so `selct 1` still answers `42601`.
         let tz = self.session_timezone();
         self.install_user_types();
-        let planned = secantus_pgplan::plan_with_session_types(
+        // An uncorrelated subquery is RUN during planning and replaced by the
+        // values it returned, so the lowering below never sees a `SubLink`.
+        // The runner is this handler's own row reader, which is what gives the
+        // planner -- otherwise unable to touch storage -- a way to evaluate
+        // one.
+        let run = |stmt: &Statement| -> std::result::Result<Vec<Vec<Bson>>, PlanError> {
+            self.subquery_rows(stmt)
+        };
+        let planned = secantus_pgplan::plan_with_session_types_and_subqueries(
             sql,
             &|n| self.lookup(n),
             params,
             param_types,
             &tz,
+            Some(&run),
         );
         self.collect_planner_warnings();
         if self.txn_failed.load(std::sync::atomic::Ordering::Relaxed) {
@@ -7834,6 +7948,11 @@ impl PgHandler {
     /// output columns, the series' one int4 column, the virtual table, or the
     /// catalog entry.
     fn select_def(&self, sel: &secantus_pgplan::Select) -> PgWireResult<TableDef> {
+        // A FROM-subquery (or an inlined CTE) carries its own output def,
+        // computed when it was planned.
+        if let Some(sub) = &sel.sub {
+            return Ok(sub.def.clone());
+        }
         if let Some(join) = &sel.join {
             return secantus_pgplan::join_output_def(join, &|n| self.lookup(n))
                 .map_err(|e| Self::err(&e));
@@ -7863,6 +7982,14 @@ impl PgHandler {
         // on documents and does not care where they came from, which is
         // why the series is a SOURCE rather than its own statement.
         let (mut docs, def): (Vec<Document>, TableDef) = match (&sel.series, &sel.join) {
+            // A FROM-subquery or inlined CTE: run the inner plan, then treat
+            // its output columns as the table. Checked first because such a
+            // select carries neither a series nor a join.
+            _ if sel.sub.is_some() => {
+                let sub = sel.sub.as_ref().expect("checked");
+                let docs = self.sub_source_docs(sub, &sel.filter)?;
+                (docs, sub.def.clone())
+            }
             // A top-level JOIN source: materialise it, treat its
             // output columns as the table.
             (_, Some(join)) => {
@@ -8102,16 +8229,7 @@ impl PgHandler {
     fn set_op_fields(&self, stmt: &Statement) -> PgWireResult<Vec<FieldInfo>> {
         match stmt {
             Statement::Select(sel) => {
-                let def = match &sel.join {
-                    Some(join) => secantus_pgplan::join_output_def(join, &|n| self.lookup(n))
-                        .map_err(|e| Self::err(&e))?,
-                    None if sel.series.is_some() => {
-                        series_table_def(sel.series.as_ref().expect("checked"))
-                    }
-                    None => self
-                        .lookup(&sel.table)
-                        .ok_or_else(|| Self::err(&PlanError::UndefinedTable(sel.table.clone())))?,
-                };
+                let def = self.select_def(sel)?;
                 Ok(self.row_schema(&def, &sel.columns, &sel.casts))
             }
             Statement::SelectConstant(sc) => Ok(sc
@@ -8230,6 +8348,30 @@ impl PgHandler {
                 Ok((schema, rows))
             }
             Statement::SetOp(set) => self.set_op_rows(set),
+            Statement::Aggregate(agg) => {
+                let def = secantus_pgplan::aggregate_output_def(agg).map_err(|e| Self::err(&e))?;
+                let schema = def
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        let wire = self
+                            .user_wire_type(&c.pg_type)
+                            .unwrap_or_else(|| wire_type(&c.pg_type));
+                        self.field(c.name.clone(), wire)
+                    })
+                    .collect::<Vec<_>>();
+                let rows = self
+                    .aggregate_rows(agg)?
+                    .iter()
+                    .map(|d| {
+                        def.columns
+                            .iter()
+                            .map(|c| Some(d.get(c.field()).cloned().unwrap_or(Bson::Null)))
+                            .collect()
+                    })
+                    .collect();
+                Ok((schema, rows))
+            }
             _ => Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".into(),
                 "0A000".into(),
@@ -14947,12 +15089,21 @@ impl PgHandler {
         // the client sees the describe's error.
         let tz = self.session_timezone();
         self.install_user_types();
-        let stmt = secantus_pgplan::plan_with_session_types(
+        // An uncorrelated subquery is RUN during planning and replaced by the
+        // values it returned, so the lowering below never sees a `SubLink`.
+        // The runner is this handler's own row reader, which is what gives the
+        // planner -- otherwise unable to touch storage -- a way to evaluate
+        // one.
+        let run = |stmt: &Statement| -> std::result::Result<Vec<Vec<Bson>>, PlanError> {
+            self.subquery_rows(stmt)
+        };
+        let stmt = secantus_pgplan::plan_with_session_types_and_subqueries(
             sql,
             &|n| self.lookup(n),
             &params,
             param_types,
             &tz,
+            Some(&run),
         )
         .map_err(|e| Self::err(&e))
         // psycopg learns a statement's columns with a `Describe` sent straight
@@ -15008,13 +15159,7 @@ impl PgHandler {
             // PostgreSQL has it -- names and types both.
             Statement::SetOp(set) => self.set_op_fields(&set.left)?,
             Statement::Select(sel) => {
-                let def = match &sel.join {
-                    Some(join) => secantus_pgplan::join_output_def(join, &|n| self.lookup(n))
-                        .map_err(|e| Self::err(&e))?,
-                    None => self
-                        .lookup(&sel.table)
-                        .ok_or_else(|| Self::err(&PlanError::UndefinedTable(sel.table.clone())))?,
-                };
+                let def = self.select_def(&sel)?;
                 self.row_schema(&def, &sel.columns, &sel.casts)
             }
             // `INSERT ... RETURNING` describes the RETURNING list over the

@@ -6795,9 +6795,9 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
       | gap | probe | error |
       | --- | --- | --- |
-      | subqueries, every form | `(select 1)`, `exists(…)`, `in (select…)` | `SubLink` |
-      | subquery in FROM | `select y from (select 1 as y) s` | `RangeSubselect` |
-      | CTEs | `with c as (select 1 as x) select x from c` | `42P01 relation "c" does not exist` |
+      | ~~subqueries, every form~~ | **DONE 2026-09-28**, uncorrelated only | correlated refused by name |
+      | ~~subquery in FROM~~ | **DONE 2026-09-28** | with `s(a, b)` column aliases |
+      | ~~CTEs~~ | **DONE 2026-09-28**, non-recursive | `WITH RECURSIVE` and data-modifying refused |
       | ~~`LIKE` / `ILIKE` / `NOT LIKE`~~ | **DONE 2026-09-28** | with `ESCAPE` |
       | ~~regex `~` / `~*` / `!~` / `!~*`~~ | **DONE 2026-09-28** | |
       | ~~`CASE`~~ | **DONE 2026-09-28** | both forms; still refused inside a bare `WHERE` |
@@ -6880,8 +6880,68 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       `INSERT … SELECT`, multi-row `VALUES`, `coalesce` / `nullif`, and the
       string functions.
 
-      Biggest single lever: **subqueries and CTEs**, which gate most real
-      application SQL and also gate any broader SQL gauge.
+      ~~Biggest single lever: **subqueries and CTEs**, which gate most real
+      application SQL and also gate any broader SQL gauge.~~ **SHIPPED
+      2026-09-28** — see the entry below for what is left of it.
+
+- [ ] **OPEN — RUST pgserver: a CORRELATED subquery is refused, and that is
+      the whole remainder of the subquery work (2026-09-28).** Uncorrelated
+      subqueries, FROM-subqueries and non-recursive CTEs all landed; measured
+      on a 50-line corpus against PostgreSQL 14.13
+      (`tools/probes/pg_corpora/subqueries.sql`), 5 of 50 diverge and all five
+      are correlated:
+
+      ```
+      select id from d where exists (select 1 from e where e.dept_id = d.id)
+      select d.name, (select count(*) from e where e.dept_id = d.id) from d
+      ```
+
+      **Why it was refused rather than approximated.** An uncorrelated
+      subquery is evaluated ONCE and replaced by the values it returned, which
+      is both what PostgreSQL does and what lets the existing `ANY`/`ALL`
+      lowering serve it. A correlated one has a different value per outer row,
+      so there is nothing to substitute.
+
+      **The shape a fix would take, and the cost, measured rather than
+      guessed.** The pieces already exist: `ColumnExpr::Row` rewrites column
+      references into parameters numbered past the statement's own and
+      evaluates the node per row, and `plan_select` can be called on a stored
+      AST with a fresh parameter list. So the inner `SelectStmt` can be kept
+      in the plan, its outer references rewritten to `$N`, and the subquery
+      re-planned and re-run per outer row. That is O(rows) plans and O(rows)
+      scans — correct, and slow enough that it should be measured before it is
+      called done. A semi-join rewrite for the `EXISTS` / `IN` cases (the
+      common ones) would avoid the per-row cost and is the better target.
+
+      **The trap, which cost a wrong answer during the uncorrelated work.**
+      Correlation cannot be detected by trying to plan the subquery and
+      catching `42703`: the lowering resolves a column by the LAST part of its
+      name and IGNORES the qualifier, so `e.dept_id = d.id` bound the outer
+      `d.id` to the inner table's own `id` and planned CLEAN. The EXISTS then
+      answered true for every outer row — a wrong answer, caught only by
+      diffing against PostgreSQL. `foreign_qualifier` now refuses any
+      qualified reference whose qualifier names nothing in the subquery's own
+      FROM, and `tests/test_rust_pgserver_slice.py::
+      test_a_correlated_subquery_is_refused_not_answered_wrongly` pins it.
+      Anything that makes correlated subqueries WORK must keep that check
+      honest, because the qualifier is still ignored everywhere else.
+
+- [ ] **WATCH — an uncorrelated subquery runs at PLAN time, so a VOLATILE
+      function inside one would fire on a bare `Describe` (2026-09-28).**
+      Not reachable today and checked rather than assumed: the Rust PG server
+      implements neither `nextval` (`function nextval() is not supported yet`,
+      even for a `serial` column's implicit sequence) nor `CREATE SEQUENCE`
+      (`CreateSeqStmt`), so nothing side-effecting can appear in a subquery at
+      all. The refusal propagates out of the subquery correctly.
+
+      **It becomes real the day `nextval` lands.** `resolve_one_sublink` runs
+      the subquery during planning, and planning happens on `Describe` as well
+      as on `Execute` — psycopg sends a `Describe` straight after `Parse`, so
+      `select (select nextval('s'))` would advance the sequence once for the
+      describe and once for the execute, where PostgreSQL advances it once.
+      Fix when it matters: skip the resolution when the plan is only being
+      described (the describe path does not need the subquery's VALUE, only
+      its type), or refuse a volatile function inside a subquery.
 
       Probe: `crates/secantus-pgserver/target/debug/secantusd-pg <store>
       127.0.0.1:<port> --database probe`, driven with psycopg 3. **Rebuild
