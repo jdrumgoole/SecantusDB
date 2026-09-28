@@ -1,6 +1,6 @@
 # Cross-Driver Conformance Summary
 
-Generated 2026-09-21 — SecantusDB 0.6.0b16. Each per-driver gauge runs the driver vendor's own integration test suite (unmodified) against a SecantusDB daemon and emits its raw output to `.validation/`. This summary normalises on **test count** so the 13 gauges compare like for like — every row counts one assertion outcome, whether it landed as a JUnit `<testcase>`, a Mocha test, an RSpec example, a `go test` event, or a pytest collected item.
+Generated 2026-09-28 — SecantusDB 0.6.0b17. Each per-driver gauge runs the driver vendor's own integration test suite (unmodified) against a SecantusDB daemon and emits its raw output to `.validation/`. This summary normalises on **test count** so the 13 gauges compare like for like — every row counts one assertion outcome, whether it landed as a JUnit `<testcase>`, a Mocha test, an RSpec example, a `go test` event, or a pytest collected item.
 
 **Failures split into two columns**: *Failed* counts tests that actually need a fix on SecantusDB; *Expected* counts tests with a documented reason for failing (driver-side cascade, out-of-scope feature, single-node-topology assumption, known intermittent flake). The expected list lives in `validation_summary/expected_failures.py` and each entry carries a rationale. Adjusted pass rate = passes ÷ (passes + actual failures).
 
@@ -8,20 +8,20 @@ Generated 2026-09-21 — SecantusDB 0.6.0b16. Each per-driver gauge runs the dri
 
 | Driver | Language | Driver version | Tests run | Passed | Failed | Expected | Skipped | Pass rate | Adjusted |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|
-| `pymongo` | Python | `f2103a95870a` | 1501 | 1072 | 0 | 5 | 424 | 99.5% | 100.0% |
-| `pymongo (async)` | Python | `f2103a95870a` | 1423 | 977 | 0 | 6 | 440 | 99.3% | 100.0% |
-| `mongo-java-driver` | Java | `cb45be6bb147` | 900 | 493 | 1 | 1 | 405 | 99.5% | 99.7% |
+| `pymongo` | Python | `f2103a95870a` | 1501 | 1204 | 2 | 5 | 290 | 99.4% | 99.8% |
+| `pymongo (async)` | Python | `f2103a95870a` | 1423 | 1109 | 2 | 6 | 306 | 99.2% | 99.8% |
+| `mongo-java-driver` | Java | `cb45be6bb147` | 900 | 492 | 2 | 2 | 404 | 99.1% | 99.5% |
 | `mongo-kotlin-driver` | Kotlin | `cb45be6bb147` | 538 | 340 | 0 | 0 | 198 | 100.0% | 100.0% |
 | `mongo-go-driver` | Go | `fd85a834c40e` | 476 | 439 | 0 | 0 | 37 | 100.0% | 100.0% |
 | `mongo-node-driver` | Node.js | `7e53685952f2` | 364 | 357 | 0 | 1 | 6 | 99.7% | 100.0% |
 | `mongo-ruby-driver` | Ruby | `f68d676643c1` | 283 | 258 | 0 | 1 | 24 | 99.6% | 100.0% |
 | `mongo-rust-driver` | Rust | `12dd49bf18bb` | 105 | 104 | 1 | 0 | 0 | 99.0% | 99.0% |
-| `mongo-php-library` | PHP | `12e56461166d` | 2221 | 2185 | 0 | 0 | 36 | 100.0% | 100.0% |
-| `mongo-php-driver` | PHP | `e81b318a33dc` | 270 | 248 | 0 | 0 | 22 | 100.0% | 100.0% |
+| `mongo-php-library` | PHP | `12e56461166d` | 2221 | 2197 | 1 | 0 | 23 | 99.9% | 99.9% |
+| `mongo-php-driver` | PHP | `06be1f01bb4c` | 271 | 253 | 1 | 0 | 17 | 99.6% | 99.6% |
 | `mongo-c-driver` | C | `57dba9c04991` | 841 | 784 | 1 | 6 | 50 | 99.1% | 99.8% |
-| `mongo-cxx-driver` | C++ | `24852b68a3d1` | 899 | 890 | 0 | 0 | 9 | 100.0% | 100.0% |
+| `mongo-cxx-driver` | C++ | `24852b68a3d1` | 901 | 892 | 0 | 0 | 9 | 100.0% | 100.0% |
 | `mongo-csharp-driver` | C# | `8297e62d7f2b` | 228 | 228 | 0 | 0 | 0 | 100.0% | 100.0% |
-| **All drivers** | — | — | **10049** | **8375** | **3** | **20** | **1651** | **99.7%** | **99.9%** |
+| **All drivers** | — | — | **10052** | **8657** | **10** | **21** | **1364** | **99.6%** | **99.8%** |
 
 ## Per-driver scope
 
@@ -60,9 +60,10 @@ These tests fail for documented reasons that have no SecantusDB-side fix (driver
 - **vendor/pymongo-tests/test/asynchronous/test_cursor.py::TestCursor::test_where** — `$where` runs server-side JavaScript and SecantusDB ships no JS runtime, so it is rejected with `BadValue` (2) 'unsupported top-level operator: $where'. Out of scope per tasks/backlog.md §4 — supporting it would mean embedding a JS engine as mongod does.
 - **vendor/pymongo-tests/test/asynchronous/test_read_preferences.py::TestMongosAndReadPreference::test_read_preference_hedge_deprecated** — Async-only, and never reaches the wire: the test constructs `PrimaryPreferred(hedge={'enabled': True})` and asserts a `DeprecationWarning` is raised by the driver's own constructor. Purely client-side pymongo behaviour, dependent on the ambient warning filters — no server can influence the outcome.
 
-### `mongo-java-driver` (1)
+### `mongo-java-driver` (2)
 
 - **client metadata is not propagated to the server: metadata append does not create new connections or close existing ones and no hello command is sent** — ClientMetadataTest: asserts the driver does NOT open a new connection or re-send `hello` after a client-side `appendMetadata` call. `appendMetadata` crosses no wire — purely Java-driver connection/handshake logic. Not server-fixable.
+- **CRUD Api Version 1 (strict): find and getMore append API version** — VersionedApiTest: asserts the Java driver decorates outbound find/getMore with `apiVersion:"1"`. SecantusDB already accepts the serverApi fields (ok:1, correct cursor lifecycle); the assertion is on the driver's outbound command, not a server reply. pymongo passes the identical crud-api-version-1 spec.
 
 ### `mongo-node-driver` (1)
 

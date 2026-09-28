@@ -1,6 +1,6 @@
 # mongo-java-driver Validation Report (Rust server)
 
-Generated 2026-09-21 — SecantusDB 0.6.0b16 vs mongo-java-driver cb45be6bb147 (`vendor/mongo-java-driver/`).
+Generated 2026-09-28 — SecantusDB 0.6.0b17 vs mongo-java-driver cb45be6bb147 (`vendor/mongo-java-driver/`).
 
 Run `uv run python -m invoke validate-java --server rust` to refresh. The same unmodified suite as `docs/validation-report-java.md`, pointed at the standalone **Rust server** (`secantusd-rs`) instead of the Python one — the gap between the two reports is part of the Rust server's remaining to-do list.
 
@@ -12,10 +12,19 @@ Run `uv run python -m invoke validate-java --server rust` to refresh. The same u
 
 | Module | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
-| `driver-core__2` | 10 | 0 | 0 | 10 | 100.0% |
+| `driver-core__2` | 9 | 1 | 0 | 10 | 90.0% |
 | `driver-sync__0` | 406 | 0 | 354 | 760 | 100.0% |
-| `driver-sync__1` | 79 | 0 | 51 | 130 | 100.0% |
-| **Overall** | **495** | **0** | **405** | **900** | **100.0%** |
+| `driver-sync__1` | 79 | 1 | 50 | 130 | 98.7% |
+| **Overall** | **494** | **2** | **404** | **900** | **99.5%** |
+
+## Failures (2)
+
+First 30 failed tests for triage:
+
+```
+driver-sync__1 :: com.mongodb.client.unified.VersionedApiTest#CRUD Api Version 1 (strict): find and getMore append API version
+driver-core__2 :: com.mongodb.client.model.GeoJsonFiltersFunctionalSpecification#$geoWithin
+```
 
 ## How this is generated
 

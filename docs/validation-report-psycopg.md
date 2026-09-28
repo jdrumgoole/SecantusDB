@@ -1,8 +1,8 @@
 # psycopg conformance report
 
-- SecantusDB (Python server) 0.6.0b16
+- SecantusDB (Python server) 0.6.0b17
 - psycopg suite: vendor/psycopg @ unknown
-- generated: 2026-09-21 06:49 UTC
+- generated: 2026-09-28 06:51 UTC
 
 | category | passed | failed | expected | skipped | total | pass rate | adjusted |
 |---|---|---|---|---|---|---|---|
@@ -28,7 +28,7 @@
 | test_conninfo_attempts.py | 27 | 0 | 0 | 0 | 27 | 100.0% | 100.0% |
 | test_conninfo_attempts_async.py | 27 | 0 | 0 | 0 | 27 | 100.0% | 100.0% |
 | test_copy.py | 111 | 1 | 0 | 0 | 112 | 99.1% | 99.1% |
-| test_copy_async.py | 111 | 1 | 0 | 0 | 112 | 99.1% | 99.1% |
+| test_copy_async.py | 110 | 2 | 0 | 0 | 112 | 98.2% | 98.2% |
 | test_cursor.py | 78 | 0 | 0 | 0 | 78 | 100.0% | 100.0% |
 | test_cursor_async.py | 78 | 0 | 0 | 0 | 78 | 100.0% | 100.0% |
 | test_cursor_client.py | 28 | 0 | 0 | 0 | 28 | 100.0% | 100.0% |
@@ -78,9 +78,9 @@
 | types/test_shapely.py | 2 | 0 | 0 | 26 | 28 | 100.0% | 100.0% |
 | types/test_string.py | 134 | 0 | 0 | 1 | 135 | 100.0% | 100.0% |
 | types/test_uuid.py | 26 | 0 | 0 | 0 | 26 | 100.0% | 100.0% |
-| **total** | **5558** | **82** | **0** | **148** | **5788** | **98.5%** | **98.5%** |
+| **total** | **5557** | **83** | **0** | **148** | **5788** | **98.5%** | **98.5%** |
 
-## Failures (82)
+## Failures (83)
 
 - `tests/pq/test_pgconn.py::test_change_password`
 - `tests/pq/test_pgconn.py::test_change_password_error`
@@ -95,6 +95,7 @@
 - `tests/test_connection_async.py::test_connect_bad[asyncio]`
 - `tests/test_connection_async.py::test_right_exception_on_server_disconnect[asyncio]`
 - `tests/test_copy.py::test_set_custom_type`
+- `tests/test_copy_async.py::test_copy_table_across[asyncio-binary]`
 - `tests/test_copy_async.py::test_set_custom_type[asyncio]`
 - `tests/test_errors.py::test_pgconn_error`
 - `tests/test_errors.py::test_pgconn_error_pickle`

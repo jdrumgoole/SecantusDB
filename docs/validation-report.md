@@ -1,6 +1,6 @@
 # pymongo Validation Report
 
-Generated 2026-09-27 — SecantusDB 0.6.0b17 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
+Generated 2026-09-28 — SecantusDB 0.6.0b17 vs pymongo f2103a95870a (`vendor/pymongo-tests/`).
 
 Run `uv run python -m invoke validate` to refresh. The pass rate is the best honest measure of how close SecantusDB is to a complete MongoDB surrogate for the in-scope wire-protocol surface; gaps are the to-do list.
 
@@ -32,13 +32,13 @@ Run `uv run python -m invoke validate` to refresh. The pass rate is the best hon
 | `test_read_preferences.py` | 9 | 0 | 0 | 20 | 29 | 100.0% |
 | `test_results.py` | 5 | 0 | 0 | 0 | 5 | 100.0% |
 | `test_run_command.py` | 17 | 0 | 0 | 4 | 21 | 100.0% |
-| `test_transactions_unified.py` | 172 | 9 | 0 | 83 | 264 | 95.0% |
+| `test_transactions_unified.py` | 179 | 2 | 0 | 83 | 264 | 98.8% |
 | `test_versioned_api.py` | 4 | 0 | 0 | 0 | 4 | 100.0% |
-| `test_versioned_api_integration.py` | 39 | 1 | 0 | 3 | 43 | 97.5% |
+| `test_versioned_api_integration.py` | 40 | 0 | 0 | 3 | 43 | 100.0% |
 | `test_write_concern.py` | 6 | 0 | 0 | 0 | 6 | 100.0% |
-| **Overall** | **1195** | **15** | **0** | **290** | **1500** | **98.7%** |
+| **Overall** | **1203** | **7** | **0** | **290** | **1500** | **99.4%** |
 
-## Failures (15)
+## Failures (7)
 
 First 30 failure node-ids for manual triage:
 
@@ -48,16 +48,8 @@ vendor/pymongo-tests/test/test_collection.py::TestCollection::test_index_text
 vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_maxtime_ms_message
 vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_to_list_csot_applied
 vendor/pymongo-tests/test/test_cursor.py::TestCursor::test_where
-vendor/pymongo-tests/test/test_transactions_unified.py::TestUnifiedCommitTransienttransactionerror::test_transaction_is_retried_after_commitTransaction_TransientTransactionError_(LockTimeout)
-vendor/pymongo-tests/test/test_transactions_unified.py::TestUnifiedCommitTransienttransactionerror::test_transaction_is_retried_after_commitTransaction_TransientTransactionError_(NoSuchTransaction)
-vendor/pymongo-tests/test/test_transactions_unified.py::TestUnifiedCommitTransienttransactionerror::test_transaction_is_retried_after_commitTransaction_TransientTransactionError_(SnapshotUnavailable)
-vendor/pymongo-tests/test/test_transactions_unified.py::TestUnifiedCommitTransienttransactionerror::test_transaction_is_retried_after_commitTransaction_TransientTransactionError_(WriteConflict)
 vendor/pymongo-tests/test/test_transactions_unified.py::TestUnifiedCommitTransienttransactionerror_4_2::test_transaction_is_retried_after_commitTransaction_TransientTransactionError_(PreparedTransactionInProgress)
-vendor/pymongo-tests/test/test_transactions_unified.py::TestUnifiedErrorLabels::test_NoSuchTransaction_errors_contain_transient_label
-vendor/pymongo-tests/test/test_transactions_unified.py::TestUnifiedErrorLabels::test_NoSuchTransaction_errors_on_commit_contain_transient_label
-vendor/pymongo-tests/test/test_transactions_unified.py::TestUnifiedErrorLabels::test_WriteConflict_errors_contain_transient_label
 vendor/pymongo-tests/test/test_transactions_unified.py::TestUnifiedRetryableCommit::test_commitTransaction_fails_after_Interrupted
-vendor/pymongo-tests/test/test_versioned_api_integration.py::TestVersionedApiTestCommandsStrictMode::test_Running_a_command_that_is_not_part_of_the_versioned_API_results_in_an_error
 ```
 
 ## How this is generated

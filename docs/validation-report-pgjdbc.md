@@ -1,8 +1,8 @@
 # pgjdbc conformance report
 
-- SecantusDB (Python server) 0.6.0b16
+- SecantusDB (Python server) 0.6.0b17
 - suite: vendor/pgjdbc @ unknown (Gradle `:postgresql:test`, unmodified; 60s JUnit default timeout injected)
-- generated: 2026-09-21 07:12 UTC
+- generated: 2026-09-28 07:16 UTC
 
 | test class | passed | failed | skipped | total | pass rate |
 |---|---|---|---|---|---|
@@ -33,7 +33,7 @@
 | jdbc2.DatabaseEncodingTest | 2 | 1 | 0 | 3 | 66.6% |
 | jdbc2.DatabaseMetaDataCacheTest | 2 | 1 | 0 | 3 | 66.6% |
 | jdbc2.DatabaseMetaDataPropertiesTest | 13 | 0 | 0 | 13 | 100.0% |
-| jdbc2.DatabaseMetaDataTest | 138 | 18 | 0 | 156 | 88.4% |
+| jdbc2.DatabaseMetaDataTest | 144 | 12 | 0 | 156 | 92.3% |
 | jdbc2.DatabaseMetaDataTransactionIsolationTest | 14 | 0 | 0 | 14 | 100.0% |
 | jdbc2.DateStyleTest | 4 | 0 | 0 | 4 | 100.0% |
 | jdbc2.DateTest | 178 | 0 | 14 | 192 | 100.0% |
@@ -81,9 +81,9 @@
 | jdbc2.TypeCacheDLLStressTest | 1 | 0 | 0 | 1 | 100.0% |
 | jdbc2.UpdateableResultTest | 34 | 2 | 0 | 36 | 94.4% |
 | jdbc2.UpsertTest | 32 | 0 | 0 | 32 | 100.0% |
-| **total** | **5732** | **59** | **28** | **5819** | **98.9%** |
+| **total** | **5738** | **53** | **28** | **5819** | **99.0%** |
 
-## Failures (59)
+## Failures (53)
 
 - `jdbc2.ArrayTest :: testNonStandardBounds()`
 - `jdbc2.ArrayTest :: testNonStandardBounds()`
@@ -103,10 +103,6 @@
 - `jdbc2.DatabaseMetaDataTest :: ascDescIndexInfo()`
 - `jdbc2.DatabaseMetaDataTest :: columnPrivileges()`
 - `jdbc2.DatabaseMetaDataTest :: columnPrivileges()`
-- `jdbc2.DatabaseMetaDataTest :: escaping()`
-- `jdbc2.DatabaseMetaDataTest :: escaping()`
-- `jdbc2.DatabaseMetaDataTest :: foreignKeysToUniqueIndexes()`
-- `jdbc2.DatabaseMetaDataTest :: foreignKeysToUniqueIndexes()`
 - `jdbc2.DatabaseMetaDataTest :: indexInfo()`
 - `jdbc2.DatabaseMetaDataTest :: indexInfo()`
 - `jdbc2.DatabaseMetaDataTest :: partialIndexInfo()`
@@ -115,8 +111,6 @@
 - `jdbc2.DatabaseMetaDataTest :: partitionedTables()`
 - `jdbc2.DatabaseMetaDataTest :: remarkIndexInfo()`
 - `jdbc2.DatabaseMetaDataTest :: remarkIndexInfo()`
-- `jdbc2.DatabaseMetaDataTest :: types()`
-- `jdbc2.DatabaseMetaDataTest :: types()`
 - `jdbc2.EnumTest :: enumArrayArray()`
 - `jdbc2.EnumTest :: enumArrayArray()`
 - `jdbc2.GeometricTest :: testPGline()`

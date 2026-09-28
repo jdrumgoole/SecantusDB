@@ -1,8 +1,8 @@
 # pgtest wire-protocol conformance report
 
-- SecantusDB (Python server) 0.6.0b16
+- SecantusDB (Python server) 0.6.0b17
 - corpus + runner: cockroachdb/cockroach @ `e3bff5d92ac1` (`pkg/sql/pgwire/testdata/pgtest`, run by `pkg/testutils/pgtest` verbatim)
-- generated: 2026-09-21 06:39 UTC
+- generated: 2026-09-28 06:42 UTC
 
 **47/66 files pass** (12 expected divergences, 2 unexpected failures, 5 skipped).
 

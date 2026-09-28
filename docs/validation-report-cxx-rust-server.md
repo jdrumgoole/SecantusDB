@@ -1,6 +1,6 @@
 # mongo-cxx-driver Validation Report
 
-Generated 2026-09-21 — SecantusDB 0.6.0b16 vs mongo-cxx-driver 24852b6 (`vendor/mongo-cxx-driver/`).
+Generated 2026-09-28 — SecantusDB 0.6.0b17 vs mongo-cxx-driver 24852b6 (`vendor/mongo-cxx-driver/`).
 
 Run `uv run python -m invoke validate-cxx` to refresh. The official MongoDB **C++** driver (`mongocxx`), built on libmongoc — its Catch2 `test_driver` suite (CRUD / cursor / aggregate / GridFS / commands) run unmodified against an embedded SecantusDB daemon.
 
@@ -8,7 +8,7 @@ Run `uv run python -m invoke validate-cxx` to refresh. The official MongoDB **C+
 
 | Passed | Failed | Skipped | Total | Pass rate |
 |---:|---:|---:|---:|---:|
-| 890 | 0 | 9 | 899 | 100.0% |
+| 892 | 0 | 9 | 901 | 100.0% |
 
 (Catch2 expands each `SECTION` into its own JUnit `<testcase>`, so the total exceeds the number of `TEST_CASE`s.)
 
