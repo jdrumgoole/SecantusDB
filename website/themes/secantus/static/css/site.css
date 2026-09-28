@@ -345,6 +345,22 @@ pre code { background: transparent; padding: 0; }
 
 .drivers-section { background: white; }
 
+/* Two grids on one page (Rust + Python): each needs a label, because a bare
+   second grid reads as more drivers rather than the same drivers on the other
+   server. */
+.drivers-grid-label {
+  margin: 40px 0 4px;
+  font-size: 1.05rem;
+  font-weight: 650;
+  color: var(--slate-900);
+}
+.drivers-grid-label:first-of-type { margin-top: 8px; }
+.drivers-grid-note {
+  margin: 0 0 20px;
+  color: var(--slate-600, #475569);
+  font-size: 0.95rem;
+}
+
 .drivers {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
