@@ -329,8 +329,7 @@ def _check_artifact_build_provenance() -> None:
         )
 
     for message in messages:
-        if message is not None:
-            raise pytest.UsageError(message)
+        _refuse_stale(message)
 
 
 def _check_core_build_provenance() -> None:
@@ -365,11 +364,41 @@ def _check_core_build_provenance() -> None:
     except ImportError:
         return
 
-    message = stale_core_message(
-        getattr(_secantus_core, "__source_tree__", ""), _committed_source_tree()
+    _refuse_stale(
+        stale_core_message(getattr(_secantus_core, "__source_tree__", ""), _committed_source_tree())
     )
-    if message is not None:
-        raise pytest.UsageError(message)
+
+
+#: Staleness messages the run continued past because the override was set.
+#: `pytest_report_header` prints them, so an overridden run still says so at the
+#: top of its output rather than looking like a clean one.
+_OVERRIDDEN_STALE: list[str] = []
+
+_OVERRIDE_ENV = "SECANTUS_ALLOW_STALE_ARTIFACT"
+
+
+def _override_active() -> bool:
+    # Read directly rather than through `provenance.override_active`, because a
+    # copied conftest has no `provenance` and must still honour the same switch.
+    # `test_build_provenance.py` pins the two to the same name and rule.
+    return os.environ.get(_OVERRIDE_ENV, "") not in ("", "0")
+
+
+def _refuse_stale(message: str | None) -> None:
+    """Abort the run on a stale artifact, unless explicitly overridden.
+
+    Both checks above go through here so that `SECANTUS_ALLOW_STALE_ARTIFACT`
+    means the same thing to pytest as it does to every probe, gauge and
+    benchmark launcher (`tools.provenance._abort`). Before this, the suite
+    raised directly and ignored the override: the only launcher that did, and
+    the one CLAUDE.md names first.
+    """
+    if message is None:
+        return
+    if _override_active():
+        _OVERRIDDEN_STALE.append(message)
+        return
+    raise pytest.UsageError(message)
 
 
 def stale_core_message(built: str, current: str) -> str | None:
@@ -410,8 +439,21 @@ def pytest_report_header() -> str | None:
     The header is the right place: a warning is invisible inside a
     15,000-test run, while this prints at the top of every one. Only the
     unknown case is reported — a matching build says nothing, and a mismatch
-    has already aborted the run in `pytest_configure`.
+    has already aborted the run in `pytest_configure`, unless
+    `SECANTUS_ALLOW_STALE_ARTIFACT` let it through, in which case the mismatch
+    is repeated here.
     """
+    lines = [
+        f"WARNING ({_OVERRIDE_ENV} is set, continuing anyway):\n{message}"
+        for message in _OVERRIDDEN_STALE
+    ]
+    dormant = _dormant_core_check_line()
+    if dormant is not None:
+        lines.append(dormant)
+    return "\n".join(lines) or None
+
+
+def _dormant_core_check_line() -> str | None:
     try:
         import _secantus_core  # type: ignore[import-not-found]
     except ImportError:

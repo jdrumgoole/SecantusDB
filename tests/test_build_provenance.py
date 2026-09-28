@@ -307,6 +307,9 @@ def test_require_fresh_pgserver_aborts_rather_than_warning(
     """
     import tools.provenance as provenance
 
+    # The suite itself may be running under the override; this asserts the
+    # default, so it must not inherit it.
+    monkeypatch.delenv(provenance.OVERRIDE_ENV, raising=False)
     monkeypatch.setattr(provenance, "binary_source_tree", lambda _p: "old")
     monkeypatch.setattr(provenance, "committed_crates_tree", lambda _r=None: "new")
     with pytest.raises(SystemExit) as excinfo:
@@ -477,6 +480,68 @@ def test_the_override_is_a_warning_not_a_silent_pass(
     out = capsys.readouterr().out
     assert provenance.OVERRIDE_ENV in out
     assert "old" in out and "new" in out
+
+
+# The pytest suite is a launcher too. Until 2026-09-28 its two checks raised
+# `UsageError` directly and ignored the override, so the one launcher CLAUDE.md
+# names first was the one where the documented opt-out did nothing -- and a
+# stale shared venv refused even a run of Markdown-only tests.
+
+
+def test_the_suite_refuses_a_stale_artifact_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    import conftest
+
+    monkeypatch.delenv(conftest._OVERRIDE_ENV, raising=False)
+    with pytest.raises(pytest.UsageError, match="built from different sources"):
+        conftest._refuse_stale("built from different sources: old vs new")
+
+
+def test_the_suite_honours_the_override_and_still_says_so(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import conftest
+
+    monkeypatch.setenv(conftest._OVERRIDE_ENV, "1")
+    monkeypatch.setattr(conftest, "_OVERRIDDEN_STALE", [])
+
+    conftest._refuse_stale("artifact: old / checkout: new")  # must NOT raise
+
+    header = conftest.pytest_report_header()
+    assert header is not None, "an overridden stale run must not look clean"
+    assert conftest._OVERRIDE_ENV in header
+    assert "artifact: old / checkout: new" in header
+
+
+@pytest.mark.parametrize("value", [None, "", "0", "1", "yes"])
+def test_the_suite_and_the_launchers_read_the_override_alike(
+    monkeypatch: pytest.MonkeyPatch, value: str | None
+) -> None:
+    """conftest reads the switch itself (a copied conftest has no `provenance`),
+    so pin it to the launchers' name and rule rather than trusting a copy."""
+    import tools.provenance as provenance
+
+    import conftest
+
+    assert conftest._OVERRIDE_ENV == provenance.OVERRIDE_ENV
+    if value is None:
+        monkeypatch.delenv(provenance.OVERRIDE_ENV, raising=False)
+    else:
+        monkeypatch.setenv(provenance.OVERRIDE_ENV, value)
+    assert conftest._override_active() == provenance.override_active()
+
+
+@pytest.mark.parametrize(
+    "check", ["_check_core_build_provenance", "_check_artifact_build_provenance"]
+)
+def test_every_suite_check_goes_through_the_override(check: str) -> None:
+    """A source check: the regression is a new check that raises directly."""
+    import inspect
+
+    import conftest
+
+    source = inspect.getsource(getattr(conftest, check))
+    assert "_refuse_stale(" in source
+    assert "UsageError" not in source, f"{check} bypasses SECANTUS_ALLOW_STALE_ARTIFACT"
 
 
 def test_the_override_is_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
