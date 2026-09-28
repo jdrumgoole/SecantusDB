@@ -19,6 +19,7 @@ import decimal as dc
 import ipaddress
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -50,6 +51,16 @@ pytestmark = pytest.mark.skipif(
     not BINARY.exists(),
     reason=f"{BINARY.relative_to(REPO)} not built (cargo build in crates/secantus-pgserver)",
 )
+
+_WINDOWS = sys.platform == "win32"
+#: Windows delivers a console control event to a process GROUP, so the server
+#: needs its own; without this the break would also reach pytest.
+_SPAWN_KWARGS: dict[str, object] = (
+    {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if _WINDOWS else {}
+)
+#: The graceful stop. `ctrlc`'s handler catches CTRL_BREAK on Windows and
+#: SIGTERM elsewhere, so both reach the server's real shutdown path.
+_STOP_SIGNAL = signal.CTRL_BREAK_EVENT if _WINDOWS else signal.SIGTERM
 
 
 class _Server:
@@ -83,6 +94,7 @@ class _Server:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            **_SPAWN_KWARGS,
         )
         line = self._readline(timeout=30)
         match = re.search(r"listening on \S+:(\d+)", line)
@@ -107,13 +119,28 @@ class _Server:
         return out[0] if out else ""
 
     def __exit__(self, *exc: object) -> None:
-        if self.proc is not None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-                self.proc.wait(timeout=10)
+        if self.proc is None:
+            return
+        # Ask for a GRACEFUL stop, because the store is handed to another
+        # server after this. `Popen.terminate()` is SIGTERM on POSIX but
+        # `TerminateProcess` on Windows -- an immediate kill that runs no
+        # handler, so WiredTiger never closes and anything not yet
+        # checkpointed is simply gone. That is why the hand-off tests read an
+        # EMPTY store on Windows. `secantusd-pg` uses the `ctrlc` crate with
+        # `termination`, which installs a console control handler there, so a
+        # CTRL_BREAK_EVENT reaches the same shutdown path SIGTERM takes on
+        # Unix. It goes to a process GROUP, hence CREATE_NEW_PROCESS_GROUP at
+        # spawn -- without it the break would also hit the pytest process.
+        with contextlib.suppress(Exception):
+            self.proc.send_signal(_STOP_SIGNAL)
+        try:
+            self.proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            # A server that will not drain is a finding, not something to
+            # paper over -- but leaving it running would wedge the suite, so
+            # kill it and let the test's own assertion report the damage.
+            self.proc.kill()
+            self.proc.wait(timeout=10)
 
     def connect(self, *, autocommit: bool = True, dbname: str = "postgres") -> psycopg.Connection:
         return psycopg.connect(

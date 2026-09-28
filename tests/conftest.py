@@ -360,6 +360,16 @@ def _check_artifact_build_provenance() -> None:
         ("secantusd-rs", "crates/secantusdb/target/debug/secantusd-rs", _REBUILD_RS_CMD),
     ):
         binary = _REPO_ROOT / rel
+        if not binary.exists() and sys.platform == "win32":
+            # Cargo emits `.exe` on Windows, so the bare name NEVER exists
+            # there and this guard skipped both binaries entirely -- on the one
+            # platform where it had already been caught once. The same missing
+            # suffix made all 1,194 tests in `test_rust_pgserver_slice.py` skip
+            # (see `BINARY` there). It cost an eighth false diagnosis on
+            # 2026-09-28: a `secantusd-pg` six days stale read as a fresh
+            # regression, and the guard written to prevent exactly that was
+            # watching a filename that cannot exist.
+            binary = binary.with_suffix(".exe")
         if not binary.exists():
             continue  # Its tests skip; nothing to be stale against.
         checks.append(
