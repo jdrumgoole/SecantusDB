@@ -3780,6 +3780,41 @@ def test_api_strict_matches_mongod(
 
 
 # ---------------------------------------------------------------------------
+# getParameter: featureCompatibilityVersion
+# ---------------------------------------------------------------------------
+
+
+@requires_mongod
+def test_feature_compatibility_version_matches_mongod(
+    secantus_uri: str, mongod_uri: str, mongod_version: tuple[int, int]
+) -> None:
+    """FCV must be the major.minor mongod reports, not a literal left behind.
+
+    This sat at ``"7.0"`` from the 6.0-era until 2026-09-28 while ``buildInfo``
+    reported 8.2.11 — so the value contradicted the same server's own handshake,
+    and a client gating a feature on FCV was told this is a 7.0 deployment.
+
+    Nothing caught it because the two tests that look at the parameter assert
+    only that the KEY is present (``tests/test_compass_commands.py`` and the
+    Rust ``get_parameter_named_and_all``). Presence is exactly the assertion a
+    stale literal survives, which is why this one reads the value and compares
+    it to the reference server rather than to a constant of our own.
+    """
+    if mongod_version[0] != PROBED_MONGOD_MAJOR:
+        found = ".".join(str(p) for p in mongod_version)
+        pytest.skip(
+            f"this gate asserts an exact match against mongod "
+            f"{PROBED_MONGOD_MAJOR}.x (probed {PROBED_MONGOD_VERSION}), and this "
+            f"box has mongod {found}. See PROBED_MONGOD_MAJOR."
+        )
+    query = {"getParameter": 1, "featureCompatibilityVersion": 1}
+    with MongoClient(mongod_uri) as m, MongoClient(secantus_uri) as s:
+        theirs = m.admin.command(query)["featureCompatibilityVersion"]["version"]
+        ours = s.admin.command(query)["featureCompatibilityVersion"]["version"]
+    assert ours == theirs, f"FCV: mongod={theirs} ours={ours}"
+
+
+# ---------------------------------------------------------------------------
 # The harness itself: a crashed oracle must be loud
 # ---------------------------------------------------------------------------
 
