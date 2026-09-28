@@ -25,10 +25,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-import bson
-
 from secantus.storage import Storage
-
 
 _PAYLOAD = b"x" * 8192
 
@@ -74,6 +71,7 @@ def main() -> int:
     finally:
         storage.close()
         import shutil
+
         shutil.rmtree(storage_path, ignore_errors=True)
 
     return 0

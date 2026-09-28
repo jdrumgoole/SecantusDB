@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import pathlib
 import platform
 import shutil
 import signal
@@ -90,7 +91,20 @@ def _wait_for_listener(host: str, port: int, timeout: float = 30.0) -> None:
 
 @contextmanager
 def _rust_client() -> Iterator[pymongo.MongoClient]:
+    # This harness produces the published latency-vs-mongod table. A stale
+    # extension does not make it slower or faster -- it measures different code
+    # under this commit's name. `SECANTUS_ALLOW_STALE_ARTIFACT=1` overrides, for
+    # a deliberate before/after against an older build.
+    import sys as _sys
+
     import _secantus_server
+
+    _repo = str(pathlib.Path(__file__).resolve().parent.parent)
+    if _repo not in _sys.path:
+        _sys.path.insert(0, _repo)
+    from tools.provenance import require_fresh_server_extension
+
+    require_fresh_server_extension(_secantus_server)
 
     srv = _secantus_server.RustServer(
         tempfile.mkdtemp(prefix="cmp-rust-"), 0, replica_set_name="secantus"

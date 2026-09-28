@@ -41,7 +41,7 @@ EXPECTED_DIVERGENCES: dict[str, str] = {
         "portals:1182 compares the CHECK-violation MESSAGE with "
         "keepErrMessage and pins crdb's wording ('failed to satisfy CHECK "
         "constraint (a > 1.0:::FLOAT8)'). We emit real PostgreSQL's ('new row "
-        "for relation \"t\" violates check constraint \"t_a_check\"'), which is "
+        'for relation "t" violates check constraint "t_a_check"\'), which is '
         "what psycopg/pgjdbc users parse — matching crdb would be a fidelity "
         "REGRESSION. Everything up to :1182 passes (1182 of 1550 lines, "
         "including PortalSuspended-on-exact-MaxRows and per-Execute row "
@@ -55,7 +55,7 @@ EXPECTED_DIVERGENCES: dict[str, str] = {
         "the SINGLE-QUOTED text ('$' -> 01272427). Real PostgreSQL's "
         "jsonpath_send emits the version byte + the canonical text WITHOUT "
         "outer quotes (0124), which is what we send. Everything else in the "
-        "file is green (oid 4072, canonical $.\"abc\" text, 42601 on an "
+        'file is green (oid 4072, canonical $."abc" text, 42601 on an '
         "empty path, jsonb_path_query)."
     ),
     "int2vector": (
@@ -70,37 +70,38 @@ EXPECTED_DIVERGENCES: dict[str, str] = {
         "row_description:376 sends `SELECT 'foo'::STRING, 'bar'::STRING(2)` "
         "with NO crdb_only marker and expects crdb's STRING aliases (text/25 "
         "and varchar/1043 typmod 6, truncating 'bar' to 'ba'). Real PostgreSQL "
-        "14 rejects both casts outright — `ERROR: 42704 type \"string\" does "
+        '14 rejects both casts outright — `ERROR: 42704 type "string" does '
         "not exist` (probed) — so the stanza can't pass against any non-crdb "
         "server, and matching crdb's varchar(2) truncation would diverge from "
         "PG. Everything before :376 is green: base-column identity across a "
         "JOIN and through a VIEW, char(n) blank padding on the wire, and "
         "attnum stability across ALTER COLUMN TYPE."
     ),
+    # NOTE: this key was written TWICE, by two sessions independently, and
+    # Python silently kept only the second -- so the first session's findings
+    # were invisible here until `ruff` was pointed at this directory on
+    # 2026-09-28 (F601). Both are preserved below rather than one being picked,
+    # because both were measured and neither is refuted by the other. They
+    # disagree on ONE detail: the offending line is cited as `procedure:66` by
+    # one and `procedure:68` by the other. Re-run the gauge before quoting
+    # either number.
     "procedure": (
-        "procedure:66 (and the extended-protocol CALL after it) compare the "
+        "procedure:66/68 (and the extended-protocol CALL after it) compare the "
         "NoticeResponse of a plpgsql `RAISE NOTICE` and pin crdb's internal "
-        "source-location fields — `File:builtins.go, Routine:func401` — which the "
-        "runner does NOT normalize (it only zeroes Line). No non-crdb server can "
-        "emit crdb's Go source refs (real PostgreSQL sends `pl_exec.c` / "
-        "`exec_stmt_raise`), so the stanza can't pass against any non-crdb server. "
-        "Everything else is green: CREATE PROCEDURE with an `a INOUT int` argmode, "
-        "CALL returning the INOUT value as the result row, the plpgsql body "
-        "(INSERT + RAISE NOTICE), COMMIT/ROLLBACK inside the procedure, and DROP "
-        "PROCEDURE — over both the simple and extended protocols."
-    ),
-    "procedure": (
-        "procedure:68 pins the NoticeResponse's SOURCE-LOCATION fields to "
-        "crdb's own Go internals — File=\"builtins.go\", Routine=\"func401\" "
-        "— with no crdb_only marker. Those fields name the server's own source "
-        "file and function, so they are unmatchable by any other "
-        "implementation: real PostgreSQL 14 emits Routine=exec_stmt_raise, "
-        "File=pl_exec.c (probed), and SecantusDB leaves them empty rather than "
-        "fabricate a C source location it does not have. Everything the stanza "
-        "actually regression-tests works: CREATE PROCEDURE ... LANGUAGE "
-        "plpgsql, CALL p(), and the three RAISE NOTICE messages (foo / bar / "
-        "baz) arriving in order with SQLSTATE 00000, followed by "
-        "CommandComplete CALL."
+        "source-location fields — `File:builtins.go, Routine:func401` — with no "
+        "crdb_only marker, and the runner does NOT normalize them (it only "
+        "zeroes Line). Those fields name the server's own source file and "
+        "function, so no other implementation can match them: real PostgreSQL 14 "
+        "emits `Routine=exec_stmt_raise, File=pl_exec.c` (probed), and SecantusDB "
+        "leaves them empty rather than fabricate a C source location it does not "
+        "have. So the stanza cannot pass against any non-crdb server. "
+        "Everything it actually regression-tests is green: CREATE PROCEDURE "
+        "... LANGUAGE plpgsql with an `a INOUT int` argmode, CALL returning the "
+        "INOUT value as the result row, the plpgsql body (INSERT + RAISE "
+        "NOTICE), the three RAISE NOTICE messages (foo / bar / baz) arriving in "
+        "order with SQLSTATE 00000 followed by CommandComplete CALL, "
+        "COMMIT/ROLLBACK inside the procedure, and DROP PROCEDURE — over both "
+        "the simple and extended protocols."
     ),
     "typing": (
         "typing's two non-crdb stanzas both use keepErrMessage and pin crdb's "
@@ -118,7 +119,7 @@ EXPECTED_DIVERGENCES: dict[str, str] = {
         "with no ignore_table_oids directive on that stanza. Real PostgreSQL "
         "reports its own pg_class oid there too (installation-specific), so "
         "the stanza can't pass against any non-crdb server. Everything else "
-        "in the file is green (oid-18 \"char\": casts, columns, params, "
+        'in the file is green (oid-18 "char": casts, columns, params, '
         "1-char truncation, NULL for empty/zero-byte, binary format)."
     ),
     "spatial": (

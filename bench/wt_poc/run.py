@@ -48,7 +48,9 @@ def _parse(text: str) -> dict[str, float] | None:
 def run_pthread(home: Path, n: int, count: int) -> dict[str, float]:
     p = subprocess.run(
         [str(PTHREAD_BIN), str(home), str(n), str(count)],
-        capture_output=True, text=True, timeout=600,
+        capture_output=True,
+        text=True,
+        timeout=600,
     )
     if p.returncode != 0:
         raise RuntimeError(f"pthread bench failed: {p.stderr}")
@@ -60,9 +62,10 @@ def run_pthread(home: Path, n: int, count: int) -> dict[str, float]:
 
 def run_swig(home: Path, n: int, count: int) -> dict[str, float]:
     p = subprocess.run(
-        [sys.executable, "-m", "bench.wt_poc.wt_swig_bench",
-         str(home), str(n), str(count)],
-        capture_output=True, text=True, timeout=600,
+        [sys.executable, "-m", "bench.wt_poc.wt_swig_bench", str(home), str(n), str(count)],
+        capture_output=True,
+        text=True,
+        timeout=600,
         cwd=str(REPO),
     )
     if p.returncode != 0:
@@ -110,8 +113,10 @@ def main() -> int:
 
     print()
     print("=" * 78)
-    print(f"{'N':<4} {'pthread (rows/s)':>18} {'pthread scale':>16} "
-          f"{'swig (rows/s)':>18} {'swig scale':>16}")
+    print(
+        f"{'N':<4} {'pthread (rows/s)':>18} {'pthread scale':>16} "
+        f"{'swig (rows/s)':>18} {'swig scale':>16}"
+    )
     print("-" * 78)
     for n in (1, 2, 4, 8):
         pth = next(r for b, nn, r in results if b == "pthread" and nn == n)

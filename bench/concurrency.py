@@ -84,19 +84,39 @@ def _parse_writer_log(text: str) -> tuple[int, int] | None:
     )
 
 
+def _require_fresh(binary: Path, repo: Path) -> None:
+    """Refuse to benchmark a binary built from a different tree than the checkout.
+
+    This harness feeds the published concurrency chart. A number measured from a
+    stale build is not slower or faster -- it is a measurement of different code
+    wearing this commit's label. `SECANTUS_ALLOW_STALE_ARTIFACT=1` overrides, for
+    an intentional before/after against an older build.
+    """
+    import sys as _sys
+
+    if str(repo) not in _sys.path:
+        _sys.path.insert(0, str(repo))
+    from tools.provenance import require_fresh_rs
+
+    require_fresh_rs(binary, repo_root=repo)
+
+
 def _rust_binary() -> str:
     """The standalone Rust daemon: $SECANTUSDB_BIN, the venv-staged copy
     (storage-engine wheel build), or the cargo target dir."""
+    repo = Path(__file__).resolve().parent.parent
     env = os.environ.get("SECANTUSDB_BIN")
     if env and Path(env).exists():
+        _require_fresh(Path(env), repo)
         return env
-    cargo_target = Path(__file__).resolve().parent.parent / "crates" / "secantusdb" / "target"
+    cargo_target = repo / "crates" / "secantusdb" / "target"
     for cand in (
         Path(sys.executable).parent / "secantusd-rs",
         cargo_target / "release" / "secantusd-rs",
         cargo_target / "debug" / "secantusd-rs",
     ):
         if cand.exists():
+            _require_fresh(cand, repo)
             return str(cand)
     raise SystemExit(
         "secantusd-rs not found — build with "

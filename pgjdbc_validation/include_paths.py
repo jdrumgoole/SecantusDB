@@ -33,5 +33,7 @@ EXCLUDE_CLASSES: dict[str, str] = {
     # whole weekly gauge for GRADLE_TIMEOUT_SECONDS rather than fail. To clear
     # it, delete this entry and run the gauge once: `uv run python -m
     # pgjdbc_validation.runner`.
-    "NotifyTest": "cross-connection NOTIFY works (verified via psycopg); needs one pgjdbc run to confirm",
+    "NotifyTest": (
+        "cross-connection NOTIFY works (verified via psycopg); needs one pgjdbc run to confirm"
+    ),
 }

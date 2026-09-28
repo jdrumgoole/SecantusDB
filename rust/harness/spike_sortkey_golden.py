@@ -16,13 +16,13 @@ equal value and order correctly across the unified numeric type.
 Usage:
     PYTHONPATH=src uv run python rust/harness/spike_sortkey_golden.py out.bson
 """
+
 from __future__ import annotations
 
 import datetime
-import sys
-
 import importlib.util
 import pathlib
+import sys
 
 import bson
 from bson import Binary, Decimal128, Int64, MaxKey, MinKey, ObjectId
@@ -61,9 +61,9 @@ def values() -> list[tuple[str, object]]:
         ("double_neg_2_5", -2.5),
         ("double_pi", 3.141592653589793),
         ("double_123_45", 123.45),
-        ("dec_1_00", Decimal128("1.00")),       # equals int 1
+        ("dec_1_00", Decimal128("1.00")),  # equals int 1
         ("dec_one", Decimal128("1")),
-        ("dec_123_45", Decimal128("123.45")),    # equals double 123.45
+        ("dec_123_45", Decimal128("123.45")),  # equals double 123.45
         ("dec_neg_1e6", Decimal128("-1E-6")),
         ("cross_int_vs_double_3", 3),
         ("cross_double_3", 3.0),

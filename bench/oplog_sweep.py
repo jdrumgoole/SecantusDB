@@ -39,9 +39,7 @@ from pathlib import Path
 ARM_CONFIGS: dict[str, list[tuple[str, dict[str, str]]]] = {
     "baseline": [("sync-default", {})],
     "ceiling": [("no-oplog", {"SECANTUS_DISABLE_OPLOG": "1"})],
-    "shards": [
-        (f"shards-{n}", {"SECANTUS_OPLOG_SHARDS": str(n)}) for n in (1, 2, 4, 8)
-    ],
+    "shards": [(f"shards-{n}", {"SECANTUS_OPLOG_SHARDS": str(n)}) for n in (1, 2, 4, 8)],
     "tablecfg": [
         ("oplog-nocompress", {"SECANTUS_OPLOG_TABLE_EXTRA": "block_compressor=none"}),
         ("oplog-bigpage", {"SECANTUS_OPLOG_TABLE_EXTRA": "memory_page_max=10MB"}),
@@ -90,7 +88,9 @@ def run_config(
         check=False,
     )
     if proc.returncode != 0:
-        print(f"  !! {label}: bench.concurrency failed:\n{proc.stdout[-2000:]}{proc.stderr[-2000:]}")
+        print(
+            f"  !! {label}: bench.concurrency failed:\n{proc.stdout[-2000:]}{proc.stderr[-2000:]}"
+        )
         return {}
     out: dict[int, int] = {}
     for m in _ROW.finditer(proc.stdout):
@@ -100,9 +100,11 @@ def run_config(
 
 def wait_for_quiet(load_limit: float) -> None:
     while True:
-        load1 = float(Path("/proc/loadavg").read_text().split()[0]) if Path(
-            "/proc/loadavg"
-        ).exists() else _mac_load1()
+        load1 = (
+            float(Path("/proc/loadavg").read_text().split()[0])
+            if Path("/proc/loadavg").exists()
+            else _mac_load1()
+        )
         if load1 < load_limit:
             return
         print(f"  load {load1:.2f} > {load_limit}, waiting...", flush=True)

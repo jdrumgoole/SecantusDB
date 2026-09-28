@@ -414,3 +414,158 @@ def test_a_copied_conftest_still_loads(tmp_path: Path) -> None:
     assert "ImportError while loading conftest" not in combined, combined
     assert "No module named 'tools'" not in combined, combined
     assert result.returncode == 0, combined
+
+
+# --------------------------------------------------------------------------- #
+# Reach: the check must cover every path that LAUNCHES one of these artifacts,
+# not just pytest and the probes.
+#
+# The failure mode these close is a PUBLISHED number. On 2026-09-18 the psycopg
+# gauge was measured against a checkout 116 crate-commits behind, reported 73.8%
+# where the truth was ~99.98%, and that figure reached the live website. The
+# binary was stamped the whole time and nothing read the stamp.
+# --------------------------------------------------------------------------- #
+
+#: Every launcher and the call it must make. A new one added without a check is
+#: a silently unguarded path to a published number, so the list is explicit
+#: rather than derived -- a derived test would grow a hole the day someone
+#: invents a launcher shaped differently from the ones here.
+LAUNCH_SITES = [
+    ("tools/probes/_servers.py", "require_fresh_server_extension"),
+    ("tools/probes/pg_differential.py", "require_fresh_pgserver"),
+    ("gauge_common.py", "require_fresh_rs"),
+    ("psycopg_validation/runner.py", "require_fresh_pgserver"),
+    ("bench/concurrency.py", "require_fresh_rs"),
+    ("bench/compare_servers.py", "require_fresh_server_extension"),
+    ("bench/pg_concurrency.py", "require_fresh_pgserver"),
+    ("bench/pg_statement_cost.py", "require_fresh_pgserver"),
+]
+
+
+@pytest.mark.parametrize(("path", "call"), LAUNCH_SITES)
+def test_every_launcher_checks_provenance(path: str, call: str) -> None:
+    """A source check, deliberately.
+
+    Running a gauge needs a built binary and twenty minutes; running a benchmark
+    needs a quiet machine. Neither belongs in a unit test. What would actually
+    regress is somebody adding a launch path and not calling the check, and that
+    is visible in the source.
+    """
+    text = (REPO / path).read_text()
+    assert call in text, f"{path} launches an artifact without checking its provenance"
+
+
+def test_the_override_is_a_warning_not_a_silent_pass(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`SECANTUS_ALLOW_STALE_ARTIFACT` exists so nobody DELETES the check.
+
+    Measuring an old build on purpose -- a bisect, a before/after against a
+    previous release -- is legitimate. Without a supported way to say so, the
+    person with that need comments the check out, and then it is gone for
+    everybody. The override still prints, so a stale run cannot look like a
+    clean one in a log.
+    """
+    import tools.provenance as provenance
+
+    monkeypatch.setenv(provenance.OVERRIDE_ENV, "1")
+    monkeypatch.setattr(provenance, "binary_source_tree", lambda _p: "old")
+    monkeypatch.setattr(provenance, "committed_crates_tree", lambda _r=None: "new")
+
+    provenance.require_fresh_pgserver(Path(__file__))  # must NOT raise
+
+    out = capsys.readouterr().out
+    assert provenance.OVERRIDE_ENV in out
+    assert "old" in out and "new" in out
+
+
+def test_the_override_is_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    import tools.provenance as provenance
+
+    monkeypatch.delenv(provenance.OVERRIDE_ENV, raising=False)
+    assert provenance.override_active() is False
+    monkeypatch.setenv(provenance.OVERRIDE_ENV, "0")
+    assert provenance.override_active() is False, "an explicit 0 must not enable it"
+
+
+# --------------------------------------------------------------------------- #
+# The lint gate's SCOPE. It was `src tests` until 2026-09-28, so `tools/`,
+# `bench/`, the gauge runners and the invoke tasks were never linted -- and the
+# first helper added to `tools/` that day used `sys` without importing it. Only
+# widening the scope caught it.
+# --------------------------------------------------------------------------- #
+
+
+def _ci_ruff_paths(prefix: str) -> set[str]:
+    """The paths a CI ruff step actually names."""
+    workflow = (REPO / ".github" / "workflows" / "test.yml").read_text()
+    for line in workflow.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(prefix):
+            return set(stripped[len(prefix) :].split())
+    raise AssertionError(f"no `{prefix}` step found in test.yml")
+
+
+def test_the_lint_gate_covers_the_whole_repo() -> None:
+    """CI must lint `.`, not a list of paths.
+
+    The scope was `src tests` until 2026-09-28, which left `tools/`, `bench/`,
+    all 19 gauge runners, the invoke tasks and `website/` unchecked. The first
+    attempt at a fix NAMED the paths, and that was wrong in the same way: an
+    enumeration reproduces the hole the moment someone adds a directory. The
+    test written against that list immediately found 27 locations missing from
+    it, which is the argument for `.` rather than a longer list.
+
+    ruff skips gitignored trees and the vendored submodules on its own, so `.`
+    reaches our Python and nothing else.
+    """
+    assert _ci_ruff_paths("run: uv run ruff check ") == {"."}
+
+
+def test_the_lint_and_format_steps_cover_the_same_paths() -> None:
+    """Checking one scope and formatting another is a hole that reads as covered."""
+    assert _ci_ruff_paths("run: uv run ruff format --check ") == _ci_ruff_paths(
+        "run: uv run ruff check "
+    )
+
+
+def test_ruff_excludes_every_vendored_tree() -> None:
+    """CI lints `.`, so a vendored tree it can see becomes OUR failure.
+
+    This bit within hours of widening the scope: CI failed on a WiredTiger
+    analytics NOTEBOOK, 125 characters wide, that upstream is entitled to write
+    however it likes. It passed locally because a fresh worktree has no
+    submodules checked out — so `.` reached nothing vendored and the exclusion
+    looked unnecessary. The difference was the ENVIRONMENT, not the config,
+    which is the recurring shape: a check that cannot see a thing reports no
+    problem with it.
+
+    Every submodule must therefore be covered by `extend-exclude`, or the next
+    one added turns the lint gate red for reasons nobody here can fix.
+    """
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # Python 3.10: tomllib is stdlib only from 3.11
+        import tomli as tomllib  # type: ignore[no-redef]
+
+    config = tomllib.loads((REPO / "pyproject.toml").read_text())
+    excluded = config["tool"]["ruff"]["extend-exclude"]
+
+    gitmodules = (REPO / ".gitmodules").read_text()
+    submodules = [
+        line.split("=", 1)[1].strip()
+        for line in gitmodules.splitlines()
+        if line.strip().startswith("path")
+    ]
+    assert submodules, "no submodules parsed from .gitmodules — has the format changed?"
+
+    uncovered = [
+        path
+        for path in submodules
+        if not any(path == ex or path.startswith(f"{ex}/") for ex in excluded)
+    ]
+    assert not uncovered, (
+        f"these submodules are not excluded from ruff: {uncovered}. CI lints `.`, "
+        f"so upstream's style would be reported as our lint failure. Add them to "
+        f"`extend-exclude` in pyproject.toml."
+    )
