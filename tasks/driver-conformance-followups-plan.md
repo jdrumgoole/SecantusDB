@@ -1,82 +1,144 @@
 # Driver-conformance follow-ups after `enableTestCommands` (plan)
 
-Written 2026-09-28, at `main` `c5febff3`. Scope: what is left after #1569 /
-#1571 turned on driver failpoint tests, as measured, not as remembered. Re-verify
-every claim below before working it -- parallel sessions move this surface.
+Written 2026-09-28 at `main` `c5febff3`; **re-verified against `2fabed24` the same
+day**, and every number below now comes from that re-check rather than from the
+first draft. Scope: what is left after #1569 / #1571 turned on driver failpoint
+tests, as measured, not as remembered. Re-verify before working an item anyway --
+parallel sessions move this surface, and this file has already been wrong once.
 
-## State this plan was written against
+## State, re-measured at `2fabed24`
 
 - Landed on `main`: #1569 (failpoint `appName` scoping, `enableTestCommands`,
   Rust session-end aborts, change-stream token fix), #1571
   (`maxTimeAlwaysTimeOut`), #1582 (`apiStrict`, both servers), #1585
-  (transaction `errorLabels`, **Python only**).
-- In flight, claimed by another session: `fix-txn-codenames`
-  (`Interrupted` / `PreparedTransactionInProgress`, **Python only**).
-- Unmerged bot refresh `validation-report-20260928`: pymongo gauge Python
-  1,203 / 7 / 290 skipped (99.4%), Rust 1,195 / 15 / 290 (98.7%).
-- The remaining gap is mostly the Rust server trailing the Python one.
+  (transaction `errorLabels`, **Python only**), and **#1597**
+  (`Interrupted` / `PreparedTransactionInProgress` codeNames, **Python only**) --
+  which the first draft listed as in flight under another session's claim. It
+  merged as `daa855a8`. **Step 2 is unblocked and unclaimed**: no open branch or
+  PR touches the Rust transaction code (`provenance-reach`,
+  `validation-report-20260928`, `pg-storage-concurrency`, `rust-pg-constraint`).
+- Unmerged bot refresh `validation-report-20260928` (`60bd8c1b`): pymongo gauge
+  Python 1,203 / 7 / 290 skipped (99.4%), Rust 1,195 / 15 / 290 (98.7%).
+  **It has #1582 and #1585 as ancestors but NOT #1597** -- the PR was opened at
+  07:17Z and #1597 landed at 08:48Z. Merging it as-is publishes numbers that
+  understate the server by exactly the two tests #1597 closed.
+- **#1599 filed a competing tracker for the same drift.** `tasks/backlog.md` now
+  carries an OPEN item saying the committed reports predate #1582 / #1585 / #1597
+  and prescribing a re-run of `invoke validate` and `invoke validate-java`. That
+  is a different answer to the question Step 1 asks. Close one before working the
+  other; this plan now recommends the re-run (see Step 1).
+- The remaining gap is almost entirely the Rust server trailing the Python one --
+  and the shape of it is sharper than the first draft said. See Step 2.
 
-## Steps, in order
+## Steps, in the order they are now worth doing
 
-### 1. Merge the report refresh -- small, verify first
+### 1. Re-run the pymongo gauge -- do NOT merge the refresh as-is
 
-- Confirm the refresh was measured on a tree containing #1569, #1571, #1582 and
-  #1585. 290 skipped is the right shape for post-flag code (the old reports
-  skipped 424); check the SHA it was built from anyway.
-- Pair it with one line in the release notes: the Python rate moves 99.5% ->
-  99.4% while 132 more tests pass, because failpoint tests that used to skip
-  now run.
+- The refresh predates #1597, so it is stale on arrival. Re-run
+  `invoke validate` (Python) and `./inv validate --server rust` at a tree
+  containing `daa855a8`, and publish that instead. Rebuild the embedded Rust
+  extension first (`./inv rust-server-build`) or the Rust run measures old code.
+- **The first draft's release-note line was wrong** and would read as a
+  regression. "99.5% -> 99.4% while 132 more tests pass" compares the
+  **2026-09-21** report to the refresh. What is committed on `main` today is the
+  **2026-09-27** run at **1,195 / 15 / 290 = 98.7%**. Against that, the refresh is
+  **98.7% -> 99.4%, a RISE** -- and a post-#1597 run should land higher still.
+  The honest note is: the rate dipped to 98.7% on 2026-09-27 because 134
+  failpoint tests that used to skip began to run, and the fixes since have taken
+  it back up.
+- Resolves the #1599 backlog item too. Delete that item's line when it lands, and
+  close PR #1595 rather than merging it.
 
-### 2. Port the transaction fixes to Rust -- the biggest win (8 of Rust's 15)
+### 2. Port the transaction fixes to Rust -- 10 of Rust's 15, and the whole gap
 
-- Rust-only failures: the `TransientTransactionError` retry set, the
-  `ErrorLabels` set, `Location50`, `Interrupted`. Python has #1585 and (soon)
-  `fix-txn-codenames`; Rust has neither.
-- **Blocker:** `fix-txn-codenames` is another session's claim. Wait for it to
-  merge, then port both in one Rust branch. Starting now edits the same code
-  table under an open claim.
-- **Risk:** the exemplar is `mongod`, not the Python server (CLAUDE.md). Only
-  #1582 added a differential test; check whether #1585 and the codeName change
-  were probed. Run `tests/test_mongod_differential.py` against the Rust server
-  too -- a Rust-vs-Python comparison proves nothing here.
-- **Verify:** the Rust gauge should reach 1,203 / 7, matching Python.
+**Unblocked as of `daa855a8`.** Start here.
+
+The Rust gauge's 15 failures are 5 out-of-scope (§7's list) plus **10** in
+`test_transactions_unified` -- not the 8 the first draft claimed. The Python
+refresh's 7 are those same 5 plus the 2 that #1597 has since closed. So:
+
+- **Python is at its ceiling.** Post-#1597 it should read **1,205 / 5 = 99.6%**,
+  and its remaining 5 are exactly §7's leave-alone list.
+- **Rust's transaction cluster is therefore the entire remaining gap**, and
+  closing it puts the two servers level.
+
+Three concrete defects, all in `crates/secantus-commands`:
+
+| | Python | Rust |
+| --- | --- | --- |
+| transient-code set | `_TRANSIENT_TXN_CODES` has `267` | `is_transient_txn_code` (`lib.rs:1160`) -- **no 267** |
+| failpoint code-name table | 17 probed names incl. `112, 251, 267, 11601` | `fail_code_name` (`failpoints.rs:311`) -- **missing 24, 112, 246, 251, 267, 11601**, all falling to `Location{code}` |
+| failpoint short-circuit -> `errorLabels` | routed through `_finish_txn_statement` (#1585) | not routed |
+
+- **One of the 10 is NOT covered by this port.**
+  `test_commit_is_not_retried_after_MaxTimeMSExpired_error` passes on Python even
+  before #1585 / #1597 and fails on Rust, so it has a separate cause. Diagnose it
+  on its own rather than assuming the port closes it.
+- **Related unfiled gap:** #1597's probe recorded
+  `50 MaxTimeMSExpired -> ['UnknownTransactionCommitResult']`, and **neither
+  server emits that label anywhere** -- zero occurrences in `src/` or `crates/`.
+  Probably the same root cause as the bullet above; probe before assuming.
+- **On the exemplar risk:** #1597 *was* probed -- its message documents 17 names
+  read off a single-node replica-set mongod 8.2.11, and it explicitly refused the
+  obvious guess (267 in, 11601 out, because mongod gives 11601 no labels at all).
+  The real gap is that **neither #1585 nor #1597 added a single test file**, and
+  `PreparedTransactionInProgress` has zero occurrences under `tests/`. The probe
+  exists and nothing pins it. **Land the missing differential tests for both
+  servers in this branch** -- it is the same code table, and the Rust port is the
+  moment the unpinned probe costs something.
+- **Verify:** the Rust gauge should reach 1,205 / 5, matching Python.
 
 ### 3. Decide the test-command gate -- Joe's call
 
 - `docs/security-reports/2026-08-10.md` recommends mongod's opt-in shape.
   `configureFailPoint` is live without `--auth` (as it was before #1569; the
   flag only stopped hiding that from drivers).
-- Proposal: keep it on by default in the embedded test handles
-  (`SecantusDBServer`, `RustServer` via Python), opt-in (default off) for the
-  standalone daemons `secantusd-rs` / `secantusd-py`.
+- **There is no gate to flip today.** `enableTestCommands` is a hardcoded `true`
+  in the `getParameter` reply on both servers (`commands.py:1828`,
+  `diagnostics.rs:194`) -- an advertisement, not a switch. This step is building
+  the mechanism, not changing a default.
+- Proposal: on by default in the embedded test handles (`SecantusDBServer`,
+  `RustServer` via Python), opt-in (default off) for the standalone daemons
+  `secantusd-rs` / `secantusd-py`.
 - Cost: the non-Python driver gauges launch daemons, so every gauge task must
   pass the flag. Miss one and that gauge silently loses its failpoint coverage.
 - Counter-argument: SecantusDB is a test tool with a loopback default bind;
   deny-by-default adds friction for its intended users against a local DoS the
   report itself rated WARNING.
 
-### 4. Small `mongod` probes, batched
+### 4. Small `mongod` probes -- one site, and runnable today
+
+**The first draft's blocker does not apply to this machine.** mongod **8.2.11 is
+on `PATH`** here (with 6.0.16 and 8.3.4 in Cellar), so no `fastdl.mongodb.org`
+allowlist is needed. That note came from the sandbox that wrote the draft -- see
+the environment section below.
 
 - `getParameter` reports `featureCompatibilityVersion: "7.0"` against an 8.x
-  target.
+  target. **This is the same dict as the hardcoded `enableTestCommands` in Step
+  3**, five lines away on both servers (`commands.py:1823` / `diagnostics.rs:189`)
+  -- one site, not two work items. Probe the exact string 8.2.11 returns; do not
+  assume `"8.2"` over `"8.0"`.
 - Under `maxTimeAlwaysTimeOut`, Python `createIndexes` answers with the
   index-build envelope and Rust with the bare message. Probe which one mongod
   gives, then align both.
-- Needs `fastdl.mongodb.org` on the environment's allowlist **at session
-  start**; it does not reach a running session.
 
-### 5. Re-run the other-language gauges on both servers
+### 5. Re-run the other-language gauges on both servers -- after Step 2
 
 - Go / Node / Java / Kotlin / Ruby / Rust-driver / PHP / C / C++ / .NET were
   not re-measured after #1569. Their failpoint tests now run too.
+- **Sequence this after Step 2**, so the sweep measures a Rust server that has
+  the transaction fixes rather than producing a baseline that is obsolete on
+  publication -- which is precisely how PR #1595 went stale.
 - Expect both pass counts and failure counts to rise. Treat new failures as bug
   reports: the pymongo rerun is how the Rust session-abort and change-stream
   token bugs were found.
 
 ### 6. Real `maxTimeMS` enforcement in Rust -- a project, not a fix
 
-- Today a slow Rust command with `maxTimeMS` runs to completion. The failpoint
-  works; the limit does not.
+- Confirmed at `2fabed24`: Rust validates `maxTimeMS` thoroughly
+  (`argtypes.rs:521`) and enforces it nowhere -- there is no equivalent of
+  `src/secantus/deadline.py`. A slow Rust command with `maxTimeMS` runs to
+  completion. The failpoint works; the limit does not.
 - Needs a cooperative deadline polled by the storage scan, the aggregation
   pipeline and the index build, as `src/secantus/deadline.py` does.
 - **Risk:** those polls sit in the flagship server's hottest loops. Benchmark
@@ -84,22 +146,29 @@ every claim below before working it -- parallel sessions move this surface.
 
 ### 7. Leave alone (both servers)
 
-- Text and hashed indexes: out of scope per CLAUDE.md.
-- `$where` (`test_where`, `test_maxtime_ms_message`): needs a JavaScript engine.
+These five are the whole of Python's remaining gauge failure list, and five of
+Rust's fifteen. Nothing else is deferred.
+
+- `test_index_text`, `test_index_hashed`: text and hashed indexes are out of
+  scope per CLAUDE.md.
+- `test_where`, `test_maxtime_ms_message`: `$where` needs a JavaScript engine.
 - `test_to_list_csot_applied`: unexplained. Reproduce before deciding; it may be
   timing-sensitive.
 
-## Environment problems seen in the session that wrote this
+## Environment problems -- SANDBOX ONLY, not this machine
 
-These belong to the environment settings, not the code. How settings reach a
-session is inferred, not documented.
+These were recorded by the session that wrote the first draft, which ran in a
+cloud sandbox. **Re-checked on the local Mac at `2fabed24`: none of them apply
+here.** Keep them for whoever next works from a sandbox; do not let them stop a
+local session.
 
 - **Deleting a branch returned 403 while pushes worked.** Reconnect GitHub, or
   enable "Automatically delete head branches" in the repo settings.
 - **Network-allowlist changes did not reach the running session.** Add
-  `fastdl.mongodb.org` before starting a session that needs `mongod`.
+  `fastdl.mongodb.org` before starting a session that needs `mongod`. Locally,
+  three Homebrew builds are already installed -- see CLAUDE.md's probe table.
 - **The disk allowance is too small for one full suite run.** The suite keeps
   every test's WiredTiger store (deleting mid-run WT_PANICs), roughly 65 GB for
-  a full run. Either raise the environment's disk or give `invoke test` a
-  chunked mode (the session ran 16 chunks with `rm -rf /tmp/pytest-of-root`
-  between them).
+  a full run; the sandbox session ran 16 chunks with `rm -rf /tmp/pytest-of-root`
+  between them. The local box had 633 GB free when this was re-checked. A chunked
+  mode for `invoke test` would still be worth having.
