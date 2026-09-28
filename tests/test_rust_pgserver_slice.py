@@ -10513,3 +10513,148 @@ def test_on_conflict_partial_index_arbiter_is_refused(home: Path) -> None:
         with pytest.raises(psycopg.Error) as info:
             cur.execute("insert into t values (1, 'z', 9) on conflict (id) where id > 0 do nothing")
         assert info.value.sqlstate == "0A000"
+
+
+# --------------------------------------------------------------------------- #
+# `GROUP BY GROUPING SETS / ROLLUP / CUBE`.
+#
+# These used to be PARSED AND DROPPED: the `GroupingSet` node fell through to
+# the expression arm, failed to resolve as a column, and the statement died with
+# `42803 column "a" must appear in the GROUP BY clause` -- an error blaming the
+# user's own query for a clause the server had discarded. Worse than refusing
+# it, and the second of the two such cases the 2026-09-28 survey found.
+#
+# Every expectation below was measured against PostgreSQL 14.13.
+# --------------------------------------------------------------------------- #
+
+
+def _gs_table(conn) -> None:
+    cur = conn.cursor()
+    cur.execute("create table s (a text, b text, n int)")
+    cur.execute("insert into s values ('x','p',1),('x','q',2),('y','p',4),('y','q',8)")
+
+
+def test_grouping_sets_adds_the_empty_set_total(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        _gs_table(conn)
+        cur = conn.cursor()
+        cur.execute("select a, sum(n) from s group by grouping sets ((a),()) order by a nulls last")
+        assert cur.fetchall() == [("x", 3), ("y", 12), (None, 15)]
+
+
+def test_grouping_sets_over_two_separate_columns(home: Path) -> None:
+    """Each set groups on its OWN columns; the others are NULL-padded."""
+    with _Server(home) as server, server.connect() as conn:
+        _gs_table(conn)
+        cur = conn.cursor()
+        cur.execute(
+            "select a, b, sum(n) from s group by grouping sets ((a),(b)) "
+            "order by a nulls last, b nulls last"
+        )
+        assert cur.fetchall() == [
+            ("x", None, 3),
+            ("y", None, 12),
+            (None, "p", 5),
+            (None, "q", 10),
+        ]
+
+
+def test_a_multi_key_set_is_a_row_expression(home: Path) -> None:
+    """`((a,b),())` — the multi-key set parses as a RowExpr, not a nested
+    GroupingSet.
+
+    Assuming the latter left `b` out of the keys entirely, so the statement
+    failed with the very 42803 this change removes. Pinned because the shape is
+    not guessable from the grammar.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        _gs_table(conn)
+        cur = conn.cursor()
+        cur.execute(
+            "select a, b, sum(n) from s group by grouping sets ((a,b),()) "
+            "order by a nulls last, b nulls last"
+        )
+        assert cur.fetchall() == [
+            ("x", "p", 1),
+            ("x", "q", 2),
+            ("y", "p", 4),
+            ("y", "q", 8),
+            (None, None, 15),
+        ]
+
+
+def test_rollup_is_prefixes_longest_first(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        _gs_table(conn)
+        cur = conn.cursor()
+        cur.execute(
+            "select a, b, sum(n) from s group by rollup (a,b) order by a nulls last, b nulls last"
+        )
+        assert cur.fetchall() == [
+            ("x", "p", 1),
+            ("x", "q", 2),
+            ("x", None, 3),
+            ("y", "p", 4),
+            ("y", "q", 8),
+            ("y", None, 12),
+            (None, None, 15),
+        ]
+
+
+def test_cube_is_every_subset(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        _gs_table(conn)
+        cur = conn.cursor()
+        cur.execute(
+            "select a, b, sum(n) from s group by cube (a,b) order by a nulls last, b nulls last"
+        )
+        assert len(cur.fetchall()) == 9  # 4 pairs + 2 a-only + 2 b-only + 1 total
+
+
+def test_grouping_sets_keeps_a_duplicate_set(home: Path) -> None:
+    """PostgreSQL does NOT deduplicate: each group comes back twice."""
+    with _Server(home) as server, server.connect() as conn:
+        _gs_table(conn)
+        cur = conn.cursor()
+        cur.execute("select a, sum(n) from s group by grouping sets ((a),(a)) order by a")
+        assert cur.fetchall() == [("x", 3), ("x", 3), ("y", 12), ("y", 12)]
+
+
+def test_grouping_sets_with_having_and_count(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        _gs_table(conn)
+        cur = conn.cursor()
+        cur.execute(
+            "select a, sum(n) from s group by grouping sets ((a),()) "
+            "having sum(n) > 3 order by a nulls last"
+        )
+        assert cur.fetchall() == [("y", 12), (None, 15)]
+        cur.execute(
+            "select a, count(*) from s group by grouping sets ((a),()) order by a nulls last"
+        )
+        assert cur.fetchall() == [("x", 2), ("y", 2), (None, 4)]
+
+
+def test_the_empty_grouping_set_alone(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        _gs_table(conn)
+        cur = conn.cursor()
+        cur.execute("select sum(n) from s group by grouping sets (())")
+        assert cur.fetchall() == [(15,)]
+
+
+def test_the_grouping_function_is_refused_by_name(home: Path) -> None:
+    """Not implemented, and the refusal SAYS so.
+
+    `GROUPING(col)` reports which set produced a row, which needs the producing
+    set carried through the group. Refused loudly — and named, because the
+    generic message ("this target is not supported yet") tells a reader nothing
+    about which part of their query to change.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        _gs_table(conn)
+        cur = conn.cursor()
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute("select a, grouping(a), sum(n) from s group by rollup (a)")
+        assert info.value.sqlstate == "0A000"
+        assert "GROUPING" in str(info.value)

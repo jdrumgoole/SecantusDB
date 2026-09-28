@@ -1900,7 +1900,60 @@ impl PgHandler {
         let mut keys: Vec<Vec<Option<Bson>>> = Vec::new();
         let mut idents: Vec<Vec<Option<Bson>>> = Vec::new();
         let mut buckets: Vec<Vec<Document>> = Vec::new();
-        if agg.group_by.is_empty() {
+        // `GROUPING SETS` / `ROLLUP` / `CUBE`: each set is grouped on its OWN
+        // subset of the keys and the rest of the row's key positions are NULL,
+        // then the sets' results are concatenated in order. That is what
+        // PostgreSQL 14.13 returns, duplicates included -- `grouping sets
+        // ((a),(a))` emits every group twice.
+        //
+        // Grouping per set rather than once with a wider key is deliberate: a
+        // row belongs to one group in EVERY set, so a single pass cannot
+        // produce the several rows a rollup owes for it.
+        if let Some(sets) = agg.grouping_sets.as_ref() {
+            let width = agg.group_by.len();
+            for set in sets {
+                let mut set_keys: Vec<Vec<Option<Bson>>> = Vec::new();
+                let mut set_idents: Vec<Vec<Option<Bson>>> = Vec::new();
+                let mut set_buckets: Vec<Vec<Document>> = Vec::new();
+                for d in &docs {
+                    // Full width, so the projection reads the same positions
+                    // whichever set produced the row; a key outside this set
+                    // is NULL, which is exactly how PostgreSQL pads it.
+                    let mut key: Vec<Option<Bson>> = vec![None; width];
+                    for &i in set {
+                        let k = &agg.group_by[i];
+                        let v = match &k.expr {
+                            Some(expr) => secantus_pgplan::apply_row_expr(expr, d)
+                                .map_err(|e| Self::err(&e))?,
+                            None => d.get(&k.field).cloned().unwrap_or(Bson::Null),
+                        };
+                        key[i] = match v {
+                            Bson::Null => None,
+                            v => Some(v),
+                        };
+                    }
+                    let ident: Vec<Option<Bson>> = key.iter().map(group_key_ident).collect();
+                    match set_idents.iter().position(|k| *k == ident) {
+                        Some(i) => set_buckets[i].push(d.clone()),
+                        None => {
+                            set_keys.push(key);
+                            set_idents.push(ident);
+                            set_buckets.push(vec![d.clone()]);
+                        }
+                    }
+                }
+                // An EMPTY set groups the whole input into one row, even when
+                // the input is empty -- `group by grouping sets (())` over no
+                // rows still returns one row, as `select sum(n)` does.
+                if set.is_empty() && set_keys.is_empty() {
+                    set_keys.push(vec![None; width]);
+                    set_buckets.push(Vec::new());
+                }
+                keys.extend(set_keys);
+                idents.extend(set_idents);
+                buckets.extend(set_buckets);
+            }
+        } else if agg.group_by.is_empty() {
             keys.push(Vec::new());
             buckets.push(docs);
         } else {

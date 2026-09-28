@@ -323,6 +323,7 @@ one request path:
     `CREATE VIEW`, `CREATE TRIGGER`, `EXPLAIN`, composite `PRIMARY KEY` /
     multi-column `FOREIGN KEY`, and a non-literal column `DEFAULT`.
 
+<<<<<<< HEAD
     **`GROUPING SETS` / `ROLLUP` is parsed and then DROPPED**, so the client
     gets a confident wrong answer rather than a refusal: the grouping clause is
     discarded and the server answers a misleading `42803` blaming the user's
@@ -334,6 +335,16 @@ one request path:
     `ON CONSTRAINT` / bare arbiter, `RETURNING`, and PostgreSQL's row counts.
     Only a partial-index arbiter (`ON CONFLICT (a) WHERE ...`) is still
     refused, and loudly.
+=======
+    **Both clause-dropping bugs this survey found are now FIXED** (2026-09-28).
+    `ON CONFLICT` and `GROUPING SETS` / `ROLLUP` / `CUBE` were each parsed and
+    then discarded, so the client got a confident wrong answer — a `23505`
+    where PostgreSQL succeeds, and a `42803` blaming the user's own query —
+    rather than an honest `0A000`. Both are implemented; what each still
+    refuses, it refuses loudly and by name (a partial-index `ON CONFLICT`
+    arbiter, and the `GROUPING()` function). See `tasks/backlog.md` §5 for the
+    full survey and what DOES work.
+>>>>>>> 90ea63f8 (feat(pgserver): GROUPING SETS, ROLLUP and CUBE, which were parsed and discarded)
 
     So do not read "96.8% of psycopg passes" as "nearly done". A SQL-shaped gauge
     (`sqllogictest`, the SQLAlchemy dialect suite) would score very differently,

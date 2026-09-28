@@ -872,6 +872,13 @@ pub struct Aggregate {
     /// EVERY GROUP BY key, in declared order -- including ones the SELECT
     /// list does not project, because ORDER BY may still reference them.
     pub group_by: Vec<GroupKey>,
+    /// `GROUPING SETS` / `ROLLUP` / `CUBE`, expanded to one entry per set,
+    /// each naming the INDICES into `group_by` that the set groups on.
+    ///
+    /// `None` is a plain `GROUP BY`, which is the same thing as a single set
+    /// naming every key -- but kept distinct so the ordinary path allocates
+    /// and branches exactly as it did before.
+    pub grouping_sets: Option<Vec<Vec<usize>>>,
     pub items: Vec<AggItem>,
     /// The output columns, in order, each pointing at a group or an aggregate.
     pub select: Vec<(String, OutputCol)>,
@@ -4494,6 +4501,146 @@ fn sample_for_type(pg_type: &str) -> Bson {
 /// a defined order. The keys are ordinary columns here; an expression is
 /// refused rather than ignored, because ignoring it answers in a DIFFERENT
 /// order and says nothing.
+/// Expand a `GROUP BY` element list into the grouping SETS it denotes.
+///
+/// `None` when no element is a grouping construct, which keeps a plain
+/// `GROUP BY` on exactly the path it was on before.
+///
+/// Semantics measured against PostgreSQL 14.13 rather than recalled:
+///
+/// * `ROLLUP (a, b)` is `(a,b), (a), ()` — prefixes, longest first.
+/// * `CUBE (a, b)` is every subset, `(a,b), (a), (b), ()`.
+/// * Several constructs in one `GROUP BY` multiply: their sets are crossed.
+/// * A duplicate set is KEPT, and emits duplicate rows
+///   (`grouping sets ((a),(a))` returns each group twice).
+fn expand_grouping_sets(elements: &[GroupElement]) -> Option<Vec<Vec<usize>>> {
+    if elements.iter().all(|e| matches!(e, GroupElement::Key(_))) {
+        return None;
+    }
+    // Start with one empty set and cross in each element's alternatives.
+    let mut sets: Vec<Vec<usize>> = vec![Vec::new()];
+    for element in elements {
+        let alternatives: Vec<Vec<usize>> = match element {
+            GroupElement::Key(i) => vec![vec![*i]],
+            GroupElement::Sets(inner) => inner.clone(),
+            GroupElement::Rollup(keys) => {
+                (0..=keys.len()).rev().map(|n| keys[..n].to_vec()).collect()
+            }
+            GroupElement::Cube(keys) => {
+                // Subsets in PostgreSQL's order: the full set first, then
+                // successively fewer, which for two keys is (a,b),(a),(b),().
+                let mut out: Vec<Vec<usize>> = Vec::new();
+                for mask in (0..(1u32 << keys.len())).rev() {
+                    out.push(
+                        keys.iter()
+                            .enumerate()
+                            .filter(|(bit, _)| mask & (1 << bit) != 0)
+                            .map(|(_, k)| *k)
+                            .collect(),
+                    );
+                }
+                out
+            }
+        };
+        let mut crossed = Vec::with_capacity(sets.len() * alternatives.len());
+        for base in &sets {
+            for alt in &alternatives {
+                let mut joined = base.clone();
+                joined.extend(alt.iter().copied());
+                crossed.push(joined);
+            }
+        }
+        sets = crossed;
+    }
+    Some(sets)
+}
+
+/// One element of a `GROUP BY` list, before expansion.
+#[derive(Debug, Clone)]
+enum GroupElement {
+    /// A plain key, by index into the collected `group_by`.
+    Key(usize),
+    /// `GROUPING SETS (...)` — each inner set already resolved to indices.
+    Sets(Vec<Vec<usize>>),
+    Rollup(Vec<usize>),
+    Cube(Vec<usize>),
+}
+
+/// Resolve one `GROUP BY` element to its key.
+///
+/// Split out of `plan_aggregate`'s loop so a `GROUPING SETS` / `ROLLUP` /
+/// `CUBE` member resolves by the same rules as a top-level key.
+fn resolve_group_key(
+    node: &pg_query::protobuf::Node,
+    def: &TableDef,
+    fields: &[RowField],
+    params: &[Bson],
+    sample: &Document,
+    s: &pg_query::protobuf::SelectStmt,
+) -> Result<(GroupKey, String)> {
+    // A name that is no column of the source but IS an output alias names
+    // that target (`select length(data) as n ... group by n`); an input
+    // column wins the tie, as PostgreSQL resolves it.
+    let node = match node.node.as_ref() {
+        Some(N::ColumnRef(c)) => match column_ref_name(c) {
+            Some(name) if def.column(&name).is_none() => s
+                .target_list
+                .iter()
+                .find_map(|t| match t.node.as_ref() {
+                    Some(N::ResTarget(rt)) if rt.name == name => rt.val.as_deref(),
+                    _ => None,
+                })
+                .unwrap_or(node),
+            _ => node,
+        },
+        _ => node,
+    };
+    // The print is taken from the RESOLVED node, because that is the form the
+    // select list looks a group key up by. Taking it from the unresolved node
+    // made `GROUP BY length` (an alias for `length(name)`) store the print
+    // `length`, so the target `length(name)` found no key and the statement
+    // failed with `this target is not supported yet`.
+    let print = node_print(node);
+    match node.node.as_ref() {
+        Some(N::ColumnRef(c)) => {
+            let name = column_ref_name(c)
+                .ok_or_else(|| Error::Unsupported("this GROUP BY expression".into()))?;
+            let column = def
+                .column(&name)
+                .ok_or_else(|| Error::UndefinedColumn(name.clone()))?;
+            Ok((
+                GroupKey {
+                    name,
+                    field: column.field(),
+                    expr: None,
+                    pg_type: column.pg_type.clone(),
+                },
+                print,
+            ))
+        }
+        Some(N::FuncCall(f)) if is_aggregate_call(f) => Err(Error::Grouping(
+            "aggregate functions are not allowed in GROUP BY".into(),
+        )),
+        Some(_) => {
+            let expr = row_column_expr(node, fields, params, sample)?;
+            let pg_type = match &expr {
+                ColumnExpr::Row { result_type, .. } => result_type.clone(),
+                _ => "text".to_string(),
+            };
+            Ok((
+                GroupKey {
+                    name: expression_column_name(node),
+                    field: String::new(),
+                    expr: Some(expr),
+                    pg_type,
+                },
+                print,
+            ))
+        }
+        None => Err(Error::Unsupported("an empty GROUP BY key".into())),
+    }
+}
+
 fn plan_aggregate_order(
     nodes: &[pg_query::protobuf::Node],
     def: &TableDef,
@@ -4786,6 +4933,8 @@ fn plan_aggregate(
             series: Some(series),
             join: None,
             group_by: Vec::new(),
+            // A bare aggregate over a series has no GROUP BY at all.
+            grouping_sets: None,
             items,
             select,
             filter,
@@ -5349,7 +5498,88 @@ fn finish_aggregate(
     }
     let mut group_by: Vec<GroupKey> = Vec::new();
     let mut group_prints: Vec<String> = Vec::new();
+    let mut elements: Vec<GroupElement> = Vec::new();
+    // `push_key` resolves one GROUP BY element to a key and returns its index,
+    // so a member of a GROUPING SETS / ROLLUP / CUBE list resolves exactly as
+    // a top-level key does -- including `GROUP BY 2` positions and output
+    // aliases. Duplicated resolution here would diverge the moment either
+    // gained a case.
+    let push_key = |node: &pg_query::protobuf::Node,
+                    group_by: &mut Vec<GroupKey>,
+                    group_prints: &mut Vec<String>|
+     -> Result<usize> {
+        let (key, print) = resolve_group_key(node, &def, &fields, params, &sample, s)?;
+        // A key named twice is ONE key: `rollup (a, a)` and a select list
+        // mentioning `a` must agree on which index they mean.
+        if let Some(i) = group_prints.iter().position(|p| *p == print) {
+            return Ok(i);
+        }
+        group_prints.push(print);
+        group_by.push(key);
+        Ok(group_by.len() - 1)
+    };
     for g in &s.group_clause {
+        // `GROUPING SETS` / `ROLLUP` / `CUBE` arrive as a `GroupingSet` node
+        // rather than an expression. Before this they fell through to the
+        // expression arm, failed to resolve as a column, and the statement
+        // died with `42803 column "a" must appear in the GROUP BY clause` --
+        // an error blaming the user's own query for a clause this server had
+        // simply dropped.
+        if let Some(N::GroupingSet(gs)) = g.node.as_ref() {
+            use pg_query::protobuf::GroupingSetKind as K;
+            let members = |content: &[pg_query::protobuf::Node],
+                           group_by: &mut Vec<GroupKey>,
+                           group_prints: &mut Vec<String>|
+             -> Result<Vec<usize>> {
+                content
+                    .iter()
+                    .map(|n| push_key(n, group_by, group_prints))
+                    .collect()
+            };
+            match K::try_from(gs.kind) {
+                Ok(K::GroupingSetEmpty) => elements.push(GroupElement::Sets(vec![Vec::new()])),
+                Ok(K::GroupingSetRollup) => {
+                    let keys = members(&gs.content, &mut group_by, &mut group_prints)?;
+                    elements.push(GroupElement::Rollup(keys));
+                }
+                Ok(K::GroupingSetCube) => {
+                    let keys = members(&gs.content, &mut group_by, &mut group_prints)?;
+                    elements.push(GroupElement::Cube(keys));
+                }
+                Ok(K::GroupingSetSets) => {
+                    let mut sets = Vec::new();
+                    for item in &gs.content {
+                        match item.node.as_ref() {
+                            // A set of SEVERAL keys, `(a, b)`, parses as a
+                            // RowExpr -- NOT as a nested GroupingSet, which is
+                            // what this first assumed. The wrong guess made
+                            // `grouping sets ((a,b),())` fail with the very
+                            // 42803 this change exists to remove, because `b`
+                            // never became a key.
+                            Some(N::RowExpr(r)) => {
+                                sets.push(members(&r.args, &mut group_by, &mut group_prints)?);
+                            }
+                            // A nested construct, e.g. `grouping sets (rollup(a))`.
+                            Some(N::GroupingSet(inner)) => {
+                                sets.push(members(
+                                    &inner.content,
+                                    &mut group_by,
+                                    &mut group_prints,
+                                )?);
+                            }
+                            // `(a)` -- a bare key is a one-key set.
+                            Some(_) => {
+                                sets.push(vec![push_key(item, &mut group_by, &mut group_prints)?]);
+                            }
+                            None => sets.push(Vec::new()),
+                        }
+                    }
+                    elements.push(GroupElement::Sets(sets));
+                }
+                _ => return Err(Error::Unsupported("this GROUP BY construct".into())),
+            }
+            continue;
+        }
         let node = match g.node.as_ref() {
             Some(N::AConst(c)) if matches!(c.val, Some(a_const::Val::Ival(_))) => {
                 let Some(a_const::Val::Ival(i)) = &c.val else {
@@ -5374,60 +5604,10 @@ fn finish_aggregate(
             Some(_) => g,
             None => return Err(Error::Unsupported("an empty GROUP BY key".into())),
         };
-        // A name that is no column of the source but IS an output alias
-        // names that target (`select length(data) as n ... group by n`);
-        // an input column wins the tie, as PostgreSQL resolves it.
-        let node = match node.node.as_ref() {
-            Some(N::ColumnRef(c)) => match column_ref_name(c) {
-                Some(name) if def.column(&name).is_none() => s
-                    .target_list
-                    .iter()
-                    .find_map(|t| match t.node.as_ref() {
-                        Some(N::ResTarget(rt)) if rt.name == name => rt.val.as_deref(),
-                        _ => None,
-                    })
-                    .unwrap_or(node),
-                _ => node,
-            },
-            _ => node,
-        };
-        let key = match node.node.as_ref() {
-            Some(N::ColumnRef(c)) => {
-                let name = column_ref_name(c)
-                    .ok_or_else(|| Error::Unsupported("this GROUP BY expression".into()))?;
-                let column = def
-                    .column(&name)
-                    .ok_or_else(|| Error::UndefinedColumn(name.clone()))?;
-                GroupKey {
-                    name,
-                    field: column.field(),
-                    expr: None,
-                    pg_type: column.pg_type.clone(),
-                }
-            }
-            Some(N::FuncCall(f)) if is_aggregate_call(f) => {
-                return Err(Error::Grouping(
-                    "aggregate functions are not allowed in GROUP BY".into(),
-                ));
-            }
-            Some(_) => {
-                let expr = row_column_expr(node, &fields, params, &sample)?;
-                let pg_type = match &expr {
-                    ColumnExpr::Row { result_type, .. } => result_type.clone(),
-                    _ => "text".to_string(),
-                };
-                GroupKey {
-                    name: expression_column_name(node),
-                    field: String::new(),
-                    expr: Some(expr),
-                    pg_type,
-                }
-            }
-            None => return Err(Error::Unsupported("an empty GROUP BY key".into())),
-        };
-        group_prints.push(node_print(node));
-        group_by.push(key);
+        let index = push_key(node, &mut group_by, &mut group_prints)?;
+        elements.push(GroupElement::Key(index));
     }
+    let grouping_sets = expand_grouping_sets(&elements);
 
     let mut items: Vec<AggItem> = Vec::new();
     let mut exprs: Vec<ColumnExpr> = Vec::new();
@@ -5436,6 +5616,14 @@ fn finish_aggregate(
         let Some(N::ResTarget(rt)) = t.node.as_ref() else {
             return Err(Error::Unsupported("this target".into()));
         };
+        // `GROUPING(col)` reports WHICH set produced a row, which means
+        // carrying the producing set through the group -- not done. Named
+        // explicitly so the refusal says what is missing: the generic arm
+        // below answers `this target is not supported yet`, which tells a
+        // reader nothing about which part of their query to change.
+        if let Some(N::GroupingFunc(_)) = rt.val.as_ref().and_then(|v| v.node.as_ref()) {
+            return Err(Error::Unsupported("the GROUPING function".into()));
+        }
         match rt.val.as_ref().and_then(|v| v.node.as_ref()) {
             Some(N::FuncCall(f)) if is_aggregate_call(f) => {
                 let name = func_name(f).unwrap_or_default();
@@ -5758,6 +5946,7 @@ fn finish_aggregate(
         join,
         table,
         group_by,
+        grouping_sets,
         items,
         select,
         filter,
