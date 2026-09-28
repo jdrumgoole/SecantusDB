@@ -6884,6 +6884,39 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       application SQL and also gate any broader SQL gauge.~~ **SHIPPED
       2026-09-28** — see the entry below for what is left of it.
 
+- [ ] **OPEN — RUST pgserver: `information_schema` is the last of the
+      sequences corpus, and the whole of the catalog one (2026-09-28).**
+      Sequences and identity columns landed, taking
+      `tools/probes/pg_corpora/sequences.sql` from 24 divergences of 26 to 1.
+      The one left is `information_schema.sequences`, and it is the same gap
+      the `catalog` corpus is mostly made of (19 of 22):
+
+      ```
+      information_schema.columns / .tables / .table_constraints / .sequences
+      pg_namespace
+      ```
+
+      Each is a view over catalog state this server already HAS, so the work
+      is shape rather than substance — but each view's columns have to be
+      right, because the clients that read them (ORMs, `\d`, migration tools)
+      match on exact names and types. `virtual_table` / `virtual_rows` is the
+      mechanism; `pg_type` and friends already go through it.
+
+      **Two things the sequence work measured, worth not re-deriving:**
+
+      * **The bound a sequence runs into depends on its DIRECTION** — a
+        descending one starts at its MAXIMUM and exhausts at its MINIMUM.
+        Checking only `max_value` let it run past its floor for ever.
+      * **The identity overriding matrix has four live cases** (14.24):
+        `ALWAYS` + no clause is `428C9`; `OVERRIDING SYSTEM VALUE` takes the
+        given value; `OVERRIDING USER VALUE` DISCARDS it and draws from the
+        sequence, for either identity kind; and an explicit NULL is `23502`
+        for both kinds even under `OVERRIDING SYSTEM VALUE`.
+
+      **Still divergent by design:** `nextval` here is a storage write, so it
+      rolls back with its transaction. PostgreSQL never re-issues a value.
+      Making that faithful needs a write outside the transaction.
+
 - [ ] **OPEN — RUST pgserver: `CREATE INDEX` and `CREATE VIEW` are what is
       left of the DDL corpus (2026-09-28).** `ALTER TABLE` and `RENAME`
       landed, taking `tools/probes/pg_corpora/ddl.sql` from 28 divergences of

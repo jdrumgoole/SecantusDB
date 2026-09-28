@@ -29,8 +29,8 @@ pub mod scalar;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use pg_query::protobuf::node::Node as N;
 use pg_query::protobuf::{
-    a_const, AExpr, AExprKind, BoolExprType, DropBehavior, NullTestType, ObjectType, SortByDir,
-    SortByNulls, SubLinkType, TransactionStmtKind, VariableSetKind,
+    a_const, AExpr, AExprKind, BoolExprType, DropBehavior, NullTestType, ObjectType,
+    OverridingKind, SortByDir, SortByNulls, SubLinkType, TransactionStmtKind, VariableSetKind,
 };
 use secantus_pgcatalog::{CheckConstraint, Column, ForeignKey, TableDef, UniqueConstraint};
 
@@ -267,6 +267,24 @@ pub enum Statement {
         table: String,
         missing_ok: bool,
         actions: Vec<AlterTableAction>,
+    },
+    /// `CREATE SEQUENCE`.
+    CreateSequence {
+        name: String,
+        options: SequenceOptions,
+        if_not_exists: bool,
+        temp: bool,
+    },
+    /// `DROP SEQUENCE`.
+    DropSequence {
+        names: Vec<String>,
+        if_exists: bool,
+    },
+    /// `ALTER SEQUENCE`, which applies only the options it names.
+    AlterSequence {
+        name: String,
+        options: SequenceOptions,
+        missing_ok: bool,
     },
     /// `ALTER TABLE <t> RENAME TO <u>`. Its own statement because pg_query
     /// parses it as a `RenameStmt` rather than an `AlterTableCmd`.
@@ -613,6 +631,12 @@ pub struct Insert {
     /// `ON CONFLICT ...`, or `None` when the statement has no such clause,
     /// which leaves the plain-INSERT path untouched.
     pub on_conflict: Option<OnConflict>,
+    /// `OVERRIDING SYSTEM VALUE`, which is the only way to write a
+    /// `GENERATED ALWAYS AS IDENTITY` column by hand.
+    pub overriding_system: bool,
+    /// `OVERRIDING USER VALUE`: the opposite -- the value the statement gives
+    /// is DISCARDED and the sequence supplies one, for either identity kind.
+    pub overriding_user: bool,
 }
 
 /// The projection a `RETURNING` clause applies to each written row.
@@ -1494,6 +1518,24 @@ pub enum ConstCol {
     /// `pg_backend_pid()` -- the connection's own backend PID, which only the
     /// server knows (pgwire assigns it during startup).
     BackendPid,
+    /// `nextval(seq)` -- draws and CONSUMES a value, so it is resolved at
+    /// execution and never at DESCRIBE: a describe that advanced the sequence
+    /// would hand the next caller a number PostgreSQL never skipped.
+    NextVal(Box<ConstCol>),
+    /// `currval(seq)` -- what THIS SESSION last drew from it.
+    CurrVal(Box<ConstCol>),
+    /// `setval(seq, value [, is_called])`.
+    SetVal {
+        sequence: Box<ConstCol>,
+        value: Box<ConstCol>,
+        is_called: Box<ConstCol>,
+    },
+    /// `pg_get_serial_sequence(table, column)` -- the sequence name a serial
+    /// column draws from, which only the catalog knows.
+    SerialSequence {
+        table: Box<ConstCol>,
+        column: Box<ConstCol>,
+    },
     /// `pg_terminate_backend(pid)` -- terminate the backend with that PID. The
     /// argument is itself a `ConstCol` because it may be a literal, a bound
     /// parameter, or a nested `pg_backend_pid()` (the common `SELECT
@@ -1914,6 +1956,8 @@ fn plan_node(
     match node {
         N::CreateStmt(c) => plan_create(&c),
         N::AlterTableStmt(a) => plan_alter_table(&a, lookup, params),
+        N::CreateSeqStmt(c) => plan_create_sequence(&c),
+        N::AlterSeqStmt(a) => plan_alter_sequence(&a),
         N::RenameStmt(r) => plan_rename(&r),
         N::CreateTableAsStmt(c) => plan_create_table_as(&c, lookup, params),
         N::InsertStmt(i) => plan_insert(&i, lookup, params),
@@ -2937,6 +2981,134 @@ fn plan_rename(r: &pg_query::protobuf::RenameStmt) -> Result<Statement> {
     }
 }
 
+/// The options a `CREATE`/`ALTER SEQUENCE` carries, each `None` when the
+/// statement did not name it.
+///
+/// `ALTER` applies only what it names, so every field has to be optional --
+/// `alter sequence s increment by 10` must not reset the start or the
+/// current value.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SequenceOptions {
+    pub start: Option<i64>,
+    pub increment: Option<i64>,
+    pub min_value: Option<i64>,
+    pub max_value: Option<i64>,
+    pub cycle: Option<bool>,
+    /// `RESTART` / `RESTART WITH n`: sets the current value and un-calls the
+    /// sequence, so the NEXT `nextval` returns it rather than one past it.
+    pub restart: Option<Option<i64>>,
+    /// `OWNED BY t.c`, or `OWNED BY NONE` as an empty string.
+    pub owned_by: Option<String>,
+}
+
+/// `CREATE SEQUENCE` / `ALTER SEQUENCE` options, read off the parser's
+/// `DefElem` list.
+fn plan_sequence_options(options: &[pg_query::protobuf::Node]) -> Result<SequenceOptions> {
+    let mut out = SequenceOptions::default();
+    for opt in options {
+        let Some(N::DefElem(d)) = opt.node.as_ref() else {
+            continue;
+        };
+        // A sequence option's argument is a BARE `Integer` / `Float` node,
+        // not the `A_Const` an expression would be -- `const_value` answered
+        // `0A000 Integer is not supported yet` for every `START 10` and
+        // `RESTART WITH 5`.
+        let value = || -> Result<Option<i64>> {
+            let Some(node) = d.arg.as_deref() else {
+                return Ok(None);
+            };
+            match node.node.as_ref() {
+                Some(N::Integer(i)) => Ok(Some(i64::from(i.ival))),
+                Some(N::Float(f)) => f.fval.parse::<i64>().map(Some).map_err(|_| {
+                    Error::Unsupported(format!("a non-integer {} for a sequence", d.defname))
+                }),
+                _ => match const_value(node, &[])? {
+                    Bson::Int32(v) => Ok(Some(i64::from(v))),
+                    Bson::Int64(v) => Ok(Some(v)),
+                    Bson::Null => Ok(None),
+                    _ => Err(Error::Unsupported(format!(
+                        "a non-integer {} for a sequence",
+                        d.defname
+                    ))),
+                },
+            }
+        };
+        match d.defname.as_str() {
+            "start" => out.start = value()?,
+            "increment" => out.increment = value()?,
+            // `NO MINVALUE` / `NO MAXVALUE` arrive as the same option with no
+            // argument, which is what `None` from `value()` means -- so the
+            // bound falls back to the type's limit rather than being left as
+            // it was.
+            "minvalue" => out.min_value = value()?,
+            "maxvalue" => out.max_value = value()?,
+            "cycle" => {
+                out.cycle = Some(match d.arg.as_ref().and_then(|n| n.node.as_ref()) {
+                    None => true,
+                    Some(N::Integer(i)) => i.ival != 0,
+                    Some(N::Boolean(b)) => b.boolval,
+                    _ => true,
+                })
+            }
+            "restart" => out.restart = Some(value()?),
+            "owned_by" => {
+                // A list of name parts: `t.c`, or the single word `none`.
+                let parts = match d.arg.as_deref().and_then(|n| n.node.as_ref()) {
+                    Some(N::List(l)) => l
+                        .items
+                        .iter()
+                        .filter_map(|i| match i.node.as_ref() {
+                            Some(N::String(s)) => Some(s.sval.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                };
+                out.owned_by = Some(
+                    if parts.len() == 1 && parts[0].eq_ignore_ascii_case("none") {
+                        String::new()
+                    } else {
+                        parts.join(".")
+                    },
+                );
+            }
+            // `AS bigint` fixes the bounds, and the sequence's own MIN/MAX
+            // options override it; `CACHE` is a performance hint with no
+            // effect on the values this server hands out.
+            "as" | "cache" => {}
+            other => return Err(Error::Unsupported(format!("the sequence option {other}"))),
+        }
+    }
+    Ok(out)
+}
+
+fn plan_create_sequence(c: &pg_query::protobuf::CreateSeqStmt) -> Result<Statement> {
+    let name = c
+        .sequence
+        .as_ref()
+        .map(|r| r.relname.clone())
+        .ok_or_else(|| Error::Parse("CREATE SEQUENCE without a name".into()))?;
+    Ok(Statement::CreateSequence {
+        name,
+        options: plan_sequence_options(&c.options)?,
+        if_not_exists: c.if_not_exists,
+        temp: c.sequence.as_ref().is_some_and(|r| r.relpersistence == "t"),
+    })
+}
+
+fn plan_alter_sequence(a: &pg_query::protobuf::AlterSeqStmt) -> Result<Statement> {
+    let name = a
+        .sequence
+        .as_ref()
+        .map(|r| r.relname.clone())
+        .ok_or_else(|| Error::Parse("ALTER SEQUENCE without a name".into()))?;
+    Ok(Statement::AlterSequence {
+        name,
+        options: plan_sequence_options(&a.options)?,
+        missing_ok: a.missing_ok,
+    })
+}
+
 fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
     use pg_query::protobuf::ConstrType as CT;
     let relation = c
@@ -3071,6 +3243,25 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                             };
                             uniques.push(UniqueConstraint::new(&name, vec![cd.colname.clone()]));
                             last_deferrable = Some(DeferTarget::Unique);
+                        }
+                        // `GENERATED ALWAYS AS IDENTITY` / `GENERATED BY
+                        // DEFAULT AS IDENTITY`: a sequence-backed column with
+                        // stricter rules than a serial. `generated_when` is
+                        // `"a"` for ALWAYS and `"d"` for BY DEFAULT; stored
+                        // under the PYTHON server's spelling, because the two
+                        // share this catalog.
+                        Ok(CT::ConstrIdentity) => {
+                            column.identity = Some(
+                                if k.generated_when == "a" {
+                                    "always"
+                                } else {
+                                    "by_default"
+                                }
+                                .to_string(),
+                            );
+                            column.sequence = Some(format!("{table}_{}_seq", cd.colname));
+                            // An identity column is NOT NULL by definition.
+                            column.nullable = false;
                         }
                         _ => {
                             return Err(Error::Unsupported(format!(
@@ -3727,6 +3918,10 @@ fn plan_insert(
         targets,
         explicit_columns: !i.cols.is_empty(),
         on_conflict,
+        overriding_system: OverridingKind::try_from(i.r#override)
+            == Ok(OverridingKind::OverridingSystemValue),
+        overriding_user: OverridingKind::try_from(i.r#override)
+            == Ok(OverridingKind::OverridingUserValue),
     }))
 }
 
@@ -9142,6 +9337,51 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 // `pg_backend_pid()` and `pg_terminate_backend(pid)` need the
                 // connection's identity, which the stateless planner does not
                 // have -- they become `ConstCol`s the server resolves.
+                // The sequence functions read and WRITE server state, so
+                // they become `ConstCol`s the server resolves rather than
+                // anything the stateless planner can fold.
+                if matches!(name.as_str(), "nextval" | "currval" | "setval")
+                    || name == "pg_get_serial_sequence"
+                {
+                    let arg = |i: usize| -> Result<ConstCol> {
+                        match f.args.get(i) {
+                            None => Ok(ConstCol::Value(Bson::Null)),
+                            Some(node) => Ok(ConstCol::Value(const_value(node, params)?)),
+                        }
+                    };
+                    let out = if rt.name.is_empty() {
+                        name.clone()
+                    } else {
+                        rt.name.clone()
+                    };
+                    let (col, ty) = match name.as_str() {
+                        "nextval" => (ConstCol::NextVal(Box::new(arg(0)?)), "int8"),
+                        "currval" => (ConstCol::CurrVal(Box::new(arg(0)?)), "int8"),
+                        "setval" => (
+                            ConstCol::SetVal {
+                                sequence: Box::new(arg(0)?),
+                                value: Box::new(arg(1)?),
+                                // The two-argument form leaves the sequence
+                                // CALLED, so the next draw is one past it.
+                                is_called: Box::new(if f.args.len() > 2 {
+                                    arg(2)?
+                                } else {
+                                    ConstCol::Value(Bson::Boolean(true))
+                                }),
+                            },
+                            "int8",
+                        ),
+                        _ => (
+                            ConstCol::SerialSequence {
+                                table: Box::new(arg(0)?),
+                                column: Box::new(arg(1)?),
+                            },
+                            "text",
+                        ),
+                    };
+                    columns.push((out, col, ty.to_string(), -1));
+                    continue;
+                }
                 if name == "pg_backend_pid" {
                     columns.push((
                         if rt.name.is_empty() {
@@ -14697,6 +14937,30 @@ fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
             arg_types,
             if_exists: d.missing_ok,
             cascade: DropBehavior::try_from(d.behavior) == Ok(DropBehavior::DropCascade),
+        });
+    }
+    // `DROP SEQUENCE`: each object is a List of name parts, like a table's.
+    if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectSequence) {
+        let mut names = Vec::new();
+        for obj in &d.objects {
+            let name = match obj.node.as_ref() {
+                Some(N::String(s)) => s.sval.clone(),
+                Some(N::List(l)) => l
+                    .items
+                    .iter()
+                    .filter_map(|n| match n.node.as_ref()? {
+                        N::String(s) => Some(s.sval.clone()),
+                        _ => None,
+                    })
+                    .next_back()
+                    .ok_or_else(|| Error::Parse("DROP SEQUENCE without a name".into()))?,
+                _ => return Err(Error::Unsupported("this DROP SEQUENCE target".into())),
+            };
+            names.push(name);
+        }
+        return Ok(Statement::DropSequence {
+            names,
+            if_exists: d.missing_ok,
         });
     }
     if ObjectType::try_from(d.remove_type) != Ok(ObjectType::ObjectTable) {
