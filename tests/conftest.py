@@ -200,6 +200,25 @@ def wt_home_module(_wt_template: str, tmp_path_factory: pytest.TempPathFactory) 
 #: The repository this checkout is, for asking git about it.
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
+# `tools` is a repo-root package and pytest puts only `tests/` on the path (no
+# `tests/__init__.py`, so `prepend` import mode uses this file's own directory).
+# One insert makes `tools.provenance` importable — see that module for why the
+# staleness comparison lives there rather than here.
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools.provenance import (  # noqa: E402
+    COST_BINARY,
+    COST_SERVER,
+    PGSERVER_REL,
+    REBUILD_PGSERVER_CMD,
+    REBUILD_RS_CMD,
+    REBUILD_SERVER_CMD,
+    RS_REL,
+    binary_staleness,
+    extension_staleness,
+)
+
 _REBUILD_CORE_CMD = "uv run python -m invoke sync"
 
 #: Crates whose content the `_secantus_core` extension is built from. Both
@@ -235,82 +254,11 @@ def _committed_source_tree() -> str:
     return "-".join(hashes)
 
 
-#: Rebuild commands per artifact — the official invoke tasks, verified against
-#: `rust_tasks.py` rather than guessed. The first draft of this table told
-#: anyone with a stale `secantusd-rs` to run `rust-server-build`, which rebuilds
-#: the embedded EXTENSION instead; a check that prints the wrong remedy sends
-#: people down a ten-minute detour and teaches them to distrust it.
-_REBUILD_SERVER_CMD = "./inv rust-server-build"
-_REBUILD_PGSERVER_CMD = "./inv rust-pgserver-build"
-_REBUILD_RS_CMD = "./inv rust-binary-build"
-
-
-#: The whole `crates` tree, which is what the server extension and both
-#: binaries stamp. Separate from :func:`_committed_source_tree`, which names the
-#: two core crates because that extension only depends on those.
-def _committed_crates_tree() -> str:
-    """The checkout's tree hash for all of `crates/`, or "" if git can't say."""
-    import subprocess
-
-    try:
-        out = subprocess.run(
-            ["git", "rev-parse", "HEAD:crates"],
-            cwd=_REPO_ROOT,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    return out.stdout.strip() if out.returncode == 0 else ""
-
-
-def _binary_source_tree(path: pathlib.Path) -> str:
-    """The tree hash a built binary reports via ``--version``, or "".
-
-    The binaries print a ``tree: <hash>`` line (added so a stale one could be
-    identified at all). An older binary predating that line simply has no stamp,
-    and the check abstains.
-    """
-    import subprocess
-
-    try:
-        out = subprocess.run([str(path), "--version"], capture_output=True, text=True, timeout=30)
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    if out.returncode != 0:
-        return ""
-    for line in out.stdout.splitlines():
-        if line.startswith("tree:"):
-            return line.split(":", 1)[1].strip()
-    return ""
-
-
-def stale_artifact_message(
-    artifact: str, built: str, current: str, rebuild: str, cost: str
-) -> str | None:
-    """The failure text when `built` and `current` disagree, else ``None``.
-
-    The generic form of :func:`stale_core_message`, which stays as-is because
-    its wording is load-bearing in its own tests. Silence when either side is
-    unknown is the important half: an unstamped artifact, or a checkout git
-    cannot read, must not fail anybody's run.
-    """
-    if not built or not current or built == current:
-        return None
-    return (
-        f"the installed `{artifact}` was built from different sources than this "
-        f"checkout:\n"
-        f"    artifact: {built}\n"
-        f"    checkout: {current}\n"
-        f"Running against a stale artifact produces failures that look like real "
-        f"regressions and are not. {cost}\nRebuild it:\n"
-        f"    {rebuild}\n"
-        "(A worktree without `vendor/wiredtiger` cannot build the WT-linked "
-        "artifacts at all — `git submodule update --init --depth 1 "
-        "vendor/wiredtiger` first, or delete the stale one, which makes its "
-        "tests skip honestly instead of failing falsely.)"
-    )
+#: The staleness comparison, the rebuild commands and the cost strings all live
+#: in `tools.provenance` (imported above) so that probes, gauges and benchmarks
+#: can reach them too. They were private to this file until 2026-09-28, which
+#: meant the check existed for pytest and for nothing else — and the repo's main
+#: bug-finding method is an ad-hoc probe, not pytest.
 
 
 def _check_artifact_build_provenance() -> None:
@@ -332,59 +280,29 @@ def _check_artifact_build_provenance() -> None:
     which is the worst of both worlds: the evidence was sitting in
     `--version` output that no automated thing read.
     """
-    checks: list[tuple[str, str, str, str, str]] = []
+    messages: list[str | None] = []
 
     try:
         import _secantus_server  # type: ignore[import-not-found]
-
-        checks.append(
-            (
-                "_secantus_server",
-                getattr(_secantus_server, "__source_tree__", ""),
-                _committed_crates_tree(),
-                _REBUILD_SERVER_CMD,
-                "On 2026-09-27 a stale one produced 3 failures and a hang in a "
-                "colleague's test file, reported as their bug; 13/13 passed "
-                "after a rebuild with no code change.",
-            )
-        )
     except ImportError:
         pass  # No extension at all is a normal, deliberate configuration.
-
-    for name, rel, rebuild in (
-        (
-            "secantusd-pg",
-            "crates/secantus-pgserver/target/debug/secantusd-pg",
-            _REBUILD_PGSERVER_CMD,
-        ),
-        ("secantusd-rs", "crates/secantusdb/target/debug/secantusd-rs", _REBUILD_RS_CMD),
-    ):
-        binary = _REPO_ROOT / rel
-        if not binary.exists() and sys.platform == "win32":
-            # Cargo emits `.exe` on Windows, so the bare name NEVER exists
-            # there and this guard skipped both binaries entirely -- on the one
-            # platform where it had already been caught once. The same missing
-            # suffix made all 1,194 tests in `test_rust_pgserver_slice.py` skip
-            # (see `BINARY` there). It cost an eighth false diagnosis on
-            # 2026-09-28: a `secantusd-pg` six days stale read as a fresh
-            # regression, and the guard written to prevent exactly that was
-            # watching a filename that cannot exist.
-            binary = binary.with_suffix(".exe")
-        if not binary.exists():
-            continue  # Its tests skip; nothing to be stale against.
-        checks.append(
-            (
-                name,
-                _binary_source_tree(binary),
-                _committed_crates_tree(),
-                rebuild,
-                "On 2026-09-27 a stale one caused six separate false-regression "
-                "diagnoses in one session.",
+    else:
+        messages.append(
+            extension_staleness(
+                _secantus_server, "_secantus_server", REBUILD_SERVER_CMD, cost=COST_SERVER
             )
         )
 
-    for artifact, built, current, rebuild, cost in checks:
-        message = stale_artifact_message(artifact, built, current, rebuild, cost)
+    for name, rel, rebuild in (
+        ("secantusd-pg", PGSERVER_REL, REBUILD_PGSERVER_CMD),
+        ("secantusd-rs", RS_REL, REBUILD_RS_CMD),
+    ):
+        # `binary_staleness` resolves the Windows `.exe` suffix and abstains on a
+        # binary that does not exist -- its tests skip, so there is nothing to be
+        # stale against.
+        messages.append(binary_staleness(_REPO_ROOT / rel, name, rebuild, cost=COST_BINARY))
+
+    for message in messages:
         if message is not None:
             raise pytest.UsageError(message)
 
