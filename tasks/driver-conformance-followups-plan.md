@@ -22,11 +22,11 @@ parallel sessions move this surface, and this file has already been wrong once.
   **It has #1582 and #1585 as ancestors but NOT #1597** -- the PR was opened at
   07:17Z and #1597 landed at 08:48Z. Merging it as-is publishes numbers that
   understate the server by exactly the two tests #1597 closed.
-- **#1599 filed a competing tracker for the same drift.** `tasks/backlog.md` now
-  carries an OPEN item saying the committed reports predate #1582 / #1585 / #1597
-  and prescribing a re-run of `invoke validate` and `invoke validate-java`. That
-  is a different answer to the question Step 1 asks. Close one before working the
-  other; this plan now recommends the re-run (see Step 1).
+- **The gauge-number drift is tracked in `tasks/backlog.md` §5, not here.**
+  #1599 filed a backlog item for it while this plan's Step 1 described the same
+  thing; the two were folded into one tracker, which also turned up the Java
+  gauge turning its whole failure set over between two runs a day apart. Step 1
+  is now a pointer to it.
 - The remaining gap is almost entirely the Rust server trailing the Python one --
   and the shape of it is sharper than the first draft said. See Step 2.
 
