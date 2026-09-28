@@ -1,13 +1,14 @@
 ---
 name: close-session
-description: Close out a SecantusDB working session — land every outstanding change, record what is left with measurements, tear down branches and worktrees, and reconcile the documentation with what actually changed. Fires on "close the session", "wrap up", "finish up", "we're done", "end of session", or when the user stops directing new work. Sequences the per-slice landing (batch-worktree) and the machine cleanup (session-cleanup) and adds the part neither covers: finding the docs, comments and tests that still describe the behaviour you just changed.
+description: Close out a SecantusDB working session — land every outstanding change, record what is left with measurements, tear down branches and worktrees, and reconcile the documentation with what actually changed. Fires on "close the session", "wrap up", "finish up", "we're done", "end of session", or when the user stops directing new work. Sequences the per-slice landing (batch-worktree) and the machine cleanup (session-cleanup) and adds the part neither covers: finding the docs, comments and tests that still describe the behaviour you just changed — and refuses to declare the session closed while any of your own work is still in flight.
 ---
 
 # Closing a session is a task, not a farewell
 
 A session ends well when someone arriving cold can tell what happened, what is
 true now, and what is left — from the repo alone, without this conversation.
-That takes four passes, in this order, because each depends on the one before.
+That takes four passes, in this order, because each depends on the one before,
+and then a gate: **you do not get to close while your own work is still moving.**
 
 Its mirror is **`start-session`**: what this skill records at the end, that one
 reads at the beginning. Three sibling skills own parts of the work and are not
@@ -45,6 +46,9 @@ gh pr list --state open --author '@me' --json number,title,headRefName,mergeStat
   reports `tail`'s status, and a gate that failed with real test failures has
   been reported as "exit 0" that way. Read the summary line, not the exit of a
   chain.
+- **Landing includes WAITING for the gate you started.** Opening a PR is not
+  landing it; pushing is not merging. If CI is queued, the slice is not landed
+  and pass 1 is not finished — see §5.
 - Work you decide **not** to land still needs a decision recorded — a branch left
   open with a note beats a branch left open silently.
 
@@ -109,8 +113,61 @@ Add a `changelog.d/<slug>.md` fragment per user-visible change — never edit
 Follow **`session-cleanup`**: processes (SIGTERM, never SIGKILL, for anything
 holding a database), temp stores, the pytest backlog, background waiters, and
 the attribution rules for deciding what is yours. Branch and worktree teardown
-belongs to the merge that created them — see `batch-worktree` — so by this point
-there should be nothing of yours left to remove.
+belongs to the merge that created them — see `batch-worktree` — so *once every
+slice has actually landed* there should be nothing of yours left to remove. If
+something is still awaiting a merge, its worktree and its temp state are not
+debris yet; §5 is where you wait for it, and you will come back through here
+afterwards.
+
+## 5. Wait until nothing of YOURS is in flight
+
+**The session is not closable while your own work is still moving.** Waiting is
+part of the task, not an interruption of it: a handover written over a queued CI
+run describes a state that does not exist yet, and every number in it is a
+prediction rather than a measurement.
+
+Check each of these, and re-check rather than remember:
+
+```bash
+gh pr list --state open --author '@me' --json number,headRefName,mergeStateStatus
+gh run list --branch <each branch you pushed> --limit 5
+git -C <each worktree> status --short          # nothing uncommitted
+git worktree list && git ls-remote --heads origin   # nothing awaiting teardown
+```
+
+**Every session here pushes as the same GitHub account, so `--author '@me'`
+lists other sessions' PRs too.** Match on the branches *you* created in this
+conversation; do not wait on, or touch, a PR you did not open.
+
+Then the things that leave no git trace: background commands and monitors you
+armed, detached runs (`scripts/detached_run.py status --name <n>`), and any
+suite, gauge or probe whose result you have not yet read.
+
+**This gate loops back.** Finishing something here usually re-opens pass 1 (a
+merge) and pass 4 (the worktree and temp state that merge frees), and may
+re-open passes 2 and 3 if the merge pulled in a conflict. Run them again rather
+than assuming the earlier pass still holds — `main` moves under you.
+
+**In flight means it finishes on its own if you wait.** A queued CI run, a suite
+at 80%, a PR that needs only a merge, a branch that needs only teardown. For all
+of them the instruction is the same: **wait, then finish it.** Re-arm an expired
+monitor instead of treating the expiry as an answer, and if the wait is long, say
+so and keep waiting — a runner queue that takes forty minutes takes forty
+minutes. That is cheaper than the alternative, because an unmerged branch is
+invisible to every other session and nothing will pick it up.
+
+**Blocked is different, and is the only thing you may close over**: it needs
+someone who is not you, or a decision that is the user's. Another session's
+branch, a gauge needing credentials you do not have, a question you raised that
+they have not answered. Name it, file it, close.
+
+**"I'll note it as left open" is not a substitute for finishing it.** On
+2026-09-28 a session ran all four passes, wrote an accurate handover, and
+declared the session closed with its own PR open and that PR's only CI run still
+QUEUED — so the close was written before the evidence for it existed, and the
+branch and worktree the handover named were still on disk waiting for a merge
+nobody was watching for any more. Everything in it was true except the word
+"closed".
 
 ## The handover
 
@@ -136,8 +193,12 @@ description of fixing your own regression.
 **End by saying the session is closed, in those words.** Not "that should be
 everything" or "let me know if you want anything else" — a definite statement
 that the session is closed, placed after the handover so it is the last thing
-read. Trailing off leaves the reader unsure whether the four passes finished or
-merely stopped, and an ambiguous ending has had someone re-run cleanup that was
-already done. If something is genuinely unfinished, close on that instead and
-name it — "closed, with X left open and filed at Y" is an ending; silence is
-not.
+read. Trailing off leaves the reader unsure whether the passes finished or merely
+stopped, and an ambiguous ending has had someone re-run cleanup that was already
+done.
+
+**Say it only once §5 is satisfied.** If something is genuinely BLOCKED — on
+another session, on a decision that is the user's — close on that and name it:
+"closed, with X blocked on Y and filed at Z" is an ending. But something merely
+*unfinished* is not something to close over, however well you describe it: go
+back to §5 and finish it. Silence is not an ending either.
