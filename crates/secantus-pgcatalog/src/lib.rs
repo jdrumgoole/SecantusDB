@@ -71,6 +71,21 @@ pub struct Column {
     /// computed one. Never stored: the wire layer stamps it when it reads
     /// the catalog, and a projection's output columns inherit it.
     pub source: Option<(i64, i16)>,
+    /// `GENERATED ... AS IDENTITY`: `"always"` (a user-supplied value is
+    /// rejected) or `"by_default"` (like a serial). The Python server's own
+    /// spelling, because the two share this catalog.
+    pub identity: Option<String>,
+    /// Every catalog key this model does NOT own, kept verbatim.
+    ///
+    /// The Python server records more per column than this one models --
+    /// `enum_type`, `domain_type`, `generated`, `comment`, `default_expr`,
+    /// `composite_type` -- and they were written back as unconditional NULLs,
+    /// so any Rust rewrite of a catalog row silently erased them. That was
+    /// unreachable while nothing here rewrote an existing row; `ALTER TABLE`
+    /// made it reachable, and a column that quietly stopped being an enum or
+    /// a generated column is exactly the silent divergence this catalog is
+    /// shared to avoid.
+    pub extra: Document,
     /// `atttypmod`: a declared width or precision, plus the varlena header
     /// for the string types -- `char(4)` is 8 -- or -1 for none.
     ///
@@ -94,9 +109,46 @@ impl Column {
             sequence: None,
             default: None,
             source: None,
+            identity: None,
+            extra: Document::new(),
             typmod: -1,
         }
     }
+
+    /// The catalog keys this model owns, and therefore writes itself. Anything
+    /// else a document carries is kept in `extra` and written back unchanged.
+    /// What `to_document` writes for the keys this model does not own.
+    ///
+    /// `extra` keeps only what DIFFERS from these, so a column built here
+    /// round-trips to ITSELF (the nulls carry no information and would
+    /// otherwise make `def -> doc -> def` inequal), while a real value the
+    /// other server wrote is still preserved.
+    fn unmodelled_defaults() -> Document {
+        doc! {
+            "default_expr": Bson::Null,
+            "comment": Bson::Null,
+            "enum_type": Bson::Null,
+            "domain_type": Bson::Null,
+            "generated": Bson::Null,
+            "composite_type": Bson::Null,
+            "composite_fields": Bson::Null,
+            "json_plain": false,
+        }
+    }
+
+    const OWNED_KEYS: &'static [&'static str] = &[
+        "name",
+        "type",
+        "field",
+        "pk",
+        "nullable",
+        "has_default",
+        "default",
+        "sequence",
+        "identity",
+        "decl_oid",
+        "typmod",
+    ];
 
     /// The `(type, decl_oid)` pair the catalog stores for this column.
     ///
@@ -130,7 +182,7 @@ impl Column {
     /// column with missing keys rather than explicit nulls.
     pub fn to_document(&self) -> Document {
         let (stored_type, decl_oid) = self.stored_type();
-        doc! {
+        let mut out = doc! {
             "name": &self.name,
             "type": stored_type,
             "field": self.field(),
@@ -141,7 +193,7 @@ impl Column {
             "default_expr": Bson::Null,
             "comment": Bson::Null,
             "sequence": self.sequence.as_deref().map_or(Bson::Null, Bson::from),
-            "identity": Bson::Null,
+            "identity": self.identity.as_deref().map_or(Bson::Null, Bson::from),
             "enum_type": Bson::Null,
             "domain_type": Bson::Null,
             "generated": Bson::Null,
@@ -150,7 +202,13 @@ impl Column {
             "json_plain": false,
             "decl_oid": decl_oid,
             "typmod": self.typmod,
+        };
+        // Anything the other server wrote that this one does not model goes
+        // back exactly as it came, OVER the nulls above.
+        for (k, v) in &self.extra {
+            out.insert(k.clone(), v.clone());
         }
+        out
     }
 
     pub fn from_document(d: &Document) -> Option<Self> {
@@ -161,6 +219,19 @@ impl Column {
             pk: d.get_bool("pk").unwrap_or(false),
             nullable: d.get_bool("nullable").unwrap_or(true),
             sequence: d.get_str("sequence").ok().map(str::to_string),
+            identity: d.get_str("identity").ok().map(str::to_string),
+            // Everything this model does not own, kept so a rewrite puts it
+            // back rather than erasing it.
+            extra: {
+                let defaults = Self::unmodelled_defaults();
+                d.iter()
+                    .filter(|(k, v)| {
+                        !Self::OWNED_KEYS.contains(&k.as_str())
+                            && defaults.get(k.as_str()) != Some(v)
+                    })
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            },
             default: d
                 .get_bool("has_default")
                 .unwrap_or(false)

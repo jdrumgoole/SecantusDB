@@ -796,6 +796,11 @@ pub struct PgHandler {
     /// Tables created (`Some`) or dropped (`None`) in the open transaction and
     /// not yet committed. Cleared when the transaction ends, whichever way.
     uncommitted: Mutex<HashMap<String, Option<TableDef>>>,
+    /// What this SESSION last drew from each sequence, for `currval`.
+    /// PostgreSQL keys it per session rather than per sequence, so a
+    /// `currval` before any `nextval` in this session is 55000 even when
+    /// another session has advanced it.
+    session_currval: Mutex<HashMap<String, i64>>,
     /// User TYPES created or dropped in the open transaction but not yet
     /// committed -- the type analogue of `uncommitted`. Planning reads the
     /// type catalog (`to_regtype`, a column's declared type), and an
@@ -1053,6 +1058,7 @@ impl PgHandler {
             cursors: Mutex::new(HashMap::new()),
             prepared: Mutex::new(Vec::new()),
             uncommitted: Mutex::new(HashMap::new()),
+            session_currval: Mutex::new(HashMap::new()),
             uncommitted_types: Mutex::new(HashMap::new()),
             in_transaction: std::sync::atomic::AtomicBool::new(false),
             binary_results: std::sync::atomic::AtomicBool::new(false),
@@ -4400,6 +4406,15 @@ impl PgHandler {
             let def = TableDef::from_document(&d)?;
             Some(Self::with_column_sources(def, self.relation_oid(name)))
         });
+        // A SEQUENCE is a relation in PostgreSQL -- `select last_value from s`
+        // reads it like a one-row table. Checked only after the catalog misses,
+        // so the ordinary table path costs nothing; not cached either, because
+        // its one row changes on every `nextval`.
+        if def.is_none() {
+            if let Ok(Some(_)) = self.sequence_doc(name) {
+                return Some(Self::sequence_table_def(name));
+            }
+        }
         if self.may_fill_catalog_cache(version) {
             cache
                 .tables
@@ -6343,6 +6358,244 @@ impl PgHandler {
         Ok(())
     }
 
+    /// A sequence-naming argument, as text. `None` for a NULL.
+    ///
+    /// PostgreSQL's `nextval` takes `regclass`, so the name arrives as a
+    /// string literal (`nextval('s')`) and a schema qualifier is dropped --
+    /// this server has one schema, so `public.s` and `s` name the same thing.
+    fn sequence_name_arg(&self, arg: &ConstCol) -> PgWireResult<Option<String>> {
+        Ok(match self.resolve_const_col(arg)? {
+            Bson::Null => None,
+            Bson::String(s) => Some(
+                s.rsplit('.')
+                    .next()
+                    .unwrap_or(&s)
+                    .trim_matches('"')
+                    .to_string(),
+            ),
+            other => Some(format!("{other}")),
+        })
+    }
+
+    /// The relation a sequence presents itself as: PostgreSQL's three
+    /// user-visible columns, in its order.
+    fn sequence_table_def(name: &str) -> TableDef {
+        TableDef::new(
+            name,
+            vec![
+                Column::new("last_value", "int8", false),
+                // `log_cnt` counts WAL-logged allocations, which this server
+                // does not do; PostgreSQL reports 0 on a freshly read
+                // sequence and a client only ever displays it.
+                Column::new("log_cnt", "int8", false),
+                Column::new("is_called", "bool", false),
+            ],
+        )
+    }
+
+    /// A sequence's stored document, or `None` when there is no such sequence.
+    fn sequence_doc(&self, name: &str) -> PgWireResult<Option<Document>> {
+        let raw = self
+            .storage
+            .find_matching(self.db(), SEQUENCE_COLLECTION, &bson::doc! { "_id": name })
+            .map_err(|e| Self::storage_err("could not read the sequence", e))?;
+        match raw.first() {
+            None => Ok(None),
+            Some(bytes) => {
+                Ok(Some(bson::from_slice(bytes).map_err(|e| {
+                    Self::storage_err("could not decode the sequence", e)
+                })?))
+            }
+        }
+    }
+
+    /// A new sequence's document, with PostgreSQL's defaults filled in.
+    ///
+    /// The bounds depend on the DIRECTION: a descending sequence (`INCREMENT
+    /// -1`) starts at its MAXIMUM and runs down to `-2^63+1`, where an
+    /// ascending one starts at 1 and runs up to `2^63-1`. Defaulting both to
+    /// the ascending pair would make every descending sequence exhausted on
+    /// its first call.
+    fn new_sequence_doc(
+        name: &str,
+        options: &secantus_pgplan::SequenceOptions,
+    ) -> PgWireResult<Document> {
+        let increment = options.increment.unwrap_or(1);
+        if increment == 0 {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "22023".into(), // invalid_parameter_value
+                "INCREMENT must not be zero".into(),
+            ))));
+        }
+        let ascending = increment > 0;
+        let min_value = options
+            .min_value
+            .unwrap_or(if ascending { 1 } else { i64::MIN + 1 });
+        let max_value = options
+            .max_value
+            .unwrap_or(if ascending { i64::MAX } else { -1 });
+        if min_value > max_value {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "22023".into(),
+                format!("MINVALUE ({min_value}) must be less than MAXVALUE ({max_value})"),
+            ))));
+        }
+        let start = options
+            .start
+            .unwrap_or(if ascending { min_value } else { max_value });
+        // The message names the bound that was actually crossed; reporting
+        // MINVALUE for a start ABOVE the maximum sent the reader the wrong way.
+        if start < min_value {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "22023".into(),
+                format!("START value ({start}) cannot be less than MINVALUE ({min_value})"),
+            ))));
+        }
+        if start > max_value {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "22023".into(),
+                format!("START value ({start}) cannot be greater than MAXVALUE ({max_value})"),
+            ))));
+        }
+        Ok(bson::doc! {
+            "_id": name,
+            "sequence": name,
+            // `last_value` is the value the NEXT `nextval` returns while
+            // `is_called` is false, and the one it just returned once it is
+            // true. That is PostgreSQL's own representation, and it is what
+            // makes `setval(s, v, false)` expressible.
+            "last_value": start,
+            "start": start,
+            "increment": increment,
+            "min_value": min_value,
+            "max_value": max_value,
+            "cycle": options.cycle.unwrap_or(false),
+            "is_called": false,
+            "owned_by": options.owned_by.clone().unwrap_or_default(),
+        })
+    }
+
+    /// Apply an `ALTER SEQUENCE`'s options to a stored sequence, leaving
+    /// everything it did not name alone.
+    fn apply_sequence_options(
+        doc: &mut Document,
+        options: &secantus_pgplan::SequenceOptions,
+    ) -> PgWireResult<()> {
+        if let Some(v) = options.increment {
+            if v == 0 {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".into(),
+                    "22023".into(),
+                    "INCREMENT must not be zero".into(),
+                ))));
+            }
+            doc.insert("increment", v);
+        }
+        if let Some(v) = options.min_value {
+            doc.insert("min_value", v);
+        }
+        if let Some(v) = options.max_value {
+            doc.insert("max_value", v);
+        }
+        if let Some(v) = options.cycle {
+            doc.insert("cycle", v);
+        }
+        if let Some(v) = options.start {
+            doc.insert("start", v);
+        }
+        if let Some(v) = options.owned_by.clone() {
+            doc.insert("owned_by", v);
+        }
+        // RESTART last, and it un-calls the sequence: the next `nextval`
+        // returns the restart value itself rather than one past it. Bare
+        // `RESTART` goes back to the sequence's START.
+        if let Some(restart) = options.restart {
+            let to = restart
+                .or_else(|| doc.get("start").and_then(bson_i64))
+                .unwrap_or(1);
+            doc.insert("last_value", to);
+            doc.insert("is_called", false);
+        }
+        Ok(())
+    }
+
+    /// `setval(seq, value [, is_called])`.
+    fn setval(&self, name: &str, value: i64, called: bool) -> PgWireResult<i64> {
+        let Some(doc) = self.sequence_doc(name)? else {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "42P01".into(),
+                format!("relation \"{name}\" does not exist"),
+            ))));
+        };
+        let min = doc.get("min_value").and_then(bson_i64).unwrap_or(1);
+        let max = doc.get("max_value").and_then(bson_i64).unwrap_or(i64::MAX);
+        if value < min || value > max {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "22003".into(), // numeric_value_out_of_range
+                format!(
+                    "setval: value {value} is out of bounds for sequence \"{name}\" ({min}..{max})"
+                ),
+            ))));
+        }
+        self.storage
+            .update_matching(
+                self.db(),
+                SEQUENCE_COLLECTION,
+                &bson::doc! { "_id": name },
+                &bson::doc! { "$set": { "last_value": value, "is_called": called } },
+                false,
+                false,
+                &[],
+                &Document::new(),
+                None,
+                None,
+                false,
+            )
+            .map_err(|e| Self::storage_err("could not set the sequence", e))?;
+        Ok(value)
+    }
+
+    /// `currval(seq)`: the value this SESSION last drew from it.
+    ///
+    /// PostgreSQL keys this to the session and refuses `55000` before any
+    /// `nextval` in it, rather than reading the sequence's stored value --
+    /// which would hand one session another's number.
+    fn currval(&self, name: &str) -> PgWireResult<i64> {
+        if self.sequence_doc(name)?.is_none() {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "42P01".into(),
+                format!("relation \"{name}\" does not exist"),
+            ))));
+        }
+        self.session_currval
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .copied()
+            .ok_or_else(|| {
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".into(),
+                    "55000".into(), // object_not_in_prerequisite_state
+                    format!("currval of sequence \"{name}\" is not yet defined in this session"),
+                )))
+            })
+    }
+
+    /// Remember what this session last drew, for `currval` / `lastval`.
+    fn note_currval(&self, name: &str, value: i64) {
+        self.session_currval
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name.to_string(), value);
+    }
+
     fn note_uncommitted(&self, name: &str, def: Option<TableDef>) {
         if !self.transaction_handle_open() {
             return;
@@ -7187,6 +7440,61 @@ impl PgHandler {
             ConstCol::BackendPid => Ok(Bson::Int32(
                 self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
             )),
+            ConstCol::NextVal(seq) => {
+                let name = self.sequence_name_arg(seq)?;
+                // A NULL sequence name is a NULL result rather than an error,
+                // which is what a strict function does with a NULL argument.
+                let Some(name) = name else {
+                    return Ok(Bson::Null);
+                };
+                let value = *self
+                    .nextval(&name, 1)?
+                    .first()
+                    .expect("nextval returns one value for count 1");
+                self.note_currval(&name, value);
+                Ok(Bson::Int64(value))
+            }
+            ConstCol::CurrVal(seq) => match self.sequence_name_arg(seq)? {
+                None => Ok(Bson::Null),
+                Some(name) => Ok(Bson::Int64(self.currval(&name)?)),
+            },
+            ConstCol::SetVal {
+                sequence,
+                value,
+                is_called,
+            } => {
+                let Some(name) = self.sequence_name_arg(sequence)? else {
+                    return Ok(Bson::Null);
+                };
+                let Some(value) = bson_i64(&self.resolve_const_col(value)?) else {
+                    return Ok(Bson::Null);
+                };
+                let called = self.resolve_const_col(is_called)? != Bson::Boolean(false);
+                let set = self.setval(&name, value, called)?;
+                // `setval` also defines this session's `currval`, as
+                // PostgreSQL has it.
+                self.note_currval(&name, set);
+                Ok(Bson::Int64(set))
+            }
+            ConstCol::SerialSequence { table, column } => {
+                let (Some(table), Some(column)) = (
+                    self.sequence_name_arg(table)?,
+                    self.sequence_name_arg(column)?,
+                ) else {
+                    return Ok(Bson::Null);
+                };
+                // NULL rather than an error when the column is not serial,
+                // and when the table is not there -- PostgreSQL answers NULL
+                // for a column with no owned sequence.
+                let owned = self
+                    .lookup(&table)
+                    .and_then(|def| def.column(&column).and_then(|c| c.sequence.clone()));
+                Ok(match owned {
+                    // PostgreSQL schema-qualifies the answer.
+                    Some(seq) => Bson::String(format!("public.{seq}")),
+                    None => Bson::Null,
+                })
+            }
             ConstCol::SessionUser => Ok(Bson::String(
                 self.session_user
                     .lock()
@@ -8128,20 +8436,48 @@ impl PgHandler {
         let mut last = int("last_value").unwrap_or(1);
         let increment = int("increment").unwrap_or(1);
         let max_value = int("max_value").unwrap_or(i64::MAX);
+        let min_value = int("min_value").unwrap_or(1);
+        let cycle = seq.get_bool("cycle").unwrap_or(false);
+        // A DESCENDING sequence runs into its MINIMUM, not its maximum, and
+        // PostgreSQL says so. Checking only the max let `create sequence s
+        // increment -3 minvalue -10` run past -10 for ever.
+        let ascending = increment > 0;
         let mut called = seq.get_bool("is_called").unwrap_or(false);
         let mut values = Vec::with_capacity(count);
         for _ in 0..count {
             let next = if called {
-                last.checked_add(increment).filter(|v| *v <= max_value)
+                last.checked_add(increment).filter(|v| {
+                    if ascending {
+                        *v <= max_value
+                    } else {
+                        *v >= min_value
+                    }
+                })
             } else {
                 Some(last)
             };
-            let Some(next) = next else {
-                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".into(),
-                    "2200H".into(), // sequence_generator_limit_exceeded
-                    format!("nextval: reached maximum value of sequence \"{name}\" ({max_value})"),
-                ))));
+            let next = match next {
+                Some(v) => v,
+                // `CYCLE` wraps to the far bound rather than failing.
+                None if cycle => {
+                    if ascending {
+                        min_value
+                    } else {
+                        max_value
+                    }
+                }
+                None => {
+                    let (word, bound) = if ascending {
+                        ("maximum", max_value)
+                    } else {
+                        ("minimum", min_value)
+                    };
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "2200H".into(), // sequence_generator_limit_exceeded
+                        format!("nextval: reached {word} value of sequence \"{name}\" ({bound})"),
+                    ))));
+                }
             };
             values.push(next);
             last = next;
@@ -8170,6 +8506,80 @@ impl PgHandler {
     /// Fill each row's omitted `serial` columns from their sequences, as the
     /// column default PostgreSQL attaches. A column the row names -- even as
     /// NULL -- keeps what it was given; only an ABSENT one draws a value.
+    /// Apply PostgreSQL's identity rules to an INSERT's rows.
+    ///
+    /// The whole matrix, measured on 14.24 -- `ALWAYS` is the only kind that
+    /// refuses a hand-written value, and `OVERRIDING USER VALUE` discards one
+    /// for EITHER kind:
+    ///
+    /// | column | clause | result |
+    /// | --- | --- | --- |
+    /// | ALWAYS | none | `428C9` |
+    /// | ALWAYS | OVERRIDING SYSTEM VALUE | the value given |
+    /// | ALWAYS | OVERRIDING USER VALUE | the SEQUENCE's value |
+    /// | BY DEFAULT | none / OVERRIDING SYSTEM VALUE | the value given |
+    /// | BY DEFAULT | OVERRIDING USER VALUE | the SEQUENCE's value |
+    ///
+    /// An explicit NULL is a not-null violation for both kinds, even under
+    /// `OVERRIDING SYSTEM VALUE`: an identity column is NOT NULL, and the
+    /// override decides WHOSE value wins, not whether the column may be null.
+    fn apply_identity_rules(
+        &self,
+        def: &TableDef,
+        rows: &mut [Document],
+        overriding_system: bool,
+        overriding_user: bool,
+    ) -> PgWireResult<()> {
+        for column in &def.columns {
+            let Some(kind) = column.identity.as_deref() else {
+                continue;
+            };
+            let field = column.field();
+            if overriding_user {
+                // The statement's value is thrown away and the sequence
+                // supplies one, which `apply_serial_defaults` then does
+                // because the field is now absent.
+                for d in rows.iter_mut() {
+                    d.remove(&field);
+                }
+                continue;
+            }
+            if kind == "always" && !overriding_system && rows.iter().any(|d| d.contains_key(&field))
+            {
+                let mut info = ErrorInfo::new(
+                    "ERROR".into(),
+                    "428C9".into(), // generated_always
+                    format!(
+                        "cannot insert a non-DEFAULT value into column \"{}\"",
+                        column.name
+                    ),
+                );
+                info.detail = Some(format!(
+                    "Column \"{}\" is an identity column defined as GENERATED ALWAYS.",
+                    column.name
+                ));
+                info.hint = Some("Use OVERRIDING SYSTEM VALUE to override.".into());
+                return Err(PgWireError::UserError(Box::new(info)));
+            }
+            // An identity column is NOT NULL, and an explicit NULL does not
+            // fall back to the sequence -- it violates the constraint.
+            if rows
+                .iter()
+                .any(|d| d.get(&field).is_some_and(|v| *v == Bson::Null))
+            {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".into(),
+                    "23502".into(), // not_null_violation
+                    format!(
+                        "null value in column \"{}\" of relation \"{}\" violates not-null constraint",
+                        column.name, def.name
+                    ),
+                ))));
+            }
+        }
+        Ok(())
+    }
+
     fn apply_serial_defaults(&self, def: &TableDef, rows: &mut [Document]) -> PgWireResult<()> {
         for column in &def.columns {
             let Some(sequence) = column.sequence.as_deref() else {
@@ -8183,6 +8593,13 @@ impl PgHandler {
                 .map(|(i, _)| i)
                 .collect();
             let values = self.nextval(sequence, missing.len())?;
+            // A serial INSERT defines this session's `currval` for the
+            // column's sequence, exactly as an explicit `nextval` would --
+            // `currval('t_id_seq')` after an insert is how a client reads
+            // back the id it was given.
+            if let Some(last) = values.last() {
+                self.note_currval(sequence, *last);
+            }
             for (i, v) in missing.into_iter().zip(values) {
                 let value = match column.pg_type.as_str() {
                     "int8" => Bson::Int64(v),
@@ -8352,6 +8769,28 @@ impl PgHandler {
             (None, _) if Self::virtual_table(&sel.table).is_some() => {
                 let docs = self.virtual_rows(&sel.table, &sel.filter).expect("checked");
                 (docs, Self::virtual_table(&sel.table).expect("checked"))
+            }
+            // A sequence read as a relation: its one row, built from the
+            // stored document rather than from a collection of that name.
+            (None, _)
+                if !sel.table.is_empty()
+                    && self.lookup(&sel.table).is_none_or(|d| {
+                        d.columns.len() == 3 && d.column("is_called").is_some()
+                    })
+                    && self.sequence_doc(&sel.table)?.is_some() =>
+            {
+                let seq = self.sequence_doc(&sel.table)?.expect("checked");
+                let mut d = Document::new();
+                d.insert(
+                    "last_value",
+                    Bson::Int64(seq.get("last_value").and_then(bson_i64).unwrap_or(1)),
+                );
+                d.insert("log_cnt", Bson::Int64(0));
+                d.insert(
+                    "is_called",
+                    Bson::Boolean(seq.get_bool("is_called").unwrap_or(false)),
+                );
+                (vec![d], Self::sequence_table_def(&sel.table))
             }
             (None, _) => {
                 let raw = self
@@ -9346,6 +9785,8 @@ impl PgHandler {
                             explicit_columns: false,
                             // `CREATE TABLE AS` has no ON CONFLICT clause.
                             on_conflict: None,
+                            overriding_system: false,
+                            overriding_user: false,
                         }),
                         max_rows,
                     )?;
@@ -9377,6 +9818,12 @@ impl PgHandler {
                         ins.rows.push(row);
                     }
                 }
+                self.apply_identity_rules(
+                    &def,
+                    &mut ins.rows,
+                    ins.overriding_system,
+                    ins.overriding_user,
+                )?;
                 self.apply_serial_defaults(&def, &mut ins.rows)?;
                 apply_column_defaults(&def, &mut ins.rows);
                 // Every constraint is checked BEFORE the first write, so a
@@ -10458,6 +10905,102 @@ impl PgHandler {
                 }
                 self.rewrite_catalog(&table, &def)?;
                 Ok(vec![Response::Execution(Tag::new("ALTER TABLE"))])
+            }
+
+            Statement::CreateSequence {
+                name,
+                options,
+                if_not_exists,
+                temp,
+            } => {
+                self.ensure_collection(SEQUENCE_COLLECTION)?;
+                if self.sequence_doc(&name)?.is_some() {
+                    if if_not_exists {
+                        return Ok(vec![Response::Execution(Tag::new("CREATE SEQUENCE"))]);
+                    }
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42P07".into(), // duplicate_table
+                        format!("relation \"{name}\" already exists"),
+                    ))));
+                }
+                if self.lookup(&name).is_some() {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42P07".into(),
+                        format!("relation \"{name}\" already exists"),
+                    ))));
+                }
+                let _ = temp;
+                let doc = Self::new_sequence_doc(&name, &options)?;
+                let bytes = bson::to_vec(&doc)
+                    .map_err(|e| Self::storage_err("could not encode the sequence", e))?;
+                self.storage
+                    .insert(self.db(), SEQUENCE_COLLECTION, vec![bytes], true)
+                    .map_err(|e| Self::storage_err("could not create the sequence", e))?;
+                Ok(vec![Response::Execution(Tag::new("CREATE SEQUENCE"))])
+            }
+
+            Statement::AlterSequence {
+                name,
+                options,
+                missing_ok,
+            } => {
+                self.ensure_collection(SEQUENCE_COLLECTION)?;
+                let Some(mut doc) = self.sequence_doc(&name)? else {
+                    if missing_ok {
+                        return Ok(vec![Response::Execution(Tag::new("ALTER SEQUENCE"))]);
+                    }
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42P01".into(),
+                        format!("relation \"{name}\" does not exist"),
+                    ))));
+                };
+                Self::apply_sequence_options(&mut doc, &options)?;
+                let bytes = bson::to_vec(&doc)
+                    .map_err(|e| Self::storage_err("could not encode the sequence", e))?;
+                self.storage
+                    .delete_matching(
+                        self.db(),
+                        SEQUENCE_COLLECTION,
+                        &bson::doc! { "_id": &name },
+                        0,
+                        &Document::new(),
+                        None,
+                    )
+                    .map_err(|e| Self::storage_err("could not alter the sequence", e))?;
+                self.storage
+                    .insert(self.db(), SEQUENCE_COLLECTION, vec![bytes], true)
+                    .map_err(|e| Self::storage_err("could not alter the sequence", e))?;
+                Ok(vec![Response::Execution(Tag::new("ALTER SEQUENCE"))])
+            }
+
+            Statement::DropSequence { names, if_exists } => {
+                self.ensure_collection(SEQUENCE_COLLECTION)?;
+                for name in &names {
+                    if self.sequence_doc(name)?.is_none() {
+                        if if_exists {
+                            continue;
+                        }
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".into(),
+                            "42P01".into(),
+                            format!("sequence \"{name}\" does not exist"),
+                        ))));
+                    }
+                    self.storage
+                        .delete_matching(
+                            self.db(),
+                            SEQUENCE_COLLECTION,
+                            &bson::doc! { "_id": name },
+                            0,
+                            &Document::new(),
+                            None,
+                        )
+                        .map_err(|e| Self::storage_err("could not drop the sequence", e))?;
+                }
+                Ok(vec![Response::Execution(Tag::new("DROP SEQUENCE"))])
             }
 
             Statement::DropTable(drop) => {

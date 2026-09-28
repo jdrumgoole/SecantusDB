@@ -143,3 +143,41 @@ fn round_trips_through_its_own_document() {
     let t = t_table();
     assert_eq!(TableDef::from_document(&t.to_document()), Some(t));
 }
+
+#[test]
+fn a_column_key_this_model_does_not_own_survives_a_round_trip() {
+    // The Python server records more per column than this one models. Those
+    // keys were written back as unconditional NULLs, so any rewrite of a
+    // catalog row here erased them -- unreachable while nothing rewrote an
+    // existing row, and reachable the moment `ALTER TABLE` did. A column that
+    // quietly stopped being an enum, a generated column or an identity is
+    // exactly the silent divergence this shared catalog exists to prevent.
+    let mut doc = t_table().to_document();
+    let columns = doc.get_array_mut("columns").expect("columns");
+    let first = columns[0].as_document().expect("a column").clone();
+    let mut written = first.clone();
+    written.insert("identity", "always");
+    written.insert("enum_type", "mood");
+    written.insert("generated", "stored");
+    written.insert("comment", "hello");
+    written.insert("json_plain", true);
+    columns[0] = crate::Bson::Document(written);
+
+    let read = TableDef::from_document(&doc).expect("parses");
+    let back = read.to_document();
+    let column = back.get_array("columns").expect("columns")[0]
+        .as_document()
+        .expect("a column");
+    for (key, want) in [
+        ("identity", crate::Bson::String("always".into())),
+        ("enum_type", crate::Bson::String("mood".into())),
+        ("generated", crate::Bson::String("stored".into())),
+        ("comment", crate::Bson::String("hello".into())),
+        ("json_plain", crate::Bson::Boolean(true)),
+    ] {
+        assert_eq!(column.get(key), Some(&want), "{key} was not preserved");
+    }
+    // And `identity` is MODELLED rather than merely carried, because this
+    // server enforces it.
+    assert_eq!(read.columns[0].identity.as_deref(), Some("always"));
+}

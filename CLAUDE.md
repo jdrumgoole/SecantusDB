@@ -363,6 +363,23 @@ one request path:
     within the numeric family, within the date/time family, `json`/`jsonb`,
     and a type to itself; everything else needs `USING`).
 
+    **Sequences and identity columns landed 2026-09-28** — `CREATE` / `ALTER`
+    / `DROP SEQUENCE`, `nextval` / `currval` / `setval`,
+    `pg_get_serial_sequence`, a sequence read as a relation, and
+    `GENERATED ALWAYS` / `BY DEFAULT AS IDENTITY` with both `OVERRIDING`
+    clauses. The sequences corpus went 24 divergences of 26 to 1 (the one left
+    is `information_schema.sequences`).
+
+    That work also closed a **cross-server catalog leak this repo's own rule
+    warns about**: a column's keys that the Rust model does not own —
+    `identity`, `enum_type`, `generated`, `comment` and four more — were
+    written back as unconditional NULLs, so any Rust rewrite of a catalog row
+    ERASED what the Python server recorded. Unreachable until `ALTER TABLE`
+    started rewriting rows, and then immediately reachable. They round-trip
+    verbatim now. **If you add a catalog field to one server, check the other
+    preserves it** — the golden test in `secantus-pgcatalog/src/golden.rs` is
+    what catches this class.
+
     **What remains refused**: correlated subqueries, a window function over an
     AGGREGATE, `SELECT *` over a JOIN, array subscripting,
     `CREATE INDEX`, `CREATE VIEW`, `CREATE TRIGGER`,
@@ -421,10 +438,12 @@ one request path:
 
     So do not read "96.8% of psycopg passes" as "nearly done". A SQL-shaped gauge
     (`sqllogictest`, the SQLAlchemy dialect suite) would score very differently.
-    With subqueries, CTEs, window functions and `ALTER TABLE` landed, the
-    next levers are `CREATE INDEX` (which also unblocks a partial-index
-    `ON CONFLICT` arbiter and `ALTER TABLE ADD CONSTRAINT UNIQUE`),
-    `CREATE VIEW`, and correlated subqueries.
+    With subqueries, CTEs, window functions, `ALTER TABLE` and sequences
+    landed, the next levers are `information_schema` (most of the `catalog`
+    corpus, and what ORMs and migration tools actually read), `CREATE INDEX`
+    (which also unblocks a partial-index `ON CONFLICT` arbiter and
+    `ALTER TABLE ADD CONSTRAINT UNIQUE`), `CREATE VIEW`, and correlated
+    subqueries.
   - Not there yet, beyond the survey above: password verification (a role's SCRAM
     verifier is stored and never checked — a wrong password and no password both
     connect, re-probed 2026-09-18, re-confirmed live 2026-09-28 by connecting

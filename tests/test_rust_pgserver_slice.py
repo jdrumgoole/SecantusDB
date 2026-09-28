@@ -11851,3 +11851,235 @@ def test_the_python_server_reads_a_rust_altered_catalog(home: Path) -> None:
         cur = conn.cursor()
         cur.execute("SELECT id, num, tag FROM xr ORDER BY id")
         assert cur.fetchall() == [(1, 10, "hi"), (2, 20, "hi"), (3, 30, "py")]
+
+
+@pytest.mark.parametrize(
+    "sql,expected",
+    [
+        # A fresh sequence reads as its START, not yet called.
+        ("SELECT last_value, is_called FROM w1", [(1, False)]),
+        ("SELECT nextval('w1'), nextval('w1')", [(1, 2)]),
+        # currval is the value THIS session last drew.
+        ("SELECT nextval('w1'), currval('w1')", [(1, 1)]),
+        # setval's two-argument form leaves the sequence CALLED, so the next
+        # draw is one past it; the three-argument `false` form does not.
+        ("SELECT setval('w1', 50), nextval('w1')", [(50, 51)]),
+        ("SELECT setval('w1', 50, false), nextval('w1')", [(50, 50)]),
+        # A NULL argument is a NULL result, not an error.
+        ("SELECT nextval(NULL)", [(None,)]),
+        ("SELECT setval(NULL, 1)", [(None,)]),
+    ],
+)
+def test_sequence_functions_match_postgres(home: Path, sql: str, expected: list[tuple]) -> None:
+    """Answers checked against a live PostgreSQL 14.13."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE SEQUENCE w1")
+        cur.execute(sql)
+        assert cur.fetchall() == expected
+
+
+def test_a_descending_sequence_starts_high_and_stops_at_its_minimum(home: Path) -> None:
+    """The bound a sequence runs into depends on its DIRECTION.
+
+    A descending sequence starts at its MAXIMUM and exhausts at its MINIMUM.
+    Checking only `max_value` let one run past its floor for ever, and
+    reported the wrong bound when it did stop.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE SEQUENCE d1 INCREMENT -3 MINVALUE -10 MAXVALUE -1")
+        cur.execute("SELECT nextval('d1'), nextval('d1'), nextval('d1'), nextval('d1')")
+        assert cur.fetchall() == [(-1, -4, -7, -10)]
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute("SELECT nextval('d1')")
+        assert info.value.sqlstate == "2200H"
+        assert "reached minimum value" in str(info.value)
+
+
+def test_cycle_wraps_to_the_far_bound(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE SEQUENCE c1 START 1 MAXVALUE 3 CYCLE")
+        cur.execute("SELECT nextval('c1'), nextval('c1'), nextval('c1'), nextval('c1')")
+        assert cur.fetchall() == [(1, 2, 3, 1)]
+        cur.execute("CREATE SEQUENCE c2 INCREMENT -1 MINVALUE 1 MAXVALUE 3 CYCLE")
+        cur.execute("SELECT nextval('c2'), nextval('c2'), nextval('c2'), nextval('c2')")
+        assert cur.fetchall() == [(3, 2, 1, 3)]
+
+
+@pytest.mark.parametrize(
+    "sql,sqlstate",
+    [
+        ("SELECT nextval('nope_s')", "42P01"),
+        ("SELECT setval('nope_s', 1)", "42P01"),
+        ("DROP SEQUENCE nope_s", "42P01"),
+        ("CREATE SEQUENCE e1 MINVALUE 5 MAXVALUE 2", "22023"),
+        ("CREATE SEQUENCE e1 START 100 MINVALUE 1 MAXVALUE 10", "22023"),
+        ("CREATE SEQUENCE e1 INCREMENT 0", "22023"),
+    ],
+)
+def test_sequence_error_surface_matches_postgres(home: Path, sql: str, sqlstate: str) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute(sql)
+        assert info.value.sqlstate == sqlstate
+
+
+def test_currval_is_per_session_and_undefined_before_a_draw(home: Path) -> None:
+    """PostgreSQL keys `currval` to the SESSION, so it is 55000 before any
+    `nextval` in it -- reading the sequence's stored value instead would hand
+    one session another's number."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE SEQUENCE p1")
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute("SELECT currval('p1')")
+        assert info.value.sqlstate == "55000"
+        conn.rollback()
+        cur.execute("SELECT nextval('p1')")
+        cur.execute("SELECT currval('p1')")
+        assert cur.fetchall() == [(1,)]
+    # A SECOND session has drawn nothing, so it is 55000 there even though the
+    # sequence has moved.
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute("SELECT currval('p1')")
+        assert info.value.sqlstate == "55000"
+
+
+def test_alter_sequence_applies_only_what_it_names(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE SEQUENCE a1 START 7")
+        cur.execute("ALTER SEQUENCE a1 INCREMENT BY 100")
+        cur.execute("SELECT nextval('a1'), nextval('a1')")
+        # The start survived the increment change.
+        assert cur.fetchall() == [(7, 107)]
+        # Bare RESTART goes back to START; RESTART WITH sets it, and neither
+        # counts as called, so the next draw IS that value.
+        cur.execute("ALTER SEQUENCE a1 RESTART")
+        cur.execute("SELECT nextval('a1')")
+        assert cur.fetchall() == [(7,)]
+        cur.execute("ALTER SEQUENCE a1 RESTART WITH 500")
+        cur.execute("SELECT nextval('a1')")
+        assert cur.fetchall() == [(500,)]
+
+
+def test_a_serial_column_defines_currval_and_names_its_sequence(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE s1 (id serial PRIMARY KEY, big bigserial, n int)")
+        cur.execute("INSERT INTO s1 (n) VALUES (1), (2), (3)")
+        cur.execute("SELECT id, big FROM s1 ORDER BY id")
+        assert cur.fetchall() == [(1, 1), (2, 2), (3, 3)]
+        # An INSERT that drew from the sequence defines this session's
+        # currval, which is how a client reads back the id it was given.
+        cur.execute("SELECT currval('s1_id_seq'), currval('s1_big_seq')")
+        assert cur.fetchall() == [(3, 3)]
+        cur.execute("SELECT pg_get_serial_sequence('s1', 'id')")
+        assert cur.fetchall() == [("public.s1_id_seq",)]
+        # A column with no owned sequence is NULL, not an error.
+        cur.execute("SELECT pg_get_serial_sequence('s1', 'n')")
+        assert cur.fetchall() == [(None,)]
+
+
+@pytest.mark.parametrize(
+    "kind,sql,expected,sqlstate",
+    [
+        # The whole overriding matrix, measured on PostgreSQL 14.24. ALWAYS is
+        # the only kind that refuses a hand-written value, and OVERRIDING USER
+        # VALUE discards one for EITHER kind.
+        ("ALWAYS", "INSERT INTO idt (id, v) VALUES (50, 1) RETURNING id", None, "428C9"),
+        (
+            "ALWAYS",
+            "INSERT INTO idt (id, v) OVERRIDING SYSTEM VALUE VALUES (50, 1) RETURNING id",
+            [(50,)],
+            None,
+        ),
+        (
+            "ALWAYS",
+            "INSERT INTO idt (id, v) OVERRIDING USER VALUE VALUES (60, 1) RETURNING id",
+            [(1,)],
+            None,
+        ),
+        ("ALWAYS", "INSERT INTO idt (v) VALUES (1) RETURNING id", [(1,)], None),
+        ("BY DEFAULT", "INSERT INTO idt (id, v) VALUES (70, 1) RETURNING id", [(70,)], None),
+        (
+            "BY DEFAULT",
+            "INSERT INTO idt (id, v) OVERRIDING SYSTEM VALUE VALUES (80, 1) RETURNING id",
+            [(80,)],
+            None,
+        ),
+        (
+            "BY DEFAULT",
+            "INSERT INTO idt (id, v) OVERRIDING USER VALUE VALUES (90, 1) RETURNING id",
+            [(1,)],
+            None,
+        ),
+        ("BY DEFAULT", "INSERT INTO idt (v) VALUES (1) RETURNING id", [(1,)], None),
+        # An identity column is NOT NULL, and an explicit NULL does not fall
+        # back to the sequence -- for either kind, and even under OVERRIDING
+        # SYSTEM VALUE, because the override decides whose value wins rather
+        # than whether the column may be null.
+        (
+            "ALWAYS",
+            "INSERT INTO idt (id, v) OVERRIDING SYSTEM VALUE VALUES (NULL, 1) RETURNING id",
+            None,
+            "23502",
+        ),
+        ("BY DEFAULT", "INSERT INTO idt (id, v) VALUES (NULL, 1) RETURNING id", None, "23502"),
+    ],
+)
+def test_identity_columns_follow_postgres_overriding_rules(
+    home: Path, kind: str, sql: str, expected: list[tuple] | None, sqlstate: str | None
+) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(f"CREATE TABLE idt (id int GENERATED {kind} AS IDENTITY, v int)")
+        if sqlstate is not None:
+            with pytest.raises(psycopg.Error) as info:
+                cur.execute(sql)
+            assert info.value.sqlstate == sqlstate
+        else:
+            cur.execute(sql)
+            assert cur.fetchall() == expected
+
+
+def test_a_sequence_reads_as_a_relation(home: Path) -> None:
+    """PostgreSQL's sequences are relations: `select last_value from s` works."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE SEQUENCE r1 START 10 INCREMENT 2")
+        cur.execute("SELECT last_value, is_called FROM r1")
+        assert cur.fetchall() == [(10, False)]
+        cur.execute("SELECT nextval('r1'), nextval('r1')")
+        cur.execute("SELECT last_value, is_called FROM r1")
+        assert cur.fetchall() == [(12, True)]
+
+
+def test_the_python_server_reads_a_rust_identity_table(home: Path) -> None:
+    """`identity` is a catalog key the PYTHON server owns and this one did
+    not model, so it was written back as NULL and erased on any rewrite.
+
+    Unreachable until `ALTER TABLE` started rewriting catalog rows. Here the
+    Rust server creates an identity table, the Python one writes to it, the
+    Rust one ALTERs it, and the identity has to still be enforced afterwards.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE ident (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v int)")
+        cur.execute("INSERT INTO ident (v) VALUES (1), (2)")
+    assert _python_sql(home, "SELECT id, v FROM ident ORDER BY id") == [(1, 1), (2, 2)]
+    _python_sql(home, "INSERT INTO ident (v) VALUES (3)")
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("ALTER TABLE ident ADD COLUMN tag text DEFAULT 'x'")
+        cur.execute("SELECT id, v, tag FROM ident ORDER BY id")
+        assert cur.fetchall() == [(1, 1, "x"), (2, 2, "x"), (3, 3, "x")]
+        # Still GENERATED ALWAYS after the rewrite.
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute("INSERT INTO ident (id, v) VALUES (99, 9)")
+        assert info.value.sqlstate == "428C9"
