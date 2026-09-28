@@ -6271,11 +6271,89 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   day validation. STILL OPEN: a wide/BC `timestamptz` is not rendered with its
   session-tz offset (`infinity` is correct for it), and the clock-dependent
   input keywords `now` / `today` / `tomorrow` / `yesterday` are not handled.
-- **Rust PG server: `numeric` DIVISION is refused (`0A000`).** Add, subtract and
-  multiply are exact with PostgreSQL's measured scale rules; division's result
-  scale depends on the operands' weights (`1.5 / 3` is `0.50000000000000000000`,
-  twenty places) in a way not yet measured, and emitting a plausible-but-wrong
-  number of decimal places would be a wrong answer.
+- [ ] **OPEN — RUST pgserver: the QUERY-LANGUAGE surface, surveyed against a
+      binary built from `HEAD:crates` (2026-09-28).** Everything below was run,
+      not read. The file's other Rust-PG entries are a nit list accumulated from
+      psycopg failures; this is the shape of what is missing, and six entries in
+      this section were STALE in the fixed direction when this was taken (see the
+      struck-through ones), so **re-probe before working any of them**.
+
+      Why the 96.8% psycopg number and this list are not in conflict: psycopg's
+      suite exercises the PROTOCOL and the TYPE SYSTEM, which is where this
+      server is strong. It barely reaches query-language breadth. A SQL-shaped
+      gauge (`sqllogictest`, the SQLAlchemy dialect suite) would score very
+      differently — **do not cite the psycopg rate as evidence about the items
+      below.**
+
+      **Refused outright (`0A000 … is not supported yet`) — honest, and the
+      bulk of the remaining work:**
+
+      | gap | probe | error |
+      | --- | --- | --- |
+      | subqueries, every form | `(select 1)`, `exists(…)`, `in (select…)` | `SubLink` |
+      | subquery in FROM | `select y from (select 1 as y) s` | `RangeSubselect` |
+      | CTEs | `with c as (select 1 as x) select x from c` | `42P01 relation "c" does not exist` |
+      | `LIKE` / `ILIKE` / `NOT LIKE` | `where s like 'a%'` | `this operator form` |
+      | regex `~` | `where s ~ '^a'` | `operator ~` |
+      | `CASE` | select list or WHERE | `CaseExpr` |
+      | window functions | `row_number() over (order by a)` | `function row_number()` |
+      | `ORDER BY` over an expression | `order by a*-1` | `ORDER BY over an expression` |
+      | `SELECT *` / `t.*` over a JOIN or comma FROM | `select * from t1, t2` | `this subquery target` |
+      | array subscripting | `(array[1,2])[1]` | `this field selection` |
+      | `CREATE INDEX` | | `IndexStmt` |
+      | `ALTER TABLE`, any form | no ADD/DROP COLUMN exists | `AlterTableStmt` |
+      | `CREATE VIEW` | | `ViewStmt` |
+      | `CREATE TRIGGER` | | `CreateTrigStmt` |
+      | `EXPLAIN` | | `ExplainStmt` |
+      | composite `PRIMARY KEY` / multi-col `FOREIGN KEY` | | `a composite PRIMARY KEY` |
+      | non-literal column `DEFAULT` | `default now()` | `a non-literal DEFAULT` |
+
+      **TWO CLAUSE-DROPPING BUGS — worse than the refusals above, and these are
+      the ones to fix first.** Both parse the clause and then ignore it, so the
+      client gets a confident wrong answer instead of `0A000`. This is precisely
+      what CLAUDE.md's "prefer a faithful *command not supported* error over a
+      half-implemented feature that silently diverges" forbids, and it is the
+      same shape as the `PARTITION BY` entry in §3:
+
+      * `ON CONFLICT DO NOTHING` / `DO UPDATE` — the conflict clause is dropped,
+        so `insert … on conflict do nothing` raises `23505` where PostgreSQL
+        inserts nothing and succeeds, and `DO UPDATE` never upserts.
+      * `GROUPING SETS` / `ROLLUP` — the grouping clause is dropped, so
+        `group by grouping sets ((a),())` answers the misleading `42803 column
+        "a" must appear in the GROUP BY clause`, blaming the user's query.
+
+      **What DOES work** (so nobody re-derives it): single- and multi-table CRUD,
+      inner and LEFT JOIN, `WHERE` predicates, `BETWEEN`, `IN` over a list,
+      arithmetic, `||`, casts, `ORDER BY` / `LIMIT` / `OFFSET` / `NULLS FIRST`,
+      `DISTINCT` + `DISTINCT ON`, `UNION` / `INTERSECT` / `EXCEPT`, `GROUP BY` +
+      `HAVING`, the aggregate family including `count(distinct)` / `avg` /
+      `string_agg` / `FILTER`, `RETURNING` on UPDATE and DELETE,
+      `INSERT … SELECT`, multi-row `VALUES`, `coalesce` / `nullif`, and the
+      string functions.
+
+      Biggest single lever: **subqueries and CTEs**, which gate most real
+      application SQL and also gate any broader SQL gauge.
+
+      Probe: `crates/secantus-pgserver/target/debug/secantusd-pg <store>
+      127.0.0.1:<port> --database probe`, driven with psycopg 3. **Rebuild
+      first** — the binary found on this box was stale, and `--version` prints
+      the `crates/` tree it was built from (`git rev-parse HEAD:crates`), which
+      is the cheap check.
+
+- [ ] **OPEN — RUST pgserver: a wrong password still connects, CONFIRMED live
+      (2026-09-28).** The existing entry above records that `CREATE / ALTER ROLE
+      … PASSWORD` stores a SCRAM-SHA-256 verifier that is never checked. Probed
+      rather than inferred: created a role with a password, connected with a
+      deliberately wrong one, and ran `select 1` successfully. Noting the
+      confirmation because "stored, never verified" reads like a catalog gap,
+      and it is an authentication bypass — anyone pointing this server at
+      anything but a test fixture should know.
+
+- [x] ~~**Rust PG server: `numeric` DIVISION is refused (`0A000`).**~~ **FIXED
+  — re-measured 2026-09-28** against a `secantusd-pg` built from `HEAD:crates`.
+  `select 10::numeric / 4::numeric` answers `2.5000000000000000`, PostgreSQL's
+  sixteen places. The entry above described the state before the scale rules
+  were measured.
 - **Rust PG server: array comparison does not require matching element types.**
   PostgreSQL has no `integer[] = smallint[]` operator — array operators need
   identical element types and do not widen — so `select array[1,2,3] = %s` with
@@ -6422,28 +6500,27 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   - `test_leak` failures are a randomised memory-leak probe round-tripping random
     values — type-fidelity noise, not cursor mechanics; the failing params shuffle
     per run.
-- **Rust PG server: DDL IS NOT TRANSACTIONAL.** `CREATE TABLE` inside a
-  transaction survives a `ROLLBACK` (and so do rows inserted into it);
-  `DROP TABLE` inside one stays dropped. PostgreSQL rolls both back. Measured
-  2026-09-05 against PG 14, both directions.
+- [x] ~~**Rust PG server: DDL IS NOT TRANSACTIONAL.**~~ **FIXED — re-measured
+  2026-09-28, BOTH directions**, against a `secantusd-pg` built from
+  `HEAD:crates`. `begin; create table rb(a int); rollback` leaves no table
+  (`select * from rb` is `42P01`), and `begin; drop table dr; rollback` RESTORES
+  the table. PostgreSQL's behaviour on both.
 
-  This is a correctness divergence, not a missing feature: a client that rolls
-  back after creating a table is left with a table it believes does not exist.
-  Fixing it needs transactional schema operations in the storage layer —
-  `create_collection` / `drop_collection` are not part of the user transaction
-  — so it is a storage-level change rather than a pgserver one.
+  The acceptance test is not enough here and was deliberately not relied on: a
+  `COMMIT`-path probe passes whether or not rollback works, so this was checked
+  by rolling back and then reading. See §0.33 of `tasks/rust-pgserver-plan.md`.
+- [x] ~~**Rust PG server: SAVEPOINTs are refused (`0A000`)**~~ **FIXED — and
+  the SEMANTICS re-measured 2026-09-28, not just the acceptance.** Against a
+  `secantusd-pg` built from `HEAD:crates`: `insert 1; savepoint s1; insert 2;
+  rollback to savepoint s1; commit` leaves `[(1,)]` — so `ROLLBACK TO` really
+  undoes, rather than being accepted and dropped. Error recovery inside a
+  savepoint also works: a duplicate-key failure after `savepoint s1`, then
+  `rollback to s1`, then a fresh insert, commits `[(1,), (2,)]`.
 
-  What DOES work as of 2026-09-05: a table created or dropped in a transaction
-  is correctly VISIBLE (or hidden) to later statements in that same
-  transaction, which is what 184 psycopg failures were waiting on.
-- **Rust PG server: SAVEPOINTs are refused (`0A000`), and that now costs more
-  than it did.** `SAVEPOINT` / `ROLLBACK TO` / `RELEASE` need nested
-  transactions in the storage layer; emulating them would silently lose the
-  semantics a client is relying on, so they are refused. Since the transaction
-  STATUS became correct (2026-09-05), psycopg reaches for a savepoint whenever
-  a `conn.transaction()` block nests inside an open transaction -- which it can
-  now see -- so tests that used to pass by never noticing the outer transaction
-  fail here instead. It is the next blocker in `test_transaction.py`.
+  **Checking acceptance alone would have been worthless here** — a server that
+  parsed `SAVEPOINT` and ignored it passes that probe and silently loses the
+  semantics, which is exactly the failure this entry warned about. Probe the
+  state after the rollback, always.
 - **Rust PG server: `generate_series` with EVERY bound a small-int parameter is
   accepted where PostgreSQL refuses it as ambiguous.** `generate_series(%s, %s,
   %s)` with `(1, 10, 3)` sends three `int2`s, and PostgreSQL answers `42725`
@@ -6670,13 +6747,16 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   PostgreSQL never reuses a sequence value (`nextval` is non-transactional).
   The sequence doc in `__sql_sequences__` is written inside the statement's
   transaction, so an abort restores it.
-- [ ] **OPEN — Rust PG server: NOT NULL is not enforced — on a serial column
-  OR an explicit `int not null` (re-measured 2026-09-09).** `create table t
-  (id int not null); insert into t (id) values (null)` stores a NULL id;
-  PostgreSQL 16 is `23502 null value in column "id" of relation "t" violates
-  not-null constraint`. Same for `serial` (which implies `NOT NULL`). Part of
-  the "NOT NULL / CHECK / FOREIGN KEY constraints are not enforced" entry in
-  the psycopg gauge section; the catalog does not record the constraint.
+
+  **Still open, re-measured 2026-09-28** against a `secantusd-pg` built from
+  `HEAD:crates`: insert / `rollback` / insert leaves the second row holding
+  id `1`, the value the aborted insert drew.
+- [x] ~~**OPEN — Rust PG server: NOT NULL is not enforced**~~ **FIXED —
+  re-measured 2026-09-28** against a `secantusd-pg` built from `HEAD:crates`.
+  `create table nn(id int not null); insert into nn(id) values (null)` is
+  `23502 null value in column "id" of relation "nn" violates not-null
+  constraint`, PostgreSQL's code and wording. Column-level `UNIQUE` is enforced
+  too (`23505`, constraint named `uq_a_key`), which CLAUDE.md already corrected.
 - [ ] **OPEN — Rust PG server: `timestamp + interval` on a STORED timestamp
   loses sub-millisecond precision (2026-09-09).** A `timestamp` column
   holding `2021-01-01 00:00:00.123456` answers `…00.123` for `ts + interval
@@ -6705,12 +6785,10 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   '')` and other nestings are `NullTest is not supported yet` / 0A000 —
   the sleep is a `ConstCol::Sleep` column, not a value the expression
   evaluator can nest.
-- [ ] **OPEN — Rust PG server: `float4` (real) text is Rust's shortest
-  form, not `float4out` (2026-09-09).** `float8` now renders exactly as
-  `float8out` (`1e+20`, `1e-07`, `Infinity`, `{1.5,2}`); `float4` still
-  goes through ryu, so `1e20::float4` is `1e20` where PostgreSQL 16 prints
-  `1e+20`. Same fix as `geo::float8_text`, with float4's 6-digit shortest
-  round-trip.
+- [x] ~~**OPEN — Rust PG server: `float4` (real) text is Rust's shortest
+  form, not `float4out`**~~ **FIXED — re-measured 2026-09-28** against a
+  `secantusd-pg` built from `HEAD:crates`: `select 1e20::float4::text` is
+  `1e+20`, matching `float4out`.
 - **Rust PG server: psycopg's `test_array.py` is 158/158 (2026-09-09).**
   Multidimensional arrays round-trip in text and binary both ways,
   `INSERT … RETURNING`, the `box` type and its `;` array separator all
