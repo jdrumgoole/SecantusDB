@@ -50,7 +50,28 @@ and is on its way back to ~99.6%.
 
 ### 2. Port the transaction fixes to Rust -- 10 of Rust's 15, and the whole gap
 
-**Unblocked as of `daa855a8`.** Start here.
+**DONE — #1606 (`9f3446a2`), 2026-09-28.** Measured rather than assumed: the
+Rust server is **0 divergent of 63** against mongod 8.2.11 on `codeName` and
+`errorLabels` across 21 codes on `insert` / `commitTransaction` /
+`abortTransaction`, and `test_transactions_unified` against the standalone
+`secantusd-rs` went **10 failures -> 3** -- the three survivors being the
+secondary-read cases in §7 that cannot pass on a single node.
+
+Three things the work found that this section did not predict, all worth
+carrying forward:
+
+- **The label depends on WHICH COMMAND failed**, not only on the code. Ending
+  the transaction splits the transient set, giving `RetryableWriteError` to the
+  13 codes about reaching the node. No server here modelled that.
+- **The first fix BROKE two passing spec tests.** mongod treats a supplied
+  `errorLabels` -- including an explicit `[]` -- as authoritative, and the parser
+  collapsed that with the key being absent. Only running the whole file caught
+  it; every targeted test was green.
+- **Both servers were missing 134 and 262 together**, because the Rust comment
+  cited `commands.py` as its authority. Neither the parity suite nor an
+  engine-vs-engine sweep can see that shape.
+
+The original text follows, since its sizing is what the work was planned from.
 
 The Rust gauge's 15 failures are 5 out-of-scope (§7's list) plus **10** in
 `test_transactions_unified` -- not the 8 the first draft claimed. The Python
@@ -112,14 +133,27 @@ on `PATH`** here (with 6.0.16 and 8.3.4 in Cellar), so no `fastdl.mongodb.org`
 allowlist is needed. That note came from the sandbox that wrote the draft -- see
 the environment section below.
 
-- `getParameter` reports `featureCompatibilityVersion: "7.0"` against an 8.x
-  target. **This is the same dict as the hardcoded `enableTestCommands` in Step
-  3**, five lines away on both servers (`commands.py:1823` / `diagnostics.rs:189`)
-  -- one site, not two work items. Probe the exact string 8.2.11 returns; do not
-  assume `"8.2"` over `"8.0"`.
-- Under `maxTimeAlwaysTimeOut`, Python `createIndexes` answers with the
-  index-build envelope and Rust with the bare message. Probe which one mongod
-  gives, then align both.
+**DONE — both items probed 2026-09-28. One needed a fix; the other needed
+none, and this section had it pointing the wrong way.**
+
+- `featureCompatibilityVersion` — **fixed in #1607 (`b9e969a1`).** mongod 8.2.11
+  answers `"8.2"` (the running binary's major.minor), and the advice above to
+  probe rather than assume `"8.0"` was right to give. The interesting part was
+  not the string: the Rust server already advertised `buildInfo.version`
+  `8.2.11` and `maxWireVersion` 27, so `"7.0"` contradicted **its own
+  handshake**, not just mongod. Both servers now DERIVE it from
+  `SERVER_VERSION_ARRAY`, because a literal is what survived the 6.0 -> 8.x
+  retarget untouched. Nothing caught it because the only two tests that read the
+  parameter asserted the KEY was present and never its value — the assertion a
+  stale literal always passes.
+- `createIndexes` under a timeout — **no Rust change needed; "align both" points
+  at PYTHON.** mongod gives the BARE `code 50 / MaxTimeMSExpired / "operation
+  exceeded time limit"` with no index-build envelope, and the Rust server already
+  matches it exactly. Probed in BOTH the failpoint and real-expiry paths on
+  purpose, since the failpoint fires before an index build exists and could have
+  differed legitimately — it does not. Filed in `tasks/backlog.md` §5.
+
+  That probe also produced **§6's reproducer** as a side effect: see below.
 
 ### 5. Re-run the other-language gauges on both servers -- after Step 2
 
@@ -138,6 +172,16 @@ the environment section below.
   (`argtypes.rs:521`) and enforces it nowhere -- there is no equivalent of
   `src/secantus/deadline.py`. A slow Rust command with `maxTimeMS` runs to
   completion. The failpoint works; the limit does not.
+- **Now DEMONSTRATED, not just described** (2026-09-28, a side effect of §4's
+  second probe). Insert 100,000 documents, then `createIndexes` with
+  `maxTimeMS: 1`:
+
+      mongod 8.2.11      -> ok: 0, code 50, MaxTimeMSExpired
+      rust secantusd-rs  -> ok: 1.0        (index fully built)
+
+  Two lines to reproduce, so this no longer needs to be taken on trust. The
+  budget is parsed and recognised — the failpoint path answers 50 correctly — and
+  simply never checked.
 - Needs a cooperative deadline polled by the storage scan, the aggregation
   pipeline and the index build, as `src/secantus/deadline.py` does.
 - **Risk:** those polls sit in the flagship server's hottest loops. Benchmark
