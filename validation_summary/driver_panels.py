@@ -31,11 +31,12 @@ via the secantusdb-release skill.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import sys
 from html import escape
 from pathlib import Path
 
-from validation_summary import rates
+from validation_summary import generate, rates
 from validation_summary.generate import (
     GaugeStats,
     _apply_expected_failures,
@@ -381,15 +382,74 @@ _GRID_FOOT = """\
 """
 
 
-def render(raw_dir: Path) -> str:
-    """Build the full ``drivers_grid.html`` text from ``.validation/``."""
+def _refuse_mixed_age(raw_dir: Path, suffix: str, server: str, max_spread_days: float) -> None:
+    """Refuse to publish a grid whose panels were measured weeks apart.
+
+    The grid goes on the website as ONE snapshot with one implied date, so a
+    panel built from a months-old artifact is read as current by everyone who
+    sees it. There was no check at all until 2026-09-28, when a Rust render
+    would have published a **10 August** pymongo-async rate beside twelve
+    numbers measured that morning — no staleness marker anywhere, because each
+    collector only ever looked at its own file and nothing compared them.
+
+    Spread rather than absolute age is the right test: a deliberately old but
+    CONSISTENT sweep is honest, and it is the mixing that misleads.
+    """
+    ages: dict[str, dt.datetime] = {}
+    for name, base in generate.GAUGE_ARTIFACTS.items():
+        path = generate._artifact(raw_dir, base, suffix)
+        if path.exists():
+            ages[name] = dt.datetime.fromtimestamp(path.stat().st_mtime)
+    if len(ages) < 2:
+        return
+    newest = max(ages.values())
+    stale = {
+        n: t for n, t in ages.items() if (newest - t).total_seconds() > max_spread_days * 86400
+    }
+    if not stale:
+        return
+    lines = "\n".join(
+        f"    {n:<22} {t:%Y-%m-%d}  ({(newest - t).days} days older)"
+        for n, t in sorted(stale.items(), key=lambda kv: kv[1])
+    )
+    raise SystemExit(
+        f"refusing to render the {server}-server panel grid: these artifacts are "
+        f"more than {max_spread_days:g} days older than the newest "
+        f"({newest:%Y-%m-%d}), so the grid would present them as one snapshot:\n"
+        f"{lines}\n"
+        f"  Re-run those gauges with `--server {server}`, or pass --allow-stale "
+        f"if you genuinely want a mixed-age grid."
+    )
+
+
+def render(
+    raw_dir: Path,
+    server: str = "python",
+    *,
+    allow_stale: bool = False,
+    max_spread_days: float = 7.0,
+) -> str:
+    """Build the full ``drivers_grid.html`` text from ``.validation/``.
+
+    ``server`` picks which half of the artifacts to read. Both halves have
+    existed for months — every gauge writes a ``-rust-server`` variant — but
+    the collectors hardcoded the Python filenames, so the published panels
+    could only ever show the Python server no matter what had been measured.
+    That is why the page's own prose had to carry a note saying the Rust
+    numbers were not shown.
+    """
+    if server not in ("python", "rust"):
+        raise SystemExit(f"--server must be 'python' or 'rust', got {server!r}")
+    suffix = "" if server == "python" else "-rust-server"
+    if not allow_stale:
+        _refuse_mixed_age(raw_dir, suffix, server, max_spread_days)
     panels: list[str] = []
     for name, collector in _COLLECTORS.items():
-        stats = collector(raw_dir)
+        stats = collector(raw_dir, suffix)
         if stats is None:
             raise SystemExit(
-                f"missing validation artifact for {name!r} under {raw_dir}; "
-                "run `invoke validate-all` first"
+                f"missing {server}-server validation artifact for {name!r} under "
+                f"{raw_dir}; run `invoke validate-all --server {server}` first"
             )
         _apply_expected_failures(stats)
         panels.append(_render_validation_panel(name, stats))
@@ -422,6 +482,23 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--server",
+        choices=("python", "rust"),
+        default="python",
+        help=(
+            "Which server's gauge artifacts to read: 'python' uses e.g. "
+            "raw.json, 'rust' uses raw-rust-server.json (default: python)."
+        ),
+    )
+    parser.add_argument(
+        "--allow-stale",
+        action="store_true",
+        help=(
+            "Render even when the artifacts were measured weeks apart. The grid "
+            "is published as one snapshot, so this is almost never what you want."
+        ),
+    )
+    parser.add_argument(
         "--print",
         dest="just_print",
         action="store_true",
@@ -432,7 +509,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.just_print and args.out is None:
         parser.error("--out is required unless --print is set")
 
-    html = render(args.raw_dir)
+    html = render(args.raw_dir, args.server, allow_stale=args.allow_stale)
     if args.just_print:
         sys.stdout.write(html)
         return 0

@@ -185,9 +185,46 @@ _PYMONGO_NON_SERVER_FILES = frozenset(
 )
 
 
-def _collect_pymongo(raw_dir: Path) -> GaugeStats | None:
+#: Panel name -> the base artifact filename each collector reads. Kept beside
+#: the collectors so a freshness check can reach the same files they do without
+#: re-deriving the names; `tests/test_driver_panels_freshness.py` pins it
+#: against `_COLLECTORS` so the two cannot drift apart.
+GAUGE_ARTIFACTS: dict[str, str] = {
+    "pymongo": "raw.json",
+    "pymongo (async)": "pymongo-async-raw.json",
+    "mongo-java-driver": "java-results",
+    "mongo-kotlin-driver": "kotlin-results",
+    "mongo-node-driver": "node-raw.json",
+    "mongo-go-driver": "go-raw.ndjson",
+    "mongo-ruby-driver": "ruby-raw.json",
+    "mongo-rust-driver": "rust-raw.json",
+    "mongo-php-library": "php-lib-junit.xml",
+    "mongo-php-driver": "php-ext-junit.xml",
+    "mongo-c-driver": "c-raw.json",
+    "mongo-cxx-driver": "cxx-raw.xml",
+    "mongo-csharp-driver": "dotnet-raw.trx",
+}
+
+
+def _artifact(raw_dir: Path, name: str, suffix: str = "") -> Path:
+    """Resolve a gauge's raw artifact, optionally its ``-rust-server`` variant.
+
+    The suffix goes before the extension (``raw.json`` ->
+    ``raw-rust-server.json``) and is simply appended for the two directory
+    artifacts (``java-results`` -> ``java-results-rust-server``), which is the
+    shape ``gauge_common.report_suffix()`` produces on the writing side. The
+    two halves were written independently and only ever agreed by inspection;
+    this is the one place that encodes the rule for readers.
+    """
+    if not suffix:
+        return raw_dir / name
+    stem, dot, ext = name.partition(".")
+    return raw_dir / (f"{stem}{suffix}{dot}{ext}" if dot else f"{name}{suffix}")
+
+
+def _collect_pymongo(raw_dir: Path, suffix: str = "") -> GaugeStats | None:
     """Read ``pytest-json-report`` output (``.validation/raw.json``)."""
-    f = raw_dir / "raw.json"
+    f = _artifact(raw_dir, "raw.json", suffix)
     if not f.exists():
         return None
     raw = json.loads(f.read_text())
@@ -223,12 +260,12 @@ def _collect_pymongo(raw_dir: Path) -> GaugeStats | None:
     )
 
 
-def _collect_pymongo_async(raw_dir: Path) -> GaugeStats | None:
+def _collect_pymongo_async(raw_dir: Path, suffix: str = "") -> GaugeStats | None:
     """Read the async gauge's ``pytest-json-report`` output
     (``.validation/pymongo-async-raw.json``) — pymongo's native
     ``AsyncMongoClient`` suite, same repo and non-server-file filter as the
     sync gauge."""
-    f = raw_dir / "pymongo-async-raw.json"
+    f = _artifact(raw_dir, "pymongo-async-raw.json", suffix)
     if not f.exists():
         return None
     raw = json.loads(f.read_text())
@@ -262,9 +299,9 @@ def _collect_pymongo_async(raw_dir: Path) -> GaugeStats | None:
     )
 
 
-def _collect_go(raw_dir: Path) -> GaugeStats | None:
+def _collect_go(raw_dir: Path, suffix: str = "") -> GaugeStats | None:
     """Read ``go test -json`` NDJSON (``.validation/go-raw.ndjson``)."""
-    f = raw_dir / "go-raw.ndjson"
+    f = _artifact(raw_dir, "go-raw.ndjson", suffix)
     if not f.exists():
         return None
     passed = failed = skipped = 0
@@ -296,9 +333,9 @@ def _collect_go(raw_dir: Path) -> GaugeStats | None:
     )
 
 
-def _collect_node(raw_dir: Path) -> GaugeStats | None:
+def _collect_node(raw_dir: Path, suffix: str = "") -> GaugeStats | None:
     """Read Mocha JSON reporter output (``.validation/node-raw.json``)."""
-    f = raw_dir / "node-raw.json"
+    f = _artifact(raw_dir, "node-raw.json", suffix)
     if not f.exists():
         return None
     raw = json.loads(f.read_text())
@@ -316,9 +353,9 @@ def _collect_node(raw_dir: Path) -> GaugeStats | None:
     )
 
 
-def _collect_ruby(raw_dir: Path) -> GaugeStats | None:
+def _collect_ruby(raw_dir: Path, suffix: str = "") -> GaugeStats | None:
     """Read RSpec JSON formatter output (``.validation/ruby-raw.json``)."""
-    f = raw_dir / "ruby-raw.json"
+    f = _artifact(raw_dir, "ruby-raw.json", suffix)
     if not f.exists():
         return None
     raw = json.loads(f.read_text())
@@ -352,9 +389,9 @@ def _collect_ruby(raw_dir: Path) -> GaugeStats | None:
     )
 
 
-def _collect_java(raw_dir: Path) -> GaugeStats | None:
+def _collect_java(raw_dir: Path, suffix: str = "") -> GaugeStats | None:
     """Walk JUnit XML output (``.validation/java-results/<module>/TEST-*.xml``)."""
-    xml_dir = raw_dir / "java-results"
+    xml_dir = _artifact(raw_dir, "java-results", suffix)
     if not xml_dir.is_dir():
         return None
     passed = failed = skipped = 0
@@ -420,14 +457,14 @@ def _collect_java(raw_dir: Path) -> GaugeStats | None:
     )
 
 
-def _collect_kotlin(raw_dir: Path) -> GaugeStats | None:
+def _collect_kotlin(raw_dir: Path, suffix: str = "") -> GaugeStats | None:
     """Walk JUnit XML output (``.validation/kotlin-results/<module>/TEST-*.xml``).
 
     The Kotlin driver ships inside the mongo-java-driver monorepo
     (``:driver-kotlin-sync:integrationTest``), so the driver version is the
     same vendored submodule's HEAD.
     """
-    xml_dir = raw_dir / "kotlin-results"
+    xml_dir = _artifact(raw_dir, "kotlin-results", suffix)
     if not xml_dir.is_dir():
         return None
     passed = failed = skipped = 0
@@ -457,9 +494,9 @@ def _collect_kotlin(raw_dir: Path) -> GaugeStats | None:
     )
 
 
-def _collect_rust(raw_dir: Path) -> GaugeStats | None:
+def _collect_rust(raw_dir: Path, suffix: str = "") -> GaugeStats | None:
     """Read the rust gauge's parsed cargo output (``.validation/rust-raw.json``)."""
-    f = raw_dir / "rust-raw.json"
+    f = _artifact(raw_dir, "rust-raw.json", suffix)
     if not f.exists():
         return None
     raw = json.loads(f.read_text())
@@ -480,7 +517,7 @@ def _collect_rust(raw_dir: Path) -> GaugeStats | None:
     )
 
 
-def _collect_php_ext(raw_dir: Path) -> GaugeStats | None:
+def _collect_php_ext(raw_dir: Path, suffix: str = "") -> GaugeStats | None:
     """Walk run-tests.php JUnit XML (``.validation/php-ext-junit.xml``).
 
     Excludes the ``tests/bson`` directory: those ~440 cases are pure
@@ -489,7 +526,7 @@ def _collect_php_ext(raw_dir: Path) -> GaugeStats | None:
     Only the wire-protocol directories measure SecantusDB's command
     surface, which is what the compatibility number should reflect.
     """
-    f = raw_dir / "php-ext-junit.xml"
+    f = _artifact(raw_dir, "php-ext-junit.xml", suffix)
     if not f.exists():
         return None
     try:
@@ -531,14 +568,14 @@ def _collect_php_ext(raw_dir: Path) -> GaugeStats | None:
 _PHP_LIB_SERVER_CATEGORIES = frozenset({"Operation", "Collection", "Database", "Command"})
 
 
-def _collect_php_lib(raw_dir: Path) -> GaugeStats | None:
+def _collect_php_lib(raw_dir: Path, suffix: str = "") -> GaugeStats | None:
     """Walk PHPUnit JUnit XML (``.validation/php-lib-junit.xml``).
 
     Counts only the server-touching functional categories (see
     ``_PHP_LIB_SERVER_CATEGORIES``); the pure-code DSL / comparator /
     helper units are run but not counted, mirroring the Java gauge.
     """
-    f = raw_dir / "php-lib-junit.xml"
+    f = _artifact(raw_dir, "php-lib-junit.xml", suffix)
     if not f.exists():
         return None
     try:
@@ -583,13 +620,13 @@ def _collect_php_lib(raw_dir: Path) -> GaugeStats | None:
     )
 
 
-def _collect_c(raw_dir: Path) -> GaugeStats | None:
+def _collect_c(raw_dir: Path, suffix: str = "") -> GaugeStats | None:
     """Read ``test-libmongoc`` JSON (``.validation/c-raw.json``).
 
     Shape: ``{"results": [{"status": "pass"|"fail"|"skip", "test_file":
     "/Suite/test", ...}, ...]}`` (see ``src/libmongoc/tests/TestSuite.c``).
     """
-    f = raw_dir / "c-raw.json"
+    f = _artifact(raw_dir, "c-raw.json", suffix)
     if not f.exists():
         return None
     # test-libmongoc's -F output isn't strictly valid JSON (trailing commas,
@@ -621,9 +658,9 @@ def _collect_c(raw_dir: Path) -> GaugeStats | None:
     )
 
 
-def _collect_cxx(raw_dir: Path) -> GaugeStats | None:
+def _collect_cxx(raw_dir: Path, suffix: str = "") -> GaugeStats | None:
     """Walk mongocxx's Catch2 JUnit XML (``.validation/cxx-raw.xml``)."""
-    f = raw_dir / "cxx-raw.xml"
+    f = _artifact(raw_dir, "cxx-raw.xml", suffix)
     if not f.exists():
         return None
     try:
@@ -658,9 +695,9 @@ _TRX_NS = "{http://microsoft.com/schemas/VisualStudio/TeamTest/2010}"
 _TRX_SKIP = {"NotExecuted", "Inconclusive", "NotRunnable", "Pending", "Warning"}
 
 
-def _collect_dotnet(raw_dir: Path) -> GaugeStats | None:
+def _collect_dotnet(raw_dir: Path, suffix: str = "") -> GaugeStats | None:
     """Read ``dotnet test`` TRX output (``.validation/dotnet-raw.trx``)."""
-    f = raw_dir / "dotnet-raw.trx"
+    f = _artifact(raw_dir, "dotnet-raw.trx", suffix)
     if not f.exists():
         return None
     try:
