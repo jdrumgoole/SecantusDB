@@ -45,6 +45,19 @@ pub struct ResolvedConfig {
     /// pymongo's change-stream topology checks pass). `true` ⇒ STANDALONE.
     pub standalone: bool,
 
+    /// `configureFailPoint` and friends, mongod's `enableTestCommands`.
+    ///
+    /// **Off by default on the standalone daemon**, as mongod is: an
+    /// unauthenticated client that can reach the port could otherwise arm a
+    /// server-wide `failCommand` that closes every connection (W6 in
+    /// `docs/security-reports/2026-08-10.md`). The embedded test handles turn
+    /// it ON, because starting a server in a test is the entire use case.
+    ///
+    /// When false no `FailPointRegistry` is wired, and the registry's absence
+    /// is what makes the command not exist — see
+    /// `secantus_commands::is_test_only_command`.
+    pub enable_test_commands: bool,
+
     // ---- [oplog] -----------------------------------------------------
     pub oplog_retention_seconds: f64,
     pub oplog_max_entries: usize,
@@ -88,6 +101,8 @@ impl Default for ResolvedConfig {
             log_level: "INFO".to_string(),
             auth: false,
             standalone: false,
+            // OFF by default, as mongod is. See the field's doc comment.
+            enable_test_commands: false,
             oplog_retention_seconds: 3600.0,
             oplog_max_entries: 100_000,
             oplog_archive_dir: None,
@@ -122,6 +137,7 @@ pub struct ConfigOverrides {
     pub log_level: Option<String>,
     pub auth: Option<bool>,
     pub standalone: Option<bool>,
+    pub enable_test_commands: Option<bool>,
     pub oplog_retention_seconds: Option<f64>,
     pub oplog_max_entries: Option<usize>,
     pub oplog_archive_dir: Option<String>,
@@ -166,6 +182,7 @@ impl ConfigOverrides {
         set!(log_level);
         set_copy!(auth);
         set_copy!(standalone);
+        set_copy!(enable_test_commands);
         set_copy!(oplog_retention_seconds);
         set_copy!(oplog_max_entries);
         // oplog_archive_dir is Option-valued; `Some(dir)` sets it.
@@ -333,6 +350,9 @@ pub fn parse_str(text: &str, label: &str) -> Result<ConfigOverrides, String> {
                 }
                 "auth" => out.auth = Some(as_bool(val, "server", key, label)?),
                 "standalone" => out.standalone = Some(as_bool(val, "server", key, label)?),
+                "enable_test_commands" => {
+                    out.enable_test_commands = Some(as_bool(val, "server", key, label)?)
+                }
                 other => return Err(unknown_key("server", other, label)),
             }
         }

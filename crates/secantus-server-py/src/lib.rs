@@ -166,6 +166,12 @@ impl RustServer {
             replica_set_name,
             require_auth,
             tls,
+            // ON for the EMBEDDED handle, mirroring `SecantusDBServer`'s own
+            // default: constructing a server in-process is a test doing it, and
+            // every driver failpoint suite needs `configureFailPoint`. The
+            // standalone `secantusd-rs` daemon keeps mongod's default of OFF —
+            // that is the one an operator exposes on a port.
+            enable_test_commands: true,
             ..ServerConfig::default()
         };
         let addr = format!("{host}:{port}");
