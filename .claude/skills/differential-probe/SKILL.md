@@ -205,7 +205,17 @@ comparison. Re-run the same probe against the old server; a difference in the
 ## The PYTHON version is a reference server too
 
 The matrix is 3.10-3.13 and a local run is one of them, so a stdlib behaviour
-that changed between versions is invisible until CI runs. That is not a
+that changed between versions is invisible until CI runs — **and on a PR, "CI
+runs" means 3.10 and nothing else.** `test.yml:100` selects
+`["3.10","3.11","3.12","3.13"]` only for `schedule` and `workflow_dispatch`;
+a push or pull_request gets `["3.10"]`. So a defect that needs 3.11+ cannot
+fail a PR at all, and surfaces in the weekly cron that notifies nobody.
+Measured 2026-09-28, when a `cbrt` assertion hardcoded to a Windows/macOS float
+sat red in the cron while every PR went green; it was found only because a
+`workflow_dispatch` was used as a stand-in for a dropped `pull_request` event
+and silently upgraded that run to the full sweep. To check a version-sensitive
+change before merging, dispatch `test.yml` on your branch rather than trusting
+the PR's green. That is not a
 theoretical hazard: `datetime.fromisoformat` accepted **only** 3 or 6
 fractional digits before 3.11, so `TIMESTAMP '2020-01-15 10:30:45.5'` -- an
 ordinary Postgres literal -- parsed on 3.12 and raised on 3.10 (found 2026-09-03

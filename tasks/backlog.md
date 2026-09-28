@@ -3018,6 +3018,69 @@ These are explicit non-goals. Don't add them without a reason.
       storage scan, the aggregation pipeline and the index build, and those polls
       sit in the flagship server's hottest loops. Benchmark before and after
       (`invoke release-benchmark`); do not assume the cost.
+- [ ] **OPEN — two job-tooling tests are load-sensitive under `-n auto`
+      (measured 2026-09-28).** `tests/test_detached_run.py::
+      test_stop_ends_a_running_command` and `tests/test_opsboard.py::
+      test_job_log_tail_captures_child_output` failed together in one full
+      `-n auto` run on Windows (14,857 passed, these 2 failed) and **both pass
+      serially on an idle box** (`-n0`, 58s). The run that failed had a
+      `scripts/detached_run.py` job of its own active, so the box was carrying
+      an extra process group plus the xdist workers.
+
+      They test the job tooling, not storage — so this is not the WT_PANIC
+      class the CLAUDE.md rule is aimed at — but "only under load" is still a
+      description of a bug. Both assert on a child process reaching a state
+      within a timeout, which is the shape that loses under CPU contention;
+      `test_detached_run.py` already carries a comment noting this assertion has
+      failed on Windows CI before. Fix is probably a longer / polled wait rather
+      than a wall-clock one. Same family as the `test_concurrent_server_
+      lifecycle_no_panic` entry in §5.
+
+- [ ] **OPEN — a push/PR CI run tests only Python 3.10 on Linux, so a 3.11+
+      Linux bug can ONLY surface in the weekly cron (found 2026-09-28).** This
+      is the structural half of the `cbrt` finding below, and it is the more
+      expensive half. `test.yml`'s push/PR matrix is 3.10 on ubuntu plus macOS;
+      `workflow_dispatch` and `schedule` get the full 3.10–3.13 sweep. So a
+      defect that needs 3.11+ on glibc is invisible to every PR, and the place
+      it shows up is a cron run nobody is watching — the 2026-09-28 06:44 cron
+      was already red on `test-durable (3.11/3.12/3.13, ubuntu-latest, 1)` and
+      `test (3.11/3.12, ubuntu-latest, 1)` hours before anyone noticed.
+
+      It was found by accident: a `workflow_dispatch` was used as a substitute
+      for a dropped `pull_request` event, which silently upgraded that run to
+      the full matrix and turned a green-looking branch red.
+
+      **Needs a decision rather than a default.** Adding 3.13-on-Linux to
+      push/PR would catch this class at the cost of runner time on an already
+      congested queue (runs were sitting ~19 minutes in the queue that day).
+      Cheaper middle grounds: one extra Linux Python on PRs, or make the cron's
+      failure loud (it currently notifies nobody).
+
+- [ ] **OPEN — on Python 3.10 our `cbrt` is EXACT on perfect cubes where
+      PostgreSQL is not, a ≤1 ULP divergence on Linux (measured 2026-09-28).**
+      `secantus/sql/scalar.py`'s `_real_cbrt` uses `math.cbrt` (a bare libm
+      call) from 3.11, and a Newton-refined power form on 3.10 because
+      `math.cbrt` does not exist there. The fallback is exact on every perfect
+      cube; libm is not.
+
+      Measured by calling `libm.so.6`'s `cbrt` through `ctypes` on **glibc
+      2.39**: `cbrt(27.0)` is `3.0000000000000004` — exactly one ULP high —
+      while 8, 64, 125 and 1e6 come out exact. MSVC and macOS answer exactly
+      `3.0`. PostgreSQL's `dcbrt` is the same bare libm call, so **PostgreSQL
+      on glibc answers `3.0000000000000004` too**, and on 3.10 we answer `3.0`
+      — i.e. the fallback is the path that diverges from the oracle, by being
+      *more* accurate than it.
+
+      `_real_cbrt`'s docstring already names this trade ("being more accurate
+      than libm would move us AWAY from Postgres") and accepts it. Left open as
+      a record, not as a task: closing it means calling libm through `ctypes` on
+      3.10, which is a fragile cure for a one-ULP disease. Revisit when 3.10
+      support is dropped, at which point it disappears on its own.
+
+      What WAS a real defect, and is fixed: the TESTS hardcoded `3.0`, a
+      Windows/macOS value, so they failed on Linux for every Python with
+      `math.cbrt`. They now assert to within one ULP and pin the byte-exact
+      libm match separately. See `tests/test_sql_missing_builtins.py::TestCbrt`.
 
 - [ ] **OPEN — a backend-termination test waits with `sleep(0.1)` for a reap it
       cannot bound, and failed CI TWICE on 2026-09-28.**
