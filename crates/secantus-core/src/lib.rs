@@ -22,6 +22,7 @@
 // call directly.
 pub mod aggregate;
 pub mod collation;
+pub mod deadline;
 pub mod diff;
 pub mod expressions;
 pub mod fallback;

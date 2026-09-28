@@ -838,6 +838,18 @@ fn map_err(e: WtError) -> StorageError {
             errmsg: "E11000 duplicate key error".to_string(),
             exec: false,
         },
+        // A spent `maxTimeMS` budget → mongod's MaxTimeMSExpired (50). Carried
+        // as a WriteError so it travels the existing per-operation path;
+        // `code_name_for(50)` renders the name, which without its table entry
+        // would be the generic `Location50`.
+        // Values mirror `secantus_core::deadline::MaxTimeMsExpired`, which this
+        // crate does not depend on; `max_time_expired_matches_core` in
+        // secantus-commands pins them together.
+        WtError::MaxTimeExpired => StorageError::WriteError {
+            code: 50,
+            errmsg: "operation exceeded time limit".to_string(),
+            exec: false,
+        },
         // A lost WT_ROLLBACK race → mongod's WriteConflict (112). Routed
         // command-level by the write handlers so the txn envelope labels it.
         WtError::WriteConflict => StorageError::WriteConflict,
