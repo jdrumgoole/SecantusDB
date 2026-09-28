@@ -23,13 +23,11 @@ query/update/expression operators, aggregation stages, indexes, change
 streams, transactions, auth, and backup/PITR. The short version of what the
 Rust server does **not** have relative to the Python server:
 
-- the SQL / PostgreSQL wire frontend (Python-server-only),
-- `mapReduce` and `top` (answered with `CommandNotFound`),
 - `secantusAdmin.restoreToTimestamp` over the wire (use
   [`secantusd-rs restore`](recovery.md) instead),
 - session-lifecycle commands beyond `startSession` are acknowledged no-ops,
 - a handful of operator edge cases the Rust engine deliberately rejects
-  rather than risk diverging from the Python oracle (some
+  rather than risk diverging from `mongod` (some
   `$dateFromString` / `$dateToString` format directives, Decimal128
   arithmetic edges, mixed-type sort orderings).
 

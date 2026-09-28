@@ -16,7 +16,7 @@ with the Python server), and ships as a single static-WiredTiger binary:
 
 ```python
 # Or bundled in the Python wheel:
-#   pip install SecantusDB   (storage-engine build)
+#   pip install SecantusDB
 import _secantus_server
 from pymongo import MongoClient
 
