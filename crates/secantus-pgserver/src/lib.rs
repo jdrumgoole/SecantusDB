@@ -4283,6 +4283,138 @@ impl PgHandler {
         out
     }
 
+    /// Write `rows` honouring an `ON CONFLICT` clause; returns
+    /// `(rows affected, rows to project for RETURNING)`.
+    ///
+    /// PostgreSQL's row counts, which the command tag reports: a skipped
+    /// `DO NOTHING` row counts 0, and so does a `DO UPDATE` whose `WHERE` is
+    /// false. Only rows actually inserted or updated count, and only those
+    /// reach `RETURNING`.
+    fn insert_on_conflict(
+        &self,
+        table: &str,
+        def: &TableDef,
+        rows: Vec<Document>,
+        oc: &secantus_pgplan::OnConflict,
+    ) -> PgWireResult<(usize, Vec<Document>)> {
+        let mut affected: Vec<Document> = Vec::new();
+        let mut written = 0usize;
+        for row in rows {
+            let bytes =
+                bson::to_vec(&row).map_err(|e| Self::storage_err("could not encode a row", e))?;
+            let (n, errors) = self
+                .storage
+                .insert(self.db(), table, vec![bytes], true)
+                .map_err(|e| Self::storage_err("could not insert", e))?;
+            let Some(err) = errors.first() else {
+                written += n;
+                affected.push(row);
+                continue;
+            };
+            let is_dup = err.get_i32("code").unwrap_or(0) == 11000
+                || err
+                    .get_str("errmsg")
+                    .unwrap_or_default()
+                    .starts_with("E11000");
+            if !is_dup {
+                return Err(Self::write_error(table, def, err));
+            }
+            let empty = Document::new();
+            let reported = err.get_document("keyValue").unwrap_or(&empty).clone();
+            // WHICH row the clause arbitrates on is decided by its TARGET, not
+            // by whichever index the storage layer happened to report first.
+            // Measured on PostgreSQL 14.13: a row colliding on BOTH the PK and
+            // a UNIQUE constraint is upserted by `on conflict (id)` and by
+            // `on conflict (tag)` alike, while a row colliding ONLY on the
+            // non-target constraint is 23505. Comparing the REPORTED index
+            // against the target would raise 23505 for the first case whenever
+            // storage reported the other index -- which is what the first
+            // version of this did, and what the tests caught.
+            let Some(probe) = Self::arbiter_key(def, oc.target.as_ref(), &row, &reported) else {
+                return Err(Self::write_error(table, def, err));
+            };
+            let existing = self
+                .storage
+                .find_matching(self.db(), table, &probe)
+                .map_err(|e| Self::storage_err("could not read", e))?;
+            let Some(bytes) = existing.first() else {
+                // Nothing holds the ARBITER key, so the duplicate was on a
+                // different constraint: PostgreSQL raises it.
+                return Err(Self::write_error(table, def, err));
+            };
+            let secantus_pgplan::ConflictAction::Update { set_exprs, filter } = &oc.action else {
+                continue; // DO NOTHING: skipped, and not counted.
+            };
+            let existing: Document = bson::from_slice(bytes)
+                .map_err(|e| Self::storage_err("could not decode a row", e))?;
+            let env = secantus_pgplan::on_conflict_row(&existing, &row);
+            if let Some(f) = filter {
+                if !secantus_pgplan::on_conflict_filter_passes(f, &env)
+                    .map_err(|e| Self::err(&e))?
+                {
+                    continue;
+                }
+            }
+            let (set, unset) = secantus_pgplan::on_conflict_row_sets(set_exprs, &env)
+                .map_err(|e| Self::err(&e))?;
+            let mut after = existing.clone();
+            for (k, v) in &set {
+                after.insert(k.clone(), v.clone());
+            }
+            for k in &unset {
+                after.remove(k);
+            }
+            self.check_row_constraints(def, &after)?;
+            self.check_foreign_keys(def, std::slice::from_ref(&after))?;
+            let id = existing.get("_id").cloned().unwrap_or(Bson::Null);
+            written += self.update_rows(table, &bson::doc! {"_id": id}, &set, &unset)?;
+            affected.push(after);
+        }
+        Ok((written, affected))
+    }
+
+    /// The filter identifying the row the clause arbitrates on.
+    ///
+    /// With a target it is the PROPOSED row's values for the target's columns,
+    /// so the lookup asks "does anything already hold this arbiter key?" —
+    /// the question PostgreSQL answers — rather than "which index did storage
+    /// notice first?". Without a target (a bare `ON CONFLICT DO NOTHING`) any
+    /// unique violation counts, so the reported key IS the arbiter.
+    fn arbiter_key(
+        def: &TableDef,
+        target: Option<&secantus_pgplan::ConflictTarget>,
+        proposed: &Document,
+        reported: &Document,
+    ) -> Option<Document> {
+        let Some(target) = target else {
+            return Some(reported.clone());
+        };
+        let columns: Vec<String> = match target {
+            secantus_pgplan::ConflictTarget::Columns(cols) => cols.clone(),
+            secantus_pgplan::ConflictTarget::Constraint(name) => {
+                if *name == format!("{}_pkey", def.name) {
+                    def.columns
+                        .iter()
+                        .filter(|c| c.pk)
+                        .map(|c| c.name.clone())
+                        .collect()
+                } else {
+                    def.unique_constraints
+                        .iter()
+                        .find(|u| &u.name == name)?
+                        .columns
+                        .clone()
+                }
+            }
+        };
+        let mut key = Document::new();
+        for column in &columns {
+            let field = def.field_of(column)?;
+            key.insert(field.clone(), proposed.get(&field).cloned()?);
+        }
+        Some(key)
+    }
+
     /// Back each UNIQUE constraint with a storage unique index.
     ///
     /// A probe-read-before-write cannot uphold a constraint: it cannot see a
@@ -8664,6 +8796,8 @@ impl PgHandler {
                             source: None,
                             targets,
                             explicit_columns: false,
+                            // `CREATE TABLE AS` has no ON CONFLICT clause.
+                            on_conflict: None,
                         }),
                         max_rows,
                     )?;
@@ -8711,20 +8845,37 @@ impl PgHandler {
                 }
                 self.check_foreign_keys(&def, &ins.rows)?;
                 let n = ins.rows.len();
-                let docs = ins
-                    .rows
-                    .iter()
-                    .map(bson::to_vec)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| Self::storage_err("could not encode a row", e))?;
-                let (written, errors) = self
-                    .storage
-                    .insert(self.db(), &ins.table, docs, true)
-                    .map_err(|e| Self::storage_err("could not insert", e))?;
-                if let Some(first) = errors.first() {
-                    return Err(Self::write_error(&ins.table, &def, first));
-                }
-                debug_assert_eq!(written, n);
+                // `ON CONFLICT` writes row by row so the STORAGE LAYER stays
+                // the arbiter of whether a key already exists. A
+                // probe-read-before-write cannot decide that: it cannot see a
+                // key another transaction committed after this snapshot, nor
+                // one a concurrent writer is inserting now -- the same reason
+                // UNIQUE is backed by a storage index rather than a pre-check.
+                // So the insert is ATTEMPTED, and the duplicate it reports is
+                // what the clause acts on.
+                let (written, ins_rows) = if let Some(oc) = ins.on_conflict.take() {
+                    self.insert_on_conflict(&ins.table, &def, ins.rows, &oc)?
+                } else {
+                    let docs = ins
+                        .rows
+                        .iter()
+                        .map(bson::to_vec)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| Self::storage_err("could not encode a row", e))?;
+                    let (written, errors) = self
+                        .storage
+                        .insert(self.db(), &ins.table, docs, true)
+                        .map_err(|e| Self::storage_err("could not insert", e))?;
+                    if let Some(first) = errors.first() {
+                        return Err(Self::write_error(&ins.table, &def, first));
+                    }
+                    debug_assert_eq!(written, n);
+                    (written, ins.rows)
+                };
+                let ins = secantus_pgplan::Insert {
+                    rows: ins_rows,
+                    ..ins
+                };
                 match ins.returning {
                     None => Ok(vec![Response::Execution(
                         Tag::new("INSERT").with_oid(0).with_rows(written),

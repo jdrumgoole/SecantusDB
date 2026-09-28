@@ -6582,12 +6582,23 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       half-implemented feature that silently diverges" forbids, and it is the
       same shape as the `PARTITION BY` entry in §3:
 
-      * `ON CONFLICT DO NOTHING` / `DO UPDATE` — the conflict clause is dropped,
-        so `insert … on conflict do nothing` raises `23505` where PostgreSQL
-        inserts nothing and succeeds, and `DO UPDATE` never upserts.
+      * ~~`ON CONFLICT DO NOTHING` / `DO UPDATE`~~ — **IMPLEMENTED 2026-09-28.**
+        `DO NOTHING` and `DO UPDATE SET ... WHERE`, with `excluded`, a column /
+        `ON CONSTRAINT` / bare arbiter, `RETURNING`, and PostgreSQL's row
+        counts. 14/14 then 15/16 against PostgreSQL 14.13 (`oc_probe`), the one
+        remaining difference being a deliberate refusal — see the entry below.
       * `GROUPING SETS` / `ROLLUP` — the grouping clause is dropped, so
         `group by grouping sets ((a),())` answers the misleading `42803 column
         "a" must appear in the GROUP BY clause`, blaming the user's query.
+
+      **Still open from the ON CONFLICT work: a PARTIAL-INDEX arbiter.**
+      `ON CONFLICT (a) WHERE <pred>` is refused `0A000`. PostgreSQL infers the
+      partial index whose predicate the clause implies; this server has no
+      partial indexes to infer, and widening it to the unconditional index
+      would absorb a conflict the user's predicate excludes — a silent wrong
+      answer of exactly the kind this change removed. Refusing is the choice
+      CLAUDE.md's wire-fidelity rule asks for; implementing it needs partial
+      indexes first.
 
       **What DOES work** (so nobody re-derives it): single- and multi-table CRUD,
       inner and LEFT JOIN, `WHERE` predicates, `BETWEEN`, `IN` over a list,

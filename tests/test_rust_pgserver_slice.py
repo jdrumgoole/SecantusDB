@@ -10331,3 +10331,185 @@ def test_a_regclass_list_selects_the_same_rows_as_or(home: Path, predicate: str)
             "WHERE conrelid = 'ch'::regclass OR conrelid = 'par'::regclass"
         )
         assert listed == cur.fetchone()[0] == 7
+
+
+# --------------------------------------------------------------------------- #
+# `INSERT ... ON CONFLICT`.
+#
+# The clause used to be PARSED AND DROPPED: `on conflict do nothing` raised
+# 23505 where PostgreSQL succeeds, and `do update` never upserted. That is worse
+# than refusing it -- the client gets a confident wrong answer instead of an
+# honest 0A000 -- and it is the failure CLAUDE.md's wire-fidelity rule names.
+#
+# Every expectation below was measured against PostgreSQL 14.13, not derived
+# from the Python server, which has its own implementation of this clause.
+# --------------------------------------------------------------------------- #
+
+
+def _oc_table(conn) -> None:
+    cur = conn.cursor()
+    cur.execute("create table t (id int primary key, tag text unique, v int)")
+    cur.execute("insert into t values (1, 'a', 10), (2, 'b', 20)")
+
+
+def test_on_conflict_do_nothing_absorbs_a_conflict(home: Path) -> None:
+    """The headline: no error, no write, and the row count is 0."""
+    with _Server(home) as server, server.connect() as conn:
+        _oc_table(conn)
+        cur = conn.cursor()
+        cur.execute("insert into t values (1, 'z', 99) on conflict do nothing")
+        assert cur.rowcount == 0
+        cur.execute("select id, tag, v from t order by id")
+        assert cur.fetchall() == [(1, "a", 10), (2, "b", 20)]
+
+
+def test_on_conflict_do_nothing_still_inserts_a_fresh_row(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        _oc_table(conn)
+        cur = conn.cursor()
+        cur.execute("insert into t values (3, 'c', 30) on conflict do nothing")
+        assert cur.rowcount == 1
+        cur.execute("select count(*) from t")
+        assert cur.fetchone()[0] == 3
+
+
+def test_on_conflict_do_update_upserts_from_excluded(home: Path) -> None:
+    """`excluded.v` must read the PROPOSED row, not the existing one.
+
+    Both resolve to the bare name `v` through the planner's column resolver,
+    which takes the LAST name of a qualified reference -- so without the
+    rename to `EXCLUDED_PREFIX` this assignment reads the row it is updating
+    and the statement is a silent no-op that still reports a row.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        _oc_table(conn)
+        cur = conn.cursor()
+        cur.execute(
+            "insert into t values (1, 'a', 99) on conflict (id) do update set v = excluded.v"
+        )
+        assert cur.rowcount == 1
+        cur.execute("select v from t where id = 1")
+        assert cur.fetchone()[0] == 99
+
+
+def test_on_conflict_do_update_reads_both_rows(home: Path) -> None:
+    """`t.v * 100 + excluded.v` — the existing row AND the proposed one."""
+    with _Server(home) as server, server.connect() as conn:
+        _oc_table(conn)
+        cur = conn.cursor()
+        cur.execute(
+            "insert into t values (1, 'a', 7) on conflict (id) "
+            "do update set v = t.v * 100 + excluded.v"
+        )
+        cur.execute("select v from t where id = 1")
+        assert cur.fetchone()[0] == 1007
+
+
+def test_on_conflict_do_update_where_gates_the_write(home: Path) -> None:
+    """A false WHERE writes nothing and counts 0, like an UPDATE matching none."""
+    with _Server(home) as server, server.connect() as conn:
+        _oc_table(conn)
+        cur = conn.cursor()
+        cur.execute(
+            "insert into t values (1, 'a', 99) on conflict (id) "
+            "do update set v = excluded.v where t.v < 0"
+        )
+        assert cur.rowcount == 0
+        cur.execute("select v from t where id = 1")
+        assert cur.fetchone()[0] == 10
+
+
+def test_on_conflict_returning_projects_only_affected_rows(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        _oc_table(conn)
+        cur = conn.cursor()
+        cur.execute(
+            "insert into t values (1, 'a', 42) on conflict (id) "
+            "do update set v = excluded.v returning id, v"
+        )
+        assert cur.fetchall() == [(1, 42)]
+        # A skipped DO NOTHING returns NO row, not a null one.
+        cur.execute("insert into t values (1, 'a', 1) on conflict do nothing returning id, v")
+        assert cur.fetchall() == []
+
+
+def test_on_conflict_arbitrates_only_on_its_target(home: Path) -> None:
+    """A conflict on a DIFFERENT constraint than the target is still 23505.
+
+    `on conflict (tag)` does not absorb a PRIMARY KEY collision — measured on
+    PostgreSQL 14.13, and the reason the executor compares the index the
+    storage layer reports against the clause's target.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        _oc_table(conn)
+        cur = conn.cursor()
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            cur.execute("insert into t values (1, 'zz', 9) on conflict (tag) do nothing")
+        conn.rollback()
+        # ... while a bare DO NOTHING takes either constraint.
+        cur.execute("insert into t values (1, 'zz', 9) on conflict do nothing")
+        assert cur.rowcount == 0
+
+
+def test_on_conflict_on_constraint_names_the_pk(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        _oc_table(conn)
+        cur = conn.cursor()
+        cur.execute("insert into t values (1, 'z', 9) on conflict on constraint t_pkey do nothing")
+        assert cur.rowcount == 0
+
+
+def test_on_conflict_unique_constraint_not_just_the_pk(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        _oc_table(conn)
+        cur = conn.cursor()
+        cur.execute(
+            "insert into t values (3, 'a', 30) on conflict (tag) do update set v = excluded.v"
+        )
+        cur.execute("select id, v from t where tag = 'a'")
+        assert cur.fetchall() == [(1, 30)]
+
+
+def test_on_conflict_target_matching_nothing_is_a_plan_error(home: Path) -> None:
+    """PostgreSQL decides the arbiter BEFORE touching a row.
+
+    A column list matching no unique index is `42P10`, and an unknown
+    constraint NAME is `42704` — two different codes, measured, not assumed.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        _oc_table(conn)
+        cur = conn.cursor()
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute("insert into t values (3, 'c', 3) on conflict (v) do nothing")
+        assert info.value.sqlstate == "42P10"
+        conn.rollback()
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute(
+                "insert into t values (3, 'c', 3) on conflict on constraint nope do nothing"
+            )
+        assert info.value.sqlstate == "42704"
+
+
+def test_on_conflict_do_update_still_checks_constraints(home: Path) -> None:
+    """The upsert path is not a hole in CHECK enforcement."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("create table c (id int primary key, n int check (n < 100))")
+        cur.execute("insert into c values (1, 1)")
+        with pytest.raises(psycopg.errors.CheckViolation):
+            cur.execute("insert into c values (1, 1) on conflict (id) do update set n = 500")
+
+
+def test_on_conflict_partial_index_arbiter_is_refused(home: Path) -> None:
+    """A WHERE on the TARGET needs partial-index inference this server has not.
+
+    Refused loudly rather than widened to the unconditional index, which would
+    absorb a conflict the user's predicate excludes — the silent-divergence
+    failure this whole change exists to remove.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        _oc_table(conn)
+        cur = conn.cursor()
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute("insert into t values (1, 'z', 9) on conflict (id) where id > 0 do nothing")
+        assert info.value.sqlstate == "0A000"
