@@ -226,6 +226,10 @@ _ERROR_CODE_NAMES: dict[int, str] = {
     7: "HostNotFound",
     24: "LockTimeout",
     89: "NetworkTimeout",
+    # 134 and 262 joined the table on 2026-09-28: #1597's probe did not cover
+    # them, so a failpoint injecting either rendered `Location134` / `Location262`.
+    134: "ReadConcernMajorityNotAvailableYet",
+    262: "ExceededTimeLimit",
     91: "ShutdownInProgress",
     112: "WriteConflict",
     189: "PrimarySteppedDown",
@@ -409,12 +413,24 @@ def _unsatisfiable_wc_error(doc: Mapping[str, Any]) -> dict[str, Any] | None:
     SecantusDB advertises as a single-node replica set (`setName:
     "secantus"`, one member). Real mongod with the same topology
     executes write commands normally but tacks a ``writeConcernError``
-    with code 100 / ``CannotSatisfyWriteConcern`` onto the reply when
+    with code 100 / ``UnsatisfiableWriteConcern`` onto the reply when
     ``w`` is an integer above the member count. Drivers see the wce and
     raise ``OperationFailure`` (mongo-ruby-driver's
     ``Mongo::Collection#create ... applies the write concern`` spec
     relies on exactly this). Returns ``None`` when ``w`` is absent,
     ``"majority"``, or ``<= 1``.
+
+    Both the name and the message were wrong until 2026-09-28, when a
+    ``w: 5`` write was actually run against a single-node replica-set
+    mongod 8.2.11 instead of being reasoned about. It answers
+    ``UnsatisfiableWriteConcern`` — not ``CannotSatisfyWriteConcern``,
+    which it uses in no context — with the bare message below rather
+    than one naming the requested ``w``. ``tests/test_crud.py`` asserted
+    the old name, so the test was pinning our bug rather than mongod.
+
+    Still divergent, filed in ``tasks/backlog.md``: mongod also carries
+    an ``errInfo.writeConcern`` sub-document recording the effective
+    write concern and its ``provenance``; we send none.
     """
     wc = doc.get("writeConcern")
     if not isinstance(wc, Mapping):
@@ -428,10 +444,8 @@ def _unsatisfiable_wc_error(doc: Mapping[str, Any]) -> dict[str, Any] | None:
     if isinstance(w, int) and w > 1:
         return {
             "code": 100,
-            "codeName": "CannotSatisfyWriteConcern",
-            "errmsg": (
-                f"Not enough data-bearing nodes; requested w={w} but only 1 member is configured"
-            ),
+            "codeName": "UnsatisfiableWriteConcern",
+            "errmsg": "Not enough data-bearing nodes",
         }
     return None
 
@@ -9583,8 +9597,25 @@ def _retry_identity(doc: Mapping[str, Any]) -> bytes:
 #: for it. The two arrived together as driver-gauge failures and it was tempting
 #: to add both -- the probe showed they want opposite treatment, and adding both
 #: would have turned one test green and the other red.
+#: Codes that earn ``TransientTransactionError`` when a statement inside a
+#: transaction fails.
+#:
+#: **Measured against mongod, not inferred.** Re-probed 2026-09-28 by injecting
+#: each code into a statement carrying ``autocommit: false`` on a single-node
+#: replica-set mongod 8.2.11, over a raw OP_MSG socket — a driver in the path is
+#: not safe here, because pymongo retries ``commitTransaction`` itself and turns
+#: the NotPrimary family into a client-side exception whose reply is never read.
+#:
+#: That run added 134 and 262, which BOTH servers were missing together: the
+#: Rust port cited this set as its authority, so the parity suite was perfectly
+#: happy with two engines being wrong the same way.
+#:
+#: Absent on purpose, because mongod gives them no labels there: 50
+#: ``MaxTimeMSExpired``, 100 ``UnsatisfiableWriteConcern``, 11601 ``Interrupted``
+#: and 11000 duplicate key (which aborts the transaction, but retrying it would
+#: not help).
 _TRANSIENT_TXN_CODES = frozenset(
-    {112, 246, 251, 24, 6, 7, 89, 91, 189, 267, 9001, 10107, 11600, 11602, 13435, 13436}
+    {6, 7, 24, 89, 91, 112, 134, 189, 246, 251, 262, 267, 9001, 10107, 11600, 11602, 13435, 13436}
 )
 
 

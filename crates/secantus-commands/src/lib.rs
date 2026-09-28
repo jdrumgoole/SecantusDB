@@ -523,9 +523,15 @@ pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
 /// Attach a `writeConcernError` when the command carried an integer `w > 1`.
 /// SecantusDB advertises as a single-node `secantus` replica set, so a write
 /// concern wider than one node can never be satisfied — mongod returns the write
-/// result *plus* a `CannotSatisfyWriteConcern` (100) writeConcernError (the write
-/// still happened). Only attaches to a successful reply that carried a write
-/// concern (reads don't send one), mirroring `commands.py`.
+/// result *plus* an `UnsatisfiableWriteConcern` (100) writeConcernError (the
+/// write still happened). Only attaches to a successful reply that carried a
+/// write concern (reads don't send one).
+///
+/// The name was `CannotSatisfyWriteConcern` on both servers until 2026-09-28,
+/// when a `w: 5` write against a single-node replica-set mongod 8.2.11 was
+/// actually run: it answers `UnsatisfiableWriteConcern`, and so does a
+/// `failCommand` injecting 100 at the top level. Neither context uses the old
+/// name.
 fn attach_write_concern_error(doc: &Document, reply: &mut Document) {
     if reply.get_f64("ok").unwrap_or(0.0) != 1.0 || reply.contains_key("writeConcernError") {
         return;
@@ -542,7 +548,7 @@ fn attach_write_concern_error(doc: &Document, reply: &mut Document) {
     if unsatisfiable {
         let mut wce = Document::new();
         wce.insert("code", 100i32);
-        wce.insert("codeName", "CannotSatisfyWriteConcern");
+        wce.insert("codeName", "UnsatisfiableWriteConcern");
         wce.insert("errmsg", "Not enough data-bearing nodes");
         reply.insert("writeConcernError", wce);
     }
@@ -805,12 +811,55 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
                     // only the labels it was given — which is why the spec has
                     // `failGetMoreAfterCursorCheckout` + code 6 resume while
                     // `failCommand` + code 6 does not.
-                    let mut labels = m.error_labels.clone();
-                    if m.server_injected
+                    // A supplied `errorLabels` — including an explicit `[]` — is
+                    // authoritative: mongod answers with exactly that list and
+                    // adds nothing of its own (measured 2026-09-28). Only when
+                    // the failpoint said nothing about labels does the server
+                    // compute them, which is what the two branches below do.
+                    let supplied = m.error_labels.is_some();
+                    let mut labels = m.error_labels.clone().unwrap_or_default();
+                    if !supplied
+                        && m.server_injected
                         && failpoints::is_resumable_change_stream_code(code)
                         && !labels.iter().any(|l| l == "ResumableChangeStreamError")
                     {
                         labels.push("ResumableChangeStreamError".to_string());
+                    }
+                    // A driver decides whether to replay a whole transaction, or
+                    // just retry the commit, by reading the label off the error.
+                    // `finish_txn_statement` has labelled transient in-transaction
+                    // failures all along, but this short-circuit returns before
+                    // the handler runs and before the transaction is resolved, so
+                    // it never reached that code. Every test in the drivers'
+                    // transaction error-label suite injects its error with
+                    // `failCommand`, so every one of them took this path and saw
+                    // `errorLabels: []` — a retry loop, exercised exactly as the
+                    // specification intends, silently did not engage.
+                    //
+                    // `autocommit: false` is the signal mongod itself uses (drivers
+                    // send it on every statement of a transaction, commit and abort
+                    // included), so the check works here without moving the
+                    // failpoint below the transaction resolution — which would
+                    // reorder failpoint-versus-transaction error precedence, and no
+                    // probe says which mongod prefers.
+                    //
+                    // Which label depends on WHICH COMMAND failed, not only on the
+                    // code: ending the transaction splits the set in two. See
+                    // `failpoints::COMMIT_RETRYABLE_WRITE_CODES` for the
+                    // measurement.
+                    if !supplied
+                        && doc.get("autocommit") == Some(&Bson::Boolean(false))
+                        && is_transient_txn_code(code)
+                    {
+                        let ending = name == "commitTransaction" || name == "abortTransaction";
+                        let label = if ending && failpoints::is_commit_retryable_write_code(code) {
+                            transactions::RETRYABLE_WRITE_LABEL
+                        } else {
+                            transactions::TRANSIENT_LABEL
+                        };
+                        if !labels.iter().any(|l| l == label) {
+                            labels.push(label.to_string());
+                        }
                     }
                     if !labels.is_empty() {
                         reply.insert(
@@ -856,14 +905,12 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
                         && !reply.contains_key("writeConcernError")
                     {
                         reply.insert("writeConcernError", Bson::Document(wce.clone()));
-                        if !m.error_labels.is_empty() && !reply.contains_key("errorLabels") {
+                        let supplied = m.error_labels.as_deref().unwrap_or(&[]);
+                        if !supplied.is_empty() && !reply.contains_key("errorLabels") {
                             reply.insert(
                                 "errorLabels",
                                 Bson::Array(
-                                    m.error_labels
-                                        .iter()
-                                        .map(|l| Bson::String(l.clone()))
-                                        .collect(),
+                                    supplied.iter().map(|l| Bson::String(l.clone())).collect(),
                                 ),
                             );
                         }
@@ -1155,12 +1202,41 @@ fn txn_blocked_agg_stage(stage: &str) -> bool {
 }
 
 /// Error codes that earn the `TransientTransactionError` label when a statement
-/// inside a transaction fails (`commands.py::_TRANSIENT_TXN_CODES`). Notably NOT
-/// 11000 duplicate key — it aborts the transaction but retrying wouldn't help.
+/// inside a transaction fails.
+///
+/// **Measured against mongod, not against the Python server.** The previous
+/// version of this comment cited `commands.py::_TRANSIENT_TXN_CODES` as its
+/// authority, and that is exactly how both servers ended up missing 134 and 262
+/// together: a parity check is satisfied by two engines being wrong in the same
+/// way. The set below is every code that came back carrying the label when
+/// injected into a statement with `autocommit: false` on a single-node replica
+/// set mongod 8.2.11 (2026-09-28, raw OP_MSG socket).
+///
+/// Deliberately absent, because mongod gives them NO labels there: 50
+/// `MaxTimeMSExpired`, 100 `UnsatisfiableWriteConcern`, 11601 `Interrupted`, and
+/// 11000 duplicate key — which aborts the transaction, but retrying would not
+/// help. 11601 is the one worth remembering: its gauge failure looked like a
+/// missing label and was a missing code NAME.
 fn is_transient_txn_code(code: i32) -> bool {
     matches!(
         code,
-        112 | 246 | 251 | 24 | 6 | 7 | 89 | 91 | 189 | 9001 | 10107 | 11600 | 11602 | 13435 | 13436
+        6 | 7
+            | 24
+            | 89
+            | 91
+            | 112
+            | 134
+            | 189
+            | 246
+            | 251
+            | 262
+            | 267
+            | 9001
+            | 10107
+            | 11600
+            | 11602
+            | 13435
+            | 13436
     )
 }
 
@@ -2111,7 +2187,7 @@ mod tests {
         assert_eq!(wce.get_i32("code").unwrap(), 100);
         assert_eq!(
             wce.get_str("codeName").unwrap(),
-            "CannotSatisfyWriteConcern"
+            "UnsatisfiableWriteConcern"
         );
     }
 

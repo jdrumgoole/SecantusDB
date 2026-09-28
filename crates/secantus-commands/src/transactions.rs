@@ -46,6 +46,12 @@ pub const DEFAULT_LIFETIME_SECONDS: f64 = 60.0;
 
 pub const TRANSIENT_LABEL: &str = "TransientTransactionError";
 
+/// The label mongod puts on a `commitTransaction` / `abortTransaction` failure
+/// whose code is about reaching the node rather than about the transaction. It
+/// tells a driver to retry the COMMIT, where `TRANSIENT_LABEL` tells it to
+/// replay the whole transaction — see `failpoints::COMMIT_RETRYABLE_WRITE_CODES`.
+pub const RETRYABLE_WRITE_LABEL: &str = "RetryableWriteError";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxnState {
     InProgress,

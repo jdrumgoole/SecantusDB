@@ -3720,7 +3720,7 @@ def test_aggregate_with_unknown_hint(coll) -> None:
 
 def test_unsatisfiable_write_concern_attaches_wce(client: MongoClient) -> None:
     # Real mongod with a 1-member replica set executes write commands but
-    # attaches `writeConcernError` (code 100, CannotSatisfyWriteConcern)
+    # attaches `writeConcernError` (code 100, UnsatisfiableWriteConcern)
     # when `w` is an int above member count. mongo-ruby-driver's
     # `Mongo::Collection#create ... applies the write concern` spec relies
     # on this: it raises `OperationFailure` because of the wce. pymongo's
@@ -3736,7 +3736,7 @@ def test_unsatisfiable_write_concern_attaches_wce(client: MongoClient) -> None:
     wce = reply.get("writeConcernError")
     assert wce is not None, f"expected writeConcernError, got {reply!r}"
     assert wce["code"] == 100
-    assert wce["codeName"] == "CannotSatisfyWriteConcern"
+    assert wce["codeName"] == "UnsatisfiableWriteConcern"
     assert "things" in db.list_collection_names()
 
     # `drop` with w:2 — same shape: op runs, wce attached.
