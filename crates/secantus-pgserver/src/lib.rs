@@ -4090,7 +4090,10 @@ impl PgHandler {
                             u.name.clone(),
                             // An `EXCLUDE (col WITH =)` is stored as a unique
                             // constraint carrying `exclusion`; PostgreSQL
-                            // types those rows 'x'.
+                            // types those rows 'x' (measured 14.24). Only
+                            // reachable via a hand-off today -- this server
+                            // refuses EXCLUDE at DDL, so the flag can only
+                            // have been written by the PYTHON server.
                             if u.exclusion { "x" } else { "u" },
                             cols,
                             u.deferrable,

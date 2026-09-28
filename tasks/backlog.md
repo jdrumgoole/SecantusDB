@@ -726,6 +726,16 @@ remain open:
       `pg_get_constraintdef()` is not implemented (the Python server has it —
       `src/secantus/sql/virtual.py`'s `constraint_def_for_oid`).
 
+      **`EXCLUDE` is refused at DDL (measured 2026-09-28).** `create table ex
+      (id int primary key, room int, constraint no_dup exclude (room with =))`
+      is `0A000 Constraint is not supported yet`; PostgreSQL 14.24 accepts it
+      and reports the row as `contype = 'x'`. `pg_constraint` here DOES emit
+      `'x'` for one, because the catalog's `UniqueConstraint.exclusion` flag is
+      written by the PYTHON server — so the only way to reach that branch today
+      is a hand-off: create the table with the Python server, then read it with
+      the Rust one. Worth knowing before "it emits 'x'" is read as "the Rust
+      server supports EXCLUDE".
+
 - [x] **RESOLVED (found and fixed 2026-09-28): a regclass/regtype operand
       inside a LIST matched NOTHING, silently.** A `regclass` value is a
       one-field document carrying its oid (`{__regclass_oid: N}`); the stored
