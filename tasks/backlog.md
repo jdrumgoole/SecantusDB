@@ -691,11 +691,62 @@ remain open:
   - `float4` / `float8` columns keep MQL's NaN placement (below every
     number) in WHERE; PG puts NaN above infinity for floats too. Only
     `numeric` was moved in this slice.
-- [ ] **OPEN — RUST pgserver: no `pg_constraint` virtual table, and multi-column
-      FOREIGN KEYs / `ON DELETE SET DEFAULT` are refused `0A000` (2026-09-09).**
+- [ ] **OPEN — RUST pgserver: multi-column FOREIGN KEYs / `ON DELETE SET
+      DEFAULT` are refused `0A000` (2026-09-09; re-measured 2026-09-28).**
       NOT NULL / CHECK / FOREIGN KEY / UNIQUE all landed (catalog + enforcement;
-      the same catalog document shape the Python server writes). `pg_constraint`
-      queries still answer `42P01`.
+      the same catalog document shape the Python server writes) — re-probed
+      2026-09-28 against PostgreSQL 14.24: CHECK (INSERT, UPDATE, and a named
+      table-level constraint), FOREIGN KEY (INSERT against a missing parent,
+      parent DELETE, and `ON DELETE CASCADE`) and NOT NULL all answer with
+      PostgreSQL's exact SQLSTATE and message, auto-generated constraint names
+      (`c1_n_check`, `f1_pid_fkey`) included. `ON DELETE SET NULL` is accepted
+      too.
+
+      **The multi-column FOREIGN KEY blocker is NOT in the FK path — it is
+      upstream, in the PARENT's key** (measured 2026-09-28). `create table p (a
+      int, b int, primary key (a, b))` is `0A000 a composite PRIMARY KEY is not
+      supported yet`, so the referenced table cannot be created and the FK half
+      is never reached. Scope composite PRIMARY KEY first; a session sizing this
+      from the entry's old wording would have started in the wrong crate.
+
+      **The `pg_constraint` half of this entry was FIXED 2026-09-28** and is
+      why the headline no longer names it. It is now a virtual table carrying
+      PostgreSQL 14.24's full 25-column shape, projected from the catalog the
+      server already kept; `conname` / `contype` / `conkey` / `confkey` / the
+      `conf*type` action codes / the flag columns / `connamespace` all match
+      the oracle exactly, as do the RowDescription oids — which needed two
+      types the server had no vocabulary for, the internal `"char"` (18) and
+      `pg_node_tree` (194). Deliberately NOT reproduced, both documented in
+      the code: `conbin` is NULL (we keep a CHECK predicate as SQL text, not
+      as PostgreSQL's serialised parse tree) and `conindid` is 0 (there are no
+      `pg_index` rows for it to point at). Constraint `oid`s are synthetic.
+
+      Still absent, and the reason a full reflection round-trip does not work
+      yet: `pg_index` / `pg_class` / `pg_namespace` have no rows, and
+      `pg_get_constraintdef()` is not implemented (the Python server has it —
+      `src/secantus/sql/virtual.py`'s `constraint_def_for_oid`).
+
+- [x] **RESOLVED (found and fixed 2026-09-28): a regclass/regtype operand
+      inside a LIST matched NOTHING, silently.** A `regclass` value is a
+      one-field document carrying its oid (`{__regclass_oid: N}`); the stored
+      column is a plain number. The scalar path unwrapped it
+      (`secantus-pgplan`'s `lower_scalar`) and the LIST paths did not, so
+      `WHERE conrelid IN ('t'::regclass, 'u'::regclass)` and
+      `= ANY(ARRAY[...])` compared documents against numbers, matched nothing,
+      and returned **zero rows with no error** — while the same predicate
+      written with `OR` returned the right ones.
+
+      **This is a wrong-rows bug, and it was aimed at the commonest shape
+      there is**: catalog reflection in SQLAlchemy and pgjdbc is written as
+      `WHERE <oid col> IN (...)` / `= ANY(...)`, so the server read as one
+      with no constraints and no columns rather than as one with a bug. It was
+      found only because a `pg_constraint` probe checked oid distinctness
+      across two tables and got 0; a control query proved `pg_attribute` was
+      hit identically, so it was never specific to the new table.
+      Fixed by `reg_oid_operand`, shared by `lower_in` and the ANY path.
+      Pinned by `tests/test_rust_pgserver_slice.py::
+      test_a_regclass_list_selects_the_same_rows_as_or` (both spellings) and
+      by three queries in `tests/test_rust_pgserver_differential.py`.
 
       **The column-level `UNIQUE` half of this entry was FIXED 2026-09-18.** It
       had been accepted and silently not enforced — a second equal value
@@ -6670,13 +6721,31 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   PostgreSQL never reuses a sequence value (`nextval` is non-transactional).
   The sequence doc in `__sql_sequences__` is written inside the statement's
   transaction, so an abort restores it.
-- [ ] **OPEN — Rust PG server: NOT NULL is not enforced — on a serial column
-  OR an explicit `int not null` (re-measured 2026-09-09).** `create table t
-  (id int not null); insert into t (id) values (null)` stores a NULL id;
-  PostgreSQL 16 is `23502 null value in column "id" of relation "t" violates
-  not-null constraint`. Same for `serial` (which implies `NOT NULL`). Part of
-  the "NOT NULL / CHECK / FOREIGN KEY constraints are not enforced" entry in
-  the psycopg gauge section; the catalog does not record the constraint.
+- [x] **RESOLVED (re-measured 2026-09-28): Rust PG server NOT NULL IS
+  enforced.** The entry this replaces said `create table t (id int not null);
+  insert into t (id) values (null)` "stores a NULL id" and that "the catalog
+  does not record the constraint". Neither reproduces. Probed against
+  PostgreSQL **14.24** (the build on this box — the entry cited PostgreSQL 16,
+  which is not installed here), all four shapes answer with PostgreSQL's exact
+  SQLSTATE and message text:
+
+  | shape | both servers |
+  | --- | --- |
+  | `int not null`, explicit `null` | `23502 null value in column "id" of relation "t1" violates not-null constraint` |
+  | `int not null`, column omitted from the INSERT | same |
+  | `serial` (implies NOT NULL) | same |
+  | `update t set id = null` | same |
+
+  A self-check scenario (a plain `int` column accepting `null`) passed on both
+  sides, so the probe was reaching the code rather than failing identically on
+  both — see "Probes lie in specific, repeatable ways" in CLAUDE.md.
+
+  **This entry was superseded the day it was written and nobody noticed for
+  nineteen days.** The `pg_constraint` entry above it already recorded "NOT
+  NULL / CHECK / FOREIGN KEY / UNIQUE all landed (catalog + enforcement)" —
+  the two sat in the same file asserting opposite things, which is exactly the
+  failure the header of this file warns about. Correct a superseded entry;
+  do not file a newer one beside it.
 - [ ] **OPEN — Rust PG server: `timestamp + interval` on a STORED timestamp
   loses sub-millisecond precision (2026-09-09).** A `timestamp` column
   holding `2021-01-01 00:00:00.123456` answers `…00.123` for `ts + interval

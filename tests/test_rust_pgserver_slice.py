@@ -10119,3 +10119,193 @@ def test_aggregates_inside_expressions(home: Path) -> None:
         cur = conn.execute("select count(*) + 1 from t")
         cur.fetchall()
         assert cur.description[0].type_code == 20  # int8, as PostgreSQL types it
+
+
+# --- pg_constraint -----------------------------------------------------------
+#
+# Every expected value below was MEASURED against PostgreSQL 14.24 on
+# 2026-09-28, not recalled: the column set from `pg_attribute`, the rows from
+# the same DDL these tests run. PostgreSQL is the exemplar for this server --
+# never the Python PG server (CLAUDE.md, "Design constraints").
+
+_CONSTRAINT_DDL = (
+    "CREATE TABLE par (id int PRIMARY KEY, tag text UNIQUE)",
+    """CREATE TABLE ch (
+         id int PRIMARY KEY,
+         n int NOT NULL CHECK (n > 0),
+         pid int REFERENCES par(id) ON DELETE CASCADE ON UPDATE RESTRICT,
+         u1 int UNIQUE,
+         CONSTRAINT named_ck CHECK (n < 100)
+       )""",
+)
+
+
+def _seed_constraints(server: _Server) -> psycopg.Connection:
+    conn = server.connect()
+    cur = conn.cursor()
+    for sql in _CONSTRAINT_DDL:
+        cur.execute(sql)
+    return conn
+
+
+def test_pg_constraint_lists_every_kind_but_not_null(home: Path) -> None:
+    """The five rows PostgreSQL 14.24 reports for this table, and only those.
+
+    NOT NULL is the point of the test: PostgreSQL records it as
+    `pg_attribute.attnotnull`, NOT as a `pg_constraint` row, so a table with
+    one NOT NULL column still has exactly five rows here. A sixth would be a
+    divergence we invented.
+    """
+    with _Server(home) as server, _seed_constraints(server) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT conname, contype FROM pg_constraint "
+            "WHERE conrelid = 'ch'::regclass ORDER BY conname"
+        )
+        assert cur.fetchall() == [
+            ("ch_n_check", "c"),
+            ("ch_pid_fkey", "f"),
+            ("ch_pkey", "p"),
+            ("ch_u1_key", "u"),
+            ("named_ck", "c"),
+        ]
+
+
+def test_pg_constraint_keys_are_attnums(home: Path) -> None:
+    """`conkey` / `confkey` are 1-based attnum arrays; `confkey` is NULL off an FK."""
+    with _Server(home) as server, _seed_constraints(server) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT conname, conkey, confkey FROM pg_constraint "
+            "WHERE conrelid = 'ch'::regclass ORDER BY conname"
+        )
+        assert cur.fetchall() == [
+            ("ch_n_check", [2], None),
+            ("ch_pid_fkey", [3], [1]),
+            ("ch_pkey", [1], None),
+            ("ch_u1_key", [4], None),
+            ("named_ck", [2], None),
+        ]
+
+
+def test_pg_constraint_fk_action_codes(home: Path) -> None:
+    """The one-letter action codes, and the blanks every non-FK row carries."""
+    with _Server(home) as server, _seed_constraints(server) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT confupdtype, confdeltype, confmatchtype, confrelid "
+            "FROM pg_constraint WHERE conname = 'ch_pid_fkey'"
+        )
+        upd, delete, match, confrelid = cur.fetchone()
+        # ON UPDATE RESTRICT, ON DELETE CASCADE, MATCH SIMPLE.
+        assert (upd, delete, match) == ("r", "c", "s")
+        cur.execute("SELECT 'par'::regclass::oid")
+        assert confrelid == cur.fetchone()[0], "confrelid is the parent's relation oid"
+
+        cur.execute(
+            "SELECT DISTINCT confupdtype, confdeltype, confmatchtype "
+            "FROM pg_constraint WHERE conrelid = 'ch'::regclass AND contype <> 'f'"
+        )
+        assert cur.fetchall() == [(" ", " ", " ")]
+
+
+def test_pg_constraint_flags_and_namespace(home: Path) -> None:
+    """`connoinherit` is false for a CHECK and true for the rest; `public` is 2200."""
+    with _Server(home) as server, _seed_constraints(server) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT conname, condeferrable, condeferred, convalidated, "
+            "       conislocal, coninhcount, connoinherit, contypid, conparentid "
+            "FROM pg_constraint WHERE conrelid = 'ch'::regclass ORDER BY conname"
+        )
+        assert cur.fetchall() == [
+            ("ch_n_check", False, False, True, True, 0, False, 0, 0),
+            ("ch_pid_fkey", False, False, True, True, 0, True, 0, 0),
+            ("ch_pkey", False, False, True, True, 0, True, 0, 0),
+            ("ch_u1_key", False, False, True, True, 0, True, 0, 0),
+            ("named_ck", False, False, True, True, 0, False, 0, 0),
+        ]
+        cur.execute(
+            "SELECT DISTINCT connamespace FROM pg_constraint WHERE conrelid = 'ch'::regclass"
+        )
+        assert cur.fetchall() == [(2200,)]
+
+
+def test_pg_constraint_oids_are_distinct(home: Path) -> None:
+    """Synthetic, but distinct per constraint -- a client may join on them."""
+    with _Server(home) as server, _seed_constraints(server) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT count(DISTINCT oid), count(*) FROM pg_constraint "
+            "WHERE conrelid IN ('ch'::regclass, 'par'::regclass)"
+        )
+        distinct, total = cur.fetchone()
+        assert total == 7, "5 rows for ch + 2 for par"
+        assert distinct == total
+
+
+def test_pg_constraint_column_wire_types(home: Path) -> None:
+    """The RowDescription oids PostgreSQL 14.24 sends for these columns.
+
+    `contype` is the INTERNAL `"char"` (18), not `bpchar` (1042), and `conbin`
+    is `pg_node_tree` (194) -- both measured. A client reads these oids.
+    """
+    with _Server(home) as server, _seed_constraints(server) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT conname, contype, conkey, conbin FROM pg_constraint WHERE conname = 'named_ck'"
+        )
+        cur.fetchall()
+        assert [(d.name, d.type_code) for d in cur.description] == [
+            ("conname", 19),  # name
+            ("contype", 18),  # "char"
+            ("conkey", 1005),  # int2[]
+            ("conbin", 194),  # pg_node_tree
+        ]
+
+
+def test_pg_constraint_is_listed_in_pg_tables(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT count(*) FROM pg_tables "
+            "WHERE schemaname = 'pg_catalog' AND tablename = 'pg_constraint'"
+        )
+        assert cur.fetchone()[0] == 1
+
+
+def test_pg_constraint_qualified_by_pg_catalog(home: Path) -> None:
+    with _Server(home) as server, _seed_constraints(server) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT count(*) FROM pg_catalog.pg_constraint WHERE conrelid = 'ch'::regclass")
+        assert cur.fetchone()[0] == 5
+
+
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        "conrelid IN ('ch'::regclass, 'par'::regclass)",
+        "conrelid = ANY(ARRAY['ch'::regclass, 'par'::regclass])",
+    ],
+)
+def test_a_regclass_list_selects_the_same_rows_as_or(home: Path, predicate: str) -> None:
+    """A regclass operand in a LIST must compare by oid, as `=` already did.
+
+    Regression test for a silent WRONG-ROWS bug: a regclass value is a
+    one-field document carrying its oid, the stored column is a number, and
+    only the scalar path unwrapped it. `WHERE conrelid IN (...)` therefore
+    compared documents against numbers, matched NOTHING, and returned zero
+    rows with no error -- while the same predicate written with `OR` returned
+    the right ones. That is the shape catalog reflection emits (SQLAlchemy and
+    pgjdbc both use `IN` / `= ANY`), so it looked like a server with no
+    constraints rather than like a bug. Measured 7 on PostgreSQL 14.24.
+    """
+    with _Server(home) as server, _seed_constraints(server) as conn:
+        cur = conn.cursor()
+        cur.execute(f"SELECT count(*) FROM pg_constraint WHERE {predicate}")
+        listed = cur.fetchone()[0]
+        cur.execute(
+            "SELECT count(*) FROM pg_constraint "
+            "WHERE conrelid = 'ch'::regclass OR conrelid = 'par'::regclass"
+        )
+        assert listed == cur.fetchone()[0] == 7

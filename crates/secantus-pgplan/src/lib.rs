@@ -13185,6 +13185,7 @@ fn lower_scalar_array(
     let mut nonnull = Vec::new();
     let mut saw_null = false;
     for el in elems {
+        let el = reg_oid_operand(el);
         if el == Bson::Null {
             saw_null = true;
         } else {
@@ -13238,6 +13239,24 @@ fn lower_scalar_array(
     Ok(doc! { "$and": arms })
 }
 
+/// A `regtype` / `regclass` operand, reduced to the OID a stored column holds.
+///
+/// The scalar comparison path already does this (see `lower_scalar`), because
+/// a regclass VALUE is a one-field document (`{__regclass_oid: N}`) while the
+/// column it is compared against is a plain number. The list paths did not,
+/// so `conrelid IN ('t'::regclass, 'u'::regclass)` compared documents against
+/// numbers, matched nothing, and returned ZERO ROWS with no error -- while the
+/// same predicate written with `OR` returned the right ones. That is the
+/// dominant shape in catalog reflection (SQLAlchemy and pgjdbc both emit
+/// `WHERE <oid col> IN (...)` / `= ANY(...)`), so it read as "this server has
+/// no constraints/columns" rather than as a bug.
+fn reg_oid_operand(v: Bson) -> Bson {
+    match regtype_oid(&v).or_else(|| regclass_oid(&v)) {
+        Some(oid) => Bson::Int64(oid),
+        None => v,
+    }
+}
+
 fn lower_in(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     let negated = in_is_negated(e);
     let field = column_field(e.lexpr.as_deref(), def)?;
@@ -13248,7 +13267,7 @@ fn lower_in(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     let mut values = Vec::new();
     let mut saw_null = false;
     for item in items {
-        let v = const_value(item, params)?;
+        let v = reg_oid_operand(const_value(item, params)?);
         if v == Bson::Null {
             saw_null = true;
         } else {
