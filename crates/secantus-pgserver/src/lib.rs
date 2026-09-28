@@ -4108,13 +4108,19 @@ impl PgHandler {
                         // recovered by matching identifiers in it -- right for
                         // the common cases and never naming a column the table
                         // does not have.
-                        let cols: Vec<i32> = t
+                        let mut hits: Vec<(usize, i32)> = t
                             .columns
                             .iter()
                             .enumerate()
-                            .filter(|(_, c)| Self::expression_mentions(&ck.expression, &c.name))
-                            .map(|(i, _)| i as i32 + 1)
+                            .filter_map(|(i, c)| {
+                                Self::expression_mentions_at(&ck.expression, &c.name)
+                                    .map(|at| (at, i as i32 + 1))
+                            })
                             .collect();
+                        // By first appearance in the predicate, which is the
+                        // order PostgreSQL reports (measured; see the helper).
+                        hits.sort_by_key(|(at, attnum)| (*at, *attnum));
+                        let cols: Vec<i32> = hits.into_iter().map(|(_, attnum)| attnum).collect();
                         push(
                             ck.name.clone(),
                             "c",
@@ -10862,17 +10868,24 @@ impl PgHandler {
         }
     }
 
-    /// Does a CHECK predicate's SQL text reference `column`?
+    /// Where a CHECK predicate's SQL text first references `column`, if it does.
     ///
-    /// Used only to fill `pg_constraint.conkey`, which PostgreSQL derives from
-    /// the constraint's parse tree. We keep the predicate as text, so this
-    /// scans for the identifier on word boundaries -- `n` must not match the
-    /// `n` inside `len` or inside the string literal-ish run `not`. It is a
-    /// heuristic, and it errs toward omitting a column rather than naming one
-    /// the table does not have.
-    fn expression_mentions(expression: &str, column: &str) -> bool {
+    /// Used to fill `pg_constraint.conkey`, which PostgreSQL derives from the
+    /// constraint's parse tree. We keep the predicate as text, so this scans
+    /// for the identifier on word boundaries -- `n` must not match the `n`
+    /// inside `len`. It is a heuristic, and it errs toward omitting a column
+    /// rather than naming one the table does not have.
+    ///
+    /// **The POSITION is what orders `conkey`, and it is not the column order.**
+    /// Measured on 14.24: a table `(a, b, c)` with `check (c > a)` reports
+    /// `conkey = {3,1}`, so PostgreSQL lists the columns as the EXPRESSION
+    /// mentions them, not as the table declares them. Returning a bool and
+    /// filtering the column list in declaration order gave `{1,3}` --
+    /// backwards, and the FK columns pair with `confkey` positionally, so
+    /// order is load-bearing in this column generally.
+    fn expression_mentions_at(expression: &str, column: &str) -> Option<usize> {
         if column.is_empty() {
-            return false;
+            return None;
         }
         let is_word = |c: char| c.is_alphanumeric() || c == '_';
         let hay = expression.to_ascii_lowercase();
@@ -10885,11 +10898,11 @@ impl PgHandler {
             let before_ok = start == 0 || !is_word(hay[..start].chars().next_back().unwrap_or(' '));
             let after_ok = end >= bytes.len() || !is_word(hay[end..].chars().next().unwrap_or(' '));
             if before_ok && after_ok {
-                return true;
+                return Some(start);
             }
             from = end;
         }
-        false
+        None
     }
 
     /// The schema a table's error diagnostics name: a TEMP table lives in the

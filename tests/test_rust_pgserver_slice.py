@@ -10188,6 +10188,28 @@ def test_pg_constraint_keys_are_attnums(home: Path) -> None:
         ]
 
 
+def test_pg_constraint_multi_column_check_conkey_is_in_expression_order(
+    home: Path,
+) -> None:
+    """`conkey` follows the EXPRESSION, not the column declaration order.
+
+    Measured on PostgreSQL 14.24: over a table `(a, b, c)`, `check (c > a)`
+    reports `conkey = {3,1}`. Listing the table's columns in declaration order
+    and filtering gave `{1,3}` -- backwards. Order is load-bearing in this
+    column generally, since an FK's `conkey` pairs with `confkey` positionally.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "CREATE TABLE mc (a int, b int, c int, CHECK (a < b), CONSTRAINT rev CHECK (c > a))"
+        )
+        cur.execute(
+            "SELECT conname, conkey FROM pg_constraint "
+            "WHERE conrelid = 'mc'::regclass AND contype = 'c' ORDER BY conname"
+        )
+        assert cur.fetchall() == [("mc_check", [1, 2]), ("rev", [3, 1])]
+
+
 def test_pg_constraint_fk_action_codes(home: Path) -> None:
     """The one-letter action codes, and the blanks every non-FK row carries."""
     with _Server(home) as server, _seed_constraints(server) as conn:
