@@ -3269,6 +3269,15 @@ These are explicit non-goals. Don't add them without a reason.
       Step 1 of `tasks/driver-conformance-followups-plan.md` points here rather
       than describing it again.
 
+      **A FOURTH source of drift as of 2026-09-28, in the UNDERSTATING
+      direction: the psycopg gauge.** Five feature PRs landed against the Rust
+      PostgreSQL server that day — `ON CONFLICT` (#1608), `GROUPING SETS` /
+      `ROLLUP` / `CUBE` (#1610), `LIKE` / `ILIKE` / regex / `CASE` (#1614), and
+      `ORDER BY <expr>` / non-lowering `WHERE` (#1615) — all AFTER the
+      5,545 / 5,729 figure was measured on 2026-09-18. That number can only
+      have gone up, so quoting it now understates the server. Re-run before
+      citing it; do not adjust it by reasoning.
+
       Three artifacts, three different staleness:
 
       * **Committed `docs/validation-report*.md`** — a full `validate-all`
@@ -6718,7 +6727,7 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       | ~~regex `~` / `~*` / `!~` / `!~*`~~ | **DONE 2026-09-28** | |
       | ~~`CASE`~~ | **DONE 2026-09-28** | both forms; still refused inside a bare `WHERE` |
       | window functions | `row_number() over (order by a)` | `function row_number()` |
-      | `ORDER BY` over an expression | `order by a*-1` | `ORDER BY over an expression` |
+      | ~~`ORDER BY` over an expression~~ | **DONE 2026-09-28** | |
       | `SELECT *` / `t.*` over a JOIN or comma FROM | `select * from t1, t2` | `this subquery target` |
       | array subscripting | `(array[1,2])[1]` | `this field selection` |
       | `CREATE INDEX` | | `IndexStmt` |
