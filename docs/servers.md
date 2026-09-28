@@ -156,11 +156,6 @@ server is measured against.
 The Rust server passes 99.5% of pymongo's suite. The remaining *feature* differences (full three-way matrix in the
 [Feature comparison](feature-comparison.md)) are:
 
-- **`mapReduce`** — the Python server ships a minimal `mapReduce`
-  (`{out: {inline: 1}}` only); the Rust server answers `CommandNotFound`.
-  Both servers now answer `top` with the mongod-shaped reply (counters are
-  always zero — there is no per-namespace instrumentation), so `mongotop`
-  runs against either.
 - **Point-in-time restore over the wire** — `secantusAdmin.restoreToTimestamp`
   is Python-server-only; the Rust server does the same restore via the
   `secantusd-rs restore` CLI subcommand.

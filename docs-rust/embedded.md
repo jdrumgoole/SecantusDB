@@ -5,9 +5,8 @@ on a GIL-released native thread, and Python holds only a thin lifecycle
 handle. Your test spawns a real Rust server on a real TCP port in a couple
 of lines, with no subprocess to manage.
 
-The handle ships in the storage-engine build of the wheel
-(`SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON`, see
-[Installation](installation.md)):
+The handle ships in every published `SecantusDB` wheel (`pip install
+SecantusDB`; see [Installation](installation.md)):
 
 ```python
 import _secantus_server

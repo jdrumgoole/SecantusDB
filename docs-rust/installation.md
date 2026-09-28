@@ -51,14 +51,17 @@ and macOS archives; it is otherwise identical.
 
 ## Bundled in the Python wheel
 
-A storage-engine build of the `SecantusDB` wheel installs `secantusd-rs` on
-`PATH` next to the pure-Python `secantusd-py`, plus the embedded
+Every published `SecantusDB` wheel installs `secantusd-rs` on `PATH` next to
+the pure-Python `secantusd-py`, plus the embedded
 [`RustServer` handle](embedded.md):
 
 ```bash
-SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON uv sync --extra dev
+pip install SecantusDB
 secantusd-rs --port 27017 --storage-path ./secantus-data
 ```
+
+From a source checkout, the wheel build needs the storage-engine flag
+(`SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON uv sync --extra dev`).
 
 ## Build from source
 
