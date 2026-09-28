@@ -5878,6 +5878,16 @@ impl PgHandler {
         let mut out = match stmt {
             // A serial column's INSERT moves its sequence too.
             Statement::Insert(i) => vec![i.table.clone(), SEQUENCE_COLLECTION.to_string()],
+            // An ALTER rewrites the ROWS as well as the catalog, so a
+            // savepoint has to capture both -- a `ROLLBACK TO` that put the
+            // catalog back but left the rewritten rows would describe the
+            // table with a shape its own rows do not have.
+            Statement::AlterTable { table, .. } | Statement::RenameColumn { table, .. } => {
+                vec![table.clone(), CATALOG_COLLECTION.to_string()]
+            }
+            Statement::RenameTable { table, to, .. } => {
+                vec![table.clone(), to.clone(), CATALOG_COLLECTION.to_string()]
+            }
             Statement::Update(u) => vec![u.table.clone()],
             Statement::Delete(d) => vec![d.table.clone()],
             // CASCADE can widen the list to referencing tables, and RESTART
@@ -6035,6 +6045,301 @@ impl PgHandler {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Check one ALTER action against the catalog, returning it when it is to
+    /// be applied and `None` when an `IF EXISTS` / `IF NOT EXISTS` makes it a
+    /// no-op.
+    ///
+    /// Separate from applying it so the WHOLE statement is validated before
+    /// any row is touched: PostgreSQL's ALTER is atomic, and a second action
+    /// failing after the first rewrote the rows would leave the table in a
+    /// shape neither the old nor the new catalog describes.
+    fn check_alter_action(
+        &self,
+        table: &str,
+        def: &TableDef,
+        action: &secantus_pgplan::AlterTableAction,
+    ) -> PgWireResult<Option<secantus_pgplan::AlterTableAction>> {
+        use secantus_pgplan::AlterTableAction as A;
+        let missing_column = |name: &str| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "42703".into(), // undefined_column
+                format!("column \"{name}\" of relation \"{table}\" does not exist"),
+            )))
+        };
+        match action {
+            A::AddColumn {
+                column,
+                if_not_exists,
+            } => {
+                if def.column(&column.name).is_some() {
+                    if *if_not_exists {
+                        return Ok(None);
+                    }
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42701".into(), // duplicate_column
+                        format!(
+                            "column \"{}\" of relation \"{table}\" already exists",
+                            column.name
+                        ),
+                    ))));
+                }
+                // A NOT NULL column with no DEFAULT cannot be added to a table
+                // that already has rows: every one of them would violate it
+                // immediately, which is PostgreSQL's own refusal.
+                if !column.nullable && column.default.is_none() && self.table_has_rows(table)? {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "23502".into(), // not_null_violation
+                        format!(
+                            "column \"{}\" of relation \"{table}\" contains null values",
+                            column.name
+                        ),
+                    ))));
+                }
+            }
+            A::DropColumn { name, if_exists } => {
+                if def.column(name).is_none() {
+                    if *if_exists {
+                        return Ok(None);
+                    }
+                    return Err(missing_column(name));
+                }
+                if def.columns.len() == 1 {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "0A000".into(),
+                        "cannot drop the only column of a table".into(),
+                    ))));
+                }
+            }
+            A::SetDefault { column, .. }
+            | A::SetNotNull { column, .. }
+            | A::AlterType { column, .. } => {
+                if def.column(column).is_none() {
+                    return Err(missing_column(column));
+                }
+            }
+            A::AddCheck(check) => {
+                if def.check_constraints.iter().any(|c| c.name == check.name) {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42710".into(), // duplicate_object
+                        format!(
+                            "constraint \"{}\" for relation \"{table}\" already exists",
+                            check.name
+                        ),
+                    ))));
+                }
+            }
+            A::DropConstraint { name, if_exists } => {
+                let known = def.check_constraints.iter().any(|c| c.name == *name)
+                    || def.unique_constraints.iter().any(|u| u.name == *name)
+                    || def.foreign_keys.iter().any(|f| f.name == *name);
+                if !known {
+                    if *if_exists {
+                        return Ok(None);
+                    }
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42704".into(), // undefined_object
+                        format!("constraint \"{name}\" of relation \"{table}\" does not exist"),
+                    ))));
+                }
+            }
+        }
+        Ok(Some(action.clone()))
+    }
+
+    /// Bring the stored rows into line with one applied ALTER action.
+    ///
+    /// `def` is the shape AFTER the action, which is what the validating
+    /// passes (NOT NULL, CHECK) have to judge the rows against.
+    fn apply_alter_rows(
+        &self,
+        table: &str,
+        def: &TableDef,
+        action: &secantus_pgplan::AlterTableAction,
+    ) -> PgWireResult<()> {
+        use secantus_pgplan::AlterTableAction as A;
+        match action {
+            // The rows are rewritten rather than left short a field, for two
+            // reasons: a read would otherwise have to know that a MISSING
+            // field means "the default" rather than NULL, and a column DROPPED
+            // and re-ADDED under the same name would resurrect the old values.
+            A::AddColumn { column, .. } => {
+                let value = column.default.clone().unwrap_or(Bson::Null);
+                self.rewrite_rows(table, |d| {
+                    d.insert(column.field(), value.clone());
+                    Ok(())
+                })
+            }
+            A::DropColumn { name, .. } => {
+                // The field goes with the column, so re-adding the name later
+                // starts empty rather than finding the old values.
+                let field = secantus_pgcatalog::field_for(name, false);
+                self.rewrite_rows(table, |d| {
+                    d.remove(&field);
+                    Ok(())
+                })
+            }
+            A::AlterType {
+                column, pg_type, ..
+            } => {
+                let field = def
+                    .column(column)
+                    .map(|c| c.field())
+                    .unwrap_or_else(|| column.clone());
+                let ty = pg_type.clone();
+                let tz = self.session_timezone();
+                self.rewrite_rows(table, move |d| {
+                    let Some(v) = d.get(&field).cloned() else {
+                        return Ok(());
+                    };
+                    if v == Bson::Null {
+                        return Ok(());
+                    }
+                    // A value the new type cannot hold FAILS the statement.
+                    // Casting it to NULL, or leaving it in the old type, would
+                    // each leave the catalog lying about what the rows are.
+                    let cast = secantus_pgplan::cast_value_with_tz(v, &ty, &tz)
+                        .map_err(|e| PgHandler::err(&e))?;
+                    d.insert(field.clone(), cast);
+                    Ok(())
+                })
+            }
+            // PostgreSQL VALIDATES a new CHECK against the rows already there,
+            // and refuses the ALTER when one fails it.
+            A::AddCheck(check) => {
+                let expr = secantus_pgplan::plan_check_expression(&check.expression, def)
+                    .map_err(|e| Self::err(&e))?;
+                for d in self.table_docs(table)? {
+                    let ok =
+                        secantus_pgplan::apply_row_expr(&expr, &d).map_err(|e| Self::err(&e))?;
+                    // Only FALSE fails it: a NULL result satisfies a CHECK,
+                    // which is SQL's rule and the opposite of a WHERE's.
+                    if ok == Bson::Boolean(false) {
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".into(),
+                            "23514".into(), // check_violation
+                            format!(
+                                "check constraint \"{}\" of relation \"{table}\" is violated by some row",
+                                check.name
+                            ),
+                        ))));
+                    }
+                }
+                Ok(())
+            }
+            A::SetNotNull {
+                column,
+                not_null: true,
+            } => {
+                let field = def
+                    .column(column)
+                    .map(|c| c.field())
+                    .unwrap_or_else(|| column.clone());
+                for d in self.table_docs(table)? {
+                    if d.get(&field).is_none_or(|v| *v == Bson::Null) {
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".into(),
+                            "23502".into(), // not_null_violation
+                            format!(
+                                "column \"{column}\" of relation \"{table}\" contains null values"
+                            ),
+                        ))));
+                    }
+                }
+                Ok(())
+            }
+            // A default, a dropped NOT NULL and a dropped constraint are
+            // catalog-only: no row changes meaning.
+            A::SetDefault { .. } | A::SetNotNull { .. } | A::DropConstraint { .. } => Ok(()),
+        }
+    }
+
+    /// Read every row of a table, transform it, and write the table back.
+    ///
+    /// A whole-table rewrite, which is what makes an ALTER O(table) here where
+    /// PostgreSQL can often avoid it. That is a deliberate trade: the rows and
+    /// the catalog are never out of step, and this server's tables are test
+    /// fixtures rather than production data.
+    fn rewrite_rows(
+        &self,
+        table: &str,
+        mut f: impl FnMut(&mut Document) -> PgWireResult<()>,
+    ) -> PgWireResult<()> {
+        let docs = self.table_docs(table)?;
+        if docs.is_empty() {
+            return Ok(());
+        }
+        let mut out = Vec::with_capacity(docs.len());
+        for mut d in docs {
+            f(&mut d)?;
+            out.push(bson::to_vec(&d).map_err(|e| Self::storage_err("could not encode a row", e))?);
+        }
+        self.storage
+            .delete_matching(
+                self.db(),
+                table,
+                &Document::new(),
+                0,
+                &Document::new(),
+                None,
+            )
+            .map_err(|e| Self::storage_err("could not clear the table", e))?;
+        self.storage
+            .insert(self.db(), table, out, true)
+            .map_err(|e| Self::storage_err("could not rewrite the table", e))?;
+        Ok(())
+    }
+
+    /// Move every row's `from` field to `to`, for a column rename.
+    fn rename_row_field(&self, table: &str, from: &str, to: &str) -> PgWireResult<()> {
+        let to = to.to_string();
+        let from = from.to_string();
+        self.rewrite_rows(table, move |d| {
+            if let Some(v) = d.remove(&from) {
+                d.insert(to.clone(), v);
+            }
+            Ok(())
+        })
+    }
+
+    fn table_has_rows(&self, table: &str) -> PgWireResult<bool> {
+        Ok(!self.table_docs(table)?.is_empty())
+    }
+
+    /// Replace a table's catalog row with `def`, and make it visible to the
+    /// rest of this transaction.
+    fn rewrite_catalog(&self, name: &str, def: &TableDef) -> PgWireResult<()> {
+        self.ensure_collection(CATALOG_COLLECTION)?;
+        self.delete_catalog(name)?;
+        let bytes = bson::to_vec(&def.to_document())
+            .map_err(|e| Self::storage_err("could not encode the catalog entry", e))?;
+        self.storage
+            .insert(self.db(), CATALOG_COLLECTION, vec![bytes], true)
+            .map_err(|e| Self::storage_err("could not record the table", e))?;
+        self.note_uncommitted(name, Some(def.clone()));
+        Ok(())
+    }
+
+    fn delete_catalog(&self, name: &str) -> PgWireResult<()> {
+        self.ensure_collection(CATALOG_COLLECTION)?;
+        self.storage
+            .delete_matching(
+                self.db(),
+                CATALOG_COLLECTION,
+                &bson::doc! { "_id": name },
+                0,
+                &Document::new(),
+                None,
+            )
+            .map_err(|e| Self::storage_err("could not update the catalog entry", e))?;
         Ok(())
     }
 
@@ -10042,6 +10347,117 @@ impl PgHandler {
                     }
                 }
                 Ok(vec![Response::Execution(Tag::new("DROP TYPE"))])
+            }
+
+            Statement::AlterTable {
+                table,
+                missing_ok,
+                actions,
+            } => {
+                let Some(mut def) = self.lookup(&table) else {
+                    if missing_ok {
+                        return Ok(vec![Response::Execution(Tag::new("ALTER TABLE"))]);
+                    }
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42P01".into(), // undefined_table
+                        format!("relation \"{table}\" does not exist"),
+                    ))));
+                };
+                // Every action is checked against the CATALOG before any of
+                // them touches a row: PostgreSQL runs the whole statement as
+                // one unit, and a half-applied ALTER would leave the catalog
+                // describing a table the rows no longer match.
+                let mut effective = Vec::new();
+                for action in &actions {
+                    if let Some(a) = self.check_alter_action(&table, &def, action)? {
+                        secantus_pgplan::apply_alter_to_def(&mut def, &a);
+                        effective.push(a);
+                    }
+                }
+                for action in &effective {
+                    self.apply_alter_rows(&table, &def, action)?;
+                }
+                self.rewrite_catalog(&table, &def)?;
+                Ok(vec![Response::Execution(Tag::new("ALTER TABLE"))])
+            }
+
+            Statement::RenameTable {
+                table,
+                to,
+                missing_ok,
+            } => {
+                let Some(mut def) = self.lookup(&table) else {
+                    if missing_ok {
+                        return Ok(vec![Response::Execution(Tag::new("ALTER TABLE"))]);
+                    }
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42P01".into(),
+                        format!("relation \"{table}\" does not exist"),
+                    ))));
+                };
+                if self.lookup(&to).is_some() {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42P07".into(), // duplicate_table
+                        format!("relation \"{to}\" already exists"),
+                    ))));
+                }
+                self.storage
+                    .rename_collection(self.db(), &table, self.db(), &to, false)
+                    .map_err(|e| Self::storage_err("could not rename the table", e))?;
+                // The catalog row is KEYED by the table name, so the rename is
+                // a delete plus an insert rather than an update in place.
+                self.delete_catalog(&table)?;
+                def.name = to.clone();
+                self.rewrite_catalog(&to, &def)?;
+                self.note_uncommitted(&table, None);
+                Ok(vec![Response::Execution(Tag::new("ALTER TABLE"))])
+            }
+
+            Statement::RenameColumn {
+                table,
+                column,
+                to,
+                missing_ok,
+            } => {
+                let Some(mut def) = self.lookup(&table) else {
+                    if missing_ok {
+                        return Ok(vec![Response::Execution(Tag::new("ALTER TABLE"))]);
+                    }
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42P01".into(),
+                        format!("relation \"{table}\" does not exist"),
+                    ))));
+                };
+                let Some(old) = def.column(&column).cloned() else {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42703".into(), // undefined_column
+                        format!("column \"{column}\" does not exist"),
+                    ))));
+                };
+                if def.column(&to).is_some() {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42701".into(), // duplicate_column
+                        format!("column \"{to}\" of relation \"{table}\" already exists"),
+                    ))));
+                }
+                // A PRIMARY KEY column is STORED as `_id` whatever it is
+                // called, so renaming it moves no field -- and renaming any
+                // other column has to move the field the rows carry, or the
+                // catalog would name a field no row has.
+                if !old.pk {
+                    self.rename_row_field(&table, &old.field(), &to)?;
+                }
+                if let Some(c) = def.columns.iter_mut().find(|c| c.name == column) {
+                    c.name = to.clone();
+                }
+                self.rewrite_catalog(&table, &def)?;
+                Ok(vec![Response::Execution(Tag::new("ALTER TABLE"))])
             }
 
             Statement::DropTable(drop) => {

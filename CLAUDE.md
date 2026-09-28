@@ -347,9 +347,25 @@ one request path:
     case. An implementation that treats the default as ROWS is wrong on every
     tie.
 
+    **`ALTER TABLE` landed 2026-09-28** — `ADD` / `DROP COLUMN`, `SET` /
+    `DROP DEFAULT`, `SET` / `DROP NOT NULL`, `ALTER COLUMN TYPE`,
+    `ADD CONSTRAINT CHECK`, `DROP CONSTRAINT`, `RENAME COLUMN` and
+    `RENAME TO`, several actions per statement. The DDL corpus went 28
+    divergences of 41 to 7, all seven index or view.
+
+    Two rules there are worth carrying. **The stored rows are REWRITTEN** on
+    `ADD` / `DROP COLUMN` rather than left short a field — otherwise a column
+    dropped and re-added under one name would resurrect the old values, which
+    no error would flag. And **`ALTER COLUMN TYPE` is governed by the TYPES,
+    not the values**: PostgreSQL allows it only where an assignment cast
+    exists, so `text -> int` is `42804` even when every value is a digit
+    string (measured across 31 pairs on 14.24 — to a string type always,
+    within the numeric family, within the date/time family, `json`/`jsonb`,
+    and a type to itself; everything else needs `USING`).
+
     **What remains refused**: correlated subqueries, a window function over an
     AGGREGATE, `SELECT *` over a JOIN, array subscripting,
-    `CREATE INDEX`, `ALTER TABLE` in ANY form, `CREATE VIEW`, `CREATE TRIGGER`,
+    `CREATE INDEX`, `CREATE VIEW`, `CREATE TRIGGER`,
     `EXPLAIN`, composite `PRIMARY KEY` / multi-column `FOREIGN KEY`, and a
     non-literal column `DEFAULT`.
 
@@ -405,9 +421,10 @@ one request path:
 
     So do not read "96.8% of psycopg passes" as "nearly done". A SQL-shaped gauge
     (`sqllogictest`, the SQLAlchemy dialect suite) would score very differently.
-    With subqueries, CTEs and window functions landed, the next levers are
-    correlated subqueries and the DDL surface (`CREATE INDEX`, `ALTER TABLE`,
-    `CREATE VIEW`), which no amount of query-language work reaches.
+    With subqueries, CTEs, window functions and `ALTER TABLE` landed, the
+    next levers are `CREATE INDEX` (which also unblocks a partial-index
+    `ON CONFLICT` arbiter and `ALTER TABLE ADD CONSTRAINT UNIQUE`),
+    `CREATE VIEW`, and correlated subqueries.
   - Not there yet, beyond the survey above: password verification (a role's SCRAM
     verifier is stored and never checked — a wrong password and no password both
     connect, re-probed 2026-09-18, re-confirmed live 2026-09-28 by connecting

@@ -131,6 +131,8 @@ pub enum Error {
     /// A subquery used as a value that returned more than one row -> 21000
     /// (cardinality_violation).
     CardinalityViolation(String),
+    /// Two columns of one name in a CREATE TABLE -> 42701 (duplicate_column).
+    DuplicateColumn(String),
     /// A window function used where one is not allowed, or a frame clause
     /// PostgreSQL itself rejects -> 42P20 (windowing_error). Its own class,
     /// not 0A000: PostgreSQL refuses these too, so they are the answer a real
@@ -155,6 +157,7 @@ impl std::fmt::Display for Error {
             Error::CardinalityViolation(m) => write!(f, "{m}"),
             Error::InvalidNtileArgument(m) => write!(f, "{m}"),
             Error::Windowing(m) => write!(f, "{m}"),
+            Error::DuplicateColumn(m) => write!(f, "{m}"),
             Error::UndefinedColumn(c) => write!(f, "column \"{c}\" does not exist"),
             Error::UndefinedField(m) => write!(f, "{m}"),
             Error::UndefinedTable(t) => write!(f, "relation \"{t}\" does not exist"),
@@ -217,6 +220,7 @@ impl Error {
             Error::CardinalityViolation(_) => "21000", // cardinality_violation
             Error::InvalidNtileArgument(_) => "22014", // invalid_argument_for_ntile_function
             Error::Windowing(_) => "42P20",            // windowing_error
+            Error::DuplicateColumn(_) => "42701",      // duplicate_column
             Error::UndefinedColumn(_) | Error::UndefinedField(_) => "42703",
             Error::UndefinedTable(_) => "42P01",
             Error::InvalidName(_) => "42602", // invalid_name
@@ -256,6 +260,28 @@ pub enum Statement {
     /// a NO-OP on an existing table rather than the `42P07` a bare one gets.
     CreateTable(TableDef, bool),
     Insert(Insert),
+    /// `ALTER TABLE <t> <action>, ...`. PostgreSQL applies the actions in
+    /// order and the whole statement is one transaction, so a later one
+    /// failing undoes the earlier ones.
+    AlterTable {
+        table: String,
+        missing_ok: bool,
+        actions: Vec<AlterTableAction>,
+    },
+    /// `ALTER TABLE <t> RENAME TO <u>`. Its own statement because pg_query
+    /// parses it as a `RenameStmt` rather than an `AlterTableCmd`.
+    RenameTable {
+        table: String,
+        to: String,
+        missing_ok: bool,
+    },
+    /// `ALTER TABLE <t> RENAME COLUMN <c> TO <d>`.
+    RenameColumn {
+        table: String,
+        column: String,
+        to: String,
+        missing_ok: bool,
+    },
     Select(Select),
     /// `UNION` / `INTERSECT` / `EXCEPT`.
     SetOp(SetOpSelect),
@@ -734,6 +760,46 @@ pub struct Select {
     /// which refuses it) and nowhere else, so a plain `SELECT DISTINCT`
     /// returned its duplicates.
     pub distinct: Distinct,
+}
+
+/// One action of an `ALTER TABLE`.
+///
+/// Only the forms whose effect on the stored rows is well defined are here;
+/// anything else is refused by name at plan time. A DDL statement that
+/// silently did nothing would leave the catalog describing a table the rows
+/// do not match, which is the worst failure this server can have.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterTableAction {
+    AddColumn {
+        column: Column,
+        if_not_exists: bool,
+    },
+    DropColumn {
+        name: String,
+        if_exists: bool,
+    },
+    /// `SET DEFAULT <literal>`, or `DROP DEFAULT` as `None`.
+    SetDefault {
+        column: String,
+        value: Option<Bson>,
+    },
+    /// `SET NOT NULL` / `DROP NOT NULL`.
+    SetNotNull {
+        column: String,
+        not_null: bool,
+    },
+    /// `ALTER COLUMN <c> TYPE <t>`. Existing values are cast, so a value the
+    /// new type cannot hold fails the statement rather than being dropped.
+    AlterType {
+        column: String,
+        pg_type: String,
+        typmod: i32,
+    },
+    AddCheck(CheckConstraint),
+    DropConstraint {
+        name: String,
+        if_exists: bool,
+    },
 }
 
 /// One window function in the select list -- `sum(v) OVER (PARTITION BY g
@@ -1847,6 +1913,8 @@ fn plan_node(
 ) -> Result<Statement> {
     match node {
         N::CreateStmt(c) => plan_create(&c),
+        N::AlterTableStmt(a) => plan_alter_table(&a, lookup, params),
+        N::RenameStmt(r) => plan_rename(&r),
         N::CreateTableAsStmt(c) => plan_create_table_as(&c, lookup, params),
         N::InsertStmt(i) => plan_insert(&i, lookup, params),
         N::SelectStmt(s) => plan_select(&s, lookup, params),
@@ -2421,6 +2489,454 @@ fn plan_create_table_as(
     })
 }
 
+/// `ALTER TABLE <t> <action>, ...`.
+///
+/// Planned against the table's CURRENT def, and each action against the def
+/// the ones before it produced -- `add column x int, alter column x set
+/// default 0` is legal in PostgreSQL and needs the second action to see the
+/// first one's column.
+fn plan_alter_table(
+    a: &pg_query::protobuf::AlterTableStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Result<Statement> {
+    let relation = a
+        .relation
+        .as_ref()
+        .ok_or_else(|| Error::Parse("ALTER TABLE without a relation".into()))?;
+    let table = relation.relname.clone();
+    // Only tables. `ALTER INDEX` / `ALTER VIEW` / `ALTER SEQUENCE` parse to
+    // the same node with a different `objtype`, and answering them as though
+    // they were table alterations would be worse than refusing them.
+    if a.objtype != ObjectType::ObjectTable as i32 {
+        return Err(Error::Unsupported(format!(
+            "ALTER {} ",
+            object_type_word(a.objtype)
+        )));
+    }
+    let Some(mut def) = lookup(&table) else {
+        if a.missing_ok {
+            return Ok(Statement::AlterTable {
+                table,
+                missing_ok: true,
+                actions: Vec::new(),
+            });
+        }
+        return Err(Error::UndefinedTable(table));
+    };
+
+    let mut actions = Vec::new();
+    for cmd in &a.cmds {
+        let Some(N::AlterTableCmd(cmd)) = cmd.node.as_ref() else {
+            return Err(Error::Unsupported("this ALTER TABLE action".into()));
+        };
+        let action = plan_alter_action(cmd, &table, &def, params)?;
+        // Apply it to the working def so the NEXT action sees it.
+        apply_alter_to_def(&mut def, &action);
+        actions.push(action);
+    }
+    Ok(Statement::AlterTable {
+        table,
+        missing_ok: a.missing_ok,
+        actions,
+    })
+}
+
+/// Whether `ALTER COLUMN ... TYPE` converts from `from` to `to` without a
+/// `USING` clause.
+///
+/// PostgreSQL allows it exactly where an ASSIGNMENT cast exists, which is not
+/// the same as "the values happen to convert". Measured on 14.24 across 31
+/// type pairs, the rule is:
+///
+/// * to a STRING type -- always (everything has an assignment cast to text,
+///   so `json`, `bytea`, `date` and `int` all convert);
+/// * within the NUMERIC family, both directions;
+/// * within the DATE/TIME family, both directions;
+/// * `json` and `jsonb`, both directions;
+/// * a type to itself.
+///
+/// Everything else needs `USING`, and PostgreSQL answers 42804 -- notably
+/// FROM a string to anything but a string (`text -> int`, `text -> date`,
+/// `varchar -> int`), `bool` to or from `int`, and a scalar to an array.
+fn alter_type_is_automatic(from: &str, to: &str) -> bool {
+    const STRINGS: &[&str] = &["text", "varchar", "bpchar", "name", "char"];
+    const NUMBERS: &[&str] = &["int2", "int4", "int8", "numeric", "float4", "float8"];
+    const DATETIMES: &[&str] = &[
+        "date",
+        "timestamp",
+        "timestamptz",
+        "time",
+        "timetz",
+        "interval",
+    ];
+    if from == to || STRINGS.contains(&to) {
+        return true;
+    }
+    let both = |set: &[&str]| set.contains(&from) && set.contains(&to);
+    both(NUMBERS) || both(DATETIMES) || both(&["json", "jsonb"])
+}
+
+/// The word PostgreSQL uses for an object type in `ALTER <word>`, for a
+/// refusal that names what was actually asked for.
+fn object_type_word(objtype: i32) -> &'static str {
+    match ObjectType::try_from(objtype) {
+        Ok(ObjectType::ObjectIndex) => "INDEX",
+        Ok(ObjectType::ObjectView) => "VIEW",
+        Ok(ObjectType::ObjectMatview) => "MATERIALIZED VIEW",
+        Ok(ObjectType::ObjectSequence) => "SEQUENCE",
+        Ok(ObjectType::ObjectForeignTable) => "FOREIGN TABLE",
+        _ => "that object",
+    }
+}
+
+fn plan_alter_action(
+    cmd: &pg_query::protobuf::AlterTableCmd,
+    table: &str,
+    def: &TableDef,
+    params: &[Bson],
+) -> Result<AlterTableAction> {
+    use pg_query::protobuf::AlterTableType as AT;
+    use pg_query::protobuf::ConstrType as CT;
+    match AT::try_from(cmd.subtype) {
+        Ok(AT::AtAddColumn) => {
+            let Some(N::ColumnDef(cd)) = cmd.def.as_ref().and_then(|d| d.node.as_ref()) else {
+                return Err(Error::Parse("ADD COLUMN without a column".into()));
+            };
+            Ok(AlterTableAction::AddColumn {
+                column: plan_added_column(cd, params)?,
+                if_not_exists: cmd.missing_ok,
+            })
+        }
+        Ok(AT::AtDropColumn) => Ok(AlterTableAction::DropColumn {
+            name: cmd.name.clone(),
+            if_exists: cmd.missing_ok,
+        }),
+        Ok(AT::AtColumnDefault) => {
+            // `DROP DEFAULT` is the same node with no expression.
+            let value = match cmd.def.as_ref() {
+                None => None,
+                Some(raw) => {
+                    let column = def
+                        .column(&cmd.name)
+                        .ok_or_else(|| Error::UndefinedColumn(cmd.name.clone()))?;
+                    Some(literal_default(raw, &cmd.name, &column.pg_type, params)?)
+                }
+            };
+            Ok(AlterTableAction::SetDefault {
+                column: cmd.name.clone(),
+                value,
+            })
+        }
+        Ok(AT::AtSetNotNull) => Ok(AlterTableAction::SetNotNull {
+            column: cmd.name.clone(),
+            not_null: true,
+        }),
+        Ok(AT::AtDropNotNull) => Ok(AlterTableAction::SetNotNull {
+            column: cmd.name.clone(),
+            not_null: false,
+        }),
+        Ok(AT::AtAlterColumnType) => {
+            let Some(N::ColumnDef(cd)) = cmd.def.as_ref().and_then(|d| d.node.as_ref()) else {
+                return Err(Error::Parse("ALTER COLUMN TYPE without a type".into()));
+            };
+            // `USING <expr>` rewrites the value rather than casting it, which
+            // is a different conversion; refused rather than silently cast.
+            if cd.raw_default.is_some() {
+                return Err(Error::Unsupported("ALTER COLUMN TYPE ... USING".into()));
+            }
+            let ty = cd
+                .type_name
+                .as_ref()
+                .map(type_name_of)
+                .ok_or_else(|| Error::Parse("ALTER COLUMN TYPE without a type".into()))?;
+            let ty = normalize_serial(&ty);
+            let current = def
+                .column(&cmd.name)
+                .ok_or_else(|| Error::UndefinedColumn(cmd.name.clone()))?;
+            // PostgreSQL decides this from the TYPES alone, before looking at
+            // a single row: the conversion is allowed only where an
+            // assignment cast exists, and otherwise the statement is refused
+            // whatever the data happens to be. Casting per row instead made
+            // `text -> int` succeed on a table whose values were all digits
+            // and answer `22P02` on one whose values were not -- neither of
+            // which is what PostgreSQL does.
+            if !alter_type_is_automatic(&current.pg_type, &ty) {
+                return Err(Error::DatatypeMismatch(format!(
+                    "column \"{}\" cannot be cast automatically to type {}",
+                    cmd.name,
+                    display_type(&ty)
+                )));
+            }
+            Ok(AlterTableAction::AlterType {
+                column: cmd.name.clone(),
+                pg_type: ty,
+                typmod: cd.type_name.as_ref().map(declared_typmod).unwrap_or(-1),
+            })
+        }
+        Ok(AT::AtAddConstraint) => {
+            let Some(N::Constraint(k)) = cmd.def.as_ref().and_then(|d| d.node.as_ref()) else {
+                return Err(Error::Parse("ADD CONSTRAINT without a constraint".into()));
+            };
+            if CT::try_from(k.contype) != Ok(CT::ConstrCheck) {
+                // UNIQUE / PRIMARY KEY / FOREIGN KEY added after the fact each
+                // need an index built over the rows already there, which is
+                // the `CREATE INDEX` work rather than this.
+                return Err(Error::Unsupported(
+                    "ALTER TABLE ADD CONSTRAINT of this kind".into(),
+                ));
+            }
+            let raw = k
+                .raw_expr
+                .as_ref()
+                .ok_or_else(|| Error::Parse("CHECK without an expression".into()))?;
+            let expression = check_expression_text(raw)?;
+            // Planned now, so an unknown column is 42703 at ALTER rather than
+            // on the next INSERT.
+            plan_check_expression(&expression, def)?;
+            let name = if k.conname.is_empty() {
+                let named = columns_referenced(raw, def);
+                let base = match named.as_slice() {
+                    [one] => format!("{table}_{one}_check"),
+                    _ => format!("{table}_check"),
+                };
+                let mut candidate = base.clone();
+                let mut n = 1;
+                while def.check_constraints.iter().any(|c| c.name == candidate) {
+                    candidate = format!("{base}{n}");
+                    n += 1;
+                }
+                candidate
+            } else {
+                k.conname.clone()
+            };
+            Ok(AlterTableAction::AddCheck(CheckConstraint {
+                name,
+                expression,
+            }))
+        }
+        Ok(AT::AtDropConstraint) => Ok(AlterTableAction::DropConstraint {
+            name: cmd.name.clone(),
+            if_exists: cmd.missing_ok,
+        }),
+        // Everything else -- OWNER, SET STATISTICS, CLUSTER, inheritance,
+        // partitioning -- is named rather than lumped under one refusal, so
+        // the message says which action was not understood.
+        Ok(other) => Err(Error::Unsupported(format!(
+            "ALTER TABLE {}",
+            alter_action_word(other)
+        ))),
+        Err(_) => Err(Error::Unsupported("this ALTER TABLE action".into())),
+    }
+}
+
+fn alter_action_word(t: pg_query::protobuf::AlterTableType) -> &'static str {
+    use pg_query::protobuf::AlterTableType as AT;
+    match t {
+        AT::AtChangeOwner => "OWNER TO",
+        AT::AtSetStatistics => "ALTER COLUMN ... SET STATISTICS",
+        AT::AtSetStorage => "ALTER COLUMN ... SET STORAGE",
+        AT::AtClusterOn => "CLUSTER ON",
+        AT::AtAddIndex | AT::AtAddIndexConstraint => "ADD INDEX",
+        AT::AtValidateConstraint => "VALIDATE CONSTRAINT",
+        AT::AtAlterConstraint => "ALTER CONSTRAINT",
+        AT::AtAddInherit | AT::AtDropInherit => "INHERIT",
+        AT::AtAttachPartition | AT::AtDetachPartition => "PARTITION",
+        AT::AtEnableTrig | AT::AtDisableTrig => "TRIGGER",
+        AT::AtEnableRowSecurity | AT::AtDisableRowSecurity => "ROW LEVEL SECURITY",
+        AT::AtSetExpression | AT::AtDropExpression => "ALTER COLUMN ... EXPRESSION",
+        _ => "this action",
+    }
+}
+
+/// A column added by `ALTER TABLE ADD COLUMN`.
+///
+/// Deliberately narrower than `CREATE TABLE`'s column: a PRIMARY KEY, UNIQUE,
+/// REFERENCES or `serial` added after the fact each need an index or a
+/// sequence built over rows that already exist, and answering the statement
+/// without building it would leave the catalog claiming a constraint nothing
+/// enforces.
+fn plan_added_column(cd: &pg_query::protobuf::ColumnDef, params: &[Bson]) -> Result<Column> {
+    use pg_query::protobuf::ConstrType as CT;
+    let ty = cd.type_name.as_ref().map(type_name_of).unwrap_or_default();
+    if normalize_serial(&ty) != ty {
+        return Err(Error::Unsupported(
+            "ALTER TABLE ADD COLUMN of a serial column".into(),
+        ));
+    }
+    let mut column = Column::new(&cd.colname, &ty, false);
+    column.typmod = cd.type_name.as_ref().map(declared_typmod).unwrap_or(-1);
+    for con in &cd.constraints {
+        let Some(N::Constraint(k)) = con.node.as_ref() else {
+            continue;
+        };
+        match CT::try_from(k.contype) {
+            Ok(CT::ConstrNotnull) => column.nullable = false,
+            Ok(CT::ConstrNull) => column.nullable = true,
+            Ok(CT::ConstrDefault) => {
+                let raw = k
+                    .raw_expr
+                    .as_ref()
+                    .ok_or_else(|| Error::Parse("DEFAULT without an expression".into()))?;
+                column.default = Some(literal_default(raw, &cd.colname, &ty, params)?);
+            }
+            Ok(CT::ConstrPrimary) => {
+                return Err(Error::Unsupported(
+                    "ALTER TABLE ADD COLUMN ... PRIMARY KEY".into(),
+                ))
+            }
+            Ok(CT::ConstrUnique) => {
+                return Err(Error::Unsupported(
+                    "ALTER TABLE ADD COLUMN ... UNIQUE".into(),
+                ))
+            }
+            Ok(CT::ConstrForeign) => {
+                return Err(Error::Unsupported(
+                    "ALTER TABLE ADD COLUMN ... REFERENCES".into(),
+                ))
+            }
+            Ok(CT::ConstrCheck) => {
+                return Err(Error::Unsupported(
+                    "ALTER TABLE ADD COLUMN ... CHECK".into(),
+                ))
+            }
+            _ => {}
+        }
+    }
+    Ok(column)
+}
+
+/// A column DEFAULT, evaluated once and stored as a value.
+///
+/// Shared by `ADD COLUMN ... DEFAULT` and `ALTER COLUMN ... SET DEFAULT`, and
+/// refusing a volatile expression for the same reason `CREATE TABLE` does: a
+/// `now()` frozen here would stamp every later row with the moment of the
+/// ALTER rather than of the INSERT.
+fn literal_default(
+    raw: &pg_query::protobuf::Node,
+    column: &str,
+    pg_type: &str,
+    params: &[Bson],
+) -> Result<Bson> {
+    if default_is_volatile(raw) {
+        return Err(Error::Unsupported(format!(
+            "a non-literal DEFAULT on column \"{column}\""
+        )));
+    }
+    let value = match const_value(raw, params) {
+        Ok(v) => v,
+        Err(Error::Unsupported(_)) => {
+            return Err(Error::Unsupported(format!(
+                "a non-literal DEFAULT on column \"{column}\""
+            )))
+        }
+        Err(e) => return Err(e),
+    };
+    cast_value(value, pg_type)
+}
+
+/// Apply one action to a def, so the next action in the same statement -- and
+/// the executor -- see the same shape.
+pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
+    match action {
+        AlterTableAction::AddColumn { column, .. } => {
+            if def.column(&column.name).is_none() {
+                def.columns.push(column.clone());
+            }
+        }
+        AlterTableAction::DropColumn { name, .. } => {
+            def.columns.retain(|c| c.name != *name);
+            // A constraint over the dropped column goes with it, which is what
+            // PostgreSQL does for a CHECK naming only that column.
+            def.check_constraints
+                .retain(|c| !constraint_mentions(&c.expression, name));
+            def.unique_constraints
+                .retain(|u| !u.columns.iter().any(|c| c == name));
+            def.foreign_keys
+                .retain(|f| !f.columns.iter().any(|c| c == name));
+        }
+        AlterTableAction::SetDefault { column, value } => {
+            if let Some(c) = def.columns.iter_mut().find(|c| c.name == *column) {
+                c.default = value.clone();
+            }
+        }
+        AlterTableAction::SetNotNull { column, not_null } => {
+            if let Some(c) = def.columns.iter_mut().find(|c| c.name == *column) {
+                c.nullable = !not_null;
+            }
+        }
+        AlterTableAction::AlterType {
+            column,
+            pg_type,
+            typmod,
+        } => {
+            if let Some(c) = def.columns.iter_mut().find(|c| c.name == *column) {
+                c.pg_type = pg_type.clone();
+                c.typmod = *typmod;
+            }
+        }
+        AlterTableAction::AddCheck(check) => {
+            def.check_constraints.push(check.clone());
+            def.check_constraints.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+        AlterTableAction::DropConstraint { name, .. } => {
+            def.check_constraints.retain(|c| c.name != *name);
+            def.unique_constraints.retain(|u| u.name != *name);
+            def.foreign_keys.retain(|f| f.name != *name);
+        }
+    }
+}
+
+/// Whether a CHECK's SQL text names `column`, as a whole identifier.
+///
+/// A substring test would drop `check (nn > 0)` when column `n` is dropped,
+/// so the match is bounded by non-identifier characters on both sides.
+fn constraint_mentions(expression: &str, column: &str) -> bool {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    let bytes: Vec<char> = expression.chars().collect();
+    let target: Vec<char> = column.chars().collect();
+    if target.is_empty() {
+        return false;
+    }
+    for i in 0..bytes.len() {
+        if bytes[i..].starts_with(target.as_slice()) {
+            let before_ok = i == 0 || !ident(bytes[i - 1]);
+            let after = i + target.len();
+            let after_ok = after >= bytes.len() || !ident(bytes[after]);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `ALTER TABLE ... RENAME TO` and `... RENAME COLUMN ... TO`.
+fn plan_rename(r: &pg_query::protobuf::RenameStmt) -> Result<Statement> {
+    let relation = r
+        .relation
+        .as_ref()
+        .ok_or_else(|| Error::Parse("RENAME without a relation".into()))?;
+    let table = relation.relname.clone();
+    match ObjectType::try_from(r.rename_type) {
+        Ok(ObjectType::ObjectTable) => Ok(Statement::RenameTable {
+            table,
+            to: r.newname.clone(),
+            missing_ok: r.missing_ok,
+        }),
+        Ok(ObjectType::ObjectColumn) => Ok(Statement::RenameColumn {
+            table,
+            column: r.subname.clone(),
+            to: r.newname.clone(),
+            missing_ok: r.missing_ok,
+        }),
+        Ok(ObjectType::ObjectTabconstraint) => Err(Error::Unsupported(
+            "ALTER TABLE ... RENAME CONSTRAINT".into(),
+        )),
+        _ => Err(Error::Unsupported("this RENAME".into())),
+    }
+}
+
 fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
     use pg_query::protobuf::ConstrType as CT;
     let relation = c
@@ -2620,6 +3136,17 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
     for fk in &mut fks {
         if fk.ref_table == table {
             resolve_fk_target(fk, &def)?;
+        }
+    }
+    // Two columns of the same name: PostgreSQL's 42701, which this accepted
+    // silently -- producing a table whose second column was unreachable,
+    // since every lookup resolves a name to the FIRST match.
+    for (i, col) in def.columns.iter().enumerate() {
+        if def.columns[..i].iter().any(|c| c.name == col.name) {
+            return Err(Error::DuplicateColumn(format!(
+                "column \"{}\" specified more than once",
+                col.name
+            )));
         }
     }
     let mut check_names: Vec<String> = fks.iter().map(|f| f.name.clone()).collect();
