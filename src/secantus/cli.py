@@ -77,6 +77,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--enable-test-commands",
+        action="store_true",
+        default=None,
+        help=(
+            "Enable mongod's test-only commands -- `configureFailPoint` above "
+            "all. OFF by default, as mongod is: an unauthenticated client that "
+            "can reach the port could otherwise arm a server-wide failCommand "
+            "that closes every connection. Driver-conformance gauges need it "
+            "and turn it on automatically."
+        ),
+    )
+    parser.add_argument(
         "--standalone",
         action="store_true",
         default=None,
@@ -228,6 +240,7 @@ def _overrides_from_args(args: argparse.Namespace) -> dict[str, object]:
         "log_level": "log_level",
         "auth": "auth",
         "standalone": "standalone",
+        "enable_test_commands": "enable_test_commands",
         "noop_heartbeat_seconds": "noop_heartbeat_seconds",
         "cache_size": "cache_size",
         "session_max": "session_max",
@@ -397,6 +410,7 @@ def main(argv: list[str] | None = None) -> int:
         require_auth=cfg.auth,
         noop_heartbeat_seconds=cfg.noop_heartbeat_seconds,
         replica_set_name=None if cfg.standalone else "secantus",
+        enable_test_commands=bool(cfg.enable_test_commands),
         oplog_retention_seconds=cfg.oplog_retention_seconds,
         oplog_max_entries=cfg.oplog_max_entries,
         oplog_archive_dir=cfg.oplog_archive_dir,

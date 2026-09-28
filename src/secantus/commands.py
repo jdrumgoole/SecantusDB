@@ -1848,11 +1848,10 @@ def _get_parameter(doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
         "featureCompatibilityVersion": {
             "version": f"{SERVER_VERSION_ARRAY[0]}.{SERVER_VERSION_ARRAY[1]}"
         },
-        # True because the test commands drivers gate on ARE implemented --
-        # ``configureFailPoint`` above all. pymongo's harness reads this flag
-        # and, while it said False, skipped ~1,080 unified-spec failpoint tests
+        # The REAL value, not a constant. Drivers gate on this: while it said
+        # False, pymongo's harness skipped ~1,080 unified-spec failpoint tests
         # this server can run (measured 2026-09-25).
-        "enableTestCommands": True,
+        "enableTestCommands": getattr(_ctx, "failpoints", None) is not None,
         "logLevel": 0,
         "quiet": False,
         # Real ``mongod`` exposes the list of enabled auth mechanisms
@@ -9838,6 +9837,12 @@ def _require_api_version_1(doc: dict[str, Any], name: str) -> dict[str, Any] | N
     }
 
 
+#: Commands mongod ships only behind ``enableTestCommands``. Mirrors the Rust
+#: ``is_test_only_command``; ``tests/test_test_command_gate.py`` pins the two
+#: together so adding one on either side without the other fails a test.
+_TEST_ONLY_COMMANDS = frozenset({"configureFailPoint"})
+
+
 def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     name = command_name(doc)
     # Database-name length limit. mongod rejects any namespace whose
@@ -9969,6 +9974,15 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     if _err is not None:
         return _err
     handler = _HANDLERS.get(name)
+    # Test-only commands are gated the way mongod gates them: without
+    # ``enableTestCommands`` they are not merely refused, they DO NOT EXIST.
+    # Measured 8.2.11 (2026-09-28) -- a mongod started without the parameter
+    # answers ``configureFailPoint`` with ``59 CommandNotFound :: no such
+    # command: 'configureFailPoint'``. The registry's absence is the gate, so
+    # the decision stays where the operator made it (server construction).
+    # Mirrors ``secantus_commands::is_test_only_command``.
+    if name in _TEST_ONLY_COMMANDS and getattr(ctx, "failpoints", None) is None:
+        handler = None
     if handler is None:
         return {
             "ok": 0.0,

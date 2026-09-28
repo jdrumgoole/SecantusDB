@@ -89,6 +89,7 @@ class SecantusDBServer:
         *,
         replica_set_name: str | None = "secantus",
         require_auth: bool = False,
+        enable_test_commands: bool = True,
         ttl_sweep_seconds: float = 60.0,
         noop_heartbeat_seconds: float = 0.0,
         client_idle_timeout_s: float = DEFAULT_CLIENT_IDLE_TIMEOUT_S,
@@ -110,6 +111,12 @@ class SecantusDBServer:
         self.port = port
         self.replica_set_name = replica_set_name
         self.require_auth = require_auth
+        #: ``configureFailPoint`` and friends. Defaults to **True** here and
+        #: False on the standalone daemon: constructing a ``SecantusDBServer``
+        #: in a test is the entire use case for this class, and every driver
+        #: failpoint suite needs it. The daemon is the one an operator exposes
+        #: on a port, so it follows mongod and defaults off.
+        self.enable_test_commands = enable_test_commands
         self.client_idle_timeout_s = client_idle_timeout_s
         self.max_connections = max_connections
         self._socket: socket.socket | None = None
@@ -210,7 +217,10 @@ class SecantusDBServer:
         # Driver test suites lean on this to inject deterministic
         # errors at the wire (failCommand → errorCode / writeConcernError).
         # See ``secantus.failpoints`` for the supported subset.
-        self.failpoints = FailPointRegistry()
+        # The registry's ABSENCE is the gate: with no registry the test-only
+        # commands answer `59 CommandNotFound`, which is what mongod answers
+        # when started without `enableTestCommands` (measured 8.2.11).
+        self.failpoints = FailPointRegistry() if enable_test_commands else None
         # Multi-document transaction state machine. The WT work is
         # bound here so the registry itself stays storage-agnostic;
         # ``txn.handle`` is None when the transaction never executed a

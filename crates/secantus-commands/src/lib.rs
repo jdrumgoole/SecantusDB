@@ -280,6 +280,19 @@ impl CommandContext {
         self
     }
 
+    /// [`with_failpoints`] for a server that may not have one — `None` leaves
+    /// the context without a registry, which is what makes the test-only
+    /// commands report `CommandNotFound`.
+    ///
+    /// [`with_failpoints`]: Self::with_failpoints
+    pub fn with_failpoints_opt(
+        mut self,
+        failpoints: Option<Arc<failpoints::FailPointRegistry>>,
+    ) -> Self {
+        self.failpoints = failpoints;
+        self
+    }
+
     /// The storage backend, or an `InternalError` if none is configured. Data
     /// commands call this; a missing backend is a server-wiring bug, not a
     /// client error.
@@ -396,6 +409,15 @@ pub(crate) fn lookup_for_test(name: &str) -> Option<Handler> {
 
 /// Resolve a command name (incl. case aliases) to its handler. `None` ⇒
 /// `CommandNotFound`. Families are added here as they are ported.
+/// Commands mongod ships only behind `enableTestCommands`.
+///
+/// Kept as a list rather than inlined so adding the next one (mongod has
+/// several) is a one-line change beside this comment, and so the Python
+/// server's mirror has something to be checked against.
+pub fn is_test_only_command(name: &str) -> bool {
+    matches!(name, "configureFailPoint")
+}
+
 fn lookup(name: &str) -> Option<Handler> {
     Some(match name {
         "hello" | "isMaster" | "ismaster" => handshake::hello,
@@ -751,6 +773,21 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
         return e.into_reply();
     }
 
+    // Test-only commands are gated the way mongod gates them: without
+    // `enableTestCommands` they are not merely refused, they DO NOT EXIST.
+    // Measured 8.2.11 (2026-09-28) — a mongod started without the parameter
+    // answers `configureFailPoint` with `59 CommandNotFound :: no such
+    // command: 'configureFailPoint'`, and reports `enableTestCommands: false`
+    // from `getParameter`.
+    //
+    // The registry's absence IS the gate: a server that did not enable test
+    // commands wires no `FailPointRegistry`, so there is nothing for the
+    // handler to configure and nothing for `failCommand` to match. That keeps
+    // the decision at server startup, where the operator made it, rather than
+    // duplicating a flag down here.
+    if is_test_only_command(name) && ctx.failpoints.is_none() {
+        return CommandError::command_not_found(name).into_reply();
+    }
     match lookup(name) {
         Some(handler) => {
             // `maxTimeMS` is a generic command field — mongod's IDL validates

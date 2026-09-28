@@ -159,8 +159,8 @@ pub fn get_log(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 }
 
 /// `getParameter` — a minimal set of well-known server parameters.
-pub fn get_parameter(doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
-    let params = known_params();
+pub fn get_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let params = known_params(ctx.failpoints.is_some());
     let arg = doc.get("getParameter");
     // "*" or the legacy `{getParameter: 1}` with no names ⇒ all params.
     let names: Vec<&String> = doc
@@ -200,14 +200,17 @@ fn feature_compatibility_version() -> String {
     format!("{}.{}", SERVER_VERSION_ARRAY[0], SERVER_VERSION_ARRAY[1])
 }
 
-fn known_params() -> Document {
+fn known_params(test_commands: bool) -> Document {
     doc! {
         "featureCompatibilityVersion": { "version": feature_compatibility_version() },
-        // True because the test commands drivers gate on ARE implemented --
-        // `configureFailPoint` above all. pymongo's harness reads this flag and,
-        // while it said false, skipped ~1,080 unified-spec failpoint tests
-        // (measured 2026-09-25 against the Python server, which shares it).
-        "enableTestCommands": true,
+        // The REAL value, not a constant. Drivers gate on this: while it said
+        // false, pymongo's harness skipped ~1,080 unified-spec failpoint tests
+        // (measured 2026-09-25). But hardcoding `true` would have made a server
+        // that refuses `configureFailPoint` claim to accept it, so the two now
+        // come from the same fact -- whether a FailPointRegistry was wired.
+        // mongod reports `false` when started without the parameter (measured
+        // 8.2.11, 2026-09-28).
+        "enableTestCommands": test_commands,
         "logLevel": 0_i32,
         "quiet": false,
         // We implement SCRAM-SHA-256 + MONGODB-X509 (R5); advertise just those

@@ -132,6 +132,10 @@ pub struct ServerConfig {
     pub replica_set_name: Option<String>,
     /// Whether access control is on (drives `accessControlEnabled`).
     pub require_auth: bool,
+    /// Wire a `FailPointRegistry`, enabling `configureFailPoint`. Off by
+    /// default as mongod is; the embedded test handles set it. The registry's
+    /// absence is what makes the command report `CommandNotFound`.
+    pub enable_test_commands: bool,
     /// TLS / mTLS options. `None` ⇒ plaintext connections.
     pub tls: Option<TlsOptions>,
     /// Once a wire message *starts* arriving, how long the whole message
@@ -150,6 +154,7 @@ impl Default for ServerConfig {
         Self {
             replica_set_name: None,
             require_auth: false,
+            enable_test_commands: false,
             tls: None,
             message_read_timeout: Some(DEFAULT_MESSAGE_READ_TIMEOUT),
         }
@@ -163,7 +168,8 @@ struct Shared {
     cursors: Arc<CursorRegistry>,
     transactions: Arc<secantus_commands::transactions::TransactionRegistry>,
     /// Server-wide `configureFailPoint` registry, shared across connections.
-    failpoints: Arc<secantus_commands::failpoints::FailPointRegistry>,
+    /// `None` when `enable_test_commands` is off — its absence is the gate.
+    failpoints: Option<Arc<secantus_commands::failpoints::FailPointRegistry>>,
     /// Server-wide per-namespace operation accounting, reported by `top`.
     top_stats: Arc<secantus_commands::topstats::TopStats>,
     address: SocketAddr,
@@ -373,12 +379,15 @@ pub fn bind(
         "CONTROL",
         format!("SecantusDB (rust) {VERSION} started"),
     );
+    let failpoints = config
+        .enable_test_commands
+        .then(|| Arc::new(secantus_commands::failpoints::FailPointRegistry::new()));
     let shared = Arc::new(Shared {
         config,
         storage,
         cursors,
         transactions,
-        failpoints: Arc::new(secantus_commands::failpoints::FailPointRegistry::new()),
+        failpoints,
         top_stats: Arc::new(secantus_commands::topstats::TopStats::new()),
         address,
         next_conn_id: AtomicI64::new(1),
@@ -904,7 +913,7 @@ fn make_context(
         .with_storage(shared.storage.clone())
         .with_cursors(shared.cursors.clone())
         .with_transactions(shared.transactions.clone())
-        .with_failpoints(shared.failpoints.clone())
+        .with_failpoints_opt(shared.failpoints.clone())
         .with_conn_auth(conn_auth.clone())
         .with_conn_killer(shared.conn_killer.clone())
         .with_logs(shared.logs.clone())

@@ -45,6 +45,8 @@ pub struct CliArgs {
     pub storage_path: String,
     pub replica_set_name: Option<String>,
     pub require_auth: bool,
+    /// `--enable-test-commands` / `[server] enable_test_commands`.
+    pub enable_test_commands: bool,
     pub tls: Option<CliTls>,
     /// PITR v2: archive pruned oplog rows to this directory (off by default).
     pub oplog_archive_dir: Option<String>,
@@ -100,6 +102,7 @@ impl CliArgs {
                 Some("secantus".to_string())
             },
             require_auth: cfg.auth,
+            enable_test_commands: cfg.enable_test_commands,
             tls,
             oplog_archive_dir: cfg.oplog_archive_dir.clone(),
             log_level: cfg.log_level.clone(),
@@ -124,6 +127,7 @@ impl CliArgs {
         ServerConfig {
             replica_set_name: self.replica_set_name.clone(),
             require_auth: self.require_auth,
+            enable_test_commands: self.enable_test_commands,
             tls: self.tls.as_ref().map(|t| TlsOptions {
                 cert_file: t.cert_file.clone(),
                 key_file: t.key_file.clone(),
@@ -310,6 +314,7 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
             }
             "--auth" => o.auth = Some(true),
             "--standalone" => o.standalone = Some(true),
+            "--enable-test-commands" => o.enable_test_commands = Some(true),
             "--tls-cert-file" => tls_cert_file = Some(take_value("--tls-cert-file")?),
             "--tls-key-file" => tls_key_file = Some(take_value("--tls-key-file")?),
             "--tls-ca-file" => tls_ca_file = Some(take_value("--tls-ca-file")?),
@@ -323,6 +328,7 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
                 flag,
                 "--auth"
                     | "--standalone"
+                    | "--enable-test-commands"
                     | "--sync-on-commit"
                     | "--oplog-async"
                     | "--oplog-nonlogged"

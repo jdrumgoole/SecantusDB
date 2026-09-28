@@ -72,6 +72,9 @@ class SecantusConfig:
     # SecantusDB default that lets pymongo's change-stream topology
     # checks pass). ``True`` flips back to STANDALONE.
     standalone: bool = False
+    #: mongod's ``enableTestCommands``. OFF by default, as mongod is — see the
+    #: CLI flag's help and ``docs/security-reports/2026-08-10.md`` W6.
+    enable_test_commands: bool = False
 
     # ---- [oplog] ----------------------------------------------------
     oplog_retention_seconds: float = 3600.0
@@ -138,7 +141,17 @@ class ConfigError(Exception):
 # Map of TOML section → which field names live there. Used to apply a
 # table-by-table update and to flag unknown keys cleanly.
 _TABLE_FIELDS: dict[str, frozenset[str]] = {
-    "server": frozenset({"host", "port", "storage_path", "log_level", "auth", "standalone"}),
+    "server": frozenset(
+        {
+            "host",
+            "port",
+            "storage_path",
+            "log_level",
+            "auth",
+            "standalone",
+            "enable_test_commands",
+        }
+    ),
     "oplog": frozenset({"retention_seconds", "max_entries", "noop_heartbeat_seconds"}),
     "storage": frozenset({"cache_size", "session_max", "ttl_sweep_seconds", "sync_on_commit"}),
     "tls": frozenset({"cert_file", "key_file", "ca_file", "require_client_cert"}),

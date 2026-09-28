@@ -138,6 +138,28 @@ def _force_port_zero(daemon_cmd: list[str]) -> list[str]:
     return out
 
 
+def _force_test_commands(daemon_cmd: list[str]) -> list[str]:
+    """Return ``daemon_cmd`` with ``--enable-test-commands`` appended if absent.
+
+    Every daemon gauge needs `configureFailPoint`: the drivers' failpoint suites
+    are a large share of what these gauges measure -- turning the flag off cost
+    pymongo ~1,080 unified-spec tests when it was merely MISREPORTED, let alone
+    disabled. The daemons now default it OFF, as mongod does, so a gauge that
+    did not ask would silently lose that coverage and simply report a smaller,
+    greener suite.
+
+    Forcing it HERE rather than in each runner is the point. There are thirteen
+    daemon gauges; `tasks/driver-conformance-followups-plan.md` predicted the
+    cost as "every gauge task must pass the flag. Miss one and that gauge
+    silently loses its failpoint coverage." One choke point removes that class
+    of mistake -- `spawn_daemon` already rewrites the port and log level the
+    same way.
+    """
+    if "--enable-test-commands" in daemon_cmd:
+        return list(daemon_cmd)
+    return list(daemon_cmd) + ["--enable-test-commands"]
+
+
 def _force_log_level_info(daemon_cmd: list[str]) -> list[str]:
     """Return ``daemon_cmd`` with ``--log-level`` set to ``INFO`` (added if
     absent).
@@ -182,7 +204,7 @@ def spawn_daemon(
     stderr are merged and drained on a background thread so the daemon never
     blocks on a full pipe.
     """
-    prepared = _force_port_zero(daemon_cmd)
+    prepared = _force_test_commands(_force_port_zero(daemon_cmd))
     if gauge_server() == "python":
         # Ensure the readiness line the loop below greps for is actually emitted
         # (the gauges' --log-level WARNING would otherwise suppress it).
