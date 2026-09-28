@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -43,12 +44,31 @@ def _read_driver_version() -> str:
     return "unknown"
 
 
-def render(ndjson_path: Path, out_path: Path) -> None:
+def render(ndjson_path: Path, out_path: Path) -> bool:
+    """Write the report. Returns True when the run was TRUNCATED.
+
+    A truncated run is the dangerous case, because it looks like a clean one.
+    `go test` killing itself on `-timeout` panics the binary WITHOUT emitting a
+    terminal event for the tests still in flight, so the summariser sees only
+    the tests that finished, counts zero failures among them, and prints
+    100.0%. The package-level result is `fail` at the same time — the two
+    disagree, and only the raw NDJSON shows it.
+
+    That is not hypothetical: every recorded run of this gauge, on both servers
+    and including the committed 2026-09-21 report, stopped at 476 of 481 tests
+    after a 30-minute timeout in `TestInitialDNSSeedlistDiscoverySpec` (a DNS
+    resolver test that never contacts SecantusDB), and all of them published
+    100.0%. Two artifacts from different servers a week apart agreeing exactly
+    read as confirmation; it meant both were cut off at the same hang.
+    """
     by_pkg: dict[str, dict[str, int]] = defaultdict(
         lambda: {"passed": 0, "failed": 0, "skipped": 0}
     )
 
     failures: list[tuple[str, str]] = []  # (package, test) for triage
+    started: set[str] = set()
+    finished: set[str] = set()
+    pkg_failed: set[str] = set()  # package-level `fail`, test-level or not
 
     with ndjson_path.open() as f:
         for line in f:
@@ -59,14 +79,29 @@ def render(ndjson_path: Path, out_path: Path) -> None:
             action = ev.get("Action")
             test = ev.get("Test")
             pkg = ev.get("Package", "?")
+            if not test:
+                # Package-level roll-up. `fail` here with no failing test below
+                # it is the signature of a binary that died without accounting
+                # for its tests.
+                if action == "fail":
+                    pkg_failed.add(pkg)
+                continue
+            if action == "run":
+                started.add(f"{pkg}::{test}")
+                continue
             # Only count terminal events on individual tests (skip subtest
             # roll-ups; `go test -json` emits an event per test name).
-            if not test or action not in {"pass", "fail", "skip"}:
+            if action not in {"pass", "fail", "skip"}:
                 continue
+            finished.add(f"{pkg}::{test}")
             bucket = {"pass": "passed", "fail": "failed", "skip": "skipped"}[action]
             by_pkg[pkg][bucket] += 1
             if action == "fail":
                 failures.append((pkg, test))
+
+    hung = sorted(started - finished)
+    silent_pkg_failures = sorted(p for p in pkg_failed if not any(fp == p for fp, _ in failures))
+    truncated = bool(hung or silent_pkg_failures)
 
     rows: list[tuple[str, int, int, int, int, str]] = []
     totals = {"passed": 0, "failed": 0, "skipped": 0}
@@ -99,6 +134,32 @@ def render(ndjson_path: Path, out_path: Path) -> None:
         "bugs (int32 vs int64) that pymongo accepts silently fail loudly here."
     )
     md.append("")
+
+    if truncated:
+        # Ahead of the numbers on purpose. A reader who sees the table first
+        # has already formed a view of the pass rate by the time any caveat
+        # further down reaches them.
+        md.append("> **THIS RUN WAS TRUNCATED — the pass rate below is not a**")
+        md.append("> **conformance result.** The test binary stopped before")
+        md.append("> every test reported, so the rate describes only the")
+        md.append("> subset that finished. Fix the cause and re-run before")
+        md.append("> quoting any number from this file.")
+        md.append(">")
+        if hung:
+            md.append(f"> Started but never completed ({len(hung)}):")
+            md.append(">")
+            md.append("> ```")
+            for t in hung[:20]:
+                md.append(f"> {t}")
+            md.append("> ```")
+        if silent_pkg_failures:
+            md.append(
+                "> Packages reporting `fail` with no failing test beneath them "
+                f"(a binary that died without accounting for its tests): "
+                f"{', '.join(_shorten(p) for p in silent_pkg_failures)}"
+            )
+        md.append("")
+
     md.append("## Summary by package")
     md.append("")
     md.append("| Package | Passed | Failed | Skipped | Total | Pass rate |")
@@ -164,6 +225,7 @@ def render(ndjson_path: Path, out_path: Path) -> None:
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(md))
+    return truncated
 
 
 def main() -> int:
@@ -171,7 +233,18 @@ def main() -> int:
     parser.add_argument("ndjson", type=Path)
     parser.add_argument("output_md", type=Path)
     args = parser.parse_args()
-    render(args.ndjson, args.output_md)
+    truncated = render(args.ndjson, args.output_md)
+    if truncated:
+        # Non-zero so the gauge cannot be reported as a clean run. The report
+        # is still written -- it carries the banner and the hung-test list,
+        # which is what you need to diagnose it.
+        print(
+            f"go gauge TRUNCATED: not every test reported a result; see "
+            f"{args.output_md}. The pass rate in that file is not a "
+            f"conformance number.",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
