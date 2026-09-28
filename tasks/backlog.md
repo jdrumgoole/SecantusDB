@@ -3693,19 +3693,46 @@ all match, and so do CREATE INDEX / VIEW and their error surface. What is open:
       binds it. So a user writing the dangling pattern literally gets an empty
       result where PostgreSQL would error. Strictly better than before, when we
       MATCHED in both cases, but still a divergence.
-- [ ] **A `json` column reports atttypid 3802 (`jsonb`), not 114 (`json`).**
-      The two are distinct types in PostgreSQL — `json` keeps its text verbatim
-      (key order, whitespace, duplicate keys), `jsonb` normalises — and this
-      server folds `json` onto the `jsonb` tag. So `CREATE TABLE t (j json)`
-      reports a jsonb column (measured 2026-09-27).
-      The machinery for the distinction partly exists: a column already carries
-      a `json_plain` flag derived from the declared `(114, -1)` identity, and
-      `_decl_identity` deliberately returns `{}` for it. The declared-char-type
-      slice (#1511) is the shape of the fix — report the DECLARED oid — but the
-      value semantics (verbatim vs normalised) are the harder half and a
-      reported 114 over jsonb storage would be a new kind of lie. The
-      `pg_type` row for `json` (114) is present and correct as of 2026-09-27;
-      only the column identity is wrong.
+- [ ] **`json` is folded onto `jsonb` end to end — FOUR measured divergences,
+      one root cause.** Mapped 2026-09-28 against PostgreSQL 14 so the next
+      session starts from this rather than re-deriving it.
+
+      | surface | ours | PostgreSQL 14 |
+      | --- | --- | --- |
+      | `pg_attribute.atttypid` of a `json` column | 3802 | **114** |
+      | `pg_typeof('{}'::json)` | `jsonb` | **json** |
+      | `'{"b":1}'::json::text` | `"{\"b\":1}"` | **`{"b":1}`** |
+      | stored `json` col `::text` | `{"b": 1}` | **`{"b":1}`** |
+
+      The WIRE oid is already correct (114 on both) — only the catalog and the
+      casts are wrong, so do not "fix" the wire.
+
+      **Root cause: there is no value-level representation for raw JSON text.**
+      After `::json` the value is a plain Python `str`, which is
+      indistinguishable from a DECODED JSON string value (`'"hi"'::jsonb` is
+      also a `str`). `scalar.py`'s `to_tag_early == "text"` branch calls
+      `_render_json` on it, which is right for the decoded-string case and
+      double-encodes the raw-text case. `typemap.JsonText(str)` exists but is a
+      PARAMETER-substitution marker only: it is rewritten to a `::jsonb` cast at
+      substitution and never survives as a value.
+
+      **Why the cheap fix is wrong.** Making `::json` decode like `::jsonb`
+      removes the double-encoding and gets `{"b": 1}` — valid, equivalent JSON,
+      differing only in whitespace. Tempting, and still not `json` semantics:
+      `json` preserves the input text verbatim, including key ORDER, whitespace
+      and DUPLICATE keys, all of which `jsonb` discards. Shipping the decode
+      would make `json` look supported while silently normalising, which is a
+      worse failure than today's visibly broken cast.
+
+      **What a real fix needs**: a value type that carries raw JSON text through
+      the engine (storage, casts, operators, wire), so `json` round-trips
+      verbatim and `jsonb` keeps normalising. That is a feature, not a fidelity
+      patch. `jsonb` has its own separate divergence worth folding in: it does
+      not SORT object keys (`'{"b":1,"a":2}'::jsonb` renders `{"b": 1, "a": 2}`
+      where PostgreSQL gives `{"a": 2, "b": 1}`).
+
+      The `pg_type` row for `json` (114) is present and correct as of
+      2026-09-27; only the column identity and the casts are wrong.
 - [ ] **`getProcedureColumns` returns nothing for a schema's PROCEDURE.**
       pgjdbc's `getProceduresWithCorrectCatalogAndWithout` asserts
       `getProcedureColumns(null, 'hasprocedures', null, null)` yields 1 row for
