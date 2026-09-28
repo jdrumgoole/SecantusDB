@@ -2974,6 +2974,51 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **OPEN — three server-side defects found by the 2026-09-28 Rust gauge
+      sweep, none of them in pymongo.** The pymongo gauge is at 1,205 / 5 with
+      only declared non-goals left, so these came from the other-language
+      gauges — which is the argument for running them.
+
+      * **`$geoIntersects` returns nothing.** Java's
+        `GeoJsonFiltersFunctionalSpecification#$geoIntersects` expects four
+        documents (3 points + a polygon) and gets `[]`. `$geoWithin` in the same
+        file passes, so this is narrower than "geo is broken". Reproduce against
+        the Rust server before assuming the query path is at fault — the index
+        picker and the Shapely-equivalent verifier are separate suspects.
+      * **Change-stream resume drops the original read preference.** php-lib's
+        `WatchFunctionalTest::testOriginalReadPreferenceIsPreservedOnResume`
+        fails `assertTrue`. Single-node, so the read preference has no practical
+        effect here, but the driver asserts the value round-trips.
+      * **C driver: 8 failures, mostly connection-string/topology.**
+        `/Client/select_server/{single,pooled}`,
+        `/Client/select_server/err/{single,pooled}`, `/Client/ipv6/single` (x2),
+        plus `/find_and_modify/hint` and `/crud/prose_test_9`. The
+        `select_server` cluster is one surface, not six bugs; triage it as one.
+
+      All eleven gauges and their rates are tabulated in
+      `tasks/driver-conformance-followups-plan.md` §5.
+
+- [ ] **OPEN — the .NET gauge spends ~90% of its wall clock after its last log
+      line (2026-09-28).** Observed: TRX and report both written at 14:53, the
+      process exited at 15:12 with `rc=0` and nothing logged in between — 19 of
+      21 minutes. The temp WiredTiger store was cleaned up and no process was
+      left behind, so it is a teardown stall rather than lost data.
+
+      Worth chasing because it makes `validate-all` look far slower than the
+      work justifies, and because an unexplained multi-minute gap is exactly the
+      kind of thing later mis-attributed to the server. Start by timing the
+      daemon shutdown path — the gauge's own test phase was 86s.
+
+- [ ] **OPEN — `.detached-runs/<name>.json` can report `exit_code: null` for a
+      process that finished long ago (2026-09-28).** The pymongo gauge finished
+      in 2m39s and wrote both artifacts; its state file still read
+      `exit_code: null` two hours later with the recorded pid dead.
+
+      `exit_code: null` means "no exit was recorded", NOT "still running" —
+      a waiter that polls that field alone waits forever. Check the pid with
+      `ps -p`, and treat a low load average as corroborating evidence. Cost here
+      was only a delay, but a `wait --name` loop would have hung indefinitely.
+
 - [ ] **OPEN — seven `-rust-server` reports carry a date weeks newer than the
       measurement behind them (2026-09-28).** The `Generated <date>` line
       records when the report GENERATOR ran, not when the tests ran, and for

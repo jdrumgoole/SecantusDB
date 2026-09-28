@@ -155,16 +155,64 @@ none, and this section had it pointing the wrong way.**
 
   That probe also produced **§6's reproducer** as a side effect: see below.
 
-### 5. Re-run the other-language gauges on both servers -- after Step 2
+### 5. Re-run the gauges -- DONE for the RUST server, 2026-09-28
 
-- Go / Node / Java / Kotlin / Ruby / Rust-driver / PHP / C / C++ / .NET were
-  not re-measured after #1569. Their failpoint tests now run too.
-- **Sequence this after Step 2**, so the sweep measures a Rust server that has
-  the transaction fixes rather than producing a baseline that is obsolete on
-  publication -- which is precisely how PR #1595 went stale.
-- Expect both pass counts and failure counts to rise. Treat new failures as bug
-  reports: the pymongo rerun is how the Rust session-abort and change-stream
-  token bugs were found.
+Eleven gauges, all against `secantusd-rs` built from `d971ef9e`. Every row was
+checked for truncation before being believed -- tests started versus tests that
+reported a result, and the raw artifact's mtime before and after the run.
+
+| gauge | passed | failed | skipped | rate |
+| --- | ---: | ---: | ---: | ---: |
+| C++ (`mongocxx`) | 892 | 0 | 9 | **100.0%** |
+| Kotlin | 340 | 0 | 198 | **100.0%** |
+| .NET | 228 | 0 | 0 | **100.0%** |
+| php-lib | 3,101 | 1 | 27 | 99.9% |
+| php-ext | 679 | 1 | 35 | 99.8% |
+| Node | 357 | 1 | 6 | 99.7% |
+| Ruby | 293 | 1 | 24 | 99.6% |
+| **pymongo** | **1,205** | **5** | **290** | **99.5%** |
+| Java | 493 | 3 | 404 | 99.3% |
+| mongo-rust-driver | 100 | 1 | 0 | 99.0% |
+| Go | 439 | 0 | 37 | *withheld -- run truncated* |
+
+**pymongo hit Step 2's predicted number exactly: 1,205 / 5.** The five remaining
+failures are precisely §7's leave-alone list and nothing else (hashed indexes,
+text indexes, `$where` x2, `test_to_list_csot_applied`), so the Rust server went
+15 failures -> 5 and is now level with the Python server on this gauge.
+
+**The prediction in the old text -- "expect both pass counts and failure counts
+to rise" -- did not hold, and the reason matters.** Failure counts FELL almost
+everywhere, because the transaction cluster was the bulk of them and Step 2
+closed it. What rose instead was confidence, and only because each run was
+audited: three of these gauges would have reported a number that was not a
+measurement.
+
+**What the sweep actually found was measurement bugs, not server bugs**
+(#1613):
+
+- The **Go** gauge printed 100.0% over a run truncated by a 30-minute DNS hang
+  -- 476 of 481 tests, on both servers, back through the committed
+  2026-09-21 report. Its rate is withheld above for that reason; 439 of 439
+  tests that RAN passed.
+- The **pymongo** gauge, on its first attempt, crashed in one second on a
+  missing `_secantus_server` and still published "Generated 2026-09-28 --
+  0.6.0b17, 99.4%" over a raw artifact from **30 August**, with figures that had
+  drifted -- so a diff read as a fresh run catching a regression.
+- Seven `-rust-server` reports were dated weeks after their data (filed in
+  `tasks/backlog.md` §5).
+
+**Genuinely new server-side findings, all filed rather than fixed here:**
+
+- Java: `GeoJsonFiltersFunctionalSpecification#$geoIntersects` returns `[]`
+  where four documents are expected.
+- php-lib: `WatchFunctionalTest::testOriginalReadPreferenceIsPreservedOnResume`.
+- C driver: 8 failures, clustered in `/Client/select_server/*` and
+  `/Client/ipv6/*` (topology/connection-string surface) plus
+  `/find_and_modify/hint` and `/crud/prose_test_9`.
+
+**Still to do:** the Python server half of this step. The Python reports are
+also stale, and `validation_summary/driver_panels.py` reads only the Python
+artifacts, so the published panels have not moved.
 
 ### 6. Real `maxTimeMS` enforcement in Rust -- a project, not a fix
 

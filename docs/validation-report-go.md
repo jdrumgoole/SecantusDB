@@ -1,8 +1,25 @@
 # mongo-go-driver Validation Report
 
-Generated 2026-09-27 — SecantusDB 0.6.0b17 vs mongo-go-driver fd85a834c40e (`vendor/mongo-go-driver/`).
+Generated 2026-09-28 — SecantusDB 0.6.0b17 vs mongo-go-driver fd85a834c40e (`vendor/mongo-go-driver/`).
 
 Run `uv run python -m invoke validate-go` to refresh. The pass rate is the analogue of the pymongo conformance gauge for the official Go driver — same shape, different wire-protocol pickiness. Type-strict bugs (int32 vs int64) that pymongo accepts silently fail loudly here.
+
+> **THIS RUN WAS TRUNCATED — the pass rate below is not a**
+> **conformance result.** The test binary stopped before
+> every test reported, so the rate describes only the
+> subset that finished. Fix the cause and re-run before
+> quoting any number from this file.
+>
+> Started but never completed (5):
+>
+> ```
+> go.mongodb.org/mongo-driver/v2/internal/integration::TestClient_BSONOptions
+> go.mongodb.org/mongo-driver/v2/internal/integration::TestCommandLoggingAndMonitoringProse
+> go.mongodb.org/mongo-driver/v2/internal/integration::TestInitialDNSSeedlistDiscoverySpec
+> go.mongodb.org/mongo-driver/v2/internal/integration::TestInitialDNSSeedlistDiscoverySpec/replica_set
+> go.mongodb.org/mongo-driver/v2/internal/integration::TestInitialDNSSeedlistDiscoverySpec/replica_set/txt-record-with-overridden-ssl-option.json
+> ```
+> Packages reporting `fail` with no failing test beneath them (a binary that died without accounting for its tests): internal/integration
 
 ## Summary by package
 
