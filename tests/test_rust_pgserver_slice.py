@@ -11203,3 +11203,378 @@ def test_subqueries_work_in_update_and_delete_predicates(home: Path) -> None:
         cur.execute("DELETE FROM sq_emp WHERE dept_id IN (SELECT id FROM sq_dept WHERE budget = 1)")
         cur.execute("SELECT count(*) FROM sq_emp")
         assert cur.fetchall() == [(2,)]
+
+
+def _windowed(conn: psycopg.Connection) -> None:
+    """A table shaped so the window edge cases are reachable.
+
+    `dan` has a NULL `v` and rows 2 and 3 TIE on it: the NULL separates the
+    aggregates (which skip it) from `count(*)` (which does not), and the tie is
+    what makes `rank` differ from `row_number` and a RANGE frame differ from a
+    ROWS one.
+    """
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE w9 (id int PRIMARY KEY, g text, v int)")
+    cur.execute(
+        "INSERT INTO w9 VALUES (1,'a',10),(2,'a',20),(3,'a',20),(4,'b',5),(5,'b',NULL),(6,'b',30)"
+    )
+
+
+@pytest.mark.parametrize(
+    "sql,expected",
+    [
+        # Ranking. `rank` skips after a tie, `dense_rank` does not, and
+        # `row_number` never ties. NULL sorts LAST ascending in PostgreSQL.
+        (
+            "SELECT id, row_number() OVER (ORDER BY id) FROM w9 ORDER BY id",
+            [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)],
+        ),
+        (
+            "SELECT id, rank() OVER (ORDER BY v), dense_rank() OVER (ORDER BY v) "
+            "FROM w9 ORDER BY id",
+            [(1, 2, 2), (2, 3, 3), (3, 3, 3), (4, 1, 1), (5, 6, 5), (6, 5, 4)],
+        ),
+        (
+            "SELECT id, rank() OVER (ORDER BY v NULLS FIRST) FROM w9 ORDER BY id",
+            [(1, 3), (2, 4), (3, 4), (4, 2), (5, 1), (6, 6)],
+        ),
+        # The DEFAULT frame is RANGE UNBOUNDED PRECEDING TO CURRENT ROW, so a
+        # running sum gives TIED rows the SAME total -- ids 2 and 3 both see
+        # each other. This is the single most important window behaviour to
+        # get right, and the one a ROWS-shaped implementation gets wrong.
+        (
+            "SELECT id, sum(v) OVER (ORDER BY v) FROM w9 ORDER BY id",
+            [(1, 15), (2, 55), (3, 55), (4, 5), (5, 85), (6, 85)],
+        ),
+        # No ORDER BY at all: every row is a peer, so the frame is the whole
+        # partition and the same rule gives the partition total.
+        (
+            "SELECT id, sum(v) OVER (PARTITION BY g) FROM w9 ORDER BY id",
+            [(1, 50), (2, 50), (3, 50), (4, 35), (5, 35), (6, 35)],
+        ),
+        # count(*) counts rows including the NULL; count(v) skips it.
+        (
+            "SELECT id, count(v) OVER (), count(*) OVER () FROM w9 ORDER BY id",
+            [(i, 5, 6) for i in range(1, 7)],
+        ),
+        # lag / lead, with and without an explicit offset and default.
+        (
+            "SELECT id, lag(v) OVER (ORDER BY id), lead(v) OVER (ORDER BY id) FROM w9 ORDER BY id",
+            [
+                (1, None, 20),
+                (2, 10, 20),
+                (3, 20, 5),
+                (4, 20, None),
+                (5, 5, 30),
+                (6, None, None),
+            ],
+        ),
+        (
+            "SELECT id, lag(v, 2, -7) OVER (ORDER BY id) FROM w9 ORDER BY id",
+            [(1, -7), (2, -7), (3, 10), (4, 20), (5, 20), (6, 5)],
+        ),
+        # A ROWS frame counts ROWS, so a tie does NOT pull its partner in.
+        (
+            "SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING "
+            "AND CURRENT ROW) FROM w9 ORDER BY id",
+            [(1, 10), (2, 30), (3, 50), (4, 55), (5, 55), (6, 85)],
+        ),
+        (
+            "SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) "
+            "FROM w9 ORDER BY id",
+            [(1, 30), (2, 50), (3, 45), (4, 25), (5, 35), (6, 30)],
+        ),
+        # A frame that reaches past the partition on both sides is EMPTY: the
+        # aggregates answer NULL and count answers 0.
+        (
+            "SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN 3 PRECEDING AND 2 PRECEDING), "
+            "count(*) OVER (ORDER BY id ROWS BETWEEN 5 FOLLOWING AND 6 FOLLOWING) "
+            "FROM w9 ORDER BY id LIMIT 1",
+            [(1, None, 1)],
+        ),
+        # first_value / last_value under the DEFAULT frame -- the classic
+        # surprise, because the frame ends at the current row's peers rather
+        # than at the partition's end.
+        (
+            "SELECT id, first_value(v) OVER (ORDER BY id), last_value(v) OVER (ORDER BY id) "
+            "FROM w9 ORDER BY id",
+            [(1, 10, 10), (2, 10, 20), (3, 10, 20), (4, 10, 5), (5, 10, None), (6, 10, 30)],
+        ),
+        (
+            "SELECT id, nth_value(v, 2) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING "
+            "AND UNBOUNDED FOLLOWING) FROM w9 ORDER BY id",
+            [(i, 20) for i in range(1, 7)],
+        ),
+        # ntile spreads the remainder over the EARLIEST buckets.
+        (
+            "SELECT id, ntile(4) OVER (ORDER BY id) FROM w9 ORDER BY id",
+            [(1, 1), (2, 1), (3, 2), (4, 2), (5, 3), (6, 4)],
+        ),
+        # PARTITION BY plus ORDER BY, and a DESC order.
+        (
+            "SELECT id, row_number() OVER (PARTITION BY g ORDER BY v DESC) FROM w9 ORDER BY id",
+            [(1, 3), (2, 1), (3, 2), (4, 3), (5, 1), (6, 2)],
+        ),
+        # A named window, in both spellings. `OVER w` and `OVER (w ...)` put
+        # the reference in DIFFERENT parser fields, and reading only one of
+        # them made `OVER w` lose its ORDER BY -- a whole-partition total where
+        # PostgreSQL gives a running one.
+        (
+            "SELECT id, sum(v) OVER w FROM w9 WINDOW w AS (ORDER BY id) ORDER BY id",
+            [(1, 10), (2, 30), (3, 50), (4, 55), (5, 55), (6, 85)],
+        ),
+        (
+            "SELECT id, sum(v) OVER (w ORDER BY id) FROM w9 WINDOW w AS (PARTITION BY g) "
+            "ORDER BY id",
+            [(1, 10), (2, 30), (3, 50), (4, 5), (5, 5), (6, 35)],
+        ),
+        # EXCLUDE, all three forms, over a window with a tie. It is part of
+        # the FRAME clause, so PostgreSQL needs one before it -- `over (order
+        # by v exclude current row)` is a syntax error there as well as here,
+        # and writing it that way made three corpus lines agree on the error
+        # while testing nothing.
+        (
+            "SELECT id, sum(v) OVER (ORDER BY v RANGE BETWEEN UNBOUNDED PRECEDING "
+            "AND CURRENT ROW EXCLUDE CURRENT ROW) FROM w9 ORDER BY id",
+            [(1, 5), (2, 35), (3, 35), (4, None), (5, 85), (6, 55)],
+        ),
+        (
+            "SELECT id, sum(v) OVER (ORDER BY v RANGE BETWEEN UNBOUNDED PRECEDING "
+            "AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) FROM w9 ORDER BY id",
+            [(1, 75), (2, 65), (3, 65), (4, 80), (5, 85), (6, 55)],
+        ),
+        (
+            "SELECT id, sum(v) OVER (ORDER BY v RANGE BETWEEN UNBOUNDED PRECEDING "
+            "AND UNBOUNDED FOLLOWING EXCLUDE GROUP) FROM w9 ORDER BY id",
+            [(1, 75), (2, 45), (3, 45), (4, 80), (5, 85), (6, 55)],
+        ),
+        # TIES drops the current row's PEERS but keeps the row itself, so it
+        # is not simply a narrower frame.
+        (
+            "SELECT id, sum(v) OVER (ORDER BY v RANGE BETWEEN UNBOUNDED PRECEDING "
+            "AND UNBOUNDED FOLLOWING EXCLUDE TIES) FROM w9 ORDER BY id",
+            [(1, 85), (2, 65), (3, 65), (4, 85), (5, 85), (6, 85)],
+        ),
+        # GROUPS counts PEER GROUPS rather than rows, so the tie counts once.
+        (
+            "SELECT id, sum(v) OVER (ORDER BY v GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) "
+            "FROM w9 ORDER BY id",
+            [(1, 15), (2, 50), (3, 50), (4, 5), (5, 30), (6, 70)],
+        ),
+        # RANGE with a VALUE offset: the bound is the current row's value
+        # shifted, not a row count.
+        (
+            "SELECT id, sum(v) OVER (ORDER BY v RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING) "
+            "FROM w9 ORDER BY id",
+            [(1, 15), (2, 40), (3, 40), (4, 15), (5, None), (6, 30)],
+        ),
+        # FILTER removes a row from the AGGREGATION, not from the output.
+        (
+            "SELECT id, count(*) FILTER (WHERE v > 10) OVER (ORDER BY id) FROM w9 ORDER BY id",
+            [(1, 0), (2, 1), (3, 2), (4, 2), (5, 2), (6, 3)],
+        ),
+        # The aggregate family as windows, through the ordinary accumulator.
+        (
+            "SELECT id, min(v) OVER (ORDER BY id), max(v) OVER (ORDER BY id) "
+            "FROM w9 ORDER BY id LIMIT 3",
+            [(1, 10, 10), (2, 10, 20), (3, 10, 20)],
+        ),
+        (
+            "SELECT id, string_agg(g, '-') OVER (ORDER BY id) FROM w9 ORDER BY id LIMIT 3",
+            [(1, "a"), (2, "a-a"), (3, "a-a-a")],
+        ),
+        (
+            "SELECT id, array_agg(v) OVER (ORDER BY id) FROM w9 ORDER BY id LIMIT 2",
+            [(1, [10]), (2, [10, 20])],
+        ),
+        # The WHERE runs BEFORE the window, the ORDER BY / LIMIT after it.
+        (
+            "SELECT id, count(*) OVER () FROM w9 WHERE v IS NOT NULL ORDER BY id",
+            [(1, 5), (2, 5), (3, 5), (4, 5), (6, 5)],
+        ),
+        (
+            "SELECT id, row_number() OVER (ORDER BY id) AS rn FROM w9 ORDER BY id DESC LIMIT 2",
+            [(6, 6), (5, 5)],
+        ),
+    ],
+)
+def test_window_functions_match_postgres(home: Path, sql: str, expected: list[tuple]) -> None:
+    """Answers checked against a live PostgreSQL 14.13; PostgreSQL is the reference."""
+    with _Server(home) as server, server.connect() as conn:
+        _windowed(conn)
+        cur = conn.cursor()
+        cur.execute(sql)
+        assert cur.fetchall() == expected
+
+
+def test_a_window_reports_postgres_column_types(home: Path) -> None:
+    """`row_number()` is int8, `ntile` int4, `percent_rank` float8.
+
+    The synthetic `__winN` field is not in any table, so a reader that rebuilt
+    the def from the catalog could not type it and fell through to the varchar
+    default -- every window value went over the wire as TEXT while its VALUE
+    was right, which a row comparison alone does not catch.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        _windowed(conn)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT row_number() OVER (), ntile(2) OVER (), percent_rank() OVER (ORDER BY id), "
+            "sum(v) OVER (), avg(v) OVER () FROM w9"
+        )
+        oids = [c.type_code for c in cur.description]
+        # int8, int4, float8, int8 (sum of int4 widens), numeric.
+        assert oids == [20, 23, 701, 20, 1700]
+
+
+def test_windows_run_before_distinct_and_can_be_ordered_by_their_alias(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        _windowed(conn)
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT count(*) OVER (PARTITION BY g) FROM w9 ORDER BY 1")
+        assert cur.fetchall() == [(3,)]
+        # `ORDER BY rn` names the OUTPUT column, which is the only way to sort
+        # by a window's result.
+        cur.execute("SELECT id, row_number() OVER (ORDER BY v) AS rn FROM w9 ORDER BY rn LIMIT 2")
+        assert cur.fetchall() == [(4, 1), (1, 2)]
+
+
+def test_a_window_is_visible_through_a_subquery_and_a_cte(home: Path) -> None:
+    """The synthetic column has to reach the subquery's published def, or the
+    query around it cannot name what the window computed."""
+    with _Server(home) as server, server.connect() as conn:
+        _windowed(conn)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT rn FROM (SELECT row_number() OVER (ORDER BY id) AS rn FROM w9) s "
+            "WHERE rn > 4 ORDER BY rn"
+        )
+        assert cur.fetchall() == [(5,), (6,)]
+        cur.execute(
+            "WITH c AS (SELECT id, rank() OVER (ORDER BY v) AS r FROM w9) "
+            "SELECT id, r FROM c WHERE r = 1 ORDER BY id"
+        )
+        assert cur.fetchall() == [(4, 1)]
+
+
+def test_order_by_an_output_alias_resolves_to_the_output(home: Path) -> None:
+    """PostgreSQL's ORDER BY sees the select list's names, and prefers them.
+
+    Independent of windows -- `select id as d ... order by d` answered
+    `42703 column "d" does not exist` -- but it is what makes a window usable,
+    since `ORDER BY rn` is the only way to sort by one.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        _windowed(conn)
+        cur = conn.cursor()
+        cur.execute("SELECT id * 2 AS d FROM w9 ORDER BY d LIMIT 2")
+        assert cur.fetchall() == [(2,), (4,)]
+        # The OUTPUT name wins over a table column of the same name.
+        cur.execute("SELECT v AS id FROM w9 ORDER BY id NULLS FIRST LIMIT 2")
+        assert cur.fetchall() == [(None,), (5,)]
+
+
+def test_an_unknown_named_window_and_a_bad_ntile_are_named_errors(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        _windowed(conn)
+        cur = conn.cursor()
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute("SELECT sum(v) OVER nosuchwindow FROM w9")
+        assert info.value.sqlstate == "42704"
+        conn.rollback()
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute("SELECT ntile(0) OVER (ORDER BY id) FROM w9")
+        # PostgreSQL gives ntile its OWN class rather than the generic 22023.
+        assert info.value.sqlstate == "22014"
+
+
+def test_a_window_over_an_aggregate_is_refused_by_its_real_name(home: Path) -> None:
+    """`sum(sum(v)) OVER (...)` beside a GROUP BY runs the window over the
+    GROUPED rows, which the aggregate planner does not do.
+
+    The message matters as much as the refusal: routed on into the aggregate
+    planner it came out as `function sum() is not supported yet`, which is
+    false, and sends whoever reads it looking in the wrong place.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        _windowed(conn)
+        cur = conn.cursor()
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute("SELECT g, sum(sum(v)) OVER (ORDER BY g) FROM w9 GROUP BY g")
+        assert info.value.sqlstate == "0A000"
+        assert "window function over an aggregate" in str(info.value)
+
+
+def test_a_window_aggregate_no_longer_demands_a_group_by(home: Path) -> None:
+    """The bug this change exists to remove.
+
+    `sum(v) OVER (...)` is a WINDOW call, but `has_aggregate` matched it on
+    the name alone and routed it into the aggregate planner, which answered
+    `42803 column "id" must appear in the GROUP BY clause` -- blaming the
+    user's query for a feature the server did not have.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        _windowed(conn)
+        cur = conn.cursor()
+        cur.execute("SELECT id, sum(v) OVER () FROM w9 ORDER BY id LIMIT 1")
+        assert cur.fetchall() == [(1, 85)]
+
+
+@pytest.mark.parametrize(
+    "sql,expected",
+    [
+        # Both bounds on ONE side of the current row. These are the shapes the
+        # first implementation got wrong: it walked outward from the current
+        # row and chose the direction from the OFFSET'S SIGN, when what
+        # decides it is which BOUND is being resolved. `1 FOLLOWING AND 20
+        # FOLLOWING` returned the whole partition.
+        (
+            "SELECT id, sum(v) OVER (ORDER BY v RANGE BETWEEN 1 FOLLOWING AND 20 FOLLOWING) "
+            "FROM w9 ORDER BY id",
+            [(1, 70), (2, 30), (3, 30), (4, 50), (5, None), (6, None)],
+        ),
+        (
+            "SELECT id, sum(v) OVER (ORDER BY v RANGE BETWEEN 20 PRECEDING AND 1 PRECEDING) "
+            "FROM w9 ORDER BY id",
+            [(1, 5), (2, 15), (3, 15), (4, None), (5, None), (6, 50)],
+        ),
+        (
+            "SELECT id, count(*) OVER (ORDER BY v RANGE BETWEEN 5 FOLLOWING AND 10 FOLLOWING) "
+            "FROM w9 ORDER BY id",
+            [(1, 2), (2, 1), (3, 1), (4, 1), (5, 1), (6, 0)],
+        ),
+        # A DESCENDING order: the bound is still `key + shift` once the key is
+        # negated, so PRECEDING still means earlier in WINDOW order.
+        (
+            "SELECT id, count(*) OVER (ORDER BY v DESC RANGE BETWEEN 1 FOLLOWING AND 20 FOLLOWING)"
+            " FROM w9 ORDER BY id",
+            [(1, 1), (2, 2), (3, 2), (4, 0), (5, 1), (6, 3)],
+        ),
+        # A zero-width frame is the current row AND ITS PEERS, not just the row.
+        (
+            "SELECT id, sum(v) OVER (ORDER BY v RANGE BETWEEN 0 PRECEDING AND 0 FOLLOWING) "
+            "FROM w9 ORDER BY id",
+            [(1, 10), (2, 40), (3, 40), (4, 5), (5, None), (6, 30)],
+        ),
+        # GROUPS counts peer GROUPS the same way.
+        (
+            "SELECT id, count(*) OVER (ORDER BY v GROUPS BETWEEN 1 FOLLOWING AND 2 FOLLOWING) "
+            "FROM w9 ORDER BY id",
+            [(1, 3), (2, 2), (3, 2), (4, 3), (5, 0), (6, 1)],
+        ),
+    ],
+)
+def test_one_sided_range_and_groups_frames_match_postgres(
+    home: Path, sql: str, expected: list[tuple]
+) -> None:
+    """Answers checked against a live PostgreSQL 14.13.
+
+    These were found by probing a shape NEITHER of the first two window
+    corpora reached -- every one of them was a wrong answer, silently, while
+    83 other lines agreed.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        _windowed(conn)
+        cur = conn.cursor()
+        cur.execute(sql)
+        assert cur.fetchall() == expected

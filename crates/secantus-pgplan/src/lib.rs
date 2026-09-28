@@ -131,6 +131,15 @@ pub enum Error {
     /// A subquery used as a value that returned more than one row -> 21000
     /// (cardinality_violation).
     CardinalityViolation(String),
+    /// A window function used where one is not allowed, or a frame clause
+    /// PostgreSQL itself rejects -> 42P20 (windowing_error). Its own class,
+    /// not 0A000: PostgreSQL refuses these too, so they are the answer a real
+    /// server gives rather than a gap in this one.
+    Windowing(String),
+    /// `ntile(0)` -> 22014 (invalid_argument_for_ntile_function).
+    /// PostgreSQL gives the ntile and nth_value argument checks their OWN
+    /// class rather than the generic 22023 an invalid parameter gets.
+    InvalidNtileArgument(String),
     /// An error PostgreSQL reports under the internal class -> XX000. The
     /// PostGIS parsers do this for malformed geometry text and GeoJSON,
     /// so a client matching on `InternalError` sees the same class.
@@ -144,6 +153,8 @@ impl std::fmt::Display for Error {
             Error::Unsupported(m) => write!(f, "{m} is not supported yet"),
             Error::FeatureNotSupported(m) => write!(f, "{m}"),
             Error::CardinalityViolation(m) => write!(f, "{m}"),
+            Error::InvalidNtileArgument(m) => write!(f, "{m}"),
+            Error::Windowing(m) => write!(f, "{m}"),
             Error::UndefinedColumn(c) => write!(f, "column \"{c}\" does not exist"),
             Error::UndefinedField(m) => write!(f, "{m}"),
             Error::UndefinedTable(t) => write!(f, "relation \"{t}\" does not exist"),
@@ -204,6 +215,8 @@ impl Error {
             Error::Parse(_) => "42601", // syntax_error
             Error::Unsupported(_) | Error::FeatureNotSupported(_) => "0A000", // feature_not_supported
             Error::CardinalityViolation(_) => "21000", // cardinality_violation
+            Error::InvalidNtileArgument(_) => "22014", // invalid_argument_for_ntile_function
+            Error::Windowing(_) => "42P20",            // windowing_error
             Error::UndefinedColumn(_) | Error::UndefinedField(_) => "42703",
             Error::UndefinedTable(_) => "42P01",
             Error::InvalidName(_) => "42602", // invalid_name
@@ -676,6 +689,10 @@ pub struct SetOpOrder {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
     pub table: String,
+    /// Window functions in the select list, each computing into its own
+    /// synthetic `__winN` field. Evaluated after the WHERE and before
+    /// `DISTINCT` / `ORDER BY` / `LIMIT`, which is PostgreSQL's order.
+    pub windows: Vec<WindowItem>,
     /// A FROM-subquery (`FROM (SELECT ...) s`) or an inlined CTE reference
     /// standing in for a table. The executor materialises the inner plan's
     /// rows first and the outer query runs over them, which is why this is a
@@ -717,6 +734,140 @@ pub struct Select {
     /// which refuses it) and nowhere else, so a plain `SELECT DISTINCT`
     /// returned its duplicates.
     pub distinct: Distinct,
+}
+
+/// One window function in the select list -- `sum(v) OVER (PARTITION BY g
+/// ORDER BY id)`.
+///
+/// Computed into `field` (a synthetic `__winN`) over the materialised rows,
+/// which the select list then projects like any stored column -- the same
+/// trick `ORDER BY upper(a)` uses for its `__orderN`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowItem {
+    /// The synthetic field the value lands in.
+    pub field: String,
+    pub func: WindowFunc,
+    /// The function's argument, evaluated per row. `None` for the
+    /// argument-less ranking functions and for `count(*)`.
+    pub arg: Option<ColumnExpr>,
+    /// Extra LITERAL arguments: `lag`/`lead`'s offset and default,
+    /// `nth_value`'s N, `ntile`'s bucket count.
+    pub args: Vec<Bson>,
+    /// `PARTITION BY`: rows are grouped by these before anything else. Reuses
+    /// `OrderKey` so one comparator serves partitioning and ordering both;
+    /// the direction and null placement are unused here.
+    pub partition_by: Vec<OrderKey>,
+    pub order_by: Vec<OrderKey>,
+    pub frame: WindowFrame,
+    /// Fixed at plan time, for the DESCRIBE pass that never sees a row.
+    pub result_type: String,
+    /// The ARGUMENT's declared type, which `sum` and `avg` need to promote
+    /// the way PostgreSQL does (int4 sums as int8, numeric sums exactly).
+    pub source_type: Option<String>,
+    /// `FILTER (WHERE ...)`, evaluated per row; a row that fails it is not
+    /// AGGREGATED but still gets an output value.
+    pub filter: Option<ColumnExpr>,
+}
+
+/// The window functions this server computes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFunc {
+    RowNumber,
+    Rank,
+    DenseRank,
+    PercentRank,
+    CumeDist,
+    Ntile,
+    Lag,
+    Lead,
+    FirstValue,
+    LastValue,
+    NthValue,
+    Sum,
+    Count,
+    CountStar,
+    Avg,
+    Min,
+    Max,
+    StringAgg,
+    ArrayAgg,
+    BoolAnd,
+    BoolOr,
+}
+
+impl WindowFunc {
+    /// True for the functions whose value depends only on the row's POSITION
+    /// in the window ordering, not on the frame. PostgreSQL ignores the frame
+    /// clause for these, so a frame written beside one must not be applied.
+    pub fn ignores_frame(self) -> bool {
+        matches!(
+            self,
+            WindowFunc::RowNumber
+                | WindowFunc::Rank
+                | WindowFunc::DenseRank
+                | WindowFunc::PercentRank
+                | WindowFunc::CumeDist
+                | WindowFunc::Ntile
+                | WindowFunc::Lag
+                | WindowFunc::Lead
+        )
+    }
+}
+
+/// A window frame: which rows of the partition the function sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowFrame {
+    pub mode: FrameMode,
+    pub start: FrameBound,
+    pub end: FrameBound,
+    pub exclude: FrameExclude,
+}
+
+/// `EXCLUDE` removes rows from the frame AFTER its bounds are found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameExclude {
+    /// The default: nothing is removed.
+    NoOthers,
+    /// The current row only.
+    CurrentRow,
+    /// The current row and every row that ties with it on the ORDER BY.
+    Group,
+    /// The ties but NOT the current row itself.
+    Ties,
+}
+
+impl WindowFrame {
+    /// PostgreSQL's DEFAULT frame, which is the same whether or not the window
+    /// has an ORDER BY: `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`
+    /// (measured -- `over ()`, `over (order by id)` and `over (partition by g)`
+    /// all parse to the identical `frame_options`).
+    ///
+    /// The familiar difference between a RUNNING total and a whole-partition
+    /// one therefore needs no special case: under RANGE the frame ends at the
+    /// last PEER of the current row, and with no ORDER BY every row in the
+    /// partition is a peer of every other, so the frame is the partition.
+    pub const DEFAULT: Self = Self {
+        mode: FrameMode::Range,
+        start: FrameBound::UnboundedPreceding,
+        end: FrameBound::CurrentRow,
+        exclude: FrameExclude::NoOthers,
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameMode {
+    Rows,
+    Range,
+    Groups,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameBound {
+    UnboundedPreceding,
+    Preceding(i64),
+    CurrentRow,
+    Following(i64),
+    UnboundedFollowing,
 }
 
 /// A subquery standing in for a table in FROM.
@@ -3257,6 +3408,468 @@ fn contains_nested_aggregate(node: &pg_query::protobuf::Node) -> bool {
     walk(Some(node), 0)
 }
 
+/// PostgreSQL's `frame_options` bitmask, measured rather than copied: each
+/// constant below was confirmed by parsing the clause it names and printing
+/// the mask (`over ()` is `0x422`, `rows between 2 preceding and 1 preceding`
+/// is `0x1815`, and so on).
+mod frameopt {
+    pub const NONDEFAULT: i32 = 0x00001;
+    pub const RANGE: i32 = 0x00002;
+    pub const ROWS: i32 = 0x00004;
+    pub const GROUPS: i32 = 0x00008;
+    pub const START_UNBOUNDED_PRECEDING: i32 = 0x00020;
+    pub const END_UNBOUNDED_FOLLOWING: i32 = 0x00100;
+    pub const START_CURRENT_ROW: i32 = 0x00200;
+    pub const END_CURRENT_ROW: i32 = 0x00400;
+    pub const START_OFFSET_PRECEDING: i32 = 0x00800;
+    pub const END_OFFSET_PRECEDING: i32 = 0x01000;
+    pub const START_OFFSET_FOLLOWING: i32 = 0x02000;
+    pub const END_OFFSET_FOLLOWING: i32 = 0x04000;
+    pub const EXCLUDE_CURRENT_ROW: i32 = 0x08000;
+    pub const EXCLUDE_GROUP: i32 = 0x10000;
+    pub const EXCLUDE_TIES: i32 = 0x20000;
+}
+
+/// True when any select-list target is a window call.
+///
+/// A window call is a `FuncCall` carrying `OVER`, which is what separates
+/// `sum(v) OVER (...)` from the aggregate `sum(v)`. `has_aggregate` has to
+/// exclude them for the same reason: routed into the aggregate planner, a
+/// window `sum` demanded a GROUP BY and the client got
+/// `42803 column "id" must appear in the GROUP BY clause` -- an error blaming
+/// the user's own query for a feature this server did not have.
+fn has_window(s: &pg_query::protobuf::SelectStmt) -> bool {
+    s.target_list.iter().any(|t| {
+        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+            return false;
+        };
+        node_has_window(rt.val.as_deref())
+    })
+}
+
+fn node_has_window(node: Option<&pg_query::protobuf::Node>) -> bool {
+    let Some(node) = node.and_then(|n| n.node.as_ref()) else {
+        return false;
+    };
+    match node {
+        N::FuncCall(f) => f.over.is_some() || f.args.iter().any(|a| node_has_window(Some(a))),
+        N::TypeCast(tc) => node_has_window(tc.arg.as_deref()),
+        N::AExpr(e) => node_has_window(e.lexpr.as_deref()) || node_has_window(e.rexpr.as_deref()),
+        _ => false,
+    }
+}
+
+/// The window functions by name, with the result type PostgreSQL gives them.
+///
+/// `sum` and friends are absent: their result type depends on the argument, so
+/// they are resolved by `window_result_type` against the column instead.
+fn window_func_by_name(name: &str) -> Option<WindowFunc> {
+    Some(match name {
+        "row_number" => WindowFunc::RowNumber,
+        "rank" => WindowFunc::Rank,
+        "dense_rank" => WindowFunc::DenseRank,
+        "percent_rank" => WindowFunc::PercentRank,
+        "cume_dist" => WindowFunc::CumeDist,
+        "ntile" => WindowFunc::Ntile,
+        "lag" => WindowFunc::Lag,
+        "lead" => WindowFunc::Lead,
+        "first_value" => WindowFunc::FirstValue,
+        "last_value" => WindowFunc::LastValue,
+        "nth_value" => WindowFunc::NthValue,
+        "sum" => WindowFunc::Sum,
+        "count" => WindowFunc::Count,
+        "avg" => WindowFunc::Avg,
+        "min" => WindowFunc::Min,
+        "max" => WindowFunc::Max,
+        "string_agg" => WindowFunc::StringAgg,
+        "array_agg" => WindowFunc::ArrayAgg,
+        "bool_and" => WindowFunc::BoolAnd,
+        "bool_or" => WindowFunc::BoolOr,
+        _ => return None,
+    })
+}
+
+/// The type a window function reports, given its argument's type.
+fn window_result_type(func: WindowFunc, source: Option<&str>) -> String {
+    match func {
+        // `row_number`, `rank`, `dense_rank` and `count` are int8 in
+        // PostgreSQL, not int4 -- a client that decoded them as int4 would
+        // read the wrong width off the wire.
+        WindowFunc::RowNumber
+        | WindowFunc::Rank
+        | WindowFunc::DenseRank
+        | WindowFunc::Count
+        | WindowFunc::CountStar => "int8".to_string(),
+        WindowFunc::Ntile => "int4".to_string(),
+        WindowFunc::PercentRank | WindowFunc::CumeDist => "float8".to_string(),
+        WindowFunc::Sum => sum_result_type(source).to_string(),
+        WindowFunc::Avg => avg_result_type(source).to_string(),
+        WindowFunc::StringAgg => "text".to_string(),
+        WindowFunc::BoolAnd | WindowFunc::BoolOr => "bool".to_string(),
+        WindowFunc::ArrayAgg => format!("{}[]", source.unwrap_or("text")),
+        // The value-returning ones keep their argument's type.
+        WindowFunc::Lag
+        | WindowFunc::Lead
+        | WindowFunc::FirstValue
+        | WindowFunc::LastValue
+        | WindowFunc::NthValue
+        | WindowFunc::Min
+        | WindowFunc::Max => source.unwrap_or("text").to_string(),
+    }
+}
+
+/// One `OVER (...)` clause, resolved against any named windows in scope.
+fn plan_window_def(
+    over: &pg_query::protobuf::WindowDef,
+    named: &[pg_query::protobuf::WindowDef],
+    def: &TableDef,
+    params: &[Bson],
+    keys: &mut usize,
+) -> Result<(Vec<OrderKey>, Vec<OrderKey>, WindowFrame)> {
+    // `OVER w` and `OVER (w ORDER BY ...)` both arrive with `refname` set; the
+    // named window supplies what the reference does not override. PostgreSQL
+    // forbids a reference overriding PARTITION BY or an existing ORDER BY, and
+    // this follows it by taking the named clause whenever it is non-empty.
+    // The two spellings put the referenced name in DIFFERENT fields, measured
+    // rather than assumed: a bare `OVER w` sets `name`, while `OVER (w ORDER
+    // BY ...)` sets `refname`. Reading only `refname` left `OVER w` with no
+    // ORDER BY at all, so every row became a peer and `sum(v) OVER w` answered
+    // the whole-partition total where PostgreSQL gives a running one -- a
+    // wrong answer, not an error.
+    let reference = if over.refname.is_empty() {
+        over.name.as_str()
+    } else {
+        over.refname.as_str()
+    };
+    let base = if reference.is_empty() {
+        None
+    } else {
+        Some(named.iter().find(|w| w.name == reference).ok_or_else(|| {
+            Error::UndefinedObject(format!("window \"{reference}\" does not exist"))
+        })?)
+    };
+    let partition_src = match base {
+        Some(b) if !b.partition_clause.is_empty() => &b.partition_clause,
+        _ => &over.partition_clause,
+    };
+    let order_src = match base {
+        Some(b) if !b.order_clause.is_empty() => &b.order_clause,
+        _ => &over.order_clause,
+    };
+    let (frame_src, frame_offsets) = match base {
+        Some(b) if over.frame_options & frameopt::NONDEFAULT == 0 => (b, b),
+        _ => (over, over),
+    };
+
+    let mut partition_by = Vec::new();
+    for item in partition_src {
+        partition_by.push(window_sort_key(item, def, params, false, keys)?);
+    }
+    let mut order_by = Vec::new();
+    for item in order_src {
+        order_by.push(window_sort_key(item, def, params, true, keys)?);
+    }
+    let frame = plan_window_frame(frame_src, frame_offsets, params)?;
+    Ok((partition_by, order_by, frame))
+}
+
+/// One PARTITION BY or ORDER BY key of a window.
+///
+/// A PARTITION BY item is a bare expression rather than a `SortBy`, so the two
+/// are read differently and both land in an `OrderKey` -- partitioning only
+/// ever uses its `field`, ordering uses the direction and null placement too.
+fn window_sort_key(
+    item: &pg_query::protobuf::Node,
+    def: &TableDef,
+    params: &[Bson],
+    sorted: bool,
+    keys: &mut usize,
+) -> Result<OrderKey> {
+    let (node, ascending, nulls) = if sorted {
+        let Some(N::SortBy(sb)) = item.node.as_ref() else {
+            return Err(Error::Unsupported("this window ORDER BY item".into()));
+        };
+        let ascending = match SortByDir::try_from(sb.sortby_dir) {
+            Ok(SortByDir::SortbyDesc) => false,
+            Ok(SortByDir::SortbyDefault | SortByDir::SortbyAsc) => true,
+            _ => return Err(Error::Unsupported("window ORDER BY ... USING".into())),
+        };
+        let nulls = match SortByNulls::try_from(sb.sortby_nulls) {
+            Ok(SortByNulls::SortbyNullsFirst) => Nulls::First,
+            Ok(SortByNulls::SortbyNullsLast) => Nulls::Last,
+            _ if ascending => Nulls::Last,
+            _ => Nulls::First,
+        };
+        (sb.node.as_deref(), ascending, nulls)
+    } else {
+        (Some(item), true, Nulls::Last)
+    };
+    let node = node.ok_or_else(|| Error::Unsupported("an empty window key".into()))?;
+    // A bare column reads its stored field; anything else is materialised per
+    // row into its own synthetic slot, the same way a computed ORDER BY key is.
+    if let Some(N::ColumnRef(c)) = node.node.as_ref() {
+        if let Some(name) = column_ref_name(c) {
+            if let Some(column) = def.column(&name) {
+                return Ok(OrderKey {
+                    field: column.field(),
+                    ascending,
+                    nulls,
+                    expr: None,
+                });
+            }
+            return Err(Error::UndefinedColumn(name));
+        }
+    }
+    let fields: Vec<RowField> = def
+        .columns
+        .iter()
+        .map(|c| (c.name.clone(), c.field(), c.pg_type.clone()))
+        .collect();
+    let mut sample = Document::new();
+    for c in &def.columns {
+        sample.insert(c.field(), sample_value_for_type(&c.pg_type));
+    }
+    let expr = row_column_expr(node, &fields, params, &sample)?;
+    // Named by POSITION across the whole statement, so two computed keys in
+    // two different windows cannot collide, and prefixed so no real column
+    // can. An empty name here would make every computed key the same field.
+    *keys += 1;
+    Ok(OrderKey {
+        field: format!("__wkey{}", *keys - 1),
+        ascending,
+        nulls,
+        expr: Some(expr),
+    })
+}
+
+fn plan_window_frame(
+    w: &pg_query::protobuf::WindowDef,
+    offsets: &pg_query::protobuf::WindowDef,
+    params: &[Bson],
+) -> Result<WindowFrame> {
+    let opts = w.frame_options;
+    if opts & frameopt::NONDEFAULT == 0 {
+        return Ok(WindowFrame::DEFAULT);
+    }
+    // EXCLUDE removes rows from the frame once its bounds are known, so it
+    // rides the peer groups the bounds already need.
+    let exclude = if opts & frameopt::EXCLUDE_CURRENT_ROW != 0 {
+        FrameExclude::CurrentRow
+    } else if opts & frameopt::EXCLUDE_GROUP != 0 {
+        FrameExclude::Group
+    } else if opts & frameopt::EXCLUDE_TIES != 0 {
+        FrameExclude::Ties
+    } else {
+        FrameExclude::NoOthers
+    };
+    let mode = if opts & frameopt::ROWS != 0 {
+        FrameMode::Rows
+    } else if opts & frameopt::GROUPS != 0 {
+        FrameMode::Groups
+    } else if opts & frameopt::RANGE != 0 {
+        FrameMode::Range
+    } else {
+        return Err(Error::Unsupported("this window frame".into()));
+    };
+    let offset = |node: Option<&pg_query::protobuf::Node>| -> Result<i64> {
+        let node = node.ok_or_else(|| Error::Parse("frame bound with no offset".into()))?;
+        match const_value(node, params)? {
+            Bson::Int32(v) => Ok(i64::from(v)),
+            Bson::Int64(v) => Ok(v),
+            // PostgreSQL's own message for a negative or non-integer bound.
+            _ => Err(Error::Unsupported("this window frame offset".into())),
+        }
+    };
+    let start = if opts & frameopt::START_UNBOUNDED_PRECEDING != 0 {
+        FrameBound::UnboundedPreceding
+    } else if opts & frameopt::START_CURRENT_ROW != 0 {
+        FrameBound::CurrentRow
+    } else if opts & frameopt::START_OFFSET_PRECEDING != 0 {
+        FrameBound::Preceding(offset(offsets.start_offset.as_deref())?)
+    } else if opts & frameopt::START_OFFSET_FOLLOWING != 0 {
+        FrameBound::Following(offset(offsets.start_offset.as_deref())?)
+    } else {
+        return Err(Error::Unsupported("this window frame start".into()));
+    };
+    let end = if opts & frameopt::END_UNBOUNDED_FOLLOWING != 0 {
+        FrameBound::UnboundedFollowing
+    } else if opts & frameopt::END_CURRENT_ROW != 0 {
+        FrameBound::CurrentRow
+    } else if opts & frameopt::END_OFFSET_PRECEDING != 0 {
+        FrameBound::Preceding(offset(offsets.end_offset.as_deref())?)
+    } else if opts & frameopt::END_OFFSET_FOLLOWING != 0 {
+        FrameBound::Following(offset(offsets.end_offset.as_deref())?)
+    } else {
+        return Err(Error::Unsupported("this window frame end".into()));
+    };
+    Ok(WindowFrame {
+        mode,
+        start,
+        end,
+        exclude,
+    })
+}
+
+/// A windowed select list: output columns, their per-column expressions, the
+/// window items themselves, and the synthetic columns their values land in.
+type WindowTargets = (
+    Vec<(String, String)>,
+    Vec<Option<ColumnExpr>>,
+    Vec<WindowItem>,
+    Vec<Column>,
+);
+
+/// Plan the select list of a query carrying window functions.
+///
+/// Each window call becomes a `WindowItem` computing into `__winN`, and the
+/// output column reads that field. Non-window targets are planned exactly as
+/// a plain select's are, so `select id, row_number() over ()` keeps `id`'s
+/// own type and table provenance.
+fn plan_window_targets(
+    s: &pg_query::protobuf::SelectStmt,
+    def: &TableDef,
+    params: &[Bson],
+) -> Result<WindowTargets> {
+    let named: Vec<pg_query::protobuf::WindowDef> = s
+        .window_clause
+        .iter()
+        .filter_map(|n| match n.node.as_ref() {
+            Some(N::WindowDef(w)) => Some((**w).clone()),
+            _ => None,
+        })
+        .collect();
+    let mut columns = Vec::new();
+    let mut casts = Vec::new();
+    let mut windows: Vec<WindowItem> = Vec::new();
+    let mut extra: Vec<Column> = Vec::new();
+    let mut keys = 0usize;
+    for t in &s.target_list {
+        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+            return Err(Error::Unsupported("this target".into()));
+        };
+        let Some(N::FuncCall(f)) = rt.val.as_ref().and_then(|v| v.node.as_ref()) else {
+            // A plain target beside the windows, planned the ordinary way.
+            let (mut c, mut k) = plan_table_targets(std::slice::from_ref(t), def, params)?;
+            columns.append(&mut c);
+            casts.append(&mut k);
+            continue;
+        };
+        let Some(over) = f.over.as_deref() else {
+            let (mut c, mut k) = plan_table_targets(std::slice::from_ref(t), def, params)?;
+            columns.append(&mut c);
+            casts.append(&mut k);
+            continue;
+        };
+        let name = func_name(f).unwrap_or_default();
+        let func = window_func_by_name(&name)
+            .ok_or_else(|| Error::Unsupported(format!("window function {name}()")))?;
+        let func = if func == WindowFunc::Count && f.agg_star {
+            WindowFunc::CountStar
+        } else {
+            func
+        };
+        if f.agg_distinct {
+            // PostgreSQL refuses this itself (`DISTINCT is not implemented for
+            // window functions`), so it is its answer rather than a gap here.
+            return Err(Error::FeatureNotSupported(
+                "DISTINCT is not implemented for window functions".into(),
+            ));
+        }
+        let (partition_by, order_by, frame) =
+            plan_window_def(over, &named, def, params, &mut keys)?;
+
+        // The first argument is the one evaluated per row; the rest are
+        // constants (`lag(v, 1, -1)`, `nth_value(v, 2)`, `ntile(3)`).
+        let (arg, source_type, args) = plan_window_args(func, f, def, params)?;
+        let field = format!("__win{}", windows.len());
+        let out = if rt.name.is_empty() {
+            name.clone()
+        } else {
+            rt.name.clone()
+        };
+        let result_type = window_result_type(func, source_type.as_deref());
+        let source_type = source_type.clone();
+        let filter = match f.agg_filter.as_deref() {
+            None => None,
+            Some(node) => {
+                let fields: Vec<RowField> = def
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.field(), c.pg_type.clone()))
+                    .collect();
+                let mut sample = Document::new();
+                for c in &def.columns {
+                    sample.insert(c.field(), sample_value_for_type(&c.pg_type));
+                }
+                Some(row_column_expr(node, &fields, params, &sample)?)
+            }
+        };
+        extra.push(Column::new(&field, &result_type, false));
+        windows.push(WindowItem {
+            field: field.clone(),
+            func,
+            arg,
+            args,
+            partition_by,
+            order_by,
+            frame,
+            result_type,
+            source_type,
+            filter,
+        });
+        columns.push((out, field));
+        casts.push(None);
+    }
+    Ok((columns, casts, windows, extra))
+}
+
+/// A window call's per-row argument, its source type, and its literal extras.
+fn plan_window_args(
+    func: WindowFunc,
+    f: &pg_query::protobuf::FuncCall,
+    def: &TableDef,
+    params: &[Bson],
+) -> Result<(Option<ColumnExpr>, Option<String>, Vec<Bson>)> {
+    if func == WindowFunc::CountStar {
+        return Ok((None, None, Vec::new()));
+    }
+    // `row_number()` / `rank()` / `dense_rank()` / `percent_rank()` /
+    // `cume_dist()` take none.
+    if f.args.is_empty() {
+        return Ok((None, None, Vec::new()));
+    }
+    let fields: Vec<RowField> = def
+        .columns
+        .iter()
+        .map(|c| (c.name.clone(), c.field(), c.pg_type.clone()))
+        .collect();
+    let mut sample = Document::new();
+    for c in &def.columns {
+        sample.insert(c.field(), sample_value_for_type(&c.pg_type));
+    }
+    // `ntile(3)` takes its bucket count as the ONLY argument, and it is a
+    // constant rather than a per-row value.
+    if func == WindowFunc::Ntile {
+        return Ok((None, None, vec![const_value(&f.args[0], params)?]));
+    }
+    let source_type = match f.args[0].node.as_ref() {
+        Some(N::ColumnRef(c)) => {
+            column_ref_name(c).and_then(|n| def.column(&n).map(|c| c.pg_type.clone()))
+        }
+        _ => None,
+    };
+    let expr = row_column_expr(&f.args[0], &fields, params, &sample)?;
+    let source_type = source_type.or_else(|| match &expr {
+        ColumnExpr::Row { result_type, .. } if !result_type.is_empty() => Some(result_type.clone()),
+        _ => None,
+    });
+    let mut args = Vec::new();
+    for extra in f.args.iter().skip(1) {
+        args.push(const_value(extra, params)?);
+    }
+    Ok((Some(expr), source_type, args))
+}
+
 fn has_aggregate(s: &pg_query::protobuf::SelectStmt) -> bool {
     // Only the names the aggregate planner actually handles. Any-FuncCall
     // routed a scalar call over a column (`regexp_replace(col, ...)`) into the
@@ -3282,10 +3895,16 @@ fn has_aggregate(s: &pg_query::protobuf::SelectStmt) -> bool {
             return false;
         };
         match rt.val.as_ref().and_then(|v| v.node.as_ref()) {
+            // `f.over.is_none()`: `sum(v) OVER (...)` is a WINDOW call, not an
+            // aggregate. Without the check it reached the aggregate planner,
+            // which demanded a GROUP BY the query neither has nor needs, and
+            // the client got `42803 column "id" must appear in the GROUP BY
+            // clause` -- an error blaming the user for a missing feature.
             Some(N::FuncCall(f))
-                if func_name(f)
-                    .as_deref()
-                    .is_some_and(|n| AGGREGATES.contains(&n)) =>
+                if f.over.is_none()
+                    && func_name(f)
+                        .as_deref()
+                        .is_some_and(|n| AGGREGATES.contains(&n)) =>
             {
                 true
             }
@@ -3538,6 +4157,7 @@ fn plan_series_select(
         table: String::new(),
         series: Some(series),
         sub: None,
+        windows: Vec::new(),
         join: None,
         columns,
         casts,
@@ -5415,7 +6035,49 @@ fn plan_select(
         return plan_select_constant(s, params);
     }
     if !s.group_clause.is_empty() || has_aggregate(s) {
+        // A window function OVER an aggregate (`sum(sum(v)) over (order by
+        // g)` beside a GROUP BY) runs the window over the GROUPED rows, which
+        // means the aggregate planner would have to grow a window pass of its
+        // own. Named here so the refusal says what is missing: routed on into
+        // the aggregate planner it came out as `function sum() is not
+        // supported yet`, which is false -- `sum` is supported, and a reader
+        // chasing that message looks in the wrong place entirely.
+        if has_window(s) {
+            return Err(Error::Unsupported(
+                "a window function over an aggregate".into(),
+            ));
+        }
         return plan_aggregate(s, lookup, params);
+    }
+    // A window function in a WHERE is an ERROR in PostgreSQL, not a filter --
+    // the WHERE runs before the windows do, so there is nothing to test.
+    // PostgreSQL's own message and class, because it refuses this too.
+    if s.where_clause
+        .as_deref()
+        .is_some_and(|w| node_has_window(Some(w)))
+    {
+        return Err(Error::Windowing(
+            "window functions are not allowed in WHERE".into(),
+        ));
+    }
+    // A window over a JOIN or a generated source. Both are planned by paths
+    // that build their output columns from the two sides' columns, and a
+    // window target is a column of NEITHER -- so they refuse it, but they
+    // refused it as `this subquery target` and `function row_number() is not
+    // supported yet`, neither of which is true or points anywhere useful.
+    if has_window(s)
+        && (s.from_clause.len() == 2
+            || matches!(
+                s.from_clause.first().and_then(|f| f.node.as_ref()),
+                Some(N::JoinExpr(_))
+            ))
+    {
+        return Err(Error::Unsupported("a window function over a JOIN".into()));
+    }
+    if has_window(s) && series_from_clause(&s.from_clause[0], params)?.is_some() {
+        return Err(Error::Unsupported(
+            "a window function over a generated source".into(),
+        ));
     }
     // `FROM a, b` -- a CROSS join, the comma form of `a CROSS JOIN b`. It
     // rides the JOIN path with no ON predicate.
@@ -5462,7 +6124,23 @@ fn plan_select(
         None => return Err(Error::Parse("empty FROM".into())),
     };
 
-    let (columns, casts) = plan_table_targets(&s.target_list, &def, params)?;
+    // Window functions project into synthetic `__winN` fields, which are
+    // appended to the def so the row schema and every later lookup resolve
+    // them exactly like a stored column.
+    let (columns, casts, windows, extra) = if has_window(s) {
+        let (c, k, w, e) = plan_window_targets(s, &def, params)?;
+        (c, k, w, e)
+    } else {
+        let (c, k) = plan_table_targets(&s.target_list, &def, params)?;
+        (c, k, Vec::new(), Vec::new())
+    };
+    let def = if extra.is_empty() {
+        def
+    } else {
+        let mut d = def;
+        d.columns.extend(extra);
+        d
+    };
 
     // A WHERE that does not lower to an MQL filter -- `where (case ... end)`,
     // say -- becomes a RESIDUAL evaluated per row instead of a refusal. Only
@@ -5521,8 +6199,18 @@ fn plan_select(
             Some(N::ColumnRef(c)) => {
                 let col = column_ref_name(c)
                     .ok_or_else(|| Error::Unsupported("this ORDER BY expression".into()))?;
-                def.field_of(&col)
-                    .ok_or_else(|| Error::UndefinedColumn(col.clone()))?
+                // An OUTPUT NAME wins over a table column, which is
+                // PostgreSQL's rule for ORDER BY (and only for ORDER BY --
+                // a WHERE cannot see an output alias). `select id * 2 as d
+                // ... order by d` and `... row_number() over (...) as rn
+                // order by rn` both depend on it, and without it the second
+                // one had no way to sort by the window it had just computed.
+                match columns.iter().find(|(out, _)| *out == col) {
+                    Some((_, field)) => field.clone(),
+                    None => def
+                        .field_of(&col)
+                        .ok_or_else(|| Error::UndefinedColumn(col.clone()))?,
+                }
             }
             // A COMPUTED sort key (`order by n * -1`, `order by upper(a)`).
             // Planned as a row expression over the table's columns and given a
@@ -5597,6 +6285,7 @@ fn plan_select(
     Ok(Statement::Select(Select {
         series: None,
         sub,
+        windows,
         join: None,
         table,
         columns,
@@ -5867,6 +6556,7 @@ fn plan_join_plain_select(
         table: String::new(),
         series: None,
         sub: None,
+        windows: Vec::new(),
         join: Some(Box::new(join)),
         columns,
         casts,
@@ -6309,6 +6999,19 @@ pub fn select_output_def(
         TableDef::new("", Vec::new())
     } else {
         lookup(&sel.table).ok_or_else(|| Error::UndefinedTable(sel.table.clone()))?
+    };
+    // A window's synthetic `__winN` is not in the SOURCE def -- it is
+    // computed over it -- so it is added here before the outputs are
+    // resolved. Without it `select rn from (select row_number() over (...) as
+    // rn from t) s` answered `42703 column "__win0" does not exist`.
+    let source = if sel.windows.is_empty() {
+        source
+    } else {
+        let mut d = source;
+        for w in &sel.windows {
+            d.columns.push(Column::new(&w.field, &w.result_type, false));
+        }
+        d
     };
     let mut columns = Vec::new();
     for (i, (out, field)) in sel.columns.iter().enumerate() {
@@ -7508,6 +8211,7 @@ fn plan_select_srf(
         table: String::new(),
         series: Some(series),
         sub: None,
+        windows: Vec::new(),
         join: None,
         columns: vec![(column.clone(), column)],
         casts: vec![cast],

@@ -329,8 +329,26 @@ one request path:
     14.13 (`tools/probes/pg_corpora/subqueries.sql`); the five that differ
     are CORRELATED subqueries, refused by name.
 
-    **What remains refused**: correlated subqueries, window functions,
-    `SELECT *` over a JOIN, array subscripting,
+    **And window functions landed 2026-09-28 too**, the other lever named
+    above: the whole family (`row_number` / `rank` / `dense_rank` /
+    `percent_rank` / `cume_dist` / `ntile`, `lag` / `lead` / `first_value` /
+    `last_value` / `nth_value`, and the aggregates as windows), `PARTITION BY`
+    and `ORDER BY`, `ROWS` / `RANGE` / `GROUPS` frames with value offsets, all
+    three `EXCLUDE` forms, named `WINDOW` clauses and `FILTER`. Two corpora
+    against PostgreSQL 14.13: `windows.sql` 26/27, `windows2.sql` 48/48.
+
+    **The default frame is the thing to get right, and it is not obvious.**
+    It is `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` whether or not
+    the window has an ORDER BY (measured: `over ()`, `over (order by id)` and
+    `over (partition by g)` all parse to the identical `frame_options`), and
+    under RANGE a bound at CURRENT ROW means the row AND ITS PEERS. So tied
+    rows share a running total, and a window with no ORDER BY sees the whole
+    partition — the second is the first with every row a peer, not a separate
+    case. An implementation that treats the default as ROWS is wrong on every
+    tie.
+
+    **What remains refused**: correlated subqueries, a window function over an
+    AGGREGATE, `SELECT *` over a JOIN, array subscripting,
     `CREATE INDEX`, `ALTER TABLE` in ANY form, `CREATE VIEW`, `CREATE TRIGGER`,
     `EXPLAIN`, composite `PRIMARY KEY` / multi-column `FOREIGN KEY`, and a
     non-literal column `DEFAULT`.
@@ -387,8 +405,9 @@ one request path:
 
     So do not read "96.8% of psycopg passes" as "nearly done". A SQL-shaped gauge
     (`sqllogictest`, the SQLAlchemy dialect suite) would score very differently.
-    With subqueries and CTEs landed, the next levers are window functions and
-    correlated subqueries.
+    With subqueries, CTEs and window functions landed, the next levers are
+    correlated subqueries and the DDL surface (`CREATE INDEX`, `ALTER TABLE`,
+    `CREATE VIEW`), which no amount of query-language work reaches.
   - Not there yet, beyond the survey above: password verification (a role's SCRAM
     verifier is stored and never checked — a wrong password and no password both
     connect, re-probed 2026-09-18, re-confirmed live 2026-09-28 by connecting
