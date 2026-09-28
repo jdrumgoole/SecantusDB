@@ -2166,7 +2166,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// The adapter inlines 50 / "operation exceeded time limit" because it does
     /// not depend on secantus-core. Two copies of a constant is how they drift,
     /// so this pins them: if the core ever changes the code or the wording, this
@@ -2185,6 +2184,7 @@ mod tests {
         assert_eq!(reply.get_str("codeName").unwrap(), "MaxTimeMSExpired");
     }
 
+    #[test]
     fn dispatch_rejects_nul_collection_name() {
         // A well-formed BSON command whose collection name carries an interior
         // NUL must return InvalidNamespace, not panic — a panic here would

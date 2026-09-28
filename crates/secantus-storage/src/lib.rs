@@ -11853,6 +11853,21 @@ impl Storage {
         coll: &str,
         hint: &Hint,
     ) -> Result<ResolvedHint> {
+        // A hint is validated during query PLANNING, and there is nothing to
+        // plan against when the collection does not exist -- so mongod accepts
+        // any hint there and returns an empty result. Measured 8.2.11
+        // (2026-09-28): `hint: "abc"` on a missing namespace is `ok` for all
+        // SEVEN commands that take one, and BadValue the moment the collection
+        // exists, empty or not. This server refused it in every case, which is
+        // what mongo-c-driver's `/find_and_modify/hint` caught -- that test
+        // runs against a collection it never creates.
+        //
+        // `Natural` is the right answer rather than an error: a scan of a
+        // missing collection yields nothing, which is exactly the empty result
+        // mongod produces.
+        if coll_options(session, db, coll)?.is_none() {
+            return Ok(ResolvedHint::Natural);
+        }
         match hint {
             Hint::Name(s) => {
                 // NOT `"$natural"`. mongod takes only the DOCUMENT form
