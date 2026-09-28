@@ -1192,6 +1192,10 @@ impl PgHandler {
     /// counter; `typarray` is DERIVED as `oid + 100_000`, never stored.)
     const SCHEMA_COLLECTION: &'static str = "__sql_schemas__";
     const COMPOSITE_COLLECTION: &'static str = "__sql_composites__";
+    /// `public`'s `pg_namespace` oid, fixed on every install (measured 2200
+    /// on 14.24, alongside `pg_catalog` at 11). `pg_constraint.connamespace`
+    /// reports it for a non-temp table.
+    const PUBLIC_NAMESPACE_OID: i64 = 2200;
     const COMPOSITE_TYPE_OID_BASE: i64 = 67_000;
     const ENUM_COLLECTION: &'static str = "__sql_enums__";
     const ENUM_META_COLLECTION: &'static str = "__sql_enum_meta__";
@@ -3389,6 +3393,48 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("creation_time", "timestamptz", false),
                 ],
             )),
+            // PostgreSQL 14's `pg_constraint`, all 25 columns in attnum
+            // order (measured 2026-09-28 against 14.24 via `pg_attribute`).
+            // The catalog already records every constraint this server
+            // enforces -- CHECK / FOREIGN KEY / UNIQUE as their own structs,
+            // PRIMARY KEY as `Column::pk` -- so the rows are a projection of
+            // `TableDef`, not new state.
+            //
+            // **NOT NULL deliberately produces NO row.** PostgreSQL carries a
+            // not-null as `pg_attribute.attnotnull`, not as a `pg_constraint`
+            // entry: a table with one NOT NULL column, one CHECK, one FK, one
+            // UNIQUE and a PK has exactly 5 rows here, measured. Emitting a
+            // sixth would be a divergence invented by us.
+            "pg_constraint" => Some(TableDef::new(
+                "pg_constraint",
+                vec![
+                    secantus_pgcatalog::Column::new("oid", "oid", false),
+                    secantus_pgcatalog::Column::new("conname", "name", false),
+                    secantus_pgcatalog::Column::new("connamespace", "oid", false),
+                    secantus_pgcatalog::Column::new("contype", "\"char\"", false),
+                    secantus_pgcatalog::Column::new("condeferrable", "bool", false),
+                    secantus_pgcatalog::Column::new("condeferred", "bool", false),
+                    secantus_pgcatalog::Column::new("convalidated", "bool", false),
+                    secantus_pgcatalog::Column::new("conrelid", "oid", false),
+                    secantus_pgcatalog::Column::new("contypid", "oid", false),
+                    secantus_pgcatalog::Column::new("conindid", "oid", false),
+                    secantus_pgcatalog::Column::new("conparentid", "oid", false),
+                    secantus_pgcatalog::Column::new("confrelid", "oid", false),
+                    secantus_pgcatalog::Column::new("confupdtype", "\"char\"", false),
+                    secantus_pgcatalog::Column::new("confdeltype", "\"char\"", false),
+                    secantus_pgcatalog::Column::new("confmatchtype", "\"char\"", false),
+                    secantus_pgcatalog::Column::new("conislocal", "bool", false),
+                    secantus_pgcatalog::Column::new("coninhcount", "int4", false),
+                    secantus_pgcatalog::Column::new("connoinherit", "bool", false),
+                    secantus_pgcatalog::Column::new("conkey", "int2[]", false),
+                    secantus_pgcatalog::Column::new("confkey", "int2[]", false),
+                    secantus_pgcatalog::Column::new("conpfeqop", "oid[]", false),
+                    secantus_pgcatalog::Column::new("conppeqop", "oid[]", false),
+                    secantus_pgcatalog::Column::new("conffeqop", "oid[]", false),
+                    secantus_pgcatalog::Column::new("conexclop", "oid[]", false),
+                    secantus_pgcatalog::Column::new("conbin", "pg_node_tree", false),
+                ],
+            )),
             _ => None,
         }
     }
@@ -3853,6 +3899,7 @@ impl PgHandler {
                     "pg_class",
                     "pg_namespace",
                     "pg_authid",
+                    "pg_constraint",
                 ] {
                     let mut d = Document::new();
                     d.insert(field("schemaname"), "pg_catalog");
@@ -3914,6 +3961,211 @@ impl PgHandler {
                         d
                     })
                     .collect()
+            }
+            "pg_constraint" => {
+                let field = |c: &str| def.field_of(c).expect("column");
+                let defs = self.all_table_defs().ok()?;
+                let mut rows: Vec<Document> = Vec::new();
+                for t in &defs {
+                    // A table created before row types were recorded has no
+                    // relation oid, so nothing could join to its rows.
+                    // Skipping beats emitting rows keyed on oid 0, which
+                    // would all collide with one another.
+                    let Some(conrelid) = self.relation_oid(&t.name) else {
+                        continue;
+                    };
+                    // A TEMP table reports 0: PostgreSQL names its session's
+                    // `pg_temp_N` namespace here, but this server has no
+                    // `pg_namespace` rows and so no oid to name it with. 0 is
+                    // "no namespace" rather than a number pointing nowhere.
+                    let namespace_oid = if t.temp {
+                        0i64
+                    } else {
+                        Self::PUBLIC_NAMESPACE_OID
+                    };
+                    // 1-based attnum, as `conkey` reports it.
+                    let attnum = |col: &str| -> Option<i32> {
+                        t.columns
+                            .iter()
+                            .position(|c| c.name == col)
+                            .map(|i| i as i32 + 1)
+                    };
+                    let mut ordinal = 0i64;
+                    let mut push = |conname: String,
+                                    contype: &str,
+                                    conkey: Vec<i32>,
+                                    deferrable: bool,
+                                    deferred: bool,
+                                    fk: Option<&secantus_pgcatalog::ForeignKey>,
+                                    confrelid: i64,
+                                    confkey: Vec<i32>,
+                                    rows: &mut Vec<Document>| {
+                        let mut d = Document::new();
+                        d.insert(
+                            field("oid"),
+                            Bson::Int64(Self::constraint_oid(conrelid, ordinal)),
+                        );
+                        ordinal += 1;
+                        d.insert(field("conname"), conname);
+                        d.insert(field("connamespace"), Bson::Int64(namespace_oid));
+                        d.insert(field("contype"), contype);
+                        d.insert(field("condeferrable"), Bson::Boolean(deferrable));
+                        d.insert(field("condeferred"), Bson::Boolean(deferred));
+                        d.insert(field("convalidated"), Bson::Boolean(true));
+                        d.insert(field("conrelid"), Bson::Int64(conrelid));
+                        d.insert(field("contypid"), Bson::Int64(0));
+                        // No `pg_index` rows exist on this server, so a
+                        // non-zero `conindid` would point at nothing. 0 is the
+                        // honest answer; PostgreSQL has a real index oid here
+                        // for p / u / f.
+                        d.insert(field("conindid"), Bson::Int64(0));
+                        d.insert(field("conparentid"), Bson::Int64(0));
+                        d.insert(field("confrelid"), Bson::Int64(confrelid));
+                        // ' ' for every non-FK row, measured on 14.24.
+                        let (upd, del, matchtype) = match fk {
+                            Some(k) => (
+                                Self::fk_action_code(k.on_update.as_deref()),
+                                Self::fk_action_code(k.on_delete.as_deref()),
+                                "s",
+                            ),
+                            None => (" ", " ", " "),
+                        };
+                        d.insert(field("confupdtype"), upd);
+                        d.insert(field("confdeltype"), del);
+                        d.insert(field("confmatchtype"), matchtype);
+                        d.insert(field("conislocal"), Bson::Boolean(true));
+                        d.insert(field("coninhcount"), Bson::Int32(0));
+                        // CHECK is the one kind PostgreSQL marks inheritable.
+                        d.insert(field("connoinherit"), Bson::Boolean(contype != "c"));
+                        let arr =
+                            |v: Vec<i32>| Bson::Array(v.into_iter().map(Bson::Int32).collect());
+                        d.insert(field("conkey"), arr(conkey));
+                        d.insert(
+                            field("confkey"),
+                            if fk.is_some() {
+                                arr(confkey)
+                            } else {
+                                Bson::Null
+                            },
+                        );
+                        // The per-column operator arrays are FK-only and carry
+                        // PostgreSQL operator oids; nothing here resolves
+                        // those, so they stay NULL rather than carry numbers
+                        // we invented.
+                        for c in ["conpfeqop", "conppeqop", "conffeqop", "conexclop"] {
+                            d.insert(field(c), Bson::Null);
+                        }
+                        // `conbin` is PostgreSQL's serialised parse tree
+                        // (`{OPEXPR :opno 521 ...}`). We keep a CHECK
+                        // predicate as SQL text, not as a node tree, and a
+                        // fabricated tree would be worse than none.
+                        d.insert(field("conbin"), Bson::Null);
+                        rows.push(d);
+                    };
+
+                    // PRIMARY KEY, named as PostgreSQL names an implicit one.
+                    let pk_cols: Vec<i32> = t
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| c.pk)
+                        .map(|(i, _)| i as i32 + 1)
+                        .collect();
+                    if !pk_cols.is_empty() {
+                        push(
+                            format!("{}_pkey", t.name),
+                            "p",
+                            pk_cols,
+                            false,
+                            false,
+                            None,
+                            0,
+                            Vec::new(),
+                            &mut rows,
+                        );
+                    }
+                    for u in &t.unique_constraints {
+                        let cols: Vec<i32> = u.columns.iter().filter_map(|c| attnum(c)).collect();
+                        push(
+                            u.name.clone(),
+                            // An `EXCLUDE (col WITH =)` is stored as a unique
+                            // constraint carrying `exclusion`; PostgreSQL
+                            // types those rows 'x' (measured 14.24). Only
+                            // reachable via a hand-off today -- this server
+                            // refuses EXCLUDE at DDL, so the flag can only
+                            // have been written by the PYTHON server.
+                            if u.exclusion { "x" } else { "u" },
+                            cols,
+                            u.deferrable,
+                            u.initially_deferred,
+                            None,
+                            0,
+                            Vec::new(),
+                            &mut rows,
+                        );
+                    }
+                    for ck in &t.check_constraints {
+                        // PostgreSQL's `conkey` for a CHECK lists the columns
+                        // the expression references. We hold the predicate as
+                        // text rather than a parse tree, so the columns are
+                        // recovered by matching identifiers in it -- right for
+                        // the common cases and never naming a column the table
+                        // does not have.
+                        let mut hits: Vec<(usize, i32)> = t
+                            .columns
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, c)| {
+                                Self::expression_mentions_at(&ck.expression, &c.name)
+                                    .map(|at| (at, i as i32 + 1))
+                            })
+                            .collect();
+                        // By first appearance in the predicate, which is the
+                        // order PostgreSQL reports (measured; see the helper).
+                        hits.sort_by_key(|(at, attnum)| (*at, *attnum));
+                        let cols: Vec<i32> = hits.into_iter().map(|(_, attnum)| attnum).collect();
+                        push(
+                            ck.name.clone(),
+                            "c",
+                            cols,
+                            false,
+                            false,
+                            None,
+                            0,
+                            Vec::new(),
+                            &mut rows,
+                        );
+                    }
+                    for fk in &t.foreign_keys {
+                        let cols: Vec<i32> = fk.columns.iter().filter_map(|c| attnum(c)).collect();
+                        let parent = self.lookup(&fk.ref_table);
+                        let confkey: Vec<i32> = match &parent {
+                            Some(p) => fk
+                                .ref_columns
+                                .iter()
+                                .filter_map(|rc| {
+                                    p.columns
+                                        .iter()
+                                        .position(|c| &c.name == rc)
+                                        .map(|i| i as i32 + 1)
+                                })
+                                .collect(),
+                            None => Vec::new(),
+                        };
+                        push(
+                            fk.name.clone(),
+                            "f",
+                            cols,
+                            fk.deferrable,
+                            fk.initially_deferred,
+                            Some(fk),
+                            self.relation_oid(&fk.ref_table).unwrap_or(0),
+                            confkey,
+                            &mut rows,
+                        );
+                    }
+                }
+                rows
             }
             _ => Vec::new(),
         };
@@ -4604,6 +4856,23 @@ fn wire_type(pg_type: &str) -> Type {
         // A real oid column type: psycopg's numeric tests read the oid back
         // and check `ftype(0) == 26`.
         "oid" => Type::OID,
+        // PostgreSQL's INTERNAL single-byte `"char"` (oid 18), which it
+        // spells WITH the quotes to keep it apart from `char(n)` / `bpchar`
+        // (1042) -- a different type with a different oid, already claimed by
+        // the `"char"` arm above. `pg_constraint.contype` and the three
+        // `conf*type` columns are this type, so a client reading their oid
+        // gets 18 as it does from a real server.
+        "\"char\"" => Type::CHAR,
+        // `pg_node_tree` (194): PostgreSQL's serialised parse tree, the type
+        // of `pg_constraint.conbin`. We never emit a VALUE for it -- see the
+        // `conbin` note in `virtual_rows` -- but the column still has to
+        // describe itself honestly on the wire.
+        "pg_node_tree" => Type::new(
+            "pg_node_tree".to_string(),
+            194,
+            postgres_types::Kind::Simple,
+            "pg_catalog".to_string(),
+        ),
         // Array oids are their own types (int4[] is 1007, not 23).
         "int4[]" | "int[]" | "integer[]" => Type::INT4_ARRAY,
         "int8[]" | "bigint[]" => Type::INT8_ARRAY,
@@ -10570,6 +10839,75 @@ fn key_values_equal(a: &Bson, b: &Bson) -> bool {
 }
 
 impl PgHandler {
+    /// A synthetic `pg_constraint.oid`.
+    ///
+    /// Constraint oids are not persisted -- the catalog records a constraint's
+    /// NAME, not an oid -- so one is derived from the table's relation oid and
+    /// the constraint's ordinal within that table. That keeps it stable across
+    /// reconnects and unaffected by other tables coming and going, which is
+    /// the property a client joining on it needs within a session. It is NOT
+    /// stable across a `DROP CONSTRAINT` that renumbers the ordinals, and it
+    /// is not PostgreSQL's oid for the same constraint; nothing here claims
+    /// otherwise.
+    ///
+    /// The stride bounds the ordinal so one table's oids can never run into
+    /// the next table's block.
+    fn constraint_oid(relation_oid: i64, ordinal: i64) -> i64 {
+        const BASE: i64 = 90_000;
+        const STRIDE: i64 = 256;
+        BASE + relation_oid.saturating_mul(STRIDE) + ordinal.min(STRIDE - 1)
+    }
+
+    /// PostgreSQL's one-letter referential-action code for `confupdtype` /
+    /// `confdeltype`. `None` is the default, `NO ACTION` -- code `a`.
+    /// Measured on 14.24: `RESTRICT` is `r`, `CASCADE` is `c`.
+    fn fk_action_code(action: Option<&str>) -> &'static str {
+        match action.map(str::trim) {
+            Some(a) if a.eq_ignore_ascii_case("CASCADE") => "c",
+            Some(a) if a.eq_ignore_ascii_case("SET NULL") => "n",
+            Some(a) if a.eq_ignore_ascii_case("SET DEFAULT") => "d",
+            Some(a) if a.eq_ignore_ascii_case("RESTRICT") => "r",
+            _ => "a",
+        }
+    }
+
+    /// Where a CHECK predicate's SQL text first references `column`, if it does.
+    ///
+    /// Used to fill `pg_constraint.conkey`, which PostgreSQL derives from the
+    /// constraint's parse tree. We keep the predicate as text, so this scans
+    /// for the identifier on word boundaries -- `n` must not match the `n`
+    /// inside `len`. It is a heuristic, and it errs toward omitting a column
+    /// rather than naming one the table does not have.
+    ///
+    /// **The POSITION is what orders `conkey`, and it is not the column order.**
+    /// Measured on 14.24: a table `(a, b, c)` with `check (c > a)` reports
+    /// `conkey = {3,1}`, so PostgreSQL lists the columns as the EXPRESSION
+    /// mentions them, not as the table declares them. Returning a bool and
+    /// filtering the column list in declaration order gave `{1,3}` --
+    /// backwards, and the FK columns pair with `confkey` positionally, so
+    /// order is load-bearing in this column generally.
+    fn expression_mentions_at(expression: &str, column: &str) -> Option<usize> {
+        if column.is_empty() {
+            return None;
+        }
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        let hay = expression.to_ascii_lowercase();
+        let needle = column.to_ascii_lowercase();
+        let bytes = hay.as_bytes();
+        let mut from = 0usize;
+        while let Some(rel) = hay[from..].find(&needle) {
+            let start = from + rel;
+            let end = start + needle.len();
+            let before_ok = start == 0 || !is_word(hay[..start].chars().next_back().unwrap_or(' '));
+            let after_ok = end >= bytes.len() || !is_word(hay[end..].chars().next().unwrap_or(' '));
+            if before_ok && after_ok {
+                return Some(start);
+            }
+            from = end;
+        }
+        None
+    }
+
     /// The schema a table's error diagnostics name: a TEMP table lives in the
     /// session's `pg_temp_N` namespace.
     fn schema_of(def: &TableDef) -> String {

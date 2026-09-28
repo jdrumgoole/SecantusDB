@@ -117,6 +117,30 @@ SETUP = [
 ]
 
 QUERIES = [
+    # The virtual `pg_constraint`. `d` has only a PRIMARY KEY, so these pin the
+    # implicit-name derivation (`d_pkey`), the attnum `conkey`, the blanks a
+    # non-FK row carries in the three `conf*type` columns, and the flag row --
+    # all against the real server rather than against our own expectations.
+    "SELECT conname, contype FROM pg_constraint WHERE conrelid = 'd'::regclass ORDER BY conname",
+    "SELECT conkey, confkey FROM pg_constraint WHERE conrelid = 'd'::regclass",
+    "SELECT confupdtype, confdeltype, confmatchtype FROM pg_constraint"
+    " WHERE conrelid = 'd'::regclass AND contype = 'p'",
+    "SELECT condeferrable, condeferred, convalidated, conislocal, coninhcount, connoinherit"
+    " FROM pg_constraint WHERE conrelid = 'd'::regclass AND contype = 'p'",
+    # `connamespace` is deliberately NOT compared here: the oracle fixture
+    # isolates each xdist worker in its own schema, so `d` is never in `public`
+    # on that side and the oid could not match by construction. It is asserted
+    # against `public` (2200) in `test_rust_pgserver_slice.py` instead.
+    "SELECT contypid, conparentid FROM pg_constraint"
+    " WHERE conrelid = 'd'::regclass AND contype = 'p'",
+    "SELECT count(*) FROM pg_constraint WHERE conrelid = 'd'::regclass",
+    "SELECT count(*) FROM pg_catalog.pg_constraint WHERE conrelid = 'd'::regclass",
+    # A regclass operand inside a LIST must compare by oid exactly as `=` does.
+    # Both spellings once matched NOTHING here while the `OR` form was right --
+    # a silent wrong-rows bug, and the shape catalog reflection actually emits.
+    "SELECT count(*) FROM pg_constraint WHERE conrelid IN ('d'::regclass)",
+    "SELECT count(*) FROM pg_constraint WHERE conrelid = ANY(ARRAY['d'::regclass])",
+    "SELECT count(*) FROM pg_constraint WHERE conrelid IN ('d'::regclass, 'd'::regclass)",
     # scalar <op> ANY/ALL(array): three-valued, empty ANY is false / empty
     # ALL is true, a NULL element or NULL scalar yields NULL.
     "SELECT 'x' = ANY(ARRAY['x','y'])",
