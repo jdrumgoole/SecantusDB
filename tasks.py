@@ -913,6 +913,54 @@ def opsboard(
     c.run(" ".join(cmd), pty=PTY)
 
 
+def _clear_raw(raw: str) -> None:
+    """Delete a gauge's raw artifact so a crashed run cannot reuse the old one.
+
+    `_run_gauge` has always done this; the two pymongo tasks did not, and that
+    is the whole of the bug below.
+    """
+    import pathlib
+
+    p = pathlib.Path(raw)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.unlink(missing_ok=True)
+
+
+def _require_fresh_raw(raw: str, gauge: str) -> None:
+    """Refuse to build a report from a raw this run did not write.
+
+    The pymongo gauges run pytest with ``warn=True`` — a crash must not abort
+    the task, because a partially-red suite still owes us a report — and then
+    generated the report UNCONDITIONALLY. Those two together mean a run that
+    collected ZERO tests still rewrote the report, from whatever raw happened
+    to be on disk, stamped with today's date and the current version.
+
+    Observed 2026-09-28: `validate --server rust` died in one second on a
+    missing ``_secantus_server`` and published "Generated 2026-09-28 —
+    SecantusDB 0.6.0b17, 99.4%" over a raw artifact from **30 August**. Worse
+    than a stale number, because the figures had drifted (99.5% -> 99.4%, with
+    a new failing test) as the generator changed underneath the same data — so
+    a reader diffing the file would have concluded a fresh run caught a
+    regression.
+
+    `_clear_raw` before the run plus this check after it makes the failure loud
+    and leaves the previous report untouched.
+    """
+    import pathlib
+
+    p = pathlib.Path(raw)
+    if p.exists() and (p.is_dir() or p.stat().st_size > 0):
+        return
+    raise SystemExit(
+        f"{gauge}: the test run produced no results ({raw} missing or empty), "
+        f"so there is nothing to report. NOT regenerating the report — the one "
+        f"on disk is from an earlier run and stays that way. Check the pytest "
+        f"output above: a run that ends in seconds usually means the embedded "
+        f"server failed to import (`invoke rust-server-build` rebuilds "
+        f"`_secantus_server`)."
+    )
+
+
 def _run_gauge(
     c: Context,
     *,
@@ -1059,6 +1107,7 @@ def validate(c: Context, server: str = "python", jobs: int = 1) -> None:
     suffix = "" if server == "python" else "-rust-server"
     raw_json = f".validation/raw{suffix}.json"
     report = f"docs/validation-report{suffix}.md"
+    _clear_raw(raw_json)
     parallel_env, parallel_flags = _gauge_parallel_flags(jobs)
     # `-p no:cacheprovider`: don't pollute pymongo's tree with .pytest_cache.
     # `-n1 -o addopts=`: pymongo's tests aren't parallel-safe against a SHARED
@@ -1109,6 +1158,7 @@ def validate(c: Context, server: str = "python", jobs: int = 1) -> None:
         pty=PTY,
         warn=True,
     )
+    _require_fresh_raw(raw_json, "pymongo gauge")
     c.run(
         "uv run --no-sync python -m pymongo_validation.generate_report "
         f"--server {server} {raw_json} {report}",
@@ -1190,6 +1240,7 @@ def validate_pymongo_async(c: Context, server: str = "python", jobs: int = 1) ->
     suffix = "" if server == "python" else "-rust-server"
     raw_json = f".validation/pymongo-async-raw{suffix}.json"
     report = f"docs/validation-report-pymongo-async{suffix}.md"
+    _clear_raw(raw_json)
     # Same invocation shape as `validate` (see that task for the `-c
     # pyproject.toml` / `-o addopts=` / `-n1` rationale), plus the
     # pytest-asyncio knobs the async suite needs: `-o asyncio_mode=auto`
@@ -1213,6 +1264,7 @@ def validate_pymongo_async(c: Context, server: str = "python", jobs: int = 1) ->
         pty=PTY,
         warn=True,
     )
+    _require_fresh_raw(raw_json, "pymongo-async gauge")
     c.run(
         "uv run --no-sync python -m pymongo_async_validation.generate_report "
         f"--server {server} {raw_json} {report}",

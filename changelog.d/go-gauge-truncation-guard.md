@@ -45,3 +45,34 @@ version and a week earlier carried **identical** numbers. Agreement between a
 fresh artifact and a stale one reads as confirmation; here it meant both were
 cut off at the same DNS hang. The honest signal was the wall clock: 30m 09s for
 a gauge whose own timeout is 30m is a truncation, not a slow run.
+
+---
+
+### A crashed pymongo gauge published a fabricated report
+
+Separate bug, same class, found in the same run. The two pymongo tasks run
+pytest with `warn=True` — correctly, since a partially-red suite still owes us a
+report — and then generated the report **unconditionally**. Unlike `_run_gauge`,
+they never cleared the raw artifact first.
+
+So `invoke validate --server rust` died in **one second** on a missing
+`_secantus_server`, collected zero tests, and rewrote
+`docs/validation-report-rust-server.md` as *"Generated 2026-09-28 — SecantusDB
+0.6.0b17"*, **99.4%** — over a raw artifact from **30 August**.
+
+The figures had even drifted against the previous report (99.5% → 99.4%, with a
+new failing test) because the generator changed under the same data. A reader
+diffing the file would have concluded a fresh run had caught a regression.
+
+#### Fixed
+
+- Both pymongo tasks now clear the raw before the run and refuse to generate a
+  report when the run produced none, leaving the previous report untouched and
+  naming the usual cause (`invoke rust-server-build`).
+
+#### Also found, not fixed here
+
+Seven `-rust-server` reports claim *"Generated 2026-09-21 — 0.6.0b16"* over raw
+artifacts dated 10–30 August: pymongo, pymongo-async, c, cxx, dotnet, php-ext
+and php-lib. The date records when the generator ran, not when the tests did.
+Filed in `tasks/backlog.md`.
