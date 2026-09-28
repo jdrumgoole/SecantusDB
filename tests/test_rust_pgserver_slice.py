@@ -10883,3 +10883,323 @@ def test_the_residual_fallback_does_not_swallow_real_errors(home: Path) -> None:
         with pytest.raises(psycopg.Error) as info:
             cur.execute("select * from e where (case when nosuchcol=1 then true else false end)")
         assert info.value.sqlstate == "42703"
+
+
+def _dept_emp(conn: psycopg.Connection) -> None:
+    """Two related tables, for the subquery and CTE tests below.
+
+    `dan` has a NULL salary and `empty` has no employees on purpose: those are
+    the rows that separate `NOT IN`'s three-valued answer from a naive one, and
+    an anti-join from an inner one.
+    """
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE sq_dept (id int PRIMARY KEY, name text, budget int)")
+    cur.execute("CREATE TABLE sq_emp (id int PRIMARY KEY, dept_id int, name text, salary int)")
+    cur.execute("INSERT INTO sq_dept VALUES (1,'eng',1000),(2,'sales',500),(3,'empty',0)")
+    cur.execute(
+        "INSERT INTO sq_emp VALUES (1,1,'ann',100),(2,1,'bob',200),(3,2,'cat',150),(4,2,'dan',NULL)"
+    )
+
+
+@pytest.mark.parametrize(
+    "sql,expected",
+    [
+        # Scalar subqueries, with and without a FROM around them.
+        ("SELECT (SELECT 1)", [(1,)]),
+        ("SELECT (SELECT 1) + 2", [(3,)]),
+        ("SELECT (SELECT max(salary) FROM sq_emp)", [(200,)]),
+        # No rows is a NULL VALUE, not zero rows.
+        ("SELECT (SELECT name FROM sq_dept WHERE id = 99)", [(None,)]),
+        (
+            "SELECT id, (SELECT count(*) FROM sq_emp) FROM sq_dept ORDER BY id",
+            [(1, 4), (2, 4), (3, 4)],
+        ),
+        # EXISTS, over a non-empty and an empty subquery.
+        ("SELECT 1 WHERE EXISTS (SELECT 1 FROM sq_dept)", [(1,)]),
+        ("SELECT 1 WHERE EXISTS (SELECT 1 FROM sq_dept WHERE id = 99)", []),
+        ("SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM sq_dept WHERE id = 99)", [(1,)]),
+        # IN / NOT IN over a subquery.
+        (
+            "SELECT id FROM sq_dept WHERE id IN (SELECT dept_id FROM sq_emp) ORDER BY id",
+            [(1,), (2,)],
+        ),
+        ("SELECT id FROM sq_dept WHERE id NOT IN (SELECT dept_id FROM sq_emp) ORDER BY id", [(3,)]),
+        # A NULL anywhere in a NOT IN subquery makes the whole predicate NULL,
+        # so PostgreSQL returns NOTHING -- not "every row that isn't listed".
+        ("SELECT id FROM sq_dept WHERE id NOT IN (SELECT salary FROM sq_emp) ORDER BY id", []),
+        # An EMPTY subquery: IN matches nothing, NOT IN matches everything.
+        (
+            "SELECT id FROM sq_dept WHERE id IN (SELECT dept_id FROM sq_emp WHERE salary > 9999)",
+            [],
+        ),
+        (
+            "SELECT id FROM sq_dept WHERE id NOT IN "
+            "(SELECT dept_id FROM sq_emp WHERE salary > 9999) ORDER BY id",
+            [(1,), (2,), (3,)],
+        ),
+        # ANY / ALL, which `IN` and `NOT IN` are spellings of.
+        (
+            "SELECT id FROM sq_dept WHERE id = ANY (SELECT dept_id FROM sq_emp) ORDER BY id",
+            [(1,), (2,)],
+        ),
+        (
+            "SELECT id FROM sq_dept WHERE budget > ALL "
+            "(SELECT salary FROM sq_emp WHERE salary IS NOT NULL) ORDER BY id",
+            [(1,), (2,)],
+        ),
+        # An empty ALL is vacuously true, an empty ANY vacuously false.
+        (
+            "SELECT id FROM sq_dept WHERE budget > ALL "
+            "(SELECT salary FROM sq_emp WHERE salary > 9999) ORDER BY id",
+            [(1,), (2,), (3,)],
+        ),
+        (
+            "SELECT id FROM sq_dept WHERE budget > ANY "
+            "(SELECT salary FROM sq_emp WHERE salary > 9999)",
+            [],
+        ),
+        # Nested: a subquery inside a subquery.
+        (
+            "SELECT id FROM sq_dept WHERE id IN "
+            "(SELECT dept_id FROM sq_emp WHERE salary > (SELECT 120)) ORDER BY id",
+            [(1,), (2,)],
+        ),
+        ("SELECT ARRAY(SELECT id FROM sq_dept ORDER BY id)", [([1, 2, 3],)]),
+        # A subquery in a HAVING.
+        (
+            "SELECT dept_id, count(*) FROM sq_emp GROUP BY dept_id "
+            "HAVING count(*) > (SELECT 1) ORDER BY dept_id",
+            [(1, 2), (2, 2)],
+        ),
+    ],
+)
+def test_uncorrelated_subqueries_match_postgres(
+    home: Path, sql: str, expected: list[tuple]
+) -> None:
+    """Answers checked against a live PostgreSQL 14.13; PostgreSQL is the reference.
+
+    An uncorrelated subquery is evaluated ONCE and replaced by the values it
+    returned, which is what PostgreSQL does too -- so these are the shapes
+    that prove the substitution keeps SQL's three-valued logic, not just its
+    row counts.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        _dept_emp(conn)
+        cur = conn.cursor()
+        cur.execute(sql)
+        assert cur.fetchall() == expected
+
+
+@pytest.mark.parametrize(
+    "sql,expected",
+    [
+        ("SELECT y FROM (SELECT 1 AS y) s", [(1,)]),
+        ("SELECT s.n FROM (SELECT count(*) AS n FROM sq_emp) s", [(4,)]),
+        (
+            "SELECT s.dept_id, s.c FROM "
+            "(SELECT dept_id, count(*) AS c FROM sq_emp GROUP BY dept_id) s ORDER BY s.dept_id",
+            [(1, 2), (2, 2)],
+        ),
+        # A WHERE and an aggregate OVER the subquery, not inside it.
+        (
+            "SELECT s.c FROM (SELECT dept_id, count(*) AS c FROM sq_emp GROUP BY dept_id) s "
+            "WHERE s.dept_id = 1",
+            [(2,)],
+        ),
+        (
+            "SELECT max(s.c) FROM (SELECT dept_id, count(*) AS c FROM sq_emp GROUP BY dept_id) s",
+            [(2,)],
+        ),
+        # A column alias list renames the outputs positionally.
+        ("SELECT a, b FROM (SELECT 1, 'x') s(a, b)", [(1, "x")]),
+        # Joined to a real table.
+        (
+            "SELECT d.name, s.c FROM sq_dept d JOIN "
+            "(SELECT dept_id, count(*) AS c FROM sq_emp GROUP BY dept_id) s ON s.dept_id = d.id "
+            "ORDER BY d.name",
+            [("eng", 2), ("sales", 2)],
+        ),
+        # Two subqueries cross-joined, referenced WITHOUT qualifiers. This
+        # answered `(None, 2)` -- a wrong answer, not an error -- until the
+        # unqualified reference learned to ask which side actually has the
+        # column.
+        ("SELECT x, y FROM (SELECT 1 AS x) a, (SELECT 2 AS y) b", [(1, 2)]),
+        ("SELECT y, x FROM (SELECT 1 AS x) a, (SELECT 2 AS y) b", [(2, 1)]),
+    ],
+)
+def test_from_subqueries_match_postgres(home: Path, sql: str, expected: list[tuple]) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        _dept_emp(conn)
+        cur = conn.cursor()
+        cur.execute(sql)
+        assert cur.fetchall() == expected
+
+
+@pytest.mark.parametrize(
+    "sql,expected",
+    [
+        ("WITH c AS (SELECT 1 AS x) SELECT x FROM c", [(1,)]),
+        ("WITH c AS (SELECT id, name FROM sq_dept) SELECT name FROM c WHERE id = 1", [("eng",)]),
+        (
+            "WITH c AS (SELECT dept_id, count(*) AS n FROM sq_emp GROUP BY dept_id) "
+            "SELECT * FROM c ORDER BY dept_id",
+            [(1, 2), (2, 2)],
+        ),
+        ("WITH c AS (SELECT id FROM sq_dept WHERE budget > 400) SELECT count(*) FROM c", [(2,)]),
+        # Two CTEs, cross-joined.
+        ("WITH a AS (SELECT 1 AS x), b AS (SELECT 2 AS y) SELECT x, y FROM a, b", [(1, 2)]),
+        # One CTE referencing the one declared before it.
+        (
+            "WITH a AS (SELECT id, budget FROM sq_dept), "
+            "b AS (SELECT id FROM a WHERE budget > 400) SELECT count(*) FROM b",
+            [(2,)],
+        ),
+        # A CTE joined to a real table.
+        (
+            "WITH c AS (SELECT dept_id, count(*) AS n FROM sq_emp GROUP BY dept_id) "
+            "SELECT d.name, c.n FROM sq_dept d JOIN c ON c.dept_id = d.id ORDER BY d.name",
+            [("eng", 2), ("sales", 2)],
+        ),
+        # An uncorrelated subquery INSIDE a CTE body: the CTE is inlined after
+        # subqueries are resolved, so one left here would reach the lowering
+        # unresolved and be refused.
+        (
+            "WITH c AS (SELECT id FROM sq_dept WHERE id IN (SELECT dept_id FROM sq_emp)) "
+            "SELECT count(*) FROM c",
+            [(2,)],
+        ),
+        # A CTE referenced under a different alias.
+        ("WITH c AS (SELECT 1 AS x) SELECT z.x FROM c AS z", [(1,)]),
+    ],
+)
+def test_ctes_match_postgres(home: Path, sql: str, expected: list[tuple]) -> None:
+    """A non-recursive CTE is inlined, which is what PostgreSQL 12+ does too.
+
+    Inlining and materialising return the same ROWS for a pure-SELECT body, so
+    the answers are PostgreSQL's even though the plan is not.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        _dept_emp(conn)
+        cur = conn.cursor()
+        cur.execute(sql)
+        assert cur.fetchall() == expected
+
+
+def test_a_subquery_sees_the_transactions_own_uncommitted_writes(home: Path) -> None:
+    """An uncorrelated subquery runs during PLANNING, which is outside the
+    `with_user_transaction` scope the statement's execution runs in.
+
+    Without entering the transaction for the read, WiredTiger served the
+    subquery its own snapshot: `insert; select ... where id in (select ...)`
+    counted the rows from BEFORE the insert while the same query without a
+    subquery counted correctly.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE tq (id int PRIMARY KEY)")
+        cur.execute("INSERT INTO tq VALUES (1), (2)")
+        conn.commit()
+        cur.execute("INSERT INTO tq VALUES (3)")
+        cur.execute("SELECT count(*) FROM tq")
+        assert cur.fetchall() == [(3,)]
+        cur.execute("SELECT count(*) FROM tq WHERE id IN (SELECT id FROM tq)")
+        assert cur.fetchall() == [(3,)]
+        cur.execute("SELECT (SELECT count(*) FROM tq)")
+        assert cur.fetchall() == [(3,)]
+        conn.rollback()
+
+
+def test_a_scalar_subquery_returning_two_rows_is_21000(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        _dept_emp(conn)
+        cur = conn.cursor()
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute("SELECT (SELECT id FROM sq_dept)")
+        assert info.value.sqlstate == "21000"
+
+
+def test_an_undefined_column_inside_a_subquery_stays_42703(home: Path) -> None:
+    """A typo must not be reported as an unsupported correlation.
+
+    The correlation check asks whether the unresolved name is one the OUTER
+    query has; a name neither side has is an ordinary `42703`, or a mistyped
+    column would look like a missing feature.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        _dept_emp(conn)
+        cur = conn.cursor()
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute("SELECT id FROM sq_dept WHERE id IN (SELECT nosuchcol FROM sq_emp)")
+        assert info.value.sqlstate == "42703"
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # An EXISTS whose subquery reads the outer row. This ANSWERED -- with
+        # every row -- before the check existed: the lowering resolves a column
+        # by its last name part and ignores the qualifier, so `d.id` bound to
+        # `sq_emp`'s own `id` and the EXISTS was true for everything.
+        "SELECT id FROM sq_dept d WHERE EXISTS (SELECT 1 FROM sq_emp e WHERE e.dept_id = d.id)",
+        "SELECT id FROM sq_dept d WHERE NOT EXISTS (SELECT 1 FROM sq_emp e WHERE e.dept_id = d.id)",
+        "SELECT d.name, (SELECT count(*) FROM sq_emp e WHERE e.dept_id = d.id) FROM sq_dept d",
+        # Correlated through an UNQUALIFIED name the inner table does not have.
+        "SELECT id FROM sq_dept WHERE EXISTS (SELECT 1 FROM sq_emp WHERE dept_id = budget)",
+    ],
+)
+def test_a_correlated_subquery_is_refused_not_answered_wrongly(home: Path, sql: str) -> None:
+    """`0A000`, by name. A correlated subquery's value depends on the outer
+    row, so there is no single set of values to substitute -- and substituting
+    one is a wrong answer rather than a missing feature."""
+    with _Server(home) as server, server.connect() as conn:
+        _dept_emp(conn)
+        cur = conn.cursor()
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute(sql)
+        assert info.value.sqlstate == "0A000"
+        assert "correlated subquery" in str(info.value)
+
+
+def test_with_recursive_and_a_data_modifying_with_are_refused(home: Path) -> None:
+    """Neither can be inlined: a self-reference has no subquery to expand into,
+    and a write must run exactly once however many times it is referenced."""
+    with _Server(home) as server, server.connect() as conn:
+        _dept_emp(conn)
+        cur = conn.cursor()
+        for sql in (
+            "WITH RECURSIVE c AS (SELECT 1 AS x) SELECT x FROM c",
+            "WITH c AS (INSERT INTO sq_dept VALUES (9,'x',1) RETURNING id) SELECT * FROM c",
+        ):
+            with pytest.raises(psycopg.Error) as info:
+                cur.execute(sql)
+            assert info.value.sqlstate == "0A000"
+            conn.rollback()
+
+
+def test_a_qualified_aggregate_argument_resolves_to_the_column(home: Path) -> None:
+    """`max(t.n)` is `n` qualified by the relation.
+
+    The aggregate planner read the FIRST name part, so every qualified
+    aggregate argument answered `42703 column "t" does not exist` -- over a
+    plain table as much as over a subquery.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        _dept_emp(conn)
+        cur = conn.cursor()
+        cur.execute("SELECT max(sq_emp.salary), count(sq_emp.id) FROM sq_emp")
+        assert cur.fetchall() == [(200, 4)]
+
+
+def test_subqueries_work_in_update_and_delete_predicates(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        _dept_emp(conn)
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE sq_dept SET budget = 1 WHERE id IN "
+            "(SELECT dept_id FROM sq_emp WHERE salary > 180)"
+        )
+        cur.execute("SELECT id, budget FROM sq_dept ORDER BY id")
+        assert cur.fetchall() == [(1, 1), (2, 500), (3, 0)]
+        cur.execute("DELETE FROM sq_emp WHERE dept_id IN (SELECT id FROM sq_dept WHERE budget = 1)")
+        cur.execute("SELECT count(*) FROM sq_emp")
+        assert cur.fetchall() == [(2,)]
