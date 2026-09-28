@@ -10757,29 +10757,44 @@ shared storage engine or building large new protocol subsystems:
     -- and the set operation treats a constant NULL column as untyped so that
     `select 1 union select null` answers `integer`, as PostgreSQL does.
     Telling the two apart needs the cast to survive planning.
-- [ ] **Rust PG server slice tests: 9 fail on a Windows dev box** (measured
-  2026-09-20, the first time they have ever RUN there -- `BINARY` in
-  `tests/test_rust_pgserver_slice.py` lacked the `.exe` suffix, so all 1,194
-  skipped; fixed in the same commit, and 355 now pass locally). **CI is
-  unaffected**: it builds `secantusd-pg` only on the Linux pg-oracle lane, so
-  these never run on the Windows lane. The failures cluster by cause:
-  - **Hand-off tests** (`test_python_server_reads_rust_timestamps`,
-    `..._reads_and_writes_a_rust_created_table`, `..._enum_created_by_one_server...`,
-    `..._composite_created_by_one_server...`): the Python server opens the
-    handed-off store and finds it EMPTY or the relation missing. `_Server.__exit__`
-    stops the server with `proc.terminate()`, which is SIGTERM on POSIX but
-    `TerminateProcess` on Windows -- an immediate kill with no graceful
-    WiredTiger close, so whatever was not checkpointed is gone. Needs a real
-    shutdown path on Windows (a `CTRL_BREAK_EVENT` to its own process group, or
-    a shutdown command) before these can pass.
-  - **Signal / lifecycle tests** (`..._survive_sigterm`,
-    `test_pg_cancel_and_terminate_backend_signal_a_running_statement`,
-    `test_idle_timeouts_end_the_session_with_a_fatal_error`,
-    `test_prepared_transaction_survives_a_restart`): same root, plus Windows
-    reporting a hard socket abort (10053) where the test expects a FATAL.
-  - `test_copy_fills_the_columns_it_omits_from_their_defaults` answers NULL
-    where the default is `67000` -- the only one NOT obviously signal-shaped,
-    so probe it on Linux before assuming it is platform-only.
+- [ ] **Rust PG server slice tests: 3 still fail on a Windows dev box**
+      (was 9, measured 2026-09-20; re-measured 2026-09-28 after the harness
+      learned to stop the server gracefully -- 384 pass, 3 fail). **CI is
+      unaffected either way**: it builds `secantusd-pg` only on the Linux
+      pg-oracle lane, so these never run on the Windows lane.
+
+      **RESOLVED (2026-09-28): seven of the nine were the HARNESS killing the
+      server, not the server losing data.** `_Server.__exit__` called
+      `proc.terminate()`, which is SIGTERM on POSIX but `TerminateProcess` on
+      Windows -- an immediate kill that runs no handler, so WiredTiger never
+      closed and anything not yet checkpointed was gone. The binary already
+      used the `ctrlc` crate with `termination` (a Windows console control
+      handler); it was simply never sent a signal it could catch. Spawning with
+      `CREATE_NEW_PROCESS_GROUP` and stopping with `CTRL_BREAK_EVENT` -- the
+      pattern `tests/test_rust_binary_smoke.py` already used -- fixed all four
+      hand-off tests, `..._survive_sigterm`, `..._prepared_transaction_survives_a_restart`,
+      and the COPY case.
+
+      **The COPY case was mis-scoped here and the correction is the reusable
+      part.** This entry called
+      `test_copy_fills_the_columns_it_omits_from_their_defaults` "the only one
+      NOT obviously signal-shaped, so probe it on Linux before assuming it is
+      platform-only" -- it WAS signal-shaped, and answered NULL only because the
+      COPY'd rows had not been checkpointed when the kill landed. A failure that
+      does not LOOK like the cluster it sits in can still share its root; the
+      shape of a symptom is weaker evidence than re-running it after the fix.
+
+      **Still open, and a DIFFERENT root cause** -- the FATAL racing the socket
+      close, not the shutdown path:
+      - `test_pg_cancel_and_terminate_backend_signal_a_running_statement`
+      - `test_idle_timeouts_end_the_session_with_a_fatal_error`
+      - `test_pg_terminate_backend_across_connections` (see the next entry --
+        this one is NOT Windows-only; the CI Linux lane has hit it too)
+
+      Windows reports a hard socket abort (10053) where the test expects a
+      FATAL. The fix is the same one the next entry describes: shut the write
+      half down and drain reads briefly before closing, so the message cannot
+      be discarded by an RST.
 - [ ] **Rust PG server: a terminated victim can lose its 57P01** (CI pg-oracle
   lane, 2026-09-19, #1518's run; that PR does not touch the Rust PG server).
   `test_rust_pgserver_slice.py::test_pg_terminate_backend_across_connections`:

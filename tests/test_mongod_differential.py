@@ -21,6 +21,7 @@ Run explicitly with `pytest -m differential`.
 from __future__ import annotations
 
 import contextlib
+import math
 import os
 import re
 import shutil
@@ -117,6 +118,61 @@ def _free_port() -> int:
         return int(s.getsockname()[1])
 
 
+#: Keep a spawned oracle out of the user's face on Windows.
+#:
+#: A console executable started with no creation flags allocates its own
+#: console when the parent has none, so under ``-n auto`` every xdist worker's
+#: mongod popped a terminal window on the desktop -- dozens of them flashing
+#: through a suite run. ``CREATE_NO_WINDOW`` keeps the child headless; its
+#: output is already going to a file, so nothing is lost. No-op off Windows.
+_NO_CONSOLE: dict[str, int] = (
+    {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
+)
+
+
+def _mongod_log(dbpath: str) -> Path:
+    """Where this mongod's captured output lives, inside its own dbpath."""
+    return Path(dbpath) / "mongod.log"
+
+
+def _stop_mongod(proc: subprocess.Popen, dbpath: str) -> None:
+    """Shut the oracle down, and make an unexpected death LOUD.
+
+    ``proc.terminate()`` on an already-dead process is a no-op and
+    ``wait()``'s status was previously discarded, so a mongod that aborted
+    mid-module was indistinguishable from one we stopped ourselves -- while
+    every comparison made after it died was against nothing at all. If the
+    process exited on its own, keep the log (the dbpath is about to be
+    deleted) and raise with its tail.
+    """
+    died_on_its_own = proc.poll() is not None
+    returncode = proc.poll()
+    if not died_on_its_own:
+        proc.terminate()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=30)
+        shutil.rmtree(dbpath, ignore_errors=True)
+        return
+
+    log = _mongod_log(dbpath)
+    tail = ""
+    kept: Path | None = None
+    if log.exists():
+        with contextlib.suppress(OSError):
+            tail = log.read_text(encoding="utf-8", errors="replace")[-2000:]
+        with contextlib.suppress(OSError):
+            kept = Path(tempfile.gettempdir()) / f"mongod-crash-{os.getpid()}-{proc.pid}.log"
+            shutil.copyfile(log, kept)
+    shutil.rmtree(dbpath, ignore_errors=True)
+    raise RuntimeError(
+        f"the reference mongod exited on its own (returncode={returncode}) -- "
+        "it was not stopped by this harness, so any comparison made after it "
+        "died measured nothing. This is a crash of the oracle, not a test "
+        f"failure.\nlog kept at: {kept or '(none captured)'}\n"
+        f"--- last of mongod's output ---\n{tail or '(empty)'}"
+    )
+
+
 def _start_mongod(env: Mapping[str, str] | None = None) -> tuple[subprocess.Popen, str, str]:
     """Spawn a throwaway standalone mongod; return ``(proc, uri, dbpath)``.
 
@@ -126,12 +182,25 @@ def _start_mongod(env: Mapping[str, str] | None = None) -> tuple[subprocess.Pope
     """
     tmp = tempfile.mkdtemp(prefix="differential-mongod-")
     port = _free_port()
+    # Keep the oracle's own diagnostics. These used to go to DEVNULL, which
+    # made a mongod crash unreadable after the fact: one really did abort on
+    # this box (2026-09-22, an application-defined 0xE0000001 -- mongod's own
+    # fatal-assertion path), and the only surviving artefact was a minidump
+    # with no log beside it. A reference server that dies mid-module
+    # invalidates every comparison after it, so its last words are worth a
+    # file handle.
+    log = subprocess.DEVNULL
+    with contextlib.suppress(OSError):
+        log = open(_mongod_log(tmp), "wb")  # noqa: SIM115 - closed with the proc
     proc = subprocess.Popen(
         [MONGOD, "--port", str(port), "--dbpath", tmp, "--quiet"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=log,
+        stderr=subprocess.STDOUT,
         env=None if env is None else dict(env),
+        **_NO_CONSOLE,
     )
+    if log is not subprocess.DEVNULL:
+        log.close()  # the child holds its own descriptor
     uri = f"mongodb://127.0.0.1:{port}/"
     # Everything from here to the `return` runs under `_reap_on_failure`: the
     # caller only gets a `finally` to clean up with once it HOLDS the handle, so
@@ -195,9 +264,7 @@ def mongod_uri() -> Iterator[str]:
     try:
         yield uri
     finally:
-        proc.terminate()
-        proc.wait(timeout=30)
-        shutil.rmtree(tmp, ignore_errors=True)
+        _stop_mongod(proc, tmp)
 
 
 @pytest.fixture(scope="module")
@@ -3370,6 +3437,62 @@ PROJECTION_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
 ]
 
 
+#: The mongo-java-driver's own geo fixture: legacy ``[lng, lat]`` pairs.
+GEO_LEGACY_DOCS: list[dict] = [
+    {"_id": 1, "geo": [1.0, 1.0]},
+    {"_id": 2, "geo": [45.0, 2.0]},
+    {"_id": 3, "geo": [3.0, 3.0]},
+]
+
+
+def _center_sphere(
+    centre: list[float], radius: float, *, index: bool
+) -> Callable[[Database], object]:
+    """``$geoWithin: {$centerSphere: ...}``, optionally over a 2d index.
+
+    Run both ways on purpose. A geo index narrows the candidate set before the
+    predicate sees it, so an index that is too aggressive silently DROPS
+    matching rows -- the same silent-data-loss shape the partial- and
+    sparse-index gates exist for. Comparing both against mongod catches a
+    divergence in either the predicate or the picker.
+    """
+
+    def run(db: Database) -> object:
+        if index:
+            db.c.create_index([("geo", "2d")])
+        return [
+            d["_id"]
+            for d in db.c.find(
+                {"geo": {"$geoWithin": {"$centerSphere": [centre, radius]}}},
+                sort=[("_id", 1)],
+            )
+        ]
+
+    return run
+
+
+#: ``$centerSphere``'s radius is in RADIANS, so anything at or past pi covers
+#: the whole sphere and must match every document. The java driver's
+#: ``GeoFiltersFunctionalSpecification`` asserts exactly that with r=4, and it
+#: failed once in the 2026-09-21 gauge and passed on 2026-09-27 -- a flake, but
+#: nothing pinned the behaviour, so a real regression here would have looked
+#: identical. Probed against 8.2.11 on 2026-09-28: 0 of 12 divergent.
+GEO_CENTERSPHERE_CASES: list[tuple[str, list[dict], Callable[[Database], object]]] = [
+    ("java-r4-idx", GEO_LEGACY_DOCS, _center_sphere([2.0, 2.0], 4.0, index=True)),
+    ("java-r4-noidx", GEO_LEGACY_DOCS, _center_sphere([2.0, 2.0], 4.0, index=False)),
+    ("pi-exact-idx", GEO_LEGACY_DOCS, _center_sphere([2.0, 2.0], math.pi, index=True)),
+    ("pi-under-idx", GEO_LEGACY_DOCS, _center_sphere([2.0, 2.0], math.pi - 1e-9, index=True)),
+    ("pi-over-idx", GEO_LEGACY_DOCS, _center_sphere([2.0, 2.0], math.pi + 1e-9, index=True)),
+    ("r2-idx", GEO_LEGACY_DOCS, _center_sphere([2.0, 2.0], 2.0, index=True)),
+    ("r0p1-idx", GEO_LEGACY_DOCS, _center_sphere([2.0, 2.0], 0.1, index=True)),
+    ("r0p1-noidx", GEO_LEGACY_DOCS, _center_sphere([2.0, 2.0], 0.1, index=False)),
+    ("r0-idx", GEO_LEGACY_DOCS, _center_sphere([2.0, 2.0], 0.0, index=True)),
+    ("r0-noidx", GEO_LEGACY_DOCS, _center_sphere([2.0, 2.0], 0.0, index=False)),
+    ("far-centre-idx", GEO_LEGACY_DOCS, _center_sphere([170.0, -80.0], 3.0, index=True)),
+    ("antipodal-idx", GEO_LEGACY_DOCS, _center_sphere([-178.0, -2.0], math.pi / 2, index=True)),
+]
+
+
 ALL_CASES = (
     [("query", c) for c in QUERY_CASES]
     + [("readpath", c) for c in READPATH_CASES]
@@ -3405,6 +3528,7 @@ ALL_CASES = (
     + [("todate", c) for c in TODATE_CASES]
     + [("projection", c) for c in PROJECTION_CASES]
     + [("unknownexpr", c) for c in UNKNOWN_EXPR_CASES]
+    + [("centersphere", c) for c in GEO_CENTERSPHERE_CASES]
 )
 
 
@@ -3529,9 +3653,7 @@ def _mongod_renders_under_tz(tz: str | None) -> list[str]:
         finally:
             client.close()
     finally:
-        proc.terminate()
-        proc.wait(timeout=30)
-        shutil.rmtree(tmp, ignore_errors=True)
+        _stop_mongod(proc, tmp)
     _TZ_MONGOD_CACHE[tz] = rendered
     return rendered
 
@@ -3655,3 +3777,54 @@ def test_api_strict_matches_mongod(
     assert mine[2] == theirs[2], (
         f"{label} errmsg:\n  secantus={mine[2]!r}\n  mongod  ={theirs[2]!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# The harness itself: a crashed oracle must be loud
+# ---------------------------------------------------------------------------
+
+
+def test_stop_mongod_surfaces_a_server_that_died_on_its_own(tmp_path: Path) -> None:
+    """A mongod that aborts mid-module must fail the run, not vanish.
+
+    Pins the 2026-09-22 lesson: mongod really did abort on this box (an
+    application-defined 0xE0000001, its own fatal-assertion path) and left
+    nothing but a minidump, because the harness sent its output to DEVNULL
+    and discarded ``wait()``'s status. A dead oracle means every comparison
+    after it measured nothing, so it has to be an error with the server's
+    own last words attached -- not silence.
+    """
+    dbpath = tmp_path / "dbpath"
+    dbpath.mkdir()
+    _mongod_log(str(dbpath)).write_text("boom: pretend fatal assertion\n", encoding="utf-8")
+
+    # A process that has already exited, standing in for the crash.
+    dead = subprocess.Popen([sys.executable, "-c", "raise SystemExit(3)"])
+    dead.wait(timeout=30)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        _stop_mongod(dead, str(dbpath))
+
+    message = str(excinfo.value)
+    assert "exited on its own" in message
+    assert "returncode=3" in message
+    # The server's own output is the point -- without it the crash is undiagnosable.
+    assert "pretend fatal assertion" in message
+
+
+def test_stop_mongod_is_quiet_for_a_server_it_stopped_itself(tmp_path: Path) -> None:
+    """The ordinary path stays silent and still cleans the dbpath up."""
+    dbpath = tmp_path / "dbpath"
+    dbpath.mkdir()
+    (dbpath / "marker").write_text("x", encoding="utf-8")
+
+    live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        _stop_mongod(live, str(dbpath))  # must not raise
+    finally:
+        if live.poll() is None:  # pragma: no cover - only if the assert above failed
+            live.kill()
+            live.wait(timeout=30)
+
+    assert live.poll() is not None, "the harness must actually stop the process"
+    assert not dbpath.exists(), "the dbpath should be reclaimed on the normal path"
