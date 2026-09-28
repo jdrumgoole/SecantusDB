@@ -2913,28 +2913,72 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
-- [ ] **OPEN — the committed validation reports and the live driver panels
-      PREDATE two fixes that landed the same day (2026-09-28).** The full
-      `validate-all` was run against `0.6.0b17` on 2026-09-27 and its numbers
-      were published; `apiStrict` (#1582) and the transaction label / codeName
-      fixes (#1585, #1597) landed after. The published numbers are not wrong
-      about what was measured — they now UNDERSTATE the server.
+- [ ] **OPEN — THE tracker for stale gauge numbers. The committed validation
+      reports, the live driver panels and the unmerged refresh PR #1595 are each
+      stale in a DIFFERENT way (2026-09-28).** This entry supersedes the shorter
+      version filed by #1599 and is the single place this drift is tracked;
+      Step 1 of `tasks/driver-conformance-followups-plan.md` points here rather
+      than describing it again.
 
-      Specifically, these reported failures should flip at the next sweep:
+      Three artifacts, three different staleness:
 
-      * `docs/validation-report-java.md` — `VersionedApiTest#Test commands:
-        strict mode` (1 of its 3 failures).
-      * `docs/validation-report.md` — `TestVersionedApiTestCommandsStrictMode`
-        plus the `test_transactions_unified` label cluster; 9 of the 15 listed
-        failures are now addressed, and 3 of the survivors are the secondary-read
-        non-goal in section 4.
+      * **Committed `docs/validation-report*.md`** — a full `validate-all`
+        against `0.6.0b17` on **2026-09-27**. It predates `apiStrict` (#1582) and
+        the transaction label / codeName fixes (#1585, #1597), so it UNDERSTATES
+        the server. Python pymongo reads 1,195 / 15 / 290 = **98.7%**.
+      * **`docs/validation-report-rust-server.md`** — older still, **2026-09-21**
+        against `0.6.0b16`, at 1,071 / 5 / **424 skipped** = 99.5%. That 424 is
+        PRE-`enableTestCommands`: the rate looks higher than the Python one only
+        because 134 failpoint tests were skipping. Do not compare the two numbers
+        as they stand.
+      * **Unmerged PR #1595 (`validation-report-20260928`, `60bd8c1b`)** — a bot
+        refresh that has #1582 and #1585 as ancestors but **NOT #1597**; it was
+        opened at 07:17Z and #1597 merged at 08:48Z. It is stale on arrival.
+        **Close it rather than merging it.**
 
-      Do NOT hand-edit the reports or the panels to match — they are generated,
-      and a hand-edited number is worse than a stale one because nothing marks it
-      as unmeasured. Re-run `invoke validate` and `invoke validate-java` (the two
-      affected gauges) and regenerate the panels with
-      `validation_summary.driver_panels`, then deploy. The pymongo rate should
-      RISE from 98.7%; the java rate from 99.3%.
+      What to do: re-run `invoke validate` (Python) and `./inv validate --server
+      rust` at a tree containing `daa855a8`, rebuilding the embedded Rust
+      extension first (`./inv rust-server-build`) or the Rust run measures old
+      code. Then regenerate the panels with `validation_summary.driver_panels`
+      and deploy. Expected: Python **1,205 / 5 = 99.6%**, its remaining five being
+      exactly the out-of-scope list (text / hashed indexes, `$where` ×2,
+      `test_to_list_csot_applied`). Rust stays at 15 failures until the Rust
+      transaction port lands — that is Step 2 of the plan, not this item.
+
+      **Say the move honestly.** The published rate did not "fall from 99.5% to
+      99.4%". It dipped to 98.7% on 2026-09-27 because 134 failpoint tests that
+      used to skip began to RUN (skips 424 → 290; +124 passes, +10 failures), and
+      the fixes since take it back up. Against what is committed today the change
+      is **98.7% → 99.6%, a rise.**
+
+      **Do NOT hand-edit the reports or the panels to match.** They are
+      generated, and a hand-edited number is worse than a stale one because
+      nothing marks it as unmeasured.
+
+      **Unresolved — the Java gauge's failure set turned over COMPLETELY between
+      the two runs, and the #1599 prediction that its rate would rise was wrong.**
+      It went 493 / 3 = 99.3% (2026-09-27) → 492 / **4** = 99.1% (2026-09-28),
+      with **zero overlap** between the two failure lists:
+
+      ```
+      2026-09-27  VersionedApiTest#Test commands: strict mode
+                  MongoCollectionTest#testMapReduceWithGenerics()
+                  MongoCollectionTest#shouldBeAbleToQueryTypedCollectionAndMapResultsIntoTypedLists()
+      2026-09-28  ClientMetadataTest#client metadata is not propagated to the server
+                  VersionedApiTest#CRUD Api Version 1 (strict): find and getMore append API version
+                  VersionedApiTest#CRUD Api Version 1 (strict): updateMany appends declared API version
+                  GeoFiltersFunctionalSpecification#$geoWithin $center
+      ```
+
+      #1582 plausibly explains the strict-mode test disappearing, and it may have
+      moved the other two `VersionedApiTest` cases. Nothing that landed that day
+      touches `$geoWithin $center` or client metadata, and
+      `testMapReduceWithGenerics` is a KNOWN permanent failure (see section 4,
+      `mapReduce`) that should not vanish. A gauge whose failures do not overlap
+      across a day is reporting run conditions, not the server — most likely the
+      `validate-all --jobs` contention flake CLAUDE.md warns about. **Run
+      `invoke validate-java` twice, serially, before publishing any Java
+      number**, and file whatever survives both runs as its own bug.
 
 - [ ] **OPEN — the published writer-scaling chart can only be measured on
       SHARED CPU, and a DigitalOcean tier ticket is in flight (2026-09-28).**
