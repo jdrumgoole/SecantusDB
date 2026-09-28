@@ -2974,6 +2974,97 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **OPEN — seven `-rust-server` reports carry a date weeks newer than the
+      measurement behind them (2026-09-28).** The `Generated <date>` line
+      records when the report GENERATOR ran, not when the tests ran, and for
+      these gauges the two are far apart:
+
+      | report | claims | raw artifact actually dated |
+      | --- | --- | --- |
+      | `validation-report-rust-server.md` (pymongo) | 2026-09-21, 0.6.0b16 | **30 Aug** |
+      | `validation-report-pymongo-async-rust-server.md` | 2026-09-21, 0.6.0b16 | **10 Aug** |
+      | `validation-report-c-rust-server.md` | 2026-09-21, 0.6.0b16 | **19 Aug** |
+      | `validation-report-cxx-rust-server.md` | 2026-09-21, 0.6.0b16 | **19 Aug** |
+      | `validation-report-dotnet-rust-server.md` | 2026-09-21, 0.6.0b16 | **19 Aug** |
+      | `validation-report-php-ext-rust-server.md` | 2026-09-21, 0.6.0b16 | **19 Aug** |
+      | `validation-report-php-lib-rust-server.md` | 2026-09-21, 0.6.0b16 | **19 Aug** |
+
+      Check any of them with
+      `ls -l .validation/*rust-server*` against `sed -n 3p docs/validation-report-<x>-rust-server.md`.
+
+      **Why this is not merely "stale".** A stale report that says so is
+      harmless. These say 2026-09-21 and a current version string over August
+      data, so the usual freshness check — read the Generated line — actively
+      confirms the wrong thing. The mechanism that produced the mismatch is
+      fixed for the two pymongo gauges (they now refuse to regenerate a report
+      from a raw the run did not write), but the OTHER five were regenerated the
+      same way and nothing re-measured them.
+
+      **Do not hand-edit the dates.** Re-run each gauge against the Rust server
+      (`invoke validate-<x> --server rust`) and let it write both artifacts, or
+      delete the report so its absence is honest. A hand-corrected date is worse
+      than a wrong one, because nothing marks it as unmeasured.
+
+      Related: `validation_summary/driver_panels.py` reads only the PYTHON
+      artifacts, so the published panels are unaffected by these seven — but
+      anyone quoting a Rust number from `docs/` is quoting August.
+
+- [ ] **OPEN — the Go gauge reports 100.0% over a population capped by a
+      30-minute timeout, and nothing in the report says so (2026-09-28).**
+      Every recorded run of this gauge has been truncated at the same point, on
+      BOTH servers, including the committed 2026-09-21 report. The published
+      "Go: 100%" has never described the whole include set.
+
+      Measured from the raw artifacts rather than the reports:
+
+      ```
+      .validation/go-raw-rust-server.ndjson   481 started  476 completed  5 hung
+      .validation/go-raw.ndjson    (python)   481 started  476 completed  5 hung
+      package "internal/integration": Action=fail, Elapsed=1801s
+      output carries: panic: test timed out after 30m0s
+      ```
+
+      **Why it prints 100.0%.** A `go test -timeout=30m` panic kills the binary
+      without emitting per-test `fail` events, so the summariser counts zero
+      failures over the 476 that did report, and `tasks.py` exits 0 because the
+      raw artifact is non-empty. The package-level result is literally `fail`
+      while the report says 100.0% — the two disagree and only the raw shows it.
+
+      The five that never complete:
+
+      ```
+      TestInitialDNSSeedlistDiscoverySpec
+      TestInitialDNSSeedlistDiscoverySpec/replica_set
+      TestInitialDNSSeedlistDiscoverySpec/replica_set/txt-record-with-overridden-ssl-option.json
+      TestClient_BSONOptions
+      TestCommandLoggingAndMonitoringProse
+      ```
+
+      `TestInitialDNSSeedlistDiscoverySpec` resolves SRV/TXT records against
+      `mongodb.test.build.10gen.cc`. It is a DNS test that never opens a
+      connection to SecantusDB, so this is not a server defect in either
+      implementation — but it silently costs 30 minutes of every Go gauge run
+      and caps the denominator.
+
+      **Two fixes, and the first is the load-bearing one:**
+
+      * **Make the gauge refuse to report a rate when a package result is `fail`
+        with zero test-level failures.** That combination means the binary died
+        without accounting for its tests, and it is exactly what a truncated run
+        looks like. Today it is indistinguishable from a clean 100%. Until this
+        exists, no Go number should be published.
+      * Exclude the DNS-dependent tests from `go_validation/include_paths.py`
+        (they need external DNS and test the driver's resolver, not our wire
+        protocol). That recovers ~30 minutes per run and uncaps the population.
+
+      **How this was found, because the tell generalises.** A Go run against the
+      Rust server and the committed report from a different server, a different
+      version and a week earlier carried IDENTICAL numbers (439/0/37/100.0%).
+      Agreement between a fresh artifact and a stale one reads as confirmation;
+      here it meant both were cut off at the same DNS hang. The WALL CLOCK was
+      the honest signal — 30m 09s for a gauge whose own timeout is 30m is a
+      truncation, not a slow run.
+
 - [ ] **CLOSED-BY-MEASUREMENT — `createIndexes` under a timeout needs no Rust
       change; the PYTHON server is the divergent one (2026-09-28).**
       `tasks/driver-conformance-followups-plan.md` §4 asked which shape mongod
