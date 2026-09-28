@@ -6587,9 +6587,17 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
         `ON CONSTRAINT` / bare arbiter, `RETURNING`, and PostgreSQL's row
         counts. 14/14 then 15/16 against PostgreSQL 14.13 (`oc_probe`), the one
         remaining difference being a deliberate refusal — see the entry below.
-      * `GROUPING SETS` / `ROLLUP` — the grouping clause is dropped, so
-        `group by grouping sets ((a),())` answers the misleading `42803 column
-        "a" must appear in the GROUP BY clause`, blaming the user's query.
+      * ~~`GROUPING SETS` / `ROLLUP`~~ — **IMPLEMENTED 2026-09-28**, with
+        `CUBE`. Each set groups on its own keys and NULL-pads the rest; sets
+        concatenate in order and duplicates are kept, as PostgreSQL has it.
+        12/13 against PostgreSQL 14.13 (`gs_probe`); the one difference is the
+        `GROUPING()` function, refused `0A000` BY NAME because it needs the
+        producing set carried through the group. A multi-key set `(a,b)` parses
+        as a `RowExpr`, not a nested `GroupingSet` — assuming otherwise dropped
+        `b` from the keys and reproduced the original 42803.
+
+      **BOTH clause-dropping bugs this survey found are now closed.** What each
+      still refuses, it refuses loudly and by name.
 
       **Still open from the ON CONFLICT work: a PARTIAL-INDEX arbiter.**
       `ON CONFLICT (a) WHERE <pred>` is refused `0A000`. PostgreSQL infers the
