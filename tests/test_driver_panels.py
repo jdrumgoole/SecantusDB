@@ -199,9 +199,16 @@ def test_render_end_to_end_against_synthetic_validation_dir(tmp_path: Path) -> N
 
 def test_render_missing_artifact_fails_loudly(tmp_path: Path) -> None:
     # Empty dir → first collector returns None → SystemExit telling the
-    # user to run validate-all.
-    with pytest.raises(SystemExit, match="run `invoke validate-all`"):
+    # user which command to run. The message names the server, because with
+    # `--server rust` the fix is `validate-all --server rust` and pointing at
+    # the bare command would send the reader to re-measure the wrong half.
+    with pytest.raises(SystemExit, match=r"run `invoke validate-all --server python`"):
         render(tmp_path)
+
+
+def test_render_missing_artifact_names_the_rust_half(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit, match=r"run `invoke validate-all --server rust`"):
+        render(tmp_path, "rust")
 
 
 def test_counts_line_accounts_for_every_failure_behind_the_rate() -> None:
