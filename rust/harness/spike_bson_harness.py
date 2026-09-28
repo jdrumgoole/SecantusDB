@@ -15,6 +15,7 @@ printed with a hexdump so we can see precisely where the crates disagree.
 Usage:
     uv run python rust/harness/spike_bson_harness.py path/to/roundtrip
 """
+
 from __future__ import annotations
 
 import datetime
@@ -50,14 +51,34 @@ def corpus() -> list[tuple[str, dict]]:
         ("int64_forced", {"big": 2**31, "i64": Int64(5), "huge": 2**62}),
         ("doubles", {"pi": 3.141592653589793, "neg": -2.5, "zero": 0.0, "tiny": 5e-324}),
         ("double_specials", {"inf": float("inf"), "ninf": float("-inf"), "nan": float("nan")}),
-        ("decimal128", {"d": Decimal128("1.00"), "d2": Decimal128("0"), "big": Decimal128("123456789.987654321")}),
-        ("decimal128_specials", {"inf": Decimal128("Infinity"), "nan": Decimal128("NaN"), "neg": Decimal128("-1E-6")}),
+        (
+            "decimal128",
+            {
+                "d": Decimal128("1.00"),
+                "d2": Decimal128("0"),
+                "big": Decimal128("123456789.987654321"),
+            },
+        ),
+        (
+            "decimal128_specials",
+            {
+                "inf": Decimal128("Infinity"),
+                "nan": Decimal128("NaN"),
+                "neg": Decimal128("-1E-6"),
+            },
+        ),
         ("objectid", {"_id": ObjectId("0123456789abcdef01234567")}),
-        ("datetime_utc", {"t": datetime.datetime(2026, 6, 5, 12, 0, 0, tzinfo=datetime.timezone.utc)}),
+        (
+            "datetime_utc",
+            {"t": datetime.datetime(2026, 6, 5, 12, 0, 0, tzinfo=datetime.timezone.utc)},
+        ),
         ("datetime_tz", {"t": datetime.datetime(2026, 1, 2, 3, 4, 5, 678000, tzinfo=tz)}),
         ("datetime_epoch", {"t": datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)}),
         ("binary_generic", {"b": Binary(b"\x00\x01\x02\xff", 0)}),
-        ("binary_uuid", {"u": Binary(uuid.UUID("12345678-1234-5678-1234-567812345678").bytes, UUID_SUBTYPE)}),
+        (
+            "binary_uuid",
+            {"u": Binary(uuid.UUID("12345678-1234-5678-1234-567812345678").bytes, UUID_SUBTYPE)},
+        ),
         ("binary_subtype4_func", {"b": Binary(b"raw-bytes-here", 4)}),
         ("regex", {"r": Regex("^abc$", "im"), "r2": Regex(".*", "")}),
         ("timestamp", {"ts": Timestamp(1700000000, 1), "ts0": Timestamp(0, 0)}),
@@ -92,7 +113,7 @@ def main() -> int:
     # document independently so a single bad doc doesn't desync the whole stream.
     ok = True
     off_in = off_out = 0
-    for (label, _), original in zip(docs, framed):
+    for (label, _), original in zip(docs, framed, strict=False):
         got = out[off_out : off_out + len(original)] if off_out < len(out) else b""
         if got == original:
             status = "ok"
@@ -110,7 +131,10 @@ def main() -> int:
         print(f"FAIL: output length {len(out)} != input length {len(stream)}", file=sys.stderr)
         ok = False
 
-    print("\nRESULT:", "PASS — bson crate is byte-faithful to pymongo" if ok else "FAIL — divergence found")
+    print(
+        "\nRESULT:",
+        "PASS — bson crate is byte-faithful to pymongo" if ok else "FAIL — divergence found",
+    )
     return 0 if ok else 1
 
 

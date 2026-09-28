@@ -450,13 +450,24 @@ jobs:
       # Lint / format are platform- AND shard-independent: pin them to the
       # ``core`` shard on Linux so neither sharding nor the cron's extra OS /
       # python cells re-run them.
+      # `.`, not a path list. The scope was `src tests` until 2026-09-28, which
+      # left `tools/`, `bench/`, all 19 gauge runners, the invoke tasks and
+      # `website/` unlinted -- and a helper added to `tools/` that day used
+      # `sys` without importing it, which no gate would have caught. A NAMED
+      # list was the first fix and was itself wrong: enumerating the paths
+      # reproduces the same hole the moment somebody adds a directory, and the
+      # test that checked the list found 27 locations missing from it. `.` has
+      # no such failure mode. ruff already skips gitignored trees and the
+      # vendored submodules, so this reaches our Python and nothing else.
+      # The whole repo was clean bar 45 trivial findings -- one of which was a
+      # dict key written twice, silently discarding a session's findings.
       - name: Lint
         if: matrix.group == 1 && runner.os == 'Linux'
-        run: uv run ruff check src tests
+        run: uv run ruff check .
 
       - name: Format check
         if: matrix.group == 1 && runner.os == 'Linux'
-        run: uv run ruff format --check src tests
+        run: uv run ruff format --check .
 
       - name: Wait for disk reclaim
         # Barrier for the backgrounded reclaim above — the pytest step is the

@@ -25,9 +25,7 @@ from pathlib import Path
 
 PATCH_MARKER = "# secantus-patch: Development -> Development.Module (manylinux compat)"
 
-ORIGINAL = (
-    "find_package(Python3 ${required_version} COMPONENTS Interpreter Development REQUIRED)"
-)
+ORIGINAL = "find_package(Python3 ${required_version} COMPONENTS Interpreter Development REQUIRED)"
 PATCHED = (
     f"{PATCH_MARKER}\n"
     "        find_package(Python3 ${required_version} "

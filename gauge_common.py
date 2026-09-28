@@ -63,14 +63,32 @@ def report_suffix() -> str:
     return "" if gauge_server() == "python" else "-rust-server"
 
 
+def _require_fresh(binary: pathlib.Path) -> None:
+    """Refuse to gauge a binary built from a different tree than this checkout.
+
+    A gauge PUBLISHES its number. On 2026-09-18 one was measured against a
+    checkout 116 crate-commits behind and reported 73.8% where the truth was
+    ~99.98%; it reached the live website before anybody checked `git log`. The
+    binary was stamped the whole time and nothing read the stamp.
+
+    `SECANTUS_ALLOW_STALE_ARTIFACT=1` overrides, for deliberately gauging an old
+    build.
+    """
+    from tools.provenance import require_fresh_rs
+
+    require_fresh_rs(binary, repo_root=_REPO_ROOT)
+
+
 def rust_binary() -> str:
     """Path to the standalone ``secantusdb`` binary, or a clear error."""
     env = os.environ.get("SECANTUSDB_BIN")
     if env and pathlib.Path(env).exists():
+        _require_fresh(pathlib.Path(env))
         return env
     for profile in ("release", "debug"):
         p = _REPO_ROOT / "crates" / "secantusdb" / "target" / profile / "secantusd-rs"
         if p.exists():
+            _require_fresh(p)
             return str(p)
     raise SystemExit(
         "secantusdb binary not built — run `cargo build --manifest-path "

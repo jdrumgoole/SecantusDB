@@ -183,19 +183,25 @@ def render_viz(results: dict, style_name: str) -> str:
         f"{st['legend_names'][s]}</span>"
         for s in ["mongod", "rust", "python", "rust-async"]
     )
-    parts.append(f'<div class="{st["wrap_class"]}"><div class="{st["legend_class"]}">{legend}</div>')  # noqa: E501
+    parts.append(
+        f'<div class="{st["wrap_class"]}"><div class="{st["legend_class"]}">{legend}</div>'
+    )  # noqa: E501
     parts.append(
         f'<svg viewBox="0 0 790 320" role="img" aria-label="{st["aria"]}" class="{st["svg_class"]}">'  # noqa: E501
     )
 
-    parts.append(f'<line x1="{X0:.0f}" y1="{Y_REF:.0f}" x2="{X1:.0f}" y2="{Y_REF:.0f}" class="{p}-ref"/>')  # noqa: E501
+    parts.append(
+        f'<line x1="{X0:.0f}" y1="{Y_REF:.0f}" x2="{X1:.0f}" y2="{Y_REF:.0f}" class="{p}-ref"/>'
+    )  # noqa: E501
     parts.append(
         f'<text x="48" y="{Y_REF + 4:.0f}" text-anchor="end" class="{p}-tick">1<tspan class="{p}-x">x</tspan></text>'  # noqa: E501
     )
     k = 2
     while y(k) >= 35:
         gy = y(k)
-        parts.append(f'<line x1="{X0:.0f}" y1="{gy:.0f}" x2="{X1:.0f}" y2="{gy:.0f}" class="{p}-grid"/>')  # noqa: E501
+        parts.append(
+            f'<line x1="{X0:.0f}" y1="{gy:.0f}" x2="{X1:.0f}" y2="{gy:.0f}" class="{p}-grid"/>'
+        )  # noqa: E501
         parts.append(
             f'<text x="48" y="{gy + 4:.0f}" text-anchor="end" class="{p}-tick">{k}<tspan class="{p}-x">x</tspan></text>'  # noqa: E501
         )
@@ -233,7 +239,7 @@ def render_viz(results: dict, style_name: str) -> str:
     for s in DRAW_ORDER:
         parts.append(
             f'<text x="{LABEL_X}" y="{label_pos[s]:.0f}" class="{p}-val" fill="var({st["var"][s]})">'  # noqa: E501
-            f"{st['label_names'][s]} {ratios[s][-1]:.1f}<tspan class=\"{p}-x\">x</tspan></text>"
+            f'{st["label_names"][s]} {ratios[s][-1]:.1f}<tspan class="{p}-x">x</tspan></text>'
         )
 
     parts.append("</svg></div>")
@@ -280,9 +286,7 @@ def render_docs_table(results: dict) -> str:
         "|---|---:|---:|---:|---:|",
     ]
     for i, n in enumerate(writers):
-        cells = " | ".join(
-            _fmt_rate(results["servers"][s]["docs_per_sec"][i]) for s in order
-        )
+        cells = " | ".join(_fmt_rate(results["servers"][s]["docs_per_sec"][i]) for s in order)
         lines.append(f"| {n} | {cells} |")
     return "\n".join(lines)
 
@@ -319,7 +323,10 @@ def load_results(path: Path) -> dict:
     writers = results["meta"]["writers"]
     for s, data in results["servers"].items():
         if len(data["docs_per_sec"]) != len(writers):
-            raise SystemExit(f"{path}: server {s!r} has {len(data['docs_per_sec'])} rates for {len(writers)} writer counts")  # noqa: E501
+            raise SystemExit(
+                f"{path}: server {s!r} has {len(data['docs_per_sec'])} rates "
+                f"for {len(writers)} writer counts"
+            )  # noqa: E501
     return results
 
 
@@ -345,12 +352,19 @@ def main(argv: list[str] | None = None) -> int:
         prog="concurrency_chart",
         description="Refresh the concurrency graphs from bench.concurrency --json results.",
     )
-    ap.add_argument("--results", type=Path, default=DEFAULT_RESULTS,
-                    help=f"Results JSON from bench.concurrency (default: {DEFAULT_RESULTS}).")
-    ap.add_argument("--performance-html", type=Path, default=PERFORMANCE_HTML,
-                    help="Path to the website performance template.")
-    ap.add_argument("--docs-md", type=Path, default=DOCS_MD,
-                    help="Path to docs/concurrency.md.")
+    ap.add_argument(
+        "--results",
+        type=Path,
+        default=DEFAULT_RESULTS,
+        help=f"Results JSON from bench.concurrency (default: {DEFAULT_RESULTS}).",
+    )
+    ap.add_argument(
+        "--performance-html",
+        type=Path,
+        default=PERFORMANCE_HTML,
+        help="Path to the website performance template.",
+    )
+    ap.add_argument("--docs-md", type=Path, default=DOCS_MD, help="Path to docs/concurrency.md.")
     args = ap.parse_args(argv)
 
     results = load_results(args.results)

@@ -10,6 +10,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+from _servers import probe_targets, report  # noqa: E402
 from bson import (  # noqa: E402
     Binary,
     Code,
@@ -20,8 +21,6 @@ from bson import (  # noqa: E402
     Regex,
     Timestamp,
 )
-
-from _servers import probe_targets, report  # noqa: E402
 
 CASES = [
     # ---- $set / $unset edge cases

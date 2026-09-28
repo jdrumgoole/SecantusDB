@@ -43,6 +43,7 @@ tree" got mis-reported that day as "2769 commits behind".
 
 from __future__ import annotations
 
+import os
 import pathlib
 import subprocess
 
@@ -73,6 +74,23 @@ COST_SERVER = (
 COST_BINARY = (
     "On 2026-09-27 a stale one caused six separate false-regression diagnoses in one session."
 )
+
+
+#: Escape hatch for the one honest reason to run a stale artifact: measuring an
+#: OLD build on purpose -- a bisect, or a before/after benchmark against a
+#: previous release. Named for what it does rather than something bland like
+#: SKIP_CHECKS, so it reads as a deliberate act in a shell history or a CI file.
+#:
+#: It exists because the alternative is worse. Without a supported way to say
+#: "yes, I mean this one", the person with a legitimate need deletes the call or
+#: comments out the check, and then it is gone for everybody, permanently. An
+#: opt-out that is visible in the command line is cheaper than a disabled guard.
+OVERRIDE_ENV = "SECANTUS_ALLOW_STALE_ARTIFACT"
+
+
+def override_active() -> bool:
+    """True when the caller has explicitly opted into a stale artifact."""
+    return os.environ.get(OVERRIDE_ENV, "") not in ("", "0")
 
 
 def committed_crates_tree(repo_root: pathlib.Path | None = None) -> str:
@@ -197,20 +215,47 @@ def extension_staleness(
     )
 
 
-def require_fresh_pgserver(binary: pathlib.Path, *, repo_root: pathlib.Path | None = None) -> None:
-    """Abort when `secantusd-pg` is stale. For probes, gauges and benchmarks.
+def _abort(message: str | None) -> None:
+    """Raise when there is something to say, unless explicitly overridden.
 
-    Raises ``SystemExit`` because that is what the probes already use for a
-    binary they cannot run, and because the alternative — a warning — is what
-    the last seven incidents proved nobody reads.
+    ``SystemExit`` because that is what the probes already use for a binary they
+    cannot run, and because the alternative — a warning — is what the incidents
+    proved nobody reads. A gauge prints thousands of lines; a benchmark prints a
+    table people paste into a document. Neither has anywhere a warning survives.
     """
-    message = binary_staleness(binary, "secantusd-pg", REBUILD_PGSERVER_CMD, repo_root=repo_root)
-    if message is not None:
-        raise SystemExit(message)
+    if message is None:
+        return
+    if override_active():
+        print(f"WARNING ({OVERRIDE_ENV} is set, continuing anyway):\n{message}")
+        return
+    raise SystemExit(message)
+
+
+def require_fresh_binary(
+    binary: pathlib.Path,
+    artifact: str,
+    rebuild: str,
+    *,
+    repo_root: pathlib.Path | None = None,
+) -> None:
+    """Abort when a built binary is stale. For probes, gauges and benchmarks."""
+    _abort(binary_staleness(binary, artifact, rebuild, repo_root=repo_root))
+
+
+def require_fresh_pgserver(binary: pathlib.Path, *, repo_root: pathlib.Path | None = None) -> None:
+    """Abort when `secantusd-pg` is stale."""
+    require_fresh_binary(binary, "secantusd-pg", REBUILD_PGSERVER_CMD, repo_root=repo_root)
+
+
+def require_fresh_rs(binary: pathlib.Path, *, repo_root: pathlib.Path | None = None) -> None:
+    """Abort when the standalone `secantusd-rs` binary is stale.
+
+    This is the one the gauges run. A stale `secantusd-rs` is how a conformance
+    rate measured against a 116-commit-old tree reached the public website.
+    """
+    require_fresh_binary(binary, "secantusd-rs", REBUILD_RS_CMD, repo_root=repo_root)
 
 
 def require_fresh_server_extension(module: object) -> None:
     """Abort when the embedded `_secantus_server` extension is stale."""
-    message = extension_staleness(module, "_secantus_server", REBUILD_SERVER_CMD)
-    if message is not None:
-        raise SystemExit(message)
+    _abort(extension_staleness(module, "_secantus_server", REBUILD_SERVER_CMD))

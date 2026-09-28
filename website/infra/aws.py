@@ -43,10 +43,7 @@ try:
     import boto3
     from botocore.exceptions import ClientError
 except ImportError:
-    sys.exit(
-        "boto3 is required. Install dev/website extras: "
-        "`uv sync --extra website`"
-    )
+    sys.exit("boto3 is required. Install dev/website extras: `uv sync --extra website`")
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +74,7 @@ class State:
     data: dict[str, str]
 
     @classmethod
-    def load(cls, path: Path) -> "State":
+    def load(cls, path: Path) -> State:
         if path.exists():
             return cls(path=path, data=json.loads(path.read_text()))
         return cls(path=path, data={})
@@ -179,7 +176,7 @@ def _wait_cert_issued_with_dns(acm, arn: str, hosted_zone_id: str) -> None:
         detail = acm.describe_certificate(CertificateArn=arn)["Certificate"]
         status = detail["Status"]
         if status == "ISSUED":
-            print(f"  acm certificate: ISSUED")
+            print("  acm certificate: ISSUED")
             return
         if status not in ("PENDING_VALIDATION",):
             raise SystemExit(f"  acm certificate entered unexpected state: {status}")
@@ -191,15 +188,17 @@ def _wait_cert_issued_with_dns(acm, arn: str, hosted_zone_id: str) -> None:
                 HostedZoneId=hosted_zone_id,
                 ChangeBatch={
                     "Comment": "ACM DNS-01 validation for SecantusDB website",
-                    "Changes": [{
-                        "Action": "UPSERT",
-                        "ResourceRecordSet": {
-                            "Name": record["Name"],
-                            "Type": record["Type"],
-                            "TTL": 60,
-                            "ResourceRecords": [{"Value": record["Value"]}],
-                        },
-                    }],
+                    "Changes": [
+                        {
+                            "Action": "UPSERT",
+                            "ResourceRecordSet": {
+                                "Name": record["Name"],
+                                "Type": record["Type"],
+                                "TTL": 60,
+                                "ResourceRecords": [{"Value": record["Value"]}],
+                            },
+                        }
+                    ],
                 },
             )
             written.add(record["Name"])
@@ -246,16 +245,18 @@ def _ensure_distribution(domain: str, bucket: str, cert_arn: str, oac_id: str) -
         "DefaultRootObject": "index.html",
         "Origins": {
             "Quantity": 1,
-            "Items": [{
-                "Id": "s3-origin",
-                "DomainName": f"{bucket}.s3.amazonaws.com",
-                "S3OriginConfig": {"OriginAccessIdentity": ""},
-                "OriginAccessControlId": oac_id,
-                "CustomHeaders": {"Quantity": 0},
-                "ConnectionAttempts": 3,
-                "ConnectionTimeout": 10,
-                "OriginShield": {"Enabled": False},
-            }],
+            "Items": [
+                {
+                    "Id": "s3-origin",
+                    "DomainName": f"{bucket}.s3.amazonaws.com",
+                    "S3OriginConfig": {"OriginAccessIdentity": ""},
+                    "OriginAccessControlId": oac_id,
+                    "CustomHeaders": {"Quantity": 0},
+                    "ConnectionAttempts": 3,
+                    "ConnectionTimeout": 10,
+                    "OriginShield": {"Enabled": False},
+                }
+            ],
         },
         "DefaultCacheBehavior": {
             "TargetOriginId": "s3-origin",
@@ -271,8 +272,18 @@ def _ensure_distribution(domain: str, bucket: str, cert_arn: str, oac_id: str) -
         "CustomErrorResponses": {
             "Quantity": 2,
             "Items": [
-                {"ErrorCode": 403, "ResponseCode": "404", "ResponsePagePath": "/404.html", "ErrorCachingMinTTL": 60},
-                {"ErrorCode": 404, "ResponseCode": "404", "ResponsePagePath": "/404.html", "ErrorCachingMinTTL": 60},
+                {
+                    "ErrorCode": 403,
+                    "ResponseCode": "404",
+                    "ResponsePagePath": "/404.html",
+                    "ErrorCachingMinTTL": 60,
+                },
+                {
+                    "ErrorCode": 404,
+                    "ResponseCode": "404",
+                    "ResponsePagePath": "/404.html",
+                    "ErrorCachingMinTTL": 60,
+                },
             ],
         },
         "Comment": "SecantusDB marketing site",
@@ -298,21 +309,25 @@ def _ensure_bucket_policy(bucket: str, distribution_id: str) -> None:
     account = sts.get_caller_identity()["Account"]
     statement = {
         "Version": "2008-10-17",
-        "Statement": [{
-            "Sid": "AllowCloudFrontServicePrincipal",
-            "Effect": "Allow",
-            "Principal": {"Service": "cloudfront.amazonaws.com"},
-            "Action": "s3:GetObject",
-            "Resource": f"arn:aws:s3:::{bucket}/*",
-            "Condition": {
-                "StringEquals": {
-                    "AWS:SourceArn": f"arn:aws:cloudfront::{account}:distribution/{distribution_id}",
-                }
-            },
-        }],
+        "Statement": [
+            {
+                "Sid": "AllowCloudFrontServicePrincipal",
+                "Effect": "Allow",
+                "Principal": {"Service": "cloudfront.amazonaws.com"},
+                "Action": "s3:GetObject",
+                "Resource": f"arn:aws:s3:::{bucket}/*",
+                "Condition": {
+                    "StringEquals": {
+                        "AWS:SourceArn": (
+                            f"arn:aws:cloudfront::{account}:distribution/{distribution_id}"
+                        ),
+                    }
+                },
+            }
+        ],
     }
     s3.put_bucket_policy(Bucket=bucket, Policy=json.dumps(statement))
-    print(f"  s3 bucket policy: granted CloudFront OAC GetObject")
+    print("  s3 bucket policy: granted CloudFront OAC GetObject")
 
 
 def _ensure_dns_aliases(domain: str, hosted_zone_id: str, distribution_domain: str) -> None:
@@ -320,18 +335,20 @@ def _ensure_dns_aliases(domain: str, hosted_zone_id: str, distribution_domain: s
     changes = []
     for name in (domain, f"www.{domain}"):
         for typ in ("A", "AAAA"):
-            changes.append({
-                "Action": "UPSERT",
-                "ResourceRecordSet": {
-                    "Name": name,
-                    "Type": typ,
-                    "AliasTarget": {
-                        "HostedZoneId": CLOUDFRONT_HOSTED_ZONE_ID,
-                        "DNSName": distribution_domain,
-                        "EvaluateTargetHealth": False,
+            changes.append(
+                {
+                    "Action": "UPSERT",
+                    "ResourceRecordSet": {
+                        "Name": name,
+                        "Type": typ,
+                        "AliasTarget": {
+                            "HostedZoneId": CLOUDFRONT_HOSTED_ZONE_ID,
+                            "DNSName": distribution_domain,
+                            "EvaluateTargetHealth": False,
+                        },
                     },
-                },
-            })
+                }
+            )
     r53.change_resource_record_sets(
         HostedZoneId=hosted_zone_id,
         ChangeBatch={"Comment": "SecantusDB site CloudFront aliases", "Changes": changes},
@@ -483,7 +500,10 @@ def cmd_index_rewrite(args: argparse.Namespace) -> None:
         cf.update_function(
             Name=_INDEX_REWRITE_NAME,
             IfMatch=etag,
-            FunctionConfig={"Comment": "append index.html to directory URIs", "Runtime": "cloudfront-js-2.0"},
+            FunctionConfig={
+                "Comment": "append index.html to directory URIs",
+                "Runtime": "cloudfront-js-2.0",
+            },
             FunctionCode=_INDEX_REWRITE_CODE.encode(),
         )
         etag = cf.describe_function(Name=_INDEX_REWRITE_NAME)["ETag"]
@@ -491,7 +511,10 @@ def cmd_index_rewrite(args: argparse.Namespace) -> None:
     except cf.exceptions.NoSuchFunctionExists:
         resp = cf.create_function(
             Name=_INDEX_REWRITE_NAME,
-            FunctionConfig={"Comment": "append index.html to directory URIs", "Runtime": "cloudfront-js-2.0"},
+            FunctionConfig={
+                "Comment": "append index.html to directory URIs",
+                "Runtime": "cloudfront-js-2.0",
+            },
             FunctionCode=_INDEX_REWRITE_CODE.encode(),
         )
         etag = resp["ETag"]
@@ -552,7 +575,9 @@ def main(argv: list[str] | None = None) -> None:
     p_sync.add_argument("--source", required=True)
     p_sync.set_defaults(func=cmd_sync)
 
-    p_ir = sub.add_parser("index-rewrite", help="Ensure + attach the directory-index CloudFront Function")
+    p_ir = sub.add_parser(
+        "index-rewrite", help="Ensure + attach the directory-index CloudFront Function"
+    )
     p_ir.add_argument("--distribution-id", required=True)
     p_ir.set_defaults(func=cmd_index_rewrite)
 

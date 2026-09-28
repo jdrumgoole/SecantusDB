@@ -7,8 +7,9 @@ Production overrides live in ``publishconf.py``. Run a local preview with
 from __future__ import annotations
 
 import sys
-import tomllib
 from pathlib import Path
+
+import tomllib
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent
@@ -130,6 +131,7 @@ def _pyhighlight(code: str) -> str:
     from pygments import highlight
     from pygments.formatters import HtmlFormatter
     from pygments.lexers import PythonLexer
+
     return highlight(code.strip("\n"), PythonLexer(), HtmlFormatter(cssclass="highlight"))
 
 

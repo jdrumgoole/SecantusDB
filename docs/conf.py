@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import sys
-import tomllib
 from pathlib import Path
+
+import tomllib
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
@@ -16,9 +17,9 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 project = "SecantusDB"
 author = "Joe Drumgoole"
 copyright = "2026, Joe Drumgoole"
-release = tomllib.loads((_REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))[
-    "project"
-]["version"]
+release = tomllib.loads((_REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"][
+    "version"
+]
 version = release
 
 extensions = [
@@ -72,7 +73,7 @@ html_theme_options = {
     **(
         {
             "announcement": (
-                'These docs have moved — the up-to-date documentation lives at '
+                "These docs have moved — the up-to-date documentation lives at "
                 '<a href="https://secantusdb.com/docs/index.html">secantusdb.com/docs</a> '
                 '(Rust server: <a href="https://secantusdb.com/docs/rust/index.html">'
                 "secantusdb.com/docs/rust</a>)."
@@ -98,16 +99,16 @@ html_theme_options = {
     # brandkit/README.md. Tokens map onto Tailwind's slate-* /
     # cyan-* scales.
     "light_css_variables": {
-        "color-brand-primary": "#0e7490",        # cyan-700, AA on white
-        "color-brand-content": "#0891b2",        # cyan-600
-        "color-foreground-primary": "#0f172a",   # slate-900
-        "color-foreground-secondary": "#475569", # slate-600
+        "color-brand-primary": "#0e7490",  # cyan-700, AA on white
+        "color-brand-content": "#0891b2",  # cyan-600
+        "color-foreground-primary": "#0f172a",  # slate-900
+        "color-foreground-secondary": "#475569",  # slate-600
     },
     "dark_css_variables": {
-        "color-brand-primary": "#22d3ee",        # cyan-400, AA on slate-900
-        "color-brand-content": "#67e8f9",        # cyan-300
-        "color-background-primary": "#0f172a",   # slate-900
-        "color-background-secondary": "#1e293b", # slate-800
+        "color-brand-primary": "#22d3ee",  # cyan-400, AA on slate-900
+        "color-brand-content": "#67e8f9",  # cyan-300
+        "color-background-primary": "#0f172a",  # slate-900
+        "color-background-secondary": "#1e293b",  # slate-800
     },
 }
 
