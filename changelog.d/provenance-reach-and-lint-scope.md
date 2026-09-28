@@ -40,3 +40,13 @@ existed but only covered part of what it was meant to.
 
 - Twelve tests: one per launcher asserting it calls the check, two for the
   override's behaviour, and two pinning the lint gate's scope.
+
+#### Note
+
+`[tool.ruff] extend-exclude` now names `vendor` and `crates/vendor`. Linting `.`
+reaches every checked-out submodule, so without it the gate reports upstream's
+style as our failure — CI failed on a WiredTiger analytics notebook. It passed
+locally because a fresh worktree has no submodules checked out, so `.` reached
+nothing vendored and the exclusion looked unnecessary; the difference was the
+environment, not the config. Pinned by `test_ruff_excludes_every_vendored_tree`,
+which fails if a newly-added submodule is not covered.

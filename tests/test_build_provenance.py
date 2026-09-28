@@ -527,3 +527,42 @@ def test_the_lint_and_format_steps_cover_the_same_paths() -> None:
     assert _ci_ruff_paths("run: uv run ruff format --check ") == _ci_ruff_paths(
         "run: uv run ruff check "
     )
+
+
+def test_ruff_excludes_every_vendored_tree() -> None:
+    """CI lints `.`, so a vendored tree it can see becomes OUR failure.
+
+    This bit within hours of widening the scope: CI failed on a WiredTiger
+    analytics NOTEBOOK, 125 characters wide, that upstream is entitled to write
+    however it likes. It passed locally because a fresh worktree has no
+    submodules checked out — so `.` reached nothing vendored and the exclusion
+    looked unnecessary. The difference was the ENVIRONMENT, not the config,
+    which is the recurring shape: a check that cannot see a thing reports no
+    problem with it.
+
+    Every submodule must therefore be covered by `extend-exclude`, or the next
+    one added turns the lint gate red for reasons nobody here can fix.
+    """
+    import tomllib
+
+    config = tomllib.loads((REPO / "pyproject.toml").read_text())
+    excluded = config["tool"]["ruff"]["extend-exclude"]
+
+    gitmodules = (REPO / ".gitmodules").read_text()
+    submodules = [
+        line.split("=", 1)[1].strip()
+        for line in gitmodules.splitlines()
+        if line.strip().startswith("path")
+    ]
+    assert submodules, "no submodules parsed from .gitmodules — has the format changed?"
+
+    uncovered = [
+        path
+        for path in submodules
+        if not any(path == ex or path.startswith(f"{ex}/") for ex in excluded)
+    ]
+    assert not uncovered, (
+        f"these submodules are not excluded from ruff: {uncovered}. CI lints `.`, "
+        f"so upstream's style would be reported as our lint failure. Add them to "
+        f"`extend-exclude` in pyproject.toml."
+    )
