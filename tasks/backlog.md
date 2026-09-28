@@ -10777,56 +10777,57 @@ shared storage engine or building large new protocol subsystems:
     -- and the set operation treats a constant NULL column as untyped so that
     `select 1 union select null` answers `integer`, as PostgreSQL does.
     Telling the two apart needs the cast to survive planning.
-- [ ] **Rust PG server slice tests: 3 still fail on a Windows dev box**
-      (was 9, measured 2026-09-20; re-measured 2026-09-28 after the harness
-      learned to stop the server gracefully -- 384 pass, 3 fail). **CI is
-      unaffected either way**: it builds `secantusd-pg` only on the Linux
-      pg-oracle lane, so these never run on the Windows lane.
+- [x] **RESOLVED (2026-09-28): the Rust PG server slice tests pass on Windows
+      -- 387 passed, 0 failed** (was 9 failing when they first RAN there on
+      2026-09-20; `BINARY` lacked the `.exe` suffix, so all 1,194 had been
+      skipping). Two distinct causes, neither a data-loss bug in the server:
 
-      **RESOLVED (2026-09-28): seven of the nine were the HARNESS killing the
-      server, not the server losing data.** `_Server.__exit__` called
-      `proc.terminate()`, which is SIGTERM on POSIX but `TerminateProcess` on
-      Windows -- an immediate kill that runs no handler, so WiredTiger never
-      closed and anything not yet checkpointed was gone. The binary already
-      used the `ctrlc` crate with `termination` (a Windows console control
-      handler); it was simply never sent a signal it could catch. Spawning with
-      `CREATE_NEW_PROCESS_GROUP` and stopping with `CTRL_BREAK_EVENT` -- the
-      pattern `tests/test_rust_binary_smoke.py` already used -- fixed all four
-      hand-off tests, `..._survive_sigterm`, `..._prepared_transaction_survives_a_restart`,
-      and the COPY case.
+      1. **The harness was killing the server, not stopping it.**
+         `_Server.__exit__` called `proc.terminate()` -- SIGTERM on POSIX,
+         `TerminateProcess` on Windows, an immediate kill that runs no handler,
+         so WiredTiger never closed and anything not yet checkpointed was gone.
+         That is why the hand-off tests opened an EMPTY store. The binary
+         already installed a console control handler (`ctrlc` with
+         `termination`); it was never sent a signal it could catch. Spawning
+         with `CREATE_NEW_PROCESS_GROUP` and stopping with `CTRL_BREAK_EVENT`
+         fixed seven of the nine.
+      2. **A FATAL destroyed by a TCP RST** -- the entry below, a real server
+         bug, now fixed in the vendored pgwire.
 
-      **The COPY case was mis-scoped here and the correction is the reusable
-      part.** This entry called
+      **Two sizing corrections worth keeping.** This entry called
       `test_copy_fills_the_columns_it_omits_from_their_defaults` "the only one
       NOT obviously signal-shaped, so probe it on Linux before assuming it is
-      platform-only" -- it WAS signal-shaped, and answered NULL only because the
-      COPY'd rows had not been checkpointed when the kill landed. A failure that
-      does not LOOK like the cluster it sits in can still share its root; the
-      shape of a symptom is weaker evidence than re-running it after the fix.
+      platform-only" -- it WAS signal-shaped, and answered NULL only because
+      the COPY'd rows had not been checkpointed when the kill landed. And it
+      scoped the hand-off cluster as needing "a real shutdown path on Windows"
+      as though that were work; the server already had one. **The shape of a
+      symptom is weaker evidence than re-running it after a fix.**
 
-      **Still open, and a DIFFERENT root cause** -- the FATAL racing the socket
-      close, not the shutdown path:
-      - `test_pg_cancel_and_terminate_backend_signal_a_running_statement`
-      - `test_idle_timeouts_end_the_session_with_a_fatal_error`
-      - `test_pg_terminate_backend_across_connections` (see the next entry --
-        this one is NOT Windows-only; the CI Linux lane has hit it too)
+- [x] **RESOLVED (2026-09-28): a terminated victim no longer loses its
+      57P01.** Seen first on the CI pg-oracle lane (2026-09-19, #1518's run,
+      which does not touch the Rust PG server), and reproducible on Windows as
+      `Software caused connection abort (10053)` with no SQLSTATE at all.
 
-      Windows reports a hard socket abort (10053) where the test expects a
-      FATAL. The fix is the same one the next entry describes: shut the write
-      half down and drain reads briefly before closing, so the message cannot
-      be discarded by an RST.
-- [ ] **Rust PG server: a terminated victim can lose its 57P01** (CI pg-oracle
-  lane, 2026-09-19, #1518's run; that PR does not touch the Rust PG server).
-  `test_rust_pgserver_slice.py::test_pg_terminate_backend_across_connections`:
-  the victim's next `select 1` raised `OperationalError('connection socket
-  closed')` with no SQLSTATE instead of `57P01`, and the 57P01 surfaced only
-  afterwards, in psycopg's rollback warning. The idle-event loop
-  (`HandlerFactory::idle_event`) sends the FATAL and closes the socket as soon
-  as `terminate` is set. A client write that lands after the close draws a TCP
-  RST, and on Linux an RST can discard the client's unread receive buffer,
-  FATAL included. A graceful close (shut down the write half, then drain reads
-  briefly before closing) would keep the RST from racing the message. Not
-  built or fixed on the Windows dev box (no libclang for `pg_query`).
+      **Cause.** The connection loop sends the FATAL and `break`s;
+      `process_socket` returns and the `TcpStream` is DROPPED, closing it
+      outright. The client's next statement is a write to that closed socket,
+      which draws a TCP RST -- and an RST discards whatever the client has not
+      yet read, which is exactly where the FATAL was sitting.
+
+      **Fix** (`crates/vendor/pgwire/src/tokio/server.rs`, `lingering_close`):
+      close the SINK first, which shuts the write half down and sends a FIN so
+      the client still reads the error and then a clean EOF; then drain reads,
+      keeping the socket half-open so the client's in-flight bytes are consumed
+      rather than reset. Applied to `process_socket` and `process_socket_unix`.
+
+      **The drain budget is a CEILING, not a delay** -- it ends at the client's
+      EOF, so an ordinary close costs nothing. A first attempt at 250ms still
+      lost the error, because the idle-timeout tests wait ~350ms before
+      speaking (a 150ms server timeout, then half a second); it is now 5s,
+      matching nginx's `lingering_timeout` default. Measured effect on the
+      slice file: **229.8s with 3 failures -> 95.1s with none** -- the aborts
+      had been burning time in retries.
+
 - [ ] **HAVING on a numeric aggregate compares at Decimal128 precision: joins,
   grouping sets and FILTER only** (Python pgserver, 2026-09-19). The select-list
   `sum` / `min` / `max` over a numeric are exact (pushed and folded in Python),
