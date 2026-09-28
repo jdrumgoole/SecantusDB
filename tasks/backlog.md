@@ -3750,12 +3750,23 @@ all match, and so do CREATE INDEX / VIEW and their error surface. What is open:
       server does not implement. Recorded so the next session does not size
       the "function metadata cluster" as tractable without knowing this — two
       of its tests are blocked on a number, not a bug.
-- [ ] **`getColumnPrivileges` on a SYSTEM catalog returns nothing.** pgjdbc's
-      `columnPrivileges` asks for `getColumnPrivileges(null, null,
-      'pg_statistic', null)` and expects at least one row — privileges on a
-      `pg_catalog` relation, which this server does not expose as a grantable
-      relation at all. Distinct from the DROP-clears-privileges fix
-      (2026-09-20), which fixed `tablePrivileges` and left this one failing.
+- [ ] **`getColumnPrivileges` on a SYSTEM catalog needs TWO things, and the
+      bigger one is that `pg_class` does not self-describe.** Probed 2026-09-28.
+      pgjdbc's `columnPrivileges` asks for `getColumnPrivileges(null, null,
+      'pg_statistic', null)` and expects at least one row.
+      1. **`pg_class` lists no system catalogs at all**: zero `pg_%` rows in an
+         empty database, where PostgreSQL 14 has **490** — the catalog tables are
+         themselves relations there, with `pg_attribute` rows each. Our
+         `pg_class` contains only user objects, so `pg_statistic` does not exist
+         to ask about. Making the catalog self-describing is a design decision
+         (490 relations plus their columns), not a patch.
+      2. **`pg_attribute.attacl` does not exist** (`column "attacl" does not
+         exist`). This one is genuinely small AND worth doing on its own merits:
+         we already record column grants (`COLUMN_GRANT_COLLECTION`), so `attacl`
+         can render the same aclitem form `relacl` does instead of being a NULL
+         placeholder. It will not flip the test by itself — (1) is the hard
+         blocker — but it closes a real gap.
+
 - [ ] **`pg_type.typcollation` is 0 for every type**, including the collatable
       string types. PostgreSQL 14 reports **100** for `text` / `varchar` /
       `bpchar` (measured 2026-09-19). Left alone deliberately when the
