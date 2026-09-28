@@ -44,6 +44,11 @@ def _raw_out(which: str) -> Path:
     return REPO_ROOT / ".validation" / name
 
 
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tools.provenance import require_fresh_pgserver  # noqa: E402
+
 RAW_OUT = REPO_ROOT / ".validation" / "psycopg-raw.json"
 #: The Rust PostgreSQL server, driven when SECANTUS_GAUGE_SERVER=rust.
 # `.exe` on Windows, where the bare name never exists -- the gauge could not
@@ -129,6 +134,13 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 2
+        # This gauge PUBLISHES its number. On 2026-09-18 it was measured against
+        # a checkout 116 crate-commits behind and reported 73.8% where the truth
+        # was ~99.98% -- and that figure reached the live website. The binary was
+        # stamped the whole time; nothing read the stamp. Now something does.
+        # `SECANTUS_ALLOW_STALE_ARTIFACT=1` overrides, for gauging an old build
+        # on purpose.
+        require_fresh_pgserver(RUST_BINARY, repo_root=REPO_ROOT)
         argv = [str(RUST_BINARY), storage_dir, f"{host}:{port}"]
     else:
         argv = [

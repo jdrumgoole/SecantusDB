@@ -25,8 +25,7 @@ from pathlib import Path
 PATCH_MARKER = "/* secantus-patch: off64_t -> off_t for musl compat */"
 
 ORIGINAL = (
-    "    WT_SYSCALL(sync_file_range(pfh->fd, (off64_t)0, (off64_t)0, "
-    "SYNC_FILE_RANGE_WRITE), ret);"
+    "    WT_SYSCALL(sync_file_range(pfh->fd, (off64_t)0, (off64_t)0, SYNC_FILE_RANGE_WRITE), ret);"
 )
 PATCHED = (
     f"    {PATCH_MARKER}\n"

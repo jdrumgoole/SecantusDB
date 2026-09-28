@@ -74,11 +74,17 @@ def _spawn_server(port: int, storage_path: Path) -> subprocess.Popen[bytes]:
     """Start ``python -m secantus`` as a subprocess on ``port``."""
     return subprocess.Popen(
         [
-            sys.executable, "-m", "secantus",
-            "--host", "127.0.0.1",
-            "--port", str(port),
-            "--storage-path", str(storage_path),
-            "--log-level", "WARNING",
+            sys.executable,
+            "-m",
+            "secantus",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--storage-path",
+            str(storage_path),
+            "--log-level",
+            "WARNING",
         ],
         stdin=subprocess.DEVNULL,
         # Inherit stdout/stderr so the user sees server warnings inline
@@ -91,13 +97,20 @@ def _spawn_writer(
 ) -> subprocess.Popen[bytes]:
     return subprocess.Popen(
         [
-            sys.executable, "-m", "bench.load_writer",
-            "--uri", uri,
-            "--db", db,
-            "--collection", collection,
+            sys.executable,
+            "-m",
+            "bench.load_writer",
+            "--uri",
+            uri,
+            "--db",
+            db,
+            "--collection",
+            collection,
             "--drop",
-            "--progress-every", "1000",
-            "--batch-size", str(batch_size),
+            "--progress-every",
+            "1000",
+            "--batch-size",
+            str(batch_size),
         ],
         stdin=subprocess.DEVNULL,
     )
@@ -121,7 +134,10 @@ def chaos_loop(
         proc = state["server_proc"]
         if proc.poll() is not None:
             # Server already exited (crash on its own?). Restart it.
-            print(f"[{_ts()}] chaos: server already dead (rc={proc.returncode}), restarting", flush=True)
+            print(
+                f"[{_ts()}] chaos: server already dead (rc={proc.returncode}), restarting",
+                flush=True,
+            )
         else:
             print(f"[{_ts()}] chaos: SIGKILL pid={proc.pid}", flush=True)
             proc.kill()
@@ -139,13 +155,15 @@ def chaos_loop(
             stop_event.set()
             return
         downtime = time.monotonic() - kill_at
-        state["kills"].append({
-            "wall_time": _dt.datetime.now(_dt.timezone.utc),
-            "downtime_seconds": downtime,
-        })
+        state["kills"].append(
+            {
+                "wall_time": _dt.datetime.now(_dt.timezone.utc),
+                "downtime_seconds": downtime,
+            }
+        )
         print(
             f"[{_ts()}] chaos: server back at pid={new_proc.pid} "
-            f"(down {downtime*1000:.0f} ms, kill #{len(state['kills'])})",
+            f"(down {downtime * 1000:.0f} ms, kill #{len(state['kills'])})",
             flush=True,
         )
 
@@ -244,9 +262,13 @@ def run_chaos(
     chaos_thread = threading.Thread(
         target=chaos_loop,
         kwargs=dict(
-            state=state, storage_path=storage_dir, port=chosen_port,
-            min_interval=min_interval, max_interval=max_interval,
-            stop_event=stop_event, rng=rng,
+            state=state,
+            storage_path=storage_dir,
+            port=chosen_port,
+            min_interval=min_interval,
+            max_interval=max_interval,
+            stop_event=stop_event,
+            rng=rng,
         ),
         name="chaos-monkey",
         daemon=True,
@@ -314,7 +336,10 @@ def run_chaos(
         )
     print(f"docs persisted:  {stats['total']:,d}")
     print(f"max n attempted: {stats['max_n']:,d}")
-    print(f"missing ns:      {stats['missing_count']:,d}  ({len(stats['gaps'])} gap{'s' if len(stats['gaps']) != 1 else ''})")
+    print(
+        f"missing ns:      {stats['missing_count']:,d}  "
+        f"({len(stats['gaps'])} gap{'s' if len(stats['gaps']) != 1 else ''})"
+    )
     print(f"duplicates:      {stats['duplicates']:,d}")
     if stats["gaps"]:
         # Show first few + last few gaps.
@@ -343,24 +368,50 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "writer hammers it. Reports persistence + gap stats at the end."
         ),
     )
-    p.add_argument("--duration", type=float, default=DEFAULT_DURATION,
-                   help=f"Total run time in seconds (default: {DEFAULT_DURATION:.0f}).")
-    p.add_argument("--min-interval", type=float, default=DEFAULT_MIN_INTERVAL,
-                   help=f"Minimum seconds between kills (default: {DEFAULT_MIN_INTERVAL}).")
-    p.add_argument("--max-interval", type=float, default=DEFAULT_MAX_INTERVAL,
-                   help=f"Maximum seconds between kills (default: {DEFAULT_MAX_INTERVAL}).")
-    p.add_argument("--port", type=int, default=None,
-                   help="Server port (default: auto-pick a free port).")
-    p.add_argument("--storage-path", type=Path, default=None,
-                   help="WiredTiger storage dir (default: tempdir, removed at end).")
-    p.add_argument("--no-load", dest="run_load", action="store_false",
-                   help="Don't auto-start the load_writer (chaos only).")
+    p.add_argument(
+        "--duration",
+        type=float,
+        default=DEFAULT_DURATION,
+        help=f"Total run time in seconds (default: {DEFAULT_DURATION:.0f}).",
+    )
+    p.add_argument(
+        "--min-interval",
+        type=float,
+        default=DEFAULT_MIN_INTERVAL,
+        help=f"Minimum seconds between kills (default: {DEFAULT_MIN_INTERVAL}).",
+    )
+    p.add_argument(
+        "--max-interval",
+        type=float,
+        default=DEFAULT_MAX_INTERVAL,
+        help=f"Maximum seconds between kills (default: {DEFAULT_MAX_INTERVAL}).",
+    )
+    p.add_argument(
+        "--port", type=int, default=None, help="Server port (default: auto-pick a free port)."
+    )
+    p.add_argument(
+        "--storage-path",
+        type=Path,
+        default=None,
+        help="WiredTiger storage dir (default: tempdir, removed at end).",
+    )
+    p.add_argument(
+        "--no-load",
+        dest="run_load",
+        action="store_false",
+        help="Don't auto-start the load_writer (chaos only).",
+    )
     p.add_argument("--db", default=DEFAULT_DB)
     p.add_argument("--collection", default=DEFAULT_COLLECTION)
-    p.add_argument("--seed", type=int, default=None,
-                   help="RNG seed for kill timing (default: random).")
-    p.add_argument("--batch-size", type=int, default=1,
-                   help="Documents per insert call in the writer (default: 1).")
+    p.add_argument(
+        "--seed", type=int, default=None, help="RNG seed for kill timing (default: random)."
+    )
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Documents per insert call in the writer (default: 1).",
+    )
     return p.parse_args(argv)
 
 

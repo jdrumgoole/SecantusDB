@@ -81,7 +81,11 @@ def main() -> int:
                 if got == want:
                     continue
                 divergent[label] = divergent.get(label, 0) + 1
-                which = [n for n, a, b in zip(("code", "codeName", "errmsg"), want, got) if a != b]
+                which = [
+                    n
+                    for n, a, b in zip(("code", "codeName", "errmsg"), want, got, strict=False)
+                    if a != b
+                ]
                 for n in which:
                     fields.setdefault(label, {})[n] = fields.setdefault(label, {}).get(n, 0) + 1
                 print(f"  {name} [{label}] differs in {'+'.join(which)}")

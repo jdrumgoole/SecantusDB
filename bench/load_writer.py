@@ -19,7 +19,6 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import signal
-import sys
 import time
 from types import FrameType
 from typing import Any
@@ -136,8 +135,7 @@ def run(
             # doesn't drown out progress lines. Includes the n range so
             # the gap is identifiable post-run.
             print(
-                f"  ! n={attempted_lo}..{attempted_hi} insert failed: "
-                f"{type(exc).__name__}: {exc}",
+                f"  ! n={attempted_lo}..{attempted_hi} insert failed: {type(exc).__name__}: {exc}",
                 flush=True,
             )
         if progress_every and n % progress_every == 0:
@@ -234,7 +232,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.drop:
         coll.drop()
         print(f"dropped {args.db}.{args.collection}", flush=True)
-
 
     target_desc = f"{args.count:,d} docs" if args.count is not None else "continuous"
     print(

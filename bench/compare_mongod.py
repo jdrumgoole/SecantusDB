@@ -27,7 +27,6 @@ docs/benchmark.md.
 from __future__ import annotations
 
 import argparse
-import os
 import shutil
 import socket
 import statistics
@@ -35,9 +34,9 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Iterator
 
 from pymongo import MongoClient
 
@@ -69,12 +68,20 @@ def secantus_daemon(data_dir: Path) -> Iterator[str]:
     port = _free_port()
     proc = subprocess.Popen(
         [
-            sys.executable, "-m", "secantus",
-            "--host", "127.0.0.1", "--port", str(port),
-            "--storage-path", str(data_dir),
-            "--log-level", "WARNING",
+            sys.executable,
+            "-m",
+            "secantus",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--storage-path",
+            str(data_dir),
+            "--log-level",
+            "WARNING",
         ],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
     try:
         _wait_for_listener("127.0.0.1", port)
@@ -96,14 +103,19 @@ def mongod_daemon(data_dir: Path) -> Iterator[str]:
     proc = subprocess.Popen(
         [
             "mongod",
-            "--bind_ip", "127.0.0.1",
-            "--port", str(port),
-            "--dbpath", str(data_dir),
-            "--logpath", str(log),
+            "--bind_ip",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--dbpath",
+            str(data_dir),
+            "--logpath",
+            str(log),
             "--noauth",
             "--quiet",
         ],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
     try:
         _wait_for_listener("127.0.0.1", port)
@@ -121,6 +133,7 @@ def mongod_daemon(data_dir: Path) -> Iterator[str]:
 
 
 # ----------------------------- workloads -----------------------------------
+
 
 def _docs() -> list[dict]:
     return [
@@ -191,7 +204,13 @@ def workload_aggregate_group(uri: str) -> float:
         list(
             coll.aggregate(
                 [
-                    {"$group": {"_id": "$category", "count": {"$sum": 1}, "max_v": {"$max": "$value"}}},
+                    {
+                        "$group": {
+                            "_id": "$category",
+                            "count": {"$sum": 1},
+                            "max_v": {"$max": "$value"},
+                        }
+                    },
                     {"$sort": {"_id": 1}},
                 ]
             )
@@ -242,6 +261,7 @@ WORKLOADS: list[tuple[str, Callable[[str], float]]] = [
 
 # ----------------------------- harness -------------------------------------
 
+
 def time_workload(uri: str, workload: Callable[[str], float], n: int) -> tuple[float, float]:
     """Run `workload` `n` times against `uri`. Return (median, p95) seconds."""
     samples = [workload(uri) for _ in range(n)]
@@ -263,29 +283,41 @@ def main() -> int:
     args = parser.parse_args()
 
     if shutil.which("mongod") is None:
-        print("mongod not on PATH; install MongoDB Community Server to run this bench.", file=sys.stderr)
+        print(
+            "mongod not on PATH; install MongoDB Community Server to run this bench.",
+            file=sys.stderr,
+        )
         return 2
 
     results: list[tuple[str, float, float, float, float]] = []
     # (workload_name, secantus_med, secantus_p95, mongod_med, mongod_p95)
 
-    print(f"Running {len(WORKLOADS)} workloads × {args.iterations} iterations against each server...", file=sys.stderr)
+    print(
+        f"Running {len(WORKLOADS)} workloads × {args.iterations} iterations against each server...",
+        file=sys.stderr,
+    )
 
     for name, fn in WORKLOADS:
         print(f"  {name} ...", file=sys.stderr, end=" ", flush=True)
-        with tempfile.TemporaryDirectory(prefix="secantus-bench-") as sec_dir, \
-             tempfile.TemporaryDirectory(prefix="mongod-bench-") as mon_dir:
+        with (
+            tempfile.TemporaryDirectory(prefix="secantus-bench-") as sec_dir,
+            tempfile.TemporaryDirectory(prefix="mongod-bench-") as mon_dir,
+        ):
             with secantus_daemon(Path(sec_dir)) as sec_uri:
                 sec_med, sec_p95 = time_workload(sec_uri, fn, args.iterations)
             with mongod_daemon(Path(mon_dir)) as mon_uri:
                 mon_med, mon_p95 = time_workload(mon_uri, fn, args.iterations)
         ratio = sec_med / mon_med if mon_med > 0 else float("inf")
-        print(f"sec={fmt_ms(sec_med)}ms  mon={fmt_ms(mon_med)}ms  (sec/mon = {ratio:.2f}×)", file=sys.stderr)
+        print(
+            f"sec={fmt_ms(sec_med)}ms  mon={fmt_ms(mon_med)}ms  (sec/mon = {ratio:.2f}×)",
+            file=sys.stderr,
+        )
         results.append((name, sec_med, sec_p95, mon_med, mon_p95))
 
     # Markdown report.
     import datetime as dt
     import platform
+
     md: list[str] = []
     md.append("# SecantusDB vs mongod benchmark")
     md.append("")
@@ -313,7 +345,10 @@ def main() -> int:
     md.append("")
     md.append("## Results")
     md.append("")
-    md.append("| Workload | SecantusDB median | SecantusDB p95 | mongod median | mongod p95 | sec/mongod |")
+    md.append(
+        "| Workload | SecantusDB median | SecantusDB p95 | "
+        "mongod median | mongod p95 | sec/mongod |"
+    )
     md.append("|---|---:|---:|---:|---:|---:|")
     for name, sec_m, sec_p, mon_m, mon_p in results:
         ratio = sec_m / mon_m if mon_m > 0 else float("inf")

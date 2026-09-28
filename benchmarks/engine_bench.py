@@ -18,6 +18,7 @@ suites):
 
     uv run --no-sync python benchmarks/engine_bench.py
 """
+
 from __future__ import annotations
 
 import importlib.util
@@ -42,8 +43,16 @@ def _load_pure():
         pkg.__path__ = [str(root)]
         sys.modules["secantus"] = pkg
     mods = {}
-    for name in ("paths", "collation", "query", "expressions", "update", "projection",
-                 "ordering", "aggregate"):
+    for name in (
+        "paths",
+        "collation",
+        "query",
+        "expressions",
+        "update",
+        "projection",
+        "ordering",
+        "aggregate",
+    ):
         full = f"secantus.{name}"
         if full not in sys.modules:
             spec = importlib.util.spec_from_file_location(full, root / f"{name}.py")
@@ -188,8 +197,9 @@ def multi_threaded():
 
 # --- batched seam: per-doc calls vs one batched call ----------------------
 
-BATCH_DOCS = [{"_id": i, "a": i % 50, "b": "hello" if i % 3 else "x", "tags": [i % 7, 2]}
-              for i in range(200)]
+BATCH_DOCS = [
+    {"_id": i, "a": i % 50, "b": "hello" if i % 3 else "x", "tags": [i % 7, 2]} for i in range(200)
+]
 BATCH_QUERY = {"a": {"$gte": 10, "$lt": 90}, "tags": {"$in": [2, 5]}}
 _batch_doc_bs = [bson.encode(d) for d in BATCH_DOCS]
 _batch_query_b = bson.encode(BATCH_QUERY)

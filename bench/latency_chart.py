@@ -117,13 +117,17 @@ def render_svg(workloads: list[dict], st: Style, aria: str) -> str:
     bottom = TOP + len(workloads) * ROW_H - 26.0
     for mult in (5, 10, 15, 20, 25):
         x = X0 + mult * PX_PER_X
-        parts.append(f'<line x1="{x:.1f}" y1="18" x2="{x:.1f}" y2="{bottom:.0f}" class="{st.grid}"/>')
+        parts.append(
+            f'<line x1="{x:.1f}" y1="18" x2="{x:.1f}" y2="{bottom:.0f}" class="{st.grid}"/>'
+        )
         parts.append(
             f'<text x="{x:.1f}" y="{bottom + 16:.0f}" text-anchor="middle" class="{st.tick}">'
             f'{mult}<tspan class="{st.x}">x</tspan></text>'
         )
     ref_x = X0 + PX_PER_X
-    parts.append(f'<line x1="{ref_x:.1f}" y1="18" x2="{ref_x:.1f}" y2="{bottom:.0f}" class="{st.ref}"/>')
+    parts.append(
+        f'<line x1="{ref_x:.1f}" y1="18" x2="{ref_x:.1f}" y2="{bottom:.0f}" class="{st.ref}"/>'
+    )
     parts.append(
         f'<text x="{ref_x:.1f}" y="12" text-anchor="middle" class="{st.reflab}">'
         f'mongod = 1<tspan class="{st.x}">x</tspan></text>'
@@ -134,7 +138,7 @@ def render_svg(workloads: list[dict], st: Style, aria: str) -> str:
         py_x = w["py_ms"] / w["mongod_ms"]
         parts.append(
             f'<text x="{X0 - 10:.0f}" y="{y + 16:.0f}" text-anchor="end" class="{st.lab}">'
-            f'{w["label"]}</text>'
+            f"{w['label']}</text>"
         )
         parts.append(_bar(rust_x, y, st.rust_fill, f"{st.rust_name} — {rust_x:.1f}x mongod", st))
         parts.append(_val(rust_x, y + 11, f"{rust_x:.1f}", st))
@@ -187,7 +191,9 @@ def render_html_tbody(workloads: list[dict]) -> str:
 
 def splice_html_tbody(path: Path, new_tbody: str) -> None:
     src = path.read_text()
-    out, n = re.subn(r"        <tbody>\n(?:          <tr>.*?\n)+        </tbody>", new_tbody, src, count=1)
+    out, n = re.subn(
+        r"        <tbody>\n(?:          <tr>.*?\n)+        </tbody>", new_tbody, src, count=1
+    )
     if n != 1:
         raise SystemExit(f"{path}: expected exactly one latency <tbody> to replace")
     path.write_text(out)
@@ -217,9 +223,7 @@ def main() -> None:
     splice_table(DOCS_MD, render_table(workloads))
     splice_svg(
         PERF_HTML,
-        render_svg(
-            workloads, SITE, "Per-operation latency as a multiple of mongod, per workload"
-        ),
+        render_svg(workloads, SITE, "Per-operation latency as a multiple of mongod, per workload"),
     )
     splice_html_tbody(PERF_HTML, render_html_tbody(workloads))
     rust = [w["rust_ms"] / w["mongod_ms"] for w in workloads]

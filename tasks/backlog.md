@@ -2974,6 +2974,123 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **OPEN — a backend-termination test waits with `sleep(0.1)` for a reap it
+      cannot bound, and failed CI once on 2026-09-28.**
+      `tests/test_rust_pgserver_slice.py::test_pg_cancel_and_terminate_backend_signal_a_running_statement`
+      terminates an IDLE session and then asserts the row is gone from
+      `pg_stat_activity`:
+
+      ```python
+      assert other.execute("select pg_terminate_backend(%s)", (idle_pid,)).fetchone() == (True,)
+      time.sleep(0.1)
+      ...
+      assert other.execute(
+          "select count(*) from pg_stat_activity where pid = %s", (idle_pid,)
+      ).fetchone() == (0,)
+      ```
+
+      The failure was the LAST assertion (line 8250 at the time), in the
+      `pg-oracle` lane of
+      [run 36398852755](https://github.com/jdrumgoole/SecantusDB/actions/runs/36398852755/job/108851645826).
+      It passed on a re-run of an otherwise identical tree
+      ([36400966809](https://github.com/jdrumgoole/SecantusDB/actions/runs/36400966809/job/108858465344)).
+
+      **Why this is filed rather than called a flake.** "Flaky" describes a bug
+      here, it does not excuse one — and the shape is a race by construction: a
+      fixed 100ms sleep standing in for "the backend has been reaped", on a
+      shared CI runner. Two readings are open and they want different fixes:
+
+      * **The test is wrong.** Reaping is asynchronous and unbounded, so the
+        assertion should POLL for the count reaching 0 with a deadline (the
+        pattern `_wait_for_listener` already uses in
+        `psycopg_validation/runner.py`) instead of sleeping a guess. Cheap, and
+        correct regardless of the second reading.
+      * **The server is slow to reap, or does not always reap.** If the row can
+        outlive the connection indefinitely, `pg_stat_activity` is lying about
+        live sessions and a client polling it would see a ghost. That is a
+        server bug and the sleep is merely what exposed it.
+
+      **Do the polling fix FIRST and give it a generous deadline, then see
+      whether it ever times out.** A poll that never times out settles the
+      question as a test bug; one that does has caught the server bug with
+      evidence, which a `sleep` cannot produce either way.
+
+      Context worth having: the file was last touched hours earlier by #1589
+      ("stop three harnesses from discarding what the servers were saying") and
+      the neighbouring FATAL-delivery path by #1592, so this may be newly
+      EXPOSED rather than newly broken. Not attributed to either — it was
+      observed from a branch that did not touch this file, and `main` was green
+      on `pg-oracle` across the four runs before it.
+
+- [ ] **OPEN — THE tracker for stale gauge numbers. The committed validation
+      reports and the live driver panels are stale in DIFFERENT ways, and the
+      one refresh that existed (PR #1595) was closed unmerged rather than
+      fixing it (2026-09-28).** This entry supersedes the shorter
+      version filed by #1599 and is the single place this drift is tracked;
+      Step 1 of `tasks/driver-conformance-followups-plan.md` points here rather
+      than describing it again.
+
+      Three artifacts, three different staleness:
+
+      * **Committed `docs/validation-report*.md`** — a full `validate-all`
+        against `0.6.0b17` on **2026-09-27**. It predates `apiStrict` (#1582) and
+        the transaction label / codeName fixes (#1585, #1597), so it UNDERSTATES
+        the server. Python pymongo reads 1,195 / 15 / 290 = **98.7%**.
+      * **`docs/validation-report-rust-server.md`** — older still, **2026-09-21**
+        against `0.6.0b16`, at 1,071 / 5 / **424 skipped** = 99.5%. That 424 is
+        PRE-`enableTestCommands`: the rate looks higher than the Python one only
+        because 134 failpoint tests were skipping. Do not compare the two numbers
+        as they stand.
+      * **PR #1595 (`validation-report-20260928`, `60bd8c1b`) — CLOSED unmerged
+        2026-09-28.** A bot refresh that had #1582 and #1585 as ancestors but
+        **NOT #1597**; it was opened at 07:17Z and #1597 merged at 08:48Z, so it
+        was stale on arrival. The branch is left in place (it is the bot's). The
+        reasons are on the PR itself, so a future refresh does not repeat it.
+
+      What to do: re-run `invoke validate` (Python) and `./inv validate --server
+      rust` at a tree containing `daa855a8`, rebuilding the embedded Rust
+      extension first (`./inv rust-server-build`) or the Rust run measures old
+      code. Then regenerate the panels with `validation_summary.driver_panels`
+      and deploy. Expected: Python **1,205 / 5 = 99.6%**, its remaining five being
+      exactly the out-of-scope list (text / hashed indexes, `$where` ×2,
+      `test_to_list_csot_applied`). Rust stays at 15 failures until the Rust
+      transaction port lands — that is Step 2 of the plan, not this item.
+
+      **Say the move honestly.** The published rate did not "fall from 99.5% to
+      99.4%". It dipped to 98.7% on 2026-09-27 because 134 failpoint tests that
+      used to skip began to RUN (skips 424 → 290; +124 passes, +10 failures), and
+      the fixes since take it back up. Against what is committed today the change
+      is **98.7% → 99.6%, a rise.**
+
+      **Do NOT hand-edit the reports or the panels to match.** They are
+      generated, and a hand-edited number is worse than a stale one because
+      nothing marks it as unmeasured.
+
+      **Unresolved — the Java gauge's failure set turned over COMPLETELY between
+      the two runs, and the #1599 prediction that its rate would rise was wrong.**
+      It went 493 / 3 = 99.3% (2026-09-27) → 492 / **4** = 99.1% (2026-09-28),
+      with **zero overlap** between the two failure lists:
+
+      ```
+      2026-09-27  VersionedApiTest#Test commands: strict mode
+                  MongoCollectionTest#testMapReduceWithGenerics()
+                  MongoCollectionTest#shouldBeAbleToQueryTypedCollectionAndMapResultsIntoTypedLists()
+      2026-09-28  ClientMetadataTest#client metadata is not propagated to the server
+                  VersionedApiTest#CRUD Api Version 1 (strict): find and getMore append API version
+                  VersionedApiTest#CRUD Api Version 1 (strict): updateMany appends declared API version
+                  GeoFiltersFunctionalSpecification#$geoWithin $center
+      ```
+
+      #1582 plausibly explains the strict-mode test disappearing, and it may have
+      moved the other two `VersionedApiTest` cases. Nothing that landed that day
+      touches `$geoWithin $center` or client metadata, and
+      `testMapReduceWithGenerics` is a KNOWN permanent failure (see section 4,
+      `mapReduce`) that should not vanish. A gauge whose failures do not overlap
+      across a day is reporting run conditions, not the server — most likely the
+      `validate-all --jobs` contention flake CLAUDE.md warns about. **Run
+      `invoke validate-java` twice, serially, before publishing any Java
+      number**, and file whatever survives both runs as its own bug.
+
 - [ ] **OPEN — the published writer-scaling chart can only be measured on
       SHARED CPU, and a DigitalOcean tier ticket is in flight (2026-09-28).**
       `invoke do-perf` needs >= 8 vCPU (the sweep runs eight writer processes
@@ -3031,39 +3148,43 @@ These are explicit non-goals. Don't add them without a reason.
       widened to `driver-sync` since these were last measured, so it may be newly
       reached rather than newly broken.
 
-- [ ] **OPEN — `apiStrict: true` does not reject a command outside the Stable
-      API, and TWO drivers independently say so (2026-09-27).** A full
-      `validate-all` against `0.6.0b17` fails the same behaviour in pymongo
-      (`test_versioned_api_integration.py::TestVersionedApiTestCommandsStrictMode
-      ::test_Running_a_command_that_is_not_part_of_the_versioned_API_results_in_an_error`)
-      and in the Java driver
-      (`com.mongodb.client.unified.VersionedApiTest#Test commands: strict mode`).
-      Two unrelated drivers agreeing is what makes this a real gap rather than a
-      harness artifact — neither is a documented load flake, and both gauges were
-      run on a quiet machine. `mongod` answers `APIStrictError` (code 323) for a
-      command absent from the declared `apiVersion`; we run it. Probe `mongod`
-      8.2.11 for the exact `errmsg` and the command allowlist before fixing, and
-      land it in both servers.
+- [x] ~~**`apiStrict: true` does not reject a command outside the Stable API**~~
+      **FIXED 2026-09-27** in both servers. Probed mongod 8.2.11 rather than
+      reading the spec, and it had THREE branches where the spec's wording implies
+      two: a command mongod HAS but that is outside v1 answers 323, a v1 command
+      runs, and a command that does not exist at all still answers 59
+      CommandNotFound. A gate that refused everything it did not recognise would
+      get that third case wrong.
 
-- [ ] **OPEN — two `test_transactions_unified` retry-semantics failures, and the
-      two codes want OPPOSITE treatment (2026-09-27).** The label half of this is
-      FIXED (a failpoint-injected error inside a transaction now carries
-      `TransientTransactionError`, closing all of `TestUnifiedErrorLabels`), and
-      the three secondary-read failures are now an explicit non-goal in section 4.
-      What is left:
+      The membership allowlist was MEASURED, by sending every command this server
+      implements to mongod under `apiStrict: true` and recording the refusals —
+      which put `distinct`, `buildInfo`, `isMaster` and `serverStatus` OUTSIDE the
+      Stable API and `count` and `hello` inside it. A list assembled from the
+      manual would have had several the wrong way round.
 
-      * `TestUnifiedRetryableCommit::test_commitTransaction_fails_after_Interrupted`
-        — code 11601 `Interrupted`. The test expects the commit to **fail**.
-      * `TestUnifiedCommitTransienttransactionerror_4_2::test_transaction_is_retried_after_commitTransaction_TransientTransactionError_(PreparedTransactionInProgress)`
-        — code 267. The test expects the transaction to be **retried**.
+      Two error messages were wrong, not one: the aggregation-stage message said
+      `Provided aggregation pipeline stage $x is not in API Version 1` where mongod
+      says `$x is not allowed with 'apiStrict: true' in API Version 1`. Pinned by
+      11 cases in `tests/test_mongod_differential.py` asserting code, codeName AND
+      errmsg. Closed the failure in both the pymongo and Java gauges.
 
-      Both codes sit outside `_TRANSIENT_TXN_CODES` (which holds 11600 and 11602
-      but not 11601). **Do not just add them.** One wants retry and one wants
-      failure, so the set is the wrong lever for at least one of the two, and a
-      change that makes one green will make the other red. Probe a single-node
-      REPLICA SET mongod — transactions need one, so a standalone cannot answer
-      this — for the labels it returns per code on `commitTransaction`, and size
-      the fix from that rather than from the test names.
+- [x] ~~**Two `test_transactions_unified` retry-semantics failures**~~ **FIXED
+      2026-09-28.** Probed a single-node replica-set mongod 8.2.11 (transactions
+      need one) and the two codes wanted OPPOSITE treatment, exactly as this
+      entry warned: mongod labels `267 PreparedTransactionInProgress`
+      `TransientTransactionError` and gives `11601 Interrupted` NO labels. Adding
+      both to `_TRANSIENT_TXN_CODES`, which was the obvious move, would have made
+      one test green and the other red.
+
+      267 is now in the set. 11601 stays out, where it already was — so the
+      `Interrupted` test was never a label bug at all. It failed because a
+      failpoint-injected code renders through `_code_name_for`, which had NONE of
+      the transaction / replication codes and fell back to `Location<code>`: the
+      test asserts `errorCodeName: "Interrupted"` and got `Location11601`.
+      Seventeen names were read off the same replica set and added.
+
+      `test_transactions_unified` is now at 3 failures, all of them the
+      secondary-read cases recorded as an explicit non-goal in section 4.
 
 - **Driver unified-spec coverage audit (2026-09-25, Python server `0.6.0b16`,
   pymongo tests `f2103a95`, go-driver `fd85a834`).** Measured by running every
@@ -6332,11 +6453,89 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   day validation. STILL OPEN: a wide/BC `timestamptz` is not rendered with its
   session-tz offset (`infinity` is correct for it), and the clock-dependent
   input keywords `now` / `today` / `tomorrow` / `yesterday` are not handled.
-- **Rust PG server: `numeric` DIVISION is refused (`0A000`).** Add, subtract and
-  multiply are exact with PostgreSQL's measured scale rules; division's result
-  scale depends on the operands' weights (`1.5 / 3` is `0.50000000000000000000`,
-  twenty places) in a way not yet measured, and emitting a plausible-but-wrong
-  number of decimal places would be a wrong answer.
+- [ ] **OPEN — RUST pgserver: the QUERY-LANGUAGE surface, surveyed against a
+      binary built from `HEAD:crates` (2026-09-28).** Everything below was run,
+      not read. The file's other Rust-PG entries are a nit list accumulated from
+      psycopg failures; this is the shape of what is missing, and six entries in
+      this section were STALE in the fixed direction when this was taken (see the
+      struck-through ones), so **re-probe before working any of them**.
+
+      Why the 96.8% psycopg number and this list are not in conflict: psycopg's
+      suite exercises the PROTOCOL and the TYPE SYSTEM, which is where this
+      server is strong. It barely reaches query-language breadth. A SQL-shaped
+      gauge (`sqllogictest`, the SQLAlchemy dialect suite) would score very
+      differently — **do not cite the psycopg rate as evidence about the items
+      below.**
+
+      **Refused outright (`0A000 … is not supported yet`) — honest, and the
+      bulk of the remaining work:**
+
+      | gap | probe | error |
+      | --- | --- | --- |
+      | subqueries, every form | `(select 1)`, `exists(…)`, `in (select…)` | `SubLink` |
+      | subquery in FROM | `select y from (select 1 as y) s` | `RangeSubselect` |
+      | CTEs | `with c as (select 1 as x) select x from c` | `42P01 relation "c" does not exist` |
+      | `LIKE` / `ILIKE` / `NOT LIKE` | `where s like 'a%'` | `this operator form` |
+      | regex `~` | `where s ~ '^a'` | `operator ~` |
+      | `CASE` | select list or WHERE | `CaseExpr` |
+      | window functions | `row_number() over (order by a)` | `function row_number()` |
+      | `ORDER BY` over an expression | `order by a*-1` | `ORDER BY over an expression` |
+      | `SELECT *` / `t.*` over a JOIN or comma FROM | `select * from t1, t2` | `this subquery target` |
+      | array subscripting | `(array[1,2])[1]` | `this field selection` |
+      | `CREATE INDEX` | | `IndexStmt` |
+      | `ALTER TABLE`, any form | no ADD/DROP COLUMN exists | `AlterTableStmt` |
+      | `CREATE VIEW` | | `ViewStmt` |
+      | `CREATE TRIGGER` | | `CreateTrigStmt` |
+      | `EXPLAIN` | | `ExplainStmt` |
+      | composite `PRIMARY KEY` / multi-col `FOREIGN KEY` | | `a composite PRIMARY KEY` |
+      | non-literal column `DEFAULT` | `default now()` | `a non-literal DEFAULT` |
+
+      **TWO CLAUSE-DROPPING BUGS — worse than the refusals above, and these are
+      the ones to fix first.** Both parse the clause and then ignore it, so the
+      client gets a confident wrong answer instead of `0A000`. This is precisely
+      what CLAUDE.md's "prefer a faithful *command not supported* error over a
+      half-implemented feature that silently diverges" forbids, and it is the
+      same shape as the `PARTITION BY` entry in §3:
+
+      * `ON CONFLICT DO NOTHING` / `DO UPDATE` — the conflict clause is dropped,
+        so `insert … on conflict do nothing` raises `23505` where PostgreSQL
+        inserts nothing and succeeds, and `DO UPDATE` never upserts.
+      * `GROUPING SETS` / `ROLLUP` — the grouping clause is dropped, so
+        `group by grouping sets ((a),())` answers the misleading `42803 column
+        "a" must appear in the GROUP BY clause`, blaming the user's query.
+
+      **What DOES work** (so nobody re-derives it): single- and multi-table CRUD,
+      inner and LEFT JOIN, `WHERE` predicates, `BETWEEN`, `IN` over a list,
+      arithmetic, `||`, casts, `ORDER BY` / `LIMIT` / `OFFSET` / `NULLS FIRST`,
+      `DISTINCT` + `DISTINCT ON`, `UNION` / `INTERSECT` / `EXCEPT`, `GROUP BY` +
+      `HAVING`, the aggregate family including `count(distinct)` / `avg` /
+      `string_agg` / `FILTER`, `RETURNING` on UPDATE and DELETE,
+      `INSERT … SELECT`, multi-row `VALUES`, `coalesce` / `nullif`, and the
+      string functions.
+
+      Biggest single lever: **subqueries and CTEs**, which gate most real
+      application SQL and also gate any broader SQL gauge.
+
+      Probe: `crates/secantus-pgserver/target/debug/secantusd-pg <store>
+      127.0.0.1:<port> --database probe`, driven with psycopg 3. **Rebuild
+      first** — the binary found on this box was stale, and `--version` prints
+      the `crates/` tree it was built from (`git rev-parse HEAD:crates`), which
+      is the cheap check.
+
+- [ ] **OPEN — RUST pgserver: a wrong password still connects, CONFIRMED live
+      (2026-09-28).** The existing entry above records that `CREATE / ALTER ROLE
+      … PASSWORD` stores a SCRAM-SHA-256 verifier that is never checked. Probed
+      rather than inferred: created a role with a password, connected with a
+      deliberately wrong one, and ran `select 1` successfully. Noting the
+      confirmation because "stored, never verified" reads like a catalog gap,
+      and it is an authentication bypass — anyone pointing this server at
+      anything but a test fixture should know.
+
+- [x] ~~**Rust PG server: `numeric` DIVISION is refused (`0A000`).**~~ **FIXED
+  — re-measured 2026-09-28** against a `secantusd-pg` built from `HEAD:crates`.
+  `select 10::numeric / 4::numeric` answers `2.5000000000000000`, PostgreSQL's
+  sixteen places. The entry above described the state before the scale rules
+  were measured.
 - **Rust PG server: array comparison does not require matching element types.**
   PostgreSQL has no `integer[] = smallint[]` operator — array operators need
   identical element types and do not widen — so `select array[1,2,3] = %s` with
@@ -6483,28 +6682,27 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   - `test_leak` failures are a randomised memory-leak probe round-tripping random
     values — type-fidelity noise, not cursor mechanics; the failing params shuffle
     per run.
-- **Rust PG server: DDL IS NOT TRANSACTIONAL.** `CREATE TABLE` inside a
-  transaction survives a `ROLLBACK` (and so do rows inserted into it);
-  `DROP TABLE` inside one stays dropped. PostgreSQL rolls both back. Measured
-  2026-09-05 against PG 14, both directions.
+- [x] ~~**Rust PG server: DDL IS NOT TRANSACTIONAL.**~~ **FIXED — re-measured
+  2026-09-28, BOTH directions**, against a `secantusd-pg` built from
+  `HEAD:crates`. `begin; create table rb(a int); rollback` leaves no table
+  (`select * from rb` is `42P01`), and `begin; drop table dr; rollback` RESTORES
+  the table. PostgreSQL's behaviour on both.
 
-  This is a correctness divergence, not a missing feature: a client that rolls
-  back after creating a table is left with a table it believes does not exist.
-  Fixing it needs transactional schema operations in the storage layer —
-  `create_collection` / `drop_collection` are not part of the user transaction
-  — so it is a storage-level change rather than a pgserver one.
+  The acceptance test is not enough here and was deliberately not relied on: a
+  `COMMIT`-path probe passes whether or not rollback works, so this was checked
+  by rolling back and then reading. See §0.33 of `tasks/rust-pgserver-plan.md`.
+- [x] ~~**Rust PG server: SAVEPOINTs are refused (`0A000`)**~~ **FIXED — and
+  the SEMANTICS re-measured 2026-09-28, not just the acceptance.** Against a
+  `secantusd-pg` built from `HEAD:crates`: `insert 1; savepoint s1; insert 2;
+  rollback to savepoint s1; commit` leaves `[(1,)]` — so `ROLLBACK TO` really
+  undoes, rather than being accepted and dropped. Error recovery inside a
+  savepoint also works: a duplicate-key failure after `savepoint s1`, then
+  `rollback to s1`, then a fresh insert, commits `[(1,), (2,)]`.
 
-  What DOES work as of 2026-09-05: a table created or dropped in a transaction
-  is correctly VISIBLE (or hidden) to later statements in that same
-  transaction, which is what 184 psycopg failures were waiting on.
-- **Rust PG server: SAVEPOINTs are refused (`0A000`), and that now costs more
-  than it did.** `SAVEPOINT` / `ROLLBACK TO` / `RELEASE` need nested
-  transactions in the storage layer; emulating them would silently lose the
-  semantics a client is relying on, so they are refused. Since the transaction
-  STATUS became correct (2026-09-05), psycopg reaches for a savepoint whenever
-  a `conn.transaction()` block nests inside an open transaction -- which it can
-  now see -- so tests that used to pass by never noticing the outer transaction
-  fail here instead. It is the next blocker in `test_transaction.py`.
+  **Checking acceptance alone would have been worthless here** — a server that
+  parsed `SAVEPOINT` and ignored it passes that probe and silently loses the
+  semantics, which is exactly the failure this entry warned about. Probe the
+  state after the rollback, always.
 - **Rust PG server: `generate_series` with EVERY bound a small-int parameter is
   accepted where PostgreSQL refuses it as ambiguous.** `generate_series(%s, %s,
   %s)` with `(1, 10, 3)` sends three `int2`s, and PostgreSQL answers `42725`
@@ -6731,6 +6929,10 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   PostgreSQL never reuses a sequence value (`nextval` is non-transactional).
   The sequence doc in `__sql_sequences__` is written inside the statement's
   transaction, so an abort restores it.
+
+  **Still open, re-measured 2026-09-28** against a `secantusd-pg` built from
+  `HEAD:crates`: insert / `rollback` / insert leaves the second row holding
+  id `1`, the value the aborted insert drew.
 - [x] **RESOLVED (re-measured 2026-09-28): Rust PG server NOT NULL IS
   enforced.** The entry this replaces said `create table t (id int not null);
   insert into t (id) values (null)` "stores a NULL id" and that "the catalog
@@ -6756,6 +6958,14 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   the two sat in the same file asserting opposite things, which is exactly the
   failure the header of this file warns about. Correct a superseded entry;
   do not file a newer one beside it.
+
+  **Column-level `UNIQUE` is enforced too**, independently re-measured the same
+  day by a parallel session: a duplicate answers `23505` under the constraint
+  name it derives (`uq_a_key`). That half was already corrected in CLAUDE.md.
+
+  Two sessions corrected this entry on 2026-09-28 without seeing each other's
+  work, which is what a stale entry costs once it has sat long enough to be
+  re-found independently.
 - [ ] **OPEN — Rust PG server: `timestamp + interval` on a STORED timestamp
   loses sub-millisecond precision (2026-09-09).** A `timestamp` column
   holding `2021-01-01 00:00:00.123456` answers `…00.123` for `ts + interval
@@ -6784,12 +6994,10 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   '')` and other nestings are `NullTest is not supported yet` / 0A000 —
   the sleep is a `ConstCol::Sleep` column, not a value the expression
   evaluator can nest.
-- [ ] **OPEN — Rust PG server: `float4` (real) text is Rust's shortest
-  form, not `float4out` (2026-09-09).** `float8` now renders exactly as
-  `float8out` (`1e+20`, `1e-07`, `Infinity`, `{1.5,2}`); `float4` still
-  goes through ryu, so `1e20::float4` is `1e20` where PostgreSQL 16 prints
-  `1e+20`. Same fix as `geo::float8_text`, with float4's 6-digit shortest
-  round-trip.
+- [x] ~~**OPEN — Rust PG server: `float4` (real) text is Rust's shortest
+  form, not `float4out`**~~ **FIXED — re-measured 2026-09-28** against a
+  `secantusd-pg` built from `HEAD:crates`: `select 1e20::float4::text` is
+  `1e+20`, matching `float4out`.
 - **Rust PG server: psycopg's `test_array.py` is 158/158 (2026-09-09).**
   Multidimensional arrays round-trip in text and binary both ways,
   `INSERT … RETURNING`, the `box` type and its `;` array separator all

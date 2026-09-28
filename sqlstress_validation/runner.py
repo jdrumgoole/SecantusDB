@@ -23,7 +23,9 @@ RAW_OUT = REPO_ROOT / ".validation" / "sqlstress-raw.json"
 LANE_TIMEOUT_SECONDS = 600.0
 
 #: The psql catalog smoke: every command must succeed (`ON_ERROR_STOP=1`).
-PSQL_SCRIPT = "\\dt\n\\d pgbench_accounts\n\\di\n\\l\n\\dn\nSELECT count(*) FROM pgbench_accounts;\n"
+PSQL_SCRIPT = (
+    "\\dt\n\\d pgbench_accounts\n\\di\n\\l\n\\dn\nSELECT count(*) FROM pgbench_accounts;\n"
+)
 
 
 def _pick_ephemeral_port() -> int:

@@ -15,14 +15,30 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from tools.provenance import (  # noqa: E402
+    REBUILD_PGSERVER_CMD as _REBUILD_PGSERVER_CMD,
+)
+from tools.provenance import (
+    REBUILD_RS_CMD as _REBUILD_RS_CMD,
+)
+from tools.provenance import (
+    REBUILD_SERVER_CMD as _REBUILD_SERVER_CMD,
+)
+from tools.provenance import (
+    binary_staleness,
+    extension_staleness,
+    require_fresh_pgserver,
+    resolve_binary,
+    stale_artifact_message,
+)
+from tools.provenance import (
+    committed_crates_tree as _committed_crates_tree,
+)
+
 from conftest import (  # noqa: E402
     _CORE_CRATES,
-    _REBUILD_PGSERVER_CMD,
-    _REBUILD_RS_CMD,
-    _REBUILD_SERVER_CMD,
-    _committed_crates_tree,
     _committed_source_tree,
-    stale_artifact_message,
     stale_core_message,
 )
 
@@ -235,3 +251,321 @@ def test_the_crates_tree_differs_from_the_core_tree() -> None:
     """
     assert _committed_crates_tree() != _committed_source_tree()
     assert len(_CORE_CRATES) == 2
+
+
+# --------------------------------------------------------------------------- #
+# The check moved out of `conftest.py` on 2026-09-28 so that PROBES, GAUGES and
+# BENCHMARKS can reach it. Before that it ran under pytest and nowhere else,
+# which left the repo's primary bug-finding method — an ad-hoc differential
+# probe — completely unguarded. A probe of `secantusd-pg` duly ran against a
+# binary from a different `crates/` tree, and only a hand-read of `--version`
+# caught it.
+#
+# These pin the part that is easy to regress: the probes must CALL the check.
+# --------------------------------------------------------------------------- #
+
+PROBES = REPO / "tools" / "probes"
+
+
+def test_binary_staleness_abstains_when_the_binary_is_absent() -> None:
+    """A missing build is somebody else's message to write.
+
+    Every caller already has a clearer one ("... is not built -- cargo build"),
+    and a staleness checker that also reports absence makes two different
+    failures share one confusing text.
+    """
+    assert binary_staleness(REPO / "nope" / "secantusd-pg", "secantusd-pg", "./inv x") is None
+
+
+def test_binary_staleness_reports_a_real_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The case it exists for, driven through the binary path rather than the
+    pure message function.
+
+    Both halves are faked because arranging a genuinely stale binary means
+    building one — and the first attempt to verify this by pointing a fresh
+    binary at another worktree proved nothing, because no commit between the two
+    checkouts had touched `crates/`, so the trees were identical and abstaining
+    was CORRECT. A probe that cannot fail is not evidence.
+    """
+    import tools.provenance as provenance
+
+    monkeypatch.setattr(provenance, "binary_source_tree", lambda _p: "built-from-this")
+    monkeypatch.setattr(provenance, "committed_crates_tree", lambda _r=None: "but-tested-that")
+    msg = provenance.binary_staleness(Path(__file__), "secantusd-pg", "./inv rust-pgserver-build")
+    assert msg is not None
+    assert "built-from-this" in msg and "but-tested-that" in msg
+    assert "./inv rust-pgserver-build" in msg
+
+
+def test_require_fresh_pgserver_aborts_rather_than_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A warning is what the last seven incidents proved nobody reads.
+
+    A probe prints hundreds of lines; a warning among them is invisible, and the
+    whole point is that the run must not produce a number at all.
+    """
+    import tools.provenance as provenance
+
+    monkeypatch.setattr(provenance, "binary_source_tree", lambda _p: "old")
+    monkeypatch.setattr(provenance, "committed_crates_tree", lambda _r=None: "new")
+    with pytest.raises(SystemExit) as excinfo:
+        require_fresh_pgserver(Path(__file__))
+    assert "secantusd-pg" in str(excinfo.value)
+
+
+def test_extension_staleness_reads_the_source_stamp() -> None:
+    """The extensions carry `__source_tree__` where the binaries print `tree:`."""
+
+    class Stale:
+        __source_tree__ = "extension-tree"
+
+    msg = extension_staleness(Stale(), "_secantus_server", "./inv x")
+    # Only a real mismatch reports; whether it does depends on the checkout, so
+    # assert the shape of the decision rather than the verdict.
+    if msg is not None:
+        assert "extension-tree" in msg and "_secantus_server" in msg
+
+    class Unstamped:
+        pass
+
+    assert extension_staleness(Unstamped(), "_secantus_server", "./inv x") is None
+
+
+def test_resolve_binary_falls_back_to_the_exe_suffix(tmp_path: Path) -> None:
+    """Cargo emits `.exe` on Windows, so the bare name never exists there.
+
+    That one missing suffix made the pytest guard skip both binaries on the only
+    platform where staleness had already bitten. It lives in one place now so it
+    cannot be forgotten by the fourth caller.
+    """
+    exe = tmp_path / "secantusd-pg.exe"
+    exe.write_text("")
+    assert resolve_binary(tmp_path / "secantusd-pg") == exe
+
+    plain = tmp_path / "secantusd-rs"
+    plain.write_text("")
+    assert resolve_binary(plain) == plain
+
+    missing = tmp_path / "absent"
+    assert resolve_binary(missing) == missing
+
+
+@pytest.mark.parametrize(
+    ("probe", "call"),
+    [
+        ("_servers.py", "require_fresh_server_extension"),
+        ("pg_differential.py", "require_fresh_pgserver"),
+    ],
+)
+def test_each_probe_launcher_checks_provenance(probe: str, call: str) -> None:
+    """The gap this refactor closed, pinned so it cannot quietly reopen.
+
+    A source check rather than a behavioural one: running a probe needs a live
+    mongod or a built binary, neither of which a unit test should demand. What
+    would actually regress is somebody adding a launch path and not calling the
+    check, and that is visible in the source.
+    """
+    text = (PROBES / probe).read_text()
+    assert call in text, f"{probe} launches a server without checking its provenance"
+
+
+def test_the_shared_module_is_importable_without_pytest() -> None:
+    """The whole point: a probe is not a pytest run.
+
+    `tools.provenance` must import with nothing but the repo root on the path —
+    no pytest, no conftest, no `src/` layout assumptions — or the probes cannot
+    use it and the gap reopens.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", "import tools.provenance as p; print(p.PGSERVER_REL)"],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "secantusd-pg" in result.stdout
+
+
+def test_a_copied_conftest_still_loads(tmp_path: Path) -> None:
+    """`conftest.py` must import from a directory that is not the checkout.
+
+    `tests/test_crash_stall_watchdog.py` writes a verbatim copy into a tmp dir so
+    its nested session exercises the real watchdog. When the provenance import
+    moved to a repo-root package, that copy could no longer resolve `tools` and
+    failed to LOAD — which is not one test failing but every test in the lane, on
+    every platform. Ten lanes went red at once.
+
+    So the import is discovered and optional, and this pins it. The assertion is
+    that a nested pytest run gets far enough to report no tests, rather than
+    dying in conftest.
+    """
+    (tmp_path / "conftest.py").write_text((REPO / "tests" / "conftest.py").read_text())
+    (tmp_path / "test_nothing.py").write_text("def test_ok():\n    assert True\n")
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-n0", "-p", "no:randomly", "-q", str(tmp_path)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    combined = result.stdout + result.stderr
+    assert "ImportError while loading conftest" not in combined, combined
+    assert "No module named 'tools'" not in combined, combined
+    assert result.returncode == 0, combined
+
+
+# --------------------------------------------------------------------------- #
+# Reach: the check must cover every path that LAUNCHES one of these artifacts,
+# not just pytest and the probes.
+#
+# The failure mode these close is a PUBLISHED number. On 2026-09-18 the psycopg
+# gauge was measured against a checkout 116 crate-commits behind, reported 73.8%
+# where the truth was ~99.98%, and that figure reached the live website. The
+# binary was stamped the whole time and nothing read the stamp.
+# --------------------------------------------------------------------------- #
+
+#: Every launcher and the call it must make. A new one added without a check is
+#: a silently unguarded path to a published number, so the list is explicit
+#: rather than derived -- a derived test would grow a hole the day someone
+#: invents a launcher shaped differently from the ones here.
+LAUNCH_SITES = [
+    ("tools/probes/_servers.py", "require_fresh_server_extension"),
+    ("tools/probes/pg_differential.py", "require_fresh_pgserver"),
+    ("gauge_common.py", "require_fresh_rs"),
+    ("psycopg_validation/runner.py", "require_fresh_pgserver"),
+    ("bench/concurrency.py", "require_fresh_rs"),
+    ("bench/compare_servers.py", "require_fresh_server_extension"),
+    ("bench/pg_concurrency.py", "require_fresh_pgserver"),
+    ("bench/pg_statement_cost.py", "require_fresh_pgserver"),
+]
+
+
+@pytest.mark.parametrize(("path", "call"), LAUNCH_SITES)
+def test_every_launcher_checks_provenance(path: str, call: str) -> None:
+    """A source check, deliberately.
+
+    Running a gauge needs a built binary and twenty minutes; running a benchmark
+    needs a quiet machine. Neither belongs in a unit test. What would actually
+    regress is somebody adding a launch path and not calling the check, and that
+    is visible in the source.
+    """
+    text = (REPO / path).read_text()
+    assert call in text, f"{path} launches an artifact without checking its provenance"
+
+
+def test_the_override_is_a_warning_not_a_silent_pass(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`SECANTUS_ALLOW_STALE_ARTIFACT` exists so nobody DELETES the check.
+
+    Measuring an old build on purpose -- a bisect, a before/after against a
+    previous release -- is legitimate. Without a supported way to say so, the
+    person with that need comments the check out, and then it is gone for
+    everybody. The override still prints, so a stale run cannot look like a
+    clean one in a log.
+    """
+    import tools.provenance as provenance
+
+    monkeypatch.setenv(provenance.OVERRIDE_ENV, "1")
+    monkeypatch.setattr(provenance, "binary_source_tree", lambda _p: "old")
+    monkeypatch.setattr(provenance, "committed_crates_tree", lambda _r=None: "new")
+
+    provenance.require_fresh_pgserver(Path(__file__))  # must NOT raise
+
+    out = capsys.readouterr().out
+    assert provenance.OVERRIDE_ENV in out
+    assert "old" in out and "new" in out
+
+
+def test_the_override_is_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    import tools.provenance as provenance
+
+    monkeypatch.delenv(provenance.OVERRIDE_ENV, raising=False)
+    assert provenance.override_active() is False
+    monkeypatch.setenv(provenance.OVERRIDE_ENV, "0")
+    assert provenance.override_active() is False, "an explicit 0 must not enable it"
+
+
+# --------------------------------------------------------------------------- #
+# The lint gate's SCOPE. It was `src tests` until 2026-09-28, so `tools/`,
+# `bench/`, the gauge runners and the invoke tasks were never linted -- and the
+# first helper added to `tools/` that day used `sys` without importing it. Only
+# widening the scope caught it.
+# --------------------------------------------------------------------------- #
+
+
+def _ci_ruff_paths(prefix: str) -> set[str]:
+    """The paths a CI ruff step actually names."""
+    workflow = (REPO / ".github" / "workflows" / "test.yml").read_text()
+    for line in workflow.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(prefix):
+            return set(stripped[len(prefix) :].split())
+    raise AssertionError(f"no `{prefix}` step found in test.yml")
+
+
+def test_the_lint_gate_covers_the_whole_repo() -> None:
+    """CI must lint `.`, not a list of paths.
+
+    The scope was `src tests` until 2026-09-28, which left `tools/`, `bench/`,
+    all 19 gauge runners, the invoke tasks and `website/` unchecked. The first
+    attempt at a fix NAMED the paths, and that was wrong in the same way: an
+    enumeration reproduces the hole the moment someone adds a directory. The
+    test written against that list immediately found 27 locations missing from
+    it, which is the argument for `.` rather than a longer list.
+
+    ruff skips gitignored trees and the vendored submodules on its own, so `.`
+    reaches our Python and nothing else.
+    """
+    assert _ci_ruff_paths("run: uv run ruff check ") == {"."}
+
+
+def test_the_lint_and_format_steps_cover_the_same_paths() -> None:
+    """Checking one scope and formatting another is a hole that reads as covered."""
+    assert _ci_ruff_paths("run: uv run ruff format --check ") == _ci_ruff_paths(
+        "run: uv run ruff check "
+    )
+
+
+def test_ruff_excludes_every_vendored_tree() -> None:
+    """CI lints `.`, so a vendored tree it can see becomes OUR failure.
+
+    This bit within hours of widening the scope: CI failed on a WiredTiger
+    analytics NOTEBOOK, 125 characters wide, that upstream is entitled to write
+    however it likes. It passed locally because a fresh worktree has no
+    submodules checked out — so `.` reached nothing vendored and the exclusion
+    looked unnecessary. The difference was the ENVIRONMENT, not the config,
+    which is the recurring shape: a check that cannot see a thing reports no
+    problem with it.
+
+    Every submodule must therefore be covered by `extend-exclude`, or the next
+    one added turns the lint gate red for reasons nobody here can fix.
+    """
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # Python 3.10: tomllib is stdlib only from 3.11
+        import tomli as tomllib  # type: ignore[no-redef]
+
+    config = tomllib.loads((REPO / "pyproject.toml").read_text())
+    excluded = config["tool"]["ruff"]["extend-exclude"]
+
+    gitmodules = (REPO / ".gitmodules").read_text()
+    submodules = [
+        line.split("=", 1)[1].strip()
+        for line in gitmodules.splitlines()
+        if line.strip().startswith("path")
+    ]
+    assert submodules, "no submodules parsed from .gitmodules — has the format changed?"
+
+    uncovered = [
+        path
+        for path in submodules
+        if not any(path == ex or path.startswith(f"{ex}/") for ex in excluded)
+    ]
+    assert not uncovered, (
+        f"these submodules are not excluded from ruff: {uncovered}. CI lints `.`, "
+        f"so upstream's style would be reported as our lint failure. Add them to "
+        f"`extend-exclude` in pyproject.toml."
+    )

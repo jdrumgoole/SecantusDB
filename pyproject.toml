@@ -399,6 +399,18 @@ markers = [
 line-length = 100
 target-version = "py310"
 src = ["src", "tests"]
+# Vendored upstream trees are NOT ours to lint or format. CI lints `.` (see
+# `.github/workflows/test.yml`), and every one of these is a git submodule or a
+# vendored copy, so without this the gate reports upstream's style as our
+# failure -- which is exactly what happened when the scope was widened on
+# 2026-09-28: CI failed on a WiredTiger analytics NOTEBOOK. It passed locally
+# because a fresh worktree has no submodules checked out, so `.` reached nothing
+# vendored there and the exclusion looked unnecessary. It is not; the difference
+# was the environment, not the config.
+extend-exclude = [
+    "vendor",
+    "crates/vendor",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM"]

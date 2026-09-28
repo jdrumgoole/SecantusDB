@@ -42,6 +42,16 @@ from pathlib import Path
 REPO = Path("/Users/jdrumgoole/GIT/SecantusDB")
 RUST_BINARY = REPO / "crates/secantus-pgserver/target/release/secantusd-pg"
 
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+
+from tools.provenance import require_fresh_pgserver  # noqa: E402
+
+# A benchmark prints a table people paste into a document, so a stale
+# binary here becomes a published wrong number. `SECANTUS_ALLOW_STALE_ARTIFACT=1`
+# overrides, which is the honest way to measure an OLD build on purpose.
+require_fresh_pgserver(RUST_BINARY, repo_root=REPO)
+
 
 @dataclass
 class Result:

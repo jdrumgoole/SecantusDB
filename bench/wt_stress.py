@@ -18,9 +18,9 @@ import tempfile
 import traceback
 from pathlib import Path
 
+import _secantus_server as _server
 import pymongo
 
-import _secantus_server as _server
 from secantus import oplog_replay
 
 

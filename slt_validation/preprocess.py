@@ -43,7 +43,9 @@ def preprocess(text: str) -> str:
             parts = line.split()
             ncols = len(parts[1]) if len(parts) > 1 else 1
             sortmode = (
-                parts[2] if len(parts) > 2 and parts[2] in ("nosort", "rowsort", "valuesort") else "nosort"
+                parts[2]
+                if len(parts) > 2 and parts[2] in ("nosort", "rowsort", "valuesort")
+                else "nosort"
             )
             out.append(line)
             i += 1

@@ -13,6 +13,7 @@ Go / Node / Java / Ruby reports.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import xml.etree.ElementTree as ET
 from collections import defaultdict
@@ -71,10 +72,8 @@ def render(xml_path: Path, out_path: Path) -> None:
             pass
     # Total run time = sum of top-level testsuite times (children of root).
     for child in list(root):
-        try:
+        with contextlib.suppress(ValueError):
             duration += float(child.attrib.get("time", 0.0))
-        except ValueError:
-            pass
 
     for case in root.iter("testcase"):
         cat = _category_for(case)

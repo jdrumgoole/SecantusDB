@@ -119,7 +119,10 @@ def _run_build(cmd: list[str], label: str) -> int:
     try:
         r = subprocess.run(cmd, timeout=BUILD_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
-        print(f"cxx_validation: {label} exceeded {BUILD_TIMEOUT_SECONDS:.0f}s budget", file=sys.stderr)
+        print(
+            f"cxx_validation: {label} exceeded {BUILD_TIMEOUT_SECONDS:.0f}s budget",
+            file=sys.stderr,
+        )
         return 1
     if r.returncode != 0:
         print(f"cxx_validation: {label} failed", file=sys.stderr)
@@ -152,10 +155,14 @@ def _ensure_c_driver_install() -> int:
     )
     if rc != 0:
         return 1
-    return _run_build(
-        [cmake, "--build", str(C_INSTALL_BUILD), "--target", "install", "--parallel"],
-        "libmongoc install",
-    ) and 1 or 0
+    return (
+        _run_build(
+            [cmake, "--build", str(C_INSTALL_BUILD), "--target", "install", "--parallel"],
+            "libmongoc install",
+        )
+        and 1
+        or 0
+    )
 
 
 def _ensure_test_binaries() -> int:
@@ -298,10 +305,13 @@ def main() -> int:
         env["MONGODB_URI"] = f"mongodb://{host}:{MONGOCXX_PORT}/"
 
         suites: list[Path] = []
-        for i, binary in enumerate(TEST_BINARIES):
+        for binary in TEST_BINARIES:
             out = RAW_OUT if len(TEST_BINARIES) == 1 else RAW_OUT.with_suffix(f".{binary}.xml")
             cmd = [str(TEST_DIR / binary), "--reporter", "junit", "--out", str(out), *EXCLUDE_SPECS]
-            print(f"cxx_validation: `{' '.join(cmd)}` (MONGODB_URI={env['MONGODB_URI']})", file=sys.stderr)
+            print(
+                f"cxx_validation: `{' '.join(cmd)}` (MONGODB_URI={env['MONGODB_URI']})",
+                file=sys.stderr,
+            )
             try:
                 subprocess.run(cmd, cwd=TEST_DIR, env=env, timeout=RUNTESTS_TIMEOUT_SECONDS)
             except subprocess.TimeoutExpired:

@@ -37,9 +37,7 @@ from pathlib import Path
 LINK_MARKER = "# secantus-patch: link-libpython conditional"
 SUFFIX_MARKER = "# secantus-patch: .pyd suffix on Windows"
 
-ORIGINAL_LINK = (
-    "swig_link_libraries(wiredtiger_python ${wiredtiger_target} ${python_libs})"
-)
+ORIGINAL_LINK = "swig_link_libraries(wiredtiger_python ${wiredtiger_target} ${python_libs})"
 PATCHED_LINK = f"""{LINK_MARKER}
 if(WIN32)
     swig_link_libraries(wiredtiger_python ${{wiredtiger_target}} ${{python_libs}})
