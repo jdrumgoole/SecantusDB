@@ -2974,8 +2974,53 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **CLOSED-BY-MEASUREMENT — `createIndexes` under a timeout needs no Rust
+      change; the PYTHON server is the divergent one (2026-09-28).**
+      `tasks/driver-conformance-followups-plan.md` §4 asked which shape mongod
+      gives when `createIndexes` exceeds `maxTimeMS`, and said to "align both".
+      Measured on mongod 8.2.11 — it gives the BARE message, so the Rust server
+      already matches it exactly and needs nothing:
+
+      ```
+      maxTimeAlwaysTimeOut failpoint       real expiry (100k docs, maxTimeMS: 1)
+        mongod  code 50 MaxTimeMSExpired     mongod  code 50 MaxTimeMSExpired
+                "operation exceeded time              "operation exceeded time
+                 limit"                                limit"
+        rust    identical      MATCH         rust    ok: 1.0   <-- see next item
+      ```
+
+      BOTH paths were probed on purpose: the failpoint fires before an index
+      build exists, so it could legitimately differ from a real expiry. It does
+      not — mongod is bare in both, with no `Index build failed: <buildUUID>:
+      Collection ...` envelope.
+
+      The Python server wraps it (`commands.py` builds that envelope), so the
+      remaining work is on the Python side, not the Rust side. Read from the
+      source, not run — the Python server was out of scope for that slice.
+
+- [ ] **OPEN — the Rust server does not ENFORCE `maxTimeMS`, demonstrated
+      (2026-09-28).** This is §6 of the driver-conformance plan, which called it
+      "a project, not a fix". It still is, but it now has a reproducer instead of
+      a description:
+
+      ```
+      100,000 documents, then createIndexes with maxTimeMS: 1
+        mongod 8.2.11      -> ok: 0, code 50, MaxTimeMSExpired
+        rust secantusd-rs  -> ok: 1.0        (index fully built)
+      ```
+
+      The failpoint path answers 50 correctly, so the budget is PARSED and
+      recognised and simply never checked — `argtypes.rs::require_max_time_ms`
+      validates it and nothing enforces it. There is no equivalent of
+      `src/secantus/deadline.py` on the Rust side.
+
+      Unchanged from the plan: the fix needs a cooperative deadline polled by the
+      storage scan, the aggregation pipeline and the index build, and those polls
+      sit in the flagship server's hottest loops. Benchmark before and after
+      (`invoke release-benchmark`); do not assume the cost.
+
 - [ ] **OPEN — a backend-termination test waits with `sleep(0.1)` for a reap it
-      cannot bound, and failed CI once on 2026-09-28.**
+      cannot bound, and failed CI TWICE on 2026-09-28.**
       `tests/test_rust_pgserver_slice.py::test_pg_cancel_and_terminate_backend_signal_a_running_statement`
       terminates an IDLE session and then asserts the row is gone from
       `pg_stat_activity`:
@@ -2994,6 +3039,21 @@ These are explicit non-goals. Don't add them without a reason.
       [run 36398852755](https://github.com/jdrumgoole/SecantusDB/actions/runs/36398852755/job/108851645826).
       It passed on a re-run of an otherwise identical tree
       ([36400966809](https://github.com/jdrumgoole/SecantusDB/actions/runs/36400966809/job/108858465344)).
+
+      **Second occurrence, same day, same assertion** — `assert (1,) == (0,)` in
+      the `pg-oracle` lane of
+      [run 36407171530](https://github.com/jdrumgoole/SecantusDB/actions/runs/36407171530/job/108878590800),
+      on PR #1607, a branch that touched only MongoDB's `getParameter` and a
+      MongoDB differential test: **zero PostgreSQL code**. It passed on the next
+      run of the rebased branch. That is the strongest evidence yet for the first
+      reading below — the race is in the test's unbounded `sleep(0.1)`, not in
+      anything a particular change provoked, because this change could not have
+      provoked it.
+
+      Practical note for whoever works it: `gh run rerun --failed` is NOT
+      available on this workflow (it answers "run ... cannot be rerun; its
+      workflow file may be broken"), so a single-lane re-run is not a diagnostic
+      you can reach for. Re-triggering means a push, and therefore a full matrix.
 
       **Why this is filed rather than called a flake.** "Flaky" describes a bug
       here, it does not excuse one — and the shape is a race by construction: a
