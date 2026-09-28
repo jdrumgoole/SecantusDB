@@ -37,6 +37,7 @@ use s2::latlng::LatLng;
 use s2::rect::Rect;
 use s2::region::RegionCoverer;
 use secantus_core::collation::Collation;
+use secantus_core::deadline;
 use secantus_core::diff::compute_update_description_for;
 use secantus_core::order;
 use secantus_core::query::matches as query_matches;
@@ -1487,6 +1488,12 @@ pub enum StorageError {
     /// `PathNotViable` (28). Without this the refusal deferred, and a defer on
     /// this server is a generic BadValue (2).
     UpdatePathNotViable(String),
+    /// The operation outlived its `maxTimeMS` budget. Raised by the loops whose
+    /// length is driven by the data -- the document scan and the index build --
+    /// which poll `secantus_core::deadline`. mongod answers these with code 50
+    /// rather than running to completion, which this server did until
+    /// 2026-09-28.
+    MaxTimeExpired,
     /// A query filter used a construct the Rust query engine can't evaluate
     /// (the `matches` "defer to Python" signal). The server's engine selection
     /// is responsible for not routing such queries to the Rust storage.
@@ -1565,6 +1572,9 @@ impl std::fmt::Display for StorageError {
                 write!(f, "unsupported value type for index sort-key encoding")
             }
             StorageError::DuplicateId => write!(f, "duplicate _id"),
+            StorageError::MaxTimeExpired => {
+                write!(f, "{}", secantus_core::deadline::MaxTimeMsExpired::MESSAGE)
+            }
             StorageError::DuplicateKey(c) => {
                 write!(f, "E11000 duplicate key error on index {}", c.index)
             }
@@ -8709,6 +8719,13 @@ impl Storage {
             stored_options.insert("multikey", Bson::Boolean(true));
             let mut out: Vec<(Vec<u8>, i64)> = Vec::new();
             for (rid, _id_k, blob) in self.scan_docs(session, db, coll)? {
+                // The scan itself polls, but building the entries is per-document
+                // work of its own (decode + sort-key encode), so a large
+                // collection can outlive its budget here even after the read
+                // finished inside it.
+                if deadline::check().is_err() {
+                    return Err(StorageError::MaxTimeExpired);
+                }
                 let d = decode_doc(&blob)?;
                 if let Some(kb) = get_path(&d, &geo.field).and_then(|v| geo.cell_kb(v)) {
                     out.push((kb, rid));
@@ -8729,6 +8746,13 @@ impl Storage {
                 .or_insert(Bson::Int32(3));
             let mut out: Vec<(Vec<u8>, i64)> = Vec::new();
             for (rid, _id_k, blob) in self.scan_docs(session, db, coll)? {
+                // The scan itself polls, but building the entries is per-document
+                // work of its own (decode + sort-key encode), so a large
+                // collection can outlive its budget here even after the read
+                // finished inside it.
+                if deadline::check().is_err() {
+                    return Err(StorageError::MaxTimeExpired);
+                }
                 let d = decode_doc(&blob)?;
                 if let Some(v) = get_path(&d, &gs.field) {
                     for kb in gs.cell_kbs(v) {
@@ -8754,6 +8778,13 @@ impl Storage {
             let mut entries: Vec<(Vec<u8>, i64)> = Vec::new();
             let mut seen: HashSet<Vec<u8>> = HashSet::new();
             for (rid, _id_k, blob) in self.scan_docs(session, db, coll)? {
+                // The scan itself polls, but building the entries is per-document
+                // work of its own (decode + sort-key encode), so a large
+                // collection can outlive its budget here even after the read
+                // finished inside it.
+                if deadline::check().is_err() {
+                    return Err(StorageError::MaxTimeExpired);
+                }
                 let d = decode_doc(&blob)?;
                 if let Some(pf) = &partial {
                     if !query_matches(&d, pf, &Document::new(), None).map_err(query_fault)? {
@@ -9181,6 +9212,13 @@ impl Storage {
             Err(e) => return Err(e.into()),
         };
         while more {
+            // The COLLSCAN is the loop whose length is the collection's size,
+            // so it is where a `maxTimeMS` budget has to be noticed. Polled
+            // every 64 documents (see `deadline::POLL_EVERY`), which bounds the
+            // overrun to 64 rows rather than the whole table.
+            if deadline::check().is_err() {
+                return Err(StorageError::MaxTimeExpired);
+            }
             let (d, c, recordid) = cur.get_key_ssq()?;
             if d != db || c != coll {
                 break;
@@ -10533,6 +10571,9 @@ impl Storage {
         } else {
             let mut out = Vec::new();
             for blob in blobs {
+                if deadline::check().is_err() {
+                    return Err(StorageError::MaxTimeExpired);
+                }
                 let raw = bson::RawDocument::from_bytes(&blob)
                     .map_err(|_| StorageError::QueryUnsupported)?;
                 if secantus_core::query::matches_raw(raw, filter, vars, coll_opt)
@@ -10588,6 +10629,9 @@ impl Storage {
             let mut seen: HashSet<i64> = HashSet::new();
             let mut out = Vec::new();
             for recordid in recordids {
+                if deadline::check().is_err() {
+                    return Err(StorageError::MaxTimeExpired);
+                }
                 if !seen.insert(recordid) {
                     continue;
                 }
@@ -10635,6 +10679,9 @@ impl Storage {
             for (_rid, _id_k, blob) in
                 self.candidate_docs(&session, db, coll, filter, coll_opt.is_some())?
             {
+                if deadline::check().is_err() {
+                    return Err(StorageError::MaxTimeExpired);
+                }
                 // Match over raw BSON — count never returns the documents, so a
                 // selective filter over wide documents decodes only the filter's
                 // fields, nothing else (matches `find_matching_with`).
@@ -11806,6 +11853,21 @@ impl Storage {
         coll: &str,
         hint: &Hint,
     ) -> Result<ResolvedHint> {
+        // A hint is validated during query PLANNING, and there is nothing to
+        // plan against when the collection does not exist -- so mongod accepts
+        // any hint there and returns an empty result. Measured 8.2.11
+        // (2026-09-28): `hint: "abc"` on a missing namespace is `ok` for all
+        // SEVEN commands that take one, and BadValue the moment the collection
+        // exists, empty or not. This server refused it in every case, which is
+        // what mongo-c-driver's `/find_and_modify/hint` caught -- that test
+        // runs against a collection it never creates.
+        //
+        // `Natural` is the right answer rather than an error: a scan of a
+        // missing collection yields nothing, which is exactly the empty result
+        // mongod produces.
+        if coll_options(session, db, coll)?.is_none() {
+            return Ok(ResolvedHint::Natural);
+        }
         match hint {
             Hint::Name(s) => {
                 // NOT `"$natural"`. mongod takes only the DOCUMENT form

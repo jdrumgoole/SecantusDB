@@ -198,6 +198,18 @@ def main() -> int:
             storage_dir,
             "--log-level",
             "WARNING",
+            # libmongoc's MONGOC_TEST_URI carries no ``replicaSet=``, so its
+            # tests assert STANDALONE semantics — and our default ``hello``
+            # advertises a single-node replica-set primary (so pymongo's
+            # change-stream machinery accepts the topology). The mismatch cost
+            # four tests: ``/Client/select_server{,/err}/{single,pooled}``
+            # select with a SECONDARY read preference and assert the result is
+            # ``standalone_or_rs_secondary_or_mongos``. Against a real
+            # standalone that is Standalone; against us it was RSPrimary.
+            #
+            # Measured 2026-09-28: with this flag the four pass, without it
+            # they fail. Same reasoning as the Java gauge above it.
+            "--standalone",
         ],
         label="c_validation",
     )

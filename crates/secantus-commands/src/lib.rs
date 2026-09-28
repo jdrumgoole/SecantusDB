@@ -59,6 +59,7 @@ use std::sync::{Arc, Mutex};
 pub use auth::ConnectionAuth;
 use bson::{doc, Bson, Document};
 pub use cursors::{CursorError, CursorRegistry};
+use secantus_core::deadline;
 pub use secantus_wire::{MAX_BSON_OBJECT_SIZE, MAX_MESSAGE_SIZE};
 pub use storage::{Storage, StorageError, UpdateOutcome};
 
@@ -307,6 +308,14 @@ impl CommandContext {
     }
 }
 
+impl From<secantus_core::deadline::MaxTimeMsExpired> for CommandError {
+    /// So a polling loop can `?` its way out to the handler boundary without
+    /// every intermediate signature learning about time.
+    fn from(_: secantus_core::deadline::MaxTimeMsExpired) -> Self {
+        CommandError::max_time_expired()
+    }
+}
+
 /// A command failure carrying mongod's error triple. Shaped into an `ok: 0`
 /// reply by [`CommandError::into_reply`].
 #[derive(Debug, Clone, PartialEq)]
@@ -335,6 +344,12 @@ impl CommandError {
     pub fn with_extra(mut self, extra: Document) -> Self {
         self.extra = Some(Box::new(extra));
         self
+    }
+
+    /// `50 MaxTimeMSExpired` — the operation outlived its `maxTimeMS` budget.
+    pub fn max_time_expired() -> Self {
+        use secantus_core::deadline::MaxTimeMsExpired as E;
+        CommandError::new(E::CODE, E::CODE_NAME, E::MESSAGE)
     }
 
     /// `59 CommandNotFound` for an unregistered command name.
@@ -1097,10 +1112,18 @@ fn maybe_record_profile(
 }
 
 /// Run `handler`, mapping its `Err` into the standard error reply.
+///
+/// `maxTimeMS` is armed HERE, around the whole handler, because that is the
+/// span mongod bounds: the operation, not any one loop inside it. Until
+/// 2026-09-28 the budget was parsed and validated exactly as mongod validates
+/// it and then never checked — a `createIndexes` over 100,000 documents with
+/// `maxTimeMS: 1` answered `ok` where mongod answers code 50.
 fn run_handler(handler: Handler, doc: &Document, ctx: &mut CommandContext) -> Document {
+    let budget = max_time_ms_budget(doc);
+    let _deadline = deadline::arm((budget > 0).then_some(budget));
     match handler(doc, ctx) {
         Ok(reply) => {
-            if max_time_ms_budget(doc) > 0 {
+            if budget > 0 {
                 mark_time_limited_cursor(&reply, ctx);
             }
             reply
@@ -2141,6 +2164,24 @@ mod tests {
             e.into_reply().get_str("codeName").unwrap(),
             "InvalidNamespace"
         );
+    }
+
+    /// The adapter inlines 50 / "operation exceeded time limit" because it does
+    /// not depend on secantus-core. Two copies of a constant is how they drift,
+    /// so this pins them: if the core ever changes the code or the wording, this
+    /// fails rather than the two halves quietly disagreeing over the wire.
+    #[test]
+    fn max_time_expired_matches_core() {
+        use secantus_core::deadline::MaxTimeMsExpired as E;
+        assert_eq!(E::CODE, 50);
+        assert_eq!(E::MESSAGE, "operation exceeded time limit");
+        let err = CommandError::max_time_expired();
+        assert_eq!(err.code, E::CODE);
+        assert_eq!(err.code_name, E::CODE_NAME);
+        assert_eq!(err.errmsg, E::MESSAGE);
+        // and the name must render, not fall through to `Location50`
+        let reply = err.into_reply();
+        assert_eq!(reply.get_str("codeName").unwrap(), "MaxTimeMSExpired");
     }
 
     #[test]

@@ -65,6 +65,16 @@ pub(crate) fn validate_write_hint(
         None | Some(Bson::Null) => return Ok(()),
         Some(h) => h,
     };
+    // A hint is validated during query PLANNING, and there is nothing to plan
+    // against when the collection does not exist — so mongod accepts any hint
+    // there. Measured 8.2.11 (2026-09-28) across all seven commands that take
+    // a hint: `ok` on a missing namespace, BadValue the moment the collection
+    // exists, empty or not. The storage layer's `resolve_hint` has the same
+    // guard; the write commands validate HERE instead, which is why fixing one
+    // left `findAndModify` / `update` / `delete` still diverging.
+    if !storage.collection_exists(db, coll).unwrap_or(true) {
+        return Ok(());
+    }
     let indexes = storage.list_indexes(db, coll).unwrap_or_default();
     let known = match hint {
         Bson::String(s) => {
@@ -352,6 +362,10 @@ pub(crate) fn error_code_name(code: i32) -> String {
 fn code_name_for(code: i32) -> &'static str {
     match code {
         2 => "BadValue",
+        // A `maxTimeMS` budget spent mid-operation. Reaches here via the
+        // storage layer's MaxTimeExpired -> WriteError { code: 50 } mapping,
+        // and without the entry would render the generic `Location50`.
+        50 => "MaxTimeMSExpired",
         9 => "FailedToParse",
         67 => "CannotCreateIndex",
         85 => "IndexOptionsConflict",
