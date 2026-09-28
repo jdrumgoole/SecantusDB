@@ -6560,9 +6560,9 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       | subqueries, every form | `(select 1)`, `exists(…)`, `in (select…)` | `SubLink` |
       | subquery in FROM | `select y from (select 1 as y) s` | `RangeSubselect` |
       | CTEs | `with c as (select 1 as x) select x from c` | `42P01 relation "c" does not exist` |
-      | `LIKE` / `ILIKE` / `NOT LIKE` | `where s like 'a%'` | `this operator form` |
-      | regex `~` | `where s ~ '^a'` | `operator ~` |
-      | `CASE` | select list or WHERE | `CaseExpr` |
+      | ~~`LIKE` / `ILIKE` / `NOT LIKE`~~ | **DONE 2026-09-28** | with `ESCAPE` |
+      | ~~regex `~` / `~*` / `!~` / `!~*`~~ | **DONE 2026-09-28** | |
+      | ~~`CASE`~~ | **DONE 2026-09-28** | both forms; still refused inside a bare `WHERE` |
       | window functions | `row_number() over (order by a)` | `function row_number()` |
       | `ORDER BY` over an expression | `order by a*-1` | `ORDER BY over an expression` |
       | `SELECT *` / `t.*` over a JOIN or comma FROM | `select * from t1, t2` | `this subquery target` |
@@ -6574,6 +6574,27 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       | `EXPLAIN` | | `ExplainStmt` |
       | composite `PRIMARY KEY` / multi-col `FOREIGN KEY` | | `a composite PRIMARY KEY` |
       | non-literal column `DEFAULT` | `default now()` | `a non-literal DEFAULT` |
+
+      **Pattern matching and `CASE` landed 2026-09-28** (0/17 -> 14/17 on
+      `pred_probe` against PostgreSQL 14.13): `LIKE` / `ILIKE` / `NOT LIKE`
+      with `ESCAPE`, the `~` / `~*` / `!~` / `!~*` regex operators, and `CASE`
+      in both forms including FROM-less selects. Three things that batch
+      measured and are worth not re-deriving:
+
+      * `LIKE` and friends arrive as their OWN `AExpr` kind, not as operators,
+        which is why every one of them answered `this operator form`.
+      * MQL's `$not` MATCHES a null or missing field, so a negated pattern
+        needs an explicit `$ne: null` beside it or `NOT LIKE` returns the NULL
+        rows PostgreSQL excludes. A comment asserting the opposite shipped in
+        the first cut and the differential caught it.
+      * `n LIKE 'x'` over an INTEGER column is `42883 operator does not exist:
+        integer ~~ unknown` on PostgreSQL. Lowering it to a regex anyway
+        returned no rows — silently — which is why the type is checked first.
+
+      **Still refused after that batch**, both honestly: `CASE` used directly as
+      a bare `WHERE` predicate (`where (case ... end)`) — `lower_where` has no
+      CaseExpr arm and a CASE does not lower to an MQL filter — and `ORDER BY`
+      over an expression.
 
       **TWO CLAUSE-DROPPING BUGS — worse than the refusals above, and these are
       the ones to fix first.** Both parse the clause and then ignore it, so the

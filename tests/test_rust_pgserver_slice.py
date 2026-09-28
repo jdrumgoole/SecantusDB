@@ -288,7 +288,10 @@ def test_duplicate_key_reports_what_postgres_reports(home: Path) -> None:
         ("SELECT * FROM t JOIN t AS u ON t.id = u.id", "0A000"),
         ("SELECT array_agg(name ORDER BY length(name)) FROM t", "0A000"),
         ("SELECT n, count(*) FROM t", "42803"),
-        ("SELECT * FROM t WHERE n LIKE 'x'", "0A000"),
+        # `LIKE` is implemented now; over an INTEGER column PostgreSQL 14.13
+        # has no such operator, so this moved from 0A000 to 42883 rather than
+        # becoming legal. It used to return no rows, silently.
+        ("SELECT * FROM t WHERE n LIKE 'x'", "42883"),
         ("SELECT * FROM t ORDER BY n + 1", "0A000"),
         # The PK is the document's `_id`, which storage treats as immutable.
         ("UPDATE t SET id = 2 WHERE id = 1", "0A000"),
@@ -10658,3 +10661,143 @@ def test_the_grouping_function_is_refused_by_name(home: Path) -> None:
             cur.execute("select a, grouping(a), sum(n) from s group by rollup (a)")
         assert info.value.sqlstate == "0A000"
         assert "GROUPING" in str(info.value)
+
+
+# --------------------------------------------------------------------------- #
+# Pattern matching (`LIKE` / `ILIKE` / `~`) and `CASE`.
+#
+# All measured against PostgreSQL 14.13. `LIKE` and friends arrive as their OWN
+# AExpr kind rather than as operators, so they never reached the operator path
+# and every one of them answered `this operator form is not supported yet`.
+# `CASE` was a missing arm in the VALUE evaluator only -- the column-reference
+# walker already descended into it.
+# --------------------------------------------------------------------------- #
+
+
+def _pat_table(conn) -> None:
+    cur = conn.cursor()
+    cur.execute("create table p (a text, n int)")
+    cur.execute("insert into p values ('abc',1),('ABC',2),('zed',3),(null,4)")
+
+
+def test_like_matches_the_whole_string(home: Path) -> None:
+    """SQL `LIKE` is anchored, unlike `~`: `'b'` does not match `'abc'`."""
+    with _Server(home) as server, server.connect() as conn:
+        _pat_table(conn)
+        cur = conn.cursor()
+        cur.execute("select a from p where a like 'a%' order by a")
+        assert cur.fetchall() == [("abc",)]
+        cur.execute("select a from p where a like 'b'")
+        assert cur.fetchall() == []
+        cur.execute("select a from p where a like '_bc' order by a")
+        assert cur.fetchall() == [("abc",)]
+
+
+def test_ilike_is_case_insensitive(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        _pat_table(conn)
+        cur = conn.cursor()
+        cur.execute("select a from p where a ilike 'a%' order by a")
+        assert cur.fetchall() == [("ABC",), ("abc",)]
+
+
+def test_a_negated_pattern_match_excludes_null(home: Path) -> None:
+    """The half that needed help.
+
+    A NULL column matches no regex, so the positive form is right for free.
+    But MQL's `$not` MATCHES a null or missing field, where PostgreSQL's
+    `NOT LIKE` over NULL is NULL and selects nothing. The first cut returned
+    the NULL row and a comment asserted the opposite; the differential caught
+    it.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        _pat_table(conn)
+        cur = conn.cursor()
+        cur.execute("select a from p where a not like 'a%' order by a")
+        assert cur.fetchall() == [("ABC",), ("zed",)]
+        cur.execute("select a from p where a !~ '^a' order by a")
+        assert cur.fetchall() == [("ABC",), ("zed",)]
+
+
+def test_like_metacharacters_are_literal(home: Path) -> None:
+    """Everything but `%` and `_` is literal, so a regex metacharacter in the
+    pattern must be escaped or `'a.c'` would match `'abc'`."""
+    with _Server(home) as server, server.connect() as conn:
+        _pat_table(conn)
+        cur = conn.cursor()
+        cur.execute("select a from p where a like 'a.c'")
+        assert cur.fetchall() == []
+        cur.execute("select 'a%b' like 'a\\%b'")
+        assert cur.fetchone()[0] is True
+
+
+def test_like_honours_an_explicit_escape(home: Path) -> None:
+    """`LIKE p ESCAPE e` folds into a `like_escape(p, e)` CALL, not a third
+    operand — reading that call is what makes ESCAPE work at all."""
+    with _Server(home) as server, server.connect() as conn:
+        _pat_table(conn)
+        cur = conn.cursor()
+        cur.execute("select 'a%b' like 'a#%b' escape '#'")
+        assert cur.fetchone()[0] is True
+        cur.execute("select 'axb' like 'a#%b' escape '#'")
+        assert cur.fetchone()[0] is False
+
+
+def test_the_regex_operators(home: Path) -> None:
+    """`~` matches anywhere, and `~*` ignores case."""
+    with _Server(home) as server, server.connect() as conn:
+        _pat_table(conn)
+        cur = conn.cursor()
+        cur.execute("select a from p where a ~ '^a' order by a")
+        assert cur.fetchall() == [("abc",)]
+        cur.execute("select a from p where a ~* '^a' order by a")
+        assert cur.fetchall() == [("ABC",), ("abc",)]
+        cur.execute("select a from p where a ~ 'b' order by a")
+        assert cur.fetchall() == [("abc",)]
+
+
+def test_like_as_a_value_not_just_a_predicate(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        _pat_table(conn)
+        cur = conn.cursor()
+        cur.execute("select a, a like 'a%' from p order by n")
+        assert cur.fetchall() == [("abc", True), ("ABC", False), ("zed", False), (None, None)]
+
+
+def test_case_in_both_forms(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        _pat_table(conn)
+        cur = conn.cursor()
+        cur.execute("select case when n=1 then 'one' else 'other' end from p order by n")
+        assert cur.fetchall() == [("one",), ("other",), ("other",), ("other",)]
+        cur.execute("select case n when 1 then 'a' when 2 then 'b' else 'z' end from p order by n")
+        assert cur.fetchall() == [("a",), ("b",), ("z",), ("z",)]
+
+
+def test_case_without_else_is_null(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        _pat_table(conn)
+        cur = conn.cursor()
+        cur.execute("select case when n=1 then 'one' end from p order by n")
+        assert cur.fetchall() == [("one",), (None,), (None,), (None,)]
+
+
+def test_case_takes_only_a_true_branch(home: Path) -> None:
+    """NULL is not TRUE, so a NULL condition falls through — the same
+    three-valued rule a WHERE uses. And a NULL subject in the simple form
+    matches nothing, not even `WHEN NULL`, because `NULL = NULL` is NULL."""
+    with _Server(home) as server, server.connect() as conn:
+        _pat_table(conn)
+        cur = conn.cursor()
+        cur.execute("select case when null then 'yes' else 'no' end")
+        assert cur.fetchone()[0] == "no"
+        cur.execute("select case a when null then 'matched' else 'no' end from p where n = 4")
+        assert cur.fetchone()[0] == "no"
+
+
+def test_case_nests_inside_a_function(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        _pat_table(conn)
+        cur = conn.cursor()
+        cur.execute("select upper(case when n=1 then 'x' else 'y' end) from p order by n")
+        assert cur.fetchall() == [("X",), ("Y",), ("Y",), ("Y",)]

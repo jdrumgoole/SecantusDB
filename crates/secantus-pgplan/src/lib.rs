@@ -7109,7 +7109,12 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 | N::AIndirection(_)
                 | N::CoalesceExpr(_)
                 | N::MinMaxExpr(_)
-                | N::NullTest(_)),
+                | N::NullTest(_)
+                // `select case when ... end` with no FROM. This list is an
+                // allow-list, so a node absent from it is refused even when
+                // `const_value` handles it perfectly well -- which is why CASE
+                // worked over a table and not here.
+                | N::CaseExpr(_)),
             ) => {
                 let val = rt.val.as_ref().expect("checked");
                 let v = const_value(val, params)?;
@@ -13037,6 +13042,60 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             _ => Err(Error::Unsupported("this IS [NOT] NULL form".into())),
         };
     }
+    // `CASE` in both of PostgreSQL's forms. The walker already descended into
+    // one (`walk_column_refs` has a CaseExpr arm, so a column inside a branch
+    // resolved correctly); only the VALUE evaluator was missing, which is why
+    // the refusal was a bare `CaseExpr is not supported yet`.
+    //
+    // Semantics measured against PostgreSQL 14.13:
+    //
+    // * The SEARCHED form `CASE WHEN c THEN v ... END` takes the first branch
+    //   whose condition is TRUE. NULL is not true, so it falls through — the
+    //   same three-valued rule a WHERE uses.
+    // * The SIMPLE form `CASE x WHEN a THEN v ... END` compares `x` to each
+    //   label with `=`. A NULL `x` matches NOTHING, not even `WHEN NULL`,
+    //   because `NULL = NULL` is NULL.
+    // * With no branch taken and no ELSE, the result is NULL.
+    //
+    // Branches are evaluated LAZILY: only the taken one, so `case when n <> 0
+    // then 1/n else 0 end` does not divide by zero on the rows it guards.
+    if let Some(N::CaseExpr(c)) = node.node.as_ref() {
+        let subject = match c.arg.as_deref() {
+            Some(a) => Some(const_value(a, params)?),
+            None => None,
+        };
+        for w in &c.args {
+            let Some(N::CaseWhen(cw)) = w.node.as_ref() else {
+                return Err(Error::Unsupported("this CASE branch".into()));
+            };
+            let test = cw
+                .expr
+                .as_deref()
+                .ok_or_else(|| Error::Parse("CASE WHEN with no condition".into()))?;
+            let taken = match &subject {
+                // Simple form: the parser leaves the comparison implicit.
+                Some(subject) => {
+                    let label = const_value(test, params)?;
+                    *subject != Bson::Null
+                        && label != Bson::Null
+                        && eval_binary("=", subject.clone(), label)? == Bson::Boolean(true)
+                }
+                // Searched form: only TRUE takes the branch.
+                None => const_value(test, params)? == Bson::Boolean(true),
+            };
+            if taken {
+                let result = cw
+                    .result
+                    .as_deref()
+                    .ok_or_else(|| Error::Parse("CASE WHEN with no result".into()))?;
+                return const_value(result, params);
+            }
+        }
+        return match c.defresult.as_deref() {
+            Some(d) => const_value(d, params),
+            None => Ok(Bson::Null),
+        };
+    }
     if let Some(N::MinMaxExpr(m)) = node.node.as_ref() {
         let args = m
             .args
@@ -13170,10 +13229,23 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             )?;
             return eval_scalar_array_const(&op, lhs, rhs, is_any);
         }
+        // `LIKE` / `ILIKE` as a VALUE (`select a like 'a%'`), not just as a
+        // WHERE predicate. Their own AExpr kind, so they never reached the
+        // operator path.
+        if matches!(
+            AExprKind::try_from(e.kind),
+            Ok(AExprKind::AexprLike | AExprKind::AexprIlike)
+        ) {
+            return eval_pattern_match_const(e, params);
+        }
         if AExprKind::try_from(e.kind) != Ok(AExprKind::AexprOp) {
             return Err(Error::Unsupported("this operator form".into()));
         }
         let op = operator_name(e)?.to_string();
+        // The regex operators are ordinary AexprOp.
+        if pattern_operator(&op).is_some() {
+            return eval_pattern_match_const(e, params);
+        }
         let rhs = const_value(
             e.rexpr
                 .as_ref()
@@ -13496,6 +13568,193 @@ fn scalar_filter(def: &TableDef, field: &str, mql_op: &str, value: Bson) -> Docu
     }
 }
 
+/// A SQL `LIKE` pattern as an anchored regular expression.
+///
+/// `%` is any run, `_` is one character, and everything else is literal — so
+/// every regex metacharacter in the pattern must be escaped, or `a.c` would
+/// match `abc`. The escape character (default `\\`, settable by `ESCAPE`)
+/// makes the NEXT character literal, including `%` and `_`.
+///
+/// Anchored at both ends because SQL's `LIKE` matches the WHOLE string, unlike
+/// `~`, which matches anywhere.
+fn like_to_regex(pattern: &str, escape: Option<char>) -> Result<String> {
+    let mut out = String::from("^");
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if Some(c) == escape {
+            match chars.next() {
+                Some(next) => out.push_str(&regex_escape(next)),
+                // PostgreSQL 14.13: a pattern ending in the escape character
+                // is an error, not a literal backslash.
+                None => {
+                    return Err(Error::InvalidText(
+                        "LIKE pattern must not end with escape character".into(),
+                    ))
+                }
+            }
+            continue;
+        }
+        match c {
+            '%' => out.push_str(".*"),
+            '_' => out.push('.'),
+            other => out.push_str(&regex_escape(other)),
+        }
+    }
+    out.push('$');
+    Ok(out)
+}
+
+/// One character, safe to drop into a regex as a literal.
+fn regex_escape(c: char) -> String {
+    if "\\^$.|?*+()[]{}".contains(c) {
+        format!("\\{c}")
+    } else {
+        c.to_string()
+    }
+}
+
+/// The pattern and escape character of a LIKE's right-hand side.
+///
+/// `LIKE p ESCAPE e` is folded by the parser into a `like_escape(p, e)` CALL,
+/// not into a third operand — so a bare `LIKE p` has no such call and takes the
+/// default backslash. Reading the call is what makes `ESCAPE` work at all;
+/// without it the RHS evaluated as an unknown function.
+///
+/// `ESCAPE ''` disables escaping entirely (PostgreSQL 14.13), which is why the
+/// escape is an `Option` rather than a char with a sentinel.
+fn like_pattern_and_escape(
+    rhs: &pg_query::protobuf::Node,
+    params: &[Bson],
+) -> Result<(Bson, Option<char>)> {
+    if let Some(N::FuncCall(f)) = rhs.node.as_ref() {
+        if func_name(f).as_deref() == Some("like_escape") && f.args.len() == 2 {
+            let pattern = const_value(&f.args[0], params)?;
+            let escape = match const_value(&f.args[1], params)? {
+                Bson::String(e) => e.chars().next(),
+                _ => Some('\\'),
+            };
+            return Ok((pattern, escape));
+        }
+    }
+    Ok((const_value(rhs, params)?, Some('\\')))
+}
+
+/// `~~` / `!~~` / `~~*` / `!~~*` (LIKE and friends) and `~` / `!~` / `~*` /
+/// `!~*` (regex) as (regex-is-negated, case-insensitive), or `None`.
+fn pattern_operator(op: &str) -> Option<(bool, bool, bool)> {
+    // (negated, case-insensitive, is_like)
+    Some(match op {
+        "~~" => (false, false, true),
+        "!~~" => (true, false, true),
+        "~~*" => (false, true, true),
+        "!~~*" => (true, true, true),
+        "~" => (false, false, false),
+        "!~" => (true, false, false),
+        "~*" => (false, true, false),
+        "!~*" => (true, true, false),
+        _ => return None,
+    })
+}
+
+/// `LIKE` / `ILIKE` / `~` and their negations as a VALUE.
+///
+/// Three-valued, as PostgreSQL has it: a NULL on either side is NULL, not
+/// FALSE -- so `NOT LIKE` over a NULL is NULL too, and a WHERE built on it
+/// matches nothing rather than everything.
+fn eval_pattern_match_const(e: &AExpr, params: &[Bson]) -> Result<Bson> {
+    let op = operator_name(e)?.to_string();
+    let (negated, insensitive, is_like) =
+        pattern_operator(&op).ok_or_else(|| Error::Unsupported(format!("the {op} operator")))?;
+    let subject = const_value(
+        e.lexpr
+            .as_deref()
+            .ok_or_else(|| Error::Parse("pattern match with no subject".into()))?,
+        params,
+    )?;
+    let rexpr = e
+        .rexpr
+        .as_deref()
+        .ok_or_else(|| Error::Parse("pattern match with no pattern".into()))?;
+    let (pattern, escape) = if is_like {
+        like_pattern_and_escape(rexpr, params)?
+    } else {
+        (const_value(rexpr, params)?, None)
+    };
+    let (Bson::String(subject), Bson::String(pattern)) = (&subject, &pattern) else {
+        return Ok(Bson::Null);
+    };
+    let source = if is_like {
+        like_to_regex(pattern, escape)?
+    } else {
+        pattern.clone()
+    };
+    let re = regex::RegexBuilder::new(&source)
+        .case_insensitive(insensitive)
+        .build()
+        .map_err(|err| Error::InvalidText(format!("invalid regular expression: {err}")))?;
+    Ok(Bson::Boolean(re.is_match(subject) != negated))
+}
+
+/// Lower `LIKE` / `ILIKE` / `~` and their negations to an MQL `$regex`.
+///
+/// SQL's three-valued logic needs help on the NEGATED side. A NULL column
+/// matches no regex, so the positive form is right for free — but MQL's `$not`
+/// MATCHES a null or missing field, where PostgreSQL's `NOT LIKE` over NULL is
+/// NULL and selects nothing. The first cut of this claimed otherwise in a
+/// comment and returned the NULL row; the differential caught it. So the
+/// negated form pairs `$not` with an explicit `$ne: null`, which is measured
+/// behaviour rather than an assumption about MQL.
+fn lower_pattern_match(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
+    let op = operator_name(e)?;
+    let (negated, insensitive, is_like) =
+        pattern_operator(op).ok_or_else(|| Error::Unsupported(format!("the {op} operator")))?;
+    let field = column_field(e.lexpr.as_deref(), def)?;
+    // PostgreSQL has no `~~` for a non-text left operand: `n LIKE 'x'` over an
+    // integer is `42883 operator does not exist: integer ~~ unknown`. Lowering
+    // it to a regex anyway matched NOTHING and returned no rows -- an empty
+    // result where PostgreSQL raises, which is the silent-divergence class
+    // this server refuses to ship. Measured on 14.13.
+    if let Some(column) = def.columns.iter().find(|c| c.field() == field) {
+        if !matches!(
+            column.pg_type.as_str(),
+            "text" | "varchar" | "bpchar" | "name" | "citext"
+        ) {
+            return Err(Error::UndefinedFunction(format!(
+                "operator does not exist: {} {} unknown",
+                display_type(&column.pg_type),
+                op
+            )));
+        }
+    }
+    let rexpr = e
+        .rexpr
+        .as_deref()
+        .ok_or_else(|| Error::Parse("pattern match with no pattern".into()))?;
+    let (rhs, escape) = if is_like {
+        like_pattern_and_escape(rexpr, params)?
+    } else {
+        (const_value(rexpr, params)?, None)
+    };
+    let Bson::String(pattern) = rhs else {
+        // A NULL pattern is NULL for every row, which is no rows.
+        return Ok(doc! { "__never__": Bson::Null, "$comment": "NULL pattern" });
+    };
+    let regex = if is_like {
+        like_to_regex(&pattern, escape)?
+    } else {
+        pattern
+    };
+    let mut spec = doc! { "$regex": regex };
+    if insensitive {
+        spec.insert("$options", "i");
+    }
+    Ok(if negated {
+        doc! { field: { "$not": spec, "$ne": Bson::Null } }
+    } else {
+        doc! { field: spec }
+    })
+}
+
 fn lower_aexpr(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     // Named enum, never the wire integer. Written against the integers first,
     // this had `Op = 0` (it is 1, so every plain `=` was refused) and
@@ -13509,9 +13768,20 @@ fn lower_aexpr(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
             return lower_between(e, def, params)
         }
         Ok(AExprKind::AexprOp) => {}
+        // `LIKE` / `ILIKE` and their NOT forms arrive as their OWN kind, so
+        // they never reached the operator path below -- the statement died
+        // with `this operator form is not supported yet`.
+        Ok(AExprKind::AexprLike | AExprKind::AexprIlike) => {
+            return lower_pattern_match(e, def, params)
+        }
         _ => return Err(Error::Unsupported("this operator form".into())),
     }
     let op = operator_name(e)?;
+    // The regex operators are ordinary AexprOp, so they land here rather than
+    // in the arm above.
+    if pattern_operator(op).is_some() {
+        return lower_pattern_match(e, def, params);
+    }
 
     let col = match e.lexpr.as_ref().and_then(|l| l.node.as_ref()) {
         Some(N::ColumnRef(c)) => {
