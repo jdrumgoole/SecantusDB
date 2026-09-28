@@ -6806,7 +6806,7 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       | `SELECT *` / `t.*` over a JOIN or comma FROM | `select * from t1, t2` | `this subquery target` |
       | array subscripting | `(array[1,2])[1]` | `this field selection` |
       | `CREATE INDEX` | | `IndexStmt` |
-      | `ALTER TABLE`, any form | no ADD/DROP COLUMN exists | `AlterTableStmt` |
+      | ~~`ALTER TABLE`, any form~~ | **DONE 2026-09-28**, incl. RENAME | `USING`, and ADD of a UNIQUE/PK/FK |
       | `CREATE VIEW` | | `ViewStmt` |
       | `CREATE TRIGGER` | | `CreateTrigStmt` |
       | `EXPLAIN` | | `ExplainStmt` |
@@ -6883,6 +6883,45 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       ~~Biggest single lever: **subqueries and CTEs**, which gate most real
       application SQL and also gate any broader SQL gauge.~~ **SHIPPED
       2026-09-28** — see the entry below for what is left of it.
+
+- [ ] **OPEN — RUST pgserver: `CREATE INDEX` and `CREATE VIEW` are what is
+      left of the DDL corpus (2026-09-28).** `ALTER TABLE` and `RENAME`
+      landed, taking `tools/probes/pg_corpora/ddl.sql` from 28 divergences of
+      41 to 7 against PostgreSQL 14.13. All seven are index or view:
+
+      ```
+      CREATE INDEX / CREATE UNIQUE INDEX / DROP INDEX   -> 0A000 IndexStmt
+      CREATE [OR REPLACE] VIEW / DROP VIEW              -> 0A000 ViewStmt
+      SELECT ... FROM <a view>                          -> 42P01
+      ```
+
+      **They are different jobs, and the index one is the load-bearing half.**
+      A SQL index has to map onto a STORAGE index — `create_unique_indexes`
+      already does that for a `UNIQUE` constraint, so `CREATE UNIQUE INDEX`
+      is close to it, while a non-unique one needs the planner to know the
+      index exists for it to be worth anything. It is also what unblocks two
+      entries already in this file: a partial-index `ON CONFLICT` arbiter, and
+      `ALTER TABLE ADD CONSTRAINT UNIQUE` (refused today for the same reason —
+      an index has to be built over rows that already exist).
+
+      A VIEW needs its defining query stored in the catalog and expanded at
+      plan time, which is the FROM-subquery machinery pointed at a stored
+      statement rather than an inline one.
+
+      **What ALTER still refuses, and why:** `ALTER COLUMN TYPE ... USING`
+      (the expression rewrites the value rather than casting it), and
+      `ADD COLUMN` carrying `PRIMARY KEY` / `UNIQUE` / `REFERENCES` / a
+      `serial` (each needs an index or a sequence built over existing rows).
+      Each is refused by its own name.
+
+      **One rule here was measured rather than assumed, and it is easy to get
+      backwards.** `ALTER COLUMN TYPE` is allowed exactly where an ASSIGNMENT
+      cast exists, which is a property of the TYPES and not of the values:
+      `text -> int` is `42804` even when every value is a digit string. The
+      matrix (31 pairs on 14.24) is: to a STRING type always; within the
+      numeric family; within the date/time family; `json` and `jsonb`; a type
+      to itself. Everything else needs `USING`. Deciding it by trying the cast
+      per row made the same statement succeed or fail depending on the data.
 
 - [ ] **OPEN — RUST pgserver: a CORRELATED subquery is refused, and that is
       the whole remainder of the subquery work (2026-09-28).** Uncorrelated

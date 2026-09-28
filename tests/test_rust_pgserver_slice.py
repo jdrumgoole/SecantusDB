@@ -11578,3 +11578,276 @@ def test_one_sided_range_and_groups_frames_match_postgres(
         cur = conn.cursor()
         cur.execute(sql)
         assert cur.fetchall() == expected
+
+
+def _altered(conn: psycopg.Connection) -> None:
+    """A table with rows already in it, which is what makes ALTER interesting.
+
+    Row 2 has a NULL `n` and row 3 a NULL `s`, so `SET NOT NULL` has something
+    to refuse and a `CHECK` has something to be violated by.
+    """
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE a20 (id int PRIMARY KEY, n int, s text)")
+    cur.execute("INSERT INTO a20 VALUES (1, 10, 'x'), (2, NULL, 'y'), (3, 30, NULL)")
+
+
+def test_add_column_fills_the_rows_already_there(home: Path) -> None:
+    """PostgreSQL shows the DEFAULT on rows that predate the column.
+
+    The rows are rewritten rather than left short a field: a read would
+    otherwise have to treat a MISSING field as "the default" rather than as
+    NULL, and the two are different for a column added without one.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        _altered(conn)
+        cur = conn.cursor()
+        cur.execute("ALTER TABLE a20 ADD COLUMN c1 text")
+        cur.execute("SELECT id, c1 FROM a20 ORDER BY id")
+        assert cur.fetchall() == [(1, None), (2, None), (3, None)]
+        cur.execute("ALTER TABLE a20 ADD COLUMN c2 int DEFAULT 7")
+        cur.execute("SELECT id, c2 FROM a20 ORDER BY id")
+        assert cur.fetchall() == [(1, 7), (2, 7), (3, 7)]
+
+
+def test_a_dropped_column_does_not_come_back_when_re_added(home: Path) -> None:
+    """The field goes with the column.
+
+    Leaving it in the stored rows would be invisible while the catalog no
+    longer named it -- and then `ADD COLUMN` under the same name would
+    resurrect the OLD values, which is a wrong answer no error would flag.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        _altered(conn)
+        cur = conn.cursor()
+        cur.execute("ALTER TABLE a20 ADD COLUMN c int DEFAULT 7")
+        cur.execute("ALTER TABLE a20 DROP COLUMN c")
+        cur.execute("ALTER TABLE a20 ADD COLUMN c int")
+        cur.execute("SELECT id, c FROM a20 ORDER BY id")
+        assert cur.fetchall() == [(1, None), (2, None), (3, None)]
+
+
+def test_alter_validates_against_the_rows_already_there(home: Path) -> None:
+    """A NOT NULL or a CHECK that the existing rows fail refuses the ALTER."""
+    with _Server(home) as server, server.connect() as conn:
+        _altered(conn)
+        cur = conn.cursor()
+        # `n` has a NULL, so SET NOT NULL is 23502.
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute("ALTER TABLE a20 ALTER COLUMN n SET NOT NULL")
+        assert info.value.sqlstate == "23502"
+        conn.rollback()
+        # A NOT NULL column with no default cannot be ADDED to a table that
+        # has rows: every one of them would violate it at once.
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute("ALTER TABLE a20 ADD COLUMN c4 int NOT NULL")
+        assert info.value.sqlstate == "23502"
+        conn.rollback()
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute("ALTER TABLE a20 ADD CONSTRAINT ck CHECK (id > 100)")
+        assert info.value.sqlstate == "23514"
+        conn.rollback()
+        # One the rows satisfy is accepted, and then enforced on writes.
+        cur.execute("ALTER TABLE a20 ADD CONSTRAINT ck_pos CHECK (id > 0)")
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute("INSERT INTO a20 (id) VALUES (-1)")
+        assert info.value.sqlstate == "23514"
+        conn.rollback()
+        cur.execute("ALTER TABLE a20 DROP CONSTRAINT ck_pos")
+        cur.execute("INSERT INTO a20 (id) VALUES (-1)")
+        cur.execute("SELECT count(*) FROM a20 WHERE id = -1")
+        assert cur.fetchall() == [(1,)]
+
+
+@pytest.mark.parametrize(
+    "from_type,to_type,allowed",
+    [
+        # PostgreSQL decides this from the TYPES, before looking at a row: the
+        # conversion is allowed only where an assignment cast exists. Measured
+        # across 31 pairs on 14.24; these are the representative ones.
+        ("int", "text", True),
+        ("int", "bigint", True),
+        ("int", "numeric", True),
+        ("numeric", "int", True),
+        ("date", "timestamp", True),
+        ("date", "text", True),
+        ("json", "jsonb", True),
+        ("text", "varchar(3)", True),
+        # FROM a string to anything but a string needs USING -- even when
+        # every value would convert cleanly, which is why this cannot be
+        # decided by trying the cast per row.
+        ("text", "int", False),
+        ("text", "date", False),
+        ("text", "json", False),
+        ("bool", "int", False),
+        ("int", "bool", False),
+    ],
+)
+def test_alter_column_type_follows_postgres_cast_rule(
+    home: Path, from_type: str, to_type: str, allowed: bool
+) -> None:
+    value = {
+        "int": "1",
+        "text": "'1'",
+        "date": "'2020-01-01'",
+        "json": "'1'",
+        "bool": "true",
+        "numeric": "1",
+    }[from_type]
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(f"CREATE TABLE ct (v {from_type})")
+        cur.execute(f"INSERT INTO ct VALUES ({value})")
+        if allowed:
+            cur.execute(f"ALTER TABLE ct ALTER COLUMN v TYPE {to_type}")
+        else:
+            with pytest.raises(psycopg.Error) as info:
+                cur.execute(f"ALTER TABLE ct ALTER COLUMN v TYPE {to_type}")
+            assert info.value.sqlstate == "42804"
+            assert "cannot be cast automatically" in str(info.value)
+
+
+def test_rename_moves_the_stored_field_except_for_the_primary_key(home: Path) -> None:
+    """A PRIMARY KEY column is stored as `_id` whatever it is called.
+
+    So renaming it moves no field, while renaming any other column has to --
+    or the catalog would name a field no row carries.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        _altered(conn)
+        cur = conn.cursor()
+        cur.execute("ALTER TABLE a20 RENAME COLUMN s TO label")
+        cur.execute("SELECT label FROM a20 WHERE id = 1")
+        assert cur.fetchall() == [("x",)]
+        cur.execute("ALTER TABLE a20 RENAME COLUMN id TO pk")
+        cur.execute("SELECT pk, label FROM a20 WHERE pk = 1")
+        assert cur.fetchall() == [(1, "x")]
+        # And the renamed key still keys: a duplicate is still a duplicate.
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute("INSERT INTO a20 (pk) VALUES (1)")
+        assert info.value.sqlstate == "23505"
+
+
+def test_rename_table_moves_the_rows_and_the_catalog(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        _altered(conn)
+        cur = conn.cursor()
+        cur.execute("ALTER TABLE a20 RENAME TO a21")
+        cur.execute("SELECT count(*) FROM a21")
+        assert cur.fetchall() == [(3,)]
+        cur.execute("INSERT INTO a21 (id) VALUES (9)")
+        cur.execute("SELECT count(*) FROM a21")
+        assert cur.fetchall() == [(4,)]
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute("SELECT count(*) FROM a20")
+        assert info.value.sqlstate == "42P01"
+        conn.rollback()
+        # Onto a name that is taken is 42P07.
+        cur.execute("CREATE TABLE b20 (id int PRIMARY KEY)")
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute("ALTER TABLE a21 RENAME TO b20")
+        assert info.value.sqlstate == "42P07"
+
+
+def test_alter_actions_apply_in_order_within_one_statement(home: Path) -> None:
+    """`add column m int, alter column m set default 5` needs the second
+    action to see the column the first one added."""
+    with _Server(home) as server, server.connect() as conn:
+        _altered(conn)
+        cur = conn.cursor()
+        cur.execute("ALTER TABLE a20 ADD COLUMN m int, ALTER COLUMN m SET DEFAULT 5")
+        cur.execute("INSERT INTO a20 (id) VALUES (20)")
+        cur.execute("SELECT m FROM a20 WHERE id = 20")
+        assert cur.fetchall() == [(5,)]
+
+
+@pytest.mark.parametrize(
+    "sql,sqlstate",
+    [
+        ("ALTER TABLE nosuch20 ADD COLUMN x int", "42P01"),
+        ("ALTER TABLE a20 ADD COLUMN id int", "42701"),
+        ("ALTER TABLE a20 DROP COLUMN nope", "42703"),
+        ("ALTER TABLE a20 ALTER COLUMN nope SET DEFAULT 1", "42703"),
+        ("ALTER TABLE a20 DROP CONSTRAINT nope", "42704"),
+        ("ALTER TABLE a20 RENAME COLUMN nope TO other", "42703"),
+        ("ALTER TABLE a20 RENAME COLUMN s TO n", "42701"),
+        ("ALTER TABLE nosuch20 RENAME TO other20", "42P01"),
+        # A table with two columns of one name was accepted silently, and the
+        # second was unreachable because every lookup takes the first match.
+        ("CREATE TABLE bad20 (id int, id int)", "42701"),
+    ],
+)
+def test_alter_error_surface_matches_postgres(home: Path, sql: str, sqlstate: str) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        _altered(conn)
+        cur = conn.cursor()
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute(sql)
+        assert info.value.sqlstate == sqlstate
+
+
+def test_if_exists_and_if_not_exists_make_an_alter_a_no_op(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        _altered(conn)
+        cur = conn.cursor()
+        cur.execute("ALTER TABLE a20 ADD COLUMN IF NOT EXISTS s text")
+        cur.execute("ALTER TABLE a20 DROP COLUMN IF EXISTS nope")
+        cur.execute("ALTER TABLE a20 DROP CONSTRAINT IF EXISTS nope")
+        cur.execute("ALTER TABLE IF EXISTS nosuch20 ADD COLUMN x int")
+        cur.execute("SELECT count(*) FROM a20")
+        assert cur.fetchall() == [(3,)]
+
+
+def test_an_alter_rolls_back_with_its_transaction(home: Path) -> None:
+    """Both halves: the catalog AND the rewritten rows.
+
+    A `ROLLBACK TO` that put the catalog back but left the rows rewritten
+    would describe the table with a shape its own rows do not have.
+    """
+    # NOT autocommit: the default here is autocommit, where `rollback()` is a
+    # no-op and this would assert nothing at all.
+    with _Server(home) as server, server.connect(autocommit=False) as conn:
+        _altered(conn)
+        conn.commit()
+        cur = conn.cursor()
+        cur.execute("ALTER TABLE a20 ADD COLUMN c text DEFAULT 'd'")
+        cur.execute("SELECT id, c FROM a20 ORDER BY id LIMIT 1")
+        assert cur.fetchall() == [(1, "d")]
+        conn.rollback()
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute("SELECT c FROM a20")
+        assert info.value.sqlstate == "42703"
+        conn.rollback()
+        # A savepoint rollback keeps the ALTER that preceded it.
+        cur.execute("ALTER TABLE a20 ADD COLUMN c2 text DEFAULT 'e'")
+        conn.commit()
+        cur.execute("SAVEPOINT s1")
+        cur.execute("ALTER TABLE a20 DROP COLUMN c2")
+        cur.execute("ROLLBACK TO s1")
+        cur.execute("SELECT c2 FROM a20 ORDER BY id LIMIT 1")
+        assert cur.fetchall() == [("e",)]
+        conn.commit()
+
+
+def test_the_python_server_reads_a_rust_altered_catalog(home: Path) -> None:
+    """The on-disk contract, which an ALTER is a new way to break.
+
+    An added column with a default, a widened type and a renamed column all
+    have to land in the catalog in the shape the PYTHON server reads -- and a
+    row it writes afterwards has to read back through the Rust one.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE xr (id int PRIMARY KEY, n int)")
+        cur.execute("INSERT INTO xr VALUES (1, 10), (2, 20)")
+        cur.execute("ALTER TABLE xr ADD COLUMN tag text DEFAULT 'hi'")
+        cur.execute("ALTER TABLE xr ALTER COLUMN n TYPE bigint")
+        cur.execute("ALTER TABLE xr RENAME COLUMN n TO num")
+    assert _python_sql(home, "SELECT id, num, tag FROM xr ORDER BY id") == [
+        (1, 10, "hi"),
+        (2, 20, "hi"),
+    ]
+    _python_sql(home, "INSERT INTO xr (id, num, tag) VALUES (3, 30, 'py')")
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id, num, tag FROM xr ORDER BY id")
+        assert cur.fetchall() == [(1, 10, "hi"), (2, 20, "hi"), (3, 30, "py")]
