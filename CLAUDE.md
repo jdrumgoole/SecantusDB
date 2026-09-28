@@ -315,15 +315,20 @@ one request path:
   - **The gauge number above measures the PROTOCOL and the TYPE SYSTEM, which is
     this server's strong half. It says very little about the QUERY LANGUAGE.**
     Surveyed 2026-09-28 against a binary built from `HEAD:crates`, seventeen
-    features were refused outright (`0A000 … is not supported yet`). **Pattern
-    matching (`LIKE` / `ILIKE` / `~`, with `ESCAPE`) and `CASE` landed
-    2026-09-28**; what remains refused is subqueries in every form (`SubLink`)
-    including `EXISTS` / `IN (select…)` / a scalar `(select 1)`, a subquery in
-    `FROM`, CTEs, window functions, `ORDER BY` over an expression, `CASE` as a
-    bare `WHERE` predicate, `SELECT *` over a JOIN, array subscripting,
+    features were refused outright (`0A000 … is not supported yet`). **Six of
+    them landed 2026-09-28** — pattern matching (`LIKE` / `ILIKE` / `~`, with
+    `ESCAPE`), `CASE` in both forms, `ORDER BY` over an expression, and a
+    `WHERE` that does not lower to an MQL filter (evaluated per row as a
+    residual). The predicate corpus is 17/17 against PostgreSQL 14.13.
+
+    **What remains refused**: subqueries in every form (`SubLink`) including
+    `EXISTS` / `IN (select…)` / a scalar `(select 1)`, a subquery in `FROM`,
+    CTEs, window functions, `SELECT *` over a JOIN, array subscripting,
     `CREATE INDEX`, `ALTER TABLE` in ANY form, `CREATE VIEW`, `CREATE TRIGGER`,
     `EXPLAIN`, composite `PRIMARY KEY` / multi-column `FOREIGN KEY`, and a
-    non-literal column `DEFAULT`.
+    non-literal column `DEFAULT`. Subqueries and CTEs are the biggest lever:
+    unlike the six above, which were missing match arms, they need new
+    execution machinery.
 
 <<<<<<< HEAD
     **`GROUPING SETS` / `ROLLUP` is parsed and then DROPPED**, so the client
