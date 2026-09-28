@@ -41,7 +41,7 @@ single-node scope, SecantusDB is the database your driver thinks it's
 talking to: same handshake, same wire frames, same error codes.
 
 It also speaks **SQL over the PostgreSQL wire protocol** as an opt-in extra
-(`pip install "secantus[sql]"`): the same data is reachable from `psql`, pg8000,
+(`pip install "SecantusDB[sql]"`): the same data is reachable from `psql`, pg8000,
 or SQLAlchemy, and a document written with `pymongo` reads back as a row. See
 [SQL / PostgreSQL interface](sql.md).
 

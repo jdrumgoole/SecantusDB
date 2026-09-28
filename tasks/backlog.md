@@ -100,14 +100,16 @@ item is not overhead — it is where the findings come from.
       — which is exactly how this went unnoticed. The suite list is enumerated
       by `grep -rl '^import pg_oracle' tests/`, so a new oracle suite is picked
       up without editing the workflow. Measured locally with the job's own
-      command: **195 passed, 0 skipped**. Original entry:
+      command: **195 passed, 0 skipped**. Original entry, kept for the
+      record (no longer open):
 
-- **CI has no PostgreSQL reference server at all**, so the six oracle
-      suites above only ever execute on a dev box that happens to have one.
-      They skip silently in CI — now with a reason that says why, but still
-      skipping. Split out of the resolved entry above (2026-08-31), which
-      raised it as "worth a CI thought" and never separated it. Deciding
-      whether CI should stand one up is the open question; nothing is broken.
+      > CI has no PostgreSQL reference server at all, so the six oracle
+      > suites above only ever execute on a dev box that happens to have
+      > one. They skip silently in CI — now with a reason that says why,
+      > but still skipping. Split out of the resolved entry above
+      > (2026-08-31), which raised it as "worth a CI thought" and never
+      > separated it. Deciding whether CI should stand one up is the open
+      > question; nothing is broken.
 
 - [x] **RESOLVED (2026-09-01) — and the entry's PREMISE was wrong.** It says
       "this box: `en_US.UTF-8`". This box's PostgreSQL is initialised with

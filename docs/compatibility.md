@@ -11,7 +11,7 @@ protocol and now matches the Python server on pymongo's suite; its few
 remaining feature gaps are delineated in [The two servers](servers.md), and
 the full three-way matrix against real `mongod` is in the
 [Feature comparison](feature-comparison.md). The separate
-**PostgreSQL-wire SQL front end** (`pip install "secantus[sql]"`) has its own
+**PostgreSQL-wire SQL front end** (`pip install "SecantusDB[sql]"`) has its own
 conformance target (`psql` + `psycopg`) and its own supported-SQL matrix in
 [SQL / PostgreSQL interface](sql.md).
 :::

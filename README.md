@@ -6,7 +6,6 @@
 </p>
 
 [![Status: beta](https://img.shields.io/badge/status-beta-yellow)](#beta-software)
-[![Tests: 584 passing](https://img.shields.io/badge/tests-584%20passing-brightgreen)](#)
 [![License: GPL-2.0-only (code) + CC-BY-4.0 (content)](https://img.shields.io/badge/license-GPL--2.0--only%20%2B%20CC--BY--4.0-blue)](#license)
 [![Python: 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![Documentation](https://img.shields.io/badge/docs-secantusdb.com-3b82f6)](https://secantusdb.com/docs/index.html)
@@ -14,129 +13,179 @@
 > [!WARNING]
 > **Beta software.** <a id="beta-software"></a>
 >
-> SecantusDB is past initial proving but the Python API surface (CLI
-> flags, public class signatures) may still shift before 1.0. **The
-> on-disk format is WiredTiger's** — the same engine MongoDB uses —
-> and the schema we layer on top (collection / index / oplog tables)
-> has been stable across releases; the test suite runs against real
-> on-disk WiredTiger storage and the
+> SecantusDB is past initial proving but its API surface (CLI flags,
+> public class signatures) may still shift before 1.0. **The on-disk
+> format is WiredTiger's** — the same engine MongoDB uses — and the
+> schema we layer on top (collection / index / oplog tables) has been
+> stable across releases; the test suite runs against real on-disk
+> WiredTiger storage and the
 > [persistence tests](https://github.com/jdrumgoole/SecantusDB/blob/main/tests/test_storage.py) explicitly verify
 > close-and-reopen round-trips. That said, we don't yet ship a migration
 > tool or a formal compatibility guarantee, so please don't put
 > production data here yet — production deployments that need durable
-> data across upgrades should still run a real `mongod`.
+> data across upgrades should still run a real `mongod` or `postgres`.
 
-**Drop-in MongoDB for single-node applications.** SecantusDB is a real
-MongoDB server written in Python: it speaks the MongoDB wire protocol on
-the same TCP socket a `mongod` would, so any standard MongoDB driver or
-tool — [`pymongo`](https://pymongo.readthedocs.io/en/stable/),
-[`mongo-go-driver`](https://github.com/mongodb/mongo-go-driver),
-`mongosh`, `mongodump` / `mongorestore` — connects unchanged. Point a
-`MongoClient` at it and your application code doesn't know the
-difference, as long as the application only needs single-node behaviour.
-No `mongod` to install, no port conflicts, parallel-test friendly,
-embedded or as a standalone daemon (`secantusd-py`).
+**A surrogate single-node database for your tests.** SecantusDB speaks
+the real **MongoDB** and **PostgreSQL** wire protocols on a real TCP
+socket, over the same **WiredTiger** storage engine MongoDB ships. Point
+your existing driver at it — `pymongo`, `mongo-go-driver`, `mongosh`,
+`psycopg`, `psql`, SQLAlchemy — and your application code doesn't know
+the difference, as long as it only needs single-node behaviour. No
+`mongod` or `postgres` to install, no port conflicts, parallel-test
+friendly, embedded in-process or as a standalone daemon.
 
-Single-node only by design: replica sets, sharding, and anything that
-depends on real cluster topology are out of scope. Within that
-single-node scope, SecantusDB is the database your driver thinks it's
-talking to — same handshake, same wire frames, same error codes.
+The servers you run are written in **Rust**:
+
+```bash
+pip install SecantusDB
+```
 
 ```python
 from pymongo import MongoClient
-from secantus import SecantusDBServer
+from _secantus_server import RustServer
 
-# On-disk by default at ./secantus-data; pass storage_path=":memory:" for ephemeral.
-with SecantusDBServer(port=27017) as server:
+with RustServer("./secantus-data") as server:     # port 0 = OS-assigned
     client = MongoClient(server.uri)
     db = client["mydb"]
     db["users"].insert_one({"_id": 1, "name": "Joe"})
     assert db["users"].find_one({"_id": 1})["name"] == "Joe"
 ```
 
+```python
+import psycopg
+from _secantus_server import PgServer
+
+with PgServer("./secantus-pg-data") as server:
+    with psycopg.connect(server.dsn, autocommit=True) as conn:
+        conn.execute("CREATE TABLE users (id int PRIMARY KEY, name text)")
+        conn.execute("INSERT INTO users VALUES (1, 'Joe')")
+        assert conn.execute("SELECT name FROM users WHERE id = 1").fetchone() == ("Joe",)
+```
+
+Python is only the launcher here: the accept loop runs on a Rust thread
+with the GIL released, and your driver connects over real TCP.
+
+Single-node only by design: replica sets, sharding, streaming
+replication, and anything else that depends on real cluster topology are
+out of scope. Within that scope, SecantusDB is the database your driver
+thinks it's talking to — same handshake, same wire frames, same error
+codes.
+
+## The four servers
+
+Two wire protocols, two implementations of each, one storage format.
+**Reach for Rust to run it; reach for Python to read it.**
+
+| Server | Wire | Run it as | Role |
+| --- | --- | --- | --- |
+| **Rust MongoDB server** | MongoDB | `RustServer` / `secantusd-rs` | **The flagship.** In the wheel; prebuilt binaries per platform |
+| **Rust PostgreSQL server** | PostgreSQL | `PgServer` / `secantusd-pg` | **The newest.** In the wheel; prebuilt `secantusd-pg` binaries on [GitHub Releases](https://github.com/jdrumgoole/SecantusDB/releases) |
+| Python MongoDB server | MongoDB | `SecantusDBServer` / `secantusd-py` | The readable reference — every operator, stage and error message lands here first |
+| Python PostgreSQL server | PostgreSQL | `SecantusPGServer` / `secantusd-py-pg` | The reference for the SQL surface, and still the most complete one |
+
+Each server is held to the **real product** it imitates — `mongod` for
+the two MongoDB servers, PostgreSQL for the two SQL servers — never to
+another SecantusDB server. See
+[The two servers](https://secantusdb.com/docs/servers.html) for what each
+one does not support yet.
+
+**Sharing one store.** All four read and write the same on-disk format,
+but how they can share it depends on the pair:
+
+- The **Python pair** can share one `Storage` object in one process
+  (`SecantusPGServer(..., storage=mongo_server.storage)`) and serve both
+  protocols at once: a collection written with `pymongo` is queryable as
+  a SQL table, `JOIN`s and all, with no `CREATE TABLE`.
+- **Separate processes** — including the two Rust servers — can only
+  **hand a directory over**, never serve it concurrently. WiredTiger
+  takes an exclusive file lock, so a second server pointed at a directory
+  that is already open exits rather than opening it. Between the Rust
+  pair the hand-over works in one direction only: a table written by
+  `secantusd-pg` reads back through `secantusd-rs` as a collection, but a
+  `pymongo`-written collection is not visible to the Rust PostgreSQL
+  server until something runs `CREATE TABLE` for it.
+
 ## Storage engine
 
 SecantusDB uses **the same WiredTiger C library mongod ships** —
-vendored at `vendor/wiredtiger/` (mongodb-7.0.33), built from source
-into the wheel, called via WT's official Python SWIG bindings. There
-is no Python re-implementation of the storage engine: B-trees, page
-eviction, write-ahead logging, durability, on-disk format are all
-pure WiredTiger. Your data lives on the same battle-tested engine
-mongod uses.
+vendored at `vendor/wiredtiger/` (mongodb-7.0.33) and built from source
+into the wheel. There is no re-implementation of the storage engine:
+B-trees, page eviction, write-ahead logging, durability, and on-disk
+format are all WiredTiger's.
 
-That doesn't make SecantusDB *as fast* as mongod — the layers above
-storage (command dispatch, query planner, aggregation pipeline) are
-Python, and a like-for-like benchmark currently has SecantusDB
-~1.2×–24× slower per operation than mongod. CRUD reads sit near the
-lower end of that; bulk update / delete and aggregation sit at the
-upper end where Python loop overhead dominates. See
-[`docs/benchmark.md`](https://secantusdb.com/docs/benchmark.html) for current numbers and
-methodology. The right use is tests, dev, embedded apps, and
-single-node prototypes where conformance + WT durability matter
-more than per-op latency.
+The layers above storage — command dispatch, query planning, the
+operator engines — are where the servers differ. On a like-for-like
+benchmark the **Rust MongoDB server runs within 1.0×–3.5× of `mongod`**
+per operation (reads at the low end, multi-stage aggregation at the
+high end); the Python server runs 2×–25×. See
+[`docs/benchmark.md`](https://secantusdb.com/docs/benchmark.html) for
+the numbers and methodology. The right use is tests, dev, CI,
+containers, and single-node prototypes where conformance and
+WiredTiger durability matter more than per-operation latency.
 
-## What's in scope
+## What's in scope: MongoDB
 
 Everything a single-node application needs from the wire — the
 handshake (`hello` / `isMaster` / `ping` / `buildInfo` / ...), CRUD
 (`insert` / `find` / `update` / `delete` / `findAndModify` / `count` /
 `drop`), cursors with `getMore` / `killCursors`, aggregation pipelines
-and the expression language they need, and **change streams**
-(single-node, oplog-backed; collection / db / cluster scope; resume
-tokens; `fullDocument: "updateLookup"`; pre-images via
+and the expression language they need, multi-document transactions, and
+**change streams** (single-node, oplog-backed; collection / db / cluster
+scope; resume tokens; `fullDocument: "updateLookup"`; pre-images via
 `fullDocumentBeforeChange`; blocking `awaitData` getMore). All backed by
 a real query planner with **index acceleration** — single-field,
-compound, mixed-direction, partial, TTL, sort — proper `explain` output
-(`IXSCAN` vs `COLLSCAN`), and a hash-join `$lookup`.
+compound, mixed-direction, multikey, partial, sparse, TTL, sort —
+`explain` output (`IXSCAN` vs `COLLSCAN`), and geo support
+(`$geoWithin` / `$geoIntersects` / `$near` / `$nearSphere`, `$geoNear`,
+`2dsphere` and `2d` indexes).
 
-**Authentication**: SCRAM-SHA-256 — MongoDB's default since 4.0 — is
-implemented end-to-end on the wire, alongside **native TLS / mTLS** and
-the **MONGODB-X509** cert-as-username mechanism. Off by default; flip
-SCRAM on with `secantusd-py --auth` (or `SecantusDBServer(...,
-require_auth=True)`), provision users with `createUser`, then connect
-with the standard `MongoClient(uri, username=, password=)` shape. See
-[Authentication](https://secantusdb.com/docs/authentication.html). Authorization
-(RBAC) is *not* enforced — an authenticated principal is currently
-treated as fully privileged — and LDAP / Kerberos / GSSAPI / AWS / OIDC
-auth mechanisms are out of scope.
+The target is **mongod 8.x**, and the Rust server passes **99.5%** of
+pymongo's own unmodified test suite (1,205 of 1,210 run, 2026-09-28).
+Twelve other official drivers run their suites against it too — see the
+[conformance validation summary](https://secantusdb.com/docs/validation-summary.html).
 
-What's **out of scope:** real replica sets, sharding, RBAC, auth
-mechanisms beyond SCRAM-SHA-256 / MONGODB-X509 (no LDAP / Kerberos /
-GSSAPI / AWS / OIDC), `OP_COMPRESSED`, text / hashed / wildcard indexes,
-and `$where` / `$function` / `$accumulator` / `mapReduce` (no embedded
-JS runtime). If you need those, run a real `mongod`. Native TLS + mTLS,
-multi-document transactions (with WiredTiger-native rollback), and geo
-support (`$geoWithin` / `$geoIntersects` / `$near` / `$nearSphere`,
-`$geoNear`, `2dsphere` and `2d` indexes) are all in scope and shipped.
+**Security**: SCRAM-SHA-256 authentication, the **MONGODB-X509**
+cert-as-username mechanism, native **TLS / mTLS**, and role-based
+**authorization** with mongod's built-in roles. All off by default; turn
+auth on with `--auth` (or `require_auth=True`), provision users with
+`createUser`, then connect with the standard
+`MongoClient(uri, username=, password=)` shape. See
+[Authentication](https://secantusdb.com/docs/authentication.html).
 
-## SQL / PostgreSQL interface (opt-in)
+What's **out of scope:** real replica sets, sharding, auth mechanisms
+beyond SCRAM / MONGODB-X509 (no LDAP / Kerberos / GSSAPI / AWS / OIDC),
+`OP_COMPRESSED`, text / hashed / wildcard indexes, and `$where` /
+`$function` / `$accumulator` / `mapReduce` (no embedded JS runtime). If
+you need those, run a real `mongod`.
 
-SecantusDB can also speak **SQL over the PostgreSQL wire protocol**. Install the
-extra (`pip install "secantus[sql]"`), start a `SecantusPGServer` — optionally
-sharing the *same* storage as the MongoDB server — and connect with `psql`,
-pg8000, or SQLAlchemy over a `postgresql://` URL:
+## What's in scope: PostgreSQL
 
-```python
-from secantus.sql import SecantusPGServer
+The subset of the PostgreSQL wire protocol real clients use — the
+extended query protocol (Parse / Bind / Describe / Execute), prepared
+statements and portals, text *and* binary formats, transactions with
+savepoints and two-phase commit, `COPY`, server-side cursors,
+`LISTEN` / `NOTIFY`, and the catalog tables a client introspects.
 
-with SecantusPGServer(port=5432) as server:
-    ...  # SELECT / INSERT / UPDATE / DELETE, JOIN, GROUP BY, transactions, ...
-```
+The **Rust PostgreSQL server** parses SQL with `libpg_query` — the real
+PostgreSQL grammar — and passes **5,545 of 5,729** of psycopg 3's own
+unmodified test suite (183 skipped, one failure that never reaches the
+wire). That gauge measures the protocol and the type system; the query
+language is narrower. Joins, aggregates, `GROUP BY` with `GROUPING SETS`,
+uncorrelated subqueries and CTEs, window functions, `ALTER TABLE` and
+`ON CONFLICT` work. Correlated subqueries, `SELECT *` over a join,
+`CREATE INDEX`, `CREATE VIEW`, triggers and `EXPLAIN` are still refused,
+with SQLSTATE `0A000` rather than a wrong answer.
 
-Or run it as a standalone daemon — `pip install "secantus[sql]"` puts a
-`secantusd-py-pg` script on your `PATH`:
+The **Python PostgreSQL server** has the wider SQL surface, including
+schema-on-read over MongoDB collections (nested documents surface as
+`jsonb` with `->`, `->>`, `#>`). It needs the `sql` extra:
 
 ```bash
+pip install "SecantusDB[sql]"
 secantusd-py-pg --host 127.0.0.1 --port 5432 --storage-path ./secantus-data
 ```
 
-SQL is compiled down to the same query / aggregation engines the MongoDB side
-uses, so it inherits index acceleration and the type system. A collection
-written with `pymongo` is queryable as a SQL table with **no `CREATE TABLE`**
-(schema-on-read), nested documents surface as `jsonb` (`->`, `->>`, `#>`), and
-`BEGIN` / `COMMIT` / `ROLLBACK` are real transactions. Auth (SCRAM-SHA-256) and
-TLS work the same as on the Mongo side. See
-[SQL / PostgreSQL interface](https://secantusdb.com/docs/sql.html)
+See [SQL / PostgreSQL interface](https://secantusdb.com/docs/sql.html)
 for the supported-SQL matrix and examples.
 
 ## Installation
@@ -148,14 +197,20 @@ pip install SecantusDB
 Pre-built wheels are published for CPython **3.10**, **3.11**, **3.12**, and **3.13** on:
 
 - macOS arm64 (Apple Silicon)
-- Linux x86_64 and aarch64 (manylinux2014 / glibc, and musllinux_1_2 / Alpine)
+- Linux x86_64 and aarch64 (manylinux_2_28 / glibc, and musllinux_1_2 / Alpine)
 - Windows AMD64
 
-macOS Intel (x86_64) is not in the wheel matrix; use a from-source
-install if you need it.
+Each wheel carries both Rust servers (`RustServer` and `PgServer` in the
+`_secantus_server` module, plus the `secantusd-rs` binary), both Python
+servers, and WiredTiger itself — no separate package, no compile step,
+no system build tools required. macOS Intel (x86_64) is not in the
+wheel matrix.
 
-WiredTiger is vendored inside the wheel — no separate package, no
-compile step, no system build tools required.
+Standalone archives of `secantusd-rs` (Linux x86_64, macOS arm64,
+Windows x86_64) and `secantusd-pg` (Linux x86_64, macOS arm64) are
+attached to the `secantusdb-v*` and `secantusd-pg-v*` tags on
+[GitHub Releases](https://github.com/jdrumgoole/SecantusDB/releases), for
+when you want the server without Python at all.
 
 ### Building from source (unsupported platforms only)
 
@@ -176,69 +231,33 @@ needs three native build tools on `PATH`:
 
 See [Installation](https://secantusdb.com/docs/installation.html) for dev-install instructions.
 
-### The Rust server (separate)
+## Standalone daemons (drop-in `mongod` / `postgres` replacements)
 
-SecantusDB ships **two separate servers** on independent version lines: the
-pure-Python server (this package's `SecantusDBServer`) and a self-contained
-**Rust server** that speaks the same wire protocol off the GIL. You run one or
-the other — there is no in-process engine switching. The Python server is always
-pure-Python; the Rust engines live only in the Rust server.
-
-> The old in-process accelerator (`SECANTUS_ENGINE=rust` / `SecantusDBServer(engine=...)`)
-> has been **retired** in favour of this two-server split.
-
-The Rust side is a Cargo workspace under `crates/`: a pure-Rust engine crate
-(`secantus-core`, no PyO3) reused by the Rust server and the standalone
-`secantusd-rs` binary, plus a thin PyO3 bindings crate (`secantus-core-py`)
-that builds the `secantus-core` wheel — the vehicle that pins each Rust engine
-byte-for-byte against its pure-Python counterpart.
-
-```bash
-pip install "secantus[rust]"      # pulls the matching secantus-core wheel
-```
-
-The Python server is the **conformance leader** and the default choice: it
-passes **99.2%** of pymongo's own test suite. The Rust server runs the same
-unmodified suite and currently passes **92.0%** — it's faster per operation
-(see [`docs/benchmark.md`](https://secantusdb.com/docs/benchmark.html)) but is
-still closing the gap. The features the Rust server doesn't support yet —
-`showExpandedEvents` DDL change events, large change-event splitting, read /
-write-concern semantics, timeseries `_id` non-uniqueness — and a side-by-side
-of when to pick each server are spelled out in
-[The two servers](https://secantusdb.com/docs/servers.html).
-
-## Standalone daemon (drop-in `mongod` replacement)
-
-`pip install` puts a `secantusd-py` script on your `PATH`. Run it like
+`pip install SecantusDB` puts `secantusd-rs` on your `PATH`. Run it like
 you'd run `mongod`:
 
 ```bash
-secantusd-py --host 127.0.0.1 --port 27017
-# storage at ./secantus-data by default; pass --storage-path :memory:
-# for an ephemeral temp dir cleaned up on shutdown.
+secantusd-rs --host 127.0.0.1 --port 27017 --storage-path ./secantus-data
 ```
 
-The same `pip install secantus` also puts the standalone **Rust** server on your
-`PATH` as `secantusd-rs` (same flags, same wire protocol; see
-[The two servers](https://secantusdb.com/docs/servers.html)) —
-on Linux, macOS (Apple Silicon), and Windows. Intel-Mac wheels are pure-Python.
+The Rust PostgreSQL server comes as a release archive and takes
+positional arguments:
 
-Then point any MongoDB driver or tool at it — **no application code
-changes**, just the URI:
+```bash
+secantusd-pg ./secantus-pg-data 127.0.0.1:5432
+```
+
+Then point any driver or tool at it — **no application code changes**,
+just the connection string:
 
 ```bash
 mongosh mongodb://127.0.0.1:27017
 mongodump --uri mongodb://127.0.0.1:27017 --out ./dump
+psql "host=127.0.0.1 port=5432 dbname=postgres user=postgres"
 ```
 
-```python
-from pymongo import MongoClient
-client = MongoClient("mongodb://127.0.0.1:27017")  # same code as for mongod
-```
-
-The conformance gauges back this up: the official driver test suites
-run **unmodified** against SecantusDB — see the
-[conformance validation summary](https://secantusdb.com/docs/validation-summary.html).
+The Python reference servers run the same way as `secantusd-py` and
+`secantusd-py-pg`.
 
 ## Examples
 
@@ -247,12 +266,14 @@ insert, index, query, drop. Full version with explanations: [examples in
 the docs](https://secantusdb.com/docs/examples.html).
 
 ```python
-from pymongo import MongoClient
-from secantus import SecantusDBServer
+import tempfile
 
-# Ephemeral here so the snippet is self-contained; the production default
-# is on-disk at ./secantus-data — drop storage_path or set a real path.
-with SecantusDBServer(port=0, storage_path=":memory:") as server:
+from pymongo import MongoClient
+from _secantus_server import RustServer
+
+# A throwaway directory so the snippet is self-contained; pass a real
+# path to keep the data across restarts.
+with RustServer(tempfile.mkdtemp()) as server:
     client = MongoClient(server.uri)
     cellar = client["wine_cellar"]
     bottles = cellar["bottles"]
@@ -305,7 +326,7 @@ change streams, inspect query plans, manage users, and take backups
 MongoDB-wire server you already have running.
 
 ```bash
-pip install 'secantusdb[admin]'
+pip install 'SecantusDB[admin]'
 secantus-admin --uri mongodb://127.0.0.1:27017
 ```
 
@@ -322,7 +343,8 @@ Full docs are at [secantusdb.com/docs](https://secantusdb.com/docs/index.html) �
 Highlights:
 
 - [Quickstart](https://secantusdb.com/docs/quickstart.html) — embedding in tests, running standalone.
-- [The two servers](https://secantusdb.com/docs/servers.html) — Python vs Rust server, which to use, and what each doesn't support yet.
+- [The two servers](https://secantusdb.com/docs/servers.html) — Rust vs Python server, and what each doesn't support yet.
+- [SQL / PostgreSQL interface](https://secantusdb.com/docs/sql.html) — the supported SQL surface.
 - [Architecture](https://secantusdb.com/docs/architecture.html) — the layered design.
 - [Indexes](https://secantusdb.com/docs/indexes.html) — what `find()` and `aggregate` accelerate,
   `explain` semantics, hints, partial indexes, TTL.
@@ -330,21 +352,20 @@ Highlights:
   expression operators.
 - [Compatibility](https://secantusdb.com/docs/compatibility.html) — the divergences you should know
   about before you point an application at SecantusDB.
-- [Conformance validation](https://secantusdb.com/docs/validation-summary.html) — every
-  supported driver's own test suite (pymongo, Go, Node, Java, Ruby,
-  Rust, and the PHP library + extension) run **unmodified** against
-  SecantusDB, with a cross-driver summary table and a per-driver report
-  for each. The other-language gauges catch wire-protocol bugs that
-  pymongo's permissive client accepts silently (e.g. int32-vs-int64
-  cursor ids).
+- [Conformance validation](https://secantusdb.com/docs/validation-summary.html) — each
+  official driver's own test suite run **unmodified** against SecantusDB,
+  with a cross-driver summary table and a per-driver report. The
+  other-language gauges catch wire-protocol bugs that pymongo's
+  permissive client accepts silently (e.g. int32-vs-int64 cursor ids).
 
 ## Development
 
 ```bash
 git clone https://github.com/jdrumgoole/SecantusDB.git
 cd SecantusDB
-uv sync --extra dev
-uv run python -m pytest    # 584 tests, runs in parallel under pytest-xdist
+git submodule update --init vendor/wiredtiger
+./inv sync                     # uv sync --all-extras, rebuilding the Rust core
+uv run python -m pytest        # runs in parallel under pytest-xdist
 ```
 
 Common workflows:

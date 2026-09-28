@@ -7,8 +7,8 @@
 > `tasks/rust-server-plan.md` as the authoritative plan. Kept for the design
 > reasoning and the measurements; do not take its next-steps as current work.
 
-Status: **in progress.** This document is the strategy: an order, a set of
-seams, and the decisions behind them.
+Status: **historical — superseded** (see the banner above). This document
+was the strategy: an order, a set of seams, and the decisions behind them.
 
 > ⚠️ **SUPERSEDED IN PART — integration model changed.** The "two co-resident
 > engines selected process-wide via `secantus.engine` / `SECANTUS_ENGINE`" model
