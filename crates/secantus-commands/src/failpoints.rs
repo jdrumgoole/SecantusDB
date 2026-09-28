@@ -45,7 +45,16 @@ struct FailCommand {
     /// `failCommand` + code 6 does not.
     server_injected: bool,
     error_code: Option<i32>,
-    error_labels: Vec<String>,
+    /// `None` when the failpoint did not mention `errorLabels` at all, which is
+    /// NOT the same as `Some(vec![])`: mongod treats a supplied list as
+    /// authoritative and adds nothing of its own to it, so an explicit `[]`
+    /// means "no labels" rather than "you decide". Measured 2026-09-28 —
+    /// injecting 11600 on `commitTransaction` answers `RetryableWriteError`
+    /// with the key omitted and `[]` with it present. Collapsing the two with
+    /// `unwrap_or_default` is what made the drivers' spec tests
+    /// `commitTransaction does not retry error without RetryableWriteError
+    /// label` (and its abort twin) fail.
+    error_labels: Option<Vec<String>>,
     write_concern_error: Option<Document>,
     close_connection: bool,
     block_time_ms: i64,
@@ -60,7 +69,9 @@ pub struct FailPointMatch {
     pub error_code: Option<i32>,
     /// See `FailCommand::server_injected`.
     pub server_injected: bool,
-    pub error_labels: Vec<String>,
+    /// `None` == the failpoint said nothing about labels; see
+    /// `FailCommand::error_labels`.
+    pub error_labels: Option<Vec<String>>,
     pub write_concern_error: Option<Document>,
     pub close_connection: bool,
     pub block_time_ms: i64,
@@ -128,15 +139,11 @@ impl FailPointRegistry {
         let app_name = data.get_str("appName").ok().map(String::from);
         let error_code = data.get("errorCode").and_then(as_i64).map(|n| n as i32);
         let server_injected = getmore_only;
-        let error_labels = data
-            .get_array("errorLabels")
-            .ok()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|b| b.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let error_labels = data.get_array("errorLabels").ok().map(|a| {
+            a.iter()
+                .filter_map(|b| b.as_str().map(String::from))
+                .collect()
+        });
         let write_concern_error = data.get_document("writeConcernError").ok().cloned();
         let close_connection = data.get_bool("closeConnection").unwrap_or(false);
         let block_connection = data.get_bool("blockConnection").unwrap_or(false);
@@ -308,19 +315,80 @@ pub fn is_resumable_change_stream_code(code: i32) -> bool {
     RESUMABLE_CHANGE_STREAM_CODES.contains(&code)
 }
 
+/// Codes that earn `RetryableWriteError` instead of `TransientTransactionError`
+/// when the failure lands on `commitTransaction` or `abortTransaction`.
+///
+/// The transaction label is not one set but two, split by which command failed —
+/// measured on a single-node replica-set mongod 8.2.11 (2026-09-28), with
+/// `commitTransaction` and `abortTransaction` behaving identically:
+///
+/// * a STATEMENT inside a transaction (`autocommit: false`) gets
+///   `TransientTransactionError` for every code in `is_transient_txn_code`;
+/// * a COMMIT or ABORT gets `RetryableWriteError` for the codes below and
+///   `TransientTransactionError` for the remaining five (24 `LockTimeout`,
+///   112 `WriteConflict`, 246 `SnapshotUnavailable`, 251 `NoSuchTransaction`,
+///   267 `PreparedTransactionInProgress`) — the failures that are about the
+///   transaction rather than about reaching the node.
+///
+/// The two lists are disjoint and together are exactly `is_transient_txn_code`.
+/// Telling a driver `TransientTransactionError` here, as this server did until
+/// now, asks it to replay the whole transaction where mongod asks it to retry
+/// just the commit.
+pub const COMMIT_RETRYABLE_WRITE_CODES: &[i32] = &[
+    6,     // HostUnreachable
+    7,     // HostNotFound
+    89,    // NetworkTimeout
+    91,    // ShutdownInProgress
+    134,   // ReadConcernMajorityNotAvailableYet
+    189,   // PrimarySteppedDown
+    262,   // ExceededTimeLimit
+    9001,  // SocketException
+    10107, // NotWritablePrimary
+    11600, // InterruptedAtShutdown
+    11602, // InterruptedDueToReplStateChange
+    13435, // NotPrimaryNoSecondaryOk
+    13436, // NotPrimaryOrSecondary
+];
+
+/// Whether a commit/abort failure with `code` is labelled `RetryableWriteError`.
+pub fn is_commit_retryable_write_code(code: i32) -> bool {
+    COMMIT_RETRYABLE_WRITE_CODES.contains(&code)
+}
+
+/// The `codeName` mongod renders for a `failCommand`-injected code.
+///
+/// Every name here was read off a single-node REPLICA SET mongod 8.2.11 over a
+/// raw OP_MSG socket (2026-09-28) — transactions need a replica set, and a
+/// driver in the path is not safe to probe through: pymongo retries
+/// `commitTransaction` itself and converts the NotPrimary family into a
+/// client-side exception, so two earlier columns measured the driver rather
+/// than the server.
+///
+/// The transaction codes (24 / 112 / 246 / 251 / 267 / 11601) were missing and
+/// fell through to `Location<code>`, which is what made the drivers' spec test
+/// `commitTransaction fails after Interrupted` assert `Interrupted` and get
+/// `Location11601`. 100 was `CannotSatisfyWriteConcern`, a name mongod does not
+/// use in either context — see `write_concern_error`.
 pub fn fail_code_name(code: i32) -> String {
     match code {
         6 => "HostUnreachable",
         7 => "HostNotFound",
+        24 => "LockTimeout",
+        50 => "MaxTimeMSExpired",
         89 => "NetworkTimeout",
         91 => "ShutdownInProgress",
-        100 => "CannotSatisfyWriteConcern",
+        100 => "UnsatisfiableWriteConcern",
+        112 => "WriteConflict",
         134 => "ReadConcernMajorityNotAvailableYet",
         189 => "PrimarySteppedDown",
+        246 => "SnapshotUnavailable",
+        251 => "NoSuchTransaction",
         262 => "ExceededTimeLimit",
+        267 => "PreparedTransactionInProgress",
         9001 => "SocketException",
         10107 => "NotWritablePrimary",
         11600 => "InterruptedAtShutdown",
+        11601 => "Interrupted",
         11602 => "InterruptedDueToReplStateChange",
         13435 => "NotPrimaryNoSecondaryOk",
         13436 => "NotPrimaryOrSecondary",
@@ -458,5 +526,119 @@ mod resume_label_tests {
             Some("old")
         );
         assert_eq!(failpoint_app_name("find", &find, None), None);
+    }
+
+    /// Every row below was read off a single-node REPLICA SET mongod 8.2.11 on
+    /// 2026-09-28, over a raw OP_MSG socket. Both qualifiers matter: transactions
+    /// need a replica set, so the standalone used for most probing in this file
+    /// cannot answer these at all; and a driver in the path is not safe here,
+    /// because pymongo retries `commitTransaction` itself and converts the
+    /// NotPrimary family into a client-side exception whose reply is never read
+    /// — two earlier passes measured the driver and not the server.
+    ///
+    /// The table is the test. If mongod changes a name, this fails and someone
+    /// re-probes; without it the only signal is a driver gauge going red for a
+    /// reason nobody can localise.
+    const MONGOD_8_2_11_FAIL_CODE_NAMES: &[(i32, &str)] = &[
+        (6, "HostUnreachable"),
+        (7, "HostNotFound"),
+        (24, "LockTimeout"),
+        (50, "MaxTimeMSExpired"),
+        (89, "NetworkTimeout"),
+        (91, "ShutdownInProgress"),
+        (100, "UnsatisfiableWriteConcern"),
+        (112, "WriteConflict"),
+        (134, "ReadConcernMajorityNotAvailableYet"),
+        (189, "PrimarySteppedDown"),
+        (246, "SnapshotUnavailable"),
+        (251, "NoSuchTransaction"),
+        (262, "ExceededTimeLimit"),
+        (267, "PreparedTransactionInProgress"),
+        (9001, "SocketException"),
+        (10107, "NotWritablePrimary"),
+        (11600, "InterruptedAtShutdown"),
+        (11601, "Interrupted"),
+        (11602, "InterruptedDueToReplStateChange"),
+        (13435, "NotPrimaryNoSecondaryOk"),
+        (13436, "NotPrimaryOrSecondary"),
+    ];
+
+    #[test]
+    fn fail_code_names_match_the_mongod_probe() {
+        for (code, want) in MONGOD_8_2_11_FAIL_CODE_NAMES {
+            assert_eq!(&fail_code_name(*code), want, "codeName for {code}");
+        }
+    }
+
+    /// `Location<code>` is the fallback for a code mongod has no name for — not
+    /// a licence to let a known name fall through it, which is how the drivers'
+    /// `commitTransaction fails after Interrupted` spec asserted `Interrupted`
+    /// and got `Location11601`.
+    #[test]
+    fn unknown_codes_still_fall_back_to_location() {
+        assert_eq!(fail_code_name(987654), "Location987654");
+        assert_ne!(fail_code_name(11601), "Location11601");
+    }
+
+    /// The commit/abort label split, measured in the same run. The two lists are
+    /// disjoint and together are exactly the transient set, so a code that is
+    /// transient on a STATEMENT is labelled one way or the other when the
+    /// failure lands on the command that ENDS the transaction.
+    #[test]
+    fn commit_retryable_and_transaction_transient_codes_are_disjoint() {
+        for code in [24, 112, 246, 251, 267] {
+            assert!(
+                !is_commit_retryable_write_code(code),
+                "{code} is about the transaction, so commit keeps TransientTransactionError"
+            );
+        }
+        for code in [
+            6, 7, 89, 91, 134, 189, 262, 9001, 10107, 11600, 11602, 13435, 13436,
+        ] {
+            assert!(
+                is_commit_retryable_write_code(code),
+                "{code} is a retryable-write failure, so commit gets RetryableWriteError"
+            );
+        }
+        // Never labelled on commit at all — mongod gives these none.
+        for code in [50, 100, 11601] {
+            assert!(
+                !is_commit_retryable_write_code(code),
+                "{code} earns no label"
+            );
+        }
+    }
+
+    /// An `errorLabels` the failpoint actually supplied is authoritative, and an
+    /// explicit `[]` is a supplied list. Collapsing the two is what made the
+    /// specs' `commitTransaction does not retry error without RetryableWriteError
+    /// label` fail: the server helpfully added a label the test required absent.
+    #[test]
+    fn explicit_error_labels_are_distinguished_from_an_absent_key() {
+        let reg = FailPointRegistry::default();
+        reg.configure(
+            "failCommand",
+            &Bson::String("alwaysOn".into()),
+            &doc! {"failCommands": ["commitTransaction"], "errorCode": 11600_i32,
+            "errorLabels": []},
+        );
+        let m = reg.match_command("commitTransaction", None).unwrap();
+        assert_eq!(
+            m.error_labels.as_deref(),
+            Some(&[][..]),
+            "an explicit [] must survive as Some(empty), not None"
+        );
+
+        let reg = FailPointRegistry::default();
+        reg.configure(
+            "failCommand",
+            &Bson::String("alwaysOn".into()),
+            &doc! {"failCommands": ["commitTransaction"], "errorCode": 11600_i32},
+        );
+        let m = reg.match_command("commitTransaction", None).unwrap();
+        assert!(
+            m.error_labels.is_none(),
+            "an absent key must stay None so the server computes the label"
+        );
     }
 }

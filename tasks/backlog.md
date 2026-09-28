@@ -2960,6 +2960,31 @@ These are explicit non-goals. Don't add them without a reason.
       EXPOSED rather than newly broken. Not attributed to either — it was
       observed from a branch that did not touch this file, and `main` was green
       on `pg-oracle` across the four runs before it.
+- [ ] **OPEN — the PYTHON server cannot tell `errorLabels: []` from an absent
+      `errorLabels`, so it adds a label where mongod adds none (2026-09-28).**
+      `failpoints.py:199` parses the key as
+      `tuple(data.get("errorLabels") or ())`, which collapses "supplied and
+      empty" into "not supplied". mongod treats a supplied list as
+      authoritative — measured over a raw OP_MSG socket on a single-node replica
+      set 8.2.11: injecting 11600 on `commitTransaction` answers
+      `['RetryableWriteError']` with the key omitted and `[]` with it present.
+
+      The Rust server had the identical hole and it is fixed there (an
+      `Option<Vec<String>>` instead of `unwrap_or_default`); Python is untouched
+      because verifying it was out of scope for that slice. The fix is the same
+      one line of parsing plus a guard at the label-append site added by #1585.
+
+      Reproduce with `scratchpad`-style raw wire, not pymongo: the driver retries
+      `commitTransaction` itself and converts the NotPrimary family into a
+      client-side exception, so a pymongo-driven probe measures the driver.
+
+- [ ] **OPEN — neither server sends `errInfo` on a write-concern error
+      (2026-09-28).** mongod's unsatisfiable-write-concern reply carries
+      `errInfo: {writeConcern: {w, wtimeout, provenance}}` alongside the code and
+      message; we send code + codeName + errmsg only. Measured with a `w: 5`
+      write against a single-node replica-set mongod 8.2.11, which answered
+      `provenance: "clientSupplied"`. The `provenance` values (and which of them
+      apply to a surrogate with no config-sourced default) have not been probed.
 
 - [ ] **OPEN — THE tracker for stale gauge numbers. The committed validation
       reports and the live driver panels are stale in DIFFERENT ways, and the
