@@ -3733,6 +3733,26 @@ all match, and so do CREATE INDEX / VIEW and their error surface. What is open:
 
       The `pg_type` row for `json` (114) is present and correct as of
       2026-09-27; only the column identity and the casts are wrong.
+- [ ] **`PARTITION BY` is accepted and SILENTLY IGNORED — needs a decision.**
+      `CREATE TABLE m (...) PARTITION BY RANGE (logdate)` succeeds and produces
+      an ORDINARY table: `relkind` is `r` where PostgreSQL reports `p`, and an
+      INSERT with no matching partition is ACCEPTED where PostgreSQL raises
+      `no partition of relation "m" found for row` (both measured 2026-09-28).
+      The partition key is not stored anywhere.
+
+      This blocks pgjdbc's `partitionedTables`, which asks
+      `getTables(..., {"PARTITIONED TABLE"})` for `relkind = 'p'`. **Do NOT fix
+      it by reporting `p`**: that would tell a client the table routes rows when
+      it does not, which is worse than today's honest "ordinary table". The
+      sibling `partitionedTablesIndex` already passes because `getPrimaryKeys`
+      is answered correctly.
+
+      CLAUDE.md's rule ("prefer a faithful `command not supported` error over a
+      half-implemented feature that silently diverges") argues for REFUSING
+      `PARTITION BY` outright. That is a behaviour change for anyone currently
+      relying on it degrading to a plain table, so it is **Joe's call**, not a
+      bug to fix unilaterally. The alternative is implementing partitioning,
+      which is a feature rather than a fidelity fix.
 - [ ] **`getProcedureColumns` returns nothing for a schema's PROCEDURE.**
       pgjdbc's `getProceduresWithCorrectCatalogAndWithout` asserts
       `getProcedureColumns(null, 'hasprocedures', null, null)` yields 1 row for
@@ -10898,7 +10918,24 @@ shared storage engine or building large new protocol subsystems:
   off the JUnit XML in `vendor/pgjdbc/pgjdbc/build/test-results/test/*.xml`
   rather than eyeballing class totals — the report lists test ids only, and
   attributing a class's failures to the wrong cause once already cost a
-  feature that fixed nothing here. Remaining, largest first:
+  feature that fixed nothing here.
+
+  **`DatabaseMetaDataTest` specifically: 16 failures / 10 distinct as of
+  2026-09-28**, down from 42 / 26, measured across the jdbc2 + jdbc4 + jdbc42
+  copies (194 tests) — not the whole `jdbc2` package the percentage above
+  covers, so the two numbers are not comparable. Ten PRs
+  (#1511 #1517 #1523 #1527 #1533 #1543 #1547 #1579 #1584, plus #1586 for the
+  stale-artifact check that made the measurements trustworthy) closed the
+  tractable half. **Every one of the remaining ten is filed with a reason** —
+  see the `json`/`jsonb`, `PARTITION BY`, `columnPrivileges`,
+  `getProcedureColumns`, `LANGUAGE internal`, `PARALLEL SAFE` and
+  `indoption`/`getIndexInfo` entries in §3 above. Two are marked deliberately
+  NOT worth doing (they need PostgreSQL's ~3,000 builtin `pg_proc` rows), and
+  none of the rest is a cheap metadata fix: they need a feature, a
+  self-describing catalog, or a decision from Joe. Re-measure before planning:
+  a stale artifact silently invalidates any of it.
+
+  Remaining, largest first:
   - **No implicit transaction around a pipelined batch** (64,
     `BatchFailureTest`) — **root cause found, fix written and proven, but it
     cannot ship yet.** Postgres treats every message between two Syncs as one
