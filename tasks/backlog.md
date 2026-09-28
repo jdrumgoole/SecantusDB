@@ -2984,25 +2984,23 @@ These are explicit non-goals. Don't add them without a reason.
       8.2.11 for the exact `errmsg` and the command allowlist before fixing, and
       land it in both servers.
 
-- [ ] **OPEN — two `test_transactions_unified` retry-semantics failures, and the
-      two codes want OPPOSITE treatment (2026-09-27).** The label half of this is
-      FIXED (a failpoint-injected error inside a transaction now carries
-      `TransientTransactionError`, closing all of `TestUnifiedErrorLabels`), and
-      the three secondary-read failures are now an explicit non-goal in section 4.
-      What is left:
+- [x] ~~**Two `test_transactions_unified` retry-semantics failures**~~ **FIXED
+      2026-09-28.** Probed a single-node replica-set mongod 8.2.11 (transactions
+      need one) and the two codes wanted OPPOSITE treatment, exactly as this
+      entry warned: mongod labels `267 PreparedTransactionInProgress`
+      `TransientTransactionError` and gives `11601 Interrupted` NO labels. Adding
+      both to `_TRANSIENT_TXN_CODES`, which was the obvious move, would have made
+      one test green and the other red.
 
-      * `TestUnifiedRetryableCommit::test_commitTransaction_fails_after_Interrupted`
-        — code 11601 `Interrupted`. The test expects the commit to **fail**.
-      * `TestUnifiedCommitTransienttransactionerror_4_2::test_transaction_is_retried_after_commitTransaction_TransientTransactionError_(PreparedTransactionInProgress)`
-        — code 267. The test expects the transaction to be **retried**.
+      267 is now in the set. 11601 stays out, where it already was — so the
+      `Interrupted` test was never a label bug at all. It failed because a
+      failpoint-injected code renders through `_code_name_for`, which had NONE of
+      the transaction / replication codes and fell back to `Location<code>`: the
+      test asserts `errorCodeName: "Interrupted"` and got `Location11601`.
+      Seventeen names were read off the same replica set and added.
 
-      Both codes sit outside `_TRANSIENT_TXN_CODES` (which holds 11600 and 11602
-      but not 11601). **Do not just add them.** One wants retry and one wants
-      failure, so the set is the wrong lever for at least one of the two, and a
-      change that makes one green will make the other red. Probe a single-node
-      REPLICA SET mongod — transactions need one, so a standalone cannot answer
-      this — for the labels it returns per code on `commitTransaction`, and size
-      the fix from that rather than from the test names.
+      `test_transactions_unified` is now at 3 failures, all of them the
+      secondary-read cases recorded as an explicit non-goal in section 4.
 
 - **Driver unified-spec coverage audit (2026-09-25, Python server `0.6.0b16`,
   pymongo tests `f2103a95`, go-driver `fd85a834`).** Measured by running every
