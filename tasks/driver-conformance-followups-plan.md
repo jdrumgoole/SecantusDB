@@ -42,10 +42,11 @@ now the only one: it holds which artifact is stale in which direction, what to
 re-run, the expected numbers, and the unresolved Java-gauge anomaly. Work it
 from there, and delete it when it closes.
 
-In one line, so this plan still reads end to end: do **not** merge PR #1595 --
-it predates #1597 and is stale on arrival -- re-run instead, and note that the
-published rate did not fall from 99.5% to 99.4%; it dipped to 98.7% when 134
-failpoint tests stopped skipping, and is on its way back to ~99.6%.
+In one line, so this plan still reads end to end: the one refresh that existed
+(PR #1595) was closed unmerged because it predated #1597, so this needs a fresh
+run rather than a merge -- and note that the published rate did not fall from
+99.5% to 99.4%; it dipped to 98.7% when 134 failpoint tests stopped skipping,
+and is on its way back to ~99.6%.
 
 ### 2. Port the transaction fixes to Rust -- 10 of Rust's 15, and the whole gap
 

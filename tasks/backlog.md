@@ -2914,8 +2914,9 @@ These are explicit non-goals. Don't add them without a reason.
 ## 5. Known bugs and edge cases to watch
 
 - [ ] **OPEN — THE tracker for stale gauge numbers. The committed validation
-      reports, the live driver panels and the unmerged refresh PR #1595 are each
-      stale in a DIFFERENT way (2026-09-28).** This entry supersedes the shorter
+      reports and the live driver panels are stale in DIFFERENT ways, and the
+      one refresh that existed (PR #1595) was closed unmerged rather than
+      fixing it (2026-09-28).** This entry supersedes the shorter
       version filed by #1599 and is the single place this drift is tracked;
       Step 1 of `tasks/driver-conformance-followups-plan.md` points here rather
       than describing it again.
@@ -2931,10 +2932,11 @@ These are explicit non-goals. Don't add them without a reason.
         PRE-`enableTestCommands`: the rate looks higher than the Python one only
         because 134 failpoint tests were skipping. Do not compare the two numbers
         as they stand.
-      * **Unmerged PR #1595 (`validation-report-20260928`, `60bd8c1b`)** — a bot
-        refresh that has #1582 and #1585 as ancestors but **NOT #1597**; it was
-        opened at 07:17Z and #1597 merged at 08:48Z. It is stale on arrival.
-        **Close it rather than merging it.**
+      * **PR #1595 (`validation-report-20260928`, `60bd8c1b`) — CLOSED unmerged
+        2026-09-28.** A bot refresh that had #1582 and #1585 as ancestors but
+        **NOT #1597**; it was opened at 07:17Z and #1597 merged at 08:48Z, so it
+        was stale on arrival. The branch is left in place (it is the bot's). The
+        reasons are on the PR itself, so a future refresh does not repeat it.
 
       What to do: re-run `invoke validate` (Python) and `./inv validate --server
       rust` at a tree containing `daa855a8`, rebuilding the embedded Rust
