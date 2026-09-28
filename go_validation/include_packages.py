@@ -42,6 +42,24 @@ INCLUDE: list[str] = [
 # are honest gaps not bugs; skipping them keeps the gauge meaningful.
 # Each entry should carry a one-line reason.
 SKIP_PATTERNS: list[str] = [
+    # DNS SRV/TXT resolution against `mongodb.test.build.10gen.cc`. It never
+    # opens a connection to SecantusDB, so it measures nothing about us — and
+    # it HANGS, taking the whole package's 30-minute budget with it.
+    #
+    # That hang is why this gauge reported 100.0% for months over an incomplete
+    # run: `go test` killing itself on `-timeout` panics the binary WITHOUT
+    # emitting terminal events for the tests still in flight, so 481 started
+    # and only 476 ever reported. The summariser divided what it could see and
+    # got a perfect score — a truncated run looks BETTER the more tests go
+    # missing. (An earlier session raised the timeout from 10 to 30 minutes to
+    # stop the kill "corrupting the signal"; that treated the cascade and not
+    # the hang, so the cost went from 10 minutes to 30 and the population
+    # stayed capped.)
+    #
+    # Skipping it costs no coverage — SRV discovery is the driver's own
+    # resolver, not our wire protocol — and recovers ~30 minutes per run plus
+    # the four tests that were merely in flight when the killer fired.
+    "TestInitialDNSSeedlistDiscoverySpec",
     # Real multi-document transactions (commit/abort with rollback)
     # are out of scope per CLAUDE.md. SecantusDB returns {ok:1} from
     # commitTransaction / abortTransaction but does not actually roll
