@@ -543,7 +543,10 @@ def test_ruff_excludes_every_vendored_tree() -> None:
     Every submodule must therefore be covered by `extend-exclude`, or the next
     one added turns the lint gate red for reasons nobody here can fix.
     """
-    import tomllib
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # Python 3.10: tomllib is stdlib only from 3.11
+        import tomli as tomllib  # type: ignore[no-redef]
 
     config = tomllib.loads((REPO / "pyproject.toml").read_text())
     excluded = config["tool"]["ruff"]["extend-exclude"]
