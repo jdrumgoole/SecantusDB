@@ -22,32 +22,30 @@ parallel sessions move this surface, and this file has already been wrong once.
   **It has #1582 and #1585 as ancestors but NOT #1597** -- the PR was opened at
   07:17Z and #1597 landed at 08:48Z. Merging it as-is publishes numbers that
   understate the server by exactly the two tests #1597 closed.
-- **#1599 filed a competing tracker for the same drift.** `tasks/backlog.md` now
-  carries an OPEN item saying the committed reports predate #1582 / #1585 / #1597
-  and prescribing a re-run of `invoke validate` and `invoke validate-java`. That
-  is a different answer to the question Step 1 asks. Close one before working the
-  other; this plan now recommends the re-run (see Step 1).
+- **The gauge-number drift is tracked in `tasks/backlog.md` §5, not here.**
+  #1599 filed a backlog item for it while this plan's Step 1 described the same
+  thing; the two were folded into one tracker, which also turned up the Java
+  gauge turning its whole failure set over between two runs a day apart. Step 1
+  is now a pointer to it.
 - The remaining gap is almost entirely the Rust server trailing the Python one --
   and the shape of it is sharper than the first draft said. See Step 2.
 
 ## Steps, in the order they are now worth doing
 
-### 1. Re-run the pymongo gauge -- do NOT merge the refresh as-is
+### 1. Re-run the gauges -- tracked in `tasks/backlog.md`, not here
 
-- The refresh predates #1597, so it is stale on arrival. Re-run
-  `invoke validate` (Python) and `./inv validate --server rust` at a tree
-  containing `daa855a8`, and publish that instead. Rebuild the embedded Rust
-  extension first (`./inv rust-server-build`) or the Rust run measures old code.
-- **The first draft's release-note line was wrong** and would read as a
-  regression. "99.5% -> 99.4% while 132 more tests pass" compares the
-  **2026-09-21** report to the refresh. What is committed on `main` today is the
-  **2026-09-27** run at **1,195 / 15 / 290 = 98.7%**. Against that, the refresh is
-  **98.7% -> 99.4%, a RISE** -- and a post-#1597 run should land higher still.
-  The honest note is: the rate dipped to 98.7% on 2026-09-27 because 134
-  failpoint tests that used to skip began to run, and the fixes since have taken
-  it back up.
-- Resolves the #1599 backlog item too. Delete that item's line when it lands, and
-  close PR #1595 rather than merging it.
+**Owned by the "THE tracker for stale gauge numbers" item in
+`tasks/backlog.md` §5.** This step used to describe the drift itself, and #1599
+filed a second, shorter description of the same thing in the backlog. Two
+trackers for one problem is how one of them goes stale, so the backlog item is
+now the only one: it holds which artifact is stale in which direction, what to
+re-run, the expected numbers, and the unresolved Java-gauge anomaly. Work it
+from there, and delete it when it closes.
+
+In one line, so this plan still reads end to end: do **not** merge PR #1595 --
+it predates #1597 and is stale on arrival -- re-run instead, and note that the
+published rate did not fall from 99.5% to 99.4%; it dipped to 98.7% when 134
+failpoint tests stopped skipping, and is on its way back to ~99.6%.
 
 ### 2. Port the transaction fixes to Rust -- 10 of Rust's 15, and the whole gap
 
