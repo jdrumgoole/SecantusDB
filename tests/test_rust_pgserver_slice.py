@@ -292,7 +292,10 @@ def test_duplicate_key_reports_what_postgres_reports(home: Path) -> None:
         # has no such operator, so this moved from 0A000 to 42883 rather than
         # becoming legal. It used to return no rows, silently.
         ("SELECT * FROM t WHERE n LIKE 'x'", "42883"),
-        ("SELECT * FROM t ORDER BY n + 1", "0A000"),
+        # `ORDER BY n + 1` is IMPLEMENTED now, so it is no longer a refusal.
+        # `ORDER BY ... USING` still is, and keeps this row exercising the
+        # ORDER BY path rather than losing the coverage entirely.
+        ("SELECT * FROM t ORDER BY n USING <", "0A000"),
         # The PK is the document's `_id`, which storage treats as immutable.
         ("UPDATE t SET id = 2 WHERE id = 1", "0A000"),
         ("UPDATE t SET nope = 1", "42703"),
@@ -10824,8 +10827,13 @@ def test_order_by_a_computed_expression(home: Path) -> None:
         cur = conn.cursor()
         cur.execute("select n from e order by n * -1")
         assert cur.fetchall() == [(3,), (2,), (1,)]
-        cur.execute("select n from e order by upper(a) nulls last")
-        assert cur.fetchall() == [(2,), (1,), (3,)]
+        # `upper('abc')` and `upper('ABC')` are BOTH `'ABC'`, so those two rows
+        # tie and their relative order is not determined by the SQL. An
+        # explicit tiebreaker keeps the assertion about what the clause
+        # actually specifies: the NULL sorts last. The first cut of this test
+        # asserted a tie order copied from the two-key query below, and failed.
+        cur.execute("select n from e order by upper(a) nulls last, n")
+        assert cur.fetchall() == [(1,), (2,), (3,)]
 
 
 def test_order_by_two_expressions_do_not_collide(home: Path) -> None:
