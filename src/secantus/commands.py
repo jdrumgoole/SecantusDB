@@ -1834,7 +1834,20 @@ def _get_parameter(doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
       * ``{getParameter: 1}`` — same as ``"*"`` (legacy form).
     """
     params: dict[str, Any] = {
-        "featureCompatibilityVersion": {"version": "7.0"},
+        # Derived from the version this server already advertises rather than
+        # written out a second time. It read "7.0" until 2026-09-28 while
+        # ``buildInfo`` reported 8.2.11, so the value contradicted the same
+        # server's own handshake and not merely mongod. Measured: a single-node
+        # replica-set mongod 8.2.11 answers ``{"version": "8.2"}`` -- the
+        # major.minor of the running binary.
+        #
+        # Deriving it is the point. As a literal it survived the retarget from
+        # 6.0 to 8.x untouched while every other version surface moved, and
+        # nothing failed, because the only tests that look at this assert the
+        # KEY is present and never read the value.
+        "featureCompatibilityVersion": {
+            "version": f"{SERVER_VERSION_ARRAY[0]}.{SERVER_VERSION_ARRAY[1]}"
+        },
         # True because the test commands drivers gate on ARE implemented --
         # ``configureFailPoint`` above all. pymongo's harness reads this flag
         # and, while it said False, skipped ~1,080 unified-spec failpoint tests
