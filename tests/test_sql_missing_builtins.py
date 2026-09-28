@@ -15,6 +15,8 @@ this diff-against-PostgreSQL sweep is what pays it back.
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from secantus.sql import run_sql
@@ -71,12 +73,91 @@ class TestScale:
 
 
 class TestCbrt:
+    """The expected value is the PLATFORM's libm, not the mathematical ideal.
+
+    PostgreSQL's `dcbrt` is a bare libm `cbrt()` call, so whatever libm answers
+    IS the oracle's answer. libm is not correctly rounded, and the error is not
+    uniform: measured 2026-09-28 by calling `libm.so.6`'s `cbrt` directly
+    through `ctypes` on **glibc 2.39**, `cbrt(27.0)` is `3.0000000000000004`
+    while 8, 64, 125 and 1e6 come out exact; Windows (MSVC) answers exactly
+    `3.0` for the same input, as does macOS.
+
+    So `cbrt(27.0)` has no single right answer across platforms, and the
+    hardcoded `3.0` these assertions used to carry was a Windows/macOS value.
+    It failed on Linux for every Python that has `math.cbrt` (3.11+) and passed
+    on 3.10, whose Newton-refined fallback rounds the ULP away -- which is why
+    only the FULL matrix saw it: a push/PR run tests 3.10 on Linux and nothing
+    else, so this sat red in the weekly cron instead.
+
+    Being *more* exact than libm would move us AWAY from PostgreSQL --
+    `_real_cbrt`'s own docstring says exactly that. So these assert to within
+    one ULP, and `test_we_return_the_platform_libm_value` pins the stronger
+    property that we hand libm's answer straight through.
+    """
+
     @pytest.mark.parametrize(
-        ("expr", "want"),
+        ("expr", "cube"),
         [("8", 2.0), ("27", 3.0), ("-8", -2.0), ("27.0", 3.0), ("1000000::numeric", 100.0)],
     )
-    def test_cube_root(self, db, expr, want):
-        assert db(f"SELECT cbrt({expr})")[0] == [(want,)]
+    def test_cube_root(self, db, expr, cube):
+        """One ULP, with no slack deliberately: glibc sits EXACTLY at the bound
+        for 27.0 (measured -- the difference is `math.ulp(3.0)` to the bit), and
+        1 ULP is libm's documented error for `cbrt`. A platform that exceeded it
+        on a perfect cube would be worth a failure rather than a wider
+        tolerance; the byte-exact property is pinned separately below."""
+        (got,) = db(f"SELECT cbrt({expr})")[0][0]
+        assert abs(got - cube) <= math.ulp(cube), f"{got!r} is more than 1 ULP from {cube!r}"
+
+    def test_we_return_the_platform_libm_value(self, db):
+        """Not merely close to the root -- byte-identical to what libm says.
+
+        This is what stops someone "fixing" the ULP by hand-rolling a
+        correctly-rounded cube root, which would disagree with PostgreSQL on
+        ~8% of inputs. On 3.10 there is no `math.cbrt` and the fallback is
+        deliberately exact on perfect cubes instead (see
+        `test_python_310_fallback`), so the comparison only applies where the
+        real thing is available.
+        """
+        libm_cbrt = getattr(math, "cbrt", None)
+        if libm_cbrt is None:
+            pytest.skip("no math.cbrt before 3.11; the fallback has its own test")
+        for expr, arg in [("27.0", 27.0), ("27", 27.0), ("2", 2.0), ("10", 10.0)]:
+            (got,) = db(f"SELECT cbrt({expr})")[0][0]
+            assert got == libm_cbrt(arg), f"cbrt({expr}) diverged from libm"
+
+    def test_a_one_ulp_libm_is_tolerated(self, db, monkeypatch):
+        """A 1-ULP libm must survive the SQL layer UNROUNDED.
+
+        Substitutes glibc's `cbrt(27.0)` (`3.0000000000000004`) for the
+        platform's, so every machine exercises the value that only Linux
+        produces. What this pins is the PLUMBING: nothing between `_cbrt` and
+        the result row quietly rounds, re-derives or "corrects" libm's answer.
+
+        It deliberately does NOT claim to make a hardcoded `3.0` elsewhere in
+        this class fail on Windows or macOS -- it cannot, because it patches
+        libm only for its own call. The guard against re-hardcoding is
+        `test_we_return_the_platform_libm_value`, which derives the expectation
+        from libm so there is no constant to hardcode. The full matrix remains
+        the only place a platform-specific literal shows up, which is the point
+        of this class's docstring.
+        """
+        from secantus.sql import scalar
+
+        # `scalar.math` IS the math module, so capture the real function before
+        # patching -- referring to `math.cbrt` inside the replacement would
+        # recurse into the patch.
+        original = getattr(math, "cbrt", None)
+        if original is None:
+            pytest.skip("no math.cbrt before 3.11; the fallback has its own test")
+        monkeypatch.setattr(
+            scalar.math,
+            "cbrt",
+            lambda x: 3.0000000000000004 if x == 27.0 else original(x),
+            raising=False,
+        )
+        (got,) = db("SELECT cbrt(27.0)")[0][0]
+        assert got == 3.0000000000000004, "the glibc value must survive the SQL layer unrounded"
+        assert abs(got - 3.0) <= math.ulp(3.0)
 
     def test_python_310_fallback(self, monkeypatch):
         """`math.cbrt` arrived in 3.11 and this package supports 3.10, so there
@@ -99,8 +180,13 @@ class TestCbrt:
     def test_a_numeric_argument_is_not_a_missing_overload(self, db):
         """`cbrt(27.0)` raised TypeError on the Decimal128, which the
         internal-error guard reported as `function cbrt(numeric) does not
-        exist`. It is not missing — it was broken."""
-        assert db("SELECT cbrt(27.0)")[0] == [(3.0,)]
+        exist`. It is not missing — it was broken.
+
+        Asserted to within one ULP for the platform-libm reason in this class's
+        docstring: the point here is that a NUMERIC argument reaches the
+        function at all, not the last bit of the result."""
+        (got,) = db("SELECT cbrt(27.0)")[0][0]
+        assert abs(got - 3.0) <= math.ulp(3.0)
 
 
 class TestJustifyOnATime:
