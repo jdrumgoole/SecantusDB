@@ -606,6 +606,51 @@ pub async fn negotiate_tls<S>(
 /// Process messages on an already-negotiated socket.
 ///
 /// This is the common message processing loop shared by both TCP and Unix sockets.
+/// Cap on how long the read half stays open after the backend has finished.
+///
+/// This is a CEILING, not a delay. The drain ends at the client's EOF, so the
+/// ordinary close -- a `Terminate` and hang-up -- costs nothing measurable,
+/// and a terminated client that comes back, reads its error and disconnects
+/// ends it just as early. Only a client that neither speaks nor hangs up waits
+/// out the full budget.
+///
+/// Five seconds because the window has to cover however long the client sits
+/// before its next round trip, which is unbounded in principle and ~350ms in
+/// the idle-timeout tests (a 150ms server timeout, then half a second before
+/// the client speaks). A first attempt at 250ms was under that and still lost
+/// the error. nginx's `lingering_timeout` defaults to the same 5s for the same
+/// reason.
+const LINGER_DRAIN_MILLIS: u64 = 5_000;
+
+/// End a connection without destroying what the client has not yet read.
+///
+/// **SecantusDB local patch.** Dropping the socket closes it outright, and a
+/// client that writes to a closed socket gets a TCP RST -- which discards
+/// whatever is still sitting unread in ITS receive buffer. When the backend
+/// has just sent a FATAL (`pg_terminate_backend`, an idle timeout) and then
+/// closed, the client's next statement is exactly such a write, so the RST
+/// raced the error: the client saw a bare connection abort with no SQLSTATE
+/// (`Software caused connection abort (10053)` on Windows), and on Linux the
+/// `57P01` surfaced only afterwards, in psycopg's rollback warning.
+///
+/// Closing the SINK shuts the write half down (a FIN), so the client still
+/// reads the error and then a clean EOF. Draining reads afterwards keeps the
+/// socket in that half-open state briefly, so the client's in-flight bytes are
+/// consumed rather than answered with a reset.
+async fn lingering_close<S, C>(socket: &mut Framed<S, C>)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    C: Decoder + Encoder<PgWireBackendMessage> + Unpin,
+{
+    let _ = SinkExt::close(socket).await;
+    let _ = tokio::time::timeout(Duration::from_millis(LINGER_DRAIN_MILLIS), async {
+        // `None` is the client's EOF -- it has closed, so there is nothing
+        // left to reset and no reason to keep waiting.
+        while socket.next().await.is_some() {}
+    })
+    .await;
+}
+
 macro_rules! process_socket_messages {
     ($socket:expr, $startup_timeout:expr, $handlers:expr) => {{
         let startup_handler = $handlers.startup_handler();
@@ -740,6 +785,7 @@ where
     socket.set_state(PgWireConnectionState::AwaitingStartup);
 
     process_socket_messages!(socket, startup_timeout, handlers);
+    lingering_close(&mut socket).await;
     Ok(())
 }
 
@@ -774,6 +820,7 @@ where
     };
 
     process_socket_messages!(socket, startup_timeout, handlers);
+    lingering_close(&mut socket).await;
     Ok(())
 }
 
