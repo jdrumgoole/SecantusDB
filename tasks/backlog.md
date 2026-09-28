@@ -2979,12 +2979,42 @@ These are explicit non-goals. Don't add them without a reason.
       only declared non-goals left, so these came from the other-language
       gauges — which is the argument for running them.
 
-      * **`$geoIntersects` returns nothing.** Java's
-        `GeoJsonFiltersFunctionalSpecification#$geoIntersects` expects four
-        documents (3 points + a polygon) and gets `[]`. `$geoWithin` in the same
-        file passes, so this is narrower than "geo is broken". Reproduce against
-        the Rust server before assuming the query path is at fault — the index
-        picker and the Shapely-equivalent verifier are separate suspects.
+      * **NOT `$geoIntersects` — the operator is correct.** This entry first
+        read "`$geoIntersects` returns nothing", taken from the Java gauge's
+        failure message. That diagnosis is WRONG and was corrected the same day
+        by reproducing it (2026-09-28):
+
+        - Probed against mongod 8.2.11: **0 divergent of 9** across indexed and
+          unindexed, with and without the GeoJSON `crs` member, points-only,
+          polygon-only, and a Point as the query geometry — including the Java
+          test's exact fixture and its `[1, 2, 3, 4]` assertion. Repeated with
+          `--standalone`, which is how the gauge spawns the server: still 0 of 9.
+        - Ran the REAL test class against the Rust server directly
+          (`./gradlew :driver-core:test --tests "*GeoJsonFilters*"
+          -Dorg.mongodb.test.uri=mongodb://127.0.0.1:<port>`): **4 of 4 pass**,
+          `failures="0" errors="0"`, `$geoIntersects` among them.
+
+        So the failure is an INTERACTION inside the full gauge run, not a defect
+        in the operator. It is stable — a second full `validate-java --server
+        rust` reproduced the identical three failures — so it is not a flake
+        either. The two differences left unexplored are the gauge's `--auth`
+        two-phase spawn, and the fact that it runs many test classes against one
+        shared daemon.
+
+        **Start there, not in `secantus-core`'s geo code.** An afternoon spent
+        on `$geoIntersects` would find nothing wrong with it.
+
+        Worth knowing when reading the JUnit XML: it labels the failing testcase
+        `$geoWithin` while the condition in its body is the `$geoIntersects`
+        assertion, so the failure's NAME and its CONTENT disagree.
+
+      * **Two real ordering divergences found while probing the above**, both
+        minor and neither explaining the gauge failure:
+        `$geoIntersects` with no sort returns `[1, 2, 4, 3]` on mongod and
+        `[1, 2, 3, 4]` here (unsorted order carries no guarantee, so this may be
+        nothing); sorting BY the 2dsphere-indexed field gives mongod
+        `[1, 2, 3, 4]` and this server `[3, 2, 1, 4]`, which is a genuine
+        document-sort divergence.
       * **Change-stream resume drops the original read preference.** php-lib's
         `WatchFunctionalTest::testOriginalReadPreferenceIsPreservedOnResume`
         fails `assertTrue`. Single-node, so the read preference has no practical
