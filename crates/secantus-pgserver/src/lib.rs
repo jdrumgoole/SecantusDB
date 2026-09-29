@@ -9037,7 +9037,23 @@ impl PgHandler {
     }
 
     /// `setval(seq, value [, is_called])`.
+    /// `setval`, like `nextval`, is not undone by a rollback.
     fn setval(&self, name: &str, value: i64, called: bool) -> PgWireResult<i64> {
+        if !self.transaction_handle_open() {
+            return self.setval_in_scope(name, value, called);
+        }
+        match self
+            .storage
+            .outside_user_transaction(|| self.setval_in_scope(name, value, called))
+        {
+            Err(PgWireError::UserError(info)) if info.code == "42P01" => {
+                self.setval_in_scope(name, value, called)
+            }
+            other => other,
+        }
+    }
+
+    fn setval_in_scope(&self, name: &str, value: i64, called: bool) -> PgWireResult<i64> {
         let Some(doc) = self.sequence_doc(name)? else {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".into(),
@@ -11063,7 +11079,28 @@ impl PgHandler {
     /// as PostgreSQL's `nextval` reports it. The move is a storage write, so
     /// it rolls back with the transaction -- PostgreSQL never re-issues a
     /// value; this server can.
+    /// `nextval` is NOT transactional in PostgreSQL: a value handed out is
+    /// never handed out again, whether the transaction commits or rolls back.
+    /// So the sequence advances OUTSIDE any open transaction. Every advance
+    /// goes that way, which is also why it cannot conflict with the block's
+    /// own earlier ones. The exception is a sequence the open transaction
+    /// created: it is invisible outside, and rolls back with the block anyway.
     fn nextval(&self, name: &str, count: usize) -> PgWireResult<Vec<i64>> {
+        if !self.transaction_handle_open() {
+            return self.nextval_in_scope(name, count);
+        }
+        match self
+            .storage
+            .outside_user_transaction(|| self.nextval_in_scope(name, count))
+        {
+            Err(PgWireError::UserError(info)) if info.code == "42P01" => {
+                self.nextval_in_scope(name, count)
+            }
+            other => other,
+        }
+    }
+
+    fn nextval_in_scope(&self, name: &str, count: usize) -> PgWireResult<Vec<i64>> {
         let filter = bson::doc! { "_id": name };
         let raw = self
             .storage

@@ -3333,6 +3333,7 @@ fn plan_added_column(cd: &pg_query::protobuf::ColumnDef, params: &[Bson]) -> Res
                 // An expression default is evaluated per EXISTING row by the
                 // executor's rewrite -- `gen_random_uuid()` gives each row its
                 // own, as PostgreSQL does -- and per inserted row after.
+                check_default_type(&column, raw)?;
                 match default_value_or_expr(raw, &ty, params)? {
                     DefaultSpec::Value(v) => {
                         column.default = Some(v);
@@ -4360,6 +4361,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                             // So a volatile one -- or one the constant
                             // evaluator cannot fold -- is kept as its SQL and
                             // evaluated per INSERTed row by the executor.
+                            check_default_type(&column, raw)?;
                             match default_value_or_expr(raw, &underlying, &[])? {
                                 DefaultSpec::Value(v) => {
                                     column.default = Some(v);
@@ -5178,6 +5180,19 @@ fn declared_expression_type(node: &pg_query::protobuf::Node) -> Option<String> {
         N::AConst(c) if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Boolval(_))) => {
             Some("bool".to_string())
         }
+        // A number literal is typed, not unknown: `values (42)` into a
+        // `jsonb` column is 42804, as it is on PostgreSQL.
+        N::AConst(c) if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Ival(_))) => {
+            Some("int4".to_string())
+        }
+        N::AConst(c) => match c.val.as_ref() {
+            Some(pg_query::protobuf::a_const::Val::Fval(f)) => Some(match fval_integer(&f.fval) {
+                Some(Bson::Int32(_)) => "int4".to_string(),
+                Some(_) => "int8".to_string(),
+                None => "numeric".to_string(),
+            }),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -5218,19 +5233,63 @@ fn check_assignment_type(column: &Column, node: &pg_query::protobuf::Node) -> Re
     let Some(from) = declared_expression_type(node) else {
         return Ok(());
     };
+    assignable(column, &from, "expression")
+}
+
+/// A column DEFAULT must be assignable to its column, typed by the
+/// expression's static type (`int default now()` is 42804).
+fn check_default_type(column: &Column, node: &pg_query::protobuf::Node) -> Result<()> {
+    let from = match node.node.as_ref() {
+        Some(N::AConst(c)) if c.isnull => return Ok(()),
+        Some(N::AConst(c)) if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) => {
+            return Ok(())
+        }
+        _ => declared_expression_type(node).unwrap_or_else(|| static_type(node, &Bson::Null)),
+    };
+    if from == "text" && !matches!(node.node.as_ref(), Some(N::TypeCast(_))) {
+        // A value-derived `text` says nothing about the expression's type.
+        return Ok(());
+    }
+    assignable(column, &from, "default expression")
+}
+
+fn assignable(column: &Column, from: &str, what: &str) -> Result<()> {
+    let from = from.to_string();
     let to = column.pg_type.as_str();
     let (from_s, to_s) = (display_type(&from), display_type(to));
+    // pg_cast's assignment-or-implicit casts, by family: a pair in two
+    // DIFFERENT known families has no assignment cast (`int -> jsonb`,
+    // `date -> int`), while a type outside the table is given the benefit
+    // of the doubt rather than a false 42804.
+    let family = |t: &str| -> Option<u8> {
+        let t = t.strip_suffix("[]").map_or(t, |_| "");
+        Some(match t {
+            "int2" | "int4" | "int8" | "numeric" | "float4" | "float8" | "decimal" | "real"
+            | "integer" | "smallint" | "bigint" | "double precision" | "oid" => 1,
+            "date" | "timestamp" | "timestamptz" => 2,
+            "time" | "timetz" | "interval" => 3,
+            "json" | "jsonb" => 4,
+            "bit" | "varbit" => 5,
+            "inet" | "cidr" => 6,
+            "bool" | "boolean" => 7,
+            "uuid" => 8,
+            "bytea" => 9,
+            _ => return None,
+        })
+    };
+    let cross_family = matches!((family(&from), family(to)), (Some(a), Some(b)) if a != b);
     let allowed = from_s == to_s
         || from == "unknown"
         || is_string_type(to)
         || !(is_string_type(&from)
+            || cross_family
             || (is_boolean_type(&from) && is_integer_type(to))
             || (is_integer_type(&from) && is_boolean_type(to)));
     if allowed {
         return Ok(());
     }
     Err(Error::DatatypeMismatch(format!(
-        "column \"{}\" is of type {to_s} but expression is of type {from_s}",
+        "column \"{}\" is of type {to_s} but {what} is of type {from_s}",
         column.name
     )))
 }
@@ -7414,10 +7473,16 @@ pub fn apply_row_expr(expr: &ColumnExpr, row: &Document) -> Result<Bson> {
     };
     let mut all = params.clone();
     all.extend(fields.iter().enumerate().map(|(i, (_, f, _))| {
-        pad_bpchar(
-            row.get(f).cloned().unwrap_or(Bson::Null),
-            widths.get(i).copied().flatten(),
-        )
+        let v = row.get(f).cloned().unwrap_or(Bson::Null);
+        // A stored timestamp keeps its sub-millisecond digits in a hidden
+        // companion; an expression over the column must see them too.
+        let v = match (&v, row.get(&companion_field(f))) {
+            (Bson::DateTime(_), Some(Bson::Int32(us))) if *us != 0 => {
+                Bson::Document(doc! { COMPOSITE_DATE: v.clone(), COMPOSITE_US: *us })
+            }
+            _ => v,
+        };
+        pad_bpchar(v, widths.get(i).copied().flatten())
     }));
     let previous = declare_row_fields(params.len(), fields);
     let out = const_value(expr, &all);
@@ -11914,8 +11979,12 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
                     continue;
                 }
                 // A bare NULL literal contributes nothing either: `array[null,
-                // 1]` is `int4[]` on PostgreSQL.
-                if matches!(element.node.as_ref(), Some(N::AConst(c)) if c.isnull) {
+                // 1]` is `int4[]` on PostgreSQL -- and nor does an untyped
+                // string literal, which takes the typed elements' type
+                // (`array[1, '2']` is `int4[]`).
+                if matches!(element.node.as_ref(), Some(N::AConst(c))
+                    if c.isnull || matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))))
+                {
                     continue;
                 }
                 let t = static_type(element, value);
@@ -11937,6 +12006,12 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
                 // type name at all and fell back to varchar).
                 Some(t) if t.ends_with("[]") => t,
                 Some(t) => format!("{t}[]"),
+                // Only untyped literals: they are `text` then.
+                None if a.elements.iter().any(|e| matches!(e.node.as_ref(), Some(N::AConst(c))
+                    if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))))) =>
+                {
+                    "text[]".to_string()
+                }
                 None => inferred_type(value).to_string(),
             }
         }
@@ -11995,6 +12070,7 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
         Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("pg_typeof") => {
             "regtype".to_string()
         }
+        Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("pg_sleep") => "void".to_string(),
         Some(N::FuncCall(f))
             if func_name(f).is_some_and(|n| n.starts_with("has_") && n.ends_with("_privilege")) =>
         {
@@ -12400,6 +12476,91 @@ fn bit_function_type(f: &pg_query::protobuf::FuncCall, name: &str) -> Option<Str
     }
     // `set_bit` / `substring` / `overlay` answer the argument's own type.
     Some(if t == "varbit" { first } else { t.to_string() })
+}
+
+/// A `box` operator over `[high x, high y, low x, low y]` corners, with
+/// PostgreSQL's fuzzy float comparisons (`EPSILON` = 1e-6).
+fn box_operator(op: &str, a: &[f64; 4], b: &[f64; 4]) -> Result<Bson> {
+    const EPS: f64 = 1.0e-6;
+    let eq = |x: f64, y: f64| x == y || (x - y).abs() <= EPS;
+    let lt = |x: f64, y: f64| y - x > EPS;
+    let le = |x: f64, y: f64| x - y <= EPS;
+    let gt = |x: f64, y: f64| x - y > EPS;
+    let ge = |x: f64, y: f64| y - x <= EPS;
+    let area = |c: &[f64; 4]| (c[0] - c[2]) * (c[1] - c[3]);
+    let (aa, ab) = (area(a), area(b));
+    let v = match op {
+        "=" => eq(aa, ab),
+        "<" => lt(aa, ab),
+        "<=" => le(aa, ab),
+        ">" => gt(aa, ab),
+        ">=" => ge(aa, ab),
+        "~=" => (0..4).all(|i| eq(a[i], b[i])),
+        "&&" => ge(a[0], b[2]) && ge(b[0], a[2]) && ge(a[1], b[3]) && ge(b[1], a[3]),
+        "@>" => ge(a[0], b[0]) && le(a[2], b[2]) && ge(a[1], b[1]) && le(a[3], b[3]),
+        "<@" => ge(b[0], a[0]) && le(b[2], a[2]) && ge(b[1], a[1]) && le(b[3], a[3]),
+        "<<" => lt(a[0], b[2]),
+        ">>" => gt(a[2], b[0]),
+        "&<" => le(a[0], b[0]),
+        "&>" => ge(a[2], b[2]),
+        "<<|" => lt(a[1], b[3]),
+        "|>>" => gt(a[3], b[1]),
+        "&<|" => le(a[1], b[1]),
+        "|&>" => ge(a[3], b[3]),
+        other => {
+            return Err(Error::UndefinedFunction(format!(
+                "operator does not exist: box {other} box"
+            )))
+        }
+    };
+    Ok(Bson::Boolean(v))
+}
+
+/// `anyarray` operators need ONE array type on both sides: `int4[] @>
+/// int2[]` is 42883 in PostgreSQL, with no implicit cast between array types.
+/// `Some(error)` when both operands are statically arrays of different
+/// element types; an untyped literal (`'{1}'`) takes the other side's type.
+fn array_operand_mismatch(e: &AExpr, def: Option<&TableDef>) -> Option<Error> {
+    let op = operator_name(e).ok()?;
+    if !matches!(op, "@>" | "<@" | "&&" | "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
+        return None;
+    }
+    let ty = |n: &pg_query::protobuf::Node| -> String {
+        if let (Some(N::ColumnRef(c)), Some(def)) = (n.node.as_ref(), def) {
+            if let Some(col) = column_ref_name(c).and_then(|name| def.column(&name).cloned()) {
+                return col.pg_type;
+            }
+        }
+        static_type(n, &Bson::Null)
+    };
+    let norm = |t: &str| -> String {
+        let base = t.strip_suffix("[]").unwrap_or(t);
+        let base = match base {
+            "integer" | "int" => "int4",
+            "smallint" => "int2",
+            "bigint" => "int8",
+            "real" => "float4",
+            "double precision" | "double" => "float8",
+            "decimal" => "numeric",
+            "character varying" => "varchar",
+            "boolean" => "bool",
+            other => other,
+        };
+        format!("{base}[]")
+    };
+    let (l, r) = (ty(e.lexpr.as_deref()?), ty(e.rexpr.as_deref()?));
+    if !l.ends_with("[]") || !r.ends_with("[]") || unknown_operand(e.lexpr.as_deref()) || unknown_operand(e.rexpr.as_deref()) {
+        return None;
+    }
+    let (nl, nr) = (norm(&l), norm(&r));
+    if nl == nr {
+        return None;
+    }
+    Some(Error::UndefinedFunction(format!(
+        "operator does not exist: {} {op} {}",
+        display_type(&nl),
+        display_type(&nr)
+    )))
 }
 
 /// A CASE's result expressions: every THEN, and the ELSE.
@@ -17738,7 +17899,18 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
                     .to_ascii_lowercase(),
             ))
         }
-        other => Err(Error::Unsupported(format!("a cast to {other}"))),
+        // A name no catalog knows is PostgreSQL's 42704; only a REAL type
+        // this server has no cast arm for is the honest 0A000.
+        other => {
+            let base = other.strip_suffix("[]").unwrap_or(other);
+            if pgtypes::oid_of_name(base).is_none()
+                && user_type_oid(base).is_none()
+                && user_composite(base).is_none()
+            {
+                return Err(Error::UndefinedObject(format!("type \"{base}\" does not exist")));
+            }
+            Err(Error::Unsupported(format!("a cast to {other}")))
+        }
     }
 }
 
@@ -19024,6 +19196,11 @@ fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
     // NULL propagates through every operator here (PG: `1 + NULL` is NULL).
     if lhs == Bson::Null || rhs == Bson::Null {
         return Ok(Bson::Null);
+    }
+    // box operators (`geo_ops.c`): equality and ordering compare AREAS within
+    // EPSILON, `~=` compares corners, the rest are positional.
+    if let (Some(a), Some(b)) = (geo::box_coords(&lhs), geo::box_coords(&rhs)) {
+        return box_operator(op, &a, &b);
     }
     // `^` is `power()` under another name: `numeric_power` over numerics,
     // `dpow` (float8) otherwise -- there is no integer `^`.
@@ -20707,6 +20884,20 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
         if func_name(f).as_deref() == Some("pg_typeof") {
             return pg_typeof(f, params);
         }
+        // `pg_sleep` inside an expression: `void`, which is the empty string
+        // and NOT NULL (`pg_sleep(0) IS NULL` is false). It waits only in the
+        // plan that executes -- a Describe must not sleep.
+        if func_name(f).as_deref() == Some("pg_sleep") && f.args.len() == 1 {
+            let secs = match cast_value(const_value(&f.args[0], params)?, "float8")? {
+                Bson::Null => return Ok(Bson::Null),
+                Bson::Double(d) => d,
+                _ => 0.0,
+            };
+            if secs > 0.0 && secs.is_finite() && PLANNING_TO_EXECUTE.with(|p| p.get()) {
+                std::thread::sleep(std::time::Duration::from_secs_f64(secs.min(3600.0)));
+            }
+            return Ok(Bson::String(String::new()));
+        }
         // `to_regclass(text)`: the relation's regclass, or NULL when there is
         // none -- the `::regclass` cast without its 42P01.
         if func_name(f).as_deref() == Some("to_regclass") {
@@ -21002,6 +21193,44 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                     .into(),
             ));
         }
+        // Nested ARRAY[...]s must agree on their type: there is no cast
+        // between array types (`array[[1,2],['3','4']]` is 42846).
+        let subs: Vec<String> = a
+            .elements
+            .iter()
+            .zip(&items)
+            .filter(|(n, _)| matches!(n.node.as_ref(), Some(N::AArrayExpr(_))))
+            .map(|(n, v)| static_type(n, v))
+            .collect();
+        if let Some(first) = subs.first() {
+            if let Some(other) = subs.iter().find(|t| *t != first) {
+                return Err(Error::CannotCoerce(format!(
+                    "ARRAY could not convert type {} to {}",
+                    display_type(other),
+                    display_type(first)
+                )));
+            }
+        }
+        // Every element takes the array's element type: an untyped literal
+        // is parsed as it (`array[1, 'a']` is 22P02, not a NULL), and a
+        // narrower number widens (`array[1, 2.5]` holds the numeric 1).
+        let array_type = static_type(node, &Bson::Array(items.clone()));
+        let element = array_type.strip_suffix("[]").unwrap_or("").to_string();
+        let items = items
+            .into_iter()
+            .zip(&a.elements)
+            .map(|(v, n)| {
+                if v == Bson::Null || matches!(v, Bson::Array(_)) || element.is_empty() || element == "text" {
+                    return Ok(v);
+                }
+                let untyped = matches!(n.node.as_ref(), Some(N::AConst(c))
+                    if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))));
+                if untyped {
+                    return cast_value(v, &element);
+                }
+                to_common_type(v, &element)
+            })
+            .collect::<Result<Vec<_>>>()?;
         return Ok(Bson::Array(items));
     }
     // `a AND b`, `a OR b`, `NOT a` as a VALUE (`select 1 = 1 and 2 = 2`),
@@ -21401,6 +21630,34 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
         // The array containment operators. Told apart from the json ones
         // above by the operands being arrays -- a json value is a string here,
         // so the two never both match.
+        if let Some(err) = array_operand_mismatch(e, None) {
+            return Err(err);
+        }
+        // An untyped literal beside an array IS that array type: `array[1,2]
+        // @> '{1}'` reads `'{1}'` as `int4[]`.
+        let (lhs, rhs) = if matches!(op.as_str(), "@>" | "<@" | "&&") {
+            let as_array_of = |other: &pg_query::protobuf::Node, ov: &Bson, v: Bson| -> Result<Bson> {
+                let t = static_type(other, ov);
+                if t.ends_with("[]") {
+                    cast_value(v, &t)
+                } else {
+                    Ok(v)
+                }
+            };
+            match (e.lexpr.as_deref(), e.rexpr.as_deref()) {
+                (Some(l), Some(_)) if matches!(lhs, Bson::String(_)) && matches!(rhs, Bson::Array(_)) && unknown_operand(e.lexpr.as_deref()) => {
+                    let r_node = e.rexpr.as_deref().expect("checked");
+                    let _ = l;
+                    (as_array_of(r_node, &rhs, lhs)?, rhs)
+                }
+                (Some(l), Some(_)) if matches!(rhs, Bson::String(_)) && matches!(lhs, Bson::Array(_)) && unknown_operand(e.rexpr.as_deref()) => {
+                    (lhs.clone(), as_array_of(l, &lhs, rhs)?)
+                }
+                _ => (lhs, rhs),
+            }
+        } else {
+            (lhs, rhs)
+        };
         if matches!(op.as_str(), "@>" | "<@" | "&&")
             && (matches!(lhs, Bson::Array(_)) || matches!(rhs, Bson::Array(_)))
         {
@@ -21998,6 +22255,9 @@ fn lower_pattern_match(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Doc
 }
 
 fn lower_aexpr(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
+    if let Some(err) = array_operand_mismatch(e, Some(def)) {
+        return Err(err);
+    }
     // Named enum, never the wire integer. Written against the integers first,
     // this had `Op = 0` (it is 1, so every plain `=` was refused) and
     // `Between = 10` (it is 11, so BETWEEN silently ran the NOT BETWEEN arm and
