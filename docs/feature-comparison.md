@@ -252,10 +252,25 @@ still returns a generic `BadValue` for the `$project` case).
 
 ## Beyond MongoDB: the SQL/PostgreSQL frontend
 
-The Python server also speaks the **PostgreSQL wire protocol**
-(`secantusd-py-pg`) against the same WiredTiger data — `psql`, psycopg, or
-SQLAlchemy connect to the same store MongoDB clients use. See
-[SQL / PostgreSQL interface](sql.md).
+**There are TWO PostgreSQL servers, and only one of them is in the table
+below.** The Python server speaks the PostgreSQL wire protocol as
+`secantusd-py-pg`, and the Rust one as **`secantusd-pg`** — both against the
+same WiredTiger data, so `psql`, psycopg or SQLAlchemy connect to the store
+MongoDB clients use. See [SQL / PostgreSQL interface](sql.md).
+
+The **"Rust server" column below is the Rust MONGODB server** (`secantusd-rs`),
+which speaks no SQL — so its ❌ is about that binary, not about the Rust side.
+`secantusd-pg` is a separate deliverable with its own version line and is not
+represented here.
+
+What `secantusd-pg` does, measured rather than claimed (2026-09-29): psycopg
+3's own unmodified suite runs against it with **5,544 passed and none failed**
+(149 skipped, 58 deselected, 34 xfailed), and the differential corpora in
+`tools/probes/pg_corpora/` compare its answers to a live PostgreSQL 14.13. Subqueries and CTEs, window functions,
+`ALTER TABLE`, sequences and identity columns, and `information_schema` all
+landed on 2026-09-28. `CREATE INDEX`, `CREATE VIEW`, `EXPLAIN` and correlated
+subqueries are still refused, by name; `tasks/backlog.md` carries the measured
+remainder.
 
 | Feature | MongoDB | Python server | Rust server |
 | --- | --- | --- | --- |

@@ -33,6 +33,25 @@ Two rules that the 2026-09-03 sweeps paid for:
   oid 25, `LIKE ... ESCAPE` sent a boolean as `'t'`, a window `sum(int4)`
   declared int4 where PG promotes to int8.
 
+Two more the 2026-09-28 sweeps paid for, both about the CORPUS rather than the
+server:
+
+- **A corpus that agrees completely is evidence about the shapes it holds and
+  nothing else.** Two window corpora totalling 75 lines matched PostgreSQL
+  exactly while a `RANGE` frame whose bounds sat on ONE side of the current row
+  — `RANGE BETWEEN 1 FOLLOWING AND 20 FOLLOWING` — returned the whole partition
+  on every row. Neither corpus contained such a frame. The cheap way to find
+  what a corpus is blind to is to name the axes it varies (here: which side
+  each bound falls on) and write the combinations it skipped.
+- **Make the `.setup.sql` drop everything the corpus creates, on the REFERENCE
+  server too.** `sequences.setup.sql` never dropped its identity tables, so
+  PostgreSQL accumulated them run over run: `CREATE TABLE idt11` answered
+  `42P07` and a `count(*)` grew by three each time. Four scenarios were
+  comparing against that debris. A stray table left under a name a later
+  corpus reuses does the same thing — a `w1` table made `CREATE SEQUENCE w1`
+  answer `42P07` and four more lines vacuous. Both read as divergences, and
+  neither is.
+
 **Check `SHOW lc_ctype` before believing a case-mapping difference.** This box's
 PostgreSQL runs the `C` locale and does not case-map non-ASCII at all
 (`upper('é')` is `é`), so several apparent `initcap` / `upper` bugs are locale
