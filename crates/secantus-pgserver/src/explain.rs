@@ -164,7 +164,10 @@ pub(crate) fn plan_tree(stmt: &Statement, scan: &ScanChooser<'_>) -> PlanNode {
 
 /// A join's key names are `alias<US>column`; a plan names only the alias.
 fn display_alias(name: &str) -> String {
-    name.split(secantus_pgplan::joins::SEP).next().unwrap_or(name).to_string()
+    name.split(secantus_pgplan::joins::SEP)
+        .next()
+        .unwrap_or(name)
+        .to_string()
 }
 
 fn table_scan(table: &str, filter: &Document, scan: &ScanChooser<'_>) -> PlanNode {
@@ -182,6 +185,7 @@ fn table_scan(table: &str, filter: &Document, scan: &ScanChooser<'_>) -> PlanNod
 
 fn join_tree(node: &JoinNode, scan: &ScanChooser<'_>) -> PlanNode {
     match node {
+        JoinNode::Lateral { .. } => PlanNode::new("Function Scan"),
         JoinNode::Leaf { plan, def, .. } => {
             let mut n = plan_tree(plan, scan);
             if n.name == "Result" && !def.name.is_empty() {
@@ -224,9 +228,19 @@ const ZERO_COSTS: &str = "  (cost=0.00..0.00 rows=0 width=0)";
 
 /// The `QUERY PLAN` text rows, PostgreSQL's layout: a child at depth d is
 /// `2 + 6(d-1)` spaces and `->  `, and a node's details sit at `2 + 6d`.
-pub(crate) fn render_text(root: &PlanNode, options: &ExplainOptions, actual_rows: Option<usize>) -> Vec<String> {
+pub(crate) fn render_text(
+    root: &PlanNode,
+    options: &ExplainOptions,
+    actual_rows: Option<usize>,
+) -> Vec<String> {
     let mut out = Vec::new();
-    fn walk(n: &PlanNode, depth: usize, options: &ExplainOptions, actual: Option<usize>, out: &mut Vec<String>) {
+    fn walk(
+        n: &PlanNode,
+        depth: usize,
+        options: &ExplainOptions,
+        actual: Option<usize>,
+        out: &mut Vec<String>,
+    ) {
         let mut header = if depth == 0 {
             n.name.clone()
         } else {
@@ -256,8 +270,16 @@ pub(crate) fn render_text(root: &PlanNode, options: &ExplainOptions, actual_rows
 
 /// The `QUERY PLAN` as PostgreSQL's `FORMAT JSON`: one array holding one
 /// object whose `Plan` is the tree.
-pub(crate) fn render_json(root: &PlanNode, options: &ExplainOptions, actual_rows: Option<usize>) -> String {
-    fn node(n: &PlanNode, options: &ExplainOptions, actual: Option<usize>) -> serde_json_lite::Value {
+pub(crate) fn render_json(
+    root: &PlanNode,
+    options: &ExplainOptions,
+    actual_rows: Option<usize>,
+) -> String {
+    fn node(
+        n: &PlanNode,
+        options: &ExplainOptions,
+        actual: Option<usize>,
+    ) -> serde_json_lite::Value {
         let mut fields: Vec<(String, serde_json_lite::Value)> = Vec::new();
         let node_type = n
             .name
@@ -275,7 +297,9 @@ pub(crate) fn render_json(root: &PlanNode, options: &ExplainOptions, actual_rows
         for (k, v) in &n.details {
             let value = if k.ends_with("Key") {
                 serde_json_lite::Value::Arr(
-                    v.split(", ").map(|s| serde_json_lite::Value::Str(s.to_string())).collect(),
+                    v.split(", ")
+                        .map(|s| serde_json_lite::Value::Str(s.to_string()))
+                        .collect(),
                 )
             } else {
                 serde_json_lite::Value::Str(v.clone())
@@ -291,21 +315,35 @@ pub(crate) fn render_json(root: &PlanNode, options: &ExplainOptions, actual_rows
             }
         }
         if let Some(rows) = actual {
-            fields.push(("Actual Rows".into(), serde_json_lite::Value::Num(rows.to_string())));
-            fields.push(("Actual Loops".into(), serde_json_lite::Value::Num("1".into())));
+            fields.push((
+                "Actual Rows".into(),
+                serde_json_lite::Value::Num(rows.to_string()),
+            ));
+            fields.push((
+                "Actual Loops".into(),
+                serde_json_lite::Value::Num("1".into()),
+            ));
         }
         if !n.children.is_empty() {
             fields.push((
                 "Plans".into(),
-                serde_json_lite::Value::Arr(n.children.iter().map(|c| node(c, options, None)).collect()),
+                serde_json_lite::Value::Arr(
+                    n.children.iter().map(|c| node(c, options, None)).collect(),
+                ),
             ));
         }
         serde_json_lite::Value::Obj(fields)
     }
     let mut top = vec![("Plan".to_string(), node(root, options, actual_rows))];
     if actual_rows.is_some() {
-        top.push(("Planning Time".into(), serde_json_lite::Value::Num("0.000".into())));
-        top.push(("Execution Time".into(), serde_json_lite::Value::Num("0.000".into())));
+        top.push((
+            "Planning Time".into(),
+            serde_json_lite::Value::Num("0.000".into()),
+        ));
+        top.push((
+            "Execution Time".into(),
+            serde_json_lite::Value::Num("0.000".into()),
+        ));
     }
     serde_json_lite::Value::Arr(vec![serde_json_lite::Value::Obj(top)]).pretty(0)
 }

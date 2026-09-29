@@ -106,7 +106,7 @@ fn null_const() -> pg_query::protobuf::Node {
 /// Visit every expression node of a SELECT at every level -- its clauses,
 /// its JOIN conditions, its FROM-subqueries, its CTEs, the sides of a set
 /// operation, and the bodies of the subqueries inside its expressions.
-fn walk_select(
+pub(crate) fn walk_select(
     s: &mut pg_query::protobuf::SelectStmt,
     visit: &mut dyn FnMut(&mut pg_query::protobuf::Node) -> Result<()>,
 ) -> Result<()> {
@@ -189,6 +189,18 @@ fn walk_from(
                 Some(N::SelectStmt(body)) => walk_select(body, visit),
                 _ => Ok(()),
             }
+        }
+        // A function in FROM: its argument expressions can read columns (of
+        // an enclosing query, or -- LATERAL -- of the items to its left).
+        Some(N::RangeFunction(rf)) => {
+            for f in &mut rf.functions {
+                if let Some(N::List(l)) = f.node.as_mut() {
+                    for item in &mut l.items {
+                        walk_expr(item, visit)?;
+                    }
+                }
+            }
+            Ok(())
         }
         _ => Ok(()),
     }

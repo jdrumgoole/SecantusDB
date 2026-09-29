@@ -7020,18 +7020,14 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       * **`unnest` over a multidimensional array yields its LEAVES**, row-major
         -- four rows for `ARRAY[[1,2],[3,4]]`, not two.
 
-      **STILL OPEN, and it is the hard half**: a set-returning function in the
-      SELECT LIST over a COLUMN -- `SELECT unnest(ia) FROM t` -- which changes
-      row cardinality mid-pipeline rather than supplying the source. That one
-      case is the whole remaining `srf` divergence, one of four in `arrays`,
-      and both of the SRF lines in `strings` (where the call sits beside a
-      scalar column, which is the same problem).
-
-      **`lateral_srf` did NOT move, contrary to the estimate that opened this
-      work.** Its nine cases are `LATERAL` forms -- a function in FROM that
-      references the row to its left -- and they refuse with `this JOIN side`
-      rather than anything SRF-shaped. LATERAL needs correlation machinery,
-      not a materialised source. Do not fold it into an SRF estimate again.
+      **The hard half landed too (2026-09-29): LATERAL, and a set-returning
+      function over a column in the select list.** A LATERAL item is SQL re-run
+      per left row with that row's values bound as typed `$N` parameters
+      (`joins::lateral_leaf`), and `SELECT unnest(ia) FROM t` is rewritten to
+      the lateral join it means (`joins::select_list_srf`). `lateral_srf` 9 ->
+      0, `srf` 1 -> 0, `arrays` 4 -> 1, `strings` 7 -> 1. SEVERAL set-returning
+      functions in one select list are refused by name: PostgreSQL runs those
+      in lockstep, which a join would get silently wrong.
 
       **The RUST PG server's STRING surface landed 2026-09-29** (`strings`
       corpus 18 divergences of 35 -> 8, new `strings2` corpus 27 -> 0, and

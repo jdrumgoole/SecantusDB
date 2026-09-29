@@ -884,7 +884,13 @@ pub struct PgHandler {
     session_lastval: Mutex<Option<i64>>,
     /// A password login in progress: the role, its stored credentials, and --
     /// once the client's first SASL message arrived -- the SCRAM exchange.
-    auth: Mutex<Option<(String, secantus_auth::StoredCredentials, Option<secantus_auth::ScramState>)>>,
+    auth: Mutex<
+        Option<(
+            String,
+            secantus_auth::StoredCredentials,
+            Option<secantus_auth::ScramState>,
+        )>,
+    >,
     /// User TYPES created or dropped in the open transaction but not yet
     /// committed -- the type analogue of `uncommitted`. Planning reads the
     /// type catalog (`to_regtype`, a column's declared type), and an
@@ -2316,6 +2322,11 @@ impl PgHandler {
     fn join_rows(&self, node: &secantus_pgplan::joins::JoinNode) -> PgWireResult<Vec<Document>> {
         use secantus_pgplan::joins::{JoinKind, JoinNode};
         match node {
+            // A LATERAL item only ever sits on a join's right; alone, with
+            // nothing to its left, it was planned as an ordinary leaf.
+            JoinNode::Lateral { .. } => Err(Self::err(&PlanError::Internal(
+                "a LATERAL item with no left side".into(),
+            ))),
             JoinNode::Leaf { plan, def, columns } => {
                 let docs = self.materialise_sub(plan, def)?;
                 Ok(docs
@@ -2340,6 +2351,26 @@ impl PgHandler {
                 right_keys,
             } => {
                 let lrows = self.join_rows(left)?;
+                if let JoinNode::Lateral {
+                    sql,
+                    params,
+                    keys,
+                    columns,
+                } = right.as_ref()
+                {
+                    return self.lateral_rows(
+                        &lrows,
+                        sql,
+                        params,
+                        keys,
+                        columns,
+                        *kind,
+                        on.as_ref(),
+                        merged,
+                        left_keys,
+                        right_keys,
+                    );
+                }
                 let rrows = self.join_rows(right)?;
                 let combine = |l: Option<&Document>, r: Option<&Document>| -> Document {
                     let mut d = Document::new();
@@ -2491,6 +2522,105 @@ impl PgHandler {
         } else {
             bson::doc! { "$and": [filter.clone(), by_id] }
         })
+    }
+
+    /// A join whose right side is LATERAL: its SQL is run once per distinct
+    /// left row, with that row's values bound past the statement's own
+    /// parameters, and each result row joined to it. A LEFT join keeps a
+    /// left row the item produced nothing for.
+    #[allow(clippy::too_many_arguments)]
+    fn lateral_rows(
+        &self,
+        lrows: &[Document],
+        sql: &str,
+        params: &[Bson],
+        keys: &[String],
+        columns: &[(String, usize)],
+        kind: secantus_pgplan::joins::JoinKind,
+        on: Option<&secantus_pgplan::ColumnExpr>,
+        merged: &[(String, String, String)],
+        left_keys: &[String],
+        right_keys: &[String],
+    ) -> PgWireResult<Vec<Document>> {
+        let mut cache: HashMap<String, Vec<Document>> = HashMap::new();
+        let mut out = Vec::new();
+        for l in lrows {
+            let mut bound = params.to_vec();
+            bound.extend(keys.iter().map(|k| l.get(k).cloned().unwrap_or(Bson::Null)));
+            let memo = format!("{bound:?}");
+            if !cache.contains_key(&memo) {
+                let rows = self.run_sql_rows(sql, &bound)?;
+                let docs = rows
+                    .into_iter()
+                    .map(|r| {
+                        let mut d = Document::new();
+                        for (key, i) in columns {
+                            d.insert(key.clone(), r.get(*i).cloned().unwrap_or(Bson::Null));
+                        }
+                        d
+                    })
+                    .collect();
+                cache.insert(memo.clone(), docs);
+            }
+            let rights = &cache[&memo];
+            let mut matched = false;
+            for r in rights {
+                let mut d = Document::new();
+                for (key, lk, _) in merged {
+                    d.insert(key.clone(), l.get(lk).cloned().unwrap_or(Bson::Null));
+                }
+                for k in left_keys {
+                    d.insert(k.clone(), l.get(k).cloned().unwrap_or(Bson::Null));
+                }
+                for k in right_keys {
+                    d.insert(k.clone(), r.get(k).cloned().unwrap_or(Bson::Null));
+                }
+                let keep = match on {
+                    None => true,
+                    Some(expr) => matches!(
+                        secantus_pgplan::apply_row_expr(expr, &d).map_err(|e| Self::err(&e))?,
+                        Bson::Boolean(true)
+                    ),
+                };
+                if keep {
+                    matched = true;
+                    out.push(d);
+                }
+            }
+            if !matched && kind == secantus_pgplan::joins::JoinKind::Left {
+                let mut d = Document::new();
+                for k in left_keys {
+                    d.insert(k.clone(), l.get(k).cloned().unwrap_or(Bson::Null));
+                }
+                for k in right_keys {
+                    d.insert(k.clone(), Bson::Null);
+                }
+                out.push(d);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Plan and run a SELECT's SQL with bound parameters, as the executing
+    /// statement, for its rows in select-list order.
+    fn run_sql_rows(&self, sql: &str, params: &[Bson]) -> PgWireResult<Vec<Vec<Bson>>> {
+        let tz = self.session_timezone();
+        let run = |stmt: &Statement| self.subquery_rows(stmt);
+        let stmt = self
+            .with_executor_hooks(|| {
+                secantus_pgplan::planning_to_execute(|| {
+                    secantus_pgplan::plan_with_session_types_and_subqueries(
+                        sql,
+                        &|n| self.lookup(n),
+                        params,
+                        &[],
+                        &tz,
+                        Some(&run),
+                    )
+                })
+            })
+            .map_err(|e| Self::err(&e))?;
+        self.subquery_rows(&stmt).map_err(|e| Self::err(&e))
     }
 
     /// The rows of a `FROM (SELECT ...) s` source, with the outer query's
@@ -6564,7 +6694,11 @@ impl StartupHandler for PgHandler {
         if let Some(role) = self.role(&user)? {
             if !role.canlogin {
                 return self
-                    .fail_login(client, "28000", format!("role \"{user}\" is not permitted to log in"))
+                    .fail_login(
+                        client,
+                        "28000",
+                        format!("role \"{user}\" is not permitted to log in"),
+                    )
                     .await;
             }
             if let Some(verifier) = role.password.as_deref() {
@@ -6572,13 +6706,19 @@ impl StartupHandler for PgHandler {
                     // An md5 verifier: this server speaks only SCRAM, and
                     // PostgreSQL's scram-sha-256 method refuses one too.
                     return self
-                        .fail_login(client, "28P01", format!("password authentication failed for user \"{user}\""))
+                        .fail_login(
+                            client,
+                            "28P01",
+                            format!("password authentication failed for user \"{user}\""),
+                        )
                         .await;
                 };
                 *self.auth.lock().unwrap_or_else(|e| e.into_inner()) = Some((user, creds, None));
                 client
                     .send(PgWireBackendMessage::Authentication(
-                        pgwire::messages::startup::Authentication::SASL(vec!["SCRAM-SHA-256".into()]),
+                        pgwire::messages::startup::Authentication::SASL(vec![
+                            "SCRAM-SHA-256".into()
+                        ]),
                     ))
                     .await?;
                 client.set_state(pgwire::api::PgWireConnectionState::AuthenticationInProgress);
@@ -6641,7 +6781,11 @@ impl PgHandler {
                 let first = message.into_sasl_initial_response()?;
                 if first.auth_method != "SCRAM-SHA-256" {
                     return self
-                        .fail_login(client, "28000", "selected SASL mechanism is not supported".into())
+                        .fail_login(
+                            client,
+                            "28000",
+                            "selected SASL mechanism is not supported".into(),
+                        )
                         .await;
                 }
                 let data = first.data.unwrap_or_default();
@@ -6650,13 +6794,16 @@ impl PgHandler {
                         *self.auth.lock().unwrap_or_else(|e| e.into_inner()) =
                             Some((user, creds, Some(state)));
                         client
-                            .send(PgWireBackendMessage::Authentication(Authentication::SASLContinue(
-                                Bytes::from(server_first),
-                            )))
+                            .send(PgWireBackendMessage::Authentication(
+                                Authentication::SASLContinue(Bytes::from(server_first)),
+                            ))
                             .await?;
                         Ok(())
                     }
-                    Err(_) => self.fail_login(client, "08P01", "malformed SCRAM message".into()).await,
+                    Err(_) => {
+                        self.fail_login(client, "08P01", "malformed SCRAM message".into())
+                            .await
+                    }
                 }
             }
             Some(mut state) => {
@@ -6664,9 +6811,9 @@ impl PgHandler {
                 match secantus_auth::continue_scram(&mut state, &last.data) {
                     Ok(server_final) => {
                         client
-                            .send(PgWireBackendMessage::Authentication(Authentication::SASLFinal(
-                                Bytes::from(server_final),
-                            )))
+                            .send(PgWireBackendMessage::Authentication(
+                                Authentication::SASLFinal(Bytes::from(server_final)),
+                            ))
                             .await?;
                         self.finish_startup(client).await
                     }
@@ -12762,13 +12909,13 @@ impl PgHandler {
                 let db = self.db().to_string();
                 let chooser = |table: &str, filter: &Document| -> Option<String> {
                     match self.storage.explain_plan(&db, table, filter).ok()? {
-                        secantus_storage::ExplainPlan::IxScan { index_name, .. } => Some(
-                            if index_name == "_id_" {
+                        secantus_storage::ExplainPlan::IxScan { index_name, .. } => {
+                            Some(if index_name == "_id_" {
                                 format!("{table}_pkey")
                             } else {
                                 index_name
-                            },
-                        ),
+                            })
+                        }
                         secantus_storage::ExplainPlan::CollScan => None,
                     }
                 };
@@ -12787,7 +12934,10 @@ impl PgHandler {
                     None
                 };
                 let (ty, lines) = if options.format == "json" {
-                    (Type::JSON, vec![explain::render_json(&tree, &options, actual)])
+                    (
+                        Type::JSON,
+                        vec![explain::render_json(&tree, &options, actual)],
+                    )
                 } else {
                     (Type::TEXT, explain::render_text(&tree, &options, actual))
                 };
