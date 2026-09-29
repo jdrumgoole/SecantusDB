@@ -1,0 +1,3 @@
+DROP TABLE IF EXISTS s10
+CREATE TABLE s10 (id int PRIMARY KEY, t text, n int)
+INSERT INTO s10 VALUES (1, 'abcdef', 3), (2, NULL, NULL)
