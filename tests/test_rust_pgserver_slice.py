@@ -10668,21 +10668,16 @@ def test_the_empty_grouping_set_alone(home: Path) -> None:
         assert cur.fetchall() == [(15,)]
 
 
-def test_the_grouping_function_is_refused_by_name(home: Path) -> None:
-    """Not implemented, and the refusal SAYS so.
-
-    `GROUPING(col)` reports which set produced a row, which needs the producing
-    set carried through the group. Refused loudly — and named, because the
-    generic message ("this target is not supported yet") tells a reader nothing
-    about which part of their query to change.
-    """
+def test_the_grouping_function(home: Path) -> None:
+    """`GROUPING(col)` is 1 on the rows a rollup produced WITHOUT that key --
+    each group carries the grouping set that produced it (PostgreSQL 14)."""
     with _Server(home) as server, server.connect() as conn:
         _gs_table(conn)
         cur = conn.cursor()
-        with pytest.raises(psycopg.Error) as info:
-            cur.execute("select a, grouping(a), sum(n) from s group by rollup (a)")
-        assert info.value.sqlstate == "0A000"
-        assert "GROUPING" in str(info.value)
+        cur.execute(
+            "select a, grouping(a), sum(n) from s group by rollup (a) order by a nulls last"
+        )
+        assert cur.fetchall() == [("x", 0, 3), ("y", 0, 12), (None, 1, 15)]
 
 
 # --------------------------------------------------------------------------- #
@@ -13030,8 +13025,10 @@ def test_a_view_is_expanded_wherever_it_is_read(home: Path) -> None:
             cur.execute("DROP VIEW big")
         with pytest.raises(psycopg.errors.DependentObjectsStillExist):
             cur.execute("DROP TABLE vt")
-        with pytest.raises(psycopg.errors.FeatureNotSupported, match="INSERT into a view"):
-            cur.execute("INSERT INTO big VALUES (4, 40)")
+        # A simple view is automatically updatable: the row lands in `vt`.
+        cur.execute("INSERT INTO big VALUES (4, 40)")
+        cur.execute("SELECT count(*) FROM vt")
+        assert cur.fetchone() == (4,)
         cur.execute("DROP VIEW big CASCADE")
         with pytest.raises(psycopg.errors.UndefinedTable):
             cur.execute("SELECT * FROM bigger")
