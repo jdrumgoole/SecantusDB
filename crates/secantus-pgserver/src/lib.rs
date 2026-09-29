@@ -3776,7 +3776,11 @@ impl PgHandler {
         }
         let key = ix.get_document("key").ok()?;
         let mut cols = Vec::new();
-        for (field, dir) in key {
+        let recorded: Option<Vec<String>> = ix
+            .get_array("sqlKeys")
+            .ok()
+            .map(|a| a.iter().filter_map(Bson::as_str).map(String::from).collect());
+        for (field, dir) in key.iter().filter(|_| recorded.is_none()) {
             let col = t.columns.iter().find(|c| &c.field() == field)?;
             let desc = matches!(dir, Bson::Int32(-1) | Bson::Int64(-1))
                 || matches!(dir, Bson::Double(d) if *d < 0.0);
@@ -3785,6 +3789,9 @@ impl PgHandler {
             } else {
                 col.name.clone()
             });
+        }
+        if let Some(keys) = recorded {
+            cols = keys;
         }
         let unique = if ix.get_bool("unique").unwrap_or(false) {
             "UNIQUE "
@@ -4156,6 +4163,174 @@ impl PgHandler {
             .any(|(_, ix)| ix.get_str("name") == Ok(name)))
     }
 
+    /// The field an EXPRESSION index is keyed on in storage. No row has it,
+    /// and the index's partial filter requires it, so the storage index is
+    /// always empty: it exists for the catalog -- listing, naming, DROP --
+    /// while the executor enforces its UNIQUE from `sqlExpressions`.
+    fn expression_index_field(name: &str) -> String {
+        format!("__sqlexpr_{name}")
+    }
+
+    fn create_expression_index(
+        &self,
+        def: &TableDef,
+        name: &str,
+        ci: &secantus_pgplan::CreateIndex,
+    ) -> PgWireResult<Vec<Response>> {
+        let field = Self::expression_index_field(name);
+        let mut options = bson::doc! {
+            "partialFilterExpression": { field.clone(): { "$exists": true } },
+            "sqlExpressions": ci.expressions.clone(),
+            "sqlKeys": ci.key_sql.clone(),
+        };
+        if ci.unique {
+            options.insert("unique", true);
+        }
+        if let Some(sql) = &ci.predicate_sql {
+            options.insert("sqlPredicate", sql.as_str());
+        }
+        if ci.method != "btree" {
+            options.insert("sqlMethod", ci.method.as_str());
+        }
+        if !ci.include.is_empty() {
+            options.insert("include", ci.include.clone());
+        }
+        // A UNIQUE index cannot be built over rows that already collide.
+        if ci.unique {
+            let rows = self
+                .storage
+                .find_matching(self.db(), &def.name, &Document::new())
+                .map_err(|e| Self::storage_err("could not read", e))?;
+            let index = Self::expression_index_doc(name, &options);
+            let mut seen: Vec<(Vec<Bson>, String)> = Vec::new();
+            for raw in rows {
+                let row = bson::from_slice::<Document>(&raw)
+                    .map_err(|e| Self::storage_err("could not decode a row", e))?;
+                if let Some((key, text)) = self.expression_key(def, &index, &row)? {
+                    if seen.iter().any(|(k, _)| *k == key) {
+                        let mut info = ErrorInfo::new(
+                            "ERROR".into(),
+                            "23505".into(),
+                            format!("could not create unique index \"{name}\""),
+                        );
+                        info.detail = Some(format!("Key ({})=({text}) is duplicated.", ci.key_sql.join(", ")));
+                        return Err(PgWireError::UserError(Box::new(info)));
+                    }
+                    seen.push((key, text));
+                }
+            }
+        }
+        let key_spec = bson::doc! { field: 1_i32 };
+        self.storage
+            .create_index(self.db(), &def.name, name, &key_spec, &options)
+            .map_err(|e| Self::storage_err("could not create the index", e))?;
+        Ok(vec![Response::Execution(Tag::new("CREATE INDEX"))])
+    }
+
+    fn expression_index_doc(name: &str, options: &Document) -> Document {
+        let mut ix = options.clone();
+        ix.insert("name", name);
+        ix
+    }
+
+    /// An expression index's key for `row`, with its display text -- `None`
+    /// when the row is outside a partial index or any key part is NULL
+    /// (NULLs never collide).
+    fn expression_key(
+        &self,
+        def: &TableDef,
+        ix: &Document,
+        row: &Document,
+    ) -> PgWireResult<Option<(Vec<Bson>, String)>> {
+        if let Ok(pred) = ix.get_str("sqlPredicate") {
+            let expr = secantus_pgplan::plan_check_expression(pred, def).map_err(|e| Self::err(&e))?;
+            if secantus_pgplan::apply_row_expr(&expr, row).map_err(|e| Self::err(&e))? != Bson::Boolean(true) {
+                return Ok(None);
+            }
+        }
+        let Ok(exprs) = ix.get_array("sqlExpressions") else {
+            return Ok(None);
+        };
+        let mut key = Vec::new();
+        for e in exprs.iter().filter_map(Bson::as_str) {
+            let expr = secantus_pgplan::plan_check_expression(e, def).map_err(|e| Self::err(&e))?;
+            let v = secantus_pgplan::apply_row_expr(&expr, row).map_err(|e| Self::err(&e))?;
+            if v == Bson::Null {
+                return Ok(None);
+            }
+            key.push(v);
+        }
+        let text = key
+            .iter()
+            .map(secantus_pgplan::value_text)
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok(Some((key, text)))
+    }
+
+    /// The UNIQUE expression indexes on `table`.
+    fn unique_expression_indexes(&self, table: &str) -> PgWireResult<Vec<Document>> {
+        Ok(self
+            .storage
+            .list_indexes(self.db(), table)
+            .map_err(|e| Self::storage_err("could not list the indexes", e))?
+            .into_iter()
+            .filter(|ix| ix.get_bool("unique").unwrap_or(false) && ix.get_array("sqlExpressions").is_ok())
+            .collect())
+    }
+
+    /// Enforce every UNIQUE expression index on the rows about to be written:
+    /// against each other, and against the stored rows other than `replacing`
+    /// (an UPDATE's own old versions).
+    fn check_expression_unique(
+        &self,
+        def: &TableDef,
+        rows: &[Document],
+        replacing: &[Bson],
+    ) -> PgWireResult<()> {
+        let indexes = self.unique_expression_indexes(&def.name)?;
+        if indexes.is_empty() {
+            return Ok(());
+        }
+        let stored: Vec<Document> = self
+            .storage
+            .find_matching(self.db(), &def.name, &Document::new())
+            .map_err(|e| Self::storage_err("could not read", e))?
+            .into_iter()
+            .filter_map(|raw| bson::from_slice::<Document>(&raw).ok())
+            .filter(|d| !d.get("_id").is_some_and(|id| replacing.contains(id)))
+            .collect();
+        for ix in &indexes {
+            let name = ix.get_str("name").unwrap_or_default();
+            let keys: Vec<String> = ix
+                .get_array("sqlKeys")
+                .map(|a| a.iter().filter_map(Bson::as_str).map(String::from).collect())
+                .unwrap_or_default();
+            let mut taken: Vec<Vec<Bson>> = Vec::new();
+            for row in &stored {
+                if let Some((k, _)) = self.expression_key(def, ix, row)? {
+                    taken.push(k);
+                }
+            }
+            for row in rows {
+                if let Some((k, text)) = self.expression_key(def, ix, row)? {
+                    if taken.contains(&k) {
+                        return Err(Self::constraint_error(
+                            "23505",
+                            format!("duplicate key value violates unique constraint \"{name}\""),
+                            format!("Key ({})=({text}) already exists.", keys.join(", ")),
+                            def,
+                            Some(name),
+                            None,
+                        ));
+                    }
+                    taken.push(k);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// `CREATE [UNIQUE] INDEX`.
     fn create_index(&self, ci: secantus_pgplan::CreateIndex) -> PgWireResult<Vec<Response>> {
         let def = self
@@ -4191,6 +4366,9 @@ impl PgHandler {
                 "42P07".into(), // duplicate_table
                 format!("relation \"{name}\" already exists"),
             ))));
+        }
+        if !ci.expressions.is_empty() {
+            return self.create_expression_index(&def, &name, &ci);
         }
         let mut key_spec = Document::new();
         let mut fields = Vec::new();
@@ -4235,6 +4413,9 @@ impl PgHandler {
         }
         if ci.method != "btree" {
             options.insert("sqlMethod", ci.method.as_str());
+        }
+        if ci.key_sql.iter().any(|k| k.contains(" NULLS ")) {
+            options.insert("sqlKeys", ci.key_sql.clone());
         }
         self.storage
             .create_index(self.db(), &def.name, &name, &key_spec, &options)
@@ -12483,6 +12664,7 @@ impl PgHandler {
                     self.check_row_constraints(&def, row)?;
                     self.check_view_conditions(&def, row, &ins.view_checks)?;
                 }
+                self.check_expression_unique(&def, &ins.rows, &[])?;
                 if let Some(dup) = self.wide_numeric_pk_conflict(&ins.table, &def, &ins.rows)? {
                     return Err(Self::write_error(
                         &ins.table,
@@ -14773,8 +14955,10 @@ impl PgHandler {
                 // A table with triggers is written row by row: each row is
                 // handed to its triggers with its OLD and NEW values.
                 let triggered = def.is_some() && self.has_triggers(&upd.table)?;
-                let constrained =
-                    def.as_ref().is_some_and(table_has_row_constraints) || referenced || triggered;
+                let constrained = def.as_ref().is_some_and(table_has_row_constraints)
+                    || referenced
+                    || triggered
+                    || !self.unique_expression_indexes(&upd.table)?.is_empty();
                 // The columns the SET list assigns, for `UPDATE OF` triggers.
                 let targets: Vec<String> = match (&def, triggered) {
                     (Some(def), true) => {
@@ -14879,6 +15063,8 @@ impl PgHandler {
                     }
                     if let Some(def) = def.as_ref() {
                         self.check_foreign_keys(def, &new_rows)?;
+                        let replacing: Vec<Bson> = writes.iter().map(|(id, _, _)| id.clone()).collect();
+                        self.check_expression_unique(def, &new_rows, &replacing)?;
                     }
                     if let (true, Some(def)) = (referenced, def.as_ref()) {
                         self.check_referencing_updates(def, &key_changes)?;

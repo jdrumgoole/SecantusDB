@@ -1798,6 +1798,14 @@ pub struct CreateIndex {
     pub predicate_sql: Option<String>,
     /// `btree` or `hash`.
     pub method: String,
+    /// Each key as `pg_indexes.indexdef` prints it: `a`, `a DESC`,
+    /// `a NULLS FIRST`, `lower(b)`.
+    pub key_sql: Vec<String>,
+    /// For an EXPRESSION index, every key's expression SQL over the table
+    /// (a plain column key is its name); empty for a column index. Such an
+    /// index holds no storage entries -- its UNIQUE is enforced by the
+    /// executor evaluating these.
+    pub expressions: Vec<String>,
 }
 
 /// A user-defined function as CREATE FUNCTION declares it.
@@ -3694,12 +3702,80 @@ fn plan_create_index(
         return Err(Error::Unsupported("UNIQUE NULLS NOT DISTINCT".into()));
     }
     let mut columns = Vec::new();
+    let mut key_sql = Vec::new();
+    let mut expressions = Vec::new();
+    let mut any_expression = false;
     for p in &i.index_params {
         let Some(N::IndexElem(e)) = p.node.as_ref() else {
             return Err(Error::Unsupported("this index key".into()));
         };
-        if e.expr.is_some() || e.name.is_empty() {
-            return Err(Error::Unsupported("an index over an expression".into()));
+        let desc = SortByDir::try_from(e.ordering) == Ok(SortByDir::SortbyDesc);
+        let nulls = match SortByNulls::try_from(e.nulls_ordering) {
+            Ok(SortByNulls::SortbyNullsFirst) if !desc => " NULLS FIRST",
+            Ok(SortByNulls::SortbyNullsLast) if desc => " NULLS LAST",
+            _ => "",
+        };
+        let suffix = format!("{}{nulls}", if desc { " DESC" } else { "" });
+        if let Some(expr) = e.expr.as_deref() {
+            // The expression must plan over the table -- a bad column is
+            // 42703 now, not at the first write.
+            let sql = deparse_expr(expr)?;
+            let planned = plan_check_expression(&sql, &def)?;
+            // An unknown function only shows when the expression RUNS; run it
+            // once over a sample row so `nope(a)` is 42883 here, as it is on
+            // PostgreSQL, rather than at the first write.
+            let mut sample = Document::new();
+            for c in &def.columns {
+                sample.insert(c.field(), sample_value_for_type(&c.pg_type));
+            }
+            if let Err(Error::Unsupported(msg)) = apply_row_expr(&planned, &sample) {
+                if let Some(name) = msg.strip_prefix("function ").and_then(|m| m.split('(').next()) {
+                    let mut types = Vec::new();
+                    let mut probe = expr.clone();
+                    walk_expr(&mut probe, &mut |n| {
+                        if let Some(N::FuncCall(f)) = n.node.as_ref() {
+                            if func_name(f).as_deref() == Some(name) && types.is_empty() {
+                                for a in &f.args {
+                                    let t = match a.node.as_ref() {
+                                        Some(N::ColumnRef(c)) => column_ref_name(c)
+                                            .and_then(|n| def.column(&n).map(|c| c.pg_type.clone()))
+                                            .unwrap_or_else(|| "unknown".into()),
+                                        _ => static_type(a, &Bson::Null),
+                                    };
+                                    types.push(display_type(&t));
+                                }
+                            }
+                        }
+                        Ok(())
+                    })?;
+                    return Err(Error::UndefinedFunction(format!(
+                        "function {name}({}) does not exist",
+                        types.join(", ")
+                    )));
+                }
+            }
+            // ruleutils parenthesises an operator expression itself, and the
+            // index key list wraps any non-call expression once more:
+            // `lower(b)`, but `((a + b))`.
+            let shown = if matches!(expr.node.as_ref(), Some(N::FuncCall(_))) {
+                sql.clone()
+            } else {
+                format!("(({sql}))")
+            };
+            key_sql.push(format!("{shown}{suffix}"));
+            expressions.push(sql);
+            // ChooseIndexColumnNames: a function key names the index after
+            // the function, any other expression is `expr`.
+            let key_name = match expression_column_name(expr) {
+                n if n == "?column?" => "expr".to_string(),
+                n => n,
+            };
+            columns.push((key_name, desc));
+            any_expression = true;
+            continue;
+        }
+        if e.name.is_empty() {
+            return Err(Error::Unsupported("this index key".into()));
         }
         if !e.opclass.is_empty() {
             return Err(Error::Unsupported("an index operator class".into()));
@@ -3710,21 +3786,15 @@ fn plan_create_index(
         if def.column(&e.name).is_none() {
             return Err(Error::UndefinedColumn(e.name.clone()));
         }
-        let desc = SortByDir::try_from(e.ordering) == Ok(SortByDir::SortbyDesc);
-        // The default is NULLS LAST ascending and NULLS FIRST descending; the
-        // storage order is fixed, so only the default can be honoured.
-        let nulls = SortByNulls::try_from(e.nulls_ordering);
-        let non_default = match nulls {
-            Ok(SortByNulls::SortbyNullsFirst) => !desc,
-            Ok(SortByNulls::SortbyNullsLast) => desc,
-            _ => false,
-        };
-        if non_default {
-            return Err(Error::Unsupported(
-                "a non-default NULLS ordering in an index".into(),
-            ));
-        }
+        // A non-default NULLS ordering is recorded, not built: an index is
+        // an access path here, and a query's ORDER BY places its NULLs by
+        // its own clause whatever the index says.
+        key_sql.push(format!("{}{suffix}", e.name));
+        expressions.push(e.name.clone());
         columns.push((e.name.clone(), desc));
+    }
+    if !any_expression {
+        expressions.clear();
     }
     let mut include = Vec::new();
     for p in &i.index_including_params {
@@ -3762,6 +3832,8 @@ fn plan_create_index(
         predicate,
         predicate_sql,
         method,
+        key_sql,
+        expressions,
     }))
 }
 
@@ -10057,6 +10129,54 @@ fn plan_aggregate(
         if let Some(src) = joins::planned_join(&r.relname) {
             let def = src.def.clone();
             return finish_aggregate(s, String::new(), None, Some(Box::new(src)), def, params);
+        }
+        // A WHERE that does not lower to a filter (`lower(email) = 'x'`,
+        // `n % 2 = 1`) is evaluated per row by a plain SELECT; aggregate over
+        // THAT: `FROM (SELECT * FROM t WHERE cond) t`.
+        if let (Some(w), Some(def)) = (s.where_clause.as_deref(), lookup(&r.relname)) {
+            if matches!(lower_where(w, &def, params), Err(Error::Unsupported(_))) {
+                let alias = r
+                    .alias
+                    .clone()
+                    .filter(|a| !a.aliasname.is_empty())
+                    .unwrap_or(pg_query::protobuf::Alias {
+                        aliasname: r.relname.clone(),
+                        colnames: Vec::new(),
+                    });
+                let inner = pg_query::protobuf::SelectStmt {
+                    target_list: vec![pg_query::protobuf::Node {
+                        node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+                            val: Some(Box::new(pg_query::protobuf::Node {
+                                node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+                                    fields: vec![pg_query::protobuf::Node {
+                                        node: Some(N::AStar(pg_query::protobuf::AStar {})),
+                                    }],
+                                    location: -1,
+                                })),
+                            })),
+                            location: -1,
+                            ..Default::default()
+                        }))),
+                    }],
+                    from_clause: s.from_clause.clone(),
+                    where_clause: Some(Box::new(w.clone())),
+                    limit_option: pg_query::protobuf::LimitOption::Default as i32,
+                    op: pg_query::protobuf::SetOperation::SetopNone as i32,
+                    ..Default::default()
+                };
+                let mut outer = s.clone();
+                outer.where_clause = None;
+                outer.from_clause = vec![pg_query::protobuf::Node {
+                    node: Some(N::RangeSubselect(Box::new(pg_query::protobuf::RangeSubselect {
+                        lateral: false,
+                        subquery: Some(Box::new(pg_query::protobuf::Node {
+                            node: Some(N::SelectStmt(Box::new(inner))),
+                        })),
+                        alias: Some(alias),
+                    }))),
+                }];
+                return plan_aggregate(&outer, lookup, params);
+            }
         }
     }
     // `FROM (SELECT ... FROM a JOIN b ON ...) x` -- the joined subquery every
