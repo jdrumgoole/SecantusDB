@@ -2712,15 +2712,14 @@ fn a_set_returning_function_in_the_select_list_makes_rows() {
     }
 }
 
-/// A set-returning function BESIDE another output column is refused.
-///
-/// `select 1, generate_series(1,3)` repeats the constant across the generated
-/// rows, which needs the constants carried into each row. Nothing in the corpus
-/// asks for it, and a shape that silently dropped a column would be worse than
-/// saying so.
+/// A set-returning function BESIDE another output column plans -- as a
+/// LATERAL join over one row, which repeats the constant across the generated
+/// rows as PostgreSQL does. Several of them are refused by name: PostgreSQL
+/// runs those in LOCKSTEP, which a join would silently get wrong.
 #[test]
-fn a_set_returning_function_beside_a_column_is_refused() {
-    let err = plan("SELECT 1, generate_series(1,3)", &lookup).expect_err("srf beside a column");
+fn a_set_returning_function_beside_a_column_plans_and_two_are_refused() {
+    plan("SELECT 1, generate_series(1,3)", &lookup).expect("srf beside a column");
+    let err = plan("SELECT unnest(ARRAY[1]), unnest(ARRAY[2])", &lookup).expect_err("two srfs");
     assert_eq!(err.sqlstate(), "0A000");
 }
 

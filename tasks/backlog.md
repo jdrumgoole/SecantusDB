@@ -693,50 +693,23 @@ remain open:
   - `float4` / `float8` columns keep MQL's NaN placement (below every
     number) in WHERE; PG puts NaN above infinity for floats too. Only
     `numeric` was moved in this slice.
-- [ ] **OPEN — RUST pgserver: multi-column FOREIGN KEYs / `ON DELETE SET
-      DEFAULT` are refused `0A000` (2026-09-09; re-measured 2026-09-28).**
-      NOT NULL / CHECK / FOREIGN KEY / UNIQUE all landed (catalog + enforcement;
-      the same catalog document shape the Python server writes) — re-probed
-      2026-09-28 against PostgreSQL 14.24: CHECK (INSERT, UPDATE, and a named
-      table-level constraint), FOREIGN KEY (INSERT against a missing parent,
-      parent DELETE, and `ON DELETE CASCADE`) and NOT NULL all answer with
-      PostgreSQL's exact SQLSTATE and message, auto-generated constraint names
-      (`c1_n_check`, `f1_pid_fkey`) included. `ON DELETE SET NULL` is accepted
-      too.
+- [ ] **OPEN — RUST pgserver: constraints -- what is left after multi-column
+      FOREIGN KEYs landed (2026-09-29).** NOT NULL / CHECK / UNIQUE / FOREIGN
+      KEY are all enforced; a FOREIGN KEY may now span several columns, target
+      a composite PRIMARY KEY or any matching UNIQUE constraint, and take `ON
+      DELETE` / `ON UPDATE` `CASCADE` / `SET NULL` / `SET DEFAULT` (new corpus
+      `fk_multi.sql` 0/24). A table something REFERENCES now takes the
+      row-by-row UPDATE path, so a changed referenced UNIQUE key runs its ON
+      UPDATE action -- before, only the immutable primary key could be
+      referenced, so nothing needed to look.
 
-      **The multi-column FOREIGN KEY blocker is NOT in the FK path — it is
-      upstream, in the PARENT's key** (measured 2026-09-28). `create table p (a
-      int, b int, primary key (a, b))` is `0A000 a composite PRIMARY KEY is not
-      supported yet`, so the referenced table cannot be created and the FK half
-      is never reached. Scope composite PRIMARY KEY first; a session sizing this
-      from the entry's old wording would have started in the wrong crate.
-
-      **The `pg_constraint` half of this entry was FIXED 2026-09-28** and is
-      why the headline no longer names it. It is now a virtual table carrying
-      PostgreSQL 14.24's full 25-column shape, projected from the catalog the
-      server already kept; `conname` / `contype` / `conkey` / `confkey` / the
-      `conf*type` action codes / the flag columns / `connamespace` all match
-      the oracle exactly, as do the RowDescription oids — which needed two
-      types the server had no vocabulary for, the internal `"char"` (18) and
-      `pg_node_tree` (194). Deliberately NOT reproduced, both documented in
-      the code: `conbin` is NULL (we keep a CHECK predicate as SQL text, not
-      as PostgreSQL's serialised parse tree) and `conindid` is 0 (there are no
-      `pg_index` rows for it to point at). Constraint `oid`s are synthetic.
-
-      Still absent, and the reason a full reflection round-trip does not work
-      yet: `pg_index` / `pg_class` / `pg_namespace` have no rows, and
-      `pg_get_constraintdef()` is not implemented (the Python server has it —
-      `src/secantus/sql/virtual.py`'s `constraint_def_for_oid`).
-
-      **`EXCLUDE` is refused at DDL (measured 2026-09-28).** `create table ex
-      (id int primary key, room int, constraint no_dup exclude (room with =))`
-      is `0A000 Constraint is not supported yet`; PostgreSQL 14.24 accepts it
-      and reports the row as `contype = 'x'`. `pg_constraint` here DOES emit
-      `'x'` for one, because the catalog's `UniqueConstraint.exclusion` flag is
-      written by the PYTHON server — so the only way to reach that branch today
-      is a hand-off: create the table with the Python server, then read it with
-      the Rust one. Worth knowing before "it emits 'x'" is read as "the Rust
-      server supports EXCLUDE".
+      **Left:** `EXCLUDE` constraints are refused at DDL (`0A000 Constraint is
+      not supported yet`; PostgreSQL 14.24 accepts them). `pg_get_constraintdef()`
+      is not implemented. `pg_constraint.conbin` is NULL (a CHECK is kept as SQL
+      text, not a parse tree) and constraint `oid`s are synthetic. `MATCH FULL`
+      is not distinguished from MATCH SIMPLE. An `ON UPDATE CASCADE` that
+      rewrites a child's key does not re-check that child's OTHER constraints
+      against the new key's parent.
 
 - [x] **RESOLVED (found and fixed 2026-09-28): a regclass/regtype operand
       inside a LIST matched NOTHING, silently.** A `regclass` value is a
@@ -797,15 +770,17 @@ remain open:
       deletion is detected at the next `COMMIT PREPARED` by the first
       minted seq being readable (`prepared_already_committed`), not by a
       commit record.
-- [ ] **OPEN — RUST pgserver: role passwords are stored, never verified
-      (2026-09-17).** `CREATE / ALTER ROLE ... PASSWORD` records a
-      SCRAM-SHA-256 verifier in `pg_authid`, but the server still trusts
-      every connection (the startup handshake never challenges). Turning on
-      verification would break every gauge that connects as `user=postgres`
-      with no password, so it needs a `pg_hba`-style trust/scram switch
-      first; pgwire's SASL hooks make the SCRAM exchange itself cheap once
-      the policy exists. Role membership (`IN ROLE` / `ROLE` / `ADMIN`) and
-      `SYSID` are refused `0A000`.
+- [ ] **OPEN — RUST pgserver: role membership and md5 passwords (password
+      verification landed 2026-09-29).** A role WITH a password now has to
+      prove it over SCRAM-SHA-256 (`secantus_auth::begin_scram_pg`), and a
+      NOLOGIN role is refused `28000`. A role with no password, and a user the
+      server has never heard of, are still trusted -- that is what every
+      fixture connecting as a password-less `postgres` relies on, and it is a
+      deliberate `pg_hba`-free policy, not PostgreSQL's (which would refuse an
+      unknown role `28000`). Left: an md5-hashed password (a client can store
+      one verbatim) cannot log in at all, since only SCRAM is spoken; `VALID
+      UNTIL` is recorded and not enforced; and role membership (`IN ROLE` /
+      `ROLE` / `ADMIN`) and `SYSID` are refused `0A000`.
 - [ ] **OPEN — RUST pgserver: `DROP EXTENSION ... CASCADE` over a column of
       the extension's type (2026-09-17).** PG drops the dependent columns
       (`select h from hdep` is then `42703`); this server has no `ALTER
@@ -6985,7 +6960,7 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       | ~~`ALTER TABLE`, any form~~ | **DONE 2026-09-28**, incl. RENAME | `USING`, and ADD of a UNIQUE/PK/FK |
       | ~~`CREATE VIEW`~~ | **DONE 2026-09-29** | read-only: writes through a view refused |
       | `CREATE TRIGGER` | | `CreateTrigStmt` |
-      | `EXPLAIN` | | `ExplainStmt` |
+      | ~~`EXPLAIN`~~ | **DONE 2026-09-29** | plan SHAPE, zero costs; FORMAT YAML/XML refused |
       | ~~composite `PRIMARY KEY`~~ / multi-col `FOREIGN KEY` | **PK DONE 2026-09-29** | multi-column FK still refused |
       | ~~non-literal column `DEFAULT`~~ | **DONE 2026-09-29** | evaluated per row; `column_default` renders a folded constant, not PostgreSQL's `(1 + 2)` |
 
@@ -7018,18 +6993,14 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       * **`unnest` over a multidimensional array yields its LEAVES**, row-major
         -- four rows for `ARRAY[[1,2],[3,4]]`, not two.
 
-      **STILL OPEN, and it is the hard half**: a set-returning function in the
-      SELECT LIST over a COLUMN -- `SELECT unnest(ia) FROM t` -- which changes
-      row cardinality mid-pipeline rather than supplying the source. That one
-      case is the whole remaining `srf` divergence, one of four in `arrays`,
-      and both of the SRF lines in `strings` (where the call sits beside a
-      scalar column, which is the same problem).
-
-      **`lateral_srf` did NOT move, contrary to the estimate that opened this
-      work.** Its nine cases are `LATERAL` forms -- a function in FROM that
-      references the row to its left -- and they refuse with `this JOIN side`
-      rather than anything SRF-shaped. LATERAL needs correlation machinery,
-      not a materialised source. Do not fold it into an SRF estimate again.
+      **The hard half landed too (2026-09-29): LATERAL, and a set-returning
+      function over a column in the select list.** A LATERAL item is SQL re-run
+      per left row with that row's values bound as typed `$N` parameters
+      (`joins::lateral_leaf`), and `SELECT unnest(ia) FROM t` is rewritten to
+      the lateral join it means (`joins::select_list_srf`). `lateral_srf` 9 ->
+      0, `srf` 1 -> 0, `arrays` 4 -> 1, `strings` 7 -> 1. SEVERAL set-returning
+      functions in one select list are refused by name: PostgreSQL runs those
+      in lockstep, which a join would get silently wrong.
 
       **The RUST PG server's STRING surface landed 2026-09-29** (`strings`
       corpus 18 divergences of 35 -> 8, new `strings2` corpus 27 -> 0, and
@@ -7438,15 +7409,6 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       current row was wrong on every row -- neither had such a frame. The
       cheap way to find what a corpus is blind to is to enumerate the axes it
       varies and write the combinations it skipped.
-
-- [ ] **OPEN — RUST pgserver: a wrong password still connects, CONFIRMED live
-      (2026-09-28).** The existing entry above records that `CREATE / ALTER ROLE
-      … PASSWORD` stores a SCRAM-SHA-256 verifier that is never checked. Probed
-      rather than inferred: created a role with a password, connected with a
-      deliberately wrong one, and ran `select 1` successfully. Noting the
-      confirmation because "stored, never verified" reads like a catalog gap,
-      and it is an authentication bypass — anyone pointing this server at
-      anything but a test fixture should know.
 
 - [x] ~~**Rust PG server: `numeric` DIVISION is refused (`0A000`).**~~ **FIXED
   — re-measured 2026-09-28** against a `secantusd-pg` built from `HEAD:crates`.

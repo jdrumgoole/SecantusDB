@@ -11,6 +11,7 @@
 
 mod do_block;
 mod encoding;
+mod explain;
 mod plpgsql_do;
 mod server;
 
@@ -560,8 +561,9 @@ impl DatabaseRegistry {
 /// A password is stored as PostgreSQL stores it -- the SCRAM-SHA-256
 /// verifier `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>`,
 /// derived here from a plaintext `PASSWORD`, or kept verbatim when the
-/// client already sent a verifier (libpq's `PQchangePassword` does). It is
-/// recorded and never checked: every connection is trusted.
+/// client already sent a verifier (libpq's `PQchangePassword` does). A login
+/// as a role that has one is checked against it over SCRAM-SHA-256 (see
+/// `continue_password_login`).
 #[derive(Clone, Debug)]
 struct RoleInfo {
     oid: i64,
@@ -880,6 +882,15 @@ pub struct PgHandler {
     /// The value this session's most recent `nextval` / `setval` produced,
     /// whichever sequence it was, for `lastval()`.
     session_lastval: Mutex<Option<i64>>,
+    /// A password login in progress: the role, its stored credentials, and --
+    /// once the client's first SASL message arrived -- the SCRAM exchange.
+    auth: Mutex<
+        Option<(
+            String,
+            secantus_auth::StoredCredentials,
+            Option<secantus_auth::ScramState>,
+        )>,
+    >,
     /// User TYPES created or dropped in the open transaction but not yet
     /// committed -- the type analogue of `uncommitted`. Planning reads the
     /// type catalog (`to_regtype`, a column's declared type), and an
@@ -1139,6 +1150,7 @@ impl PgHandler {
             uncommitted: Mutex::new(HashMap::new()),
             session_currval: Mutex::new(HashMap::new()),
             session_lastval: Mutex::new(None),
+            auth: Mutex::new(None),
             uncommitted_types: Mutex::new(HashMap::new()),
             in_transaction: std::sync::atomic::AtomicBool::new(false),
             binary_results: std::sync::atomic::AtomicBool::new(false),
@@ -2310,6 +2322,11 @@ impl PgHandler {
     fn join_rows(&self, node: &secantus_pgplan::joins::JoinNode) -> PgWireResult<Vec<Document>> {
         use secantus_pgplan::joins::{JoinKind, JoinNode};
         match node {
+            // A LATERAL item only ever sits on a join's right; alone, with
+            // nothing to its left, it was planned as an ordinary leaf.
+            JoinNode::Lateral { .. } => Err(Self::err(&PlanError::Internal(
+                "a LATERAL item with no left side".into(),
+            ))),
             JoinNode::Leaf { plan, def, columns } => {
                 let docs = self.materialise_sub(plan, def)?;
                 Ok(docs
@@ -2334,6 +2351,26 @@ impl PgHandler {
                 right_keys,
             } => {
                 let lrows = self.join_rows(left)?;
+                if let JoinNode::Lateral {
+                    sql,
+                    params,
+                    keys,
+                    columns,
+                } = right.as_ref()
+                {
+                    return self.lateral_rows(
+                        &lrows,
+                        sql,
+                        params,
+                        keys,
+                        columns,
+                        *kind,
+                        on.as_ref(),
+                        merged,
+                        left_keys,
+                        right_keys,
+                    );
+                }
                 let rrows = self.join_rows(right)?;
                 let combine = |l: Option<&Document>, r: Option<&Document>| -> Document {
                     let mut d = Document::new();
@@ -2485,6 +2522,105 @@ impl PgHandler {
         } else {
             bson::doc! { "$and": [filter.clone(), by_id] }
         })
+    }
+
+    /// A join whose right side is LATERAL: its SQL is run once per distinct
+    /// left row, with that row's values bound past the statement's own
+    /// parameters, and each result row joined to it. A LEFT join keeps a
+    /// left row the item produced nothing for.
+    #[allow(clippy::too_many_arguments)]
+    fn lateral_rows(
+        &self,
+        lrows: &[Document],
+        sql: &str,
+        params: &[Bson],
+        keys: &[String],
+        columns: &[(String, usize)],
+        kind: secantus_pgplan::joins::JoinKind,
+        on: Option<&secantus_pgplan::ColumnExpr>,
+        merged: &[(String, String, String)],
+        left_keys: &[String],
+        right_keys: &[String],
+    ) -> PgWireResult<Vec<Document>> {
+        let mut cache: HashMap<String, Vec<Document>> = HashMap::new();
+        let mut out = Vec::new();
+        for l in lrows {
+            let mut bound = params.to_vec();
+            bound.extend(keys.iter().map(|k| l.get(k).cloned().unwrap_or(Bson::Null)));
+            let memo = format!("{bound:?}");
+            if !cache.contains_key(&memo) {
+                let rows = self.run_sql_rows(sql, &bound)?;
+                let docs = rows
+                    .into_iter()
+                    .map(|r| {
+                        let mut d = Document::new();
+                        for (key, i) in columns {
+                            d.insert(key.clone(), r.get(*i).cloned().unwrap_or(Bson::Null));
+                        }
+                        d
+                    })
+                    .collect();
+                cache.insert(memo.clone(), docs);
+            }
+            let rights = &cache[&memo];
+            let mut matched = false;
+            for r in rights {
+                let mut d = Document::new();
+                for (key, lk, _) in merged {
+                    d.insert(key.clone(), l.get(lk).cloned().unwrap_or(Bson::Null));
+                }
+                for k in left_keys {
+                    d.insert(k.clone(), l.get(k).cloned().unwrap_or(Bson::Null));
+                }
+                for k in right_keys {
+                    d.insert(k.clone(), r.get(k).cloned().unwrap_or(Bson::Null));
+                }
+                let keep = match on {
+                    None => true,
+                    Some(expr) => matches!(
+                        secantus_pgplan::apply_row_expr(expr, &d).map_err(|e| Self::err(&e))?,
+                        Bson::Boolean(true)
+                    ),
+                };
+                if keep {
+                    matched = true;
+                    out.push(d);
+                }
+            }
+            if !matched && kind == secantus_pgplan::joins::JoinKind::Left {
+                let mut d = Document::new();
+                for k in left_keys {
+                    d.insert(k.clone(), l.get(k).cloned().unwrap_or(Bson::Null));
+                }
+                for k in right_keys {
+                    d.insert(k.clone(), Bson::Null);
+                }
+                out.push(d);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Plan and run a SELECT's SQL with bound parameters, as the executing
+    /// statement, for its rows in select-list order.
+    fn run_sql_rows(&self, sql: &str, params: &[Bson]) -> PgWireResult<Vec<Vec<Bson>>> {
+        let tz = self.session_timezone();
+        let run = |stmt: &Statement| self.subquery_rows(stmt);
+        let stmt = self
+            .with_executor_hooks(|| {
+                secantus_pgplan::planning_to_execute(|| {
+                    secantus_pgplan::plan_with_session_types_and_subqueries(
+                        sql,
+                        &|n| self.lookup(n),
+                        params,
+                        &[],
+                        &tz,
+                        Some(&run),
+                    )
+                })
+            })
+            .map_err(|e| Self::err(&e))?;
+        self.subquery_rows(&stmt).map_err(|e| Self::err(&e))
     }
 
     /// The rows of a `FROM (SELECT ...) s` source, with the outer query's
@@ -6522,6 +6658,10 @@ impl StartupHandler for PgHandler {
         C::Error: std::fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        // The client's replies in a SCRAM exchange arrive here too.
+        if let PgWireFrontendMessage::PasswordMessageFamily(pw) = message {
+            return self.continue_password_login(client, pw).await;
+        }
         let PgWireFrontendMessage::Startup(ref startup) = message else {
             return Ok(());
         };
@@ -6545,6 +6685,152 @@ impl StartupHandler for PgHandler {
             return Ok(());
         }
 
+        // A role that HAS a password must prove it -- SCRAM-SHA-256, as
+        // PostgreSQL's default `password_encryption` stores it. A role with
+        // none, or a user this server has never heard of, is trusted, which is
+        // what keeps every fixture connecting as a password-less `postgres`
+        // working (PostgreSQL's `trust` for those).
+        let user = client.metadata().get("user").cloned().unwrap_or_default();
+        if let Some(role) = self.role(&user)? {
+            if !role.canlogin {
+                return self
+                    .fail_login(
+                        client,
+                        "28000",
+                        format!("role \"{user}\" is not permitted to log in"),
+                    )
+                    .await;
+            }
+            if let Some(verifier) = role.password.as_deref() {
+                let Some(creds) = scram_credentials(verifier) else {
+                    // An md5 verifier: this server speaks only SCRAM, and
+                    // PostgreSQL's scram-sha-256 method refuses one too.
+                    return self
+                        .fail_login(
+                            client,
+                            "28P01",
+                            format!("password authentication failed for user \"{user}\""),
+                        )
+                        .await;
+                };
+                *self.auth.lock().unwrap_or_else(|e| e.into_inner()) = Some((user, creds, None));
+                client
+                    .send(PgWireBackendMessage::Authentication(
+                        pgwire::messages::startup::Authentication::SASL(vec![
+                            "SCRAM-SHA-256".into()
+                        ]),
+                    ))
+                    .await?;
+                client.set_state(pgwire::api::PgWireConnectionState::AuthenticationInProgress);
+                return Ok(());
+            }
+        }
+        self.finish_startup(client).await
+    }
+}
+
+/// The SCRAM credentials in a stored `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>`
+/// verifier, or `None` for any other form (an md5 hash).
+fn scram_credentials(verifier: &str) -> Option<secantus_auth::StoredCredentials> {
+    let rest = verifier.strip_prefix("SCRAM-SHA-256$")?;
+    let (params, keys) = rest.split_once('$')?;
+    let (iterations, salt) = params.split_once(':')?;
+    let (stored, server) = keys.split_once(':')?;
+    secantus_auth::StoredCredentials::from_b64(iterations.parse().ok()?, salt, stored, server).ok()
+}
+
+impl PgHandler {
+    /// A login that failed: PostgreSQL's FATAL, and the connection closes.
+    async fn fail_login<C>(&self, client: &mut C, code: &str, message: String) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let info = ErrorInfo::new("FATAL".into(), code.into(), message);
+        client
+            .send(PgWireBackendMessage::ErrorResponse(info.into()))
+            .await?;
+        client.close().await?;
+        Ok(())
+    }
+
+    /// One client message of a SCRAM exchange: the client-first (answered
+    /// with the server-first), then the client-final (checked, and answered
+    /// with the server signature and the rest of the startup).
+    async fn continue_password_login<C>(
+        &self,
+        client: &mut C,
+        message: pgwire::messages::startup::PasswordMessageFamily,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        use pgwire::messages::startup::Authentication;
+        let pending = self.auth.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let Some((user, creds, scram)) = pending else {
+            return self
+                .fail_login(client, "08P01", "unexpected password message".into())
+                .await;
+        };
+        let failed = format!("password authentication failed for user \"{user}\"");
+        match scram {
+            None => {
+                let first = message.into_sasl_initial_response()?;
+                if first.auth_method != "SCRAM-SHA-256" {
+                    return self
+                        .fail_login(
+                            client,
+                            "28000",
+                            "selected SASL mechanism is not supported".into(),
+                        )
+                        .await;
+                }
+                let data = first.data.unwrap_or_default();
+                match secantus_auth::begin_scram_pg(&data, Some(creds.clone())) {
+                    Ok((server_first, state)) => {
+                        *self.auth.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some((user, creds, Some(state)));
+                        client
+                            .send(PgWireBackendMessage::Authentication(
+                                Authentication::SASLContinue(Bytes::from(server_first)),
+                            ))
+                            .await?;
+                        Ok(())
+                    }
+                    Err(_) => {
+                        self.fail_login(client, "08P01", "malformed SCRAM message".into())
+                            .await
+                    }
+                }
+            }
+            Some(mut state) => {
+                let last = message.into_sasl_response()?;
+                match secantus_auth::continue_scram(&mut state, &last.data) {
+                    Ok(server_final) => {
+                        client
+                            .send(PgWireBackendMessage::Authentication(
+                                Authentication::SASLFinal(Bytes::from(server_final)),
+                            ))
+                            .await?;
+                        self.finish_startup(client).await
+                    }
+                    Err(_) => self.fail_login(client, "28P01", failed).await,
+                }
+            }
+        }
+    }
+
+    /// `AuthenticationOk`, the session's ParameterStatus values, and the first
+    /// `ReadyForQuery`: the end of a startup, trusted or authenticated.
+    async fn finish_startup<C>(&self, client: &mut C) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
         let (pid, secret_key) = PID_GENERATOR.generate(client);
         client.set_pid_and_secret_key(pid, secret_key);
         // The startup ParameterStatus values are the SESSION's settings, so
@@ -6569,9 +6855,7 @@ impl StartupHandler for PgHandler {
         client.set_state(pgwire::api::PgWireConnectionState::ReadyForQuery);
         Ok(())
     }
-}
 
-impl PgHandler {
     /// Binds this connection to the database the startup packet named.
     fn select_database(&self, name: &str) -> PgWireResult<()> {
         let fatal = |code: &str, message: String| {
@@ -12621,6 +12905,53 @@ impl PgHandler {
             Statement::JoinRows(_) => Err(Self::err(&PlanError::Internal(
                 "a join source reached execution on its own".into(),
             ))),
+            Statement::Explain { inner, options } => {
+                let db = self.db().to_string();
+                let chooser = |table: &str, filter: &Document| -> Option<String> {
+                    match self.storage.explain_plan(&db, table, filter).ok()? {
+                        secantus_storage::ExplainPlan::IxScan { index_name, .. } => {
+                            Some(if index_name == "_id_" {
+                                format!("{table}_pkey")
+                            } else {
+                                index_name
+                            })
+                        }
+                        secantus_storage::ExplainPlan::CollScan => None,
+                    }
+                };
+                let tree = explain::plan_tree(&inner, &chooser);
+                // ANALYZE runs the statement, as PostgreSQL's does -- a write
+                // is written -- and reports the rows it produced.
+                let actual = if options.analyze {
+                    Some(match inner.as_ref() {
+                        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
+                            self.execute_statement(*inner.clone(), 0)?;
+                            0
+                        }
+                        other => self.rows_with_schema(other)?.1.len(),
+                    })
+                } else {
+                    None
+                };
+                let (ty, lines) = if options.format == "json" {
+                    (
+                        Type::JSON,
+                        vec![explain::render_json(&tree, &options, actual)],
+                    )
+                } else {
+                    (Type::TEXT, explain::render_text(&tree, &options, actual))
+                };
+                let schema = Arc::new(vec![self.field("QUERY PLAN".to_string(), ty)]);
+                let schema_ref = schema.clone();
+                let rows = stream::iter(lines).map(move |v| {
+                    let mut enc = DataRowEncoder::new(schema_ref.clone());
+                    enc.encode_field(&Some(v.as_str()))?;
+                    Ok(enc.take_row())
+                });
+                let mut response = QueryResponse::new(schema, rows);
+                response.set_bare_command_tag("EXPLAIN");
+                Ok(vec![Response::Query(response)])
+            }
             Statement::CreateIndex(ci) => self.create_index(ci),
 
             Statement::DropIndex { names, if_exists } => {
@@ -13616,7 +13947,11 @@ impl PgHandler {
                 upd.filter =
                     self.narrow_by_residual(&upd.table, &upd.filter, upd.residual.take())?;
                 let def = self.lookup(&upd.table);
-                let constrained = def.as_ref().is_some_and(table_has_row_constraints);
+                // A table another one REFERENCES has to see each row's old and
+                // new key, for the referencing side's ON UPDATE action.
+                let referenced = !self.referencing_keys(&upd.table)?.is_empty();
+                let constrained = def.as_ref().is_some_and(table_has_row_constraints) || referenced;
+                let mut key_changes: Vec<(Document, Document)> = Vec::new();
                 // RETURNING needs each row AFTER the update, which only the
                 // row-by-row path below computes -- the bulk path knows just
                 // how many rows matched.
@@ -13660,6 +13995,9 @@ impl PgHandler {
                             if let Some(def) = def.as_ref() {
                                 self.check_row_constraints(def, &after)?;
                             }
+                            if referenced {
+                                key_changes.push((row.clone(), after.clone()));
+                            }
                             new_rows.push(after);
                         }
                         let id = row_id(&row);
@@ -13667,6 +14005,9 @@ impl PgHandler {
                     }
                     if let Some(def) = def.as_ref() {
                         self.check_foreign_keys(def, &new_rows)?;
+                    }
+                    if let (true, Some(def)) = (referenced, def.as_ref()) {
+                        self.check_referencing_updates(def, &key_changes)?;
                     }
                     let mut matched = 0usize;
                     for (id, set, unset) in writes {
@@ -14121,25 +14462,45 @@ impl PgHandler {
     fn referenced_key_exists(
         &self,
         parent: &TableDef,
-        ref_field: &str,
-        value: &Bson,
+        ref_fields: &[String],
+        values: &[Bson],
         pending: &[Document],
     ) -> PgWireResult<bool> {
-        if pending
-            .iter()
-            .any(|r| r.get(ref_field).is_some_and(|v| key_values_equal(v, value)))
-        {
+        let matches = |r: &Document| {
+            ref_fields
+                .iter()
+                .zip(values)
+                .all(|(f, v)| r.get(f).is_some_and(|x| key_values_equal(x, v)))
+        };
+        if pending.iter().any(matches) {
             return Ok(true);
+        }
+        let mut filter = Document::new();
+        for (f, v) in ref_fields.iter().zip(values) {
+            filter.insert(f.clone(), v.clone());
         }
         let found = self
             .storage
-            .find_matching(
-                self.db(),
-                &parent.name,
-                &bson::doc! { ref_field: value.clone() },
-            )
+            .find_matching(self.db(), &parent.name, &filter)
             .map_err(|e| Self::storage_err("could not read", e))?;
         Ok(!found.is_empty())
+    }
+
+    /// A foreign key's `(child field, parent field)` pairs, in key order.
+    fn fk_fields(
+        child: &TableDef,
+        parent: &TableDef,
+        fk: &secantus_pgcatalog::ForeignKey,
+    ) -> Option<(Vec<String>, Vec<String>)> {
+        let fields: Option<Vec<String>> = fk.columns.iter().map(|c| child.field_of(c)).collect();
+        let refs: Option<Vec<String>> = fk.ref_columns.iter().map(|c| parent.field_of(c)).collect();
+        Some((fields?, refs?))
+    }
+
+    /// `Key (a, b)=(1, x)` as PostgreSQL's DETAIL renders a key.
+    fn key_detail(columns: &[String], values: &[Bson]) -> String {
+        let vals: Vec<String> = values.iter().map(secantus_pgplan::value_text).collect();
+        format!("Key ({})=({})", columns.join(", "), vals.join(", "))
     }
 
     /// The child side of every FOREIGN KEY on `def`, over the rows a
@@ -14178,28 +14539,27 @@ impl PgHandler {
         fk: &secantus_pgcatalog::ForeignKey,
         rows: &[Document],
     ) -> PgWireResult<()> {
-        let (Some(col), Some(ref_col)) = (fk.columns.first(), fk.ref_columns.first()) else {
-            return Ok(());
-        };
-        let Some(field) = def.field_of(col) else {
-            return Ok(());
-        };
         let parent = if fk.ref_table == def.name {
             def.clone()
         } else {
             self.lookup(&fk.ref_table)
                 .ok_or_else(|| Self::err(&PlanError::UndefinedTable(fk.ref_table.clone())))?
         };
-        let Some(ref_field) = parent.field_of(ref_col) else {
+        let Some((fields, ref_fields)) = Self::fk_fields(def, &parent, fk) else {
             return Ok(());
         };
         let pending: &[Document] = if fk.ref_table == def.name { rows } else { &[] };
         for row in rows {
-            let value = match row.get(&field) {
-                None | Some(Bson::Null) => continue,
-                Some(v) => v,
+            // MATCH SIMPLE: a key with ANY NULL column references nothing and
+            // passes.
+            let values: Option<Vec<Bson>> = fields
+                .iter()
+                .map(|f| row.get(f).filter(|v| **v != Bson::Null).cloned())
+                .collect();
+            let Some(values) = values else {
+                continue;
             };
-            if !self.referenced_key_exists(&parent, &ref_field, value, pending)? {
+            if !self.referenced_key_exists(&parent, &ref_fields, &values, pending)? {
                 return Err(Self::constraint_error(
                     "23503",
                     format!(
@@ -14207,9 +14567,8 @@ impl PgHandler {
                         def.name, fk.name
                     ),
                     format!(
-                        "Key ({})=({}) is not present in table \"{}\".",
-                        col,
-                        secantus_pgplan::value_text(value),
+                        "{} is not present in table \"{}\".",
+                        Self::key_detail(&fk.columns, &values),
                         fk.ref_table
                     ),
                     def,
@@ -14276,87 +14635,193 @@ impl PgHandler {
             .map_err(|e| Self::storage_err("could not read", e))?;
         let going: Vec<Document> = raw.iter().filter_map(|b| decode_doc(b).ok()).collect();
         for (child, fk) in referencing {
-            let (Some(col), Some(ref_col)) = (fk.columns.first(), fk.ref_columns.first()) else {
-                continue;
-            };
-            let (Some(field), Some(ref_field)) = (child.field_of(col), def.field_of(ref_col))
-            else {
+            let Some((fields, ref_fields)) = Self::fk_fields(&child, def, &fk) else {
                 continue;
             };
             for row in &going {
-                let Some(key) = row.get(&ref_field).filter(|v| **v != Bson::Null) else {
+                let key: Option<Vec<Bson>> = ref_fields
+                    .iter()
+                    .map(|f| row.get(f).filter(|v| **v != Bson::Null).cloned())
+                    .collect();
+                let Some(key) = key else {
                     continue;
                 };
                 // A self-referencing row that is itself going does not hold
                 // its own parent; only rows that STAY count.
-                let mut child_filter = bson::doc! { &field: key.clone() };
+                let mut child_filter = Document::new();
+                for (f, v) in fields.iter().zip(&key) {
+                    child_filter.insert(f.clone(), v.clone());
+                }
                 if child.name == def.name {
                     let going_ids: Vec<Bson> = going.iter().map(row_id).collect();
                     child_filter.insert("_id", bson::doc! { "$nin": going_ids });
                 }
-                let dependants = self
-                    .storage
-                    .find_matching(self.db(), &child.name, &child_filter)
-                    .map_err(|e| Self::storage_err("could not read", e))?;
-                if dependants.is_empty() {
+                self.apply_referential_action(
+                    def,
+                    &child,
+                    &fk,
+                    fk.on_delete.as_deref(),
+                    &fields,
+                    &key,
+                    &child_filter,
+                    None,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// What happens to the rows of `child` that reference a parent key that is
+    /// going away (a DELETE) or changing (an UPDATE, `new_key` set): NO
+    /// ACTION / RESTRICT refuse, CASCADE deletes them (or rewrites their key),
+    /// SET NULL / SET DEFAULT reset their key columns -- after which a SET
+    /// DEFAULT key must itself reference an existing row.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_referential_action(
+        &self,
+        parent: &TableDef,
+        child: &TableDef,
+        fk: &secantus_pgcatalog::ForeignKey,
+        action: Option<&str>,
+        fields: &[String],
+        key: &[Bson],
+        child_filter: &Document,
+        new_key: Option<&[Bson]>,
+    ) -> PgWireResult<()> {
+        let dependants = self
+            .storage
+            .find_matching(self.db(), &child.name, child_filter)
+            .map_err(|e| Self::storage_err("could not read", e))?;
+        if dependants.is_empty() {
+            return Ok(());
+        }
+        let reset = |value_of: &dyn Fn(&str) -> PgWireResult<Bson>| -> PgWireResult<()> {
+            let mut set = Document::new();
+            for (col, f) in fk.columns.iter().zip(fields) {
+                set.insert(f.clone(), value_of(col)?);
+            }
+            let mut after = Vec::new();
+            for b in &dependants {
+                let mut r: Document =
+                    decode_doc(b).map_err(|e| Self::storage_err("could not decode a row", e))?;
+                for (k, v) in &set {
+                    r.insert(k.clone(), v.clone());
+                }
+                self.check_row_constraints(child, &r)?;
+                after.push(r);
+            }
+            if fk.ref_table == child.name || matches!(action, Some("SET DEFAULT")) {
+                self.check_fk_child_side(child, fk, &after)?;
+            }
+            self.update_rows(&child.name, child_filter, &set, &[])?;
+            Ok(())
+        };
+        match action {
+            Some("CASCADE") => match new_key {
+                None => {
+                    self.check_referencing_rows(child, child_filter)?;
+                    self.storage
+                        .delete_matching(
+                            self.db(),
+                            &child.name,
+                            child_filter,
+                            0,
+                            &Document::new(),
+                            None,
+                        )
+                        .map_err(|e| Self::storage_err("could not delete", e))?;
+                    Ok(())
+                }
+                Some(new_key) => {
+                    let by_col: Vec<(String, Bson)> =
+                        fk.columns.iter().cloned().zip(new_key.iter().cloned()).collect();
+                    reset(&|col| {
+                        Ok(by_col
+                            .iter()
+                            .find(|(c, _)| c == col)
+                            .map_or(Bson::Null, |(_, v)| v.clone()))
+                    })
+                }
+            },
+            Some("SET NULL") => reset(&|_| Ok(Bson::Null)),
+            Some("SET DEFAULT") => reset(&|col| {
+                let column = child
+                    .column(col)
+                    .ok_or_else(|| Self::err(&PlanError::UndefinedColumn(col.to_string())))?;
+                match column.default_expr() {
+                    Some(expr) => {
+                        self.eval_constant_sql(&format!("SELECT ({expr})::{}", column.pg_type))
+                    }
+                    None => Ok(column.default.clone().unwrap_or(Bson::Null)),
+                }
+            }),
+            _ if fk.initially_deferred
+                && self
+                    .in_transaction
+                    .load(std::sync::atomic::Ordering::Relaxed) =>
+            {
+                self.defer_fk(&child.name, &fk.name);
+                Ok(())
+            }
+            _ => Err(Self::constraint_error(
+                "23503",
+                format!(
+                    "update or delete on table \"{}\" violates foreign key constraint \"{}\" on table \"{}\"",
+                    parent.name, fk.name, child.name
+                ),
+                format!(
+                    "{} is still referenced from table \"{}\".",
+                    Self::key_detail(&fk.ref_columns, key),
+                    child.name
+                ),
+                child,
+                Some(&fk.name),
+                None,
+            )),
+        }
+    }
+
+    /// The parent side of an UPDATE: a row whose REFERENCED key changes takes
+    /// the key's ON UPDATE action with it. Only a UNIQUE-key reference can
+    /// reach this -- a primary key is immutable here.
+    fn check_referencing_updates(
+        &self,
+        def: &TableDef,
+        pairs: &[(Document, Document)],
+    ) -> PgWireResult<()> {
+        for (child, fk) in self.referencing_keys(&def.name)? {
+            let Some((fields, ref_fields)) = Self::fk_fields(&child, def, &fk) else {
+                continue;
+            };
+            for (before, after) in pairs {
+                let old: Option<Vec<Bson>> = ref_fields
+                    .iter()
+                    .map(|f| before.get(f).filter(|v| **v != Bson::Null).cloned())
+                    .collect();
+                let Some(old) = old else {
+                    continue;
+                };
+                let new: Vec<Bson> = ref_fields
+                    .iter()
+                    .map(|f| after.get(f).cloned().unwrap_or(Bson::Null))
+                    .collect();
+                if old.iter().zip(&new).all(|(a, b)| key_values_equal(a, b)) {
                     continue;
                 }
-                match fk.on_delete.as_deref() {
-                    Some("CASCADE") => {
-                        self.check_referencing_rows(&child, &child_filter)?;
-                        self.storage
-                            .delete_matching(
-                                self.db(),
-                                &child.name,
-                                &child_filter,
-                                0,
-                                &Document::new(),
-                                None,
-                            )
-                            .map_err(|e| Self::storage_err("could not delete", e))?;
-                    }
-                    Some("SET NULL") => {
-                        let mut after = Vec::new();
-                        for b in &dependants {
-                            let mut r: Document = decode_doc(b)
-                                .map_err(|e| Self::storage_err("could not decode a row", e))?;
-                            r.insert(field.clone(), Bson::Null);
-                            self.check_row_constraints(&child, &r)?;
-                            after.push(r);
-                        }
-                        self.update_rows(
-                            &child.name,
-                            &child_filter,
-                            &bson::doc! { &field: Bson::Null },
-                            &[],
-                        )?;
-                    }
-                    _ if fk.initially_deferred
-                        && self
-                            .in_transaction
-                            .load(std::sync::atomic::Ordering::Relaxed) =>
-                    {
-                        self.defer_fk(&child.name, &fk.name);
-                    }
-                    _ => {
-                        return Err(Self::constraint_error(
-                            "23503",
-                            format!(
-                                "update or delete on table \"{}\" violates foreign key constraint \"{}\" on table \"{}\"",
-                                def.name, fk.name, child.name
-                            ),
-                            format!(
-                                "Key ({})=({}) is still referenced from table \"{}\".",
-                                ref_col,
-                                secantus_pgplan::value_text(key),
-                                child.name
-                            ),
-                            &child,
-                            Some(&fk.name),
-                            None,
-                        ));
-                    }
+                let mut child_filter = Document::new();
+                for (f, v) in fields.iter().zip(&old) {
+                    child_filter.insert(f.clone(), v.clone());
                 }
+                self.apply_referential_action(
+                    def,
+                    &child,
+                    &fk,
+                    fk.on_update.as_deref(),
+                    &fields,
+                    &old,
+                    &child_filter,
+                    Some(&new),
+                )?;
             }
         }
         Ok(())
@@ -18515,6 +18980,14 @@ impl PgHandler {
                 })
                 .collect(),
             Statement::Show(name) => vec![self.field(canonical_setting(&name), Type::TEXT)],
+            Statement::Explain { options, .. } => vec![self.field(
+                "QUERY PLAN".to_string(),
+                if options.format == "json" {
+                    Type::JSON
+                } else {
+                    Type::TEXT
+                },
+            )],
             Statement::SelectConstant(sc) => sc
                 .columns
                 .iter()

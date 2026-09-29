@@ -13244,3 +13244,91 @@ def test_a_composite_primary_key_shares_the_pythons_layout(home: Path) -> None:
         assert cur.fetchall() == [(2, "z", 5)]
         with pytest.raises(psycopg.errors.UniqueViolation):
             cur.execute("INSERT INTO ck VALUES (2, 'z', 6)")
+
+
+def test_a_role_with_a_password_must_prove_it(home: Path) -> None:
+    """SCRAM-SHA-256 against the verifier `CREATE ROLE ... PASSWORD` stores.
+
+    Before this every connection was trusted, so a wrong password -- or none
+    -- connected as a password-protected role: an authentication bypass. A
+    role with no password, and a user the server has never heard of, are
+    still trusted, which is what every fixture connecting as a password-less
+    `postgres` relies on.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE ROLE alice LOGIN PASSWORD 's3cret'")
+        conn.execute("CREATE ROLE gate PASSWORD 'x'")
+        dsn = f"host=127.0.0.1 port={server.port} dbname=postgres connect_timeout=10"
+        with psycopg.connect(f"{dsn} user=alice password=s3cret") as ok:
+            assert ok.execute("SELECT current_user").fetchone() == ("alice",)
+        with pytest.raises(psycopg.OperationalError, match="password authentication failed"):
+            psycopg.connect(f"{dsn} user=alice password=wrong")
+        with pytest.raises(psycopg.OperationalError):
+            psycopg.connect(f"{dsn} user=alice")
+        with pytest.raises(psycopg.OperationalError, match="not permitted to log in"):
+            psycopg.connect(f"{dsn} user=gate password=x")
+        with psycopg.connect(f"{dsn} user=stranger") as trusted:
+            assert trusted.execute("SELECT 1").fetchone() == (1,)
+
+
+def test_explain_reports_the_plans_shape(home: Path) -> None:
+    """EXPLAIN in PostgreSQL's layout. The node types are real -- an index
+    scan exactly when the storage would use the index -- and the costs are
+    zeros rather than a fiction, so tests compare plans with COSTS OFF."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE ex (id int PRIMARY KEY, n int, g text)")
+        cur.execute("INSERT INTO ex VALUES (1, 1, 'a')")
+
+        def plan(sql: str) -> list[str]:
+            cur.execute(sql)
+            return [r[0] for r in cur.fetchall()]
+
+        assert plan("EXPLAIN (COSTS OFF) SELECT * FROM ex ORDER BY g LIMIT 1") == [
+            "Limit",
+            "  ->  Sort",
+            "        Sort Key: g",
+            "        ->  Seq Scan on ex",
+        ]
+        assert plan("EXPLAIN (COSTS OFF) SELECT g, count(*) FROM ex GROUP BY g") == [
+            "HashAggregate",
+            "  Group Key: g",
+            "  ->  Seq Scan on ex",
+        ]
+        assert plan("EXPLAIN SELECT 1") == ["Result  (cost=0.00..0.00 rows=0 width=0)"]
+        cur.execute("EXPLAIN (FORMAT JSON, COSTS OFF) SELECT * FROM ex")
+        assert cur.fetchone()[0][0]["Plan"]["Node Type"] == "Seq Scan"
+        assert plan("EXPLAIN ANALYZE SELECT * FROM ex")[-1] == "Execution Time: 0.000 ms"
+
+
+def test_multi_column_foreign_keys(home: Path) -> None:
+    """A foreign key over several columns, to a composite PRIMARY KEY or a
+    UNIQUE constraint: MATCH SIMPLE (a NULL anywhere passes), the DELETE and
+    UPDATE actions, and a DETAIL naming the whole key."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE p (a int, b text, PRIMARY KEY (a, b))")
+        cur.execute("CREATE TABLE u (id int PRIMARY KEY, x int, y int, UNIQUE (x, y))")
+        cur.execute("INSERT INTO p VALUES (1, 'x'), (2, 'y')")
+        cur.execute("INSERT INTO u VALUES (1, 5, 5)")
+        cur.execute(
+            "CREATE TABLE c (id int PRIMARY KEY, pa int, pb text, "
+            "FOREIGN KEY (pa, pb) REFERENCES p ON DELETE CASCADE)"
+        )
+        cur.execute("INSERT INTO c VALUES (1, 1, 'x'), (2, NULL, 'nope')")
+        with pytest.raises(psycopg.errors.ForeignKeyViolation) as info:
+            cur.execute("INSERT INTO c VALUES (3, 1, 'y')")
+        assert info.value.diag.message_detail == 'Key (pa, pb)=(1, y) is not present in table "p".'
+        cur.execute("DELETE FROM p WHERE a = 1")
+        cur.execute("SELECT id FROM c ORDER BY id")
+        assert cur.fetchall() == [(2,)]
+        cur.execute(
+            "CREATE TABLE g (id int PRIMARY KEY, x int, y int, "
+            "FOREIGN KEY (x, y) REFERENCES u (x, y) ON UPDATE CASCADE)"
+        )
+        cur.execute("INSERT INTO g VALUES (1, 5, 5)")
+        cur.execute("UPDATE u SET y = 6 WHERE id = 1")
+        cur.execute("SELECT x, y FROM g")
+        assert cur.fetchall() == [(5, 6)]
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):
+            cur.execute("DELETE FROM u WHERE id = 1")

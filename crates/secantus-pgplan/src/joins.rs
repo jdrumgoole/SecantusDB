@@ -46,6 +46,18 @@ pub enum JoinNode {
         /// `(joined-row key, field in the leaf's rows)`.
         columns: Vec<(String, String)>,
     },
+    /// A LATERAL item: SQL re-run for every row of the join's LEFT side, its
+    /// references to that side bound as `$N` parameters past the statement's
+    /// own. Only ever the right side of a `Join`.
+    Lateral {
+        sql: String,
+        /// The statement's own parameters, which the SQL's `$1..$n` still are.
+        params: Vec<Bson>,
+        /// The left side's keys whose values fill `$n+1..`, in order.
+        keys: Vec<String>,
+        /// `(joined-row key, position in the SQL's select list)`.
+        columns: Vec<(String, usize)>,
+    },
     Join {
         kind: JoinKind,
         left: Box<JoinNode>,
@@ -182,7 +194,8 @@ pub(crate) fn plan_join_source(
     let mut scope = Scope::default();
     let mut tree: Option<JoinNode> = None;
     for item in &s.from_clause {
-        let (node, item_scope) = build(item, lookup, params, &mut scope.aliases)?;
+        let left = (tree.is_some()).then(|| scope.clone());
+        let (node, item_scope) = build(item, lookup, params, &mut scope.aliases, left.as_ref())?;
         tree = Some(match tree {
             None => node,
             // `FROM a, b`: a cross join, left to right.
@@ -278,6 +291,7 @@ pub(crate) fn unmangle(e: Error) -> Error {
 fn keys_of(node: &JoinNode) -> Vec<String> {
     match node {
         JoinNode::Leaf { columns, .. } => columns.iter().map(|(k, _)| k.clone()).collect(),
+        JoinNode::Lateral { columns, .. } => columns.iter().map(|(k, _)| k.clone()).collect(),
         JoinNode::Join {
             left_keys,
             right_keys,
@@ -298,9 +312,15 @@ fn build(
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &[Bson],
     aliases: &mut Vec<String>,
+    left: Option<&Scope>,
 ) -> Result<(JoinNode, Scope)> {
+    if let Some(left) = left {
+        if let Some(lateral) = lateral_leaf(item, left, lookup, params, aliases)? {
+            return Ok(lateral);
+        }
+    }
     match item.node.as_ref() {
-        Some(N::JoinExpr(j)) => build_join(j, lookup, params, aliases),
+        Some(N::JoinExpr(j)) => build_join(j, lookup, params, aliases, left),
         Some(N::RangeVar(r)) => {
             let alias = r
                 .alias
@@ -331,16 +351,13 @@ fn build(
             )
         }
         Some(N::RangeSubselect(rs)) => {
-            if rs.lateral {
-                return Err(Error::Unsupported("a LATERAL subquery in FROM".into()));
-            }
-            let src = plan_from_subquery(rs, lookup, params)?;
+            // LATERAL with nothing to its left is an ordinary subquery.
+            let mut rs = rs.clone();
+            rs.lateral = false;
+            let src = plan_from_subquery(&rs, lookup, params)?;
             leaf_from_source(src.plan, src.def, &src.alias, lookup, aliases)
         }
         Some(N::RangeFunction(rf)) => {
-            if rf.lateral {
-                return Err(Error::Unsupported("a LATERAL function in FROM".into()));
-            }
             // A function call's own alias names the source; without one,
             // PostgreSQL names it after the function.
             let alias = rf
@@ -350,9 +367,233 @@ fn build(
                 .filter(|a| !a.is_empty())
                 .or_else(|| range_function_name(rf))
                 .ok_or_else(|| Error::Unsupported("this FROM function".into()))?;
-            leaf(item.clone(), &alias, &[], lookup, params, aliases)
+            let mut rf = rf.clone();
+            rf.lateral = false;
+            let colnames = function_colnames(&rf);
+            rf.alias = None;
+            leaf(
+                pg_query::protobuf::Node {
+                    node: Some(N::RangeFunction(rf)),
+                },
+                &alias,
+                &colnames,
+                lookup,
+                params,
+                aliases,
+            )
         }
         _ => Err(Error::Unsupported("this JOIN side".into())),
+    }
+}
+
+/// A function's output column names from its alias: `AS t(a, b)` names them;
+/// a bare `AS x` over a function returning ONE column names that column too,
+/// which is PostgreSQL's rule for a scalar function in FROM.
+fn function_colnames(rf: &pg_query::protobuf::RangeFunction) -> Vec<pg_query::protobuf::Node> {
+    match rf.alias.as_ref() {
+        Some(a) if !a.colnames.is_empty() => a.colnames.clone(),
+        Some(a) if !a.aliasname.is_empty() => vec![pg_query::protobuf::Node {
+            node: Some(N::String(pg_query::protobuf::String {
+                sval: a.aliasname.clone(),
+            })),
+        }],
+        _ => Vec::new(),
+    }
+}
+
+/// A FROM item that reads the row to its LEFT -- a `LATERAL` subquery, or a
+/// function whose arguments name a column there (a function in FROM is
+/// implicitly lateral, as in PostgreSQL) -- planned as SQL re-run per left
+/// row. `None` for an item that reads nothing on the left, which is then an
+/// ordinary leaf.
+fn lateral_leaf(
+    item: &pg_query::protobuf::Node,
+    left: &Scope,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+    aliases: &mut Vec<String>,
+) -> Result<Option<(JoinNode, Scope)>> {
+    let (mut inner, alias, colnames, function) = match item.node.as_ref() {
+        Some(N::RangeSubselect(rs)) if rs.lateral => {
+            let Some(N::SelectStmt(sel)) = rs.subquery.as_deref().and_then(|q| q.node.as_ref())
+            else {
+                return Err(Error::Unsupported("this LATERAL subquery".into()));
+            };
+            let alias = rs
+                .alias
+                .as_ref()
+                .map(|a| a.aliasname.clone())
+                .unwrap_or_default();
+            if alias.is_empty() {
+                return Err(Error::Parse("subquery in FROM must have an alias".into()));
+            }
+            let colnames = rs
+                .alias
+                .as_ref()
+                .map(|a| a.colnames.clone())
+                .unwrap_or_default();
+            ((**sel).clone(), alias, colnames, false)
+        }
+        Some(N::RangeFunction(rf)) => {
+            let alias = rf
+                .alias
+                .as_ref()
+                .map(|a| a.aliasname.clone())
+                .filter(|a| !a.is_empty())
+                .or_else(|| range_function_name(rf))
+                .ok_or_else(|| Error::Unsupported("this FROM function".into()))?;
+            let colnames = function_colnames(rf);
+            let mut bare = rf.clone();
+            bare.lateral = false;
+            bare.alias = None;
+            let select = pg_query::protobuf::SelectStmt {
+                target_list: vec![star_target()],
+                from_clause: vec![pg_query::protobuf::Node {
+                    node: Some(N::RangeFunction(bare)),
+                }],
+                limit_option: pg_query::protobuf::LimitOption::Default as i32,
+                op: pg_query::protobuf::SetOperation::SetopNone as i32,
+                ..Default::default()
+            };
+            (select, alias, colnames, true)
+        }
+        _ => return Ok(None),
+    };
+    // The references to the left side, each bound to a parameter.
+    let mut keys: Vec<String> = Vec::new();
+    let mut types: Vec<String> = Vec::new();
+    let base = params.len() + 1;
+    let mut failure: Option<Error> = None;
+    crate::correlated::walk_select(&mut inner, &mut |n| {
+        let Some(N::ColumnRef(c)) = n.node.as_ref() else {
+            return Ok(());
+        };
+        let Some(parts) = names_of(c) else {
+            return Ok(());
+        };
+        let points_left = match parts.as_slice() {
+            [_, qualifier, _] | [qualifier, _] => left.aliases.contains(qualifier),
+            // A function has no columns of its own, so a bare name in its
+            // arguments can only be the left side's.
+            [_] => function,
+            _ => false,
+        };
+        if !points_left {
+            return Ok(());
+        }
+        let key = match left.resolve(&parts) {
+            Ok(Some(k)) => k,
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                failure.get_or_insert(e);
+                return Ok(());
+            }
+        };
+        let i = match keys.iter().position(|k| *k == key) {
+            Some(i) => i,
+            None => {
+                let ty = left
+                    .cols
+                    .iter()
+                    .find(|c| c.key == key)
+                    .map(|c| c.pg_type.clone())
+                    .unwrap_or_else(|| "text".into());
+                keys.push(key);
+                types.push(ty);
+                keys.len() - 1
+            }
+        };
+        // Bound as `$N::<the column's type>`, so an operator that depends on
+        // the type (`j -> 'a'` on a jsonb) resolves the same with a value as
+        // it would over the column.
+        let param = pg_query::protobuf::Node {
+            node: Some(N::ParamRef(pg_query::protobuf::ParamRef {
+                number: i32::try_from(base + i).unwrap_or(i32::MAX),
+                location: c.location,
+            })),
+        };
+        n.node = Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+            arg: Some(Box::new(param)),
+            type_name: Some(type_name_node(&types[i])),
+            location: -1,
+        })));
+        Ok(())
+    })?;
+    if let Some(e) = failure {
+        return Err(e);
+    }
+    if keys.is_empty() {
+        // It reads nothing on its left after all.
+        return Ok(None);
+    }
+    // Planned once over typed sample values, for the output's shape; each left
+    // row re-plans it with its own.
+    let mut sample_params = params.to_vec();
+    sample_params.extend(types.iter().map(|t| sample_value_for_type(t)));
+    let plan = plan_select(&inner, lookup, &sample_params)?;
+    let def = sub_plan_def(&plan, lookup)?;
+    let names: Vec<String> = colnames.iter().filter_map(alias_colname).collect();
+    if names.len() > def.columns.len() {
+        return Err(Error::Parse(format!(
+            "table \"{alias}\" has {} columns available but {} columns specified",
+            def.columns.len(),
+            names.len()
+        )));
+    }
+    if aliases.contains(&alias) {
+        return Err(Error::Sqlstate(
+            "42712",
+            format!("table name \"{alias}\" specified more than once"),
+        ));
+    }
+    aliases.push(alias.clone());
+    let sql = pg_query::protobuf::Node {
+        node: Some(N::SelectStmt(Box::new(inner))),
+    }
+    .deparse()
+    .map_err(|e| Error::Parse(e.to_string()))?;
+    let mut scope = Scope {
+        cols: Vec::new(),
+        aliases: vec![alias.clone()],
+    };
+    let mut columns = Vec::new();
+    for (i, c) in def.columns.iter().enumerate() {
+        let name = names.get(i).cloned().unwrap_or_else(|| c.name.clone());
+        let key = join_key(&alias, &name);
+        columns.push((key.clone(), i));
+        scope.cols.push(ScopeCol {
+            alias: alias.clone(),
+            name,
+            key,
+            pg_type: c.pg_type.clone(),
+            bare: true,
+            star: true,
+        });
+    }
+    Ok(Some((
+        JoinNode::Lateral {
+            sql,
+            params: params.to_vec(),
+            keys,
+            columns,
+        },
+        scope,
+    )))
+}
+
+fn star_target() -> pg_query::protobuf::Node {
+    pg_query::protobuf::Node {
+        node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+            val: Some(Box::new(pg_query::protobuf::Node {
+                node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+                    fields: vec![pg_query::protobuf::Node {
+                        node: Some(N::AStar(pg_query::protobuf::AStar {})),
+                    }],
+                    location: -1,
+                })),
+            })),
+            ..Default::default()
+        }))),
     }
 }
 
@@ -485,6 +726,7 @@ fn build_join(
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &[Bson],
     aliases: &mut Vec<String>,
+    outer_left: Option<&Scope>,
 ) -> Result<(JoinNode, Scope)> {
     use pg_query::protobuf::JoinType;
     if j.alias.is_some() {
@@ -505,8 +747,19 @@ fn build_join(
         .rarg
         .as_deref()
         .ok_or_else(|| Error::Parse("JOIN without a right side".into()))?;
-    let (left, lscope) = build(larg, lookup, params, aliases)?;
-    let (right, rscope) = build(rarg, lookup, params, aliases)?;
+    let (left, lscope) = build(larg, lookup, params, aliases, outer_left)?;
+    // The right side may be LATERAL over everything to its left.
+    let mut visible = outer_left.cloned().unwrap_or_default();
+    visible.cols.extend(lscope.cols.iter().cloned());
+    visible.aliases.extend(lscope.aliases.iter().cloned());
+    let (right, rscope) = build(rarg, lookup, params, aliases, Some(&visible))?;
+    if matches!(right, JoinNode::Lateral { .. }) && matches!(kind, JoinKind::Right | JoinKind::Full)
+    {
+        return Err(Error::Sqlstate(
+            "42P10",
+            "The combining JOIN type must be INNER or LEFT for a LATERAL reference.".into(),
+        ));
+    }
     let left_keys = keys_of(&left);
     let right_keys = keys_of(&right);
 
@@ -829,4 +1082,117 @@ fn rewrite_query(s: &mut pg_query::protobuf::SelectStmt, scope: &Scope) -> Resul
         rewrite_expr(w, scope, &[])?;
     }
     Ok(())
+}
+
+/// The set-returning functions a select list may call over a column.
+const SELECT_LIST_SRFS: &[&str] = &[
+    "unnest",
+    "generate_series",
+    "generate_subscripts",
+    "regexp_split_to_table",
+    "jsonb_array_elements",
+    "json_array_elements",
+    "jsonb_array_elements_text",
+    "json_array_elements_text",
+    "jsonb_object_keys",
+    "json_object_keys",
+    "regexp_matches",
+];
+
+/// `SELECT unnest(ia) FROM t` as the LATERAL join it means: `FROM t, LATERAL
+/// unnest(ia) AS __srf0`, the target reading the function's column. A
+/// set-returning function in the select list changes the ROW COUNT, which no
+/// per-row expression can do; as a lateral source it is just more rows.
+///
+/// `None` when the select list calls none over a column. Several are refused
+/// by name: PostgreSQL runs them in LOCKSTEP (the longest decides the row
+/// count, the others pad with NULL), which a join would get wrong silently.
+pub(crate) fn select_list_srf(
+    s: &pg_query::protobuf::SelectStmt,
+) -> Result<Option<pg_query::protobuf::SelectStmt>> {
+    let is_srf = |n: Option<&pg_query::protobuf::Node>| match n.and_then(|v| v.node.as_ref()) {
+        Some(N::FuncCall(f)) if f.over.is_none() => {
+            func_name(f).is_some_and(|name| SELECT_LIST_SRFS.contains(&name.as_str()))
+        }
+        _ => false,
+    };
+    let positions: Vec<usize> = s
+        .target_list
+        .iter()
+        .enumerate()
+        .filter(
+            |(_, t)| matches!(t.node.as_ref(), Some(N::ResTarget(r)) if is_srf(r.val.as_deref())),
+        )
+        .map(|(i, _)| i)
+        .collect();
+    // With no FROM, a set-returning function ALONE is already its own
+    // source; beside another target it needs one row to join to.
+    if s.from_clause.is_empty() && (positions.is_empty() || s.target_list.len() == 1) {
+        return Ok(None);
+    }
+    match positions.as_slice() {
+        [] => Ok(None),
+        [i] => {
+            let mut out = s.clone();
+            if out.from_clause.is_empty() {
+                let one = pg_query::protobuf::SelectStmt {
+                    target_list: Vec::new(),
+                    limit_option: pg_query::protobuf::LimitOption::Default as i32,
+                    op: pg_query::protobuf::SetOperation::SetopNone as i32,
+                    ..Default::default()
+                };
+                out.from_clause.push(pg_query::protobuf::Node {
+                    node: Some(N::RangeSubselect(Box::new(
+                        pg_query::protobuf::RangeSubselect {
+                            lateral: false,
+                            subquery: Some(Box::new(pg_query::protobuf::Node {
+                                node: Some(N::SelectStmt(Box::new(one))),
+                            })),
+                            alias: Some(pg_query::protobuf::Alias {
+                                aliasname: "__one".into(),
+                                colnames: Vec::new(),
+                            }),
+                        },
+                    ))),
+                });
+            }
+            let Some(N::ResTarget(rt)) = out.target_list[*i].node.as_mut() else {
+                return Ok(None);
+            };
+            let call = rt.val.take().expect("checked");
+            let name = match call.node.as_ref() {
+                Some(N::FuncCall(f)) => func_name(f).unwrap_or_default(),
+                _ => String::new(),
+            };
+            if rt.name.is_empty() {
+                rt.name = name;
+            }
+            rt.val = Some(Box::new(pg_query::protobuf::Node {
+                node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+                    fields: vec![string_node("__srf0"), string_node("__srf0")],
+                    location: -1,
+                })),
+            }));
+            let rf = pg_query::protobuf::RangeFunction {
+                lateral: true,
+                functions: vec![pg_query::protobuf::Node {
+                    node: Some(N::List(pg_query::protobuf::List {
+                        items: vec![*call, pg_query::protobuf::Node { node: None }],
+                    })),
+                }],
+                alias: Some(pg_query::protobuf::Alias {
+                    aliasname: "__srf0".into(),
+                    colnames: vec![string_node("__srf0")],
+                }),
+                ..Default::default()
+            };
+            out.from_clause.push(pg_query::protobuf::Node {
+                node: Some(N::RangeFunction(rf)),
+            });
+            Ok(Some(out))
+        }
+        _ => Err(Error::Unsupported(
+            "several set-returning functions in one select list".into(),
+        )),
+    }
 }

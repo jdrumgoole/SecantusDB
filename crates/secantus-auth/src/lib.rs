@@ -165,7 +165,31 @@ pub fn begin_scram(
     payload: &[u8],
     creds: Option<StoredCredentials>,
 ) -> Result<(Vec<u8>, ScramState), AuthError> {
-    if !payload.starts_with(b"n,") {
+    begin(conversation_id, db_name, payload, creds, false)
+}
+
+/// `begin_scram` as PostgreSQL's SASL exchange runs it. Two differences from
+/// MongoDB's: the client-first message carries an EMPTY user name (`n=,`),
+/// because the server takes the user from the startup packet, and a client
+/// that supports channel binding the server did not offer sends the `y,,`
+/// GS2 header rather than `n,,`. Both are part of the bare message the proof
+/// is computed over, so neither may be rewritten -- only accepted.
+pub fn begin_scram_pg(
+    payload: &[u8],
+    creds: Option<StoredCredentials>,
+) -> Result<(Vec<u8>, ScramState), AuthError> {
+    begin(0, "", payload, creds, true)
+}
+
+fn begin(
+    conversation_id: i32,
+    db_name: &str,
+    payload: &[u8],
+    creds: Option<StoredCredentials>,
+    postgres: bool,
+) -> Result<(Vec<u8>, ScramState), AuthError> {
+    let header_ok = payload.starts_with(b"n,") || (postgres && payload.starts_with(b"y,"));
+    if !header_ok {
         return Err(err("invalid SCRAM client-first: expected GS2 header 'n,,'"));
     }
     // Skip the GS2 header ("n,," — no channel binding / authzid) to the bare.
@@ -178,7 +202,7 @@ pub fn begin_scram(
     let attrs = parse_attrs(&bare);
     let username = attrs.get("n").cloned().unwrap_or_default();
     let client_nonce = attrs.get("r").cloned().unwrap_or_default();
-    if username.is_empty() || client_nonce.is_empty() {
+    if (username.is_empty() && !postgres) || client_nonce.is_empty() {
         return Err(err("invalid SCRAM client-first: missing user or nonce"));
     }
 

@@ -220,6 +220,11 @@ impl Error {
             }
             // An assignment with no assignment cast (measured on 16: `insert
             // into t(j) values ($1)` with a `text`-declared `$1` into `jsonb`).
+            Error::UndefinedFunction(m)
+                if m.starts_with("function ") && m.ends_with(") does not exist") =>
+            {
+                Some("No function matches the given name and argument types. You might need to add explicit type casts.")
+            }
             Error::DatatypeMismatch(m) if m.contains(" but expression is of type ") => {
                 Some("You will need to rewrite or cast the expression.")
             }
@@ -331,6 +336,11 @@ pub enum Statement {
     /// The rows of a general JOIN, planned as a source: only ever the `plan`
     /// of a `SubSource`, never executed on its own.
     JoinRows(joins::JoinRows),
+    /// `EXPLAIN [ANALYZE] [(options)] <statement>`.
+    Explain {
+        inner: Box<Statement>,
+        options: ExplainOptions,
+    },
     /// `CREATE [UNIQUE] INDEX`.
     CreateIndex(CreateIndex),
     /// `DROP INDEX <name>, ...`.
@@ -1710,6 +1720,16 @@ pub struct CreateIndex {
     pub method: String,
 }
 
+/// `EXPLAIN`'s options, as PostgreSQL defaults them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplainOptions {
+    pub analyze: bool,
+    pub verbose: bool,
+    pub costs: bool,
+    /// `text` or `json`.
+    pub format: String,
+}
+
 /// `CREATE [OR REPLACE] VIEW`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateView {
@@ -2152,6 +2172,7 @@ fn plan_node(
         N::CreateSeqStmt(c) => plan_create_sequence(&c),
         N::IndexStmt(i) => plan_create_index(&i, lookup, params),
         N::ViewStmt(v) => plan_create_view(&v),
+        N::ExplainStmt(e) => plan_explain(&e, lookup, params),
         N::AlterSeqStmt(a) => plan_alter_sequence(&a),
         N::RenameStmt(r) => plan_rename(&r),
         N::CreateTableAsStmt(c) => plan_create_table_as(&c, lookup, params),
@@ -3553,6 +3574,98 @@ fn render_index_predicate(node: &pg_query::protobuf::Node, def: &TableDef) -> Op
     }
 }
 
+/// `EXPLAIN`. The statement is planned as it would run; the server renders
+/// the plan's SHAPE -- this server has no cost model, so it never pretends to
+/// PostgreSQL's numbers.
+fn plan_explain(
+    e: &pg_query::protobuf::ExplainStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Result<Statement> {
+    let mut options = ExplainOptions {
+        analyze: false,
+        verbose: false,
+        costs: true,
+        format: "text".into(),
+    };
+    for o in &e.options {
+        let Some(N::DefElem(d)) = o.node.as_ref() else {
+            continue;
+        };
+        let text = d.arg.as_deref().and_then(|a| match a.node.as_ref() {
+            Some(N::String(s)) => Some(s.sval.to_ascii_lowercase()),
+            Some(N::Boolean(b)) => Some(b.boolval.to_string()),
+            Some(N::Integer(i)) => Some(i.ival.to_string()),
+            _ => None,
+        });
+        let flag = || -> Result<bool> {
+            match text.as_deref() {
+                None | Some("true" | "on" | "1") => Ok(true),
+                Some("false" | "off" | "0") => Ok(false),
+                Some(_) => Err(Error::Sqlstate(
+                    "22023",
+                    format!("{} requires a Boolean value", d.defname),
+                )),
+            }
+        };
+        match d.defname.as_str() {
+            "analyze" => options.analyze = flag()?,
+            "verbose" => options.verbose = flag()?,
+            "costs" => options.costs = flag()?,
+            "buffers" | "timing" | "summary" | "settings" | "wal" => {
+                flag()?;
+            }
+            "format" => match text.as_deref() {
+                Some(f @ ("text" | "json")) => options.format = f.to_string(),
+                Some(f @ ("yaml" | "xml")) => {
+                    return Err(Error::Unsupported(format!(
+                        "EXPLAIN (FORMAT {})",
+                        f.to_ascii_uppercase()
+                    )))
+                }
+                other => {
+                    return Err(Error::Sqlstate(
+                        "22023",
+                        format!(
+                            "unrecognized value for EXPLAIN option \"format\": \"{}\"",
+                            other.unwrap_or_default()
+                        ),
+                    ))
+                }
+            },
+            other => {
+                return Err(Error::Sqlstate(
+                    "42601",
+                    format!("unrecognized EXPLAIN option \"{other}\""),
+                ))
+            }
+        }
+    }
+    let query = e
+        .query
+        .as_deref()
+        .and_then(|q| q.node.clone())
+        .ok_or_else(|| Error::Parse("EXPLAIN without a statement".into()))?;
+    let inner = plan_node(query, lookup, params)?;
+    if !matches!(
+        inner,
+        Statement::Select(_)
+            | Statement::Aggregate(_)
+            | Statement::SetOp(_)
+            | Statement::SelectConstant(_)
+            | Statement::ValuesConstant(_)
+            | Statement::Insert(_)
+            | Statement::Update(_)
+            | Statement::Delete(_)
+    ) {
+        return Err(Error::Unsupported("EXPLAIN of this statement".into()));
+    }
+    Ok(Statement::Explain {
+        inner: Box::new(inner),
+        options,
+    })
+}
+
 /// `CREATE [OR REPLACE] VIEW`. The body is kept as SQL text, which is what the
 /// Python server stores too, and expanded as a FROM-subquery wherever the
 /// view is read (`expand_views`).
@@ -4202,9 +4315,6 @@ fn foreign_key_of(
             "number of referencing and referenced columns for foreign key disagree".into(),
         ));
     }
-    if columns.len() != 1 {
-        return Err(Error::Unsupported("a multi-column FOREIGN KEY".into()));
-    }
     // PostgreSQL's one-letter action codes (`parsenodes.h`).
     let action = |code: &str| -> Result<Option<String>> {
         Ok(match code {
@@ -4212,7 +4322,7 @@ fn foreign_key_of(
             "r" => Some("RESTRICT".to_string()),
             "c" => Some("CASCADE".to_string()),
             "n" => Some("SET NULL".to_string()),
-            "d" => return Err(Error::Unsupported("a FOREIGN KEY with SET DEFAULT".into())),
+            "d" => Some("SET DEFAULT".to_string()),
             other => {
                 return Err(Error::Parse(format!(
                     "unknown referential action {other:?}"
@@ -4244,33 +4354,31 @@ fn foreign_key_of(
 /// column must BE that key (this server has no other unique constraint to
 /// reference) -- PostgreSQL's 42830 otherwise.
 pub fn resolve_fk_target(fk: &mut ForeignKey, target: &TableDef) -> Result<()> {
-    let key: Vec<&Column> = target.columns.iter().filter(|c| c.pk).collect();
-    if key.len() > 1 {
-        let names: Vec<String> = key.iter().map(|c| c.name.clone()).collect();
-        let matches = if fk.ref_columns.is_empty() {
-            fk.columns.len() == names.len()
-        } else {
-            fk.ref_columns.len() == names.len() && fk.ref_columns.iter().all(|c| names.contains(c))
-        };
-        if !matches || fk.columns.len() != names.len() {
+    let no_match = || {
+        Error::InvalidForeignKey(format!(
+            "there is no unique constraint matching given keys for referenced table \"{}\"",
+            target.name
+        ))
+    };
+    let pk: Vec<String> = target
+        .columns
+        .iter()
+        .filter(|c| c.pk)
+        .map(|c| c.name.clone())
+        .collect();
+    if fk.ref_columns.is_empty() {
+        if pk.is_empty() {
             return Err(Error::InvalidForeignKey(format!(
-                "there is no unique constraint matching given keys for referenced table \"{}\"",
+                "there is no primary key for referenced table \"{}\"",
                 target.name
             )));
         }
-        return Err(Error::Unsupported(
-            "a FOREIGN KEY to a composite PRIMARY KEY".into(),
-        ));
-    }
-    let pk = target.columns.iter().find(|c| c.pk);
-    if fk.ref_columns.is_empty() {
-        let pk = pk.ok_or_else(|| {
-            Error::InvalidForeignKey(format!(
-                "there is no primary key for referenced table \"{}\"",
-                target.name
-            ))
-        })?;
-        fk.ref_columns = vec![pk.name.clone()];
+        if pk.len() != fk.columns.len() {
+            return Err(Error::InvalidForeignKey(
+                "number of referencing and referenced columns for foreign key disagree".into(),
+            ));
+        }
+        fk.ref_columns = pk;
         return Ok(());
     }
     for col in &fk.ref_columns {
@@ -4278,12 +4386,21 @@ pub fn resolve_fk_target(fk: &mut ForeignKey, target: &TableDef) -> Result<()> {
             return Err(Error::UndefinedColumn(col.clone()));
         }
     }
-    match pk {
-        Some(pk) if fk.ref_columns == [pk.name.clone()] => Ok(()),
-        _ => Err(Error::InvalidForeignKey(format!(
-            "there is no unique constraint matching given keys for referenced table \"{}\"",
-            target.name
-        ))),
+    // The referenced columns must be exactly a unique key -- the PRIMARY KEY
+    // or a UNIQUE constraint -- as a SET: PostgreSQL pairs the columns
+    // positionally but matches the key regardless of the order it is named.
+    let same_set = |key: &[String]| {
+        key.len() == fk.ref_columns.len() && fk.ref_columns.iter().all(|c| key.contains(c))
+    };
+    if same_set(&pk)
+        || target
+            .unique_constraints
+            .iter()
+            .any(|u| !u.deferrable && same_set(&u.columns))
+    {
+        Ok(())
+    } else {
+        Err(no_match())
     }
 }
 
@@ -5721,15 +5838,224 @@ fn srf_rows(
         }
         call.args.iter().map(|a| const_value(a, params)).collect()
     };
+    // The JSON set-returning functions. A json / jsonb value is its text
+    // here; each element or member is rendered back as the same type.
+    let json_arg = || -> Result<Option<(json::Json, bool)>> {
+        let a = args(1)?;
+        let is_jsonb = name.starts_with("jsonb");
+        match &a[0] {
+            Bson::Null => Ok(None),
+            Bson::String(text) => json::parse(text).map(|j| Some((j, is_jsonb))).map_err(|_| {
+                Error::InvalidText(format!("invalid input syntax for type json: {text}"))
+            }),
+            other => Err(Error::Unsupported(format!(
+                "{name}() over {}",
+                inferred_type(other)
+            ))),
+        }
+    };
+    let render = |j: &json::Json, jsonb: bool| {
+        if jsonb {
+            json::render_jsonb(j)
+        } else {
+            json::render_json(j)
+        }
+    };
+    let kind_of = |j: &json::Json| match j {
+        json::Json::Object(_) => "an object",
+        json::Json::Array(_) => "an array",
+        _ => "a scalar",
+    };
+    match name {
+        "jsonb_array_elements"
+        | "json_array_elements"
+        | "jsonb_array_elements_text"
+        | "json_array_elements_text" => {
+            let as_text = name.ends_with("_text");
+            let ty = if as_text {
+                "text"
+            } else if name.starts_with("jsonb") {
+                "jsonb"
+            } else {
+                "json"
+            };
+            let col = "value";
+            let rows = match json_arg()? {
+                None => Vec::new(),
+                Some((json::Json::Array(items), jsonb)) => items
+                    .iter()
+                    .map(|v| {
+                        vec![if as_text {
+                            json::as_sql_text(v).map_or(Bson::Null, Bson::String)
+                        } else {
+                            Bson::String(render(v, jsonb))
+                        }]
+                    })
+                    .collect(),
+                Some((other, _)) => {
+                    return Err(Error::InvalidParameter(format!(
+                        "cannot extract elements from {}",
+                        kind_of(&other)
+                    )))
+                }
+            };
+            return Ok(Some((vec![col.to_string()], vec![ty.to_string()], rows)));
+        }
+        "jsonb_each" | "json_each" | "jsonb_each_text" | "json_each_text" => {
+            let as_text = name.ends_with("_text");
+            let ty = if as_text {
+                "text"
+            } else if name.starts_with("jsonb") {
+                "jsonb"
+            } else {
+                "json"
+            };
+            let rows = match json_arg()? {
+                None => Vec::new(),
+                Some((json::Json::Object(members), jsonb)) => {
+                    // jsonb reports its members in its normalised (sorted)
+                    // order; json keeps the input's.
+                    let mut members = members.clone();
+                    if jsonb {
+                        members.sort_by(|a, b| a.0.len().cmp(&b.0.len()).then(a.0.cmp(&b.0)));
+                        members.dedup_by(|a, b| a.0 == b.0);
+                    }
+                    members
+                        .iter()
+                        .map(|(k, v)| {
+                            vec![
+                                Bson::String(k.clone()),
+                                if as_text {
+                                    json::as_sql_text(v).map_or(Bson::Null, Bson::String)
+                                } else {
+                                    Bson::String(render(v, jsonb))
+                                },
+                            ]
+                        })
+                        .collect()
+                }
+                Some((other, _)) => {
+                    return Err(Error::InvalidParameter(format!(
+                        "cannot call {name} on {}",
+                        match other {
+                            json::Json::Array(_) => "an array",
+                            _ => "a non-object",
+                        }
+                    )))
+                }
+            };
+            return Ok(Some((
+                vec!["key".into(), "value".into()],
+                vec!["text".into(), ty.to_string()],
+                rows,
+            )));
+        }
+        // One row per match: the capture groups as a text[], or the whole
+        // match when there are none. Without `g`, only the first.
+        "regexp_matches" => {
+            if !(2..=3).contains(&call.args.len()) {
+                return Err(Error::UndefinedFunction(format!(
+                    "function {name} does not exist with that argument list"
+                )));
+            }
+            let a: Vec<Bson> = call
+                .args
+                .iter()
+                .map(|x| const_value(x, params))
+                .collect::<Result<_>>()?;
+            if a.contains(&Bson::Null) {
+                return Ok(Some((vec![name.into()], vec!["text[]".into()], Vec::new())));
+            }
+            let text = |v: &Bson| match v {
+                Bson::String(s) => s.clone(),
+                other => value_text(other),
+            };
+            let (source, pattern) = (text(&a[0]), text(&a[1]));
+            let flags = a.get(2).map(&text).unwrap_or_default();
+            let re = regex::Regex::new(&format!(
+                "{}{pattern}",
+                if flags.contains('i') { "(?i)" } else { "" }
+            ))
+            .map_err(|_| {
+                Error::InvalidRegex(format!("invalid regular expression: \"{pattern}\""))
+            })?;
+            let row = |c: regex::Captures| -> Vec<Bson> {
+                let cells: Vec<Bson> = if c.len() > 1 {
+                    (1..c.len())
+                        .map(|i| {
+                            c.get(i)
+                                .map_or(Bson::Null, |m| Bson::String(m.as_str().to_string()))
+                        })
+                        .collect()
+                } else {
+                    vec![Bson::String(c[0].to_string())]
+                };
+                vec![Bson::Array(cells)]
+            };
+            let rows: Vec<Vec<Bson>> = if flags.contains('g') {
+                re.captures_iter(&source).map(row).collect()
+            } else {
+                re.captures(&source).map(row).into_iter().collect()
+            };
+            return Ok(Some((vec![name.into()], vec!["text[]".into()], rows)));
+        }
+        "jsonb_object_keys" | "json_object_keys" => {
+            let rows = match json_arg()? {
+                None => Vec::new(),
+                Some((json::Json::Object(members), jsonb)) => {
+                    let mut keys: Vec<String> = members.into_iter().map(|(k, _)| k).collect();
+                    if jsonb {
+                        keys.sort_by(|a, b| a.len().cmp(&b.len()).then(a.cmp(b)));
+                        keys.dedup();
+                    }
+                    keys.into_iter().map(|k| vec![Bson::String(k)]).collect()
+                }
+                Some((other, _)) => {
+                    return Err(Error::InvalidParameter(format!(
+                        "cannot call {name} on {}",
+                        kind_of(&other)
+                    )))
+                }
+            };
+            return Ok(Some((vec![name.to_string()], vec!["text".into()], rows)));
+        }
+        _ => {}
+    }
     Ok(Some(match name {
         "unnest" => {
             // Multi-argument `unnest(a, b)` zips the arrays and pads the short
             // ones with NULLs -- a different shape from this single-column one,
             // and refused by name until it is written.
-            if call.args.len() != 1 {
-                return Err(Error::Unsupported(
-                    "unnest() with this argument list".into(),
-                ));
+            // Several arrays ZIP: one column each, as many rows as the longest,
+            // the shorter ones padded with NULL.
+            if call.args.len() > 1 {
+                let mut columns = Vec::new();
+                let mut types = Vec::new();
+                let mut lists = Vec::new();
+                for a in &call.args {
+                    let value = const_value(a, params)?;
+                    let element = static_type(a, &value)
+                        .strip_suffix("[]")
+                        .map(str::to_owned)
+                        .ok_or_else(|| Error::Unsupported("unnest() over a non-array".into()))?;
+                    lists.push(match value {
+                        Bson::Null => Vec::new(),
+                        v @ Bson::Array(_) => arrays::flatten(&v),
+                        _ => return Err(Error::Unsupported("unnest() over a non-array".into())),
+                    });
+                    columns.push(name.to_string());
+                    types.push(element);
+                }
+                let n = lists.iter().map(Vec::len).max().unwrap_or(0);
+                let rows = (0..n)
+                    .map(|i| {
+                        lists
+                            .iter()
+                            .map(|l| l.get(i).cloned().unwrap_or(Bson::Null))
+                            .collect()
+                    })
+                    .collect();
+                return Ok(Some((columns, types, rows)));
             }
             let value = const_value(&call.args[0], params)?;
             let element = static_type(&call.args[0], &value)
@@ -7658,6 +7984,47 @@ pub fn planning_to_execute<R>(f: impl FnOnce() -> R) -> R {
     out
 }
 
+/// A function this server's reference -- PostgreSQL 14 -- does not have, or
+/// refuses in a UTF8 database, answered as PostgreSQL answers it:
+/// `regexp_count` and friends arrived in 15 (42883, naming the argument
+/// types), and `to_ascii` cannot convert from UTF8 (0A000).
+fn function_absent_in_reference(
+    f: &pg_query::protobuf::FuncCall,
+    params: &[Bson],
+) -> Option<Error> {
+    let name = func_name(f)?;
+    if name == "to_ascii" {
+        return Some(Error::FeatureNotSupported(
+            "encoding conversion from UTF8 to ASCII not supported".into(),
+        ));
+    }
+    if !matches!(
+        name.as_str(),
+        "regexp_count" | "regexp_instr" | "regexp_substr" | "regexp_like"
+    ) {
+        return None;
+    }
+    let types: Vec<String> = f
+        .args
+        .iter()
+        .map(|a| match a.node.as_ref() {
+            Some(N::AConst(c))
+                if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) =>
+            {
+                "unknown".to_string()
+            }
+            _ => {
+                let v = const_value(a, params).unwrap_or(Bson::Null);
+                display_type(&static_type(a, &v))
+            }
+        })
+        .collect();
+    Some(Error::UndefinedFunction(format!(
+        "function {name}({}) does not exist",
+        types.join(", ")
+    )))
+}
+
 /// A `TypeName` for an internal type name (`int4`, `text[]`).
 fn type_name_node(ty: &str) -> pg_query::protobuf::TypeName {
     let (base, array) = match ty.strip_suffix("[]") {
@@ -8146,6 +8513,11 @@ fn plan_select(
     let s = &expanded;
     if s.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
         return plan_set_operation(s, lookup, params);
+    }
+    // A set-returning function over a column in the select list is a
+    // LATERAL join (see `joins::select_list_srf`).
+    if let Some(rewritten) = joins::select_list_srf(s)? {
+        return plan_select(&rewritten, lookup, params);
     }
     if s.from_clause.is_empty() {
         return plan_select_constant(s, params);
@@ -10857,6 +11229,9 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
         {
             Some(N::FuncCall(f)) => {
                 refuse_untyped_any_args(f)?;
+                if let Some(e) = function_absent_in_reference(f, params) {
+                    return Err(e);
+                }
                 let name = f
                     .funcname
                     .iter()
@@ -17470,9 +17845,45 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
     if let Some(N::SqlvalueFunction(svf)) = node.node.as_ref() {
         return sql_value_function(svf);
     }
+    // `x COLLATE "C"`: every comparison here is already bytewise, which IS
+    // the C collation, so the C-equivalent names change nothing. A locale
+    // collation would order differently, and is refused by name.
+    if let Some(N::CollateClause(cc)) = node.node.as_ref() {
+        let arg = cc
+            .arg
+            .as_deref()
+            .ok_or_else(|| Error::Parse("COLLATE without an operand".into()))?;
+        let value = const_value(arg, params)?;
+        let ty = static_type(arg, &value);
+        if !matches!(
+            ty.as_str(),
+            "text" | "varchar" | "bpchar" | "name" | "unknown"
+        ) {
+            return Err(Error::DatatypeMismatch(format!(
+                "collations are not supported by type {}",
+                display_type(&ty)
+            )));
+        }
+        let collation = cc
+            .collname
+            .iter()
+            .filter_map(|n| match n.node.as_ref()? {
+                N::String(s) => Some(s.sval.clone()),
+                _ => None,
+            })
+            .next_back()
+            .unwrap_or_default();
+        if !matches!(collation.as_str(), "C" | "POSIX" | "default" | "ucs_basic") {
+            return Err(Error::Unsupported(format!("COLLATE \"{collation}\"")));
+        }
+        return Ok(value);
+    }
     if let Some(N::FuncCall(f)) = node.node.as_ref() {
         if let Some(result) = correlated::eval_correlated(f, params) {
             return result;
+        }
+        if let Some(e) = function_absent_in_reference(f, params) {
+            return Err(e);
         }
         if let Some(name) =
             func_name(f).filter(|n| correlated::SEQUENCE_FUNCTIONS.contains(&n.as_str()))
