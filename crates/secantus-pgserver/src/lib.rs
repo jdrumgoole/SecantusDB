@@ -11,6 +11,7 @@
 
 mod do_block;
 mod encoding;
+mod explain;
 mod plpgsql_do;
 mod server;
 
@@ -12757,6 +12758,50 @@ impl PgHandler {
             Statement::JoinRows(_) => Err(Self::err(&PlanError::Internal(
                 "a join source reached execution on its own".into(),
             ))),
+            Statement::Explain { inner, options } => {
+                let db = self.db().to_string();
+                let chooser = |table: &str, filter: &Document| -> Option<String> {
+                    match self.storage.explain_plan(&db, table, filter).ok()? {
+                        secantus_storage::ExplainPlan::IxScan { index_name, .. } => Some(
+                            if index_name == "_id_" {
+                                format!("{table}_pkey")
+                            } else {
+                                index_name
+                            },
+                        ),
+                        secantus_storage::ExplainPlan::CollScan => None,
+                    }
+                };
+                let tree = explain::plan_tree(&inner, &chooser);
+                // ANALYZE runs the statement, as PostgreSQL's does -- a write
+                // is written -- and reports the rows it produced.
+                let actual = if options.analyze {
+                    Some(match inner.as_ref() {
+                        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
+                            self.execute_statement(*inner.clone(), 0)?;
+                            0
+                        }
+                        other => self.rows_with_schema(other)?.1.len(),
+                    })
+                } else {
+                    None
+                };
+                let (ty, lines) = if options.format == "json" {
+                    (Type::JSON, vec![explain::render_json(&tree, &options, actual)])
+                } else {
+                    (Type::TEXT, explain::render_text(&tree, &options, actual))
+                };
+                let schema = Arc::new(vec![self.field("QUERY PLAN".to_string(), ty)]);
+                let schema_ref = schema.clone();
+                let rows = stream::iter(lines).map(move |v| {
+                    let mut enc = DataRowEncoder::new(schema_ref.clone());
+                    enc.encode_field(&Some(v.as_str()))?;
+                    Ok(enc.take_row())
+                });
+                let mut response = QueryResponse::new(schema, rows);
+                response.set_bare_command_tag("EXPLAIN");
+                Ok(vec![Response::Query(response)])
+            }
             Statement::CreateIndex(ci) => self.create_index(ci),
 
             Statement::DropIndex { names, if_exists } => {
@@ -18651,6 +18696,14 @@ impl PgHandler {
                 })
                 .collect(),
             Statement::Show(name) => vec![self.field(canonical_setting(&name), Type::TEXT)],
+            Statement::Explain { options, .. } => vec![self.field(
+                "QUERY PLAN".to_string(),
+                if options.format == "json" {
+                    Type::JSON
+                } else {
+                    Type::TEXT
+                },
+            )],
             Statement::SelectConstant(sc) => sc
                 .columns
                 .iter()

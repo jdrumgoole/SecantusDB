@@ -331,6 +331,11 @@ pub enum Statement {
     /// The rows of a general JOIN, planned as a source: only ever the `plan`
     /// of a `SubSource`, never executed on its own.
     JoinRows(joins::JoinRows),
+    /// `EXPLAIN [ANALYZE] [(options)] <statement>`.
+    Explain {
+        inner: Box<Statement>,
+        options: ExplainOptions,
+    },
     /// `CREATE [UNIQUE] INDEX`.
     CreateIndex(CreateIndex),
     /// `DROP INDEX <name>, ...`.
@@ -1710,6 +1715,16 @@ pub struct CreateIndex {
     pub method: String,
 }
 
+/// `EXPLAIN`'s options, as PostgreSQL defaults them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplainOptions {
+    pub analyze: bool,
+    pub verbose: bool,
+    pub costs: bool,
+    /// `text` or `json`.
+    pub format: String,
+}
+
 /// `CREATE [OR REPLACE] VIEW`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateView {
@@ -2152,6 +2167,7 @@ fn plan_node(
         N::CreateSeqStmt(c) => plan_create_sequence(&c),
         N::IndexStmt(i) => plan_create_index(&i, lookup, params),
         N::ViewStmt(v) => plan_create_view(&v),
+        N::ExplainStmt(e) => plan_explain(&e, lookup, params),
         N::AlterSeqStmt(a) => plan_alter_sequence(&a),
         N::RenameStmt(r) => plan_rename(&r),
         N::CreateTableAsStmt(c) => plan_create_table_as(&c, lookup, params),
@@ -3551,6 +3567,92 @@ fn render_index_predicate(node: &pg_query::protobuf::Node, def: &TableDef) -> Op
         }
         _ => None,
     }
+}
+
+/// `EXPLAIN`. The statement is planned as it would run; the server renders
+/// the plan's SHAPE -- this server has no cost model, so it never pretends to
+/// PostgreSQL's numbers.
+fn plan_explain(
+    e: &pg_query::protobuf::ExplainStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Result<Statement> {
+    let mut options = ExplainOptions {
+        analyze: false,
+        verbose: false,
+        costs: true,
+        format: "text".into(),
+    };
+    for o in &e.options {
+        let Some(N::DefElem(d)) = o.node.as_ref() else {
+            continue;
+        };
+        let text = d.arg.as_deref().and_then(|a| match a.node.as_ref() {
+            Some(N::String(s)) => Some(s.sval.to_ascii_lowercase()),
+            Some(N::Boolean(b)) => Some(b.boolval.to_string()),
+            Some(N::Integer(i)) => Some(i.ival.to_string()),
+            _ => None,
+        });
+        let flag = || -> Result<bool> {
+            match text.as_deref() {
+                None | Some("true" | "on" | "1") => Ok(true),
+                Some("false" | "off" | "0") => Ok(false),
+                Some(_) => Err(Error::Sqlstate(
+                    "22023",
+                    format!("{} requires a Boolean value", d.defname),
+                )),
+            }
+        };
+        match d.defname.as_str() {
+            "analyze" => options.analyze = flag()?,
+            "verbose" => options.verbose = flag()?,
+            "costs" => options.costs = flag()?,
+            "buffers" | "timing" | "summary" | "settings" | "wal" => {
+                flag()?;
+            }
+            "format" => match text.as_deref() {
+                Some(f @ ("text" | "json")) => options.format = f.to_string(),
+                Some(f @ ("yaml" | "xml")) => {
+                    return Err(Error::Unsupported(format!("EXPLAIN (FORMAT {})", f.to_ascii_uppercase())))
+                }
+                other => {
+                    return Err(Error::Sqlstate(
+                        "22023",
+                        format!("unrecognized value for EXPLAIN option \"format\": \"{}\"", other.unwrap_or_default()),
+                    ))
+                }
+            },
+            other => {
+                return Err(Error::Sqlstate(
+                    "42601",
+                    format!("unrecognized EXPLAIN option \"{other}\""),
+                ))
+            }
+        }
+    }
+    let query = e
+        .query
+        .as_deref()
+        .and_then(|q| q.node.clone())
+        .ok_or_else(|| Error::Parse("EXPLAIN without a statement".into()))?;
+    let inner = plan_node(query, lookup, params)?;
+    if !matches!(
+        inner,
+        Statement::Select(_)
+            | Statement::Aggregate(_)
+            | Statement::SetOp(_)
+            | Statement::SelectConstant(_)
+            | Statement::ValuesConstant(_)
+            | Statement::Insert(_)
+            | Statement::Update(_)
+            | Statement::Delete(_)
+    ) {
+        return Err(Error::Unsupported("EXPLAIN of this statement".into()));
+    }
+    Ok(Statement::Explain {
+        inner: Box::new(inner),
+        options,
+    })
 }
 
 /// `CREATE [OR REPLACE] VIEW`. The body is kept as SQL text, which is what the

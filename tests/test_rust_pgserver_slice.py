@@ -13269,3 +13269,33 @@ def test_a_role_with_a_password_must_prove_it(home: Path) -> None:
             psycopg.connect(f"{dsn} user=gate password=x")
         with psycopg.connect(f"{dsn} user=stranger") as trusted:
             assert trusted.execute("SELECT 1").fetchone() == (1,)
+
+
+def test_explain_reports_the_plans_shape(home: Path) -> None:
+    """EXPLAIN in PostgreSQL's layout. The node types are real -- an index
+    scan exactly when the storage would use the index -- and the costs are
+    zeros rather than a fiction, so tests compare plans with COSTS OFF."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE ex (id int PRIMARY KEY, n int, g text)")
+        cur.execute("INSERT INTO ex VALUES (1, 1, 'a')")
+
+        def plan(sql: str) -> list[str]:
+            cur.execute(sql)
+            return [r[0] for r in cur.fetchall()]
+
+        assert plan("EXPLAIN (COSTS OFF) SELECT * FROM ex ORDER BY g LIMIT 1") == [
+            "Limit",
+            "  ->  Sort",
+            "        Sort Key: g",
+            "        ->  Seq Scan on ex",
+        ]
+        assert plan("EXPLAIN (COSTS OFF) SELECT g, count(*) FROM ex GROUP BY g") == [
+            "HashAggregate",
+            "  Group Key: g",
+            "  ->  Seq Scan on ex",
+        ]
+        assert plan("EXPLAIN SELECT 1") == ["Result  (cost=0.00..0.00 rows=0 width=0)"]
+        cur.execute("EXPLAIN (FORMAT JSON, COSTS OFF) SELECT * FROM ex")
+        assert cur.fetchone()[0][0]["Plan"]["Node Type"] == "Seq Scan"
+        assert plan("EXPLAIN ANALYZE SELECT * FROM ex")[-1] == "Execution Time: 0.000 ms"

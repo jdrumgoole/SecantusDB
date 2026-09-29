@@ -6987,7 +6987,7 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       | ~~`ALTER TABLE`, any form~~ | **DONE 2026-09-28**, incl. RENAME | `USING`, and ADD of a UNIQUE/PK/FK |
       | ~~`CREATE VIEW`~~ | **DONE 2026-09-29** | read-only: writes through a view refused |
       | `CREATE TRIGGER` | | `CreateTrigStmt` |
-      | `EXPLAIN` | | `ExplainStmt` |
+      | ~~`EXPLAIN`~~ | **DONE 2026-09-29** | plan SHAPE, zero costs; FORMAT YAML/XML refused |
       | ~~composite `PRIMARY KEY`~~ / multi-col `FOREIGN KEY` | **PK DONE 2026-09-29** | multi-column FK still refused |
       | ~~non-literal column `DEFAULT`~~ | **DONE 2026-09-29** | evaluated per row; `column_default` renders a folded constant, not PostgreSQL's `(1 + 2)` |
 
