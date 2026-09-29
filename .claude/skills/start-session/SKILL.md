@@ -35,17 +35,26 @@ git stash list
 
 ## 2. The machine may still be running the last session
 
+Run **`close-session` §6's four-pass gate** — the same sweep that should have
+left the box clean, used here to find out whether it did — plus:
+
 ```bash
-pgrep -fl "mongod|python -m secantus|pytest-xdist"
 uptime                             # load should be near idle
 df -h /                            # WiredTiger stores are large
 ```
+
+A name-only `pgrep` is not enough to open on: a server launched from a script
+(`Python launch_sd.py --port 27102`) matches no daemon pattern, and waiter
+shells match none at all. On 2026-09-29 the box carried three servers and three
+sleep-loop waiters that a name sweep would have missed — one of the waiters
+twenty days old.
 
 A leftover daemon holding a port, or a pytest backlog inflating every later
 run's exit time, will be blamed on your change if you don't notice it first.
 **`session-cleanup`** has the attribution rules — age, storage path, the
 snapshot id in a `zsh -c` cmdline — for deciding what is yours before you kill
-anything. A process older than your session is not yours.
+anything. A process older than your session is not yours, and one whose owning
+session is still alive is not yours either, however old it looks.
 
 ## 3. Read the record, then distrust it enough to check
 
