@@ -110,6 +110,7 @@ from secantus.rbac import (
 )
 from secantus.serverparams import ServerParams, SetParameterError
 from secantus.sessions import SessionRegistry
+from secantus.stepdown import StepDownError, StepDownState, not_primary_reply, step_down
 from secantus.storage import (
     DocumentTooLargeError,
     DuplicateKeyError,
@@ -646,6 +647,9 @@ class CommandContext:
     # unit-test contexts: ``setParameter`` then validates and answers but
     # nothing persists.
     server_params: ServerParams | None = None
+    # Server-wide ``replSetStepDown`` window. While it is open this node is a
+    # SECONDARY: ``hello`` says so and writes are refused. None off-server.
+    step_down_state: StepDownState | None = None
     transactions: TransactionRegistry | None = None
     # MONGODB-X509: the subject DN of the verified client cert the
     # connection's TLS handshake produced, in RFC 4514 string form
@@ -758,12 +762,33 @@ def _hello(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     # pymongo accepts either, but the official Go driver (mongodump/restore,
     # mongo-go-driver) refuses the handshake with "expected 'counter' to be
     # an int64 but it's a BSON 32-bit integer" when these are int32.
+    # mongod refuses an awaitable request that names a budget but no version to
+    # wait on -- there is nothing to compare against, so the wait is undefined.
+    # Measured 8.2.11 (2026-09-29): 31368 / Location31368. Both servers used to
+    # ACCEPT it and answer immediately.
+    if "maxAwaitTimeMS" in doc and "topologyVersion" not in doc:
+        return {
+            "ok": 0.0,
+            "errmsg": "A request with 'maxAwaitTimeMS' must include a 'topologyVersion'",
+            "code": 31368,
+            "codeName": "Location31368",
+        }
+
+    # Inside a ``replSetStepDown`` window this node is a SECONDARY. SDAM reads
+    # these flags to place the server in the topology, so they must flip
+    # together with the write refusal -- a server that keeps claiming to be
+    # primary while rejecting every write is worse than either alone.
+    _stepped_down = ctx.step_down_state is not None and ctx.step_down_state.is_stepped_down()
+    _topology_counter = ctx.step_down_state.topology_counter() if ctx.step_down_state else 0
     response: dict[str, Any] = {
-        "isWritablePrimary": True,
-        "ismaster": True,
+        "isWritablePrimary": not _stepped_down,
+        "ismaster": not _stepped_down,
+        # The counter moves when the TOPOLOGY moves. A driver ignores a "not
+        # primary" error whose topologyVersion is not NEWER than the one it
+        # holds, so a counter frozen at 0 makes the step-down look stale.
         "topologyVersion": {
             "processId": _HELLO_PROCESS_ID,
-            "counter": bson.Int64(0),
+            "counter": bson.Int64(_topology_counter),
         },
         "maxBsonObjectSize": MAX_BSON_OBJECT_SIZE,
         "maxMessageSizeBytes": MAX_MESSAGE_SIZE,
@@ -798,9 +823,18 @@ def _hello(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 "hosts": [addr],
                 "passives": [],
                 "arbiters": [],
-                "primary": addr,
+                # Measured on a single-node replica set (mongod 8.2.11,
+                # 2026-09-29): a stepped-down node reports ``secondary: true``
+                # and DROPS both ``primary`` and ``electionId`` -- there is no
+                # known primary and no election it won.
+                "secondary": _stepped_down,
+                **({} if _stepped_down else {"primary": addr}),
                 "me": addr,
-                "electionId": bson.ObjectId("7fffffff0000000000000001"),
+                **(
+                    {}
+                    if _stepped_down
+                    else {"electionId": bson.ObjectId("7fffffff0000000000000001")}
+                ),
                 "lastWrite": {
                     "opTime": {"ts": cluster_time, "t": 1},
                     "lastWriteDate": _dt.datetime.now(_dt.timezone.utc),
@@ -1901,6 +1935,19 @@ def _get_parameter(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     if not keys:
         return {**params, "ok": 1.0}
     return {**{k: params[k] for k in keys if k in params}, "ok": 1.0}
+
+
+def _replset_step_down(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """``replSetStepDown`` — see :mod:`secantus.stepdown` for the measured contract."""
+    try:
+        return step_down(doc, replica_set_name=ctx.replica_set_name, state=ctx.step_down_state)
+    except StepDownError as exc:
+        return {
+            "ok": 0.0,
+            "errmsg": str(exc),
+            "code": exc.code,
+            "codeName": exc.code_name,
+        }
 
 
 def _set_parameter(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
@@ -8941,6 +8988,7 @@ _HANDLERS: dict[str, CommandHandler] = {
     "getCmdLineOpts": _get_cmd_line_opts,
     "getParameter": _get_parameter,
     "setParameter": _set_parameter,
+    "replSetStepDown": _replset_step_down,
     "connectionStatus": _connection_status,
     "dbStats": _db_stats,
     "dbstats": _db_stats,
@@ -10230,6 +10278,16 @@ def dispatch(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
                 # rendered 91 as "Location91" where 91 is ShutdownInProgress.
                 failpoint_wce = dict(match.write_concern_error)
                 failpoint_labels = match.error_labels
+
+    # A node inside its ``replSetStepDown`` window is a SECONDARY, and mongod
+    # refuses writes there with 10107 while still serving reads. Gated on the
+    # write-command set so a read is unaffected.
+    if (
+        name in _RETRYABLE_WRITE_COMMANDS
+        and ctx.step_down_state is not None
+        and ctx.step_down_state.is_stepped_down()
+    ):
+        return not_primary_reply(ctx.step_down_state, _HELLO_PROCESS_ID)
 
     # Multi-document transaction envelope. ``autocommit: false`` +
     # ``lsid`` + ``txnNumber`` marks an in-transaction statement (the

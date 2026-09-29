@@ -217,7 +217,14 @@ def _start_mongod(
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             try:
-                MongoClient(uri, serverSelectionTimeoutMS=500).admin.command("ping")
+                # `directConnection` matters for the replica-set fixture: an
+                # UNINITIATED member fails server selection through normal
+                # discovery, so the readiness probe timed out and the whole
+                # step-down comparison skipped with "mongod did not become
+                # ready" rather than running.
+                MongoClient(uri, serverSelectionTimeoutMS=500, directConnection=True).admin.command(
+                    "ping"
+                )
                 break
             except Exception:  # noqa: BLE001 - polling for readiness
                 time.sleep(0.25)
@@ -4299,3 +4306,180 @@ def test_op_msg_hello_ok_matches_mongod(
     theirs = answer(mongod_uri)
     assert mine == theirs, f"{command} asked={ask_hello_ok}: secantus={mine!r} mongod={theirs!r}"
     assert theirs is (True if ask_hello_ok else None)
+
+
+# ---------------------------------------------------------------------------
+# replSetStepDown
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def mongod_replset_uri() -> Iterator[str]:
+    """A throwaway SINGLE-NODE replica set.
+
+    ``replSetStepDown`` cannot be compared against the standalone this module
+    normally spawns: a standalone answers 76 ``NoReplicationEnabled``, which is
+    the one answer SecantusDB must NOT give, because it advertises a set name
+    and already serves ``replSetGetStatus``. The persona we claim is a
+    single-node replica set, so that is the reference.
+    """
+    if MONGOD is None:
+        pytest.skip("no mongod on PATH")
+    from pymongo import MongoClient
+
+    proc, uri, tmp = _start_mongod(extra_args=("--replSet", "gatereplset"))
+    try:
+        client = MongoClient(uri, directConnection=True, serverSelectionTimeoutMS=10000)
+        host, port = _host_port(uri)
+        client.admin.command(
+            {
+                "replSetInitiate": {
+                    "_id": "gatereplset",
+                    "members": [{"_id": 0, "host": f"{host}:{port}"}],
+                }
+            }
+        )
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if client.admin.command("hello").get("isWritablePrimary"):
+                break
+            time.sleep(0.2)
+        else:  # pragma: no cover - a set that never elects is a broken fixture
+            pytest.skip("the single-node set never became primary")
+        client.close()
+        yield uri
+    finally:
+        _stop_mongod(proc, tmp)
+
+
+def _await_primary(uri: str, limit: float = 60.0) -> None:
+    from pymongo import MongoClient
+
+    client = MongoClient(uri, directConnection=True, serverSelectionTimeoutMS=10000)
+    try:
+        deadline = time.monotonic() + limit
+        while time.monotonic() < deadline:
+            if client.admin.command("hello").get("isWritablePrimary"):
+                return
+            time.sleep(0.1)
+        raise AssertionError("server never returned to primary")
+    finally:
+        client.close()
+
+
+@requires_mongod
+@pytest.mark.parametrize(
+    ("label", "command"),
+    [
+        ("unforced, under the catch-up period", {"replSetStepDown": 5}),
+        ("unforced, over it", {"replSetStepDown": 60}),
+        ("unforced, catch-up overridden", {"replSetStepDown": 5, "secondaryCatchUpPeriodSecs": 1}),
+        ("negative period", {"replSetStepDown": -1, "force": True}),
+    ],
+)
+def test_replset_step_down_refusals_match_mongod(
+    label: str, command: dict, secantus_uri: str, mongod_replset_uri: str
+) -> None:
+    """The refusals, against a real single-node replica set.
+
+    The 262 is the interesting one: past validation a non-forced step-down needs
+    a secondary to hand over to, and a single-node set genuinely has none — so
+    mongod's own answer is already ours rather than a stand-in for one. Only the
+    timestamp inside its message differs, so the code and the message's stable
+    prefix are what get compared.
+    """
+    from pymongo import MongoClient
+
+    def answer(uri: str) -> tuple[object, object]:
+        _await_primary(uri)
+        client = MongoClient(uri, directConnection=True, serverSelectionTimeoutMS=10000)
+        try:
+            client.admin.command(command)
+            return ("accepted", None)
+        except Exception as exc:  # noqa: BLE001 - comparing the error IS the test
+            d = getattr(exc, "details", {}) or {}
+            message = d.get("errmsg") or ""
+            # The 262's message embeds a wall clock; compare its stable half.
+            if d.get("code") == 262:
+                message = message.split(" as of ")[0]
+            return (d.get("code"), message)
+        finally:
+            client.close()
+
+    theirs = answer(mongod_replset_uri)
+    mine = answer(secantus_uri)
+    assert mine == theirs, f"{label}:\n  secantus={mine}\n  mongod  ={theirs}"
+
+
+@requires_mongod
+def test_step_down_window_matches_mongod(secantus_uri: str, mongod_replset_uri: str) -> None:
+    """The whole observable of the window, compared line for line.
+
+    `hello`'s flags, whether `primary` / `electionId` are present, that WRITES
+    are refused with 10107 while READS keep working, and the presence of
+    `topologyVersion` on the refusal — which is what stops the driver marking
+    the server Unknown and failing the very next read.
+    """
+    from pymongo import MongoClient
+
+    def observe(uri: str) -> tuple:
+        _await_primary(uri)
+        client = MongoClient(uri, directConnection=True, serverSelectionTimeoutMS=10000)
+        try:
+            coll = client.stepdowngate.c
+            coll.drop()
+            coll.insert_one({"seed": 1})
+            client.admin.command({"replSetStepDown": 3, "force": True})
+            time.sleep(0.4)
+            hello = client.admin.command("hello")
+            try:
+                coll.insert_one({"x": 1})
+                write: tuple = ("accepted", None)
+            except Exception as exc:  # noqa: BLE001 - the error IS the observation
+                d = getattr(exc, "details", {}) or {}
+                write = (d.get("code"), "topologyVersion" in d)
+            read_ok = coll.find_one({"seed": 1}) is not None
+            return (
+                hello.get("isWritablePrimary"),
+                hello.get("secondary"),
+                "primary" in hello,
+                "electionId" in hello,
+                write,
+                read_ok,
+            )
+        finally:
+            client.close()
+
+    theirs = observe(mongod_replset_uri)
+    mine = observe(secantus_uri)
+    assert theirs[:4] == (False, True, False, False), f"reference changed: {theirs}"
+    assert mine == theirs, f"\n  secantus={mine}\n  mongod  ={theirs}"
+    _await_primary(secantus_uri)
+
+
+@requires_mongod
+def test_awaitable_hello_holds_like_mongod(secantus_uri: str, mongod_uri: str) -> None:
+    """A plain awaitable `hello` blocks for its budget on both servers.
+
+    `topologyVersion` + `maxAwaitTimeMS` WITHOUT `exhaustAllowed` asks the
+    server to hold the reply. SecantusDB answered in 0.3ms where mongod took the
+    full 502ms (measured 2026-09-29), which makes a driver polling this way spin
+    instead of wait. The streaming `exhaustAllowed` path is a separate
+    optimisation on top and was already implemented.
+    """
+    from pymongo import MongoClient
+
+    def held_for(uri: str) -> float:
+        client = MongoClient(uri, directConnection=True, serverSelectionTimeoutMS=10000)
+        try:
+            version = client.admin.command("hello")["topologyVersion"]
+            started = time.monotonic()
+            client.admin.command({"hello": 1, "topologyVersion": version, "maxAwaitTimeMS": 400})
+            return time.monotonic() - started
+        finally:
+            client.close()
+
+    theirs = held_for(mongod_uri)
+    assert theirs >= 0.3, f"reference did not hold the reply ({theirs:.3f}s)"
+    mine = held_for(secantus_uri)
+    assert mine >= 0.3, f"secantus returned after only {mine:.3f}s; mongod held {theirs:.3f}s"

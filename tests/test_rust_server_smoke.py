@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import time
 
 import pytest
 
@@ -2588,5 +2589,140 @@ def test_hello_ok_echo_against_rust_server(tmp_path, command, ask) -> None:
             request["helloOk"] = True
         reply = _client(srv)["admin"].command(request)
         assert reply.get("helloOk") == (True if ask else None)
+    finally:
+        srv.stop()
+
+
+def test_replset_step_down_against_rust_server(tmp_path) -> None:
+    """The whole observable of a single-node replica set's step-down.
+
+    The embedded handle defaults to a STANDALONE (`replica_set_name=None`),
+    unlike the `secantusd-rs` binary which advertises `secantus`. A standalone
+    correctly answers 76 `NoReplicationEnabled` here, so every step-down test
+    has to ask for the replica-set persona explicitly.
+
+    Every value here was measured against a real single-node replica set
+    (mongod 8.2.11, 2026-09-29) and the two servers were compared line for line
+    through the window: `hello`'s flags, whether `primary` / `electionId` are
+    present, that WRITES are refused with 10107 while READS keep working, and
+    that it returns to primary afterwards.
+
+    The `topologyVersion` on the refusal is not decoration. Without it the
+    driver marks the server UNKNOWN and a read issued straight after a refused
+    write fails server selection -- reproduced 3 times out of 3 before it was
+    added, while the same sequence succeeded against mongod.
+    """
+    srv = _server.RustServer(str(tmp_path / "wt"), 0, replica_set_name="secantus")
+    try:
+        client = _client(srv)
+        admin, coll = client["admin"], client["t"]["c"]
+        coll.insert_one({"seed": 1})
+
+        before = admin.command("hello")
+        assert before["isWritablePrimary"] is True
+        assert before["secondary"] is False
+        assert "primary" in before and "electionId" in before
+
+        assert admin.command({"replSetStepDown": 2, "force": True})["ok"] == 1
+
+        during = admin.command("hello")
+        assert during["isWritablePrimary"] is False
+        assert during["secondary"] is True
+        assert "primary" not in during, "a stepped-down node knows of no primary"
+        assert "electionId" not in during, "... and won no election"
+        assert during["topologyVersion"]["counter"] > before["topologyVersion"]["counter"], (
+            "the counter must advance or the driver treats the step-down as stale"
+        )
+
+        # pymongo maps 10107 to NotPrimaryError, which subclasses
+        # ConnectionFailure rather than OperationFailure -- the driver treats a
+        # stepped-down primary as a TOPOLOGY event, not a command failure.
+        with pytest.raises(pymongo.errors.NotPrimaryError) as caught:
+            coll.insert_one({"x": 1})
+        assert caught.value.details["code"] == 10107
+        assert caught.value.details["codeName"] == "NotWritablePrimary"
+        assert caught.value.details["errmsg"] == "not primary"
+        assert "topologyVersion" in caught.value.details
+
+        # Reads keep working while the node is a secondary.
+        assert coll.find_one({"seed": 1}) is not None
+
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if admin.command("hello")["isWritablePrimary"]:
+                break
+            time.sleep(0.05)
+        assert admin.command("hello")["isWritablePrimary"] is True
+        coll.insert_one({"after": 1})
+        client.close()
+    finally:
+        srv.stop()
+
+
+@pytest.mark.parametrize(
+    ("label", "command", "code", "errmsg"),
+    [
+        (
+            "unforced, shorter than the catch-up period",
+            {"replSetStepDown": 5},
+            2,
+            "stepdown period must be longer than secondaryCatchUpPeriodSecs",
+        ),
+        (
+            "negative period",
+            {"replSetStepDown": -1, "force": True},
+            2,
+            "stepdown period must be a positive integer",
+        ),
+    ],
+)
+def test_replset_step_down_refusals(tmp_path, label, command, code, errmsg) -> None:
+    srv = _server.RustServer(str(tmp_path / "wt"), 0, replica_set_name="secantus")
+    try:
+        with pytest.raises(pymongo.errors.OperationFailure) as caught:
+            _client(srv)["admin"].command(command)
+        assert (caught.value.details["code"], caught.value.details["errmsg"]) == (code, errmsg), (
+            label
+        )
+    finally:
+        srv.stop()
+
+
+def test_unforced_step_down_has_no_secondary_to_hand_over_to(tmp_path) -> None:
+    """262, and it is mongod's own answer rather than a stand-in for one.
+
+    A single-node set genuinely has no electable secondary to hand over to, so
+    this is the honest reply and not a refusal we invented.
+    """
+    srv = _server.RustServer(str(tmp_path / "wt"), 0, replica_set_name="secantus")
+    try:
+        with pytest.raises(pymongo.errors.OperationFailure) as caught:
+            _client(srv)["admin"].command({"replSetStepDown": 60})
+        assert caught.value.details["code"] == 262
+        assert caught.value.details["errmsg"].startswith(
+            "No electable secondaries caught up as of "
+        )
+    finally:
+        srv.stop()
+
+
+def test_awaitable_hello_holds_the_reply(tmp_path) -> None:
+    """A plain awaitable `hello` blocks for its budget, as mongod does.
+
+    `topologyVersion` + `maxAwaitTimeMS` without `exhaustAllowed` asks the
+    server to hold the reply until the topology changes or the budget expires.
+    We answered in 0.3ms where mongod took the full 502ms (measured
+    2026-09-29), which makes a driver polling this way spin instead of wait.
+    The `exhaustAllowed` streaming path is a separate, already-implemented
+    optimisation on top of this.
+    """
+    srv = _server.RustServer(str(tmp_path / "wt"), 0, replica_set_name="secantus")
+    try:
+        admin = _client(srv)["admin"]
+        topology_version = admin.command("hello")["topologyVersion"]
+        started = time.monotonic()
+        admin.command({"hello": 1, "topologyVersion": topology_version, "maxAwaitTimeMS": 400})
+        held = time.monotonic() - started
+        assert held >= 0.3, f"awaitable hello returned after only {held:.3f}s"
     finally:
         srv.stop()

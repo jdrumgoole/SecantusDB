@@ -33,7 +33,12 @@ def test_hello_process_id_is_stable_across_calls(wt_home):
     pid1 = h1["topologyVersion"]["processId"]
     assert pid1 == h2["topologyVersion"]["processId"]
     assert pid1 == h3["topologyVersion"]["processId"]
-    # counter stays 0 (topology never changes on a single-node surrogate).
+    # The counter starts at 0 and moves only when the TOPOLOGY moves, which on
+    # this single-node surrogate means a `replSetStepDown`. It used to be
+    # asserted as permanently 0 -- "the topology never changes" -- which stopped
+    # being true when step-down landed. A driver IGNORES a "not primary" error
+    # whose topologyVersion is not newer than the one it holds, so a frozen
+    # counter would make a step-down look stale and never reach the driver.
     assert h1["topologyVersion"]["counter"] == 0
 
 
