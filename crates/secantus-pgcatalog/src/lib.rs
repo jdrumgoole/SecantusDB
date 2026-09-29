@@ -55,6 +55,11 @@ pub fn field_for(column: &str, pk: bool) -> String {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Column {
     pub name: String,
+    /// A stored field other than the one the name implies: a COMPOSITE
+    /// primary key's columns live at `_id.<name>` inside a subdocument `_id`,
+    /// which is how the Python server lays one out too. `None` for everything
+    /// else.
+    pub field_override: Option<String>,
     /// The PostgreSQL type name, e.g. `int4` / `text`.
     pub pg_type: String,
     pub pk: bool,
@@ -111,6 +116,7 @@ impl Column {
             source: None,
             identity: None,
             extra: Document::new(),
+            field_override: None,
             typmod: -1,
         }
     }
@@ -172,7 +178,10 @@ impl Column {
     }
 
     pub fn field(&self) -> String {
-        field_for(&self.name, self.pk)
+        match &self.field_override {
+            Some(f) => f.clone(),
+            None => field_for(&self.name, self.pk),
+        }
     }
 
     /// The column sub-document, field-for-field as the Python server writes it.
@@ -211,10 +220,36 @@ impl Column {
         out
     }
 
+    /// An EXPRESSION default (`now()`, `gen_random_uuid()`), as SQL text,
+    /// evaluated for each row an INSERT leaves the column out of. Stored under
+    /// the Python server's `default_expr` key, beside `has_default: false`.
+    pub fn default_expr(&self) -> Option<&str> {
+        self.extra.get_str("default_expr").ok()
+    }
+
+    /// Set or clear the expression default. A literal default and an
+    /// expression one are exclusive.
+    pub fn set_default_expr(&mut self, expr: Option<String>) {
+        match expr {
+            Some(e) => {
+                self.default = None;
+                self.extra.insert("default_expr", e);
+            }
+            None => {
+                self.extra.remove("default_expr");
+            }
+        }
+    }
+
     pub fn from_document(d: &Document) -> Option<Self> {
         let decl_oid = d.get_i32("decl_oid").ok();
         Some(Self {
             name: d.get_str("name").ok()?.to_string(),
+            field_override: d
+                .get_str("field")
+                .ok()
+                .filter(|f| f.starts_with("_id."))
+                .map(str::to_string),
             pg_type: Self::type_from_stored(d.get_str("type").ok()?, decl_oid),
             pk: d.get_bool("pk").unwrap_or(false),
             nullable: d.get_bool("nullable").unwrap_or(true),

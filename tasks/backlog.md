@@ -6986,8 +6986,8 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       | ~~`CREATE VIEW`~~ | **DONE 2026-09-29** | read-only: writes through a view refused |
       | `CREATE TRIGGER` | | `CreateTrigStmt` |
       | `EXPLAIN` | | `ExplainStmt` |
-      | composite `PRIMARY KEY` / multi-col `FOREIGN KEY` | | `a composite PRIMARY KEY` |
-      | non-literal column `DEFAULT` | `default now()` | `a non-literal DEFAULT` |
+      | ~~composite `PRIMARY KEY`~~ / multi-col `FOREIGN KEY` | **PK DONE 2026-09-29** | multi-column FK still refused |
+      | ~~non-literal column `DEFAULT`~~ | **DONE 2026-09-29** | evaluated per row; `column_default` renders a folded constant, not PostgreSQL's `(1 + 2)` |
 
       **SET-RETURNING FUNCTIONS in FROM landed 2026-09-29** (new `srf` corpus
       16 divergences of 19 -> 1; `arrays` 6 -> 4). `unnest`,
@@ -7364,6 +7364,14 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
         `e.dept_id = d.id` to the per-row path instead of binding `d.id` to
         the inner table's own `id`.
 
+- [ ] **OPEN — RUST pgserver: `column_default` shows a FOLDED constant
+      (2026-09-29).** A non-volatile DEFAULT expression is evaluated once at
+      CREATE and stored as its value, so `default 1 + 2` reports `3` where
+      PostgreSQL reports `(1 + 2)`, and `default 'x' || 'y'` reports
+      `'xy'::text` where PostgreSQL has `('x'::text || 'y'::text)`. The values
+      the rows get are identical; only the catalog text differs. Reproducing
+      ruleutils' rendering is the fix, and it is not small.
+
 - [ ] **OPEN — RUST pgserver: the general JOIN planner has no predicate
       pushdown (2026-09-29).** A join is planned as a source whose leaves are
       `SELECT * FROM <leaf>` (`secantus-pgplan/src/joins.rs`), hash-joined on
@@ -7400,86 +7408,36 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       and `INCLUDE (...)` are not rendered in `pg_indexes.indexdef`. The
       corpus is `tools/probes/pg_corpora/indexes.sql` (run WITHOUT `--rust`).
 
-- [ ] **OPEN — RUST pgserver: a window function over an AGGREGATE, which is
-      all that is left of the window work (2026-09-28).** Everything else
-      landed; measured on two corpora against PostgreSQL 14.13,
-      `windows.sql` is 26/27 and `windows2.sql` (48 lines, written for that
-      change) is clean. The one that differs:
+- [ ] **OPEN — RUST pgserver: window functions -- the two known limits
+      (landed 2026-09-29: over an aggregate, over `generate_series`, over a
+      JOIN, and nested inside an expression).** `windows` / `windows2` /
+      `windows3` / `windows4` / the new `windows5` corpora are all at 0.
 
-      ```
-      select g, sum(sum(v)) over (order by g) from w9 group by g
-        -> 0A000 a window function over an aggregate is not supported yet
-      ```
+      A window over an aggregate is planned as the two queries it is -- the
+      grouping, then the window over the grouped rows as a FROM-subquery
+      (`split_window_over_aggregate`). A window call nested in an expression
+      is hoisted into its own window item and the expression reads its field.
 
-      **One more source refuses a window** (a window over a JOIN WORKS since
-      2026-09-29 -- the general JOIN planner hands the planner a single
-      source):
+      **Two known limits, neither reached by any corpus:** a `RANGE` frame
+      with a value offset compares through `f64`, so a bound beyond 2^53 on an
+      int8 or a wide numeric column could land a row on the wrong side of it
+      (the non-numeric case is refused by name); and partitioning scans the
+      distinct partition keys linearly, which is O(partitions^2).
 
-      ```
-      select n, row_number() over (order by n) from generate_series(1,3) as t(n)
-        -> 0A000 a window function over a generated source is not supported yet
-      ```
+      **Carried from the implementation, worth not re-deriving:** the DEFAULT
+      frame is `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` whether or
+      not the window has an ORDER BY, and under RANGE a bound at CURRENT ROW
+      means the row AND ITS PEERS; `OVER w` and `OVER (w ORDER BY ...)` put
+      the referenced name in different parser fields (`name` / `refname`);
+      and a RANGE bound is always `key(current) + shift`, whichever way the
+      window is ordered.
 
-      `plan_join_plain_select` and `plan_series_select` build their output
-      columns from the SOURCE's columns, and a window target is a column of
-      neither -- so each would need the same "plan the window targets against
-      this def" step `plan_select` grew. The executor half already works on
-      any `Vec<Document>`, so the join's materialised rows need nothing new.
-      (Before this was named, the two answered `this subquery target` and
-      `function row_number() is not supported yet` -- the second flatly false,
-      since `row_number` works everywhere else.)
-
-      The window runs over the GROUPED rows, so `plan_aggregate` would need a
-      window pass of its own — `materialise_windows` already works on any
-      `Vec<Document>`, so the executor half is mostly a call; the planner half
-      has to resolve `sum(v)` as a group value and `sum(...)` as the window's
-      argument over it.
-
-      **Two known limits of the window implementation, neither reached by
-      either corpus:** a `RANGE` frame with a value offset compares through
-      `f64`, so a bound sitting beyond 2^53 on an int8 or a wide numeric
-      column could land a row on the wrong side of it (the non-numeric case
-      is refused by name rather than compared wrongly); and partitioning
-      scans the distinct partition keys linearly, which is O(partitions²) on
-      a query that makes very many of them.
-
-      **A third, and it is the one that nearly shipped a wrong answer.**
-      Two corpora totalling 75 lines agreed with PostgreSQL completely, and a
-      RANGE frame whose bounds sat on ONE SIDE of the current row was wrong
-      on every row — `RANGE BETWEEN 1 FOLLOWING AND 20 FOLLOWING` returned
-      the whole partition. Neither corpus contained such a frame: both had
-      one bound at `CURRENT ROW` or `UNBOUNDED`, which is the shape that
-      happens to work under a walk outward from the current row.
-
-      It was found by writing a THIRD corpus of exactly the shapes the first
-      two did not reach, on the suspicion that the scan direction was keyed
-      off the wrong thing — which it was: the offset's SIGN rather than which
-      BOUND was being resolved. **A corpus that agrees completely is evidence
-      about the shapes it contains and nothing else**, and the cheapest way
-      to find what it is blind to is to enumerate the axes it varies (here:
-      which side each bound falls on) and write the combinations it skipped.
-
-      The rule that replaced it is worth keeping: sort order is monotone in
-      `key(v)` — `v` ascending, `-v` descending — so a bound is ALWAYS
-      `key(current) + shift`, with `shift` negative for PRECEDING and
-      positive for FOLLOWING, whichever way the window is ordered. One rule,
-      both directions, no walking.
-
-      **Two things that cost real time here, both worth not re-deriving:**
-
-      * **The DEFAULT frame is `RANGE UNBOUNDED PRECEDING TO CURRENT ROW`, and
-        it is the SAME whether or not the window has an ORDER BY** (measured:
-        `over ()`, `over (order by id)` and `over (partition by g)` all parse
-        to `frame_options = 0x422`). Under RANGE a bound at CURRENT ROW means
-        the row AND ITS PEERS, so tied rows share a running total and a window
-        with no ORDER BY sees the whole partition — the second is not a
-        special case, it is the first with every row a peer.
-      * **`OVER w` and `OVER (w ORDER BY ...)` put the referenced name in
-        DIFFERENT parser fields** — `name` for the bare form, `refname` for
-        the parenthesised one. Reading only `refname` left `OVER w` with no
-        ORDER BY, so every row became a peer and `sum(v) OVER w` answered the
-        whole-partition total where PostgreSQL gives a running one: a wrong
-        answer, not an error.
+      **A corpus that agrees completely is evidence about the shapes it
+      contains and nothing else.** Two corpora of 75 lines agreed with
+      PostgreSQL while a RANGE frame whose bounds sat on ONE SIDE of the
+      current row was wrong on every row -- neither had such a frame. The
+      cheap way to find what a corpus is blind to is to enumerate the axes it
+      varies and write the combinations it skipped.
 
 - [ ] **OPEN — RUST pgserver: a wrong password still connects, CONFIRMED live
       (2026-09-28).** The existing entry above records that `CREATE / ALTER ROLE
