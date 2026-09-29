@@ -286,7 +286,7 @@ pub fn from_args(args: &[Bson], type_name: &str, null_flags_is_error: bool) -> R
 
 /// Normalise a range: reject a crossed pair, collapse an empty one, and — for a
 /// DISCRETE element type only — rewrite the bounds to `[)`.
-fn canonicalise(mut r: Range, element: &str, discrete: bool, type_name: &str) -> Result<Range> {
+pub(crate) fn canonicalise(mut r: Range, element: &str, discrete: bool, type_name: &str) -> Result<Range> {
     if r.empty {
         return Ok(r);
     }
@@ -346,7 +346,7 @@ fn canonicalise(mut r: Range, element: &str, discrete: bool, type_name: &str) ->
     Ok(r)
 }
 
-fn compare_bounds(a: &str, b: &str, element: &str) -> Result<std::cmp::Ordering> {
+pub(crate) fn compare_bounds(a: &str, b: &str, element: &str) -> Result<std::cmp::Ordering> {
     let av = cast_value(Bson::String(a.to_string()), element)?;
     let bv = cast_value(Bson::String(b.to_string()), element)?;
     crate::compare_constants(&av, &bv)

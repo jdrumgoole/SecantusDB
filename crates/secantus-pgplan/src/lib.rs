@@ -39,6 +39,7 @@ pub mod numeric;
 pub mod numeric_math;
 pub mod pgtypes;
 pub mod range;
+pub mod range_ops;
 pub mod scalar;
 pub mod view_dml;
 
@@ -12231,6 +12232,12 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
                 };
             }
             let op = operator_name(e).unwrap_or("");
+            if let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
+                let (lt, rt) = (static_type(l, &Bson::Null), static_type(r, &Bson::Null));
+                if let Some(t) = range_ops::result_type(op, &lt, &rt) {
+                    return t;
+                }
+            }
             // Bit-string operators keep the left operand's type; `||` is varbit
             // and `~` the operand's.
             if matches!(op, "&" | "|" | "#" | "<<" | ">>" | "||" | "~") {
@@ -20706,15 +20713,37 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
         } else {
             value
         };
-        // A BC / wide-year timestamptz is text, rendered in the session zone.
-        if matches!(target.as_str(), "text" | "varchar" | "bpchar" | "name")
-            && static_type(arg, &value) == "timestamptz"
-        {
-            if let Bson::String(t) = &value {
-                return cast_value(
-                    Bson::String(wide_timestamptz_text(t, &session_timezone())),
-                    &target,
-                );
+        // A BC / wide-year timestamptz is text, rendered in the session zone;
+        // so are a tstzrange's bounds and a timestamptz array's elements,
+        // which are stored in UTC.
+        if matches!(target.as_str(), "text" | "varchar" | "bpchar" | "name") && value != Bson::Null {
+            let source = static_type(arg, &value);
+            let tz = session_timezone();
+            let rendered = match (source.as_str(), &value) {
+                ("timestamptz", Bson::String(t)) => Some(wide_timestamptz_text(t, &tz)),
+                ("tstzrange", Bson::String(t)) => Some(range::render_in_zone(t, &tz)?),
+                ("tstzmultirange", Bson::String(t)) => {
+                    Some(range::render_multirange_in_zone(t, &tz)?)
+                }
+                ("timestamptz[]", Bson::Array(items)) => {
+                    let parts: Vec<String> = items
+                        .iter()
+                        .map(|v| match v {
+                            Bson::Null => "NULL".to_string(),
+                            other => format!(
+                                "\"{}\"",
+                                timestamptz_value_text(other, &tz).unwrap_or_else(|| {
+                                    wide_timestamptz_text(&value_text(other), &tz)
+                                })
+                            ),
+                        })
+                        .collect();
+                    Some(format!("{{{}}}", parts.join(",")))
+                }
+                _ => None,
+            };
+            if let Some(text) = rendered {
+                return cast_value(Bson::String(text), &target);
             }
         }
         // A float4 renders as float4out does: the shortest text of the f32.
@@ -21507,6 +21536,14 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 _ => return Err(Error::Unsupported(format!("unary {op}"))),
             },
         };
+        // Ranges and multiranges are text at run time too.
+        {
+            let lt = e.lexpr.as_deref().map(|n| static_type(n, &lhs)).unwrap_or_default();
+            let rt = e.rexpr.as_deref().map(|n| static_type(n, &rhs)).unwrap_or_default();
+            if let Some(out) = range_ops::binary(&op, &lhs, &rhs, &lt, &rt) {
+                return out;
+            }
+        }
         // Bit strings are text at run time, so their operators are chosen by
         // the operands' STATIC types.
         if e.lexpr

@@ -16239,8 +16239,13 @@ fn copy_reassemble(d: &Document, field: &str, ty: &Type) -> Option<Bson> {
 /// every type, and the gap is recorded in `tasks/backlog.md` rather than
 /// hidden.
 fn binary_encodable(ty: &Type) -> bool {
-    const OK: [Type; 35] = [
+    const OK: [Type; 40] = [
         Type::OID,
+        Type::REGTYPE,
+        Type::REGCLASS,
+        Type::BOX,
+        Type::BIT,
+        Type::VARBIT,
         Type::JSON_ARRAY,
         Type::JSONB_ARRAY,
         Type::OID_ARRAY,
@@ -16585,6 +16590,28 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
         if let Bson::String(bits) = v {
             return enc.encode_field(&Some(secantus_pgplan::bits::to_wire(bits)));
         }
+    }
+    // A regtype / regclass is its 4-byte oid.
+    if matches!(*ty, Type::REGTYPE | Type::REGCLASS) {
+        let oid = secantus_pgplan::regtype_oid(v)
+            .or_else(|| secantus_pgplan::regclass_oid(v))
+            .or_else(|| match v {
+                Bson::Int32(i) => Some(i64::from(*i)),
+                Bson::Int64(i) => Some(*i),
+                _ => None,
+            })
+            .and_then(|o| u32::try_from(o).ok())
+            .ok_or_else(|| bad("this value"))?;
+        return enc.encode_field(&Some(oid));
+    }
+    // `box_send`: the high corner, then the low one, each as two float8s.
+    if *ty == Type::BOX {
+        let c = secantus_pgplan::geo::box_coords(v).ok_or_else(|| bad("this value"))?;
+        let mut bytes = Vec::with_capacity(32);
+        for x in c {
+            bytes.extend_from_slice(&x.to_be_bytes());
+        }
+        return enc.encode_field(&Some(bytes));
     }
     let as_i64 = |v: &Bson| -> Option<i64> {
         match v {
