@@ -1,6 +1,6 @@
 # mongo-go-driver Validation Report
 
-Generated 2026-09-29 — SecantusDB 0.6.0b17 vs mongo-go-driver fd85a834c40e (`vendor/mongo-go-driver/`).
+Generated 2026-09-30 — SecantusDB 0.6.0b17 vs mongo-go-driver fd85a834c40e (`vendor/mongo-go-driver/`).
 
 Run `uv run python -m invoke validate-go` to refresh. The pass rate is the analogue of the pymongo conformance gauge for the official Go driver — same shape, different wire-protocol pickiness. Type-strict bugs (int32 vs int64) that pymongo accepts silently fail loudly here.
 
@@ -8,17 +8,15 @@ Run `uv run python -m invoke validate-go` to refresh. The pass rate is the analo
 
 | Package | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
-| `internal/integration` | 552 | 16 | 49 | 617 | 97.1% |
+| `internal/integration` | 554 | 14 | 49 | 617 | 97.5% |
 | `internal/integration/unified` | 42 | 0 | 0 | 42 | 100.0% |
-| **Overall** | **594** | **16** | **49** | **659** | **97.3%** |
+| **Overall** | **596** | **14** | **49** | **659** | **97.7%** |
 
-## Failures (16)
+## Failures (14)
 
 First 30 failed tests for triage:
 
 ```
-internal/integration :: TestConnectionsSurvivePrimaryStepDown/getMore_iteration
-internal/integration :: TestConnectionsSurvivePrimaryStepDown
 internal/integration :: TestRetryableReadsProse/retrying_reads_in_a_replica_set/overload_errors_retried_on_a_different_replicaset_server
 internal/integration :: TestRetryableReadsProse/retrying_reads_in_a_replica_set
 internal/integration :: TestRetryableReadsProse

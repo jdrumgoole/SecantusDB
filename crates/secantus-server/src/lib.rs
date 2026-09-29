@@ -1176,8 +1176,9 @@ fn reply_ok(reply: &Document) -> bool {
 /// or `maxAwaitTimeMS` elapses). If the server answers with a single
 /// `moreToCome`-clear reply, the driver's monitor still treats the connection as
 /// a live stream and, when the socket later closes, raises "Server ended
-/// moreToCome unexpectedly" and clears the pool. Our topology is fixed, so we
-/// re-emit the same hello state every `maxAwaitTimeMS` with `moreToCome` set;
+/// moreToCome unexpectedly" and clears the pool. Our topology changes only on a
+/// `replSetStepDown`, so we re-emit the same hello state every `maxAwaitTimeMS`
+/// with `moreToCome` set AND immediately whenever that happens;
 /// the wait polls `shared.stop` so shutdown is prompt, and on shutdown we send a
 /// final `moreToCome`-clear reply (a clean end the driver accepts silently).
 /// Mirrors `server.py::_stream_awaitable_hello`. `Ok(true)` = ended cleanly,
@@ -1251,7 +1252,7 @@ fn stream_awaitable_hello<S: Read + Write>(
         return Ok(false);
     }
     loop {
-        // Hold up to maxAwaitTimeMS (topology never changes). Each iteration
+        // Hold up to maxAwaitTimeMS, or until the topology moves. Each iteration
         // probes the socket (its read timeout is `READ_POLL`): a 0-byte read is
         // EOF — the client closed it or a kill shut it down — and any bytes mid-
         // stream are an unexpected client message; either way we drop the stream.

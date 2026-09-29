@@ -66,6 +66,8 @@ command set. The divergences:
 | `serverStatus` | ✅ | ⚠️ version + mostly-zeroed metrics | ⚠️ smaller subset still |
 | `dbStats` / `collStats` | ✅ | ✅ real counts/sizes from the WT tables | ⚠️ `dataSize` used for size fields |
 | `replSetGetStatus` | ✅ | ⚠️ single-node persona reply | ⚠️ single-node persona reply |
+| `replSetStepDown` | ✅ | ⚠️ the single-node behaviour: `force: true` makes the node a secondary for the period (writes `10107`, reads served), then primary again. Election TIMING not reproduced — mongod's return is driven by an election, so a 0-second period takes ~19s there and 0s here | ⚠️ same |
+| `getParameter` / `setParameter` | ✅ | ⚠️ the parameters this server actually has (`logLevel`, `quiet`, and the read-only handshake ones). A name we do not register is refused `72` rather than accepted and ignored | ⚠️ same |
 | Atlas Search index commands (`createSearchIndexes`, …) | Atlas only | ❌ rejected (`CommandNotSupported`) | ❌ rejected |
 | `secantusAdmin.*` (backup / PITR / prune — SecantusDB-proprietary) | — | ✅ | ✅ (`restoreToTimestamp` via the `secantusd-rs restore` CLI rather than a wire command) |
 
