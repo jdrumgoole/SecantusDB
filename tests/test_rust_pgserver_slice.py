@@ -12272,3 +12272,323 @@ def test_a_tables_row_type_does_not_double_its_pg_attribute_rows(home: Path) -> 
             "SELECT count(*) FROM pg_attribute WHERE attrelid='cc_parent'::regclass AND attnum > 0"
         )
         assert cur.fetchall() == [(6,)]
+
+
+# --- arrays: functions, containment operators, subscripting -----------------
+#
+# Every expectation below is PostgreSQL 14.13's own answer, taken from
+# `tools/probes/pg_corpora/arrays{,2}.sql` run through
+# `tools/probes/pg_differential.py`. The corpora are the wide net; these pin
+# the cases whose rules are surprising enough that a future reader would
+# otherwise "fix" them into agreement with intuition.
+
+
+def test_array_dimension_functions_distinguish_empty_from_null(home: Path) -> None:
+    """An EMPTY array and a NULL one answer differently, and `cardinality` is
+    the one that separates them: it is 0 for the empty array where every other
+    dimension function is NULL."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT array_length(ARRAY[]::int[],1), array_ndims(ARRAY[]::int[]),"
+            " array_dims(ARRAY[]::int[]), cardinality(ARRAY[]::int[])"
+        )
+        assert cur.fetchall() == [(None, None, None, 0)]
+        cur.execute(
+            "SELECT array_length(NULL::int[],1), cardinality(NULL::int[]),"
+            " array_ndims(NULL::int[]), array_dims(NULL::int[])"
+        )
+        assert cur.fetchall() == [(None, None, None, None)]
+
+
+def test_dimension_functions_read_every_dimension(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT array_dims(ARRAY[[1,2],[3,4]]), array_ndims(ARRAY[[1,2],[3,4]]),"
+            " cardinality(ARRAY[[1,2],[3,4]]), array_length(ARRAY[[1,2],[3,4]],2),"
+            " array_upper(ARRAY[1,2],1), array_lower(ARRAY[1,2],1)"
+        )
+        assert cur.fetchall() == [("[1:2][1:2]", 2, 4, 2, 2, 1)]
+        # A dimension the array does not have is NULL, not an error.
+        cur.execute("SELECT array_length(ARRAY[1,2],0), array_length(ARRAY[1,2],2)")
+        assert cur.fetchall() == [(None, None)]
+
+
+def test_the_search_functions_match_null_to_null(home: Path) -> None:
+    """`array_position` / `array_remove` / `array_replace` find a NULL, which
+    is NOT how `@>` behaves — see the test below. The two rules look like one
+    another's bug; PostgreSQL really does have both."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT array_position(ARRAY[1,NULL,2], NULL),"
+            " array_positions(ARRAY[1,NULL], NULL),"
+            " array_remove(ARRAY[1,NULL], NULL),"
+            " array_replace(ARRAY[1,NULL], NULL, 9)"
+        )
+        assert cur.fetchall() == [(2, [2], [1], [1, 9])]
+
+
+def test_containment_never_matches_a_null(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT ARRAY[1,NULL] @> ARRAY[NULL]::int[],"
+            " ARRAY[1,NULL] <@ ARRAY[1,NULL],"
+            " ARRAY[1,NULL] && ARRAY[NULL]::int[]"
+        )
+        assert cur.fetchall() == [(False, False, False)]
+        # A NULL operand is a NULL answer; an empty right side is contained.
+        cur.execute(
+            "SELECT ARRAY[1] @> NULL::int[], ARRAY[1,2] @> ARRAY[]::int[],"
+            " ARRAY[1,2] && ARRAY[2,9], ARRAY[1] && ARRAY[9]"
+        )
+        assert cur.fetchall() == [(None, True, True, False)]
+        # Containment ignores dimensionality: both sides are flattened.
+        cur.execute("SELECT ARRAY[[1,2],[3,4]] @> ARRAY[3]")
+        assert cur.fetchall() == [(True,)]
+
+
+def test_array_search_and_removal_refuse_a_multidimensional_array(home: Path) -> None:
+    """PostgreSQL's own refusals, not this server's gaps — `array_replace`
+    beside them works, because replacing cannot change the shape."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        for sql in (
+            "SELECT array_position(ARRAY[[1,2],[3,4]], 1)",
+            "SELECT array_remove(ARRAY[[1,2],[3,4]], 1)",
+        ):
+            with pytest.raises(psycopg.Error):
+                cur.execute(sql)
+            conn.rollback()
+        cur.execute("SELECT array_replace(ARRAY[[1,2],[3,4]], 1, 9)")
+        assert cur.fetchall() == [[[9, 2], [3, 4]]]
+
+
+def test_array_to_string_skips_nulls_unless_given_a_null_string(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT array_to_string(ARRAY[1,NULL,3], ','),"
+            " array_to_string(ARRAY[1,NULL,3], ',', 'X'),"
+            " array_to_string(ARRAY[[1,2],[3,4]], ','),"
+            " array_to_string(ARRAY[1,2], NULL)"
+        )
+        assert cur.fetchall() == [("1,3", "1,X,3", "1,2,3,4", None)]
+
+
+def test_string_to_array_separator_shapes(home: Path) -> None:
+    """Three shapes PostgreSQL treats differently: an EMPTY separator keeps the
+    whole string, a NULL separator splits into characters, and an empty INPUT
+    is the empty array whatever the separator."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT string_to_array('abc', ''), string_to_array('abc', NULL),"
+            " string_to_array('', ','), string_to_array('a,b,,c', ','),"
+            " string_to_array('a,b', ',', 'b'), string_to_array(NULL, ',')"
+        )
+        assert cur.fetchall() == [
+            (["abc"], ["a", "b", "c"], [], ["a", "b", "", "c"], ["a", None], None)
+        ]
+
+
+def test_concatenation_takes_a_null_side_as_the_empty_one(home: Path) -> None:
+    """`array_cat` and `array_append` are NOT null-propagating, which is what
+    lets them fold over a nullable accumulator. `array_remove` beside them
+    is."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT array_cat(NULL::int[], ARRAY[3]), array_cat(ARRAY[1], NULL::int[]),"
+            " array_cat(NULL::int[], NULL::int[]), array_append(NULL::int[], 2),"
+            " array_append(ARRAY[1], NULL::int), array_prepend(NULL::int, ARRAY[1]),"
+            " array_remove(NULL::int[], 1)"
+        )
+        assert cur.fetchall() == [([3], [1], None, [2], [1, None], [None, 1], None)]
+
+
+def test_concatenation_joins_by_dimensionality(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT array_cat(ARRAY[[1,2],[3,4]], ARRAY[5,6])")
+        assert cur.fetchall() == [[[1, 2], [3, 4], [5, 6]]]
+        with pytest.raises(psycopg.Error):
+            cur.execute("SELECT array_cat(ARRAY[1,2], ARRAY[[3,4,5]])")
+
+
+def test_array_fill_refuses_a_lower_bound_it_cannot_represent(home: Path) -> None:
+    """This server does not model array lower bounds, so `array_fill` with one
+    is REFUSED rather than answered with a 1-based array.
+
+    The value would be right and every subscript into it wrong — PostgreSQL
+    renders it as `[3:4]={7,7}` and answers `(...)[3]` as 7. A named 0A000 is
+    the honest answer; silently re-basing is the kind of divergence this
+    project treats as data loss.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT array_fill(0, ARRAY[2,2]), array_fill(1, ARRAY[0])")
+        assert cur.fetchall() == [([[0, 0], [0, 0]], [])]
+        cur.execute("SELECT array_fill(7, ARRAY[2], ARRAY[1])")
+        assert cur.fetchall() == [([7, 7],)]
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute("SELECT array_fill(7, ARRAY[2], ARRAY[3])")
+        assert info.value.sqlstate == "0A000"
+
+
+def test_subscripting_reads_elements_and_slices(home: Path) -> None:
+    """A subscript out of range is NULL; a SLICE out of range is the EMPTY
+    array. Two different answers to what looks like one question."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT (ARRAY[1,2,3])[1], (ARRAY[1,2,3])[0], (ARRAY[1,2,3])[9],"
+            " (ARRAY[1,2,3])[2:3], (ARRAY[1,2,3])[2:], (ARRAY[1,2,3])[:2],"
+            " (ARRAY[1,2,3])[5:9], (ARRAY[1,2,3])[3:1], (ARRAY[1,2,3])[0:1]"
+        )
+        assert cur.fetchall() == [(1, None, None, [2, 3], [2, 3], [1, 2], [], [], [1])]
+        cur.execute("SELECT (NULL::int[])[1], (ARRAY[1,2])[NULL]")
+        assert cur.fetchall() == [(None, None)]
+
+
+def test_a_bare_index_beside_a_slice_means_one_to_n(home: Path) -> None:
+    """PostgreSQL: once ANY subscript is a slice, a subscript written as a
+    single number is "from 1 to the number specified".
+
+    So `m[1:2][2]` is the WHOLE second dimension, not its second element —
+    and `m[1:2][1]` agrees with the `n:n` reading, which is exactly why a
+    probe that only tried `[1]` would call this correct.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT (ARRAY[[1,2],[3,4]])[1:2][1], (ARRAY[[1,2],[3,4]])[1:2][2],"
+            " (ARRAY[[1,2],[3,4]])[2:2]"
+        )
+        assert cur.fetchall() == [([[1], [3]], [[1, 2], [3, 4]], [[3, 4]])]
+
+
+def test_a_short_subscript_list_selects_nothing(home: Path) -> None:
+    """`(ARRAY[[1,2],[3,4]])[1]` is NULL on PostgreSQL, not the inner row."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT (ARRAY[[1,2],[3,4]])[1], (ARRAY[[1,2],[3,4]])[1][2]")
+        assert cur.fetchall() == [(None, 2)]
+
+
+def test_a_subscript_carries_the_element_type_not_the_array_type(home: Path) -> None:
+    """An element reference drops the `[]` and a slice keeps it, which the
+    VALUE cannot say once a one-element slice has been taken. Described
+    wrongly, `length(ta[1])` came back as the string `'1'`."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE arr_t (id int PRIMARY KEY, ia int[], ta text[])")
+        cur.execute("INSERT INTO arr_t VALUES (1, ARRAY[1,2,3], ARRAY['a','b'])")
+        cur.execute("SELECT length(ta[1]), ia[1] + 1, ta[1] || ta[2] FROM arr_t")
+        assert cur.fetchall() == [(1, 2, "ab")]
+        cur.execute("SELECT ia[1], ia[1:2] FROM arr_t")
+        [element, slice_] = cur.description
+        assert (element.type_code, slice_.type_code) == (23, 1007)
+
+
+def test_a_subscript_bound_may_read_the_row(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE arr_n (id int PRIMARY KEY, ia int[], n int)")
+        cur.execute("INSERT INTO arr_n VALUES (1, ARRAY[1,2,3], 2)")
+        cur.execute("SELECT ia[n], ia[n:3], ia[1:n] FROM arr_n")
+        assert cur.fetchall() == [(2, [2, 3], [1, 2])]
+
+
+def test_assigning_into_an_array_extends_it_with_nulls(home: Path) -> None:
+    """`SET a[i] = v` rewrites the stored array rather than replacing it, and a
+    subscript past the end pads the gap with NULLs.
+
+    Before this landed the bulk UPDATE path ran instead, wrote an empty `$set`
+    and still answered `UPDATE 1` — a statement that reported success and
+    changed nothing.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE arr_u (id int PRIMARY KEY, ia int[], m int[][])")
+        cur.execute(
+            "INSERT INTO arr_u VALUES (1, ARRAY[1,2,3], ARRAY[[1,2],[3,4]]), (2, NULL, NULL)"
+        )
+        cur.execute("UPDATE arr_u SET ia[2] = 99 WHERE id=1 RETURNING ia")
+        assert cur.fetchall() == [([1, 99, 3],)]
+        cur.execute("UPDATE arr_u SET ia[6] = 6 WHERE id=1 RETURNING ia")
+        assert cur.fetchall() == [([1, 99, 3, None, None, 6],)]
+        # Two assignments to one column in one statement: the second sees the
+        # first, rather than both starting from the stored row.
+        cur.execute("UPDATE arr_u SET ia[1] = 7, ia[2] = 8 WHERE id=1 RETURNING ia")
+        assert cur.fetchall() == [([7, 8, 3, None, None, 6],)]
+        cur.execute("UPDATE arr_u SET ia[2:3] = ARRAY[4,5] WHERE id=1 RETURNING ia")
+        assert cur.fetchall() == [([7, 4, 5, None, None, 6],)]
+        # Assigning into a NULL column builds the array from nothing.
+        cur.execute("UPDATE arr_u SET ia[1] = 1 WHERE id=2 RETURNING ia")
+        assert cur.fetchall() == [([1],)]
+        cur.execute("UPDATE arr_u SET m[1][2] = 42 WHERE id=1 RETURNING m")
+        assert cur.fetchall() == [[[1, 42], [3, 4]]]
+        # The rewrite is STORED, not only returned.
+        cur.execute("SELECT ia, m FROM arr_u WHERE id=1")
+        assert cur.fetchall() == [([7, 4, 5, None, None, 6], [[1, 42], [3, 4]])]
+
+
+def test_assigning_below_subscript_1_is_refused(home: Path) -> None:
+    """PostgreSQL answers it by MOVING the array's lower bound — `SET ia[0]=0`
+    leaves an `[0:5]={...}`. Without a lower-bound model, writing it at index 1
+    would silently shift every other subscript, so it is refused by name."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE arr_lb (id int PRIMARY KEY, ia int[])")
+        cur.execute("INSERT INTO arr_lb VALUES (1, ARRAY[1,2,3])")
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute("UPDATE arr_lb SET ia[0] = 0 WHERE id=1")
+        assert info.value.sqlstate == "0A000"
+        conn.rollback()
+        cur.execute("SELECT ia FROM arr_lb WHERE id=1")
+        assert cur.fetchall() == [([1, 2, 3],)]
+
+
+def test_a_slice_assignment_source_must_fill_the_range(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE arr_s (id int PRIMARY KEY, ia int[])")
+        cur.execute("INSERT INTO arr_s VALUES (1, ARRAY[1,2,3])")
+        with pytest.raises(psycopg.Error):
+            cur.execute("UPDATE arr_s SET ia[1:2] = ARRAY[1] WHERE id=1")
+        conn.rollback()
+        # A source LONGER than the range has its tail ignored.
+        cur.execute("UPDATE arr_s SET ia[1:2] = ARRAY[8,9,10] WHERE id=1 RETURNING ia")
+        assert cur.fetchall() == [([8, 9, 3],)]
+
+
+def test_a_multidimensional_array_is_typed_as_its_element_array(home: Path) -> None:
+    """`{{1,2},{3,4}}` is `int4[]` (oid 1007), never `int4[][]`, which is no
+    type name at all. Reading only the first element's kind typed it `text[]`,
+    and a binary-format client then refused the int rows as `_text`."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT array_fill(0, ARRAY[2,2])")
+        assert cur.description[0].type_code == 1007
+        assert cur.fetchall() == [[[0, 0], [0, 0]]]
+        # A LEADING NULL must not decide the element type either.
+        cur.execute("SELECT array_prepend(NULL::int, ARRAY[1])")
+        assert cur.description[0].type_code == 1007
+        assert cur.fetchall() == [([None, 1],)]
+
+
+def test_array_functions_report_their_type_when_the_value_is_null_or_empty(
+    home: Path,
+) -> None:
+    """A NULL result cannot say its type and an EMPTY array says the wrong one,
+    so both come from the CALL. `array_remove(NULL::int[], 1)` reported `text`
+    and `string_to_array('', 'x')` reported `int4[]`."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT array_remove(NULL::int[], 1), array_cat(NULL::int[], NULL::int[])")
+        assert [d.type_code for d in cur.description] == [1007, 1007]
+        cur.execute("SELECT string_to_array('', 'x'), array_positions(ARRAY[1], 9)")
+        assert [d.type_code for d in cur.description] == [1009, 1007]

@@ -6924,7 +6924,7 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       | ~~window functions~~ | **DONE 2026-09-28** | a window over an AGGREGATE is still refused |
       | ~~`ORDER BY` over an expression~~ | **DONE 2026-09-28** | |
       | `SELECT *` / `t.*` over a JOIN or comma FROM | `select * from t1, t2` | `this subquery target` |
-      | array subscripting | `(array[1,2])[1]` | `this field selection` |
+      | ~~array subscripting~~ | **DONE 2026-09-29** | read AND `SET a[i] = v`; below subscript 1 refused |
       | `CREATE INDEX` | | `IndexStmt` |
       | ~~`ALTER TABLE`, any form~~ | **DONE 2026-09-28**, incl. RENAME | `USING`, and ADD of a UNIQUE/PK/FK |
       | `CREATE VIEW` | | `ViewStmt` |
@@ -6932,6 +6932,45 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       | `EXPLAIN` | | `ExplainStmt` |
       | composite `PRIMARY KEY` / multi-col `FOREIGN KEY` | | `a composite PRIMARY KEY` |
       | non-literal column `DEFAULT` | `default now()` | `a non-literal DEFAULT` |
+
+      **The ARRAY surface landed 2026-09-29** (`arrays` corpus 24 divergences
+      of 29 -> 6, every one of the six an honest named refusal): the fifteen
+      array functions (`array_length` / `_ndims` / `_dims` / `_lower` /
+      `_upper` / `cardinality` / `_cat` / `_append` / `_prepend` /
+      `_to_string` / `string_to_array` / `_position` / `_positions` /
+      `_remove` / `_replace` / `_fill`), the `@>` / `<@` / `&&` containment
+      operators, subscript READS (`a[1]`, `a[2:3]`, `a[2:]`, `m[1][2]`,
+      `m[1:2][1:1]`, a bound that reads the row) and subscript ASSIGNMENT
+      (`SET a[i] = v`, `SET a[lo:hi] = v`, padding past the end, building from
+      a NULL column). A second corpus, `arrays2`, covers 32 more shapes at 0
+      divergences. Five things that batch measured and are worth not
+      re-deriving:
+
+      * **PostgreSQL has TWO array equality rules and they disagree about
+        NULL.** `array_position` / `_remove` / `_replace` match NULL to NULL
+        (`array_position(ARRAY[1,NULL], NULL)` is 2); `@>` / `<@` / `&&` never
+        match a NULL, so `ARRAY[1,NULL] <@ ARRAY[1,NULL]` is FALSE. Each one
+        looks like the other's bug.
+      * **A bare index beside a slice is `1:n`, not `n:n`** — `m[1:2][2]` is
+        the whole second dimension. The two readings AGREE whenever n is 1,
+        which is exactly why the first probe (`m[1:2][1]`) called the wrong
+        one correct. Probe a subscript rule at 2, never at 1.
+      * **A subscript list shorter than the array's dimensionality selects
+        NOTHING**: `(ARRAY[[1,2],[3,4]])[1]` is NULL, not the inner row.
+      * **Array lower bounds are NOT modelled, and the two constructors that
+        could produce one are refused by name** rather than re-based to 1:
+        `array_fill(v, dims, lbounds)` with a bound other than 1, and
+        `SET a[i] = v` below subscript 1 (PostgreSQL answers the latter by
+        MOVING the bound, leaving an `[0:5]={...}`). The value would be right
+        and every subscript into it wrong — see `crates/secantus-pgplan/src/
+        arrays.rs`' header.
+      * **Three TYPE bugs sat behind this and none was visible in a value
+        comparison**: an array whose first element is NULL typed as `text[]`
+        (so a binary client decoded the integers beside it as NULL); a
+        MULTIdimensional array typed as `text[]` rather than its element
+        array; and an ARRAY column sampled as `Bson::Null` at plan time, so
+        every expression over one — `length(ta[1])` — typed from a NULL and
+        came back as a string. **Run the differential with `--types`.**
 
       **Pattern matching and `CASE` landed 2026-09-28** (0/17 -> 14/17 on
       `pred_probe` against PostgreSQL 14.13): `LIKE` / `ILIKE` / `NOT LIKE`
