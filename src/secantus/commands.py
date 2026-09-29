@@ -96,6 +96,7 @@ from secantus.rbac import (
     A_RENAME_COLL_SAME_DB,
     A_REVOKE_ROLE,
     A_SERVER_STATUS,
+    A_SET_PARAMETER,
     A_TOP,
     A_UPDATE,
     A_VIEW_ROLE,
@@ -107,6 +108,7 @@ from secantus.rbac import (
     check_privilege,
     is_known_role,
 )
+from secantus.serverparams import ServerParams, SetParameterError
 from secantus.sessions import SessionRegistry
 from secantus.storage import (
     DocumentTooLargeError,
@@ -639,6 +641,11 @@ class CommandContext:
     logs: LogBuffer | None = None
     sessions: SessionRegistry | None = None
     failpoints: FailPointRegistry | None = None
+    # Server-wide store of runtime-changed server parameters, written by
+    # ``setParameter`` and overlaid onto ``getParameter``'s defaults. None in
+    # unit-test contexts: ``setParameter`` then validates and answers but
+    # nothing persists.
+    server_params: ServerParams | None = None
     transactions: TransactionRegistry | None = None
     # MONGODB-X509: the subject DN of the verified client cert the
     # connection's TLS handshake produced, in RFC 4514 string form
@@ -1819,7 +1826,7 @@ def _top(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     return {"totals": totals, "ok": 1.0}
 
 
-def _get_parameter(doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
+def _get_parameter(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
     """Return server parameters.
 
     Real `mongod` exposes hundreds of tunables. SecantusDB returns a
@@ -1852,7 +1859,7 @@ def _get_parameter(doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
         # The REAL value, not a constant. Drivers gate on this: while it said
         # False, pymongo's harness skipped ~1,080 unified-spec failpoint tests
         # this server can run (measured 2026-09-25).
-        "enableTestCommands": getattr(_ctx, "failpoints", None) is not None,
+        "enableTestCommands": getattr(ctx, "failpoints", None) is not None,
         "logLevel": 0,
         "quiet": False,
         # Real ``mongod`` exposes the list of enabled auth mechanisms
@@ -1866,6 +1873,10 @@ def _get_parameter(doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
         # failing on the missing handshake.
         "authenticationMechanisms": ["SCRAM-SHA-256"],
     }
+    # A value ``setParameter`` changed wins over the compiled-in default, so
+    # the two commands cannot disagree about what the server currently holds.
+    if ctx.server_params is not None:
+        params.update(ctx.server_params.snapshot())
     arg = doc.get("getParameter")
     if isinstance(arg, str) and arg == "*":
         return {**params, "ok": 1.0}
@@ -1878,6 +1889,35 @@ def _get_parameter(doc: dict[str, Any], _ctx: CommandContext) -> dict[str, Any]:
     if not keys:
         return {**params, "ok": 1.0}
     return {**{k: params[k] for k in keys if k in params}, "ok": 1.0}
+
+
+def _set_parameter(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
+    """``setParameter`` — change a runtime-settable server parameter.
+
+    The codes, messages and coercion rules live in
+    :mod:`secantus.serverparams`, measured against mongod 8.2.11; this is just
+    the command wrapper. ``getParameter``'s table supplies ``was`` for a
+    parameter nobody has changed yet, so the default is stated once.
+    """
+    if ctx.db_name != "admin":
+        return {
+            "ok": 0.0,
+            "errmsg": "setParameter may only be run against the admin database.",
+            "code": 13,
+            "codeName": "Unauthorized",
+        }
+    store = ctx.server_params if ctx.server_params is not None else ServerParams()
+    # The defaults come from `getParameter` itself so the two cannot drift.
+    defaults = {k: v for k, v in _get_parameter({"getParameter": "*"}, ctx).items() if k != "ok"}
+    try:
+        return store.apply(doc, defaults)
+    except SetParameterError as exc:
+        return {
+            "ok": 0.0,
+            "errmsg": str(exc),
+            "code": exc.code,
+            "codeName": exc.code_name,
+        }
 
 
 def _get_cmd_line_opts(_doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
@@ -8888,6 +8928,7 @@ _HANDLERS: dict[str, CommandHandler] = {
     "top": _top,
     "getCmdLineOpts": _get_cmd_line_opts,
     "getParameter": _get_parameter,
+    "setParameter": _set_parameter,
     "connectionStatus": _connection_status,
     "dbStats": _db_stats,
     "dbstats": _db_stats,
@@ -9045,6 +9086,7 @@ _COMMAND_ACTIONS: dict[str, tuple[str, str]] = {
     # an unprivileged authenticated user could call. Reuse the same
     # cluster-monitor action as the other introspection commands.
     "getParameter": (A_GET_CMD_LINE_OPTS, SCOPE_CLUSTER),
+    "setParameter": (A_SET_PARAMETER, SCOPE_CLUSTER),
     "getLog": (A_GET_LOG, SCOPE_CLUSTER),
     "currentOp": (A_INPROG, SCOPE_CLUSTER),
     # Fault injection is a server-wide DoS lever (e.g. closeConnection on

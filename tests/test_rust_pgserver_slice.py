@@ -8253,9 +8253,24 @@ def test_pg_cancel_and_terminate_backend_signal_a_running_statement(home: Path) 
                 idle.execute("select 1")
             assert info.value.sqlstate == "57P01"
             assert idle.closed
-            assert other.execute(
-                "select count(*) from pg_stat_activity where pid = %s", (idle_pid,)
-            ).fetchone() == (0,)
+            # The CLIENT observing its socket close and the SERVER reaping the
+            # activity-registry entry are not synchronised -- the handler thread
+            # unregisters after the peer is already gone. Asserting immediately
+            # read `(1,)` under CI load on 2026-09-29 (green on the eleven runs
+            # before it, which is exactly how a race this narrow presents).
+            # Poll instead: still requires the entry to disappear, and now says
+            # so deterministically rather than depending on who wins.
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                remaining = other.execute(
+                    "select count(*) from pg_stat_activity where pid = %s", (idle_pid,)
+                ).fetchone()
+                if remaining == (0,):
+                    break
+                time.sleep(0.02)
+            assert remaining == (0,), (
+                f"a terminated session was still in pg_stat_activity after 10s: {remaining}"
+            )
 
 
 def test_create_table_as_function_sources_and_expression_aggregates(home: Path) -> None:

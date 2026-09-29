@@ -64,6 +64,10 @@ pub const A_ENABLE_PROFILER: &str = "enableProfiler";
 // needs an explicit cluster-admin grant — mongod gates the same command
 // behind enableTestCommands AND a privileged role.
 pub const A_CONFIGURE_FAIL_POINT: &str = "configureFailPoint";
+/// mongod grants `setParameter` to `hostManager`, which `clusterAdmin`
+/// includes; we hang it off the same cluster-admin bundle as the other
+/// server-wide levers.
+pub const A_SET_PARAMETER: &str = "setParameter";
 
 // --- Resource scopes -----------------------------------------------------
 
@@ -135,7 +139,13 @@ const CLUSTER_MONITOR_ACTIONS: &[&str] = &[
     A_INPROG,
 ];
 
-const CLUSTER_ADMIN_EXTRA: &[&str] = &[A_FSYNC, A_DROP_DATABASE, A_KILLOP, A_CONFIGURE_FAIL_POINT];
+const CLUSTER_ADMIN_EXTRA: &[&str] = &[
+    A_FSYNC,
+    A_DROP_DATABASE,
+    A_KILLOP,
+    A_CONFIGURE_FAIL_POINT,
+    A_SET_PARAMETER,
+];
 
 /// Actions + scope flags for a built-in role. Mirrors `rbac.py::_RoleSpec`.
 struct RoleSpec {

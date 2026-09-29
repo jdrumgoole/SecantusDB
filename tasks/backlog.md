@@ -2985,19 +2985,61 @@ These are explicit non-goals. Don't add them without a reason.
       **Two are missing commands, and both are more interesting than "not
       implemented":**
 
-      * **`setParameter` is not implemented on either server** — mongod has it
-        (verified 8.2.11: `{setParameter: 1, logLevel: 0}` → ok). Needed by
-        `TestConnectionPoolBackpressure` and almost certainly
-        `TestSDAMProse/heartbeats_processed_more_frequently`, which tune server
-        behaviour mid-test. A read-only `getParameter` already exists, so the
-        write side is the gap.
-      * **`replSetStepDown` answers 59 CommandNotFound here; a STANDALONE mongod
-        answers `76 NoReplicationEnabled`.** So this is a divergence, not merely
-        an unimplemented multi-node feature — mongod recognises the command and
-        refuses it with a specific code. Worth probing against a single-node
-        REPLICA SET before choosing our answer, because that is the persona we
-        advertise and it may attempt the step-down rather than refuse.
-        Breaks `TestConnectionsSurvivePrimaryStepDown/getMore_iteration`.
+      * **`setParameter` — IMPLEMENTED on both servers 2026-09-29**, matching
+        mongod 8.2.11 on every outcome for the parameters we register: `ok` plus
+        the previous value in `was`; 20 `IllegalOperation` for a parameter that
+        exists but is startup-only; 72 `InvalidOptions` for a name we do not
+        register and for a call naming none; 2 `BadValue` for a bad value; 13
+        `Unauthorized` outside `admin`. Five coercion rules had to be measured
+        rather than assumed (`logLevel` takes doubles and bools, truncates
+        toward zero, clamps at 5, and refuses only a negative that does not
+        truncate to zero; a bool parameter takes EVERY type, and an empty string
+        is true). 0 divergences of 64 on the value-for-value matrix.
+
+        **It does NOT unblock `TestConnectionPoolBackpressure`**, and the entry
+        that said it would was reading the test's first line. That test sets
+        four `ingressConnectionEstablishment*` parameters — a real mongod
+        connection rate limiter we have no equivalent of — then fires 100
+        concurrent finds with `$where: sleep(2000)` and asserts ≥10 checkout
+        FAILURES. It needs (a) that rate limiter and (b) server-side JavaScript.
+        We refuse the parameters deliberately rather than accepting names we do
+        not honour; see the `$where` item.
+
+      * **`TestSDAMProse/heartbeats_processed_more_frequently` has nothing to do
+        with `setParameter`** — the entry guessed "almost certainly" and the
+        guess was wrong. Measured 2026-09-29 against the Rust server: it fails
+        `expected number of messages to be in range [6, 10], got 12 (num nodes =
+        1, duration = 2.000205375s, interval = 500ms)`. The driver counts the
+        messages IT sent over 2s at a 500ms heartbeat interval; the formula is
+        `N * (2 handshakes + D/I heartbeats + D/I RTTs)` = 10, and we provoke
+        12. That is an SDAM fidelity question about our handshake — two extra
+        round trips per node — not a missing command. **Open and undiagnosed**;
+        the next step is to capture what the driver actually sends (it is the
+        client side that is counted, so the answer is in what our `hello` reply
+        makes it do — `topologyVersion` / awaitable-hello support is the first
+        thing to check).
+
+      * **`replSetStepDown` answers 59 CommandNotFound here. Which mongod
+        answer is right depends on the persona, and ours is a REPLICA SET**
+        (measured 2026-09-29):
+        - a STANDALONE mongod: `76 NoReplicationEnabled` "not running with
+          --replSet";
+        - a SINGLE-NODE REPLICA SET: `{replSetStepDown: 5}` is
+          `2 BadValue` "stepdown period must be longer than
+          secondaryCatchUpPeriod", and `{replSetStepDown: 5, force: true}`
+          **succeeds** — the node goes secondary for ~5s, re-elects itself
+          (it is the only member) and returns to primary, and an open cursor
+          survives the whole transition.
+
+        We advertise `setName` and already serve `replSetGetStatus` with a full
+        status, so 76 "not running with --replSet" would contradict our own
+        handshake. The faithful answer is the single-node replica-set one,
+        which means really transitioning to secondary for the requested period
+        — **a genuine behaviour change** (writes must be refused during the
+        window) and therefore Joe's call rather than a drive-by. Breaks
+        `TestConnectionsSurvivePrimaryStepDown/getMore_iteration`, which needs
+        the command to succeed, the cursor to survive, and the pool not to
+        clear.
 
       **Two need a second replica-set member — the documented single-node
       non-goal:**

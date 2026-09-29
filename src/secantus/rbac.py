@@ -116,6 +116,10 @@ A_ENABLE_PROFILER = "enableProfiler"
 # needs an explicit cluster-admin grant — mongod gates the same command
 # behind enableTestCommands AND a privileged role.
 A_CONFIGURE_FAIL_POINT = "configureFailPoint"
+# mongod grants ``setParameter`` to ``hostManager``, which ``clusterAdmin``
+# includes; hung off the same cluster-admin bundle as the other server-wide
+# levers, mirroring the Rust server's ``A_SET_PARAMETER``.
+A_SET_PARAMETER = "setParameter"
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +229,7 @@ _CLUSTER_ADMIN_EXTRA_ACTIONS: frozenset[str] = frozenset(
         A_DROP_DATABASE,
         A_KILLOP,
         A_CONFIGURE_FAIL_POINT,
+        A_SET_PARAMETER,
     }
 )
 
