@@ -22,7 +22,10 @@ pub mod geo;
 pub mod geometry;
 pub mod hstore;
 pub mod joins;
-pub use correlated::{with_correlated_runner, with_sequence_hook};
+pub use correlated::set_user_functions;
+pub use correlated::{
+    with_correlated_runner, with_function_hook, with_sequence_hook, FnResult, UserFn,
+};
 pub mod json;
 pub mod net;
 pub mod numeric;
@@ -404,6 +407,16 @@ pub enum Statement {
         /// The built-in the wrapper names (`textin`).
         body: String,
         volatility: String,
+    },
+    /// `CREATE [OR REPLACE] FUNCTION` in `LANGUAGE sql` or `plpgsql`.
+    CreateUserFunction(UserFunctionDef),
+    /// `CREATE [OR REPLACE] TRIGGER`.
+    CreateTrigger(TriggerDef),
+    /// `DROP TRIGGER [IF EXISTS] name ON table`.
+    DropTrigger {
+        name: String,
+        table: String,
+        if_exists: bool,
     },
     /// `DROP FUNCTION [IF EXISTS] name[(args)] [CASCADE]`.
     DropFunction {
@@ -1720,6 +1733,43 @@ pub struct CreateIndex {
     pub method: String,
 }
 
+/// A user-defined function as CREATE FUNCTION declares it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UserFunctionDef {
+    pub name: String,
+    pub replace: bool,
+    /// `(name, type)` of each INPUT parameter, in order; a name may be empty.
+    pub params: Vec<(String, String)>,
+    pub return_type: String,
+    pub returns_set: bool,
+    /// `RETURNS TABLE (...)` / OUT columns.
+    pub columns: Vec<(String, String)>,
+    pub body: String,
+    pub language: String,
+    pub volatility: String,
+}
+
+/// A trigger as CREATE TRIGGER declares it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TriggerDef {
+    pub name: String,
+    pub table: String,
+    pub replace: bool,
+    /// `BEFORE` / `AFTER`.
+    pub timing: String,
+    /// `INSERT` / `UPDATE` / `DELETE` / `TRUNCATE`, in PostgreSQL's order.
+    pub events: Vec<String>,
+    /// `UPDATE OF col, ...`: fire only when one of these is a SET target.
+    pub update_columns: Vec<String>,
+    /// `ROW` / `STATEMENT`.
+    pub level: String,
+    pub function: String,
+    /// `EXECUTE FUNCTION f('a', 'b')`: the literal arguments, as `TG_ARGV`.
+    pub args: Vec<String>,
+    /// The `WHEN (...)` condition, deparsed.
+    pub when: Option<String>,
+}
+
 /// `EXPLAIN`'s options, as PostgreSQL defaults them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExplainOptions {
@@ -2272,6 +2322,7 @@ fn plan_node(
             plan_define_type(&d)
         }
         N::CreateFunctionStmt(f) => plan_create_function(&f),
+        N::CreateTrigStmt(t) => plan_create_trigger(&t),
         N::CopyStmt(c) => plan_copy(&c, lookup, params),
         N::VariableShowStmt(v) => Ok(Statement::Show(v.name.clone())),
         N::AlterRoleStmt(a) => Ok(Statement::AlterRole {
@@ -2515,6 +2566,90 @@ fn plan_define_type(d: &pg_query::protobuf::DefineStmt) -> Result<Statement> {
 /// Only the internal language is planned -- the catalog registration is what a
 /// base type's `input = ` / `output = ` options resolve against. A function
 /// in any other language is refused, since nothing here could run it.
+/// `CREATE TRIGGER`. `timing` and `events` are PostgreSQL's `TRIGGER_TYPE_*`
+/// bits: BEFORE 2, INSERT 4, DELETE 8, UPDATE 16, TRUNCATE 32, INSTEAD 64.
+fn plan_create_trigger(t: &pg_query::protobuf::CreateTrigStmt) -> Result<Statement> {
+    if t.isconstraint {
+        return Err(Error::Unsupported("CREATE CONSTRAINT TRIGGER".into()));
+    }
+    if !t.transition_rels.is_empty() {
+        return Err(Error::Unsupported(
+            "a trigger's REFERENCING transition tables".into(),
+        ));
+    }
+    let timing = match t.timing {
+        2 => "BEFORE",
+        64 => "INSTEAD OF",
+        _ => "AFTER",
+    };
+    if timing == "INSTEAD OF" {
+        return Err(Error::Unsupported("INSTEAD OF triggers".into()));
+    }
+    let mut events = Vec::new();
+    for (bit, name) in [
+        (4, "INSERT"),
+        (8, "DELETE"),
+        (16, "UPDATE"),
+        (32, "TRUNCATE"),
+    ] {
+        if t.events & bit != 0 {
+            events.push(name.to_string());
+        }
+    }
+    if t.row && events.iter().any(|e| e == "TRUNCATE") {
+        return Err(Error::FeatureNotSupported(
+            "TRUNCATE FOR EACH ROW triggers are not supported".into(),
+        ));
+    }
+    let table = t
+        .relation
+        .as_ref()
+        .map(relation_name)
+        .ok_or_else(|| Error::Parse("CREATE TRIGGER without a table".into()))?;
+    let function = t
+        .funcname
+        .iter()
+        .filter_map(|n| match n.node.as_ref()? {
+            N::String(s) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .next_back()
+        .ok_or_else(|| Error::Parse("CREATE TRIGGER without a function".into()))?;
+    let strings = |nodes: &[pg_query::protobuf::Node]| -> Vec<String> {
+        nodes
+            .iter()
+            .filter_map(|n| match n.node.as_ref()? {
+                N::String(s) => Some(s.sval.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let when = match t.when_clause.as_deref() {
+        Some(w) => {
+            if !t.row && references_columns(w) {
+                return Err(Error::Sqlstate(
+                    "42P17",
+                    "statement trigger's WHEN condition cannot reference column values".into(),
+                ));
+            }
+            Some(deparse_expr(w)?)
+        }
+        None => None,
+    };
+    Ok(Statement::CreateTrigger(TriggerDef {
+        name: t.trigname.clone(),
+        table,
+        replace: t.replace,
+        timing: timing.to_string(),
+        events,
+        update_columns: strings(&t.columns),
+        level: if t.row { "ROW" } else { "STATEMENT" }.to_string(),
+        function,
+        args: strings(&t.args),
+        when,
+    }))
+}
+
 fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<Statement> {
     if f.is_procedure {
         return Err(Error::Unsupported("CREATE PROCEDURE".into()));
@@ -2560,7 +2695,47 @@ fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<St
             _ => {}
         }
     }
-    let language = language.unwrap_or_default();
+    let language = language.unwrap_or_default().to_ascii_lowercase();
+    if matches!(language.as_str(), "sql" | "plpgsql") {
+        if f.sql_body.is_some() {
+            return Err(Error::Unsupported(
+                "a SQL-standard function body (BEGIN ATOMIC / RETURN)".into(),
+            ));
+        }
+        let mut params = Vec::new();
+        let mut columns = Vec::new();
+        for p in &f.parameters {
+            let Some(N::FunctionParameter(fp)) = p.node.as_ref() else {
+                continue;
+            };
+            let ty = fp.arg_type.as_ref().map(type_name_of).unwrap_or_default();
+            use pg_query::protobuf::FunctionParameterMode as M;
+            match M::try_from(fp.mode) {
+                Ok(M::FuncParamOut | M::FuncParamTable) => columns.push((fp.name.clone(), ty)),
+                Ok(M::FuncParamInout) => {
+                    params.push((fp.name.clone(), ty.clone()));
+                    columns.push((fp.name.clone(), ty));
+                }
+                Ok(M::FuncParamVariadic) => {
+                    return Err(Error::Unsupported("a VARIADIC parameter".into()))
+                }
+                _ => params.push((fp.name.clone(), ty)),
+            }
+        }
+        let returns_set = f.return_type.as_ref().is_some_and(|t| t.setof);
+        let body = body.ok_or_else(|| Error::Parse("no function body specified".into()))?;
+        return Ok(Statement::CreateUserFunction(UserFunctionDef {
+            name,
+            replace: f.replace,
+            params,
+            return_type,
+            returns_set,
+            columns,
+            body,
+            language,
+            volatility,
+        }));
+    }
     if !language.eq_ignore_ascii_case("internal") {
         return Err(Error::Unsupported(format!(
             "CREATE FUNCTION in language \"{language}\""
@@ -5838,6 +6013,27 @@ fn srf_rows(
         }
         call.args.iter().map(|a| const_value(a, params)).collect()
     };
+    // A user-defined set-returning function: the executor runs it.
+    if let Some(u) = correlated::user_function(name, call.args.len()).filter(|u| u.returns_set) {
+        let a: Vec<Bson> = call
+            .args
+            .iter()
+            .map(|x| const_value(x, params))
+            .collect::<Result<_>>()?;
+        let (names, types) = if u.columns.is_empty() {
+            (vec![name.to_string()], vec![u.return_type.clone()])
+        } else {
+            (
+                u.columns.iter().map(|(n, _)| n.clone()).collect(),
+                u.columns.iter().map(|(_, t)| t.clone()).collect(),
+            )
+        };
+        let rows = match correlated::call_user_function(&u, &a)? {
+            correlated::FnResult::Rows(_, _, rows) => rows,
+            correlated::FnResult::Value(v) => vec![vec![v]],
+        };
+        return Ok(Some((names, types, rows)));
+    }
     // The JSON set-returning functions. A json / jsonb value is its text
     // here; each element or member is rendered back as the same type.
     let json_arg = || -> Result<Option<(json::Json, bool)>> {
@@ -7993,6 +8189,22 @@ fn function_absent_in_reference(
     params: &[Bson],
 ) -> Option<Error> {
     let name = func_name(f)?;
+    if correlated::user_function_named(&name)
+        && correlated::user_function(&name, f.args.len()).is_none()
+    {
+        let types: Vec<String> = f
+            .args
+            .iter()
+            .map(|a| {
+                let v = const_value(a, params).unwrap_or(Bson::Null);
+                display_type(&static_type(a, &v))
+            })
+            .collect();
+        return Some(Error::UndefinedFunction(format!(
+            "function {name}({}) does not exist",
+            types.join(", ")
+        )));
+    }
     if name == "to_ascii" {
         return Some(Error::FeatureNotSupported(
             "encoding conversion from UTF8 to ASCII not supported".into(),
@@ -10517,6 +10729,16 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
         {
             "int8".to_string()
         }
+        Some(N::FuncCall(f))
+            if func_name(f)
+                .and_then(|n| correlated::user_function(&n, f.args.len()))
+                .is_some() =>
+        {
+            func_name(f)
+                .and_then(|n| correlated::user_function(&n, f.args.len()))
+                .map(|u| u.return_type)
+                .unwrap_or_default()
+        }
         Some(N::FuncCall(f)) if correlated::correlated_type(f).is_some() => {
             correlated::correlated_type(f).expect("checked")
         }
@@ -11231,6 +11453,21 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 refuse_untyped_any_args(f)?;
                 if let Some(e) = function_absent_in_reference(f, params) {
                     return Err(e);
+                }
+                if let Some(u) =
+                    func_name(f).and_then(|n| correlated::user_function(&n, f.args.len()))
+                {
+                    if !u.returns_set {
+                        let node = rt.val.as_deref().expect("a FuncCall target");
+                        let value = const_value(node, params)?;
+                        columns.push((
+                            if rt.name.is_empty() { u.name.clone() } else { rt.name.clone() },
+                            ConstCol::Value(value),
+                            u.return_type.clone(),
+                            -1,
+                        ));
+                        continue;
+                    }
                 }
                 let name = f
                     .funcname
@@ -17155,6 +17392,29 @@ fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
             cascade: DropBehavior::try_from(d.behavior) == Ok(DropBehavior::DropCascade),
         });
     }
+    // `DROP TRIGGER name ON table`: the object is the list
+    // `[schema.]table.trigger`.
+    if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectTrigger) {
+        let Some(N::List(l)) = d.objects.first().and_then(|o| o.node.as_ref()) else {
+            return Err(Error::Parse("DROP TRIGGER without a name".into()));
+        };
+        let parts: Vec<String> = l
+            .items
+            .iter()
+            .filter_map(|n| match n.node.as_ref()? {
+                N::String(s) => Some(s.sval.clone()),
+                _ => None,
+            })
+            .collect();
+        let [.., table, name] = parts.as_slice() else {
+            return Err(Error::Parse("DROP TRIGGER without a table".into()));
+        };
+        return Ok(Statement::DropTrigger {
+            name: name.clone(),
+            table: table.clone(),
+            if_exists: d.missing_ok,
+        });
+    }
     // `DROP SEQUENCE`: each object is a List of name parts, like a table's.
     if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectSequence) {
         let mut names = Vec::new();
@@ -17884,6 +18144,22 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
         }
         if let Some(e) = function_absent_in_reference(f, params) {
             return Err(e);
+        }
+        if let Some(u) = func_name(f).and_then(|n| correlated::user_function(&n, f.args.len())) {
+            if u.returns_set {
+                return Err(Error::FeatureNotSupported(
+                    "set-valued function called in context that cannot accept a set".into(),
+                ));
+            }
+            let args = f
+                .args
+                .iter()
+                .map(|a| const_value(a, params))
+                .collect::<Result<Vec<_>>>()?;
+            return match correlated::call_user_function(&u, &args)? {
+                correlated::FnResult::Value(v) => Ok(v),
+                correlated::FnResult::Rows(..) => Ok(Bson::Null),
+            };
         }
         if let Some(name) =
             func_name(f).filter(|n| correlated::SEQUENCE_FUNCTIONS.contains(&n.as_str()))

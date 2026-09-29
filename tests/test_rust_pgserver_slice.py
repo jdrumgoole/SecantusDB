@@ -13332,3 +13332,117 @@ def test_multi_column_foreign_keys(home: Path) -> None:
         assert cur.fetchall() == [(5, 6)]
         with pytest.raises(psycopg.errors.ForeignKeyViolation):
             cur.execute("DELETE FROM u WHERE id = 1")
+
+
+def test_user_defined_functions(home: Path) -> None:
+    """`LANGUAGE sql` and `plpgsql` functions: scalar calls in the select list
+    and WHERE, recursion, SETOF with RETURN NEXT, exception handlers, and the
+    errors PostgreSQL gives for a wrong arity and a duplicate."""
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE ft (id int PRIMARY KEY, n int)")
+        cur.execute("INSERT INTO ft VALUES (1, 10), (2, 20)")
+        cur.execute("CREATE FUNCTION add2(a int, b int) RETURNS int AS 'SELECT a + b' LANGUAGE sql")
+        cur.execute("SELECT id, add2(id, n) FROM ft ORDER BY id")
+        assert cur.fetchall() == [(1, 11), (2, 22)]
+        cur.execute("SELECT id FROM ft WHERE add2(id, 1) > 2")
+        assert cur.fetchall() == [(2,)]
+        cur.execute(
+            "CREATE FUNCTION fact(n int) RETURNS int AS $$ BEGIN IF n <= 1 THEN RETURN 1; "
+            "END IF; RETURN n * fact(n - 1); END $$ LANGUAGE plpgsql"
+        )
+        cur.execute("SELECT fact(5)")
+        assert cur.fetchone() == (120,)
+        cur.execute(
+            "CREATE FUNCTION evens(m int) RETURNS SETOF int AS $$ BEGIN FOR i IN 1..m LOOP "
+            "IF i % 2 = 0 THEN RETURN NEXT i; END IF; END LOOP; END $$ LANGUAGE plpgsql"
+        )
+        cur.execute("SELECT * FROM evens(7)")
+        assert cur.fetchall() == [(2,), (4,), (6,)]
+        cur.execute(
+            "CREATE FUNCTION safe_div(a int, b int) RETURNS int AS $$ BEGIN RETURN a / b; "
+            "EXCEPTION WHEN division_by_zero THEN RETURN NULL; END $$ LANGUAGE plpgsql"
+        )
+        cur.execute("SELECT safe_div(6, 3), safe_div(1, 0)")
+        assert cur.fetchone() == (2, None)
+        with pytest.raises(psycopg.errors.UndefinedFunction) as info:
+            cur.execute("SELECT add2(1)")
+        assert str(info.value.diag.message_primary) == "function add2(integer) does not exist"
+        with pytest.raises(psycopg.errors.DuplicateFunction):
+            cur.execute("CREATE FUNCTION add2(a int, b int) RETURNS int AS 'SELECT 0' LANGUAGE sql")
+
+
+def test_triggers(home: Path) -> None:
+    """Row and statement triggers around INSERT / UPDATE / DELETE: a BEFORE
+    trigger rewriting or skipping a row, an AFTER trigger writing an audit
+    table, WHEN and TG_ARGV, a trigger's error aborting the whole statement,
+    and DROP FUNCTION refusing while a trigger still calls it."""
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE tt (id int PRIMARY KEY, name text, n int)")
+        cur.execute("CREATE TABLE tlog (seq serial PRIMARY KEY, msg text)")
+        cur.execute(
+            "CREATE FUNCTION up() RETURNS trigger AS $$ BEGIN IF NEW.n < 0 THEN RETURN NULL; "
+            "END IF; NEW.name := upper(NEW.name); RETURN NEW; END $$ LANGUAGE plpgsql"
+        )
+        cur.execute(
+            "CREATE FUNCTION audit() RETURNS trigger AS $$ BEGIN INSERT INTO tlog(msg) VALUES "
+            "(TG_OP || ' ' || TG_ARGV[0] || ' ' || coalesce(OLD.id, NEW.id)); "
+            "RETURN NULL; END $$ LANGUAGE plpgsql"
+        )
+        cur.execute("CREATE TRIGGER t_up BEFORE INSERT ON tt FOR EACH ROW EXECUTE FUNCTION up()")
+        cur.execute(
+            "CREATE TRIGGER t_audit AFTER INSERT OR DELETE ON tt FOR EACH ROW "
+            "EXECUTE FUNCTION audit('row')"
+        )
+        cur.execute("INSERT INTO tt VALUES (1, 'a', 1), (2, 'b', -1), (3, 'c', 3)")
+        assert cur.rowcount == 2
+        cur.execute("SELECT id, name FROM tt ORDER BY id")
+        assert cur.fetchall() == [(1, "A"), (3, "C")]
+        cur.execute(
+            "CREATE FUNCTION guard() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'no %', "
+            "NEW.id; END $$ LANGUAGE plpgsql"
+        )
+        cur.execute(
+            "CREATE TRIGGER t_guard BEFORE UPDATE ON tt FOR EACH ROW WHEN (NEW.n > 100) "
+            "EXECUTE FUNCTION guard()"
+        )
+        with pytest.raises(psycopg.errors.RaiseException):
+            cur.execute("UPDATE tt SET n = 500")
+        cur.execute("UPDATE tt SET n = 50 WHERE id = 1")
+        cur.execute("SELECT n FROM tt ORDER BY id")
+        assert cur.fetchall() == [(50,), (3,)]
+        cur.execute("DELETE FROM tt WHERE id = 3")
+        cur.execute("SELECT msg FROM tlog ORDER BY seq")
+        assert cur.fetchall() == [("INSERT row 1",), ("INSERT row 3",), ("DELETE row 3",)]
+        with pytest.raises(psycopg.errors.DependentObjectsStillExist):
+            cur.execute("DROP FUNCTION guard()")
+        cur.execute("DROP TRIGGER t_guard ON tt")
+        cur.execute("DROP FUNCTION guard()")
+        cur.execute("SELECT count(*) FROM pg_trigger WHERE tgrelid = 'tt'::regclass")
+        assert cur.fetchone() == (2,)
+        # ROLLBACK TO undoes what a trigger wrote to ANOTHER table too.
+        cur.execute("DELETE FROM tlog")
+        cur.execute("BEGIN")
+        cur.execute("SAVEPOINT s")
+        cur.execute("INSERT INTO tt VALUES (9, 'z', 9)")
+        cur.execute("ROLLBACK TO s")
+        cur.execute("COMMIT")
+        cur.execute("SELECT (SELECT count(*) FROM tt WHERE id = 9), (SELECT count(*) FROM tlog)")
+        assert cur.fetchone() == (0, 0)
+        # An AFTER trigger that raises takes its statement's rows with it,
+        # and so does a DO block, outside any block too.
+        cur.execute(
+            "CREATE FUNCTION boom() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'boom'; "
+            "END $$ LANGUAGE plpgsql"
+        )
+        cur.execute("CREATE TRIGGER t_boom AFTER INSERT ON tt FOR EACH ROW EXECUTE FUNCTION boom()")
+        with pytest.raises(psycopg.errors.RaiseException):
+            cur.execute("INSERT INTO tt VALUES (10, 'y', 1)")
+        with pytest.raises(psycopg.errors.RaiseException):
+            cur.execute(
+                "DO $$ BEGIN EXECUTE 'INSERT INTO tlog(msg) VALUES (''x'')'; "
+                "RAISE EXCEPTION 'boom'; END $$"
+            )
+        cur.execute("SELECT (SELECT count(*) FROM tt WHERE id = 10), (SELECT count(*) FROM tlog)")
+        assert cur.fetchone() == (0, 0)

@@ -617,39 +617,29 @@ remain open:
       exist: "a-b" = "a-b"` / `could not identify an ordering operator for
       type "a-b"`. Values carry no type tag on the way out of storage, which
       is what a faithful refusal needs.
-- [ ] **OPEN — RUST pgserver: `CREATE FUNCTION` plans only `LANGUAGE
-      internal`, as a catalog row that is never callable (2026-09-09).** The
-      registration exists so a base type's `input = ` / `output = ` resolve
-      (PG 16.15 crashed its backend when a mis-declared internal wrapper was
-      called, so calling one is not imitated); `LANGUAGE sql` / `plpgsql`
-      are 0A000, and PG's `WARNING: type input function f should not be
-      volatile` is not emitted (the shared `__sql_functions__` doc has no
-      volatility field). Two overloads at one arity are refused with 0A000
-      because the shared catalog keys a function on `name/nargs`. The
-      `CREATE TYPE` options other than `input` / `output` / `like`
-      (`internallength`, `category`, `receive`, ...) are 0A000 rather than
-      applied.
-- [ ] **OPEN — RUST pgserver: `DO` blocks cover a SUBSET of PL/pgSQL
-      (2026-09-09).** `plpgsql_do.rs` parses `BEGIN ... END` with `RAISE`
-      (all levels, `USING errcode / message / detail / hint / column /
-      constraint / datatype / table / schema`, `%` format args), `PERFORM`,
-      `EXECUTE <string>`, `NULL` and bare SQL statements; anything else
-      (`EXCEPTION WHEN ... THEN` handlers — `do $$ begin perform 1/0;
-      exception when division_by_zero then raise notice 'caught'; end $$`
-      is `0A000 the PL/pgSQL statement "exception" in an inline code block
-      is not supported yet` where PG prints the notice — `DECLARE`
-      variables, `IF` / `LOOP` / `FOR`, assignments, `SELECT ... INTO`) is
-      refused with `0A000`, where PG runs it. Two known divergences inside
-      the subset: (a)
-      a scalar subquery in a `RAISE` argument (`raise notice '%', (select
-      1)`) is `0A000 SubLink is not supported yet`; PG prints `1`. (b) the
-      block is NOT atomic across `EXECUTE`d writes — PG wraps the whole `DO`
-      in the enclosing transaction and a later `RAISE EXCEPTION` rolls the
-      earlier writes back; the Rust executor runs each statement through the
-      normal path and leaves the earlier writes committed when autocommit is
-      on — `create table t (x int); do $$ begin execute 'insert into t
-      values (1)'; raise exception 'boom'; end $$; select count(*) from t`
-      is `0` on PG and `1` here.
+- [ ] **OPEN — RUST pgserver: what `CREATE FUNCTION` still refuses
+      (updated 2026-09-29).** `LANGUAGE sql` / `plpgsql` functions are now
+      stored AND callable (corpus `functions` 0 of 27), on the PL/pgSQL
+      interpreter in `plpgsql_fn.rs`. Still refused or unimitated:
+      `VARIADIC` parameters and `BEGIN ATOMIC` SQL bodies (0A000); two
+      overloads at one arity (0A000 — the shared catalog keys a function on
+      `name/nargs`); `DML ... RETURNING INTO` inside PL/pgSQL (0A000);
+      `LANGUAGE internal` wrappers are catalog rows that are never callable
+      (PG 16.15 crashed its backend when a mis-declared one was called, so
+      that is not imitated); PG's `WARNING: type input function f should not
+      be volatile` is not emitted; and the `CREATE TYPE` options other than
+      `input` / `output` / `like` (`internallength`, `category`, `receive`,
+      ...) are 0A000 rather than applied.
+- [ ] **OPEN — RUST pgserver: what triggers still refuse (2026-09-29).**
+      Corpora `triggers` 0/41 and `triggers2` 0/44 against PostgreSQL 14.
+      Refused with 0A000: `INSTEAD OF` (needs writable views, which are
+      themselves refused), `CREATE CONSTRAINT TRIGGER` (and so deferred
+      firing), and `REFERENCING OLD/NEW TABLE` transition tables.
+      **Cross-server:** the Python PG server
+      fires only `BEFORE INSERT FOR EACH ROW` triggers, so it silently
+      ignores every other kind the Rust server stores in the shared
+      `__sql_triggers__` catalog; its `event` key carries only the first
+      event of a multi-event trigger.
 - [ ] **OPEN — RUST pgserver: a non-boolean constant WHERE over
       `generate_series` carries no error POSITION (2026-09-09).** `select 1
       from generate_series(1,3) where 1` is `42804 argument of WHERE must be
@@ -6959,7 +6949,7 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       | ~~`CREATE INDEX`~~ | **DONE 2026-09-29** | btree/hash, UNIQUE, partial, INCLUDE; expression keys refused |
       | ~~`ALTER TABLE`, any form~~ | **DONE 2026-09-28**, incl. RENAME | `USING`, and ADD of a UNIQUE/PK/FK |
       | ~~`CREATE VIEW`~~ | **DONE 2026-09-29** | read-only: writes through a view refused |
-      | `CREATE TRIGGER` | | `CreateTrigStmt` |
+      | ~~`CREATE TRIGGER`~~ | **DONE 2026-09-29** | BEFORE/AFTER, ROW/STATEMENT, WHEN, UPDATE OF; INSTEAD OF, constraint triggers and REFERENCING tables refused |
       | ~~`EXPLAIN`~~ | **DONE 2026-09-29** | plan SHAPE, zero costs; FORMAT YAML/XML refused |
       | ~~composite `PRIMARY KEY`~~ / multi-col `FOREIGN KEY` | **PK DONE 2026-09-29** | multi-column FK still refused |
       | ~~non-literal column `DEFAULT`~~ | **DONE 2026-09-29** | evaluated per row; `column_default` renders a folded constant, not PostgreSQL's `(1 + 2)` |

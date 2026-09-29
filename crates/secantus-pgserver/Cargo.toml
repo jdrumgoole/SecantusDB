@@ -29,8 +29,12 @@ secantus-pgcatalog = { path = "../secantus-pgcatalog" }
 secantus-pgplan = { path = "../secantus-pgplan" }
 secantus-storage = { path = "../secantus-storage" }
 # The SCRAM-SHA-256 verifier `CREATE ROLE ... PASSWORD` stores, derived as
-# PostgreSQL derives it. Recorded, not checked: every connection is trusted.
+# PostgreSQL derives it, and the exchange a login is checked by.
 secantus-auth = { path = "../secantus-auth" }
+# PostgreSQL's own PL/pgSQL grammar (`parse_plpgsql`) and scanner, for user
+# functions; the JSON tree the former returns.
+pg_query = "6"
+serde_json = "1"
 rand = "0.9"
 # "termination" so SIGTERM is caught too, not just SIGINT: a supervisor or a
 # test harness stops the daemon with SIGTERM, and an uncaught one skips the

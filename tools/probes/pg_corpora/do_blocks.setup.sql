@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS do_t
+CREATE TABLE do_t (id int PRIMARY KEY, v text)

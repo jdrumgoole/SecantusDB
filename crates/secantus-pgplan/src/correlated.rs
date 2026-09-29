@@ -492,11 +492,23 @@ pub fn has_correlated(expr: &ColumnExpr) -> bool {
     let mut found = false;
     let _ = walk_expr(&mut node, &mut |n| {
         if let Some(N::FuncCall(f)) = n.node.as_ref() {
-            found |= is_correlated(f);
+            // A correlated subquery, a user-defined function and a sequence
+            // function all run through the EXECUTOR's hooks.
+            found |= is_correlated(f)
+                || func_name(f).is_some_and(|name| {
+                    SEQUENCE_FUNCTIONS.contains(&name.as_str())
+                        || user_function(&name, f.args.len()).is_some()
+                });
         }
         Ok(())
     });
     found
+}
+
+/// Is `name` a user-defined function at SOME arity? A call at another arity
+/// is then PostgreSQL's 42883, not an unimplemented built-in.
+pub(crate) fn user_function_named(name: &str) -> bool {
+    USER_FUNCTIONS.with(|f| f.borrow().iter().any(|u| u.name == name))
 }
 
 /// Runs a sequence function -- `nextval` / `currval` / `setval` / `lastval`
@@ -555,4 +567,80 @@ pub(crate) fn without_side_effects<R>(f: impl FnOnce() -> R) -> R {
     let out = f();
     SUPPRESSED.with(|s| s.set(previous));
     out
+}
+
+/// A user-defined function (`LANGUAGE sql` / `plpgsql`) as the planner knows
+/// it: enough to type a call and to route one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UserFn {
+    pub name: String,
+    pub arg_types: Vec<String>,
+    /// The return type; for a set-returning function, of one row's column.
+    pub return_type: String,
+    pub returns_set: bool,
+    /// `RETURNS TABLE (...)` / OUT columns, `(name, type)`.
+    pub columns: Vec<(String, String)>,
+}
+
+/// What a user function call produced.
+pub enum FnResult {
+    Value(Bson),
+    /// `(column names, column types, rows)`.
+    Rows(Vec<String>, Vec<String>, Vec<Vec<Bson>>),
+}
+
+/// Runs a user-defined function. Supplied by the executor.
+pub type FunctionHook<'a> = dyn Fn(&UserFn, &[Bson]) -> Result<FnResult> + 'a;
+type FHook = FunctionHook<'static>;
+
+thread_local! {
+    static FUNCTION_HOOK: std::cell::Cell<Option<*const FHook>> = const { std::cell::Cell::new(None) };
+    static USER_FUNCTIONS: std::cell::RefCell<Vec<UserFn>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Install the user-defined functions for the statements that follow.
+pub fn set_user_functions(fns: Vec<UserFn>) {
+    USER_FUNCTIONS.with(|f| *f.borrow_mut() = fns);
+}
+
+/// The user function a call names, by name and argument count.
+pub(crate) fn user_function(name: &str, nargs: usize) -> Option<UserFn> {
+    USER_FUNCTIONS.with(|f| {
+        f.borrow()
+            .iter()
+            .find(|u| u.name == name && u.arg_types.len() == nargs)
+            .cloned()
+    })
+}
+
+/// Run `f` able to call user-defined functions.
+pub fn with_function_hook<R>(hook: &FunctionHook<'_>, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<*const FHook>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FUNCTION_HOOK.with(|r| r.set(self.0));
+        }
+    }
+    // SAFETY: as `with_correlated_runner`.
+    let ptr: *const FHook =
+        unsafe { std::mem::transmute::<*const FunctionHook<'_>, *const FHook>(hook) };
+    let _restore = Restore(FUNCTION_HOOK.with(|r| r.replace(Some(ptr))));
+    f()
+}
+
+/// Call a user function. With no hook installed (a Describe), or while only
+/// a TYPE is wanted, nothing runs and the answer is NULL.
+pub(crate) fn call_user_function(u: &UserFn, args: &[Bson]) -> Result<FnResult> {
+    if SUPPRESSED.with(|s| s.get()) {
+        return Ok(FnResult::Value(Bson::Null));
+    }
+    match FUNCTION_HOOK.with(|r| r.get()) {
+        // SAFETY: set only inside `with_function_hook`, whose borrow is live.
+        Some(hook) => unsafe { (*hook)(u, args) },
+        None => Ok(if u.returns_set {
+            FnResult::Rows(Vec::new(), Vec::new(), Vec::new())
+        } else {
+            FnResult::Value(Bson::Null)
+        }),
+    }
 }

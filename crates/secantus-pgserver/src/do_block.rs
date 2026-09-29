@@ -63,7 +63,30 @@ impl PgHandler {
                 ))
             }
         }
-        let stmts = pl::parse(body).map_err(|e| Self::do_parse_error(e, body, query))?;
+        let stmts = match pl::parse(body) {
+            Ok(stmts) => stmts,
+            // Beyond the statements this path renders with PostgreSQL's
+            // exact error context, the block runs on the function
+            // interpreter: declarations, control flow, handlers, INTO.
+            Err(ParseError::Unsupported(_)) => {
+                let sql = format!(
+                    "CREATE FUNCTION inline_code_block() RETURNS void AS \
+                     $secantus_do$\n{body}\n$secantus_do$ LANGUAGE plpgsql"
+                );
+                crate::plpgsql_fn::run(
+                    &sql,
+                    crate::plpgsql_fn::Invocation {
+                        args: &[],
+                        trigger: None,
+                        returns_set: false,
+                    },
+                    &crate::PlHost { h: self },
+                )
+                .map_err(crate::wire_pl_error)?;
+                return Ok(vec![Response::Execution(Tag::new("DO"))]);
+            }
+            Err(e) => return Err(Self::do_parse_error(e, body, query)),
+        };
         for stmt in stmts {
             match stmt {
                 Stmt::Null => {}

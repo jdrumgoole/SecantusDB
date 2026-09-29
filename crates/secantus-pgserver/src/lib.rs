@@ -13,7 +13,9 @@ mod do_block;
 mod encoding;
 mod explain;
 mod plpgsql_do;
+mod plpgsql_fn;
 mod server;
+mod triggers;
 
 pub use server::{bind, RunningPgServer};
 
@@ -347,6 +349,249 @@ fn row_id(d: &Document) -> Bson {
     nest_key(d)
         .and_then(|n| n.get("_id").cloned())
         .unwrap_or(Bson::Null)
+}
+
+thread_local! {
+    /// How deep the user-function calls on this thread are nested, for
+    /// PostgreSQL's `stack depth limit exceeded` on runaway recursion.
+    static CALL_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The CREATE text PL/pgSQL's parser needs, rebuilt from a stored function
+/// document -- the parameters are what give the body's variables their names.
+fn plpgsql_create_sql(doc: &Document) -> String {
+    let strings = |key: &str| -> Vec<String> {
+        doc.get_array(key)
+            .map(|a| {
+                a.iter()
+                    .map(|v| v.as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let names = strings("params");
+    let types = strings("param_types");
+    let mut params: Vec<String> = names
+        .iter()
+        .zip(&types)
+        .map(|(n, t)| {
+            if n.is_empty() {
+                t.clone()
+            } else {
+                format!("{n} {t}")
+            }
+        })
+        .collect();
+    let columns: Vec<(String, String)> = doc
+        .get_array("table_columns")
+        .map(|a| {
+            a.iter()
+                .filter_map(|c| c.as_document())
+                .map(|c| {
+                    (
+                        c.get_str("name").unwrap_or_default().to_string(),
+                        c.get_str("type_tag").unwrap_or("text").to_string(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let ret = doc.get_str("return_tag").unwrap_or("void");
+    let returns = if doc.get_bool("is_table").unwrap_or(false) && !columns.is_empty() {
+        let cols: Vec<String> = columns.iter().map(|(n, t)| format!("{n} {t}")).collect();
+        format!("TABLE ({})", cols.join(", "))
+    } else if doc.get_bool("returns_set").unwrap_or(false) {
+        format!("SETOF {ret}")
+    } else {
+        if !columns.is_empty() {
+            params.extend(columns.iter().map(|(n, t)| format!("OUT {n} {t}")));
+        }
+        ret.to_string()
+    };
+    let body = doc.get_str("body").unwrap_or_default();
+    format!(
+        "CREATE FUNCTION f({}) RETURNS {returns} AS $secantus_body${body}$secantus_body$ LANGUAGE plpgsql",
+        params.join(", ")
+    )
+}
+
+/// A SQL function body's references to its parameters BY NAME, rewritten to
+/// `$n` -- token by token, so a column that happens to share a name inside
+/// a string literal is untouched.
+fn bind_parameter_names(sql: &str, names: &[String], types: &[String]) -> String {
+    let Ok(scan) = pg_query::scan(sql) else {
+        return sql.to_string();
+    };
+    let mut out = String::new();
+    let mut cursor = 0usize;
+    let tokens = scan.tokens;
+    for (i, t) in tokens.iter().enumerate() {
+        let (start, end) = (t.start as usize, t.end as usize);
+        let word = &sql[start..end];
+        let is_word = t.token == pg_query::protobuf::Token::Ident as i32
+            || t.keyword_kind == pg_query::protobuf::KeywordKind::UnreservedKeyword as i32;
+        let prev_dot =
+            i > 0 && &sql[tokens[i - 1].start as usize..tokens[i - 1].end as usize] == ".";
+        let next = tokens
+            .get(i + 1)
+            .map(|n| &sql[n.start as usize..n.end as usize]);
+        if !is_word || prev_dot || next == Some("(") || next == Some(".") {
+            continue;
+        }
+        let lower = word.trim_matches('"').to_ascii_lowercase();
+        if let Some(pos) = names.iter().position(|n| !n.is_empty() && *n == lower) {
+            out.push_str(&sql[cursor..start]);
+            out.push_str(&format!(
+                "${}::{}",
+                pos + 1,
+                types.get(pos).map_or("text", String::as_str)
+            ));
+            cursor = end;
+        }
+    }
+    out.push_str(&sql[cursor..]);
+    out
+}
+
+/// A stored function document as the planner's `UserFn`.
+fn user_fn_of(d: &Document) -> secantus_pgplan::UserFn {
+    let strings = |key: &str| -> Vec<String> {
+        d.get_array(key)
+            .map(|a| {
+                a.iter()
+                    .map(|v| v.as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let columns = d
+        .get_array("table_columns")
+        .map(|a| {
+            a.iter()
+                .filter_map(|c| c.as_document())
+                .map(|c| {
+                    (
+                        c.get_str("name").unwrap_or_default().to_string(),
+                        c.get_str("type_tag").unwrap_or("text").to_string(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    secantus_pgplan::UserFn {
+        name: d.get_str("name").unwrap_or_default().to_string(),
+        arg_types: strings("param_types"),
+        return_type: d.get_str("return_tag").unwrap_or("text").to_string(),
+        returns_set: d.get_bool("returns_set").unwrap_or(false)
+            || d.get_bool("is_table").unwrap_or(false),
+        columns,
+    }
+}
+
+/// The server as the PL/pgSQL interpreter's host.
+struct PlHost<'a> {
+    h: &'a PgHandler,
+}
+
+impl PlHost<'_> {
+    fn plan(
+        &self,
+        sql: &str,
+        params: &[Bson],
+        types: &[String],
+    ) -> Result<Statement, plpgsql_fn::PlError> {
+        let tz = self.h.session_timezone();
+        let run = |stmt: &Statement| self.h.subquery_rows(stmt);
+        let declared: Vec<Option<String>> = types.iter().map(|t| Some(t.clone())).collect();
+        secantus_pgplan::planning_to_execute(|| {
+            secantus_pgplan::plan_with_session_types_and_subqueries(
+                sql,
+                &|n| self.h.lookup(n),
+                params,
+                &declared,
+                &tz,
+                Some(&run),
+            )
+        })
+        .map_err(|e| pl_error(&PgHandler::err(&e)))
+    }
+}
+
+/// The interpreter's error as a wire error.
+fn wire_pl_error(e: plpgsql_fn::PlError) -> PgWireError {
+    let mut info = ErrorInfo::new("ERROR".into(), e.sqlstate, e.message);
+    info.detail = e.detail;
+    info.hint = e.hint;
+    PgWireError::UserError(Box::new(info))
+}
+
+/// A wire error as the interpreter's.
+fn pl_error(e: &PgWireError) -> plpgsql_fn::PlError {
+    match e {
+        PgWireError::UserError(info) => {
+            let mut p = plpgsql_fn::PlError::new(&info.code, info.message.clone());
+            p.detail = info.detail.clone();
+            p.hint = info.hint.clone();
+            p
+        }
+        other => plpgsql_fn::PlError::new("XX000", other.to_string()),
+    }
+}
+
+impl plpgsql_fn::Host for PlHost<'_> {
+    fn query(
+        &self,
+        sql: &str,
+        params: &[Bson],
+        types: &[String],
+    ) -> Result<plpgsql_fn::QueryOut, plpgsql_fn::PlError> {
+        let stmt = self.plan(sql, params, types)?;
+        let (schema, rows) = self.h.rows_with_schema(&stmt).map_err(|e| pl_error(&e))?;
+        let columns = schema
+            .iter()
+            .map(|f| {
+                let ty = secantus_pgplan::pgtypes::name_of_oid(i64::from(f.datatype().oid()))
+                    .unwrap_or("text")
+                    .to_string();
+                (f.name().to_string(), ty)
+            })
+            .collect();
+        let rows = rows
+            .into_iter()
+            .map(|r| r.into_iter().map(|v| v.unwrap_or(Bson::Null)).collect())
+            .collect();
+        Ok(plpgsql_fn::QueryOut { columns, rows })
+    }
+
+    fn execute(
+        &self,
+        sql: &str,
+        params: &[Bson],
+        types: &[String],
+    ) -> Result<u64, plpgsql_fn::PlError> {
+        let stmt = self.plan(sql, params, types)?;
+        let responses = self
+            .h
+            .execute_statement(stmt, 0)
+            .map_err(|e| pl_error(&e))?;
+        Ok(responses
+            .iter()
+            .filter_map(|r| match r {
+                Response::Execution(tag) => tag.rows(),
+                _ => None,
+            })
+            .sum::<usize>() as u64)
+    }
+
+    fn notice(&self, severity: &str, sqlstate: &str, message: String) {
+        let mut info = ErrorInfo::new(severity.into(), sqlstate.into(), message);
+        info.detail = None;
+        self.h
+            .pending_notices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(info);
+    }
 }
 
 fn bson_i64(v: &Bson) -> Option<i64> {
@@ -1396,6 +1641,14 @@ impl PgHandler {
         // Views ride the same per-version gate: a view is expanded by the
         // planner, which cannot read the catalog itself.
         secantus_pgplan::set_views(self.views().unwrap_or_default());
+        // User-defined functions, so the planner can type and route a call.
+        secantus_pgplan::set_user_functions(
+            self.user_function_docs()
+                .unwrap_or_default()
+                .iter()
+                .map(user_fn_of)
+                .collect(),
+        );
         // Enums resolve by name too. A `public` enum resolves by its bare name
         // (public is on the default search_path); a schema-qualified one
         // resolves only as `schema.name`, exactly like composites and ranges.
@@ -3549,6 +3802,225 @@ impl PgHandler {
         Some(out)
     }
 
+    /// The stored `LANGUAGE sql` / `plpgsql` function documents.
+    fn user_function_docs(&self) -> PgWireResult<Vec<Document>> {
+        Ok(self
+            .type_catalog_docs(Self::FUNCTION_COLLECTION)?
+            .iter()
+            .filter(|d| matches!(d.get_str("language"), Ok("sql" | "plpgsql")))
+            .cloned()
+            .collect())
+    }
+
+    /// `CREATE [OR REPLACE] FUNCTION ... LANGUAGE sql | plpgsql`, stored in
+    /// the Python server's `__sql_functions__` shape (keyed `name/nargs`), so
+    /// either server can call the other's.
+    fn create_user_function(
+        &self,
+        def: secantus_pgplan::UserFunctionDef,
+    ) -> PgWireResult<Vec<Response>> {
+        let nargs = def.params.len();
+        let key = format!("{}/{nargs}", def.name);
+        let doc = bson::doc! {
+            "_id": &key,
+            "name": &def.name,
+            "nargs": nargs as i32,
+            "params": def.params.iter().map(|(n, _)| Bson::String(n.clone())).collect::<Vec<_>>(),
+            "param_types": def.params.iter().map(|(_, t)| Bson::String(t.clone())).collect::<Vec<_>>(),
+            "return_tag": &def.return_type,
+            "returns_set": def.returns_set,
+            "is_table": !def.columns.is_empty() && def.returns_set,
+            "table_columns": def
+                .columns
+                .iter()
+                .map(|(n, t)| Bson::Document(bson::doc! { "name": n, "type_tag": t }))
+                .collect::<Vec<_>>(),
+            "body": &def.body,
+            "language": &def.language,
+            "returns_trigger": def.return_type == "trigger",
+            "volatility": &def.volatility,
+        };
+        // PostgreSQL checks the body at CREATE (`check_function_bodies`).
+        match def.language.as_str() {
+            "plpgsql" => plpgsql_fn::validate(&plpgsql_create_sql(&doc)).map_err(|e| {
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".into(),
+                    e.sqlstate,
+                    e.message,
+                )))
+            })?,
+            _ => {
+                pg_query::split_with_parser(&def.body).map_err(|e| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42601".into(),
+                        e.to_string(),
+                    )))
+                })?;
+            }
+        }
+        self.ensure_collection(Self::FUNCTION_COLLECTION)?;
+        let exists = self
+            .type_catalog_docs(Self::FUNCTION_COLLECTION)?
+            .iter()
+            .any(|d| d.get_str("_id") == Ok(key.as_str()));
+        if exists {
+            if !def.replace {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".into(),
+                    "42723".into(),
+                    format!(
+                        "function \"{}\" already exists with same argument types",
+                        def.name
+                    ),
+                ))));
+            }
+            self.delete_type_doc(Self::FUNCTION_COLLECTION, &key)?;
+        }
+        self.insert_type_doc(Self::FUNCTION_COLLECTION, &key, doc)?;
+        Ok(vec![Response::Execution(Tag::new("CREATE FUNCTION"))])
+    }
+
+    /// Run `f` one call level deeper, refusing past PostgreSQL's stack
+    /// depth rather than overflowing ours.
+    fn with_call_depth<T>(&self, f: impl FnOnce() -> PgWireResult<T>) -> PgWireResult<T> {
+        let depth = CALL_DEPTH.with(|d| {
+            let v = d.get() + 1;
+            d.set(v);
+            v
+        });
+        struct Unwind;
+        impl Drop for Unwind {
+            fn drop(&mut self) {
+                CALL_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+            }
+        }
+        let _unwind = Unwind;
+        if depth > 200 {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "54001".into(),
+                "stack depth limit exceeded".into(),
+            ))));
+        }
+        f()
+    }
+
+    /// Run one call of a user-defined function.
+    fn call_user_function(
+        &self,
+        u: &secantus_pgplan::UserFn,
+        args: &[Bson],
+    ) -> PgWireResult<secantus_pgplan::FnResult> {
+        let key = format!("{}/{}", u.name, u.arg_types.len());
+        let doc = self
+            .user_function_docs()?
+            .into_iter()
+            .find(|d| d.get_str("_id") == Ok(key.as_str()))
+            .ok_or_else(|| {
+                Self::err(&PlanError::UndefinedFunction(format!(
+                    "function {}() does not exist",
+                    u.name
+                )))
+            })?;
+        self.with_call_depth(|| self.run_user_function(&doc, u, args))
+    }
+
+    fn run_user_function(
+        &self,
+        doc: &Document,
+        u: &secantus_pgplan::UserFn,
+        args: &[Bson],
+    ) -> PgWireResult<secantus_pgplan::FnResult> {
+        match doc.get_str("language").unwrap_or_default() {
+            "plpgsql" => {
+                let host = PlHost { h: self };
+                let outcome = plpgsql_fn::run(
+                    &plpgsql_create_sql(doc),
+                    plpgsql_fn::Invocation {
+                        args,
+                        trigger: None,
+                        returns_set: u.returns_set,
+                    },
+                    &host,
+                )
+                .map_err(wire_pl_error)?;
+                Ok(match outcome {
+                    plpgsql_fn::Outcome::Value(v) => secantus_pgplan::FnResult::Value(v),
+                    plpgsql_fn::Outcome::Rows(rows) => {
+                        secantus_pgplan::FnResult::Rows(Vec::new(), Vec::new(), rows)
+                    }
+                    plpgsql_fn::Outcome::Record(r) => secantus_pgplan::FnResult::Value(
+                        r.map_or(Bson::Null, |r| Bson::Array(r.values)),
+                    ),
+                })
+            }
+            _ => self.call_sql_function(doc, u, args),
+        }
+    }
+
+    /// A `LANGUAGE sql` function: its statements run in order with the
+    /// arguments bound (by `$n` or by parameter name); the LAST one's result
+    /// is the function's.
+    fn call_sql_function(
+        &self,
+        doc: &Document,
+        u: &secantus_pgplan::UserFn,
+        args: &[Bson],
+    ) -> PgWireResult<secantus_pgplan::FnResult> {
+        let names: Vec<String> = doc
+            .get_array("params")
+            .map(|a| {
+                a.iter()
+                    .map(|v| v.as_str().unwrap_or_default().to_ascii_lowercase())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let body = doc.get_str("body").unwrap_or_default();
+        let statements = pg_query::split_with_parser(body).map_err(|e| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "42601".into(),
+                e.to_string(),
+            )))
+        })?;
+        let host = PlHost { h: self };
+        let mut last: Option<plpgsql_fn::QueryOut> = None;
+        for (i, stmt) in statements.iter().enumerate() {
+            let sql = bind_parameter_names(stmt, &names, &u.arg_types);
+            let head = sql.trim_start().to_ascii_lowercase();
+            let is_query = head.starts_with("select")
+                || head.starts_with("with")
+                || head.starts_with("values");
+            let to_wire = |e: plpgsql_fn::PlError| {
+                let mut info = ErrorInfo::new("ERROR".into(), e.sqlstate, e.message);
+                info.detail = e.detail;
+                PgWireError::UserError(Box::new(info))
+            };
+            if is_query {
+                last = Some(
+                    plpgsql_fn::Host::query(&host, &sql, args, &u.arg_types).map_err(to_wire)?,
+                );
+            } else {
+                plpgsql_fn::Host::execute(&host, &sql, args, &u.arg_types).map_err(to_wire)?;
+                if i + 1 == statements.len() {
+                    last = None;
+                }
+            }
+        }
+        let rows = last.map(|q| q.rows).unwrap_or_default();
+        Ok(if u.returns_set {
+            secantus_pgplan::FnResult::Rows(Vec::new(), Vec::new(), rows)
+        } else {
+            secantus_pgplan::FnResult::Value(
+                rows.into_iter()
+                    .next()
+                    .and_then(|r| r.into_iter().next())
+                    .unwrap_or(Bson::Null),
+            )
+        })
+    }
+
     /// PostgreSQL's 2BP01 for a RESTRICT drop that something depends on: one
     /// DETAIL line per dependant.
     fn dependants_error(what: &str, dependants: &[String]) -> PgWireError {
@@ -4265,6 +4737,25 @@ impl PgHandler {
                     Column::new("indexdef", "text", false),
                 ],
             )),
+            "pg_trigger" => Some(TableDef::new(
+                "pg_trigger",
+                vec![
+                    Column::new("oid", "oid", false),
+                    Column::new("tgrelid", "oid", false),
+                    Column::new("tgparentid", "oid", false),
+                    Column::new("tgname", "name", false),
+                    Column::new("tgfoid", "oid", false),
+                    Column::new("tgtype", "int2", false),
+                    Column::new("tgenabled", "\"char\"", false),
+                    Column::new("tgisinternal", "bool", false),
+                    Column::new("tgconstrrelid", "oid", false),
+                    Column::new("tgconstrindid", "oid", false),
+                    Column::new("tgconstraint", "oid", false),
+                    Column::new("tgdeferrable", "bool", false),
+                    Column::new("tginitdeferred", "bool", false),
+                    Column::new("tgnargs", "int2", false),
+                ],
+            )),
             "pg_attrdef" => Some(TableDef::new(
                 "pg_attrdef",
                 vec![
@@ -4810,6 +5301,58 @@ impl PgHandler {
                         d.insert(f("indkey"), Bson::Array(cols));
                         rows.push(d);
                     }
+                }
+                rows
+            }
+            "pg_trigger" => {
+                let f = |name: &str| def.field_of(name).expect("column");
+                let mut rows = Vec::new();
+                for t in self.trigger_docs().ok()? {
+                    let table = t.get_str("table").unwrap_or_default();
+                    // PostgreSQL's TRIGGER_TYPE_* bits.
+                    let mut ty = 0i32;
+                    if t.get_str("level").unwrap_or("ROW") == "ROW" {
+                        ty |= 1;
+                    }
+                    if t.get_str("timing") == Ok("BEFORE") {
+                        ty |= 2;
+                    }
+                    let events: Vec<String> = match t.get_array("events") {
+                        Ok(a) => a
+                            .iter()
+                            .filter_map(|e| e.as_str().map(String::from))
+                            .collect(),
+                        Err(_) => vec![t.get_str("event").unwrap_or_default().to_string()],
+                    };
+                    for e in &events {
+                        ty |= match e.as_str() {
+                            "INSERT" => 4,
+                            "DELETE" => 8,
+                            "UPDATE" => 16,
+                            "TRUNCATE" => 32,
+                            _ => 0,
+                        };
+                    }
+                    let nargs = t.get_array("args").map(|a| a.len()).unwrap_or(0);
+                    let mut d = Document::new();
+                    d.insert(f("oid"), Bson::Int64(0));
+                    d.insert(
+                        f("tgrelid"),
+                        Bson::Int64(self.relation_oid(table).unwrap_or(0)),
+                    );
+                    d.insert(f("tgparentid"), Bson::Int64(0));
+                    d.insert(f("tgname"), t.get_str("name").unwrap_or_default());
+                    d.insert(f("tgfoid"), Bson::Int64(0));
+                    d.insert(f("tgtype"), Bson::Int32(ty));
+                    d.insert(f("tgenabled"), "O");
+                    d.insert(f("tgisinternal"), false);
+                    d.insert(f("tgconstrrelid"), Bson::Int64(0));
+                    d.insert(f("tgconstrindid"), Bson::Int64(0));
+                    d.insert(f("tgconstraint"), Bson::Int64(0));
+                    d.insert(f("tgdeferrable"), false);
+                    d.insert(f("tginitdeferred"), false);
+                    d.insert(f("tgnargs"), Bson::Int32(nargs as i32));
+                    rows.push(d);
                 }
                 rows
             }
@@ -7032,8 +7575,13 @@ impl SimpleQueryHandler for PgHandler {
                 return Err(Self::err(&e));
             }
         };
-        let out = if stmts.len() <= 1 {
+        let out = if stmts.len() <= 1 && !self.runs_user_code(query) {
             self.run(query, &[], 0).await
+        } else if stmts.len() <= 1 {
+            // A statement that can run user code is ONE transaction, as every
+            // statement is in PostgreSQL: a trigger or a DO block that raises
+            // after writing must take those writes with it.
+            self.run_batch(&[query.to_string()]).await
         } else {
             self.run_batch(&stmts).await
         };
@@ -7497,7 +8045,12 @@ impl PgHandler {
                 Self::EXTENSION_COLLECTION.to_string(),
                 Self::BASE_TYPE_COLLECTION.to_string(),
             ],
-            Statement::CreateFunction { .. } => vec![Self::FUNCTION_COLLECTION.to_string()],
+            Statement::CreateFunction { .. } | Statement::CreateUserFunction(_) => {
+                vec![Self::FUNCTION_COLLECTION.to_string()]
+            }
+            Statement::CreateTrigger(_) | Statement::DropTrigger { .. } => {
+                vec![triggers::TRIGGER_COLLECTION.to_string()]
+            }
             Statement::DropFunction { .. } => vec![
                 Self::FUNCTION_COLLECTION.to_string(),
                 Self::BASE_TYPE_COLLECTION.to_string(),
@@ -7524,12 +8077,25 @@ impl PgHandler {
     /// the table as it was before that write, and later writes find the entry
     /// already there and leave it alone.
     fn capture_for_savepoints(&self, stmt: &Statement) -> PgWireResult<()> {
+        if self
+            .savepoints
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+        {
+            return Ok(());
+        }
+        let mut wanted = Self::written_tables(stmt);
+        // A trigger or a user function can write ANY table, and nothing about
+        // the statement says which. While either exists, every table is
+        // captured -- once per savepoint, so the cost is paid on first touch.
+        if !self.trigger_docs()?.is_empty() || !self.user_function_docs()?.is_empty() {
+            wanted.extend(self.all_table_defs()?.into_iter().map(|t| t.name));
+            wanted.sort();
+            wanted.dedup();
+        }
         let tables = {
             let savepoints = self.savepoints.lock().unwrap_or_else(|e| e.into_inner());
-            if savepoints.is_empty() {
-                return Ok(());
-            }
-            let wanted = Self::written_tables(stmt);
             // Read what is missing WITHOUT holding the savepoint lock, because
             // reading goes back through storage.
             wanted
@@ -8329,7 +8895,15 @@ impl PgHandler {
         let hook = |name: &str, args: &[Bson]| -> std::result::Result<Bson, PlanError> {
             self.sequence_call(name, args).map_err(Self::to_plan_error)
         };
-        secantus_pgplan::with_sequence_hook(&hook, || self.correlated_scope(f))
+        let functions = |u: &secantus_pgplan::UserFn,
+                         args: &[Bson]|
+         -> std::result::Result<secantus_pgplan::FnResult, PlanError> {
+            self.call_user_function(u, args)
+                .map_err(Self::to_plan_error)
+        };
+        secantus_pgplan::with_function_hook(&functions, || {
+            secantus_pgplan::with_sequence_hook(&hook, || self.correlated_scope(f))
+        })
     }
 
     fn note_uncommitted(&self, name: &str, def: Option<TableDef>) {
@@ -8495,6 +9069,29 @@ impl PgHandler {
                     format!("conversion between {name} and UTF8 is not supported"),
                 ))))
             }
+        }
+    }
+
+    /// Can `query` run user-written code -- a DO block, or DML / a query
+    /// while a trigger or a user function exists? Outside a block such a
+    /// statement needs its own implicit transaction.
+    fn runs_user_code(&self, query: &str) -> bool {
+        if self.txn.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+            return false;
+        }
+        let word: String = query
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        match word.as_str() {
+            "do" => true,
+            "insert" | "update" | "delete" | "select" | "with" | "values" | "truncate" => {
+                self.trigger_docs().is_ok_and(|t| !t.is_empty())
+                    || self.user_function_docs().is_ok_and(|f| !f.is_empty())
+            }
+            _ => false,
         }
     }
 
@@ -11723,6 +12320,13 @@ impl PgHandler {
                 self.apply_serial_defaults(&def, &mut ins.rows)?;
                 self.apply_expression_defaults(&def, &mut ins.rows)?;
                 apply_column_defaults(&def, &mut ins.rows);
+                // BEFORE triggers see each row with its defaults, and may
+                // rewrite or drop it before any constraint is checked.
+                let triggered = self.has_triggers(&ins.table)?;
+                if triggered {
+                    self.fire_statement_triggers(&ins.table, "BEFORE", "INSERT")?;
+                    ins.rows = self.before_insert_rows(&def, std::mem::take(&mut ins.rows))?;
+                }
                 // Every constraint is checked BEFORE the first write, so a
                 // violation on any row leaves none of them inserted.
                 for row in &ins.rows {
@@ -11764,6 +12368,10 @@ impl PgHandler {
                     debug_assert_eq!(written, n);
                     (written, ins.rows)
                 };
+                if triggered {
+                    self.after_insert_rows(&def, &ins_rows)?;
+                    self.fire_statement_triggers(&ins.table, "AFTER", "INSERT")?;
+                }
                 let ins = secantus_pgplan::Insert {
                     rows: ins_rows,
                     ..ins
@@ -12486,6 +13094,50 @@ impl PgHandler {
                         self.delete_type_doc(Self::FUNCTION_COLLECTION, id)?;
                     }
                 }
+                // A trigger depends on the function it executes.
+                let calling = if target.param_types.is_empty() {
+                    self.triggers_calling(&target.name)?
+                } else {
+                    Vec::new()
+                };
+                if !calling.is_empty() {
+                    let descs: Vec<String> = calling
+                        .iter()
+                        .map(|t| {
+                            format!(
+                                "trigger {} on table {}",
+                                t.get_str("name").unwrap_or_default(),
+                                t.get_str("table").unwrap_or_default()
+                            )
+                        })
+                        .collect();
+                    if !cascade {
+                        let mut info = ErrorInfo::new(
+                            "ERROR".into(),
+                            "2BP01".into(), // dependent_objects_still_exist
+                            format!(
+                                "cannot drop function {sig} because other objects depend on it"
+                            ),
+                        );
+                        info.detail = Some(
+                            descs
+                                .iter()
+                                .map(|d| format!("{d} depends on function {sig}"))
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        );
+                        info.hint = Some(
+                            "Use DROP ... CASCADE to drop the dependent objects too.".to_string(),
+                        );
+                        return Err(PgWireError::UserError(Box::new(info)));
+                    }
+                    self.cascade_notice(&descs);
+                    for t in &calling {
+                        if let Ok(id) = t.get_str("_id") {
+                            self.delete_type_doc(triggers::TRIGGER_COLLECTION, id)?;
+                        }
+                    }
+                }
                 let id_key = format!("{}/{}", target.name, target.param_types.len());
                 self.delete_type_doc(Self::FUNCTION_COLLECTION, &id_key)?;
                 tag()
@@ -12952,6 +13604,19 @@ impl PgHandler {
                 response.set_bare_command_tag("EXPLAIN");
                 Ok(vec![Response::Query(response)])
             }
+            Statement::CreateUserFunction(def) => self.create_user_function(def),
+            Statement::CreateTrigger(def) => {
+                self.create_trigger(def)?;
+                Ok(vec![Response::Execution(Tag::new("CREATE TRIGGER"))])
+            }
+            Statement::DropTrigger {
+                name,
+                table,
+                if_exists,
+            } => {
+                self.drop_trigger(&name, &table, if_exists)?;
+                Ok(vec![Response::Execution(Tag::new("DROP TRIGGER"))])
+            }
             Statement::CreateIndex(ci) => self.create_index(ci),
 
             Statement::DropIndex { names, if_exists } => {
@@ -13093,6 +13758,8 @@ impl PgHandler {
                             format!("table \"{table}\" does not exist"),
                         ))));
                     };
+                    // Its triggers go with it.
+                    self.drop_table_triggers(table)?;
                     // The sequences its serial columns own go with it.
                     if def.columns.iter().any(|c| c.sequence.is_some()) {
                         self.ensure_collection(SEQUENCE_COLLECTION)?;
@@ -13950,7 +14617,33 @@ impl PgHandler {
                 // A table another one REFERENCES has to see each row's old and
                 // new key, for the referencing side's ON UPDATE action.
                 let referenced = !self.referencing_keys(&upd.table)?.is_empty();
-                let constrained = def.as_ref().is_some_and(table_has_row_constraints) || referenced;
+                // A table with triggers is written row by row: each row is
+                // handed to its triggers with its OLD and NEW values.
+                let triggered = def.is_some() && self.has_triggers(&upd.table)?;
+                let constrained =
+                    def.as_ref().is_some_and(table_has_row_constraints) || referenced || triggered;
+                // The columns the SET list assigns, for `UPDATE OF` triggers.
+                let targets: Vec<String> = match (&def, triggered) {
+                    (Some(def), true) => {
+                        let fields: Vec<&str> = upd
+                            .set
+                            .keys()
+                            .map(String::as_str)
+                            .chain(upd.set_exprs.iter().map(|(f, _, _)| f.as_str()))
+                            .chain(upd.set_subscripts.iter().map(|a| a.field.as_str()))
+                            .collect();
+                        def.columns
+                            .iter()
+                            .filter(|c| fields.contains(&c.field().as_str()))
+                            .map(|c| c.name.clone())
+                            .collect()
+                    }
+                    _ => Vec::new(),
+                };
+                if triggered {
+                    self.fire_statement_triggers(&upd.table, "BEFORE", "UPDATE")?;
+                }
+                let mut trigger_pairs: Vec<(Document, Document)> = Vec::new();
                 let mut key_changes: Vec<(Document, Document)> = Vec::new();
                 // RETURNING needs each row AFTER the update, which only the
                 // row-by-row path below computes -- the bulk path knows just
@@ -13978,7 +14671,7 @@ impl PgHandler {
                     for bytes in &raw {
                         let row: Document = decode_doc(bytes)
                             .map_err(|e| Self::storage_err("could not decode a row", e))?;
-                        let (set, unset) = if !per_row {
+                        let (mut set, mut unset) = if !per_row {
                             (upd.set.clone(), upd.unset.clone())
                         } else {
                             secantus_pgplan::update_row_sets(&upd, &row)
@@ -13991,6 +14684,33 @@ impl PgHandler {
                             }
                             for k in &unset {
                                 after.remove(k);
+                            }
+                            if let (true, Some(def)) = (triggered, def.as_ref()) {
+                                // A BEFORE trigger may skip the row or
+                                // rewrite it; the write is then the whole
+                                // row it returned.
+                                let Some(fired) =
+                                    self.before_update_row(def, &targets, &row, after)?
+                                else {
+                                    continue;
+                                };
+                                after = fired;
+                                set = Document::new();
+                                for (k, v) in &after {
+                                    if k != "_id" && !k.starts_with("_id.") {
+                                        set.insert(k.clone(), v.clone());
+                                    }
+                                }
+                                unset = row
+                                    .keys()
+                                    .filter(|k| {
+                                        *k != "_id"
+                                            && !k.starts_with("_id.")
+                                            && !after.contains_key(k)
+                                    })
+                                    .cloned()
+                                    .collect();
+                                trigger_pairs.push((row.clone(), after.clone()));
                             }
                             if let Some(def) = def.as_ref() {
                                 self.check_row_constraints(def, &after)?;
@@ -14017,6 +14737,10 @@ impl PgHandler {
                     returned = new_rows;
                     matched
                 };
+                if let (true, Some(def)) = (triggered, def.as_ref()) {
+                    self.after_update_rows(def, &targets, &trigger_pairs)?;
+                    self.fire_statement_triggers(&upd.table, "AFTER", "UPDATE")?;
+                }
                 if let Some(returning) = upd.returning.as_ref() {
                     let def = def
                         .ok_or_else(|| Self::err(&PlanError::UndefinedTable(upd.table.clone())))?;
@@ -14049,6 +14773,62 @@ impl PgHandler {
                     self.narrow_by_residual(&del.table, &del.filter, del.residual.take())?;
                 if let Some(def) = self.lookup(&del.table) {
                     self.check_referencing_rows(&def, &del.filter)?;
+                }
+                let trigger_def = match self.lookup(&del.table) {
+                    Some(def) if self.has_triggers(&del.table)? => Some(def),
+                    _ => None,
+                };
+                if let Some(def) = trigger_def.as_ref() {
+                    // Row triggers see each row, and a BEFORE trigger that
+                    // answers NULL spares it: the delete becomes one by key
+                    // over the rows that survived their triggers.
+                    self.fire_statement_triggers(&def.name, "BEFORE", "DELETE")?;
+                    let mut kept = Vec::new();
+                    for bytes in self
+                        .storage
+                        .find_matching(self.db(), &del.table, &del.filter)
+                        .map_err(|e| Self::storage_err("could not read", e))?
+                    {
+                        let row: Document = decode_doc(&bytes)
+                            .map_err(|e| Self::storage_err("could not decode a row", e))?;
+                        if self.before_delete_row(def, &row)? {
+                            kept.push(row);
+                        }
+                    }
+                    let mut deleted = 0usize;
+                    for row in &kept {
+                        deleted += self
+                            .storage
+                            .delete_matching(
+                                self.db(),
+                                &del.table,
+                                &bson::doc! {"_id": row_id(row)},
+                                1,
+                                &Document::new(),
+                                None,
+                            )
+                            .map_err(|e| Self::storage_err("could not delete", e))?;
+                    }
+                    self.after_delete_rows(def, &kept)?;
+                    self.fire_statement_triggers(&def.name, "AFTER", "DELETE")?;
+                    if let Some(returning) = del.returning.as_ref() {
+                        let mut response = self.project_rows(
+                            kept,
+                            def,
+                            &returning.columns,
+                            &returning.casts,
+                            &RowEnv {
+                                tz: row_tz,
+                                ds: row_ds,
+                                cenc: row_cenc,
+                            },
+                        )?;
+                        response.set_command_tag("DELETE");
+                        return Ok(vec![Response::Query(response)]);
+                    }
+                    return Ok(vec![Response::Execution(
+                        Tag::new("DELETE").with_rows(deleted),
+                    )]);
                 }
                 // RETURNING reports the rows as they were, so they are read
                 // before the delete removes them.
@@ -14105,6 +14885,9 @@ impl PgHandler {
             } => {
                 let tables = self.truncate_set(&tables, cascade)?;
                 for table in &tables {
+                    self.fire_statement_triggers(table, "BEFORE", "TRUNCATE")?;
+                }
+                for table in &tables {
                     self.storage
                         .delete_matching(
                             self.db(),
@@ -14118,6 +14901,9 @@ impl PgHandler {
                 }
                 if restart_identity {
                     self.restart_owned_sequences(&tables)?;
+                }
+                for table in &tables {
+                    self.fire_statement_triggers(table, "AFTER", "TRUNCATE")?;
                 }
                 Ok(vec![Response::Execution(Tag::new("TRUNCATE TABLE"))])
             }
