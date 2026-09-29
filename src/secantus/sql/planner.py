@@ -259,6 +259,13 @@ class UpdatePlan:
     # ``(storage_field, type_tag, expr_node)`` evaluated against the old row by the
     # executor. Empty for a pure-literal UPDATE (the fast bulk ``$set`` path).
     computed: list[tuple[str, str, Any]] = field(default_factory=list)
+    # ``SET a[i] = v`` / ``SET a[lo:hi] = v`` -- assignments INTO an array the row
+    # already holds, which rewrite it rather than replace it. One entry per
+    # COLUMN, carrying every subscript assignment to it in statement order, so a
+    # later one sees an earlier one (``SET a[1]=7, a[2]=8`` is two writes to one
+    # array). Each is ``(storage_field, type_tag, [(subs, value_expr), ...])``
+    # where ``subs`` is one ``(is_slice, lo_node, hi_node)`` per subscript.
+    array_sets: list[tuple[str, str, list]] = field(default_factory=list)
     # An auto-updatable view's ``WITH CHECK OPTION`` predicate (an sqlglot
     # expression over base columns): every updated row's post-image must satisfy it
     # or the write raises ``44000``. None for a direct table write.
@@ -491,6 +498,34 @@ def _coerce_cast(value: Any, datatype: exp.Expression | None) -> Any:
     except (TypeError, ValueError):
         return value
     return value
+
+
+def _array_subscript_target(node: exp.Expression, table: TableDef) -> tuple | None:
+    """``a[i]`` / ``a[lo:hi]`` / ``m[i][j]`` as an UPDATE target.
+
+    Returns ``(column, subs)`` where ``subs`` is one ``(is_slice, lo, hi)`` per
+    subscript in DIMENSION order (innermost first), or None when this is not a
+    subscripted target at all. The column must be array-typed -- subscripting
+    anything else is not an assignment form this server has.
+    """
+    if not isinstance(node, exp.Bracket) or not node.expressions:
+        return None
+    subs: list = []
+    cur: Any = node
+    while isinstance(cur, exp.Bracket) and cur.expressions:
+        idx = cur.expressions[0]
+        if isinstance(idx, exp.Slice):
+            subs.append((True, idx.this, idx.args.get("expression")))
+        else:
+            subs.append((False, None, idx))
+        cur = cur.this
+    subs.reverse()
+    if not isinstance(cur, exp.Column):
+        return None
+    col = table.column(cur.name)
+    if col is None or not typemap.is_array_tag(col.type_tag):
+        return None
+    return col, subs
 
 
 def _column_name(node: exp.Expression) -> str:
@@ -4101,12 +4136,28 @@ def _is_array_field(operand: exp.Expression, table: TableDef) -> bool:
 
 
 def _is_nonempty_array_literal(operand: exp.Expression) -> bool:
-    """Whether ``operand`` is a non-empty ``ARRAY[...]`` literal. (An *empty* array
-    literal is excluded: ``arr @> '{}'`` is true for every row, which ``$all: []``
-    would not express — those stay on the per-row path.)"""
+    """Whether ``operand`` is a non-empty ``ARRAY[...]`` literal with no NULL in it.
+
+    Two exclusions, both because the Mongo filter this shape lowers to would
+    answer a different question:
+
+    * an *empty* literal — ``arr @> '{}'`` is true for every row, which
+      ``$all: []`` would not express;
+    * a literal containing **NULL** — the filter becomes a bare equality
+      ``{field: None}``, and a Mongo bare-equality against null matches a
+      MISSING field as well as a null element, where PostgreSQL's containment
+      matches a NULL against nothing at all. ``WHERE ia @> ARRAY[NULL]``
+      returned rows PostgreSQL excludes until this gate went in.
+
+    Both fall back to the per-row scalar evaluator, which has the right rules.
+    """
     if isinstance(operand, exp.Paren):
         operand = operand.this
-    return isinstance(operand, exp.Array) and len(operand.expressions) > 0
+    if not (isinstance(operand, exp.Array) and len(operand.expressions) > 0):
+        return False
+    return not any(
+        isinstance(e.unnest() if hasattr(e, "unnest") else e, exp.Null) for e in operand.expressions
+    )
 
 
 def _array_index_operands(op: exp.Expression, table: TableDef) -> bool:
@@ -4315,9 +4366,28 @@ def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
     unset_fields: list[str] = []
     rekey = False
     computed: list[tuple[str, str, Any]] = []
+    array_sets: list[tuple[str, str, list]] = []
     for assign in stmt.expressions:
         if not isinstance(assign, exp.EQ):
             raise errors.feature_not_supported(f"unsupported SET item: {assign.sql()}")
+        # ``SET a[i] = v`` -- the target is one element (or slice) of the array
+        # the column holds, so the assignment reads the old value. Checked
+        # BEFORE `_column_name`, which saw a `Bracket` and answered
+        # `0A000 expected a column, got: ia[1]` -- an error naming a subscript
+        # the user never wrote, because sqlglot had already folded it to
+        # 0-based.
+        sub_target = _array_subscript_target(assign.this, table)
+        if sub_target is not None:
+            sub_col, subs = sub_target
+            if sub_col.pk:
+                raise errors.feature_not_supported("updating the primary key is not supported")
+            for existing in array_sets:
+                if existing[0] == sub_col.field:
+                    existing[2].append((subs, assign.expression))
+                    break
+            else:
+                array_sets.append((sub_col.field, sub_col.type_tag, [(subs, assign.expression)]))
+            continue
         # ``SET col.field = v`` writes into the composite subdocument at ``col.field``.
         subfield_target = _composite_subfield_target(assign.this, table)
         if subfield_target is not None:
@@ -4421,6 +4491,7 @@ def plan_update(stmt: exp.Update, table: TableDef) -> UpdatePlan:
         returning=_returning_columns(stmt, table),
         rekey=rekey,
         computed=computed,
+        array_sets=array_sets,
     )
 
 
@@ -13573,9 +13644,20 @@ def _infer_scalar_tag_impl(node: exp.Expression, resolve: Resolve) -> str:
             _etag = _infer_scalar_tag(_first, resolve) if _first is not None else "text"
         return f"{_etag}[]" if f"{_etag}[]" in typemap.PG_OID else "text[]"
     if isinstance(node, exp.Bracket) and node.expressions:
-        # ``arr[i]`` yields the element type; ``arr[lo:hi]`` stays the array type.
-        base_tag = _infer_scalar_tag(node.this, resolve)
-        if isinstance(node.expressions[0], exp.Slice):
+        # ``arr[i]`` yields the element type; ``arr[lo:hi]`` stays the array
+        # type -- and that is decided over the WHOLE subscript chain, because
+        # once any subscript is a slice PostgreSQL treats every one as a slice.
+        # Reading only the outermost subscript typed ``m[1:2][2]`` as the
+        # element, and the array it actually evaluates to then failed to coerce
+        # with a bare ``int('{{1,2},{3,4}}')`` that reached the client as a
+        # Python ValueError with no SQLSTATE.
+        levels: list = []
+        cur_node: Any = node
+        while isinstance(cur_node, exp.Bracket) and cur_node.expressions:
+            levels.append(cur_node.expressions[0])
+            cur_node = cur_node.this
+        base_tag = _infer_scalar_tag(cur_node, resolve)
+        if any(isinstance(lvl, exp.Slice) for lvl in levels):
             return base_tag
         return typemap.array_element_tag(base_tag) if typemap.is_array_tag(base_tag) else base_tag
     if isinstance(node, exp.Window):

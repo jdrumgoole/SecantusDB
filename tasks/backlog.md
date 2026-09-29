@@ -6975,6 +6975,55 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       | composite `PRIMARY KEY` / multi-col `FOREIGN KEY` | | `a composite PRIMARY KEY` |
       | non-literal column `DEFAULT` | `default now()` | `a non-literal DEFAULT` |
 
+      **The PYTHON PG server's array surface was WORSE than the Rust one, and
+      four of its defects were silent wrong answers** (measured 2026-09-29,
+      `arrays2` corpus 18 divergences of 32 -> 0; `arrays` 7 -> 2). Worth
+      recording because it inverts the usual assumption: the Python server is
+      the more complete SQL implementation *in general*, and that is not a
+      reason to assume it on any particular surface. What it got wrong:
+
+      * `ia @> ARRAY[NULL]` and `ia && ARRAY[NULL]` answered TRUE, and
+        `ARRAY[1,NULL] <@ ARRAY[1,NULL]` too -- Python's `None == None` standing
+        in for a BSON/SQL semantic, the fourth instance of that shape in this
+        file. In a WHERE clause it returned rows PostgreSQL excludes.
+      * The same predicate had a SECOND, independent copy of the bug in the
+        INDEX path: `field @> ARRAY[...]` lowers to a Mongo bare equality, and
+        a bare equality against null also matches a MISSING field. Fixing the
+        evaluator alone would have left the indexed query wrong. **When you fix
+        a predicate, grep for its pushdown.**
+      * `m @> ARRAY[3]` answered FALSE -- containment was compared level by
+        level instead of flattened, so it was wrong for every multidimensional
+        array.
+      * `array_position(arr, elem, start)` IGNORED `start`. sqlglot files that
+        third argument under `zero_based`, a slot name it reuses; reading
+        `expressions` finds nothing, so the argument was dropped silently and
+        the function answered a wrong NUMBER.
+      * `array_cat(NULL, NULL)` answered `{}` where PostgreSQL answers NULL.
+
+      And three that were bogus ERRORS rather than wrong values: a NULL array
+      operand to any of `@>` / `<@` / `&&` fell past every handler and surfaced
+      as `42883 function array_contains_all() does not exist`; `array_length(a,
+      NULL)` raised `int(None)` and surfaced as `42883 function
+      array_size(integer[], unknown) does not exist`; and `string_to_array(s,
+      '')` reached `str.split('')`, which raises. **A `42883` naming a function
+      the user did not call is the tell that an internal exception is being
+      re-labelled rather than handled.**
+
+      Worst of all, a multidimensional subscript (`m[1]`, `m[1:2][2]`) leaked a
+      bare Python `ValueError` to the wire with **no SQLSTATE at all** --
+      `None: invalid literal for int() with base 10: '{1,2}'`. That breaks the
+      architecture rule in CLAUDE.md directly ("Don't leak Python tracebacks to
+      the wire"), and it was reachable from a plain SELECT.
+
+      `SET a[i] = v` is implemented on both servers now. What both still refuse,
+      by name: a subscript below 1, and `array_fill` with a lower bound other
+      than 1 -- neither server models array lower bounds.
+
+      Still open on the Python server after this batch (2 of 29 on `arrays`):
+      `ta || 'c'` is accepted where PostgreSQL 14 answers `22P02 malformed
+      array literal: "c"` (a permissive divergence, not data loss), and
+      multi-argument `unnest(a, b)` in FROM returns only the first column.
+
       **The ARRAY surface landed 2026-09-29** (`arrays` corpus 24 divergences
       of 29 -> 6, every one of the six an honest named refusal): the fifteen
       array functions (`array_length` / `_ndims` / `_dims` / `_lower` /

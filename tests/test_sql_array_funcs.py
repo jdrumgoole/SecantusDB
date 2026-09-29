@@ -166,3 +166,83 @@ def test_multidim_array_column_roundtrip_and_funcs(storage, session):
         (2, 6)
     ]
     assert run(storage, session, "SELECT array_length(g, 2) FROM grids").rows == [(3,)]
+
+
+# --- PostgreSQL fidelity, measured on 14.13 via tools/probes/pg_differential.py
+#
+# Each expectation below is PostgreSQL's own answer to the same statement. The
+# cases here are the ones where this server had a DIFFERENT answer rather than
+# no answer -- a wrong value or a bogus error, neither of which a refusal-shaped
+# test would have caught.
+
+
+def test_array_cat_of_two_nulls_is_null_not_the_empty_array(storage, session):
+    """A NULL side is taken as the empty one -- that is what lets `array_cat`
+    fold over a nullable accumulator -- but when EVERY side is NULL the answer
+    is NULL. Coercing each operand first returned `{}`, a value PostgreSQL
+    never gives here and one that `IS NULL` then disagrees about."""
+    row = run(
+        storage,
+        session,
+        "SELECT array_cat(NULL::int[], ARRAY[3]), array_cat(ARRAY[1], NULL::int[]),"
+        " array_cat(NULL::int[], NULL::int[])",
+    ).rows[0]
+    assert row == ([3], [1], None)
+
+
+def test_array_position_honours_its_start_argument(storage, session):
+    """The third argument was parsed and then DROPPED, so
+    `array_position(ARRAY[1,2,3,2], 2, 3)` answered 2 where PostgreSQL answers
+    4 -- a wrong number rather than an error, which is why nothing caught it.
+
+    sqlglot files that argument under `zero_based`, a slot name it reuses;
+    reading `expressions` (the obvious guess) finds nothing at all.
+    """
+    row = run(
+        storage,
+        session,
+        "SELECT array_position(ARRAY[1,2,3,2], 2), array_position(ARRAY[1,2,3,2], 2, 3),"
+        " array_position(ARRAY[1,2,3,2], 2, 9)",
+    ).rows[0]
+    assert row == (2, 4, None)
+
+
+def test_array_position_matches_a_null_to_a_null(storage, session):
+    """The SEARCH functions match NULL to NULL. The CONTAINMENT operators do
+    not -- see test_sql_array_ops.py. Each looks like the other's bug."""
+    row = run(
+        storage,
+        session,
+        "SELECT array_position(ARRAY[1,NULL,2], NULL), array_remove(ARRAY[1,NULL], NULL),"
+        " array_replace(ARRAY[1,NULL], NULL, 9)",
+    ).rows[0]
+    assert row == (2, [1], [1, 9])
+
+
+def test_array_length_with_a_null_dimension_is_null(storage, session):
+    """`int(None)` raised, and the TypeError surfaced as
+    `42883 function array_size(integer[], unknown) does not exist` -- a
+    signature error naming sqlglot's internal node, for a call PostgreSQL
+    simply answers NULL."""
+    row = run(
+        storage,
+        session,
+        "SELECT array_length(ARRAY[1,2], NULL), array_length(ARRAY[1,2], 0),"
+        " array_length(ARRAY[1,2], 2), array_length(ARRAY[1,2], 1)",
+    ).rows[0]
+    assert row == (None, None, None, 2)
+
+
+def test_string_to_array_separator_shapes(storage, session):
+    """Three shapes PostgreSQL treats differently. The EMPTY separator reached
+    `str.split('')`, which raises -- surfacing as a bogus
+    `42883 function string_to_array(unknown, unknown) does not exist` -- and an
+    empty INPUT returned `{''}` where PostgreSQL returns `{}`."""
+    row = run(
+        storage,
+        session,
+        "SELECT string_to_array('abc', ''), string_to_array('abc', NULL),"
+        " string_to_array('', ','), string_to_array('a,b,,c', ','),"
+        " string_to_array('a,b', ',', 'b')",
+    ).rows[0]
+    assert row == (["abc"], ["a", "b", "c"], [], ["a", "b", "", "c"], ["a", None])

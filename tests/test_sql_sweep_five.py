@@ -136,7 +136,13 @@ class TestArrayAndRangeFunctions:
         [
             # These typed as text, so the array went out as a string literal.
             ("SELECT array_fill(7, ARRAY[3])", "int4[]"),
-            ("SELECT array_positions('{1,2,1}'::int[], 1)", "int8[]"),
+            # `int4[]`, not `int8[]`: PostgreSQL 14.13 reports
+            # `pg_typeof(array_positions(...))` as `integer[]` (re-probed
+            # 2026-09-29). This line asserted `int8[]` from the day it was
+            # written -- a wrong expectation pinned as if it were measured, so
+            # a client decoding the column by its declared oid got the wrong
+            # width and the test defended it.
+            ("SELECT array_positions('{1,2,1}'::int[], 1)", "int4[]"),
             # A CAST is as much a range operand as the constructor is.
             ("SELECT range_merge('[1,3)'::int4range, '[5,7)'::int4range)", "int4range"),
         ],

@@ -228,3 +228,71 @@ def test_array_overlaps_int_column(st):
         run_sql(st, DB, f"INSERT INTO n VALUES ({i}, '{arr}')", session=sess)
     assert _ids(st, sess, "SELECT id FROM n WHERE xs && ARRAY[3,5] ORDER BY id") == [2, 3]
     assert _ids(st, sess, "SELECT id FROM n WHERE xs @> ARRAY[2] ORDER BY id") == [1, 2]
+
+
+# --- containment against PostgreSQL 14.13's rules, measured
+
+
+def test_containment_never_matches_a_null(st):
+    """`@>` / `<@` / `&&` use the element type's `=`, under which NULL matches
+    nothing -- not even another NULL. Python's `None == None` is True, so every
+    one of these answered true, and in a WHERE clause that returned rows
+    PostgreSQL excludes.
+
+    This is NOT the rule the search functions use: `array_position(ARRAY[1,NULL],
+    NULL)` really is 2. See test_sql_array_funcs.py.
+    """
+    st, sess = _fresh(st)
+    row = _run(
+        st,
+        sess,
+        "SELECT ARRAY[1,NULL] @> ARRAY[NULL]::int[], ARRAY[1,NULL] <@ ARRAY[1,NULL],"
+        " ARRAY[1,NULL] && ARRAY[NULL]::int[]",
+    ).rows[0]
+    assert row == (False, False, False)
+
+
+def test_containment_flattens_a_multidimensional_array(st):
+    """Containment ignores dimensionality, so `ARRAY[[1,2],[3,4]] @> ARRAY[3]`
+    is true. Comparing level-by-level made every such test answer false."""
+    st, sess = _fresh(st)
+    row = _run(
+        st,
+        sess,
+        "SELECT ARRAY[[1,2],[3,4]] @> ARRAY[3], ARRAY[[1,2],[3,4]] && ARRAY[9,4],"
+        " ARRAY[1] <@ ARRAY[[1,2],[3,4]]",
+    ).rows[0]
+    assert row == (True, True, True)
+
+
+def test_a_null_array_operand_is_a_null_answer(st):
+    """These operators are NULL-propagating. A NULL operand fell past every
+    handler in the dispatch chain and surfaced as
+    `42883 function array_contains_all() does not exist` -- a function name no
+    user wrote, for an operator that does exist."""
+    st, sess = _fresh(st)
+    row = _run(
+        st,
+        sess,
+        "SELECT NULL::int[] @> ARRAY[1], ARRAY[1] @> NULL::int[],"
+        " NULL::int[] && ARRAY[1], NULL::int[] <@ ARRAY[1]",
+    ).rows[0]
+    assert row == (None, None, None, None)
+
+
+def test_a_null_in_the_literal_does_not_take_the_index_path(st):
+    """`field @> ARRAY[...]` lowers to a Mongo bare-equality filter so it can
+    use a multikey index -- but a bare equality against null matches a MISSING
+    field too, where PostgreSQL's containment matches a NULL against nothing.
+
+    The row this returned was wrong, not merely differently ordered, so the
+    index path must decline a literal containing NULL and let the per-row
+    evaluator answer.
+    """
+    st, sess = _fresh(st)
+    run_sql(st, DB, "INSERT INTO a VALUES (4, ARRAY[7,NULL])", session=sess)
+    assert _ids(st, sess, "SELECT id FROM a WHERE nums @> ARRAY[NULL]::int[] ORDER BY id") == []
+    assert _ids(st, sess, "SELECT id FROM a WHERE nums && ARRAY[NULL]::int[] ORDER BY id") == []
+    # The NULL-free shapes still work, and still find the right rows.
+    assert _ids(st, sess, "SELECT id FROM a WHERE nums @> ARRAY[2] ORDER BY id") == [1, 3]
+    assert _ids(st, sess, "SELECT id FROM a WHERE nums && ARRAY[4,6] ORDER BY id") == [2, 3]
