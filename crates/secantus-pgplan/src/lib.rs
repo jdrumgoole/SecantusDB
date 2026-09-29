@@ -1217,6 +1217,10 @@ pub enum OutputCol {
     /// aggregate inside it is an ordinary item, computed once and read back
     /// by its slot name.
     Expr(usize),
+    /// `GROUPING(a, b, ...)`, by index into `Aggregate::groupings`: an int4
+    /// whose bit `n-1-i` is set when argument `i` is NOT grouped by the
+    /// grouping set that produced the row.
+    Grouping(usize),
 }
 
 /// A `HAVING` predicate over the grouped rows.
@@ -1290,6 +1294,8 @@ pub struct Aggregate {
     /// naming every key -- but kept distinct so the ordinary path allocates
     /// and branches exactly as it did before.
     pub grouping_sets: Option<Vec<Vec<usize>>>,
+    /// Each `GROUPING(...)` call's arguments, as `group_by` indices.
+    pub groupings: Vec<Vec<usize>>,
     pub items: Vec<AggItem>,
     /// The output columns, in order, each pointing at a group or an aggregate.
     pub select: Vec<(String, OutputCol)>,
@@ -6165,6 +6171,13 @@ fn srf_rows(
         }
         call.args.iter().map(|a| const_value(a, params)).collect()
     };
+    // `generate_series` over numeric, or over timestamps with an interval
+    // step. (The integer form is the `Series` source.)
+    if name == "generate_series" && matches!(call.args.len(), 2 | 3) {
+        if let Some(kind) = non_integer_series_kind(call) {
+            return series_rows(name, kind, call, params).map(Some);
+        }
+    }
     // A user-defined set-returning function: the executor runs it.
     if let Some(u) = correlated::user_function(name, call.args.len()).filter(|u| u.returns_set) {
         let a: Vec<Bson> = call
@@ -6505,6 +6518,10 @@ fn series_from_clause(from: &pg_query::protobuf::Node, params: &[Bson]) -> Resul
     if func_name(&call).as_deref() != Some("generate_series") {
         return Ok(None);
     }
+    // numeric and timestamp series are set-returning functions proper.
+    if non_integer_series_kind(&call).is_some() {
+        return Ok(None);
+    }
     let series = series_from_args(&call, params)?;
     // `AS g(x)` -- the column alias, then the table alias, then the default.
     let column = rf
@@ -6521,6 +6538,120 @@ fn series_from_clause(from: &pg_query::protobuf::Node, params: &[Bson]) -> Resul
         })
         .unwrap_or_else(|| "generate_series".to_string());
     Ok(Some(Series { column, ..series }))
+}
+
+/// The result type of a `generate_series` that is NOT over integers --
+/// `numeric`, `timestamp` or `timestamptz` (a `date` bound resolves to
+/// timestamptz, the preferred datetime type) -- or `None` for the integer one.
+fn non_integer_series_kind(f: &pg_query::protobuf::FuncCall) -> Option<&'static str> {
+    let types: Vec<String> = f
+        .args
+        .iter()
+        .take(2)
+        .map(|a| static_type(a, &Bson::Null))
+        .collect();
+    let has = |t: &str| types.iter().any(|x| x == t);
+    if has("timestamptz") || has("date") {
+        return Some("timestamptz");
+    }
+    if has("timestamp") {
+        return Some("timestamp");
+    }
+    if has("numeric") || f.args.get(2).is_some_and(|a| static_type(a, &Bson::Null) == "numeric") {
+        return Some("numeric");
+    }
+    None
+}
+
+/// The rows of a numeric or timestamp `generate_series`: each value the
+/// previous plus the step (iteratively, as PostgreSQL adds it -- which is
+/// what makes a month step from the 31st clamp and stay clamped).
+fn series_rows(
+    name: &str,
+    kind: &str,
+    call: &pg_query::protobuf::FuncCall,
+    params: &[Bson],
+) -> Result<SrfRows> {
+    const MAX_ROWS: usize = 10_000_000;
+    let vals = call
+        .args
+        .iter()
+        .map(|a| const_value(a, params))
+        .collect::<Result<Vec<_>>>()?;
+    let mut rows: Vec<Vec<Bson>> = Vec::new();
+    let done = |rows: Vec<Vec<Bson>>| Ok((vec![name.to_string()], vec![kind.to_string()], rows));
+    if vals.contains(&Bson::Null) {
+        return done(rows);
+    }
+    let zero_step = || Error::InvalidParameter("step size cannot equal zero".into());
+    if kind == "numeric" {
+        let text = |v: &Bson| numeric::numeric_operand_text(v).ok_or_else(|| Error::Unsupported("this generate_series argument".into()));
+        let (start, stop) = (text(&vals[0])?, text(&vals[1])?);
+        let step = match vals.get(2) {
+            Some(v) => text(v)?,
+            None => "1".to_string(),
+        };
+        for (what, t) in [("start", &start), ("stop", &stop), ("step size", &step)] {
+            if t == "NaN" {
+                return Err(Error::InvalidParameter(format!("{what} value cannot be NaN")));
+            }
+            if t.ends_with("Infinity") {
+                return Err(Error::InvalidParameter(format!("{what} value cannot be infinity")));
+            }
+        }
+        let sign = compare_decimal_text(&step, "0").unwrap_or(std::cmp::Ordering::Equal);
+        if sign == std::cmp::Ordering::Equal {
+            return Err(zero_step());
+        }
+        let mut cur = start;
+        loop {
+            let ord = compare_decimal_text(&cur, &stop).unwrap_or(std::cmp::Ordering::Equal);
+            let within = if sign == std::cmp::Ordering::Greater { ord.is_le() } else { ord.is_ge() };
+            if !within || rows.len() >= MAX_ROWS {
+                break;
+            }
+            rows.push(vec![numeric::numeric_bson(&cur)]);
+            cur = match decimal_arith("+", &cur, &step) {
+                Some(Ok(v)) => numeric_text(&v).unwrap_or_default(),
+                _ => break,
+            };
+        }
+        return done(rows);
+    }
+    let [start, stop, step] = vals.as_slice() else {
+        return Err(Error::UndefinedFunction(format!(
+            "function generate_series({}, {}) does not exist",
+            display_type(kind),
+            display_type(kind)
+        )));
+    };
+    let micros = |v: &Bson| -> Result<i64> {
+        instant_micros(&cast_value(v.clone(), kind)?)
+            .ok_or_else(|| Error::Unsupported("this generate_series bound".into()))
+    };
+    let (mut cur, stop) = (micros(start)?, micros(stop)?);
+    let step = match Interval::from_bson(step) {
+        Some(iv) => iv,
+        None => parse_interval(&value_text(step))?,
+    };
+    // An interval's sign, as `interval_cmp` against zero orders it.
+    let span = i128::from(step.months) * 30 * 86_400_000_000
+        + i128::from(step.days) * 86_400_000_000
+        + i128::from(step.micros);
+    if span == 0 {
+        return Err(zero_step());
+    }
+    while (span > 0 && cur <= stop) || (span < 0 && cur >= stop) {
+        if rows.len() >= MAX_ROWS {
+            break;
+        }
+        rows.push(vec![timestamptz_value_from_micros(cur)]);
+        match add_interval_to_micros(cur, &step, 1) {
+            Some(next) => cur = next,
+            None => break,
+        }
+    }
+    done(rows)
 }
 
 /// `generate_series(start, stop [, step])` from its arguments.
@@ -9760,6 +9891,16 @@ fn plan_select_rest(
         }
         return plan_aggregate(s, lookup, params);
     }
+    // `GROUPING()` names a grouping expression, and with no GROUP BY there is
+    // none -- whatever its argument.
+    if s.target_list.iter().any(|t| {
+        matches!(t.node.as_ref(), Some(N::ResTarget(rt))
+            if matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()), Some(N::GroupingFunc(_))))
+    }) {
+        return Err(Error::Grouping(
+            "arguments to GROUPING must be grouping expressions of the associated query level".into(),
+        ));
+    }
     // A window function in a WHERE is an ERROR in PostgreSQL, not a filter --
     // the WHERE runs before the windows do, so there is nothing to test.
     // PostgreSQL's own message and class, because it refuses this too.
@@ -10120,6 +10261,148 @@ fn plan_aggregate(
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &[Bson],
 ) -> Result<Statement> {
+    match plan_aggregate_direct(s, lookup, params) {
+        Err(Error::Unsupported(m))
+            if m.starts_with("ORDER BY over")
+                && !s.sort_clause.is_empty()
+                && s.distinct_clause.is_empty() =>
+        {
+            plan_aggregate_sorted_outside(s, lookup, params)
+        }
+        other => other,
+    }
+}
+
+/// An aggregate whose ORDER BY reads its RESULTS -- `ORDER BY count(*)
+/// DESC`, `ORDER BY 2`, `ORDER BY c` for an aggregate alias -- as the
+/// grouped query in a FROM subquery, sorted and limited outside:
+///
+/// `SELECT __c1 AS a, __c2 AS count FROM (SELECT a AS __c1, count(*) AS
+/// __c2, sum(n) AS __o1 FROM t GROUP BY a) __agg ORDER BY __o1 DESC`.
+///
+/// Every output is renamed positionally so two columns of one name (`count`,
+/// `count`) stay two; an ORDER BY expression that is not an output rides as
+/// a hidden column. An output alias or position in ORDER BY names that output,
+/// which is PostgreSQL's resolution order.
+fn plan_aggregate_sorted_outside(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Result<Statement> {
+    let target = |name: &str, val: pg_query::protobuf::Node| pg_query::protobuf::Node {
+        node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+            name: name.to_string(),
+            val: Some(Box::new(val)),
+            location: -1,
+            ..Default::default()
+        }))),
+    };
+    let colref = |name: &str| pg_query::protobuf::Node {
+        node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+            fields: vec![string_node(name)],
+            location: -1,
+        })),
+    };
+    let mut inner = s.clone();
+    inner.sort_clause = Vec::new();
+    inner.limit_count = None;
+    inner.limit_offset = None;
+    inner.limit_option = pg_query::protobuf::LimitOption::Default as i32;
+    inner.target_list = Vec::new();
+    let mut outer_targets = Vec::new();
+    let mut aliases: Vec<String> = Vec::new();
+    for (k, t) in s.target_list.iter().enumerate() {
+        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+            return Err(Error::Unsupported("this target".into()));
+        };
+        let val = rt
+            .val
+            .as_deref()
+            .cloned()
+            .ok_or_else(|| Error::Unsupported("an empty target".into()))?;
+        let original = if rt.name.is_empty() {
+            match val.node.as_ref() {
+                Some(N::GroupingFunc(_)) => "grouping".to_string(),
+                _ => expression_column_name(&val),
+            }
+        } else {
+            rt.name.clone()
+        };
+        let slot = format!("__c{}", k + 1);
+        inner.target_list.push(target(&slot, val));
+        outer_targets.push(target(&original, colref(&slot)));
+        aliases.push(original);
+    }
+    let mut outer_sort = Vec::new();
+    for (k, item) in s.sort_clause.iter().enumerate() {
+        let Some(N::SortBy(sb)) = item.node.as_ref() else {
+            return Err(Error::Unsupported("this ORDER BY item".into()));
+        };
+        let node = sb
+            .node
+            .as_deref()
+            .ok_or_else(|| Error::Unsupported("this ORDER BY item".into()))?;
+        let by_output = match node.node.as_ref() {
+            Some(N::AConst(c)) => match &c.val {
+                Some(a_const::Val::Ival(i)) => {
+                    let n = usize::try_from(i.ival).ok().filter(|n| (1..=aliases.len()).contains(n));
+                    Some(n.ok_or_else(|| {
+                        Error::InvalidColumnReference(format!(
+                            "ORDER BY position {} is not in select list",
+                            i.ival
+                        ))
+                    })?)
+                }
+                _ => None,
+            },
+            Some(N::ColumnRef(c)) if c.fields.len() == 1 => column_ref_name(c)
+                .and_then(|n| aliases.iter().position(|a| *a == n))
+                .map(|p| p + 1),
+            _ => None,
+        };
+        let slot = match by_output {
+            Some(n) => format!("__c{n}"),
+            None => {
+                let slot = format!("__o{}", k + 1);
+                inner.target_list.push(target(&slot, node.clone()));
+                slot
+            }
+        };
+        let mut sort = (**sb).clone();
+        sort.node = Some(Box::new(colref(&slot)));
+        outer_sort.push(pg_query::protobuf::Node {
+            node: Some(N::SortBy(Box::new(sort))),
+        });
+    }
+    let outer = pg_query::protobuf::SelectStmt {
+        target_list: outer_targets,
+        from_clause: vec![pg_query::protobuf::Node {
+            node: Some(N::RangeSubselect(Box::new(pg_query::protobuf::RangeSubselect {
+                lateral: false,
+                subquery: Some(Box::new(pg_query::protobuf::Node {
+                    node: Some(N::SelectStmt(Box::new(inner))),
+                })),
+                alias: Some(pg_query::protobuf::Alias {
+                    aliasname: "__agg".into(),
+                    colnames: Vec::new(),
+                }),
+            }))),
+        }],
+        sort_clause: outer_sort,
+        limit_count: s.limit_count.clone(),
+        limit_offset: s.limit_offset.clone(),
+        limit_option: s.limit_option,
+        op: pg_query::protobuf::SetOperation::SetopNone as i32,
+        ..Default::default()
+    };
+    plan_select(&outer, lookup, params)
+}
+
+fn plan_aggregate_direct(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Result<Statement> {
     if s.from_clause.len() != 1 {
         return Err(Error::Unsupported(
             "an aggregate that is not over one table".into(),
@@ -10279,6 +10562,7 @@ fn plan_aggregate(
             group_by: Vec::new(),
             // A bare aggregate over a series has no GROUP BY at all.
             grouping_sets: None,
+            groupings: Vec::new(),
             items,
             select,
             filter,
@@ -10751,6 +11035,7 @@ pub fn aggregate_output_def(agg: &Aggregate) -> Result<TableDef> {
             OutputCol::Group(i) => agg.group_by[*i].pg_type.clone(),
             OutputCol::Expr(i) => column_expr_type(&agg.exprs[*i]).to_string(),
             OutputCol::Agg(i) => aggregate_item_type(&agg.items[*i]),
+            OutputCol::Grouping(_) => "int4".to_string(),
         };
         let mut c = Column::new(out, &ty, false);
         if let OutputCol::Group(i) = col {
@@ -11077,6 +11362,7 @@ fn finish_aggregate(
     let mut items: Vec<AggItem> = Vec::new();
     let mut exprs: Vec<ColumnExpr> = Vec::new();
     let mut select: Vec<(String, OutputCol)> = Vec::new();
+    let mut groupings: Vec<Vec<usize>> = Vec::new();
     for t in &s.target_list {
         let Some(N::ResTarget(rt)) = t.node.as_ref() else {
             return Err(Error::Unsupported("this target".into()));
@@ -11086,8 +11372,37 @@ fn finish_aggregate(
         // explicitly so the refusal says what is missing: the generic arm
         // below answers `this target is not supported yet`, which tells a
         // reader nothing about which part of their query to change.
-        if let Some(N::GroupingFunc(_)) = rt.val.as_ref().and_then(|v| v.node.as_ref()) {
-            return Err(Error::Unsupported("the GROUPING function".into()));
+        if let Some(N::GroupingFunc(g)) = rt.val.as_ref().and_then(|v| v.node.as_ref()) {
+            let mut idxs = Vec::new();
+            for a in &g.args {
+                let print = node_print(a);
+                let by_name = match a.node.as_ref() {
+                    Some(N::ColumnRef(c)) => column_ref_name(c)
+                        .and_then(|n| group_by.iter().position(|k| k.expr.is_none() && k.name == n)),
+                    _ => None,
+                };
+                let idx = group_prints.iter().position(|p| *p == print).or(by_name).ok_or_else(|| {
+                    Error::Grouping(
+                        "arguments to GROUPING must be grouping expressions of the associated query level"
+                            .into(),
+                    )
+                })?;
+                idxs.push(idx);
+            }
+            if idxs.len() > 31 {
+                return Err(Error::Sqlstate(
+                    "54011",
+                    "GROUPING must have fewer than 32 arguments".into(),
+                ));
+            }
+            let out = if rt.name.is_empty() {
+                "grouping".to_string()
+            } else {
+                rt.name.clone()
+            };
+            select.push((out, OutputCol::Grouping(groupings.len())));
+            groupings.push(idxs);
+            continue;
         }
         match rt.val.as_ref().and_then(|v| v.node.as_ref()) {
             Some(N::FuncCall(f)) if is_aggregate_call(f) => {
@@ -11202,7 +11517,7 @@ fn finish_aggregate(
                     .ok_or_else(|| Error::Unsupported("this ORDER BY expression".into()))?;
                 match select.iter().find(|(out, _)| *out == col).map(|(_, o)| *o) {
                     Some(OutputCol::Group(i)) => i,
-                    Some(OutputCol::Agg(_) | OutputCol::Expr(_)) => {
+                    Some(OutputCol::Agg(_) | OutputCol::Expr(_) | OutputCol::Grouping(_)) => {
                         return Err(Error::Unsupported(
                             "ORDER BY over an aggregate result".into(),
                         ))
@@ -11232,7 +11547,7 @@ fn finish_aggregate(
                     })?;
                 match col.1 {
                     OutputCol::Group(i) => i,
-                    OutputCol::Agg(_) | OutputCol::Expr(_) => {
+                    OutputCol::Agg(_) | OutputCol::Expr(_) | OutputCol::Grouping(_) => {
                         return Err(Error::Unsupported(
                             "ORDER BY over an aggregate result".into(),
                         ))
@@ -11283,6 +11598,7 @@ fn finish_aggregate(
         table,
         group_by,
         grouping_sets,
+        groupings,
         items,
         select,
         filter,
@@ -11574,6 +11890,9 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
         }
         Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("to_regclass") => {
             "regclass".to_string()
+        }
+        Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("pg_typeof") => {
+            "regtype".to_string()
         }
         Some(N::FuncCall(f))
             if func_name(f).is_some_and(|n| n.starts_with("has_") && n.ends_with("_privilege")) =>

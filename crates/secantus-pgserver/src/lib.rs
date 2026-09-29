@@ -2278,6 +2278,9 @@ impl PgHandler {
         let mut keys: Vec<Vec<Option<Bson>>> = Vec::new();
         let mut idents: Vec<Vec<Option<Bson>>> = Vec::new();
         let mut buckets: Vec<Vec<Document>> = Vec::new();
+        // The grouping set that produced each group, for `GROUPING()`; a plain
+        // GROUP BY groups on every key.
+        let mut group_sets: Vec<Vec<usize>> = Vec::new();
         // `GROUPING SETS` / `ROLLUP` / `CUBE`: each set is grouped on its OWN
         // subset of the keys and the rest of the row's key positions are NULL,
         // then the sets' results are concatenated in order. That is what
@@ -2327,6 +2330,7 @@ impl PgHandler {
                     set_keys.push(vec![None; width]);
                     set_buckets.push(Vec::new());
                 }
+                group_sets.extend(std::iter::repeat_n(set.clone(), set_keys.len()));
                 keys.extend(set_keys);
                 idents.extend(set_idents);
                 buckets.extend(set_buckets);
@@ -2373,15 +2377,29 @@ impl PgHandler {
         // (group key, computed aggregates) per group. Kept POSITIONAL:
         // `SELECT count(*), count(n)` yields two columns both named
         // `count`, so a name-keyed row silently drops one.
+        let all_keys: Vec<usize> = (0..agg.group_by.len()).collect();
         let mut groups: Vec<(Vec<Option<Bson>>, Vec<Bson>)> = keys
             .iter()
             .zip(buckets.iter())
-            .map(|(k, bucket)| {
-                let vals = agg
+            .enumerate()
+            .map(|(g, (k, bucket))| {
+                let mut vals = agg
                     .items
                     .iter()
                     .map(|item| compute_aggregate(item, bucket))
                     .collect::<PgWireResult<Vec<_>>>()?;
+                // Each `GROUPING(...)` value rides after the aggregates: bit
+                // `n-1-i` set when argument `i` is not in this group's set.
+                let set = group_sets.get(g).unwrap_or(&all_keys);
+                for args in &agg.groupings {
+                    let n = args.len();
+                    let bits = args
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, a)| !set.contains(a))
+                        .fold(0_i32, |acc, (i, _)| acc | (1 << (n - 1 - i)));
+                    vals.push(Bson::Int32(bits));
+                }
                 Ok((k.clone(), vals))
             })
             .collect::<PgWireResult<_>>()?;
@@ -2439,6 +2457,7 @@ impl PgHandler {
                         let v = match col {
                             OutputCol::Group(i) => key.get(*i).cloned().flatten(),
                             OutputCol::Agg(i) => vals.get(*i).cloned(),
+                            OutputCol::Grouping(g) => vals.get(agg.items.len() + *g).cloned(),
                             OutputCol::Expr(i) => {
                                 Self::aggregate_expr_value(agg, *i, &key, &vals).ok()
                             }
@@ -2479,6 +2498,7 @@ impl PgHandler {
                 let v = match col {
                     OutputCol::Group(i) => key[*i].clone().unwrap_or(Bson::Null),
                     OutputCol::Agg(i) => vals[*i].clone(),
+                    OutputCol::Grouping(g) => vals[agg.items.len() + *g].clone(),
                     OutputCol::Expr(i) => Self::aggregate_expr_value(agg, *i, &key, &vals)?,
                 };
                 doc.insert(name.clone(), v);
@@ -14896,6 +14916,7 @@ impl PgHandler {
                                     self.user_wire_type(t).unwrap_or_else(|| wire_type(t))
                                 }
                                 OutputCol::Agg(i) => aggregate_wire_type(&agg.items[*i]),
+                                OutputCol::Grouping(_) => Type::INT4,
                                 OutputCol::Expr(i) => {
                                     let t = secantus_pgplan::column_expr_type(&agg.exprs[*i]);
                                     self.user_wire_type(t).unwrap_or_else(|| wire_type(t))
@@ -14906,7 +14927,7 @@ impl PgHandler {
                             let typmod = match col {
                                 OutputCol::Agg(i) => aggregate_result_typmod(&agg.items[*i]),
                                 OutputCol::Group(i) => agg.group_by[*i].typmod,
-                                OutputCol::Expr(_) => -1,
+                                OutputCol::Expr(_) | OutputCol::Grouping(_) => -1,
                             };
                             self.field_mod(name.clone(), ty, typmod)
                         })
@@ -14925,6 +14946,9 @@ impl PgHandler {
                         let v = match col {
                             OutputCol::Group(i) => key[*i].clone().unwrap_or(Bson::Null),
                             OutputCol::Agg(i) => vals[*i].clone(),
+                            OutputCol::Grouping(g) => {
+                                vals.get(expr_agg.items.len() + *g).cloned().unwrap_or(Bson::Null)
+                            }
                             OutputCol::Expr(i) => {
                                 Self::aggregate_expr_value(&expr_agg, *i, &key, &vals)
                                     .unwrap_or(Bson::Null)
@@ -17409,7 +17433,7 @@ fn having_holds(having: &secantus_pgplan::Having, key: &[Option<Bson>], vals: &[
                 Some(v) => Some(v.clone()),
             },
             // `plan_having` only ever names an aggregate or a grouping key.
-            OutputCol::Expr(_) => None,
+            OutputCol::Expr(_) | OutputCol::Grouping(_) => None,
         }
     };
     match having {
@@ -20159,7 +20183,7 @@ impl PgHandler {
                 .map(|(name, col)| {
                     let ty = match col {
                         OutputCol::Agg(i) => aggregate_wire_type(&agg.items[*i]),
-                        OutputCol::Group(_) => Type::INT4,
+                        OutputCol::Group(_) | OutputCol::Grouping(_) => Type::INT4,
                         OutputCol::Expr(i) => {
                             let t = secantus_pgplan::column_expr_type(&agg.exprs[*i]);
                             self.user_wire_type(t).unwrap_or_else(|| wire_type(t))
@@ -20178,6 +20202,7 @@ impl PgHandler {
                             self.user_wire_type(t).unwrap_or_else(|| wire_type(t))
                         }
                         OutputCol::Agg(i) => aggregate_wire_type(&agg.items[*i]),
+                        OutputCol::Grouping(_) => Type::INT4,
                         OutputCol::Expr(i) => {
                             let t = secantus_pgplan::column_expr_type(&agg.exprs[*i]);
                             self.user_wire_type(t).unwrap_or_else(|| wire_type(t))
@@ -20186,7 +20211,7 @@ impl PgHandler {
                     let typmod = match col {
                         OutputCol::Agg(i) => aggregate_result_typmod(&agg.items[*i]),
                         OutputCol::Group(i) => agg.group_by[*i].typmod,
-                        OutputCol::Expr(_) => -1,
+                        OutputCol::Expr(_) | OutputCol::Grouping(_) => -1,
                     };
                     self.field_mod(name.clone(), ty, typmod)
                 })
