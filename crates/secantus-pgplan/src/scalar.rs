@@ -16,6 +16,7 @@ pub fn is_scalar(name: &str) -> bool {
         || CATALOG_NAMES.contains(&name)
         || crate::arrays::is_array_function(name)
         || extension_scalar(name).is_some()
+        || crate::fts::is_function(name)
 }
 
 /// Does this built-in's result type follow from its NAME alone?
@@ -85,6 +86,8 @@ fn extension_scalar(name: &str) -> Option<crate::ExtensionType> {
 }
 
 const SCALAR_NAMES: &[&str] = &[
+    "to_char",
+    "to_number",
     "gen_random_uuid",
     "uuid_generate_v4",
     "random",
@@ -379,6 +382,9 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
     if crate::arrays::is_array_function(name) {
         return crate::arrays::call(name, args);
     }
+    if let Some(out) = crate::fts::call(name, args) {
+        return out;
+    }
     if !matches!(
         name,
         "concat" | "concat_ws" | "greatest" | "least" | "format" | "quote_nullable"
@@ -400,6 +406,20 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp" => {
             need(0)?;
             Ok(now_value())
+        }
+        "to_char" => {
+            need(2)?;
+            match crate::formatting::to_char_value(&arg(0), &s(1), false) {
+                Some(out) => out.map(Bson::String),
+                None => Err(Error::Unsupported("to_char() of this type".into())),
+            }
+        }
+        "to_number" => {
+            need(2)?;
+            match crate::formatting::to_number(&s(0), &s(1))? {
+                Some(text) => crate::cast_value(Bson::String(text), "numeric"),
+                None => Ok(Bson::Null),
+            }
         }
         // A version-4 UUID: 122 random bits, the version nibble 4 and the
         // RFC 4122 variant bits.
@@ -1521,6 +1541,9 @@ pub fn static_result_type(name: &str) -> &'static str {
     if let Some(t) = crate::arrays::static_result_type(name) {
         return t;
     }
+    if let Some(t) = crate::fts::result_type(name) {
+        return t;
+    }
     match name {
         "gen_random_uuid" | "uuid_generate_v4" => "uuid",
         "random" => "float8",
@@ -1529,6 +1552,7 @@ pub fn static_result_type(name: &str) -> &'static str {
         "abs" | "ceil" | "ceiling" | "floor" | "round" | "trunc" | "mod" | "div" => "numeric",
         "sqrt" | "exp" | "ln" | "log" | "log10" | "power" | "pow" | "sign" => "float8",
         "starts_with" => "bool",
+        "to_number" => "numeric",
         "lpad" | "rpad" | "to_hex" | "translate" | "overlay" | "quote_literal"
         | "quote_nullable" | "unistr" | "convert_from" | "normalize" => "text",
         "regexp_split_to_array" => "text[]",

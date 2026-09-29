@@ -6210,6 +6210,13 @@ def _eval_fts_match(left: Any, right: Any) -> Any:
 
     left_v, left_q = _fts.is_tsvector(left), _fts.is_tsquery(left)
     right_v, right_q = _fts.is_tsvector(right), _fts.is_tsquery(right)
+    # A string opposite a tsquery is a document: a tsvector the Rust server
+    # stored as its canonical text, or plain `text @@ tsquery`, which
+    # PostgreSQL runs through to_tsvector first.
+    if right_q and isinstance(left, str):
+        left, left_v = _fts.text_as_tsvector(left), True
+    elif left_q and isinstance(right, str):
+        right, right_v = _fts.text_as_tsvector(right), True
     if not (left_v or left_q or right_v or right_q):
         return _NOT_FTS
     if left is None or right is None:

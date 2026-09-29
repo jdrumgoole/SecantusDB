@@ -7056,6 +7056,9 @@ fn wire_type(pg_type: &str) -> Type {
         "varchar" | "character varying" => Type::VARCHAR,
         "bpchar" | "char" | "character" => Type::BPCHAR,
         "name" => Type::NAME,
+        "tsvector" => Type::TS_VECTOR,
+        "tsquery" => Type::TSQUERY,
+        "regconfig" => Type::REGCONFIG,
         // Stored as canonical TEXT but reported with their real oids: a client
         // reading 1082/1083 parses the value into a date/time object, whereas
         // varchar hands it back as a string. Same shape as the text-vs-varchar
@@ -8958,12 +8961,20 @@ impl PgHandler {
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let notices: Vec<ErrorInfo> = std::mem::take(
+        let mut notices: Vec<ErrorInfo> = std::mem::take(
             &mut *self
                 .pending_notices
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()),
         );
+        // The planner's own notices (a stop-word-only text-search query).
+        // A statement is planned for Describe as well as Execute, so the
+        // same one is reported once.
+        let mut planner: Vec<String> = secantus_pgplan::fts::take_notices();
+        planner.dedup();
+        for msg in planner {
+            notices.push(ErrorInfo::new("NOTICE".into(), "00000".into(), msg));
+        }
         for info in notices {
             client
                 .send(PgWireBackendMessage::NoticeResponse(info.into()))
@@ -15693,6 +15704,12 @@ fn resolve_cell(
         .map_err(|e| PgHandler::err(&e))?;
         return Ok(Some(v));
     }
+    // A tsvector / tsquery the Python server wrote is a document.
+    if *datatype == Type::TS_VECTOR || *datatype == Type::TSQUERY {
+        if let Some(text) = doc.get(field).and_then(secantus_pgplan::fts::python_text) {
+            return Ok(Some(Bson::String(text)));
+        }
+    }
     let reassembled = if *datatype == Type::TIMESTAMPTZ {
         timestamptz_text(doc, field, tz)
     } else {
@@ -15748,6 +15765,12 @@ fn timestamptz_text(
 /// hand the encoder a millisecond-truncated `DateTime` and lose the last three
 /// digits of a `.ffffff` timestamp. Every other column is its value verbatim.
 fn copy_reassemble(d: &Document, field: &str, ty: &Type) -> Option<Bson> {
+    // A tsvector / tsquery the Python server wrote is a document.
+    if matches!(*ty, Type::TS_VECTOR | Type::TSQUERY) {
+        if let Some(text) = d.get(field).and_then(secantus_pgplan::fts::python_text) {
+            return Some(Bson::String(text));
+        }
+    }
     if matches!(*ty, Type::TIMESTAMP | Type::TIMESTAMPTZ) {
         if let Some(Bson::DateTime(dt)) = d.get(field) {
             let rem = match d.get(companion_field(field)) {

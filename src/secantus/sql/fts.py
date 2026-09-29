@@ -98,11 +98,27 @@ def is_tsvector(v: Any) -> bool:
     return isinstance(v, dict) and "tsvector" in v
 
 
+_CANONICAL_TSVECTOR_RE = re.compile(r"^'(?:[^']|'')*'(?::\d+[A-D]?(?:,\d+[A-D]?)*)?(?: '(?:[^']|'')*'(?::\d+[A-D]?(?:,\d+[A-D]?)*)?)*$")
+
+
+def text_as_tsvector(text: str) -> dict[str, Any]:
+    """A string on the document side of ``@@``: the canonical text of a stored
+    tsvector (what the Rust server writes) is parsed; anything else is plain
+    text, which ``text @@ tsquery`` indexes with ``to_tsvector``."""
+    if _CANONICAL_TSVECTOR_RE.match(text):
+        return parse_tsvector(text)
+    return to_tsvector(text)
+
+
 def is_tsquery(v: Any) -> bool:
     return isinstance(v, dict) and "tsquery" in v
 
 
 def tsvector_lexemes(v: Any) -> dict[str, list[int]]:
+    # The Rust server stores a tsvector as its canonical TEXT (weights and
+    # all); both servers share one store, so the text form is read too.
+    if isinstance(v, str):
+        return parse_tsvector(v)["tsvector"]
     return v.get("tsvector", {}) if isinstance(v, dict) else {}
 
 
@@ -130,7 +146,7 @@ def parse_tsvector(text: str) -> dict[str, Any]:
             pos_list = [int(p) for p in re.findall(r"\d+", poss)]
         else:
             lex, pos_list = token, []
-        lex = lex.strip().strip("'").lower()
+        lex = lex.strip().strip("'").replace("''", "'").lower()
         if not lex:
             continue
         positions.setdefault(lex, []).extend(pos_list)

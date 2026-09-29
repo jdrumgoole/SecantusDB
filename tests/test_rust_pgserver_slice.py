@@ -13446,3 +13446,42 @@ def test_triggers(home: Path) -> None:
             )
         cur.execute("SELECT (SELECT count(*) FROM tt WHERE id = 10), (SELECT count(*) FROM tlog)")
         assert cur.fetchone() == (0, 0)
+
+
+def test_full_text_search(home: Path) -> None:
+    """`tsvector` / `tsquery`: stemming, stop-words, phrases, weights and
+    ranking as PostgreSQL 14 answers them, a tsvector column searched with
+    `@@`, and the column read by the Python server over the same store --
+    and a Python-written one read back here."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT to_tsvector('english', 'The quick brown foxes jumped')")
+        assert cur.fetchone()[0] == "'brown':3 'fox':4 'jump':5 'quick':2"
+        assert cur.description[0].type_code == 3614
+        cur.execute("SELECT to_tsquery('english', 'fox <-> the <-> quick')")
+        assert cur.fetchone()[0] == "'fox' <2> 'quick'"
+        cur.execute(
+            "SELECT ts_rank(to_tsvector('english', 'The quick brown fox jumps over the lazy dog'), "
+            "to_tsquery('english', 'fox & dog'))"
+        )
+        assert cur.fetchone()[0] == pytest.approx(0.09148999)
+        cur.execute("CREATE TABLE docs (id int PRIMARY KEY, body text, tv tsvector)")
+        cur.execute(
+            "INSERT INTO docs VALUES (1, 'cats sat', to_tsvector('english', 'cats sat')), "
+            "(2, 'dogs ran', to_tsvector('english', 'dogs ran'))"
+        )
+        cur.execute("SELECT id FROM docs WHERE tv @@ to_tsquery('english', 'cat') ORDER BY id")
+        assert cur.fetchall() == [(1,)]
+        cur.execute("SELECT id FROM docs WHERE body @@ 'dogs' ORDER BY id")
+        assert cur.fetchall() == [(2,)]
+
+    assert _python_sql(
+        home, "SELECT id FROM docs WHERE tv @@ to_tsquery('english', 'dog') ORDER BY id"
+    ) == [(2,)]
+    _python_sql(home, "INSERT INTO docs VALUES (3, 'birds', to_tsvector('english', 'birds fly'))")
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT tv FROM docs WHERE id = 3")
+        assert cur.fetchone()[0] == "'bird':1 'fli':2"
+        cur.execute("SELECT id FROM docs WHERE tv @@ to_tsquery('english', 'bird') ORDER BY id")
+        assert cur.fetchall() == [(3,)]

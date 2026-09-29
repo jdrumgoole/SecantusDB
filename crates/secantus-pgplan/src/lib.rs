@@ -18,6 +18,8 @@ pub mod arrays;
 pub mod bytea;
 pub mod correlated;
 pub mod escape_strings;
+pub mod formatting;
+pub mod fts;
 pub mod geo;
 pub mod geometry;
 pub mod hstore;
@@ -7044,6 +7046,14 @@ fn plan_table_targets(
                 let field = def
                     .field_of(&column)
                     .ok_or_else(|| Error::UndefinedColumn(column.clone()))?;
+                // `length` of a tsvector counts its lexemes.
+                let name = if name == "length"
+                    && def.column(&column).is_some_and(|c| c.pg_type == "tsvector")
+                {
+                    "tsvector_length".to_string()
+                } else {
+                    name
+                };
                 let out = if rt.name.is_empty() {
                     name.clone()
                 } else {
@@ -10768,6 +10778,14 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
                 .find(|t| t.ends_with("[]"))
                 .unwrap_or_else(|| inferred_type(value).to_string())
         }
+        // The full-text functions each have one result type.
+        Some(N::FuncCall(f)) if func_name(f).as_deref().and_then(fts::result_type).is_some() => {
+            func_name(f)
+                .as_deref()
+                .and_then(fts::result_type)
+                .unwrap_or("text")
+                .to_string()
+        }
         // The array functions with a FIXED result type -- `array_length` is
         // `int4` whatever it is handed, `string_to_array` always `text[]`.
         Some(N::FuncCall(f))
@@ -10877,6 +10895,21 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
                 };
             }
             let op = operator_name(e).unwrap_or("");
+            // The full-text operators.
+            if matches!(op, "@@" | "@@@") {
+                return "bool".to_string();
+            }
+            if op == "!!" && e.lexpr.is_none() {
+                return "tsquery".to_string();
+            }
+            if matches!(op, "||" | "&&" | "<->") {
+                if let Some(l) = e.lexpr.as_deref() {
+                    let t = static_type(l, &Bson::Null);
+                    if t == "tsvector" || t == "tsquery" {
+                        return t;
+                    }
+                }
+            }
             // The hstore operators type from the operator and, for `->`,
             // from whether the RIGHT operand is a key or a key list.
             if static_hstore_operand(e.lexpr.as_deref(), &Bson::Null) {
@@ -11594,6 +11627,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 // branch below: those three are answered by the server when
                 // they stand alone, and folding them here would freeze a
                 // `current_setting` the session may still change.
+                let name = overload_name(f, name);
                 if scalar::is_scalar(&name) && !scalar::defers_to_connection(&name) {
                     let args = f
                         .args
@@ -11619,7 +11653,10 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                                 Some(n) => static_type(n, &value),
                                 None => inferred_type(&value).to_string(),
                             }
-                        } else if value == Bson::Null || declared == "timestamptz" {
+                        } else if value == Bson::Null
+                            || declared == "timestamptz"
+                            || fts::result_type(&name).is_some()
+                        {
                             declared.to_string()
                         } else {
                             inferred_type(&value).to_string()
@@ -15864,6 +15901,21 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
                 Error::InvalidText(format!("invalid input syntax for type uuid: \"{text}\""))
             })
         }
+        "tsvector" => Ok(Bson::String(fts::render_vector(&fts::parse_vector(
+            &as_text(&value),
+        )?))),
+        "tsquery" => Ok(Bson::String(fts::render_query(&fts::parse_query(
+            &as_text(&value),
+        )?))),
+        "regconfig" => {
+            let text = as_text(&value);
+            fts::config(&text)?;
+            Ok(Bson::String(
+                text.trim()
+                    .trim_start_matches("pg_catalog.")
+                    .to_ascii_lowercase(),
+            ))
+        }
         other => Err(Error::Unsupported(format!("a cast to {other}"))),
     }
 }
@@ -16458,6 +16510,95 @@ fn static_hstore_operand(n: Option<&pg_query::protobuf::Node>, value: &Bson) -> 
         return false;
     };
     static_type(n, value) == "hstore" && extension_type("hstore") == Some(ExtensionType::Hstore)
+}
+
+/// The built-in a call resolves to when its argument TYPES pick an
+/// overload the name alone does not: `length(tsvector)`.
+fn overload_name(f: &pg_query::protobuf::FuncCall, name: String) -> String {
+    if name == "length" && f.args.len() == 1 && static_type(&f.args[0], &Bson::Null) == "tsvector" {
+        return "tsvector_length".to_string();
+    }
+    name
+}
+
+/// Is `n` an untyped string literal or parameter -- a value PostgreSQL's
+/// operator resolution types from the OTHER operand?
+fn unknown_operand(n: Option<&pg_query::protobuf::Node>) -> bool {
+    match n.and_then(|x| x.node.as_ref()) {
+        Some(N::AConst(c)) => matches!(c.val.as_ref(), Some(a_const::Val::Sval(_))),
+        Some(N::ParamRef(p)) => {
+            declared_param_type(usize::try_from(p.number).unwrap_or(0)).is_none()
+        }
+        _ => false,
+    }
+}
+
+/// The full-text operators: `@@` / `@@@` (with `text` sides converted as
+/// PostgreSQL's `ts_match_tt` / `ts_match_tq` do), `||` / `&&` / `<->` on
+/// queries, `||` on vectors. `None`: not a full-text operation.
+fn fts_operator(e: &AExpr, op: &str, lhs: &Bson, rhs: &Bson) -> Option<Result<Bson>> {
+    if !matches!(op, "@@" | "@@@" | "||" | "&&" | "<->") {
+        return None;
+    }
+    let lt = e
+        .lexpr
+        .as_deref()
+        .map_or_else(String::new, |n| static_type(n, lhs));
+    let rt = e
+        .rexpr
+        .as_deref()
+        .map_or_else(String::new, |n| static_type(n, rhs));
+    let fts_type = |t: &str| t == "tsvector" || t == "tsquery";
+    if op != "@@" && op != "@@@" {
+        if !fts_type(&lt) {
+            return None;
+        }
+        if *lhs == Bson::Null || *rhs == Bson::Null {
+            return Some(Ok(Bson::Null));
+        }
+        return Some(fts::operator(op, &lt, lhs, rhs));
+    }
+    if !fts_type(&lt) && !fts_type(&rt) && !(lt == "text" || unknown_operand(e.lexpr.as_deref())) {
+        return None;
+    }
+    if *lhs == Bson::Null || *rhs == Bson::Null {
+        return Some(Ok(Bson::Null));
+    }
+    // The document side and the query side, with an untyped literal resolved
+    // as PostgreSQL resolves it among `tsvector @@ tsquery`,
+    // `text @@ tsquery` and `text @@ text`.
+    let (lu, ru) = (
+        unknown_operand(e.lexpr.as_deref()),
+        unknown_operand(e.rexpr.as_deref()),
+    );
+    let (doc, mut dt, du, query, mut qt, qu) = if lt == "tsquery" {
+        (rhs, rt, ru, lhs, lt, lu)
+    } else {
+        (lhs, lt, lu, rhs, rt, ru)
+    };
+    if qu {
+        qt = if dt == "tsvector" {
+            "tsquery".into()
+        } else {
+            "text".into()
+        };
+    }
+    if du {
+        dt = "text".into();
+    }
+    Some((|| {
+        let vector = if dt == "tsvector" {
+            fts::parse_vector(&fts::text_of(doc))?
+        } else {
+            fts::to_tsvector(fts::DEFAULT_CONFIG, &fts::text_of(doc))
+        };
+        let q = if qt == "tsquery" {
+            fts::parse_query(&fts::text_of(query))?
+        } else {
+            fts::plainto_tsquery(fts::DEFAULT_CONFIG, &fts::text_of(query))
+        };
+        Ok(Bson::Boolean(fts::matches(&vector, &q)))
+    })())
 }
 
 /// The result type of an hstore operator, or `None` for an operator this
@@ -18236,6 +18377,7 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             if let Some(result) = range_accessor_value(f, params) {
                 return result.map(|(value, _)| value);
             }
+            let name = overload_name(f, name);
             if scalar::is_scalar(&name) {
                 let args = f
                     .args
@@ -18555,6 +18697,8 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 }
                 "-" => Bson::Int32(0),
                 "+" => return Ok(rhs),
+                "!!" if rhs == Bson::Null => return Ok(Bson::Null),
+                "!!" => return fts::not_value(&rhs),
                 _ => return Err(Error::Unsupported(format!("unary {op}"))),
             },
         };
@@ -18573,6 +18717,11 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                     !(is_row_ctor(e.lexpr.as_deref()) && is_row_ctor(e.rexpr.as_deref()));
                 return record_compare(&op, a, b, composite);
             }
+        }
+        // Full-text search: `@@` between a document and a query, and the
+        // combining operators, told apart by the operands' STATIC types.
+        if let Some(out) = fts_operator(e, &op, &lhs, &rhs) {
+            return out;
         }
         // The hstore operators, like the json ones below, are told apart
         // from everything else by the left operand's STATIC type.
