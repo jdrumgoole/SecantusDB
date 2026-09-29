@@ -560,8 +560,9 @@ impl DatabaseRegistry {
 /// A password is stored as PostgreSQL stores it -- the SCRAM-SHA-256
 /// verifier `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>`,
 /// derived here from a plaintext `PASSWORD`, or kept verbatim when the
-/// client already sent a verifier (libpq's `PQchangePassword` does). It is
-/// recorded and never checked: every connection is trusted.
+/// client already sent a verifier (libpq's `PQchangePassword` does). A login
+/// as a role that has one is checked against it over SCRAM-SHA-256 (see
+/// `continue_password_login`).
 #[derive(Clone, Debug)]
 struct RoleInfo {
     oid: i64,
@@ -880,6 +881,9 @@ pub struct PgHandler {
     /// The value this session's most recent `nextval` / `setval` produced,
     /// whichever sequence it was, for `lastval()`.
     session_lastval: Mutex<Option<i64>>,
+    /// A password login in progress: the role, its stored credentials, and --
+    /// once the client's first SASL message arrived -- the SCRAM exchange.
+    auth: Mutex<Option<(String, secantus_auth::StoredCredentials, Option<secantus_auth::ScramState>)>>,
     /// User TYPES created or dropped in the open transaction but not yet
     /// committed -- the type analogue of `uncommitted`. Planning reads the
     /// type catalog (`to_regtype`, a column's declared type), and an
@@ -1139,6 +1143,7 @@ impl PgHandler {
             uncommitted: Mutex::new(HashMap::new()),
             session_currval: Mutex::new(HashMap::new()),
             session_lastval: Mutex::new(None),
+            auth: Mutex::new(None),
             uncommitted_types: Mutex::new(HashMap::new()),
             in_transaction: std::sync::atomic::AtomicBool::new(false),
             binary_results: std::sync::atomic::AtomicBool::new(false),
@@ -6522,6 +6527,10 @@ impl StartupHandler for PgHandler {
         C::Error: std::fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        // The client's replies in a SCRAM exchange arrive here too.
+        if let PgWireFrontendMessage::PasswordMessageFamily(pw) = message {
+            return self.continue_password_login(client, pw).await;
+        }
         let PgWireFrontendMessage::Startup(ref startup) = message else {
             return Ok(());
         };
@@ -6545,6 +6554,135 @@ impl StartupHandler for PgHandler {
             return Ok(());
         }
 
+        // A role that HAS a password must prove it -- SCRAM-SHA-256, as
+        // PostgreSQL's default `password_encryption` stores it. A role with
+        // none, or a user this server has never heard of, is trusted, which is
+        // what keeps every fixture connecting as a password-less `postgres`
+        // working (PostgreSQL's `trust` for those).
+        let user = client.metadata().get("user").cloned().unwrap_or_default();
+        if let Some(role) = self.role(&user)? {
+            if !role.canlogin {
+                return self
+                    .fail_login(client, "28000", format!("role \"{user}\" is not permitted to log in"))
+                    .await;
+            }
+            if let Some(verifier) = role.password.as_deref() {
+                let Some(creds) = scram_credentials(verifier) else {
+                    // An md5 verifier: this server speaks only SCRAM, and
+                    // PostgreSQL's scram-sha-256 method refuses one too.
+                    return self
+                        .fail_login(client, "28P01", format!("password authentication failed for user \"{user}\""))
+                        .await;
+                };
+                *self.auth.lock().unwrap_or_else(|e| e.into_inner()) = Some((user, creds, None));
+                client
+                    .send(PgWireBackendMessage::Authentication(
+                        pgwire::messages::startup::Authentication::SASL(vec!["SCRAM-SHA-256".into()]),
+                    ))
+                    .await?;
+                client.set_state(pgwire::api::PgWireConnectionState::AuthenticationInProgress);
+                return Ok(());
+            }
+        }
+        self.finish_startup(client).await
+    }
+}
+
+/// The SCRAM credentials in a stored `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>`
+/// verifier, or `None` for any other form (an md5 hash).
+fn scram_credentials(verifier: &str) -> Option<secantus_auth::StoredCredentials> {
+    let rest = verifier.strip_prefix("SCRAM-SHA-256$")?;
+    let (params, keys) = rest.split_once('$')?;
+    let (iterations, salt) = params.split_once(':')?;
+    let (stored, server) = keys.split_once(':')?;
+    secantus_auth::StoredCredentials::from_b64(iterations.parse().ok()?, salt, stored, server).ok()
+}
+
+impl PgHandler {
+    /// A login that failed: PostgreSQL's FATAL, and the connection closes.
+    async fn fail_login<C>(&self, client: &mut C, code: &str, message: String) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let info = ErrorInfo::new("FATAL".into(), code.into(), message);
+        client
+            .send(PgWireBackendMessage::ErrorResponse(info.into()))
+            .await?;
+        client.close().await?;
+        Ok(())
+    }
+
+    /// One client message of a SCRAM exchange: the client-first (answered
+    /// with the server-first), then the client-final (checked, and answered
+    /// with the server signature and the rest of the startup).
+    async fn continue_password_login<C>(
+        &self,
+        client: &mut C,
+        message: pgwire::messages::startup::PasswordMessageFamily,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        use pgwire::messages::startup::Authentication;
+        let pending = self.auth.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let Some((user, creds, scram)) = pending else {
+            return self
+                .fail_login(client, "08P01", "unexpected password message".into())
+                .await;
+        };
+        let failed = format!("password authentication failed for user \"{user}\"");
+        match scram {
+            None => {
+                let first = message.into_sasl_initial_response()?;
+                if first.auth_method != "SCRAM-SHA-256" {
+                    return self
+                        .fail_login(client, "28000", "selected SASL mechanism is not supported".into())
+                        .await;
+                }
+                let data = first.data.unwrap_or_default();
+                match secantus_auth::begin_scram_pg(&data, Some(creds.clone())) {
+                    Ok((server_first, state)) => {
+                        *self.auth.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some((user, creds, Some(state)));
+                        client
+                            .send(PgWireBackendMessage::Authentication(Authentication::SASLContinue(
+                                Bytes::from(server_first),
+                            )))
+                            .await?;
+                        Ok(())
+                    }
+                    Err(_) => self.fail_login(client, "08P01", "malformed SCRAM message".into()).await,
+                }
+            }
+            Some(mut state) => {
+                let last = message.into_sasl_response()?;
+                match secantus_auth::continue_scram(&mut state, &last.data) {
+                    Ok(server_final) => {
+                        client
+                            .send(PgWireBackendMessage::Authentication(Authentication::SASLFinal(
+                                Bytes::from(server_final),
+                            )))
+                            .await?;
+                        self.finish_startup(client).await
+                    }
+                    Err(_) => self.fail_login(client, "28P01", failed).await,
+                }
+            }
+        }
+    }
+
+    /// `AuthenticationOk`, the session's ParameterStatus values, and the first
+    /// `ReadyForQuery`: the end of a startup, trusted or authenticated.
+    async fn finish_startup<C>(&self, client: &mut C) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
         let (pid, secret_key) = PID_GENERATOR.generate(client);
         client.set_pid_and_secret_key(pid, secret_key);
         // The startup ParameterStatus values are the SESSION's settings, so
@@ -6569,9 +6707,7 @@ impl StartupHandler for PgHandler {
         client.set_state(pgwire::api::PgWireConnectionState::ReadyForQuery);
         Ok(())
     }
-}
 
-impl PgHandler {
     /// Binds this connection to the database the startup packet named.
     fn select_database(&self, name: &str) -> PgWireResult<()> {
         let fatal = |code: &str, message: String| {

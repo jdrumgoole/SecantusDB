@@ -13244,3 +13244,28 @@ def test_a_composite_primary_key_shares_the_pythons_layout(home: Path) -> None:
         assert cur.fetchall() == [(2, "z", 5)]
         with pytest.raises(psycopg.errors.UniqueViolation):
             cur.execute("INSERT INTO ck VALUES (2, 'z', 6)")
+
+
+def test_a_role_with_a_password_must_prove_it(home: Path) -> None:
+    """SCRAM-SHA-256 against the verifier `CREATE ROLE ... PASSWORD` stores.
+
+    Before this every connection was trusted, so a wrong password -- or none
+    -- connected as a password-protected role: an authentication bypass. A
+    role with no password, and a user the server has never heard of, are
+    still trusted, which is what every fixture connecting as a password-less
+    `postgres` relies on.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE ROLE alice LOGIN PASSWORD 's3cret'")
+        conn.execute("CREATE ROLE gate PASSWORD 'x'")
+        dsn = f"host=127.0.0.1 port={server.port} dbname=postgres connect_timeout=10"
+        with psycopg.connect(f"{dsn} user=alice password=s3cret") as ok:
+            assert ok.execute("SELECT current_user").fetchone() == ("alice",)
+        with pytest.raises(psycopg.OperationalError, match="password authentication failed"):
+            psycopg.connect(f"{dsn} user=alice password=wrong")
+        with pytest.raises(psycopg.OperationalError):
+            psycopg.connect(f"{dsn} user=alice")
+        with pytest.raises(psycopg.OperationalError, match="not permitted to log in"):
+            psycopg.connect(f"{dsn} user=gate password=x")
+        with psycopg.connect(f"{dsn} user=stranger") as trusted:
+            assert trusted.execute("SELECT 1").fetchone() == (1,)

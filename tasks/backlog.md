@@ -797,15 +797,17 @@ remain open:
       deletion is detected at the next `COMMIT PREPARED` by the first
       minted seq being readable (`prepared_already_committed`), not by a
       commit record.
-- [ ] **OPEN — RUST pgserver: role passwords are stored, never verified
-      (2026-09-17).** `CREATE / ALTER ROLE ... PASSWORD` records a
-      SCRAM-SHA-256 verifier in `pg_authid`, but the server still trusts
-      every connection (the startup handshake never challenges). Turning on
-      verification would break every gauge that connects as `user=postgres`
-      with no password, so it needs a `pg_hba`-style trust/scram switch
-      first; pgwire's SASL hooks make the SCRAM exchange itself cheap once
-      the policy exists. Role membership (`IN ROLE` / `ROLE` / `ADMIN`) and
-      `SYSID` are refused `0A000`.
+- [ ] **OPEN — RUST pgserver: role membership and md5 passwords (password
+      verification landed 2026-09-29).** A role WITH a password now has to
+      prove it over SCRAM-SHA-256 (`secantus_auth::begin_scram_pg`), and a
+      NOLOGIN role is refused `28000`. A role with no password, and a user the
+      server has never heard of, are still trusted -- that is what every
+      fixture connecting as a password-less `postgres` relies on, and it is a
+      deliberate `pg_hba`-free policy, not PostgreSQL's (which would refuse an
+      unknown role `28000`). Left: an md5-hashed password (a client can store
+      one verbatim) cannot log in at all, since only SCRAM is spoken; `VALID
+      UNTIL` is recorded and not enforced; and role membership (`IN ROLE` /
+      `ROLE` / `ADMIN`) and `SYSID` are refused `0A000`.
 - [ ] **OPEN — RUST pgserver: `DROP EXTENSION ... CASCADE` over a column of
       the extension's type (2026-09-17).** PG drops the dependent columns
       (`select h from hdep` is then `42703`); this server has no `ALTER
@@ -7438,15 +7440,6 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       current row was wrong on every row -- neither had such a frame. The
       cheap way to find what a corpus is blind to is to enumerate the axes it
       varies and write the combinations it skipped.
-
-- [ ] **OPEN — RUST pgserver: a wrong password still connects, CONFIRMED live
-      (2026-09-28).** The existing entry above records that `CREATE / ALTER ROLE
-      … PASSWORD` stores a SCRAM-SHA-256 verifier that is never checked. Probed
-      rather than inferred: created a role with a password, connected with a
-      deliberately wrong one, and ran `select 1` successfully. Noting the
-      confirmation because "stored, never verified" reads like a catalog gap,
-      and it is an authentication bypass — anyone pointing this server at
-      anything but a test fixture should know.
 
 - [x] ~~**Rust PG server: `numeric` DIVISION is refused (`0A000`).**~~ **FIXED
   — re-measured 2026-09-28** against a `secantusd-pg` built from `HEAD:crates`.
