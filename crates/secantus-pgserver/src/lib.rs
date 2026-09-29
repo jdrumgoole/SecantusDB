@@ -3804,10 +3804,12 @@ impl PgHandler {
         }
         let key = ix.get_document("key").ok()?;
         let mut cols = Vec::new();
-        let recorded: Option<Vec<String>> = ix
-            .get_array("sqlKeys")
-            .ok()
-            .map(|a| a.iter().filter_map(Bson::as_str).map(String::from).collect());
+        let recorded: Option<Vec<String>> = ix.get_array("sqlKeys").ok().map(|a| {
+            a.iter()
+                .filter_map(Bson::as_str)
+                .map(String::from)
+                .collect()
+        });
         for (field, dir) in key.iter().filter(|_| recorded.is_none()) {
             let col = t.columns.iter().find(|c| &c.field() == field)?;
             let desc = matches!(dir, Bson::Int32(-1) | Bson::Int64(-1))
@@ -4241,7 +4243,10 @@ impl PgHandler {
                             "23505".into(),
                             format!("could not create unique index \"{name}\""),
                         );
-                        info.detail = Some(format!("Key ({})=({text}) is duplicated.", ci.key_sql.join(", ")));
+                        info.detail = Some(format!(
+                            "Key ({})=({text}) is duplicated.",
+                            ci.key_sql.join(", ")
+                        ));
                         return Err(PgWireError::UserError(Box::new(info)));
                     }
                     seen.push((key, text));
@@ -4271,8 +4276,11 @@ impl PgHandler {
         row: &Document,
     ) -> PgWireResult<Option<(Vec<Bson>, String)>> {
         if let Ok(pred) = ix.get_str("sqlPredicate") {
-            let expr = secantus_pgplan::plan_check_expression(pred, def).map_err(|e| Self::err(&e))?;
-            if secantus_pgplan::apply_row_expr(&expr, row).map_err(|e| Self::err(&e))? != Bson::Boolean(true) {
+            let expr =
+                secantus_pgplan::plan_check_expression(pred, def).map_err(|e| Self::err(&e))?;
+            if secantus_pgplan::apply_row_expr(&expr, row).map_err(|e| Self::err(&e))?
+                != Bson::Boolean(true)
+            {
                 return Ok(None);
             }
         }
@@ -4303,7 +4311,9 @@ impl PgHandler {
             .list_indexes(self.db(), table)
             .map_err(|e| Self::storage_err("could not list the indexes", e))?
             .into_iter()
-            .filter(|ix| ix.get_bool("unique").unwrap_or(false) && ix.get_array("sqlExpressions").is_ok())
+            .filter(|ix| {
+                ix.get_bool("unique").unwrap_or(false) && ix.get_array("sqlExpressions").is_ok()
+            })
             .collect())
     }
 
@@ -4332,7 +4342,12 @@ impl PgHandler {
             let name = ix.get_str("name").unwrap_or_default();
             let keys: Vec<String> = ix
                 .get_array("sqlKeys")
-                .map(|a| a.iter().filter_map(Bson::as_str).map(String::from).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Bson::as_str)
+                        .map(String::from)
+                        .collect()
+                })
                 .unwrap_or_default();
             let mut taken: Vec<Vec<Bson>> = Vec::new();
             for row in &stored {
@@ -5143,7 +5158,11 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("datname", "name", false),
                     secantus_pgcatalog::Column::new("datdba", "oid", false),
                     secantus_pgcatalog::Column::new("encoding", "int4", false),
-                    secantus_pgcatalog::Column::new("datlocprovider", secantus_pgplan::QUOTED_CHAR, false),
+                    secantus_pgcatalog::Column::new(
+                        "datlocprovider",
+                        secantus_pgplan::QUOTED_CHAR,
+                        false,
+                    ),
                     secantus_pgcatalog::Column::new("datistemplate", "bool", false),
                     secantus_pgcatalog::Column::new("datallowconn", "bool", false),
                     secantus_pgcatalog::Column::new("datconnlimit", "int4", false),
@@ -7179,10 +7198,10 @@ fn default_settings() -> HashMap<String, String> {
         ("idle_session_timeout", "0"),
         ("application_name", ""),
         ("server_encoding", "UTF8"),
-        // A C-locale cluster: text compares by byte and case mapping is
-        // ASCII-only, which is what these report.
-        ("lc_collate", "C"),
-        ("lc_ctype", "C"),
+        // `C.UTF-8`: text sorts by code point (which, over UTF-8, is byte
+        // order -- this server's sort), and case maps Unicode letters.
+        ("lc_collate", "C.UTF-8"),
+        ("lc_ctype", "C.UTF-8"),
         ("lc_messages", "C"),
         ("lc_monetary", "C"),
         ("lc_numeric", "C"),
@@ -12200,7 +12219,9 @@ impl PgHandler {
         let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
         let on = |k: &str| settings.get(k).is_some_and(|v| v == "on");
         on("transaction_read_only")
-            || (!self.in_transaction.load(std::sync::atomic::Ordering::Relaxed)
+            || (!self
+                .in_transaction
+                .load(std::sync::atomic::Ordering::Relaxed)
                 && on("default_transaction_read_only"))
     }
 
@@ -12216,9 +12237,9 @@ impl PgHandler {
             Statement::Notify { .. } => "NOTIFY",
             Statement::CreateTable(..) => "CREATE TABLE",
             Statement::CreateTableAs { .. } => "CREATE TABLE AS",
-            Statement::AlterTable { .. } | Statement::RenameTable { .. } | Statement::RenameColumn { .. } => {
-                "ALTER TABLE"
-            }
+            Statement::AlterTable { .. }
+            | Statement::RenameTable { .. }
+            | Statement::RenameColumn { .. } => "ALTER TABLE",
             Statement::CreateSequence { .. } => "CREATE SEQUENCE",
             Statement::DropSequence { .. } => "DROP SEQUENCE",
             Statement::AlterSequence { .. } => "ALTER SEQUENCE",
@@ -12233,7 +12254,9 @@ impl PgHandler {
             | Statement::CreateComposite { .. }
             | Statement::CreateRange { .. } => "CREATE TYPE",
             Statement::DropType { .. } => "DROP TYPE",
-            Statement::CreateFunction { .. } | Statement::CreateUserFunction(..) => "CREATE FUNCTION",
+            Statement::CreateFunction { .. } | Statement::CreateUserFunction(..) => {
+                "CREATE FUNCTION"
+            }
             Statement::DropFunction { .. } => "DROP FUNCTION",
             Statement::CreateTrigger(..) => "CREATE TRIGGER",
             Statement::DropTrigger { .. } => "DROP TRIGGER",
@@ -13955,9 +13978,15 @@ impl PgHandler {
                         vec![explain::render_json(&tree, &options, actual)],
                     )
                 } else if options.format == "yaml" {
-                    (Type::TEXT, vec![explain::render_yaml(&tree, &options, actual)])
+                    (
+                        Type::TEXT,
+                        vec![explain::render_yaml(&tree, &options, actual)],
+                    )
                 } else if options.format == "xml" {
-                    (Type::XML, vec![explain::render_xml(&tree, &options, actual)])
+                    (
+                        Type::XML,
+                        vec![explain::render_xml(&tree, &options, actual)],
+                    )
                 } else {
                     (Type::TEXT, explain::render_text(&tree, &options, actual))
                 };
@@ -14961,9 +14990,10 @@ impl PgHandler {
                         let v = match col {
                             OutputCol::Group(i) => key[*i].clone().unwrap_or(Bson::Null),
                             OutputCol::Agg(i) => vals[*i].clone(),
-                            OutputCol::Grouping(g) => {
-                                vals.get(expr_agg.items.len() + *g).cloned().unwrap_or(Bson::Null)
-                            }
+                            OutputCol::Grouping(g) => vals
+                                .get(expr_agg.items.len() + *g)
+                                .cloned()
+                                .unwrap_or(Bson::Null),
                             OutputCol::Expr(i) => {
                                 Self::aggregate_expr_value(&expr_agg, *i, &key, &vals)
                                     .unwrap_or(Bson::Null)
@@ -15031,7 +15061,11 @@ impl PgHandler {
                 // (which is empty) and reported the rows matched -- an UPDATE
                 // that answered `UPDATE 1` and changed nothing.
                 let per_row = !upd.set_exprs.is_empty() || !upd.set_subscripts.is_empty();
-                let matched = if !per_row && !constrained && view_checks.is_empty() && upd.returning.is_none() {
+                let matched = if !per_row
+                    && !constrained
+                    && view_checks.is_empty()
+                    && upd.returning.is_none()
+                {
                     self.update_rows(&upd.table, &upd.filter, &upd.set, &upd.unset)?
                 } else {
                     // A SET list that reads the row (`num = num * 2`) is
@@ -15102,7 +15136,8 @@ impl PgHandler {
                     }
                     if let Some(def) = def.as_ref() {
                         self.check_foreign_keys(def, &new_rows)?;
-                        let replacing: Vec<Bson> = writes.iter().map(|(id, _, _)| id.clone()).collect();
+                        let replacing: Vec<Bson> =
+                            writes.iter().map(|(id, _, _)| id.clone()).collect();
                         self.check_expression_unique(def, &new_rows, &replacing)?;
                     }
                     if let (true, Some(def)) = (referenced, def.as_ref()) {

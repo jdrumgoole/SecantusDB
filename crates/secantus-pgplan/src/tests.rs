@@ -398,12 +398,12 @@ fn duplicate_aggregate_names_stay_distinct_columns() {
     }
 }
 
-/// ORDER BY over a column that is neither grouped nor aggregated is refused
-/// rather than silently ignored.
+/// ORDER BY over a column that is neither grouped nor aggregated is
+/// PostgreSQL's 42803, not a silent no-op.
 #[test]
 fn order_by_a_non_grouped_column_is_refused() {
     let err = plan("SELECT count(*) FROM t ORDER BY name", &lookup).expect_err("must refuse");
-    assert_eq!(err.sqlstate(), "0A000");
+    assert_eq!(err.sqlstate(), "42803");
 }
 
 #[test]

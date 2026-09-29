@@ -632,8 +632,8 @@ remain open:
       ...) are 0A000 rather than applied.
 - [ ] **OPEN — RUST pgserver: what triggers still refuse (2026-09-29).**
       Corpora `triggers` 0/41 and `triggers2` 0/44 against PostgreSQL 14.
-      Refused with 0A000: `INSTEAD OF` (needs writable views, which are
-      themselves refused), `CREATE CONSTRAINT TRIGGER` (and so deferred
+      Refused with 0A000: `INSTEAD OF` (simple views are writable since
+      2026-09-29 without one; a trigger for a NON-updatable view is not), `CREATE CONSTRAINT TRIGGER` (and so deferred
       firing), and `REFERENCING OLD/NEW TABLE` transition tables.
       **Cross-server:** the Python PG server
       fires only `BEFORE INSERT FOR EACH ROW` triggers, so it silently
@@ -657,6 +657,36 @@ remain open:
         can get an id PostgreSQL would number differently.
       - A malformed `to_date` / `to_timestamp` input that PostgreSQL reports
         as `22008` is `22007` in a few shapes (message text matches).
+- [ ] **OPEN — RUST pgserver: what batch 7 (UPDATE FROM, updatable views,
+      numeric math, bit strings, date/time input) leaves (2026-09-29).**
+      Corpora `dml_from`, `view_dml`, `expr_index`, `grouping_fn`, `gs_types`,
+      `agg_where`, `dt_input` (212 lines) and the numeric / catalog / misc /
+      transactions / views / indexes / defaults / explain / casts corpora at 0
+      against PostgreSQL 14. Left:
+      - An array operator does not check element types: `int4[] @> $1` with an
+        `int2[]` parameter answers where PostgreSQL says 42883 (`params`, 3
+        lines). Needs the parameter's declared array type at the operator.
+      - The `xml` type and `xmlelement` / `xmlforest` / ... are unimplemented.
+      - A CORRELATED subquery that aggregates an OUTER column inside HAVING
+        (`HAVING count(*) = (SELECT ... WHERE x = min(d.id))`) is refused.
+      - `array_fill` with explicit lower bounds (arrays here have no lower
+        bound other than 1).
+      - EXPLAIN's structured formats carry no `Filter` / `Hash Cond` /
+        `Join Type` / costs: the plan holds the lowered MQL filter, not SQL.
+      - An EXPRESSION index is an empty storage index (a synthetic key, a
+        partial filter nothing matches) plus its SQL; a MongoDB-side
+        `listIndexes` on that collection shows it. Its UNIQUE check scans the
+        table per write.
+      - Case mapping is Unicode-aware with the SIMPLE mapping, which matches a
+        UTF-8-locale PostgreSQL; this box's reference is `lc_ctype=C`, so
+        `lower('İ')` / `initcap('ßx')` still differ in `strings` (not a bug,
+        see the `strings` notes).
+      - Date/time input: the zone abbreviations are the fixed-offset subset
+        of PostgreSQL's `Default` set (no dynamic abbreviations like `MSK`
+        history), and `DecodeTimeOnly` (bare `time` input) is unchanged.
+      - **Python PG server: SQLAlchemy 2.1 reflection queries
+        `pg_catalog.pg_tablespace`**, which the Python server does not have
+        (three reflection tests fail under 2.1; CI pins 2.0.51).
 - [ ] **OPEN — RUST pgserver: a non-boolean constant WHERE over
       `generate_series` carries no error POSITION (2026-09-09).** `select 1
       from generate_series(1,3) where 1` is `42804 argument of WHERE must be
@@ -6967,7 +6997,7 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       | ~~`ALTER TABLE`, any form~~ | **DONE 2026-09-28**, incl. RENAME | `USING`, and ADD of a UNIQUE/PK/FK |
       | ~~`CREATE VIEW`~~ | **DONE 2026-09-29** | read-only: writes through a view refused |
       | ~~`CREATE TRIGGER`~~ | **DONE 2026-09-29** | BEFORE/AFTER, ROW/STATEMENT, WHEN, UPDATE OF; INSTEAD OF, constraint triggers and REFERENCING tables refused |
-      | ~~`EXPLAIN`~~ | **DONE 2026-09-29** | plan SHAPE, zero costs; FORMAT YAML/XML refused |
+      | ~~`EXPLAIN`~~ | **DONE 2026-09-29** | plan SHAPE, zero costs; all four FORMATs; no Filter / Join details in the structured formats |
       | ~~composite `PRIMARY KEY`~~ / multi-col `FOREIGN KEY` | **PK DONE 2026-09-29** | multi-column FK still refused |
       | ~~non-literal column `DEFAULT`~~ | **DONE 2026-09-29** | evaluated per row; `column_default` renders a folded constant, not PostgreSQL's `(1 + 2)` |
 
@@ -7179,9 +7209,9 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       * ~~`GROUPING SETS` / `ROLLUP`~~ — **IMPLEMENTED 2026-09-28**, with
         `CUBE`. Each set groups on its own keys and NULL-pads the rest; sets
         concatenate in order and duplicates are kept, as PostgreSQL has it.
-        12/13 against PostgreSQL 14.13 (`gs_probe`); the one difference is the
-        `GROUPING()` function, refused `0A000` BY NAME because it needs the
-        producing set carried through the group. A multi-key set `(a,b)` parses
+        13/13 against PostgreSQL 14.13 (`gs_probe`) since `GROUPING()` landed
+        2026-09-29 (each group carries the set that produced it; corpus
+        `grouping_fn` 0/15). A multi-key set `(a,b)` parses
         as a `RowExpr`, not a nested `GroupingSet` — assuming otherwise dropped
         `b` from the keys and reproduced the original 42803.
 
@@ -7597,11 +7627,6 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   answers rows. Matching it needs the parameters' DECLARED OIDS threaded into
   the planner, which today sees only decoded values; every other argument shape
   matches (19-case probe, 2026-09-05).
-- **Rust PG server: `generate_series` over `numeric` is refused (`0A000`).**
-  PostgreSQL has a `generate_series(numeric, numeric [, numeric])` overload, so
-  `generate_series(1, 3, 0.5)` walks by halves there and is refused here. The
-  series carries `i64` bounds; a numeric series needs decimal bounds and a
-  decimal-valued output column.
 - **Rust PG server: a SAVEPOINT captures whole tables, so its cost is the size
   of what the block writes.** WiredTiger has no savepoint, so one here is a set
   of pre-images: the first write to a table after a savepoint copies that

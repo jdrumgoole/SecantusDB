@@ -3433,7 +3433,10 @@ fn ruleutils_default(node: &pg_query::protobuf::Node) -> Option<String> {
             _ => None,
         }
     }
-    if matches!(node.node.as_ref(), Some(N::AConst(_)) | Some(N::TypeCast(_))) {
+    if matches!(
+        node.node.as_ref(),
+        Some(N::AConst(_)) | Some(N::TypeCast(_))
+    ) {
         return None;
     }
     render(node)
@@ -3792,7 +3795,10 @@ fn plan_create_index(
                 sample.insert(c.field(), sample_value_for_type(&c.pg_type));
             }
             if let Err(Error::Unsupported(msg)) = apply_row_expr(&planned, &sample) {
-                if let Some(name) = msg.strip_prefix("function ").and_then(|m| m.split('(').next()) {
+                if let Some(name) = msg
+                    .strip_prefix("function ")
+                    .and_then(|m| m.split('(').next())
+                {
                     let mut types = Vec::new();
                     let mut probe = expr.clone();
                     walk_expr(&mut probe, &mut |n| {
@@ -6611,7 +6617,11 @@ fn non_integer_series_kind(f: &pg_query::protobuf::FuncCall) -> Option<&'static 
     if has("timestamp") {
         return Some("timestamp");
     }
-    if has("numeric") || f.args.get(2).is_some_and(|a| static_type(a, &Bson::Null) == "numeric") {
+    if has("numeric")
+        || f.args
+            .get(2)
+            .is_some_and(|a| static_type(a, &Bson::Null) == "numeric")
+    {
         return Some("numeric");
     }
     None
@@ -6639,7 +6649,10 @@ fn series_rows(
     }
     let zero_step = || Error::InvalidParameter("step size cannot equal zero".into());
     if kind == "numeric" {
-        let text = |v: &Bson| numeric::numeric_operand_text(v).ok_or_else(|| Error::Unsupported("this generate_series argument".into()));
+        let text = |v: &Bson| {
+            numeric::numeric_operand_text(v)
+                .ok_or_else(|| Error::Unsupported("this generate_series argument".into()))
+        };
         let (start, stop) = (text(&vals[0])?, text(&vals[1])?);
         let step = match vals.get(2) {
             Some(v) => text(v)?,
@@ -6647,10 +6660,14 @@ fn series_rows(
         };
         for (what, t) in [("start", &start), ("stop", &stop), ("step size", &step)] {
             if t == "NaN" {
-                return Err(Error::InvalidParameter(format!("{what} value cannot be NaN")));
+                return Err(Error::InvalidParameter(format!(
+                    "{what} value cannot be NaN"
+                )));
             }
             if t.ends_with("Infinity") {
-                return Err(Error::InvalidParameter(format!("{what} value cannot be infinity")));
+                return Err(Error::InvalidParameter(format!(
+                    "{what} value cannot be infinity"
+                )));
             }
         }
         let sign = compare_decimal_text(&step, "0").unwrap_or(std::cmp::Ordering::Equal);
@@ -6660,7 +6677,11 @@ fn series_rows(
         let mut cur = start;
         loop {
             let ord = compare_decimal_text(&cur, &stop).unwrap_or(std::cmp::Ordering::Equal);
-            let within = if sign == std::cmp::Ordering::Greater { ord.is_le() } else { ord.is_ge() };
+            let within = if sign == std::cmp::Ordering::Greater {
+                ord.is_le()
+            } else {
+                ord.is_ge()
+            };
             if !within || rows.len() >= MAX_ROWS {
                 break;
             }
@@ -7111,7 +7132,9 @@ pub(crate) fn fit_length(v: Bson, pg_type: &str, typmod: i32) -> Result<Bson> {
     }
     if typmod > 4 && matches!(pg_type, "numeric" | "decimal") && is_numeric(&v) {
         let text = numeric_text(&v).unwrap_or_default();
-        return Ok(numeric::numeric_bson(&numeric::apply_numeric_typmod(&text, typmod)?));
+        return Ok(numeric::numeric_bson(&numeric::apply_numeric_typmod(
+            &text, typmod,
+        )?));
     }
     if typmod <= 4 || !matches!(pg_type, "bpchar" | "varchar") {
         return Ok(v);
@@ -8635,7 +8658,10 @@ fn rewrite_dml_from(
     node: &mut pg_query::protobuf::Node,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
 ) -> Result<()> {
-    fn sublink(kind: SubLinkType, select: pg_query::protobuf::SelectStmt) -> pg_query::protobuf::Node {
+    fn sublink(
+        kind: SubLinkType,
+        select: pg_query::protobuf::SelectStmt,
+    ) -> pg_query::protobuf::Node {
         pg_query::protobuf::Node {
             node: Some(N::SubLink(Box::new(pg_query::protobuf::SubLink {
                 sub_link_type: kind as i32,
@@ -8745,7 +8771,8 @@ fn rewrite_dml_from(
                         [.., q, col] if target_names.iter().any(|t| t == q) => Some(*col),
                         _ => None,
                     };
-                    cond_reads_changed |= target_column.is_some_and(|c| changed.iter().any(|x| x == c));
+                    cond_reads_changed |=
+                        target_column.is_some_and(|c| changed.iter().any(|x| x == c));
                 }
                 Ok(())
             })?;
@@ -8818,7 +8845,10 @@ fn rewrite_dml_from(
                     "number of columns does not match number of values".into(),
                 ));
             }
-            let Some(item) = usize::try_from(m.colno - 1).ok().and_then(|i| row.args.get(i)) else {
+            let Some(item) = usize::try_from(m.colno - 1)
+                .ok()
+                .and_then(|i| row.args.get(i))
+            else {
                 continue;
             };
             rt.val = Some(Box::new(item.clone()));
@@ -8912,7 +8942,9 @@ fn from_item_columns(
     lookup: &dyn Fn(&str) -> Option<TableDef>,
 ) -> Option<Vec<String>> {
     match item.node.as_ref()? {
-        N::RangeVar(r) => lookup(&r.relname).map(|d| d.columns.iter().map(|c| c.name.clone()).collect()),
+        N::RangeVar(r) => {
+            lookup(&r.relname).map(|d| d.columns.iter().map(|c| c.name.clone()).collect())
+        }
         N::RangeSubselect(rs) => {
             if let Some(a) = rs.alias.as_ref().filter(|a| !a.colnames.is_empty()) {
                 return Some(
@@ -8925,7 +8957,8 @@ fn from_item_columns(
                         .collect(),
                 );
             }
-            let Some(N::SelectStmt(s)) = rs.subquery.as_deref().and_then(|q| q.node.as_ref()) else {
+            let Some(N::SelectStmt(s)) = rs.subquery.as_deref().and_then(|q| q.node.as_ref())
+            else {
                 return None;
             };
             Some(
@@ -8933,13 +8966,17 @@ fn from_item_columns(
                     .iter()
                     .filter_map(|t| match t.node.as_ref() {
                         Some(N::ResTarget(rt)) if !rt.name.is_empty() => Some(rt.name.clone()),
-                        Some(N::ResTarget(rt)) => match rt.val.as_deref().and_then(|v| v.node.as_ref()) {
-                            Some(N::ColumnRef(c)) => match c.fields.last().and_then(|f| f.node.as_ref()) {
-                                Some(N::String(s)) => Some(s.sval.clone()),
+                        Some(N::ResTarget(rt)) => {
+                            match rt.val.as_deref().and_then(|v| v.node.as_ref()) {
+                                Some(N::ColumnRef(c)) => {
+                                    match c.fields.last().and_then(|f| f.node.as_ref()) {
+                                        Some(N::String(s)) => Some(s.sval.clone()),
+                                        _ => None,
+                                    }
+                                }
                                 _ => None,
-                            },
-                            _ => None,
-                        },
+                            }
+                        }
                         _ => None,
                     })
                     .collect(),
@@ -9952,7 +9989,8 @@ fn plan_select_rest(
             if matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()), Some(N::GroupingFunc(_))))
     }) {
         return Err(Error::Grouping(
-            "arguments to GROUPING must be grouping expressions of the associated query level".into(),
+            "arguments to GROUPING must be grouping expressions of the associated query level"
+                .into(),
         ));
     }
     // A window function in a WHERE is an ERROR in PostgreSQL, not a filter --
@@ -10399,7 +10437,9 @@ fn plan_aggregate_sorted_outside(
         let by_output = match node.node.as_ref() {
             Some(N::AConst(c)) => match &c.val {
                 Some(a_const::Val::Ival(i)) => {
-                    let n = usize::try_from(i.ival).ok().filter(|n| (1..=aliases.len()).contains(n));
+                    let n = usize::try_from(i.ival)
+                        .ok()
+                        .filter(|n| (1..=aliases.len()).contains(n));
                     Some(n.ok_or_else(|| {
                         Error::InvalidColumnReference(format!(
                             "ORDER BY position {} is not in select list",
@@ -10431,16 +10471,18 @@ fn plan_aggregate_sorted_outside(
     let outer = pg_query::protobuf::SelectStmt {
         target_list: outer_targets,
         from_clause: vec![pg_query::protobuf::Node {
-            node: Some(N::RangeSubselect(Box::new(pg_query::protobuf::RangeSubselect {
-                lateral: false,
-                subquery: Some(Box::new(pg_query::protobuf::Node {
-                    node: Some(N::SelectStmt(Box::new(inner))),
-                })),
-                alias: Some(pg_query::protobuf::Alias {
-                    aliasname: "__agg".into(),
-                    colnames: Vec::new(),
-                }),
-            }))),
+            node: Some(N::RangeSubselect(Box::new(
+                pg_query::protobuf::RangeSubselect {
+                    lateral: false,
+                    subquery: Some(Box::new(pg_query::protobuf::Node {
+                        node: Some(N::SelectStmt(Box::new(inner))),
+                    })),
+                    alias: Some(pg_query::protobuf::Alias {
+                        aliasname: "__agg".into(),
+                        colnames: Vec::new(),
+                    }),
+                },
+            ))),
         }],
         sort_clause: outer_sort,
         limit_count: s.limit_count.clone(),
@@ -10504,13 +10546,15 @@ fn plan_aggregate_direct(
                 let mut outer = s.clone();
                 outer.where_clause = None;
                 outer.from_clause = vec![pg_query::protobuf::Node {
-                    node: Some(N::RangeSubselect(Box::new(pg_query::protobuf::RangeSubselect {
-                        lateral: false,
-                        subquery: Some(Box::new(pg_query::protobuf::Node {
-                            node: Some(N::SelectStmt(Box::new(inner))),
-                        })),
-                        alias: Some(alias),
-                    }))),
+                    node: Some(N::RangeSubselect(Box::new(
+                        pg_query::protobuf::RangeSubselect {
+                            lateral: false,
+                            subquery: Some(Box::new(pg_query::protobuf::Node {
+                                node: Some(N::SelectStmt(Box::new(inner))),
+                            })),
+                            alias: Some(alias),
+                        },
+                    ))),
                 }];
                 return plan_aggregate(&outer, lookup, params);
             }
@@ -11431,8 +11475,11 @@ fn finish_aggregate(
             for a in &g.args {
                 let print = node_print(a);
                 let by_name = match a.node.as_ref() {
-                    Some(N::ColumnRef(c)) => column_ref_name(c)
-                        .and_then(|n| group_by.iter().position(|k| k.expr.is_none() && k.name == n)),
+                    Some(N::ColumnRef(c)) => column_ref_name(c).and_then(|n| {
+                        group_by
+                            .iter()
+                            .position(|k| k.expr.is_none() && k.name == n)
+                    }),
                     _ => None,
                 };
                 let idx = group_prints.iter().position(|p| *p == print).or(by_name).ok_or_else(|| {
@@ -12252,14 +12299,17 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
 /// `x IS TRUE` is `coalesce(x, false)`, `x IS NOT FALSE` `coalesce(x, true)`,
 /// `x IS FALSE` `coalesce(not x, false)`, `x IS NOT TRUE` `coalesce(not x,
 /// true)`, and `IS [NOT] UNKNOWN` is `IS [NOT] NULL`.
-fn boolean_test_equivalent(t: &pg_query::protobuf::BooleanTest) -> Result<pg_query::protobuf::Node> {
+fn boolean_test_equivalent(
+    t: &pg_query::protobuf::BooleanTest,
+) -> Result<pg_query::protobuf::Node> {
     use pg_query::protobuf::BoolTestType as B;
     let arg = t
         .arg
         .as_deref()
         .cloned()
         .ok_or_else(|| Error::Parse("IS TRUE with no operand".into()))?;
-    let kind = B::try_from(t.booltesttype).map_err(|_| Error::Unsupported("this IS test".into()))?;
+    let kind =
+        B::try_from(t.booltesttype).map_err(|_| Error::Unsupported("this IS test".into()))?;
     let node = |n: N| pg_query::protobuf::Node { node: Some(n) };
     let not = |a: pg_query::protobuf::Node| {
         node(N::BoolExpr(Box::new(pg_query::protobuf::BoolExpr {
@@ -12270,11 +12320,13 @@ fn boolean_test_equivalent(t: &pg_query::protobuf::BooleanTest) -> Result<pg_que
         })))
     };
     let coalesce = |a: pg_query::protobuf::Node, b: bool| {
-        node(N::CoalesceExpr(Box::new(pg_query::protobuf::CoalesceExpr {
-            args: vec![a, bool_const_node(b)],
-            location: -1,
-            ..Default::default()
-        })))
+        node(N::CoalesceExpr(Box::new(
+            pg_query::protobuf::CoalesceExpr {
+                args: vec![a, bool_const_node(b)],
+                location: -1,
+                ..Default::default()
+            },
+        )))
     };
     let null_test = |a: pg_query::protobuf::Node, t: NullTestType| {
         node(N::NullTest(Box::new(pg_query::protobuf::NullTest {
@@ -12299,10 +12351,7 @@ fn boolean_test_equivalent(t: &pg_query::protobuf::BooleanTest) -> Result<pg_que
 /// means none, a fraction rounds (`LIMIT 2.5` is 3, as the int8 cast
 /// rounds), and a negative one is refused -- `2201W` / `2201X`, which an
 /// empty result used to stand in for.
-fn limit_offset(
-    s: &pg_query::protobuf::SelectStmt,
-    params: &[Bson],
-) -> Result<(Option<i64>, i64)> {
+fn limit_offset(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> Result<(Option<i64>, i64)> {
     let value = |n: &pg_query::protobuf::Node, what: &str| -> Result<Option<i64>> {
         Ok(match const_value(n, params)? {
             Bson::Null => None,
@@ -12323,14 +12372,20 @@ fn limit_offset(
         None => None,
     };
     if limit.is_some_and(|l| l < 0) {
-        return Err(Error::Sqlstate("2201W", "LIMIT must not be negative".into()));
+        return Err(Error::Sqlstate(
+            "2201W",
+            "LIMIT must not be negative".into(),
+        ));
     }
     let offset = match s.limit_offset.as_deref() {
         Some(n) => value(n, "OFFSET")?.unwrap_or(0),
         None => 0,
     };
     if offset < 0 {
-        return Err(Error::Sqlstate("2201X", "OFFSET must not be negative".into()));
+        return Err(Error::Sqlstate(
+            "2201X",
+            "OFFSET must not be negative".into(),
+        ));
     }
     Ok((limit, offset))
 }
@@ -13613,7 +13668,9 @@ fn parse_date(text: &str) -> Result<String> {
         NaiveDate::parse_from_str(t, "%Y-%m-%d")
     };
     let parsed = parsed.or_else(|e| match decode_general(t, "date") {
-        Ok(GeneralDateTime::At(_, _, _, d)) if (1..=9999).contains(&chrono::Datelike::year(&d)) => Ok(d),
+        Ok(GeneralDateTime::At(_, _, _, d)) if (1..=9999).contains(&chrono::Datelike::year(&d)) => {
+            Ok(d)
+        }
         _ => Err(e),
     });
     if parsed.is_err() {
@@ -13624,7 +13681,8 @@ fn parse_date(text: &str) -> Result<String> {
             Ok(GeneralDateTime::NegInfinity) => return Ok("-infinity".to_string()),
             Ok(GeneralDateTime::Now) => {
                 let now = instant_micros(&scalar::now_value()).unwrap_or(0);
-                let local = now + i64::from(session_timezone().offset_at(now).local_minus_utc()) * 1_000_000;
+                let local = now
+                    + i64::from(session_timezone().offset_at(now).local_minus_utc()) * 1_000_000;
                 if let Some(d) = chrono::DateTime::from_timestamp_micros(local) {
                     return Ok(render_date_pg(d.date_naive()));
                 }
@@ -13684,15 +13742,20 @@ fn decode_general(text: &str, type_name: &str) -> Result<GeneralDateTime> {
     let date = match p.relative_day {
         Some(delta) => {
             let now = instant_micros(&scalar::now_value()).unwrap_or(0);
-            let local = now + i64::from(session_timezone().offset_at(now).local_minus_utc()) * 1_000_000;
+            let local =
+                now + i64::from(session_timezone().offset_at(now).local_minus_utc()) * 1_000_000;
             chrono::DateTime::from_timestamp_micros(local)
                 .map(|d| d.date_naive() + chrono::Duration::days(delta))
         }
         None => NaiveDate::from_ymd_opt(p.year, p.month, p.day),
     }
-    .ok_or_else(|| Error::DatetimeFieldOverflow(format!("date/time field value out of range: \"{text}\"")))?;
-    let time = NaiveTime::from_hms_opt(p.hour.min(23), p.minute, p.second.min(59))
-        .ok_or_else(|| Error::DatetimeFieldOverflow(format!("date/time field value out of range: \"{text}\"")))?;
+    .ok_or_else(|| {
+        Error::DatetimeFieldOverflow(format!("date/time field value out of range: \"{text}\""))
+    })?;
+    let time =
+        NaiveTime::from_hms_opt(p.hour.min(23), p.minute, p.second.min(59)).ok_or_else(|| {
+            Error::DatetimeFieldOverflow(format!("date/time field value out of range: \"{text}\""))
+        })?;
     let mut at = date.and_time(time) + chrono::Duration::microseconds(p.micros);
     // 24:00:00 and a leap second are both the NEXT instant, as PostgreSQL has them.
     if p.hour == 24 {
@@ -13701,12 +13764,13 @@ fn decode_general(text: &str, type_name: &str) -> Result<GeneralDateTime> {
     if p.second == 60 {
         at += chrono::Duration::seconds(1);
     }
-    let zone = match p.zone.as_deref() {
-        Some(z) => Some(dtparse::resolve_zone(z).ok_or_else(|| {
-            Error::InvalidParameter(format!("time zone \"{z}\" not recognized"))
-        })?),
-        None => None,
-    };
+    let zone =
+        match p.zone.as_deref() {
+            Some(z) => Some(dtparse::resolve_zone(z).ok_or_else(|| {
+                Error::InvalidParameter(format!("time zone \"{z}\" not recognized"))
+            })?),
+            None => None,
+        };
     Ok(GeneralDateTime::At(at, p.offset, zone, date))
 }
 
@@ -13726,7 +13790,11 @@ fn wide_timestamp_text(at: &NaiveDateTime) -> Option<String> {
         time.push('.');
         time.push_str(frac.trim_end_matches('0'));
     }
-    Some(format!("{year:04}-{:02}-{:02} {time}{bc}", at.month(), at.day()))
+    Some(format!(
+        "{year:04}-{:02}-{:02} {time}{bc}",
+        at.month(),
+        at.day()
+    ))
 }
 
 /// Render a `NaiveDate` in PostgreSQL's ISO `date` text, including the eras a
@@ -14756,8 +14824,8 @@ pub(crate) fn parse_timestamp(text: &str) -> Result<i64> {
                 .expect("the epoch")),
             Ok(GeneralDateTime::Now) => {
                 let now = instant_micros(&scalar::now_value()).unwrap_or(0);
-                let local =
-                    now + i64::from(session_timezone().offset_at(now).local_minus_utc()) * 1_000_000;
+                let local = now
+                    + i64::from(session_timezone().offset_at(now).local_minus_utc()) * 1_000_000;
                 chrono::DateTime::from_timestamp_micros(local)
                     .map(|d| d.naive_utc())
                     .ok_or(e)
@@ -14847,13 +14915,24 @@ impl TimeZoneSetting {
                     .unwrap_or_default()
                     .naive_utc();
                 // A local time can be ambiguous (the hour DST repeats) or absent
-                // (the hour it skips). PostgreSQL takes the EARLIER offset for an
-                // ambiguous reading, which is what `earliest()` gives.
-                tz.from_local_datetime(&naive)
-                    .earliest()
-                    .or_else(|| tz.from_local_datetime(&naive).latest())
-                    .map(|d| d.offset().fix())
-                    .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).expect("zero is valid"))
+                // (the hour it skips). PostgreSQL's DetermineTimeZoneOffset
+                // picks, in BOTH cases, the offset further WEST of the two
+                // either side of the transition -- measured: under New York,
+                // `2020-11-01 01:30` is -05 (the repeated hour's second
+                // reading) and `2020-03-08 02:30` is -05 too (03:30-04).
+                match tz.from_local_datetime(&naive) {
+                    chrono::LocalResult::Single(d) => d.offset().fix(),
+                    _ => {
+                        let day = chrono::Duration::days(1);
+                        let before = tz.offset_from_utc_datetime(&(naive - day)).fix();
+                        let after = tz.offset_from_utc_datetime(&(naive + day)).fix();
+                        if before.local_minus_utc() <= after.local_minus_utc() {
+                            before
+                        } else {
+                            after
+                        }
+                    }
+                }
             }
         }
     }
@@ -15032,14 +15111,6 @@ pub fn render_date_styled(iso: &str, ds: &DateStyle) -> String {
     format!("{a}{sep}{b}{sep}{ye}{era}")
 }
 
-/// Render a canonical ISO timestamp (`render_timestamp`' output:
-/// `YYYY-MM-DD HH:MM:SS[.frac][ BC]`) in the given `DateStyle`. The time part
-/// (and any fractional seconds) is untouched; only the date is restyled, and
-/// Postgres style also gains a day-of-week and spelled-out month:
-/// - ISO: `2026-09-08 12:34:56.789`
-/// - Postgres: `Tue Sep 08 12:34:56.789 2026` (MDY) / `Tue 08 Sep ... 2026` (DMY)
-/// - SQL: `09/08/2026 12:34:56.789`
-/// - German: `08.09.2026 12:34:56.789`
 /// A BC or wide-year `timestamptz`, carried as its text, rendered with the
 /// session zone's offset before any era: `2020-01-05 00:00:00+00 BC`. The
 /// offset is the zone's at the nearest instant the zone database covers (for
@@ -15069,6 +15140,14 @@ pub fn wide_timestamptz_text(text: &str, tz: &TimeZoneSetting) -> String {
     format!("{core}{}{era}", render_offset(offset))
 }
 
+/// Render a canonical ISO timestamp (`render_timestamp`' output:
+/// `YYYY-MM-DD HH:MM:SS[.frac][ BC]`) in the given `DateStyle`. The time part
+/// (and any fractional seconds) is untouched; only the date is restyled, and
+/// Postgres style also gains a day-of-week and spelled-out month:
+/// - ISO: `2026-09-08 12:34:56.789`
+/// - Postgres: `Tue Sep 08 12:34:56.789 2026` (MDY) / `Tue 08 Sep ... 2026` (DMY)
+/// - SQL: `09/08/2026 12:34:56.789`
+/// - German: `08.09.2026 12:34:56.789`
 pub fn render_timestamp_styled(iso: &str, ds: &DateStyle) -> String {
     if ds.format == DateStyleFormat::Iso {
         return iso.to_string();
@@ -15918,7 +15997,9 @@ fn parse_timestamptz(text: &str, tz: &TimeZoneSetting) -> Result<i64> {
             let local = at.and_utc().timestamp_micros();
             let seconds = match (offset, zone) {
                 (Some(s), _) => s,
-                (None, Some(z)) => TimeZoneSetting::Named(z).offset_for_local(local).local_minus_utc(),
+                (None, Some(z)) => TimeZoneSetting::Named(z)
+                    .offset_for_local(local)
+                    .local_minus_utc(),
                 (None, None) => tz.offset_for_local(local).local_minus_utc(),
             };
             return Ok(local - i64::from(seconds) * 1_000_000);
@@ -17423,7 +17504,9 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
             // so its range error quotes that text; float8 -> float4 does not.
             let source_text = is_numeric(&value).then(|| numeric_text(&value)).flatten();
             let range = |which: &str| match &source_text {
-                Some(t) => Error::NumericOutOfRange(format!("\"{t}\" is out of range for type real")),
+                Some(t) => {
+                    Error::NumericOutOfRange(format!("\"{t}\" is out of range for type real"))
+                }
                 None => Error::NumericOutOfRange(format!("value out of range: {which}")),
             };
             match cast_value_inner(value, "float8")? {
@@ -20405,7 +20488,9 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 .map(declared_typmod)
                 .and_then(|m| usize::try_from(m).ok());
             let raw = match &value {
-                Bson::Int32(i) if target == "bit" => bits::from_int(i64::from(*i), 32, n.unwrap_or(1)),
+                Bson::Int32(i) if target == "bit" => {
+                    bits::from_int(i64::from(*i), 32, n.unwrap_or(1))
+                }
                 Bson::Int64(i) if target == "bit" => bits::from_int(*i, 64, n.unwrap_or(1)),
                 Bson::Int32(_) | Bson::Int64(_) => {
                     return Err(Error::CannotCoerce(format!(
@@ -20449,7 +20534,10 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             && static_type(arg, &value) == "timestamptz"
         {
             if let Bson::String(t) = &value {
-                return cast_value(Bson::String(wide_timestamptz_text(t, &session_timezone())), &target);
+                return cast_value(
+                    Bson::String(wide_timestamptz_text(t, &session_timezone())),
+                    &target,
+                );
             }
         }
         // A float4 renders as float4out does: the shortest text of the f32.
@@ -20481,7 +20569,9 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             let typmod = declared_typmod(tn);
             if typmod > 4 && target == "numeric" && is_numeric(&out) {
                 let text = numeric_text(&out).unwrap_or_default();
-                return Ok(numeric::numeric_bson(&numeric::apply_numeric_typmod(&text, typmod)?));
+                return Ok(numeric::numeric_bson(&numeric::apply_numeric_typmod(
+                    &text, typmod,
+                )?));
             }
         }
         return Ok(out);
@@ -20638,7 +20728,9 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
         // GRANT), so every role holds every privilege -- which is the true
         // answer here. The privilege names are still validated, and a table
         // must exist, as on PostgreSQL.
-        if let Some(name) = func_name(f).filter(|n| n.starts_with("has_") && n.ends_with("_privilege")) {
+        if let Some(name) =
+            func_name(f).filter(|n| n.starts_with("has_") && n.ends_with("_privilege"))
+        {
             let args = f
                 .args
                 .iter()
@@ -20653,9 +20745,21 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 let p = p.strip_suffix(" WITH GRANT OPTION").unwrap_or(&p).trim();
                 if !matches!(
                     p,
-                    "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "TRUNCATE" | "REFERENCES"
-                        | "TRIGGER" | "USAGE" | "CREATE" | "CONNECT" | "TEMPORARY" | "TEMP"
-                        | "EXECUTE" | "SET" | "ALTER SYSTEM"
+                    "SELECT"
+                        | "INSERT"
+                        | "UPDATE"
+                        | "DELETE"
+                        | "TRUNCATE"
+                        | "REFERENCES"
+                        | "TRIGGER"
+                        | "USAGE"
+                        | "CREATE"
+                        | "CONNECT"
+                        | "TEMPORARY"
+                        | "TEMP"
+                        | "EXECUTE"
+                        | "SET"
+                        | "ALTER SYSTEM"
                 ) {
                     return Err(Error::InvalidParameter(format!(
                         "unrecognized privilege type: \"{}\"",
@@ -20663,8 +20767,13 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                     )));
                 }
             }
-            if matches!(name.as_str(), "has_table_privilege" | "has_column_privilege") {
-                let table = &args[args.len().saturating_sub(if name == "has_column_privilege" { 3 } else { 2 })];
+            if matches!(
+                name.as_str(),
+                "has_table_privilege" | "has_column_privilege"
+            ) {
+                let table = &args[args
+                    .len()
+                    .saturating_sub(if name == "has_column_privilege" { 3 } else { 2 })];
                 if let Bson::String(t) = table {
                     resolve_regclass(t)?;
                 }
@@ -20857,7 +20966,10 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                     .result
                     .as_deref()
                     .ok_or_else(|| Error::Parse("CASE WHEN with no result".into()))?;
-                return to_common_type(const_value(result, params)?, &common_type(&case_results(c)));
+                return to_common_type(
+                    const_value(result, params)?,
+                    &common_type(&case_results(c)),
+                );
             }
         }
         return match c.defresult.as_deref() {

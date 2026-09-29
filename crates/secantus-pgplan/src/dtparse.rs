@@ -106,9 +106,9 @@ fn to_error(f: Fail, text: &str, type_name: &str) -> Error {
         Fail::BadFormat => Error::InvalidDatetimeFormat(format!(
             "invalid input syntax for type {type_name}: \"{text}\""
         )),
-        Fail::FieldOverflow | Fail::MdFieldOverflow => Error::DatetimeFieldOverflow(format!(
-            "date/time field value out of range: \"{text}\""
-        )),
+        Fail::FieldOverflow | Fail::MdFieldOverflow => {
+            Error::DatetimeFieldOverflow(format!("date/time field value out of range: \"{text}\""))
+        }
         Fail::TzOverflow => Error::Sqlstate(
             "22009",
             format!("time zone displacement out of range: \"{text}\""),
@@ -145,7 +145,11 @@ fn parse_fields(text: &str) -> std::result::Result<Vec<(String, Ftype)>, Fail> {
                 f.push(delim);
                 i += 1;
                 if i < cs.len() && cs[i].is_ascii_digit() {
-                    let mut k = if delim == '.' { Ftype::Number } else { Ftype::Date };
+                    let mut k = if delim == '.' {
+                        Ftype::Number
+                    } else {
+                        Ftype::Date
+                    };
                     while i < cs.len() && cs[i].is_ascii_digit() {
                         f.push(cs[i]);
                         i += 1;
@@ -197,7 +201,8 @@ fn parse_fields(text: &str) -> std::result::Result<Vec<(String, Ftype)>, Fail> {
                     f.push(lower(cs[i]));
                     i += 1;
                     if !(i < cs.len()
-                        && (matches!(cs[i], '+' | '-' | '/' | '_' | '.' | ':') || cs[i].is_ascii_alphanumeric()))
+                        && (matches!(cs[i], '+' | '-' | '/' | '_' | '.' | ':')
+                            || cs[i].is_ascii_alphanumeric()))
                     {
                         break;
                     }
@@ -398,7 +403,8 @@ fn decode_time(s: &str, tm: &mut Tm) -> std::result::Result<u32, Fail> {
     } else {
         return Err(Fail::BadFormat);
     }
-    if tm.hour < 0 || tm.min < 0 || tm.min > 59 || tm.sec < 0 || tm.sec > 60 || tm.fsec > 1_000_000 {
+    if tm.hour < 0 || tm.min < 0 || tm.min > 59 || tm.sec < 0 || tm.sec > 60 || tm.fsec > 1_000_000
+    {
         return Err(Fail::FieldOverflow);
     }
     Ok(TIME_M)
@@ -441,13 +447,17 @@ fn decode_number_field(
 ) -> std::result::Result<u32, Fail> {
     let mut str_ = s.to_string();
     if let Some(dot) = s.find('.') {
-        let frac: f64 = format!("0{}", &s[dot..]).parse().map_err(|_| Fail::BadFormat)?;
+        let frac: f64 = format!("0{}", &s[dot..])
+            .parse()
+            .map_err(|_| Fail::BadFormat)?;
         tm.fsec = (frac * 1_000_000.0).round() as i64;
         str_.truncate(dot);
     } else if fmask & DATE_M != DATE_M && str_.len() >= 6 {
         let len = str_.len();
         tm.mday = str_[len - 2..].parse().map_err(|_| Fail::BadFormat)?;
-        tm.mon = str_[len - 4..len - 2].parse().map_err(|_| Fail::BadFormat)?;
+        tm.mon = str_[len - 4..len - 2]
+            .parse()
+            .map_err(|_| Fail::BadFormat)?;
         tm.year = str_[..len - 4].parse().map_err(|_| Fail::BadFormat)?;
         if len - 4 == 2 {
             *is2digits = true;
@@ -668,7 +678,11 @@ fn j2date(jd: i64) -> (i32, i32, i32) {
     quad = julian / 1461;
     julian -= quad * 1461;
     let mut y = julian * 4 / 1461;
-    julian = if y != 0 { (julian + 305) % 365 } else { (julian + 306) % 366 } + 123;
+    julian = if y != 0 {
+        (julian + 305) % 365
+    } else {
+        (julian + 306) % 366
+    } + 123;
     y += quad * 4;
     let year = y - 4800;
     quad = julian * 2141 / 65536;
@@ -713,7 +727,9 @@ fn validate_date(
     if fmask & DAY != 0 && !(1..=31).contains(&tm.mday) {
         return Err(Fail::MdFieldOverflow);
     }
-    if fmask & DATE_M == DATE_M && tm.mday > DAYS[usize::from(is_leap(tm.year))][(tm.mon - 1) as usize] {
+    if fmask & DATE_M == DATE_M
+        && tm.mday > DAYS[usize::from(is_leap(tm.year))][(tm.mon - 1) as usize]
+    {
         return Err(Fail::FieldOverflow);
     }
     Ok(())
@@ -850,7 +866,8 @@ fn decode(text: &str) -> std::result::Result<Parsed, Fail> {
                             isjulian = true;
                             let mut m_ = DATE_M;
                             if rest.starts_with('.') {
-                                let frac: f64 = format!("0{rest}").parse().map_err(|_| Fail::BadFormat)?;
+                                let frac: f64 =
+                                    format!("0{rest}").parse().map_err(|_| Fail::BadFormat)?;
                                 let us = (frac * 86_400_000_000.0).round() as i64;
                                 tm.hour = (us / 3_600_000_000) as i32;
                                 tm.min = ((us / 60_000_000) % 60) as i32;
@@ -861,7 +878,8 @@ fn decode(text: &str) -> std::result::Result<Parsed, Fail> {
                             m_
                         }
                         U_TIME => {
-                            let m = decode_number_field(f, fmask | DATE_M, &mut tm, &mut is2digits)?;
+                            let m =
+                                decode_number_field(f, fmask | DATE_M, &mut tm, &mut is2digits)?;
                             if m != TIME_M {
                                 return Err(Fail::BadFormat);
                             }
@@ -928,7 +946,11 @@ fn decode(text: &str) -> std::result::Result<Parsed, Fail> {
                 }
                 Some(Tok::Month(m)) => {
                     let mut t = MONTH;
-                    if fmask & MONTH != 0 && !have_text_month && fmask & DAY == 0 && (1..=31).contains(&tm.mon) {
+                    if fmask & MONTH != 0
+                        && !have_text_month
+                        && fmask & DAY == 0
+                        && (1..=31).contains(&tm.mon)
+                    {
                         tm.mday = tm.mon;
                         t = DAY;
                     }
@@ -960,7 +982,9 @@ fn decode(text: &str) -> std::result::Result<Parsed, Fail> {
                     if fmask & DATE_M != DATE_M {
                         return Err(Fail::BadFormat);
                     }
-                    if i + 1 >= nf || !matches!(fields[i + 1].1, Ftype::Number | Ftype::Time | Ftype::Date) {
+                    if i + 1 >= nf
+                        || !matches!(fields[i + 1].1, Ftype::Number | Ftype::Time | Ftype::Date)
+                    {
                         return Err(Fail::BadFormat);
                     }
                     ptype = U_TIME;
@@ -1015,6 +1039,14 @@ fn decode(text: &str) -> std::result::Result<Parsed, Fail> {
     out.micros = tm.fsec;
     out.offset = tz;
     Ok(out)
+}
+
+/// A time zone ABBREVIATION's offset in seconds east (`est` is -18000).
+pub fn abbreviation_offset(name: &str) -> Option<i32> {
+    match keyword(&name.to_ascii_lowercase()) {
+        Some(Tok::Tz(v)) | Some(Tok::Dtz(v)) => Some(v),
+        _ => None,
+    }
 }
 
 fn chrono_tz_known(name: &str) -> bool {

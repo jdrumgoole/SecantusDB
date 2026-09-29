@@ -140,7 +140,8 @@ fn unwrap_column_list(body: pg_query::protobuf::SelectStmt) -> pg_query::protobu
     }
     let mut inner = (**inner).clone();
     for (t, name) in inner.target_list.iter_mut().zip(&alias.colnames) {
-        if let (Some(N::ResTarget(rt)), Some(N::String(s))) = (t.node.as_mut(), name.node.as_ref()) {
+        if let (Some(N::ResTarget(rt)), Some(N::String(s))) = (t.node.as_mut(), name.node.as_ref())
+        {
             rt.name = s.sval.clone();
         }
     }
@@ -194,7 +195,10 @@ fn view_columns(
             continue;
         };
         if let Some(N::ColumnRef(c)) = val.node.as_ref() {
-            if matches!(c.fields.last().and_then(|f| f.node.as_ref()), Some(N::AStar(_))) {
+            if matches!(
+                c.fields.last().and_then(|f| f.node.as_ref()),
+                Some(N::AStar(_))
+            ) {
                 let def = lookup(base).ok_or_else(|| Error::UndefinedTable(base.to_string()))?;
                 for col in &def.columns {
                     out.push(ViewColumn {
@@ -208,7 +212,11 @@ fn view_columns(
             if let Some(parts) = ref_parts(c) {
                 let col = parts.last().cloned().unwrap_or_default();
                 out.push(ViewColumn {
-                    name: if rt.name.is_empty() { col.clone() } else { rt.name.clone() },
+                    name: if rt.name.is_empty() {
+                        col.clone()
+                    } else {
+                        rt.name.clone()
+                    },
                     expr: column_ref(&[col.as_str()]),
                     base: Some(col),
                 });
@@ -230,7 +238,10 @@ fn view_columns(
 
 /// Qualify every column reference in `expr` by `qualifier` (the base
 /// relation's name or alias), dropping whatever qualifier it had.
-fn qualify(mut expr: pg_query::protobuf::Node, qualifier: &str) -> Result<pg_query::protobuf::Node> {
+fn qualify(
+    mut expr: pg_query::protobuf::Node,
+    qualifier: &str,
+) -> Result<pg_query::protobuf::Node> {
     walk_expr(&mut expr, &mut |n| {
         if let Some(N::ColumnRef(c)) = n.node.as_ref() {
             if let Some(parts) = ref_parts(c) {
@@ -271,7 +282,10 @@ fn substitute(
     })
 }
 
-fn and(a: Option<pg_query::protobuf::Node>, b: Option<pg_query::protobuf::Node>) -> Option<Box<pg_query::protobuf::Node>> {
+fn and(
+    a: Option<pg_query::protobuf::Node>,
+    b: Option<pg_query::protobuf::Node>,
+) -> Option<Box<pg_query::protobuf::Node>> {
     match (a, b) {
         (Some(a), Some(b)) => Some(Box::new(pg_query::protobuf::Node {
             node: Some(N::BoolExpr(Box::new(pg_query::protobuf::BoolExpr {
@@ -333,7 +347,10 @@ pub(crate) fn rewrite(
         };
         let body = unwrap_column_list(*body);
         if not_updatable(&body).is_some() {
-            return Err(Error::Sqlstate("55000", format!("cannot {verb} view \"{view}\"")));
+            return Err(Error::Sqlstate(
+                "55000",
+                format!("cannot {verb} view \"{view}\""),
+            ));
         }
         let kind = check_kind(&view);
         let Some(N::RangeVar(base)) = body.from_clause[0].node.clone() else {
@@ -381,10 +398,12 @@ pub(crate) fn rewrite(
                     // Positional: the first N view columns, N the width of
                     // what is inserted.
                     let width = match i.select_stmt.as_deref().and_then(|s| s.node.as_ref()) {
-                        Some(N::SelectStmt(s)) if !s.values_lists.is_empty() => match s.values_lists[0].node.as_ref() {
-                            Some(N::List(l)) => l.items.len(),
-                            _ => columns.len(),
-                        },
+                        Some(N::SelectStmt(s)) if !s.values_lists.is_empty() => {
+                            match s.values_lists[0].node.as_ref() {
+                                Some(N::List(l)) => l.items.len(),
+                                _ => columns.len(),
+                            }
+                        }
                         Some(N::SelectStmt(s)) => s.target_list.len(),
                         _ => 0,
                     };
@@ -408,7 +427,9 @@ pub(crate) fn rewrite(
                         if let Some(v) = rt.val.as_deref_mut() {
                             if rt.name.is_empty() {
                                 if let Some(N::ColumnRef(c)) = v.node.as_ref() {
-                                    rt.name = ref_parts(c).and_then(|p| p.last().cloned()).unwrap_or_default();
+                                    rt.name = ref_parts(c)
+                                        .and_then(|p| p.last().cloned())
+                                        .unwrap_or_default();
                                 }
                             }
                             substitute(v, &columns, &view_names, &qualifier)?;
@@ -436,7 +457,9 @@ pub(crate) fn rewrite(
                         if let Some(v) = rt.val.as_deref_mut() {
                             if rt.name.is_empty() {
                                 if let Some(N::ColumnRef(c)) = v.node.as_ref() {
-                                    rt.name = ref_parts(c).and_then(|p| p.last().cloned()).unwrap_or_default();
+                                    rt.name = ref_parts(c)
+                                        .and_then(|p| p.last().cloned())
+                                        .unwrap_or_default();
                                 }
                             }
                             substitute(v, &columns, &view_names, &qualifier)?;
@@ -456,7 +479,9 @@ pub(crate) fn rewrite(
                         if let Some(v) = rt.val.as_deref_mut() {
                             if rt.name.is_empty() {
                                 if let Some(N::ColumnRef(c)) = v.node.as_ref() {
-                                    rt.name = ref_parts(c).and_then(|p| p.last().cloned()).unwrap_or_default();
+                                    rt.name = ref_parts(c)
+                                        .and_then(|p| p.last().cloned())
+                                        .unwrap_or_default();
                                 }
                             }
                             substitute(v, &columns, &view_names, &qualifier)?;

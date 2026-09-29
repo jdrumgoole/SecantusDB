@@ -74,11 +74,17 @@ pub fn fit_assignment(bits: &str, ty: &str, n: Option<usize>) -> Result<String> 
     match (ty, n) {
         ("bit", Some(n)) if bits.len() != n => Err(Error::Sqlstate(
             "22026",
-            format!("bit string length {} does not match type bit({n})", bits.len()),
+            format!(
+                "bit string length {} does not match type bit({n})",
+                bits.len()
+            ),
         )),
         ("bit", None) if bits.len() != 1 => Err(Error::Sqlstate(
             "22026",
-            format!("bit string length {} does not match type bit(1)", bits.len()),
+            format!(
+                "bit string length {} does not match type bit(1)",
+                bits.len()
+            ),
         )),
         (_, Some(n)) if ty != "bit" && bits.len() > n => Err(Error::Sqlstate(
             "22001",
@@ -113,7 +119,12 @@ pub fn from_int(v: i64, width: usize, n: usize) -> String {
 pub fn to_int(bits: &str, width: usize) -> Result<i64> {
     if bits.len() > width {
         return Err(Error::NumericOutOfRange(
-            (if width == 32 { "integer out of range" } else { "bigint out of range" }).into(),
+            (if width == 32 {
+                "integer out of range"
+            } else {
+                "bigint out of range"
+            })
+            .into(),
         ));
     }
     let mut u: u64 = 0;
@@ -214,7 +225,10 @@ pub fn call(name: &str, args: &[Bson]) -> Option<Result<Bson>> {
             if i < 0 || i >= b.len() as i64 {
                 return Some(Err(Error::Sqlstate(
                     "2202E",
-                    format!("bit index {i} out of valid range (0..{})", b.len() as i64 - 1),
+                    format!(
+                        "bit index {i} out of valid range (0..{})",
+                        b.len() as i64 - 1
+                    ),
                 )));
             }
             Bson::Int32(i32::from(b.as_bytes()[i as usize] == b'1'))
@@ -226,7 +240,10 @@ pub fn call(name: &str, args: &[Bson]) -> Option<Result<Bson>> {
             if i < 0 || i >= b.len() as i64 {
                 return Some(Err(Error::Sqlstate(
                     "2202E",
-                    format!("bit index {i} out of valid range (0..{})", b.len() as i64 - 1),
+                    format!(
+                        "bit index {i} out of valid range (0..{})",
+                        b.len() as i64 - 1
+                    ),
                 )));
             }
             if v != 0 && v != 1 {
@@ -251,7 +268,11 @@ pub fn call(name: &str, args: &[Bson]) -> Option<Result<Bson>> {
         ("substring" | "substr", 2 | 3) => {
             let b = s(0);
             let start = int(1)?;
-            let len = if args.len() == 3 { int(2)? } else { i64::MAX / 4 };
+            let len = if args.len() == 3 {
+                int(2)?
+            } else {
+                i64::MAX / 4
+            };
             if len < 0 {
                 return Some(Err(Error::Sqlstate(
                     "22011",
@@ -269,7 +290,11 @@ pub fn call(name: &str, args: &[Bson]) -> Option<Result<Bson>> {
         ("overlay", 3 | 4) => {
             let (b, p) = (s(0), s(1));
             let from = int(2)?;
-            let len = if args.len() == 4 { int(3)? } else { p.len() as i64 };
+            let len = if args.len() == 4 {
+                int(3)?
+            } else {
+                p.len() as i64
+            };
             let from = from.max(1) as usize;
             let head: String = b.chars().take(from - 1).collect();
             let tail: String = b.chars().skip(from - 1 + len.max(0) as usize).collect();
@@ -311,7 +336,11 @@ pub fn from_wire(bytes: &[u8]) -> Option<String> {
     (0..n)
         .map(|i| {
             let byte = *data.get(i / 8)?;
-            Some(if byte & (0x80 >> (i % 8)) != 0 { '1' } else { '0' })
+            Some(if byte & (0x80 >> (i % 8)) != 0 {
+                '1'
+            } else {
+                '0'
+            })
         })
         .collect()
 }

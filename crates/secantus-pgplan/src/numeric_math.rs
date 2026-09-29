@@ -14,6 +14,11 @@
 //! digits too and rounds once, so both land on the correctly rounded result.
 //! `sqrt` and an integer `power` are exact.
 
+// PostgreSQL's own literals (`0.434294481903252`, `2.302585092994046`) are
+// kept verbatim: they decide result scales, and `LOG10_E` is not the same
+// double as `0.434294481903252`.
+#![allow(clippy::approx_constant)]
+
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive, Zero};
 
@@ -187,7 +192,10 @@ fn ln_fixed(d: &Dec, w: u32) -> BigInt {
 
 /// `exp(x)` for a fixed-point `x` (scale `s`), rounded to `rscale` places.
 fn exp_fixed(x: &BigInt, s: u32, rscale: u32) -> Result<Dec> {
-    let xf = round_to(x, s, 17.min(s)).render().parse::<f64>().unwrap_or(0.0);
+    let xf = round_to(x, s, 17.min(s))
+        .render()
+        .parse::<f64>()
+        .unwrap_or(0.0);
     if xf > MAX_RESULT_SCALE * 3.0 * 2.302585092994046 / 0.999 {
         return Err(overflow());
     }
@@ -262,7 +270,11 @@ fn check_log_arg(x: &Dec) -> Result<()> {
 fn ln(x: &Dec) -> Result<String> {
     check_log_arg(x)?;
     let rscale = clamp_scale((MIN_SIG_DIGITS - estimate_ln_dweight(x)).max(i64::from(x.scale)));
-    render(&round_to(&ln_fixed(x, rscale + GUARD), rscale + GUARD, rscale))
+    render(&round_to(
+        &ln_fixed(x, rscale + GUARD),
+        rscale + GUARD,
+        rscale,
+    ))
 }
 
 /// `log_var`: `log(base, num)`, with its own scale rule.
@@ -484,7 +496,15 @@ pub fn numeric_send(canonical: &str) -> Vec<u8> {
 pub fn is_function(name: &str) -> bool {
     matches!(
         name,
-        "sqrt" | "exp" | "ln" | "log" | "log10" | "power" | "pow" | "scale" | "min_scale"
+        "sqrt"
+            | "exp"
+            | "ln"
+            | "log"
+            | "log10"
+            | "power"
+            | "pow"
+            | "scale"
+            | "min_scale"
             | "trim_scale"
     )
 }
@@ -505,9 +525,9 @@ fn non_finite(name: &str, args: &[String]) -> Option<Result<String>> {
     };
     let one = |s: &str| Dec::parse(s).is_some_and(|d| cmp(&d, &dec(1, 0)).is_eq());
     match (name, args) {
-        ("sqrt", [a]) if a == "-Infinity" => {
-            Some(Err(power_error("cannot take square root of a negative number")))
-        }
+        ("sqrt", [a]) if a == "-Infinity" => Some(Err(power_error(
+            "cannot take square root of a negative number",
+        ))),
         ("sqrt" | "ln", [a]) if a == "-Infinity" && name == "ln" => {
             Some(Err(log_error("cannot take logarithm of a negative number")))
         }
@@ -531,14 +551,20 @@ fn non_finite(name: &str, args: &[String]) -> Option<Result<String>> {
         }
         ("power", [x, y]) => {
             if x == "NaN" {
-                return ok(if !special(y) && sign(y) == 0 { "1" } else { "NaN" });
+                return ok(if !special(y) && sign(y) == 0 {
+                    "1"
+                } else {
+                    "NaN"
+                });
             }
             if y == "NaN" {
                 return ok(if !special(x) && one(x) { "1" } else { "NaN" });
             }
             let (s1, s2) = (sign(x), sign(y));
             if s1 == 0 && s2 < 0 {
-                return Some(Err(power_error("zero raised to a negative power is undefined")));
+                return Some(Err(power_error(
+                    "zero raised to a negative power is undefined",
+                )));
             }
             let y_integral = special(y) || Dec::parse(y).is_some_and(|d| is_integral(&d));
             if s1 < 0 && !y_integral {
@@ -568,7 +594,11 @@ fn non_finite(name: &str, args: &[String]) -> Option<Result<String>> {
                 if !special(x) && Dec::parse(x).is_some_and(|d| cmp(&d, &dec(-1, 0)).is_eq()) {
                     return ok("1");
                 }
-                return ok(if abs_gt_one == (s2 > 0) { "Infinity" } else { "0" });
+                return ok(if abs_gt_one == (s2 > 0) {
+                    "Infinity"
+                } else {
+                    "0"
+                });
             }
             if x == "Infinity" {
                 return ok(if s2 > 0 { "Infinity" } else { "0" });

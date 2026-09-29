@@ -501,6 +501,28 @@ one request path:
       and text casts. `octet_length` / `concat` / `format` see the padding;
       most other functions do not.
 
+    **Batch 7 (2026-09-29)** closed two silent-write bugs and a run of gaps.
+    `UPDATE ... FROM` / `DELETE ... USING` had ignored the extra FROM and
+    written EVERY row; they are now rewritten into correlated subqueries.
+    A `READ ONLY` transaction had written freely; it now refuses (25006).
+    Also landed: automatically updatable views with CHECK OPTION, `int4`
+    overflow (it had silently widened to int8), exact numeric `sqrt` / `exp` /
+    `ln` / `log` / `power` (transcribed scale rules, BigInt values), bit
+    strings, a transcription of `DecodeDateTime` for date/time input,
+    `AT TIME ZONE`, expression indexes with UNIQUE enforced, `ORDER BY` over
+    aggregates, `GROUPING()`. Rules from that work:
+
+    - **A rewrite beats a new plan node.** UPDATE FROM, views, aggregate
+      ORDER BY and an aggregate over a residual WHERE are all AST rewrites
+      onto shapes the planner already runs (correlated subqueries, a FROM
+      subquery). Each needed no executor change.
+    - **Case mapping is Unicode-aware with the SIMPLE mapping**, and the
+      server reports `lc_ctype = C.UTF-8`. This box's reference runs `C`,
+      which maps no non-ASCII letter; matching it would break against every
+      UTF-8-locale server. That decision was recorded before and briefly
+      overridden this batch -- read the `strings` notes in the backlog
+      before touching it again.
+
     **What remains refused**: writing THROUGH a view (and so `INSTEAD OF`
     triggers), an expression / non-btree index, constraint triggers and
     transition tables, `VARIADIC` / `BEGIN ATOMIC` functions, and correlation

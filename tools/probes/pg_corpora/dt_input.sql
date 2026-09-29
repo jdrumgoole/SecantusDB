@@ -190,3 +190,23 @@ SET DateStyle = 'ISO, YMD'
 SELECT '20/01/05'::date
 SET DateStyle = 'ISO, MDY'
 SELECT '1/5/2020'::date
+SELECT ('2020-01-05 10:30+00'::timestamptz at time zone '+05')::text
+SELECT ('2020-01-05 10:30+00'::timestamptz at time zone 'EST')::text
+SELECT ('2020-01-05 10:30'::timestamp at time zone 'America/New_York')::text
+SELECT ('2020-07-05 10:30+00'::timestamptz at time zone 'America/New_York')::text
+SELECT ('2020-01-05 10:30+00'::timestamptz at time zone interval '+05:00')::text
+SELECT ('2020-01-05 10:30+00'::timestamptz at time zone 'utc+3')::text
+SELECT pg_typeof(now() at time zone 'UTC')
+SELECT pg_typeof(localtimestamp at time zone 'UTC')
+SELECT ('2020-01-05 10:30'::timestamp at time zone 'nope')::text
+SELECT timezone('UTC', '2020-01-05 10:30'::timestamp)::text
+SELECT ('2020-01-05'::date at time zone 'Asia/Tokyo')::text
+SELECT ('2020-03-08 02:30'::timestamp at time zone 'America/New_York')::text
+SELECT ('2020-01-05 10:30+00'::timestamptz at time zone 'Europe/London')::text
+SELECT ('2020-01-05 10:30+00'::timestamptz at time zone interval '1 day')::text
+SELECT ('2020-01-05 10:30+00'::timestamptz at time zone '-03:30')::text
+SELECT ('2020-01-05 10:30+00'::timestamptz at time zone NULL) IS NULL
+SELECT ('2020-11-01 01:30'::timestamp at time zone 'America/New_York')::text
+SET timezone = 'America/New_York'
+SELECT '2020-11-01 01:30'::timestamptz::text, '2020-03-08 02:30'::timestamptz::text
+SET timezone = 'UTC'

@@ -304,8 +304,15 @@ fn structured(
             fields.push((k.clone(), Value::Str(v.clone())));
         }
         // A scanned relation's alias is its name unless the plan named one.
-        if n.props.iter().any(|(k, _)| k == "Relation Name") && !n.props.iter().any(|(k, _)| k == "Alias") {
-            let rel = n.props.iter().find(|(k, _)| k == "Relation Name").map(|(_, v)| v.clone()).unwrap_or_default();
+        if n.props.iter().any(|(k, _)| k == "Relation Name")
+            && !n.props.iter().any(|(k, _)| k == "Alias")
+        {
+            let rel = n
+                .props
+                .iter()
+                .find(|(k, _)| k == "Relation Name")
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default();
             fields.push(("Alias".into(), Value::Str(rel)));
         }
         for (k, v) in &n.details {
@@ -397,7 +404,10 @@ pub(crate) fn render_yaml(
                     list_item(item, col + 2, out);
                 }
             }
-            other => out.push(format!("{lead}{key}: {}", scalar(other).unwrap_or_default())),
+            other => out.push(format!(
+                "{lead}{key}: {}",
+                scalar(other).unwrap_or_default()
+            )),
         }
     }
     fn list_item(item: &Value, col: usize, out: &mut Vec<String>) {
@@ -405,7 +415,11 @@ pub(crate) fn render_yaml(
         match item {
             Value::Obj(fs) => {
                 for (i, (k, v)) in fs.iter().enumerate() {
-                    let lead = if i == 0 { dash.clone() } else { " ".repeat(col + 2) };
+                    let lead = if i == 0 {
+                        dash.clone()
+                    } else {
+                        " ".repeat(col + 2)
+                    };
                     field(k, v, col + 2, &lead, out);
                 }
             }
@@ -430,7 +444,9 @@ pub(crate) fn render_xml(
 ) -> String {
     use serde_json_lite::Value;
     fn escape(s: &str) -> String {
-        s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
     }
     fn element(tag: &str, v: &Value, depth: usize, out: &mut Vec<String>) {
         let pad = " ".repeat(depth * 2);
@@ -497,7 +513,11 @@ mod serde_json_lite {
                 Value::Str(s) => quote(s),
                 Value::Num(n) => n.clone(),
                 Value::Arr(items) if items.is_empty() => "[]".into(),
-                Value::Arr(items) if items.iter().all(|v| matches!(v, Value::Str(_) | Value::Num(_))) => {
+                Value::Arr(items)
+                    if items
+                        .iter()
+                        .all(|v| matches!(v, Value::Str(_) | Value::Num(_))) =>
+                {
                     let parts: Vec<String> = items.iter().map(|v| v.pretty(indent)).collect();
                     format!("[{}]", parts.join(", "))
                 }

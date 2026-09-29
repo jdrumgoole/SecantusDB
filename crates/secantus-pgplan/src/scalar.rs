@@ -580,28 +580,30 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
                 crate::json::render_jsonb(&obj)
             }))
         }
-        // This server is a C-locale cluster -- text compares by byte, and
-        // `lc_ctype` is `C` -- so case mapping touches ASCII letters only,
-        // as PostgreSQL's does under C: `upper('é')` is `é`, `upper('ß')` is
-        // `ß`, and in `initcap` a non-ASCII letter is not a word character.
+        // Unicode-aware, as a UTF-8-locale PostgreSQL maps case -- but the
+        // SIMPLE mapping (towupper / towlower, one character to one), never
+        // the full one: `upper('ß')` is `ß`, not `SS`. `İ` lowers to `i`, as
+        // glibc has it. (This box's reference runs lc_ctype=C, which maps no
+        // non-ASCII letter at all; tasks/backlog.md records why that is not
+        // matched.)
         "upper" => {
             need(1)?;
-            Ok(Bson::String(s(0).to_ascii_uppercase()))
+            Ok(Bson::String(s(0).chars().map(simple_upper).collect()))
         }
         "lower" => {
             need(1)?;
-            Ok(Bson::String(s(0).to_ascii_lowercase()))
+            Ok(Bson::String(s(0).chars().map(simple_lower).collect()))
         }
         "initcap" => {
             need(1)?;
             let mut out = String::new();
             let mut fresh = true;
             for c in s(0).chars() {
-                if c.is_ascii_alphanumeric() {
+                if c.is_alphanumeric() {
                     if fresh {
-                        out.push(c.to_ascii_uppercase());
+                        out.push(simple_upper(c));
                     } else {
-                        out.push(c.to_ascii_lowercase());
+                        out.push(simple_lower(c));
                     }
                     fresh = false;
                 } else {
@@ -1036,12 +1038,14 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         "abs" => {
             need(1)?;
             Ok(match arg(0) {
-                Bson::Int32(i) => Bson::Int32(i.checked_abs().ok_or_else(|| {
-                    Error::NumericOutOfRange("integer out of range".into())
-                })?),
-                Bson::Int64(i) => Bson::Int64(i.checked_abs().ok_or_else(|| {
-                    Error::NumericOutOfRange("bigint out of range".into())
-                })?),
+                Bson::Int32(i) => Bson::Int32(
+                    i.checked_abs()
+                        .ok_or_else(|| Error::NumericOutOfRange("integer out of range".into()))?,
+                ),
+                Bson::Int64(i) => Bson::Int64(
+                    i.checked_abs()
+                        .ok_or_else(|| Error::NumericOutOfRange("bigint out of range".into()))?,
+                ),
                 Bson::Double(d) => Bson::Double(d.abs()),
                 v if crate::is_numeric(&v) => {
                     let t = crate::numeric_text(&v).unwrap_or_default();
@@ -1080,8 +1084,10 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
             if args.contains(&Bson::Null) {
                 return Ok(Bson::Null);
             }
-            let texts: Option<Vec<String>> =
-                args.iter().map(crate::numeric::numeric_operand_text).collect();
+            let texts: Option<Vec<String>> = args
+                .iter()
+                .map(crate::numeric::numeric_operand_text)
+                .collect();
             let texts = texts.ok_or_else(|| wrong_args(name))?;
             crate::numeric_math::call(name, &texts).unwrap_or_else(|| Err(wrong_args(name)))
         }
@@ -1090,15 +1096,19 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
             if arg(0) == Bson::Null {
                 return Ok(Bson::Null);
             }
-            let text = crate::numeric::numeric_operand_text(&arg(0)).ok_or_else(|| wrong_args(name))?;
-            Ok(crate::bytea::to_binary(crate::numeric_math::numeric_send(&text)))
+            let text =
+                crate::numeric::numeric_operand_text(&arg(0)).ok_or_else(|| wrong_args(name))?;
+            Ok(crate::bytea::to_binary(crate::numeric_math::numeric_send(
+                &text,
+            )))
         }
         "scale" | "min_scale" | "trim_scale" => {
             need(1)?;
             if arg(0) == Bson::Null {
                 return Ok(Bson::Null);
             }
-            let text = crate::numeric::numeric_operand_text(&arg(0)).ok_or_else(|| wrong_args(name))?;
+            let text =
+                crate::numeric::numeric_operand_text(&arg(0)).ok_or_else(|| wrong_args(name))?;
             crate::numeric_math::call(name, &[text]).unwrap_or_else(|| Err(wrong_args(name)))
         }
         "sqrt" | "exp" | "ln" | "log" | "log10" | "power" | "pow" => float_math(name, args),
@@ -1414,6 +1424,28 @@ fn float_math(name: &str, args: &[Bson]) -> Result<Bson> {
         _ => return Err(Error::Unsupported(format!("function {name}()"))),
     };
     Ok(Bson::Double(out))
+}
+
+/// One character's SIMPLE uppercase: its full mapping when that is a single
+/// character, else itself (`ß` stays `ß`).
+fn simple_upper(c: char) -> char {
+    let mut it = c.to_uppercase();
+    match (it.next(), it.next()) {
+        (Some(u), None) => u,
+        _ => c,
+    }
+}
+
+/// One character's SIMPLE lowercase; `İ` (U+0130) is `i`, as towlower has it.
+fn simple_lower(c: char) -> char {
+    if c == '\u{130}' {
+        return 'i';
+    }
+    let mut it = c.to_lowercase();
+    match (it.next(), it.next()) {
+        (Some(l), None) => l,
+        _ => c,
+    }
 }
 
 /// MD5, for `md5()`. Small enough to carry rather than take a dependency for.
