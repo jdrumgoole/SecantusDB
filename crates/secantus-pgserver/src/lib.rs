@@ -90,6 +90,18 @@ pub struct BackendEntry {
     wake: tokio::sync::Notify,
 }
 
+/// One index relation as `pg_index` / `pg_class` report it.
+struct IndexRelation {
+    name: String,
+    oid: i64,
+    table: TableDef,
+    /// 1-based column numbers; 0 for an expression key.
+    keys: Vec<i32>,
+    unique: bool,
+    primary: bool,
+    exclusion: bool,
+}
+
 /// One queued `NotificationResponse`.
 #[derive(Clone, Debug)]
 struct Notification {
@@ -3536,7 +3548,147 @@ impl PgHandler {
                 let temp = temps.contains(&name);
                 Some((name, oid, temp))
             })
+            .chain(self.index_relations().into_iter().map(|ix| {
+                let temp = temps.contains(&ix.table.name);
+                (ix.name, ix.oid, temp)
+            }))
             .collect()
+    }
+
+    /// Index oids live in their own band so they never meet a type or table
+    /// oid. Within it, a table's own indexes follow the table's oid `T`:
+    /// `T*16 + 1` is its primary key and `T*16 + 2 + i` its i-th UNIQUE /
+    /// EXCLUDE constraint, while a CREATE INDEX mints `C*16` from the shared
+    /// oid counter (`sqlOid` in the index's options). The counter only
+    /// grows, so an index created after the table sorts after its key, and
+    /// `ORDER BY indexrelid` is creation order as it is on PostgreSQL.
+    const INDEX_OID_BAND: i64 = 0x1000_0000;
+
+    /// The fallback oid for an index with no table oid or minted oid (one
+    /// built before oids were minted): FNV-1a of its namespace-unique name,
+    /// folded into a band above the derived one.
+    fn index_oid(name: &str) -> i64 {
+        let mut h: u32 = 0x811c_9dc5;
+        for b in name.bytes() {
+            h ^= u32::from(b);
+            h = h.wrapping_mul(0x0100_0193);
+        }
+        0x4000_0000 | i64::from(h & 0x0FFF_FFFF)
+    }
+
+    /// The oid a CREATE INDEX records for itself, minted from the counter
+    /// tables and types share.
+    fn mint_index_oid(&self) -> PgWireResult<i64> {
+        Ok(Self::INDEX_OID_BAND + self.mint_composite_oid()? * 16)
+    }
+
+    /// Every index relation, as PostgreSQL's `pg_index` lists them: a table's
+    /// primary key (`<t>_pkey`, which storage keeps as `_id_`), each storage
+    /// index (CREATE INDEX and every UNIQUE constraint), and an EXCLUDE
+    /// constraint enforced row by row, which has no storage index.
+    fn index_relations(&self) -> Vec<IndexRelation> {
+        let mut out = Vec::new();
+        let Ok(defs) = self.all_table_defs() else {
+            return out;
+        };
+        for t in defs {
+            let table_oid = self.relation_oid(&t.name).filter(|o| *o > 0);
+            let derived = |slot: i64, name: &str| match table_oid {
+                Some(o) if slot < 16 => Self::INDEX_OID_BAND + o * 16 + slot,
+                _ => Self::index_oid(name),
+            };
+            let position = |field: &str| -> i32 {
+                t.columns
+                    .iter()
+                    .position(|c| t.field_of(&c.name).as_deref() == Some(field))
+                    .map_or(0, |i| (i + 1) as i32)
+            };
+            let pk: Vec<i32> = t
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.pk)
+                .map(|(i, _)| (i + 1) as i32)
+                .collect();
+            if !pk.is_empty() {
+                let name = format!("{}_pkey", t.name);
+                out.push(IndexRelation {
+                    oid: derived(1, &name),
+                    name,
+                    table: t.clone(),
+                    keys: pk,
+                    unique: true,
+                    primary: true,
+                    exclusion: false,
+                });
+            }
+            let stored = self
+                .storage
+                .list_indexes(self.db(), &t.name)
+                .unwrap_or_default();
+            let mut names = std::collections::HashSet::new();
+            for ix in stored {
+                let Ok(name) = ix.get_str("name") else {
+                    continue;
+                };
+                if name == "_id_" {
+                    continue;
+                }
+                let keys: Vec<i32> = ix
+                    .get_document("key")
+                    .map(|k| k.keys().map(|f| position(f)).collect())
+                    .unwrap_or_default();
+                let unique = ix
+                    .get_document("options")
+                    .ok()
+                    .and_then(|o| o.get_bool("unique").ok())
+                    .or_else(|| ix.get_bool("unique").ok())
+                    .unwrap_or(false);
+                names.insert(name.to_string());
+                let slot = t.unique_constraints.iter().position(|u| u.name == name);
+                let oid = match (ix.get_i64("sqlOid"), slot) {
+                    (Ok(oid), _) => oid,
+                    (_, Some(i)) => derived(2 + i as i64, name),
+                    _ => Self::index_oid(name),
+                };
+                out.push(IndexRelation {
+                    oid,
+                    name: name.to_string(),
+                    table: t.clone(),
+                    keys,
+                    unique,
+                    primary: false,
+                    exclusion: false,
+                });
+            }
+            for (i, u) in t.unique_constraints.iter().enumerate() {
+                if names.contains(&u.name) {
+                    continue;
+                }
+                let keys: Vec<i32> = u
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        t.columns
+                            .iter()
+                            .position(|col| col.name == *c)
+                            .map_or(0, |i| (i + 1) as i32)
+                    })
+                    .collect();
+                out.push(IndexRelation {
+                    oid: derived(2 + i as i64, &u.name),
+                    name: u.name.clone(),
+                    table: t.clone(),
+                    keys,
+                    unique: !u.exclusion,
+                    primary: false,
+                    exclusion: u.exclusion,
+                });
+            }
+        }
+        // pg_index's physical order is creation order, which the oids follow.
+        out.sort_by_key(|ix| ix.oid);
+        out
     }
 
     /// Stamp each column of `def` with where it is read from, for the
@@ -3948,7 +4100,10 @@ impl PgHandler {
                 "stack depth limit exceeded".into(),
             ))));
         }
-        f()
+        // Keep at least 1 MiB free for this level, moving onto a fresh 16 MiB
+        // segment when less is left, so the depth guard above -- not a stack
+        // overflow that aborts every connection -- is what stops recursion.
+        stacker::maybe_grow(1024 * 1024, 16 * 1024 * 1024, f)
     }
 
     /// Run one call of a user-defined function.
@@ -3968,7 +4123,30 @@ impl PgHandler {
                     u.name
                 )))
             })?;
-        self.with_call_depth(|| self.run_user_function(&doc, u, args))
+        let out = self.with_call_depth(|| self.run_user_function(&doc, u, args))?;
+        // The value comes back in the declared return type: `RETURN 1` from a
+        // `RETURNS numeric` function is numeric 1, so `n * f(n - 1)` is
+        // numeric arithmetic and does not overflow an integer.
+        Ok(match out {
+            secantus_pgplan::FnResult::Value(v)
+                if !u.returns_set
+                    && v != Bson::Null
+                    && matches!(
+                        u.return_type.as_str(),
+                        "int2" | "int4" | "int8" | "numeric" | "float4" | "float8"
+                    ) =>
+            {
+                secantus_pgplan::FnResult::Value(
+                    secantus_pgplan::cast_value_with_tz(
+                        v,
+                        &u.return_type,
+                        &self.session_timezone(),
+                    )
+                    .map_err(|e| Self::err(&e))?,
+                )
+            }
+            other => other,
+        })
     }
 
     fn run_user_function(
@@ -4106,7 +4284,12 @@ impl PgHandler {
                     _ => String::new(),
                 }
             };
-            let pk: Vec<&str> = t.columns.iter().filter(|c| c.pk).map(|c| c.name.as_str()).collect();
+            let pk: Vec<&str> = t
+                .columns
+                .iter()
+                .filter(|c| c.pk)
+                .map(|c| c.name.as_str())
+                .collect();
             if !pk.is_empty() {
                 push(format!("PRIMARY KEY ({})", pk.join(", ")));
             }
@@ -4116,7 +4299,12 @@ impl PgHandler {
                         .columns
                         .iter()
                         .enumerate()
-                        .map(|(i, c)| format!("{c} WITH {}", u.exclusion_ops.get(i).map_or("=", String::as_str)))
+                        .map(|(i, c)| {
+                            format!(
+                                "{c} WITH {}",
+                                u.exclusion_ops.get(i).map_or("=", String::as_str)
+                            )
+                        })
                         .collect();
                     push(format!(
                         "EXCLUDE USING {} ({})",
@@ -4138,7 +4326,13 @@ impl PgHandler {
                 // `REFERENCES t` with no list names t's primary key.
                 let ref_columns: Vec<String> = if fk.ref_columns.is_empty() {
                     self.lookup(&fk.ref_table)
-                        .map(|p| p.columns.iter().filter(|c| c.pk).map(|c| c.name.clone()).collect())
+                        .map(|p| {
+                            p.columns
+                                .iter()
+                                .filter(|c| c.pk)
+                                .map(|c| c.name.clone())
+                                .collect()
+                        })
                         .unwrap_or_default()
                 } else {
                     fk.ref_columns.clone()
@@ -4306,6 +4500,7 @@ impl PgHandler {
         if !ci.include.is_empty() {
             options.insert("include", ci.include.clone());
         }
+        options.insert("sqlOid", self.mint_index_oid()?);
         // A UNIQUE index cannot be built over rows that already collide.
         if ci.unique {
             let rows = self
@@ -4389,7 +4584,12 @@ impl PgHandler {
     /// (the new ones against each other and against the stored rows other
     /// than `replacing`) may have EVERY `col op col` true. NULLs never
     /// conflict. PostgreSQL's 23P01.
-    fn check_exclusions(&self, def: &TableDef, rows: &[Document], replacing: &[Bson]) -> PgWireResult<()> {
+    fn check_exclusions(
+        &self,
+        def: &TableDef,
+        rows: &[Document],
+        replacing: &[Bson],
+    ) -> PgWireResult<()> {
         let excl: Vec<&secantus_pgcatalog::UniqueConstraint> = def
             .unique_constraints
             .iter()
@@ -4423,14 +4623,20 @@ impl PgHandler {
             };
             let conflicts = |a: &[Bson], b: &[Bson]| -> PgWireResult<bool> {
                 for ((_, ty, op), (x, y)) in cols.iter().zip(a.iter().zip(b)) {
-                    let v = secantus_pgplan::apply_typed_operator(op, y, x, ty).map_err(|e| Self::err(&e))?;
+                    let v = secantus_pgplan::apply_typed_operator(op, y, x, ty)
+                        .map_err(|e| Self::err(&e))?;
                     if v != Bson::Boolean(true) {
                         return Ok(false);
                     }
                 }
                 Ok(true)
             };
-            let render = |k: &[Bson]| k.iter().map(secantus_pgplan::value_text).collect::<Vec<_>>().join(", ");
+            let render = |k: &[Bson]| {
+                k.iter()
+                    .map(secantus_pgplan::value_text)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
             let mut seen: Vec<Vec<Bson>> = stored.iter().filter_map(|r| key(r)).collect();
             for row in rows {
                 let Some(k) = key(row) else { continue };
@@ -4438,7 +4644,10 @@ impl PgHandler {
                     if conflicts(&k, other)? {
                         return Err(Self::constraint_error(
                             "23P01",
-                            format!("conflicting key value violates exclusion constraint \"{}\"", c.name),
+                            format!(
+                                "conflicting key value violates exclusion constraint \"{}\"",
+                                c.name
+                            ),
                             format!(
                                 "Key ({})=({}) conflicts with existing key ({})=({}).",
                                 c.columns.join(", "),
@@ -4614,6 +4823,7 @@ impl PgHandler {
         if ci.key_sql.iter().any(|k| k.contains(" NULLS ")) {
             options.insert("sqlKeys", ci.key_sql.clone());
         }
+        options.insert("sqlOid", self.mint_index_oid()?);
         self.storage
             .create_index(self.db(), &def.name, &name, &key_spec, &options)
             .map_err(|e| match e {
@@ -5149,7 +5359,8 @@ impl PgHandler {
                     Column::new("indnatts", "int2", false),
                     Column::new("indisunique", "bool", false),
                     Column::new("indisprimary", "bool", false),
-                    Column::new("indkey", "int2[]", false),
+                    Column::new("indisexclusion", "bool", false),
+                    Column::new("indkey", "int2vector", false),
                 ],
             )),
             "pg_indexes" => Some(TableDef::new(
@@ -5630,6 +5841,7 @@ impl PgHandler {
             "pg_class" => {
                 let f = |name: &str| def.field_of(name).expect("column");
                 let mut rows = Vec::new();
+                let indexes = self.index_relations();
                 for t in self.all_table_defs().ok()? {
                     let mut d = Document::new();
                     d.insert(
@@ -5640,10 +5852,26 @@ impl PgHandler {
                     d.insert(f("relnamespace"), Bson::Int64(Self::PUBLIC_NAMESPACE_OID));
                     d.insert(f("relkind"), "r");
                     d.insert(f("relnatts"), Bson::Int32(t.columns.len() as i32));
-                    d.insert(f("relhasindex"), t.columns.iter().any(|c| c.pk));
+                    d.insert(
+                        f("relhasindex"),
+                        indexes.iter().any(|ix| ix.table.name == t.name),
+                    );
                     d.insert(f("reltuples"), Bson::Double(-1.0));
                     d.insert(f("relowner"), Bson::Int64(10));
                     d.insert(f("relpersistence"), if t.temp { "t" } else { "p" });
+                    rows.push(d);
+                }
+                for ix in &indexes {
+                    let mut d = Document::new();
+                    d.insert(f("oid"), Bson::Int64(ix.oid));
+                    d.insert(f("relname"), ix.name.as_str());
+                    d.insert(f("relnamespace"), Bson::Int64(Self::PUBLIC_NAMESPACE_OID));
+                    d.insert(f("relkind"), "i");
+                    d.insert(f("relnatts"), Bson::Int32(ix.keys.len() as i32));
+                    d.insert(f("relhasindex"), false);
+                    d.insert(f("reltuples"), Bson::Double(-1.0));
+                    d.insert(f("relowner"), Bson::Int64(10));
+                    d.insert(f("relpersistence"), if ix.table.temp { "t" } else { "p" });
                     rows.push(d);
                 }
                 // A sequence is a relation too, and `relkind` is how a client
@@ -5687,51 +5915,26 @@ impl PgHandler {
             }
             "pg_index" => {
                 let f = |name: &str| def.field_of(name).expect("column");
-                let mut rows = Vec::new();
-                for t in self.all_table_defs().ok()? {
-                    let oid = self.relation_oid(&t.name).unwrap_or(0);
-                    let pk: Vec<i32> = t
-                        .columns
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, c)| c.pk)
-                        .map(|(i, _)| (i + 1) as i32)
-                        .collect();
-                    if !pk.is_empty() {
+                self.index_relations()
+                    .into_iter()
+                    .map(|ix| {
                         let mut d = Document::new();
-                        d.insert(f("indexrelid"), Bson::Int64(0));
-                        d.insert(f("indrelid"), Bson::Int64(oid));
-                        d.insert(f("indnatts"), Bson::Int32(pk.len() as i32));
-                        d.insert(f("indisunique"), true);
-                        d.insert(f("indisprimary"), true);
+                        d.insert(f("indexrelid"), Bson::Int64(ix.oid));
+                        d.insert(
+                            f("indrelid"),
+                            Bson::Int64(self.relation_oid(&ix.table.name).unwrap_or(0)),
+                        );
+                        d.insert(f("indnatts"), Bson::Int32(ix.keys.len() as i32));
+                        d.insert(f("indisunique"), ix.unique);
+                        d.insert(f("indisprimary"), ix.primary);
+                        d.insert(f("indisexclusion"), ix.exclusion);
                         d.insert(
                             f("indkey"),
-                            Bson::Array(pk.into_iter().map(Bson::Int32).collect()),
+                            Bson::Array(ix.keys.into_iter().map(Bson::Int32).collect()),
                         );
-                        rows.push(d);
-                    }
-                    for u in &t.unique_constraints {
-                        let cols: Vec<Bson> = u
-                            .columns
-                            .iter()
-                            .filter_map(|name| {
-                                t.columns
-                                    .iter()
-                                    .position(|c| c.name == *name)
-                                    .map(|i| Bson::Int32((i + 1) as i32))
-                            })
-                            .collect();
-                        let mut d = Document::new();
-                        d.insert(f("indexrelid"), Bson::Int64(0));
-                        d.insert(f("indrelid"), Bson::Int64(oid));
-                        d.insert(f("indnatts"), Bson::Int32(cols.len() as i32));
-                        d.insert(f("indisunique"), true);
-                        d.insert(f("indisprimary"), false);
-                        d.insert(f("indkey"), Bson::Array(cols));
-                        rows.push(d);
-                    }
-                }
-                rows
+                        d
+                    })
+                    .collect()
             }
             "pg_trigger" => {
                 let f = |name: &str| def.field_of(name).expect("column");
@@ -7091,7 +7294,10 @@ impl PgHandler {
             .collect();
         // An all-`=` EXCLUDE is enforced by the same unique index, but it is
         // reported as the exclusion constraint it is (23P01).
-        let exclusion = def.unique_constraints.iter().any(|u| u.name == name && u.exclusion);
+        let exclusion = def
+            .unique_constraints
+            .iter()
+            .any(|u| u.name == name && u.exclusion);
         let mut info = if exclusion {
             ErrorInfo::new(
                 "ERROR".into(),
@@ -7113,7 +7319,11 @@ impl PgHandler {
                     vals = values.join(", ")
                 )
             } else {
-                format!("Key ({})=({}) already exists.", columns.join(", "), values.join(", "))
+                format!(
+                    "Key ({})=({}) already exists.",
+                    columns.join(", "),
+                    values.join(", ")
+                )
             });
         }
         // pgwire 0.39 added the protocol's schema/table/column/constraint
@@ -7432,6 +7642,8 @@ fn internal_type_name(ty: &Type) -> Option<String> {
             114 => "json",
             3802 => "jsonb",
             1005 => "int2[]",
+            22 => "int2vector",
+            30 => "oidvector",
             1007 => "int4[]",
             1016 => "int8[]",
             1021 => "float4[]",
@@ -7579,6 +7791,8 @@ fn wire_type(pg_type: &str) -> Type {
         "int4[]" | "int[]" | "integer[]" => Type::INT4_ARRAY,
         "int8[]" | "bigint[]" => Type::INT8_ARRAY,
         "int2[]" | "smallint[]" => Type::INT2_ARRAY,
+        "int2vector" => Type::INT2_VECTOR,
+        "oidvector" => Type::OID_VECTOR,
         "float8[]" | "double[]" => Type::FLOAT8_ARRAY,
         "float4[]" | "real[]" => Type::FLOAT4_ARRAY,
         "bool[]" | "boolean[]" => Type::BOOL_ARRAY,
@@ -14775,6 +14989,7 @@ impl PgHandler {
                         .filter(|b| b.extension.as_deref() == Some(name))
                         .collect();
                     let mut dependents = Vec::new();
+                    let mut columns: Vec<(String, String)> = Vec::new();
                     for def in self.all_table_defs()? {
                         for col in &def.columns {
                             let element = col.pg_type.strip_suffix("[]").unwrap_or(&col.pg_type);
@@ -14784,19 +14999,50 @@ impl PgHandler {
                             {
                                 dependents
                                     .push(format!("column {} of table {}", col.name, def.name));
+                                columns.push((def.name.clone(), col.name.clone()));
                             }
                         }
                     }
                     if !dependents.is_empty() {
                         if cascade {
-                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                                "ERROR".into(),
-                                "0A000".into(), // feature_not_supported
-                                format!(
-                                    "DROP EXTENSION {name} CASCADE is not supported while a \
-                                     column depends on it; drop the table first"
-                                ),
-                            ))));
+                            // CASCADE drops each dependent column, as an
+                            // ALTER TABLE ... DROP COLUMN would.
+                            if let [only] = dependents.as_slice() {
+                                self.notice("00000", format!("drop cascades to {only}"), None);
+                            } else {
+                                self.notice(
+                                    "00000",
+                                    format!("drop cascades to {} other objects", dependents.len()),
+                                    Some(
+                                        dependents
+                                            .iter()
+                                            .map(|d| format!("drop cascades to {d}"))
+                                            .collect::<Vec<_>>()
+                                            .join("\n"),
+                                    ),
+                                );
+                            }
+                            for (table, column) in columns {
+                                self.execute_inner(
+                                    Statement::AlterTable {
+                                        table,
+                                        missing_ok: false,
+                                        actions: vec![
+                                            secantus_pgplan::AlterTableAction::DropColumn {
+                                                name: column,
+                                                if_exists: true,
+                                            },
+                                        ],
+                                    },
+                                    0,
+                                )?;
+                            }
+                            for b in &owned {
+                                let key = Self::type_resolution(&b.schema, &b.name);
+                                self.delete_type_doc(Self::BASE_TYPE_COLLECTION, &key)?;
+                            }
+                            self.delete_type_doc(Self::EXTENSION_COLLECTION, name)?;
+                            continue;
                         }
                         let mut info = ErrorInfo::new(
                             "ERROR".into(),
@@ -15268,9 +15514,11 @@ impl PgHandler {
                     || referenced
                     || triggered
                     || !self.unique_expression_indexes(&upd.table)?.is_empty()
-                    || def
-                        .as_ref()
-                        .is_some_and(|d| d.unique_constraints.iter().any(|u| !u.exclusion_ops.is_empty()));
+                    || def.as_ref().is_some_and(|d| {
+                        d.unique_constraints
+                            .iter()
+                            .any(|u| !u.exclusion_ops.is_empty())
+                    });
                 // The columns the SET list assigns, for `UPDATE OF` triggers.
                 let targets: Vec<String> = match (&def, triggered) {
                     (Some(def), true) => {
@@ -16464,8 +16712,10 @@ fn copy_reassemble(d: &Document, field: &str, ty: &Type) -> Option<Bson> {
 /// every type, and the gap is recorded in `tasks/backlog.md` rather than
 /// hidden.
 fn binary_encodable(ty: &Type) -> bool {
-    const OK: [Type; 40] = [
+    const OK: [Type; 42] = [
         Type::OID,
+        Type::INT2_VECTOR,
+        Type::OID_VECTOR,
         Type::REGTYPE,
         Type::REGCLASS,
         Type::BOX,
@@ -16814,6 +17064,34 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
     if matches!(*ty, Type::BIT | Type::VARBIT) {
         if let Bson::String(bits) = v {
             return enc.encode_field(&Some(secantus_pgplan::bits::to_wire(bits)));
+        }
+    }
+    // `int2vector` / `oidvector` send as a one-dimensional array whose lower
+    // bound is 0 (they are subscripted from 0), not 1.
+    if matches!(*ty, Type::INT2_VECTOR | Type::OID_VECTOR) {
+        if let Bson::Array(items) = v {
+            let int2 = *ty == Type::INT2_VECTOR;
+            let mut out = Vec::new();
+            out.extend_from_slice(&1i32.to_be_bytes());
+            out.extend_from_slice(&0i32.to_be_bytes());
+            out.extend_from_slice(&(if int2 { 21u32 } else { 26u32 }).to_be_bytes());
+            out.extend_from_slice(&(items.len() as i32).to_be_bytes());
+            out.extend_from_slice(&0i32.to_be_bytes());
+            for item in items {
+                let n = match item {
+                    Bson::Int32(i) => i64::from(*i),
+                    Bson::Int64(i) => *i,
+                    _ => return Err(bad("this value")),
+                };
+                if int2 {
+                    out.extend_from_slice(&2i32.to_be_bytes());
+                    out.extend_from_slice(&(n as i16).to_be_bytes());
+                } else {
+                    out.extend_from_slice(&4i32.to_be_bytes());
+                    out.extend_from_slice(&(n as u32).to_be_bytes());
+                }
+            }
+            return enc.encode_field(&Some(out));
         }
     }
     // A regtype / regclass is its 4-byte oid.
@@ -17445,6 +17723,30 @@ fn encode_field_value_inner(
         // Binary datetime output is DateStyle-INDEPENDENT (it is a fixed-width
         // integer, not text), so `ds` is deliberately unused on this path.
         return encode_binary(enc, field.datatype(), v);
+    }
+    // `int2vector` / `oidvector` (pg_index.indkey): space-separated, no braces.
+    if matches!(field.datatype().oid(), 22 | 30) {
+        // Raw bytes: a plain string under an array-kind type would be
+        // escaped as though it were an array element (`"2 3"`).
+        let text = match v {
+            Some(Bson::Array(items)) => Some(
+                items
+                    .iter()
+                    .map(secantus_pgplan::value_text)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+            Some(Bson::String(text)) => Some(text.clone()),
+            _ => None,
+        };
+        if let Some(text) = text {
+            return enc.encode_field_with_type_and_format(
+                &RawEncoded(text.into_bytes()),
+                field.datatype(),
+                field.format(),
+                &FormatOptions::default(),
+            );
+        }
     }
     // A float4 is carried as the double it rounds to; float4out prints the
     // SHORTEST text that round-trips the f32 (`0.33333334`), not the f64.

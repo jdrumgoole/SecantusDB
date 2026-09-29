@@ -48,8 +48,16 @@ fn cmp(a: &Bound, b: &Bound, element: &str) -> Result<Ordering> {
         } else {
             Ordering::Greater
         }),
-        (None, Some(_)) => Ok(if a.lower { Ordering::Less } else { Ordering::Greater }),
-        (Some(_), None) => Ok(if b.lower { Ordering::Greater } else { Ordering::Less }),
+        (None, Some(_)) => Ok(if a.lower {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        }),
+        (Some(_), None) => Ok(if b.lower {
+            Ordering::Greater
+        } else {
+            Ordering::Less
+        }),
         (Some(x), Some(y)) => {
             let mut r = range::compare_bounds(x, y, element)?;
             if r == Ordering::Equal {
@@ -62,9 +70,17 @@ fn cmp(a: &Bound, b: &Bound, element: &str) -> Result<Ordering> {
                         Ordering::Less
                     };
                 } else if !a.inclusive {
-                    r = if a.lower { Ordering::Greater } else { Ordering::Less };
+                    r = if a.lower {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Less
+                    };
                 } else if !b.inclusive {
-                    r = if b.lower { Ordering::Less } else { Ordering::Greater };
+                    r = if b.lower {
+                        Ordering::Less
+                    } else {
+                        Ordering::Greater
+                    };
                 }
             }
             Ok(r)
@@ -130,8 +146,9 @@ fn overlaps(a: &Range, b: &Range, e: &str) -> Result<bool> {
 /// `[1,5)` / `[5,8)` meet at 5.)
 fn bounds_adjacent(up: &Bound, lo: &Bound, e: &str) -> Result<bool> {
     match (&up.val, &lo.val) {
-        (Some(x), Some(y)) => Ok(range::compare_bounds(x, y, e)? == Ordering::Equal
-            && up.inclusive != lo.inclusive),
+        (Some(x), Some(y)) => {
+            Ok(range::compare_bounds(x, y, e)? == Ordering::Equal && up.inclusive != lo.inclusive)
+        }
         _ => Ok(false),
     }
 }
@@ -147,7 +164,8 @@ fn range_eq(a: &Range, b: &Range, e: &str) -> Result<bool> {
     if a.empty || b.empty {
         return Ok(a.empty == b.empty);
     }
-    Ok(cmp(&lower(a), &lower(b), e)? == Ordering::Equal && cmp(&upper(a), &upper(b), e)? == Ordering::Equal)
+    Ok(cmp(&lower(a), &lower(b), e)? == Ordering::Equal
+        && cmp(&upper(a), &upper(b), e)? == Ordering::Equal)
 }
 
 /// `range_cmp`: empty sorts first, then by lower bound, then upper.
@@ -177,8 +195,16 @@ fn union(a: &Range, b: &Range, t: &str, strict: bool) -> Result<Range> {
             "result of range union would not be contiguous".into(),
         ));
     }
-    let lo = if cmp(&lower(a), &lower(b), &e)?.is_le() { lower(a) } else { lower(b) };
-    let hi = if cmp(&upper(a), &upper(b), &e)?.is_ge() { upper(a) } else { upper(b) };
+    let lo = if cmp(&lower(a), &lower(b), &e)?.is_le() {
+        lower(a)
+    } else {
+        lower(b)
+    };
+    let hi = if cmp(&upper(a), &upper(b), &e)?.is_ge() {
+        upper(a)
+    } else {
+        upper(b)
+    };
     make(lo, hi, t)
 }
 
@@ -187,8 +213,16 @@ fn intersect(a: &Range, b: &Range, t: &str) -> Result<Range> {
     if a.empty || b.empty || !overlaps(a, b, &e)? {
         return Ok(Range::empty());
     }
-    let lo = if cmp(&lower(a), &lower(b), &e)?.is_ge() { lower(a) } else { lower(b) };
-    let hi = if cmp(&upper(a), &upper(b), &e)?.is_le() { upper(a) } else { upper(b) };
+    let lo = if cmp(&lower(a), &lower(b), &e)?.is_ge() {
+        lower(a)
+    } else {
+        lower(b)
+    };
+    let hi = if cmp(&upper(a), &upper(b), &e)?.is_le() {
+        upper(a)
+    } else {
+        upper(b)
+    };
     make(lo, hi, t)
 }
 
@@ -261,23 +295,42 @@ fn as_multi(s: &Side) -> Option<(Vec<Range>, String)> {
 /// Evaluate `op` when either operand is (statically) a range or multirange.
 /// `None` when this is not a range operator.
 pub fn binary(op: &str, lhs: &Bson, rhs: &Bson, lt: &str, rt: &str) -> Option<Result<Bson>> {
-    if !(range::is_range_type(lt) || range::is_multirange_type(lt) || range::is_range_type(rt)
+    if !(range::is_range_type(lt)
+        || range::is_multirange_type(lt)
+        || range::is_range_type(rt)
         || range::is_multirange_type(rt))
     {
         return None;
     }
     if !matches!(
         op,
-        "@>" | "<@" | "&&" | "-|-" | "<<" | ">>" | "&<" | "&>" | "=" | "<>" | "!=" | "<" | "<="
-            | ">" | ">=" | "+" | "*" | "-"
+        "@>" | "<@"
+            | "&&"
+            | "-|-"
+            | "<<"
+            | ">>"
+            | "&<"
+            | "&>"
+            | "="
+            | "<>"
+            | "!="
+            | "<"
+            | "<="
+            | ">"
+            | ">="
+            | "+"
+            | "*"
+            | "-"
     ) {
         return None;
     }
     // The set operators and comparisons exist only between two of the SAME
     // kind; containment and overlap also mix a range with a multirange.
     let multi = |t: &str| range::is_multirange_type(t);
-    if matches!(op, "+" | "*" | "-" | "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=")
-        && multi(lt) != multi(rt)
+    if matches!(
+        op,
+        "+" | "*" | "-" | "=" | "<>" | "!=" | "<" | "<=" | ">" | ">="
+    ) && multi(lt) != multi(rt)
         && (range::is_range_type(lt) || multi(lt))
         && (range::is_range_type(rt) || multi(rt))
     {
@@ -297,7 +350,11 @@ fn eval(op: &str, lhs: &Bson, rhs: &Bson, lt: &str, rt: &str) -> Result<Bson> {
     match (&a, &b, op) {
         (Side::Range(r, t), Side::Elem(v), "@>") | (Side::Elem(v), Side::Range(r, t), "<@") => {
             let e = element(t)?;
-            return Ok(Bson::Boolean(contains_elem(r, &crate::render_value_text(v), &e)?));
+            return Ok(Bson::Boolean(contains_elem(
+                r,
+                &crate::render_value_text(v),
+                &e,
+            )?));
         }
         (Side::Multi(m, t), Side::Elem(v), "@>") | (Side::Elem(v), Side::Multi(m, t), "<@") => {
             let e = element(t)?;
@@ -346,11 +403,14 @@ fn eval(op: &str, lhs: &Bson, rhs: &Bson, lt: &str, rt: &str) -> Result<Bson> {
     }
     // Anything with a multirange: work over member lists.
     let (Some((ma, t)), Some((mb, _))) = (as_multi(&a), as_multi(&b)) else {
-        return Err(Error::Unsupported(format!("operator {op} on these operands")));
+        return Err(Error::Unsupported(format!(
+            "operator {op} on these operands"
+        )));
     };
     let e = element(&t)?;
     let norm = |v: Vec<Range>| range::normalise_multirange(v, &t);
-    let render = |v: Vec<Range>| -> Result<Bson> { Ok(Bson::String(range::render_multirange(&norm(v)?))) };
+    let render =
+        |v: Vec<Range>| -> Result<Bson> { Ok(Bson::String(range::render_multirange(&norm(v)?))) };
     match op {
         "+" => render(ma.into_iter().chain(mb).collect()),
         "*" => {
@@ -400,7 +460,9 @@ fn eval(op: &str, lhs: &Bson, rhs: &Bson, lt: &str, rt: &str) -> Result<Bson> {
         "=" | "<>" | "!=" => {
             let (x, y) = (norm(ma)?, norm(mb)?);
             let same = x.len() == y.len()
-                && x.iter().zip(&y).try_fold(true, |acc, (p, q)| Ok::<_, Error>(acc && range_eq(p, q, &e)?))?;
+                && x.iter().zip(&y).try_fold(true, |acc, (p, q)| {
+                    Ok::<_, Error>(acc && range_eq(p, q, &e)?)
+                })?;
             Ok(Bson::Boolean(if op == "=" { same } else { !same }))
         }
         _ => Err(Error::Unsupported(format!("multirange operator {op}"))),

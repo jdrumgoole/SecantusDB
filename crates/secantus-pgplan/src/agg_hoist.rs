@@ -56,6 +56,19 @@ fn target(name: &str, val: pg_query::protobuf::Node) -> pg_query::protobuf::Node
     }
 }
 
+/// Is this ORDER BY item a bare name one of the output columns carries?
+fn bare_output_name(item: &pg_query::protobuf::Node, out_names: &[String]) -> bool {
+    let Some(N::SortBy(sb)) = item.node.as_ref() else {
+        return false;
+    };
+    match sb.node.as_deref().and_then(|n| n.node.as_ref()) {
+        Some(N::ColumnRef(c)) if c.fields.len() == 1 => {
+            column_ref_name(c).is_some_and(|n| out_names.contains(&n))
+        }
+        _ => false,
+    }
+}
+
 fn contains_sublink(n: &pg_query::protobuf::Node) -> bool {
     let mut found = false;
     let mut n = n.clone();
@@ -134,6 +147,19 @@ impl Slots {
     /// `inner` is `Some(names)` inside a subquery (whose own aggregates and
     /// columns stay put unless they read only the outer query).
     fn rewrite(&mut self, n: &mut pg_query::protobuf::Node, inner: Option<&[String]>) {
+        // A grouped EXPRESSION (`GROUP BY n % 2`) written again in the
+        // outer query is its slot, wherever it sits (`(n % 2)::text`).
+        if inner.is_none()
+            && !matches!(
+                n.node.as_ref(),
+                Some(N::ColumnRef(_)) | Some(N::AConst(_)) | None
+            )
+        {
+            if let Some(slot) = self.group_slot(n) {
+                *n = slot_ref(&slot);
+                return;
+            }
+        }
         match n.node.as_mut() {
             Some(N::FuncCall(f)) if is_aggregate_call(f) && f.over.is_none() => {
                 let hoist = match inner {
@@ -173,7 +199,9 @@ impl Slots {
                 return;
             }
             Some(N::SubLink(sl)) => {
-                if let Some(N::SelectStmt(body)) = sl.subselect.as_deref_mut().and_then(|q| q.node.as_mut()) {
+                if let Some(N::SelectStmt(body)) =
+                    sl.subselect.as_deref_mut().and_then(|q| q.node.as_mut())
+                {
                     let names = from_names(body);
                     self.rewrite_select(body, &names);
                 }
@@ -236,7 +264,9 @@ impl Slots {
 /// Split a grouped SELECT whose select list, HAVING or ORDER BY holds a
 /// subquery; `None` when there is nothing to split (or a shape this does not
 /// split: DISTINCT, windows, grouping sets, set operations).
-pub(crate) fn split(s: &pg_query::protobuf::SelectStmt) -> Result<Option<pg_query::protobuf::SelectStmt>> {
+pub(crate) fn split(
+    s: &pg_query::protobuf::SelectStmt,
+) -> Result<Option<pg_query::protobuf::SelectStmt>> {
     let Some(out) = split_inner(s) else {
         return Ok(None);
     };
@@ -248,8 +278,97 @@ pub(crate) fn split(s: &pg_query::protobuf::SelectStmt) -> Result<Option<pg_quer
     }
 }
 
+/// Split a grouped SELECT whose select list, HAVING or ORDER BY computes
+/// over its groups -- `n::text ... GROUP BY n`, `-n, count(*)` -- which the
+/// aggregate planner refuses: the inner query groups, the outer one computes.
+/// The planner's fallback when the grouped plan is unsupported. An outer
+/// column that is neither grouped nor aggregated is PostgreSQL's 42803.
+pub(crate) fn split_expressions(
+    s: &pg_query::protobuf::SelectStmt,
+) -> Result<Option<pg_query::protobuf::SelectStmt>> {
+    let Some((stmt, ungrouped)) = split_inner_with(s, true) else {
+        return Ok(None);
+    };
+    if let Some(col) = ungrouped {
+        return Err(Error::Grouping(format!(
+            "subquery uses ungrouped column \"{col}\" from outer query"
+        )));
+    }
+    let mut stray: Option<Vec<String>> = None;
+    let mut check = |n: &pg_query::protobuf::Node| {
+        let mut n = n.clone();
+        let _ = walk_expr(&mut n, &mut |x| {
+            match x.node.as_ref() {
+                // A subquery's own columns are its business; blank it so
+                // the walk does not descend.
+                Some(N::SubLink(_)) => *x = pg_query::protobuf::Node { node: None },
+                Some(N::ColumnRef(c)) => {
+                    let parts: Vec<String> = c
+                        .fields
+                        .iter()
+                        .filter_map(|p| match p.node.as_ref() {
+                            Some(N::String(s)) => Some(s.sval.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    if parts.first().map(String::as_str) != Some("__grp") && stray.is_none() {
+                        stray = Some(parts);
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        });
+    };
+    for t in &stmt.target_list {
+        check(t);
+    }
+    if let Some(w) = stmt.where_clause.as_deref() {
+        check(w);
+    }
+    let out_names: Vec<String> = stmt
+        .target_list
+        .iter()
+        .filter_map(|t| match t.node.as_ref() {
+            Some(N::ResTarget(rt)) => Some(rt.name.clone()),
+            _ => None,
+        })
+        .collect();
+    for o in &stmt.sort_clause {
+        if !bare_output_name(o, &out_names) {
+            check(o);
+        }
+    }
+    if let Some(mut parts) = stray {
+        if parts.len() == 1 {
+            if let [only] = s.from_clause.as_slice() {
+                if let Some(N::RangeVar(rv)) = only.node.as_ref() {
+                    let q = rv
+                        .alias
+                        .as_ref()
+                        .map(|a| a.aliasname.clone())
+                        .unwrap_or_else(|| rv.relname.clone());
+                    parts.insert(0, q);
+                }
+            }
+        }
+        return Err(Error::Grouping(format!(
+            "column \"{}\" must appear in the GROUP BY clause or be used in an aggregate function",
+            parts.join(".")
+        )));
+    }
+    Ok(Some(stmt))
+}
+
 fn split_inner(
     s: &pg_query::protobuf::SelectStmt,
+) -> Option<(pg_query::protobuf::SelectStmt, Option<String>)> {
+    split_inner_with(s, false)
+}
+
+fn split_inner_with(
+    s: &pg_query::protobuf::SelectStmt,
+    force: bool,
 ) -> Option<(pg_query::protobuf::SelectStmt, Option<String>)> {
     let grouped = !s.group_clause.is_empty() || has_aggregate(s);
     if !grouped
@@ -257,14 +376,16 @@ fn split_inner(
         || !s.window_clause.is_empty()
         || has_window(s)
         || s.op != pg_query::protobuf::SetOperation::SetopNone as i32
-        || s.group_clause.iter().any(|g| matches!(g.node.as_ref(), Some(N::GroupingSet(_))))
+        || s.group_clause
+            .iter()
+            .any(|g| matches!(g.node.as_ref(), Some(N::GroupingSet(_))))
     {
         return None;
     }
     let has = s.target_list.iter().any(contains_sublink)
         || s.having_clause.as_deref().is_some_and(contains_sublink)
         || s.sort_clause.iter().any(contains_sublink);
-    if !has {
+    if !has && !force {
         return None;
     }
     let mut slots = Slots {
@@ -290,24 +411,33 @@ fn split_inner(
         let mut val = rt.val.as_deref()?.clone();
         let name = if rt.name.is_empty() {
             match val.node.as_ref() {
-                Some(N::SubLink(sl)) if SubLinkType::try_from(sl.sub_link_type) == Ok(SubLinkType::ExistsSublink) => {
+                Some(N::SubLink(sl))
+                    if SubLinkType::try_from(sl.sub_link_type)
+                        == Ok(SubLinkType::ExistsSublink) =>
+                {
                     "exists".to_string()
                 }
                 Some(N::SubLink(_)) => {
                     // A scalar subquery is named after its own single column.
                     match &val.node {
-                        Some(N::SubLink(sl)) => match sl.subselect.as_deref().and_then(|q| q.node.as_ref()) {
-                            Some(N::SelectStmt(b)) => match b.target_list.first().and_then(|t| t.node.as_ref()) {
-                                Some(N::ResTarget(r)) if !r.name.is_empty() => r.name.clone(),
-                                Some(N::ResTarget(r)) => r
-                                    .val
-                                    .as_deref()
-                                    .map(expression_column_name)
-                                    .unwrap_or_else(|| "?column?".into()),
+                        Some(N::SubLink(sl)) => {
+                            match sl.subselect.as_deref().and_then(|q| q.node.as_ref()) {
+                                Some(N::SelectStmt(b)) => {
+                                    match b.target_list.first().and_then(|t| t.node.as_ref()) {
+                                        Some(N::ResTarget(r)) if !r.name.is_empty() => {
+                                            r.name.clone()
+                                        }
+                                        Some(N::ResTarget(r)) => r
+                                            .val
+                                            .as_deref()
+                                            .map(expression_column_name)
+                                            .unwrap_or_else(|| "?column?".into()),
+                                        _ => "?column?".into(),
+                                    }
+                                }
                                 _ => "?column?".into(),
-                            },
-                            _ => "?column?".into(),
-                        },
+                            }
+                        }
                         _ => "?column?".into(),
                     }
                 }
@@ -323,8 +453,21 @@ fn split_inner(
     if let Some(h) = having.as_mut() {
         slots.rewrite(h, None);
     }
+    // A bare name in ORDER BY that is an OUTPUT column's name is that output
+    // column, before it is any input column (`SELECT n::text ... ORDER BY n`
+    // sorts the text): the outer query resolves it, so it stays as written.
+    let out_names: Vec<String> = outer_targets
+        .iter()
+        .filter_map(|t| match t.node.as_ref() {
+            Some(N::ResTarget(rt)) => Some(rt.name.clone()),
+            _ => None,
+        })
+        .collect();
     let mut sort = s.sort_clause.clone();
     for item in &mut sort {
+        if bare_output_name(item, &out_names) {
+            continue;
+        }
         slots.rewrite(item, None);
     }
     // An output alias in ORDER BY names the output column, which the outer
@@ -337,37 +480,45 @@ fn split_inner(
     inner.limit_offset = None;
     inner.limit_option = pg_query::protobuf::LimitOption::Default as i32;
     if inner.target_list.is_empty() {
-        inner.target_list.push(target("__n", pg_query::protobuf::Node {
-            node: Some(N::FuncCall(Box::new(pg_query::protobuf::FuncCall {
-                funcname: vec![string_node("count")],
-                agg_star: true,
-                funcformat: pg_query::protobuf::CoercionForm::CoerceExplicitCall as i32,
-                location: -1,
-                ..Default::default()
-            }))),
-        }));
+        inner.target_list.push(target(
+            "__n",
+            pg_query::protobuf::Node {
+                node: Some(N::FuncCall(Box::new(pg_query::protobuf::FuncCall {
+                    funcname: vec![string_node("count")],
+                    agg_star: true,
+                    funcformat: pg_query::protobuf::CoercionForm::CoerceExplicitCall as i32,
+                    location: -1,
+                    ..Default::default()
+                }))),
+            },
+        ));
     }
     let ungrouped = slots.ungrouped.take();
-    Some((pg_query::protobuf::SelectStmt {
-        target_list: outer_targets,
-        from_clause: vec![pg_query::protobuf::Node {
-            node: Some(N::RangeSubselect(Box::new(pg_query::protobuf::RangeSubselect {
-                lateral: false,
-                subquery: Some(Box::new(pg_query::protobuf::Node {
-                    node: Some(N::SelectStmt(Box::new(inner))),
-                })),
-                alias: Some(pg_query::protobuf::Alias {
-                    aliasname: "__grp".into(),
-                    colnames: Vec::new(),
-                }),
-            }))),
-        }],
-        where_clause: having.map(Box::new),
-        sort_clause: sort,
-        limit_count: s.limit_count.clone(),
-        limit_offset: s.limit_offset.clone(),
-        limit_option: s.limit_option,
-        op: pg_query::protobuf::SetOperation::SetopNone as i32,
-        ..Default::default()
-    }, ungrouped))
+    Some((
+        pg_query::protobuf::SelectStmt {
+            target_list: outer_targets,
+            from_clause: vec![pg_query::protobuf::Node {
+                node: Some(N::RangeSubselect(Box::new(
+                    pg_query::protobuf::RangeSubselect {
+                        lateral: false,
+                        subquery: Some(Box::new(pg_query::protobuf::Node {
+                            node: Some(N::SelectStmt(Box::new(inner))),
+                        })),
+                        alias: Some(pg_query::protobuf::Alias {
+                            aliasname: "__grp".into(),
+                            colnames: Vec::new(),
+                        }),
+                    },
+                ))),
+            }],
+            where_clause: having.map(Box::new),
+            sort_clause: sort,
+            limit_count: s.limit_count.clone(),
+            limit_offset: s.limit_offset.clone(),
+            limit_option: s.limit_option,
+            op: pg_query::protobuf::SetOperation::SetopNone as i32,
+            ..Default::default()
+        },
+        ungrouped,
+    ))
 }

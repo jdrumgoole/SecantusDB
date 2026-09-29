@@ -1,0 +1,7 @@
+DROP TABLE IF EXISTS ec_t
+DROP TABLE IF EXISTS ec_u
+DROP EXTENSION IF EXISTS hstore CASCADE
+CREATE EXTENSION hstore
+CREATE TABLE ec_t (id int PRIMARY KEY, h hstore, n int)
+CREATE TABLE ec_u (id int PRIMARY KEY, hs hstore[])
+INSERT INTO ec_t VALUES (1, 'a=>1', 5)
