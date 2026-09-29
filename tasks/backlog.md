@@ -819,14 +819,6 @@ remain open:
       both for a constant and for a stored column. The `::text` twin was
       fixed with the role catalog (the cast chain now carries the source
       type); the `timestamp` target still sees only the UTC carrier.
-- [ ] **OPEN — RUST pgserver: `SELECT *` / `t.*` over a JOIN or a comma
-      FROM (2026-09-10).** `select * from t1, t2` and `select t1.*, t2.f3
-      from t1 join t2 on ...` are 0A000 `this subquery target`; the join
-      planner expands only named targets. (The comma FROM itself, `regclass`
-      and the RowDescription's `ftable` / `ftablecol` landed with
-      `test_ftable_and_col`; a table created before row types were recorded
-      has no relation oid and still reports 0 / 0, and aggregate outputs
-      report 0 / 0 without measuring PostgreSQL.)
 - [ ] **OPEN — RUST pgserver: a cast to an unknown type is 0A000, not 42704
       (2026-09-09).** `select 1::no_such_type` is `0A000 a cast to
       no_such_type is not supported yet`; PostgreSQL 16 is `42704 type
@@ -6980,11 +6972,11 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       | ~~`CASE`~~ | **DONE 2026-09-28** | both forms; still refused inside a bare `WHERE` |
       | ~~window functions~~ | **DONE 2026-09-28** | a window over an AGGREGATE is still refused |
       | ~~`ORDER BY` over an expression~~ | **DONE 2026-09-28** | |
-      | `SELECT *` / `t.*` over a JOIN or comma FROM | `select * from t1, t2` | `this subquery target` |
+      | ~~`SELECT *` / `t.*` over a JOIN or comma FROM~~ | **DONE 2026-09-29** | with the general JOIN planner |
       | ~~array subscripting~~ | **DONE 2026-09-29** | read AND `SET a[i] = v`; below subscript 1 refused |
-      | `CREATE INDEX` | | `IndexStmt` |
+      | ~~`CREATE INDEX`~~ | **DONE 2026-09-29** | btree/hash, UNIQUE, partial, INCLUDE; expression keys refused |
       | ~~`ALTER TABLE`, any form~~ | **DONE 2026-09-28**, incl. RENAME | `USING`, and ADD of a UNIQUE/PK/FK |
-      | `CREATE VIEW` | | `ViewStmt` |
+      | ~~`CREATE VIEW`~~ | **DONE 2026-09-29** | read-only: writes through a view refused |
       | `CREATE TRIGGER` | | `CreateTrigStmt` |
       | `EXPLAIN` | | `ExplainStmt` |
       | composite `PRIMARY KEY` / multi-col `FOREIGN KEY` | | `a composite PRIMARY KEY` |
@@ -7233,13 +7225,12 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       application SQL and also gate any broader SQL gauge.~~ **SHIPPED
       2026-09-28** — see the entry below for what is left of it.
 
-- [ ] **OPEN — RUST pgserver: four catalog-corpus lines left, and two of
-      them wait on `CREATE INDEX` (2026-09-28).** `information_schema` and
+- [ ] **OPEN — RUST pgserver: three catalog-corpus lines left
+      (2026-09-28; `pg_indexes` fixed 2026-09-29 with CREATE INDEX).** `information_schema` and
       the catalog views landed, taking `catalog.sql` from 19 divergences of 22
       to 4 and finishing `sequences.sql` at 0. What is left:
 
       ```
-      pg_indexes                     -- misses a CREATE INDEX'd index
       pg_index JOIN pg_attribute     -- 0A000 this ON clause (ANY(i.indkey))
       to_regclass('t')               -- needs the CATALOG in the expression
       has_table_privilege('t', ...)  -- same
@@ -7300,86 +7291,107 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       rolls back with its transaction. PostgreSQL never re-issues a value.
       Making that faithful needs a write outside the transaction.
 
-- [ ] **OPEN — RUST pgserver: `CREATE INDEX` and `CREATE VIEW` are what is
-      left of the DDL corpus (2026-09-28).** `ALTER TABLE` and `RENAME`
-      landed, taking `tools/probes/pg_corpora/ddl.sql` from 28 divergences of
-      41 to 7 against PostgreSQL 14.13. All seven are index or view:
+- [ ] **OPEN — RUST pgserver: what CREATE INDEX / CREATE VIEW still refuse
+      (landed 2026-09-29).** `ddl.sql` 7 divergences of 41 -> 0; the new
+      `indexes.sql` is 2 of 48 and `views.sql` 2 of 44, every one a refusal
+      by name:
 
-      ```
-      CREATE INDEX / CREATE UNIQUE INDEX / DROP INDEX   -> 0A000 IndexStmt
-      CREATE [OR REPLACE] VIEW / DROP VIEW              -> 0A000 ViewStmt
-      SELECT ... FROM <a view>                          -> 42P01
-      ```
+      * **An index over an EXPRESSION** (`create index on t (lower(b))`),
+        a non-default `NULLS FIRST/LAST`, an operator class, a `COLLATE`, and
+        the gin / gist / brin / spgist access methods. A non-unique one of
+        these changes no answer, so accepting it as metadata only is the cheap
+        path; a UNIQUE expression index enforces, and needs the hidden-field
+        scheme the Python server uses (`ExprIndex`).
+      * **Writing THROUGH a view** (`insert into v ...`): PostgreSQL's
+        auto-updatable views (one table, no aggregates / DISTINCT / LIMIT /
+        set operations, plain column targets) plus `WITH CHECK OPTION`.
+        Refused as `0A000 INSERT into a view`; the check option is stored.
+      * **A view breaks on `ALTER TABLE ... RENAME COLUMN`** of a column it
+        reads: the definition is stored as TEXT (the shared on-disk shape),
+        where PostgreSQL binds by attnum. Not probed against PostgreSQL yet.
+      * `ALTER TABLE ADD CONSTRAINT UNIQUE` and a partial-index `ON CONFLICT`
+        arbiter, which the backlog said waited on CREATE INDEX, are still
+        refused -- the index machinery now exists for both.
 
-      **They are different jobs, and the index one is the load-bearing half.**
-      A SQL index has to map onto a STORAGE index — `create_unique_indexes`
-      already does that for a `UNIQUE` constraint, so `CREATE UNIQUE INDEX`
-      is close to it, while a non-unique one needs the planner to know the
-      index exists for it to be worth anything. It is also what unblocks two
-      entries already in this file: a partial-index `ON CONFLICT` arbiter, and
-      `ALTER TABLE ADD CONSTRAINT UNIQUE` (refused today for the same reason —
-      an index has to be built over rows that already exist).
+      **Two things worth not re-deriving.** A unique index is built with a
+      partial filter excluding NULL from every key column, which is how SQL's
+      "NULLs are distinct" survives a storage unique index that collides them
+      -- the same trick the UNIQUE constraint's index already used -- and it
+      records `sqlNullsDistinct` so `pg_indexes` does not render that filter
+      as the user's WHERE. And a violation now names the INDEX: before, the
+      23505 path guessed `<table>_<cols>_key` from the columns.
 
-      A VIEW needs its defining query stored in the catalog and expanded at
-      plan time, which is the FROM-subquery machinery pointed at a stored
-      statement rather than an inline one.
+      **What ALTER still refuses, and why** (carried over from the DDL entry
+      this replaced): `ALTER COLUMN TYPE ... USING` (the expression rewrites
+      the value rather than casting it), and `ADD COLUMN` carrying `PRIMARY
+      KEY` / `UNIQUE` / `REFERENCES` / a `serial` (each needs an index or a
+      sequence built over existing rows). Each is refused by its own name.
 
-      **What ALTER still refuses, and why:** `ALTER COLUMN TYPE ... USING`
-      (the expression rewrites the value rather than casting it), and
-      `ADD COLUMN` carrying `PRIMARY KEY` / `UNIQUE` / `REFERENCES` / a
-      `serial` (each needs an index or a sequence built over existing rows).
-      Each is refused by its own name.
-
-      **One rule here was measured rather than assumed, and it is easy to get
+      **One rule there was measured rather than assumed, and it is easy to get
       backwards.** `ALTER COLUMN TYPE` is allowed exactly where an ASSIGNMENT
       cast exists, which is a property of the TYPES and not of the values:
       `text -> int` is `42804` even when every value is a digit string. The
       matrix (31 pairs on 14.24) is: to a STRING type always; within the
       numeric family; within the date/time family; `json` and `jsonb`; a type
-      to itself. Everything else needs `USING`. Deciding it by trying the cast
-      per row made the same statement succeed or fail depending on the data.
+      to itself. Everything else needs `USING`.
 
-- [ ] **OPEN — RUST pgserver: a CORRELATED subquery is refused, and that is
-      the whole remainder of the subquery work (2026-09-28).** Uncorrelated
-      subqueries, FROM-subqueries and non-recursive CTEs all landed; measured
-      on a 50-line corpus against PostgreSQL 14.13
-      (`tools/probes/pg_corpora/subqueries.sql`), 5 of 50 diverge and all five
-      are correlated:
+- [ ] **OPEN — RUST pgserver: correlated subqueries landed (2026-09-29);
+      what is left.** `subqueries.sql` 5 of 50 -> 0 (53 lines now), `joins.sql`
+      0 of 38, and the new `correlated.sql` 1 of 24. A correlated subquery
+      becomes an internal per-row call (`secantus-pgplan/src/correlated.rs`):
+      its outer references are `$N` parameters of the stored inner SQL, and
+      the executor plans and runs it per outer row, memoised by the bound
+      values. EXISTS / NOT EXISTS / IN / ANY / ALL / ARRAY / scalar, in WHERE,
+      the select list, ORDER BY, CASE, an UPDATE's SET and an UPDATE / DELETE
+      WHERE (which gained a per-row RESIDUAL for this).
 
-      ```
-      select id from d where exists (select 1 from e where e.dept_id = d.id)
-      select d.name, (select count(*) from e where e.dept_id = d.id) from d
-      ```
+      * **Left: correlation through an AGGREGATE** -- `having count(*) =
+        (select ... where x.dept_id = min(d.id))` answers `0A000 function
+        min() is not supported yet`, which is false.
+      * **Cost**: O(distinct outer values) plans and scans. PostgreSQL turns
+        EXISTS / IN into a semi-join; doing that here (the general JOIN
+        planner now exists) is the performance follow-up. Not measured.
+      * **The qualifier check still matters**: correlation is detected by a
+        qualifier naming nothing inside, because the lowering resolves a
+        column by its last name part. `foreign_qualifier` is what routes
+        `e.dept_id = d.id` to the per-row path instead of binding `d.id` to
+        the inner table's own `id`.
 
-      **Why it was refused rather than approximated.** An uncorrelated
-      subquery is evaluated ONCE and replaced by the values it returned, which
-      is both what PostgreSQL does and what lets the existing `ANY`/`ALL`
-      lowering serve it. A correlated one has a different value per outer row,
-      so there is nothing to substitute.
+- [ ] **OPEN — RUST pgserver: the general JOIN planner has no predicate
+      pushdown (2026-09-29).** A join is planned as a source whose leaves are
+      `SELECT * FROM <leaf>` (`secantus-pgplan/src/joins.rs`), hash-joined on
+      the ON clause's column equalities; the query's WHERE runs on the joined
+      rows. So every join reads both tables in full, however selective the
+      WHERE. Correct, and not measured. Pushing a single-leaf conjunct into its
+      leaf is safe for an inner join and for the PRESERVED side of an outer
+      one -- NOT the nullable side, which is exactly the bug the narrow join
+      path had (a LEFT JOIN pre-filter keeping NULL-extended rows). The narrow
+      two-table path still goes first, because psycopg's catalog queries rely
+      on its regtype-aware OID equality; that is the other reason to measure
+      before trusting the general path on catalog tables.
 
-      **The shape a fix would take, and the cost, measured rather than
-      guessed.** The pieces already exist: `ColumnExpr::Row` rewrites column
-      references into parameters numbered past the statement's own and
-      evaluates the node per row, and `plan_select` can be called on a stored
-      AST with a fresh parameter list. So the inner `SelectStmt` can be kept
-      in the plan, its outer references rewritten to `$N`, and the subquery
-      re-planned and re-run per outer row. That is O(rows) plans and O(rows)
-      scans — correct, and slow enough that it should be measured before it is
-      called done. A semi-join rewrite for the `EXISTS` / `IN` cases (the
-      common ones) would avoid the per-row cost and is the better target.
+- [ ] **OPEN — RUST pgserver: catalog columns carry the wrong wire TYPE
+      (found 2026-09-29, `catalog` corpus with `--types`).** Values match;
+      OIDs do not. `information_schema.*` string columns (`column_name`,
+      `data_type`, `is_nullable`, `table_type`, `constraint_type`, ...) go out
+      as `text` (25) where PostgreSQL sends its domains' base type -- `name`
+      (19) for `sql_identifier`, `varchar` (1043) for `character_data` /
+      `yes_or_no`. `pg_class.relkind` goes out as `bpchar` (1042) where
+      PostgreSQL's is `"char"` (18). A client that decodes by OID reads these
+      differently; psql and psycopg's text path do not notice.
 
-      **The trap, which cost a wrong answer during the uncorrelated work.**
-      Correlation cannot be detected by trying to plan the subquery and
-      catching `42703`: the lowering resolves a column by the LAST part of its
-      name and IGNORES the qualifier, so `e.dept_id = d.id` bound the outer
-      `d.id` to the inner table's own `id` and planned CLEAN. The EXISTS then
-      answered true for every outer row — a wrong answer, caught only by
-      diffing against PostgreSQL. `foreign_qualifier` now refuses any
-      qualified reference whose qualifier names nothing in the subquery's own
-      FROM, and `tests/test_rust_pgserver_slice.py::
-      test_a_correlated_subquery_is_refused_not_answered_wrongly` pins it.
-      Anything that makes correlated subqueries WORK must keep that check
-      honest, because the qualifier is still ignored everywhere else.
+- [ ] **OPEN — PYTHON pgserver: CREATE INDEX diverges from PostgreSQL 14.13
+      on 13 of 48 lines of `indexes.sql` (found 2026-09-29).** Three are
+      INTERNAL ERRORS reaching the client as `XX000`: a `CREATE UNIQUE INDEX`
+      over rows that already collide, and an UPDATE into a unique index's
+      duplicate (the storage `IndexConflict` is not translated to 23505). The
+      rest: a default index name is the Mongo form (`b_1`, `a_1_b_1`) rather
+      than `<table>_<cols>_idx`; an index name is not checked against the
+      relation namespace (`CREATE INDEX t ON other (...)` and `CREATE TABLE
+      <index name>` both succeed); dropping a UNIQUE constraint's index is
+      allowed (PostgreSQL: 2BP01); `DROP INDEX a, b` is `42601`; `USING hash`
+      and `INCLUDE (...)` are not rendered in `pg_indexes.indexdef`. The
+      corpus is `tools/probes/pg_corpora/indexes.sql` (run WITHOUT `--rust`).
 
 - [ ] **OPEN — RUST pgserver: a window function over an AGGREGATE, which is
       all that is left of the window work (2026-09-28).** Everything else
@@ -7392,12 +7404,11 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
         -> 0A000 a window function over an aggregate is not supported yet
       ```
 
-      **Two more sources refuse a window, for the same structural reason.**
-      Both are honest and named, and both are shapes real SQL uses:
+      **One more source refuses a window** (a window over a JOIN WORKS since
+      2026-09-29 -- the general JOIN planner hands the planner a single
+      source):
 
       ```
-      select a.n, row_number() over (order by a.n) from a join b on b.id = a.id
-        -> 0A000 a window function over a JOIN is not supported yet
       select n, row_number() over (order by n) from generate_series(1,3) as t(n)
         -> 0A000 a window function over a generated source is not supported yet
       ```
@@ -7462,29 +7473,6 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
         ORDER BY, so every row became a peer and `sum(v) OVER w` answered the
         whole-partition total where PostgreSQL gives a running one: a wrong
         answer, not an error.
-
-- [ ] **WATCH — an uncorrelated subquery runs at PLAN time, so a VOLATILE
-      function inside one would fire on a bare `Describe` (2026-09-28).**
-      Not reachable today and checked rather than assumed: the Rust PG server
-      implements neither `nextval` (`function nextval() is not supported yet`,
-      even for a `serial` column's implicit sequence) nor `CREATE SEQUENCE`
-      (`CreateSeqStmt`), so nothing side-effecting can appear in a subquery at
-      all. The refusal propagates out of the subquery correctly.
-
-      **It becomes real the day `nextval` lands.** `resolve_one_sublink` runs
-      the subquery during planning, and planning happens on `Describe` as well
-      as on `Execute` — psycopg sends a `Describe` straight after `Parse`, so
-      `select (select nextval('s'))` would advance the sequence once for the
-      describe and once for the execute, where PostgreSQL advances it once.
-      Fix when it matters: skip the resolution when the plan is only being
-      described (the describe path does not need the subquery's VALUE, only
-      its type), or refuse a volatile function inside a subquery.
-
-      Probe: `crates/secantus-pgserver/target/debug/secantusd-pg <store>
-      127.0.0.1:<port> --database probe`, driven with psycopg 3. **Rebuild
-      first** — the binary found on this box was stale, and `--version` prints
-      the `crates/` tree it was built from (`git rev-parse HEAD:crates`), which
-      is the cheap check.
 
 - [ ] **OPEN — RUST pgserver: a wrong password still connects, CONFIRMED live
       (2026-09-28).** The existing entry above records that `CREATE / ALTER ROLE

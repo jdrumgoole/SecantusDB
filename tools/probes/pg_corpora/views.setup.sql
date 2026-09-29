@@ -1,0 +1,9 @@
+DROP VIEW IF EXISTS vv3
+DROP VIEW IF EXISTS vv2
+DROP VIEW IF EXISTS vv1
+DROP TABLE IF EXISTS vt
+DROP TABLE IF EXISTS vt2
+CREATE TABLE vt (id int PRIMARY KEY, g text, n int)
+CREATE TABLE vt2 (id int PRIMARY KEY, label text)
+INSERT INTO vt VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 30), (4, 'b', NULL)
+INSERT INTO vt2 VALUES (1, 'one'), (3, 'three')

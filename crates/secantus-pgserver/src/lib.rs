@@ -1198,6 +1198,9 @@ impl PgHandler {
     /// counter; `typarray` is DERIVED as `oid + 100_000`, never stored.)
     const SCHEMA_COLLECTION: &'static str = "__sql_schemas__";
     const COMPOSITE_COLLECTION: &'static str = "__sql_composites__";
+    /// Views: `{_id, view, definition, check_option}`, the Python server's
+    /// `__sql_views__` shape, so either server reads the other's.
+    const VIEW_COLLECTION: &'static str = "__sql_views__";
     /// `public`'s `pg_namespace` oid, fixed on every install (measured 2200
     /// on 14.24, alongside `pg_catalog` at 11). `pg_constraint.connamespace`
     /// reports it for a non-temp table.
@@ -1298,6 +1301,9 @@ impl PgHandler {
     /// Build the planner's user-type tables from the catalog and publish
     /// them to this thread. `install_user_types` is the gate in front.
     fn publish_user_types(&self) {
+        // Views ride the same per-version gate: a view is expanded by the
+        // planner, which cannot read the catalog itself.
+        secantus_pgplan::set_views(self.views().unwrap_or_default());
         // Enums resolve by name too. A `public` enum resolves by its bare name
         // (public is on the default search_path); a schema-qualified one
         // resolves only as `schema.name`, exactly like composites and ranges.
@@ -2196,6 +2202,9 @@ impl PgHandler {
     /// pre-rename name and find nothing. Two outputs may also share a name,
     /// which a name-keyed rebuild would collapse into one.
     fn materialise_sub(&self, stmt: &Statement, def: &TableDef) -> PgWireResult<Vec<Document>> {
+        if let Statement::JoinRows(join) = stmt {
+            return self.join_rows(&join.tree);
+        }
         let (_, rows) = self.rows_with_schema(stmt)?;
         Ok(rows
             .into_iter()
@@ -2211,6 +2220,193 @@ impl PgHandler {
                 d
             })
             .collect())
+    }
+
+    /// The rows of a general JOIN (see `secantus_pgplan::joins`), keyed by
+    /// the joined keys the rewritten query reads.
+    ///
+    /// Each pair is found by hashing on the ON's column equalities when it
+    /// has any, and ALWAYS decided by the ON itself: the hash only narrows
+    /// the candidates, so a value it cannot normalise (a numeric, a date)
+    /// falls back to comparing every pair rather than to a wrong answer.
+    fn join_rows(&self, node: &secantus_pgplan::joins::JoinNode) -> PgWireResult<Vec<Document>> {
+        use secantus_pgplan::joins::{JoinKind, JoinNode};
+        match node {
+            JoinNode::Leaf { plan, def, columns } => {
+                let docs = self.materialise_sub(plan, def)?;
+                Ok(docs
+                    .into_iter()
+                    .map(|d| {
+                        let mut out = Document::new();
+                        for (key, field) in columns {
+                            out.insert(key.clone(), d.get(field).cloned().unwrap_or(Bson::Null));
+                        }
+                        out
+                    })
+                    .collect())
+            }
+            JoinNode::Join {
+                kind,
+                left,
+                right,
+                on,
+                equi,
+                merged,
+                left_keys,
+                right_keys,
+            } => {
+                let lrows = self.join_rows(left)?;
+                let rrows = self.join_rows(right)?;
+                let combine = |l: Option<&Document>, r: Option<&Document>| -> Document {
+                    let mut d = Document::new();
+                    for (key, lk, rk) in merged {
+                        let lv = l
+                            .and_then(|l| l.get(lk))
+                            .filter(|v| !matches!(v, Bson::Null));
+                        let rv = r
+                            .and_then(|r| r.get(rk))
+                            .filter(|v| !matches!(v, Bson::Null));
+                        let v = match kind {
+                            JoinKind::Right => rv,
+                            JoinKind::Full => lv.or(rv),
+                            _ => lv,
+                        };
+                        d.insert(key.clone(), v.cloned().unwrap_or(Bson::Null));
+                    }
+                    for k in left_keys {
+                        d.insert(
+                            k.clone(),
+                            l.and_then(|l| l.get(k)).cloned().unwrap_or(Bson::Null),
+                        );
+                    }
+                    for k in right_keys {
+                        d.insert(
+                            k.clone(),
+                            r.and_then(|r| r.get(k)).cloned().unwrap_or(Bson::Null),
+                        );
+                    }
+                    d
+                };
+                let passes = |d: &Document| -> PgWireResult<bool> {
+                    match on {
+                        None => Ok(true),
+                        Some(expr) => Ok(matches!(
+                            secantus_pgplan::apply_row_expr(expr, d).map_err(|e| Self::err(&e))?,
+                            Bson::Boolean(true)
+                        )),
+                    }
+                };
+                // Candidates per left row: every right row, or those sharing
+                // the equality keys' hash.
+                let hash_key = |d: &Document, keys: &[&String]| -> Option<Vec<String>> {
+                    keys.iter()
+                        .map(|k| match d.get(k.as_str()) {
+                            Some(Bson::Int32(v)) => Some(format!("n{v}")),
+                            Some(Bson::Int64(v)) => Some(format!("n{v}")),
+                            Some(Bson::String(v)) => Some(format!("s{v}")),
+                            Some(Bson::Boolean(v)) => Some(format!("b{v}")),
+                            _ => None,
+                        })
+                        .collect()
+                };
+                let lk: Vec<&String> = equi.iter().map(|(l, _)| l).collect();
+                let rk: Vec<&String> = equi.iter().map(|(_, r)| r).collect();
+                let mut index: HashMap<Vec<String>, Vec<usize>> = HashMap::new();
+                let mut unhashable: Vec<usize> = Vec::new();
+                let hashed = !equi.is_empty();
+                if hashed {
+                    for (i, r) in rrows.iter().enumerate() {
+                        match hash_key(r, &rk) {
+                            Some(k) => index.entry(k).or_default().push(i),
+                            // A NULL key never equals anything, but a type the
+                            // hash does not model might: compare it the slow way.
+                            None if rk
+                                .iter()
+                                .any(|k| matches!(r.get(k.as_str()), Some(Bson::Null) | None)) => {}
+                            None => unhashable.push(i),
+                        }
+                    }
+                }
+                let all: Vec<usize> = (0..rrows.len()).collect();
+                let mut right_matched = vec![false; rrows.len()];
+                let mut out = Vec::new();
+                for l in &lrows {
+                    let candidates: Vec<usize> = if !hashed {
+                        all.clone()
+                    } else {
+                        match hash_key(l, &lk) {
+                            Some(k) => {
+                                let mut c = index.get(&k).cloned().unwrap_or_default();
+                                c.extend(unhashable.iter().copied());
+                                c
+                            }
+                            None if lk
+                                .iter()
+                                .any(|k| matches!(l.get(k.as_str()), Some(Bson::Null) | None)) =>
+                            {
+                                Vec::new()
+                            }
+                            None => all.clone(),
+                        }
+                    };
+                    let mut matched = false;
+                    for i in candidates {
+                        let d = combine(Some(l), Some(&rrows[i]));
+                        if passes(&d)? {
+                            matched = true;
+                            right_matched[i] = true;
+                            out.push(d);
+                        }
+                    }
+                    if !matched && matches!(kind, JoinKind::Left | JoinKind::Full) {
+                        out.push(combine(Some(l), None));
+                    }
+                }
+                if matches!(kind, JoinKind::Right | JoinKind::Full) {
+                    for (i, r) in rrows.iter().enumerate() {
+                        if !right_matched[i] {
+                            out.push(combine(None, Some(r)));
+                        }
+                    }
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// A write's filter, narrowed by a RESIDUAL predicate the planner could
+    /// not lower: the candidates are read, the residual decides each, and the
+    /// write then targets exactly the `_id`s it accepted.
+    fn narrow_by_residual(
+        &self,
+        table: &str,
+        filter: &Document,
+        residual: Option<secantus_pgplan::ColumnExpr>,
+    ) -> PgWireResult<Document> {
+        let Some(residual) = residual else {
+            return Ok(filter.clone());
+        };
+        let raw = self
+            .storage
+            .find_matching(self.db(), table, filter)
+            .map_err(|e| Self::storage_err("could not read", e))?;
+        let mut ids = Vec::new();
+        for bytes in raw {
+            let d: Document = bson::from_slice(&bytes)
+                .map_err(|e| Self::storage_err("could not decode a row", e))?;
+            if matches!(
+                secantus_pgplan::apply_row_expr(&residual, &d).map_err(|e| Self::err(&e))?,
+                Bson::Boolean(true)
+            ) {
+                ids.push(d.get("_id").cloned().unwrap_or(Bson::Null));
+            }
+        }
+        let by_id = bson::doc! { "_id": { "$in": ids } };
+        Ok(if filter.is_empty() {
+            by_id
+        } else {
+            bson::doc! { "$and": [filter.clone(), by_id] }
+        })
     }
 
     /// The rows of a `FROM (SELECT ...) s` source, with the outer query's
@@ -2496,8 +2692,9 @@ impl PgHandler {
     /// conflict (`create schema s; create type e as enum (...)` on a fresh
     /// store did exactly that). The rows are server bookkeeping, not
     /// something a `ROLLBACK` should undo, so they belong before the block.
-    const CATALOG_COLLECTIONS: [&'static str; 7] = [
+    const CATALOG_COLLECTIONS: [&'static str; 8] = [
         CATALOG_COLLECTION,
+        Self::VIEW_COLLECTION,
         SEQUENCE_COLLECTION,
         Self::SCHEMA_COLLECTION,
         Self::COMPOSITE_COLLECTION,
@@ -3092,6 +3289,379 @@ impl PgHandler {
                 );
             }
         }
+    }
+
+    /// `pg_indexes.indexdef` for an index `CREATE INDEX` built, or `None` for
+    /// one that is not that: storage's `_id_` (reported as `<t>_pkey`), a
+    /// UNIQUE constraint's (reported from the constraint), and an index over
+    /// something that is not a column.
+    fn created_index_def(t: &TableDef, schema: &str, ix: &Document) -> Option<String> {
+        let name = ix.get_str("name").ok()?;
+        if name == "_id_" || t.unique_constraints.iter().any(|u| u.name == name) {
+            return None;
+        }
+        let key = ix.get_document("key").ok()?;
+        let mut cols = Vec::new();
+        for (field, dir) in key {
+            let col = t.columns.iter().find(|c| &c.field() == field)?;
+            let desc = matches!(dir, Bson::Int32(-1) | Bson::Int64(-1))
+                || matches!(dir, Bson::Double(d) if *d < 0.0);
+            cols.push(if desc {
+                format!("{} DESC", col.name)
+            } else {
+                col.name.clone()
+            });
+        }
+        let unique = if ix.get_bool("unique").unwrap_or(false) {
+            "UNIQUE "
+        } else {
+            ""
+        };
+        let method = ix.get_str("sqlMethod").unwrap_or("btree");
+        let mut out = format!(
+            "CREATE {unique}INDEX {name} ON {schema}.{} USING {method} ({})",
+            t.name,
+            cols.join(", ")
+        );
+        if let Ok(include) = ix.get_array("include") {
+            let names: Vec<&str> = include.iter().filter_map(Bson::as_str).collect();
+            if !names.is_empty() {
+                out.push_str(&format!(" INCLUDE ({})", names.join(", ")));
+            }
+        }
+        if let Ok(pred) = ix.get_str("sqlPredicate") {
+            out.push_str(&format!(" WHERE {pred}"));
+        }
+        Some(out)
+    }
+
+    /// PostgreSQL's 2BP01 for a RESTRICT drop that something depends on: one
+    /// DETAIL line per dependant.
+    fn dependants_error(what: &str, dependants: &[String]) -> PgWireError {
+        let mut info = ErrorInfo::new(
+            "ERROR".into(),
+            "2BP01".into(), // dependent_objects_still_exist
+            format!("cannot drop {what} because other objects depend on it"),
+        );
+        let lines: Vec<String> = dependants
+            .iter()
+            .map(|d| format!("view {d} depends on {what}"))
+            .collect();
+        info.detail = Some(lines.join("\n"));
+        info.hint = Some("Use DROP ... CASCADE to drop the dependent objects too.".into());
+        PgWireError::UserError(Box::new(info))
+    }
+
+    /// Every view: `(name, stored definition)`, name-sorted, with this
+    /// transaction's uncommitted creates and drops applied.
+    fn views(&self) -> PgWireResult<Vec<(String, String)>> {
+        let mut out: Vec<(String, String)> = self
+            .type_catalog_docs(Self::VIEW_COLLECTION)?
+            .iter()
+            .filter_map(|d| {
+                let name = d
+                    .get_str("view")
+                    .or_else(|_| d.get_str("_id"))
+                    .ok()?
+                    .to_string();
+                let definition = d.get_str("definition").ok()?.to_string();
+                Some((name, definition))
+            })
+            .collect();
+        out.sort();
+        Ok(out)
+    }
+
+    fn delete_view(&self, name: &str) -> PgWireResult<()> {
+        self.storage
+            .delete_matching(
+                self.db(),
+                Self::VIEW_COLLECTION,
+                &bson::doc! { "_id": name },
+                0,
+                &Document::new(),
+                None,
+            )
+            .map_err(|e| Self::storage_err("could not drop the view", e))?;
+        self.note_uncommitted_type(Self::VIEW_COLLECTION, name, None);
+        Ok(())
+    }
+
+    /// Every index a `CREATE INDEX` or a UNIQUE constraint built, with the
+    /// table it is on -- storage's own `_id_` excluded, since the primary key
+    /// is reported as `<t>_pkey` from the catalog instead.
+    fn all_indexes(&self) -> PgWireResult<Vec<(TableDef, Document)>> {
+        let mut out = Vec::new();
+        for def in self.all_table_defs()? {
+            let indexes = self
+                .storage
+                .list_indexes(self.db(), &def.name)
+                .map_err(|e| Self::storage_err("could not list the indexes", e))?;
+            for ix in indexes {
+                if ix.get_str("name") == Ok("_id_") {
+                    continue;
+                }
+                out.push((def.clone(), ix));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Is `name` taken in the relation namespace -- a table, a view, a
+    /// sequence, an index, a composite type or a catalog relation? PostgreSQL
+    /// keeps them all in one `pg_class`, so each collides with the others.
+    fn relation_exists(&self, name: &str) -> PgWireResult<bool> {
+        if self.lookup(name).is_some() || self.views()?.iter().any(|(n, _)| n == name) {
+            return Ok(true);
+        }
+        if self.composites()?.iter().any(|(n, _, _)| n == name) {
+            return Ok(true);
+        }
+        Ok(self
+            .all_indexes()?
+            .iter()
+            .any(|(_, ix)| ix.get_str("name") == Ok(name)))
+    }
+
+    /// `CREATE [UNIQUE] INDEX`.
+    fn create_index(&self, ci: secantus_pgplan::CreateIndex) -> PgWireResult<Vec<Response>> {
+        let def = self
+            .lookup(&ci.table)
+            .ok_or_else(|| Self::err(&PlanError::UndefinedTable(ci.table.clone())))?;
+        let name = match &ci.name {
+            Some(n) => n.clone(),
+            None => {
+                // PostgreSQL's ChooseRelationName: `<table>_<cols>_idx`, then
+                // a number appended until it is free.
+                let cols: Vec<&str> = ci.columns.iter().map(|(c, _)| c.as_str()).collect();
+                let base = format!("{}_{}_idx", ci.table, cols.join("_"));
+                let mut candidate = base.clone();
+                let mut n = 0;
+                while self.relation_exists(&candidate)? {
+                    n += 1;
+                    candidate = format!("{base}{n}");
+                }
+                candidate
+            }
+        };
+        if self.relation_exists(&name)? {
+            if ci.if_not_exists {
+                self.notice(
+                    "42P07",
+                    format!("relation \"{name}\" already exists, skipping"),
+                    None,
+                );
+                return Ok(vec![Response::Execution(Tag::new("CREATE INDEX"))]);
+            }
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "42P07".into(), // duplicate_table
+                format!("relation \"{name}\" already exists"),
+            ))));
+        }
+        let mut key_spec = Document::new();
+        let mut fields = Vec::new();
+        for (col, desc) in &ci.columns {
+            let field = def
+                .field_of(col)
+                .ok_or_else(|| Self::err(&PlanError::UndefinedColumn(col.clone())))?;
+            key_spec.insert(field.clone(), if *desc { -1_i32 } else { 1_i32 });
+            fields.push(field);
+        }
+        let mut options = Document::new();
+        let mut clauses: Vec<Bson> = Vec::new();
+        if ci.unique {
+            options.insert("unique", true);
+            // SQL NULLs are DISTINCT, while a storage unique index collides
+            // them: excluding NULL from every key column reproduces the SQL
+            // rule, exactly as a declared UNIQUE constraint's index does.
+            for f in &fields {
+                clauses.push(Bson::Document(
+                    bson::doc! { f.clone(): { "$ne": Bson::Null } },
+                ));
+            }
+            options.insert("sqlNullsDistinct", true);
+        }
+        if let Some(p) = &ci.predicate {
+            clauses.push(Bson::Document(p.clone()));
+        }
+        match clauses.len() {
+            0 => {}
+            1 => {
+                options.insert("partialFilterExpression", clauses.remove(0));
+            }
+            _ => {
+                options.insert("partialFilterExpression", bson::doc! { "$and": clauses });
+            }
+        }
+        if let Some(sql) = &ci.predicate_sql {
+            options.insert("sqlPredicate", sql.as_str());
+        }
+        if !ci.include.is_empty() {
+            options.insert("include", ci.include.clone());
+        }
+        if ci.method != "btree" {
+            options.insert("sqlMethod", ci.method.as_str());
+        }
+        self.storage
+            .create_index(self.db(), &def.name, &name, &key_spec, &options)
+            .map_err(|e| match e {
+                secantus_storage::StorageError::DuplicateKey(c) => {
+                    let names: Vec<&str> = ci.columns.iter().map(|(c, _)| c.as_str()).collect();
+                    let values: Vec<String> = fields
+                        .iter()
+                        .map(|f| match c.key_value.get(f) {
+                            Some(Bson::String(v)) => v.clone(),
+                            Some(b) if secantus_pgplan::is_numeric(b) => {
+                                secantus_pgplan::numeric_text(b).unwrap_or_default()
+                            }
+                            Some(Bson::Null) | None => "null".to_string(),
+                            Some(b) => b.to_string().trim_matches('"').to_string(),
+                        })
+                        .collect();
+                    let mut info = ErrorInfo::new(
+                        "ERROR".into(),
+                        "23505".into(),
+                        format!("could not create unique index \"{name}\""),
+                    );
+                    info.detail = Some(format!(
+                        "Key ({})=({}) is duplicated.",
+                        names.join(", "),
+                        values.join(", ")
+                    ));
+                    PgWireError::UserError(Box::new(info))
+                }
+                other => Self::storage_err("could not create the index", other),
+            })?;
+        Ok(vec![Response::Execution(Tag::new("CREATE INDEX"))])
+    }
+
+    /// `CREATE [OR REPLACE] VIEW`: the definition is planned now, so a view
+    /// over a missing table or column fails here as PostgreSQL's does, and
+    /// its output columns are what OR REPLACE is checked against.
+    fn create_view(&self, cv: secantus_pgplan::CreateView) -> PgWireResult<Vec<Response>> {
+        let name = cv.name.clone();
+        let existing = self
+            .views()?
+            .into_iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, d)| d);
+        if existing.is_none() && self.relation_exists(&name)? {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "42P07".into(),
+                format!("relation \"{name}\" already exists"),
+            ))));
+        }
+        if existing.is_some() && !cv.replace {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "42P07".into(),
+                format!("relation \"{name}\" already exists"),
+            ))));
+        }
+        let body_fields = self.describe_fields(&cv.body, 0, &[])?.unwrap_or_default();
+        if cv.columns.len() > body_fields.len() {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "42601".into(),
+                "CREATE VIEW specifies more column names than columns".into(),
+            ))));
+        }
+        let fields = self
+            .describe_fields(&cv.definition, 0, &[])?
+            .unwrap_or_default();
+        {
+            let mut seen = HashSet::new();
+            for f in &fields {
+                if !seen.insert(f.name()) {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42701".into(), // duplicate_column
+                        format!("column \"{}\" specified more than once", f.name()),
+                    ))));
+                }
+            }
+        }
+        if let Some(old) = &existing {
+            // OR REPLACE may only ADD columns at the end: each existing one
+            // keeps its name and type (PostgreSQL's 42P16 rules).
+            let old_fields = self.describe_fields(old, 0, &[])?.unwrap_or_default();
+            if fields.len() < old_fields.len() {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".into(),
+                    "42P16".into(), // invalid_table_definition
+                    "cannot drop columns from view".into(),
+                ))));
+            }
+            for (o, n) in old_fields.iter().zip(fields.iter()) {
+                if o.name() != n.name() {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42P16".into(),
+                        format!(
+                            "cannot change name of view column \"{}\" to \"{}\"",
+                            o.name(),
+                            n.name()
+                        ),
+                    ))));
+                }
+                if o.datatype() != n.datatype() {
+                    let mut info = ErrorInfo::new(
+                        "ERROR".into(),
+                        "42P16".into(),
+                        format!(
+                            "cannot change data type of view column \"{}\" from {} to {}",
+                            o.name(),
+                            secantus_pgplan::display_type(
+                                secantus_pgplan::pgtypes::name_of_oid(i64::from(
+                                    o.datatype().oid()
+                                ))
+                                .unwrap_or("unknown")
+                            ),
+                            secantus_pgplan::display_type(
+                                secantus_pgplan::pgtypes::name_of_oid(i64::from(
+                                    n.datatype().oid()
+                                ))
+                                .unwrap_or("unknown")
+                            ),
+                        ),
+                    );
+                    info.hint = Some(
+                        "Use ALTER VIEW ... RENAME COLUMN ... to change name of view column instead."
+                            .into(),
+                    );
+                    return Err(PgWireError::UserError(Box::new(info)));
+                }
+            }
+        }
+        self.ensure_collection(Self::VIEW_COLLECTION)?;
+        let check = cv.check_option.as_deref().map_or(Bson::Null, Bson::from);
+        let doc = bson::doc! {
+            "_id": &name,
+            "view": &name,
+            "definition": &cv.definition,
+            "check_option": check,
+        };
+        if existing.is_some() {
+            self.storage
+                .delete_matching(
+                    self.db(),
+                    Self::VIEW_COLLECTION,
+                    &bson::doc! { "_id": &name },
+                    0,
+                    &Document::new(),
+                    None,
+                )
+                .map_err(|e| Self::storage_err("could not replace the view", e))?;
+        }
+        let bytes =
+            bson::to_vec(&doc).map_err(|e| Self::storage_err("could not encode the view", e))?;
+        self.storage
+            .insert(self.db(), Self::VIEW_COLLECTION, vec![bytes], true)
+            .map_err(|e| Self::storage_err("could not record the view", e))?;
+        self.note_uncommitted_type(Self::VIEW_COLLECTION, &name, Some(doc));
+        Ok(vec![Response::Execution(Tag::new("CREATE VIEW"))])
     }
 
     /// The base type (shell or defined) resolving under `key`
@@ -4055,6 +4625,18 @@ impl PgHandler {
                                 pk.join(", ")
                             ),
                         );
+                        rows.push(d);
+                    }
+                    for ix in self.storage.list_indexes(self.db(), &t.name).ok()? {
+                        let Some(indexdef) = Self::created_index_def(&t, &schema, &ix) else {
+                            continue;
+                        };
+                        let mut d = Document::new();
+                        d.insert(f("schemaname"), schema.as_str());
+                        d.insert(f("tablename"), t.name.as_str());
+                        d.insert(f("indexname"), ix.get_str("name").unwrap_or_default());
+                        d.insert(f("tablespace"), Bson::Null);
+                        d.insert(f("indexdef"), indexdef);
                         rows.push(d);
                     }
                     for u in &t.unique_constraints {
@@ -5222,7 +5804,13 @@ impl PgHandler {
             let empty = Document::new();
             let key_pattern = err.get_document("keyPattern").unwrap_or(&empty);
             let key_value = err.get_document("keyValue").unwrap_or(&empty);
-            return Self::unique_violation(table, def, key_pattern, key_value);
+            // `E11000 ... index: <name> dup key: ...`: the index is named in
+            // the message only.
+            let index = msg
+                .split_once(" index: ")
+                .and_then(|(_, rest)| rest.split_once(" dup key"))
+                .map(|(name, _)| name);
+            return Self::unique_violation(table, def, key_pattern, key_value, index);
         }
         Self::storage_err("could not insert", msg)
     }
@@ -5247,6 +5835,7 @@ impl PgHandler {
         def: &TableDef,
         key_pattern: &Document,
         key_value: &Document,
+        index: Option<&str>,
     ) -> PgWireError {
         // Stored field -> column name.
         let columns: Vec<String> = key_pattern
@@ -5263,6 +5852,11 @@ impl PgHandler {
         let is_pk = key_pattern.keys().any(|f| f == "_id");
         let name = if is_pk {
             format!("{table}_pkey")
+        } else if let Some(index) = index.filter(|i| *i != "_id_") {
+            // The storage index IS the constraint (a declared UNIQUE's index
+            // takes its name) or the `CREATE UNIQUE INDEX` itself, which is
+            // what PostgreSQL names in the message either way.
+            index.to_string()
         } else {
             def.unique_constraints
                 .iter()
@@ -6507,6 +7101,9 @@ impl PgHandler {
             // is what stops a later COMMIT from resurrecting it.
             Statement::CreateComposite { .. } => vec![Self::COMPOSITE_COLLECTION.to_string()],
             Statement::CreateEnum { .. } => vec![Self::ENUM_COLLECTION.to_string()],
+            Statement::CreateView(_) | Statement::DropView { .. } => {
+                vec![Self::VIEW_COLLECTION.to_string()]
+            }
             Statement::CreateRange { .. } => vec![Self::RANGE_COLLECTION.to_string()],
             Statement::CreateShellType { .. } | Statement::CreateBaseType { .. } => {
                 vec![Self::BASE_TYPE_COLLECTION.to_string()]
@@ -7732,14 +8329,16 @@ impl PgHandler {
         let run = |stmt: &Statement| -> std::result::Result<Vec<Vec<Bson>>, PlanError> {
             self.subquery_rows(stmt)
         };
-        let planned = secantus_pgplan::plan_with_session_types_and_subqueries(
-            sql,
-            &|n| self.lookup(n),
-            params,
-            param_types,
-            &tz,
-            Some(&run),
-        );
+        let planned = secantus_pgplan::planning_to_execute(|| {
+            secantus_pgplan::plan_with_session_types_and_subqueries(
+                sql,
+                &|n| self.lookup(n),
+                params,
+                param_types,
+                &tz,
+                Some(&run),
+            )
+        });
         self.collect_planner_warnings();
         if self.txn_failed.load(std::sync::atomic::Ordering::Relaxed) {
             let ends_the_block = matches!(
@@ -9703,6 +10302,10 @@ impl PgHandler {
     /// A row-producing statement as `(schema, rows)`: what a set operation
     /// needs from each of its sides.
     fn rows_with_schema(&self, stmt: &Statement) -> PgWireResult<SchemaAndRows> {
+        self.correlated_scope(|| self.rows_with_schema_inner(stmt))
+    }
+
+    fn rows_with_schema_inner(&self, stmt: &Statement) -> PgWireResult<SchemaAndRows> {
         match stmt {
             Statement::Select(sel) => {
                 let (docs, def) = self.select_docs(sel, 0)?;
@@ -9980,8 +10583,37 @@ impl PgHandler {
         env: &RowEnv,
     ) -> PgWireResult<QueryResponse> {
         let schema = Arc::new(self.row_schema(def, columns, casts));
-        let fields: Vec<String> = columns.iter().map(|(_, f)| f.clone()).collect();
-        let casts = casts.to_vec();
+        let mut fields: Vec<String> = columns.iter().map(|(_, f)| f.clone()).collect();
+        let mut casts = casts.to_vec();
+        // A column holding a CORRELATED subquery is evaluated now, while the
+        // runner that plans and runs it is installed; the stream below runs
+        // after this returns. Its value rides the row under a synthetic key.
+        let mut docs = docs;
+        if casts
+            .iter()
+            .flatten()
+            .any(secantus_pgplan::correlated::has_correlated)
+        {
+            self.correlated_scope(|| -> PgWireResult<()> {
+                for (i, cast) in casts.iter_mut().enumerate() {
+                    let Some(expr) = cast
+                        .as_ref()
+                        .filter(|e| secantus_pgplan::correlated::has_correlated(e))
+                    else {
+                        continue;
+                    };
+                    let key = format!("\u{1f}correlated{i}");
+                    for d in docs.iter_mut() {
+                        let v =
+                            secantus_pgplan::apply_row_expr(expr, d).map_err(|e| Self::err(&e))?;
+                        d.insert(key.clone(), v);
+                    }
+                    *cast = None;
+                    fields[i] = key;
+                }
+                Ok(())
+            })?;
+        }
         let (row_tz, row_ds, row_cenc) = (env.tz.clone(), env.ds, env.cenc);
         let tz = self.session_timezone();
         let schema_ref = schema.clone();
@@ -10124,6 +10756,43 @@ impl PgHandler {
     /// it, and that INSERT's lookup must not find the "no such table" the
     /// CTAS itself cached a moment earlier (see `CatalogCache`).
     fn execute(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response>> {
+        self.correlated_scope(|| self.execute_statement(stmt, max_rows))
+    }
+
+    /// Run `f` able to evaluate CORRELATED subqueries: each is planned and
+    /// run per outer row with that row's values bound, which only the
+    /// executor can do. Memoised by the bound values, so an outer column with
+    /// few distinct values costs few runs. Installed around both entry points
+    /// that produce rows -- a statement's execution and a streamed read.
+    fn correlated_scope<R>(&self, f: impl FnOnce() -> R) -> R {
+        let cache: std::cell::RefCell<HashMap<String, Vec<Vec<Bson>>>> =
+            std::cell::RefCell::new(HashMap::new());
+        let runner =
+            |sql: &str, params: &[Bson]| -> std::result::Result<Vec<Vec<Bson>>, PlanError> {
+                let key = format!("{sql}\u{0}{params:?}");
+                if let Some(rows) = cache.borrow().get(&key) {
+                    return Ok(rows.clone());
+                }
+                let tz = self.session_timezone();
+                let run = |stmt: &Statement| self.subquery_rows(stmt);
+                let stmt = secantus_pgplan::planning_to_execute(|| {
+                    secantus_pgplan::plan_with_session_types_and_subqueries(
+                        sql,
+                        &|n| self.lookup(n),
+                        params,
+                        &[],
+                        &tz,
+                        Some(&run),
+                    )
+                })?;
+                let rows = self.subquery_rows(&stmt)?;
+                cache.borrow_mut().insert(key, rows.clone());
+                Ok(rows)
+            };
+        secantus_pgplan::with_correlated_runner(&runner, f)
+    }
+
+    fn execute_statement(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response>> {
         let may_change_catalog = Self::may_change_catalog(&stmt);
         // Creating a temporary relation touches the temp namespace as
         // surely as opening one does (`lookup` covers the latter); PREPARE
@@ -10168,7 +10837,13 @@ impl PgHandler {
             Statement::DeclareCursor { .. } => unreachable!("handled before execute"),
             Statement::Do { .. } => unreachable!("handled before execute"),
             Statement::CreateTable(mut def, if_not_exists) => {
-                if self.lookup(&def.name).is_some() {
+                if self.lookup(&def.name).is_some()
+                    || self.views()?.iter().any(|(n, _)| *n == def.name)
+                    || self
+                        .all_indexes()?
+                        .iter()
+                        .any(|(_, ix)| ix.get_str("name") == Ok(def.name.as_str()))
+                {
                     // `IF NOT EXISTS` is a NO-OP on an existing table, tag and
                     // all -- PostgreSQL only adds a notice. Raising here made
                     // the idiomatic "create it if it isn't there" fixture fail
@@ -11639,8 +12314,142 @@ impl PgHandler {
                 Ok(vec![Response::Execution(Tag::new("DROP SEQUENCE"))])
             }
 
+            // A join's rows are only ever materialised as another query's
+            // source; there is nothing to run on their own.
+            Statement::JoinRows(_) => Err(Self::err(&PlanError::Internal(
+                "a join source reached execution on its own".into(),
+            ))),
+            Statement::CreateIndex(ci) => self.create_index(ci),
+
+            Statement::DropIndex { names, if_exists } => {
+                for name in &names {
+                    let found = self
+                        .all_indexes()?
+                        .into_iter()
+                        .find(|(_, ix)| ix.get_str("name") == Ok(name.as_str()));
+                    let Some((def, _)) = found else {
+                        if self.relation_exists(name)? {
+                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".into(),
+                                "42809".into(), // wrong_object_type
+                                format!("\"{name}\" is not an index"),
+                            ))));
+                        }
+                        if if_exists {
+                            self.notice(
+                                "00000",
+                                format!("index \"{name}\" does not exist, skipping"),
+                                None,
+                            );
+                            continue;
+                        }
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".into(),
+                            "42704".into(), // undefined_object
+                            format!("index \"{name}\" does not exist"),
+                        ))));
+                    };
+                    // The index behind a UNIQUE constraint belongs to the
+                    // constraint: PostgreSQL refuses to drop it on its own.
+                    if def.unique_constraints.iter().any(|u| &u.name == name) {
+                        let mut info = ErrorInfo::new(
+                            "ERROR".into(),
+                            "2BP01".into(), // dependent_objects_still_exist
+                            format!(
+                                "cannot drop index {name} because constraint {name} on table {} requires it",
+                                def.name
+                            ),
+                        );
+                        info.hint = Some(format!(
+                            "You can drop constraint {name} on table {} instead.",
+                            def.name
+                        ));
+                        return Err(PgWireError::UserError(Box::new(info)));
+                    }
+                    self.storage
+                        .drop_index(self.db(), &def.name, name)
+                        .map_err(|e| Self::storage_err("could not drop the index", e))?;
+                }
+                Ok(vec![Response::Execution(Tag::new("DROP INDEX"))])
+            }
+
+            Statement::CreateView(cv) => self.create_view(cv),
+
+            Statement::DropView {
+                names,
+                if_exists,
+                cascade,
+            } => {
+                self.ensure_collection(Self::VIEW_COLLECTION)?;
+                let views = self.views()?;
+                for name in &names {
+                    if !views.iter().any(|(n, _)| n == name) {
+                        if self.relation_exists(name)? {
+                            let mut info = ErrorInfo::new(
+                                "ERROR".into(),
+                                "42809".into(), // wrong_object_type
+                                format!("\"{name}\" is not a view"),
+                            );
+                            if self.lookup(name).is_some() {
+                                info.hint = Some("Use DROP TABLE to remove a table.".into());
+                            }
+                            return Err(PgWireError::UserError(Box::new(info)));
+                        }
+                        if if_exists {
+                            self.notice(
+                                "00000",
+                                format!("view \"{name}\" does not exist, skipping"),
+                                None,
+                            );
+                            continue;
+                        }
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".into(),
+                            "42P01".into(), // undefined_table
+                            format!("view \"{name}\" does not exist"),
+                        ))));
+                    }
+                    let dependants: Vec<String> = secantus_pgplan::views_reading(name)
+                        .into_iter()
+                        .filter(|d| !names.contains(d))
+                        .collect();
+                    if !dependants.is_empty() {
+                        if !cascade {
+                            return Err(Self::dependants_error(
+                                &format!("view {name}"),
+                                &dependants,
+                            ));
+                        }
+                        let descs: Vec<String> =
+                            dependants.iter().map(|d| format!("view {d}")).collect();
+                        self.cascade_notice(&descs);
+                        for d in &dependants {
+                            self.delete_view(d)?;
+                        }
+                    }
+                    self.delete_view(name)?;
+                }
+                Ok(vec![Response::Execution(Tag::new("DROP VIEW"))])
+            }
+
             Statement::DropTable(drop) => {
                 for table in &drop.tables {
+                    if self.views()?.iter().any(|(n, _)| n == table) {
+                        let mut info = ErrorInfo::new(
+                            "ERROR".into(),
+                            "42809".into(), // wrong_object_type
+                            format!("\"{table}\" is not a table"),
+                        );
+                        info.hint = Some("Use DROP VIEW to remove a view.".into());
+                        return Err(PgWireError::UserError(Box::new(info)));
+                    }
+                    let dependants = secantus_pgplan::views_reading(table);
+                    if !dependants.is_empty() && self.lookup(table).is_some() {
+                        return Err(Self::dependants_error(
+                            &format!("table {table}"),
+                            &dependants,
+                        ));
+                    }
                     let Some(def) = self.lookup(table) else {
                         if drop.if_exists {
                             continue;
@@ -12501,7 +13310,9 @@ impl PgHandler {
                 Ok(vec![Response::Query(QueryResponse::new(schema, rows))])
             }
 
-            Statement::Update(upd) => {
+            Statement::Update(mut upd) => {
+                upd.filter =
+                    self.narrow_by_residual(&upd.table, &upd.filter, upd.residual.take())?;
                 let def = self.lookup(&upd.table);
                 let constrained = def.as_ref().is_some_and(table_has_row_constraints);
                 // RETURNING needs each row AFTER the update, which only the
@@ -12590,7 +13401,9 @@ impl PgHandler {
                 )])
             }
 
-            Statement::Delete(del) => {
+            Statement::Delete(mut del) => {
+                del.filter =
+                    self.narrow_by_residual(&del.table, &del.filter, del.residual.take())?;
                 if let Some(def) = self.lookup(&del.table) {
                     self.check_referencing_rows(&def, &del.filter)?;
                 }
@@ -12798,7 +13611,13 @@ impl PgHandler {
                 // persona leaking through the PostgreSQL one, with no SQLSTATE
                 // a client could branch on.
                 secantus_storage::StorageError::DuplicateKey(c) => match self.lookup(table) {
-                    Some(def) => Self::unique_violation(table, &def, &c.key_pattern, &c.key_value),
+                    Some(def) => Self::unique_violation(
+                        table,
+                        &def,
+                        &c.key_pattern,
+                        &c.key_value,
+                        Some(c.index.as_str()),
+                    ),
                     None => Self::storage_err("could not update", e),
                 },
                 _ => Self::storage_err("could not update", e),
