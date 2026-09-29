@@ -6990,6 +6990,48 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       | composite `PRIMARY KEY` / multi-col `FOREIGN KEY` | | `a composite PRIMARY KEY` |
       | non-literal column `DEFAULT` | `default now()` | `a non-literal DEFAULT` |
 
+      **The RUST PG server's STRING surface landed 2026-09-29** (`strings`
+      corpus 18 divergences of 35 -> 8, new `strings2` corpus 27 -> 0, and
+      `char_padding` 36 -> 32 / `jsonpath_number` 61 -> 60 incidentally).
+      Added: `lpad`, `rpad`, `to_hex`, `translate`, `overlay`,
+      `quote_literal`, `quote_nullable`, `regexp_split_to_array`, `unistr`,
+      `convert_from`. Four things worth not re-deriving:
+
+      * **`substring(s FROM pattern)` was not a missing FUNCTION but a missing
+        OVERLOAD.** The second argument's TYPE decides whether it is an offset
+        or a POSIX regex, exactly as PostgreSQL's own resolution does; reading
+        it as an integer regardless answered `42601 function substring does
+        not exist with that argument list` for every regex use. A `0A000` would
+        at least have named a gap; this named the user's call as malformed.
+      * **`split_part` refused a NEGATIVE field**, which PostgreSQL has counted
+        from the END since 14 (`split_part('a,b,c', ',', -1)` is `c`), and its
+        zero-field message named the wrong rule -- PostgreSQL says "must not be
+        zero", not "must be greater than zero".
+      * **`regexp_replace` passed `\&` through literally.** PostgreSQL's
+        replacement text takes `\1`..`\9` for groups and `\&` for the WHOLE
+        match, so `regexp_replace('abc','b','\&\&')` is `abbc`; we answered
+        `a\&\&c`. An unknown escape (`\q`) correctly stays as written.
+      * **`quote_nullable(NULL)` is the four-character STRING `NULL`**, not a
+        NULL -- that difference is the entire reason it exists beside
+        `quote_literal`. It needs to be exempt from the blanket
+        NULL-propagation guard, and `psql` renders both as `NULL`, so probe it
+        with `IS NULL` rather than by eye. The first reading of this probe got
+        it backwards.
+
+      `overlay` with a `from` below 1 needed a new error class: PostgreSQL uses
+      **22011 (substring_error)**, not the generic 22P02 a bad value gets.
+
+      **What remains in `strings`, and why each is NOT simply "unimplemented":**
+
+      | remaining | why |
+      | --- | --- |
+      | `upper('ss-sharp')` / `lower` / `initcap` on non-ASCII | **NOT a bug.** This box's PostgreSQL runs `lc_ctype = C`, which does no non-ASCII case mapping at all. Matching it would break against any UTF-8-locale server. Check `SHOW lc_ctype` before touching this. |
+      | `regexp_count` / `_substr` / `_instr` / `_like` | PostgreSQL **14 does not have them** (added in 15), so the reference server answers `42883`. Implementing them puts us AHEAD of the reference and the corpus still shows a divergence. |
+      | `regexp_matches`, `regexp_split_to_table` | SET-RETURNING -- the `unnest` family, the single largest remaining gap on both servers. |
+      | `normalize(s [, form])` | Needs real Unicode normalization tables. A new dependency (`unicode-normalization`) for one function -- **Joe's call**, and half-implementing it is the silent-divergence shape this project refuses. |
+      | `COLLATE` in an expression | `CollateClause`, a separate feature. |
+      | `to_ascii` | Same class (0A000), different message; PostgreSQL's own error here is environment-specific (UTF8 database). |
+
       **The PYTHON PG server's array surface was WORSE than the Rust one, and
       four of its defects were silent wrong answers** (measured 2026-09-29,
       `arrays2` corpus 18 divergences of 32 -> 0; `arrays` 7 -> 2). Worth

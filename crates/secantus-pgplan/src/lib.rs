@@ -111,6 +111,11 @@ pub enum Error {
     IndeterminateDatatype(String),
     /// A named object (a type, mostly) that does not exist -> 42704.
     UndefinedObject(String),
+    /// A substring / overlay offset outside what the operation allows -> 22011
+    /// (substring_error). Its own class, not 22P02: PostgreSQL does not treat
+    /// `overlay('abc' placing 'X' from 0)` as a malformed VALUE, and a client
+    /// matching on the class would mis-route it.
+    SubstringError(String),
     /// A malformed regular expression -> 2201B. Its own class, not 22P02: the
     /// PATTERN is broken, not the value being matched.
     InvalidRegex(String),
@@ -172,7 +177,9 @@ impl std::fmt::Display for Error {
             }
             Error::DivisionByZero => write!(f, "division by zero"),
             Error::NumericOutOfRange(m) => write!(f, "{m}"),
-            Error::DataException(m) | Error::InvalidParameter(m) => write!(f, "{m}"),
+            Error::DataException(m) | Error::InvalidParameter(m) | Error::SubstringError(m) => {
+                write!(f, "{m}")
+            }
             Error::NullValueNotAllowed(m) => write!(f, "{m}"),
             Error::UntranslatableCharacter(m) => write!(f, "{m}"),
             Error::InvalidColumnReference(m)
@@ -224,11 +231,12 @@ impl Error {
             Error::DuplicateColumn(_) => "42701",      // duplicate_column
             Error::UndefinedColumn(_) | Error::UndefinedField(_) => "42703",
             Error::UndefinedTable(_) => "42P01",
-            Error::InvalidName(_) => "42602", // invalid_name
-            Error::Grouping(_) => "42803",    // grouping_error
-            Error::NoArbiter(_) => "42P10",   // invalid_column_reference
-            Error::Parameter(_) => "42P02",   // undefined_parameter
-            Error::InvalidText(_) => "22P02", // invalid_text_representation
+            Error::InvalidName(_) => "42602",    // invalid_name
+            Error::Grouping(_) => "42803",       // grouping_error
+            Error::NoArbiter(_) => "42P10",      // invalid_column_reference
+            Error::Parameter(_) => "42P02",      // undefined_parameter
+            Error::SubstringError(_) => "22011", // substring_error
+            Error::InvalidText(_) => "22P02",    // invalid_text_representation
             Error::InvalidDatetimeFormat(_) => "22007", // invalid_datetime_format
             Error::DatetimeFieldOverflow(_) => "22008", // datetime_field_overflow
             Error::DivisionByZero => "22012",
@@ -11904,7 +11912,11 @@ fn regexp_replace(args: &[Bson]) -> Result<Bson> {
     builder.push_str(&pattern);
     let re = regex::Regex::new(&builder)
         .map_err(|_| Error::InvalidRegex(format!("invalid regular expression: \"{pattern}\"")))?;
-    // PostgreSQL's `\1` group references are the regex crate's `${1}`.
+    // PostgreSQL's `\1` group references are the regex crate's `${1}`, and its
+    // `\&` -- the WHOLE match -- is `${0}`. Without the `\&` case the escape
+    // passed through literally, so `regexp_replace('abc', 'b', '\&\&')` gave
+    // `a\&\&c` where PostgreSQL gives `abbc`. An UNKNOWN escape (`\q`) stays
+    // as written, which is also what PostgreSQL does.
     let replacement = {
         let mut out = String::new();
         let mut chars = replacement.chars().peekable();
@@ -11915,6 +11927,11 @@ fn regexp_replace(args: &[Bson]) -> Result<Bson> {
                         out.push_str("${");
                         out.push(*d);
                         out.push('}');
+                        chars.next();
+                        continue;
+                    }
+                    Some('&') => {
+                        out.push_str("${0}");
                         chars.next();
                         continue;
                     }

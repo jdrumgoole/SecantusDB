@@ -12632,3 +12632,159 @@ def test_a_size_postgres_refuses_is_refused_before_it_is_allocated(home: Path) -
             conn.rollback()
         cur.execute("SELECT ia FROM arr_big WHERE id=1")
         assert cur.fetchall() == [([1],)]
+
+
+# --- strings: padding, hex, translate, overlay, quoting, regex ---------------
+#
+# Every expectation is PostgreSQL 14.13's own answer, from
+# `tools/probes/pg_corpora/strings2.sql` run through the differential.
+
+
+def test_padding_truncates_and_counts_characters(home: Path) -> None:
+    """`lpad` / `rpad` TRUNCATE when the target is shorter than the input, count
+    CHARACTERS rather than bytes, and cannot pad at all with an empty fill."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT lpad('abc',5), lpad('abcdef',3), lpad('ab',7,'xy'), lpad('abc',0),"
+            " lpad('abc',-1), lpad('abc',5,'')"
+        )
+        assert cur.fetchall() == [("  abc", "abc", "xyxyxab", "", "", "abc")]
+        cur.execute("SELECT rpad('abc',5), rpad('abc',5,'xy'), rpad('abc',2)")
+        assert cur.fetchall() == [("abc  ", "abcxy", "ab")]
+        # Characters, not bytes: a two-byte codepoint still counts as one.
+        cur.execute("SELECT lpad('λx',4,'.'), length(lpad('λx',4,'.'))")
+        assert cur.fetchall() == [("..λx", 4)]
+
+
+def test_to_hex_width_follows_the_argument_type(home: Path) -> None:
+    """An `int4` -1 is `ffffffff`; an `int8` -1 is `ffffffffffffffff`. Read off
+    the VALUE alone the two would collapse into one answer."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT to_hex(4294967295), to_hex(0), to_hex((-1)::int),"
+            " to_hex((-1)::bigint), to_hex(255::bigint)"
+        )
+        assert cur.fetchall() == [("ffffffff", "0", "ffffffff", "ffffffffffffffff", "ff")]
+
+
+def test_translate_deletes_what_the_target_does_not_cover(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT translate('abc','abc','xy'), translate('abc','','x'),"
+            " translate('aabb','ab','xy'), translate('abcabc','ab','')"
+        )
+        assert cur.fetchall() == [("xy", "abc", "xxyy", "cc")]
+
+
+def test_overlay_replaces_a_run_and_refuses_a_zero_offset(home: Path) -> None:
+    """`for` defaults to the length of the replacement, so
+    `overlay('abcdef' placing 'XY' from 2)` is `aXYdef`. A `from` below 1 is
+    PostgreSQL's `22011`, not a generic bad-value `22P02`."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT overlay('abc' placing 'XY' from 1 for 0),"
+            " overlay('abcdef' placing 'XY' from 2),"
+            " overlay('abc' placing 'XY' from 2 for 2),"
+            " overlay('abcdef' placing '' from 2 for 3),"
+            " overlay('abc' placing 'XYZ' from 5)"
+        )
+        assert cur.fetchall() == [("XYabc", "aXYdef", "aXY", "aef", "abcXYZ")]
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute("SELECT overlay('abc' placing 'X' from 0)")
+        assert info.value.sqlstate == "22011"
+
+
+def test_quote_nullable_answers_the_string_null(home: Path) -> None:
+    """`quote_literal(NULL)` is NULL; `quote_nullable(NULL)` is the four-character
+    string `NULL`. That difference is the whole reason the two exist as a pair —
+    and `psql` renders both as `NULL`, so it has to be probed with `IS NULL`
+    rather than read off the screen."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT quote_literal(1), quote_literal(NULL), quote_nullable('a'),"
+            " quote_nullable(NULL), quote_nullable(NULL) IS NULL"
+        )
+        assert cur.fetchall() == [("'1'", None, "'a'", "NULL", False)]
+        # A backslash forces the E'...' form, with backslashes doubled.
+        cur.execute(r"SELECT quote_literal('a\b'), quote_literal('it''s')")
+        assert cur.fetchall() == [(r"E'a\\b'", "'it''s'")]
+
+
+def test_split_part_counts_from_the_end_when_the_field_is_negative(home: Path) -> None:
+    """PostgreSQL has supported a negative field since 14. Refusing every
+    non-positive field rejected a working form, and the message named the wrong
+    rule: zero is "must not be zero", not "must be greater than zero"."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT split_part('a,b,c',',',-1), split_part('a,b,c',',',-3),"
+            " split_part('a,b,c',',',-4), split_part('a,b,c',',',9),"
+            " split_part('abc','',1)"
+        )
+        assert cur.fetchall() == [("c", "a", "", "", "abc")]
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute("SELECT split_part('a,b,c',',',0)")
+        assert "must not be zero" in str(info.value)
+
+
+def test_substring_from_a_pattern_is_a_different_function(home: Path) -> None:
+    """`substring(s FROM pattern)` shares a name with the offset form but takes
+    a POSIX regex, and answers the first CAPTURE GROUP when the pattern has one
+    and the whole match otherwise. Reading the second argument as an integer
+    regardless answered `42601 ... does not exist with that argument list` for
+    every regex use."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT substring('abcde' from 'b(c)d'), substring('abc' from '(b)'),"
+            " substring('abc' from 'b'), substring('abc' from 'x')"
+        )
+        assert cur.fetchall() == [("c", "b", "b", None)]
+        # The SQL-standard form, where `#\"...#\"` marks the part to return.
+        cur.execute("SELECT substring('abcde' from '%#\"c#\"%' for '#')")
+        assert cur.fetchall() == [("c",)]
+        # The offset form still works, and still refuses a negative length.
+        cur.execute("SELECT substring('abcdef' from 2 for 3)")
+        assert cur.fetchall() == [("bcd",)]
+
+
+def test_regexp_replace_expands_the_whole_match_escape(home: Path) -> None:
+    r"""PostgreSQL's replacement text takes `\1`..`\9` for groups and `\&` for
+    the WHOLE match. `\&` passed through literally, so
+    `regexp_replace('abc','b','\&\&')` gave `a\&\&c` where PostgreSQL gives
+    `abbc`. An unknown escape stays as written, which PostgreSQL also does."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            r"SELECT regexp_replace('abc','b','\&\&'), regexp_replace('abc','(b)','[\1]'),"
+            r" regexp_replace('abc','b','x\&y'), regexp_replace('abc','b','\q')"
+        )
+        assert cur.fetchall() == [("abbc", "a[b]c", "axbyc", r"a\qc")]
+
+
+def test_regexp_split_to_array_and_unistr(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT regexp_split_to_array('a1b22c','[0-9]+'), regexp_split_to_array('abc','')"
+        )
+        assert cur.fetchall() == [(["a", "b", "c"], ["a", "b", "c"])]
+        cur.execute(r"SELECT unistr('d\0061t\+000061'), unistr('\\'), unistr('a\0062')")
+        assert cur.fetchall() == [("data", "\\", "ab")]
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute(r"SELECT unistr('\x')")
+        assert info.value.sqlstate == "42601"
+
+
+def test_convert_from_decodes_stored_bytes(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            r"SELECT convert_from('\x616263'::bytea,'UTF8'), convert_from('abc'::bytea,'LATIN1')"
+        )
+        assert cur.fetchall() == [("abc", "abc")]

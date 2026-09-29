@@ -115,6 +115,16 @@ const SCALAR_NAMES: &[&str] = &[
     "ascii",
     "split_part",
     "starts_with",
+    "lpad",
+    "rpad",
+    "to_hex",
+    "translate",
+    "overlay",
+    "quote_literal",
+    "quote_nullable",
+    "regexp_split_to_array",
+    "unistr",
+    "convert_from",
     "abs",
     "ceil",
     "ceiling",
@@ -220,6 +230,127 @@ fn substring(s: &str, start: i64, len: Option<i64>) -> String {
         .collect()
 }
 
+/// `substring(s FROM pattern [FOR escape])`.
+///
+/// Without an escape the pattern is a POSIX regex and the answer is the first
+/// CAPTURE GROUP when there is one, the whole match otherwise -- so
+/// `substring('abc' from '(b)')` and `substring('abc' from 'b')` both give
+/// `b`, by different routes. No match is NULL, not the empty string.
+///
+/// With an escape it is the SQL-standard form: `%` and `_` are the LIKE
+/// wildcards and the escape character doubled around `"` marks the part to
+/// return, so `substring('abcde' from '%#"c#"%' for '#')` is `c`.
+fn substring_pattern(subject: &str, pattern: &str, escape: Option<String>) -> Result<Bson> {
+    let source = match escape.as_deref() {
+        None => pattern.to_string(),
+        Some(esc) => sql_substring_to_regex(pattern, esc)?,
+    };
+    let re = regex::Regex::new(&source)
+        .map_err(|e| Error::InvalidText(format!("invalid regular expression: {e}")))?;
+    let Some(caps) = re.captures(subject) else {
+        return Ok(Bson::Null);
+    };
+    let found = match caps.len() {
+        1 => caps.get(0),
+        _ => caps.get(1),
+    };
+    Ok(match found {
+        Some(m) => Bson::String(m.as_str().to_string()),
+        None => Bson::Null,
+    })
+}
+
+/// The SQL-standard `substring ... for <escape>` pattern as a regex.
+///
+/// `%` is `.*`, `_` is `.`, `<esc>"` opens and closes the returned part, and
+/// `<esc><char>` is that character literally. Everything else is escaped, so a
+/// pattern cannot smuggle regex syntax through.
+fn sql_substring_to_regex(pattern: &str, escape: &str) -> Result<String> {
+    let esc = escape
+        .chars()
+        .next()
+        .ok_or_else(|| Error::InvalidText("invalid escape string".to_string()))?;
+    let mut out = String::from("^");
+    let mut chars = pattern.chars().peekable();
+    let mut groups = 0;
+    while let Some(c) = chars.next() {
+        if c == esc {
+            match chars.next() {
+                Some('"') => {
+                    out.push_str(if groups == 0 { "(" } else { ")" });
+                    groups += 1;
+                }
+                Some(other) => out.push_str(&regex::escape(&other.to_string())),
+                None => return Err(Error::InvalidText("invalid escape string".to_string())),
+            }
+            continue;
+        }
+        match c {
+            '%' => out.push_str(".*"),
+            '_' => out.push('.'),
+            other => out.push_str(&regex::escape(&other.to_string())),
+        }
+    }
+    out.push('$');
+    Ok(out)
+}
+
+/// `quote_literal(x)` -- the text as a SQL string literal.
+///
+/// A backslash forces the `E'...'` form, in which backslashes are doubled;
+/// otherwise a plain `'...'` with every quote doubled. Measured on PostgreSQL
+/// 14.13: `quote_literal('a\b')` is `E'a\\b'` and `quote_literal("it's")`
+/// is `'it''s'`.
+fn quote_literal_text(v: &str) -> String {
+    if v.contains('\\') {
+        format!("E'{}'", v.replace('\\', "\\\\").replace('\'', "''"))
+    } else {
+        format!("'{}'", v.replace('\'', "''"))
+    }
+}
+
+/// `unistr(text)` -- decode PostgreSQL's Unicode escapes.
+///
+/// Four spellings, and the HINT PostgreSQL prints for a bad one names all of
+/// them: `\XXXX`, `\+XXXXXX`, `\uXXXX`, `\UXXXXXXXX`. A doubled backslash is
+/// a literal backslash. Anything else is `42601 invalid Unicode escape`.
+fn unistr(input: &str) -> Result<String> {
+    let bad = || Error::Parse("invalid Unicode escape".to_string());
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '\\' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let next = *chars.get(i + 1).ok_or_else(bad)?;
+        let (digits, skip) = match next {
+            '\\' => {
+                out.push('\\');
+                i += 2;
+                continue;
+            }
+            '+' => (6, 2),
+            'u' => (4, 2),
+            'U' => (8, 2),
+            c if c.is_ascii_hexdigit() => (4, 1),
+            _ => return Err(bad()),
+        };
+        let start = i + skip;
+        let end = start + digits;
+        if end > chars.len() {
+            return Err(bad());
+        }
+        let hex: String = chars[start..end].iter().collect();
+        let code = u32::from_str_radix(&hex, 16).map_err(|_| bad())?;
+        out.push(char::from_u32(code).ok_or_else(bad)?);
+        i = end;
+    }
+    Ok(out)
+}
+
 /// Evaluate a scalar built-in. `None` means "not one of ours".
 pub fn call(name: &str, args: &[Bson]) -> Option<Result<Bson>> {
     if !is_scalar(name) {
@@ -246,7 +377,7 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
     }
     if !matches!(
         name,
-        "concat" | "concat_ws" | "greatest" | "least" | "format"
+        "concat" | "concat_ws" | "greatest" | "least" | "format" | "quote_nullable"
     ) && args.iter().any(|a| a == &Bson::Null)
     {
         return Ok(Bson::Null);
@@ -474,11 +605,25 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
             if args.len() < 2 || args.len() > 3 {
                 return Err(wrong_args(name));
             }
+            // `substring(s FROM pattern)` is a different function sharing the
+            // name: a STRING second argument is a POSIX pattern, not an offset,
+            // and answers the first capture group when the pattern has one and
+            // the whole match otherwise. With a third string argument it is
+            // the SQL-standard form, whose `%` / `_` and `#"..."#` delimiters
+            // mark the part to return.
+            //
+            // Told apart by the ARGUMENT's type, as PostgreSQL's own overload
+            // resolution does. Reading the second argument as an integer
+            // regardless answered `42601 function substring does not exist
+            // with that argument list` for every regex use.
+            if matches!(arg(1), Bson::String(_)) {
+                return substring_pattern(&s(0), &s(1), args.get(2).map(text));
+            }
             let start = as_i64(&arg(1)).ok_or_else(|| wrong_args(name))?;
             let len = if args.len() == 3 {
                 let l = as_i64(&arg(2)).ok_or_else(|| wrong_args(name))?;
                 if l < 0 {
-                    return Err(Error::InvalidText(
+                    return Err(Error::SubstringError(
                         "negative substring length not allowed".into(),
                     ));
                 }
@@ -583,18 +728,36 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
             need(1)?;
             Ok(Bson::Int32(s(0).chars().next().map_or(0, |c| c as i32)))
         }
+        // `split_part(s, sep, n)` -- a NEGATIVE `n` counts from the END
+        // (`split_part('a,b,c', ',', -1)` is `c`), and only ZERO is an error.
+        // Refusing every non-positive field rejected a form PostgreSQL has
+        // supported since 14, and the message named the wrong rule: it says
+        // "must not be zero", not "must be greater than zero".
+        //
+        // An EMPTY separator is not a split at all: the whole string is field
+        // one. Rust's `split("")` yields empty edge pieces instead.
         "split_part" => {
             need(3)?;
             let n = as_i64(&arg(2)).unwrap_or(0);
+            if n == 0 {
+                return Err(Error::InvalidParameter(
+                    "field position must not be zero".into(),
+                ));
+            }
             let subject = s(0);
             let sep = s(1);
-            let parts: Vec<&str> = subject.split(&sep as &str).collect();
+            let parts: Vec<&str> = if sep.is_empty() {
+                vec![subject.as_str()]
+            } else {
+                subject.split(&sep as &str).collect()
+            };
             let idx = if n > 0 {
                 (n - 1) as usize
             } else {
-                return Err(Error::InvalidText(
-                    "field position must be greater than zero".into(),
-                ));
+                match parts.len().checked_sub((-n) as usize) {
+                    Some(i) => i,
+                    None => return Ok(Bson::String(String::new())),
+                }
             };
             Ok(Bson::String(
                 parts.get(idx).copied().unwrap_or("").to_string(),
@@ -603,6 +766,169 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         "starts_with" => {
             need(2)?;
             Ok(Bson::Boolean(s(0).starts_with(&s(1))))
+        }
+        // `lpad` / `rpad` count CHARACTERS, not bytes, and TRUNCATE when the
+        // target is shorter than the input: `lpad('abcdef', 3)` is `abc`. A
+        // target of 0 or less is the empty string, and an EMPTY fill cannot
+        // pad, so the input comes back unchanged.
+        "lpad" | "rpad" => {
+            if args.len() < 2 || args.len() > 3 {
+                return Err(wrong_args(name));
+            }
+            let subject: Vec<char> = s(0).chars().collect();
+            let width = as_i64(&arg(1)).ok_or_else(|| wrong_args(name))?;
+            if width <= 0 {
+                return Ok(Bson::String(String::new()));
+            }
+            let width = width as usize;
+            if subject.len() >= width {
+                return Ok(Bson::String(subject[..width].iter().collect()));
+            }
+            let fill: Vec<char> = if args.len() == 3 {
+                s(2).chars().collect()
+            } else {
+                vec![' ']
+            };
+            if fill.is_empty() {
+                return Ok(Bson::String(subject.iter().collect()));
+            }
+            let pad: String = fill.iter().cycle().take(width - subject.len()).collect();
+            let body: String = subject.iter().collect();
+            Ok(Bson::String(if name == "lpad" {
+                format!("{pad}{body}")
+            } else {
+                format!("{body}{pad}")
+            }))
+        }
+        // `to_hex`'s WIDTH follows the argument's TYPE, not its value: an
+        // `int4` -1 is `ffffffff` and an `int8` -1 is `ffffffffffffffff`.
+        // Formatting from the value alone would collapse the two.
+        "to_hex" => {
+            need(1)?;
+            Ok(Bson::String(match arg(0) {
+                Bson::Int32(i) => format!("{:x}", i as u32),
+                Bson::Int64(i) => format!("{:x}", i as u64),
+                other => match as_i64(&other) {
+                    Some(i) => format!("{:x}", i as u64),
+                    None => return Err(wrong_args(name)),
+                },
+            }))
+        }
+        // `translate(s, from, to)` -- a character at position i in `from`
+        // becomes `to[i]`, or is DELETED when `to` is shorter. Only the FIRST
+        // occurrence of a character in `from` counts.
+        "translate" => {
+            need(3)?;
+            let from: Vec<char> = s(1).chars().collect();
+            let to: Vec<char> = s(2).chars().collect();
+            let mut out = String::new();
+            for c in s(0).chars() {
+                match from.iter().position(|f| *f == c) {
+                    Some(i) => {
+                        if let Some(r) = to.get(i) {
+                            out.push(*r);
+                        }
+                    }
+                    None => out.push(c),
+                }
+            }
+            Ok(Bson::String(out))
+        }
+        // `overlay(s placing r from p [for n])` -- replace `n` characters at
+        // 1-based `p` with `r`; `n` defaults to `r`'s own length. A `p` below
+        // 1 is PostgreSQL's own "negative substring length not allowed", the
+        // same error the `substring` it is defined in terms of gives.
+        "overlay" => {
+            if args.len() < 3 || args.len() > 4 {
+                return Err(wrong_args(name));
+            }
+            let subject: Vec<char> = s(0).chars().collect();
+            let placing: Vec<char> = s(1).chars().collect();
+            let from = as_i64(&arg(2)).ok_or_else(|| wrong_args(name))?;
+            if from < 1 {
+                return Err(Error::SubstringError(
+                    "negative substring length not allowed".into(),
+                ));
+            }
+            let count = match args.len() {
+                4 => as_i64(&arg(3)).ok_or_else(|| wrong_args(name))?,
+                _ => placing.len() as i64,
+            };
+            if count < 0 {
+                return Err(Error::SubstringError(
+                    "negative substring length not allowed".into(),
+                ));
+            }
+            let head_end = ((from - 1) as usize).min(subject.len());
+            let tail_start = (((from - 1) + count) as usize).min(subject.len());
+            let mut out: String = subject[..head_end].iter().collect();
+            out.extend(placing.iter());
+            out.extend(subject[tail_start..].iter());
+            Ok(Bson::String(out))
+        }
+        // `quote_literal` is NULL-propagating; `quote_nullable` answers the
+        // four-character string `NULL` instead -- which is the whole reason
+        // the two exist as a pair, and which `psql` renders identically to a
+        // real NULL, so probe it with `IS NULL` rather than by eye.
+        "quote_literal" | "quote_nullable" => {
+            need(1)?;
+            if arg(0) == Bson::Null {
+                return Ok(if name == "quote_nullable" {
+                    Bson::String("NULL".into())
+                } else {
+                    Bson::Null
+                });
+            }
+            Ok(Bson::String(quote_literal_text(&s(0))))
+        }
+        "regexp_split_to_array" => {
+            if args.len() < 2 || args.len() > 3 {
+                return Err(wrong_args(name));
+            }
+            let flags = if args.len() == 3 { s(2) } else { String::new() };
+            let re = regex::RegexBuilder::new(&s(1))
+                .case_insensitive(flags.contains('i'))
+                .build()
+                .map_err(|e| Error::InvalidText(format!("invalid regular expression: {e}")))?;
+            let subject = s(0);
+            // An EMPTY pattern splits into characters, as PostgreSQL does;
+            // Rust's own split on an empty match yields empty edge pieces.
+            let parts: Vec<Bson> = if re.as_str().is_empty() {
+                subject
+                    .chars()
+                    .map(|c| Bson::String(c.to_string()))
+                    .collect()
+            } else {
+                re.split(&subject)
+                    .map(|p| Bson::String(p.to_string()))
+                    .collect()
+            };
+            Ok(Bson::Array(parts))
+        }
+        "unistr" => {
+            need(1)?;
+            Ok(Bson::String(unistr(&s(0))?))
+        }
+        // `convert_from(bytea, encoding)` -- decode stored bytes as text.
+        "convert_from" => {
+            need(2)?;
+            let bytes = match arg(0) {
+                Bson::Binary(b) => b.bytes,
+                other => text(&other).into_bytes(),
+            };
+            let encoding = s(1).to_ascii_uppercase().replace(['-', '_'], "");
+            match encoding.as_str() {
+                "UTF8" | "UNICODE" => String::from_utf8(bytes).map(Bson::String).map_err(|_| {
+                    Error::InvalidText("invalid byte sequence for encoding \"UTF8\"".into())
+                }),
+                // The LATIN family is single-byte: each octet IS its codepoint.
+                e if e.starts_with("LATIN") || e == "SQLASCII" => {
+                    Ok(Bson::String(bytes.iter().map(|b| *b as char).collect()))
+                }
+                other => Err(Error::InvalidText(format!(
+                    "invalid encoding name \"{other}\""
+                ))),
+            }
         }
         // --- numeric -------------------------------------------------------
         // `abs` gives back the type it was handed, so an exact numeric stays
@@ -1146,6 +1472,9 @@ pub fn static_result_type(name: &str) -> &'static str {
         "abs" | "ceil" | "ceiling" | "floor" | "round" | "trunc" | "mod" | "div" => "numeric",
         "sqrt" | "exp" | "ln" | "log" | "log10" | "power" | "pow" | "sign" => "float8",
         "starts_with" => "bool",
+        "lpad" | "rpad" | "to_hex" | "translate" | "overlay" | "quote_literal"
+        | "quote_nullable" | "unistr" | "convert_from" => "text",
+        "regexp_split_to_array" => "text[]",
         "set_byte" | "decode" => "bytea",
         "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp" => {
             "timestamptz"
