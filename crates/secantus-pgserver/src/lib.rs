@@ -1590,6 +1590,14 @@ impl PgHandler {
     /// Before the skip, every statement rebuilt every table's row type
     /// from BSON, and a used store made `select 1` twice as slow.
     fn install_user_types(&self) {
+        // Session state, so installed per statement -- the gate below is
+        // per catalog version, and a SET DateStyle changes no catalog.
+        // `1/5/2020` is January or May by the session's DateStyle order.
+        secantus_pgplan::dtparse::set_date_order(match self.session_datestyle().order {
+            secantus_pgplan::DateStyleOrder::Ymd => secantus_pgplan::dtparse::DateOrder::Ymd,
+            secantus_pgplan::DateStyleOrder::Dmy => secantus_pgplan::dtparse::DateOrder::Dmy,
+            secantus_pgplan::DateStyleOrder::Mdy => secantus_pgplan::dtparse::DateOrder::Mdy,
+        });
         secantus_pgplan::set_session_user(Some(
             self.session_user
                 .lock()
@@ -8807,6 +8815,9 @@ impl PgHandler {
         if let Some(expr) = c.default_expr() {
             return Bson::String(Self::render_default_expr(expr));
         }
+        if let (Some(sql), Some(_)) = (c.default_sql(), c.default.as_ref()) {
+            return Bson::String(sql.to_string());
+        }
         match c.default.as_ref() {
             None | Some(Bson::Null) => Bson::Null,
             Some(Bson::String(s)) => {
@@ -13943,6 +13954,10 @@ impl PgHandler {
                         Type::JSON,
                         vec![explain::render_json(&tree, &options, actual)],
                     )
+                } else if options.format == "yaml" {
+                    (Type::TEXT, vec![explain::render_yaml(&tree, &options, actual)])
+                } else if options.format == "xml" {
+                    (Type::XML, vec![explain::render_xml(&tree, &options, actual)])
                 } else {
                     (Type::TEXT, explain::render_text(&tree, &options, actual))
                 };
@@ -17233,7 +17248,10 @@ fn encode_field_value_inner(
             // `NotImplementedError`, so the exact text here is not parsed back;
             // restyle the shape it recognises and pass the rest through.
             Some(Bson::String(s)) => {
-                let out = secantus_pgplan::render_timestamp_styled(s, ds);
+                let out = secantus_pgplan::render_timestamp_styled(
+                    &secantus_pgplan::wide_timestamptz_text(s, tz),
+                    ds,
+                );
                 return enc.encode_field(&Some(out.as_str()));
             }
             Some(value) => {
@@ -17295,7 +17313,10 @@ fn session_zone_text(
             secantus_pgplan::range::render_multirange_in_zone(text, tz)
                 .unwrap_or_else(|_| text.clone())
         }
-        ("timestamptz", Bson::String(text)) => secantus_pgplan::render_timestamp_styled(text, ds),
+        ("timestamptz", Bson::String(text)) => secantus_pgplan::render_timestamp_styled(
+            &secantus_pgplan::wide_timestamptz_text(text, tz),
+            ds,
+        ),
         ("timestamptz", value) => secantus_pgplan::timestamptz_value_text_styled(value, tz, ds)
             .unwrap_or_else(|| secantus_pgplan::value_text(value)),
         (_, value) => secantus_pgplan::value_text(value),
@@ -20219,10 +20240,10 @@ impl PgHandler {
             Statement::Show(name) => vec![self.field(canonical_setting(&name), Type::TEXT)],
             Statement::Explain { options, .. } => vec![self.field(
                 "QUERY PLAN".to_string(),
-                if options.format == "json" {
-                    Type::JSON
-                } else {
-                    Type::TEXT
+                match options.format.as_str() {
+                    "json" => Type::JSON,
+                    "xml" => Type::XML,
+                    _ => Type::TEXT,
                 },
             )],
             Statement::SelectConstant(sc) => sc

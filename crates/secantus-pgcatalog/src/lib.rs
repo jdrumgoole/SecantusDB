@@ -241,6 +241,24 @@ impl Column {
         }
     }
 
+    /// How PostgreSQL's catalog prints a FOLDED constant default that was
+    /// written as an expression (`DEFAULT 1 + 2` stores 3, prints `(1 + 2)`).
+    /// Display only; the value is `default`.
+    pub fn default_sql(&self) -> Option<&str> {
+        self.extra.get_str("default_sql").ok()
+    }
+
+    pub fn set_default_sql(&mut self, sql: Option<String>) {
+        match sql {
+            Some(s) => {
+                self.extra.insert("default_sql", s);
+            }
+            None => {
+                self.extra.remove("default_sql");
+            }
+        }
+    }
+
     pub fn from_document(d: &Document) -> Option<Self> {
         let decl_oid = d.get_i32("decl_oid").ok();
         Some(Self {

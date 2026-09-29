@@ -19,6 +19,7 @@ pub mod bits;
 pub mod bytea;
 pub mod correlated;
 pub mod datetime;
+pub mod dtparse;
 pub mod escape_strings;
 pub mod formatting;
 pub mod fts;
@@ -877,6 +878,9 @@ pub enum AlterTableAction {
         value: Option<Bson>,
         /// An expression default, kept as SQL (`SET DEFAULT now()`).
         expr: Option<String>,
+        /// A folded default's catalog rendering (`(1 + 2)`), when it was
+        /// written as an expression.
+        sql: Option<String>,
     },
     /// `SET NOT NULL` / `DROP NOT NULL`.
     SetNotNull {
@@ -3168,10 +3172,12 @@ fn plan_alter_action(
                 Some(DefaultSpec::Value(v)) => (Some(v), None),
                 Some(DefaultSpec::Expr(e)) => (None, Some(e)),
             };
+            let sql = cmd.def.as_deref().and_then(ruleutils_default);
             Ok(AlterTableAction::SetDefault {
                 column: cmd.name.clone(),
                 value,
                 expr,
+                sql,
             })
         }
         Ok(AT::AtSetNotNull) => Ok(AlterTableAction::SetNotNull {
@@ -3328,7 +3334,10 @@ fn plan_added_column(cd: &pg_query::protobuf::ColumnDef, params: &[Bson]) -> Res
                 // executor's rewrite -- `gen_random_uuid()` gives each row its
                 // own, as PostgreSQL does -- and per inserted row after.
                 match default_value_or_expr(raw, &ty, params)? {
-                    DefaultSpec::Value(v) => column.default = Some(v),
+                    DefaultSpec::Value(v) => {
+                        column.default = Some(v);
+                        column.set_default_sql(ruleutils_default(raw));
+                    }
                     DefaultSpec::Expr(e) => column.set_default_expr(Some(e)),
                 }
             }
@@ -3384,6 +3393,52 @@ pub(crate) fn deparse_expr(node: &pg_query::protobuf::Node) -> Result<String> {
 
 /// A column DEFAULT as planned: a value folded now, or an expression kept as
 /// SQL text for the executor to evaluate per row.
+/// A constant default written as an EXPRESSION, as PostgreSQL's ruleutils
+/// prints it back -- `(1 + 2)`, `('x'::text || 'y'::text)`, `lower('A'::text)`
+/// -- or `None` for a bare literal (printed from its value, as before) and for
+/// any shape this does not reproduce.
+fn ruleutils_default(node: &pg_query::protobuf::Node) -> Option<String> {
+    use pg_query::protobuf::a_const::Val;
+    fn render(node: &pg_query::protobuf::Node) -> Option<String> {
+        match node.node.as_ref()? {
+            N::AConst(c) => match c.val.as_ref()? {
+                Val::Ival(i) => Some(i.ival.to_string()),
+                Val::Fval(f) => Some(f.fval.clone()),
+                Val::Boolval(b) => Some(b.boolval.to_string()),
+                Val::Sval(s) => Some(format!("'{}'::text", s.sval.replace('\'', "''"))),
+                _ => None,
+            },
+            N::AExpr(e) if AExprKind::try_from(e.kind) == Ok(AExprKind::AexprOp) => {
+                let op = operator_name(e).ok()?;
+                let r = render(e.rexpr.as_deref()?)?;
+                match e.lexpr.as_deref() {
+                    Some(l) => Some(format!("({} {op} {r})", render(l)?)),
+                    None => Some(format!("({op}{r})")),
+                }
+            }
+            N::FuncCall(f) => {
+                let args: Option<Vec<String>> = f.args.iter().map(render).collect();
+                Some(format!("{}({})", func_name(f)?, args?.join(", ")))
+            }
+            N::TypeCast(tc) => {
+                let ty = display_type(&type_name_of(tc.type_name.as_ref()?));
+                match tc.arg.as_deref()?.node.as_ref()? {
+                    N::AConst(c) => match c.val.as_ref()? {
+                        Val::Sval(s) => Some(format!("'{}'::{ty}", s.sval.replace('\'', "''"))),
+                        _ => Some(format!("{}::{ty}", render(tc.arg.as_deref()?)?)),
+                    },
+                    _ => Some(format!("({})::{ty}", render(tc.arg.as_deref()?)?)),
+                }
+            }
+            _ => None,
+        }
+    }
+    if matches!(node.node.as_ref(), Some(N::AConst(_)) | Some(N::TypeCast(_))) {
+        return None;
+    }
+    render(node)
+}
+
 pub enum DefaultSpec {
     Value(Bson),
     Expr(String),
@@ -3433,10 +3488,12 @@ pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
             column,
             value,
             expr,
+            sql,
         } => {
             if let Some(c) = def.columns.iter_mut().find(|c| c.name == *column) {
                 c.default = value.clone();
                 c.set_default_expr(expr.clone());
+                c.set_default_sql(if value.is_some() { sql.clone() } else { None });
             }
         }
         AlterTableAction::SetNotNull { column, not_null } => {
@@ -3958,13 +4015,7 @@ fn plan_explain(
                 flag()?;
             }
             "format" => match text.as_deref() {
-                Some(f @ ("text" | "json")) => options.format = f.to_string(),
-                Some(f @ ("yaml" | "xml")) => {
-                    return Err(Error::Unsupported(format!(
-                        "EXPLAIN (FORMAT {})",
-                        f.to_ascii_uppercase()
-                    )))
-                }
+                Some(f @ ("text" | "json" | "yaml" | "xml")) => options.format = f.to_string(),
                 other => {
                     return Err(Error::Sqlstate(
                         "22023",
@@ -4304,7 +4355,10 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                             // evaluator cannot fold -- is kept as its SQL and
                             // evaluated per INSERTed row by the executor.
                             match default_value_or_expr(raw, &underlying, &[])? {
-                                DefaultSpec::Value(v) => column.default = Some(v),
+                                DefaultSpec::Value(v) => {
+                                    column.default = Some(v);
+                                    column.set_default_sql(ruleutils_default(raw));
+                                }
                                 DefaultSpec::Expr(e) => column.set_default_expr(Some(e)),
                             }
                         }
@@ -13558,6 +13612,34 @@ fn parse_date(text: &str) -> Result<String> {
     } else {
         NaiveDate::parse_from_str(t, "%Y-%m-%d")
     };
+    let parsed = parsed.or_else(|e| match decode_general(t, "date") {
+        Ok(GeneralDateTime::At(_, _, _, d)) if (1..=9999).contains(&chrono::Datelike::year(&d)) => Ok(d),
+        _ => Err(e),
+    });
+    if parsed.is_err() {
+        match decode_general(t, "date") {
+            Ok(GeneralDateTime::At(_, _, _, d)) => return Ok(render_date_pg(d)),
+            Ok(GeneralDateTime::Epoch) => return Ok("1970-01-01".to_string()),
+            Ok(GeneralDateTime::Infinity) => return Ok("infinity".to_string()),
+            Ok(GeneralDateTime::NegInfinity) => return Ok("-infinity".to_string()),
+            Ok(GeneralDateTime::Now) => {
+                let now = instant_micros(&scalar::now_value()).unwrap_or(0);
+                let local = now + i64::from(session_timezone().offset_at(now).local_minus_utc()) * 1_000_000;
+                if let Some(d) = chrono::DateTime::from_timestamp_micros(local) {
+                    return Ok(render_date_pg(d.date_naive()));
+                }
+            }
+            // A value the general decoder refuses outright (field out of
+            // range) is its answer; a merely unrecognised shape falls to the
+            // wide-date reading below.
+            Err(e @ Error::DatetimeFieldOverflow(_)) => return Err(e),
+            Err(e) => {
+                if !matches!(classify_wide_date(t), WideDate::Valid) {
+                    return Err(e);
+                }
+            }
+        }
+    }
     match parsed {
         Ok(d) => Ok(d.format("%Y-%m-%d").to_string()),
         // A `YYYY-MM-DD` shape chrono rejected only for its YEAR magnitude
@@ -13574,6 +13656,77 @@ fn parse_date(text: &str) -> Result<String> {
             ))),
         },
     }
+}
+
+/// What PostgreSQL's general date/time decoder made of an input the strict
+/// ISO paths did not take.
+enum GeneralDateTime {
+    /// A wall-clock reading, with the offset (seconds EAST) or zone it named,
+    /// and the DATE as written (`24:00:00` rolls the reading, not the date).
+    At(NaiveDateTime, Option<i32>, Option<chrono_tz::Tz>, NaiveDate),
+    Epoch,
+    Infinity,
+    NegInfinity,
+    Now,
+}
+
+/// `DecodeDateTime` over `text` (see `dtparse`). `today` / `yesterday` /
+/// `tomorrow` resolve against the current date in the session zone.
+fn decode_general(text: &str, type_name: &str) -> Result<GeneralDateTime> {
+    let p = dtparse::parse(text, type_name)?;
+    match p.special {
+        Some(dtparse::Special::Epoch) => return Ok(GeneralDateTime::Epoch),
+        Some(dtparse::Special::Infinity) => return Ok(GeneralDateTime::Infinity),
+        Some(dtparse::Special::NegInfinity) => return Ok(GeneralDateTime::NegInfinity),
+        Some(dtparse::Special::Now) => return Ok(GeneralDateTime::Now),
+        None => {}
+    }
+    let date = match p.relative_day {
+        Some(delta) => {
+            let now = instant_micros(&scalar::now_value()).unwrap_or(0);
+            let local = now + i64::from(session_timezone().offset_at(now).local_minus_utc()) * 1_000_000;
+            chrono::DateTime::from_timestamp_micros(local)
+                .map(|d| d.date_naive() + chrono::Duration::days(delta))
+        }
+        None => NaiveDate::from_ymd_opt(p.year, p.month, p.day),
+    }
+    .ok_or_else(|| Error::DatetimeFieldOverflow(format!("date/time field value out of range: \"{text}\"")))?;
+    let time = NaiveTime::from_hms_opt(p.hour.min(23), p.minute, p.second.min(59))
+        .ok_or_else(|| Error::DatetimeFieldOverflow(format!("date/time field value out of range: \"{text}\"")))?;
+    let mut at = date.and_time(time) + chrono::Duration::microseconds(p.micros);
+    // 24:00:00 and a leap second are both the NEXT instant, as PostgreSQL has them.
+    if p.hour == 24 {
+        at += chrono::Duration::hours(1);
+    }
+    if p.second == 60 {
+        at += chrono::Duration::seconds(1);
+    }
+    let zone = match p.zone.as_deref() {
+        Some(z) => Some(dtparse::resolve_zone(z).ok_or_else(|| {
+            Error::InvalidParameter(format!("time zone \"{z}\" not recognized"))
+        })?),
+        None => None,
+    };
+    Ok(GeneralDateTime::At(at, p.offset, zone, date))
+}
+
+/// A decoded reading as the canonical text a BC or wide-year timestamp is
+/// carried as (`2020-01-05 00:00:00 BC`), or `None` inside years 1..=9999.
+fn wide_timestamp_text(at: &NaiveDateTime) -> Option<String> {
+    use chrono::{Datelike, Timelike};
+    let y = at.year();
+    if (1..=9999).contains(&y) {
+        return None;
+    }
+    let (year, bc) = if y <= 0 { (1 - y, " BC") } else { (y, "") };
+    let mut time = format!("{:02}:{:02}:{:02}", at.hour(), at.minute(), at.second());
+    let us = at.nanosecond() / 1000;
+    if us > 0 {
+        let frac = format!("{us:06}");
+        time.push('.');
+        time.push_str(frac.trim_end_matches('0'));
+    }
+    Some(format!("{year:04}-{:02}-{:02} {time}{bc}", at.month(), at.day()))
 }
 
 /// Render a `NaiveDate` in PostgreSQL's ISO `date` text, including the eras a
@@ -13611,8 +13764,9 @@ fn special_timestamp_text(t: &str) -> Option<String> {
     if lower.ends_with(" bc") {
         // classify_wide_date needs the era, so hand it the date part WITH `BC`.
         let date_bc = format!("{date_part} BC");
-        return matches!(classify_wide_date(&date_bc), WideDate::Valid)
-            .then(|| canonical_wide_timestamp(trimmed));
+        if matches!(classify_wide_date(&date_bc), WideDate::Valid) {
+            return Some(canonical_wide_timestamp(trimmed));
+        }
     }
     // A wide year (> 9999) chrono cannot parse: keep the text.
     if matches!(classify_wide_date(date_part), WideDate::Valid)
@@ -13620,7 +13774,11 @@ fn special_timestamp_text(t: &str) -> Option<String> {
     {
         return Some(canonical_wide_timestamp(trimmed));
     }
-    None
+    // Any other spelling of one (`Jan 5 2020 BC`), through the decoder.
+    match decode_general(trimmed, "timestamp") {
+        Ok(GeneralDateTime::At(at, _, _, _)) => wide_timestamp_text(&at),
+        _ => None,
+    }
 }
 
 /// Canonicalise a wide/BC timestamp literal to PostgreSQL's rendered text.
@@ -14585,6 +14743,31 @@ pub(crate) fn parse_timestamp(text: &str) -> Result<i64> {
             NaiveDate::parse_from_str(&normalised, "%Y-%m-%d")
                 .map(|d| d.and_hms_opt(0, 0, 0).expect("midnight is valid"))
         });
+    let parsed = match parsed {
+        Ok(v) => Ok(v),
+        Err(e) => match decode_general(t, "timestamp") {
+            Ok(GeneralDateTime::At(at, _, _, _))
+                if (1..=9999).contains(&chrono::Datelike::year(&at)) =>
+            {
+                Ok(at)
+            }
+            Ok(GeneralDateTime::Epoch) => Ok(NaiveDate::from_ymd_opt(1970, 1, 1)
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+                .expect("the epoch")),
+            Ok(GeneralDateTime::Now) => {
+                let now = instant_micros(&scalar::now_value()).unwrap_or(0);
+                let local =
+                    now + i64::from(session_timezone().offset_at(now).local_minus_utc()) * 1_000_000;
+                chrono::DateTime::from_timestamp_micros(local)
+                    .map(|d| d.naive_utc())
+                    .ok_or(e)
+            }
+            // The general decoder's verdict -- 22007 for a shape it cannot
+            // read, 22008 for a field out of range -- is PostgreSQL's.
+            Err(e2) => return Err(e2),
+            _ => Err(e),
+        },
+    };
     match parsed {
         Ok(dt) => Ok(dt.and_utc().timestamp_micros()),
         Err(_) => {
@@ -14857,6 +15040,35 @@ pub fn render_date_styled(iso: &str, ds: &DateStyle) -> String {
 /// - Postgres: `Tue Sep 08 12:34:56.789 2026` (MDY) / `Tue 08 Sep ... 2026` (DMY)
 /// - SQL: `09/08/2026 12:34:56.789`
 /// - German: `08.09.2026 12:34:56.789`
+/// A BC or wide-year `timestamptz`, carried as its text, rendered with the
+/// session zone's offset before any era: `2020-01-05 00:00:00+00 BC`. The
+/// offset is the zone's at the nearest instant the zone database covers (for
+/// a named zone before 1 AD that is its local mean time, as in PostgreSQL).
+/// Infinity and any text that already carries an offset pass unchanged.
+pub fn wide_timestamptz_text(text: &str, tz: &TimeZoneSetting) -> String {
+    let t = text.trim();
+    if t.eq_ignore_ascii_case("infinity") || t.eq_ignore_ascii_case("-infinity") {
+        return t.to_string();
+    }
+    let (core, era) = match t.strip_suffix(" BC") {
+        Some(b) => (b, " BC"),
+        None => (t, ""),
+    };
+    let Some((_, time)) = core.split_once(' ') else {
+        return t.to_string();
+    };
+    if time.contains(['+', '-']) {
+        return t.to_string();
+    }
+    let probe = if era.is_empty() {
+        253_402_300_799_000_000 // 9999-12-31 23:59:59
+    } else {
+        -62_135_596_800_000_000 // 0001-01-01
+    };
+    let offset = tz.offset_at(probe).local_minus_utc();
+    format!("{core}{}{era}", render_offset(offset))
+}
+
 pub fn render_timestamp_styled(iso: &str, ds: &DateStyle) -> String {
     if ds.format == DateStyleFormat::Iso {
         return iso.to_string();
@@ -15697,6 +15909,21 @@ fn split_trailing_offset(text: &str) -> (String, Option<i32>) {
 /// not is a WALL-CLOCK reading in the session zone, so the offset — and with it
 /// the instant — depends on the zone's rule at that local time.
 fn parse_timestamptz(text: &str, tz: &TimeZoneSetting) -> Result<i64> {
+    // A shape only the general decoder reads -- a zone NAME or abbreviation,
+    // a textual month, a Julian day -- carries its own zone.
+    if let Ok(GeneralDateTime::At(at, offset, zone, _)) =
+        decode_general(text.trim(), "timestamp with time zone")
+    {
+        if (1..=9999).contains(&chrono::Datelike::year(&at)) {
+            let local = at.and_utc().timestamp_micros();
+            let seconds = match (offset, zone) {
+                (Some(s), _) => s,
+                (None, Some(z)) => TimeZoneSetting::Named(z).offset_for_local(local).local_minus_utc(),
+                (None, None) => tz.offset_for_local(local).local_minus_utc(),
+            };
+            return Ok(local - i64::from(seconds) * 1_000_000);
+        }
+    }
     let (body, offset) = split_trailing_offset(text);
     let naive = parse_timestamp(&body).map_err(|e| match e {
         Error::InvalidDatetimeFormat(_) => Error::InvalidDatetimeFormat(format!(
@@ -20217,6 +20444,14 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
         } else {
             value
         };
+        // A BC / wide-year timestamptz is text, rendered in the session zone.
+        if matches!(target.as_str(), "text" | "varchar" | "bpchar" | "name")
+            && static_type(arg, &value) == "timestamptz"
+        {
+            if let Bson::String(t) = &value {
+                return cast_value(Bson::String(wide_timestamptz_text(t, &session_timezone())), &target);
+            }
+        }
         // A float4 renders as float4out does: the shortest text of the f32.
         if matches!(target.as_str(), "text" | "varchar" | "bpchar" | "name") {
             if let Bson::Double(d) = value {
