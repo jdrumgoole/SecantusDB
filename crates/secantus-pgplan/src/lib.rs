@@ -15,6 +15,7 @@ use bson::{doc, Bson, Document};
 
 pub mod acl;
 pub mod arrays;
+mod agg_hoist;
 pub mod bits;
 pub mod bytea;
 pub mod correlated;
@@ -8884,6 +8885,13 @@ fn rewrite_dml_from(
     // A write whose target is a VIEW becomes the same write on its base
     // table (automatically updatable views).
     view_dml::rewrite(node, lookup)?;
+    // A grouped SELECT with subqueries over its groups is split so they run
+    // over the grouped rows (see `agg_hoist`).
+    if let Some(N::SelectStmt(sel)) = node.node.as_mut() {
+        if let Some(split) = agg_hoist::split(sel)? {
+            **sel = split;
+        }
+    }
     // `SET (a, b) = (1, 2)` is `SET a = 1, b = 2`. The row-subquery form
     // `SET (a, b) = (SELECT ...)` has no per-column split and stays refused.
     if let Some(N::UpdateStmt(u)) = node.node.as_mut() {
