@@ -12,8 +12,48 @@ use bson::Bson;
 
 /// Is this a scalar built-in this server implements?
 pub fn is_scalar(name: &str) -> bool {
-    SCALAR_NAMES.contains(&name) || extension_scalar(name).is_some()
+    SCALAR_NAMES.contains(&name)
+        || CATALOG_NAMES.contains(&name)
+        || extension_scalar(name).is_some()
 }
+
+/// The catalog functions that must be answered by the CONNECTION when they
+/// stand alone, rather than folded here.
+///
+/// Each has a `ConstCol` of its own, and the server's value is the live one:
+/// `current_setting` has to see a `set_config` from earlier in the session,
+/// and folding it at plan time also means a caller with no session installed
+/// (every planner unit test) gets "unrecognized configuration parameter" for
+/// a GUC that exists. They are still reachable HERE, which is what makes
+/// `current_setting('x') ~ '...'` work -- the expression path has no
+/// `ConstCol` to defer to.
+pub fn defers_to_connection(name: &str) -> bool {
+    matches!(
+        name,
+        "current_database" | "current_catalog" | "current_setting"
+    )
+}
+
+/// The catalog-facing built-ins, which a client calls inside an EXPRESSION at
+/// least as often as on its own -- `version() LIKE 'PostgreSQL%'`,
+/// `current_setting('x') ~ '...'`, `obj_description(oid) IS NULL`.
+///
+/// Kept apart from `SCALAR_NAMES` because they read SESSION state rather than
+/// only their arguments, and because that is the fact worth seeing at a
+/// glance: as a bare select-list target they become a `ConstCol` the server
+/// resolves, and this list is what lets the constant evaluator reach them too.
+const CATALOG_NAMES: &[&str] = &[
+    "version",
+    "current_schema",
+    "current_database",
+    "current_catalog",
+    "current_setting",
+    "format_type",
+    "obj_description",
+    "col_description",
+    "shobj_description",
+    "pg_get_expr",
+];
 
 /// The extension a function belongs to, when that extension's type is
 /// installed. Without the extension PostgreSQL has no such function, and
@@ -182,6 +222,12 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
     // answer is NULL, not an error. Four are not, and all four IGNORE a NULL
     // argument instead: `concat` and `concat_ws` skip them, and `greatest` /
     // `least` pick the extreme of what remains, so `greatest(1, NULL)` is 1.
+    // `format_type(oid, NULL)` is NOT null-propagating in its SECOND
+    // argument: a NULL typmod means "no modifier", and PostgreSQL answers
+    // `integer` rather than NULL.
+    if name == "format_type" {
+        return format_type_call(args);
+    }
     if !matches!(
         name,
         "concat" | "concat_ws" | "greatest" | "least" | "format"
@@ -636,7 +682,78 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
             }
             Ok(best.unwrap_or(Bson::Null))
         }
+        // The catalog-facing functions, which a client calls INSIDE an
+        // expression at least as often as on its own: `version() LIKE
+        // 'PostgreSQL%'`, `current_setting('x') ~ '...'`,
+        // `obj_description(oid) IS NULL`. As a bare select-list target they
+        // become a `ConstCol` the server resolves; reaching them here is what
+        // makes the expression form work too.
+        "version" | "current_schema" => crate::session_function(name)
+            .ok_or_else(|| Error::Unsupported(format!("function {name}()"))),
+        "current_database" | "current_catalog" => Ok(Bson::String(crate::session_database())),
+        "current_setting" => {
+            let Some(Bson::String(key)) = args.first() else {
+                return Ok(Bson::Null);
+            };
+            let missing_ok = matches!(args.get(1), Some(Bson::Boolean(true)));
+            match crate::session_setting(key) {
+                Some(v) => Ok(Bson::String(v)),
+                // PostgreSQL's own refusal for an unknown GUC, unless the
+                // second argument asked for NULL instead.
+                None if missing_ok => Ok(Bson::Null),
+                None => Err(Error::UndefinedObject(format!(
+                    "unrecognized configuration parameter \"{key}\""
+                ))),
+            }
+        }
+        // No COMMENT is stored for a relation, so its description is NULL --
+        // which is also what PostgreSQL answers for an uncommented one.
+        "obj_description" | "col_description" | "shobj_description" => Ok(Bson::Null),
+        // `pg_get_expr(adbin, adrelid)` renders a stored expression. This
+        // server keeps `adbin` as the rendered TEXT already (see the
+        // `pg_attrdef` rows), so it hands the first argument straight back.
+        "pg_get_expr" => Ok(args.first().cloned().unwrap_or(Bson::Null)),
         _ => Err(Error::Unsupported(format!("function {name}()"))),
+    }
+}
+
+/// `format_type(oid, typmod)` renders a type the way PostgreSQL writes it in
+/// an error or a `\d`: `integer`, `numeric(10,2)`.
+fn format_type_call(args: &[Bson]) -> Result<Bson> {
+    let Some(oid) = args.first().and_then(|v| match v {
+        Bson::Int32(x) => Some(i64::from(*x)),
+        Bson::Int64(x) => Some(*x),
+        _ => None,
+    }) else {
+        // A NULL OID is the one argument that DOES make it NULL.
+        return Ok(Bson::Null);
+    };
+    let Some(name) = crate::pgtypes::name_of_oid(oid) else {
+        return Ok(Bson::String(format!("???({oid})")));
+    };
+    let typmod = args.get(1).and_then(|v| match v {
+        Bson::Int32(x) => Some(*x),
+        Bson::Int64(x) => i32::try_from(*x).ok(),
+        _ => None,
+    });
+    Ok(Bson::String(format_type_text(name, typmod)))
+}
+
+/// `format_type`'s rendering: the display name, with the declared width or
+/// precision put back on when the modifier carries one.
+pub(crate) fn format_type_text(name: &str, typmod: Option<i32>) -> String {
+    let display = crate::display_type(name);
+    let Some(typmod) = typmod.filter(|m| *m >= 4) else {
+        return display;
+    };
+    match name {
+        // A `numeric`'s two numbers are packed into one modifier.
+        "numeric" | "decimal" => {
+            let packed = typmod - 4;
+            format!("{display}({},{})", packed >> 16, packed & 0xffff)
+        }
+        "varchar" | "bpchar" => format!("{display}({})", typmod - 4),
+        _ => display,
     }
 }
 

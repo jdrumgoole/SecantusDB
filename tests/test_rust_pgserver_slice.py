@@ -12083,3 +12083,192 @@ def test_the_python_server_reads_a_rust_identity_table(home: Path) -> None:
         with pytest.raises(psycopg.Error) as info:
             cur.execute("INSERT INTO ident (id, v) VALUES (99, 9)")
         assert info.value.sqlstate == "428C9"
+
+
+def _catalogued(conn: psycopg.Connection) -> None:
+    """A table shaped so every information_schema column has something to say."""
+    cur = conn.cursor()
+    cur.execute("CREATE SEQUENCE cc_seq START 5 INCREMENT 2 MINVALUE 1 MAXVALUE 99 CYCLE")
+    cur.execute(
+        "CREATE TABLE cc_parent (id int PRIMARY KEY, code text UNIQUE, "
+        "amount numeric(12,3), label varchar(20), flag bool NOT NULL DEFAULT false, note text)"
+    )
+    cur.execute("CREATE TABLE cc_child (cid serial PRIMARY KEY, pid int REFERENCES cc_parent(id))")
+
+
+@pytest.mark.parametrize(
+    "sql,expected",
+    [
+        (
+            "SELECT column_name, data_type, is_nullable FROM information_schema.columns "
+            "WHERE table_name='cc_parent' ORDER BY ordinal_position",
+            [
+                ("id", "integer", "NO"),
+                ("code", "text", "YES"),
+                ("amount", "numeric", "YES"),
+                ("label", "character varying", "YES"),
+                ("flag", "boolean", "NO"),
+                ("note", "text", "YES"),
+            ],
+        ),
+        # `numeric(12,3)` packs both numbers into one `atttypmod`.
+        (
+            "SELECT numeric_precision, numeric_scale FROM information_schema.columns "
+            "WHERE table_name='cc_parent' AND column_name='amount'",
+            [(12, 3)],
+        ),
+        # An unqualified integer reports its natural precision in BITS.
+        (
+            "SELECT numeric_precision, numeric_scale FROM information_schema.columns "
+            "WHERE table_name='cc_parent' AND column_name='id'",
+            [(32, 0)],
+        ),
+        (
+            "SELECT character_maximum_length FROM information_schema.columns "
+            "WHERE table_name='cc_parent' AND column_name='label'",
+            [(20,)],
+        ),
+        # A default is rendered as a literal with its type stamped on.
+        (
+            "SELECT column_name, column_default FROM information_schema.columns "
+            "WHERE table_name='cc_parent' AND column_default IS NOT NULL ORDER BY column_name",
+            [("flag", "false")],
+        ),
+        # A serial column's default is the nextval CALL, not the stored value.
+        (
+            "SELECT column_default FROM information_schema.columns "
+            "WHERE table_name='cc_child' AND column_name='cid'",
+            [("nextval('cc_child_cid_seq'::regclass)",)],
+        ),
+        (
+            "SELECT table_name, table_type FROM information_schema.tables "
+            "WHERE table_name LIKE 'cc_%' ORDER BY table_name",
+            [("cc_child", "BASE TABLE"), ("cc_parent", "BASE TABLE")],
+        ),
+        # PostgreSQL records a CHECK for every NOT NULL column, the PRIMARY
+        # KEY column included -- so `cc_parent` has two, not one.
+        (
+            "SELECT constraint_type, count(*) FROM information_schema.table_constraints "
+            "WHERE table_name='cc_parent' GROUP BY constraint_type ORDER BY constraint_type",
+            [("CHECK", 2), ("PRIMARY KEY", 1), ("UNIQUE", 1)],
+        ),
+        # Only the KEY constraints appear in key_column_usage -- a CHECK names
+        # no key column.
+        (
+            "SELECT column_name FROM information_schema.key_column_usage "
+            "WHERE table_name='cc_parent' ORDER BY column_name",
+            [("code",), ("id",)],
+        ),
+        (
+            "SELECT sequence_name, data_type, start_value, minimum_value, maximum_value, "
+            "increment, cycle_option FROM information_schema.sequences "
+            "WHERE sequence_name='cc_seq'",
+            [("cc_seq", "bigint", "5", "1", "99", "2", "YES")],
+        ),
+        # `relkind` is how a client tells a sequence from a table.
+        ("SELECT relname, relkind FROM pg_class WHERE relname='cc_parent'", [("cc_parent", "r")]),
+        ("SELECT relname, relkind FROM pg_class WHERE relname='cc_seq'", [("cc_seq", "S")]),
+        ("SELECT relnatts FROM pg_class WHERE relname='cc_parent'", [(6,)]),
+        (
+            "SELECT nspname FROM pg_namespace WHERE nspname IN ('public','pg_catalog') "
+            "ORDER BY nspname",
+            [("pg_catalog",), ("public",)],
+        ),
+        # `pg_attribute` over a TABLE, which only listed composites before.
+        (
+            "SELECT attname, attnotnull FROM pg_attribute WHERE attrelid='cc_parent'::regclass "
+            "AND attnum > 0 ORDER BY attnum",
+            [
+                ("id", True),
+                ("code", False),
+                ("amount", False),
+                ("label", False),
+                ("flag", True),
+                ("note", False),
+            ],
+        ),
+    ],
+)
+def test_catalog_views_match_postgres(home: Path, sql: str, expected: list[tuple]) -> None:
+    """Answers checked against a live PostgreSQL 14.13.
+
+    These views are what an ORM, a migration tool and `\\d` actually read, so
+    the column NAMES and TYPES have to be right, not merely present.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        _catalogued(conn)
+        cur = conn.cursor()
+        cur.execute(sql)
+        assert cur.fetchall() == expected
+
+
+@pytest.mark.parametrize(
+    "sql,expected",
+    [
+        # These already worked as a BARE select-list target, where they become
+        # a `ConstCol` the server resolves. Inside an EXPRESSION the constant
+        # evaluator reached them instead and had nowhere to ask, so every one
+        # of them answered `0A000` -- which is exactly how a client uses them.
+        ("SELECT version() LIKE 'PostgreSQL%'", [(True,)]),
+        ("SELECT current_schema(), current_database() IS NOT NULL", [("public", True)]),
+        ("SELECT current_setting('server_version_num') ~ '^[0-9]+$'", [(True,)]),
+        ("SELECT current_setting('nosuch_guc_cc', true) IS NULL", [(True,)]),
+        ("SELECT obj_description('cc_parent'::regclass) IS NULL", [(True,)]),
+        # `format_type(oid, NULL)` is NOT null-propagating in its second
+        # argument: a NULL typmod means "no modifier".
+        (
+            "SELECT format_type(23, NULL), format_type(1700, 655366), format_type(1043, 24)",
+            [("integer", "numeric(10,2)", "character varying(20)")],
+        ),
+    ],
+)
+def test_catalog_functions_work_inside_an_expression(
+    home: Path, sql: str, expected: list[tuple]
+) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        _catalogued(conn)
+        cur = conn.cursor()
+        cur.execute(sql)
+        assert cur.fetchall() == expected
+
+
+def test_an_unknown_guc_is_42704(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        with pytest.raises(psycopg.Error) as info:
+            cur.execute("SELECT current_setting('nosuch_guc_cc')")
+        assert info.value.sqlstate == "42704"
+
+
+def test_a_user_table_may_be_called_columns(home: Path) -> None:
+    """`information_schema`'s views are called `tables`, `columns`,
+    `sequences` -- names a user table may perfectly well have.
+
+    A virtual relation wins over the catalog, so registering them bare would
+    make a user's own `columns` table unreachable. They keep their schema in
+    the name instead, and both resolve.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        _catalogued(conn)
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE columns (id int PRIMARY KEY, x int)")
+        cur.execute("INSERT INTO columns VALUES (1, 10)")
+        cur.execute("SELECT id, x FROM columns")
+        assert cur.fetchall() == [(1, 10)]
+        cur.execute(
+            "SELECT count(*) > 0 FROM information_schema.columns WHERE table_name='cc_parent'"
+        )
+        assert cur.fetchall() == [(True,)]
+
+
+def test_a_tables_row_type_does_not_double_its_pg_attribute_rows(home: Path) -> None:
+    """A table's ROW TYPE is a composite under the same name and the same
+    relation oid, so listing both put every column in twice -- once with
+    `attnotnull` true and once false."""
+    with _Server(home) as server, server.connect() as conn:
+        _catalogued(conn)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT count(*) FROM pg_attribute WHERE attrelid='cc_parent'::regclass AND attnum > 0"
+        )
+        assert cur.fetchall() == [(6,)]

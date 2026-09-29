@@ -407,6 +407,25 @@ one request path:
     preserves it** — the golden test in `secantus-pgcatalog/src/golden.rs` is
     what catches this class.
 
+    **`information_schema` and the catalog views landed 2026-09-28** —
+    `information_schema.columns` / `.tables` / `.table_constraints` /
+    `.key_column_usage` / `.sequences`, plus `pg_class`, `pg_namespace`,
+    `pg_index`, `pg_indexes`, `pg_attrdef`, and `pg_attribute` over TABLES
+    rather than only composites. The catalog corpus went 19 divergences of 22
+    to 4.
+
+    Two things there are easy to trip over. **Seven catalog functions worked
+    only as a BARE select-list target** — `version()`, `current_setting()`,
+    `obj_description()` and friends become a `ConstCol` the server resolves
+    when they stand alone, and answered `0A000` inside any expression, which
+    is how a client actually writes them; `scalar::is_scalar` is the gate, and
+    a name absent from it never reaches the evaluator. And
+    **`information_schema`'s views are called `tables` / `columns` /
+    `sequences`**, names a user table may have — a virtual relation wins over
+    the catalog, so they keep their schema in the name (see
+    `secantus_pgplan::relation_name`) or a user's own `columns` table becomes
+    unreachable.
+
     **What remains refused**: correlated subqueries, a window function over an
     AGGREGATE, `SELECT *` over a JOIN, array subscripting,
     `CREATE INDEX`, `CREATE VIEW`, `CREATE TRIGGER`,
@@ -465,12 +484,13 @@ one request path:
 
     So do not read "96.8% of psycopg passes" as "nearly done". A SQL-shaped gauge
     (`sqllogictest`, the SQLAlchemy dialect suite) would score very differently.
-    With subqueries, CTEs, window functions, `ALTER TABLE` and sequences
-    landed, the next levers are `information_schema` (most of the `catalog`
-    corpus, and what ORMs and migration tools actually read), `CREATE INDEX`
-    (which also unblocks a partial-index `ON CONFLICT` arbiter and
-    `ALTER TABLE ADD CONSTRAINT UNIQUE`), `CREATE VIEW`, and correlated
-    subqueries.
+    With subqueries, CTEs, window functions, `ALTER TABLE`, sequences and
+    `information_schema` landed, the next levers are `CREATE INDEX` (which
+    also unblocks a partial-index `ON CONFLICT` arbiter, `ALTER TABLE ADD
+    CONSTRAINT UNIQUE`, and two of the four catalog lines left), the
+    `arrays` / `datetimes` / `strings` function surface (24, 18 and 18
+    divergences, all breadth rather than depth), `CREATE VIEW`, and
+    correlated subqueries.
   - Not there yet, beyond the survey above: password verification (a role's SCRAM
     verifier is stored and never checked — a wrong password and no password both
     connect, re-probed 2026-09-18, re-confirmed live 2026-09-28 by connecting
