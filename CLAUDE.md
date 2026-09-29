@@ -339,8 +339,12 @@ one request path:
     call it, and an artifact carrying no stamp at all — the check abstains rather
     than guess, so silence is not proof of freshness. `<binary> --version` prints
     the tree; compare it yourself when in doubt.
-  - **The gauge number above measures the PROTOCOL and the TYPE SYSTEM, which is
-    this server's strong half. It says very little about the QUERY LANGUAGE.**
+  - **The gauge number above measures the PROTOCOL and the TYPE SYSTEM, which
+    was this server's strong half while the QUERY LANGUAGE lagged far behind
+    it.** That gap is mostly closed as of 2026-09-28 — the paragraphs below are
+    a running record of the day it closed, and the survey opening this bullet
+    is what it looked like BEFORE. Read to the end before quoting any of it.
+
     Surveyed 2026-09-28 against a binary built from `HEAD:crates`, seventeen
     features were refused outright (`0A000 … is not supported yet`). **Six of
     them landed 2026-09-28** — pattern matching (`LIKE` / `ILIKE` / `~`, with
