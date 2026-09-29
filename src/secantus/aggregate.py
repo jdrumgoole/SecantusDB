@@ -1345,8 +1345,36 @@ def _stage_match(
             code=15959,
             code_name="Location15959",
         )
+    _reject_where_in_match(spec)
     coll_obj = _parse_collation(ctx.collation)
     return [d for d in docs if matches(d, spec, vars=ctx.vars, collation=coll_obj)]
+
+
+def _reject_where_in_match(spec: Any) -> None:
+    """Refuse ``$where`` anywhere inside a ``$match`` filter.
+
+    This is an aggregation rule, not a scripting one: mongod answers code 2
+    ``$where is not allowed in this context`` whether or not it has a script
+    engine (measured on 8.2.11 both with JS enabled and under
+    ``--noscripting``, 2026-09-29), so it is NOT the same refusal a plain
+    ``find`` gets and must not be folded into it.
+
+    Parse-time, and recursive through ``$and`` / ``$or`` / ``$nor``: mongod
+    rejects a nested ``$where`` on an empty *and* a nonexistent collection, so
+    a per-document check in the matcher would wrongly return an empty batch.
+    """
+    if isinstance(spec, Mapping):
+        for key, value in spec.items():
+            if key == "$where":
+                raise AggregateError(
+                    "$where is not allowed in this context",
+                    code=2,
+                    code_name="BadValue",
+                )
+            _reject_where_in_match(value)
+    elif isinstance(spec, (list, tuple)):
+        for item in spec:
+            _reject_where_in_match(item)
 
 
 def _stage_count(
@@ -6533,6 +6561,23 @@ _STAGES = {
 }
 
 
+def reject_where_in_match_stages(pipeline: list[Any]) -> None:
+    """Refuse ``$where`` in any ``$match`` stage, at aggregate PARSE time.
+
+    Must run before the command layer lifts a leading ``$match`` into the
+    initial fetch's filter: once lifted, the filter goes through the query
+    matcher, which answers the query-context refusal (6108304) instead of
+    mongod's aggregation-context code 2. Measured 8.2.11 2026-09-29 -- a
+    non-leading ``$match`` already answered code 2 while the leading one did
+    not, which is the asymmetry this closes.
+    """
+    for stage in pipeline:
+        if isinstance(stage, Mapping):
+            for name, spec in stage.items():
+                if name == "$match":
+                    _reject_where_in_match(spec)
+
+
 def validate_stage_names(pipeline: list[Any]) -> None:
     """Upfront stage-name validation (mongod validates at parse time,
     before any document flows — change streams need the 40324 at
@@ -6565,6 +6610,12 @@ def validate_stage_names(pipeline: list[Any]) -> None:
         # errors that only make sense against a real change event stay
         # deferred to execution time.
         if name == "$match" and isinstance(stage[name], Mapping):
+            # $where must be refused as an aggregation-CONTEXT error (code 2)
+            # before the generic matcher validation below, which would answer
+            # with the query-context refusal instead. mongod distinguishes the
+            # two and gives $where-in-$match the same code 2 whether or not it
+            # has a script engine -- see _reject_where_in_match.
+            _reject_where_in_match(stage[name])
             try:
                 matches({}, stage[name])
             except QueryError:

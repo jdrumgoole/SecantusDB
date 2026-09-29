@@ -25,6 +25,7 @@ from secantus.aggregate import (
     apply_pipeline,
     expression_problem_in_filter,
     expression_problem_in_pipeline,
+    reject_where_in_match_stages,
     validate_stage_names,
     wrap_expression_problem,
 )
@@ -7031,6 +7032,19 @@ def _aggregate(doc: dict[str, Any], ctx: CommandContext) -> dict[str, Any]:
             "errmsg": "A pipeline must be an array of objects",
             "code": 14,
             "codeName": "TypeMismatch",
+        }
+    # ``$where`` in a ``$match`` is an aggregation-context error (code 2) on
+    # every mongod, script engine or not. It has to be refused HERE, before the
+    # leading-``$match`` lift below hands the filter to the query matcher --
+    # which would answer with the query-context refusal instead.
+    try:
+        reject_where_in_match_stages(pipeline)
+    except AggregateError as exc:
+        return {
+            "ok": 0.0,
+            "errmsg": str(exc),
+            "code": exc.code,
+            "codeName": exc.code_name,
         }
     # An undefined `$$variable` is a PARSE error for mongod -- it fires on an
     # EMPTY collection, where nothing is ever evaluated, so the evaluator alone

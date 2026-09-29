@@ -313,7 +313,13 @@ pub(crate) fn read_exec_error(err: StorageError, command: &str, ns: &str) -> Com
             exec: true,
         } => CommandError::new(
             code,
-            code_name_for(code),
+            // `error_code_name`, NOT `code_name_for`: the latter returns the
+            // bare "Location" SENTINEL for a code with no symbolic name, and
+            // emitting that verbatim put `codeName: "Location"` on the wire
+            // where mongod says `Location<n>`. Found 2026-09-29 when 6108304
+            // became the first unnamed code to travel this path under a
+            // comparison that looked at codeName and not just code.
+            error_code_name(code),
             format!("Executor error during {command} command: {ns} :: caused by :: {errmsg}"),
         ),
         other => command_error(other),
@@ -335,7 +341,9 @@ pub(crate) fn command_error_during(err: StorageError, command: &str) -> CommandE
         StorageError::Internal(msg) => CommandError::new(1, "InternalError", msg),
         StorageError::WriteError { code, errmsg, exec } => CommandError::new(
             code,
-            code_name_for(code),
+            // See the note in `read_exec_error`: the bare "Location" sentinel
+            // must be formatted into `Location<n>` before it reaches a client.
+            error_code_name(code),
             exec_wrapped(errmsg, exec, command),
         ),
         StorageError::DuplicateKey(info) => CommandError::new(11000, "DuplicateKey", info.errmsg),

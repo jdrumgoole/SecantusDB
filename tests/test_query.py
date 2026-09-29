@@ -790,3 +790,45 @@ def test_jsonschema_deep_nesting_raises_typed_error_not_recursion() -> None:
     assert ei.value.code == 9
     assert ei.value.code_name == "FailedToParse"
     assert "deep" in str(ei.value)
+
+
+def test_where_refuses_with_mongods_no_script_engine_error() -> None:
+    """``$where`` needs a JavaScript engine SecantusDB does not embed.
+
+    The values are mongod's own, taken from ``mongod --noscripting`` 8.2.11 on
+    2026-09-29 -- a supported configuration with exactly our property. The
+    previous message, "unknown top level operator: $where", was wrong twice
+    over: mongod knows ``$where``, and a client that reads the code learned
+    nothing true from a generic BadValue.
+
+    ``code_name`` is asserted because it was the half that silently diverged:
+    ``QueryError`` defaults to ``BadValue``, so a correct 6108304 shipped under
+    the wrong name and a code-and-message check could not see it.
+    """
+    with pytest.raises(QueryError) as exc:
+        matches({"x": 1}, {"$where": "function() { return true; }"})
+    assert exc.value.code == 6108304
+    assert exc.value.code_name == "Location6108304"
+    assert str(exc.value) == "no globalScriptEngine in $where parsing"
+
+
+def test_where_refusal_does_not_depend_on_the_document() -> None:
+    """The refusal is parse-time, so an empty document still raises.
+
+    This is what lets the command layer validate a filter by running the
+    matcher against ``{}``: mongod refuses ``$where`` on an empty and on a
+    nonexistent collection, so a refusal that only fired once a real document
+    was examined would return an empty batch instead of an error.
+    """
+    for doc in ({}, {"x": 1}, {"unrelated": "value"}):
+        with pytest.raises(QueryError) as exc:
+            matches(doc, {"$where": "function() { return false; }"})
+        assert exc.value.code == 6108304
+
+
+def test_where_is_refused_when_nested_in_a_logical_operator() -> None:
+    """``$or`` / ``$and`` / ``$nor`` recurse into the same top-level dispatch."""
+    for wrapper in ("$or", "$and", "$nor"):
+        with pytest.raises(QueryError) as exc:
+            matches({"x": 1}, {wrapper: [{"$where": "function() { return true; }"}]})
+        assert exc.value.code == 6108304, wrapper

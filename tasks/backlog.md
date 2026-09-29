@@ -3005,18 +3005,34 @@ These are explicit non-goals. Don't add them without a reason.
       * `TestRetryableReadsProse/retrying_reads_in_a_replica_set/overload_errors_retried_on_a_different_replicaset_server`
         — retries on a DIFFERENT member; there is no other member.
 
-      **Two are SDAM pool-clearing and want investigation — these are the ones
-      most likely to be real:**
+      **Two were filed as SDAM pool-clearing. They are not.** (Diagnosed and
+      the server-side half fixed 2026-09-29.) The entry that named them was
+      written from the test NAMES; the bodies tell a different story. Both
+      issue a `find` whose filter is
+      `{$where: "function() { sleep(1000); return false; }"}` and then abandon
+      it client-side after 100ms -- one via a context deadline, one via
+      `cancel()`. The pool assertion is the LAST line of each test and is never
+      reached: `$where` needs a JavaScript engine, our servers refused it
+      instantly, and the tests failed several assertions earlier on
+      "expected timeout error, got ..." / "expected network error, got ...".
 
       * `TestSDAMErrorHandling/after_handshake_completes/network_errors/pool_not_cleared_on_timeout_network_error`
       * `...pool_not_cleared_on_context_cancellation`
 
-        Both assert the connection pool is **not** cleared when a network error
-        is a timeout or a client-side cancellation (as opposed to a real socket
-        failure, which must clear it). Both fail "Should be true". If we clear
-        the pool on a cancelled context, a client that cancels one operation
-        drops every pooled connection — a real and unpleasant behaviour, not a
-        topology nicety. Probe before assuming it is out of scope.
+        **Our pool-clearing behaviour was never in question** -- the sibling
+        case `pool_cleared_on_non-timeout_network_error`, which drives the same
+        code through a `failCommand` failpoint, passes on both servers.
+
+        **A real `mongod --noscripting` fails these two tests with
+        byte-identical messages to ours** (verified by running the Go tests
+        against both). So they require server-side JavaScript and cannot pass
+        without it; they are NOT evidence of a defect. They stay red and
+        un-skipped deliberately: excluding them would hide the `$where` gap,
+        and they will start passing by themselves if a script engine ever
+        lands.
+
+        What WAS wrong, and is fixed, is the refusal itself -- see the `$where`
+        item below.
 
       **Two are mongocryptd:**
 
@@ -3032,6 +3048,51 @@ These are explicit non-goals. Don't add them without a reason.
       `cd vendor/mongo-go-driver && MONGODB_URI=mongodb://127.0.0.1:<port> go test
       ./internal/integration/ -run '<TestName>' -timeout 60s -count=1 -v`
       against a daemon WITHOUT `--standalone` (several are replica-set-gated).
+
+- [ ] **OPEN — `$where` / server-side JavaScript is not implemented, and the
+      refusal is now faithful (2026-09-29).** `$where` runs user JavaScript;
+      SecantusDB embeds no script engine and there is no plan to. What changed
+      is the ANSWER, which used to be our implementation leaking onto the wire:
+
+      | | before | now (= `mongod --noscripting` 8.2.11) |
+      | --- | --- | --- |
+      | Rust server | 2 / `Location` / "query uses a construct the Rust server does not support" | 6108304 / `Location6108304` / "no globalScriptEngine in $where parsing" |
+      | Python server | 2 / `BadValue` / "unknown top level operator: $where" | same as above |
+
+      `mongod --noscripting` is a supported configuration with exactly our
+      property, so its refusal is a real server's error surface rather than one
+      we invented. "unknown top level operator" was wrong twice over: mongod
+      knows `$where` perfectly well.
+
+      **`$where` in an aggregation `$match` is a DIFFERENT refusal** — code 2
+      `$where is not allowed in this context`, which mongod gives whether or
+      not it has a script engine, so it is a pipeline rule and not a scripting
+      one. It had to be checked at aggregate parse time, ahead of the
+      leading-`$match` lift: once lifted into the fetch filter it went through
+      the query matcher and picked up the query-context refusal, so the first
+      stage disagreed with every other position.
+
+      Pinned by `tests/test_mongod_differential.py::test_where_refusal_matches_a_scriptless_mongod`
+      (against a live `--noscripting` mongod, via the new `mongod_noscripting_uri`
+      fixture) and `::test_where_in_aggregate_match_is_a_context_error`, plus
+      `tests/test_rust_server_smoke.py` for the Rust server (the differential
+      gate drives the Python one, so nothing there would see the Rust server
+      drift) and `tests/test_crud.py` for a box with no mongod.
+
+      **What this does NOT fix:** the two Go tests filed above as
+      "SDAM pool-clearing" still fail, because they need the JavaScript to
+      actually run for ~1s. A real `--noscripting` mongod fails them the same
+      way, with byte-identical messages. Implementing `$where` means embedding a
+      JS engine — a large dependency for one operator, and worth a deliberate
+      decision rather than drifting into.
+
+      **Fixed on the way past:** `command_error_during` / `read_exec_error` in
+      `crates/secantus-commands/src/util.rs` used `code_name_for` rather than
+      `error_code_name`, so any code with no symbolic name reached the client as
+      the bare sentinel `codeName: "Location"` instead of `Location<n>`. 6108304
+      was the first such code anyone compared on `codeName` rather than just
+      `code` and message — which is the general lesson: **compare `codeName`
+      too, or a correct code hides a wrong name.**
 
 - [ ] **OPEN — three server-side defects found by the 2026-09-28 Rust gauge
       sweep, none of them in pymongo.** The pymongo gauge is at 1,205 / 5 with
