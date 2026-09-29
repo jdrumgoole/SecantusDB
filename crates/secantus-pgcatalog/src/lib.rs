@@ -321,6 +321,13 @@ pub struct UniqueConstraint {
     pub initially_deferred: bool,
     pub comment: Option<String>,
     pub exclusion: bool,
+    /// An `EXCLUDE` constraint's per-column operators when any is not `=`
+    /// (`&&` over a range): enforced by the executor row by row rather than
+    /// by a unique index. Empty for UNIQUE and for an all-`=` EXCLUDE, which
+    /// is the Python server's shape.
+    pub exclusion_ops: Vec<String>,
+    /// The EXCLUDE's access method (`gist`, `btree`), for its definition.
+    pub exclusion_method: Option<String>,
 }
 
 impl UniqueConstraint {
@@ -332,11 +339,13 @@ impl UniqueConstraint {
             initially_deferred: false,
             comment: None,
             exclusion: false,
+            exclusion_ops: Vec::new(),
+            exclusion_method: None,
         }
     }
 
     pub fn to_document(&self) -> Document {
-        doc! {
+        let mut d = doc! {
             "name": &self.name,
             "columns": self.columns.iter().map(|c| Bson::String(c.clone()))
                 .collect::<Vec<_>>(),
@@ -344,7 +353,14 @@ impl UniqueConstraint {
             "initially_deferred": self.initially_deferred,
             "comment": self.comment.clone().map(Bson::String).unwrap_or(Bson::Null),
             "exclusion": self.exclusion,
+        };
+        if !self.exclusion_ops.is_empty() {
+            d.insert("exclusion_ops", self.exclusion_ops.clone());
         }
+        if let Some(m) = &self.exclusion_method {
+            d.insert("exclusion_method", m.as_str());
+        }
+        d
     }
 
     pub fn from_document(d: &Document) -> Option<Self> {
@@ -360,6 +376,11 @@ impl UniqueConstraint {
             initially_deferred: d.get_bool("initially_deferred").unwrap_or(false),
             comment: d.get_str("comment").ok().map(str::to_string),
             exclusion: d.get_bool("exclusion").unwrap_or(false),
+            exclusion_ops: d
+                .get_array("exclusion_ops")
+                .map(|a| a.iter().filter_map(|b| b.as_str().map(str::to_string)).collect())
+                .unwrap_or_default(),
+            exclusion_method: d.get_str("exclusion_method").ok().map(str::to_string),
         })
     }
 }
@@ -378,6 +399,10 @@ pub struct ForeignKey {
     pub on_update: Option<String>,
     pub deferrable: bool,
     pub initially_deferred: bool,
+    /// `MATCH FULL`: a key with SOME null columns is a violation, not a
+    /// pass. Written only when set, so the shared document shape is the
+    /// Python server's for the default MATCH SIMPLE.
+    pub match_full: bool,
 }
 
 impl CheckConstraint {
@@ -399,7 +424,7 @@ impl CheckConstraint {
 
 impl ForeignKey {
     pub fn to_document(&self) -> Document {
-        doc! {
+        let mut d = doc! {
             "name": &self.name,
             "columns": self.columns.clone(),
             "ref_table": &self.ref_table,
@@ -409,7 +434,11 @@ impl ForeignKey {
             "deferrable": self.deferrable,
             "initially_deferred": self.initially_deferred,
             "comment": Bson::Null,
+        };
+        if self.match_full {
+            d.insert("match_full", true);
         }
+        d
     }
 
     pub fn from_document(d: &Document) -> Option<Self> {
@@ -431,6 +460,7 @@ impl ForeignKey {
             on_update: d.get_str("on_update").ok().map(str::to_string),
             deferrable: d.get_bool("deferrable").unwrap_or(false),
             initially_deferred: d.get_bool("initially_deferred").unwrap_or(false),
+            match_full: d.get_bool("match_full").unwrap_or(false),
         })
     }
 }

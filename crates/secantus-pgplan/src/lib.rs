@@ -2191,10 +2191,16 @@ pub fn identifier_position(sql: &str, name: &str) -> Option<usize> {
 /// PostgreSQL's (`syntax error at or near "selct"`), and the label reached
 /// the client's `message_primary`.
 fn parse_error(e: pg_query::Error) -> Error {
-    Error::Parse(match e {
+    let m = match e {
         pg_query::Error::Parse(m) | pg_query::Error::Split(m) | pg_query::Error::Scan(m) => m,
         other => other.to_string(),
-    })
+    };
+    // The grammar raises a few FEATURE_NOT_SUPPORTED errors itself
+    // (`MATCH PARTIAL not yet implemented`); those are 0A000, not 42601.
+    if m.contains("not yet implemented") || m.contains("is not supported") {
+        return Error::FeatureNotSupported(m);
+    }
+    Error::Parse(m)
 }
 
 pub fn split_statements(sql: &str) -> Result<Vec<String>> {
@@ -3909,6 +3915,39 @@ fn plan_create_index(
     }))
 }
 
+thread_local! {
+    /// `(constraint oid, pg_get_constraintdef text)`, published by the wire
+    /// layer with the rest of the catalog.
+    static CONSTRAINT_DEFS: std::cell::RefCell<Vec<(i64, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Install the constraint definitions `pg_get_constraintdef` answers from.
+pub fn set_constraint_defs(defs: Vec<(i64, String)>) {
+    CONSTRAINT_DEFS.with(|d| *d.borrow_mut() = defs);
+}
+
+/// A CHECK constraint's expression as `pg_get_constraintdef` prints it:
+/// `CHECK ((n > 0))`.
+pub fn check_constraint_text(expression: &str, def: &TableDef) -> String {
+    let inner = pg_query::parse(&format!("SELECT {expression}"))
+        .ok()
+        .and_then(|p| {
+            p.protobuf.stmts.first().and_then(|s| match s.stmt.as_ref()?.node.as_ref()? {
+                N::SelectStmt(sel) => match sel.target_list.first()?.node.as_ref()? {
+                    N::ResTarget(rt) => rt.val.as_deref().cloned(),
+                    _ => None,
+                },
+                _ => None,
+            })
+        })
+        .and_then(|node| {
+            render_index_predicate(&node, def).or_else(|| deparse_expr(&node).ok().map(|s| format!("({s})")))
+        })
+        .unwrap_or_else(|| format!("({expression})"));
+    format!("CHECK ({inner})")
+}
+
 /// An index predicate as PostgreSQL's ruleutils prints it in
 /// `pg_indexes.indexdef` -- every comparison parenthesised, a string constant
 /// carrying its column's cast. `None` for a shape this does not reproduce
@@ -4469,6 +4508,64 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                     uniques.push(uq);
                 }
                 Ok(CT::ConstrPrimary) => table_pk = string_list(&k.keys),
+                // `EXCLUDE [USING m] (col WITH op, ...)`: each exclusion is a
+                // `[IndexElem, [op]]` pair. An all-`=` one is a UNIQUE (the
+                // Python server's shape); any other operator is enforced row
+                // by row.
+                Ok(CT::ConstrExclusion) => {
+                    let mut cols = Vec::new();
+                    let mut ops = Vec::new();
+                    for ex in &k.exclusions {
+                        let Some(N::List(pair)) = ex.node.as_ref() else {
+                            return Err(Error::Unsupported("this EXCLUDE element".into()));
+                        };
+                        let (Some(elem), Some(op)) = (pair.items.first(), pair.items.get(1)) else {
+                            return Err(Error::Unsupported("this EXCLUDE element".into()));
+                        };
+                        let Some(N::IndexElem(ie)) = elem.node.as_ref() else {
+                            return Err(Error::Unsupported("this EXCLUDE element".into()));
+                        };
+                        if ie.expr.is_some() || ie.name.is_empty() {
+                            return Err(Error::Unsupported("an EXCLUDE over an expression".into()));
+                        }
+                        let op = match op.node.as_ref() {
+                            Some(N::List(l)) => l
+                                .items
+                                .iter()
+                                .filter_map(|n| match n.node.as_ref() {
+                                    Some(N::String(s)) => Some(s.sval.clone()),
+                                    _ => None,
+                                })
+                                .next_back()
+                                .unwrap_or_default(),
+                            _ => String::new(),
+                        };
+                        cols.push(ie.name.clone());
+                        ops.push(op);
+                    }
+                    if k.where_clause.is_some() {
+                        return Err(Error::Unsupported("EXCLUDE ... WHERE".into()));
+                    }
+                    let name = if k.conname.is_empty() {
+                        format!("{table}_{}_excl", cols.join("_"))
+                    } else {
+                        k.conname.clone()
+                    };
+                    let mut uq = UniqueConstraint::new(&name, cols);
+                    uq.exclusion = true;
+                    uq.deferrable = k.deferrable;
+                    uq.initially_deferred = k.initdeferred;
+                    let method = if k.access_method.is_empty() {
+                        "btree".to_string()
+                    } else {
+                        k.access_method.clone()
+                    };
+                    if ops.iter().any(|o| o != "=") || method != "btree" {
+                        uq.exclusion_ops = ops;
+                        uq.exclusion_method = Some(method);
+                    }
+                    uniques.push(uq);
+                }
                 _ => return Err(Error::Unsupported(disc(el.node.as_ref().unwrap()))),
             },
             Some(other) => return Err(Error::Unsupported(disc(other))),
@@ -4755,6 +4852,17 @@ fn foreign_key_of(
         on_update,
         deferrable: k.deferrable,
         initially_deferred: k.initdeferred,
+        match_full: match k.fk_matchtype.as_str() {
+            "f" => true,
+            // PostgreSQL itself refuses MATCH PARTIAL (measured 14).
+            "p" => {
+                return Err(Error::Sqlstate(
+                    "0A000",
+                    "MATCH PARTIAL not yet implemented".into(),
+                ))
+            }
+            _ => false,
+        },
     })
 }
 
@@ -12080,6 +12188,9 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
             "regtype".to_string()
         }
         Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("pg_sleep") => "void".to_string(),
+        Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("pg_get_constraintdef") => {
+            "text".to_string()
+        }
         Some(N::FuncCall(f))
             if func_name(f).is_some_and(|n| n.starts_with("has_") && n.ends_with("_privilege")) =>
         {
@@ -12576,6 +12687,21 @@ fn array_operand_mismatch(e: &AExpr, def: Option<&TableDef>) -> Option<Error> {
         display_type(&nl),
         display_type(&nr)
     )))
+}
+
+/// Apply a binary operator to two values of the column type `ty`: the range
+/// and bit-string operators by type, everything else by value (`=`, `<>`,
+/// the box operators). For an EXCLUDE constraint's check.
+pub fn apply_typed_operator(op: &str, a: &Bson, b: &Bson, ty: &str) -> Result<Bson> {
+    if let Some(out) = range_ops::binary(op, a, b, ty, ty) {
+        return out;
+    }
+    if bits::is_bit_type(ty) {
+        if let Some(out) = bits::binary(op, a, b) {
+            return out;
+        }
+    }
+    eval_binary(op, a.clone(), b.clone())
 }
 
 /// A CASE's result expressions: every THEN, and the ELSE.
@@ -13152,6 +13278,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 // what evaluates it inside a WHERE clause.
                 if name == "to_regtype"
                     || name == "to_regclass"
+                    || name == "pg_get_constraintdef"
                     || (name.starts_with("has_") && name.ends_with("_privilege"))
                 {
                     let node = rt.val.as_deref().expect("checked");
@@ -17533,6 +17660,17 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
             // `'text'::regtype` -- unlike `to_regtype`, an unknown NAME is an
             // error here, which is why psycopg prefers the function.
             Bson::String(name) => {
+                // `regtypein` parses the text with the SQL grammar
+                // (`parseTypeString`), so an unquoted RESERVED word is a
+                // syntax error -- `'order'::regtype` is 42601 even when a
+                // type named "order" exists.
+                if pg_query::parse(&format!("SELECT NULL::{name}")).is_err() {
+                    let word = name.trim().split(|c: char| !c.is_alphanumeric() && c != '_').next().unwrap_or("");
+                    return Err(Error::Sqlstate(
+                        "42601",
+                        format!("syntax error at or near \"{word}\""),
+                    ));
+                }
                 match pgtypes::oid_of_name(&name).or_else(|| user_type_or_array_oid(&name)) {
                     Some(oid) => Ok(regtype_value(oid)),
                     None => Err(match shell_type_named(&name) {
@@ -20934,6 +21072,22 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 std::thread::sleep(std::time::Duration::from_secs_f64(secs.min(3600.0)));
             }
             return Ok(Bson::String(String::new()));
+        }
+        // `pg_get_constraintdef(oid [, pretty])`: the definition, or NULL for
+        // an oid that is no constraint.
+        if func_name(f).as_deref() == Some("pg_get_constraintdef") && !f.args.is_empty() {
+            let oid = match const_value(&f.args[0], params)? {
+                Bson::Int32(i) => i64::from(i),
+                Bson::Int64(i) => i,
+                Bson::Null => return Ok(Bson::Null),
+                other => regclass_oid(&other).unwrap_or(-1),
+            };
+            return Ok(CONSTRAINT_DEFS.with(|d| {
+                d.borrow()
+                    .iter()
+                    .find(|(o, _)| *o == oid)
+                    .map_or(Bson::Null, |(_, t)| Bson::String(t.clone()))
+            }));
         }
         // `to_regclass(text)`: the relation's regclass, or NULL when there is
         // none -- the `::regclass` cast without its 42P01.

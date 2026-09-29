@@ -1651,6 +1651,7 @@ impl PgHandler {
         // planner, which cannot read the catalog itself.
         secantus_pgplan::set_views(self.views().unwrap_or_default());
         secantus_pgplan::view_dml::set_checked_views(self.checked_views().unwrap_or_default());
+        secantus_pgplan::set_constraint_defs(self.constraint_defs().unwrap_or_default());
         // User-defined functions, so the planner can type and route a call.
         secantus_pgplan::set_user_functions(
             self.user_function_docs()
@@ -4084,6 +4085,86 @@ impl PgHandler {
 
     /// Every view: `(name, stored definition)`, name-sorted, with this
     /// transaction's uncommitted creates and drops applied.
+    /// `pg_get_constraintdef` for every constraint, keyed by the synthetic oid
+    /// `pg_constraint` gives it -- walked in the SAME order as those rows
+    /// (primary key, unique, check, foreign key), since the oid is positional.
+    fn constraint_defs(&self) -> PgWireResult<Vec<(i64, String)>> {
+        let mut out = Vec::new();
+        for t in self.all_table_defs()? {
+            let Some(rel) = self.relation_oid(&t.name) else {
+                continue;
+            };
+            let mut ordinal = 0i64;
+            let mut push = |text: String| {
+                out.push((Self::constraint_oid(rel, ordinal), text));
+                ordinal += 1;
+            };
+            let deferral = |deferrable: bool, deferred: bool| -> String {
+                match (deferrable, deferred) {
+                    (true, true) => " DEFERRABLE INITIALLY DEFERRED".into(),
+                    (true, false) => " DEFERRABLE".into(),
+                    _ => String::new(),
+                }
+            };
+            let pk: Vec<&str> = t.columns.iter().filter(|c| c.pk).map(|c| c.name.as_str()).collect();
+            if !pk.is_empty() {
+                push(format!("PRIMARY KEY ({})", pk.join(", ")));
+            }
+            for u in &t.unique_constraints {
+                if u.exclusion {
+                    let parts: Vec<String> = u
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| format!("{c} WITH {}", u.exclusion_ops.get(i).map_or("=", String::as_str)))
+                        .collect();
+                    push(format!(
+                        "EXCLUDE USING {} ({})",
+                        u.exclusion_method.as_deref().unwrap_or("btree"),
+                        parts.join(", ")
+                    ));
+                } else {
+                    push(format!(
+                        "UNIQUE ({}){}",
+                        u.columns.join(", "),
+                        deferral(u.deferrable, u.initially_deferred)
+                    ));
+                }
+            }
+            for ck in &t.check_constraints {
+                push(secantus_pgplan::check_constraint_text(&ck.expression, &t));
+            }
+            for fk in &t.foreign_keys {
+                // `REFERENCES t` with no list names t's primary key.
+                let ref_columns: Vec<String> = if fk.ref_columns.is_empty() {
+                    self.lookup(&fk.ref_table)
+                        .map(|p| p.columns.iter().filter(|c| c.pk).map(|c| c.name.clone()).collect())
+                        .unwrap_or_default()
+                } else {
+                    fk.ref_columns.clone()
+                };
+                let mut text = format!(
+                    "FOREIGN KEY ({}) REFERENCES {}({})",
+                    fk.columns.join(", "),
+                    fk.ref_table,
+                    ref_columns.join(", ")
+                );
+                if fk.match_full {
+                    text.push_str(" MATCH FULL");
+                }
+                if let Some(a) = &fk.on_update {
+                    text.push_str(&format!(" ON UPDATE {a}"));
+                }
+                if let Some(a) = &fk.on_delete {
+                    text.push_str(&format!(" ON DELETE {a}"));
+                }
+                text.push_str(&deferral(fk.deferrable, fk.initially_deferred));
+                push(text);
+            }
+        }
+        Ok(out)
+    }
+
     /// The views created `WITH CHECK OPTION`, which a write through the view
     /// must honour.
     fn checked_views(&self) -> PgWireResult<Vec<(String, String)>> {
@@ -4302,6 +4383,79 @@ impl PgHandler {
             .collect::<Vec<_>>()
             .join(", ");
         Ok(Some((key, text)))
+    }
+
+    /// Enforce every EXCLUDE constraint with a non-`=` operator: no two rows
+    /// (the new ones against each other and against the stored rows other
+    /// than `replacing`) may have EVERY `col op col` true. NULLs never
+    /// conflict. PostgreSQL's 23P01.
+    fn check_exclusions(&self, def: &TableDef, rows: &[Document], replacing: &[Bson]) -> PgWireResult<()> {
+        let excl: Vec<&secantus_pgcatalog::UniqueConstraint> = def
+            .unique_constraints
+            .iter()
+            .filter(|u| !u.exclusion_ops.is_empty())
+            .collect();
+        if excl.is_empty() {
+            return Ok(());
+        }
+        let stored: Vec<Document> = self
+            .storage
+            .find_matching(self.db(), &def.name, &Document::new())
+            .map_err(|e| Self::storage_err("could not read", e))?
+            .into_iter()
+            .filter_map(|raw| bson::from_slice::<Document>(&raw).ok())
+            .filter(|d| !d.get("_id").is_some_and(|id| replacing.contains(id)))
+            .collect();
+        for c in excl {
+            let cols: Vec<(String, String, String)> = c
+                .columns
+                .iter()
+                .zip(&c.exclusion_ops)
+                .filter_map(|(col, op)| {
+                    let column = def.column(col)?;
+                    Some((column.field(), column.pg_type.clone(), op.clone()))
+                })
+                .collect();
+            let key = |row: &Document| -> Option<Vec<Bson>> {
+                cols.iter()
+                    .map(|(f, _, _)| row.get(f).filter(|v| **v != Bson::Null).cloned())
+                    .collect()
+            };
+            let conflicts = |a: &[Bson], b: &[Bson]| -> PgWireResult<bool> {
+                for ((_, ty, op), (x, y)) in cols.iter().zip(a.iter().zip(b)) {
+                    let v = secantus_pgplan::apply_typed_operator(op, y, x, ty).map_err(|e| Self::err(&e))?;
+                    if v != Bson::Boolean(true) {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            };
+            let render = |k: &[Bson]| k.iter().map(secantus_pgplan::value_text).collect::<Vec<_>>().join(", ");
+            let mut seen: Vec<Vec<Bson>> = stored.iter().filter_map(|r| key(r)).collect();
+            for row in rows {
+                let Some(k) = key(row) else { continue };
+                for other in &seen {
+                    if conflicts(&k, other)? {
+                        return Err(Self::constraint_error(
+                            "23P01",
+                            format!("conflicting key value violates exclusion constraint \"{}\"", c.name),
+                            format!(
+                                "Key ({})=({}) conflicts with existing key ({})=({}).",
+                                c.columns.join(", "),
+                                render(&k),
+                                c.columns.join(", "),
+                                render(other)
+                            ),
+                            def,
+                            Some(&c.name),
+                            None,
+                        ));
+                    }
+                }
+                seen.push(k);
+            }
+        }
+        Ok(())
     }
 
     /// The UNIQUE expression indexes on `table`.
@@ -6363,7 +6517,7 @@ impl PgHandler {
                             Some(k) => (
                                 Self::fk_action_code(k.on_update.as_deref()),
                                 Self::fk_action_code(k.on_delete.as_deref()),
-                                "s",
+                                if k.match_full { "f" } else { "s" },
                             ),
                             None => (" ", " ", " "),
                         };
@@ -6786,6 +6940,11 @@ impl PgHandler {
         def: &TableDef,
     ) -> Result<(), PgWireError> {
         for uq in &def.unique_constraints {
+            // An EXCLUDE over anything but `=` is not a uniqueness; the
+            // executor enforces it row by row (`check_exclusions`).
+            if !uq.exclusion_ops.is_empty() {
+                continue;
+            }
             if uq.deferrable {
                 // A DEFERRABLE constraint may be violated transiently inside a
                 // transaction and is judged at COMMIT — swapping two values is
@@ -6930,17 +7089,32 @@ impl PgHandler {
                 Some(b) => b.to_string().trim_matches('"').to_string(),
             })
             .collect();
-        let mut info = ErrorInfo::new(
-            "ERROR".into(),
-            "23505".into(),
-            format!("duplicate key value violates unique constraint \"{name}\""),
-        );
+        // An all-`=` EXCLUDE is enforced by the same unique index, but it is
+        // reported as the exclusion constraint it is (23P01).
+        let exclusion = def.unique_constraints.iter().any(|u| u.name == name && u.exclusion);
+        let mut info = if exclusion {
+            ErrorInfo::new(
+                "ERROR".into(),
+                "23P01".into(),
+                format!("conflicting key value violates exclusion constraint \"{name}\""),
+            )
+        } else {
+            ErrorInfo::new(
+                "ERROR".into(),
+                "23505".into(),
+                format!("duplicate key value violates unique constraint \"{name}\""),
+            )
+        };
         if !columns.is_empty() {
-            info.detail = Some(format!(
-                "Key ({})=({}) already exists.",
-                columns.join(", "),
-                values.join(", ")
-            ));
+            info.detail = Some(if exclusion {
+                format!(
+                    "Key ({cols})=({vals}) conflicts with existing key ({cols})=({vals}).",
+                    cols = columns.join(", "),
+                    vals = values.join(", ")
+                )
+            } else {
+                format!("Key ({})=({}) already exists.", columns.join(", "), values.join(", "))
+            });
         }
         // pgwire 0.39 added the protocol's schema/table/column/constraint
         // fields (they were absent in 0.31, which is why this used to be a
@@ -12756,6 +12930,7 @@ impl PgHandler {
                     self.check_view_conditions(&def, row, &ins.view_checks)?;
                 }
                 self.check_expression_unique(&def, &ins.rows, &[])?;
+                self.check_exclusions(&def, &ins.rows, &[])?;
                 if let Some(dup) = self.wide_numeric_pk_conflict(&ins.table, &def, &ins.rows)? {
                     return Err(Self::write_error(
                         &ins.table,
@@ -12953,15 +13128,43 @@ impl PgHandler {
             Statement::DropSchema {
                 names,
                 if_exists,
-                cascade: _,
+                cascade,
             } => {
-                // CASCADE would drop the schema's contents; this server does
-                // not track which tables/types belong to a schema (names carry
-                // no schema), so it accepts the keyword and drops only the
-                // schema record. The test corpus creates a schema, uses it,
-                // and drops it CASCADE at teardown -- the objects are dropped
-                // by name elsewhere, so nothing is orphaned in practice.
+                // The TYPES a schema holds (enums, composites, ranges, base
+                // types) record it; CASCADE drops them with the schema, and
+                // without it their presence is 2BP01. Tables carry no schema
+                // here, so they are left alone.
                 self.ensure_collection(Self::SCHEMA_COLLECTION)?;
+                for name in &names {
+                    let mut members: Vec<(&str, String)> = Vec::new();
+                    for coll in [
+                        Self::ENUM_COLLECTION,
+                        Self::COMPOSITE_COLLECTION,
+                        Self::RANGE_COLLECTION,
+                        Self::BASE_TYPE_COLLECTION,
+                    ] {
+                        for d in self.type_catalog_docs(coll)?.iter() {
+                            if d.get_str("schema") == Ok(name.as_str()) {
+                                if let Ok(id) = d.get_str("_id") {
+                                    members.push((coll, id.to_string()));
+                                }
+                            }
+                        }
+                    }
+                    if !members.is_empty() && !cascade {
+                        let mut info = ErrorInfo::new(
+                            "ERROR".into(),
+                            "2BP01".into(),
+                            format!("cannot drop schema {name} because other objects depend on it"),
+                        );
+                        info.hint =
+                            Some("Use DROP ... CASCADE to drop the dependent objects too.".into());
+                        return Err(PgWireError::UserError(Box::new(info)));
+                    }
+                    for (coll, id) in &members {
+                        self.delete_type_doc(coll, id)?;
+                    }
+                }
                 for name in &names {
                     let removed = self
                         .storage
@@ -15064,7 +15267,10 @@ impl PgHandler {
                 let constrained = def.as_ref().is_some_and(table_has_row_constraints)
                     || referenced
                     || triggered
-                    || !self.unique_expression_indexes(&upd.table)?.is_empty();
+                    || !self.unique_expression_indexes(&upd.table)?.is_empty()
+                    || def
+                        .as_ref()
+                        .is_some_and(|d| d.unique_constraints.iter().any(|u| !u.exclusion_ops.is_empty()));
                 // The columns the SET list assigns, for `UPDATE OF` triggers.
                 let targets: Vec<String> = match (&def, triggered) {
                     (Some(def), true) => {
@@ -15176,6 +15382,7 @@ impl PgHandler {
                         let replacing: Vec<Bson> =
                             writes.iter().map(|(id, _, _)| id.clone()).collect();
                         self.check_expression_unique(def, &new_rows, &replacing)?;
+                        self.check_exclusions(def, &new_rows, &replacing)?;
                     }
                     if let (true, Some(def)) = (referenced, def.as_ref()) {
                         self.check_referencing_updates(def, &key_changes)?;
@@ -15794,6 +16001,24 @@ impl PgHandler {
                 .map(|f| row.get(f).filter(|v| **v != Bson::Null).cloned())
                 .collect();
             let Some(values) = values else {
+                // MATCH FULL: all-NULL passes, but a MIX is a violation.
+                let nulls = fields
+                    .iter()
+                    .filter(|f| matches!(row.get(f.as_str()), None | Some(Bson::Null)))
+                    .count();
+                if fk.match_full && nulls < fields.len() {
+                    return Err(Self::constraint_error(
+                        "23503",
+                        format!(
+                            "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
+                            def.name, fk.name
+                        ),
+                        "MATCH FULL does not allow mixing of null and nonnull key values.".into(),
+                        def,
+                        Some(&fk.name),
+                        None,
+                    ));
+                }
                 continue;
             };
             if !self.referenced_key_exists(&parent, &ref_fields, &values, pending)? {
