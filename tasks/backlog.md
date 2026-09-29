@@ -2950,11 +2950,30 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
-- [ ] **OPEN — the Go gauge's 8 real failures, triaged (2026-09-29).** These were
-      invisible until the truncation fix: the run was killed at 476 of 481 tests
-      and the survivors scored 100.0%, so 16 fail events (8 distinct leaves, the
-      rest parent roll-ups) never reported at all. Now 659 of 659 complete and
-      the gauge reads 97.3%.
+- [ ] **OPEN — the Go gauge's 7 remaining failures, triaged (2026-09-29,
+      re-measured 2026-09-30).** These were invisible until the truncation fix:
+      the run was killed at 476 of 481 tests and the survivors scored 100.0%, so
+      16 fail events (8 distinct leaves, the rest parent roll-ups) never reported
+      at all.
+
+      **Now 659 of 659 complete and the gauge reads 97.7%** — 596 / 14 / 49,
+      verified from `.validation/go-raw.ndjson` as 659 `run` actions against 659
+      terminal outcomes, 0 started-without-result. `replSetStepDown` took it from
+      97.3% by clearing the `TestConnectionsSurvivePrimaryStepDown` pair, so
+      **14 fail events are 7 distinct leaves** now:
+
+      | leaf | needs |
+      | --- | --- |
+      | `TestConnectionPoolBackpressure` | an ingress rate limiter AND `$where` |
+      | `TestSDAMErrorHandling/.../pool_not_cleared_on_timeout_network_error` | `$where` |
+      | `TestSDAMErrorHandling/.../pool_not_cleared_on_context_cancellation` | `$where` |
+      | `TestSDAMProse/heartbeats_processed_more_frequently` | **unknown — the only genuinely open one** |
+      | `TestRetryableReadsProse/.../overload_errors_retried_on_a_different_replicaset_server` | a second replica-set member (non-goal) |
+      | `TestSessionsMongocryptdProse/18.` | a `mongocryptd` binary on PATH |
+      | `TestSessionsMongocryptdProse/19.` | a `mongocryptd` binary on PATH |
+
+      So six of the seven are accounted for by two absent dependencies and one
+      declared non-goal; exactly ONE is an undiagnosed divergence.
 
       **Two are missing commands, and both are more interesting than "not
       implemented":**
