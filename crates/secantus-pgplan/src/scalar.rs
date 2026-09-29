@@ -1618,7 +1618,7 @@ fn random_u64() -> u64 {
 fn similar_escape(pattern: &str, escape: Option<&str>) -> Result<String> {
     let esc: Option<char> = match escape {
         None => Some('\\'),
-        Some(e) if e.is_empty() => None,
+        Some("") => None,
         Some(e) => {
             if e.chars().count() > 1 {
                 return Err(Error::Sqlstate("22025", "invalid escape string".into()));

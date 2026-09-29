@@ -647,7 +647,7 @@ pub enum ConflictAction {
     Update {
         /// `(stored field, column type, expression)`, planned over the
         /// target's columns PLUS the proposed row's under `EXCLUDED_PREFIX`.
-        set_exprs: Vec<(String, String, ColumnExpr)>,
+        set_exprs: Vec<(String, String, i32, ColumnExpr)>,
         /// `WHERE` on the DO UPDATE: the update is skipped when it is false.
         filter: Option<ColumnExpr>,
     },
@@ -1870,7 +1870,7 @@ pub struct Update {
     /// Each is (stored field, declared column type, expression); the server
     /// evaluates them per matched row with `update_row_sets` and writes the
     /// result by `_id`, because a constant `$set` cannot express them.
-    pub set_exprs: Vec<(String, String, ColumnExpr)>,
+    pub set_exprs: Vec<(String, String, i32, ColumnExpr)>,
     /// `SET a[i] = v` / `SET a[lo:hi] = v` -- assignments INTO an array the
     /// row already holds, which rewrite it rather than replace it. Kept apart
     /// from `set_exprs` because the new value is a function of the OLD one and
@@ -4836,7 +4836,7 @@ fn plan_on_conflict(
             for (_, field, ty) in &fields {
                 sample.insert(field.clone(), sample_value_for_type(ty));
             }
-            let mut set_exprs: Vec<(String, String, ColumnExpr)> = Vec::new();
+            let mut set_exprs: Vec<(String, String, i32, ColumnExpr)> = Vec::new();
             for t in &clause.target_list {
                 let Some(N::ResTarget(rt)) = t.node.as_ref() else {
                     return Err(Error::Unsupported("this ON CONFLICT SET target".into()));
@@ -4862,7 +4862,7 @@ fn plan_on_conflict(
                 // beside an `excluded.` reference, and the row it reads is
                 // assembled per conflict.
                 let expr = row_column_expr(&val, &fields, params, &sample)?;
-                set_exprs.push((field, column.pg_type.clone(), expr));
+                set_exprs.push((field, column.pg_type.clone(), column.typmod, expr));
             }
             if set_exprs.is_empty() {
                 return Err(Error::Parse(
@@ -5660,9 +5660,9 @@ fn plan_window_call(
                 .columns
                 .iter()
                 .map(|c| {
-            note_bpchar_width(c);
-            (c.name.clone(), c.field(), c.pg_type.clone())
-        })
+                    note_bpchar_width(c);
+                    (c.name.clone(), c.field(), c.pg_type.clone())
+                })
                 .collect();
             let mut sample = Document::new();
             for c in &def.columns {
@@ -5802,8 +5802,6 @@ fn plan_window_args(
     }
     Ok((Some(expr), source_type, args))
 }
-
-/// The aggregate names the aggregate planner handles.
 
 fn has_aggregate(s: &pg_query::protobuf::SelectStmt) -> bool {
     // Only the names the aggregate planner actually handles. Any-FuncCall
@@ -6817,24 +6815,40 @@ fn pad_bpchar(v: Bson, width: Option<usize>) -> Bson {
 /// the length is blanks, which are silently dropped (PostgreSQL's
 /// assignment rule -- an explicit CAST truncates instead).
 pub(crate) fn fit_to_column(v: Bson, column: &Column) -> Result<Bson> {
-    if column.typmod <= 4 || !matches!(column.pg_type.as_str(), "bpchar" | "varchar") {
+    fit_length(v, &column.pg_type, column.typmod)
+}
+
+/// [`fit_to_column`] over a bare type and modifier.
+pub(crate) fn fit_length(v: Bson, pg_type: &str, typmod: i32) -> Result<Bson> {
+    if typmod <= 4 || !matches!(pg_type, "bpchar" | "varchar") {
         return Ok(v);
     }
     let Bson::String(text) = &v else { return Ok(v) };
-    let n = (column.typmod - 4) as usize;
+    let n = (typmod - 4) as usize;
     if text.chars().count() <= n {
         return Ok(v);
     }
-    let (head, tail): (String, String) = (text.chars().take(n).collect(), text.chars().skip(n).collect());
+    let (head, tail): (String, String) = (
+        text.chars().take(n).collect(),
+        text.chars().skip(n).collect(),
+    );
     if tail.chars().all(|c| c == ' ') {
-        let head = if column.pg_type == "bpchar" { head.trim_end_matches(' ').to_string() } else { head };
+        let head = if pg_type == "bpchar" {
+            head.trim_end_matches(' ').to_string()
+        } else {
+            head
+        };
         return Ok(Bson::String(head));
     }
     Err(Error::Sqlstate(
         "22001",
         format!(
             "value too long for type {}({n})",
-            if column.pg_type == "bpchar" { "character" } else { "character varying" }
+            if pg_type == "bpchar" {
+                "character"
+            } else {
+                "character varying"
+            }
         ),
     ))
 }
@@ -6867,7 +6881,13 @@ fn row_column_expr(
         let w = w.borrow();
         fields
             .iter()
-            .map(|(_, f, t)| if t == "bpchar" { w.get(f).copied() } else { None })
+            .map(|(_, f, t)| {
+                if t == "bpchar" {
+                    w.get(f).copied()
+                } else {
+                    None
+                }
+            })
             .collect()
     });
     let mut out = ColumnExpr::Row {
@@ -7194,12 +7214,11 @@ fn plan_table_targets(
                         || n == "regexp_replace"
                 }) && single_column_call(f, params).is_some_and(|(col, _)| {
                     def.column(&col).is_none_or(|c| c.pg_type != "bpchar")
-                })
-                    && !(func_name(f).as_deref() == Some("to_char")
-                        && single_column_call(f, params).is_some_and(|(c, _)| {
-                            def.column(&c)
-                                .is_some_and(|col| datetime::is_datetime(&col.pg_type))
-                        })) =>
+                }) && !(func_name(f).as_deref() == Some("to_char")
+                    && single_column_call(f, params).is_some_and(|(c, _)| {
+                        def.column(&c)
+                            .is_some_and(|col| datetime::is_datetime(&col.pg_type))
+                    })) =>
             {
                 let name = func_name(f).expect("checked");
                 let (column, args) = single_column_call(f, params).expect("checked");
@@ -7280,9 +7299,9 @@ fn plan_table_targets(
                     .columns
                     .iter()
                     .map(|c| {
-            note_bpchar_width(c);
-            (c.name.clone(), c.field(), c.pg_type.clone())
-        })
+                        note_bpchar_width(c);
+                        (c.name.clone(), c.field(), c.pg_type.clone())
+                    })
                     .collect();
                 // A sample row typed from the columns' declared types stands
                 // in for a real one, so a scalar call is typed by its result.
@@ -9368,9 +9387,9 @@ fn plan_select_rest(
                     .columns
                     .iter()
                     .map(|c| {
-            note_bpchar_width(c);
-            (c.name.clone(), c.field(), c.pg_type.clone())
-        })
+                        note_bpchar_width(c);
+                        (c.name.clone(), c.field(), c.pg_type.clone())
+                    })
                     .collect();
                 let mut sample = Document::new();
                 for c in &def.columns {
@@ -9436,9 +9455,9 @@ fn plan_select_rest(
                     .columns
                     .iter()
                     .map(|c| {
-            note_bpchar_width(c);
-            (c.name.clone(), c.field(), c.pg_type.clone())
-        })
+                        note_bpchar_width(c);
+                        (c.name.clone(), c.field(), c.pg_type.clone())
+                    })
                     .collect();
                 let mut sample = Document::new();
                 for c in &def.columns {
@@ -10280,7 +10299,10 @@ pub fn select_output_def(
         // expression that keeps the SOURCE column's type, exactly as
         // `join_output_def` treats it.
         let expr = sel.casts.get(i).and_then(|c| c.as_ref());
-        let src = source.columns.iter().find(|c| c.field() == *field || c.name == *field);
+        let src = source
+            .columns
+            .iter()
+            .find(|c| c.field() == *field || c.name == *field);
         let ty = match expr {
             Some(e) if !matches!(e, ColumnExpr::Coalesce { .. }) => column_expr_type(e).to_string(),
             _ => src
@@ -12797,7 +12819,6 @@ pub(crate) fn regtype_value(oid: i64) -> Bson {
 /// The tag key of an anonymous record value.
 pub const RECORD_KEY: &str = "__record";
 
-
 /// The companion key holding a `ROW(...)` record's STATIC field types.
 ///
 /// PostgreSQL's binary record format carries an oid per field, and that oid
@@ -12840,7 +12861,8 @@ pub fn record_field_types(v: &Bson) -> Option<Vec<String>> {
 pub(crate) fn record_fields(v: &Bson) -> Option<&Vec<Bson>> {
     match v {
         Bson::Document(d)
-            if d.keys().all(|k| k == RECORD_KEY || k == RECORD_TYPES_KEY || k == RECORD_NAMES_KEY) =>
+            if d.keys()
+                .all(|k| k == RECORD_KEY || k == RECORD_TYPES_KEY || k == RECORD_NAMES_KEY) =>
         {
             match d.get(RECORD_KEY) {
                 Some(Bson::Array(items)) => Some(items),
@@ -12860,7 +12882,10 @@ pub fn record_names(v: &Bson) -> Option<Vec<String>> {
     let Bson::Document(d) = v else { return None };
     record_fields(v)?;
     match d.get(RECORD_NAMES_KEY) {
-        Some(Bson::Array(items)) => items.iter().map(|t| t.as_str().map(str::to_owned)).collect(),
+        Some(Bson::Array(items)) => items
+            .iter()
+            .map(|t| t.as_str().map(str::to_owned))
+            .collect(),
         _ => None,
     }
 }
@@ -13200,7 +13225,12 @@ fn composite_value(value: Bson, target: &str, fields: &[(String, String)]) -> Re
     if let Bson::Document(d) = &mut record {
         d.insert(
             RECORD_NAMES_KEY,
-            Bson::Array(fields.iter().map(|(n, _)| Bson::String(n.clone())).collect()),
+            Bson::Array(
+                fields
+                    .iter()
+                    .map(|(n, _)| Bson::String(n.clone()))
+                    .collect(),
+            ),
         );
     }
     Ok(record)
@@ -15766,7 +15796,11 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
     // a filter against the stored value, and `'x  '` must find `'x'`. The
     // blanks come back where PostgreSQL shows them -- on output, and when
     // the value takes part in an expression (`pad_bpchar`).
-    Ok(if target == "bpchar" { trim_bpchar(out) } else { out })
+    Ok(if target == "bpchar" {
+        trim_bpchar(out)
+    } else {
+        out
+    })
 }
 
 fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
@@ -16857,7 +16891,7 @@ pub(crate) fn jsonpath_call(name: &str, args: &[Bson]) -> Result<Bson> {
             "function {name} does not exist"
         )));
     }
-    if args[..2].iter().any(|a| *a == Bson::Null) {
+    if args[..2].contains(&Bson::Null) {
         return Ok(Bson::Null);
     }
     let vars = match args.get(2) {
@@ -17039,7 +17073,10 @@ fn whole_row_rewrite(
     let mut rowtype: Option<String> = None;
     let (alias, columns): (String, Vec<String>) = match item.node.as_ref() {
         Some(N::RangeVar(r)) => {
-            let alias = r.alias.as_ref().map_or_else(|| r.relname.clone(), |a| a.aliasname.clone());
+            let alias = r
+                .alias
+                .as_ref()
+                .map_or_else(|| r.relname.clone(), |a| a.aliasname.clone());
             match lookup(&relation_name(r)) {
                 Some(def) => {
                     rowtype = Some(relation_name(r));
@@ -17052,7 +17089,8 @@ fn whole_row_rewrite(
             let Some(alias) = rs.alias.as_ref().map(|a| a.aliasname.clone()) else {
                 return Ok(None);
             };
-            let Some(N::SelectStmt(sub)) = rs.subquery.as_ref().and_then(|q| q.node.as_ref()) else {
+            let Some(N::SelectStmt(sub)) = rs.subquery.as_ref().and_then(|q| q.node.as_ref())
+            else {
                 return Ok(None);
             };
             let stmt = plan_select(sub, lookup, params)?;
@@ -17070,7 +17108,7 @@ fn whole_row_rewrite(
         }
         _ => return Ok(None),
     };
-    if columns.iter().any(|c| *c == alias) {
+    if columns.contains(&alias) {
         return Ok(None);
     }
     let is_whole_row = |c: &pg_query::protobuf::ColumnRef, allow_star: bool| -> bool {
@@ -17093,7 +17131,9 @@ fn whole_row_rewrite(
         let col_node = |name: &str| pg_query::protobuf::Node {
             node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
                 fields: vec![pg_query::protobuf::Node {
-                    node: Some(N::String(pg_query::protobuf::String { sval: name.to_string() })),
+                    node: Some(N::String(pg_query::protobuf::String {
+                        sval: name.to_string(),
+                    })),
                 }],
                 location: 0,
             })),
@@ -17298,7 +17338,7 @@ fn fts_operator(e: &AExpr, op: &str, lhs: &Bson, rhs: &Bson) -> Option<Result<Bs
         }
         return Some(fts::operator(op, &lt, lhs, rhs));
     }
-    if !fts_type(&lt) && !fts_type(&rt) && !(lt == "text" || unknown_operand(e.lexpr.as_deref())) {
+    if !fts_type(&lt) && !fts_type(&rt) && lt != "text" && !unknown_operand(e.lexpr.as_deref()) {
         return None;
     }
     if *lhs == Bson::Null || *rhs == Bson::Null {
@@ -18458,16 +18498,16 @@ fn plan_update(
 
     let mut set = Document::new();
     let mut unset: Vec<String> = Vec::new();
-    let mut set_exprs: Vec<(String, String, ColumnExpr)> = Vec::new();
+    let mut set_exprs: Vec<(String, String, i32, ColumnExpr)> = Vec::new();
     let mut set_subscripts: Vec<SubscriptAssign> = Vec::new();
     let row_fields = || -> (Vec<RowField>, Document) {
         let fields: Vec<RowField> = def
             .columns
             .iter()
             .map(|c| {
-            note_bpchar_width(c);
-            (c.name.clone(), c.field(), c.pg_type.clone())
-        })
+                note_bpchar_width(c);
+                (c.name.clone(), c.field(), c.pg_type.clone())
+            })
             .collect();
         let mut sample = Document::new();
         for c in &def.columns {
@@ -18526,10 +18566,13 @@ fn plan_update(
         if references_columns(val) || default_is_volatile(val) {
             let (fields, sample) = row_fields();
             let row = row_column_expr(val, &fields, params, &sample)?;
-            set_exprs.push((field, column.pg_type.clone(), row));
+            set_exprs.push((field, column.pg_type.clone(), column.typmod, row));
             continue;
         }
-        let value = fit_to_column(cast_value(const_value(val, params)?, &column.pg_type)?, column)?;
+        let value = fit_to_column(
+            cast_value(const_value(val, params)?, &column.pg_type)?,
+            column,
+        )?;
         set_stored_value(&mut set, &mut unset, field, value);
     }
     if set.is_empty() && set_exprs.is_empty() && set_subscripts.is_empty() {
@@ -18594,13 +18637,17 @@ pub fn on_conflict_row(existing: &Document, proposed: &Document) -> Document {
 
 /// `update_row_sets` for an `ON CONFLICT DO UPDATE` assignment list.
 pub fn on_conflict_row_sets(
-    set_exprs: &[(String, String, ColumnExpr)],
+    set_exprs: &[(String, String, i32, ColumnExpr)],
     row: &Document,
 ) -> Result<(Document, Vec<String>)> {
     let mut set = Document::new();
     let mut unset = Vec::new();
-    for (field, pg_type, expr) in set_exprs {
-        let value = cast_value(apply_row_expr(expr, row)?, pg_type)?;
+    for (field, pg_type, typmod, expr) in set_exprs {
+        let value = fit_length(
+            cast_value(apply_row_expr(expr, row)?, pg_type)?,
+            pg_type,
+            *typmod,
+        )?;
         set_stored_value(&mut set, &mut unset, field.clone(), value);
     }
     Ok((set, unset))
@@ -18617,8 +18664,12 @@ pub fn on_conflict_filter_passes(filter: &ColumnExpr, row: &Document) -> Result<
 pub fn update_row_sets(upd: &Update, row: &Document) -> Result<(Document, Vec<String>)> {
     let mut set = upd.set.clone();
     let mut unset = upd.unset.clone();
-    for (field, pg_type, expr) in &upd.set_exprs {
-        let value = cast_value(apply_row_expr(expr, row)?, pg_type)?;
+    for (field, pg_type, typmod, expr) in &upd.set_exprs {
+        let value = fit_length(
+            cast_value(apply_row_expr(expr, row)?, pg_type)?,
+            pg_type,
+            *typmod,
+        )?;
         set_stored_value(&mut set, &mut unset, field.clone(), value);
     }
     for a in &upd.set_subscripts {
@@ -19499,34 +19550,48 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
         // anywhere makes the answer NULL.
         if AExprKind::try_from(e.kind) == Ok(AExprKind::AexprIn) {
             let negated = in_is_negated(e);
-            let items: Vec<pg_query::protobuf::Node> = match e.rexpr.as_deref().and_then(|n| n.node.as_ref()) {
-                Some(N::List(l)) => l.items.clone(),
-                _ => return Err(Error::Unsupported("this IN list".into())),
-            };
+            let items: Vec<pg_query::protobuf::Node> =
+                match e.rexpr.as_deref().and_then(|n| n.node.as_ref()) {
+                    Some(N::List(l)) => l.items.clone(),
+                    _ => return Err(Error::Unsupported("this IN list".into())),
+                };
             let mut saw_null = false;
             for item in items {
                 let mut eq = e.clone();
                 eq.kind = AExprKind::AexprOp as i32;
                 eq.name = vec![string_node("=")];
                 eq.rexpr = Some(Box::new(item));
-                match const_value(&pg_query::protobuf::Node { node: Some(N::AExpr(eq)) }, params)? {
+                match const_value(
+                    &pg_query::protobuf::Node {
+                        node: Some(N::AExpr(eq)),
+                    },
+                    params,
+                )? {
                     Bson::Boolean(true) => return Ok(Bson::Boolean(!negated)),
                     Bson::Null => saw_null = true,
                     _ => {}
                 }
             }
-            return Ok(if saw_null { Bson::Null } else { Bson::Boolean(negated) });
+            return Ok(if saw_null {
+                Bson::Null
+            } else {
+                Bson::Boolean(negated)
+            });
         }
         // `x SIMILAR TO p [ESCAPE e]`: the parser has already wrapped the
         // pattern in `similar_to_escape(...)`, which turns it into an
         // anchored POSIX regex; the operator is `~` (`!~` for NOT SIMILAR).
         if AExprKind::try_from(e.kind) == Ok(AExprKind::AexprSimilar) {
             let subject = const_value(
-                e.lexpr.as_deref().ok_or_else(|| Error::Parse("SIMILAR TO with no subject".into()))?,
+                e.lexpr
+                    .as_deref()
+                    .ok_or_else(|| Error::Parse("SIMILAR TO with no subject".into()))?,
                 params,
             )?;
             let pattern = const_value(
-                e.rexpr.as_deref().ok_or_else(|| Error::Parse("SIMILAR TO with no pattern".into()))?,
+                e.rexpr
+                    .as_deref()
+                    .ok_or_else(|| Error::Parse("SIMILAR TO with no pattern".into()))?,
                 params,
             )?;
             let (Bson::String(subject), Bson::String(pattern)) = (&subject, &pattern) else {
@@ -19535,7 +19600,11 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             let re = regex::Regex::new(pattern)
                 .map_err(|err| Error::InvalidText(format!("invalid regular expression: {err}")))?;
             let hit = re.is_match(subject);
-            return Ok(Bson::Boolean(if operator_name(e)? == "!~" { !hit } else { hit }));
+            return Ok(Bson::Boolean(if operator_name(e)? == "!~" {
+                !hit
+            } else {
+                hit
+            }));
         }
         if AExprKind::try_from(e.kind) != Ok(AExprKind::AexprOp) {
             return Err(Error::Unsupported("this operator form".into()));
@@ -19594,7 +19663,10 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             };
             let (lb, rb) = (bp(e.lexpr.as_deref(), &lhs), bp(e.rexpr.as_deref(), &rhs));
             if lb || rb {
-                let (lu, ru) = (unknown_operand(e.lexpr.as_deref()), unknown_operand(e.rexpr.as_deref()));
+                let (lu, ru) = (
+                    unknown_operand(e.lexpr.as_deref()),
+                    unknown_operand(e.rexpr.as_deref()),
+                );
                 if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
                     if lb || (lu && rb) {
                         lhs = trim_bpchar(lhs);
@@ -19757,9 +19829,11 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                             },
                             _ => None,
                         });
-                        if let (true, Some(w), Bson::String(text)) =
-                            (matches!(base.as_str(), "bpchar" | "char" | "character"), width, &v)
-                        {
+                        if let (true, Some(w), Bson::String(text)) = (
+                            matches!(base.as_str(), "bpchar" | "char" | "character"),
+                            width,
+                            &v,
+                        ) {
                             let n = text.chars().count();
                             if n < w {
                                 v = Bson::String(format!("{text}{}", " ".repeat(w - n)));
@@ -20402,9 +20476,9 @@ fn lower_where_or_residual(
                 .columns
                 .iter()
                 .map(|c| {
-            note_bpchar_width(c);
-            (c.name.clone(), c.field(), c.pg_type.clone())
-        })
+                    note_bpchar_width(c);
+                    (c.name.clone(), c.field(), c.pg_type.clone())
+                })
                 .collect();
             let mut sample = Document::new();
             for c in &def.columns {

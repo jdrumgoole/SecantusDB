@@ -260,13 +260,11 @@ fn tokens(text: &str) -> Vec<(String, Kind)> {
         }
         while j < n {
             let c = chars[j];
-            if is_word(c) {
-                j += 1;
-            } else if matches!(c, '-' | '.' | '@' | '/' | '_' | '+')
+            let joiner = matches!(c, '-' | '.' | '@' | '/' | '_' | '+')
                 && j + 1 < n
                 && is_word(chars[j + 1])
-                && j > start
-            {
+                && j > start;
+            if is_word(c) || joiner {
                 j += 1;
             } else {
                 break;
@@ -802,7 +800,7 @@ impl QueryParser<'_> {
             if d > 16384 {
                 return Err(Error::Sqlstate(
                     "22023",
-                    format!("distance in phrase operator must be an integer value between zero and 16384 inclusive"),
+                    "distance in phrase operator must be an integer value between zero and 16384 inclusive".to_string(),
                 ));
             }
             return Ok(Some(d as u16));
@@ -905,6 +903,7 @@ fn morph(text: &str, cfg: Config, prefix: bool, weight: u8, phrase: bool) -> Que
 
 /// Remove stop-word placeholders, widening the phrases around them --
 /// `clean_stopword_intree`. `(node, ladd, radd)`.
+#[allow(clippy::type_complexity)]
 fn clean_stop(q: Query) -> (Option<Query>, u16, u16) {
     match q {
         Query::Val { .. } => (Some(q), 0, 0),
@@ -1784,58 +1783,13 @@ pub fn stem(word: &str) -> String {
     // Step 5.
     let (r1, r2) = regions(&w);
     if ends(&w, "e") {
-        if w.len() - 1 >= r2 || (w.len() - 1 >= r1 && !ends_short_syllable(&w[..w.len() - 1])) {
+        if w.len() > r2 || (w.len() > r1 && !ends_short_syllable(&w[..w.len() - 1])) {
             cut(&mut w, 1);
         }
-    } else if ends(&w, "ll") && w.len() - 1 >= r2 {
+    } else if ends(&w, "ll") && w.len() > r2 {
         cut(&mut w, 1);
     }
     w.iter().collect::<String>().replace('Y', "y")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Every word of the corpus PostgreSQL 14.13's `ts_lexize('english_stem')`
-    /// stemmed, matched exactly.
-    #[test]
-    fn stems_match_postgresql() {
-        let data = include_str!("../../../tests/data/english_stems.txt");
-        let mut wrong = Vec::new();
-        for line in data.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let mut parts = line.split_whitespace();
-            let (Some(word), Some(want)) = (parts.next(), parts.next()) else {
-                continue;
-            };
-            if stem(word) != want {
-                wrong.push(format!("{word}: {} != {want}", stem(word)));
-            }
-        }
-        assert!(
-            wrong.is_empty(),
-            "{} wrong: {:?}",
-            wrong.len(),
-            &wrong[..wrong.len().min(20)]
-        );
-    }
-
-    #[test]
-    fn renders_like_postgresql() {
-        let q = to_tsquery(Config::English, "fox <-> the <-> quick").unwrap();
-        assert_eq!(render_query(&q), "'fox' <2> 'quick'");
-        let q = to_tsquery(Config::English, "(fox | quick) & brown").unwrap();
-        assert_eq!(render_query(&q), "( 'fox' | 'quick' ) & 'brown'");
-        let v = to_tsvector(Config::English, "foo-bar abc123 42 -7 3.14 don't café 2x");
-        assert_eq!(
-            render_vector(&v),
-            "'-7':6 '2x':11 '3.14':7 '42':5 'abc123':4 'bar':3 'café':10 'foo':2 'foo-bar':1"
-        );
-    }
 }
 
 // ------------------------------------------------------------------------
@@ -2031,7 +1985,7 @@ pub fn call(name: &str, args: &[Bson]) -> Option<Result<Bson>> {
     if !is_function(name) {
         return None;
     }
-    if args.iter().any(|a| *a == Bson::Null) && name != "setweight" {
+    if args.contains(&Bson::Null) && name != "setweight" {
         return Some(Ok(Bson::Null));
     }
     Some(call_inner(name, args))
@@ -2298,6 +2252,7 @@ fn rank_or(w: &[f32; 4], v: &TsVector, q: &Query) -> f32 {
     res
 }
 
+#[allow(clippy::type_complexity, clippy::needless_range_loop)]
 fn rank_and(w: &[f32; 4], v: &TsVector, q: &Query) -> f32 {
     let items = operands(q);
     if items.len() < 2 {
@@ -2603,4 +2558,49 @@ pub fn rank_cd(weights: Option<[f32; 4]>, v: &TsVector, q: &Option<Query>, metho
         wdoc /= wdoc + 1.0;
     }
     wdoc as f32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every word of the corpus PostgreSQL 14.13's `ts_lexize('english_stem')`
+    /// stemmed, matched exactly.
+    #[test]
+    fn stems_match_postgresql() {
+        let data = include_str!("../../../tests/data/english_stems.txt");
+        let mut wrong = Vec::new();
+        for line in data.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            let (Some(word), Some(want)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            if stem(word) != want {
+                wrong.push(format!("{word}: {} != {want}", stem(word)));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} wrong: {:?}",
+            wrong.len(),
+            &wrong[..wrong.len().min(20)]
+        );
+    }
+
+    #[test]
+    fn renders_like_postgresql() {
+        let q = to_tsquery(Config::English, "fox <-> the <-> quick").unwrap();
+        assert_eq!(render_query(&q), "'fox' <2> 'quick'");
+        let q = to_tsquery(Config::English, "(fox | quick) & brown").unwrap();
+        assert_eq!(render_query(&q), "( 'fox' | 'quick' ) & 'brown'");
+        let v = to_tsvector(Config::English, "foo-bar abc123 42 -7 3.14 don't café 2x");
+        assert_eq!(
+            render_vector(&v),
+            "'-7':6 '2x':11 '3.14':7 '42':5 'abc123':4 'bar':3 'café':10 'foo':2 'foo-bar':1"
+        );
+    }
 }

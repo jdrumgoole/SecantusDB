@@ -98,7 +98,8 @@ def is_tsvector(v: Any) -> bool:
     return isinstance(v, dict) and "tsvector" in v
 
 
-_CANONICAL_TSVECTOR_RE = re.compile(r"^'(?:[^']|'')*'(?::\d+[A-D]?(?:,\d+[A-D]?)*)?(?: '(?:[^']|'')*'(?::\d+[A-D]?(?:,\d+[A-D]?)*)?)*$")
+_TSVECTOR_ENTRY = r"'(?:[^']|'')*'(?::\d+[A-D]?(?:,\d+[A-D]?)*)?"
+_CANONICAL_TSVECTOR_RE = re.compile(rf"^{_TSVECTOR_ENTRY}(?: {_TSVECTOR_ENTRY})*$")
 
 
 def text_as_tsvector(text: str) -> dict[str, Any]:

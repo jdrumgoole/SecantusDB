@@ -964,10 +964,10 @@ pub fn make_date(y: i32, m: i32, d: i32) -> Result<NaiveDate> {
 fn make_time_micros(h: i32, m: i32, sec: f64) -> Result<i64> {
     let micros = (sec * 1_000_000.0).round() as i64;
     let total = i64::from(h) * USECS_PER_HOUR + i64::from(m) * USECS_PER_MINUTE + micros;
-    if !(0..=23).contains(&h) || !(0..=59).contains(&m) || !(0.0..60.0).contains(&sec) {
-        if !(h == 24 && m == 0 && sec == 0.0) {
-            return Err(field_range("time", format!("{h}:{m:02}:{sec:02}")));
-        }
+    let in_range = (0..=23).contains(&h) && (0..=59).contains(&m) && (0.0..60.0).contains(&sec);
+    let midnight = h == 24 && m == 0 && sec == 0.0;
+    if !(in_range || midnight) {
+        return Err(field_range("time", format!("{h}:{m:02}:{sec:02}")));
     }
     Ok(total)
 }
@@ -980,7 +980,7 @@ pub fn make(name: &str, args: &[Bson]) -> Option<Result<Bson>> {
     ) {
         return None;
     }
-    if name != "make_interval" && args.iter().any(|a| *a == Bson::Null) {
+    if name != "make_interval" && args.contains(&Bson::Null) {
         return Some(Ok(Bson::Null));
     }
     Some((|| match name {
@@ -1037,7 +1037,7 @@ pub fn make(name: &str, args: &[Bson]) -> Option<Result<Bson>> {
                     Some(v) => num(v),
                 }
             };
-            if args.iter().any(|a| *a == Bson::Null) {
+            if args.contains(&Bson::Null) {
                 return Ok(Bson::Null);
             }
             let months = get(0)? as i32 * 12 + get(1)? as i32;
@@ -1309,18 +1309,13 @@ fn parse_dch(fmt: &str) -> Vec<DNode> {
     while !rest.is_empty() {
         let mut fm = false;
         let mut tm = false;
-        loop {
-            if let Some(r) = rest.strip_prefix("FM").or_else(|| rest.strip_prefix("fm")) {
-                fm = true;
-                rest = r;
-            } else if let Some(r) = rest.strip_prefix("TM").or_else(|| rest.strip_prefix("tm")) {
-                tm = true;
-                rest = r;
-            } else {
-                break;
-            }
-            // One prefix only, as suff_search takes the first match.
-            break;
+        // One prefix only, as suff_search takes the first match.
+        if let Some(r) = rest.strip_prefix("FM").or_else(|| rest.strip_prefix("fm")) {
+            fm = true;
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("TM").or_else(|| rest.strip_prefix("tm")) {
+            tm = true;
+            rest = r;
         }
         if let Some((kw, k)) = DCH.iter().find(|(kw, _)| rest.starts_with(kw)) {
             rest = &rest[kw.len()..];
@@ -2011,7 +2006,7 @@ fn from_char(input: &str, fmt: &str) -> Result<(NaiveDate, i64, Option<i64>)> {
         }
     }
     let mut y = match (year, cc) {
-        (Some(y), _) if ydigits < 4 && ydigits >= 2 => {
+        (Some(y), _) if (2..4).contains(&ydigits) => {
             // Two- and three-digit years pick the nearest century to 2020.
             if ydigits == 2 {
                 if y < 70 {
@@ -2174,7 +2169,7 @@ pub fn call(name: &str, args: &[Bson], types: &[String]) -> Option<Result<Bson>>
         return Some(r);
     }
     let t = |i: usize| types.get(i).map(String::as_str).unwrap_or("");
-    let strict = |args: &[Bson]| args.iter().any(|a| *a == Bson::Null);
+    let strict = |args: &[Bson]| args.contains(&Bson::Null);
     Some(match name {
         "extract" | "date_part" => {
             let [u, v] = args else { return None };

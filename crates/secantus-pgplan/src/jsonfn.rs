@@ -51,19 +51,20 @@ pub fn to_json_value(v: &Bson, ty: &str) -> Json {
             Bson::Boolean(b) => Json::Bool(*b),
             other => Json::Str(crate::value_text(other)),
         },
-        "timestamp" | "timestamp without time zone" | "timestamptz" | "timestamp with time zone" => {
-            match crate::instant_micros(v) {
-                Some(m) => {
-                    let text = crate::render_timestamp(m).replacen(' ', "T", 1);
-                    if ty.contains("tz") || ty.contains("with time zone") {
-                        Json::Str(format!("{text}+00:00"))
-                    } else {
-                        Json::Str(text)
-                    }
+        "timestamp"
+        | "timestamp without time zone"
+        | "timestamptz"
+        | "timestamp with time zone" => match crate::instant_micros(v) {
+            Some(m) => {
+                let text = crate::render_timestamp(m).replacen(' ', "T", 1);
+                if ty.contains("tz") || ty.contains("with time zone") {
+                    Json::Str(format!("{text}+00:00"))
+                } else {
+                    Json::Str(text)
                 }
-                None => Json::Str(crate::value_text(v)),
             }
-        }
+            None => Json::Str(crate::value_text(v)),
+        },
         "text" | "varchar" | "bpchar" | "name" | "char" | "unknown" | "date" | "time" | "uuid" => {
             Json::Str(crate::value_text(v))
         }
@@ -73,7 +74,9 @@ pub fn to_json_value(v: &Bson, ty: &str) -> Json {
             Bson::Double(d) if d.is_finite() => Json::Number(crate::geo::float8_text(*d)),
             Bson::Double(d) => Json::Str(crate::geo::float8_text(*d)),
             Bson::Boolean(b) => Json::Bool(*b),
-            Bson::Decimal128(_) => Json::Number(crate::numeric::numeric_text(v).unwrap_or_default()),
+            Bson::Decimal128(_) => {
+                Json::Number(crate::numeric::numeric_text(v).unwrap_or_default())
+            }
             Bson::Document(d) if d.contains_key(crate::WIDE_NUMERIC_KEY) => {
                 Json::Number(crate::numeric::numeric_text(v).unwrap_or_default())
             }
@@ -88,12 +91,19 @@ pub fn to_json_value(v: &Bson, ty: &str) -> Json {
 /// spaces anywhere, keys in their original order.
 pub fn compact(j: &Json) -> String {
     match j {
-        Json::Array(items) => format!("[{}]", items.iter().map(compact).collect::<Vec<_>>().join(",")),
+        Json::Array(items) => format!(
+            "[{}]",
+            items.iter().map(compact).collect::<Vec<_>>().join(",")
+        ),
         Json::Object(members) => format!(
             "{{{}}}",
             members
                 .iter()
-                .map(|(k, v)| format!("{}:{}", json::render_jsonb(&Json::Str(k.clone())), compact(v)))
+                .map(|(k, v)| format!(
+                    "{}:{}",
+                    json::render_jsonb(&Json::Str(k.clone())),
+                    compact(v)
+                ))
                 .collect::<Vec<_>>()
                 .join(",")
         ),
@@ -143,9 +153,13 @@ pub const FUNCTIONS: &[&str] = &[
 
 /// A JSON constructor's result type.
 pub fn result_type(name: &str) -> Option<&'static str> {
-    FUNCTIONS
-        .contains(&name)
-        .then(|| if name.starts_with("jsonb") || name == "to_jsonb" { "jsonb" } else { "json" })
+    FUNCTIONS.contains(&name).then(|| {
+        if name.starts_with("jsonb") || name == "to_jsonb" {
+            "jsonb"
+        } else {
+            "json"
+        }
+    })
 }
 
 fn text_of_key(v: &Bson) -> Result<String> {
@@ -166,7 +180,11 @@ pub fn call(name: &str, args: &[Bson], types: &[String]) -> Result<Bson> {
     let t = |i: usize| types.get(i).map_or("", String::as_str);
     let jsonb = name.starts_with("jsonb") || name == "to_jsonb";
     let out = |j: Json| -> Bson {
-        Bson::String(if jsonb { json::render_jsonb(&j) } else { compact(&j) })
+        Bson::String(if jsonb {
+            json::render_jsonb(&j)
+        } else {
+            compact(&j)
+        })
     };
     match name {
         "to_json" | "to_jsonb" => {
@@ -181,7 +199,9 @@ pub fn call(name: &str, args: &[Bson], types: &[String]) -> Result<Bson> {
             }
         }
         "row_to_json" | "array_to_json" => {
-            let Some(v) = args.first() else { return Err(wrong(name)) };
+            let Some(v) = args.first() else {
+                return Err(wrong(name));
+            };
             if *v == Bson::Null {
                 return Ok(Bson::Null);
             }
@@ -191,7 +211,7 @@ pub fn call(name: &str, args: &[Bson], types: &[String]) -> Result<Bson> {
             Ok(Bson::String(compact(&to_json_value(v, t(0)))))
         }
         "json_build_object" | "jsonb_build_object" => {
-            if args.len() % 2 != 0 {
+            if !args.len().is_multiple_of(2) {
                 return Err(Error::Sqlstate(
                     "22023",
                     "argument list must have even number of elements".into(),
@@ -208,7 +228,10 @@ pub fn call(name: &str, args: &[Bson], types: &[String]) -> Result<Bson> {
             if jsonb {
                 let mut members = Vec::new();
                 for i in (0..args.len()).step_by(2) {
-                    members.push((text_of_key(&args[i])?, to_json_value(&args[i + 1], t(i + 1))));
+                    members.push((
+                        text_of_key(&args[i])?,
+                        to_json_value(&args[i + 1], t(i + 1)),
+                    ));
                 }
                 return Ok(out(Json::Object(members)));
             }
@@ -226,10 +249,17 @@ pub fn call(name: &str, args: &[Bson], types: &[String]) -> Result<Bson> {
         "json_build_array" | "jsonb_build_array" => {
             if jsonb {
                 return Ok(out(Json::Array(
-                    args.iter().enumerate().map(|(i, a)| to_json_value(a, t(i))).collect(),
+                    args.iter()
+                        .enumerate()
+                        .map(|(i, a)| to_json_value(a, t(i)))
+                        .collect(),
                 )));
             }
-            let parts: Vec<String> = args.iter().enumerate().map(|(i, a)| datum_json_text(a, t(i))).collect();
+            let parts: Vec<String> = args
+                .iter()
+                .enumerate()
+                .map(|(i, a)| datum_json_text(a, t(i)))
+                .collect();
             Ok(Bson::String(format!("[{}]", parts.join(", "))))
         }
         "json_object" | "jsonb_object" => {
@@ -237,16 +267,31 @@ pub fn call(name: &str, args: &[Bson], types: &[String]) -> Result<Bson> {
                 match v {
                     Bson::Array(items) => Ok(items
                         .iter()
-                        .map(|x| if *x == Bson::Null { None } else { Some(crate::value_text(x)) })
+                        .map(|x| {
+                            if *x == Bson::Null {
+                                None
+                            } else {
+                                Some(crate::value_text(x))
+                            }
+                        })
                         .collect()),
                     Bson::String(s) => match crate::parse_array(s, "text")? {
                         Bson::Array(items) => Ok(items
                             .iter()
-                            .map(|x| if *x == Bson::Null { None } else { Some(crate::value_text(x)) })
+                            .map(|x| {
+                                if *x == Bson::Null {
+                                    None
+                                } else {
+                                    Some(crate::value_text(x))
+                                }
+                            })
                             .collect()),
                         _ => Ok(Vec::new()),
                     },
-                    _ => Err(Error::Sqlstate("22023", "array must have even number of elements".into())),
+                    _ => Err(Error::Sqlstate(
+                        "22023",
+                        "array must have even number of elements".into(),
+                    )),
                 }
             };
             let pairs: Vec<(String, Option<String>)> = match args {
@@ -256,7 +301,10 @@ pub fn call(name: &str, args: &[Bson], types: &[String]) -> Result<Bson> {
                     }
                     let items = strings(one)?;
                     if items.len() % 2 != 0 {
-                        return Err(Error::Sqlstate("2202E", "array must have even number of elements".into()));
+                        return Err(Error::Sqlstate(
+                            "2202E",
+                            "array must have even number of elements".into(),
+                        ));
                     }
                     let mut out = Vec::new();
                     for c in items.chunks(2) {
@@ -273,7 +321,10 @@ pub fn call(name: &str, args: &[Bson], types: &[String]) -> Result<Bson> {
                     }
                     let (k, v) = (strings(ks)?, strings(vs)?);
                     if k.len() != v.len() {
-                        return Err(Error::Sqlstate("2202E", "mismatched array dimensions".into()));
+                        return Err(Error::Sqlstate(
+                            "2202E",
+                            "mismatched array dimensions".into(),
+                        ));
                     }
                     let mut out = Vec::new();
                     for (k, v) in k.into_iter().zip(v) {
@@ -288,11 +339,19 @@ pub fn call(name: &str, args: &[Bson], types: &[String]) -> Result<Bson> {
             };
             let as_json = |v: &Option<String>| v.clone().map_or(Json::Null, Json::Str);
             if jsonb {
-                return Ok(out(Json::Object(pairs.iter().map(|(k, v)| (k.clone(), as_json(v))).collect())));
+                return Ok(out(Json::Object(
+                    pairs.iter().map(|(k, v)| (k.clone(), as_json(v))).collect(),
+                )));
             }
             let parts: Vec<String> = pairs
                 .iter()
-                .map(|(k, v)| format!("{} : {}", json::render_jsonb(&Json::Str(k.clone())), json::render_jsonb(&as_json(v))))
+                .map(|(k, v)| {
+                    format!(
+                        "{} : {}",
+                        json::render_jsonb(&Json::Str(k.clone())),
+                        json::render_jsonb(&as_json(v))
+                    )
+                })
                 .collect();
             Ok(Bson::String(format!("{{{}}}", parts.join(", "))))
         }

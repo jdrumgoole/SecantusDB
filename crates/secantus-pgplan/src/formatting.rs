@@ -490,7 +490,7 @@ fn process(
     }
     let sign_wrote;
     if num.has(F_PLUS) || num.has(F_MINUS) {
-        sign_wrote = !(num.has(F_PLUS) && !num.has(F_MINUS));
+        sign_wrote = !num.has(F_PLUS) || num.has(F_MINUS);
     } else {
         if sign != '-' && num.has(F_FILLMODE) {
             num.flag &= !F_BRACKET;
@@ -588,10 +588,8 @@ fn process(
                         p.out.push(' ');
                     }
                 }
-                Key::Sg => {
-                    if p.sign != '\0' {
-                        p.out.push(p.sign);
-                    }
+                Key::Sg if p.sign != '\0' => {
+                    p.out.push(p.sign);
                 }
                 _ => {}
             },

@@ -11064,7 +11064,10 @@ impl PgHandler {
                 let (ty, source) = match casts.get(i).and_then(|c| c.as_ref()) {
                     Some(expr) => {
                         let ty = secantus_pgplan::column_expr_type(expr);
-                        (self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty)), None)
+                        (
+                            self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty)),
+                            None,
+                        )
                     }
                     // By STORED FIELD first, then by either name. A primary
                     // key is stored as `_id`, which is not a column name, so
@@ -14651,7 +14654,7 @@ impl PgHandler {
                             .set
                             .keys()
                             .map(String::as_str)
-                            .chain(upd.set_exprs.iter().map(|(f, _, _)| f.as_str()))
+                            .chain(upd.set_exprs.iter().map(|(f, _, _, _)| f.as_str()))
                             .chain(upd.set_subscripts.iter().map(|a| a.field.as_str()))
                             .collect();
                         def.columns

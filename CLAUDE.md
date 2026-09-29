@@ -484,6 +484,23 @@ one request path:
       exists, an open savepoint captures every table, not just the statement's
       target -- otherwise `ROLLBACK TO` left a trigger's writes behind.
 
+    **Full-text search, formatting, datetime, jsonpath and the statistical
+    aggregates landed 2026-09-29** (`fts.rs`, `formatting.rs`, `datetime.rs`,
+    `jsonpath.rs`, `jsonfn.rs`; server `aggregates.rs`). Each was TRANSCRIBED
+    from the PostgreSQL C source rather than written from the docs, and
+    checked by a matrix of `SELECT <expr>` against PostgreSQL 14: numeric
+    `to_char` 471/471, `to_number` 401/401, datetime 1009/1009, jsonpath
+    935/935. Two rules from that work:
+
+    - **PostgreSQL on arm64 contracts floating-point multiply-adds into FMA**,
+      so the last digit of `percentile_cont`, `corr`, `regr_*` and `stddev`
+      over floats only matches with `f64::mul_add` at the same sites. Code
+      that looks algebraically equal still differs in the last digit.
+    - **`char(n)` is stored TRIMMED and padded where it enters an expression**
+      (`ROW_WIDTHS` / `pad_bpchar`), then trimmed again for comparison, `||`
+      and text casts. `octet_length` / `concat` / `format` see the padding;
+      most other functions do not.
+
     **What remains refused**: writing THROUGH a view (and so `INSTEAD OF`
     triggers), an expression / non-btree index, constraint triggers and
     transition tables, `VARIADIC` / `BEGIN ATOMIC` functions, and correlation
