@@ -160,7 +160,12 @@ pub fn get_log(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 
 /// `getParameter` — a minimal set of well-known server parameters.
 pub fn get_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    let params = known_params(ctx.failpoints.is_some());
+    let mut params = known_params(ctx.failpoints.is_some());
+    // A value `setParameter` changed wins over the compiled-in default, so the
+    // two commands cannot disagree about what the server currently holds.
+    if let Some(store) = ctx.server_params.as_ref() {
+        store.overlay(&mut params);
+    }
     let arg = doc.get("getParameter");
     // "*" or the legacy `{getParameter: 1}` with no names ⇒ all params.
     let names: Vec<&String> = doc
@@ -200,7 +205,7 @@ fn feature_compatibility_version() -> String {
     format!("{}.{}", SERVER_VERSION_ARRAY[0], SERVER_VERSION_ARRAY[1])
 }
 
-fn known_params(test_commands: bool) -> Document {
+pub(crate) fn known_params(test_commands: bool) -> Document {
     doc! {
         "featureCompatibilityVersion": { "version": feature_compatibility_version() },
         // The REAL value, not a constant. Drivers gate on this: while it said

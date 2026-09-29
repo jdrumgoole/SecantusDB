@@ -170,6 +170,7 @@ struct Shared {
     /// Server-wide `configureFailPoint` registry, shared across connections.
     /// `None` when `enable_test_commands` is off — its absence is the gate.
     failpoints: Option<Arc<secantus_commands::failpoints::FailPointRegistry>>,
+    server_params: Arc<secantus_commands::params::ServerParams>,
     /// Server-wide per-namespace operation accounting, reported by `top`.
     top_stats: Arc<secantus_commands::topstats::TopStats>,
     address: SocketAddr,
@@ -388,6 +389,7 @@ pub fn bind(
         cursors,
         transactions,
         failpoints,
+        server_params: Arc::new(secantus_commands::params::ServerParams::new()),
         top_stats: Arc::new(secantus_commands::topstats::TopStats::new()),
         address,
         next_conn_id: AtomicI64::new(1),
@@ -913,6 +915,7 @@ fn make_context(
         .with_storage(shared.storage.clone())
         .with_cursors(shared.cursors.clone())
         .with_transactions(shared.transactions.clone())
+        .with_server_params(shared.server_params.clone())
         .with_failpoints_opt(shared.failpoints.clone())
         .with_conn_auth(conn_auth.clone())
         .with_conn_killer(shared.conn_killer.clone())

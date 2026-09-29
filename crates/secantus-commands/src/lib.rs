@@ -47,6 +47,7 @@ pub mod findandmodify;
 pub mod handshake;
 pub mod logbuf;
 pub mod mapreduce;
+pub mod params;
 pub mod rbac;
 pub mod roles;
 pub mod storage;
@@ -140,6 +141,11 @@ pub struct CommandContext {
     /// on plaintext connections or when no client cert was presented; the
     /// `MONGODB-X509` mechanism (R5c) reads it.
     pub peer_cert_dn: Option<String>,
+    /// Server-wide store of runtime-changed server parameters, written by
+    /// `setParameter` and overlaid onto `getParameter`'s defaults. `None` in
+    /// unit-test contexts and before the server wires one in, in which case
+    /// `setParameter` still validates and answers but nothing persists.
+    pub server_params: Option<Arc<params::ServerParams>>,
     /// Server-wide `configureFailPoint` registry. `None` in unit-test contexts;
     /// the server wires one in so `failCommand` short-circuits in dispatch.
     pub failpoints: Option<Arc<failpoints::FailPointRegistry>>,
@@ -200,6 +206,7 @@ impl CommandContext {
             server_address: None,
             replica_set_name: None,
             require_auth: false,
+            server_params: None,
             cluster_time: bson::Timestamp {
                 time: 0,
                 increment: 0,
@@ -286,6 +293,13 @@ impl CommandContext {
     /// commands report `CommandNotFound`.
     ///
     /// [`with_failpoints`]: Self::with_failpoints
+    /// Share the server-wide runtime-parameter store, so a value set on one
+    /// connection is visible to every other one (and to `getParameter`).
+    pub fn with_server_params(mut self, params: Arc<params::ServerParams>) -> Self {
+        self.server_params = Some(params);
+        self
+    }
+
     pub fn with_failpoints_opt(
         mut self,
         failpoints: Option<Arc<failpoints::FailPointRegistry>>,
@@ -507,6 +521,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "revokeRolesFromRole" => roles::revoke_roles_from_role,
         "rolesInfo" => roles::roles_info,
         "getParameter" => diagnostics::get_parameter,
+        "setParameter" => params::set_parameter,
         "getCmdLineOpts" => diagnostics::get_cmd_line_opts,
         "connectionStatus" => diagnostics::connection_status,
         "whatsmyuri" => diagnostics::whatsmyuri,
@@ -1804,6 +1819,7 @@ fn command_action(name: &str) -> Option<(&'static str, &'static str)> {
         "top" => (A_TOP, SCOPE_CLUSTER),
         "getCmdLineOpts" => (A_GET_CMD_LINE_OPTS, SCOPE_CLUSTER),
         "getParameter" => (A_GET_CMD_LINE_OPTS, SCOPE_CLUSTER),
+        "setParameter" => (A_SET_PARAMETER, SCOPE_CLUSTER),
         "getLog" => (A_GET_LOG, SCOPE_CLUSTER),
         // Fault injection is a server-wide DoS lever (e.g. closeConnection on
         // every find); require an explicit cluster-admin grant under --auth.

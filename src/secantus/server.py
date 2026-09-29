@@ -25,6 +25,7 @@ from secantus.cursors import CursorRegistry
 from secantus.failpoints import CloseConnectionRequested, FailPointRegistry
 from secantus.logbuf import LogBuffer
 from secantus.metrics import Metrics
+from secantus.serverparams import ServerParams
 from secantus.sessions import SessionRegistry
 from secantus.storage import Storage
 from secantus.transactions import Transaction, TransactionRegistry
@@ -221,6 +222,9 @@ class SecantusDBServer:
         # commands answer `59 CommandNotFound`, which is what mongod answers
         # when started without `enableTestCommands` (measured 8.2.11).
         self.failpoints = FailPointRegistry() if enable_test_commands else None
+        # Server-wide, so a parameter set on one connection is visible to
+        # every other one (and to ``getParameter``).
+        self.server_params = ServerParams()
         # Multi-document transaction state machine. The WT work is
         # bound here so the registry itself stays storage-agnostic;
         # ``txn.handle`` is None when the transaction never executed a
@@ -753,6 +757,7 @@ class SecantusDBServer:
                             logs=self.logs,
                             sessions=self.sessions,
                             failpoints=self.failpoints,
+                            server_params=self.server_params,
                             transactions=self.transactions,
                             peer_cert_dn=peer_cert_dn,
                         )
@@ -843,6 +848,7 @@ class SecantusDBServer:
                             logs=self.logs,
                             sessions=self.sessions,
                             failpoints=self.failpoints,
+                            server_params=self.server_params,
                             transactions=self.transactions,
                             peer_cert_dn=peer_cert_dn,
                         )

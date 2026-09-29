@@ -4021,3 +4021,172 @@ def test_where_in_aggregate_match_is_a_context_error(
     theirs = answer(mongod_uri)
     assert theirs[0] == 2, f"{label}: reference no longer answers code 2, got {theirs}"
     assert mine == theirs, f"{label}:\n  secantus={mine}\n  mongod  ={theirs}"
+
+
+# ---------------------------------------------------------------------------
+# setParameter
+# ---------------------------------------------------------------------------
+
+# Parameters BOTH servers register. mongod has hundreds more; a name we do not
+# register is answered 72 ("unrecognized"), which is the correct answer for a
+# server with our parameter set rather than a divergence -- so the comparison
+# below is scoped to the shared names, and the deliberate part is pinned
+# separately by `test_unregistered_parameter_is_refused_not_silently_accepted`.
+_SET_PARAM_CASES: list[tuple[str, dict]] = [
+    ("settable int", {"setParameter": 1, "logLevel": 3}),
+    ("settable bool", {"setParameter": 1, "quiet": True}),
+    ("startup-only", {"setParameter": 1, "enableTestCommands": True}),
+    ("unregistered name", {"setParameter": 1, "notARealParameter": 1}),
+    ("no parameter at all", {"setParameter": 1}),
+    ("wrong type", {"setParameter": 1, "logLevel": "nope"}),
+    ("wrong type, array", {"setParameter": 1, "logLevel": [1, 2]}),
+    ("wrong type, document", {"setParameter": 1, "logLevel": {"a": 1}}),
+    ("wrong type, null", {"setParameter": 1, "logLevel": None}),
+    ("negative", {"setParameter": 1, "logLevel": -1}),
+]
+
+# `(value, parameter)` pairs mongod COERCES rather than refusing. Every one of
+# these contradicts the obvious guess, which is why they are a test: an "int"
+# parameter takes doubles and bools, truncates toward zero, and clamps at 5; a
+# "bool" parameter takes every type there is, and an EMPTY STRING is true.
+_COERCION_CASES: list[tuple[str, str, object]] = [
+    ("logLevel", "double truncates toward zero", 1.9),
+    ("logLevel", "small negative truncates to zero", -0.5),
+    ("logLevel", "bool true", True),
+    ("logLevel", "bool false", False),
+    ("logLevel", "above the max is clamped", 99),
+    ("quiet", "int", 1),
+    ("quiet", "zero int", 0),
+    ("quiet", "zero float", 0.0),
+    ("quiet", "string", "yes"),
+    ("quiet", "empty string", ""),
+    ("quiet", "null", None),
+    ("quiet", "array", [1, 2]),
+    ("quiet", "document", {"a": 1}),
+]
+
+
+def _set_param_answer(uri: str, command: dict) -> tuple[object, object, object]:
+    """``(code, codeName, errmsg)`` for a refusal, or ``("ok", None, was)``.
+
+    A successful call is issued TWICE and the second reply compared, so ``was``
+    reports the value this function just set rather than the server's STARTUP
+    default. That matters: the gate spawns mongod with ``--quiet``, which makes
+    its ``quiet`` parameter default to ``True`` where ours is ``False`` — a
+    command-line difference between the two servers, not a ``setParameter``
+    divergence, and comparing the raw first ``was`` reported it as one.
+    """
+    from pymongo import MongoClient
+
+    client = MongoClient(uri, serverSelectionTimeoutMS=10000)
+    try:
+        try:
+            client.admin.command(command)
+            reply = client.admin.command(command)
+        except Exception as exc:  # noqa: BLE001 - comparing the error IS the test
+            d = getattr(exc, "details", {}) or {}
+            return (d.get("code"), d.get("codeName"), d.get("errmsg"))
+        return ("ok", None, reply.get("was"))
+    finally:
+        client.close()
+
+
+@requires_mongod
+@pytest.mark.parametrize(("label", "command"), _SET_PARAM_CASES)
+def test_set_parameter_matches_mongod(
+    label: str, command: dict, secantus_uri: str, mongod_uri: str
+) -> None:
+    """Every ``setParameter`` outcome for a parameter both servers register.
+
+    The five refusals are distinct codes and mongod picks between them on a
+    rule that is easy to get wrong: a parameter that EXISTS but cannot be
+    changed at runtime is 20 ``IllegalOperation``, not the 72 a name it does
+    not know gets -- and answering 72 there would claim the parameter does not
+    exist, which ``getParameter`` reporting it immediately contradicts.
+    """
+    mine = _set_param_answer(secantus_uri, command)
+    theirs = _set_param_answer(mongod_uri, command)
+    assert mine == theirs, f"{label}:\n  secantus={mine}\n  mongod  ={theirs}"
+
+
+@requires_mongod
+@pytest.mark.parametrize(("param", "label", "value"), _COERCION_CASES)
+def test_set_parameter_coercion_matches_mongod(
+    param: str, label: str, value: object, secantus_uri: str, mongod_uri: str
+) -> None:
+    """The value mongod STORES, not merely whether it accepted the call.
+
+    Comparing acceptance alone would pass while the two servers stored
+    different values -- the same blind spot that let a wrong ``codeName`` ship
+    under a correct code. So this sets, then reads back through
+    ``getParameter``.
+    """
+    from pymongo import MongoClient
+
+    def stored(uri: str) -> object:
+        client = MongoClient(uri, serverSelectionTimeoutMS=10000)
+        try:
+            client.admin.command({"setParameter": 1, param: value})
+            return client.admin.command({"getParameter": 1, param: 1}).get(param)
+        finally:
+            client.close()
+
+    mine = stored(secantus_uri)
+    theirs = stored(mongod_uri)
+    assert mine == theirs, f"{param} / {label}: secantus={mine!r} mongod={theirs!r}"
+
+
+@requires_mongod
+def test_set_parameter_ignores_the_session_envelope(secantus_uri: str, mongod_uri: str) -> None:
+    """A driver's ``lsid`` must not be mistaken for a parameter name.
+
+    pymongo attaches one to every command, so a handler that filters only
+    ``$``-prefixed keys rejects EVERY real driver call with "unrecognized
+    parameter [lsid]" while a unit test built from a bare document passes.
+    That is exactly what happened here on 2026-09-29; this pins it against a
+    real client rather than a hand-built document.
+    """
+    from pymongo import MongoClient
+
+    def answer(uri: str) -> object:
+        client = MongoClient(uri, serverSelectionTimeoutMS=10000)
+        try:
+            # A session makes pymongo attach `lsid`.
+            with client.start_session() as session:
+                reply = client.admin.command({"setParameter": 1, "logLevel": 2}, session=session)
+            return reply.get("ok")
+        finally:
+            client.close()
+
+    assert answer(secantus_uri) == answer(mongod_uri) == 1.0
+
+
+@requires_mongod
+def test_unregistered_parameter_is_refused_not_silently_accepted(
+    secantus_uri: str,
+) -> None:
+    """A parameter we do not implement is refused, and DELIBERATELY so.
+
+    mongod has these (they tune its ingress connection rate limiter) and
+    SecantusDB has no equivalent. Accepting the name would let a client ask
+    for rate limiting and silently get none -- the half-implemented feature
+    this project prefers an honest refusal to. No mongod comparison, because
+    the whole point is that we answer differently from a server that HAS the
+    parameter; what is pinned is that we never quietly accept it.
+    """
+    from pymongo import MongoClient
+    from pymongo.errors import OperationFailure
+
+    client = MongoClient(secantus_uri, serverSelectionTimeoutMS=10000)
+    try:
+        for name in (
+            "ingressConnectionEstablishmentRateLimiterEnabled",
+            "ingressConnectionEstablishmentRatePerSec",
+            "maxTransactionLockRequestTimeoutMillis",
+        ):
+            with pytest.raises(OperationFailure) as caught:
+                client.admin.command({"setParameter": 1, name: 1})
+            assert caught.value.details["code"] == 72, name
+            assert f"unrecognized parameter [{name}]" in caught.value.details["errmsg"]
+    finally:
+        client.close()

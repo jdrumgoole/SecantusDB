@@ -2491,3 +2491,79 @@ def test_where_in_aggregate_match_is_a_context_error(tmp_path, label, match) -> 
         ), f"{label}: {details}"
     finally:
         srv.stop()
+
+
+# setParameter values, measured off mongod 8.2.11 (2026-09-29) and pinned
+# against a live one by tests/test_mongod_differential.py. Repeated here
+# because that gate drives the PYTHON server, so nothing there would notice the
+# Rust server drifting.
+def test_set_parameter_against_rust_server(tmp_path) -> None:
+    """Set, read back, and check the refusals — all on the Rust server."""
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        admin = _client(srv)["admin"]
+
+        # A settable parameter reports the PREVIOUS value and then sticks.
+        assert admin.command({"setParameter": 1, "logLevel": 3})["was"] == 0
+        assert admin.command({"setParameter": 1, "logLevel": 4})["was"] == 3
+        assert admin.command({"getParameter": 1, "logLevel": 1})["logLevel"] == 4
+
+        # Coercion, not refusal: a double truncates, a bool converts, and the
+        # top end clamps at 5 rather than erroring.
+        for value, stored in ((1.9, 1), (True, 1), (False, 0), (99, 5), (-0.5, 0)):
+            admin.command({"setParameter": 1, "logLevel": value})
+            assert admin.command({"getParameter": 1, "logLevel": 1})["logLevel"] == stored, value
+
+        # A bool parameter takes every type; an EMPTY STRING is true and null
+        # is false.
+        for value, stored in ((0, False), ("", True), (None, False), ([1], True)):
+            admin.command({"setParameter": 1, "quiet": value})
+            assert admin.command({"getParameter": 1, "quiet": 1})["quiet"] is stored, value
+
+        for command, code in (
+            ({"setParameter": 1, "notARealParameter": 1}, 72),
+            ({"setParameter": 1}, 72),
+            ({"setParameter": 1, "enableTestCommands": True}, 20),
+            ({"setParameter": 1, "logLevel": "nope"}, 2),
+            ({"setParameter": 1, "logLevel": -1}, 2),
+        ):
+            with pytest.raises(pymongo.errors.OperationFailure) as caught:
+                admin.command(command)
+            assert caught.value.details["code"] == code, command
+    finally:
+        srv.stop()
+
+
+def test_set_parameter_is_shared_across_connections(tmp_path) -> None:
+    """A parameter set on one connection is visible on another.
+
+    The store is server-wide, not per-connection: a client that sets a value
+    and then reconnects (as a driver does after any pool churn) must see it.
+    A per-context store would pass every single-connection test and fail here.
+    """
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        first = _client(srv)
+        first["admin"].command({"setParameter": 1, "logLevel": 5})
+        second = _client(srv)
+        try:
+            assert second["admin"].command({"getParameter": 1, "logLevel": 1})["logLevel"] == 5
+        finally:
+            second.close()
+            first.close()
+    finally:
+        srv.stop()
+
+
+def test_set_parameter_only_on_admin_against_rust_server(tmp_path) -> None:
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        with pytest.raises(pymongo.errors.OperationFailure) as caught:
+            _client(srv)["t"].command({"setParameter": 1, "logLevel": 0})
+        assert caught.value.details["code"] == 13
+        assert (
+            caught.value.details["errmsg"]
+            == "setParameter may only be run against the admin database."
+        )
+    finally:
+        srv.stop()
