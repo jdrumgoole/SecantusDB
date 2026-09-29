@@ -17,6 +17,7 @@ pub mod acl;
 pub mod arrays;
 pub mod bytea;
 pub mod correlated;
+pub mod datetime;
 pub mod escape_strings;
 pub mod formatting;
 pub mod fts;
@@ -7039,7 +7040,12 @@ fn plan_table_targets(
                 if func_name(f).as_deref().is_some_and(|n| {
                     (scalar::is_scalar(n) && scalar::has_static_result_type(n))
                         || n == "regexp_replace"
-                }) && single_column_call(f, params).is_some() =>
+                }) && single_column_call(f, params).is_some()
+                    && !(func_name(f).as_deref() == Some("to_char")
+                        && single_column_call(f, params).is_some_and(|(c, _)| {
+                            def.column(&c)
+                                .is_some_and(|col| datetime::is_datetime(&col.pg_type))
+                        })) =>
             {
                 let name = func_name(f).expect("checked");
                 let (column, args) = single_column_call(f, params).expect("checked");
@@ -10778,6 +10784,15 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
                 .find(|t| t.ends_with("[]"))
                 .unwrap_or_else(|| inferred_type(value).to_string())
         }
+        // The datetime functions, typed from their arguments' types.
+        Some(N::FuncCall(f))
+            if func_name(f)
+                .as_deref()
+                .is_some_and(|n| datetime_result_type(f, n).is_some()) =>
+        {
+            datetime_result_type(f, &func_name(f).unwrap_or_default())
+                .unwrap_or_else(|| "text".into())
+        }
         // The full-text functions each have one result type.
         Some(N::FuncCall(f)) if func_name(f).as_deref().and_then(fts::result_type).is_some() => {
             func_name(f)
@@ -10975,6 +10990,14 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
                     // every value is NULL -- which is when psycopg picks its
                     // result loader. Without this a `timestamp + interval` was
                     // described as `int4`/`text` and the client decoded it wrong.
+                    // Unary minus keeps an interval an interval.
+                    if e.lexpr.is_none() && matches!(op, "-" | "+") {
+                        if let Some(r) = e.rexpr.as_deref() {
+                            if static_type(r, &Bson::Null) == "interval" {
+                                return "interval".to_string();
+                            }
+                        }
+                    }
                     if let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
                         let lt = static_type(l, &Bson::Null);
                         let rt = static_type(r, &Bson::Null);
@@ -11628,7 +11651,26 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 // they stand alone, and folding them here would freeze a
                 // `current_setting` the session may still change.
                 let name = overload_name(f, name);
-                if scalar::is_scalar(&name) && !scalar::defers_to_connection(&name) {
+                let datetime_typed = datetime_result_type(f, &name);
+                if let Some(t) = datetime_typed.clone() {
+                    if let Some(value) = datetime_call(f, &name, params) {
+                        columns.push((
+                            if rt.name.is_empty() {
+                                name.clone()
+                            } else {
+                                rt.name.clone()
+                            },
+                            ConstCol::Value(value?),
+                            t,
+                            -1,
+                        ));
+                        continue;
+                    }
+                }
+                if scalar::is_scalar(&name)
+                    && !scalar::defers_to_connection(&name)
+                    && datetime_typed.is_none()
+                {
                     let args = f
                         .args
                         .iter()
@@ -14265,8 +14307,11 @@ fn split_trailing_offset(text: &str) -> (String, Option<i32>) {
             continue;
         }
         let head = &t[..i];
-        // A date's `-` never follows a `:` or a space-separated time.
-        if !head.contains(':') {
+        // A date's `-` never follows a `:` or a space-separated time. With no
+        // time at all, a `+` still starts an offset (a date has none), and so
+        // does a `-` set off by a space: `'2001-01-01 +05'` is midnight at
+        // UTC+5, which ignoring the offset silently moved by five hours.
+        if !head.contains(':') && c != '+' && !head.ends_with(char::is_whitespace) {
             continue;
         }
         // An offset can carry SECONDS -- `+01:02:03` is a real PostgreSQL
@@ -15831,7 +15876,31 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
         // `date` and `time` are stored as their canonical TEXT, matching what
         // the Python server writes -- the two servers share one store, so the
         // representation is a contract, not an implementation choice.
-        "date" => Ok(Bson::String(parse_date(&as_text(&value))?)),
+        // A timestamp value (an instant, or its text) keeps its date part.
+        "date"
+            if matches!(value, Bson::DateTime(_))
+                || matches!(&value, Bson::Document(d) if d.contains_key(COMPOSITE_DATE)) =>
+        {
+            let micros = instant_micros(&value).ok_or_else(|| {
+                Error::InvalidDatetimeFormat("invalid input syntax for type date".into())
+            })?;
+            Ok(Bson::String(render_date_pg(
+                chrono::DateTime::from_timestamp_micros(micros)
+                    .map(|d| d.date_naive())
+                    .unwrap_or_default(),
+            )))
+        }
+        "date" => match parse_date(&as_text(&value)) {
+            Ok(d) => Ok(Bson::String(d)),
+            Err(e) => match parse_timestamp(&as_text(&value)) {
+                Ok(micros) => Ok(Bson::String(render_date_pg(
+                    chrono::DateTime::from_timestamp_micros(micros)
+                        .map(|d| d.date_naive())
+                        .unwrap_or_default(),
+                ))),
+                Err(_) => Err(e),
+            },
+        },
         // `timestamptz` and `timetz` are stored as their canonical TEXT, the
         // same choice `date` and `time` already make here. A `timestamptz`
         // renders in the SESSION zone, so the text is only canonical for the
@@ -15878,7 +15947,15 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
             if let Some(text) = special_timestamp_text(&as_text(&value)) {
                 return Ok(Bson::String(text));
             }
-            let micros = parse_timestamp(&as_text(&value))?;
+            // `timestamp` accepts a zone and ignores it: `'2001-01-01+00'`.
+            let text = as_text(&value);
+            let micros = match parse_timestamp(&text) {
+                Ok(m) => m,
+                Err(e) => match split_trailing_offset(&text) {
+                    (body, Some(_)) => parse_timestamp(&body).map_err(|_| e)?,
+                    _ => return Err(e),
+                },
+            };
             let (ms, rem) = split_subms(micros);
             let date = Bson::DateTime(bson::DateTime::from_millis(ms));
             Ok(if rem == 0 {
@@ -15887,7 +15964,27 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
                 Bson::Document(doc! { COMPOSITE_DATE: date, COMPOSITE_US: rem })
             })
         }
-        "time" => Ok(Bson::String(parse_time(&as_text(&value))?)),
+        // A timestamp value (an instant, or its text) keeps its time of day.
+        "time"
+            if matches!(value, Bson::DateTime(_))
+                || matches!(&value, Bson::Document(d) if d.contains_key(COMPOSITE_DATE)) =>
+        {
+            let micros = instant_micros(&value).ok_or_else(|| {
+                Error::InvalidDatetimeFormat("invalid input syntax for type time".into())
+            })?;
+            let day = micros.rem_euclid(86_400_000_000);
+            parse_time(&render_timestamp(day)[11..]).map(Bson::String)
+        }
+        "time" => match parse_time(&as_text(&value)) {
+            Ok(t) => Ok(Bson::String(t)),
+            Err(e) => match parse_timestamp(&as_text(&value)) {
+                Ok(micros) => {
+                    parse_time(&render_timestamp(micros.rem_euclid(86_400_000_000))[11..])
+                        .map(Bson::String)
+                }
+                Err(_) => Err(e),
+            },
+        },
         "inet" => Ok(Bson::String(net::normalize_inet(&as_text(&value))?)),
         "cidr" => Ok(Bson::String(net::normalize_cidr(&as_text(&value))?)),
         "aclitem" => Ok(Bson::String(acl::parse(&as_text(&value))?)),
@@ -16512,6 +16609,66 @@ fn static_hstore_operand(n: Option<&pg_query::protobuf::Node>, value: &Bson) -> 
     static_type(n, value) == "hstore" && extension_type("hstore") == Some(ExtensionType::Hstore)
 }
 
+/// A datetime function's result type from its call, or `None`.
+fn datetime_result_type(f: &pg_query::protobuf::FuncCall, name: &str) -> Option<String> {
+    let types: Vec<String> = f.args.iter().map(|a| static_type(a, &Bson::Null)).collect();
+    datetime::result_type(name, &types)
+}
+
+/// Evaluate a datetime function, typed by its arguments' static types.
+fn datetime_call(
+    f: &pg_query::protobuf::FuncCall,
+    name: &str,
+    params: &[Bson],
+) -> Option<Result<Bson>> {
+    datetime_result_type(f, name)?;
+    // `make_interval(days => 10)`: named arguments, the rest defaulted.
+    if name == "make_interval"
+        && f.args
+            .iter()
+            .any(|a| matches!(a.node.as_ref(), Some(N::NamedArgExpr(_))))
+    {
+        const NAMES: [&str; 7] = ["years", "months", "weeks", "days", "hours", "mins", "secs"];
+        let mut args = vec![Bson::Int32(0); 7];
+        for (i, a) in f.args.iter().enumerate() {
+            let (slot, node) = match a.node.as_ref() {
+                Some(N::NamedArgExpr(na)) => match NAMES.iter().position(|n| *n == na.name) {
+                    Some(p) => (p, na.arg.as_deref()),
+                    None => {
+                        return Some(Err(Error::UndefinedFunction(format!(
+                            "function make_interval({} => unknown) does not exist",
+                            na.name
+                        ))))
+                    }
+                },
+                _ => (i, Some(a)),
+            };
+            let Some(node) = node else { continue };
+            match const_value(node, params) {
+                Ok(v) => args[slot] = v,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        return datetime::make(name, &args);
+    }
+    let args = match f
+        .args
+        .iter()
+        .map(|a| const_value(a, params))
+        .collect::<Result<Vec<_>>>()
+    {
+        Ok(a) => a,
+        Err(e) => return Some(Err(e)),
+    };
+    let types: Vec<String> = f
+        .args
+        .iter()
+        .zip(&args)
+        .map(|(a, v)| static_type(a, v))
+        .collect();
+    datetime::call(name, &args, &types)
+}
+
 /// The built-in a call resolves to when its argument TYPES pick an
 /// overload the name alone does not: `length(tsvector)`.
 fn overload_name(f: &pg_query::protobuf::FuncCall, name: String) -> String {
@@ -16822,6 +16979,22 @@ fn array_concat(lhs: Bson, rhs: Bson) -> Result<Bson> {
     }
 }
 
+/// Is `v` a `time` value's text (`HH:MM[:SS[.ffffff]]`)?
+fn is_time_text(v: &Bson) -> bool {
+    let Bson::String(s) = v else { return false };
+    let parts: Vec<&str> = s.trim().split(':').collect();
+    (2..=3).contains(&parts.len())
+        && parts[..2]
+            .iter()
+            .all(|p| (1..=2).contains(&p.len()) && p.chars().all(|c| c.is_ascii_digit()))
+        && parts.get(2).is_none_or(|p| {
+            let (w, f) = p.split_once('.').unwrap_or((p, "0"));
+            w.len() == 2
+                && w.chars().all(|c| c.is_ascii_digit())
+                && f.chars().all(|c| c.is_ascii_digit())
+        })
+}
+
 fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
     // Array concatenation is `array_cat`, which is NOT strict: a NULL beside
     // an array is the array. So it goes before the NULL propagation below.
@@ -16866,6 +17039,12 @@ fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
                     micros: a.micros + sign * b.micros,
                 }
                 .to_bson());
+            }
+            (None, Some(iv)) if is_time_text(&lhs) => {
+                return datetime::time_plus(&lhs, &iv, sign);
+            }
+            (Some(iv), None) if op == "+" && is_time_text(&rhs) => {
+                return datetime::time_plus(&rhs, &iv, 1);
             }
             (None, Some(iv)) => {
                 // <instant or date or timestamp text> +/- interval.
@@ -16913,6 +17092,20 @@ fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
             if let (Some(a), Some(b)) = (as_ymd(&lhs), as_ymd(&rhs)) {
                 let days = a.signed_duration_since(b).num_days();
                 return Ok(Bson::Int32(days as i32));
+            }
+            // timestamp - timestamp: two stored instants (never texts,
+            // which a date or a time also is).
+            let stored = |v: &Bson| {
+                matches!(v, Bson::DateTime(_))
+                    || matches!(v, Bson::Document(d) if d.contains_key(COMPOSITE_DATE))
+            };
+            if stored(&lhs) && stored(&rhs) {
+                if let (Some(a), Some(b)) = (instant_micros(&lhs), instant_micros(&rhs)) {
+                    return Ok(datetime::timestamp_diff(a, b));
+                }
+            }
+            if is_time_text(&lhs) && is_time_text(&rhs) {
+                return datetime::time_diff(&lhs, &rhs);
             }
         }
     }
@@ -18378,6 +18571,9 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 return result.map(|(value, _)| value);
             }
             let name = overload_name(f, name);
+            if let Some(out) = datetime_call(f, &name, params) {
+                return out;
+            }
             if scalar::is_scalar(&name) {
                 let args = f
                     .args
@@ -18694,6 +18890,15 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 // arithmetic has no special values.
                 "-" if is_numeric(&rhs) => {
                     return negate_numeric_text(&numeric_text(&rhs).unwrap_or_default());
+                }
+                "-" if Interval::from_bson(&rhs).is_some() => {
+                    let iv = Interval::from_bson(&rhs).expect("checked");
+                    return Ok(Interval {
+                        months: -iv.months,
+                        days: -iv.days,
+                        micros: -iv.micros,
+                    }
+                    .to_bson());
                 }
                 "-" => Bson::Int32(0),
                 "+" => return Ok(rhs),
