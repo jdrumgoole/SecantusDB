@@ -88,6 +88,8 @@ fn extension_scalar(name: &str) -> Option<crate::ExtensionType> {
 const SCALAR_NAMES: &[&str] = &[
     "to_char",
     "to_number",
+    "similar_to_escape",
+    "similar_escape",
     "jsonb_path_exists",
     "jsonb_path_match",
     "jsonb_path_query_first",
@@ -417,6 +419,10 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp" => {
             need(0)?;
             Ok(now_value())
+        }
+        "similar_to_escape" | "similar_escape" => {
+            let esc = if args.len() > 1 { Some(s(1)) } else { None };
+            similar_escape(&s(0), esc.as_deref()).map(Bson::String)
         }
         "to_char" => {
             need(2)?;
@@ -1603,4 +1609,83 @@ fn random_u64() -> u64 {
             .unwrap_or(0),
     );
     h.finish()
+}
+
+/// `similar_escape_internal`: a SQL `SIMILAR TO` pattern as an anchored
+/// POSIX regex. `%` is `.*`, `_` is `.`, `(` is non-capturing, the regex
+/// metacharacters `\ . ^ $` are escaped, a bracket expression passes through,
+/// and escape-double-quotes split the pattern into its three SUBSTRING parts.
+fn similar_escape(pattern: &str, escape: Option<&str>) -> Result<String> {
+    let esc: Option<char> = match escape {
+        None => Some('\\'),
+        Some(e) if e.is_empty() => None,
+        Some(e) => {
+            if e.chars().count() > 1 {
+                return Err(Error::Sqlstate("22025", "invalid escape string".into()));
+            }
+            e.chars().next()
+        }
+    };
+    let mut r = String::from("^(?:");
+    let mut after = false;
+    let mut nquotes = 0;
+    let mut depth = 0;
+    let mut pos = 0;
+    for c in pattern.chars() {
+        if after {
+            if c == '"' && depth < 1 {
+                match nquotes {
+                    0 => r.push_str("){1,1}?("),
+                    1 => r.push_str("){1,1}(?:"),
+                    _ => {
+                        return Err(Error::Sqlstate(
+                            "2200C",
+                            "SQL regular expression may not contain more than two escape-double-quote separators"
+                                .into(),
+                        ))
+                    }
+                }
+                nquotes += 1;
+            } else {
+                r.push('\\');
+                r.push(c);
+                pos = 3;
+            }
+            after = false;
+        } else if Some(c) == esc {
+            after = true;
+        } else if depth > 0 {
+            if c == '\\' {
+                r.push('\\');
+            }
+            r.push(c);
+            if c == ']' && pos > 2 {
+                depth -= 1;
+            } else if c == '[' {
+                depth += 1;
+                pos = 3;
+            } else if c == '^' {
+                pos += 1;
+            } else {
+                pos = 3;
+            }
+        } else if c == '[' {
+            r.push(c);
+            depth = 1;
+            pos = 1;
+        } else if c == '%' {
+            r.push_str(".*");
+        } else if c == '_' {
+            r.push('.');
+        } else if c == '(' {
+            r.push_str("(?:");
+        } else if matches!(c, '\\' | '.' | '^' | '$') {
+            r.push('\\');
+            r.push(c);
+        } else {
+            r.push(c);
+        }
+    }
+    r.push_str(")$");
+    Ok(r)
 }

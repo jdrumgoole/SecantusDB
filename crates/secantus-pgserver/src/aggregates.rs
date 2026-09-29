@@ -494,79 +494,12 @@ fn regr_final(f: AggFunc, a: &Regr) -> Bson {
     float_bson(v)
 }
 
-// ------------------------------------------------------------------------
-// SQL values as JSON (`to_json` / `datum_to_json`)
-// ------------------------------------------------------------------------
-
 /// A SQL value of type `ty` as a JSON value.
 pub(crate) fn to_json(v: &Bson, ty: &str) -> Json {
-    if *v == Bson::Null {
-        return Json::Null;
-    }
-    let ty = ty.trim();
-    if let Some(elem) = ty.strip_suffix("[]") {
-        if let Bson::Array(items) = v {
-            return Json::Array(items.iter().map(|x| to_json(x, elem)).collect());
-        }
-    }
-    match ty {
-        "json" | "jsonb" => {
-            let t = secantus_pgplan::value_text(v);
-            secantus_pgplan::json::parse(&t).unwrap_or(Json::Str(t))
-        }
-        "bool" | "boolean" => match v {
-            Bson::Boolean(b) => Json::Bool(*b),
-            other => Json::Str(secantus_pgplan::value_text(other)),
-        },
-        "int2" | "int4" | "int8" | "smallint" | "integer" | "bigint" | "numeric" | "decimal" => {
-            Json::Number(match v {
-                Bson::Int32(i) => i.to_string(),
-                Bson::Int64(i) => i.to_string(),
-                other => secantus_pgplan::numeric::numeric_text(other)
-                    .unwrap_or_else(|| secantus_pgplan::value_text(other)),
-            })
-        }
-        "float4" | "float8" | "real" | "double precision" => match as_f64(v) {
-            Some(f) if f.is_finite() => Json::Number(secantus_pgplan::geo::float8_text(f)),
-            Some(f) => Json::Str(secantus_pgplan::geo::float8_text(f)),
-            None => Json::Null,
-        },
-        "timestamp"
-        | "timestamp without time zone"
-        | "timestamptz"
-        | "timestamp with time zone" => match secantus_pgplan::instant_micros_pub(v) {
-            Some(m) => {
-                let text = secantus_pgplan::render_timestamp(m).replacen(' ', "T", 1);
-                if ty.contains("tz") || ty.contains("with time zone") {
-                    Json::Str(format!("{text}+00:00"))
-                } else {
-                    Json::Str(text)
-                }
-            }
-            None => Json::Str(secantus_pgplan::value_text(v)),
-        },
-        _ => match v {
-            Bson::Int32(i) => Json::Number(i.to_string()),
-            Bson::Int64(i) => Json::Number(i.to_string()),
-            Bson::Double(d) if d.is_finite() => Json::Number(secantus_pgplan::geo::float8_text(*d)),
-            Bson::Boolean(b) => Json::Bool(*b),
-            Bson::Array(items) => Json::Array(items.iter().map(|x| to_json(x, "text")).collect()),
-            other => Json::Str(
-                secantus_pgplan::interval_value_text(other)
-                    .unwrap_or_else(|| secantus_pgplan::value_text(other)),
-            ),
-        },
-    }
+    secantus_pgplan::jsonfn::to_json_value(v, ty)
 }
 
-/// A value's text inside a `json` aggregate: a json value verbatim,
-/// anything else as `to_json` renders it.
+/// A value's text inside a `json` aggregate.
 fn json_text(v: &Bson, ty: &str) -> String {
-    if *v == Bson::Null {
-        return "null".into();
-    }
-    if ty == "json" {
-        return secantus_pgplan::value_text(v);
-    }
-    secantus_pgplan::json::render_jsonb(&to_json(v, ty))
+    secantus_pgplan::jsonfn::datum_json_text(v, ty)
 }

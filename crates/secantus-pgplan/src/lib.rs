@@ -30,6 +30,7 @@ pub use correlated::{
     with_correlated_runner, with_function_hook, with_sequence_hook, FnResult, UserFn,
 };
 pub mod json;
+pub mod jsonfn;
 pub mod jsonpath;
 pub mod net;
 pub mod numeric;
@@ -1256,6 +1257,8 @@ pub struct GroupKey {
     pub expr: Option<ColumnExpr>,
     /// The key's declared PostgreSQL type, for the row description.
     pub pg_type: String,
+    /// A bare column key's modifier (`char(n)` pads on output); -1 otherwise.
+    pub typmod: i32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1608,6 +1611,9 @@ pub enum ColumnExpr {
         fields: Vec<RowField>,
         params: Vec<Bson>,
         result_type: String,
+        /// Each field's `char(n)` width, when it has one: the value is
+        /// padded to it before evaluation.
+        widths: Vec<Option<usize>>,
     },
 }
 
@@ -4510,7 +4516,10 @@ fn columns_referenced(node: &pg_query::protobuf::Node, def: &TableDef) -> Vec<St
     let all: Vec<RowField> = def
         .columns
         .iter()
-        .map(|c| (c.name.clone(), c.field(), c.pg_type.clone()))
+        .map(|c| {
+            note_bpchar_width(c);
+            (c.name.clone(), c.field(), c.pg_type.clone())
+        })
         .collect();
     def.columns
         .iter()
@@ -4652,7 +4661,10 @@ pub fn plan_check_expression(expression: &str, def: &TableDef) -> Result<ColumnE
     let fields: Vec<RowField> = def
         .columns
         .iter()
-        .map(|c| (c.name.clone(), c.field(), c.pg_type.clone()))
+        .map(|c| {
+            note_bpchar_width(c);
+            (c.name.clone(), c.field(), c.pg_type.clone())
+        })
         .collect();
     let mut sample = Document::new();
     for c in &def.columns {
@@ -4725,7 +4737,10 @@ fn on_conflict_fields(def: &TableDef) -> Vec<RowField> {
     let mut fields: Vec<RowField> = def
         .columns
         .iter()
-        .map(|c| (c.name.clone(), c.field(), c.pg_type.clone()))
+        .map(|c| {
+            note_bpchar_width(c);
+            (c.name.clone(), c.field(), c.pg_type.clone())
+        })
         .collect();
     for c in &def.columns {
         fields.push((
@@ -5086,7 +5101,7 @@ pub fn insert_row(
         // `INSERT INTO t(d) VALUES ('2026-9-1')` STORES `2026-09-01`.
         // Without this the literal went in verbatim and a client reading
         // the column back could not parse it as a date.
-        let value = cast_value(value, &column.pg_type)?;
+        let value = fit_to_column(cast_value(value, &column.pg_type)?, column)?;
         // Resolves the hidden companion (setting or CLEARING it), so a
         // whole-millisecond write cannot inherit stale microseconds.
         let field = column.field();
@@ -5425,7 +5440,10 @@ fn window_sort_key(
     let fields: Vec<RowField> = def
         .columns
         .iter()
-        .map(|c| (c.name.clone(), c.field(), c.pg_type.clone()))
+        .map(|c| {
+            note_bpchar_width(c);
+            (c.name.clone(), c.field(), c.pg_type.clone())
+        })
         .collect();
     let mut sample = Document::new();
     for c in &def.columns {
@@ -5641,7 +5659,10 @@ fn plan_window_call(
             let fields: Vec<RowField> = def
                 .columns
                 .iter()
-                .map(|c| (c.name.clone(), c.field(), c.pg_type.clone()))
+                .map(|c| {
+            note_bpchar_width(c);
+            (c.name.clone(), c.field(), c.pg_type.clone())
+        })
                 .collect();
             let mut sample = Document::new();
             for c in &def.columns {
@@ -5750,7 +5771,10 @@ fn plan_window_args(
     let fields: Vec<RowField> = def
         .columns
         .iter()
-        .map(|c| (c.name.clone(), c.field(), c.pg_type.clone()))
+        .map(|c| {
+            note_bpchar_width(c);
+            (c.name.clone(), c.field(), c.pg_type.clone())
+        })
         .collect();
     let mut sample = Document::new();
     for c in &def.columns {
@@ -6756,6 +6780,74 @@ fn cast_source_names_column(node: &pg_query::protobuf::Node) -> bool {
 /// table's PK column is stored as `_id`.
 pub type RowField = (String, String, String);
 
+thread_local! {
+    /// The declared width of each `char(n)` column a row field was built
+    /// from, by stored field: a `char(n)` value is BLANK-PADDED when it takes
+    /// part in an expression (PostgreSQL stores it padded; this server stores
+    /// it trimmed and pads on the way out and on the way in here).
+    static ROW_WIDTHS: std::cell::RefCell<std::collections::HashMap<String, usize>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Record (or forget) a column's `char(n)` width as its row field is built.
+fn note_bpchar_width(c: &Column) {
+    ROW_WIDTHS.with(|w| {
+        let mut w = w.borrow_mut();
+        if c.pg_type == "bpchar" && c.typmod > 4 {
+            w.insert(c.field(), (c.typmod - 4) as usize);
+        } else {
+            w.remove(&c.field());
+        }
+    });
+}
+
+/// Pad a `char(n)` value to its width.
+fn pad_bpchar(v: Bson, width: Option<usize>) -> Bson {
+    match (v, width) {
+        (Bson::String(t), Some(n)) if t.chars().count() < n => {
+            let len = t.chars().count();
+            Bson::String(format!("{t}{}", " ".repeat(n - len)))
+        }
+        (v, _) => v,
+    }
+}
+
+/// An assigned value fitted to its column's declared length: a
+/// `char(n)` / `varchar(n)` value too long is 22001, unless everything past
+/// the length is blanks, which are silently dropped (PostgreSQL's
+/// assignment rule -- an explicit CAST truncates instead).
+pub(crate) fn fit_to_column(v: Bson, column: &Column) -> Result<Bson> {
+    if column.typmod <= 4 || !matches!(column.pg_type.as_str(), "bpchar" | "varchar") {
+        return Ok(v);
+    }
+    let Bson::String(text) = &v else { return Ok(v) };
+    let n = (column.typmod - 4) as usize;
+    if text.chars().count() <= n {
+        return Ok(v);
+    }
+    let (head, tail): (String, String) = (text.chars().take(n).collect(), text.chars().skip(n).collect());
+    if tail.chars().all(|c| c == ' ') {
+        let head = if column.pg_type == "bpchar" { head.trim_end_matches(' ').to_string() } else { head };
+        return Ok(Bson::String(head));
+    }
+    Err(Error::Sqlstate(
+        "22001",
+        format!(
+            "value too long for type {}({n})",
+            if column.pg_type == "bpchar" { "character" } else { "character varying" }
+        ),
+    ))
+}
+
+/// A `char(n)` value as `text`: its trailing blanks stripped, which is the
+/// bpchar-to-text cast every text operation applies first.
+pub(crate) fn trim_bpchar(v: Bson) -> Bson {
+    match v {
+        Bson::String(t) => Bson::String(t.trim_end_matches(' ').to_string()),
+        other => other,
+    }
+}
+
 /// Build a `ColumnExpr::Row` for an expression over the row's `fields`,
 /// given the statement's own `params`.
 ///
@@ -6771,11 +6863,19 @@ fn row_column_expr(
 ) -> Result<ColumnExpr> {
     let mut expr = node.clone();
     rewrite_column_refs(&mut expr, fields, params.len())?;
+    let widths = ROW_WIDTHS.with(|w| {
+        let w = w.borrow();
+        fields
+            .iter()
+            .map(|(_, f, t)| if t == "bpchar" { w.get(f).copied() } else { None })
+            .collect()
+    });
     let mut out = ColumnExpr::Row {
         expr: Box::new(expr.clone()),
         fields: fields.to_vec(),
         params: params.to_vec(),
         result_type: String::new(),
+        widths,
     };
     // A sample row's value types what the node alone cannot (a scalar call's
     // result); an expression that fails on the sample still gets the node's
@@ -6970,17 +7070,19 @@ pub fn apply_row_expr(expr: &ColumnExpr, row: &Document) -> Result<Bson> {
         expr,
         fields,
         params,
+        widths,
         ..
     } = expr
     else {
         return Err(Error::Unsupported("not a row expression".into()));
     };
     let mut all = params.clone();
-    all.extend(
-        fields
-            .iter()
-            .map(|(_, f, _)| row.get(f).cloned().unwrap_or(Bson::Null)),
-    );
+    all.extend(fields.iter().enumerate().map(|(i, (_, f, _))| {
+        pad_bpchar(
+            row.get(f).cloned().unwrap_or(Bson::Null),
+            widths.get(i).copied().flatten(),
+        )
+    }));
     let previous = declare_row_fields(params.len(), fields);
     let out = const_value(expr, &all);
     PLAN_PARAM_TYPES.with(|t| *t.borrow_mut() = previous);
@@ -7057,7 +7159,13 @@ fn plan_table_targets(
             // client's type-discovery query reads the catalog
             // (`oid::regtype::text AS regtype`). Chained casts flatten into
             // the last one applied to the innermost column.
-            Some(N::TypeCast(tc)) if cast_chain_over_column(tc).is_ok() => {
+            // A `char(n)` column takes the general path below, which pads
+            // it the way every expression sees it.
+            Some(N::TypeCast(tc))
+                if cast_chain_over_column(tc).is_ok_and(|(col, _)| {
+                    def.column(&col).is_none_or(|c| c.pg_type != "bpchar")
+                }) =>
+            {
                 let (col_name, chain) = cast_chain_over_column(tc)?;
                 let field = def
                     .field_of(&col_name)
@@ -7084,7 +7192,9 @@ fn plan_table_targets(
                 if func_name(f).as_deref().is_some_and(|n| {
                     (scalar::is_scalar(n) && scalar::has_static_result_type(n))
                         || n == "regexp_replace"
-                }) && single_column_call(f, params).is_some()
+                }) && single_column_call(f, params).is_some_and(|(col, _)| {
+                    def.column(&col).is_none_or(|c| c.pg_type != "bpchar")
+                })
                     && !(func_name(f).as_deref() == Some("to_char")
                         && single_column_call(f, params).is_some_and(|(c, _)| {
                             def.column(&c)
@@ -7169,7 +7279,10 @@ fn plan_table_targets(
                 let fields: Vec<RowField> = def
                     .columns
                     .iter()
-                    .map(|c| (c.name.clone(), c.field(), c.pg_type.clone()))
+                    .map(|c| {
+            note_bpchar_width(c);
+            (c.name.clone(), c.field(), c.pg_type.clone())
+        })
                     .collect();
                 // A sample row typed from the columns' declared types stands
                 // in for a real one, so a scalar call is typed by its result.
@@ -7613,7 +7726,10 @@ fn plan_aggregate_item(
     let fields: Vec<RowField> = def
         .columns
         .iter()
-        .map(|c| (c.name.clone(), c.field(), c.pg_type.clone()))
+        .map(|c| {
+            note_bpchar_width(c);
+            (c.name.clone(), c.field(), c.pg_type.clone())
+        })
         .collect();
     let mut sample = Document::new();
     for c in &def.columns {
@@ -8048,6 +8164,7 @@ fn resolve_group_key(
                     field: column.field(),
                     expr: None,
                     pg_type: column.pg_type.clone(),
+                    typmod: column.typmod,
                 },
                 print,
             ))
@@ -8067,6 +8184,7 @@ fn resolve_group_key(
                     field: String::new(),
                     expr: Some(expr),
                     pg_type,
+                    typmod: -1,
                 },
                 print,
             ))
@@ -8998,6 +9116,11 @@ fn plan_select(
     if let Some(rewritten) = joins::select_list_srf(s)? {
         return plan_select(&rewritten, lookup, params);
     }
+    // A reference to the RELATION itself -- `row_to_json(t)`, `SELECT jr
+    // FROM jr`, `(jr.*)::text` -- is the whole row as a record.
+    if let Some(rewritten) = whole_row_rewrite(s, lookup, params)? {
+        return plan_select(&rewritten, lookup, params);
+    }
     if s.from_clause.is_empty() {
         return plan_select_constant(s, params);
     }
@@ -9244,7 +9367,10 @@ fn plan_select_rest(
                 let fields: Vec<RowField> = def
                     .columns
                     .iter()
-                    .map(|c| (c.name.clone(), c.field(), c.pg_type.clone()))
+                    .map(|c| {
+            note_bpchar_width(c);
+            (c.name.clone(), c.field(), c.pg_type.clone())
+        })
                     .collect();
                 let mut sample = Document::new();
                 for c in &def.columns {
@@ -9309,7 +9435,10 @@ fn plan_select_rest(
                 let fields: Vec<RowField> = def
                     .columns
                     .iter()
-                    .map(|c| (c.name.clone(), c.field(), c.pg_type.clone()))
+                    .map(|c| {
+            note_bpchar_width(c);
+            (c.name.clone(), c.field(), c.pg_type.clone())
+        })
                     .collect();
                 let mut sample = Document::new();
                 for c in &def.columns {
@@ -10067,7 +10196,11 @@ pub fn aggregate_output_def(agg: &Aggregate) -> Result<TableDef> {
             OutputCol::Expr(i) => column_expr_type(&agg.exprs[*i]).to_string(),
             OutputCol::Agg(i) => aggregate_item_type(&agg.items[*i]),
         };
-        columns.push(Column::new(out, &ty, false));
+        let mut c = Column::new(out, &ty, false);
+        if let OutputCol::Group(i) = col {
+            c.typmod = agg.group_by[*i].typmod;
+        }
+        columns.push(c);
     }
     Ok(TableDef::new("", columns))
 }
@@ -10147,16 +10280,22 @@ pub fn select_output_def(
         // expression that keeps the SOURCE column's type, exactly as
         // `join_output_def` treats it.
         let expr = sel.casts.get(i).and_then(|c| c.as_ref());
+        let src = source.columns.iter().find(|c| c.field() == *field || c.name == *field);
         let ty = match expr {
             Some(e) if !matches!(e, ColumnExpr::Coalesce { .. }) => column_expr_type(e).to_string(),
-            _ => source
-                .columns
-                .iter()
-                .find(|c| c.field() == *field || c.name == *field)
+            _ => src
                 .map(|c| c.pg_type.clone())
                 .ok_or_else(|| Error::UndefinedColumn(field.clone()))?,
         };
-        columns.push(Column::new(out, &ty, false));
+        let mut col = Column::new(out, &ty, false);
+        // A column read straight through keeps its modifier: a `char(n)`
+        // is still `char(n)` seen from outside the subquery.
+        if expr.is_none() {
+            if let Some(c) = src {
+                col.typmod = c.typmod;
+            }
+        }
+        columns.push(col);
     }
     Ok(TableDef::new("", columns))
 }
@@ -10254,7 +10393,10 @@ fn finish_aggregate(
     let fields: Vec<RowField> = def
         .columns
         .iter()
-        .map(|c| (c.name.clone(), c.field(), c.pg_type.clone()))
+        .map(|c| {
+            note_bpchar_width(c);
+            (c.name.clone(), c.field(), c.pg_type.clone())
+        })
         .collect();
     let mut sample = Document::new();
     for c in &def.columns {
@@ -11789,11 +11931,14 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 {
                     let args = match named_call_args(f, &name, params) {
                         Some(a) => a?,
-                        None => f
-                            .args
-                            .iter()
-                            .map(|a| const_value(a, params))
-                            .collect::<Result<Vec<_>>>()?,
+                        None => bpchar_args(
+                            f,
+                            &name,
+                            f.args
+                                .iter()
+                                .map(|a| const_value(a, params))
+                                .collect::<Result<Vec<_>>>()?,
+                        ),
                     };
                     if let Some(result) = scalar::call(&name, &args) {
                         let value = result?;
@@ -12652,14 +12797,6 @@ pub(crate) fn regtype_value(oid: i64) -> Bson {
 /// The tag key of an anonymous record value.
 pub const RECORD_KEY: &str = "__record";
 
-/// An anonymous record (`ROW(...)` / `(a, b, ...)`): an ORDERED field list,
-/// tagged so it is distinct from an array (`{...}`) and from any other
-/// document. Rendered as `(a,b,...)` and reported as oid 2249.
-pub(crate) fn record_value(fields: Vec<Bson>) -> Bson {
-    let mut d = Document::new();
-    d.insert(RECORD_KEY, Bson::Array(fields));
-    Bson::Document(d)
-}
 
 /// The companion key holding a `ROW(...)` record's STATIC field types.
 ///
@@ -12702,12 +12839,28 @@ pub fn record_field_types(v: &Bson) -> Option<Vec<String>> {
 /// The field list inside a record value, or `None` for any other value.
 pub(crate) fn record_fields(v: &Bson) -> Option<&Vec<Bson>> {
     match v {
-        Bson::Document(d) if d.len() == 1 || (d.len() == 2 && d.contains_key(RECORD_TYPES_KEY)) => {
+        Bson::Document(d)
+            if d.keys().all(|k| k == RECORD_KEY || k == RECORD_TYPES_KEY || k == RECORD_NAMES_KEY) =>
+        {
             match d.get(RECORD_KEY) {
                 Some(Bson::Array(items)) => Some(items),
                 _ => None,
             }
         }
+        _ => None,
+    }
+}
+
+/// The key holding a record's field NAMES, when it has them: a whole-row
+/// reference (`row_to_json(t)`) does, an anonymous `ROW(...)` does not.
+pub const RECORD_NAMES_KEY: &str = "__record_names";
+
+/// A record's field names, or `None` for an anonymous record.
+pub fn record_names(v: &Bson) -> Option<Vec<String>> {
+    let Bson::Document(d) = v else { return None };
+    record_fields(v)?;
+    match d.get(RECORD_NAMES_KEY) {
+        Some(Bson::Array(items)) => items.iter().map(|t| t.as_str().map(str::to_owned)).collect(),
         _ => None,
     }
 }
@@ -13041,7 +13194,16 @@ fn composite_value(value: Bson, target: &str, fields: &[(String, String)]) -> Re
     for (v, (_, ty)) in raw.into_iter().zip(fields.iter()) {
         out.push(cast_value(v, ty)?);
     }
-    Ok(record_value(out))
+    // A composite value knows its fields' names and types --
+    // `row_to_json(row(1, 'x')::comp)` names them.
+    let mut record = typed_record_value(out, fields.iter().map(|(_, t)| t.clone()).collect());
+    if let Bson::Document(d) = &mut record {
+        d.insert(
+            RECORD_NAMES_KEY,
+            Bson::Array(fields.iter().map(|(n, _)| Bson::String(n.clone())).collect()),
+        );
+    }
+    Ok(record)
 }
 
 /// The oid inside a regtype value, or `None` for any other value.
@@ -15599,6 +15761,15 @@ pub(crate) fn render_value_text(v: &Bson) -> String {
 }
 
 pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
+    let out = cast_value_inner(value, target)?;
+    // A `char(n)` value is STORED without its padding: equality lowers to
+    // a filter against the stored value, and `'x  '` must find `'x'`. The
+    // blanks come back where PostgreSQL shows them -- on output, and when
+    // the value takes part in an expression (`pad_bpchar`).
+    Ok(if target == "bpchar" { trim_bpchar(out) } else { out })
+}
+
+fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
     // A NULL survives every cast; only its declared type changes.
     if value == Bson::Null {
         return Ok(Bson::Null);
@@ -16847,8 +17018,179 @@ fn static_hstore_operand(n: Option<&pg_query::protobuf::Node>, value: &Bson) -> 
     static_type(n, value) == "hstore" && extension_type("hstore") == Some(ExtensionType::Hstore)
 }
 
-/// A datetime function's result type from its call, or `None`.
+/// Rewrite whole-row references over a single FROM item into `ROW(...)`
+/// of its columns, the field NAMES kept in the RowExpr's `colnames` (which
+/// is where PostgreSQL itself keeps them for a whole-row Var).
+///
+/// Only a name the FROM item introduces, and only when no column is called
+/// that -- a column wins, as it does in PostgreSQL -- so a typo is still a
+/// 42703 rather than a record. `alias.*` as a bare target is left alone: it
+/// expands to the columns, not to one record.
+fn whole_row_rewrite(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Result<Option<pg_query::protobuf::SelectStmt>> {
+    let [item] = s.from_clause.as_slice() else {
+        return Ok(None);
+    };
+    // A table's whole row is its composite ROWTYPE (typed by the table's
+    // name); a subquery's is an anonymous record.
+    let mut rowtype: Option<String> = None;
+    let (alias, columns): (String, Vec<String>) = match item.node.as_ref() {
+        Some(N::RangeVar(r)) => {
+            let alias = r.alias.as_ref().map_or_else(|| r.relname.clone(), |a| a.aliasname.clone());
+            match lookup(&relation_name(r)) {
+                Some(def) => {
+                    rowtype = Some(relation_name(r));
+                    (alias, def.columns.iter().map(|c| c.name.clone()).collect())
+                }
+                None => return Ok(None),
+            }
+        }
+        Some(N::RangeSubselect(rs)) => {
+            let Some(alias) = rs.alias.as_ref().map(|a| a.aliasname.clone()) else {
+                return Ok(None);
+            };
+            let Some(N::SelectStmt(sub)) = rs.subquery.as_ref().and_then(|q| q.node.as_ref()) else {
+                return Ok(None);
+            };
+            let stmt = plan_select(sub, lookup, params)?;
+            let def = sub_plan_def(&stmt, lookup)?;
+            let mut cols: Vec<String> = def.columns.iter().map(|c| c.name.clone()).collect();
+            // `s(a, b)` column aliases rename the subquery's outputs.
+            if let Some(a) = rs.alias.as_ref() {
+                for (i, c) in a.colnames.iter().enumerate() {
+                    if let (Some(N::String(sv)), Some(slot)) = (c.node.as_ref(), cols.get_mut(i)) {
+                        slot.clone_from(&sv.sval);
+                    }
+                }
+            }
+            (alias, cols)
+        }
+        _ => return Ok(None),
+    };
+    if columns.iter().any(|c| *c == alias) {
+        return Ok(None);
+    }
+    let is_whole_row = |c: &pg_query::protobuf::ColumnRef, allow_star: bool| -> bool {
+        let names: Vec<Option<&str>> = c
+            .fields
+            .iter()
+            .map(|f| match f.node.as_ref() {
+                Some(N::String(sv)) => Some(sv.sval.as_str()),
+                Some(N::AStar(_)) => Some("*"),
+                _ => None,
+            })
+            .collect();
+        match names.as_slice() {
+            [Some(n)] => *n == alias,
+            [Some(n), Some("*")] => allow_star && *n == alias,
+            _ => false,
+        }
+    };
+    let row = || -> pg_query::protobuf::Node {
+        let col_node = |name: &str| pg_query::protobuf::Node {
+            node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+                fields: vec![pg_query::protobuf::Node {
+                    node: Some(N::String(pg_query::protobuf::String { sval: name.to_string() })),
+                }],
+                location: 0,
+            })),
+        };
+        let row = pg_query::protobuf::Node {
+            node: Some(N::RowExpr(Box::new(pg_query::protobuf::RowExpr {
+                xpr: None,
+                args: columns.iter().map(|c| col_node(c)).collect(),
+                row_typeid: 0,
+                row_format: pg_query::protobuf::CoercionForm::CoerceImplicitCast as i32,
+                colnames: columns
+                    .iter()
+                    .map(|c| pg_query::protobuf::Node {
+                        node: Some(N::String(pg_query::protobuf::String { sval: c.clone() })),
+                    })
+                    .collect(),
+                location: 0,
+            }))),
+        };
+        match &rowtype {
+            None => row,
+            Some(t) => pg_query::protobuf::Node {
+                node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                    arg: Some(Box::new(row)),
+                    type_name: Some(type_name_node(t)),
+                    location: 0,
+                }))),
+            },
+        }
+    };
+    let mut out = s.clone();
+    let mut changed = false;
+    let mut rewrite = |node: &mut pg_query::protobuf::Node, top_target: bool| -> Result<()> {
+        if let Some(N::ColumnRef(c)) = node.node.as_ref() {
+            if is_whole_row(c, !top_target) {
+                *node = row();
+                changed = true;
+                return Ok(());
+            }
+        }
+        walk_expr(node, &mut |n| {
+            if let Some(N::ColumnRef(c)) = n.node.as_ref() {
+                if is_whole_row(c, true) {
+                    *n = row();
+                    changed = true;
+                }
+            }
+            Ok(())
+        })
+    };
+    for t in &mut out.target_list {
+        if let Some(N::ResTarget(rt)) = t.node.as_mut() {
+            if let Some(v) = rt.val.as_deref_mut() {
+                rewrite(v, true)?;
+            }
+        }
+    }
+    if let Some(w) = out.where_clause.as_deref_mut() {
+        rewrite(w, false)?;
+    }
+    for sb in &mut out.sort_clause {
+        if let Some(N::SortBy(b)) = sb.node.as_mut() {
+            if let Some(n) = b.node.as_deref_mut() {
+                rewrite(n, false)?;
+            }
+        }
+    }
+    Ok(changed.then_some(out))
+}
+
+/// A built-in's arguments with each `char(n)` one trimmed, as the
+/// bpchar-to-text cast in front of a text function trims it -- except for
+/// the functions that take the value as it is (`octet_length` counts the
+/// blanks, `concat` / `format` print them).
+fn bpchar_args(f: &pg_query::protobuf::FuncCall, name: &str, args: Vec<Bson>) -> Vec<Bson> {
+    const PADDED: &[&str] = &["octet_length", "concat", "concat_ws", "format"];
+    if PADDED.contains(&name) {
+        return args;
+    }
+    args.into_iter()
+        .zip(f.args.iter())
+        .map(|(v, node)| {
+            if static_type(node, &v) == "bpchar" {
+                trim_bpchar(v)
+            } else {
+                v
+            }
+        })
+        .collect()
+}
+
+/// A datetime (or JSON-constructor) function's result type from its call,
+/// or `None`. Both families are chosen by their arguments' STATIC types.
 fn datetime_result_type(f: &pg_query::protobuf::FuncCall, name: &str) -> Option<String> {
+    if let Some(t) = jsonfn::result_type(name) {
+        return Some(t.to_string());
+    }
     let types: Vec<String> = f.args.iter().map(|a| static_type(a, &Bson::Null)).collect();
     datetime::result_type(name, &types)
 }
@@ -16904,6 +17246,9 @@ fn datetime_call(
         .zip(&args)
         .map(|(a, v)| static_type(a, v))
         .collect();
+    if jsonfn::result_type(name).is_some() {
+        return Some(jsonfn::call(name, &args, &types));
+    }
     datetime::call(name, &args, &types)
 }
 
@@ -18119,7 +18464,10 @@ fn plan_update(
         let fields: Vec<RowField> = def
             .columns
             .iter()
-            .map(|c| (c.name.clone(), c.field(), c.pg_type.clone()))
+            .map(|c| {
+            note_bpchar_width(c);
+            (c.name.clone(), c.field(), c.pg_type.clone())
+        })
             .collect();
         let mut sample = Document::new();
         for c in &def.columns {
@@ -18181,7 +18529,7 @@ fn plan_update(
             set_exprs.push((field, column.pg_type.clone(), row));
             continue;
         }
-        let value = cast_value(const_value(val, params)?, &column.pg_type)?;
+        let value = fit_to_column(cast_value(const_value(val, params)?, &column.pg_type)?, column)?;
         set_stored_value(&mut set, &mut unset, field, value);
     }
     if set.is_empty() && set_exprs.is_empty() && set_subscripts.is_empty() {
@@ -18632,7 +18980,31 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 )));
             }
         }
-        return cast_value(value, &target);
+        // `char(n)` to a text type drops the trailing blanks.
+        let value = if matches!(target.as_str(), "text" | "varchar" | "name")
+            && static_type(arg, &value) == "bpchar"
+        {
+            trim_bpchar(value)
+        } else {
+            value
+        };
+        let out = cast_value(value, &target)?;
+        // An explicit cast to `varchar(n)` / `char(n)` TRUNCATES (silently --
+        // only an assignment raises), and `char(n)` pads: `123::char(2)` is
+        // `12`, `'ab'::char(4)` is `ab  `.
+        if let (Some(tn), Bson::String(text)) = (tc.type_name.as_ref(), &out) {
+            let typmod = declared_typmod(tn);
+            if typmod > 4 && matches!(target.as_str(), "varchar" | "bpchar") {
+                let n = (typmod - 4) as usize;
+                let mut t: String = text.chars().take(n).collect();
+                if target == "bpchar" {
+                    let len = t.chars().count();
+                    t.push_str(&" ".repeat(n - len));
+                }
+                return Ok(Bson::String(t));
+            }
+        }
+        return Ok(out);
     }
     // `(expr).field` -- select a named field from a composite or record value.
     // The field NAME resolves to a position through the source's type: a named
@@ -18841,6 +19213,7 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                     .iter()
                     .map(|a| const_value(a, params))
                     .collect::<Result<Vec<_>>>()?;
+                let args = bpchar_args(f, &name, args);
                 if let Some(result) = scalar::call(&name, &args) {
                     return result;
                 }
@@ -18851,7 +19224,7 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                     .iter()
                     .map(|a| const_value(a, params))
                     .collect::<Result<Vec<_>>>()?;
-                return regexp_replace(&args);
+                return regexp_replace(&bpchar_args(f, &name, args));
             }
         }
     }
@@ -19121,6 +19494,49 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             };
             return Ok(Bson::Boolean(same == not_distinct));
         }
+        // `x IN (a, b)` / `x NOT IN (...)`: an `=` / `<>` against each, with
+        // SQL's three-valued rule -- a match decides, otherwise a NULL
+        // anywhere makes the answer NULL.
+        if AExprKind::try_from(e.kind) == Ok(AExprKind::AexprIn) {
+            let negated = in_is_negated(e);
+            let items: Vec<pg_query::protobuf::Node> = match e.rexpr.as_deref().and_then(|n| n.node.as_ref()) {
+                Some(N::List(l)) => l.items.clone(),
+                _ => return Err(Error::Unsupported("this IN list".into())),
+            };
+            let mut saw_null = false;
+            for item in items {
+                let mut eq = e.clone();
+                eq.kind = AExprKind::AexprOp as i32;
+                eq.name = vec![string_node("=")];
+                eq.rexpr = Some(Box::new(item));
+                match const_value(&pg_query::protobuf::Node { node: Some(N::AExpr(eq)) }, params)? {
+                    Bson::Boolean(true) => return Ok(Bson::Boolean(!negated)),
+                    Bson::Null => saw_null = true,
+                    _ => {}
+                }
+            }
+            return Ok(if saw_null { Bson::Null } else { Bson::Boolean(negated) });
+        }
+        // `x SIMILAR TO p [ESCAPE e]`: the parser has already wrapped the
+        // pattern in `similar_to_escape(...)`, which turns it into an
+        // anchored POSIX regex; the operator is `~` (`!~` for NOT SIMILAR).
+        if AExprKind::try_from(e.kind) == Ok(AExprKind::AexprSimilar) {
+            let subject = const_value(
+                e.lexpr.as_deref().ok_or_else(|| Error::Parse("SIMILAR TO with no subject".into()))?,
+                params,
+            )?;
+            let pattern = const_value(
+                e.rexpr.as_deref().ok_or_else(|| Error::Parse("SIMILAR TO with no pattern".into()))?,
+                params,
+            )?;
+            let (Bson::String(subject), Bson::String(pattern)) = (&subject, &pattern) else {
+                return Ok(Bson::Null);
+            };
+            let re = regex::Regex::new(pattern)
+                .map_err(|err| Error::InvalidText(format!("invalid regular expression: {err}")))?;
+            let hit = re.is_match(subject);
+            return Ok(Bson::Boolean(if operator_name(e)? == "!~" { !hit } else { hit }));
+        }
         if AExprKind::try_from(e.kind) != Ok(AExprKind::AexprOp) {
             return Err(Error::Unsupported("this operator form".into()));
         }
@@ -19129,7 +19545,7 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
         if pattern_operator(&op).is_some() {
             return eval_pattern_match_const(e, params);
         }
-        let rhs = const_value(
+        let mut rhs = const_value(
             e.rexpr
                 .as_ref()
                 .ok_or_else(|| Error::Parse("operator with no right operand".into()))?,
@@ -19138,7 +19554,7 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
         // A missing left operand is unary: `-3`, `+3`. A double is negated
         // outright rather than subtracted from zero, which is the difference
         // between `-(0.0::float8)` printing `-0` (PostgreSQL) and `0`.
-        let lhs = match e.lexpr.as_ref() {
+        let mut lhs = match e.lexpr.as_ref() {
             Some(l) => const_value(l, params)?,
             None => match op.as_str() {
                 "-" if matches!(rhs, Bson::Double(_)) => {
@@ -19168,6 +19584,34 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 _ => return Err(Error::Unsupported(format!("unary {op}"))),
             },
         };
+        // A `char(n)` operand is compared, and concatenated, as TEXT: its
+        // trailing blanks do not count. Against another `char(n)` or an
+        // untyped literal both sides are bpchar (`bpchareq` ignores trailing
+        // blanks on each); against `text` only the bpchar side is converted.
+        {
+            let bp = |n: Option<&pg_query::protobuf::Node>, v: &Bson| {
+                n.is_some_and(|n| static_type(n, v) == "bpchar")
+            };
+            let (lb, rb) = (bp(e.lexpr.as_deref(), &lhs), bp(e.rexpr.as_deref(), &rhs));
+            if lb || rb {
+                let (lu, ru) = (unknown_operand(e.lexpr.as_deref()), unknown_operand(e.rexpr.as_deref()));
+                if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
+                    if lb || (lu && rb) {
+                        lhs = trim_bpchar(lhs);
+                    }
+                    if rb || (ru && lb) {
+                        rhs = trim_bpchar(rhs);
+                    }
+                } else if op == "||" {
+                    if lb {
+                        lhs = trim_bpchar(lhs);
+                    }
+                    if rb {
+                        rhs = trim_bpchar(rhs);
+                    }
+                }
+            }
+        }
         // Two records compare with rules that depend on whether each side is a
         // ROW CONSTRUCTOR or a composite VALUE (see record_compare). Only the
         // AST distinguishes them -- a bare `ROW(...)` is an `N::RowExpr`, while
@@ -19300,7 +19744,29 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             let mut fields = Vec::with_capacity(r.args.len());
             let mut types = Vec::with_capacity(r.args.len());
             for a in &r.args {
-                let v = const_value(a, params)?;
+                let mut v = const_value(a, params)?;
+                // A `char(n)` field is blank-padded in the record, as its
+                // output function pads it: `('d'::char(2))` prints `("d ")`.
+                if let Some(N::TypeCast(tc)) = a.node.as_ref() {
+                    if let Some(tn) = tc.type_name.as_ref() {
+                        let base = type_name_of(tn);
+                        let width = tn.typmods.first().and_then(|m| match m.node.as_ref() {
+                            Some(N::AConst(c)) => match c.val.as_ref() {
+                                Some(a_const::Val::Ival(i)) => usize::try_from(i.ival).ok(),
+                                _ => None,
+                            },
+                            _ => None,
+                        });
+                        if let (true, Some(w), Bson::String(text)) =
+                            (matches!(base.as_str(), "bpchar" | "char" | "character"), width, &v)
+                        {
+                            let n = text.chars().count();
+                            if n < w {
+                                v = Bson::String(format!("{text}{}", " ".repeat(w - n)));
+                            }
+                        }
+                    }
+                }
                 let t = match a.node.as_ref() {
                     Some(N::AConst(c))
                         if c.isnull || matches!(c.val, Some(a_const::Val::Sval(_))) =>
@@ -19312,7 +19778,22 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 fields.push(v);
                 types.push(t);
             }
-            Ok(typed_record_value(fields, types))
+            let mut record = typed_record_value(fields, types);
+            // A whole-row reference names its fields (`colnames`).
+            let names: Vec<Bson> = r
+                .colnames
+                .iter()
+                .filter_map(|n| match n.node.as_ref() {
+                    Some(N::String(s)) => Some(Bson::String(s.sval.clone())),
+                    _ => None,
+                })
+                .collect();
+            if !names.is_empty() {
+                if let Bson::Document(d) = &mut record {
+                    d.insert(RECORD_NAMES_KEY, Bson::Array(names));
+                }
+            }
+            Ok(record)
         }
         // `current_timestamp` inside an expression (`current_timestamp::text`)
         // is `now()`; the bare-column form is handled by `plan_select_constant`.
@@ -19744,6 +20225,15 @@ fn lower_pattern_match(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Doc
     let (negated, insensitive, is_like) =
         pattern_operator(op).ok_or_else(|| Error::Unsupported(format!("the {op} operator")))?;
     let field = column_field(e.lexpr.as_deref(), def)?;
+    // A `char(n)` value is matched PADDED, which the stored (trimmed) value
+    // cannot express in a filter: it is matched per row instead.
+    if def
+        .columns
+        .iter()
+        .any(|c| c.field() == field && c.pg_type == "bpchar" && c.typmod > 4)
+    {
+        return Err(Error::Unsupported("a pattern match over char(n)".into()));
+    }
     // PostgreSQL has no `~~` for a non-text left operand: `n LIKE 'x'` over an
     // integer is `42883 operator does not exist: integer ~~ unknown`. Lowering
     // it to a regex anyway matched NOTHING and returned no rows -- an empty
@@ -19911,7 +20401,10 @@ fn lower_where_or_residual(
             let fields: Vec<RowField> = def
                 .columns
                 .iter()
-                .map(|c| (c.name.clone(), c.field(), c.pg_type.clone()))
+                .map(|c| {
+            note_bpchar_width(c);
+            (c.name.clone(), c.field(), c.pg_type.clone())
+        })
                 .collect();
             let mut sample = Document::new();
             for c in &def.columns {

@@ -11062,7 +11062,10 @@ impl PgHandler {
             .enumerate()
             .map(|(i, (out, field))| {
                 let (ty, source) = match casts.get(i).and_then(|c| c.as_ref()) {
-                    Some(expr) => (wire_type(secantus_pgplan::column_expr_type(expr)), None),
+                    Some(expr) => {
+                        let ty = secantus_pgplan::column_expr_type(expr);
+                        (self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty)), None)
+                    }
                     // By STORED FIELD first, then by either name. A primary
                     // key is stored as `_id`, which is not a column name, so
                     // `id AS k` matched neither the field nor the output name
@@ -14590,7 +14593,8 @@ impl PgHandler {
                             // padded type, and the encoder pads on the way out.
                             let typmod = match col {
                                 OutputCol::Agg(i) => aggregate_result_typmod(&agg.items[*i]),
-                                _ => -1,
+                                OutputCol::Group(i) => agg.group_by[*i].typmod,
+                                OutputCol::Expr(_) => -1,
                             };
                             self.field_mod(name.clone(), ty, typmod)
                         })
@@ -19823,7 +19827,12 @@ impl PgHandler {
                             self.user_wire_type(t).unwrap_or_else(|| wire_type(t))
                         }
                     };
-                    self.field(name.clone(), ty)
+                    let typmod = match col {
+                        OutputCol::Agg(i) => aggregate_result_typmod(&agg.items[*i]),
+                        OutputCol::Group(i) => agg.group_by[*i].typmod,
+                        OutputCol::Expr(_) => -1,
+                    };
+                    self.field_mod(name.clone(), ty, typmod)
                 })
                 .collect(),
             Statement::Show(name) => vec![self.field(canonical_setting(&name), Type::TEXT)],
