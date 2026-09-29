@@ -9,6 +9,7 @@
 //! because the point of P1 is to prove the SEAM end to end on real storage,
 //! including the shared on-disk catalog format. Breadth is P5's problem.
 
+mod aggregates;
 mod do_block;
 mod encoding;
 mod explain;
@@ -2258,12 +2259,17 @@ impl PgHandler {
         // field.
         let mut docs = docs;
         for item in &agg.items {
-            let (Some(expr), Some(slot)) = (item.expr.as_ref(), item.field.as_deref()) else {
-                continue;
-            };
-            for d in docs.iter_mut() {
-                let v = secantus_pgplan::apply_row_expr(expr, d).map_err(|e| Self::err(&e))?;
-                d.insert(slot, v);
+            for (expr, slot) in [
+                (item.expr.as_ref(), item.field.as_deref()),
+                (item.expr2.as_ref(), item.field2.as_deref()),
+            ] {
+                let (Some(expr), Some(slot)) = (expr, slot) else {
+                    continue;
+                };
+                for d in docs.iter_mut() {
+                    let v = secantus_pgplan::apply_row_expr(expr, d).map_err(|e| Self::err(&e))?;
+                    d.insert(slot, v);
+                }
             }
         }
         // Group, preserving first-seen order so output is deterministic
@@ -2374,10 +2380,10 @@ impl PgHandler {
                     .items
                     .iter()
                     .map(|item| compute_aggregate(item, bucket))
-                    .collect();
-                (k.clone(), vals)
+                    .collect::<PgWireResult<Vec<_>>>()?;
+                Ok((k.clone(), vals))
             })
-            .collect();
+            .collect::<PgWireResult<_>>()?;
 
         // Sort on the GROUP KEY, by index -- so `GROUP BY s ORDER BY s`
         // works even when `s` is not projected.
@@ -17119,6 +17125,9 @@ fn aggregate_result_typmod(item: &AggItem) -> i32 {
 /// Probed against PostgreSQL 14: `count(*)` and `count(col)` are int8 (oid 20),
 /// `sum(int4)` is **int8**, not int4, and `min`/`max` return the INPUT type.
 fn aggregate_wire_type(item: &AggItem) -> Type {
+    if aggregates::is_extended(item.func) {
+        return wire_type(&secantus_pgplan::aggregate_item_type(item));
+    }
     match item.func {
         AggFunc::CountStar | AggFunc::Count => Type::INT8,
         AggFunc::BoolAnd | AggFunc::BoolOr => Type::BOOL,
@@ -17142,7 +17151,32 @@ fn aggregate_wire_type(item: &AggItem) -> Type {
             .as_deref()
             .map(|t| wire_type(&format!("{t}[]")))
             .unwrap_or(Type::TEXT_ARRAY),
+        // The extended families returned above.
+        _ => Type::TEXT,
     }
+}
+
+/// One aggregate over a group's rows. The extended families
+/// (`aggregates.rs`) see the rows after FILTER and the aggregate's own
+/// ordering, exactly as the basic ones do.
+fn compute_aggregate(item: &AggItem, rows: &[Document]) -> PgWireResult<Bson> {
+    if !aggregates::is_extended(item.func) {
+        return Ok(compute_basic_aggregate(item, rows));
+    }
+    let mut rows: Vec<Document> = match item.filter.as_ref() {
+        None => rows.to_vec(),
+        Some(filter) => {
+            let empty = Document::new();
+            rows.iter()
+                .filter(|d| secantus_core::query::matches(d, filter, &empty, None).unwrap_or(false))
+                .cloned()
+                .collect()
+        }
+    };
+    if !item.order.is_empty() {
+        sort_rows(&mut rows, &item.order);
+    }
+    aggregates::compute(item, &rows)
 }
 
 /// One aggregate over one group.
@@ -17150,7 +17184,7 @@ fn aggregate_wire_type(item: &AggItem) -> Type {
 /// PostgreSQL's NULL rules, probed on 14: `count(*)` counts ROWS; every other
 /// aggregate SKIPS NULLs; and over an empty input `count` is 0 while `sum`,
 /// `min` and `max` are **NULL, not zero**.
-fn compute_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
+fn compute_basic_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
     // `FILTER (WHERE ...)`: only the matching rows contribute. A group where
     // none match becomes the empty input, which is already right for every
     // aggregate -- `count` 0, the rest NULL.
@@ -17438,6 +17472,8 @@ fn compute_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
             }
             best.cloned().unwrap_or(Bson::Null)
         }
+        // The extended families are computed in `aggregates.rs`.
+        _ => Bson::Null,
     }
 }
 
@@ -17782,6 +17818,7 @@ fn window_aggregate(w: &secantus_pgplan::WindowItem, frame: &[Bson]) -> Bson {
         sep: w.args.first().cloned(),
         order: Vec::new(),
         source_typmod: -1,
+        ..Default::default()
     };
     let rows: Vec<Document> = frame
         .iter()
@@ -17791,7 +17828,7 @@ fn window_aggregate(w: &secantus_pgplan::WindowItem, frame: &[Bson]) -> Bson {
             d
         })
         .collect();
-    compute_aggregate(&item, &rows)
+    compute_basic_aggregate(&item, &rows)
 }
 
 /// `[lo, hi]` of the current row's frame, or `None` when it is empty.

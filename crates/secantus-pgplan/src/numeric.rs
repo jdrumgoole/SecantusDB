@@ -958,3 +958,65 @@ pub fn decimal_unary_or_mod(op: &str, a: &str, b: Option<&str>) -> Option<Result
     };
     Some(canonical_numeric_text(&out.render()))
 }
+
+/// `numeric_stddev_internal`: the exact sample / population variance or
+/// standard deviation of numeric texts. `None` when undefined (fewer than
+/// two values for a sample, none for a population).
+///
+/// The numerator `N*sum(x^2) - sum(x)^2` is exact; a non-positive one
+/// (roundoff cannot happen here, but PostgreSQL guards it) answers `0`. The
+/// division uses `select_div_scale`, rounded half away from zero, and the
+/// square root is taken at that same scale.
+pub fn numeric_variance(values: &[String], sample: bool, stddev: bool) -> Option<String> {
+    let xs: Vec<Dec> = values.iter().filter_map(|v| Dec::parse(v)).collect();
+    let n = xs.len() as u64;
+    if (sample && n <= 1) || n == 0 {
+        return None;
+    }
+    let scale = xs.iter().map(|d| d.scale).max().unwrap_or(0);
+    let lifted: Vec<BigInt> = xs.iter().map(|d| d.lift(scale)).collect();
+    let sum: BigInt = lifted.iter().sum();
+    let sum2: BigInt = lifted.iter().map(|v| v * v).sum();
+    // N*sum2 - sum^2 at scale 2*scale.
+    let numerator = Dec {
+        unscaled: BigInt::from(n) * sum2 - &sum * &sum,
+        scale: scale * 2,
+    };
+    if !numerator.unscaled.is_positive() {
+        return Some("0".to_string());
+    }
+    let denom = Dec {
+        unscaled: if sample {
+            BigInt::from(n) * BigInt::from(n - 1)
+        } else {
+            BigInt::from(n) * BigInt::from(n)
+        },
+        scale: 0,
+    };
+    let rscale = div_scale(&numerator, &denom);
+    let num = numerator.unscaled.clone() * BigInt::from(10u32).pow(rscale);
+    let den = denom.unscaled * BigInt::from(10u32).pow(numerator.scale);
+    let var = round_half_away(&num, &den);
+    let out = if stddev {
+        // sqrt at rscale: isqrt of var * 10^(rscale + 2) gives one extra
+        // digit, rounded half away.
+        let scaled = &var * BigInt::from(10u32).pow(rscale + 2);
+        let root = scaled.sqrt();
+        let (q, r) = (&root / BigInt::from(10u32), &root % BigInt::from(10u32));
+        let rounded = if r >= BigInt::from(5u32) {
+            q + BigInt::one()
+        } else {
+            q
+        };
+        Dec {
+            unscaled: rounded,
+            scale: rscale,
+        }
+    } else {
+        Dec {
+            unscaled: var,
+            scale: rscale,
+        }
+    };
+    Some(out.render())
+}

@@ -1078,9 +1078,10 @@ impl Series {
 /// `avg` is deliberately absent: PostgreSQL returns `numeric` with its own
 /// scale rules (`avg(int4)` over {1,3} is `2.0000000000000000`), and
 /// approximating that would be a wrong answer rather than a missing feature.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AggFunc {
     /// `count(*)` — counts ROWS, including those whose columns are all NULL.
+    #[default]
     CountStar,
     /// `count(col)` — skips NULLs.
     Count,
@@ -1101,9 +1102,50 @@ pub enum AggFunc {
     /// `string_agg(col, sep)` -- the non-NULL values joined, in group order.
     /// The separator is the item's `sep`.
     StringAgg,
+    /// `variance` / `var_samp`, `var_pop`, `stddev` / `stddev_samp`,
+    /// `stddev_pop`: exact numeric over integers and numerics, float8 over
+    /// floats (PostgreSQL's two accumulator families).
+    VarSamp,
+    VarPop,
+    StddevSamp,
+    StddevPop,
+    /// `json_agg` / `jsonb_agg`: every value, NULLs as JSON null.
+    JsonAgg,
+    JsonbAgg,
+    /// `json_object_agg(k, v)` / `jsonb_object_agg`.
+    JsonObjectAgg,
+    JsonbObjectAgg,
+    /// The float8 regression family over `(y, x)` pairs, rows with either
+    /// NULL skipped (`float8_regr_accum`).
+    Corr,
+    CovarPop,
+    CovarSamp,
+    RegrCount,
+    RegrAvgX,
+    RegrAvgY,
+    RegrSxx,
+    RegrSyy,
+    RegrSxy,
+    RegrSlope,
+    RegrIntercept,
+    RegrR2,
+    /// Ordered-set aggregates: the argument is the WITHIN GROUP expression,
+    /// the fraction a direct argument.
+    PercentileCont,
+    PercentileDisc,
+    Mode,
+    /// Hypothetical-set aggregates: where the direct argument would rank
+    /// among the WITHIN GROUP values.
+    HypRank,
+    HypDenseRank,
+    HypPercentRank,
+    HypCumeDist,
+    /// `bit_and` / `bit_or` over integers.
+    BitAnd,
+    BitOr,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct AggItem {
     pub func: AggFunc,
     /// Stored field; `None` only for `count(*)`.
@@ -1140,6 +1182,15 @@ pub struct AggItem {
     /// take the column's own type. `string_agg` does not -- its argument is
     /// coerced to `text`, which strips (all measured on 14.24).
     pub source_typmod: i32,
+    /// A two-argument aggregate's second argument (`corr(y, x)`'s `x`,
+    /// `json_object_agg(k, v)`'s `v`): its field, and the expression that
+    /// fills it per row when it is not a bare column.
+    pub field2: Option<String>,
+    pub expr2: Option<ColumnExpr>,
+    pub source_type2: Option<String>,
+    /// An ordered-set or hypothetical-set aggregate's DIRECT arguments, already
+    /// evaluated: the fraction, or the hypothetical row.
+    pub direct: Vec<Bson>,
 }
 
 /// One output column of an aggregate query, by POSITION.
@@ -5114,17 +5165,6 @@ pub fn sum_result_type(source: Option<&str>) -> &'static str {
 /// refused, where PostgreSQL returns one row. Refusing here makes the answer
 /// the same either way, and names what is actually missing.
 fn contains_nested_aggregate(node: &pg_query::protobuf::Node) -> bool {
-    const AGGREGATES: &[&str] = &[
-        "count",
-        "sum",
-        "avg",
-        "min",
-        "max",
-        "array_agg",
-        "string_agg",
-        "bool_and",
-        "bool_or",
-    ];
     fn walk(node: Option<&pg_query::protobuf::Node>, depth: usize) -> bool {
         let Some(node) = node else { return false };
         match node.node.as_ref() {
@@ -5136,7 +5176,7 @@ fn contains_nested_aggregate(node: &pg_query::protobuf::Node) -> bool {
                     && f.over.is_none()
                     && func_name(f)
                         .as_deref()
-                        .is_some_and(|n| AGGREGATES.contains(&n))
+                        .is_some_and(|n| aggregate_func(n, f.agg_within_group).is_some())
                 {
                     return true;
                 }
@@ -5740,21 +5780,6 @@ fn plan_window_args(
 }
 
 /// The aggregate names the aggregate planner handles.
-const AGGREGATES: &[&str] = &[
-    "count",
-    "sum",
-    "avg",
-    "min",
-    "max",
-    "array_agg",
-    "bool_and",
-    "bool_or",
-    // Not implemented, but it IS an aggregate: routed here so it is refused
-    // while PLANNING. Left on the scalar path it answered `function
-    // string_agg() is not supported yet` per row -- and NO ROWS AT ALL over an
-    // empty table, where PostgreSQL answers one.
-    "string_agg",
-];
 
 fn has_aggregate(s: &pg_query::protobuf::SelectStmt) -> bool {
     // Only the names the aggregate planner actually handles. Any-FuncCall
@@ -5775,7 +5800,7 @@ fn has_aggregate(s: &pg_query::protobuf::SelectStmt) -> bool {
                 if f.over.is_none()
                     && func_name(f)
                         .as_deref()
-                        .is_some_and(|n| AGGREGATES.contains(&n)) =>
+                        .is_some_and(|n| aggregate_func(n, f.agg_within_group).is_some()) =>
             {
                 true
             }
@@ -5812,7 +5837,7 @@ fn split_window_over_aggregate(
     let mut outer = s.clone();
     let mut replace = |n: &mut pg_query::protobuf::Node| -> Result<()> {
         let is_agg = matches!(n.node.as_ref(), Some(N::FuncCall(f))
-            if f.over.is_none() && func_name(f).is_some_and(|name| AGGREGATES.contains(&name.as_str())));
+            if f.over.is_none() && func_name(f).is_some_and(|name| aggregate_func(&name, f.agg_within_group).is_some()));
         let is_col = matches!(n.node.as_ref(), Some(N::ColumnRef(c))
             if !c.fields.iter().any(|f| matches!(f.node, Some(N::AStar(_)))));
         if !is_agg && !is_col {
@@ -7462,13 +7487,17 @@ fn having_subject(
     let node = node.ok_or_else(|| Error::Parse("a HAVING term without an operand".into()))?;
     match node.node.as_ref() {
         Some(N::FuncCall(f)) if is_aggregate_call(f) => {
-            let item = plan_bare_aggregate(f, def, items.len(), _params)?;
-            if let Some(i) = items.iter().position(|existing| {
-                existing.func == item.func
-                    && existing.field == item.field
-                    && existing.distinct == item.distinct
-                    && existing.filter == item.filter
-            }) {
+            let item = plan_aggregate_item(
+                f,
+                def,
+                items.len(),
+                _params,
+                format!("__having{}", items.len()),
+            )?;
+            if let Some(i) = items
+                .iter()
+                .position(|existing| same_aggregate(existing, &item))
+            {
                 return Ok(OutputCol::Agg(i));
             }
             items.push(item);
@@ -7492,82 +7521,236 @@ fn having_subject(
     }
 }
 
-/// One aggregate over a bare column (or `count(*)`), as HAVING writes them.
-fn plan_bare_aggregate(
+/// Do two items compute the same thing (everything but the output name)?
+fn same_aggregate(a: &AggItem, b: &AggItem) -> bool {
+    let mut x = a.clone();
+    x.out.clone_from(&b.out);
+    x == *b
+}
+
+/// The aggregate a function name calls, with how many ordinary arguments it
+/// takes. `None`: not an aggregate this server computes.
+fn aggregate_func(name: &str, within_group: bool) -> Option<(AggFunc, usize)> {
+    if within_group {
+        return Some(match name {
+            "percentile_cont" => (AggFunc::PercentileCont, 1),
+            "percentile_disc" => (AggFunc::PercentileDisc, 1),
+            "mode" => (AggFunc::Mode, 0),
+            "rank" => (AggFunc::HypRank, 1),
+            "dense_rank" => (AggFunc::HypDenseRank, 1),
+            "percent_rank" => (AggFunc::HypPercentRank, 1),
+            "cume_dist" => (AggFunc::HypCumeDist, 1),
+            _ => return None,
+        });
+    }
+    Some(match name {
+        "count" => (AggFunc::Count, 1),
+        "sum" => (AggFunc::Sum, 1),
+        "min" => (AggFunc::Min, 1),
+        "max" => (AggFunc::Max, 1),
+        "array_agg" => (AggFunc::ArrayAgg, 1),
+        "bool_and" | "every" => (AggFunc::BoolAnd, 1),
+        "bool_or" => (AggFunc::BoolOr, 1),
+        "avg" => (AggFunc::Avg, 1),
+        "string_agg" => (AggFunc::StringAgg, 2),
+        "variance" | "var_samp" => (AggFunc::VarSamp, 1),
+        "var_pop" => (AggFunc::VarPop, 1),
+        "stddev" | "stddev_samp" => (AggFunc::StddevSamp, 1),
+        "stddev_pop" => (AggFunc::StddevPop, 1),
+        "json_agg" => (AggFunc::JsonAgg, 1),
+        "jsonb_agg" => (AggFunc::JsonbAgg, 1),
+        "json_object_agg" => (AggFunc::JsonObjectAgg, 2),
+        "jsonb_object_agg" => (AggFunc::JsonbObjectAgg, 2),
+        "corr" => (AggFunc::Corr, 2),
+        "covar_pop" => (AggFunc::CovarPop, 2),
+        "covar_samp" => (AggFunc::CovarSamp, 2),
+        "regr_count" => (AggFunc::RegrCount, 2),
+        "regr_avgx" => (AggFunc::RegrAvgX, 2),
+        "regr_avgy" => (AggFunc::RegrAvgY, 2),
+        "regr_sxx" => (AggFunc::RegrSxx, 2),
+        "regr_syy" => (AggFunc::RegrSyy, 2),
+        "regr_sxy" => (AggFunc::RegrSxy, 2),
+        "regr_slope" => (AggFunc::RegrSlope, 2),
+        "regr_intercept" => (AggFunc::RegrIntercept, 2),
+        "regr_r2" => (AggFunc::RegrR2, 2),
+        "bit_and" => (AggFunc::BitAnd, 1),
+        "bit_or" => (AggFunc::BitOr, 1),
+        _ => return None,
+    })
+}
+
+/// One aggregate call as an `AggItem`: its arguments resolved to stored
+/// fields (a bare column), or to hidden per-row slots (`__agg{index}`,
+/// `__agg{index}_2`) filled from an expression. `WITHIN GROUP` aggregates
+/// take their argument from the ORDER BY and their direct arguments as
+/// constants. One builder for the select list, HAVING and aggregates inside
+/// expressions, so every aggregate means the same thing in each.
+fn plan_aggregate_item(
     f: &pg_query::protobuf::FuncCall,
     def: &TableDef,
     index: usize,
     params: &[Bson],
+    out: String,
 ) -> Result<AggItem> {
     let name = func_name(f).unwrap_or_default();
     let filter = match f.agg_filter.as_deref() {
         None => None,
         Some(node) => Some(lower_where(node, def, params)?),
     };
-    let order = plan_aggregate_order(&f.agg_order, def)?;
-    let sep = if name == "string_agg" {
-        if f.args.len() != 2 {
+    if name == "count" && f.agg_star {
+        return Ok(AggItem {
+            func: AggFunc::CountStar,
+            out,
+            distinct: f.agg_distinct,
+            filter,
+            order: plan_aggregate_order(&f.agg_order, def)?,
+            source_typmod: -1,
+            ..Default::default()
+        });
+    }
+    let (func, nargs) = aggregate_func(&name, f.agg_within_group)
+        .ok_or_else(|| Error::Unsupported(format!("aggregate {name}()")))?;
+    let fields: Vec<RowField> = def
+        .columns
+        .iter()
+        .map(|c| (c.name.clone(), c.field(), c.pg_type.clone()))
+        .collect();
+    let mut sample = Document::new();
+    for c in &def.columns {
+        sample.insert(c.field(), sample_value_for_type(&c.pg_type));
+    }
+    // (field, type, typmod, expression) for one argument node.
+    let resolve = |node: &pg_query::protobuf::Node,
+                   slot: String|
+     -> Result<(String, Option<String>, i32, Option<ColumnExpr>)> {
+        if let Some(N::ColumnRef(c)) = node.node.as_ref() {
+            if let Some(col) = column_ref_name(c) {
+                let column = def
+                    .column(&col)
+                    .ok_or_else(|| Error::UndefinedColumn(col.clone()))?;
+                return Ok((
+                    column.field(),
+                    Some(column.pg_type.clone()),
+                    column.typmod,
+                    None,
+                ));
+            }
+        }
+        let expr = row_column_expr(node, &fields, params, &sample)?;
+        let ty = match &expr {
+            ColumnExpr::Row { result_type, .. } => result_type.clone(),
+            _ => "text".to_string(),
+        };
+        Ok((slot, Some(ty), -1, Some(expr)))
+    };
+    let mut item = AggItem {
+        func,
+        out,
+        distinct: f.agg_distinct,
+        filter,
+        source_typmod: -1,
+        ..Default::default()
+    };
+    if f.agg_within_group {
+        // `percentile_cont(0.5) WITHIN GROUP (ORDER BY v)`: the ordered
+        // argument is `v`, sorted as written; the fraction / hypothetical
+        // row is a direct argument.
+        let [sort] = f.agg_order.as_slice() else {
+            return Err(Error::Unsupported(format!(
+                "{name}() WITHIN GROUP over more than one column"
+            )));
+        };
+        let Some(N::SortBy(sb)) = sort.node.as_ref() else {
+            return Err(Error::Unsupported("this WITHIN GROUP clause".into()));
+        };
+        let node = sb
+            .node
+            .as_deref()
+            .ok_or_else(|| Error::Parse("an empty WITHIN GROUP".into()))?;
+        let (field, ty, typmod, expr) = resolve(node, format!("__agg{index}"))?;
+        let ascending = !matches!(
+            SortByDir::try_from(sb.sortby_dir),
+            Ok(SortByDir::SortbyDesc)
+        );
+        let nulls = match SortByNulls::try_from(sb.sortby_nulls) {
+            Ok(SortByNulls::SortbyNullsFirst) => Nulls::First,
+            Ok(SortByNulls::SortbyNullsLast) => Nulls::Last,
+            _ if ascending => Nulls::Last,
+            _ => Nulls::First,
+        };
+        if f.args.len() != nargs {
+            return Err(Error::UndefinedFunction(format!(
+                "function {name}({}) does not exist",
+                vec!["unknown"; f.args.len()].join(", ")
+            )));
+        }
+        item.direct = f
+            .args
+            .iter()
+            .map(|a| const_value(a, params))
+            .collect::<Result<_>>()?;
+        item.order = vec![OrderKey {
+            field: field.clone(),
+            ascending,
+            nulls,
+            expr: None,
+        }];
+        item.field = Some(field);
+        item.source_type = ty;
+        item.source_typmod = typmod;
+        item.expr = expr;
+        return Ok(item);
+    }
+    if f.args.len() != nargs {
+        if func == AggFunc::StringAgg {
             return Err(Error::Unsupported(
                 "string_agg takes a value and a separator".into(),
             ));
         }
-        Some(const_value(&f.args[1], params)?)
-    } else {
-        None
-    };
-    let out = format!("__having{index}");
-    if name == "count" && f.agg_star {
-        return Ok(AggItem {
-            func: AggFunc::CountStar,
-            field: None,
-            out,
-            source_type: None,
-            expr: None,
-            distinct: f.agg_distinct,
-            filter,
-            sep: None,
-            order,
-            source_typmod: -1,
-        });
-    }
-    let func = match name.as_str() {
-        "count" => AggFunc::Count,
-        "sum" => AggFunc::Sum,
-        "min" => AggFunc::Min,
-        "max" => AggFunc::Max,
-        "array_agg" => AggFunc::ArrayAgg,
-        "bool_and" => AggFunc::BoolAnd,
-        "bool_or" => AggFunc::BoolOr,
-        "avg" => AggFunc::Avg,
-        "string_agg" => AggFunc::StringAgg,
-        other => return Err(Error::Unsupported(format!("aggregate {other}()"))),
-    };
-    if f.args.len() != usize::from(func == AggFunc::StringAgg) + 1 {
         return Err(Error::Unsupported(
-            "an aggregate with more than one argument".into(),
+            "an aggregate with this many arguments".into(),
         ));
     }
-    let Some(N::ColumnRef(c)) = f.args[0].node.as_ref() else {
-        return Err(Error::Unsupported(
-            "this aggregate argument in HAVING".into(),
-        ));
-    };
-    let col = column_ref_name(c).ok_or_else(|| Error::Unsupported("this HAVING term".into()))?;
-    let column = def
-        .column(&col)
-        .ok_or_else(|| Error::UndefinedColumn(col.clone()))?;
-    Ok(AggItem {
-        func,
-        field: Some(column.field()),
-        out,
-        source_type: Some(column.pg_type.clone()),
-        expr: None,
-        distinct: f.agg_distinct,
-        filter,
-        sep,
-        order,
-        source_typmod: column.typmod,
-    })
+    item.order = plan_aggregate_order(&f.agg_order, def)?;
+    let (field, ty, typmod, expr) = resolve(&f.args[0], format!("__agg{index}"))?;
+    item.field = Some(field);
+    item.source_type = ty;
+    item.source_typmod = typmod;
+    item.expr = expr;
+    if func == AggFunc::StringAgg {
+        item.sep = Some(const_value(&f.args[1], params)?);
+    } else if nargs == 2 {
+        let (field2, ty2, _, expr2) = resolve(&f.args[1], format!("__agg{index}_2"))?;
+        item.field2 = Some(field2);
+        item.source_type2 = ty2;
+        item.expr2 = expr2;
+    }
+    if matches!(func, AggFunc::BitAnd | AggFunc::BitOr)
+        && !matches!(
+            item.source_type.as_deref(),
+            Some("int2" | "int4" | "int8" | "smallint" | "integer" | "bigint" | "bit" | "varbit")
+        )
+    {
+        return Err(Error::UndefinedFunction(format!(
+            "function {name}({}) does not exist",
+            display_type(item.source_type.as_deref().unwrap_or("unknown"))
+        )));
+    }
+    if func == AggFunc::StringAgg
+        && !matches!(
+            item.source_type.as_deref(),
+            Some("text" | "varchar" | "bpchar" | "name" | "char")
+        )
+        && item.expr.is_none()
+    {
+        // PostgreSQL has no `string_agg(integer, ...)`: it is a missing
+        // FUNCTION, not an unsupported one.
+        return Err(Error::UndefinedFunction(format!(
+            "function string_agg({}, unknown) does not exist",
+            item.source_type.as_deref().unwrap_or("unknown")
+        )));
+    }
+    Ok(item)
 }
 
 /// Replace every aggregate call inside `node` with a reference to a slot
@@ -7588,15 +7771,17 @@ fn extract_aggregates(
     if let Some(N::FuncCall(f)) = node.node.as_ref() {
         if is_aggregate_call(f) {
             let f = f.clone();
-            let item = plan_bare_aggregate(&f, def, items.len(), params)?;
-            let index = match items.iter().position(|existing| {
-                existing.func == item.func
-                    && existing.field == item.field
-                    && existing.distinct == item.distinct
-                    && existing.filter == item.filter
-                    && existing.sep == item.sep
-                    && existing.order == item.order
-            }) {
+            let item = plan_aggregate_item(
+                &f,
+                def,
+                items.len(),
+                params,
+                format!("__having{}", items.len()),
+            )?;
+            let index = match items
+                .iter()
+                .position(|existing| same_aggregate(existing, &item))
+            {
                 Some(i) => i,
                 None => {
                     items.push(item);
@@ -7667,7 +7852,7 @@ fn column_ref_node(name: &str) -> pg_query::protobuf::Node {
 }
 
 /// The PostgreSQL type one aggregate item answers.
-fn aggregate_item_type(item: &AggItem) -> String {
+pub fn aggregate_item_type(item: &AggItem) -> String {
     match item.func {
         AggFunc::CountStar | AggFunc::Count => "int8".to_string(),
         AggFunc::Sum => sum_result_type(item.source_type.as_deref()).to_string(),
@@ -7679,6 +7864,53 @@ fn aggregate_item_type(item: &AggItem) -> String {
         AggFunc::ArrayAgg => format!("{}[]", item.source_type.as_deref().unwrap_or("text")),
         AggFunc::BoolAnd | AggFunc::BoolOr => "bool".to_string(),
         AggFunc::StringAgg => "text".to_string(),
+        AggFunc::VarSamp | AggFunc::VarPop | AggFunc::StddevSamp | AggFunc::StddevPop => {
+            match item.source_type.as_deref() {
+                Some("float4" | "float8" | "real" | "double precision") => "float8".to_string(),
+                _ => "numeric".to_string(),
+            }
+        }
+        AggFunc::JsonAgg | AggFunc::JsonObjectAgg => "json".to_string(),
+        AggFunc::JsonbAgg | AggFunc::JsonbObjectAgg => "jsonb".to_string(),
+        AggFunc::RegrCount | AggFunc::HypRank | AggFunc::HypDenseRank => "int8".to_string(),
+        AggFunc::Corr
+        | AggFunc::CovarPop
+        | AggFunc::CovarSamp
+        | AggFunc::RegrAvgX
+        | AggFunc::RegrAvgY
+        | AggFunc::RegrSxx
+        | AggFunc::RegrSyy
+        | AggFunc::RegrSxy
+        | AggFunc::RegrSlope
+        | AggFunc::RegrIntercept
+        | AggFunc::RegrR2
+        | AggFunc::HypPercentRank
+        | AggFunc::HypCumeDist => "float8".to_string(),
+        AggFunc::PercentileCont => {
+            let base = if item.source_type.as_deref() == Some("interval") {
+                "interval"
+            } else {
+                "float8"
+            };
+            if matches!(item.direct.first(), Some(Bson::Array(_))) {
+                format!("{base}[]")
+            } else {
+                base.to_string()
+            }
+        }
+        AggFunc::PercentileDisc | AggFunc::Mode | AggFunc::BitAnd | AggFunc::BitOr => {
+            let base = item
+                .source_type
+                .clone()
+                .unwrap_or_else(|| "text".to_string());
+            if item.func == AggFunc::PercentileDisc
+                && matches!(item.direct.first(), Some(Bson::Array(_)))
+            {
+                format!("{base}[]")
+            } else {
+                base
+            }
+        }
     }
 }
 
@@ -9331,6 +9563,7 @@ fn plan_aggregate(
                 sep: None,
                 order: Vec::new(),
                 source_typmod: -1,
+                ..Default::default()
             });
         }
         // The WHERE clause was silently dropped here before: `count(*)
@@ -9832,23 +10065,7 @@ pub fn aggregate_output_def(agg: &Aggregate) -> Result<TableDef> {
         let ty = match col {
             OutputCol::Group(i) => agg.group_by[*i].pg_type.clone(),
             OutputCol::Expr(i) => column_expr_type(&agg.exprs[*i]).to_string(),
-            OutputCol::Agg(i) => {
-                let item = &agg.items[*i];
-                match item.func {
-                    AggFunc::CountStar | AggFunc::Count => "int8".to_string(),
-                    AggFunc::Sum => sum_result_type(item.source_type.as_deref()).to_string(),
-                    AggFunc::Min | AggFunc::Max => item
-                        .source_type
-                        .clone()
-                        .unwrap_or_else(|| "text".to_string()),
-                    AggFunc::ArrayAgg => {
-                        format!("{}[]", item.source_type.as_deref().unwrap_or("text"))
-                    }
-                    AggFunc::BoolAnd | AggFunc::BoolOr => "bool".to_string(),
-                    AggFunc::Avg => avg_result_type(item.source_type.as_deref()).to_string(),
-                    AggFunc::StringAgg => "text".to_string(),
-                }
-            }
+            OutputCol::Agg(i) => aggregate_item_type(&agg.items[*i]),
         };
         columns.push(Column::new(out, &ty, false));
     }
@@ -10174,123 +10391,14 @@ fn finish_aggregate(
         match rt.val.as_ref().and_then(|v| v.node.as_ref()) {
             Some(N::FuncCall(f)) if is_aggregate_call(f) => {
                 let name = func_name(f).unwrap_or_default();
-                let agg_filter = match f.agg_filter.as_deref() {
-                    None => None,
-                    Some(node) => Some(lower_where(node, &def, params)?),
-                };
-                let agg_order = plan_aggregate_order(&f.agg_order, &def)?;
-                let mut agg_sep = None;
-                if name == "string_agg" {
-                    if f.args.len() != 2 {
-                        return Err(Error::Unsupported(
-                            "string_agg takes a value and a separator".into(),
-                        ));
-                    }
-                    agg_sep = Some(const_value(&f.args[1], params)?);
-                }
-                let (func, field, source_type) = if name == "count" && f.agg_star {
-                    (AggFunc::CountStar, None, None)
-                } else {
-                    let func = match name.as_str() {
-                        "count" => AggFunc::Count,
-                        "sum" => AggFunc::Sum,
-                        "min" => AggFunc::Min,
-                        "max" => AggFunc::Max,
-                        "array_agg" => AggFunc::ArrayAgg,
-                        "bool_and" => AggFunc::BoolAnd,
-                        "bool_or" => AggFunc::BoolOr,
-                        "avg" => AggFunc::Avg,
-                        "string_agg" => AggFunc::StringAgg,
-                        other => return Err(Error::Unsupported(format!("aggregate {other}()"))),
-                    };
-                    if f.args.len() != usize::from(func == AggFunc::StringAgg) + 1 {
-                        return Err(Error::Unsupported(
-                            "an aggregate with more than one argument".into(),
-                        ));
-                    }
-                    let col = match f.args[0].node.as_ref() {
-                        // The LAST field is the column: `max(t.n)` is `n`
-                        // qualified by the relation, and PostgreSQL resolves it
-                        // that way everywhere. Reading the FIRST field here
-                        // made every qualified aggregate argument answer
-                        // `42703 column "t" does not exist` -- over a plain
-                        // table as much as over a subquery, and for as long as
-                        // aggregates have existed.
-                        Some(N::ColumnRef(c)) => column_ref_name(c)
-                            .ok_or_else(|| Error::Unsupported("this aggregate argument".into()))?,
-                        Some(_) => {
-                            let expr = row_column_expr(&f.args[0], &fields, params, &sample)?;
-                            let pg_type = match &expr {
-                                ColumnExpr::Row { result_type, .. } => result_type.clone(),
-                                _ => "text".to_string(),
-                            };
-                            let slot = format!("__agg{}", items.len());
-                            let out = if rt.name.is_empty() {
-                                name.clone()
-                            } else {
-                                rt.name.clone()
-                            };
-                            select.push((out.clone(), OutputCol::Agg(items.len())));
-                            items.push(AggItem {
-                                func,
-                                field: Some(slot),
-                                out,
-                                source_type: Some(pg_type),
-                                expr: Some(expr),
-                                distinct: f.agg_distinct,
-                                filter: agg_filter.clone(),
-                                sep: agg_sep.clone(),
-                                order: agg_order.clone(),
-                                source_typmod: -1,
-                            });
-                            continue;
-                        }
-                        None => {
-                            return Err(Error::Unsupported(
-                                "an aggregate over an expression".into(),
-                            ))
-                        }
-                    };
-                    let column = def
-                        .column(&col)
-                        .ok_or_else(|| Error::UndefinedColumn(col.clone()))?;
-                    (func, Some(column.field()), Some(column.pg_type.clone()))
-                };
-                let source_field = field.clone();
                 let out = if rt.name.is_empty() {
                     name.clone()
                 } else {
                     rt.name.clone()
                 };
-                select.push((out.clone(), OutputCol::Agg(items.len())));
-                if func == AggFunc::StringAgg
-                    && !matches!(
-                        source_type.as_deref(),
-                        Some("text" | "varchar" | "bpchar" | "name" | "char")
-                    )
-                {
-                    // PostgreSQL has no `string_agg(integer, ...)`: it is a
-                    // missing FUNCTION, not an unsupported one.
-                    return Err(Error::UndefinedFunction(format!(
-                        "function string_agg({}, unknown) does not exist",
-                        source_type.as_deref().unwrap_or("unknown")
-                    )));
-                }
-                items.push(AggItem {
-                    func,
-                    field,
-                    out,
-                    source_type,
-                    expr: None,
-                    distinct: f.agg_distinct,
-                    filter: agg_filter,
-                    sep: agg_sep,
-                    order: agg_order,
-                    source_typmod: source_field
-                        .as_deref()
-                        .and_then(|f| def.columns.iter().find(|c| c.field() == *f))
-                        .map_or(-1, |c| c.typmod),
-                });
+                let item = plan_aggregate_item(f, &def, items.len(), params, out.clone())?;
+                select.push((out, OutputCol::Agg(items.len())));
+                items.push(item);
             }
             Some(N::ColumnRef(c)) => {
                 // The LAST name part: `c.a` is the column `a` qualified by its
@@ -10518,20 +10626,9 @@ fn node_print(node: &pg_query::protobuf::Node) -> String {
 /// Is this call one of the aggregates this planner lowers?
 fn is_aggregate_call(f: &pg_query::protobuf::FuncCall) -> bool {
     f.agg_star
-        || matches!(
-            func_name(f).as_deref(),
-            Some(
-                "count"
-                    | "sum"
-                    | "min"
-                    | "max"
-                    | "array_agg"
-                    | "avg"
-                    | "bool_and"
-                    | "bool_or"
-                    | "string_agg"
-            )
-        )
+        || func_name(f)
+            .as_deref()
+            .is_some_and(|n| aggregate_func(n, f.agg_within_group).is_some())
 }
 
 /// The session functions a connecting client asks for.
@@ -16127,6 +16224,11 @@ fn parse_uuid(s: &str) -> Option<String> {
 /// The instant behind a value that names one: a BSON date, the sub-millisecond
 /// composite, or the canonical text a date / timestamp / timestamptz is stored
 /// as. Returns `None` for anything that is not a moment in time.
+/// `instant_micros` for the server: a stored timestamp's UTC microseconds.
+pub fn instant_micros_pub(v: &Bson) -> Option<i64> {
+    instant_micros(v)
+}
+
 fn instant_micros(v: &Bson) -> Option<i64> {
     match v {
         Bson::DateTime(d) => Some(d.timestamp_millis() * 1000),
@@ -18400,6 +18502,24 @@ pub fn lower_where(
     def: &TableDef,
     params: &[Bson],
 ) -> Result<Document> {
+    // A predicate over no column -- `WHERE false`, `WHERE $1` -- is decided
+    // once: every row, or none (NULL is none).
+    if matches!(
+        node.node.as_ref(),
+        Some(N::AConst(_) | N::TypeCast(_) | N::ParamRef(_))
+    ) && !references_columns(node)
+    {
+        return Ok(match const_value(node, params)? {
+            Bson::Boolean(true) => Document::new(),
+            Bson::Boolean(false) | Bson::Null => doc! { "_id": { "$in": [] } },
+            other => {
+                return Err(Error::DatatypeMismatch(format!(
+                    "argument of WHERE must be type boolean, not type {}",
+                    inferred_type(&other)
+                )))
+            }
+        });
+    }
     match node.node.as_ref() {
         Some(N::AExpr(e)) => lower_aexpr(e, def, params),
         Some(N::NullTest(t)) => {
