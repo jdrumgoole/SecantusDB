@@ -4190,3 +4190,112 @@ def test_unregistered_parameter_is_refused_not_silently_accepted(
             assert f"unrecognized parameter [{name}]" in caught.value.details["errmsg"]
     finally:
         client.close()
+
+
+# ---------------------------------------------------------------------------
+# helloOk: the flag that decides whether a driver uses `hello` or `isMaster`
+# ---------------------------------------------------------------------------
+
+
+def _op_query_handshake(host: str, port: int, *, ask_hello_ok: bool) -> dict:
+    """Send the initial OP_QUERY handshake and return the decoded reply.
+
+    Deliberately raw rather than through pymongo: this is the ONE exchange that
+    decides whether the driver will speak `hello` or the legacy `isMaster` for
+    the rest of the connection, and pymongo's own handshake hides it.
+    """
+    import struct
+
+    import bson
+
+    request: dict = {"isMaster": 1}
+    if ask_hello_ok:
+        request["helloOk"] = True
+    request["client"] = {
+        "driver": {"name": "differential-gate", "version": "1"},
+        "os": {"type": sys.platform},
+    }
+    doc = bson.encode(request)
+    body = struct.pack("<i", 0) + b"admin.$cmd\x00" + struct.pack("<ii", 0, -1) + doc
+    message = struct.pack("<iiii", 16 + len(body), 1, 0, 2004) + body
+
+    sock = socket.create_connection((host, port), timeout=10)
+    try:
+        sock.sendall(message)
+        head = b""
+        while len(head) < 16:
+            chunk = sock.recv(16 - len(head))
+            if not chunk:
+                raise AssertionError("connection closed during the handshake")
+            head += chunk
+        length = struct.unpack_from("<i", head, 0)[0]
+        rest = b""
+        while len(rest) < length - 16:
+            chunk = sock.recv(length - 16 - len(rest))
+            if not chunk:
+                raise AssertionError("connection closed mid-reply")
+            rest += chunk
+        # OP_REPLY header: responseFlags(4) cursorID(8) startingFrom(4) numberReturned(4)
+        return bson.decode(rest[20:])
+    finally:
+        sock.close()
+
+
+def _host_port(uri: str) -> tuple[str, int]:
+    from pymongo.uri_parser import parse_uri
+
+    return parse_uri(uri)["nodelist"][0]
+
+
+@requires_mongod
+@pytest.mark.parametrize("ask_hello_ok", [True, False])
+def test_op_query_handshake_hello_ok_matches_mongod(
+    ask_hello_ok: bool, secantus_uri: str, mongod_uri: str
+) -> None:
+    """``helloOk: true`` is echoed when the client asks, and only then.
+
+    This single field decides which command a driver uses for the life of every
+    connection. A driver puts ``helloOk: true`` in its handshake to ask whether
+    the server understands the modern ``hello``; the echo says yes. Without it
+    the driver concludes the server predates ``hello`` and falls back to the
+    LEGACY ``isMaster`` — which is exactly what mongo-go-driver's SDAM monitor
+    did against SecantusDB (verified on the wire: ``isMaster exhaustAllowed``
+    to us, ``hello exhaustAllowed`` to mongod) until this landed.
+
+    Both directions are asserted. Echoing unconditionally would be just as
+    wrong as never echoing, and a test for only the positive case would not
+    see it.
+    """
+    mine = _op_query_handshake(*_host_port(secantus_uri), ask_hello_ok=ask_hello_ok)
+    theirs = _op_query_handshake(*_host_port(mongod_uri), ask_hello_ok=ask_hello_ok)
+    assert mine.get("helloOk") == theirs.get("helloOk"), (
+        f"asked={ask_hello_ok}: secantus={mine.get('helloOk')!r} mongod={theirs.get('helloOk')!r}"
+    )
+    # Guard against a vacuous pass: the reference must actually differ between
+    # the two branches, or this test proves nothing.
+    assert theirs.get("helloOk") is (True if ask_hello_ok else None)
+
+
+@requires_mongod
+@pytest.mark.parametrize("command", ["hello", "isMaster"])
+@pytest.mark.parametrize("ask_hello_ok", [True, False])
+def test_op_msg_hello_ok_matches_mongod(
+    command: str, ask_hello_ok: bool, secantus_uri: str, mongod_uri: str
+) -> None:
+    """The same echo rule over OP_MSG, for both command spellings."""
+    from pymongo import MongoClient
+
+    def answer(uri: str) -> object:
+        client = MongoClient(uri, serverSelectionTimeoutMS=10000)
+        try:
+            request: dict = {command: 1}
+            if ask_hello_ok:
+                request["helloOk"] = True
+            return client.admin.command(request).get("helloOk")
+        finally:
+            client.close()
+
+    mine = answer(secantus_uri)
+    theirs = answer(mongod_uri)
+    assert mine == theirs, f"{command} asked={ask_hello_ok}: secantus={mine!r} mongod={theirs!r}"
+    assert theirs is (True if ask_hello_ok else None)

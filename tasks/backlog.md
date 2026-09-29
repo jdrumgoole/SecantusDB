@@ -3005,19 +3005,34 @@ These are explicit non-goals. Don't add them without a reason.
         We refuse the parameters deliberately rather than accepting names we do
         not honour; see the `$where` item.
 
-      * **`TestSDAMProse/heartbeats_processed_more_frequently` has nothing to do
-        with `setParameter`** — the entry guessed "almost certainly" and the
-        guess was wrong. Measured 2026-09-29 against the Rust server: it fails
-        `expected number of messages to be in range [6, 10], got 12 (num nodes =
-        1, duration = 2.000205375s, interval = 500ms)`. The driver counts the
-        messages IT sent over 2s at a 500ms heartbeat interval; the formula is
-        `N * (2 handshakes + D/I heartbeats + D/I RTTs)` = 10, and we provoke
-        12. That is an SDAM fidelity question about our handshake — two extra
-        round trips per node — not a missing command. **Open and undiagnosed**;
-        the next step is to capture what the driver actually sends (it is the
-        client side that is counted, so the answer is in what our `hello` reply
-        makes it do — `topologyVersion` / awaitable-hello support is the first
-        thing to check).
+      * **`TestSDAMProse/heartbeats_processed_more_frequently` — still OPEN,
+        with two causes now RULED OUT by probe.** The entry originally blamed
+        `setParameter` ("almost certainly"); it is not that. It is also not
+        `helloOk`, which the 2026-09-29 investigation found and fixed along the
+        way — a real bug with broad reach, just not this one.
+
+        It fails `expected number of messages to be in range [6, 10], got 12
+        (num nodes = 1, duration = 2.0s, interval = 500ms)`. The driver counts
+        the messages IT sent; the formula is
+        `N * (2 handshakes + D/I heartbeats + D/I RTTs)` = 10.
+
+        What is established:
+        - mongod PASSES the same test on this box, so it is our divergence.
+        - Before the `helloOk` fix the Go monitor spoke LEGACY `isMaster` to us
+          and modern `hello` to mongod (captured on the wire through a logging
+          proxy). After the fix it speaks `hello` to both — and the count is
+          STILL 12, so the command spelling was not the cause.
+        - The streaming-SDAM path (`stream_awaitable_hello`, gated on
+          `exhaustAllowed`) is implemented, and the driver does take it.
+        - A plain AWAITABLE hello — `topologyVersion` + `maxAwaitTimeMS`
+          WITHOUT `exhaustAllowed` — returns immediately here where mongod
+          blocks for the full budget (0.3ms vs 502ms, measured). That is a
+          second real divergence, not yet shown to cause this failure, and it
+          is the most promising remaining lead.
+
+        Next step: capture BOTH servers' monitor traffic through one proxy and
+        diff the message SEQUENCES rather than the totals — the gap is 2
+        messages, the size of one extra handshake pair.
 
       * **`replSetStepDown` answers 59 CommandNotFound here. Which mongod
         answer is right depends on the persona, and ours is a REPLICA SET**
