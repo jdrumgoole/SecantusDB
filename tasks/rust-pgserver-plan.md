@@ -1,5 +1,22 @@
 # Plan: a Rust PostgreSQL server
 
+> **Status: P0/P1/P5/P7 LANDED; the QUERY LANGUAGE caught up on 2026-09-28.**
+> Everything below the next paragraph is the 2026-08-31 spike write-up and is
+> kept as the record of how the premise was established. **It is not a
+> description of what the server does now** — read `tasks/backlog.md`'s
+> Rust-pgserver entries and `CLAUDE.md` for that, both of which carry measured
+> numbers.
+>
+> Landed 2026-09-28, each against a live PostgreSQL 14.13 and each with its own
+> differential corpus under `tools/probes/pg_corpora/`: subqueries and CTEs
+> (uncorrelated; #1620), window functions (#1621), `ALTER TABLE` and `RENAME`
+> (#1625), sequences and identity columns (#1627), and `information_schema`
+> plus the catalog views (#1632). The psycopg gauge is 5,544 passed / 0 failed.
+> Still refused, by name: correlated subqueries, `CREATE INDEX`, `CREATE VIEW`,
+> `EXPLAIN`, a window over an aggregate.
+>
+> **Original 2026-08-31 header follows.**
+>
 > **Status: P0 PASSED, P1 LANDED, P5 STARTED, P7 LANDED, 2026-08-31.**
 > P7 (extended protocol) is done — see §0.8. It was pulled forward ahead of the
 > rest of P5 because it was not a missing feature but a WRONG ANSWER, and
