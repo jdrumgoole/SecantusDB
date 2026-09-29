@@ -493,7 +493,54 @@ def render(
         panels.append(_render_validation_panel(name, stats))
     for s in SMOKE_PANELS:
         panels.append(_render_smoke_panel(s))
-    return '<div class="drivers">\n' + "\n".join(panels) + "</div>\n\n" + _GRID_FOOT
+    return '<div class="drivers">\n' + "\n".join(panels) + "</div>\n"
+
+
+#: Heading shown above each grid in `render_both`. The Rust servers are what
+#: the site leads with, so they come first; the Python row is labelled as the
+#: reference implementation rather than left to be inferred from its position.
+_GRID_LABELS = {
+    "rust": (
+        "Rust MongoDB server",
+        "The flagship — the server these numbers are measured against by default.",
+    ),
+    "python": (
+        "Python reference server",
+        "The reference implementation the Rust server is held to, run through the "
+        "same unmodified suites.",
+    ),
+}
+
+
+def render_both(
+    raw_dir: Path,
+    *,
+    allow_stale: bool = False,
+    max_spread_days: float = 7.0,
+) -> str:
+    """Both servers' grids, one above the other, each labelled.
+
+    Published together rather than choosing one, because the interesting fact
+    is that they AGREE: the Rust server reaching pymongo parity with the Python
+    reference is the claim the project actually makes, and a single grid cannot
+    show it. Each half is guarded independently, so a stale or empty artifact on
+    either side refuses the whole page rather than publishing one fresh grid
+    beside one that is not.
+    """
+    parts: list[str] = []
+    for server in ("rust", "python"):
+        title, blurb = _GRID_LABELS[server]
+        parts.append(
+            f'<h3 class="drivers-grid-label">{escape(title)}</h3>\n'
+            f'<p class="drivers-grid-note">{escape(blurb)}</p>\n'
+            + render(
+                raw_dir,
+                server,
+                allow_stale=allow_stale,
+                max_spread_days=max_spread_days,
+            )
+        )
+    return "\n".join(parts) + "\n" + _GRID_FOOT
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -521,7 +568,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--server",
-        choices=("python", "rust"),
+        choices=("python", "rust", "both"),
         default="python",
         help=(
             "Which server's gauge artifacts to read: 'python' uses e.g. "
@@ -547,7 +594,10 @@ def main(argv: list[str] | None = None) -> int:
     if not args.just_print and args.out is None:
         parser.error("--out is required unless --print is set")
 
-    html = render(args.raw_dir, args.server, allow_stale=args.allow_stale)
+    if args.server == "both":
+        html = render_both(args.raw_dir, allow_stale=args.allow_stale)
+    else:
+        html = render(args.raw_dir, args.server, allow_stale=args.allow_stale)
     if args.just_print:
         sys.stdout.write(html)
         return 0

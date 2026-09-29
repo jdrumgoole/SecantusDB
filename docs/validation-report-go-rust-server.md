@@ -1,33 +1,39 @@
 # mongo-go-driver Validation Report
 
-Generated 2026-09-28 — SecantusDB 0.6.0b17 vs mongo-go-driver fd85a834c40e (`vendor/mongo-go-driver/`).
+Generated 2026-09-29 — SecantusDB 0.6.0b17 vs mongo-go-driver fd85a834c40e (`vendor/mongo-go-driver/`).
 
 Run `uv run python -m invoke validate-go` to refresh. The pass rate is the analogue of the pymongo conformance gauge for the official Go driver — same shape, different wire-protocol pickiness. Type-strict bugs (int32 vs int64) that pymongo accepts silently fail loudly here.
-
-> **THIS RUN WAS TRUNCATED — the pass rate below is not a**
-> **conformance result.** The test binary stopped before
-> every test reported, so the rate describes only the
-> subset that finished. Fix the cause and re-run before
-> quoting any number from this file.
->
-> Started but never completed (5):
->
-> ```
-> go.mongodb.org/mongo-driver/v2/internal/integration::TestClient_BSONOptions
-> go.mongodb.org/mongo-driver/v2/internal/integration::TestCommandLoggingAndMonitoringProse
-> go.mongodb.org/mongo-driver/v2/internal/integration::TestInitialDNSSeedlistDiscoverySpec
-> go.mongodb.org/mongo-driver/v2/internal/integration::TestInitialDNSSeedlistDiscoverySpec/replica_set
-> go.mongodb.org/mongo-driver/v2/internal/integration::TestInitialDNSSeedlistDiscoverySpec/replica_set/txt-record-with-overridden-ssl-option.json
-> ```
-> Packages reporting `fail` with no failing test beneath them (a binary that died without accounting for its tests): internal/integration
 
 ## Summary by package
 
 | Package | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
-| `internal/integration` | 397 | 0 | 37 | 434 | 100.0% |
+| `internal/integration` | 552 | 16 | 49 | 617 | 97.1% |
 | `internal/integration/unified` | 42 | 0 | 0 | 42 | 100.0% |
-| **Overall** | **439** | **0** | **37** | **476** | **100.0%** |
+| **Overall** | **594** | **16** | **49** | **659** | **97.3%** |
+
+## Failures (16)
+
+First 30 failed tests for triage:
+
+```
+internal/integration :: TestConnectionsSurvivePrimaryStepDown/getMore_iteration
+internal/integration :: TestConnectionsSurvivePrimaryStepDown
+internal/integration :: TestRetryableReadsProse/retrying_reads_in_a_replica_set/overload_errors_retried_on_a_different_replicaset_server
+internal/integration :: TestRetryableReadsProse/retrying_reads_in_a_replica_set
+internal/integration :: TestRetryableReadsProse
+internal/integration :: TestSDAMErrorHandling/after_handshake_completes/network_errors/pool_not_cleared_on_timeout_network_error
+internal/integration :: TestSDAMErrorHandling/after_handshake_completes/network_errors/pool_not_cleared_on_context_cancellation
+internal/integration :: TestSDAMErrorHandling/after_handshake_completes/network_errors
+internal/integration :: TestSDAMErrorHandling/after_handshake_completes
+internal/integration :: TestSDAMErrorHandling
+internal/integration :: TestSDAMProse/heartbeats_processed_more_frequently
+internal/integration :: TestSDAMProse
+internal/integration :: TestConnectionPoolBackpressure
+internal/integration :: TestSessionsMongocryptdProse/18._implicit_session_is_ignored_if_connection_does_not_support_sessions
+internal/integration :: TestSessionsMongocryptdProse/19._explicit_session_raises_an_error_if_connection_does_not_support_sessions
+internal/integration :: TestSessionsMongocryptdProse
+```
 
 ## How this is generated
 
