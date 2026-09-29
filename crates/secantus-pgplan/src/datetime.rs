@@ -2118,9 +2118,101 @@ pub fn to_timestamp_text(input: &str, fmt: &str) -> Result<Bson> {
 // ------------------------------------------------------------------------
 
 /// The functions routed here, with their static result types.
+/// The zone an `AT TIME ZONE` names: a zone name, an abbreviation (`EST`,
+/// offset east), a POSIX-style offset (`+05`, `utc+3` -- hours WEST, the
+/// reverse of an ISO offset), or an interval (east). 22023 otherwise.
+fn zone_of(zone: &Bson) -> Result<crate::TimeZoneSetting> {
+    let fixed = |east: i64| -> Result<crate::TimeZoneSetting> {
+        i32::try_from(east)
+            .ok()
+            .and_then(chrono::FixedOffset::east_opt)
+            .map(crate::TimeZoneSetting::Fixed)
+            .ok_or_else(|| Error::InvalidParameter("time zone displacement out of range".into()))
+    };
+    if let Some(iv) = crate::Interval::from_bson(zone) {
+        if iv.months != 0 || iv.days != 0 {
+            return Err(Error::InvalidParameter(format!(
+                "interval time zone \"{}\" must not include months or days",
+                crate::interval_value_text(zone).unwrap_or_default()
+            )));
+        }
+        return fixed(iv.micros / 1_000_000);
+    }
+    let text = crate::value_text(zone);
+    let t = text.trim();
+    if t.eq_ignore_ascii_case("utc") || t.eq_ignore_ascii_case("gmt") || t.eq_ignore_ascii_case("z")
+    {
+        return Ok(crate::TimeZoneSetting::Utc);
+    }
+    if let Some(tz) = crate::dtparse::resolve_zone(t) {
+        return Ok(crate::TimeZoneSetting::Named(tz));
+    }
+    if let Some(east) = crate::dtparse::abbreviation_offset(t) {
+        return fixed(i64::from(east));
+    }
+    // POSIX: an optional name, then [+-]hh[:mm[:ss]], positive meaning WEST.
+    let body = t.trim_start_matches(|c: char| c.is_ascii_alphabetic());
+    let (sign, digits) = match body.strip_prefix('-') {
+        Some(rest) => (-1, rest),
+        None => (1, body.strip_prefix('+').unwrap_or(body)),
+    };
+    let parts: Vec<&str> = digits.split(':').collect();
+    if !digits.is_empty()
+        && parts.len() <= 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    {
+        let n: Vec<i64> = parts.iter().map(|p| p.parse().unwrap_or(0)).collect();
+        let west =
+            n[0] * 3600 + n.get(1).copied().unwrap_or(0) * 60 + n.get(2).copied().unwrap_or(0);
+        return fixed(-sign * west);
+    }
+    Err(Error::InvalidParameter(format!(
+        "time zone \"{t}\" not recognized"
+    )))
+}
+
+/// `timezone(zone, ts)`: a `timestamptz` read as the wall clock in `zone`
+/// (a `timestamp`), or a `timestamp` taken as wall clock in `zone` (a
+/// `timestamptz`).
+fn at_time_zone(zone: &Bson, ts: &Bson, ts_type: &str) -> Result<Bson> {
+    if *zone == Bson::Null || *ts == Bson::Null {
+        return Ok(Bson::Null);
+    }
+    let tz = zone_of(zone)?;
+    if matches!(ts_type, "timestamp" | "timestamp without time zone") {
+        let local =
+            crate::instant_micros(ts).ok_or_else(|| Error::Unsupported("this timestamp".into()))?;
+        let offset = tz.offset_for_local(local).local_minus_utc();
+        return Ok(crate::timestamptz_value_from_micros(
+            local - i64::from(offset) * 1_000_000,
+        ));
+    }
+    let utc = match crate::instant_micros(ts) {
+        Some(m) => m,
+        None => crate::instant_micros(&crate::cast_value(ts.clone(), "timestamptz")?)
+            .ok_or_else(|| Error::Unsupported("this timestamp".into()))?,
+    };
+    let offset = tz.offset_at(utc).local_minus_utc();
+    Ok(crate::timestamptz_value_from_micros(
+        utc + i64::from(offset) * 1_000_000,
+    ))
+}
+
 pub fn result_type(name: &str, arg_types: &[String]) -> Option<String> {
     let first = arg_types.first().map(String::as_str).unwrap_or("");
     let second = arg_types.get(1).map(String::as_str).unwrap_or("");
+    // `ts AT TIME ZONE z` is `timezone(z, ts)`, and it SWAPS the zone-ness.
+    if name == "timezone" && arg_types.len() == 2 {
+        return Some(
+            if matches!(second, "timestamp" | "timestamp without time zone") {
+                "timestamptz".to_string()
+            } else {
+                "timestamp".to_string()
+            },
+        );
+    }
     Some(
         match name {
             "extract" => "numeric",
@@ -2167,6 +2259,13 @@ pub fn is_datetime(t: &str) -> bool {
 pub fn call(name: &str, args: &[Bson], types: &[String]) -> Option<Result<Bson>> {
     if let Some(r) = make(name, args) {
         return Some(r);
+    }
+    if name == "timezone" && args.len() == 2 {
+        return Some(at_time_zone(
+            &args[0],
+            &args[1],
+            types.get(1).map_or("", String::as_str),
+        ));
     }
     let t = |i: usize| types.get(i).map(String::as_str).unwrap_or("");
     let strict = |args: &[Bson]| args.contains(&Bson::Null);

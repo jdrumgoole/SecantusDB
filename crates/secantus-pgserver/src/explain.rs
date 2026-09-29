@@ -270,17 +270,21 @@ pub(crate) fn render_text(
 
 /// The `QUERY PLAN` as PostgreSQL's `FORMAT JSON`: one array holding one
 /// object whose `Plan` is the tree.
-pub(crate) fn render_json(
+/// The plan as the structured formats (JSON / YAML / XML) share it: the
+/// `[{"Plan": {...}}]` value tree, keys in PostgreSQL's order.
+fn structured(
     root: &PlanNode,
     options: &ExplainOptions,
     actual_rows: Option<usize>,
-) -> String {
+) -> serde_json_lite::Value {
+    use serde_json_lite::Value;
     fn node(
         n: &PlanNode,
         options: &ExplainOptions,
         actual: Option<usize>,
-    ) -> serde_json_lite::Value {
-        let mut fields: Vec<(String, serde_json_lite::Value)> = Vec::new();
+        relationship: Option<&str>,
+    ) -> Value {
+        let mut fields: Vec<(String, Value)> = Vec::new();
         let node_type = n
             .name
             .split(" on ")
@@ -290,62 +294,191 @@ pub(crate) fn render_json(
             .next()
             .unwrap_or(&n.name)
             .to_string();
-        fields.push(("Node Type".into(), serde_json_lite::Value::Str(node_type)));
+        fields.push(("Node Type".into(), Value::Str(node_type.clone())));
+        if let Some(r) = relationship {
+            fields.push(("Parent Relationship".into(), Value::Str(r.into())));
+        }
+        fields.push(("Parallel Aware".into(), Value::Num("false".into())));
+        fields.push(("Async Capable".into(), Value::Num("false".into())));
         for (k, v) in &n.props {
-            fields.push((k.clone(), serde_json_lite::Value::Str(v.clone())));
+            fields.push((k.clone(), Value::Str(v.clone())));
+        }
+        // A scanned relation's alias is its name unless the plan named one.
+        if n.props.iter().any(|(k, _)| k == "Relation Name")
+            && !n.props.iter().any(|(k, _)| k == "Alias")
+        {
+            let rel = n
+                .props
+                .iter()
+                .find(|(k, _)| k == "Relation Name")
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default();
+            fields.push(("Alias".into(), Value::Str(rel)));
         }
         for (k, v) in &n.details {
             let value = if k.ends_with("Key") {
-                serde_json_lite::Value::Arr(
-                    v.split(", ")
-                        .map(|s| serde_json_lite::Value::Str(s.to_string()))
-                        .collect(),
-                )
+                Value::Arr(v.split(", ").map(|s| Value::Str(s.to_string())).collect())
             } else {
-                serde_json_lite::Value::Str(v.clone())
+                Value::Str(v.clone())
             };
             fields.push((k.clone(), value));
         }
         if options.costs {
             for k in ["Startup Cost", "Total Cost"] {
-                fields.push((k.into(), serde_json_lite::Value::Num("0.00".into())));
+                fields.push((k.into(), Value::Num("0.00".into())));
             }
             for k in ["Plan Rows", "Plan Width"] {
-                fields.push((k.into(), serde_json_lite::Value::Num("0".into())));
+                fields.push((k.into(), Value::Num("0".into())));
             }
         }
         if let Some(rows) = actual {
-            fields.push((
-                "Actual Rows".into(),
-                serde_json_lite::Value::Num(rows.to_string()),
-            ));
-            fields.push((
-                "Actual Loops".into(),
-                serde_json_lite::Value::Num("1".into()),
-            ));
+            fields.push(("Actual Rows".into(), Value::Num(rows.to_string())));
+            fields.push(("Actual Loops".into(), Value::Num("1".into())));
         }
         if !n.children.is_empty() {
-            fields.push((
-                "Plans".into(),
-                serde_json_lite::Value::Arr(
-                    n.children.iter().map(|c| node(c, options, None)).collect(),
-                ),
-            ));
+            let kids = n
+                .children
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let rel = if node_type == "Append" {
+                        "Member"
+                    } else if node_type == "Subquery Scan" {
+                        "Subquery"
+                    } else if i == 0 {
+                        "Outer"
+                    } else {
+                        "Inner"
+                    };
+                    node(c, options, None, Some(rel))
+                })
+                .collect();
+            fields.push(("Plans".into(), Value::Arr(kids)));
         }
-        serde_json_lite::Value::Obj(fields)
+        Value::Obj(fields)
     }
-    let mut top = vec![("Plan".to_string(), node(root, options, actual_rows))];
+    let mut top = vec![("Plan".to_string(), node(root, options, actual_rows, None))];
     if actual_rows.is_some() {
-        top.push((
-            "Planning Time".into(),
-            serde_json_lite::Value::Num("0.000".into()),
-        ));
-        top.push((
-            "Execution Time".into(),
-            serde_json_lite::Value::Num("0.000".into()),
-        ));
+        top.push(("Planning Time".into(), Value::Num("0.000".into())));
+        top.push(("Execution Time".into(), Value::Num("0.000".into())));
     }
-    serde_json_lite::Value::Arr(vec![serde_json_lite::Value::Obj(top)]).pretty(0)
+    Value::Arr(vec![Value::Obj(top)])
+}
+
+/// `FORMAT JSON`.
+pub(crate) fn render_json(
+    root: &PlanNode,
+    options: &ExplainOptions,
+    actual_rows: Option<usize>,
+) -> String {
+    structured(root, options, actual_rows).pretty(0)
+}
+
+/// `FORMAT YAML`: PostgreSQL's layout -- a list of one mapping, a nested
+/// mapping or list opening on a line of its own after `key: ` (with that
+/// trailing blank), strings double-quoted, numbers and booleans bare.
+pub(crate) fn render_yaml(
+    root: &PlanNode,
+    options: &ExplainOptions,
+    actual_rows: Option<usize>,
+) -> String {
+    use serde_json_lite::Value;
+    fn scalar(v: &Value) -> Option<String> {
+        match v {
+            Value::Str(s) => Some(serde_json_lite::quote(s)),
+            Value::Num(n) => Some(n.clone()),
+            _ => None,
+        }
+    }
+    fn field(key: &str, v: &Value, col: usize, lead: &str, out: &mut Vec<String>) {
+        match v {
+            Value::Obj(fs) => {
+                out.push(format!("{lead}{key}: "));
+                for (k, v) in fs {
+                    field(k, v, col + 2, &" ".repeat(col + 2), out);
+                }
+            }
+            Value::Arr(items) => {
+                out.push(format!("{lead}{key}: "));
+                for item in items {
+                    list_item(item, col + 2, out);
+                }
+            }
+            other => out.push(format!(
+                "{lead}{key}: {}",
+                scalar(other).unwrap_or_default()
+            )),
+        }
+    }
+    fn list_item(item: &Value, col: usize, out: &mut Vec<String>) {
+        let dash = format!("{}- ", " ".repeat(col));
+        match item {
+            Value::Obj(fs) => {
+                for (i, (k, v)) in fs.iter().enumerate() {
+                    let lead = if i == 0 {
+                        dash.clone()
+                    } else {
+                        " ".repeat(col + 2)
+                    };
+                    field(k, v, col + 2, &lead, out);
+                }
+            }
+            other => out.push(format!("{dash}{}", scalar(other).unwrap_or_default())),
+        }
+    }
+    let mut out = Vec::new();
+    if let Value::Arr(items) = structured(root, options, actual_rows) {
+        for item in &items {
+            list_item(item, 0, &mut out);
+        }
+    }
+    out.join("\n")
+}
+
+/// `FORMAT XML`: the `explain` document PostgreSQL writes, keys with their
+/// blanks as hyphens, a list's items as `<Item>` (plans as `<Plan>`).
+pub(crate) fn render_xml(
+    root: &PlanNode,
+    options: &ExplainOptions,
+    actual_rows: Option<usize>,
+) -> String {
+    use serde_json_lite::Value;
+    fn escape(s: &str) -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    }
+    fn element(tag: &str, v: &Value, depth: usize, out: &mut Vec<String>) {
+        let pad = " ".repeat(depth * 2);
+        let tag = tag.replace(' ', "-");
+        match v {
+            Value::Str(s) => out.push(format!("{pad}<{tag}>{}</{tag}>", escape(s))),
+            Value::Num(n) => out.push(format!("{pad}<{tag}>{n}</{tag}>")),
+            Value::Obj(fs) => {
+                out.push(format!("{pad}<{tag}>"));
+                for (k, v) in fs {
+                    element(k, v, depth + 1, out);
+                }
+                out.push(format!("{pad}</{tag}>"));
+            }
+            Value::Arr(items) => {
+                out.push(format!("{pad}<{tag}>"));
+                let item_tag = if tag == "Plans" { "Plan" } else { "Item" };
+                for item in items {
+                    element(item_tag, item, depth + 1, out);
+                }
+                out.push(format!("{pad}</{tag}>"));
+            }
+        }
+    }
+    let mut out = vec!["<explain xmlns=\"http://www.postgresql.org/2009/explain\">".to_string()];
+    if let Value::Arr(items) = structured(root, options, actual_rows) {
+        for item in &items {
+            element("Query", item, 1, &mut out);
+        }
+    }
+    out.push("</explain>".into());
+    out.join("\n")
 }
 
 /// The little JSON writer `FORMAT JSON` needs, laid out as PostgreSQL lays it
@@ -358,7 +491,7 @@ mod serde_json_lite {
         Obj(Vec<(String, Value)>),
     }
 
-    fn quote(s: &str) -> String {
+    pub fn quote(s: &str) -> String {
         let mut out = String::from("\"");
         for c in s.chars() {
             match c {
@@ -380,6 +513,14 @@ mod serde_json_lite {
                 Value::Str(s) => quote(s),
                 Value::Num(n) => n.clone(),
                 Value::Arr(items) if items.is_empty() => "[]".into(),
+                Value::Arr(items)
+                    if items
+                        .iter()
+                        .all(|v| matches!(v, Value::Str(_) | Value::Num(_))) =>
+                {
+                    let parts: Vec<String> = items.iter().map(|v| v.pretty(indent)).collect();
+                    format!("[{}]", parts.join(", "))
+                }
                 Value::Arr(items) => {
                     let parts: Vec<String> = items
                         .iter()

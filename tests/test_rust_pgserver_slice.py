@@ -10668,21 +10668,16 @@ def test_the_empty_grouping_set_alone(home: Path) -> None:
         assert cur.fetchall() == [(15,)]
 
 
-def test_the_grouping_function_is_refused_by_name(home: Path) -> None:
-    """Not implemented, and the refusal SAYS so.
-
-    `GROUPING(col)` reports which set produced a row, which needs the producing
-    set carried through the group. Refused loudly — and named, because the
-    generic message ("this target is not supported yet") tells a reader nothing
-    about which part of their query to change.
-    """
+def test_the_grouping_function(home: Path) -> None:
+    """`GROUPING(col)` is 1 on the rows a rollup produced WITHOUT that key --
+    each group carries the grouping set that produced it (PostgreSQL 14)."""
     with _Server(home) as server, server.connect() as conn:
         _gs_table(conn)
         cur = conn.cursor()
-        with pytest.raises(psycopg.Error) as info:
-            cur.execute("select a, grouping(a), sum(n) from s group by rollup (a)")
-        assert info.value.sqlstate == "0A000"
-        assert "GROUPING" in str(info.value)
+        cur.execute(
+            "select a, grouping(a), sum(n) from s group by rollup (a) order by a nulls last"
+        )
+        assert cur.fetchall() == [("x", 0, 3), ("y", 0, 12), (None, 1, 15)]
 
 
 # --------------------------------------------------------------------------- #
@@ -13030,8 +13025,10 @@ def test_a_view_is_expanded_wherever_it_is_read(home: Path) -> None:
             cur.execute("DROP VIEW big")
         with pytest.raises(psycopg.errors.DependentObjectsStillExist):
             cur.execute("DROP TABLE vt")
-        with pytest.raises(psycopg.errors.FeatureNotSupported, match="INSERT into a view"):
-            cur.execute("INSERT INTO big VALUES (4, 40)")
+        # A simple view is automatically updatable: the row lands in `vt`.
+        cur.execute("INSERT INTO big VALUES (4, 40)")
+        cur.execute("SELECT count(*) FROM vt")
+        assert cur.fetchone() == (4,)
         cur.execute("DROP VIEW big CASCADE")
         with pytest.raises(psycopg.errors.UndefinedTable):
             cur.execute("SELECT * FROM bigger")
@@ -13564,3 +13561,130 @@ def test_char_n_padding_and_length(home: Path) -> None:
         ]
         assert _sqlstate(conn, "INSERT INTO cp VALUES (3, 'toolong', 'z')") == "22001"
         assert _sqlstate(conn, "UPDATE cp SET v = 'toolong' WHERE id = 1") == "22001"
+
+
+def test_update_from_and_delete_using(home: Path) -> None:
+    """`UPDATE ... FROM` and `DELETE ... USING` touch only the joined rows --
+    the extra FROM used to be dropped, so every row was written -- and an
+    unqualified column both sides have is 42702."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.autocommit = True
+        conn.execute("CREATE TABLE uf_t (id int PRIMARY KEY, n int)")
+        conn.execute("CREATE TABLE uf_s (id int PRIMARY KEY, tid int, v int)")
+        conn.execute("INSERT INTO uf_t VALUES (1, 10), (2, 20), (3, 30)")
+        conn.execute("INSERT INTO uf_s VALUES (1, 1, 100), (2, 2, 200)")
+        assert _fetch(
+            conn,
+            "UPDATE uf_t SET n = s.v FROM uf_s s WHERE uf_t.id = s.tid RETURNING uf_t.id, s.v",
+        ) == [(1, 100), (2, 200)]
+        assert _fetch(conn, "SELECT id, n FROM uf_t ORDER BY id") == [(1, 100), (2, 200), (3, 30)]
+        assert (
+            _sqlstate(conn, "UPDATE uf_t SET n = 0 FROM uf_s WHERE uf_t.id = tid RETURNING id")
+            == "42702"
+        )
+        assert _fetch(
+            conn, "DELETE FROM uf_t USING uf_s WHERE uf_t.id = uf_s.tid RETURNING uf_t.id"
+        ) == [
+            (1,),
+            (2,),
+        ]
+        assert _fetch(conn, "SELECT id FROM uf_t") == [(3,)]
+
+
+def test_integer_overflow_numeric_math_and_bits(home: Path) -> None:
+    """int4 arithmetic overflows as 22003 instead of widening; the numeric
+    transcendentals answer numeric at PostgreSQL's result scale; bit strings
+    and the integer bitwise operators work."""
+    with _Server(home) as server, server.connect() as conn:
+        assert _sqlstate(conn, "SELECT 2147483647 + 1") == "22003"
+        assert _sqlstate(conn, "SELECT abs(-2147483648)") == "22003"
+        assert _fetch(
+            conn,
+            "SELECT sqrt(2.0)::text, (2.0 ^ 0.5)::text, ln(10.0)::text, exp(1.0)::text, "
+            "power(2::numeric, 100)::text, scale(1.230), trim_scale(1.230)::text",
+        ) == [
+            (
+                "1.414213562373095",
+                "1.4142135623730950",
+                "2.3025850929940457",
+                "2.7182818284590452",
+                "1267650600228229401496703205376.0000000000000000",
+                3,
+                "1.23",
+            )
+        ]
+        assert _fetch(
+            conn,
+            "SELECT (B'1010' & B'0110')::text, (~B'1010')::text, (B'1010' << 1)::text, "
+            "5::bit(4)::text, B'1010'::int, get_bit(B'1010', 0), 5 & 3, 1 << 4",
+        ) == [("0010", "0101", "0100", "0101", 10, 1, 1, 16)]
+        assert _fetch(
+            conn,
+            "SELECT '1.1'::float4::float8::text, (1/3.0)::float4::text, upper('é'), "
+            "current_setting('lc_ctype')",
+        ) == [("1.100000023841858", "0.33333334", "É", "C.UTF-8")]
+
+
+def test_updatable_views_and_read_only_transactions(home: Path) -> None:
+    """A simple view takes INSERT / UPDATE / DELETE onto its base table, WITH
+    CHECK OPTION refuses rows it would not show (44000), and a READ ONLY
+    transaction refuses every write (25006)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.autocommit = True
+        conn.execute("CREATE TABLE vw_t (id int PRIMARY KEY, n int)")
+        conn.execute("CREATE VIEW vw_v AS SELECT id, n, n * 2 AS dbl FROM vw_t WHERE n > 0")
+        conn.execute("CREATE VIEW vw_c AS SELECT id, n FROM vw_t WHERE n > 0 WITH CHECK OPTION")
+        assert _fetch(conn, "INSERT INTO vw_v (id, n) VALUES (1, 5) RETURNING dbl") == [(10,)]
+        assert _sqlstate(conn, "INSERT INTO vw_v (id, dbl) VALUES (2, 1)") == "0A000"
+        assert _fetch(conn, "UPDATE vw_v SET n = n + 1 RETURNING id, n") == [(1, 6)]
+        assert _sqlstate(conn, "INSERT INTO vw_c VALUES (3, -1)") == "44000"
+        assert _sqlstate(conn, "UPDATE vw_c SET n = -1") == "44000"
+        assert _fetch(conn, "DELETE FROM vw_v RETURNING id") == [(1,)]
+        conn.execute("BEGIN READ ONLY")
+        assert _sqlstate(conn, "INSERT INTO vw_t VALUES (9, 9)") == "25006"
+        conn.execute("ROLLBACK")
+        assert _fetch(conn, "SELECT count(*) FROM vw_t") == [(0,)]
+
+
+def test_expression_index_order_by_aggregate_and_grouping(home: Path) -> None:
+    """A UNIQUE index over an expression is enforced; ORDER BY may read an
+    aggregate result; GROUPING() names the rolled-up keys."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.autocommit = True
+        conn.execute("CREATE TABLE ei (id int PRIMARY KEY, email text, g text, n int)")
+        conn.execute("CREATE UNIQUE INDEX ei_email ON ei (lower(email))")
+        conn.execute(
+            "INSERT INTO ei VALUES (1, 'A@x', 'a', 1), (2, 'b@x', 'a', 2), (3, 'c@x', 'b', 3)"
+        )
+        assert _sqlstate(conn, "INSERT INTO ei VALUES (4, 'a@X', 'b', 4)") == "23505"
+        assert _fetch(conn, "SELECT g, count(*) FROM ei GROUP BY g ORDER BY count(*) DESC, g") == [
+            ("a", 2),
+            ("b", 1),
+        ]
+        assert _fetch(
+            conn,
+            "SELECT g, sum(n), grouping(g) FROM ei GROUP BY ROLLUP (g) ORDER BY g NULLS LAST",
+        ) == [("a", 3, 0), ("b", 3, 0), (None, 6, 1)]
+
+
+def test_general_datetime_input_and_series(home: Path) -> None:
+    """Date/time input beyond ISO -- textual months, AM/PM, zone
+    abbreviations -- and generate_series over dates and numerics."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("SET timezone = 'UTC'")
+        assert _fetch(
+            conn,
+            "SELECT 'Jan 5, 2020'::date::text, '5 January 2020 10:30 PM'::timestamp::text, "
+            "('2020-01-05 10:30 EST'::timestamptz AT TIME ZONE 'UTC')::text",
+        ) == [("2020-01-05", "2020-01-05 22:30:00", "2020-01-05 15:30:00")]
+        assert _fetch(
+            conn,
+            "SELECT count(*) FROM generate_series("
+            "'2020-01-01'::date, '2020-01-31'::date, '1 week')",
+        ) == [(5,)]
+        assert _fetch(conn, "SELECT g::text FROM generate_series(1.5, 3, 0.5) g") == [
+            ("1.5",),
+            ("2.0",),
+            ("2.5",),
+            ("3.0",),
+        ]

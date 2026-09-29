@@ -599,8 +599,8 @@ pub fn compare_decimal_text(a: &str, b: &str) -> Option<Ordering> {
 /// or a Decimal128 -- can hold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dec {
-    unscaled: BigInt,
-    scale: u32,
+    pub(crate) unscaled: BigInt,
+    pub(crate) scale: u32,
 }
 
 impl Dec {
@@ -674,7 +674,7 @@ impl Dec {
     }
 }
 
-fn round_half_away(num: &BigInt, den: &BigInt) -> BigInt {
+pub(crate) fn round_half_away(num: &BigInt, den: &BigInt) -> BigInt {
     // Both non-negative.
     let (q, r) = (num / den, num % den);
     if &r * BigInt::from(2u32) >= *den {
@@ -957,6 +957,64 @@ pub fn decimal_unary_or_mod(op: &str, a: &str, b: Option<&str>) -> Option<Result
         _ => return None,
     };
     Some(canonical_numeric_text(&out.render()))
+}
+
+/// `apply_typmod`: a canonical numeric fitted to `numeric(precision,
+/// scale)` -- rounded half away from zero to `scale` places, and `22003
+/// numeric field overflow` when the integer part needs more than
+/// `precision - scale` digits. An infinity never fits; NaN always does.
+pub fn apply_numeric_typmod(canonical: &str, typmod: i32) -> Result<String> {
+    if typmod < 4 {
+        return Ok(canonical.to_string());
+    }
+    let precision = (typmod - 4) >> 16;
+    let scale = ((typmod - 4) & 0x7FF) as u32;
+    // PostgreSQL's DETAIL ("A field with precision 5, scale 2 must round
+    // to ...") has no channel here; the SQLSTATE and message match.
+    let overflow = |_detail: String| Error::Sqlstate("22003", "numeric field overflow".into());
+    match canonical {
+        "NaN" => return Ok(canonical.to_string()),
+        "Infinity" | "-Infinity" => {
+            return Err(overflow(format!(
+                "A field with precision {precision}, scale {scale} cannot hold an infinite value."
+            )))
+        }
+        _ => {}
+    }
+    let Some(d) = Dec::parse(canonical) else {
+        return Ok(canonical.to_string());
+    };
+    let unscaled = if d.scale > scale {
+        let q = round_half_away(&d.unscaled.abs(), &BigInt::from(10u32).pow(d.scale - scale));
+        if d.unscaled.is_negative() {
+            -q
+        } else {
+            q
+        }
+    } else {
+        &d.unscaled * BigInt::from(10u32).pow(scale - d.scale)
+    };
+    let int_digits = {
+        let t = (unscaled.abs() / BigInt::from(10u32).pow(scale)).to_string();
+        if t == "0" {
+            0
+        } else {
+            t.len() as i32
+        }
+    };
+    if int_digits > precision - scale as i32 {
+        let limit = precision - scale as i32;
+        return Err(overflow(if limit > 0 {
+            format!(
+                "A field with precision {precision}, scale {scale} must round to an absolute value less than 10^{limit}."
+            )
+        } else {
+            format!(
+                "A field with precision {precision}, scale {scale} must round to an absolute value less than 1."
+            )
+        }));
+    }
+    canonical_numeric_text(&Dec { unscaled, scale }.render())
 }
 
 /// `numeric_stddev_internal`: the exact sample / population variance or
