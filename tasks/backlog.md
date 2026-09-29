@@ -6886,8 +6886,42 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       application SQL and also gate any broader SQL gauge.~~ **SHIPPED
       2026-09-28** — see the entry below for what is left of it.
 
-- [ ] **OPEN — RUST pgserver: `information_schema` is the last of the
-      sequences corpus, and the whole of the catalog one (2026-09-28).**
+- [ ] **OPEN — RUST pgserver: four catalog-corpus lines left, and two of
+      them wait on `CREATE INDEX` (2026-09-28).** `information_schema` and
+      the catalog views landed, taking `catalog.sql` from 19 divergences of 22
+      to 4 and finishing `sequences.sql` at 0. What is left:
+
+      ```
+      pg_indexes                     -- misses a CREATE INDEX'd index
+      pg_index JOIN pg_attribute     -- 0A000 this ON clause (ANY(i.indkey))
+      to_regclass('t')               -- needs the CATALOG in the expression
+      has_table_privilege('t', ...)  -- same
+      ```
+
+      **`to_regclass` and `has_table_privilege` are one problem, and it has a
+      price.** The other catalog functions read only SESSION state, which a
+      per-statement thread-local snapshot supplies cheaply (that is how
+      `current_database()` and `current_setting()` now work inside an
+      expression). These two need to know whether a RELATION exists, and the
+      constant evaluator has no `lookup`. Snapshotting every table name per
+      statement would put a full catalog read in front of every query --
+      `install_user_types` already runs per statement and was optimised
+      specifically to avoid that. The cheap version is to reuse
+      `catalog_cache()`'s version stamp so the name list is rebuilt only when
+      the catalog moves.
+
+      **Two things this work measured, worth not re-deriving:**
+
+      * **Seven catalog functions already worked as a BARE select-list target
+        and nowhere else** — `version()`, `current_setting()`,
+        `obj_description()` and friends become a `ConstCol` the server
+        resolves when they stand alone, and answered `0A000` inside any
+        expression. `scalar::is_scalar` is the gate; a name absent from it
+        never reaches the evaluator at all.
+      * **A table's ROW TYPE is a composite under the same name and the same
+        relation oid.** Listing both in `pg_attribute` put every column in
+        twice with different `attnotnull`. Anything that enumerates relations
+        has to pick one.
       Sequences and identity columns landed, taking
       `tools/probes/pg_corpora/sequences.sql` from 24 divergences of 26 to 1.
       The one left is `information_schema.sequences`, and it is the same gap

@@ -1255,6 +1255,17 @@ impl PgHandler {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
         ));
+        // The database and the GUCs, for `current_database()` and
+        // `current_setting()` reached INSIDE an expression -- where the
+        // constant evaluator handles them rather than the server, and had
+        // nowhere to ask before this.
+        secantus_pgplan::set_session_context(
+            self.db(),
+            self.settings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        );
         let overlay_empty = self
             .uncommitted_types
             .lock()
@@ -3355,6 +3366,130 @@ impl PgHandler {
     /// wire layer and holds nothing a client named).
     fn virtual_table(name: &str) -> Option<TableDef> {
         match name {
+            // `information_schema` keeps its SCHEMA in the name, because its
+            // views are called `tables` / `columns` / `sequences` -- names a
+            // user table may have, and a virtual relation wins over the
+            // catalog. See `secantus_pgplan::relation_name`.
+            "information_schema.columns" => Some(TableDef::new(
+                "columns",
+                vec![
+                    Column::new("table_catalog", "name", false),
+                    Column::new("table_schema", "name", false),
+                    Column::new("table_name", "name", false),
+                    Column::new("column_name", "name", false),
+                    Column::new("ordinal_position", "int4", false),
+                    Column::new("column_default", "text", false),
+                    Column::new("is_nullable", "text", false),
+                    Column::new("data_type", "text", false),
+                    Column::new("character_maximum_length", "int4", false),
+                    Column::new("numeric_precision", "int4", false),
+                    Column::new("numeric_scale", "int4", false),
+                    Column::new("datetime_precision", "int4", false),
+                    Column::new("udt_name", "name", false),
+                    Column::new("is_identity", "text", false),
+                    Column::new("identity_generation", "text", false),
+                ],
+            )),
+            "information_schema.tables" => Some(TableDef::new(
+                "tables",
+                vec![
+                    Column::new("table_catalog", "name", false),
+                    Column::new("table_schema", "name", false),
+                    Column::new("table_name", "name", false),
+                    Column::new("table_type", "text", false),
+                ],
+            )),
+            "information_schema.table_constraints" => Some(TableDef::new(
+                "table_constraints",
+                vec![
+                    Column::new("constraint_catalog", "name", false),
+                    Column::new("constraint_schema", "name", false),
+                    Column::new("constraint_name", "name", false),
+                    Column::new("table_catalog", "name", false),
+                    Column::new("table_schema", "name", false),
+                    Column::new("table_name", "name", false),
+                    Column::new("constraint_type", "text", false),
+                ],
+            )),
+            "information_schema.key_column_usage" => Some(TableDef::new(
+                "key_column_usage",
+                vec![
+                    Column::new("constraint_catalog", "name", false),
+                    Column::new("constraint_schema", "name", false),
+                    Column::new("constraint_name", "name", false),
+                    Column::new("table_catalog", "name", false),
+                    Column::new("table_schema", "name", false),
+                    Column::new("table_name", "name", false),
+                    Column::new("column_name", "name", false),
+                    Column::new("ordinal_position", "int4", false),
+                ],
+            )),
+            "information_schema.sequences" => Some(TableDef::new(
+                "sequences",
+                vec![
+                    Column::new("sequence_catalog", "name", false),
+                    Column::new("sequence_schema", "name", false),
+                    Column::new("sequence_name", "name", false),
+                    Column::new("data_type", "text", false),
+                    Column::new("start_value", "text", false),
+                    Column::new("minimum_value", "text", false),
+                    Column::new("maximum_value", "text", false),
+                    Column::new("increment", "text", false),
+                    Column::new("cycle_option", "text", false),
+                ],
+            )),
+            "pg_class" => Some(TableDef::new(
+                "pg_class",
+                vec![
+                    Column::new("oid", "oid", false),
+                    Column::new("relname", "name", false),
+                    Column::new("relnamespace", "oid", false),
+                    Column::new("relkind", "char", false),
+                    Column::new("relnatts", "int2", false),
+                    Column::new("relhasindex", "bool", false),
+                    Column::new("reltuples", "float4", false),
+                    Column::new("relowner", "oid", false),
+                    Column::new("relpersistence", "char", false),
+                ],
+            )),
+            "pg_namespace" => Some(TableDef::new(
+                "pg_namespace",
+                vec![
+                    Column::new("oid", "oid", false),
+                    Column::new("nspname", "name", false),
+                    Column::new("nspowner", "oid", false),
+                ],
+            )),
+            "pg_index" => Some(TableDef::new(
+                "pg_index",
+                vec![
+                    Column::new("indexrelid", "oid", false),
+                    Column::new("indrelid", "oid", false),
+                    Column::new("indnatts", "int2", false),
+                    Column::new("indisunique", "bool", false),
+                    Column::new("indisprimary", "bool", false),
+                    Column::new("indkey", "int2[]", false),
+                ],
+            )),
+            "pg_indexes" => Some(TableDef::new(
+                "pg_indexes",
+                vec![
+                    Column::new("schemaname", "name", false),
+                    Column::new("tablename", "name", false),
+                    Column::new("indexname", "name", false),
+                    Column::new("tablespace", "name", false),
+                    Column::new("indexdef", "text", false),
+                ],
+            )),
+            "pg_attrdef" => Some(TableDef::new(
+                "pg_attrdef",
+                vec![
+                    Column::new("oid", "oid", false),
+                    Column::new("adrelid", "oid", false),
+                    Column::new("adnum", "int2", false),
+                    Column::new("adbin", "text", false),
+                ],
+            )),
             "pg_type" => Some(TableDef::new(
                 "pg_type",
                 vec![
@@ -3418,6 +3553,9 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("atttypid", "oid", false),
                     secantus_pgcatalog::Column::new("attnum", "int2", false),
                     secantus_pgcatalog::Column::new("attisdropped", "bool", false),
+                    secantus_pgcatalog::Column::new("attnotnull", "bool", false),
+                    secantus_pgcatalog::Column::new("atttypmod", "int4", false),
+                    secantus_pgcatalog::Column::new("atthasdef", "bool", false),
                 ],
             )),
             "pg_range" => Some(TableDef::new(
@@ -3607,6 +3745,362 @@ impl PgHandler {
     fn virtual_rows(&self, name: &str, filter: &Document) -> Option<Vec<Document>> {
         let def = Self::virtual_table(name)?;
         let rows: Vec<Document> = match name {
+            "information_schema.columns" => {
+                let f = |name: &str| def.field_of(name).expect("column");
+                let db = self.db().to_string();
+                let mut rows = Vec::new();
+                for t in self.all_table_defs().ok()? {
+                    for (i, c) in t.columns.iter().enumerate() {
+                        let mut d = Document::new();
+                        d.insert(f("table_catalog"), db.as_str());
+                        d.insert(f("table_schema"), Self::schema_of(&t));
+                        d.insert(f("table_name"), t.name.as_str());
+                        d.insert(f("column_name"), c.name.as_str());
+                        d.insert(f("ordinal_position"), Bson::Int32((i + 1) as i32));
+                        d.insert(f("column_default"), Self::default_expression(c));
+                        // A text `YES` / `NO`, not a boolean: this is the SQL
+                        // standard's view and PostgreSQL follows it.
+                        d.insert(f("is_nullable"), if c.nullable { "YES" } else { "NO" });
+                        d.insert(f("data_type"), secantus_pgplan::display_type(&c.pg_type));
+                        let (precision, scale, length) = Self::typmod_parts(c);
+                        d.insert(f("character_maximum_length"), length);
+                        d.insert(f("numeric_precision"), precision);
+                        d.insert(f("numeric_scale"), scale);
+                        d.insert(f("datetime_precision"), Bson::Null);
+                        d.insert(f("udt_name"), c.pg_type.as_str());
+                        d.insert(
+                            f("is_identity"),
+                            if c.identity.is_some() { "YES" } else { "NO" },
+                        );
+                        d.insert(
+                            f("identity_generation"),
+                            match c.identity.as_deref() {
+                                Some("always") => Bson::String("ALWAYS".into()),
+                                Some(_) => Bson::String("BY DEFAULT".into()),
+                                None => Bson::Null,
+                            },
+                        );
+                        rows.push(d);
+                    }
+                }
+                rows
+            }
+            "information_schema.tables" => {
+                let f = |name: &str| def.field_of(name).expect("column");
+                let db = self.db().to_string();
+                self.all_table_defs()
+                    .ok()?
+                    .into_iter()
+                    .map(|t| {
+                        let mut d = Document::new();
+                        d.insert(f("table_catalog"), db.as_str());
+                        d.insert(f("table_schema"), Self::schema_of(&t));
+                        d.insert(f("table_name"), t.name.as_str());
+                        // A temporary table is still a BASE TABLE; `LOCAL
+                        // TEMPORARY` is the table_type of a declared local
+                        // temporary, which this server has none of.
+                        d.insert(f("table_type"), "BASE TABLE");
+                        d
+                    })
+                    .collect()
+            }
+            "information_schema.table_constraints" => {
+                let f = |name: &str| def.field_of(name).expect("column");
+                let db = self.db().to_string();
+                let mut rows = Vec::new();
+                for t in self.all_table_defs().ok()? {
+                    let schema = Self::schema_of(&t);
+                    let push = |name: &str, kind: &str, rows: &mut Vec<Document>| {
+                        let mut d = Document::new();
+                        d.insert(f("constraint_catalog"), db.as_str());
+                        d.insert(f("constraint_schema"), schema.as_str());
+                        d.insert(f("constraint_name"), name);
+                        d.insert(f("table_catalog"), db.as_str());
+                        d.insert(f("table_schema"), schema.as_str());
+                        d.insert(f("table_name"), t.name.as_str());
+                        d.insert(f("constraint_type"), kind);
+                        rows.push(d);
+                    };
+                    if t.columns.iter().any(|c| c.pk) {
+                        push(&format!("{}_pkey", t.name), "PRIMARY KEY", &mut rows);
+                    }
+                    for u in &t.unique_constraints {
+                        push(&u.name, "UNIQUE", &mut rows);
+                    }
+                    for c in &t.check_constraints {
+                        push(&c.name, "CHECK", &mut rows);
+                    }
+                    // PostgreSQL records a CHECK for every NOT NULL column
+                    // too, named `<n>_not_null`, and a client counting
+                    // constraints sees them. The PRIMARY KEY column is one of
+                    // them: its NOT NULL is implicit but still recorded, so
+                    // excluding it under-counted every table by one.
+                    for c in t.columns.iter().filter(|c| !c.nullable) {
+                        push(
+                            &format!("{}_{}_not_null", t.name, c.name),
+                            "CHECK",
+                            &mut rows,
+                        );
+                    }
+                    for fk in &t.foreign_keys {
+                        push(&fk.name, "FOREIGN KEY", &mut rows);
+                    }
+                }
+                rows
+            }
+            "information_schema.key_column_usage" => {
+                let f = |name: &str| def.field_of(name).expect("column");
+                let db = self.db().to_string();
+                let mut rows = Vec::new();
+                for t in self.all_table_defs().ok()? {
+                    let schema = Self::schema_of(&t);
+                    let push = |name: &str, column: &str, pos: i32, rows: &mut Vec<Document>| {
+                        let mut d = Document::new();
+                        d.insert(f("constraint_catalog"), db.as_str());
+                        d.insert(f("constraint_schema"), schema.as_str());
+                        d.insert(f("constraint_name"), name);
+                        d.insert(f("table_catalog"), db.as_str());
+                        d.insert(f("table_schema"), schema.as_str());
+                        d.insert(f("table_name"), t.name.as_str());
+                        d.insert(f("column_name"), column);
+                        d.insert(f("ordinal_position"), Bson::Int32(pos));
+                        rows.push(d);
+                    };
+                    // Only the KEY constraints appear here -- a CHECK names no
+                    // key column, which is why a count over this view is one
+                    // for a single-column primary key rather than one per
+                    // constraint of any kind.
+                    let pkey = format!("{}_pkey", t.name);
+                    for (i, c) in t.columns.iter().filter(|c| c.pk).enumerate() {
+                        push(&pkey, &c.name, (i + 1) as i32, &mut rows);
+                    }
+                    for u in &t.unique_constraints {
+                        for (i, c) in u.columns.iter().enumerate() {
+                            push(&u.name, c, (i + 1) as i32, &mut rows);
+                        }
+                    }
+                    for fk in &t.foreign_keys {
+                        for (i, c) in fk.columns.iter().enumerate() {
+                            push(&fk.name, c, (i + 1) as i32, &mut rows);
+                        }
+                    }
+                }
+                rows
+            }
+            "information_schema.sequences" => {
+                let f = |name: &str| def.field_of(name).expect("column");
+                let db = self.db().to_string();
+                self.all_sequence_docs()
+                    .ok()?
+                    .into_iter()
+                    .map(|s| {
+                        let text = |k: &str, fallback: i64| {
+                            Bson::String(
+                                s.get(k).and_then(bson_i64).unwrap_or(fallback).to_string(),
+                            )
+                        };
+                        let mut d = Document::new();
+                        d.insert(f("sequence_catalog"), db.as_str());
+                        d.insert(f("sequence_schema"), "public");
+                        d.insert(f("sequence_name"), s.get_str("_id").unwrap_or_default());
+                        d.insert(f("data_type"), "bigint");
+                        // The bounds are TEXT in this view, which is the SQL
+                        // standard's shape for a value that may not fit the
+                        // view's own numeric type.
+                        d.insert(f("start_value"), text("start", 1));
+                        d.insert(f("minimum_value"), text("min_value", 1));
+                        d.insert(f("maximum_value"), text("max_value", i64::MAX));
+                        d.insert(f("increment"), text("increment", 1));
+                        d.insert(
+                            f("cycle_option"),
+                            if s.get_bool("cycle").unwrap_or(false) {
+                                "YES"
+                            } else {
+                                "NO"
+                            },
+                        );
+                        d
+                    })
+                    .collect()
+            }
+            "pg_class" => {
+                let f = |name: &str| def.field_of(name).expect("column");
+                let mut rows = Vec::new();
+                for t in self.all_table_defs().ok()? {
+                    let mut d = Document::new();
+                    d.insert(
+                        f("oid"),
+                        Bson::Int64(self.relation_oid(&t.name).unwrap_or(0)),
+                    );
+                    d.insert(f("relname"), t.name.as_str());
+                    d.insert(f("relnamespace"), Bson::Int64(Self::PUBLIC_NAMESPACE_OID));
+                    d.insert(f("relkind"), "r");
+                    d.insert(f("relnatts"), Bson::Int32(t.columns.len() as i32));
+                    d.insert(f("relhasindex"), t.columns.iter().any(|c| c.pk));
+                    d.insert(f("reltuples"), Bson::Double(-1.0));
+                    d.insert(f("relowner"), Bson::Int64(10));
+                    d.insert(f("relpersistence"), if t.temp { "t" } else { "p" });
+                    rows.push(d);
+                }
+                // A sequence is a relation too, and `relkind` is how a client
+                // tells one from a table.
+                for s in self.all_sequence_docs().ok()? {
+                    let name = s.get_str("_id").unwrap_or_default().to_string();
+                    let mut d = Document::new();
+                    d.insert(f("oid"), Bson::Int64(0));
+                    d.insert(f("relname"), name.as_str());
+                    d.insert(f("relnamespace"), Bson::Int64(Self::PUBLIC_NAMESPACE_OID));
+                    d.insert(f("relkind"), "S");
+                    d.insert(f("relnatts"), Bson::Int32(3));
+                    d.insert(f("relhasindex"), false);
+                    d.insert(f("reltuples"), Bson::Double(1.0));
+                    d.insert(f("relowner"), Bson::Int64(10));
+                    d.insert(f("relpersistence"), "p");
+                    rows.push(d);
+                }
+                rows
+            }
+            "pg_namespace" => {
+                let f = |name: &str| def.field_of(name).expect("column");
+                ["public", "pg_catalog", "information_schema", "pg_toast"]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| {
+                        let mut d = Document::new();
+                        d.insert(
+                            f("oid"),
+                            Bson::Int64(if *name == "public" {
+                                Self::PUBLIC_NAMESPACE_OID
+                            } else {
+                                (11 + i) as i64
+                            }),
+                        );
+                        d.insert(f("nspname"), *name);
+                        d.insert(f("nspowner"), Bson::Int64(10));
+                        d
+                    })
+                    .collect()
+            }
+            "pg_index" => {
+                let f = |name: &str| def.field_of(name).expect("column");
+                let mut rows = Vec::new();
+                for t in self.all_table_defs().ok()? {
+                    let oid = self.relation_oid(&t.name).unwrap_or(0);
+                    let pk: Vec<i32> = t
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| c.pk)
+                        .map(|(i, _)| (i + 1) as i32)
+                        .collect();
+                    if !pk.is_empty() {
+                        let mut d = Document::new();
+                        d.insert(f("indexrelid"), Bson::Int64(0));
+                        d.insert(f("indrelid"), Bson::Int64(oid));
+                        d.insert(f("indnatts"), Bson::Int32(pk.len() as i32));
+                        d.insert(f("indisunique"), true);
+                        d.insert(f("indisprimary"), true);
+                        d.insert(
+                            f("indkey"),
+                            Bson::Array(pk.into_iter().map(Bson::Int32).collect()),
+                        );
+                        rows.push(d);
+                    }
+                    for u in &t.unique_constraints {
+                        let cols: Vec<Bson> = u
+                            .columns
+                            .iter()
+                            .filter_map(|name| {
+                                t.columns
+                                    .iter()
+                                    .position(|c| c.name == *name)
+                                    .map(|i| Bson::Int32((i + 1) as i32))
+                            })
+                            .collect();
+                        let mut d = Document::new();
+                        d.insert(f("indexrelid"), Bson::Int64(0));
+                        d.insert(f("indrelid"), Bson::Int64(oid));
+                        d.insert(f("indnatts"), Bson::Int32(cols.len() as i32));
+                        d.insert(f("indisunique"), true);
+                        d.insert(f("indisprimary"), false);
+                        d.insert(f("indkey"), Bson::Array(cols));
+                        rows.push(d);
+                    }
+                }
+                rows
+            }
+            "pg_indexes" => {
+                let f = |name: &str| def.field_of(name).expect("column");
+                let mut rows = Vec::new();
+                for t in self.all_table_defs().ok()? {
+                    let schema = Self::schema_of(&t);
+                    let pk: Vec<&str> = t
+                        .columns
+                        .iter()
+                        .filter(|c| c.pk)
+                        .map(|c| c.name.as_str())
+                        .collect();
+                    if !pk.is_empty() {
+                        let mut d = Document::new();
+                        d.insert(f("schemaname"), schema.as_str());
+                        d.insert(f("tablename"), t.name.as_str());
+                        d.insert(f("indexname"), format!("{}_pkey", t.name));
+                        d.insert(f("tablespace"), Bson::Null);
+                        d.insert(
+                            f("indexdef"),
+                            format!(
+                                "CREATE UNIQUE INDEX {}_pkey ON {schema}.{} USING btree ({})",
+                                t.name,
+                                t.name,
+                                pk.join(", ")
+                            ),
+                        );
+                        rows.push(d);
+                    }
+                    for u in &t.unique_constraints {
+                        let mut d = Document::new();
+                        d.insert(f("schemaname"), schema.as_str());
+                        d.insert(f("tablename"), t.name.as_str());
+                        d.insert(f("indexname"), u.name.as_str());
+                        d.insert(f("tablespace"), Bson::Null);
+                        d.insert(
+                            f("indexdef"),
+                            format!(
+                                "CREATE UNIQUE INDEX {} ON {schema}.{} USING btree ({})",
+                                u.name,
+                                t.name,
+                                u.columns.join(", ")
+                            ),
+                        );
+                        rows.push(d);
+                    }
+                }
+                rows
+            }
+            "pg_attrdef" => {
+                let f = |name: &str| def.field_of(name).expect("column");
+                let mut rows = Vec::new();
+                for t in self.all_table_defs().ok()? {
+                    let oid = self.relation_oid(&t.name).unwrap_or(0);
+                    for (i, c) in t.columns.iter().enumerate() {
+                        let expr = Self::default_expression(c);
+                        if expr == Bson::Null {
+                            continue;
+                        }
+                        let mut d = Document::new();
+                        d.insert(f("oid"), Bson::Int64(0));
+                        d.insert(f("adrelid"), Bson::Int64(oid));
+                        d.insert(f("adnum"), Bson::Int32((i + 1) as i32));
+                        // `adbin` is a parse tree in PostgreSQL, read through
+                        // `pg_get_expr`. This server stores the rendered text
+                        // and `pg_get_expr` hands it straight back, which is
+                        // what every client does with it.
+                        d.insert(f("adbin"), expr);
+                        rows.push(d);
+                    }
+                }
+                rows
+            }
             "pg_type" => {
                 let mut rows: Vec<Document> = secantus_pgplan::pgtypes::BUILTIN_TYPES
                     .iter()
@@ -3864,7 +4358,63 @@ impl PgHandler {
             // attnum 1-based, atttypid = the field type's oid.
             "pg_attribute" => {
                 let mut rows = Vec::new();
-                for (_, oid, fields) in self.composites().ok()? {
+                // A TABLE's columns, which is what a client reading
+                // `pg_attribute` almost always wants -- only a composite's
+                // fields were listed here, so `attrelid = 't'::regclass`
+                // found nothing for a table.
+                for t in self.all_table_defs().ok()? {
+                    let relid = self.relation_oid(&t.name).unwrap_or(0);
+                    for (i, c) in t.columns.iter().enumerate() {
+                        let Some(atttypid) = self.type_oid_by_name(&c.pg_type) else {
+                            continue;
+                        };
+                        let mut d = Document::new();
+                        d.insert(
+                            def.field_of("attrelid").expect("column"),
+                            Bson::Int64(relid),
+                        );
+                        d.insert(def.field_of("attname").expect("column"), c.name.as_str());
+                        d.insert(
+                            def.field_of("atttypid").expect("column"),
+                            Bson::Int64(atttypid),
+                        );
+                        d.insert(
+                            def.field_of("attnum").expect("column"),
+                            Bson::Int32((i + 1) as i32),
+                        );
+                        d.insert(
+                            def.field_of("attisdropped").expect("column"),
+                            Bson::Boolean(false),
+                        );
+                        d.insert(
+                            def.field_of("attnotnull").expect("column"),
+                            Bson::Boolean(!c.nullable),
+                        );
+                        d.insert(
+                            def.field_of("atttypmod").expect("column"),
+                            Bson::Int32(c.typmod),
+                        );
+                        d.insert(
+                            def.field_of("atthasdef").expect("column"),
+                            Bson::Boolean(Self::default_expression(c) != Bson::Null),
+                        );
+                        rows.push(d);
+                    }
+                }
+                // A table's ROW TYPE is a composite under the same name and
+                // the same relation oid, so listing both put every table
+                // column in twice -- once from the table and once from its
+                // row type, with different `attnotnull`.
+                let table_names: Vec<String> = self
+                    .all_table_defs()
+                    .ok()?
+                    .into_iter()
+                    .map(|t| t.name)
+                    .collect();
+                for (cname, oid, fields) in self.composites().ok()? {
+                    if table_names.contains(&cname) {
+                        continue;
+                    }
                     for (i, (fname, ftype)) in fields.iter().enumerate() {
                         let Some(atttypid) = self.type_oid_by_name(ftype) else {
                             continue;
@@ -3882,6 +4432,15 @@ impl PgHandler {
                         );
                         d.insert(
                             def.field_of("attisdropped").expect("column"),
+                            Bson::Boolean(false),
+                        );
+                        d.insert(
+                            def.field_of("attnotnull").expect("column"),
+                            Bson::Boolean(false),
+                        );
+                        d.insert(def.field_of("atttypmod").expect("column"), Bson::Int32(-1));
+                        d.insert(
+                            def.field_of("atthasdef").expect("column"),
                             Bson::Boolean(false),
                         );
                         rows.push(d);
@@ -4991,6 +5550,9 @@ fn default_settings() -> HashMap<String, String> {
         ("application_name", ""),
         ("server_encoding", "UTF8"),
         ("server_version", "15.0"),
+        // The numeric form every client that gates on a server version
+        // actually reads -- `major * 10000 + minor`, so 15.0 is 150000.
+        ("server_version_num", "150000"),
         // Read by a client before `ALTER USER ... PASSWORD` to pick the hash
         // (libpq's `PQchangePassword`); PostgreSQL 16's default.
         ("password_encryption", "scram-sha-256"),
@@ -6391,6 +6953,80 @@ impl PgHandler {
                 Column::new("is_called", "bool", false),
             ],
         )
+    }
+
+    /// Every sequence this database holds.
+    fn all_sequence_docs(&self) -> PgWireResult<Vec<Document>> {
+        if !self
+            .storage
+            .collection_exists(self.db(), SEQUENCE_COLLECTION)
+            .unwrap_or(false)
+        {
+            return Ok(Vec::new());
+        }
+        let raw = self
+            .storage
+            .find_matching(self.db(), SEQUENCE_COLLECTION, &Document::new())
+            .map_err(|e| Self::storage_err("could not read the sequences", e))?;
+        Ok(raw
+            .iter()
+            .filter_map(|b| bson::from_slice(b).ok())
+            .collect())
+    }
+
+    /// A column's DEFAULT as PostgreSQL renders it in the catalog -- a
+    /// literal with its type stamped on, `'x'::text`.
+    ///
+    /// A `serial` column's default is the `nextval` call rather than the
+    /// stored value, because that is what it actually is.
+    fn default_expression(c: &Column) -> Bson {
+        if let Some(seq) = c.sequence.as_deref() {
+            // An IDENTITY column has no column default in PostgreSQL: the
+            // value comes from the identity machinery, and `column_default`
+            // is NULL for it.
+            if c.identity.is_some() {
+                return Bson::Null;
+            }
+            return Bson::String(format!("nextval('{seq}'::regclass)"));
+        }
+        match c.default.as_ref() {
+            None | Some(Bson::Null) => Bson::Null,
+            Some(Bson::String(s)) => {
+                // Single quotes double inside a SQL literal.
+                let escaped = s.replace('\'', "''");
+                Bson::String(format!("'{escaped}'::{}", c.pg_type))
+            }
+            Some(Bson::Boolean(b)) => Bson::String(b.to_string()),
+            Some(other) => Bson::String(
+                secantus_pgplan::numeric::numeric_text(other).unwrap_or_else(|| format!("{other}")),
+            ),
+        }
+    }
+
+    /// `(numeric_precision, numeric_scale, character_maximum_length)` from a
+    /// column's declared type and `atttypmod`.
+    ///
+    /// PostgreSQL packs a `numeric(p, s)`'s two numbers into one modifier --
+    /// `((p << 16) | s) + 4` -- and reports the width of a `varchar(n)` as
+    /// `typmod - 4`. An UNQUALIFIED type reports its own natural precision
+    /// (an `integer` is 32) and no length at all.
+    fn typmod_parts(c: &Column) -> (Bson, Bson, Bson) {
+        let int = |v: i32| Bson::Int32(v);
+        match c.pg_type.as_str() {
+            "numeric" | "decimal" if c.typmod >= 4 => {
+                let packed = c.typmod - 4;
+                (int(packed >> 16), int(packed & 0xffff), Bson::Null)
+            }
+            "numeric" | "decimal" => (Bson::Null, Bson::Null, Bson::Null),
+            // The integer types report a precision in BITS and a scale of 0.
+            "int2" => (int(16), int(0), Bson::Null),
+            "int4" => (int(32), int(0), Bson::Null),
+            "int8" => (int(64), int(0), Bson::Null),
+            "float4" => (int(24), Bson::Null, Bson::Null),
+            "float8" => (int(53), Bson::Null, Bson::Null),
+            "varchar" | "bpchar" if c.typmod >= 4 => (Bson::Null, Bson::Null, int(c.typmod - 4)),
+            _ => (Bson::Null, Bson::Null, Bson::Null),
+        }
     }
 
     /// A sequence's stored document, or `None` when there is no such sequence.

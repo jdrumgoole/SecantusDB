@@ -3109,6 +3109,23 @@ fn plan_alter_sequence(a: &pg_query::protobuf::AlterSeqStmt) -> Result<Statement
     })
 }
 
+/// The name a FROM item resolves to, keeping the schema only where it
+/// DISAMBIGUATES.
+///
+/// `information_schema`'s views are called `tables`, `columns`, `sequences` --
+/// names a user table may perfectly well have. The virtual-relation lookup
+/// wins over the catalog, so registering them bare would make a user's own
+/// `columns` table unreachable. Keeping the qualifier for that one schema
+/// separates them; `pg_catalog.pg_type` still resolves to `pg_type`, because
+/// nothing else is called that, and `public.t` to `t`.
+pub fn relation_name(r: &pg_query::protobuf::RangeVar) -> String {
+    if r.schemaname.eq_ignore_ascii_case("information_schema") {
+        format!("information_schema.{}", r.relname)
+    } else {
+        r.relname.clone()
+    }
+}
+
 fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
     use pg_query::protobuf::ConstrType as CT;
     let relation = c
@@ -6838,7 +6855,7 @@ fn plan_select(
             (String::new(), src.def.clone(), Some(Box::new(src)))
         }
         Some(N::RangeVar(r)) => {
-            let table = r.relname.clone();
+            let table = relation_name(r);
             let def = lookup(&table).ok_or_else(|| Error::UndefinedTable(table.clone()))?;
             (table, def, None)
         }
@@ -7223,7 +7240,7 @@ fn plan_aggregate(
         return finish_aggregate(s, String::new(), None, Some(Box::new(src)), def, params);
     }
     let table = match s.from_clause[0].node.as_ref() {
-        Some(N::RangeVar(r)) => r.relname.clone(),
+        Some(N::RangeVar(r)) => relation_name(r),
         Some(other) => return Err(Error::Unsupported(disc(other))),
         None => return Err(Error::Parse("empty FROM".into())),
     };
@@ -7406,7 +7423,7 @@ fn plan_join_select(
                     .as_ref()
                     .map(|a| a.aliasname.clone())
                     .unwrap_or_else(|| r.relname.clone());
-                Ok(((r.relname.clone(), alias), None))
+                Ok(((relation_name(r), alias), None))
             }
             // A subquery side: `... JOIN (SELECT ...) a`. Plan it recursively;
             // the executor materialises its rows. Carries `""` as its table.
@@ -8355,7 +8372,7 @@ fn is_aggregate_call(f: &pg_query::protobuf::FuncCall) -> bool {
 /// SecantusDB -- the conformance gauges refuse to run against a daemon whose
 /// `version()` does not name it, precisely so a stray real PostgreSQL cannot
 /// inflate the numbers.
-fn session_function(name: &str) -> Option<Bson> {
+pub(crate) fn session_function(name: &str) -> Option<Bson> {
     Some(match name {
         "version" => Bson::String(format!(
             "PostgreSQL 15.0 (SecantusDB) on {}, compiled by rust",
@@ -11153,6 +11170,35 @@ thread_local! {
 /// Install the session user for the statements that follow on this thread.
 pub fn set_session_user(user: Option<String>) {
     PLAN_SESSION_USER.with(|u| *u.borrow_mut() = user);
+}
+
+thread_local! {
+    /// The database this connection is on, and its GUC settings.
+    ///
+    /// `current_database()` and `current_setting()` already worked as a BARE
+    /// select-list target, where they become a `ConstCol` the server
+    /// resolves. Inside an EXPRESSION -- `current_database() IS NOT NULL`,
+    /// `current_setting('x') ~ '...'` -- the constant evaluator reached them
+    /// instead and had nowhere to ask, so both answered `0A000`. This is the
+    /// same thread-local the session user and the timezone already use.
+    static PLAN_SESSION_DB: std::cell::RefCell<String> =
+        const { std::cell::RefCell::new(String::new()) };
+    static PLAN_SETTINGS: std::cell::RefCell<std::collections::HashMap<String, String>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Install the database and settings for the statements that follow.
+pub fn set_session_context(database: &str, settings: std::collections::HashMap<String, String>) {
+    PLAN_SESSION_DB.with(|d| *d.borrow_mut() = database.to_string());
+    PLAN_SETTINGS.with(|s| *s.borrow_mut() = settings);
+}
+
+pub(crate) fn session_database() -> String {
+    PLAN_SESSION_DB.with(|d| d.borrow().clone())
+}
+
+pub(crate) fn session_setting(name: &str) -> Option<String> {
+    PLAN_SETTINGS.with(|s| s.borrow().get(name).cloned())
 }
 
 pub(crate) fn session_user() -> Option<String> {
