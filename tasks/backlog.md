@@ -693,50 +693,23 @@ remain open:
   - `float4` / `float8` columns keep MQL's NaN placement (below every
     number) in WHERE; PG puts NaN above infinity for floats too. Only
     `numeric` was moved in this slice.
-- [ ] **OPEN — RUST pgserver: multi-column FOREIGN KEYs / `ON DELETE SET
-      DEFAULT` are refused `0A000` (2026-09-09; re-measured 2026-09-28).**
-      NOT NULL / CHECK / FOREIGN KEY / UNIQUE all landed (catalog + enforcement;
-      the same catalog document shape the Python server writes) — re-probed
-      2026-09-28 against PostgreSQL 14.24: CHECK (INSERT, UPDATE, and a named
-      table-level constraint), FOREIGN KEY (INSERT against a missing parent,
-      parent DELETE, and `ON DELETE CASCADE`) and NOT NULL all answer with
-      PostgreSQL's exact SQLSTATE and message, auto-generated constraint names
-      (`c1_n_check`, `f1_pid_fkey`) included. `ON DELETE SET NULL` is accepted
-      too.
+- [ ] **OPEN — RUST pgserver: constraints -- what is left after multi-column
+      FOREIGN KEYs landed (2026-09-29).** NOT NULL / CHECK / UNIQUE / FOREIGN
+      KEY are all enforced; a FOREIGN KEY may now span several columns, target
+      a composite PRIMARY KEY or any matching UNIQUE constraint, and take `ON
+      DELETE` / `ON UPDATE` `CASCADE` / `SET NULL` / `SET DEFAULT` (new corpus
+      `fk_multi.sql` 0/24). A table something REFERENCES now takes the
+      row-by-row UPDATE path, so a changed referenced UNIQUE key runs its ON
+      UPDATE action -- before, only the immutable primary key could be
+      referenced, so nothing needed to look.
 
-      **The multi-column FOREIGN KEY blocker is NOT in the FK path — it is
-      upstream, in the PARENT's key** (measured 2026-09-28). `create table p (a
-      int, b int, primary key (a, b))` is `0A000 a composite PRIMARY KEY is not
-      supported yet`, so the referenced table cannot be created and the FK half
-      is never reached. Scope composite PRIMARY KEY first; a session sizing this
-      from the entry's old wording would have started in the wrong crate.
-
-      **The `pg_constraint` half of this entry was FIXED 2026-09-28** and is
-      why the headline no longer names it. It is now a virtual table carrying
-      PostgreSQL 14.24's full 25-column shape, projected from the catalog the
-      server already kept; `conname` / `contype` / `conkey` / `confkey` / the
-      `conf*type` action codes / the flag columns / `connamespace` all match
-      the oracle exactly, as do the RowDescription oids — which needed two
-      types the server had no vocabulary for, the internal `"char"` (18) and
-      `pg_node_tree` (194). Deliberately NOT reproduced, both documented in
-      the code: `conbin` is NULL (we keep a CHECK predicate as SQL text, not
-      as PostgreSQL's serialised parse tree) and `conindid` is 0 (there are no
-      `pg_index` rows for it to point at). Constraint `oid`s are synthetic.
-
-      Still absent, and the reason a full reflection round-trip does not work
-      yet: `pg_index` / `pg_class` / `pg_namespace` have no rows, and
-      `pg_get_constraintdef()` is not implemented (the Python server has it —
-      `src/secantus/sql/virtual.py`'s `constraint_def_for_oid`).
-
-      **`EXCLUDE` is refused at DDL (measured 2026-09-28).** `create table ex
-      (id int primary key, room int, constraint no_dup exclude (room with =))`
-      is `0A000 Constraint is not supported yet`; PostgreSQL 14.24 accepts it
-      and reports the row as `contype = 'x'`. `pg_constraint` here DOES emit
-      `'x'` for one, because the catalog's `UniqueConstraint.exclusion` flag is
-      written by the PYTHON server — so the only way to reach that branch today
-      is a hand-off: create the table with the Python server, then read it with
-      the Rust one. Worth knowing before "it emits 'x'" is read as "the Rust
-      server supports EXCLUDE".
+      **Left:** `EXCLUDE` constraints are refused at DDL (`0A000 Constraint is
+      not supported yet`; PostgreSQL 14.24 accepts them). `pg_get_constraintdef()`
+      is not implemented. `pg_constraint.conbin` is NULL (a CHECK is kept as SQL
+      text, not a parse tree) and constraint `oid`s are synthetic. `MATCH FULL`
+      is not distinguished from MATCH SIMPLE. An `ON UPDATE CASCADE` that
+      rewrites a child's key does not re-check that child's OTHER constraints
+      against the new key's parent.
 
 - [x] **RESOLVED (found and fixed 2026-09-28): a regclass/regtype operand
       inside a LIST matched NOTHING, silently.** A `regclass` value is a

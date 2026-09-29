@@ -30,3 +30,9 @@ shape in PostgreSQL's layout; it prints zero costs rather than invented ones.
   PostgreSQL 14 does (42883, 0A000) rather than "not supported yet".
 - `unnest(a) AS x` names its column `x`, as PostgreSQL's rule for a function
   returning one column has it.
+
+#### Added (foreign keys)
+
+- Multi-column FOREIGN KEYs, to a composite PRIMARY KEY or to a UNIQUE
+  constraint; `ON DELETE` / `ON UPDATE` with `CASCADE`, `SET NULL` and the new
+  `SET DEFAULT`. MATCH SIMPLE: a key with a NULL column references nothing.
