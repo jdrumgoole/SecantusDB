@@ -1097,6 +1097,8 @@ const SELECT_LIST_SRFS: &[&str] = &[
     "jsonb_object_keys",
     "json_object_keys",
     "regexp_matches",
+    "jsonb_path_query",
+    "jsonb_path_query_tz",
 ];
 
 /// `SELECT unnest(ia) FROM t` as the LATERAL join it means: `FROM t, LATERAL

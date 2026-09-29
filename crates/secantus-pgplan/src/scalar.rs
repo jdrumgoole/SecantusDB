@@ -16,6 +16,7 @@ pub fn is_scalar(name: &str) -> bool {
         || CATALOG_NAMES.contains(&name)
         || crate::arrays::is_array_function(name)
         || extension_scalar(name).is_some()
+        || crate::fts::is_function(name)
 }
 
 /// Does this built-in's result type follow from its NAME alone?
@@ -85,6 +86,18 @@ fn extension_scalar(name: &str) -> Option<crate::ExtensionType> {
 }
 
 const SCALAR_NAMES: &[&str] = &[
+    "to_char",
+    "to_number",
+    "similar_to_escape",
+    "similar_escape",
+    "jsonb_path_exists",
+    "jsonb_path_match",
+    "jsonb_path_query_first",
+    "jsonb_path_query_array",
+    "jsonb_path_exists_tz",
+    "jsonb_path_match_tz",
+    "jsonb_path_query_first_tz",
+    "jsonb_path_query_array_tz",
     "gen_random_uuid",
     "uuid_generate_v4",
     "random",
@@ -379,6 +392,12 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
     if crate::arrays::is_array_function(name) {
         return crate::arrays::call(name, args);
     }
+    if let Some(out) = crate::fts::call(name, args) {
+        return out;
+    }
+    if crate::jsonpath::is_function(name) {
+        return crate::jsonpath_call(name, args);
+    }
     if !matches!(
         name,
         "concat" | "concat_ws" | "greatest" | "least" | "format" | "quote_nullable"
@@ -400,6 +419,24 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp" => {
             need(0)?;
             Ok(now_value())
+        }
+        "similar_to_escape" | "similar_escape" => {
+            let esc = if args.len() > 1 { Some(s(1)) } else { None };
+            similar_escape(&s(0), esc.as_deref()).map(Bson::String)
+        }
+        "to_char" => {
+            need(2)?;
+            match crate::formatting::to_char_value(&arg(0), &s(1), false) {
+                Some(out) => out.map(Bson::String),
+                None => Err(Error::Unsupported("to_char() of this type".into())),
+            }
+        }
+        "to_number" => {
+            need(2)?;
+            match crate::formatting::to_number(&s(0), &s(1))? {
+                Some(text) => crate::cast_value(Bson::String(text), "numeric"),
+                None => Ok(Bson::Null),
+            }
         }
         // A version-4 UUID: 122 random bits, the version nibble 4 and the
         // RFC 4122 variant bits.
@@ -1521,6 +1558,9 @@ pub fn static_result_type(name: &str) -> &'static str {
     if let Some(t) = crate::arrays::static_result_type(name) {
         return t;
     }
+    if let Some(t) = crate::fts::result_type(name) {
+        return t;
+    }
     match name {
         "gen_random_uuid" | "uuid_generate_v4" => "uuid",
         "random" => "float8",
@@ -1529,6 +1569,15 @@ pub fn static_result_type(name: &str) -> &'static str {
         "abs" | "ceil" | "ceiling" | "floor" | "round" | "trunc" | "mod" | "div" => "numeric",
         "sqrt" | "exp" | "ln" | "log" | "log10" | "power" | "pow" | "sign" => "float8",
         "starts_with" => "bool",
+        "to_number" => "numeric",
+        "jsonb_path_exists"
+        | "jsonb_path_match"
+        | "jsonb_path_exists_tz"
+        | "jsonb_path_match_tz" => "bool",
+        "jsonb_path_query_first"
+        | "jsonb_path_query_array"
+        | "jsonb_path_query_first_tz"
+        | "jsonb_path_query_array_tz" => "jsonb",
         "lpad" | "rpad" | "to_hex" | "translate" | "overlay" | "quote_literal"
         | "quote_nullable" | "unistr" | "convert_from" | "normalize" => "text",
         "regexp_split_to_array" => "text[]",
@@ -1560,4 +1609,83 @@ fn random_u64() -> u64 {
             .unwrap_or(0),
     );
     h.finish()
+}
+
+/// `similar_escape_internal`: a SQL `SIMILAR TO` pattern as an anchored
+/// POSIX regex. `%` is `.*`, `_` is `.`, `(` is non-capturing, the regex
+/// metacharacters `\ . ^ $` are escaped, a bracket expression passes through,
+/// and escape-double-quotes split the pattern into its three SUBSTRING parts.
+fn similar_escape(pattern: &str, escape: Option<&str>) -> Result<String> {
+    let esc: Option<char> = match escape {
+        None => Some('\\'),
+        Some("") => None,
+        Some(e) => {
+            if e.chars().count() > 1 {
+                return Err(Error::Sqlstate("22025", "invalid escape string".into()));
+            }
+            e.chars().next()
+        }
+    };
+    let mut r = String::from("^(?:");
+    let mut after = false;
+    let mut nquotes = 0;
+    let mut depth = 0;
+    let mut pos = 0;
+    for c in pattern.chars() {
+        if after {
+            if c == '"' && depth < 1 {
+                match nquotes {
+                    0 => r.push_str("){1,1}?("),
+                    1 => r.push_str("){1,1}(?:"),
+                    _ => {
+                        return Err(Error::Sqlstate(
+                            "2200C",
+                            "SQL regular expression may not contain more than two escape-double-quote separators"
+                                .into(),
+                        ))
+                    }
+                }
+                nquotes += 1;
+            } else {
+                r.push('\\');
+                r.push(c);
+                pos = 3;
+            }
+            after = false;
+        } else if Some(c) == esc {
+            after = true;
+        } else if depth > 0 {
+            if c == '\\' {
+                r.push('\\');
+            }
+            r.push(c);
+            if c == ']' && pos > 2 {
+                depth -= 1;
+            } else if c == '[' {
+                depth += 1;
+                pos = 3;
+            } else if c == '^' {
+                pos += 1;
+            } else {
+                pos = 3;
+            }
+        } else if c == '[' {
+            r.push(c);
+            depth = 1;
+            pos = 1;
+        } else if c == '%' {
+            r.push_str(".*");
+        } else if c == '_' {
+            r.push('.');
+        } else if c == '(' {
+            r.push_str("(?:");
+        } else if matches!(c, '\\' | '.' | '^' | '$') {
+            r.push('\\');
+            r.push(c);
+        } else {
+            r.push(c);
+        }
+    }
+    r.push_str(")$");
+    Ok(r)
 }

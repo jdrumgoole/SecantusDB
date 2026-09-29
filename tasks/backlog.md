@@ -640,6 +640,23 @@ remain open:
       ignores every other kind the Rust server stores in the shared
       `__sql_triggers__` catalog; its `event` key carries only the first
       event of a multi-event trigger.
+- [ ] **OPEN — RUST pgserver: what batch 6 (FTS, formatting, datetime,
+      jsonpath, statistical aggregates) still refuses or approximates
+      (2026-09-29).** Corpora `fts` / `fts2` / `datetimes` / `char_padding` /
+      `char_padding2` / `json_record` / `whole_row` / `regr_aggregates` /
+      `hypothetical_set` at 0 divergences against PostgreSQL 14; matrices
+      numeric `to_char` 471/471, `to_number` 401/401, datetime 1009/1009,
+      jsonpath 935/935, aggregates 239 + 375 all matching. Left:
+      - Text search: only the `english` and `simple` configurations; any other
+        (`french`, ...) is 0A000. Lowercasing is ASCII (C-locale), which is
+        what the reference cluster runs; a UTF-8 locale would fold more.
+      - jsonpath `.datetime()` is refused (0A000); every other method is
+        implemented.
+      - `keyvalue()` ids are computed from a modelled jsonb binary layout; a
+        path that visits the SAME object twice through different containers
+        can get an id PostgreSQL would number differently.
+      - A malformed `to_date` / `to_timestamp` input that PostgreSQL reports
+        as `22008` is `22007` in a few shapes (message text matches).
 - [ ] **OPEN — RUST pgserver: a non-boolean constant WHERE over
       `generate_series` carries no error POSITION (2026-09-09).** `select 1
       from generate_series(1,3) where 1` is `42804 argument of WHERE must be

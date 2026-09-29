@@ -13446,3 +13446,121 @@ def test_triggers(home: Path) -> None:
             )
         cur.execute("SELECT (SELECT count(*) FROM tt WHERE id = 10), (SELECT count(*) FROM tlog)")
         assert cur.fetchone() == (0, 0)
+
+
+def test_full_text_search(home: Path) -> None:
+    """`tsvector` / `tsquery`: stemming, stop-words, phrases, weights and
+    ranking as PostgreSQL 14 answers them, a tsvector column searched with
+    `@@`, and the column read by the Python server over the same store --
+    and a Python-written one read back here."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT to_tsvector('english', 'The quick brown foxes jumped')")
+        assert cur.fetchone()[0] == "'brown':3 'fox':4 'jump':5 'quick':2"
+        assert cur.description[0].type_code == 3614
+        cur.execute("SELECT to_tsquery('english', 'fox <-> the <-> quick')")
+        assert cur.fetchone()[0] == "'fox' <2> 'quick'"
+        cur.execute(
+            "SELECT ts_rank(to_tsvector('english', 'The quick brown fox jumps over the lazy dog'), "
+            "to_tsquery('english', 'fox & dog'))"
+        )
+        assert cur.fetchone()[0] == pytest.approx(0.09148999)
+        cur.execute("CREATE TABLE docs (id int PRIMARY KEY, body text, tv tsvector)")
+        cur.execute(
+            "INSERT INTO docs VALUES (1, 'cats sat', to_tsvector('english', 'cats sat')), "
+            "(2, 'dogs ran', to_tsvector('english', 'dogs ran'))"
+        )
+        cur.execute("SELECT id FROM docs WHERE tv @@ to_tsquery('english', 'cat') ORDER BY id")
+        assert cur.fetchall() == [(1,)]
+        cur.execute("SELECT id FROM docs WHERE body @@ 'dogs' ORDER BY id")
+        assert cur.fetchall() == [(2,)]
+
+    assert _python_sql(
+        home, "SELECT id FROM docs WHERE tv @@ to_tsquery('english', 'dog') ORDER BY id"
+    ) == [(2,)]
+    _python_sql(home, "INSERT INTO docs VALUES (3, 'birds', to_tsvector('english', 'birds fly'))")
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT tv FROM docs WHERE id = 3")
+        assert cur.fetchone()[0] == "'bird':1 'fli':2"
+        cur.execute("SELECT id FROM docs WHERE tv @@ to_tsquery('english', 'bird') ORDER BY id")
+        assert cur.fetchall() == [(3,)]
+
+
+def _fetch(conn, sql: str) -> list[tuple]:
+    """Every row of `sql`, values as psycopg decoded them."""
+    return conn.execute(sql).fetchall()
+
+
+def test_formatting_datetime_and_jsonpath(home: Path) -> None:
+    """Numeric and datetime `to_char` / `to_number`, the datetime function
+    family, and SQL/JSON path queries -- each value as PostgreSQL 14 prints
+    it (measured with psql)."""
+    with _Server(home) as server, server.connect() as conn:
+        assert _fetch(
+            conn,
+            "SELECT to_char(1234.5::numeric, 'FM9,999.00'), "
+            "to_number('$1,234.50', 'L9,999.99')::text",
+        ) == [("1,234.50", "1234.50")]
+        assert _fetch(
+            conn, "SELECT to_char(timestamp '2024-03-05 14:07:09', 'Day DD Mon YYYY HH12:MI:SS AM')"
+        ) == [("Tuesday   05 Mar 2024 02:07:09 PM",)]
+        assert _fetch(
+            conn,
+            "SELECT extract(epoch FROM timestamp '2024-01-01 00:00:00')::text, "
+            "date_trunc('month', timestamp '2024-03-15 10:00')::text, "
+            "age(timestamp '2024-03-01', timestamp '2023-01-15')::text",
+        ) == [("1704067200.000000", "2024-03-01 00:00:00", "1 year 1 mon 17 days")]
+        assert _fetch(
+            conn,
+            "SELECT jsonb_path_query_array('{\"a\":[1,2,3,4]}', '$.a[*] ? (@ > 2)')::text, "
+            "jsonb_path_exists('{\"a\":1}', '$.b'), "
+            "('{\"a\":[1,2]}'::jsonb @? '$.a[*] ? (@ == 2)')",
+        ) == [("[3, 4]", False, True)]
+
+
+def test_statistical_and_ordered_set_aggregates(home: Path) -> None:
+    """The statistical, ordered-set and hypothetical-set aggregates, and the
+    JSON constructors, as PostgreSQL 14 answers them."""
+    with _Server(home) as server, server.connect() as conn:
+        assert _fetch(
+            conn,
+            "SELECT stddev_samp(x)::text, var_pop(x)::text, corr(x, y)::text, "
+            "regr_slope(y, x)::text "
+            "FROM (VALUES (1,2),(2,4),(3,7)) v(x,y)",
+        ) == [("1.00000000000000000000", "0.66666666666666666667", "0.9933992677987828", "2.5")]
+        assert _fetch(
+            conn,
+            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x), "
+            "percentile_disc(0.5) WITHIN GROUP (ORDER BY x), "
+            "mode() WITHIN GROUP (ORDER BY x), rank(2) WITHIN GROUP (ORDER BY x) "
+            "FROM (VALUES (1),(2),(2),(5)) v(x)",
+        ) == [(2.0, 2, 2, 2)]
+        assert _fetch(
+            conn,
+            "SELECT json_build_object('a', 1, 'b', ARRAY[1,2])::text, "
+            "jsonb_build_array(1, 'x', NULL)::text, "
+            "row_to_json(ROW(1, 'x'))::text",
+        ) == [('{"a" : 1, "b" : [1,2]}', '[1, "x", null]', '{"f1":1,"f2":"x"}')]
+
+
+def test_char_n_padding_and_length(home: Path) -> None:
+    """`char(n)` pads on output, compares blank-insensitively, and an
+    assignment that is too long is 22001 unless the excess is blanks."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE cp (id int PRIMARY KEY, c char(5), v varchar(5))")
+        cur.execute("INSERT INTO cp VALUES (1, 'x', 'x'), (2, 'ab      ', 'y')")
+        assert _fetch(
+            conn, "SELECT c, c = 'x  ', length(c), octet_length(c) FROM cp ORDER BY id"
+        ) == [
+            ("x    ", True, 1, 5),
+            ("ab   ", False, 2, 5),
+        ]
+        assert _fetch(conn, "SELECT c, count(*) FROM cp GROUP BY c ORDER BY c") == [
+            ("ab   ", 1),
+            ("x    ", 1),
+        ]
+        assert _sqlstate(conn, "INSERT INTO cp VALUES (3, 'toolong', 'z')") == "22001"
+        assert _sqlstate(conn, "UPDATE cp SET v = 'toolong' WHERE id = 1") == "22001"
