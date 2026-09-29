@@ -285,7 +285,10 @@ def test_duplicate_key_reports_what_postgres_reports(home: Path) -> None:
         ("CREATE TABLE t (id int PRIMARY KEY)", "42P07"),
         # Unsupported must be an honest 0A000 -- never a wrong row. There is no
         # fallback into Python by design.
-        ("SELECT * FROM t JOIN t AS u ON t.id = u.id", "0A000"),
+        # A self-join is implemented; a BARE column both sides have is
+        # PostgreSQL's 42702, never the left side's value taken silently.
+        ("SELECT id FROM t JOIN t AS u ON t.id = u.id", "42702"),
+        ("SELECT x.id FROM t JOIN t AS u ON t.id = u.id", "42P01"),
         ("SELECT array_agg(name ORDER BY length(name)) FROM t", "0A000"),
         ("SELECT n, count(*) FROM t", "42803"),
         # `LIKE` is implemented now; over an INTEGER column PostgreSQL 14.13
@@ -11149,30 +11152,66 @@ def test_an_undefined_column_inside_a_subquery_stays_42703(home: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "sql",
+    "sql,expected",
     [
-        # An EXISTS whose subquery reads the outer row. This ANSWERED -- with
-        # every row -- before the check existed: the lowering resolves a column
-        # by its last name part and ignores the qualifier, so `d.id` bound to
-        # `sq_emp`'s own `id` and the EXISTS was true for everything.
-        "SELECT id FROM sq_dept d WHERE EXISTS (SELECT 1 FROM sq_emp e WHERE e.dept_id = d.id)",
-        "SELECT id FROM sq_dept d WHERE NOT EXISTS (SELECT 1 FROM sq_emp e WHERE e.dept_id = d.id)",
-        "SELECT d.name, (SELECT count(*) FROM sq_emp e WHERE e.dept_id = d.id) FROM sq_dept d",
+        # An EXISTS whose subquery reads the outer row. This once ANSWERED --
+        # with every row -- because the lowering resolves a column by its last
+        # name part and ignores the qualifier, so `d.id` bound to `sq_emp`'s
+        # own `id`. It is evaluated per outer row now; the qualifier check that
+        # caught the wrong answer is what routes it there.
+        (
+            "SELECT id FROM sq_dept d WHERE EXISTS "
+            "(SELECT 1 FROM sq_emp e WHERE e.dept_id = d.id) ORDER BY id",
+            [(1,), (2,)],
+        ),
+        (
+            "SELECT id FROM sq_dept d WHERE NOT EXISTS "
+            "(SELECT 1 FROM sq_emp e WHERE e.dept_id = d.id) ORDER BY id",
+            [(3,)],
+        ),
+        (
+            "SELECT d.name, (SELECT count(*) FROM sq_emp e WHERE e.dept_id = d.id) "
+            "FROM sq_dept d ORDER BY d.id",
+            [("eng", 2), ("sales", 2), ("empty", 0)],
+        ),
         # Correlated through an UNQUALIFIED name the inner table does not have.
-        "SELECT id FROM sq_dept WHERE EXISTS (SELECT 1 FROM sq_emp WHERE dept_id = budget)",
+        (
+            "SELECT id FROM sq_dept WHERE EXISTS (SELECT 1 FROM sq_emp WHERE dept_id = budget)",
+            [],
+        ),
+        # `x > ALL (no rows)` is TRUE even for a NULL `x`.
+        (
+            "SELECT id FROM sq_dept d WHERE d.budget > ALL "
+            "(SELECT salary FROM sq_emp e WHERE e.dept_id = d.id) ORDER BY id",
+            [(1,), (3,)],
+        ),
     ],
 )
-def test_a_correlated_subquery_is_refused_not_answered_wrongly(home: Path, sql: str) -> None:
-    """`0A000`, by name. A correlated subquery's value depends on the outer
-    row, so there is no single set of values to substitute -- and substituting
-    one is a wrong answer rather than a missing feature."""
+def test_a_correlated_subquery_answers_per_row(home: Path, sql: str, expected: list[tuple]) -> None:
+    """Matches PostgreSQL 14.13 on the same data."""
     with _Server(home) as server, server.connect() as conn:
         _dept_emp(conn)
         cur = conn.cursor()
-        with pytest.raises(psycopg.Error) as info:
-            cur.execute(sql)
-        assert info.value.sqlstate == "0A000"
-        assert "correlated subquery" in str(info.value)
+        cur.execute(sql)
+        assert cur.fetchall() == expected
+
+
+def test_correlated_subqueries_in_update_and_delete(home: Path) -> None:
+    """A correlated SET value, and a correlated WHERE that cannot lower to a
+    filter -- narrowed per row before the write, never widened."""
+    with _Server(home) as server, server.connect() as conn:
+        _dept_emp(conn)
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE sq_dept d SET budget = (SELECT count(*) FROM sq_emp e WHERE e.dept_id = d.id)"
+        )
+        cur.execute("SELECT id, budget FROM sq_dept ORDER BY id")
+        assert cur.fetchall() == [(1, 2), (2, 2), (3, 0)]
+        cur.execute(
+            "DELETE FROM sq_dept d WHERE NOT EXISTS "
+            "(SELECT 1 FROM sq_emp e WHERE e.dept_id = d.id) RETURNING id"
+        )
+        assert cur.fetchall() == [(3,)]
 
 
 def test_with_recursive_and_a_data_modifying_with_are_refused(home: Path) -> None:
@@ -12912,3 +12951,178 @@ def test_normalize_across_all_four_unicode_forms(home: Path) -> None:
         assert cur.fetchall() == [("fi", "fi", "ﬁ")]
         cur.execute("SELECT normalize(NULL), normalize('abc'), normalize('') = ''")
         assert cur.fetchall() == [(None, "abc", True)]
+
+
+def test_a_rust_view_and_index_are_read_by_the_python_server(home: Path) -> None:
+    """Views and indexes share the on-disk format across the two SQL servers.
+
+    A view is a `__sql_views__` row holding its SELECT as text, and an index
+    is a storage index over the table's collection, on both servers -- so a
+    store handed from one to the other keeps both. The column-list form is
+    stored as a wrapped subquery, which the Python server has to parse too.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE vt (id int PRIMARY KEY, g text, n int)")
+        cur.execute("INSERT INTO vt VALUES (1,'a',10),(2,'a',20),(3,'b',NULL)")
+        cur.execute("CREATE VIEW v1 AS SELECT id, n FROM vt WHERE n IS NOT NULL")
+        cur.execute("CREATE VIEW v2 (k, total) AS SELECT g, sum(n) FROM vt GROUP BY g")
+        cur.execute("CREATE INDEX vt_n ON vt (n)")
+
+    assert _python_sql(home, "SELECT id, n FROM v1 ORDER BY id") == [(1, 10), (2, 20)]
+    assert _python_sql(home, "SELECT k, total FROM v2 ORDER BY k") == [("a", 30), ("b", None)]
+    assert _python_sql(home, "SELECT indexname FROM pg_indexes WHERE indexname = 'vt_n'") == [
+        ("vt_n",)
+    ]
+
+
+def test_a_python_view_and_index_are_read_by_the_rust_server(home: Path) -> None:
+    """The other direction: the Python server's sqlglot-rendered definition
+    has to parse under libpg_query, and its index has to be listed."""
+    _python_sql(
+        home,
+        "CREATE TABLE pt (id int PRIMARY KEY, g text, n int)",
+        "INSERT INTO pt VALUES (1,'a',10),(2,'b',20)",
+        "CREATE VIEW pv AS SELECT id, n * 2 AS dbl FROM pt WHERE g = 'b'",
+        "CREATE INDEX pt_g ON pt (g)",
+    )
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id, dbl FROM pv")
+        assert cur.fetchall() == [(2, 40)]
+        cur.execute("SELECT indexdef FROM pg_indexes WHERE indexname = 'pt_g'")
+        assert cur.fetchall() == [("CREATE INDEX pt_g ON public.pt USING btree (g)",)]
+
+
+def test_a_unique_index_admits_many_nulls_and_names_itself(home: Path) -> None:
+    """`CREATE UNIQUE INDEX` follows SQL's rule that NULLs are distinct, and a
+    duplicate names the INDEX -- not a `<t>_<col>_key` guessed from its
+    columns, which is what a violation reported before indexes existed."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE u (id int PRIMARY KEY, s text)")
+        cur.execute("INSERT INTO u VALUES (1, NULL), (2, NULL), (3, 'x')")
+        cur.execute("CREATE UNIQUE INDEX u_s_uniq ON u (s)")
+        cur.execute("INSERT INTO u VALUES (4, NULL)")
+        with pytest.raises(psycopg.errors.UniqueViolation, match='"u_s_uniq"'):
+            cur.execute("INSERT INTO u VALUES (5, 'x')")
+        cur.execute("INSERT INTO u VALUES (6, 'y')")
+        with pytest.raises(psycopg.errors.UniqueViolation, match="Key \\(s\\)=\\(x\\)"):
+            cur.execute("UPDATE u SET s = 'x' WHERE id = 6")
+
+
+def test_a_view_is_expanded_wherever_it_is_read(home: Path) -> None:
+    """FROM, a JOIN, a FROM-subquery, an IN-subquery and a view over a view."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE vt (id int PRIMARY KEY, n int)")
+        cur.execute("INSERT INTO vt VALUES (1, 10), (2, 20), (3, 30)")
+        cur.execute("CREATE VIEW big AS SELECT id, n FROM vt WHERE n > 15")
+        cur.execute("CREATE VIEW bigger AS SELECT id FROM big WHERE n > 25")
+        cur.execute("SELECT count(*) FROM big")
+        assert cur.fetchone() == (2,)
+        cur.execute("SELECT id FROM vt WHERE id IN (SELECT id FROM big) ORDER BY id")
+        assert cur.fetchall() == [(2,), (3,)]
+        cur.execute("SELECT b.id FROM big b JOIN vt ON vt.id = b.id ORDER BY b.id")
+        assert cur.fetchall() == [(2,), (3,)]
+        cur.execute("SELECT * FROM bigger")
+        assert cur.fetchall() == [(3,)]
+        with pytest.raises(psycopg.errors.DependentObjectsStillExist):
+            cur.execute("DROP VIEW big")
+        with pytest.raises(psycopg.errors.DependentObjectsStillExist):
+            cur.execute("DROP TABLE vt")
+        with pytest.raises(psycopg.errors.FeatureNotSupported, match="INSERT into a view"):
+            cur.execute("INSERT INTO big VALUES (4, 40)")
+        cur.execute("DROP VIEW big CASCADE")
+        with pytest.raises(psycopg.errors.UndefinedTable):
+            cur.execute("SELECT * FROM bigger")
+
+
+def test_ddl_rolls_back_with_its_transaction(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE r (id int PRIMARY KEY, n int)")
+        cur.execute("BEGIN")
+        cur.execute("CREATE VIEW rv AS SELECT id FROM r")
+        cur.execute("CREATE INDEX r_n ON r (n)")
+        cur.execute("SELECT count(*) FROM rv")
+        assert cur.fetchone() == (0,)
+        cur.execute("ROLLBACK")
+        with pytest.raises(psycopg.errors.UndefinedTable):
+            cur.execute("SELECT * FROM rv")
+        cur.execute("SELECT count(*) FROM pg_indexes WHERE indexname = 'r_n'")
+        assert cur.fetchone() == (0,)
+
+
+def test_general_joins_answer_like_postgres(home: Path) -> None:
+    """A JOIN is planned as a SOURCE and the query around it as any other, so
+    aggregates, windows, `*`, USING / NATURAL and the outer joins all work.
+
+    Two regressions it pins: a WHERE on the NULLABLE side of a LEFT JOIN runs
+    AFTER the join (a pre-filter kept the NULL-extended rows PostgreSQL drops),
+    and a bare name both sides have is 42702 rather than the left side's.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE j (id int PRIMARY KEY, g text, n int)")
+        cur.execute("CREATE TABLE k (id int PRIMARY KEY, jid int, v int)")
+        cur.execute("INSERT INTO j VALUES (1,'a',10),(2,'b',20),(3,'c',NULL)")
+        cur.execute("INSERT INTO k VALUES (10,1,100),(11,1,200),(12,2,300)")
+
+        def rows(sql: str) -> list[tuple]:
+            cur.execute(sql)
+            return cur.fetchall()
+
+        assert rows(
+            "SELECT j.id, count(k.id) FROM j LEFT JOIN k ON k.jid = j.id "
+            "GROUP BY j.id ORDER BY j.id"
+        ) == [(1, 2), (2, 1), (3, 0)]
+        assert rows(
+            "SELECT j.id, k.v FROM j LEFT JOIN k ON k.jid = j.id WHERE k.v > 150 ORDER BY 1"
+        ) == [(1, 200), (2, 300)]
+        assert rows("SELECT * FROM j JOIN k USING (id)") == []
+        assert rows("SELECT * FROM j JOIN k ON k.jid = j.id ORDER BY k.id")[0] == (
+            1,
+            "a",
+            10,
+            10,
+            1,
+            100,
+        )
+        assert rows(
+            "SELECT j.id, k.v FROM j FULL JOIN k ON k.jid = j.id AND k.v > 150 ORDER BY 1, 2"
+        ) == [(1, 200), (2, 300), (3, None), (None, 100)]
+        assert rows(
+            "SELECT j.g, row_number() OVER (PARTITION BY j.g ORDER BY k.v DESC) "
+            "FROM j JOIN k ON k.jid = j.id ORDER BY 1, 2"
+        ) == [("a", 1), ("a", 2), ("b", 1)]
+        assert rows("SELECT count(*) FROM j CROSS JOIN k") == [(9,)]
+        with pytest.raises(psycopg.errors.AmbiguousColumn):
+            cur.execute("SELECT id FROM j JOIN k ON k.jid = j.id")
+        with pytest.raises(psycopg.errors.UndefinedColumn, match="j.nosuch"):
+            cur.execute("SELECT j.nosuch FROM j JOIN k ON k.jid = j.id")
+
+
+def test_a_cte_is_visible_inside_a_subquery(home: Path) -> None:
+    """A subquery is resolved on its own, before the `WITH` around it is
+    inlined -- so it could not see the statement's CTEs (42P01)."""
+    with _Server(home) as server, server.connect() as conn:
+        _dept_emp(conn)
+        cur = conn.cursor()
+        cur.execute(
+            "WITH big AS (SELECT id FROM sq_emp WHERE salary > 120) "
+            "SELECT id FROM sq_emp WHERE id IN (SELECT id FROM big) ORDER BY id"
+        )
+        assert cur.fetchall() == [(2,), (3,)]
+
+
+def test_a_volatile_subquery_runs_once_per_execution(home: Path) -> None:
+    """An uncorrelated subquery runs at plan time, and a statement is planned
+    for its Describe as well as its Execute -- so `nextval` in one advanced
+    the sequence two and three times per statement. PostgreSQL: once."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE SEQUENCE s")
+        assert cur.execute("SELECT (SELECT nextval('s'))", prepare=True).fetchall() == [(1,)]
+        assert cur.execute("SELECT (SELECT nextval('s'))").fetchall() == [(2,)]
+        assert cur.execute("SELECT currval('s')").fetchall() == [(2,)]

@@ -72,3 +72,6 @@ SELECT ARRAY(SELECT id FROM sq_dept ORDER BY id)
 SELECT count(*) FROM (SELECT id FROM sq_dept WHERE id IN (SELECT dept_id FROM sq_emp)) s
 # --- an undefined column inside a subquery keeps its 42703 ---
 SELECT id FROM sq_dept WHERE id IN (SELECT nosuchcol FROM sq_emp)
+WITH big AS (SELECT id FROM sq_emp WHERE salary > 120) SELECT id FROM sq_emp WHERE id IN (SELECT id FROM big) ORDER BY id
+WITH big AS (SELECT id FROM sq_emp WHERE salary > 120) SELECT id, (SELECT count(*) FROM big) FROM sq_dept ORDER BY id
+WITH d AS (SELECT id FROM sq_dept) SELECT id FROM sq_dept x WHERE EXISTS (SELECT 1 FROM d WHERE d.id = x.id AND x.budget > 100) ORDER BY id

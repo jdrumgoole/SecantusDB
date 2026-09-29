@@ -994,9 +994,15 @@ fn drop_table_is_planned() {
     // would be the wrong kind of helpful.
     let err = plan("DROP TABLE t CASCADE", &lookup).expect_err("cascade");
     assert_eq!(err.sqlstate(), "0A000");
-    // Other DROP targets stay refused rather than dropping the wrong thing.
-    let err = plan("DROP INDEX i", &lookup).expect_err("drop index");
-    assert_eq!(err.sqlstate(), "0A000");
+    // An index and a view are their own statements, never a table drop.
+    assert!(matches!(
+        plan_ok("DROP INDEX i, j"),
+        Statement::DropIndex { names, if_exists: false } if names == ["i", "j"]
+    ));
+    assert!(matches!(
+        plan_ok("DROP VIEW IF EXISTS v CASCADE"),
+        Statement::DropView { names, if_exists: true, cascade: true } if names == ["v"]
+    ));
 }
 
 /// Constant expressions, with the corners PostgreSQL gets surprising.

@@ -1,0 +1,483 @@
+//! Correlated subqueries: a subquery whose value depends on the OUTER row.
+//!
+//! An uncorrelated subquery is run once at plan time and replaced by what it
+//! returned (`resolve_one_sublink`). A correlated one has a different value
+//! per outer row, so it is replaced instead by a call this module evaluates
+//! PER ROW: its references to the outer query become `$N` parameters of the
+//! stored inner SQL, and the outer query passes those columns as the call's
+//! arguments. Everything around it -- a residual WHERE, a select-list
+//! expression, a join -- already evaluates expressions per row, so the call
+//! needs no new plan node.
+//!
+//! The inner query is planned and run by the EXECUTOR's runner, installed for
+//! the duration of a statement's execution (`with_correlated_runner`); the
+//! planner alone cannot read storage. Results are memoised by the parameter
+//! values, so an outer column with few distinct values costs few runs.
+//!
+//! That is O(distinct outer values) plans and scans -- correct first. The
+//! semi-join rewrite for `EXISTS` / `IN` that PostgreSQL itself does is the
+//! better plan and is not done here.
+
+use super::*;
+use pg_query::protobuf::a_const::Val;
+
+/// The internal function a correlated subquery becomes. A unit separator
+/// keeps it out of any name a user can write.
+pub(crate) const CORRELATED: &str = "\u{1f}correlated";
+
+/// Plans and runs a correlated subquery's SQL with its bound values.
+pub type CorrelatedRunner<'a> = dyn Fn(&str, &[Bson]) -> Result<Vec<Vec<Bson>>> + 'a;
+type Runner = CorrelatedRunner<'static>;
+
+thread_local! {
+    static RUNNER: std::cell::Cell<Option<*const Runner>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with `runner` as the way to run a correlated subquery's SQL. The
+/// runner is only reachable while `f` runs, which is what makes the raw
+/// pointer sound: it never outlives the borrow it was taken from.
+pub fn with_correlated_runner<R>(runner: &CorrelatedRunner<'_>, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<*const Runner>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            RUNNER.with(|r| r.set(self.0));
+        }
+    }
+    // SAFETY: only the lifetime is erased; `Restore` puts the previous
+    // pointer back before `runner`'s borrow ends, on every exit from `f`.
+    let ptr: *const Runner = unsafe {
+        std::mem::transmute::<
+            *const (dyn Fn(&str, &[Bson]) -> Result<Vec<Vec<Bson>>> + '_),
+            *const Runner,
+        >(runner)
+    };
+    let _restore = Restore(RUNNER.with(|r| r.replace(Some(ptr))));
+    f()
+}
+
+fn run(sql: &str, params: &[Bson]) -> Result<Vec<Vec<Bson>>> {
+    match RUNNER.with(|r| r.get()) {
+        // SAFETY: set only inside `with_correlated_runner`, whose borrow is
+        // still live while the pointer is installed.
+        Some(runner) => unsafe { (*runner)(sql, params) },
+        None => Err(Error::Unsupported(
+            "a correlated subquery evaluated outside a statement's execution".into(),
+        )),
+    }
+}
+
+fn int_const(v: i32) -> pg_query::protobuf::Node {
+    pg_query::protobuf::Node {
+        node: Some(N::AConst(pg_query::protobuf::AConst {
+            isnull: false,
+            location: -1,
+            val: Some(Val::Ival(pg_query::protobuf::Integer { ival: v })),
+        })),
+    }
+}
+
+fn str_const(v: &str) -> pg_query::protobuf::Node {
+    pg_query::protobuf::Node {
+        node: Some(N::AConst(pg_query::protobuf::AConst {
+            isnull: false,
+            location: -1,
+            val: Some(Val::Sval(pg_query::protobuf::String {
+                sval: v.to_string(),
+            })),
+        })),
+    }
+}
+
+fn null_const() -> pg_query::protobuf::Node {
+    pg_query::protobuf::Node {
+        node: Some(N::AConst(pg_query::protobuf::AConst {
+            isnull: true,
+            location: -1,
+            val: None,
+        })),
+    }
+}
+
+/// Visit every expression node of a SELECT at every level -- its clauses,
+/// its JOIN conditions, its FROM-subqueries, its CTEs, the sides of a set
+/// operation, and the bodies of the subqueries inside its expressions.
+fn walk_select(
+    s: &mut pg_query::protobuf::SelectStmt,
+    visit: &mut dyn FnMut(&mut pg_query::protobuf::Node) -> Result<()>,
+) -> Result<()> {
+    let expr = |n: &mut pg_query::protobuf::Node,
+                visit: &mut dyn FnMut(&mut pg_query::protobuf::Node) -> Result<()>|
+     -> Result<()> {
+        walk_expr(n, &mut |node| {
+            visit(node)?;
+            if let Some(N::SubLink(sl)) = node.node.as_mut() {
+                if let Some(N::SelectStmt(body)) =
+                    sl.subselect.as_deref_mut().and_then(|q| q.node.as_mut())
+                {
+                    walk_select(body, visit)?;
+                }
+            }
+            Ok(())
+        })
+    };
+    for n in s
+        .target_list
+        .iter_mut()
+        .chain(s.group_clause.iter_mut())
+        .chain(s.sort_clause.iter_mut())
+        .chain(s.distinct_clause.iter_mut())
+        .chain(s.window_clause.iter_mut())
+    {
+        expr(n, visit)?;
+    }
+    for n in [
+        s.where_clause.as_deref_mut(),
+        s.having_clause.as_deref_mut(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        expr(n, visit)?;
+    }
+    for item in &mut s.from_clause {
+        walk_from(item, visit)?;
+    }
+    for side in [s.larg.as_deref_mut(), s.rarg.as_deref_mut()]
+        .into_iter()
+        .flatten()
+    {
+        walk_select(side, visit)?;
+    }
+    if let Some(with) = s.with_clause.as_mut() {
+        for cte in &mut with.ctes {
+            if let Some(N::CommonTableExpr(c)) = cte.node.as_mut() {
+                if let Some(N::SelectStmt(body)) =
+                    c.ctequery.as_deref_mut().and_then(|q| q.node.as_mut())
+                {
+                    walk_select(body, visit)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn walk_from(
+    item: &mut pg_query::protobuf::Node,
+    visit: &mut dyn FnMut(&mut pg_query::protobuf::Node) -> Result<()>,
+) -> Result<()> {
+    match item.node.as_mut() {
+        Some(N::JoinExpr(j)) => {
+            for side in [j.larg.as_deref_mut(), j.rarg.as_deref_mut()]
+                .into_iter()
+                .flatten()
+            {
+                walk_from(side, visit)?;
+            }
+            if let Some(q) = j.quals.as_deref_mut() {
+                walk_expr(q, visit)?;
+            }
+            Ok(())
+        }
+        Some(N::RangeSubselect(rs)) => {
+            match rs.subquery.as_deref_mut().and_then(|q| q.node.as_mut()) {
+                Some(N::SelectStmt(body)) => walk_select(body, visit),
+                _ => Ok(()),
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Every name the FROM items of `s` can be addressed by, at every level.
+fn inner_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut s = s.clone();
+    for item in &s.from_clause {
+        collect_from_names(item, &mut names);
+    }
+    let _ = walk_select(&mut s, &mut |n| {
+        if let Some(N::SubLink(sl)) = n.node.as_ref() {
+            if let Some(N::SelectStmt(body)) = sl.subselect.as_deref().and_then(|q| q.node.as_ref())
+            {
+                for item in &body.from_clause {
+                    collect_from_names(item, &mut names);
+                }
+            }
+        }
+        Ok(())
+    });
+    names
+}
+
+fn parts_of(c: &pg_query::protobuf::ColumnRef) -> Option<Vec<String>> {
+    c.fields
+        .iter()
+        .map(|f| match f.node.as_ref()? {
+            N::String(s) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Replace every reference in `outer_refs` with its `$N`.
+fn substitute(
+    s: &pg_query::protobuf::SelectStmt,
+    outer_refs: &[Vec<String>],
+    first_param: usize,
+) -> pg_query::protobuf::SelectStmt {
+    let mut out = s.clone();
+    let _ = walk_select(&mut out, &mut |n| {
+        let Some(N::ColumnRef(c)) = n.node.as_ref() else {
+            return Ok(());
+        };
+        let Some(parts) = parts_of(c) else {
+            return Ok(());
+        };
+        if let Some(i) = outer_refs.iter().position(|r| *r == parts) {
+            n.node = Some(N::ParamRef(pg_query::protobuf::ParamRef {
+                number: i32::try_from(first_param + i).unwrap_or(i32::MAX),
+                location: c.location,
+            }));
+        }
+        Ok(())
+    });
+    out
+}
+
+/// A correlated subquery, as the per-row call that stands in for it.
+///
+/// `inner` has had its own uncorrelated subqueries resolved already; `outer`
+/// is the column names the enclosing query's FROM exposes, which is what
+/// tells a correlation from a typo for an UNQUALIFIED reference.
+pub(crate) fn correlate(
+    sl: &pg_query::protobuf::SubLink,
+    inner: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+    outer: &[String],
+) -> Result<pg_query::protobuf::Node> {
+    let kind = SubLinkType::try_from(sl.sub_link_type)
+        .map_err(|_| Error::Unsupported("this subquery form".into()))?;
+    if !matches!(
+        kind,
+        SubLinkType::ExistsSublink
+            | SubLinkType::ExprSublink
+            | SubLinkType::ArraySublink
+            | SubLinkType::AnySublink
+            | SubLinkType::AllSublink
+    ) {
+        return Err(Error::Unsupported("this correlated subquery form".into()));
+    }
+    // Qualified references whose qualifier names nothing inside.
+    let names = inner_names(inner);
+    let mut outer_refs: Vec<Vec<String>> = Vec::new();
+    let mut probe = inner.clone();
+    walk_select(&mut probe, &mut |n| {
+        if let Some(N::ColumnRef(c)) = n.node.as_ref() {
+            if let Some(parts) = parts_of(c) {
+                if parts.len() >= 2
+                    && !names.contains(&parts[parts.len() - 2])
+                    && !outer_refs.contains(&parts)
+                {
+                    outer_refs.push(parts);
+                }
+            }
+        }
+        Ok(())
+    })?;
+    // Unqualified ones, found by planning: a name the subquery cannot resolve
+    // that the outer query has is a correlation; anything else is a typo.
+    let first = params.len() + 1;
+    let (planned, body) = loop {
+        let body = substitute(inner, &outer_refs, first);
+        let mut probe_params = params.to_vec();
+        probe_params.extend(std::iter::repeat_n(Bson::Null, outer_refs.len()));
+        match plan_select(&body, lookup, &probe_params) {
+            Ok(p) => break (p, body),
+            Err(Error::UndefinedColumn(name))
+                if outer.contains(&name) && !outer_refs.contains(&vec![name.clone()]) =>
+            {
+                outer_refs.push(vec![name]);
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    let result_type = match kind {
+        SubLinkType::ExistsSublink | SubLinkType::AnySublink | SubLinkType::AllSublink => {
+            "bool".to_string()
+        }
+        _ => {
+            let def = sub_plan_def(&planned, lookup)?;
+            let first = def
+                .columns
+                .first()
+                .map(|c| c.pg_type.clone())
+                .unwrap_or_else(|| "text".into());
+            if kind == SubLinkType::ArraySublink {
+                format!("{first}[]")
+            } else {
+                first
+            }
+        }
+    };
+    let sql = pg_query::protobuf::Node {
+        node: Some(N::SelectStmt(Box::new(body))),
+    }
+    .deparse()
+    .map_err(|e| Error::Parse(e.to_string()))?;
+    let op = sl
+        .oper_name
+        .first()
+        .and_then(|n| match n.node.as_ref() {
+            Some(N::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "=".to_string());
+    let mut args = vec![
+        int_const(kind as i32),
+        str_const(&sql),
+        str_const(&result_type),
+        str_const(&op),
+        sl.testexpr.as_deref().cloned().unwrap_or_else(null_const),
+        int_const(i32::try_from(params.len()).unwrap_or(i32::MAX)),
+    ];
+    // The statement's own parameters travel as arguments too: the inner SQL
+    // numbers them `$1..$n`, exactly as the outer statement bound them.
+    for i in 1..=params.len() {
+        args.push(pg_query::protobuf::Node {
+            node: Some(N::ParamRef(pg_query::protobuf::ParamRef {
+                number: i32::try_from(i).unwrap_or(i32::MAX),
+                location: -1,
+            })),
+        });
+    }
+    for parts in &outer_refs {
+        args.push(pg_query::protobuf::Node {
+            node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+                fields: parts
+                    .iter()
+                    .map(|p| pg_query::protobuf::Node {
+                        node: Some(N::String(pg_query::protobuf::String { sval: p.clone() })),
+                    })
+                    .collect(),
+                location: sl.location,
+            })),
+        });
+    }
+    Ok(pg_query::protobuf::Node {
+        node: Some(N::FuncCall(Box::new(pg_query::protobuf::FuncCall {
+            funcname: vec![string_node(CORRELATED)],
+            args,
+            // Deparsed when a correlated subquery nests inside another's
+            // SQL, and libpg_query asserts on an Undefined enum there.
+            funcformat: pg_query::protobuf::CoercionForm::CoerceExplicitCall as i32,
+            location: sl.location,
+            ..Default::default()
+        }))),
+    })
+}
+
+fn is_correlated(f: &pg_query::protobuf::FuncCall) -> bool {
+    matches!(
+        f.funcname.as_slice(),
+        [n] if matches!(n.node.as_ref(), Some(N::String(s)) if s.sval == CORRELATED)
+    )
+}
+
+/// The static type of a correlated call, when `f` is one.
+pub(crate) fn correlated_type(f: &pg_query::protobuf::FuncCall) -> Option<String> {
+    if !is_correlated(f) {
+        return None;
+    }
+    match f.args.get(2)?.node.as_ref()? {
+        N::AConst(pg_query::protobuf::AConst {
+            val: Some(Val::Sval(s)),
+            ..
+        }) => Some(s.sval.clone()),
+        _ => None,
+    }
+}
+
+/// Evaluate a correlated call over the row its arguments were read from, or
+/// `None` when `f` is not one.
+pub(crate) fn eval_correlated(
+    f: &pg_query::protobuf::FuncCall,
+    params: &[Bson],
+) -> Option<Result<Bson>> {
+    if !is_correlated(f) {
+        return None;
+    }
+    Some(eval(f, params))
+}
+
+fn eval(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result<Bson> {
+    let arg = |i: usize| -> Result<&pg_query::protobuf::Node> {
+        f.args
+            .get(i)
+            .ok_or_else(|| Error::Internal("a malformed correlated subquery".into()))
+    };
+    let text = |i: usize| -> Result<String> {
+        match const_value(arg(i)?, params)? {
+            Bson::String(s) => Ok(s),
+            _ => Err(Error::Internal("a malformed correlated subquery".into())),
+        }
+    };
+    let int = |i: usize| -> Result<i64> {
+        match const_value(arg(i)?, params)? {
+            Bson::Int32(v) => Ok(i64::from(v)),
+            Bson::Int64(v) => Ok(v),
+            _ => Err(Error::Internal("a malformed correlated subquery".into())),
+        }
+    };
+    let kind = SubLinkType::try_from(i32::try_from(int(0)?).unwrap_or(0))
+        .map_err(|_| Error::Internal("a malformed correlated subquery".into()))?;
+    let sql = text(1)?;
+    let op = text(3)?;
+    let n_params = usize::try_from(int(5)?).unwrap_or(0);
+    let mut inner_params = Vec::new();
+    for i in 6..f.args.len() {
+        inner_params.push(const_value(&f.args[i], params)?);
+    }
+    debug_assert!(inner_params.len() >= n_params);
+    let rows = run(&sql, &inner_params)?;
+    let first = |r: &Vec<Bson>| r.first().cloned().unwrap_or(Bson::Null);
+    match kind {
+        SubLinkType::ExistsSublink => Ok(Bson::Boolean(!rows.is_empty())),
+        SubLinkType::ExprSublink => {
+            if rows.len() > 1 {
+                return Err(Error::CardinalityViolation(
+                    "more than one row returned by a subquery used as an expression".into(),
+                ));
+            }
+            Ok(rows.first().map_or(Bson::Null, first))
+        }
+        SubLinkType::ArraySublink => Ok(Bson::Array(rows.iter().map(first).collect())),
+        SubLinkType::AnySublink | SubLinkType::AllSublink => {
+            // `x op ANY (values)` over what this row's subquery returned: the
+            // constant evaluator already has ANY / ALL's three-valued rules.
+            let test = const_value(arg(4)?, params)?;
+            let values = Bson::Array(rows.iter().map(first).collect());
+            eval_scalar_array_const(&op, test, values, kind == SubLinkType::AnySublink)
+        }
+        _ => Err(Error::Unsupported("this correlated subquery form".into())),
+    }
+}
+
+/// Does this computed column contain a correlated subquery? Such a column
+/// has to be evaluated where the executor's runner is installed, not lazily
+/// inside a row stream that outlives it.
+pub fn has_correlated(expr: &ColumnExpr) -> bool {
+    let ColumnExpr::Row { expr, .. } = expr else {
+        return false;
+    };
+    let mut node = (**expr).clone();
+    let mut found = false;
+    let _ = walk_expr(&mut node, &mut |n| {
+        if let Some(N::FuncCall(f)) = n.node.as_ref() {
+            found |= is_correlated(f);
+        }
+        Ok(())
+    });
+    found
+}

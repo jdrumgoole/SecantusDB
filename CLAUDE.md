@@ -357,8 +357,8 @@ one request path:
     `(select 1)`, `EXISTS` / `NOT EXISTS`, `IN` / `NOT IN`, `ANY` / `ALL`,
     `ARRAY(select …)`, `FROM (select …) s` with `s(a, b)` column aliases, and
     non-recursive `WITH`. The subquery corpus is 45/50 against PostgreSQL
-    14.13 (`tools/probes/pg_corpora/subqueries.sql`); the five that differ
-    are CORRELATED subqueries, refused by name.
+    14.13 (`tools/probes/pg_corpora/subqueries.sql`); the five that differed
+    were CORRELATED subqueries, which landed 2026-09-29 (below).
 
     **And window functions landed 2026-09-28 too**, the other lever named
     above: the whole family (`row_number` / `rank` / `dense_rank` /
@@ -430,52 +430,49 @@ one request path:
     `secantus_pgplan::relation_name`) or a user's own `columns` table becomes
     unreachable.
 
-    **What remains refused**: correlated subqueries, a window function over an
-    AGGREGATE, `SELECT *` over a JOIN, array subscripting,
-    `CREATE INDEX`, `CREATE VIEW`, `CREATE TRIGGER`,
-    `EXPLAIN`, composite `PRIMARY KEY` / multi-column `FOREIGN KEY`, and a
-    non-literal column `DEFAULT`.
+    **General JOINs, correlated subqueries, views and indexes landed
+    2026-09-29.** A JOIN of any kind -- inner / LEFT / RIGHT / FULL / CROSS,
+    `USING`, `NATURAL`, three or more relations, subquery and function sides
+    -- is planned as a SOURCE (`secantus-pgplan/src/joins.rs`) and every
+    clause over it is the single-source planner's, so `SELECT *`, aggregates
+    and windows over a join all work. A correlated subquery becomes a per-row
+    call (`correlated.rs`), evaluated by a runner the executor installs.
+    `CREATE [UNIQUE] INDEX` and `CREATE VIEW` share the Python server's
+    on-disk shape. Corpora: `joins` 0/38, `subqueries` 0/53, `ddl` 0/41,
+    `indexes` 2/48, `views` 2/44, `correlated` 1/24.
 
-    Two things about the subquery work worth carrying:
+    Three rules from that work worth carrying:
 
-    - **An uncorrelated subquery is RUN during planning** and replaced by the
-      values it returned, which is what PostgreSQL does with one too. That is
-      why `IN (select …)` needed no new plan node — it lowers through the
-      `ANY`/`ALL` path that already had the three-valued rules right. The
-      planner is handed a runner callback by the executor; a caller with no
-      executor (a CHECK constraint, a `DO` block) keeps the refusal.
-    - **Correlation cannot be detected by planning the subquery and catching
-      `42703`.** The lowering resolves a column by the LAST part of its name
-      and ignores the qualifier, so `exists (select 1 from e where e.dept_id =
-      d.id)` bound the outer `d.id` to the inner table's own `id`, planned
-      clean, and answered TRUE FOR EVERY ROW. `foreign_qualifier` refuses any
-      qualified reference naming nothing in the subquery's own FROM. Anything
-      that later makes correlated subqueries work must keep that check honest
-      — the qualifier is still ignored everywhere else.
+    - **A joined row is keyed `alias<U+001F>column`, and the source exposes
+      ONLY those keys.** The lowering resolves a column by its LAST name part
+      and ignores the qualifier, so `j.id` and `k.id` would otherwise be one
+      column. Every reference is rewritten to its key first; one the rewrite
+      misses finds nothing and is a 42703 -- never a binding to the wrong
+      side. A bare name both sides have is 42702.
+    - **The narrow two-table join path still goes FIRST**, because psycopg's
+      catalog queries rely on its regtype-aware OID equality. It now refuses
+      (and so hands to the general planner) the three shapes it answered
+      wrongly: a WHERE on the NULLABLE side of a LEFT JOIN (it pre-filtered,
+      keeping rows PostgreSQL drops), a bare name both sides have, and a
+      qualifier naming neither side.
+    - **A subquery with a side effect runs only in the plan that EXECUTES.**
+      A statement is planned for its Describe as well as its Execute, and an
+      uncorrelated subquery runs during planning -- so `select (select
+      nextval('s'))` advanced the sequence two and three times.
+      `planning_to_execute` marks the executing plan; every other plan sees
+      a volatile subquery return no rows.
 
-    **Subqueries work in every UNCORRELATED form** — a scalar `(select 1)`,
-    `EXISTS` / `NOT EXISTS`, `IN` / `NOT IN`, `ANY` / `ALL`, `ARRAY(select …)`,
-    `FROM (select …) s` with `s(a, b)` column aliases, and non-recursive
-    `WITH`. Measured on a 50-line corpus against PostgreSQL 14.13
-    (`tools/probes/pg_corpora/subqueries.sql`): 5 divergences, all of them
-    CORRELATED subqueries, refused by name.
+    **What remains refused**: a window function over an AGGREGATE or a
+    generated source, writing THROUGH a view, an expression / non-btree
+    index, `CREATE TRIGGER`, `EXPLAIN`, composite `PRIMARY KEY` / multi-column
+    `FOREIGN KEY`, a non-literal column `DEFAULT`, and correlation through an
+    aggregate in HAVING.
 
-    Two things about that worth carrying:
-
-    - **An uncorrelated subquery is RUN during planning** and replaced by the
-      values it returned, which is what PostgreSQL does with one too. That is
-      why `IN (select …)` needed no new plan node — it lowers through the
-      `ANY`/`ALL` path that already had the three-valued rules right. The
-      planner is handed a runner callback by the executor; a caller with no
-      executor (a CHECK constraint, a `DO` block) keeps the refusal.
-    - **Correlation cannot be detected by planning the subquery and catching
-      `42703`.** The lowering resolves a column by the LAST part of its name
-      and ignores the qualifier, so `exists (select 1 from e where e.dept_id =
-      d.id)` bound the outer `d.id` to the inner table's own `id`, planned
-      clean, and answered TRUE FOR EVERY ROW. `foreign_qualifier` refuses any
-      qualified reference naming nothing in the subquery's own FROM. Anything
-      that later makes correlated subqueries work must keep that check honest
-      — the qualifier is still ignored everywhere else.
+    **Correlation detection is still the qualifier check.** `foreign_qualifier`
+    finds a qualified reference naming nothing in the subquery's own FROM and
+    routes the subquery to the per-row path; an UNQUALIFIED outer reference is
+    found by planning and catching 42703 for a name the outer query has.
+    Keep both honest -- the qualifier is ignored everywhere else.
 
     **Both clause-dropping bugs this survey found are now FIXED** (2026-09-28).
     `ON CONFLICT` and `GROUPING SETS` / `ROLLUP` / `CUBE` were each parsed and
@@ -488,13 +485,13 @@ one request path:
 
     So do not read "96.8% of psycopg passes" as "nearly done". A SQL-shaped gauge
     (`sqllogictest`, the SQLAlchemy dialect suite) would score very differently.
-    With subqueries, CTEs, window functions, `ALTER TABLE`, sequences and
-    `information_schema` landed, the next levers are `CREATE INDEX` (which
-    also unblocks a partial-index `ON CONFLICT` arbiter, `ALTER TABLE ADD
-    CONSTRAINT UNIQUE`, and two of the four catalog lines left), the
-    `arrays` / `datetimes` / `strings` function surface (24, 18 and 18
-    divergences, all breadth rather than depth), `CREATE VIEW`, and
-    correlated subqueries.
+    With joins, subqueries (correlated too), CTEs, window functions, views,
+    indexes, `ALTER TABLE`, sequences and `information_schema` landed, the
+    next levers are the function surface (`fts`, `jsonpath_number`,
+    `json_record`, `datetimes`, `char_padding` and the statistical
+    aggregates are the corpora with the most divergences -- run
+    `tools/probes/pg_differential.py ... --rust` over `pg_corpora/` for the
+    current counts rather than trusting a number here).
   - Not there yet, beyond the survey above: password verification (a role's SCRAM
     verifier is stored and never checked — a wrong password and no password both
     connect, re-probed 2026-09-18, re-confirmed live 2026-09-28 by connecting

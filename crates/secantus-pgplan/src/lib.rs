@@ -16,10 +16,13 @@ use bson::{doc, Bson, Document};
 pub mod acl;
 pub mod arrays;
 pub mod bytea;
+pub mod correlated;
 pub mod escape_strings;
 pub mod geo;
 pub mod geometry;
 pub mod hstore;
+pub mod joins;
+pub use correlated::with_correlated_runner;
 pub mod json;
 pub mod net;
 pub mod numeric;
@@ -99,6 +102,9 @@ pub enum Error {
     /// Distinct from `Unsupported`: PostgreSQL has no such function either, so
     /// this is the answer a real server gives rather than a gap in this one.
     UndefinedFunction(String),
+    /// An error PostgreSQL raises with its own SQLSTATE and message, where no
+    /// dedicated variant exists: `(sqlstate, message)`.
+    Sqlstate(&'static str, String),
     /// More than one command where only one is allowed -> 42601.
     ///
     /// PostgreSQL accepts a multi-command string over the SIMPLE query
@@ -192,6 +198,7 @@ impl std::fmt::Display for Error {
             | Error::CannotCoerce(m)
             | Error::InvalidForeignKey(m)
             | Error::Internal(m) => write!(f, "{m}"),
+            Error::Sqlstate(_, m) => write!(f, "{m}"),
             Error::MultipleCommands => {
                 write!(
                     f,
@@ -256,6 +263,7 @@ impl Error {
             Error::CannotCoerce(_) => "42846",      // cannot_coerce
             Error::InvalidForeignKey(_) => "42830", // invalid_foreign_key
             Error::Internal(_) => "XX000",          // internal_error
+            Error::Sqlstate(code, _) => code,
         }
     }
 }
@@ -320,6 +328,24 @@ pub enum Statement {
     ValuesConstant(ValuesConstant),
     Transaction(TransactionControl),
     DropTable(DropTable),
+    /// The rows of a general JOIN, planned as a source: only ever the `plan`
+    /// of a `SubSource`, never executed on its own.
+    JoinRows(joins::JoinRows),
+    /// `CREATE [UNIQUE] INDEX`.
+    CreateIndex(CreateIndex),
+    /// `DROP INDEX <name>, ...`.
+    DropIndex {
+        names: Vec<String>,
+        if_exists: bool,
+    },
+    /// `CREATE [OR REPLACE] VIEW <name> [(cols)] AS <select>`.
+    CreateView(CreateView),
+    /// `DROP VIEW <name>, ...`.
+    DropView {
+        names: Vec<String>,
+        if_exists: bool,
+        cascade: bool,
+    },
     /// `CREATE TYPE <name> AS ENUM (<labels>)`.
     CreateEnum {
         name: String,
@@ -1656,6 +1682,48 @@ pub struct DropTable {
     pub if_exists: bool,
 }
 
+/// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name] ON t (cols) [INCLUDE (...)]
+/// [WHERE pred]`.
+///
+/// An index maps onto a STORAGE index over the table's collection -- the shape
+/// the Python server writes too, so either server reads the other's. It never
+/// changes an answer, except that a UNIQUE one enforces.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateIndex {
+    /// `None` when the statement named no index: the server picks
+    /// PostgreSQL's `<table>_<cols>_idx`, numbered on a collision.
+    pub name: Option<String>,
+    pub table: String,
+    /// `(column, descending)`, in key order.
+    pub columns: Vec<(String, bool)>,
+    /// `INCLUDE (...)` columns: metadata only, reported by the catalog.
+    pub include: Vec<String>,
+    pub unique: bool,
+    pub if_not_exists: bool,
+    /// `WHERE pred` lowered to a filter over stored fields.
+    pub predicate: Option<Document>,
+    /// The predicate as PostgreSQL renders it in `pg_indexes.indexdef`.
+    pub predicate_sql: Option<String>,
+    /// `btree` or `hash`.
+    pub method: String,
+}
+
+/// `CREATE [OR REPLACE] VIEW`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateView {
+    pub name: String,
+    /// The deparsed SELECT alone, before any column list is applied.
+    pub body: String,
+    /// The stored definition: the deparsed SELECT, wrapped so a declared
+    /// column list renames its outputs.
+    pub definition: String,
+    /// The declared column list, empty when none was written.
+    pub columns: Vec<String>,
+    pub replace: bool,
+    /// `LOCAL` / `CASCADED` for `WITH CHECK OPTION`.
+    pub check_option: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Update {
     pub table: String,
@@ -1677,6 +1745,8 @@ pub struct Update {
     /// express.
     pub set_subscripts: Vec<SubscriptAssign>,
     pub filter: Document,
+    /// As `Delete::residual`.
+    pub residual: Option<ColumnExpr>,
     /// `UPDATE ... RETURNING`, over the rows AFTER the update -- which is
     /// what PostgreSQL returns. Dropped on the floor before 2026-09-20: the
     /// rows were updated and the client got no rowset at all.
@@ -1709,6 +1779,9 @@ pub enum SubscriptTarget {
 pub struct Delete {
     pub table: String,
     pub filter: Document,
+    /// A WHERE (or the part of one) that does not lower to a filter,
+    /// evaluated per candidate row by the executor.
+    pub residual: Option<ColumnExpr>,
     /// `DELETE ... RETURNING`, over the rows as they were before the delete.
     pub returning: Option<Returning>,
 }
@@ -2033,6 +2106,7 @@ pub fn plan_with_params(
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &[Bson],
 ) -> Result<Statement> {
+    joins::clear_planned_joins();
     plan_node(parse_one(sql)?, lookup, params)
 }
 
@@ -2074,6 +2148,8 @@ fn plan_node(
         N::CreateStmt(c) => plan_create(&c),
         N::AlterTableStmt(a) => plan_alter_table(&a, lookup, params),
         N::CreateSeqStmt(c) => plan_create_sequence(&c),
+        N::IndexStmt(i) => plan_create_index(&i, lookup, params),
+        N::ViewStmt(v) => plan_create_view(&v),
         N::AlterSeqStmt(a) => plan_alter_sequence(&a),
         N::RenameStmt(r) => plan_rename(&r),
         N::CreateTableAsStmt(c) => plan_create_table_as(&c, lookup, params),
@@ -3243,6 +3319,414 @@ pub fn relation_name(r: &pg_query::protobuf::RangeVar) -> String {
     }
 }
 
+/// `CREATE [UNIQUE] INDEX`.
+///
+/// What cannot be mapped onto a storage index is refused BY NAME rather than
+/// approximated: an expression key, an operator class, a collation, a
+/// non-default NULLS ordering and the non-btree access methods all change
+/// either what the index enforces or what the catalog must report, and an
+/// index silently built as something else is the wrong index.
+fn plan_create_index(
+    i: &pg_query::protobuf::IndexStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Result<Statement> {
+    let relation = i
+        .relation
+        .as_ref()
+        .ok_or_else(|| Error::Parse("CREATE INDEX without a relation".into()))?;
+    let table = relation.relname.clone();
+    let def = lookup(&table).ok_or_else(|| write_target_missing(&table, "an index on"))?;
+    let method = if i.access_method.is_empty() {
+        "btree".to_string()
+    } else {
+        i.access_method.to_ascii_lowercase()
+    };
+    match method.as_str() {
+        "btree" => {}
+        "hash" => {
+            if i.unique {
+                return Err(Error::FeatureNotSupported(
+                    "access method \"hash\" does not support unique indexes".into(),
+                ));
+            }
+            if i.index_params.len() > 1 {
+                return Err(Error::FeatureNotSupported(
+                    "access method \"hash\" does not support multicolumn indexes".into(),
+                ));
+            }
+        }
+        other => {
+            return Err(Error::Unsupported(format!(
+                "an index using access method \"{other}\""
+            )))
+        }
+    }
+    if i.nulls_not_distinct {
+        return Err(Error::Unsupported("UNIQUE NULLS NOT DISTINCT".into()));
+    }
+    let mut columns = Vec::new();
+    for p in &i.index_params {
+        let Some(N::IndexElem(e)) = p.node.as_ref() else {
+            return Err(Error::Unsupported("this index key".into()));
+        };
+        if e.expr.is_some() || e.name.is_empty() {
+            return Err(Error::Unsupported("an index over an expression".into()));
+        }
+        if !e.opclass.is_empty() {
+            return Err(Error::Unsupported("an index operator class".into()));
+        }
+        if !e.collation.is_empty() {
+            return Err(Error::Unsupported("an index key COLLATE".into()));
+        }
+        if def.column(&e.name).is_none() {
+            return Err(Error::UndefinedColumn(e.name.clone()));
+        }
+        let desc = SortByDir::try_from(e.ordering) == Ok(SortByDir::SortbyDesc);
+        // The default is NULLS LAST ascending and NULLS FIRST descending; the
+        // storage order is fixed, so only the default can be honoured.
+        let nulls = SortByNulls::try_from(e.nulls_ordering);
+        let non_default = match nulls {
+            Ok(SortByNulls::SortbyNullsFirst) => !desc,
+            Ok(SortByNulls::SortbyNullsLast) => desc,
+            _ => false,
+        };
+        if non_default {
+            return Err(Error::Unsupported(
+                "a non-default NULLS ordering in an index".into(),
+            ));
+        }
+        columns.push((e.name.clone(), desc));
+    }
+    let mut include = Vec::new();
+    for p in &i.index_including_params {
+        let Some(N::IndexElem(e)) = p.node.as_ref() else {
+            return Err(Error::Unsupported("this INCLUDE column".into()));
+        };
+        if e.expr.is_some() || e.name.is_empty() {
+            return Err(Error::FeatureNotSupported(
+                "expressions are not supported in included columns".into(),
+            ));
+        }
+        if def.column(&e.name).is_none() {
+            return Err(Error::UndefinedColumn(e.name.clone()));
+        }
+        include.push(e.name.clone());
+    }
+    let (predicate, predicate_sql) = match i.where_clause.as_deref() {
+        None => (None, None),
+        Some(w) => {
+            let filter = lower_where(w, &def, params)?;
+            let sql = render_index_predicate(w, &def)
+                .or_else(|| w.deparse().ok().map(|s| format!("({s})")))
+                .unwrap_or_default();
+            (Some(filter), Some(sql))
+        }
+    };
+    let name = (!i.idxname.is_empty()).then(|| i.idxname.clone());
+    Ok(Statement::CreateIndex(CreateIndex {
+        name,
+        table,
+        columns,
+        include,
+        unique: i.unique,
+        if_not_exists: i.if_not_exists,
+        predicate,
+        predicate_sql,
+        method,
+    }))
+}
+
+/// An index predicate as PostgreSQL's ruleutils prints it in
+/// `pg_indexes.indexdef` -- every comparison parenthesised, a string constant
+/// carrying its column's cast. `None` for a shape this does not reproduce
+/// exactly; the caller then falls back to the parenthesised deparse.
+fn render_index_predicate(node: &pg_query::protobuf::Node, def: &TableDef) -> Option<String> {
+    use pg_query::protobuf::{a_const::Val, BoolExprType, NullTestType};
+    let column = |n: &pg_query::protobuf::Node| -> Option<String> {
+        let N::ColumnRef(c) = n.node.as_ref()? else {
+            return None;
+        };
+        let name = match c.fields.last()?.node.as_ref()? {
+            N::String(s) => s.sval.clone(),
+            _ => return None,
+        };
+        def.column(&name).map(|_| name)
+    };
+    match node.node.as_ref()? {
+        N::BoolExpr(b) => {
+            let parts: Option<Vec<String>> = b
+                .args
+                .iter()
+                .map(|a| render_index_predicate(a, def))
+                .collect();
+            let parts = parts?;
+            match BoolExprType::try_from(b.boolop).ok()? {
+                BoolExprType::AndExpr => Some(format!("({})", parts.join(" AND "))),
+                BoolExprType::OrExpr => Some(format!("({})", parts.join(" OR "))),
+                BoolExprType::NotExpr => Some(format!("(NOT {})", parts.first()?)),
+                _ => None,
+            }
+        }
+        N::NullTest(t) => {
+            let col = column(t.arg.as_deref()?)?;
+            match NullTestType::try_from(t.nulltesttype).ok()? {
+                NullTestType::IsNull => Some(format!("({col} IS NULL)")),
+                NullTestType::IsNotNull => Some(format!("({col} IS NOT NULL)")),
+                _ => None,
+            }
+        }
+        N::ColumnRef(_) => column(node),
+        N::AExpr(a) if a.kind == pg_query::protobuf::AExprKind::AexprOp as i32 => {
+            let op = match a.name.first()?.node.as_ref()? {
+                N::String(s) => s.sval.clone(),
+                _ => return None,
+            };
+            if !matches!(op.as_str(), "=" | "<>" | "<" | "<=" | ">" | ">=") {
+                return None;
+            }
+            let col = column(a.lexpr.as_deref()?)?;
+            let N::AConst(c) = a.rexpr.as_deref()?.node.as_ref()? else {
+                return None;
+            };
+            let ty = def.column(&col)?.pg_type.clone();
+            let lit = match c.val.as_ref()? {
+                Val::Ival(v) => v.ival.to_string(),
+                Val::Fval(v) if ty == "numeric" => v.fval.clone(),
+                Val::Boolval(v) => v.boolval.to_string(),
+                Val::Sval(v) => {
+                    let cast = match ty.as_str() {
+                        "text" => "text",
+                        "varchar" => "character varying",
+                        _ => return None,
+                    };
+                    format!("'{}'::{cast}", v.sval.replace('\'', "''"))
+                }
+                _ => return None,
+            };
+            Some(format!("({col} {op} {lit})"))
+        }
+        _ => None,
+    }
+}
+
+/// `CREATE [OR REPLACE] VIEW`. The body is kept as SQL text, which is what the
+/// Python server stores too, and expanded as a FROM-subquery wherever the
+/// view is read (`expand_views`).
+fn plan_create_view(v: &pg_query::protobuf::ViewStmt) -> Result<Statement> {
+    let relation = v
+        .view
+        .as_ref()
+        .ok_or_else(|| Error::Parse("CREATE VIEW without a name".into()))?;
+    if relation.relpersistence == "t" {
+        return Err(Error::Unsupported("CREATE TEMP VIEW".into()));
+    }
+    let query = v
+        .query
+        .as_deref()
+        .ok_or_else(|| Error::Parse("CREATE VIEW without a query".into()))?;
+    let Some(N::SelectStmt(select)) = query.node.as_ref() else {
+        return Err(Error::Unsupported("a view over this statement".into()));
+    };
+    if select.with_clause.as_ref().is_some_and(|w| w.recursive) {
+        return Err(Error::Unsupported("CREATE RECURSIVE VIEW".into()));
+    }
+    let body = query.deparse().map_err(|e| Error::Parse(e.to_string()))?;
+    let columns: Vec<String> = v
+        .aliases
+        .iter()
+        .filter_map(|n| match n.node.as_ref()? {
+            N::String(s) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .collect();
+    let name = relation.relname.clone();
+    // A declared column list renames the outputs. Written into the select
+    // list's own aliases where it can be -- that is the form the Python
+    // server stores and reads -- and as a column-aliased subquery only where
+    // it cannot (a `*` target or a set operation has no per-column alias).
+    let renamed = (!columns.is_empty()
+        && select.op == pg_query::protobuf::SetOperation::SetopNone as i32
+        && select.target_list.len() >= columns.len()
+        && select.target_list.iter().all(|t| {
+            matches!(t.node.as_ref(), Some(N::ResTarget(r))
+                if !matches!(r.val.as_deref().and_then(|v| v.node.as_ref()),
+                    Some(N::ColumnRef(c)) if c.fields.iter().any(|f| matches!(f.node, Some(N::AStar(_))))))
+        }))
+    .then(|| {
+        let mut sel = (**select).clone();
+        for (target, name) in sel.target_list.iter_mut().zip(&columns) {
+            if let Some(N::ResTarget(r)) = target.node.as_mut() {
+                r.name = name.clone();
+            }
+        }
+        pg_query::protobuf::Node {
+            node: Some(N::SelectStmt(Box::new(sel))),
+        }
+        .deparse()
+        .ok()
+    })
+    .flatten();
+    let definition = if columns.is_empty() {
+        body.clone()
+    } else if let Some(renamed) = renamed {
+        renamed
+    } else {
+        let quoted: Vec<String> = columns
+            .iter()
+            .map(|c| crate::scalar::quote_identifier(c))
+            .collect();
+        format!(
+            "SELECT * FROM ({body}) AS {}({})",
+            crate::scalar::quote_identifier(&name),
+            quoted.join(", ")
+        )
+    };
+    let check_option = match pg_query::protobuf::ViewCheckOption::try_from(v.with_check_option) {
+        Ok(pg_query::protobuf::ViewCheckOption::LocalCheckOption) => Some("LOCAL".to_string()),
+        Ok(pg_query::protobuf::ViewCheckOption::CascadedCheckOption) => {
+            Some("CASCADED".to_string())
+        }
+        _ => None,
+    };
+    Ok(Statement::CreateView(CreateView {
+        name,
+        body,
+        definition,
+        columns,
+        replace: v.replace,
+        check_option,
+    }))
+}
+
+thread_local! {
+    /// The views this connection can read: `(name, stored definition)`,
+    /// installed per statement by the wire layer beside the user types.
+    static PLAN_VIEWS: std::cell::RefCell<Vec<(String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Install the views for the statements that follow on this thread.
+pub fn set_views(views: Vec<(String, String)>) {
+    PLAN_VIEWS.with(|v| *v.borrow_mut() = views);
+}
+
+fn view_definition(name: &str) -> Option<String> {
+    PLAN_VIEWS.with(|v| {
+        v.borrow()
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, d)| d.clone())
+    })
+}
+
+/// Is `name` a view this connection can read?
+pub fn is_view(name: &str) -> bool {
+    view_definition(name).is_some()
+}
+
+/// Replace every FROM reference to a VIEW with the subquery its definition
+/// is -- which is what PostgreSQL's rewriter does with a view, too. Only the
+/// top level of this SELECT is rewritten: a FROM-subquery, a subquery in an
+/// expression and each side of a set operation are all planned through
+/// `plan_select` in their turn, which expands their own references.
+fn expand_views(s: &pg_query::protobuf::SelectStmt) -> Result<pg_query::protobuf::SelectStmt> {
+    if PLAN_VIEWS.with(|v| v.borrow().is_empty()) {
+        return Ok(s.clone());
+    }
+    let mut out = s.clone();
+    for item in &mut out.from_clause {
+        expand_views_in_from(item, 0)?;
+    }
+    Ok(out)
+}
+
+fn expand_views_in_from(item: &mut pg_query::protobuf::Node, depth: usize) -> Result<()> {
+    match item.node.as_mut() {
+        Some(N::RangeVar(r)) => {
+            if !(r.schemaname.is_empty() || r.schemaname == "public") || !r.catalogname.is_empty() {
+                return Ok(());
+            }
+            let Some(definition) = view_definition(&r.relname) else {
+                return Ok(());
+            };
+            // A view whose definition reaches itself (only possible through
+            // OR REPLACE) is PostgreSQL's 42P17 at query time.
+            if depth > 32 {
+                return Err(Error::Unsupported(format!(
+                    "infinite recursion detected in rules for relation \"{}\"",
+                    r.relname
+                )));
+            }
+            let N::SelectStmt(body) = parse_one(&definition)? else {
+                return Err(Error::Internal(format!(
+                    "the stored definition of view \"{}\" is not a SELECT",
+                    r.relname
+                )));
+            };
+            let mut body = *body;
+            for inner in &mut body.from_clause {
+                expand_views_in_from(inner, depth + 1)?;
+            }
+            let alias = r
+                .alias
+                .clone()
+                .filter(|a| !a.aliasname.is_empty())
+                .unwrap_or(pg_query::protobuf::Alias {
+                    aliasname: r.relname.clone(),
+                    colnames: Vec::new(),
+                });
+            item.node = Some(N::RangeSubselect(Box::new(
+                pg_query::protobuf::RangeSubselect {
+                    lateral: false,
+                    subquery: Some(Box::new(pg_query::protobuf::Node {
+                        node: Some(N::SelectStmt(Box::new(body))),
+                    })),
+                    alias: Some(alias),
+                },
+            )));
+            Ok(())
+        }
+        Some(N::JoinExpr(j)) => {
+            for side in [j.larg.as_mut(), j.rarg.as_mut()].into_iter().flatten() {
+                expand_views_in_from(side, depth)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The error for a statement whose target relation is not a table: a VIEW is
+/// refused by name (this server does not write through one), anything else
+/// is the ordinary 42P01.
+fn write_target_missing(table: &str, what: &str) -> Error {
+    if is_view(table) {
+        Error::Unsupported(format!("{what} a view"))
+    } else {
+        Error::UndefinedTable(table.to_string())
+    }
+}
+
+/// Every view whose definition reads `table`, for DROP's dependency check.
+pub fn views_reading(table: &str) -> Vec<String> {
+    PLAN_VIEWS.with(|v| {
+        v.borrow()
+            .iter()
+            .filter(|(_, d)| {
+                pg_query::parse(d)
+                    .map(|p| {
+                        p.tables()
+                            .iter()
+                            .any(|t| t == table || t == &format!("public.{table}"))
+                    })
+                    .unwrap_or(false)
+            })
+            .map(|(n, _)| n.clone())
+            .collect()
+    })
+}
+
 fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
     use pg_query::protobuf::ConstrType as CT;
     let relation = c
@@ -3985,7 +4469,7 @@ fn plan_insert(
         .as_ref()
         .map(|r| r.relname.clone())
         .ok_or_else(|| Error::Parse("INSERT without a relation".into()))?;
-    let def = lookup(&table).ok_or_else(|| Error::UndefinedTable(table.clone()))?;
+    let def = lookup(&table).ok_or_else(|| write_target_missing(&table, "INSERT into"))?;
 
     // Explicit column list, else every column in declared order.
     let targets: Vec<String> = if i.cols.is_empty() {
@@ -5466,7 +5950,41 @@ fn walk_expr(
             }
             Ok(())
         }
-        N::FuncCall(f) => f.args.iter_mut().try_for_each(|a| walk_expr(a, visit)),
+        N::FuncCall(f) => {
+            f.args.iter_mut().try_for_each(|a| walk_expr(a, visit))?;
+            // An aggregate's ORDER BY and FILTER, and a window's PARTITION BY
+            // and ORDER BY, read the row too.
+            f.agg_order
+                .iter_mut()
+                .try_for_each(|a| walk_expr(a, visit))?;
+            if let Some(filter) = f.agg_filter.as_deref_mut() {
+                walk_expr(filter, visit)?;
+            }
+            if let Some(over) = f.over.as_deref_mut() {
+                walk_window_def(over, visit)?;
+            }
+            Ok(())
+        }
+        N::WindowDef(w) => walk_window_def(w, visit),
+        N::SortBy(sb) => sb
+            .node
+            .as_deref_mut()
+            .map_or(Ok(()), |a| walk_expr(a, visit)),
+        N::ResTarget(rt) => rt
+            .val
+            .as_deref_mut()
+            .map_or(Ok(()), |a| walk_expr(a, visit)),
+        N::BooleanTest(t) => t.arg.as_deref_mut().map_or(Ok(()), |a| walk_expr(a, visit)),
+        N::CollateClause(c) => c.arg.as_deref_mut().map_or(Ok(()), |a| walk_expr(a, visit)),
+        N::NamedArgExpr(a) => a.arg.as_deref_mut().map_or(Ok(()), |a| walk_expr(a, visit)),
+        N::GroupingSet(g) => g.content.iter_mut().try_for_each(|a| walk_expr(a, visit)),
+        N::List(l) => l.items.iter_mut().try_for_each(|a| walk_expr(a, visit)),
+        // The TESTED expression of `x IN (select ...)` belongs to this row;
+        // the subquery's body does not (see above).
+        N::SubLink(sl) => sl
+            .testexpr
+            .as_deref_mut()
+            .map_or(Ok(()), |a| walk_expr(a, visit)),
         N::BoolExpr(b) => b.args.iter_mut().try_for_each(|a| walk_expr(a, visit)),
         N::AArrayExpr(a) => a.elements.iter_mut().try_for_each(|a| walk_expr(a, visit)),
         N::RowExpr(r) => r.args.iter_mut().try_for_each(|a| walk_expr(a, visit)),
@@ -5512,6 +6030,16 @@ fn walk_expr(
         }
         _ => Ok(()),
     }
+}
+
+fn walk_window_def(
+    w: &mut pg_query::protobuf::WindowDef,
+    visit: &mut dyn FnMut(&mut pg_query::protobuf::Node) -> Result<()>,
+) -> Result<()> {
+    w.partition_clause
+        .iter_mut()
+        .chain(w.order_clause.iter_mut())
+        .try_for_each(|a| walk_expr(a, visit))
 }
 
 /// Evaluate a `ColumnExpr::Row` over one row.
@@ -6491,6 +7019,14 @@ fn resolve_sublinks(
             if let Some(w) = u.where_clause.as_deref_mut() {
                 clauses.push(w);
             }
+            // A SET value may be a subquery too: `SET n = (SELECT ...)`.
+            for t in &mut u.target_list {
+                if let Some(N::ResTarget(rt)) = t.node.as_mut() {
+                    if let Some(v) = rt.val.as_deref_mut() {
+                        clauses.push(v);
+                    }
+                }
+            }
             for c in clauses {
                 resolve_sublinks_in_expr(c, lookup, params, run, &outer)?;
             }
@@ -6522,7 +7058,31 @@ fn outer_columns(
         .unwrap_or_default()
 }
 
+thread_local! {
+    /// The CTEs visible to a subquery being resolved: every enclosing
+    /// statement's `WITH` items, innermost last. A subquery is planned on its
+    /// own, before the `WITH` around it is inlined, so without this
+    /// `with c as (...) select ... where x in (select ... from c)` could not
+    /// see `c` at all.
+    static VISIBLE_CTES: std::cell::RefCell<Vec<pg_query::protobuf::Node>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn resolve_sublinks_in_select(
+    s: &mut pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &mut Vec<Bson>,
+    run: SubqueryRunner<'_>,
+) -> Result<()> {
+    // The scoped body pushes this statement's CTEs once their own bodies are
+    // resolved; whatever it pushed is popped here, on every exit.
+    let depth = VISIBLE_CTES.with(|v| v.borrow().len());
+    let out = resolve_sublinks_in_select_scoped(s, lookup, params, run);
+    VISIBLE_CTES.with(|v| v.borrow_mut().truncate(depth));
+    out
+}
+
+fn resolve_sublinks_in_select_scoped(
     s: &mut pg_query::protobuf::SelectStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &mut Vec<Bson>,
@@ -6551,6 +7111,13 @@ fn resolve_sublinks_in_select(
                     resolve_sublinks_in_select(body, lookup, params, run)?;
                 }
             }
+        }
+        // Visible to the subqueries in the rest of this statement -- pushed
+        // now, with their bodies RESOLVED, so a subquery that copies them in
+        // never resolves them a second time.
+        if !with.recursive {
+            let ctes = with.ctes.clone();
+            VISIBLE_CTES.with(|v| v.borrow_mut().extend(ctes));
         }
     }
     // A set operation's sides, and a FROM-subquery's body, are selects in
@@ -6721,6 +7288,87 @@ fn resolve_sublinks_in_expr(
     Ok(())
 }
 
+thread_local! {
+    /// Is the plan being made the one that will EXECUTE? Every other plan --
+    /// a `Describe`, a classification pass -- must not run a subquery that
+    /// has a side effect, or `select (select nextval('s'))` advances the
+    /// sequence once per plan rather than once per execution. Defaults to
+    /// false, so a planning path nobody marked is side-effect free.
+    static PLANNING_TO_EXECUTE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Mark the plans made inside `f` as the ones that execute.
+pub fn planning_to_execute<R>(f: impl FnOnce() -> R) -> R {
+    let previous = PLANNING_TO_EXECUTE.with(|p| p.replace(true));
+    let out = f();
+    PLANNING_TO_EXECUTE.with(|p| p.set(previous));
+    out
+}
+
+/// A `TypeName` for an internal type name (`int4`, `text[]`).
+fn type_name_node(ty: &str) -> pg_query::protobuf::TypeName {
+    let (base, array) = match ty.strip_suffix("[]") {
+        Some(b) => (b, true),
+        None => (ty, false),
+    };
+    pg_query::protobuf::TypeName {
+        names: vec![string_node(base)],
+        typemod: -1,
+        array_bounds: if array {
+            vec![pg_query::protobuf::Node {
+                node: Some(N::Integer(pg_query::protobuf::Integer { ival: -1 })),
+            }]
+        } else {
+            Vec::new()
+        },
+        location: -1,
+        ..Default::default()
+    }
+}
+
+/// The functions whose call is a side effect or differs per call.
+const VOLATILE_FUNCTIONS: &[&str] = &[
+    "nextval",
+    "setval",
+    "currval",
+    "lastval",
+    "random",
+    "gen_random_uuid",
+    "uuid_generate_v4",
+    "clock_timestamp",
+    "timeofday",
+    "pg_sleep",
+    "pg_advisory_lock",
+    "pg_try_advisory_lock",
+    "txid_current",
+];
+
+fn calls_volatile(s: &pg_query::protobuf::SelectStmt) -> bool {
+    let mut probe = s.clone();
+    let mut found = false;
+    let mut check = |n: &mut pg_query::protobuf::Node| -> Result<()> {
+        if let Some(N::FuncCall(f)) = n.node.as_ref() {
+            if func_name(f).is_some_and(|name| VOLATILE_FUNCTIONS.contains(&name.as_str())) {
+                found = true;
+            }
+        }
+        Ok(())
+    };
+    for n in probe.target_list.iter_mut() {
+        let _ = walk_expr(n, &mut check);
+    }
+    for n in [
+        probe.where_clause.as_deref_mut(),
+        probe.having_clause.as_deref_mut(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let _ = walk_expr(n, &mut check);
+    }
+    found
+}
+
 /// One subquery, resolved to the node that stands in for it.
 fn resolve_one_sublink(
     sl: &pg_query::protobuf::SubLink,
@@ -6736,6 +7384,15 @@ fn resolve_one_sublink(
     // before it is planned, innermost first.
     let mut inner = (**inner).clone();
     resolve_sublinks_in_select(&mut inner, lookup, params, run)?;
+    // The enclosing statements' CTEs are in scope, behind the subquery's own
+    // (inlining takes the first definition of a name, so its own win). Added
+    // AFTER the subquery's own resolution: they are already resolved.
+    let visible = VISIBLE_CTES.with(|v| v.borrow().clone());
+    if !visible.is_empty() {
+        let mut with = inner.with_clause.clone().unwrap_or_default();
+        with.ctes.extend(visible);
+        inner.with_clause = Some(with);
+    }
     let inner = inline_ctes(&inner)?;
 
     // A QUALIFIED reference to something outside the subquery has to be
@@ -6745,27 +7402,44 @@ fn resolve_one_sublink(
     // `d.id` to `sq_emp`'s OWN `id` and planned clean. The EXISTS around it
     // then answered true for every outer row -- a wrong answer, not an error,
     // and invisible until it was diffed against PostgreSQL.
-    if let Some(qualifier) = foreign_qualifier(&inner) {
-        return Err(Error::Unsupported(format!(
-            "a correlated subquery (it reads \"{qualifier}\", which is not in its own FROM)"
-        )));
+    // A CORRELATED subquery -- one reading the outer row -- has no single
+    // value to substitute, so it becomes a call evaluated per row instead
+    // (see `correlated`). Detected two ways, because planning alone cannot
+    // see a qualified one: the lowering resolves a column by its LAST name
+    // part and ignores the qualifier, so `e.dept_id = d.id` would bind the
+    // outer `d.id` to the inner table's own `id` and plan clean.
+    if foreign_qualifier(&inner).is_some() {
+        let test = sl.testexpr.as_deref().cloned();
+        let mut sl = sl.clone();
+        if let Some(mut t) = test {
+            resolve_sublinks_in_expr(&mut t, lookup, params, run, outer)?;
+            sl.testexpr = Some(Box::new(t));
+        }
+        return correlated::correlate(&sl, &inner, lookup, params, outer);
     }
     let plan = match plan_select(&inner, lookup, params) {
         Ok(p) => p,
         // A column the subquery's own FROM does not have, but the query
-        // AROUND it does, is a CORRELATION -- the subquery's value depends on
-        // the outer row, so there is no one set of values to substitute here.
-        // Refused by name; substituting anything would be a wrong answer.
-        // A name the outer query does not have either is an ordinary typo and
-        // keeps its 42703.
+        // AROUND it does, is a correlation too. A name the outer query does
+        // not have either is an ordinary typo and keeps its 42703.
         Err(Error::UndefinedColumn(name)) if outer.contains(&name) => {
-            return Err(Error::Unsupported(format!(
-                "a correlated subquery (it reads the outer column \"{name}\")"
-            )));
+            let test = sl.testexpr.as_deref().cloned();
+            let mut sl = sl.clone();
+            if let Some(mut t) = test {
+                resolve_sublinks_in_expr(&mut t, lookup, params, run, outer)?;
+                sl.testexpr = Some(Box::new(t));
+            }
+            return correlated::correlate(&sl, &inner, lookup, params, outer);
         }
         Err(e) => return Err(e),
     };
-    let rows = run(&plan)?;
+    // A subquery with a side effect runs only in the plan that executes; any
+    // other plan needs just its TYPE, and sees it return no rows.
+    let rows = if calls_volatile(&inner) && !PLANNING_TO_EXECUTE.with(|p| p.get()) {
+        Vec::new()
+    } else {
+        run(&plan)?
+    };
     let first_column = |r: Vec<Bson>| r.into_iter().next().unwrap_or(Bson::Null);
 
     match SubLinkType::try_from(sl.sub_link_type) {
@@ -6777,9 +7451,27 @@ fn resolve_one_sublink(
                 ));
             }
             // No rows is NULL, not zero rows: `(select x from t where false)`
-            // is a NULL value, which is why the empty case is a value at all.
-            let value = rows.into_iter().next().map_or(Bson::Null, first_column);
-            Ok(param_node(params, value))
+            // is a NULL value, which is why the empty case is a value at all
+            // -- and a NULL of the subquery's column TYPE, which a bare NULL
+            // parameter would not carry.
+            match rows.into_iter().next().map(first_column) {
+                Some(value) => Ok(param_node(params, value)),
+                None => {
+                    let ty = sub_plan_def(&plan, lookup)?
+                        .columns
+                        .first()
+                        .map(|c| c.pg_type.clone())
+                        .unwrap_or_else(|| "text".into());
+                    let null = param_node(params, Bson::Null);
+                    Ok(pg_query::protobuf::Node {
+                        node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                            arg: Some(Box::new(null)),
+                            type_name: Some(type_name_node(&ty)),
+                            location: -1,
+                        }))),
+                    })
+                }
+            }
         }
         Ok(SubLinkType::ArraySublink) => {
             let values: Vec<Bson> = rows.into_iter().map(first_column).collect();
@@ -7095,12 +7787,96 @@ fn plan_select(
     if s.with_clause.is_some() {
         return plan_select(&inline_ctes(s)?, lookup, params);
     }
+    // A view is shorthand for the subquery it was defined as, so it is
+    // rewritten away here, before any shape check looks at the FROM list.
+    let expanded = expand_views(s)?;
+    let s = &expanded;
     if s.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
         return plan_set_operation(s, lookup, params);
     }
     if s.from_clause.is_empty() {
         return plan_select_constant(s, params);
     }
+    // A JOIN, or a comma-separated FROM. The narrow two-table join path goes
+    // first: it is what psycopg's catalog queries take, and it compares OIDs
+    // with the regtype / regclass awareness those need. Anything it refuses
+    // becomes a planned SOURCE and the query is rewritten to read it, then
+    // planned like any single-source query (see `joins`).
+    let planned = if joins::is_join(s) {
+        match plan_select_rest(s, lookup, params) {
+            Err(Error::Unsupported(_)) => joins::plan_join_source(s, lookup, params)
+                .and_then(|rewritten| plan_select(&rewritten, lookup, params))
+                .map_err(joins::unmangle),
+            other => other,
+        }
+    } else {
+        plan_select_rest(s, lookup, params)
+    };
+    planned.map_err(|e| qualify_undefined_column(e, s))
+}
+
+/// PostgreSQL names a missing QUALIFIED column with its qualifier --
+/// `column e.nosuch does not exist` -- where the lowering, which resolves by
+/// the last name part, knows only `nosuch`.
+fn qualify_undefined_column(e: Error, s: &pg_query::protobuf::SelectStmt) -> Error {
+    let Error::UndefinedColumn(name) = &e else {
+        return e;
+    };
+    let mut found: Option<String> = None;
+    let mut bare = false;
+    let mut probe = s.clone();
+    let mut check = |n: &mut pg_query::protobuf::Node| -> Result<()> {
+        if let Some(N::ColumnRef(c)) = n.node.as_ref() {
+            let parts: Vec<String> = c
+                .fields
+                .iter()
+                .filter_map(|f| match f.node.as_ref()? {
+                    N::String(s) => Some(s.sval.clone()),
+                    _ => None,
+                })
+                .collect();
+            if parts.len() == 1 && parts[0] == *name {
+                // A BARE reference by this name may be the one that failed --
+                // and is what the correlation detector looks for -- so the
+                // plain error stands.
+                bare = true;
+            }
+            if parts.len() >= 2 && parts.last() == Some(name) && found.is_none() {
+                found = Some(parts[parts.len() - 2..].join("."));
+            }
+        }
+        Ok(())
+    };
+    for n in probe
+        .target_list
+        .iter_mut()
+        .chain(probe.sort_clause.iter_mut())
+        .chain(probe.group_clause.iter_mut())
+    {
+        let _ = walk_expr(n, &mut check);
+    }
+    for n in [
+        probe.where_clause.as_deref_mut(),
+        probe.having_clause.as_deref_mut(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let _ = walk_expr(n, &mut check);
+    }
+    match found {
+        Some(q) if !bare => Error::Sqlstate("42703", format!("column {q} does not exist")),
+        _ => e,
+    }
+}
+
+/// `plan_select` past the rewrites that turn a statement into its canonical
+/// shape (CTEs, views, set operations, a FROM-less select, a general join).
+fn plan_select_rest(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Result<Statement> {
     if !s.group_clause.is_empty() || has_aggregate(s) {
         // A window function OVER an aggregate (`sum(sum(v)) over (order by
         // g)` beside a GROUP BY) runs the window over the GROUPED rows, which
@@ -7190,6 +7966,10 @@ fn plan_select(
         }
         Some(N::RangeSubselect(rs)) => {
             let src = plan_from_subquery(rs, lookup, params)?;
+            (String::new(), src.def.clone(), Some(Box::new(src)))
+        }
+        Some(N::RangeVar(r)) if joins::planned_join(&r.relname).is_some() => {
+            let src = joins::planned_join(&r.relname).expect("checked");
             (String::new(), src.def.clone(), Some(Box::new(src)))
         }
         Some(N::RangeVar(r)) => {
@@ -7459,6 +8239,12 @@ fn plan_aggregate(
         return Err(Error::Unsupported(
             "an aggregate that is not over one table".into(),
         ));
+    }
+    if let Some(N::RangeVar(r)) = s.from_clause[0].node.as_ref() {
+        if let Some(src) = joins::planned_join(&r.relname) {
+            let def = src.def.clone();
+            return finish_aggregate(s, String::new(), None, Some(Box::new(src)), def, params);
+        }
     }
     // `FROM (SELECT ... FROM a JOIN b ON ...) x` -- the joined subquery every
     // psycopg type-registration query is built on. Kept as its own path
@@ -7932,6 +8718,47 @@ fn plan_join_select(
         None => Vec::new(),
         Some(node) => join_where_preds(node, params)?,
     };
+    // Column references this path would resolve LOOSELY -- a bare name both
+    // sides have (it took the left one), a qualifier naming neither side,
+    // a column the named side lacks -- go to the general planner, whose
+    // answers are PostgreSQL's 42702 / 42P01 / 42703.
+    {
+        let side_def = |sub: &Option<Box<Statement>>, table: &str| -> Option<TableDef> {
+            match sub {
+                Some(stmt) => sub_plan_def(stmt, lookup).ok(),
+                None => lookup(table),
+            }
+        };
+        let ldef = side_def(&left_sub, &left.0);
+        let rdef = side_def(&right_sub, &right.0);
+        let has = |d: &Option<TableDef>, c: &str| d.as_ref().is_some_and(|d| d.column(c).is_some());
+        for (i, (_, alias, col)) in columns.iter().enumerate() {
+            if matches!(exprs.get(i), Some(Some(ColumnExpr::Const { .. }))) {
+                continue;
+            }
+            let loose = if alias.is_empty() {
+                has(&ldef, col) && has(&rdef, col)
+            } else if *alias == left.1 {
+                !has(&ldef, col)
+            } else if *alias == right.1 {
+                !has(&rdef, col)
+            } else {
+                true
+            };
+            if loose {
+                return Err(Error::Unsupported("this JOIN target".into()));
+            }
+        }
+    }
+    // This path applies each predicate to its side BEFORE joining. For the
+    // NULLABLE side of a LEFT JOIN that is a different query: PostgreSQL's
+    // WHERE runs after the join and drops the NULL-extended rows, while a
+    // pre-filter keeps them. Such a query goes to the general join planner.
+    if left_join && filter.iter().any(|p| p.alias != left.1) {
+        return Err(Error::Unsupported(
+            "a WHERE on the nullable side of a LEFT JOIN".into(),
+        ));
+    }
 
     // ORDER BY one column.
     let order = match s.sort_clause.len() {
@@ -8041,6 +8868,7 @@ pub fn sub_plan_def(
     lookup: &dyn Fn(&str) -> Option<TableDef>,
 ) -> Result<TableDef> {
     match stmt {
+        Statement::JoinRows(j) => Ok(j.def.clone()),
         Statement::Aggregate(agg) => aggregate_output_def(agg),
         Statement::Select(sel) => select_output_def(sel, lookup),
         Statement::SetOp(set) => {
@@ -8821,6 +9649,9 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
             Some(pg_query::protobuf::a_const::Val::Boolval(_)) => "bool".to_string(),
             _ => inferred_type(value).to_string(),
         },
+        Some(N::FuncCall(f)) if correlated::correlated_type(f).is_some() => {
+            correlated::correlated_type(f).expect("checked")
+        }
         Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("to_regtype") => {
             "regtype".to_string()
         }
@@ -15461,6 +16292,49 @@ fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
             if_exists: d.missing_ok,
         });
     }
+    // `DROP INDEX` / `DROP VIEW`: each object is a List of name parts.
+    if matches!(
+        ObjectType::try_from(d.remove_type),
+        Ok(ObjectType::ObjectIndex | ObjectType::ObjectView)
+    ) {
+        let index = ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectIndex);
+        let cascade = DropBehavior::try_from(d.behavior) == Ok(DropBehavior::DropCascade);
+        let mut names = Vec::new();
+        for obj in &d.objects {
+            let name = match obj.node.as_ref() {
+                Some(N::String(s)) => s.sval.clone(),
+                Some(N::List(l)) => l
+                    .items
+                    .iter()
+                    .filter_map(|n| match n.node.as_ref()? {
+                        N::String(s) => Some(s.sval.clone()),
+                        _ => None,
+                    })
+                    .next_back()
+                    .ok_or_else(|| Error::Parse("DROP without a name".into()))?,
+                _ => return Err(Error::Unsupported("this DROP target".into())),
+            };
+            names.push(name);
+        }
+        if index {
+            if d.concurrent && names.len() > 1 {
+                return Err(Error::FeatureNotSupported(
+                    "DROP INDEX CONCURRENTLY does not support dropping multiple objects".into(),
+                ));
+            }
+            // An index has no dependants this server models, so CASCADE and
+            // RESTRICT drop the same thing.
+            return Ok(Statement::DropIndex {
+                names,
+                if_exists: d.missing_ok,
+            });
+        }
+        return Ok(Statement::DropView {
+            names,
+            if_exists: d.missing_ok,
+            cascade,
+        });
+    }
     if ObjectType::try_from(d.remove_type) != Ok(ObjectType::ObjectTable) {
         // Named, not `{:?}`: the debug form of a protobuf enum leaked to the
         // wire here for as long as DROP knew only tables.
@@ -15516,7 +16390,7 @@ fn plan_update(
         .as_ref()
         .map(|r| r.relname.clone())
         .ok_or_else(|| Error::Parse("UPDATE without a relation".into()))?;
-    let def = lookup(&table).ok_or_else(|| Error::UndefinedTable(table.clone()))?;
+    let def = lookup(&table).ok_or_else(|| write_target_missing(&table, "UPDATE of"))?;
 
     let mut set = Document::new();
     let mut unset: Vec<String> = Vec::new();
@@ -15584,9 +16458,9 @@ fn plan_update(
     if set.is_empty() && set_exprs.is_empty() && set_subscripts.is_empty() {
         return Err(Error::Parse("UPDATE without a SET list".into()));
     }
-    let filter = match u.where_clause.as_ref() {
-        None => Document::new(),
-        Some(w) => lower_where(w, &def, params)?,
+    let (filter, residual) = match u.where_clause.as_ref() {
+        None => (Document::new(), None),
+        Some(w) => lower_where_or_residual(w, &def, params)?,
     };
     let returning = if u.returning_list.is_empty() {
         None
@@ -15602,6 +16476,7 @@ fn plan_update(
         set_exprs,
         set_subscripts,
         filter,
+        residual,
         returning,
     }))
 }
@@ -15851,10 +16726,10 @@ fn plan_delete(
         .as_ref()
         .map(|r| r.relname.clone())
         .ok_or_else(|| Error::Parse("DELETE without a relation".into()))?;
-    let def = lookup(&table).ok_or_else(|| Error::UndefinedTable(table.clone()))?;
-    let filter = match d.where_clause.as_ref() {
-        None => Document::new(),
-        Some(w) => lower_where(w, &def, params)?,
+    let def = lookup(&table).ok_or_else(|| write_target_missing(&table, "DELETE from"))?;
+    let (filter, residual) = match d.where_clause.as_ref() {
+        None => (Document::new(), None),
+        Some(w) => lower_where_or_residual(w, &def, params)?,
     };
     let returning = if d.returning_list.is_empty() {
         None
@@ -15866,6 +16741,7 @@ fn plan_delete(
     Ok(Statement::Delete(Delete {
         table,
         filter,
+        residual,
         returning,
     }))
 }
@@ -16061,6 +16937,9 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             .ok_or(Error::UndefinedField(err));
     }
     if let Some(N::FuncCall(f)) = node.node.as_ref() {
+        if let Some(result) = correlated::eval_correlated(f, params) {
+            return result;
+        }
         refuse_untyped_any_args(f)?;
         if func_name(f).as_deref() == Some("pg_typeof") {
             return pg_typeof(f, params);
@@ -16375,6 +17254,42 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             Ok(AExprKind::AexprLike | AExprKind::AexprIlike)
         ) {
             return eval_pattern_match_const(e, params);
+        }
+        // `a IS [NOT] DISTINCT FROM b`: equality in which NULL is a value --
+        // two NULLs are not distinct, a NULL and a value are -- so it is
+        // never NULL itself.
+        if matches!(
+            AExprKind::try_from(e.kind),
+            Ok(AExprKind::AexprDistinct | AExprKind::AexprNotDistinct)
+        ) {
+            let not_distinct = AExprKind::try_from(e.kind) == Ok(AExprKind::AexprNotDistinct);
+            let operand = |n: Option<&Box<pg_query::protobuf::Node>>| -> Result<Bson> {
+                const_value(
+                    n.ok_or_else(|| Error::Parse("DISTINCT FROM with a missing operand".into()))?,
+                    params,
+                )
+            };
+            let lhs = operand(e.lexpr.as_ref())?;
+            let rhs = operand(e.rexpr.as_ref())?;
+            let same = match (lhs == Bson::Null, rhs == Bson::Null) {
+                (true, true) => true,
+                (true, false) | (false, true) => false,
+                (false, false) => {
+                    let mut eq = e.clone();
+                    eq.kind = AExprKind::AexprOp as i32;
+                    eq.name = vec![string_node("=")];
+                    matches!(
+                        const_value(
+                            &pg_query::protobuf::Node {
+                                node: Some(N::AExpr(eq)),
+                            },
+                            params,
+                        )?,
+                        Bson::Boolean(true)
+                    )
+                }
+            };
+            return Ok(Bson::Boolean(same == not_distinct));
         }
         if AExprKind::try_from(e.kind) != Ok(AExprKind::AexprOp) {
             return Err(Error::Unsupported("this operator form".into()));
@@ -16927,6 +17842,9 @@ fn lower_aexpr(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
         Ok(AExprKind::AexprLike | AExprKind::AexprIlike) => {
             return lower_pattern_match(e, def, params)
         }
+        Ok(AExprKind::AexprDistinct | AExprKind::AexprNotDistinct) => {
+            return lower_distinct(e, def, params)
+        }
         _ => return Err(Error::Unsupported("this operator form".into())),
     }
     let op = operator_name(e)?;
@@ -17010,6 +17928,80 @@ fn lower_aexpr(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     Ok(scalar_filter(def, &field, mongo_op, value))
 }
 
+/// A WHERE as a filter, or -- when it does not lower -- an empty filter and
+/// a RESIDUAL evaluated per row. Only `Unsupported` falls back: an undefined
+/// column or a bad type is a real error and must stay one, or a typo would
+/// become a silent full scan.
+fn lower_where_or_residual(
+    w: &pg_query::protobuf::Node,
+    def: &TableDef,
+    params: &[Bson],
+) -> Result<(Document, Option<ColumnExpr>)> {
+    match lower_where(w, def, params) {
+        Ok(f) => Ok((f, None)),
+        Err(Error::Unsupported(_)) => {
+            let fields: Vec<RowField> = def
+                .columns
+                .iter()
+                .map(|c| (c.name.clone(), c.field(), c.pg_type.clone()))
+                .collect();
+            let mut sample = Document::new();
+            for c in &def.columns {
+                sample.insert(c.field(), sample_value_for_type(&c.pg_type));
+            }
+            Ok((
+                Document::new(),
+                Some(row_column_expr(w, &fields, params, &sample)?),
+            ))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// `col IS [NOT] DISTINCT FROM <constant>`. Anything else -- a column on
+/// the right, an expression on the left -- is refused here and evaluated per
+/// row as a residual by the caller.
+fn lower_distinct(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
+    if !matches!(
+        e.lexpr.as_deref().and_then(|l| l.node.as_ref()),
+        Some(N::ColumnRef(_))
+    ) {
+        return Err(Error::Unsupported("this DISTINCT FROM".into()));
+    }
+    let rhs = e
+        .rexpr
+        .as_ref()
+        .ok_or_else(|| Error::Parse("DISTINCT FROM with no right operand".into()))?;
+    let value =
+        const_value(rhs, params).map_err(|_| Error::Unsupported("this DISTINCT FROM".into()))?;
+    let not_distinct = AExprKind::try_from(e.kind) == Ok(AExprKind::AexprNotDistinct);
+    let col = match e.lexpr.as_deref().and_then(|l| l.node.as_ref()) {
+        Some(N::ColumnRef(c)) => {
+            column_ref_name(c).ok_or_else(|| Error::Unsupported("this column reference".into()))?
+        }
+        _ => unreachable!("checked above"),
+    };
+    let field = def
+        .field_of(&col)
+        .ok_or_else(|| Error::UndefinedColumn(col.clone()))?;
+    if value == Bson::Null {
+        return Ok(if not_distinct {
+            doc! { field: Bson::Null }
+        } else {
+            doc! { field: { "$ne": Bson::Null } }
+        });
+    }
+    let mut eq = e.clone();
+    eq.kind = AExprKind::AexprOp as i32;
+    eq.name = vec![string_node("=")];
+    let equal = lower_aexpr(&eq, def, params)?;
+    Ok(if not_distinct {
+        equal
+    } else {
+        doc! { "$nor": [equal] }
+    })
+}
+
 /// `x IN (a, b)` / `x NOT IN (a, b)`.
 ///
 /// PostgreSQL's three-valued logic drives both edge cases here, probed on 14:
@@ -17053,6 +18045,13 @@ fn op_to_mql(op: &str) -> Option<&'static str> {
 /// NULL if any element was NULL, else TRUE (an empty array is TRUE).
 fn eval_scalar_array_const(op: &str, lhs: Bson, rhs: Bson, is_any: bool) -> Result<Bson> {
     if lhs == Bson::Null {
+        // Over an EMPTY array the answer does not depend on the left side:
+        // `NULL > ALL ('{}')` is TRUE and `NULL = ANY ('{}')` FALSE
+        // (PostgreSQL 14.13), which is how a correlated `x > ALL (subquery)`
+        // with no rows keeps a row whose `x` is NULL.
+        if matches!(&rhs, Bson::Array(v) if v.is_empty()) {
+            return Ok(Bson::Boolean(!is_any));
+        }
         return Ok(Bson::Null);
     }
     let rhs = coerce_any_array(rhs, inferred_type(&lhs));
