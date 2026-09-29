@@ -1642,6 +1642,7 @@ impl PgHandler {
         // Views ride the same per-version gate: a view is expanded by the
         // planner, which cannot read the catalog itself.
         secantus_pgplan::set_views(self.views().unwrap_or_default());
+        secantus_pgplan::view_dml::set_checked_views(self.checked_views().unwrap_or_default());
         // User-defined functions, so the planner can type and route a call.
         secantus_pgplan::set_user_functions(
             self.user_function_docs()
@@ -4046,6 +4047,46 @@ impl PgHandler {
 
     /// Every view: `(name, stored definition)`, name-sorted, with this
     /// transaction's uncommitted creates and drops applied.
+    /// The views created `WITH CHECK OPTION`, which a write through the view
+    /// must honour.
+    fn checked_views(&self) -> PgWireResult<Vec<(String, String)>> {
+        Ok(self
+            .type_catalog_docs(Self::VIEW_COLLECTION)?
+            .iter()
+            .filter_map(|d| {
+                let kind = d.get_str("check_option").ok()?.to_ascii_uppercase();
+                let name = d.get_str("view").or_else(|_| d.get_str("_id")).ok()?;
+                Some((name.to_string(), kind))
+            })
+            .collect())
+    }
+
+    /// A row written through a view `WITH CHECK OPTION` must be one the view
+    /// would show: every condition TRUE (NULL fails, as PostgreSQL's
+    /// `ExecWithCheckOptions` has it), else 44000.
+    fn check_view_conditions(
+        &self,
+        def: &TableDef,
+        row: &Document,
+        checks: &[(String, String)],
+    ) -> PgWireResult<()> {
+        for (view, condition) in checks {
+            let expr = secantus_pgplan::plan_check_expression(condition, def)
+                .map_err(|e| Self::err(&e))?;
+            let verdict = secantus_pgplan::apply_row_expr(&expr, row).map_err(|e| Self::err(&e))?;
+            if verdict != Bson::Boolean(true) {
+                let mut info = ErrorInfo::new(
+                    "ERROR".into(),
+                    "44000".into(),
+                    format!("new row violates check option for view \"{view}\""),
+                );
+                info.detail = Some(Self::failing_row_detail(def, row));
+                return Err(PgWireError::UserError(Box::new(info)));
+            }
+        }
+        Ok(())
+    }
+
     fn views(&self) -> PgWireResult<Vec<(String, String)>> {
         let mut out: Vec<(String, String)> = self
             .type_catalog_docs(Self::VIEW_COLLECTION)?
@@ -4640,16 +4681,16 @@ impl PgHandler {
                     Column::new("table_name", "name", false),
                     Column::new("column_name", "name", false),
                     Column::new("ordinal_position", "int4", false),
-                    Column::new("column_default", "text", false),
-                    Column::new("is_nullable", "text", false),
-                    Column::new("data_type", "text", false),
+                    Column::new("column_default", "varchar", false),
+                    Column::new("is_nullable", "varchar", false),
+                    Column::new("data_type", "varchar", false),
                     Column::new("character_maximum_length", "int4", false),
                     Column::new("numeric_precision", "int4", false),
                     Column::new("numeric_scale", "int4", false),
                     Column::new("datetime_precision", "int4", false),
                     Column::new("udt_name", "name", false),
-                    Column::new("is_identity", "text", false),
-                    Column::new("identity_generation", "text", false),
+                    Column::new("is_identity", "varchar", false),
+                    Column::new("identity_generation", "varchar", false),
                 ],
             )),
             "information_schema.tables" => Some(TableDef::new(
@@ -4658,7 +4699,7 @@ impl PgHandler {
                     Column::new("table_catalog", "name", false),
                     Column::new("table_schema", "name", false),
                     Column::new("table_name", "name", false),
-                    Column::new("table_type", "text", false),
+                    Column::new("table_type", "varchar", false),
                 ],
             )),
             "information_schema.table_constraints" => Some(TableDef::new(
@@ -4670,7 +4711,7 @@ impl PgHandler {
                     Column::new("table_catalog", "name", false),
                     Column::new("table_schema", "name", false),
                     Column::new("table_name", "name", false),
-                    Column::new("constraint_type", "text", false),
+                    Column::new("constraint_type", "varchar", false),
                 ],
             )),
             "information_schema.key_column_usage" => Some(TableDef::new(
@@ -4692,12 +4733,12 @@ impl PgHandler {
                     Column::new("sequence_catalog", "name", false),
                     Column::new("sequence_schema", "name", false),
                     Column::new("sequence_name", "name", false),
-                    Column::new("data_type", "text", false),
-                    Column::new("start_value", "text", false),
-                    Column::new("minimum_value", "text", false),
-                    Column::new("maximum_value", "text", false),
-                    Column::new("increment", "text", false),
-                    Column::new("cycle_option", "text", false),
+                    Column::new("data_type", "varchar", false),
+                    Column::new("start_value", "varchar", false),
+                    Column::new("minimum_value", "varchar", false),
+                    Column::new("maximum_value", "varchar", false),
+                    Column::new("increment", "varchar", false),
+                    Column::new("cycle_option", "varchar", false),
                 ],
             )),
             "pg_class" => Some(TableDef::new(
@@ -4706,12 +4747,12 @@ impl PgHandler {
                     Column::new("oid", "oid", false),
                     Column::new("relname", "name", false),
                     Column::new("relnamespace", "oid", false),
-                    Column::new("relkind", "char", false),
+                    Column::new("relkind", secantus_pgplan::QUOTED_CHAR, false),
                     Column::new("relnatts", "int2", false),
                     Column::new("relhasindex", "bool", false),
                     Column::new("reltuples", "float4", false),
                     Column::new("relowner", "oid", false),
-                    Column::new("relpersistence", "char", false),
+                    Column::new("relpersistence", secantus_pgplan::QUOTED_CHAR, false),
                 ],
             )),
             "pg_namespace" => Some(TableDef::new(
@@ -4893,7 +4934,7 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("datname", "name", false),
                     secantus_pgcatalog::Column::new("datdba", "oid", false),
                     secantus_pgcatalog::Column::new("encoding", "int4", false),
-                    secantus_pgcatalog::Column::new("datlocprovider", "char", false),
+                    secantus_pgcatalog::Column::new("datlocprovider", secantus_pgplan::QUOTED_CHAR, false),
                     secantus_pgcatalog::Column::new("datistemplate", "bool", false),
                     secantus_pgcatalog::Column::new("datallowconn", "bool", false),
                     secantus_pgcatalog::Column::new("datconnlimit", "int4", false),
@@ -6929,6 +6970,14 @@ fn default_settings() -> HashMap<String, String> {
         ("idle_session_timeout", "0"),
         ("application_name", ""),
         ("server_encoding", "UTF8"),
+        // A C-locale cluster: text compares by byte and case mapping is
+        // ASCII-only, which is what these report.
+        ("lc_collate", "C"),
+        ("lc_ctype", "C"),
+        ("lc_messages", "C"),
+        ("lc_monetary", "C"),
+        ("lc_numeric", "C"),
+        ("lc_time", "C"),
         ("server_version", "15.0"),
         // The numeric form every client that gates on a server version
         // actually reads -- `major * 10000 + minor`, so 15.0 is 150000.
@@ -8903,6 +8952,14 @@ impl PgHandler {
     /// and sequence functions inside expressions both need the store.
     fn with_executor_hooks<R>(&self, f: impl FnOnce() -> R) -> R {
         let hook = |name: &str, args: &[Bson]| -> std::result::Result<Bson, PlanError> {
+            // `nextval` / `setval` write the sequence, so a READ ONLY
+            // transaction refuses them as it would an INSERT.
+            if matches!(name, "nextval" | "setval") && self.read_only_now() {
+                return Err(PlanError::Sqlstate(
+                    "25006",
+                    format!("cannot execute {name}() in a read-only transaction"),
+                ));
+            }
             self.sequence_call(name, args).map_err(Self::to_plan_error)
         };
         let functions = |u: &secantus_pgplan::UserFn,
@@ -11924,6 +11981,61 @@ impl PgHandler {
     /// (every DDL, type, function, schema and database statement, and the
     /// forms this list does not name) is taken to. Errs on `true`: an extra
     /// catalog re-read is cheap, a stale catalog is a wrong answer.
+    /// Whether the transaction a statement runs in is READ ONLY: the open
+    /// block's own mode, or -- outside one -- the session default, which is
+    /// what an autocommit statement's implicit transaction takes.
+    fn read_only_now(&self) -> bool {
+        let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+        let on = |k: &str| settings.get(k).is_some_and(|v| v == "on");
+        on("transaction_read_only")
+            || (!self.in_transaction.load(std::sync::atomic::Ordering::Relaxed)
+                && on("default_transaction_read_only"))
+    }
+
+    /// The command a READ ONLY transaction would refuse this statement as,
+    /// or `None` for one that writes nothing.
+    fn write_verb(stmt: &Statement) -> Option<&'static str> {
+        Some(match stmt {
+            Statement::Insert(_) => "INSERT",
+            Statement::Update(_) => "UPDATE",
+            Statement::Delete(_) => "DELETE",
+            Statement::Truncate { .. } => "TRUNCATE TABLE",
+            Statement::CopyFrom(_) => "COPY FROM",
+            Statement::Notify { .. } => "NOTIFY",
+            Statement::CreateTable(..) => "CREATE TABLE",
+            Statement::CreateTableAs { .. } => "CREATE TABLE AS",
+            Statement::AlterTable { .. } | Statement::RenameTable { .. } | Statement::RenameColumn { .. } => {
+                "ALTER TABLE"
+            }
+            Statement::CreateSequence { .. } => "CREATE SEQUENCE",
+            Statement::DropSequence { .. } => "DROP SEQUENCE",
+            Statement::AlterSequence { .. } => "ALTER SEQUENCE",
+            Statement::DropTable(_) => "DROP TABLE",
+            Statement::CreateIndex(_) => "CREATE INDEX",
+            Statement::DropIndex { .. } => "DROP INDEX",
+            Statement::CreateView(_) => "CREATE VIEW",
+            Statement::DropView { .. } => "DROP VIEW",
+            Statement::CreateEnum { .. }
+            | Statement::CreateShellType { .. }
+            | Statement::CreateBaseType { .. }
+            | Statement::CreateComposite { .. }
+            | Statement::CreateRange { .. } => "CREATE TYPE",
+            Statement::DropType { .. } => "DROP TYPE",
+            Statement::CreateFunction { .. } | Statement::CreateUserFunction(..) => "CREATE FUNCTION",
+            Statement::DropFunction { .. } => "DROP FUNCTION",
+            Statement::CreateTrigger(..) => "CREATE TRIGGER",
+            Statement::DropTrigger { .. } => "DROP TRIGGER",
+            Statement::CreateSchema { .. } => "CREATE SCHEMA",
+            Statement::DropSchema { .. } => "DROP SCHEMA",
+            Statement::CreateRole { .. } => "CREATE ROLE",
+            Statement::AlterRole { .. } => "ALTER ROLE",
+            Statement::DropRole { .. } => "DROP ROLE",
+            Statement::CreateExtension { .. } => "CREATE EXTENSION",
+            Statement::DropExtension { .. } => "DROP EXTENSION",
+            _ => return None,
+        })
+    }
+
     fn may_change_catalog(stmt: &Statement) -> bool {
         !matches!(
             stmt,
@@ -11999,6 +12111,19 @@ impl PgHandler {
     }
 
     fn execute_statement(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response>> {
+        // A READ ONLY transaction refuses every write, DDL included, with the
+        // statement's own command name (`cannot execute INSERT in a read-only
+        // transaction`). Checked here, where a statement run by another --
+        // EXPLAIN ANALYZE's, a function's, a trigger's -- passes too.
+        if let Some(verb) = Self::write_verb(&stmt) {
+            if self.read_only_now() {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "25006".to_owned(),
+                    format!("cannot execute {verb} in a read-only transaction"),
+                ))));
+            }
+        }
         let may_change_catalog = Self::may_change_catalog(&stmt);
         // Creating a temporary relation touches the temp namespace as
         // surely as opening one does (`lookup` covers the latter); PREPARE
@@ -12295,6 +12420,7 @@ impl PgHandler {
                     self.execute(
                         Statement::Insert(secantus_pgplan::Insert {
                             table: table.clone(),
+                            view_checks: Vec::new(),
                             rows,
                             returning: None,
                             source: None,
@@ -12355,6 +12481,7 @@ impl PgHandler {
                 // violation on any row leaves none of them inserted.
                 for row in &ins.rows {
                     self.check_row_constraints(&def, row)?;
+                    self.check_view_conditions(&def, row, &ins.view_checks)?;
                 }
                 if let Some(dup) = self.wide_numeric_pk_conflict(&ins.table, &def, &ins.rows)? {
                     return Err(Self::write_error(
@@ -14636,6 +14763,7 @@ impl PgHandler {
             }
 
             Statement::Update(mut upd) => {
+                let view_checks = std::mem::take(&mut upd.view_checks);
                 upd.filter =
                     self.narrow_by_residual(&upd.table, &upd.filter, upd.residual.take())?;
                 let def = self.lookup(&upd.table);
@@ -14680,7 +14808,7 @@ impl PgHandler {
                 // (which is empty) and reported the rows matched -- an UPDATE
                 // that answered `UPDATE 1` and changed nothing.
                 let per_row = !upd.set_exprs.is_empty() || !upd.set_subscripts.is_empty();
-                let matched = if !per_row && !constrained && upd.returning.is_none() {
+                let matched = if !per_row && !constrained && view_checks.is_empty() && upd.returning.is_none() {
                     self.update_rows(&upd.table, &upd.filter, &upd.set, &upd.unset)?
                 } else {
                     // A SET list that reads the row (`num = num * 2`) is
@@ -14739,6 +14867,7 @@ impl PgHandler {
                             }
                             if let Some(def) = def.as_ref() {
                                 self.check_row_constraints(def, &after)?;
+                                self.check_view_conditions(def, &after, &view_checks)?;
                             }
                             if referenced {
                                 key_changes.push((row.clone(), after.clone()));

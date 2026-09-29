@@ -580,24 +580,28 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
                 crate::json::render_jsonb(&obj)
             }))
         }
+        // This server is a C-locale cluster -- text compares by byte, and
+        // `lc_ctype` is `C` -- so case mapping touches ASCII letters only,
+        // as PostgreSQL's does under C: `upper('é')` is `é`, `upper('ß')` is
+        // `ß`, and in `initcap` a non-ASCII letter is not a word character.
         "upper" => {
             need(1)?;
-            Ok(Bson::String(s(0).to_uppercase()))
+            Ok(Bson::String(s(0).to_ascii_uppercase()))
         }
         "lower" => {
             need(1)?;
-            Ok(Bson::String(s(0).to_lowercase()))
+            Ok(Bson::String(s(0).to_ascii_lowercase()))
         }
         "initcap" => {
             need(1)?;
             let mut out = String::new();
             let mut fresh = true;
             for c in s(0).chars() {
-                if c.is_alphanumeric() {
+                if c.is_ascii_alphanumeric() {
                     if fresh {
-                        out.extend(c.to_uppercase());
+                        out.push(c.to_ascii_uppercase());
                     } else {
-                        out.extend(c.to_lowercase());
+                        out.push(c.to_ascii_lowercase());
                     }
                     fresh = false;
                 } else {
@@ -1626,6 +1630,7 @@ pub fn static_result_type(name: &str) -> &'static str {
         "abs" | "ceil" | "ceiling" | "floor" | "round" | "trunc" | "mod" | "div" => "numeric",
         "sqrt" | "exp" | "ln" | "log" | "log10" | "power" | "pow" | "sign" => "float8",
         "scale" | "min_scale" => "int4",
+        "current_schema" | "current_database" | "current_user" | "session_user" => "name",
         "trim_scale" => "numeric",
         "numeric_send" => "bytea",
         "starts_with" => "bool",

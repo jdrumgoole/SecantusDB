@@ -39,6 +39,7 @@ pub mod numeric_math;
 pub mod pgtypes;
 pub mod range;
 pub mod scalar;
+pub mod view_dml;
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use pg_query::protobuf::node::Node as N;
@@ -675,6 +676,9 @@ pub const EXCLUDED_PREFIX: &str = "__excluded__.";
 #[derive(Debug, Clone, PartialEq)]
 pub struct Insert {
     pub table: String,
+    /// A write through a view `WITH CHECK OPTION`: each new row must satisfy
+    /// these `(view, condition over this table)` or the statement fails 44000.
+    pub view_checks: Vec<(String, String)>,
     /// One document per row, already keyed by stored FIELD (PK as `_id`).
     pub rows: Vec<Document>,
     /// `RETURNING ...`: the output columns and their expressions, planned
@@ -1862,6 +1866,8 @@ pub struct CreateView {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Update {
     pub table: String,
+    /// As `Insert::view_checks`, for the updated rows.
+    pub view_checks: Vec<(String, String)>,
     /// Stored field -> new value.
     pub set: Document,
     /// Hidden companion fields to REMOVE. An update to a whole-millisecond
@@ -5006,6 +5012,7 @@ fn plan_insert(
     };
     Ok(Statement::Insert(Insert {
         table,
+        view_checks: view_dml::take_view_checks(),
         rows,
         returning,
         source,
@@ -8524,6 +8531,9 @@ fn rewrite_dml_from(
             )),
         })),
     };
+    // A write whose target is a VIEW becomes the same write on its base
+    // table (automatically updatable views).
+    view_dml::rewrite(node, lookup)?;
     // `SET (a, b) = (1, 2)` is `SET a = 1, b = 2`. The row-subquery form
     // `SET (a, b) = (SELECT ...)` has no per-column split and stays refused.
     if let Some(N::UpdateStmt(u)) = node.node.as_mut() {
@@ -11442,6 +11452,14 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
         Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("to_regtype") => {
             "regtype".to_string()
         }
+        Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("to_regclass") => {
+            "regclass".to_string()
+        }
+        Some(N::FuncCall(f))
+            if func_name(f).is_some_and(|n| n.starts_with("has_") && n.ends_with("_privilege")) =>
+        {
+            "bool".to_string()
+        }
         // `array_cat` / `array_append` / `array_prepend` / `array_remove` /
         // `array_replace` answer whichever ARGUMENT is the array, so the type
         // has to come from the call. Without this they fell back to the
@@ -12408,15 +12426,15 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 // `to_regtype` in a bare target list, same shape as above; the
                 // value itself is computed by `const_value`, which is also
                 // what evaluates it inside a WHERE clause.
-                if name == "to_regtype" {
+                if name == "to_regtype"
+                    || name == "to_regclass"
+                    || (name.starts_with("has_") && name.ends_with("_privilege"))
+                {
+                    let node = rt.val.as_deref().expect("checked");
                     columns.push((
-                        if rt.name.is_empty() {
-                            "to_regtype".to_string()
-                        } else {
-                            rt.name.clone()
-                        },
-                        ConstCol::Value(const_value(rt.val.as_ref().expect("checked"), params)?),
-                        "regtype".to_string(),
+                        if rt.name.is_empty() { name.clone() } else { rt.name.clone() },
+                        ConstCol::Value(const_value(node, params)?),
+                        static_type(node, &Bson::Null),
                         -1,
                     ));
                     continue;
@@ -12557,6 +12575,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                             }
                         } else if value == Bson::Null
                             || declared == "timestamptz"
+                            || declared == "name"
                             || fts::result_type(&name).is_some()
                             || jsonpath::is_function(&name)
                         {
@@ -19269,6 +19288,7 @@ fn plan_update(
 
     Ok(Statement::Update(Update {
         table,
+        view_checks: view_dml::take_view_checks(),
         set,
         unset,
         set_exprs,
@@ -19922,6 +19942,60 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
         refuse_untyped_any_args(f)?;
         if func_name(f).as_deref() == Some("pg_typeof") {
             return pg_typeof(f, params);
+        }
+        // `to_regclass(text)`: the relation's regclass, or NULL when there is
+        // none -- the `::regclass` cast without its 42P01.
+        if func_name(f).as_deref() == Some("to_regclass") {
+            let [arg] = f.args.as_slice() else {
+                return Err(Error::Parse(
+                    "function to_regclass() requires exactly one argument".into(),
+                ));
+            };
+            return Ok(match const_value(arg, params)? {
+                Bson::String(name) => match resolve_regclass(&name) {
+                    Ok(oid) => regclass_value(oid),
+                    Err(Error::UndefinedTable(_)) => Bson::Null,
+                    Err(e) => return Err(e),
+                },
+                _ => Bson::Null,
+            });
+        }
+        // `has_*_privilege`: this server enforces no privileges (there is no
+        // GRANT), so every role holds every privilege -- which is the true
+        // answer here. The privilege names are still validated, and a table
+        // must exist, as on PostgreSQL.
+        if let Some(name) = func_name(f).filter(|n| n.starts_with("has_") && n.ends_with("_privilege")) {
+            let args = f
+                .args
+                .iter()
+                .map(|a| const_value(a, params))
+                .collect::<Result<Vec<_>>>()?;
+            if args.contains(&Bson::Null) {
+                return Ok(Bson::Null);
+            }
+            let privileges = value_text(args.last().expect("has_*_privilege takes arguments"));
+            for p in privileges.split(',') {
+                let p = p.trim().to_ascii_uppercase();
+                let p = p.strip_suffix(" WITH GRANT OPTION").unwrap_or(&p).trim();
+                if !matches!(
+                    p,
+                    "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "TRUNCATE" | "REFERENCES"
+                        | "TRIGGER" | "USAGE" | "CREATE" | "CONNECT" | "TEMPORARY" | "TEMP"
+                        | "EXECUTE" | "SET" | "ALTER SYSTEM"
+                ) {
+                    return Err(Error::InvalidParameter(format!(
+                        "unrecognized privilege type: \"{}\"",
+                        p.to_ascii_lowercase()
+                    )));
+                }
+            }
+            if matches!(name.as_str(), "has_table_privilege" | "has_column_privilege") {
+                let table = &args[args.len().saturating_sub(if name == "has_column_privilege" { 3 } else { 2 })];
+                if let Bson::String(t) = table {
+                    resolve_regclass(t)?;
+                }
+            }
+            return Ok(Bson::Boolean(true));
         }
         // `to_regtype(name)` resolves a type name to its oid, and NULL --
         // rather than an error -- for a name it does not know. That NULL is

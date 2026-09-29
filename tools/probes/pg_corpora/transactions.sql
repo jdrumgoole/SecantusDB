@@ -38,3 +38,16 @@ BEGIN
 CREATE TABLE tmp12 (a int)
 ROLLBACK
 SELECT count(*) FROM tmp12
+BEGIN READ ONLY
+UPDATE tx12 SET n = 0
+ROLLBACK
+BEGIN READ ONLY
+CREATE TABLE ro12 (a int)
+ROLLBACK
+BEGIN READ ONLY
+SELECT count(*) FROM tx12
+COMMIT
+SET default_transaction_read_only = on
+DELETE FROM tx12
+SET default_transaction_read_only = off
+DELETE FROM tx12 WHERE id = 9
