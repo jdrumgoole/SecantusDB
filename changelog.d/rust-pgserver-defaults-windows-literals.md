@@ -38,3 +38,15 @@ a bare select-list target. Window functions work over an aggregate, over
   row instead of once per row.
 - `now()::date` and the other timestamptz casts to a zone-less type failed in a
   constant expression.
+
+#### Added (composite keys)
+
+- A composite `PRIMARY KEY`, stored as the Python server's subdocument `_id`
+  (its columns in table order), so either server reads and enforces the
+  other's. A duplicate names the key's columns in its DETAIL.
+
+#### Fixed (grouping)
+
+- A QUALIFIED grouped column in the select list (`select c.a, count(*) from t
+  c group by c.a`) was a 42803 naming the alias `c`: the target read the first
+  name part rather than the column.

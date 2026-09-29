@@ -148,9 +148,10 @@ fn unsupported_and_undefined_carry_postgres_sqlstates() {
         ("SELECT * FROM t WHERE nope = 1", "42703"),
         ("SELECT * FROM missing", "42P01"),
         ("INSERT INTO missing VALUES (1)", "42P01"),
+        // Two PRIMARY KEY constraints (not one composite key) -- 42P16.
         (
             "CREATE TABLE t (a int PRIMARY KEY, b int PRIMARY KEY)",
-            "0A000",
+            "42P16",
         ),
         ("SELECT !!! FROM", "42601"),
     ];

@@ -6986,7 +6986,7 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       | ~~`CREATE VIEW`~~ | **DONE 2026-09-29** | read-only: writes through a view refused |
       | `CREATE TRIGGER` | | `CreateTrigStmt` |
       | `EXPLAIN` | | `ExplainStmt` |
-      | composite `PRIMARY KEY` / multi-col `FOREIGN KEY` | | `a composite PRIMARY KEY` |
+      | ~~composite `PRIMARY KEY`~~ / multi-col `FOREIGN KEY` | **PK DONE 2026-09-29** | multi-column FK still refused |
       | ~~non-literal column `DEFAULT`~~ | **DONE 2026-09-29** | evaluated per row; `column_default` renders a folded constant, not PostgreSQL's `(1 + 2)` |
 
       **SET-RETURNING FUNCTIONS in FROM landed 2026-09-29** (new `srf` corpus
@@ -7363,20 +7363,6 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
         column by its last name part. `foreign_qualifier` is what routes
         `e.dept_id = d.id` to the per-row path instead of binding `d.id` to
         the inner table's own `id`.
-
-- [ ] **OPEN — RUST pgserver: a composite PRIMARY KEY is refused
-      (re-measured 2026-09-29).** `create table t (a int, b int, primary key
-      (a, b))` is `0A000 a composite PRIMARY KEY`. The Python server stores
-      one as a SUBDOCUMENT `_id` whose keys are the PK columns in TABLE-column
-      order, each column's catalog `field` being `_id.<name>` -- so the Rust
-      side has to read and write that shape to share a store. Every Rust read
-      and write treats a field as a flat document key, so the work is: a
-      column field override from the stored `field`, flattening `_id` into
-      `_id.<name>` keys where table rows are decoded and nesting it again
-      where they are written (about 20 of the ~50 storage call sites are table
-      data), a 23505 DETAIL that names the columns rather than `_id`, and the
-      catalog views that enumerate PK columns. Multi-column FOREIGN KEYs wait
-      on it. Common in real schemas (join tables), so worth the effort.
 
 - [ ] **OPEN — RUST pgserver: `column_default` shows a FOLDED constant
       (2026-09-29).** A non-volatile DEFAULT expression is evaluated once at

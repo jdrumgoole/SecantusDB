@@ -278,7 +278,13 @@ type SchemaAndRows = (Vec<FieldInfo>, Vec<Vec<Option<Bson>>>);
 /// included, has a scalar or string `_id` and comes back unchanged.
 fn decode_doc(bytes: &[u8]) -> Result<Document, bson::de::Error> {
     let d: Document = bson::from_slice(bytes)?;
-    if !matches!(d.get("_id"), Some(Bson::Document(_))) {
+    // A VALUE can be a document too -- a numeric wider than Decimal128 is
+    // `{__numeric, __numkey}` -- and one of those as a single-column key must
+    // stay whole. Internal value documents are the ones keyed `__...`; a
+    // composite key is keyed by column names.
+    let composite =
+        matches!(d.get("_id"), Some(Bson::Document(id)) if !id.keys().any(|k| k.starts_with("__")));
+    if !composite {
         return Ok(d);
     }
     let mut out = Document::new();
@@ -11461,7 +11467,7 @@ impl PgHandler {
                     let docs = ins
                         .rows
                         .iter()
-                        .map(|d| encode_doc(&d))
+                        .map(encode_doc)
                         .collect::<Result<Vec<_>, _>>()
                         .map_err(|e| Self::storage_err("could not encode a row", e))?;
                     let (written, errors) = self
@@ -19023,7 +19029,7 @@ impl CopyHandler for PgHandler {
                 apply_column_defaults(&def, &mut rows);
                 let docs = rows
                     .iter()
-                    .map(|d| encode_doc(&d))
+                    .map(encode_doc)
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| Self::storage_err("could not encode a COPY row", e))?;
                 self.storage

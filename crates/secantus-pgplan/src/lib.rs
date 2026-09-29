@@ -3956,6 +3956,16 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
             None => {}
         }
     }
+    // ONE primary key per table: two column-level ones, or a column-level
+    // one beside a table-level one, is PostgreSQL's 42P16. Only a single
+    // constraint naming several columns is a composite key.
+    let column_level = columns.iter().filter(|c| c.pk).count();
+    if column_level + usize::from(!table_pk.is_empty()) > 1 {
+        return Err(Error::Sqlstate(
+            "42P16",
+            format!("multiple primary keys for table \"{table}\" are not allowed"),
+        ));
+    }
     for name in &table_pk {
         let col = columns
             .iter_mut()

@@ -16,3 +16,5 @@ SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'cpk'
 SELECT constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_name = 'cpk' AND constraint_type = 'PRIMARY KEY'
 SELECT column_name, ordinal_position FROM information_schema.key_column_usage WHERE table_name = 'cpk' ORDER BY ordinal_position
 CREATE TABLE cpk_child (id int PRIMARY KEY, a int REFERENCES cpk (a))
+CREATE TABLE cpk_bad (a int PRIMARY KEY, b int PRIMARY KEY)
+CREATE TABLE cpk_bad (a int PRIMARY KEY, b int, PRIMARY KEY (b))
