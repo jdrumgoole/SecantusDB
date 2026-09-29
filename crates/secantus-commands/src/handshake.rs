@@ -67,6 +67,21 @@ pub fn hello(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         "readOnly": false,
         "ok": 1.0,
     };
+    // A driver puts `helloOk: true` in its handshake to ask whether this server
+    // understands the modern `hello`; the server echoes it back to say yes, and
+    // the driver then uses `hello` for the life of the connection. Measured on
+    // mongod 8.2.11 (2026-09-29): echoed ONLY when the client asked, over both
+    // OP_QUERY and OP_MSG.
+    //
+    // Omitting it is not cosmetic. Without the echo every modern driver decides
+    // this server predates `hello` and falls back to the LEGACY `isMaster` on
+    // every connection -- which is what mongo-go-driver's SDAM monitor did,
+    // taking a different monitoring path from the one it takes against mongod
+    // and failing `TestSDAMProse/heartbeats_processed_more_frequently` with 12
+    // messages where the formula allows 10.
+    if doc.get_bool("helloOk").unwrap_or(false) {
+        response.insert("helloOk", true);
+    }
 
     if let (Some(set_name), Some((host, port))) =
         (ctx.replica_set_name.as_ref(), ctx.server_address.as_ref())

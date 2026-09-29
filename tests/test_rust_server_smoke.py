@@ -2567,3 +2567,26 @@ def test_set_parameter_only_on_admin_against_rust_server(tmp_path) -> None:
         )
     finally:
         srv.stop()
+
+
+@pytest.mark.parametrize("command", ["hello", "isMaster"])
+@pytest.mark.parametrize("ask", [True, False])
+def test_hello_ok_echo_against_rust_server(tmp_path, command, ask) -> None:
+    """``helloOk: true`` is echoed when asked, and only then.
+
+    Measured off mongod 8.2.11 (2026-09-29) and pinned against a live one by
+    tests/test_mongod_differential.py; repeated here because that gate drives
+    the PYTHON server.
+
+    This one field decides whether a driver speaks modern ``hello`` or legacy
+    ``isMaster`` for the life of every connection it opens.
+    """
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        request = {command: 1}
+        if ask:
+            request["helloOk"] = True
+        reply = _client(srv)["admin"].command(request)
+        assert reply.get("helloOk") == (True if ask else None)
+    finally:
+        srv.stop()
