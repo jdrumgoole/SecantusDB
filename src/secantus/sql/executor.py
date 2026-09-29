@@ -2863,7 +2863,13 @@ def execute_evaluated_select(
 def execute_update(
     plan: planner.UpdatePlan, storage: Any, db: str, catalog: Any = None, session: Any = None
 ) -> SQLResult:
-    if getattr(plan, "rekey", False) or getattr(plan, "computed", None):
+    # A SUBSCRIPTED assignment reads the row's old array, so it needs the
+    # materialized path exactly as a computed RHS does.
+    if (
+        getattr(plan, "rekey", False)
+        or getattr(plan, "computed", None)
+        or getattr(plan, "array_sets", None)
+    ):
         return _execute_update_materialized(plan, storage, db, catalog, session)
     coll = plan.table.collection
     _validate_update_post_images(plan, storage, db, session, catalog)
@@ -2979,7 +2985,7 @@ def _execute_update_materialized_body(
     other_sets = {k: v for k, v in set_doc.items() if k not in id_sets}
     ctx = (
         scalar.ScalarContext(storage=storage, catalog=catalog, db=db, session=session)
-        if plan.computed
+        if (plan.computed or plan.array_sets)
         else None
     )
 
@@ -3002,6 +3008,15 @@ def _execute_update_materialized_body(
             scope = scope_for(doc)
             for field, tag, expr in plan.computed:
                 val = scalar.evaluate(expr, scope, ctx)
+                if tag != "any":
+                    val = typemap.coerce(val, tag)
+                set_path(new, field, val)
+        # ``SET a[i] = v`` rewrites the array the row already holds, so it reads
+        # the OLD value and writes the whole column back.
+        if plan.array_sets:
+            scope = scope_for(doc)
+            for field, tag, targets in plan.array_sets:
+                val = scalar.apply_subscript_sets(get_path(doc, field), targets, scope, ctx)
                 if tag != "any":
                     val = typemap.coerce(val, tag)
                 set_path(new, field, val)
@@ -3051,7 +3066,12 @@ def _execute_update_materialized_body(
         # In-place: write back only the fields the statement changed (literal sets,
         # computed sets, and any generated column the post-image recomputed).
         gen_fields = [c.field for c in table.columns if c.generated is not None]
-        changed = list(other_sets) + [f for f, _, _ in plan.computed] + gen_fields
+        changed = (
+            list(other_sets)
+            + [f for f, _, _ in plan.computed]
+            + [f for f, _, _ in plan.array_sets]
+            + gen_fields
+        )
         for old, new in zip(matched, posts, strict=True):
             write_set = {f: get_path(new, f) for f in changed}
             if write_set:

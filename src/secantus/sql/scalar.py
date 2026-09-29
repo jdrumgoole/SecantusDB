@@ -509,38 +509,198 @@ def _lambda_as_json_arrow(node: exp.Expression) -> exp.Expression | None:
     return exp.JSONExtract(this=left, expression=node.this)
 
 
-def _eval_bracket(node: exp.Bracket, scope: Scope, ctx: ScalarContext) -> Any:
-    """Postgres array subscript / slice: ``arr[i]`` (1-based element, NULL when out
-    of range) and ``arr[lo:hi]`` (1-based inclusive slice, clamped).
+#: An omitted slice bound (``a[2:]``), which is NOT the same as a NULL one.
+_OMITTED = object()
+
+
+def _subscript_index(idx_node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    """One single (non-slice) subscript as a 1-BASED index, or None for NULL.
 
     sqlglot's Postgres dialect folds a compile-time-constant single index to
-    0-based (``arr[1]`` → literal ``0``) but leaves a runtime (column-bearing)
-    index as the raw 1-based value; slice bounds always stay 1-based. We mirror
-    that: a column-bearing single index is decremented, a constant one is used
-    as-is, and a negative resulting index is out of range (no Python wraparound)."""
-    base = evaluate(node.this, scope, ctx)
-    if base is None or not node.expressions:
-        return None
-    idx_node = node.expressions[0]
-    if isinstance(idx_node, exp.Slice):
-        if not isinstance(base, (list, tuple)):
-            return None
-        lo = idx_node.this
-        hi = idx_node.args.get("expression")
-        lo_i = max(int(evaluate(lo, scope, ctx)), 1) if lo is not None else 1
-        hi_i = int(evaluate(hi, scope, ctx)) if hi is not None else len(base)
-        return list(base[lo_i - 1 : hi_i])
-    if not isinstance(base, (list, tuple)):
-        return None
+    0-based (``a[1]`` arrives as the literal ``0``) but leaves a runtime
+    (column-bearing) one at its raw 1-based value. Slice bounds are always
+    1-based. Verified against the parser rather than taken from the comment
+    that used to assert it.
+    """
     val = evaluate(idx_node, scope, ctx)
     if val is None:
         return None
     i = int(val)
-    if any(True for _ in idx_node.find_all(exp.Column)):
-        i -= 1  # runtime 1-based index -> 0-based
-    if i < 0 or i >= len(base):
-        return None  # out of range -> NULL (no negative wraparound)
-    return base[i]
+    if not any(True for _ in idx_node.find_all(exp.Column)):
+        i += 1  # undo sqlglot's 0-based folding of a constant index
+    return i
+
+
+def _slice_array(v: Any, bounds: list) -> Any:
+    """Apply one ``(lower, upper)`` pair per dimension, each 1-based, inclusive
+    and clamped to the array."""
+    if not bounds:
+        return v
+    if not isinstance(v, (list, tuple)):
+        return []
+    (lo, hi), rest = bounds[0], bounds[1:]
+    lo_i = max(int(lo), 1)
+    hi_i = len(v) if hi is _OMITTED else min(int(hi), len(v))
+    if hi_i < lo_i:
+        return []
+    taken = list(v[lo_i - 1 : hi_i])
+    return [_slice_array(x, rest) for x in taken] if rest else taken
+
+
+def _eval_bracket(node: exp.Bracket, scope: Scope, ctx: ScalarContext) -> Any:
+    """Postgres array subscript / slice, over the WHOLE subscript chain.
+
+    ``m[1:2][2]`` parses as nested ``Bracket`` nodes, and the rules only make
+    sense over the chain as a unit, so it is collected before anything is
+    evaluated. Three rules, each measured against PostgreSQL 14.13:
+
+    * A chain SHORTER than the array's dimensionality selects nothing:
+      ``(ARRAY[[1,2],[3,4]])[1]`` is NULL, not the inner row. Returning the
+      inner row handed a list to a column declared ``int4``, and the
+      ``int('{1,2}')`` that followed reached the client as a bare Python
+      ``ValueError`` with no SQLSTATE at all.
+    * Once ANY subscript is a slice, EVERY one is, and a subscript written as
+      a single number means "from 1 to that number" -- so ``m[1:2][2]`` is the
+      whole second dimension, not its second element. The two readings agree
+      whenever the number is 1, which is why ``m[1:2][1]`` looks like evidence
+      for either.
+    * An element out of range is NULL; a SLICE out of range is the EMPTY
+      array.
+    """
+    levels: list = []
+    cur: Any = node
+    while isinstance(cur, exp.Bracket) and cur.expressions:
+        levels.append(cur.expressions[0])
+        cur = cur.this
+    levels.reverse()  # innermost subscript is dimension 1
+    base = evaluate(cur, scope, ctx)
+    if base is None or not levels or not isinstance(base, (list, tuple)):
+        return None
+
+    if not any(isinstance(lvl, exp.Slice) for lvl in levels):
+        if len(levels) != len(_array_dim_lengths(base)):
+            return None
+        value: Any = base
+        for lvl in levels:
+            i = _subscript_index(lvl, scope, ctx)
+            if i is None or i < 1 or not isinstance(value, (list, tuple)) or i > len(value):
+                return None
+            value = value[i - 1]
+        return value
+
+    bounds: list = []
+    for lvl in levels:
+        if isinstance(lvl, exp.Slice):
+            lo_node, hi_node = lvl.this, lvl.args.get("expression")
+            lo = 1 if lo_node is None else evaluate(lo_node, scope, ctx)
+            hi = _OMITTED if hi_node is None else evaluate(hi_node, scope, ctx)
+        else:
+            lo, hi = 1, _subscript_index(lvl, scope, ctx)
+        if lo is None or hi is None:  # a NULL bound makes the whole slice NULL
+            return None
+        bounds.append((lo, hi))
+    return _slice_array(base, bounds)
+
+
+def apply_subscript_sets(current: Any, targets: list, scope: Scope, ctx: ScalarContext) -> Any:
+    """Apply ``SET a[...] = v`` assignments to the array a row already holds.
+
+    ``targets`` is a list of ``(subs, value_node)`` in statement order, where
+    ``subs`` is one ``(is_slice, lo_node, hi_node)`` per subscript. Later
+    assignments see earlier ones -- ``SET a[1]=7, a[2]=8`` is two writes to one
+    array, not two independent rewrites of the pre-image.
+
+    Rules, measured against PostgreSQL 14.13:
+
+    * a subscript past the end EXTENDS the array, padding the gap with NULLs;
+    * assigning into a NULL column builds the array from nothing;
+    * a slice whose source is shorter than the range is ``source array too
+      small``, and a longer one has its tail ignored;
+    * a subscript BELOW 1 is REFUSED. PostgreSQL answers it by moving the
+      array's lower bound (leaving an ``[0:5]={...}``), which this server does
+      not model; writing it at 1 instead would silently shift every other
+      subscript into the array.
+    """
+    out = list(current) if isinstance(current, (list, tuple)) else None
+    for subs, value_node in targets:
+        value = evaluate(value_node, scope, ctx)
+        if len(subs) == 1 and subs[0][0]:
+            out = _assign_slice(out, subs[0], value, scope, ctx)
+        else:
+            path = []
+            for is_slice, _lo, hi in subs:
+                if is_slice:
+                    raise errors.feature_not_supported(
+                        "UPDATE of a slice of a multidimensional array is not supported"
+                    )
+                path.append(_assign_index(hi, scope, ctx))
+            out = _assign_at_path(out, path, value)
+    return out
+
+
+def _assign_index(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> int:
+    """One assignment subscript as a 1-based index, refusing what cannot be
+    represented without a lower-bound model."""
+    i = _subscript_index(node, scope, ctx)
+    if i is None:
+        raise errors.SQLError("22004", "array subscript in assignment must not be null")
+    if i < 1:
+        raise errors.feature_not_supported(
+            "UPDATE of an array element below subscript 1 is not supported"
+        )
+    if i > _MAX_ARRAY_SIZE:
+        raise errors.SQLError(
+            "54000", f"array size exceeds the maximum allowed ({_MAX_ARRAY_SIZE})"
+        )
+    return i
+
+
+#: PostgreSQL's ceiling on an array's element count, and the number it quotes.
+#: Enforced because ``SET a[1000000000] = 1`` is one line and would otherwise
+#: allocate every slot it names.
+_MAX_ARRAY_SIZE = 134_217_727
+
+
+def _assign_at_path(out: Any, path: list[int], value: Any) -> list:
+    items = list(out) if isinstance(out, (list, tuple)) else []
+    head, rest = path[0], path[1:]
+    if len(items) < head:
+        items.extend([None] * (head - len(items)))
+    items[head - 1] = _assign_at_path(items[head - 1], rest, value) if rest else value
+    return items
+
+
+def _assign_slice(out: Any, sub: tuple, value: Any, scope: Scope, ctx: ScalarContext) -> list:
+    _is_slice, lo_node, hi_node = sub
+    items = list(out) if isinstance(out, (list, tuple)) else []
+    lo = 1 if lo_node is None else _assign_slice_bound(lo_node, scope, ctx)
+    hi = len(items) if hi_node is None else _assign_slice_bound(hi_node, scope, ctx)
+    if lo < 1:
+        raise errors.feature_not_supported(
+            "UPDATE of an array element below subscript 1 is not supported"
+        )
+    if hi > _MAX_ARRAY_SIZE:
+        raise errors.SQLError(
+            "54000", f"array size exceeds the maximum allowed ({_MAX_ARRAY_SIZE})"
+        )
+    width = max(hi - lo + 1, 0)
+    source = list(value) if isinstance(value, (list, tuple)) else None
+    if source is None or len(source) < width:
+        raise errors.SQLError("2202E", "source array too small")
+    if len(items) < hi:
+        items.extend([None] * (hi - len(items)))
+    for n, slot in enumerate(range(lo, hi + 1)):
+        items[slot - 1] = source[n]
+    return items
+
+
+def _assign_slice_bound(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> int:
+    """A slice bound in an assignment target -- always 1-based, unlike a bare
+    index, which sqlglot folds."""
+    raw = evaluate(node, scope, ctx)
+    if raw is None:
+        raise errors.SQLError("22004", "array subscript in assignment must not be null")
+    return int(raw)
 
 
 def _truthy(value: Any) -> bool:
@@ -1234,7 +1394,14 @@ def _eval_array_size(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> 
         return None
     dims = _array_dim_lengths(v)
     dim_node = node.args.get("expression")
-    dim = int(evaluate(dim_node, scope, ctx)) if dim_node is not None else 1
+    # A NULL dimension is a NULL answer. `int(None)` raised instead, and the
+    # TypeError surfaced as `42883 function array_size(integer[], unknown) does
+    # not exist` -- a signature error naming sqlglot's internal node, for a
+    # call PostgreSQL simply answers NULL.
+    raw = evaluate(dim_node, scope, ctx) if dim_node is not None else 1
+    if raw is None:
+        return None
+    dim = int(raw)
     if dim < 1 or dim > len(dims):
         return None
     return dims[dim - 1]
@@ -1280,19 +1447,53 @@ def _is_array_operand(node: exp.Expression) -> bool:
 
 
 def _eval_array_cat(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
-    out = _as_list(evaluate(node.this, scope, ctx))
-    for e in node.args.get("expressions") or []:
-        out = out + _as_list(evaluate(e, scope, ctx))
+    """``array_cat(a, b)`` -- and the ``||`` operator's array forms.
+
+    A NULL side is taken as the EMPTY one, which is what lets ``array_cat``
+    fold over a nullable accumulator: ``array_cat(NULL, ARRAY[3])`` is ``{3}``.
+    But when EVERY side is NULL the answer is NULL, not the empty array --
+    ``_as_list(None)`` turned it into ``{}``, a value PostgreSQL never returns
+    here and one that ``IS NULL`` then disagrees about.
+    """
+    values = [evaluate(node.this, scope, ctx)]
+    values += [evaluate(e, scope, ctx) for e in node.args.get("expressions") or []]
+    if all(v is None for v in values):
+        return None
+    out: list = []
+    for v in values:
+        out = out + _as_list(v)
     return out
 
 
 def _eval_array_position(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> Any:
+    """``array_position(arr, elem [, start])`` -- the 1-based index of the first
+    match at or after ``start``.
+
+    The third argument was parsed and then DROPPED, so
+    ``array_position(ARRAY[1,2,3,2], 2, 3)`` answered 2 where PostgreSQL
+    answers 4 -- a wrong number rather than an error, which is why nothing
+    caught it. A NULL ``start`` is a NULL answer.
+
+    Searching matches NULL to NULL here, unlike the containment operators --
+    see ``_array_membership``.
+    """
     arr = evaluate(node.this, scope, ctx)
     if not isinstance(arr, (list, tuple)):
         return None
     elem = evaluate(node.args.get("expression"), scope, ctx)
-    for i, v in enumerate(arr, start=1):  # 1-based, first match
-        if v == elem:
+    # sqlglot files `array_position`'s THIRD argument under `zero_based` -- a
+    # slot name it reuses, not a flag. Reading `expressions` (the obvious
+    # guess) found nothing, which is how the argument came to be dropped
+    # silently in the first place.
+    start = 1
+    start_node = node.args.get("zero_based")
+    if start_node is not None:
+        raw = evaluate(start_node, scope, ctx)
+        if raw is None:
+            raise errors.SQLError("22004", "initial position must not be null")
+        start = max(1, int(raw))
+    for i, v in enumerate(arr, start=1):  # 1-based, first match at or after start
+        if i >= start and v == elem:
             return i
     return None
 
@@ -4622,12 +4823,26 @@ def _plain_scalar(name: str, args: list[Any]) -> Any:
             _as_text(a)
         )
     if name == "string_to_array":
-        # A NULL delimiter splits into single characters, as PG does.
+        # Three separator shapes PostgreSQL treats differently, all measured on
+        # 14.13: a NULL delimiter splits into single CHARACTERS, an EMPTY one
+        # keeps the whole string as one element, and an empty INPUT is the
+        # empty array whatever the delimiter is.
+        #
+        # The empty delimiter reached `str.split('')`, which raises -- and the
+        # ValueError surfaced as `42883 function string_to_array(unknown,
+        # unknown) does not exist`. The empty input returned `{''}` where
+        # PostgreSQL returns `{}`.
         if a is None:
             return None
         delim = args[1] if len(args) > 1 else None
         text = _as_text(a)
-        parts = list(text) if delim is None else text.split(_as_text(delim))
+        if text == "":
+            return []
+        if delim is None:
+            parts = list(text)
+        else:
+            sep = _as_text(delim)
+            parts = [text] if sep == "" else text.split(sep)
         null_str = _as_text(args[2]) if len(args) > 2 and args[2] is not None else None
         return [None if null_str is not None and x == null_str else x for x in parts]
     if name == "array_replace":
@@ -4756,7 +4971,10 @@ PLAIN_SCALAR_TAGS = {
     "regexp_match": "text[]",
     "regexp_split_to_array": "text[]",
     "string_to_array": "text[]",
-    "array_positions": "int8[]",
+    # `array_positions` answers `integer[]` on PostgreSQL (14.13, probed), not
+    # `bigint[]` -- a client decoding the column by its declared oid got the
+    # wrong width.
+    "array_positions": "int4[]",
     "num_nonnulls": "int4",
     "num_nulls": "int4",
     "parse_ident": "text[]",
@@ -6026,15 +6244,50 @@ def _eval_range_op(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> An
 
 
 def _array_membership(needle: Any, haystack: list) -> bool:
-    """Postgres array element equality — a plain ``in`` test, but tolerant of the
-    ``value in [..]`` raising on unhashable / mismatched element types."""
+    """Postgres array element equality for the CONTAINMENT operators — a plain
+    ``in`` test, but tolerant of the ``value in [..]`` raising on unhashable /
+    mismatched element types.
+
+    **A NULL matches nothing, not even another NULL.** ``@>`` / ``<@`` / ``&&``
+    use the element type's ``=``, under which ``NULL = NULL`` is unknown — so
+    ``ARRAY[1,NULL] @> ARRAY[NULL]`` is FALSE on PostgreSQL and
+    ``ARRAY[1,NULL] <@ ARRAY[1,NULL]`` is false as well (measured on 14.13).
+    Python's ``None == None`` is True, so without this gate every one of those
+    answered true — and in a WHERE clause that returned rows PostgreSQL
+    excludes.
+
+    This is NOT the rule the SEARCH functions use: ``array_position`` /
+    ``array_remove`` / ``array_replace`` do match NULL to NULL. The two look
+    like one another's bug; PostgreSQL really has both.
+    """
+    if needle is None:
+        return False
     for item in haystack:
+        if item is None:
+            continue
         try:
             if item == needle:
                 return True
         except Exception:  # noqa: BLE001 — heterogeneous element types compare unequal
             continue
     return False
+
+
+def _array_flatten(v: Any) -> list:
+    """Every leaf element of a (possibly multidimensional) array, row-major.
+
+    The containment operators ignore dimensionality — ``ARRAY[[1,2],[3,4]] @>
+    ARRAY[3]`` is true on PostgreSQL — so both sides are flattened before they
+    are compared. Comparing them level-by-level made every containment test
+    against a 2-D array answer false.
+    """
+    out: list = []
+    for item in v:
+        if isinstance(item, (list, tuple)):
+            out.extend(_array_flatten(item))
+        else:
+            out.append(item)
+    return out
 
 
 def _array_dim_lengths(v: Any) -> list[int]:
@@ -6056,9 +6309,21 @@ def _eval_array_op(node: exp.Expression, scope: Scope, ctx: ScalarContext) -> An
     same operator token."""
     left = evaluate(node.this, scope, ctx)
     right = evaluate(node.expression, scope, ctx)
-    if not (isinstance(left, (list, tuple)) and isinstance(right, (list, tuple))):
+    # These three operators are NULL-propagating: `ARRAY[1] @> NULL` is NULL on
+    # PostgreSQL, not false. Reached here whenever EITHER side is an array and
+    # the other is NULL -- and when both are, which is also NULL for the jsonb
+    # reading further down, so nothing is lost by answering it here.
+    #
+    # Without this the pair fell past every handler in the dispatch chain and
+    # surfaced as `42883 function array_contains_all() does not exist`: a
+    # function name no user wrote, for an operator that does exist.
+    left_arr = isinstance(left, (list, tuple))
+    right_arr = isinstance(right, (list, tuple))
+    if (left is None and (right is None or right_arr)) or (right is None and left_arr):
+        return None
+    if not (left_arr and right_arr):
         return _NOT_ARRAY
-    left, right = list(left), list(right)
+    left, right = _array_flatten(left), _array_flatten(right)
     if isinstance(node, exp.ArrayOverlaps):  # && : share at least one element
         return any(_array_membership(x, right) for x in left)
     if isinstance(node, exp.ArrayContainedBy):  # <@ : every left element is in right
