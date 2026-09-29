@@ -12788,3 +12788,95 @@ def test_convert_from_decodes_stored_bytes(home: Path) -> None:
             r"SELECT convert_from('\x616263'::bytea,'UTF8'), convert_from('abc'::bytea,'LATIN1')"
         )
         assert cur.fetchall() == [("abc", "abc")]
+
+
+# --- set-returning functions as a FROM item ---------------------------------
+#
+# `generate_series` already worked; these are the ones bounded by their
+# arguments, which can be materialised. Expectations from
+# `tools/probes/pg_corpora/srf.sql` against PostgreSQL 14.13.
+
+
+def test_unnest_as_a_from_item(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM unnest(ARRAY[1,2,3])")
+        assert cur.fetchall() == [(1,), (2,), (3,)]
+        cur.execute("SELECT * FROM unnest(ARRAY['a','b']) AS t(s)")
+        assert cur.fetchall() == [("a",), ("b",)]
+        # `AS x` with no column list names the table AND the single column.
+        cur.execute("SELECT x FROM unnest(ARRAY[3,1,2]) x")
+        assert cur.fetchall() == [(3,), (1,), (2,)]
+        cur.execute("SELECT x * 2 FROM unnest(ARRAY[1,2]) x")
+        assert cur.fetchall() == [(2,), (4,)]
+
+
+def test_an_empty_or_null_array_yields_no_rows(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM unnest(ARRAY[]::int[])")
+        assert cur.fetchall() == []
+        cur.execute("SELECT * FROM unnest(NULL::int[])")
+        assert cur.fetchall() == []
+
+
+def test_unnest_flattens_a_multidimensional_array(home: Path) -> None:
+    """`unnest(ARRAY[[1,2],[3,4]])` is FOUR rows, not two — it yields the
+    leaves in row-major order, not the inner arrays."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM unnest(ARRAY[[1,2],[3,4]])")
+        assert cur.fetchall() == [(1,), (2,), (3,), (4,)]
+
+
+def test_clauses_and_aggregates_over_a_set_returning_source(home: Path) -> None:
+    """The source is planned as a FROM-subquery, so WHERE / ORDER BY / LIMIT
+    and the aggregates come from the path that already handles
+    `FROM (SELECT ...) s` — none of it is written twice."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT x FROM unnest(ARRAY[3,1,2]) x ORDER BY x")
+        assert cur.fetchall() == [(1,), (2,), (3,)]
+        cur.execute("SELECT x FROM unnest(ARRAY[3,1,2]) x WHERE x > 1 ORDER BY x")
+        assert cur.fetchall() == [(2,), (3,)]
+        cur.execute("SELECT x FROM unnest(ARRAY[3,1,2]) x ORDER BY x LIMIT 2")
+        assert cur.fetchall() == [(1,), (2,)]
+        cur.execute("SELECT count(*) FROM unnest(ARRAY[1,2,3])")
+        assert cur.fetchall() == [(3,)]
+        cur.execute("SELECT array_agg(x) FROM unnest(ARRAY[3,1,2]) x")
+        assert cur.fetchall() == [([3, 1, 2],)]
+
+
+def test_generate_series_still_takes_its_own_path(home: Path) -> None:
+    """A series is a RANGE and stays lazy: materialising
+    `generate_series(1, 10000000)` into a Vec would be a real regression, so it
+    keeps the source it had rather than joining the materialised ones."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM generate_series(1,3)")
+        assert cur.fetchall() == [(1,), (2,), (3,)]
+        cur.execute("SELECT g FROM generate_series(1,3) g WHERE g > 1")
+        assert cur.fetchall() == [(2,), (3,)]
+
+
+def test_other_set_returning_functions_in_from(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM regexp_split_to_table('a,b,c', ',')")
+        assert cur.fetchall() == [("a",), ("b",), ("c",)]
+        cur.execute("SELECT * FROM generate_subscripts(ARRAY[5,6,7], 1)")
+        assert cur.fetchall() == [(1,), (2,), (3,)]
+        # A dimension the array does not have yields no rows, not an error.
+        cur.execute("SELECT * FROM generate_subscripts(ARRAY[5,6,7], 2)")
+        assert cur.fetchall() == []
+
+
+def test_a_set_returning_function_as_a_bare_target(home: Path) -> None:
+    """The FROM-less spelling shares `srf_rows` with the FROM one, so the two
+    cannot drift."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT unnest(ARRAY[1,2])")
+        assert cur.fetchall() == [(1,), (2,)]
+        cur.execute("SELECT generate_subscripts(ARRAY[5,6,7], 1)")
+        assert cur.fetchall() == [(1,), (2,), (3,)]

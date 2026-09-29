@@ -6990,6 +6990,48 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       | composite `PRIMARY KEY` / multi-col `FOREIGN KEY` | | `a composite PRIMARY KEY` |
       | non-literal column `DEFAULT` | `default now()` | `a non-literal DEFAULT` |
 
+      **SET-RETURNING FUNCTIONS in FROM landed 2026-09-29** (new `srf` corpus
+      16 divergences of 19 -> 1; `arrays` 6 -> 4). `unnest`,
+      `generate_subscripts` and `regexp_split_to_table` now work as a FROM
+      item -- with WHERE, ORDER BY, LIMIT, aggregates, table and column
+      aliases, `*`, empty/NULL arrays and multidimensional flattening -- and
+      as a bare FROM-less target.
+
+      **The implementation was FAR smaller than reading the code suggested,
+      and this is the fifth entry in this file to say so.** The estimate was
+      "build set-returning functions"; the reality was that the executor
+      already had the right abstraction. Its own comment says the generated
+      series is "a SOURCE rather than its own statement, because everything
+      after this point works on documents and does not care where they came
+      from". So an SRF is planned as a `SubSource` wrapping a
+      `ValuesConstant` -- the same shape `FROM (SELECT ...) s` produces -- and
+      the FROM-subquery path supplies every clause for free. Two hooks and two
+      new functions; no executor change at all.
+
+      Three things worth carrying:
+
+      * **`generate_series` deliberately keeps its OWN lazy path.** It is a
+        RANGE, and materialising `generate_series(1, 10000000)` into a `Vec`
+        would be a real regression. Only functions bounded by their arguments
+        are materialised.
+      * **The FROM spelling and the bare-target spelling share `srf_rows`**, so
+        `SELECT unnest(ARRAY[1,2])` and `FROM unnest(ARRAY[1,2])` cannot drift.
+      * **`unnest` over a multidimensional array yields its LEAVES**, row-major
+        -- four rows for `ARRAY[[1,2],[3,4]]`, not two.
+
+      **STILL OPEN, and it is the hard half**: a set-returning function in the
+      SELECT LIST over a COLUMN -- `SELECT unnest(ia) FROM t` -- which changes
+      row cardinality mid-pipeline rather than supplying the source. That one
+      case is the whole remaining `srf` divergence, one of four in `arrays`,
+      and both of the SRF lines in `strings` (where the call sits beside a
+      scalar column, which is the same problem).
+
+      **`lateral_srf` did NOT move, contrary to the estimate that opened this
+      work.** Its nine cases are `LATERAL` forms -- a function in FROM that
+      references the row to its left -- and they refuse with `this JOIN side`
+      rather than anything SRF-shaped. LATERAL needs correlation machinery,
+      not a materialised source. Do not fold it into an SRF estimate again.
+
       **The RUST PG server's STRING surface landed 2026-09-29** (`strings`
       corpus 18 divergences of 35 -> 8, new `strings2` corpus 27 -> 0, and
       `char_padding` 36 -> 32 / `jsonpath_number` 61 -> 60 incidentally).
