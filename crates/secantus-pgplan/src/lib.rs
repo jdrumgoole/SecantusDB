@@ -4315,9 +4315,6 @@ fn foreign_key_of(
             "number of referencing and referenced columns for foreign key disagree".into(),
         ));
     }
-    if columns.len() != 1 {
-        return Err(Error::Unsupported("a multi-column FOREIGN KEY".into()));
-    }
     // PostgreSQL's one-letter action codes (`parsenodes.h`).
     let action = |code: &str| -> Result<Option<String>> {
         Ok(match code {
@@ -4325,7 +4322,7 @@ fn foreign_key_of(
             "r" => Some("RESTRICT".to_string()),
             "c" => Some("CASCADE".to_string()),
             "n" => Some("SET NULL".to_string()),
-            "d" => return Err(Error::Unsupported("a FOREIGN KEY with SET DEFAULT".into())),
+            "d" => Some("SET DEFAULT".to_string()),
             other => {
                 return Err(Error::Parse(format!(
                     "unknown referential action {other:?}"
@@ -4357,33 +4354,31 @@ fn foreign_key_of(
 /// column must BE that key (this server has no other unique constraint to
 /// reference) -- PostgreSQL's 42830 otherwise.
 pub fn resolve_fk_target(fk: &mut ForeignKey, target: &TableDef) -> Result<()> {
-    let key: Vec<&Column> = target.columns.iter().filter(|c| c.pk).collect();
-    if key.len() > 1 {
-        let names: Vec<String> = key.iter().map(|c| c.name.clone()).collect();
-        let matches = if fk.ref_columns.is_empty() {
-            fk.columns.len() == names.len()
-        } else {
-            fk.ref_columns.len() == names.len() && fk.ref_columns.iter().all(|c| names.contains(c))
-        };
-        if !matches || fk.columns.len() != names.len() {
+    let no_match = || {
+        Error::InvalidForeignKey(format!(
+            "there is no unique constraint matching given keys for referenced table \"{}\"",
+            target.name
+        ))
+    };
+    let pk: Vec<String> = target
+        .columns
+        .iter()
+        .filter(|c| c.pk)
+        .map(|c| c.name.clone())
+        .collect();
+    if fk.ref_columns.is_empty() {
+        if pk.is_empty() {
             return Err(Error::InvalidForeignKey(format!(
-                "there is no unique constraint matching given keys for referenced table \"{}\"",
+                "there is no primary key for referenced table \"{}\"",
                 target.name
             )));
         }
-        return Err(Error::Unsupported(
-            "a FOREIGN KEY to a composite PRIMARY KEY".into(),
-        ));
-    }
-    let pk = target.columns.iter().find(|c| c.pk);
-    if fk.ref_columns.is_empty() {
-        let pk = pk.ok_or_else(|| {
-            Error::InvalidForeignKey(format!(
-                "there is no primary key for referenced table \"{}\"",
-                target.name
-            ))
-        })?;
-        fk.ref_columns = vec![pk.name.clone()];
+        if pk.len() != fk.columns.len() {
+            return Err(Error::InvalidForeignKey(
+                "number of referencing and referenced columns for foreign key disagree".into(),
+            ));
+        }
+        fk.ref_columns = pk;
         return Ok(());
     }
     for col in &fk.ref_columns {
@@ -4391,12 +4386,21 @@ pub fn resolve_fk_target(fk: &mut ForeignKey, target: &TableDef) -> Result<()> {
             return Err(Error::UndefinedColumn(col.clone()));
         }
     }
-    match pk {
-        Some(pk) if fk.ref_columns == [pk.name.clone()] => Ok(()),
-        _ => Err(Error::InvalidForeignKey(format!(
-            "there is no unique constraint matching given keys for referenced table \"{}\"",
-            target.name
-        ))),
+    // The referenced columns must be exactly a unique key -- the PRIMARY KEY
+    // or a UNIQUE constraint -- as a SET: PostgreSQL pairs the columns
+    // positionally but matches the key regardless of the order it is named.
+    let same_set = |key: &[String]| {
+        key.len() == fk.ref_columns.len() && fk.ref_columns.iter().all(|c| key.contains(c))
+    };
+    if same_set(&pk)
+        || target
+            .unique_constraints
+            .iter()
+            .any(|u| !u.deferrable && same_set(&u.columns))
+    {
+        Ok(())
+    } else {
+        Err(no_match())
     }
 }
 

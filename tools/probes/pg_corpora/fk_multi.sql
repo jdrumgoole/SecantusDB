@@ -1,0 +1,24 @@
+CREATE TABLE fkc (id int PRIMARY KEY, pa int, pb text, FOREIGN KEY (pa, pb) REFERENCES fkp (a, b) ON DELETE CASCADE)
+INSERT INTO fkc VALUES (1, 1, 'x')
+INSERT INTO fkc VALUES (2, 1, 'y')
+INSERT INTO fkc VALUES (3, NULL, 'zz')
+UPDATE fkc SET pb = 'q' WHERE id = 1
+DELETE FROM fkp WHERE a = 1
+SELECT count(*) FROM fkc
+CREATE TABLE fkd (id int PRIMARY KEY, x int, y int, FOREIGN KEY (x, y) REFERENCES fku (x, y))
+INSERT INTO fkd VALUES (1, 1, 1)
+INSERT INTO fkd VALUES (2, 1, 2)
+CREATE TABLE fke (id int PRIMARY KEY, pa int REFERENCES fkp (a))
+CREATE TABLE fkf (id int PRIMARY KEY, x int REFERENCES fku (id) ON DELETE SET DEFAULT)
+INSERT INTO fku VALUES (2, 5, 5)
+CREATE TABLE fkg (id int PRIMARY KEY, x int, y int, FOREIGN KEY (x, y) REFERENCES fku (x, y) ON UPDATE CASCADE)
+INSERT INTO fkg VALUES (1, 5, 5)
+UPDATE fku SET y = 6 WHERE id = 2
+SELECT x, y FROM fkg
+UPDATE fku SET x = 9 WHERE id = 1
+DELETE FROM fku WHERE id = 1
+CREATE TABLE fkh (id int PRIMARY KEY, x int DEFAULT 1, y int DEFAULT 1, FOREIGN KEY (x, y) REFERENCES fku (x, y) ON DELETE SET DEFAULT)
+INSERT INTO fkh VALUES (1, 5, 6)
+DELETE FROM fku WHERE id = 2
+SELECT x, y FROM fkh
+CREATE TABLE fki (id int PRIMARY KEY, x int, FOREIGN KEY (x) REFERENCES fku (y))

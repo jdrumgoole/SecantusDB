@@ -13299,3 +13299,36 @@ def test_explain_reports_the_plans_shape(home: Path) -> None:
         cur.execute("EXPLAIN (FORMAT JSON, COSTS OFF) SELECT * FROM ex")
         assert cur.fetchone()[0][0]["Plan"]["Node Type"] == "Seq Scan"
         assert plan("EXPLAIN ANALYZE SELECT * FROM ex")[-1] == "Execution Time: 0.000 ms"
+
+
+def test_multi_column_foreign_keys(home: Path) -> None:
+    """A foreign key over several columns, to a composite PRIMARY KEY or a
+    UNIQUE constraint: MATCH SIMPLE (a NULL anywhere passes), the DELETE and
+    UPDATE actions, and a DETAIL naming the whole key."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE p (a int, b text, PRIMARY KEY (a, b))")
+        cur.execute("CREATE TABLE u (id int PRIMARY KEY, x int, y int, UNIQUE (x, y))")
+        cur.execute("INSERT INTO p VALUES (1, 'x'), (2, 'y')")
+        cur.execute("INSERT INTO u VALUES (1, 5, 5)")
+        cur.execute(
+            "CREATE TABLE c (id int PRIMARY KEY, pa int, pb text, "
+            "FOREIGN KEY (pa, pb) REFERENCES p ON DELETE CASCADE)"
+        )
+        cur.execute("INSERT INTO c VALUES (1, 1, 'x'), (2, NULL, 'nope')")
+        with pytest.raises(psycopg.errors.ForeignKeyViolation) as info:
+            cur.execute("INSERT INTO c VALUES (3, 1, 'y')")
+        assert info.value.diag.message_detail == 'Key (pa, pb)=(1, y) is not present in table "p".'
+        cur.execute("DELETE FROM p WHERE a = 1")
+        cur.execute("SELECT id FROM c ORDER BY id")
+        assert cur.fetchall() == [(2,)]
+        cur.execute(
+            "CREATE TABLE g (id int PRIMARY KEY, x int, y int, "
+            "FOREIGN KEY (x, y) REFERENCES u (x, y) ON UPDATE CASCADE)"
+        )
+        cur.execute("INSERT INTO g VALUES (1, 5, 5)")
+        cur.execute("UPDATE u SET y = 6 WHERE id = 1")
+        cur.execute("SELECT x, y FROM g")
+        assert cur.fetchall() == [(5, 6)]
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):
+            cur.execute("DELETE FROM u WHERE id = 1")

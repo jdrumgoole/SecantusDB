@@ -13947,7 +13947,11 @@ impl PgHandler {
                 upd.filter =
                     self.narrow_by_residual(&upd.table, &upd.filter, upd.residual.take())?;
                 let def = self.lookup(&upd.table);
-                let constrained = def.as_ref().is_some_and(table_has_row_constraints);
+                // A table another one REFERENCES has to see each row's old and
+                // new key, for the referencing side's ON UPDATE action.
+                let referenced = !self.referencing_keys(&upd.table)?.is_empty();
+                let constrained = def.as_ref().is_some_and(table_has_row_constraints) || referenced;
+                let mut key_changes: Vec<(Document, Document)> = Vec::new();
                 // RETURNING needs each row AFTER the update, which only the
                 // row-by-row path below computes -- the bulk path knows just
                 // how many rows matched.
@@ -13991,6 +13995,9 @@ impl PgHandler {
                             if let Some(def) = def.as_ref() {
                                 self.check_row_constraints(def, &after)?;
                             }
+                            if referenced {
+                                key_changes.push((row.clone(), after.clone()));
+                            }
                             new_rows.push(after);
                         }
                         let id = row_id(&row);
@@ -13998,6 +14005,9 @@ impl PgHandler {
                     }
                     if let Some(def) = def.as_ref() {
                         self.check_foreign_keys(def, &new_rows)?;
+                    }
+                    if let (true, Some(def)) = (referenced, def.as_ref()) {
+                        self.check_referencing_updates(def, &key_changes)?;
                     }
                     let mut matched = 0usize;
                     for (id, set, unset) in writes {
@@ -14452,25 +14462,45 @@ impl PgHandler {
     fn referenced_key_exists(
         &self,
         parent: &TableDef,
-        ref_field: &str,
-        value: &Bson,
+        ref_fields: &[String],
+        values: &[Bson],
         pending: &[Document],
     ) -> PgWireResult<bool> {
-        if pending
-            .iter()
-            .any(|r| r.get(ref_field).is_some_and(|v| key_values_equal(v, value)))
-        {
+        let matches = |r: &Document| {
+            ref_fields
+                .iter()
+                .zip(values)
+                .all(|(f, v)| r.get(f).is_some_and(|x| key_values_equal(x, v)))
+        };
+        if pending.iter().any(matches) {
             return Ok(true);
+        }
+        let mut filter = Document::new();
+        for (f, v) in ref_fields.iter().zip(values) {
+            filter.insert(f.clone(), v.clone());
         }
         let found = self
             .storage
-            .find_matching(
-                self.db(),
-                &parent.name,
-                &bson::doc! { ref_field: value.clone() },
-            )
+            .find_matching(self.db(), &parent.name, &filter)
             .map_err(|e| Self::storage_err("could not read", e))?;
         Ok(!found.is_empty())
+    }
+
+    /// A foreign key's `(child field, parent field)` pairs, in key order.
+    fn fk_fields(
+        child: &TableDef,
+        parent: &TableDef,
+        fk: &secantus_pgcatalog::ForeignKey,
+    ) -> Option<(Vec<String>, Vec<String>)> {
+        let fields: Option<Vec<String>> = fk.columns.iter().map(|c| child.field_of(c)).collect();
+        let refs: Option<Vec<String>> = fk.ref_columns.iter().map(|c| parent.field_of(c)).collect();
+        Some((fields?, refs?))
+    }
+
+    /// `Key (a, b)=(1, x)` as PostgreSQL's DETAIL renders a key.
+    fn key_detail(columns: &[String], values: &[Bson]) -> String {
+        let vals: Vec<String> = values.iter().map(secantus_pgplan::value_text).collect();
+        format!("Key ({})=({})", columns.join(", "), vals.join(", "))
     }
 
     /// The child side of every FOREIGN KEY on `def`, over the rows a
@@ -14509,28 +14539,27 @@ impl PgHandler {
         fk: &secantus_pgcatalog::ForeignKey,
         rows: &[Document],
     ) -> PgWireResult<()> {
-        let (Some(col), Some(ref_col)) = (fk.columns.first(), fk.ref_columns.first()) else {
-            return Ok(());
-        };
-        let Some(field) = def.field_of(col) else {
-            return Ok(());
-        };
         let parent = if fk.ref_table == def.name {
             def.clone()
         } else {
             self.lookup(&fk.ref_table)
                 .ok_or_else(|| Self::err(&PlanError::UndefinedTable(fk.ref_table.clone())))?
         };
-        let Some(ref_field) = parent.field_of(ref_col) else {
+        let Some((fields, ref_fields)) = Self::fk_fields(def, &parent, fk) else {
             return Ok(());
         };
         let pending: &[Document] = if fk.ref_table == def.name { rows } else { &[] };
         for row in rows {
-            let value = match row.get(&field) {
-                None | Some(Bson::Null) => continue,
-                Some(v) => v,
+            // MATCH SIMPLE: a key with ANY NULL column references nothing and
+            // passes.
+            let values: Option<Vec<Bson>> = fields
+                .iter()
+                .map(|f| row.get(f).filter(|v| **v != Bson::Null).cloned())
+                .collect();
+            let Some(values) = values else {
+                continue;
             };
-            if !self.referenced_key_exists(&parent, &ref_field, value, pending)? {
+            if !self.referenced_key_exists(&parent, &ref_fields, &values, pending)? {
                 return Err(Self::constraint_error(
                     "23503",
                     format!(
@@ -14538,9 +14567,8 @@ impl PgHandler {
                         def.name, fk.name
                     ),
                     format!(
-                        "Key ({})=({}) is not present in table \"{}\".",
-                        col,
-                        secantus_pgplan::value_text(value),
+                        "{} is not present in table \"{}\".",
+                        Self::key_detail(&fk.columns, &values),
                         fk.ref_table
                     ),
                     def,
@@ -14607,87 +14635,193 @@ impl PgHandler {
             .map_err(|e| Self::storage_err("could not read", e))?;
         let going: Vec<Document> = raw.iter().filter_map(|b| decode_doc(b).ok()).collect();
         for (child, fk) in referencing {
-            let (Some(col), Some(ref_col)) = (fk.columns.first(), fk.ref_columns.first()) else {
-                continue;
-            };
-            let (Some(field), Some(ref_field)) = (child.field_of(col), def.field_of(ref_col))
-            else {
+            let Some((fields, ref_fields)) = Self::fk_fields(&child, def, &fk) else {
                 continue;
             };
             for row in &going {
-                let Some(key) = row.get(&ref_field).filter(|v| **v != Bson::Null) else {
+                let key: Option<Vec<Bson>> = ref_fields
+                    .iter()
+                    .map(|f| row.get(f).filter(|v| **v != Bson::Null).cloned())
+                    .collect();
+                let Some(key) = key else {
                     continue;
                 };
                 // A self-referencing row that is itself going does not hold
                 // its own parent; only rows that STAY count.
-                let mut child_filter = bson::doc! { &field: key.clone() };
+                let mut child_filter = Document::new();
+                for (f, v) in fields.iter().zip(&key) {
+                    child_filter.insert(f.clone(), v.clone());
+                }
                 if child.name == def.name {
                     let going_ids: Vec<Bson> = going.iter().map(row_id).collect();
                     child_filter.insert("_id", bson::doc! { "$nin": going_ids });
                 }
-                let dependants = self
-                    .storage
-                    .find_matching(self.db(), &child.name, &child_filter)
-                    .map_err(|e| Self::storage_err("could not read", e))?;
-                if dependants.is_empty() {
+                self.apply_referential_action(
+                    def,
+                    &child,
+                    &fk,
+                    fk.on_delete.as_deref(),
+                    &fields,
+                    &key,
+                    &child_filter,
+                    None,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// What happens to the rows of `child` that reference a parent key that is
+    /// going away (a DELETE) or changing (an UPDATE, `new_key` set): NO
+    /// ACTION / RESTRICT refuse, CASCADE deletes them (or rewrites their key),
+    /// SET NULL / SET DEFAULT reset their key columns -- after which a SET
+    /// DEFAULT key must itself reference an existing row.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_referential_action(
+        &self,
+        parent: &TableDef,
+        child: &TableDef,
+        fk: &secantus_pgcatalog::ForeignKey,
+        action: Option<&str>,
+        fields: &[String],
+        key: &[Bson],
+        child_filter: &Document,
+        new_key: Option<&[Bson]>,
+    ) -> PgWireResult<()> {
+        let dependants = self
+            .storage
+            .find_matching(self.db(), &child.name, child_filter)
+            .map_err(|e| Self::storage_err("could not read", e))?;
+        if dependants.is_empty() {
+            return Ok(());
+        }
+        let reset = |value_of: &dyn Fn(&str) -> PgWireResult<Bson>| -> PgWireResult<()> {
+            let mut set = Document::new();
+            for (col, f) in fk.columns.iter().zip(fields) {
+                set.insert(f.clone(), value_of(col)?);
+            }
+            let mut after = Vec::new();
+            for b in &dependants {
+                let mut r: Document =
+                    decode_doc(b).map_err(|e| Self::storage_err("could not decode a row", e))?;
+                for (k, v) in &set {
+                    r.insert(k.clone(), v.clone());
+                }
+                self.check_row_constraints(child, &r)?;
+                after.push(r);
+            }
+            if fk.ref_table == child.name || matches!(action, Some("SET DEFAULT")) {
+                self.check_fk_child_side(child, fk, &after)?;
+            }
+            self.update_rows(&child.name, child_filter, &set, &[])?;
+            Ok(())
+        };
+        match action {
+            Some("CASCADE") => match new_key {
+                None => {
+                    self.check_referencing_rows(child, child_filter)?;
+                    self.storage
+                        .delete_matching(
+                            self.db(),
+                            &child.name,
+                            child_filter,
+                            0,
+                            &Document::new(),
+                            None,
+                        )
+                        .map_err(|e| Self::storage_err("could not delete", e))?;
+                    Ok(())
+                }
+                Some(new_key) => {
+                    let by_col: Vec<(String, Bson)> =
+                        fk.columns.iter().cloned().zip(new_key.iter().cloned()).collect();
+                    reset(&|col| {
+                        Ok(by_col
+                            .iter()
+                            .find(|(c, _)| c == col)
+                            .map_or(Bson::Null, |(_, v)| v.clone()))
+                    })
+                }
+            },
+            Some("SET NULL") => reset(&|_| Ok(Bson::Null)),
+            Some("SET DEFAULT") => reset(&|col| {
+                let column = child
+                    .column(col)
+                    .ok_or_else(|| Self::err(&PlanError::UndefinedColumn(col.to_string())))?;
+                match column.default_expr() {
+                    Some(expr) => {
+                        self.eval_constant_sql(&format!("SELECT ({expr})::{}", column.pg_type))
+                    }
+                    None => Ok(column.default.clone().unwrap_or(Bson::Null)),
+                }
+            }),
+            _ if fk.initially_deferred
+                && self
+                    .in_transaction
+                    .load(std::sync::atomic::Ordering::Relaxed) =>
+            {
+                self.defer_fk(&child.name, &fk.name);
+                Ok(())
+            }
+            _ => Err(Self::constraint_error(
+                "23503",
+                format!(
+                    "update or delete on table \"{}\" violates foreign key constraint \"{}\" on table \"{}\"",
+                    parent.name, fk.name, child.name
+                ),
+                format!(
+                    "{} is still referenced from table \"{}\".",
+                    Self::key_detail(&fk.ref_columns, key),
+                    child.name
+                ),
+                child,
+                Some(&fk.name),
+                None,
+            )),
+        }
+    }
+
+    /// The parent side of an UPDATE: a row whose REFERENCED key changes takes
+    /// the key's ON UPDATE action with it. Only a UNIQUE-key reference can
+    /// reach this -- a primary key is immutable here.
+    fn check_referencing_updates(
+        &self,
+        def: &TableDef,
+        pairs: &[(Document, Document)],
+    ) -> PgWireResult<()> {
+        for (child, fk) in self.referencing_keys(&def.name)? {
+            let Some((fields, ref_fields)) = Self::fk_fields(&child, def, &fk) else {
+                continue;
+            };
+            for (before, after) in pairs {
+                let old: Option<Vec<Bson>> = ref_fields
+                    .iter()
+                    .map(|f| before.get(f).filter(|v| **v != Bson::Null).cloned())
+                    .collect();
+                let Some(old) = old else {
+                    continue;
+                };
+                let new: Vec<Bson> = ref_fields
+                    .iter()
+                    .map(|f| after.get(f).cloned().unwrap_or(Bson::Null))
+                    .collect();
+                if old.iter().zip(&new).all(|(a, b)| key_values_equal(a, b)) {
                     continue;
                 }
-                match fk.on_delete.as_deref() {
-                    Some("CASCADE") => {
-                        self.check_referencing_rows(&child, &child_filter)?;
-                        self.storage
-                            .delete_matching(
-                                self.db(),
-                                &child.name,
-                                &child_filter,
-                                0,
-                                &Document::new(),
-                                None,
-                            )
-                            .map_err(|e| Self::storage_err("could not delete", e))?;
-                    }
-                    Some("SET NULL") => {
-                        let mut after = Vec::new();
-                        for b in &dependants {
-                            let mut r: Document = decode_doc(b)
-                                .map_err(|e| Self::storage_err("could not decode a row", e))?;
-                            r.insert(field.clone(), Bson::Null);
-                            self.check_row_constraints(&child, &r)?;
-                            after.push(r);
-                        }
-                        self.update_rows(
-                            &child.name,
-                            &child_filter,
-                            &bson::doc! { &field: Bson::Null },
-                            &[],
-                        )?;
-                    }
-                    _ if fk.initially_deferred
-                        && self
-                            .in_transaction
-                            .load(std::sync::atomic::Ordering::Relaxed) =>
-                    {
-                        self.defer_fk(&child.name, &fk.name);
-                    }
-                    _ => {
-                        return Err(Self::constraint_error(
-                            "23503",
-                            format!(
-                                "update or delete on table \"{}\" violates foreign key constraint \"{}\" on table \"{}\"",
-                                def.name, fk.name, child.name
-                            ),
-                            format!(
-                                "Key ({})=({}) is still referenced from table \"{}\".",
-                                ref_col,
-                                secantus_pgplan::value_text(key),
-                                child.name
-                            ),
-                            &child,
-                            Some(&fk.name),
-                            None,
-                        ));
-                    }
+                let mut child_filter = Document::new();
+                for (f, v) in fields.iter().zip(&old) {
+                    child_filter.insert(f.clone(), v.clone());
                 }
+                self.apply_referential_action(
+                    def,
+                    &child,
+                    &fk,
+                    fk.on_update.as_deref(),
+                    &fields,
+                    &old,
+                    &child_filter,
+                    Some(&new),
+                )?;
             }
         }
         Ok(())
