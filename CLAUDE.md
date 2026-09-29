@@ -462,11 +462,32 @@ one request path:
       `planning_to_execute` marks the executing plan; every other plan sees
       a volatile subquery return no rows.
 
-    **What remains refused**: a window function over an AGGREGATE or a
-    generated source, writing THROUGH a view, an expression / non-btree
-    index, `CREATE TRIGGER`, `EXPLAIN`, composite `PRIMARY KEY` / multi-column
-    `FOREIGN KEY`, a non-literal column `DEFAULT`, and correlation through an
-    aggregate in HAVING.
+    **Functions, triggers, EXPLAIN, LATERAL and passwords landed
+    2026-09-29.** `CREATE FUNCTION ... LANGUAGE sql | plpgsql` is callable
+    everywhere an expression or a FROM item goes; PL/pgSQL runs on an
+    interpreter over `pg_query::parse_plpgsql`'s JSON
+    (`secantus-pgserver/src/plpgsql_fn.rs`), which also runs the `DO` blocks
+    the older `plpgsql_do.rs` subset refuses. `CREATE TRIGGER` fires BEFORE /
+    AFTER, ROW / STATEMENT (`triggers.rs`). Also landed: window functions over
+    aggregates, expression column defaults, composite `PRIMARY KEY` and
+    multi-column `FOREIGN KEY`, `LATERAL`, `EXPLAIN` (plan shape, zero costs),
+    and SCRAM password verification. Corpora: `functions` 0/27, `triggers`
+    0/41, `triggers2` 0/44, `do_blocks` 0/16.
+
+    Two rules from that work:
+
+    - **A statement that can run user code is its OWN transaction**, even in
+      autocommit (`runs_user_code` sends it through `run_batch`'s implicit
+      transaction). Without that, a trigger or `DO` block that raised after
+      writing left the writes committed.
+    - **User code can write ANY table**, so while a trigger or user function
+      exists, an open savepoint captures every table, not just the statement's
+      target -- otherwise `ROLLBACK TO` left a trigger's writes behind.
+
+    **What remains refused**: writing THROUGH a view (and so `INSTEAD OF`
+    triggers), an expression / non-btree index, constraint triggers and
+    transition tables, `VARIADIC` / `BEGIN ATOMIC` functions, and correlation
+    through an aggregate in HAVING. `tasks/backlog.md` has the detail.
 
     **Correlation detection is still the qualifier check.** `foreign_qualifier`
     finds a qualified reference naming nothing in the subquery's own FROM and
@@ -492,10 +513,9 @@ one request path:
     aggregates are the corpora with the most divergences -- run
     `tools/probes/pg_differential.py ... --rust` over `pg_corpora/` for the
     current counts rather than trusting a number here).
-  - Not there yet, beyond the survey above: password verification (a role's SCRAM
-    verifier is stored and never checked — a wrong password and no password both
-    connect, re-probed 2026-09-18, re-confirmed live 2026-09-28 by connecting
-    with a deliberately wrong one).
+  - Password verification works since 2026-09-29: a role with a password must
+    pass SCRAM-SHA-256; a role with none, and an unknown user, are still
+    trusted (test fixtures rely on that).
     **`UNIQUE` IS enforced** — the earlier claim that it was "accepted without
     being enforced" was stale when measured against PostgreSQL 14.24 on
     2026-09-20: a duplicate on a column-level or table-level `UNIQUE` raises

@@ -35,6 +35,12 @@ impl Tag {
     }
 
     /// Set the number of rows affected.
+    /// The row count this tag reports, if any. (Local patch: SecantusDB's
+    /// PL/pgSQL `FOUND` / `GET DIAGNOSTICS` read it back.)
+    pub fn rows(&self) -> Option<usize> {
+        self.rows
+    }
+
     pub fn with_rows(mut self, rows: usize) -> Tag {
         self.rows = Some(rows);
         self

@@ -1,0 +1,12 @@
+DROP TABLE IF EXISTS fn_t
+DROP FUNCTION IF EXISTS add2(int, int)
+DROP FUNCTION IF EXISTS fact(int)
+DROP FUNCTION IF EXISTS grade(int)
+DROP FUNCTION IF EXISTS evens(int)
+DROP FUNCTION IF EXISTS names_like(text)
+DROP FUNCTION IF EXISTS total_n()
+DROP FUNCTION IF EXISTS safe_div(int, int)
+DROP FUNCTION IF EXISTS upsert_n(int, int)
+DROP FUNCTION IF EXISTS tbl(int)
+CREATE TABLE fn_t (id int PRIMARY KEY, name text, n int)
+INSERT INTO fn_t VALUES (1, 'ann', 10), (2, 'bob', 20), (3, 'amy', 30)

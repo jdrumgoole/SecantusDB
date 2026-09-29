@@ -1111,9 +1111,11 @@ pub(crate) fn select_list_srf(
     s: &pg_query::protobuf::SelectStmt,
 ) -> Result<Option<pg_query::protobuf::SelectStmt>> {
     let is_srf = |n: Option<&pg_query::protobuf::Node>| match n.and_then(|v| v.node.as_ref()) {
-        Some(N::FuncCall(f)) if f.over.is_none() => {
-            func_name(f).is_some_and(|name| SELECT_LIST_SRFS.contains(&name.as_str()))
-        }
+        Some(N::FuncCall(f)) if f.over.is_none() => func_name(f).is_some_and(|name| {
+            SELECT_LIST_SRFS.contains(&name.as_str())
+                || crate::correlated::user_function(&name, f.args.len())
+                    .is_some_and(|u| u.returns_set)
+        }),
         _ => false,
     };
     let positions: Vec<usize> = s
