@@ -4773,6 +4773,184 @@ fn has_aggregate(s: &pg_query::protobuf::SelectStmt) -> bool {
     })
 }
 
+/// A `FROM <set-returning function>(...)` item as a materialised source.
+///
+/// `generate_series` keeps its own path (`series_from_clause`): it is a RANGE
+/// and can be produced lazily, so `generate_series(1, 10000000)` must not
+/// become ten million rows in a Vec. The functions here are bounded by their
+/// arguments, so materialising them costs what the argument already cost.
+///
+/// The rows are handed back as a `SubSource` wrapping a `ValuesConstant` --
+/// the same shape `FROM (SELECT ...) s` produces. That is deliberate: the
+/// FROM-subquery path already handles the WHERE, ORDER BY, LIMIT, aggregates,
+/// column aliases and `*` expansion that a client puts around one of these,
+/// and reusing it means none of that has to be written twice or kept in step.
+fn srf_from_clause(from: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Option<SubSource>> {
+    let Some(N::RangeFunction(rf)) = from.node.as_ref() else {
+        return Ok(None);
+    };
+    if rf.is_rowsfrom && rf.functions.len() > 1 {
+        return Err(Error::Unsupported(
+            "ROWS FROM with several functions".into(),
+        ));
+    }
+    // The nesting is a list of lists; the call is the first leaf.
+    let call = rf
+        .functions
+        .iter()
+        .flat_map(|f| match f.node.as_ref() {
+            Some(N::List(l)) => l.items.clone(),
+            _ => vec![f.clone()],
+        })
+        .find_map(|n| match n.node.as_ref() {
+            Some(N::FuncCall(f)) => Some(f.clone()),
+            _ => None,
+        });
+    let Some(call) = call else {
+        return Ok(None);
+    };
+    let name = func_name(&call).unwrap_or_default();
+    let Some((names, types, rows)) = srf_rows(&name, &call, params)? else {
+        return Ok(None);
+    };
+    // `AS t(a, b)` renames positionally; `AS t` names the table, and for a
+    // single-column function the column takes that name too -- which is what
+    // `FROM unnest(...) x` relies on to make `x` both the alias and the column.
+    let (alias, colnames): (String, Vec<String>) = match rf.alias.as_ref() {
+        Some(a) => (
+            a.aliasname.clone(),
+            a.colnames.iter().filter_map(alias_colname).collect(),
+        ),
+        None => (name.clone(), Vec::new()),
+    };
+    let mut names = names;
+    if colnames.len() > names.len() {
+        return Err(Error::Parse(format!(
+            "table \"{alias}\" has {} columns available but {} columns specified",
+            names.len(),
+            colnames.len()
+        )));
+    }
+    for (n, given) in names.iter_mut().zip(&colnames) {
+        *n = given.clone();
+    }
+    if colnames.is_empty() && names.len() == 1 && !alias.is_empty() {
+        names[0] = alias.clone();
+    }
+    let plan = Statement::ValuesConstant(ValuesConstant {
+        names: names.clone(),
+        types: types.clone(),
+        rows,
+    });
+    let mut def = TableDef::new(
+        &alias,
+        names
+            .iter()
+            .zip(&types)
+            .map(|(n, t)| Column::new(n, t, false))
+            .collect(),
+    );
+    def.name = alias.clone();
+    Ok(Some(SubSource {
+        alias,
+        plan: Box::new(plan),
+        def,
+    }))
+}
+
+/// What a set-returning function yields: the output column names, their
+/// declared types, and the rows -- one `Vec<Bson>` per row, one cell per
+/// column.
+type SrfRows = (Vec<String>, Vec<String>, Vec<Vec<Bson>>);
+
+/// The rows a set-returning function produces. `None` means this is not one of
+/// the set-returning functions this server materialises.
+fn srf_rows(
+    name: &str,
+    call: &pg_query::protobuf::FuncCall,
+    params: &[Bson],
+) -> Result<Option<SrfRows>> {
+    let one = |v: Vec<Bson>, ty: &str| {
+        (
+            vec![name.to_string()],
+            vec![ty.to_string()],
+            v.into_iter().map(|x| vec![x]).collect::<Vec<_>>(),
+        )
+    };
+    let args = |n: usize| -> Result<Vec<Bson>> {
+        if call.args.len() != n {
+            return Err(Error::Parse(format!(
+                "function {name} does not exist with that argument list"
+            )));
+        }
+        call.args.iter().map(|a| const_value(a, params)).collect()
+    };
+    Ok(Some(match name {
+        "unnest" => {
+            // Multi-argument `unnest(a, b)` zips the arrays and pads the short
+            // ones with NULLs -- a different shape from this single-column one,
+            // and refused by name until it is written.
+            if call.args.len() != 1 {
+                return Err(Error::Unsupported(
+                    "unnest() with this argument list".into(),
+                ));
+            }
+            let value = const_value(&call.args[0], params)?;
+            let element = static_type(&call.args[0], &value)
+                .strip_suffix("[]")
+                .map(str::to_owned)
+                .ok_or_else(|| Error::Unsupported("unnest() over a non-array".into()))?;
+            // A multidimensional array unnests to its LEAVES, in row-major
+            // order -- `unnest(ARRAY[[1,2],[3,4]])` is four rows, not two.
+            let values = match value {
+                Bson::Null => Vec::new(),
+                v @ Bson::Array(_) => arrays::flatten(&v),
+                _ => return Err(Error::Unsupported("unnest() over a non-array".into())),
+            };
+            one(values, &element)
+        }
+        "generate_subscripts" => {
+            let a = args(2)?;
+            let dims = arrays::dim_lengths(&a[0]);
+            let dim = match &a[1] {
+                Bson::Int32(i) => i64::from(*i),
+                Bson::Int64(i) => *i,
+                _ => return Ok(Some(one(Vec::new(), "int4"))),
+            };
+            let values = match usize::try_from(dim).ok().filter(|d| *d >= 1) {
+                Some(d) if d <= dims.len() => (1..=dims[d - 1])
+                    .map(|i| Bson::Int32(i32::try_from(i).unwrap_or(i32::MAX)))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            one(values, "int4")
+        }
+        "regexp_split_to_table" => {
+            if call.args.len() < 2 || call.args.len() > 3 {
+                return Err(Error::Parse(format!(
+                    "function {name} does not exist with that argument list"
+                )));
+            }
+            let a: Vec<Bson> = call
+                .args
+                .iter()
+                .map(|x| const_value(x, params))
+                .collect::<Result<_>>()?;
+            if a.iter().take(2).any(|v| *v == Bson::Null) {
+                return Ok(Some(one(Vec::new(), "text")));
+            }
+            let parts = scalar::call("regexp_split_to_array", &a)
+                .ok_or_else(|| Error::Unsupported("this FROM function".into()))??;
+            let values = match parts {
+                Bson::Array(items) => items,
+                _ => Vec::new(),
+            };
+            one(values, "text")
+        }
+        _ => return Ok(None),
+    }))
+}
+
 /// A `FROM generate_series(...)` item, if that is what this FROM clause is.
 ///
 /// The alias renames the column: `AS g` makes it `g`, and `AS g(x)` makes it
@@ -6989,10 +7167,16 @@ fn plan_select(
         let join = plan_join_select(s, lookup, params)?;
         return plan_join_plain_select(s, join, lookup, params);
     }
+    // A SET-returning function in FROM becomes a materialised source and rides
+    // the FROM-subquery path below. Checked before the single-value function
+    // source, which would otherwise claim it and answer `this FROM function`.
+    let srf = srf_from_clause(&s.from_clause[0], params)?;
     // Any other function in FROM -- `pg_sleep`, `pg_listening_channels` --
     // is a FROM-less select with the function as its row source.
-    if let Some(N::RangeFunction(rf)) = s.from_clause[0].node.as_ref() {
-        return plan_function_source_select(s, rf, params);
+    if srf.is_none() {
+        if let Some(N::RangeFunction(rf)) = s.from_clause[0].node.as_ref() {
+            return plan_function_source_select(s, rf, params);
+        }
     }
     // `FROM (SELECT ...) s`, and an inlined CTE reference, which arrives as
     // exactly the same node. The subquery's OUTPUT def stands in for the
@@ -7000,6 +7184,10 @@ fn plan_select(
     // LIMIT -- plans against it unchanged and never learns the source was not
     // a table.
     let (table, def, sub) = match s.from_clause[0].node.as_ref() {
+        _ if srf.is_some() => {
+            let src = srf.expect("checked");
+            (String::new(), src.def.clone(), Some(Box::new(src)))
+        }
         Some(N::RangeSubselect(rs)) => {
             let src = plan_from_subquery(rs, lookup, params)?;
             (String::new(), src.def.clone(), Some(Box::new(src)))
@@ -7381,6 +7569,13 @@ fn plan_aggregate(
             exprs: Vec::new(),
             distinct: aggregate_distinct(s)?,
         }));
+    }
+    // An aggregate over a SET-returning function -- `count(*) FROM unnest(...)`,
+    // `array_agg(x) FROM unnest(...) x`. The materialised source is the same
+    // one the plain select uses, so GROUP BY and HAVING over it work for free.
+    if let Some(src) = srf_from_clause(&s.from_clause[0], params)? {
+        let def = src.def.clone();
+        return finish_aggregate(s, String::new(), None, Some(Box::new(src)), def, params);
     }
     // `select max(c) from (select ... group by k) s` -- and every aggregate
     // over an inlined CTE, which reaches here as the same node.
@@ -9206,10 +9401,13 @@ fn plan_select_srf(
     })))
 }
 
-/// `select unnest(<array>)` with no FROM: one row per element, in a column
-/// named `unnest` of the array's element type. A NULL array is zero rows.
-/// The array is a constant here (a literal or a bound parameter), so the rows
-/// are materialised at planning like a `VALUES` list's.
+/// `select <set-returning function>(...)` with no FROM: one row per value the
+/// function yields, in a column named after it.
+///
+/// The arguments are constants here (literals or bound parameters), so the
+/// rows are materialised at planning like a `VALUES` list's. The same
+/// `srf_rows` the FROM form uses produces them, so the two spellings of
+/// `unnest(ARRAY[1,2])` -- as a target and as a FROM item -- cannot drift.
 fn plan_select_unnest(
     s: &pg_query::protobuf::SelectStmt,
     params: &[Bson],
@@ -9223,41 +9421,30 @@ fn plan_select_unnest(
     let Some(N::FuncCall(f)) = rt.val.as_ref().and_then(|v| v.node.as_ref()) else {
         return Ok(None);
     };
-    if func_name(f).as_deref() != Some("unnest") {
+    let name = func_name(f).unwrap_or_default();
+    let Some((names, types, rows)) = srf_rows(&name, f, params)? else {
         return Ok(None);
-    }
-    if f.args.len() != 1 {
-        return Err(Error::Unsupported(
-            "unnest() with this argument list".into(),
-        ));
-    }
+    };
+    // A clause needs a source to apply to, and this shape has none. Refused by
+    // name rather than silently ignored -- dropping a WHERE would return rows
+    // the client asked not to see.
     if s.where_clause.is_some()
         || !s.sort_clause.is_empty()
         || s.limit_count.is_some()
         || s.limit_offset.is_some()
     {
-        return Err(Error::Unsupported(
-            "a clause over a set-returning unnest()".into(),
-        ));
+        return Err(Error::Unsupported(format!(
+            "a clause over a set-returning {name}()"
+        )));
     }
-    let value = const_value(&f.args[0], params)?;
-    let element_type = static_type(&f.args[0], &value)
-        .strip_suffix("[]")
-        .map(str::to_owned)
-        .ok_or_else(|| Error::Unsupported("unnest() over a non-array".into()))?;
-    let rows = match value {
-        Bson::Array(items) => items.into_iter().map(|v| vec![v]).collect(),
-        Bson::Null => Vec::new(),
-        _ => return Err(Error::Unsupported("unnest() over a non-array".into())),
-    };
-    let name = if rt.name.is_empty() {
-        "unnest".to_string()
+    let names = vec![if rt.name.is_empty() {
+        names.into_iter().next().unwrap_or(name)
     } else {
         rt.name.clone()
-    };
+    }];
     Ok(Some(Statement::ValuesConstant(ValuesConstant {
-        names: vec![name],
-        types: vec![element_type],
+        names,
+        types,
         rows,
     })))
 }
