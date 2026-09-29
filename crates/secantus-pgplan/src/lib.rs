@@ -9226,7 +9226,11 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                     ));
                     continue;
                 }
-                if scalar::is_scalar(&name) {
+                // `defers_to_connection` falls THROUGH to the `ConstCol`
+                // branch below: those three are answered by the server when
+                // they stand alone, and folding them here would freeze a
+                // `current_setting` the session may still change.
+                if scalar::is_scalar(&name) && !scalar::defers_to_connection(&name) {
                     let args = f
                         .args
                         .iter()

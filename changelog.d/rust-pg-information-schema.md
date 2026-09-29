@@ -14,7 +14,17 @@ lines written for this change is clean.
 Two findings worth stating:
 
 **Seven catalog functions already worked — but only as a bare select-list
-target.** `version()`, `current_schema()`, `current_database()`,
+target, and the two halves have to be kept apart.** Three of them
+(`current_database`, `current_catalog`, `current_setting`) must still DEFER to
+the connection when they stand alone: the server's value is the live one, and
+`current_setting` has to see a `set_config` from earlier in the session.
+Making the expression form work by adding them to the scalar evaluator's name
+list silently broke that — the bare-target gate matched them first and folded
+them, which a planner unit test with no session installed saw as
+"unrecognized configuration parameter" for a GUC that exists. CI's `rust` job
+caught it; a test now pins both halves together.
+
+**The seven:** `version()`, `current_schema()`, `current_database()`,
 `current_setting()`, `format_type()`, `obj_description()` and `pg_get_expr()`
 become a value the server resolves when they stand alone. Reached inside an
 EXPRESSION — `version() LIKE 'PostgreSQL%'`, `current_setting('x') ~ '...'`,

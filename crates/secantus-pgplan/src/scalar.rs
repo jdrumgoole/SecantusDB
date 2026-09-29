@@ -17,6 +17,23 @@ pub fn is_scalar(name: &str) -> bool {
         || extension_scalar(name).is_some()
 }
 
+/// The catalog functions that must be answered by the CONNECTION when they
+/// stand alone, rather than folded here.
+///
+/// Each has a `ConstCol` of its own, and the server's value is the live one:
+/// `current_setting` has to see a `set_config` from earlier in the session,
+/// and folding it at plan time also means a caller with no session installed
+/// (every planner unit test) gets "unrecognized configuration parameter" for
+/// a GUC that exists. They are still reachable HERE, which is what makes
+/// `current_setting('x') ~ '...'` work -- the expression path has no
+/// `ConstCol` to defer to.
+pub fn defers_to_connection(name: &str) -> bool {
+    matches!(
+        name,
+        "current_database" | "current_catalog" | "current_setting"
+    )
+}
+
 /// The catalog-facing built-ins, which a client calls inside an EXPRESSION at
 /// least as often as on its own -- `version() LIKE 'PostgreSQL%'`,
 /// `current_setting('x') ~ '...'`, `obj_description(oid) IS NULL`.

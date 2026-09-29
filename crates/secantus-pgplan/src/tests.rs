@@ -868,6 +868,37 @@ fn select_without_from_answers_session_functions() {
     assert_eq!(err.sqlstate(), "0A000");
 }
 
+#[test]
+fn a_session_function_defers_alone_and_folds_inside_an_expression() {
+    // The pair that has to hold together. ALONE, `current_database()` becomes
+    // a `ConstCol` the server answers -- its value is the live one, and
+    // `current_setting` in particular has to see a `set_config` from earlier
+    // in the session. Inside an EXPRESSION there is no `ConstCol` to defer
+    // to, so the constant evaluator answers it from the session snapshot.
+    //
+    // Making the second work by adding these names to `scalar::is_scalar`
+    // silently broke the first: the bare-target gate matched them first and
+    // folded them, which a planner unit test (no session installed) saw as
+    // "unrecognized configuration parameter" for a GUC that exists.
+    match plan_ok("SELECT current_database()") {
+        Statement::SelectConstant(sc) => {
+            assert_eq!(sc.columns[0].1, ConstCol::CurrentDatabase);
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    match plan_ok("SELECT current_database() IS NOT NULL") {
+        Statement::SelectConstant(sc) => {
+            // Folded here, so it is a VALUE rather than a deferred column.
+            assert!(
+                matches!(sc.columns[0].1, ConstCol::Value(_)),
+                "{:?}",
+                sc.columns[0]
+            );
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+}
+
 /// A cast DECLARES its column's type, which is not the same as the type of the
 /// value that turns up.
 ///
