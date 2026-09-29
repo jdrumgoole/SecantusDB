@@ -3025,36 +3025,43 @@ These are explicit non-goals. Don't add them without a reason.
         - The streaming-SDAM path (`stream_awaitable_hello`, gated on
           `exhaustAllowed`) is implemented, and the driver does take it.
         - A plain AWAITABLE hello — `topologyVersion` + `maxAwaitTimeMS`
-          WITHOUT `exhaustAllowed` — returns immediately here where mongod
-          blocks for the full budget (0.3ms vs 502ms, measured). That is a
-          second real divergence, not yet shown to cause this failure, and it
-          is the most promising remaining lead.
+          WITHOUT `exhaustAllowed` — returned immediately here where mongod
+          blocks for the full budget (0.3ms vs 502ms). **FIXED 2026-09-29 on
+          both servers**, along with `31368` for a `maxAwaitTimeMS` that names
+          no `topologyVersion`. The count is STILL 12, so that was not the
+          cause either — four candidates are now eliminated by probe
+          (`setParameter`, `helloOk`, the topology push, the non-exhaust hold).
 
         Next step: capture BOTH servers' monitor traffic through one proxy and
         diff the message SEQUENCES rather than the totals — the gap is 2
         messages, the size of one extra handshake pair.
 
-      * **`replSetStepDown` answers 59 CommandNotFound here. Which mongod
-        answer is right depends on the persona, and ours is a REPLICA SET**
-        (measured 2026-09-29):
-        - a STANDALONE mongod: `76 NoReplicationEnabled` "not running with
-          --replSet";
-        - a SINGLE-NODE REPLICA SET: `{replSetStepDown: 5}` is
-          `2 BadValue` "stepdown period must be longer than
-          secondaryCatchUpPeriod", and `{replSetStepDown: 5, force: true}`
-          **succeeds** — the node goes secondary for ~5s, re-elects itself
-          (it is the only member) and returns to primary, and an open cursor
-          survives the whole transition.
+      * **`replSetStepDown` — IMPLEMENTED on both servers 2026-09-29, and
+        `TestConnectionsSurvivePrimaryStepDown` now PASSES in full.** The
+        contract was measured against a real single-node replica set, and the
+        whole observable matches it line for line: `{ok: 1}` immediately, then
+        `hello` reporting `isWritablePrimary: false` / `secondary: true` with
+        `primary` and `electionId` DROPPED, writes refused `10107 "not primary"`
+        while reads keep working, then back to primary.
 
-        We advertise `setName` and already serve `replSetGetStatus` with a full
-        status, so 76 "not running with --replSet" would contradict our own
-        handshake. The faithful answer is the single-node replica-set one,
-        which means really transitioning to secondary for the requested period
-        — **a genuine behaviour change** (writes must be refused during the
-        window) and therefore Joe's call rather than a drive-by. Breaks
-        `TestConnectionsSurvivePrimaryStepDown/getMore_iteration`, which needs
-        the command to succeed, the cursor to survive, and the pool not to
-        clear.
+        Two parts were not guessable and are why this needed probing:
+        - the 10107 must carry `topologyVersion`, or the driver marks the server
+          UNKNOWN and the very next READ fails server selection (3 of 3 before
+          it was added, while mongod's identical sequence succeeded);
+        - the hello stream must PUSH the change rather than wait out
+          `maxAwaitTimeMS`, or the driver does not learn about it until its next
+          heartbeat and the error above looks newer than its world view.
+
+        A non-forced step-down answers **262 "No electable secondaries caught
+        up as of <ts>"** — mongod's own answer, and an honest one: a single-node
+        set genuinely has no secondary to hand over to.
+
+        **Election TIMING is deliberately not reproduced.** mongod's return to
+        primary is driven by its election machinery, not the period alone — a
+        period of 5 came back after ~5s but a period of 0 took ~19s. Modelling
+        that means modelling election timeouts, the multi-node machinery this
+        project puts out of scope. Here the window is exactly the requested
+        period, and that is the only observable in the table that differs.
 
       **Two need a second replica-set member — the documented single-node
       non-goal:**

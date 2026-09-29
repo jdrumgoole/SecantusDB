@@ -50,6 +50,7 @@ pub mod mapreduce;
 pub mod params;
 pub mod rbac;
 pub mod roles;
+pub mod stepdown;
 pub mod storage;
 pub mod topstats;
 pub mod transactions;
@@ -146,6 +147,9 @@ pub struct CommandContext {
     /// unit-test contexts and before the server wires one in, in which case
     /// `setParameter` still validates and answers but nothing persists.
     pub server_params: Option<Arc<params::ServerParams>>,
+    /// Server-wide `replSetStepDown` window. While it is open this node is a
+    /// SECONDARY: `hello` says so and writes are refused. `None` off-server.
+    pub step_down: Option<Arc<stepdown::StepDownState>>,
     /// Server-wide `configureFailPoint` registry. `None` in unit-test contexts;
     /// the server wires one in so `failCommand` short-circuits in dispatch.
     pub failpoints: Option<Arc<failpoints::FailPointRegistry>>,
@@ -207,6 +211,7 @@ impl CommandContext {
             replica_set_name: None,
             require_auth: false,
             server_params: None,
+            step_down: None,
             cluster_time: bson::Timestamp {
                 time: 0,
                 increment: 0,
@@ -297,6 +302,12 @@ impl CommandContext {
     /// connection is visible to every other one (and to `getParameter`).
     pub fn with_server_params(mut self, params: Arc<params::ServerParams>) -> Self {
         self.server_params = Some(params);
+        self
+    }
+
+    /// Share the server-wide step-down window.
+    pub fn with_step_down(mut self, state: Arc<stepdown::StepDownState>) -> Self {
+        self.step_down = Some(state);
         self
     }
 
@@ -522,6 +533,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "rolesInfo" => roles::roles_info,
         "getParameter" => diagnostics::get_parameter,
         "setParameter" => params::set_parameter,
+        "replSetStepDown" => stepdown::replset_step_down,
         "getCmdLineOpts" => diagnostics::get_cmd_line_opts,
         "connectionStatus" => diagnostics::connection_status,
         "whatsmyuri" => diagnostics::whatsmyuri,
@@ -947,6 +959,12 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
             if is_write_concern_command(name) {
                 if let Some(e) = validate_write_concern(doc, name) {
                     return e.into_reply();
+                }
+                // A node inside its `replSetStepDown` window is a SECONDARY, and
+                // mongod refuses writes there with 10107 while still serving
+                // reads. Gated on the write-command set so a read is unaffected.
+                if ctx.step_down.as_ref().is_some_and(|s| s.is_stepped_down()) {
+                    return stepdown::not_primary_error(ctx.step_down.as_deref()).into_reply();
                 }
             }
             // Refuse a direct insert/update/delete on a synthetic read-only view

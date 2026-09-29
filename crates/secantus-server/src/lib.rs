@@ -171,6 +171,7 @@ struct Shared {
     /// `None` when `enable_test_commands` is off — its absence is the gate.
     failpoints: Option<Arc<secantus_commands::failpoints::FailPointRegistry>>,
     server_params: Arc<secantus_commands::params::ServerParams>,
+    step_down: Arc<secantus_commands::stepdown::StepDownState>,
     /// Server-wide per-namespace operation accounting, reported by `top`.
     top_stats: Arc<secantus_commands::topstats::TopStats>,
     address: SocketAddr,
@@ -390,6 +391,7 @@ pub fn bind(
         transactions,
         failpoints,
         server_params: Arc::new(secantus_commands::params::ServerParams::new()),
+        step_down: Arc::new(secantus_commands::stepdown::StepDownState::new()),
         top_stats: Arc::new(secantus_commands::topstats::TopStats::new()),
         address,
         next_conn_id: AtomicI64::new(1),
@@ -650,6 +652,23 @@ fn serve<S: Read + Write>(
                     )? {
                         return Ok(());
                     }
+                } else if is_hello_command(&request)
+                    && request.contains_key("maxAwaitTimeMS")
+                    && request.contains_key("topologyVersion")
+                    && reply_ok(&reply)
+                {
+                    // An AWAITABLE hello WITHOUT `exhaustAllowed`. The streaming
+                    // branch above is an optimisation on top of this, not the
+                    // whole feature: a client that sends `topologyVersion` plus
+                    // `maxAwaitTimeMS` is asking the server to HOLD the reply
+                    // until the topology changes or the budget expires, and then
+                    // send exactly one.
+                    //
+                    // We answered immediately -- 0.3ms where mongod took the
+                    // full 502ms (measured 2026-09-29) -- which makes a driver
+                    // that polls this way spin instead of waiting.
+                    let reply = await_hello_reply(stream, shared, &request, reply);
+                    write_op_msg(stream, &header, shared, &reply, None)?;
                 } else {
                     write_op_msg(stream, &header, shared, &reply, pending.as_ref())?;
                 }
@@ -916,6 +935,7 @@ fn make_context(
         .with_cursors(shared.cursors.clone())
         .with_transactions(shared.transactions.clone())
         .with_server_params(shared.server_params.clone())
+        .with_step_down(shared.step_down.clone())
         .with_failpoints_opt(shared.failpoints.clone())
         .with_conn_auth(conn_auth.clone())
         .with_conn_killer(shared.conn_killer.clone())
@@ -1162,6 +1182,42 @@ fn reply_ok(reply: &Document) -> bool {
 /// final `moreToCome`-clear reply (a clean end the driver accepts silently).
 /// Mirrors `server.py::_stream_awaitable_hello`. `Ok(true)` = ended cleanly,
 /// `Ok(false)` = a write failed (drop the connection).
+/// Hold an awaitable `hello` until the topology changes or `maxAwaitTimeMS`
+/// expires, then return the reply to send.
+///
+/// The non-streaming half of the SDAM awaitable-hello protocol: one request,
+/// one reply, but the reply is DELAYED. `shared.stop` is polled so shutdown
+/// stays prompt, and the socket is left alone -- unlike the streaming case there
+/// is no `moreToCome` sequence to police, and the client is simply waiting.
+fn await_hello_reply<S: Read + Write>(
+    _stream: &mut S,
+    shared: &Arc<Shared>,
+    request: &Document,
+    reply: Document,
+) -> Document {
+    let max_await_ms = request
+        .get_i64("maxAwaitTimeMS")
+        .or_else(|_| request.get_i32("maxAwaitTimeMS").map(i64::from))
+        .unwrap_or(0)
+        .clamp(0, 60_000) as u64;
+    let counter_at_entry = shared.step_down.topology_counter();
+    let deadline = Instant::now() + Duration::from_millis(max_await_ms);
+    while Instant::now() < deadline {
+        if shared.stop.load(Ordering::SeqCst) {
+            break;
+        }
+        if shared.step_down.topology_counter() != counter_at_entry {
+            // The topology moved: answer NOW, and with the new state rather
+            // than the snapshot taken before the wait.
+            break;
+        }
+        std::thread::sleep(
+            Duration::from_millis(20).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+    reply
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stream_awaitable_hello<S: Read + Write>(
     stream: &mut S,
@@ -1179,6 +1235,9 @@ fn stream_awaitable_hello<S: Read + Write>(
         .unwrap_or(10_000)
         .max(0) as u64;
 
+    // The topology counter as of the reply we are about to send; the wait below
+    // ends early when it moves.
+    let mut topology_counter_at_send = shared.step_down.topology_counter();
     // Establish the stream with the reply the handler already produced.
     if write_op_msg_flags(
         stream,
@@ -1207,6 +1266,20 @@ fn stream_awaitable_hello<S: Read + Write>(
             if Instant::now() >= deadline {
                 break;
             }
+            // A TOPOLOGY CHANGE ends the wait early. That is the whole point of
+            // the streaming protocol -- mongod pushes the new state the instant
+            // it changes rather than making the client wait out the budget.
+            //
+            // Without it a `replSetStepDown` was invisible to the driver until
+            // its next heartbeat, so the driver still believed this node was
+            // primary when the refused write arrived; the 10107's NEWER
+            // topologyVersion then marked the server UNKNOWN and a read issued
+            // straight after failed server selection. Against mongod the same
+            // read succeeded instantly, because the driver had already been
+            // told (measured 3 of 3, 2026-09-29).
+            if shared.step_down.topology_counter() != topology_counter_at_send {
+                break;
+            }
             let mut probe = [0u8; 1];
             match stream.read(&mut probe) {
                 Ok(0) => return Ok(false), // EOF: client closed / killed
@@ -1225,6 +1298,7 @@ fn stream_awaitable_hello<S: Read + Write>(
             // must see the socket drop (SDAM "Failing heartbeat" tests).
             return Ok(false);
         }
+        topology_counter_at_send = shared.step_down.topology_counter();
         if write_op_msg_flags(stream, header, shared, &reply, OP_MSG_FLAG_MORE_TO_COME).is_err() {
             return Ok(false);
         }

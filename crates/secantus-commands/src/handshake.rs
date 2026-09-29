@@ -15,8 +15,8 @@ use std::sync::OnceLock;
 use bson::{doc, oid::ObjectId, Bson, DateTime, Document};
 
 use crate::{
-    CommandContext, HandlerResult, MAX_BSON_OBJECT_SIZE, MAX_MESSAGE_SIZE, SERVER_VERSION,
-    SERVER_VERSION_ARRAY, WIRE_VERSION,
+    CommandContext, CommandError, HandlerResult, MAX_BSON_OBJECT_SIZE, MAX_MESSAGE_SIZE,
+    SERVER_VERSION, SERVER_VERSION_ARRAY, WIRE_VERSION,
 };
 
 /// `topologyVersion.processId` identifies the server *process* and is fixed for
@@ -25,7 +25,7 @@ use crate::{
 /// clear the connection pool (close + reconnect). Minting a fresh `ObjectId` per
 /// hello therefore triggered a spurious pool-clear on nearly every monitoring
 /// heartbeat — so pin it once per process. (Java-gauge finding)
-fn hello_process_id() -> ObjectId {
+pub(crate) fn hello_process_id() -> ObjectId {
     static PROCESS_ID: OnceLock<ObjectId> = OnceLock::new();
     *PROCESS_ID.get_or_init(ObjectId::new)
 }
@@ -48,13 +48,35 @@ pub fn hello(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     }
 
+    // mongod refuses an awaitable request that names a budget but no version to
+    // wait on -- there is nothing to compare against, so the wait is undefined.
+    // Measured 8.2.11 (2026-09-29): 31368 / Location31368. Both servers used to
+    // ACCEPT it and answer immediately.
+    if doc.contains_key("maxAwaitTimeMS") && !doc.contains_key("topologyVersion") {
+        return Err(CommandError::new(
+            31368,
+            "Location31368",
+            "A request with 'maxAwaitTimeMS' must include a 'topologyVersion'",
+        ));
+    }
+
     let now = DateTime::now();
+    // Inside a `replSetStepDown` window this node is a SECONDARY. The SDAM spec
+    // reads these two fields to place the server in the topology, so they must
+    // flip together with the write refusal -- a server that keeps claiming to be
+    // primary while rejecting every write is worse than either alone.
+    let stepped_down = ctx.step_down.as_ref().is_some_and(|s| s.is_stepped_down());
+    let topology_counter = ctx.step_down.as_ref().map_or(0, |s| s.topology_counter());
     let mut response = doc! {
-        "isWritablePrimary": true,
-        "ismaster": true,
+        "isWritablePrimary": !stepped_down,
+        "ismaster": !stepped_down,
+        // The counter moves when the TOPOLOGY moves, which for a single-node
+        // surrogate means a `replSetStepDown`. A driver ignores a "not primary"
+        // error whose topologyVersion is not NEWER than the one it already has,
+        // so a counter frozen at 0 would make the step-down error look stale.
         "topologyVersion": {
             "processId": hello_process_id(),
-            "counter": Bson::Int64(0),
+            "counter": Bson::Int64(topology_counter),
         },
         "maxBsonObjectSize": MAX_BSON_OBJECT_SIZE,
         "maxMessageSizeBytes": MAX_MESSAGE_SIZE,
@@ -104,9 +126,19 @@ pub fn hello(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         response.insert("hosts", vec![Bson::String(addr.clone())]);
         response.insert("passives", Vec::<Bson>::new());
         response.insert("arbiters", Vec::<Bson>::new());
-        response.insert("primary", addr.clone());
+        // Measured on a single-node replica set (mongod 8.2.11, 2026-09-29):
+        // while a node is stepped down it reports `secondary: true` and DROPS
+        // both `primary` and `electionId` -- there is no known primary and no
+        // election it won. Reporting a primary that is not writable is the
+        // combination SDAM cannot make sense of.
+        response.insert("secondary", stepped_down);
+        if !stepped_down {
+            response.insert("primary", addr.clone());
+        }
         response.insert("me", addr);
-        response.insert("electionId", election);
+        if !stepped_down {
+            response.insert("electionId", election);
+        }
         response.insert(
             "lastWrite",
             doc! {

@@ -27,6 +27,7 @@ from secantus.logbuf import LogBuffer
 from secantus.metrics import Metrics
 from secantus.serverparams import ServerParams
 from secantus.sessions import SessionRegistry
+from secantus.stepdown import StepDownState
 from secantus.storage import Storage
 from secantus.transactions import Transaction, TransactionRegistry
 from secantus.wire import (
@@ -225,6 +226,8 @@ class SecantusDBServer:
         # Server-wide, so a parameter set on one connection is visible to
         # every other one (and to ``getParameter``).
         self.server_params = ServerParams()
+        # Server-wide, so a step-down is visible on every connection.
+        self.step_down_state = StepDownState()
         # Multi-document transaction state machine. The WT work is
         # bound here so the registry itself stays storage-agnostic;
         # ``txn.handle`` is None when the transaction never executed a
@@ -530,6 +533,31 @@ class SecantusDBServer:
                     more=False,
                 )
 
+    def _await_hello(self, body: dict[str, Any]) -> None:
+        """Hold an awaitable ``hello`` for its budget.
+
+        The non-streaming half of the SDAM awaitable-hello protocol: one
+        request, one reply, but the reply is DELAYED until the topology changes
+        or ``maxAwaitTimeMS`` expires. ``_stop_event`` is polled so shutdown
+        stays prompt.
+        """
+        try:
+            budget_s = max(0.0, min(float(body.get("maxAwaitTimeMS", 0)) / 1000.0, 60.0))
+        except (TypeError, ValueError):
+            return
+        counter_at_entry = self.step_down_state.topology_counter() if self.step_down_state else 0
+        deadline = time.monotonic() + budget_s
+        while time.monotonic() < deadline:
+            if self._stop_event.is_set():
+                return
+            if (
+                self.step_down_state is not None
+                and self.step_down_state.topology_counter() != counter_at_entry
+            ):
+                # The topology moved: answer NOW rather than waiting it out.
+                return
+            self._stop_event.wait(min(0.02, max(0.0, deadline - time.monotonic())))
+
     def _stream_awaitable_hello(
         self,
         conn: socket.socket,
@@ -554,8 +582,9 @@ class SecantusDBServer:
         failing whatever operation was in flight. That was an intermittent
         ``mongosh`` smoke failure on slower CI.
 
-        Our topology is fixed, so we simply re-emit the same hello state every
-        ``maxAwaitTimeMS`` with ``moreToCome`` set. The wait is interruptible by
+        Our topology changes only on a ``replSetStepDown``, so we re-emit the
+        same hello state every ``maxAwaitTimeMS`` with ``moreToCome`` set AND
+        immediately whenever that happens. The wait is interruptible by
         ``_stop_event`` so shutdown is prompt, and on shutdown we send one final
         ``moreToCome``-clear reply: a *clean* end of stream the driver accepts
         silently instead of surfacing as an unexpected close.
@@ -607,14 +636,28 @@ class SecantusDBServer:
             return bool(readable)
 
         while True:
-            # Hold up to maxAwaitTimeMS (topology never changes), but wake early
+            # Hold up to maxAwaitTimeMS, but wake early
             # on a readable socket (client close / killOp ⇒ EOF) or on shutdown.
             # Poll in short slices so kill and shutdown are both promptly noticed
             # (a plain ``_stop_event.wait`` would leave a killed monitor
             # connection pinned until maxAwaitTimeMS elapsed).
             remaining = max_await_s
             socket_closed = False
+            # A TOPOLOGY CHANGE ends the wait early -- the point of the
+            # streaming protocol is that the server PUSHES the new state rather
+            # than making the client wait out the budget. Without this a
+            # ``replSetStepDown`` stayed invisible until the driver's next
+            # heartbeat, so the driver still believed this node was primary when
+            # the refused write arrived; the 10107's newer topologyVersion then
+            # marked the server UNKNOWN and a read issued straight after failed
+            # server selection (reproduced 3 of 3, 2026-09-29).
+            counter_at_send = self.step_down_state.topology_counter() if self.step_down_state else 0
             while remaining > 0 and not self._stop_event.is_set():
+                if (
+                    self.step_down_state is not None
+                    and self.step_down_state.topology_counter() != counter_at_send
+                ):
+                    break
                 slice_t = min(remaining, 0.25)
                 try:
                     if _readable(slice_t):
@@ -758,6 +801,7 @@ class SecantusDBServer:
                             sessions=self.sessions,
                             failpoints=self.failpoints,
                             server_params=self.server_params,
+                            step_down_state=self.step_down_state,
                             transactions=self.transactions,
                             peer_cert_dn=peer_cert_dn,
                         )
@@ -828,6 +872,22 @@ class SecantusDBServer:
                             ):
                                 continue
                             return
+                        # An AWAITABLE hello WITHOUT `exhaustAllowed`. The
+                        # streaming branch above is an optimisation on top of
+                        # this, not the whole feature: a client sending
+                        # `topologyVersion` + `maxAwaitTimeMS` asks the server to
+                        # HOLD the reply until the topology changes or the budget
+                        # expires, then send exactly one. We answered at once --
+                        # 0.3ms where mongod took the full 502ms (measured
+                        # 2026-09-29) -- which makes a driver polling this way
+                        # spin instead of wait.
+                        if (
+                            cmd0 in ("hello", "isMaster", "ismaster")
+                            and "maxAwaitTimeMS" in body
+                            and "topologyVersion" in body
+                            and response_doc.get("ok")
+                        ):
+                            self._await_hello(body)
                         reply = build_op_msg_reply(
                             response_to=message.header.request_id,
                             request_id=next(reply_ids),
@@ -849,6 +909,7 @@ class SecantusDBServer:
                             sessions=self.sessions,
                             failpoints=self.failpoints,
                             server_params=self.server_params,
+                            step_down_state=self.step_down_state,
                             transactions=self.transactions,
                             peer_cert_dn=peer_cert_dn,
                         )
