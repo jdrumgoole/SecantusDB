@@ -12363,7 +12363,7 @@ def test_array_search_and_removal_refuse_a_multidimensional_array(home: Path) ->
                 cur.execute(sql)
             conn.rollback()
         cur.execute("SELECT array_replace(ARRAY[[1,2],[3,4]], 1, 9)")
-        assert cur.fetchall() == [[[9, 2], [3, 4]]]
+        assert cur.fetchall() == [([[9, 2], [3, 4]],)]
 
 
 def test_array_to_string_skips_nulls_unless_given_a_null_string(home: Path) -> None:
@@ -12413,7 +12413,7 @@ def test_concatenation_joins_by_dimensionality(home: Path) -> None:
     with _Server(home) as server, server.connect() as conn:
         cur = conn.cursor()
         cur.execute("SELECT array_cat(ARRAY[[1,2],[3,4]], ARRAY[5,6])")
-        assert cur.fetchall() == [[[1, 2], [3, 4], [5, 6]]]
+        assert cur.fetchall() == [([[1, 2], [3, 4], [5, 6]],)]
         with pytest.raises(psycopg.Error):
             cur.execute("SELECT array_cat(ARRAY[1,2], ARRAY[[3,4,5]])")
 
@@ -12530,7 +12530,7 @@ def test_assigning_into_an_array_extends_it_with_nulls(home: Path) -> None:
         cur.execute("UPDATE arr_u SET ia[1] = 1 WHERE id=2 RETURNING ia")
         assert cur.fetchall() == [([1],)]
         cur.execute("UPDATE arr_u SET m[1][2] = 42 WHERE id=1 RETURNING m")
-        assert cur.fetchall() == [[[1, 42], [3, 4]]]
+        assert cur.fetchall() == [([[1, 42], [3, 4]],)]
         # The rewrite is STORED, not only returned.
         cur.execute("SELECT ia, m FROM arr_u WHERE id=1")
         assert cur.fetchall() == [([7, 4, 5, None, None, 6], [[1, 42], [3, 4]])]
@@ -12573,7 +12573,7 @@ def test_a_multidimensional_array_is_typed_as_its_element_array(home: Path) -> N
         cur = conn.cursor()
         cur.execute("SELECT array_fill(0, ARRAY[2,2])")
         assert cur.description[0].type_code == 1007
-        assert cur.fetchall() == [[[0, 0], [0, 0]]]
+        assert cur.fetchall() == [([[0, 0], [0, 0]],)]
         # A LEADING NULL must not decide the element type either.
         cur.execute("SELECT array_prepend(NULL::int, ARRAY[1])")
         assert cur.description[0].type_code == 1007
@@ -12592,3 +12592,28 @@ def test_array_functions_report_their_type_when_the_value_is_null_or_empty(
         assert [d.type_code for d in cur.description] == [1007, 1007]
         cur.execute("SELECT string_to_array('', 'x'), array_positions(ARRAY[1], 9)")
         assert [d.type_code for d in cur.description] == [1009, 1007]
+
+
+def test_a_size_postgres_refuses_is_refused_before_it_is_allocated(home: Path) -> None:
+    """`array_fill(1, ARRAY[1000000000])` and `SET a[1000000000] = 1` are each
+    one line, and each SIZES an array from a user-supplied number.
+
+    PostgreSQL caps an array at 134217727 elements and says so; a server that
+    instead tried to build what was asked for would be exhaustible by a single
+    statement. The cap is checked before any allocation.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE arr_big (id int PRIMARY KEY, ia int[])")
+        cur.execute("INSERT INTO arr_big VALUES (1, ARRAY[1])")
+        for sql in (
+            "SELECT array_fill(1, ARRAY[1000000000])",
+            "SELECT array_fill(1, ARRAY[20000, 20000])",
+            "UPDATE arr_big SET ia[1000000000] = 1 WHERE id=1",
+        ):
+            with pytest.raises(psycopg.Error) as info:
+                cur.execute(sql)
+            assert "134217727" in str(info.value), sql
+            conn.rollback()
+        cur.execute("SELECT ia FROM arr_big WHERE id=1")
+        assert cur.fetchall() == [([1],)]

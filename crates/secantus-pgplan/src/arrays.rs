@@ -69,6 +69,26 @@ pub fn static_result_type(name: &str) -> Option<&'static str> {
     })
 }
 
+/// PostgreSQL's own ceiling on an array's element count, and the number its
+/// error message quotes.
+///
+/// It is enforced here because the two constructors that SIZE an array from a
+/// user-supplied number -- `array_fill(v, ARRAY[n])` and `SET a[n] = v` --
+/// would otherwise allocate whatever `n` asked for. `SET a[1000000000] = 1` is
+/// a one-line statement; PostgreSQL answers it with this error, and a server
+/// that instead tried to build the array would be trivially exhaustible.
+pub const MAX_ARRAY_SIZE: i64 = 134_217_727;
+
+/// Refuse an element count PostgreSQL would refuse, in its own words.
+pub fn check_array_size(n: i64) -> Result<()> {
+    if n > MAX_ARRAY_SIZE {
+        return Err(Error::DataException(format!(
+            "array size exceeds the maximum allowed ({MAX_ARRAY_SIZE})"
+        )));
+    }
+    Ok(())
+}
+
 fn wrong_args(name: &str) -> Error {
     Error::Parse(format!(
         "function {name} does not exist with that argument list"
@@ -590,6 +610,12 @@ fn array_fill(name: &str, args: &[Bson]) -> Result<Bson> {
         .iter()
         .map(|d| as_i64(d).unwrap_or(0))
         .collect();
+    // Size the whole thing BEFORE allocating any of it.
+    let mut total: i64 = 1;
+    for d in &dims {
+        total = total.saturating_mul((*d).max(0));
+        check_array_size(total)?;
+    }
     let mut out = args[0].clone();
     for d in dims.iter().rev() {
         out = Bson::Array(if *d > 0 {
@@ -631,8 +657,14 @@ mod tests {
     #[test]
     fn empty_array_has_no_dimensions_but_zero_cardinality() {
         let empty = arr(vec![]);
-        assert_eq!(call("array_ndims", std::slice::from_ref(&empty)).unwrap(), Bson::Null);
-        assert_eq!(call("array_dims", std::slice::from_ref(&empty)).unwrap(), Bson::Null);
+        assert_eq!(
+            call("array_ndims", std::slice::from_ref(&empty)).unwrap(),
+            Bson::Null
+        );
+        assert_eq!(
+            call("array_dims", std::slice::from_ref(&empty)).unwrap(),
+            Bson::Null
+        );
         assert_eq!(
             call("array_length", &[empty.clone(), i(1)]).unwrap(),
             Bson::Null
@@ -801,6 +833,17 @@ mod tests {
             call("array_replace", &[two_by_two(), i(1), i(9)]).unwrap(),
             arr(vec![arr(vec![i(9), i(2)]), arr(vec![i(3), i(4)])])
         );
+    }
+
+    #[test]
+    fn a_size_postgres_refuses_is_refused_before_it_is_allocated() {
+        // The point is that this returns rather than trying to build it.
+        let err = call("array_fill", &[i(1), arr(vec![Bson::Int64(1_000_000_000)])]);
+        assert!(err.is_err());
+        assert!(check_array_size(MAX_ARRAY_SIZE).is_ok());
+        assert!(check_array_size(MAX_ARRAY_SIZE + 1).is_err());
+        // The product across dimensions is what counts, not each one.
+        assert!(call("array_fill", &[i(1), arr(vec![i(20_000), i(20_000)])]).is_err());
     }
 
     #[test]

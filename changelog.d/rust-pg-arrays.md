@@ -57,3 +57,11 @@ is the kind of quiet divergence this project treats as data loss.
 - `UPDATE` with only a subscripted assignment took the bulk write path, wrote
   an empty `$set` and still reported `UPDATE 1` — a statement that claimed
   success and changed nothing.
+
+#### Security
+
+- `array_fill(1, ARRAY[1000000000])` and `SET a[1000000000] = 1` each size an
+  array from a number the client supplies. PostgreSQL caps an array at
+  134217727 elements and says so; the cap is now checked before any
+  allocation, so a single statement can no longer exhaust the server's
+  memory.

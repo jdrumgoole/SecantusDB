@@ -15565,6 +15565,10 @@ fn apply_subscript_assign(a: &SubscriptAssign, row: &Document, current: Bson) ->
                 "UPDATE of an array element below subscript 1".into(),
             ));
         }
+        // A subscript past the end EXTENDS the array, so the subscript is the
+        // size being asked for -- `SET a[1000000000] = 1` is a one-line
+        // statement that would otherwise allocate a billion slots.
+        arrays::check_array_size(i)?;
         Ok(i)
     };
     if let [SubscriptTarget::Slice(lo, hi)] = a.subs.as_slice() {
