@@ -7070,7 +7070,7 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
       | `upper('ss-sharp')` / `lower` / `initcap` on non-ASCII | **NOT a bug.** This box's PostgreSQL runs `lc_ctype = C`, which does no non-ASCII case mapping at all. Matching it would break against any UTF-8-locale server. Check `SHOW lc_ctype` before touching this. |
       | `regexp_count` / `_substr` / `_instr` / `_like` | PostgreSQL **14 does not have them** (added in 15), so the reference server answers `42883`. Implementing them puts us AHEAD of the reference and the corpus still shows a divergence. |
       | `regexp_matches`, `regexp_split_to_table` | SET-RETURNING -- the `unnest` family, the single largest remaining gap on both servers. |
-      | `normalize(s [, form])` | Needs real Unicode normalization tables. A new dependency (`unicode-normalization`) for one function -- **Joe's call**, and half-implementing it is the silent-divergence shape this project refuses. |
+      | ~~`normalize(s [, form])`~~ | **DONE 2026-09-29.** Joe approved the `unicode-normalization` dependency. All four forms match PostgreSQL 14.13; the form arrives as an ordinary string constant, so an unknown one is a SYNTAX error before the evaluator sees it. `IS NORMALIZED` is a separate node and still unimplemented. |
       | `COLLATE` in an expression | `CollateClause`, a separate feature. |
       | `to_ascii` | Same class (0A000), different message; PostgreSQL's own error here is environment-specific (UTF8 database). |
 

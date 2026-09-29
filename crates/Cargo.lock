@@ -1372,6 +1372,7 @@ dependencies = [
  "pg_query",
  "regex",
  "secantus-pgcatalog",
+ "unicode-normalization",
 ]
 
 [[package]]
