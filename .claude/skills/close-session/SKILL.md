@@ -1,6 +1,6 @@
 ---
 name: close-session
-description: Close out a SecantusDB working session — land every outstanding change, record what is left with measurements, tear down branches and worktrees, and reconcile the documentation with what actually changed. Fires on "close the session", "wrap up", "finish up", "we're done", "end of session", or when the user stops directing new work. Sequences the per-slice landing (batch-worktree) and the machine cleanup (session-cleanup) and adds the part neither covers: finding the docs, comments and tests that still describe the behaviour you just changed — and refuses to declare the session closed while any of your own work is still in flight.
+description: Close out a SecantusDB working session — land every outstanding change, record what is left with measurements, tear down branches and worktrees, and reconcile the documentation with what actually changed. Fires on "close the session", "wrap up", "finish up", "we're done", "end of session", or when the user stops directing new work. Sequences the per-slice landing (batch-worktree) and the machine cleanup (session-cleanup) and adds the part neither covers: finding the docs, comments and tests that still describe the behaviour you just changed. Refuses to declare the session closed while any of your own work is still in flight, and gates the close on a final process sweep so the session leaves no server, waiter or detached run behind.
 ---
 
 # Closing a session is a task, not a farewell
@@ -8,7 +8,11 @@ description: Close out a SecantusDB working session — land every outstanding c
 A session ends well when someone arriving cold can tell what happened, what is
 true now, and what is left — from the repo alone, without this conversation.
 That takes four passes, in this order, because each depends on the one before,
-and then a gate: **you do not get to close while your own work is still moving.**
+and then two gates: **you do not get to close while your own work is still
+moving (§5), and you do not get to close while anything you started is still
+running (§6).** The process gate is last on purpose — waiting in §5 arms waits
+and re-runs suites, so a machine that was clean in §4 is not clean any more by
+the time you reach the handover.
 
 Its mirror is **`start-session`**: what this skill records at the end, that one
 reads at the beginning. Three sibling skills own parts of the work and are not
@@ -119,6 +123,11 @@ something is still awaiting a merge, its worktree and its temp state are not
 debris yet; §5 is where you wait for it, and you will come back through here
 afterwards.
 
+**This pass is provisional, and §6 is the one that counts.** Everything you
+sweep here can be undone by the next thing you do — a waiter armed in §5, a
+suite re-run after a rebase, a probe server started to answer one last question.
+Do not report the machine as clean from this pass.
+
 ## 5. Wait until nothing of YOURS is in flight
 
 **The session is not closable while your own work is still moving.** Waiting is
@@ -156,6 +165,30 @@ so and keep waiting — a runner queue that takes forty minutes takes forty
 minutes. That is cheaper than the alternative, because an unmerged branch is
 invisible to every other session and nothing will pick it up.
 
+**Wedged is neither in flight nor blocked — and it is what this skill has
+actually been leaving behind.** A wait finishes on its own only while its
+condition can still become true. Once the job it watches has died, been
+superseded, or never wrote the string the pattern matches, the waiter sleeps
+forever, and the session that armed it ends without noticing, because the thing
+that would have told it is the notification that never comes. Three such shells
+were found alive on this box on 2026-09-29: one waiting two days for `TOTAL=` in
+a gauge log that had long since finished, one waiting two days on
+`/tmp/suite11.log`, and one waiting **twenty days** for a string in a task
+output belonging to a session that no longer existed. None was in flight; none
+appeared in its own session's handover.
+
+So for each wait still outstanding, decide which of three it is before you wait
+on it — and decide it by checking **the job, not the waiter**
+(`scripts/detached_run.py status --name <n>`, the `.exit` file, `gh run list`):
+
+- the job is still running → **in flight**: wait, then finish it;
+- the job is finished or gone, so the condition can never fire → **wedged**:
+  kill the waiter and read the result straight from its log or `.exit` file;
+- it needs someone who is not you → **blocked**: name it, file it, close over it.
+
+A waiter's own silence is evidence of nothing. Silence is exactly what it
+produces when wedged, and what it produces while working.
+
 **Blocked is different, and is the only thing you may close over**: it needs
 someone who is not you, or a decision that is the user's. Another session's
 branch, a gauge needing credentials you do not have, a question you raised that
@@ -169,6 +202,49 @@ branch and worktree the handover named were still on disk waiting for a merge
 nobody was watching for any more. Everything in it was true except the word
 "closed".
 
+## 6. The process gate: nothing you started is still running
+
+**Run this after §5, and re-run it after anything that starts work.** This is
+the gate that stands between a clean close and the twenty-day waiter above.
+
+```bash
+# A. Anything holding a session scratchpad store — the catch-all. A server
+#    launched from a script carries no recognisable name (a bare `Python
+#    launch_sd.py` matches no daemon pattern), but every one of them carries
+#    its storage path. The [c]haracter class keeps the gate off its own
+#    command line.
+ps -Ao pid,etime,command | grep '[c]laude-501/-Users-jdrumgoole-GIT-SecantusDB'
+
+# B. Databases and gauge runners by name, for anything storing elsewhere.
+pgrep -fl 'secantusd|python -m secantus|[m]ongod|pytest-xdist|gradle|dotnet test|test-libmongoc|psycopg_validation'
+
+# C. Waiter shells — sleep loops, from any session. Same bracket trick: a
+#    bare `grep -E 'sleep|until|while'` matches the pipeline running it.
+ps -Ao pid,ppid,etime,command | grep '[s]hell-snapshots' | grep -E '[s]leep |[u]ntil |[w]hile '
+
+# D. Detached runs with no exit file — still running, or died un-reaped.
+for j in .detached-runs/*.json; do [ -f "${j%.json}.exit" ] || echo "ACTIVE: $j"; done
+```
+
+Every line printed either goes away or gets named in the handover. Nothing may
+be left merely observed.
+
+**Attribution is the session id in the storage path.** Your scratchpad path
+contains this conversation's uuid; a different uuid is a different session,
+whose processes you report and do not touch. Before calling any of them
+orphaned, check whether that session is still alive — `pgrep -fl 'claude
+--resume <uuid>'`. On 2026-09-29 three servers that looked abandoned (a
+`mongod`, a `secantusd-rs` and a Python server, on ports 27100–27102) turned out
+to belong to a session that was still running and still using them. Age alone
+does not settle it; a live owner does.
+
+Kill order is `session-cleanup`'s: **SIGTERM** for anything holding a database,
+never SIGKILL; xdist workers by proctitle; a waiter shell takes a plain `kill`.
+Then **re-run the gate and confirm each pid is gone** — an unverified kill is a
+claim, not a measurement. Harness tasks that owned a waiter you killed will
+report `exit code 144` (128 + SIGTERM); that is the kill landing, not a new
+failure.
+
 ## The handover
 
 Close with what the repo now says, each line backed by a command you just ran:
@@ -180,7 +256,10 @@ Close with what the repo now says, each line backed by a command you just ran:
   finished work, a leftover unmentioned is a trap;
 - anything that outlives the session and would surprise someone: a changed
   default, a machine-wide install (an 8.2.11 `mongod` was added under its own
-  prefix on 2026-08-31), a still-running process that belongs to someone else.
+  prefix on 2026-08-31), a still-running process that belongs to someone else —
+  **by pid, with the evidence for whose it is, copied from §6's output.** A
+  survivor you did not name is one the next session has to re-derive from
+  scratch, and the twenty-day waiter is what that costs.
   **Write the version you measured, not the one you expected** — the `mongod`
   line in `CLAUDE.md` was wrong for a day because a session recorded the
   intended version rather than `mongod --version`'s answer.
@@ -197,7 +276,8 @@ read. Trailing off leaves the reader unsure whether the passes finished or merel
 stopped, and an ambiguous ending has had someone re-run cleanup that was already
 done.
 
-**Say it only once §5 is satisfied.** If something is genuinely BLOCKED — on
+**Say it only once §5 and §6 are both satisfied**, with §6 re-run after the
+last thing you did. If something is genuinely BLOCKED — on
 another session, on a decision that is the user's — close on that and name it:
 "closed, with X blocked on Y and filed at Z" is an ending. But something merely
 *unfinished* is not something to close over, however well you describe it: go

@@ -144,9 +144,14 @@ Run it, then report what it printed:
 git branch --show-current && git log --oneline -1 && git status --short
 git worktree list
 git ls-remote --heads origin | grep <your-branch>      # expect nothing
-pgrep -fl "python -m secantus|mongod|pytest-xdist"     # expect nothing of yours
 df -h / | tail -1 && uptime
 ```
+
+For the process half, run **`close-session` §6's gate** rather than a pattern of
+your own. A name-based `pgrep` is not enough on its own: a server launched from
+a script (`Python launch_sd.py --port 27102 ...`) matches no daemon name, and a
+bare `grep -E 'sleep|until|while'` for waiter shells matches the pipeline
+running it. §6 catches both, and is the single copy — do not fork it here.
 
 Then say which items were yours, which pre-existed, and which you deliberately
 left for the user — with the reason. A leftover reported honestly is finished
