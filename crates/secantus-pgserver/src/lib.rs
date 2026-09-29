@@ -272,6 +272,76 @@ struct RowEnv {
 type SchemaAndRows = (Vec<FieldInfo>, Vec<Vec<Option<Bson>>>);
 
 /// An integer sequence field, whichever BSON width it was written at.
+/// Decode a stored document, FLATTENING a subdocument `_id` into
+/// `_id.<name>` keys at the same position -- a composite primary key's
+/// layout (see `Column::field_override`). Every other document, catalog rows
+/// included, has a scalar or string `_id` and comes back unchanged.
+fn decode_doc(bytes: &[u8]) -> Result<Document, bson::de::Error> {
+    let d: Document = bson::from_slice(bytes)?;
+    if !matches!(d.get("_id"), Some(Bson::Document(_))) {
+        return Ok(d);
+    }
+    let mut out = Document::new();
+    for (k, v) in d {
+        match (k.as_str(), v) {
+            ("_id", Bson::Document(id)) => {
+                for (ik, iv) in id {
+                    out.insert(format!("_id.{ik}"), iv);
+                }
+            }
+            (_, v) => {
+                out.insert(k, v);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The inverse of `decode_doc`: `_id.<name>` keys nested back into a
+/// subdocument `_id`, in the order they appear.
+fn nest_key(d: &Document) -> Option<Document> {
+    if !d.keys().any(|k| k.starts_with("_id.")) {
+        return None;
+    }
+    let mut id = Document::new();
+    let mut out = Document::new();
+    let mut placed = false;
+    for (k, v) in d {
+        match k.strip_prefix("_id.") {
+            Some(inner) => {
+                id.insert(inner.to_string(), v.clone());
+                if !placed {
+                    out.insert("_id", Bson::Null);
+                    placed = true;
+                }
+            }
+            None => {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    out.insert("_id", Bson::Document(id));
+    Some(out)
+}
+
+/// Encode a document for storage, nesting a composite key (see `nest_key`).
+fn encode_doc(d: &Document) -> Result<Vec<u8>, bson::ser::Error> {
+    match nest_key(d) {
+        Some(nested) => bson::to_vec(&nested),
+        None => bson::to_vec(d),
+    }
+}
+
+/// A decoded row's `_id` as stored -- scalar, or the composite key rebuilt.
+fn row_id(d: &Document) -> Bson {
+    if let Some(id) = d.get("_id") {
+        return id.clone();
+    }
+    nest_key(d)
+        .and_then(|n| n.get("_id").cloned())
+        .unwrap_or(Bson::Null)
+}
+
 fn bson_i64(v: &Bson) -> Option<i64> {
     match v {
         Bson::Int32(n) => Some(i64::from(*n)),
@@ -372,7 +442,7 @@ impl DatabaseRegistry {
             .find_matching(Self::NAMESPACE, Self::COLLECTION, &Document::new())
             .map_err(|e| PgHandler::storage_err("could not read the databases", e))?
             .iter()
-            .filter_map(|bytes| bson::from_slice::<Document>(bytes).ok())
+            .filter_map(|bytes| decode_doc(bytes).ok())
             .filter_map(|d| {
                 Some(DatabaseInfo {
                     oid: d.get("oid").and_then(bson_i64)?,
@@ -440,7 +510,7 @@ impl DatabaseRegistry {
             .max(Self::FIRST_USER_OID)
             + 1;
         let doc = bson::doc! {"_id": name, "oid": oid};
-        let bytes = bson::to_vec(&doc)
+        let bytes = encode_doc(&doc)
             .map_err(|e| PgHandler::storage_err("could not encode the database", e))?;
         storage
             .insert(Self::NAMESPACE, Self::COLLECTION, vec![bytes], true)
@@ -633,7 +703,7 @@ impl PgHandler {
             .find_matching(ns, Self::ROLE_COLLECTION, &Document::new())
             .map_err(|e| Self::storage_err("could not read the roles", e))?
             .iter()
-            .filter_map(|bytes| bson::from_slice::<Document>(bytes).ok())
+            .filter_map(|bytes| decode_doc(bytes).ok())
             .filter_map(|d| RoleInfo::from_doc(&d))
             .filter(|r| r.oid != RoleInfo::BOOTSTRAP_OID)
             .collect();
@@ -659,7 +729,7 @@ impl PgHandler {
                 .create_collection(ns, Self::ROLE_COLLECTION)
                 .map_err(|e| Self::storage_err("could not record the role", e))?;
         }
-        let bytes = bson::to_vec(&info.to_doc())
+        let bytes = encode_doc(&info.to_doc())
             .map_err(|e| Self::storage_err("could not encode the role", e))?;
         if new {
             self.storage
@@ -1850,9 +1920,7 @@ impl PgHandler {
             .find_matching(self.db(), table, &Document::new())
             .map_err(|e| Self::storage_err("could not read", e))?;
         raw.iter()
-            .map(|b| {
-                bson::from_slice(b).map_err(|e| Self::storage_err("could not decode a row", e))
-            })
+            .map(|b| decode_doc(b).map_err(|e| Self::storage_err("could not decode a row", e)))
             .collect()
     }
 
@@ -1908,7 +1976,7 @@ impl PgHandler {
                     .find_matching(self.db(), &agg.table, &agg.filter)
                     .map_err(|e| Self::storage_err("could not read", e))?;
                 raw.iter()
-                    .map(|b| bson::from_slice(b))
+                    .map(|b| decode_doc(b))
                     .collect::<Result<_, _>>()
                     .map_err(|e| Self::storage_err("could not decode a row", e))?
             }
@@ -2396,13 +2464,13 @@ impl PgHandler {
             .map_err(|e| Self::storage_err("could not read", e))?;
         let mut ids = Vec::new();
         for bytes in raw {
-            let d: Document = bson::from_slice(&bytes)
-                .map_err(|e| Self::storage_err("could not decode a row", e))?;
+            let d: Document =
+                decode_doc(&bytes).map_err(|e| Self::storage_err("could not decode a row", e))?;
             if matches!(
                 secantus_pgplan::apply_row_expr(&residual, &d).map_err(|e| Self::err(&e))?,
                 Bson::Boolean(true)
             ) {
-                ids.push(d.get("_id").cloned().unwrap_or(Bson::Null));
+                ids.push(row_id(&d));
             }
         }
         let by_id = bson::doc! { "_id": { "$in": ids } };
@@ -2825,8 +2893,8 @@ impl PgHandler {
         let mut by_id: std::collections::BTreeMap<String, Document> =
             std::collections::BTreeMap::new();
         for bytes in raw {
-            let d: Document = bson::from_slice(&bytes)
-                .map_err(|e| Self::storage_err("could not decode a type", e))?;
+            let d: Document =
+                decode_doc(&bytes).map_err(|e| Self::storage_err("could not decode a type", e))?;
             let id = d.get_str("_id").unwrap_or_default().to_string();
             by_id.insert(id, d);
         }
@@ -3660,7 +3728,7 @@ impl PgHandler {
                 .map_err(|e| Self::storage_err("could not replace the view", e))?;
         }
         let bytes =
-            bson::to_vec(&doc).map_err(|e| Self::storage_err("could not encode the view", e))?;
+            encode_doc(&doc).map_err(|e| Self::storage_err("could not encode the view", e))?;
         self.storage
             .insert(self.db(), Self::VIEW_COLLECTION, vec![bytes], true)
             .map_err(|e| Self::storage_err("could not record the view", e))?;
@@ -3732,7 +3800,7 @@ impl PgHandler {
         doc: Document,
     ) -> PgWireResult<()> {
         let bytes =
-            bson::to_vec(&doc).map_err(|e| Self::storage_err("could not encode the catalog", e))?;
+            encode_doc(&doc).map_err(|e| Self::storage_err("could not encode the catalog", e))?;
         self.storage
             .insert(self.db(), collection, vec![bytes], true)
             .map_err(|e| Self::storage_err("could not record the catalog", e))?;
@@ -3800,7 +3868,7 @@ impl PgHandler {
             )
             .map_err(|e| Self::storage_err("could not read the oid counter", e))?;
         let oid = if let Some(bytes) = counter.first() {
-            let d: Document = bson::from_slice(bytes)
+            let d: Document = decode_doc(bytes)
                 .map_err(|e| Self::storage_err("could not decode the oid counter", e))?;
             d.get_i64("next")
                 .or_else(|_| d.get_i32("next").map(i64::from))
@@ -3825,7 +3893,7 @@ impl PgHandler {
             )
             .map_err(|e| Self::storage_err("could not advance the oid counter", e))?;
         let doc = bson::doc! {"_id": key, "next": oid + 1};
-        let bytes = bson::to_vec(&doc)
+        let bytes = encode_doc(&doc)
             .map_err(|e| Self::storage_err("could not encode the oid counter", e))?;
         self.storage
             .insert(self.db(), Self::ENUM_META_COLLECTION, vec![bytes], true)
@@ -3900,7 +3968,7 @@ impl PgHandler {
             )
             .map_err(|e| Self::storage_err("could not read the oid counter", e))?;
         let oid = if let Some(bytes) = counter.first() {
-            let d: Document = bson::from_slice(bytes)
+            let d: Document = decode_doc(bytes)
                 .map_err(|e| Self::storage_err("could not decode the oid counter", e))?;
             d.get_i64("next")
                 .or_else(|_| d.get_i32("next").map(i64::from))
@@ -3925,7 +3993,7 @@ impl PgHandler {
             )
             .map_err(|e| Self::storage_err("could not advance the oid counter", e))?;
         let doc = bson::doc! {"_id": "oid_counter", "next": oid + 1};
-        let bytes = bson::to_vec(&doc)
+        let bytes = encode_doc(&doc)
             .map_err(|e| Self::storage_err("could not encode the oid counter", e))?;
         self.storage
             .insert(self.db(), Self::ENUM_META_COLLECTION, vec![bytes], true)
@@ -5547,7 +5615,7 @@ impl PgHandler {
             .find_matching(self.db(), CATALOG_COLLECTION, &filter)
             .ok()?;
         let def = rows.first().and_then(|raw| {
-            let d: Document = bson::from_slice(raw).ok()?;
+            let d: Document = decode_doc(raw).ok()?;
             let def = TableDef::from_document(&d)?;
             Some(Self::with_column_sources(def, self.relation_oid(name)))
         });
@@ -5619,7 +5687,7 @@ impl PgHandler {
         let mut written = 0usize;
         for row in rows {
             let bytes =
-                bson::to_vec(&row).map_err(|e| Self::storage_err("could not encode a row", e))?;
+                encode_doc(&row).map_err(|e| Self::storage_err("could not encode a row", e))?;
             let (n, errors) = self
                 .storage
                 .insert(self.db(), table, vec![bytes], true)
@@ -5663,8 +5731,8 @@ impl PgHandler {
             let secantus_pgplan::ConflictAction::Update { set_exprs, filter } = &oc.action else {
                 continue; // DO NOTHING: skipped, and not counted.
             };
-            let existing: Document = bson::from_slice(bytes)
-                .map_err(|e| Self::storage_err("could not decode a row", e))?;
+            let existing: Document =
+                decode_doc(bytes).map_err(|e| Self::storage_err("could not decode a row", e))?;
             let env = secantus_pgplan::on_conflict_row(&existing, &row);
             if let Some(f) = filter {
                 if !secantus_pgplan::on_conflict_filter_passes(f, &env)
@@ -5684,7 +5752,7 @@ impl PgHandler {
             }
             self.check_row_constraints(def, &after)?;
             self.check_foreign_keys(def, std::slice::from_ref(&after))?;
-            let id = existing.get("_id").cloned().unwrap_or(Bson::Null);
+            let id = row_id(&existing);
             written += self.update_rows(table, &bson::doc! {"_id": id}, &set, &unset)?;
             affected.push(after);
         }
@@ -5841,6 +5909,29 @@ impl PgHandler {
         key_value: &Document,
         index: Option<&str>,
     ) -> PgWireError {
+        // A COMPOSITE key collides on the whole `_id` subdocument: report its
+        // columns and their values, not `_id`.
+        let composite: Vec<&Column> = def
+            .columns
+            .iter()
+            .filter(|c| c.pk && c.field_override.is_some())
+            .collect();
+        if !composite.is_empty() && key_pattern.keys().any(|f| f == "_id") {
+            let id = key_value.get_document("_id").cloned().unwrap_or_default();
+            let mut pattern = Document::new();
+            let mut value = Document::new();
+            for c in &composite {
+                pattern.insert(c.field(), 1_i32);
+                value.insert(c.field(), id.get(&c.name).cloned().unwrap_or(Bson::Null));
+            }
+            let mut info = Self::unique_violation(table, def, &pattern, &value, None);
+            if let PgWireError::UserError(i) = &mut info {
+                let name = format!("{table}_pkey");
+                i.message = format!("duplicate key value violates unique constraint \"{name}\"");
+                i.constraint = Some(name);
+            }
+            return info;
+        }
         // Stored field -> column name.
         let columns: Vec<String> = key_pattern
             .keys()
@@ -7468,7 +7559,7 @@ impl PgHandler {
         let mut out = Vec::with_capacity(docs.len());
         for mut d in docs {
             f(&mut d)?;
-            out.push(bson::to_vec(&d).map_err(|e| Self::storage_err("could not encode a row", e))?);
+            out.push(encode_doc(&d).map_err(|e| Self::storage_err("could not encode a row", e))?);
         }
         self.storage
             .delete_matching(
@@ -7507,7 +7598,7 @@ impl PgHandler {
     fn rewrite_catalog(&self, name: &str, def: &TableDef) -> PgWireResult<()> {
         self.ensure_collection(CATALOG_COLLECTION)?;
         self.delete_catalog(name)?;
-        let bytes = bson::to_vec(&def.to_document())
+        let bytes = encode_doc(&def.to_document())
             .map_err(|e| Self::storage_err("could not encode the catalog entry", e))?;
         self.storage
             .insert(self.db(), CATALOG_COLLECTION, vec![bytes], true)
@@ -7579,10 +7670,7 @@ impl PgHandler {
             .storage
             .find_matching(self.db(), SEQUENCE_COLLECTION, &Document::new())
             .map_err(|e| Self::storage_err("could not read the sequences", e))?;
-        Ok(raw
-            .iter()
-            .filter_map(|b| bson::from_slice(b).ok())
-            .collect())
+        Ok(raw.iter().filter_map(|b| decode_doc(b).ok()).collect())
     }
 
     /// A column's DEFAULT as PostgreSQL renders it in the catalog -- a
@@ -7681,7 +7769,7 @@ impl PgHandler {
         match raw.first() {
             None => Ok(None),
             Some(bytes) => {
-                Ok(Some(bson::from_slice(bytes).map_err(|e| {
+                Ok(Some(decode_doc(bytes).map_err(|e| {
                     Self::storage_err("could not decode the sequence", e)
                 })?))
             }
@@ -9795,8 +9883,8 @@ impl PgHandler {
                 format!("relation \"{name}\" does not exist"),
             ))));
         };
-        let seq: Document = bson::from_slice(raw)
-            .map_err(|e| Self::storage_err("could not decode the sequence", e))?;
+        let seq: Document =
+            decode_doc(raw).map_err(|e| Self::storage_err("could not decode the sequence", e))?;
         let int = |key: &str| seq.get(key).and_then(bson_i64);
         let mut last = int("last_value").unwrap_or(1);
         let increment = int("increment").unwrap_or(1);
@@ -10246,7 +10334,7 @@ impl PgHandler {
                 // values, and re-decoding per comparison is quadratic.
                 let docs: Vec<Document> = raw
                     .iter()
-                    .map(|b| bson::from_slice(b))
+                    .map(|b| decode_doc(b))
                     .collect::<Result<_, _>>()
                     .map_err(|e| Self::storage_err("could not decode a row", e))?;
                 (docs, def)
@@ -11120,7 +11208,7 @@ impl PgHandler {
                     .create_collection(self.db(), &def.name)
                     .map_err(|e| Self::storage_err("could not create the table", e))?;
                 Self::create_unique_indexes(&self.storage, self.db(), &def)?;
-                let bytes = bson::to_vec(&def.to_document())
+                let bytes = encode_doc(&def.to_document())
                     .map_err(|e| Self::storage_err("could not encode the catalog entry", e))?;
                 self.storage
                     .insert(self.db(), CATALOG_COLLECTION, vec![bytes], true)
@@ -11138,7 +11226,7 @@ impl PgHandler {
                             _ => i64::from(i32::MAX),
                         };
                         let owned_by = format!("{}.{}", def.name, c.name);
-                        bson::to_vec(&secantus_pgcatalog::sequence_document(
+                        encode_doc(&secantus_pgcatalog::sequence_document(
                             seq, &owned_by, max_value,
                         ))
                     })
@@ -11191,7 +11279,7 @@ impl PgHandler {
                     "oid": oid,
                     "relation": true,
                 };
-                let bytes = bson::to_vec(&row_type)
+                let bytes = encode_doc(&row_type)
                     .map_err(|e| Self::storage_err("could not encode the row type", e))?;
                 self.storage
                     .insert(self.db(), Self::COMPOSITE_COLLECTION, vec![bytes], true)
@@ -11373,7 +11461,7 @@ impl PgHandler {
                     let docs = ins
                         .rows
                         .iter()
-                        .map(bson::to_vec)
+                        .map(|d| encode_doc(&d))
                         .collect::<Result<Vec<_>, _>>()
                         .map_err(|e| Self::storage_err("could not encode a row", e))?;
                     let (written, errors) = self
@@ -11532,7 +11620,7 @@ impl PgHandler {
                     ))));
                 }
                 let doc = bson::doc! {"_id": &name, "schema": &name};
-                let bytes = bson::to_vec(&doc)
+                let bytes = encode_doc(&doc)
                     .map_err(|e| Self::storage_err("could not encode the schema", e))?;
                 self.storage
                     .insert(self.db(), Self::SCHEMA_COLLECTION, vec![bytes], true)
@@ -11632,7 +11720,7 @@ impl PgHandler {
                     "fields": field_docs,
                     "oid": oid,
                 };
-                let bytes = bson::to_vec(&doc)
+                let bytes = encode_doc(&doc)
                     .map_err(|e| Self::storage_err("could not encode the type", e))?;
                 self.storage
                     .insert(self.db(), Self::COMPOSITE_COLLECTION, vec![bytes], true)
@@ -11683,7 +11771,7 @@ impl PgHandler {
                     "subtype": &subtype,
                     "oid": oid,
                 };
-                let bytes = bson::to_vec(&doc)
+                let bytes = encode_doc(&doc)
                     .map_err(|e| Self::storage_err("could not encode the type", e))?;
                 self.storage
                     .insert(self.db(), Self::RANGE_COLLECTION, vec![bytes], true)
@@ -12153,7 +12241,7 @@ impl PgHandler {
                     "labels": labels,
                     "oid": oid,
                 };
-                let bytes = bson::to_vec(&doc)
+                let bytes = encode_doc(&doc)
                     .map_err(|e| Self::storage_err("could not encode the type", e))?;
                 self.storage
                     .insert(self.db(), Self::ENUM_COLLECTION, vec![bytes], true)
@@ -12452,7 +12540,7 @@ impl PgHandler {
                 }
                 let _ = temp;
                 let doc = Self::new_sequence_doc(&name, &options)?;
-                let bytes = bson::to_vec(&doc)
+                let bytes = encode_doc(&doc)
                     .map_err(|e| Self::storage_err("could not encode the sequence", e))?;
                 self.storage
                     .insert(self.db(), SEQUENCE_COLLECTION, vec![bytes], true)
@@ -12477,7 +12565,7 @@ impl PgHandler {
                     ))));
                 };
                 Self::apply_sequence_options(&mut doc, &options)?;
-                let bytes = bson::to_vec(&doc)
+                let bytes = encode_doc(&doc)
                     .map_err(|e| Self::storage_err("could not encode the sequence", e))?;
                 self.storage
                     .delete_matching(
@@ -12805,7 +12893,7 @@ impl PgHandler {
                                 .map_err(|e| Self::storage_err("could not read", e))?;
                             let docs: Vec<Document> = raw
                                 .iter()
-                                .map(|b| bson::from_slice(b))
+                                .map(|b| decode_doc(b))
                                 .collect::<Result<_, _>>()
                                 .map_err(|e| Self::storage_err("could not decode a row", e))?;
                             let types: Vec<Type> =
@@ -13547,7 +13635,7 @@ impl PgHandler {
                     let mut writes = Vec::with_capacity(raw.len());
                     let mut new_rows = Vec::with_capacity(raw.len());
                     for bytes in &raw {
-                        let row: Document = bson::from_slice(bytes)
+                        let row: Document = decode_doc(bytes)
                             .map_err(|e| Self::storage_err("could not decode a row", e))?;
                         let (set, unset) = if !per_row {
                             (upd.set.clone(), upd.unset.clone())
@@ -13568,7 +13656,7 @@ impl PgHandler {
                             }
                             new_rows.push(after);
                         }
-                        let id = row.get("_id").cloned().unwrap_or(Bson::Null);
+                        let id = row_id(&row);
                         writes.push((id, set, unset));
                     }
                     if let Some(def) = def.as_ref() {
@@ -13624,7 +13712,7 @@ impl PgHandler {
                         .find_matching(self.db(), &del.table, &del.filter)
                         .map_err(|e| Self::storage_err("could not read", e))?
                         .iter()
-                        .map(|b| bson::from_slice(b))
+                        .map(|b| decode_doc(b))
                         .collect::<Result<_, _>>()
                         .map_err(|e| Self::storage_err("could not decode a row", e))?,
                 };
@@ -13754,7 +13842,7 @@ impl PgHandler {
                 let Some(raw) = raw.first() else {
                     continue;
                 };
-                let doc: Document = bson::from_slice(raw)
+                let doc: Document = decode_doc(raw)
                     .map_err(|e| Self::storage_err("could not decode the sequence", e))?;
                 let start = doc.get("start").and_then(bson_i64).unwrap_or(1);
                 self.storage
@@ -13837,7 +13925,9 @@ impl PgHandler {
 /// Whether an UPDATE of `def` must look at each row it writes: a NOT NULL
 /// column, a CHECK, or a FOREIGN KEY can all be violated by the new value.
 fn table_has_row_constraints(def: &TableDef) -> bool {
-    def.columns.iter().any(|c| !c.nullable && !c.pk)
+    def.columns
+        .iter()
+        .any(|c| !c.nullable && (!c.pk || c.field_override.is_some()))
         || !def.check_constraints.is_empty()
         || !def.foreign_keys.is_empty()
 }
@@ -13978,7 +14068,10 @@ impl PgHandler {
     /// name. A CHECK that evaluates to NULL passes (SQL's rule).
     fn check_row_constraints(&self, def: &TableDef, row: &Document) -> PgWireResult<()> {
         for c in &def.columns {
-            if c.nullable || c.pk {
+            // A single-column key is the document's `_id` and guarded where
+            // that is written; a composite key's columns are ordinary fields
+            // and checked here like any NOT NULL column.
+            if c.nullable || (c.pk && c.field_override.is_none()) {
                 continue;
             }
             if matches!(row.get(c.field()), None | Some(Bson::Null)) {
@@ -14132,7 +14225,7 @@ impl PgHandler {
             .map_err(|e| Self::storage_err("could not read the catalog", e))?;
         let mut defs: Vec<TableDef> = raw
             .iter()
-            .filter_map(|b| bson::from_slice::<Document>(b).ok())
+            .filter_map(|b| decode_doc(b).ok())
             .filter_map(|d| TableDef::from_document(&d))
             .collect();
         {
@@ -14175,10 +14268,7 @@ impl PgHandler {
             .storage
             .find_matching(self.db(), &def.name, filter)
             .map_err(|e| Self::storage_err("could not read", e))?;
-        let going: Vec<Document> = raw
-            .iter()
-            .filter_map(|b| bson::from_slice::<Document>(b).ok())
-            .collect();
+        let going: Vec<Document> = raw.iter().filter_map(|b| decode_doc(b).ok()).collect();
         for (child, fk) in referencing {
             let (Some(col), Some(ref_col)) = (fk.columns.first(), fk.ref_columns.first()) else {
                 continue;
@@ -14195,8 +14285,7 @@ impl PgHandler {
                 // its own parent; only rows that STAY count.
                 let mut child_filter = bson::doc! { &field: key.clone() };
                 if child.name == def.name {
-                    let going_ids: Vec<Bson> =
-                        going.iter().filter_map(|r| r.get("_id").cloned()).collect();
+                    let going_ids: Vec<Bson> = going.iter().map(row_id).collect();
                     child_filter.insert("_id", bson::doc! { "$nin": going_ids });
                 }
                 let dependants = self
@@ -14223,7 +14312,7 @@ impl PgHandler {
                     Some("SET NULL") => {
                         let mut after = Vec::new();
                         for b in &dependants {
-                            let mut r: Document = bson::from_slice(b)
+                            let mut r: Document = decode_doc(b)
                                 .map_err(|e| Self::storage_err("could not decode a row", e))?;
                             r.insert(field.clone(), Bson::Null);
                             self.check_row_constraints(&child, &r)?;
@@ -14283,10 +14372,7 @@ impl PgHandler {
                 .storage
                 .find_matching(self.db(), &table, &Document::new())
                 .map_err(|e| Self::storage_err("could not read", e))?;
-            let rows: Vec<Document> = raw
-                .iter()
-                .filter_map(|b| bson::from_slice::<Document>(b).ok())
-                .collect();
+            let rows: Vec<Document> = raw.iter().filter_map(|b| decode_doc(b).ok()).collect();
             self.check_fk_child_side(&def, fk, &rows)?;
         }
         Ok(())
@@ -18937,7 +19023,7 @@ impl CopyHandler for PgHandler {
                 apply_column_defaults(&def, &mut rows);
                 let docs = rows
                     .iter()
-                    .map(bson::to_vec)
+                    .map(|d| encode_doc(&d))
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| Self::storage_err("could not encode a COPY row", e))?;
                 self.storage

@@ -13217,3 +13217,30 @@ def test_windows_over_aggregates_series_and_inside_expressions(home: Path) -> No
         assert cur.fetchall() == [(1, 1), (2, 3), (3, 6), (4, 10)]
         cur.execute("SELECT id, coalesce(lag(v) OVER (ORDER BY id), 0) FROM w ORDER BY id")
         assert cur.fetchall() == [(1, 0), (2, 10), (3, 20), (4, 5)]
+
+
+def test_a_composite_primary_key_shares_the_pythons_layout(home: Path) -> None:
+    """A composite key is a subdocument `_id` whose fields are the key columns
+    in TABLE order -- the Python server's layout -- so either server reads and
+    enforces the other's. A duplicate names the columns, not `_id`."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE ck (a int, b text, v int, PRIMARY KEY (a, b))")
+        cur.execute("INSERT INTO ck (b, a, v) VALUES ('x', 1, 10), ('y', 1, 20)")
+        with pytest.raises(psycopg.errors.UniqueViolation) as info:
+            cur.execute("INSERT INTO ck VALUES (1, 'x', 99)")
+        assert info.value.diag.message_detail == "Key (a, b)=(1, x) already exists."
+        with pytest.raises(psycopg.errors.NotNullViolation):
+            cur.execute("INSERT INTO ck VALUES (NULL, 'q', 1)")
+        cur.execute("UPDATE ck SET v = v + 1 WHERE a = 1")
+        cur.execute("SELECT c.a, sum(c.v) FROM ck c GROUP BY c.a")
+        assert cur.fetchall() == [(1, 32)]
+
+    assert _python_sql(home, "SELECT a, b, v FROM ck ORDER BY b") == [(1, "x", 11), (1, "y", 21)]
+    _python_sql(home, "INSERT INTO ck VALUES (2, 'z', 5)")
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT a, b, v FROM ck WHERE a = 2")
+        assert cur.fetchall() == [(2, "z", 5)]
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            cur.execute("INSERT INTO ck VALUES (2, 'z', 6)")

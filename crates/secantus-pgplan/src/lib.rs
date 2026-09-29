@@ -3964,11 +3964,14 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
         col.pk = true;
         col.nullable = false;
     }
+    // A COMPOSITE primary key is a subdocument `_id` whose fields are the key
+    // columns, in TABLE-column order -- the Python server's layout, so the
+    // two share a store, and a fixed order so the same key is always the same
+    // `_id` (a document's equality depends on its key order).
     if columns.iter().filter(|c| c.pk).count() > 1 {
-        // The stored form maps the PK onto `_id`, so exactly one column can be
-        // it. A composite PK needs a different mapping; refuse rather than
-        // silently store only one of them.
-        return Err(Error::Unsupported("a composite PRIMARY KEY".into()));
+        for c in columns.iter_mut().filter(|c| c.pk) {
+            c.field_override = Some(format!("_id.{}", c.name));
+        }
     }
     let mut def = TableDef::new(&table, columns);
     def.temp = temp;
@@ -4231,6 +4234,24 @@ fn foreign_key_of(
 /// column must BE that key (this server has no other unique constraint to
 /// reference) -- PostgreSQL's 42830 otherwise.
 pub fn resolve_fk_target(fk: &mut ForeignKey, target: &TableDef) -> Result<()> {
+    let key: Vec<&Column> = target.columns.iter().filter(|c| c.pk).collect();
+    if key.len() > 1 {
+        let names: Vec<String> = key.iter().map(|c| c.name.clone()).collect();
+        let matches = if fk.ref_columns.is_empty() {
+            fk.columns.len() == names.len()
+        } else {
+            fk.ref_columns.len() == names.len() && fk.ref_columns.iter().all(|c| names.contains(c))
+        };
+        if !matches || fk.columns.len() != names.len() {
+            return Err(Error::InvalidForeignKey(format!(
+                "there is no unique constraint matching given keys for referenced table \"{}\"",
+                target.name
+            )));
+        }
+        return Err(Error::Unsupported(
+            "a FOREIGN KEY to a composite PRIMARY KEY".into(),
+        ));
+    }
     let pk = target.columns.iter().find(|c| c.pk);
     if fk.ref_columns.is_empty() {
         let pk = pk.ok_or_else(|| {
@@ -4715,7 +4736,25 @@ pub fn insert_row(
         let stored = carry_subms(&mut d, &field, value);
         d.insert(field, stored);
     }
-    Ok(d)
+    Ok(canonical_key_order(def, d))
+}
+
+/// A composite primary key's `_id.<name>` fields in TABLE-column order, so the
+/// `_id` subdocument they become on write is the same document however the
+/// INSERT listed its columns.
+pub fn canonical_key_order(def: &TableDef, mut d: Document) -> Document {
+    let key_fields: Vec<String> = def
+        .columns
+        .iter()
+        .filter(|c| c.pk && c.field_override.is_some())
+        .map(|c| c.field())
+        .collect();
+    for f in key_fields {
+        if let Some(v) = d.remove(&f) {
+            d.insert(f, v);
+        }
+    }
+    d
 }
 
 /// Does this target list contain an aggregate call?
@@ -9625,15 +9664,11 @@ fn finish_aggregate(
                 });
             }
             Some(N::ColumnRef(c)) => {
-                let col = c
-                    .fields
-                    .first()
-                    .and_then(|f| f.node.as_ref())
-                    .and_then(|n| match n {
-                        N::String(st) => Some(st.sval.clone()),
-                        _ => None,
-                    })
-                    .ok_or_else(|| Error::Unsupported("this target".into()))?;
+                // The LAST name part: `c.a` is the column `a` qualified by its
+                // relation. The first part named the qualifier, so every
+                // qualified grouped column was a 42803 naming the ALIAS.
+                let col =
+                    column_ref_name(c).ok_or_else(|| Error::Unsupported("this target".into()))?;
                 // A bare column alongside an aggregate must be grouped by --
                 // PostgreSQL errors 42803 otherwise, and so do we.
                 let idx = group_by
