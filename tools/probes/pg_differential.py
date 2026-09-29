@@ -286,11 +286,15 @@ def _report(sql: str, label: str, want: tuple, got: tuple, *, types: bool, tags:
     rowdiff = (want[0], want[1]) != (got[0], got[1])
     both_ok = want[0] == got[0] == "ok"
     tagdiff = tags and both_ok and want[2] != got[2]
+
     # A USER type's oid (>= 16384, a table rowtype, an enum, a composite) is
     # assigned independently by each server, so two such oids are the same
     # KIND of answer; only a builtin oid is compared literally.
     def _norm_types(ts):
-        return None if ts is None else tuple("user" if isinstance(t, int) and t >= 16384 else t for t in ts)
+        if ts is None:
+            return None
+        return tuple("user" if isinstance(t, int) and t >= 16384 else t for t in ts)
+
     typediff = types and both_ok and _norm_types(want[3]) != _norm_types(got[3])
     if not (rowdiff or tagdiff or typediff):
         return 0
