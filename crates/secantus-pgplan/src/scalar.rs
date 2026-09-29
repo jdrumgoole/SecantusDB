@@ -88,6 +88,14 @@ fn extension_scalar(name: &str) -> Option<crate::ExtensionType> {
 const SCALAR_NAMES: &[&str] = &[
     "to_char",
     "to_number",
+    "jsonb_path_exists",
+    "jsonb_path_match",
+    "jsonb_path_query_first",
+    "jsonb_path_query_array",
+    "jsonb_path_exists_tz",
+    "jsonb_path_match_tz",
+    "jsonb_path_query_first_tz",
+    "jsonb_path_query_array_tz",
     "gen_random_uuid",
     "uuid_generate_v4",
     "random",
@@ -384,6 +392,9 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
     }
     if let Some(out) = crate::fts::call(name, args) {
         return out;
+    }
+    if crate::jsonpath::is_function(name) {
+        return crate::jsonpath_call(name, args);
     }
     if !matches!(
         name,
@@ -1553,6 +1564,14 @@ pub fn static_result_type(name: &str) -> &'static str {
         "sqrt" | "exp" | "ln" | "log" | "log10" | "power" | "pow" | "sign" => "float8",
         "starts_with" => "bool",
         "to_number" => "numeric",
+        "jsonb_path_exists"
+        | "jsonb_path_match"
+        | "jsonb_path_exists_tz"
+        | "jsonb_path_match_tz" => "bool",
+        "jsonb_path_query_first"
+        | "jsonb_path_query_array"
+        | "jsonb_path_query_first_tz"
+        | "jsonb_path_query_array_tz" => "jsonb",
         "lpad" | "rpad" | "to_hex" | "translate" | "overlay" | "quote_literal"
         | "quote_nullable" | "unistr" | "convert_from" | "normalize" => "text",
         "regexp_split_to_array" => "text[]",

@@ -30,6 +30,7 @@ pub use correlated::{
     with_correlated_runner, with_function_hook, with_sequence_hook, FnResult, UserFn,
 };
 pub mod json;
+pub mod jsonpath;
 pub mod net;
 pub mod numeric;
 pub mod pgtypes;
@@ -6037,6 +6038,24 @@ fn srf_rows(
         };
         return Ok(Some((names, types, rows)));
     }
+    // `jsonb_path_query(target, path [, vars [, silent]])`: one jsonb row
+    // per item the path yields.
+    if matches!(name, "jsonb_path_query" | "jsonb_path_query_tz") {
+        let a: Vec<Bson> = call
+            .args
+            .iter()
+            .map(|x| const_value(x, params))
+            .collect::<Result<_>>()?;
+        let rows = match jsonpath_call(name, &a)? {
+            Bson::Array(items) => items.into_iter().map(|i| vec![i]).collect(),
+            _ => Vec::new(),
+        };
+        return Ok(Some((
+            vec![name.to_string()],
+            vec!["jsonb".to_string()],
+            rows,
+        )));
+    }
     // The JSON set-returning functions. A json / jsonb value is its text
     // here; each element or member is rendered back as the same type.
     let json_arg = || -> Result<Option<(json::Json, bool)>> {
@@ -10911,7 +10930,7 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
             }
             let op = operator_name(e).unwrap_or("");
             // The full-text operators.
-            if matches!(op, "@@" | "@@@") {
+            if matches!(op, "@@" | "@@@" | "@?") {
                 return "bool".to_string();
             }
             if op == "!!" && e.lexpr.is_none() {
@@ -11671,11 +11690,14 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                     && !scalar::defers_to_connection(&name)
                     && datetime_typed.is_none()
                 {
-                    let args = f
-                        .args
-                        .iter()
-                        .map(|a| const_value(a, params))
-                        .collect::<Result<Vec<_>>>()?;
+                    let args = match named_call_args(f, &name, params) {
+                        Some(a) => a?,
+                        None => f
+                            .args
+                            .iter()
+                            .map(|a| const_value(a, params))
+                            .collect::<Result<Vec<_>>>()?,
+                    };
                     if let Some(result) = scalar::call(&name, &args) {
                         let value = result?;
                         // A NULL result cannot say its type -- and at DESCRIBE
@@ -11698,6 +11720,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                         } else if value == Bson::Null
                             || declared == "timestamptz"
                             || fts::result_type(&name).is_some()
+                            || jsonpath::is_function(&name)
                         {
                             declared.to_string()
                         } else {
@@ -15998,6 +16021,9 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
                 Error::InvalidText(format!("invalid input syntax for type uuid: \"{text}\""))
             })
         }
+        "jsonpath" => Ok(Bson::String(jsonpath::render(&jsonpath::parse(&as_text(
+            &value,
+        ))?))),
         "tsvector" => Ok(Bson::String(fts::render_vector(&fts::parse_vector(
             &as_text(&value),
         )?))),
@@ -16492,6 +16518,116 @@ fn refuse_untyped_any_args(f: &pg_query::protobuf::FuncCall) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The parameter names and defaults of the built-ins that take named
+/// arguments (`silent => true`).
+fn named_signature(name: &str) -> Option<(&'static [&'static str], Vec<Bson>)> {
+    if jsonpath::is_function(name) {
+        return Some((
+            &["target", "path", "vars", "silent"],
+            vec![
+                Bson::Null,
+                Bson::Null,
+                Bson::String("{}".into()),
+                Bson::Boolean(false),
+            ],
+        ));
+    }
+    None
+}
+
+/// A call's argument values with named arguments placed by name and the
+/// rest defaulted; `None` when it has no named argument.
+fn named_call_args(
+    f: &pg_query::protobuf::FuncCall,
+    name: &str,
+    params: &[Bson],
+) -> Option<Result<Vec<Bson>>> {
+    if !f
+        .args
+        .iter()
+        .any(|a| matches!(a.node.as_ref(), Some(N::NamedArgExpr(_))))
+    {
+        return None;
+    }
+    let (names, mut values) = named_signature(name)?;
+    for (i, a) in f.args.iter().enumerate() {
+        let (slot, node) = match a.node.as_ref() {
+            Some(N::NamedArgExpr(na)) => match names.iter().position(|n| *n == na.name) {
+                Some(p) => (p, na.arg.as_deref()),
+                None => {
+                    return Some(Err(Error::UndefinedFunction(format!(
+                        "function {name}({} => unknown) does not exist",
+                        na.name
+                    ))))
+                }
+            },
+            _ => (i, Some(a)),
+        };
+        if let Some(node) = node {
+            match const_value(node, params) {
+                Ok(v) => values[slot] = v,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
+    Some(Ok(values))
+}
+
+/// Evaluate a `jsonb_path_*` function over its argument values. For
+/// `jsonb_path_query` the answer is the ARRAY of items (the caller spreads
+/// it into rows).
+pub(crate) fn jsonpath_call(name: &str, args: &[Bson]) -> Result<Bson> {
+    if args.len() < 2 || args.len() > 4 {
+        return Err(Error::UndefinedFunction(format!(
+            "function {name} does not exist"
+        )));
+    }
+    if args[..2].iter().any(|a| *a == Bson::Null) {
+        return Ok(Bson::Null);
+    }
+    let vars = match args.get(2) {
+        Some(Bson::Null) => return Ok(Bson::Null),
+        Some(v) => Some(json_text_of(v)),
+        None => None,
+    };
+    let silent = match args.get(3) {
+        Some(Bson::Boolean(b)) => *b,
+        Some(Bson::Null) => return Ok(Bson::Null),
+        Some(other) => value_text(other).eq_ignore_ascii_case("true"),
+        None => false,
+    };
+    let base = name.strip_suffix("_tz").unwrap_or(name);
+    let out = jsonpath::call(
+        base,
+        &json_text_of(&args[0]),
+        &value_text(&args[1]),
+        vars.as_deref(),
+        silent,
+    )?;
+    Ok(match (base, out) {
+        (_, jsonpath::PathOut::Bool(b)) => b.map_or(Bson::Null, Bson::Boolean),
+        ("jsonb_path_query_first", jsonpath::PathOut::Items(items)) => items
+            .first()
+            .map_or(Bson::Null, |j| Bson::String(json::render_jsonb(j))),
+        ("jsonb_path_query_array", jsonpath::PathOut::Items(items)) => {
+            Bson::String(json::render_jsonb(&json::Json::Array(items)))
+        }
+        (_, jsonpath::PathOut::Items(items)) => Bson::Array(
+            items
+                .iter()
+                .map(|j| Bson::String(json::render_jsonb(j)))
+                .collect(),
+        ),
+    })
+}
+
+fn json_text_of(v: &Bson) -> String {
+    match v {
+        Bson::String(s) => s.clone(),
+        other => value_text(other),
+    }
 }
 
 /// A range, a multirange, or an array of either.
@@ -18574,6 +18710,11 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             if let Some(out) = datetime_call(f, &name, params) {
                 return out;
             }
+            if let Some(args) = named_call_args(f, &name, params) {
+                if let Some(result) = scalar::call(&name, &args?) {
+                    return result;
+                }
+            }
             if scalar::is_scalar(&name) {
                 let args = f
                     .args
@@ -18922,6 +19063,24 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                     !(is_row_ctor(e.lexpr.as_deref()) && is_row_ctor(e.rexpr.as_deref()));
                 return record_compare(&op, a, b, composite);
             }
+        }
+        // SQL/JSON path: `jsonb @? jsonpath` and `jsonb @@ jsonpath`, the
+        // silent forms of jsonb_path_exists / jsonb_path_match.
+        if op == "@?"
+            || (op == "@@"
+                && e.lexpr
+                    .as_deref()
+                    .is_some_and(|l| matches!(static_type(l, &lhs).as_str(), "jsonb" | "json")))
+        {
+            let f = if op == "@?" {
+                "jsonb_path_exists"
+            } else {
+                "jsonb_path_match"
+            };
+            return jsonpath_call(
+                f,
+                &[lhs, rhs, Bson::String("{}".into()), Bson::Boolean(true)],
+            );
         }
         // Full-text search: `@@` between a document and a query, and the
         // combining operators, told apart by the operands' STATIC types.

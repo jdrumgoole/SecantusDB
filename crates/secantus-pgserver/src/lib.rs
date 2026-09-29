@@ -7059,6 +7059,7 @@ fn wire_type(pg_type: &str) -> Type {
         "tsvector" => Type::TS_VECTOR,
         "tsquery" => Type::TSQUERY,
         "regconfig" => Type::REGCONFIG,
+        "jsonpath" => Type::JSONPATH,
         // Stored as canonical TEXT but reported with their real oids: a client
         // reading 1082/1083 parses the value into a date/time object, whereas
         // varchar hands it back as a string. Same shape as the text-vs-varchar

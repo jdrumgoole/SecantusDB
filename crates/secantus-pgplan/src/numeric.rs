@@ -910,3 +910,51 @@ pub fn sum_numeric_texts<'a>(texts: impl IntoIterator<Item = &'a str>) -> Option
 pub fn bigint_to_i128(n: &BigInt) -> Option<i128> {
     n.to_i128()
 }
+
+/// `numeric % numeric` (`x - trunc(x / y) * y`, scale `max(s1, s2)`), and
+/// the rounding methods `abs` / `floor` / `ceil` (floor and ceil at scale 0),
+/// over finite canonical texts. `None` for a non-finite or unparsable input.
+pub fn decimal_unary_or_mod(op: &str, a: &str, b: Option<&str>) -> Option<Result<String>> {
+    let x = Dec::parse(a)?;
+    let out = match (op, b) {
+        ("%", Some(b)) => {
+            let y = Dec::parse(b)?;
+            if y.is_zero() {
+                return Some(Err(Error::DivisionByZero));
+            }
+            let scale = x.scale.max(y.scale);
+            let (xa, ya) = (x.lift(scale), y.lift(scale));
+            // Truncated division, so the remainder takes the dividend's sign.
+            let q = &xa / &ya;
+            Dec {
+                unscaled: xa - q * ya,
+                scale,
+            }
+        }
+        ("abs", None) => Dec {
+            unscaled: x.unscaled.abs(),
+            scale: x.scale,
+        },
+        ("floor" | "ceil", None) => {
+            let den = BigInt::from(10u32).pow(x.scale);
+            let (q, r) = (&x.unscaled / &den, &x.unscaled % &den);
+            let adjust = if op == "floor" {
+                if r.is_negative() {
+                    -BigInt::one()
+                } else {
+                    BigInt::zero()
+                }
+            } else if r.is_positive() {
+                BigInt::one()
+            } else {
+                BigInt::zero()
+            };
+            Dec {
+                unscaled: q + adjust,
+                scale: 0,
+            }
+        }
+        _ => return None,
+    };
+    Some(canonical_numeric_text(&out.render()))
+}
