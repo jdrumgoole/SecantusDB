@@ -56,6 +56,9 @@ pub fn with_correlated_runner<R>(runner: &CorrelatedRunner<'_>, f: impl FnOnce()
 }
 
 fn run(sql: &str, params: &[Bson]) -> Result<Vec<Vec<Bson>>> {
+    if SUPPRESSED.with(|s| s.get()) {
+        return Err(Error::Unsupported("a subquery evaluated for its type".into()));
+    }
     match RUNNER.with(|r| r.get()) {
         // SAFETY: set only inside `with_correlated_runner`, whose borrow is
         // still live while the pointer is installed.
@@ -480,4 +483,61 @@ pub fn has_correlated(expr: &ColumnExpr) -> bool {
         Ok(())
     });
     found
+}
+
+/// Runs a sequence function -- `nextval` / `currval` / `setval` / `lastval`
+/// -- against the store. Supplied by the executor for the same reason as the
+/// correlated runner: the planner cannot write.
+pub type SequenceHook<'a> = dyn Fn(&str, &[Bson]) -> Result<Bson> + 'a;
+type Hook = SequenceHook<'static>;
+
+thread_local! {
+    static SEQUENCE_HOOK: std::cell::Cell<Option<*const Hook>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` able to call sequence functions anywhere in an expression -- in
+/// `VALUES`, in arithmetic, in an UPDATE's SET -- not only as a bare target.
+pub fn with_sequence_hook<R>(hook: &SequenceHook<'_>, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<*const Hook>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SEQUENCE_HOOK.with(|r| r.set(self.0));
+        }
+    }
+    // SAFETY: as `with_correlated_runner` -- only the lifetime is erased, and
+    // `Restore` reinstates the previous pointer before the borrow ends.
+    let ptr: *const Hook = unsafe { std::mem::transmute::<*const SequenceHook<'_>, *const Hook>(hook) };
+    let _restore = Restore(SEQUENCE_HOOK.with(|r| r.replace(Some(ptr))));
+    f()
+}
+
+/// The sequence functions.
+pub(crate) const SEQUENCE_FUNCTIONS: &[&str] = &["nextval", "currval", "setval", "lastval"];
+
+/// Call a sequence function. With no hook installed -- a Describe, or any
+/// plan that will not execute -- the call must NOT advance anything, and its
+/// value is not needed, so it is NULL.
+pub(crate) fn call_sequence(name: &str, args: &[Bson]) -> Result<Bson> {
+    if SUPPRESSED.with(|s| s.get()) {
+        return Ok(Bson::Null);
+    }
+    match SEQUENCE_HOOK.with(|r| r.get()) {
+        // SAFETY: set only inside `with_sequence_hook`, whose borrow is live.
+        Some(hook) => unsafe { (*hook)(name, args) },
+        None => Ok(Bson::Null),
+    }
+}
+
+thread_local! {
+    /// Set while an expression is evaluated only to learn its TYPE (a row
+    /// expression's sample row): nothing may be drawn or run then.
+    static SUPPRESSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with sequence draws and correlated subqueries switched off.
+pub(crate) fn without_side_effects<R>(f: impl FnOnce() -> R) -> R {
+    let previous = SUPPRESSED.with(|s| s.replace(true));
+    let out = f();
+    SUPPRESSED.with(|s| s.set(previous));
+    out
 }

@@ -211,6 +211,27 @@ impl Column {
         out
     }
 
+    /// An EXPRESSION default (`now()`, `gen_random_uuid()`), as SQL text,
+    /// evaluated for each row an INSERT leaves the column out of. Stored under
+    /// the Python server's `default_expr` key, beside `has_default: false`.
+    pub fn default_expr(&self) -> Option<&str> {
+        self.extra.get_str("default_expr").ok()
+    }
+
+    /// Set or clear the expression default. A literal default and an
+    /// expression one are exclusive.
+    pub fn set_default_expr(&mut self, expr: Option<String>) {
+        match expr {
+            Some(e) => {
+                self.default = None;
+                self.extra.insert("default_expr", e);
+            }
+            None => {
+                self.extra.remove("default_expr");
+            }
+        }
+    }
+
     pub fn from_document(d: &Document) -> Option<Self> {
         let decl_oid = d.get_i32("decl_oid").ok();
         Some(Self {

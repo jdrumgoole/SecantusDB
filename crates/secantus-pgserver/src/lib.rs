@@ -801,6 +801,9 @@ pub struct PgHandler {
     /// `currval` before any `nextval` in this session is 55000 even when
     /// another session has advanced it.
     session_currval: Mutex<HashMap<String, i64>>,
+    /// The value this session's most recent `nextval` / `setval` produced,
+    /// whichever sequence it was, for `lastval()`.
+    session_lastval: Mutex<Option<i64>>,
     /// User TYPES created or dropped in the open transaction but not yet
     /// committed -- the type analogue of `uncommitted`. Planning reads the
     /// type catalog (`to_regtype`, a column's declared type), and an
@@ -1059,6 +1062,7 @@ impl PgHandler {
             prepared: Mutex::new(Vec::new()),
             uncommitted: Mutex::new(HashMap::new()),
             session_currval: Mutex::new(HashMap::new()),
+            session_lastval: Mutex::new(None),
             uncommitted_types: Mutex::new(HashMap::new()),
             in_transaction: std::sync::atomic::AtomicBool::new(false),
             binary_results: std::sync::atomic::AtomicBool::new(false),
@@ -7586,6 +7590,9 @@ impl PgHandler {
             }
             return Bson::String(format!("nextval('{seq}'::regclass)"));
         }
+        if let Some(expr) = c.default_expr() {
+            return Bson::String(expr.to_string());
+        }
         match c.default.as_ref() {
             None | Some(Bson::Null) => Bson::Null,
             Some(Bson::String(s)) => {
@@ -7827,6 +7834,79 @@ impl PgHandler {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(name.to_string(), value);
+        *self.session_lastval.lock().unwrap_or_else(|e| e.into_inner()) = Some(value);
+    }
+
+    /// A sequence function reached inside an EXPRESSION (`values
+    /// (nextval('s'))`, `n + currval('s')`), called by the planner through
+    /// its sequence hook. The same functions as a bare select-list target go
+    /// through `ConstCol`; both end in the calls below.
+    fn sequence_call(&self, name: &str, args: &[Bson]) -> PgWireResult<Bson> {
+        let seq = |i: usize| -> PgWireResult<Option<String>> {
+            self.sequence_name_arg(&ConstCol::Value(args.get(i).cloned().unwrap_or(Bson::Null)))
+        };
+        match name {
+            "nextval" => {
+                let Some(seq) = seq(0)? else {
+                    return Ok(Bson::Null);
+                };
+                let value = *self
+                    .nextval(&seq, 1)?
+                    .first()
+                    .expect("nextval returns one value for count 1");
+                self.note_currval(&seq, value);
+                Ok(Bson::Int64(value))
+            }
+            "currval" => match seq(0)? {
+                None => Ok(Bson::Null),
+                Some(seq) => Ok(Bson::Int64(self.currval(&seq)?)),
+            },
+            "setval" => {
+                let Some(seq) = seq(0)? else {
+                    return Ok(Bson::Null);
+                };
+                let Some(value) = args.get(1).and_then(bson_i64) else {
+                    return Ok(Bson::Null);
+                };
+                let called = args.get(2) != Some(&Bson::Boolean(false));
+                let set = self.setval(&seq, value, called)?;
+                self.note_currval(&seq, set);
+                Ok(Bson::Int64(set))
+            }
+            "lastval" => self
+                .session_lastval
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .map(Bson::Int64)
+                .ok_or_else(|| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "55000".into(), // object_not_in_prerequisite_state
+                        "lastval is not yet defined in this session".into(),
+                    )))
+                }),
+            other => Err(Self::err(&PlanError::Unsupported(format!("function {other}()")))),
+        }
+    }
+
+    /// A wire error as a planner error, keeping its SQLSTATE, for a callback
+    /// the planner makes into the executor.
+    fn to_plan_error(e: PgWireError) -> PlanError {
+        match e {
+            PgWireError::UserError(info) => {
+                PlanError::Sqlstate(Box::leak(info.code.clone().into_boxed_str()), info.message.clone())
+            }
+            other => PlanError::Internal(other.to_string()),
+        }
+    }
+
+    /// Run `f` with the executor's callbacks installed: correlated subqueries
+    /// and sequence functions inside expressions both need the store.
+    fn with_executor_hooks<R>(&self, f: impl FnOnce() -> R) -> R {
+        let hook = |name: &str, args: &[Bson]| -> std::result::Result<Bson, PlanError> {
+            self.sequence_call(name, args).map_err(Self::to_plan_error)
+        };
+        secantus_pgplan::with_sequence_hook(&hook, || self.correlated_scope(f))
     }
 
     fn note_uncommitted(&self, name: &str, def: Option<TableDef>) {
@@ -8329,15 +8409,20 @@ impl PgHandler {
         let run = |stmt: &Statement| -> std::result::Result<Vec<Vec<Bson>>, PlanError> {
             self.subquery_rows(stmt)
         };
-        let planned = secantus_pgplan::planning_to_execute(|| {
-            secantus_pgplan::plan_with_session_types_and_subqueries(
-                sql,
-                &|n| self.lookup(n),
-                params,
-                param_types,
-                &tz,
-                Some(&run),
-            )
+        // The plan that EXECUTES, with the executor's hooks: `values
+        // (nextval('s'))` is folded while planning, so the sequence moves
+        // here -- once -- and never in a Describe's plan.
+        let planned = self.with_executor_hooks(|| {
+            secantus_pgplan::planning_to_execute(|| {
+                secantus_pgplan::plan_with_session_types_and_subqueries(
+                    sql,
+                    &|n| self.lookup(n),
+                    params,
+                    param_types,
+                    &tz,
+                    Some(&run),
+                )
+            })
         });
         self.collect_planner_warnings();
         if self.txn_failed.load(std::sync::atomic::Ordering::Relaxed) {
@@ -9815,6 +9900,56 @@ impl PgHandler {
         Ok(())
     }
 
+    /// Fill each omitted column whose DEFAULT is an EXPRESSION (`now()`,
+    /// `gen_random_uuid()`, `nextval('s')`), once per row -- where PostgreSQL
+    /// evaluates it. The value is produced by planning a one-column INSERT of
+    /// the expression, so it is converted to the stored form (a timestamp's
+    /// sub-millisecond companion included) by the same code any INSERT uses.
+    fn apply_expression_defaults(&self, def: &TableDef, rows: &mut [Document]) -> PgWireResult<()> {
+        for column in &def.columns {
+            let Some(expr) = column.default_expr() else {
+                continue;
+            };
+            let field = column.field();
+            let sql = format!(
+                "INSERT INTO {} ({}) VALUES ({expr})",
+                secantus_pgplan::scalar::quote_identifier(&def.name),
+                secantus_pgplan::scalar::quote_identifier(&column.name),
+            );
+            let tz = self.session_timezone();
+            for row in rows.iter_mut().filter(|d| !d.contains_key(&field)) {
+                let run = |stmt: &Statement| self.subquery_rows(stmt);
+                let planned = self
+                    .with_executor_hooks(|| {
+                        secantus_pgplan::planning_to_execute(|| {
+                            secantus_pgplan::plan_with_session_types_and_subqueries(
+                                &sql,
+                                &|n| self.lookup(n),
+                                &[],
+                                &[],
+                                &tz,
+                                Some(&run),
+                            )
+                        })
+                    })
+                    .map_err(|e| Self::err(&e))?;
+                let Statement::Insert(ins) = planned else {
+                    return Err(Self::err(&PlanError::Internal(
+                        "a column default did not plan as an insert".into(),
+                    )));
+                };
+                if let Some(values) = ins.rows.first() {
+                    for (k, v) in values {
+                        if !row.contains_key(k) {
+                            row.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn apply_serial_defaults(&self, def: &TableDef, rows: &mut [Document]) -> PgWireResult<()> {
         for column in &def.columns {
             let Some(sequence) = column.sequence.as_deref() else {
@@ -10302,7 +10437,7 @@ impl PgHandler {
     /// A row-producing statement as `(schema, rows)`: what a set operation
     /// needs from each of its sides.
     fn rows_with_schema(&self, stmt: &Statement) -> PgWireResult<SchemaAndRows> {
-        self.correlated_scope(|| self.rows_with_schema_inner(stmt))
+        self.with_executor_hooks(|| self.rows_with_schema_inner(stmt))
     }
 
     fn rows_with_schema_inner(&self, stmt: &Statement) -> PgWireResult<SchemaAndRows> {
@@ -10756,7 +10891,7 @@ impl PgHandler {
     /// it, and that INSERT's lookup must not find the "no such table" the
     /// CTAS itself cached a moment earlier (see `CatalogCache`).
     fn execute(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response>> {
-        self.correlated_scope(|| self.execute_statement(stmt, max_rows))
+        self.with_executor_hooks(|| self.execute_statement(stmt, max_rows))
     }
 
     /// Run `f` able to evaluate CORRELATED subqueries: each is planned and
@@ -11136,6 +11271,7 @@ impl PgHandler {
                     ins.overriding_user,
                 )?;
                 self.apply_serial_defaults(&def, &mut ins.rows)?;
+                self.apply_expression_defaults(&def, &mut ins.rows)?;
                 apply_column_defaults(&def, &mut ins.rows);
                 // Every constraint is checked BEFORE the first write, so a
                 // violation on any row leaves none of them inserted.
@@ -18725,6 +18861,7 @@ impl CopyHandler for PgHandler {
             let load = || -> PgWireResult<_> {
                 let mut rows = parsed_rows;
                 self.apply_serial_defaults(&def, &mut rows)?;
+                self.apply_expression_defaults(&def, &mut rows)?;
                 apply_column_defaults(&def, &mut rows);
                 let docs = rows
                     .iter()

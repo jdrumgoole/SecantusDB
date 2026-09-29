@@ -22,7 +22,7 @@ pub mod geo;
 pub mod geometry;
 pub mod hstore;
 pub mod joins;
-pub use correlated::with_correlated_runner;
+pub use correlated::{with_correlated_runner, with_sequence_hook};
 pub mod json;
 pub mod net;
 pub mod numeric;
@@ -841,6 +841,8 @@ pub enum AlterTableAction {
     SetDefault {
         column: String,
         value: Option<Bson>,
+        /// An expression default, kept as SQL (`SET DEFAULT now()`).
+        expr: Option<String>,
     },
     /// `SET NOT NULL` / `DROP NOT NULL`.
     SetNotNull {
@@ -2857,12 +2859,20 @@ fn plan_alter_action(
                     let column = def
                         .column(&cmd.name)
                         .ok_or_else(|| Error::UndefinedColumn(cmd.name.clone()))?;
-                    Some(literal_default(raw, &cmd.name, &column.pg_type, params)?)
+                    // SET DEFAULT rewrites no rows, so an expression default
+                    // needs nothing evaluated now.
+                    Some(default_value_or_expr(raw, &column.pg_type, params)?)
                 }
+            };
+            let (value, expr) = match value {
+                None => (None, None),
+                Some(DefaultSpec::Value(v)) => (Some(v), None),
+                Some(DefaultSpec::Expr(e)) => (None, Some(e)),
             };
             Ok(AlterTableAction::SetDefault {
                 column: cmd.name.clone(),
                 value,
+                expr,
             })
         }
         Ok(AT::AtSetNotNull) => Ok(AlterTableAction::SetNotNull {
@@ -3043,6 +3053,57 @@ fn plan_added_column(cd: &pg_query::protobuf::ColumnDef, params: &[Bson]) -> Res
     Ok(column)
 }
 
+/// An EXPRESSION as SQL text. pg_query deparses only whole statements, so the
+/// expression rides a `SELECT` whose prefix is cut off again.
+pub(crate) fn deparse_expr(node: &pg_query::protobuf::Node) -> Result<String> {
+    let select = pg_query::protobuf::Node {
+        node: Some(N::SelectStmt(Box::new(pg_query::protobuf::SelectStmt {
+            target_list: vec![pg_query::protobuf::Node {
+                node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+                    val: Some(Box::new(node.clone())),
+                    location: -1,
+                    ..Default::default()
+                }))),
+            }],
+            limit_option: pg_query::protobuf::LimitOption::Default as i32,
+            op: pg_query::protobuf::SetOperation::SetopNone as i32,
+            ..Default::default()
+        }))),
+    };
+    let text = select.deparse().map_err(|e| Error::Parse(e.to_string()))?;
+    Ok(text
+        .strip_prefix("SELECT ")
+        .map(str::to_string)
+        .unwrap_or(text))
+}
+
+/// A column DEFAULT as planned: a value folded now, or an expression kept as
+/// SQL text for the executor to evaluate per row.
+pub enum DefaultSpec {
+    Value(Bson),
+    Expr(String),
+}
+
+/// Fold a DEFAULT to a value when it is a constant; keep it as SQL when it is
+/// volatile (`now()`, `nextval`, `gen_random_uuid()`) or does not fold, so it
+/// is evaluated per row -- where PostgreSQL evaluates it -- rather than frozen
+/// at CREATE time.
+fn default_value_or_expr(
+    raw: &pg_query::protobuf::Node,
+    pg_type: &str,
+    params: &[Bson],
+) -> Result<DefaultSpec> {
+    let as_expr = || -> Result<DefaultSpec> { Ok(DefaultSpec::Expr(deparse_expr(raw)?)) };
+    if default_is_volatile(raw) {
+        return as_expr();
+    }
+    match const_value(raw, params) {
+        Ok(v) => Ok(DefaultSpec::Value(cast_value(v, pg_type)?)),
+        Err(Error::Unsupported(_)) => as_expr(),
+        Err(e) => Err(e),
+    }
+}
+
 /// A column DEFAULT, evaluated once and stored as a value.
 ///
 /// Shared by `ADD COLUMN ... DEFAULT` and `ALTER COLUMN ... SET DEFAULT`, and
@@ -3092,9 +3153,14 @@ pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
             def.foreign_keys
                 .retain(|f| !f.columns.iter().any(|c| c == name));
         }
-        AlterTableAction::SetDefault { column, value } => {
+        AlterTableAction::SetDefault {
+            column,
+            value,
+            expr,
+        } => {
             if let Some(c) = def.columns.iter_mut().find(|c| c.name == *column) {
                 c.default = value.clone();
+                c.set_default_expr(expr.clone());
             }
         }
         AlterTableAction::SetNotNull { column, not_null } => {
@@ -3418,7 +3484,7 @@ fn plan_create_index(
         Some(w) => {
             let filter = lower_where(w, &def, params)?;
             let sql = render_index_predicate(w, &def)
-                .or_else(|| w.deparse().ok().map(|s| format!("({s})")))
+                .or_else(|| deparse_expr(w).ok().map(|s| format!("({s})")))
                 .unwrap_or_default();
             (Some(filter), Some(sql))
         }
@@ -3802,23 +3868,13 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                             // would carry the table's creation instant where
                             // PostgreSQL stamps each INSERT. Refuse it rather
                             // than store the wrong value silently.
-                            if default_is_volatile(raw) {
-                                return Err(Error::Unsupported(format!(
-                                    "a non-literal DEFAULT on column \"{}\"",
-                                    cd.colname
-                                )));
+                            // So a volatile one -- or one the constant
+                            // evaluator cannot fold -- is kept as its SQL and
+                            // evaluated per INSERTed row by the executor.
+                            match default_value_or_expr(raw, &underlying, &[])? {
+                                DefaultSpec::Value(v) => column.default = Some(v),
+                                DefaultSpec::Expr(e) => column.set_default_expr(Some(e)),
                             }
-                            let value = match const_value(raw, &[]) {
-                                Ok(v) => v,
-                                Err(Error::Unsupported(_)) => {
-                                    return Err(Error::Unsupported(format!(
-                                        "a non-literal DEFAULT on column \"{}\"",
-                                        cd.colname
-                                    )));
-                                }
-                                Err(e) => return Err(e),
-                            };
-                            column.default = Some(cast_value(value, &underlying)?);
                         }
                         Ok(CT::ConstrCheck) => {
                             let Some(raw) = k.raw_expr.as_ref() else {
@@ -4489,9 +4545,17 @@ fn plan_insert(
         }
     }
 
+    // `INSERT ... DEFAULT VALUES`: one row, every column left to its default.
+    let default_values = pg_query::protobuf::SelectStmt {
+        values_lists: vec![pg_query::protobuf::Node {
+            node: Some(N::List(pg_query::protobuf::List { items: Vec::new() })),
+        }],
+        ..Default::default()
+    };
     let sel = match i.select_stmt.as_ref().and_then(|s| s.node.as_ref()) {
         Some(N::SelectStmt(s)) => s,
-        _ => return Err(Error::Unsupported("INSERT DEFAULT VALUES".into())),
+        None if i.select_stmt.is_none() => &default_values,
+        _ => return Err(Error::Unsupported("this INSERT source".into())),
     };
     let mut rows = Vec::new();
     // `INSERT ... SELECT`: the query is planned whole and evaluated by the
@@ -4512,11 +4576,31 @@ fn plan_insert(
                 check_assignment_type(column, item)?;
             }
         }
+        // A `DEFAULT` item leaves its column out of the row, so the column's
+        // default fills it exactly as it would an omitted one.
+        let defaulted: Vec<&String> = items
+            .iter()
+            .zip(&targets)
+            .filter(|(item, _)| matches!(item.node.as_ref(), Some(N::SetToDefault(_))))
+            .map(|(_, t)| t)
+            .collect();
         let values = items
             .iter()
-            .map(|item| const_value(item, params))
+            .map(|item| match item.node.as_ref() {
+                Some(N::SetToDefault(_)) => Ok(Bson::Null),
+                _ => const_value(item, params),
+            })
             .collect::<Result<Vec<_>>>()?;
-        rows.push(insert_row(&def, &targets, !i.cols.is_empty(), values)?);
+        let explicit = !i.cols.is_empty() && !items.is_empty();
+        let mut row = insert_row(&def, &targets, explicit, values)?;
+        for target in defaulted {
+            if let Some(column) = def.column(target) {
+                let field = column.field();
+                row.remove(&companion_field(&field));
+                row.remove(&field);
+            }
+        }
+        rows.push(row);
     }
     let returning = if i.returning_list.is_empty() {
         None
@@ -4723,7 +4807,11 @@ fn contains_nested_aggregate(node: &pg_query::protobuf::Node) -> bool {
         let Some(node) = node else { return false };
         match node.node.as_ref() {
             Some(N::FuncCall(f)) => {
+                // `sum(x) OVER (...)` is a WINDOW call, not an aggregate --
+                // its arguments are still searched, since `sum(sum(v)) over
+                // ()` holds a real one.
                 if depth > 0
+                    && f.over.is_none()
                     && func_name(f)
                         .as_deref()
                         .is_some_and(|n| AGGREGATES.contains(&n))
@@ -4791,12 +4879,24 @@ fn node_has_window(node: Option<&pg_query::protobuf::Node>) -> bool {
     let Some(node) = node.and_then(|n| n.node.as_ref()) else {
         return false;
     };
-    match node {
-        N::FuncCall(f) => f.over.is_some() || f.args.iter().any(|a| node_has_window(Some(a))),
-        N::TypeCast(tc) => node_has_window(tc.arg.as_deref()),
-        N::AExpr(e) => node_has_window(e.lexpr.as_deref()) || node_has_window(e.rexpr.as_deref()),
-        _ => false,
+    if let N::FuncCall(f) = node {
+        if f.over.is_some() {
+            return true;
+        }
     }
+    // Anywhere else in the expression -- a COALESCE, a CASE, a cast --
+    // through the one walker every expression rewrite shares.
+    let mut probe = pg_query::protobuf::Node {
+        node: Some(node.clone()),
+    };
+    let mut found = false;
+    let _ = walk_expr(&mut probe, &mut |n| {
+        if let Some(N::FuncCall(f)) = n.node.as_ref() {
+            found |= f.over.is_some();
+        }
+        Ok(())
+    });
+    found
 }
 
 /// The window functions by name, with the result type PostgreSQL gives them.
@@ -5088,79 +5188,176 @@ fn plan_window_targets(
             return Err(Error::Unsupported("this target".into()));
         };
         let Some(N::FuncCall(f)) = rt.val.as_ref().and_then(|v| v.node.as_ref()) else {
-            // A plain target beside the windows, planned the ordinary way.
+            // A plain target beside the windows, planned the ordinary way --
+            // unless a window is nested inside it.
+            if node_has_window(rt.val.as_deref()) {
+                let (c, k) =
+                    plan_nested_windows(rt, &named, def, params, &mut keys, &mut windows, &mut extra)?;
+                columns.push(c);
+                casts.push(k);
+                continue;
+            }
             let (mut c, mut k) = plan_table_targets(std::slice::from_ref(t), def, params)?;
             columns.append(&mut c);
             casts.append(&mut k);
             continue;
         };
-        let Some(over) = f.over.as_deref() else {
-            let (mut c, mut k) = plan_table_targets(std::slice::from_ref(t), def, params)?;
-            columns.append(&mut c);
-            casts.append(&mut k);
+        if f.over.is_none() {
+            // Not a window itself -- but it may HOLD one (`v / sum(v) over
+            // ()`), which is hoisted below like any nested window.
+            if !node_has_window(rt.val.as_deref()) {
+                let (mut c, mut k) = plan_table_targets(std::slice::from_ref(t), def, params)?;
+                columns.append(&mut c);
+                casts.append(&mut k);
+                continue;
+            }
+            let (c, k) = plan_nested_windows(rt, &named, def, params, &mut keys, &mut windows, &mut extra)?;
+            columns.push(c);
+            casts.push(k);
             continue;
-        };
-        let name = func_name(f).unwrap_or_default();
-        let func = window_func_by_name(&name)
-            .ok_or_else(|| Error::Unsupported(format!("window function {name}()")))?;
-        let func = if func == WindowFunc::Count && f.agg_star {
-            WindowFunc::CountStar
-        } else {
-            func
-        };
-        if f.agg_distinct {
-            // PostgreSQL refuses this itself (`DISTINCT is not implemented for
-            // window functions`), so it is its answer rather than a gap here.
-            return Err(Error::FeatureNotSupported(
-                "DISTINCT is not implemented for window functions".into(),
-            ));
         }
-        let (partition_by, order_by, frame) =
-            plan_window_def(over, &named, def, params, &mut keys)?;
-
-        // The first argument is the one evaluated per row; the rest are
-        // constants (`lag(v, 1, -1)`, `nth_value(v, 2)`, `ntile(3)`).
-        let (arg, source_type, args) = plan_window_args(func, f, def, params)?;
-        let field = format!("__win{}", windows.len());
         let out = if rt.name.is_empty() {
-            name.clone()
+            func_name(f).unwrap_or_default()
         } else {
             rt.name.clone()
         };
-        let result_type = window_result_type(func, source_type.as_deref());
-        let source_type = source_type.clone();
-        let filter = match f.agg_filter.as_deref() {
-            None => None,
-            Some(node) => {
-                let fields: Vec<RowField> = def
-                    .columns
-                    .iter()
-                    .map(|c| (c.name.clone(), c.field(), c.pg_type.clone()))
-                    .collect();
-                let mut sample = Document::new();
-                for c in &def.columns {
-                    sample.insert(c.field(), sample_value_for_type(&c.pg_type));
-                }
-                Some(row_column_expr(node, &fields, params, &sample)?)
-            }
-        };
-        extra.push(Column::new(&field, &result_type, false));
-        windows.push(WindowItem {
-            field: field.clone(),
-            func,
-            arg,
-            args,
-            partition_by,
-            order_by,
-            frame,
-            result_type,
-            source_type,
-            filter,
-        });
+        let field = plan_window_call(f, &named, def, params, &mut keys, &mut windows, &mut extra)?;
         columns.push((out, field));
         casts.push(None);
     }
     Ok((columns, casts, windows, extra))
+}
+
+/// One window call, planned into `windows` and `extra`; answers the synthetic
+/// field its value lands in.
+#[allow(clippy::too_many_arguments)]
+fn plan_window_call(
+    f: &pg_query::protobuf::FuncCall,
+    named: &[pg_query::protobuf::WindowDef],
+    def: &TableDef,
+    params: &[Bson],
+    keys: &mut usize,
+    windows: &mut Vec<WindowItem>,
+    extra: &mut Vec<Column>,
+) -> Result<String> {
+    let over = f
+        .over
+        .as_deref()
+        .ok_or_else(|| Error::Internal("a window call without OVER".into()))?;
+    let name = func_name(f).unwrap_or_default();
+    let func = window_func_by_name(&name)
+        .ok_or_else(|| Error::Unsupported(format!("window function {name}()")))?;
+    let func = if func == WindowFunc::Count && f.agg_star {
+        WindowFunc::CountStar
+    } else {
+        func
+    };
+    if f.agg_distinct {
+        // PostgreSQL refuses this itself (`DISTINCT is not implemented for
+        // window functions`), so it is its answer rather than a gap here.
+        return Err(Error::FeatureNotSupported(
+            "DISTINCT is not implemented for window functions".into(),
+        ));
+    }
+    let (partition_by, order_by, frame) = plan_window_def(over, named, def, params, keys)?;
+    // The first argument is the one evaluated per row; the rest are
+    // constants (`lag(v, 1, -1)`, `nth_value(v, 2)`, `ntile(3)`).
+    let (arg, source_type, args) = plan_window_args(func, f, def, params)?;
+    let field = format!("__win{}", windows.len());
+    let result_type = window_result_type(func, source_type.as_deref());
+    let filter = match f.agg_filter.as_deref() {
+        None => None,
+        Some(node) => {
+            let fields: Vec<RowField> = def
+                .columns
+                .iter()
+                .map(|c| (c.name.clone(), c.field(), c.pg_type.clone()))
+                .collect();
+            let mut sample = Document::new();
+            for c in &def.columns {
+                sample.insert(c.field(), sample_value_for_type(&c.pg_type));
+            }
+            Some(row_column_expr(node, &fields, params, &sample)?)
+        }
+    };
+    extra.push(Column::new(&field, &result_type, false));
+    windows.push(WindowItem {
+        field: field.clone(),
+        func,
+        arg,
+        args,
+        partition_by,
+        order_by,
+        frame,
+        result_type,
+        source_type,
+        filter,
+    });
+    Ok(field)
+}
+
+/// A target that HOLDS window calls inside an expression -- `v::numeric /
+/// sum(v) over ()`. Each call is planned as its own window, replaced in the
+/// expression by a reference to the field it lands in, and the expression is
+/// then an ordinary per-row one over the row plus those fields.
+#[allow(clippy::too_many_arguments)]
+fn plan_nested_windows(
+    rt: &pg_query::protobuf::ResTarget,
+    named: &[pg_query::protobuf::WindowDef],
+    def: &TableDef,
+    params: &[Bson],
+    keys: &mut usize,
+    windows: &mut Vec<WindowItem>,
+    extra: &mut Vec<Column>,
+) -> Result<((String, String), Option<ColumnExpr>)> {
+    let mut val = rt
+        .val
+        .as_deref()
+        .cloned()
+        .ok_or_else(|| Error::Parse("a target without a value".into()))?;
+    let out = if rt.name.is_empty() {
+        expression_column_name(&val)
+    } else {
+        rt.name.clone()
+    };
+    let mut failure: Option<Error> = None;
+    walk_expr(&mut val, &mut |n| {
+        if failure.is_some() {
+            return Ok(());
+        }
+        if let Some(N::FuncCall(f)) = n.node.as_ref() {
+            if f.over.is_some() {
+                match plan_window_call(f, named, def, params, keys, windows, extra) {
+                    Ok(field) => {
+                        n.node = Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+                            fields: vec![string_node(&field)],
+                            location: -1,
+                        }));
+                    }
+                    Err(e) => failure = Some(e),
+                }
+            }
+        }
+        Ok(())
+    })?;
+    if let Some(e) = failure {
+        return Err(e);
+    }
+    let mut extended = def.clone();
+    extended.columns.extend(extra.iter().cloned());
+    let target = pg_query::protobuf::Node {
+        node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+            name: out,
+            val: Some(Box::new(val)),
+            location: rt.location,
+            ..Default::default()
+        }))),
+    };
+    let (mut c, mut k) = plan_table_targets(std::slice::from_ref(&target), &extended, params)?;
+    match (c.pop(), k.pop()) {
+        (Some(col), Some(cast)) => Ok((col, cast)),
+        _ => Err(Error::Internal("a nested window target planned to nothing".into())),
+    }
 }
 
 /// A window call's per-row argument, its source type, and its literal extras.
@@ -5210,26 +5407,28 @@ fn plan_window_args(
     Ok((Some(expr), source_type, args))
 }
 
+/// The aggregate names the aggregate planner handles.
+const AGGREGATES: &[&str] = &[
+    "count",
+    "sum",
+    "avg",
+    "min",
+    "max",
+    "array_agg",
+    "bool_and",
+    "bool_or",
+    // Not implemented, but it IS an aggregate: routed here so it is refused
+    // while PLANNING. Left on the scalar path it answered `function
+    // string_agg() is not supported yet` per row -- and NO ROWS AT ALL over an
+    // empty table, where PostgreSQL answers one.
+    "string_agg",
+];
+
 fn has_aggregate(s: &pg_query::protobuf::SelectStmt) -> bool {
     // Only the names the aggregate planner actually handles. Any-FuncCall
     // routed a scalar call over a column (`regexp_replace(col, ...)`) into the
     // aggregate planner, whose refusal came out as a GROUPING error -- the
     // wrong error for what was a plain unsupported target.
-    const AGGREGATES: &[&str] = &[
-        "count",
-        "sum",
-        "avg",
-        "min",
-        "max",
-        "array_agg",
-        "bool_and",
-        "bool_or",
-        // Not implemented, but it IS an aggregate: routed here so it is
-        // refused while PLANNING. Left on the scalar path it answered
-        // `function string_agg() is not supported yet` per row -- and NO ROWS
-        // AT ALL over an empty table, where PostgreSQL answers one.
-        "string_agg",
-    ];
     s.target_list.iter().any(|t| {
         let Some(N::ResTarget(rt)) = t.node.as_ref() else {
             return false;
@@ -5255,6 +5454,117 @@ fn has_aggregate(s: &pg_query::protobuf::SelectStmt) -> bool {
             _ => rt.val.as_deref().is_some_and(contains_nested_aggregate),
         }
     })
+}
+
+/// A window function OVER an aggregate -- `sum(sum(v)) over (order by g)`
+/// beside a GROUP BY -- as the two queries it is: the grouping, then the
+/// window over the grouped rows.
+///
+/// PostgreSQL evaluates windows after GROUP BY and HAVING, so the inner query
+/// takes the FROM / WHERE / GROUP BY / HAVING and outputs every aggregate and
+/// every column the rest of the statement reads; the outer one keeps the
+/// targets (each aggregate and column replaced by the inner output), the
+/// window definitions, DISTINCT, ORDER BY and LIMIT.
+fn split_window_over_aggregate(
+    s: &pg_query::protobuf::SelectStmt,
+) -> Result<pg_query::protobuf::SelectStmt> {
+    let mut inner_targets: Vec<pg_query::protobuf::Node> = Vec::new();
+    let mut seen: Vec<(pg_query::protobuf::Node, String)> = Vec::new();
+    // Structural identity ignoring where in the text each was written.
+    static LOCATION: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let location = LOCATION.get_or_init(|| regex::Regex::new(r"location: -?\d+").expect("static regex"));
+    let strip_location =
+        |n: &pg_query::protobuf::Node| -> String { location.replace_all(&format!("{n:?}"), "").into_owned() };
+    let mut outer = s.clone();
+    let mut replace = |n: &mut pg_query::protobuf::Node| -> Result<()> {
+        let is_agg = matches!(n.node.as_ref(), Some(N::FuncCall(f))
+            if f.over.is_none() && func_name(f).is_some_and(|name| AGGREGATES.contains(&name.as_str())));
+        let is_col = matches!(n.node.as_ref(), Some(N::ColumnRef(c))
+            if !c.fields.iter().any(|f| matches!(f.node, Some(N::AStar(_)))));
+        if !is_agg && !is_col {
+            return Ok(());
+        }
+        let key = strip_location(n);
+        let alias = match seen.iter().position(|(_, k)| *k == key) {
+            Some(i) => format!("__g{i}"),
+            None => {
+                let alias = format!("__g{}", seen.len());
+                inner_targets.push(pg_query::protobuf::Node {
+                    node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+                        name: alias.clone(),
+                        val: Some(Box::new(n.clone())),
+                        location: -1,
+                        ..Default::default()
+                    }))),
+                });
+                seen.push((n.clone(), key));
+                alias
+            }
+        };
+        n.node = Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+            fields: vec![string_node(&alias)],
+            location: -1,
+        }));
+        Ok(())
+    };
+    let mut targets = Vec::new();
+    for mut t in std::mem::take(&mut outer.target_list) {
+        if let Some(N::ResTarget(rt)) = t.node.as_mut() {
+            // An unnamed target keeps the name it would have had.
+            if rt.name.is_empty() {
+                rt.name = match rt.val.as_deref().and_then(|v| v.node.as_ref()) {
+                    Some(N::ColumnRef(c)) => column_ref_name(c).unwrap_or_default(),
+                    Some(N::FuncCall(f)) => func_name(f).unwrap_or_default(),
+                    Some(_) => expression_column_name(rt.val.as_deref().expect("some")),
+                    _ => String::new(),
+                };
+            }
+            if let Some(v) = rt.val.as_deref_mut() {
+                walk_expr(v, &mut replace)?;
+            }
+        }
+        targets.push(t);
+    }
+    outer.target_list = targets;
+    for n in outer
+        .sort_clause
+        .iter_mut()
+        .chain(outer.window_clause.iter_mut())
+        .chain(outer.distinct_clause.iter_mut())
+    {
+        walk_expr(n, &mut replace)?;
+    }
+    let inner = pg_query::protobuf::SelectStmt {
+        target_list: inner_targets,
+        from_clause: s.from_clause.clone(),
+        where_clause: s.where_clause.clone(),
+        group_clause: s.group_clause.clone(),
+        having_clause: s.having_clause.clone(),
+        limit_option: pg_query::protobuf::LimitOption::Default as i32,
+        op: pg_query::protobuf::SetOperation::SetopNone as i32,
+        ..Default::default()
+    };
+    outer.from_clause = vec![pg_query::protobuf::Node {
+        node: Some(N::RangeSubselect(Box::new(pg_query::protobuf::RangeSubselect {
+            lateral: false,
+            subquery: Some(Box::new(pg_query::protobuf::Node {
+                node: Some(N::SelectStmt(Box::new(inner))),
+            })),
+            alias: Some(pg_query::protobuf::Alias {
+                aliasname: "__grouped".into(),
+                colnames: Vec::new(),
+            }),
+        }))),
+    }];
+    outer.where_clause = None;
+    outer.group_clause = Vec::new();
+    outer.having_clause = None;
+    // Every aggregate moved inside; one still here would split again, for
+    // ever.
+    if has_aggregate(&outer) {
+        return Err(Error::Unsupported("a window function over this aggregate".into()));
+    }
+    Ok(outer)
 }
 
 /// A `FROM <set-returning function>(...)` item as a materialised source.
@@ -5859,7 +6169,8 @@ fn row_column_expr(
     // A sample row's value types what the node alone cannot (a scalar call's
     // result); an expression that fails on the sample still gets the node's
     // own type, and fails per row when run.
-    let sample_value = apply_row_expr(&out, sample).unwrap_or(Bson::Null);
+    let sample_value =
+        correlated::without_side_effects(|| apply_row_expr(&out, sample)).unwrap_or(Bson::Null);
     let previous = declare_row_fields(params.len(), fields);
     let result_type = static_type(&expr, &sample_value);
     PLAN_PARAM_TYPES.with(|t| *t.borrow_mut() = previous);
@@ -7886,9 +8197,7 @@ fn plan_select_rest(
         // supported yet`, which is false -- `sum` is supported, and a reader
         // chasing that message looks in the wrong place entirely.
         if has_window(s) {
-            return Err(Error::Unsupported(
-                "a window function over an aggregate".into(),
-            ));
+            return plan_select(&split_window_over_aggregate(s)?, lookup, params);
         }
         return plan_aggregate(s, lookup, params);
     }
@@ -7917,10 +8226,39 @@ fn plan_select_rest(
     {
         return Err(Error::Unsupported("a window function over a JOIN".into()));
     }
-    if has_window(s) && series_from_clause(&s.from_clause[0], params)?.is_some() {
-        return Err(Error::Unsupported(
-            "a window function over a generated source".into(),
-        ));
+    // A window over `generate_series`: the series keeps a lazy path of its
+    // own, but a window needs every row at once anyway, so it is materialised
+    // into a source here and the query planned over that.
+    if has_window(s) && s.from_clause.len() == 1 {
+        if let Some(series) = series_from_clause(&s.from_clause[0], params)? {
+            let fits = |v: i64| i32::try_from(v).is_ok();
+            let wide = !fits(series.start) || !fits(series.stop);
+            let ty = if wide { "int8" } else { "int4" };
+            let rows: Vec<Vec<Bson>> = series
+                .values()
+                .into_iter()
+                .map(|v| {
+                    vec![if wide {
+                        Bson::Int64(v)
+                    } else {
+                        Bson::Int32(i32::try_from(v).unwrap_or_default())
+                    }]
+                })
+                .collect();
+            let def = TableDef::new("", vec![Column::new(&series.column, ty, false)]);
+            let name = joins::register_source(SubSource {
+                alias: series.column.clone(),
+                plan: Box::new(Statement::ValuesConstant(ValuesConstant {
+                    names: vec![series.column.clone()],
+                    types: vec![ty.to_string()],
+                    rows,
+                })),
+                def,
+            });
+            let mut rewritten = s.clone();
+            rewritten.from_clause = vec![joins::placeholder_from(name)];
+            return plan_select_rest(&rewritten, lookup, params);
+        }
     }
     // `FROM a, b` -- a CROSS join, the comma form of `a CROSS JOIN b`. It
     // rides the JOIN path with no ON predicate.
@@ -9566,16 +9904,128 @@ pub(crate) fn session_function(name: &str) -> Option<Bson> {
 /// Whether a DEFAULT expression calls a function whose value changes from row
 /// to row (`now()` and its siblings, `current_timestamp`). The planner stores a
 /// DEFAULT as one evaluated value, which such a function cannot be.
-fn default_is_volatile(node: &pg_query::protobuf::Node) -> bool {
-    match node.node.as_ref() {
-        Some(N::FuncCall(f)) => matches!(
-            func_name(f).as_deref(),
-            Some("now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp")
-        ),
-        Some(N::SqlvalueFunction(_)) => true,
-        Some(N::TypeCast(tc)) => tc.arg.as_deref().is_some_and(default_is_volatile),
-        _ => false,
+/// The type of a keyword function -- `CURRENT_DATE`, `LOCALTIME`, `USER`.
+fn sql_value_function_type(svf: &pg_query::protobuf::SqlValueFunction) -> &'static str {
+    use pg_query::protobuf::SqlValueFunctionOp as Op;
+    match Op::try_from(svf.op).unwrap_or(Op::SqlvalueFunctionOpUndefined) {
+        Op::SvfopCurrentDate => "date",
+        Op::SvfopCurrentTime | Op::SvfopCurrentTimeN => "timetz",
+        Op::SvfopCurrentTimestamp | Op::SvfopCurrentTimestampN => "timestamptz",
+        Op::SvfopLocaltime | Op::SvfopLocaltimeN => "time",
+        Op::SvfopLocaltimestamp | Op::SvfopLocaltimestampN => "timestamp",
+        _ => "name",
     }
+}
+
+/// A keyword function's value. The date/time ones are the statement's
+/// instant cast to their type, which renders it in the session zone as
+/// PostgreSQL does; the role ones are the session's.
+fn sql_value_function(svf: &pg_query::protobuf::SqlValueFunction) -> Result<Bson> {
+    use pg_query::protobuf::SqlValueFunctionOp as Op;
+    let op = Op::try_from(svf.op).unwrap_or(Op::SqlvalueFunctionOpUndefined);
+    Ok(match op {
+        Op::SvfopCurrentUser | Op::SvfopUser | Op::SvfopSessionUser | Op::SvfopCurrentRole => {
+            session_user().map_or(Bson::Null, Bson::String)
+        }
+        Op::SvfopCurrentCatalog => Bson::String(session_database()),
+        Op::SvfopCurrentSchema => Bson::String("public".into()),
+        Op::SvfopCurrentTimestamp | Op::SvfopCurrentTimestampN => scalar::now_value(),
+        Op::SqlvalueFunctionOpUndefined => {
+            return Err(Error::Unsupported("this keyword function".into()))
+        }
+        _ => timestamptz_as_local(&scalar::now_value(), sql_value_function_type(svf))?
+            .ok_or_else(|| Error::Internal("the current instant did not render".into()))?,
+    })
+}
+
+/// A timestamptz as the session zone's wall clock (`2026-09-29
+/// 17:26:09.52+02`), cut to the part `target` names and read as that type:
+/// `date`, `timestamp`, `time` or `timetz`. `None` when the value is not an
+/// instant.
+fn timestamptz_as_local(value: &Bson, target: &str) -> Result<Option<Bson>> {
+    let Some(text) = timestamptz_value_text(value, &session_timezone()) else {
+        return Ok(None);
+    };
+    let (date, time_tz) = text.split_once(' ').unwrap_or((text.as_str(), ""));
+    let offset_at = time_tz.find(['+', '-']).unwrap_or(time_tz.len());
+    let time = &time_tz[..offset_at];
+    let part = match target {
+        "date" => date.to_string(),
+        "timestamp" => format!("{date} {time}"),
+        "time" => time.to_string(),
+        _ => time_tz.to_string(),
+    };
+    cast_value(Bson::String(part), target).map(Some)
+}
+
+/// A column's DEFAULT as an expression node: its sequence's `nextval`, its
+/// expression default, its literal, or NULL.
+fn column_default_node(column: &Column) -> Result<pg_query::protobuf::Node> {
+    let text = if let Some(seq) = column.sequence.as_deref() {
+        format!("nextval('{}')", seq.replace('\'', "''"))
+    } else if let Some(expr) = column.default_expr() {
+        expr.to_string()
+    } else {
+        return Ok(param_less_const(column.default.clone().unwrap_or(Bson::Null)));
+    };
+    let N::SelectStmt(sel) = parse_one(&format!("SELECT {text}"))? else {
+        return Err(Error::Internal("a column default did not parse".into()));
+    };
+    sel.target_list
+        .first()
+        .and_then(|t| match t.node.as_ref() {
+            Some(N::ResTarget(r)) => r.val.as_deref().cloned(),
+            _ => None,
+        })
+        .ok_or_else(|| Error::Internal("a column default did not parse".into()))
+}
+
+/// A literal value as an expression node, for a stored literal default.
+fn param_less_const(value: Bson) -> pg_query::protobuf::Node {
+    use pg_query::protobuf::a_const::Val;
+    let val = match &value {
+        Bson::Null => None,
+        Bson::Int32(v) => Some(Val::Ival(pg_query::protobuf::Integer { ival: *v })),
+        Bson::Boolean(b) => Some(Val::Boolval(pg_query::protobuf::Boolean { boolval: *b })),
+        Bson::String(s) => Some(Val::Sval(pg_query::protobuf::String { sval: s.clone() })),
+        other => Some(Val::Sval(pg_query::protobuf::String {
+            sval: numeric::numeric_text(other).unwrap_or_else(|| other.to_string()),
+        })),
+    };
+    pg_query::protobuf::Node {
+        node: Some(N::AConst(pg_query::protobuf::AConst {
+            isnull: val.is_none(),
+            location: -1,
+            val,
+        })),
+    }
+}
+
+/// Is a DEFAULT expression one whose value must be computed per row rather
+/// than folded once? A time function, a sequence function, a random one --
+/// anywhere in the expression, not only at its top.
+fn default_is_volatile(node: &pg_query::protobuf::Node) -> bool {
+    let mut probe = node.clone();
+    let mut found = false;
+    let _ = walk_expr(&mut probe, &mut |n| {
+        match n.node.as_ref() {
+            Some(N::FuncCall(f)) => {
+                if func_name(f).is_some_and(|name| {
+                    VOLATILE_FUNCTIONS.contains(&name.as_str())
+                        || matches!(
+                            name.as_str(),
+                            "now" | "transaction_timestamp" | "statement_timestamp"
+                        )
+                }) {
+                    found = true;
+                }
+            }
+            Some(N::SqlvalueFunction(_)) => found = true,
+            _ => {}
+        }
+        Ok(())
+    });
+    found
 }
 
 fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
@@ -9649,6 +10099,11 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
             Some(pg_query::protobuf::a_const::Val::Boolval(_)) => "bool".to_string(),
             _ => inferred_type(value).to_string(),
         },
+        Some(N::FuncCall(f))
+            if func_name(f).is_some_and(|n| correlated::SEQUENCE_FUNCTIONS.contains(&n.as_str())) =>
+        {
+            "int8".to_string()
+        }
         Some(N::FuncCall(f)) if correlated::correlated_type(f).is_some() => {
             correlated::correlated_type(f).expect("checked")
         }
@@ -9711,12 +10166,7 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
         {
             "timestamptz".to_string()
         }
-        Some(N::SqlvalueFunction(svf))
-            if pg_query::protobuf::SqlValueFunctionOp::try_from(svf.op)
-                == Ok(pg_query::protobuf::SqlValueFunctionOp::SvfopCurrentTimestamp) =>
-        {
-            "timestamptz".to_string()
-        }
+        Some(N::SqlvalueFunction(svf)) => sql_value_function_type(svf).to_string(),
         // `int4range(1,5)` is an `int4range`, not the text it renders as.
         Some(N::FuncCall(f)) if range_constructor_type(f).is_some() => {
             range_constructor_type(f).unwrap_or_default()
@@ -10631,6 +11081,19 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 // The sequence functions read and WRITE server state, so
                 // they become `ConstCol`s the server resolves rather than
                 // anything the stateless planner can fold.
+                // `lastval()` reads only this session's state; it is folded
+                // while planning the statement that executes (NULL, and no
+                // error, in a Describe's plan).
+                if name == "lastval" {
+                    let out = if rt.name.is_empty() {
+                        name.clone()
+                    } else {
+                        rt.name.clone()
+                    };
+                    let value = correlated::call_sequence("lastval", &[])?;
+                    columns.push((out, ConstCol::Value(value), "int8".to_string(), -1));
+                    continue;
+                }
                 if matches!(name.as_str(), "nextval" | "currval" | "setval")
                     || name == "pg_get_serial_sequence"
                 {
@@ -10767,12 +11230,20 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                         ConstCol::Value(Bson::String("public".into())),
                     ),
                     other => {
-                        return Err(Error::Unsupported(
-                            other
-                                .as_str_name()
-                                .trim_start_matches("SVFOP_")
-                                .to_ascii_lowercase(),
+                        // The date/time keywords: folded now, as
+                        // `current_timestamp` is above.
+                        let name = other
+                            .as_str_name()
+                            .trim_start_matches("SVFOP_")
+                            .trim_end_matches("_N")
+                            .to_ascii_lowercase();
+                        columns.push((
+                            if rt.name.is_empty() { name } else { rt.name.clone() },
+                            ConstCol::Value(sql_value_function(svf)?),
+                            sql_value_function_type(svf).to_string(),
+                            -1,
                         ));
+                        continue;
                     }
                 };
                 (name.to_string(), col, "name".to_string(), -1)
@@ -16443,10 +16914,20 @@ fn plan_update(
             )?);
             continue;
         }
+        // `SET c = DEFAULT`: the column's own default, whatever form it has.
+        let default_node;
+        let val = if matches!(val.node.as_ref(), Some(N::SetToDefault(_))) {
+            default_node = column_default_node(column)?;
+            &default_node
+        } else {
+            &**val
+        };
         check_assignment_type(column, val)?;
         // A value that reads the row (`num * 2`) has no constant to store;
-        // it is planned as a row expression and evaluated per matched row.
-        if references_columns(val) {
+        // it is planned as a row expression and evaluated per matched row --
+        // as is a VOLATILE one (`nextval`, `random()`), which PostgreSQL
+        // evaluates once per row, not once per statement.
+        if references_columns(val) || default_is_volatile(val) {
             let (fields, sample) = row_fields();
             let row = row_column_expr(val, &fields, params, &sample)?;
             set_exprs.push((field, column.pg_type.clone(), row));
@@ -16836,6 +17317,15 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 return Ok(Bson::String(t));
             }
         }
+        // To a zone-less type, a timestamptz is first the session zone's WALL
+        // CLOCK: `now()::date` is today where the session is, not in UTC.
+        if matches!(target.as_str(), "date" | "timestamp" | "time" | "timetz")
+            && static_type(arg, &value) == "timestamptz"
+        {
+            if let Some(v) = timestamptz_as_local(&value, &target)? {
+                return Ok(v);
+            }
+        }
         // A redundant `timestamptz` -> `timestamptz` cast (e.g. `$1::timestamptz`
         // over a parameter already declared timestamptz) is a NO-OP: the value
         // is the stored INSTANT. Routing it through `cast_value` would render it
@@ -16936,9 +17426,20 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             .cloned()
             .ok_or(Error::UndefinedField(err));
     }
+    if let Some(N::SqlvalueFunction(svf)) = node.node.as_ref() {
+        return sql_value_function(svf);
+    }
     if let Some(N::FuncCall(f)) = node.node.as_ref() {
         if let Some(result) = correlated::eval_correlated(f, params) {
             return result;
+        }
+        if let Some(name) = func_name(f).filter(|n| correlated::SEQUENCE_FUNCTIONS.contains(&n.as_str())) {
+            let args = f
+                .args
+                .iter()
+                .map(|a| const_value(a, params))
+                .collect::<Result<Vec<_>>>()?;
+            return correlated::call_sequence(&name, &args);
         }
         refuse_untyped_any_args(f)?;
         if func_name(f).as_deref() == Some("pg_typeof") {
@@ -17618,9 +18119,112 @@ fn needs_numeric_filter(def: &TableDef, field: &str, value: &Bson) -> bool {
         && matches!(value, Bson::Int32(_) | Bson::Int64(_) | Bson::Decimal128(_))
 }
 
+/// The declared type of the column stored under `field`.
+fn field_type<'a>(def: &'a TableDef, field: &str) -> Option<&'a str> {
+    def.columns
+        .iter()
+        .find(|c| c.field() == field || c.name == field)
+        .map(|c| c.pg_type.as_str())
+}
+
+fn is_timestamp_field(def: &TableDef, field: &str) -> bool {
+    matches!(field_type(def, field), Some("timestamp" | "timestamptz"))
+}
+
+/// A string literal compared with a column is PostgreSQL's UNKNOWN-typed
+/// constant, and resolves to the COLUMN's type: `n > '5'` compares integers
+/// and `t > '2026-03-01'` instants. Left a string, the filter compared across
+/// BSON types and matched NOTHING -- a silent empty answer for every quoted
+/// number, boolean, timestamp or interval in a WHERE (measured 2026-09-29:
+/// 15 of 23 shapes). The types listed are the ones stored as something other
+/// than their text; a text-stored type (date, time, uuid) compares correctly
+/// as a string already and is left alone.
+fn coerce_to_column(def: &TableDef, field: &str, value: Bson) -> Result<Bson> {
+    let Bson::String(_) = &value else {
+        return Ok(value);
+    };
+    match field_type(def, field) {
+        Some(
+            ty @ ("int2" | "int4" | "int8" | "numeric" | "float4" | "float8" | "bool"
+            | "timestamp" | "timestamptz" | "interval" | "oid"),
+        ) => cast_value(value, ty),
+        _ => Ok(value),
+    }
+}
+
+/// A comparison against a `timestamp` / `timestamptz` column, which stores a
+/// millisecond `DateTime` plus a hidden companion holding any microsecond
+/// REMAINDER (absent when it is zero). A plain MQL comparison of the
+/// `DateTime` alone is wrong both ways: `t > '10:00:00.123'` must match a
+/// stored `10:00:00.123456`, whose millisecond part is equal, and `t =
+/// '...123456'` compares a value carrying the remainder. So each operator
+/// compares the millisecond part and, where that is equal, the remainder.
+/// `None` for a value that is not an instant (`infinity`, say), which keeps
+/// the plain comparison.
+fn timestamp_filter(field: &str, op: &str, value: &Bson) -> Option<Document> {
+    let (date, us) = match value {
+        Bson::DateTime(_) => (value.clone(), 0),
+        Bson::Document(d) => match (d.get(COMPOSITE_DATE), d.get(COMPOSITE_US)) {
+            (Some(date @ Bson::DateTime(_)), Some(us)) => (date.clone(), us.as_i32().unwrap_or(0)),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let comp = companion_field(field);
+    // The remainder of a stored row is its companion, or 0 when absent.
+    let rem_eq = if us == 0 {
+        doc! { &comp: { "$exists": false } }
+    } else {
+        doc! { &comp: us }
+    };
+    let rem_gt = if us == 0 {
+        doc! { &comp: { "$exists": true } }
+    } else {
+        doc! { &comp: { "$gt": us } }
+    };
+    let rem_lt = if us == 0 {
+        None
+    } else {
+        Some(doc! { "$or": [ { &comp: { "$exists": false } }, { &comp: { "$lt": us } } ] })
+    };
+    let at = |rem: Document| -> Document {
+        let mut d = doc! { field: date.clone() };
+        d.extend(rem);
+        d
+    };
+    let eq = at(rem_eq.clone());
+    Some(match op {
+        "$eq" => eq,
+        "$ne" => doc! { "$and": [
+            doc! { "$nor": [eq] },
+            doc! { field: { "$ne": Bson::Null } },
+        ]},
+        "$gt" => doc! { "$or": [ { field: { "$gt": date.clone() } }, at(rem_gt) ] },
+        "$gte" => doc! { "$or": [ { field: { "$gt": date.clone() } }, at(rem_gt), eq ] },
+        "$lt" => match rem_lt {
+            None => doc! { field: { "$lt": date.clone() } },
+            Some(rem) => doc! { "$or": [ { field: { "$lt": date.clone() } }, at(rem) ] },
+        },
+        "$lte" => {
+            let mut arms = vec![Bson::Document(doc! { field: { "$lt": date.clone() } })];
+            if let Some(rem) = rem_lt {
+                arms.push(Bson::Document(at(rem)));
+            }
+            arms.push(Bson::Document(eq));
+            doc! { "$or": arms }
+        }
+        _ => return None,
+    })
+}
+
 /// `field <mql_op> value`, exact for a numeric column of either width, or the
 /// plain MQL form for anything else.
 fn scalar_filter(def: &TableDef, field: &str, mql_op: &str, value: Bson) -> Document {
+    if is_timestamp_field(def, field) {
+        if let Some(d) = timestamp_filter(field, mql_op, &value) {
+            return d;
+        }
+    }
     if needs_numeric_filter(def, field, &value) {
         if let Some(d) = numeric::numeric_filter(field, mql_op, &value) {
             return d;
@@ -17915,6 +18519,7 @@ fn lower_aexpr(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
         Some(oid) => Bson::Int64(oid),
         None => value,
     };
+    let value = coerce_to_column(def, &field, value)?;
 
     // `=` and the range operators are already NULL-correct: MQL brackets by
     // type, so a null column value matches none of them -- which is what
@@ -18206,14 +18811,17 @@ fn lower_in(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     let mut values = Vec::new();
     let mut saw_null = false;
     for item in items {
-        let v = reg_oid_operand(const_value(item, params)?);
+        let v = coerce_to_column(def, &field, reg_oid_operand(const_value(item, params)?))?;
         if v == Bson::Null {
             saw_null = true;
         } else {
             values.push(v);
         }
     }
-    let numeric = values.iter().any(|v| needs_numeric_filter(def, &field, v));
+    // A timestamp compares through its companion too, so it takes the
+    // per-value arms the numeric case already builds.
+    let numeric = is_timestamp_field(def, &field)
+        || values.iter().any(|v| needs_numeric_filter(def, &field, v));
     if negated {
         if saw_null {
             // `NOT IN` over a list containing NULL is never true.
@@ -18252,8 +18860,8 @@ fn lower_between(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document>
         Some(N::List(l)) if l.items.len() == 2 => &l.items,
         _ => return Err(Error::Unsupported("this BETWEEN form".into())),
     };
-    let lo = const_value(&bounds[0], params)?;
-    let hi = const_value(&bounds[1], params)?;
+    let lo = coerce_to_column(def, &field, const_value(&bounds[0], params)?)?;
+    let hi = coerce_to_column(def, &field, const_value(&bounds[1], params)?)?;
     if lo == Bson::Null || hi == Bson::Null {
         return Ok(match_nothing());
     }
@@ -18270,7 +18878,10 @@ fn lower_between(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document>
             ]
         });
     }
-    if needs_numeric_filter(def, &field, &lo) || needs_numeric_filter(def, &field, &hi) {
+    if is_timestamp_field(def, &field)
+        || needs_numeric_filter(def, &field, &lo)
+        || needs_numeric_filter(def, &field, &hi)
+    {
         return Ok(doc! { "$and": [
             scalar_filter(def, &field, "$gte", lo),
             scalar_filter(def, &field, "$lte", hi),

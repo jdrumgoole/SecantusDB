@@ -237,6 +237,29 @@ pub(crate) fn plan_join_source(
     Ok(out)
 }
 
+/// Register an already-planned source under a placeholder FROM name, for a
+/// rewrite that has to hand the planner a source it cannot express as SQL.
+pub(crate) fn register_source(src: SubSource) -> String {
+    PLANNED_JOINS.with(|j| {
+        let mut j = j.borrow_mut();
+        let name = format!("{SEP}source{SEP}{}", j.len());
+        j.push((name.clone(), src));
+        name
+    })
+}
+
+/// A FROM item naming a registered source.
+pub(crate) fn placeholder_from(name: String) -> pg_query::protobuf::Node {
+    pg_query::protobuf::Node {
+        node: Some(N::RangeVar(pg_query::protobuf::RangeVar {
+            relname: name,
+            inh: true,
+            relpersistence: "p".into(),
+            ..Default::default()
+        })),
+    }
+}
+
 /// Forget the join sources of the statement just planned.
 pub(crate) fn clear_planned_joins() {
     PLANNED_JOINS.with(|j| j.borrow_mut().clear());

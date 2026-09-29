@@ -85,6 +85,9 @@ fn extension_scalar(name: &str) -> Option<crate::ExtensionType> {
 }
 
 const SCALAR_NAMES: &[&str] = &[
+    "gen_random_uuid",
+    "uuid_generate_v4",
+    "random",
     "upper",
     "lower",
     "initcap",
@@ -397,6 +400,28 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp" => {
             need(0)?;
             Ok(now_value())
+        }
+        // A version-4 UUID: 122 random bits, the version nibble 4 and the
+        // RFC 4122 variant bits.
+        "gen_random_uuid" | "uuid_generate_v4" => {
+            need(0)?;
+            let (hi, lo) = (random_u64(), random_u64());
+            let hi = (hi & !0xF000) | 0x4000;
+            let lo = (lo & !(0b11 << 62)) | (0b10 << 62);
+            let text = format!(
+                "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+                hi >> 32,
+                (hi >> 16) & 0xFFFF,
+                hi & 0xFFFF,
+                lo >> 48,
+                lo & 0xFFFF_FFFF_FFFF
+            );
+            crate::cast_value(Bson::String(text), "uuid")
+        }
+        // Uniform in [0, 1), from 53 random bits -- a double's mantissa.
+        "random" => {
+            need(0)?;
+            Ok(Bson::Double((random_u64() >> 11) as f64 / (1u64 << 53) as f64))
         }
         "st_geomfromgeojson" => {
             need(1)?;
@@ -1495,6 +1520,8 @@ pub fn static_result_type(name: &str) -> &'static str {
         return t;
     }
     match name {
+        "gen_random_uuid" | "uuid_generate_v4" => "uuid",
+        "random" => "float8",
         "length" | "char_length" | "character_length" | "octet_length" | "bit_length"
         | "strpos" | "position" | "ascii" | "get_byte" => "int4",
         "abs" | "ceil" | "ceiling" | "floor" | "round" | "trunc" | "mod" | "div" => "numeric",
@@ -1516,4 +1543,19 @@ pub fn static_result_type(name: &str) -> &'static str {
         "hstore_to_jsonb" => "jsonb",
         _ => "text",
     }
+}
+
+/// 64 random bits. `RandomState` is seeded from the operating system once per
+/// process and stepped for every instance, so each call hashes to a fresh,
+/// unpredictable value without a dependency on a random-number crate.
+fn random_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    );
+    h.finish()
 }
