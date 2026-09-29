@@ -14,7 +14,18 @@ use bson::Bson;
 pub fn is_scalar(name: &str) -> bool {
     SCALAR_NAMES.contains(&name)
         || CATALOG_NAMES.contains(&name)
+        || crate::arrays::is_array_function(name)
         || extension_scalar(name).is_some()
+}
+
+/// Does this built-in's result type follow from its NAME alone?
+///
+/// Most do, and the planner uses that to type a call it has not run. The array
+/// functions that answer an array do not: `array_remove(x, 1)` is whatever
+/// `x` is, so they are typed from the CALL by `static_type` instead, and the
+/// select-list fast path that only has a name has to step around them.
+pub fn has_static_result_type(name: &str) -> bool {
+    !crate::arrays::is_array_function(name) || crate::arrays::static_result_type(name).is_some()
 }
 
 /// The catalog functions that must be answered by the CONNECTION when they
@@ -147,7 +158,7 @@ pub fn now_value() -> Bson {
     crate::timestamptz_value_from_micros(micros)
 }
 
-fn text(v: &Bson) -> String {
+pub(crate) fn text(v: &Bson) -> String {
     match v {
         Bson::String(s) => s.clone(),
         Bson::Int32(i) => i.to_string(),
@@ -227,6 +238,11 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
     // `integer` rather than NULL.
     if name == "format_type" {
         return format_type_call(args);
+    }
+    // The array built-ins each decide what a NULL argument means -- see
+    // `arrays`' header -- so they are routed BEFORE the blanket guard below.
+    if crate::arrays::is_array_function(name) {
+        return crate::arrays::call(name, args);
     }
     if !matches!(
         name,
@@ -1121,6 +1137,9 @@ fn md5_hex(data: &[u8]) -> String {
 /// input and fall back to text only when unknown, which is also what an
 /// untyped output column defaults to.
 pub fn static_result_type(name: &str) -> &'static str {
+    if let Some(t) = crate::arrays::static_result_type(name) {
+        return t;
+    }
     match name {
         "length" | "char_length" | "character_length" | "octet_length" | "bit_length"
         | "strpos" | "position" | "ascii" | "get_byte" => "int4",

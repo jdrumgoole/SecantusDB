@@ -14,6 +14,7 @@
 use bson::{doc, Bson, Document};
 
 pub mod acl;
+pub mod arrays;
 pub mod bytea;
 pub mod escape_strings;
 pub mod geo;
@@ -1661,11 +1662,39 @@ pub struct Update {
     /// evaluates them per matched row with `update_row_sets` and writes the
     /// result by `_id`, because a constant `$set` cannot express them.
     pub set_exprs: Vec<(String, String, ColumnExpr)>,
+    /// `SET a[i] = v` / `SET a[lo:hi] = v` -- assignments INTO an array the
+    /// row already holds, which rewrite it rather than replace it. Kept apart
+    /// from `set_exprs` because the new value is a function of the OLD one and
+    /// of the subscripts, none of which a plain expression over the row can
+    /// express.
+    pub set_subscripts: Vec<SubscriptAssign>,
     pub filter: Document,
     /// `UPDATE ... RETURNING`, over the rows AFTER the update -- which is
     /// what PostgreSQL returns. Dropped on the floor before 2026-09-20: the
     /// rows were updated and the client got no rowset at all.
     pub returning: Option<Returning>,
+}
+
+/// One `SET a[...] = v` assignment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubscriptAssign {
+    /// The array column's stored field.
+    pub field: String,
+    /// The column's declared type, which the rewritten ARRAY is cast to.
+    pub pg_type: String,
+    /// The type the assigned value is cast to: the element type for an
+    /// element assignment, the array type itself for a slice.
+    pub value_type: String,
+    pub subs: Vec<SubscriptTarget>,
+    pub value: ColumnExpr,
+}
+
+/// One subscript of an assignment target. A bound is an expression over the
+/// row, because `SET a[n] = 1` is legal and `n` may be a column.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SubscriptTarget {
+    Index(ColumnExpr),
+    Slice(Option<ColumnExpr>, Option<ColumnExpr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1706,6 +1735,86 @@ fn func_name(f: &pg_query::protobuf::FuncCall) -> Option<String> {
             _ => None,
         })
         .next_back()
+}
+
+/// `a[i]`, `a[lo:hi]` and their multidimensional forms.
+///
+/// Two rules decide the shape of the answer, and both are PostgreSQL's rather
+/// than this server's (measured on 14.13):
+///
+/// - If ANY subscript in the chain is a slice, EVERY one is — a bare `[1]`
+///   beside a slice means `[1:1]`, so `m[1:2][1]` is `{{1},{3}}` and not a
+///   1-D array. The result is then an array; otherwise it is one element.
+/// - A subscript chain SHORTER than the array's dimensionality selects
+///   nothing: `(ARRAY[[1,2],[3,4]])[1]` is NULL, not `{1,2}`.
+fn array_subscript(
+    arg: &pg_query::protobuf::Node,
+    indirection: &[pg_query::protobuf::Node],
+    params: &[Bson],
+) -> Result<Bson> {
+    let value = const_value(arg, params)?;
+    if value == Bson::Null {
+        return Ok(Bson::Null);
+    }
+    if !matches!(value, Bson::Array(_)) {
+        return Err(Error::DatatypeMismatch(format!(
+            "cannot subscript type {} because it does not support subscripting",
+            static_type(arg, &value)
+        )));
+    }
+    let bound = |n: Option<&pg_query::protobuf::Node>| -> Result<Option<i64>> {
+        let Some(n) = n else { return Ok(None) };
+        Ok(match const_value(n, params)? {
+            Bson::Null => None,
+            v => Some(arrays::subscript_index(&v)?),
+        })
+    };
+    let mut subs = Vec::with_capacity(indirection.len());
+    let mut any_slice = false;
+    for ind in indirection {
+        let Some(N::AIndices(idx)) = ind.node.as_ref() else {
+            return Err(Error::Unsupported("this field selection".into()));
+        };
+        any_slice |= idx.is_slice;
+        subs.push((
+            idx.is_slice,
+            bound(idx.lidx.as_deref())?,
+            bound(idx.uidx.as_deref())?,
+        ));
+    }
+    if !any_slice {
+        let ndims = arrays::dim_lengths(&value).len();
+        let plain: Vec<Option<i64>> = subs.iter().map(|(_, _, u)| *u).collect();
+        return Ok(arrays::element(&value, &plain, ndims));
+    }
+    // Under a slice an omitted bound is the array's own edge, and a bare
+    // index `i` stands for `i:i`.
+    let bounds: Vec<(Option<i64>, Option<i64>)> = subs
+        .iter()
+        .enumerate()
+        .map(|(dim, (is_slice, lo, hi))| {
+            if *is_slice {
+                let len = arrays::dim_lengths(&value)
+                    .get(dim)
+                    .map(|n| *n as i64)
+                    .unwrap_or(0);
+                (Some(lo.unwrap_or(1)), Some(hi.unwrap_or(len)))
+            } else {
+                // PostgreSQL: "any subscript written as a single number is
+                // treated as being from 1 to the number specified". So
+                // `m[1:2][2]` is `m[1:2][1:2]` -- the WHOLE second dimension,
+                // not its second element. Reading it as `n:n` happened to
+                // agree whenever n was 1, which is why the first probe of
+                // `m[1:2][1]` did not catch it.
+                (Some(1), *hi)
+            }
+        })
+        .collect();
+    // A NULL bound anywhere makes the whole slice NULL.
+    if bounds.iter().any(|(l, u)| l.is_none() || u.is_none()) {
+        return Ok(Bson::Null);
+    }
+    Ok(arrays::slice(&value, &bounds).unwrap_or(Bson::Null))
 }
 
 /// The range or multirange type a CONSTRUCTOR call names, when it names one:
@@ -5196,7 +5305,25 @@ fn walk_expr(
                 .as_deref_mut()
                 .map_or(Ok(()), |d| walk_expr(d, visit))
         }
-        N::AIndirection(a) => a.arg.as_deref_mut().map_or(Ok(()), |a| walk_expr(a, visit)),
+        N::AIndirection(a) => {
+            // A subscript's BOUNDS are expressions of their own: `ia[n]` and
+            // `ia[lo:hi]` reference columns there, and leaving them unwalked
+            // left the `ColumnRef` in place to be refused at evaluation.
+            if let Some(arg) = a.arg.as_deref_mut() {
+                walk_expr(arg, visit)?;
+            }
+            for ind in &mut a.indirection {
+                if let Some(N::AIndices(idx)) = ind.node.as_mut() {
+                    for bound in [idx.lidx.as_deref_mut(), idx.uidx.as_deref_mut()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        walk_expr(bound, visit)?;
+                    }
+                }
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -5318,10 +5445,10 @@ fn plan_table_targets(
             // is computed per row by the executor; the TYPE is fixed here so
             // the describe pass, which sees no rows, still names it.
             Some(N::FuncCall(f))
-                if func_name(f)
-                    .as_deref()
-                    .is_some_and(|n| scalar::is_scalar(n) || n == "regexp_replace")
-                    && single_column_call(f, params).is_some() =>
+                if func_name(f).as_deref().is_some_and(|n| {
+                    (scalar::is_scalar(n) && scalar::has_static_result_type(n))
+                        || n == "regexp_replace"
+                }) && single_column_call(f, params).is_some() =>
             {
                 let name = func_name(f).expect("checked");
                 let (column, args) = single_column_call(f, params).expect("checked");
@@ -5453,7 +5580,14 @@ fn sample_value_for_type(pg_type: &str) -> Bson {
         "numeric" | "decimal" => Bson::Decimal128("1".parse().expect("literal")),
         "bool" => Bson::Boolean(true),
         "text" | "varchar" | "bpchar" | "name" => Bson::String(String::new()),
-        _ => Bson::Null,
+        // An ARRAY column samples as a ONE-ELEMENT array of its element's
+        // sample. Without this every expression over an array column typed
+        // from a NULL sample, so `length(ta[1])` was described as `text` and
+        // the executor then rendered the integer it computed as a string.
+        other => match other.strip_suffix("[]") {
+            Some(element) => Bson::Array(vec![sample_value_for_type(element)]),
+            None => Bson::Null,
+        },
     }
 }
 
@@ -6374,7 +6508,15 @@ fn resolve_sublinks_in_expr(
         N::CoalesceExpr(c) => children.extend(c.args.iter_mut()),
         N::MinMaxExpr(m) => children.extend(m.args.iter_mut()),
         N::NullTest(t) => children.extend(t.arg.as_deref_mut()),
-        N::AIndirection(a) => children.extend(a.arg.as_deref_mut()),
+        N::AIndirection(a) => {
+            children.extend(a.arg.as_deref_mut());
+            for ind in &mut a.indirection {
+                if let Some(N::AIndices(idx)) = ind.node.as_mut() {
+                    children.extend(idx.lidx.as_deref_mut());
+                    children.extend(idx.uidx.as_deref_mut());
+                }
+            }
+        }
         N::CaseExpr(c) => {
             children.extend(c.arg.as_deref_mut());
             for w in &mut c.args {
@@ -8479,6 +8621,50 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
         Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("to_regtype") => {
             "regtype".to_string()
         }
+        // `array_cat` / `array_append` / `array_prepend` / `array_remove` /
+        // `array_replace` answer whichever ARGUMENT is the array, so the type
+        // has to come from the call. Without this they fell back to the
+        // value, which is silent until the value is NULL -- and at DESCRIBE
+        // time every value is.
+        Some(N::FuncCall(f))
+            if matches!(
+                func_name(f).as_deref(),
+                Some(
+                    "array_cat"
+                        | "array_append"
+                        | "array_prepend"
+                        | "array_remove"
+                        | "array_replace"
+                )
+            ) =>
+        {
+            f.args
+                .iter()
+                .map(|a| static_type(a, &Bson::Null))
+                .find(|t| t.ends_with("[]"))
+                .unwrap_or_else(|| inferred_type(value).to_string())
+        }
+        // The array functions with a FIXED result type -- `array_length` is
+        // `int4` whatever it is handed, `string_to_array` always `text[]`.
+        Some(N::FuncCall(f))
+            if func_name(f)
+                .as_deref()
+                .and_then(arrays::static_result_type)
+                .is_some() =>
+        {
+            func_name(f)
+                .as_deref()
+                .and_then(arrays::static_result_type)
+                .unwrap_or("text")
+                .to_string()
+        }
+        // `array_fill(v, ...)` is an array OF v's type.
+        Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("array_fill") => {
+            match f.args.first().map(|a| static_type(a, &Bson::Null)) {
+                Some(t) if !t.ends_with("[]") && t != "text" => format!("{t}[]"),
+                _ => inferred_type(value).to_string(),
+            }
+        }
         // `now()` and its siblings are `timestamptz`. The value alone cannot
         // say so -- a timestamptz INSTANT is stored exactly like a naive
         // `timestamp` -- so `now()::text` rendered the wall clock with no zone
@@ -8512,6 +8698,32 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
         // `(expr).field` reports the SELECTED field's declared type, taken from
         // the source composite's field list. An anonymous record (or an unknown
         // field) falls back to the value's inferred type.
+        Some(N::AIndirection(ind))
+            if !ind.indirection.is_empty()
+                && ind
+                    .indirection
+                    .iter()
+                    .all(|i| matches!(i.node.as_ref(), Some(N::AIndices(_)))) =>
+        {
+            // A subscript over an array: an ELEMENT reference drops the `[]`,
+            // a SLICE keeps it. `ia[1]` is `int4` where `ia[1:2]` is `int4[]`,
+            // and the value alone cannot tell the two apart once a single-row
+            // slice has been taken.
+            let base = ind
+                .arg
+                .as_deref()
+                .map(|a| static_type(a, &Bson::Null))
+                .unwrap_or_default();
+            let any_slice = ind
+                .indirection
+                .iter()
+                .any(|i| matches!(i.node.as_ref(), Some(N::AIndices(idx)) if idx.is_slice));
+            match base.strip_suffix("[]") {
+                Some(_) if any_slice => base,
+                Some(element) => element.to_string(),
+                None => inferred_type(value).to_string(),
+            }
+        }
         Some(N::AIndirection(ind)) => {
             let field = ind
                 .indirection
@@ -8566,6 +8778,19 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
                         "->>" | "#>>" => "text".to_string(),
                         _ => "bool".to_string(),
                     };
+                }
+            }
+            // The array containment operators answer a boolean. Reached only
+            // when the json branch above did not claim the operator, so an
+            // array operand is what is left.
+            if matches!(op, "@>" | "<@" | "&&") {
+                let side = |n: Option<&pg_query::protobuf::Node>| {
+                    n.map(|node| static_type(node, &Bson::Null))
+                };
+                if side(e.lexpr.as_deref()).is_some_and(|t| t.ends_with("[]"))
+                    || side(e.rexpr.as_deref()).is_some_and(|t| t.ends_with("[]"))
+                {
+                    return "bool".to_string();
                 }
             }
             match op {
@@ -8718,13 +8943,23 @@ fn inferred_type(v: &Bson) -> &'static str {
         Bson::Decimal128(_) => "numeric",
         Bson::Document(d) if d.contains_key(WIDE_NUMERIC_KEY) => "numeric",
         Bson::Document(d) if d.len() == 1 && d.contains_key(REGCLASS_KEY) => "regclass",
-        Bson::Array(items) => match items.first() {
+        // A MULTIDIMENSIONAL array is the same array type as its elements --
+        // `int4[]` (oid 1007), never `int4[][]`, which is no type at all.
+        // Recursing is what makes that so: reading only the first element's
+        // kind typed `{{1,2},{3,4}}` as `text[]`, and a binary-format client
+        // then refused the int rows it was handed as `_text`.
+        // `items.first()` was the element kind until 2026-09-29: a leading
+        // NULL then typed `{NULL,1}` as `text[]`, and a binary-format client
+        // decoded the integer beside it as NULL. The first NON-NULL element
+        // is the one that can say.
+        Bson::Array(items) => match items.iter().find(|i| *i != &Bson::Null).or(items.first()) {
             Some(Bson::Int32(_)) | None => "int4[]",
             Some(Bson::Int64(_)) => "int8[]",
             Some(Bson::Double(_)) => "float8[]",
             Some(Bson::Decimal128(_)) => "numeric[]",
             Some(Bson::Boolean(_)) => "bool[]",
             Some(Bson::Binary(_)) => "bytea[]",
+            Some(inner @ Bson::Array(_)) => inferred_type(inner),
             Some(other) if geo::is_box(other) => "box[]",
             _ => "text[]",
         },
@@ -9246,7 +9481,16 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                         // A `timestamptz` value is a bare date on the wire
                         // and would read as `timestamp` from its shape.
                         let declared = scalar::static_result_type(&name);
-                        let t = if value == Bson::Null || declared == "timestamptz" {
+                        // An ARRAY function's type is decided by `static_type`
+                        // from the CALL. Reading it off the value instead made
+                        // `string_to_array('', 'x')` -- an empty array -- report
+                        // `int4[]`, and every NULL-returning one report `text`.
+                        let t = if arrays::is_array_function(&name) {
+                            match rt.val.as_deref() {
+                                Some(n) => static_type(n, &value),
+                                None => inferred_type(&value).to_string(),
+                            }
+                        } else if value == Bson::Null || declared == "timestamptz" {
                             declared.to_string()
                         } else {
                             inferred_type(&value).to_string()
@@ -15073,6 +15317,19 @@ fn plan_update(
     let mut set = Document::new();
     let mut unset: Vec<String> = Vec::new();
     let mut set_exprs: Vec<(String, String, ColumnExpr)> = Vec::new();
+    let mut set_subscripts: Vec<SubscriptAssign> = Vec::new();
+    let row_fields = || -> (Vec<RowField>, Document) {
+        let fields: Vec<RowField> = def
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), c.field(), c.pg_type.clone()))
+            .collect();
+        let mut sample = Document::new();
+        for c in &def.columns {
+            sample.insert(c.field(), sample_value_for_type(&c.pg_type));
+        }
+        (fields, sample)
+    };
     for t in &u.target_list {
         let Some(N::ResTarget(rt)) = t.node.as_ref() else {
             return Err(Error::Unsupported("this SET target".into()));
@@ -15090,19 +15347,29 @@ fn plan_update(
             .val
             .as_ref()
             .ok_or_else(|| Error::Parse("SET without a value".into()))?;
+        // `SET a[i] = v` -- the target is one element (or slice) of the array
+        // the column holds, so the assignment reads the old value. Checked
+        // BEFORE `check_assignment_type`, which would compare the element
+        // against the column's ARRAY type and report `cannot cast int4 to
+        // int4[]` -- an error about a cast the statement never asked for.
+        if !rt.indirection.is_empty() {
+            let (fields, sample) = row_fields();
+            set_subscripts.push(plan_subscript_assign(
+                column,
+                &field,
+                &rt.indirection,
+                val,
+                &fields,
+                params,
+                &sample,
+            )?);
+            continue;
+        }
         check_assignment_type(column, val)?;
         // A value that reads the row (`num * 2`) has no constant to store;
         // it is planned as a row expression and evaluated per matched row.
         if references_columns(val) {
-            let fields: Vec<RowField> = def
-                .columns
-                .iter()
-                .map(|c| (c.name.clone(), c.field(), c.pg_type.clone()))
-                .collect();
-            let mut sample = Document::new();
-            for c in &def.columns {
-                sample.insert(c.field(), sample_value_for_type(&c.pg_type));
-            }
+            let (fields, sample) = row_fields();
             let row = row_column_expr(val, &fields, params, &sample)?;
             set_exprs.push((field, column.pg_type.clone(), row));
             continue;
@@ -15110,7 +15377,7 @@ fn plan_update(
         let value = cast_value(const_value(val, params)?, &column.pg_type)?;
         set_stored_value(&mut set, &mut unset, field, value);
     }
-    if set.is_empty() && set_exprs.is_empty() {
+    if set.is_empty() && set_exprs.is_empty() && set_subscripts.is_empty() {
         return Err(Error::Parse("UPDATE without a SET list".into()));
     }
     let filter = match u.where_clause.as_ref() {
@@ -15129,6 +15396,7 @@ fn plan_update(
         set,
         unset,
         set_exprs,
+        set_subscripts,
         filter,
         returning,
     }))
@@ -15197,7 +15465,165 @@ pub fn update_row_sets(upd: &Update, row: &Document) -> Result<(Document, Vec<St
         let value = cast_value(apply_row_expr(expr, row)?, pg_type)?;
         set_stored_value(&mut set, &mut unset, field.clone(), value);
     }
+    for a in &upd.set_subscripts {
+        // `SET a[1] = 1, a[2] = 2` assigns into the array twice, so the second
+        // has to see the first: read back what this loop already wrote before
+        // falling back to the stored row.
+        let current = set
+            .get(&a.field)
+            .cloned()
+            .unwrap_or_else(|| row.get(&a.field).cloned().unwrap_or(Bson::Null));
+        let value = cast_value(apply_subscript_assign(a, row, current)?, &a.pg_type)?;
+        set_stored_value(&mut set, &mut unset, a.field.clone(), value);
+    }
     Ok((set, unset))
+}
+
+/// Plan one `SET a[...] = v`.
+///
+/// Every subscript is planned as an expression over the row, because `a[n]`
+/// may name a column. A subscript BELOW 1 is refused: PostgreSQL answers it by
+/// moving the array's lower bound (`UPDATE ... SET ia[0] = 0` leaves an
+/// `[0:5]={...}`), and this server does not model lower bounds -- see the
+/// `arrays` module header. Refusing is the honest answer; re-basing to 1 would
+/// silently shift every other subscript into the array.
+#[allow(clippy::too_many_arguments)]
+fn plan_subscript_assign(
+    column: &secantus_pgcatalog::Column,
+    field: &str,
+    indirection: &[pg_query::protobuf::Node],
+    val: &pg_query::protobuf::Node,
+    fields: &[RowField],
+    params: &[Bson],
+    sample: &Document,
+) -> Result<SubscriptAssign> {
+    let element = column.pg_type.strip_suffix("[]").ok_or_else(|| {
+        Error::DatatypeMismatch(format!(
+            "cannot subscript type {} because it does not support subscripting",
+            column.pg_type
+        ))
+    })?;
+    let mut subs = Vec::with_capacity(indirection.len());
+    let mut slices = 0usize;
+    for ind in indirection {
+        let Some(N::AIndices(idx)) = ind.node.as_ref() else {
+            // A field selection (`SET c.f = 1`) on a composite column is a
+            // different construct, and this server has none.
+            return Err(Error::Unsupported("UPDATE of a field of a column".into()));
+        };
+        let bound = |n: Option<&pg_query::protobuf::Node>| -> Result<Option<ColumnExpr>> {
+            n.map(|n| row_column_expr(n, fields, params, sample))
+                .transpose()
+        };
+        if idx.is_slice {
+            slices += 1;
+            subs.push(SubscriptTarget::Slice(
+                bound(idx.lidx.as_deref())?,
+                bound(idx.uidx.as_deref())?,
+            ));
+        } else {
+            let i = bound(idx.uidx.as_deref())?
+                .ok_or_else(|| Error::Parse("array subscript with no index".into()))?;
+            subs.push(SubscriptTarget::Index(i));
+        }
+    }
+    // A slice assignment rewrites a whole range, and doing that in more than
+    // one dimension at once needs the shape rules an element assignment does
+    // not. Refused by name rather than half-applied.
+    if slices > 1 || (slices == 1 && subs.len() > 1) {
+        return Err(Error::Unsupported(
+            "UPDATE of a slice of a multidimensional array".into(),
+        ));
+    }
+    let value_type = if slices == 1 {
+        column.pg_type.clone()
+    } else {
+        element.to_string()
+    };
+    Ok(SubscriptAssign {
+        field: field.to_string(),
+        pg_type: column.pg_type.clone(),
+        value_type,
+        subs,
+        value: row_column_expr(val, fields, params, sample)?,
+    })
+}
+
+/// Apply one `SET a[...] = v` to the array the row holds.
+///
+/// A subscript past the end EXTENDS the array, padding the gap with NULLs:
+/// `ia[5] = 5` over `{1,2,3}` is `{1,2,3,NULL,5}`, and assigning into a NULL
+/// column builds the array from nothing. A slice whose source is shorter than
+/// the range is PostgreSQL's own "source array too small"; a longer one has
+/// its tail ignored.
+fn apply_subscript_assign(a: &SubscriptAssign, row: &Document, current: Bson) -> Result<Bson> {
+    let value = cast_value(apply_row_expr(&a.value, row)?, &a.value_type)?;
+    let index = |e: &ColumnExpr| -> Result<i64> {
+        let i = arrays::subscript_index(&apply_row_expr(e, row)?)?;
+        if i < 1 {
+            return Err(Error::Unsupported(
+                "UPDATE of an array element below subscript 1".into(),
+            ));
+        }
+        // A subscript past the end EXTENDS the array, so the subscript is the
+        // size being asked for -- `SET a[1000000000] = 1` is a one-line
+        // statement that would otherwise allocate a billion slots.
+        arrays::check_array_size(i)?;
+        Ok(i)
+    };
+    if let [SubscriptTarget::Slice(lo, hi)] = a.subs.as_slice() {
+        let items = match &current {
+            Bson::Array(items) => items.clone(),
+            _ => Vec::new(),
+        };
+        let lo = lo.as_ref().map(&index).transpose()?.unwrap_or(1);
+        let hi = match hi.as_ref().map(&index).transpose()? {
+            Some(h) => h,
+            None => items.len() as i64,
+        };
+        let Bson::Array(source) = &value else {
+            // A NULL source for a slice is PostgreSQL's own error rather than
+            // a no-op: there is nothing to copy into the range.
+            return Err(Error::DataException("source array too small".into()));
+        };
+        let width = (hi - lo + 1).max(0) as usize;
+        if source.len() < width {
+            return Err(Error::DataException("source array too small".into()));
+        }
+        let mut out = items;
+        out.resize(out.len().max(hi.max(0) as usize), Bson::Null);
+        for (n, slot) in (lo..=hi).enumerate() {
+            out[slot as usize - 1] = source[n].clone();
+        }
+        return Ok(Bson::Array(out));
+    }
+    let mut path = Vec::with_capacity(a.subs.len());
+    for sub in &a.subs {
+        match sub {
+            SubscriptTarget::Index(e) => path.push(index(e)?),
+            SubscriptTarget::Slice(..) => {
+                return Err(Error::Unsupported(
+                    "UPDATE of a slice of a multidimensional array".into(),
+                ))
+            }
+        }
+    }
+    fn place(current: &Bson, path: &[i64], value: Bson) -> Bson {
+        let Some((&head, rest)) = path.split_first() else {
+            return value;
+        };
+        let mut items = match current {
+            Bson::Array(items) => items.clone(),
+            _ => Vec::new(),
+        };
+        let slot = head as usize - 1;
+        if items.len() <= slot {
+            items.resize(slot + 1, Bson::Null);
+        }
+        items[slot] = place(&items[slot].clone(), rest, value);
+        Bson::Array(items)
+    }
+    Ok(place(&current, &path, value))
 }
 
 /// Whether `node` reads a column anywhere beneath it.
@@ -15381,8 +15807,18 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             .arg
             .as_ref()
             .ok_or_else(|| Error::Parse("field selection with no operand".into()))?;
-        // Only single field-name selection is supported here; array subscripts
-        // and `(rec).*` are separate constructs.
+        // An indirection made ENTIRELY of subscripts is an array reference,
+        // not a field selection: `ia[1]`, `ia[2:3]`, `m[1][2]`, `m[1:2][1:1]`.
+        if ind
+            .indirection
+            .iter()
+            .all(|i| matches!(i.node.as_ref(), Some(N::AIndices(_))))
+            && !ind.indirection.is_empty()
+        {
+            return array_subscript(arg, &ind.indirection, params);
+        }
+        // Only single field-name selection is supported here; `(rec).*` and a
+        // mixed subscript/field chain are separate constructs.
         if ind.indirection.len() != 1 {
             return Err(Error::Unsupported("this field selection".into()));
         }
@@ -15824,6 +16260,21 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 }
                 return json_operator(&op, &target, &lhs, &rhs);
             }
+        }
+        // The array containment operators. Told apart from the json ones
+        // above by the operands being arrays -- a json value is a string here,
+        // so the two never both match.
+        if matches!(op.as_str(), "@>" | "<@" | "&&")
+            && (matches!(lhs, Bson::Array(_)) || matches!(rhs, Bson::Array(_)))
+        {
+            if lhs == Bson::Null || rhs == Bson::Null {
+                return Ok(Bson::Null);
+            }
+            return Ok(Bson::Boolean(match op.as_str() {
+                "@>" => arrays::contains(&lhs, &rhs),
+                "<@" => arrays::contains(&rhs, &lhs),
+                _ => arrays::overlaps(&lhs, &rhs),
+            }));
         }
         // A bare UNKNOWN literal takes the type of the operand beside it,
         // which decides both the parse and the error.

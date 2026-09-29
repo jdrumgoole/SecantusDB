@@ -12508,8 +12508,13 @@ impl PgHandler {
                 // row-by-row path below computes -- the bulk path knows just
                 // how many rows matched.
                 let mut returned: Vec<Document> = Vec::new();
-                let matched = if upd.set_exprs.is_empty() && !constrained && upd.returning.is_none()
-                {
+                // A SUBSCRIPTED assignment reads the row's old array, so it
+                // needs the row-by-row path exactly as `set_exprs` does.
+                // Without it the bulk path ran, wrote the constant `$set`
+                // (which is empty) and reported the rows matched -- an UPDATE
+                // that answered `UPDATE 1` and changed nothing.
+                let per_row = !upd.set_exprs.is_empty() || !upd.set_subscripts.is_empty();
+                let matched = if !per_row && !constrained && upd.returning.is_none() {
                     self.update_rows(&upd.table, &upd.filter, &upd.set, &upd.unset)?
                 } else {
                     // A SET list that reads the row (`num = num * 2`) is
@@ -12525,7 +12530,7 @@ impl PgHandler {
                     for bytes in &raw {
                         let row: Document = bson::from_slice(bytes)
                             .map_err(|e| Self::storage_err("could not decode a row", e))?;
-                        let (set, unset) = if upd.set_exprs.is_empty() {
+                        let (set, unset) = if !per_row {
                             (upd.set.clone(), upd.unset.clone())
                         } else {
                             secantus_pgplan::update_row_sets(&upd, &row)
