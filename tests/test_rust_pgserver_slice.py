@@ -5436,13 +5436,14 @@ def test_literal_column_defaults(home: Path) -> None:
         with pytest.raises(psycopg.errors.InvalidTextRepresentation) as ei:
             cur.execute("create table fp_e (id int, n int default 'a')")
         assert str(ei.value).startswith('invalid input syntax for type integer: "a"')
-        # PostgreSQL accepts a volatile DEFAULT and stamps each INSERT; this
-        # server stores a DEFAULT as one evaluated value, so `now()` would be
-        # frozen at CREATE time. Refused rather than silently wrong.
-        with pytest.raises(psycopg.errors.FeatureNotSupported):
-            cur.execute("create table fp_e (id int, n text default now())")
-        with pytest.raises(psycopg.errors.FeatureNotSupported):
-            cur.execute("create table fp_e (id int, n timestamptz default current_timestamp)")
+        # A volatile DEFAULT is kept as its expression and stamps each INSERT,
+        # as PostgreSQL does -- it was refused before, rather than frozen at
+        # CREATE time.
+        cur.execute(
+            "create table fp_e (id int primary key, n timestamptz default current_timestamp)"
+        )
+        cur.execute("insert into fp_e (id) values (1) returning n is not null")
+        assert cur.fetchone() == (True,)
     # The default survives a restart: it is in the catalog, not the session.
     with _Server(home) as server, server.connect() as conn:
         cur = conn.cursor()
@@ -11542,21 +11543,19 @@ def test_an_unknown_named_window_and_a_bad_ntile_are_named_errors(home: Path) ->
         assert info.value.sqlstate == "22014"
 
 
-def test_a_window_over_an_aggregate_is_refused_by_its_real_name(home: Path) -> None:
+def test_a_window_over_an_aggregate_runs_over_the_grouped_rows(home: Path) -> None:
     """`sum(sum(v)) OVER (...)` beside a GROUP BY runs the window over the
-    GROUPED rows, which the aggregate planner does not do.
+    GROUPED rows -- planned as the grouping, then the window over it.
 
-    The message matters as much as the refusal: routed on into the aggregate
-    planner it came out as `function sum() is not supported yet`, which is
-    false, and sends whoever reads it looking in the wrong place.
+    It was refused by name before; before THAT, routed into the aggregate
+    planner, it came out as `function sum() is not supported yet`, which was
+    false. PostgreSQL 14.13 on the same rows answers what is asserted here.
     """
     with _Server(home) as server, server.connect() as conn:
         _windowed(conn)
         cur = conn.cursor()
-        with pytest.raises(psycopg.Error) as info:
-            cur.execute("SELECT g, sum(sum(v)) OVER (ORDER BY g) FROM w9 GROUP BY g")
-        assert info.value.sqlstate == "0A000"
-        assert "window function over an aggregate" in str(info.value)
+        cur.execute("SELECT g, sum(sum(v)) OVER (ORDER BY g) FROM w9 GROUP BY g ORDER BY g")
+        assert cur.fetchall() == [("a", 50), ("b", 85)]
 
 
 def test_a_window_aggregate_no_longer_demands_a_group_by(home: Path) -> None:
@@ -13126,3 +13125,95 @@ def test_a_volatile_subquery_runs_once_per_execution(home: Path) -> None:
         assert cur.execute("SELECT (SELECT nextval('s'))", prepare=True).fetchall() == [(1,)]
         assert cur.execute("SELECT (SELECT nextval('s'))").fetchall() == [(2,)]
         assert cur.execute("SELECT currval('s')").fetchall() == [(2,)]
+
+
+def test_a_quoted_literal_compares_as_the_columns_type(home: Path) -> None:
+    """An unknown-typed literal resolves to the column's type. Left a string,
+    `n > '5'` and `t > '2026-03-01'` compared across BSON types and matched
+    NOTHING -- silently, for every quoted number, boolean, timestamp and
+    interval in a WHERE. A timestamp also compares its sub-millisecond
+    remainder, which lives in a hidden companion field."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE lc (id int PRIMARY KEY, n int, t timestamptz, ok bool)")
+        cur.execute(
+            "INSERT INTO lc VALUES (1, 5, '2026-01-01 10:00:00.123456+00', true), "
+            "(2, 7, '2026-06-01 10:00:00.123+00', false)"
+        )
+
+        def ids(where: str) -> list[int]:
+            cur.execute(f"SELECT id FROM lc WHERE {where} ORDER BY id")
+            return [r[0] for r in cur.fetchall()]
+
+        assert ids("n > '5'") == [2]
+        assert ids("n IN ('5', '6')") == [1]
+        assert ids("ok = 't'") == [1]
+        assert ids("t > '2026-03-01'") == [2]
+        assert ids("t > '2026-01-01 10:00:00.123+00'") == [1, 2]
+        assert ids("t = '2026-01-01 10:00:00.123456+00'") == [1]
+        assert ids("t <= '2026-06-01 10:00:00.123+00'") == [1, 2]
+        assert ids("t BETWEEN '2025-01-01' AND now()") == [1, 2]
+        with pytest.raises(psycopg.errors.InvalidTextRepresentation):
+            cur.execute("SELECT id FROM lc WHERE n > 'abc'")
+
+
+def test_expression_defaults_are_evaluated_per_row(home: Path) -> None:
+    """`now()`, `gen_random_uuid()` and `nextval()` defaults, the DEFAULT
+    keyword in VALUES and SET, and DEFAULT VALUES -- once per row, where
+    PostgreSQL evaluates them, never frozen at CREATE time."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE SEQUENCE ds START 100")
+        cur.execute(
+            "CREATE TABLE de (id int PRIMARY KEY DEFAULT nextval('ds'), "
+            "at timestamptz DEFAULT now(), u uuid DEFAULT gen_random_uuid(), n int DEFAULT 3)"
+        )
+        cur.execute("INSERT INTO de DEFAULT VALUES RETURNING id, n")
+        assert cur.fetchall() == [(100, 3)]
+        cur.execute("INSERT INTO de (n) VALUES (5), (6) RETURNING id")
+        assert cur.fetchall() == [(101,), (102,)]
+        cur.execute("INSERT INTO de (id, n) VALUES (DEFAULT, 7) RETURNING id")
+        assert cur.fetchall() == [(103,)]
+        cur.execute("SELECT count(DISTINCT u), count(*) FROM de WHERE at <= now()")
+        assert cur.fetchall() == [(4, 4)]
+        cur.execute("UPDATE de SET n = DEFAULT WHERE id = 101 RETURNING n")
+        assert cur.fetchall() == [(3,)]
+        cur.execute("UPDATE de SET n = nextval('ds') WHERE id < 102 RETURNING n")
+        assert sorted(r[0] for r in cur.fetchall()) == [104, 105]
+        cur.execute("ALTER TABLE de ADD COLUMN u2 uuid DEFAULT gen_random_uuid()")
+        cur.execute("SELECT count(DISTINCT u2) FROM de")
+        assert cur.fetchall() == [(4,)]
+        cur.execute(
+            "SELECT column_default FROM information_schema.columns "
+            "WHERE table_name = 'de' AND column_name = 'id'"
+        )
+        assert cur.fetchall() == [("nextval('ds'::regclass)",)]
+
+
+def test_sequence_functions_work_inside_expressions(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE SEQUENCE s")
+        cur.execute("CREATE TABLE q (id int PRIMARY KEY, n int)")
+        cur.execute("INSERT INTO q VALUES (nextval('s'), 1), (nextval('s') * 10, 2)")
+        cur.execute("SELECT id FROM q ORDER BY id")
+        assert cur.fetchall() == [(1,), (20,)]
+        cur.execute("SELECT nextval('s') + 100, currval('s'), lastval()")
+        assert cur.fetchall() == [(103, 3, 3)]
+
+
+def test_windows_over_aggregates_series_and_inside_expressions(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE w (id int PRIMARY KEY, g text, v int)")
+        cur.execute("INSERT INTO w VALUES (1,'a',10),(2,'a',20),(3,'b',5),(4,'c',40)")
+        cur.execute("SELECT g, sum(v), sum(sum(v)) OVER (ORDER BY g) FROM w GROUP BY g ORDER BY g")
+        assert cur.fetchall() == [("a", 30, 30), ("b", 5, 35), ("c", 40, 75)]
+        cur.execute(
+            "SELECT g, rank() OVER (ORDER BY count(*) DESC, g) FROM w GROUP BY g ORDER BY g"
+        )
+        assert cur.fetchall() == [("a", 1), ("b", 2), ("c", 3)]
+        cur.execute("SELECT n, sum(n) OVER (ORDER BY n) FROM generate_series(1, 4) n ORDER BY n")
+        assert cur.fetchall() == [(1, 1), (2, 3), (3, 6), (4, 10)]
+        cur.execute("SELECT id, coalesce(lag(v) OVER (ORDER BY id), 0) FROM w ORDER BY id")
+        assert cur.fetchall() == [(1, 0), (2, 10), (3, 20), (4, 5)]

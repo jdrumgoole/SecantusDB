@@ -3025,7 +3025,13 @@ fn plan_added_column(cd: &pg_query::protobuf::ColumnDef, params: &[Bson]) -> Res
                     .raw_expr
                     .as_ref()
                     .ok_or_else(|| Error::Parse("DEFAULT without an expression".into()))?;
-                column.default = Some(literal_default(raw, &cd.colname, &ty, params)?);
+                // An expression default is evaluated per EXISTING row by the
+                // executor's rewrite -- `gen_random_uuid()` gives each row its
+                // own, as PostgreSQL does -- and per inserted row after.
+                match default_value_or_expr(raw, &ty, params)? {
+                    DefaultSpec::Value(v) => column.default = Some(v),
+                    DefaultSpec::Expr(e) => column.set_default_expr(Some(e)),
+                }
             }
             Ok(CT::ConstrPrimary) => {
                 return Err(Error::Unsupported(
@@ -3102,35 +3108,6 @@ fn default_value_or_expr(
         Err(Error::Unsupported(_)) => as_expr(),
         Err(e) => Err(e),
     }
-}
-
-/// A column DEFAULT, evaluated once and stored as a value.
-///
-/// Shared by `ADD COLUMN ... DEFAULT` and `ALTER COLUMN ... SET DEFAULT`, and
-/// refusing a volatile expression for the same reason `CREATE TABLE` does: a
-/// `now()` frozen here would stamp every later row with the moment of the
-/// ALTER rather than of the INSERT.
-fn literal_default(
-    raw: &pg_query::protobuf::Node,
-    column: &str,
-    pg_type: &str,
-    params: &[Bson],
-) -> Result<Bson> {
-    if default_is_volatile(raw) {
-        return Err(Error::Unsupported(format!(
-            "a non-literal DEFAULT on column \"{column}\""
-        )));
-    }
-    let value = match const_value(raw, params) {
-        Ok(v) => v,
-        Err(Error::Unsupported(_)) => {
-            return Err(Error::Unsupported(format!(
-                "a non-literal DEFAULT on column \"{column}\""
-            )))
-        }
-        Err(e) => return Err(e),
-    };
-    cast_value(value, pg_type)
 }
 
 /// Apply one action to a def, so the next action in the same statement -- and
@@ -4596,7 +4573,7 @@ fn plan_insert(
         for target in defaulted {
             if let Some(column) = def.column(target) {
                 let field = column.field();
-                row.remove(&companion_field(&field));
+                row.remove(companion_field(&field));
                 row.remove(&field);
             }
         }
@@ -5191,8 +5168,15 @@ fn plan_window_targets(
             // A plain target beside the windows, planned the ordinary way --
             // unless a window is nested inside it.
             if node_has_window(rt.val.as_deref()) {
-                let (c, k) =
-                    plan_nested_windows(rt, &named, def, params, &mut keys, &mut windows, &mut extra)?;
+                let (c, k) = plan_nested_windows(
+                    rt,
+                    &named,
+                    def,
+                    params,
+                    &mut keys,
+                    &mut windows,
+                    &mut extra,
+                )?;
                 columns.push(c);
                 casts.push(k);
                 continue;
@@ -5211,7 +5195,8 @@ fn plan_window_targets(
                 casts.append(&mut k);
                 continue;
             }
-            let (c, k) = plan_nested_windows(rt, &named, def, params, &mut keys, &mut windows, &mut extra)?;
+            let (c, k) =
+                plan_nested_windows(rt, &named, def, params, &mut keys, &mut windows, &mut extra)?;
             columns.push(c);
             casts.push(k);
             continue;
@@ -5356,7 +5341,9 @@ fn plan_nested_windows(
     let (mut c, mut k) = plan_table_targets(std::slice::from_ref(&target), &extended, params)?;
     match (c.pop(), k.pop()) {
         (Some(col), Some(cast)) => Ok((col, cast)),
-        _ => Err(Error::Internal("a nested window target planned to nothing".into())),
+        _ => Err(Error::Internal(
+            "a nested window target planned to nothing".into(),
+        )),
     }
 }
 
@@ -5472,9 +5459,11 @@ fn split_window_over_aggregate(
     let mut seen: Vec<(pg_query::protobuf::Node, String)> = Vec::new();
     // Structural identity ignoring where in the text each was written.
     static LOCATION: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let location = LOCATION.get_or_init(|| regex::Regex::new(r"location: -?\d+").expect("static regex"));
-    let strip_location =
-        |n: &pg_query::protobuf::Node| -> String { location.replace_all(&format!("{n:?}"), "").into_owned() };
+    let location =
+        LOCATION.get_or_init(|| regex::Regex::new(r"location: -?\d+").expect("static regex"));
+    let strip_location = |n: &pg_query::protobuf::Node| -> String {
+        location.replace_all(&format!("{n:?}"), "").into_owned()
+    };
     let mut outer = s.clone();
     let mut replace = |n: &mut pg_query::protobuf::Node| -> Result<()> {
         let is_agg = matches!(n.node.as_ref(), Some(N::FuncCall(f))
@@ -5545,16 +5534,18 @@ fn split_window_over_aggregate(
         ..Default::default()
     };
     outer.from_clause = vec![pg_query::protobuf::Node {
-        node: Some(N::RangeSubselect(Box::new(pg_query::protobuf::RangeSubselect {
-            lateral: false,
-            subquery: Some(Box::new(pg_query::protobuf::Node {
-                node: Some(N::SelectStmt(Box::new(inner))),
-            })),
-            alias: Some(pg_query::protobuf::Alias {
-                aliasname: "__grouped".into(),
-                colnames: Vec::new(),
-            }),
-        }))),
+        node: Some(N::RangeSubselect(Box::new(
+            pg_query::protobuf::RangeSubselect {
+                lateral: false,
+                subquery: Some(Box::new(pg_query::protobuf::Node {
+                    node: Some(N::SelectStmt(Box::new(inner))),
+                })),
+                alias: Some(pg_query::protobuf::Alias {
+                    aliasname: "__grouped".into(),
+                    colnames: Vec::new(),
+                }),
+            },
+        ))),
     }];
     outer.where_clause = None;
     outer.group_clause = Vec::new();
@@ -5562,7 +5553,9 @@ fn split_window_over_aggregate(
     // Every aggregate moved inside; one still here would split again, for
     // ever.
     if has_aggregate(&outer) {
-        return Err(Error::Unsupported("a window function over this aggregate".into()));
+        return Err(Error::Unsupported(
+            "a window function over this aggregate".into(),
+        ));
     }
     Ok(outer)
 }
@@ -9966,7 +9959,9 @@ fn column_default_node(column: &Column) -> Result<pg_query::protobuf::Node> {
     } else if let Some(expr) = column.default_expr() {
         expr.to_string()
     } else {
-        return Ok(param_less_const(column.default.clone().unwrap_or(Bson::Null)));
+        return Ok(param_less_const(
+            column.default.clone().unwrap_or(Bson::Null),
+        ));
     };
     let N::SelectStmt(sel) = parse_one(&format!("SELECT {text}"))? else {
         return Err(Error::Internal("a column default did not parse".into()));
@@ -10100,7 +10095,8 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
             _ => inferred_type(value).to_string(),
         },
         Some(N::FuncCall(f))
-            if func_name(f).is_some_and(|n| correlated::SEQUENCE_FUNCTIONS.contains(&n.as_str())) =>
+            if func_name(f)
+                .is_some_and(|n| correlated::SEQUENCE_FUNCTIONS.contains(&n.as_str())) =>
         {
             "int8".to_string()
         }
@@ -17433,7 +17429,9 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
         if let Some(result) = correlated::eval_correlated(f, params) {
             return result;
         }
-        if let Some(name) = func_name(f).filter(|n| correlated::SEQUENCE_FUNCTIONS.contains(&n.as_str())) {
+        if let Some(name) =
+            func_name(f).filter(|n| correlated::SEQUENCE_FUNCTIONS.contains(&n.as_str()))
+        {
             let args = f
                 .args
                 .iter()
@@ -18145,8 +18143,8 @@ fn coerce_to_column(def: &TableDef, field: &str, value: Bson) -> Result<Bson> {
     };
     match field_type(def, field) {
         Some(
-            ty @ ("int2" | "int4" | "int8" | "numeric" | "float4" | "float8" | "bool"
-            | "timestamp" | "timestamptz" | "interval" | "oid"),
+            ty @ ("int2" | "int4" | "int8" | "numeric" | "float4" | "float8" | "bool" | "timestamp"
+            | "timestamptz" | "interval" | "oid"),
         ) => cast_value(value, ty),
         _ => Ok(value),
     }

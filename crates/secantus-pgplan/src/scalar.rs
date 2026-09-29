@@ -421,7 +421,9 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         // Uniform in [0, 1), from 53 random bits -- a double's mantissa.
         "random" => {
             need(0)?;
-            Ok(Bson::Double((random_u64() >> 11) as f64 / (1u64 << 53) as f64))
+            Ok(Bson::Double(
+                (random_u64() >> 11) as f64 / (1u64 << 53) as f64,
+            ))
         }
         "st_geomfromgeojson" => {
             need(1)?;

@@ -57,7 +57,9 @@ pub fn with_correlated_runner<R>(runner: &CorrelatedRunner<'_>, f: impl FnOnce()
 
 fn run(sql: &str, params: &[Bson]) -> Result<Vec<Vec<Bson>>> {
     if SUPPRESSED.with(|s| s.get()) {
-        return Err(Error::Unsupported("a subquery evaluated for its type".into()));
+        return Err(Error::Unsupported(
+            "a subquery evaluated for its type".into(),
+        ));
     }
     match RUNNER.with(|r| r.get()) {
         // SAFETY: set only inside `with_correlated_runner`, whose borrow is
@@ -506,7 +508,8 @@ pub fn with_sequence_hook<R>(hook: &SequenceHook<'_>, f: impl FnOnce() -> R) -> 
     }
     // SAFETY: as `with_correlated_runner` -- only the lifetime is erased, and
     // `Restore` reinstates the previous pointer before the borrow ends.
-    let ptr: *const Hook = unsafe { std::mem::transmute::<*const SequenceHook<'_>, *const Hook>(hook) };
+    let ptr: *const Hook =
+        unsafe { std::mem::transmute::<*const SequenceHook<'_>, *const Hook>(hook) };
     let _restore = Restore(SEQUENCE_HOOK.with(|r| r.replace(Some(ptr))));
     f()
 }

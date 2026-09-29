@@ -7350,6 +7350,16 @@ impl PgHandler {
             // field means "the default" rather than NULL, and a column DROPPED
             // and re-ADDED under the same name would resurrect the old values.
             A::AddColumn { column, .. } => {
+                if let Some(expr) = column.default_expr() {
+                    let sql = format!("SELECT ({expr})::{}", column.pg_type);
+                    let field = column.field();
+                    return self.rewrite_rows(table, |d| {
+                        let value = self.eval_constant_sql(&sql)?;
+                        let stored = secantus_pgplan::carry_subms(d, &field, value);
+                        d.insert(field.clone(), stored);
+                        Ok(())
+                    });
+                }
                 let value = column.default.clone().unwrap_or(Bson::Null);
                 self.rewrite_rows(table, |d| {
                     d.insert(column.field(), value.clone());
@@ -7591,7 +7601,7 @@ impl PgHandler {
             return Bson::String(format!("nextval('{seq}'::regclass)"));
         }
         if let Some(expr) = c.default_expr() {
-            return Bson::String(expr.to_string());
+            return Bson::String(Self::render_default_expr(expr));
         }
         match c.default.as_ref() {
             None | Some(Bson::Null) => Bson::Null,
@@ -7605,6 +7615,35 @@ impl PgHandler {
                 secantus_pgplan::numeric::numeric_text(other).unwrap_or_else(|| format!("{other}")),
             ),
         }
+    }
+
+    /// A stored expression default as PostgreSQL's catalog prints it: the
+    /// keyword functions in upper case, and a `nextval` argument as the
+    /// `regclass` it is. Anything else is shown as stored.
+    fn render_default_expr(expr: &str) -> String {
+        let out = match expr
+            .strip_prefix("nextval('")
+            .and_then(|rest| rest.strip_suffix("')"))
+        {
+            Some(name) => format!("nextval('{name}'::regclass)"),
+            None => expr.to_string(),
+        };
+        let keywords = [
+            "current_date",
+            "current_timestamp",
+            "current_time",
+            "localtimestamp",
+            "localtime",
+            "current_user",
+            "session_user",
+            "current_role",
+            "current_catalog",
+            "current_schema",
+        ];
+        if keywords.contains(&out.as_str()) {
+            return out.to_ascii_uppercase();
+        }
+        out
     }
 
     /// `(numeric_precision, numeric_scale, character_maximum_length)` from a
@@ -7834,7 +7873,10 @@ impl PgHandler {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(name.to_string(), value);
-        *self.session_lastval.lock().unwrap_or_else(|e| e.into_inner()) = Some(value);
+        *self
+            .session_lastval
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(value);
     }
 
     /// A sequence function reached inside an EXPRESSION (`values
@@ -7885,7 +7927,9 @@ impl PgHandler {
                         "lastval is not yet defined in this session".into(),
                     )))
                 }),
-            other => Err(Self::err(&PlanError::Unsupported(format!("function {other}()")))),
+            other => Err(Self::err(&PlanError::Unsupported(format!(
+                "function {other}()"
+            )))),
         }
     }
 
@@ -7893,9 +7937,10 @@ impl PgHandler {
     /// the planner makes into the executor.
     fn to_plan_error(e: PgWireError) -> PlanError {
         match e {
-            PgWireError::UserError(info) => {
-                PlanError::Sqlstate(Box::leak(info.code.clone().into_boxed_str()), info.message.clone())
-            }
+            PgWireError::UserError(info) => PlanError::Sqlstate(
+                Box::leak(info.code.clone().into_boxed_str()),
+                info.message.clone(),
+            ),
             other => PlanError::Internal(other.to_string()),
         }
     }
@@ -9898,6 +9943,33 @@ impl PgHandler {
             }
         }
         Ok(())
+    }
+
+    /// The single value of a constant `SELECT`, planned and run as the
+    /// executing statement (so `nextval` draws, once).
+    fn eval_constant_sql(&self, sql: &str) -> PgWireResult<Bson> {
+        let tz = self.session_timezone();
+        let run = |stmt: &Statement| self.subquery_rows(stmt);
+        let stmt = self
+            .with_executor_hooks(|| {
+                secantus_pgplan::planning_to_execute(|| {
+                    secantus_pgplan::plan_with_session_types_and_subqueries(
+                        sql,
+                        &|n| self.lookup(n),
+                        &[],
+                        &[],
+                        &tz,
+                        Some(&run),
+                    )
+                })
+            })
+            .map_err(|e| Self::err(&e))?;
+        let rows = self.with_executor_hooks(|| self.query_rows(&stmt))?;
+        Ok(rows
+            .into_iter()
+            .next()
+            .and_then(|r| r.into_iter().next().flatten())
+            .unwrap_or(Bson::Null))
     }
 
     /// Fill each omitted column whose DEFAULT is an EXPRESSION (`now()`,
