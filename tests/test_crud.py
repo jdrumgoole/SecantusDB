@@ -5723,3 +5723,108 @@ def test_plain_failcommand_does_not_stamp_resumable_label(client) -> None:
         db["c"].insert_one({"x": 2})
         with pytest.raises(PyMongoError):
             stream.next()
+
+
+# ---------------------------------------------------------------------------
+# $where: the refusal a server with no script engine gives
+# ---------------------------------------------------------------------------
+
+_WHERE = {"$where": "function() { return true; }"}
+# Measured off `mongod --noscripting` 8.2.11, 2026-09-29. Pinned against a live
+# one by tests/test_mongod_differential.py; repeated here so the claim is also
+# checked on a box with no mongod, where that gate skips.
+_NO_SCRIPT = (6108304, "Location6108304", "no globalScriptEngine in $where parsing")
+
+
+@pytest.mark.parametrize(
+    ("label", "command"),
+    [
+        ("find", {"find": "c", "filter": _WHERE}),
+        ("find nested in $or", {"find": "c", "filter": {"$or": [_WHERE]}}),
+        ("count", {"count": "c", "query": _WHERE}),
+        ("distinct", {"distinct": "c", "key": "x", "query": _WHERE}),
+        ("findAndModify", {"findAndModify": "c", "query": _WHERE, "remove": True}),
+    ],
+)
+def test_where_is_refused_like_a_scriptless_mongod(client, label, command) -> None:
+    """Every read-ish command that takes a filter answers mongod's own error."""
+    from pymongo.errors import OperationFailure
+
+    db = client["wheredb"]
+    db.c.insert_one({"x": 1})
+    with pytest.raises(OperationFailure) as caught:
+        db.command(command)
+    d = caught.value.details
+    assert (d["code"], d["codeName"], d["errmsg"]) == _NO_SCRIPT, f"{label}: {d}"
+
+
+@pytest.mark.parametrize(
+    ("label", "command"),
+    [
+        ("delete", {"delete": "c", "deletes": [{"q": _WHERE, "limit": 0}]}),
+        ("update", {"update": "c", "updates": [{"q": _WHERE, "u": {"$set": {"y": 1}}}]}),
+    ],
+)
+def test_where_in_a_write_command_reports_per_statement(client, label, command) -> None:
+    """The two batch writes report in ``writeErrors`` with ``ok: 1``.
+
+    mongod's shape for a write whose filter is bad -- the same split the
+    ``hint`` refusal has -- and there is no ``codeName`` inside the entry.
+    """
+    db = client["wheredb"]
+    db.c.insert_one({"x": 1})
+    reply = db.command(command)
+    assert reply["ok"] == 1, f"{label}: {reply}"
+    entry = reply["writeErrors"][0]
+    assert (entry["code"], entry["errmsg"]) == (_NO_SCRIPT[0], _NO_SCRIPT[2]), f"{label}: {entry}"
+    assert "codeName" not in entry, f"{label}: {entry}"
+
+
+@pytest.mark.parametrize(
+    ("label", "match"),
+    [
+        ("top level", _WHERE),
+        ("nested in $or", {"$or": [_WHERE]}),
+        ("double nested", {"$and": [{"$or": [_WHERE]}]}),
+    ],
+)
+def test_where_in_aggregate_match_is_a_context_error(client, label, match) -> None:
+    """``$where`` in a ``$match`` is code 2, a pipeline rule not a scripting one.
+
+    mongod answers identically with JavaScript on and off, so this is a
+    different refusal from the one above and must not be folded into it.
+    "top level" is the position that regressed: the leading ``$match`` is
+    lifted into the fetch filter, so without a parse-time check it picked up
+    the query-context refusal while every other position answered code 2.
+    """
+    from pymongo.errors import OperationFailure
+
+    db = client["wheredb"]
+    db.c.insert_one({"x": 1})
+    with pytest.raises(OperationFailure) as caught:
+        db.command({"aggregate": "c", "pipeline": [{"$match": match}], "cursor": {}})
+    d = caught.value.details
+    assert (d["code"], d["codeName"], d["errmsg"]) == (
+        2,
+        "BadValue",
+        "$where is not allowed in this context",
+    ), f"{label}: {d}"
+
+
+def test_where_is_refused_on_an_empty_collection(client) -> None:
+    """Parse-time, so an empty and a nonexistent collection both refuse.
+
+    Without this, a filter our matcher rejects would return an empty cursor
+    instead of an error whenever there was nothing to examine -- which is how a
+    client learns the query was accepted when it was not.
+    """
+    from pymongo.errors import OperationFailure
+
+    db = client["whereemptydb"]
+    for coll in ("never_created", "emptied"):
+        if coll == "emptied":
+            db[coll].insert_one({"x": 1})
+            db[coll].delete_many({})
+        with pytest.raises(OperationFailure) as caught:
+            db.command({"find": coll, "filter": _WHERE})
+        assert caught.value.details["code"] == _NO_SCRIPT[0], coll

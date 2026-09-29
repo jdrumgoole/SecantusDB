@@ -7,6 +7,13 @@ __pycache__/
 .venv
 .venv/
 venv/
+# A worktree's throwaway test venv. It belongs here rather than in
+# `.git/info/exclude`: inside a worktree `.git` is a FILE, so the usual
+# `echo .venv-test/ >> .git/info/exclude` fails with "Not a directory" and the
+# venv is left trackable — which is exactly where `git add -A` picks up a few
+# hundred MB of site-packages.
+.venv-test/
+.venv-t/
 .env
 
 # Never commit private keys / certs / keystores — a safety net so a stray

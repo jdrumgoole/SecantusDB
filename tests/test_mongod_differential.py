@@ -30,7 +30,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 
@@ -173,12 +173,17 @@ def _stop_mongod(proc: subprocess.Popen, dbpath: str) -> None:
     )
 
 
-def _start_mongod(env: Mapping[str, str] | None = None) -> tuple[subprocess.Popen, str, str]:
+def _start_mongod(
+    env: Mapping[str, str] | None = None,
+    extra_args: Sequence[str] = (),
+) -> tuple[subprocess.Popen, str, str]:
     """Spawn a throwaway standalone mongod; return ``(proc, uri, dbpath)``.
 
-    Shared by the module fixture below and by the per-zone local-time cases at
-    the end of this file, which need identical readiness handling but a
-    DIFFERENT process environment. The caller owns the teardown.
+    Shared by the module fixture below, by the per-zone local-time cases at
+    the end of this file (identical readiness handling, a DIFFERENT process
+    environment), and by the ``--noscripting`` fixture (same again, different
+    ARGV) -- ``extra_args`` is appended to the command line for that last one.
+    The caller owns the teardown.
     """
     tmp = tempfile.mkdtemp(prefix="differential-mongod-")
     port = _free_port()
@@ -193,7 +198,7 @@ def _start_mongod(env: Mapping[str, str] | None = None) -> tuple[subprocess.Pope
     with contextlib.suppress(OSError):
         log = open(_mongod_log(tmp), "wb")  # noqa: SIM115 - closed with the proc
     proc = subprocess.Popen(
-        [MONGOD, "--port", str(port), "--dbpath", tmp, "--quiet"],
+        [MONGOD, "--port", str(port), "--dbpath", tmp, "--quiet", *extra_args],
         stdout=log,
         stderr=subprocess.STDOUT,
         env=None if env is None else dict(env),
@@ -261,6 +266,25 @@ def mongod_uri() -> Iterator[str]:
     if MONGOD is None:
         pytest.skip("no mongod on PATH")
     proc, uri, tmp = _start_mongod()
+    try:
+        yield uri
+    finally:
+        _stop_mongod(proc, tmp)
+
+
+@pytest.fixture(scope="module")
+def mongod_noscripting_uri() -> Iterator[str]:
+    """A throwaway mongod with NO JavaScript engine (``--noscripting``).
+
+    SecantusDB embeds no script engine, so this -- not the default mongod -- is
+    the reference for what ``$where`` must answer. The default mongod EXECUTES
+    the JavaScript, so comparing our refusal against it would assert the wrong
+    thing; spawning the configuration we actually resemble keeps the claim
+    honest and lets the gate catch a drift in mongod's own refusal.
+    """
+    if MONGOD is None:
+        pytest.skip("no mongod on PATH")
+    proc, uri, tmp = _start_mongod(extra_args=("--noscripting",))
     try:
         yield uri
     finally:
@@ -3863,3 +3887,137 @@ def test_stop_mongod_is_quiet_for_a_server_it_stopped_itself(tmp_path: Path) -> 
 
     assert live.poll() is not None, "the harness must actually stop the process"
     assert not dbpath.exists(), "the dbpath should be reclaimed on the normal path"
+
+
+# ---------------------------------------------------------------------------
+# $where: the refusal a server with no script engine gives
+# ---------------------------------------------------------------------------
+
+_WHERE = {"$where": "function() { return true; }"}
+
+# Every command that takes a query filter, and what shape its refusal has.
+# `writeErrors` is mongod's per-statement form for the two batch write
+# commands -- `ok: 1` with the error inside -- the same split the `hint`
+# refusal already has.
+_WHERE_COMMANDS: list[tuple[str, dict, str]] = [
+    ("find", {"find": "c", "filter": _WHERE}, "error"),
+    ("find nested in $or", {"find": "c", "filter": {"$or": [_WHERE]}}, "error"),
+    ("count", {"count": "c", "query": _WHERE}, "error"),
+    ("distinct", {"distinct": "c", "key": "x", "query": _WHERE}, "error"),
+    ("findAndModify", {"findAndModify": "c", "query": _WHERE, "remove": True}, "error"),
+    ("delete", {"delete": "c", "deletes": [{"q": _WHERE, "limit": 0}]}, "writeErrors"),
+    (
+        "update",
+        {"update": "c", "updates": [{"q": _WHERE, "u": {"$set": {"y": 1}}}]},
+        "writeErrors",
+    ),
+]
+
+
+def _where_answer(uri: str, command: dict) -> tuple[object, object, object, str]:
+    """``(code, codeName, errmsg, shape)`` for one ``$where`` command."""
+    from pymongo import MongoClient
+
+    client = MongoClient(uri, serverSelectionTimeoutMS=10000)
+    try:
+        db = client.wheredifferential
+        db.c.drop()
+        db.c.insert_one({"x": 1})
+        try:
+            reply = db.command(command)
+        except Exception as exc:  # noqa: BLE001 - comparing the error IS the test
+            d = getattr(exc, "details", {}) or {}
+            return (d.get("code"), d.get("codeName"), d.get("errmsg"), "error")
+        write_errors = reply.get("writeErrors") or []
+        if write_errors:
+            e = write_errors[0]
+            return (e.get("code"), e.get("codeName"), e.get("errmsg"), "writeErrors")
+        return (None, None, None, "accepted")
+    finally:
+        client.close()
+
+
+@requires_mongod
+@pytest.mark.parametrize(("label", "command", "expected_shape"), _WHERE_COMMANDS)
+def test_where_refusal_matches_a_scriptless_mongod(
+    label: str,
+    command: dict,
+    expected_shape: str,
+    secantus_uri: str,
+    mongod_noscripting_uri: str,
+) -> None:
+    """``$where`` must answer what a mongod with no script engine answers.
+
+    The reference here is deliberately ``mongod --noscripting`` and NOT the
+    default mongod: SecantusDB embeds no JavaScript engine, and a default
+    mongod EXECUTES the function, so it cannot say what our refusal should
+    look like. ``--noscripting`` is a supported mongod configuration with
+    exactly our property, which makes its answer -- 6108304 /
+    ``Location6108304`` / "no globalScriptEngine in $where parsing" -- a real
+    server's error surface rather than one we invented.
+
+    Before this gate both servers answered a generic code 2: the Rust one with
+    "query uses a construct the Rust server does not support" (our
+    implementation leaking onto the wire) and the Python one with "unknown top
+    level operator: $where", which is wrong twice over -- mongod knows $where
+    perfectly well.
+
+    ``codeName`` is compared, not just ``code``. A code-and-message comparison
+    passed while the Rust server was sending the bare sentinel ``"Location"``
+    and the Python server ``"BadValue"``, both under a correct 6108304.
+    """
+    mine = _where_answer(secantus_uri, command)
+    theirs = _where_answer(mongod_noscripting_uri, command)
+    assert theirs[3] == expected_shape, (
+        f"{label}: reference shape changed -- expected {expected_shape}, got {theirs[3]}. "
+        "Re-probe before trusting the rest of this case."
+    )
+    assert mine == theirs, f"{label}:\n  secantus={mine}\n  mongod  ={theirs}"
+
+
+@requires_mongod
+@pytest.mark.parametrize(
+    ("label", "match"),
+    [
+        ("top level", _WHERE),
+        ("nested in $or", {"$or": [_WHERE]}),
+        ("double nested", {"$and": [{"$or": [_WHERE]}]}),
+    ],
+)
+def test_where_in_aggregate_match_is_a_context_error(
+    label: str, match: dict, secantus_uri: str, mongod_uri: str
+) -> None:
+    """``$where`` inside ``$match`` is an aggregation-context error, code 2.
+
+    This one uses the DEFAULT mongod on purpose: the refusal is independent of
+    scripting -- measured identical on 8.2.11 with JavaScript enabled and under
+    ``--noscripting`` (2026-09-29) -- so it is a pipeline rule and not the
+    script-engine refusal above. Folding the two together would answer 6108304
+    here, which is why they are separate tests.
+
+    It must also be refused at PARSE time, ahead of the leading-``$match``
+    lift: once lifted into the fetch filter it goes through the query matcher
+    and picks up the query-context refusal instead. That made the first stage
+    disagree with every other position, which is what "top level" pins.
+    """
+    from pymongo import MongoClient
+
+    def answer(uri: str) -> tuple[object, object, object]:
+        client = MongoClient(uri, serverSelectionTimeoutMS=10000)
+        try:
+            db = client.wheredifferential
+            db.c.drop()
+            db.c.insert_one({"x": 1})
+            try:
+                db.command({"aggregate": "c", "pipeline": [{"$match": match}], "cursor": {}})
+                return ("accepted", None, None)
+            except Exception as exc:  # noqa: BLE001 - comparing the error IS the test
+                d = getattr(exc, "details", {}) or {}
+                return (d.get("code"), d.get("codeName"), d.get("errmsg"))
+        finally:
+            client.close()
+
+    mine = answer(secantus_uri)
+    theirs = answer(mongod_uri)
+    assert theirs[0] == 2, f"{label}: reference no longer answers code 2, got {theirs}"
+    assert mine == theirs, f"{label}:\n  secantus={mine}\n  mongod  ={theirs}"

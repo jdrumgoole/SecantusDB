@@ -135,7 +135,18 @@ fn match_clause_raw(
             let doc: Document = raw.try_into().map_err(|_| Fallback::Defer)?;
             match_clause(&doc, key, cond, vars, coll)
         }
-        // $where, $text, ... -> Python.
+        // $where runs user JavaScript. SecantusDB embeds no script engine, and
+        // mongod has a supported configuration with the same property --
+        // `--noscripting` -- which refuses $where with exactly this code and
+        // message (measured 8.2.11, 2026-09-29). Refusing as that mongod does
+        // keeps the Rust server on a real mongod's error surface; `Defer` sent
+        // it to the generic "construct the Rust server does not support"
+        // BadValue, which is our implementation leaking onto the wire.
+        "$where" => Err(Fallback::mongo(
+            6108304,
+            "no globalScriptEngine in $where parsing",
+        )),
+        // $text, ... -> Python.
         _ if key.starts_with('$') => Err(Fallback::Defer),
         _ => {
             let reached = resolve_path_raw(raw, key)?;
@@ -256,7 +267,18 @@ fn match_clause(
             Ok(expressions::truthy(&value))
         }
         "$jsonSchema" => validate_json_schema(&Bson::Document(doc.clone()), cond),
-        // $where, $text, ... -> Python.
+        // $where runs user JavaScript. SecantusDB embeds no script engine, and
+        // mongod has a supported configuration with the same property --
+        // `--noscripting` -- which refuses $where with exactly this code and
+        // message (measured 8.2.11, 2026-09-29). Refusing as that mongod does
+        // keeps the Rust server on a real mongod's error surface; `Defer` sent
+        // it to the generic "construct the Rust server does not support"
+        // BadValue, which is our implementation leaking onto the wire.
+        "$where" => Err(Fallback::mongo(
+            6108304,
+            "no globalScriptEngine in $where parsing",
+        )),
+        // $text, ... -> Python.
         _ if key.starts_with('$') => Err(Fallback::Defer),
         _ => field_matches(&resolve_path(doc, key), cond, coll, key),
     }

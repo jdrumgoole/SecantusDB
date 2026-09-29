@@ -121,6 +121,23 @@ def _match_clause(
                 code=9,
                 code_name="FailedToParse",
             ) from exc
+    if key == "$where":
+        # $where runs user JavaScript, which needs a script engine SecantusDB
+        # does not embed. mongod has a supported configuration with the same
+        # property -- `--noscripting` -- and refuses $where there with this
+        # exact code and message (measured 8.2.11, 2026-09-29). Answering as a
+        # --noscripting mongod does keeps us on a real mongod's error surface
+        # rather than inventing one; `unknown top level operator` was wrong
+        # twice over, because mongod knows $where perfectly well.
+        raise QueryError(
+            "no globalScriptEngine in $where parsing",
+            code=6108304,
+            # 6108304 has no symbolic name, so mongod renders the generic
+            # `Location<n>`. QueryError's default is BadValue, which would be
+            # a silent codeName divergence under a matching `code` -- the half
+            # a code-and-message comparison cannot see.
+            code_name="Location6108304",
+        )
     if key.startswith("$"):
         raise QueryError(
             f"unknown top level operator: {key}. If you have a field name that "

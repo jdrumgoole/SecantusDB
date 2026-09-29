@@ -107,6 +107,12 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     if let Err(e) = validate_stage_names(&pipeline) {
         return Ok(e.into_reply());
     }
+    // `$where` in a `$match` is refused with the aggregation-context code on
+    // every mongod, script engine or not -- and it must be refused before the
+    // leading-`$match` lift hands the filter to the query matcher.
+    if let Err(e) = validate_no_where_in_match(&pipeline) {
+        return Ok(e.into_reply());
+    }
     // A missing REQUIRED argument is a parse error too, and mongod names the
     // stage the same way. Must precede the check below, which only knows about
     // unknown operator names.
@@ -644,6 +650,41 @@ fn unknown_expr_error(stage: Option<&str>, op: &str) -> CommandError {
         None => message,
     };
     CommandError::new(168, crate::util::error_code_name(168), message)
+}
+
+/// Refuse `$where` inside any `$match` stage, at aggregate PARSE time.
+///
+/// This is an aggregation-CONTEXT rule, not a scripting one: mongod answers
+/// code 2 `$where is not allowed in this context` whether or not it has a
+/// script engine (measured 8.2.11 both ways, 2026-09-29), so it is a DIFFERENT
+/// refusal from the one a plain `find` gets (6108304, see `query.rs`) and must
+/// not be folded into it.
+///
+/// Parse-time on purpose, and it has to run before `lift_leading_match`: once
+/// the leading `$match` is lifted into the fetch filter it goes through the
+/// query matcher, which answers the query-context refusal instead. A
+/// non-leading `$match` already answered code 2, so this closes an asymmetry
+/// between the first stage and every other one.
+fn validate_no_where_in_match(pipeline: &[Bson]) -> Result<(), CommandError> {
+    fn scan(value: &Bson) -> bool {
+        match value {
+            Bson::Document(d) => d.iter().any(|(k, v)| k == "$where" || scan(v)),
+            Bson::Array(a) => a.iter().any(scan),
+            _ => false,
+        }
+    }
+    for stage in pipeline {
+        if let Some(Bson::Document(spec)) = stage.as_document().and_then(|d| d.get("$match")) {
+            if scan(&Bson::Document(spec.clone())) {
+                return Err(CommandError::new(
+                    2,
+                    "BadValue",
+                    "$where is not allowed in this context",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_stage_names(pipeline: &[Bson]) -> Result<(), CommandError> {

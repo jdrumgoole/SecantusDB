@@ -2385,3 +2385,109 @@ def test_checkpoint_seconds_kwarg_accepted(tmp_path, monkeypatch) -> None:
         assert _client(srv)["t"]["c"].count_documents({}) == 10
     finally:
         srv.stop()
+
+
+# The refusal a server with no JavaScript engine gives, measured off
+# `mongod --noscripting` 8.2.11 on 2026-09-29. The default mongod EXECUTES the
+# function, so it cannot be the reference for a refusal -- see
+# `tests/test_mongod_differential.py::test_where_refusal_matches_a_scriptless_mongod`,
+# which pins these same values against a live `--noscripting` mongod. This copy
+# exists because the differential gate drives the PYTHON server, so nothing
+# there would notice the Rust server drifting.
+_NO_SCRIPT_ENGINE = (6108304, "Location6108304", "no globalScriptEngine in $where parsing")
+_WHERE_FILTER = {"$where": "function() { return true; }"}
+
+
+@pytest.mark.parametrize(
+    ("label", "command", "shape"),
+    [
+        ("find", {"find": "c", "filter": _WHERE_FILTER}, "error"),
+        ("find nested in $or", {"find": "c", "filter": {"$or": [_WHERE_FILTER]}}, "error"),
+        ("count", {"count": "c", "query": _WHERE_FILTER}, "error"),
+        ("distinct", {"distinct": "c", "key": "x", "query": _WHERE_FILTER}, "error"),
+        (
+            "findAndModify",
+            {"findAndModify": "c", "query": _WHERE_FILTER, "remove": True},
+            "error",
+        ),
+        (
+            "delete",
+            {"delete": "c", "deletes": [{"q": _WHERE_FILTER, "limit": 0}]},
+            "writeErrors",
+        ),
+        (
+            "update",
+            {"update": "c", "updates": [{"q": _WHERE_FILTER, "u": {"$set": {"y": 1}}}]},
+            "writeErrors",
+        ),
+    ],
+)
+def test_where_refuses_like_a_scriptless_mongod(tmp_path, label, command, shape) -> None:
+    """``$where`` is refused with mongod's own no-script-engine error.
+
+    ``codeName`` is asserted, not just ``code``: the Rust server sent the bare
+    sentinel ``"Location"`` under a correct 6108304 until 2026-09-29, and a
+    comparison that looked only at code and message passed while it did.
+
+    The two batch write commands report per-statement in ``writeErrors`` with
+    ``ok: 1`` -- mongod's shape for a write whose filter is bad, the same split
+    the ``hint`` refusal has -- and carry no ``codeName`` there.
+    """
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        db = _client(srv)["t"]
+        db.c.insert_one({"x": 1})
+        code, code_name, errmsg = _NO_SCRIPT_ENGINE
+        if shape == "writeErrors":
+            reply = db.command(command)
+            assert reply["ok"] == 1, f"{label}: expected ok:1 with writeErrors, got {reply}"
+            entry = reply["writeErrors"][0]
+            assert entry["code"] == code, f"{label}: {entry}"
+            assert entry["errmsg"] == errmsg, f"{label}: {entry}"
+            assert "codeName" not in entry, (
+                f"{label}: mongod carries no codeName inside writeErrors, got {entry}"
+            )
+        else:
+            with pytest.raises(pymongo.errors.OperationFailure) as caught:
+                db.command(command)
+            details = caught.value.details
+            assert (details["code"], details["codeName"], details["errmsg"]) == (
+                code,
+                code_name,
+                errmsg,
+            ), f"{label}: {details}"
+    finally:
+        srv.stop()
+
+
+@pytest.mark.parametrize(
+    ("label", "match"),
+    [
+        ("top level", _WHERE_FILTER),
+        ("nested in $or", {"$or": [_WHERE_FILTER]}),
+        ("double nested", {"$and": [{"$or": [_WHERE_FILTER]}]}),
+    ],
+)
+def test_where_in_aggregate_match_is_a_context_error(tmp_path, label, match) -> None:
+    """``$where`` in a ``$match`` is code 2, not the script-engine refusal.
+
+    mongod answers this identically with JavaScript enabled and disabled, so it
+    is a pipeline rule rather than a scripting one. "top level" is the case that
+    regressed first: the leading ``$match`` is lifted into the fetch filter, so
+    without a parse-time check it picked up the query-context refusal (6108304)
+    while every other position answered code 2.
+    """
+    srv = _server.RustServer(str(tmp_path / "wt"), 0)
+    try:
+        db = _client(srv)["t"]
+        db.c.insert_one({"x": 1})
+        with pytest.raises(pymongo.errors.OperationFailure) as caught:
+            db.command({"aggregate": "c", "pipeline": [{"$match": match}], "cursor": {}})
+        details = caught.value.details
+        assert (details["code"], details["codeName"], details["errmsg"]) == (
+            2,
+            "BadValue",
+            "$where is not allowed in this context",
+        ), f"{label}: {details}"
+    finally:
+        srv.stop()
