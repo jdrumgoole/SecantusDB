@@ -122,6 +122,7 @@ const SCALAR_NAMES: &[&str] = &[
     "overlay",
     "quote_literal",
     "quote_nullable",
+    "normalize",
     "regexp_split_to_array",
     "unistr",
     "convert_from",
@@ -909,6 +910,33 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
             need(1)?;
             Ok(Bson::String(unistr(&s(0))?))
         }
+        // `normalize(text [, form])` -- Unicode normalisation, NFC by default.
+        // The form arrives as an ordinary string constant (`NFD` and friends
+        // are grammar keywords, so an unknown one is a SYNTAX error before it
+        // ever reaches here, and needs no check).
+        "normalize" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(wrong_args(name));
+            }
+            use unicode_normalization::UnicodeNormalization;
+            let subject = s(0);
+            let form = if args.len() == 2 {
+                s(1).to_ascii_uppercase()
+            } else {
+                "NFC".to_string()
+            };
+            Ok(Bson::String(match form.as_str() {
+                "NFC" => subject.nfc().collect(),
+                "NFD" => subject.nfd().collect(),
+                "NFKC" => subject.nfkc().collect(),
+                "NFKD" => subject.nfkd().collect(),
+                other => {
+                    return Err(Error::InvalidParameter(format!(
+                        "invalid normalization form: {other}"
+                    )))
+                }
+            }))
+        }
         // `convert_from(bytea, encoding)` -- decode stored bytes as text.
         "convert_from" => {
             need(2)?;
@@ -1473,7 +1501,7 @@ pub fn static_result_type(name: &str) -> &'static str {
         "sqrt" | "exp" | "ln" | "log" | "log10" | "power" | "pow" | "sign" => "float8",
         "starts_with" => "bool",
         "lpad" | "rpad" | "to_hex" | "translate" | "overlay" | "quote_literal"
-        | "quote_nullable" | "unistr" | "convert_from" => "text",
+        | "quote_nullable" | "unistr" | "convert_from" | "normalize" => "text",
         "regexp_split_to_array" => "text[]",
         "set_byte" | "decode" => "bytea",
         "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp" => {

@@ -35,3 +35,9 @@ SELECT unistr('d\0061t\+000061'), unistr('\\'), unistr('a\0062')
 SELECT unistr('\x')
 # --- encoding
 SELECT convert_from('\x616263'::bytea,'UTF8'), convert_from('abc'::bytea,'LATIN1')
+# --- normalize
+SELECT normalize(U&'\00E1'), normalize(U&'\00E1', NFD) = U&'\0061\0301'
+SELECT length(normalize(U&'\00E1', NFD)), length(normalize(U&'\0061\0301', NFC))
+SELECT normalize(U&'\FB01', NFKC), normalize(U&'\FB01', NFKD), normalize(U&'\FB01', NFC)
+SELECT normalize(NULL), normalize('abc'), normalize('') = ''
+SELECT normalize(t), normalize(t, NFD) FROM s10 WHERE id=1

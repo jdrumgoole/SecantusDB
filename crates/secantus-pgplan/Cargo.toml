@@ -10,6 +10,13 @@ license = "Apache-2.0"
 # measured client sends.
 regex = "1"
 
+# `normalize(text [, form])`. Unicode normalisation is TABLE-driven -- the
+# composition and decomposition mappings are data, not an algorithm -- so there
+# is no honest way to approximate it in a few lines. Half-implementing it (say,
+# ASCII passthrough) would answer most inputs correctly and a minority
+# silently wrongly, which is the divergence shape this project refuses.
+unicode-normalization = "0.1"
+
 bson = "2"
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 # The IANA tz database, for `timestamptz`: PostgreSQL interprets a zone-less

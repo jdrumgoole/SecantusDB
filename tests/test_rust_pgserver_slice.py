@@ -12880,3 +12880,35 @@ def test_a_set_returning_function_as_a_bare_target(home: Path) -> None:
         assert cur.fetchall() == [(1,), (2,)]
         cur.execute("SELECT generate_subscripts(ARRAY[5,6,7], 1)")
         assert cur.fetchall() == [(1,), (2,), (3,)]
+
+
+def test_normalize_across_all_four_unicode_forms(home: Path) -> None:
+    r"""`normalize(text [, form])`, defaulting to NFC.
+
+    Unicode normalisation is TABLE-driven — the composition and decomposition
+    mappings are data, not an algorithm — so this is the one function in the
+    string surface that needed a dependency (`unicode-normalization`) rather
+    than a few lines. Approximating it would have answered most inputs right
+    and a minority silently wrong.
+
+    The form arrives as an ordinary string constant: `NFD` and friends are
+    grammar keywords, so an unknown one is a syntax error before it reaches
+    the evaluator.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        # NFD decomposes a precomposed character; NFC recomposes it.
+        cur.execute(
+            r"SELECT normalize(U&'\00E1', NFD) = U&'\0061\0301',"
+            r" length(normalize(U&'\00E1', NFD)),"
+            r" length(normalize(U&'\0061\0301', NFC))"
+        )
+        assert cur.fetchall() == [(True, 2, 1)]
+        # The COMPATIBILITY forms fold a ligature; the canonical ones do not.
+        cur.execute(
+            r"SELECT normalize(U&'\FB01', NFKC), normalize(U&'\FB01', NFKD),"
+            r" normalize(U&'\FB01', NFC)"
+        )
+        assert cur.fetchall() == [("fi", "fi", "ﬁ")]
+        cur.execute("SELECT normalize(NULL), normalize('abc'), normalize('') = ''")
+        assert cur.fetchall() == [(None, "abc", True)]
