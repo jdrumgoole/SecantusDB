@@ -155,6 +155,10 @@ const SCALAR_NAMES: &[&str] = &[
     "log10",
     "power",
     "pow",
+    "scale",
+    "numeric_send",
+    "min_scale",
+    "trim_scale",
     "mod",
     "sign",
     "div",
@@ -1028,8 +1032,12 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         "abs" => {
             need(1)?;
             Ok(match arg(0) {
-                Bson::Int32(i) => Bson::Int32(i.abs()),
-                Bson::Int64(i) => Bson::Int64(i.abs()),
+                Bson::Int32(i) => Bson::Int32(i.checked_abs().ok_or_else(|| {
+                    Error::NumericOutOfRange("integer out of range".into())
+                })?),
+                Bson::Int64(i) => Bson::Int64(i.checked_abs().ok_or_else(|| {
+                    Error::NumericOutOfRange("bigint out of range".into())
+                })?),
                 Bson::Double(d) => Bson::Double(d.abs()),
                 v if crate::is_numeric(&v) => {
                     let t = crate::numeric_text(&v).unwrap_or_default();
@@ -1058,6 +1066,37 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
             })
         }
         "ceil" | "ceiling" | "floor" | "trunc" | "round" => numeric_rounding(name, args),
+        // Over a `numeric` argument these are numeric functions, with
+        // numeric.c's result scales (`numeric_math`); two-argument `log`
+        // exists ONLY over numeric. Otherwise they are the float8 ones.
+        "sqrt" | "exp" | "ln" | "log" | "log10" | "power" | "pow"
+            if (args.iter().any(crate::is_numeric) || (name == "log" && args.len() == 2))
+                && !args.iter().any(|a| matches!(a, Bson::Double(_))) =>
+        {
+            if args.contains(&Bson::Null) {
+                return Ok(Bson::Null);
+            }
+            let texts: Option<Vec<String>> =
+                args.iter().map(crate::numeric::numeric_operand_text).collect();
+            let texts = texts.ok_or_else(|| wrong_args(name))?;
+            crate::numeric_math::call(name, &texts).unwrap_or_else(|| Err(wrong_args(name)))
+        }
+        "numeric_send" => {
+            need(1)?;
+            if arg(0) == Bson::Null {
+                return Ok(Bson::Null);
+            }
+            let text = crate::numeric::numeric_operand_text(&arg(0)).ok_or_else(|| wrong_args(name))?;
+            Ok(crate::bytea::to_binary(crate::numeric_math::numeric_send(&text)))
+        }
+        "scale" | "min_scale" | "trim_scale" => {
+            need(1)?;
+            if arg(0) == Bson::Null {
+                return Ok(Bson::Null);
+            }
+            let text = crate::numeric::numeric_operand_text(&arg(0)).ok_or_else(|| wrong_args(name))?;
+            crate::numeric_math::call(name, &[text]).unwrap_or_else(|| Err(wrong_args(name)))
+        }
         "sqrt" | "exp" | "ln" | "log" | "log10" | "power" | "pow" => float_math(name, args),
         "mod" => {
             need(2)?;
@@ -1114,7 +1153,25 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
                     }
                 });
             }
-            Ok(best.unwrap_or(Bson::Null))
+            // The result has the arguments' COMMON type: `least(1, 2.5)` is
+            // the numeric 1, `greatest(1, 2.5::float8)` a float8.
+            let any_double = args.iter().any(|a| matches!(a, Bson::Double(_)));
+            let any_numeric = args.iter().any(crate::is_numeric);
+            let any_int64 = args.iter().any(|a| matches!(a, Bson::Int64(_)));
+            Ok(match best {
+                Some(Bson::Int32(i)) if any_double => Bson::Double(f64::from(i)),
+                Some(Bson::Int64(i)) if any_double => Bson::Double(i as f64),
+                Some(v) if any_double && crate::is_numeric(&v) => Bson::Double(
+                    crate::numeric_text(&v)
+                        .and_then(|t| crate::numeric::numeric_text_to_f64(&t))
+                        .unwrap_or(f64::NAN),
+                ),
+                Some(Bson::Int32(i)) if any_numeric => crate::numeric::numeric_bson(&i.to_string()),
+                Some(Bson::Int64(i)) if any_numeric => crate::numeric::numeric_bson(&i.to_string()),
+                Some(Bson::Int32(i)) if any_int64 => Bson::Int64(i64::from(i)),
+                Some(v) => v,
+                None => Bson::Null,
+            })
         }
         // The catalog-facing functions, which a client calls INSIDE an
         // expression at least as often as on its own: `version() LIKE
@@ -1568,6 +1625,9 @@ pub fn static_result_type(name: &str) -> &'static str {
         | "strpos" | "position" | "ascii" | "get_byte" => "int4",
         "abs" | "ceil" | "ceiling" | "floor" | "round" | "trunc" | "mod" | "div" => "numeric",
         "sqrt" | "exp" | "ln" | "log" | "log10" | "power" | "pow" | "sign" => "float8",
+        "scale" | "min_scale" => "int4",
+        "trim_scale" => "numeric",
+        "numeric_send" => "bytea",
         "starts_with" => "bool",
         "to_number" => "numeric",
         "jsonb_path_exists"

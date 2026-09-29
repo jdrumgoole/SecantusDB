@@ -215,12 +215,33 @@ pub fn float8_text(v: f64) -> String {
         return (if v.is_sign_negative() { "-0" } else { "0" }).to_string();
     }
     // Rust's `{:e}` is the shortest round-trip form: `1.2345678901234568e17`.
-    let sci = format!("{:e}", v.abs());
+    shortest_text(&format!("{:e}", v.abs()), v < 0.0, 15)
+}
+
+/// `float4out`: as [`float8_text`], over the shortest text that round-trips
+/// a FLOAT4, with fixed notation only for exponents in `-4..6` (measured:
+/// `100000` but `1e+06`, `1.234567e+06`, `1.6777216e+07`).
+pub fn float4_text(v: f32) -> String {
+    if v.is_nan() {
+        return "NaN".to_string();
+    }
+    if v.is_infinite() {
+        return (if v > 0.0 { "Infinity" } else { "-Infinity" }).to_string();
+    }
+    if v == 0.0 {
+        return (if v.is_sign_negative() { "-0" } else { "0" }).to_string();
+    }
+    shortest_text(&format!("{:e}", v.abs()), v < 0.0, 6)
+}
+
+/// A shortest-round-trip `{:e}` string in PostgreSQL's layout: fixed notation
+/// for decimal exponents in `-4..fixed_below`, `d.ddde+XX` otherwise.
+fn shortest_text(sci: &str, negative: bool, fixed_below: i32) -> String {
     let (mantissa, exp) = sci.split_once('e').expect("exponent form");
     let exp: i32 = exp.parse().expect("integer exponent");
     let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-    let sign = if v < 0.0 { "-" } else { "" };
-    if !(-4..15).contains(&exp) {
+    let sign = if negative { "-" } else { "" };
+    if !(-4..fixed_below).contains(&exp) {
         let (first, rest) = digits.split_at(1);
         let frac = if rest.is_empty() {
             String::new()

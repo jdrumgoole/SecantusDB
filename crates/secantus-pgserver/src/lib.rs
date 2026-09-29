@@ -16155,6 +16155,11 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
             format!("cannot send {what} as a binary {}", ty.name()),
         )))
     };
+    if matches!(*ty, Type::BIT | Type::VARBIT) {
+        if let Bson::String(bits) = v {
+            return enc.encode_field(&Some(secantus_pgplan::bits::to_wire(bits)));
+        }
+    }
     let as_i64 = |v: &Bson| -> Option<i64> {
         match v {
             Bson::Int32(x) => Some(i64::from(*x)),
@@ -16762,6 +16767,13 @@ fn encode_field_value_inner(
         // Binary datetime output is DateStyle-INDEPENDENT (it is a fixed-width
         // integer, not text), so `ds` is deliberately unused on this path.
         return encode_binary(enc, field.datatype(), v);
+    }
+    // A float4 is carried as the double it rounds to; float4out prints the
+    // SHORTEST text that round-trips the f32 (`0.33333334`), not the f64.
+    if *field.datatype() == Type::FLOAT4 {
+        if let Some(Bson::Double(x)) = v {
+            return enc.encode_field(&Some(secantus_pgplan::geo::float4_text(*x as f32).as_str()));
+        }
     }
     // An inet/cidr COLUMN in TEXT format uses inet_out/cidr_out: inet drops a
     // full-host mask (`/32`, `/128`), cidr keeps it. (A `::text` cast is type
@@ -19120,6 +19132,15 @@ fn decode_parameter(
             }
             // `bytea` is raw bytes on the wire -- stored verbatim as Binary.
             Some(17) => Ok(secantus_pgplan::bytea::to_binary(bytes.to_vec())),
+            // bit / varbit: an int32 bit count and the bits packed MSB-first,
+            // stored as the canonical `0`/`1` text.
+            Some(1560) | Some(1562) => secantus_pgplan::bits::from_wire(bytes)
+                .map(Bson::String)
+                .ok_or_else(|| {
+                    PgHandler::err(&secantus_pgplan::Error::InvalidText(
+                        "invalid binary bit string".into(),
+                    ))
+                }),
             // `uuid` is 16 raw bytes on the wire -> canonical lowercase text
             // (the same value the text path stores).
             Some(2950) => secantus_pgplan::uuid_from_wire(bytes)
@@ -19796,6 +19817,23 @@ impl PgHandler {
                     .lookup(&ins.table)
                     .ok_or_else(|| Self::err(&PlanError::UndefinedTable(ins.table.clone())))?;
                 let returning = ins.returning.as_ref().expect("checked");
+                self.row_schema(&def, &returning.columns, &returning.casts)
+            }
+            // `UPDATE` / `DELETE ... RETURNING` likewise -- without these a
+            // portal Describe answered NoData and the rows that followed had
+            // no RowDescription, which a client rejects outright.
+            Statement::Update(upd) if upd.returning.is_some() => {
+                let def = self
+                    .lookup(&upd.table)
+                    .ok_or_else(|| Self::err(&PlanError::UndefinedTable(upd.table.clone())))?;
+                let returning = upd.returning.as_ref().expect("checked");
+                self.row_schema(&def, &returning.columns, &returning.casts)
+            }
+            Statement::Delete(del) if del.returning.is_some() => {
+                let def = self
+                    .lookup(&del.table)
+                    .ok_or_else(|| Self::err(&PlanError::UndefinedTable(del.table.clone())))?;
+                let returning = del.returning.as_ref().expect("checked");
                 self.row_schema(&def, &returning.columns, &returning.casts)
             }
             // An aggregate over a generated source has no table to look up, and
