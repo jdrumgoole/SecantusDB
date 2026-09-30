@@ -14634,6 +14634,49 @@ def test_statement_and_lock_timeouts(home: Path) -> None:
         assert _fetch(b, "SELECT count(*) FROM lt") == [(0,)]
 
 
+def test_statements_in_a_block_hold_table_locks(home: Path) -> None:
+    """A read or write inside a block holds ACCESS SHARE / ROW EXCLUSIVE to
+    its end: another session's conflicting LOCK waits (55P03 under a
+    lock_timeout), pg_locks lists the hold, a cycle of waits is 40P01, and
+    the aborted side's holds go at once so the other proceeds."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        a.execute("CREATE TABLE lk1 (id int)")
+        a.execute("CREATE TABLE lk2 (id int)")
+        a.execute("BEGIN")
+        a.execute("SELECT count(*) FROM lk1")
+        b.execute("SET lock_timeout = 200")
+        b.execute("BEGIN")
+        assert _sqlstate(b, "LOCK TABLE lk1 IN ACCESS EXCLUSIVE MODE") == "55P03"
+        b.execute("ROLLBACK")
+        assert _fetch(
+            a,
+            "SELECT mode, granted FROM pg_locks WHERE relation = 'lk1'::regclass",
+        ) == [("AccessShareLock", True)]
+        a.execute("INSERT INTO lk1 VALUES (1)")
+        b.execute("BEGIN")
+        assert _sqlstate(b, "LOCK TABLE lk1 IN SHARE MODE") == "55P03"
+        b.execute("ROLLBACK")
+        a.execute("ROLLBACK")
+        b.execute("SET lock_timeout = 0")
+        a.execute("BEGIN")
+        a.execute("SELECT 1 FROM lk1")
+        b.execute("BEGIN")
+        b.execute("SELECT 1 FROM lk2")
+        out: dict[str, str | None] = {}
+        worker = threading.Thread(
+            target=lambda: out.setdefault(
+                "a", _sqlstate(a, "LOCK TABLE lk2 IN ACCESS EXCLUSIVE MODE")
+            )
+        )
+        worker.start()
+        time.sleep(0.3)
+        mine = _sqlstate(b, "LOCK TABLE lk1 IN ACCESS EXCLUSIVE MODE")
+        worker.join(10)
+        assert sorted([str(out.get("a")), str(mine)]) == ["40P01", "None"]
+        a.execute("ROLLBACK")
+        b.execute("ROLLBACK")
+
+
 def test_maintenance_statements_and_cluster(home: Path) -> None:
     """VACUUM / ANALYZE / CHECKPOINT / REINDEX validate what they name, and
     CLUSTER rewrites the table in an index's order, recording it."""

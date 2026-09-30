@@ -26,6 +26,7 @@ mod enum_order;
 pub mod escape_strings;
 pub mod formatting;
 pub mod fts;
+mod func_cast;
 pub mod geo;
 pub mod geom;
 pub mod geometry;
@@ -2623,6 +2624,7 @@ fn parse_tree(sql: &str) -> Result<std::sync::Arc<pg_query::protobuf::ParseResul
     if let Some(tree) = memo.lock().unwrap_or_else(|e| e.into_inner()).get(sql) {
         return Ok(Arc::clone(tree));
     }
+    func_cast::check_numeric_junk(sql)?;
     let tree = Arc::new(pg_query::parse(sql).map_err(parse_error)?.protobuf);
     let mut guard = memo.lock().unwrap_or_else(|e| e.into_inner());
     if guard.len() >= MAX_ENTRIES {
@@ -2641,11 +2643,13 @@ fn parse_one(sql: &str) -> Result<N> {
     if stmts.is_empty() {
         return Err(Error::Parse("empty statement".into()));
     }
-    stmts[0]
+    let mut node = stmts[0]
         .stmt
         .as_ref()
         .and_then(|s| s.node.clone())
-        .ok_or_else(|| Error::Parse("empty statement".into()))
+        .ok_or_else(|| Error::Parse("empty statement".into()))?;
+    func_cast::rewrite(&mut node);
+    Ok(node)
 }
 
 /// Lower one statement. `lookup` resolves a table name to its catalog entry;

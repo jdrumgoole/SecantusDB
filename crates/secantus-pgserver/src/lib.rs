@@ -4863,12 +4863,14 @@ impl PgHandler {
                                     let b = match v.to_ascii_lowercase().as_str() {
                                         "true" | "on" | "yes" | "1" => "true",
                                         "false" | "off" | "no" | "0" => "false",
-                                        _ => return Err(Self::user_error(
-                                            "22023",
-                                            format!(
+                                        _ => {
+                                            return Err(Self::user_error(
+                                                "22023",
+                                                format!(
                                                 "invalid value for boolean option \"{name}\": {v}"
                                             ),
-                                        )),
+                                            ))
+                                        }
                                     };
                                     options.insert(name, b);
                                 }
@@ -5644,8 +5646,12 @@ impl PgHandler {
     /// with what this statement would take on a relation it names (ACCESS
     /// SHARE to read, ROW EXCLUSIVE to write, ACCESS EXCLUSIVE to TRUNCATE).
     /// One atomic load when no table is locked anywhere.
+    ///
+    /// Inside a transaction block the statement also TAKES that mode, held
+    /// to the block's end, so another session's `LOCK` waits for it.
     fn wait_for_table_locks(&self, sql: &str) -> PgWireResult<()> {
-        if !table_locks::any() {
+        let in_block = self.transaction_handle_open();
+        if !in_block && !table_locks::any() {
             return Ok(());
         }
         let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
@@ -5655,9 +5661,22 @@ impl PgHandler {
                 "TRUNCATE" => table_locks::ACCESS_EXCLUSIVE,
                 _ => table_locks::ROW_EXCLUSIVE,
             };
-            table_locks::acquire(&table, pid, mode, false, false, self.lock_wait_poll())?;
+            table_locks::acquire(
+                &table,
+                pid,
+                mode,
+                in_block,
+                false,
+                self.lock_wait_poll(),
+                Self::deadlock_error,
+            )?;
         }
         Ok(())
+    }
+
+    /// PostgreSQL's answer to a lock wait that closes a cycle.
+    fn deadlock_error() -> PgWireError {
+        Self::user_error("40P01", "deadlock detected".into())
     }
 
     /// The (field, descending) keys index `index` of `table` sorts by, for
@@ -5688,6 +5707,20 @@ impl PgHandler {
             .into_iter()
             .find(|ix| ix.get_str("name") == Ok(index));
         if let Some(ix) = stored {
+            // An expression index: sorted on each row's computed key, which
+            // `cluster_table` fills into `__cluster<i>` fields.
+            if let Some((exprs, keys)) = Self::index_expressions(&ix) {
+                return Ok(exprs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| {
+                        let desc = keys
+                            .get(i)
+                            .is_some_and(|k| k.to_ascii_uppercase().contains(" DESC"));
+                        (format!("__cluster{i}"), desc)
+                    })
+                    .collect());
+            }
             let key = ix.get_document("key").map_err(|_| missing())?;
             let mut out = Vec::new();
             for (field, dir) in key {
@@ -5729,6 +5762,26 @@ impl PgHandler {
         }
         let keys = self.cluster_keys(table, index)?;
         let mut docs = self.table_docs(table)?;
+        let expressions = self
+            .storage
+            .list_indexes(self.db(), table)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|ix| ix.get_str("name") == Ok(index))
+            .and_then(|ix| Self::index_expressions(&ix))
+            .map(|(e, _)| e);
+        if let Some(exprs) = &expressions {
+            let planned = exprs
+                .iter()
+                .map(|e| secantus_pgplan::plan_check_expression(e, &def).map_err(|e| Self::err(&e)))
+                .collect::<PgWireResult<Vec<_>>>()?;
+            for d in &mut docs {
+                for (i, expr) in planned.iter().enumerate() {
+                    let v = secantus_pgplan::apply_row_expr(expr, d).map_err(|e| Self::err(&e))?;
+                    d.insert(format!("__cluster{i}"), v);
+                }
+            }
+        }
         docs.sort_by(|a, b| {
             for (field, desc) in &keys {
                 let (x, y) = (
@@ -5751,6 +5804,13 @@ impl PgHandler {
             }
             std::cmp::Ordering::Equal
         });
+        if let Some(exprs) = &expressions {
+            for d in &mut docs {
+                for i in 0..exprs.len() {
+                    d.remove(format!("__cluster{i}"));
+                }
+            }
+        }
         if !docs.is_empty() {
             let out = docs
                 .iter()
@@ -5765,6 +5825,27 @@ impl PgHandler {
         ))?;
         self.execute_statement(record, 0)?;
         Ok(())
+    }
+
+    /// An expression index's `(expressions, key SQL)`, from its stored
+    /// options (at the top level or under `options`, as storage lists them).
+    fn index_expressions(ix: &Document) -> Option<(Vec<String>, Vec<String>)> {
+        let get = |k: &str| {
+            ix.get_array(k)
+                .ok()
+                .or_else(|| {
+                    ix.get_document("options")
+                        .ok()
+                        .and_then(|o| o.get_array(k).ok())
+                })
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+        };
+        let exprs = get("sqlExpressions").filter(|e| !e.is_empty())?;
+        Some((exprs, get("sqlKeys").unwrap_or_default()))
     }
 
     /// 26000 for a prepared statement no PREPARE / Parse made.
@@ -8531,6 +8612,27 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("datacl", "text", false),
                 ],
             )),
+            "pg_locks" => Some(TableDef::new(
+                "pg_locks",
+                vec![
+                    secantus_pgcatalog::Column::new("locktype", "text", false),
+                    secantus_pgcatalog::Column::new("database", "oid", false),
+                    secantus_pgcatalog::Column::new("relation", "oid", false),
+                    secantus_pgcatalog::Column::new("page", "int4", false),
+                    secantus_pgcatalog::Column::new("tuple", "int2", false),
+                    secantus_pgcatalog::Column::new("virtualxid", "text", false),
+                    secantus_pgcatalog::Column::new("transactionid", "xid", false),
+                    secantus_pgcatalog::Column::new("classid", "oid", false),
+                    secantus_pgcatalog::Column::new("objid", "oid", false),
+                    secantus_pgcatalog::Column::new("objsubid", "int2", false),
+                    secantus_pgcatalog::Column::new("virtualtransaction", "text", false),
+                    secantus_pgcatalog::Column::new("pid", "int4", false),
+                    secantus_pgcatalog::Column::new("mode", "text", false),
+                    secantus_pgcatalog::Column::new("granted", "bool", false),
+                    secantus_pgcatalog::Column::new("fastpath", "bool", false),
+                    secantus_pgcatalog::Column::new("waitstart", "timestamptz", false),
+                ],
+            )),
             "pg_stat_activity" => Some(TableDef::new(
                 "pg_stat_activity",
                 vec![
@@ -10122,6 +10224,72 @@ impl PgHandler {
                         d
                     })
                     .collect()
+            }
+            // Table locks (held and awaited) and advisory locks. PostgreSQL
+            // also lists each backend's virtualxid and the fast-path locks
+            // on what the querying statement reads; those have nothing here
+            // to correspond to.
+            "pg_locks" => {
+                let f = |name: &str| def.field_of(name).expect("column");
+                let db_oid = self
+                    .databases
+                    .all(&self.storage)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|i| i.name == self.db())
+                    .map_or(Bson::Null, |i| Bson::Int64(i.oid));
+                let blank = |kind: &str, pid: i32, mode: &str, granted: bool| {
+                    let mut d = Document::new();
+                    for k in [
+                        "database",
+                        "relation",
+                        "page",
+                        "tuple",
+                        "virtualxid",
+                        "transactionid",
+                        "classid",
+                        "objid",
+                        "objsubid",
+                        "waitstart",
+                    ] {
+                        d.insert(f(k), Bson::Null);
+                    }
+                    d.insert(f("locktype"), kind);
+                    d.insert(f("virtualtransaction"), format!("{pid}/1"));
+                    d.insert(f("pid"), Bson::Int32(pid));
+                    d.insert(f("mode"), mode);
+                    d.insert(f("granted"), granted);
+                    d.insert(f("fastpath"), false);
+                    d
+                };
+                let mut rows = Vec::new();
+                let relations = table_locks::snapshot()
+                    .into_iter()
+                    .map(|h| (h, true))
+                    .chain(table_locks::waiting().into_iter().map(|w| (w, false)));
+                for ((table, pid, mode), granted) in relations {
+                    let Some(oid) = self.relation_oid(&table) else {
+                        continue;
+                    };
+                    let mut d = blank("relation", pid, table_locks::mode_name(mode), granted);
+                    d.insert(f("database"), db_oid.clone());
+                    d.insert(f("relation"), Bson::Int64(oid));
+                    rows.push(d);
+                }
+                for ((form, value), pid, shared) in advisory::snapshot() {
+                    let mut d = blank(
+                        "advisory",
+                        pid,
+                        if shared { "ShareLock" } else { "ExclusiveLock" },
+                        true,
+                    );
+                    d.insert(f("database"), db_oid.clone());
+                    d.insert(f("classid"), Bson::Int64((value >> 32) & 0xffff_ffff));
+                    d.insert(f("objid"), Bson::Int64(value & 0xffff_ffff));
+                    d.insert(f("objsubid"), Bson::Int32(if form == 0 { 1 } else { 2 }));
+                    rows.push(d);
+                }
+                rows
             }
             "pg_stat_activity" => {
                 let backends: Vec<(i32, BackendActivity)> = backend_registry()
@@ -14898,6 +15066,18 @@ impl PgHandler {
         {
             self.txn_failed
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+            // An aborted transaction releases its table locks at once, as
+            // PostgreSQL's abort does -- the block still waits for its
+            // ROLLBACK, but no other session waits on it. (Inside a savepoint
+            // the holds stay: ROLLBACK TO may carry on under them.)
+            if self
+                .savepoints
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+            {
+                table_locks::release(self.backend_pid.load(std::sync::atomic::Ordering::Relaxed));
+            }
         }
         // An error anywhere in an extended-protocol statement group -- a
         // `Describe` that cannot resolve the statement as much as an
@@ -20368,8 +20548,15 @@ impl PgHandler {
                     if self.lookup(t).is_none() {
                         return Err(Self::relation_missing(t));
                     }
-                    let got =
-                        table_locks::acquire(t, pid, mode, true, nowait, self.lock_wait_poll())?;
+                    let got = table_locks::acquire(
+                        t,
+                        pid,
+                        mode,
+                        true,
+                        nowait,
+                        self.lock_wait_poll(),
+                        Self::deadlock_error,
+                    )?;
                     if !got {
                         return Err(Self::user_error(
                             "55P03",
