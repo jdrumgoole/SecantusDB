@@ -273,3 +273,54 @@ pub(crate) fn rewrite(node: &mut N) {
         }
     }
 }
+
+/// What parse analysis refuses because it cannot type a value: `$1 IS NULL`
+/// over a parameter the client left untyped is 42P18, and `to_json` /
+/// `to_jsonb` / `array_to_json` of an untyped literal or parameter is 42804
+/// (a polymorphic argument must have a type).
+pub(crate) fn refuse_unresolved(node: &N) -> Result<()> {
+    let untyped_param = |n: &pg_query::protobuf::Node| -> Option<i32> {
+        match n.node.as_ref() {
+            Some(N::ParamRef(p))
+                if declared_param_type(usize::try_from(p.number).unwrap_or(0)).is_none() =>
+            {
+                Some(p.number)
+            }
+            _ => None,
+        }
+    };
+    let untyped_literal = |n: &pg_query::protobuf::Node| {
+        matches!(n.node.as_ref(), Some(N::AConst(c))
+            if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))))
+    };
+    for (n, _, _, _) in node.nodes() {
+        match n {
+            pg_query::NodeRef::NullTest(t) => {
+                if let Some(p) = t.arg.as_deref().and_then(untyped_param) {
+                    return Err(Error::Sqlstate(
+                        "42P18",
+                        format!("could not determine data type of parameter ${p}"),
+                    ));
+                }
+            }
+            pg_query::NodeRef::FuncCall(f)
+                if matches!(
+                    func_name(f).as_deref(),
+                    Some("to_json" | "to_jsonb" | "array_to_json")
+                ) && !correlated::user_function_named(&func_name(f).unwrap_or_default()) =>
+            {
+                if f.args
+                    .first()
+                    .is_some_and(|a| untyped_literal(a) || untyped_param(a).is_some())
+                {
+                    return Err(Error::DatatypeMismatch(
+                        "could not determine polymorphic type because input has type unknown"
+                            .into(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}

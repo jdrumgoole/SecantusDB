@@ -2734,6 +2734,9 @@ pub fn plan_with_subqueries(
     if let Some(st) = instead_of::plan(&node)? {
         return Ok(st);
     }
+    if let Some(inner) = node.node.as_ref() {
+        func_cast::refuse_unresolved(inner)?;
+    }
     let mut params = params.to_vec();
     materialize_dml_ctes(&mut node, lookup, &mut params, run)?;
     rewrite_dml_from(&mut node, lookup)?;
@@ -19204,6 +19207,19 @@ fn split_subms(micros_since_epoch: i64) -> (i64, i32) {
 /// Always resolves the companion -- writing it when there is a remainder and
 /// REMOVING it when there is not -- so a field overwritten with a
 /// whole-millisecond value cannot keep the previous row's microseconds.
+/// A stored field's value with its hidden sub-millisecond remainder folded
+/// back in, as the composite a timestamp expression reads: a cast of a
+/// column (`ts::text`) must see the microseconds the row carries.
+pub fn field_value(doc: &Document, field: &str) -> Bson {
+    let v = doc.get(field).cloned().unwrap_or(Bson::Null);
+    if let (Bson::DateTime(_), Some(Bson::Int32(rem))) = (&v, doc.get(companion_field(field))) {
+        if *rem != 0 {
+            return Bson::Document(doc! { COMPOSITE_DATE: v, COMPOSITE_US: *rem });
+        }
+    }
+    v
+}
+
 pub fn carry_subms(doc: &mut Document, field: &str, value: Bson) -> Bson {
     let companion = companion_field(field);
     if let Bson::Document(d) = &value {
@@ -23917,6 +23933,17 @@ fn coerce_unknown_operand(
             Some(cast_value(Bson::String(text.clone()), "timestamp")?)
         }
         Bson::DateTime(_) => Some(cast_value(Bson::String(text.clone()), "timestamp")?),
+        // Beside a number or a boolean an unknown IS that type -- `$1 = 1`
+        // bound to 'a' is PostgreSQL's 22P02 -- except for `||`, which is
+        // text concatenation whatever sits beside it.
+        v @ (Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Boolean(_))
+            if op != "||" =>
+        {
+            Some(cast_value(Bson::String(text.clone()), inferred_type(v))?)
+        }
+        v if op != "||" && is_numeric(v) => {
+            Some(cast_value(Bson::String(text.clone()), "numeric")?)
+        }
         // An array literal takes the element type from the array beside it.
         Bson::Array(items) => {
             let element = items.first().map(inferred_type).unwrap_or("text");

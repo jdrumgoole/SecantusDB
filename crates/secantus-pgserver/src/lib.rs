@@ -17420,7 +17420,7 @@ impl PgHandler {
                         // column, not just the one it is filed under.
                         secantus_pgplan::apply_row_expr(expr, &d)
                     } else {
-                        let v = d.get(f).cloned().unwrap_or(Bson::Null);
+                        let v = secantus_pgplan::field_value(&d, f);
                         secantus_pgplan::apply_column_expr(expr, v, &tz)
                     }
                     .map_err(|e| PgHandler::err(&e))?;
@@ -22594,7 +22594,7 @@ fn resolve_cell(
         let v = if matches!(expr, secantus_pgplan::ColumnExpr::Row { .. }) {
             secantus_pgplan::apply_row_expr(expr, doc)
         } else {
-            let v = doc.get(field).cloned().unwrap_or(Bson::Null);
+            let v = secantus_pgplan::field_value(doc, field);
             secantus_pgplan::apply_column_expr(expr, v, tz)
         }
         .map_err(|e| PgHandler::err(&e))?;
