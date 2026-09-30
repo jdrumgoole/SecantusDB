@@ -226,6 +226,23 @@ pub(crate) fn decode_docs_minimal(
 }
 
 /// Encode owned `Document`s back to bytes (for the cursor / storage seam).
+/// [`encode_docs`] without taking ownership.
+pub(crate) fn encode_docs_ref(docs: &[Document]) -> Result<Vec<Vec<u8>>, CommandError> {
+    docs.iter()
+        .map(|d| {
+            let mut v = Vec::new();
+            d.to_writer(&mut v).map_err(|e| {
+                CommandError::new(
+                    1,
+                    "InternalError",
+                    format!("failed to encode document: {e}"),
+                )
+            })?;
+            Ok(v)
+        })
+        .collect()
+}
+
 pub(crate) fn encode_docs(docs: Vec<Document>) -> Result<Vec<Vec<u8>>, CommandError> {
     docs.iter()
         .map(|d| {
@@ -374,6 +391,8 @@ fn code_name_for(code: i32) -> &'static str {
         // storage layer's MaxTimeExpired -> WriteError { code: 50 } mapping,
         // and without the entry would render the generic `Location50`.
         50 => "MaxTimeMSExpired",
+        // `$range`'s memory estimate over the 100 MiB expression limit.
+        146 => "ExceededMemoryLimit",
         9 => "FailedToParse",
         67 => "CannotCreateIndex",
         85 => "IndexOptionsConflict",

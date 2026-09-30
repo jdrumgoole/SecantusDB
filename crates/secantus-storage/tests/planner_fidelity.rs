@@ -226,3 +226,144 @@ fn sort_under_a_filter_skips_a_sparse_index_the_filter_cannot_cover() {
         );
     });
 }
+
+/// The sort key's byte form ranks a document or array by its raw BSON, which
+/// starts with its LENGTH. mongod compares field by field / element by element
+/// (`{a: 2, b: 1, c: ...} < {a: 2, b: [3]} < {a: 3} < {a: 5} < {a: 9, ...}`),
+/// with or without an index on the field.
+#[test]
+fn embedded_documents_sort_by_value_not_by_encoded_length() {
+    for indexed in [false, true] {
+        with_db(|st| {
+            if indexed {
+                st.create_index("app", "c", "x_1", &doc! {"x": 1}, &doc! {})
+                    .unwrap();
+            }
+            insert(
+                st,
+                &[
+                    doc! {"_id": 1, "x": {"a": 5}},
+                    doc! {"_id": 2, "x": {"a": 2, "b": [3]}},
+                    doc! {"_id": 3, "x": {"a": 3}},
+                    doc! {"_id": 4, "x": {"a": 2, "b": 1, "c": "long string here"}},
+                    doc! {"_id": 5, "x": {"a": 9, "z": {"q": [1, 2, 3, 4, 5, 6]}}},
+                ],
+            );
+            assert_eq!(
+                ids(st, doc! {}, Some(doc! {"x": 1}), None),
+                vec![4, 2, 3, 1, 5],
+                "indexed={indexed}"
+            );
+            assert_eq!(
+                ids(
+                    st,
+                    doc! {"x": {"$gt": {"a": 0}}},
+                    Some(doc! {"x": -1}),
+                    None
+                ),
+                vec![5, 1, 3, 2, 4],
+                "indexed={indexed}"
+            );
+        });
+    }
+}
+
+#[test]
+fn nested_arrays_sort_element_by_element() {
+    with_db(|st| {
+        insert(
+            st,
+            &[
+                doc! {"_id": 1, "x": [[5]]},
+                doc! {"_id": 2, "x": [1, [2, [3]]]},
+                doc! {"_id": 3, "x": [[1], [9]]},
+                doc! {"_id": 4, "x": []},
+                doc! {"_id": 5, "x": [[]]},
+            ],
+        );
+        // mongod: descending by each array's largest element, compared
+        // element-wise -- [9] > [5] > [2, [3]] > [] ; the empty array last.
+        assert_eq!(
+            ids(st, doc! {}, Some(doc! {"x": -1}), None),
+            vec![3, 1, 2, 5, 4]
+        );
+        assert_eq!(
+            ids(st, doc! {}, Some(doc! {"x": 1}), None),
+            vec![4, 2, 5, 3, 1]
+        );
+    });
+}
+
+/// A hinted walk returns the index's ORDER, and for document keys that is value
+/// order, not encoded-length order (mongod 8.2.11: `[4, 2, 3, 1, 5]`).
+#[test]
+fn hinted_walk_over_document_keys_is_in_value_order() {
+    with_db(|st| {
+        st.create_index("app", "c", "x_1", &doc! {"x": 1}, &doc! {})
+            .unwrap();
+        st.create_index("app", "c", "x_d", &doc! {"x": -1}, &doc! {})
+            .unwrap();
+        insert(
+            st,
+            &[
+                doc! {"_id": 1, "x": {"a": 5}},
+                doc! {"_id": 2, "x": {"a": 2, "b": [3]}},
+                doc! {"_id": 3, "x": {"a": 3}},
+                doc! {"_id": 4, "x": {"a": 2, "b": 1, "c": "long string here"}},
+                doc! {"_id": 5, "x": {"a": 9, "z": {"q": [1, 2, 3, 4, 5, 6]}}},
+            ],
+        );
+        let h = |n: &str| Some(Hint::Name(n.to_string()));
+        assert_eq!(ids(st, doc! {}, None, h("x_1")), vec![4, 2, 3, 1, 5]);
+        assert_eq!(ids(st, doc! {}, None, h("x_d")), vec![5, 1, 3, 2, 4]);
+    });
+}
+
+/// An index range scan bounded by an array or a document compared the
+/// entries' raw-BSON bytes, which order by LENGTH first: `{x: {$gt: [1, 2, 3]}}`
+/// dropped `{x: [9]}`. Such bounds no longer use the index; equality still does.
+#[test]
+fn array_and_document_range_bounds_do_not_scan_index_bytes() {
+    with_db(|st| {
+        st.create_index("app", "c", "x_1", &doc! {"x": 1}, &doc! {})
+            .unwrap();
+        insert(
+            st,
+            &[
+                doc! {"_id": 6, "x": [1, 2]},
+                doc! {"_id": 7, "x": [9]},
+                doc! {"_id": 8, "x": [1, 2, 3, 4, 5, 6, 7, 8]},
+                doc! {"_id": 1, "x": {"a": 5}},
+                doc! {"_id": 4, "x": {"a": 2, "b": 1, "c": "long string here"}},
+            ],
+        );
+        let sorted = |mut v: Vec<i32>| {
+            v.sort();
+            v
+        };
+        // mongod 8.2.11.
+        assert_eq!(
+            sorted(ids(st, doc! {"x": {"$gt": [1, 2, 3]}}, None, None)),
+            vec![7, 8]
+        );
+        assert_eq!(
+            sorted(ids(
+                st,
+                doc! {"x": {"$gte": [1, 2, 3, 4, 5, 6, 7, 8, 9]}},
+                None,
+                None
+            )),
+            vec![7]
+        );
+        assert_eq!(
+            sorted(ids(
+                st,
+                doc! {"x": {"$lt": {"a": 4, "long": "xxxxxxxx"}}},
+                None,
+                None
+            )),
+            vec![4]
+        );
+        assert_eq!(ids(st, doc! {"x": [9]}, None, None), vec![7]);
+    });
+}

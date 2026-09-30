@@ -2219,8 +2219,32 @@ fn coerce_index(b: &Bson) -> IdxCoerce {
                 IdxCoerce::Fractional
             }
         }
+        // A whole DECIMAL is an index like any other number -- mongod answers
+        // `$slice: [[1, 2, 3], NumberDecimal("1")]` with `[1]`, where this
+        // returned null (measured 8.2.11, 2026-09-30). Magnitude only matters
+        // to the 32-bit checks, which an `f64` decides exactly at that scale.
+        Bson::Decimal128(d) => match d.to_string().parse::<f64>() {
+            Ok(f) if f.is_finite() && f.fract() == 0.0 => IdxCoerce::Int(f as i64),
+            _ => IdxCoerce::Fractional,
+        },
         _ => IdxCoerce::NotNumber,
     }
+}
+
+/// Whether an index fits mongod's 32-bit argument checks.
+fn fits_i32(n: i64) -> bool {
+    (i32::MIN as i64..=i32::MAX as i64).contains(&n)
+}
+
+/// A numeric argument rendered the way mongod renders it after converting it
+/// to a DOUBLE (`3e+09`, `-2.14748e+09`), which is how `$slice` reports every
+/// numeric type, a decimal included.
+fn num_as_double_g(v: &Bson) -> String {
+    let f = match v {
+        Bson::Decimal128(d) => d.to_string().parse::<f64>().unwrap_or(f64::NAN),
+        other => as_float_like(other).unwrap_or(f64::NAN),
+    };
+    format_double_g(f)
 }
 
 /// mongod names the POSITION argument "Second" in both the two-arg and the
@@ -2233,7 +2257,17 @@ fn slice_second_not_32bit(v: &Bson) -> Fallback {
         28726,
         format!(
             "Second argument to $slice can't be represented as a 32-bit integer: {}",
-            format_double_g(as_float_like(v).unwrap_or(f64::NAN))
+            num_as_double_g(v)
+        ),
+    )
+}
+
+fn slice_third_not_32bit(v: &Bson) -> Fallback {
+    Fallback::mongo(
+        28728,
+        format!(
+            "Third argument to $slice can't be represented as a 32-bit integer: {}",
+            num_as_double_g(v)
         ),
     )
 }
@@ -2265,8 +2299,8 @@ fn op_slice(arg: &Bson, ctx: &Ctx) -> R {
             return Err(Fallback::mongo(28725, SLICE_SECOND_BOOL));
         }
         let n = match coerce_index(&n_v) {
-            IdxCoerce::Int(n) => n,
-            IdxCoerce::Fractional => return Err(slice_second_not_32bit(&n_v)),
+            IdxCoerce::Int(n) if fits_i32(n) => n,
+            IdxCoerce::Int(_) | IdxCoerce::Fractional => return Err(slice_second_not_32bit(&n_v)),
             IdxCoerce::NotNumber => return Ok(Bson::Null),
         };
         if n >= 0 {
@@ -2287,16 +2321,32 @@ fn op_slice(arg: &Bson, ctx: &Ctx) -> R {
             ));
         }
         let pos = match coerce_index(&pos_v) {
-            IdxCoerce::Int(p) => p,
-            IdxCoerce::Fractional => return Err(slice_second_not_32bit(&pos_v)),
+            IdxCoerce::Int(p) if fits_i32(p) => p,
+            IdxCoerce::Int(_) | IdxCoerce::Fractional => {
+                return Err(slice_second_not_32bit(&pos_v))
+            }
             IdxCoerce::NotNumber => return Ok(Bson::Null),
         };
         let n = match coerce_index(&n_v) {
-            IdxCoerce::Int(n) => n,
-            IdxCoerce::Fractional => return Err(Fallback::Defer), // Python raises 28728
+            IdxCoerce::Int(n) if fits_i32(n) => n,
+            IdxCoerce::Int(_) | IdxCoerce::Fractional => return Err(slice_third_not_32bit(&n_v)),
             IdxCoerce::NotNumber => return Ok(Bson::Null),
         };
-        (pos, pos.saturating_add(n))
+        // The COUNT must be positive: `[..., 0, 0]` and `[..., 0, -1]` are
+        // refused, where this answered `[]` and `[1, 2]`.
+        if n <= 0 {
+            return Err(Fallback::mongo(
+                28729,
+                format!(
+                    "Third argument to $slice must be positive: {}",
+                    num_as_double_g(&n_v)
+                ),
+            ));
+        }
+        // The count runs from the NORMALISED start: `[[1, 2, 3], -1, 1]` is
+        // `[3]`. Adding it to the raw -1 gave an end of 0 and answered `[]`.
+        let s = norm_index(pos, len);
+        (s, s.saturating_add(n))
     };
     let (s, e) = (norm_index(start, len), norm_index(stop, len));
     Ok(Bson::Array(if s >= e {
@@ -2486,10 +2536,21 @@ fn index_of_codes(op: &str) -> (i32, i32) {
 /// "nonnegative" code. Mirrors `expressions.py::_index_of_pos`.
 fn index_of_pos(op: &str, which: &str, v: &Bson) -> Result<i64, Fallback> {
     let (integral_code, nonneg_code) = index_of_codes(op);
-    let n = match v {
-        Bson::Int32(n) => *n as i64,
-        Bson::Int64(n) => *n,
-        Bson::Double(d) if d.is_finite() && d.fract() == 0.0 => *d as i64,
+    // A whole decimal is accepted like a whole double, and every numeric type
+    // must fit int32 -- `3e9` used to be taken as a start past the end and
+    // answer -1 (measured 8.2.11, 2026-09-30).
+    let whole = match v {
+        Bson::Int32(n) => Some(*n as i64),
+        Bson::Int64(n) => Some(*n),
+        Bson::Double(d) if d.is_finite() && d.fract() == 0.0 => Some(*d as i64),
+        Bson::Decimal128(_) => match coerce_index(v) {
+            IdxCoerce::Int(n) => Some(n),
+            _ => None,
+        },
+        _ => None,
+    };
+    let n = match whole {
+        Some(n) if fits_i32(n) => n,
         _ => {
             return Err(Fallback::mongo(
                 integral_code,
@@ -2938,29 +2999,38 @@ fn op_substr_cp(arg: &Bson, ctx: &Ctx) -> R {
             "$substrCP: length must be a numeric type (is BSON type bool)",
         ));
     }
+    // Out of int32 is the same refusal as a fraction (`3e9` answered `"abc"`).
+    // A long is rendered as an integer here, unlike `$slice` (measured 8.2.11,
+    // 2026-09-30: `length ... value: 3000000000`).
+    let substr_repr = |v: &Bson| match v {
+        Bson::Int32(_) | Bson::Int64(_) => mongo_val_repr(v),
+        // A decimal keeps its own spelling here (`3E+9`).
+        Bson::Decimal128(d) => d.to_string(),
+        other => num_as_double_g(other),
+    };
     let start = match coerce_index(&start_v) {
-        IdxCoerce::Int(n) => n,
-        IdxCoerce::Fractional => {
+        IdxCoerce::Int(n) if fits_i32(n) => n,
+        IdxCoerce::Int(_) | IdxCoerce::Fractional => {
             return Err(Fallback::mongo(
                 34451,
                 format!(
                     "$substrCP: starting index cannot be represented as a 32-bit \
                      integral value: {}",
-                    format_double_g(as_float_like(&start_v).unwrap_or(f64::NAN))
+                    substr_repr(&start_v)
                 ),
             ));
         }
         IdxCoerce::NotNumber => return Err(Fallback::Defer),
     };
     let length = match coerce_index(&length_v) {
-        IdxCoerce::Int(n) => n,
-        IdxCoerce::Fractional => {
+        IdxCoerce::Int(n) if fits_i32(n) => n,
+        IdxCoerce::Int(_) | IdxCoerce::Fractional => {
             return Err(Fallback::mongo(
                 34453,
                 format!(
                     "$substrCP: length cannot be represented as a 32-bit integral \
                      value: {}",
-                    format_double_g(as_float_like(&length_v).unwrap_or(f64::NAN))
+                    substr_repr(&length_v)
                 ),
             ));
         }
@@ -7707,7 +7777,7 @@ fn op_replace(arg: &Bson, ctx: &Ctx, all: bool) -> R {
 
 // --- $range -------------------------------------------------------------
 
-const MAX_RANGE_SIZE: i128 = 100_000;
+const RANGE_MEMORY_LIMIT: i128 = 100 * 1024 * 1024;
 
 /// One `$range` argument. mongod has a separate code for each position and for
 /// each of the two ways it can be wrong -- non-numeric vs not representable as
@@ -7793,11 +7863,22 @@ fn op_range(arg: &Bson, ctx: &Ctx) -> R {
             "$range requires a non-zero step value",
         ));
     }
+    // mongod's limit is on MEMORY, estimated before building anything: 16
+    // bytes per element plus 40, with the element count taken as the TRUNCATED
+    // quotient (so `[0, 20000000, 3]` is estimated at 6666666 elements, not
+    // 6666667). Over 100 MiB is 146. Measured 8.2.11 (2026-09-30). This used to
+    // refuse anything past 100,000 elements, which mongod answers happily.
     let delta = end - start;
     if (delta > 0) == (step > 0) && delta != 0 {
-        let size = (delta.abs() + step.abs() - 1) / step.abs();
-        if size > MAX_RANGE_SIZE {
-            return Err(Fallback::Defer); // Python raises past the cap
+        let bytes = 16 * (delta / step).abs() + 40;
+        if bytes > RANGE_MEMORY_LIMIT {
+            return Err(Fallback::mongo(
+                146,
+                format!(
+                    "$range would use too much memory ({bytes} bytes) and cannot spill to \
+                     disk. Memory limit: {RANGE_MEMORY_LIMIT} bytes"
+                ),
+            ));
         }
     }
     let mut out = Vec::new();
@@ -9631,5 +9712,136 @@ mod decimal_string_tests {
             conv("9.999999999999999999999999999999999E+6144"),
             Ok("9.999999999999999999999999999999999E+6144".into())
         );
+    }
+}
+
+/// Index / count arguments must be whole numbers that fit in 32 bits, a whole
+/// decimal counts as one, and a `$range` is bounded by its memory estimate.
+/// Every expected value measured on mongod 8.2.11, 2026-09-30.
+#[cfg(test)]
+mod int32_argument_tests {
+    use super::*;
+    use bson::{bson, Decimal128};
+    use std::str::FromStr;
+
+    fn run(expr: Bson) -> Result<Bson, (i32, String)> {
+        evaluate(&Document::new(), &expr, &Document::new()).map_err(|f| match f.as_mongo() {
+            Some((c, m)) => (c, m.to_string()),
+            None => (0, "defer".into()),
+        })
+    }
+
+    fn dec(s: &str) -> Bson {
+        Bson::Decimal128(Decimal128::from_str(s).unwrap())
+    }
+
+    #[test]
+    fn slice_takes_a_whole_decimal_and_counts_from_a_normalised_start() {
+        assert_eq!(
+            run(bson!({"$slice": [[1, 2, 3], dec("1")]})),
+            Ok(bson!([1]))
+        );
+        assert_eq!(
+            run(bson!({"$slice": [[1, 2, 3], dec("1"), dec("1")]})),
+            Ok(bson!([2]))
+        );
+        assert_eq!(run(bson!({"$slice": [[1, 2, 3], -1, 1]})), Ok(bson!([3])));
+        assert_eq!(
+            run(bson!({"$slice": [[1, 2, 3], -2147483648_i64]})),
+            Ok(bson!([1, 2, 3]))
+        );
+    }
+
+    #[test]
+    fn slice_refuses_out_of_range_and_non_positive_counts() {
+        let e = |x| run(x).unwrap_err();
+        assert_eq!(
+            e(bson!({"$slice": [[1, 2, 3], 3e9]})),
+            (
+                28726,
+                "Second argument to $slice can't be represented as a 32-bit integer: 3e+09".into()
+            )
+        );
+        assert_eq!(
+            e(bson!({"$slice": [[1, 2, 3], -2147483649_i64]})).1,
+            "Second argument to $slice can't be represented as a 32-bit integer: -2.14748e+09"
+        );
+        assert_eq!(
+            e(bson!({"$slice": [[1, 2, 3], 0, 1.5]})),
+            (
+                28728,
+                "Third argument to $slice can't be represented as a 32-bit integer: 1.5".into()
+            )
+        );
+        assert_eq!(
+            e(bson!({"$slice": [[1, 2, 3], 0, 0]})),
+            (28729, "Third argument to $slice must be positive: 0".into())
+        );
+        assert_eq!(e(bson!({"$slice": [[1, 2, 3], dec("1.5")]})).0, 28726);
+    }
+
+    #[test]
+    fn substr_cp_checks_32_bits_and_renders_each_type_its_own_way() {
+        assert_eq!(
+            run(bson!({"$substrCP": ["abc", dec("1"), dec("1")]})),
+            Ok(bson!("b"))
+        );
+        let e = |x| run(x).unwrap_err();
+        assert_eq!(
+            e(bson!({"$substrCP": ["abc", 0, 3000000000_i64]})).1,
+            "$substrCP: length cannot be represented as a 32-bit integral value: 3000000000"
+        );
+        assert_eq!(
+            e(bson!({"$substrCP": ["abc", 3e9, 1]})).1,
+            "$substrCP: starting index cannot be represented as a 32-bit integral value: 3e+09"
+        );
+        assert_eq!(
+            e(bson!({"$substrCP": ["abc", 0, dec("3E+9")]})).1,
+            "$substrCP: length cannot be represented as a 32-bit integral value: 3E+9"
+        );
+    }
+
+    #[test]
+    fn index_of_takes_a_whole_decimal_and_refuses_past_int32() {
+        assert_eq!(
+            run(bson!({"$indexOfCP": ["abc", "b", dec("1")]})),
+            Ok(Bson::Int32(1))
+        );
+        assert_eq!(
+            run(bson!({"$indexOfArray": [[1, 2], 2, dec("1")]})),
+            Ok(Bson::Int32(1))
+        );
+        assert_eq!(
+            run(bson!({"$indexOfCP": ["abc", "b", 3e9]})).unwrap_err(),
+            (
+                40096,
+                "$indexOfCPrequires an integral starting index, found a value of type: double, \
+                 with value: 3e+09"
+                    .into()
+            )
+        );
+        assert_eq!(
+            run(bson!({"$indexOfArray": [[1], 1, 0, 3000000000_i64]}))
+                .unwrap_err()
+                .0,
+            9711600
+        );
+    }
+
+    #[test]
+    fn range_is_bounded_by_memory_not_by_a_count() {
+        let big = run(bson!({"$range": [0, 200000]})).unwrap();
+        assert_eq!(big.as_array().map(Vec::len), Some(200000));
+        assert_eq!(
+            run(bson!({"$range": [0, 20000000, 3]})).unwrap_err(),
+            (
+                146,
+                "$range would use too much memory (106666696 bytes) and cannot spill to disk. \
+                 Memory limit: 104857600 bytes"
+                    .into()
+            )
+        );
+        // Opposite directions build nothing, so estimate nothing.
+        assert_eq!(run(bson!({"$range": [0, -7000000, 1]})), Ok(bson!([])));
     }
 }

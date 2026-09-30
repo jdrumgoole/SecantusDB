@@ -1664,11 +1664,15 @@ These work end-to-end but cut corners.
   in `commands.py::_split_into_cursor` (encode-to-measure) and
   `find.rs::split_into_cursor` (blob lengths already known, so free). Both now
   answer 15 / 15.0 MiB / cursor open, matching mongod exactly.
-  **Not covered:** `find.rs::split_docs_into_cursor`, the projected/aggregate path
-  that carries decoded `Document`s rather than blobs. Measuring there means encoding
-  each document purely to size it — real overhead on the Rust server's hot path for
-  a case (megabyte documents *and* a projection) that no driver has hit. Left
-  deliberately, recorded rather than silently skipped.
+  **The projected / aggregate path is covered too since 2026-09-30.**
+  `find.rs::split_docs_into_cursor_checked` encodes each result once, which both
+  sizes the batch and produces the bytes the cursor remainder needs anyway
+  (20 x 1.5 MB aggregate results: first batch 11, cursor open — identical to
+  mongod 8.2.11). It found a worse bug than the budget: a single result over
+  16 MB (`{$range: [0, 6553590]}` is 84 MB) went out as an 84 MB MESSAGE, past
+  the 48 MB wire maximum, and the driver dropped the connection. `aggregate`
+  now answers mongod's `10334 Serializing Document failed` under the executor
+  prefix.
 - ~~**Three-droplet DigitalOcean benchmark: no repeat-and-median mode**~~ — shipped. `--repeat N` interleaves the engines within each pass (so drift lands on both equally) and reports medians plus a `(max - min) / median` spread column and a per-pass table. Measured 3.4% spread for secantusdb and 1.1% for mongod over three 60s passes. The whole harness is now live-verified: provisioning, VPC + firewall, SSH, cloud-init, both deploy routes, both engines, repeat/median, and all three teardown modes. See `bench/DO_CLUSTER.md`.
 - [x] **RESOLVED (2026-08-30): the Rust server has the MongoDB 8.0 features and
   advertises 8.2.11, matching the Python server.** `bulkWrite`, `sort` on update
@@ -3371,8 +3375,20 @@ These are explicit non-goals. Don't add them without a reason.
       remaining work is on the Python side, not the Rust side. Read from the
       source, not run — the Python server was out of scope for that slice.
 
-- [ ] **OPEN — the Rust server does not ENFORCE `maxTimeMS`, demonstrated
-      (2026-09-28).** This is §6 of the driver-conformance plan, which called it
+- [x] **RESOLVED (2026-09-30) — `maxTimeMS` is enforced on every read and
+      write path of the Rust server.** #1622 added the deadline and the scan /
+      index-build polls; the aggregation pipeline never polled (`check_now`
+      existed with no caller), and neither did the index walks, so `$group`,
+      `$sort`, `$project`, `distinct` and a sorted `find` ran to completion.
+      They poll now; `find` / `aggregate` / `distinct` / `count` wrap an
+      execution-time expiry in mongod's executor prefix; and `update` /
+      `delete` fail the COMMAND (`ok: 0`) instead of reporting a code-50
+      `writeErrors` entry under `ok: 1`. `tools/probes/max_time_expiry.py`:
+      0 of 11 divergent against 8.2.11 (the Python server is 8 of 11 -- see the
+      entry below). The original entry follows.
+
+      ~~**OPEN — the Rust server does not ENFORCE `maxTimeMS`, demonstrated
+      (2026-09-28).**~~ This is §6 of the driver-conformance plan, which called it
       "a project, not a fix". It still is, but it now has a reproducer instead of
       a description:
 
@@ -4233,10 +4249,19 @@ all still open. Probe: `scratchpad/readsweep.py` + `readsweep_lib.py`.
   Pinned by `tests/test_rust_descending_sort.py` (7 tests over the wire, 4 of
   which fail against the pre-fix binary) and four `secantus-storage` unit tests.
 
-  **Still open, and unrelated to the prefix bug:** the `sort: x desc` case in
-  the read-path sweep now differs only on `[[5]]` versus `[1, [2, [3]]]` — an
-  array-versus-array comparison, which belongs to the array-descent family
-  above.
+  **The `[[5]]` versus `[1, [2, [3]]]` case is FIXED on the Rust server
+  (2026-09-30), and it was not an array-descent bug.** The storage sort compared
+  the `sortkey` BYTES of the representative values, and `sortkey` writes a
+  document or array as raw BSON, which leads with a little-endian LENGTH — so
+  `[2, [3]]` ranked above `[5]`, and `{a: 2, b: [3]}` above `{a: 5}`, for being
+  longer. `find().sort()` over embedded documents was wrong on 5 of 7 measured
+  shapes while the aggregation `$sort` (which compares values with
+  `order::cmp`) was right on all 7. The storage sort now carries the value for a
+  document / array key part and compares it with `order::cmp`
+  (`SortPart` / `compare_sort_part`), and an index walk that meets such a value
+  gives up its sort-order claim, because the entries keep the byte form (it is
+  on disk). Standing cover: `tools/probes/nested_value_sort.py` (0 of 20 against
+  8.2.11; 14 of 20 before). Pinned by two `planner_fidelity.rs` tests.
 
 
 ### 2026-09-03 SQL sweep twelve: LIMIT and row NULLs — what is still open
@@ -9189,7 +9214,14 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   computes at 34 digits THROUGHOUT to track mongod's own error; `$asinh` is now
   the one exception, and any decision here should say which rule wins.
 
-- [ ] **Decimal128 operands are refused by some Rust operators.** Shrinking:
+- [ ] **Decimal128 operands are refused by some Rust operators.** `$pow` and
+  `$atan2` answer a decimal since 2026-09-30 -- correctly rounded under the
+  #1436 rule, which was MEASURED for `$pow` rather than assumed: over 183
+  finite pairs against 8.2.11, correct rounding matched mongod on 130 where
+  `exp(e * ln b)` at 34 digits (mongod's apparent algorithm, and the Python
+  engine's) matched on 56. The special values are mongod's own, a 12x12 grid
+  per operator; 10 of 288 differ, each a last digit where mongod is off by one
+  ULP (verified against a 90-digit reference). Shrinking:
   `$abs`, `$toBool`, `$toInt`, `$toLong`, `$toDouble`, and now `$sqrt`,
   `$degreesToRadians`, `$radiansToDegrees` and `$exp`'s decided regions
   (2026-09-08) take them. What still declines is the transcendental set above
@@ -9890,12 +9922,15 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   lookahead). Only patterns neither engine compiles, or over the 1000-char cap,
   → `Fallback` (defer). Parity suite extended: curated regex cases (incl.
   lookahead/lookbehind/backref) + a 4000-iteration `test_regex_fuzz_parity`
-  (safe-subset patterns/options/subjects; Rust ≡ Python `re`). **Known divergence
-  (accepted):** the `regex` crate's `$` matches only end-of-haystack, not before a
-  trailing `\n` like Python/PCRE — so `{x:{$regex:"foo$"}}` against `"foo\n"`
-  matches on the Python server but not the Rust server. Rare; documented in
-  `query.rs` module docs. Fuzz subjects are newline-free to avoid spurious parity
-  failures from this gap.
+  (safe-subset patterns/options/subjects; Rust ≡ Python `re`). **The `$` anchor
+  divergence is FIXED on the Rust server (2026-09-30).** It had been "accepted" as
+  rare, and it was worse than recorded: PCRE's non-multiline `$` and `\Z` match
+  before a final newline, so `{x: /foo$/}` missed `"foo\n"`, `$regexFind`
+  reported no match, and `\Z` did not compile at all — the query was REFUSED.
+  `regexutil::pcre_end_anchors` rewrites both to `(?=\n?\z)` (PCRE's own
+  definition) and sends the pattern to `fancy-regex`. Pinned by the anchor block
+  of `tools/probes/regex_value_semantics.py` (0 divergent against 8.2.11 for the
+  Rust server) and `regexutil::pcre_anchor_tests`.
 - [x] **View-collection reads — DONE on both servers.** `find` / `aggregate` /
   `count` on a view resolve the view's `viewOn` + pipeline against the base
   collection (recursively for a view-on-a-view): Python `commands._resolve_view`
@@ -10294,9 +10329,14 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   accept a whole-number double and reject a fractional one — same helpers, three-way
   mongod 7.0.12-verified. (`$substrBytes`/`$substr` already accept any double and
   truncate — mongod-correct, left as-is.) So the whole-double-index sweep is
-  **complete** across the aggregation surface. Remaining edge: a *huge* whole double
-  (> 2^31) is accepted here but mongod rejects it (32-bit-representable check) — a
-  narrow case; both SecantusDB engines stay mutually consistent (both null/whole).
+  **complete** across the aggregation surface. The *huge* whole-number edge is
+  FIXED on the Rust server (2026-09-30), and "narrow" undersold it: `$slice`
+  took `3e9` as a count and returned the whole array, a whole DECIMAL made
+  `$slice` return null, `$slice`'s count of 0 or -1 was accepted, `$slice:
+  [a, -1, 1]` returned `[]` (mongod `[3]`), `$indexOf*` answered -1 for a
+  start past int32, and `$range` refused anything past 100,000 elements where
+  mongod's limit is a 100 MiB memory estimate (146). 83 of 189 shapes diverged;
+  `tools/probes/int32_arguments.py` is 0 of 189 now.
   (2) **`$substrBytes` / `$substr` mid-UTF8-character — FIXED (2026-07-18).**
   A byte range that splits a UTF-8 char now raises mongod's codes on the Python
   server (28656 start-on-continuation-byte / 28657 end-mid-character, verbatim
@@ -11225,8 +11265,10 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   non-string metadata, non-object schema) → `14 TypeMismatch`. Python:
   `query._check_json_schema_keywords` (QueryError now carries code/codeName);
   Rust: `secantus_core::query::json_schema_keyword_error` + the find-command
-  parse-time check. (`type: "integer"` acceptance remains a small known
-  divergence — mongod rejects the alias; both our servers accept it.)
+  parse-time check. (`type: "integer"` is FIXED on the Rust server
+  (2026-09-30): 9 "not currently supported" in `type` or `bsonType`, and an
+  unknown name — including `type: "int"`, which only `bsonType` takes — is
+  2 `Unknown type name alias`. The Python server still accepts `integer`.)
 - [x] **Error-code — unrecognized expression operator: FIXED on both servers.**
   Query `$expr` → `168 InvalidPipelineOperator` on both (find.rs parse-time
   check via `expressions::first_unknown_expr_operator`); aggregation

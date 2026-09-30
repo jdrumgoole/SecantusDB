@@ -1060,6 +1060,30 @@ const CONFLICTING_OPTS: &[&str] = &[
 /// `storage._RANGE_OPS`.
 const RANGE_OPS: &[&str] = &["$eq", "$gt", "$gte", "$lt", "$lte", "$in"];
 
+/// Whether an operator document can be answered from index BOUNDS: every
+/// operator is in `RANGE_OPS`, and no range operator is bounded by a document
+/// or an array.
+///
+/// The entries order a document or array key by its raw BSON, which leads with
+/// a little-endian LENGTH -- so byte bounds are not value bounds there. With an
+/// index on `x`, `find({x: {$gt: [1, 2, 3]}})` dropped `{x: [9]}`, whose short
+/// encoding sorts below the bound although `[9]` is greater element by
+/// element; a collection scan and mongod 8.2.11 both return it (2026-09-30).
+/// Equality and `$in` stay indexable: exact byte equality IS value equality.
+fn index_can_bound(opd: &Document) -> bool {
+    opd.iter().all(|(k, v)| {
+        RANGE_OPS.contains(&k.as_str())
+            && !(matches!(k.as_str(), "$gt" | "$gte" | "$lt" | "$lte")
+                && byte_order_is_not_value_order(v))
+    })
+}
+
+/// A value whose `sortkey` bytes do not order it by value (see
+/// `index_can_bound`).
+fn byte_order_is_not_value_order(v: &Bson) -> bool {
+    matches!(v, Bson::Document(_) | Bson::Array(_))
+}
+
 /// `(index_name, direction, is_compound)` — the index a leading-field lookup
 /// resolves to (the tuple `find_leading_field_index` returns).
 type LeadingFieldMatch = (String, i32, bool);
@@ -2461,6 +2485,12 @@ fn op_implies_bound(qop: &str, qv: &Bson, pop: &str, pv: &Bson) -> bool {
     if pop != "$eq" && type_bracket(&a) != type_bracket(&b) {
         return false;
     }
+    // Inside the document and array brackets the bytes are raw BSON, which
+    // order by LENGTH first, not by value -- so a byte compare there answers an
+    // implication question about the wrong order. See `index_can_bound`.
+    if pop != "$eq" && (byte_order_is_not_value_order(qv) || byte_order_is_not_value_order(pv)) {
+        return false;
+    }
     let (le, lt, ge, gt, eq) = (a <= b, a < b, a >= b, a > b, a == b);
     match pop {
         // query upper-bounds the field; need its max <= / < pv.
@@ -2608,11 +2638,28 @@ fn multi_sort_spec(sort: Option<&Document>) -> Option<Vec<(String, i32)>> {
 /// prefix-shorter-first is exactly right ascending, and its reverse is exactly
 /// right descending. Nothing here is persisted, so the flat single-key form
 /// (which needed the inversion) buys nothing.
+/// One field of a document's sort key.
+///
+/// `bytes` is the byte-sortable encoding, which orders every SCALAR the way
+/// mongod does. It does not order documents or arrays: `sortkey` writes them as
+/// raw BSON, which leads with a little-endian LENGTH, so `{a: 2, b: [3]}`
+/// sorted above `{a: 5}` because it is longer. `find().sort()` over embedded
+/// documents was wrong on 5 of 7 measured shapes (8.2.11, 2026-09-30) while the
+/// aggregation `$sort`, which compares values, was right on all 7. So a
+/// document or array also carries its value, compared with the same
+/// `order::cmp` the `$sort` stage uses. The entries table keeps the byte form
+/// -- it is on disk -- which is why an index walk that meets one of these
+/// values gives up its claim to be in sort order (`sort_values_are_nested`).
+struct SortPart {
+    bytes: Vec<u8>,
+    nested: Option<Bson>,
+}
+
 fn sort_key(
     doc: &Document,
     spec: &[(String, i32)],
     coll: Option<&Collation>,
-) -> Result<Vec<Vec<u8>>> {
+) -> Result<Vec<SortPart>> {
     let mut parts = Vec::with_capacity(spec.len());
     for (f, d) in spec {
         // mongod refuses a sort path whose component names both an array index
@@ -2632,16 +2679,22 @@ fn sort_key(
         // above bare MinKey. No direction fix-up is needed now that the
         // comparator owns direction.
         if matches!(v, Bson::Undefined) {
-            parts.push(vec![RANK_MINKEY, 0xFF]);
+            parts.push(SortPart {
+                bytes: vec![RANK_MINKEY, 0xFF],
+                nested: None,
+            });
             continue;
         }
         // Collation-aware sort: a strength/caseLevel collation folds string keys
         // before encoding. A collation the encoder can't reproduce (non-ASCII /
         // numericOrdering) surfaces as UnsupportedValue → command BadValue.
         // The ORDERING key, not the index key: this is the sort path.
-        parts.push(
-            sortkey::encode_sort_value(&v, coll).map_err(|_| StorageError::UnsupportedValue)?,
-        );
+        let bytes =
+            sortkey::encode_sort_value(&v, coll).map_err(|_| StorageError::UnsupportedValue)?;
+        let nested = (matches!(v, Bson::Document(_) | Bson::Array(_))
+            && secantus_core::order::is_sortable(&v))
+        .then_some(v);
+        parts.push(SortPart { bytes, nested });
     }
     Ok(parts)
 }
@@ -2732,15 +2785,72 @@ fn sort_field_value(doc: &Document, field: &str, reverse: bool) -> Bson {
 }
 
 /// Compare two `sort_key` part lists under `spec`'s per-field directions.
-fn compare_sort_keys(a: &[Vec<u8>], b: &[Vec<u8>], spec: &[(String, i32)]) -> std::cmp::Ordering {
+fn compare_sort_keys(a: &[SortPart], b: &[SortPart], spec: &[(String, i32)]) -> std::cmp::Ordering {
     for (i, (_, d)) in spec.iter().enumerate() {
-        let ord = a[i].cmp(&b[i]);
+        let ord = compare_sort_part(&a[i], &b[i]);
         let ord = if *d < 0 { ord.reverse() } else { ord };
         if ord != std::cmp::Ordering::Equal {
             return ord;
         }
     }
     std::cmp::Ordering::Equal
+}
+
+/// One field, ascending. A TOTAL order, which Rust's sort requires (it may
+/// panic otherwise): by rank byte first, then two comparable documents / arrays
+/// by value, then -- only for a value `order::cmp` cannot take, one holding a
+/// DbPointer -- after the comparable ones of its rank, by bytes.
+fn compare_sort_part(a: &SortPart, b: &SortPart) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if a.bytes.first() != b.bytes.first() {
+        return a.bytes.cmp(&b.bytes);
+    }
+    match (&a.nested, &b.nested) {
+        (Some(x), Some(y)) => secantus_core::order::cmp(x, y),
+        (Some(_), None) if is_nested_rank(&b.bytes) => Ordering::Less,
+        (None, Some(_)) if is_nested_rank(&a.bytes) => Ordering::Greater,
+        _ => a.bytes.cmp(&b.bytes),
+    }
+}
+
+fn is_nested_rank(bytes: &[u8]) -> bool {
+    matches!(
+        bytes.first(),
+        Some(&r) if r == sortkey::RANK_DOCUMENT || r == sortkey::RANK_ARRAY
+    )
+}
+
+/// Whether any of these documents sorts by a document or array value under
+/// `spec` -- the values the entries table's byte order gets wrong (see
+/// `SortPart`), so an index walk over them is not a sort. Reads raw BSON, only
+/// the sort paths.
+fn sort_values_are_nested(blobs: &[Vec<u8>], spec: &[(String, i32)]) -> bool {
+    blobs.iter().any(|blob| {
+        let Ok(raw) = bson::RawDocument::from_bytes(blob) else {
+            return true;
+        };
+        spec.iter().any(|(path, _)| raw_path_is_nested(raw, path))
+    })
+}
+
+fn raw_path_is_nested(raw: &bson::RawDocument, path: &str) -> bool {
+    let mut cur = raw;
+    let mut parts = path.split('.').peekable();
+    while let Some(part) = parts.next() {
+        match cur.get(part) {
+            Ok(Some(bson::RawBsonRef::Document(d))) => {
+                if parts.peek().is_none() {
+                    return true;
+                }
+                cur = d;
+            }
+            Ok(Some(bson::RawBsonRef::Array(_))) => return true,
+            Ok(Some(_)) | Ok(None) => return false,
+            // Unreadable: claim nothing about order and let the post-sort run.
+            Err(_) => return true,
+        }
+    }
+    false
 }
 
 /// Build an `IxScan` plan, setting `direction` to `"backward"` when the sort
@@ -2786,7 +2896,7 @@ fn partition_compound_range_filter(filter: &Document) -> Option<(Document, Strin
             if opd.is_empty() || !opd.keys().all(|k| k.starts_with('$')) {
                 return None;
             }
-            if !opd.keys().all(|k| RANGE_OPS.contains(&k.as_str())) {
+            if !index_can_bound(opd) {
                 return None;
             }
             if operator_field.is_some() {
@@ -5282,7 +5392,7 @@ impl Storage {
                     out.reverse();
                 }
             } else if let Some(spec) = multi_sort_spec(sort) {
-                let mut keyed: Vec<(Vec<Vec<u8>>, Vec<u8>)> = Vec::with_capacity(out.len());
+                let mut keyed: Vec<(Vec<SortPart>, Vec<u8>)> = Vec::with_capacity(out.len());
                 for (d, blob) in out {
                     keyed.push((sort_key(&d, &spec, coll_opt)?, blob));
                 }
@@ -10621,13 +10731,20 @@ impl Storage {
             }
             out
         };
+        if in_sort_order {
+            if let Some(spec) = multi_sort_spec(sort) {
+                if sort_values_are_nested(&out, &spec) {
+                    in_sort_order = false;
+                }
+            }
+        }
         if !in_sort_order {
             if let Some(spec) = multi_sort_spec(sort) {
                 // A post-sort needs the sort-field values, so decode the *matched*
                 // documents only (the filter already discarded the rest). Decorate
                 // -sort-undecorate on the byte-sortable compound key (collation-
                 // folded when a collation is active).
-                let mut keyed: Vec<(Vec<Vec<u8>>, Vec<u8>)> = Vec::with_capacity(out.len());
+                let mut keyed: Vec<(Vec<SortPart>, Vec<u8>)> = Vec::with_capacity(out.len());
                 for blob in out {
                     let d = decode_doc(&blob)?;
                     keyed.push((sort_key(&d, &spec, coll_opt)?, blob));
@@ -12033,6 +12150,28 @@ impl Storage {
                     }
                 }
                 let mut docs = self.walk_index_in_order(session, db, coll, name, false, 1)?;
+                // The entries order a document / array key by its raw BSON
+                // bytes (see `SortPart`), not by value, so a hinted walk over
+                // such keys came back in a different order from mongod's
+                // (8.2.11, 2026-09-30). Reorder by the key pattern, each field
+                // in the index's own direction -- which is the index order.
+                if let Some((key_spec, _)) = &found {
+                    let spec: Option<Vec<(String, i32)>> = key_spec
+                        .iter()
+                        .map(|(f, d)| direction_of(d).map(|di| (f.clone(), di)))
+                        .collect();
+                    if let Some(spec) = spec.filter(|p| p.iter().all(|(_, d)| d.abs() == 1)) {
+                        if sort_values_are_nested(&docs, &spec) {
+                            let mut keyed: Vec<(Vec<SortPart>, Vec<u8>)> =
+                                Vec::with_capacity(docs.len());
+                            for blob in docs {
+                                keyed.push((sort_key(&decode_doc(&blob)?, &spec, None)?, blob));
+                            }
+                            keyed.sort_by(|a, b| compare_sort_keys(&a.0, &b.0, &spec));
+                            docs = keyed.into_iter().map(|(_, b)| b).collect();
+                        }
+                    }
+                }
                 let in_order = match (&leading, sort_field) {
                     (Some((f, _)), Some(sf)) => f == sf,
                     _ => false,
@@ -12083,7 +12222,7 @@ impl Storage {
             .get_document("partialFilterExpression")
             .ok()
             .filter(|d| !d.is_empty());
-        let mut keyed: Vec<(Vec<Vec<u8>>, Vec<u8>)> = Vec::new();
+        let mut keyed: Vec<(Vec<SortPart>, Vec<u8>)> = Vec::new();
         for (_rid, _id_k, blob) in self.scan_docs(session, db, coll)? {
             let d = decode_doc(&blob)?;
             if sparse && !sparse_covers(&d, key_spec) {
@@ -12559,7 +12698,7 @@ impl Storage {
             // An operator-form clause must be range ops the index can serve;
             // otherwise this field can't be the leading-field clause.
             if let Bson::Document(opd) = value {
-                if opd.is_empty() || !opd.keys().all(|k| RANGE_OPS.contains(&k.as_str())) {
+                if opd.is_empty() || !index_can_bound(opd) {
                     continue;
                 }
             }
@@ -12616,7 +12755,7 @@ impl Storage {
         if opdoc.is_empty() || !opdoc.keys().all(|k| k.starts_with('$')) {
             return Ok(None);
         }
-        if !opdoc.keys().all(|k| RANGE_OPS.contains(&k.as_str())) {
+        if !index_can_bound(opdoc) {
             return Ok(None);
         }
         if opdoc.contains_key("$in") {
@@ -13055,7 +13194,7 @@ impl Storage {
             if let Bson::Document(opdoc) = value {
                 if opdoc.is_empty()
                     || !opdoc.keys().all(|k| k.starts_with('$'))
-                    || !opdoc.keys().all(|k| RANGE_OPS.contains(&k.as_str()))
+                    || !index_can_bound(opdoc)
                 {
                     return Ok(None);
                 }
@@ -15163,7 +15302,7 @@ mod tests {
             .iter()
             .map(|s| doc! {"x": *s})
             .collect();
-        let mut keyed: Vec<(Vec<Vec<u8>>, &str)> = docs
+        let mut keyed: Vec<(Vec<SortPart>, &str)> = docs
             .iter()
             .zip(["", "a", "ab", "abc", "b"])
             .map(|(d, label)| (sort_key(d, &spec, None).unwrap(), label))
@@ -15179,7 +15318,7 @@ mod tests {
     fn ascending_sort_is_unchanged_by_the_comparator() {
         let spec = vec![("x".to_string(), 1)];
         let labels = ["", "a", "ab", "abc", "b"];
-        let mut keyed: Vec<(Vec<Vec<u8>>, &str)> = labels
+        let mut keyed: Vec<(Vec<SortPart>, &str)> = labels
             .iter()
             .map(|s| (sort_key(&doc! {"x": *s}, &spec, None).unwrap(), *s))
             .collect();
@@ -15191,7 +15330,7 @@ mod tests {
     /// columns that ask for it.
     #[test]
     fn compare_sort_keys_applies_direction_per_field() {
-        type Row<'a> = (Vec<Vec<u8>>, (&'a str, &'a str));
+        type Row<'a> = (Vec<SortPart>, (&'a str, &'a str));
         let spec = vec![("a".to_string(), 1), ("b".to_string(), -1)];
         let mut rows: Vec<Row<'_>> = [("x", ""), ("x", "z"), ("w", "")]
             .iter()
@@ -15221,7 +15360,7 @@ mod tests {
                 (doc! {"x": Bson::Null}, "null"),
                 (doc! {"x": "s"}, "s"),
             ];
-            let mut keyed: Vec<(Vec<Vec<u8>>, &str)> = rows
+            let mut keyed: Vec<(Vec<SortPart>, &str)> = rows
                 .iter()
                 .map(|(d, l)| (sort_key(d, &spec, None).unwrap(), *l))
                 .collect();

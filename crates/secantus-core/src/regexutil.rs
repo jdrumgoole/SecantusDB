@@ -182,9 +182,12 @@ pub(crate) fn compile(pattern: &Bson, options: Option<&Bson>) -> Result<Compiled
 /// multiline is on -- by option or by an inline `(?m)` anywhere -- `$` is left
 /// alone: the `regex` crate's multiline `$` is PCRE's.
 fn pcre_end_anchors(pat: &str, multiline: bool) -> Option<String> {
-    let inline_m = pat
-        .match_indices("(?")
-        .any(|(i, _)| pat[i + 2..].chars().take_while(|c| c.is_ascii_alphabetic()).any(|c| c == 'm'));
+    let inline_m = pat.match_indices("(?").any(|(i, _)| {
+        pat[i + 2..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic())
+            .any(|c| c == 'm')
+    });
     let rewrite_dollar = !multiline && !inline_m;
     const END: &str = "(?=\\n?\\z)";
     let mut out = String::with_capacity(pat.len() + 16);
@@ -270,8 +273,11 @@ mod pcre_anchor_tests {
     use bson::Bson;
 
     fn hits(pattern: &str, options: &str, subjects: &[&str]) -> Vec<bool> {
-        let re = compile(&Bson::String(pattern.into()), Some(&Bson::String(options.into())))
-            .expect("compiles");
+        let re = compile(
+            &Bson::String(pattern.into()),
+            Some(&Bson::String(options.into())),
+        )
+        .expect("compiles");
         subjects.iter().map(|s| re.is_match(s)).collect()
     }
 

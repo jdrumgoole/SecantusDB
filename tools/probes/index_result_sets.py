@@ -186,6 +186,15 @@ VALUES = [
     ObjectId("64b7f9a2c1d2e3f4a5b6c7d8"),
     datetime.datetime(2026, 1, 2, 3, 4, 5),
     Int64(2**40),
+    # Documents and arrays of DIFFERENT LENGTHS (2026-09-30). The entries
+    # encode them as raw BSON, which leads with the length, so byte order is
+    # not value order there -- `{x: {$gt: [1, 2, 3]}}` dropped `{x: [9]}` on an
+    # indexed collection. The list above held one short array and one document,
+    # and the range operators only ever took a number, so nothing reached it.
+    [9],
+    [1, 2, 3],
+    {"a": 2, "b": [3]},
+    {"a": 5},
 ]
 INDEXES = [
     ([("a", 1)], {"sparse": True}),
@@ -204,6 +213,20 @@ def _ids(coll, query, sort, hint=None):
     see the module docstring."""
     order = list(sort.items()) if sort else None
     return sorted(d["_id"] for d in coll.find(query, sort=order, hint=hint))
+
+
+def _diverges(indexed, bare, expected, expected_bare):
+    """Each configuration against mongod's SAME configuration.
+
+    Comparing our indexed answer with our unindexed one is the point of this
+    probe, and it still happens whenever mongod's two answers agree -- then all
+    four must. But mongod's own sparse index CHANGES its answer in one known
+    place: `{b: {$gt: MinKey}}` over a sparse index on `b` omits the documents
+    missing `b`, which a collection scan returns (8.2.11, 2026-09-30). Holding
+    our unindexed answer to mongod's indexed one flagged the server for
+    matching mongod exactly.
+    """
+    return indexed != expected or bare != expected_bare
 
 
 def main() -> int:
@@ -234,7 +257,8 @@ def main() -> int:
             indexed = _ids(sec[dbn].c, q, sort)
             bare = _ids(sec[dbn].bare, q, sort)
             expected = _ids(mon[dbn].c, q, sort)
-            if indexed != bare or indexed != expected:
+            expected_bare = _ids(mon[dbn].bare, q, sort)
+            if _diverges(indexed, bare, expected, expected_bare):
                 bad += 1
                 print(f"DIFF [{name}] q={q} sort={sort}")
                 print(f"  indexed={indexed}  no-index={bare}  mongod={expected}")
@@ -269,6 +293,7 @@ def main() -> int:
             lambda f: {f: {"$in": rng.sample(VALUES, 2)}},
             lambda f: {f: {"$gt": rng.choice([0, 1, 5])}},
             lambda f: {f: {"$lte": rng.choice([0, 1, 5, 1.5])}},
+            lambda f: {f: {rng.choice(["$gt", "$gte", "$lt", "$lte"]): rng.choice(VALUES)}},
             lambda f: {f: {"$ne": rng.choice(VALUES)}},
             lambda f: {f: {"$exists": rng.choice([True, False])}},
         ]
@@ -306,9 +331,10 @@ def main() -> int:
                 indexed = _ids(sec[dbn].c, q, sort)
                 bare = _ids(sec[dbn].bare, q, sort)
                 expected = _ids(mon[dbn].c, q, sort)
+                expected_bare = _ids(mon[dbn].bare, q, sort)
             except pymongo.errors.PyMongoError:
                 continue
-            if indexed != bare or indexed != expected:
+            if _diverges(indexed, bare, expected, expected_bare):
                 rbad += 1
                 if rbad <= 6:
                     print(f"DIFF idx={keys}{opts} q={q} sort={sort}")

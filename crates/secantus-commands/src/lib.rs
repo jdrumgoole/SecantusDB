@@ -1203,7 +1203,7 @@ fn run_handler(handler: Handler, doc: &Document, ctx: &mut CommandContext) -> Do
         }
         Err(mut e) => {
             if budget > 0 && e.code == deadline::MaxTimeMsExpired::CODE {
-                if let Some(prefix) = executor_error_prefix(doc, ctx) {
+                if let Some(prefix) = executor_error_prefix(doc, &ctx.db_name) {
                     e.errmsg = format!("{prefix} :: caused by :: {}", e.errmsg);
                 }
             }
@@ -1219,11 +1219,11 @@ fn run_handler(handler: Handler, doc: &Document, ctx: &mut CommandContext) -> Do
 /// mongod sends the bare message for these four too when the budget is gone
 /// before execution starts, which on this server is only the
 /// `maxTimeAlwaysTimeOut` failpoint, answered before the handler runs.
-fn executor_error_prefix(doc: &Document, ctx: &CommandContext) -> Option<String> {
+fn executor_error_prefix(doc: &Document, db: &str) -> Option<String> {
     let (name, target) = doc.iter().next()?;
     let ns = match target {
-        Bson::String(coll) => format!("{}.{coll}", ctx.db_name),
-        _ => format!("{}.$cmd.{name}", ctx.db_name),
+        Bson::String(coll) => format!("{db}.{coll}"),
+        _ => format!("{db}.$cmd.{name}"),
     };
     match name.as_str() {
         "find" => Some(format!("Executor error during find command: {ns}")),
@@ -2293,6 +2293,44 @@ mod tests {
     /// not depend on secantus-core. Two copies of a constant is how they drift,
     /// so this pins them: if the core ever changes the code or the wording, this
     /// fails rather than the two halves quietly disagreeing over the wire.
+    /// mongod 8.2.11 (2026-09-30), a budget spent mid-execution: the four read
+    /// commands carry their executor prefix, everything else is bare.
+    #[test]
+    fn max_time_expiry_prefix_is_per_command() {
+        let p = |d: Document| executor_error_prefix(&d, "db");
+        assert_eq!(
+            p(doc! {"find": "c"}).as_deref(),
+            Some("Executor error during find command: db.c")
+        );
+        for cmd in ["aggregate", "distinct", "count"] {
+            assert_eq!(
+                p(doc! {cmd: "c"}),
+                Some(format!(
+                    "Executor error during {cmd} command on namespace: db.c"
+                ))
+            );
+        }
+        for cmd in ["findAndModify", "update", "delete", "createIndexes"] {
+            assert_eq!(p(doc! {cmd: "c"}), None, "{cmd}");
+        }
+    }
+
+    /// An interrupted write fails the COMMAND; a duplicate key does not.
+    #[test]
+    fn expired_write_statement_fails_the_command() {
+        let reply =
+            doc! {"n": 0, "writeErrors": [{"index": 0, "code": 50, "errmsg": "x"}], "ok": 1.0};
+        let err = expired_write_statement(&doc! {"update": "c"}, &reply).expect("lifted");
+        assert_eq!(
+            (err.code, err.errmsg.as_str()),
+            (50, "operation exceeded time limit")
+        );
+        let dup =
+            doc! {"n": 0, "writeErrors": [{"index": 0, "code": 11000, "errmsg": "x"}], "ok": 1.0};
+        assert!(expired_write_statement(&doc! {"insert": "c"}, &dup).is_none());
+        assert!(expired_write_statement(&doc! {"find": "c"}, &reply).is_none());
+    }
+
     #[test]
     fn max_time_expired_matches_core() {
         use secantus_core::deadline::MaxTimeMsExpired as E;
