@@ -1,7 +1,8 @@
 # reference-version: 15
 # Rules (CREATE RULE on INSERT / UPDATE / DELETE: ALSO, INSTEAD, INSTEAD
 # NOTHING, a WHERE), DROP RULE, ALTER TABLE ENABLE / DISABLE RULE and
-# TRIGGER, and pg_rewrite / pg_trigger.tgenabled.
+# TRIGGER, pg_rewrite / pg_trigger.tgenabled, and pg_rules.definition as
+# ruleutils prints it.
 create table rl_t (id int primary key, v text)
 create table rl_log (op text, id int, v text)
 create rule rl_ins as on insert to rl_t do also insert into rl_log values ('i', new.id, new.v)
@@ -20,6 +21,7 @@ insert into rl_ro values (7)
 select count(*) from rl_ro
 select * from rl_log where op = 'redirect'
 select rulename, ev_type, is_instead from pg_rewrite r join pg_class c on c.oid = r.ev_class where c.relname like 'rl_%' order by 1
+select rulename, definition from pg_rules where tablename = 'rl_t' order by 1
 create rule rl_ins as on insert to rl_t do also nothing
 create or replace rule rl_ins as on insert to rl_t do also nothing
 insert into rl_t values (3, 'c')
@@ -45,3 +47,12 @@ select rulename, ev_enabled from pg_rewrite where rulename = 'rl_del'
 select rulename, definition from pg_rules where rulename = 'rl_del'
 drop table rl_t, rl_log, rl_ro
 drop function rl_tf()
+create table rd_t (id int primary key, v text, n numeric)
+create table rd_log (op text, id int, v text)
+create rule rd_1 as on insert to rd_t do also insert into rd_log values ('i', new.id, new.v)
+create rule rd_2 as on update to rd_t where old.v <> new.v do also insert into rd_log (id, op) values (new.id, 'u')
+create rule rd_3 as on delete to rd_t do instead (delete from rd_log where rd_log.id = old.id; insert into rd_log values ('d', old.id, null))
+create rule rd_4 as on update to rd_t do also update rd_log set v = new.v, op = 'x' where id = old.id
+create rule rd_5 as on insert to rd_t where new.n > 1 do instead nothing
+select rulename, definition from pg_rules where tablename = 'rd_t' order by 1
+drop table rd_t, rd_log

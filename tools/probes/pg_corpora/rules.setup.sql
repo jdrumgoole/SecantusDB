@@ -1,2 +1,3 @@
 DROP TABLE IF EXISTS rl_t, rl_log, rl_ro
 DROP FUNCTION IF EXISTS rl_tf()
+DROP TABLE IF EXISTS rd_t, rd_log

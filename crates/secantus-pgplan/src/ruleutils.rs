@@ -31,6 +31,8 @@ const PRETTYINDENT_VAR: i32 = 4;
 struct Rte {
     refname: String,
     columns: Vec<(String, String)>,
+    /// A rule's NEW / OLD: named only when qualified.
+    qualified_only: bool,
 }
 
 /// Where a query's relations and views come from.
@@ -243,7 +245,7 @@ impl<'a> Printer<'a> {
                 [col] => {
                     let hits: Vec<&Rte> = scope
                         .iter()
-                        .filter(|r| r.columns.iter().any(|(n, _)| n == col))
+                        .filter(|r| !r.qualified_only && r.columns.iter().any(|(n, _)| n == col))
                         .collect();
                     match hits.as_slice() {
                         [r] => return Some((r.refname.clone(), col.clone(), find_col(r, col)?)),
@@ -1451,6 +1453,7 @@ impl Printer<'_> {
                             .map(|a| a.aliasname.clone())
                             .unwrap_or_else(|| rv.relname.clone()),
                         columns,
+                        qualified_only: false,
                     });
                 }
                 N::JoinExpr(j) => {
@@ -1474,6 +1477,7 @@ impl Printer<'_> {
                     out.push(Rte {
                         refname: alias.aliasname.clone(),
                         columns,
+                        qualified_only: false,
                     });
                 }
                 _ => return None,
@@ -2084,4 +2088,219 @@ fn bool_simple(own: BoolExprType, parent: Parent<'_>) -> bool {
         },
         _ => false,
     }
+}
+
+impl Printer<'_> {
+    /// A rule action: `get_insert_query_def` / `_update_` / `_delete_`.
+    fn dml(&mut self, n: &Node) -> Option<()> {
+        match n.node.as_ref()? {
+            N::InsertStmt(ins) => {
+                if ins.on_conflict_clause.is_some()
+                    || !ins.returning_list.is_empty()
+                    || ins.with_clause.is_some()
+                {
+                    return None;
+                }
+                let rel = ins.relation.as_ref()?;
+                if rel.alias.is_some() {
+                    return None;
+                }
+                let columns = self.relation_columns(&rel.relname)?;
+                self.indent += PRETTYINDENT_STD;
+                self.buf.push(' ');
+                self.buf
+                    .push_str(&format!("INSERT INTO {} ", q(&rel.relname)));
+                let targets: Vec<(String, String)> = if ins.cols.is_empty() {
+                    columns.clone()
+                } else {
+                    ins.cols
+                        .iter()
+                        .map(|c| match c.node.as_ref() {
+                            Some(N::ResTarget(rt)) if rt.indirection.is_empty() => {
+                                columns.iter().find(|(n, _)| *n == rt.name).cloned()
+                            }
+                            _ => None,
+                        })
+                        .collect::<Option<Vec<_>>>()?
+                };
+                let Some(N::SelectStmt(sel)) =
+                    ins.select_stmt.as_deref().and_then(|s| s.node.as_ref())
+                else {
+                    return None;
+                };
+                let [row] = sel.values_lists.as_slice() else {
+                    return None;
+                };
+                let Some(N::List(values)) = row.node.as_ref() else {
+                    return None;
+                };
+                let used = &targets[..values.items.len().min(targets.len())];
+                let cols: Vec<String> = used.iter().map(|(n, _)| q(n)).collect();
+                self.buf.push_str(&format!("({}) ", cols.join(", ")));
+                self.keyword("VALUES (", -PRETTYINDENT_STD, PRETTYINDENT_STD, 2);
+                for (i, (v, (_, ty))) in values.items.iter().zip(used).enumerate() {
+                    if i > 0 {
+                        self.buf.push_str(", ");
+                    }
+                    // Only an untyped literal shows the column's type; an
+                    // assignment cast is implicit and not printed here.
+                    if self.typ(v)? == "unknown" {
+                        self.const_as(v, ty)?;
+                    } else {
+                        self.expr(v)?;
+                    }
+                }
+                self.buf.push(')');
+            }
+            N::UpdateStmt(u) => {
+                if !u.from_clause.is_empty()
+                    || !u.returning_list.is_empty()
+                    || u.with_clause.is_some()
+                {
+                    return None;
+                }
+                let rel = u.relation.as_ref()?;
+                if rel.alias.is_some() {
+                    return None;
+                }
+                let columns = self.relation_columns(&rel.relname)?;
+                self.scopes.last_mut()?.push(Rte {
+                    refname: rel.relname.clone(),
+                    columns: columns.clone(),
+                    qualified_only: false,
+                });
+                self.indent += PRETTYINDENT_STD;
+                self.buf.push(' ');
+                self.buf
+                    .push_str(&format!("UPDATE {} SET ", q(&rel.relname)));
+                for (i, t) in u.target_list.iter().enumerate() {
+                    let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+                        return None;
+                    };
+                    if !rt.indirection.is_empty() {
+                        return None;
+                    }
+                    let ty = columns.iter().find(|(n, _)| *n == rt.name)?.1.clone();
+                    if i > 0 {
+                        self.buf.push_str(", ");
+                    }
+                    self.buf.push_str(&format!("{} = ", q(&rt.name)));
+                    let v = rt.val.as_deref()?;
+                    if self.typ(v)? == "unknown" {
+                        self.const_as(v, &ty)?;
+                    } else {
+                        self.expr(v)?;
+                    }
+                }
+                if let Some(w) = u.where_clause.as_deref() {
+                    self.keyword(" WHERE ", -PRETTYINDENT_STD, PRETTYINDENT_STD, 1);
+                    self.expr(w)?;
+                }
+            }
+            N::DeleteStmt(d) => {
+                if !d.using_clause.is_empty()
+                    || !d.returning_list.is_empty()
+                    || d.with_clause.is_some()
+                {
+                    return None;
+                }
+                let rel = d.relation.as_ref()?;
+                if rel.alias.is_some() {
+                    return None;
+                }
+                let columns = self.relation_columns(&rel.relname)?;
+                self.scopes.last_mut()?.push(Rte {
+                    refname: rel.relname.clone(),
+                    columns,
+                    qualified_only: false,
+                });
+                self.indent += PRETTYINDENT_STD;
+                self.buf.push(' ');
+                self.buf
+                    .push_str(&format!("DELETE FROM {}", q(&rel.relname)));
+                if let Some(w) = d.where_clause.as_deref() {
+                    self.keyword(" WHERE ", -PRETTYINDENT_STD, PRETTYINDENT_STD, 1);
+                    self.expr(w)?;
+                }
+            }
+            N::SelectStmt(_) => self.query(n, None)?,
+            _ => return None,
+        }
+        Some(())
+    }
+}
+
+/// `pg_get_ruledef` / `pg_rules.definition` for an INSERT / UPDATE /
+/// DELETE rule (`make_ruledef` under PRETTYFLAG_INDENT).
+pub fn rule_def(
+    name: &str,
+    table: &str,
+    event: &str,
+    instead: bool,
+    condition: Option<&str>,
+    actions: &[String],
+    cat: &Catalog<'_>,
+) -> Option<String> {
+    let mut base = Printer::new(cat, 0);
+    let columns = base.relation_columns(table)?;
+    // NEW and OLD, as the event gives them.
+    let mut pseudo = Vec::new();
+    if event != "DELETE" {
+        pseudo.push(Rte {
+            refname: "new".into(),
+            columns: columns.clone(),
+            qualified_only: true,
+        });
+    }
+    if event != "INSERT" {
+        pseudo.push(Rte {
+            refname: "old".into(),
+            columns,
+            qualified_only: true,
+        });
+    }
+    let mut out = format!(
+        "CREATE RULE {} AS\n    ON {event} TO public.{}",
+        q(name),
+        q(table)
+    );
+    if let Some(c) = condition {
+        let node = parse_select(&format!("SELECT {c}"))?;
+        let Some(N::SelectStmt(s)) = node.node.as_ref() else {
+            return None;
+        };
+        let Some(N::ResTarget(rt)) = s.target_list.first()?.node.as_ref() else {
+            return None;
+        };
+        let mut p = Printer::new(cat, 0);
+        p.scopes.push(pseudo.clone());
+        p.expr(rt.val.as_deref()?)?;
+        out.push_str("\n   WHERE ");
+        out.push_str(&p.buf);
+    }
+    out.push_str(" DO ");
+    if instead {
+        out.push_str("INSTEAD ");
+    }
+    let render = |sql: &str| -> Option<String> {
+        let node = parse_select(sql)?;
+        let mut p = Printer::new(cat, 0);
+        p.scopes.push(pseudo.clone());
+        p.dml(&node)?;
+        Some(p.buf)
+    };
+    match actions {
+        [] => out.push_str("NOTHING"),
+        [one] => out.push_str(&render(one)?),
+        many => {
+            out.push('(');
+            for a in many {
+                out.push_str(&render(a)?);
+                out.push_str(";\n");
+            }
+            out.push(')');
+        }
+    }
+    out.push(';');
+    Some(out)
 }

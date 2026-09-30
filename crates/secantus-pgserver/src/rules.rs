@@ -273,10 +273,33 @@ impl PgHandler {
     /// `pg_rules`: each rule's definition as ruleutils prints it.
     pub(crate) fn pg_rules_rows(&self, def: &TableDef) -> Vec<Document> {
         let f = |name: &str| def.field_of(name).expect("column");
+        let views = self.views().unwrap_or_default();
+        let lookup = |n: &str| self.lookup(n);
+        let view_sql = |n: &str| views.iter().find(|(v, _)| v == n).map(|(_, d)| d.clone());
+        let cat = secantus_pgplan::ruleutils::Catalog {
+            lookup: &lookup,
+            view_sql: &view_sql,
+        };
         self.rule_docs()
             .iter()
             .map(rule_of)
             .map(|(r, _, _)| {
+                if let Some(text) = secantus_pgplan::ruleutils::rule_def(
+                    &r.name,
+                    &r.table,
+                    &r.event,
+                    r.instead,
+                    r.condition.as_deref(),
+                    &r.actions,
+                    &cat,
+                ) {
+                    let mut d = Document::new();
+                    d.insert(f("schemaname"), "public");
+                    d.insert(f("tablename"), r.table.as_str());
+                    d.insert(f("rulename"), r.name.as_str());
+                    d.insert(f("definition"), text);
+                    return d;
+                }
                 let condition = r
                     .condition
                     .as_ref()
