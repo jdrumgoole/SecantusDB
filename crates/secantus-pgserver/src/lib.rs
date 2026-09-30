@@ -9492,6 +9492,12 @@ fn internal_type_name(ty: &Type) -> Option<String> {
             650 => "cidr",
             1033 => "aclitem",
             603 => "box",
+            600 => "point",
+            601 => "lseg",
+            602 => "path",
+            604 => "polygon",
+            628 => "line",
+            718 => "circle",
             1043 => "varchar",
             1042 => "bpchar",
             19 => "name",
@@ -9524,6 +9530,12 @@ fn internal_type_name(ty: &Type) -> Option<String> {
             1041 => "inet[]",
             651 => "cidr[]",
             1020 => "box[]",
+            1017 => "point[]",
+            1018 => "lseg[]",
+            1019 => "path[]",
+            1027 => "polygon[]",
+            629 => "line[]",
+            719 => "circle[]",
             2951 => "uuid[]",
             oid => {
                 return secantus_pgplan::range::range_oid_name(oid)
@@ -9560,7 +9572,9 @@ fn type_size(ty: &Type) -> i16 {
         Type::INT8 | Type::FLOAT8 | Type::TIME | Type::TIMESTAMP | Type::TIMESTAMPTZ => 8,
         Type::TIMETZ => 12,
         Type::INTERVAL | Type::UUID => 16,
-        Type::BOX => 32,
+        Type::BOX | Type::LSEG => 32,
+        Type::POINT => 16,
+        Type::LINE | Type::CIRCLE => 24,
         Type::NAME => 64,
         _ => -1,
     }
@@ -9589,6 +9603,12 @@ fn wire_type(pg_type: &str) -> Type {
         "cidr" => Type::CIDR,
         "aclitem" => Type::ACLITEM,
         "box" => Type::BOX,
+        "point" => Type::POINT,
+        "lseg" => Type::LSEG,
+        "path" => Type::PATH,
+        "polygon" => Type::POLYGON,
+        "line" => Type::LINE,
+        "circle" => Type::CIRCLE,
         "varchar" | "character varying" => Type::VARCHAR,
         "bpchar" | "char" | "character" => Type::BPCHAR,
         "name" => Type::NAME,
@@ -9709,6 +9729,12 @@ fn wire_type(pg_type: &str) -> Type {
         "cidr[]" => Type::CIDR_ARRAY,
         "aclitem[]" => Type::ACLITEM_ARRAY,
         "box[]" => Type::BOX_ARRAY,
+        "point[]" => Type::POINT_ARRAY,
+        "lseg[]" => Type::LSEG_ARRAY,
+        "path[]" => Type::PATH_ARRAY,
+        "polygon[]" => Type::POLYGON_ARRAY,
+        "line[]" => Type::LINE_ARRAY,
+        "circle[]" => Type::CIRCLE_ARRAY,
         "uuid[]" => Type::UUID_ARRAY,
         "bpchar[]" | "char[]" | "character[]" => Type::BPCHAR_ARRAY,
         "name[]" => Type::NAME_ARRAY,
@@ -19264,7 +19290,20 @@ fn copy_reassemble(d: &Document, field: &str, ty: &Type) -> Option<Bson> {
 /// every type, and the gap is recorded in `tasks/backlog.md` rather than
 /// hidden.
 fn binary_encodable(ty: &Type) -> bool {
-    const OK: [Type; 43] = [
+    const OK: [Type; 56] = [
+        Type::POINT_ARRAY,
+        Type::LSEG_ARRAY,
+        Type::PATH_ARRAY,
+        Type::POLYGON_ARRAY,
+        Type::LINE_ARRAY,
+        Type::CIRCLE_ARRAY,
+        Type::BOX_ARRAY,
+        Type::POINT,
+        Type::LSEG,
+        Type::PATH,
+        Type::POLYGON,
+        Type::LINE,
+        Type::CIRCLE,
         Type::OID,
         Type::XML,
         Type::INT2_VECTOR,
@@ -19660,6 +19699,14 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
             .ok_or_else(|| bad("this value"))?;
         return enc.encode_field(&Some(oid));
     }
+    // The other geometric types' `*_send` layouts.
+    if matches!(
+        *ty,
+        Type::POINT | Type::LSEG | Type::PATH | Type::POLYGON | Type::LINE | Type::CIRCLE
+    ) {
+        let g = secantus_pgplan::geom::from_bson(v).ok_or_else(|| bad("this value"))?;
+        return enc.encode_field(&Some(secantus_pgplan::geom::to_binary(&g)));
+    }
     // `box_send`: the high corner, then the low one, each as two float8s.
     if *ty == Type::BOX {
         let c = secantus_pgplan::geo::box_coords(v).ok_or_else(|| bad("this value"))?;
@@ -19956,6 +20003,13 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
         Type::CIDR_ARRAY => Some(Type::CIDR),
         Type::JSON_ARRAY => Some(Type::JSON),
         Type::JSONB_ARRAY => Some(Type::JSONB),
+        Type::POINT_ARRAY => Some(Type::POINT),
+        Type::LSEG_ARRAY => Some(Type::LSEG),
+        Type::PATH_ARRAY => Some(Type::PATH),
+        Type::POLYGON_ARRAY => Some(Type::POLYGON),
+        Type::LINE_ARRAY => Some(Type::LINE),
+        Type::CIRCLE_ARRAY => Some(Type::CIRCLE),
+        Type::BOX_ARRAY => Some(Type::BOX),
         _ => match ty.kind() {
             postgres_types::Kind::Array(inner) if datetime_or_range_kind(inner) => {
                 Some(inner.clone())
@@ -20544,6 +20598,9 @@ fn encode_value(enc: &mut DataRowEncoder, v: Option<&Bson>) -> PgWireResult<()> 
         // A box is four corners in a document; the wire wants `(h),(l)`.
         if let Some(coords) = secantus_pgplan::geo::box_coords(value) {
             return enc.encode_field(&Some(secantus_pgplan::geo::box_text(&coords).as_str()));
+        }
+        if let Some(g) = secantus_pgplan::geom::from_bson(value) {
+            return enc.encode_field(&Some(secantus_pgplan::geom::text(&g).as_str()));
         }
     }
     match v {
@@ -21947,6 +22004,13 @@ impl ToSqlText for RawField {
 /// prefix). Mirrors the single-value arms of `encode_binary`; returns `None`
 /// for an element type whose binary layout this server does not emit.
 fn element_binary(v: &Bson, elem: &Type) -> Option<Vec<u8>> {
+    // A geometric element: its type's `*_send` layout.
+    if matches!(
+        *elem,
+        Type::POINT | Type::LSEG | Type::PATH | Type::POLYGON | Type::LINE | Type::CIRCLE | Type::BOX
+    ) {
+        return secantus_pgplan::geom::from_bson(v).map(|g| secantus_pgplan::geom::to_binary(&g));
+    }
     // A COMPOSITE or anonymous RECORD element: its own binary record format.
     // (Checked before the oid match because a user composite's oid is not one
     // of the built-in codes below.)
@@ -22269,6 +22333,12 @@ fn element_of_array_oid(oid: u32) -> Option<&'static str> {
         651 => "cidr",
         1034 => "aclitem",
         1020 => "box",
+        1017 => "point",
+        1018 => "lseg",
+        1019 => "path",
+        1027 => "polygon",
+        629 => "line",
+        719 => "circle",
         2951 => "uuid",
         // `oid[]` sent as text (`{1,2}`, psycopg's `[Oid(1), Oid(2)]`) used to
         // stay the literal string, and a binary result then refused it as
@@ -22693,6 +22763,12 @@ fn decode_parameter(
                 bytes[..4].try_into().expect("checked"),
             )))),
             Some(16) if bytes.len() == 1 => Ok(Bson::Boolean(bytes[0] != 0)),
+            Some(oid @ (600 | 601 | 602 | 603 | 604 | 628 | 718)) => {
+                let ty = secantus_pgplan::pgtypes::name_of_oid(i64::from(oid)).unwrap_or("point");
+                secantus_pgplan::geom::from_binary(ty, bytes)
+                    .map(|g| secantus_pgplan::geom::to_bson(&g))
+                    .map_err(|e| PgHandler::err(&e))
+            }
             // An oid is a 4-byte UNSIGNED integer; through i64 so the value
             // survives the top bit.
             Some(26) if bytes.len() == 4 => Ok(Bson::Int64(i64::from(u32::from_be_bytes(
@@ -22970,6 +23046,10 @@ fn decode_parameter(
         }
         Some(603) => {
             secantus_pgplan::cast_text_to(&text, "box", tz).map_err(|e| PgHandler::err(&e))
+        }
+        Some(oid @ (600 | 601 | 602 | 604 | 628 | 718)) => {
+            let ty = secantus_pgplan::pgtypes::name_of_oid(i64::from(oid)).unwrap_or("point");
+            secantus_pgplan::cast_text_to(&text, ty, tz).map_err(|e| PgHandler::err(&e))
         }
         // The TYPED text forms. These reach the same value the BINARY path
         // produces for the same oid, which is the whole point: a parameter's

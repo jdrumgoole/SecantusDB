@@ -14385,3 +14385,39 @@ def test_trigger_transition_tables(home: Path) -> None:
         conn.execute("INSERT INTO trt VALUES (1, 10), (2, 20)")
         assert _fetch(conn, "SELECT msg FROM trlog") == [("2:30",)]
         assert _fetch(conn, "SELECT count(*) FROM pg_class WHERE relname = 'nt'") == [(0,)]
+
+
+def test_geometric_types(home: Path) -> None:
+    """point / lseg / line / path / polygon / circle: input and output forms,
+    casts, the common operators and functions, stored columns, and binary
+    results byte-identical to PostgreSQL 14's `*_send`."""
+    with _Server(home) as server, server.connect() as conn:
+        assert _fetch(
+            conn,
+            "SELECT '1 , 2'::point::text, '1,2,3,4'::lseg::text, '[(0,0),(1,1)]'::line::text, "
+            "'1,2,3,4'::path::text, '(0,0),(1,0),(1,1)'::polygon::text, '1,2,3'::circle::text",
+        ) == [
+            (
+                "(1,2)",
+                "[(1,2),(3,4)]",
+                "{1,-1,0}",
+                "((1,2),(3,4))",
+                "((0,0),(1,0),(1,1))",
+                "<(1,2),3>",
+            )
+        ]
+        assert _fetch(
+            conn,
+            "SELECT point(1.5, 2.25) <-> point(4, 6), circle '<(0,0),5>' @> point '(3,4)', "
+            "(point '(1,2)' * point '(3,4)')::text, area(circle '<(0,0),1>')",
+        ) == [(4.5069390943299865, True, "(-5,10)", 3.141592653589793)]
+        assert _sqlstate(conn, "SELECT area('((0,0),(4,0),(4,3))'::polygon)") == "42883"
+        conn.execute("CREATE TABLE gtt (id int PRIMARY KEY, p point, c circle)")
+        conn.execute("INSERT INTO gtt VALUES (1, '(3,4)', '<(0,0),1>')")
+        assert _fetch(
+            conn, "SELECT p[0], p <-> point '(0,0)', length('[(0,0),(3,4)]'::lseg) FROM gtt"
+        ) == [(3.0, 5.0, 5.0)]
+        cur = conn.cursor(binary=True)
+        cur.execute("SELECT p, c FROM gtt")
+        assert cur.pgresult.fformat(0) == 1
+        assert cur.pgresult.get_value(0, 0) == bytes.fromhex("40080000000000004010000000000000")

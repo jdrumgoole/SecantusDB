@@ -33,6 +33,7 @@ pub mod joins;
 pub mod partitions;
 pub mod instead_of;
 pub mod pgcrypto;
+pub mod geom;
 pub use correlated::set_user_functions;
 pub use correlated::{
     with_correlated_runner, with_function_hook, with_sequence_hook, FnResult, UserFn,
@@ -2134,6 +2135,30 @@ fn array_subscript(
     let value = const_value(arg, params)?;
     if value == Bson::Null {
         return Ok(Bson::Null);
+    }
+    // `point[0]`, `lseg[1]`, `box[0]`: a geometric value's coordinates or
+    // corner points.
+    if let Some(g) = geom::from_bson(&value) {
+        if let [one] = indirection {
+            if let Some(N::AIndices(ix)) = one.node.as_ref() {
+                if !ix.is_slice {
+                    let i = ix
+                        .uidx
+                        .as_deref()
+                        .map(|n| const_value(n, params))
+                        .transpose()?
+                        .and_then(|v| match v {
+                            Bson::Int32(i) => Some(i64::from(i)),
+                            Bson::Int64(i) => Some(i),
+                            _ => None,
+                        })
+                        .unwrap_or(-1);
+                    if let Some(v) = geom::subscript(&g, i) {
+                        return Ok(v);
+                    }
+                }
+            }
+        }
     }
     if !matches!(value, Bson::Array(_)) {
         return Err(Error::DatatypeMismatch(format!(
@@ -8759,6 +8784,13 @@ fn plan_table_targets(
                     && def.column(&column).is_some_and(|c| c.pg_type == "tsvector")
                 {
                     "tsvector_length".to_string()
+                } else if name == "length"
+                    && def
+                        .column(&column)
+                        .is_some_and(|c| matches!(c.pg_type.as_str(), "lseg" | "path"))
+                {
+                    // A segment's or a path's length is a float8.
+                    "geom_length".to_string()
                 } else {
                     name
                 };
@@ -14348,6 +14380,18 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
             let name = func_name(f).expect("checked");
             bit_function_type(f, &name).expect("checked")
         }
+        // `length` of a line segment or a path is its float8 length, not a
+        // string's character count.
+        Some(N::FuncCall(f))
+            if func_name(f).as_deref() == Some("length")
+                && f.args.len() == 1
+                && matches!(
+                    static_type(&f.args[0], &Bson::Null).as_str(),
+                    "lseg" | "path"
+                ) =>
+        {
+            "float8".to_string()
+        }
         Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("to_regtype") => {
             "regtype".to_string()
         }
@@ -14557,6 +14601,8 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
                     if any_slice { "int2[]" } else { "int2" }.to_string()
                 }
                 None if base == "oidvector" => if any_slice { "oid[]" } else { "oid" }.to_string(),
+                None if base == "point" => "float8".to_string(),
+                None if matches!(base.as_str(), "lseg" | "box") => "point".to_string(),
                 None => inferred_type(value).to_string(),
             }
         }
@@ -14612,10 +14658,19 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
                 };
             }
             let op = operator_name(e).unwrap_or("");
+            // A prefix operator over a geometric operand (`@@ circle`).
+            if let (None, Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
+                if let Some(t) = geom::unary_type(op, &static_type(r, &Bson::Null)) {
+                    return t.to_string();
+                }
+            }
             if let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
                 let (lt, rt) = (static_type(l, &Bson::Null), static_type(r, &Bson::Null));
                 if let Some(t) = range_ops::result_type(op, &lt, &rt) {
                     return t;
+                }
+                if let Some(t) = geom::operator_type(op, &lt, &rt) {
+                    return t.to_string();
                 }
                 // jsonb's `-` / `#-` / `||` answer jsonb.
                 if (lt == "jsonb" && matches!(op, "-" | "#-" | "||"))
@@ -15153,6 +15208,14 @@ pub(crate) fn inferred_type(v: &Bson) -> &'static str {
             Some(Bson::Binary(_)) => "bytea[]",
             Some(inner @ Bson::Array(_)) => inferred_type(inner),
             Some(other) if geo::is_box(other) => "box[]",
+            Some(other) if geom::is_geom(other) => match geom::from_bson(other).map(|g| g.type_name()) {
+                Some("point") => "point[]",
+                Some("lseg") => "lseg[]",
+                Some("line") => "line[]",
+                Some("path") => "path[]",
+                Some("polygon") => "polygon[]",
+                _ => "circle[]",
+            },
             _ => "text[]",
         },
         Bson::Boolean(_) => "bool",
@@ -15162,6 +15225,7 @@ pub(crate) fn inferred_type(v: &Bson) -> &'static str {
         // format rendered `\x..` under oid 17.
         Bson::Binary(_) => "bytea",
         other if geo::is_box(other) => "box",
+        other if geom::is_geom(other) => geom::from_bson(other).map_or("text", |g| g.type_name()),
         _ => "text",
     }
 }
@@ -15750,6 +15814,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                             || xml::result_type(&name).is_some()
                             || jsonops::result_type(&name).is_some()
                             || mathfn::result_type(&name).is_some()
+                            || geom::result_type(&name).is_some()
                             || pgcrypto::result_type(&name).is_some()
                             || jsonpath::is_function(&name)
                         {
@@ -19484,6 +19549,9 @@ fn render_array_element(v: &Bson) -> String {
         // A box's commas are not the array's delimiter (that is `;`), so the
         // text needs no quoting: `{(3,4),(1,2);(7,8),(5,6)}`.
         _ if geo::is_box(v) => return geo::box_text(&geo::box_coords(v).expect("checked")),
+        // The other geometric types' commas ARE the delimiter, so their text
+        // is quoted below: `{"(1,2)","(3,4)"}`.
+        _ if geom::is_geom(v) => geom::text(&geom::from_bson(v).expect("checked")),
         // A bytea element renders as its `\x…` hex, then the array-quoting
         // below wraps and escapes it (`"\\x01"`), matching PostgreSQL.
         Bson::Binary(b) => bytea::render_hex(&b.bytes),
@@ -19911,6 +19979,21 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
     }
     // A box renders to text as `(high),(low)` and is a no-op cast to itself;
     // no other cast is defined for it on PostgreSQL.
+    // The other geometric types, from their text, and between each other.
+    if let Some(g) = geom::from_bson(&value).filter(|g| !matches!(g, geom::Geo::Box(..))) {
+        return geom::cast(&g, target);
+    }
+    if geom::TYPES.contains(&target) {
+        return match &value {
+            Bson::String(text) => geom::parse(target, text).map(|g| geom::to_bson(&g)),
+            other if geo::is_box(other) => geom::cast(&geom::from_bson(other).expect("box"), target),
+            other => Err(Error::CannotCoerce(format!(
+                "cannot cast type {} to {}",
+                display_type(inferred_type(other)),
+                target
+            ))),
+        };
+    }
     if let Some(coords) = geo::box_coords(&value) {
         return match target {
             "text" | "varchar" | "bpchar" | "name" => Ok(Bson::String(geo::box_text(&coords))),
@@ -21480,6 +21563,12 @@ fn overload_name(f: &pg_query::protobuf::FuncCall, name: String) -> String {
     if name == "length" && f.args.len() == 1 && static_type(&f.args[0], &Bson::Null) == "tsvector" {
         return "tsvector_length".to_string();
     }
+    if name == "length"
+        && f.args.len() == 1
+        && matches!(static_type(&f.args[0], &Bson::Null).as_str(), "lseg" | "path")
+    {
+        return "geom_length".to_string();
+    }
     name
 }
 
@@ -21813,7 +21902,21 @@ fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
     // box operators (`geo_ops.c`): equality and ordering compare AREAS within
     // EPSILON, `~=` compares corners, the rest are positional.
     if let (Some(a), Some(b)) = (geo::box_coords(&lhs), geo::box_coords(&rhs)) {
-        return box_operator(op, &a, &b);
+        // Distance is the geometric module's (between the centres).
+        if op != "<->" {
+            return box_operator(op, &a, &b);
+        }
+    }
+    // The other geometric types, and a box beside one of them.
+    if let (Some(a), Some(b)) = (geom::from_bson(&lhs), geom::from_bson(&rhs)) {
+        if let Some(out) = geom::operator(op, &a, &b) {
+            return out;
+        }
+        return Err(Error::UndefinedFunction(format!(
+            "operator does not exist: {} {op} {}",
+            a.type_name(),
+            b.type_name()
+        )));
     }
     // `^` is `power()` under another name: `numeric_power` over numerics,
     // `dpow` (float8) otherwise -- there is no integer `^`.
@@ -24494,6 +24597,15 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                     .is_some_and(|r| bits::is_bit_type(&static_type(r, &rhs))) =>
                 {
                     return Ok(bits::not(&rhs));
+                }
+                _ if geom::from_bson(&rhs).is_some() => {
+                    let g = geom::from_bson(&rhs).expect("checked");
+                    return geom::unary(op.as_str(), &g).unwrap_or_else(|| {
+                        Err(Error::UndefinedFunction(format!(
+                            "operator does not exist: {op} {}",
+                            g.type_name()
+                        )))
+                    });
                 }
                 "!!" if rhs == Bson::Null => return Ok(Bson::Null),
                 "!!" => return fts::not_value(&rhs),
