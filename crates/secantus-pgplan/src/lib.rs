@@ -2318,6 +2318,15 @@ pub struct ExplainOptions {
     pub costs: bool,
     /// `text` or `json`.
     pub format: String,
+    /// A single-relation statement's WHERE, as the scan's `Index Cond` /
+    /// `Filter` print it: each AND conjunct's text and, for an index-usable
+    /// one, the column it constrains.
+    pub scan_quals: Vec<(String, Option<String>)>,
+    /// Each JOIN's ON condition, post-order, as its join node prints it.
+    pub join_conds: Vec<String>,
+    /// A joined SELECT's WHERE conjuncts, each with the relation whose scan
+    /// it filters (`None`: the top join's filter).
+    pub join_where: Vec<(String, Option<String>)>,
 }
 
 /// `CREATE [OR REPLACE] VIEW`.
@@ -6127,6 +6136,9 @@ fn plan_explain(
         verbose: false,
         costs: true,
         format: "text".into(),
+        scan_quals: Vec::new(),
+        join_conds: Vec::new(),
+        join_where: Vec::new(),
     };
     for o in &e.options {
         let Some(N::DefElem(d)) = o.node.as_ref() else {
@@ -6180,7 +6192,28 @@ fn plan_explain(
         .as_deref()
         .and_then(|q| q.node.clone())
         .ok_or_else(|| Error::Parse("EXPLAIN without a statement".into()))?;
+    let scan_quals = explain_scan_quals(&query, lookup).unwrap_or_default();
+    let join_conds = match &query {
+        N::SelectStmt(s) => {
+            let none = |_: &str| None;
+            let cat = ruleutils::Catalog {
+                lookup,
+                view_sql: &none,
+            };
+            options.join_where = if s.from_clause.len() == 1
+                && matches!(s.from_clause[0].node.as_ref(), Some(N::JoinExpr(_)))
+            {
+                ruleutils::join_where(s, &cat).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            ruleutils::join_conditions(s, &cat).unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
     let inner = plan_node(query, lookup, params)?;
+    options.scan_quals = scan_quals;
+    options.join_conds = join_conds;
     if !matches!(
         inner,
         Statement::Select(_)
@@ -30706,4 +30739,33 @@ fn plan_create_rule(r: &pg_query::protobuf::RuleStmt) -> Result<Statement> {
         actions,
         replace: r.replace,
     })
+}
+
+/// A statement over ONE relation: its WHERE's conjuncts for EXPLAIN.
+fn explain_scan_quals(
+    query: &N,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<Vec<(String, Option<String>)>> {
+    let (table, where_clause) = match query {
+        N::SelectStmt(s) => {
+            let [item] = s.from_clause.as_slice() else {
+                return None;
+            };
+            let Some(N::RangeVar(rv)) = item.node.as_ref() else {
+                return None;
+            };
+            (rv.relname.clone(), s.where_clause.as_deref()?)
+        }
+        N::UpdateStmt(u) if u.from_clause.is_empty() => (
+            u.relation.as_ref()?.relname.clone(),
+            u.where_clause.as_deref()?,
+        ),
+        N::DeleteStmt(d) if d.using_clause.is_empty() => (
+            d.relation.as_ref()?.relname.clone(),
+            d.where_clause.as_deref()?,
+        ),
+        _ => return None,
+    };
+    let def = lookup(&table)?;
+    ruleutils::explain_conjuncts(where_clause, &def)
 }

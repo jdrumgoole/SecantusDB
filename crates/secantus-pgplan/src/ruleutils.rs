@@ -2278,6 +2278,224 @@ pub fn rule_def(
     Some(out)
 }
 
+/// A single-relation WHERE as EXPLAIN shows it: each top-level AND conjunct
+/// printed as ruleutils prints it (columns unqualified), with the column it
+/// compares to a constant when it is an index-usable shape
+/// (`col op const`, op one of `= < <= > >=`). `None` for a shape the printer
+/// does not know.
+pub fn explain_conjuncts(
+    where_clause: &pg_query::protobuf::Node,
+    def: &TableDef,
+) -> Option<Vec<(String, Option<String>)>> {
+    let mut parts = Vec::new();
+    fn flatten<'n>(n: &'n Node, out: &mut Vec<&'n Node>) {
+        match n.node.as_ref() {
+            Some(N::BoolExpr(b)) if b.boolop == BoolExprType::AndExpr as i32 => {
+                for a in &b.args {
+                    flatten(a, out);
+                }
+            }
+            _ => out.push(n),
+        }
+    }
+    flatten(where_clause, &mut parts);
+    parts
+        .into_iter()
+        .map(|p| {
+            let text = expr_node_def(p, def)?;
+            let column = match p.node.as_ref() {
+                Some(N::AExpr(e))
+                    if e.kind == AExprKind::AexprOp as i32
+                        && matches!(
+                            crate::operator_name(e).ok(),
+                            Some("=" | "<" | "<=" | ">" | ">=")
+                        ) =>
+                {
+                    let col = |n: Option<&Node>| match n.and_then(|n| n.node.as_ref()) {
+                        Some(N::ColumnRef(c)) => names(&c.fields).pop(),
+                        _ => None,
+                    };
+                    let konst = |n: Option<&Node>| {
+                        matches!(
+                            n.and_then(|n| n.node.as_ref()),
+                            Some(N::AConst(_) | N::TypeCast(_) | N::ParamRef(_))
+                        )
+                    };
+                    let (l, r) = (e.lexpr.as_deref(), e.rexpr.as_deref());
+                    if konst(r) {
+                        col(l)
+                    } else if konst(l) {
+                        col(r)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            Some((text, column))
+        })
+        .collect()
+}
+
+/// Each JOIN's ON condition in a SELECT's FROM, post-order (a left-deep
+/// join's inner joins first), printed as EXPLAIN does (qualified).
+pub fn join_conditions(
+    s: &pg_query::protobuf::SelectStmt,
+    cat: &Catalog<'_>,
+) -> Option<Vec<String>> {
+    let mut p = Printer::new(cat, 0);
+    let mut rtes = Vec::new();
+    p.collect_rtes(&s.from_clause, &mut rtes)?;
+    p.scopes.push(rtes);
+    fn walk(p: &mut Printer<'_>, n: &Node, out: &mut Vec<String>) -> Option<()> {
+        if let Some(N::JoinExpr(j)) = n.node.as_ref() {
+            walk(p, j.larg.as_deref()?, out)?;
+            walk(p, j.rarg.as_deref()?, out)?;
+            match j.quals.as_deref() {
+                Some(q) => {
+                    p.buf.clear();
+                    p.expr(q)?;
+                    out.push(std::mem::take(&mut p.buf));
+                }
+                None => out.push(String::new()),
+            }
+        }
+        Some(())
+    }
+    let mut out = Vec::new();
+    for item in &s.from_clause {
+        walk(&mut p, item, &mut out)?;
+    }
+    Some(out)
+}
+
+/// A joined SELECT's WHERE as EXPLAIN places it: each AND conjunct printed
+/// qualified, with the relation it belongs to when it names exactly one
+/// relation that no outer join makes nullable (PostgreSQL pushes that one
+/// down to the relation's scan; any other stays on the join).
+pub fn join_where(
+    s: &pg_query::protobuf::SelectStmt,
+    cat: &Catalog<'_>,
+) -> Option<Vec<(String, Option<String>)>> {
+    let w = s.where_clause.as_deref()?;
+    let mut p = Printer::new(cat, 0);
+    let mut rtes = Vec::new();
+    p.collect_rtes(&s.from_clause, &mut rtes)?;
+    p.scopes.push(rtes);
+    // The relations an outer join can null-extend.
+    fn refnames(n: &Node, out: &mut Vec<String>) {
+        match n.node.as_ref() {
+            Some(N::RangeVar(r)) => out.push(
+                r.alias
+                    .as_ref()
+                    .map(|a| a.aliasname.clone())
+                    .unwrap_or_else(|| r.relname.clone()),
+            ),
+            Some(N::RangeSubselect(r)) => {
+                if let Some(a) = r.alias.as_ref() {
+                    out.push(a.aliasname.clone());
+                }
+            }
+            Some(N::JoinExpr(j)) => {
+                for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                    refnames(side, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn nullable(n: &Node, out: &mut Vec<String>) {
+        if let Some(N::JoinExpr(j)) = n.node.as_ref() {
+            let (l, r) = (j.larg.as_deref(), j.rarg.as_deref());
+            match JoinType::try_from(j.jointype) {
+                Ok(JoinType::JoinLeft) => r.into_iter().for_each(|x| refnames(x, out)),
+                Ok(JoinType::JoinRight) => l.into_iter().for_each(|x| refnames(x, out)),
+                Ok(JoinType::JoinFull) => {
+                    [l, r].into_iter().flatten().for_each(|x| refnames(x, out))
+                }
+                _ => {}
+            }
+            for side in [l, r].into_iter().flatten() {
+                nullable(side, out);
+            }
+        }
+    }
+    let mut nulls = Vec::new();
+    for item in &s.from_clause {
+        nullable(item, &mut nulls);
+    }
+    let mut parts = Vec::new();
+    fn flatten<'n>(n: &'n Node, out: &mut Vec<&'n Node>) {
+        match n.node.as_ref() {
+            Some(N::BoolExpr(b)) if b.boolop == BoolExprType::AndExpr as i32 => {
+                for a in &b.args {
+                    flatten(a, out);
+                }
+            }
+            _ => out.push(n),
+        }
+    }
+    flatten(w, &mut parts);
+    let mut out = Vec::new();
+    for part in parts {
+        p.buf.clear();
+        p.expr(part)?;
+        let text = std::mem::take(&mut p.buf);
+        let mut rels: Vec<String> = Vec::new();
+        let mut copy = part.clone();
+        crate::walk_expr(&mut copy, &mut |n| {
+            if let Some(N::ColumnRef(c)) = n.node.as_ref() {
+                if let Some((rel, _, _)) = p.resolve(&names(&c.fields)) {
+                    if !rels.contains(&rel) {
+                        rels.push(rel);
+                    }
+                }
+            }
+            Ok(())
+        })
+        .ok()?;
+        let home = match rels.as_slice() {
+            [one] if !nulls.contains(one) => Some(one.clone()),
+            _ => None,
+        };
+        // A scan's own filter prints its columns bare (`show_scan_qual`).
+        let text = if home.is_some() {
+            p.unqualified = true;
+            p.buf.clear();
+            p.expr(part)?;
+            p.unqualified = false;
+            std::mem::take(&mut p.buf)
+        } else {
+            text
+        };
+        out.push((text, home));
+    }
+    Some(out)
+}
+
+/// An expression node over one table, printed as `pg_get_expr` does.
+pub fn expr_node_def(n: &Node, def: &TableDef) -> Option<String> {
+    let none_lookup = |_: &str| None;
+    let none_views = |_: &str| None;
+    let cat = Catalog {
+        lookup: &none_lookup,
+        view_sql: &none_views,
+    };
+    let mut p = Printer::new(&cat, 0);
+    p.unqualified = true;
+    p.scopes.push(vec![Rte {
+        refname: def.name.clone(),
+        columns: def
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), base_type(&c.pg_type)))
+            .collect(),
+        qualified_only: false,
+    }]);
+    p.expr(n)?;
+    Some(p.buf)
+}
+
 /// `pg_get_expr(expr, relid)`: an expression over one table's columns, as
 /// ruleutils prints a stored default, generated column, CHECK or policy
 /// (columns unqualified). `None` for a shape this does not reproduce.

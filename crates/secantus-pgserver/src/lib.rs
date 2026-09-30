@@ -20776,7 +20776,24 @@ impl PgHandler {
                         secantus_storage::ExplainPlan::CollScan => None,
                     }
                 };
-                let tree = explain::plan_tree(&inner, &chooser);
+                let mut tree = explain::plan_tree(&inner, &chooser);
+                let relations = self.index_relations();
+                let index_columns = |name: &str| -> Vec<String> {
+                    relations
+                        .iter()
+                        .find(|ix| ix.name == name)
+                        .map(|ix| {
+                            ix.keys
+                                .iter()
+                                .filter_map(|k| usize::try_from(*k).ok()?.checked_sub(1))
+                                .filter_map(|i| ix.table.columns.get(i).map(|c| c.name.clone()))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                explain::attach_scan_quals(&mut tree, &options.scan_quals, &index_columns);
+                explain::attach_join_conds(&mut tree, &options.join_conds);
+                explain::attach_join_where(&mut tree, &options.join_where);
                 // ANALYZE runs the statement, as PostgreSQL's does -- a write
                 // is written -- and reports the rows it produced.
                 let actual = if options.analyze {
