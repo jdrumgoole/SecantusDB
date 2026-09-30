@@ -1577,6 +1577,12 @@ struct PreparedRecord {
     /// The result columns' display names, or `None` for a statement that
     /// returns no rows -- PostgreSQL reports NULL there, not an empty array.
     result_types: Option<Vec<String>>,
+    /// Made by SQL `PREPARE` rather than a protocol `Parse`.
+    from_sql: bool,
+    /// The query `EXECUTE` runs, and its parameters' internal type names
+    /// (empty where no type could be inferred).
+    query: String,
+    arg_types: Vec<String>,
 }
 
 /// A base type as the `__sql_base_types__` catalog holds it.
@@ -2402,9 +2408,10 @@ impl PgHandler {
                 col.map(|c| c.pg_type.clone())
             })
         };
-        let parameter_types = secantus_pgplan::catalog_param_types(&sql, &declared, &column_type)
-            .into_iter()
-            .map(|t| secantus_pgplan::display_type(&t))
+        let arg_types = secantus_pgplan::catalog_param_types(&sql, &declared, &column_type);
+        let parameter_types = arg_types
+            .iter()
+            .map(|t| secantus_pgplan::display_type(t))
             .collect();
         let result_types = self
             .describe_fields(&sql, declared.len(), &declared)
@@ -2423,10 +2430,13 @@ impl PgHandler {
             });
         PreparedRecord {
             name: stmt.id.clone(),
+            query: sql.clone(),
             statement: sql,
             prepare_time: bson::DateTime::now(),
             parameter_types,
             result_types,
+            from_sql: false,
+            arg_types,
         }
     }
 
@@ -4976,6 +4986,14 @@ impl PgHandler {
             }
         }
         Ok(())
+    }
+
+    /// 26000 for a prepared statement no PREPARE / Parse made.
+    fn prepared_missing(name: &str) -> PgWireError {
+        Self::user_error(
+            "26000",
+            format!("prepared statement \"{name}\" does not exist"),
+        )
     }
 
     /// The role that owns view `name`, when it is a view with one recorded.
@@ -8976,7 +8994,7 @@ impl PgHandler {
                         );
                         d.insert(
                             def.field_of("from_sql").expect("column"),
-                            Bson::Boolean(false),
+                            Bson::Boolean(rec.from_sql),
                         );
                         let has_params = !rec.parameter_types.is_empty();
                         d.insert(
@@ -15565,6 +15583,7 @@ impl PgHandler {
                 | Statement::CloseCursor(_)
                 | Statement::Deallocate(_)
                 | Statement::DeallocateAll
+                | Statement::SqlPrepare { .. }
                 | Statement::Notify { .. }
                 | Statement::Listen(_)
                 | Statement::Unlisten(_)
@@ -18409,6 +18428,129 @@ impl PgHandler {
                     .unwrap_or_else(|e| e.into_inner())
                     .clear();
                 Ok(vec![Response::Execution(Tag::new("DEALLOCATE ALL"))])
+            }
+            Statement::SqlPrepare {
+                name,
+                arg_types,
+                query,
+                text,
+            } => {
+                if self
+                    .prepared
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .any(|r| r.name == name)
+                {
+                    return Err(Self::user_error(
+                        "42P05",
+                        format!("prepared statement \"{name}\" already exists"),
+                    ));
+                }
+                let declared: Vec<Option<String>> =
+                    arg_types.iter().map(|t| Some(t.clone())).collect();
+                let n = declared
+                    .len()
+                    .max(secantus_pgplan::max_param_number(&query));
+                let mut declared = declared;
+                declared.resize(n, None);
+                // Planned now, as PostgreSQL analyses it at PREPARE: a
+                // missing table is this statement's error, not EXECUTE's.
+                let fields = self.describe_fields(&query, n, &declared)?;
+                let column_type = |table: &str, column: secantus_pgplan::ColumnRef<'_>| {
+                    self.lookup(table).and_then(|def| {
+                        let col = match column {
+                            secantus_pgplan::ColumnRef::Name(name) => def.column(name),
+                            secantus_pgplan::ColumnRef::Position(pos) => def.columns.get(pos),
+                        };
+                        col.map(|c| c.pg_type.clone())
+                    })
+                };
+                let arg_types = secantus_pgplan::catalog_param_types(&query, &declared, &column_type);
+                let result_types = fields.filter(|f| !f.is_empty()).map(|fields| {
+                    fields
+                        .iter()
+                        .map(|f| {
+                            let ty = f.datatype();
+                            internal_type_name(ty)
+                                .map(|n| secantus_pgplan::display_type(&n))
+                                .unwrap_or_else(|| ty.name().to_string())
+                        })
+                        .collect()
+                });
+                self.prepared
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(PreparedRecord {
+                        name,
+                        statement: text,
+                        prepare_time: bson::DateTime::now(),
+                        parameter_types: arg_types
+                            .iter()
+                            .map(|t| secantus_pgplan::display_type(t))
+                            .collect(),
+                        result_types,
+                        from_sql: true,
+                        query,
+                        arg_types,
+                    });
+                Ok(vec![Response::Execution(Tag::new("PREPARE"))])
+            }
+            Statement::SqlExecute { name, args } => {
+                let found = self
+                    .prepared
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .find(|r| r.name == name)
+                    .map(|r| (r.query.clone(), r.arg_types.clone()));
+                let Some((query, types)) = found else {
+                    return Err(Self::prepared_missing(&name));
+                };
+                if args.len() != types.len() {
+                    return Err(Self::user_error(
+                        "42601",
+                        format!("wrong number of parameters for prepared statement \"{name}\""),
+                    ));
+                }
+                // Each argument is coerced to its parameter's type, as an
+                // assignment would be: `EXECUTE p('1')` for an int parameter.
+                let tz = self.session_timezone();
+                let params = args
+                    .into_iter()
+                    .zip(&types)
+                    .map(|(a, t)| {
+                        if t.is_empty() || a == Bson::Null {
+                            Ok(a)
+                        } else {
+                            secantus_pgplan::cast_value_with_tz(a, t, &tz)
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| Self::err(&e))?;
+                let declared: Vec<Option<String>> = types
+                    .iter()
+                    .map(|t| Some(t.clone()).filter(|t| !t.is_empty()))
+                    .collect();
+                self.check_sql_privileges(&query)?;
+                let run = |stmt: &Statement| -> std::result::Result<Vec<Vec<Bson>>, PlanError> {
+                    self.subquery_rows(stmt)
+                };
+                let stmt = self.with_executor_hooks(|| {
+                    secantus_pgplan::planning_to_execute(|| {
+                        secantus_pgplan::plan_with_session_types_and_subqueries(
+                            &query,
+                            &|n| self.lookup(n),
+                            &params,
+                            &declared,
+                            &tz,
+                            Some(&run),
+                        )
+                    })
+                });
+                self.collect_planner_warnings();
+                let stmt = stmt.map_err(|e| Self::err(&e))?;
+                self.execute_statement(stmt, max_rows)
             }
             Statement::Deallocate(name) => {
                 let mut prepared = self.prepared.lock().unwrap_or_else(|e| e.into_inner());
@@ -24333,6 +24475,24 @@ impl PgHandler {
         // the failure went unrecorded and the aborted block kept accepting
         // commands.
         .inspect_err(|_| self.note_failure())?;
+        // `EXECUTE p(...)` describes what `p` returns.
+        if let Statement::SqlExecute { name, .. } = &stmt {
+            let found = self
+                .prepared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .find(|r| r.name == *name)
+                .map(|r| (r.query.clone(), r.arg_types.clone()));
+            let Some((query, types)) = found else {
+                return Err(Self::prepared_missing(name));
+            };
+            let declared: Vec<Option<String>> = types
+                .iter()
+                .map(|t| Some(t.clone()).filter(|t| !t.is_empty()))
+                .collect();
+            return self.describe_fields(&query, declared.len(), &declared);
+        }
         Ok(Some(match stmt {
             // A FETCH describes the CURSOR's columns. Without this arm a
             // prepared FETCH described zero of them, and psycopg prepares any

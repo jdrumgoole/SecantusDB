@@ -14532,3 +14532,68 @@ def test_row_level_security_enforced(home: Path) -> None:
         assert _fetch(conn, "SELECT id FROM rt ORDER BY id") == [(2,), (3,)]
         conn.execute("RESET ROLE")
         assert _fetch(conn, "SELECT count(*) FROM rt") == [(2,)]
+
+
+def test_array_lower_bounds(home: Path) -> None:
+    """An array whose lower bound is not 1 keeps it: in its text form, its
+    subscripts, `array_lower` / `array_dims`, equality, the functions that
+    carry it (`array_append`, `||`), a stored column, and an assignment below
+    or past its bounds, which extends it."""
+    with _Server(home) as server, server.connect() as conn:
+        assert _fetch(
+            conn,
+            "SELECT '[0:1]={a,b}'::text[]::text, ('[0:1]={a,b}'::text[])[0], "
+            "array_lower('[0:1]={a,b}'::text[], 1), array_dims(array_fill(7, ARRAY[2], ARRAY[3]))",
+        ) == [("[0:1]={a,b}", "a", 0, "[3:4]")]
+        assert _fetch(
+            conn,
+            "SELECT '[0:1]={a,b}'::text[] = '{a,b}'::text[], "
+            "(array_append('[0:1]={a,b}'::text[], 'c'))::text",
+        ) == [(False, "[0:2]={a,b,c}")]
+        conn.execute("CREATE TABLE lb (id int, a int[])")
+        conn.execute("INSERT INTO lb VALUES (1, '{1,2}'), (2, '[0:1]={5,6}')")
+        conn.execute("UPDATE lb SET a[0] = 9 WHERE id = 1")
+        conn.execute("UPDATE lb SET a[3] = 8 WHERE id = 2")
+        assert _fetch(conn, "SELECT a::text FROM lb ORDER BY id") == [
+            ("[0:2]={9,1,2}",),
+            ("[0:3]={5,6,NULL,8}",),
+        ]
+        assert _fetch(conn, "SELECT id FROM lb WHERE a = '[0:3]={5,6,NULL,8}'") == [(2,)]
+
+
+def test_view_and_subquery_privileges(home: Path) -> None:
+    """A view is checked as the view, its base tables as its owner; a
+    subquery anywhere in the statement is checked with it."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE ROLE vu LOGIN")
+        conn.execute("CREATE TABLE vb (id int)")
+        conn.execute("CREATE TABLE vo (id int)")
+        conn.execute("INSERT INTO vb VALUES (1), (2)")
+        conn.execute("CREATE VIEW vv AS SELECT id FROM vb")
+        conn.execute("GRANT SELECT ON vv TO vu")
+        conn.execute("SET ROLE vu")
+        assert _fetch(conn, "SELECT id FROM vv ORDER BY id") == [(1,), (2,)]
+        assert _sqlstate(conn, "SELECT id FROM vb") == "42501"
+        assert _sqlstate(conn, "SELECT id FROM vv WHERE id IN (SELECT id FROM vo)") == "42501"
+        assert _sqlstate(conn, "UPDATE vv SET id = 3") == "42501"
+
+
+def test_sql_prepare_execute(home: Path) -> None:
+    """SQL `PREPARE` / `EXECUTE` / `DEALLOCATE`: arguments coerced to the
+    parameters' types, the wrong count refused, and the statement listed in
+    `pg_prepared_statements` with `from_sql`."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE TABLE ps (id int, v text)")
+        conn.execute("PREPARE ins(int, text) AS INSERT INTO ps VALUES ($1, $2)")
+        conn.execute("EXECUTE ins(1, 'a')")
+        conn.execute("PREPARE sel AS SELECT v FROM ps WHERE id = $1")
+        assert _fetch(conn, "EXECUTE sel('1')") == [("a",)]
+        assert _sqlstate(conn, "EXECUTE sel") == "42601"
+        assert _sqlstate(conn, "EXECUTE nope") == "26000"
+        assert _sqlstate(conn, "PREPARE sel AS SELECT 1") == "42P05"
+        assert _fetch(
+            conn,
+            "SELECT name, parameter_types::text, from_sql FROM pg_prepared_statements ORDER BY 1",
+        ) == [("ins", "{integer,text}", True), ("sel", "{integer}", True)]
+        conn.execute("DEALLOCATE ALL")
+        assert _fetch(conn, "SELECT count(*) FROM pg_prepared_statements") == [(0,)]

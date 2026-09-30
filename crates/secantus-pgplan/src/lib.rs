@@ -636,6 +636,17 @@ pub enum Statement {
     /// `DEALLOCATE <name>`: the wire layer drops that one prepared statement,
     /// answering 26000 when no statement of the name exists.
     Deallocate(String),
+    /// `PREPARE name [(types)] AS query`: the query, planned again on each
+    /// `EXECUTE` with the arguments as its parameters. `text` is the
+    /// statement as `pg_prepared_statements` shows it.
+    SqlPrepare {
+        name: String,
+        arg_types: Vec<String>,
+        query: String,
+        text: String,
+    },
+    /// `EXECUTE name [(args)]`, the arguments already evaluated.
+    SqlExecute { name: String, args: Vec<Bson> },
     /// `NOTIFY channel [, payload]`: queued for the transaction, delivered
     /// to every backend LISTENing on the channel when it commits.
     Notify {
@@ -2809,6 +2820,38 @@ fn plan_node(
         }
         N::ClosePortalStmt(c) => Ok(Statement::CloseCursor(c.portalname.clone())),
         // `DEALLOCATE ALL` carries no name; `DEALLOCATE x` names one.
+        N::PrepareStmt(p) => {
+            let query = p
+                .query
+                .as_deref()
+                .ok_or_else(|| Error::Parse("PREPARE with no statement".into()))?;
+            let arg_types = p
+                .argtypes
+                .iter()
+                .map(|t| match t.node.as_ref() {
+                    Some(N::TypeName(t)) => Ok(type_name_of(t)),
+                    _ => Err(Error::Parse("a PREPARE parameter type".into())),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Statement::SqlPrepare {
+                name: p.name.clone(),
+                arg_types,
+                query: query.deparse().map_err(|e| Error::Parse(e.to_string()))?,
+                text: pg_query::protobuf::Node {
+                    node: Some(N::PrepareStmt(p.clone())),
+                }
+                .deparse()
+                .map_err(|e| Error::Parse(e.to_string()))?,
+            })
+        }
+        N::ExecuteStmt(e) => Ok(Statement::SqlExecute {
+            name: e.name.clone(),
+            args: e
+                .params
+                .iter()
+                .map(|a| const_value(a, params))
+                .collect::<Result<Vec<_>>>()?,
+        }),
         N::DeallocateStmt(d) if d.name.is_empty() => Ok(Statement::DeallocateAll),
         N::DeallocateStmt(d) => Ok(Statement::Deallocate(d.name.clone())),
         // LISTEN / UNLISTEN / NOTIFY: the parser has already folded the
@@ -21219,8 +21262,52 @@ pub fn catalog_param_types_opt(
         _ => None,
     };
     if let Ok(parsed) = parse_tree(sql) {
+        // The statement's own tables, for a parameter compared with (or
+        // assigned to) a column: `where id = $1` is `id`'s type.
+        let tables: Vec<String> = parsed
+            .nodes()
+            .into_iter()
+            .filter_map(|(node, _, _, _)| match node {
+                pg_query::NodeRef::RangeVar(r) => Some(r.relname.clone()),
+                _ => None,
+            })
+            .collect();
+        let named_column_type = |c: &pg_query::protobuf::ColumnRef| -> Option<String> {
+            let name = column_ref_name(c)?;
+            let bare = name.rsplit('.').next().unwrap_or(&name).to_string();
+            tables
+                .iter()
+                .find_map(|t| column_type(t, ColumnRef::Name(&bare)))
+        };
         for (node, _, _, _) in parsed.nodes() {
             match node {
+                pg_query::NodeRef::AExpr(e) => {
+                    let (l, r) = (
+                        e.lexpr.as_deref().and_then(|n| n.node.as_ref()),
+                        e.rexpr.as_deref().and_then(|n| n.node.as_ref()),
+                    );
+                    let pair = match (l, r) {
+                        (Some(N::ColumnRef(c)), Some(N::ParamRef(p)))
+                        | (Some(N::ParamRef(p)), Some(N::ColumnRef(c))) => Some((c, p)),
+                        _ => None,
+                    };
+                    if let Some((c, p)) = pair {
+                        let i = usize::try_from(p.number).ok().and_then(|n| n.checked_sub(1));
+                        if let Some(slot @ None) = i.and_then(|i| inferred.get_mut(i)) {
+                            *slot = named_column_type(c);
+                        }
+                    }
+                }
+                pg_query::NodeRef::UpdateStmt(u) => {
+                    let table = u.relation.as_ref().map(|r| r.relname.clone()).unwrap_or_default();
+                    for t in &u.target_list {
+                        let Some(N::ResTarget(rt)) = t.node.as_ref() else { continue };
+                        let Some(i) = rt.val.as_deref().and_then(param_index) else { continue };
+                        if let Some(slot @ None) = inferred.get_mut(i) {
+                            *slot = column_type(&table, ColumnRef::Name(&rt.name));
+                        }
+                    }
+                }
                 pg_query::NodeRef::TypeCast(tc) => {
                     let Some(i) = tc.arg.as_deref().and_then(param_index) else {
                         continue;
