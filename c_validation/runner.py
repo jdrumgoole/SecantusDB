@@ -30,6 +30,7 @@ cmake libssl-dev`` on Debian/Ubuntu). The first run builds the driver
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import socket
@@ -41,7 +42,8 @@ from pathlib import Path
 
 import gauge_common
 
-from .include_paths import INCLUDE, SKIP_TESTS
+from . import load_results
+from .include_paths import INCLUDE, SKIP_TESTS, STANDALONE_ONLY
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "mongo-c-driver"
@@ -166,55 +168,31 @@ def _ensure_test_binary() -> int:
     return 0
 
 
-def main() -> int:
-    if not VENDOR.is_dir() or not (VENDOR / "CMakeLists.txt").is_file():
-        print(
-            f"vendor/mongo-c-driver/ missing or not initialised ({VENDOR}); "
-            "run `git submodule update --init vendor/mongo-c-driver`",
-            file=sys.stderr,
-        )
-        return 2
-
-    rc = _ensure_test_binary()
-    if rc != 0:
-        return rc
-
-    RAW_OUT.parent.mkdir(parents=True, exist_ok=True)
-    RAW_OUT.unlink(missing_ok=True)
-
+def _run_pass(*, topology: str, includes: list[str], skips: list[str], raw: Path) -> int:
+    """Run `test-libmongoc` once against a fresh daemon of the given topology,
+    writing its `-F` JSON to `raw`. Returns non-zero if no results were written."""
+    raw.unlink(missing_ok=True)
     host = "127.0.0.1"
-    storage_dir = tempfile.mkdtemp(prefix="secantus-c-gauge-")
+    storage_dir = tempfile.mkdtemp(prefix=f"secantus-c-gauge-{topology}-")
+    daemon_cmd = [
+        sys.executable,
+        "-m",
+        "secantus",
+        "--host",
+        host,
+        "--port",
+        "0",
+        "--storage-path",
+        storage_dir,
+        "--log-level",
+        "WARNING",
+    ]
+    if topology == "standalone":
+        daemon_cmd.append("--standalone")
     # Race-free spawn on a kernel-assigned port (see gauge_common.spawn_daemon).
-    daemon, host, port = gauge_common.spawn_daemon(
-        [
-            sys.executable,
-            "-m",
-            "secantus",
-            "--host",
-            host,
-            "--port",
-            "0",
-            "--storage-path",
-            storage_dir,
-            "--log-level",
-            "WARNING",
-            # libmongoc's MONGOC_TEST_URI carries no ``replicaSet=``, so its
-            # tests assert STANDALONE semantics — and our default ``hello``
-            # advertises a single-node replica-set primary (so pymongo's
-            # change-stream machinery accepts the topology). The mismatch cost
-            # four tests: ``/Client/select_server{,/err}/{single,pooled}``
-            # select with a SECONDARY read preference and assert the result is
-            # ``standalone_or_rs_secondary_or_mongos``. Against a real
-            # standalone that is Standalone; against us it was RSPrimary.
-            #
-            # Measured 2026-09-28: with this flag the four pass, without it
-            # they fail. Same reasoning as the Java gauge above it.
-            "--standalone",
-        ],
-        label="c_validation",
-    )
+    daemon, host, port = gauge_common.spawn_daemon(daemon_cmd, label="c_validation")
     print(
-        f"c_validation: started daemon on {host}:{port} "
+        f"c_validation[{topology}]: started daemon on {host}:{port} "
         f"(storage {storage_dir}, will be cleaned up)",
         file=sys.stderr,
     )
@@ -232,33 +210,36 @@ def main() -> int:
         # coverage and pad the wall clock.
         env["MONGOC_TEST_SKIP_SLOW"] = "on"
 
-        cmd = [str(TEST_BIN), "-F", str(RAW_OUT)]
-        if SKIP_TESTS:
+        cmd = [str(TEST_BIN), "-F", str(raw)]
+        if skips:
             fd, skip_path = tempfile.mkstemp(prefix="c-gauge-skip-", suffix=".txt")
             with os.fdopen(fd, "w") as fh:
-                fh.write("\n".join(SKIP_TESTS) + "\n")
+                fh.write("\n".join(skips) + "\n")
             skip_file = Path(skip_path)
             cmd += ["--skip-tests", str(skip_file)]
-        for pat in INCLUDE:
+        for pat in includes:
             cmd += ["-l", pat]
 
         print(
-            f"c_validation: `{' '.join(cmd)}` in {VENDOR} "
-            f"(MONGOC_TEST_URI={env['MONGOC_TEST_URI']}, results -> {RAW_OUT})",
+            f"c_validation[{topology}]: `{' '.join(cmd)}` in {VENDOR} "
+            f"(MONGOC_TEST_URI={env['MONGOC_TEST_URI']}, results -> {raw})",
             file=sys.stderr,
         )
         try:
             subprocess.run(cmd, cwd=VENDOR, env=env, timeout=RUNTESTS_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
             print(
-                f"c_validation: test-libmongoc exceeded "
+                f"c_validation[{topology}]: test-libmongoc exceeded "
                 f"{RUNTESTS_TIMEOUT_SECONDS:.0f}s wall-clock budget; killed. "
-                f"Partial JSON (if any) at {RAW_OUT}.",
+                f"Partial JSON (if any) at {raw}.",
                 file=sys.stderr,
             )
 
-        if not RAW_OUT.is_file() or RAW_OUT.stat().st_size == 0:
-            print("c_validation: no JSON output (test-libmongoc error?)", file=sys.stderr)
+        if not raw.is_file() or raw.stat().st_size == 0:
+            print(
+                f"c_validation[{topology}]: no JSON output (test-libmongoc error?)",
+                file=sys.stderr,
+            )
             return 1
     finally:
         daemon.terminate()
@@ -270,7 +251,60 @@ def main() -> int:
         shutil.rmtree(storage_dir, ignore_errors=True)
         if skip_file is not None:
             skip_file.unlink(missing_ok=True)
+    return 0
 
+
+def main() -> int:
+    if not VENDOR.is_dir() or not (VENDOR / "CMakeLists.txt").is_file():
+        print(
+            f"vendor/mongo-c-driver/ missing or not initialised ({VENDOR}); "
+            "run `git submodule update --init vendor/mongo-c-driver`",
+            file=sys.stderr,
+        )
+        return 2
+
+    rc = _ensure_test_binary()
+    if rc != 0:
+        return rc
+
+    RAW_OUT.parent.mkdir(parents=True, exist_ok=True)
+    RAW_OUT.unlink(missing_ok=True)
+
+    # Two passes, because libmongoc's suite wants two topologies. The replica-
+    # set daemon runs everything except the four STANDALONE_ONLY tests (under
+    # `--standalone` libmongoc skips its replica-set-only tests -- 16 of
+    # `/change_stream` among them); a `--standalone` daemon then runs just
+    # those four. Running only the standalone pass bought 4 passes for 20
+    # skips, and the headline rate went UP while passing tests went down.
+    replset_raw = RAW_OUT.with_name(RAW_OUT.stem + ".replset.json")
+    standalone_raw = RAW_OUT.with_name(RAW_OUT.stem + ".standalone.json")
+    rc = _run_pass(
+        topology="replset",
+        includes=INCLUDE,
+        skips=[*SKIP_TESTS, *STANDALONE_ONLY],
+        raw=replset_raw,
+    )
+    if rc != 0:
+        return rc
+    rc = _run_pass(topology="standalone", includes=STANDALONE_ONLY, skips=[], raw=standalone_raw)
+    if rc != 0:
+        return rc
+
+    merged = []
+    for topology, raw in (("replset", replset_raw), ("standalone", standalone_raw)):
+        for result in load_results(raw)["results"]:
+            # The replica-set pass reports the four as skipped (they were in
+            # its skip file); their real result is the standalone pass's.
+            if topology == "replset" and result["test_file"] in STANDALONE_ONLY:
+                continue
+            merged.append({**result, "topology": topology})
+    RAW_OUT.write_text(json.dumps({"results": merged}, indent=0))
+    replset_raw.unlink(missing_ok=True)
+    standalone_raw.unlink(missing_ok=True)
+    print(
+        f"c_validation: merged {len(merged)} results from both passes into {RAW_OUT}",
+        file=sys.stderr,
+    )
     return 0
 
 

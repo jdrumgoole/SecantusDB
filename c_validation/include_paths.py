@@ -93,3 +93,22 @@ SKIP_TESTS: list[str] = [
     "/Collection/aggregate/secondary",
     "/change_stream/live/read_prefs",
 ]
+
+# Tests that assert STANDALONE semantics. `MONGOC_TEST_URI` carries no
+# `replicaSet=`. The first four select with a SECONDARY read preference and
+# assert the chosen server is `standalone_or_rs_secondary_or_mongos` -- true of
+# a real standalone, false of the single-node replica-set primary SecantusDB
+# advertises by default. They run in a SECOND pass against a `--standalone`
+# daemon (see `runner.py`); every other test runs against the replica-set
+# daemon, because under `--standalone` libmongoc self-skips its replica-set-only
+# tests -- 16 of the `/change_stream` suite among them (measured 2026-09-30).
+STANDALONE_ONLY: list[str] = [
+    "/Client/select_server/single",
+    "/Client/select_server/pooled",
+    "/Client/select_server/err/single",
+    "/Client/select_server/err/pooled",
+    # `hello` must carry NO `lastWrite` -- a standalone property; a replica-set
+    # member reports one, so these self-skip against the replica-set daemon.
+    "/Client/last_write_date_absent",
+    "/Client/last_write_date_absent/pooled",
+]
