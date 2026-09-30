@@ -597,7 +597,7 @@ fn star_target() -> pg_query::protobuf::Node {
     }
 }
 
-fn range_function_name(rf: &pg_query::protobuf::RangeFunction) -> Option<String> {
+pub(crate) fn range_function_name(rf: &pg_query::protobuf::RangeFunction) -> Option<String> {
     let first = rf.functions.first()?;
     let N::List(l) = first.node.as_ref()? else {
         return None;
@@ -1090,6 +1090,7 @@ const SELECT_LIST_SRFS: &[&str] = &[
     "generate_series",
     "generate_subscripts",
     "regexp_split_to_table",
+    "string_to_table",
     "jsonb_array_elements",
     "json_array_elements",
     "jsonb_array_elements_text",

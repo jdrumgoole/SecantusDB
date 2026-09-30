@@ -289,7 +289,6 @@ def test_duplicate_key_reports_what_postgres_reports(home: Path) -> None:
         # PostgreSQL's 42702, never the left side's value taken silently.
         ("SELECT id FROM t JOIN t AS u ON t.id = u.id", "42702"),
         ("SELECT x.id FROM t JOIN t AS u ON t.id = u.id", "42P01"),
-        ("SELECT array_agg(name ORDER BY length(name)) FROM t", "0A000"),
         ("SELECT n, count(*) FROM t", "42803"),
         # `LIKE` is implemented now; over an INTEGER column PostgreSQL 14.13
         # has no such operator, so this moved from 0A000 to 42883 rather than
@@ -300,7 +299,6 @@ def test_duplicate_key_reports_what_postgres_reports(home: Path) -> None:
         # ORDER BY path rather than losing the coverage entirely.
         ("SELECT * FROM t ORDER BY n USING <", "0A000"),
         # The PK is the document's `_id`, which storage treats as immutable.
-        ("UPDATE t SET id = 2 WHERE id = 1", "0A000"),
         ("UPDATE t SET nope = 1", "42703"),
         ("DELETE FROM missing", "42P01"),
     ],
@@ -2877,21 +2875,21 @@ def test_binary_result_columns(home: Path, sql: str, want: object) -> None:
                 assert got == want
 
 
-def test_a_type_without_a_binary_encoding_stays_text(home: Path) -> None:
-    """A column this server cannot render in binary is described as text.
-
-    PostgreSQL honours the request for every type. This one honours it for the
-    types it can encode exactly and describes the rest as text, which the
-    client reads correctly because the format travels per column -- the gap is
-    in `tasks/backlog.md`, not hidden behind a wrong answer. (`box` and
-    `regtype` are what is left; the datetime family moved to binary, see
-    `test_binary_results_cover_every_faker_type`.)
-    """
+def test_box_and_regtype_results_are_binary(home: Path) -> None:
+    """`box` and `regtype` -- the last two types described as text when a
+    client asked for binary -- are sent in binary, byte for byte as
+    PostgreSQL 14 sends them (measured 2026-09-30)."""
     with _Server(home) as server, server.connect() as conn:
         cur = conn.cursor(binary=True)
         cur.execute("select '(1,2),(3,4)'::box")
-        assert cur.pgresult.fformat(0) == 0
-        assert cur.pgresult.get_value(0, 0) == b"(3,4),(1,2)"
+        assert cur.pgresult.fformat(0) == 1
+        assert cur.pgresult.get_value(0, 0) == (
+            b"@\x08\x00\x00\x00\x00\x00\x00@\x10\x00\x00\x00\x00\x00\x00"
+            b"?\xf0\x00\x00\x00\x00\x00\x00@\x00\x00\x00\x00\x00\x00\x00"
+        )
+        cur.execute("select 'int4'::regtype")
+        assert cur.pgresult.fformat(0) == 1
+        assert cur.pgresult.get_value(0, 0) == (23).to_bytes(4, "big")
 
 
 def test_a_server_cursor_describes_its_portal(home: Path) -> None:
@@ -4063,7 +4061,9 @@ def test_composite_parameter_round_trips_in_both_formats(home: Path, binary: boo
 
         cur = conn.cursor(binary=binary)
         # The Parse wall: the parameter's type is resolved from the raw oid.
-        assert cur.execute("select pg_typeof(%s)", [obj]).fetchone()[0] == "cp"
+        # (`::text`: in binary a regtype is its oid, which psycopg has no
+        # loader for -- PostgreSQL sends the same four bytes.)
+        assert cur.execute("select pg_typeof(%s)::text", [obj]).fetchone()[0] == "cp"
         # The value decodes to the composite and round-trips through a cast.
         got = cur.execute("select %s::cp", [obj]).fetchone()[0]
         assert (got.foo, got.bar, got.baz) == ("hi", 42, 3.5)
@@ -4091,7 +4091,7 @@ def test_composite_parameter_round_trips_in_both_formats(home: Path, binary: boo
         register_composite(rinfo, conn2)
         robj = rinfo.python_type(10, Range(empty=True), [])
         cur = conn2.cursor(binary=binary)
-        assert cur.execute("select pg_typeof(%s)", [robj]).fetchone()[0] == "cpr"
+        assert cur.execute("select pg_typeof(%s)::text", [robj]).fetchone()[0] == "cpr"
         assert cur.execute("select %s::text", [robj]).fetchone()[0] == "(10,empty,{})"
 
 
@@ -9836,20 +9836,21 @@ def test_an_unsupported_aggregate_refuses_the_same_way_on_an_empty_table(home: P
     where PostgreSQL answers one. Refusing while planning makes the answer the
     same either way.
 
-    The shapes that showed this (`string_agg`, `count(*) + 1`) have since been
-    implemented, so the property is pinned here with one that has not:
-    `ORDER BY` over an EXPRESSION inside an aggregate.
+    The shapes that showed this (`string_agg`, `count(*) + 1`, an ORDER BY
+    over an expression) have since been implemented, so the property is
+    pinned with an error PostgreSQL raises while planning: a DISTINCT
+    aggregate ordered by something other than its argument (42P10).
     """
-    sql = "select array_agg(s order by length(s)) from t"
+    sql = "select array_agg(distinct s order by length(s)) from t"
     with _Server(home) as server, server.connect() as conn:
         conn.execute("create table t (id int primary key, n int, s text)")
         with pytest.raises(psycopg.Error) as empty:
             conn.execute(sql).fetchall()
-        assert empty.value.sqlstate == "0A000"
+        assert empty.value.sqlstate == "42P10"
         conn.execute("insert into t values (1, 1, 'a')")
         with pytest.raises(psycopg.Error) as filled:
             conn.execute(sql).fetchall()
-        assert filled.value.sqlstate == "0A000"
+        assert filled.value.sqlstate == "42P10"
 
 
 def test_char_n_is_blank_padded_and_carries_its_width(home: Path) -> None:
@@ -10103,9 +10104,8 @@ def test_order_by_inside_an_aggregate(home: Path) -> None:
             "select g, array_agg(s order by id desc) from t group by g order by g"
         ).fetchall() == [(1, ["a", "b"]), (2, [None, "c"]), (3, ["d"])]
         # An expression key is refused rather than answered in another order.
-        with pytest.raises(psycopg.Error) as exc:
-            conn.execute("select array_agg(s order by length(s)) from t").fetchall()
-        assert exc.value.sqlstate == "0A000"
+        # ORDER BY over an expression (n: b=2 a=1 c=3 NULL=4 d=5).
+        assert one("select array_agg(s order by n * -1) from t") == ["d", None, "c", "b", "a"]
 
 
 def test_aggregates_inside_expressions(home: Path) -> None:
@@ -11210,14 +11210,16 @@ def test_correlated_subqueries_in_update_and_delete(home: Path) -> None:
         assert cur.fetchall() == [(3,)]
 
 
-def test_with_recursive_and_a_data_modifying_with_are_refused(home: Path) -> None:
-    """Neither can be inlined: a self-reference has no subquery to expand into,
-    and a write must run exactly once however many times it is referenced."""
+def test_a_data_modifying_with_is_refused(home: Path) -> None:
+    """A write inside WITH must run exactly once however many times it is
+    referenced, so it cannot be inlined like a read. (`WITH RECURSIVE`, once
+    refused beside it, is iterated to a fixed point now.)"""
     with _Server(home) as server, server.connect() as conn:
         _dept_emp(conn)
         cur = conn.cursor()
+        cur.execute("WITH RECURSIVE c AS (SELECT 1 AS x) SELECT x FROM c")
+        assert cur.fetchall() == [(1,)]
         for sql in (
-            "WITH RECURSIVE c AS (SELECT 1 AS x) SELECT x FROM c",
             "WITH c AS (INSERT INTO sq_dept VALUES (9,'x',1) RETURNING id) SELECT * FROM c",
         ):
             with pytest.raises(psycopg.Error) as info:
@@ -13687,4 +13689,581 @@ def test_general_datetime_input_and_series(home: Path) -> None:
             ("2.0",),
             ("2.5",),
             ("3.0",),
+        ]
+
+
+def test_geometric_and_range_operators(home: Path) -> None:
+    """`box` comparison and overlap operators, range and multirange set
+    operators, and PostgreSQL's 42883 for mixing a range with a multirange
+    under `+`."""
+    with _Server(home) as server, server.connect() as conn:
+        assert _fetch(
+            conn,
+            "SELECT box '(2,2),(0,0)' && box '(3,3),(1,1)', "
+            "box '(3,3),(0,0)' @> box '(2,2),(1,1)', box '(1,1),(0,0)' = box '(0,1),(1,0)'",
+        ) == [(True, True, True)]
+        assert _fetch(
+            conn,
+            "SELECT (int4range(1, 5) + int4range(3, 8))::text, "
+            "(int4range(1, 10) - int4range(5, 12))::text, "
+            "(int4multirange(int4range(1, 3)) + int4multirange(int4range(5, 7)))::text",
+        ) == [("[1,8)", "[1,5)", "{[1,3),[5,7)}")]
+        assert _sqlstate(conn, "SELECT int4range(1, 3) + int4multirange(int4range(5, 7))") == (
+            "42883"
+        )
+
+
+def test_sequences_advance_outside_the_transaction(home: Path) -> None:
+    """`nextval` is not rolled back with the block that called it."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE SEQUENCE sq_tx")
+        conn.execute("BEGIN")
+        assert _fetch(conn, "SELECT nextval('sq_tx')") == [(1,)]
+        conn.execute("ROLLBACK")
+        assert _fetch(conn, "SELECT nextval('sq_tx')") == [(2,)]
+
+
+def test_subqueries_over_grouped_rows(home: Path) -> None:
+    """A subquery in a grouped query's select list, HAVING or ORDER BY runs
+    over the grouped rows; an ungrouped outer column is 42803."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE TABLE gs_d (id int PRIMARY KEY, g text)")
+        conn.execute("CREATE TABLE gs_e (id int PRIMARY KEY, g text)")
+        conn.execute("INSERT INTO gs_d VALUES (1, 'a'), (2, 'a'), (3, 'b')")
+        conn.execute("INSERT INTO gs_e VALUES (1, 'a'), (2, 'b'), (3, 'b')")
+        assert _fetch(
+            conn,
+            "SELECT g, count(*), (SELECT count(*) FROM gs_e WHERE gs_e.g = gs_d.g) "
+            "FROM gs_d GROUP BY g ORDER BY g",
+        ) == [("a", 2, 1), ("b", 1, 2)]
+        assert _fetch(
+            conn,
+            "SELECT g FROM gs_d GROUP BY g HAVING count(*) > "
+            "(SELECT count(*) FROM gs_e WHERE gs_e.g = gs_d.g) ORDER BY g",
+        ) == [("a",)]
+        assert (
+            _sqlstate(
+                conn,
+                "SELECT g, (SELECT count(*) FROM gs_e WHERE gs_e.id = gs_d.id) "
+                "FROM gs_d GROUP BY g",
+            )
+            == "42803"
+        )
+
+
+def test_exclusion_constraints_and_match_full(home: Path) -> None:
+    """An EXCLUDE constraint over `&&` refuses an overlapping range (23P01);
+    a MATCH FULL foreign key refuses a partly-NULL key (23503)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute(
+            "CREATE TABLE ex_r (id int PRIMARY KEY, r int4range, EXCLUDE USING gist (r WITH &&))"
+        )
+        conn.execute("INSERT INTO ex_r VALUES (1, int4range(1, 5))")
+        assert _sqlstate(conn, "INSERT INTO ex_r VALUES (2, int4range(4, 8))") == "23P01"
+        conn.execute("INSERT INTO ex_r VALUES (3, int4range(5, 8))")
+        conn.execute("CREATE TABLE fk_p (a int, b int, PRIMARY KEY (a, b))")
+        conn.execute(
+            "CREATE TABLE fk_c (id int PRIMARY KEY, a int, b int, "
+            "FOREIGN KEY (a, b) REFERENCES fk_p (a, b) MATCH FULL)"
+        )
+        assert _sqlstate(conn, "INSERT INTO fk_c VALUES (1, 1, NULL)") == "23503"
+        conn.execute("INSERT INTO fk_c VALUES (2, NULL, NULL)")
+
+
+def test_pg_index_lists_every_index(home: Path) -> None:
+    """Every index -- primary key, UNIQUE constraint, CREATE INDEX, over an
+    expression -- has a pg_index row whose `indexrelid` is its pg_class oid,
+    and `indkey` is an int2vector: `2 3` as text, subscripted from 0."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE TABLE pix (id int PRIMARY KEY, a int, b text, c int UNIQUE)")
+        conn.execute("CREATE INDEX pix_ab ON pix (a, b)")
+        conn.execute("CREATE INDEX pix_expr ON pix (lower(b))")
+        assert _fetch(
+            conn,
+            "SELECT c.relname, c.relkind, i.indisunique, i.indisprimary, i.indkey::text "
+            "FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+            "WHERE i.indrelid = 'pix'::regclass ORDER BY i.indexrelid",
+        ) == [
+            ("pix_pkey", "i", True, True, "1"),
+            ("pix_c_key", "i", True, False, "4"),
+            ("pix_ab", "i", False, False, "2 3"),
+            ("pix_expr", "i", False, False, "0"),
+        ]
+        assert _fetch(
+            conn,
+            "SELECT indkey[0], pg_typeof(indkey)::text FROM pg_index "
+            "WHERE indexrelid = 'pix_ab'::regclass",
+        ) == [(2, "int2vector")]
+        assert _fetch(
+            conn,
+            "SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid "
+            "AND a.attnum = ANY(i.indkey) WHERE i.indexrelid = 'pix_ab'::regclass ORDER BY 1",
+        ) == [("a",), ("b",)]
+
+
+def test_order_by_a_computed_output_column(home: Path) -> None:
+    """`ORDER BY 1` / `ORDER BY alias` over a computed column sorts by the
+    computed value -- text order for `n::text` -- in plain, DISTINCT and
+    grouped queries alike."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE TABLE obo (id int PRIMARY KEY, n int)")
+        conn.execute("INSERT INTO obo VALUES (1, 9), (2, 10), (3, 100)")
+        expected = [("10",), ("100",), ("9",)]
+        assert _fetch(conn, "SELECT n::text FROM obo ORDER BY 1") == expected
+        assert _fetch(conn, "SELECT n::text AS s FROM obo ORDER BY s") == expected
+        assert _fetch(conn, "SELECT DISTINCT n::text FROM obo ORDER BY 1") == expected
+        assert _fetch(conn, "SELECT n::text FROM obo GROUP BY n ORDER BY n") == expected
+        assert _fetch(conn, "SELECT -n FROM obo ORDER BY 1") == [(-100,), (-10,), (-9,)]
+        assert _fetch(conn, "SELECT n % 2 AS p, sum(n) FROM obo GROUP BY n % 2 ORDER BY p") == [
+            (0, 110),
+            (1, 9),
+        ]
+        assert _sqlstate(conn, "SELECT n + id FROM obo GROUP BY n") == "42803"
+
+
+def test_recursive_functions_and_the_depth_limit(home: Path) -> None:
+    """A recursive PL/pgSQL function recurses (its result coerced to the
+    declared `numeric`, so no integer overflow), and runaway recursion is
+    54001 with the server still serving."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute(
+            "CREATE FUNCTION rfact(n int) RETURNS numeric AS $$ BEGIN IF n <= 1 THEN "
+            "RETURN 1; END IF; RETURN n * rfact(n - 1); END $$ LANGUAGE plpgsql"
+        )
+        assert _fetch(conn, "SELECT rfact(25)::text") == [("15511210043330985984000000",)]
+        conn.execute(
+            "CREATE FUNCTION runaway(n int) RETURNS int AS $$ BEGIN "
+            "RETURN runaway(n + 1); END $$ LANGUAGE plpgsql"
+        )
+        assert _sqlstate(conn, "SELECT runaway(1)") == "54001"
+        assert _fetch(conn, "SELECT 1") == [(1,)]
+
+
+def test_drop_extension_cascade_drops_dependent_columns(home: Path) -> None:
+    """RESTRICT refuses (2BP01); CASCADE drops the columns of the
+    extension's types and leaves the rest of the table."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE EXTENSION hstore")
+        conn.execute("CREATE TABLE dxc (id int PRIMARY KEY, h hstore, n int)")
+        conn.execute("INSERT INTO dxc VALUES (1, 'a=>1', 5)")
+        assert _sqlstate(conn, "DROP EXTENSION hstore") == "2BP01"
+        conn.execute("DROP EXTENSION hstore CASCADE")
+        assert _fetch(conn, "SELECT * FROM dxc") == [(1, 5)]
+        assert _sqlstate(conn, "SELECT h FROM dxc") == "42703"
+
+
+def test_text_search_configurations_for_every_language(home: Path) -> None:
+    """Every PostgreSQL text-search configuration stems as PostgreSQL does:
+    its Snowball stemmer and stop-word list; `russian` sends ASCII words to
+    the English stemmer; any non-ASCII character is a letter (C locale)."""
+    with _Server(home) as server, server.connect() as conn:
+        assert _fetch(
+            conn,
+            "SELECT to_tsvector('french', 'Les chats mangeaient des souris')::text, "
+            "to_tsvector('german', 'Die Katzen fraßen Mäuse')::text, "
+            "to_tsvector('russian', 'Кошки running')::text, "
+            "to_tsvector('simple', '«bonjour» a—b')::text",
+        ) == [
+            (
+                "'chat':2 'le':1 'mang':3 'sour':5",
+                "'frass':3 'katz':2 'maus':4",
+                "'run':2 'Кошк':1",
+                "'a—b':2 '«bonjour»':1",
+            )
+        ]
+        assert _fetch(conn, "SELECT to_tsvector('basque', 'etxea')::text") == [("'etxea':1",)]
+        assert _sqlstate(conn, "SELECT to_tsvector('klingon', 'x')") == "42704"
+
+
+def test_read_committed_sees_other_connections_commits(home: Path) -> None:
+    """Inside a READ COMMITTED block each statement sees what other
+    connections committed before it -- rows and tables -- and may update a
+    row another connection changed since the block began. REPEATABLE READ
+    keeps the block's first snapshot."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        a.execute("CREATE TABLE rcv (id int PRIMARY KEY, v int)")
+        a.execute("INSERT INTO rcv VALUES (1, 10)")
+        a.execute("BEGIN")
+        assert _fetch(a, "SELECT v FROM rcv ORDER BY id") == [(10,)]
+        b.execute("INSERT INTO rcv VALUES (2, 20)")
+        b.execute("UPDATE rcv SET v = 11 WHERE id = 1")
+        assert _fetch(a, "SELECT v FROM rcv ORDER BY id") == [(11,), (20,)]
+        a.execute("UPDATE rcv SET v = v + 100 WHERE id = 1")
+        assert _fetch(a, "SELECT v FROM rcv ORDER BY id") == [(111,), (20,)]
+        a.execute("COMMIT")
+        a.execute("BEGIN")
+        a.execute("SELECT 1")
+        b.execute("CREATE TABLE rcv_new (x int)")
+        b.execute("INSERT INTO rcv_new VALUES (7)")
+        assert _fetch(a, "SELECT x FROM rcv_new") == [(7,)]
+        a.execute("ROLLBACK")
+        a.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        assert _fetch(a, "SELECT count(*) FROM rcv") == [(2,)]
+        b.execute("INSERT INTO rcv VALUES (3, 30)")
+        assert _fetch(a, "SELECT count(*) FROM rcv") == [(2,)]
+        a.execute("COMMIT")
+
+
+def test_xml_type_constructors_and_xpath(home: Path) -> None:
+    """The `xml` type: input is checked (2200N), the SQL/XML constructors
+    build what PostgreSQL builds, `xmlagg` concatenates, and `xpath` /
+    `xmlexists` evaluate XPath 1.0."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("SET timezone = 'UTC'")
+        assert _sqlstate(conn, "SELECT '<a>'::xml") == "2200N"
+        assert _fetch(
+            conn,
+            "SELECT xmlelement(name foo, xmlattributes('a&b' AS x, 1 AS y), 'x<y', "
+            "xmlelement(name e))::text, xmlforest('x' AS a, NULL AS b, 3 AS c)::text, "
+            "xmlpi(name php, 'echo 1;')::text, xmlcomment('hi')::text",
+        ) == [
+            (
+                '<foo x="a&amp;b" y="1">x&lt;y<e/></foo>',
+                "<a>x</a><c>3</c>",
+                "<?php echo 1;?>",
+                "<!--hi-->",
+            )
+        ]
+        conn.execute("CREATE TABLE xmt (id int PRIMARY KEY, doc xml)")
+        conn.execute("INSERT INTO xmt VALUES (1, '<r><i>1</i></r>'), (2, '<r/>')")
+        assert _sqlstate(conn, "INSERT INTO xmt VALUES (3, '<bad')") == "2200N"
+        assert _fetch(
+            conn, "SELECT xmlagg(xmlelement(name i, id) ORDER BY id DESC)::text FROM xmt"
+        ) == [("<i>2</i><i>1</i>",)]
+        assert _fetch(
+            conn, "SELECT id FROM xmt WHERE xmlexists('/r/i' PASSING doc) ORDER BY id"
+        ) == [(1,)]
+        assert _fetch(
+            conn,
+            "SELECT xpath('/a/b/text()', '<a><b>x</b><b>y</b></a>')::text[], "
+            "xpath('//n:b/text()', '<a xmlns:n=\"u\"><n:b>q</n:b></a>', "
+            "ARRAY[ARRAY['n', 'u']])::text[]",
+        ) == [(["x", "y"], ["q"])]
+        assert _sqlstate(conn, "SELECT '<a/>'::xml = '<a/>'::xml") == "42883"
+
+
+def test_untyped_range_accessor_is_ambiguous(home: Path) -> None:
+    """`isempty('[1,2)')` names no range type: PostgreSQL cannot choose
+    between the range and multirange overloads (42725)."""
+    with _Server(home) as server, server.connect() as conn:
+        assert _sqlstate(conn, "SELECT isempty('[1,2)')") == "42725"
+        assert _fetch(conn, "SELECT isempty('[1,2)'::int4range)") == [(False,)]
+
+
+def test_with_recursive(home: Path) -> None:
+    """WITH RECURSIVE: a counter, a tree walk, UNION's cycle stop, and the
+    42P19 refusal of a self-reference without a non-recursive term."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE TABLE wr_emp (id int PRIMARY KEY, boss int, name text)")
+        conn.execute("INSERT INTO wr_emp VALUES (1, NULL, 'ceo'), (2, 1, 'cto'), (3, 2, 'dev')")
+        assert _fetch(
+            conn,
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5) "
+            "SELECT sum(n) FROM r",
+        ) == [(15,)]
+        assert _fetch(
+            conn,
+            "WITH RECURSIVE t(id, depth) AS (SELECT id, 0 FROM wr_emp WHERE boss IS NULL "
+            "UNION ALL SELECT e.id, t.depth + 1 FROM wr_emp e JOIN t ON e.boss = t.id) "
+            "SELECT id, depth FROM t ORDER BY id",
+        ) == [(1, 0), (2, 1), (3, 2)]
+        assert _fetch(
+            conn,
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION SELECT (x % 3) + 1 FROM c) "
+            "SELECT x FROM c ORDER BY x",
+        ) == [(1,), (2,), (3,)]
+        assert _sqlstate(conn, "WITH RECURSIVE r(n) AS (SELECT n FROM r) SELECT * FROM r") == (
+            "42P19"
+        )
+        assert conn.execute(
+            "WITH RECURSIVE r(n) AS (SELECT %s::int UNION ALL SELECT n + 1 FROM r WHERE n < %s) "
+            "SELECT count(*) FROM r",
+            (1, 4),
+        ).fetchall() == [(4,)]
+
+
+def test_from_clause_scope(home: Path) -> None:
+    """A LATERAL subquery reads the row to its left; without LATERAL the
+    same reference is 42P01, as is a qualifier naming nothing in FROM. A
+    select-list `t.*` is the table's columns, and a qualified column works
+    in IN."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE TABLE fs_c (id int PRIMARY KEY, name text)")
+        conn.execute("CREATE TABLE fs_o (id int PRIMARY KEY, cid int, amt int)")
+        conn.execute("INSERT INTO fs_c VALUES (1, 'a'), (2, 'b')")
+        conn.execute("INSERT INTO fs_o VALUES (1, 1, 10), (2, 1, 20), (3, 2, 5)")
+        assert _fetch(
+            conn,
+            "SELECT c.name, x.total FROM fs_c c, LATERAL "
+            "(SELECT sum(amt) AS total FROM fs_o WHERE cid = c.id) x ORDER BY c.id",
+        ) == [("a", 30), ("b", 5)]
+        assert (
+            _sqlstate(
+                conn,
+                "SELECT c.name FROM fs_c c, (SELECT sum(amt) FROM fs_o WHERE cid = c.id) x",
+            )
+            == "42P01"
+        )
+        assert _sqlstate(conn, "SELECT id FROM fs_o WHERE cid = fs_c.id") == "42P01"
+        assert _fetch(conn, "SELECT c.* FROM fs_c c ORDER BY 1") == [(1, "a"), (2, "b")]
+        assert _fetch(conn, "SELECT c.id FROM fs_c c WHERE c.name IN ('b') ORDER BY 1") == [(2,)]
+
+
+def test_comment_on_and_descriptions(home: Path) -> None:
+    """COMMENT ON a table, column, index and constraint, read back through
+    obj_description / col_description; NULL or '' removes a comment."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute(
+            "CREATE TABLE cmo (id int PRIMARY KEY, a int CONSTRAINT cmo_chk CHECK (a > 0))"
+        )
+        conn.execute("CREATE INDEX cmo_i ON cmo (a)")
+        conn.execute("COMMENT ON TABLE cmo IS 'the table'")
+        conn.execute("COMMENT ON COLUMN cmo.a IS 'col a'")
+        conn.execute("COMMENT ON INDEX cmo_i IS 'idx'")
+        conn.execute("COMMENT ON CONSTRAINT cmo_chk ON cmo IS 'chk'")
+        assert _fetch(
+            conn,
+            "SELECT obj_description('cmo'::regclass, 'pg_class'), "
+            "col_description('cmo'::regclass, 2), obj_description('cmo_i'::regclass)",
+        ) == [("the table", "col a", "idx")]
+        conn.execute("COMMENT ON TABLE cmo IS NULL")
+        assert _fetch(conn, "SELECT obj_description('cmo'::regclass, 'pg_class')") == [(None,)]
+        assert _sqlstate(conn, "COMMENT ON COLUMN cmo.nosuch IS 'x'") == "42703"
+        assert _sqlstate(conn, "COMMENT ON TABLE nosuch IS 'x'") == "42P01"
+
+
+def test_grant_and_revoke(home: Path) -> None:
+    """GRANT / REVOKE validate their roles (42704) and relations (42P01) and
+    privileges (0LP01); role membership and default privileges are
+    accepted."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE TABLE grt (id int)")
+        conn.execute("CREATE ROLE grr")
+        conn.execute("GRANT SELECT, INSERT ON grt TO grr")
+        conn.execute("GRANT ALL ON grt TO PUBLIC")
+        conn.execute("REVOKE INSERT ON grt FROM grr")
+        assert _sqlstate(conn, "GRANT SELECT ON grt TO nosuch") == "42704"
+        assert _sqlstate(conn, "GRANT SELECT ON nosuch TO grr") == "42P01"
+        assert _sqlstate(conn, "GRANT USAGE ON grt TO grr") == "0LP01"
+        conn.execute("GRANT SELECT ON ALL TABLES IN SCHEMA public TO grr")
+        conn.execute("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO grr")
+        conn.execute("GRANT grr TO CURRENT_USER")
+        conn.execute("REVOKE grr FROM CURRENT_USER")
+
+
+def test_domains(home: Path) -> None:
+    """A domain's NOT NULL, CHECKs and DEFAULT apply on INSERT, UPDATE and
+    casts; ALTER DOMAIN validates existing data; the wire type is the base
+    type's."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE DOMAIN dmn_pos AS int CHECK (VALUE > 0)")
+        conn.execute("CREATE DOMAIN dmn_s AS text NOT NULL DEFAULT 'x'")
+        conn.execute("CREATE TABLE dmn_t (id int PRIMARY KEY, q dmn_pos, s dmn_s)")
+        assert _sqlstate(conn, "INSERT INTO dmn_t VALUES (1, -1, 'a')") == "23514"
+        assert _sqlstate(conn, "INSERT INTO dmn_t VALUES (1, 1, NULL)") == "23502"
+        conn.execute("INSERT INTO dmn_t (id, q) VALUES (2, 3)")
+        assert _fetch(conn, "SELECT q, s FROM dmn_t") == [(3, "x")]
+        assert _sqlstate(conn, "UPDATE dmn_t SET q = 0") == "23514"
+        assert _sqlstate(conn, "SELECT (-5)::dmn_pos") == "23514"
+        assert _sqlstate(conn, "ALTER DOMAIN dmn_pos ADD CONSTRAINT tiny CHECK (VALUE < 2)") == (
+            "23514"
+        )
+        cur = conn.execute("SELECT q FROM dmn_t")
+        assert cur.description[0].type_code == 23
+        assert _sqlstate(conn, "DROP DOMAIN dmn_pos") == "2BP01"
+        assert _sqlstate(conn, "CREATE TABLE dmn_bad (a nosuchtype)") == "42704"
+
+
+def test_materialized_views(home: Path) -> None:
+    """A materialized view keeps its snapshot until REFRESH, refuses writes
+    (42809), and is listed in pg_matviews; an aggregate query feeds it."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE TABLE mvb (id int PRIMARY KEY, g text, n int)")
+        conn.execute("INSERT INTO mvb VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 5)")
+        conn.execute(
+            "CREATE MATERIALIZED VIEW mvs AS SELECT g, sum(n) AS total FROM mvb GROUP BY g"
+        )
+        conn.execute("INSERT INTO mvb VALUES (4, 'b', 1)")
+        assert _fetch(conn, "SELECT g, total FROM mvs ORDER BY g") == [("a", 30), ("b", 5)]
+        conn.execute("REFRESH MATERIALIZED VIEW mvs")
+        assert _fetch(conn, "SELECT g, total FROM mvs ORDER BY g") == [("a", 30), ("b", 6)]
+        assert _sqlstate(conn, "DELETE FROM mvs") == "42809"
+        assert _fetch(conn, "SELECT matviewname FROM pg_matviews") == [("mvs",)]
+        conn.execute("DROP MATERIALIZED VIEW mvs")
+        conn.execute("CREATE TABLE mva (g text, c int)")
+        conn.execute("INSERT INTO mva SELECT g, count(*) FROM mvb GROUP BY g")
+        assert _fetch(conn, "SELECT * FROM mva ORDER BY g") == [("a", 2), ("b", 2)]
+
+
+def test_tablesample_and_size_functions(home: Path) -> None:
+    """TABLESAMPLE at 100% keeps every row and at 0% none; the size
+    functions answer and pg_size_pretty formats as PostgreSQL 14 does."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE TABLE tsz (id int PRIMARY KEY)")
+        conn.execute("INSERT INTO tsz SELECT generate_series(1, 10)")
+        assert _fetch(conn, "SELECT count(*) FROM tsz TABLESAMPLE SYSTEM (100)") == [(10,)]
+        assert _fetch(conn, "SELECT count(*) FROM tsz TABLESAMPLE BERNOULLI (0)") == [(0,)]
+        assert _sqlstate(conn, "SELECT * FROM tsz TABLESAMPLE SYSTEM (200)") == "2202H"
+        assert _fetch(
+            conn,
+            "SELECT pg_size_pretty(10240::bigint), pg_size_pretty(1.5e12::numeric), "
+            "pg_size_bytes('1.5 GB'), pg_total_relation_size('tsz') > 0",
+        ) == [("10 kB", "1397 GB", 1610612736, True)]
+
+
+def test_row_security_and_policies(home: Path) -> None:
+    """ALTER TABLE's row-security flags show in pg_class; CREATE / ALTER /
+    DROP POLICY keep pg_policies, with ruleutils-rendered expressions and
+    PostgreSQL's duplicate / missing errors."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE TABLE rlt (id int PRIMARY KEY, owner text)")
+        conn.execute("ALTER TABLE rlt ENABLE ROW LEVEL SECURITY")
+        conn.execute("ALTER TABLE rlt FORCE ROW LEVEL SECURITY")
+        flags = "SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = 'rlt'"
+        assert _fetch(conn, flags) == [(True, True)]
+        conn.execute("CREATE POLICY p1 ON rlt USING (owner = current_user)")
+        assert _sqlstate(conn, "CREATE POLICY p1 ON rlt USING (true)") == "42710"
+        conn.execute("CREATE POLICY p2 ON rlt FOR INSERT WITH CHECK (id > 0)")
+        conn.execute("ALTER POLICY p2 ON rlt RENAME TO p2b")
+        assert _fetch(
+            conn,
+            "SELECT policyname, cmd, roles, qual, with_check FROM pg_policies ORDER BY 1",
+        ) == [
+            ("p1", "ALL", ["public"], "(owner = CURRENT_USER)", None),
+            ("p2b", "INSERT", ["public"], None, "(id > 0)"),
+        ]
+        assert _sqlstate(conn, "DROP POLICY nosuch ON rlt") == "42704"
+        conn.execute("DROP POLICY IF EXISTS nosuch ON rlt")
+        conn.execute("DROP POLICY p1 ON rlt")
+        conn.execute("ALTER TABLE rlt DISABLE ROW LEVEL SECURITY")
+        assert _fetch(conn, flags) == [(False, True)]
+
+
+def test_declarative_partitioning(home: Path) -> None:
+    """Rows written to a partitioned table route to their partition (23514
+    when none takes them), a partition reads only its rows, an UPDATE moves a
+    row between partitions, and ATTACH / DETACH / DROP / COPY carry the rows
+    with them."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE TABLE pr (id int PRIMARY KEY, d date) PARTITION BY RANGE (id)")
+        conn.execute("CREATE TABLE pr_a PARTITION OF pr FOR VALUES FROM (MINVALUE) TO (10)")
+        conn.execute("CREATE TABLE pr_b PARTITION OF pr FOR VALUES FROM (10) TO (20)")
+        conn.execute("INSERT INTO pr VALUES (1, '2024-01-01'), (15, '2024-02-02')")
+        assert _fetch(conn, "SELECT id FROM pr_a") == [(1,)]
+        assert _fetch(conn, "SELECT id FROM pr_b") == [(15,)]
+        assert _sqlstate(conn, "INSERT INTO pr VALUES (99, NULL)") == "23514"
+        assert _sqlstate(conn, "INSERT INTO pr_a VALUES (12, NULL)") == "23514"
+        assert (
+            _sqlstate(conn, "CREATE TABLE pr_x PARTITION OF pr FOR VALUES FROM (5) TO (12)")
+            == "42P17"
+        )
+        conn.execute("UPDATE pr SET id = 11 WHERE id = 1")
+        assert _fetch(conn, "SELECT id FROM pr_b ORDER BY id") == [(11,), (15,)]
+        assert _fetch(conn, "SELECT tableoid::regclass::text, id FROM pr ORDER BY id") == [
+            ("pr_b", 11),
+            ("pr_b", 15),
+        ]
+        cur = conn.cursor()
+        with cur.copy("COPY pr_a FROM STDIN") as cp:
+            cp.write("3\t2024-03-03\n")
+        assert _fetch(conn, "SELECT id FROM pr ORDER BY id") == [(3,), (11,), (15,)]
+        with cur.copy("COPY pr_b TO STDOUT") as cp:
+            out = b"".join(bytes(b) for b in cp)
+        assert sorted(out.splitlines()) == [b"11\t2024-01-01", b"15\t2024-02-02"]
+        assert _fetch(
+            conn,
+            "SELECT relname, relkind, pg_get_expr(relpartbound, oid) FROM pg_class "
+            "WHERE relname LIKE 'pr%' ORDER BY 1",
+        ) == [
+            ("pr", "p", None),
+            ("pr_a", "r", "FOR VALUES FROM (MINVALUE) TO (10)"),
+            ("pr_a_pkey", "i", None),
+            ("pr_b", "r", "FOR VALUES FROM (10) TO (20)"),
+            ("pr_b_pkey", "i", None),
+            ("pr_pkey", "I", None),
+        ]
+        conn.execute("ALTER TABLE pr DETACH PARTITION pr_b")
+        assert _fetch(conn, "SELECT id FROM pr_b ORDER BY id") == [(11,), (15,)]
+        assert _fetch(conn, "SELECT id FROM pr ORDER BY id") == [(3,)]
+        conn.execute("ALTER TABLE pr ATTACH PARTITION pr_b FOR VALUES FROM (10) TO (20)")
+        assert _fetch(conn, "SELECT count(*) FROM pr") == [(3,)]
+        conn.execute("DROP TABLE pr_b")
+        assert _fetch(conn, "SELECT id FROM pr") == [(3,)]
+        conn.execute("DROP TABLE pr")
+        assert _fetch(conn, "SELECT count(*) FROM pg_class WHERE relname = 'pr_a'") == [(0,)]
+
+
+def test_update_of_primary_key(home: Path) -> None:
+    """A PRIMARY KEY column can be updated -- single and composite -- with
+    PostgreSQL's row-by-row uniqueness: `id = id + 1` over (1, 2) collides."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE TABLE upk (id int PRIMARY KEY, v text)")
+        conn.execute("INSERT INTO upk VALUES (1, 'a'), (2, 'b')")
+        assert _sqlstate(conn, "UPDATE upk SET id = id + 1") == "23505"
+        assert _fetch(conn, "UPDATE upk SET id = id + 10 RETURNING id, v") == [
+            (11, "a"),
+            (12, "b"),
+        ]
+        assert _fetch(conn, "SELECT v FROM upk WHERE id = 12") == [("b",)]
+        conn.execute("CREATE TABLE upk2 (a int, b int, v text, PRIMARY KEY (a, b))")
+        conn.execute("INSERT INTO upk2 VALUES (1, 1, 'x'), (2, 2, 'y')")
+        conn.execute("UPDATE upk2 SET a = 5 WHERE a = 1")
+        assert _fetch(conn, "SELECT a, b, v FROM upk2 ORDER BY a") == [(2, 2, "y"), (5, 1, "x")]
+        assert _sqlstate(conn, "UPDATE upk2 SET a = 2, b = 2 WHERE a = 5") == "23505"
+
+
+def test_gin_gist_brin_spgist_indexes(home: Path) -> None:
+    """The non-btree access methods are accepted with PostgreSQL's operator
+    class rules; btree_gin / btree_gist add scalar classes, and dropping one
+    takes its dependent indexes (2BP01 without CASCADE)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE TABLE gx (id int PRIMARY KEY, j jsonb, tags text[], n int)")
+        conn.execute("INSERT INTO gx VALUES (1, '{\"a\": 1}', '{x}', 3)")
+        conn.execute("CREATE INDEX gx_j ON gx USING gin (j jsonb_path_ops)")
+        conn.execute("CREATE INDEX gx_tags ON gx USING gin (tags)")
+        conn.execute("CREATE INDEX gx_n ON gx USING brin (n)")
+        assert _sqlstate(conn, "CREATE INDEX gx_bad ON gx USING gin (n)") == "42704"
+        assert _sqlstate(conn, "CREATE UNIQUE INDEX gx_u ON gx USING gin (j)") == "0A000"
+        assert _fetch(conn, "SELECT indexdef FROM pg_indexes WHERE indexname = 'gx_j'") == [
+            ("CREATE INDEX gx_j ON public.gx USING gin (j jsonb_path_ops)",)
+        ]
+        assert _fetch(conn, "SELECT id FROM gx WHERE j @> '{\"a\": 1}'") == [(1,)]
+        conn.execute("CREATE EXTENSION btree_gin")
+        conn.execute("CREATE INDEX gx_gn ON gx USING gin (n)")
+        assert _sqlstate(conn, "DROP EXTENSION btree_gin") == "2BP01"
+        conn.execute("DROP EXTENSION btree_gin CASCADE")
+        assert _fetch(conn, "SELECT count(*) FROM pg_indexes WHERE indexname = 'gx_gn'") == [(0,)]
+
+
+def test_rollback_to_savepoint_keeps_sequence_draws(home: Path) -> None:
+    """ROLLBACK TO after an insert into a `serial` table works, and the draw
+    is not undone -- PostgreSQL never rolls a sequence back. (Restoring the
+    sequence's catalog there collided with its non-transactional write and
+    failed the whole block with 40001.)"""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE TABLE sp_s (id serial PRIMARY KEY, v text)")
+        conn.autocommit = False
+        conn.execute("SAVEPOINT s")
+        conn.execute("INSERT INTO sp_s (v) VALUES ('rolled back')")
+        conn.execute("ROLLBACK TO s")
+        conn.execute("INSERT INTO sp_s (v) VALUES ('kept')")
+        conn.commit()
+        assert _fetch(conn, "SELECT id, v FROM sp_s") == [(2, "kept")]
+
+
+def test_composite_and_distinct_aggregate_ordering(home: Path) -> None:
+    """Ordering comparisons of COMPOSITE values are decided (not NULL), and a
+    DISTINCT aggregate follows its ORDER BY's direction and NULL placement,
+    answering NULL over no rows."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE TYPE cpo AS (a int, b int)")
+        assert _fetch(conn, "SELECT row(1, 2)::cpo < row(1, 3)::cpo") == [(True,)]
+        conn.execute("CREATE TABLE dag (id int PRIMARY KEY, s text)")
+        assert _fetch(conn, "SELECT array_agg(DISTINCT s) FROM dag") == [(None,)]
+        conn.execute("INSERT INTO dag VALUES (1, 'b'), (2, 'a'), (3, NULL), (4, 'b')")
+        assert _fetch(conn, "SELECT array_agg(DISTINCT s ORDER BY s DESC) FROM dag") == [
+            ([None, "b", "a"],)
+        ]
+        assert _fetch(conn, "SELECT string_agg(DISTINCT s, ',' ORDER BY s DESC) FROM dag") == [
+            ("b,a",)
         ]

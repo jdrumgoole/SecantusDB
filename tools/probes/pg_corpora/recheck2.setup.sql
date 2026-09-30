@@ -1,0 +1,4 @@
+DROP TABLE IF EXISTS rc2_j
+DROP TABLE IF EXISTS rc2_s
+CREATE TABLE rc2_j (data jsonb)
+CREATE TABLE rc2_s (id serial PRIMARY KEY, v int)
