@@ -13742,12 +13742,38 @@ impl PgHandler {
             Some(Bson::String(s)) => {
                 // Single quotes double inside a SQL literal.
                 let escaped = s.replace('\'', "''");
-                Bson::String(format!("'{escaped}'::{}", c.pg_type))
+                Bson::String(format!(
+                    "'{escaped}'::{}",
+                    secantus_pgplan::display_type(&c.pg_type)
+                ))
             }
+            Some(Bson::Array(items)) => Bson::String(format!(
+                "'{}'::{}",
+                secantus_pgplan::render_array(items).replace('\'', "''"),
+                secantus_pgplan::display_type(&c.pg_type)
+            )),
             Some(Bson::Boolean(b)) => Bson::String(b.to_string()),
-            Some(other) => Bson::String(
-                secantus_pgplan::numeric::numeric_text(other).unwrap_or_else(|| format!("{other}")),
-            ),
+            Some(other) => {
+                let text = secantus_pgplan::numeric::numeric_text(other)
+                    .unwrap_or_else(|| format!("{other}"));
+                // A negative constant is quoted and stamped with the LITERAL's
+                // type (not the column's), so it cannot read as a unary minus:
+                // `'-1'::integer`, `'-2.5'::numeric`.
+                Bson::String(if text.starts_with('-') {
+                    let ty = if text.contains(['.', 'e', 'E', 'N', 'I']) {
+                        "numeric"
+                    } else if text.parse::<i32>().is_ok() {
+                        "integer"
+                    } else if text.parse::<i64>().is_ok() {
+                        "bigint"
+                    } else {
+                        "numeric"
+                    };
+                    format!("'{text}'::{ty}")
+                } else {
+                    text
+                })
+            }
         }
     }
 
@@ -26749,8 +26775,14 @@ impl PgHandler {
             &column_type,
         );
         for i in untyped_binary {
-            if let (Some(slot), Some(Some(name))) = (param_types.get_mut(i), inferred.get(i)) {
-                *slot = Some(name.clone());
+            if let Some(slot) = param_types.get_mut(i) {
+                // What context cannot type is `unknown`, which PostgreSQL
+                // resolves as `text` -- and a binary text must be valid UTF-8
+                // (a NUL byte is 22021), so it decodes as one.
+                *slot = Some(match inferred.get(i) {
+                    Some(Some(name)) => name.clone(),
+                    _ => "text".to_string(),
+                });
             }
         }
     }

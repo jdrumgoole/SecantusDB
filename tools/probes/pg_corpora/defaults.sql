@@ -13,3 +13,7 @@ SELECT current_date = now()::date, localtimestamp IS NOT NULL, current_time IS N
 ALTER TABLE dx ADD COLUMN u2 uuid DEFAULT gen_random_uuid()
 SELECT count(DISTINCT u2) = count(*), count(t2) = count(*) FROM dx
 INSERT INTO dx (id) VALUES (900) RETURNING t2 IS NOT NULL, u2 IS NOT NULL
+# column_default as ruleutils prints it: negative constants quoted and typed
+# by the LITERAL, an integer beside a numeric shown with its implicit cast,
+# NOT / AND kept rather than folded, arrays as typed literals.
+SELECT column_name, column_default FROM information_schema.columns WHERE table_name = 'cdf' ORDER BY ordinal_position

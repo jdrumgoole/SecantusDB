@@ -4626,8 +4626,12 @@ fn ruleutils_default(node: &pg_query::protobuf::Node) -> Option<String> {
     use pg_query::protobuf::a_const::Val;
     fn render(node: &pg_query::protobuf::Node) -> Option<String> {
         match node.node.as_ref()? {
+            // ruleutils quotes a negative constant and stamps its type on,
+            // so it cannot be misread as a unary minus: `'-1'::integer`.
             N::AConst(c) => match c.val.as_ref()? {
+                Val::Ival(i) if i.ival < 0 => Some(format!("'{}'::integer", i.ival)),
                 Val::Ival(i) => Some(i.ival.to_string()),
+                Val::Fval(f) if f.fval.starts_with('-') => Some(format!("'{}'::numeric", f.fval)),
                 Val::Fval(f) => Some(f.fval.clone()),
                 Val::Boolval(b) => Some(b.boolval.to_string()),
                 Val::Sval(s) => Some(format!("'{}'::text", s.sval.replace('\'', "''"))),
@@ -4635,10 +4639,38 @@ fn ruleutils_default(node: &pg_query::protobuf::Node) -> Option<String> {
             },
             N::AExpr(e) if AExprKind::try_from(e.kind) == Ok(AExprKind::AexprOp) => {
                 let op = operator_name(e).ok()?;
-                let r = render(e.rexpr.as_deref()?)?;
+                let kind = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
+                    Some(N::AConst(c)) => match c.val.as_ref() {
+                        Some(Val::Ival(_)) => 1,
+                        Some(Val::Fval(f)) if f.fval.contains(['.', 'e', 'E']) => 2,
+                        _ => 0,
+                    },
+                    _ => 0,
+                };
+                // An integer constant beside a numeric one is coerced to
+                // numeric, which ruleutils shows as an explicit cast.
+                let side = |n: &pg_query::protobuf::Node, other: &pg_query::protobuf::Node| {
+                    let text = render(n)?;
+                    Some(if kind(n) == 1 && kind(other) == 2 {
+                        format!("({text})::numeric")
+                    } else {
+                        text
+                    })
+                };
+                let rn = e.rexpr.as_deref()?;
                 match e.lexpr.as_deref() {
-                    Some(l) => Some(format!("({} {op} {r})", render(l)?)),
-                    None => Some(format!("({op}{r})")),
+                    Some(l) => Some(format!("({} {op} {})", side(l, rn)?, side(rn, l)?)),
+                    None => Some(format!("({op}{})", render(rn)?)),
+                }
+            }
+            N::BoolExpr(b) => {
+                let args: Option<Vec<String>> = b.args.iter().map(render).collect();
+                let args = args?;
+                match BoolExprType::try_from(b.boolop).ok()? {
+                    BoolExprType::NotExpr => Some(format!("(NOT {})", args.first()?)),
+                    BoolExprType::AndExpr => Some(format!("({})", args.join(" AND "))),
+                    BoolExprType::OrExpr => Some(format!("({})", args.join(" OR "))),
+                    _ => None,
                 }
             }
             N::FuncCall(f) => {
