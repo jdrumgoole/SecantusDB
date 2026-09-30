@@ -519,6 +519,23 @@ pub enum Statement {
         if_exists: bool,
         cascade: bool,
     },
+    /// `CREATE [OR REPLACE] RULE` on INSERT / UPDATE / DELETE.
+    CreateRule {
+        table: String,
+        name: String,
+        /// `INSERT` / `UPDATE` / `DELETE`.
+        event: String,
+        instead: bool,
+        condition: Option<String>,
+        actions: Vec<String>,
+        replace: bool,
+    },
+    /// `DROP RULE [IF EXISTS] name ON table`.
+    DropRule {
+        table: String,
+        name: String,
+        if_exists: bool,
+    },
     /// `DROP CAST [IF EXISTS] (source AS target)`.
     DropCast {
         source: String,
@@ -1125,6 +1142,17 @@ pub enum AlterTableAction {
     RowSecurity {
         enable: Option<bool>,
         force: Option<bool>,
+    },
+    /// `ENABLE` / `DISABLE TRIGGER name | ALL | USER`: `name` is `None` for
+    /// every trigger on the table.
+    TriggerEnabled {
+        name: Option<String>,
+        enabled: bool,
+    },
+    /// `ENABLE` / `DISABLE RULE name`.
+    RuleEnabled {
+        name: String,
+        enabled: bool,
     },
     /// `OWNER TO role`: checked (the role must exist) and otherwise a no-op,
     /// since every relation here is the session's.
@@ -3200,6 +3228,7 @@ fn plan_node(
         }
         N::CreateFunctionStmt(f) => plan_create_function(&f),
         N::CreateCastStmt(c) => user_casts::plan_create(&c),
+        N::RuleStmt(r) => plan_create_rule(&r),
         N::CreateTrigStmt(t) => plan_create_trigger(&t),
         N::CopyStmt(c) => plan_copy(&c, lookup, params),
         N::VariableShowStmt(v) => Ok(Statement::Show(v.name.clone())),
@@ -4483,6 +4512,36 @@ fn plan_alter_action(
             column: cmd.name.clone(),
             not_null: true,
         }),
+        // `ENABLE ALWAYS` / `REPLICA` fire in this server's only replication
+        // role (origin) just as a plain ENABLE does.
+        Ok(AT::AtEnableTrig | AT::AtEnableAlwaysTrig | AT::AtEnableReplicaTrig) => {
+            Ok(AlterTableAction::TriggerEnabled {
+                name: Some(cmd.name.clone()),
+                enabled: true,
+            })
+        }
+        Ok(AT::AtDisableTrig) => Ok(AlterTableAction::TriggerEnabled {
+            name: Some(cmd.name.clone()),
+            enabled: false,
+        }),
+        Ok(AT::AtEnableTrigAll | AT::AtEnableTrigUser) => Ok(AlterTableAction::TriggerEnabled {
+            name: None,
+            enabled: true,
+        }),
+        Ok(AT::AtDisableTrigAll | AT::AtDisableTrigUser) => Ok(AlterTableAction::TriggerEnabled {
+            name: None,
+            enabled: false,
+        }),
+        Ok(AT::AtEnableRule | AT::AtEnableAlwaysRule | AT::AtEnableReplicaRule) => {
+            Ok(AlterTableAction::RuleEnabled {
+                name: cmd.name.clone(),
+                enabled: true,
+            })
+        }
+        Ok(AT::AtDisableRule) => Ok(AlterTableAction::RuleEnabled {
+            name: cmd.name.clone(),
+            enabled: false,
+        }),
         Ok(AT::AtEnableRowSecurity) => Ok(AlterTableAction::RowSecurity {
             enable: Some(true),
             force: None,
@@ -4974,6 +5033,8 @@ pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
             }
         },
         AlterTableAction::RowSecurity { .. }
+        | AlterTableAction::TriggerEnabled { .. }
+        | AlterTableAction::RuleEnabled { .. }
         | AlterTableAction::AttachPartition { .. }
         | AlterTableAction::DetachPartition(_) => {}
         AlterTableAction::ValidateConstraint(name) => {
@@ -26440,6 +26501,31 @@ fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
     if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectCollation) {
         return collation::plan_drop(d);
     }
+    // `DROP RULE name ON table`: the object is `[schema.]table.rule`.
+    if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectRule) {
+        let [obj] = d.objects.as_slice() else {
+            return Err(Error::Unsupported("DROP RULE of more than one rule".into()));
+        };
+        let Some(N::List(l)) = obj.node.as_ref() else {
+            return Err(Error::Unsupported("this DROP RULE target".into()));
+        };
+        let parts: Vec<String> = l
+            .items
+            .iter()
+            .filter_map(|n| match n.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            })
+            .collect();
+        let [.., table, name] = parts.as_slice() else {
+            return Err(Error::Parse("DROP RULE needs a table".into()));
+        };
+        return Ok(Statement::DropRule {
+            table: table.clone(),
+            name: name.clone(),
+            if_exists: d.missing_ok,
+        });
+    }
     // `DROP SCHEMA`: the object is a bare String / one-element List.
     if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectSchema) {
         let mut names = Vec::new();
@@ -30414,3 +30500,49 @@ fn lower_between(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document>
 
 #[cfg(test)]
 mod tests;
+
+/// `CREATE [OR REPLACE] RULE name AS ON event TO table [WHERE cond] DO
+/// [ALSO | INSTEAD] { NOTHING | command | ( command; ... ) }`.
+fn plan_create_rule(r: &pg_query::protobuf::RuleStmt) -> Result<Statement> {
+    use pg_query::protobuf::CmdType;
+    let table = r
+        .relation
+        .as_ref()
+        .map(|rv| rv.relname.clone())
+        .ok_or_else(|| Error::Parse("a rule needs a table".into()))?;
+    let event = match CmdType::try_from(r.event) {
+        Ok(CmdType::CmdInsert) => "INSERT",
+        Ok(CmdType::CmdUpdate) => "UPDATE",
+        Ok(CmdType::CmdDelete) => "DELETE",
+        Ok(CmdType::CmdSelect) => {
+            // An ON SELECT rule turns a table into a view: `_RETURN` only.
+            if r.rulename != "_RETURN" {
+                return Err(Error::Sqlstate(
+                    "42P17",
+                    format!("view rule for \"{table}\" must be named \"_RETURN\""),
+                ));
+            }
+            return Err(Error::FeatureNotSupported(
+                "converting a table to a view with an ON SELECT rule".into(),
+            ));
+        }
+        _ => return Err(Error::Unsupported("this rule event".into())),
+    };
+    let condition = r.where_clause.as_deref().map(deparse_expr).transpose()?;
+    let mut actions = Vec::with_capacity(r.actions.len());
+    for a in &r.actions {
+        actions.push(
+            a.deparse()
+                .map_err(|e| Error::Parse(format!("a rule action: {e}")))?,
+        );
+    }
+    Ok(Statement::CreateRule {
+        table,
+        name: r.rulename.clone(),
+        event: event.to_string(),
+        instead: r.instead,
+        condition,
+        actions,
+        replace: r.replace,
+    })
+}

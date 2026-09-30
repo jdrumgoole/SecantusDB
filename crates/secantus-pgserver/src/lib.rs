@@ -22,6 +22,7 @@ mod merge;
 mod partition;
 mod plpgsql_do;
 mod plpgsql_fn;
+mod rules;
 mod server;
 mod table_locks;
 mod triggers;
@@ -9225,6 +9226,8 @@ impl PgHandler {
             "pg_description" => Some(catalog_fill::pg_description_def()),
             "pg_opclass" => Some(catalog_fill::pg_opclass_def()),
             "pg_cast" => Some(casts::pg_cast_def()),
+            "pg_rewrite" => Some(rules::pg_rewrite_def()),
+            "pg_rules" => Some(rules::pg_rules_def()),
             "pg_depend" => Some(catalog_fill::pg_depend_def()),
             "pg_publication_namespace" => Some(catalog_fill::pg_publication_namespace_def()),
             _ => Self::catalog_object_table(name),
@@ -9246,6 +9249,8 @@ impl PgHandler {
             "pg_description" => self.pg_description_rows(&def),
             "pg_opclass" => self.pg_opclass_rows(&def),
             "pg_cast" => self.pg_cast_rows(&def),
+            "pg_rewrite" => self.pg_rewrite_rows(&def),
+            "pg_rules" => self.pg_rules_rows(&def),
             "pg_depend" => Vec::new(),
             "pg_publication_namespace" => Vec::new(),
             "information_schema.columns" => {
@@ -9809,7 +9814,14 @@ impl PgHandler {
                     d.insert(f("tgname"), t.get_str("name").unwrap_or_default());
                     d.insert(f("tgfoid"), Bson::Int64(0));
                     d.insert(f("tgtype"), Bson::Int32(ty));
-                    d.insert(f("tgenabled"), "O");
+                    d.insert(
+                        f("tgenabled"),
+                        if t.get_bool("enabled").unwrap_or(true) {
+                            "O"
+                        } else {
+                            "D"
+                        },
+                    );
                     d.insert(f("tgisinternal"), false);
                     d.insert(f("tgconstrrelid"), Bson::Int64(0));
                     d.insert(f("tgconstrindid"), Bson::Int64(0));
@@ -13397,7 +13409,13 @@ impl PgHandler {
             // savepoint has to capture both -- a `ROLLBACK TO` that put the
             // catalog back but left the rewritten rows would describe the
             // table with a shape its own rows do not have.
-            Statement::AlterTable { table, .. } | Statement::RenameColumn { table, .. } => {
+            Statement::AlterTable { table, .. } => vec![
+                table.clone(),
+                CATALOG_COLLECTION.to_string(),
+                triggers::TRIGGER_COLLECTION.to_string(),
+                rules::RULE_COLLECTION.to_string(),
+            ],
+            Statement::RenameColumn { table, .. } => {
                 vec![table.clone(), CATALOG_COLLECTION.to_string()]
             }
             Statement::RenameTable { table, to, .. } => {
@@ -13437,6 +13455,8 @@ impl PgHandler {
                 v.push(CATALOG_COLLECTION.to_string());
                 v.push(SEQUENCE_COLLECTION.to_string());
                 v.push(Self::COMPOSITE_COLLECTION.to_string());
+                v.push(triggers::TRIGGER_COLLECTION.to_string());
+                v.push(rules::RULE_COLLECTION.to_string());
                 v
             }
             // CREATE/DROP TYPE writes a type-catalog row; a `ROLLBACK TO`
@@ -13487,6 +13507,9 @@ impl PgHandler {
             }
             Statement::CreateTrigger(_) | Statement::DropTrigger { .. } => {
                 vec![triggers::TRIGGER_COLLECTION.to_string()]
+            }
+            Statement::CreateRule { .. } | Statement::DropRule { .. } => {
+                vec![rules::RULE_COLLECTION.to_string()]
             }
             Statement::DropFunction { .. } => vec![
                 Self::FUNCTION_COLLECTION.to_string(),
@@ -13661,9 +13684,11 @@ impl PgHandler {
             )))
         };
         match action {
-            A::RowSecurity { .. } | A::AttachPartition { .. } | A::DetachPartition(_) => {
-                return Ok(Some(action.clone()))
-            }
+            A::RowSecurity { .. }
+            | A::TriggerEnabled { .. }
+            | A::RuleEnabled { .. }
+            | A::AttachPartition { .. }
+            | A::DetachPartition(_) => return Ok(Some(action.clone())),
             A::OwnerTo(role) => {
                 return Ok(Some(A::OwnerTo(self.grantee_name(role)?)));
             }
@@ -13884,6 +13909,10 @@ impl PgHandler {
                 };
                 self.put_comment_doc(Self::RLS_COLLECTION, table, Some(doc))
             }
+            A::TriggerEnabled { name, enabled } => {
+                self.set_trigger_enabled(table, name.as_deref(), *enabled)
+            }
+            A::RuleEnabled { name, enabled } => self.set_rule_enabled(table, name, *enabled),
             A::ValidateConstraint(name) => {
                 let Some(check) = before.check_constraints.iter().find(|c| c.name == *name) else {
                     return Ok(());
@@ -18290,6 +18319,8 @@ impl PgHandler {
             Statement::CreateCollation { .. } => "CREATE COLLATION",
             Statement::DropCollation { .. } => "DROP COLLATION",
             Statement::DropCast { .. } => "DROP CAST",
+            Statement::CreateRule { .. } => "CREATE RULE",
+            Statement::DropRule { .. } => "DROP RULE",
             Statement::DropOperator { .. } => "DROP OPERATOR",
             Statement::AlterView { table_form, .. }
             | Statement::RenameView { table_form, .. }
@@ -18448,6 +18479,32 @@ impl PgHandler {
     }
 
     fn execute_inner(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response>> {
+        // A row an INSTEAD rule of the statement's own kind replaced counts
+        // in its tag, as the rule's action does in PostgreSQL's.
+        if !matches!(
+            stmt,
+            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+        ) {
+            return self.execute_dispatch(stmt, max_rows);
+        }
+        let saved = rules::take_instead_rows();
+        let out = self.execute_dispatch(stmt, max_rows);
+        let replaced = rules::take_instead_rows();
+        rules::add_instead_rows(saved);
+        let mut out = out?;
+        if replaced > 0 {
+            for r in &mut out {
+                if let Response::Execution(tag) = r {
+                    if let Some(n) = tag.rows() {
+                        *tag = tag.clone().with_rows(n + replaced);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn execute_dispatch(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response>> {
         // A timestamptz renders in the SESSION zone; capture it once here and
         // thread it into the row encoder explicitly. A thread-local does not
         // work: pgwire may encode the DataRows lazily on another async worker
@@ -19562,6 +19619,30 @@ impl PgHandler {
                 if_exists,
             } => self.drop_operator(&name, left.as_deref(), &right, if_exists),
             Statement::CreateCast(cast) => self.create_cast(cast),
+            Statement::CreateRule {
+                table,
+                name,
+                event,
+                instead,
+                condition,
+                actions,
+                replace,
+            } => self.create_rule(
+                rules::Rule {
+                    table,
+                    name,
+                    event,
+                    instead,
+                    condition,
+                    actions,
+                },
+                replace,
+            ),
+            Statement::DropRule {
+                table,
+                name,
+                if_exists,
+            } => self.drop_rule(&table, &name, if_exists),
             Statement::CreateCollation {
                 collation,
                 if_not_exists,

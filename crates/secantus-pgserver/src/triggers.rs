@@ -82,12 +82,21 @@ impl PgHandler {
             .into_iter()
             .filter(|d| {
                 d.get_str("table") == Ok(table)
+                    && d.get_bool("enabled").unwrap_or(true)
                     && d.get_str("timing") == Ok(timing)
                     && d.get_str("level").unwrap_or("ROW") == level
                     && events_of(d).iter().any(|e| e == event)
             })
             .collect();
         out.sort_by(|a, b| a.get_str("name").ok().cmp(&b.get_str("name").ok()));
+        // A rule is a rewrite, applied before any trigger fires.
+        if level == "ROW" {
+            let mut rules = self.rule_triggers(table, timing, event);
+            if !rules.is_empty() {
+                rules.append(&mut out);
+                return Ok(rules);
+            }
+        }
         Ok(out)
     }
 
@@ -97,7 +106,35 @@ impl PgHandler {
         Ok(self
             .trigger_docs()?
             .iter()
-            .any(|d| d.get_str("table") == Ok(table)))
+            .any(|d| d.get_str("table") == Ok(table))
+            || self.has_rules(table))
+    }
+
+    /// `ALTER TABLE ... ENABLE / DISABLE TRIGGER name | ALL | USER`.
+    pub(crate) fn set_trigger_enabled(
+        &self,
+        table: &str,
+        name: Option<&str>,
+        enabled: bool,
+    ) -> PgWireResult<()> {
+        let mut found = false;
+        for mut d in self.trigger_docs()? {
+            if d.get_str("table") != Ok(table) || name.is_some_and(|n| d.get_str("name") != Ok(n)) {
+                continue;
+            }
+            found = true;
+            let id = d.get_str("_id").unwrap_or_default().to_string();
+            d.insert("enabled", enabled);
+            self.delete_type_doc(TRIGGER_COLLECTION, &id)?;
+            self.insert_type_doc(TRIGGER_COLLECTION, &id, d)?;
+        }
+        match name {
+            Some(n) if !found => Err(user_error(
+                "42704",
+                format!("trigger \"{n}\" for table \"{table}\" does not exist"),
+            )),
+            _ => Ok(()),
+        }
     }
 
     pub(crate) fn create_trigger(&self, def: TriggerDef) -> PgWireResult<()> {
@@ -335,7 +372,7 @@ impl PgHandler {
                 }
             }
         }
-        Ok(())
+        self.drop_table_rules(table)
     }
 
     /// The triggers that call `function`, for DROP FUNCTION's dependency
@@ -384,12 +421,21 @@ impl PgHandler {
         new: Option<Record>,
         old: Option<Record>,
     ) -> PgWireResult<Option<Record>> {
-        let function = trg.get_str("function").unwrap_or_default();
-        let doc = self
-            .user_function_docs()?
-            .into_iter()
-            .find(|d| d.get_str("name") == Ok(function) && d.get_i32("nargs") == Ok(0))
-            .ok_or_else(|| user_error("42883", format!("function {function}() does not exist")))?;
+        // A rule carries its own body.
+        let source = match trg.get_str("inline_function") {
+            Ok(sql) => sql.to_string(),
+            Err(_) => {
+                let function = trg.get_str("function").unwrap_or_default();
+                let doc = self
+                    .user_function_docs()?
+                    .into_iter()
+                    .find(|d| d.get_str("name") == Ok(function) && d.get_i32("nargs") == Ok(0))
+                    .ok_or_else(|| {
+                        user_error("42883", format!("function {function}() does not exist"))
+                    })?;
+                crate::plpgsql_create_sql(&doc)
+            }
+        };
         let data = TriggerData {
             new,
             old,
@@ -403,7 +449,7 @@ impl PgHandler {
         let outcome = self.with_transition_tables(trg, || {
             self.with_call_depth(|| {
                 plpgsql_fn::run(
-                    &crate::plpgsql_create_sql(&doc),
+                    &source,
                     plpgsql_fn::Invocation {
                         args: &[],
                         arg_types: &[],
@@ -415,10 +461,14 @@ impl PgHandler {
                 .map_err(crate::wire_pl_error)
             })
         })?;
-        Ok(match outcome {
+        let row = match outcome {
             plpgsql_fn::Outcome::Record(r) => r,
             _ => None,
-        })
+        };
+        if row.is_none() && trg.get_bool("rule_instead_same_kind").unwrap_or(false) {
+            crate::rules::add_instead_rows(1);
+        }
+        Ok(row)
     }
 
     /// Does a row trigger's `WHEN` condition hold? Evaluated by the same
