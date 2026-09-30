@@ -10226,16 +10226,12 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   crates.io; (b) add a `secantusdb` **binary crate** (a thin `main` over the
   engines + storage) — gated on the storage keystone (Phase 4 above), since a
   standalone server also needs storage in Rust, not just the operator engines.
-- [ ] **OPEN -- `RunningPgServer` panics when stopped or dropped inside a tokio
-  runtime.** `stop()` ends with `runtime.shutdown_timeout(..)` on the handle's
-  own runtime, which tokio refuses from an async context, and `Drop` calls
-  `stop()` (`secantus-pgserver/src/server.rs`). So any Rust caller that lets the
-  handle fall out of scope in a `#[tokio::test]` panics; the repo's own
-  `tests/embedded.rs` avoids it by keeping every `stop()` outside `block_on`.
-  Invisible to the Python embedding (it calls from a plain thread), fatal to a
-  Rust one. Fix: run the shutdown on a dedicated thread and join it; test it
-  from current-thread and multi-thread `#[tokio::test]`s. Phase C.3 of
-  `tasks/rust-packages-plan.md`.
+- [x] **`RunningPgServer` inside a tokio runtime -- FIXED in #1665.** Found
+  while planning the packages: `bind` panicked inside a runtime ("Cannot start
+  a runtime from within a runtime" -- it `block_on`'d its own), and so did
+  `stop()` / `Drop` ("Cannot drop a runtime in a context where blocking is not
+  allowed"). So a `#[tokio::test]` could neither start nor drop the server.
+  Invisible to the Python embedding, which calls from a plain thread.
 - [ ] **Make Rust the *recommended* default — a product/docs decision for
   Joe** (2026-07-17 audit). The byte-seam overhead rationale below is moot
   under the two-server model (the Rust server has no per-call seam); what

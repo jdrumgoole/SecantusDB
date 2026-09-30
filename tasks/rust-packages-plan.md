@@ -94,14 +94,12 @@ Measured, in order of cost:
    in a published crate, so it would not compile against upstream.
 4. **`publish = false`** on all 13 Mongo-side crates, and every internal
    dependency is a path dependency with no `version`.
-5. **The PG handle cannot be dropped inside a tokio runtime.**
-   `RunningPgServer::stop` ends with `runtime.shutdown_timeout(..)`, which
-   panics when called from an async context; `Drop` calls `stop`. Every
-   `#[tokio::test]` that lets the server fall out of scope would panic — the
-   most common way a Rust user would write the test. The repo's own
-   `secantus-pgserver/tests/embedded.rs` works around exactly this (its `run`
-   helper: "dropping one inside a runtime context panics, so `stop()` must be
-   called outside `block_on`").
+5. ~~**The PG handle cannot be used inside a tokio runtime.**~~ **Fixed in
+   #1665.** Both `bind` (which `block_on`'d its own runtime) and `stop` /
+   `Drop` (which shut that runtime down) panicked inside an async context, so
+   a `#[tokio::test]` could neither start nor drop the server. The repo's own
+   `secantus-pgserver/tests/embedded.rs` had worked around it by keeping every
+   call outside `block_on`.
 6. **No one-line constructor on either side.** Both servers already have a
    real in-process API — `secantus_server::bind(addr, ServerConfig,
    Arc<dyn Storage>, Arc<CursorRegistry>)` and
@@ -215,11 +213,8 @@ step 1 is what protects that, and it is non-negotiable.
 2. `secantus_pg::PgServer`: the same shape — `start()`, `builder()` with
    `.storage_path`, `.databases([...])`, `.port`; `.dsn()`,
    `.connection_string()` (URL form), `.address()`.
-3. **Fix the async drop (§3.5).** Run the shutdown on a dedicated thread and
-   join it, so `stop` / `Drop` are safe from inside a runtime. Test it the way
-   users will hit it: a `#[tokio::test]` that drops the server, current-thread
-   and multi-thread flavours. This is a bug in today's handle, not only a
-   packaging nicety; fix it first, as its own slice.
+3. ~~Fix the async drop (§3.5).~~ Done in #1665, with current-thread and
+   multi-thread `#[tokio::test]` coverage.
 4. Feature flags: the library pulls no allocator (`mimalloc` only under the
    `bin` feature — a library must not choose the host program's allocator),
    and the binary sits behind a default-on `bin` feature so a dev-dependency
@@ -269,7 +264,7 @@ not a footnote.
 | phase | depends on | rough size |
 | --- | --- | --- |
 | §2 decisions | — | a conversation |
-| C.3 async-drop fix | — | small; a real bug, do it now |
+| C.3 async-drop fix | — | **done** (#1665) |
 | D.2 binstall metadata | names registered | small |
 | A — WT from a crate | — | **largest and riskiest**: 3-5 days, mostly CI across three OSes |
 | B — publishable crates | A, §2 | 2-3 days (pgwire upstreaming may take longer; the fork covers it) |
