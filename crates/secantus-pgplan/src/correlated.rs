@@ -653,6 +653,11 @@ pub fn set_user_functions(fns: Vec<UserFn>) {
     USER_FUNCTIONS.with(|f| *f.borrow_mut() = fns);
 }
 
+/// The installed user functions.
+pub(crate) fn user_functions() -> Vec<UserFn> {
+    USER_FUNCTIONS.with(|f| f.borrow().clone())
+}
+
 /// The user function a call resolves to: by name and argument count, and --
 /// when overloads share the count -- by the arguments' types, an untyped
 /// literal matching any. Several equally good candidates are PostgreSQL's

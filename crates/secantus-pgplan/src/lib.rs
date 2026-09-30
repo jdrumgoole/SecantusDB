@@ -55,6 +55,7 @@ pub mod pgtypes;
 pub mod range;
 pub mod range_ops;
 pub mod scalar;
+pub mod user_agg;
 pub mod view_dml;
 pub mod xml;
 
@@ -451,6 +452,17 @@ pub enum Statement {
         table: String,
         if_exists: bool,
     },
+    /// `CREATE [OR REPLACE] AGGREGATE name (args) (SFUNC = ..., STYPE = ...)`.
+    CreateAggregate {
+        def: user_agg::UserAggregate,
+        replace: bool,
+    },
+    /// `DROP AGGREGATE [IF EXISTS] name (args)`.
+    DropAggregate {
+        name: String,
+        arg_types: Vec<String>,
+        if_exists: bool,
+    },
     /// `DROP FUNCTION [IF EXISTS] name[(args)] [CASCADE]`.
     DropFunction {
         name: String,
@@ -791,6 +803,46 @@ pub enum ConflictAction {
 pub struct OnConflict {
     pub target: Option<ConflictTarget>,
     pub action: ConflictAction,
+    /// `ON CONFLICT (cols) WHERE <pred>`: the predicate, as SQL. A partial
+    /// unique index is an arbiter only when this implies its predicate.
+    pub where_sql: Option<String>,
+    /// The column target matches no declared constraint, so it must be a
+    /// unique INDEX -- which only the executor can see. It resolves the
+    /// arbiter (or answers 42P10) before touching a row.
+    pub index_arbiter: bool,
+}
+
+/// Whether `condition` implies `predicate`, the way an `ON CONFLICT ...
+/// WHERE` must imply a partial index's predicate: every AND-ed conjunct of
+/// the predicate is one of the condition's, compared as normalised SQL.
+/// Sound, not complete -- `a > 5` does not prove `a > 0` here -- which errs
+/// toward 42P10 rather than toward the wrong arbiter.
+pub fn predicate_implied(condition: &str, predicate: &str) -> bool {
+    fn conjuncts(sql: &str) -> Option<Vec<String>> {
+        let tree = pg_query::parse(&format!("SELECT 1 WHERE {sql}")).ok()?;
+        let stmt = tree.protobuf.stmts.first()?.stmt.as_ref()?;
+        let Some(N::SelectStmt(s)) = stmt.node.as_ref() else {
+            return None;
+        };
+        let mut out = Vec::new();
+        let mut stack = vec![(**s.where_clause.as_ref()?).clone()];
+        while let Some(n) = stack.pop() {
+            match n.node.as_ref() {
+                Some(N::BoolExpr(b))
+                    if pg_query::protobuf::BoolExprType::try_from(b.boolop)
+                        == Ok(pg_query::protobuf::BoolExprType::AndExpr) =>
+                {
+                    stack.extend(b.args.iter().cloned());
+                }
+                _ => out.push(deparse_expr(&n).ok()?),
+            }
+        }
+        Some(out)
+    }
+    match (conjuncts(condition), conjuncts(predicate)) {
+        (Some(c), Some(p)) => p.iter().all(|x| c.contains(x)),
+        _ => false,
+    }
 }
 
 /// Field prefix under which a `DO UPDATE` expression sees the PROPOSED row.
@@ -1100,6 +1152,8 @@ pub struct WindowItem {
     /// `FILTER (WHERE ...)`, evaluated per row; a row that fails it is not
     /// AGGREGATED but still gets an output value.
     pub filter: Option<ColumnExpr>,
+    /// `WindowFunc::User`'s aggregate.
+    pub user: Option<user_agg::UserAggregate>,
 }
 
 /// The window functions this server computes.
@@ -1126,6 +1180,8 @@ pub enum WindowFunc {
     ArrayAgg,
     BoolAnd,
     BoolOr,
+    /// A `CREATE AGGREGATE` aggregate over the frame.
+    User,
 }
 
 impl WindowFunc {
@@ -1325,6 +1381,8 @@ pub enum AggFunc {
     /// `bit_and` / `bit_or` over integers.
     BitAnd,
     BitOr,
+    /// A `CREATE AGGREGATE` aggregate; `AggItem::user` holds its definition.
+    User,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -1373,6 +1431,8 @@ pub struct AggItem {
     /// An ordered-set or hypothetical-set aggregate's DIRECT arguments, already
     /// evaluated: the fraction, or the hypothetical row.
     pub direct: Vec<Bson>,
+    /// `AggFunc::User`'s definition, resolved at plan time.
+    pub user: Option<user_agg::UserAggregate>,
 }
 
 /// One output column of an aggregate query, by POSITION.
@@ -2792,6 +2852,9 @@ fn plan_node(
         N::DefineStmt(d) if ObjectType::try_from(d.kind) == Ok(ObjectType::ObjectType) => {
             plan_define_type(&d)
         }
+        N::DefineStmt(d) if ObjectType::try_from(d.kind) == Ok(ObjectType::ObjectAggregate) => {
+            plan_create_aggregate(&d)
+        }
         N::CreateFunctionStmt(f) => plan_create_function(&f),
         N::CreateTrigStmt(t) => plan_create_trigger(&t),
         N::CopyStmt(c) => plan_copy(&c, lookup, params),
@@ -3158,6 +3221,90 @@ fn plan_define_type(d: &pg_query::protobuf::DefineStmt) -> Result<Statement> {
         schema,
         input,
         output,
+    })
+}
+
+/// `CREATE AGGREGATE`, in both forms: `name (args) (sfunc = ..., ...)` and
+/// the old `name (basetype = t, sfunc = ..., ...)`. What changes only a
+/// plan's cost or its parallelism (`combinefunc`, `sortop`, `parallel`, the
+/// moving-aggregate functions) is accepted and has nothing to do here; what
+/// would change an answer and is not implemented is refused by name.
+fn plan_create_aggregate(d: &pg_query::protobuf::DefineStmt) -> Result<Statement> {
+    let (_, name) = split_qualified_type_name(&d.defnames)?;
+    let mut def = user_agg::UserAggregate {
+        name,
+        ..Default::default()
+    };
+    if !d.oldstyle {
+        let Some(N::List(l)) = d.args.first().and_then(|a| a.node.as_ref()) else {
+            return Err(Error::Parse("CREATE AGGREGATE without arguments".into()));
+        };
+        for p in &l.items {
+            let Some(N::FunctionParameter(fp)) = p.node.as_ref() else {
+                continue;
+            };
+            let ty = fp
+                .arg_type
+                .as_ref()
+                .map(type_name_of)
+                .ok_or_else(|| Error::Parse("an aggregate argument without a type".into()))?;
+            def.arg_types.push(ty);
+        }
+        // `name (args ORDER BY args)`: an ordered-set aggregate.
+        if matches!(d.args.get(1).and_then(|a| a.node.as_ref()), Some(N::Integer(i)) if i.ival >= 0)
+        {
+            return Err(Error::Unsupported("an ordered-set CREATE AGGREGATE".into()));
+        }
+    }
+    for opt in &d.definition {
+        let Some(N::DefElem(e)) = opt.node.as_ref() else {
+            continue;
+        };
+        let value = match e.arg.as_ref().and_then(|a| a.node.as_ref()) {
+            Some(N::TypeName(t)) => Some(type_name_of(t)),
+            Some(N::String(s)) => Some(s.sval.clone()),
+            Some(N::Integer(i)) => Some(i.ival.to_string()),
+            Some(N::Float(f)) => Some(f.fval.clone()),
+            Some(N::List(l)) => l.items.iter().rev().find_map(|n| match n.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            }),
+            _ => None,
+        };
+        let key = e.defname.to_ascii_lowercase();
+        match key.as_str() {
+            "sfunc" | "sfunc1" => def.sfunc = value.unwrap_or_default(),
+            "stype" | "stype1" => def.stype = value.unwrap_or_default(),
+            "finalfunc" => def.finalfunc = value,
+            "initcond" | "initcond1" => def.initcond = value,
+            "basetype" if d.oldstyle => {
+                // `basetype = "ANY"` is the zero-argument form.
+                let t = value.unwrap_or_default();
+                if !t.eq_ignore_ascii_case("any") {
+                    def.arg_types.push(t);
+                }
+            }
+            "combinefunc" | "serialfunc" | "deserialfunc" | "sortop" | "parallel" | "sspace"
+            | "msspace" | "msfunc" | "minvfunc" | "mstype" | "mfinalfunc" | "minitcond"
+            | "mfinalfunc_extra" | "mfinalfunc_modify" => {}
+            "finalfunc_modify" => {}
+            other => {
+                return Err(Error::Unsupported(format!(
+                    "the CREATE AGGREGATE option \"{other}\""
+                )))
+            }
+        }
+    }
+    user_agg::validate(&def)?;
+    if def.arg_types.len() != 1 {
+        return Err(Error::Unsupported(format!(
+            "an aggregate of {} arguments",
+            def.arg_types.len()
+        )));
+    }
+    Ok(Statement::CreateAggregate {
+        def,
+        replace: d.replace,
     })
 }
 
@@ -3800,7 +3947,7 @@ fn plan_alter_action(
                 return Err(Error::Parse("ADD COLUMN without a column".into()));
             };
             Ok(AlterTableAction::AddColumn {
-                column: plan_added_column(cd, params)?,
+                column: plan_added_column(cd, params, table)?,
                 if_not_exists: cmd.missing_ok,
             })
         }
@@ -4082,15 +4229,20 @@ fn split_added_column_constraints(
     (main, extra)
 }
 
-fn plan_added_column(cd: &pg_query::protobuf::ColumnDef, params: &[Bson]) -> Result<Column> {
+fn plan_added_column(
+    cd: &pg_query::protobuf::ColumnDef,
+    params: &[Bson],
+    table: &str,
+) -> Result<Column> {
     use pg_query::protobuf::ConstrType as CT;
-    let ty = cd.type_name.as_ref().map(type_name_of).unwrap_or_default();
-    if normalize_serial(&ty) != ty {
-        return Err(Error::Unsupported(
-            "ALTER TABLE ADD COLUMN of a serial column".into(),
-        ));
-    }
+    let declared = cd.type_name.as_ref().map(type_name_of).unwrap_or_default();
+    let ty = normalize_serial(&declared);
     let mut column = Column::new(&cd.colname, &ty, false);
+    // A serial column draws from `<table>_<column>_seq` (the executor picks
+    // a free name if that one is taken) and numbers the existing rows.
+    if ty != declared {
+        column.sequence = Some(format!("{table}_{}_seq", cd.colname));
+    }
     column.typmod = cd.type_name.as_ref().map(declared_typmod).unwrap_or(-1);
     for con in &cd.constraints {
         let Some(N::Constraint(k)) = con.node.as_ref() else {
@@ -6256,15 +6408,6 @@ fn plan_on_conflict(
     let target = match clause.infer.as_deref() {
         None => None,
         Some(infer) => {
-            // A partial-index arbiter (`ON CONFLICT (a) WHERE b`) needs index
-            // inference this server does not have. REFUSED rather than
-            // silently widened to the unconditional index, which would take a
-            // conflict the user's predicate excludes.
-            if infer.where_clause.is_some() {
-                return Err(Error::Unsupported(
-                    "ON CONFLICT with a WHERE on the conflict target".into(),
-                ));
-            }
             if !infer.conname.is_empty() {
                 Some(ConflictTarget::Constraint(infer.conname.clone()))
             } else {
@@ -6287,6 +6430,13 @@ fn plan_on_conflict(
     // PostgreSQL resolves the arbiter at PLAN time: a target matching no
     // unique constraint is 42P10 before any row is touched, not a dup-key
     // error when one happens to collide.
+    let where_sql = clause
+        .infer
+        .as_deref()
+        .and_then(|i| i.where_clause.as_deref())
+        .map(deparse_expr)
+        .transpose()?;
+    let mut index_arbiter = false;
     if let Some(t) = &target {
         let known = arbiters(def);
         let matched = match t {
@@ -6304,6 +6454,13 @@ fn plan_on_conflict(
                     return Err(Error::UndefinedColumn(col));
                 }
             }
+            // A column list may still name a unique INDEX (`CREATE UNIQUE
+            // INDEX`, partial or not), which the executor resolves.
+            if matches!(t, ConflictTarget::Columns(_)) {
+                index_arbiter = true;
+            }
+        }
+        if !matched && !index_arbiter {
             // The two halves are DIFFERENT errors in PostgreSQL 14, measured
             // rather than assumed: a named constraint that does not exist is
             // `42704 undefined_object`, while a column list matching no unique
@@ -6338,13 +6495,6 @@ fn plan_on_conflict(
                 let column = def
                     .column(&rt.name)
                     .ok_or_else(|| Error::UndefinedColumn(rt.name.clone()))?;
-                // The PK is the document `_id`, which storage treats as
-                // immutable — the same refusal `UPDATE` makes.
-                if column.pk {
-                    return Err(Error::Unsupported(
-                        "ON CONFLICT DO UPDATE of a PRIMARY KEY column".into(),
-                    ));
-                }
                 let field = column.field();
                 let val = rt
                     .val
@@ -6376,7 +6526,12 @@ fn plan_on_conflict(
         _ => return Err(Error::Unsupported("this ON CONFLICT action".into())),
     };
 
-    Ok(OnConflict { target, action })
+    Ok(OnConflict {
+        target,
+        action,
+        where_sql,
+        index_arbiter,
+    })
 }
 
 fn plan_insert(
@@ -6910,6 +7065,7 @@ fn window_func_by_name(name: &str) -> Option<WindowFunc> {
         "array_agg" => WindowFunc::ArrayAgg,
         "bool_and" => WindowFunc::BoolAnd,
         "bool_or" => WindowFunc::BoolOr,
+        n if user_agg::is_user_aggregate(n) => WindowFunc::User,
         _ => return None,
     })
 }
@@ -6932,6 +7088,8 @@ fn window_result_type(func: WindowFunc, source: Option<&str>) -> String {
         WindowFunc::StringAgg => "text".to_string(),
         WindowFunc::BoolAnd | WindowFunc::BoolOr => "bool".to_string(),
         WindowFunc::ArrayAgg => format!("{}[]", source.unwrap_or("text")),
+        // Replaced by the aggregate's own result type once it is resolved.
+        WindowFunc::User => source.unwrap_or("text").to_string(),
         // The value-returning ones keep their argument's type.
         WindowFunc::Lag
         | WindowFunc::Lead
@@ -7260,7 +7418,15 @@ fn plan_window_call(
     // constants (`lag(v, 1, -1)`, `nth_value(v, 2)`, `ntile(3)`).
     let (arg, source_type, args) = plan_window_args(func, f, def, params)?;
     let field = format!("__win{}", windows.len());
-    let result_type = window_result_type(func, source_type.as_deref());
+    let user = if func == WindowFunc::User {
+        Some(user_agg::resolve(&name, source_type.as_deref())?)
+    } else {
+        None
+    };
+    let result_type = match &user {
+        Some(u) => user_agg::result_type(u, source_type.as_deref()),
+        None => window_result_type(func, source_type.as_deref()),
+    };
     let filter = match f.agg_filter.as_deref() {
         None => None,
         Some(node) => {
@@ -7291,6 +7457,7 @@ fn plan_window_call(
         result_type,
         source_type,
         filter,
+        user,
     });
     Ok(field)
 }
@@ -9767,6 +9934,7 @@ fn aggregate_func(name: &str, within_group: bool) -> Option<(AggFunc, usize)> {
         "bit_or" => (AggFunc::BitOr, 1),
         "range_agg" => (AggFunc::RangeAgg, 1),
         "range_intersect_agg" => (AggFunc::RangeIntersectAgg, 1),
+        n if user_agg::is_user_aggregate(n) => (AggFunc::User, 1),
         _ => return None,
     })
 }
@@ -9929,6 +10097,9 @@ fn plan_aggregate_item(
     item.source_type = ty;
     item.source_typmod = typmod;
     item.expr = expr;
+    if func == AggFunc::User {
+        item.user = Some(user_agg::resolve(&name, item.source_type.as_deref())?);
+    }
     if func == AggFunc::StringAgg {
         item.sep = Some(const_value(&f.args[1], params)?);
     } else if nargs == 2 {
@@ -10105,6 +10276,11 @@ pub fn aggregate_item_type(item: &AggItem) -> String {
             }
         }
         AggFunc::RangeIntersectAgg => item.source_type.clone().unwrap_or_default(),
+        AggFunc::User => item
+            .user
+            .as_ref()
+            .map(|u| user_agg::result_type(u, item.source_type.as_deref()))
+            .unwrap_or_else(|| "text".to_string()),
         AggFunc::Corr
         | AggFunc::CovarPop
         | AggFunc::CovarSamp
@@ -23154,7 +23330,7 @@ fn is_time_text(v: &Bson) -> bool {
         })
 }
 
-fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
+pub(crate) fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
     if arrays::is_bounded(&lhs) || arrays::is_bounded(&rhs) {
         return eval_binary_bounded(op, lhs, rhs);
     }
@@ -23980,6 +24156,39 @@ fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
             names,
             if_exists: d.missing_ok,
             cascade,
+        });
+    }
+    // `DROP AGGREGATE name (args)`: an ObjectWithArgs, as a function's is.
+    if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectAggregate) {
+        let [obj] = d.objects.as_slice() else {
+            return Err(Error::Unsupported(
+                "DROP AGGREGATE of more than one aggregate".into(),
+            ));
+        };
+        let Some(N::ObjectWithArgs(o)) = obj.node.as_ref() else {
+            return Err(Error::Unsupported("this DROP AGGREGATE target".into()));
+        };
+        let name = o
+            .objname
+            .iter()
+            .filter_map(|n| match n.node.as_ref()? {
+                N::String(s) => Some(s.sval.clone()),
+                _ => None,
+            })
+            .next_back()
+            .ok_or_else(|| Error::Parse("DROP AGGREGATE without a name".into()))?;
+        let arg_types = o
+            .objargs
+            .iter()
+            .filter_map(|n| match n.node.as_ref()? {
+                N::TypeName(tn) => Some(type_name_of(tn)),
+                _ => None,
+            })
+            .collect();
+        return Ok(Statement::DropAggregate {
+            name,
+            arg_types,
+            if_exists: d.missing_ok,
         });
     }
     // `DROP FUNCTION`: each object is an ObjectWithArgs -- the name parts plus

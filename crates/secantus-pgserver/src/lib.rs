@@ -1844,6 +1844,10 @@ impl PgHandler {
     /// Rust server writes only `language: "internal"` wrappers here (a base
     /// type's I/O functions) and never runs them.
     const FUNCTION_COLLECTION: &'static str = "__sql_functions__";
+    /// `CREATE AGGREGATE`: `{_id: "name/argtypes", name, arg_types, sfunc,
+    /// stype, finalfunc, initcond}`. Rust-server only; the Python server has
+    /// no user aggregates.
+    const AGGREGATE_COLLECTION: &'static str = "__sql_aggregates__";
     /// `CREATE MATERIALIZED VIEW`: `{_id, matview, definition, populated}`,
     /// the Python server's store. The rows live in a table of the same name.
     const MATVIEW_COLLECTION: &'static str = "__sql_matviews__";
@@ -2022,6 +2026,7 @@ impl PgHandler {
         secantus_pgplan::set_constraint_defs(self.constraint_defs().unwrap_or_default());
         secantus_pgplan::set_object_comments(self.object_comments());
         secantus_pgplan::domains::set_user_domains(self.domains().unwrap_or_default());
+        secantus_pgplan::user_agg::set_user_aggregates(self.user_aggregates().unwrap_or_default());
         // User-defined functions, so the planner can type and route a call.
         secantus_pgplan::set_user_functions(
             self.user_function_docs()
@@ -4680,6 +4685,129 @@ impl PgHandler {
         }
         self.insert_type_doc(Self::FUNCTION_COLLECTION, &key, doc)?;
         Ok(vec![Response::Execution(Tag::new("CREATE FUNCTION"))])
+    }
+
+    /// The `__sql_aggregates__` key: the name and the argument types.
+    fn aggregate_key(name: &str, arg_types: &[String]) -> String {
+        format!("{name}/{}", arg_types.join(","))
+    }
+
+    /// Whether two argument-type lists name the same types (`int` and
+    /// `int4` do).
+    fn same_types(a: &[String], b: &[String]) -> bool {
+        let oid = |t: &str| secantus_pgplan::pgtypes::oid_of_name(t);
+        a.len() == b.len()
+            && a.iter().zip(b).all(|(x, y)| match (oid(x), oid(y)) {
+                (Some(p), Some(q)) => p == q,
+                _ => x.eq_ignore_ascii_case(y),
+            })
+    }
+
+    /// The database's user aggregates.
+    fn user_aggregates(&self) -> PgWireResult<Vec<secantus_pgplan::user_agg::UserAggregate>> {
+        let docs = self.type_catalog_docs(Self::AGGREGATE_COLLECTION)?;
+        Ok(docs
+            .iter()
+            .map(|d| secantus_pgplan::user_agg::UserAggregate {
+                name: d.get_str("name").unwrap_or_default().to_string(),
+                arg_types: d
+                    .get_array("arg_types")
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                sfunc: d.get_str("sfunc").unwrap_or_default().to_string(),
+                stype: d.get_str("stype").unwrap_or_default().to_string(),
+                finalfunc: d.get_str("finalfunc").ok().map(str::to_string),
+                initcond: d.get_str("initcond").ok().map(str::to_string),
+            })
+            .collect())
+    }
+
+    fn create_aggregate(
+        &self,
+        def: secantus_pgplan::user_agg::UserAggregate,
+        replace: bool,
+    ) -> PgWireResult<Vec<Response>> {
+        self.ensure_collection(Self::AGGREGATE_COLLECTION)?;
+        let existing = self
+            .user_aggregates()?
+            .into_iter()
+            .find(|a| a.name == def.name && Self::same_types(&a.arg_types, &def.arg_types));
+        if let Some(old) = existing {
+            if !replace {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".into(),
+                    "42723".into(),
+                    format!(
+                        "function \"{}\" already exists with same argument types",
+                        def.name
+                    ),
+                ))));
+            }
+            self.delete_type_doc(
+                Self::AGGREGATE_COLLECTION,
+                &Self::aggregate_key(&old.name, &old.arg_types),
+            )?;
+        }
+        let key = Self::aggregate_key(&def.name, &def.arg_types);
+        let mut doc = bson::doc! {
+            "_id": &key,
+            "name": &def.name,
+            "arg_types": def.arg_types.iter().map(|t| Bson::String(t.clone())).collect::<Vec<_>>(),
+            "sfunc": &def.sfunc,
+            "stype": &def.stype,
+        };
+        if let Some(f) = &def.finalfunc {
+            doc.insert("finalfunc", f);
+        }
+        if let Some(i) = &def.initcond {
+            doc.insert("initcond", i);
+        }
+        self.insert_type_doc(Self::AGGREGATE_COLLECTION, &key, doc)?;
+        Ok(vec![Response::Execution(Tag::new("CREATE AGGREGATE"))])
+    }
+
+    fn drop_aggregate(
+        &self,
+        name: &str,
+        arg_types: &[String],
+        if_exists: bool,
+    ) -> PgWireResult<Vec<Response>> {
+        let found = self
+            .user_aggregates()?
+            .into_iter()
+            .find(|a| a.name == name && Self::same_types(&a.arg_types, arg_types));
+        let Some(agg) = found else {
+            let sig = format!(
+                "{name}({})",
+                arg_types
+                    .iter()
+                    .map(|t| self.display_type_name(t))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            if if_exists {
+                self.notice(
+                    "00000",
+                    format!("aggregate {sig} does not exist, skipping"),
+                    None,
+                );
+                return Ok(vec![Response::Execution(Tag::new("DROP AGGREGATE"))]);
+            }
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "42883".into(),
+                format!("aggregate {sig} does not exist"),
+            ))));
+        };
+        self.delete_type_doc(
+            Self::AGGREGATE_COLLECTION,
+            &Self::aggregate_key(&agg.name, &agg.arg_types),
+        )?;
+        Ok(vec![Response::Execution(Tag::new("DROP AGGREGATE"))])
     }
 
     /// Run `f` one call level deeper, refusing past PostgreSQL's stack
@@ -8954,6 +9082,45 @@ impl PgHandler {
                         row.insert(f("prosrc"), d.get_str("body").unwrap_or_default());
                         row
                     })
+                    .chain(self.user_aggregates().ok()?.into_iter().map(|a| {
+                        // An aggregate is a pg_proc row of kind `a`, its
+                        // body `aggregate_dummy`.
+                        let mut row = Document::new();
+                        let key = Self::aggregate_key(&a.name, &a.arg_types);
+                        row.insert(
+                            f("oid"),
+                            Bson::Int64(Self::index_oid(&format!("agg:{key}"))),
+                        );
+                        row.insert(f("proname"), a.name.clone());
+                        row.insert(f("pronamespace"), Bson::Int64(Self::PUBLIC_NAMESPACE_OID));
+                        row.insert(f("proowner"), Bson::Int64(10));
+                        row.insert(f("prolang"), Bson::Int64(12));
+                        row.insert(f("prokind"), "a");
+                        row.insert(f("prosecdef"), false);
+                        row.insert(f("proisstrict"), false);
+                        row.insert(f("proretset"), false);
+                        row.insert(f("provolatile"), "i");
+                        row.insert(f("pronargs"), Bson::Int32(a.arg_types.len() as i32));
+                        row.insert(
+                            f("prorettype"),
+                            Bson::Int64(type_oid(&secantus_pgplan::user_agg::result_type(
+                                &a,
+                                a.arg_types.first().map(String::as_str),
+                            ))),
+                        );
+                        row.insert(
+                            f("proargtypes"),
+                            Bson::Array(
+                                a.arg_types
+                                    .iter()
+                                    .map(|t| Bson::Int64(type_oid(t)))
+                                    .collect(),
+                            ),
+                        );
+                        row.insert(f("proargnames"), Bson::Null);
+                        row.insert(f("prosrc"), "aggregate_dummy");
+                        row
+                    }))
                     .collect()
             }
             "pg_inherits" => {
@@ -9883,6 +10050,14 @@ impl PgHandler {
     ) -> PgWireResult<(usize, Vec<Document>)> {
         let mut affected: Vec<Document> = Vec::new();
         let mut written = 0usize;
+        // A column target naming a unique INDEX: resolved here, before any
+        // row is written, to that index's own filter (a partial index holds
+        // only the rows its predicate admits, so only those can conflict).
+        let index_filter = if oc.index_arbiter {
+            Some(self.resolve_index_arbiter(table, def, oc)?)
+        } else {
+            None
+        };
         for row in rows {
             let bytes =
                 encode_doc(&row).map_err(|e| Self::storage_err("could not encode a row", e))?;
@@ -9916,6 +10091,10 @@ impl PgHandler {
             // version of this did, and what the tests caught.
             let Some(probe) = Self::arbiter_key(def, oc.target.as_ref(), &row, &reported) else {
                 return Err(Self::write_error(table, def, err));
+            };
+            let probe = match &index_filter {
+                Some(Some(partial)) => bson::doc! { "$and": [probe, partial.clone()] },
+                _ => probe,
             };
             let existing = self
                 .storage
@@ -9951,10 +10130,78 @@ impl PgHandler {
             self.check_row_constraints(def, &after)?;
             self.check_foreign_keys(def, std::slice::from_ref(&after))?;
             let id = row_id(&existing);
-            written += self.update_rows(table, &bson::doc! {"_id": id}, &set, &unset)?;
+            if row_id(&after) != id {
+                // A new PRIMARY KEY moves the row, as UPDATE does: the key's
+                // own 23505 first, then the rows referencing the old key.
+                let pair = vec![(existing.clone(), after.clone())];
+                self.check_rekeys(table, def, &pair)?;
+                self.check_referencing_updates(def, &pair)?;
+                written += self.move_rekeyed_rows(table, def, &pair)?;
+            } else {
+                written += self.update_rows(table, &bson::doc! {"_id": id}, &set, &unset)?;
+            }
             affected.push(after);
         }
         Ok((written, affected))
+    }
+
+    /// The unique index an `ON CONFLICT (cols) [WHERE pred]` target infers,
+    /// as its partial filter (`None` for a full index): an index on exactly
+    /// those columns, whose predicate -- if it has one -- the target's WHERE
+    /// implies. None qualifying is PostgreSQL's 42P10.
+    fn resolve_index_arbiter(
+        &self,
+        table: &str,
+        def: &TableDef,
+        oc: &secantus_pgplan::OnConflict,
+    ) -> PgWireResult<Option<Document>> {
+        let no_arbiter = || {
+            Self::err(&PlanError::NoArbiter(
+                "there is no unique or exclusion constraint matching the ON CONFLICT \
+                 specification"
+                    .to_string(),
+            ))
+        };
+        let Some(secantus_pgplan::ConflictTarget::Columns(cols)) = &oc.target else {
+            return Err(no_arbiter());
+        };
+        let mut want: Vec<String> = cols.iter().filter_map(|c| def.field_of(c)).collect();
+        want.sort();
+        for ix in self
+            .storage
+            .list_indexes(self.db(), table)
+            .unwrap_or_default()
+        {
+            let options = ix.get_document("options").ok();
+            let unique = ix.get_bool("unique").unwrap_or(false)
+                || options.is_some_and(|o| o.get_bool("unique").unwrap_or(false));
+            if !unique {
+                continue;
+            }
+            let Ok(key) = ix.get_document("key") else {
+                continue;
+            };
+            let mut have: Vec<String> = key.keys().cloned().collect();
+            have.sort();
+            if have != want {
+                continue;
+            }
+            let lookup = |k: &str| {
+                ix.get(k)
+                    .or_else(|| options.and_then(|o| o.get(k)))
+                    .cloned()
+            };
+            let predicate = lookup("sqlPredicate").and_then(|p| p.as_str().map(str::to_string));
+            let usable = match (&predicate, &oc.where_sql) {
+                (None, _) => true,
+                (Some(p), Some(w)) => secantus_pgplan::predicate_implied(w, p),
+                (Some(_), None) => false,
+            };
+            if usable {
+                return Ok(lookup("partialFilterExpression").and_then(|f| f.as_document().cloned()));
+            }
+        }
+        Err(no_arbiter())
     }
 
     /// The filter identifying the row the clause arbitrates on.
@@ -11788,7 +12035,11 @@ impl PgHandler {
             Statement::DropFunction { .. } => vec![
                 Self::FUNCTION_COLLECTION.to_string(),
                 Self::BASE_TYPE_COLLECTION.to_string(),
+                Self::AGGREGATE_COLLECTION.to_string(),
             ],
+            Statement::CreateAggregate { .. } | Statement::DropAggregate { .. } => {
+                vec![Self::AGGREGATE_COLLECTION.to_string()]
+            }
             Statement::DropType { .. } => vec![
                 Self::ENUM_COLLECTION.to_string(),
                 Self::COMPOSITE_COLLECTION.to_string(),
@@ -12027,6 +12278,30 @@ impl PgHandler {
                 // A NOT NULL column with no DEFAULT cannot be added to a table
                 // that already has rows: every one of them would violate it
                 // immediately, which is PostgreSQL's own refusal.
+                // A serial column gives every existing row a value, from a
+                // sequence named `<table>_<column>_seq` -- or, if that name is
+                // taken, the first free `..._seq1`, `..._seq2`, as PostgreSQL
+                // chooses.
+                if let Some(seq) = &column.sequence {
+                    let mut name = seq.clone();
+                    let mut n = 0;
+                    while self.relation_exists(&name)?
+                        || self
+                            .all_sequence_docs()?
+                            .iter()
+                            .any(|d| d.get_str("_id") == Ok(name.as_str()))
+                    {
+                        n += 1;
+                        name = format!("{seq}{n}");
+                    }
+                    let mut column = column.clone();
+                    column.sequence = Some(name);
+                    column.nullable = false;
+                    return Ok(Some(A::AddColumn {
+                        column,
+                        if_not_exists: *if_not_exists,
+                    }));
+                }
                 if !column.nullable && column.default.is_none() && self.table_has_rows(table)? {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
@@ -12142,6 +12417,40 @@ impl PgHandler {
             // field means "the default" rather than NULL, and a column DROPPED
             // and re-ADDED under the same name would resurrect the old values.
             A::AddColumn { column, .. } => {
+                if let Some(seq) = column.sequence.as_deref() {
+                    let max_value = match column.pg_type.as_str() {
+                        "int2" => i64::from(i16::MAX),
+                        "int8" => i64::MAX,
+                        _ => i64::from(i32::MAX),
+                    };
+                    let doc = secantus_pgcatalog::sequence_document(
+                        seq,
+                        &format!("{table}.{}", column.name),
+                        max_value,
+                    );
+                    let bytes = encode_doc(&doc)
+                        .map_err(|e| Self::storage_err("could not encode a sequence", e))?;
+                    self.ensure_collection(SEQUENCE_COLLECTION)?;
+                    self.insert_checked(
+                        SEQUENCE_COLLECTION,
+                        vec![bytes],
+                        "could not record the sequence",
+                    )?;
+                    let field = column.field();
+                    let wide = column.pg_type == "int8";
+                    return self.rewrite_rows(table, |d| {
+                        let n = self.nextval(seq, 1)?.first().copied().unwrap_or(0);
+                        d.insert(
+                            field.clone(),
+                            if wide {
+                                Bson::Int64(n)
+                            } else {
+                                Bson::Int32(n as i32)
+                            },
+                        );
+                        Ok(())
+                    });
+                }
                 if let Some(expr) = column.default_expr() {
                     let sql = format!("SELECT ({expr})::{}", column.pg_type);
                     let field = column.field();
@@ -16354,6 +16663,8 @@ impl PgHandler {
                 "CREATE FUNCTION"
             }
             Statement::DropFunction { .. } => "DROP FUNCTION",
+            Statement::CreateAggregate { .. } => "CREATE AGGREGATE",
+            Statement::DropAggregate { .. } => "DROP AGGREGATE",
             Statement::CreateTrigger(..) => "CREATE TRIGGER",
             Statement::DropTrigger { .. } => "DROP TRIGGER",
             Statement::CreateSchema { .. } => "CREATE SCHEMA",
@@ -17561,6 +17872,12 @@ impl PgHandler {
                 Ok(vec![Response::Execution(Tag::new("CREATE FUNCTION"))])
             }
 
+            Statement::CreateAggregate { def, replace } => self.create_aggregate(def, replace),
+            Statement::DropAggregate {
+                name,
+                arg_types,
+                if_exists,
+            } => self.drop_aggregate(&name, &arg_types, if_exists),
             Statement::DropFunction {
                 name,
                 arg_types,
@@ -17568,6 +17885,23 @@ impl PgHandler {
                 cascade,
             } => {
                 let tag = || Ok(vec![Response::Execution(Tag::new("DROP FUNCTION"))]);
+                // An aggregate is dropped with DROP AGGREGATE (42809).
+                if !self.functions()?.iter().any(|f| f.name == name)
+                    && self.user_aggregates()?.iter().any(|a| {
+                        a.name == name
+                            && arg_types
+                                .as_ref()
+                                .is_none_or(|t| Self::same_types(t, &a.arg_types))
+                    })
+                {
+                    let mut info = ErrorInfo::new(
+                        "ERROR".into(),
+                        "42809".into(), // wrong_object_type
+                        format!("\"{name}\" is an aggregate function"),
+                    );
+                    info.hint = Some("Use DROP AGGREGATE to drop aggregate functions.".into());
+                    return Err(PgWireError::UserError(Box::new(info)));
+                }
                 // Every named argument type must resolve first (measured on
                 // 16: `drop function invout("a-b")` after the type is gone is
                 // 42704 on the TYPE, not 42883 on the function).
@@ -17717,6 +18051,56 @@ impl PgHandler {
                     }
                     for id in &cascade_functions {
                         self.delete_type_doc(Self::FUNCTION_COLLECTION, id)?;
+                    }
+                }
+                // An aggregate depends on its state and final functions.
+                let aggs: Vec<secantus_pgplan::user_agg::UserAggregate> = self
+                    .user_aggregates()?
+                    .into_iter()
+                    .filter(|a| {
+                        (a.sfunc == target.name
+                            && target.param_types.len() == a.arg_types.len() + 1)
+                            || (a.finalfunc.as_deref() == Some(target.name.as_str())
+                                && target.param_types.len() == 1)
+                    })
+                    .collect();
+                if !aggs.is_empty() {
+                    let object = |f: &str, types: &[String]| {
+                        let t: Vec<String> =
+                            types.iter().map(|t| self.display_type_name(t)).collect();
+                        format!("{f}({})", t.join(","))
+                    };
+                    let fsig = object(&target.name, &target.param_types);
+                    let descs: Vec<String> = aggs
+                        .iter()
+                        .map(|a| format!("function {}", object(&a.name, &a.arg_types)))
+                        .collect();
+                    if !cascade {
+                        let mut info = ErrorInfo::new(
+                            "ERROR".into(),
+                            "2BP01".into(),
+                            format!(
+                                "cannot drop function {fsig} because other objects depend on it"
+                            ),
+                        );
+                        info.detail = Some(
+                            descs
+                                .iter()
+                                .map(|d| format!("{d} depends on function {fsig}"))
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        );
+                        info.hint = Some(
+                            "Use DROP ... CASCADE to drop the dependent objects too.".to_string(),
+                        );
+                        return Err(PgWireError::UserError(Box::new(info)));
+                    }
+                    self.cascade_notice(&descs);
+                    for a in &aggs {
+                        self.delete_type_doc(
+                            Self::AGGREGATE_COLLECTION,
+                            &Self::aggregate_key(&a.name, &a.arg_types),
+                        )?;
                     }
                 }
                 // A trigger depends on the function it executes.
@@ -22814,6 +23198,25 @@ fn compute_aggregate(item: &AggItem, rows: &[Document]) -> PgWireResult<Bson> {
                 .collect()
         }
     };
+    // `agg(DISTINCT x)`: one row per distinct argument value (by VALUE, as
+    // the basic aggregates dedup), NULL counting as one value.
+    if item.distinct {
+        let field = item.field.as_deref().unwrap_or("");
+        let field2 = item.field2.as_deref();
+        let mut seen: Vec<(Option<Bson>, Option<Bson>)> = Vec::new();
+        rows.retain(|d| {
+            let k = (
+                group_key_ident(&d.get(field).cloned()),
+                field2.and_then(|f| group_key_ident(&d.get(f).cloned())),
+            );
+            if seen.contains(&k) {
+                false
+            } else {
+                seen.push(k);
+                true
+            }
+        });
+    }
     if !item.order.is_empty() {
         // An ORDER BY over an expression: computed into its synthetic field.
         for key in &item.order {
@@ -23450,6 +23853,10 @@ fn window_value(
             }
             frame.get((nth - 1) as usize).cloned().unwrap_or(Bson::Null)
         }
+        secantus_pgplan::WindowFunc::User => match &w.user {
+            Some(u) => secantus_pgplan::user_agg::compute(u, &frame, w.source_type.as_deref())?,
+            None => Bson::Null,
+        },
         _ => window_aggregate(w, &frame),
     })
 }
