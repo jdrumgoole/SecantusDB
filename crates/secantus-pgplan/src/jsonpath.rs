@@ -2661,7 +2661,7 @@ fn parse_date(s: &str) -> Option<chrono::NaiveDate> {
 /// fields.
 fn parse_datetime(text: &str, template: Option<&str>) -> Result<Json> {
     if let Some(fmt) = template {
-        let (d, tod, off) = crate::datetime::from_char(text, fmt)?;
+        let (d, tod, off) = crate::datetime::from_char_strict(text, fmt)?;
         let f = fmt.to_ascii_uppercase();
         let has_date = ["YY", "MM", "DD", "MON", "J", "IYY", "Q"]
             .iter()

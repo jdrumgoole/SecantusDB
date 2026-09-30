@@ -1773,6 +1773,21 @@ fn zone_abbrev(zone: &crate::TimeZoneSetting, utc: i64) -> String {
 /// Parse `input` by a DCH format into `(date, time-of-day micros, offset
 /// seconds if the format read one)`.
 pub(crate) fn from_char(input: &str, fmt: &str) -> Result<(NaiveDate, i64, Option<i64>)> {
+    from_char_mode(input, fmt, false)
+}
+
+/// `from_char` in PostgreSQL's strict ("std") mode, as jsonpath's
+/// `.datetime(template)` uses it: every field must be present and nothing may
+/// follow the last one.
+pub(crate) fn from_char_strict(input: &str, fmt: &str) -> Result<(NaiveDate, i64, Option<i64>)> {
+    from_char_mode(input, fmt, true)
+}
+
+fn from_char_mode(
+    input: &str,
+    fmt: &str,
+    strict: bool,
+) -> Result<(NaiveDate, i64, Option<i64>)> {
     let nodes = parse_dch(fmt);
     let inp: Vec<char> = input.chars().collect();
     let mut i = 0usize;
@@ -1793,6 +1808,17 @@ pub(crate) fn from_char(input: &str, fmt: &str) -> Result<(NaiveDate, i64, Optio
         }
     };
     for (n_idx, node) in nodes.iter().enumerate() {
+        // Strict (jsonpath `.datetime()`) parsing: input that runs out while
+        // fields remain is an error, where `to_timestamp` defaults them.
+        if strict && i >= inp.len() {
+            if nodes[n_idx..].iter().any(|n| matches!(n, DNode::Key { .. })) {
+                return Err(Error::Sqlstate(
+                    "22007",
+                    "input string is too short for datetime format".into(),
+                ));
+            }
+            break;
+        }
         match node {
             DNode::Lit(c) => {
                 // A literal skips one input character; a separator or space
@@ -1991,6 +2017,17 @@ pub(crate) fn from_char(input: &str, fmt: &str) -> Result<(NaiveDate, i64, Optio
                     K::FX => {}
                 }
             }
+        }
+    }
+    if strict {
+        while i < inp.len() && inp[i].is_whitespace() {
+            i += 1;
+        }
+        if i < inp.len() {
+            return Err(Error::Sqlstate(
+                "22007",
+                "trailing characters remain in input string after datetime format".into(),
+            ));
         }
     }
     if hh12 || pm.is_some() {

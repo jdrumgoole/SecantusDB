@@ -24,3 +24,9 @@ select jsonb_path_exists('"x"', '$.datetime()', '{}', true)
 select jsonb_path_query_array('["2020-01-02", "2021-03-04"]', '$[*].datetime()')
 select jsonb_path_exists_tz('"2020-01-02"', '$.datetime() ? (@ < "2020-01-03 00:00:00+00".datetime())')
 select jsonb_path_query('{"a":1}', '$.a')::text
+# --- strict template parsing: nothing may follow, nothing may be missing
+select jsonb_path_query('"12:30 extra"', '$.datetime("HH24:MI")')
+select jsonb_path_query('"2020-01"', '$.datetime("YYYY-MM-DD")')
+select jsonb_path_query('"12:30  "', '$.datetime("HH24:MI")')::text
+select jsonb_path_query('"2020-01-02 "', '$.datetime("YYYY-MM-DD HH24")')
+select to_timestamp('12:30 extra', 'HH24:MI')::text

@@ -267,6 +267,67 @@ fn substring(s: &str, start: i64, len: Option<i64>) -> String {
 ///
 /// Without an escape the pattern is a POSIX regex and the answer is the first
 /// CAPTURE GROUP when there is one, the whole match otherwise -- so
+/// A PostgreSQL regular expression's POSIX character classes as the server's
+/// `C.UTF-8` ctype reads them. The regex crate's `[[:alpha:]]` is ASCII-only,
+/// where PostgreSQL under a UTF-8 locale counts `é` as a letter; `[:digit:]`
+/// stays ASCII, as PostgreSQL's does (measured on 14 under `C.UTF-8`).
+pub(crate) fn pg_regex_source(pattern: &str) -> String {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = String::with_capacity(pattern.len());
+    let mut in_bracket = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            out.push(c);
+            if let Some(n) = chars.get(i + 1) {
+                out.push(*n);
+            }
+            i += 2;
+            continue;
+        }
+        if in_bracket && c == '[' && chars.get(i + 1) == Some(&':') {
+            let rest: String = chars[i + 2..].iter().collect();
+            if let Some(end) = rest.find(":]") {
+                let class = &rest[..end];
+                let mapped = match class {
+                    "alpha" => Some("\\p{Alphabetic}"),
+                    "upper" => Some("\\p{Uppercase}"),
+                    "lower" => Some("\\p{Lowercase}"),
+                    "alnum" => Some("\\p{Alphabetic}0-9"),
+                    _ => None,
+                };
+                if let Some(m) = mapped {
+                    out.push_str(m);
+                    i += 2 + class.chars().count() + 2;
+                    continue;
+                }
+            }
+        }
+        if !in_bracket && c == '[' {
+            in_bracket = true;
+            out.push(c);
+            i += 1;
+            // A leading `^` and a leading `]` belong to the bracket.
+            if chars.get(i) == Some(&'^') {
+                out.push('^');
+                i += 1;
+            }
+            if chars.get(i) == Some(&']') {
+                out.push(']');
+                i += 1;
+            }
+            continue;
+        }
+        if in_bracket && c == ']' {
+            in_bracket = false;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
 /// `substring('abc' from '(b)')` and `substring('abc' from 'b')` both give
 /// `b`, by different routes. No match is NULL, not the empty string.
 ///
@@ -278,7 +339,7 @@ fn substring_pattern(subject: &str, pattern: &str, escape: Option<String>) -> Re
         None => pattern.to_string(),
         Some(esc) => sql_substring_to_regex(pattern, esc)?,
     };
-    let re = regex::Regex::new(&source)
+    let re = regex::Regex::new(&pg_regex_source(&source))
         .map_err(|e| Error::InvalidText(format!("invalid regular expression: {e}")))?;
     let Some(caps) = re.captures(subject) else {
         return Ok(Bson::Null);
@@ -1005,7 +1066,7 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
                 return Err(wrong_args(name));
             }
             let flags = if args.len() == 3 { s(2) } else { String::new() };
-            let re = regex::RegexBuilder::new(&s(1))
+            let re = regex::RegexBuilder::new(&pg_regex_source(&s(1)))
                 .case_insensitive(flags.contains('i'))
                 .build()
                 .map_err(|e| Error::InvalidText(format!("invalid regular expression: {e}")))?;

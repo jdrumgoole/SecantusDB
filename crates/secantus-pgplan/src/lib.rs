@@ -7650,8 +7650,9 @@ fn srf_rows(
             let (source, pattern) = (text(&a[0]), text(&a[1]));
             let flags = a.get(2).map(&text).unwrap_or_default();
             let re = regex::Regex::new(&format!(
-                "{}{pattern}",
-                if flags.contains('i') { "(?i)" } else { "" }
+                "{}{}",
+                if flags.contains('i') { "(?i)" } else { "" },
+                scalar::pg_regex_source(&pattern)
             ))
             .map_err(|_| {
                 Error::InvalidRegex(format!("invalid regular expression: \"{pattern}\""))
@@ -18719,7 +18720,7 @@ fn regexp_replace(args: &[Bson]) -> Result<Bson> {
     if flags.contains('i') {
         builder.push_str("(?i)");
     }
-    builder.push_str(&pattern);
+    builder.push_str(&scalar::pg_regex_source(&pattern));
     let re = regex::Regex::new(&builder)
         .map_err(|_| Error::InvalidRegex(format!("invalid regular expression: \"{pattern}\"")))?;
     // PostgreSQL's `\1` group references are the regex crate's `${1}`, and its
@@ -24759,7 +24760,7 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             let (Bson::String(subject), Bson::String(pattern)) = (&subject, &pattern) else {
                 return Ok(Bson::Null);
             };
-            let re = regex::Regex::new(pattern)
+            let re = regex::Regex::new(&scalar::pg_regex_source(pattern))
                 .map_err(|err| Error::InvalidText(format!("invalid regular expression: {err}")))?;
             let hit = re.is_match(subject);
             return Ok(Bson::Boolean(if operator_name(e)? == "!~" {
@@ -25582,7 +25583,7 @@ fn eval_pattern_match_const(e: &AExpr, params: &[Bson]) -> Result<Bson> {
     let source = if is_like {
         like_to_regex(pattern, escape)?
     } else {
-        pattern.clone()
+        scalar::pg_regex_source(pattern)
     };
     let re = regex::RegexBuilder::new(&source)
         .case_insensitive(insensitive)
@@ -25647,7 +25648,7 @@ fn lower_pattern_match(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Doc
     let regex = if is_like {
         like_to_regex(&pattern, escape)?
     } else {
-        pattern
+        scalar::pg_regex_source(&pattern)
     };
     let mut spec = doc! { "$regex": regex };
     if insensitive {

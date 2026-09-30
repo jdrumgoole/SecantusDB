@@ -7544,8 +7544,8 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("datfrozenxid", "xid", false),
                     secantus_pgcatalog::Column::new("datminmxid", "xid", false),
                     secantus_pgcatalog::Column::new("dattablespace", "oid", false),
-                    secantus_pgcatalog::Column::new("datcollate", "text", false),
-                    secantus_pgcatalog::Column::new("datctype", "text", false),
+                    secantus_pgcatalog::Column::new("datcollate", "name", false),
+                    secantus_pgcatalog::Column::new("datctype", "name", false),
                     secantus_pgcatalog::Column::new("daticulocale", "text", false),
                     secantus_pgcatalog::Column::new("daticurules", "text", false),
                     secantus_pgcatalog::Column::new("datcollversion", "text", false),
@@ -8935,8 +8935,8 @@ impl PgHandler {
                         d.insert(field("datfrozenxid"), Bson::Int64(722));
                         d.insert(field("datminmxid"), Bson::Int64(1));
                         d.insert(field("dattablespace"), Bson::Int64(1663));
-                        d.insert(field("datcollate"), "C");
-                        d.insert(field("datctype"), "C");
+                        d.insert(field("datcollate"), "C.UTF-8");
+                        d.insert(field("datctype"), "C.UTF-8");
                         d.insert(field("daticulocale"), Bson::Null);
                         d.insert(field("daticurules"), Bson::Null);
                         d.insert(field("datcollversion"), Bson::Null);

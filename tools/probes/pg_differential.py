@@ -177,6 +177,39 @@ def _split_params(line: str) -> tuple[str, list | None]:
     return sql.strip(), list(args)
 
 
+def _reference_locale(path: str) -> str | None:
+    """The locale a corpus's `# reference-locale: <name>` line asks for.
+
+    Case mapping and character classes follow the DATABASE's LC_CTYPE, and a
+    reference cluster initialised under `C` maps ASCII only -- while this
+    server reports (and behaves as) `C.UTF-8`. A corpus that measures those
+    runs against a reference database in the locale the server claims, so the
+    comparison is like with like rather than a report of the reference's
+    configuration.
+    """
+    with open(path) as fh:
+        for ln in fh:
+            head, _, value = ln.strip().partition("reference-locale:")
+            if head.strip() == "#" and value.strip():
+                return value.strip()
+    return None
+
+
+def _reference_in_locale(ref: psycopg.Connection, locale: str) -> psycopg.Connection:
+    """A connection to a reference database whose collation and ctype are
+    `locale`, created from `template0` on first use."""
+    dbname = "secantus_ref_" + "".join(c if c.isalnum() else "_" for c in locale.lower())
+    exists = ref.execute("SELECT 1 FROM pg_database WHERE datname = %s", [dbname]).fetchone()
+    if not exists:
+        ref.execute(
+            f"CREATE DATABASE {dbname} TEMPLATE template0 ENCODING 'UTF8' "
+            f"LC_COLLATE '{locale}' LC_CTYPE '{locale}'"
+        )
+    host, port, user = ref.info.host, ref.info.port, ref.info.user
+    ref.close()
+    return psycopg.connect(host=host, port=port, user=user, dbname=dbname, autocommit=True)
+
+
 def _read(path: str) -> list[str]:
     with open(path) as fh:
         return [ln.rstrip() for ln in fh if ln.strip() and not ln.lstrip().startswith("#")]
@@ -239,6 +272,9 @@ def main(setup_path: str, corpus_path: str, *, types: bool, tags: bool, server: 
         host, port = srv.address
         sec = psycopg.connect(host=host, port=port, dbname="db", user="probe", autocommit=True)
     ref = psycopg.connect(os.environ.get("SECANTUS_PG_ORACLE_DSN", DEFAULT_DSN), autocommit=True)
+    locale = _reference_locale(corpus_path)
+    if locale:
+        ref = _reference_in_locale(ref, locale)
     scur, rcur = sec.cursor(), ref.cursor()
 
     for stmt in _read(setup_path):
