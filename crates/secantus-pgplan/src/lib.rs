@@ -32,6 +32,7 @@ pub mod geo;
 pub mod geom;
 pub mod geometry;
 pub mod hstore;
+pub mod inherit;
 pub mod instead_of;
 pub mod joins;
 pub mod merge;
@@ -487,6 +488,9 @@ pub enum Statement {
     },
     /// A statement that only records something (see `catalog_stmts`).
     Catalog(catalog_stmts::CatalogOp),
+    /// One statement per table of an inheritance tree, run in order, the
+    /// row counts summed under one tag.
+    Sequence(&'static str, Vec<Statement>),
     /// `CREATE OPERATOR` (see `user_ops`).
     CreateOperator(user_ops::UserOperator),
     /// `DROP OPERATOR [IF EXISTS] name (left, right)`.
@@ -2753,13 +2757,41 @@ fn plan_node(
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &[Bson],
 ) -> Result<Statement> {
+    // A write or ALTER over an inheritance parent reaches every descendant.
+    if let Some((tag, nodes)) = inherit::per_table(&node)? {
+        let statements = nodes
+            .into_iter()
+            .map(|n| plan_node(n, lookup, params))
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(Statement::Sequence(tag, statements));
+    }
     match node {
         N::CreateStmt(c) => {
             catalog_stmts::check_tablespace(&c.tablespacename)?;
+            // `INHERITS (p)` -- not a partition's `PARTITION OF`, which
+            // arrives with a bound.
+            let parents: Vec<String> = if c.partbound.is_none() {
+                c.inh_relations
+                    .iter()
+                    .filter_map(|r| match r.node.as_ref() {
+                        Some(N::RangeVar(v)) => Some(v.relname.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let mut c = c;
+            if !parents.is_empty() {
+                c.inh_relations.clear();
+            }
             let (c, extra) = partitions::lower_create(&c, lookup)?;
             let mut st = plan_create(&expand_table_like(&c, lookup)?)?;
             if let Statement::CreateTable(def, _) = &mut st {
                 def.extra.extend(extra);
+                if !parents.is_empty() {
+                    inherit::merge_parents(def, &parents, lookup)?;
+                }
             }
             Ok(st)
         }
@@ -5688,19 +5720,25 @@ pub fn is_view(name: &str) -> bool {
 /// expression and each side of a set operation are all planned through
 /// `plan_select` in their turn, which expands their own references.
 fn expand_views(s: &pg_query::protobuf::SelectStmt) -> Result<pg_query::protobuf::SelectStmt> {
-    if PLAN_VIEWS.with(|v| v.borrow().is_empty()) && !rls::active() {
+    if PLAN_VIEWS.with(|v| v.borrow().is_empty()) && !rls::active() && !inherit::descendants_any() {
         return Ok(s.clone());
     }
     let mut out = s.clone();
-    for item in &mut out.from_clause {
-        expand_views_in_from(item, 0)?;
-    }
+    let previous = inherit::WANT_TABLEOID.with(|w| w.replace(partitions::mentions_tableoid(s)));
+    let result = out
+        .from_clause
+        .iter_mut()
+        .try_for_each(|item| expand_views_in_from(item, 0));
+    inherit::WANT_TABLEOID.with(|w| w.set(previous));
+    result?;
     Ok(out)
 }
 
 fn expand_views_in_from(item: &mut pg_query::protobuf::Node, depth: usize) -> Result<()> {
     // A table row-level security restricts reads as its filtered subquery.
     rls::expand_from(item)?;
+    // A parent read without ONLY reads its descendants too.
+    inherit::expand_from(item)?;
     match item.node.as_mut() {
         Some(N::RangeVar(r)) => {
             if !(r.schemaname.is_empty() || r.schemaname == "public") || !r.catalogname.is_empty() {
@@ -25170,6 +25208,14 @@ fn plan_truncate(
         lookup(&r.relname).ok_or_else(|| Error::UndefinedTable(r.relname.clone()))?;
         if !tables.contains(&r.relname) {
             tables.push(r.relname.clone());
+        }
+        // Without ONLY, the tree's tables go too.
+        if r.inh {
+            for c in inherit::descendants(&r.relname) {
+                if !tables.contains(&c) {
+                    tables.push(c);
+                }
+            }
         }
     }
     Ok(Statement::Truncate {

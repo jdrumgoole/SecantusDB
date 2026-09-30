@@ -1956,6 +1956,8 @@ impl PgHandler {
         secantus_pgplan::set_current_user(Some(self.current_role_name()));
         secantus_pgplan::catalog_stmts::set_tablespaces(self.tablespace_names());
         secantus_pgplan::user_ops::set_user_operators(self.user_operators());
+        let (pairs, columns) = self.inheritance();
+        secantus_pgplan::inherit::set_inheritance(pairs, columns);
         secantus_pgplan::rls::set_rls(self.rls_tables());
         secantus_pgplan::rls::set_view_rls(self.view_rls_tables());
         // The database and the GUCs, for `current_database()` and
@@ -5866,6 +5868,40 @@ impl PgHandler {
             .iter()
             .find(|d| d.get_str("view").or_else(|_| d.get_str("_id")) == Ok(name))
             .cloned()
+    }
+
+    /// The tables `def` inherits from (`INHERITS (p, ...)`).
+    fn inherited_parents(def: &TableDef) -> Vec<String> {
+        def.extra
+            .get_array("inherits")
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The inheritance tree, for the planner: `(child, parent)` pairs and
+    /// each parent's columns.
+    fn inheritance(&self) -> (Vec<(String, String)>, Vec<(String, Vec<String>)>) {
+        let defs = self.all_table_defs().unwrap_or_default();
+        let mut pairs = Vec::new();
+        let mut columns: Vec<(String, Vec<String>)> = Vec::new();
+        for t in &defs {
+            for p in Self::inherited_parents(t) {
+                if !columns.iter().any(|(n, _)| *n == p) {
+                    if let Some(pd) = defs.iter().find(|d| d.name == p) {
+                        columns.push((
+                            p.clone(),
+                            pd.columns.iter().map(|c| c.name.clone()).collect(),
+                        ));
+                    }
+                }
+                pairs.push((t.name.clone(), p));
+            }
+        }
+        (pairs, columns)
     }
 
     /// Per view, `ALTER VIEW ... SET DEFAULT`'s `(column, default SQL)`.
@@ -9801,8 +9837,8 @@ impl PgHandler {
             "pg_inherits" => {
                 let f = |name: &str| def.field_of(name).expect("column");
                 let oid = |n: &str| Bson::Int64(self.relation_oid(n).unwrap_or(0));
-                self.all_table_defs()
-                    .ok()?
+                let defs = self.all_table_defs().ok()?;
+                let mut rows: Vec<Document> = defs
                     .iter()
                     .filter_map(|t| {
                         let parent = partition::parent_of(t)?;
@@ -9813,7 +9849,19 @@ impl PgHandler {
                         d.insert(f("inhdetachpending"), false);
                         Some(d)
                     })
-                    .collect()
+                    .collect();
+                // `INHERITS (p, ...)`: one row per parent, numbered.
+                for t in &defs {
+                    for (i, p) in Self::inherited_parents(t).iter().enumerate() {
+                        let mut d = Document::new();
+                        d.insert(f("inhrelid"), oid(&t.name));
+                        d.insert(f("inhparent"), oid(p));
+                        d.insert(f("inhseqno"), Bson::Int32(i as i32 + 1));
+                        d.insert(f("inhdetachpending"), false);
+                        rows.push(d);
+                    }
+                }
+                rows
             }
             "pg_partitioned_table" => {
                 let f = |name: &str| def.field_of(name).expect("column");
@@ -12696,6 +12744,7 @@ impl PgHandler {
     /// catalog would leave a table the server still believes in.
     fn written_tables(stmt: &Statement) -> Vec<String> {
         let mut out = match stmt {
+            Statement::Sequence(_, stmts) => stmts.iter().flat_map(Self::written_tables).collect(),
             // A serial column's INSERT moves its sequence too.
             Statement::Insert(i) => vec![i.table.clone(), SEQUENCE_COLLECTION.to_string()],
             // An ALTER rewrites the ROWS as well as the catalog, so a
@@ -17453,6 +17502,7 @@ impl PgHandler {
             Statement::DropFunction { .. } => "DROP FUNCTION",
             Statement::CreateAggregate { .. } => "CREATE AGGREGATE",
             Statement::Catalog(op) => op.tag(),
+            Statement::Sequence(tag, _) => tag,
             Statement::CreateOperator(_) => "CREATE OPERATOR",
             Statement::DropOperator { .. } => "DROP OPERATOR",
             Statement::AlterView { table_form, .. }
@@ -18674,6 +18724,22 @@ impl PgHandler {
 
             Statement::CreateAggregate { def, replace } => self.create_aggregate(def, replace),
             Statement::Catalog(op) => self.execute_catalog(op),
+            // One statement per table of an inheritance tree.
+            Statement::Sequence(tag, statements) => {
+                let mut rows = 0usize;
+                for st in statements {
+                    for r in self.execute(st, max_rows)? {
+                        if let Response::Execution(t) = r {
+                            rows += t.rows().unwrap_or(0);
+                        }
+                    }
+                }
+                Ok(vec![Response::Execution(if tag == "ALTER TABLE" {
+                    Tag::new(tag)
+                } else {
+                    Tag::new(tag).with_rows(rows)
+                })])
+            }
             Statement::CreateOperator(op) => self.create_operator(op),
             Statement::DropOperator {
                 name,
@@ -19684,14 +19750,30 @@ impl PgHandler {
                                 frontier.push(format!("view {v}"));
                             }
                         }
-                        let objects: Vec<(String, String)> = fks
+                        // Inheritance children (and theirs) depend on it too.
+                        let mut kids: Vec<(String, String)> = Vec::new();
+                        let mut stack = vec![table.clone()];
+                        let defs = self.all_table_defs()?;
+                        while let Some(p) = stack.pop() {
+                            for d in &defs {
+                                if Self::inherited_parents(d).contains(&p)
+                                    && !kids.iter().any(|(k, _)| *k == d.name)
+                                    && !drop.tables.contains(&d.name)
+                                {
+                                    kids.push((d.name.clone(), p.clone()));
+                                    stack.push(d.name.clone());
+                                }
+                            }
+                        }
+                        let objects: Vec<(String, String)> = kids
                             .iter()
-                            .map(|(child, fk)| {
+                            .map(|(k, p)| (format!("table {k}"), format!("table {p}")))
+                            .chain(fks.iter().map(|(child, fk)| {
                                 (
                                     format!("constraint {} on table {}", fk.name, child.name),
                                     format!("table {table}"),
                                 )
-                            })
+                            }))
                             .chain(
                                 views
                                     .iter()
@@ -19730,6 +19812,18 @@ impl PgHandler {
                             }
                             for (v, _) in views.iter().rev() {
                                 self.delete_view(v)?;
+                            }
+                            for (k, _) in kids.iter().rev() {
+                                if self.lookup(k).is_some() {
+                                    self.execute(
+                                        Statement::DropTable(secantus_pgplan::DropTable {
+                                            tables: vec![k.clone()],
+                                            if_exists: true,
+                                            cascade: true,
+                                        }),
+                                        max_rows,
+                                    )?;
+                                }
                             }
                         }
                     }

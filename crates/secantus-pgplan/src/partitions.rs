@@ -320,12 +320,36 @@ pub fn set_tableoids(v: Vec<(String, String)>) {
 }
 
 fn tableoid_sql(name: &str) -> Option<String> {
-    TABLEOIDS.with(|t| {
+    let partitioned = TABLEOIDS.with(|t| {
         t.borrow()
             .iter()
             .find(|(n, _)| n == name)
             .map(|(_, s)| s.clone())
+    });
+    // Any other relation is its own oid -- except an inheritance parent,
+    // whose rows come from several tables: its union carries the column.
+    partitioned.or_else(|| {
+        (!is_view(name) && crate::inherit::descendants(name).is_empty())
+            .then(|| format!("{}::regclass::oid", crate::scalar::quote_literal(name)))
     })
+}
+
+/// Does the statement name the `tableoid` system column anywhere?
+pub(crate) fn mentions_tableoid(s: &pg_query::protobuf::SelectStmt) -> bool {
+    s.target_list
+        .iter()
+        .chain(s.where_clause.iter().map(|b| &**b))
+        .chain(s.group_clause.iter())
+        .chain(s.sort_clause.iter())
+        .any(|n| {
+            n.node.as_ref().is_some_and(|x| {
+                x.nodes().iter().any(|(r, _, _, _)| {
+                    matches!(r, pg_query::NodeRef::ColumnRef(c)
+                        if matches!(c.fields.last().and_then(|f| f.node.as_ref()),
+                            Some(N::String(s)) if s.sval == "tableoid"))
+                })
+            })
+        })
 }
 
 /// Replace references to the `tableoid` system column with the expression
@@ -357,6 +381,9 @@ pub(crate) fn rewrite_tableoid(
             }
             _ => {}
         }
+    }
+    if !mentions_tableoid(s) {
+        return Ok(None);
     }
     let mut ranges: Vec<(String, String)> = Vec::new();
     for f in &s.from_clause {

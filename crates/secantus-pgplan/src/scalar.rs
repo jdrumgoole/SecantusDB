@@ -1893,7 +1893,7 @@ fn pg_format(fmt: &str, args: &[Bson]) -> Result<String> {
 
 /// PostgreSQL's `quote_literal`: single quotes doubled, and a backslash
 /// forces the `E'...'` form with the backslashes doubled too.
-fn quote_literal(text: &str) -> String {
+pub(crate) fn quote_literal(text: &str) -> String {
     let body = text.replace('\'', "''");
     if body.contains('\\') {
         format!("E'{}'", body.replace('\\', "\\\\"))
