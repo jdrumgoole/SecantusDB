@@ -3691,10 +3691,18 @@ fn plan_alter_table(
         let Some(N::AlterTableCmd(cmd)) = cmd.node.as_ref() else {
             return Err(Error::Unsupported("this ALTER TABLE action".into()));
         };
-        let action = plan_alter_action(cmd, &table, &def, params)?;
+        // `ADD COLUMN c int UNIQUE REFERENCES t` is the column, then each of
+        // its constraints added as a table constraint over it.
+        let (cmd, constraints) = split_added_column_constraints(cmd);
+        let action = plan_alter_action(&cmd, &table, &def, params)?;
         // Apply it to the working def so the NEXT action sees it.
         apply_alter_to_def(&mut def, &action);
         actions.push(action);
+        for extra in &constraints {
+            let action = plan_alter_action(extra, &table, &def, params)?;
+            apply_alter_to_def(&mut def, &action);
+            actions.push(action);
+        }
     }
     Ok(Statement::AlterTable {
         table,
@@ -3996,6 +4004,48 @@ fn alter_action_word(t: pg_query::protobuf::AlterTableType) -> &'static str {
 /// sequence built over rows that already exist, and answering the statement
 /// without building it would leave the catalog claiming a constraint nothing
 /// enforces.
+/// An `ADD COLUMN` with its UNIQUE / PRIMARY KEY / REFERENCES / CHECK
+/// constraints taken off, and each as the `ADD CONSTRAINT` over the column it
+/// means -- which is also how PostgreSQL names them (`<t>_<c>_key`,
+/// `<t>_pkey`, `<t>_<c>_fkey`, `<t>_<c>_check`).
+fn split_added_column_constraints(
+    cmd: &pg_query::protobuf::AlterTableCmd,
+) -> (pg_query::protobuf::AlterTableCmd, Vec<pg_query::protobuf::AlterTableCmd>) {
+    use pg_query::protobuf::{AlterTableType as AT, ConstrType as CT};
+    let mut main = cmd.clone();
+    if AT::try_from(cmd.subtype) != Ok(AT::AtAddColumn) {
+        return (main, Vec::new());
+    }
+    let Some(N::ColumnDef(cd)) = main.def.as_mut().and_then(|d| d.node.as_mut()) else {
+        return (main, Vec::new());
+    };
+    let column = cd.colname.clone();
+    let string = |v: &str| pg_query::protobuf::Node {
+        node: Some(N::String(pg_query::protobuf::String { sval: v.to_string() })),
+    };
+    let mut extra = Vec::new();
+    cd.constraints.retain(|c| {
+        let Some(N::Constraint(k)) = c.node.as_ref() else { return true };
+        let mut k = (**k).clone();
+        match CT::try_from(k.contype) {
+            Ok(CT::ConstrUnique) | Ok(CT::ConstrPrimary) => k.keys = vec![string(&column)],
+            Ok(CT::ConstrForeign) => k.fk_attrs = vec![string(&column)],
+            Ok(CT::ConstrCheck) => {}
+            _ => return true,
+        }
+        extra.push(pg_query::protobuf::AlterTableCmd {
+            subtype: AT::AtAddConstraint as i32,
+            def: Some(Box::new(pg_query::protobuf::Node {
+                node: Some(N::Constraint(Box::new(k))),
+            })),
+            behavior: cmd.behavior,
+            ..Default::default()
+        });
+        false
+    });
+    (main, extra)
+}
+
 fn plan_added_column(cd: &pg_query::protobuf::ColumnDef, params: &[Bson]) -> Result<Column> {
     use pg_query::protobuf::ConstrType as CT;
     let ty = cd.type_name.as_ref().map(type_name_of).unwrap_or_default();
@@ -11769,6 +11819,14 @@ fn resolve_one_sublink(
             let values: Vec<Bson> = rows.into_iter().map(first_column).collect();
             Ok(param_node(params, Bson::Array(values)))
         }
+        Ok(kind @ (SubLinkType::AnySublink | SubLinkType::AllSublink))
+            if matches!(
+                sl.testexpr.as_deref().and_then(|t| t.node.as_ref()),
+                Some(N::RowExpr(_))
+            ) =>
+        {
+            row_subquery_comparison(sl, kind == SubLinkType::AnySublink, rows, lookup, params, run, outer)
+        }
         Ok(kind @ (SubLinkType::AnySublink | SubLinkType::AllSublink)) => {
             let values: Vec<Bson> = rows.into_iter().map(first_column).collect();
             let mut test = sl
@@ -11814,6 +11872,98 @@ fn resolve_one_sublink(
         }
         _ => Err(Error::Unsupported("this subquery form".into())),
     }
+}
+
+/// `(a, b) IN (SELECT x, y ...)` / `(a, b) NOT IN (...)` over the subquery's
+/// rows, as the boolean tree a row comparison means: `IN` is an OR over the
+/// rows of `a = x AND b = y`, `NOT IN` an AND over the rows of `a <> x OR b
+/// <> y` -- whose three-valued logic is SQL's row comparison exactly (a NULL
+/// makes a row's comparison unknown, not false). No rows: FALSE for IN,
+/// TRUE for NOT IN.
+#[allow(clippy::too_many_arguments)]
+fn row_subquery_comparison(
+    sl: &pg_query::protobuf::SubLink,
+    any: bool,
+    rows: Vec<Vec<Bson>>,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &mut Vec<Bson>,
+    run: SubqueryRunner<'_>,
+    outer: &[String],
+) -> Result<pg_query::protobuf::Node> {
+    let mut test = sl.testexpr.as_deref().cloned().expect("checked");
+    resolve_sublinks_in_expr(&mut test, lookup, params, run, outer)?;
+    let Some(N::RowExpr(row)) = test.node.as_ref() else {
+        return Err(Error::Unsupported("this row comparison".into()));
+    };
+    let op = sl
+        .oper_name
+        .first()
+        .and_then(|n| match n.node.as_ref() {
+            Some(N::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "=".to_string());
+    if !matches!(op.as_str(), "=" | "<>") {
+        return Err(Error::Unsupported(format!("a row comparison with {op} and a subquery")));
+    }
+    let width = row.args.len();
+    if let Some(r) = rows.first() {
+        if r.len() != width {
+            return Err(Error::Parse(if r.len() > width {
+                "subquery has too many columns".into()
+            } else {
+                "subquery has too few columns".into()
+            }));
+        }
+    }
+    let boolexpr = |op: BoolExprType, args: Vec<pg_query::protobuf::Node>| pg_query::protobuf::Node {
+        node: Some(N::BoolExpr(Box::new(pg_query::protobuf::BoolExpr {
+            boolop: op as i32,
+            args,
+            location: -1,
+            ..Default::default()
+        }))),
+    };
+    let (inner, outer_op) = if any {
+        (BoolExprType::AndExpr, BoolExprType::OrExpr)
+    } else {
+        (BoolExprType::OrExpr, BoolExprType::AndExpr)
+    };
+    let mut arms = Vec::with_capacity(rows.len());
+    for r in rows {
+        let cmps: Vec<pg_query::protobuf::Node> = row
+            .args
+            .iter()
+            .zip(r)
+            .map(|(lhs, v)| pg_query::protobuf::Node {
+                node: Some(N::AExpr(Box::new(AExpr {
+                    kind: AExprKind::AexprOp as i32,
+                    name: vec![string_node(&op)],
+                    lexpr: Some(Box::new(lhs.clone())),
+                    rexpr: Some(Box::new(param_node(params, v))),
+                    location: -1,
+                }))),
+            })
+            .collect();
+        arms.push(if cmps.len() == 1 {
+            cmps.into_iter().next().expect("one")
+        } else {
+            boolexpr(inner, cmps)
+        });
+    }
+    Ok(match arms.len() {
+        0 => pg_query::protobuf::Node {
+            node: Some(N::AConst(pg_query::protobuf::AConst {
+                isnull: false,
+                location: -1,
+                val: Some(pg_query::protobuf::a_const::Val::Boolval(pg_query::protobuf::Boolean {
+                    boolval: !any,
+                })),
+            })),
+        },
+        1 => arms.into_iter().next().expect("one"),
+        _ => boolexpr(outer_op, arms),
+    })
 }
 
 /// The first qualified column reference in `s` whose qualifier names nothing

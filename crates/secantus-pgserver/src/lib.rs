@@ -12265,11 +12265,20 @@ impl PgHandler {
         columns: &[String],
     ) -> PgWireResult<()> {
         let docs = self.table_docs(table)?;
-        let old: Vec<(String, String)> = before
+        // Each key column's field BEFORE it became the key -- in table-column
+        // order, which a composite key's subdocument follows. A column this
+        // same statement added is at its ordinary (non-key) field.
+        let old: Vec<(String, String)> = def
             .columns
             .iter()
             .filter(|c| columns.contains(&c.name))
-            .map(|c| (c.name.clone(), c.field()))
+            .map(|c| {
+                let field = before
+                    .column(&c.name)
+                    .map(|b| b.field())
+                    .unwrap_or_else(|| secantus_pgcatalog::field_for(&c.name, false));
+                (c.name.clone(), field)
+            })
             .collect();
         for (col, field) in &old {
             if docs.iter().any(|d| d.get(field).is_none_or(|v| *v == Bson::Null)) {
