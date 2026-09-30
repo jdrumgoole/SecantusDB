@@ -9423,12 +9423,48 @@ fn row_column_expr(
                         Some(N::String(s)) if !user_ops::is_builtin(&s.sval))))
         })
     });
+    // An unknown function, or one given the wrong types, is PostgreSQL's
+    // 42883 at PLAN time -- the sample row is where it shows, and a table
+    // with no rows would otherwise never report it.
     let sample_value = match correlated::without_side_effects(|| apply_row_expr(&out, sample)) {
         Ok(v) => v,
-        Err(e @ Error::UndefinedFunction(_)) if unknown_op => return Err(e),
+        Err(e @ Error::UndefinedFunction(_)) => return Err(e),
+        // A function PostgreSQL has not got either (the server words it as
+        // 42883).
+        Err(Error::Unsupported(w))
+            if w.strip_prefix("function ")
+                .and_then(|r| r.split_once('('))
+                .is_some_and(|(name, _)| !is_catalog_function(name)) =>
+        {
+            return Err(Error::Unsupported(w))
+        }
         Err(_) => Bson::Null,
     };
+    let _ = unknown_op;
     let previous = declare_row_fields(params.len(), fields);
+    {
+        let all_params: Vec<Bson> = params
+            .iter()
+            .cloned()
+            .chain(
+                fields
+                    .iter()
+                    .map(|(_, f, _)| sample.get(f).cloned().unwrap_or(Bson::Null)),
+            )
+            .collect();
+        let mismatch = expr.node.as_ref().and_then(|n| {
+            n.nodes().iter().find_map(|(x, _, _, _)| match x {
+                pg_query::NodeRef::FuncCall(f) => {
+                    text_function_mismatch(f, &call_arg_types(f, &all_params))
+                }
+                _ => None,
+            })
+        });
+        if let Some(e) = mismatch {
+            PLAN_PARAM_TYPES.with(|t| *t.borrow_mut() = previous);
+            return Err(e);
+        }
+    }
     let result_type = static_type(&expr, &sample_value);
     PLAN_PARAM_TYPES.with(|t| *t.borrow_mut() = previous);
     if let ColumnExpr::Row { result_type: t, .. } = &mut out {
@@ -9780,6 +9816,21 @@ fn plan_table_targets(
             {
                 let name = func_name(f).expect("checked");
                 let (column, args) = single_column_call(f, params).expect("checked");
+                // Resolved by type, as PostgreSQL resolves it at plan time.
+                let types: Vec<String> = f
+                    .args
+                    .iter()
+                    .zip(call_arg_types(f, params))
+                    .map(|(a, t)| match a.node.as_ref() {
+                        Some(N::ColumnRef(c)) if column_ref_name(c).as_deref() == Some(&column) => {
+                            def.column(&column).map_or(t, |c| c.pg_type.clone())
+                        }
+                        _ => t,
+                    })
+                    .collect();
+                if let Some(e) = text_function_mismatch(f, &types) {
+                    return Err(e);
+                }
                 let field = def
                     .field_of(&column)
                     .ok_or_else(|| Error::UndefinedColumn(column.clone()))?;
@@ -12154,6 +12205,130 @@ fn sql_json_absent(node: &pg_query::protobuf::Node, sql: &str, params: &[Bson]) 
     None
 }
 
+/// The built-ins whose every signature takes TEXT in the first position
+/// (PostgreSQL 15's `pg_proc`), and how many arguments are text.
+fn text_signature(name: &str) -> Option<usize> {
+    Some(match name {
+        "upper" | "lower" | "initcap" | "reverse" | "quote_ident" | "ascii" | "ltrim" | "rtrim"
+        | "btrim" | "left" | "right" | "repeat" | "lpad" | "rpad" => 1,
+        "replace" | "translate" => 3,
+        "split_part" | "strpos" | "starts_with" | "regexp_replace" => 2,
+        _ => return None,
+    })
+}
+
+/// 42883 for a text-only built-in given an argument of a type with no
+/// implicit cast to text (`upper(1)`): PostgreSQL resolves functions by
+/// type at plan time, where this server would otherwise stringify.
+fn text_function_mismatch(f: &pg_query::protobuf::FuncCall, types: &[String]) -> Option<Error> {
+    let name = func_name(f)?;
+    // `length` also takes bytea, bit strings, a tsvector and the geometric
+    // path types -- but not a number or a date.
+    if name == "length" && !correlated::user_function_named(&name) {
+        let t = types.first().map(String::as_str).unwrap_or("");
+        let numeric_or_time = matches!(
+            t,
+            "int2"
+                | "int4"
+                | "int8"
+                | "numeric"
+                | "float4"
+                | "float8"
+                | "bool"
+                | "date"
+                | "timestamp"
+                | "timestamptz"
+                | "interval"
+                | "uuid"
+        );
+        return numeric_or_time.then(|| {
+            Error::UndefinedFunction(format!(
+                "function length({}) does not exist",
+                types
+                    .iter()
+                    .map(|t| display_type(t))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        });
+    }
+    let text_args = text_signature(&name)?;
+    if correlated::user_function_named(&name) {
+        return None;
+    }
+    let texty = |t: &str| {
+        matches!(
+            t,
+            "text"
+                | "varchar"
+                | "bpchar"
+                | "name"
+                | "char"
+                | "unknown"
+                | "character varying"
+                | "character"
+                | ""
+        ) || domains::user_domain(t).is_some()
+    };
+    let non_text = |t: &str| {
+        matches!(
+            t,
+            "int2"
+                | "int4"
+                | "int8"
+                | "numeric"
+                | "float4"
+                | "float8"
+                | "bool"
+                | "date"
+                | "timestamp"
+                | "timestamptz"
+                | "time"
+                | "timetz"
+                | "interval"
+                | "json"
+                | "jsonb"
+                | "uuid"
+                | "bytea"
+        ) || t.ends_with("[]")
+    };
+    if types
+        .iter()
+        .take(text_args)
+        .any(|t| !texty(t) && non_text(t))
+    {
+        return Some(Error::UndefinedFunction(format!(
+            "function {name}({}) does not exist",
+            types
+                .iter()
+                .map(|t| display_type(t))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    None
+}
+
+/// The argument types a call's arguments have statically, `unknown` for an
+/// untyped string literal.
+fn call_arg_types(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Vec<String> {
+    f.args
+        .iter()
+        .map(|a| match a.node.as_ref() {
+            Some(N::AConst(c))
+                if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) =>
+            {
+                "unknown".to_string()
+            }
+            Some(N::AConst(c)) if c.isnull => "unknown".to_string(),
+            _ => {
+                let v = const_value(a, params).unwrap_or(Bson::Null);
+                static_type(a, &v)
+            }
+        })
+        .collect()
+}
+
 /// A function the PostgreSQL this server reports (15) does not have, or
 /// refuses in a UTF8 database, answered as PostgreSQL answers it: 42883
 /// naming the argument types, and `to_ascii` cannot convert from UTF8
@@ -12162,6 +12337,9 @@ fn function_absent_in_reference(
     f: &pg_query::protobuf::FuncCall,
     params: &[Bson],
 ) -> Option<Error> {
+    if let Some(e) = text_function_mismatch(f, &call_arg_types(f, params)) {
+        return Some(e);
+    }
     let name = func_name(f)?;
     if correlated::user_function_named(&name)
         && correlated::user_function_for(&name, &f.args).is_none()
