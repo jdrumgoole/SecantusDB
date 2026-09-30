@@ -10214,12 +10214,28 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   decision** (2026-07-17 audit). (b) the `secantusdb` binary crate exists and
   ships (`secantusd-rs`, the `secantusdb-v*` release-binaries track). (a)
   flipping `publish = false` and publishing `secantus-core` to crates.io needs
-  Joe's crates.io account + a public-API freeze decision — flagged. Original: With the lib/bindings
+  Joe's crates.io account + a public-API freeze decision — flagged.
+  **Planned 2026-09-30 in `tasks/rust-packages-plan.md`** — one crates.io
+  package per server (`secantusdb`, `secantus-pg`) with a one-line embedding
+  API and `cargo install` / `cargo binstall` binaries. That plan found what
+  blocks it (WiredTiger is prebuilt-only, a patched `pgwire`, a PG handle that
+  panics when dropped inside a tokio runtime) and lists the six decisions it
+  needs from Joe in §2. Original: With the lib/bindings
   split done, the remaining steps to "ultimately a Rust package": (a) settle the
   `secantus-core` lib's public API and flip `publish = false` → publish to
   crates.io; (b) add a `secantusdb` **binary crate** (a thin `main` over the
   engines + storage) — gated on the storage keystone (Phase 4 above), since a
   standalone server also needs storage in Rust, not just the operator engines.
+- [ ] **OPEN -- `RunningPgServer` panics when stopped or dropped inside a tokio
+  runtime.** `stop()` ends with `runtime.shutdown_timeout(..)` on the handle's
+  own runtime, which tokio refuses from an async context, and `Drop` calls
+  `stop()` (`secantus-pgserver/src/server.rs`). So any Rust caller that lets the
+  handle fall out of scope in a `#[tokio::test]` panics; the repo's own
+  `tests/embedded.rs` avoids it by keeping every `stop()` outside `block_on`.
+  Invisible to the Python embedding (it calls from a plain thread), fatal to a
+  Rust one. Fix: run the shutdown on a dedicated thread and join it; test it
+  from current-thread and multi-thread `#[tokio::test]`s. Phase C.3 of
+  `tasks/rust-packages-plan.md`.
 - [ ] **Make Rust the *recommended* default — a product/docs decision for
   Joe** (2026-07-17 audit). The byte-seam overhead rationale below is moot
   under the two-server model (the Rust server has no per-call seam); what
