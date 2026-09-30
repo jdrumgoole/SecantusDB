@@ -47,9 +47,13 @@ pub(crate) struct Dropped {
 pub(crate) struct DdlCommand {
     classid: i64,
     objid: i64,
+    objsubid: i32,
     tag: String,
     object_type: &'static str,
-    identity: String,
+    /// NULL for a GRANT, which names no single object.
+    identity: Option<String>,
+    /// NULL for a schema or a GRANT.
+    schema: Option<String>,
 }
 
 thread_local! {
@@ -138,7 +142,11 @@ impl Dropped {
             address_args: Vec::new(),
         };
         let array = Self {
-            objid: 0,
+            objid: if oid == 0 {
+                0
+            } else {
+                oid + secantus_pgplan::USER_TYPE_ARRAY_OID_OFFSET
+            },
             name: Some(format!("_{name}")),
             identity: format!("public.{}[]", ident(name)),
             address_names: vec![format!("public.{}[]", ident(name))],
@@ -302,6 +310,14 @@ impl PgHandler {
         }
         let _reset = Reset;
         self.fire_event("ddl_command_start", &tag)?;
+        // `table_rewrite` fires before a command rewrites a table's rows.
+        if let Some((table, reason)) = self.rewrite_of(&stmt) {
+            let oid = self.relation_oid(&table).unwrap_or(0);
+            secantus_pgplan::event_triggers::set_rewrite(Some((oid, reason)));
+            let fired = self.fire_event("table_rewrite", &tag);
+            secantus_pgplan::event_triggers::set_rewrite(None);
+            fired?;
+        }
         let dropped = self.dropped_by(&stmt);
         let created = Self::created_by(&stmt);
         let out = run(stmt)?;
@@ -316,7 +332,82 @@ impl PgHandler {
         Ok(out)
     }
 
-    fn fire_event(&self, event: &str, tag: &str) -> PgWireResult<()> {
+    fn fire_event(&self, event: &'static str, tag: &str) -> PgWireResult<()> {
+        secantus_pgplan::event_triggers::set_context(Some(event));
+        let out = self.fire_event_inner(event, tag);
+        secantus_pgplan::event_triggers::set_context(None);
+        out
+    }
+
+    /// The rewrite `stmt` makes of a table, `(table, reason)`, as
+    /// PostgreSQL's ALTER TABLE decides it: a column type change that is not
+    /// binary-coercible (or a narrowing modifier, or `USING`) is reason 4,
+    /// a new column whose default must be computed per row is reason 2.
+    fn rewrite_of(&self, stmt: &Statement) -> Option<(String, i32)> {
+        use secantus_pgplan::AlterTableAction as A;
+        let Statement::AlterTable { table, actions, .. } = stmt else {
+            return None;
+        };
+        let def = self.lookup(table)?;
+        let mut reason = 0;
+        for a in actions {
+            match a {
+                A::AlterType {
+                    column,
+                    pg_type,
+                    typmod,
+                    using,
+                } => {
+                    let Some(col) = def.column(column) else {
+                        continue;
+                    };
+                    let (old, new) = (col.pg_type.as_str(), pg_type.as_str());
+                    let coercible = matches!(
+                        (old, new),
+                        ("text", "varchar") | ("varchar", "text") | ("cidr", "inet")
+                    ) || (old == new
+                        && (*typmod < 0 || (col.typmod >= 0 && *typmod >= col.typmod)));
+                    if using.is_some() || !coercible {
+                        reason |= 4;
+                    }
+                }
+                A::AddColumn { column, .. } => {
+                    let volatile = column.sequence.is_some()
+                        || column.default_expr().is_some_and(|e| {
+                            let e = e.to_ascii_lowercase();
+                            [
+                                "nextval(",
+                                "random(",
+                                "clock_timestamp(",
+                                "timeofday(",
+                                "gen_random_uuid(",
+                                "uuid_generate_v4(",
+                            ]
+                            .iter()
+                            .any(|f| e.contains(f))
+                        });
+                    if volatile {
+                        reason |= 2;
+                    }
+                }
+                _ => {}
+            }
+        }
+        (reason != 0).then(|| (table.clone(), reason))
+    }
+
+    /// A user routine's `pg_proc` oid, by name.
+    fn routine_oid(&self, name: &str) -> i64 {
+        self.user_function_docs()
+            .unwrap_or_default()
+            .iter()
+            .find(|d| d.get_str("name") == Ok(name))
+            .map_or(0, |d| {
+                Self::index_oid(&format!("fn:{}", d.get_str("_id").unwrap_or_default()))
+            })
+    }
+
+    fn fire_event_inner(&self, event: &str, tag: &str) -> PgWireResult<()> {
         let mut triggers: Vec<Document> = self
             .event_trigger_docs()
             .into_iter()
@@ -391,10 +482,10 @@ impl PgHandler {
                         continue;
                     }
                     out.push(Dropped::relation("view", Self::view_oid(v), v, true));
-                    out.extend(Dropped::row_types(self.type_oid_by_name(v).unwrap_or(0), v));
+                    out.extend(Dropped::row_types(Self::view_type_oid(v), v));
                     out.push(Dropped {
                         classid: PG_REWRITE,
-                        objid: 0,
+                        objid: Self::view_rule_oid(v),
                         original: false,
                         normal: true,
                         object_type: "rule",
@@ -480,7 +571,10 @@ impl PgHandler {
                         .unwrap_or_default();
                     out.push(Dropped {
                         classid: PG_PROC,
-                        objid: 0,
+                        objid: Self::index_oid(&format!(
+                            "fn:{}",
+                            f.get_str("_id").unwrap_or_default()
+                        )),
                         original: true,
                         normal: false,
                         object_type: "function",
@@ -574,9 +668,37 @@ impl PgHandler {
                 v.push(("table", def.name.clone()));
                 v
             }
-            Statement::AlterTable { table, .. }
-            | Statement::RenameTable { table, .. }
-            | Statement::RenameColumn { table, .. } => vec![("table", table.clone())],
+            Statement::AlterTable { table, .. } => vec![("table", table.clone())],
+            Statement::RenameTable { to, .. } => vec![("table", to.clone())],
+            Statement::RenameColumn { table, to, .. } => {
+                vec![("table column", format!("{table}.{to}"))]
+            }
+            Statement::RenameView { to, .. } => vec![("view", to.clone())],
+            Statement::AlterView { view, .. } => vec![("view", view.clone())],
+            Statement::CreateSchema { name, .. } => vec![("schema", name.clone())],
+            Statement::Grant { .. } => vec![("grant", String::new())],
+            Statement::Comment { kind, names, .. } => match (kind.as_str(), names.as_slice()) {
+                ("column", [.., t, c]) => vec![("table column", format!("{t}.{c}"))],
+                ("table" | "view" | "index" | "sequence" | "type" | "schema", [.., n]) => vec![(
+                    match kind.as_str() {
+                        "table" => "table",
+                        "view" => "view",
+                        "index" => "index",
+                        "sequence" => "sequence",
+                        "type" => "type",
+                        _ => "schema",
+                    },
+                    n.clone(),
+                )],
+                _ => Vec::new(),
+            },
+            Statement::AlterFunction { name, action, .. } => {
+                let now = match action {
+                    secantus_pgplan::alter_routine::AlterFunctionAction::Rename(to) => to.clone(),
+                    _ => name.clone(),
+                };
+                vec![("routine", now)]
+            }
             Statement::CreateIndex(ci) => vec![("index", ci.name.clone().unwrap_or_default())],
             Statement::CreateView(v) => vec![("view", v.name.clone())],
             Statement::CreateSequence { name, .. } => vec![("sequence", name.clone())],
@@ -586,7 +708,11 @@ impl PgHandler {
             Statement::CreateUserFunction(def) => {
                 let args: Vec<String> = def.params.iter().map(|(_, t)| qualified_type(t)).collect();
                 vec![(
-                    "function",
+                    if def.is_procedure {
+                        "procedure"
+                    } else {
+                        "function"
+                    },
                     format!("{}({})", ident(&def.name), args.join(",")),
                 )]
             }
@@ -601,9 +727,11 @@ impl PgHandler {
             let relation = |kind: &'static str, name: &str, tag: &str| DdlCommand {
                 classid: PG_CLASS,
                 objid: self.relation_oid(name).unwrap_or(0),
+                objsubid: 0,
                 tag: tag.to_string(),
                 object_type: kind,
-                identity: format!("public.{}", ident(name)),
+                identity: Some(format!("public.{}", ident(name))),
+                schema: Some("public".into()),
             };
             match kind {
                 "table" if tag == "CREATE TABLE" => {
@@ -627,19 +755,98 @@ impl PgHandler {
                     out.push(relation("sequence", &name, "CREATE SEQUENCE"))
                 }
                 "index" if name.is_empty() => {}
-                "function" => out.push(DdlCommand {
+                "function" | "procedure" => out.push(DdlCommand {
                     classid: PG_PROC,
-                    objid: 0,
+                    objid: self.routine_oid(name.split('(').next().unwrap_or_default()),
+                    objsubid: 0,
                     tag: tag.to_string(),
-                    object_type: "function",
-                    identity: format!("public.{name}"),
+                    object_type: kind,
+                    identity: Some(format!("public.{name}")),
+                    schema: Some("public".into()),
                 }),
+                // A routine an ALTER named, by its name after the command.
+                "routine" => {
+                    let docs = self.user_function_docs().unwrap_or_default();
+                    if let Some(d) = docs.iter().find(|d| d.get_str("name") == Ok(name.as_str())) {
+                        let args: Vec<String> = d
+                            .get_array("param_types")
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|t| t.as_str().map(qualified_type))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let schema = d.get_str("schema").unwrap_or("public").to_string();
+                        out.push(DdlCommand {
+                            classid: PG_PROC,
+                            objid: Self::index_oid(&format!(
+                                "fn:{}",
+                                d.get_str("_id").unwrap_or_default()
+                            )),
+                            objsubid: 0,
+                            tag: tag.to_string(),
+                            object_type: if d.get_bool("is_procedure").unwrap_or(false) {
+                                "procedure"
+                            } else {
+                                "function"
+                            },
+                            identity: Some(format!(
+                                "{schema}.{}({})",
+                                ident(&name),
+                                args.join(",")
+                            )),
+                            schema: Some(schema),
+                        });
+                    }
+                }
                 "type" => out.push(DdlCommand {
                     classid: PG_TYPE,
                     objid: self.type_oid_by_name(&name).unwrap_or(0),
+                    objsubid: 0,
                     tag: tag.to_string(),
                     object_type: "type",
-                    identity: format!("public.{}", ident(&name)),
+                    identity: Some(format!("public.{}", ident(&name))),
+                    schema: Some("public".into()),
+                }),
+                "schema" => out.push(DdlCommand {
+                    classid: PG_NAMESPACE,
+                    objid: self
+                        .namespaces()
+                        .into_iter()
+                        .find(|(n, _)| *n == name)
+                        .map_or(0, |(_, o)| o),
+                    objsubid: 0,
+                    tag: tag.to_string(),
+                    object_type: "schema",
+                    identity: Some(ident(&name)),
+                    schema: None,
+                }),
+                "table column" => {
+                    let (table, column) = name.split_once('.').unwrap_or((&name, ""));
+                    let attnum = self
+                        .lookup(table)
+                        .and_then(|d| d.columns.iter().position(|c| c.name == column))
+                        .map_or(0, |i| i as i32 + 1);
+                    out.push(DdlCommand {
+                        classid: PG_CLASS,
+                        objid: self.relation_oid(table).unwrap_or(0),
+                        objsubid: attnum,
+                        tag: tag.to_string(),
+                        object_type: "table column",
+                        identity: Some(format!("public.{}.{}", ident(table), ident(column))),
+                        schema: Some("public".into()),
+                    });
+                }
+                // A GRANT names no single object: PostgreSQL reports the
+                // object KIND and nothing else.
+                "grant" => out.push(DdlCommand {
+                    classid: 0,
+                    objid: 0,
+                    objsubid: 0,
+                    tag: tag.to_string(),
+                    object_type: "TABLE",
+                    identity: None,
+                    schema: None,
                 }),
                 _ => out.push(relation(kind, &name, tag)),
             }
@@ -720,12 +927,19 @@ impl PgHandler {
                     let mut r = Document::new();
                     r.insert(f("classid"), Bson::Int64(o.classid));
                     r.insert(f("objid"), Bson::Int64(o.objid));
-                    r.insert(f("objsubid"), Bson::Int32(0));
+                    r.insert(f("objsubid"), Bson::Int32(o.objsubid));
                     r.insert(f("command_tag"), o.tag.as_str());
                     r.insert(f("object_type"), o.object_type);
-                    r.insert(f("schema_name"), "public");
-                    r.insert(f("object_identity"), o.identity.as_str());
+                    r.insert(
+                        f("schema_name"),
+                        o.schema.clone().map_or(Bson::Null, Bson::String),
+                    );
+                    r.insert(
+                        f("object_identity"),
+                        o.identity.clone().map_or(Bson::Null, Bson::String),
+                    );
                     r.insert(f("in_extension"), false);
+                    r.insert(f("command"), Bson::Null);
                     r
                 })
                 .collect()
@@ -784,6 +998,8 @@ pub(crate) fn ddl_commands_def() -> TableDef {
             Column::new("schema_name", "text", false),
             Column::new("object_identity", "text", false),
             Column::new("in_extension", "bool", false),
+            // A `pg_ddl_command`, which has no output form here either.
+            Column::new("command", "text", false),
         ],
     )
 }

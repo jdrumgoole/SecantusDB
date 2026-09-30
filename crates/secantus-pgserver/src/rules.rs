@@ -402,6 +402,22 @@ impl PgHandler {
                 d.insert(f("is_instead"), r.instead);
                 d
             })
+            // A view IS its `_RETURN` rule, as PostgreSQL records it.
+            .chain(
+                self.views()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(view, _)| {
+                        let mut d = Document::new();
+                        d.insert(f("oid"), Bson::Int64(Self::view_rule_oid(&view)));
+                        d.insert(f("rulename"), "_RETURN");
+                        d.insert(f("ev_class"), Bson::Int64(Self::view_oid(&view)));
+                        d.insert(f("ev_type"), "1");
+                        d.insert(f("ev_enabled"), "O");
+                        d.insert(f("is_instead"), true);
+                        d
+                    }),
+            )
             .collect()
     }
 

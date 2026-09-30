@@ -3006,7 +3006,7 @@ pub fn plan_with_params(
     let mut node = pg_query::protobuf::Node {
         node: Some(parse_one(sql)?),
     };
-    event_triggers::rewrite_sources(sql, &mut node);
+    event_triggers::rewrite_sources(sql, &mut node)?;
     if let Some(inner) = node.node.as_ref() {
         fdw::refuse_foreign_access(inner, lookup)?;
     }
@@ -3049,7 +3049,7 @@ pub fn plan_with_subqueries(
     // The resolved values are appended to the bound parameters as `$N`, so
     // the list the statement is finally planned with is longer than the one
     // the client bound.
-    event_triggers::rewrite_sources(sql, &mut node);
+    event_triggers::rewrite_sources(sql, &mut node)?;
     if let Some(inner) = node.node.as_ref() {
         fdw::refuse_foreign_access(inner, lookup)?;
     }
@@ -18341,6 +18341,16 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
         }
         Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("pg_sleep") => "void".to_string(),
         Some(N::FuncCall(f))
+            if func_name(f).as_deref() == Some("pg_event_trigger_table_rewrite_oid") =>
+        {
+            "regclass".to_string()
+        }
+        Some(N::FuncCall(f))
+            if func_name(f).as_deref() == Some("pg_event_trigger_table_rewrite_reason") =>
+        {
+            "int4".to_string()
+        }
+        Some(N::FuncCall(f))
             if matches!(
                 func_name(f).as_deref(),
                 Some(
@@ -29073,6 +29083,12 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         refuse_untyped_any_args(f)?;
         if func_name(f).as_deref() == Some("pg_typeof") {
             return pg_typeof(f, params);
+        }
+        if let Some(out) = func_name(f)
+            .as_deref()
+            .and_then(event_triggers::rewrite_function)
+        {
+            return out;
         }
         // `pg_sleep` inside an expression: `void`, which is the empty string
         // and NOT NULL (`pg_sleep(0) IS NULL` is false). It waits only in the

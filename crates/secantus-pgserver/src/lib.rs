@@ -4722,6 +4722,14 @@ impl PgHandler {
         Self::index_oid(&format!("view:{name}")) | 0x2000_0000
     }
 
+    /// A view's row type (every relation has one), and its `_RETURN` rule.
+    pub(crate) fn view_type_oid(name: &str) -> i64 {
+        Self::index_oid(&format!("viewtype:{name}")) | 0x1000_0000
+    }
+    pub(crate) fn view_rule_oid(name: &str) -> i64 {
+        Self::index_oid(&format!("viewrule:{name}")) | 0x1000_0000
+    }
+
     /// Index oids live in their own band so they never meet a type or table
     /// oid. Within it, a table's own indexes follow the table's oid `T`:
     /// `T*16 + 1` is its primary key and `T*16 + 2 + i` its i-th UNIQUE /
@@ -5890,6 +5898,11 @@ impl PgHandler {
         // `RETURNS numeric` function is numeric 1, so `n * f(n - 1)` is
         // numeric arithmetic and does not overflow an integer.
         Ok(match out {
+            // `void` is the empty string, not NULL (`select f() is null` is
+            // false for a void function).
+            secantus_pgplan::FnResult::Value(_) if !u.returns_set && u.return_type == "void" => {
+                secantus_pgplan::FnResult::Value(Bson::String(String::new()))
+            }
             secantus_pgplan::FnResult::Value(v)
                 if !u.returns_set
                     && v != Bson::Null
@@ -10586,6 +10599,7 @@ impl PgHandler {
             }
             "pg_class" => {
                 let f = |name: &str| def.field_of(name).expect("column");
+                let row_types = self.composites().unwrap_or_default();
                 let mut rows = Vec::new();
                 let indexes = self.index_relations();
                 let matviews: Vec<String> = self
@@ -10621,6 +10635,13 @@ impl PgHandler {
                             .map_or(Bson::Null, Bson::String),
                     );
                     d.insert(f("relnatts"), Bson::Int32(t.columns.len() as i32));
+                    // Its row type, the composite every table has.
+                    if let (Some(field), Some((_, oid, _))) = (
+                        def.field_of("reltype"),
+                        row_types.iter().find(|(n, _, _)| *n == t.name),
+                    ) {
+                        d.insert(field, Bson::Int64(*oid));
+                    }
                     d.insert(
                         f("relhasindex"),
                         indexes.iter().any(|ix| ix.table.name == t.name),
@@ -10673,6 +10694,9 @@ impl PgHandler {
                     d.insert(f("relname"), name.as_str());
                     d.insert(f("relnamespace"), Bson::Int64(Self::PUBLIC_NAMESPACE_OID));
                     d.insert(f("relkind"), "v");
+                    if let Some(field) = def.field_of("reltype") {
+                        d.insert(field, Bson::Int64(Self::view_type_oid(&name)));
+                    }
                     d.insert(f("relnatts"), Bson::Int32(natts as i32));
                     d.insert(f("relhasindex"), false);
                     d.insert(f("reltuples"), Bson::Double(-1.0));
@@ -11208,6 +11232,85 @@ impl PgHandler {
                         }),
                     );
                 }
+                let f = |name: &str| def.field_of(name).expect("column");
+                let common = |d: &mut Document, typtype: &str| {
+                    d.insert(f("typtype"), typtype);
+                    d.insert(f("typbasetype"), Bson::Int64(0));
+                    d.insert(f("typnotnull"), false);
+                    d.insert(f("typtypmod"), Bson::Int32(-1));
+                    d.insert(f("typdefault"), Bson::Null);
+                    d.insert(f("typnamespace"), Bson::Int64(Self::PUBLIC_NAMESPACE_OID));
+                    d.insert(f("typdelim"), ",");
+                };
+                // A view's row type: every relation has one.
+                for (view, _) in self.views().unwrap_or_default() {
+                    let oid = Self::view_type_oid(&view);
+                    let mut d = Document::new();
+                    d.insert(f("typname"), view.as_str());
+                    d.insert(f("oid"), Bson::Int64(oid));
+                    d.insert(
+                        f("typarray"),
+                        Bson::Int64(oid + Self::USER_TYPE_ARRAY_OID_OFFSET),
+                    );
+                    common(&mut d, "c");
+                    d.insert(f("typrelid"), Bson::Int64(Self::view_oid(&view)));
+                    rows.push(d);
+                }
+                // Every user type's ARRAY type, `_name`, as PostgreSQL makes
+                // one alongside each enum, composite, range and domain.
+                let have: std::collections::HashSet<i64> = rows
+                    .iter()
+                    .filter_map(|d| d.get(f("oid")).and_then(Bson::as_i64))
+                    .collect();
+                let mut arrays = Vec::new();
+                for d in &rows {
+                    let (Some(Bson::Int64(oid)), Some(Bson::Int64(array))) =
+                        (d.get(f("oid")), d.get(f("typarray")))
+                    else {
+                        continue;
+                    };
+                    if *array == 0 || have.contains(array) {
+                        continue;
+                    }
+                    let name = d.get_str(f("typname")).unwrap_or_default();
+                    let kind = d.get_str(f("typtype")).unwrap_or("b");
+                    let align = match kind {
+                        "c" => "d".to_string(),
+                        "d" => d
+                            .get(f("typbasetype"))
+                            .and_then(Bson::as_i64)
+                            .and_then(|b| crate::pg_type_facts::builtin(b, "typalign"))
+                            .and_then(|v| v.as_str().map(str::to_string))
+                            .unwrap_or_else(|| "i".into()),
+                        _ => "i".to_string(),
+                    };
+                    let mut a = Document::new();
+                    a.insert(f("typname"), format!("_{name}"));
+                    a.insert(f("oid"), Bson::Int64(*array));
+                    a.insert(f("typarray"), Bson::Int64(0));
+                    common(&mut a, "b");
+                    if let Some(ns) = d.get(f("typnamespace")) {
+                        a.insert(f("typnamespace"), ns.clone());
+                    }
+                    a.insert(f("typrelid"), Bson::Int64(0));
+                    a.insert(f("typelem"), Bson::Int64(*oid));
+                    a.insert(f("typlen"), Bson::Int32(-1));
+                    a.insert(f("typbyval"), false);
+                    a.insert(f("typalign"), align);
+                    a.insert(f("typstorage"), "x");
+                    a.insert(f("typcategory"), "A");
+                    a.insert(f("typispreferred"), false);
+                    a.insert(f("typinput"), "array_in");
+                    a.insert(f("typoutput"), "array_out");
+                    a.insert(f("typreceive"), "array_recv");
+                    a.insert(f("typsend"), "array_send");
+                    a.insert(f("typmodin"), "-");
+                    a.insert(f("typmodout"), "-");
+                    a.insert(f("typanalyze"), "array_typanalyze");
+                    a.insert(f("typsubscript"), "array_subscript_handler");
+                    arrays.push(a);
+                }
+                rows.extend(arrays);
                 rows
             }
             "pg_policies" => {
@@ -19572,10 +19675,20 @@ impl PgHandler {
             | Statement::CreateComposite { .. }
             | Statement::CreateRange { .. } => "CREATE TYPE",
             Statement::DropType { .. } => "DROP TYPE",
+            Statement::CreateUserFunction(def) if def.is_procedure => "CREATE PROCEDURE",
             Statement::CreateFunction { .. } | Statement::CreateUserFunction(..) => {
                 "CREATE FUNCTION"
             }
-            Statement::DropFunction { .. } => "DROP FUNCTION",
+            Statement::DropFunction { kind, .. } => match kind.as_str() {
+                "procedure" => "DROP PROCEDURE",
+                "routine" => "DROP ROUTINE",
+                _ => "DROP FUNCTION",
+            },
+            Statement::AlterFunction { kind, .. } => match kind.as_str() {
+                "procedure" => "ALTER PROCEDURE",
+                "routine" => "ALTER ROUTINE",
+                _ => "ALTER FUNCTION",
+            },
             Statement::CreateAggregate { .. } => "CREATE AGGREGATE",
             Statement::Catalog(op) => op.tag(),
             Statement::Sequence(tag, _) => tag,
