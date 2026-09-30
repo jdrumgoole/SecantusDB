@@ -29100,7 +29100,7 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                 comp_fields.iter().position(|(n, _)| *n == field),
                 format!("column \"{field}\" not found in data type {ty}"),
             )
-        } else if let Some(names) = named.filter(|n| n.iter().any(|x| *x == field)) {
+        } else if let Some(names) = named.filter(|n| n.contains(&field)) {
             (
                 names.iter().position(|n| *n == field),
                 format!("could not identify column \"{field}\" in record data type"),
