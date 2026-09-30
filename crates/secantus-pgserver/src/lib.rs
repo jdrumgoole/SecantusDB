@@ -521,6 +521,7 @@ fn user_fn_of(d: &Document) -> secantus_pgplan::UserFn {
         columns,
         variadic: d.get_bool("variadic").unwrap_or(false),
         key: d.get_str("_id").unwrap_or_default().to_string(),
+        strict: d.get_bool("strict").unwrap_or(false),
     }
 }
 
@@ -1896,6 +1897,7 @@ impl PgHandler {
         // Session state, so installed per statement -- the gate below is
         // per catalog version, and a SET DateStyle changes no catalog.
         // `1/5/2020` is January or May by the session's DateStyle order.
+        secantus_pgplan::set_session_datestyle(self.session_datestyle());
         secantus_pgplan::dtparse::set_date_order(match self.session_datestyle().order {
             secantus_pgplan::DateStyleOrder::Ymd => secantus_pgplan::dtparse::DateOrder::Ymd,
             secantus_pgplan::DateStyleOrder::Dmy => secantus_pgplan::dtparse::DateOrder::Dmy,
@@ -4637,6 +4639,7 @@ impl PgHandler {
             "returns_trigger": def.return_type == "trigger",
             "volatility": &def.volatility,
             "variadic": def.variadic,
+            "strict": def.strict,
         };
         // PostgreSQL checks the body at CREATE (`check_function_bodies`).
         match def.language.as_str() {
@@ -8921,7 +8924,7 @@ impl PgHandler {
                         row.insert(f("prolang"), Bson::Int64(lang));
                         row.insert(f("prokind"), "f");
                         row.insert(f("prosecdef"), false);
-                        row.insert(f("proisstrict"), false);
+                        row.insert(f("proisstrict"), d.get_bool("strict").unwrap_or(false));
                         row.insert(f("proretset"), d.get_bool("returns_set").unwrap_or(false));
                         row.insert(
                             f("provolatile"),
@@ -22464,11 +22467,18 @@ fn encode_field_value_inner(
                 options.as_ref(),
             );
         }
+        // A date / timestamp element follows the session DateStyle
+        // (`{04.03.2020}` under German), as the scalar arms below do.
         let rendered: Vec<Option<String>> = items
             .iter()
-            .map(|x| match x {
-                Bson::Null => None,
-                other => Some(secantus_pgplan::value_text(other)),
+            .map(|x| match (element, x) {
+                (_, Bson::Null) => None,
+                ("date", Bson::String(t)) => Some(secantus_pgplan::render_date_styled(t, ds)),
+                ("timestamp", other) => Some(
+                    secantus_pgplan::timestamp_value_text_styled(other, ds)
+                        .unwrap_or_else(|| secantus_pgplan::value_text(other)),
+                ),
+                (_, other) => Some(secantus_pgplan::value_text(other)),
             })
             .collect();
         return enc.encode_field(&rendered);

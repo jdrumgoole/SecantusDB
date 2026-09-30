@@ -346,6 +346,214 @@ fn keyword(t: &str) -> Option<Tok> {
         "aedt" => Tok::Dtz(11 * 3600),
         "nzst" => Tok::Tz(12 * 3600),
         "nzdt" => Tok::Dtz(13 * 3600),
+        _ => {
+            return default_abbreviation(t)
+                .map(|(off, dst)| if dst { Tok::Dtz(off) } else { Tok::Tz(off) })
+        }
+    })
+}
+
+/// PostgreSQL's `Default` `timezone_abbreviations` set, as
+/// `pg_timezone_abbrevs` lists it on 15 (offset east in seconds, and whether
+/// it is a daylight-saving abbreviation). The zone-dependent ones (`MSK`)
+/// carry their current offset.
+fn default_abbreviation(t: &str) -> Option<(i32, bool)> {
+    Some(match t {
+        "acdt" => (37800, true),
+        "acsst" => (37800, true),
+        "acst" => (34200, false),
+        "act" => (-18000, false),
+        "acwst" => (31500, false),
+        "adt" => (-10800, true),
+        "aedt" => (39600, true),
+        "aesst" => (39600, true),
+        "aest" => (36000, false),
+        "aft" => (16200, false),
+        "akdt" => (-28800, true),
+        "akst" => (-32400, false),
+        "almst" => (25200, true),
+        "almt" => (21600, false),
+        "amst" => (14400, false),
+        "amt" => (-14400, false),
+        "anast" => (43200, false),
+        "anat" => (43200, false),
+        "arst" => (-10800, false),
+        "art" => (-10800, false),
+        "ast" => (-14400, false),
+        "awsst" => (32400, true),
+        "awst" => (28800, false),
+        "azost" => (0, true),
+        "azot" => (-3600, false),
+        "azst" => (14400, false),
+        "azt" => (14400, false),
+        "bdst" => (7200, true),
+        "bdt" => (21600, false),
+        "bnt" => (28800, false),
+        "bort" => (28800, false),
+        "bot" => (-14400, false),
+        "bra" => (-10800, false),
+        "brst" => (-7200, true),
+        "brt" => (-10800, false),
+        "bst" => (3600, true),
+        "btt" => (21600, false),
+        "cadt" => (37800, true),
+        "cast" => (34200, false),
+        "cct" => (28800, false),
+        "cdt" => (-18000, true),
+        "cest" => (7200, true),
+        "cet" => (3600, false),
+        "cetdst" => (7200, true),
+        "chadt" => (49500, true),
+        "chast" => (45900, false),
+        "chut" => (36000, false),
+        "ckt" => (-36000, false),
+        "clst" => (-10800, true),
+        "clt" => (-10800, true),
+        "cot" => (-18000, false),
+        "cst" => (-21600, false),
+        "cxt" => (25200, false),
+        "davt" => (25200, false),
+        "ddut" => (36000, false),
+        "easst" => (-18000, true),
+        "east" => (-18000, true),
+        "eat" => (10800, false),
+        "edt" => (-14400, true),
+        "eest" => (10800, true),
+        "eet" => (7200, false),
+        "eetdst" => (10800, true),
+        "egst" => (0, true),
+        "egt" => (-3600, false),
+        "est" => (-18000, false),
+        "fet" => (10800, false),
+        "fjst" => (46800, true),
+        "fjt" => (43200, false),
+        "fkst" => (-10800, false),
+        "fkt" => (-10800, false),
+        "fnst" => (-3600, true),
+        "fnt" => (-7200, false),
+        "galt" => (-21600, false),
+        "gamt" => (-32400, false),
+        "gest" => (14400, false),
+        "get" => (14400, false),
+        "gft" => (-10800, false),
+        "gilt" => (43200, false),
+        "gmt" => (0, false),
+        "gyt" => (-14400, false),
+        "hkt" => (28800, false),
+        "hst" => (-36000, false),
+        "ict" => (25200, false),
+        "idt" => (10800, true),
+        "iot" => (21600, false),
+        "irkst" => (28800, false),
+        "irkt" => (28800, false),
+        "irt" => (12600, false),
+        "ist" => (7200, false),
+        "jayt" => (32400, false),
+        "jst" => (32400, false),
+        "kdt" => (36000, true),
+        "kgst" => (21600, true),
+        "kgt" => (21600, false),
+        "kost" => (39600, false),
+        "krast" => (25200, false),
+        "krat" => (25200, false),
+        "kst" => (32400, false),
+        "lhdt" => (37800, false),
+        "lhst" => (37800, false),
+        "ligt" => (36000, false),
+        "lint" => (50400, false),
+        "lkt" => (19800, false),
+        "magst" => (39600, false),
+        "magt" => (39600, false),
+        "mart" => (-34200, false),
+        "mawt" => (18000, false),
+        "mdt" => (-21600, true),
+        "mest" => (7200, true),
+        "mesz" => (7200, true),
+        "met" => (3600, false),
+        "metdst" => (7200, true),
+        "mez" => (3600, false),
+        "mht" => (43200, false),
+        "mmt" => (23400, false),
+        "mpt" => (36000, false),
+        "msd" => (14400, true),
+        "msk" => (10800, false),
+        "mst" => (-25200, false),
+        "must" => (18000, true),
+        "mut" => (14400, false),
+        "mvt" => (18000, false),
+        "myt" => (28800, false),
+        "ndt" => (-9000, true),
+        "nft" => (-12600, false),
+        "novst" => (25200, false),
+        "novt" => (25200, false),
+        "npt" => (20700, false),
+        "nst" => (-12600, false),
+        "nut" => (-39600, false),
+        "nzdt" => (46800, true),
+        "nzst" => (43200, false),
+        "nzt" => (43200, false),
+        "omsst" => (21600, false),
+        "omst" => (21600, false),
+        "pdt" => (-25200, true),
+        "pet" => (-18000, false),
+        "petst" => (43200, false),
+        "pett" => (43200, false),
+        "pgt" => (36000, false),
+        "pht" => (28800, false),
+        "pkst" => (21600, true),
+        "pkt" => (18000, false),
+        "pmdt" => (-7200, true),
+        "pmst" => (-10800, false),
+        "pont" => (39600, false),
+        "pst" => (-28800, false),
+        "pwt" => (32400, false),
+        "pyst" => (-10800, true),
+        "pyt" => (-10800, false),
+        "ret" => (14400, false),
+        "sadt" => (37800, true),
+        "sast" => (7200, false),
+        "sct" => (14400, false),
+        "sgt" => (28800, false),
+        "taht" => (-36000, false),
+        "tft" => (18000, false),
+        "tjt" => (18000, false),
+        "tkt" => (46800, false),
+        "tmt" => (18000, false),
+        "tot" => (46800, false),
+        "trut" => (36000, false),
+        "tvt" => (43200, false),
+        "uct" => (0, false),
+        "ulast" => (32400, true),
+        "ulat" => (28800, false),
+        "ut" => (0, false),
+        "utc" => (0, false),
+        "uyst" => (-7200, true),
+        "uyt" => (-10800, false),
+        "uzst" => (21600, true),
+        "uzt" => (18000, false),
+        "vet" => (-14400, false),
+        "vlast" => (36000, false),
+        "vlat" => (36000, false),
+        "volt" => (10800, false),
+        "vut" => (39600, false),
+        "wadt" => (28800, true),
+        "wakt" => (43200, false),
+        "wast" => (25200, false),
+        "wat" => (3600, false),
+        "wdt" => (32400, true),
+        "wet" => (0, false),
+        "wetdst" => (3600, true),
+        "wft" => (43200, false),
+        "wgst" => (-7200, true),
+        "wgt" => (-10800, false),
+        "xjt" => (21600, false),
+        "yakst" => (32400, false),
+        "yakt" => (32400, false),
+        "yapt" => (36000, false),
+        "yekst" => (21600, true),
+        "yekt" => (18000, false),
+        "z" => (0, false),
+        "zulu" => (0, false),
         _ => return None,
     })
 }
@@ -738,10 +946,18 @@ fn validate_date(
 /// Decode `text` as `DecodeDateTime` does. `type_name` names the target in
 /// the error (`date`, `timestamp`, `timestamp with time zone`).
 pub fn parse(text: &str, type_name: &str) -> Result<Parsed> {
-    decode(text).map_err(|f| to_error(f, text, type_name))
+    decode(text, false).map_err(|f| to_error(f, text, type_name))
 }
 
-fn decode(text: &str) -> std::result::Result<Parsed, Fail> {
+/// A `time` / `timetz` input: `DecodeTimeOnly`. A date part is accepted and
+/// ignored; a bare six-digit number is `HHMMSS` rather than `YYMMDD`; the
+/// result is the time of day (`has_date` false), with `24:00:00` allowed and a
+/// leap second carried into the next minute.
+pub fn parse_time_only(text: &str, type_name: &str) -> Result<Parsed> {
+    decode(text, true).map_err(|f| to_error(f, text, type_name))
+}
+
+fn decode(text: &str, time_only: bool) -> std::result::Result<Parsed, Fail> {
     let fields = parse_fields(text)?;
     let nf = fields.len();
     let mut tm = Tm::default();
@@ -891,7 +1107,14 @@ fn decode(text: &str) -> std::result::Result<Parsed, Fail> {
                 } else {
                     let flen = f.len();
                     let dot = f.find('.');
-                    if dot.is_some() && fmask & DATE_M == 0 {
+                    if time_only {
+                        let int_len = dot.unwrap_or(flen);
+                        tmask = if int_len > 2 || (dot.is_none() && flen > 4) {
+                            decode_number_field(f, fmask | DATE_M, &mut tm, &mut is2digits)?
+                        } else {
+                            decode_number(f, false, fmask | DATE_M, &mut tm, &mut is2digits)?
+                        };
+                    } else if dot.is_some() && fmask & DATE_M == 0 {
                         tmask = decode_date(f, fmask, &mut tm, &mut is2digits)?;
                     } else if let Some(d) = dot.filter(|d| *d > 2) {
                         let _ = d;
@@ -979,7 +1202,7 @@ fn decode(text: &str) -> std::result::Result<Parsed, Fail> {
                     continue;
                 }
                 Some(Tok::IsoTime) => {
-                    if fmask & DATE_M != DATE_M {
+                    if !time_only && fmask & DATE_M != DATE_M {
                         return Err(Fail::BadFormat);
                     }
                     if i + 1 >= nf
@@ -1013,6 +1236,9 @@ fn decode(text: &str) -> std::result::Result<Parsed, Fail> {
         let _ = s;
         return Ok(out);
     }
+    if time_only {
+        return finish_time_only(fmask, mer, tm, tz, out);
+    }
     if out.relative_day.is_none() {
         validate_date(fmask, isjulian, is2digits, bc, &mut tm)?;
     }
@@ -1037,6 +1263,57 @@ fn decode(text: &str) -> std::result::Result<Parsed, Fail> {
     out.minute = tm.min as u32;
     out.second = tm.sec as u32;
     out.micros = tm.fsec;
+    out.offset = tz;
+    Ok(out)
+}
+
+/// The tail of `DecodeTimeOnly`: the meridian, the range checks, and the
+/// normalisation of a 60th second.
+fn finish_time_only(
+    fmask: u32,
+    mer: Option<bool>,
+    mut tm: Tm,
+    tz: Option<i32>,
+    mut out: Parsed,
+) -> std::result::Result<Parsed, Fail> {
+    if fmask & TIME_M == 0 && tz.is_none() {
+        return Err(Fail::BadFormat);
+    }
+    if let Some(pm) = mer {
+        if tm.hour > 12 {
+            return Err(Fail::FieldOverflow);
+        }
+        if !pm && tm.hour == 12 {
+            tm.hour = 0;
+        } else if pm && tm.hour != 12 {
+            tm.hour += 12;
+        }
+    }
+    if tm.hour < 0
+        || tm.min < 0
+        || tm.min > 59
+        || tm.sec < 0
+        || tm.sec > 60
+        || tm.hour > 24
+        || (tm.hour == 24 && (tm.min > 0 || tm.sec > 0 || tm.fsec > 0))
+        || tm.fsec < 0
+        || tm.fsec > 1_000_000
+    {
+        return Err(Fail::FieldOverflow);
+    }
+    let mut total = (i64::from(tm.hour) * 3600 + i64::from(tm.min) * 60 + i64::from(tm.sec))
+        * 1_000_000
+        + tm.fsec;
+    if total > 86_400_000_000 {
+        return Err(Fail::FieldOverflow);
+    }
+    out.has_date = false;
+    out.hour = (total / 3_600_000_000) as u32;
+    total %= 3_600_000_000;
+    out.minute = (total / 60_000_000) as u32;
+    total %= 60_000_000;
+    out.second = (total / 1_000_000) as u32;
+    out.micros = total % 1_000_000;
     out.offset = tz;
     Ok(out)
 }

@@ -627,6 +627,9 @@ pub struct UserFn {
     pub variadic: bool,
     /// The catalog key the executor finds the function's body under.
     pub key: String,
+    /// `STRICT`: any NULL argument answers NULL (no rows, for a set-returning
+    /// function) without the body running.
+    pub strict: bool,
 }
 
 /// What a user function call produced.
@@ -731,6 +734,13 @@ pub fn with_function_hook<R>(hook: &FunctionHook<'_>, f: impl FnOnce() -> R) -> 
 pub(crate) fn call_user_function(u: &UserFn, args: &[Bson]) -> Result<FnResult> {
     if SUPPRESSED.with(|s| s.get()) {
         return Ok(FnResult::Value(Bson::Null));
+    }
+    if u.strict && args.iter().any(|a| *a == Bson::Null) {
+        return Ok(if u.returns_set {
+            FnResult::Rows(Vec::new(), Vec::new(), Vec::new())
+        } else {
+            FnResult::Value(Bson::Null)
+        });
     }
     // A VARIADIC call packs its trailing arguments into the last parameter's
     // array, unless it passed that array itself (`VARIADIC ARRAY[...]`).

@@ -1,0 +1,13 @@
+DROP AGGREGATE IF EXISTS mysum(int)
+DROP AGGREGATE IF EXISTS mysum2(int)
+DROP AGGREGATE IF EXISTS mycat(text)
+DROP AGGREGATE IF EXISTS mylen(text)
+DROP AGGREGATE IF EXISTS myarr(anyelement)
+DROP AGGREGATE IF EXISTS oldsum(int)
+DROP AGGREGATE IF EXISTS mymax(int)
+DROP FUNCTION IF EXISTS add_int(int, int)
+DROP FUNCTION IF EXISTS cat_fn(text, text)
+DROP FUNCTION IF EXISTS fin(text)
+DROP TABLE IF EXISTS ag
+CREATE TABLE ag (id int, n int, t text, g int)
+INSERT INTO ag VALUES (1, 10, 'b', 1), (2, NULL, 'a', 1), (3, 5, NULL, 2), (4, 5, 'c', 2)

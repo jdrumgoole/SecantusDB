@@ -2065,6 +2065,10 @@ fn from_char_mode(input: &str, fmt: &str, strict: bool) -> Result<(NaiveDate, i6
     if bc {
         y = -y + 1;
     }
+    // A zero month or day is "not given", as `do_to_timestamp`'s
+    // `if (tmfc.mm)` has it: `to_date('2020-00-10', ...)` is January 10th.
+    let mon = mon.filter(|m| *m != 0);
+    let mday = mday.filter(|d| *d != 0);
     let date = if let Some(j) = julian {
         let days = j - date2j(2000, 1, 1);
         NaiveDate::from_ymd_opt(2000, 1, 1)

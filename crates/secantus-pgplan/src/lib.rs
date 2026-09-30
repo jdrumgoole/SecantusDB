@@ -2035,6 +2035,8 @@ pub struct UserFunctionDef {
     pub volatility: String,
     /// The last parameter is `VARIADIC`.
     pub variadic: bool,
+    /// `STRICT`: a NULL argument answers NULL without running the body.
+    pub strict: bool,
 }
 
 /// A trigger as CREATE TRIGGER declares it.
@@ -3347,10 +3349,18 @@ fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<St
     let mut language = None;
     let mut body = None;
     let mut volatility = "volatile".to_string();
+    let mut strict = false;
     for opt in &f.options {
         let Some(N::DefElem(e)) = opt.node.as_ref() else {
             continue;
         };
+        // `STRICT` / `RETURNS NULL ON NULL INPUT` (true) and `CALLED ON NULL
+        // INPUT` (false).
+        if e.defname.eq_ignore_ascii_case("strict") {
+            strict = matches!(e.arg.as_ref().and_then(|a| a.node.as_ref()),
+                Some(N::Boolean(b)) if b.boolval);
+            continue;
+        }
         let text = e.arg.as_ref().and_then(|a| type_name_of_node(a));
         match e.defname.to_ascii_lowercase().as_str() {
             "language" => language = text,
@@ -3424,6 +3434,7 @@ fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<St
             language,
             volatility,
             variadic,
+            strict,
         }));
     }
     if !language.eq_ignore_ascii_case("internal") {
@@ -17665,6 +17676,12 @@ fn parse_time(text: &str) -> Result<String> {
         .or_else(|_| NaiveTime::parse_from_str(t, "%H:%M"));
     let time = match parsed {
         Ok(v) => v,
+        // Everything else a client may send -- `12:34 pm`, `allballs`,
+        // `T12:34`, `040506.789` -- goes through `DecodeTimeOnly`.
+        Err(_) if dtparse::parse_time_only(t, "time").is_ok() => {
+            let p = dtparse::parse_time_only(t, "time")?;
+            return Ok(render_time_parts(&p));
+        }
         Err(_) => {
             let numeric_shape = t
                 .split([':', '.'])
@@ -17684,6 +17701,17 @@ fn parse_time(text: &str) -> Result<String> {
         let frac = format!("{micros:06}");
         format!("{}.{}", time.format("%H:%M:%S"), frac.trim_end_matches('0'))
     })
+}
+
+/// A `DecodeTimeOnly` result as `time` text.
+fn render_time_parts(p: &dtparse::Parsed) -> String {
+    let clock = format!("{:02}:{:02}:{:02}", p.hour, p.minute, p.second);
+    if p.micros == 0 {
+        clock
+    } else {
+        let frac = format!("{:06}", p.micros);
+        format!("{clock}.{}", frac.trim_end_matches('0'))
+    }
 }
 
 /// Whether `t` is PostgreSQL's special end-of-day `time` value: hour 24 with
@@ -19565,11 +19593,19 @@ pub fn apply_column_expr(expr: &ColumnExpr, value: Bson, tz: &TimeZoneSetting) -
             let mut v = value;
             let mut prev: Option<&str> = match source.as_deref() {
                 Some("timestamptz") | Some("timestamp with time zone") => Some("timestamptz"),
-                Some(t @ ("int2vector" | "oidvector")) => Some(t),
+                Some(t @ ("int2vector" | "oidvector" | "date" | "timestamp")) => Some(t),
+                Some(t @ ("date[]" | "timestamp[]" | "timestamptz[]")) => Some(t),
                 Some(t) if range::is_range_type(t) || range::is_multirange_type(t) => Some(t),
                 _ => None,
             };
             for target in chain {
+                if matches!(target.as_str(), "text" | "varchar" | "name") {
+                    if let Some(styled) = prev.and_then(|p| datetime_text_styled(&v, p, tz)) {
+                        v = styled;
+                        prev = Some(target);
+                        continue;
+                    }
+                }
                 // A range cast to its multirange is the one-member multirange.
                 if let Some(r) = prev {
                     if range::is_range_type(r)
@@ -19713,6 +19749,58 @@ pub fn cast_text_to(text: &str, target: &str, tz: &TimeZoneSetting) -> Result<Bs
 
 fn session_timezone() -> TimeZoneSetting {
     PLAN_TIMEZONE.with(|t| t.borrow().clone())
+}
+
+thread_local! {
+    static PLAN_DATESTYLE: std::cell::Cell<DateStyle> = std::cell::Cell::new(DateStyle::default());
+}
+
+/// Install the session's `DateStyle` for the statements that follow: a
+/// date or timestamp cast to text renders in it.
+pub fn set_session_datestyle(ds: DateStyle) {
+    PLAN_DATESTYLE.with(|d| d.set(ds));
+}
+
+fn session_datestyle() -> DateStyle {
+    PLAN_DATESTYLE.with(std::cell::Cell::get)
+}
+
+/// A date / timestamp / timestamptz value (or an array of them) as the text
+/// its cast to a string type produces under the session `DateStyle` and
+/// zone. `None` when `source` is none of those, or the value is not one.
+fn datetime_text_styled(value: &Bson, source: &str, tz: &TimeZoneSetting) -> Option<Bson> {
+    let ds = session_datestyle();
+    if let Some(element) = source.strip_suffix("[]") {
+        if ds.format == DateStyleFormat::Iso
+            || !matches!(element, "date" | "timestamp" | "timestamptz")
+        {
+            return None;
+        }
+        let Bson::Array(items) = value else {
+            return None;
+        };
+        let styled: Vec<Bson> = items
+            .iter()
+            .map(|v| match v {
+                Bson::Null => Bson::Null,
+                v => datetime_text_styled(v, element, tz).unwrap_or_else(|| v.clone()),
+            })
+            .collect();
+        return Some(Bson::String(render_value_text(&Bson::Array(styled))));
+    }
+    match (source, value) {
+        (_, Bson::Null) => None,
+        ("date", Bson::String(t)) if ds.format != DateStyleFormat::Iso => {
+            Some(Bson::String(render_date_styled(t, &ds)))
+        }
+        ("timestamp", v) if ds.format != DateStyleFormat::Iso => {
+            timestamp_value_text_styled(v, &ds).map(Bson::String)
+        }
+        ("timestamptz", v) if ds.format != DateStyleFormat::Iso => {
+            timestamptz_value_text_styled(v, tz, &ds).map(Bson::String)
+        }
+        _ => None,
+    }
 }
 
 /// Split a trailing UTC offset off a timestamp literal.
@@ -19910,7 +19998,15 @@ pub fn render_timetz(micros: i64, east_seconds: i32) -> String {
 /// same literal can mean different things on either side of a DST change.
 fn parse_timetz(text: &str, tz: &TimeZoneSetting) -> Result<String> {
     let (body, offset) = split_trailing_offset(text);
-    let time = parse_time(&body)?;
+    let (time, offset) = match parse_time(&body) {
+        Ok(time) => (time, offset),
+        // `allballs` is midnight UTC, and `12:34 pm EST` names its zone as an
+        // abbreviation: both come out of `DecodeTimeOnly` with the offset.
+        Err(e) => match dtparse::parse_time_only(text.trim(), "time with time zone") {
+            Ok(p) if p.zone.is_none() => (render_time_parts(&p), p.offset.or(offset)),
+            _ => return Err(e),
+        },
+    };
     let seconds = match offset {
         Some(s) => s,
         None => {
@@ -23338,6 +23434,15 @@ fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
             };
             let (x, y) = match (floats(&lhs), floats(&rhs)) {
                 (Some(x), Some(y)) => (x, y),
+                // A text beside a number has no arithmetic operator at all:
+                // `'a'::text * 2` is 42883 on PostgreSQL.
+                _ if matches!(lhs, Bson::String(_)) || matches!(rhs, Bson::String(_)) => {
+                    return Err(Error::UndefinedFunction(format!(
+                        "operator does not exist: {} {op} {}",
+                        display_type(inferred_type(&lhs)),
+                        display_type(inferred_type(&rhs))
+                    )))
+                }
                 _ => {
                     return Err(Error::Unsupported(format!(
                         "operator {op} on these operands"
@@ -24846,6 +24951,13 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
         // Casting a timestamptz INSTANT to text renders it in the session zone
         // (the instant alone cannot say it is a timestamptz, so the source cast
         // decides). PLAN_TIMEZONE is set during planning, where this evaluates.
+        if matches!(target.as_str(), "text" | "varchar" | "name") {
+            if let Some(v) =
+                datetime_text_styled(&value, &static_type(arg, &value), &session_timezone())
+            {
+                return Ok(v);
+            }
+        }
         if target == "text" && static_type(arg, &value) == "timestamptz" {
             if let Some(t) = timestamptz_value_text(&value, &session_timezone()) {
                 return Ok(Bson::String(t));
