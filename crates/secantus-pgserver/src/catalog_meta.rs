@@ -154,3 +154,60 @@ pub(crate) fn class_rows(def: &TableDef, namespace_oid: impl Fn(&str) -> i64) ->
     }
     out
 }
+
+/// Install PostgreSQL's own relations in the planner, once: `'pg_statistic'
+/// ::regclass`, `'information_schema.tables'::regclass` and their rendering.
+pub(crate) fn install_system_relations() {
+    static DONE: std::sync::Once = std::sync::Once::new();
+    DONE.call_once(|| {
+        secantus_pgplan::set_system_relations(
+            CLASSES
+                .lines()
+                .filter_map(|l| {
+                    let c: Vec<&str> = l.split('\t').collect();
+                    Some((
+                        c.get(2)?.to_string(),
+                        c.get(1)?.to_string(),
+                        c.first()?.parse().ok()?,
+                    ))
+                })
+                .collect(),
+        );
+    });
+}
+
+const ATTRIBUTES: &str = include_str!("pg_attribute_system.tsv");
+
+/// `pg_attribute` rows for PostgreSQL's own relations' columns -- tables,
+/// views, indexes and TOAST relations -- dumped from PostgreSQL 15
+/// (`pg_attribute_system.tsv`: attrelid, attname, atttypid, attnum,
+/// attnotnull, atttypmod, atthasdef). An `information_schema` column of one
+/// of that schema's domains reports the domain's base type.
+pub(crate) fn attribute_rows(def: &TableDef) -> Vec<Document> {
+    let f = |name: &str| def.field_of(name);
+    let mut out = Vec::new();
+    for l in ATTRIBUTES.lines() {
+        let [relid, name, ty, num, notnull, typmod, hasdef] = l.split('\t').collect::<Vec<_>>()[..]
+        else {
+            continue;
+        };
+        let int = |s: &str| s.parse::<i64>().unwrap_or(0);
+        let mut d = Document::new();
+        let mut put = |k: &str, b: Bson| {
+            if let Some(field) = f(k) {
+                d.insert(field, b);
+            }
+        };
+        put("attrelid", Bson::Int64(int(relid)));
+        put("attname", Bson::String(name.to_string()));
+        put("atttypid", Bson::Int64(int(ty)));
+        put("attnum", Bson::Int32(int(num) as i32));
+        put("attisdropped", Bson::Boolean(false));
+        put("attnotnull", Bson::Boolean(notnull == "1"));
+        put("atttypmod", Bson::Int32(int(typmod) as i32));
+        put("atthasdef", Bson::Boolean(hasdef == "1"));
+        put("attgenerated", Bson::String(String::new()));
+        out.push(d);
+    }
+    out
+}

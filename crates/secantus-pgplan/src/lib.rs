@@ -14554,8 +14554,13 @@ fn resolve_one_sublink(
                     let ty = sub_plan_def(&plan, lookup)
                         .ok()
                         .and_then(|d| d.columns.first().map(|c| c.pg_type.clone()));
+                    // So must a type the value reads back as another (an
+                    // `oid` is carried as a bigint, a `name` as text).
                     Ok(match ty.as_deref() {
-                        Some(ty @ ("int2vector" | "oidvector")) => pg_query::protobuf::Node {
+                        Some(
+                            ty @ ("int2vector" | "oidvector" | "oid" | "int2" | "float4" | "name"
+                            | "varchar" | "bpchar" | "\"char\"" | "xid" | "cid"),
+                        ) => pg_query::protobuf::Node {
                             node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
                                 arg: Some(Box::new(node)),
                                 type_name: Some(type_name_node(ty)),
@@ -21509,6 +21514,25 @@ pub fn set_user_relations(relations: Vec<(String, i64, bool)>) {
     PLAN_USER_RELATIONS.with(|t| *t.borrow_mut() = relations);
 }
 
+/// PostgreSQL's own relations -- every `pg_catalog`, `information_schema` and
+/// `pg_toast` table, view and index -- as `(schema, name, oid)`, installed
+/// once by the server from PostgreSQL 15's `pg_class`.
+static SYSTEM_RELATIONS: std::sync::OnceLock<Vec<(String, String, i64)>> =
+    std::sync::OnceLock::new();
+
+/// Install the system relations (the first call wins; they never change).
+pub fn set_system_relations(relations: Vec<(String, String, i64)>) {
+    let _ = SYSTEM_RELATIONS.set(relations);
+}
+
+fn system_relation(schema: &str, name: &str) -> Option<i64> {
+    SYSTEM_RELATIONS
+        .get()?
+        .iter()
+        .find(|(s, n, _)| s == schema && n == name)
+        .map(|(_, _, oid)| *oid)
+}
+
 /// The system catalogs this server answers for, under PostgreSQL's own fixed
 /// oids (`'pg_class'::regclass::oid` is 1259 on every install; measured 16).
 const CATALOG_RELATIONS: &[(&str, i64)] = &[
@@ -21573,6 +21597,18 @@ pub fn regclass_text(oid: i64) -> String {
     }
     if let Some((name, _)) = CATALOG_RELATIONS.iter().find(|(_, o)| *o == oid) {
         return (*name).to_string();
+    }
+    // Any other system relation: bare in pg_catalog (on the search path),
+    // qualified elsewhere.
+    if let Some((schema, name, _)) = SYSTEM_RELATIONS
+        .get()
+        .and_then(|v| v.iter().find(|(_, _, o)| *o == oid))
+    {
+        return if schema == "pg_catalog" {
+            name.clone()
+        } else {
+            format!("{schema}.{name}")
+        };
     }
     oid.to_string()
 }
@@ -21673,10 +21709,12 @@ fn resolve_regclass(text: &str) -> Result<i64> {
     let found = match schema {
         None => user(name, Some(true))
             .or_else(|| user(name, Some(false)))
-            .or_else(catalog),
+            .or_else(catalog)
+            .or_else(|| system_relation("pg_catalog", name)),
         Some("public") => user(name, Some(false)),
         Some(s) if s == "pg_temp" || s.starts_with("pg_temp_") => user(name, Some(true)),
-        Some("pg_catalog") => catalog(),
+        Some("pg_catalog") => catalog().or_else(|| system_relation("pg_catalog", name)),
+        Some(s @ ("information_schema" | "pg_toast")) => system_relation(s, name),
         // A table in another schema is stored under `schema.name`.
         Some(s) => user(&format!("{s}.{name}"), Some(false)),
     };

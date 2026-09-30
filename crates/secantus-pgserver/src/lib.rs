@@ -2670,6 +2670,7 @@ impl PgHandler {
         secantus_pgplan::user_agg::set_user_aggregates(self.user_aggregates().unwrap_or_default());
         // User-defined functions, so the planner can type and route a call.
         secantus_pgplan::rule_rewrite::set_rules(self.enabled_rules());
+        catalog_meta::install_system_relations();
         let routines = self.user_function_docs().unwrap_or_default();
         let is_procedure = |d: &&Document| d.get_bool("is_procedure").unwrap_or(false);
         secantus_pgplan::set_user_functions(
@@ -12045,6 +12046,8 @@ impl PgHandler {
                         rows.push(d);
                     }
                 }
+                // PostgreSQL's own relations' columns.
+                rows.extend(catalog_meta::attribute_rows(&def));
                 rows
             }
             // One row per label, in declared order; sortorder starts at 1.

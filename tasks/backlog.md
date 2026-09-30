@@ -4282,6 +4282,10 @@ all match, and so do CREATE INDEX / VIEW and their error surface. What is open:
       of its tests are blocked on a number, not a bug.
 - [ ] **`getColumnPrivileges` on a SYSTEM catalog needs TWO things, and the
       bigger one is that `pg_class` does not self-describe.** Probed 2026-09-28.
+      **The RUST server has both since batch 13** -- `pg_class` / `pg_attribute`
+      list PostgreSQL 15's own relations and columns (`catalog_system` corpus)
+      and `attacl` renders column grants (`column_privileges`); what follows
+      describes the Python server.
       pgjdbc's `columnPrivileges` asks for `getColumnPrivileges(null, null,
       'pg_statistic', null)` and expects at least one row.
       1. **`pg_class` lists no system catalogs at all**: zero `pg_%` rows in an
