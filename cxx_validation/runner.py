@@ -276,21 +276,29 @@ def main() -> int:
         f"(storage {storage_dir}, will be cleaned up)",
         file=sys.stderr,
     )
+    # The one gauge that launches its daemon outside `spawn_daemon` (it needs
+    # the FIXED port 27017, which `spawn_daemon` rewrites to 0), so it must
+    # force `--enable-test-commands` itself. It did not: once #1624 turned
+    # failpoints off by default, `configureFailPoint` became "no such command"
+    # here and the WriteConcernError errInfo test failed on the harness, not
+    # the server (measured 2026-09-30).
     daemon = subprocess.Popen(
         gauge_common.for_server(
-            [
-                sys.executable,
-                "-m",
-                "secantus",
-                "--host",
-                host,
-                "--port",
-                str(MONGOCXX_PORT),
-                "--storage-path",
-                storage_dir,
-                "--log-level",
-                "WARNING",
-            ]
+            gauge_common._force_test_commands(
+                [
+                    sys.executable,
+                    "-m",
+                    "secantus",
+                    "--host",
+                    host,
+                    "--port",
+                    str(MONGOCXX_PORT),
+                    "--storage-path",
+                    storage_dir,
+                    "--log-level",
+                    "WARNING",
+                ]
+            )
         ),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,

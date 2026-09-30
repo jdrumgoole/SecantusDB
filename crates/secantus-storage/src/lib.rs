@@ -1553,7 +1553,7 @@ pub enum StorageError {
     /// cache-derived dirty budget (see `Storage::txn_dirty_limit`). Raised
     /// BEFORE the transaction can pin enough unevictable dirty content to
     /// livelock WiredTiger; the command layer maps it to mongod's
-    /// `TransactionTooLargeForCache` (313, no transient label).
+    /// `TransactionTooLargeForCache` (388, no transient label).
     TransactionTooLargeForCache,
     /// A `hint` did not resolve to an existing index (command layer maps this to
     /// a mongod `BadValue`).
