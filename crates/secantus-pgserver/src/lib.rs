@@ -11,6 +11,7 @@
 
 mod advisory;
 mod table_locks;
+mod merge;
 mod aggregates;
 mod do_block;
 mod encoding;
@@ -13318,7 +13319,11 @@ impl PgHandler {
                     }
                 }
             }
-            None if Self::row_write(&stmt) => self.run_autocommit_write(stmt, max_rows),
+            // Not when a transaction is already active on this thread: a
+            // trigger's or MERGE's own writes join the statement they serve.
+            None if Self::row_write(&stmt) && !self.storage.in_user_txn() => {
+                self.run_autocommit_write(stmt, max_rows)
+            }
             None => self.execute(stmt, max_rows),
         });
         self.collect_planner_warnings();
@@ -13333,7 +13338,7 @@ impl PgHandler {
     fn row_write(stmt: &Statement) -> bool {
         matches!(
             stmt,
-            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) | Statement::Merge(_)
         )
     }
 
@@ -18749,6 +18754,7 @@ impl PgHandler {
                     .clear();
                 Ok(vec![Response::Execution(Tag::new("DEALLOCATE ALL"))])
             }
+            Statement::Merge(m) => self.execute_merge(m),
             Statement::Maintenance {
                 command,
                 tables,
@@ -20041,10 +20047,11 @@ impl PgHandler {
             }
         }
         for c in &def.columns {
-            // A single-column key is the document's `_id` and guarded where
-            // that is written; a composite key's columns are ordinary fields
-            // and checked here like any NOT NULL column.
-            if c.nullable || (c.pk && c.field_override.is_none()) {
+            // A PRIMARY KEY column is NOT NULL, the single-column key (the
+            // document's `_id`) included: a row written without one would
+            // otherwise be given a generated `_id` and stored with a NULL key
+            // -- as many times as it was written.
+            if c.nullable && !c.pk {
                 continue;
             }
             if matches!(row.get(c.field()), None | Some(Bson::Null)) {

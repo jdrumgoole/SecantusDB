@@ -177,6 +177,41 @@ def _split_params(line: str) -> tuple[str, list | None]:
     return sql.strip(), list(args)
 
 
+def _directive(path: str, name: str) -> str | None:
+    """The value of a corpus's `# <name>: <value>` line, if it has one."""
+    with open(path) as fh:
+        for ln in fh:
+            head, _, value = ln.strip().partition(f"{name}:")
+            if head.strip() == "#" and value.strip():
+                return value.strip()
+    return None
+
+
+def _reference_connection(corpus_path: str) -> psycopg.Connection:
+    """The reference server for a corpus.
+
+    A corpus that measures a feature newer than the default reference (14)
+    names the major it needs -- `# reference-version: 15` for MERGE -- and
+    runs against `SECANTUS_PG_ORACLE_DSN_<major>`, a cluster of that version.
+    The run refuses a reference of the wrong major rather than report its
+    `syntax error` as a divergence.
+    """
+    major = _directive(corpus_path, "reference-version")
+    if major is None:
+        dsn = os.environ.get("SECANTUS_PG_ORACLE_DSN", DEFAULT_DSN)
+    else:
+        dsn = os.environ.get(
+            f"SECANTUS_PG_ORACLE_DSN_{major}",
+            f"host=127.0.0.1 port=54{int(major):02d} dbname=postgres user=postgres",
+        )
+    ref = psycopg.connect(dsn, autocommit=True)
+    if major is not None:
+        got = ref.execute("SHOW server_version_num").fetchone()[0]
+        if int(got) // 10000 != int(major):
+            raise SystemExit(f"{corpus_path} needs a PostgreSQL {major} reference; {dsn} is {got}")
+    return ref
+
+
 def _reference_locale(path: str) -> str | None:
     """The locale a corpus's `# reference-locale: <name>` line asks for.
 
@@ -271,7 +306,7 @@ def main(setup_path: str, corpus_path: str, *, types: bool, tags: bool, server: 
         srv.start()
         host, port = srv.address
         sec = psycopg.connect(host=host, port=port, dbname="db", user="probe", autocommit=True)
-    ref = psycopg.connect(os.environ.get("SECANTUS_PG_ORACLE_DSN", DEFAULT_DSN), autocommit=True)
+    ref = _reference_connection(corpus_path)
     locale = _reference_locale(corpus_path)
     if locale:
         ref = _reference_in_locale(ref, locale)

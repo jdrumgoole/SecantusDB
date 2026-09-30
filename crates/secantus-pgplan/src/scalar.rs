@@ -151,6 +151,7 @@ const SCALAR_NAMES: &[&str] = &[
     "quote_literal",
     "quote_nullable",
     "normalize",
+    "is_normalized",
     "regexp_split_to_array",
     "unistr",
     "convert_from",
@@ -1121,6 +1122,14 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
                 }
             }))
         }
+        // `s IS [form] NORMALIZED`: whether `normalize(s, form)` is `s`.
+        "is_normalized" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(wrong_args(name));
+            }
+            let normal = eval("normalize", args)?;
+            Ok(Bson::Boolean(normal == Bson::String(s(0))))
+        }
         // `convert_from(bytea, encoding)` -- decode stored bytes as text.
         "convert_from" => {
             need(2)?;
@@ -1932,7 +1941,7 @@ pub fn static_result_type(name: &str) -> &'static str {
         "jsonb_path_exists"
         | "jsonb_path_match"
         | "jsonb_path_exists_tz"
-        | "jsonb_path_match_tz" => "bool",
+        | "jsonb_path_match_tz" | "is_normalized" => "bool",
         "jsonb_path_query_first"
         | "jsonb_path_query_array"
         | "jsonb_path_query_first_tz"

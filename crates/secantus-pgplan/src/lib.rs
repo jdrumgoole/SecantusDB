@@ -38,6 +38,7 @@ pub mod regobj;
 pub mod privileges;
 pub mod rls;
 mod rowsfrom;
+pub mod merge;
 pub use correlated::set_user_functions;
 pub use correlated::{
     with_correlated_runner, with_function_hook, with_sequence_hook, FnResult, UserFn,
@@ -660,6 +661,8 @@ pub enum Statement {
         mode: i32,
         nowait: bool,
     },
+    /// `MERGE INTO t USING s ON c WHEN ...` (see `merge`).
+    Merge(merge::Merge),
     /// `PREPARE name [(types)] AS query`: the query, planned again on each
     /// `EXECUTE` with the arguments as its parameters. `text` is the
     /// statement as `pg_prepared_statements` shows it.
@@ -2847,6 +2850,7 @@ fn plan_node(
         }
         N::ClosePortalStmt(c) => Ok(Statement::CloseCursor(c.portalname.clone())),
         // `DEALLOCATE ALL` carries no name; `DEALLOCATE x` names one.
+        N::MergeStmt(m) => merge::plan(&m, lookup, params),
         N::VacuumStmt(v) => {
             let command = if v.is_vacuumcmd { "VACUUM" } else { "ANALYZE" };
             let analyze = !v.is_vacuumcmd
@@ -23952,6 +23956,11 @@ pub fn lower_where(
     }
     match node.node.as_ref() {
         Some(N::AExpr(e)) => lower_aexpr(e, def, params),
+        // A bare boolean column -- `WHERE f`, `FILTER (WHERE f)`: TRUE rows
+        // only, a NULL being no more TRUE than FALSE is.
+        Some(N::ColumnRef(_)) if bool_column_field(node, def).is_some() => {
+            Ok(doc! { bool_column_field(node, def).expect("checked"): true })
+        }
         Some(N::NullTest(t)) => {
             let field = column_field(t.arg.as_deref(), def)?;
             // A SQL NULL is either an explicit null or an absent field here,
@@ -25626,12 +25635,25 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
 /// De Morgan is valid in SQL's three-valued (Kleene) logic, so `NOT (a AND b)`
 /// -> `NOT a OR NOT b` is sound, as is the double-negation collapse. Anything
 /// not handled here stays an honest 0A000 rather than an approximation.
+/// The field of a bare `boolean` column reference, or `None`.
+fn bool_column_field(node: &pg_query::protobuf::Node, def: &TableDef) -> Option<String> {
+    let Some(N::ColumnRef(c)) = node.node.as_ref() else {
+        return None;
+    };
+    let column = def.column(&column_ref_name(c)?)?;
+    (column.pg_type == "bool").then(|| column.field())
+}
+
 fn lower_negated(
     node: &pg_query::protobuf::Node,
     def: &TableDef,
     params: &[Bson],
 ) -> Result<Document> {
     match node.node.as_ref() {
+        // `NOT f`: FALSE rows only -- a NULL stays out, as it does in SQL.
+        Some(N::ColumnRef(_)) if bool_column_field(node, def).is_some() => {
+            Ok(doc! { bool_column_field(node, def).expect("checked"): false })
+        }
         Some(N::BoolExpr(b)) => match BoolExprType::try_from(b.boolop) {
             Ok(BoolExprType::AndExpr) => {
                 let arms = b
