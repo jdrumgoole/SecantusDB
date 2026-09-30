@@ -115,7 +115,9 @@ pub fn resolve(kind: &str, input: &str) -> Result<i64> {
             let name = unquote(input);
             NAMESPACES
                 .with(|t| t.borrow().iter().find(|(n, _)| *n == name).map(|(_, o)| *o))
-                .ok_or_else(|| Error::Sqlstate("3F000", format!("schema \"{name}\" does not exist")))
+                .ok_or_else(|| {
+                    Error::Sqlstate("3F000", format!("schema \"{name}\" does not exist"))
+                })
         }
         "regrole" => {
             let name = unquote(input);
@@ -174,7 +176,10 @@ pub fn resolve(kind: &str, input: &str) -> Result<i64> {
                         .iter()
                         .find(|(n, _, a)| {
                             *n == name
-                                && a.split(',').map(str::trim).filter(|x| !x.is_empty()).collect::<Vec<_>>()
+                                && a.split(',')
+                                    .map(str::trim)
+                                    .filter(|x| !x.is_empty())
+                                    .collect::<Vec<_>>()
                                     == wanted.iter().map(String::as_str).collect::<Vec<_>>()
                         })
                         .map(|(_, o, _)| *o)

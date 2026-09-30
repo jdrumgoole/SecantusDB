@@ -27,18 +27,18 @@ pub mod escape_strings;
 pub mod formatting;
 pub mod fts;
 pub mod geo;
+pub mod geom;
 pub mod geometry;
 pub mod hstore;
-pub mod joins;
-pub mod partitions;
 pub mod instead_of;
+pub mod joins;
+pub mod merge;
+pub mod partitions;
 pub mod pgcrypto;
-pub mod geom;
-pub mod regobj;
 pub mod privileges;
+pub mod regobj;
 pub mod rls;
 mod rowsfrom;
-pub mod merge;
 pub use correlated::set_user_functions;
 pub use correlated::{
     with_correlated_runner, with_function_hook, with_sequence_hook, FnResult, UserFn,
@@ -673,7 +673,10 @@ pub enum Statement {
         text: String,
     },
     /// `EXECUTE name [(args)]`, the arguments already evaluated.
-    SqlExecute { name: String, args: Vec<Bson> },
+    SqlExecute {
+        name: String,
+        args: Vec<Bson>,
+    },
     /// `NOTIFY channel [, payload]`: queued for the transaction, delivered
     /// to every backend LISTENing on the channel when it commits.
     Notify {
@@ -2878,12 +2881,14 @@ fn plan_node(
         N::VacuumStmt(v) => {
             let command = if v.is_vacuumcmd { "VACUUM" } else { "ANALYZE" };
             let analyze = !v.is_vacuumcmd
-                || v.options.iter().any(|o| {
-                    matches!(o.node.as_ref(), Some(N::DefElem(d)) if d.defname == "analyze")
-                });
+                || v.options.iter().any(
+                    |o| matches!(o.node.as_ref(), Some(N::DefElem(d)) if d.defname == "analyze"),
+                );
             let mut tables = Vec::new();
             for r in &v.rels {
-                let Some(N::VacuumRelation(vr)) = r.node.as_ref() else { continue };
+                let Some(N::VacuumRelation(vr)) = r.node.as_ref() else {
+                    continue;
+                };
                 let columns: Vec<String> = vr
                     .va_cols
                     .iter()
@@ -2897,7 +2902,11 @@ fn plan_node(
                         "ANALYZE option must be specified when a column list is provided".into(),
                     ));
                 }
-                let name = vr.relation.as_ref().map(|r| r.relname.clone()).unwrap_or_default();
+                let name = vr
+                    .relation
+                    .as_ref()
+                    .map(|r| r.relname.clone())
+                    .unwrap_or_default();
                 tables.push((name, columns));
             }
             Ok(Statement::Maintenance {
@@ -2915,7 +2924,11 @@ fn plan_node(
         }),
         N::ReindexStmt(r) => {
             use pg_query::protobuf::ReindexObjectType as R;
-            let rel = r.relation.as_ref().map(|r| r.relname.clone()).unwrap_or_default();
+            let rel = r
+                .relation
+                .as_ref()
+                .map(|r| r.relname.clone())
+                .unwrap_or_default();
             let (tables, indexes, whole) = match R::try_from(r.kind) {
                 Ok(R::ReindexObjectTable) => (vec![(rel, Vec::new())], Vec::new(), None),
                 Ok(R::ReindexObjectIndex) => (Vec::new(), vec![rel], None),
@@ -3356,7 +3369,10 @@ fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<St
                 "duplicate function body specified".into(),
             ));
         }
-        if !language.as_deref().is_none_or(|l| l.eq_ignore_ascii_case("sql")) {
+        if !language
+            .as_deref()
+            .is_none_or(|l| l.eq_ignore_ascii_case("sql"))
+        {
             return Err(Error::Sqlstate(
                 "42P13",
                 "inline SQL function body only valid for language SQL".into(),
@@ -3924,7 +3940,9 @@ fn plan_alter_action(
                 }
                 Ok(CT::ConstrForeign) => {
                     let cols = string_list(&k.fk_attrs);
-                    return Ok(AlterTableAction::AddForeignKey(foreign_key_of(k, table, cols)?));
+                    return Ok(AlterTableAction::AddForeignKey(foreign_key_of(
+                        k, table, cols,
+                    )?));
                 }
                 _ => {
                     return Err(Error::Unsupported(
@@ -4010,7 +4028,10 @@ fn alter_action_word(t: pg_query::protobuf::AlterTableType) -> &'static str {
 /// `<t>_pkey`, `<t>_<c>_fkey`, `<t>_<c>_check`).
 fn split_added_column_constraints(
     cmd: &pg_query::protobuf::AlterTableCmd,
-) -> (pg_query::protobuf::AlterTableCmd, Vec<pg_query::protobuf::AlterTableCmd>) {
+) -> (
+    pg_query::protobuf::AlterTableCmd,
+    Vec<pg_query::protobuf::AlterTableCmd>,
+) {
     use pg_query::protobuf::{AlterTableType as AT, ConstrType as CT};
     let mut main = cmd.clone();
     if AT::try_from(cmd.subtype) != Ok(AT::AtAddColumn) {
@@ -4021,11 +4042,15 @@ fn split_added_column_constraints(
     };
     let column = cd.colname.clone();
     let string = |v: &str| pg_query::protobuf::Node {
-        node: Some(N::String(pg_query::protobuf::String { sval: v.to_string() })),
+        node: Some(N::String(pg_query::protobuf::String {
+            sval: v.to_string(),
+        })),
     };
     let mut extra = Vec::new();
     cd.constraints.retain(|c| {
-        let Some(N::Constraint(k)) = c.node.as_ref() else { return true };
+        let Some(N::Constraint(k)) = c.node.as_ref() else {
+            return true;
+        };
         let mut k = (**k).clone();
         match CT::try_from(k.contype) {
             Ok(CT::ConstrUnique) | Ok(CT::ConstrPrimary) => k.keys = vec![string(&column)],
@@ -7793,7 +7818,9 @@ fn integer_series_rows(
         None => 1,
     };
     if step == 0 {
-        return Err(Error::InvalidParameter("step size cannot equal zero".into()));
+        return Err(Error::InvalidParameter(
+            "step size cannot equal zero".into(),
+        ));
     }
     let series = Series {
         start: int(&vals[0])?,
@@ -7804,7 +7831,13 @@ fn integer_series_rows(
     let rows = series
         .values()
         .into_iter()
-        .map(|v| vec![if wide { Bson::Int64(v) } else { Bson::Int32(v as i32) }])
+        .map(|v| {
+            vec![if wide {
+                Bson::Int64(v)
+            } else {
+                Bson::Int32(v as i32)
+            }]
+        })
         .collect();
     Ok(Some((vec![name.into()], vec![ty.into()], rows)))
 }
@@ -9867,9 +9900,10 @@ fn plan_aggregate_item(
         item.expr2 = expr2;
     }
     if matches!(func, AggFunc::RangeAgg | AggFunc::RangeIntersectAgg)
-        && !item.source_type.as_deref().is_some_and(|t| {
-            range::is_range_type(t) || range::is_multirange_type(t)
-        })
+        && !item
+            .source_type
+            .as_deref()
+            .is_some_and(|t| range::is_range_type(t) || range::is_multirange_type(t))
     {
         return Err(Error::UndefinedFunction(format!(
             "function {name}({}) does not exist",
@@ -10491,7 +10525,10 @@ fn materialize_dml_ctes(
         let Some(inner) = c.ctequery.as_deref().and_then(|q| q.node.clone()) else {
             continue;
         };
-        if !matches!(inner, N::InsertStmt(_) | N::UpdateStmt(_) | N::DeleteStmt(_)) {
+        if !matches!(
+            inner,
+            N::InsertStmt(_) | N::UpdateStmt(_) | N::DeleteStmt(_)
+        ) {
             continue;
         }
         let mut dml = pg_query::protobuf::Node { node: Some(inner) };
@@ -11519,11 +11556,17 @@ fn sql_json_absent(node: &pg_query::protobuf::Node, sql: &str, params: &[Bson]) 
             .collect::<Vec<_>>()
             .join(", ")
     };
-    fn raw(v: &Option<Box<pg_query::protobuf::JsonValueExpr>>) -> Option<&pg_query::protobuf::Node> {
+    fn raw(
+        v: &Option<Box<pg_query::protobuf::JsonValueExpr>>,
+    ) -> Option<&pg_query::protobuf::Node> {
         v.as_ref().and_then(|v| v.raw_expr.as_deref())
     }
     // A key/value pair is written `k : v` or `k VALUE v`; 15 stops at either.
-    let pair_token = if sql.to_ascii_uppercase().contains(" VALUE ") { "VALUE" } else { ":" };
+    let pair_token = if sql.to_ascii_uppercase().contains(" VALUE ") {
+        "VALUE"
+    } else {
+        ":"
+    };
     let absent = |name: &str, args: Vec<&pg_query::protobuf::Node>| {
         Some(Error::UndefinedFunction(format!(
             "function {name}({}) does not exist",
@@ -11560,7 +11603,8 @@ fn sql_json_absent(node: &pg_query::protobuf::Node, sql: &str, params: &[Bson]) 
                     Ok(pg_query::protobuf::JsonExprOp::JsonValueOp) => "json_value",
                     _ => "json_query",
                 };
-                let mut args: Vec<&pg_query::protobuf::Node> = raw(&f.context_item).into_iter().collect();
+                let mut args: Vec<&pg_query::protobuf::Node> =
+                    raw(&f.context_item).into_iter().collect();
                 args.extend(f.pathspec.as_deref());
                 absent(name, args)
             }
@@ -11825,7 +11869,15 @@ fn resolve_one_sublink(
                 Some(N::RowExpr(_))
             ) =>
         {
-            row_subquery_comparison(sl, kind == SubLinkType::AnySublink, rows, lookup, params, run, outer)
+            row_subquery_comparison(
+                sl,
+                kind == SubLinkType::AnySublink,
+                rows,
+                lookup,
+                params,
+                run,
+                outer,
+            )
         }
         Ok(kind @ (SubLinkType::AnySublink | SubLinkType::AllSublink)) => {
             let values: Vec<Bson> = rows.into_iter().map(first_column).collect();
@@ -11904,7 +11956,9 @@ fn row_subquery_comparison(
         })
         .unwrap_or_else(|| "=".to_string());
     if !matches!(op.as_str(), "=" | "<>") {
-        return Err(Error::Unsupported(format!("a row comparison with {op} and a subquery")));
+        return Err(Error::Unsupported(format!(
+            "a row comparison with {op} and a subquery"
+        )));
     }
     let width = row.args.len();
     if let Some(r) = rows.first() {
@@ -11916,14 +11970,15 @@ fn row_subquery_comparison(
             }));
         }
     }
-    let boolexpr = |op: BoolExprType, args: Vec<pg_query::protobuf::Node>| pg_query::protobuf::Node {
-        node: Some(N::BoolExpr(Box::new(pg_query::protobuf::BoolExpr {
-            boolop: op as i32,
-            args,
-            location: -1,
-            ..Default::default()
-        }))),
-    };
+    let boolexpr =
+        |op: BoolExprType, args: Vec<pg_query::protobuf::Node>| pg_query::protobuf::Node {
+            node: Some(N::BoolExpr(Box::new(pg_query::protobuf::BoolExpr {
+                boolop: op as i32,
+                args,
+                location: -1,
+                ..Default::default()
+            }))),
+        };
     let (inner, outer_op) = if any {
         (BoolExprType::AndExpr, BoolExprType::OrExpr)
     } else {
@@ -11956,9 +12011,9 @@ fn row_subquery_comparison(
             node: Some(N::AConst(pg_query::protobuf::AConst {
                 isnull: false,
                 location: -1,
-                val: Some(pg_query::protobuf::a_const::Val::Boolval(pg_query::protobuf::Boolean {
-                    boolval: !any,
-                })),
+                val: Some(pg_query::protobuf::a_const::Val::Boolval(
+                    pg_query::protobuf::Boolean { boolval: !any },
+                )),
             })),
         },
         1 => arms.into_iter().next().expect("one"),
@@ -16025,14 +16080,16 @@ pub(crate) fn inferred_type(v: &Bson) -> &'static str {
             Some(Bson::Binary(_)) => "bytea[]",
             Some(inner @ Bson::Array(_)) => inferred_type(inner),
             Some(other) if geo::is_box(other) => "box[]",
-            Some(other) if geom::is_geom(other) => match geom::from_bson(other).map(|g| g.type_name()) {
-                Some("point") => "point[]",
-                Some("lseg") => "lseg[]",
-                Some("line") => "line[]",
-                Some("path") => "path[]",
-                Some("polygon") => "polygon[]",
-                _ => "circle[]",
-            },
+            Some(other) if geom::is_geom(other) => {
+                match geom::from_bson(other).map(|g| g.type_name()) {
+                    Some("point") => "point[]",
+                    Some("lseg") => "lseg[]",
+                    Some("line") => "line[]",
+                    Some("path") => "path[]",
+                    Some("polygon") => "polygon[]",
+                    _ => "circle[]",
+                }
+            }
             _ => "text[]",
         },
         Bson::Boolean(_) => "bool",
@@ -16394,16 +16451,18 @@ fn values_as_subquery(s: &pg_query::protobuf::SelectStmt) -> pg_query::protobuf:
         }))),
     };
     let from = pg_query::protobuf::Node {
-        node: Some(N::RangeSubselect(Box::new(pg_query::protobuf::RangeSubselect {
-            lateral: false,
-            subquery: Some(Box::new(pg_query::protobuf::Node {
-                node: Some(N::SelectStmt(Box::new(rows))),
-            })),
-            alias: Some(pg_query::protobuf::Alias {
-                aliasname: "*VALUES*".into(),
-                colnames: (1..=width).map(|i| string(format!("column{i}"))).collect(),
-            }),
-        }))),
+        node: Some(N::RangeSubselect(Box::new(
+            pg_query::protobuf::RangeSubselect {
+                lateral: false,
+                subquery: Some(Box::new(pg_query::protobuf::Node {
+                    node: Some(N::SelectStmt(Box::new(rows))),
+                })),
+                alias: Some(pg_query::protobuf::Alias {
+                    aliasname: "*VALUES*".into(),
+                    colnames: (1..=width).map(|i| string(format!("column{i}"))).collect(),
+                }),
+            },
+        ))),
     };
     pg_query::protobuf::SelectStmt {
         target_list: vec![star],
@@ -20913,7 +20972,9 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
     if geom::TYPES.contains(&target) {
         return match &value {
             Bson::String(text) => geom::parse(target, text).map(|g| geom::to_bson(&g)),
-            other if geo::is_box(other) => geom::cast(&geom::from_bson(other).expect("box"), target),
+            other if geo::is_box(other) => {
+                geom::cast(&geom::from_bson(other).expect("box"), target)
+            }
             other => Err(Error::CannotCoerce(format!(
                 "cannot cast type {} to {}",
                 display_type(inferred_type(other)),
@@ -21938,17 +21999,27 @@ pub fn catalog_param_types_opt(
                         _ => None,
                     };
                     if let Some((c, p)) = pair {
-                        let i = usize::try_from(p.number).ok().and_then(|n| n.checked_sub(1));
+                        let i = usize::try_from(p.number)
+                            .ok()
+                            .and_then(|n| n.checked_sub(1));
                         if let Some(slot @ None) = i.and_then(|i| inferred.get_mut(i)) {
                             *slot = named_column_type(c);
                         }
                     }
                 }
                 pg_query::NodeRef::UpdateStmt(u) => {
-                    let table = u.relation.as_ref().map(|r| r.relname.clone()).unwrap_or_default();
+                    let table = u
+                        .relation
+                        .as_ref()
+                        .map(|r| r.relname.clone())
+                        .unwrap_or_default();
                     for t in &u.target_list {
-                        let Some(N::ResTarget(rt)) = t.node.as_ref() else { continue };
-                        let Some(i) = rt.val.as_deref().and_then(param_index) else { continue };
+                        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+                            continue;
+                        };
+                        let Some(i) = rt.val.as_deref().and_then(param_index) else {
+                            continue;
+                        };
                         if let Some(slot @ None) = inferred.get_mut(i) {
                             *slot = column_type(&table, ColumnRef::Name(&rt.name));
                         }
@@ -22552,7 +22623,10 @@ fn overload_name(f: &pg_query::protobuf::FuncCall, name: String) -> String {
     }
     if name == "length"
         && f.args.len() == 1
-        && matches!(static_type(&f.args[0], &Bson::Null).as_str(), "lseg" | "path")
+        && matches!(
+            static_type(&f.args[0], &Bson::Null).as_str(),
+            "lseg" | "path"
+        )
     {
         return "geom_length".to_string();
     }
@@ -24287,7 +24361,10 @@ fn apply_subscript_assign(a: &SubscriptAssign, row: &Document, current: Bson) ->
         items[slot] = place(&items[slot].clone(), rest, value);
         Bson::Array(items)
     }
-    Ok(arrays::bounded(place(&Bson::Array(items), &path, value), &lower))
+    Ok(arrays::bounded(
+        place(&Bson::Array(items), &path, value),
+        &lower,
+    ))
 }
 
 /// Whether `node` reads a column anywhere beneath it.
@@ -25712,7 +25789,8 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             );
             if ls.is_some() || rs.is_some() {
                 let name = |n: &pg_query::protobuf::Node, v: &Bson, b: &Option<String>| {
-                    b.clone().unwrap_or_else(|| display_type(&static_type(n, v)))
+                    b.clone()
+                        .unwrap_or_else(|| display_type(&static_type(n, v)))
                 };
                 return Err(Error::UndefinedFunction(format!(
                     "operator does not exist: {} {op} {}",

@@ -319,15 +319,18 @@ pub fn range_intersect_agg(values: &[Bson], ty: &str) -> Result<Bson> {
     if range::is_range_type(ty) {
         let mut acc = range::from_text(&crate::render_value_text(first), ty)?;
         for v in rest {
-            acc = intersect(&acc, &range::from_text(&crate::render_value_text(v), ty)?, ty)?;
+            acc = intersect(
+                &acc,
+                &range::from_text(&crate::render_value_text(v), ty)?,
+                ty,
+            )?;
         }
         return Ok(Bson::String(range::render(&acc)));
     }
     let mut acc = first.clone();
     for v in rest {
-        acc = binary("*", &acc, v, ty, ty).unwrap_or_else(|| {
-            Err(Error::Unsupported(format!("range_intersect_agg over {ty}")))
-        })?;
+        acc = binary("*", &acc, v, ty, ty)
+            .unwrap_or_else(|| Err(Error::Unsupported(format!("range_intersect_agg over {ty}"))))?;
     }
     Ok(acc)
 }

@@ -208,7 +208,7 @@ pub fn call(name: &str, args: &[Bson]) -> Option<Result<Bson>> {
     if !is_function(name) {
         return None;
     }
-    if args.iter().any(|a| *a == Bson::Null) {
+    if args.contains(&Bson::Null) {
         return Some(Ok(Bson::Null));
     }
     let text = |i: usize| args.get(i).map(value_text).unwrap_or_default();
@@ -228,10 +228,7 @@ pub fn call(name: &str, args: &[Bson]) -> Option<Result<Bson>> {
                 Ok(bytea(random(n as usize)?))
             }
             ("gen_salt", 1) => Ok(Bson::String(gen_salt(&text(0), None)?)),
-            ("gen_salt", 2) => Ok(Bson::String(gen_salt(
-                &text(0),
-                Some(int_of(&args[1])?),
-            )?)),
+            ("gen_salt", 2) => Ok(Bson::String(gen_salt(&text(0), Some(int_of(&args[1])?))?)),
             ("crypt", 2) => Ok(Bson::String(crypt(&text(0), &text(1))?)),
             _ => Err(Error::UndefinedFunction(format!(
                 "function {name} does not exist"

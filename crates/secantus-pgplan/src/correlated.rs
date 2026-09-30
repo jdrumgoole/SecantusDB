@@ -703,7 +703,7 @@ pub(crate) fn user_function_for(name: &str, args: &[pg_query::protobuf::Node]) -
         .into_iter()
         .filter_map(|u| score(&u).map(|s| (s, u)))
         .collect();
-    best.sort_by(|a, b| b.0.cmp(&a.0));
+    best.sort_by_key(|b| std::cmp::Reverse(b.0));
     match best.as_slice() {
         [(s1, _), (s2, _), ..] if s1 == s2 => None,
         [(_, u), ..] => Some(u.clone()),

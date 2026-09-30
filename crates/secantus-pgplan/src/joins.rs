@@ -1181,23 +1181,31 @@ pub(crate) fn select_list_srf(
             ..Default::default()
         };
         out.from_clause.push(pg_query::protobuf::Node {
-            node: Some(N::RangeSubselect(Box::new(pg_query::protobuf::RangeSubselect {
-                lateral: false,
-                subquery: Some(Box::new(pg_query::protobuf::Node {
-                    node: Some(N::SelectStmt(Box::new(one))),
-                })),
-                alias: Some(pg_query::protobuf::Alias {
-                    aliasname: "__one".into(),
-                    colnames: Vec::new(),
-                }),
-            }))),
+            node: Some(N::RangeSubselect(Box::new(
+                pg_query::protobuf::RangeSubselect {
+                    lateral: false,
+                    subquery: Some(Box::new(pg_query::protobuf::Node {
+                        node: Some(N::SelectStmt(Box::new(one))),
+                    })),
+                    alias: Some(pg_query::protobuf::Alias {
+                        aliasname: "__one".into(),
+                        colnames: Vec::new(),
+                    }),
+                },
+            ))),
         });
     }
     // One function's column is `__srf0.__srf0`, as before; several run in
     // LOCKSTEP -- the longest decides the row count, the others pad with
     // NULL -- which is `ROWS FROM (f, g)`, one column each.
     let several = positions.len() > 1;
-    let column_name = |k: usize| if several { format!("c{k}") } else { "__srf0".to_string() };
+    let column_name = |k: usize| {
+        if several {
+            format!("c{k}")
+        } else {
+            "__srf0".to_string()
+        }
+    };
     let mut calls = Vec::new();
     for (k, i) in positions.iter().enumerate() {
         let Some(N::ResTarget(rt)) = out.target_list[*i].node.as_mut() else {
@@ -1258,7 +1266,9 @@ pub(crate) fn select_list_srf(
             .collect(),
         alias: Some(pg_query::protobuf::Alias {
             aliasname: "__srf0".into(),
-            colnames: (0..positions.len()).map(|k| string_node(&column_name(k))).collect(),
+            colnames: (0..positions.len())
+                .map(|k| string_node(&column_name(k)))
+                .collect(),
         }),
         ..Default::default()
     };

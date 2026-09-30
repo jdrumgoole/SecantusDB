@@ -22,11 +22,15 @@ pub fn sql_relations(sql: &str) -> Vec<(String, &'static str)> {
     };
     let mut out = Vec::new();
     for raw in &parsed.protobuf.stmts {
-        let Some(stmt) = raw.stmt.as_ref() else { continue };
+        let Some(stmt) = raw.stmt.as_ref() else {
+            continue;
+        };
         let mut ctes: Vec<String> = Vec::new();
         let mut targets: Vec<(String, &'static str)> = Vec::new();
         match stmt.node.as_ref() {
-            Some(N::ViewStmt(_)) | Some(N::CreateFunctionStmt(_)) | Some(N::RuleStmt(_)) => continue,
+            Some(N::ViewStmt(_)) | Some(N::CreateFunctionStmt(_)) | Some(N::RuleStmt(_)) => {
+                continue
+            }
             Some(N::InsertStmt(i)) => {
                 if let Some(r) = &i.relation {
                     targets.push((r.relname.clone(), "INSERT"));
@@ -66,7 +70,10 @@ pub fn sql_relations(sql: &str) -> Vec<(String, &'static str)> {
             }
             Some(N::CopyStmt(c)) => {
                 if let Some(r) = &c.relation {
-                    targets.push((r.relname.clone(), if c.is_from { "INSERT" } else { "SELECT" }));
+                    targets.push((
+                        r.relname.clone(),
+                        if c.is_from { "INSERT" } else { "SELECT" },
+                    ));
                 }
             }
             _ => {}
@@ -74,7 +81,9 @@ pub fn sql_relations(sql: &str) -> Vec<(String, &'static str)> {
         for (t, p) in targets {
             push(&mut out, &t, p);
         }
-        let Some(inner) = stmt.node.as_ref() else { continue };
+        let Some(inner) = stmt.node.as_ref() else {
+            continue;
+        };
         let nodes = inner.nodes();
         for (node, _, _, _) in &nodes {
             if let pg_query::NodeRef::CommonTableExpr(c) = node {

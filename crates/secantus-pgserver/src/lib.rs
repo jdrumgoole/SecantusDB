@@ -10,16 +10,16 @@
 //! including the shared on-disk catalog format. Breadth is P5's problem.
 
 mod advisory;
-mod table_locks;
-mod merge;
 mod aggregates;
 mod do_block;
 mod encoding;
 mod explain;
+mod merge;
 mod partition;
 mod plpgsql_do;
 mod plpgsql_fn;
 mod server;
+mod table_locks;
 mod triggers;
 
 pub use server::{bind, RunningPgServer};
@@ -96,6 +96,13 @@ pub struct BackendEntry {
     /// one: a cancellation point past it answers 57014.
     deadline: Mutex<Option<std::time::Instant>>,
 }
+
+/// A statement's OLD and NEW transition rows, for a trigger's REFERENCING
+/// tables.
+type TransitionRows = (Vec<Document>, Vec<Document>);
+
+/// A result's columns as `(name, type)`.
+type ColumnTypes = Vec<(String, String)>;
 
 /// One index relation as `pg_index` / `pg_class` report it.
 struct IndexRelation {
@@ -532,9 +539,7 @@ impl PlHost<'_> {
         let tz = self.h.session_timezone();
         // A function body runs with the caller's privileges (SECURITY
         // INVOKER, the default), checked like any statement of theirs.
-        self.h
-            .check_sql_privileges(sql)
-            .map_err(|e| pl_error(&e))?;
+        self.h.check_sql_privileges(sql).map_err(|e| pl_error(&e))?;
         let run = |stmt: &Statement| self.h.subquery_rows(stmt);
         let declared: Vec<Option<String>> = types.iter().map(|t| Some(t.clone())).collect();
         secantus_pgplan::planning_to_execute(|| {
@@ -624,7 +629,10 @@ impl plpgsql_fn::Host for PlHost<'_> {
         types: &[String],
     ) -> Result<plpgsql_fn::QueryOut, plpgsql_fn::PlError> {
         let stmt = self.plan(sql, params, types)?;
-        let (columns, rows) = self.h.dml_returning_values(stmt).map_err(|e| pl_error(&e))?;
+        let (columns, rows) = self
+            .h
+            .dml_returning_values(stmt)
+            .map_err(|e| pl_error(&e))?;
         Ok(plpgsql_fn::QueryOut { columns, rows })
     }
 
@@ -1198,9 +1206,8 @@ impl PgHandler {
             .any(|g| {
                 let grantee = g.get_str("grantee").unwrap_or_default();
                 (grantee.eq_ignore_ascii_case("PUBLIC") || member_of(grantee))
-                    && g.get_array("privileges").is_ok_and(|ps| {
-                        ps.iter().any(|p| p.as_str() == Some(privilege))
-                    })
+                    && g.get_array("privileges")
+                        .is_ok_and(|ps| ps.iter().any(|p| p.as_str() == Some(privilege)))
             });
         if granted {
             return Ok(());
@@ -1217,15 +1224,15 @@ impl PgHandler {
     /// BYPASSRLS role and -- unless FORCE -- the owner are not restricted.
     fn rls_tables(&self) -> Vec<secantus_pgplan::rls::RlsTable> {
         let role = self.current_role_name();
-        if self.is_superuser(&role)
-            || self.role(&role).ok().flatten().is_some_and(|r| r.bypassrls)
+        if self.is_superuser(&role) || self.role(&role).ok().flatten().is_some_and(|r| r.bypassrls)
         {
             return Vec::new();
         }
-        let Ok(enabled) = self
-            .storage
-            .find_matching(self.db(), Self::RLS_COLLECTION, &bson::doc! {"enabled": true})
-        else {
+        let Ok(enabled) = self.storage.find_matching(
+            self.db(),
+            Self::RLS_COLLECTION,
+            &bson::doc! {"enabled": true},
+        ) else {
             return Vec::new();
         };
         let policies = self.policy_docs();
@@ -1244,7 +1251,9 @@ impl PgHandler {
         for doc in enabled.iter().filter_map(|b| decode_doc(b).ok()) {
             let table = doc.get_str("_id").unwrap_or_default().to_string();
             let forced = doc.get_bool("forced").unwrap_or(false);
-            let Some(def) = self.lookup(&table) else { continue };
+            let Some(def) = self.lookup(&table) else {
+                continue;
+            };
             if !forced && member_of(&self.table_owner(&def)) {
                 continue;
             }
@@ -1253,9 +1262,8 @@ impl PgHandler {
                 .iter()
                 .filter(|p| p.get_str("table") == Ok(table.as_str()))
                 .filter(|p| {
-                    p.get_array("roles").is_ok_and(|rs| {
-                        rs.iter().any(|r| r.as_str().is_some_and(|r| member_of(r)))
-                    })
+                    p.get_array("roles")
+                        .is_ok_and(|rs| rs.iter().any(|r| r.as_str().is_some_and(&member_of)))
                 })
                 .collect();
             let combine = |command: &str, key: &str, fallback_using: bool| -> String {
@@ -1480,7 +1488,7 @@ pub struct PgHandler {
     deferred_triggers: Mutex<Vec<triggers::DeferredTrigger>>,
     /// The rows the statement in flight wrote to each table, `(new, old)`,
     /// for its triggers' `REFERENCING` transition tables.
-    transition_rows: Mutex<HashMap<String, (Vec<Document>, Vec<Document>)>>,
+    transition_rows: Mutex<HashMap<String, TransitionRows>>,
     /// `SET CONSTRAINTS` for the open transaction: ALL's mode, then each
     /// named constraint's (`true` = deferred).
     constraint_modes: Mutex<(Option<bool>, HashMap<String, bool>)>,
@@ -1976,8 +1984,11 @@ impl PgHandler {
                 .unwrap_or_default()
                 .iter()
                 .map(|f| {
-                    let args: Vec<String> =
-                        f.param_types.iter().map(|t| self.display_type_name(t)).collect();
+                    let args: Vec<String> = f
+                        .param_types
+                        .iter()
+                        .map(|t| self.display_type_name(t))
+                        .collect();
                     (
                         f.name.clone(),
                         Self::index_oid(&format!("fn:{}", f.key)),
@@ -1995,7 +2006,11 @@ impl PgHandler {
                 .flat_map(|d| {
                     let view = d.get_str("table").unwrap_or_default().to_string();
                     d.get_array("events")
-                        .map(|a| a.iter().filter_map(|e| e.as_str().map(str::to_string)).collect::<Vec<_>>())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|e| e.as_str().map(str::to_string))
+                                .collect::<Vec<_>>()
+                        })
                         .unwrap_or_default()
                         .into_iter()
                         .map(move |e| (view.clone(), e))
@@ -2914,7 +2929,7 @@ impl PgHandler {
     pub(crate) fn dml_returning_values(
         &self,
         stmt: Statement,
-    ) -> PgWireResult<(Vec<(String, String)>, Vec<Vec<Bson>>)> {
+    ) -> PgWireResult<(ColumnTypes, Vec<Vec<Bson>>)> {
         let previous = self
             .cursor_capture
             .lock()
@@ -2923,7 +2938,10 @@ impl PgHandler {
         let responses = self.execute_statement(stmt, 0);
         let restore = |this: &Self| {
             std::mem::replace(
-                &mut *this.cursor_capture.lock().unwrap_or_else(|e| e.into_inner()),
+                &mut *this
+                    .cursor_capture
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
                 previous.clone(),
             )
         };
@@ -2941,9 +2959,10 @@ impl PgHandler {
                     .row_schema
                     .iter()
                     .map(|f| {
-                        let ty = secantus_pgplan::pgtypes::name_of_oid(i64::from(f.datatype().oid()))
-                            .unwrap_or("text")
-                            .to_string();
+                        let ty =
+                            secantus_pgplan::pgtypes::name_of_oid(i64::from(f.datatype().oid()))
+                                .unwrap_or("text")
+                                .to_string();
                         (f.name().to_string(), ty)
                     })
                     .collect();
@@ -2981,10 +3000,13 @@ impl PgHandler {
             let run = || self.dml_returning_values(stmt.clone());
             let out = match self.txn.try_lock() {
                 Ok(mut guard) => match guard.as_mut() {
-                    Some(handle) => self
-                        .storage
-                        .with_user_transaction(handle, run)
-                        .map_err(|e| PlanError::Internal(format!("could not run a WITH item: {e}")))?,
+                    Some(handle) => {
+                        self.storage
+                            .with_user_transaction(handle, run)
+                            .map_err(|e| {
+                                PlanError::Internal(format!("could not run a WITH item: {e}"))
+                            })?
+                    }
                     None => {
                         drop(guard);
                         run()
@@ -4898,7 +4920,11 @@ impl PgHandler {
                 } else {
                     push(format!(
                         "UNIQUE {}({}){}",
-                        if u.nulls_not_distinct { "NULLS NOT DISTINCT " } else { "" },
+                        if u.nulls_not_distinct {
+                            "NULLS NOT DISTINCT "
+                        } else {
+                            ""
+                        },
                         u.columns.join(", "),
                         deferral(u.deferrable, u.initially_deferred)
                     ));
@@ -5073,7 +5099,10 @@ impl PgHandler {
         if !(text.contains("duplicate key") || text.contains("E11000")) {
             return e;
         }
-        Self::user_error("23505", format!("could not create unique index \"{index}\""))
+        Self::user_error(
+            "23505",
+            format!("could not create unique index \"{index}\""),
+        )
     }
 
     /// Insert `docs` into `coll`, failing on the first write error. The
@@ -5126,7 +5155,9 @@ impl PgHandler {
     /// CLUSTER: 42704 when the table has no such index, 0A000 for an
     /// expression key, which has no stored field to sort on.
     fn cluster_keys(&self, table: &str, index: &str) -> PgWireResult<Vec<(String, bool)>> {
-        let def = self.lookup(table).ok_or_else(|| Self::relation_missing(table))?;
+        let def = self
+            .lookup(table)
+            .ok_or_else(|| Self::relation_missing(table))?;
         let missing = || {
             Self::user_error(
                 "42704",
@@ -5178,7 +5209,9 @@ impl PgHandler {
     /// (ascending NULLs last, descending NULLs first, as the index sorts),
     /// and the index recorded as the table's clustered one.
     fn cluster_table(&self, table: &str, index: &str) -> PgWireResult<()> {
-        let def = self.lookup(table).ok_or_else(|| Self::relation_missing(table))?;
+        let def = self
+            .lookup(table)
+            .ok_or_else(|| Self::relation_missing(table))?;
         if partition::is_partitioned(&def) {
             return Err(Self::user_error(
                 "0A000",
@@ -5198,8 +5231,9 @@ impl PgHandler {
                     // NULLs sort last ascending, so first descending.
                     (true, false) => std::cmp::Ordering::Greater,
                     (false, true) => std::cmp::Ordering::Less,
-                    (false, false) => secantus_pgplan::compare_values(&x, &y)
-                        .unwrap_or(std::cmp::Ordering::Equal),
+                    (false, false) => {
+                        secantus_pgplan::compare_values(&x, &y).unwrap_or(std::cmp::Ordering::Equal)
+                    }
                 };
                 let ord = if *desc { ord.reverse() } else { ord };
                 if ord != std::cmp::Ordering::Equal {
@@ -5880,7 +5914,11 @@ impl PgHandler {
         }
         let bytes =
             encode_doc(&doc).map_err(|e| Self::storage_err("could not encode the view", e))?;
-        self.insert_checked(Self::VIEW_COLLECTION, vec![bytes], "could not record the view")?;
+        self.insert_checked(
+            Self::VIEW_COLLECTION,
+            vec![bytes],
+            "could not record the view",
+        )?;
         self.note_uncommitted_type(Self::VIEW_COLLECTION, &name, Some(doc));
         Ok(vec![Response::Execution(Tag::new("CREATE VIEW"))])
     }
@@ -6332,7 +6370,11 @@ impl PgHandler {
             if oid == 10 {
                 return Some(session.clone());
             }
-            self.roles().ok()?.into_iter().find(|r| r.oid == oid).map(|r| r.name)
+            self.roles()
+                .ok()?
+                .into_iter()
+                .find(|r| r.oid == oid)
+                .map(|r| r.name)
         };
         let found = match v {
             Bson::Int32(o) => by_oid(i64::from(*o)),
@@ -6365,17 +6407,33 @@ impl PgHandler {
                 self.role_by_name_or_oid(role)?,
                 p,
             ),
-            _ => return Err(Self::user_error("42883", "function pg_has_role does not exist".into())),
+            _ => {
+                return Err(Self::user_error(
+                    "42883",
+                    "function pg_has_role does not exist".into(),
+                ))
+            }
         };
         let privileges: Vec<String> = secantus_pgplan::value_text(privilege)
             .split(',')
             .map(|p| p.trim().to_ascii_uppercase())
             .collect();
         for p in &privileges {
-            if !matches!(p.as_str(), "MEMBER" | "USAGE" | "MEMBER WITH ADMIN OPTION" | "USAGE WITH ADMIN OPTION" | "MEMBER WITH GRANT OPTION" | "USAGE WITH GRANT OPTION") {
+            if !matches!(
+                p.as_str(),
+                "MEMBER"
+                    | "USAGE"
+                    | "MEMBER WITH ADMIN OPTION"
+                    | "USAGE WITH ADMIN OPTION"
+                    | "MEMBER WITH GRANT OPTION"
+                    | "USAGE WITH GRANT OPTION"
+            ) {
                 return Err(Self::user_error(
                     "22023",
-                    format!("unrecognized privilege type: \"{}\"", p.to_ascii_lowercase()),
+                    format!(
+                        "unrecognized privilege type: \"{}\"",
+                        p.to_ascii_lowercase()
+                    ),
                 ));
             }
         }
@@ -7368,7 +7426,11 @@ impl PgHandler {
         let doc = bson::doc! {"_id": key, "next": oid + 1};
         let bytes = encode_doc(&doc)
             .map_err(|e| Self::storage_err("could not encode the oid counter", e))?;
-        self.insert_checked(Self::ENUM_META_COLLECTION, vec![bytes], "could not advance the oid counter")?;
+        self.insert_checked(
+            Self::ENUM_META_COLLECTION,
+            vec![bytes],
+            "could not advance the oid counter",
+        )?;
         Ok(oid)
     }
 
@@ -7466,7 +7528,11 @@ impl PgHandler {
         let doc = bson::doc! {"_id": "oid_counter", "next": oid + 1};
         let bytes = encode_doc(&doc)
             .map_err(|e| Self::storage_err("could not encode the oid counter", e))?;
-        self.insert_checked(Self::ENUM_META_COLLECTION, vec![bytes], "could not advance the oid counter")?;
+        self.insert_checked(
+            Self::ENUM_META_COLLECTION,
+            vec![bytes],
+            "could not advance the oid counter",
+        )?;
         Ok(oid)
     }
 
@@ -8424,10 +8490,20 @@ impl PgHandler {
                     let constraint = t.get_bool("constraint").unwrap_or(false);
                     d.insert(
                         f("tgconstraint"),
-                        Bson::Int64(if constraint { Self::index_oid(&format!("trg:{key}", key = t.get_str("_id").unwrap_or_default())) } else { 0 }),
+                        Bson::Int64(if constraint {
+                            Self::index_oid(&format!(
+                                "trg:{key}",
+                                key = t.get_str("_id").unwrap_or_default()
+                            ))
+                        } else {
+                            0
+                        }),
                     );
                     d.insert(f("tgdeferrable"), t.get_bool("deferrable").unwrap_or(false));
-                    d.insert(f("tginitdeferred"), t.get_bool("initially_deferred").unwrap_or(false));
+                    d.insert(
+                        f("tginitdeferred"),
+                        t.get_bool("initially_deferred").unwrap_or(false),
+                    );
                     d.insert(f("tgnargs"), Bson::Int32(nargs as i32));
                     rows.push(d);
                 }
@@ -8486,7 +8562,11 @@ impl PgHandler {
                                 u.name,
                                 t.name,
                                 u.columns.join(", "),
-                                if u.nulls_not_distinct { " NULLS NOT DISTINCT" } else { "" }
+                                if u.nulls_not_distinct {
+                                    " NULLS NOT DISTINCT"
+                                } else {
+                                    ""
+                                }
                             ),
                         );
                         rows.push(d);
@@ -8783,16 +8863,21 @@ impl PgHandler {
             }
             "pg_language" => {
                 let f = |name: &str| def.field_of(name).expect("column");
-                [(12i64, "internal", false), (13, "c", false), (14, "sql", true), (14078, "plpgsql", true)]
-                    .iter()
-                    .map(|(oid, name, trusted)| {
-                        let mut d = Document::new();
-                        d.insert(f("oid"), Bson::Int64(*oid));
-                        d.insert(f("lanname"), *name);
-                        d.insert(f("lanpltrusted"), *trusted);
-                        d
-                    })
-                    .collect()
+                [
+                    (12i64, "internal", false),
+                    (13, "c", false),
+                    (14, "sql", true),
+                    (14078, "plpgsql", true),
+                ]
+                .iter()
+                .map(|(oid, name, trusted)| {
+                    let mut d = Document::new();
+                    d.insert(f("oid"), Bson::Int64(*oid));
+                    d.insert(f("lanname"), *name);
+                    d.insert(f("lanpltrusted"), *trusted);
+                    d
+                })
+                .collect()
             }
             "pg_proc" => {
                 let f = |name: &str| def.field_of(name).expect("column");
@@ -8807,7 +8892,11 @@ impl PgHandler {
                     .map(|d| {
                         let strings = |key: &str| -> Vec<String> {
                             d.get_array(key)
-                                .map(|a| a.iter().map(|v| v.as_str().unwrap_or_default().to_string()).collect())
+                                .map(|a| {
+                                    a.iter()
+                                        .map(|v| v.as_str().unwrap_or_default().to_string())
+                                        .collect()
+                                })
                                 .unwrap_or_default()
                         };
                         let types = strings("param_types");
@@ -8833,10 +8922,7 @@ impl PgHandler {
                         row.insert(f("prokind"), "f");
                         row.insert(f("prosecdef"), false);
                         row.insert(f("proisstrict"), false);
-                        row.insert(
-                            f("proretset"),
-                            d.get_bool("returns_set").unwrap_or(false),
-                        );
+                        row.insert(f("proretset"), d.get_bool("returns_set").unwrap_or(false));
                         row.insert(
                             f("provolatile"),
                             match d.get_str("volatility").unwrap_or("volatile") {
@@ -10893,7 +10979,11 @@ impl PgHandler {
     {
         use pgwire::messages::startup::Authentication;
         // An md5 challenge's answer: `md5` + md5(stored hash + salt).
-        let md5 = self.md5_auth.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let md5 = self
+            .md5_auth
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         if let Some((user, stored, salt)) = md5 {
             let answer = message.into_password()?.password;
             let mut input = stored.as_bytes()[3..].to_vec();
@@ -11905,7 +11995,11 @@ impl PgHandler {
                     ))));
                 }
                 // A CHECK added NOT VALID is checked against the rows now.
-                if def.check_constraints.iter().any(|c| c.name == *name && c.not_valid) {
+                if def
+                    .check_constraints
+                    .iter()
+                    .any(|c| c.name == *name && c.not_valid)
+                {
                     return Ok(Some(action.clone()));
                 }
                 return Ok(None);
@@ -12020,7 +12114,13 @@ impl PgHandler {
             }
             A::OwnerTo(_) | A::ClusterOn(_) => Ok(()),
             A::AddUnique(uq) => {
-                self.check_existing_unique(table, def, &uq.name, &uq.columns, uq.nulls_not_distinct)?;
+                self.check_existing_unique(
+                    table,
+                    def,
+                    &uq.name,
+                    &uq.columns,
+                    uq.nulls_not_distinct,
+                )?;
                 Self::create_unique_index(&self.storage, self.db(), def, uq)
             }
             A::AddPrimaryKey { name, columns } => {
@@ -12212,7 +12312,14 @@ impl PgHandler {
     fn replace_table_rows(&self, table: &str, rows: Vec<Vec<u8>>) -> PgWireResult<()> {
         let run = || -> PgWireResult<()> {
             self.storage
-                .delete_matching(self.db(), table, &Document::new(), 0, &Document::new(), None)
+                .delete_matching(
+                    self.db(),
+                    table,
+                    &Document::new(),
+                    0,
+                    &Document::new(),
+                    None,
+                )
                 .map_err(|e| Self::storage_err("could not clear the table", e))?;
             if !rows.is_empty() {
                 self.insert_checked(table, rows.clone(), "could not rewrite the table")?;
@@ -12281,7 +12388,10 @@ impl PgHandler {
             })
             .collect();
         for (col, field) in &old {
-            if docs.iter().any(|d| d.get(field).is_none_or(|v| *v == Bson::Null)) {
+            if docs
+                .iter()
+                .any(|d| d.get(field).is_none_or(|v| *v == Bson::Null))
+            {
                 return Err(Self::user_error(
                     "23502",
                     format!("column \"{col}\" of relation \"{table}\" contains null values"),
@@ -12302,7 +12412,14 @@ impl PgHandler {
                     single = v;
                 }
             }
-            d.insert("_id", if composite { Bson::Document(key) } else { single });
+            d.insert(
+                "_id",
+                if composite {
+                    Bson::Document(key)
+                } else {
+                    single
+                },
+            );
             out.push(encode_doc(&d).map_err(|e| Self::storage_err("could not encode a row", e))?);
         }
         self.replace_table_rows(table, out)
@@ -12310,14 +12427,27 @@ impl PgHandler {
         // Indexes over a key column now read the column at its new field.
         let moved: Vec<(String, String)> = old
             .iter()
-            .map(|(col, field)| (field.clone(), def.field_of(col).unwrap_or_else(|| col.clone())))
+            .map(|(col, field)| {
+                (
+                    field.clone(),
+                    def.field_of(col).unwrap_or_else(|| col.clone()),
+                )
+            })
             .collect();
-        for ix in self.storage.list_indexes(self.db(), table).unwrap_or_default() {
-            let Ok(ix_name) = ix.get_str("name") else { continue };
+        for ix in self
+            .storage
+            .list_indexes(self.db(), table)
+            .unwrap_or_default()
+        {
+            let Ok(ix_name) = ix.get_str("name") else {
+                continue;
+            };
             if ix_name == "_id_" {
                 continue;
             }
-            let Ok(key) = ix.get_document("key") else { continue };
+            let Ok(key) = ix.get_document("key") else {
+                continue;
+            };
             if !key.keys().any(|k| moved.iter().any(|(from, _)| from == k)) {
                 continue;
             }
@@ -12372,7 +12502,11 @@ impl PgHandler {
         self.delete_catalog(name)?;
         let bytes = encode_doc(&def.to_document())
             .map_err(|e| Self::storage_err("could not encode the catalog entry", e))?;
-        self.insert_checked(CATALOG_COLLECTION, vec![bytes], "could not record the table")?;
+        self.insert_checked(
+            CATALOG_COLLECTION,
+            vec![bytes],
+            "could not record the table",
+        )?;
         self.note_uncommitted(name, Some(def.clone()));
         Ok(())
     }
@@ -13690,7 +13824,10 @@ impl PgHandler {
     fn row_write(stmt: &Statement) -> bool {
         matches!(
             stmt,
-            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) | Statement::Merge(_)
+            Statement::Insert(_)
+                | Statement::Update(_)
+                | Statement::Delete(_)
+                | Statement::Merge(_)
         )
     }
 
@@ -13739,7 +13876,11 @@ impl PgHandler {
         )
     }
 
-    fn run_autocommit_write(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response>> {
+    fn run_autocommit_write(
+        &self,
+        stmt: Statement,
+        max_rows: usize,
+    ) -> PgWireResult<Vec<Response>> {
         let read_committed = self.read_committed_default();
         let mut poll = self.lock_wait_poll();
         let mut delay = std::time::Duration::from_millis(2);
@@ -13761,9 +13902,12 @@ impl PgHandler {
                 Err(e) => {
                     // A handle that committed has nothing to roll back; one
                     // that failed is rolled back before anything else.
-                    let _ = self.storage.rollback_user_transaction(&mut handle).map_err(|re| {
-                        eprintln!("secantusd-pg: rolling back a failed statement: {re}")
-                    });
+                    let _ = self
+                        .storage
+                        .rollback_user_transaction(&mut handle)
+                        .map_err(|re| {
+                            eprintln!("secantusd-pg: rolling back a failed statement: {re}")
+                        });
                     if !(read_committed && Self::is_write_conflict(&e)) {
                         return Err(e);
                     }
@@ -15135,7 +15279,7 @@ impl PgHandler {
     pub(crate) fn internal_query(
         &self,
         sql: &str,
-    ) -> PgWireResult<(Vec<(String, String)>, Vec<Vec<Option<Bson>>>)> {
+    ) -> PgWireResult<(ColumnTypes, Vec<Vec<Option<Bson>>>)> {
         let stmt = self.plan_internal(sql)?;
         let fields = self.copy_query_fields(&stmt)?;
         let rows = self.with_executor_hooks(|| self.query_rows(&stmt))?;
@@ -16474,7 +16618,11 @@ impl PgHandler {
                 Self::create_unique_indexes(&self.storage, self.db(), &def)?;
                 let bytes = encode_doc(&def.to_document())
                     .map_err(|e| Self::storage_err("could not encode the catalog entry", e))?;
-                self.insert_checked(CATALOG_COLLECTION, vec![bytes], "could not record the table")?;
+                self.insert_checked(
+                    CATALOG_COLLECTION,
+                    vec![bytes],
+                    "could not record the table",
+                )?;
                 // Each serial column's sequence, owned by the column so the
                 // table's DROP takes it along.
                 let sequences = def
@@ -16511,7 +16659,11 @@ impl PgHandler {
                             )
                             .map_err(|e| Self::storage_err("could not reset a sequence", e))?;
                     }
-                    self.insert_checked(SEQUENCE_COLLECTION, sequences, "could not record a sequence")?;
+                    self.insert_checked(
+                        SEQUENCE_COLLECTION,
+                        sequences,
+                        "could not record a sequence",
+                    )?;
                 }
                 // The table's ROW TYPE: a composite of its columns, in the
                 // type catalog like any other so `'(foo)'::mytype`,
@@ -16541,7 +16693,11 @@ impl PgHandler {
                 };
                 let bytes = encode_doc(&row_type)
                     .map_err(|e| Self::storage_err("could not encode the row type", e))?;
-                self.insert_checked(Self::COMPOSITE_COLLECTION, vec![bytes], "could not record the row type")?;
+                self.insert_checked(
+                    Self::COMPOSITE_COLLECTION,
+                    vec![bytes],
+                    "could not record the row type",
+                )?;
                 self.note_uncommitted_type(Self::COMPOSITE_COLLECTION, &def.name, Some(row_type));
                 // Remember it for the rest of this transaction: the catalog row
                 // above is not committed yet, so a plain read cannot see it.
@@ -16914,7 +17070,11 @@ impl PgHandler {
                 let doc = bson::doc! {"_id": &name, "schema": &name};
                 let bytes = encode_doc(&doc)
                     .map_err(|e| Self::storage_err("could not encode the schema", e))?;
-                self.insert_checked(Self::SCHEMA_COLLECTION, vec![bytes], "could not record the schema")?;
+                self.insert_checked(
+                    Self::SCHEMA_COLLECTION,
+                    vec![bytes],
+                    "could not record the schema",
+                )?;
                 Ok(vec![Response::Execution(Tag::new("CREATE SCHEMA"))])
             }
 
@@ -17059,7 +17219,11 @@ impl PgHandler {
                 };
                 let bytes = encode_doc(&doc)
                     .map_err(|e| Self::storage_err("could not encode the type", e))?;
-                self.insert_checked(Self::COMPOSITE_COLLECTION, vec![bytes], "could not record the type")?;
+                self.insert_checked(
+                    Self::COMPOSITE_COLLECTION,
+                    vec![bytes],
+                    "could not record the type",
+                )?;
                 self.note_uncommitted_type(Self::COMPOSITE_COLLECTION, &id_key, Some(doc));
                 Ok(vec![Response::Execution(Tag::new("CREATE TYPE"))])
             }
@@ -17108,7 +17272,11 @@ impl PgHandler {
                 };
                 let bytes = encode_doc(&doc)
                     .map_err(|e| Self::storage_err("could not encode the type", e))?;
-                self.insert_checked(Self::RANGE_COLLECTION, vec![bytes], "could not record the type")?;
+                self.insert_checked(
+                    Self::RANGE_COLLECTION,
+                    vec![bytes],
+                    "could not record the type",
+                )?;
                 self.note_uncommitted_type(Self::RANGE_COLLECTION, &id_key, Some(doc));
                 Ok(vec![Response::Execution(Tag::new("CREATE TYPE"))])
             }
@@ -17244,7 +17412,9 @@ impl PgHandler {
                         .type_catalog_docs(Self::FUNCTION_COLLECTION)?
                         .iter()
                         .find(|d| d.get_str("name") == Ok(fname.as_str()))
-                        .is_none_or(|d| d.get_str("volatility").unwrap_or("volatile") == "volatile");
+                        .is_none_or(|d| {
+                            d.get_str("volatility").unwrap_or("volatile") == "volatile"
+                        });
                     if volatile {
                         self.warning(
                             "01000",
@@ -17641,7 +17811,11 @@ impl PgHandler {
                 };
                 let bytes = encode_doc(&doc)
                     .map_err(|e| Self::storage_err("could not encode the type", e))?;
-                self.insert_checked(Self::ENUM_COLLECTION, vec![bytes], "could not record the type")?;
+                self.insert_checked(
+                    Self::ENUM_COLLECTION,
+                    vec![bytes],
+                    "could not record the type",
+                )?;
                 self.note_uncommitted_type(Self::ENUM_COLLECTION, &id_key, Some(doc));
                 Ok(vec![Response::Execution(Tag::new("CREATE TYPE"))])
             }
@@ -17971,7 +18145,11 @@ impl PgHandler {
                 let doc = Self::new_sequence_doc(&name, &options)?;
                 let bytes = encode_doc(&doc)
                     .map_err(|e| Self::storage_err("could not encode the sequence", e))?;
-                self.insert_checked(SEQUENCE_COLLECTION, vec![bytes], "could not create the sequence")?;
+                self.insert_checked(
+                    SEQUENCE_COLLECTION,
+                    vec![bytes],
+                    "could not create the sequence",
+                )?;
                 Ok(vec![Response::Execution(Tag::new("CREATE SEQUENCE"))])
             }
 
@@ -18004,7 +18182,11 @@ impl PgHandler {
                         None,
                     )
                     .map_err(|e| Self::storage_err("could not alter the sequence", e))?;
-                self.insert_checked(SEQUENCE_COLLECTION, vec![bytes], "could not alter the sequence")?;
+                self.insert_checked(
+                    SEQUENCE_COLLECTION,
+                    vec![bytes],
+                    "could not alter the sequence",
+                )?;
                 Ok(vec![Response::Execution(Tag::new("ALTER SEQUENCE"))])
             }
 
@@ -19100,7 +19282,9 @@ impl PgHandler {
                     self.refuse_in_transaction_block(&command)?;
                 }
                 for (table, columns) in &tables {
-                    let def = self.lookup(table).ok_or_else(|| Self::relation_missing(table))?;
+                    let def = self
+                        .lookup(table)
+                        .ok_or_else(|| Self::relation_missing(table))?;
                     for c in columns {
                         if def.column(c).is_none() {
                             return Err(Self::user_error(
@@ -19154,7 +19338,10 @@ impl PgHandler {
                 mode,
                 nowait,
             } => {
-                if !self.in_transaction.load(std::sync::atomic::Ordering::Relaxed) {
+                if !self
+                    .in_transaction
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
                     return Err(Self::user_error(
                         "25P01",
                         "LOCK TABLE can only be used in transaction blocks".into(),
@@ -19165,7 +19352,8 @@ impl PgHandler {
                     if self.lookup(t).is_none() {
                         return Err(Self::relation_missing(t));
                     }
-                    let got = table_locks::acquire(t, pid, mode, true, nowait, self.lock_wait_poll())?;
+                    let got =
+                        table_locks::acquire(t, pid, mode, true, nowait, self.lock_wait_poll())?;
                     if !got {
                         return Err(Self::user_error(
                             "55P03",
@@ -19212,7 +19400,8 @@ impl PgHandler {
                         col.map(|c| c.pg_type.clone())
                     })
                 };
-                let arg_types = secantus_pgplan::catalog_param_types(&query, &declared, &column_type);
+                let arg_types =
+                    secantus_pgplan::catalog_param_types(&query, &declared, &column_type);
                 let result_types = fields.filter(|f| !f.is_empty()).map(|fields| {
                     fields
                         .iter()
@@ -20511,25 +20700,37 @@ impl PgHandler {
     /// transaction block, and `SET CONSTRAINTS` overrides the declaration for
     /// a DEFERRABLE one.
     pub(crate) fn deferred_now(&self, name: &str, deferrable: bool, initially: bool) -> bool {
-        if !self.in_transaction.load(std::sync::atomic::Ordering::Relaxed) {
+        if !self
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return false;
         }
         if !deferrable {
             return false;
         }
-        let modes = self.constraint_modes.lock().unwrap_or_else(|e| e.into_inner());
+        let modes = self
+            .constraint_modes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         modes.1.get(name).copied().or(modes.0).unwrap_or(initially)
     }
 
     /// Forget every deferred check and `SET CONSTRAINTS` mode: the block is
     /// over.
     fn clear_deferred(&self) {
-        self.deferred_fks.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.deferred_fks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.deferred_triggers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
-        *self.constraint_modes.lock().unwrap_or_else(|e| e.into_inner()) = (None, HashMap::new());
+        *self
+            .constraint_modes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = (None, HashMap::new());
     }
 
     fn defer_fk(&self, table: &str, name: &str) {
@@ -20869,7 +21070,10 @@ impl PgHandler {
             run
         };
         let events: Vec<triggers::DeferredTrigger> = {
-            let mut q = self.deferred_triggers.lock().unwrap_or_else(|e| e.into_inner());
+            let mut q = self
+                .deferred_triggers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let (run, keep): (Vec<_>, Vec<_>) = q
                 .drain(..)
                 .partition(|t| wanted(t.trg.get_str("name").unwrap_or_default()));
@@ -23756,14 +23960,21 @@ fn rename_filter_fields(v: &Bson, rename: &dyn Fn(&str) -> String) -> Bson {
         Bson::Document(d) => {
             let mut out = Document::new();
             for (k, val) in d {
-                let key = if k.starts_with('$') { k.clone() } else { rename(k) };
+                let key = if k.starts_with('$') {
+                    k.clone()
+                } else {
+                    rename(k)
+                };
                 out.insert(key, rename_filter_fields(val, rename));
             }
             Bson::Document(out)
         }
-        Bson::Array(items) => {
-            Bson::Array(items.iter().map(|i| rename_filter_fields(i, rename)).collect())
-        }
+        Bson::Array(items) => Bson::Array(
+            items
+                .iter()
+                .map(|i| rename_filter_fields(i, rename))
+                .collect(),
+        ),
         other => other.clone(),
     }
 }
@@ -23839,7 +24050,13 @@ fn element_binary(v: &Bson, elem: &Type) -> Option<Vec<u8>> {
     // A geometric element: its type's `*_send` layout.
     if matches!(
         *elem,
-        Type::POINT | Type::LSEG | Type::PATH | Type::POLYGON | Type::LINE | Type::CIRCLE | Type::BOX
+        Type::POINT
+            | Type::LSEG
+            | Type::PATH
+            | Type::POLYGON
+            | Type::LINE
+            | Type::CIRCLE
+            | Type::BOX
     ) {
         return secantus_pgplan::geom::from_bson(v).map(|g| secantus_pgplan::geom::to_binary(&g));
     }

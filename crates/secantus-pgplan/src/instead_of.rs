@@ -105,7 +105,9 @@ pub(crate) fn plan(node: &pg_query::protobuf::Node) -> Result<Option<Statement>>
             }
             refuse_extras(!u.returning_list.is_empty(), false)?;
             if !u.from_clause.is_empty() {
-                return Err(Error::Unsupported("UPDATE ... FROM through an INSTEAD OF trigger".into()));
+                return Err(Error::Unsupported(
+                    "UPDATE ... FROM through an INSTEAD OF trigger".into(),
+                ));
             }
             let mut columns = Vec::new();
             let mut values = Vec::new();
@@ -121,7 +123,11 @@ pub(crate) fn plan(node: &pg_query::protobuf::Node) -> Result<Option<Statement>>
                 columns.push(rt.name.clone());
                 values.push(format!(
                     "({})",
-                    rt.val.as_deref().map(deparse_expr).transpose()?.unwrap_or_default()
+                    rt.val
+                        .as_deref()
+                        .map(deparse_expr)
+                        .transpose()?
+                        .unwrap_or_default()
                 ));
             }
             let from = match &alias {
@@ -149,7 +155,9 @@ pub(crate) fn plan(node: &pg_query::protobuf::Node) -> Result<Option<Statement>>
             }
             refuse_extras(!d.returning_list.is_empty(), false)?;
             if !d.using_clause.is_empty() {
-                return Err(Error::Unsupported("DELETE ... USING through an INSTEAD OF trigger".into()));
+                return Err(Error::Unsupported(
+                    "DELETE ... USING through an INSTEAD OF trigger".into(),
+                ));
             }
             let from = match &alias {
                 Some(a) => format!("{} AS {}", q(&view), q(a)),
@@ -172,10 +180,14 @@ pub(crate) fn plan(node: &pg_query::protobuf::Node) -> Result<Option<Statement>>
 
 fn refuse_extras(returning: bool, on_conflict: bool) -> Result<()> {
     if returning {
-        return Err(Error::Unsupported("RETURNING through an INSTEAD OF trigger".into()));
+        return Err(Error::Unsupported(
+            "RETURNING through an INSTEAD OF trigger".into(),
+        ));
     }
     if on_conflict {
-        return Err(Error::Unsupported("ON CONFLICT through an INSTEAD OF trigger".into()));
+        return Err(Error::Unsupported(
+            "ON CONFLICT through an INSTEAD OF trigger".into(),
+        ));
     }
     Ok(())
 }

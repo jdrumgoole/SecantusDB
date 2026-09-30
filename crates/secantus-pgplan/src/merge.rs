@@ -90,7 +90,9 @@ fn true_const() -> pg_query::protobuf::Node {
 
 fn qualified(alias: &str, column: &str) -> pg_query::protobuf::Node {
     let s = |v: &str| pg_query::protobuf::Node {
-        node: Some(N::String(pg_query::protobuf::String { sval: v.to_string() })),
+        node: Some(N::String(pg_query::protobuf::String {
+            sval: v.to_string(),
+        })),
     };
     pg_query::protobuf::Node {
         node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
@@ -150,8 +152,7 @@ pub(crate) fn plan(
         .as_ref()
         .ok_or_else(|| Error::Parse("MERGE with no target".into()))?;
     let target = rel.relname.clone();
-    let def = lookup(&target)
-        .ok_or_else(|| Error::UndefinedTable(target.clone()))?;
+    let def = lookup(&target).ok_or_else(|| Error::UndefinedTable(target.clone()))?;
     let alias = rel
         .alias
         .as_ref()
@@ -168,7 +169,12 @@ pub(crate) fn plan(
         .as_deref()
         .cloned()
         .ok_or_else(|| Error::Parse("MERGE with no join condition".into()))?;
-    let pk: Vec<String> = def.columns.iter().filter(|c| c.pk).map(|c| c.name.clone()).collect();
+    let pk: Vec<String> = def
+        .columns
+        .iter()
+        .filter(|c| c.pk)
+        .map(|c| c.name.clone())
+        .collect();
     let key_is_pk = !pk.is_empty();
     let key = if key_is_pk {
         pk
@@ -201,7 +207,9 @@ pub(crate) fn plan(
             Ok(CmdType::CmdUpdate) => {
                 let mut columns = Vec::new();
                 for t in &w.target_list {
-                    let Some(N::ResTarget(rt)) = t.node.as_ref() else { continue };
+                    let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+                        continue;
+                    };
                     if !rt.indirection.is_empty() {
                         return Err(Error::Unsupported("a subscripted SET in MERGE".into()));
                     }
@@ -242,7 +250,11 @@ pub(crate) fn plan(
                         insert_values.push(v.clone());
                     }
                 }
-                let width = if columns.is_empty() { def.columns.len() } else { columns.len() };
+                let width = if columns.is_empty() {
+                    def.columns.len()
+                } else {
+                    columns.len()
+                };
                 if defaults.len() > width {
                     return Err(Error::Sqlstate(
                         "42601",

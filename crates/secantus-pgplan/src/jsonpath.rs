@@ -2513,7 +2513,11 @@ fn compare_datetimes(a: &Dt, b: &Dt) -> Result<Option<std::cmp::Ordering>> {
     }
     let zoned = |k: &str| matches!(k, "timestamptz" | "timetz");
     if zoned(&a.kind) != zoned(&b.kind) && !USE_TZ.with(|t| t.get()) {
-        let (from, to) = if zoned(&a.kind) { (&b.kind, &a.kind) } else { (&a.kind, &b.kind) };
+        let (from, to) = if zoned(&a.kind) {
+            (&b.kind, &a.kind)
+        } else {
+            (&a.kind, &b.kind)
+        };
         let mut msg = format!("cannot convert value from {from} to {to} without time zone usage");
         msg.push_str("\nHint: Use *_tz() function for time zone support.");
         return Err(sqlerr("0A000", msg));
@@ -2558,7 +2562,12 @@ fn offset_text(off: i64) -> String {
 
 fn date_text(d: chrono::NaiveDate) -> String {
     use chrono::Datelike;
-    format!("{:04}-{}-{}", d.year(), two(i64::from(d.month())), two(i64::from(d.day())))
+    format!(
+        "{:04}-{}-{}",
+        d.year(),
+        two(i64::from(d.month())),
+        two(i64::from(d.day()))
+    )
 }
 
 fn days_from_epoch(d: chrono::NaiveDate) -> i64 {
@@ -2570,7 +2579,12 @@ fn dt_item(kind: &str, date: Option<chrono::NaiveDate>, tod: i64, off: Option<i6
     match kind {
         "date" => {
             let d = date.expect("date kind");
-            dt_json("date", date_text(d), days_from_epoch(d) * USECS_PER_DAY, None)
+            dt_json(
+                "date",
+                date_text(d),
+                days_from_epoch(d) * USECS_PER_DAY,
+                None,
+            )
         }
         "time" => dt_json("time", time_text(tod), tod, None),
         "timetz" => {
@@ -2627,7 +2641,9 @@ fn parse_time_of_day(s: &str) -> Option<i64> {
         None => (s, None),
     };
     let parts: Vec<&str> = hms.split(':').collect();
-    let [h, m, sec] = parts.as_slice() else { return None };
+    let [h, m, sec] = parts.as_slice() else {
+        return None;
+    };
     if h.len() != 2 || m.len() != 2 || sec.len() != 2 {
         return None;
     }
@@ -2648,7 +2664,9 @@ fn parse_time_of_day(s: &str) -> Option<i64> {
 
 fn parse_date(s: &str) -> Option<chrono::NaiveDate> {
     let parts: Vec<&str> = s.split('-').collect();
-    let [y, m, d] = parts.as_slice() else { return None };
+    let [y, m, d] = parts.as_slice() else {
+        return None;
+    };
     if y.len() < 4 || m.len() != 2 || d.len() != 2 {
         return None;
     }
@@ -2694,7 +2712,12 @@ fn parse_datetime(text: &str, template: Option<&str>) -> Result<Json> {
     // Time, with or without a zone.
     let (time_part, off) = split_offset(t);
     if let Some(tod) = parse_time_of_day(time_part) {
-        return Ok(dt_item(if off.is_some() { "timetz" } else { "time" }, None, tod, off));
+        return Ok(dt_item(
+            if off.is_some() { "timetz" } else { "time" },
+            None,
+            tod,
+            off,
+        ));
     }
     // Timestamp: a date, a space or `T`, a time, maybe a zone.
     if t.len() > 11 {
@@ -2704,7 +2727,11 @@ fn parse_datetime(text: &str, template: Option<&str>) -> Result<Json> {
             if let Some(d) = parse_date(date_part) {
                 let (time_part, off) = split_offset(&rest[1..]);
                 if let Some(tod) = parse_time_of_day(time_part) {
-                    let kind = if off.is_some() { "timestamptz" } else { "timestamp" };
+                    let kind = if off.is_some() {
+                        "timestamptz"
+                    } else {
+                        "timestamp"
+                    };
                     return Ok(dt_item(kind, Some(d), tod, off));
                 }
             }

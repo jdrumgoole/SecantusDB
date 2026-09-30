@@ -54,7 +54,10 @@ pub enum Geo {
     Line(f64, f64, f64),
     /// High corner, low corner.
     Box(P, P),
-    Path { closed: bool, pts: Vec<P> },
+    Path {
+        closed: bool,
+        pts: Vec<P>,
+    },
     Polygon(Vec<P>),
     Circle(P, f64),
 }
@@ -198,8 +201,14 @@ pub fn text(g: &Geo) -> String {
         Geo::Lseg(a, b) => format!("[{},{}]", pt(*a), pt(*b)),
         Geo::Line(a, b, c) => format!("{{{},{},{}}}", f(*a), f(*b), f(*c)),
         Geo::Box(h, l) => format!("{},{}", pt(*h), pt(*l)),
-        Geo::Path { closed: true, pts: p } => format!("({})", pts(p)),
-        Geo::Path { closed: false, pts: p } => format!("[{}]", pts(p)),
+        Geo::Path {
+            closed: true,
+            pts: p,
+        } => format!("({})", pts(p)),
+        Geo::Path {
+            closed: false,
+            pts: p,
+        } => format!("[{}]", pts(p)),
         Geo::Polygon(p) => format!("({})", pts(p)),
         Geo::Circle(c, r) => format!("<{},{}>", pt(*c), f(*r)),
     }
@@ -388,7 +397,11 @@ pub fn to_binary(g: &Geo) -> Vec<u8> {
 pub fn from_binary(ty: &str, bytes: &[u8]) -> Result<Geo> {
     let bad = || Error::Sqlstate("22P03", format!("incorrect binary data format for {ty}"));
     let float = |i: usize| -> Result<f64> {
-        let b: [u8; 8] = bytes.get(i..i + 8).ok_or_else(bad)?.try_into().map_err(|_| bad())?;
+        let b: [u8; 8] = bytes
+            .get(i..i + 8)
+            .ok_or_else(bad)?
+            .try_into()
+            .map_err(|_| bad())?;
         Ok(f64::from_be_bytes(b))
     };
     let points_at = |start: usize, n: usize| -> Result<Vec<P>> {
@@ -402,15 +415,46 @@ pub fn from_binary(ty: &str, bytes: &[u8]) -> Result<Geo> {
             .collect()
     };
     let count = |i: usize| -> Result<usize> {
-        let b: [u8; 4] = bytes.get(i..i + 4).ok_or_else(bad)?.try_into().map_err(|_| bad())?;
+        let b: [u8; 4] = bytes
+            .get(i..i + 4)
+            .ok_or_else(bad)?
+            .try_into()
+            .map_err(|_| bad())?;
         usize::try_from(i32::from_be_bytes(b)).map_err(|_| bad())
     };
     Ok(match ty {
-        "point" => Geo::Point(P { x: float(0)?, y: float(8)? }),
-        "lseg" => Geo::Lseg(P { x: float(0)?, y: float(8)? }, P { x: float(16)?, y: float(24)? }),
-        "box" => boxed(P { x: float(0)?, y: float(8)? }, P { x: float(16)?, y: float(24)? }),
+        "point" => Geo::Point(P {
+            x: float(0)?,
+            y: float(8)?,
+        }),
+        "lseg" => Geo::Lseg(
+            P {
+                x: float(0)?,
+                y: float(8)?,
+            },
+            P {
+                x: float(16)?,
+                y: float(24)?,
+            },
+        ),
+        "box" => boxed(
+            P {
+                x: float(0)?,
+                y: float(8)?,
+            },
+            P {
+                x: float(16)?,
+                y: float(24)?,
+            },
+        ),
         "line" => Geo::Line(float(0)?, float(8)?, float(16)?),
-        "circle" => Geo::Circle(P { x: float(0)?, y: float(8)? }, float(16)?),
+        "circle" => Geo::Circle(
+            P {
+                x: float(0)?,
+                y: float(8)?,
+            },
+            float(16)?,
+        ),
         "path" => {
             let closed = *bytes.first().ok_or_else(bad)? != 0;
             Geo::Path {
@@ -609,7 +653,16 @@ fn distance(a: &Geo, b: &Geo) -> Option<f64> {
         }
         // Box to box is between their CENTERS (`box_distance`).
         (Geo::Box(..), Geo::Box(..)) => center(a)?.dist(center(b)?),
-        (Geo::Path { closed: c1, pts: p1 }, Geo::Path { closed: c2, pts: p2 }) => {
+        (
+            Geo::Path {
+                closed: c1,
+                pts: p1,
+            },
+            Geo::Path {
+                closed: c2,
+                pts: p2,
+            },
+        ) => {
             let mut best = f64::MAX;
             for (a1, a2) in segments(p1, *c1) {
                 for (b1, b2) in segments(p2, *c2) {
@@ -624,8 +677,14 @@ fn distance(a: &Geo, b: &Geo) -> Option<f64> {
                 0.0
             } else {
                 distance(
-                    &Geo::Path { closed: true, pts: p1.clone() },
-                    &Geo::Path { closed: true, pts: p2.clone() },
+                    &Geo::Path {
+                        closed: true,
+                        pts: p1.clone(),
+                    },
+                    &Geo::Path {
+                        closed: true,
+                        pts: p2.clone(),
+                    },
                 )?
             }
         }
@@ -666,9 +725,9 @@ fn contains(outer: &Geo, inner: &Geo) -> Option<bool> {
         (Geo::Polygon(ps), Geo::Point(p)) => in_polygon(*p, ps),
         (Geo::Circle(c, r), Geo::Point(p)) => fp_le(c.dist(*p), *r),
         (Geo::Path { closed: true, pts }, Geo::Point(p)) => in_polygon(*p, pts),
-        (Geo::Path { closed: false, pts }, Geo::Point(p)) => {
-            segments(pts, false).into_iter().any(|(a, b)| on_segment(*p, a, b))
-        }
+        (Geo::Path { closed: false, pts }, Geo::Point(p)) => segments(pts, false)
+            .into_iter()
+            .any(|(a, b)| on_segment(*p, a, b)),
         (Geo::Lseg(a, b), Geo::Point(p)) => on_segment(*p, *a, *b),
         (Geo::Line(a, b, c), Geo::Point(p)) => fp_eq(a * p.x + b * p.y + c, 0.0),
         (Geo::Circle(c1, r1), Geo::Circle(c2, r2)) => fp_le(c1.dist(*c2) + r2, *r1),
@@ -681,7 +740,9 @@ fn contains(outer: &Geo, inner: &Geo) -> Option<bool> {
                 })
         }
         (Geo::Box(h, l), Geo::Lseg(a, b)) => in_box(*a, *h, *l) && in_box(*b, *h, *l),
-        (Geo::Line(..), Geo::Lseg(a, b)) => contains(outer, &Geo::Point(*a))? && contains(outer, &Geo::Point(*b))?,
+        (Geo::Line(..), Geo::Lseg(a, b)) => {
+            contains(outer, &Geo::Point(*a))? && contains(outer, &Geo::Point(*b))?
+        }
         (Geo::Polygon(_), Geo::Box(h, l)) => contains(outer, &Geo::Polygon(box_pts(*h, *l)))?,
         (Geo::Box(h, l), Geo::Polygon(ps)) => ps.iter().all(|p| in_box(*p, *h, *l)),
         _ => return None,
@@ -788,17 +849,33 @@ pub fn operator(op: &str, lhs: &Geo, rhs: &Geo) -> Option<Result<Bson>> {
         ("~=", _, _) => same(lhs, rhs).map(|v| Ok(b(v))),
         // Point arithmetic is complex arithmetic; the shapes are translated
         // (+ -) or scaled-and-rotated (* /) point by point.
-        ("+", Point(a), Point(q)) => r(Ok(Point(P { x: a.x + q.x, y: a.y + q.y }))),
-        ("-", Point(a), Point(q)) => r(Ok(Point(P { x: a.x - q.x, y: a.y - q.y }))),
+        ("+", Point(a), Point(q)) => r(Ok(Point(P {
+            x: a.x + q.x,
+            y: a.y + q.y,
+        }))),
+        ("-", Point(a), Point(q)) => r(Ok(Point(P {
+            x: a.x - q.x,
+            y: a.y - q.y,
+        }))),
         ("*", Point(a), Point(q)) => r(Ok(Point(pmul(*a, *q)))),
         ("/", Point(a), Point(q)) => r(pdiv(*a, *q).map(Point)),
         ("+", Box(..) | Path { .. } | Circle(..), Point(q)) => {
             let q = *q;
-            r(map_points(lhs, &|p| Ok(P { x: p.x + q.x, y: p.y + q.y })))
+            r(map_points(lhs, &|p| {
+                Ok(P {
+                    x: p.x + q.x,
+                    y: p.y + q.y,
+                })
+            }))
         }
         ("-", Box(..) | Path { .. } | Circle(..), Point(q)) => {
             let q = *q;
-            r(map_points(lhs, &|p| Ok(P { x: p.x - q.x, y: p.y - q.y })))
+            r(map_points(lhs, &|p| {
+                Ok(P {
+                    x: p.x - q.x,
+                    y: p.y - q.y,
+                })
+            }))
         }
         ("*", Box(..) | Path { .. }, Point(q)) => {
             let q = *q;
@@ -814,10 +891,23 @@ pub fn operator(op: &str, lhs: &Geo, rhs: &Geo) -> Option<Result<Bson>> {
             r(pdiv(*c, *q).map(|c| Circle(c, rad / scale)))
         }
         // Two OPEN paths concatenate; a closed one has no sum.
-        ("+", Path { closed: false, pts: a }, Path { closed: false, pts: q }) => {
+        (
+            "+",
+            Path {
+                closed: false,
+                pts: a,
+            },
+            Path {
+                closed: false,
+                pts: q,
+            },
+        ) => {
             let mut all = a.clone();
             all.extend(q.iter().copied());
-            r(Ok(Path { closed: false, pts: all }))
+            r(Ok(Path {
+                closed: false,
+                pts: all,
+            }))
         }
         ("+", Path { .. }, Path { .. }) => Some(Ok(Bson::Null)),
         // Positional operators on points.
@@ -845,9 +935,7 @@ pub fn operator(op: &str, lhs: &Geo, rhs: &Geo) -> Option<Result<Bson>> {
         ("|>>", Circle(c1, r1), Circle(c2, r2)) => Some(Ok(b(fp_gt(c1.y - r1, c2.y + r2)))),
         // Line segments: equality by endpoints, ordering by length.
         ("=", Lseg(a1, a2), Lseg(b1, b2)) => Some(Ok(b(a1.same(*b1) && a2.same(*b2)))),
-        ("<>" | "!=", Lseg(a1, a2), Lseg(b1, b2)) => {
-            Some(Ok(b(!(a1.same(*b1) && a2.same(*b2)))))
-        }
+        ("<>" | "!=", Lseg(a1, a2), Lseg(b1, b2)) => Some(Ok(b(!(a1.same(*b1) && a2.same(*b2))))),
         ("<" | "<=" | ">" | ">=", Lseg(a1, a2), Lseg(b1, b2)) => {
             let (l1, l2) = (a1.dist(*a2), b1.dist(*b2));
             Some(Ok(b(match op {
@@ -879,18 +967,28 @@ pub fn operator(op: &str, lhs: &Geo, rhs: &Geo) -> Option<Result<Bson>> {
             } else {
                 c1 / c2
             };
-            Some(Ok(b(fp_eq(*a1, k * a2) && fp_eq(*b1, k * b2) && fp_eq(*c1, k * c2))))
+            Some(Ok(b(fp_eq(*a1, k * a2)
+                && fp_eq(*b1, k * b2)
+                && fp_eq(*c1, k * c2))))
         }
         ("?#", Line(a1, b1, _), Line(a2, b2, _)) => Some(Ok(b(!fp_eq(a1 * b2, a2 * b1)))),
         ("?||", Line(a1, b1, _), Line(a2, b2, _)) => Some(Ok(b(fp_eq(a1 * b2, a2 * b1)))),
         ("?-|", Line(a1, b1, _), Line(a2, b2, _)) => Some(Ok(b(fp_eq(a1 * a2 + b1 * b2, 0.0)))),
-        ("?#", Path { closed: c1, pts: p1 }, Path { closed: c2, pts: p2 }) => {
-            Some(Ok(b(segments(p1, *c1).into_iter().any(|(x, y)| {
-                segments(p2, *c2)
-                    .into_iter()
-                    .any(|(z, w)| segs_intersect(x, y, z, w))
-            }))))
-        }
+        (
+            "?#",
+            Path {
+                closed: c1,
+                pts: p1,
+            },
+            Path {
+                closed: c2,
+                pts: p2,
+            },
+        ) => Some(Ok(b(segments(p1, *c1).into_iter().any(|(x, y)| {
+            segments(p2, *c2)
+                .into_iter()
+                .any(|(z, w)| segs_intersect(x, y, z, w))
+        })))),
         // Positional operators on polygons, by bounding box.
         ("<<" | ">>" | "&<" | "&>" | "<<|" | "|>>" | "&<|" | "|&>", Polygon(p1), Polygon(p2)) => {
             let (h1, l1) = bbox(p1);
@@ -979,7 +1077,16 @@ pub fn cast(g: &Geo, target: &str) -> Result<Bson> {
         }
         (Geo::Circle(c, r), "box") => {
             let k = r / std::f64::consts::SQRT_2;
-            boxed(P { x: c.x + k, y: c.y + k }, P { x: c.x - k, y: c.y - k })
+            boxed(
+                P {
+                    x: c.x + k,
+                    y: c.y + k,
+                },
+                P {
+                    x: c.x - k,
+                    y: c.y - k,
+                },
+            )
         }
         (Geo::Circle(..), "polygon") => circle_polygon(12, g)?,
         (Geo::Path { closed: false, .. }, "polygon") => {
@@ -1039,9 +1146,33 @@ fn circle_polygon(n: i64, g: &Geo) -> Result<Geo> {
 
 /// The functions, by name.
 pub const FUNCTIONS: &[&str] = &[
-    "box", "point", "geom_length", "lseg", "line", "path", "polygon", "circle", "area", "center", "radius", "diameter",
-    "height", "width", "length", "npoints", "isclosed", "isopen", "pclose", "popen", "diagonal",
-    "bound_box", "slope", "isvertical", "ishorizontal", "isparallel", "isperp",
+    "box",
+    "point",
+    "geom_length",
+    "lseg",
+    "line",
+    "path",
+    "polygon",
+    "circle",
+    "area",
+    "center",
+    "radius",
+    "diameter",
+    "height",
+    "width",
+    "length",
+    "npoints",
+    "isclosed",
+    "isopen",
+    "pclose",
+    "popen",
+    "diagonal",
+    "bound_box",
+    "slope",
+    "isvertical",
+    "ishorizontal",
+    "isparallel",
+    "isperp",
 ];
 
 fn num(v: &Bson) -> Option<f64> {
@@ -1126,8 +1257,14 @@ pub fn call(name: &str, args: &[Bson]) -> Option<Result<Bson>> {
         }),
         ("diagonal", [Some(g @ Geo::Box(..))]) => Some(cast(g, "lseg")),
         ("bound_box", [Some(Geo::Box(h1, l1)), Some(Geo::Box(h2, l2))]) => out(boxed(
-            P { x: h1.x.max(h2.x), y: h1.y.max(h2.y) },
-            P { x: l1.x.min(l2.x), y: l1.y.min(l2.y) },
+            P {
+                x: h1.x.max(h2.x),
+                y: h1.y.max(h2.y),
+            },
+            P {
+                x: l1.x.min(l2.x),
+                y: l1.y.min(l2.y),
+            },
         )),
         ("slope", [Some(Geo::Point(a)), Some(Geo::Point(q))]) => Some(Ok(d(if fp_eq(a.x, q.x) {
             f64::INFINITY

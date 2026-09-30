@@ -84,24 +84,31 @@ pub(crate) fn as_subselect(rf: &pg_query::protobuf::RangeFunction) -> Result<N> 
     };
     // Without an alias the relation is named for the (first) function, and
     // ROWS FROM's columns for theirs -- PostgreSQL's defaults.
-    let mut alias = rf.alias.clone().unwrap_or_else(|| pg_query::protobuf::Alias {
-        aliasname: names.first().cloned().unwrap_or_default(),
-        colnames: Vec::new(),
-    });
+    let mut alias = rf
+        .alias
+        .clone()
+        .unwrap_or_else(|| pg_query::protobuf::Alias {
+            aliasname: names.first().cloned().unwrap_or_default(),
+            colnames: Vec::new(),
+        });
     if alias.colnames.is_empty() && calls.len() > 1 {
         let string = |v: &str| pg_query::protobuf::Node {
-            node: Some(N::String(pg_query::protobuf::String { sval: v.to_string() })),
+            node: Some(N::String(pg_query::protobuf::String {
+                sval: v.to_string(),
+            })),
         };
         alias.colnames = names.iter().map(|n| string(n)).collect();
         if rf.ordinality {
             alias.colnames.push(string("ordinality"));
         }
     }
-    Ok(N::RangeSubselect(Box::new(pg_query::protobuf::RangeSubselect {
-        lateral: rf.lateral,
-        subquery: Some(Box::new(pg_query::protobuf::Node {
-            node: Some(N::SelectStmt(body)),
-        })),
-        alias: Some(alias),
-    })))
+    Ok(N::RangeSubselect(Box::new(
+        pg_query::protobuf::RangeSubselect {
+            lateral: rf.lateral,
+            subquery: Some(Box::new(pg_query::protobuf::Node {
+                node: Some(N::SelectStmt(body)),
+            })),
+            alias: Some(alias),
+        },
+    )))
 }

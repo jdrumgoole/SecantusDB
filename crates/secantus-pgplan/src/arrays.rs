@@ -235,7 +235,8 @@ pub fn call(name: &str, args: &[Bson]) -> Result<Bson> {
     // `array_cat(arr, '{3}')`: an untyped literal beside an array takes that
     // array's type, as PostgreSQL resolves the `anyarray` pair.
     if name == "array_cat" && args.len() == 2 {
-        let literal = |v: &Bson| matches!(v, Bson::String(t) if t.trim_start().starts_with(['{', '[']));
+        let literal =
+            |v: &Bson| matches!(v, Bson::String(t) if t.trim_start().starts_with(['{', '[']));
         let typed = |v: &Bson| matches!(v, Bson::Array(_)) || is_bounded(v);
         let coerce = |lit: &Bson, other: &Bson| -> Result<Bson> {
             crate::cast_value(lit.clone(), crate::inferred_type(other))
@@ -255,10 +256,16 @@ pub fn call(name: &str, args: &[Bson]) -> Result<Bson> {
     match name {
         "array_lower" | "array_upper" => {
             let len = call_plain("array_length", &plain)?;
-            let Bson::Int32(len) = len else { return Ok(len) };
+            let Bson::Int32(len) = len else {
+                return Ok(len);
+            };
             let d = as_i64(&plain[1]).unwrap_or(1) as usize;
             let lb = first_lbs().get(d - 1).copied().unwrap_or(1);
-            let v = if name == "array_lower" { lb } else { lb + i64::from(len) - 1 };
+            let v = if name == "array_lower" {
+                lb
+            } else {
+                lb + i64::from(len) - 1
+            };
             Ok(Bson::Int32(i32::try_from(v).unwrap_or(i32::MAX)))
         }
         "array_dims" => Ok(dims_text(&args[0]).map_or(Bson::Null, Bson::String)),
@@ -318,7 +325,10 @@ pub fn bounded(v: Bson, lbs: &[i64]) -> Bson {
     let mut lbs = lbs.to_vec();
     lbs.resize(ndims, 1);
     let mut d = bson::Document::new();
-    d.insert(LB_KEY, Bson::Array(lbs.into_iter().map(Bson::Int64).collect()));
+    d.insert(
+        LB_KEY,
+        Bson::Array(lbs.into_iter().map(Bson::Int64).collect()),
+    );
     d.insert(ITEMS_KEY, Bson::Array(items));
     Bson::Document(d)
 }
@@ -759,7 +769,10 @@ fn array_fill(name: &str, args: &[Bson]) -> Result<Bson> {
         need_array(name, lb)?;
     }
     let lbs: Vec<i64> = match args.get(2) {
-        Some(lb) => need_array(name, lb)?.iter().map(|b| as_i64(b).unwrap_or(1)).collect(),
+        Some(lb) => need_array(name, lb)?
+            .iter()
+            .map(|b| as_i64(b).unwrap_or(1))
+            .collect(),
         None => Vec::new(),
     };
     let dims: Vec<i64> = need_array(name, &args[1])?
@@ -1003,7 +1016,7 @@ mod tests {
     }
 
     #[test]
-    fn array_fill_refuses_a_lower_bound_it_cannot_represent() {
+    fn array_fill_keeps_a_lower_bound_other_than_one() {
         assert_eq!(
             call("array_fill", &[i(0), arr(vec![i(2), i(2)])]).unwrap(),
             arr(vec![arr(vec![i(0), i(0)]), arr(vec![i(0), i(0)])])
@@ -1012,7 +1025,11 @@ mod tests {
             call("array_fill", &[i(1), arr(vec![i(0)])]).unwrap(),
             arr(vec![])
         );
-        assert!(call("array_fill", &[i(7), arr(vec![i(2)]), arr(vec![i(3)])]).is_err());
+        // `array_fill(7, ARRAY[2], ARRAY[3])` is `[3:4]={7,7}`.
+        let filled = call("array_fill", &[i(7), arr(vec![i(2)]), arr(vec![i(3)])]).unwrap();
+        assert_eq!(lower_bounds(&filled), vec![3]);
+        assert_eq!(strip(&filled), arr(vec![i(7), i(7)]));
+        assert_eq!(dims_text(&filled).as_deref(), Some("[3:4]"));
         assert_eq!(
             call("array_fill", &[i(7), arr(vec![i(2)]), arr(vec![i(1)])]).unwrap(),
             arr(vec![i(7), i(7)])

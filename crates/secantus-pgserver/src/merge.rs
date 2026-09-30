@@ -17,9 +17,9 @@ use crate::{PgHandler, PlHost};
 
 impl PgHandler {
     pub(crate) fn execute_merge(&self, m: Merge) -> PgWireResult<Vec<Response>> {
-        let def = self
-            .lookup(&m.target)
-            .ok_or_else(|| Self::user_error("42P01", format!("relation \"{}\" does not exist", m.target)))?;
+        let def = self.lookup(&m.target).ok_or_else(|| {
+            Self::user_error("42P01", format!("relation \"{}\" does not exist", m.target))
+        })?;
         let matched = self.run_sql_rows(&m.matched_sql, &m.params)?;
         let not_matched = self.run_sql_rows(&m.not_matched_sql, &m.params)?;
         let host = PlHost { h: self };
@@ -53,7 +53,11 @@ impl PgHandler {
                 .iter()
                 .enumerate()
                 .map(|(n, k)| {
-                    let op = if m.key_is_pk { "=" } else { "IS NOT DISTINCT FROM" };
+                    let op = if m.key_is_pk {
+                        "="
+                    } else {
+                        "IS NOT DISTINCT FROM"
+                    };
                     format!("{} {op} ${}", q(k), first_param + n)
                 })
                 .collect::<Vec<_>>()

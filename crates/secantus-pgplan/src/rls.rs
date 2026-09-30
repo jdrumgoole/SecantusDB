@@ -90,13 +90,15 @@ pub(crate) fn expand_from(item: &mut pg_query::protobuf::Node) -> Result<()> {
             aliasname: r.relname.clone(),
             colnames: Vec::new(),
         });
-    item.node = Some(N::RangeSubselect(Box::new(pg_query::protobuf::RangeSubselect {
-        lateral: false,
-        subquery: Some(Box::new(pg_query::protobuf::Node {
-            node: Some(N::SelectStmt(body)),
-        })),
-        alias: Some(alias),
-    })));
+    item.node = Some(N::RangeSubselect(Box::new(
+        pg_query::protobuf::RangeSubselect {
+            lateral: false,
+            subquery: Some(Box::new(pg_query::protobuf::Node {
+                node: Some(N::SelectStmt(body)),
+            })),
+            alias: Some(alias),
+        },
+    )));
     Ok(())
 }
 
@@ -107,7 +109,9 @@ pub(crate) fn rewrite_dml(node: &mut pg_query::protobuf::Node) -> Result<()> {
             let Some(table) = u.relation.as_ref().map(|r| r.relname.clone()) else {
                 return Ok(());
             };
-            let Some(e) = entry(&table) else { return Ok(()) };
+            let Some(e) = entry(&table) else {
+                return Ok(());
+            };
             // A statement that READS the rows (a WHERE, a RETURNING, or a SET
             // over a column) must see them, so the SELECT policies apply too.
             let reads = u.where_clause.is_some()
@@ -132,7 +136,9 @@ pub(crate) fn rewrite_dml(node: &mut pg_query::protobuf::Node) -> Result<()> {
             let Some(table) = d.relation.as_ref().map(|r| r.relname.clone()) else {
                 return Ok(());
             };
-            let Some(e) = entry(&table) else { return Ok(()) };
+            let Some(e) = entry(&table) else {
+                return Ok(());
+            };
             if d.where_clause.is_some() || !d.returning_list.is_empty() {
                 if let Some(f) = &e.select {
                     and_into(&mut d.where_clause, condition(f)?);

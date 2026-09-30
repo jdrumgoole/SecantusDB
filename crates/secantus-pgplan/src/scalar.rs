@@ -345,7 +345,9 @@ fn regexp_function(name: &str, args: &[Bson]) -> Result<Bson> {
         })
     };
     let int = |i: usize, param: &str, default: i64, min: i64| -> Result<i64> {
-        let Some(v) = args.get(i) else { return Ok(default) };
+        let Some(v) = args.get(i) else {
+            return Ok(default);
+        };
         let n = match v {
             Bson::Int32(n) => i64::from(*n),
             Bson::Int64(n) => *n,
@@ -384,10 +386,19 @@ fn regexp_function(name: &str, args: &[Bson]) -> Result<Bson> {
     if name == "regexp_like" {
         return Ok(Bson::Boolean(re.is_match(&subject)));
     }
-    let start = if name == "regexp_like" { 1 } else { int(2, "start", 1, 1)? };
+    let start = if name == "regexp_like" {
+        1
+    } else {
+        int(2, "start", 1, 1)?
+    };
     // The byte offset of character `start`; past the end, no match.
     let chars: Vec<(usize, char)> = subject.char_indices().collect();
-    let char_at = |byte: usize| chars.iter().position(|(b, _)| *b >= byte).unwrap_or(chars.len());
+    let char_at = |byte: usize| {
+        chars
+            .iter()
+            .position(|(b, _)| *b >= byte)
+            .unwrap_or(chars.len())
+    };
     let from = match chars.get(start as usize - 1) {
         Some((b, _)) => *b,
         None if start as usize - 1 == chars.len() => subject.len(),
@@ -2043,7 +2054,9 @@ pub fn static_result_type(name: &str) -> &'static str {
         "jsonb_path_exists"
         | "jsonb_path_match"
         | "jsonb_path_exists_tz"
-        | "jsonb_path_match_tz" | "is_normalized" | "regexp_like" => "bool",
+        | "jsonb_path_match_tz"
+        | "is_normalized"
+        | "regexp_like" => "bool",
         "regexp_count" | "regexp_instr" => "int4",
         "regexp_substr" => "text",
         "jsonb_path_query_first"

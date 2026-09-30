@@ -307,19 +307,21 @@ impl PgHandler {
             level: trg.get_str("level").unwrap_or("ROW").to_string(),
             args: strings(trg, "args"),
         };
-        let outcome = self.with_transition_tables(trg, || self.with_call_depth(|| {
-            plpgsql_fn::run(
-                &crate::plpgsql_create_sql(&doc),
-                plpgsql_fn::Invocation {
-                    args: &[],
-                    arg_types: &[],
-                    trigger: Some(data),
-                    returns_set: false,
-                },
-                &PlHost { h: self },
-            )
-            .map_err(crate::wire_pl_error)
-        }))?;
+        let outcome = self.with_transition_tables(trg, || {
+            self.with_call_depth(|| {
+                plpgsql_fn::run(
+                    &crate::plpgsql_create_sql(&doc),
+                    plpgsql_fn::Invocation {
+                        args: &[],
+                        arg_types: &[],
+                        trigger: Some(data),
+                        returns_set: false,
+                    },
+                    &PlHost { h: self },
+                )
+                .map_err(crate::wire_pl_error)
+            })
+        })?;
         Ok(match outcome {
             plpgsql_fn::Outcome::Record(r) => r,
             _ => None,
@@ -597,15 +599,18 @@ impl PgHandler {
                     let mut values = vec![Bson::Null; width];
                     for (i, v) in row.into_iter().enumerate() {
                         let slot = match io.columns.get(i) {
-                            Some(name) => view_cols.iter().position(|(c, _)| c == name).ok_or_else(|| {
-                                user_error(
-                                    "42703",
-                                    format!(
-                                        "column \"{name}\" of relation \"{}\" does not exist",
-                                        io.view
-                                    ),
-                                )
-                            })?,
+                            Some(name) => view_cols
+                                .iter()
+                                .position(|(c, _)| c == name)
+                                .ok_or_else(|| {
+                                    user_error(
+                                        "42703",
+                                        format!(
+                                            "column \"{name}\" of relation \"{}\" does not exist",
+                                            io.view
+                                        ),
+                                    )
+                                })?,
                             None if io.columns.is_empty() && i < width => i,
                             None => {
                                 return Err(user_error(
@@ -622,15 +627,19 @@ impl PgHandler {
                     let old: Vec<Bson> = row[..width.min(row.len())].to_vec();
                     let mut new = old.clone();
                     for (name, v) in io.columns.iter().zip(row.iter().skip(width)) {
-                        let slot = view_cols.iter().position(|(c, _)| c == name).ok_or_else(|| {
-                            user_error(
-                                "42703",
-                                format!(
-                                    "column \"{name}\" of relation \"{}\" does not exist",
-                                    io.view
-                                ),
-                            )
-                        })?;
+                        let slot =
+                            view_cols
+                                .iter()
+                                .position(|(c, _)| c == name)
+                                .ok_or_else(|| {
+                                    user_error(
+                                        "42703",
+                                        format!(
+                                            "column \"{name}\" of relation \"{}\" does not exist",
+                                            io.view
+                                        ),
+                                    )
+                                })?;
                         new[slot] = v.clone();
                     }
                     (Some(record(new)), Some(record(old)))
@@ -698,7 +707,10 @@ impl PgHandler {
     /// the rest of the block. IMMEDIATE also runs what is already queued for
     /// them, as PostgreSQL does. Outside a block it only warns.
     pub(crate) fn set_constraints(&self, names: &[String], deferred: bool) -> PgWireResult<()> {
-        if !self.in_transaction.load(std::sync::atomic::Ordering::Relaxed) {
+        if !self
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             self.warning(
                 "25P01",
                 "SET CONSTRAINTS can only be used in transaction blocks".into(),
@@ -741,7 +753,10 @@ impl PgHandler {
             }
         }
         {
-            let mut modes = self.constraint_modes.lock().unwrap_or_else(|e| e.into_inner());
+            let mut modes = self
+                .constraint_modes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if names.is_empty() {
                 modes.0 = Some(deferred);
                 modes.1.clear();
@@ -797,11 +812,15 @@ impl PgHandler {
         let mut made = Vec::new();
         let mut setup = || -> PgWireResult<()> {
             for (name, is_new) in &names {
-                self.internal_sql(&format!("CREATE TEMP TABLE {} (LIKE {})", q(name), q(&table)))?;
+                self.internal_sql(&format!(
+                    "CREATE TEMP TABLE {} (LIKE {})",
+                    q(name),
+                    q(&table)
+                ))?;
                 made.push(name.clone());
-                let tdef = self
-                    .lookup(name)
-                    .ok_or_else(|| user_error("42P01", format!("relation \"{name}\" does not exist")))?;
+                let tdef = self.lookup(name).ok_or_else(|| {
+                    user_error("42P01", format!("relation \"{name}\" does not exist"))
+                })?;
                 let docs = if *is_new { &new } else { &old };
                 self.insert_shaped(name, Self::reshape_rows(&def, &tdef, docs)?)?;
             }

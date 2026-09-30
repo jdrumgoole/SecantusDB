@@ -68,7 +68,9 @@ pub trait Host {
     /// (`... RETURNING ... INTO`).
     fn returning(&self, sql: &str, params: &[Bson], types: &[String]) -> Result<QueryOut, PlError> {
         let _ = (sql, params, types);
-        Err(PlError::unsupported("INSERT / UPDATE / DELETE ... RETURNING INTO"))
+        Err(PlError::unsupported(
+            "INSERT / UPDATE / DELETE ... RETURNING INTO",
+        ))
     }
 }
 

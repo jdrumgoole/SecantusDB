@@ -1783,11 +1783,7 @@ pub(crate) fn from_char_strict(input: &str, fmt: &str) -> Result<(NaiveDate, i64
     from_char_mode(input, fmt, true)
 }
 
-fn from_char_mode(
-    input: &str,
-    fmt: &str,
-    strict: bool,
-) -> Result<(NaiveDate, i64, Option<i64>)> {
+fn from_char_mode(input: &str, fmt: &str, strict: bool) -> Result<(NaiveDate, i64, Option<i64>)> {
     let nodes = parse_dch(fmt);
     let inp: Vec<char> = input.chars().collect();
     let mut i = 0usize;
@@ -1811,7 +1807,10 @@ fn from_char_mode(
         // Strict (jsonpath `.datetime()`) parsing: input that runs out while
         // fields remain is an error, where `to_timestamp` defaults them.
         if strict && i >= inp.len() {
-            if nodes[n_idx..].iter().any(|n| matches!(n, DNode::Key { .. })) {
+            if nodes[n_idx..]
+                .iter()
+                .any(|n| matches!(n, DNode::Key { .. }))
+            {
                 return Err(Error::Sqlstate(
                     "22007",
                     "input string is too short for datetime format".into(),
