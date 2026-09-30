@@ -33,6 +33,11 @@ index, check, foreign-key, referenced-by, trigger and policy footers.
 `\dt+`'s Size column is the one exception: PostgreSQL counts its TOAST index
 pages, which this server does not have.
 
+**SQLAlchemy 2.1's reflection matches.** Its inspector answers the same as
+against PostgreSQL 15 for columns, keys, foreign keys, indexes (DESC ordering
+included), unique and check constraints, and comments. That covers
+`pg_opclass`, and `pg_index.indclass` / `indoption` / `indcollation`.
+
 #### Added
 
 - `CREATE AGGREGATE`, `CREATE OPERATOR`, `CREATE STATISTICS`,

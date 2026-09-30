@@ -701,6 +701,13 @@ remain open:
         it (`psql_describe*` corpora, byte-identical output).
       - `pg_table_size` / `\dt+` report 0 bytes for an empty table where
         PostgreSQL counts its TOAST index's 8192.
+      - **Harness, not server:** `tests/test_tmp_retention_guard.py::
+        test_default_tmp_retention_policy_is_allowed` timed out ONCE in three
+        quiet full-suite runs on 2026-09-30: its nested `pytest --co -q
+        tests/test_smoke.py` produced no output for 300 s, where the same
+        command takes 0.5 s alone and the test passes in 24 s. Not reproduced;
+        the cause (what the nested collection blocked on) is unknown. If it
+        recurs, capture the nested process's stack before the timeout kills it.
       - `CREATE AGGREGATE`'s built-in state / final function signatures are
         checked for the operator functions (`int4pl`, `numeric_add`,
         `textcat`, ...); any other built-in is taken as declared.
