@@ -60,27 +60,38 @@ fn key_names(def: &TableDef) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The key in DECLARED order -- a range bound compares its values
+/// position by position, so table-column order would pair the wrong ones --
+/// each a column or a parenthesised expression, with its type.
 fn key_of(parent: &TableDef) -> Key<'_> {
-    let names = key_names(parent);
+    let by = parent.extra.get_document("partition_by").ok();
+    let strs = |k: &str| -> Vec<&str> {
+        by.and_then(|b| b.get_array(k).ok())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default()
+    };
+    let (names, types) = (strs("columns"), strs("key_types"));
     Key {
-        columns: parent
-            .columns
+        columns: names
             .iter()
-            .filter(|c| names.contains(&c.name))
-            .map(|c| (c.name.as_str(), c.pg_type.as_str()))
+            .enumerate()
+            .filter_map(|(i, n)| {
+                let ty = types
+                    .get(i)
+                    .copied()
+                    .or_else(|| parent.column(n).map(|c| c.pg_type.as_str()))?;
+                Some((*n, ty))
+            })
             .collect(),
     }
 }
 
-/// The key columns in DECLARED order, with their types.
+/// The key in DECLARED order, with its types.
 fn ordered_key(parent: &TableDef) -> Vec<(String, String)> {
-    key_names(parent)
+    key_of(parent)
+        .columns
         .into_iter()
-        .filter_map(|n| {
-            parent
-                .column(&n)
-                .map(|c| (c.name.clone(), c.pg_type.clone()))
-        })
+        .map(|(n, t)| (n.to_string(), t.to_string()))
         .collect()
 }
 
@@ -999,10 +1010,15 @@ impl PgHandler {
             "hash" => "h",
             _ => return None,
         };
+        // An expression key is attribute 0, as in `pg_partitioned_table`.
         let attrs = key_names(def)
             .iter()
-            .filter_map(|n| def.columns.iter().position(|c| c.name == *n))
-            .map(|i| (i + 1) as i16)
+            .map(|n| {
+                def.columns
+                    .iter()
+                    .position(|c| c.name == *n)
+                    .map_or(0, |i| (i + 1) as i16)
+            })
             .collect();
         Some((strat, attrs))
     }

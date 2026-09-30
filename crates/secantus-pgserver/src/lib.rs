@@ -17754,7 +17754,7 @@ impl PgHandler {
                 if let Ok(spec) = def.extra.get_document("partition_by") {
                     for c in spec.get_array("columns").into_iter().flatten() {
                         let c = c.as_str().unwrap_or_default();
-                        if def.column(c).is_none() {
+                        if !c.starts_with('(') && def.column(c).is_none() {
                             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                                 "ERROR".into(),
                                 "42703".into(),

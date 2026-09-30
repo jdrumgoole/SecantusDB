@@ -87,10 +87,13 @@ pub(crate) fn lower_create(
             let Some(N::PartitionElem(e)) = p.node.as_ref() else {
                 continue;
             };
-            if e.expr.is_some() || e.name.is_empty() {
-                return Err(Error::Unsupported("partitioning by an expression".into()));
+            // An expression key is kept as its SQL, parenthesised; its type
+            // is settled once the table's columns are (see `key_types`).
+            match e.expr.as_deref() {
+                Some(expr) => columns.push(Bson::String(format!("({})", deparse_expr(expr)?))),
+                None if !e.name.is_empty() => columns.push(Bson::String(e.name.clone())),
+                None => return Err(Error::Parse("an empty partition key".into())),
             }
-            columns.push(Bson::String(e.name.clone()));
         }
         if strategy == "list" && columns.len() > 1 {
             return Err(Error::Sqlstate(
@@ -149,6 +152,40 @@ pub(crate) fn lower_create(
     Ok((out, extra))
 }
 
+/// Each partition key's type, in declared order: a column's own, an
+/// expression's as it types over the table. Recorded as `key_types`.
+pub(crate) fn key_types(def: &mut TableDef) -> Result<()> {
+    let Ok(by) = def.extra.get_document("partition_by").cloned() else {
+        return Ok(());
+    };
+    let names: Vec<String> = by
+        .get_array("columns")
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut types = Vec::new();
+    for n in &names {
+        let ty = if n.starts_with('(') {
+            match plan_check_expression(n, def)? {
+                ColumnExpr::Row { result_type, .. } if !result_type.is_empty() => result_type,
+                _ => "text".to_string(),
+            }
+        } else {
+            // A missing column is the executor's 42703, worded for a key.
+            def.column(n)
+                .map_or_else(String::new, |c| c.pg_type.clone())
+        };
+        types.push(Bson::String(ty));
+    }
+    let mut by = by;
+    by.insert("key_types", types);
+    def.extra.insert("partition_by", by);
+    Ok(())
+}
+
 /// `quote` a bound datum's canonical text as ruleutils prints it in
 /// `pg_get_expr(relpartbound)`: numbers bare, everything else as a literal.
 pub fn render_datum(text: &str, pg_type: &str) -> String {
@@ -197,7 +234,6 @@ fn cast(value: &str, ty: &str) -> String {
 /// a DEFAULT partition is the complement of. `values` are canonical texts;
 /// `None` stands for a NULL list member.
 pub fn bound_condition(key: &Key<'_>, bound: &Document, siblings: &[Document]) -> String {
-    let q = scalar::quote_identifier;
     let strings = |field: &str| -> Vec<Option<String>> {
         bound
             .get_array(field)
@@ -211,10 +247,10 @@ pub fn bound_condition(key: &Key<'_>, bound: &Document, siblings: &[Document]) -
             let listed: Vec<String> = values.iter().flatten().map(|v| cast(v, ty)).collect();
             let mut parts = Vec::new();
             if !listed.is_empty() {
-                parts.push(format!("{} IN ({})", q(col), listed.join(", ")));
+                parts.push(format!("{} IN ({})", kq(col), listed.join(", ")));
             }
             if values.iter().any(Option::is_none) {
-                parts.push(format!("{} IS NULL", q(col)));
+                parts.push(format!("{} IS NULL", kq(col)));
             }
             if parts.is_empty() {
                 "false".into()
@@ -228,7 +264,7 @@ pub fn bound_condition(key: &Key<'_>, bound: &Document, siblings: &[Document]) -
             let mut parts: Vec<String> = key
                 .columns
                 .iter()
-                .map(|(c, _)| format!("{} IS NOT NULL", q(c)))
+                .map(|(c, _)| format!("{} IS NOT NULL", kq(c)))
                 .collect();
             if let Some(lo) = lexicographic(key, &from, ">") {
                 parts.push(lo);
@@ -243,7 +279,7 @@ pub fn bound_condition(key: &Key<'_>, bound: &Document, siblings: &[Document]) -
             let keys: Vec<String> = key
                 .columns
                 .iter()
-                .map(|(c, ty)| format!("'{ty}', {}", q(c)))
+                .map(|(c, ty)| format!("'{ty}', {}", kq(c)))
                 .collect();
             format!(
                 "secantus_hash_partition({}, {}, {})",
@@ -273,7 +309,6 @@ pub fn bound_condition(key: &Key<'_>, bound: &Document, siblings: &[Document]) -
 /// and MINVALUE / MAXVALUE ending the comparison at their column. `None`
 /// when the bound constrains nothing.
 fn lexicographic(key: &Key<'_>, bound: &[Option<String>], op: &str) -> Option<String> {
-    let q = scalar::quote_identifier;
     let mut alternatives: Vec<String> = Vec::new();
     let mut prefix: Vec<String> = Vec::new();
     for (i, (col, ty)) in key.columns.iter().enumerate() {
@@ -297,17 +332,27 @@ fn lexicographic(key: &Key<'_>, bound: &[Option<String>], op: &str) -> Option<St
         }
         let lit = cast(&v, ty);
         let last = i + 1 == key.columns.len();
-        let strict = format!("{} {op} {lit}", q(col));
+        let strict = format!("{} {op} {lit}", kq(col));
         let mut here = prefix.clone();
         if last && op == ">" {
-            here.push(format!("{} >= {lit}", q(col)));
+            here.push(format!("{} >= {lit}", kq(col)));
         } else {
             here.push(strict);
         }
         alternatives.push(conj(&here));
-        prefix.push(format!("{} = {lit}", q(col)));
+        prefix.push(format!("{} = {lit}", kq(col)));
     }
     Some(disj(&alternatives))
+}
+
+/// A key in a bound condition: a column by its quoted name, an expression
+/// key (stored parenthesised) as written.
+fn kq(c: &str) -> String {
+    if c.starts_with('(') {
+        c.to_string()
+    } else {
+        scalar::quote_identifier(c)
+    }
 }
 
 fn conj(parts: &[String]) -> String {

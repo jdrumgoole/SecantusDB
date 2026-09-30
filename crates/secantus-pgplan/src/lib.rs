@@ -2793,6 +2793,7 @@ fn plan_node(
                 if !parents.is_empty() {
                     inherit::merge_parents(def, &parents, lookup)?;
                 }
+                partitions::key_types(def)?;
             }
             Ok(st)
         }
