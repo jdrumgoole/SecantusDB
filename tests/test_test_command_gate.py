@@ -85,6 +85,28 @@ def test_the_gauges_force_the_flag_on():
     assert gauge_common._force_test_commands(forced).count("--enable-test-commands") == 1
 
 
+def test_no_gauge_launches_a_daemon_around_the_choke_point():
+    """A runner that starts its daemon itself must force the flag itself.
+
+    The choke point only covers runners that go through `spawn_daemon`. The C++
+    gauge cannot (it needs the fixed port 27017, which `spawn_daemon` rewrites),
+    launched with a bare `subprocess.Popen`, and silently lost `configureFailPoint`
+    when #1624 turned failpoints off by default -- found 2026-09-30 as a
+    "WriteConcernError errInfo" failure that was the harness, not the server.
+    So: any runner that builds a daemon command with `for_server` but does not
+    call `spawn_daemon` must call `_force_test_commands`.
+    """
+    root = Path(__file__).resolve().parents[1]
+    offenders = []
+    for runner in sorted(root.glob("*_validation/runner.py")):
+        text = runner.read_text()
+        if "for_server(" not in text or "spawn_daemon(" in text:
+            continue
+        if "_force_test_commands(" not in text:
+            offenders.append(runner.relative_to(root).as_posix())
+    assert offenders == []
+
+
 def test_the_two_servers_gate_the_same_command_set():
     """The Rust mirror is `is_test_only_command`; drift between them would mean
     one server exposing a command the other refuses."""
