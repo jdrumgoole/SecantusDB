@@ -20,6 +20,7 @@ pub fn is_scalar(name: &str) -> bool {
         || crate::xml::is_function(name)
         || crate::jsonops::FUNCTIONS.contains(&name)
         || crate::mathfn::FUNCTIONS.contains(&name)
+        || crate::pgcrypto::is_function(name)
 }
 
 /// Does this built-in's result type follow from its NAME alone?
@@ -416,6 +417,9 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         return out;
     }
     if let Some(out) = crate::mathfn::call(name, args) {
+        return out;
+    }
+    if let Some(out) = crate::pgcrypto::call(name, args) {
         return out;
     }
     if crate::jsonpath::is_function(name) {
@@ -1834,6 +1838,9 @@ pub fn static_result_type(name: &str) -> &'static str {
         return t;
     }
     if let Some(t) = crate::mathfn::result_type(name) {
+        return t;
+    }
+    if let Some(t) = crate::pgcrypto::result_type(name) {
         return t;
     }
     match name {

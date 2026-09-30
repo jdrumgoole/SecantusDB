@@ -32,6 +32,7 @@ pub mod hstore;
 pub mod joins;
 pub mod partitions;
 pub mod instead_of;
+pub mod pgcrypto;
 pub use correlated::set_user_functions;
 pub use correlated::{
     with_correlated_runner, with_function_hook, with_sequence_hook, FnResult, UserFn,
@@ -14452,6 +14453,18 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
         Some(N::FuncCall(f))
             if func_name(f)
                 .as_deref()
+                .and_then(pgcrypto::result_type)
+                .is_some() =>
+        {
+            func_name(f)
+                .as_deref()
+                .and_then(pgcrypto::result_type)
+                .unwrap_or("bytea")
+                .to_string()
+        }
+        Some(N::FuncCall(f))
+            if func_name(f)
+                .as_deref()
                 .and_then(mathfn::result_type)
                 .is_some() =>
         {
@@ -15737,6 +15750,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                             || xml::result_type(&name).is_some()
                             || jsonops::result_type(&name).is_some()
                             || mathfn::result_type(&name).is_some()
+                            || pgcrypto::result_type(&name).is_some()
                             || jsonpath::is_function(&name)
                         {
                             declared.to_string()

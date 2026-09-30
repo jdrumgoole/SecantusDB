@@ -3989,6 +3989,8 @@ impl PgHandler {
             // Operator classes only: GIN / GiST over the scalar types.
             "btree_gin" => Some(("1.3", true, &[])),
             "btree_gist" => Some(("1.6", true, &[])),
+            // Functions only: digest / hmac / crypt / gen_salt / ...
+            "pgcrypto" => Some(("1.3", true, &[])),
             "postgis" => Some(("3.4.6", false, &["geometry"])),
             _ => None,
         }
