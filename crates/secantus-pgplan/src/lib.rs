@@ -31243,15 +31243,44 @@ fn plan_create_rule(r: &pg_query::protobuf::RuleStmt) -> Result<Statement> {
                     format!("view rule for \"{table}\" must be named \"_RETURN\""),
                 ));
             }
-            return Err(Error::FeatureNotSupported(
-                "converting a table to a view with an ON SELECT rule".into(),
-            ));
+            "SELECT"
         }
         _ => return Err(Error::Unsupported("this rule event".into())),
     };
     let condition = r.where_clause.as_deref().map(deparse_expr).transpose()?;
     let mut actions = Vec::with_capacity(r.actions.len());
     for a in &r.actions {
+        // A set operation's members are separate queries, so NEW / OLD (a
+        // relation of the rule's own query level) cannot appear in them:
+        // PostgreSQL's 42P10, at the reference.
+        if let Some(N::InsertStmt(ins)) = a.node.as_ref() {
+            let sel = ins.select_stmt.as_deref().and_then(|n| n.node.as_ref());
+            if let Some(sel @ N::SelectStmt(s)) = sel {
+                if s.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
+                    let pseudo = sel.nodes().into_iter().find_map(|(n, _, _, _)| match n {
+                        pg_query::NodeRef::ColumnRef(c)
+                            if c.fields.len() > 1
+                                && matches!(
+                                    c.fields[0].node.as_ref(),
+                                    Some(N::String(s)) if s.sval == "old" || s.sval == "new"
+                                ) =>
+                        {
+                            Some(c.location)
+                        }
+                        _ => None,
+                    });
+                    if let Some(location) = pseudo {
+                        set_error_location(location);
+                        return Err(Error::Sqlstate(
+                            "42P10",
+                            "UNION/INTERSECT/EXCEPT member statement cannot refer to other \
+                             relations of same query level"
+                                .into(),
+                        ));
+                    }
+                }
+            }
+        }
         actions.push(
             a.deparse()
                 .map_err(|e| Error::Parse(format!("a rule action: {e}")))?,

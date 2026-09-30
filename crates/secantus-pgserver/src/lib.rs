@@ -10380,6 +10380,14 @@ impl PgHandler {
                     d.insert(f("relpartbound"), Bson::Null);
                     rows.push(d);
                 }
+                // PostgreSQL's own relations, as its pg_class lists them.
+                let namespaces = self.namespaces();
+                rows.extend(catalog_meta::class_rows(&def, |nsp| {
+                    namespaces
+                        .iter()
+                        .find(|(n, _)| n == nsp)
+                        .map_or(0, |(_, o)| *o)
+                }));
                 rows
             }
             "pg_namespace" => {
