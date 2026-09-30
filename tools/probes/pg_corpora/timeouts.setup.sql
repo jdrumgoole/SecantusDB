@@ -1,0 +1,2 @@
+RESET statement_timeout
+RESET lock_timeout

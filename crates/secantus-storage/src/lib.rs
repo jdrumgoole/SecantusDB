@@ -168,6 +168,15 @@ pub struct UserTransactionHandle {
 }
 
 impl UserTransactionHandle {
+    /// Has the transaction written anything? Until it has, abandoning it and
+    /// starting afresh is invisible at READ COMMITTED -- which is how a
+    /// server retries a statement whose first write lost a conflict.
+    pub fn has_written(&self) -> bool {
+        self.snapshot_fixed
+    }
+}
+
+impl UserTransactionHandle {
     /// Remove this transaction's minted ranges from the in-flight window and
     /// wake tailable waiters (the visible tail may advance). Idempotent.
     fn deregister_minted(&mut self) {

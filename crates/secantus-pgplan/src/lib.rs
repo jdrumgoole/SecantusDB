@@ -637,6 +637,29 @@ pub enum Statement {
     /// `DEALLOCATE <name>`: the wire layer drops that one prepared statement,
     /// answering 26000 when no statement of the name exists.
     Deallocate(String),
+    /// `VACUUM` / `ANALYZE` / `CHECKPOINT` / `REINDEX`: nothing to do in this
+    /// storage, but PostgreSQL's validation still applies -- the relations
+    /// and columns must exist (`indexes` names ones that must be indexes),
+    /// and `outside_block` ones refuse a transaction block (25001).
+    Maintenance {
+        command: String,
+        tables: Vec<(String, Vec<String>)>,
+        indexes: Vec<String>,
+        outside_block: bool,
+    },
+    /// `CLUSTER [table [USING index]]`: the table's rows rewritten in the
+    /// index's order, which an unordered scan then shows.
+    Cluster {
+        table: Option<String>,
+        index: Option<String>,
+    },
+    /// `LOCK [TABLE] t, ... [IN mode MODE] [NOWAIT]`, `mode` being
+    /// PostgreSQL's lock-mode number (1 ACCESS SHARE .. 8 ACCESS EXCLUSIVE).
+    LockTable {
+        tables: Vec<String>,
+        mode: i32,
+        nowait: bool,
+    },
     /// `PREPARE name [(types)] AS query`: the query, planned again on each
     /// `EXECUTE` with the arguments as its parameters. `text` is the
     /// statement as `pg_prepared_statements` shows it.
@@ -976,6 +999,9 @@ pub enum AlterTableAction {
     /// `VALIDATE CONSTRAINT name`: every constraint here is validated when
     /// added, so only its existence is checked.
     ValidateConstraint(String),
+    /// `CLUSTER ON index` / `SET WITHOUT CLUSTER` (`None`): the index a bare
+    /// `CLUSTER t` reorders by, which `pg_index.indisclustered` reports.
+    ClusterOn(Option<String>),
     /// `ATTACH PARTITION name FOR VALUES ...`: the bound as
     /// [`partitions::bound_document`] records it.
     AttachPartition {
@@ -2821,6 +2847,80 @@ fn plan_node(
         }
         N::ClosePortalStmt(c) => Ok(Statement::CloseCursor(c.portalname.clone())),
         // `DEALLOCATE ALL` carries no name; `DEALLOCATE x` names one.
+        N::VacuumStmt(v) => {
+            let command = if v.is_vacuumcmd { "VACUUM" } else { "ANALYZE" };
+            let analyze = !v.is_vacuumcmd
+                || v.options.iter().any(|o| {
+                    matches!(o.node.as_ref(), Some(N::DefElem(d)) if d.defname == "analyze")
+                });
+            let mut tables = Vec::new();
+            for r in &v.rels {
+                let Some(N::VacuumRelation(vr)) = r.node.as_ref() else { continue };
+                let columns: Vec<String> = vr
+                    .va_cols
+                    .iter()
+                    .filter_map(|c| match c.node.as_ref() {
+                        Some(N::String(s)) => Some(s.sval.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if !columns.is_empty() && !analyze {
+                    return Err(Error::FeatureNotSupported(
+                        "ANALYZE option must be specified when a column list is provided".into(),
+                    ));
+                }
+                let name = vr.relation.as_ref().map(|r| r.relname.clone()).unwrap_or_default();
+                tables.push((name, columns));
+            }
+            Ok(Statement::Maintenance {
+                command: command.into(),
+                tables,
+                indexes: Vec::new(),
+                outside_block: v.is_vacuumcmd,
+            })
+        }
+        N::CheckPointStmt(_) => Ok(Statement::Maintenance {
+            command: "CHECKPOINT".into(),
+            tables: Vec::new(),
+            indexes: Vec::new(),
+            outside_block: false,
+        }),
+        N::ReindexStmt(r) => {
+            use pg_query::protobuf::ReindexObjectType as R;
+            let rel = r.relation.as_ref().map(|r| r.relname.clone()).unwrap_or_default();
+            let (tables, indexes, whole) = match R::try_from(r.kind) {
+                Ok(R::ReindexObjectTable) => (vec![(rel, Vec::new())], Vec::new(), None),
+                Ok(R::ReindexObjectIndex) => (Vec::new(), vec![rel], None),
+                Ok(R::ReindexObjectDatabase) => (Vec::new(), Vec::new(), Some("DATABASE")),
+                Ok(R::ReindexObjectSystem) => (Vec::new(), Vec::new(), Some("SYSTEM")),
+                _ => (Vec::new(), Vec::new(), Some("SCHEMA")),
+            };
+            Ok(Statement::Maintenance {
+                command: match whole {
+                    Some(w) => format!("REINDEX {w}"),
+                    None => "REINDEX".into(),
+                },
+                tables,
+                indexes,
+                outside_block: whole.is_some(),
+            })
+        }
+        N::ClusterStmt(c) => Ok(Statement::Cluster {
+            table: c.relation.as_ref().map(|r| r.relname.clone()),
+            index: Some(c.indexname.clone()).filter(|i| !i.is_empty()),
+        }),
+        N::LockStmt(l) => Ok(Statement::LockTable {
+            tables: l
+                .relations
+                .iter()
+                .filter_map(|r| match r.node.as_ref() {
+                    Some(N::RangeVar(r)) => Some(r.relname.clone()),
+                    _ => None,
+                })
+                .collect(),
+            mode: l.mode,
+            nowait: l.nowait,
+        }),
         N::PrepareStmt(p) => {
             let query = p
                 .query
@@ -3714,6 +3814,8 @@ fn plan_alter_action(
                 .unwrap_or_default(),
         )),
         Ok(AT::AtValidateConstraint) => Ok(AlterTableAction::ValidateConstraint(cmd.name.clone())),
+        Ok(AT::AtClusterOn) => Ok(AlterTableAction::ClusterOn(Some(cmd.name.clone()))),
+        Ok(AT::AtDropCluster) => Ok(AlterTableAction::ClusterOn(None)),
         Ok(AT::AtDropNotNull) => Ok(AlterTableAction::SetNotNull {
             column: cmd.name.clone(),
             not_null: false,
@@ -4039,6 +4141,14 @@ pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
         AlterTableAction::OwnerTo(role) => {
             def.extra.insert("owner", role.clone());
         }
+        AlterTableAction::ClusterOn(index) => match index {
+            Some(i) => {
+                def.extra.insert("clustered_index", i.clone());
+            }
+            None => {
+                def.extra.remove("clustered_index");
+            }
+        },
         AlterTableAction::RowSecurity { .. }
         | AlterTableAction::AttachPartition { .. }
         | AlterTableAction::DetachPartition(_)

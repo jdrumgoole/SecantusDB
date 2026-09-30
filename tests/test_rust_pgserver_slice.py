@@ -14597,3 +14597,84 @@ def test_sql_prepare_execute(home: Path) -> None:
         ) == [("ins", "{integer,text}", True), ("sel", "{integer}", True)]
         conn.execute("DEALLOCATE ALL")
         assert _fetch(conn, "SELECT count(*) FROM pg_prepared_statements") == [(0,)]
+
+
+def test_autocommit_write_waits_and_reevaluates(home: Path) -> None:
+    """An autocommit UPDATE that meets another transaction's uncommitted
+    write to its row waits for it and then builds on the committed value --
+    it does not overwrite it (a lost update). Simple and extended protocol."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        a.execute("CREATE TABLE lu (id int PRIMARY KEY, n int)")
+        a.execute("INSERT INTO lu VALUES (1, 0)")
+        for sql, args in (
+            ("UPDATE lu SET n = n + 1 WHERE id = 1", None),
+            ("UPDATE lu SET n = n + %s WHERE id = %s", (1, 1)),
+        ):
+            a.execute("BEGIN")
+            a.execute("UPDATE lu SET n = n + 100 WHERE id = 1")
+            worker = threading.Thread(target=b.execute, args=(sql, args))
+            worker.start()
+            time.sleep(0.3)
+            a.execute("COMMIT")
+            worker.join(10)
+            assert not worker.is_alive()
+        assert _fetch(a, "SELECT n FROM lu") == [(202,)]
+
+
+def test_statement_and_lock_timeouts(home: Path) -> None:
+    """`statement_timeout` cancels a running statement (57014) and
+    `lock_timeout` a lock wait (55P03); `LOCK TABLE` needs a block, and a
+    table locked ACCESS EXCLUSIVE shuts out another session's reads."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        a.execute("SET statement_timeout = 100")
+        assert _sqlstate(a, "SELECT pg_sleep(1)") == "57014"
+        a.execute("RESET statement_timeout")
+        assert _fetch(a, "SHOW statement_timeout") == [("0",)]
+        a.execute("CREATE TABLE lt (id int)")
+        assert _sqlstate(a, "LOCK TABLE lt") == "25P01"
+        a.execute("BEGIN")
+        a.execute("LOCK TABLE lt IN ACCESS EXCLUSIVE MODE")
+        b.execute("SET lock_timeout = 100")
+        assert _sqlstate(b, "SELECT count(*) FROM lt") == "55P03"
+        b.execute("BEGIN")
+        assert _sqlstate(b, "LOCK TABLE lt IN SHARE MODE NOWAIT") == "55P03"
+        b.execute("ROLLBACK")
+        a.execute("COMMIT")
+        assert _fetch(b, "SELECT count(*) FROM lt") == [(0,)]
+
+
+def test_maintenance_statements_and_cluster(home: Path) -> None:
+    """VACUUM / ANALYZE / CHECKPOINT / REINDEX validate what they name, and
+    CLUSTER rewrites the table in an index's order, recording it."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE TABLE mc (id int PRIMARY KEY, v text)")
+        conn.execute("INSERT INTO mc VALUES (3, 'c'), (1, 'a'), (2, 'b')")
+        conn.execute("CREATE INDEX mc_v ON mc (v DESC)")
+        for ok in ("VACUUM mc", "ANALYZE mc (v)", "CHECKPOINT", "REINDEX TABLE mc"):
+            conn.execute(ok)
+        assert _sqlstate(conn, "VACUUM nosuch") == "42P01"
+        assert _sqlstate(conn, "ANALYZE mc (nope)") == "42703"
+        conn.execute("CLUSTER mc USING mc_v")
+        assert _fetch(conn, "SELECT id FROM mc") == [(3,), (2,), (1,)]
+        conn.execute("CLUSTER mc USING mc_pkey")
+        assert _fetch(conn, "SELECT id FROM mc") == [(1,), (2,), (3,)]
+        conn.execute("BEGIN")
+        assert _sqlstate(conn, "VACUUM mc") == "25001"
+        conn.execute("ROLLBACK")
+
+
+def test_ordinality_rows_from_and_values_clauses(home: Path) -> None:
+    """`WITH ORDINALITY` numbers a function's rows, `ROWS FROM` zips
+    functions, a bare VALUES takes ORDER BY / LIMIT, and one output name
+    twice in a FROM subquery is still two columns."""
+    with _Server(home) as server, server.connect() as conn:
+        assert _fetch(conn, "SELECT * FROM unnest(ARRAY['a','b']) WITH ORDINALITY AS t(v, n)") == [
+            ("a", 1),
+            ("b", 2),
+        ]
+        assert _fetch(
+            conn,
+            "SELECT * FROM ROWS FROM (generate_series(1,2), unnest(ARRAY['x','y','z'])) AS t(a, b)",
+        ) == [(1, "x"), (2, "y"), (None, "z")]
+        assert _fetch(conn, "VALUES (1), (2), (3) ORDER BY 1 DESC LIMIT 2") == [(3,), (2,)]
+        assert _fetch(conn, "SELECT * FROM (SELECT 1 AS a, 2 AS a) s") == [(1, 2)]

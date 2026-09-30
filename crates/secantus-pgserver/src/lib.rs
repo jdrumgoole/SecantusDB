@@ -10,6 +10,7 @@
 //! including the shared on-disk catalog format. Breadth is P5's problem.
 
 mod advisory;
+mod table_locks;
 mod aggregates;
 mod do_block;
 mod encoding;
@@ -90,6 +91,9 @@ pub struct BackendEntry {
     /// Wakes the connection's idle wait when the inbox fills or `terminate`
     /// is set, so an idle client hears without sending anything.
     wake: tokio::sync::Notify,
+    /// When the running statement's `statement_timeout` expires, if it has
+    /// one: a cancellation point past it answers 57014.
+    deadline: Mutex<Option<std::time::Instant>>,
 }
 
 /// One index relation as `pg_index` / `pg_class` report it.
@@ -144,6 +148,7 @@ impl BackendEntry {
             listening: Mutex::new(Vec::new()),
             inbox: Mutex::new(VecDeque::new()),
             wake: tokio::sync::Notify::new(),
+            deadline: Mutex::new(None),
             activity: Mutex::new(BackendActivity {
                 datname: datname.to_string(),
                 usename: String::new(),
@@ -4988,6 +4993,138 @@ impl PgHandler {
         Ok(())
     }
 
+    /// 42P01 for a relation that does not exist.
+    fn relation_missing(name: &str) -> PgWireError {
+        Self::user_error("42P01", format!("relation \"{name}\" does not exist"))
+    }
+
+    /// Wait while another session's `LOCK TABLE` holds a mode that conflicts
+    /// with what this statement would take on a relation it names (ACCESS
+    /// SHARE to read, ROW EXCLUSIVE to write, ACCESS EXCLUSIVE to TRUNCATE).
+    /// One atomic load when no table is locked anywhere.
+    fn wait_for_table_locks(&self, sql: &str) -> PgWireResult<()> {
+        if !table_locks::any() {
+            return Ok(());
+        }
+        let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
+        for (table, privilege) in secantus_pgplan::privileges::sql_relations(sql) {
+            let mode = match privilege {
+                "SELECT" => table_locks::ACCESS_SHARE,
+                "TRUNCATE" => table_locks::ACCESS_EXCLUSIVE,
+                _ => table_locks::ROW_EXCLUSIVE,
+            };
+            table_locks::acquire(&table, pid, mode, false, false, self.lock_wait_poll())?;
+        }
+        Ok(())
+    }
+
+    /// The (field, descending) keys index `index` of `table` sorts by, for
+    /// CLUSTER: 42704 when the table has no such index, 0A000 for an
+    /// expression key, which has no stored field to sort on.
+    fn cluster_keys(&self, table: &str, index: &str) -> PgWireResult<Vec<(String, bool)>> {
+        let def = self.lookup(table).ok_or_else(|| Self::relation_missing(table))?;
+        let missing = || {
+            Self::user_error(
+                "42704",
+                format!("index \"{index}\" for table \"{table}\" does not exist"),
+            )
+        };
+        if index == format!("{table}_pkey") && def.columns.iter().any(|c| c.pk) {
+            return Ok(def
+                .columns
+                .iter()
+                .filter(|c| c.pk)
+                .map(|c| (c.field(), false))
+                .collect());
+        }
+        let stored = self
+            .storage
+            .list_indexes(self.db(), table)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|ix| ix.get_str("name") == Ok(index));
+        if let Some(ix) = stored {
+            let key = ix.get_document("key").map_err(|_| missing())?;
+            let mut out = Vec::new();
+            for (field, dir) in key {
+                if !def.columns.iter().any(|c| c.field() == *field) {
+                    return Err(Self::user_error(
+                        "0A000",
+                        "CLUSTER on an expression index is not supported yet".into(),
+                    ));
+                }
+                let desc = matches!(dir, Bson::Int32(d) if *d < 0)
+                    || matches!(dir, Bson::Int64(d) if *d < 0)
+                    || matches!(dir, Bson::Double(d) if *d < 0.0);
+                out.push((field.clone(), desc));
+            }
+            return Ok(out);
+        }
+        if let Some(u) = def.unique_constraints.iter().find(|u| u.name == index) {
+            return Ok(u
+                .columns
+                .iter()
+                .filter_map(|c| def.column(c).map(|c| (c.field(), false)))
+                .collect());
+        }
+        Err(missing())
+    }
+
+    /// `CLUSTER table USING index`: the rows rewritten in the index's order
+    /// (ascending NULLs last, descending NULLs first, as the index sorts),
+    /// and the index recorded as the table's clustered one.
+    fn cluster_table(&self, table: &str, index: &str) -> PgWireResult<()> {
+        let def = self.lookup(table).ok_or_else(|| Self::relation_missing(table))?;
+        if partition::is_partitioned(&def) {
+            return Err(Self::user_error(
+                "0A000",
+                "cannot cluster a partitioned table".into(),
+            ));
+        }
+        let keys = self.cluster_keys(table, index)?;
+        let mut docs = self.table_docs(table)?;
+        docs.sort_by(|a, b| {
+            for (field, desc) in &keys {
+                let (x, y) = (
+                    a.get(field).cloned().unwrap_or(Bson::Null),
+                    b.get(field).cloned().unwrap_or(Bson::Null),
+                );
+                let ord = match (x == Bson::Null, y == Bson::Null) {
+                    (true, true) => std::cmp::Ordering::Equal,
+                    // NULLs sort last ascending, so first descending.
+                    (true, false) => std::cmp::Ordering::Greater,
+                    (false, true) => std::cmp::Ordering::Less,
+                    (false, false) => secantus_pgplan::compare_values(&x, &y)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                };
+                let ord = if *desc { ord.reverse() } else { ord };
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+        if !docs.is_empty() {
+            let out = docs
+                .iter()
+                .map(|d| encode_doc(d).map_err(|e| Self::storage_err("could not encode a row", e)))
+                .collect::<PgWireResult<Vec<_>>>()?;
+            self.storage
+                .delete_matching(self.db(), table, &Document::new(), 0, &Document::new(), None)
+                .map_err(|e| Self::storage_err("could not clear the table", e))?;
+            self.storage
+                .insert(self.db(), table, out, true)
+                .map_err(|e| Self::storage_err("could not rewrite the table", e))?;
+        }
+        let record = self.plan_internal(&format!(
+            "ALTER TABLE {} CLUSTER ON {}",
+            secantus_pgplan::scalar::quote_identifier(table),
+            secantus_pgplan::scalar::quote_identifier(index)
+        ))?;
+        self.execute_statement(record, 0)?;
+        Ok(())
+    }
+
     /// 26000 for a prepared statement no PREPARE / Parse made.
     fn prepared_missing(name: &str) -> PgWireError {
         Self::user_error(
@@ -6924,9 +7061,9 @@ impl PgHandler {
             return Ok(Bson::Boolean(released));
         }
         if xact && !in_block {
-            advisory::wait_free(key, pid, shared, || self.check_cancel())?;
+            advisory::wait_free(key, pid, shared, self.lock_wait_poll())?;
         } else {
-            advisory::lock(key, pid, shared, xact, || self.check_cancel())?;
+            advisory::lock(key, pid, shared, xact, self.lock_wait_poll())?;
         }
         Ok(Bson::String(String::new()))
     }
@@ -7368,6 +7505,7 @@ impl PgHandler {
                     Column::new("indisunique", "bool", false),
                     Column::new("indisprimary", "bool", false),
                     Column::new("indisexclusion", "bool", false),
+                    Column::new("indisclustered", "bool", false),
                     Column::new("indkey", "int2vector", false),
                 ],
             )),
@@ -8133,6 +8271,10 @@ impl PgHandler {
                         d.insert(f("indisunique"), ix.unique);
                         d.insert(f("indisprimary"), ix.primary);
                         d.insert(f("indisexclusion"), ix.exclusion);
+                        d.insert(
+                            f("indisclustered"),
+                            ix.table.extra.get_str("clustered_index") == Ok(ix.name.as_str()),
+                        );
                         d.insert(
                             f("indkey"),
                             Bson::Array(ix.keys.into_iter().map(Bson::Int32).collect()),
@@ -10082,6 +10224,10 @@ fn canonical_ms_guc(name: &str, value: &str) -> PgWireResult<String> {
     }
 }
 
+/// The statement-scoped millisecond GUCs this server OBEYS: validated and
+/// canonicalised like the idle timeouts (`SHOW statement_timeout` is `1s`).
+const MS_GUCS: [&str; 2] = ["statement_timeout", "lock_timeout"];
+
 /// The boolean GUCs whose value this server OBEYS, so `SET` validates them as
 /// PostgreSQL does (`22023 parameter "x" requires a Boolean value`) and
 /// stores the canonical `on` / `off` a client reads back.
@@ -10146,6 +10292,8 @@ fn default_settings() -> HashMap<String, String> {
         ("search_path", "\"$user\", public"),
         ("idle_in_transaction_session_timeout", "0"),
         ("idle_session_timeout", "0"),
+        ("statement_timeout", "0"),
+        ("lock_timeout", "0"),
         ("application_name", ""),
         ("server_encoding", "UTF8"),
         // `C.UTF-8`: text sorts by code point (which, over UTF-8, is byte
@@ -10842,8 +10990,9 @@ impl Drop for PgHandler {
         // Deregister so the map never signals a PID this connection has left
         // behind. `0` means startup never ran, so there is nothing to remove.
         let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
-        // A session's advisory locks die with it.
+        // A session's advisory locks die with it, and its table locks.
         advisory::release_session(pid);
+        table_locks::release(pid);
         if pid != 0 {
             backend_registry()
                 .lock()
@@ -11583,6 +11732,11 @@ impl PgHandler {
             A::OwnerTo(role) => {
                 return Ok(Some(A::OwnerTo(self.grantee_name(role)?)));
             }
+            A::ClusterOn(Some(index)) => {
+                self.cluster_keys(table, index)?;
+                return Ok(Some(action.clone()));
+            }
+            A::ClusterOn(None) => return Ok(Some(action.clone())),
             A::ValidateConstraint(name) => {
                 let exists = def.check_constraints.iter().any(|c| c.name == *name)
                     || def.foreign_keys.iter().any(|f| f.name == *name)
@@ -11696,7 +11850,7 @@ impl PgHandler {
                 };
                 self.put_comment_doc(Self::RLS_COLLECTION, table, Some(doc))
             }
-            A::OwnerTo(_) | A::ValidateConstraint(_) => Ok(()),
+            A::OwnerTo(_) | A::ValidateConstraint(_) | A::ClusterOn(_) => Ok(()),
             A::AttachPartition { name, bound } => self.attach_partition(table, name, bound),
             A::DetachPartition(name) => self.detach_partition(table, name),
             // The rows are rewritten rather than left short a field, for two
@@ -12739,6 +12893,14 @@ impl PgHandler {
         self.backend
             .cancel
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        // `statement_timeout` starts now, for this statement.
+        let timeout = self.ms_setting("statement_timeout");
+        *self
+            .backend
+            .deadline
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = (timeout > 0)
+            .then(|| std::time::Instant::now() + std::time::Duration::from_millis(timeout as u64));
         // A COPY OUT cancelled mid-stream failed after its statement had
         // answered; the block is poisoned from here, as it is on PostgreSQL.
         if self
@@ -12845,7 +13007,47 @@ impl PgHandler {
         if self.backend.cancelled() {
             return Err(Self::query_canceled());
         }
+        let expired = self
+            .backend
+            .deadline
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|d| std::time::Instant::now() >= d);
+        if expired {
+            return Err(Self::user_error(
+                "57014",
+                "canceling statement due to statement timeout".into(),
+            ));
+        }
         Ok(())
+    }
+
+    /// A millisecond setting (`statement_timeout`, `lock_timeout`) as a
+    /// number; 0 -- off -- when unset.
+    fn ms_setting(&self, name: &str) -> i64 {
+        self.settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .and_then(|v| parse_ms_guc(v))
+            .unwrap_or(0)
+    }
+
+    /// The poll a lock wait runs: a cancel or `statement_timeout` ends it, and
+    /// so does `lock_timeout` measured from the wait's start (55P03).
+    fn lock_wait_poll(&self) -> impl FnMut() -> PgWireResult<()> + '_ {
+        let limit = self.ms_setting("lock_timeout");
+        let start = std::time::Instant::now();
+        move || {
+            self.check_cancel()?;
+            if limit > 0 && start.elapsed() >= std::time::Duration::from_millis(limit as u64) {
+                return Err(Self::user_error(
+                    "55P03",
+                    "canceling statement due to lock timeout".into(),
+                ));
+            }
+            Ok(())
+        }
     }
 
     async fn run_typed_inner(
@@ -12871,6 +13073,7 @@ impl PgHandler {
         // start before the check. An aborted block answers 25P02 instead.
         if !self.txn_failed.load(std::sync::atomic::Ordering::Relaxed) {
             self.check_sql_privileges(sql)?;
+            self.wait_for_table_locks(sql)?;
         }
         // An uncorrelated subquery is RUN during planning and replaced by the
         // values it returned, so the lowering below never sees a `SubLink`.
@@ -12951,9 +13154,9 @@ impl PgHandler {
                             | TransactionControl::Rollback { .. }
                             | TransactionControl::Prepare(_)
                     ) {
-                        advisory::release_xact(
-                            self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
-                        );
+                        let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
+                        advisory::release_xact(pid);
+                        table_locks::release(pid);
                     }
                     out
                 }
@@ -13082,13 +13285,40 @@ impl PgHandler {
         // `CancelRequest` meant to interrupt the statement never arrives.
         let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
         let out = tokio::task::block_in_place(|| match guard.as_mut() {
-            Some(handle) => self
-                .storage
-                .with_user_transaction(self.with_isolation(handle)?, || {
-                    self.execute(stmt, max_rows)
-                })
-                .map_err(|e| Self::storage_err("transaction failed", e))
-                .and_then(|r| r),
+            Some(handle) => {
+                // A row write in a transaction that has not written yet --
+                // an extended-protocol group's first statement, or a block's
+                // first write -- can lose a conflict and be run again on a
+                // fresh transaction, invisibly at READ COMMITTED: PostgreSQL
+                // waits for the other writer and re-evaluates there.
+                let fresh = Self::row_write(&stmt) && !handle.has_written();
+                let mut poll = fresh.then(|| self.lock_wait_poll());
+                let mut delay = std::time::Duration::from_millis(2);
+                loop {
+                    let out = self
+                        .storage
+                        .with_user_transaction(self.with_isolation(handle)?, || {
+                            self.execute(stmt.clone(), max_rows)
+                        })
+                        .map_err(|e| Self::storage_err("transaction failed", e))
+                        .and_then(|r| r);
+                    match (&out, poll.as_mut()) {
+                        (Err(e), Some(poll))
+                            if Self::is_write_conflict(e) && self.read_committed_now() =>
+                        {
+                            self.storage
+                                .rollback_user_transaction(handle)
+                                .map_err(|e| Self::storage_err("could not roll back", e))?;
+                            *handle = self.open_transaction_handle()?;
+                            poll()?;
+                            std::thread::sleep(delay);
+                            delay = (delay * 2).min(std::time::Duration::from_millis(20));
+                        }
+                        _ => break out,
+                    }
+                }
+            }
+            None if Self::row_write(&stmt) => self.run_autocommit_write(stmt, max_rows),
             None => self.execute(stmt, max_rows),
         });
         self.collect_planner_warnings();
@@ -13096,6 +13326,96 @@ impl PgHandler {
             self.note_failure();
         }
         out
+    }
+
+    /// An INSERT / UPDATE / DELETE: what an autocommit statement runs in a
+    /// transaction of its own for (`run_autocommit_write`).
+    fn row_write(stmt: &Statement) -> bool {
+        matches!(
+            stmt,
+            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+        )
+    }
+
+    /// Is `e` the serialization failure a write conflict surfaces as?
+    fn is_write_conflict(e: &PgWireError) -> bool {
+        matches!(e, PgWireError::UserError(info) if info.code == "40001")
+    }
+
+    /// Run an autocommit row write in a transaction of its own, as
+    /// PostgreSQL does: it commits whole or not at all, and it reads the
+    /// rows it rewrites in the same snapshot it writes them in.
+    ///
+    /// Without it each storage operation committed separately, and a SET
+    /// computed from a row (`n = n + 1`) was written after another session's
+    /// commit to the same row -- silently overwriting it (a lost update, seen
+    /// as `2` where PostgreSQL answers `101`).
+    ///
+    /// When the write collides with another transaction's, READ COMMITTED
+    /// waits for that transaction and re-evaluates against the row it left:
+    /// here the statement's transaction is rolled back and the statement run
+    /// again, polling for a cancel, `statement_timeout` and `lock_timeout`
+    /// between attempts. Under REPEATABLE READ / SERIALIZABLE the collision
+    /// is PostgreSQL's 40001, which stands.
+    /// Is the transaction a statement runs in READ COMMITTED: the block's
+    /// level inside one, the session default outside?
+    fn read_committed_now(&self) -> bool {
+        matches!(
+            self.settings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get("transaction_isolation")
+                .map(String::as_str),
+            None | Some("read committed" | "read uncommitted")
+        )
+    }
+
+    /// Is a statement outside a block READ COMMITTED (the session default)?
+    fn read_committed_default(&self) -> bool {
+        matches!(
+            self.settings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get("default_transaction_isolation")
+                .map(String::as_str),
+            None | Some("read committed" | "read uncommitted")
+        )
+    }
+
+    fn run_autocommit_write(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response>> {
+        let read_committed = self.read_committed_default();
+        let mut poll = self.lock_wait_poll();
+        let mut delay = std::time::Duration::from_millis(2);
+        loop {
+            let mut handle = self.open_transaction_handle()?;
+            let out = self
+                .storage
+                .with_user_transaction(&mut handle, || self.execute(stmt.clone(), max_rows))
+                .map_err(|e| Self::storage_err("transaction failed", e))
+                .and_then(|r| r)
+                .and_then(|r| {
+                    self.storage
+                        .commit_user_transaction(&mut handle)
+                        .map_err(|e| Self::storage_err("could not commit a transaction", e))?;
+                    Ok(r)
+                });
+            match out {
+                Ok(r) => return Ok(r),
+                Err(e) => {
+                    // A handle that committed has nothing to roll back; one
+                    // that failed is rolled back before anything else.
+                    let _ = self.storage.rollback_user_transaction(&mut handle).map_err(|re| {
+                        eprintln!("secantusd-pg: rolling back a failed statement: {re}")
+                    });
+                    if !(read_committed && Self::is_write_conflict(&e)) {
+                        return Err(e);
+                    }
+                }
+            }
+            poll()?;
+            std::thread::sleep(delay);
+            delay = (delay * 2).min(std::time::Duration::from_millis(20));
+        }
     }
 
     /// Queue the WARNINGs the planner raised on this thread (an `aclitem`
@@ -18429,6 +18749,91 @@ impl PgHandler {
                     .clear();
                 Ok(vec![Response::Execution(Tag::new("DEALLOCATE ALL"))])
             }
+            Statement::Maintenance {
+                command,
+                tables,
+                indexes,
+                outside_block,
+            } => {
+                if outside_block {
+                    self.refuse_in_transaction_block(&command)?;
+                }
+                for (table, columns) in &tables {
+                    let def = self.lookup(table).ok_or_else(|| Self::relation_missing(table))?;
+                    for c in columns {
+                        if def.column(c).is_none() {
+                            return Err(Self::user_error(
+                                "42703",
+                                format!("column \"{c}\" of relation \"{table}\" does not exist"),
+                            ));
+                        }
+                    }
+                }
+                for index in &indexes {
+                    if !self.index_relations().iter().any(|ix| ix.name == *index) {
+                        return Err(Self::relation_missing(index));
+                    }
+                }
+                let tag = command.split(' ').next().unwrap_or_default().to_string();
+                Ok(vec![Response::Execution(Tag::new(&tag))])
+            }
+            Statement::Cluster { table, index } => {
+                let tables: Vec<(String, String)> = match (table, index) {
+                    // A bare CLUSTER re-clusters every table that has been
+                    // clustered, and refuses a transaction block.
+                    (None, _) => {
+                        self.refuse_in_transaction_block("CLUSTER")?;
+                        self.all_table_defs()?
+                            .into_iter()
+                            .filter_map(|d| {
+                                let ix = d.extra.get_str("clustered_index").ok()?.to_string();
+                                Some((d.name.clone(), ix))
+                            })
+                            .collect()
+                    }
+                    (Some(t), Some(i)) => vec![(t, i)],
+                    (Some(t), None) => {
+                        let def = self.lookup(&t).ok_or_else(|| Self::relation_missing(&t))?;
+                        let Ok(i) = def.extra.get_str("clustered_index") else {
+                            return Err(Self::user_error(
+                                "42704",
+                                format!("there is no previously clustered index for table \"{t}\""),
+                            ));
+                        };
+                        vec![(t.clone(), i.to_string())]
+                    }
+                };
+                for (t, i) in tables {
+                    self.cluster_table(&t, &i)?;
+                }
+                Ok(vec![Response::Execution(Tag::new("CLUSTER"))])
+            }
+            Statement::LockTable {
+                tables,
+                mode,
+                nowait,
+            } => {
+                if !self.in_transaction.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(Self::user_error(
+                        "25P01",
+                        "LOCK TABLE can only be used in transaction blocks".into(),
+                    ));
+                }
+                let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
+                for t in &tables {
+                    if self.lookup(t).is_none() {
+                        return Err(Self::relation_missing(t));
+                    }
+                    let got = table_locks::acquire(t, pid, mode, true, nowait, self.lock_wait_poll())?;
+                    if !got {
+                        return Err(Self::user_error(
+                            "55P03",
+                            format!("could not obtain lock on relation \"{t}\""),
+                        ));
+                    }
+                }
+                Ok(vec![Response::Execution(Tag::new("LOCK TABLE"))])
+            }
             Statement::SqlPrepare {
                 name,
                 arg_types,
@@ -18631,7 +19036,9 @@ impl PgHandler {
                     // the stored value and the reported ParameterStatus agree.
                     let value = if key == "DateStyle" {
                         secantus_pgplan::DateStyle::parse(&value).canonical()
-                    } else if IDLE_TIMEOUT_GUCS.iter().any(|(guc, _, _)| *guc == key) {
+                    } else if IDLE_TIMEOUT_GUCS.iter().any(|(guc, _, _)| *guc == key)
+                        || MS_GUCS.contains(&key.as_str())
+                    {
                         canonical_ms_guc(&key, &value)?
                     } else if BOOL_GUCS.contains(&key.as_str()) {
                         canonical_bool_guc(&key, &value)?
