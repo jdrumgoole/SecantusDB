@@ -150,6 +150,13 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
             let first = hits.next()?;
             hits.next().is_none().then(|| pos(first.start))?
         }
+        // A date/time literal that does not read: at the literal.
+        "22007" | "22008" => {
+            let (_, value) = m.rsplit_once(": \"")?;
+            let value = value.strip_suffix('"')?;
+            let lit = format!("'{}'", value.replace('\'', "''"));
+            pos(toks.iter().find(|t| t.text == lit)?.start)
+        }
         "22P02" => {
             // `invalid input syntax for type integer: "abc"`: the literal.
             let (_, value) = m.rsplit_once(": \"")?;

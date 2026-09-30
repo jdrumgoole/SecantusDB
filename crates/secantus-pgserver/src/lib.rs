@@ -25096,6 +25096,51 @@ fn encode_typed_row(
 }
 
 /// Whether a field's rendered bytes may carry non-ASCII characters that need
+/// A binary-format array of a text-family type: its elements carry text,
+/// between length words a whole-payload transcode would corrupt.
+fn binary_text_array(field: &FieldInfo) -> bool {
+    field.format() == FieldFormat::Binary
+        && matches!(
+            *field.datatype(),
+            Type::TEXT_ARRAY
+                | Type::VARCHAR_ARRAY
+                | Type::BPCHAR_ARRAY
+                | Type::NAME_ARRAY
+                | Type::CHAR_ARRAY
+        )
+}
+
+/// `array_send`'s bytes with each element transcoded (and its length word
+/// rewritten): `ndim, flags, elemtype, (size, lbound) per dim`, then each
+/// element as `len` + bytes (`-1` for NULL).
+fn transcode_binary_array(bytes: &[u8], cenc: ClientEncoding) -> Result<Vec<u8>, Option<char>> {
+    let word = |at: usize| -> Result<i32, Option<char>> {
+        bytes
+            .get(at..at + 4)
+            .map(|b| i32::from_be_bytes(b.try_into().expect("4 bytes")))
+            .ok_or(None)
+    };
+    let ndim = usize::try_from(word(0)?).map_err(|_| None)?;
+    let head = 12 + 8 * ndim;
+    let mut out = bytes.get(..head).ok_or(None)?.to_vec();
+    let mut at = head;
+    while at < bytes.len() {
+        let len = word(at)?;
+        at += 4;
+        if len < 0 {
+            out.extend_from_slice(&len.to_be_bytes());
+            continue;
+        }
+        let elem = bytes.get(at..at + len as usize).ok_or(None)?;
+        at += len as usize;
+        let converted = encoding::encode(cenc, elem).map_err(Some)?;
+        out.extend_from_slice(&(converted.len() as i32).to_be_bytes());
+        out.extend_from_slice(&converted);
+    }
+    Ok(out)
+}
+
+/// Whether a field's rendered bytes may carry non-ASCII characters that need
 /// transcoding to the client encoding.
 ///
 /// In TEXT format every value is safe to transcode as one blob: the structural
@@ -25103,10 +25148,8 @@ fn encode_typed_row(
 /// LATIN1 / LATIN9, so only the character content moves. In BINARY format that
 /// is true only for a scalar text-family value, whose whole payload IS the
 /// string bytes -- json too, and jsonb, whose only non-text byte is the `1`
-/// version prefix that a Latin transcode leaves alone; a binary array or record
-/// interleaves big-endian length words that a blanket transcode would corrupt,
-/// so those keep the internal UTF-8 bytes (correct for ASCII; non-ASCII in a
-/// binary array under LATIN1 / LATIN9 is deferred -- see `tasks/backlog.md`).
+/// version prefix that a Latin transcode leaves alone. A binary text-family
+/// ARRAY is transcoded element by element (`transcode_binary_array`).
 fn field_may_carry_text(field: &FieldInfo) -> bool {
     match field.format() {
         FieldFormat::Text => true,
@@ -25176,7 +25219,8 @@ fn transcoding_field<F>(
 where
     F: FnOnce(&mut DataRowEncoder) -> PgWireResult<()>,
 {
-    if !cenc.transcodes() || !field_may_carry_text(field) {
+    let array = binary_text_array(field);
+    if !cenc.transcodes() || !(field_may_carry_text(field) || array) {
         return encode_once(enc);
     }
     let schema = Arc::new(vec![field.clone()]);
@@ -25186,8 +25230,14 @@ where
     match split_single_field(&row) {
         None => enc.encode_field(&None::<&str>),
         Some(utf8) => {
-            let bytes =
-                encoding::encode(cenc, &utf8).map_err(|ch| untranslatable_char(ch, cenc))?;
+            let bytes = if array {
+                transcode_binary_array(&utf8, cenc).map_err(|e| match e {
+                    Some(ch) => untranslatable_char(ch, cenc),
+                    None => PgWireError::ApiError("malformed binary array".into()),
+                })?
+            } else {
+                encoding::encode(cenc, &utf8).map_err(|ch| untranslatable_char(ch, cenc))?
+            };
             enc.encode_field_with_type_and_format(
                 &RawEncoded(bytes),
                 field.datatype(),
@@ -25387,7 +25437,9 @@ fn encode_field_value_inner(
         // encoder cannot do; its whole text is rendered here instead.
         // Sent as plain TEXT: the `&str` encoder quotes a value that holds
         // braces when the field is array-typed, and this is the whole array.
-        if element == "box" {
+        // A MULTIDIMENSIONAL array likewise: the element-wise encoder would
+        // quote each sub-array as a string (`{"{a,b}","{c,d}"}`).
+        if element == "box" || items.iter().any(|x| matches!(x, Bson::Array(_))) {
             let text = secantus_pgplan::value_text(&Bson::Array(items.clone()));
             let options = field.format_options().clone();
             return enc.encode_field_with_type_and_format(
