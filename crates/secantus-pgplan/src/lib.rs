@@ -31,6 +31,7 @@ pub mod fts;
 mod func_cast;
 mod optype;
 pub use errpos::error_position;
+pub mod collation;
 pub mod geo;
 pub mod geom;
 pub mod geometry;
@@ -507,6 +508,17 @@ pub enum Statement {
     CreateOperator(user_ops::UserOperator),
     /// `CREATE CAST` (see `user_casts`).
     CreateCast(user_casts::UserCast),
+    /// `CREATE COLLATION` (see `collation`).
+    CreateCollation {
+        collation: collation::UserCollation,
+        if_not_exists: bool,
+    },
+    /// `DROP COLLATION [IF EXISTS] names [CASCADE]`.
+    DropCollation {
+        names: Vec<String>,
+        if_exists: bool,
+        cascade: bool,
+    },
     /// `DROP CAST [IF EXISTS] (source AS target)`.
     DropCast {
         source: String,
@@ -3183,6 +3195,9 @@ fn plan_node(
         N::DefineStmt(d) if ObjectType::try_from(d.kind) == Ok(ObjectType::ObjectOperator) => {
             plan_create_operator(&d)
         }
+        N::DefineStmt(d) if ObjectType::try_from(d.kind) == Ok(ObjectType::ObjectCollation) => {
+            collation::plan_create(&d)
+        }
         N::CreateFunctionStmt(f) => plan_create_function(&f),
         N::CreateCastStmt(c) => user_casts::plan_create(&c),
         N::CreateTrigStmt(t) => plan_create_trigger(&t),
@@ -5563,12 +5578,29 @@ fn plan_create_index(
         if e.name.is_empty() {
             return Err(Error::Unsupported("this index key".into()));
         }
-        if !e.collation.is_empty() {
-            return Err(Error::Unsupported("an index key COLLATE".into()));
-        }
+        let key_collation = e
+            .collation
+            .iter()
+            .rev()
+            .find_map(|n| match n.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            });
         let Some(column) = def.column(&e.name) else {
             return Err(Error::UndefinedColumn(e.name.clone()));
         };
+        // A key's COLLATE: it must exist and the column must take one. It
+        // changes only which comparisons the index could serve, and a
+        // collated comparison reads a sort key rather than any index.
+        if let Some(name) = &key_collation {
+            if !collation::collatable(&column.pg_type) {
+                return Err(Error::DatatypeMismatch(format!(
+                    "collations are not supported by type {}",
+                    display_type(&column.pg_type)
+                )));
+            }
+            collation::resolve(name)?;
+        }
         let opclass = e
             .opclass
             .iter()
@@ -5582,7 +5614,24 @@ fn plan_create_index(
         // an access path here, and a query's ORDER BY places its NULLs by
         // its own clause whatever the index says.
         key_sql.push(format!("{}{opclass_sql}{suffix}", e.name));
-        expressions.push(e.name.clone());
+        // A key under a NONDETERMINISTIC collation is kept by its sort key,
+        // so a UNIQUE index refuses what the collation calls equal
+        // (`Apple` / `apple` under a case-insensitive one).
+        let key_nondeterministic = key_collation
+            .clone()
+            .or_else(|| column.extra.get_str("collation").ok().map(str::to_string))
+            .filter(|c| collation::resolve(c).is_ok_and(|r| !r.deterministic()));
+        match key_nondeterministic {
+            Some(c) => {
+                expressions.push(format!(
+                    "__coll_key('{}', {})",
+                    c.replace('\'', "''"),
+                    scalar::quote_identifier(&e.name)
+                ));
+                any_expression = true;
+            }
+            None => expressions.push(e.name.clone()),
+        }
         columns.push((e.name.clone(), desc));
     }
     if !any_expression {
@@ -6383,6 +6432,20 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                 // 4 rather than as an unsized `text` -- and so the Python
                 // server, which shares this catalog, reads the same type.
                 column.typmod = cd.type_name.as_ref().map(declared_typmod).unwrap_or(-1);
+                // `s text COLLATE x`: recorded, and honoured wherever the
+                // column is ordered or compared (`enum_order`). It used to be
+                // dropped, so the column compared by bytes whatever it said.
+                if let Some(cc) = cd.coll_clause.as_deref() {
+                    let name = collation::clause_name(cc);
+                    if !collation::collatable(&underlying) {
+                        return Err(Error::DatatypeMismatch(format!(
+                            "collations are not supported by type {}",
+                            display_type(&underlying)
+                        )));
+                    }
+                    collation::resolve(&name)?;
+                    column.extra.insert("collation", name);
+                }
                 if let Some(d) = &domain {
                     column.typmod = d.typmod;
                     column.extra.insert("domain_type", d.name.clone());
@@ -11742,9 +11805,167 @@ fn distinct_on_over_groups(
     })
 }
 
+/// `SELECT DISTINCT ON (<expressions>) ...` over plain rows: the keys and
+/// the ORDER BY terms are computed as columns of a FROM subquery, and the
+/// DISTINCT ON / ORDER BY / LIMIT run over those -- the planner's DISTINCT
+/// ON reads stored columns only. `None` when every key is already a column
+/// (or the query groups, which `distinct_on_over_groups` handles).
+fn distinct_on_over_expressions(
+    s: &pg_query::protobuf::SelectStmt,
+) -> Option<pg_query::protobuf::SelectStmt> {
+    if s.distinct_clause.is_empty() || s.distinct_clause[0].node.is_none() {
+        return None;
+    }
+    if !s.group_clause.is_empty() || has_aggregate(s) {
+        return None;
+    }
+    if s.distinct_clause
+        .iter()
+        .all(|k| matches!(k.node.as_ref(), Some(N::ColumnRef(_))))
+    {
+        return None;
+    }
+    let targets: Vec<&pg_query::protobuf::ResTarget> = s
+        .target_list
+        .iter()
+        .map(|t| match t.node.as_ref() {
+            Some(N::ResTarget(rt)) => Some(&**rt),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    // `*` expands to columns this cannot name.
+    if targets.iter().any(|rt| {
+        matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()),
+            Some(N::ColumnRef(c)) if c.fields.iter().any(|f| matches!(f.node, Some(N::AStar(_)))))
+    }) {
+        return None;
+    }
+    let output_name = |rt: &pg_query::protobuf::ResTarget| -> String {
+        if !rt.name.is_empty() {
+            return rt.name.clone();
+        }
+        match rt.val.as_deref().and_then(|v| v.node.as_ref()) {
+            Some(N::ColumnRef(c)) => column_ref_name(c).unwrap_or_else(|| "?column?".into()),
+            Some(N::FuncCall(f)) => func_name(f).unwrap_or_else(|| "?column?".into()),
+            Some(N::TypeCast(tc)) => cast_chain_over_column(tc)
+                .map(|(c, _)| c)
+                .unwrap_or_else(|_| "?column?".into()),
+            _ => "?column?".into(),
+        }
+    };
+    let names: Vec<String> = targets.iter().map(|rt| output_name(rt)).collect();
+    let col = |name: String| pg_query::protobuf::Node {
+        node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+            fields: vec![pg_query::protobuf::Node {
+                node: Some(N::String(pg_query::protobuf::String { sval: name })),
+            }],
+            location: -1,
+        })),
+    };
+    let named = |name: String, val: pg_query::protobuf::Node| pg_query::protobuf::Node {
+        node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+            name,
+            val: Some(Box::new(val)),
+            location: -1,
+            ..Default::default()
+        }))),
+    };
+    // An output position or name reads the target it names.
+    let output_ref = |n: &pg_query::protobuf::Node| -> Option<usize> {
+        match n.node.as_ref() {
+            Some(N::AConst(c)) => match c.val.as_ref() {
+                Some(pg_query::protobuf::a_const::Val::Ival(i)) => usize::try_from(i.ival)
+                    .ok()?
+                    .checked_sub(1)
+                    .filter(|k| *k < targets.len()),
+                _ => None,
+            },
+            Some(N::ColumnRef(c)) if c.fields.len() == 1 => {
+                let name = column_ref_name(c)?;
+                names.iter().position(|x| *x == name)
+            }
+            _ => None,
+        }
+    };
+    let mut inner_targets: Vec<pg_query::protobuf::Node> = targets
+        .iter()
+        .enumerate()
+        .map(|(i, rt)| {
+            named(
+                format!("__dt{i}"),
+                rt.val.as_deref().cloned().unwrap_or_default(),
+            )
+        })
+        .collect();
+    let mut keys = Vec::new();
+    for (k, key) in s.distinct_clause.iter().enumerate() {
+        match output_ref(key) {
+            Some(i) => keys.push(col(format!("__dt{i}"))),
+            None => {
+                inner_targets.push(named(format!("__dk{k}"), key.clone()));
+                keys.push(col(format!("__dk{k}")));
+            }
+        }
+    }
+    let mut sorts = Vec::new();
+    for (j, item) in s.sort_clause.iter().enumerate() {
+        let Some(N::SortBy(sb)) = item.node.as_ref() else {
+            return None;
+        };
+        let mut sb = (**sb).clone();
+        let node = sb.node.as_deref()?;
+        let reference = match output_ref(node) {
+            Some(i) => col(format!("__dt{i}")),
+            None => {
+                inner_targets.push(named(format!("__ds{j}"), node.clone()));
+                col(format!("__ds{j}"))
+            }
+        };
+        sb.node = Some(Box::new(reference));
+        sorts.push(pg_query::protobuf::Node {
+            node: Some(N::SortBy(Box::new(sb))),
+        });
+    }
+    let mut inner = s.clone();
+    inner.distinct_clause = Vec::new();
+    inner.sort_clause = Vec::new();
+    inner.limit_count = None;
+    inner.limit_offset = None;
+    inner.target_list = inner_targets;
+    let outer_targets = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| named(name.clone(), col(format!("__dt{i}"))))
+        .collect();
+    Some(pg_query::protobuf::SelectStmt {
+        distinct_clause: keys,
+        target_list: outer_targets,
+        from_clause: vec![pg_query::protobuf::Node {
+            node: Some(N::RangeSubselect(Box::new(
+                pg_query::protobuf::RangeSubselect {
+                    lateral: false,
+                    subquery: Some(Box::new(pg_query::protobuf::Node {
+                        node: Some(N::SelectStmt(Box::new(inner))),
+                    })),
+                    alias: Some(pg_query::protobuf::Alias {
+                        aliasname: "__dx".into(),
+                        colnames: Vec::new(),
+                    }),
+                },
+            ))),
+        }],
+        sort_clause: sorts,
+        limit_count: s.limit_count.clone(),
+        limit_offset: s.limit_offset.clone(),
+        limit_option: s.limit_option,
+        op: pg_query::protobuf::SetOperation::SetopNone as i32,
+        ..Default::default()
+    })
+}
+
 /// Are two expressions the same, ignoring where in the text each was
 /// written? (`ORDER BY sum(v)` names the select list's `sum(v)`.)
-fn same_expression(a: &pg_query::protobuf::Node, b: &pg_query::protobuf::Node) -> bool {
+pub(crate) fn same_expression(a: &pg_query::protobuf::Node, b: &pg_query::protobuf::Node) -> bool {
     static LOCATION: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re =
         LOCATION.get_or_init(|| regex::Regex::new(r"location: -?\d+").expect("a fixed pattern"));
@@ -14587,6 +14808,9 @@ fn plan_select(
         return plan_select(&rewritten, lookup, params);
     }
     if let Some(rewritten) = distinct_on_over_groups(s) {
+        return plan_select(&rewritten, lookup, params);
+    }
+    if let Some(rewritten) = distinct_on_over_expressions(s) {
         return plan_select(&rewritten, lookup, params);
     }
     // An enum orders by its labels' declared positions, not their text.
@@ -19142,6 +19366,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 // `const_value` handles it perfectly well -- which is why CASE
                 // worked over a table and not here.
                 | N::CaseExpr(_)
+                | N::CollateClause(_)
                 | N::XmlExpr(_)
                 | N::XmlSerialize(_)),
             ) => {
@@ -26212,6 +26437,9 @@ fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
     if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectCast) {
         return user_casts::plan_drop(d);
     }
+    if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectCollation) {
+        return collation::plan_drop(d);
+    }
     // `DROP SCHEMA`: the object is a bare String / one-element List.
     if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectSchema) {
         let mut names = Vec::new();
@@ -27815,9 +28043,9 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
             })
             .next_back()
             .unwrap_or_default();
-        if !matches!(collation.as_str(), "C" | "POSIX" | "default" | "ucs_basic") {
-            return Err(Error::Unsupported(format!("COLLATE \"{collation}\"")));
-        }
+        // The name must exist; what it changes -- ordering and comparison --
+        // is applied where those happen (`enum_order`), not to the value.
+        collation::resolve(&collation)?;
         return Ok(value);
     }
     if let Some(N::FuncCall(f)) = node.node.as_ref() {

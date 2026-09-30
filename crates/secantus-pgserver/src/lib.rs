@@ -14,6 +14,7 @@ mod aggregates;
 mod casts;
 mod catalog_fill;
 mod catalog_objects;
+mod collations;
 mod do_block;
 mod encoding;
 mod explain;
@@ -2177,6 +2178,7 @@ impl PgHandler {
         secantus_pgplan::catalog_stmts::set_tablespaces(self.tablespace_names());
         secantus_pgplan::user_ops::set_user_operators(self.user_operators());
         secantus_pgplan::user_casts::set_user_casts(self.user_casts());
+        secantus_pgplan::collation::set_user_collations(self.user_collations());
         let (pairs, columns) = self.inheritance();
         secantus_pgplan::inherit::set_inheritance(pairs, columns);
         secantus_pgplan::rls::set_rls(self.rls_tables());
@@ -6453,14 +6455,17 @@ impl PgHandler {
                 let row = bson::from_slice::<Document>(&raw)
                     .map_err(|e| Self::storage_err("could not decode a row", e))?;
                 if let Some((key, text)) = self.expression_key(def, &index, &row)? {
-                    if seen.iter().any(|(k, _)| *k == key) {
+                    // The row it collides with is the one shown: identical to
+                    // this one for a plain duplicate, and PostgreSQL's choice
+                    // (the first) when a collation calls two texts equal.
+                    if let Some((_, first)) = seen.iter().find(|(k, _)| *k == key) {
                         let mut info = ErrorInfo::new(
                             "ERROR".into(),
                             "23505".into(),
                             format!("could not create unique index \"{name}\""),
                         );
                         info.detail = Some(format!(
-                            "Key ({})=({text}) is duplicated.",
+                            "Key ({})=({first}) is duplicated.",
                             ci.key_sql.join(", ")
                         ));
                         return Err(PgWireError::UserError(Box::new(info)));
@@ -6504,20 +6509,31 @@ impl PgHandler {
             return Ok(None);
         };
         let mut key = Vec::new();
+        let mut shown = Vec::new();
         for e in exprs.iter().filter_map(Bson::as_str) {
             let expr = secantus_pgplan::plan_check_expression(e, def).map_err(|e| Self::err(&e))?;
             let v = secantus_pgplan::apply_row_expr(&expr, row).map_err(|e| Self::err(&e))?;
             if v == Bson::Null {
                 return Ok(None);
             }
+            // A collated key (`__coll_key('c', col)`) is SHOWN as its column's
+            // value, as PostgreSQL shows `Key (s)=(Apple)`.
+            let display = match e
+                .strip_prefix("__coll_key(")
+                .and_then(|rest| rest.rsplit_once(", "))
+                .map(|(_, col)| col.trim_end_matches(')'))
+            {
+                Some(col) => {
+                    let inner = secantus_pgplan::plan_check_expression(col, def)
+                        .map_err(|e| Self::err(&e))?;
+                    secantus_pgplan::apply_row_expr(&inner, row).map_err(|e| Self::err(&e))?
+                }
+                None => v.clone(),
+            };
+            shown.push(secantus_pgplan::value_text(&display));
             key.push(v);
         }
-        let text = key
-            .iter()
-            .map(secantus_pgplan::value_text)
-            .collect::<Vec<_>>()
-            .join(", ");
-        Ok(Some((key, text)))
+        Ok(Some((key, shown.join(", "))))
     }
 
     /// Enforce every EXCLUDE constraint with a non-`=` operator: no two rows
@@ -8664,6 +8680,9 @@ impl PgHandler {
                     Column::new("udt_name", "name", false),
                     Column::new("is_identity", "varchar", false),
                     Column::new("identity_generation", "varchar", false),
+                    Column::new("collation_catalog", "name", false),
+                    Column::new("collation_schema", "name", false),
+                    Column::new("collation_name", "name", false),
                     Column::new("domain_catalog", "name", false),
                     Column::new("domain_schema", "name", false),
                     Column::new("domain_name", "name", false),
@@ -9216,7 +9235,11 @@ impl PgHandler {
     fn virtual_rows(&self, name: &str, filter: &Document) -> Option<Vec<Document>> {
         let def = Self::virtual_table(name)?;
         let mut rows: Vec<Document> = match name {
-            "pg_collation" => self.pg_collation_rows(&def),
+            "pg_collation" => {
+                let mut rows = self.pg_collation_rows(&def);
+                rows.extend(self.user_collation_rows(&def));
+                rows
+            }
             "pg_am" => self.pg_am_rows(&def),
             "pg_policy" => self.pg_policy_rows(&def),
             "pg_sequence" => self.pg_sequence_rows(&def),
@@ -9259,6 +9282,24 @@ impl PgHandler {
                                 Some(_) => Bson::String("BY DEFAULT".into()),
                                 None => Bson::Null,
                             },
+                        );
+                        // Only a column that DECLARES a collation shows one.
+                        let collation = c.extra.get_str("collation").ok();
+                        d.insert(
+                            f("collation_catalog"),
+                            collation.map_or(Bson::Null, |_| Bson::String(db.clone())),
+                        );
+                        d.insert(
+                            f("collation_schema"),
+                            collation.map_or(Bson::Null, |n| {
+                                let builtin = matches!(n, "C" | "POSIX" | "ucs_basic" | "default")
+                                    || n.ends_with("-x-icu");
+                                Bson::String(if builtin { "pg_catalog" } else { "public" }.into())
+                            }),
+                        );
+                        d.insert(
+                            f("collation_name"),
+                            collation.map_or(Bson::Null, |n| Bson::String(n.to_string())),
                         );
                         let domain = c.extra.get_str("domain_type").ok();
                         d.insert(
@@ -13460,6 +13501,9 @@ impl PgHandler {
             }
             Statement::CreateCast(_) | Statement::DropCast { .. } => {
                 vec![casts::CAST_COLLECTION.to_string()]
+            }
+            Statement::CreateCollation { .. } | Statement::DropCollation { .. } => {
+                vec![collations::COLLATION_COLLECTION.to_string()]
             }
             Statement::Catalog(_) => vec![
                 catalog_objects::STATISTICS_COLLECTION.to_string(),
@@ -18243,6 +18287,8 @@ impl PgHandler {
             Statement::Sequence(tag, _) => tag,
             Statement::CreateOperator(_) => "CREATE OPERATOR",
             Statement::CreateCast(_) => "CREATE CAST",
+            Statement::CreateCollation { .. } => "CREATE COLLATION",
+            Statement::DropCollation { .. } => "DROP COLLATION",
             Statement::DropCast { .. } => "DROP CAST",
             Statement::DropOperator { .. } => "DROP OPERATOR",
             Statement::AlterView { table_form, .. }
@@ -19516,6 +19562,15 @@ impl PgHandler {
                 if_exists,
             } => self.drop_operator(&name, left.as_deref(), &right, if_exists),
             Statement::CreateCast(cast) => self.create_cast(cast),
+            Statement::CreateCollation {
+                collation,
+                if_not_exists,
+            } => self.create_collation(collation, if_not_exists),
+            Statement::DropCollation {
+                names,
+                if_exists,
+                cascade,
+            } => self.drop_collations(&names, if_exists, cascade),
             Statement::DropCast {
                 source,
                 target,

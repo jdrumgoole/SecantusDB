@@ -62,3 +62,7 @@ des = "0.8"
 blowfish = "0.9"
 cast5 = "0.11"
 flate2 = "1"
+# ICU collation (`COLLATE "und-x-icu"`, `CREATE COLLATION ... provider = icu`):
+# the CLDR root collation and its tailorings, compiled in.
+icu_collator = "2"
+icu_locale = "2"

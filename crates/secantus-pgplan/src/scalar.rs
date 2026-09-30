@@ -209,6 +209,9 @@ const SCALAR_NAMES: &[&str] = &[
     "__net_op",
     "__net_arith",
     "__net_diff",
+    "__coll_key",
+    "__coll_keyv",
+    "__coll_value",
     "transaction_timestamp",
     "statement_timestamp",
     "clock_timestamp",
@@ -711,6 +714,18 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
             need(3)?;
             let left = if s(0) == "~" { None } else { Some(arg(1)) };
             crate::net::arith(&s(0), left.as_ref(), &arg(2))
+        }
+        "__coll_key" => {
+            need(2)?;
+            crate::collation::sort_key(&s(0), &s(1)).map(Bson::String)
+        }
+        "__coll_keyv" => {
+            need(2)?;
+            crate::collation::sort_key_with_value(&s(0), &s(1)).map(Bson::String)
+        }
+        "__coll_value" => {
+            need(1)?;
+            Ok(Bson::String(crate::collation::key_value(&s(0))))
         }
         "__net_diff" => {
             need(2)?;

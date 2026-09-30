@@ -103,6 +103,7 @@ pub(crate) fn pg_collation_def() -> TableDef {
             Column::new("collencoding", "int4", false),
             Column::new("collcollate", "text", false),
             Column::new("collctype", "text", false),
+            Column::new("colliculocale", "text", false),
         ],
     )
 }
@@ -311,6 +312,7 @@ impl PgHandler {
             d.insert(f("collencoding"), Bson::Int32(encoding));
             d.insert(f("collcollate"), collate);
             d.insert(f("collctype"), ctype);
+            d.insert(f("colliculocale"), Bson::Null);
             d
         })
         .collect()
@@ -796,7 +798,24 @@ impl PgHandler {
                                     None => String::new(),
                                 })
                             }
-                            "attcollation" => Bson::Int64(type_collation(type_oid)),
+                            // A column's own COLLATE, else its type's.
+                            "attcollation" => {
+                                let table = table_by_oid(int(get(row, "attrelid")));
+                                let attname = text(get(row, "attname"));
+                                let declared =
+                                    table.and_then(|t| t.column(&attname)).and_then(|col| {
+                                        col.extra.get_str("collation").ok().map(str::to_string)
+                                    });
+                                match declared {
+                                    Some(name) => Bson::Int64(
+                                        secantus_pgplan::regobj::collation_names()
+                                            .into_iter()
+                                            .find(|(n, _)| *n == name)
+                                            .map_or_else(|| type_collation(type_oid), |(_, o)| o),
+                                    ),
+                                    None => Bson::Int64(type_collation(type_oid)),
+                                }
+                            }
                             "attlen" => Bson::Int32(match type_oid {
                                 16 | 18 => 1,
                                 21 => 2,

@@ -59,6 +59,23 @@ change is measured against PostgreSQL 15 (and 14 where a corpus needs it).
 
 #### Added
 
+- **Collations:**
+  - ICU ones: any `<tag>-x-icu` name, and `CREATE COLLATION ... provider =
+    icu` with the locale's `ks` / `kn` / `kf` / `co` / `ka` keywords
+    (`de-u-co-phonebk`, `und-u-kn-true`).
+  - Applied in `ORDER BY`, comparisons, `IN`, `min` / `max`, `greatest` /
+    `least`, `DISTINCT`, `GROUP BY` and `UNIQUE` indexes.
+  - Nondeterministic (case-insensitive) collations compare equal where their
+    strength says so; `LIKE` under one is refused, as in PostgreSQL.
+  - A column's `COLLATE`, which was silently dropped, is recorded and
+    honoured.
+  - `COLLATE` in an index key, `DROP COLLATION` with its column dependencies,
+    and the `42P21` / `42P22` conflicts.
+  - Catalog: `pg_collation`, `pg_attribute.attcollation`,
+    `information_schema.columns.collation_name`, `regcollation` and
+    `pg_collation_for` / `COLLATION FOR`.
+  - Built on ICU4X, over the same CLDR data as the ICU PostgreSQL links.
+- **`DISTINCT ON` over an expression** (`DISTINCT ON (lower(x))`).
 - **`CREATE CAST` / `DROP CAST`:**
   - function, `WITH INOUT` and binary casts;
   - explicit, `AS ASSIGNMENT` and `AS IMPLICIT` contexts, through `INSERT` and

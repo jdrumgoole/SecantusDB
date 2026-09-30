@@ -46,6 +46,7 @@ pub const BUILTIN_TYPES: &[(&str, i64, i64)] = &[
     ("regprocedure", 2202, 2207),
     ("regnamespace", 4089, 4090),
     ("regrole", 4096, 4097),
+    ("regcollation", 4191, 4192),
     ("regtype", 2206, 2211),
     ("uuid", 2950, 2951),
     ("tsvector", 3614, 3643),
