@@ -8676,32 +8676,31 @@ def test_a_blocks_earlier_write_survives_a_later_conflict(home: Path) -> None:
     while both statements and the COMMIT reported success. The block now
     fails whole (40001) and nothing it wrote is half-kept.
     """
-    with _Server(home) as server:
-        with server.connect() as a, server.connect() as b:
-            a.execute("create table tq_c (id int primary key, n int)")
-            a.execute("insert into tq_c values (1, 0), (2, 0)")
-            b.execute("begin")
-            b.execute("update tq_c set n = n + 1 where id = 2")
-            a.execute("begin")
-            a.execute("update tq_c set n = n + 1 where id = 1")
-            outcome: dict[str, str] = {}
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        a.execute("create table tq_c (id int primary key, n int)")
+        a.execute("insert into tq_c values (1, 0), (2, 0)")
+        b.execute("begin")
+        b.execute("update tq_c set n = n + 1 where id = 2")
+        a.execute("begin")
+        a.execute("update tq_c set n = n + 1 where id = 1")
+        outcome: dict[str, str] = {}
 
-            def second_write() -> None:
-                outcome["b"] = _sqlstate(b, "update tq_c set n = n + 10 where id = 1") or "ok"
+        def second_write() -> None:
+            outcome["b"] = _sqlstate(b, "update tq_c set n = n + 10 where id = 1") or "ok"
 
-            t = threading.Thread(target=second_write)
-            t.start()
-            time.sleep(0.5)
-            a.execute("commit")
-            t.join(10)
-            b.execute("commit")
-            rows = a.execute("select id, n from tq_c order by id").fetchall()
-            # Either the whole block (PostgreSQL waits and applies both) or
-            # none of it -- never its second write without its first.
-            assert (outcome["b"], rows) in [
-                ("ok", [(1, 11), (2, 1)]),
-                ("40001", [(1, 1), (2, 0)]),
-            ]
+        t = threading.Thread(target=second_write)
+        t.start()
+        time.sleep(0.5)
+        a.execute("commit")
+        t.join(10)
+        b.execute("commit")
+        rows = a.execute("select id, n from tq_c order by id").fetchall()
+        # Either the whole block (PostgreSQL waits and applies both) or
+        # none of it -- never its second write without its first.
+        assert (outcome["b"], rows) in [
+            ("ok", [(1, 11), (2, 1)]),
+            ("40001", [(1, 1), (2, 0)]),
+        ]
 
 
 def test_prepared_gid_is_byte_exact(home: Path) -> None:
