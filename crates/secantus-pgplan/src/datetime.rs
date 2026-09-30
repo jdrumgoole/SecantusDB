@@ -1798,6 +1798,10 @@ fn from_char_mode(input: &str, fmt: &str, strict: bool) -> Result<(NaiveDate, i6
     let mut tzm = 0i64;
     let mut cc: Option<i64> = None;
     let mut ydigits = 4usize;
+    // ISO 8601 week-numbering: `IYYY` / `IW` / `ID`.
+    let mut iso_year = false;
+    let mut iso_week: Option<i64> = None;
+    let mut iso_day: Option<i64> = None;
     let skip_space = |i: &mut usize| {
         while *i < inp.len() && inp[*i].is_whitespace() {
             *i += 1;
@@ -1806,6 +1810,11 @@ fn from_char_mode(input: &str, fmt: &str, strict: bool) -> Result<(NaiveDate, i6
     for (n_idx, node) in nodes.iter().enumerate() {
         // Strict (jsonpath `.datetime()`) parsing: input that runs out while
         // fields remain is an error, where `to_timestamp` defaults them.
+        // PostgreSQL stops at the end of the input: the fields left over
+        // take their defaults.
+        if !strict && i >= inp.len() {
+            break;
+        }
         if strict && i >= inp.len() {
             if nodes[n_idx..]
                 .iter()
@@ -1854,6 +1863,7 @@ fn from_char_mode(input: &str, fmt: &str, strict: bool) -> Result<(NaiveDate, i6
                         let y = read_int(&mut i, 4)?;
                         year = Some(y);
                         ydigits = 4;
+                        iso_year |= *k == K::IYYY;
                     }
                     K::YCOMMA => {
                         let a = read_int(&mut i, 1)?;
@@ -1996,7 +2006,9 @@ fn from_char_mode(input: &str, fmt: &str, strict: bool) -> Result<(NaiveDate, i6
                         }
                         i += len;
                     }
-                    K::D | K::ID | K::W | K::WW | K::IW | K::Q => {
+                    K::IW => iso_week = Some(read_int(&mut i, 2)?),
+                    K::ID => iso_day = Some(read_int(&mut i, 1)?),
+                    K::D | K::W | K::WW | K::Q => {
                         read_int(&mut i, 2)?;
                     }
                     K::TZH => {
@@ -2031,7 +2043,7 @@ fn from_char_mode(input: &str, fmt: &str, strict: bool) -> Result<(NaiveDate, i6
     }
     if hh12 || pm.is_some() {
         if !(1..=12).contains(&hour) {
-            return Err(Error::DatetimeFieldOverflow(format!(
+            return Err(Error::InvalidDatetimeFormat(format!(
                 "hour \"{hour}\" is invalid for the 12-hour clock"
             )));
         }
@@ -2062,14 +2074,33 @@ fn from_char_mode(input: &str, fmt: &str, strict: bool) -> Result<(NaiveDate, i6
         // No year field: year zero, which is 1 BC.
         (None, None) => 0,
     };
+    // `do_to_timestamp`: BC negates, and a year at or below zero is one
+    // off from the proleptic count (there is no year 0).
     if bc {
-        y = -y + 1;
+        y = -y;
     }
-    // A zero month or day is "not given", as `do_to_timestamp`'s
-    // `if (tmfc.mm)` has it: `to_date('2020-00-10', ...)` is January 10th.
+    if y < 0 {
+        y += 1;
+    }
+    // A zero month, day or day-of-year is "not given", as
+    // `do_to_timestamp`'s `if (tmfc.mm)` has it: `to_date('2020-00-10',
+    // ...)` is January 10th.
     let mon = mon.filter(|m| *m != 0);
     let mday = mday.filter(|d| *d != 0);
-    let date = if let Some(j) = julian {
+    let yday = yday.filter(|d| *d != 0);
+    // `isoweek2j`: day 1 of ISO week 1 is the Monday of the week holding
+    // January 4th; `ID` counts Monday 1 .. Sunday 7.
+    let iso = iso_week.filter(|_| iso_year).map(|w| {
+        let day4 = date2j(y as i32, 1, 4);
+        let day0 = (day4 - 1 + 1).rem_euclid(7);
+        let jday = (w - 1) * 7 + (day4 - day0) + iso_day.map_or(0, |d| (d - 1).rem_euclid(7));
+        jday
+    });
+    let date = if let Some(j) = iso {
+        let days = j - date2j(2000, 1, 1);
+        NaiveDate::from_ymd_opt(2000, 1, 1)
+            .and_then(|d| d.checked_add_signed(chrono::Duration::days(days)))
+    } else if let Some(j) = julian {
         let days = j - date2j(2000, 1, 1);
         NaiveDate::from_ymd_opt(2000, 1, 1)
             .and_then(|d| d.checked_add_signed(chrono::Duration::days(days)))
