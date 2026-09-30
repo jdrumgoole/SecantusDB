@@ -4553,6 +4553,9 @@ impl PgHandler {
                 out.push_str(&format!(" INCLUDE ({})", names.join(", ")));
             }
         }
+        if ix.get_bool("sqlNullsNotDistinct").unwrap_or(false) {
+            out.push_str(" NULLS NOT DISTINCT");
+        }
         if let Ok(pred) = ix.get_str("sqlPredicate") {
             out.push_str(&format!(" WHERE {pred}"));
         }
@@ -4894,7 +4897,8 @@ impl PgHandler {
                     ));
                 } else {
                     push(format!(
-                        "UNIQUE ({}){}",
+                        "UNIQUE {}({}){}",
+                        if u.nulls_not_distinct { "NULLS NOT DISTINCT " } else { "" },
                         u.columns.join(", "),
                         deferral(u.deferrable, u.initially_deferred)
                     ));
@@ -5582,12 +5586,17 @@ impl PgHandler {
             // SQL NULLs are DISTINCT, while a storage unique index collides
             // them: excluding NULL from every key column reproduces the SQL
             // rule, exactly as a declared UNIQUE constraint's index does.
-            for f in &fields {
-                clauses.push(Bson::Document(
-                    bson::doc! { f.clone(): { "$ne": Bson::Null } },
-                ));
+            // `NULLS NOT DISTINCT` is the storage index's own rule.
+            if ci.nulls_not_distinct {
+                options.insert("sqlNullsNotDistinct", true);
+            } else {
+                for f in &fields {
+                    clauses.push(Bson::Document(
+                        bson::doc! { f.clone(): { "$ne": Bson::Null } },
+                    ));
+                }
+                options.insert("sqlNullsDistinct", true);
             }
-            options.insert("sqlNullsDistinct", true);
         }
         if let Some(p) = &ci.predicate {
             clauses.push(Bson::Document(p.clone()));
@@ -8389,10 +8398,11 @@ impl PgHandler {
                         d.insert(
                             f("indexdef"),
                             format!(
-                                "CREATE UNIQUE INDEX {} ON {schema}.{} USING btree ({})",
+                                "CREATE UNIQUE INDEX {} ON {schema}.{} USING btree ({}){}",
                                 u.name,
                                 t.name,
-                                u.columns.join(", ")
+                                u.columns.join(", "),
+                                if u.nulls_not_distinct { " NULLS NOT DISTINCT" } else { "" }
                             ),
                         );
                         rows.push(d);
@@ -9869,7 +9879,13 @@ impl PgHandler {
             } else {
                 bson::doc! { "$and": clauses }
             };
-            let options = bson::doc! { "unique": true, "partialFilterExpression": partial };
+            // `NULLS NOT DISTINCT` keeps NULL keys in the index, where they
+            // collide as the storage index collides any equal keys.
+            let options = if uq.nulls_not_distinct {
+                bson::doc! { "unique": true }
+            } else {
+                bson::doc! { "unique": true, "partialFilterExpression": partial }
+            };
             storage
                 .create_index(db, &def.name, &uq.name, &key_spec, &options)
                 .map_err(|e| Self::storage_err("could not create the unique index", e))?;

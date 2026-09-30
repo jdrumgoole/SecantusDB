@@ -330,6 +330,10 @@ pub struct UniqueConstraint {
     pub exclusion_ops: Vec<String>,
     /// The EXCLUDE's access method (`gist`, `btree`), for its definition.
     pub exclusion_method: Option<String>,
+    /// `UNIQUE NULLS NOT DISTINCT` (PostgreSQL 15): NULLs collide like any
+    /// other value. Recorded only when set, so the shared shape is unchanged
+    /// for every constraint without it.
+    pub nulls_not_distinct: bool,
 }
 
 impl UniqueConstraint {
@@ -343,6 +347,7 @@ impl UniqueConstraint {
             exclusion: false,
             exclusion_ops: Vec::new(),
             exclusion_method: None,
+            nulls_not_distinct: false,
         }
     }
 
@@ -361,6 +366,9 @@ impl UniqueConstraint {
         }
         if let Some(m) = &self.exclusion_method {
             d.insert("exclusion_method", m.as_str());
+        }
+        if self.nulls_not_distinct {
+            d.insert("nulls_not_distinct", true);
         }
         d
     }
@@ -387,6 +395,7 @@ impl UniqueConstraint {
                 })
                 .unwrap_or_default(),
             exclusion_method: d.get_str("exclusion_method").ok().map(str::to_string),
+            nulls_not_distinct: d.get_bool("nulls_not_distinct").unwrap_or(false),
         })
     }
 }

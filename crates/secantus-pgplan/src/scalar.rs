@@ -152,6 +152,10 @@ const SCALAR_NAMES: &[&str] = &[
     "quote_nullable",
     "normalize",
     "is_normalized",
+    "regexp_count",
+    "regexp_instr",
+    "regexp_substr",
+    "regexp_like",
     "regexp_split_to_array",
     "unistr",
     "convert_from",
@@ -327,6 +331,101 @@ pub(crate) fn pg_regex_source(pattern: &str) -> String {
         i += 1;
     }
     out
+}
+
+/// PostgreSQL 15's `regexp_count` / `regexp_instr` / `regexp_substr` /
+/// `regexp_like`, over CHARACTER positions (1-based, as PostgreSQL counts).
+/// Measured against PostgreSQL 15.19: an empty match counts at every
+/// position, `g` is refused, and out-of-range parameters are 22023.
+fn regexp_function(name: &str, args: &[Bson]) -> Result<Bson> {
+    let text = |i: usize| -> Option<String> {
+        args.get(i).map(|v| match v {
+            Bson::String(s) => s.clone(),
+            other => crate::value_text(other),
+        })
+    };
+    let int = |i: usize, param: &str, default: i64, min: i64| -> Result<i64> {
+        let Some(v) = args.get(i) else { return Ok(default) };
+        let n = match v {
+            Bson::Int32(n) => i64::from(*n),
+            Bson::Int64(n) => *n,
+            Bson::String(s) => s.trim().parse().map_err(|_| {
+                Error::InvalidText(format!("invalid input syntax for type integer: \"{s}\""))
+            })?,
+            other => crate::value_text(other).parse().unwrap_or(default),
+        };
+        if n < min {
+            return Err(Error::Sqlstate(
+                "22023",
+                format!("invalid value for parameter \"{param}\": {n}"),
+            ));
+        }
+        Ok(n)
+    };
+    let (subject, pattern) = (text(0).unwrap_or_default(), text(1).unwrap_or_default());
+    // Where each function keeps its flags.
+    let flags_at = match name {
+        "regexp_count" => 3,
+        "regexp_like" => 2,
+        "regexp_instr" => 5,
+        _ => 4,
+    };
+    let flags = text(flags_at).unwrap_or_default();
+    if flags.contains('g') {
+        return Err(Error::Sqlstate(
+            "22023",
+            format!("{name}() does not support the \"global\" option"),
+        ));
+    }
+    let re = regex::RegexBuilder::new(&pg_regex_source(&pattern))
+        .case_insensitive(flags.contains('i'))
+        .build()
+        .map_err(|e| Error::InvalidRegex(format!("invalid regular expression: {e}")))?;
+    if name == "regexp_like" {
+        return Ok(Bson::Boolean(re.is_match(&subject)));
+    }
+    let start = if name == "regexp_like" { 1 } else { int(2, "start", 1, 1)? };
+    // The byte offset of character `start`; past the end, no match.
+    let chars: Vec<(usize, char)> = subject.char_indices().collect();
+    let char_at = |byte: usize| chars.iter().position(|(b, _)| *b >= byte).unwrap_or(chars.len());
+    let from = match chars.get(start as usize - 1) {
+        Some((b, _)) => *b,
+        None if start as usize - 1 == chars.len() => subject.len(),
+        None => {
+            return Ok(match name {
+                "regexp_substr" => Bson::Null,
+                _ => Bson::Int32(0),
+            })
+        }
+    };
+    if name == "regexp_count" {
+        let n = re.find_iter(&subject[from..]).count();
+        return Ok(Bson::Int32(i32::try_from(n).unwrap_or(i32::MAX)));
+    }
+    let nth = int(3, "n", 1, 1)?;
+    let (endoption, subexpr) = if name == "regexp_instr" {
+        let e = int(4, "endoption", 0, 0)?;
+        if e > 1 {
+            return Err(Error::Sqlstate(
+                "22023",
+                format!("invalid value for parameter \"endoption\": {e}"),
+            ));
+        }
+        (e, int(6, "subexpr", 0, 0)?)
+    } else {
+        (0, int(5, "subexpr", 0, 0)?)
+    };
+    let hit = re.captures_iter(&subject[from..]).nth(nth as usize - 1);
+    let group = hit.as_ref().and_then(|c| c.get(subexpr as usize));
+    Ok(match (name, group) {
+        ("regexp_substr", Some(m)) => Bson::String(m.as_str().to_string()),
+        ("regexp_substr", None) => Bson::Null,
+        (_, Some(m)) => {
+            let byte = from + if endoption == 1 { m.end() } else { m.start() };
+            Bson::Int32(char_at(byte) as i32 + 1)
+        }
+        (_, None) => Bson::Int32(0),
+    })
 }
 
 /// `substring('abc' from '(b)')` and `substring('abc' from 'b')` both give
@@ -1121,6 +1220,9 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
                     )))
                 }
             }))
+        }
+        "regexp_count" | "regexp_instr" | "regexp_substr" | "regexp_like" => {
+            regexp_function(name, args)
         }
         // `s IS [form] NORMALIZED`: whether `normalize(s, form)` is `s`.
         "is_normalized" => {
@@ -1941,7 +2043,9 @@ pub fn static_result_type(name: &str) -> &'static str {
         "jsonb_path_exists"
         | "jsonb_path_match"
         | "jsonb_path_exists_tz"
-        | "jsonb_path_match_tz" | "is_normalized" => "bool",
+        | "jsonb_path_match_tz" | "is_normalized" | "regexp_like" => "bool",
+        "regexp_count" | "regexp_instr" => "int4",
+        "regexp_substr" => "text",
         "jsonb_path_query_first"
         | "jsonb_path_query_array"
         | "jsonb_path_query_first_tz"
