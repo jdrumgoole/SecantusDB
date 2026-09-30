@@ -30,6 +30,22 @@ thread_local! {
 pub fn set_namespaces(v: Vec<(String, i64)>) {
     NAMESPACES.with(|t| *t.borrow_mut() = v);
 }
+/// `pg_get_userbyid(oid)`: the role's name, or PostgreSQL's
+/// `unknown (OID=n)` for an oid no role has.
+pub fn role_name(oid: i64) -> String {
+    ROLES.with(|t| {
+        t.borrow()
+            .iter()
+            .find(|(_, o)| *o == oid)
+            .map(|(n, _)| n.clone())
+            .unwrap_or_else(|| match oid {
+                // The built-in role that owns `public` from PostgreSQL 15 on.
+                6171 => "pg_database_owner".to_string(),
+                _ => format!("unknown (OID={oid})"),
+            })
+    })
+}
+
 pub fn set_roles(v: Vec<(String, i64)>) {
     ROLES.with(|t| *t.borrow_mut() = v);
 }

@@ -524,12 +524,25 @@ one request path:
       Matching the `C` cluster instead would break against every UTF-8-locale
       server.
 
-    **What remains refused** (re-measured 2026-09-30, after batch 9):
-    - Catalog-object statements: `CREATE AGGREGATE` / `CAST` / `OPERATOR` /
-      `COLLATION` / `STATISTICS` / `PUBLICATION` / `RULE` / `EVENT TRIGGER`.
-    - Foreign data wrappers, tablespaces, `SECURITY LABEL`, and table
-      inheritance.
-    - `ADD COLUMN ... serial`, and a partial-index `ON CONFLICT` arbiter.
+    **What remains refused** (re-measured 2026-09-30, after batch 10):
+    `CREATE CAST` / `COLLATION` / `RULE` / `EVENT TRIGGER`, foreign data
+    wrappers (`CREATE FOREIGN DATA WRAPPER`, `IMPORT FOREIGN SCHEMA`), a
+    partition's own column options in `PARTITION OF (...)`, and pgcrypto's
+    `pgp_*`. Batch 10 landed `CREATE AGGREGATE` / `OPERATOR` / `STATISTICS`
+    / `PUBLICATION` / `TABLESPACE`, `SECURITY LABEL`, `INHERITS`, `PARTITION
+    BY HASH`, `pg_trgm`, `ALTER VIEW`, `ADD COLUMN ... serial` and partial-
+    index `ON CONFLICT` arbiters.
+
+    **Two batch-10 lessons worth not re-deriving:**
+    - **Operators resolve by TYPE, at plan time.** A comparison across type
+      categories (`text = int`, `date = int`, `bool = int`) is PostgreSQL's
+      `42883`; lowered to MQL it compared across BSON types and matched
+      NOTHING -- a silent empty answer. `optype.rs` checks operands typed in
+      the statement's own FROM scope; inside a subquery nothing is checked.
+    - **A probe whose two sides fail identically is vacuous.** A mixed-format
+      probe reported SAME while both runs died on the same Python
+      IndentationError. Count the lines each side produced before believing
+      a diff that says they agree.
 
     `MERGE`, row-level security (ENFORCED now), `LOCK TABLE`,
     `statement_timeout` / `lock_timeout`, `CLUSTER`, array lower bounds,

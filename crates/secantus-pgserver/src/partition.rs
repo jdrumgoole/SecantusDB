@@ -34,6 +34,17 @@ pub(crate) fn parent_of(def: &TableDef) -> Option<&str> {
     def.extra.get_str("partition_of").ok()
 }
 
+/// `pg_get_partkeydef`: the strategy and the key, `LIST (k)`.
+pub(crate) fn partkey_text(def: &TableDef) -> Option<String> {
+    let strategy = match strategy(def) {
+        "range" => "RANGE",
+        "list" => "LIST",
+        "hash" => "HASH",
+        _ => return None,
+    };
+    Some(format!("{strategy} ({})", key_names(def).join(", ")))
+}
+
 /// Is `def` a partitioned table (`PARTITION BY`)?
 pub(crate) fn is_partitioned(def: &TableDef) -> bool {
     def.extra.get_document("partition_by").is_ok()
@@ -60,27 +71,38 @@ fn key_names(def: &TableDef) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The key in DECLARED order -- a range bound compares its values
+/// position by position, so table-column order would pair the wrong ones --
+/// each a column or a parenthesised expression, with its type.
 fn key_of(parent: &TableDef) -> Key<'_> {
-    let names = key_names(parent);
+    let by = parent.extra.get_document("partition_by").ok();
+    let strs = |k: &str| -> Vec<&str> {
+        by.and_then(|b| b.get_array(k).ok())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default()
+    };
+    let (names, types) = (strs("columns"), strs("key_types"));
     Key {
-        columns: parent
-            .columns
+        columns: names
             .iter()
-            .filter(|c| names.contains(&c.name))
-            .map(|c| (c.name.as_str(), c.pg_type.as_str()))
+            .enumerate()
+            .filter_map(|(i, n)| {
+                let ty = types
+                    .get(i)
+                    .copied()
+                    .or_else(|| parent.column(n).map(|c| c.pg_type.as_str()))?;
+                Some((*n, ty))
+            })
             .collect(),
     }
 }
 
-/// The key columns in DECLARED order, with their types.
+/// The key in DECLARED order, with its types.
 fn ordered_key(parent: &TableDef) -> Vec<(String, String)> {
-    key_names(parent)
+    key_of(parent)
+        .columns
         .into_iter()
-        .filter_map(|n| {
-            parent
-                .column(&n)
-                .map(|c| (c.name.clone(), c.pg_type.clone()))
-        })
+        .map(|(n, t)| (n.to_string(), t.to_string()))
         .collect()
 }
 
@@ -217,6 +239,38 @@ impl PgHandler {
             .collect()
     }
 
+    /// Each partition's own column DEFAULTs (those differing from its
+    /// parent's), which an INSERT written directly into the partition --
+    /// served as a view -- gives a column it omits.
+    pub(crate) fn partition_defaults(&self) -> Vec<(String, Vec<(String, String)>)> {
+        let Ok(defs) = self.all_table_defs() else {
+            return Vec::new();
+        };
+        defs.iter()
+            .filter_map(|d| {
+                let parent = self.lookup(parent_of(d)?)?;
+                let cols: Vec<(String, String)> = d
+                    .columns
+                    .iter()
+                    .filter_map(|c| {
+                        let own = Self::default_expression(c);
+                        let inherited = parent
+                            .column(&c.name)
+                            .map(Self::default_expression)
+                            .unwrap_or(Bson::Null);
+                        match own {
+                            Bson::String(sql) if Bson::String(sql.clone()) != inherited => {
+                                Some((c.name.clone(), sql))
+                            }
+                            _ => None,
+                        }
+                    })
+                    .collect();
+                (!cols.is_empty()).then(|| (d.name.clone(), cols))
+            })
+            .collect()
+    }
+
     /// Every table's `tableoid`: its own oid, or -- for a partitioned one --
     /// the oid of the leaf partition each row falls in.
     pub(crate) fn tableoid_expressions(&self) -> Vec<(String, String)> {
@@ -313,6 +367,12 @@ impl PgHandler {
         let key = ordered_key(&parent);
         let kind = bound.get_str("kind").unwrap_or_default().to_string();
         let strat = strategy(&parent);
+        if kind == "default" && strat == "hash" {
+            return Err(user_err(
+                "42P16",
+                "a hash-partitioned table may not have a default partition",
+            ));
+        }
         if kind != "default" && kind != strat {
             return Err(user_err(
                 "42P16",
@@ -361,6 +421,28 @@ impl PgHandler {
                 }
             }
             "list" => canonical("values", bound)?,
+            "hash" => {
+                let modulus = bound.get_i32("modulus").unwrap_or(0);
+                let remainder = bound.get_i32("remainder").unwrap_or(0);
+                if modulus < 1 {
+                    return Err(user_err(
+                        "42P16",
+                        "modulus for hash partition must be an integer value greater than zero",
+                    ));
+                }
+                if remainder < 0 {
+                    return Err(user_err(
+                        "42P16",
+                        "remainder for hash partition must be an integer value greater than or equal to zero",
+                    ));
+                }
+                if remainder >= modulus {
+                    return Err(user_err(
+                        "42P16",
+                        "remainder for hash partition must be less than modulus",
+                    ));
+                }
+            }
             _ => {}
         }
         let siblings: Vec<TableDef> = self
@@ -419,6 +501,47 @@ impl PgHandler {
                     if cmp_tuple(&lo, &hi2) == Ordering::Less
                         && cmp_tuple(&lo2, &hi) == Ordering::Less
                     {
+                        return Err(user_err(
+                            "42P17",
+                            format!(
+                                "partition \"{name}\" would overlap partition \"{}\"",
+                                s.name
+                            ),
+                        ));
+                    }
+                }
+            }
+            // Every modulus a factor of the next larger, and no two
+            // partitions claiming one remainder class (PostgreSQL's rules).
+            "hash" => {
+                let m = bound.get_i32("modulus").unwrap_or(1);
+                let r = bound.get_i32("remainder").unwrap_or(0);
+                for s in &siblings {
+                    let b = bound_of(s);
+                    if b.get_str("kind") != Ok("hash") {
+                        continue;
+                    }
+                    let (m2, r2) = (
+                        b.get_i32("modulus").unwrap_or(1),
+                        b.get_i32("remainder").unwrap_or(0),
+                    );
+                    let (small, big) = if m <= m2 { (m, m2) } else { (m2, m) };
+                    if big % small != 0 {
+                        let mut info = ErrorInfo::new(
+                            "ERROR".into(),
+                            "42P17".into(),
+                            "every hash partition modulus must be a factor of the next larger modulus"
+                                .into(),
+                        );
+                        info.detail = Some(format!(
+                            "The new modulus {m} is not {} of modulus {m2}, the modulus of existing partition \"{}\".",
+                            if m < m2 { "a factor" } else { "divisible by" },
+                            s.name
+                        ));
+                        return Err(PgWireError::UserError(Box::new(info)));
+                    }
+                    let (rs, rb) = if m <= m2 { (r, r2) } else { (r2, r) };
+                    if rb % small == rs {
                         return Err(user_err(
                             "42P17",
                             format!(
@@ -523,7 +646,15 @@ impl PgHandler {
                 }
             }
             match found {
-                Some(p) => level = p,
+                // The partition's OWN NOT NULLs and CHECKs hold for the rows
+                // it takes, whichever table they were written through.
+                Some(p) => {
+                    let shaped = Self::reshape_rows(def, &p, std::slice::from_ref(row))?;
+                    if let Some(r) = shaped.first() {
+                        self.check_row_constraints(&p, r)?;
+                    }
+                    level = p;
+                }
                 None => {
                     let key = ordered_key(&level);
                     let names: Vec<&str> = key.iter().map(|(n, _)| n.as_str()).collect();
@@ -548,6 +679,121 @@ impl PgHandler {
                         values.join(", ")
                     ));
                     return Err(PgWireError::UserError(Box::new(info)));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The partitions a row of `def` passes through, top level first.
+    fn route_path(&self, def: &TableDef, row: &Document) -> PgWireResult<Vec<TableDef>> {
+        let mut path = Vec::new();
+        let mut level = def.clone();
+        for _ in 0..64 {
+            if !is_partitioned(&level) {
+                break;
+            }
+            let mut next = None;
+            for p in self.partitions_of(&level.name)? {
+                if let Some(cond) = self.partition_condition(&p)? {
+                    if self.row_satisfies(def, &cond, row)? {
+                        next = Some(p);
+                        break;
+                    }
+                }
+            }
+            match next {
+                Some(p) => {
+                    path.push(p.clone());
+                    level = p;
+                }
+                None => break,
+            }
+        }
+        Ok(path)
+    }
+
+    /// A partition's own PRIMARY KEY and UNIQUE constraints, over the rows
+    /// the partition holds: `rows` (under the root `def`'s fields) against
+    /// its stored rows other than `replacing`, and against one another.
+    pub(crate) fn check_partition_unique(
+        &self,
+        def: &TableDef,
+        rows: &[Document],
+        replacing: &[Bson],
+    ) -> PgWireResult<()> {
+        if !is_partitioned(def) {
+            return Ok(());
+        }
+        // (partition, constraint name, columns) -> keys already taken.
+        let mut taken: Vec<(String, String, Vec<Vec<Bson>>)> = Vec::new();
+        for row in rows {
+            for p in self.route_path(def, row)? {
+                let mut keys: Vec<(String, Vec<String>)> = Vec::new();
+                let pk: Vec<String> = p
+                    .columns
+                    .iter()
+                    .filter(|c| c.pk)
+                    .map(|c| c.name.clone())
+                    .collect();
+                if !pk.is_empty() {
+                    keys.push((format!("{}_pkey", p.name), pk));
+                }
+                for u in p.unique_constraints.iter().filter(|u| !u.exclusion) {
+                    keys.push((u.name.clone(), u.columns.clone()));
+                }
+                for (name, columns) in keys {
+                    let key_of = |d: &Document| -> Option<Vec<Bson>> {
+                        columns
+                            .iter()
+                            .map(|c| {
+                                let field = def.column(c).map(|col| col.field())?;
+                                match d.get(&field) {
+                                    None | Some(Bson::Null) => None,
+                                    Some(v) => Some(v.clone()),
+                                }
+                            })
+                            .collect()
+                    };
+                    let Some(key) = key_of(row) else {
+                        continue;
+                    };
+                    let slot = match taken
+                        .iter()
+                        .position(|(t, n, _)| *t == p.name && *n == name)
+                    {
+                        Some(i) => i,
+                        None => {
+                            let stored = match self.partition_rows(&p)? {
+                                Some((_, docs)) => docs,
+                                None => Vec::new(),
+                            };
+                            let existing: Vec<Vec<Bson>> = stored
+                                .iter()
+                                .filter(|d| !d.get("_id").is_some_and(|id| replacing.contains(id)))
+                                .filter_map(key_of)
+                                .collect();
+                            taken.push((p.name.clone(), name.clone(), existing));
+                            taken.len() - 1
+                        }
+                    };
+                    if taken[slot].2.contains(&key) {
+                        let text: Vec<String> =
+                            key.iter().map(secantus_pgplan::value_text).collect();
+                        return Err(Self::constraint_error(
+                            "23505",
+                            format!("duplicate key value violates unique constraint \"{name}\""),
+                            format!(
+                                "Key ({})=({}) already exists.",
+                                columns.join(", "),
+                                text.join(", ")
+                            ),
+                            &p,
+                            Some(&name),
+                            None,
+                        ));
+                    }
+                    taken[slot].2.push(key);
                 }
             }
         }
@@ -913,6 +1159,11 @@ impl PgHandler {
         Some(match bound.get_str("kind").unwrap_or_default() {
             "default" => "DEFAULT".into(),
             "list" => format!("FOR VALUES IN ({})", render("values")),
+            "hash" => format!(
+                "FOR VALUES WITH (modulus {}, remainder {})",
+                bound.get_i32("modulus").unwrap_or(0),
+                bound.get_i32("remainder").unwrap_or(0)
+            ),
             _ => format!("FOR VALUES FROM ({}) TO ({})", render("from"), render("to")),
         })
     }
@@ -922,12 +1173,18 @@ impl PgHandler {
         let strat = match strategy(def) {
             "range" => "r",
             "list" => "l",
+            "hash" => "h",
             _ => return None,
         };
+        // An expression key is attribute 0, as in `pg_partitioned_table`.
         let attrs = key_names(def)
             .iter()
-            .filter_map(|n| def.columns.iter().position(|c| c.name == *n))
-            .map(|i| (i + 1) as i16)
+            .map(|n| {
+                def.columns
+                    .iter()
+                    .position(|c| c.name == *n)
+                    .map_or(0, |i| (i + 1) as i16)
+            })
             .collect();
         Some((strat, attrs))
     }

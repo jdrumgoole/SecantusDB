@@ -1,0 +1,6 @@
+DROP TABLE IF EXISTS ti
+CREATE TABLE ti (id int PRIMARY KEY, n int)
+INSERT INTO ti VALUES (1, 1)
+DROP TABLE IF EXISTS tid
+CREATE TABLE tid (d date, ts timestamp, a date[])
+INSERT INTO tid VALUES ('2020-03-04', '2020-03-04 05:06:07.5', '{2020-03-04,NULL}')

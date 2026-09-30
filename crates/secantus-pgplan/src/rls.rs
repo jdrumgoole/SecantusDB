@@ -29,6 +29,14 @@ pub const CHECK_PREFIX: &str = "\u{1}rls:";
 
 thread_local! {
     static RLS: std::cell::RefCell<Vec<RlsTable>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Per view, the tables RLS restricts for the view's OWNER: a table read
+    /// through a view is subject to the owner's policies (and exempt when
+    /// the owner is), not the caller's.
+    static VIEW_RLS: std::cell::RefCell<Vec<(String, Vec<RlsTable>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// The set in force while a view's body is expanded.
+    static INSIDE_VIEW: std::cell::RefCell<Vec<Vec<RlsTable>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Install the tables RLS restricts, for the statements that follow.
@@ -36,13 +44,53 @@ pub fn set_rls(tables: Vec<RlsTable>) {
     RLS.with(|t| *t.borrow_mut() = tables);
 }
 
-fn entry(table: &str) -> Option<RlsTable> {
-    RLS.with(|t| t.borrow().iter().find(|e| e.table == table).cloned())
+/// Install, per view, the tables RLS restricts for that view's owner.
+pub fn set_view_rls(views: Vec<(String, Vec<RlsTable>)>) {
+    VIEW_RLS.with(|v| *v.borrow_mut() = views);
 }
 
-/// Is any table restricted for the current statement?
+fn entry(table: &str) -> Option<RlsTable> {
+    let inner = INSIDE_VIEW.with(|v| {
+        v.borrow()
+            .last()
+            .map(|set| set.iter().find(|e| e.table == table).cloned())
+    });
+    match inner {
+        Some(found) => found,
+        None => RLS.with(|t| t.borrow().iter().find(|e| e.table == table).cloned()),
+    }
+}
+
+/// Is any table restricted for the current statement, directly or through
+/// a view?
 pub(crate) fn active() -> bool {
     RLS.with(|t| !t.borrow().is_empty())
+        || VIEW_RLS.with(|v| v.borrow().iter().any(|(_, set)| !set.is_empty()))
+}
+
+/// Run `f` -- the expansion of view `view`'s body -- under the view owner's
+/// row-level security.
+pub(crate) fn within_view<R>(view: &str, f: impl FnOnce() -> R) -> R {
+    let set = VIEW_RLS.with(|v| {
+        v.borrow()
+            .iter()
+            .find(|(n, _)| n == view)
+            .map(|(_, set)| set.clone())
+    });
+    let Some(set) = set else {
+        return f();
+    };
+    struct Pop;
+    impl Drop for Pop {
+        fn drop(&mut self) {
+            INSIDE_VIEW.with(|v| {
+                v.borrow_mut().pop();
+            });
+        }
+    }
+    INSIDE_VIEW.with(|v| v.borrow_mut().push(set));
+    let _pop = Pop;
+    f()
 }
 
 fn condition(sql: &str) -> Result<pg_query::protobuf::Node> {
@@ -68,13 +116,20 @@ fn and_into(
 
 /// `FROM t` over a restricted table, as the filtered subquery.
 pub(crate) fn expand_from(item: &mut pg_query::protobuf::Node) -> Result<()> {
-    let Some(N::RangeVar(r)) = item.node.as_ref() else {
+    let Some(N::RangeVar(r)) = item.node.as_mut() else {
         return Ok(());
     };
     if !r.inh || !(r.schemaname.is_empty() || r.schemaname == "public") {
         return Ok(());
     }
     let Some(filter) = entry(&r.relname).and_then(|e| e.select) else {
+        // Read through a view whose owner RLS does not restrict: marked
+        // `ONLY`, as a filtered read is, so a later planning pass over the
+        // expanded statement does not apply the CALLER's policies to it.
+        let caller_restricted = RLS.with(|t| t.borrow().iter().any(|e| e.table == r.relname));
+        if INSIDE_VIEW.with(|v| !v.borrow().is_empty()) && caller_restricted {
+            r.inh = false;
+        }
         return Ok(());
     };
     let q = scalar::quote_identifier;

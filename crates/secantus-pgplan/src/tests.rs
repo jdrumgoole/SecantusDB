@@ -986,10 +986,11 @@ fn drop_table_is_planned() {
         }
         other => panic!("wrong statement: {other:?}"),
     }
-    // CASCADE would have to chase dependants; behaving as RESTRICT silently
-    // would be the wrong kind of helpful.
-    let err = plan("DROP TABLE t CASCADE", &lookup).expect_err("cascade");
-    assert_eq!(err.sqlstate(), "0A000");
+    // CASCADE is carried to the executor, which drops the dependants.
+    assert!(matches!(
+        plan_ok("DROP TABLE t CASCADE"),
+        Statement::DropTable(d) if d.cascade
+    ));
     // An index and a view are their own statements, never a table drop.
     assert!(matches!(
         plan_ok("DROP INDEX i, j"),
@@ -1875,7 +1876,9 @@ fn set_timezone_uses_the_posix_sign() {
         ("+02:00", east(-2 * 3600)),
         ("-02:00", east(2 * 3600)),
         ("+05:30", east(-(5 * 3600 + 30 * 60))),
-        ("2", east(-2 * 3600)),
+        // A bare NUMBER is hours EAST of UTC, unlike a POSIX string
+        // (`set timezone = 2` shows `<+02>-02` on PostgreSQL 15).
+        ("2", east(2 * 3600)),
     ] {
         match TimeZoneSetting::parse(value) {
             TimeZoneSetting::Fixed(off) => assert_eq!(off, want, "for {value}"),

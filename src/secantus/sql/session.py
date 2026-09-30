@@ -70,6 +70,10 @@ GUC_DEFAULTS: dict[str, str] = {
     # connection (getMaxIndexKeys) and every FK/primary-key metadata call
     # errors out if the pg_settings row is absent.
     "max_index_keys": "32",
+    # SQLAlchemy 2.1's table reflection compares each table's access method
+    # against this (``current_setting('default_table_access_method')``).
+    "default_table_access_method": "heap",
+    "default_tablespace": "",
 }
 
 # Postgres encoding name (canonicalised: upper, no -_/ separators) -> Python

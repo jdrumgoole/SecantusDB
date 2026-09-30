@@ -35,6 +35,22 @@ fn table() -> &'static Table {
     })
 }
 
+/// Every session's holds, one per `(key, pid, shared)`, for `pg_locks`.
+pub fn snapshot() -> Vec<(Key, i32, bool)> {
+    let mut out: Vec<(Key, i32, bool)> = Vec::new();
+    for h in table()
+        .holds
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        if !out.contains(&(h.key, h.pid, h.shared)) {
+            out.push((h.key, h.pid, h.shared));
+        }
+    }
+    out
+}
+
 fn conflicts(holds: &[Hold], key: Key, pid: i32, shared: bool) -> bool {
     holds
         .iter()

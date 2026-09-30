@@ -11,6 +11,8 @@
 
 mod advisory;
 mod aggregates;
+mod catalog_fill;
+mod catalog_objects;
 mod do_block;
 mod encoding;
 mod explain;
@@ -521,6 +523,11 @@ fn user_fn_of(d: &Document) -> secantus_pgplan::UserFn {
         columns,
         variadic: d.get_bool("variadic").unwrap_or(false),
         key: d.get_str("_id").unwrap_or_default().to_string(),
+        strict: d.get_bool("strict").unwrap_or(false),
+        defaults: d
+            .get_array("param_defaults")
+            .map(|a| a.iter().map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default(),
     }
 }
 
@@ -1223,7 +1230,46 @@ impl PgHandler {
     /// (none at all denies), restrictive ones ANDed on. A superuser, a
     /// BYPASSRLS role and -- unless FORCE -- the owner are not restricted.
     fn rls_tables(&self) -> Vec<secantus_pgplan::rls::RlsTable> {
-        let role = self.current_role_name();
+        self.rls_tables_for(&self.current_role_name())
+    }
+
+    /// Per view, the tables RLS restricts for the view's owner (a view with
+    /// none recorded belongs to the login role). Empty when no table has RLS
+    /// enabled, which is the common case and costs one catalog read.
+    fn view_rls_tables(&self) -> Vec<(String, Vec<secantus_pgplan::rls::RlsTable>)> {
+        let any_enabled = self
+            .storage
+            .find_matching(
+                self.db(),
+                Self::RLS_COLLECTION,
+                &bson::doc! {"enabled": true},
+            )
+            .is_ok_and(|r| !r.is_empty());
+        if !any_enabled {
+            return Vec::new();
+        }
+        let Ok(views) = self.type_catalog_docs(Self::VIEW_COLLECTION) else {
+            return Vec::new();
+        };
+        views
+            .iter()
+            .filter(|d| {
+                d.get_document("options")
+                    .map_or(true, |o| o.get_str("security_invoker") != Ok("true"))
+            })
+            .filter_map(|d| {
+                let name = d.get_str("view").or_else(|_| d.get_str("_id")).ok()?;
+                let owner = d
+                    .get_str("owner")
+                    .map(str::to_string)
+                    .unwrap_or_else(|_| self.session_user_name());
+                Some((name.to_string(), self.rls_tables_for(&owner)))
+            })
+            .collect()
+    }
+
+    fn rls_tables_for(&self, role: &str) -> Vec<secantus_pgplan::rls::RlsTable> {
+        let role = role.to_string();
         if self.is_superuser(&role) || self.role(&role).ok().flatten().is_some_and(|r| r.bypassrls)
         {
             return Vec::new();
@@ -1413,6 +1459,10 @@ pub struct PgHandler {
     /// `in_transaction`, it is read from inside `execute` while `run` holds
     /// the mutexes.
     binary_results: std::sync::atomic::AtomicBool,
+    /// A `Bind`'s per-column result formats when they are MIXED (some text,
+    /// some binary); `binary_results` is then off and the answer is
+    /// re-encoded column by column on its way out (`apply_mixed_formats`).
+    mixed_formats: Mutex<Option<Vec<i16>>>,
     /// Whether the open transaction has FAILED.
     ///
     /// PostgreSQL refuses every statement after an error inside a transaction
@@ -1531,6 +1581,69 @@ type UncommittedTypes = HashMap<(&'static str, String), Option<Document>>;
 /// server cursor so a BINARY `FETCH` can re-encode rows frozen in text at
 /// DECLARE.
 type CapturedRows = Vec<Vec<Option<Bson>>>;
+
+/// `(child, parent)` pairs, and each parent's column names in order.
+type InheritanceTree = (Vec<(String, String)>, Vec<(String, Vec<String>)>);
+
+/// A `DataRow`'s cells: each one's bytes, or `None` for NULL.
+fn split_data_row(row: &DataRow) -> Vec<Option<Vec<u8>>> {
+    let mut data: &[u8] = &row.data;
+    let mut out = Vec::with_capacity(usize::try_from(row.field_count).unwrap_or(0));
+    for _ in 0..row.field_count {
+        let Some(len) = data
+            .get(..4)
+            .and_then(|b| b.try_into().ok())
+            .map(i32::from_be_bytes)
+        else {
+            break;
+        };
+        data = &data[4..];
+        if len < 0 {
+            out.push(None);
+            continue;
+        }
+        let len = len as usize;
+        out.push(data.get(..len).map(<[u8]>::to_vec));
+        data = data.get(len..).unwrap_or_default();
+    }
+    out
+}
+
+/// A cursor's typed values read back from the TEXT rows it froze at DECLARE,
+/// each cell cast from its text through its column's type; `None` when any
+/// cell does not come back (a type with no name here, a non-UTF-8 client
+/// encoding), which leaves the cursor on its text rows.
+fn typed_from_text(
+    schema: &[FieldInfo],
+    rows: &[DataRow],
+    tz: &secantus_pgplan::TimeZoneSetting,
+) -> Option<CapturedRows> {
+    let types: Vec<String> = schema
+        .iter()
+        .map(|f| secantus_pgplan::pgtypes::type_name_of_oid(i64::from(f.datatype().oid())))
+        .collect::<Option<_>>()?;
+    rows.iter()
+        .map(|row| {
+            let mut data: &[u8] = &row.data;
+            types
+                .iter()
+                .map(|ty| {
+                    let len = i32::from_be_bytes(data.get(..4)?.try_into().ok()?);
+                    data = &data[4..];
+                    if len < 0 {
+                        return Some(None);
+                    }
+                    let len = len as usize;
+                    let text = std::str::from_utf8(data.get(..len)?).ok()?;
+                    data = &data[len..];
+                    secantus_pgplan::cast_text_to(text, ty.as_str(), tz)
+                        .ok()
+                        .map(Some)
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+        .collect()
+}
 
 /// One open savepoint and the table contents it can put back.
 struct Savepoint {
@@ -1666,6 +1779,7 @@ impl PgHandler {
             uncommitted_types: Mutex::new(HashMap::new()),
             in_transaction: std::sync::atomic::AtomicBool::new(false),
             binary_results: std::sync::atomic::AtomicBool::new(false),
+            mixed_formats: Mutex::new(None),
             txn_failed: std::sync::atomic::AtomicBool::new(false),
             ensured_catalog: Mutex::new(HashSet::new()),
             savepoints: Mutex::new(Vec::new()),
@@ -1759,19 +1873,139 @@ impl PgHandler {
 
     /// Remember the result format a `Bind` asked for.
     ///
-    /// A MIXED request -- some columns binary, some text -- is answered
-    /// entirely in text. PostgreSQL honours it column by column; no client
-    /// this server is measured against sends one, and quietly answering half
-    /// of it in the wrong format would be worse than uniformly answering the
-    /// format the `RowDescription` then reports.
+    /// A MIXED request -- some columns binary, some text -- is produced in
+    /// text and then re-encoded column by column (`apply_mixed_formats`), as
+    /// PostgreSQL honours it.
     fn note_result_format(&self, format: &Format) {
-        let binary = match format {
-            Format::UnifiedText => false,
-            Format::UnifiedBinary => true,
-            Format::Individual(codes) => !codes.is_empty() && codes.iter().all(|c| *c == 1),
+        let (binary, mixed) = match format {
+            Format::UnifiedText => (false, None),
+            Format::UnifiedBinary => (true, None),
+            // One code per column: kept, so the count is checked against the
+            // columns (08P01 when it differs) and a mix is honoured.
+            Format::Individual(codes) => (
+                !codes.is_empty() && codes.iter().all(|c| *c == 1),
+                Some(codes.clone()),
+            ),
         };
         self.binary_results
             .store(binary, std::sync::atomic::Ordering::Relaxed);
+        *self.mixed_formats.lock().unwrap_or_else(|e| e.into_inner()) = mixed;
+    }
+
+    /// A description in the MIXED formats the `Bind` asked for: each column
+    /// binary where its code says so and its type has a binary form.
+    fn mixed_fields(&self, fields: Vec<FieldInfo>) -> PgWireResult<Vec<FieldInfo>> {
+        let mixed = self
+            .mixed_formats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(codes) = mixed else {
+            return Ok(fields);
+        };
+        if codes.len() != fields.len() {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "08P01".into(),
+                format!(
+                    "bind message has {} result formats but query has {} columns",
+                    codes.len(),
+                    fields.len()
+                ),
+            ))));
+        }
+        Ok(fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let binary = codes.get(i).copied() == Some(1)
+                    && secantus_pgplan::pgtypes::type_name_of_oid(i64::from(f.datatype().oid()))
+                        .is_some();
+                rebind_field_format(f, binary)
+            })
+            .collect())
+    }
+
+    /// A text answer re-encoded in the MIXED formats the `Bind` asked for:
+    /// each binary-requested cell is read back from its text through its
+    /// column's type and encoded in binary; the text cells go out as they are.
+    fn apply_mixed_formats(&self, response: Response) -> PgWireResult<Response> {
+        let Response::Query(q) = response else {
+            return Ok(response);
+        };
+        let fields = self.mixed_fields(q.row_schema.as_ref().clone())?;
+        if fields
+            .iter()
+            .zip(q.row_schema.iter())
+            .all(|(a, b)| a.format() == b.format())
+        {
+            return Ok(Response::Query(q));
+        }
+        let schema = Arc::new(fields);
+        let bin_schema = Arc::new(
+            q.row_schema
+                .iter()
+                .map(|f| rebind_field_format(f, true))
+                .collect::<Vec<_>>(),
+        );
+        let types: Vec<Option<String>> = q
+            .row_schema
+            .iter()
+            .map(|f| secantus_pgplan::pgtypes::type_name_of_oid(i64::from(f.datatype().oid())))
+            .collect();
+        let (tz, ds, cenc) = (
+            self.session_timezone(),
+            self.session_datestyle(),
+            self.client_encoding(),
+        );
+        let out_schema = schema.clone();
+        let rows = q.data_rows.map(move |row| {
+            let row = row?;
+            let cells = split_data_row(&row);
+            let bad = || {
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".into(),
+                    "XX000".into(),
+                    "a result cell could not be re-encoded in binary".into(),
+                )))
+            };
+            let mut values: Vec<Option<Bson>> = Vec::with_capacity(cells.len());
+            for (i, cell) in cells.iter().enumerate() {
+                let binary = out_schema.get(i).map(|f| f.format()) == Some(FieldFormat::Binary);
+                values.push(match (cell, binary) {
+                    (Some(bytes), true) => {
+                        let text = std::str::from_utf8(bytes).map_err(|_| bad())?;
+                        let ty = types.get(i).cloned().flatten().ok_or_else(bad)?;
+                        let ty = ty.as_str();
+                        Some(secantus_pgplan::cast_text_to(text, ty, &tz).map_err(|_| bad())?)
+                    }
+                    _ => None,
+                });
+            }
+            let binary_row = encode_typed_row(&bin_schema, &values, &tz, &ds, cenc)?;
+            let binary_cells = split_data_row(&binary_row);
+            let mut data = BytesMut::new();
+            for (i, cell) in cells.iter().enumerate() {
+                let binary = out_schema.get(i).map(|f| f.format()) == Some(FieldFormat::Binary);
+                let chosen = if binary {
+                    binary_cells.get(i).cloned().flatten()
+                } else {
+                    cell.clone()
+                };
+                match chosen {
+                    None => data.extend_from_slice(&(-1i32).to_be_bytes()),
+                    Some(b) => {
+                        data.extend_from_slice(&(b.len() as i32).to_be_bytes());
+                        data.extend_from_slice(&b);
+                    }
+                }
+            }
+            Ok(DataRow::new(data, row.field_count))
+        });
+        let mut out = QueryResponse::new(schema, rows);
+        out.command_tag = q.command_tag;
+        out.tag_counts_rows = q.tag_counts_rows;
+        Ok(Response::Query(out))
     }
 
     /// Plan a statement, resolving table names against the catalog PLUS any
@@ -1843,6 +2077,10 @@ impl PgHandler {
     /// Rust server writes only `language: "internal"` wrappers here (a base
     /// type's I/O functions) and never runs them.
     const FUNCTION_COLLECTION: &'static str = "__sql_functions__";
+    /// `CREATE AGGREGATE`: `{_id: "name/argtypes", name, arg_types, sfunc,
+    /// stype, finalfunc, initcond}`. Rust-server only; the Python server has
+    /// no user aggregates.
+    const AGGREGATE_COLLECTION: &'static str = "__sql_aggregates__";
     /// `CREATE MATERIALIZED VIEW`: `{_id, matview, definition, populated}`,
     /// the Python server's store. The rows live in a table of the same name.
     const MATVIEW_COLLECTION: &'static str = "__sql_matviews__";
@@ -1896,6 +2134,10 @@ impl PgHandler {
         // Session state, so installed per statement -- the gate below is
         // per catalog version, and a SET DateStyle changes no catalog.
         // `1/5/2020` is January or May by the session's DateStyle order.
+        secantus_pgplan::set_session_datestyle(self.session_datestyle());
+        // The zone too: a row expression runs AFTER planning, and a stored
+        // timestamptz cast to `timestamp` is the session zone's wall clock.
+        secantus_pgplan::set_session_timezone(self.session_timezone());
         secantus_pgplan::dtparse::set_date_order(match self.session_datestyle().order {
             secantus_pgplan::DateStyleOrder::Ymd => secantus_pgplan::dtparse::DateOrder::Ymd,
             secantus_pgplan::DateStyleOrder::Dmy => secantus_pgplan::dtparse::DateOrder::Dmy,
@@ -1908,7 +2150,12 @@ impl PgHandler {
                 .clone(),
         ));
         secantus_pgplan::set_current_user(Some(self.current_role_name()));
+        secantus_pgplan::catalog_stmts::set_tablespaces(self.tablespace_names());
+        secantus_pgplan::user_ops::set_user_operators(self.user_operators());
+        let (pairs, columns) = self.inheritance();
+        secantus_pgplan::inherit::set_inheritance(pairs, columns);
         secantus_pgplan::rls::set_rls(self.rls_tables());
+        secantus_pgplan::rls::set_view_rls(self.view_rls_tables());
         // The database and the GUCs, for `current_database()` and
         // `current_setting()` reached INSIDE an expression -- where the
         // constant evaluator handles them rather than the server, and had
@@ -1967,6 +2214,7 @@ impl PgHandler {
         views.extend(partitions);
         secantus_pgplan::set_views(views);
         secantus_pgplan::view_dml::set_checked_views(checked);
+        secantus_pgplan::view_dml::set_view_defaults(self.view_column_defaults());
         secantus_pgplan::partitions::set_tableoids(self.tableoid_expressions());
         secantus_pgplan::regobj::set_namespaces(self.namespaces());
         secantus_pgplan::regobj::set_roles(
@@ -2018,8 +2266,31 @@ impl PgHandler {
                 .collect(),
         );
         secantus_pgplan::set_constraint_defs(self.constraint_defs().unwrap_or_default());
+        secantus_pgplan::set_view_defs(self.view_defs());
+        secantus_pgplan::set_index_defs(self.index_defs());
+        secantus_pgplan::set_trigger_defs(self.trigger_defs());
+        secantus_pgplan::set_function_sigs(self.function_sigs());
+        secantus_pgplan::set_function_defs(self.function_defs());
+        secantus_pgplan::set_partkey_defs(
+            self.all_table_defs()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|t| Some((self.relation_oid(&t.name)?, partition::partkey_text(t)?)))
+                .collect(),
+        );
+        secantus_pgplan::set_partition_parents(
+            self.all_table_defs()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|t| {
+                    let parent = partition::parent_of(t)?;
+                    Some((self.relation_oid(&t.name)?, self.relation_oid(parent)?))
+                })
+                .collect(),
+        );
         secantus_pgplan::set_object_comments(self.object_comments());
         secantus_pgplan::domains::set_user_domains(self.domains().unwrap_or_default());
+        secantus_pgplan::user_agg::set_user_aggregates(self.user_aggregates().unwrap_or_default());
         // User-defined functions, so the planner can type and route a call.
         secantus_pgplan::set_user_functions(
             self.user_function_docs()
@@ -3997,7 +4268,7 @@ impl PgHandler {
 
     /// Every table with a relation oid, as `(stored name, oid, temp)`, for
     /// the planner's `regclass` resolution.
-    fn relations(&self) -> Vec<(String, i64, bool)> {
+    pub(crate) fn relations(&self) -> Vec<(String, i64, bool)> {
         let docs = match self.type_catalog_docs(Self::COMPOSITE_COLLECTION) {
             Ok(docs) => docs,
             Err(_) => return Vec::new(),
@@ -4033,7 +4304,23 @@ impl PgHandler {
                         (name, oid, false)
                     }),
             )
+            // A sequence is a relation too: `'s'::regclass` names it.
+            .chain(
+                self.all_sequence_docs()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|d| {
+                        let name = d.get_str("_id").ok()?.to_string();
+                        let oid = Self::sequence_oid(&name);
+                        Some((name, oid, false))
+                    }),
+            )
             .collect()
+    }
+
+    /// A sequence's relation oid: stable for its name, in its own band.
+    pub(crate) fn sequence_oid(name: &str) -> i64 {
+        Self::index_oid(&format!("seq:{name}")) | 0x0400_0000
     }
 
     /// A view's oid: stable for its name, in a band no table, type or index
@@ -4360,6 +4647,8 @@ impl PgHandler {
             "btree_gist" => Some(("1.6", true, &[])),
             // Functions only: digest / hmac / crypt / gen_salt / ...
             "pgcrypto" => Some(("1.3", true, &[])),
+            // Trigram similarity: functions and operators, no types.
+            "pg_trgm" => Some(("1.6", true, &[])),
             "postgis" => Some(("3.4.6", false, &["geometry"])),
             _ => None,
         }
@@ -4637,6 +4926,12 @@ impl PgHandler {
             "returns_trigger": def.return_type == "trigger",
             "volatility": &def.volatility,
             "variadic": def.variadic,
+            "strict": def.strict,
+            "param_defaults": def
+                .defaults
+                .iter()
+                .map(|d| d.clone().map_or(Bson::Null, Bson::String))
+                .collect::<Vec<_>>(),
         };
         // PostgreSQL checks the body at CREATE (`check_function_bodies`).
         match def.language.as_str() {
@@ -4677,6 +4972,468 @@ impl PgHandler {
         }
         self.insert_type_doc(Self::FUNCTION_COLLECTION, &key, doc)?;
         Ok(vec![Response::Execution(Tag::new("CREATE FUNCTION"))])
+    }
+
+    /// The view an `ALTER VIEW` names, checked the way PostgreSQL does: it
+    /// must exist (or IF EXISTS skips with a notice), be a view, and belong
+    /// to the caller. `None`: skipped.
+    fn view_to_alter(&self, view: &str, missing_ok: bool) -> PgWireResult<Option<Document>> {
+        let Some(doc) = self.view_doc(view) else {
+            if self.lookup(view).is_some() {
+                return Err(Self::user_error(
+                    "42809",
+                    format!("\"{view}\" is not a view"),
+                ));
+            }
+            if missing_ok {
+                self.notice(
+                    "00000",
+                    format!("relation \"{view}\" does not exist, skipping"),
+                    None,
+                );
+                return Ok(None);
+            }
+            return Err(Self::user_error(
+                "42P01",
+                format!("relation \"{view}\" does not exist"),
+            ));
+        };
+        let role = self.current_role_name();
+        let owner = doc
+            .get_str("owner")
+            .map(str::to_string)
+            .unwrap_or_else(|_| self.session_user_name());
+        let member = role == owner
+            || self
+                .has_role_call(&[
+                    Bson::String(role.clone()),
+                    Bson::String(owner.clone()),
+                    Bson::String("USAGE".into()),
+                ])
+                .is_ok_and(|b| b == Bson::Boolean(true));
+        if !self.is_superuser(&role) && !member {
+            return Err(Self::user_error(
+                "42501",
+                format!("must be owner of view {view}"),
+            ));
+        }
+        Ok(Some(doc))
+    }
+
+    fn replace_view_doc(&self, old_id: &str, doc: Document) -> PgWireResult<()> {
+        self.delete_type_doc(Self::VIEW_COLLECTION, old_id)?;
+        let id = doc.get_str("_id").unwrap_or_default().to_string();
+        self.insert_type_doc(Self::VIEW_COLLECTION, &id, doc)
+    }
+
+    fn alter_view(
+        &self,
+        view: &str,
+        missing_ok: bool,
+        actions: Vec<secantus_pgplan::AlterViewAction>,
+        table_form: bool,
+    ) -> PgWireResult<Vec<Response>> {
+        use secantus_pgplan::AlterViewAction as A;
+        let tag = if table_form {
+            "ALTER TABLE"
+        } else {
+            "ALTER VIEW"
+        };
+        let Some(mut doc) = self.view_to_alter(view, missing_ok)? else {
+            return Ok(vec![Response::Execution(Tag::new(tag))]);
+        };
+        let definition = doc.get_str("definition").unwrap_or_default().to_string();
+        for action in actions {
+            match action {
+                A::OwnerTo(role) => {
+                    let role = if matches!(role.as_str(), "CURRENT_USER" | "CURRENT_ROLE") {
+                        self.current_role_name()
+                    } else {
+                        self.grantee_name(&role)?
+                    };
+                    doc.insert("owner", role);
+                }
+                A::SetDefault { column, sql } => {
+                    let names: Vec<String> = self
+                        .describe_fields(&definition, 0, &[])?
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|f| f.name().to_string())
+                        .collect();
+                    if !names.contains(&column) {
+                        return Err(Self::user_error(
+                            "42703",
+                            format!("column \"{column}\" of relation \"{view}\" does not exist"),
+                        ));
+                    }
+                    let mut defaults = doc.get_document("defaults").cloned().unwrap_or_default();
+                    match sql {
+                        Some(sql) => {
+                            defaults.insert(column, sql);
+                        }
+                        None => {
+                            defaults.remove(&column);
+                        }
+                    }
+                    doc.insert("defaults", defaults);
+                }
+                A::Options(opts) => {
+                    let mut options = doc.get_document("options").cloned().unwrap_or_default();
+                    for (name, value) in opts {
+                        match name.as_str() {
+                            "check_option" => match value.as_deref().map(str::to_ascii_lowercase) {
+                                None => {
+                                    doc.insert("check_option", Bson::Null);
+                                }
+                                Some(v) if v == "local" || v == "cascaded" => {
+                                    doc.insert("check_option", v.to_ascii_uppercase());
+                                }
+                                Some(v) => {
+                                    let mut info = ErrorInfo::new(
+                                        "ERROR".into(),
+                                        "22023".into(),
+                                        format!(
+                                            "invalid value for enum option \"check_option\": {v}"
+                                        ),
+                                    );
+                                    info.detail =
+                                        Some("Valid values are \"local\" and \"cascaded\".".into());
+                                    return Err(PgWireError::UserError(Box::new(info)));
+                                }
+                            },
+                            "security_barrier" | "security_invoker" => match value {
+                                None => {
+                                    options.remove(&name);
+                                }
+                                Some(v) => {
+                                    let b = match v.to_ascii_lowercase().as_str() {
+                                        "true" | "on" | "yes" | "1" => "true",
+                                        "false" | "off" | "no" | "0" => "false",
+                                        _ => {
+                                            return Err(Self::user_error(
+                                                "22023",
+                                                format!(
+                                                "invalid value for boolean option \"{name}\": {v}"
+                                            ),
+                                            ))
+                                        }
+                                    };
+                                    options.insert(name, b);
+                                }
+                            },
+                            other => {
+                                return Err(Self::user_error(
+                                    "22023",
+                                    format!("unrecognized parameter \"{other}\""),
+                                ))
+                            }
+                        }
+                    }
+                    doc.insert("options", options);
+                }
+            }
+        }
+        self.replace_view_doc(view, doc)?;
+        Ok(vec![Response::Execution(Tag::new(tag))])
+    }
+
+    fn rename_view(
+        &self,
+        view: &str,
+        to: &str,
+        missing_ok: bool,
+        table_form: bool,
+    ) -> PgWireResult<Vec<Response>> {
+        let tag = if table_form {
+            "ALTER TABLE"
+        } else {
+            "ALTER VIEW"
+        };
+        let Some(mut doc) = self.view_to_alter(view, missing_ok)? else {
+            return Ok(vec![Response::Execution(Tag::new(tag))]);
+        };
+        if self.relation_exists(to)? {
+            return Err(Self::user_error(
+                "42P07",
+                format!("relation \"{to}\" already exists"),
+            ));
+        }
+        doc.insert("_id", to);
+        doc.insert("view", to);
+        self.replace_view_doc(view, doc)?;
+        self.rename_relation_in_views(view, to)?;
+        // What is keyed by the view's name follows it: its triggers and its
+        // grants.
+        for mut t in self.trigger_docs()?.iter().cloned() {
+            if t.get_str("table") == Ok(view) {
+                let id = t.get_str("_id").unwrap_or_default().to_string();
+                t.insert("table", to);
+                let new_id = id.replacen(view, to, 1);
+                t.insert("_id", new_id.clone());
+                self.delete_type_doc(triggers::TRIGGER_COLLECTION, &id)?;
+                self.insert_type_doc(triggers::TRIGGER_COLLECTION, &new_id, t)?;
+            }
+        }
+        let grants: Vec<Document> = self
+            .storage
+            .find_matching(
+                self.db(),
+                Self::GRANT_COLLECTION,
+                &bson::doc! {"table": view},
+            )
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|b| decode_doc(b).ok())
+            .collect();
+        for mut g in grants {
+            let id = g.get_str("_id").unwrap_or_default().to_string();
+            let grantee = g.get_str("grantee").unwrap_or_default().to_string();
+            let new_id = format!("{to}\0{grantee}");
+            g.insert("table", to);
+            g.insert("_id", new_id.clone());
+            self.put_comment_doc(Self::GRANT_COLLECTION, &id, None)?;
+            self.put_comment_doc(Self::GRANT_COLLECTION, &new_id, Some(g))?;
+        }
+        Ok(vec![Response::Execution(Tag::new(tag))])
+    }
+
+    /// Every view (but `skip`) whose definition reads column `old` of
+    /// `relation`, rewritten to read `new` -- called BEFORE the rename lands,
+    /// so the relations' columns are still the old ones.
+    fn rename_column_in_views(
+        &self,
+        relation: &str,
+        old: &str,
+        new: &str,
+        skip: Option<&str>,
+    ) -> PgWireResult<()> {
+        let docs = self.type_catalog_docs(Self::VIEW_COLLECTION)?;
+        let views = self.views()?;
+        let columns_of = |name: &str| -> Option<Vec<String>> {
+            if let Some((_, def)) = views.iter().find(|(n, _)| n == name) {
+                return self
+                    .describe_fields(def, 0, &[])
+                    .ok()
+                    .flatten()
+                    .map(|fs| fs.iter().map(|f| f.name().to_string()).collect());
+            }
+            self.lookup(name)
+                .map(|d| d.columns.iter().map(|c| c.name.clone()).collect())
+        };
+        let mut rewrites = Vec::new();
+        for d in docs.iter() {
+            let id = d.get_str("_id").unwrap_or_default().to_string();
+            if Some(id.as_str()) == skip {
+                continue;
+            }
+            let Ok(def) = d.get_str("definition") else {
+                continue;
+            };
+            let rewritten =
+                secantus_pgplan::view_deps::rename_column(def, relation, old, new, &columns_of)
+                    .map_err(|e| Self::err(&e))?;
+            if rewritten != def {
+                let mut d = d.clone();
+                d.insert("definition", rewritten);
+                rewrites.push((id, d));
+            }
+        }
+        for (id, d) in rewrites {
+            self.replace_view_doc(&id, d)?;
+        }
+        Ok(())
+    }
+
+    /// Every OTHER view whose definition names relation `old`, rewritten to
+    /// name `new` (PostgreSQL's views follow a rename by OID).
+    fn rename_relation_in_views(&self, old: &str, new: &str) -> PgWireResult<()> {
+        let docs = self.type_catalog_docs(Self::VIEW_COLLECTION)?;
+        for d in docs.iter() {
+            let Ok(def) = d.get_str("definition") else {
+                continue;
+            };
+            let rewritten = secantus_pgplan::view_deps::rename_relation(def, old, new)
+                .map_err(|e| Self::err(&e))?;
+            if rewritten != def {
+                let id = d.get_str("_id").unwrap_or_default().to_string();
+                let mut d = d.clone();
+                d.insert("definition", rewritten);
+                self.replace_view_doc(&id, d)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn rename_view_column(
+        &self,
+        view: &str,
+        column: &str,
+        to: &str,
+        missing_ok: bool,
+        table_form: bool,
+    ) -> PgWireResult<Vec<Response>> {
+        let tag = if table_form {
+            "ALTER TABLE"
+        } else {
+            "ALTER VIEW"
+        };
+        let Some(mut doc) = self.view_to_alter(view, missing_ok)? else {
+            return Ok(vec![Response::Execution(Tag::new(tag))]);
+        };
+        let definition = doc.get_str("definition").unwrap_or_default().to_string();
+        let names: Vec<String> = self
+            .describe_fields(&definition, 0, &[])?
+            .unwrap_or_default()
+            .iter()
+            .map(|f| f.name().to_string())
+            .collect();
+        let Some(index) = names.iter().position(|n| n == column) else {
+            return Err(Self::user_error(
+                "42703",
+                format!("column \"{column}\" does not exist"),
+            ));
+        };
+        if names.iter().any(|n| n == to) {
+            return Err(Self::user_error(
+                "42701",
+                format!("column \"{to}\" of relation \"{view}\" already exists"),
+            ));
+        }
+        self.rename_column_in_views(view, column, to, Some(view))?;
+        let rewritten = secantus_pgplan::view_deps::rename_output(&definition, &names, index, to)
+            .map_err(|e| Self::err(&e))?;
+        doc.insert("definition", rewritten);
+        if let Ok(mut defaults) = doc.get_document("defaults").cloned() {
+            if let Some(v) = defaults.remove(column) {
+                defaults.insert(to, v);
+                doc.insert("defaults", defaults);
+            }
+        }
+        self.replace_view_doc(view, doc)?;
+        Ok(vec![Response::Execution(Tag::new(tag))])
+    }
+
+    /// The `__sql_aggregates__` key: the name and the argument types.
+    fn aggregate_key(name: &str, arg_types: &[String]) -> String {
+        format!("{name}/{}", arg_types.join(","))
+    }
+
+    /// Whether two argument-type lists name the same types (`int` and
+    /// `int4` do).
+    fn same_types(a: &[String], b: &[String]) -> bool {
+        let oid = |t: &str| secantus_pgplan::pgtypes::oid_of_name(t);
+        a.len() == b.len()
+            && a.iter().zip(b).all(|(x, y)| match (oid(x), oid(y)) {
+                (Some(p), Some(q)) => p == q,
+                _ => x.eq_ignore_ascii_case(y),
+            })
+    }
+
+    /// The database's user aggregates.
+    fn user_aggregates(&self) -> PgWireResult<Vec<secantus_pgplan::user_agg::UserAggregate>> {
+        let docs = self.type_catalog_docs(Self::AGGREGATE_COLLECTION)?;
+        Ok(docs
+            .iter()
+            .map(|d| secantus_pgplan::user_agg::UserAggregate {
+                name: d.get_str("name").unwrap_or_default().to_string(),
+                arg_types: d
+                    .get_array("arg_types")
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                sfunc: d.get_str("sfunc").unwrap_or_default().to_string(),
+                stype: d.get_str("stype").unwrap_or_default().to_string(),
+                finalfunc: d.get_str("finalfunc").ok().map(str::to_string),
+                initcond: d.get_str("initcond").ok().map(str::to_string),
+            })
+            .collect())
+    }
+
+    fn create_aggregate(
+        &self,
+        def: secantus_pgplan::user_agg::UserAggregate,
+        replace: bool,
+    ) -> PgWireResult<Vec<Response>> {
+        self.ensure_collection(Self::AGGREGATE_COLLECTION)?;
+        let existing = self
+            .user_aggregates()?
+            .into_iter()
+            .find(|a| a.name == def.name && Self::same_types(&a.arg_types, &def.arg_types));
+        if let Some(old) = existing {
+            if !replace {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".into(),
+                    "42723".into(),
+                    format!(
+                        "function \"{}\" already exists with same argument types",
+                        def.name
+                    ),
+                ))));
+            }
+            self.delete_type_doc(
+                Self::AGGREGATE_COLLECTION,
+                &Self::aggregate_key(&old.name, &old.arg_types),
+            )?;
+        }
+        let key = Self::aggregate_key(&def.name, &def.arg_types);
+        let mut doc = bson::doc! {
+            "_id": &key,
+            "name": &def.name,
+            "arg_types": def.arg_types.iter().map(|t| Bson::String(t.clone())).collect::<Vec<_>>(),
+            "sfunc": &def.sfunc,
+            "stype": &def.stype,
+        };
+        if let Some(f) = &def.finalfunc {
+            doc.insert("finalfunc", f);
+        }
+        if let Some(i) = &def.initcond {
+            doc.insert("initcond", i);
+        }
+        self.insert_type_doc(Self::AGGREGATE_COLLECTION, &key, doc)?;
+        Ok(vec![Response::Execution(Tag::new("CREATE AGGREGATE"))])
+    }
+
+    fn drop_aggregate(
+        &self,
+        name: &str,
+        arg_types: &[String],
+        if_exists: bool,
+    ) -> PgWireResult<Vec<Response>> {
+        let found = self
+            .user_aggregates()?
+            .into_iter()
+            .find(|a| a.name == name && Self::same_types(&a.arg_types, arg_types));
+        let Some(agg) = found else {
+            let sig = format!(
+                "{name}({})",
+                arg_types
+                    .iter()
+                    .map(|t| self.display_type_name(t))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            if if_exists {
+                self.notice(
+                    "00000",
+                    format!("aggregate {sig} does not exist, skipping"),
+                    None,
+                );
+                return Ok(vec![Response::Execution(Tag::new("DROP AGGREGATE"))]);
+            }
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "42883".into(),
+                format!("aggregate {sig} does not exist"),
+            ))));
+        };
+        self.delete_type_doc(
+            Self::AGGREGATE_COLLECTION,
+            &Self::aggregate_key(&agg.name, &agg.arg_types),
+        )?;
+        Ok(vec![Response::Execution(Tag::new("DROP AGGREGATE"))])
     }
 
     /// Run `f` one call level deeper, refusing past PostgreSQL's stack
@@ -4874,6 +5631,11 @@ impl PgHandler {
     /// (primary key, unique, check, foreign key), since the oid is positional.
     fn constraint_defs(&self) -> PgWireResult<Vec<(i64, String)>> {
         let mut out = Vec::new();
+        out.extend(
+            self.domain_constraints()
+                .into_iter()
+                .map(|(oid, _, _, _, text)| (oid, text)),
+        );
         for t in self.all_table_defs()? {
             let Some(rel) = self.relation_oid(&t.name) else {
                 continue;
@@ -5135,20 +5897,45 @@ impl PgHandler {
     /// with what this statement would take on a relation it names (ACCESS
     /// SHARE to read, ROW EXCLUSIVE to write, ACCESS EXCLUSIVE to TRUNCATE).
     /// One atomic load when no table is locked anywhere.
+    ///
+    /// Inside a transaction block the statement also TAKES that mode, held
+    /// to the block's end, so another session's `LOCK` waits for it.
     fn wait_for_table_locks(&self, sql: &str) -> PgWireResult<()> {
-        if !table_locks::any() {
+        let in_block = self.transaction_handle_open();
+        if !in_block && !table_locks::any() {
             return Ok(());
         }
         let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
-        for (table, privilege) in secantus_pgplan::privileges::sql_relations(sql) {
-            let mode = match privilege {
-                "SELECT" => table_locks::ACCESS_SHARE,
-                "TRUNCATE" => table_locks::ACCESS_EXCLUSIVE,
-                _ => table_locks::ROW_EXCLUSIVE,
-            };
-            table_locks::acquire(&table, pid, mode, false, false, self.lock_wait_poll())?;
+        let dml = secantus_pgplan::privileges::sql_relations(sql)
+            .into_iter()
+            .map(|(table, privilege)| {
+                let mode = match privilege {
+                    "SELECT" => table_locks::ACCESS_SHARE,
+                    "TRUNCATE" => table_locks::ACCESS_EXCLUSIVE,
+                    _ => table_locks::ROW_EXCLUSIVE,
+                };
+                (table, mode)
+            });
+        // DDL waits for readers too: ALTER / DROP / rename / CLUSTER take
+        // ACCESS EXCLUSIVE, CREATE INDEX takes SHARE.
+        let ddl = secantus_pgplan::privileges::ddl_locks(sql);
+        for (table, mode) in dml.chain(ddl) {
+            table_locks::acquire(
+                &table,
+                pid,
+                mode,
+                in_block,
+                false,
+                self.lock_wait_poll(),
+                Self::deadlock_error,
+            )?;
         }
         Ok(())
+    }
+
+    /// PostgreSQL's answer to a lock wait that closes a cycle.
+    fn deadlock_error() -> PgWireError {
+        Self::user_error("40P01", "deadlock detected".into())
     }
 
     /// The (field, descending) keys index `index` of `table` sorts by, for
@@ -5179,6 +5966,20 @@ impl PgHandler {
             .into_iter()
             .find(|ix| ix.get_str("name") == Ok(index));
         if let Some(ix) = stored {
+            // An expression index: sorted on each row's computed key, which
+            // `cluster_table` fills into `__cluster<i>` fields.
+            if let Some((exprs, keys)) = Self::index_expressions(&ix) {
+                return Ok(exprs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| {
+                        let desc = keys
+                            .get(i)
+                            .is_some_and(|k| k.to_ascii_uppercase().contains(" DESC"));
+                        (format!("__cluster{i}"), desc)
+                    })
+                    .collect());
+            }
             let key = ix.get_document("key").map_err(|_| missing())?;
             let mut out = Vec::new();
             for (field, dir) in key {
@@ -5220,6 +6021,26 @@ impl PgHandler {
         }
         let keys = self.cluster_keys(table, index)?;
         let mut docs = self.table_docs(table)?;
+        let expressions = self
+            .storage
+            .list_indexes(self.db(), table)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|ix| ix.get_str("name") == Ok(index))
+            .and_then(|ix| Self::index_expressions(&ix))
+            .map(|(e, _)| e);
+        if let Some(exprs) = &expressions {
+            let planned = exprs
+                .iter()
+                .map(|e| secantus_pgplan::plan_check_expression(e, &def).map_err(|e| Self::err(&e)))
+                .collect::<PgWireResult<Vec<_>>>()?;
+            for d in &mut docs {
+                for (i, expr) in planned.iter().enumerate() {
+                    let v = secantus_pgplan::apply_row_expr(expr, d).map_err(|e| Self::err(&e))?;
+                    d.insert(format!("__cluster{i}"), v);
+                }
+            }
+        }
         docs.sort_by(|a, b| {
             for (field, desc) in &keys {
                 let (x, y) = (
@@ -5242,6 +6063,13 @@ impl PgHandler {
             }
             std::cmp::Ordering::Equal
         });
+        if let Some(exprs) = &expressions {
+            for d in &mut docs {
+                for i in 0..exprs.len() {
+                    d.remove(format!("__cluster{i}"));
+                }
+            }
+        }
         if !docs.is_empty() {
             let out = docs
                 .iter()
@@ -5258,12 +6086,103 @@ impl PgHandler {
         Ok(())
     }
 
+    /// An expression index's `(expressions, key SQL)`, from its stored
+    /// options (at the top level or under `options`, as storage lists them).
+    fn index_expressions(ix: &Document) -> Option<(Vec<String>, Vec<String>)> {
+        let get = |k: &str| {
+            ix.get_array(k)
+                .ok()
+                .or_else(|| {
+                    ix.get_document("options")
+                        .ok()
+                        .and_then(|o| o.get_array(k).ok())
+                })
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+        };
+        let exprs = get("sqlExpressions").filter(|e| !e.is_empty())?;
+        Some((exprs, get("sqlKeys").unwrap_or_default()))
+    }
+
     /// 26000 for a prepared statement no PREPARE / Parse made.
     fn prepared_missing(name: &str) -> PgWireError {
         Self::user_error(
             "26000",
             format!("prepared statement \"{name}\" does not exist"),
         )
+    }
+
+    /// The stored catalog document of view `name`.
+    fn view_doc(&self, name: &str) -> Option<Document> {
+        self.type_catalog_docs(Self::VIEW_COLLECTION)
+            .ok()?
+            .iter()
+            .find(|d| d.get_str("view").or_else(|_| d.get_str("_id")) == Ok(name))
+            .cloned()
+    }
+
+    /// The tables `def` inherits from (`INHERITS (p, ...)`).
+    fn inherited_parents(def: &TableDef) -> Vec<String> {
+        def.extra
+            .get_array("inherits")
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The inheritance tree, for the planner: `(child, parent)` pairs and
+    /// each parent's columns.
+    fn inheritance(&self) -> InheritanceTree {
+        let defs = self.all_table_defs().unwrap_or_default();
+        let mut pairs = Vec::new();
+        let mut columns: Vec<(String, Vec<String>)> = Vec::new();
+        for t in &defs {
+            for p in Self::inherited_parents(t) {
+                if !columns.iter().any(|(n, _)| *n == p) {
+                    if let Some(pd) = defs.iter().find(|d| d.name == p) {
+                        columns.push((
+                            p.clone(),
+                            pd.columns.iter().map(|c| c.name.clone()).collect(),
+                        ));
+                    }
+                }
+                pairs.push((t.name.clone(), p));
+            }
+        }
+        (pairs, columns)
+    }
+
+    /// Per view, `ALTER VIEW ... SET DEFAULT`'s `(column, default SQL)`.
+    fn view_column_defaults(&self) -> Vec<(String, Vec<(String, String)>)> {
+        let docs = self
+            .type_catalog_docs(Self::VIEW_COLLECTION)
+            .unwrap_or_default();
+        docs.iter()
+            .filter_map(|d| {
+                let defaults = d.get_document("defaults").ok()?;
+                let name = d.get_str("view").or_else(|_| d.get_str("_id")).ok()?;
+                let cols: Vec<(String, String)> = defaults
+                    .iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect();
+                (!cols.is_empty()).then(|| (name.to_string(), cols))
+            })
+            .chain(self.partition_defaults())
+            .collect()
+    }
+
+    /// `ALTER VIEW ... SET (security_invoker = true)`: the view's reads are
+    /// checked, and row-level-secured, as the caller rather than its owner.
+    fn view_security_invoker(&self, name: &str) -> bool {
+        self.view_doc(name)
+            .and_then(|d| d.get_document("options").ok().cloned())
+            .is_some_and(|o| o.get_str("security_invoker") == Ok("true"))
     }
 
     /// The role that owns view `name`, when it is a view with one recorded.
@@ -5283,26 +6202,29 @@ impl PgHandler {
     /// subquery -- correlated or not -- is still part of the statement.
     fn check_sql_privileges(&self, sql: &str) -> PgWireResult<()> {
         let role = self.current_role_name();
-        if self.is_superuser(&role) {
+        let views = self.views()?;
+        // A superuser needs no check of its own -- but what a view reads is
+        // checked as the view's OWNER even then, so views still expand.
+        if self.is_superuser(&role) && views.is_empty() {
             return Ok(());
         }
-        let views = self.views()?;
         let mut pending: Vec<(String, String, &'static str, usize)> =
             secantus_pgplan::privileges::sql_relations(sql)
                 .into_iter()
                 .map(|(t, p)| (role.clone(), t, p, 0))
                 .collect();
         while let Some((as_role, relation, privilege, depth)) = pending.pop() {
-            if self.is_superuser(&as_role) {
-                continue;
-            }
             match views.iter().find(|(n, _)| *n == relation) {
                 Some((name, definition)) => {
                     self.check_privilege_as(&as_role, name, privilege, "view")?;
                     if depth < 16 {
-                        let owner = self
-                            .view_owner(name)
-                            .unwrap_or_else(|| self.session_user_name());
+                        // `security_invoker` views read as the caller.
+                        let owner = if self.view_security_invoker(name) {
+                            as_role.clone()
+                        } else {
+                            self.view_owner(name)
+                                .unwrap_or_else(|| self.session_user_name())
+                        };
                         for (t, _) in secantus_pgplan::privileges::sql_relations(definition) {
                             pending.push((
                                 owner.clone(),
@@ -5317,6 +6239,60 @@ impl PgHandler {
             }
         }
         Ok(())
+    }
+
+    /// Every index's `(oid, pg_get_indexdef text)`: `pg_indexes.indexdef`,
+    /// keyed by the index oid `pg_index` / `pg_class` carry.
+    fn index_defs(&self) -> Vec<(i64, String)> {
+        let Some(rows) = self.virtual_rows("pg_indexes", &Document::new()) else {
+            return Vec::new();
+        };
+        let Some(def) = Self::virtual_table("pg_indexes") else {
+            return Vec::new();
+        };
+        let (Some(name_f), Some(def_f)) = (def.field_of("indexname"), def.field_of("indexdef"))
+        else {
+            return Vec::new();
+        };
+        let by_name: Vec<(String, String)> = rows
+            .iter()
+            .filter_map(|r| {
+                Some((
+                    r.get_str(&name_f).ok()?.to_string(),
+                    r.get_str(&def_f).ok()?.to_string(),
+                ))
+            })
+            .collect();
+        self.index_relations()
+            .into_iter()
+            .filter_map(|ix| {
+                by_name
+                    .iter()
+                    .find(|(n, _)| *n == ix.name)
+                    .map(|(_, d)| (ix.oid, d.clone()))
+            })
+            .collect()
+    }
+
+    /// Every view's and materialized view's `(regclass oid, name,
+    /// definition)`, as `pg_get_viewdef` prints it (`pg_views.definition`).
+    fn view_defs(&self) -> Vec<(i64, String, String)> {
+        let views = self.views().unwrap_or_default();
+        let matviews = self
+            .matviews()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(n, d, _)| (n, d));
+        views
+            .into_iter()
+            .chain(matviews)
+            .map(|(name, definition)| {
+                let oid = self
+                    .relation_oid(&name)
+                    .unwrap_or_else(|| Self::view_oid(&name));
+                (oid, name, format!(" {definition};"))
+            })
+            .collect()
     }
 
     fn views(&self) -> PgWireResult<Vec<(String, String)>> {
@@ -5888,6 +6864,21 @@ impl PgHandler {
             }
         }
         self.ensure_collection(Self::VIEW_COLLECTION)?;
+        // `*` expands NOW, as PostgreSQL expands it when the view is made.
+        let all_views = self.views()?;
+        let columns_of = |rel: &str| -> Option<Vec<String>> {
+            if let Some((_, def)) = all_views.iter().find(|(n, _)| n == rel) {
+                return self
+                    .describe_fields(def, 0, &[])
+                    .ok()
+                    .flatten()
+                    .map(|fs| fs.iter().map(|f| f.name().to_string()).collect());
+            }
+            self.lookup(rel)
+                .map(|d| d.columns.iter().map(|c| c.name.clone()).collect())
+        };
+        let definition = secantus_pgplan::view_deps::expand_stars(&cv.definition, &columns_of)
+            .map_err(|e| Self::err(&e))?;
         let check = cv.check_option.as_deref().map_or(Bson::Null, Bson::from);
         // The owner is whoever created it; `CREATE OR REPLACE` keeps it.
         let owner = self
@@ -5896,7 +6887,7 @@ impl PgHandler {
         let doc = bson::doc! {
             "_id": &name,
             "view": &name,
-            "definition": &cv.definition,
+            "definition": &definition,
             "check_option": check,
             "owner": owner,
         };
@@ -6956,6 +7947,47 @@ impl PgHandler {
         )
     }
 
+    /// Every domain CHECK as a `pg_constraint` row's pieces: `(constraint
+    /// oid, name, domain type oid, domain name, pg_get_constraintdef text)`.
+    fn domain_constraints(&self) -> Vec<(i64, String, i64, String, String)> {
+        // `value` as a whole word, in any case, is PostgreSQL's `VALUE`.
+        let upper_value = |expr: &str| -> String {
+            let mut out = String::with_capacity(expr.len());
+            let chars: Vec<char> = expr.chars().collect();
+            let word = |c: char| c.is_alphanumeric() || c == '_';
+            let mut i = 0;
+            while i < chars.len() {
+                let rest: String = chars[i..chars.len().min(i + 5)].iter().collect();
+                if rest.eq_ignore_ascii_case("value")
+                    && (i == 0 || !word(chars[i - 1]))
+                    && chars.get(i + 5).is_none_or(|c| !word(*c))
+                {
+                    out.push_str("VALUE");
+                    i += 5;
+                } else {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
+            out
+        };
+        self.domains()
+            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|d| {
+                let type_oid = d.oid;
+                d.checks
+                    .into_iter()
+                    .map(|(name, expr)| {
+                        let oid = Self::index_oid(&format!("domcon:{}:{name}", d.name));
+                        let text = format!("CHECK (({}))", upper_value(&expr));
+                        (oid, name, type_oid, d.name.clone(), text)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     /// PostgreSQL's 42809 for a write to a materialized view, which only
     /// REFRESH may change.
     fn refuse_matview_write(&self, table: &str) -> PgWireResult<()> {
@@ -7297,8 +8329,19 @@ impl PgHandler {
     /// Every stored comment as pg_description keys it: `(object oid,
     /// sub-id, text)`, the sub-id a column's number or 0. Objects with no
     /// oid here (a sequence, a schema) are not listed.
-    fn object_comments(&self) -> Vec<(i64, i32, String)> {
+    pub(crate) fn object_comments(&self) -> Vec<(i64, i32, String)> {
         let mut out = Vec::new();
+        // An extension's description is its control file's `comment`.
+        for (i, (name, _, _)) in self
+            .extensions()
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+        {
+            if let Some(c) = catalog_fill::extension_description(&name) {
+                out.push((13_826 + i as i64, 0, c.to_string()));
+            }
+        }
         for def in self.all_table_defs().unwrap_or_default() {
             let Some(oid) = self.relation_oid(&def.name) else {
                 continue;
@@ -7542,6 +8585,19 @@ impl PgHandler {
     /// pipeline tests count (empty here -- the statement store lives in the
     /// wire layer and holds nothing a client named).
     fn virtual_table(name: &str) -> Option<TableDef> {
+        let mut def = Self::virtual_table_base(name)?;
+        // The columns clients read that are PostgreSQL's constant (or
+        // simply derived) values; `fill_catalog_columns` sets them.
+        for (column, ty) in catalog_fill::extra_columns(name) {
+            if def.column(column).is_none() {
+                def.columns
+                    .push(secantus_pgcatalog::Column::new(column, ty, false));
+            }
+        }
+        Some(def)
+    }
+
+    fn virtual_table_base(name: &str) -> Option<TableDef> {
         match name {
             // `information_schema` keeps its SCHEMA in the name, because its
             // views are called `tables` / `columns` / `sequences` -- names a
@@ -7570,6 +8626,21 @@ impl PgHandler {
                     Column::new("domain_name", "name", false),
                     Column::new("is_generated", "varchar", false),
                     Column::new("generation_expression", "varchar", false),
+                ],
+            )),
+            "information_schema.views" => Some(TableDef::new(
+                "views",
+                vec![
+                    Column::new("table_catalog", "name", false),
+                    Column::new("table_schema", "name", false),
+                    Column::new("table_name", "name", false),
+                    Column::new("view_definition", "varchar", false),
+                    Column::new("check_option", "varchar", false),
+                    Column::new("is_updatable", "varchar", false),
+                    Column::new("is_insertable_into", "varchar", false),
+                    Column::new("is_trigger_updatable", "varchar", false),
+                    Column::new("is_trigger_deletable", "varchar", false),
+                    Column::new("is_trigger_insertable_into", "varchar", false),
                 ],
             )),
             "information_schema.domains" => Some(TableDef::new(
@@ -7800,6 +8871,15 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("partattrs", "int2vector", false),
                 ],
             )),
+            "pg_views" => Some(TableDef::new(
+                "pg_views",
+                vec![
+                    secantus_pgcatalog::Column::new("schemaname", "name", false),
+                    secantus_pgcatalog::Column::new("viewname", "name", false),
+                    secantus_pgcatalog::Column::new("viewowner", "name", false),
+                    secantus_pgcatalog::Column::new("definition", "text", false),
+                ],
+            )),
             "pg_matviews" => Some(TableDef::new(
                 "pg_matviews",
                 vec![
@@ -7945,6 +9025,27 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("datacl", "text", false),
                 ],
             )),
+            "pg_locks" => Some(TableDef::new(
+                "pg_locks",
+                vec![
+                    secantus_pgcatalog::Column::new("locktype", "text", false),
+                    secantus_pgcatalog::Column::new("database", "oid", false),
+                    secantus_pgcatalog::Column::new("relation", "oid", false),
+                    secantus_pgcatalog::Column::new("page", "int4", false),
+                    secantus_pgcatalog::Column::new("tuple", "int2", false),
+                    secantus_pgcatalog::Column::new("virtualxid", "text", false),
+                    secantus_pgcatalog::Column::new("transactionid", "xid", false),
+                    secantus_pgcatalog::Column::new("classid", "oid", false),
+                    secantus_pgcatalog::Column::new("objid", "oid", false),
+                    secantus_pgcatalog::Column::new("objsubid", "int2", false),
+                    secantus_pgcatalog::Column::new("virtualtransaction", "text", false),
+                    secantus_pgcatalog::Column::new("pid", "int4", false),
+                    secantus_pgcatalog::Column::new("mode", "text", false),
+                    secantus_pgcatalog::Column::new("granted", "bool", false),
+                    secantus_pgcatalog::Column::new("fastpath", "bool", false),
+                    secantus_pgcatalog::Column::new("waitstart", "timestamptz", false),
+                ],
+            )),
             "pg_stat_activity" => Some(TableDef::new(
                 "pg_stat_activity",
                 vec![
@@ -8055,14 +9156,30 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("conbin", "pg_node_tree", false),
                 ],
             )),
-            _ => None,
+            "pg_collation" => Some(catalog_fill::pg_collation_def()),
+            "pg_am" => Some(catalog_fill::pg_am_def()),
+            "pg_policy" => Some(catalog_fill::pg_policy_def()),
+            "pg_sequence" => Some(catalog_fill::pg_sequence_def()),
+            "pg_description" => Some(catalog_fill::pg_description_def()),
+            "pg_opclass" => Some(catalog_fill::pg_opclass_def()),
+            "pg_depend" => Some(catalog_fill::pg_depend_def()),
+            "pg_publication_namespace" => Some(catalog_fill::pg_publication_namespace_def()),
+            _ => Self::catalog_object_table(name),
         }
     }
 
     /// The rows of one virtual table, already filtered.
     fn virtual_rows(&self, name: &str, filter: &Document) -> Option<Vec<Document>> {
         let def = Self::virtual_table(name)?;
-        let rows: Vec<Document> = match name {
+        let mut rows: Vec<Document> = match name {
+            "pg_collation" => self.pg_collation_rows(&def),
+            "pg_am" => self.pg_am_rows(&def),
+            "pg_policy" => self.pg_policy_rows(&def),
+            "pg_sequence" => self.pg_sequence_rows(&def),
+            "pg_description" => self.pg_description_rows(&def),
+            "pg_opclass" => self.pg_opclass_rows(&def),
+            "pg_depend" => Vec::new(),
+            "pg_publication_namespace" => Vec::new(),
             "information_schema.columns" => {
                 let f = |name: &str| def.field_of(name).expect("column");
                 let db = self.db().to_string();
@@ -8129,7 +9246,108 @@ impl PgHandler {
                         rows.push(d);
                     }
                 }
+                // A view's columns: its output, nullable, typed as described.
+                let docs = self.type_catalog_docs(Self::VIEW_COLLECTION).ok()?;
+                for v in docs.iter() {
+                    let Ok(name) = v.get_str("view").or_else(|_| v.get_str("_id")) else {
+                        continue;
+                    };
+                    let Some(fields) = v
+                        .get_str("definition")
+                        .ok()
+                        .and_then(|sql| self.describe_fields(sql, 0, &[]).ok().flatten())
+                    else {
+                        continue;
+                    };
+                    let defaults = v.get_document("defaults").ok();
+                    for (i, fd) in fields.iter().enumerate() {
+                        let ty =
+                            secantus_pgplan::pgtypes::name_of_oid(i64::from(fd.datatype().oid()))
+                                .unwrap_or("text");
+                        let mut d = Document::new();
+                        d.insert(f("table_catalog"), db.as_str());
+                        d.insert(f("table_schema"), "public");
+                        d.insert(f("table_name"), name);
+                        d.insert(f("column_name"), fd.name());
+                        d.insert(f("ordinal_position"), Bson::Int32((i + 1) as i32));
+                        d.insert(
+                            f("column_default"),
+                            defaults
+                                .and_then(|m| m.get_str(fd.name()).ok())
+                                .map_or(Bson::Null, |s| Bson::String(s.to_string())),
+                        );
+                        d.insert(f("is_nullable"), "YES");
+                        d.insert(f("data_type"), secantus_pgplan::display_type(ty));
+                        for k in [
+                            "character_maximum_length",
+                            "numeric_precision",
+                            "numeric_scale",
+                            "datetime_precision",
+                            "identity_generation",
+                            "domain_catalog",
+                            "domain_schema",
+                            "domain_name",
+                            "generation_expression",
+                        ] {
+                            d.insert(f(k), Bson::Null);
+                        }
+                        d.insert(f("udt_name"), ty);
+                        d.insert(f("is_identity"), "NO");
+                        d.insert(f("is_generated"), "NEVER");
+                        rows.push(d);
+                    }
+                }
                 rows
+            }
+            "information_schema.views" => {
+                let f = |name: &str| def.field_of(name).expect("column");
+                let db = self.db().to_string();
+                self.type_catalog_docs(Self::VIEW_COLLECTION)
+                    .ok()?
+                    .iter()
+                    .filter_map(|v| {
+                        let name = v.get_str("view").or_else(|_| v.get_str("_id")).ok()?;
+                        let sql = v.get_str("definition").unwrap_or_default();
+                        let updatable = secantus_pgplan::view_dml::is_updatable(sql);
+                        let yes_no = |b: bool| if b { "YES" } else { "NO" };
+                        let triggers: Vec<String> = self
+                            .trigger_docs()
+                            .unwrap_or_default()
+                            .iter()
+                            .filter(|t| {
+                                t.get_str("table") == Ok(name)
+                                    && t.get_str("timing") == Ok("INSTEAD OF")
+                            })
+                            .flat_map(|t| {
+                                t.get_array("events")
+                                    .map(|a| {
+                                        a.iter()
+                                            .filter_map(|e| e.as_str().map(str::to_string))
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .unwrap_or_default()
+                            })
+                            .collect();
+                        let has = |e: &str| triggers.iter().any(|t| t == e);
+                        let mut d = Document::new();
+                        d.insert(f("table_catalog"), db.as_str());
+                        d.insert(f("table_schema"), "public");
+                        d.insert(f("table_name"), name);
+                        d.insert(f("view_definition"), format!(" {sql};"));
+                        d.insert(
+                            f("check_option"),
+                            v.get_str("check_option")
+                                .unwrap_or("NONE")
+                                .to_ascii_uppercase(),
+                        );
+                        d.insert(f("is_updatable"), yes_no(updatable));
+                        d.insert(f("is_insertable_into"), yes_no(updatable || has("INSERT")));
+                        d.insert(f("is_trigger_updatable"), yes_no(has("UPDATE")));
+                        d.insert(f("is_trigger_deletable"), yes_no(has("DELETE")));
+                        d.insert(f("is_trigger_insertable_into"), yes_no(has("INSERT")));
+                        Some(d)
+                    })
+                    .collect()
             }
             "information_schema.domains" => {
                 let f = |name: &str| def.field_of(name).expect("column");
@@ -8168,6 +9386,20 @@ impl PgHandler {
                         d.insert(f("table_type"), "BASE TABLE");
                         d
                     })
+                    .chain(
+                        self.views()
+                            .ok()?
+                            .into_iter()
+                            .map(|(name, _)| {
+                                let mut d = Document::new();
+                                d.insert(f("table_catalog"), db.as_str());
+                                d.insert(f("table_schema"), "public");
+                                d.insert(f("table_name"), name);
+                                d.insert(f("table_type"), "VIEW");
+                                d
+                            })
+                            .collect::<Vec<_>>(),
+                    )
                     .collect()
             }
             "information_schema.table_constraints" => {
@@ -8356,6 +9588,8 @@ impl PgHandler {
                     d.insert(f("relpersistence"), if ix.table.temp { "t" } else { "p" });
                     d.insert(f("relrowsecurity"), false);
                     d.insert(f("relforcerowsecurity"), false);
+                    d.insert(f("relispartition"), false);
+                    d.insert(f("relpartbound"), Bson::Null);
                     rows.push(d);
                 }
                 // A sequence is a relation too, and `relkind` is how a client
@@ -8388,7 +9622,7 @@ impl PgHandler {
                 for s in self.all_sequence_docs().ok()? {
                     let name = s.get_str("_id").unwrap_or_default().to_string();
                     let mut d = Document::new();
-                    d.insert(f("oid"), Bson::Int64(0));
+                    d.insert(f("oid"), Bson::Int64(Self::sequence_oid(&name)));
                     d.insert(f("relname"), name.as_str());
                     d.insert(f("relnamespace"), Bson::Int64(Self::PUBLIC_NAMESPACE_OID));
                     d.insert(f("relkind"), "S");
@@ -8399,6 +9633,8 @@ impl PgHandler {
                     d.insert(f("relpersistence"), "p");
                     d.insert(f("relrowsecurity"), false);
                     d.insert(f("relforcerowsecurity"), false);
+                    d.insert(f("relispartition"), false);
+                    d.insert(f("relpartbound"), Bson::Null);
                     rows.push(d);
                 }
                 rows
@@ -8410,8 +9646,12 @@ impl PgHandler {
                     .map(|(name, oid)| {
                         let mut d = Document::new();
                         d.insert(f("oid"), Bson::Int64(oid));
+                        // `public` belongs to `pg_database_owner` since 15.
+                        d.insert(
+                            f("nspowner"),
+                            Bson::Int64(if name == "public" { 6171 } else { 10 }),
+                        );
                         d.insert(f("nspname"), name);
-                        d.insert(f("nspowner"), Bson::Int64(10));
                         d
                     })
                     .collect()
@@ -8474,7 +9714,7 @@ impl PgHandler {
                     }
                     let nargs = t.get_array("args").map(|a| a.len()).unwrap_or(0);
                     let mut d = Document::new();
-                    d.insert(f("oid"), Bson::Int64(0));
+                    d.insert(f("oid"), Bson::Int64(Self::trigger_oid(&t)));
                     d.insert(
                         f("tgrelid"),
                         Bson::Int64(self.relation_oid(table).unwrap_or(0)),
@@ -8921,7 +10161,7 @@ impl PgHandler {
                         row.insert(f("prolang"), Bson::Int64(lang));
                         row.insert(f("prokind"), "f");
                         row.insert(f("prosecdef"), false);
-                        row.insert(f("proisstrict"), false);
+                        row.insert(f("proisstrict"), d.get_bool("strict").unwrap_or(false));
                         row.insert(f("proretset"), d.get_bool("returns_set").unwrap_or(false));
                         row.insert(
                             f("provolatile"),
@@ -8951,13 +10191,52 @@ impl PgHandler {
                         row.insert(f("prosrc"), d.get_str("body").unwrap_or_default());
                         row
                     })
+                    .chain(self.user_aggregates().ok()?.into_iter().map(|a| {
+                        // An aggregate is a pg_proc row of kind `a`, its
+                        // body `aggregate_dummy`.
+                        let mut row = Document::new();
+                        let key = Self::aggregate_key(&a.name, &a.arg_types);
+                        row.insert(
+                            f("oid"),
+                            Bson::Int64(Self::index_oid(&format!("agg:{key}"))),
+                        );
+                        row.insert(f("proname"), a.name.clone());
+                        row.insert(f("pronamespace"), Bson::Int64(Self::PUBLIC_NAMESPACE_OID));
+                        row.insert(f("proowner"), Bson::Int64(10));
+                        row.insert(f("prolang"), Bson::Int64(12));
+                        row.insert(f("prokind"), "a");
+                        row.insert(f("prosecdef"), false);
+                        row.insert(f("proisstrict"), false);
+                        row.insert(f("proretset"), false);
+                        row.insert(f("provolatile"), "i");
+                        row.insert(f("pronargs"), Bson::Int32(a.arg_types.len() as i32));
+                        row.insert(
+                            f("prorettype"),
+                            Bson::Int64(type_oid(&secantus_pgplan::user_agg::result_type(
+                                &a,
+                                a.arg_types.first().map(String::as_str),
+                            ))),
+                        );
+                        row.insert(
+                            f("proargtypes"),
+                            Bson::Array(
+                                a.arg_types
+                                    .iter()
+                                    .map(|t| Bson::Int64(type_oid(t)))
+                                    .collect(),
+                            ),
+                        );
+                        row.insert(f("proargnames"), Bson::Null);
+                        row.insert(f("prosrc"), "aggregate_dummy");
+                        row
+                    }))
                     .collect()
             }
             "pg_inherits" => {
                 let f = |name: &str| def.field_of(name).expect("column");
                 let oid = |n: &str| Bson::Int64(self.relation_oid(n).unwrap_or(0));
-                self.all_table_defs()
-                    .ok()?
+                let defs = self.all_table_defs().ok()?;
+                let mut rows: Vec<Document> = defs
                     .iter()
                     .filter_map(|t| {
                         let parent = partition::parent_of(t)?;
@@ -8968,7 +10247,19 @@ impl PgHandler {
                         d.insert(f("inhdetachpending"), false);
                         Some(d)
                     })
-                    .collect()
+                    .collect();
+                // `INHERITS (p, ...)`: one row per parent, numbered.
+                for t in &defs {
+                    for (i, p) in Self::inherited_parents(t).iter().enumerate() {
+                        let mut d = Document::new();
+                        d.insert(f("inhrelid"), oid(&t.name));
+                        d.insert(f("inhparent"), oid(p));
+                        d.insert(f("inhseqno"), Bson::Int32(i as i32 + 1));
+                        d.insert(f("inhdetachpending"), false);
+                        rows.push(d);
+                    }
+                }
+                rows
             }
             "pg_partitioned_table" => {
                 let f = |name: &str| def.field_of(name).expect("column");
@@ -9000,6 +10291,26 @@ impl PgHandler {
                         d.insert(
                             f("partattrs"),
                             Bson::Array(attrs.into_iter().map(|a| Bson::Int32(a.into())).collect()),
+                        );
+                        Some(d)
+                    })
+                    .collect()
+            }
+            "pg_views" => {
+                let f = |name: &str| def.field_of(name).expect("column");
+                let login = self.session_user_name();
+                self.type_catalog_docs(Self::VIEW_COLLECTION)
+                    .ok()?
+                    .iter()
+                    .filter_map(|v| {
+                        let name = v.get_str("view").or_else(|_| v.get_str("_id")).ok()?;
+                        let mut d = Document::new();
+                        d.insert(f("schemaname"), "public");
+                        d.insert(f("viewname"), name);
+                        d.insert(f("viewowner"), v.get_str("owner").unwrap_or(login.as_str()));
+                        d.insert(
+                            f("definition"),
+                            format!(" {};", v.get_str("definition").unwrap_or_default()),
                         );
                         Some(d)
                     })
@@ -9220,6 +10531,84 @@ impl PgHandler {
                         rows.push(d);
                     }
                 }
+                // A view's and a materialized view's columns are its output
+                // columns; an index's are its key columns, in key order
+                // (psql's `\d view` / `\d index` read them here).
+                let plain = |relid: i64, name: &str, atttypid: i64, attnum: usize| {
+                    let mut d = Document::new();
+                    d.insert(
+                        def.field_of("attrelid").expect("column"),
+                        Bson::Int64(relid),
+                    );
+                    d.insert(def.field_of("attname").expect("column"), name);
+                    d.insert(
+                        def.field_of("atttypid").expect("column"),
+                        Bson::Int64(atttypid),
+                    );
+                    d.insert(
+                        def.field_of("attnum").expect("column"),
+                        Bson::Int32(attnum as i32),
+                    );
+                    d.insert(
+                        def.field_of("attisdropped").expect("column"),
+                        Bson::Boolean(false),
+                    );
+                    d.insert(
+                        def.field_of("attnotnull").expect("column"),
+                        Bson::Boolean(false),
+                    );
+                    d.insert(def.field_of("atttypmod").expect("column"), Bson::Int32(-1));
+                    d.insert(
+                        def.field_of("atthasdef").expect("column"),
+                        Bson::Boolean(false),
+                    );
+                    d.insert(def.field_of("attgenerated").expect("column"), "");
+                    d
+                };
+                let views = self
+                    .views()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(n, _)| (Self::view_oid(&n), n))
+                    .chain(
+                        self.matviews()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter_map(|(n, _, _)| Some((self.relation_oid(&n)?, n))),
+                    );
+                for (relid, name) in views {
+                    let Ok((cols, _)) = self.internal_query(&format!(
+                        "SELECT * FROM {} LIMIT 0",
+                        secantus_pgplan::scalar::quote_identifier(&name)
+                    )) else {
+                        continue;
+                    };
+                    for (i, (cname, ctype)) in cols.iter().enumerate() {
+                        if let Some(atttypid) = self.type_oid_by_name(ctype) {
+                            rows.push(plain(relid, cname, atttypid, i + 1));
+                        }
+                    }
+                }
+                for ix in self.index_relations() {
+                    for (i, key) in ix.keys.iter().enumerate() {
+                        let Some(c) = usize::try_from(*key)
+                            .ok()
+                            .filter(|k| *k > 0)
+                            .and_then(|k| ix.table.columns.get(k - 1))
+                        else {
+                            continue;
+                        };
+                        let declared = c.extra.get_str("domain_type").unwrap_or(&c.pg_type);
+                        if let Some(atttypid) = self.type_oid_by_name(declared) {
+                            let mut d = plain(ix.oid, &c.name, atttypid, i + 1);
+                            d.insert(
+                                def.field_of("atttypmod").expect("column"),
+                                Bson::Int32(c.typmod),
+                            );
+                            rows.push(d);
+                        }
+                    }
+                }
                 // A table's ROW TYPE is a composite under the same name and
                 // the same relation oid, so listing both put every table
                 // column in twice -- once from the table and once from its
@@ -9362,6 +10751,72 @@ impl PgHandler {
                         d
                     })
                     .collect()
+            }
+            // Table locks (held and awaited) and advisory locks. PostgreSQL
+            // also lists each backend's virtualxid and the fast-path locks
+            // on what the querying statement reads; those have nothing here
+            // to correspond to.
+            "pg_locks" => {
+                let f = |name: &str| def.field_of(name).expect("column");
+                let db_oid = self
+                    .databases
+                    .all(&self.storage)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|i| i.name == self.db())
+                    .map_or(Bson::Null, |i| Bson::Int64(i.oid));
+                let blank = |kind: &str, pid: i32, mode: &str, granted: bool| {
+                    let mut d = Document::new();
+                    for k in [
+                        "database",
+                        "relation",
+                        "page",
+                        "tuple",
+                        "virtualxid",
+                        "transactionid",
+                        "classid",
+                        "objid",
+                        "objsubid",
+                        "waitstart",
+                    ] {
+                        d.insert(f(k), Bson::Null);
+                    }
+                    d.insert(f("locktype"), kind);
+                    d.insert(f("virtualtransaction"), format!("{pid}/1"));
+                    d.insert(f("pid"), Bson::Int32(pid));
+                    d.insert(f("mode"), mode);
+                    d.insert(f("granted"), granted);
+                    d.insert(f("fastpath"), false);
+                    d
+                };
+                let mut rows = Vec::new();
+                let relations = table_locks::snapshot()
+                    .into_iter()
+                    .map(|h| (h, true))
+                    .chain(table_locks::waiting().into_iter().map(|w| (w, false)));
+                for ((table, pid, mode), granted) in relations {
+                    let Some(oid) = self.relation_oid(&table) else {
+                        continue;
+                    };
+                    let mut d = blank("relation", pid, table_locks::mode_name(mode), granted);
+                    d.insert(f("database"), db_oid.clone());
+                    d.insert(f("relation"), Bson::Int64(oid));
+                    rows.push(d);
+                }
+                for ((form, value), pid, shared) in advisory::snapshot() {
+                    let mut d = blank(
+                        "advisory",
+                        pid,
+                        if shared { "ShareLock" } else { "ExclusiveLock" },
+                        true,
+                    );
+                    d.insert(f("database"), db_oid.clone());
+                    d.insert(f("classid"), Bson::Int64((value >> 32) & 0xffff_ffff));
+                    d.insert(f("objid"), Bson::Int64(value & 0xffff_ffff));
+                    d.insert(f("objsubid"), Bson::Int32(if form == 0 { 1 } else { 2 }));
+                    rows.push(d);
+                }
+                rows
             }
             "pg_stat_activity" => {
                 let backends: Vec<(i32, BackendActivity)> = backend_registry()
@@ -9508,7 +10963,38 @@ impl PgHandler {
             "pg_constraint" => {
                 let field = |c: &str| def.field_of(c).expect("column");
                 let defs = self.all_table_defs().ok()?;
+                // A key / unique / exclude constraint's index, by name.
+                let index_oids: Vec<(String, String, i64)> = self
+                    .index_relations()
+                    .into_iter()
+                    .map(|ix| (ix.table.name.clone(), ix.name.clone(), ix.oid))
+                    .collect();
                 let mut rows: Vec<Document> = Vec::new();
+                // A domain's CHECKs: `contypid` names the domain, `conrelid`
+                // is 0.
+                for (oid, conname, type_oid, _, text) in self.domain_constraints() {
+                    let mut d = Document::new();
+                    d.insert(field("oid"), Bson::Int64(oid));
+                    d.insert(field("conname"), conname);
+                    d.insert(
+                        field("connamespace"),
+                        Bson::Int64(Self::PUBLIC_NAMESPACE_OID),
+                    );
+                    d.insert(field("contype"), "c");
+                    d.insert(field("condeferrable"), Bson::Boolean(false));
+                    d.insert(field("condeferred"), Bson::Boolean(false));
+                    d.insert(field("convalidated"), Bson::Boolean(true));
+                    d.insert(field("conrelid"), Bson::Int64(0));
+                    d.insert(field("contypid"), Bson::Int64(type_oid));
+                    d.insert(field("conindid"), Bson::Int64(0));
+                    d.insert(field("conparentid"), Bson::Int64(0));
+                    d.insert(field("confrelid"), Bson::Int64(0));
+                    d.insert(field("confupdtype"), " ");
+                    d.insert(field("confdeltype"), " ");
+                    d.insert(field("confmatchtype"), " ");
+                    d.insert(field("conbin"), text);
+                    rows.push(d);
+                }
                 for t in &defs {
                     // A table created before row types were recorded has no
                     // relation oid, so nothing could join to its rows.
@@ -9549,7 +11035,7 @@ impl PgHandler {
                             Bson::Int64(Self::constraint_oid(conrelid, ordinal)),
                         );
                         ordinal += 1;
-                        d.insert(field("conname"), conname);
+                        d.insert(field("conname"), conname.as_str());
                         d.insert(field("connamespace"), Bson::Int64(namespace_oid));
                         d.insert(field("contype"), contype);
                         d.insert(field("condeferrable"), Bson::Boolean(deferrable));
@@ -9557,11 +11043,18 @@ impl PgHandler {
                         d.insert(field("convalidated"), Bson::Boolean(true));
                         d.insert(field("conrelid"), Bson::Int64(conrelid));
                         d.insert(field("contypid"), Bson::Int64(0));
-                        // No `pg_index` rows exist on this server, so a
-                        // non-zero `conindid` would point at nothing. 0 is the
-                        // honest answer; PostgreSQL has a real index oid here
-                        // for p / u / f.
-                        d.insert(field("conindid"), Bson::Int64(0));
+                        // The index behind a PRIMARY KEY / UNIQUE / EXCLUDE
+                        // constraint (psql's `\d` joins on it). A FOREIGN
+                        // KEY's -- the referenced key's index -- stays 0.
+                        let conindid = if matches!(contype, "p" | "u" | "x") {
+                            index_oids
+                                .iter()
+                                .find(|(table, name, _)| *table == t.name && *name == conname)
+                                .map_or(0, |(_, _, oid)| *oid)
+                        } else {
+                            0
+                        };
+                        d.insert(field("conindid"), Bson::Int64(conindid));
                         d.insert(field("conparentid"), Bson::Int64(0));
                         d.insert(field("confrelid"), Bson::Int64(confrelid));
                         // ' ' for every non-FK row, measured on 14.24.
@@ -9719,8 +11212,9 @@ impl PgHandler {
                 }
                 rows
             }
-            _ => Vec::new(),
+            _ => self.catalog_object_rows(name, &def).unwrap_or_default(),
         };
+        self.fill_catalog_columns(name, &def, &mut rows);
         let empty = Document::new();
         Some(
             rows.into_iter()
@@ -9856,12 +11350,31 @@ impl PgHandler {
     /// relation points at its first mention (`LINE 1: select * from wat`).
     fn err_in(e: &PlanError, sql: &str) -> PgWireError {
         let mut out = Self::err(e);
-        if let (PlanError::UndefinedTable(name), PgWireError::UserError(info)) = (e, &mut out) {
-            if let Some(pos) = secantus_pgplan::identifier_position(sql, name) {
+        if let PgWireError::UserError(info) = &mut out {
+            let pos = match e {
+                PlanError::UndefinedTable(name) => {
+                    let _ = secantus_pgplan::take_error_location();
+                    secantus_pgplan::identifier_position(sql, name)
+                }
+                _ => secantus_pgplan::error_position(sql, e.sqlstate(), &e.to_string()),
+            };
+            if let Some(pos) = pos {
                 info.position = Some(pos.to_string());
             }
         }
         out
+    }
+
+    /// An error raised while RUNNING `sql` (not planning it), given the
+    /// position PostgreSQL would point at when the statement names it.
+    fn positioned(mut e: PgWireError, sql: &str) -> PgWireError {
+        if let PgWireError::UserError(info) = &mut e {
+            if info.position.is_none() && info.severity == "ERROR" {
+                info.position = secantus_pgplan::error_position(sql, &info.code, &info.message)
+                    .map(|p| p.to_string());
+            }
+        }
+        e
     }
 
     /// Write `rows` honouring an `ON CONFLICT` clause; returns
@@ -9880,6 +11393,14 @@ impl PgHandler {
     ) -> PgWireResult<(usize, Vec<Document>)> {
         let mut affected: Vec<Document> = Vec::new();
         let mut written = 0usize;
+        // A column target naming a unique INDEX: resolved here, before any
+        // row is written, to that index's own filter (a partial index holds
+        // only the rows its predicate admits, so only those can conflict).
+        let index_filter = if oc.index_arbiter {
+            Some(self.resolve_index_arbiter(table, def, oc)?)
+        } else {
+            None
+        };
         for row in rows {
             let bytes =
                 encode_doc(&row).map_err(|e| Self::storage_err("could not encode a row", e))?;
@@ -9913,6 +11434,10 @@ impl PgHandler {
             // version of this did, and what the tests caught.
             let Some(probe) = Self::arbiter_key(def, oc.target.as_ref(), &row, &reported) else {
                 return Err(Self::write_error(table, def, err));
+            };
+            let probe = match &index_filter {
+                Some(Some(partial)) => bson::doc! { "$and": [probe, partial.clone()] },
+                _ => probe,
             };
             let existing = self
                 .storage
@@ -9948,10 +11473,78 @@ impl PgHandler {
             self.check_row_constraints(def, &after)?;
             self.check_foreign_keys(def, std::slice::from_ref(&after))?;
             let id = row_id(&existing);
-            written += self.update_rows(table, &bson::doc! {"_id": id}, &set, &unset)?;
+            if row_id(&after) != id {
+                // A new PRIMARY KEY moves the row, as UPDATE does: the key's
+                // own 23505 first, then the rows referencing the old key.
+                let pair = vec![(existing.clone(), after.clone())];
+                self.check_rekeys(table, def, &pair)?;
+                self.check_referencing_updates(def, &pair)?;
+                written += self.move_rekeyed_rows(table, def, &pair)?;
+            } else {
+                written += self.update_rows(table, &bson::doc! {"_id": id}, &set, &unset)?;
+            }
             affected.push(after);
         }
         Ok((written, affected))
+    }
+
+    /// The unique index an `ON CONFLICT (cols) [WHERE pred]` target infers,
+    /// as its partial filter (`None` for a full index): an index on exactly
+    /// those columns, whose predicate -- if it has one -- the target's WHERE
+    /// implies. None qualifying is PostgreSQL's 42P10.
+    fn resolve_index_arbiter(
+        &self,
+        table: &str,
+        def: &TableDef,
+        oc: &secantus_pgplan::OnConflict,
+    ) -> PgWireResult<Option<Document>> {
+        let no_arbiter = || {
+            Self::err(&PlanError::NoArbiter(
+                "there is no unique or exclusion constraint matching the ON CONFLICT \
+                 specification"
+                    .to_string(),
+            ))
+        };
+        let Some(secantus_pgplan::ConflictTarget::Columns(cols)) = &oc.target else {
+            return Err(no_arbiter());
+        };
+        let mut want: Vec<String> = cols.iter().filter_map(|c| def.field_of(c)).collect();
+        want.sort();
+        for ix in self
+            .storage
+            .list_indexes(self.db(), table)
+            .unwrap_or_default()
+        {
+            let options = ix.get_document("options").ok();
+            let unique = ix.get_bool("unique").unwrap_or(false)
+                || options.is_some_and(|o| o.get_bool("unique").unwrap_or(false));
+            if !unique {
+                continue;
+            }
+            let Ok(key) = ix.get_document("key") else {
+                continue;
+            };
+            let mut have: Vec<String> = key.keys().cloned().collect();
+            have.sort();
+            if have != want {
+                continue;
+            }
+            let lookup = |k: &str| {
+                ix.get(k)
+                    .or_else(|| options.and_then(|o| o.get(k)))
+                    .cloned()
+            };
+            let predicate = lookup("sqlPredicate").and_then(|p| p.as_str().map(str::to_string));
+            let usable = match (&predicate, &oc.where_sql) {
+                (None, _) => true,
+                (Some(p), Some(w)) => secantus_pgplan::predicate_implied(w, p),
+                (Some(_), None) => false,
+            };
+            if usable {
+                return Ok(lookup("partialFilterExpression").and_then(|f| f.as_document().cloned()));
+            }
+        }
+        Err(no_arbiter())
     }
 
     /// The filter identifying the row the clause arbitrates on.
@@ -10252,6 +11845,7 @@ impl PgHandler {
         table: &str,
         def: &TableDef,
         rows: &[Document],
+        replacing: &[Bson],
     ) -> PgWireResult<Option<Bson>> {
         let Some(pk) = def.columns.iter().find(|c| c.pk) else {
             return Ok(None);
@@ -10284,7 +11878,14 @@ impl PgHandler {
                     .storage
                     .find_matching(self.db(), table, &filter)
                     .map_err(|e| Self::storage_err("could not check the primary key", e))?;
-                if !hit.is_empty() {
+                // A row this UPDATE rewrites no longer holds its old key.
+                let taken = hit.iter().any(|raw| {
+                    decode_doc(raw)
+                        .ok()
+                        .and_then(|d| d.get("_id").cloned())
+                        .is_none_or(|old| !replacing.contains(&old))
+                });
+                if taken {
                     return Ok(Some(id.clone()));
                 }
             }
@@ -11263,7 +12864,7 @@ impl SimpleQueryHandler for PgHandler {
             Err(e) => {
                 self.note_failure();
                 self.flush_notices(_c).await?;
-                return Err(Self::err(&e));
+                return Err(Self::err_in(&e, query));
             }
         };
         let out = if stmts.len() <= 1 && !self.runs_user_code(query) {
@@ -11272,9 +12873,9 @@ impl SimpleQueryHandler for PgHandler {
             // A statement that can run user code is ONE transaction, as every
             // statement is in PostgreSQL: a trigger or a DO block that raises
             // after writing must take those writes with it.
-            self.run_batch(&[query.to_string()]).await
+            self.run_batch(&[query.to_string()], query).await
         } else {
-            self.run_batch(&stmts).await
+            self.run_batch(&stmts, query).await
         };
         // A simple query inside an extended-protocol statement group runs in
         // the group's transaction and ends it, as PostgreSQL's does
@@ -11328,14 +12929,24 @@ impl PgHandler {
     /// no-op here (as it is a warning in PostgreSQL), and `COMMIT` already
     /// takes the handle. After a mid-batch COMMIT a fresh implicit transaction
     /// is opened for the commands that follow, which is what PostgreSQL does.
-    async fn run_batch(&self, stmts: &[String]) -> PgWireResult<Vec<Response>> {
+    async fn run_batch(&self, stmts: &[String], whole: &str) -> PgWireResult<Vec<Response>> {
         let mut implicit = self.txn.lock().unwrap_or_else(|e| e.into_inner()).is_none();
         if implicit {
             self.begin_implicit()?;
         }
 
         let mut out = Vec::with_capacity(stmts.len());
+        // Where each statement starts in the string the client sent: an
+        // error's position counts from there, as PostgreSQL counts it.
+        let mut cursor = 0usize;
         for (i, sql) in stmts.iter().enumerate() {
+            let offset = whole
+                .get(cursor..)
+                .and_then(|rest| rest.find(sql.as_str()))
+                .map(|at| {
+                    cursor += at + sql.len();
+                    whole[..cursor - sql.len()].chars().count()
+                });
             match self.run(sql, &[], 0).await {
                 Ok(responses) => {
                     // A BEGIN inside the batch makes the implicit transaction
@@ -11353,11 +12964,19 @@ impl PgHandler {
                     }
                     out.extend(responses);
                 }
-                Err(e) => {
+                Err(mut e) => {
                     if implicit {
                         // Roll back whatever this batch opened. A failure to
                         // roll back must not mask the error that caused it.
                         let _ = self.rollback_implicit();
+                    }
+                    if let PgWireError::UserError(info) = &mut e {
+                        info.position = match (info.position.as_deref(), offset) {
+                            (Some(p), Some(off)) => {
+                                p.parse::<usize>().ok().map(|p| (p + off).to_string())
+                            }
+                            _ => None,
+                        };
                     }
                     return Err(e);
                 }
@@ -11685,6 +13304,7 @@ impl PgHandler {
     /// catalog would leave a table the server still believes in.
     fn written_tables(stmt: &Statement) -> Vec<String> {
         let mut out = match stmt {
+            Statement::Sequence(_, stmts) => stmts.iter().flat_map(Self::written_tables).collect(),
             // A serial column's INSERT moves its sequence too.
             Statement::Insert(i) => vec![i.table.clone(), SEQUENCE_COLLECTION.to_string()],
             // An ALTER rewrites the ROWS as well as the catalog, so a
@@ -11785,6 +13405,25 @@ impl PgHandler {
             Statement::DropFunction { .. } => vec![
                 Self::FUNCTION_COLLECTION.to_string(),
                 Self::BASE_TYPE_COLLECTION.to_string(),
+                Self::AGGREGATE_COLLECTION.to_string(),
+            ],
+            Statement::CreateAggregate { .. } | Statement::DropAggregate { .. } => {
+                vec![Self::AGGREGATE_COLLECTION.to_string()]
+            }
+            Statement::CreateOperator(_) | Statement::DropOperator { .. } => {
+                vec![catalog_objects::OPERATOR_COLLECTION.to_string()]
+            }
+            Statement::Catalog(_) => vec![
+                catalog_objects::STATISTICS_COLLECTION.to_string(),
+                catalog_objects::TABLESPACE_COLLECTION.to_string(),
+                catalog_objects::PUBLICATION_COLLECTION.to_string(),
+            ],
+            Statement::AlterView { .. }
+            | Statement::RenameView { .. }
+            | Statement::RenameViewColumn { .. } => vec![
+                Self::VIEW_COLLECTION.to_string(),
+                triggers::TRIGGER_COLLECTION.to_string(),
+                Self::GRANT_COLLECTION.to_string(),
             ],
             Statement::DropType { .. } => vec![
                 Self::ENUM_COLLECTION.to_string(),
@@ -11969,7 +13608,7 @@ impl PgHandler {
                 }
                 return Ok(Some(action.clone()));
             }
-            A::AddForeignKey(fk) => {
+            A::AddForeignKey { fk, named } => {
                 for c in &fk.columns {
                     if def.column(c).is_none() {
                         return Err(missing_column(c));
@@ -11980,7 +13619,32 @@ impl PgHandler {
                     .ok_or_else(|| Self::relation_missing(&fk.ref_table))?;
                 let mut fk = fk.clone();
                 secantus_pgplan::resolve_fk_target(&mut fk, &target).map_err(|e| Self::err(&e))?;
-                return Ok(Some(A::AddForeignKey(fk)));
+                let taken = |n: &str| {
+                    def.check_constraints.iter().any(|c| c.name == n)
+                        || def.unique_constraints.iter().any(|u| u.name == n)
+                        || def.foreign_keys.iter().any(|f| f.name == n)
+                        || (def.columns.iter().any(|c| c.pk) && n == format!("{table}_pkey"))
+                };
+                if taken(&fk.name) {
+                    if *named {
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".into(),
+                            "42710".into(), // duplicate_object
+                            format!(
+                                "constraint \"{}\" for relation \"{table}\" already exists",
+                                fk.name
+                            ),
+                        ))));
+                    }
+                    // `ChooseConstraintName`: the first free `<base><n>`.
+                    let base = fk.name.clone();
+                    let mut n = 1;
+                    while taken(&fk.name) {
+                        fk.name = format!("{base}{n}");
+                        n += 1;
+                    }
+                }
+                return Ok(Some(A::AddForeignKey { fk, named: *named }));
             }
             A::ValidateConstraint(name) => {
                 let exists = def.check_constraints.iter().any(|c| c.name == *name)
@@ -12024,6 +13688,30 @@ impl PgHandler {
                 // A NOT NULL column with no DEFAULT cannot be added to a table
                 // that already has rows: every one of them would violate it
                 // immediately, which is PostgreSQL's own refusal.
+                // A serial column gives every existing row a value, from a
+                // sequence named `<table>_<column>_seq` -- or, if that name is
+                // taken, the first free `..._seq1`, `..._seq2`, as PostgreSQL
+                // chooses.
+                if let Some(seq) = &column.sequence {
+                    let mut name = seq.clone();
+                    let mut n = 0;
+                    while self.relation_exists(&name)?
+                        || self
+                            .all_sequence_docs()?
+                            .iter()
+                            .any(|d| d.get_str("_id") == Ok(name.as_str()))
+                    {
+                        n += 1;
+                        name = format!("{seq}{n}");
+                    }
+                    let mut column = column.clone();
+                    column.sequence = Some(name);
+                    column.nullable = false;
+                    return Ok(Some(A::AddColumn {
+                        column,
+                        if_not_exists: *if_not_exists,
+                    }));
+                }
                 if !column.nullable && column.default.is_none() && self.table_has_rows(table)? {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
@@ -12126,7 +13814,7 @@ impl PgHandler {
             A::AddPrimaryKey { name, columns } => {
                 self.add_primary_key(table, def, before, name, columns)
             }
-            A::AddForeignKey(fk) => {
+            A::AddForeignKey { fk, .. } => {
                 let mut only = def.clone();
                 only.foreign_keys = vec![fk.clone()];
                 let docs = self.table_docs(table)?;
@@ -12139,6 +13827,40 @@ impl PgHandler {
             // field means "the default" rather than NULL, and a column DROPPED
             // and re-ADDED under the same name would resurrect the old values.
             A::AddColumn { column, .. } => {
+                if let Some(seq) = column.sequence.as_deref() {
+                    let max_value = match column.pg_type.as_str() {
+                        "int2" => i64::from(i16::MAX),
+                        "int8" => i64::MAX,
+                        _ => i64::from(i32::MAX),
+                    };
+                    let doc = secantus_pgcatalog::sequence_document(
+                        seq,
+                        &format!("{table}.{}", column.name),
+                        max_value,
+                    );
+                    let bytes = encode_doc(&doc)
+                        .map_err(|e| Self::storage_err("could not encode a sequence", e))?;
+                    self.ensure_collection(SEQUENCE_COLLECTION)?;
+                    self.insert_checked(
+                        SEQUENCE_COLLECTION,
+                        vec![bytes],
+                        "could not record the sequence",
+                    )?;
+                    let field = column.field();
+                    let wide = column.pg_type == "int8";
+                    return self.rewrite_rows(table, |d| {
+                        let n = self.nextval(seq, 1)?.first().copied().unwrap_or(0);
+                        d.insert(
+                            field.clone(),
+                            if wide {
+                                Bson::Int64(n)
+                            } else {
+                                Bson::Int32(n as i32)
+                            },
+                        );
+                        Ok(())
+                    });
+                }
                 if let Some(expr) = column.default_expr() {
                     let sql = format!("SELECT ({expr})::{}", column.pg_type);
                     let field = column.field();
@@ -12149,7 +13871,7 @@ impl PgHandler {
                         Ok(())
                     });
                 }
-                let value = column.default.clone().unwrap_or(Bson::Null);
+                let value = typed_default(column)?.unwrap_or(Bson::Null);
                 self.rewrite_rows(table, |d| {
                     d.insert(column.field(), value.clone());
                     Ok(())
@@ -12532,7 +14254,12 @@ impl PgHandler {
     /// string literal (`nextval('s')`) and a schema qualifier is dropped --
     /// this server has one schema, so `public.s` and `s` name the same thing.
     fn sequence_name_arg(&self, arg: &ConstCol) -> PgWireResult<Option<String>> {
-        Ok(match self.resolve_const_col(arg)? {
+        let value = self.resolve_const_col(arg)?;
+        // `nextval('s'::regclass)`: the regclass names the sequence by oid.
+        if let Some(oid) = secantus_pgplan::regclass_oid(&value) {
+            return Ok(Some(secantus_pgplan::regclass_text(oid)));
+        }
+        Ok(match value {
             Bson::Null => None,
             Bson::String(s) => Some(
                 s.rsplit('.')
@@ -12603,12 +14330,38 @@ impl PgHandler {
             Some(Bson::String(s)) => {
                 // Single quotes double inside a SQL literal.
                 let escaped = s.replace('\'', "''");
-                Bson::String(format!("'{escaped}'::{}", c.pg_type))
+                Bson::String(format!(
+                    "'{escaped}'::{}",
+                    secantus_pgplan::display_type(&c.pg_type)
+                ))
             }
+            Some(Bson::Array(items)) => Bson::String(format!(
+                "'{}'::{}",
+                secantus_pgplan::render_array(items).replace('\'', "''"),
+                secantus_pgplan::display_type(&c.pg_type)
+            )),
             Some(Bson::Boolean(b)) => Bson::String(b.to_string()),
-            Some(other) => Bson::String(
-                secantus_pgplan::numeric::numeric_text(other).unwrap_or_else(|| format!("{other}")),
-            ),
+            Some(other) => {
+                let text = secantus_pgplan::numeric::numeric_text(other)
+                    .unwrap_or_else(|| format!("{other}"));
+                // A negative constant is quoted and stamped with the LITERAL's
+                // type (not the column's), so it cannot read as a unary minus:
+                // `'-1'::integer`, `'-2.5'::numeric`.
+                Bson::String(if text.starts_with('-') {
+                    let ty = if text.contains(['.', 'e', 'E', 'N', 'I']) {
+                        "numeric"
+                    } else if text.parse::<i32>().is_ok() {
+                        "integer"
+                    } else if text.parse::<i64>().is_ok() {
+                        "bigint"
+                    } else {
+                        "numeric"
+                    };
+                    format!("'{text}'::{ty}")
+                } else {
+                    text
+                })
+            }
         }
     }
 
@@ -12903,6 +14656,32 @@ impl PgHandler {
         }
         if name == "pg_has_role" {
             return self.has_role_call(args);
+        }
+        // `pg_trgm`'s `set_limit(real)`: the session's similarity threshold.
+        if name == "set_limit" {
+            let v = match args.first() {
+                Some(Bson::Double(d)) => *d,
+                Some(Bson::Int32(i)) => f64::from(*i),
+                Some(Bson::Int64(i)) => *i as f64,
+                Some(other) => secantus_pgplan::value_text(other)
+                    .parse()
+                    .unwrap_or(f64::NAN),
+                None => f64::NAN,
+            };
+            if !(0.0..=1.0).contains(&v) {
+                return Err(Self::user_error(
+                    "22023",
+                    format!(
+                        "{v} is outside the valid range for parameter \"pg_trgm.similarity_threshold\" (0 .. 1)"
+                    ),
+                ));
+            }
+            let text = format!("{}", v as f32);
+            self.settings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert("pg_trgm.similarity_threshold".into(), text);
+            return Ok(Bson::Double(f64::from(v as f32)));
         }
         let seq = |i: usize| -> PgWireResult<Option<String>> {
             self.sequence_name_arg(&ConstCol::Value(args.get(i).cloned().unwrap_or(Bson::Null)))
@@ -13428,7 +15207,7 @@ impl PgHandler {
             },
             None,
         );
-        result
+        result.map_err(|e| Self::positioned(e, query))
     }
 
     /// Record what `pg_stat_activity` shows for this backend: the state, and
@@ -13573,6 +15352,7 @@ impl PgHandler {
         // The plan that EXECUTES, with the executor's hooks: `values
         // (nextval('s'))` is folded while planning, so the sequence moves
         // here -- once -- and never in a Describe's plan.
+        let _ = secantus_pgplan::take_error_location();
         let planned = self.with_executor_hooks(|| {
             secantus_pgplan::planning_to_execute(|| {
                 secantus_pgplan::plan_with_session_types_and_subqueries(
@@ -13736,7 +15516,11 @@ impl PgHandler {
                 .cursor_capture
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .take();
+                .take()
+                // A source the executor did not capture (VALUES, an
+                // aggregate, a constant select) is recovered from its text
+                // rows, so a binary FETCH still sends binary.
+                .or_else(|| typed_from_text(&schema, &rows, &tz));
             self.cursors
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -13989,6 +15773,18 @@ impl PgHandler {
         {
             self.txn_failed
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+            // An aborted transaction releases its table locks at once, as
+            // PostgreSQL's abort does -- the block still waits for its
+            // ROLLBACK, but no other session waits on it. (Inside a savepoint
+            // the holds stay: ROLLBACK TO may carry on under them.)
+            if self
+                .savepoints
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+            {
+                table_locks::release(self.backend_pid.load(std::sync::atomic::Ordering::Relaxed));
+            }
         }
         // An error anywhere in an extended-protocol statement group -- a
         // `Describe` that cannot resolve the statement as much as an
@@ -14009,8 +15805,23 @@ impl PgHandler {
             ConstCol::CurrentSetting { name, missing_ok } => {
                 let key = canonical_setting(name);
                 let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
-                match settings.get(&key) {
-                    Some(v) => Ok(Bson::String(v.clone())),
+                // `pg_trgm`'s thresholds exist once the extension does.
+                let trgm_default = match key.as_str() {
+                    "pg_trgm.similarity_threshold" => Some("0.3"),
+                    "pg_trgm.word_similarity_threshold" => Some("0.6"),
+                    "pg_trgm.strict_word_similarity_threshold" => Some("0.5"),
+                    _ => None,
+                }
+                .filter(|_| {
+                    self.type_catalog_docs(Self::EXTENSION_COLLECTION)
+                        .is_ok_and(|d| d.iter().any(|e| e.get_str("_id") == Ok("pg_trgm")))
+                });
+                match settings
+                    .get(&key)
+                    .cloned()
+                    .or(trgm_default.map(str::to_string))
+                {
+                    Some(v) => Ok(Bson::String(v)),
                     // `current_setting(x)` errors on an unknown name;
                     // `current_setting(x, true)` answers NULL (probed PG 14).
                     None if *missing_ok => Ok(Bson::Null),
@@ -15077,9 +16888,12 @@ impl PgHandler {
     /// own earlier ones. The exception is a sequence the open transaction
     /// created: it is invisible outside, and rolls back with the block anyway.
     fn nextval(&self, name: &str, count: usize) -> PgWireResult<Vec<i64>> {
-        if !self.transaction_handle_open() {
-            return self.nextval_in_scope(name, count);
-        }
+        // A sequence advance is never rolled back -- not with a block, and
+        // not with a failed autocommit statement, whose own transaction (not
+        // the session's handle) would otherwise take the advance with it: a
+        // duplicate-key INSERT consumes its serial value on PostgreSQL. A
+        // sequence created in the open transaction is invisible outside it,
+        // so it advances inside.
         match self
             .storage
             .outside_user_transaction(|| self.nextval_in_scope(name, count))
@@ -16228,7 +18042,7 @@ impl PgHandler {
                         // column, not just the one it is filed under.
                         secantus_pgplan::apply_row_expr(expr, &d)
                     } else {
-                        let v = d.get(f).cloned().unwrap_or(Bson::Null);
+                        let v = secantus_pgplan::field_value(&d, f);
                         secantus_pgplan::apply_column_expr(expr, v, &tz)
                     }
                     .map_err(|e| PgHandler::err(&e))?;
@@ -16351,6 +18165,21 @@ impl PgHandler {
                 "CREATE FUNCTION"
             }
             Statement::DropFunction { .. } => "DROP FUNCTION",
+            Statement::CreateAggregate { .. } => "CREATE AGGREGATE",
+            Statement::Catalog(op) => op.tag(),
+            Statement::Sequence(tag, _) => tag,
+            Statement::CreateOperator(_) => "CREATE OPERATOR",
+            Statement::DropOperator { .. } => "DROP OPERATOR",
+            Statement::AlterView { table_form, .. }
+            | Statement::RenameView { table_form, .. }
+            | Statement::RenameViewColumn { table_form, .. } => {
+                if *table_form {
+                    "ALTER TABLE"
+                } else {
+                    "ALTER VIEW"
+                }
+            }
+            Statement::DropAggregate { .. } => "DROP AGGREGATE",
             Statement::CreateTrigger(..) => "CREATE TRIGGER",
             Statement::DropTrigger { .. } => "DROP TRIGGER",
             Statement::CreateSchema { .. } => "CREATE SCHEMA",
@@ -16590,7 +18419,7 @@ impl PgHandler {
                 if let Ok(spec) = def.extra.get_document("partition_by") {
                     for c in spec.get_array("columns").into_iter().flatten() {
                         let c = c.as_str().unwrap_or_default();
-                        if def.column(c).is_none() {
+                        if !c.starts_with('(') && def.column(c).is_none() {
                             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                                 "ERROR".into(),
                                 "42703".into(),
@@ -16863,7 +18692,7 @@ impl PgHandler {
                 )?;
                 self.apply_serial_defaults(&def, &mut ins.rows)?;
                 self.apply_expression_defaults(&def, &mut ins.rows)?;
-                apply_column_defaults(&def, &mut ins.rows);
+                apply_column_defaults(&def, &mut ins.rows)?;
                 self.apply_generated(&def, &mut ins.rows)?;
                 // BEFORE triggers see each row with its defaults, and may
                 // rewrite or drop it before any constraint is checked.
@@ -16880,12 +18709,15 @@ impl PgHandler {
                     self.check_partition_route(&def, row)?;
                 }
                 self.check_expression_unique(&def, &ins.rows, &[])?;
+                self.check_partition_unique(&def, &ins.rows, &[])?;
                 self.check_exclusions(&def, &ins.rows, &[])?;
-                if let Some(dup) = self.wide_numeric_pk_conflict(&ins.table, &def, &ins.rows)? {
+                if let Some(dup) =
+                    self.wide_numeric_pk_conflict(&ins.table, &def, &ins.rows, &[])?
+                {
                     return Err(Self::write_error(
                         &ins.table,
                         &def,
-                        &bson::doc! { "code": 11000, "keyValue": { "_id": dup } },
+                        &bson::doc! { "code": 11000, "keyPattern": { "_id": 1 }, "keyValue": { "_id": dup } },
                     ));
                 }
                 self.check_foreign_keys(&def, &ins.rows)?;
@@ -17558,6 +19390,55 @@ impl PgHandler {
                 Ok(vec![Response::Execution(Tag::new("CREATE FUNCTION"))])
             }
 
+            Statement::CreateAggregate { def, replace } => self.create_aggregate(def, replace),
+            Statement::Catalog(op) => self.execute_catalog(op),
+            // One statement per table of an inheritance tree.
+            Statement::Sequence(tag, statements) => {
+                let mut rows = 0usize;
+                for st in statements {
+                    for r in self.execute(st, max_rows)? {
+                        if let Response::Execution(t) = r {
+                            rows += t.rows().unwrap_or(0);
+                        }
+                    }
+                }
+                Ok(vec![Response::Execution(if tag == "ALTER TABLE" {
+                    Tag::new(tag)
+                } else {
+                    Tag::new(tag).with_rows(rows)
+                })])
+            }
+            Statement::CreateOperator(op) => self.create_operator(op),
+            Statement::DropOperator {
+                name,
+                left,
+                right,
+                if_exists,
+            } => self.drop_operator(&name, left.as_deref(), &right, if_exists),
+            Statement::AlterView {
+                view,
+                missing_ok,
+                actions,
+                table_form,
+            } => self.alter_view(&view, missing_ok, actions, table_form),
+            Statement::RenameView {
+                view,
+                to,
+                missing_ok,
+                table_form,
+            } => self.rename_view(&view, &to, missing_ok, table_form),
+            Statement::RenameViewColumn {
+                view,
+                column,
+                to,
+                missing_ok,
+                table_form,
+            } => self.rename_view_column(&view, &column, &to, missing_ok, table_form),
+            Statement::DropAggregate {
+                name,
+                arg_types,
+                if_exists,
+            } => self.drop_aggregate(&name, &arg_types, if_exists),
             Statement::DropFunction {
                 name,
                 arg_types,
@@ -17565,6 +19446,23 @@ impl PgHandler {
                 cascade,
             } => {
                 let tag = || Ok(vec![Response::Execution(Tag::new("DROP FUNCTION"))]);
+                // An aggregate is dropped with DROP AGGREGATE (42809).
+                if !self.functions()?.iter().any(|f| f.name == name)
+                    && self.user_aggregates()?.iter().any(|a| {
+                        a.name == name
+                            && arg_types
+                                .as_ref()
+                                .is_none_or(|t| Self::same_types(t, &a.arg_types))
+                    })
+                {
+                    let mut info = ErrorInfo::new(
+                        "ERROR".into(),
+                        "42809".into(), // wrong_object_type
+                        format!("\"{name}\" is an aggregate function"),
+                    );
+                    info.hint = Some("Use DROP AGGREGATE to drop aggregate functions.".into());
+                    return Err(PgWireError::UserError(Box::new(info)));
+                }
                 // Every named argument type must resolve first (measured on
                 // 16: `drop function invout("a-b")` after the type is gone is
                 // 42704 on the TYPE, not 42883 on the function).
@@ -17714,6 +19612,56 @@ impl PgHandler {
                     }
                     for id in &cascade_functions {
                         self.delete_type_doc(Self::FUNCTION_COLLECTION, id)?;
+                    }
+                }
+                // An aggregate depends on its state and final functions.
+                let aggs: Vec<secantus_pgplan::user_agg::UserAggregate> = self
+                    .user_aggregates()?
+                    .into_iter()
+                    .filter(|a| {
+                        (a.sfunc == target.name
+                            && target.param_types.len() == a.arg_types.len() + 1)
+                            || (a.finalfunc.as_deref() == Some(target.name.as_str())
+                                && target.param_types.len() == 1)
+                    })
+                    .collect();
+                if !aggs.is_empty() {
+                    let object = |f: &str, types: &[String]| {
+                        let t: Vec<String> =
+                            types.iter().map(|t| self.display_type_name(t)).collect();
+                        format!("{f}({})", t.join(","))
+                    };
+                    let fsig = object(&target.name, &target.param_types);
+                    let descs: Vec<String> = aggs
+                        .iter()
+                        .map(|a| format!("function {}", object(&a.name, &a.arg_types)))
+                        .collect();
+                    if !cascade {
+                        let mut info = ErrorInfo::new(
+                            "ERROR".into(),
+                            "2BP01".into(),
+                            format!(
+                                "cannot drop function {fsig} because other objects depend on it"
+                            ),
+                        );
+                        info.detail = Some(
+                            descs
+                                .iter()
+                                .map(|d| format!("{d} depends on function {fsig}"))
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        );
+                        info.hint = Some(
+                            "Use DROP ... CASCADE to drop the dependent objects too.".to_string(),
+                        );
+                        return Err(PgWireError::UserError(Box::new(info)));
+                    }
+                    self.cascade_notice(&descs);
+                    for a in &aggs {
+                        self.delete_type_doc(
+                            Self::AGGREGATE_COLLECTION,
+                            &Self::aggregate_key(&a.name, &a.arg_types),
+                        )?;
                     }
                 }
                 // A trigger depends on the function it executes.
@@ -18055,6 +20003,8 @@ impl PgHandler {
                 def.name = to.clone();
                 self.rewrite_catalog(&to, &def)?;
                 self.note_uncommitted(&table, None);
+                // Views reading the table follow the rename.
+                self.rename_relation_in_views(&table, &to)?;
                 // Its partitions follow the new name.
                 for mut child in self.partitions_of(&table)? {
                     child.extra.insert("partition_of", to.as_str());
@@ -18104,6 +20054,8 @@ impl PgHandler {
                         format!("cannot rename inherited column \"{column}\""),
                     ))));
                 }
+                // Views reading the column follow the rename.
+                self.rename_column_in_views(&table, &column, &to, None)?;
                 if !old.pk {
                     self.rename_row_field(&table, &old.field(), &to)?;
                 }
@@ -18426,6 +20378,7 @@ impl PgHandler {
                                 Statement::DropTable(secantus_pgplan::DropTable {
                                     tables: vec![child.name.clone()],
                                     if_exists: false,
+                                    cascade: drop.cascade,
                                 }),
                                 max_rows,
                             )?;
@@ -18434,13 +20387,113 @@ impl PgHandler {
                             self.delete_partition_rows(&def)?;
                         }
                     }
-                    let mut dependants = secantus_pgplan::views_reading(table);
-                    dependants.retain(|v| !self.is_partition(v) && !children.contains(v));
-                    if !dependants.is_empty() && self.lookup(table).is_some() {
-                        return Err(Self::dependants_error(
-                            &format!("table {table}"),
-                            &dependants,
-                        ));
+                    // What depends on the table: other tables' foreign keys
+                    // referencing it, then the views over it (and over those
+                    // views), in PostgreSQL's order. RESTRICT refuses;
+                    // CASCADE drops the views and the constraints.
+                    if self.lookup(table).is_some() {
+                        let fks: Vec<(TableDef, secantus_pgcatalog::ForeignKey)> = self
+                            .referencing_keys(table)?
+                            .into_iter()
+                            .filter(|(child, _)| {
+                                child.name != *table && !drop.tables.contains(&child.name)
+                            })
+                            .collect();
+                        // (view, what it depends on), breadth first.
+                        let mut views: Vec<(String, String)> = Vec::new();
+                        let mut frontier = vec![format!("table {table}")];
+                        let mut names = vec![table.clone()];
+                        while let Some(on) = names.first().cloned() {
+                            names.remove(0);
+                            let what = frontier.remove(0);
+                            for v in secantus_pgplan::views_reading(&on) {
+                                if self.is_partition(&v)
+                                    || children.contains(&v)
+                                    || views.iter().any(|(n, _)| *n == v)
+                                {
+                                    continue;
+                                }
+                                views.push((v.clone(), what.clone()));
+                                names.push(v.clone());
+                                frontier.push(format!("view {v}"));
+                            }
+                        }
+                        // Inheritance children (and theirs) depend on it too.
+                        let mut kids: Vec<(String, String)> = Vec::new();
+                        let mut stack = vec![table.clone()];
+                        let defs = self.all_table_defs()?;
+                        while let Some(p) = stack.pop() {
+                            for d in &defs {
+                                if Self::inherited_parents(d).contains(&p)
+                                    && !kids.iter().any(|(k, _)| *k == d.name)
+                                    && !drop.tables.contains(&d.name)
+                                {
+                                    kids.push((d.name.clone(), p.clone()));
+                                    stack.push(d.name.clone());
+                                }
+                            }
+                        }
+                        let objects: Vec<(String, String)> = kids
+                            .iter()
+                            .map(|(k, p)| (format!("table {k}"), format!("table {p}")))
+                            .chain(fks.iter().map(|(child, fk)| {
+                                (
+                                    format!("constraint {} on table {}", fk.name, child.name),
+                                    format!("table {table}"),
+                                )
+                            }))
+                            .chain(
+                                views
+                                    .iter()
+                                    .map(|(v, on)| (format!("view {v}"), on.clone())),
+                            )
+                            .collect();
+                        if !objects.is_empty() {
+                            if !drop.cascade {
+                                let mut info = ErrorInfo::new(
+                                    "ERROR".into(),
+                                    "2BP01".into(),
+                                    format!(
+                                        "cannot drop table {table} because other objects depend on it"
+                                    ),
+                                );
+                                info.detail = Some(
+                                    objects
+                                        .iter()
+                                        .map(|(o, on)| format!("{o} depends on {on}"))
+                                        .collect::<Vec<_>>()
+                                        .join("\n"),
+                                );
+                                info.hint = Some(
+                                    "Use DROP ... CASCADE to drop the dependent objects too."
+                                        .into(),
+                                );
+                                return Err(PgWireError::UserError(Box::new(info)));
+                            }
+                            let descs: Vec<String> = objects.into_iter().map(|(o, _)| o).collect();
+                            self.cascade_notice(&descs);
+                            for (child, fk) in &fks {
+                                let mut def =
+                                    self.lookup(&child.name).unwrap_or_else(|| child.clone());
+                                def.foreign_keys.retain(|f| f.name != fk.name);
+                                self.rewrite_catalog(&child.name, &def)?;
+                            }
+                            for (v, _) in views.iter().rev() {
+                                self.delete_view(v)?;
+                            }
+                            for (k, _) in kids.iter().rev() {
+                                if self.lookup(k).is_some() {
+                                    self.execute(
+                                        Statement::DropTable(secantus_pgplan::DropTable {
+                                            tables: vec![k.clone()],
+                                            if_exists: true,
+                                            cascade: true,
+                                        }),
+                                        max_rows,
+                                    )?;
+                                }
+                            }
+                        }
                     }
                     let Some(def) = self.lookup(table) else {
                         if drop.if_exists {
@@ -18457,8 +20510,10 @@ impl PgHandler {
                             format!("table \"{table}\" does not exist"),
                         ))));
                     };
-                    // Its triggers go with it.
+                    // Its triggers go with it, and its statistics objects and
+                    // publication memberships.
                     self.drop_table_triggers(table)?;
+                    self.drop_table_catalog_objects(table)?;
                     // The sequences its serial columns own go with it.
                     if def.columns.iter().any(|c| c.sequence.is_some()) {
                         self.ensure_collection(SEQUENCE_COLLECTION)?;
@@ -18848,6 +20903,7 @@ impl PgHandler {
                         Statement::DropTable(secantus_pgplan::DropTable {
                             tables: vec![name.clone()],
                             if_exists: true,
+                            cascade: false,
                         }),
                         max_rows,
                     )?;
@@ -19352,8 +21408,15 @@ impl PgHandler {
                     if self.lookup(t).is_none() {
                         return Err(Self::relation_missing(t));
                     }
-                    let got =
-                        table_locks::acquire(t, pid, mode, true, nowait, self.lock_wait_poll())?;
+                    let got = table_locks::acquire(
+                        t,
+                        pid,
+                        mode,
+                        true,
+                        nowait,
+                        self.lock_wait_poll(),
+                        Self::deadlock_error,
+                    )?;
                     if !got {
                         return Err(Self::user_error(
                             "55P03",
@@ -19572,6 +21635,10 @@ impl PgHandler {
                         canonical_ms_guc(&key, &value)?
                     } else if BOOL_GUCS.contains(&key.as_str()) {
                         canonical_bool_guc(&key, &value)?
+                    } else if key == "TimeZone" {
+                        // A bare number of hours is recorded as its POSIX
+                        // spec, as PostgreSQL shows it (`3` -> `<+03>-03`).
+                        secantus_pgplan::TimeZoneSetting::canonical_setting(&value).unwrap_or(value)
                     } else {
                         value
                     };
@@ -19987,7 +22054,19 @@ impl PgHandler {
                             .chain(rekeys.iter().map(|(old, _)| row_id(old)))
                             .collect();
                         self.check_expression_unique(def, &new_rows, &replacing)?;
+                        self.check_partition_unique(def, &new_rows, &replacing)?;
                         self.check_exclusions(def, &new_rows, &replacing)?;
+                        // A wide numeric key is stored by its text, so the
+                        // storage index cannot see `1e41` equal `1e41.0`.
+                        if let Some(dup) =
+                            self.wide_numeric_pk_conflict(&upd.table, def, &new_rows, &replacing)?
+                        {
+                            return Err(Self::write_error(
+                                &upd.table,
+                                def,
+                                &bson::doc! { "code": 11000, "keyPattern": { "_id": 1 }, "keyValue": { "_id": dup } },
+                            ));
+                        }
                     }
                     if let (true, Some(def)) = (referenced, def.as_ref()) {
                         self.check_rekeys(&upd.table, def, &rekeys)?;
@@ -20943,6 +23022,13 @@ impl PgHandler {
             if fk.ref_table == child.name || matches!(action, Some("SET DEFAULT")) {
                 self.check_fk_child_side(child, fk, &after)?;
             }
+            // The rewritten columns may also belong to the child's OTHER
+            // foreign keys, which PostgreSQL checks against the new values.
+            for other in &child.foreign_keys {
+                if other.name != fk.name && other.columns.iter().any(|c| fk.columns.contains(c)) {
+                    self.check_fk_child_side(child, other, &after)?;
+                }
+            }
             self.update_rows(&child.name, child_filter, &set, &[])?;
             Ok(())
         };
@@ -21116,9 +23202,30 @@ impl PgHandler {
 /// Fill every column an INSERT omitted with its literal DEFAULT. Sequence
 /// defaults are applied first (`apply_serial_defaults`); a column with
 /// neither stays absent, which reads as NULL.
-fn apply_column_defaults(def: &TableDef, rows: &mut [Document]) {
+/// A column's folded DEFAULT as a row stores it. The default is kept as
+/// written (`column_default` prints `1.25`) and takes the column's modifier
+/// on the way in: a numeric(4,1) stores `1.3`, as an inserted literal would.
+fn typed_default(column: &Column) -> PgWireResult<Option<Bson>> {
+    let Some(default) = column.default.as_ref() else {
+        return Ok(None);
+    };
+    Ok(Some(match (column.pg_type.as_str(), column.typmod) {
+        ("numeric" | "decimal", t) if t > 4 => {
+            match secantus_pgplan::numeric::numeric_text(default) {
+                Some(text) => secantus_pgplan::numeric::numeric_bson(
+                    &secantus_pgplan::numeric::apply_numeric_typmod(&text, t)
+                        .map_err(|e| PgHandler::err(&e))?,
+                ),
+                None => default.clone(),
+            }
+        }
+        _ => default.clone(),
+    }))
+}
+
+fn apply_column_defaults(def: &TableDef, rows: &mut [Document]) -> PgWireResult<()> {
     for column in &def.columns {
-        let Some(default) = column.default.as_ref() else {
+        let Some(default) = typed_default(column)? else {
             continue;
         };
         let field = column.field();
@@ -21128,6 +23235,7 @@ fn apply_column_defaults(def: &TableDef, rows: &mut [Document]) {
             }
         }
     }
+    Ok(())
 }
 
 /// A stored timestamp, with its hidden companion added back.
@@ -21152,7 +23260,7 @@ fn resolve_cell(
         let v = if matches!(expr, secantus_pgplan::ColumnExpr::Row { .. }) {
             secantus_pgplan::apply_row_expr(expr, doc)
         } else {
-            let v = doc.get(field).cloned().unwrap_or(Bson::Null);
+            let v = secantus_pgplan::field_value(doc, field);
             secantus_pgplan::apply_column_expr(expr, v, tz)
         }
         .map_err(|e| PgHandler::err(&e))?;
@@ -22464,11 +24572,18 @@ fn encode_field_value_inner(
                 options.as_ref(),
             );
         }
+        // A date / timestamp element follows the session DateStyle
+        // (`{04.03.2020}` under German), as the scalar arms below do.
         let rendered: Vec<Option<String>> = items
             .iter()
-            .map(|x| match x {
-                Bson::Null => None,
-                other => Some(secantus_pgplan::value_text(other)),
+            .map(|x| match (element, x) {
+                (_, Bson::Null) => None,
+                ("date", Bson::String(t)) => Some(secantus_pgplan::render_date_styled(t, ds)),
+                ("timestamp", other) => Some(
+                    secantus_pgplan::timestamp_value_text_styled(other, ds)
+                        .unwrap_or_else(|| secantus_pgplan::value_text(other)),
+                ),
+                (_, other) => Some(secantus_pgplan::value_text(other)),
             })
             .collect();
         return enc.encode_field(&rendered);
@@ -22804,6 +24919,25 @@ fn compute_aggregate(item: &AggItem, rows: &[Document]) -> PgWireResult<Bson> {
                 .collect()
         }
     };
+    // `agg(DISTINCT x)`: one row per distinct argument value (by VALUE, as
+    // the basic aggregates dedup), NULL counting as one value.
+    if item.distinct {
+        let field = item.field.as_deref().unwrap_or("");
+        let field2 = item.field2.as_deref();
+        let mut seen: Vec<(Option<Bson>, Option<Bson>)> = Vec::new();
+        rows.retain(|d| {
+            let k = (
+                group_key_ident(&d.get(field).cloned()),
+                field2.and_then(|f| group_key_ident(&d.get(f).cloned())),
+            );
+            if seen.contains(&k) {
+                false
+            } else {
+                seen.push(k);
+                true
+            }
+        });
+    }
     if !item.order.is_empty() {
         // An ORDER BY over an expression: computed into its synthetic field.
         for key in &item.order {
@@ -23440,6 +25574,10 @@ fn window_value(
             }
             frame.get((nth - 1) as usize).cloned().unwrap_or(Bson::Null)
         }
+        secantus_pgplan::WindowFunc::User => match &w.user {
+            Some(u) => secantus_pgplan::user_agg::compute(u, &frame, w.source_type.as_deref())?,
+            None => Bson::Null,
+        },
         _ => window_aggregate(w, &frame),
     })
 }
@@ -23560,7 +25698,17 @@ fn window_frame_bounds(
                     }
                     peers.group_start[g.max(0) as usize]
                 }
-                M::Range => match range_bound(order_values, pos, signed, ascending, true, peers)? {
+                M::Range => match range_bound(
+                    order_values,
+                    pos,
+                    signed,
+                    w.frame
+                        .start_value
+                        .map(|v| (v, matches!(w.frame.start, B::Preceding(_)))),
+                    ascending,
+                    true,
+                    peers,
+                )? {
                     Some(v) => v,
                     None => return Ok(None),
                 },
@@ -23602,7 +25750,17 @@ fn window_frame_bounds(
                     peers.group_start.get(g + 1).map(|s| s - 1).unwrap_or(n - 1)
                 }
                 M::Range => {
-                    match range_bound(order_values, pos, signed, ascending, false, peers)? {
+                    match range_bound(
+                        order_values,
+                        pos,
+                        signed,
+                        w.frame
+                            .end_value
+                            .map(|v| (v, matches!(w.frame.end, B::Preceding(_)))),
+                        ascending,
+                        false,
+                        peers,
+                    )? {
                         Some(v) => v,
                         None => return Ok(None),
                     }
@@ -23639,11 +25797,23 @@ fn range_bound(
     order_values: &[Option<Bson>],
     pos: usize,
     shift: i64,
+    value: Option<(secantus_pgplan::RangeOffset, bool)>,
     ascending: bool,
     start: bool,
     peers: &Peers,
 ) -> Result<Option<usize>, PlanError> {
-    let key = |v: &Bson| -> Option<f64> { numeric_f64(v).map(|x| if ascending { x } else { -x }) };
+    use secantus_pgplan::RangeOffset;
+    // An interval offset measures a date / time column in microseconds; a
+    // number measures a number.
+    let by_time = matches!(value, Some((RangeOffset::Interval(_), _)));
+    let key = |v: &Bson| -> Option<f64> {
+        let x = if by_time {
+            secantus_pgplan::instant_micros_pub(v).map(|m| m as f64)
+        } else {
+            numeric_f64(v)
+        };
+        x.map(|x| if ascending { x } else { -x })
+    };
     let current = order_values.get(pos).and_then(|v| v.clone());
     let Some(current) = current.filter(|v| *v != Bson::Null) else {
         return Ok(Some(if start {
@@ -23652,12 +25822,85 @@ fn range_bound(
             peers.end[pos] - 1
         }));
     };
+    // Integers compare EXACTLY: through f64, int8 keys above 2^53 collide
+    // and a row lands in its neighbour's frame.
+    let n = order_values.len();
+    let int_of = |v: &Bson| match v {
+        Bson::Int32(x) => Some(i128::from(*x)),
+        Bson::Int64(x) => Some(i128::from(*x)),
+        _ => None,
+    };
+    let int_offset: Option<i128> = match value {
+        None => Some(i128::from(shift)),
+        Some((RangeOffset::Number(bits), preceding)) => {
+            let f = f64::from_bits(bits);
+            (f.fract() == 0.0 && f.abs() < 9.0e15).then(|| {
+                let o = f as i128;
+                if preceding {
+                    -o
+                } else {
+                    o
+                }
+            })
+        }
+        Some((RangeOffset::Interval(_), _)) => None,
+    };
+    let all_int = (0..n).all(|i| {
+        order_values
+            .get(i)
+            .and_then(|v| v.as_ref())
+            .is_none_or(|v| *v == Bson::Null || int_of(v).is_some())
+    });
+    if let (Some(b), Some(off), true) = (int_of(&current), int_offset, all_int) {
+        let dir = |x: i128| if ascending { x } else { -x };
+        let bound = dir(b) + off;
+        let keyed = |i: usize| {
+            order_values
+                .get(i)
+                .and_then(|v| v.as_ref())
+                .and_then(int_of)
+                .map(dir)
+        };
+        return Ok(if start {
+            (0..n).find(|i| keyed(*i).is_some_and(|k| k >= bound))
+        } else {
+            (0..n).rev().find(|i| keyed(*i).is_some_and(|k| k <= bound))
+        });
+    }
     let Some(base) = key(&current) else {
         return Err(PlanError::FeatureNotSupported(
             "RANGE with an offset over a non-numeric ORDER BY column".into(),
         ));
     };
-    let bound = base + shift as f64;
+    // A value offset's direction: PRECEDING moves the key down.
+    let bound = match value {
+        None => base + shift as f64,
+        Some((RangeOffset::Number(bits), preceding)) => {
+            let off = f64::from_bits(bits);
+            if preceding {
+                base - off
+            } else {
+                base + off
+            }
+        }
+        Some((RangeOffset::Interval(iv), preceding)) => {
+            // In VALUE space: PRECEDING on an ascending window subtracts.
+            let dir = if preceding { -1 } else { 1 } * if ascending { 1 } else { -1 };
+            let micros = secantus_pgplan::instant_micros_pub(&current).ok_or_else(|| {
+                PlanError::FeatureNotSupported(
+                    "RANGE with an interval offset over a non-date ORDER BY column".into(),
+                )
+            })?;
+            let moved = secantus_pgplan::add_interval_to_micros(micros, &iv, dir)
+                .ok_or_else(|| PlanError::Sqlstate("22008", "timestamp out of range".into()))?
+                as f64;
+            if ascending {
+                moved
+            } else {
+                -moved
+            }
+        }
+    };
     let keyed = |i: usize| -> Option<f64> {
         order_values
             .get(i)
@@ -23665,7 +25908,6 @@ fn range_bound(
             .filter(|v| **v != Bson::Null)
             .and_then(key)
     };
-    let n = order_values.len();
     if start {
         // The FIRST row at or past the bound.
         Ok((0..n).find(|i| keyed(*i).is_some_and(|k| k >= bound)))
@@ -25277,8 +27519,14 @@ impl PgHandler {
             &column_type,
         );
         for i in untyped_binary {
-            if let (Some(slot), Some(Some(name))) = (param_types.get_mut(i), inferred.get(i)) {
-                *slot = Some(name.clone());
+            if let Some(slot) = param_types.get_mut(i) {
+                // What context cannot type is `unknown`, which PostgreSQL
+                // resolves as `text` -- and a binary text must be valid UTF-8
+                // (a NUL byte is 22021), so it decodes as one.
+                *slot = Some(match inferred.get(i) {
+                    Some(Some(name)) => name.clone(),
+                    _ => "text".to_string(),
+                });
             }
         }
     }
@@ -25897,7 +28145,7 @@ impl ExtendedQueryHandler for PgHandler {
             &param_types,
         )?;
         Ok(match fields {
-            Some(fields) => DescribePortalResponse::new(fields),
+            Some(fields) => DescribePortalResponse::new(self.mixed_fields(fields)?),
             None => pgwire::api::results::DescribeResponse::no_data(),
         })
     }
@@ -25944,7 +28192,7 @@ impl ExtendedQueryHandler for PgHandler {
         // Report any GUC change (TimeZone, DateStyle, ...) the statement made.
         self.report_pending_params(_c).await?;
         // One portal is one statement, so exactly one response.
-        Ok(responses.remove(0))
+        self.apply_mixed_formats(responses.remove(0))
     }
 }
 
@@ -26135,7 +28383,7 @@ impl CopyHandler for PgHandler {
                 let mut rows = parsed_rows;
                 self.apply_serial_defaults(&def, &mut rows)?;
                 self.apply_expression_defaults(&def, &mut rows)?;
-                apply_column_defaults(&def, &mut rows);
+                apply_column_defaults(&def, &mut rows)?;
                 self.apply_generated(&def, &mut rows)?;
                 let (table, _, rows) = self.copy_target(&def, rows)?;
                 let docs = rows

@@ -10525,19 +10525,15 @@ def test_on_conflict_do_update_still_checks_constraints(home: Path) -> None:
             cur.execute("insert into c values (1, 1) on conflict (id) do update set n = 500")
 
 
-def test_on_conflict_partial_index_arbiter_is_refused(home: Path) -> None:
-    """A WHERE on the TARGET needs partial-index inference this server has not.
-
-    Refused loudly rather than widened to the unconditional index, which would
-    absorb a conflict the user's predicate excludes — the silent-divergence
-    failure this whole change exists to remove.
-    """
+def test_on_conflict_where_without_a_partial_index_infers_the_key(home: Path) -> None:
+    """A WHERE on the TARGET selects a partial unique index whose predicate
+    it implies; with none, PostgreSQL's inference falls back to the plain
+    unique key (here the primary key), and the conflict is absorbed."""
     with _Server(home) as server, server.connect() as conn:
         _oc_table(conn)
         cur = conn.cursor()
-        with pytest.raises(psycopg.Error) as info:
-            cur.execute("insert into t values (1, 'z', 9) on conflict (id) where id > 0 do nothing")
-        assert info.value.sqlstate == "0A000"
+        cur.execute("insert into t values (1, 'z', 9) on conflict (id) where id > 0 do nothing")
+        assert cur.rowcount == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -14634,6 +14630,49 @@ def test_statement_and_lock_timeouts(home: Path) -> None:
         assert _fetch(b, "SELECT count(*) FROM lt") == [(0,)]
 
 
+def test_statements_in_a_block_hold_table_locks(home: Path) -> None:
+    """A read or write inside a block holds ACCESS SHARE / ROW EXCLUSIVE to
+    its end: another session's conflicting LOCK waits (55P03 under a
+    lock_timeout), pg_locks lists the hold, a cycle of waits is 40P01, and
+    the aborted side's holds go at once so the other proceeds."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        a.execute("CREATE TABLE lk1 (id int)")
+        a.execute("CREATE TABLE lk2 (id int)")
+        a.execute("BEGIN")
+        a.execute("SELECT count(*) FROM lk1")
+        b.execute("SET lock_timeout = 200")
+        b.execute("BEGIN")
+        assert _sqlstate(b, "LOCK TABLE lk1 IN ACCESS EXCLUSIVE MODE") == "55P03"
+        b.execute("ROLLBACK")
+        assert _fetch(
+            a,
+            "SELECT mode, granted FROM pg_locks WHERE relation = 'lk1'::regclass",
+        ) == [("AccessShareLock", True)]
+        a.execute("INSERT INTO lk1 VALUES (1)")
+        b.execute("BEGIN")
+        assert _sqlstate(b, "LOCK TABLE lk1 IN SHARE MODE") == "55P03"
+        b.execute("ROLLBACK")
+        a.execute("ROLLBACK")
+        b.execute("SET lock_timeout = 0")
+        a.execute("BEGIN")
+        a.execute("SELECT 1 FROM lk1")
+        b.execute("BEGIN")
+        b.execute("SELECT 1 FROM lk2")
+        out: dict[str, str | None] = {}
+        worker = threading.Thread(
+            target=lambda: out.setdefault(
+                "a", _sqlstate(a, "LOCK TABLE lk2 IN ACCESS EXCLUSIVE MODE")
+            )
+        )
+        worker.start()
+        time.sleep(0.3)
+        mine = _sqlstate(b, "LOCK TABLE lk1 IN ACCESS EXCLUSIVE MODE")
+        worker.join(10)
+        assert sorted([str(out.get("a")), str(mine)]) == ["40P01", "None"]
+        a.execute("ROLLBACK")
+        b.execute("ROLLBACK")
+
+
 def test_maintenance_statements_and_cluster(home: Path) -> None:
     """VACUUM / ANALYZE / CHECKPOINT / REINDEX validate what they name, and
     CLUSTER rewrites the table in an index's order, recording it."""
@@ -14669,3 +14708,187 @@ def test_ordinality_rows_from_and_values_clauses(home: Path) -> None:
         ) == [(1, "x"), (2, "y"), (None, "z")]
         assert _fetch(conn, "VALUES (1), (2), (3) ORDER BY 1 DESC LIMIT 2") == [(3,), (2,)]
         assert _fetch(conn, "SELECT * FROM (SELECT 1 AS a, 2 AS a) s") == [(1, 2)]
+
+
+def test_binary_cursor_over_any_source_sends_binary(home: Path) -> None:
+    """A binary server-side cursor over VALUES, an aggregate or a constant
+    select FETCHes binary values, as a SELECT source does. It used to send
+    the text bytes, which a binary client decoded as garbage integers."""
+    with _Server(home) as server, server.connect(autocommit=False) as conn:
+        sources = {
+            "VALUES (1, 'a'::text), (2, 'b')": [(1, "a"), (2, "b")],
+            "SELECT count(*), max(x) FROM generate_series(1, 4) x": [(4, 4)],
+            "SELECT 1::int, 2.5::numeric, 'q'::text": [(1, dc.Decimal("2.5"), "q")],
+        }
+        for source, expected in sources.items():
+            with conn.cursor(name="bc", binary=True) as cur:
+                cur.execute(source)
+                assert cur.fetchall() == expected, source
+                assert cur.pgresult is not None
+                assert cur.pgresult.fformat(0) == 1, source
+            conn.rollback()
+
+
+def test_a_partitions_own_constraints_are_enforced(home: Path) -> None:
+    """NOT NULL, CHECK, UNIQUE and PRIMARY KEY declared on a PARTITION hold
+    for the rows it takes, whether written through the parent or the
+    partition; before, a partition's own constraints were accepted and never
+    checked, so duplicate keys went in silently."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE TABLE pk_p (id int, v int, s text) PARTITION BY RANGE (id)")
+        conn.execute(
+            "CREATE TABLE pk_p1 PARTITION OF pk_p (v NOT NULL, s DEFAULT 'dflt', "
+            "CONSTRAINT pk_p1_v CHECK (v > 0)) FOR VALUES FROM (0) TO (10)"
+        )
+        conn.execute(
+            "CREATE TABLE pk_p2 PARTITION OF pk_p (PRIMARY KEY (id)) FOR VALUES FROM (10) TO (20)"
+        )
+        conn.execute("CREATE TABLE pk_p3 PARTITION OF pk_p (s UNIQUE) FOR VALUES FROM (20) TO (30)")
+        assert _sqlstate(conn, "INSERT INTO pk_p (id, v) VALUES (1, NULL)") == "23502"
+        assert _sqlstate(conn, "INSERT INTO pk_p (id, v) VALUES (1, -1)") == "23514"
+        conn.execute("INSERT INTO pk_p1 (id, v) VALUES (4, 4)")
+        assert _fetch(conn, "SELECT s FROM pk_p1 WHERE id = 4") == [("dflt",)]
+        assert _sqlstate(conn, "INSERT INTO pk_p VALUES (11, 1, 'a'), (11, 2, 'b')") == "23505"
+        conn.execute("INSERT INTO pk_p VALUES (11, 1, 'a')")
+        assert _sqlstate(conn, "INSERT INTO pk_p2 VALUES (11, 2, 'b')") == "23505"
+        assert _sqlstate(conn, "UPDATE pk_p SET id = 11 WHERE id = 4") == "23505"
+        assert _sqlstate(conn, "INSERT INTO pk_p VALUES (21, 1, 'x'), (22, 2, 'x')") == "23505"
+        assert _fetch(conn, "SELECT count(*) FROM pk_p") == [(2,)]
+
+
+def test_ddl_waits_for_a_readers_lock(home: Path) -> None:
+    """ALTER / DROP / rename / CLUSTER take ACCESS EXCLUSIVE, so they wait
+    for a session still reading the table (55P03 under a lock_timeout);
+    CREATE INDEX takes SHARE, which a reader does not block. A DDL inside a
+    block holds its lock, so another session's read waits in turn."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        a.execute("CREATE TABLE dw_t (id int)")
+        b.execute("SET lock_timeout = 300")
+        for ddl in [
+            "ALTER TABLE dw_t ADD COLUMN x int",
+            "DROP TABLE dw_t",
+            "ALTER TABLE dw_t RENAME TO dw_t2",
+        ]:
+            a.execute("BEGIN")
+            a.execute("SELECT * FROM dw_t")
+            assert _sqlstate(b, ddl) == "55P03", ddl
+            a.execute("ROLLBACK")
+        a.execute("BEGIN")
+        a.execute("SELECT * FROM dw_t")
+        b.execute("CREATE INDEX ON dw_t (id)")
+        a.execute("ROLLBACK")
+        a.execute("BEGIN")
+        a.execute("ALTER TABLE dw_t ADD COLUMN y int")
+        assert _sqlstate(b, "SELECT count(*) FROM dw_t") == "55P03"
+        a.execute("ROLLBACK")
+        assert _fetch(b, "SELECT count(*) FROM dw_t") == [(0,)]
+
+
+def test_mixed_result_formats_are_honoured_per_column(home: Path) -> None:
+    """A Bind asking for binary, text, binary gets each column in its own
+    format, as PostgreSQL answers it; a format count that matches neither one
+    nor the columns is 08P01."""
+    import socket
+    import struct
+
+    def msg(t: bytes, body: bytes) -> bytes:
+        return t + struct.pack("!I", len(body) + 4) + body
+
+    def cstr(s: str) -> bytes:
+        return s.encode() + b"\0"
+
+    def read_until_ready(sock: socket.socket) -> list[tuple[bytes, bytes]]:
+        out, buf = [], b""
+        while True:
+            while len(buf) < 5:
+                buf += sock.recv(65536)
+            n = struct.unpack("!I", buf[1:5])[0]
+            while len(buf) < 1 + n:
+                buf += sock.recv(65536)
+            out.append((buf[:1], buf[5 : 1 + n]))
+            buf = buf[1 + n :]
+            if out[-1][0] == b"Z":
+                return out
+
+    def run(sock: socket.socket, sql: str, formats: tuple[int, ...]) -> list[tuple[bytes, bytes]]:
+        m = msg(b"P", cstr("") + cstr(sql) + struct.pack("!H", 0))
+        m += msg(
+            b"B",
+            cstr("")
+            + cstr("")
+            + struct.pack("!HH", 0, 0)
+            + struct.pack("!H", len(formats))
+            + struct.pack("!" + "H" * len(formats), *formats),
+        )
+        m += msg(b"E", cstr("") + struct.pack("!I", 0)) + msg(b"S", b"")
+        sock.sendall(m)
+        return read_until_ready(sock)
+
+    with _Server(home) as server:
+        sock = socket.create_connection(("127.0.0.1", server.port))
+        body = (
+            struct.pack("!I", 196608)
+            + cstr("user")
+            + cstr("test")
+            + cstr("database")
+            + cstr("postgres")
+            + b"\0"
+        )
+        sock.sendall(struct.pack("!I", len(body) + 4) + body)
+        read_until_ready(sock)
+        replies = run(sock, "SELECT 1::int4, 'x'::text, 2::int8", (1, 0, 1))
+        rows = [b for t, b in replies if t == b"D"]
+        assert len(rows) == 1
+        row = rows[0]
+        assert row == (
+            struct.pack("!H", 3)
+            + struct.pack("!i", 4)
+            + struct.pack("!i", 1)
+            + struct.pack("!i", 1)
+            + b"x"
+            + struct.pack("!i", 8)
+            + struct.pack("!q", 2)
+        )
+        errors = [b for t, b in run(sock, "SELECT 1, 2, 3", (1, 0)) if t == b"E"]
+        assert errors and b"C08P01\0" in errors[0]
+        sock.close()
+
+
+def test_sqlalchemy_reflection_matches_postgresql(home: Path) -> None:
+    """SQLAlchemy's inspector reads the catalogs psql does, and more
+    (`pg_opclass`, `pg_index.indclass` / `indoption`, set-returning
+    functions over `pg_index`). Every value here is what PostgreSQL 15
+    answers for the same tables."""
+    sa = pytest.importorskip("sqlalchemy")
+    with _Server(home) as server:
+        engine = sa.create_engine(f"postgresql+psycopg://test@127.0.0.1:{server.port}/postgres")
+        with engine.begin() as c:
+            for q in [
+                "create table sa_p (id serial primary key, code varchar(10) unique not null)",
+                "create table sa_c (id int primary key, pid int references sa_p(id) "
+                "on delete cascade, amt numeric(8,2) check (amt >= 0), note text)",
+                "create index sa_c_amt on sa_c (amt desc, note)",
+                "comment on table sa_c is 'kids'",
+            ]:
+                c.execute(sa.text(q))
+        i = sa.inspect(engine)
+        assert [(c["name"], str(c["type"]), c["nullable"]) for c in i.get_columns("sa_c")] == [
+            ("id", "INTEGER", False),
+            ("pid", "INTEGER", True),
+            ("amt", "NUMERIC(8, 2)", True),
+            ("note", "TEXT", True),
+        ]
+        assert i.get_pk_constraint("sa_c")["constrained_columns"] == ["id"]
+        fks = i.get_foreign_keys("sa_c")
+        assert [(k["name"], k["referred_table"], k["options"]) for k in fks] == [
+            ("sa_c_pid_fkey", "sa_p", {"ondelete": "CASCADE"})
+        ]
+        assert [
+            (x["name"], x["column_names"], x.get("column_sorting")) for x in i.get_indexes("sa_c")
+        ] == [("sa_c_amt", ["amt", "note"], {"amt": ("desc",)})]
+        assert i.get_check_constraints("sa_c") == [
+            {"name": "sa_c_amt_check", "sqltext": "amt >= 0::numeric", "comment": None}
+        ]
+        assert i.get_unique_constraints("sa_p")[0]["column_names"] == ["code"]
+        assert i.get_table_comment("sa_c") == {"text": "kids"}
+        engine.dispose()

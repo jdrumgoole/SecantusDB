@@ -181,6 +181,17 @@ pub(crate) fn compute(item: &AggItem, rows: &[Document]) -> PgWireResult<Bson> {
             };
             out.map_err(|e| crate::PgHandler::err(&e))
         }
+        // A CREATE AGGREGATE aggregate folds every row's value, NULLs
+        // included: whether a NULL reaches the state function is its
+        // strictness's call, not ours.
+        AggFunc::User => {
+            let Some(agg) = item.user.as_ref() else {
+                return Ok(Bson::Null);
+            };
+            let values: Vec<Bson> = rows.iter().map(|d| get(d, field)).collect();
+            secantus_pgplan::user_agg::compute(agg, &values, item.source_type.as_deref())
+                .map_err(|e| crate::PgHandler::err(&e))
+        }
         AggFunc::BitAnd | AggFunc::BitOr => {
             let ints: Vec<i64> = non_null
                 .iter()
