@@ -563,6 +563,8 @@ pub(crate) const SEQUENCE_FUNCTIONS: &[&str] = &[
     "pg_advisory_xact_lock_shared",
     "pg_try_advisory_xact_lock",
     "pg_try_advisory_xact_lock_shared",
+    // The role graph lives in the executor's catalog.
+    "pg_has_role",
 ];
 
 /// The result type of an executor-answered function other than the
@@ -576,6 +578,7 @@ pub fn executor_function_type(name: &str) -> Option<&'static str> {
             "bool"
         }
         n if n.contains("advisory") => "void",
+        "pg_has_role" => "bool",
         _ => return None,
     })
 }

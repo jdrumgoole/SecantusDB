@@ -1772,7 +1772,7 @@ fn zone_abbrev(zone: &crate::TimeZoneSetting, utc: i64) -> String {
 
 /// Parse `input` by a DCH format into `(date, time-of-day micros, offset
 /// seconds if the format read one)`.
-fn from_char(input: &str, fmt: &str) -> Result<(NaiveDate, i64, Option<i64>)> {
+pub(crate) fn from_char(input: &str, fmt: &str) -> Result<(NaiveDate, i64, Option<i64>)> {
     let nodes = parse_dch(fmt);
     let inp: Vec<char> = input.chars().collect();
     let mut i = 0usize;

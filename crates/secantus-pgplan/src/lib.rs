@@ -1583,6 +1583,12 @@ pub struct RoleOptions {
     pub connection_limit: Option<i64>,
     pub password: Option<Option<String>>,
     pub valid_until: Option<String>,
+    /// `IN ROLE r, ...`: the new role becomes a member of each.
+    pub in_roles: Vec<String>,
+    /// `ROLE m, ...`: each becomes a member of the new role.
+    pub members: Vec<String>,
+    /// `ADMIN m, ...`: members with the admin option.
+    pub admins: Vec<String>,
 }
 
 /// The role option list of a CREATE / ALTER ROLE: `DefElem`s named by
@@ -1648,10 +1654,29 @@ fn role_options(options: &[pg_query::protobuf::Node]) -> Result<RoleOptions> {
                     _ => Some(-1),
                 }
             }
-            // Membership and SYSID options: parsed by PostgreSQL, but this
-            // server has no role graph to record them in.
-            "addroleto" | "rolemembers" | "adminmembers" | "sysid" | "encrypted"
-            | "unencrypted" => {
+            // Membership: the same role graph `GRANT role TO role` records.
+            "addroleto" | "rolemembers" | "adminmembers" => {
+                let names: Vec<String> = match d.arg.as_ref().and_then(|a| a.node.as_ref()) {
+                    Some(N::List(l)) => l
+                        .items
+                        .iter()
+                        .filter_map(|n| match n.node.as_ref() {
+                            Some(N::RoleSpec(r)) => Some(role_spec_name(r)),
+                            _ => None,
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                match d.defname.as_str() {
+                    "addroleto" => out.in_roles.extend(names),
+                    "rolemembers" => out.members.extend(names),
+                    _ => out.admins.extend(names),
+                }
+            }
+            // PostgreSQL ignores SYSID (with a NOTICE the executor does not
+            // send); UNENCRYPTED passwords are gone since 10.
+            "sysid" => {}
+            "encrypted" | "unencrypted" => {
                 return Err(Error::Unsupported(format!("the {} role option", d.defname)))
             }
             other => {
@@ -18377,6 +18402,13 @@ fn user_base_type(name: &str) -> Option<(String, i64, bool)> {
     })
 }
 
+/// The user base type (not an extension's) an expression statically has.
+fn user_defined_base_source(arg: &pg_query::protobuf::Node, value: &Bson) -> Option<String> {
+    let t = static_type(arg, value);
+    let (name, _, defined) = user_base_type(&t)?;
+    (defined && extension_type(&t).is_none()).then_some(name)
+}
+
 /// A base type's resolution NAME by oid -- the reverse door, for rendering
 /// `oid::regtype::text` (which PostgreSQL renders for a shell too).
 fn user_base_type_name(oid: i64) -> Option<String> {
@@ -21302,8 +21334,10 @@ pub(crate) fn jsonpath_call(name: &str, args: &[Bson]) -> Result<Bson> {
         None => false,
     };
     let base = name.strip_suffix("_tz").unwrap_or(name);
+    // The `_tz` suffix travels with the name: it is what lets a datetime
+    // comparison in the path cross the time-zone line.
     let out = jsonpath::call(
-        base,
+        name,
         &json_text_of(&args[0]),
         &value_text(&args[1]),
         vars.as_deref(),
@@ -23766,6 +23800,19 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             .ok_or_else(|| Error::Parse("cast with no operand".into()))?;
         let value = const_value(arg, params)?;
         let target = tc.type_name.as_ref().map(type_name_of).unwrap_or_default();
+        // A user BASE type (`CREATE TYPE t (input = ..., output = ...)`) is
+        // carried as its text, but it has no cast to anything but the string
+        // types and itself: `'a'::t::int` is 42846 on PostgreSQL rather than a
+        // parse of the text.
+        if let Some(source) = user_defined_base_source(arg, &value) {
+            let target_base = user_base_type(&target).map(|(n, _, _)| n);
+            if !(is_string_type(&target) || target_base.as_deref() == Some(source.as_str())) {
+                return Err(Error::CannotCoerce(format!(
+                    "cannot cast type {source} to {}",
+                    display_type(&target)
+                )));
+            }
+        }
         // Casting a timestamptz INSTANT to text renders it in the session zone
         // (the instant alone cannot say it is a timestamptz, so the source cast
         // decides). PLAN_TIMEZONE is set during planning, where this evaluates.
@@ -24773,6 +24820,25 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 _ => return Err(Error::Unsupported(format!("unary {op}"))),
             },
         };
+        // A user BASE type has no operators unless someone defined them,
+        // which this server cannot: `'a'::t = 'a'::t` is 42883 on
+        // PostgreSQL, not a comparison of the carried text.
+        if let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
+            let (ls, rs) = (
+                user_defined_base_source(l, &lhs),
+                user_defined_base_source(r, &rhs),
+            );
+            if ls.is_some() || rs.is_some() {
+                let name = |n: &pg_query::protobuf::Node, v: &Bson, b: &Option<String>| {
+                    b.clone().unwrap_or_else(|| display_type(&static_type(n, v)))
+                };
+                return Err(Error::UndefinedFunction(format!(
+                    "operator does not exist: {} {op} {}",
+                    name(l, &lhs, &ls),
+                    name(r, &rhs, &rs)
+                )));
+            }
+        }
         // Ranges and multiranges are text at run time too.
         {
             let lt = e

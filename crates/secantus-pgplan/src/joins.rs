@@ -1121,18 +1121,35 @@ pub(crate) fn select_list_srf(
         }),
         _ => false,
     };
+    // A target that IS a set-returning call, or holds one inside an
+    // expression (`generate_series(1, 3) * 2`, `jsonb_path_query(...)::text`).
+    let holds_srf = |n: Option<&pg_query::protobuf::Node>| -> bool {
+        let Some(n) = n else { return false };
+        let mut probe = n.clone();
+        let mut hit = false;
+        let _ = walk_expr(&mut probe, &mut |m| {
+            if is_srf(Some(m)) {
+                hit = true;
+            }
+            Ok(())
+        });
+        hit
+    };
     let positions: Vec<usize> = s
         .target_list
         .iter()
         .enumerate()
         .filter(
-            |(_, t)| matches!(t.node.as_ref(), Some(N::ResTarget(r)) if is_srf(r.val.as_deref())),
+            |(_, t)| matches!(t.node.as_ref(), Some(N::ResTarget(r)) if holds_srf(r.val.as_deref())),
         )
         .map(|(i, _)| i)
         .collect();
     // With no FROM, a set-returning function ALONE is already its own
-    // source; beside another target it needs one row to join to.
-    if s.from_clause.is_empty() && (positions.is_empty() || s.target_list.len() == 1) {
+    // source; beside another target, or inside an expression, it needs one
+    // row to join to.
+    let bare_single = s.target_list.len() == 1
+        && matches!(s.target_list[0].node.as_ref(), Some(N::ResTarget(r)) if is_srf(r.val.as_deref()));
+    if s.from_clause.is_empty() && (positions.is_empty() || bare_single) {
         return Ok(None);
     }
     match positions.as_slice() {
@@ -1164,25 +1181,39 @@ pub(crate) fn select_list_srf(
             let Some(N::ResTarget(rt)) = out.target_list[*i].node.as_mut() else {
                 return Ok(None);
             };
-            let call = rt.val.take().expect("checked");
-            let name = match call.node.as_ref() {
-                Some(N::FuncCall(f)) => func_name(f).unwrap_or_default(),
-                _ => String::new(),
-            };
+            let mut expr = *rt.val.take().expect("checked");
+            // The output keeps the name PostgreSQL gives the ORIGINAL
+            // expression (`jsonb_path_query` for its `::text` too).
             if rt.name.is_empty() {
-                rt.name = name;
+                rt.name = expression_column_name(&expr);
             }
-            rt.val = Some(Box::new(pg_query::protobuf::Node {
+            let column = pg_query::protobuf::Node {
                 node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
                     fields: vec![string_node("__srf0"), string_node("__srf0")],
                     location: -1,
                 })),
-            }));
+            };
+            // Pull the call out of the expression; the column takes its place.
+            let mut call: Option<pg_query::protobuf::Node> = None;
+            if is_srf(Some(&expr)) {
+                call = Some(std::mem::replace(&mut expr, column.clone()));
+            } else {
+                walk_expr(&mut expr, &mut |m| {
+                    if call.is_none() && is_srf(Some(m)) {
+                        call = Some(std::mem::replace(m, column.clone()));
+                    }
+                    Ok(())
+                })?;
+            }
+            let Some(call) = call else {
+                return Ok(None);
+            };
+            rt.val = Some(Box::new(expr));
             let rf = pg_query::protobuf::RangeFunction {
                 lateral: true,
                 functions: vec![pg_query::protobuf::Node {
                     node: Some(N::List(pg_query::protobuf::List {
-                        items: vec![*call, pg_query::protobuf::Node { node: None }],
+                        items: vec![call, pg_query::protobuf::Node { node: None }],
                     })),
                 }],
                 alias: Some(pg_query::protobuf::Alias {

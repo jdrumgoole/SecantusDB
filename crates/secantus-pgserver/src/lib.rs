@@ -1170,6 +1170,9 @@ pub struct PgHandler {
             Option<secantus_auth::ScramState>,
         )>,
     >,
+    /// An md5 password login in progress: the role, its stored
+    /// `md5<hex>` hash, and the salt sent to the client.
+    md5_auth: Mutex<Option<(String, String, [u8; 4])>>,
     /// User TYPES created or dropped in the open transaction but not yet
     /// committed -- the type analogue of `uncommitted`. Planning reads the
     /// type catalog (`to_regtype`, a column's declared type), and an
@@ -1441,6 +1444,7 @@ impl PgHandler {
             session_currval: Mutex::new(HashMap::new()),
             session_lastval: Mutex::new(None),
             auth: Mutex::new(None),
+            md5_auth: Mutex::new(None),
             uncommitted_types: Mutex::new(HashMap::new()),
             in_transaction: std::sync::atomic::AtomicBool::new(false),
             binary_results: std::sync::atomic::AtomicBool::new(false),
@@ -5787,6 +5791,108 @@ impl PgHandler {
     }
 
     /// `GRANT role TO member` / `REVOKE role FROM member`.
+    /// `(role, member, admin_option)` of every recorded membership.
+    fn role_memberships(&self) -> Vec<(String, String, bool)> {
+        self.storage
+            .find_matching(self.db(), Self::ROLE_MEMBER_COLLECTION, &Document::new())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|b| decode_doc(b).ok())
+            .map(|d| {
+                (
+                    d.get_str("role").unwrap_or_default().to_string(),
+                    d.get_str("member").unwrap_or_default().to_string(),
+                    d.get_bool("admin_option").unwrap_or(false),
+                )
+            })
+            .collect()
+    }
+
+    /// A role name, or an oid given for one.
+    fn role_by_name_or_oid(&self, v: &Bson) -> PgWireResult<String> {
+        let session = self.session_user_name();
+        let by_oid = |oid: i64| -> Option<String> {
+            if oid == 10 {
+                return Some(session.clone());
+            }
+            self.roles().ok()?.into_iter().find(|r| r.oid == oid).map(|r| r.name)
+        };
+        let found = match v {
+            Bson::Int32(o) => by_oid(i64::from(*o)),
+            Bson::Int64(o) => by_oid(*o),
+            other => {
+                let name = secantus_pgplan::value_text(other);
+                (name == session || self.role(&name)?.is_some()).then_some(name)
+            }
+        };
+        found.ok_or_else(|| {
+            Self::user_error(
+                "42704",
+                format!("role \"{}\" does not exist", secantus_pgplan::value_text(v)),
+            )
+        })
+    }
+
+    /// `pg_has_role([user,] role, privilege)`: a superuser holds every
+    /// role; otherwise a role holds itself and, through the membership
+    /// graph, every role it is (transitively) a member of -- `WITH ADMIN
+    /// OPTION` only where a direct grant carries it.
+    fn has_role_call(&self, args: &[Bson]) -> PgWireResult<Bson> {
+        if args.contains(&Bson::Null) {
+            return Ok(Bson::Null);
+        }
+        let (user, role, privilege) = match args {
+            [role, p] => (self.session_user_name(), self.role_by_name_or_oid(role)?, p),
+            [user, role, p] => (
+                self.role_by_name_or_oid(user)?,
+                self.role_by_name_or_oid(role)?,
+                p,
+            ),
+            _ => return Err(Self::user_error("42883", "function pg_has_role does not exist".into())),
+        };
+        let privileges: Vec<String> = secantus_pgplan::value_text(privilege)
+            .split(',')
+            .map(|p| p.trim().to_ascii_uppercase())
+            .collect();
+        for p in &privileges {
+            if !matches!(p.as_str(), "MEMBER" | "USAGE" | "MEMBER WITH ADMIN OPTION" | "USAGE WITH ADMIN OPTION" | "MEMBER WITH GRANT OPTION" | "USAGE WITH GRANT OPTION") {
+                return Err(Self::user_error(
+                    "22023",
+                    format!("unrecognized privilege type: \"{}\"", p.to_ascii_lowercase()),
+                ));
+            }
+        }
+        let superuser = user == self.session_user_name()
+            && self.role(&user)?.is_none_or(|r| r.superuser)
+            || self.role(&user)?.is_some_and(|r| r.superuser);
+        if superuser {
+            return Ok(Bson::Boolean(true));
+        }
+        let edges = self.role_memberships();
+        // Every role `user` reaches through membership.
+        let mut reached = vec![user.clone()];
+        let mut i = 0;
+        while i < reached.len() {
+            let current = reached[i].clone();
+            for (r, m, _) in &edges {
+                if *m == current && !reached.contains(r) {
+                    reached.push(r.clone());
+                }
+            }
+            i += 1;
+        }
+        let any = privileges.iter().any(|p| {
+            if p.contains("ADMIN") || p.contains("GRANT") {
+                edges
+                    .iter()
+                    .any(|(r, m, admin)| *r == role && reached.contains(m) && *admin)
+            } else {
+                reached.contains(&role)
+            }
+        });
+        Ok(Bson::Boolean(any))
+    }
+
     fn grant_role(
         &self,
         is_grant: bool,
@@ -7013,6 +7119,15 @@ impl PgHandler {
                     Column::new("prosrc", "text", false),
                 ],
             )),
+            "pg_auth_members" => Some(TableDef::new(
+                "pg_auth_members",
+                vec![
+                    Column::new("roleid", "oid", false),
+                    Column::new("member", "oid", false),
+                    Column::new("grantor", "oid", false),
+                    Column::new("admin_option", "bool", false),
+                ],
+            )),
             "pg_language" => Some(TableDef::new(
                 "pg_language",
                 vec![
@@ -8121,6 +8236,28 @@ impl PgHandler {
                         d.insert(f("cmd"), p.get_str("command").unwrap_or("ALL"));
                         d.insert(f("qual"), render(p.get_str("using").ok()));
                         d.insert(f("with_check"), render(p.get_str("check").ok()));
+                        d
+                    })
+                    .collect()
+            }
+            "pg_auth_members" => {
+                let f = |name: &str| def.field_of(name).expect("column");
+                let session = self.session_user_name();
+                let roles = self.roles().ok()?;
+                let oid = |n: &str| -> i64 {
+                    if n == session {
+                        return 10;
+                    }
+                    roles.iter().find(|r| r.name == n).map_or(0, |r| r.oid)
+                };
+                self.role_memberships()
+                    .into_iter()
+                    .map(|(role, member, admin)| {
+                        let mut d = Document::new();
+                        d.insert(f("roleid"), Bson::Int64(oid(&role)));
+                        d.insert(f("member"), Bson::Int64(oid(&member)));
+                        d.insert(f("grantor"), Bson::Int64(10));
+                        d.insert(f("admin_option"), admin);
                         d
                     })
                     .collect()
@@ -10104,9 +10241,36 @@ impl StartupHandler for PgHandler {
                     .await;
             }
             if let Some(verifier) = role.password.as_deref() {
+                // A password past its VALID UNTIL cannot log in; PostgreSQL
+                // says only that authentication failed.
+                if Self::password_expired(&role.valid_until) {
+                    return self
+                        .fail_login(
+                            client,
+                            "28P01",
+                            format!("password authentication failed for user \"{user}\""),
+                        )
+                        .await;
+                }
                 let Some(creds) = scram_credentials(verifier) else {
-                    // An md5 verifier: this server speaks only SCRAM, and
-                    // PostgreSQL's scram-sha-256 method refuses one too.
+                    // An md5 hash: the md5 challenge, as PostgreSQL's `md5`
+                    // method answers a role whose stored password is one.
+                    if verifier.len() == 35 && verifier.starts_with("md5") {
+                        let salt: [u8; 4] = rand::random();
+                        *self.md5_auth.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some((user, verifier.to_string(), salt));
+                        client
+                            .send(PgWireBackendMessage::Authentication(
+                                pgwire::messages::startup::Authentication::MD5Password(
+                                    salt.to_vec(),
+                                ),
+                            ))
+                            .await?;
+                        client.set_state(
+                            pgwire::api::PgWireConnectionState::AuthenticationInProgress,
+                        );
+                        return Ok(());
+                    }
                     return self
                         .fail_login(
                             client,
@@ -10128,6 +10292,17 @@ impl StartupHandler for PgHandler {
             }
         }
         self.finish_startup(client).await
+    }
+}
+
+impl PgHandler {
+    /// Is a role's `VALID UNTIL` in the past?
+    fn password_expired(valid_until: &Bson) -> bool {
+        match valid_until {
+            Bson::DateTime(t) => t.timestamp_millis() < bson::DateTime::now().timestamp_millis(),
+            Bson::String(s) => s == "-infinity",
+            _ => false,
+        }
     }
 }
 
@@ -10171,6 +10346,24 @@ impl PgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         use pgwire::messages::startup::Authentication;
+        // An md5 challenge's answer: `md5` + md5(stored hash + salt).
+        let md5 = self.md5_auth.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some((user, stored, salt)) = md5 {
+            let answer = message.into_password()?.password;
+            let mut input = stored.as_bytes()[3..].to_vec();
+            input.extend_from_slice(&salt);
+            let expected = format!("md5{}", secantus_pgplan::scalar::md5_hex(&input));
+            if answer.trim_end_matches('\0') == expected {
+                return self.finish_startup(client).await;
+            }
+            return self
+                .fail_login(
+                    client,
+                    "28P01",
+                    format!("password authentication failed for user \"{user}\""),
+                )
+                .await;
+        }
         let pending = self.auth.lock().unwrap_or_else(|e| e.into_inner()).take();
         let Some((user, creds, scram)) = pending else {
             return self
@@ -11785,6 +11978,9 @@ impl PgHandler {
         }
         if name.contains("advisory") {
             return self.advisory_call(name, args);
+        }
+        if name == "pg_has_role" {
+            return self.has_role_call(args);
         }
         let seq = |i: usize| -> PgWireResult<Option<String>> {
             self.sequence_name_arg(&ConstCol::Value(args.get(i).cloned().unwrap_or(Bson::Null)))
@@ -16083,6 +16279,21 @@ impl PgHandler {
                         format!("type output function {output} must return type cstring"),
                     ))));
                 }
+                // PostgreSQL warns about a VOLATILE I/O function (the
+                // CREATE FUNCTION default), input first.
+                for (fname, kind) in [(&input, "input"), (&output, "output")] {
+                    let volatile = self
+                        .type_catalog_docs(Self::FUNCTION_COLLECTION)?
+                        .iter()
+                        .find(|d| d.get_str("name") == Ok(fname.as_str()))
+                        .is_none_or(|d| d.get_str("volatility").unwrap_or("volatile") == "volatile");
+                    if volatile {
+                        self.warning(
+                            "01000",
+                            format!("type {kind} function {fname} should not be volatile"),
+                        );
+                    }
+                }
                 let doc = bson::doc! {
                     "_id": &id_key,
                     "base": &name,
@@ -16103,7 +16314,7 @@ impl PgHandler {
                 arg_types,
                 return_type,
                 body,
-                volatility: _,
+                volatility,
             } => {
                 // A `LANGUAGE internal` wrapper over a built-in: a catalog
                 // row only, which is all a base type's `input = ` / `output =`
@@ -16212,6 +16423,7 @@ impl PgHandler {
                     "is_table": false,
                     "body": &body,
                     "language": "internal",
+                    "volatility": &volatility,
                     "returns_trigger": false,
                 };
                 self.insert_type_doc(Self::FUNCTION_COLLECTION, &id_key, doc)?;
@@ -17777,6 +17989,16 @@ impl PgHandler {
                 let mut info = RoleInfo::new(self.next_role_oid()?, &name);
                 self.apply_role_options(&mut info, &options)?;
                 self.write_role(&info, true)?;
+                // `IN ROLE` / `ROLE` / `ADMIN`: memberships, as GRANT records.
+                if !options.in_roles.is_empty() {
+                    self.grant_role(true, &options.in_roles, std::slice::from_ref(&name), false)?;
+                }
+                if !options.members.is_empty() {
+                    self.grant_role(true, std::slice::from_ref(&name), &options.members, false)?;
+                }
+                if !options.admins.is_empty() {
+                    self.grant_role(true, std::slice::from_ref(&name), &options.admins, true)?;
+                }
                 Ok(vec![Response::Execution(Tag::new("CREATE ROLE"))])
             }
             Statement::AlterRole { name, options } => {

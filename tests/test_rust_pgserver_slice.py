@@ -14421,3 +14421,82 @@ def test_geometric_types(home: Path) -> None:
         cur.execute("SELECT p, c FROM gtt")
         assert cur.pgresult.fformat(0) == 1
         assert cur.pgresult.get_value(0, 0) == bytes.fromhex("40080000000000004010000000000000")
+
+
+def test_data_modifying_with_and_returning_into(home: Path) -> None:
+    """A data-modifying WITH item runs once and its RETURNING rows feed the
+    query; PL/pgSQL's `INSERT ... RETURNING ... INTO` fills its target."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE TABLE dws (id int PRIMARY KEY, v text)")
+        conn.execute("CREATE TABLE dwa (id int, v text)")
+        conn.execute("INSERT INTO dws VALUES (1, 'a'), (2, 'b')")
+        conn.execute(
+            "WITH moved AS (DELETE FROM dws WHERE id = 1 RETURNING id, v) "
+            "INSERT INTO dwa SELECT id, v FROM moved"
+        )
+        assert _fetch(conn, "SELECT * FROM dwa") == [(1, "a")]
+        assert _fetch(conn, "SELECT id FROM dws") == [(2,)]
+        conn.execute("CREATE TABLE dwi (id serial PRIMARY KEY, name text)")
+        conn.execute(
+            "CREATE FUNCTION dwadd(n text) RETURNS int LANGUAGE plpgsql AS $$ DECLARE x int; "
+            "BEGIN INSERT INTO dwi (name) VALUES (n) RETURNING id INTO x; RETURN x; END $$"
+        )
+        assert _fetch(conn, "SELECT dwadd('p'), dwadd('q')") == [(1, 2)]
+
+
+def test_function_overloads_and_pg_proc(home: Path) -> None:
+    """Two functions with one name and arity resolve by argument type (an
+    untyped literal prefers text), DROP names the overload, and pg_proc
+    lists them."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE FUNCTION ov(a int) RETURNS text LANGUAGE sql AS 'SELECT ''int'''")
+        conn.execute("CREATE FUNCTION ov(a text) RETURNS text LANGUAGE sql AS 'SELECT ''text'''")
+        assert _fetch(conn, "SELECT ov(1), ov('x')") == [("int", "text")]
+        assert _fetch(conn, "SELECT count(*) FROM pg_proc WHERE proname = 'ov'") == [(2,)]
+        assert _sqlstate(conn, "DROP FUNCTION ov") == "42725"
+        conn.execute("DROP FUNCTION ov(text)")
+        assert _fetch(conn, "SELECT ov('5')") == [("int",)]
+
+
+def test_role_membership_and_reg_types(home: Path) -> None:
+    """CREATE ROLE ... IN ROLE / ROLE / ADMIN record memberships that
+    pg_auth_members and pg_has_role answer from; regnamespace / regrole /
+    regproc resolve and render names."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE ROLE ra")
+        conn.execute("CREATE ROLE rb IN ROLE ra")
+        conn.execute("CREATE ROLE rc")
+        assert _fetch(
+            conn,
+            "SELECT pg_has_role('rb', 'ra', 'member'), pg_has_role('rc', 'ra', 'member')",
+        ) == [(True, False)]
+        assert _fetch(conn, "SELECT count(*) FROM pg_auth_members") == [(1,)]
+        conn.execute("CREATE SCHEMA rs")
+        conn.execute("CREATE FUNCTION rf(a int) RETURNS int LANGUAGE sql AS 'SELECT a'")
+        assert _fetch(
+            conn,
+            "SELECT 'public'::regnamespace::oid, 'rs'::regnamespace::text, "
+            "'rf'::regproc::text, 'rf(integer)'::regprocedure::text",
+        ) == [(2200, "rs", "rf", "rf(integer)")]
+        assert _sqlstate(conn, "SELECT 'nope'::regnamespace") == "3F000"
+
+
+def test_jsonpath_datetime_and_nested_srfs(home: Path) -> None:
+    """`.datetime()` parses ISO forms and templates, compares by kind, and a
+    zone-crossing comparison needs a `*_tz` function; a set-returning call
+    inside a select-list expression expands rows."""
+    with _Server(home) as server, server.connect() as conn:
+        assert _fetch(
+            conn, "SELECT jsonb_path_query('\"2020-01-02 03:04:05+03\"', '$.datetime()')::text"
+        ) == [('"2020-01-02T03:04:05+03:00"',)]
+        assert _fetch(
+            conn,
+            'SELECT jsonb_path_query(\'["2020-01-02", "2019-05-05"]\', '
+            "'$[*] ? (@.datetime() < \"2020-01-01\".datetime())')::text",
+        ) == [('"2019-05-05"',)]
+        tz_query = "'$.datetime() ? (@ < \"2020-01-02 01:00:00+00\".datetime())'"
+        assert _sqlstate(conn, f"SELECT jsonb_path_query('\"2020-01-02\"', {tz_query})") == "0A000"
+        assert _fetch(
+            conn, f"SELECT count(*) FROM jsonb_path_query_tz('\"2020-01-02\"', {tz_query})"
+        ) == [(1,)]
+        assert _fetch(conn, "SELECT generate_series(1, 3) * 2") == [(2,), (4,), (6,)]
