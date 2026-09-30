@@ -28,3 +28,13 @@ select id, (select count(*) from (select 1 from ty_u q where q.v > ty_u.v and ex
 select id from ty_u where exists (select 1 from (select v from ty_u q where q.id = ty_u.id) x where x.v > 15) order by 1
 drop table ty_u
 drop table ty_t
+create table op_t (id int, t text, d date)
+insert into op_t values (1, 'x', '2020-01-01')
+select * from op_t where (case when id > 0 then t else 'b' end) = 1
+select * from op_t where coalesce(t, 'x') = 1
+select * from op_t where (t || 'a') = 1
+select * from op_t where (id::text) = 1
+select * from op_t where d + 1 = 'x'
+select * from op_t where (select t from op_t limit 1) = 1
+select * from op_t where nullif(t, 'a') = 1
+drop table op_t

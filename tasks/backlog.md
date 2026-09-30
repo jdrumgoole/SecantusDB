@@ -653,13 +653,15 @@ remain open:
       operator resolution by type, error positions) leaves (2026-09-30).**
       132+ corpora at 0 divergences (PG 14 reference; PG 15.19 where a
       corpus needs 15). Left, each measured:
-      - **Operator resolution by type** covers comparisons (`=`, `<>`, `<`,
-        `<=`, `>`, `>=`, `IN`, `LIKE` / `~~`) whose operands are typed
-        statically: a column of a table in scope (a subquery's own FROM, then
-        the enclosing query's), a constant, a cast, a declared parameter. An
-        operand that is itself an expression, or a column of a FROM subquery
-        or CTE, is not checked, and a cross-category comparison there still
-        answers no rows rather than 42883.
+      - **Operator resolution by type** (widened in batch 12) types a
+        column (of a table, FROM subquery or CTE in scope), a constant, a
+        cast, a parameter, a built-in's result (by the overload its arguments
+        select), CASE / COALESCE / GREATEST / LEAST / NULLIF, `||`, date and
+        numeric arithmetic and a scalar subquery; an untyped literal compared
+        with one is coerced when analysed. An operand of any other shape (an
+        array subscript, a row constructor, a window result) is not checked,
+        and a cross-category comparison there still answers no rows rather
+        than 42883.
       - **Error positions** (`P`) come from the parse location where the
         raising site recorded one, and otherwise from the first token the
         message names. A name mentioned twice may point at the wrong
