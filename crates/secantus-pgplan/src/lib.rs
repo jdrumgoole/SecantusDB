@@ -459,6 +459,7 @@ pub enum Statement {
         schema: Option<String>,
         input: Option<String>,
         output: Option<String>,
+        attrs: BaseTypeAttrs,
     },
     /// `CREATE [OR REPLACE] FUNCTION name(args) RETURNS t LANGUAGE internal AS
     /// '<builtin>'` -- a catalog registration of an internal-language wrapper,
@@ -3636,6 +3637,92 @@ fn split_qualified_type_name(
     }
 }
 
+/// A base type's `CREATE TYPE` attributes other than its I/O functions, as
+/// `DefineType` reads them. `None` is "not given" (a `LIKE` type or the
+/// default fills it).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BaseTypeAttrs {
+    /// `internallength`: a size in bytes, or -1 for `variable`.
+    pub internallength: Option<i32>,
+    pub byval: Option<bool>,
+    /// `typalign`: `c` / `s` / `i` / `d`.
+    pub align: Option<char>,
+    /// `typstorage`: `p` / `e` / `x` / `m`.
+    pub storage: Option<char>,
+    pub category: Option<char>,
+    pub preferred: bool,
+    pub default: Option<String>,
+    pub delimiter: Option<char>,
+    pub receive: Option<String>,
+    pub send: Option<String>,
+    pub typmod_in: Option<String>,
+    pub typmod_out: Option<String>,
+    pub analyze: Option<String>,
+    pub subscript: Option<String>,
+    pub element: Option<String>,
+    pub collatable: bool,
+    pub like: Option<String>,
+    /// The first invalid attribute value, as `(sqlstate, message)`:
+    /// PostgreSQL finds the shell type before it reads the attributes, so
+    /// the executor raises this after that check.
+    pub error: Option<(String, String)>,
+}
+
+/// A `CREATE TYPE` attribute's value as a string, however it was written.
+fn def_elem_string(e: &pg_query::protobuf::DefElem) -> Option<String> {
+    use pg_query::protobuf::a_const::Val;
+    match e.arg.as_deref()?.node.as_ref()? {
+        N::String(s) => Some(s.sval.clone()),
+        N::Integer(i) => Some(i.ival.to_string()),
+        N::Float(f) => Some(f.fval.clone()),
+        N::Boolean(b) => Some(b.boolval.to_string()),
+        N::AConst(c) => match c.val.as_ref()? {
+            Val::Sval(s) => Some(s.sval.clone()),
+            Val::Ival(i) => Some(i.ival.to_string()),
+            Val::Fval(f) => Some(f.fval.clone()),
+            Val::Boolval(b) => Some(b.boolval.to_string()),
+            Val::Bsval(b) => Some(b.bsval.clone()),
+        },
+        N::TypeName(t) => {
+            // As written, qualification included (`pg_catalog.int4`).
+            let parts: Vec<String> = t
+                .names
+                .iter()
+                .filter_map(|n| match n.node.as_ref()? {
+                    N::String(s) => Some(s.sval.clone()),
+                    _ => None,
+                })
+                .collect();
+            Some(parts.join("."))
+        }
+        N::List(l) => Some(
+            l.items
+                .iter()
+                .filter_map(|n| match n.node.as_ref()? {
+                    N::String(s) => Some(s.sval.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("."),
+        ),
+        _ => None,
+    }
+}
+
+fn type_attr_bool(e: &pg_query::protobuf::DefElem) -> Result<bool> {
+    let Some(v) = def_elem_string(e) else {
+        return Ok(true);
+    };
+    match v.to_ascii_lowercase().as_str() {
+        "true" | "on" | "1" | "yes" | "t" => Ok(true),
+        "false" | "off" | "0" | "no" | "f" => Ok(false),
+        _ => Err(Error::Sqlstate(
+            "22023",
+            format!("{} requires a Boolean value", e.defname),
+        )),
+    }
+}
+
 /// `CREATE TYPE name` (a shell) or `CREATE TYPE name (input = f, output = g,
 /// like = t)` (a base type over its shell). Both arrive as a `DefineStmt` of
 /// kind OBJECT_TYPE; an empty option list is the shell form.
@@ -3646,30 +3733,110 @@ fn plan_define_type(d: &pg_query::protobuf::DefineStmt) -> Result<Statement> {
     }
     let mut input = None;
     let mut output = None;
+    let mut a = BaseTypeAttrs::default();
     for opt in &d.definition {
         let Some(N::DefElem(e)) = opt.node.as_ref() else {
             return Err(Error::Parse("malformed CREATE TYPE option".into()));
         };
         let value = e.arg.as_ref().and_then(|a| type_name_of_node(a));
+        let text = def_elem_string(e);
         match e.defname.to_ascii_lowercase().as_str() {
             "input" => input = value,
             "output" => output = value,
-            // `like = text` copies the representation (typlen / alignment /
-            // storage), none of which this server surfaces: a base type is
-            // carried as its text form whatever it is `like`.
-            "like" => {}
-            other => {
-                return Err(Error::Unsupported(format!(
-                    "the CREATE TYPE option \"{other}\""
-                )))
+            "receive" => a.receive = value,
+            "send" => a.send = value,
+            "typmod_in" => a.typmod_in = value,
+            "typmod_out" => a.typmod_out = value,
+            "analyze" | "analyse" => a.analyze = value,
+            "subscript" => a.subscript = value,
+            "element" => a.element = value,
+            "like" => a.like = value,
+            "internallength" => {
+                let t = text.unwrap_or_default();
+                a.internallength = Some(if t.eq_ignore_ascii_case("variable") {
+                    -1
+                } else {
+                    match t.parse::<i32>() {
+                        Ok(n) => n,
+                        Err(_) => {
+                            a.error.get_or_insert((
+                                "22023".into(),
+                                format!("invalid type internal size {t}"),
+                            ));
+                            continue;
+                        }
+                    }
+                });
             }
+            "passedbyvalue" => a.byval = Some(type_attr_bool(e)?),
+            "alignment" => {
+                let t = text.unwrap_or_default();
+                a.align = Some(match t.to_ascii_lowercase().as_str() {
+                    "double" | "float8" | "pg_catalog.float8" => 'd',
+                    "int4" | "pg_catalog.int4" => 'i',
+                    "int2" | "pg_catalog.int2" => 's',
+                    "char" | "pg_catalog.bpchar" => 'c',
+                    _ => {
+                        a.error.get_or_insert((
+                            "22023".into(),
+                            format!("alignment \"{t}\" not recognized"),
+                        ));
+                        continue;
+                    }
+                });
+            }
+            "storage" => {
+                let t = text.unwrap_or_default();
+                a.storage = Some(match t.to_ascii_lowercase().as_str() {
+                    "plain" => 'p',
+                    "external" => 'e',
+                    "extended" => 'x',
+                    "main" => 'm',
+                    _ => {
+                        a.error.get_or_insert((
+                            "22023".into(),
+                            format!("storage \"{t}\" not recognized"),
+                        ));
+                        continue;
+                    }
+                });
+            }
+            "category" => {
+                let t = text.unwrap_or_default();
+                match t.chars().next() {
+                    Some(c) if (' '..='~').contains(&c) => a.category = Some(c),
+                    _ => {
+                        a.error.get_or_insert((
+                            "22023".into(),
+                            format!("invalid type category \"{t}\": must be simple ASCII"),
+                        ));
+                        continue;
+                    }
+                }
+            }
+            "preferred" => a.preferred = type_attr_bool(e)?,
+            "default" => a.default = text,
+            "delimiter" => a.delimiter = text.and_then(|t| t.chars().next()),
+            "collatable" => a.collatable = type_attr_bool(e)?,
+            // PostgreSQL WARNS about an attribute it does not know and goes on.
+            other => warn(
+                "42601",
+                format!("type attribute \"{other}\" not recognized"),
+            ),
         }
+    }
+    if a.element.is_some() && a.subscript.is_none() {
+        a.error.get_or_insert((
+            "22023".into(),
+            "element type cannot be specified without a subscripting function".into(),
+        ));
     }
     Ok(Statement::CreateBaseType {
         name,
         schema,
         input,
         output,
+        attrs: a,
     })
 }
 

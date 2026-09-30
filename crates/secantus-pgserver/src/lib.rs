@@ -23,6 +23,7 @@ mod explain;
 mod fdw;
 mod merge;
 mod partition;
+mod pg_type_facts;
 mod plpgsql_do;
 mod plpgsql_fn;
 mod rules;
@@ -7128,11 +7129,30 @@ impl PgHandler {
     /// (`t[]`) is as defined as its element type.
     fn type_kind(&self, key: &str) -> PgWireResult<TypeKind> {
         let element = key.strip_suffix("[]").unwrap_or(key);
-        if element == "cstring"
-            || element == "void"
-            || element == "trigger"
-            || element == "record"
-            || secantus_pgplan::pgtypes::oid_of_name(element).is_some()
+        if matches!(
+            element,
+            "cstring"
+                | "void"
+                | "trigger"
+                | "record"
+                | "internal"
+                | "event_trigger"
+                | "fdw_handler"
+                | "language_handler"
+                | "index_am_handler"
+                | "table_am_handler"
+                | "tsm_handler"
+                | "anyelement"
+                | "anyarray"
+                | "anynonarray"
+                | "anyenum"
+                | "anyrange"
+                | "anymultirange"
+                | "anycompatible"
+                | "anycompatiblearray"
+                | "anycompatiblenonarray"
+                | "anycompatiblerange"
+        ) || secantus_pgplan::pgtypes::oid_of_name(element).is_some()
         {
             return Ok(TypeKind::Defined);
         }
@@ -9128,7 +9148,11 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("typname", "name", false),
                     secantus_pgcatalog::Column::new("oid", "int8", false),
                     secantus_pgcatalog::Column::new("typarray", "int8", false),
-                    secantus_pgcatalog::Column::new("typdelim", "text", false),
+                    secantus_pgcatalog::Column::new(
+                        "typdelim",
+                        secantus_pgplan::QUOTED_CHAR,
+                        false,
+                    ),
                     // A composite's row type: its own oid here, 0 otherwise.
                     // `pg_attribute` keys a composite's fields on it.
                     secantus_pgcatalog::Column::new("typrelid", "oid", false),
@@ -10293,8 +10317,84 @@ impl PgHandler {
                 // Base types: `typarray` is 0 while the type is a SHELL --
                 // PostgreSQL mints the array type only when the full CREATE
                 // TYPE completes it (measured on 16) -- and derived after.
+                let base_docs = self
+                    .type_catalog_docs(Self::BASE_TYPE_COLLECTION)
+                    .map(|d| d.to_vec())
+                    .unwrap_or_default();
                 for b in self.base_types().ok()? {
                     let mut d = Document::new();
+                    let raw = base_docs.iter().find(|x| {
+                        x.get_i64("oid")
+                            .or_else(|_| x.get_i32("oid").map(i64::from))
+                            == Ok(b.oid)
+                    });
+                    let field = |n: &str| def.field_of(n);
+                    if !b.defined {
+                        // A shell: PostgreSQL's TypeShellMake.
+                        d.insert(def.field_of("typtype").expect("column"), "p");
+                        if let Some(f) = field("typisdefined") {
+                            d.insert(f, false);
+                        }
+                    } else if let Some(raw) = raw.filter(|r| r.contains_key("typlen")) {
+                        let proc = |k: &str| -> Bson {
+                            Bson::String(raw.get_str(k).unwrap_or("-").to_string())
+                        };
+                        let put = |d: &mut Document, n: &str, v: Bson| {
+                            if let Some(f) = def.field_of(n) {
+                                d.insert(f, v);
+                            }
+                        };
+                        put(
+                            &mut d,
+                            "typlen",
+                            Bson::Int32(raw.get_i32("typlen").unwrap_or(-1)),
+                        );
+                        put(
+                            &mut d,
+                            "typbyval",
+                            Bson::Boolean(raw.get_bool("typbyval").unwrap_or(false)),
+                        );
+                        for k in ["typalign", "typstorage", "typcategory"] {
+                            put(
+                                &mut d,
+                                k,
+                                Bson::String(raw.get_str(k).unwrap_or_default().to_string()),
+                            );
+                        }
+                        put(
+                            &mut d,
+                            "typispreferred",
+                            Bson::Boolean(raw.get_bool("typispreferred").unwrap_or(false)),
+                        );
+                        put(
+                            &mut d,
+                            "typinput",
+                            Bson::String(b.input.clone().unwrap_or_default()),
+                        );
+                        put(
+                            &mut d,
+                            "typoutput",
+                            Bson::String(b.output.clone().unwrap_or_default()),
+                        );
+                        for k in [
+                            "typreceive",
+                            "typsend",
+                            "typmodin",
+                            "typmodout",
+                            "typanalyze",
+                            "typsubscript",
+                        ] {
+                            put(&mut d, k, proc(k));
+                        }
+                        put(
+                            &mut d,
+                            "typdefault",
+                            raw.get("typdefault").cloned().unwrap_or(Bson::Null),
+                        );
+                        if raw.get_bool("collatable").unwrap_or(false) {
+                            put(&mut d, "typcollation", Bson::Int64(100));
+                        }
+                    }
                     d.insert(def.field_of("typname").expect("column"), b.name.clone());
                     d.insert(def.field_of("oid").expect("column"), Bson::Int64(b.oid));
                     let typarray = if b.defined {
@@ -10309,9 +10409,11 @@ impl PgHandler {
                     // PostGIS declares `geometry` with `DELIMITER = ':'`
                     // (measured on 3.4.6); every other base type is `,`.
                     let delim = if b.extension.is_some() && b.name == "geometry" {
-                        ":"
+                        ":".to_string()
                     } else {
-                        ","
+                        raw.and_then(|r| r.get_str("typdelim").ok())
+                            .unwrap_or(",")
+                            .to_string()
                     };
                     d.insert(def.field_of("typdelim").expect("column"), delim);
                     d.insert(def.field_of("typrelid").expect("column"), Bson::Int64(0));
@@ -10345,6 +10447,26 @@ impl PgHandler {
                     );
                     rows.push(d);
                 }
+                // Each built-in's ARRAY type is a row of its own (`_int4`).
+                let listed: std::collections::HashSet<i64> = rows
+                    .iter()
+                    .filter_map(|d| d.get_i64(def.field_of("oid").expect("column")).ok())
+                    .collect();
+                for (typname, _, typarray) in secantus_pgplan::pgtypes::BUILTIN_TYPES {
+                    if *typarray == 0 || listed.contains(typarray) {
+                        continue;
+                    }
+                    let mut d = Document::new();
+                    d.insert(
+                        def.field_of("typname").expect("column"),
+                        format!("_{typname}"),
+                    );
+                    d.insert(def.field_of("oid").expect("column"), Bson::Int64(*typarray));
+                    d.insert(def.field_of("typarray").expect("column"), Bson::Int64(0));
+                    d.insert(def.field_of("typdelim").expect("column"), ",");
+                    d.insert(def.field_of("typrelid").expect("column"), Bson::Int64(0));
+                    rows.push(d);
+                }
                 // The columns the loops above leave to their defaults: the
                 // type's kind from where it came from, and its namespace.
                 let oids =
@@ -10356,7 +10478,7 @@ impl PgHandler {
                 for d in &mut rows {
                     let oid = d.get_i64(f("oid")).unwrap_or(0);
                     let name = d.get_str(f("typname")).unwrap_or_default().to_string();
-                    let builtin = secantus_pgplan::pgtypes::name_of_oid(oid).is_some();
+                    let builtin = secantus_pgplan::pgtypes::type_name_of_oid(oid).is_some();
                     if !d.contains_key(f("typtype")) {
                         let kind = if enum_oids.contains(&oid) {
                             "e"
@@ -10381,7 +10503,9 @@ impl PgHandler {
                         d.insert(f("typbasetype"), Bson::Int64(0));
                         d.insert(f("typnotnull"), false);
                         d.insert(f("typtypmod"), Bson::Int32(-1));
-                        d.insert(f("typdefault"), Bson::Null);
+                        if !d.contains_key(f("typdefault")) {
+                            d.insert(f("typdefault"), Bson::Null);
+                        }
                     }
                     d.insert(
                         f("typnamespace"),
@@ -19667,6 +19791,7 @@ impl PgHandler {
                 schema,
                 input,
                 output,
+                attrs,
             } => {
                 // The full form completes a shell. Every refusal below is
                 // PostgreSQL 16's, in its order: the shell must exist
@@ -19707,6 +19832,10 @@ impl PgHandler {
                         return Err(PgWireError::UserError(Box::new(info)));
                     }
                 };
+                // An attribute's value, read after the shell is found.
+                if let Some((code, message)) = &attrs.error {
+                    return Err(Self::user_error(code, message.clone()));
+                }
                 let Some(input) = input else {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
@@ -19773,6 +19902,78 @@ impl PgHandler {
                         );
                     }
                 }
+                // The other support functions, each by its signature.
+                let lookup_fn =
+                    |f: &Option<String>, sig: &[&str], shown: &str| -> PgWireResult<()> {
+                        let Some(f) = f else { return Ok(()) };
+                        if functions.iter().any(|x| {
+                            x.name == *f
+                                && x.param_types.first().map(String::as_str) == sig.first().copied()
+                        }) {
+                            return Ok(());
+                        }
+                        Err(Self::user_error(
+                            "42883",
+                            format!("function {f}({shown}) does not exist"),
+                        ))
+                    };
+                lookup_fn(&attrs.receive, &["internal"], "internal")?;
+                lookup_fn(&attrs.send, &[id_key.as_str()], &quoted)?;
+                lookup_fn(&attrs.typmod_in, &["cstring[]"], "cstring[]")?;
+                lookup_fn(&attrs.typmod_out, &["int4"], "integer")?;
+                lookup_fn(&attrs.analyze, &["internal"], "internal")?;
+                lookup_fn(&attrs.subscript, &["internal"], "internal")?;
+                // LIKE supplies the representation the options leave out.
+                let like = match &attrs.like {
+                    Some(t) => {
+                        let oid = secantus_pgplan::pgtypes::oid_of_name(t);
+                        let fact = |c: &str| oid.and_then(|o| pg_type_facts::builtin(o, c));
+                        (
+                            fact("typlen").and_then(|v| v.as_i32()),
+                            fact("typbyval").and_then(|v| v.as_bool()),
+                            fact("typalign")
+                                .and_then(|v| v.as_str().and_then(|s| s.chars().next())),
+                            fact("typstorage")
+                                .and_then(|v| v.as_str().and_then(|s| s.chars().next())),
+                        )
+                    }
+                    None => (None, None, None, None),
+                };
+                let len = attrs.internallength.or(like.0).unwrap_or(-1);
+                let byval = attrs.byval.or(like.1).unwrap_or(false);
+                let align = attrs.align.or(like.2).unwrap_or('i');
+                let storage = attrs.storage.or(like.3).unwrap_or('p');
+                // TypeCreate's checks, in its order.
+                let invalid = |m: String| Self::user_error("42P17", m);
+                if !(len > 0 || len == -1 || len == -2) {
+                    return Err(invalid(format!("invalid type internal size {len}")));
+                }
+                if byval {
+                    let want = match len {
+                        1 => 'c',
+                        2 => 's',
+                        4 => 'i',
+                        8 => 'd',
+                        _ => {
+                            return Err(invalid(format!(
+                                "internal size {len} is invalid for passed-by-value type"
+                            )))
+                        }
+                    };
+                    if align != want {
+                        return Err(invalid(format!(
+                            "alignment \"{align}\" is invalid for passed-by-value type of size {len}"
+                        )));
+                    }
+                } else if len == -1 && !matches!(align, 'i' | 'd') {
+                    return Err(invalid(format!(
+                        "alignment \"{align}\" is invalid for variable-length type"
+                    )));
+                }
+                if storage != 'p' && len != -1 {
+                    return Err(invalid("fixed-size types must have storage PLAIN".into()));
+                }
+                let opt = |v: &Option<String>| v.clone().map_or(Bson::Null, Bson::String);
                 let doc = bson::doc! {
                     "_id": &id_key,
                     "base": &name,
@@ -19781,6 +19982,22 @@ impl PgHandler {
                     "defined": true,
                     "input": &input,
                     "output": &output,
+                    "typlen": len,
+                    "typbyval": byval,
+                    "typalign": align.to_string(),
+                    "typstorage": storage.to_string(),
+                    "typcategory": attrs.category.unwrap_or('U').to_string(),
+                    "typispreferred": attrs.preferred,
+                    "typdefault": opt(&attrs.default),
+                    "typdelim": attrs.delimiter.unwrap_or(',').to_string(),
+                    "typreceive": opt(&attrs.receive),
+                    "typsend": opt(&attrs.send),
+                    "typmodin": opt(&attrs.typmod_in),
+                    "typmodout": opt(&attrs.typmod_out),
+                    "typanalyze": opt(&attrs.analyze),
+                    "typsubscript": opt(&attrs.subscript),
+                    "typelem_name": opt(&attrs.element),
+                    "collatable": attrs.collatable,
                 };
                 self.delete_type_doc(Self::BASE_TYPE_COLLECTION, &id_key)?;
                 self.insert_type_doc(Self::BASE_TYPE_COLLECTION, &id_key, doc)?;
