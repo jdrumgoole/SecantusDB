@@ -1977,9 +1977,8 @@ impl PgHandler {
         };
         // The RowDescription carries column names in the client encoding, so
         // a LATIN1 / LATIN9 session gets the name's transcoded bytes. A name
-        // with a character the encoding cannot represent keeps its UTF-8 bytes
-        // (PostgreSQL raises 22P05 there; `field_mod` is infallible and the
-        // case needs a non-Latin alias under a Latin client encoding).
+        // with a character the encoding cannot represent is refused 22P05
+        // where the fields leave the handler (`check_field_names`).
         let name_raw = transcoded_name(self.client_encoding(), &name);
         let (table_id, column_id) = match source {
             Some((oid, attnum)) => (i32::try_from(oid).ok(), Some(attnum)),
@@ -13395,6 +13394,17 @@ impl SimpleQueryHandler for PgHandler {
         // A simple query inside an extended-protocol statement group runs in
         // the group's transaction and ends it, as PostgreSQL's does
         // (`exec_simple_query` finishes the transaction command).
+        let out = out.and_then(|resps| {
+            for r in &resps {
+                if let Response::Query(q) = r {
+                    if let Err(e) = check_field_names(self.client_encoding(), &q.row_schema()) {
+                        self.note_failure();
+                        return Err(e);
+                    }
+                }
+            }
+            Ok(resps)
+        });
         let out = match self.close_extended_group(out.is_err()) {
             Ok(()) => out,
             Err(e) => out.and(Err(e)),
@@ -25065,6 +25075,22 @@ fn rebind_field_format(field: &FieldInfo, binary: bool) -> FieldInfo {
 /// A column name's `RowDescription` bytes under the client encoding, or `None`
 /// when they are the name's own UTF-8 (the UTF8 / passthrough encodings, and a
 /// name the target encoding cannot represent).
+/// PostgreSQL converts each column name to the client encoding as it writes
+/// the RowDescription, so a name with a character the encoding cannot
+/// represent is `22P05` for the statement (Describe or Execute alike) rather
+/// than the name's UTF-8 bytes.
+fn check_field_names(cenc: ClientEncoding, fields: &[FieldInfo]) -> PgWireResult<()> {
+    if !cenc.transcodes() {
+        return Ok(());
+    }
+    for f in fields.iter().filter(|f| !f.name().is_ascii()) {
+        if let Err(ch) = encoding::encode(cenc, f.name().as_bytes()) {
+            return Err(untranslatable_char(ch, cenc));
+        }
+    }
+    Ok(())
+}
+
 fn transcoded_name(cenc: ClientEncoding, name: &str) -> Option<Bytes> {
     if !cenc.transcodes() || name.is_ascii() {
         return None;
@@ -28953,6 +28979,9 @@ impl ExtendedQueryHandler for PgHandler {
         let param_types = self.param_type_names(target);
         let fields =
             self.describe_fields(&target.statement.sql, param_types.len(), &param_types)?;
+        if let Some(fields) = &fields {
+            check_field_names(self.client_encoding(), fields)?;
+        }
         // A parameter with no mapped builtin type reports its user-type oid
         // when the raw Parse oid named one (a composite / enum); otherwise
         // the type the STATEMENT gives it -- `$1::int4` describes as int4 and
@@ -29079,6 +29108,9 @@ impl ExtendedQueryHandler for PgHandler {
             param_types.len(),
             &param_types,
         )?;
+        if let Some(fields) = &fields {
+            check_field_names(self.client_encoding(), fields)?;
+        }
         Ok(match fields {
             Some(fields) => DescribePortalResponse::new(self.mixed_fields(fields)?),
             None => pgwire::api::results::DescribeResponse::no_data(),

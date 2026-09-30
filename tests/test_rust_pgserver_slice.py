@@ -15008,3 +15008,26 @@ def test_a_rule_action_runs_once_per_statement_not_per_row(home: Path) -> None:
         )
         c.execute("delete from rq_t where id = 1")
         assert c.execute("select max(n) from rq_log").fetchone() == (3,)
+
+
+def test_latin1_binary_text_arrays_and_untranslatable_names(home: Path) -> None:
+    """A binary text-family array is transcoded ELEMENT by element.
+
+    Its wire form interleaves big-endian length words with the text, so a
+    whole-payload transcode would corrupt it; each element is converted and
+    its length rewritten. A column NAME the client encoding cannot hold is
+    22P05, as the RowDescription PostgreSQL writes refuses it -- not the
+    name's UTF-8 bytes. And a 2-D ``varchar[]`` is a 2-D array in text, not a
+    1-D array of the sub-arrays' text.
+    """
+    with _Server(home) as server, server.connect() as c:
+        c.execute("SET client_encoding = 'LATIN1'")
+        cur = c.execute("SELECT ARRAY['café', NULL, 'ü']::varchar[]", binary=True)
+        assert cur.fetchone() == (["café", None, "ü"],)
+        with pytest.raises(psycopg.errors.UntranslatableCharacter):
+            c.execute("SELECT ARRAY[chr(20013)]::text[]", binary=True)
+        with pytest.raises(psycopg.errors.UntranslatableCharacter):
+            c.execute('SELECT 1 AS U&"\\20AC"')
+        assert c.execute('SELECT 1 AS U&"\\00E9"').description[0].name == "é"
+        cur = c.execute("SELECT '{{a,b},{c,\"d e\"}}'::varchar[]")
+        assert cur.fetchone() == ([["a", "b"], ["c", "d e"]],)
