@@ -5009,7 +5009,10 @@ impl PgHandler {
         Ok(self
             .type_catalog_docs(Self::FUNCTION_COLLECTION)?
             .iter()
-            .filter(|d| matches!(d.get_str("language"), Ok("sql" | "plpgsql")))
+            .filter(|d| {
+                matches!(d.get_str("language"), Ok("sql" | "plpgsql"))
+                    || d.get_str("call_sql").is_ok()
+            })
             .cloned()
             .collect())
     }
@@ -5671,6 +5674,13 @@ impl PgHandler {
                         r.map_or(Bson::Null, |r| Bson::Array(r.values)),
                     ),
                 })
+            }
+            // A `LANGUAGE internal` wrapper runs the built-in it names.
+            "internal" => {
+                let mut sql_doc = doc.clone();
+                sql_doc.insert("body", doc.get_str("call_sql").unwrap_or_default());
+                sql_doc.insert("language", "sql");
+                self.call_sql_function(&sql_doc, u, args)
             }
             _ => self.call_sql_function(doc, u, args),
         }
@@ -7144,7 +7154,10 @@ impl PgHandler {
     /// type's `<name>in` / `<name>out` pair plus the array pair. Anything
     /// else is PostgreSQL's 42883 `there is no built-in function named`.
     fn is_builtin_function(body: &str) -> bool {
-        if body == "array_in" || body == "array_out" {
+        if body == "array_in"
+            || body == "array_out"
+            || secantus_pgplan::user_ops::is_internal_function(body)
+        {
             return true;
         }
         secantus_pgplan::pgtypes::BUILTIN_TYPES
@@ -9568,7 +9581,10 @@ impl PgHandler {
                         d.insert(
                             f("generation_expression"),
                             generated
-                                .and_then(secantus_pgplan::generation_expression)
+                                .and_then(|g| {
+                                    secantus_pgplan::ruleutils::expr_def(g, &t)
+                                        .or_else(|| secantus_pgplan::generation_expression(g))
+                                })
                                 .map_or(Bson::Null, Bson::String),
                         );
                         rows.push(d);
@@ -10165,7 +10181,8 @@ impl PgHandler {
                     let oid = self.relation_oid(&t.name).unwrap_or(0);
                     for (i, c) in t.columns.iter().enumerate() {
                         let expr = match c.extra.get_str("generated") {
-                            Ok(g) => secantus_pgplan::generation_expression(g)
+                            Ok(g) => secantus_pgplan::ruleutils::expr_def(g, &t)
+                                .or_else(|| secantus_pgplan::generation_expression(g))
                                 .map_or(Bson::Null, Bson::String),
                             Err(_) => Self::default_expression(c),
                         };
@@ -10376,11 +10393,13 @@ impl PgHandler {
             "pg_policies" => {
                 let f = |name: &str| def.field_of(name).expect("column");
                 // ruleutils parenthesises an operator expression.
-                let render = |v: Option<&str>| -> Bson {
+                let render = |table: &str, v: Option<&str>| -> Bson {
                     match v {
                         None => Bson::Null,
                         Some(e) => Bson::String(
-                            secantus_pgplan::generation_expression(e)
+                            self.lookup(table)
+                                .and_then(|t| secantus_pgplan::ruleutils::expr_def(e, &t))
+                                .or_else(|| secantus_pgplan::generation_expression(e))
                                 .unwrap_or_else(|| e.to_string()),
                         ),
                     }
@@ -10417,8 +10436,9 @@ impl PgHandler {
                             .unwrap_or_default();
                         d.insert(f("roles"), roles);
                         d.insert(f("cmd"), p.get_str("command").unwrap_or("ALL"));
-                        d.insert(f("qual"), render(p.get_str("using").ok()));
-                        d.insert(f("with_check"), render(p.get_str("check").ok()));
+                        let table = p.get_str("table").unwrap_or_default();
+                        d.insert(f("qual"), render(table, p.get_str("using").ok()));
+                        d.insert(f("with_check"), render(table, p.get_str("check").ok()));
                         d
                     })
                     .collect()
@@ -11541,7 +11561,8 @@ impl PgHandler {
                         // conrelid)` -- which is how a client reads a CHECK
                         // back -- answers it as ruleutils prints it.
                         if let Some(row) = rows.last_mut() {
-                            let text = secantus_pgplan::generation_expression(&ck.expression)
+                            let text = secantus_pgplan::ruleutils::expr_def(&ck.expression, &t)
+                                .or_else(|| secantus_pgplan::generation_expression(&ck.expression))
                                 .unwrap_or_else(|| format!("({})", ck.expression));
                             row.insert(field("conbin"), text);
                             row.insert(field("convalidated"), Bson::Boolean(!ck.not_valid));
@@ -19893,6 +19914,14 @@ impl PgHandler {
                     "volatility": &volatility,
                     "returns_trigger": false,
                 };
+                // Callable when the C function is one this server has in
+                // SQL: the wrapper runs that.
+                let mut doc = doc;
+                if let Some(sql) =
+                    secantus_pgplan::user_ops::internal_call_sql(&body, param_types.len())
+                {
+                    doc.insert("call_sql", sql);
+                }
                 self.insert_type_doc(Self::FUNCTION_COLLECTION, &id_key, doc)?;
                 Ok(vec![Response::Execution(Tag::new("CREATE FUNCTION"))])
             }

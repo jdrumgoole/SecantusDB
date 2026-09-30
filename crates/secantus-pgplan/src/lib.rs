@@ -5975,6 +5975,9 @@ pub fn set_constraint_defs(defs: Vec<(i64, String)>) {
 /// A CHECK constraint's expression as `pg_get_constraintdef` prints it:
 /// `CHECK ((n > 0))`.
 pub fn check_constraint_text(expression: &str, def: &TableDef) -> String {
+    if let Some(inner) = ruleutils::expr_def(expression, def) {
+        return format!("CHECK ({inner})");
+    }
     let inner = pg_query::parse(&format!("SELECT {expression}"))
         .ok()
         .and_then(|p| {

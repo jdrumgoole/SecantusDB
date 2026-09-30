@@ -57,6 +57,8 @@ struct Printer<'a> {
     col_names_visible: bool,
     /// PRETTYFLAG_PAREN: parentheses only where precedence needs them.
     pretty: bool,
+    /// `pg_get_expr` over one relation: columns print bare.
+    unqualified: bool,
 }
 
 /// What a sub-expression is printed inside, for `isSimpleNode`.
@@ -181,6 +183,7 @@ impl<'a> Printer<'a> {
             depth: 0,
             col_names_visible: true,
             pretty: false,
+            unqualified: false,
         }
     }
 
@@ -493,7 +496,7 @@ impl<'a> Printer<'a> {
     /// The coercions a comparison puts on its operands.
     fn compare_coercion(l: &str, r: &str) -> Option<(String, String)> {
         if l == r {
-            if matches!(l, "varchar" | "name") {
+            if l == "varchar" {
                 return Some(("text".into(), "text".into()));
             }
             if l == "unknown" {
@@ -526,8 +529,22 @@ impl<'a> Printer<'a> {
             return Some((lt.into(), rt.into()));
         }
         if is_stringish(l) && is_stringish(r) {
-            let lt = if l == "text" { "" } else { "text" };
-            let rt = if r == "text" { "" } else { "text" };
+            // `text = name` and `name = text` are operators of their own
+            // (PostgreSQL 12+): a name meeting text, or varchar-as-text,
+            // stays a name.
+            let keep = |t: &str| t == "text" || t == "name";
+            let text_side = |t: &str| matches!(t, "text" | "varchar");
+            let (lt, rt) = if (l == "name" && text_side(r)) || (r == "name" && text_side(l)) {
+                (
+                    if keep(l) { "" } else { "text" },
+                    if keep(r) { "" } else { "text" },
+                )
+            } else {
+                (
+                    if l == "text" { "" } else { "text" },
+                    if r == "text" { "" } else { "text" },
+                )
+            };
             return Some((lt.into(), rt.into()));
         }
         // date vs timestamp and the like: this analyser does not know.
@@ -686,7 +703,11 @@ impl<'a> Printer<'a> {
             N::ColumnRef(c) => {
                 let fields = names(&c.fields);
                 let (rel, col, _) = self.resolve(&fields)?;
-                self.buf.push_str(&format!("{}.{}", q(&rel), q(&col)));
+                if self.unqualified {
+                    self.buf.push_str(&q(&col));
+                } else {
+                    self.buf.push_str(&format!("{}.{}", q(&rel), q(&col)));
+                }
             }
             N::AConst(c) => match c.val.as_ref() {
                 None => self.buf.push_str("NULL::text"),
@@ -2303,4 +2324,39 @@ pub fn rule_def(
     }
     out.push(';');
     Some(out)
+}
+
+/// `pg_get_expr(expr, relid)`: an expression over one table's columns, as
+/// ruleutils prints a stored default, generated column, CHECK or policy
+/// (columns unqualified). `None` for a shape this does not reproduce.
+pub fn expr_def(sql: &str, def: &TableDef) -> Option<String> {
+    let node = parse_select(&format!("SELECT {sql}"))?;
+    let Some(N::SelectStmt(s)) = node.node.as_ref() else {
+        return None;
+    };
+    let [target] = s.target_list.as_slice() else {
+        return None;
+    };
+    let Some(N::ResTarget(rt)) = target.node.as_ref() else {
+        return None;
+    };
+    let none_lookup = |_: &str| None;
+    let none_views = |_: &str| None;
+    let cat = Catalog {
+        lookup: &none_lookup,
+        view_sql: &none_views,
+    };
+    let mut p = Printer::new(&cat, 0);
+    p.unqualified = true;
+    p.scopes.push(vec![Rte {
+        refname: def.name.clone(),
+        columns: def
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), base_type(&c.pg_type)))
+            .collect(),
+        qualified_only: false,
+    }]);
+    p.expr(rt.val.as_deref()?)?;
+    Some(p.buf)
 }

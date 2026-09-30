@@ -320,11 +320,14 @@ impl PgHandler {
 
     pub(crate) fn pg_policy_rows(&self, def: &TableDef) -> Vec<Document> {
         let f = |name: &str| def.field_of(name).expect("column");
-        let render = |v: Option<&str>| -> Bson {
+        let render = |table: &str, v: Option<&str>| -> Bson {
             match v {
                 None => Bson::Null,
                 Some(e) => Bson::String(
-                    secantus_pgplan::generation_expression(e).unwrap_or_else(|| e.to_string()),
+                    self.lookup(table)
+                        .and_then(|t| secantus_pgplan::ruleutils::expr_def(e, &t))
+                        .or_else(|| secantus_pgplan::generation_expression(e))
+                        .unwrap_or_else(|| e.to_string()),
                 ),
             }
         };
@@ -369,8 +372,8 @@ impl PgHandler {
                     })
                     .unwrap_or_else(|_| vec![Bson::Int64(0)]);
                 d.insert(f("polroles"), polroles);
-                d.insert(f("polqual"), render(p.get_str("using").ok()));
-                d.insert(f("polwithcheck"), render(p.get_str("check").ok()));
+                d.insert(f("polqual"), render(table, p.get_str("using").ok()));
+                d.insert(f("polwithcheck"), render(table, p.get_str("check").ok()));
                 d
             })
             .collect()

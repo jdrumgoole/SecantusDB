@@ -1,0 +1,4 @@
+DROP FUNCTION IF EXISTS in_len(text)
+DROP FUNCTION IF EXISTS in_add(int, int)
+DROP FUNCTION IF EXISTS in_up(text)
+DROP FUNCTION IF EXISTS in_abs(numeric)
