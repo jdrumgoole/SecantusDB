@@ -302,6 +302,8 @@ impl Column {
 pub struct CheckConstraint {
     pub name: String,
     pub expression: String,
+    /// `COMMENT ON CONSTRAINT`, shared with the Python server.
+    pub comment: Option<String>,
 }
 
 /// A declared UNIQUE constraint, in the Python server's on-disk shape
@@ -378,7 +380,11 @@ impl UniqueConstraint {
             exclusion: d.get_bool("exclusion").unwrap_or(false),
             exclusion_ops: d
                 .get_array("exclusion_ops")
-                .map(|a| a.iter().filter_map(|b| b.as_str().map(str::to_string)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|b| b.as_str().map(str::to_string))
+                        .collect()
+                })
                 .unwrap_or_default(),
             exclusion_method: d.get_str("exclusion_method").ok().map(str::to_string),
         })
@@ -403,6 +409,8 @@ pub struct ForeignKey {
     /// pass. Written only when set, so the shared document shape is the
     /// Python server's for the default MATCH SIMPLE.
     pub match_full: bool,
+    /// `COMMENT ON CONSTRAINT`, shared with the Python server.
+    pub comment: Option<String>,
 }
 
 impl CheckConstraint {
@@ -410,7 +418,7 @@ impl CheckConstraint {
         doc! {
             "name": &self.name,
             "expression": &self.expression,
-            "comment": Bson::Null,
+            "comment": self.comment.clone().map_or(Bson::Null, Bson::String),
         }
     }
 
@@ -418,6 +426,7 @@ impl CheckConstraint {
         Some(Self {
             name: d.get_str("name").ok()?.to_string(),
             expression: d.get_str("expression").ok()?.to_string(),
+            comment: d.get_str("comment").ok().map(str::to_string),
         })
     }
 }
@@ -433,7 +442,7 @@ impl ForeignKey {
             "on_update": self.on_update.as_deref().map_or(Bson::Null, Bson::from),
             "deferrable": self.deferrable,
             "initially_deferred": self.initially_deferred,
-            "comment": Bson::Null,
+            "comment": self.comment.clone().map_or(Bson::Null, Bson::String),
         };
         if self.match_full {
             d.insert("match_full", true);
@@ -461,6 +470,7 @@ impl ForeignKey {
             deferrable: d.get_bool("deferrable").unwrap_or(false),
             initially_deferred: d.get_bool("initially_deferred").unwrap_or(false),
             match_full: d.get_bool("match_full").unwrap_or(false),
+            comment: d.get_str("comment").ok().map(str::to_string),
         })
     }
 }
@@ -474,6 +484,12 @@ pub struct TableDef {
     pub check_constraints: Vec<CheckConstraint>,
     pub foreign_keys: Vec<ForeignKey>,
     pub unique_constraints: Vec<UniqueConstraint>,
+    /// Every table-level catalog key this model does not own -- `comment`,
+    /// `pk_name`, `pk_comment`, `pk_column_order`, `expr_indexes` -- kept
+    /// verbatim, as `Column::extra` does for columns. They used to be written
+    /// back as NULLs, so a Rust rewrite of a table erased what the Python
+    /// server recorded (a `COMMENT ON TABLE`, a named primary key).
+    pub extra: Document,
 }
 
 impl TableDef {
@@ -485,6 +501,47 @@ impl TableDef {
             check_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             unique_constraints: Vec::new(),
+            extra: Document::new(),
+        }
+    }
+
+    const OWNED_KEYS: &'static [&'static str] = &[
+        "_id",
+        "table",
+        "collection",
+        "columns",
+        "temp",
+        "foreign_keys",
+        "check_constraints",
+        "unique_constraints",
+    ];
+
+    /// What `to_document` writes for the keys this model does not own; see
+    /// `Column::unmodelled_defaults`.
+    fn unmodelled_defaults() -> Document {
+        doc! {
+            "comment": Bson::Null,
+            "pk_name": Bson::Null,
+            "pk_comment": Bson::Null,
+            "pk_column_order": Bson::Null,
+            "expr_indexes": Vec::<Bson>::new(),
+        }
+    }
+
+    /// `COMMENT ON TABLE`'s text, if any.
+    pub fn comment(&self) -> Option<&str> {
+        self.extra.get_str("comment").ok()
+    }
+
+    /// Set or clear (`None`) the table's comment.
+    pub fn set_comment(&mut self, comment: Option<String>) {
+        match comment {
+            Some(c) => {
+                self.extra.insert("comment", c);
+            }
+            None => {
+                self.extra.remove("comment");
+            }
         }
     }
 
@@ -500,16 +557,26 @@ impl TableDef {
     }
 
     pub fn to_document(&self) -> Document {
-        doc! {
+        // In the Python server's key order (the golden test pins it), each
+        // unmodelled key its stored value or its default.
+        let defaults = Self::unmodelled_defaults();
+        let get = |k: &str| -> Bson {
+            self.extra
+                .get(k)
+                .cloned()
+                .or_else(|| defaults.get(k).cloned())
+                .unwrap_or(Bson::Null)
+        };
+        let mut out = doc! {
             "_id": &self.name,
             "table": &self.name,
             "collection": &self.name,
             "columns": self.columns.iter().map(|c| Bson::Document(c.to_document()))
                 .collect::<Vec<_>>(),
-            "comment": Bson::Null,
-            "pk_name": Bson::Null,
-            "pk_comment": Bson::Null,
-            "pk_column_order": Bson::Null,
+            "comment": get("comment"),
+            "pk_name": get("pk_name"),
+            "pk_comment": get("pk_comment"),
+            "pk_column_order": get("pk_column_order"),
             "temp": self.temp,
             "foreign_keys": self.foreign_keys.iter().map(|f| Bson::Document(f.to_document()))
                 .collect::<Vec<_>>(),
@@ -519,8 +586,15 @@ impl TableDef {
             "unique_constraints": self.unique_constraints.iter()
                 .map(|u| Bson::Document(u.to_document()))
                 .collect::<Vec<_>>(),
-            "expr_indexes": Vec::<Bson>::new(),
+            "expr_indexes": get("expr_indexes"),
+        };
+        // Keys neither model knows, after the known ones.
+        for (k, v) in &self.extra {
+            if !out.contains_key(k) {
+                out.insert(k.clone(), v.clone());
+            }
         }
+        out
     }
 
     pub fn from_document(d: &Document) -> Option<Self> {
@@ -560,6 +634,16 @@ impl TableDef {
                         .collect()
                 })
                 .unwrap_or_default(),
+            extra: {
+                let defaults = Self::unmodelled_defaults();
+                d.iter()
+                    .filter(|(k, v)| {
+                        !Self::OWNED_KEYS.contains(&k.as_str())
+                            && defaults.get(k.as_str()) != Some(v)
+                    })
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            },
         })
     }
 }

@@ -647,9 +647,8 @@ remain open:
       `hypothetical_set` at 0 divergences against PostgreSQL 14; matrices
       numeric `to_char` 471/471, `to_number` 401/401, datetime 1009/1009,
       jsonpath 935/935, aggregates 239 + 375 all matching. Left:
-      - Text search: only the `english` and `simple` configurations; any other
-        (`french`, ...) is 0A000. Lowercasing is ASCII (C-locale), which is
-        what the reference cluster runs; a UTF-8 locale would fold more.
+      - Text search lowercasing is ASCII (C-locale), which is what the
+        reference cluster runs; a UTF-8 locale would fold more.
       - jsonpath `.datetime()` is refused (0A000); every other method is
         implemented.
       - `keyvalue()` ids are computed from a modelled jsonb binary layout; a
@@ -666,7 +665,6 @@ remain open:
       - An array operator does not check element types: `int4[] @> $1` with an
         `int2[]` parameter answers where PostgreSQL says 42883 (`params`, 3
         lines). Needs the parameter's declared array type at the operator.
-      - The `xml` type and `xmlelement` / `xmlforest` / ... are unimplemented.
       - A CORRELATED subquery that aggregates an OUTER column inside HAVING
         (`HAVING count(*) = (SELECT ... WHERE x = min(d.id))`) is refused.
       - `array_fill` with explicit lower bounds (arrays here have no lower
@@ -687,6 +685,44 @@ remain open:
       - **Python PG server: SQLAlchemy 2.1 reflection queries
         `pg_catalog.pg_tablespace`**, which the Python server does not have
         (three reflection tests fail under 2.1; CI pins 2.0.51).
+- [ ] **OPEN — RUST pgserver: what batch 8 (partitioning, row-level
+      security, domains, materialized views, WITH RECURSIVE, xml, READ
+      COMMITTED, enums, generated columns) leaves (2026-09-30).** 87 corpora
+      swept against PostgreSQL 14 at 0 divergences except `arrays` and
+      `strings` (one line each, below). Left:
+      - **Row-level security is recorded, not enforced.** Policies are stored
+        and listed in `pg_policies`, and `relrowsecurity` is set, but no read
+        or write is filtered. That needs per-role privilege enforcement, which
+        this server does not have at all yet (every connection is effectively
+        the owner, which PostgreSQL also exempts from RLS unless FORCE is set).
+        FORCE with the owner is the case that would differ today.
+      - Partitioning: `PARTITION BY HASH` and expression partition keys are
+        refused (0A000). A partition's own column options and constraints in
+        `PARTITION OF ... ( ... )` are refused. The Python server does not know
+        partitions: it sees a partition as an empty table (the rows are in the
+        root's collection). `tableoid` is resolved for relations in the FROM
+        list and its JOINs, not inside a FROM subquery.
+      - PRIMARY KEY UPDATE: a SECONDARY unique index refusing a re-keyed row
+        restores that row, but rows re-keyed earlier in the same statement
+        stay moved when the statement is outside a transaction block.
+      - `arrays`: an array's lower bound is always 1 (`'[0:1]={1,2}'` is
+        refused), so `array_lower` / `array_fill` with bounds differ.
+      - `strings`: `lower('İ')`: the C-locale reference, not a bug.
+      - A ruleutils-style deparser is approximated: a generation expression or
+        policy qual with a function call over a cast, or a CASE, renders
+        differently from `pg_get_expr` (`generated` corpus covers the common
+        shapes).
+      - An unknown function over a table with NO rows answers the empty
+        result (`select foo(id) from empty_t`); PostgreSQL refuses it at plan
+        time (42883). With rows it is 42883 with PostgreSQL's message.
+      - Built-in function arguments are not type-checked: `upper(1)` answers
+        `'1'` where PostgreSQL has no implicit int -> text cast (42883).
+      - Extensions still refused (`is not available`): `pg_trgm`
+        (`similarity`, `%`, trigram opclasses) and `pgcrypto` (`digest`,
+        `hmac`, `crypt`, `gen_salt`, `gen_random_bytes`, `pgp_*`). The
+        reference database has both installed.
+      - The geometric types other than `box` (`point`, `line`, `lseg`,
+        `path`, `polygon`, `circle`) do not exist (42704).
 - [ ] **OPEN — RUST pgserver: a non-boolean constant WHERE over
       `generate_series` carries no error POSITION (2026-09-09).** `select 1
       from generate_series(1,3) where 1` is `42804 argument of WHERE must be
@@ -3870,8 +3906,6 @@ These are explicit non-goals. Don't add them without a reason.
     remainder: `select ts + interval '1 hour' from ut` and `ts::text` over a
     stored `00:00:00.123456` answer `.123`; `apply_row_expr` reads the bare
     BSON date, not the companion field. Same for UPDATE SET.
-  - `UPDATE ut SET id = id + 1` on the primary-key column: PG performs it
-    (`UPDATE 1`); ours 0A000 `UPDATE of a PRIMARY KEY column is not supported yet`.
   - `DEALLOCATE` clears the handler's registry but not pgwire's statement
     store, so a later `EXECUTE`-by-name over the protocol still finds the
     statement (psycopg never does this — it re-prepares).

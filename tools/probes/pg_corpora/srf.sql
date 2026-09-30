@@ -22,3 +22,12 @@ SELECT * FROM generate_subscripts(ARRAY[5,6,7], 1)
 SELECT unnest(ARRAY[1,2])
 SELECT unnest(ia) FROM sr1 WHERE id=1
 SELECT generate_subscripts(ARRAY[5,6,7], 1)
+SELECT sum(x), count(*) FROM generate_series(1, 3) x
+SELECT jsonb_agg(x) FROM generate_series(1, 3) x
+SELECT string_agg(x::text, ',') FROM generate_series(1, 3) x
+SELECT x % 2, count(*) FROM generate_series(1, 5) x GROUP BY 1 ORDER BY 1
+SELECT array_agg(x ORDER BY x DESC) FROM generate_series(1, 3) x
+SELECT avg(x), max(x) FROM generate_series(1, 4) AS g(x)
+SELECT count(*) FILTER (WHERE x > 1) FROM generate_series(1, 3) x
+SELECT sum(v) FROM unnest(ARRAY[1,2,3]) v
+SELECT jsonb_agg(t) FROM (SELECT 1 AS a) t

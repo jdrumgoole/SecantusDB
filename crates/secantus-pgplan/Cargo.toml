@@ -31,3 +31,17 @@ secantus-pgcatalog = { path = "../secantus-pgcatalog" }
 # arbitrary precision, and a sum or product of two wide values has to be exact.
 num-bigint = "0.4"
 num-traits = "0.2"
+# The Snowball stemmers behind PostgreSQL's `<language>_stem` dictionaries
+# (french, german, russian, ...), the same algorithms libstemmer runs.
+rust-stemmers = "1"
+# The Snowball languages `rust-stemmers` does not carry (basque, catalan,
+# hindi, ...). Used for those ten only: its Dutch is Snowball 3's rewrite,
+# while PostgreSQL 14 runs the older one `rust-stemmers` matches.
+snowball_stemmers_rs = "1.0.1"
+# `xpath()` / `xmlexists()`: an XPath 1.0 engine over a parsed document,
+# as PostgreSQL has libxml2's.
+sxd-document = "0.3.2"
+sxd-xpath = "0.4.2"
+# `sha224()` .. `sha512()` over bytea (the digest `secantus-auth` already
+# carries for SCRAM).
+sha2 = "0.10"

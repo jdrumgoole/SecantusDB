@@ -523,10 +523,13 @@ one request path:
       overridden this batch -- read the `strings` notes in the backlog
       before touching it again.
 
-    **What remains refused**: writing THROUGH a view (and so `INSTEAD OF`
-    triggers), an expression / non-btree index, constraint triggers and
-    transition tables, `VARIADIC` / `BEGIN ATOMIC` functions, and correlation
-    through an aggregate in HAVING. `tasks/backlog.md` has the detail.
+    **What remains refused** (re-measured 2026-09-30): `INSTEAD OF` triggers,
+    constraint triggers and transition tables, and `VARIADIC` / `BEGIN
+    ATOMIC` functions. Writing through a view, expression and GIN / GiST /
+    BRIN / SP-GiST indexes, and correlation through an aggregate in HAVING
+    have all landed, as have declarative partitioning, row-level-security DDL
+    (recorded, not enforced), domains, materialized views, `WITH RECURSIVE`
+    and `xml`. `tasks/backlog.md` has the detail.
 
     **Correlation detection is still the qualifier check.** `foreign_qualifier`
     finds a qualified reference naming nothing in the subquery's own FROM and

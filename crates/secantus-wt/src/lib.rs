@@ -72,6 +72,21 @@ impl WtError {
     pub fn is_rollback(&self) -> bool {
         self.code == sys::WT_ROLLBACK
     }
+    /// `ENOTSUP`: the operation is not supported in the session's current
+    /// state (e.g. `reset_snapshot` after the transaction has written).
+    /// WiredTiger returns the C library's `ENOTSUP`, whose number differs by
+    /// platform: 45 on macOS / the BSDs, 95 on Linux (glibc and musl), 129 in
+    /// MSVC's CRT.
+    pub fn is_not_supported(&self) -> bool {
+        let enotsup = if cfg!(windows) {
+            129
+        } else if cfg!(target_os = "linux") {
+            95
+        } else {
+            45
+        };
+        self.code == enotsup
+    }
 }
 
 impl std::fmt::Display for WtError {
@@ -216,6 +231,15 @@ impl Session {
     }
     pub fn rollback_transaction(&self, config: Option<&str>) -> Result<()> {
         self.txn(unsafe { (*self.ptr).rollback_transaction }, config)
+    }
+    /// `WT_SESSION::reset_snapshot`: give a snapshot transaction a fresh
+    /// snapshot. Refused (`ENOTSUP`) once the transaction has written.
+    pub fn reset_snapshot(&self) -> Result<()> {
+        let f = unsafe { (*self.ptr).reset_snapshot }.ok_or_else(|| WtError {
+            code: -1,
+            message: "reset_snapshot is not available".into(),
+        })?;
+        check(unsafe { f(self.ptr) })
     }
     pub fn checkpoint(&self, config: Option<&str>) -> Result<()> {
         self.txn(unsafe { (*self.ptr).checkpoint }, config)
