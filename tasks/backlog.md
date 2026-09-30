@@ -661,10 +661,10 @@ remain open:
         cast, a parameter, a built-in's result (by the overload its arguments
         select), CASE / COALESCE / GREATEST / LEAST / NULLIF, `||`, date and
         numeric arithmetic and a scalar subquery; an untyped literal compared
-        with one is coerced when analysed. An operand of any other shape (an
-        array subscript, a row constructor, a window result) is not checked,
-        and a cross-category comparison there still answers no rows rather
-        than 42883.
+        with one is coerced when analysed; since batch 14 also an array
+        subscript, a pair of row constructors and a window function's result
+        (`operand_shapes` corpus). An operand of any other shape (a record
+        field, a set-returning function's column) is not checked.
       - **Error positions** (`P`) come from the parse location where the
         raising site recorded one, and otherwise from the first token the
         message names. A name mentioned twice may point at the wrong
@@ -677,9 +677,6 @@ remain open:
         command takes 0.5 s alone and the test passes in 24 s. Not reproduced;
         the cause (what the nested collection blocked on) is unknown. If it
         recurs, capture the nested process's stack before the timeout kills it.
-      - `CREATE AGGREGATE`'s built-in state / final function signatures are
-        checked for the operator functions (`int4pl`, `numeric_add`,
-        `textcat`, ...); any other built-in is taken as declared.
 - [ ] **OPEN — RUST pgserver: what batch 11 (rules, event triggers, foreign
       data, CREATE CAST / COLLATION, pgcrypto PGP, ruleutils) leaves
       (2026-09-30).** Every statement batch 9 listed as refused now runs.
