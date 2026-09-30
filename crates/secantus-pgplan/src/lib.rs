@@ -6457,7 +6457,12 @@ fn plan_insert(
             })
             .collect::<Result<Vec<_>>>()?;
         let explicit = !i.cols.is_empty() && !items.is_empty();
-        let mut row = insert_row(&def, &targets, explicit, values)?;
+        let types: Vec<String> = items
+            .iter()
+            .zip(&values)
+            .map(|(e, v)| static_type(e, v))
+            .collect();
+        let mut row = insert_row_typed(&def, &targets, explicit, values, &types)?;
         for target in defaulted {
             if let Some(column) = def.column(target) {
                 let field = column.field();
@@ -6648,6 +6653,21 @@ pub fn insert_row(
     explicit_columns: bool,
     values: Vec<Bson>,
 ) -> Result<Document> {
+    insert_row_typed(def, targets, explicit_columns, values, &[])
+}
+
+/// `insert_row` knowing each value's static type. A range or multirange
+/// value that already IS the column's type is in its stored form -- a
+/// `tstzrange`'s bounds naive UTC -- so it is stored as it is: re-parsing it
+/// as input read those UTC bounds in the SESSION zone and stored an instant
+/// shifted by the zone's offset.
+pub fn insert_row_typed(
+    def: &TableDef,
+    targets: &[String],
+    explicit_columns: bool,
+    values: Vec<Bson>,
+    types: &[String],
+) -> Result<Document> {
     if values.len() > targets.len() {
         return Err(Error::Parse(
             "INSERT has more expressions than target columns".into(),
@@ -6659,15 +6679,22 @@ pub fn insert_row(
         ));
     }
     let mut d = Document::new();
-    for (col, value) in targets.iter().zip(values) {
+    for (i, (col, value)) in targets.iter().zip(values).enumerate() {
         let column = def
             .column(col)
             .ok_or_else(|| Error::UndefinedColumn(col.clone()))?;
+        let already_stored = types.get(i).is_some_and(|t| {
+            *t == column.pg_type && (range::is_range_type(t) || range::is_multirange_type(t))
+        });
         // PostgreSQL coerces an assigned value to the column's type, so
         // `INSERT INTO t(d) VALUES ('2026-9-1')` STORES `2026-09-01`.
         // Without this the literal went in verbatim and a client reading
         // the column back could not parse it as a date.
-        let value = fit_to_column(cast_value(value, &column.pg_type)?, column)?;
+        let value = if already_stored {
+            value
+        } else {
+            fit_to_column(cast_value(value, &column.pg_type)?, column)?
+        };
         // Resolves the hidden companion (setting or CLEARING it), so a
         // whole-millisecond write cannot inherit stale microseconds.
         let field = column.field();
@@ -16633,8 +16660,11 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                         .iter()
                         .map(|a| const_value(a, params))
                         .collect::<Result<Vec<_>>>()?;
-                    let value =
-                        range::render_multirange(&range::multirange_from_args(&args, &type_name)?);
+                    let types: Vec<String> =
+                        f.args.iter().zip(&args).map(|(a, v)| static_type(a, v)).collect();
+                    let value = range::render_multirange(&range::multirange_from_typed_args(
+                        &args, &types, &type_name,
+                    )?);
                     columns.push((
                         if rt.name.is_empty() {
                             name.clone()
@@ -19536,13 +19566,40 @@ pub fn apply_column_expr(expr: &ColumnExpr, value: Bson, tz: &TimeZoneSetting) -
             let mut prev: Option<&str> = match source.as_deref() {
                 Some("timestamptz") | Some("timestamp with time zone") => Some("timestamptz"),
                 Some(t @ ("int2vector" | "oidvector")) => Some(t),
+                Some(t) if range::is_range_type(t) || range::is_multirange_type(t) => Some(t),
                 _ => None,
             };
             for target in chain {
+                // A range cast to its multirange is the one-member multirange.
+                if let Some(r) = prev {
+                    if range::is_range_type(r)
+                        && range::multirange_member(target).as_deref() == Some(r)
+                    {
+                        v = range_to_multirange(v, target)?;
+                        prev = Some(target);
+                        continue;
+                    }
+                }
                 // timestamptz -> text renders the instant in the session zone.
                 if target == "text" && prev == Some("timestamptz") {
                     if let Some(t) = timestamptz_value_text(&v, tz) {
                         v = Bson::String(t);
+                        prev = Some(target);
+                        continue;
+                    }
+                }
+                // So do a stored tstzrange's / tstzmultirange's bounds, which
+                // the store keeps as naive UTC.
+                if matches!(target.as_str(), "text" | "varchar" | "name") {
+                    if let (Some(kind @ ("tstzrange" | "tstzmultirange")), Bson::String(t)) =
+                        (prev, &v)
+                    {
+                        let text = if kind == "tstzrange" {
+                            range::render_in_zone(t, tz)?
+                        } else {
+                            range::render_multirange_in_zone(t, tz)?
+                        };
+                        v = Bson::String(text);
                         prev = Some(target);
                         continue;
                     }
@@ -19626,6 +19683,20 @@ fn const_col_type(v: &Bson) -> &'static str {
 
 /// As `cast_text_to`, for a VALUE that is already typed -- the wire layer's
 /// door onto per-column cast chains (`oid::regtype::text`).
+/// `range::multirange` -- the multirange holding the one range (none, for
+/// `empty`).
+fn range_to_multirange(value: Bson, target: &str) -> Result<Bson> {
+    if value == Bson::Null {
+        return Ok(value);
+    }
+    let types = range::multirange_member(target)
+        .into_iter()
+        .collect::<Vec<_>>();
+    Ok(Bson::String(range::render_multirange(
+        &range::multirange_from_typed_args(&[value], &types, target)?,
+    )))
+}
+
 pub fn cast_value_with_tz(value: Bson, target: &str, tz: &TimeZoneSetting) -> Result<Bson> {
     let previous = PLAN_TIMEZONE.with(|t| t.replace(tz.clone()));
     let out = cast_value(value, target);
@@ -24872,6 +24943,12 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 Bson::Int64(bits::to_int(&text, 64)?)
             });
         }
+        // A range cast to its multirange is the one-member multirange.
+        if range::is_range_type(&source)
+            && range::multirange_member(&target).as_deref() == Some(source.as_str())
+        {
+            return range_to_multirange(value, &target);
+        }
         // `char(n)` to a text type drops the trailing blanks.
         let value = if matches!(target.as_str(), "text" | "varchar" | "name")
             && static_type(arg, &value) == "bpchar"
@@ -25238,8 +25315,14 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                     .iter()
                     .map(|a| const_value(a, params))
                     .collect::<Result<Vec<_>>>()?;
+                let types: Vec<String> = f
+                    .args
+                    .iter()
+                    .zip(&args)
+                    .map(|(a, v)| static_type(a, v))
+                    .collect();
                 return Ok(Bson::String(range::render_multirange(
-                    &range::multirange_from_args(&args, &type_name)?,
+                    &range::multirange_from_typed_args(&args, &types, &type_name)?,
                 )));
             }
             // `int4range(1,5)` and friends: a constructor named for its type.
@@ -26390,6 +26473,38 @@ fn timestamp_filter(field: &str, op: &str, value: &Bson) -> Option<Document> {
 
 /// `field <mql_op> value`, exact for a numeric column of either width, or the
 /// plain MQL form for anything else.
+/// A range comparison over a FLOAT column, where PostgreSQL and MQL disagree
+/// about NaN: PostgreSQL orders NaN ABOVE every number (`Infinity` included)
+/// and equal to itself, while an MQL range operator excludes NaN entirely.
+/// So `f > 1` must also match NaN, and `f < 'NaN'` matches every number.
+/// `None` for an operator MQL already answers the same way (`=` and `<>`
+/// treat NaN as equal to NaN in both).
+fn float_nan_filter(field: &str, mql_op: &str, value: &Bson) -> Option<Document> {
+    let nan = |v: &Bson| matches!(v, Bson::Double(d) if d.is_nan());
+    if !matches!(
+        value,
+        Bson::Double(_) | Bson::Int32(_) | Bson::Int64(_) | Bson::Decimal128(_)
+    ) {
+        return None;
+    }
+    // Any number that is not NaN (a range operator never matches NaN or NULL).
+    let any_number = || doc! { field: { "$gte": f64::NEG_INFINITY } };
+    let is_nan = || doc! { field: f64::NAN };
+    Some(match (mql_op, nan(value)) {
+        ("$gt" | "$gte", false) => doc! { "$or": [
+            doc! { field: { mql_op: value.clone() } },
+            is_nan(),
+        ]},
+        ("$lt" | "$lte", false) => return None,
+        // Nothing is above NaN.
+        ("$gt", true) => match_nothing(),
+        ("$gte", true) => is_nan(),
+        ("$lt", true) => any_number(),
+        ("$lte", true) => doc! { "$or": [any_number(), is_nan()] },
+        _ => return None,
+    })
+}
+
 fn scalar_filter(def: &TableDef, field: &str, mql_op: &str, value: Bson) -> Document {
     if is_timestamp_field(def, field) {
         if let Some(d) = timestamp_filter(field, mql_op, &value) {
@@ -26398,6 +26513,11 @@ fn scalar_filter(def: &TableDef, field: &str, mql_op: &str, value: Bson) -> Docu
     }
     if needs_numeric_filter(def, field, &value) {
         if let Some(d) = numeric::numeric_filter(field, mql_op, &value) {
+            return d;
+        }
+    }
+    if matches!(field_type(def, field), Some("float4" | "float8")) {
+        if let Some(d) = float_nan_filter(field, mql_op, &value) {
             return d;
         }
     }
@@ -26589,7 +26709,7 @@ fn lower_pattern_match(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Doc
     };
     let Bson::String(pattern) = rhs else {
         // A NULL pattern is NULL for every row, which is no rows.
-        return Ok(doc! { "__never__": Bson::Null, "$comment": "NULL pattern" });
+        return Ok(match_nothing());
     };
     let regex = if is_like {
         like_to_regex(&pattern, escape)?
@@ -27065,6 +27185,7 @@ fn lower_between(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document>
         });
     }
     if is_timestamp_field(def, &field)
+        || matches!(field_type(def, &field), Some("float4" | "float8"))
         || needs_numeric_filter(def, &field, &lo)
         || needs_numeric_filter(def, &field, &hi)
     {
