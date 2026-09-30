@@ -1945,10 +1945,7 @@ fn from_char_mode(input: &str, fmt: &str, strict: bool) -> Result<(NaiveDate, i6
                             pm = Some(rest.starts_with('P'));
                             i += 2;
                         } else {
-                            return Err(Error::InvalidDatetimeFormat(format!(
-                                "invalid value \"{rest}\" for \"{}\"",
-                                key_name(*k)
-                            )));
+                            return Err(not_allowed(&inp[i..], &key_name(*k)));
                         }
                     }
                     K::AD | K::BC | K::ad | K::bc | K::ADp | K::BCp | K::adp | K::bcp => {
@@ -1991,13 +1988,8 @@ fn from_char_mode(input: &str, fmt: &str, strict: bool) -> Result<(NaiveDate, i6
                                 }
                             }
                         }
-                        let (m, len) = found.ok_or_else(|| {
-                            Error::InvalidDatetimeFormat(format!(
-                                "invalid value \"{}\" for \"{}\"",
-                                inp[i..].iter().take(3).collect::<String>(),
-                                key_name(*k)
-                            ))
-                        })?;
+                        let (m, len) =
+                            found.ok_or_else(|| not_allowed(&inp[i..], &key_name(*k)))?;
                         mon = Some(m);
                         i += len;
                     }
@@ -2014,6 +2006,9 @@ fn from_char_mode(input: &str, fmt: &str, strict: bool) -> Result<(NaiveDate, i6
                             if rest.starts_with(&d[..3]) {
                                 len = 3;
                             }
+                        }
+                        if len == 0 {
+                            return Err(not_allowed(&inp[i..], &key_name(*k)));
                         }
                         i += len;
                     }
@@ -2155,7 +2150,7 @@ fn read_digits(inp: &[char], i: &mut usize, width: usize, fixed: bool, k: K) -> 
     if j == digits_start {
         let found: String = inp[start..].iter().take(width.max(1)).collect();
         return Err(Error::InvalidDatetimeFormat(format!(
-            "invalid value \"{found}\" for \"{}\"",
+            "invalid value \"{found}\" for \"{}\"\nDetail: Value must be an integer.",
             key_name(k)
         )));
     }
@@ -2526,4 +2521,13 @@ pub fn call(name: &str, args: &[Bson], types: &[String]) -> Option<Result<Bson>>
         }
         _ => return None,
     })
+}
+
+/// `from_char_seq_search`'s failure: the input as written, up to the next
+/// whitespace, and the field.
+fn not_allowed(rest: &[char], field: &str) -> Error {
+    let word: String = rest.iter().take_while(|c| !c.is_whitespace()).collect();
+    Error::InvalidDatetimeFormat(format!(
+        "invalid value \"{word}\" for \"{field}\"\nDetail: The given value did not match any of the allowed values for this field."
+    ))
 }

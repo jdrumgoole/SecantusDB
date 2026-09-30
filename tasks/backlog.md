@@ -828,17 +828,6 @@ remain open:
         deletion is detected at the next `COMMIT PREPARED` by the first minted
         seq being readable (`prepared_already_committed`), not by a commit
         record.
-- [ ] **OPEN — RUST pgserver: role membership and md5 passwords (password
-      verification landed 2026-09-29).** A role WITH a password now has to
-      prove it over SCRAM-SHA-256 (`secantus_auth::begin_scram_pg`), and a
-      NOLOGIN role is refused `28000`. A role with no password, and a user the
-      server has never heard of, are still trusted -- that is what every
-      fixture connecting as a password-less `postgres` relies on, and it is a
-      deliberate `pg_hba`-free policy, not PostgreSQL's (which would refuse an
-      unknown role `28000`). Left: an md5-hashed password (a client can store
-      one verbatim) cannot log in at all, since only SCRAM is spoken; `VALID
-      UNTIL` is recorded and not enforced; and role membership (`IN ROLE` /
-      `ROLE` / `ADMIN`) and `SYSID` are refused `0A000`.
 **Rust server errors where Python defers — MEASURED 2026-08-26, and the five
 entries describing it are largely stale.** A three-way probe of 45
 query / update / aggregate constructs against the standalone `secantusd-rs`
