@@ -469,6 +469,11 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
     if crate::arrays::is_array_function(name) {
         return crate::arrays::call(name, args);
     }
+    // Every other built-in sees an array's elements, not its lower bounds.
+    if args.iter().any(crate::arrays::is_bounded) {
+        let plain: Vec<Bson> = args.iter().map(crate::arrays::strip).collect();
+        return eval(name, &plain);
+    }
     if let Some(out) = crate::fts::call(name, args) {
         return out;
     }

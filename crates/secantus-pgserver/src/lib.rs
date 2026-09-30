@@ -524,6 +524,11 @@ impl PlHost<'_> {
         types: &[String],
     ) -> Result<Statement, plpgsql_fn::PlError> {
         let tz = self.h.session_timezone();
+        // A function body runs with the caller's privileges (SECURITY
+        // INVOKER, the default), checked like any statement of theirs.
+        self.h
+            .check_sql_privileges(sql)
+            .map_err(|e| pl_error(&e))?;
         let run = |stmt: &Statement| self.h.subquery_rows(stmt);
         let declared: Vec<Option<String>> = types.iter().map(|t| Some(t.clone())).collect();
         secantus_pgplan::planning_to_execute(|| {
@@ -1136,16 +1141,30 @@ impl PgHandler {
             .unwrap_or_else(|_| self.session_user_name())
     }
 
-    /// May the effective role use `privilege` on `table`? A superuser and the
-    /// owner (or a member of the owning role) may; anyone else needs a GRANT
-    /// to itself, a role it is in, or PUBLIC. 42501 otherwise.
-    fn check_table_privilege(&self, table: &str, privilege: &str) -> PgWireResult<()> {
-        let role = self.current_role_name();
+    /// May `role` use `privilege` on `table` -- a table, or (`kind` "view") a
+    /// view, whose owner is recorded on the view rather than a `TableDef`? A
+    /// superuser and the owner (or a member of the owning role) may; anyone
+    /// else needs a GRANT to itself, a role it is in, or PUBLIC. 42501
+    /// otherwise.
+    fn check_privilege_as(
+        &self,
+        role: &str,
+        table: &str,
+        privilege: &str,
+        kind: &str,
+    ) -> PgWireResult<()> {
+        let role = role.to_string();
         if self.is_superuser(&role) {
             return Ok(());
         }
-        let Some(def) = self.lookup(table) else {
-            return Ok(());
+        let owner = if kind == "view" {
+            self.view_owner(table)
+                .unwrap_or_else(|| self.session_user_name())
+        } else {
+            let Some(def) = self.lookup(table) else {
+                return Ok(());
+            };
+            self.table_owner(&def)
         };
         let member_of = |other: &str| -> bool {
             other == role
@@ -1157,7 +1176,7 @@ impl PgHandler {
                     ])
                     .is_ok_and(|b| b == Bson::Boolean(true))
         };
-        if member_of(&self.table_owner(&def)) {
+        if member_of(&owner) {
             return Ok(());
         }
         let granted = self
@@ -1182,7 +1201,7 @@ impl PgHandler {
         }
         Err(Self::user_error(
             "42501",
-            format!("permission denied for table {table}"),
+            format!("permission denied for {kind} {table}"),
         ))
     }
 
@@ -4959,6 +4978,59 @@ impl PgHandler {
         Ok(())
     }
 
+    /// The role that owns view `name`, when it is a view with one recorded.
+    fn view_owner(&self, name: &str) -> Option<String> {
+        self.type_catalog_docs(Self::VIEW_COLLECTION)
+            .ok()?
+            .iter()
+            .find(|d| d.get_str("view").or_else(|_| d.get_str("_id")) == Ok(name))
+            .and_then(|d| d.get_str("owner").ok().map(str::to_string))
+    }
+
+    /// Check the relations `sql` names against the effective role, as
+    /// PostgreSQL's executor does: a view is checked AS A VIEW for the
+    /// caller, and the relations its definition reads are checked for the
+    /// view's OWNER (so a view is a way to grant access to what it shows).
+    /// Read off the SQL rather than the plan, so a view is still a view and a
+    /// subquery -- correlated or not -- is still part of the statement.
+    fn check_sql_privileges(&self, sql: &str) -> PgWireResult<()> {
+        let role = self.current_role_name();
+        if self.is_superuser(&role) {
+            return Ok(());
+        }
+        let views = self.views()?;
+        let mut pending: Vec<(String, String, &'static str, usize)> =
+            secantus_pgplan::privileges::sql_relations(sql)
+                .into_iter()
+                .map(|(t, p)| (role.clone(), t, p, 0))
+                .collect();
+        while let Some((as_role, relation, privilege, depth)) = pending.pop() {
+            if self.is_superuser(&as_role) {
+                continue;
+            }
+            match views.iter().find(|(n, _)| *n == relation) {
+                Some((name, definition)) => {
+                    self.check_privilege_as(&as_role, name, privilege, "view")?;
+                    if depth < 16 {
+                        let owner = self
+                            .view_owner(name)
+                            .unwrap_or_else(|| self.session_user_name());
+                        for (t, _) in secantus_pgplan::privileges::sql_relations(definition) {
+                            pending.push((
+                                owner.clone(),
+                                t,
+                                privilege_through_view(privilege),
+                                depth + 1,
+                            ));
+                        }
+                    }
+                }
+                None => self.check_privilege_as(&as_role, &relation, privilege, "table")?,
+            }
+        }
+        Ok(())
+    }
+
     fn views(&self) -> PgWireResult<Vec<(String, String)>> {
         let mut out: Vec<(String, String)> = self
             .type_catalog_docs(Self::VIEW_COLLECTION)?
@@ -5524,11 +5596,16 @@ impl PgHandler {
         }
         self.ensure_collection(Self::VIEW_COLLECTION)?;
         let check = cv.check_option.as_deref().map_or(Bson::Null, Bson::from);
+        // The owner is whoever created it; `CREATE OR REPLACE` keeps it.
+        let owner = self
+            .view_owner(&name)
+            .unwrap_or_else(|| self.current_role_name());
         let doc = bson::doc! {
             "_id": &name,
             "view": &name,
             "definition": &cv.definition,
             "check_option": check,
+            "owner": owner,
         };
         if existing.is_some() {
             self.storage
@@ -12771,6 +12848,12 @@ impl PgHandler {
         // runs first there too, so `selct 1` still answers `42601`.
         let tz = self.session_timezone();
         self.install_user_types();
+        // Table privileges, read off the SQL before planning -- which runs
+        // uncorrelated subqueries and data-modifying CTEs, so it must not
+        // start before the check. An aborted block answers 25P02 instead.
+        if !self.txn_failed.load(std::sync::atomic::Ordering::Relaxed) {
+            self.check_sql_privileges(sql)?;
+        }
         // An uncorrelated subquery is RUN during planning and replaced by the
         // values it returned, so the lowering below never sees a `SubLink`.
         // The runner is this handler's own row reader, which is what gives the
@@ -15537,11 +15620,6 @@ impl PgHandler {
     fn execute_statement(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response>> {
         // Table privileges, for a role that is not a superuser: nothing to
         // look up in the common case.
-        if !self.is_superuser(&self.current_role_name()) {
-            for (table, privilege) in secantus_pgplan::privileges::statement_relations(&stmt) {
-                self.check_table_privilege(&table, privilege)?;
-            }
-        }
         // A READ ONLY transaction refuses every write, DDL included, with the
         // statement's own command name (`cannot execute INSERT in a read-only
         // transaction`). Checked here, where a statement run by another --
@@ -20688,6 +20766,22 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
         return enc.encode_field(&Some(x));
     }
 
+    // An array whose lower bound is not 1: the hand-built form, which is the
+    // only one that carries the bounds.
+    if secantus_pgplan::arrays::is_bounded(v) {
+        let elem = match ty.kind() {
+            postgres_types::Kind::Array(inner) => inner.clone(),
+            _ => wire_type(element_of_array_oid(ty.oid()).ok_or_else(|| bad("this value"))?),
+        };
+        let Bson::Array(items) = secantus_pgplan::arrays::strip(v) else {
+            return Err(bad("this value"));
+        };
+        let lower = secantus_pgplan::arrays::lower_bounds(v);
+        let binary =
+            array_binary_bounded(&items, &elem, &lower).ok_or_else(|| bad("this value"))?;
+        let text = secantus_pgplan::value_text(v);
+        return enc.encode_field(&RawField { binary, text });
+    }
     // Arrays: one element type for the whole array, so the element conversion
     // is chosen once rather than per element.
     let Bson::Array(items) = v else {
@@ -21423,6 +21517,12 @@ fn encode_value(enc: &mut DataRowEncoder, v: Option<&Bson>) -> PgWireResult<()> 
         // text would be the same trade in a less visible place.
         // A multidimensional array in the TEXT format: `value_text` already
         // renders the nesting as `{{1,2},{3,4}}`, which the client parses.
+        // An array whose lower bound is not 1 renders with its dimensions,
+        // `[0:1]={a,b}`.
+        // (Verbatim: a `str` would be re-quoted against the array type.)
+        Some(b) if secantus_pgplan::arrays::is_bounded(b) => {
+            enc.encode_field(&RawEncoded(secantus_pgplan::value_text(b).into_bytes()))
+        }
         Some(Bson::Array(items)) if items.iter().any(|x| matches!(x, Bson::Array(_))) => {
             let text = secantus_pgplan::value_text(&Bson::Array(items.clone()));
             enc.encode_field(&Some(text))
@@ -22692,11 +22792,12 @@ fn binary_array(
     if bytes.len() < 12 + 8 * ndim {
         return Err(unsupported_binary_oid(None));
     }
-    // Each dimension's length; the lower bound beside it is dropped (the
-    // parsed value carries none, as with the text form).
+    // Each dimension's length, and the lower bound beside it, which the
+    // value keeps (see `secantus_pgplan::arrays::bounded`).
     let dims: Vec<usize> = (0..ndim)
         .map(|d| usize::try_from(be32(12 + 8 * d).max(0)).unwrap_or(0))
         .collect();
+    let lower: Vec<i64> = (0..ndim).map(|d| i64::from(be32(16 + 8 * d))).collect();
     let count: usize = dims.iter().product();
     let mut pos = 12 + 8 * ndim;
     let mut flat = Vec::with_capacity(count);
@@ -22732,7 +22833,17 @@ fn binary_array(
             .map(|chunk| Bson::Array(chunk.to_vec()))
             .collect();
     }
-    Ok(Bson::Array(level))
+    Ok(secantus_pgplan::arrays::bounded(Bson::Array(level), &lower))
+}
+
+/// The privilege a view's owner needs on what the view reads, for a use of
+/// the view needing `privilege`: a write through an auto-updatable view is
+/// that write on its base table; anything else reads it.
+fn privilege_through_view(privilege: &'static str) -> &'static str {
+    match privilege {
+        "INSERT" | "UPDATE" | "DELETE" => privilege,
+        _ => "SELECT",
+    }
 }
 
 fn unsupported_binary_oid(oid: Option<u32>) -> PgWireError {
@@ -23021,6 +23132,11 @@ fn record_field_type(v: &Bson) -> Type {
 /// `None` if a leaf's element type has no binary encoder, or the nesting is
 /// ragged (mongod's stored values are rectangular, so this is a guard).
 fn array_binary(items: &[Bson], elem: &Type) -> Option<Vec<u8>> {
+    array_binary_bounded(items, elem, &[])
+}
+
+/// `array_binary` with each dimension's lower bound (missing ones 1).
+fn array_binary_bounded(items: &[Bson], elem: &Type, lower: &[i64]) -> Option<Vec<u8>> {
     // Dimension sizes: walk the first-element chain down to the leaves.
     // An empty array has NO dimensions (`array_send` writes ndim 0 and no
     // dimension pair), not one dimension of length zero.
@@ -23064,9 +23180,10 @@ fn array_binary(items: &[Bson], elem: &Type) -> Option<Vec<u8>> {
     out.extend_from_slice(&(ndims as i32).to_be_bytes());
     out.extend_from_slice(&i32::from(hasnull).to_be_bytes());
     out.extend_from_slice(&(elem.oid() as i32).to_be_bytes());
-    for d in &dims {
+    for (i, d) in dims.iter().enumerate() {
         out.extend_from_slice(&(*d as i32).to_be_bytes());
-        out.extend_from_slice(&1i32.to_be_bytes()); // lower bound is 1
+        let lb = lower.get(i).copied().unwrap_or(1);
+        out.extend_from_slice(&i32::try_from(lb).unwrap_or(1).to_be_bytes());
     }
     for leaf in &flat {
         match leaf {

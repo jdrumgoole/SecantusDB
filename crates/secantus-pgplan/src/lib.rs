@@ -2191,6 +2191,10 @@ fn array_subscript(
             }
         }
     }
+    // An array whose lower bound is not 1 is subscripted relative to it: each
+    // dimension's subscripts move by that dimension's bound.
+    let lower = arrays::lower_bounds(&value);
+    let value = arrays::strip(&value);
     if !matches!(value, Bson::Array(_)) {
         return Err(Error::DatatypeMismatch(format!(
             "cannot subscript type {} because it does not support subscripting",
@@ -2202,24 +2206,25 @@ fn array_subscript(
         static_type(arg, &value).as_str(),
         "int2vector" | "oidvector"
     ));
-    let bound = |n: Option<&pg_query::protobuf::Node>| -> Result<Option<i64>> {
+    let bound = |n: Option<&pg_query::protobuf::Node>, dim: usize| -> Result<Option<i64>> {
         let Some(n) = n else { return Ok(None) };
+        let rebase = 1 - lower.get(dim).copied().unwrap_or(1);
         Ok(match const_value(n, params)? {
             Bson::Null => None,
-            v => Some(arrays::subscript_index(&v)? + shift),
+            v => Some(arrays::subscript_index(&v)? + shift + rebase),
         })
     };
     let mut subs = Vec::with_capacity(indirection.len());
     let mut any_slice = false;
-    for ind in indirection {
+    for (dim, ind) in indirection.iter().enumerate() {
         let Some(N::AIndices(idx)) = ind.node.as_ref() else {
             return Err(Error::Unsupported("this field selection".into()));
         };
         any_slice |= idx.is_slice;
         subs.push((
             idx.is_slice,
-            bound(idx.lidx.as_deref())?,
-            bound(idx.uidx.as_deref())?,
+            bound(idx.lidx.as_deref(), dim)?,
+            bound(idx.uidx.as_deref(), dim)?,
         ));
     }
     if !any_slice {
@@ -7711,7 +7716,7 @@ fn srf_rows(
                 let mut types = Vec::new();
                 let mut lists = Vec::new();
                 for a in &call.args {
-                    let value = const_value(a, params)?;
+                    let value = arrays::strip(&const_value(a, params)?);
                     let element = static_type(a, &value)
                         .strip_suffix("[]")
                         .map(str::to_owned)
@@ -7735,7 +7740,7 @@ fn srf_rows(
                     .collect();
                 return Ok(Some((columns, types, rows)));
             }
-            let value = const_value(&call.args[0], params)?;
+            let value = arrays::strip(&const_value(&call.args[0], params)?);
             let element = static_type(&call.args[0], &value)
                 .strip_suffix("[]")
                 .map(str::to_owned)
@@ -7751,16 +7756,20 @@ fn srf_rows(
         }
         "generate_subscripts" => {
             let a = args(2)?;
-            let dims = arrays::dim_lengths(&a[0]);
+            let lower = arrays::lower_bounds(&a[0]);
+            let dims = arrays::dim_lengths(&arrays::strip(&a[0]));
             let dim = match &a[1] {
                 Bson::Int32(i) => i64::from(*i),
                 Bson::Int64(i) => *i,
                 _ => return Ok(Some(one(Vec::new(), "int4"))),
             };
             let values = match usize::try_from(dim).ok().filter(|d| *d >= 1) {
-                Some(d) if d <= dims.len() => (1..=dims[d - 1])
-                    .map(|i| Bson::Int32(i32::try_from(i).unwrap_or(i32::MAX)))
-                    .collect(),
+                Some(d) if d <= dims.len() => {
+                    let lb = lower.get(d - 1).copied().unwrap_or(1);
+                    (0..dims[d - 1] as i64)
+                        .map(|i| Bson::Int32(i32::try_from(lb + i).unwrap_or(i32::MAX)))
+                        .collect()
+                }
                 _ => Vec::new(),
             };
             one(values, "int4")
@@ -14596,6 +14605,7 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
                         | "array_prepend"
                         | "array_remove"
                         | "array_replace"
+                        | "trim_array"
                 )
             ) =>
         {
@@ -15363,6 +15373,7 @@ pub(crate) fn inferred_type(v: &Bson) -> &'static str {
         Bson::Document(d) if d.contains_key(WIDE_NUMERIC_KEY) => "numeric",
         Bson::Document(d) if d.len() == 1 && d.contains_key(REGCLASS_KEY) => "regclass",
         other if regobj::from_bson(other).is_some() => regobj::from_bson(other).expect("checked").0,
+        other if arrays::is_bounded(other) => inferred_type(&arrays::strip(other)),
         // A MULTIDIMENSIONAL array is the same array type as its elements --
         // `int4[]` (oid 1007), never `int4[][]`, which is no type at all.
         // Recursing is what makes that so: reading only the first element's
@@ -19847,25 +19858,33 @@ fn parse_array(text: &str, element_type: &str) -> Result<Bson> {
         delim: pgtypes::typdelim(element_type),
     };
     p.skip_space();
-    // An optional dimension decoration, `[lo:hi]...=`, which PostgreSQL checks
-    // against the contents and otherwise discards -- the parsed value carries
-    // no lower bounds. A wrong bound count is the same 22P02 as any other
-    // malformed literal.
+    // An optional dimension decoration, `[lo:hi]...=` (`[hi]` alone means
+    // `[1:hi]`), checked against the contents and kept as the value's lower
+    // bounds. A wrong bound count is the same 22P02 as any other malformed
+    // literal; bounds in the wrong order are PostgreSQL's own 2202E.
     let mut declared: Vec<usize> = Vec::new();
+    let mut lower: Vec<i64> = Vec::new();
     while p.peek() == Some('[') {
         p.pos += 1;
-        let lo = p.take_int().ok_or_else(malformed)?;
-        let hi = if p.peek() == Some(':') {
+        let first = p.take_int().ok_or_else(malformed)?;
+        let (lo, hi) = if p.peek() == Some(':') {
             p.pos += 1;
-            p.take_int().ok_or_else(malformed)?
+            (first, p.take_int().ok_or_else(malformed)?)
         } else {
-            lo
+            (1, first)
         };
-        if p.peek() != Some(']') || hi < lo {
+        if p.peek() != Some(']') {
             return Err(malformed());
+        }
+        if hi < lo {
+            return Err(Error::Sqlstate(
+                "2202E",
+                "upper bound cannot be less than lower bound".into(),
+            ));
         }
         p.pos += 1;
         declared.push(usize::try_from(hi - lo + 1).map_err(|_| malformed())?);
+        lower.push(lo);
     }
     if !declared.is_empty() {
         p.skip_space();
@@ -19895,7 +19914,7 @@ fn parse_array(text: &str, element_type: &str) -> Result<Bson> {
     if !declared.is_empty() && array_dims(&items) != declared {
         return Err(malformed());
     }
-    Ok(Bson::Array(items))
+    Ok(arrays::bounded(Bson::Array(items), &lower))
 }
 
 /// The lengths of a (rectangular) array along each dimension, outermost first.
@@ -20123,6 +20142,23 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
     // A NULL survives every cast; only its declared type changes.
     if value == Bson::Null {
         return Ok(Bson::Null);
+    }
+    // An array whose lower bound is not 1: an array cast keeps the bounds, a
+    // text cast shows them (`[0:1]={a,b}`), anything else sees the elements.
+    if arrays::is_bounded(&value) {
+        let plain = arrays::strip(&value);
+        if target.ends_with("[]") {
+            let lower = arrays::lower_bounds(&value);
+            return Ok(arrays::bounded(cast_value_inner(plain, target)?, &lower));
+        }
+        if matches!(target, "text" | "varchar" | "bpchar" | "name") {
+            return Ok(Bson::String(format!(
+                "{}={}",
+                arrays::dims_text(&value).unwrap_or_default(),
+                value_text(&plain)
+            )));
+        }
+        return cast_value_inner(plain, target);
     }
     // A bit string from text: validated, never fitted (the caller fits it --
     // an explicit cast pads, an assignment refuses).
@@ -21766,6 +21802,9 @@ fn datetime_call(
         .zip(&args)
         .map(|(a, v)| static_type(a, v))
         .collect();
+    // None of these has a use for an array's lower bounds: `to_json` of
+    // `[0:1]={a,b}` is `["a","b"]`.
+    let args: Vec<Bson> = args.iter().map(arrays::strip).collect();
     if jsonfn::result_type(name).is_some() {
         return Some(jsonfn::call(name, &args, &types));
     }
@@ -22040,6 +22079,43 @@ fn coerce_unknown_operand(
 /// an N-dimensional array takes an (N-1)-dimensional one as a new last (or
 /// first) slice, which is how `element || array` and `array || element` are
 /// the same rule with N = 1; a NULL or empty side yields the other.
+/// An operator with an array whose lower bound is not 1 on either side.
+///
+/// `||` keeps the bounds as `array_cat` / `array_append` / `array_prepend` do.
+/// A comparison compares the ELEMENTS first and only then the bounds (with
+/// equal elements, `'[0:1]={a,b}' < '{a,b}'`), so two arrays that differ
+/// only in their bounds are not equal -- PostgreSQL's `array_cmp`. Every other
+/// operator (containment, overlap) has no use for the bounds.
+fn eval_binary_bounded(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
+    let arrayish = |v: &Bson| matches!(v, Bson::Array(_)) || arrays::is_bounded(v);
+    if op == "||" {
+        let (name, args) = match (arrayish(&lhs), arrayish(&rhs)) {
+            (true, true) => ("array_cat", [lhs, rhs]),
+            (true, false) => ("array_append", [lhs, rhs]),
+            _ => ("array_prepend", [lhs, rhs]),
+        };
+        return arrays::call(name, &args);
+    }
+    let (pl, pr) = (arrays::strip(&lhs), arrays::strip(&rhs));
+    if matches!(op, "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") && arrayish(&lhs) && arrayish(&rhs)
+    {
+        if eval_binary("=", pl.clone(), pr.clone())? != Bson::Boolean(true) {
+            return eval_binary(op, pl, pr);
+        }
+        let ord = arrays::lower_bounds(&lhs).cmp(&arrays::lower_bounds(&rhs));
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        return Ok(Bson::Boolean(match op {
+            "=" => ord == Equal,
+            "<>" | "!=" => ord != Equal,
+            "<" => ord == Less,
+            "<=" => ord != Greater,
+            ">" => ord == Greater,
+            _ => ord != Less,
+        }));
+    }
+    eval_binary(op, pl, pr)
+}
+
 fn array_concat(lhs: Bson, rhs: Bson) -> Result<Bson> {
     fn ndim(v: &Bson) -> usize {
         match v {
@@ -22105,6 +22181,9 @@ fn is_time_text(v: &Bson) -> bool {
 }
 
 fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
+    if arrays::is_bounded(&lhs) || arrays::is_bounded(&rhs) {
+        return eval_binary_bounded(op, lhs, rhs);
+    }
     // Array concatenation is `array_cat`, which is NOT strict: a NULL beside
     // an array is the array. So it goes before the NULL propagation below.
     if op == "||" && (matches!(lhs, Bson::Array(_)) || matches!(rhs, Bson::Array(_))) {
@@ -23299,11 +23378,9 @@ pub fn update_row_sets(upd: &Update, row: &Document) -> Result<(Document, Vec<St
 /// Plan one `SET a[...] = v`.
 ///
 /// Every subscript is planned as an expression over the row, because `a[n]`
-/// may name a column. A subscript BELOW 1 is refused: PostgreSQL answers it by
-/// moving the array's lower bound (`UPDATE ... SET ia[0] = 0` leaves an
-/// `[0:5]={...}`), and this server does not model lower bounds -- see the
-/// `arrays` module header. Refusing is the honest answer; re-basing to 1 would
-/// silently shift every other subscript into the array.
+/// may name a column. A subscript below the array's lower bound moves the
+/// bound (`UPDATE ... SET ia[0] = 0` leaves an `[0:5]={...}`), as in
+/// PostgreSQL -- see `apply_subscript_assign`.
 #[allow(clippy::too_many_arguments)]
 fn plan_subscript_assign(
     column: &secantus_pgcatalog::Column,
@@ -23377,28 +23454,53 @@ fn apply_subscript_assign(a: &SubscriptAssign, row: &Document, current: Bson) ->
     let value = cast_value(apply_row_expr(&a.value, row)?, &a.value_type)?;
     let index = |e: &ColumnExpr| -> Result<i64> {
         let i = arrays::subscript_index(&apply_row_expr(e, row)?)?;
-        if i < 1 {
-            return Err(Error::Unsupported(
-                "UPDATE of an array element below subscript 1".into(),
-            ));
-        }
         // A subscript past the end EXTENDS the array, so the subscript is the
         // size being asked for -- `SET a[1000000000] = 1` is a one-line
         // statement that would otherwise allocate a billion slots.
-        arrays::check_array_size(i)?;
+        arrays::check_array_size(i.abs())?;
         Ok(i)
     };
+    // The array as its elements and each dimension's lower bound; a NULL
+    // column is an empty array, which takes whatever bound it is given.
+    let lower = arrays::lower_bounds(&current);
+    let items = match arrays::strip(&current) {
+        Bson::Array(items) => items,
+        _ => Vec::new(),
+    };
+    let one_dim = arrays::dim_lengths(&Bson::Array(items.clone())).len() <= 1;
+    // One dimension: the assignment may reach BELOW the lower bound as well as
+    // past the upper one, and either way the array grows to meet it, the gap
+    // NULL-filled -- `SET a[0] = 9` over `{1,2}` is `[0:2]={9,1,2}`.
+    let place_range = |lo: i64, hi: i64, source: &[Bson]| -> Result<Bson> {
+        let (mut lb, mut out) = (lower.first().copied().unwrap_or(1), items.clone());
+        if out.is_empty() {
+            lb = lo;
+        }
+        if lo < lb {
+            let grow = (lb - lo) as usize;
+            let mut front = vec![Bson::Null; grow];
+            front.extend(out);
+            out = front;
+            lb = lo;
+        }
+        let needed = (hi - lb + 1).max(0) as usize;
+        arrays::check_array_size(needed as i64)?;
+        if out.len() < needed {
+            out.resize(needed, Bson::Null);
+        }
+        for (n, slot) in (lo..=hi).enumerate() {
+            out[(slot - lb) as usize] = source[n].clone();
+        }
+        Ok(arrays::bounded(Bson::Array(out), &[lb]))
+    };
     if let [SubscriptTarget::Slice(lo, hi)] = a.subs.as_slice() {
-        let items = match &current {
-            Bson::Array(items) => items.clone(),
-            _ => Vec::new(),
-        };
-        let lo = lo.as_ref().map(&index).transpose()?.unwrap_or(1);
+        let lb = lower.first().copied().unwrap_or(1);
+        let lo = lo.as_ref().map(&index).transpose()?.unwrap_or(lb);
         let hi = match hi.as_ref().map(&index).transpose()? {
             Some(h) => h,
-            None => items.len() as i64,
+            None => lb + items.len() as i64 - 1,
         };
-        let Bson::Array(source) = &value else {
+        let Bson::Array(source) = arrays::strip(&value) else {
             // A NULL source for a slice is PostgreSQL's own error rather than
             // a no-op: there is nothing to copy into the range.
             return Err(Error::DataException("source array too small".into()));
@@ -23407,17 +23509,29 @@ fn apply_subscript_assign(a: &SubscriptAssign, row: &Document, current: Bson) ->
         if source.len() < width {
             return Err(Error::DataException("source array too small".into()));
         }
-        let mut out = items;
-        out.resize(out.len().max(hi.max(0) as usize), Bson::Null);
-        for (n, slot) in (lo..=hi).enumerate() {
-            out[slot as usize - 1] = source[n].clone();
+        if width == 0 {
+            return Ok(current);
         }
-        return Ok(Bson::Array(out));
+        return place_range(lo, hi, &source);
     }
+    if let ([SubscriptTarget::Index(e)], true) = (a.subs.as_slice(), one_dim) {
+        let i = index(e)?;
+        return place_range(i, i, std::slice::from_ref(&value));
+    }
+    // Several dimensions: each subscript is relative to its dimension's lower
+    // bound, and one below it is refused by name rather than re-based.
     let mut path = Vec::with_capacity(a.subs.len());
-    for sub in &a.subs {
+    for (dim, sub) in a.subs.iter().enumerate() {
         match sub {
-            SubscriptTarget::Index(e) => path.push(index(e)?),
+            SubscriptTarget::Index(e) => {
+                let rebased = index(e)? - lower.get(dim).copied().unwrap_or(1) + 1;
+                if rebased < 1 {
+                    return Err(Error::Unsupported(
+                        "UPDATE of a multidimensional array element below its lower bound".into(),
+                    ));
+                }
+                path.push(rebased);
+            }
             SubscriptTarget::Slice(..) => {
                 return Err(Error::Unsupported(
                     "UPDATE of a slice of a multidimensional array".into(),
@@ -23440,7 +23554,7 @@ fn apply_subscript_assign(a: &SubscriptAssign, row: &Document, current: Bson) ->
         items[slot] = place(&items[slot].clone(), rest, value);
         Bson::Array(items)
     }
-    Ok(place(&current, &path, value))
+    Ok(arrays::bounded(place(&Bson::Array(items), &path, value), &lower))
 }
 
 /// Whether `node` reads a column anywhere beneath it.
@@ -24661,7 +24775,7 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                     .ok_or_else(|| Error::Parse("ANY/ALL with no array operand".into()))?,
                 params,
             )?;
-            return eval_scalar_array_const(&op, lhs, rhs, is_any);
+            return eval_scalar_array_const(&op, lhs, arrays::strip(&rhs), is_any);
         }
         // `LIKE` / `ILIKE` as a VALUE (`select a like 'a%'`), not just as a
         // WHERE predicate. Their own AExpr kind, so they never reached the
@@ -25373,6 +25487,9 @@ fn coerce_to_column(def: &TableDef, field: &str, value: Bson) -> Result<Bson> {
             ty @ ("int2" | "int4" | "int8" | "numeric" | "float4" | "float8" | "bool" | "timestamp"
             | "timestamptz" | "interval" | "oid"),
         ) => cast_value(value, ty),
+        // An array column: the literal is that array type, bounds and all --
+        // `a = '[0:1]={5,6}'` must compare the lower bound too.
+        Some(ty) if ty.ends_with("[]") => cast_value(value, ty),
         _ => Ok(value),
     }
 }
@@ -25862,7 +25979,7 @@ fn coerce_any_array(rhs: Bson, element_type: &str) -> Bson {
     if let Bson::String(s) = &rhs {
         if s.starts_with('{') {
             if let Ok(arr) = parse_array(s, element_type) {
-                return arr;
+                return arrays::strip(&arr);
             }
         }
     }

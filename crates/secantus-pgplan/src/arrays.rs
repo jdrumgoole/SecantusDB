@@ -5,14 +5,15 @@
 //! — every element of a dimension has the same length — so the shape is read
 //! off the first element at each level and needs no per-element check.
 //!
-//! **Lower bounds are not modelled.** Every array here starts at subscript 1,
-//! which is what every array a client can build with `ARRAY[...]`, a literal,
-//! or a column read does. The one constructor that can produce another lower
-//! bound — `array_fill(v, dims, lbounds)` — is REFUSED when the bounds are not
-//! all 1 rather than answered with an array whose subscripts would then lie:
-//! PostgreSQL renders such an array as `[3:4]={7,7}` in text format and
-//! answers `(array_fill(7,ARRAY[2],ARRAY[3]))[3]` as `7`, and a server that
-//! silently re-based it to 1 would disagree with both.
+//! **Lower bounds.** Nearly every array starts at subscript 1 and is a plain
+//! `Bson::Array`. One that does not -- a `'[0:1]={a,b}'` literal,
+//! `array_fill(v, dims, lbounds)`, an assignment below or past its bounds --
+//! is a tagged document (`bounded`) carrying a lower bound per dimension, so
+//! its text form (`[3:4]={7,7}`), its subscripts, `array_lower` /
+//! `array_dims` and equality all agree with PostgreSQL. Functions that have
+//! no use for the bounds see the plain array (`strip`); the ones that keep
+//! them -- `array_append`, `array_cat`, `array_prepend` and friends -- put
+//! them back on their result, as PostgreSQL does.
 //!
 //! Two equality rules live here, and they are NOT the same one — measured on
 //! PostgreSQL 14.13, because the difference is the kind of thing a reader
@@ -46,6 +47,7 @@ pub const ARRAY_NAMES: &[&str] = &[
     "array_remove",
     "array_replace",
     "array_fill",
+    "trim_array",
 ];
 
 /// Is this one of the array built-ins?
@@ -230,6 +232,143 @@ pub fn slice(v: &Bson, bounds: &[(Option<i64>, Option<i64>)]) -> Option<Bson> {
 /// ones do: `array_cat(NULL, ARRAY[3])` is `{3}`, `array_remove(NULL, 1)` is
 /// NULL, and `array_position(a, NULL)` searches for the NULL.
 pub fn call(name: &str, args: &[Bson]) -> Result<Bson> {
+    // `array_cat(arr, '{3}')`: an untyped literal beside an array takes that
+    // array's type, as PostgreSQL resolves the `anyarray` pair.
+    if name == "array_cat" && args.len() == 2 {
+        let literal = |v: &Bson| matches!(v, Bson::String(t) if t.trim_start().starts_with(['{', '[']));
+        let typed = |v: &Bson| matches!(v, Bson::Array(_)) || is_bounded(v);
+        let coerce = |lit: &Bson, other: &Bson| -> Result<Bson> {
+            crate::cast_value(lit.clone(), crate::inferred_type(other))
+        };
+        if literal(&args[1]) && typed(&args[0]) {
+            return call(name, &[args[0].clone(), coerce(&args[1], &args[0])?]);
+        }
+        if literal(&args[0]) && typed(&args[1]) {
+            return call(name, &[coerce(&args[0], &args[1])?, args[1].clone()]);
+        }
+    }
+    if name != "array_fill" && !args.iter().any(is_bounded) {
+        return call_plain(name, args);
+    }
+    let plain: Vec<Bson> = args.iter().map(strip).collect();
+    let first_lbs = || lower_bounds(args.first().unwrap_or(&Bson::Null));
+    match name {
+        "array_lower" | "array_upper" => {
+            let len = call_plain("array_length", &plain)?;
+            let Bson::Int32(len) = len else { return Ok(len) };
+            let d = as_i64(&plain[1]).unwrap_or(1) as usize;
+            let lb = first_lbs().get(d - 1).copied().unwrap_or(1);
+            let v = if name == "array_lower" { lb } else { lb + i64::from(len) - 1 };
+            Ok(Bson::Int32(i32::try_from(v).unwrap_or(i32::MAX)))
+        }
+        "array_dims" => Ok(dims_text(&args[0]).map_or(Bson::Null, Bson::String)),
+        "array_append" | "array_remove" | "array_replace" => {
+            Ok(bounded(call_plain(name, &plain)?, &first_lbs()))
+        }
+        "array_cat" => {
+            let lbs = if strip(&args[0]).as_array().is_some_and(|a| !a.is_empty()) {
+                first_lbs()
+            } else {
+                lower_bounds(&args[1])
+            };
+            Ok(bounded(call_plain(name, &plain)?, &lbs))
+        }
+        // The new first element takes the array's lower bound (measured:
+        // `array_prepend('z', '[0:1]={a,b}')` is `[0:2]={z,a,b}`).
+        "array_prepend" => Ok(bounded(call_plain(name, &plain)?, &lower_bounds(&args[1]))),
+        "array_position" | "array_positions" => {
+            // Positions are SUBSCRIPTS, so they move with the lower bound --
+            // and so does `array_position`'s optional starting subscript.
+            let shift = first_lbs().first().copied().unwrap_or(1) - 1;
+            let mut plain = plain;
+            if let Some(start) = plain.get_mut(2) {
+                if let Some(n) = as_i64(start) {
+                    *start = Bson::Int64(n - shift);
+                }
+            }
+            let move_by = |v: Bson| match v {
+                Bson::Int32(n) => Bson::Int32(n + shift as i32),
+                Bson::Int64(n) => Bson::Int64(n + shift),
+                other => other,
+            };
+            Ok(match call_plain(name, &plain)? {
+                Bson::Array(items) => Bson::Array(items.into_iter().map(move_by).collect()),
+                other => move_by(other),
+            })
+        }
+        "array_fill" => array_fill(name, &plain),
+        _ => call_plain(name, &plain),
+    }
+}
+
+/// The document keys of an array whose lower bound is not 1 (see
+/// `bounded`). PostgreSQL stores a lower bound per dimension; an array whose
+/// bounds are all 1 -- nearly every array -- stays a plain `Bson::Array`.
+pub const LB_KEY: &str = "__arr_lb";
+pub const ITEMS_KEY: &str = "__arr";
+
+/// `v` with lower bounds `lbs` (one per dimension, missing ones 1). A plain
+/// array when every bound is 1 or the array is empty.
+pub fn bounded(v: Bson, lbs: &[i64]) -> Bson {
+    let Bson::Array(items) = v else { return v };
+    if items.is_empty() || lbs.iter().all(|l| *l == 1) {
+        return Bson::Array(items);
+    }
+    let ndims = dim_lengths(&Bson::Array(items.clone())).len().max(1);
+    let mut lbs = lbs.to_vec();
+    lbs.resize(ndims, 1);
+    let mut d = bson::Document::new();
+    d.insert(LB_KEY, Bson::Array(lbs.into_iter().map(Bson::Int64).collect()));
+    d.insert(ITEMS_KEY, Bson::Array(items));
+    Bson::Document(d)
+}
+
+/// Is `v` an array with a lower bound other than 1?
+pub fn is_bounded(v: &Bson) -> bool {
+    matches!(v, Bson::Document(d) if d.len() == 2 && d.contains_key(LB_KEY) && d.contains_key(ITEMS_KEY))
+}
+
+/// `v` as a plain array, its bounds dropped (anything else unchanged).
+pub fn strip(v: &Bson) -> Bson {
+    match v {
+        Bson::Document(d) if is_bounded(v) => d.get(ITEMS_KEY).cloned().unwrap_or(Bson::Null),
+        other => other.clone(),
+    }
+}
+
+/// The lower bound of each dimension of `v` (empty for a non-array).
+pub fn lower_bounds(v: &Bson) -> Vec<i64> {
+    match v {
+        Bson::Document(d) if is_bounded(v) => d
+            .get_array(LB_KEY)
+            .map(|a| a.iter().filter_map(as_i64).collect())
+            .unwrap_or_default(),
+        Bson::Array(_) => vec![1; dim_lengths(v).len()],
+        _ => Vec::new(),
+    }
+}
+
+/// `[lb:ub]` per dimension, as `array_dims` and a bounded array's text
+/// form show it; `None` for an empty array or a non-array.
+pub fn dims_text(v: &Bson) -> Option<String> {
+    let plain = strip(v);
+    let dims = dim_lengths(&plain);
+    if !matches!(plain, Bson::Array(_)) || dims.is_empty() {
+        return None;
+    }
+    let lbs = lower_bounds(v);
+    Some(
+        dims.iter()
+            .enumerate()
+            .map(|(i, n)| {
+                let lb = lbs.get(i).copied().unwrap_or(1);
+                format!("[{lb}:{}]", lb + *n as i64 - 1)
+            })
+            .collect(),
+    )
+}
+
+fn call_plain(name: &str, args: &[Bson]) -> Result<Bson> {
     let arg = |i: usize| args.get(i).cloned().unwrap_or(Bson::Null);
     match name {
         "array_length" | "array_upper" | "array_lower" => {
@@ -361,6 +500,26 @@ pub fn call(name: &str, args: &[Bson]) -> Result<Bson> {
             append(name, &arg(1), &arg(0), true)
         }
         "array_fill" => array_fill(name, args),
+        "trim_array" => {
+            if args.len() != 2 {
+                return Err(wrong_args(name));
+            }
+            if args.iter().any(|a| a == &Bson::Null) {
+                return Ok(Bson::Null);
+            }
+            let items = need_array(name, &args[0])?;
+            let n = as_i64(&args[1]).unwrap_or(-1);
+            if n < 0 || n > items.len() as i64 {
+                return Err(Error::Sqlstate(
+                    "2202E",
+                    format!(
+                        "number of elements to trim must be between 0 and {}",
+                        items.len()
+                    ),
+                ));
+            }
+            Ok(Bson::Array(items[..items.len() - n as usize].to_vec()))
+        }
         _ => Err(wrong_args(name)),
     }
 }
@@ -582,10 +741,8 @@ fn append(name: &str, arr: &Bson, elem: &Bson, prepend: bool) -> Result<Bson> {
 
 /// `array_fill(value, dims [, lbounds])`.
 ///
-/// The `lbounds` argument is REFUSED unless every bound is 1 — see this
-/// module's header: the value would be right and every subscript into it
-/// wrong, which is the silent kind of divergence this project refuses to
-/// ship. A NULL `dims` is PostgreSQL's own 22004, not a NULL result.
+/// `lbounds` gives each dimension's lower bound (see `bounded`). A NULL
+/// `dims` is PostgreSQL's own 22004, not a NULL result.
 fn array_fill(name: &str, args: &[Bson]) -> Result<Bson> {
     if args.len() < 2 || args.len() > 3 {
         return Err(wrong_args(name));
@@ -599,13 +756,12 @@ fn array_fill(name: &str, args: &[Bson]) -> Result<Bson> {
         if *lb == Bson::Null {
             return Err(null_bound());
         }
-        let bounds = need_array(name, lb)?;
-        if bounds.iter().any(|b| as_i64(b) != Some(1)) {
-            return Err(Error::Unsupported(
-                "array_fill() with a lower bound other than 1".into(),
-            ));
-        }
+        need_array(name, lb)?;
     }
+    let lbs: Vec<i64> = match args.get(2) {
+        Some(lb) => need_array(name, lb)?.iter().map(|b| as_i64(b).unwrap_or(1)).collect(),
+        None => Vec::new(),
+    };
     let dims: Vec<i64> = need_array(name, &args[1])?
         .iter()
         .map(|d| as_i64(d).unwrap_or(0))
@@ -626,7 +782,7 @@ fn array_fill(name: &str, args: &[Bson]) -> Result<Bson> {
     }
     // `array_fill(v, ARRAY[])` — no dimensions at all — is still an array.
     Ok(match out {
-        Bson::Array(_) => out,
+        Bson::Array(_) => bounded(out, &lbs),
         scalar => Bson::Array(vec![scalar]),
     })
 }
