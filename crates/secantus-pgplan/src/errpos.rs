@@ -1,0 +1,136 @@
+//! The `P` (position) field of an error: the 1-based character offset of the
+//! token PostgreSQL's error cursor points at (`LINE 1: select nocol ...`
+//! with a caret under `nocol`).
+//!
+//! PostgreSQL knows the token from the parse tree node the error is about.
+//! A raising site here that has the node records its location
+//! (`set_error_location`); otherwise the token is found in the statement's
+//! own tokens from what the message names -- the column, the function, the
+//! literal -- which is the same token PostgreSQL points at whenever the name
+//! occurs once, and its first mention otherwise.
+
+use super::*;
+
+struct Tok<'a> {
+    start: usize,
+    text: &'a str,
+}
+
+fn unquote_ident(text: &str) -> String {
+    match text.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+        Some(inner) => inner.replace("\"\"", "\""),
+        None => text.to_ascii_lowercase(),
+    }
+}
+
+fn quoted_between<'a>(m: &'a str, prefix: &str) -> Option<&'a str> {
+    let rest = m.strip_prefix(prefix)?;
+    let rest = rest.strip_prefix('"')?;
+    rest.split_once('"').map(|(name, _)| name)
+}
+
+/// The position in `sql` of an error with this SQLSTATE and primary
+/// message, when it can be found.
+pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize> {
+    let location = take_error_location();
+    let scanned = pg_query::scan(sql).ok()?;
+    let toks: Vec<Tok> = scanned
+        .tokens
+        .iter()
+        .filter_map(|t| {
+            let (s, e) = (t.start as usize, t.end as usize);
+            Some(Tok {
+                start: s,
+                text: sql.get(s..e)?,
+            })
+        })
+        .collect();
+    let pos = |start: usize| Some(sql.get(..start)?.chars().count() + 1);
+    if let Some(loc) = location.and_then(|l| usize::try_from(l).ok()) {
+        if toks.iter().any(|t| t.start == loc) {
+            return pos(loc);
+        }
+    }
+    let ident_at = |name: &str| toks.iter().position(|t| unquote_ident(t.text) == name);
+    let m = message.split('\n').next().unwrap_or("");
+    match sqlstate {
+        "42703" => {
+            // `column "x" does not exist`, or `column t.x does not exist`:
+            // a qualified reference points at its qualifier.
+            let name = quoted_between(m, "column ")
+                .map(str::to_string)
+                .or_else(|| {
+                    m.strip_prefix("column ")?
+                        .strip_suffix(" does not exist")
+                        .map(str::to_string)
+                })?;
+            let parts: Vec<&str> = name.split('.').collect();
+            let last = parts.last()?;
+            let i = toks.iter().enumerate().position(|(i, t)| {
+                unquote_ident(t.text) == *last
+                    && (parts.len() == 1
+                        || (i >= 2
+                            && toks[i - 1].text == "."
+                            && unquote_ident(toks[i - 2].text) == parts[parts.len() - 2]))
+            })?;
+            let first = if parts.len() > 1 { i - 2 } else { i };
+            pos(toks[first].start)
+        }
+        "42P01" => {
+            let name = quoted_between(m, "relation ")
+                .or_else(|| quoted_between(m, "missing FROM-clause entry for table "))?;
+            let name = name.rsplit('.').next()?;
+            pos(toks[ident_at(name)?].start)
+        }
+        "42704" => {
+            let name = quoted_between(m, "type ")?;
+            let name = name.rsplit('.').next()?;
+            pos(toks[ident_at(name)?].start)
+        }
+        "42883" => {
+            if let Some(call) = m.strip_prefix("function ") {
+                let name = call.split('(').next()?.rsplit('.').next()?;
+                let i = toks.iter().enumerate().position(|(i, t)| {
+                    unquote_ident(t.text) == name && toks.get(i + 1).is_some_and(|n| n.text == "(")
+                })?;
+                return pos(toks[i].start);
+            }
+            let rest = m.strip_prefix("operator does not exist: ")?;
+            let op = rest
+                .split(' ')
+                .find(|w| !w.is_empty() && w.chars().all(|c| "+-*/<>=~!@#%^&|`?".contains(c)))?;
+            let mut hits = toks.iter().filter(|t| t.text == op);
+            let first = hits.next()?;
+            hits.next().is_none().then(|| pos(first.start))?
+        }
+        "22P02" => {
+            // `invalid input syntax for type integer: "abc"`: the literal.
+            let (_, value) = m.rsplit_once(": \"")?;
+            let value = value.strip_suffix('"')?;
+            let lit = format!("'{}'", value.replace('\'', "''"));
+            pos(toks.iter().find(|t| t.text == lit)?.start)
+        }
+        "42601" => {
+            if m == "syntax error at end of input" {
+                return Some(sql.trim_end().chars().count() + 1);
+            }
+            let near = quoted_between(m, "syntax error at or near ")?;
+            pos(toks.iter().find(|t| t.text == near)?.start)
+        }
+        "42804" => {
+            // `argument of WHERE must be type boolean`: the clause's first
+            // token.
+            let clause = m.strip_prefix("argument of ")?.split(' ').next()?;
+            let mut hits = toks
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.text.eq_ignore_ascii_case(clause));
+            let (i, _) = hits.next()?;
+            if hits.next().is_some() {
+                return None;
+            }
+            pos(toks.get(i + 1)?.start)
+        }
+        _ => None,
+    }
+}

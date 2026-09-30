@@ -2895,6 +2895,16 @@ def _pg_am(db: str, session: Session, storage: Any, catalog: Catalog) -> list[di
     return [{"oid": _BTREE_AM_OID, "amname": "btree"}, {"oid": _HEAP_AM_OID, "amname": "heap"}]
 
 
+def _pg_tablespace(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
+    """PostgreSQL's two built-in tablespaces. Every relation reports
+    ``reltablespace = 0`` (the database default), which SQLAlchemy 2.1's
+    reflection LEFT JOINs here to read a table's tablespace name."""
+    return [
+        {"oid": 1663, "spcname": "pg_default", "spcowner": 10, "spcacl": None, "spcoptions": None},
+        {"oid": 1664, "spcname": "pg_global", "spcowner": 10, "spcacl": None, "spcoptions": None},
+    ]
+
+
 def _pg_opclass(db: str, session: Session, storage: Any, catalog: Catalog) -> list[dict]:
     return [{"oid": _DEFAULT_OPCLASS_OID, "opcname": "default_ops", "opcdefault": True}]
 
@@ -3677,6 +3687,18 @@ _register(
     "pg_am",
     [("oid", "int4"), ("amname", "text")],
     _pg_am,
+)
+_register(
+    "pg_catalog",
+    "pg_tablespace",
+    [
+        ("oid", "int4"),
+        ("spcname", "text"),
+        ("spcowner", "int4"),
+        ("spcacl", "text"),
+        ("spcoptions", "text"),
+    ],
+    _pg_tablespace,
 )
 _register(
     "pg_catalog",

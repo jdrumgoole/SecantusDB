@@ -1,0 +1,15 @@
+DROP TABLE IF EXISTS pc
+DROP TABLE IF EXISTS pu
+CREATE TABLE pc (id int PRIMARY KEY, k int, active bool)
+CREATE UNIQUE INDEX pc_k ON pc (k) WHERE active
+INSERT INTO pc VALUES (1, 10, true), (2, 10, false)
+CREATE TABLE pu (id int PRIMARY KEY, k int, j int)
+CREATE UNIQUE INDEX pu_k ON pu (k)
+CREATE UNIQUE INDEX pu_jk ON pu (j, k)
+INSERT INTO pu VALUES (1, 10, 1)
+DROP TABLE IF EXISTS fkc
+DROP TABLE IF EXISTS pk1
+CREATE TABLE pk1 (id int PRIMARY KEY, k int UNIQUE, v text)
+INSERT INTO pk1 VALUES (1, 10, 'a'), (2, 20, 'b')
+CREATE TABLE fkc (x int REFERENCES pk1 (id))
+INSERT INTO fkc VALUES (2)

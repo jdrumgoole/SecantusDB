@@ -683,12 +683,33 @@ pub fn multirange_from_text(text: &str, type_name: &str) -> Result<Vec<Range>> {
 
 /// A multirange from constructor arguments, each of which is already a range.
 pub fn multirange_from_args(args: &[Bson], type_name: &str) -> Result<Vec<Range>> {
+    multirange_from_typed_args(args, &[], type_name)
+}
+
+/// `multirange_from_args` knowing each argument's static type. An argument
+/// that already IS a range of the member type is its stored text -- a
+/// `tstzrange`'s bounds are naive UTC there -- and is taken as it is; only an
+/// untyped literal is parsed as input. Parsing a stored `tstzrange` as input
+/// read its UTC bounds in the SESSION zone, shifting the instant.
+pub fn multirange_from_typed_args(
+    args: &[Bson],
+    types: &[String],
+    type_name: &str,
+) -> Result<Vec<Range>> {
     let member_type = multirange_member(type_name)
         .ok_or_else(|| Error::Unsupported(format!("the {type_name} type")))?;
     let members = args
         .iter()
-        .filter(|a| *a != &Bson::Null)
-        .map(|a| from_text(&crate::render_value_text(a), &member_type))
+        .enumerate()
+        .filter(|(_, a)| *a != &Bson::Null)
+        .map(|(i, a)| {
+            let text = crate::render_value_text(a);
+            if types.get(i).is_some_and(|t| *t == member_type) {
+                parse_stored(&text)
+            } else {
+                from_text(&text, &member_type)
+            }
+        })
         .collect::<Result<Vec<_>>>()?;
     normalise_multirange(members, &member_type)
 }

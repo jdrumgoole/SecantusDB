@@ -61,7 +61,8 @@ pub fn bound_document(b: &pg_query::protobuf::PartitionBoundSpec) -> Result<Docu
             "to": list(&b.upperdatums)?,
         }),
         "l" => Ok(bson::doc! {"kind": "list", "values": list(&b.listdatums)?}),
-        _ => Err(Error::Unsupported("hash partitioning".into())),
+        "h" => Ok(bson::doc! {"kind": "hash", "modulus": b.modulus, "remainder": b.remainder}),
+        _ => Err(Error::Unsupported("this partition bound".into())),
     }
 }
 
@@ -70,7 +71,12 @@ pub fn bound_document(b: &pg_query::protobuf::PartitionBoundSpec) -> Result<Docu
 pub(crate) fn lower_create(
     c: &pg_query::protobuf::CreateStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
-) -> Result<(pg_query::protobuf::CreateStmt, Document)> {
+) -> Result<(
+    pg_query::protobuf::CreateStmt,
+    Document,
+    Vec<pg_query::protobuf::ColumnDef>,
+)> {
+    let mut column_options = Vec::new();
     use pg_query::protobuf::PartitionStrategy as PS;
     let mut out = c.clone();
     let mut extra = Document::new();
@@ -78,17 +84,21 @@ pub(crate) fn lower_create(
         let strategy = match PS::try_from(spec.strategy) {
             Ok(PS::Range) => "range",
             Ok(PS::List) => "list",
-            _ => return Err(Error::Unsupported("hash partitioning".into())),
+            Ok(PS::Hash) => "hash",
+            _ => return Err(Error::Unsupported("this partitioning strategy".into())),
         };
         let mut columns = Vec::new();
         for p in &spec.part_params {
             let Some(N::PartitionElem(e)) = p.node.as_ref() else {
                 continue;
             };
-            if e.expr.is_some() || e.name.is_empty() {
-                return Err(Error::Unsupported("partitioning by an expression".into()));
+            // An expression key is kept as its SQL, parenthesised; its type
+            // is settled once the table's columns are (see `key_types`).
+            match e.expr.as_deref() {
+                Some(expr) => columns.push(Bson::String(format!("({})", deparse_expr(expr)?))),
+                None if !e.name.is_empty() => columns.push(Bson::String(e.name.clone())),
+                None => return Err(Error::Parse("an empty partition key".into())),
             }
-            columns.push(Bson::String(e.name.clone()));
         }
         if strategy == "list" && columns.len() > 1 {
             return Err(Error::Sqlstate(
@@ -123,15 +133,15 @@ pub(crate) fn lower_create(
                     relation_oid: 0,
                 })),
             };
-            // Column options (`WITH OPTIONS`) are not modelled; table
-            // constraints carry across.
+            // Table constraints carry across as written; a column's own
+            // options (`v NOT NULL`, `s DEFAULT ...`, a column CHECK) are
+            // applied to the inherited column once the table is planned
+            // (`apply_column_options`).
             let mut elts = vec![like];
             for e in &c.table_elts {
                 match e.node.as_ref() {
                     Some(N::Constraint(_)) => elts.push(e.clone()),
-                    Some(N::ColumnDef(_)) => {
-                        return Err(Error::Unsupported("column options on a partition".into()))
-                    }
+                    Some(N::ColumnDef(cd)) => column_options.push((**cd).clone()),
                     _ => {}
                 }
             }
@@ -144,7 +154,91 @@ pub(crate) fn lower_create(
         }
         _ => {}
     }
-    Ok((out, extra))
+    Ok((out, extra, column_options))
+}
+
+/// A partition's column options, applied to the columns it took from its
+/// parent: each is planned as a one-column table of the parent column's
+/// type, and its NOT NULL, default, key and CHECKs carried over.
+pub(crate) fn apply_column_options(
+    def: &mut TableDef,
+    options: &[pg_query::protobuf::ColumnDef],
+) -> Result<()> {
+    for cd in options {
+        let Some(col) = def.columns.iter().find(|c| c.name == cd.colname).cloned() else {
+            return Err(Error::UndefinedColumn(cd.colname.clone()));
+        };
+        let mut typed = cd.clone();
+        typed.type_name = Some(type_name_node(&col.pg_type));
+        let stmt = pg_query::protobuf::CreateStmt {
+            relation: Some(pg_query::protobuf::RangeVar {
+                relname: def.name.clone(),
+                inh: true,
+                relpersistence: "p".into(),
+                ..Default::default()
+            }),
+            table_elts: vec![pg_query::protobuf::Node {
+                node: Some(N::ColumnDef(Box::new(typed))),
+            }],
+            oncommit: pg_query::protobuf::OnCommitAction::OncommitNoop as i32,
+            ..Default::default()
+        };
+        let Statement::CreateTable(one, _) = plan_create(&stmt)? else {
+            return Err(Error::Internal("a partition column's options".into()));
+        };
+        let Some(planned) = one.columns.first() else {
+            continue;
+        };
+        if let Some(target) = def.columns.iter_mut().find(|c| c.name == cd.colname) {
+            if !planned.nullable {
+                target.nullable = false;
+            }
+            if planned.pk {
+                target.pk = true;
+            }
+            if planned.default.is_some() {
+                target.default = planned.default.clone();
+            }
+            target.extra.extend(planned.extra.clone());
+        }
+        def.check_constraints.extend(one.check_constraints);
+        def.unique_constraints.extend(one.unique_constraints);
+    }
+    Ok(())
+}
+
+/// Each partition key's type, in declared order: a column's own, an
+/// expression's as it types over the table. Recorded as `key_types`.
+pub(crate) fn key_types(def: &mut TableDef) -> Result<()> {
+    let Ok(by) = def.extra.get_document("partition_by").cloned() else {
+        return Ok(());
+    };
+    let names: Vec<String> = by
+        .get_array("columns")
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut types = Vec::new();
+    for n in &names {
+        let ty = if n.starts_with('(') {
+            match plan_check_expression(n, def)? {
+                ColumnExpr::Row { result_type, .. } if !result_type.is_empty() => result_type,
+                _ => "text".to_string(),
+            }
+        } else {
+            // A missing column is the executor's 42703, worded for a key.
+            def.column(n)
+                .map_or_else(String::new, |c| c.pg_type.clone())
+        };
+        types.push(Bson::String(ty));
+    }
+    let mut by = by;
+    by.insert("key_types", types);
+    def.extra.insert("partition_by", by);
+    Ok(())
 }
 
 /// `quote` a bound datum's canonical text as ruleutils prints it in
@@ -195,7 +289,6 @@ fn cast(value: &str, ty: &str) -> String {
 /// a DEFAULT partition is the complement of. `values` are canonical texts;
 /// `None` stands for a NULL list member.
 pub fn bound_condition(key: &Key<'_>, bound: &Document, siblings: &[Document]) -> String {
-    let q = scalar::quote_identifier;
     let strings = |field: &str| -> Vec<Option<String>> {
         bound
             .get_array(field)
@@ -209,10 +302,10 @@ pub fn bound_condition(key: &Key<'_>, bound: &Document, siblings: &[Document]) -
             let listed: Vec<String> = values.iter().flatten().map(|v| cast(v, ty)).collect();
             let mut parts = Vec::new();
             if !listed.is_empty() {
-                parts.push(format!("{} IN ({})", q(col), listed.join(", ")));
+                parts.push(format!("{} IN ({})", kq(col), listed.join(", ")));
             }
             if values.iter().any(Option::is_none) {
-                parts.push(format!("{} IS NULL", q(col)));
+                parts.push(format!("{} IS NULL", kq(col)));
             }
             if parts.is_empty() {
                 "false".into()
@@ -226,7 +319,7 @@ pub fn bound_condition(key: &Key<'_>, bound: &Document, siblings: &[Document]) -
             let mut parts: Vec<String> = key
                 .columns
                 .iter()
-                .map(|(c, _)| format!("{} IS NOT NULL", q(c)))
+                .map(|(c, _)| format!("{} IS NOT NULL", kq(c)))
                 .collect();
             if let Some(lo) = lexicographic(key, &from, ">") {
                 parts.push(lo);
@@ -235,6 +328,20 @@ pub fn bound_condition(key: &Key<'_>, bound: &Document, siblings: &[Document]) -
                 parts.push(hi);
             }
             format!("({})", parts.join(" AND "))
+        }
+        // The row's hash, as PostgreSQL routes it (see `hashpart`).
+        "hash" => {
+            let keys: Vec<String> = key
+                .columns
+                .iter()
+                .map(|(c, ty)| format!("'{ty}', {}", kq(c)))
+                .collect();
+            format!(
+                "secantus_hash_partition({}, {}, {})",
+                bound.get_i32("modulus").unwrap_or(0),
+                bound.get_i32("remainder").unwrap_or(0),
+                keys.join(", ")
+            )
         }
         "default" => {
             let others: Vec<String> = siblings
@@ -257,7 +364,6 @@ pub fn bound_condition(key: &Key<'_>, bound: &Document, siblings: &[Document]) -
 /// and MINVALUE / MAXVALUE ending the comparison at their column. `None`
 /// when the bound constrains nothing.
 fn lexicographic(key: &Key<'_>, bound: &[Option<String>], op: &str) -> Option<String> {
-    let q = scalar::quote_identifier;
     let mut alternatives: Vec<String> = Vec::new();
     let mut prefix: Vec<String> = Vec::new();
     for (i, (col, ty)) in key.columns.iter().enumerate() {
@@ -281,17 +387,27 @@ fn lexicographic(key: &Key<'_>, bound: &[Option<String>], op: &str) -> Option<St
         }
         let lit = cast(&v, ty);
         let last = i + 1 == key.columns.len();
-        let strict = format!("{} {op} {lit}", q(col));
+        let strict = format!("{} {op} {lit}", kq(col));
         let mut here = prefix.clone();
         if last && op == ">" {
-            here.push(format!("{} >= {lit}", q(col)));
+            here.push(format!("{} >= {lit}", kq(col)));
         } else {
             here.push(strict);
         }
         alternatives.push(conj(&here));
-        prefix.push(format!("{} = {lit}", q(col)));
+        prefix.push(format!("{} = {lit}", kq(col)));
     }
     Some(disj(&alternatives))
+}
+
+/// A key in a bound condition: a column by its quoted name, an expression
+/// key (stored parenthesised) as written.
+fn kq(c: &str) -> String {
+    if c.starts_with('(') {
+        c.to_string()
+    } else {
+        scalar::quote_identifier(c)
+    }
 }
 
 fn conj(parts: &[String]) -> String {
@@ -320,12 +436,36 @@ pub fn set_tableoids(v: Vec<(String, String)>) {
 }
 
 fn tableoid_sql(name: &str) -> Option<String> {
-    TABLEOIDS.with(|t| {
+    let partitioned = TABLEOIDS.with(|t| {
         t.borrow()
             .iter()
             .find(|(n, _)| n == name)
             .map(|(_, s)| s.clone())
+    });
+    // Any other relation is its own oid -- except an inheritance parent,
+    // whose rows come from several tables: its union carries the column.
+    partitioned.or_else(|| {
+        (!is_view(name) && crate::inherit::descendants(name).is_empty())
+            .then(|| format!("{}::regclass::oid", crate::scalar::quote_literal(name)))
     })
+}
+
+/// Does the statement name the `tableoid` system column anywhere?
+pub(crate) fn mentions_tableoid(s: &pg_query::protobuf::SelectStmt) -> bool {
+    s.target_list
+        .iter()
+        .chain(s.where_clause.iter().map(|b| &**b))
+        .chain(s.group_clause.iter())
+        .chain(s.sort_clause.iter())
+        .any(|n| {
+            n.node.as_ref().is_some_and(|x| {
+                x.nodes().iter().any(|(r, _, _, _)| {
+                    matches!(r, pg_query::NodeRef::ColumnRef(c)
+                        if matches!(c.fields.last().and_then(|f| f.node.as_ref()),
+                            Some(N::String(s)) if s.sval == "tableoid"))
+                })
+            })
+        })
 }
 
 /// Replace references to the `tableoid` system column with the expression
@@ -357,6 +497,9 @@ pub(crate) fn rewrite_tableoid(
             }
             _ => {}
         }
+    }
+    if !mentions_tableoid(s) {
+        return Ok(None);
     }
     let mut ranges: Vec<(String, String)> = Vec::new();
     for f in &s.from_clause {

@@ -32,6 +32,106 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Per view, its `(column, default SQL)` pairs.
+type ViewDefaults = Vec<(String, Vec<(String, String)>)>;
+
+thread_local! {
+    /// `ALTER VIEW ... ALTER COLUMN c SET DEFAULT`: per view, `(column,
+    /// default SQL)`, which an INSERT through the view gives a column it
+    /// omits (or writes as DEFAULT).
+    static VIEW_DEFAULTS: std::cell::RefCell<ViewDefaults> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Install the views' column defaults for the statements that follow.
+pub fn set_view_defaults(defaults: Vec<(String, Vec<(String, String)>)>) {
+    VIEW_DEFAULTS.with(|d| *d.borrow_mut() = defaults);
+}
+
+fn view_defaults(view: &str) -> Vec<(String, String)> {
+    VIEW_DEFAULTS.with(|d| {
+        d.borrow()
+            .iter()
+            .find(|(v, _)| v == view)
+            .map(|(_, cols)| cols.clone())
+            .unwrap_or_default()
+    })
+}
+
+/// Give an INSERT through `view` the view's column defaults: a column the
+/// INSERT omits gets its default expression (per VALUES row, or as an extra
+/// select-list entry), and an explicit DEFAULT in its slot becomes it.
+fn apply_view_defaults(i: &mut pg_query::protobuf::InsertStmt, view: &str) -> Result<()> {
+    let defaults = view_defaults(view);
+    if defaults.is_empty() {
+        return Ok(());
+    }
+    let parse = |sql: &str| domains::parse_default_sql(sql);
+    let named: Vec<String> = i
+        .cols
+        .iter()
+        .filter_map(|c| match c.node.as_ref() {
+            Some(N::ResTarget(rt)) => Some(rt.name.clone()),
+            _ => None,
+        })
+        .collect();
+    let Some(N::SelectStmt(sel)) = i.select_stmt.as_deref_mut().and_then(|s| s.node.as_mut())
+    else {
+        return Ok(());
+    };
+    // An explicit DEFAULT in a VALUES row, at a column with a view default.
+    for row in &mut sel.values_lists {
+        if let Some(N::List(l)) = row.node.as_mut() {
+            for (slot, item) in l.items.iter_mut().enumerate() {
+                if !matches!(item.node, Some(N::SetToDefault(_))) {
+                    continue;
+                }
+                if let Some((_, sql)) = named
+                    .get(slot)
+                    .and_then(|n| defaults.iter().find(|(c, _)| c == n))
+                {
+                    *item = parse(sql)?;
+                }
+            }
+        }
+    }
+    let star = sel.target_list.iter().any(|t| {
+        matches!(t.node.as_ref(), Some(N::ResTarget(rt))
+            if matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()),
+                Some(N::ColumnRef(c)) if c.fields.iter().any(|f| matches!(f.node, Some(N::AStar(_))))))
+    });
+    for (column, sql) in &defaults {
+        if named.contains(column) {
+            continue;
+        }
+        if !sel.values_lists.is_empty() {
+            for row in &mut sel.values_lists {
+                if let Some(N::List(l)) = row.node.as_mut() {
+                    l.items.push(parse(sql)?);
+                }
+            }
+        } else if !star && !sel.target_list.is_empty() {
+            sel.target_list.push(pg_query::protobuf::Node {
+                node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+                    val: Some(Box::new(parse(sql)?)),
+                    location: -1,
+                    ..Default::default()
+                }))),
+            });
+        } else {
+            continue;
+        }
+        i.cols.push(pg_query::protobuf::Node {
+            node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+                name: column.clone(),
+                location: -1,
+                ..Default::default()
+            }))),
+        });
+    }
+    Ok(())
+}
+
 /// Install the views that carry a CHECK OPTION: `(name, LOCAL | CASCADED)`.
 pub fn set_checked_views(views: Vec<(String, String)>) {
     CHECKED_VIEWS.with(|v| *v.borrow_mut() = views);
@@ -151,6 +251,15 @@ fn unwrap_column_list(body: pg_query::protobuf::SelectStmt) -> pg_query::protobu
         }
     }
     inner
+}
+
+/// Whether a view with this definition is automatically updatable
+/// (`information_schema.views.is_updatable`).
+pub fn is_updatable(definition: &str) -> bool {
+    let Ok(N::SelectStmt(body)) = parse_one(definition) else {
+        return false;
+    };
+    not_updatable(&unwrap_column_list(*body)).is_none()
 }
 
 /// Why a view is not automatically updatable, or `None` when it is.
@@ -422,6 +531,7 @@ pub(crate) fn rewrite(
                         });
                     }
                 }
+                apply_view_defaults(i, &view)?;
                 for c in &mut i.cols {
                     if let Some(N::ResTarget(rt)) = c.node.as_mut() {
                         rt.name = writable(&rt.name)?;

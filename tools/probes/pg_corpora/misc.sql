@@ -33,3 +33,8 @@ SELECT count(DISTINCT s) FROM mi12
 SELECT s FROM mi12 GROUP BY s ORDER BY s NULLS LAST
 SELECT n IS NULL, count(*) FROM mi12 GROUP BY n IS NULL ORDER BY 1
 SELECT string_agg(coalesce(s,'-'), ',' ORDER BY id) FROM mi12
+# A FROM-less set-returning select: a WHERE naming no column is a constant,
+# and an output alias is not visible to it (42703).
+SELECT generate_series(1, 3) WHERE 1 = 1
+SELECT generate_series(1, 3) WHERE 1 > 2
+SELECT generate_series(1, 3) AS g WHERE g > 1

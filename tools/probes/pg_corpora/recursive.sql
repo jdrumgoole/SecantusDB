@@ -10,3 +10,10 @@ WITH RECURSIVE r(n) AS (SELECT n FROM r) SELECT * FROM r
 WITH RECURSIVE r(n) AS (SELECT 1 WHERE false UNION ALL SELECT n + 1 FROM r) SELECT count(*) FROM r
 WITH RECURSIVE p(path, id) AS (SELECT name, id FROM rt_emp WHERE id = 1 UNION ALL SELECT p.path || '/' || e.name, e.id FROM rt_emp e JOIN p ON e.boss = p.id) SELECT path FROM p ORDER BY path
 WITH r AS (SELECT 1 AS n) SELECT n FROM r
+# The column's type is the UNION's resolved type: an anchor narrower than the
+# recursive term's is 42804; a wider anchor, or varchar beside text, holds.
+WITH RECURSIVE r(n) AS (SELECT 1::int2 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r
+WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1.5 FROM r WHERE n < 3) SELECT n FROM r
+WITH RECURSIVE r(n) AS (SELECT 1::int8 UNION ALL SELECT (n + 1)::int4 FROM r WHERE n < 3) SELECT n FROM r
+WITH RECURSIVE r(n) AS (SELECT 1.0 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r
+WITH RECURSIVE r(s) AS (SELECT 'a'::varchar UNION ALL SELECT s || 'b' FROM r WHERE length(s) < 3) SELECT s FROM r

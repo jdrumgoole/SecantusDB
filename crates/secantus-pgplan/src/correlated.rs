@@ -540,6 +540,8 @@ pub fn with_sequence_hook<R>(hook: &SequenceHook<'_>, f: impl FnOnce() -> R) -> 
 
 /// The sequence functions.
 pub(crate) const SEQUENCE_FUNCTIONS: &[&str] = &[
+    // `pg_trgm`'s `set_limit` writes the session's threshold.
+    "set_limit",
     "nextval",
     "currval",
     "setval",
@@ -579,6 +581,7 @@ pub fn executor_function_type(name: &str) -> Option<&'static str> {
         }
         n if n.contains("advisory") => "void",
         "pg_has_role" => "bool",
+        "set_limit" => "float4",
         _ => return None,
     })
 }
@@ -590,9 +593,18 @@ pub(crate) fn call_sequence(name: &str, args: &[Bson]) -> Result<Bson> {
     if SUPPRESSED.with(|s| s.get()) {
         return Ok(Bson::Null);
     }
+    // A `regclass` argument (`nextval('s'::regclass)`) names the sequence
+    // by oid; the hook takes its name.
+    let args: Vec<Bson> = args
+        .iter()
+        .map(|a| match crate::regclass_oid(a) {
+            Some(oid) => Bson::String(crate::regclass_text(oid)),
+            None => a.clone(),
+        })
+        .collect();
     match SEQUENCE_HOOK.with(|r| r.get()) {
         // SAFETY: set only inside `with_sequence_hook`, whose borrow is live.
-        Some(hook) => unsafe { (*hook)(name, args) },
+        Some(hook) => unsafe { (*hook)(name, &args) },
         None => Ok(Bson::Null),
     }
 }
@@ -627,6 +639,11 @@ pub struct UserFn {
     pub variadic: bool,
     /// The catalog key the executor finds the function's body under.
     pub key: String,
+    /// `STRICT`: any NULL argument answers NULL (no rows, for a set-returning
+    /// function) without the body running.
+    pub strict: bool,
+    /// Each input parameter's `DEFAULT` as SQL, `None` where it has none.
+    pub defaults: Vec<Option<String>>,
 }
 
 /// What a user function call produced.
@@ -650,6 +667,11 @@ pub fn set_user_functions(fns: Vec<UserFn>) {
     USER_FUNCTIONS.with(|f| *f.borrow_mut() = fns);
 }
 
+/// The installed user functions.
+pub(crate) fn user_functions() -> Vec<UserFn> {
+    USER_FUNCTIONS.with(|f| f.borrow().clone())
+}
+
 /// The user function a call resolves to: by name and argument count, and --
 /// when overloads share the count -- by the arguments' types, an untyped
 /// literal matching any. Several equally good candidates are PostgreSQL's
@@ -661,7 +683,11 @@ pub(crate) fn user_function_for(name: &str, args: &[pg_query::protobuf::Node]) -
             .filter(|u| {
                 u.name == name
                     && (u.arg_types.len() == args.len()
-                        || (u.variadic && args.len() >= u.arg_types.len()))
+                        || (u.variadic && args.len() >= u.arg_types.len())
+                        // Trailing parameters with a DEFAULT may be left out.
+                        || (args.len() < u.arg_types.len()
+                            && (args.len()..u.arg_types.len())
+                                .all(|i| u.defaults.get(i).is_some_and(Option::is_some))))
             })
             .cloned()
             .collect()
@@ -731,6 +757,31 @@ pub fn with_function_hook<R>(hook: &FunctionHook<'_>, f: impl FnOnce() -> R) -> 
 pub(crate) fn call_user_function(u: &UserFn, args: &[Bson]) -> Result<FnResult> {
     if SUPPRESSED.with(|s| s.get()) {
         return Ok(FnResult::Value(Bson::Null));
+    }
+    // Parameters the call left out take their DEFAULT, evaluated now and
+    // cast to the parameter's type.
+    let defaulted;
+    let args = if args.len() < u.arg_types.len() && !u.variadic {
+        let mut out = args.to_vec();
+        for i in args.len()..u.arg_types.len() {
+            let sql = u.defaults.get(i).cloned().flatten().ok_or_else(|| {
+                Error::UndefinedFunction(format!("function {}() does not exist", u.name))
+            })?;
+            let node = crate::domains::parse_default_sql(&sql)?;
+            let v = crate::const_value(&node, &[])?;
+            out.push(crate::cast_value(v, &u.arg_types[i])?);
+        }
+        defaulted = out;
+        &defaulted[..]
+    } else {
+        args
+    };
+    if u.strict && args.contains(&Bson::Null) {
+        return Ok(if u.returns_set {
+            FnResult::Rows(Vec::new(), Vec::new(), Vec::new())
+        } else {
+            FnResult::Value(Bson::Null)
+        });
     }
     // A VARIADIC call packs its trailing arguments into the last parameter's
     // array, unless it passed that array itself (`VARIADIC ARRAY[...]`).

@@ -107,3 +107,60 @@ fn push(out: &mut Vec<(String, &'static str)>, table: &str, privilege: &'static 
         out.push((table.to_string(), privilege));
     }
 }
+
+/// The relations a DDL statement locks, with PostgreSQL's lock mode for each
+/// (1 ACCESS SHARE .. 8 ACCESS EXCLUSIVE): `ALTER TABLE`, `DROP TABLE`, a
+/// rename and `CLUSTER` take ACCESS EXCLUSIVE, so they wait for a session
+/// still reading the table; `CREATE INDEX` takes SHARE (which a reader does
+/// not block). Empty for any other statement.
+pub fn ddl_locks(sql: &str) -> Vec<(String, i32)> {
+    use pg_query::protobuf::ObjectType;
+    let Ok(parsed) = pg_query::parse(sql) else {
+        return Vec::new();
+    };
+    let name = |r: &pg_query::protobuf::RangeVar| r.relname.clone();
+    let mut out = Vec::new();
+    for raw in &parsed.protobuf.stmts {
+        let Some(node) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
+            continue;
+        };
+        match node {
+            N::AlterTableStmt(a) if a.objtype == ObjectType::ObjectTable as i32 => {
+                if let Some(r) = &a.relation {
+                    out.push((name(r), 8));
+                }
+            }
+            N::RenameStmt(r)
+                if matches!(
+                    ObjectType::try_from(r.rename_type),
+                    Ok(ObjectType::ObjectTable | ObjectType::ObjectColumn)
+                ) =>
+            {
+                if let Some(rel) = &r.relation {
+                    out.push((name(rel), 8));
+                }
+            }
+            N::ClusterStmt(c) => {
+                if let Some(r) = &c.relation {
+                    out.push((name(r), 8));
+                }
+            }
+            N::IndexStmt(i) if !i.concurrent => {
+                if let Some(r) = &i.relation {
+                    out.push((name(r), 5));
+                }
+            }
+            N::DropStmt(d) if d.remove_type == ObjectType::ObjectTable as i32 => {
+                for o in &d.objects {
+                    if let Some(N::List(l)) = o.node.as_ref() {
+                        if let Some(N::String(s)) = l.items.last().and_then(|n| n.node.as_ref()) {
+                            out.push((s.sval.clone(), 8));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}

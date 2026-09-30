@@ -1,0 +1,6 @@
+DROP TABLE IF EXISTS sgp
+DROP TABLE IF EXISTS sgd
+DROP SEQUENCE IF EXISTS sgp_s
+CREATE SEQUENCE sgp_s
+CREATE TABLE sgp (id serial PRIMARY KEY, u text UNIQUE)
+CREATE TABLE sgd (id int, n numeric(4,1) DEFAULT 1.25, v varchar(3) DEFAULT 'ab')
