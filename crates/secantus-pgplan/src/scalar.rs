@@ -12,7 +12,8 @@ use bson::Bson;
 
 /// Is this a scalar built-in this server implements?
 pub fn is_scalar(name: &str) -> bool {
-    SCALAR_NAMES.contains(&name)
+    name == "secantus_hash_partition"
+        || SCALAR_NAMES.contains(&name)
         || CATALOG_NAMES.contains(&name)
         || crate::arrays::is_array_function(name)
         || extension_scalar(name).is_some()
@@ -574,6 +575,10 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
     // `integer` rather than NULL.
     if name == "format_type" {
         return format_type_call(args);
+    }
+    // A hash partition's condition: NULL keys are part of the hash.
+    if name == "secantus_hash_partition" {
+        return crate::hashpart::satisfies(args);
     }
     // The array built-ins each decide what a NULL argument means -- see
     // `arrays`' header -- so they are routed BEFORE the blanket guard below.
@@ -1994,6 +1999,9 @@ pub fn md5_hex(data: &[u8]) -> String {
 /// input and fall back to text only when unknown, which is also what an
 /// untyped output column defaults to.
 pub fn static_result_type(name: &str) -> &'static str {
+    if name == "secantus_hash_partition" {
+        return "bool";
+    }
     if let Some(t) = crate::correlated::executor_function_type(name) {
         return t;
     }

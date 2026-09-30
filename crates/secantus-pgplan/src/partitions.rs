@@ -61,7 +61,8 @@ pub fn bound_document(b: &pg_query::protobuf::PartitionBoundSpec) -> Result<Docu
             "to": list(&b.upperdatums)?,
         }),
         "l" => Ok(bson::doc! {"kind": "list", "values": list(&b.listdatums)?}),
-        _ => Err(Error::Unsupported("hash partitioning".into())),
+        "h" => Ok(bson::doc! {"kind": "hash", "modulus": b.modulus, "remainder": b.remainder}),
+        _ => Err(Error::Unsupported("this partition bound".into())),
     }
 }
 
@@ -78,7 +79,8 @@ pub(crate) fn lower_create(
         let strategy = match PS::try_from(spec.strategy) {
             Ok(PS::Range) => "range",
             Ok(PS::List) => "list",
-            _ => return Err(Error::Unsupported("hash partitioning".into())),
+            Ok(PS::Hash) => "hash",
+            _ => return Err(Error::Unsupported("this partitioning strategy".into())),
         };
         let mut columns = Vec::new();
         for p in &spec.part_params {
@@ -235,6 +237,20 @@ pub fn bound_condition(key: &Key<'_>, bound: &Document, siblings: &[Document]) -
                 parts.push(hi);
             }
             format!("({})", parts.join(" AND "))
+        }
+        // The row's hash, as PostgreSQL routes it (see `hashpart`).
+        "hash" => {
+            let keys: Vec<String> = key
+                .columns
+                .iter()
+                .map(|(c, ty)| format!("'{ty}', {}", q(c)))
+                .collect();
+            format!(
+                "secantus_hash_partition({}, {}, {})",
+                bound.get_i32("modulus").unwrap_or(0),
+                bound.get_i32("remainder").unwrap_or(0),
+                keys.join(", ")
+            )
         }
         "default" => {
             let others: Vec<String> = siblings

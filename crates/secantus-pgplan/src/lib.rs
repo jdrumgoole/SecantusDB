@@ -31,6 +31,7 @@ mod func_cast;
 pub mod geo;
 pub mod geom;
 pub mod geometry;
+pub mod hashpart;
 pub mod hstore;
 pub mod inherit;
 pub mod instead_of;

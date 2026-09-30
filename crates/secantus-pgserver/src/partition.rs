@@ -313,6 +313,12 @@ impl PgHandler {
         let key = ordered_key(&parent);
         let kind = bound.get_str("kind").unwrap_or_default().to_string();
         let strat = strategy(&parent);
+        if kind == "default" && strat == "hash" {
+            return Err(user_err(
+                "42P16",
+                "a hash-partitioned table may not have a default partition",
+            ));
+        }
         if kind != "default" && kind != strat {
             return Err(user_err(
                 "42P16",
@@ -361,6 +367,28 @@ impl PgHandler {
                 }
             }
             "list" => canonical("values", bound)?,
+            "hash" => {
+                let modulus = bound.get_i32("modulus").unwrap_or(0);
+                let remainder = bound.get_i32("remainder").unwrap_or(0);
+                if modulus < 1 {
+                    return Err(user_err(
+                        "42P16",
+                        "modulus for hash partition must be an integer value greater than zero",
+                    ));
+                }
+                if remainder < 0 {
+                    return Err(user_err(
+                        "42P16",
+                        "remainder for hash partition must be an integer value greater than or equal to zero",
+                    ));
+                }
+                if remainder >= modulus {
+                    return Err(user_err(
+                        "42P16",
+                        "remainder for hash partition must be less than modulus",
+                    ));
+                }
+            }
             _ => {}
         }
         let siblings: Vec<TableDef> = self
@@ -419,6 +447,47 @@ impl PgHandler {
                     if cmp_tuple(&lo, &hi2) == Ordering::Less
                         && cmp_tuple(&lo2, &hi) == Ordering::Less
                     {
+                        return Err(user_err(
+                            "42P17",
+                            format!(
+                                "partition \"{name}\" would overlap partition \"{}\"",
+                                s.name
+                            ),
+                        ));
+                    }
+                }
+            }
+            // Every modulus a factor of the next larger, and no two
+            // partitions claiming one remainder class (PostgreSQL's rules).
+            "hash" => {
+                let m = bound.get_i32("modulus").unwrap_or(1);
+                let r = bound.get_i32("remainder").unwrap_or(0);
+                for s in &siblings {
+                    let b = bound_of(s);
+                    if b.get_str("kind") != Ok("hash") {
+                        continue;
+                    }
+                    let (m2, r2) = (
+                        b.get_i32("modulus").unwrap_or(1),
+                        b.get_i32("remainder").unwrap_or(0),
+                    );
+                    let (small, big) = if m <= m2 { (m, m2) } else { (m2, m) };
+                    if big % small != 0 {
+                        let mut info = ErrorInfo::new(
+                            "ERROR".into(),
+                            "42P17".into(),
+                            "every hash partition modulus must be a factor of the next larger modulus"
+                                .into(),
+                        );
+                        info.detail = Some(format!(
+                            "The new modulus {m} is not {} of modulus {m2}, the modulus of existing partition \"{}\".",
+                            if m < m2 { "a factor" } else { "divisible by" },
+                            s.name
+                        ));
+                        return Err(PgWireError::UserError(Box::new(info)));
+                    }
+                    let (rs, rb) = if m <= m2 { (r, r2) } else { (r2, r) };
+                    if rb % small == rs {
                         return Err(user_err(
                             "42P17",
                             format!(
@@ -913,6 +982,11 @@ impl PgHandler {
         Some(match bound.get_str("kind").unwrap_or_default() {
             "default" => "DEFAULT".into(),
             "list" => format!("FOR VALUES IN ({})", render("values")),
+            "hash" => format!(
+                "FOR VALUES WITH (modulus {}, remainder {})",
+                bound.get_i32("modulus").unwrap_or(0),
+                bound.get_i32("remainder").unwrap_or(0)
+            ),
             _ => format!("FOR VALUES FROM ({}) TO ({})", render("from"), render("to")),
         })
     }
@@ -922,6 +996,7 @@ impl PgHandler {
         let strat = match strategy(def) {
             "range" => "r",
             "list" => "l",
+            "hash" => "h",
             _ => return None,
         };
         let attrs = key_names(def)
