@@ -61,6 +61,12 @@ pub fn defers_to_connection(name: &str) -> bool {
 /// only their arguments, and because that is the fact worth seeing at a
 /// glance: as a bare select-list target they become a `ConstCol` the server
 /// resolves, and this list is what lets the constant evaluator reach them too.
+/// Is `name` one of the catalog readers (`version`, `format_type`,
+/// `obj_description` ...), which take this server's catalog columns?
+pub(crate) fn is_catalog_reader(name: &str) -> bool {
+    CATALOG_NAMES.contains(&name)
+}
+
 const CATALOG_NAMES: &[&str] = &[
     "version",
     "current_schema",

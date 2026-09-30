@@ -1,0 +1,1 @@
+DROP TABLE IF EXISTS ty_t, ty_u

@@ -647,9 +647,6 @@ remain open:
         prints views, rules and stored expressions from a small analyser; a
         shape outside it falls back to the text as written -- see the batch
         11 entry below for what it covers.
-      - Built-in function arguments are type-checked for the text and numeric
-        families only (`upper(1)`, `abs('x'::text)` are 42883); other
-        built-ins still take what they are given.
 - [ ] **OPEN — RUST pgserver: what batch 10 (CREATE AGGREGATE / OPERATOR /
       STATISTICS / PUBLICATION, INHERITS, hash and expression partitioning,
       pg_trgm, ALTER VIEW, table locks, time input, wide timestamptz,

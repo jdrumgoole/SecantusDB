@@ -31,6 +31,7 @@ pub mod fdw;
 pub mod formatting;
 pub mod fts;
 mod func_cast;
+mod funcsig;
 mod optype;
 pub use errpos::error_position;
 pub mod collation;
@@ -13692,9 +13693,17 @@ fn numeric_signature(name: &str) -> Option<usize> {
 /// type at plan time, where this server would otherwise stringify.
 fn text_function_mismatch(f: &pg_query::protobuf::FuncCall, types: &[String]) -> Option<Error> {
     let name = func_name(f)?;
+    // A SQL-syntax function (`EXTRACT`, `OVERLAY`) is `pg_catalog.`-qualified
+    // by the grammar, and PostgreSQL names it so.
+    let shown = match f.funcname.first().and_then(|n| n.node.as_ref()) {
+        Some(N::String(s)) if s.sval == "pg_catalog" && f.funcname.len() == 2 => {
+            format!("pg_catalog.{name}")
+        }
+        _ => name.clone(),
+    };
     let missing = || {
         Error::UndefinedFunction(format!(
-            "function {name}({}) does not exist",
+            "function {shown}({}) does not exist",
             types
                 .iter()
                 .map(|t| display_type(t))
@@ -13709,6 +13718,10 @@ fn text_function_mismatch(f: &pg_query::protobuf::FuncCall, types: &[String]) ->
             && !matches!(t, "int2vector" | "oidvector" | "anyarray" | "record")
             && pgtypes::oid_of_name(t).is_some()
     };
+    // A built-in no overload of which takes these argument types.
+    if !correlated::user_function_named(&name) && funcsig::resolves(&name, types) == Some(false) {
+        return Some(missing());
+    }
     if !correlated::user_function_named(&name) {
         let first = types.first().map(String::as_str).unwrap_or("");
         // The array built-ins take an array first; a known scalar has no
@@ -14380,7 +14393,59 @@ fn foreign_qualifier(s: &pg_query::protobuf::SelectStmt) -> Option<String> {
     for a in &mut args {
         let _ = walk_expr(a, &mut check);
     }
-    found
+    if found.is_some() {
+        return found;
+    }
+    // A derived table in FROM (not LATERAL) sees only its own FROM and the
+    // queries ENCLOSING this subquery -- so a qualifier its own FROM does not
+    // define reads the enclosing row. Its names follow PostgreSQL: an
+    // aliased relation goes by the alias only, so an inner `t q` does not
+    // hide the outer `t`.
+    for item in &s.from_clause {
+        if let Some(f) = derived_foreign_qualifier(item) {
+            return Some(f);
+        }
+    }
+    None
+}
+
+fn derived_foreign_qualifier(item: &pg_query::protobuf::Node) -> Option<String> {
+    match item.node.as_ref()? {
+        N::RangeSubselect(rs) if !rs.lateral => {
+            let Some(N::SelectStmt(body)) = rs.subquery.as_deref().and_then(|q| q.node.as_ref())
+            else {
+                return None;
+            };
+            let names = correlated::inner_names(body);
+            let mut found = None;
+            let mut b = (**body).clone();
+            let _ = correlated::walk_select(&mut b, &mut |n| {
+                if found.is_some() {
+                    return Ok(());
+                }
+                if let Some(N::ColumnRef(c)) = n.node.as_ref() {
+                    if c.fields.len() >= 2 {
+                        if let Some(N::String(q)) = c.fields[c.fields.len() - 2].node.as_ref() {
+                            if !names.contains(&q.sval) {
+                                found = Some(format!(
+                                    "{}.{}",
+                                    q.sval,
+                                    column_ref_name(c).unwrap_or_default()
+                                ));
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            });
+            found.or_else(|| body.from_clause.iter().find_map(derived_foreign_qualifier))
+        }
+        N::JoinExpr(j) => [j.larg.as_deref(), j.rarg.as_deref()]
+            .into_iter()
+            .flatten()
+            .find_map(derived_foreign_qualifier),
+        _ => None,
+    }
 }
 
 /// Every name a FROM item can be addressed by: its alias when it has one, and

@@ -212,7 +212,7 @@ fn walk_from(
 /// expressions. A name found only one level down is still the subquery's
 /// own, never an outer reference: missing the derived tables made
 /// `(SELECT r.id FROM t r WHERE ...)` read `r.id` from the OUTER query.
-fn inner_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
+pub(crate) fn inner_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
     fn from_item(item: &pg_query::protobuf::Node, names: &mut Vec<String>) {
         // An aliased relation goes by its alias ONLY, so an inner `t r`
         // does not hide an outer `t`.

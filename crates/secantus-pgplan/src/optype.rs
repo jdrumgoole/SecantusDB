@@ -256,6 +256,26 @@ fn operand_type(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<String> {
         }
         N::ColumnRef(c) => scope.column_type(c),
         N::ParamRef(p) => declared_param_type(usize::try_from(p.number).ok()?),
+        // A built-in's result, as the overload its arguments select returns.
+        N::FuncCall(f) if f.over.is_none() && !f.agg_star && f.agg_order.is_empty() => {
+            let name = func_name(f)?;
+            if correlated::user_function_named(&name) || f.funcname.len() > 2 {
+                return None;
+            }
+            let args: Vec<String> = f
+                .args
+                .iter()
+                .map(|a| match a.node.as_ref() {
+                    Some(N::AConst(c))
+                        if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) =>
+                    {
+                        Some(String::new())
+                    }
+                    _ => operand_type(a, scope),
+                })
+                .collect::<Option<Vec<_>>>()?;
+            crate::funcsig::result_type(&name, &args)
+        }
         // Arithmetic over two numbers is a number: `a + 0` is numeric, so
         // `a + 0 = 'x'::text` is judged like `a = 'x'::text`.
         N::AExpr(e)
@@ -407,6 +427,21 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
                 walk(v, scope, cx)?;
             }
         }
+        // An untyped literal among typed arguments is coerced to their type
+        // when the statement is analysed, so a literal that is not valid
+        // input for it fails then -- evaluated or not (`coalesce(id, 'x')`).
+        N::CoalesceExpr(c) => {
+            literals_fit(&c.args, scope)?;
+            for a in &c.args {
+                walk(a, scope, cx)?;
+            }
+        }
+        N::MinMaxExpr(m) => {
+            literals_fit(&m.args, scope)?;
+            for a in &m.args {
+                walk(a, scope, cx)?;
+            }
+        }
         N::CaseExpr(c) => {
             for w in &c.args {
                 if let Some(N::CaseWhen(w)) = w.node.as_ref() {
@@ -543,4 +578,36 @@ pub(crate) fn check(node: &N, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Resu
         }
         _ => Ok(()),
     }
+}
+
+/// Do the untyped string literals among `args` read as the type the typed
+/// ones share? The first literal that does not is its cast's error, at the
+/// literal.
+fn literals_fit(args: &[pg_query::protobuf::Node], scope: &Scope) -> Result<()> {
+    use pg_query::protobuf::a_const::Val;
+    let typed: Vec<String> = args.iter().filter_map(|a| operand_type(a, scope)).collect();
+    let Some(first) = typed.first() else {
+        return Ok(());
+    };
+    if typed.iter().any(|t| t != first) {
+        return Ok(());
+    }
+    // Only the types whose input this check can judge exactly.
+    if !matches!(
+        first.as_str(),
+        "int2" | "int4" | "int8" | "numeric" | "float4" | "float8" | "bool" | "date" | "uuid"
+    ) {
+        return Ok(());
+    }
+    for a in args {
+        if let Some(N::AConst(c)) = a.node.as_ref() {
+            if let Some(Val::Sval(s)) = c.val.as_ref() {
+                if let Err(e) = crate::cast_value(bson::Bson::String(s.sval.clone()), first) {
+                    set_error_location(c.location);
+                    return Err(e);
+                }
+            }
+        }
+    }
+    Ok(())
 }
