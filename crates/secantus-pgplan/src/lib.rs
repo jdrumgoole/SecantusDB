@@ -9080,6 +9080,23 @@ fn plan_aggregate_item(
     out: String,
 ) -> Result<AggItem> {
     let name = func_name(f).unwrap_or_default();
+    // Under DISTINCT the rows are deduplicated on the arguments, so an ORDER
+    // BY over anything else would have no single value to sort by.
+    if f.agg_distinct && !f.agg_order.is_empty() {
+        let args: Vec<String> = f.args.iter().filter_map(|a| deparse_expr(a).ok()).collect();
+        for o in &f.agg_order {
+            if let Some(N::SortBy(sb)) = o.node.as_ref() {
+                let key = sb.node.as_deref().and_then(|n| deparse_expr(n).ok());
+                if !key.is_some_and(|k| args.contains(&k)) {
+                    return Err(Error::Sqlstate(
+                        "42P10",
+                        "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list"
+                            .into(),
+                    ));
+                }
+            }
+        }
+    }
     let filter = match f.agg_filter.as_deref() {
         None => None,
         Some(node) => Some(lower_where(node, def, params)?),

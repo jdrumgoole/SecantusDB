@@ -111,6 +111,10 @@ now reports PostgreSQL's retryable `40001`, not `XX000`.
 - `CREATE TABLE ... PARTITION OF` used to create a table with no columns,
   and every row stayed in the parent. `INHERITS` was ignored. It is now
   refused by name.
+- `array_agg(DISTINCT x)` over no rows answered `{}` instead of NULL. A
+  DISTINCT `array_agg` / `string_agg` ignored its `ORDER BY ... DESC` and
+  `NULLS` placement. An ORDER BY that is not the argument is now PostgreSQL's
+  `42P10`.
 - `jsonb || jsonb` concatenated the two as text.
 - `FILTER (WHERE ...)` over `generate_series` ignored the filter.
 - An unknown function is `42883` with PostgreSQL's message, argument types

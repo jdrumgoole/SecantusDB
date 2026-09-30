@@ -10587,6 +10587,11 @@ impl PgHandler {
             return Ok(());
         }
         let mut wanted = Self::written_tables(stmt);
+        // Sequences are not transactional (PostgreSQL never rolls a `nextval`
+        // back), and their collection is written OUTSIDE the block, so a
+        // capture restored on ROLLBACK TO would both un-draw values and
+        // conflict with that outside write.
+        wanted.retain(|t| t != SEQUENCE_COLLECTION);
         // A trigger or a user function can write ANY table, and nothing about
         // the statement says which. While either exists, every table is
         // captured -- once per savepoint, so the cost is paid on first touch.
@@ -12913,6 +12918,9 @@ impl PgHandler {
                 };
                 self.in_open_transaction(|| {
                     for (table, docs) in &restore {
+                        if table == SEQUENCE_COLLECTION {
+                            continue;
+                        }
                         self.restore_table(table, docs.as_ref())?;
                     }
                     Ok(())
@@ -18274,6 +18282,14 @@ fn table_has_row_constraints(def: &TableDef) -> bool {
         || !def.foreign_keys.is_empty()
 }
 
+/// A DISTINCT aggregate's `(ascending, nulls last)`, from its ORDER BY.
+fn distinct_agg_order(item: &secantus_pgplan::AggItem) -> (bool, bool) {
+    match item.order.first() {
+        Some(k) => (k.ascending, k.nulls == secantus_pgplan::Nulls::Last),
+        None => (true, true),
+    }
+}
+
 /// Two stored values equal as PostgreSQL compares a key: numerics by value
 /// across the integer / float widths, everything else structurally.
 fn key_values_equal(a: &Bson, b: &Bson) -> bool {
@@ -20718,6 +20734,10 @@ fn compute_basic_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
         // NULL -- it is a value here, not something to skip -- and PostgreSQL
         // returns the deduped values SORTED, NULLs last, rather than in group
         // order (measured on 14.24: `c,a,b,a,NULL` -> `a,b,c,NULL`).
+        // Over an EMPTY input every aggregate but `count` is NULL, and
+        // `array_agg` is no exception, DISTINCT or not -- PostgreSQL 14.24
+        // answers NULL where this answered an empty ARRAY.
+        AggFunc::ArrayAgg if rows.is_empty() => Bson::Null,
         AggFunc::ArrayAgg if item.distinct => {
             let mut seen: Vec<Option<Bson>> = Vec::new();
             let mut kept: Vec<Bson> = Vec::new();
@@ -20729,20 +20749,23 @@ fn compute_basic_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
                     kept.push(v);
                 }
             }
+            // The aggregate's own ORDER BY (which PostgreSQL requires to be
+            // the argument itself under DISTINCT) sets the direction and
+            // where the NULLs go; without one it is ascending, NULLs last.
+            let (ascending, nulls_last) = distinct_agg_order(item);
             kept.sort_by(
                 |a, b| match (matches!(a, Bson::Null), matches!(b, Bson::Null)) {
                     (true, true) => Ordering::Equal,
-                    (true, false) => Ordering::Greater,
-                    (false, true) => Ordering::Less,
-                    (false, false) => compare_values(a, b),
+                    (true, false) if nulls_last => Ordering::Greater,
+                    (true, false) => Ordering::Less,
+                    (false, true) if nulls_last => Ordering::Less,
+                    (false, true) => Ordering::Greater,
+                    (false, false) if ascending => compare_values(a, b),
+                    (false, false) => compare_values(b, a),
                 },
             );
             Bson::Array(kept)
         }
-        // Over an EMPTY input every aggregate but `count` is NULL, and
-        // `array_agg` is no exception -- it answered an empty ARRAY, where
-        // PostgreSQL 14.24 answers NULL.
-        AggFunc::ArrayAgg if rows.is_empty() => Bson::Null,
         AggFunc::ArrayAgg => Bson::Array(
             rows.iter()
                 .map(|d| d.get(field).cloned().unwrap_or(Bson::Null))
@@ -20768,6 +20791,9 @@ fn compute_basic_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
             if item.distinct {
                 texts.sort();
                 texts.dedup();
+                if !distinct_agg_order(item).0 {
+                    texts.reverse();
+                }
             }
             let sep = match item.sep.as_ref() {
                 Some(Bson::String(t)) => t.as_str(),

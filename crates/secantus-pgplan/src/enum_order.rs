@@ -50,10 +50,21 @@ fn scope(
     }
 }
 
+/// The labels of `ty` when it is an ENUM. The user-type table the planner
+/// holds carries composites and other user types beside enums, and treating
+/// one of those as an enum with no labels turned every ordering comparison
+/// of it into NULL.
+fn enum_labels(ty: &str) -> Option<Vec<String>> {
+    if user_composite(ty).is_some() || crate::range::is_range_type(ty) {
+        return None;
+    }
+    user_enum(ty).map(|(_, labels)| labels)
+}
+
 /// The enum a column's declared type names, if any.
 fn column_enum(c: &Column) -> Option<(String, Vec<String>)> {
     let ty = c.extra.get_str("enum_type").unwrap_or(&c.pg_type);
-    user_enum(ty).map(|(_, labels)| (ty.to_string(), labels))
+    enum_labels(ty).map(|labels| (ty.to_string(), labels))
 }
 
 struct Rewriter<'a> {
@@ -98,7 +109,7 @@ impl Rewriter<'_> {
             }
             Some(N::TypeCast(tc)) => {
                 let ty = tc.type_name.as_ref().map(type_name_of)?;
-                user_enum(&ty).map(|(_, labels)| (ty, labels))
+                enum_labels(&ty).map(|labels| (ty, labels))
             }
             _ => None,
         }

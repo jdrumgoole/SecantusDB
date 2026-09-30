@@ -7734,22 +7734,10 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `overlaps` (`&&`); none are ported to the Rust `scalar.rs` yet. Add only what
   the psycopg gauge exercises — probe first. The type itself (cast, column,
   `::text`, binary parameter + result) is done and gauged at 0 divergences.
-- [ ] **OPEN — RUST pgserver: `box` and `regtype` result columns are
-  described as TEXT when the client asks for BINARY.** Every other type the
-  psycopg faker draws — the datetime family, `interval`, ranges, multiranges,
-  `json`/`jsonb` and their arrays, empty arrays — is binary and byte-identical
-  to PostgreSQL 16 as of 2026-09-09 (`test_binary_results_cover_every_faker_type`
-  pins the bytes). Only `box` (`select '(1,2),(3,4)'::box` → PG sends four
-  float8s) and `regtype` (`select pg_typeof(1)` → PG sends the 4-byte oid
-  `00000017`; ours `696e7465676572`) still come back as text. The client reads
-  them correctly — the format travels per column — so this is a fidelity gap,
-  and it matters because psycopg reads EVERY column of a row in column 0's
-  format: a text `pg_typeof` in column 0 makes it run text loaders over the
-  binary columns after it. `test_a_type_without_a_binary_encoding_stays_text`
-  pins the `box` half.
-
-  A MIXED request (some columns binary, some text in one `Bind`) is answered
-  entirely in text. No measured client sends one.
+- [ ] **OPEN — RUST pgserver: a MIXED result-format request** (some columns
+  binary, some text in one `Bind`) is answered entirely in text. No measured
+  client sends one. (`box` and `regtype`, the last types answered in text
+  when binary was asked, are binary as of 2026-09-30.)
 - **Rust PG server: a cursor's rows are encoded at DECLARE, in TEXT, whatever
   format the FETCH asks for.** psycopg's `conn.cursor(name, binary=True)`
   therefore reads text (correctly — the format is described per column, and the

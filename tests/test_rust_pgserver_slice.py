@@ -289,7 +289,6 @@ def test_duplicate_key_reports_what_postgres_reports(home: Path) -> None:
         # PostgreSQL's 42702, never the left side's value taken silently.
         ("SELECT id FROM t JOIN t AS u ON t.id = u.id", "42702"),
         ("SELECT x.id FROM t JOIN t AS u ON t.id = u.id", "42P01"),
-        ("SELECT array_agg(name ORDER BY length(name)) FROM t", "0A000"),
         ("SELECT n, count(*) FROM t", "42803"),
         # `LIKE` is implemented now; over an INTEGER column PostgreSQL 14.13
         # has no such operator, so this moved from 0A000 to 42883 rather than
@@ -300,7 +299,6 @@ def test_duplicate_key_reports_what_postgres_reports(home: Path) -> None:
         # ORDER BY path rather than losing the coverage entirely.
         ("SELECT * FROM t ORDER BY n USING <", "0A000"),
         # The PK is the document's `_id`, which storage treats as immutable.
-        ("UPDATE t SET id = 2 WHERE id = 1", "0A000"),
         ("UPDATE t SET nope = 1", "42703"),
         ("DELETE FROM missing", "42P01"),
     ],
@@ -2877,21 +2875,21 @@ def test_binary_result_columns(home: Path, sql: str, want: object) -> None:
                 assert got == want
 
 
-def test_a_type_without_a_binary_encoding_stays_text(home: Path) -> None:
-    """A column this server cannot render in binary is described as text.
-
-    PostgreSQL honours the request for every type. This one honours it for the
-    types it can encode exactly and describes the rest as text, which the
-    client reads correctly because the format travels per column -- the gap is
-    in `tasks/backlog.md`, not hidden behind a wrong answer. (`box` and
-    `regtype` are what is left; the datetime family moved to binary, see
-    `test_binary_results_cover_every_faker_type`.)
-    """
+def test_box_and_regtype_results_are_binary(home: Path) -> None:
+    """`box` and `regtype` -- the last two types described as text when a
+    client asked for binary -- are sent in binary, byte for byte as
+    PostgreSQL 14 sends them (measured 2026-09-30)."""
     with _Server(home) as server, server.connect() as conn:
         cur = conn.cursor(binary=True)
         cur.execute("select '(1,2),(3,4)'::box")
-        assert cur.pgresult.fformat(0) == 0
-        assert cur.pgresult.get_value(0, 0) == b"(3,4),(1,2)"
+        assert cur.pgresult.fformat(0) == 1
+        assert cur.pgresult.get_value(0, 0) == (
+            b"@\x08\x00\x00\x00\x00\x00\x00@\x10\x00\x00\x00\x00\x00\x00"
+            b"?\xf0\x00\x00\x00\x00\x00\x00@\x00\x00\x00\x00\x00\x00\x00"
+        )
+        cur.execute("select 'int4'::regtype")
+        assert cur.pgresult.fformat(0) == 1
+        assert cur.pgresult.get_value(0, 0) == (23).to_bytes(4, "big")
 
 
 def test_a_server_cursor_describes_its_portal(home: Path) -> None:
@@ -4063,7 +4061,9 @@ def test_composite_parameter_round_trips_in_both_formats(home: Path, binary: boo
 
         cur = conn.cursor(binary=binary)
         # The Parse wall: the parameter's type is resolved from the raw oid.
-        assert cur.execute("select pg_typeof(%s)", [obj]).fetchone()[0] == "cp"
+        # (`::text`: in binary a regtype is its oid, which psycopg has no
+        # loader for -- PostgreSQL sends the same four bytes.)
+        assert cur.execute("select pg_typeof(%s)::text", [obj]).fetchone()[0] == "cp"
         # The value decodes to the composite and round-trips through a cast.
         got = cur.execute("select %s::cp", [obj]).fetchone()[0]
         assert (got.foo, got.bar, got.baz) == ("hi", 42, 3.5)
@@ -4091,7 +4091,7 @@ def test_composite_parameter_round_trips_in_both_formats(home: Path, binary: boo
         register_composite(rinfo, conn2)
         robj = rinfo.python_type(10, Range(empty=True), [])
         cur = conn2.cursor(binary=binary)
-        assert cur.execute("select pg_typeof(%s)", [robj]).fetchone()[0] == "cpr"
+        assert cur.execute("select pg_typeof(%s)::text", [robj]).fetchone()[0] == "cpr"
         assert cur.execute("select %s::text", [robj]).fetchone()[0] == "(10,empty,{})"
 
 
@@ -9836,20 +9836,21 @@ def test_an_unsupported_aggregate_refuses_the_same_way_on_an_empty_table(home: P
     where PostgreSQL answers one. Refusing while planning makes the answer the
     same either way.
 
-    The shapes that showed this (`string_agg`, `count(*) + 1`) have since been
-    implemented, so the property is pinned here with one that has not:
-    `ORDER BY` over an EXPRESSION inside an aggregate.
+    The shapes that showed this (`string_agg`, `count(*) + 1`, an ORDER BY
+    over an expression) have since been implemented, so the property is
+    pinned with an error PostgreSQL raises while planning: a DISTINCT
+    aggregate ordered by something other than its argument (42P10).
     """
-    sql = "select array_agg(s order by length(s)) from t"
+    sql = "select array_agg(distinct s order by length(s)) from t"
     with _Server(home) as server, server.connect() as conn:
         conn.execute("create table t (id int primary key, n int, s text)")
         with pytest.raises(psycopg.Error) as empty:
             conn.execute(sql).fetchall()
-        assert empty.value.sqlstate == "0A000"
+        assert empty.value.sqlstate == "42P10"
         conn.execute("insert into t values (1, 1, 'a')")
         with pytest.raises(psycopg.Error) as filled:
             conn.execute(sql).fetchall()
-        assert filled.value.sqlstate == "0A000"
+        assert filled.value.sqlstate == "42P10"
 
 
 def test_char_n_is_blank_padded_and_carries_its_width(home: Path) -> None:
@@ -10103,9 +10104,8 @@ def test_order_by_inside_an_aggregate(home: Path) -> None:
             "select g, array_agg(s order by id desc) from t group by g order by g"
         ).fetchall() == [(1, ["a", "b"]), (2, [None, "c"]), (3, ["d"])]
         # An expression key is refused rather than answered in another order.
-        with pytest.raises(psycopg.Error) as exc:
-            conn.execute("select array_agg(s order by length(s)) from t").fetchall()
-        assert exc.value.sqlstate == "0A000"
+        # ORDER BY over an expression (n: b=2 a=1 c=3 NULL=4 d=5).
+        assert one("select array_agg(s order by n * -1) from t") == ["d", None, "c", "b", "a"]
 
 
 def test_aggregates_inside_expressions(home: Path) -> None:
@@ -11210,14 +11210,16 @@ def test_correlated_subqueries_in_update_and_delete(home: Path) -> None:
         assert cur.fetchall() == [(3,)]
 
 
-def test_with_recursive_and_a_data_modifying_with_are_refused(home: Path) -> None:
-    """Neither can be inlined: a self-reference has no subquery to expand into,
-    and a write must run exactly once however many times it is referenced."""
+def test_a_data_modifying_with_is_refused(home: Path) -> None:
+    """A write inside WITH must run exactly once however many times it is
+    referenced, so it cannot be inlined like a read. (`WITH RECURSIVE`, once
+    refused beside it, is iterated to a fixed point now.)"""
     with _Server(home) as server, server.connect() as conn:
         _dept_emp(conn)
         cur = conn.cursor()
+        cur.execute("WITH RECURSIVE c AS (SELECT 1 AS x) SELECT x FROM c")
+        assert cur.fetchall() == [(1,)]
         for sql in (
-            "WITH RECURSIVE c AS (SELECT 1 AS x) SELECT x FROM c",
             "WITH c AS (INSERT INTO sq_dept VALUES (9,'x',1) RETURNING id) SELECT * FROM c",
         ):
             with pytest.raises(psycopg.Error) as info:
@@ -14231,3 +14233,37 @@ def test_gin_gist_brin_spgist_indexes(home: Path) -> None:
         assert _sqlstate(conn, "DROP EXTENSION btree_gin") == "2BP01"
         conn.execute("DROP EXTENSION btree_gin CASCADE")
         assert _fetch(conn, "SELECT count(*) FROM pg_indexes WHERE indexname = 'gx_gn'") == [(0,)]
+
+
+def test_rollback_to_savepoint_keeps_sequence_draws(home: Path) -> None:
+    """ROLLBACK TO after an insert into a `serial` table works, and the draw
+    is not undone -- PostgreSQL never rolls a sequence back. (Restoring the
+    sequence's catalog there collided with its non-transactional write and
+    failed the whole block with 40001.)"""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE TABLE sp_s (id serial PRIMARY KEY, v text)")
+        conn.autocommit = False
+        conn.execute("SAVEPOINT s")
+        conn.execute("INSERT INTO sp_s (v) VALUES ('rolled back')")
+        conn.execute("ROLLBACK TO s")
+        conn.execute("INSERT INTO sp_s (v) VALUES ('kept')")
+        conn.commit()
+        assert _fetch(conn, "SELECT id, v FROM sp_s") == [(2, "kept")]
+
+
+def test_composite_and_distinct_aggregate_ordering(home: Path) -> None:
+    """Ordering comparisons of COMPOSITE values are decided (not NULL), and a
+    DISTINCT aggregate follows its ORDER BY's direction and NULL placement,
+    answering NULL over no rows."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE TYPE cpo AS (a int, b int)")
+        assert _fetch(conn, "SELECT row(1, 2)::cpo < row(1, 3)::cpo") == [(True,)]
+        conn.execute("CREATE TABLE dag (id int PRIMARY KEY, s text)")
+        assert _fetch(conn, "SELECT array_agg(DISTINCT s) FROM dag") == [(None,)]
+        conn.execute("INSERT INTO dag VALUES (1, 'b'), (2, 'a'), (3, NULL), (4, 'b')")
+        assert _fetch(conn, "SELECT array_agg(DISTINCT s ORDER BY s DESC) FROM dag") == [
+            ([None, "b", "a"],)
+        ]
+        assert _fetch(conn, "SELECT string_agg(DISTINCT s, ',' ORDER BY s DESC) FROM dag") == [
+            ("b,a",)
+        ]
