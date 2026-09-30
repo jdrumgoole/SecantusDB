@@ -1242,8 +1242,13 @@ fn project_one(doc: &Document, spec: &Document, vars: &Document) -> R<Document> 
         }
     }
 
-    let has_inclusion = !inclusions.is_empty() || !computed.is_empty();
     let has_exclusion = !exclusions.is_empty();
+    // `{_id: 1}` on its own is an INCLUSION projection: mongod returns only
+    // `_id` (measured 8.2.11, 2026-09-30). With nothing else included it fell
+    // through to exclusion mode here, excluded nothing, and returned the whole
+    // document. Beside an exclusion (`{_id: 1, a: 0}`) it stays an exclusion.
+    let id_only_inclusion = id_handling == Some(1) && !has_exclusion;
+    let has_inclusion = !inclusions.is_empty() || !computed.is_empty() || id_only_inclusion;
     if has_inclusion && has_exclusion {
         return Err(Fallback::Defer); // Python raises (mix of inclusion/exclusion)
     }
@@ -1610,5 +1615,27 @@ mod redact_tests {
             }}
         }})];
         assert!(runtime_error(&[doc! {"_id": 1, "n": 1}], &defaulted, &vars, None).is_none());
+    }
+}
+
+#[cfg(test)]
+mod project_id_only_tests {
+    use super::*;
+    use bson::{bson, doc};
+
+    fn project(spec: Bson) -> Document {
+        let docs = vec![doc! {"_id": 1, "v": true, "w": 2}];
+        apply_pipeline(docs, &[bson!({"$project": spec})], &Document::new(), None)
+            .unwrap()
+            .remove(0)
+    }
+
+    /// mongod 8.2.11 (2026-09-30).
+    #[test]
+    fn id_alone_is_an_inclusion_projection() {
+        assert_eq!(project(bson!({"_id": 1})), doc! {"_id": 1});
+        assert_eq!(project(bson!({"_id": true})), doc! {"_id": 1});
+        assert_eq!(project(bson!({"_id": 1, "v": 0})), doc! {"_id": 1, "w": 2});
+        assert_eq!(project(bson!({"_id": 0, "w": 1})), doc! {"w": 2});
     }
 }

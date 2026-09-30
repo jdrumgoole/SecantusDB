@@ -1477,12 +1477,106 @@ fn granularity_coerce(v: &Bson) -> R<f64> {
         Bson::Int32(n) => *n as f64,
         Bson::Int64(n) => *n as f64,
         Bson::Double(d) => *d,
+        // A decimal is rounded in decimal (see `granularity_round`); the f64 is
+        // only its sign / NaN check here.
+        Bson::Decimal128(d) => d.to_string().parse::<f64>().unwrap_or(f64::NAN),
         _ => return Err(Fallback::Defer),
     };
     if f.is_nan() || f < 0.0 {
         return Err(Fallback::Defer);
     }
     Ok(f)
+}
+
+/// One granularity rounding of a groupBy value, in its own type: a decimal is
+/// rounded in decimal and answers a decimal (mongod's
+/// `GranularityRounder*::round{Up,Down}` branch on `numberDecimal`); every
+/// other number goes through the double path and answers a double. Measured
+/// 8.2.11 (2026-09-30): `[2, NumberDecimal("20")]` bucket to
+/// `(1.6, 2.5)` and `(2.5, NumberDecimal("25.0000000000000"))`. A decimal used
+/// to refuse the whole stage.
+fn granularity_round(v: &Bson, granularity: &str, series: &[f64], up: bool) -> R<Bson> {
+    if let Bson::Decimal128(_) = v {
+        let d = decimal::from_bson(v).ok_or(Fallback::Defer)?;
+        if d.is_zero() || matches!(d, decimal::Dec::Inf(_)) {
+            return Ok(v.clone());
+        }
+        let r = if granularity == "POWERSOF2" {
+            decimal::granularity_round_pow2(&d, up)
+        } else {
+            decimal::granularity_round_series(&d, series, up)
+        };
+        return r.as_ref().and_then(decimal::to_bson).ok_or(Fallback::Defer);
+    }
+    if granularity == "POWERSOF2" {
+        if let Some(n) = match v {
+            Bson::Int32(n) => Some(i64::from(*n)),
+            Bson::Int64(n) => Some(*n),
+            _ => None,
+        } {
+            // mongod returns a zero unchanged, in its own type.
+            return Ok(if n == 0 {
+                v.clone()
+            } else {
+                pow2_round_integer(n, up)
+            });
+        }
+    }
+    let x = granularity_coerce(v)?;
+    if granularity == "POWERSOF2" && x != 0.0 && x.is_finite() {
+        // The double branch also ends in `$pow(2, <int exponent>)`, so a
+        // non-negative exponent answers an INT (`1024.0` rounds up to `2048`,
+        // not `2048.0`) and only a negative one a double.
+        let e = if up {
+            x.log2().floor() + 1.0
+        } else {
+            x.log2().ceil() - 1.0
+        };
+        return Ok(pow2_of_exponent(e as i64));
+    }
+    Ok(Bson::Double(match (granularity == "POWERSOF2", up) {
+        (true, true) => round_up_pow2(x),
+        (true, false) => round_down_pow2(x),
+        (false, true) => round_up_series(x, series),
+        (false, false) => round_down_series(x, series),
+    }))
+}
+
+/// mongod's INTEGER branch of `GranularityRounderPowersOfTwo`: the exponent
+/// by bit counting, then `$pow(2, exponent)` -- an int, widening to a long only
+/// when it must. The double path answered `512.0` where mongod answers `512`
+/// (measured 8.2.11, 2026-09-30).
+fn pow2_round_integer(n: i64, up: bool) -> Bson {
+    let lz = n.leading_zeros() as i64;
+    let tz = n.trailing_zeros() as i64;
+    let exp = if up {
+        63 - lz + 1
+    } else if lz + tz == 63 {
+        // Already a power of two: round down to the one below it.
+        63 - lz - 1
+    } else {
+        63 - lz
+    };
+    pow2_of_exponent(exp)
+}
+
+/// `$pow(2, exp)` for an integer exponent: int, widening to long, and a double
+/// only for a negative (or too large) exponent.
+fn pow2_of_exponent(exp: i64) -> Bson {
+    match exp {
+        0..=30 => Bson::Int32(1 << exp),
+        31..=62 => Bson::Int64(1i64 << exp),
+        _ => Bson::Double(2f64.powi(exp as i32)),
+    }
+}
+
+/// Whether a rounded boundary is numerically zero.
+fn is_numeric_zero(v: &Bson) -> bool {
+    match v {
+        Bson::Double(d) => *d == 0.0,
+        Bson::Decimal128(_) => decimal::from_bson(v).is_some_and(|d| d.is_zero()),
+        _ => false,
+    }
 }
 
 /// mongod `DocumentSourceBucketAuto::populateNextBucket` with a granularity
@@ -1496,9 +1590,10 @@ fn bucket_auto_granular(
     vars: &Document,
 ) -> R<Vec<Document>> {
     let n = keyed.len();
-    let mut values: Vec<f64> = Vec::with_capacity(n);
+    let mut values: Vec<Bson> = Vec::with_capacity(n);
     for (_, v, _) in keyed {
-        values.push(granularity_coerce(v)?);
+        granularity_coerce(v)?;
+        values.push(v.clone());
     }
     let is_pow2 = granularity == "POWERSOF2";
     let series: &[f64] = if is_pow2 {
@@ -1506,20 +1601,8 @@ fn bucket_auto_granular(
     } else {
         series_for(granularity).ok_or(Fallback::Defer)?
     };
-    let rup = |x: f64| {
-        if is_pow2 {
-            round_up_pow2(x)
-        } else {
-            round_up_series(x, series)
-        }
-    };
-    let rdn = |x: f64| {
-        if is_pow2 {
-            round_down_pow2(x)
-        } else {
-            round_down_series(x, series)
-        }
-    };
+    let rup = |x: &Bson| granularity_round(x, granularity, series, true);
+    let rdn = |x: &Bson| granularity_round(x, granularity, series, false);
 
     let mut approx = (n as f64 / n_buckets as f64 + 0.5).floor() as i64; // std::round (positive)
     if approx < 1 {
@@ -1528,7 +1611,7 @@ fn bucket_auto_granular(
 
     let mut out: Vec<Document> = Vec::new();
     let mut idx = 0usize;
-    let mut previous_max: Option<f64> = None;
+    let mut previous_max: Option<Bson> = None;
     let mut carry: Option<usize> = None;
     let mut bucket_num = 0usize;
     loop {
@@ -1543,13 +1626,16 @@ fn bucket_auto_granular(
             idx += 1;
             c
         };
-        let cur_min = previous_max.unwrap_or_else(|| rdn(values[cur_i]));
-        let mut cur_max = values[cur_i];
+        let cur_min = match previous_max.take() {
+            Some(p) => p,
+            None => rdn(&values[cur_i])?,
+        };
+        let mut cur_max = values[cur_i].clone();
         let mut chunk: Vec<usize> = vec![cur_i];
         let is_last = bucket_num == n_buckets;
         let mut i = 1i64;
         while idx < n && (i < approx || is_last) {
-            cur_max = values[idx];
+            cur_max = values[idx].clone();
             chunk.push(idx);
             idx += 1;
             i += 1;
@@ -1561,10 +1647,10 @@ fn bucket_auto_granular(
         } else {
             None
         };
-        let boundary = rup(cur_max);
+        let boundary = rup(&cur_max)?;
         // Absorb values that now fall below the rounded boundary (boundary fixed).
         while let Some(ni) = next_i {
-            if boundary > values[ni] {
+            if crate::order::cmp(&boundary, &values[ni]) == Ordering::Greater {
                 chunk.push(ni);
                 next_i = if idx < n {
                     let c = idx;
@@ -1578,10 +1664,10 @@ fn bucket_auto_granular(
             }
         }
         let bucket_max = match next_i {
-            Some(ni) if boundary == 0.0 => rdn(values[ni]),
+            Some(ni) if is_numeric_zero(&boundary) => rdn(&values[ni])?,
             _ => boundary,
         };
-        let id = Bson::Document(bson::doc! { "min": cur_min, "max": bucket_max });
+        let id = Bson::Document(bson::doc! { "min": cur_min, "max": bucket_max.clone() });
         let chunk_docs: Vec<&Document> = chunk.iter().map(|&ci| keyed[ci].2).collect();
         out.push(accumulate_into(id, output_spec, &chunk_docs, vars)?);
         previous_max = Some(bucket_max);
@@ -2069,5 +2155,76 @@ mod tests {
         assert_eq!(out[0].get("_id"), Some(&Bson::String("a".into())));
         assert_eq!(out[1].get("_id"), Some(&Bson::String("b".into())));
         assert_eq!(out[2].get("_id"), Some(&Bson::String("c".into())));
+    }
+}
+
+/// `$bucketAuto` granularity rounds each boundary in the rounded value's own
+/// type (mongod 8.2.11, 2026-09-30).
+#[cfg(test)]
+mod bucket_auto_granularity_type_tests {
+    use super::*;
+    use bson::{bson, doc, Decimal128};
+    use std::str::FromStr;
+
+    fn bounds(values: Vec<Bson>, gran: &str, buckets: i32) -> Vec<(Bson, Bson)> {
+        let docs: Vec<Document> = values.into_iter().map(|v| doc! {"x": v}).collect();
+        let spec = bson!({"groupBy": "$x", "buckets": buckets, "granularity": gran});
+        bucket_auto_stage(&spec, &docs, &Document::new())
+            .unwrap()
+            .into_iter()
+            .map(|d| {
+                let id = d.get_document("_id").unwrap();
+                (
+                    id.get("min").unwrap().clone(),
+                    id.get("max").unwrap().clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn dec(s: &str) -> Bson {
+        Bson::Decimal128(Decimal128::from_str(s).unwrap())
+    }
+
+    #[test]
+    fn a_decimal_rounds_in_decimal_with_mongods_quantum() {
+        assert_eq!(
+            bounds(
+                vec![dec("1.5"), dec("20"), dec("300"), dec("4000")],
+                "R5",
+                2
+            ),
+            vec![
+                (dec("1.00000000000000"), dec("25.0000000000000")),
+                (dec("25.0000000000000"), dec("6300.0000000000000")),
+            ]
+        );
+        assert_eq!(
+            bounds(vec![dec("3")], "POWERSOF2", 1),
+            vec![(
+                dec("2.000000000000000000000000000000000"),
+                dec("4.000000000000000000000000000000000")
+            )]
+        );
+    }
+
+    #[test]
+    fn powers_of_two_answer_an_int_for_a_whole_power() {
+        assert_eq!(
+            bounds(
+                vec![Bson::Int32(2), dec("20"), Bson::Int32(300)],
+                "POWERSOF2",
+                1
+            ),
+            vec![(Bson::Int32(1), Bson::Int32(512))]
+        );
+        assert_eq!(
+            bounds(
+                vec![Bson::Double(0.3), Bson::Double(1024.0)],
+                "POWERSOF2",
+                1
+            ),
+            vec![(Bson::Double(0.25), Bson::Int32(2048))]
+        );
     }
 }

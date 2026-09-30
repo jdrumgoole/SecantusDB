@@ -1013,7 +1013,7 @@ These commands accept the request and return a wire-valid response, but the resp
 
 These work end-to-end but cut corners.
 
-- [x] **`$bucketAuto` `granularity` rounding — SHIPPED, hex-exact on both servers (2026-07-19).** The prior "1-ULP blocker" was a wrong-constants artifact: mongod stores each preferred-number series as **integer-valued doubles** (R5 = `{10,16,25,40,63}`, not normalised `0.63`-style literals) and computes `series_element * multiplier` (multiplier a power of 10), which reproduces its non-standard ULPs (`63 * 0.1 = 6.300000000000001`) bit-for-bit in Python and Rust f64. Ported `roundUp` / `roundDown` (double path) verbatim from `granularity_rounder_preferred_numbers.cpp` + the `populateNextBucket` boundary walk (first min = `roundDown(dataMin)`, every other boundary = `roundUp(chunkMax)` with the absorb-below-boundary loop; `std::round(nDocs/nBuckets)` bucket size), plus the POWERSOF2 rounder. Both engines: `secantus.aggregate._bucket_auto_granular` (`_BUCKET_AUTO_SERIES` + `_round_up/down_series` + `_round_up/down_pow2`) and `secantus-core` `group::bucket_auto_granular`. **Verified hex-exact vs a live mongod 7.0.12 oracle** (1200+ cases across all 13 granularities × scales × bucket counts, incl. edges: zeros, exact-boundary values, +inf, single bucket); Rust pinned to Python by a 400-case parity fuzz. Value validation reproduces mongod's codes on the Python server — non-numeric 40258, NaN 40259, negative 40260 (name errors 40261/40257 already shipped) — and defers on the Rust server (BadValue, the standing error-code gap). **Remaining sub-limitation:** a **Decimal128**-valued groupBy defers/rejects (code 2) rather than running mongod's separate Decimal128 rounder — the standing Decimal128 precision deferral; the double/int path (the common case) is complete.
+- [x] **`$bucketAuto` `granularity` rounding — SHIPPED, hex-exact on both servers (2026-07-19).** The prior "1-ULP blocker" was a wrong-constants artifact: mongod stores each preferred-number series as **integer-valued doubles** (R5 = `{10,16,25,40,63}`, not normalised `0.63`-style literals) and computes `series_element * multiplier` (multiplier a power of 10), which reproduces its non-standard ULPs (`63 * 0.1 = 6.300000000000001`) bit-for-bit in Python and Rust f64. Ported `roundUp` / `roundDown` (double path) verbatim from `granularity_rounder_preferred_numbers.cpp` + the `populateNextBucket` boundary walk (first min = `roundDown(dataMin)`, every other boundary = `roundUp(chunkMax)` with the absorb-below-boundary loop; `std::round(nDocs/nBuckets)` bucket size), plus the POWERSOF2 rounder. Both engines: `secantus.aggregate._bucket_auto_granular` (`_BUCKET_AUTO_SERIES` + `_round_up/down_series` + `_round_up/down_pow2`) and `secantus-core` `group::bucket_auto_granular`. **Verified hex-exact vs a live mongod 7.0.12 oracle** (1200+ cases across all 13 granularities × scales × bucket counts, incl. edges: zeros, exact-boundary values, +inf, single bucket); Rust pinned to Python by a 400-case parity fuzz. Value validation reproduces mongod's codes on the Python server — non-numeric 40258, NaN 40259, negative 40260 (name errors 40261/40257 already shipped) — and defers on the Rust server (BadValue, the standing error-code gap). **The Decimal128 sub-limitation is FIXED on the Rust server (2026-09-30)**: a decimal groupBy runs mongod's decimal rounder (`decimal::granularity_round_series` / `_pow2`, transcribed from the 8.2 source) with its quantum (`1600.0000000000000`), and a mixed-type set rounds each boundary in its own type. Measuring it found a second, older divergence on the double/int path: `POWERSOF2` answers an INT for a whole power (`$pow(2, <int>)` in mongod) where both servers answered a double. `tools/probes/bucket_auto_granularity.py`: 240 of 312 divergent -> 0. The Python server still refuses a decimal groupBy (code 2) and still answers doubles for `POWERSOF2`.
 - [x] **`_id` numeric type bridge — NaN was a real bug and is FIXED (2026-08-22).**
   Works for finite int/float/Decimal128; `bool` is deliberately not numeric. The old
   "NaN and infinity fall through to the BSON-blob path; behavior is unspecified" was
@@ -6924,6 +6924,75 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
 
 ## 7. Python → Rust rewrite (in progress)
 
+### 7.00 Rust MongoDB server batch — 2026-09-30, measured against mongod 8.2.11
+
+Every item below was found by running the Rust server and mongod side by side
+(`PROBE_SERVER` against a real `mongod`), fixed on the Rust server, and pinned by
+a probe that goes 0-divergent plus a Rust test. Old-build -> new-build counts
+are the probes' own numbers.
+
+- [x] **Silent data loss, all on `main` before this batch** (`planner_fidelity.rs`,
+  `tools/probes/index_result_sets.py`):
+  - a compound sort walked a PARTIAL index under an empty filter (4 of 10 rows);
+  - a sort or a hint walked a MULTIKEY index, and an empty-array document has
+    no entry -- `find({}).sort({a: 1})`, `find({}).hint("a_1")` and
+    `count({}, hint: "a_1")` all dropped it;
+  - an index range scan bounded by an array or document compared raw-BSON
+    bytes (length first): `{x: {$gt: [1, 2, 3]}}` dropped `{x: [9]}`.
+- [x] **Wrong answers:** `find().sort()` over embedded documents / nested arrays
+  ordered by encoded LENGTH (`nested_value_sort.py` 14 -> 0 of 20); aggregate
+  `$project: {_id: 1}` returned whole documents; `$slice` took a decimal as
+  null, a count past int32 as "all", a count of 0 as `[]`, and a negative
+  start with a count from the wrong end; `$indexOf*` past int32 answered -1;
+  `$range` refused over 100,000 elements (`int32_arguments.py` 83 -> 0 of
+  189); `$bucketAuto` POWERSOF2 answered doubles for whole powers.
+- [x] **Wire:** an aggregate result over 16 MB went out as an 84 MB message the
+  driver rejected (now 10334); decoded first batches are byte-budgeted.
+- [x] **Missing:** decimal `$pow` / `$atan2` / `$bucketAuto` granularity; PCRE
+  `$` / `\Z` (`\Z` was refused); `$jsonSchema` `integer` / unknown type
+  names; `maxTimeMS` on aggregate, distinct, sorted find and the index walks
+  (`max_time_expiry.py` 0 of 11); a multi-field filter riding one
+  single-field index, and a sort under an unindexed filter walking the sort
+  index (mongod's two plans).
+- [x] **Probe harness:** three probes ran their embedded server into a
+  `WT_PANIC` at exit (the store was deleted under a live connection) --
+  `_servers.probe_server()` now stops it first.
+
+**Found and NOT fixed -- Python-server divergences** (out of this batch's scope,
+which was the Rust server; each measured against 8.2.11 on 2026-09-30):
+
+- [ ] `maxTimeMS`: 8 of 11 commands differ (`tools/probes/max_time_expiry.py`
+  without `PROBE_SERVER`) -- no executor prefix on find / aggregate /
+  distinct / count.
+- [ ] regex `\Z` misses a final newline and `\z` is refused (the anchor block
+  of `regex_value_semantics.py`).
+- [ ] `$jsonSchema` accepts `type: "integer"` (mongod: 9).
+- [ ] aggregate `$project: {_id: 1}` returns whole documents
+  (`aggregation_stage_results.py`, python 2).
+- [ ] `$slice: [a, <negative>, n]` counts from the raw start (`[[4, 3, 1, 3, 1],
+  -3, 4]` is `[]`, mongod `[1, 3, 1]`) and a count of 0 or less is accepted.
+  `test_index_math_fuzz` draws around both, with the reason written in.
+- [ ] `$bucketAuto` refuses a decimal groupBy with a granularity, and answers
+  doubles for `POWERSOF2`.
+- [ ] decimal `$pow` is `exp(e * ln b)` at 34 digits; correctly rounded matches
+  mongod on 130 of 183 finite pairs, that method on 56.
+
+**Still open on the Rust server after this batch:**
+
+- [ ] **A mongod plan artifact, recorded not matched:** with a multikey index,
+  `$sort: {x: -1, _id: 1}` over `[[3], [1, 2, 3]]` returns `[1, 0]` on mongod,
+  contradicting its own `_id` tiebreak (without the index it returns `[0, 1]`).
+  `nested_value_sort.py` lists it as KNOWN.
+- [ ] **The entries table still orders document / array keys by raw BSON.** The
+  batch made every READER correct (sort walks, hint walks and range bounds no
+  longer trust that order), so no query answers differently. What is lost is
+  speed: those queries now post-sort or scan. A real fix is an `entryFormat`
+  bump with a value-ordered encoding for documents and arrays, on both servers
+  (the layout is shared).
+- [ ] **The Go gauge has not been re-run** with `--noop-heartbeat-seconds` now
+  reaching the Rust server (see the §7.5 entry).
+
+
 - [x] **Aggregation stage-spec messages — the PYTHON server is DONE 2026-09-02.**
   `tools/probes/aggregation_stage_specs.py` went 167 → 22 → **0 of 725**. The
   rule the remaining 22 all turned on: mongod parses a stage spec field by
@@ -10871,7 +10940,12 @@ session tests + the go harness race below.
   mtest harness under full-gauge load, not suppressible at the runner and not a server bug.
   **Accepted**, same as the Python-server verdict in §5. See the top-section entry for the
   full 2026-06-26 evidence.
-  - [ ] *Minor, separate — the CAUSE has changed; re-probed 2026-08-20.* The go gauge
+  - [x] **Unstripped 2026-09-30.** `_PYTHON_ONLY_FLAGS` is empty: `secantusd-rs`
+    accepts all six flags it listed, and with `--noop-heartbeat-seconds 1` a quiet
+    change stream's resume token advances on every getMore (13 distinct in 13s).
+    The Go gauge has not yet been re-run with heartbeats on against the Rust server
+    -- that confirmation is still owed. The original entry follows.
+  - ~~*Minor, separate — the CAUSE has changed; re-probed 2026-08-20.*~~ The go gauge
     still runs the Rust server without periodic noop heartbeats, but no longer because
     the binary lacks the flag: `secantusd-rs --help` lists `--noop-heartbeat-seconds S`,
     `crates/secantus-server/src/args.rs:268` parses it, and the daemon starts cleanly

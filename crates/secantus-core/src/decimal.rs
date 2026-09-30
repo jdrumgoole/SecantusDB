@@ -2616,6 +2616,114 @@ pub fn rem(a: &Dec, b: &Dec) -> Option<Dec> {
     })
 }
 
+// --- `$bucketAuto` granularity on Decimal128 ------------------------------
+//
+// Transcribed from mongod 8.2's `granularity_rounder_preferred_numbers.cpp`:
+// the series -- stored integer-valued, `[10, 16, 25, 40, 63]` for R5, see
+// `group::series_for` -- are converted with `Decimal128(double)` (15
+// significant digits, so `16.0000000000000`), and an exact Decimal128
+// multiplier is scaled by x10 / /10 until the number falls inside the scaled
+// series. The multiplier's quantum shows in the result: `(10^k, exp 0)` after k
+// multiplications, `(1, exp -k)` after k divisions (1600 is
+// `1600.0000000000000`, 0.025 is `0.0250000000000000`; measured 8.2.11,
+// 2026-09-30). The only products mongod returns use a multiplier that has moved
+// in one direction, so those two forms are all there is.
+
+/// `series * 10^k` in the quantum mongod's multiplier gives it.
+fn granularity_product(series: &Dec, k: i32) -> Dec {
+    match series {
+        Dec::Fin { sign, coeff, exp } if k >= 1 => {
+            let mut c = coeff.clone();
+            c.extend(std::iter::repeat_n(0u8, k as usize));
+            Dec::Fin {
+                sign: *sign,
+                coeff: c,
+                exp: *exp,
+            }
+        }
+        Dec::Fin { sign, coeff, exp } => Dec::Fin {
+            sign: *sign,
+            coeff: coeff.clone(),
+            exp: exp + k,
+        },
+        other => other.clone(),
+    }
+}
+
+/// The furthest the multiplier may travel before the answer is decided by the
+/// format's own range.
+const GRANULARITY_MAX_STEPS: i32 = 6_200;
+
+/// A preferred-number series rounding of a POSITIVE finite decimal (`up` =
+/// `roundUp`). `None` if the scaling would leave decimal128's range.
+pub fn granularity_round_series(number: &Dec, series: &[f64], up: bool) -> Option<Dec> {
+    use std::cmp::Ordering::{Greater, Less};
+    let ser: Vec<Dec> = series
+        .iter()
+        .map(|f| from_bson(&Bson::Double(*f)))
+        .collect::<Option<_>>()?;
+    let (front, back) = (ser.first()?, ser.last()?);
+    let cmp = |k: i32, s: &Dec| cmp_abs(number, &granularity_product(s, k));
+    let mut k = 0i32;
+    if up {
+        while cmp(k, back)? != Less {
+            k += 1;
+            if k > GRANULARITY_MAX_STEPS {
+                return None;
+            }
+        }
+        while cmp(k, front)? == Less {
+            let previous_min = granularity_product(front, k);
+            k -= 1;
+            if k < -GRANULARITY_MAX_STEPS {
+                return None;
+            }
+            if cmp(k, back)? != Less {
+                return Some(previous_min);
+            }
+        }
+        // The first series element strictly greater than the number.
+        ser.iter()
+            .find(|s| cmp(k, s) == Some(Less))
+            .map(|s| granularity_product(s, k))
+    } else {
+        while cmp(k, front)? != Greater {
+            k -= 1;
+            if k < -GRANULARITY_MAX_STEPS {
+                return None;
+            }
+        }
+        while cmp(k, back)? == Greater {
+            let previous_max = granularity_product(back, k);
+            k += 1;
+            if k > GRANULARITY_MAX_STEPS {
+                return None;
+            }
+            if cmp(k, front)? != Greater {
+                return Some(previous_max);
+            }
+        }
+        // The element before the first one not less than the number.
+        let idx = ser.iter().position(|s| cmp(k, s) != Some(Greater))?;
+        idx.checked_sub(1).map(|i| granularity_product(&ser[i], k))
+    }
+}
+
+/// `POWERSOF2` rounding of a positive finite decimal: `$pow(2, n)` with `n`
+/// from the double `log2`, exactly as mongod computes it -- which makes the
+/// result the exact power of two, padded to 34 digits.
+pub fn granularity_round_pow2(number: &Dec, up: bool) -> Option<Dec> {
+    let f: f64 = to_string(number).parse().ok()?;
+    let l = f.log2();
+    let n = if up { l.floor() + 1.0 } else { l.ceil() - 1.0 };
+    if !n.is_finite() || n.abs() > 20_000.0 {
+        return None;
+    }
+    pow(&hp_from_i64(2, 0), &hp_from_i64(n as i64, 0))
+        .ok()
+        .flatten()
+}
+
 // --- `$pow` and `$atan2` on Decimal128 -----------------------------------
 //
 // Both follow the rule the rest of the decimal transcendentals settled on
@@ -3054,5 +3162,35 @@ mod pow_atan2_tests {
         ] {
             assert_eq!(show(atan2(&d(y), &d(x))), want, "atan2({y}, {x})");
         }
+    }
+}
+
+#[cfg(test)]
+mod granularity_tests {
+    use super::*;
+
+    const R5: [f64; 5] = [10.0, 16.0, 25.0, 40.0, 63.0];
+
+    fn up(v: &str) -> String {
+        to_string(&granularity_round_series(&parse(v).unwrap(), &R5, true).unwrap())
+    }
+    fn down(v: &str) -> String {
+        to_string(&granularity_round_series(&parse(v).unwrap(), &R5, false).unwrap())
+    }
+
+    /// mongod 8.2.11, 2026-09-30: the multiplier's quantum shows in the result.
+    #[test]
+    fn preferred_series_quanta_match_mongod() {
+        assert_eq!(up("1.5"), "1.60000000000000");
+        assert_eq!(down("1.5"), "1.00000000000000");
+        assert_eq!(up("20"), "25.0000000000000");
+        assert_eq!(down("20"), "16.0000000000000");
+        assert_eq!(down("200"), "160.0000000000000");
+        assert_eq!(down("2000"), "1600.0000000000000");
+        assert_eq!(up("4000"), "6300.0000000000000");
+        assert_eq!(down("3E+10"), "25000000000.0000000000000");
+        assert_eq!(up("0.2"), "0.250000000000000");
+        assert_eq!(up("0.02"), "0.0250000000000000");
+        assert_eq!(down("2E-7"), "1.60000000000000E-7");
     }
 }
