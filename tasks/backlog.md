@@ -615,28 +615,18 @@ remain open:
       ignores every other kind the Rust server stores in the shared
       `__sql_triggers__` catalog; its `event` key carries only the first
       event of a multi-event trigger.
-- [ ] **OPEN — RUST pgserver: what batch 6 (FTS, formatting, datetime,
-      jsonpath, statistical aggregates) still refuses or approximates
-      (2026-09-29).** Corpora `fts` / `fts2` / `datetimes` / `char_padding` /
-      `char_padding2` / `json_record` / `whole_row` / `regr_aggregates` /
-      `hypothetical_set` at 0 divergences against PostgreSQL 14; matrices
-      numeric `to_char` 471/471, `to_number` 401/401, datetime 1009/1009,
-      jsonpath 935/935, aggregates 239 + 375 all matching. Left:
-      - Text search lowercasing is ASCII (C-locale), which is what the
-        reference cluster runs; a UTF-8 locale would fold more.
-      - `keyvalue()` ids are computed from a modelled jsonb binary layout; a
-        path that visits the SAME object twice through different containers
-        can get an id PostgreSQL would number differently.
-      - A malformed `to_date` / `to_timestamp` input that PostgreSQL reports
-        as `22008` is `22007` in a few shapes (message text matches).
 - [ ] **OPEN — RUST pgserver: what batch 7 (UPDATE FROM, updatable views,
       numeric math, bit strings, date/time input) leaves (2026-09-29).**
       Corpora `dml_from`, `view_dml`, `expr_index`, `grouping_fn`, `gs_types`,
       `agg_where`, `dt_input` (212 lines) and the numeric / catalog / misc /
       transactions / views / indexes / defaults / explain / casts corpora at 0
       against PostgreSQL 14. Left:
-      - EXPLAIN's structured formats carry no `Filter` / `Hash Cond` /
-        `Join Type` / costs: the plan holds the lowered MQL filter, not SQL.
+      - EXPLAIN (batch 12) prints `Index Cond` / `Filter` / `Hash Cond` /
+        `Join Filter` and scan aliases as PostgreSQL does (`explain_quals`
+        corpus). What it cannot reproduce is PostgreSQL's COST MODEL: costs
+        print as zeros, and which side of a hash join is built (and so
+        `Hash Left` vs `Hash Right Join`) follows this server's join order,
+        not PostgreSQL's estimates.
       - An EXPRESSION index is an empty storage index (a synthetic key, a
         partial filter nothing matches) plus its SQL; a MongoDB-side
         `listIndexes` on that collection shows it. Its UNIQUE check scans the
@@ -678,11 +668,9 @@ remain open:
         message names. A name mentioned twice may point at the wrong
         occurrence. An error inside a function body carries no internal
         position.
-      - `information_schema.tables` / `.columns` and `pg_class` list no
-        `pg_catalog` or `information_schema` relation (PostgreSQL 15 lists
-        139 relations and 2,005 columns); matching the set needs the catalogs
-        this server does not model. psql's describe commands do not depend on
-        it (`psql_describe*` corpora, byte-identical output).
+      - `pg_class` lists no `pg_catalog` or `information_schema` relation.
+        (`information_schema.tables` / `.columns` do since batch 12 -- all
+        208 relations and 2,005 columns, `infoschema_system` corpus.)
       - **Harness, not server:** `tests/test_tmp_retention_guard.py::
         test_default_tmp_retention_policy_is_allowed` timed out ONCE in three
         quiet full-suite runs on 2026-09-30: its nested `pytest --co -q
@@ -700,12 +688,11 @@ remain open:
       `collations`, `user_casts`, `views_ruleutils`, `expr_ruleutils`,
       `internal_functions`, `catalog_b11`, `pgcrypto_ciphers`. Left, each
       measured:
-      - **Rules** run as row-level actions of the statement (a synthetic
-        BEFORE trigger for INSTEAD, AFTER for ALSO), so an action runs once
-        per affected ROW where PostgreSQL rewrites the statement into one
-        query: an action that aggregates over the table (`INSERT ... SELECT
-        count(*)`) sees each row's state, not the statement's. Rules on a
-        VIEW and `ON SELECT` rules (turning a table into a view) are refused.
+      - **Rules** (rewritten as PostgreSQL's rewriter does since batch 12:
+        `secantus-pgplan/src/rule_rewrite.rs`) refuse only `ON SELECT` rules
+        (turning a table into a view), and a statement shape the rewrite
+        cannot join to its source (a multi-row VALUES action, a set-operation
+        action SELECT, an INSERT with `DEFAULT` inside VALUES) answers 0A000.
       - **Event triggers**: `table_rewrite` never fires, and only a
         top-level DDL command fires them (DDL run inside a trigger function
         does not). `pg_event_trigger_ddl_commands()` reports CREATE / ALTER
