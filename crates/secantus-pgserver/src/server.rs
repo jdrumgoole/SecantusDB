@@ -127,7 +127,14 @@ impl RunningPgServer {
     /// WiredTiger). Idempotent — a second call is a no-op — and called by
     /// `Drop`.
     ///
-    /// Must not be called from inside a tokio runtime: it drops one.
+    /// Safe to call from anywhere, a tokio runtime included. The teardown ends
+    /// by shutting down the handle's OWN runtime, which tokio refuses from an
+    /// async context ("Cannot drop a runtime in a context where blocking is not
+    /// allowed"), so a `#[tokio::test]` that let the handle fall out of scope
+    /// used to panic in `Drop`. From inside a runtime the teardown now runs on
+    /// a plain thread and this call waits for it, so it still returns only
+    /// once the store is closed -- the checkpoint is not left to race the
+    /// caller.
     pub fn stop(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
         // Tell the accept loop and every live connection to finish. Ignore a
@@ -136,8 +143,55 @@ impl RunningPgServer {
         if let Some(handle) = self.accept.take() {
             handle.abort();
         }
-        // Then wait for them, bounded. Each holds an `Arc<Storage>` clone and
-        // the checkpoint below cannot run while one is outstanding.
+        let teardown = Teardown {
+            address: self.address,
+            active: Arc::clone(&self.active),
+            runtime: self.runtime.take(),
+            storage: self.storage.take(),
+        };
+        if tokio::runtime::Handle::try_current().is_err() {
+            teardown.run();
+            return;
+        }
+        // Inside a runtime: hand the blocking part to a thread that is not.
+        // Joining blocks this worker until the store is closed, which is what
+        // `stop` promises; the server's connections run on its own runtime,
+        // so nothing the drain waits for needs the caller's.
+        match std::thread::Builder::new()
+            .name("secantus-pgserver-stop".into())
+            .spawn(move || teardown.run())
+        {
+            Ok(thread) => {
+                if let Err(panic) = thread.join() {
+                    std::panic::resume_unwind(panic);
+                }
+            }
+            // No thread to be had: report it rather than return as if stopped
+            // (the teardown was moved into the failed spawn and dropped, which
+            // is exactly the runtime drop this path exists to avoid).
+            Err(e) => eprintln!(
+                "secantus-pgserver: WARNING: could not start the shutdown thread for {}: {e}; \
+                 the store's close-checkpoint may not have run",
+                self.address
+            ),
+        }
+    }
+}
+
+/// The blocking half of [`RunningPgServer::stop`]: wait for the connections,
+/// shut the runtime down, and close the store. Owns everything it touches so it
+/// can run on a thread of its own.
+struct Teardown {
+    address: SocketAddr,
+    active: Arc<AtomicUsize>,
+    runtime: Option<Runtime>,
+    storage: Option<Arc<Storage>>,
+}
+
+impl Teardown {
+    fn run(mut self) {
+        // Wait for the connections, bounded. Each holds an `Arc<Storage>`
+        // clone and the checkpoint below cannot run while one is outstanding.
         let deadline = Instant::now() + DRAIN_TIMEOUT;
         while self.active.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
             std::thread::sleep(DRAIN_POLL);
@@ -178,6 +232,9 @@ impl Drop for RunningPgServer {
     }
 }
 
+/// Each runtime worker's stack: see `bind`.
+pub const WORKER_STACK_BYTES: usize = 256 << 20;
+
 /// Open a listener on `addr` and start serving the PostgreSQL wire protocol
 /// over `storage`.
 ///
@@ -187,11 +244,15 @@ impl Drop for RunningPgServer {
 /// The bound address is resolved before returning, which is what makes
 /// `"127.0.0.1:0"` usable.
 ///
+/// It may equally be called from INSIDE a runtime -- a `#[tokio::test]`, the
+/// way a Rust caller writes one. It used to `block_on` its own runtime to bind
+/// the listener, which tokio refuses from an async context ("Cannot start a
+/// runtime from within a runtime"), so it panicked before returning a handle.
+/// Nothing here blocks on a runtime now: the socket is bound with std, and
+/// registered with the handle's runtime by entering it.
+///
 /// `storage` is taken by value and owned by the returned handle — see the
 /// module docs; that ownership is what makes `stop()` checkpoint.
-/// Each runtime worker's stack: see `bind`.
-pub const WORKER_STACK_BYTES: usize = 256 << 20;
-
 pub fn bind(
     addr: &str,
     storage: Storage,
@@ -207,7 +268,15 @@ pub fn bind(
         .thread_stack_size(WORKER_STACK_BYTES)
         .enable_all()
         .build()?;
-    let listener = runtime.block_on(async { TcpListener::bind(addr).await })?;
+    let std_listener = std::net::TcpListener::bind(addr)?;
+    std_listener.set_nonblocking(true)?;
+    let listener = {
+        // `from_std` must run inside a runtime to register the socket with its
+        // reactor. Entering one is not blocking on it, so this is safe from
+        // an async context too.
+        let _entered = runtime.enter();
+        TcpListener::from_std(std_listener)?
+    };
     let address = listener.local_addr()?;
 
     let storage = Arc::new(storage);

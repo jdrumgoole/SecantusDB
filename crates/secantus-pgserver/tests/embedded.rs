@@ -26,9 +26,9 @@ fn start(home: &std::path::Path) -> RunningPgServer {
 }
 
 /// Run `sql` statements against the server and return the rows of the last
-/// `query`, if any. The client runtime is the TEST's, never the server's: a
-/// `RunningPgServer` owns a runtime and dropping one inside a runtime context
-/// panics, so `stop()` must be called outside `block_on`.
+/// `query`, if any. The client runtime is the TEST's, never the server's.
+/// (These tests call `stop()` outside `block_on`; the async tests at the end
+/// of the file cover stopping and dropping INSIDE a runtime.)
 fn run(rt: &Runtime, server: &RunningPgServer, statements: &[&str]) {
     rt.block_on(async {
         let (client, connection) = tokio_postgres::connect(&server.dsn(), tokio_postgres::NoTls)
@@ -187,4 +187,61 @@ fn stop_is_idempotent_and_drop_is_safe() {
     // teardown had left WiredTiger's lock or its files in a bad state.
     let again = start(dir.path());
     drop(again);
+}
+
+/// Serve, write, and let the handle go out of scope -- all INSIDE an async
+/// test, which is how a Rust caller writes one. Then reopen the same home
+/// (still inside the runtime) and read the rows back, so a drop that returned
+/// without checkpointing fails here rather than passing quietly.
+///
+/// `stop()` shuts down the server's OWN tokio runtime, and tokio refuses that
+/// from an async context ("Cannot drop a runtime in a context where blocking is
+/// not allowed"), so this panicked in `Drop`. The helpers above keep every
+/// `stop()` outside `block_on` for exactly that reason; a user would not know to.
+async fn serve_write_and_drop_inside_a_runtime() {
+    let dir = TempDir::new().expect("tempdir");
+    {
+        let server = start(dir.path());
+        let (client, connection) = tokio_postgres::connect(&server.dsn(), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        let driver = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute("CREATE TABLE kept (n int); INSERT INTO kept VALUES (7)")
+            .await
+            .expect("write");
+        drop(client);
+        let _ = driver.await;
+        drop(server);
+    }
+    let mut reopened = start(dir.path());
+    let (client, connection) = tokio_postgres::connect(&reopened.dsn(), tokio_postgres::NoTls)
+        .await
+        .expect("reconnect");
+    let driver = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let rows = client.query("SELECT n FROM kept", &[]).await.expect("read");
+    let values: Vec<i32> = rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(
+        values,
+        vec![7],
+        "a write acknowledged before the drop was lost"
+    );
+    drop(client);
+    let _ = driver.await;
+    // An explicit stop() inside the runtime, then the drop that follows it.
+    reopened.stop();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dropping_inside_a_current_thread_runtime_is_safe() {
+    serve_write_and_drop_inside_a_runtime().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_inside_a_multi_thread_runtime_is_safe() {
+    serve_write_and_drop_inside_a_runtime().await;
 }
