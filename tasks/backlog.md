@@ -6994,6 +6994,15 @@ newly pass (Rust driver `find_one_and_delete_hint_server_version`, Java
   (The Ruby gauge hit a similar local problem -- Homebrew's read-only
   `rdoc_plugin.rb` -- and passed with `BUNDLE_PATH` pointed elsewhere.)
 
+- [ ] **`test_tmp_retention_guard.py::test_default_tmp_retention_policy_is_allowed`
+  timed out ONCE (2026-09-30).** Its nested collect-only pytest hit the 300s
+  `subprocess.run` timeout in an `-n auto` run of eight files alongside the
+  PG-binary tests; it takes ~3s, and passed 3 of 3 alone straight after. A
+  300s wall on a 3s job is a hang, not slowness -- the docstring already
+  names one such hang (the atexit `pytest-of-<user>` cleanup), which
+  `--basetemp` was meant to remove. Not reproduced yet; run the file under
+  `-n auto` next to a heavy suite and sample the nested process if it sticks.
+
 **Found and NOT fixed -- Python-server divergences** (out of scope here):
 
 - [ ] the Python server has the same oversized-transaction code, 313 instead
