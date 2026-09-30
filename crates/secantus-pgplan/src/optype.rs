@@ -422,6 +422,26 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
             }
         }
     }
+    // `oid` has comparison operators and nothing arithmetic: `oid + integer`,
+    // `oid - oid` and a prefix `- oid` are all 42883 on PostgreSQL, where
+    // evaluating them as the integers the values are carried as answered.
+    if kind == Some(K::AexprOp) && matches!(op.as_str(), "+" | "-" | "*" | "/" | "%" | "^") {
+        let side = |n: Option<&pg_query::protobuf::Node>| n.and_then(|n| operand_type(n, scope));
+        let (l, r) = (side(e.lexpr.as_deref()), side(e.rexpr.as_deref()));
+        if l.as_deref() == Some("oid") || r.as_deref() == Some("oid") {
+            match (e.lexpr.is_some(), l, r) {
+                (false, _, Some(r)) => {
+                    set_error_location(e.location);
+                    return Err(Error::UndefinedFunction(format!(
+                        "operator does not exist: {op} {}",
+                        display_type(&r)
+                    )));
+                }
+                (true, Some(l), Some(r)) => return Err(mismatch(&op, &l, &r, e.location)),
+                _ => {}
+            }
+        }
+    }
     let Some(l) = e.lexpr.as_deref().and_then(|n| operand_type(n, scope)) else {
         return Ok(());
     };

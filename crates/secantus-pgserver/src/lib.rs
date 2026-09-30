@@ -27716,7 +27716,7 @@ fn series_table_def(series: &secantus_pgplan::Series) -> TableDef {
         "generate_series",
         vec![secantus_pgcatalog::Column::new(
             &series.column,
-            "int4",
+            if series.int8 { "int8" } else { "int4" },
             false,
         )],
     )

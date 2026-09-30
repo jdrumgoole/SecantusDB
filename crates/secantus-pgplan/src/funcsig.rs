@@ -13,6 +13,9 @@ use std::sync::OnceLock;
 
 const SIGS: &str = include_str!("pg_proc_sigs.tsv");
 const CASTS: &str = include_str!("pg_implicit_casts.tsv");
+/// `(type, typcategory, typispreferred)` of every `pg_catalog` type, arrays
+/// spelled `elem[]`, read from PostgreSQL 15.19.
+const CATEGORIES: &str = include_str!("pg_type_category.tsv");
 
 struct Sig {
     args: Vec<String>,
@@ -121,9 +124,13 @@ pub(crate) fn resolves(name: &str, args: &[String]) -> Option<bool> {
     Some(overloads.iter().any(|s| sig_accepts(s, args)))
 }
 
-/// The type a call returns, when every overload that takes `args` returns
-/// the same concrete (non-polymorphic, non-set) type.
+/// The type a call returns: the overload `func_select_candidate` picks, or
+/// else the one concrete (non-polymorphic, non-set) type every overload
+/// that takes `args` returns.
 pub(crate) fn result_type(name: &str, args: &[String]) -> Option<String> {
+    if let Some(t) = selected_result_type(name, args) {
+        return Some(t);
+    }
     let overloads = sigs().get(name)?;
     let mut out: Option<&str> = None;
     for s in overloads.iter().filter(|s| sig_accepts(s, args)) {
@@ -143,6 +150,127 @@ pub(crate) fn result_type(name: &str, args: &[String]) -> Option<String> {
         }
     }
     out.map(str::to_string)
+}
+
+fn categories() -> &'static HashMap<String, (char, bool)> {
+    static C: OnceLock<HashMap<String, (char, bool)>> = OnceLock::new();
+    C.get_or_init(|| {
+        CATEGORIES
+            .lines()
+            .filter_map(|l| {
+                let mut it = l.split('\t');
+                let name = it.next()?;
+                let cat = it.next()?.chars().next()?;
+                let preferred = it.next()? == "1";
+                Some((name.to_string(), (cat, preferred)))
+            })
+            .collect()
+    })
+}
+
+/// The declared type of argument `i` under overload `s` (a variadic's
+/// element past its fixed arguments).
+fn param_at(s: &Sig, i: usize) -> Option<&str> {
+    let fixed = if s.variadic {
+        s.args.len().saturating_sub(1)
+    } else {
+        s.args.len()
+    };
+    if i < fixed || !s.variadic {
+        return s.args.get(i).map(String::as_str);
+    }
+    let v = s.args.last().map(String::as_str).unwrap_or("any");
+    Some(if v == "any" {
+        "any"
+    } else {
+        v.strip_suffix("[]").unwrap_or(v)
+    })
+}
+
+/// PostgreSQL's `func_select_candidate` over the overloads that take `args`:
+/// an exact match wins; otherwise keep those with the most EXACT matches,
+/// then those with the most positions where the parameter is exact or the
+/// PREFERRED type of the argument's category (`round(int4)` is the `float8`
+/// one, not the `numeric` one). `Some(survivors)` -- one is the winner, more
+/// is ambiguous (42725) -- and `None` where PostgreSQL's rules are not fully
+/// modelled here: an argument that is not a known built-in type, or a
+/// candidate with a polymorphic parameter.
+fn select_candidates<'a>(name: &str, args: &[String]) -> Option<Vec<&'a Sig>> {
+    if crate::scalar::is_catalog_reader(name) || name.starts_with("pg_") || args.is_empty() {
+        return None;
+    }
+    let cats = categories();
+    if args
+        .iter()
+        .any(|a| !cats.contains_key(a.as_str()) || a == "unknown")
+    {
+        return None;
+    }
+    let overloads = sigs().get(name)?;
+    let mut cands: Vec<&Sig> = overloads.iter().filter(|s| sig_accepts(s, args)).collect();
+    if cands.is_empty() {
+        return None;
+    }
+    let params = |s: &Sig| -> Vec<String> {
+        (0..args.len())
+            .map(|i| param_at(s, i).unwrap_or("any").to_string())
+            .collect()
+    };
+    if cands
+        .iter()
+        .flat_map(|s| params(s))
+        .any(|p| p.starts_with("any") || matches!(p.as_str(), "record" | "internal" | "cstring"))
+    {
+        return None;
+    }
+    if let Some(exact) = cands
+        .iter()
+        .find(|s| params(s).iter().zip(args).all(|(p, a)| p == a))
+    {
+        return Some(vec![*exact]);
+    }
+    let keep_best = |cands: &mut Vec<&Sig>, score: &dyn Fn(&str, &str) -> bool| {
+        let count = |s: &&Sig| {
+            params(s)
+                .iter()
+                .zip(args)
+                .filter(|(p, a)| score(p, a))
+                .count()
+        };
+        let best = cands.iter().map(count).max().unwrap_or(0);
+        cands.retain(|s| count(s) == best);
+    };
+    keep_best(&mut cands, &|p, a| p == a);
+    keep_best(&mut cands, &|p, a| {
+        p == a
+            || matches!(
+                (cats.get(p), cats.get(a)),
+                (Some((pc, true)), Some((ac, _))) if pc == ac
+            )
+    });
+    Some(cands)
+}
+
+/// Several overloads take `args` equally well: 42725 `is not unique`.
+pub(crate) fn ambiguous(name: &str, args: &[String]) -> bool {
+    select_candidates(name, args).is_some_and(|c| c.len() > 1)
+}
+
+/// The concrete, non-set return type of the one overload
+/// `func_select_candidate` picks for `args`.
+pub(crate) fn selected_result_type(name: &str, args: &[String]) -> Option<String> {
+    match select_candidates(name, args)?.as_slice() {
+        [s] if !s.retset
+            && !s.ret.starts_with("any")
+            && !matches!(
+                s.ret.as_str(),
+                "record" | "void" | "internal" | "trigger" | "unknown"
+            ) =>
+        {
+            Some(s.ret.clone())
+        }
+        _ => None,
+    }
 }
 
 fn sig_accepts(s: &Sig, args: &[String]) -> bool {

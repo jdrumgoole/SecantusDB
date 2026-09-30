@@ -3688,14 +3688,6 @@ These are explicit non-goals. Don't add them without a reason.
     not server bugs. `test_sessions_unified` snapshot tests fail 5 (event-count
     mismatches, not yet diagnosed).
 
-- **Rust PG server: an `inet[]` / `cidr[]` cast to TEXT keeps a max-length
-  mask** (`{127.0.0.1/32}`) where PostgreSQL's `inet_out` drops it
-  (`{127.0.0.1}`). The array text renderer (`render_array_element`) is
-  type-blind, so it cannot apply the `net::text_out` rule the scalar column
-  path uses. The inet/cidr COLUMN round-trip and binary-array params are
-  unaffected (0-divergence); only the explicit `::text` cast of an array
-  diverges. Needs element-type threading into `render_array`. (2026-09-07)
-
 - [ ] **OPEN — RUST pgserver range family, what is left (measured 2026-09-09).**
   psycopg's `tests/types/test_range.py` + `test_multirange.py` are at 479
   passed / 1 failed / 24 xfailed against the Rust PG server (was 72 failed);
@@ -7196,145 +7188,6 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
   `select 10::numeric / 4::numeric` answers `2.5000000000000000`, PostgreSQL's
   sixteen places. The entry above described the state before the scale rules
   were measured.
-- **Rust PG server: user-type DDL is now visible within its own open
-  transaction — FIXED (2026-09-08).** An uncommitted `CREATE`/`DROP TYPE`
-  (composite, enum, range) is now visible to later statements in the same
-  transaction: `to_regtype`, value casts, and psycopg's
-  `CompositeInfo`/`EnumInfo`/`RangeInfo` `.fetch` all resolve the type before
-  commit; `ROLLBACK`/`ROLLBACK TO` discard it and `COMMIT` persists it. The fix
-  mirrors the TABLE `uncommitted` overlay — a per-connection map of the
-  transaction's pending type creates/drops (`uncommitted_types`), consulted by
-  `type_catalog_docs` before the committed catalog, snapshotted by savepoints,
-  and reverted by savepoint pre-images so a rolled-back create cannot survive a
-  later commit. Wrapping the catalog read in `with_user_transaction` was
-  rejected because it deadlocks COPY (same reason the table fix rejected it).
-  NOTE the item's speculation that CREATE TABLE was also broken was wrong —
-  CREATE TABLE in-txn already worked via the existing table overlay; only TYPES
-  lacked one. Slice tests:
-  `test_user_types_are_visible_in_the_transaction_that_creates_them`,
-  `test_fetch_info_works_in_the_creating_transaction`,
-  `test_rollback_discards_a_type_created_in_the_transaction`,
-  `test_savepoint_rollback_discards_a_type_created_after_it`.
-
-- **Rust PG server: `regtype::text` of a CUSTOM RANGE renders the oid, not the
-  name (probed 2026-09-08, autocommit AND in-txn).** `CREATE TYPE r AS RANGE
-  (subtype = int4); SELECT 'r'::regtype::text` returns the oid string (e.g.
-  `69000`) where the oracle returns `r`. The range resolves (no 42704) — its
-  oid is found — but the regtype→name reverse map does not cover custom ranges,
-  so the `::text` render falls back to the oid number. Composites and enums
-  render their name correctly; only ranges miss. This is NOT a visibility bug
-  (it shows in autocommit too). Fix: extend the oid→typename reverse lookup
-  that `regtype::text` uses to consult `ranges()` (it already consults
-  composites/enums). Probe: `scratchpad/committed_type_probe.py`.
-
-- **Rust PG server: composite VALUE round-trip (`register_composite` of a value)
-  is the remaining composite piece (2026-09-08).** `CompositeInfo.fetch` now
-  WORKS — the 4-layer catalog query (`pg_type LEFT JOIN (SELECT array_agg(...)
-  FROM (pg_attribute JOIN pg_type) GROUP BY attrelid)` with `coalesce(..., '{}')`
-  per column) matches the oracle at zero divergences, including a nested
-  composite field and a base type's empty-array result (shipped: aggregate
-  subquery join side, `oid[]` column type, coalesce-as-target, coalesce-on-miss
-  empty array, user-type field-oid resolution in `pg_attribute`). **Schema-
-  qualified composite naming also shipped** — `CREATE TYPE s.t` is a distinct
-  type from a bare `t`, `to_regtype` resolves bare / `schema.name` / quoted
-  `"schema"."name"` forms, and DROP is schema-aware — so psycopg's session-
-  scoped `testcomp` fixture (which creates `testschema.testcomp` beside
-  `testcomp`) no longer cascades and `test_fetch_info` / `test_fetch_info_async`
-  pass. **The scalar composite VALUE round-trip now SHIPPED (2026-09-08):** a
-  `'(1,x)'::testcomp` text cast and a `row(1,'x')::testcomp` record cast both
-  parse into a composite (record-shaped) value whose result column carries the
-  composite's own oid, so `register_composite`'s loader fires; a composite param
-  cast on the wire (`%s::testcomp`) and INSERT/SELECT through a composite column
-  round-trip; field escaping (NULL / empty / comma / quote / backslash / parens /
-  whitespace, all 255 chars) matches the oracle at zero divergences; and an array
-  of composites renders each element as its `(...)` text (was leaking Rust's
-  `{:?}` debug form).
-
-  **Composite BINARY RESULT + array-of-composite load now SHIPPED (2026-09-08,
-  `pgserver-compval`):** a composite result column in a BINARY cursor goes out in
-  PostgreSQL's binary record format (int32 field count, then per field int32 oid
-  + int32 len + bytes) — composite wire types carry `Kind::Composite` with their
-  declared field types so the encoder knows each field's oid, and nested
-  composites recurse. An `array[<composite>]` now reports the composite's derived
-  `typarray` oid (was varchar, so the whole array arrived as one string), and its
-  TEXT rendering escapes each element's `(...)` once (was double-escaped through
-  the catch-all). Measured on the psycopg composite gauge (`test_composite.py`,
-  oracle PostgreSQL 14): **47→55 of 79 passing** (`test_load_composite`,
-  `test_load_composite_factory`, `test_load_keyword_composite_factory`,
-  `test_load_recursive_composite`, all in both wire formats).
-
-  What REMAINS (each a separable follow-on):
-- [ ] **OPEN — composite PARAM decode (the pgwire Parse oid wall), ~18 gauge
-  tests (2026-09-08).** Every remaining `test_dump_*` failure is a composite sent
-  AS A PARAM: `row(...)::t = %s` / `%b` with a registered-dumper obj (surfaces as
-  `comparing document with string using =`), and `pg_typeof($1)` / field access
-  `($1).bar` of a composite param (surfaces as `IndeterminateDatatype: could not
-  determine data type of parameter $N`). Both TEXT and BINARY params hit the same
-  wall: the composite oid is dropped by pgwire's `Type::from_oid` before
-  `parse_sql`, so the param never resolves to a composite type. Needs the raw
-  Parse param oid plumbed through Describe/Parse (`secantus-pgserver` Parse path)
-  before the field-type map is built — deeper than the value-side work, and the
-  binary DUMP additionally raises psycopg-side `InvalidBinaryRepresentation` /
-  `binary parameters of type oid None` until the oid is carried.
-- [ ] **OPEN — range-typed composite field** (a composite whose field type is a
-  custom range) is untested against the value round-trip.
-  NOTE the schema-qualified TypeInfo tests additionally need in-transaction DDL
-  visibility (separate backlog item above).
-
-- **Rust PG server: record FUNCTIONS and field access are deferred (2026-09-07).**
-  `ROW(...)` / `(a, b, ...)` construction, the `::text` render, and the
-  `=`/`<>`/`<`/`<=`/`>`/`>=` record comparison operators all work now (oid 2249,
-  psycopg decodes to a tuple). Still unimplemented: `row_to_json(...)` and other
-  record-consuming functions, NAMED composite construction (`ROW(...)::mytype`
-  beyond a bare-record no-op), and field access `(ROW(1,2)).f1`.
-- **Rust PG server: `generate_series` is the only set-returning function.**
-  A WHERE clause over it now works (2026-09-09: a constant predicate —
-  `where false` / `where true` / `where 1` → `42804` — and a comparison on
-  the series column, `select count(*) from generate_series(1,5) i where i >
-  2` → `3`, all as PG 16.15 answers). `unnest` and `generate_subscripts` are still
-  unsupported; a scalar function in FROM (`select 'ok' from pg_sleep(0.5)`,
-  `select * from pg_listening_channels()`) is one row per result since
-  2026-09-09, but only for the functions the planner names, not a general
-  `RangeFunction`. In the SELECT LIST it works
-  (`select generate_series(1, 10)`, with alias / ORDER BY / LIMIT / OFFSET), but
-  only as the SOLE target: `select 1, generate_series(1,3)` — which repeats the
-  other columns across the generated rows — is refused, as is more than one
-  set-returning target in one list.
-- **Rust PG server — psycopg CURSOR gaps (map, 2026-09-08).** Ran psycopg 3's own
-  `test_cursor*.py` against `secantusd-pg` (~151 failures before). The task's
-  `cursor.rowcount`-tag theory did **not** hold — the row-count tags
-  (`SELECT n` / `UPDATE n` / `DELETE n` / `INSERT 0 n`) are already correct; the
-  real shared blockers were two SQL gaps every server-cursor test hit.
-  **LANDED (+38 measured, `pgserver-cursor`):**
-  - `pg_cursors` virtual catalog table over the connection's open cursors
-    (psycopg's server cursor reads it directly and as `SELECT 1 FROM
-    pg_catalog.pg_cursors WHERE name = ...` before closing a stolen cursor).
-  - `ColumnExpr::Const` — a literal select-list column (`SELECT 1 FROM t`,
-    `SELECT 1 FROM generate_series(...)`), named `?column?`, one value per row.
-
-  **DEFERRED (mapped, not started):**
-  - **`INSERT INTO t SELECT <query>`** (e.g. `... SELECT generate_series(1, 42)`)
-    inserts nothing / reports `INSERT 0 0`: `plan_insert` only reads
-    `sel.values_lists`. Needs the executor to run the inner SELECT and stream its
-    rows into the insert (cross-layer). Blocks `test_rowcount` (×3) and
-    `test_executemany_returning`-adjacent shapes.
-  - **`generate_series(...)::int4` and other casts over a SRF projection** — a
-    `TypeCast`/`FuncCall` wrapping the series target in the SELECT LIST is refused
-    (`function generate_series() is not supported yet`). Blocks `test_description`,
-    `test_binary_cursor_execute`, `test_execute_binary`, `test_binary_cursor_text_override`.
-  - **WITHOUT HOLD cursors are not dropped on COMMIT/ROLLBACK** — `test_no_hold`
-    expects a post-commit `fetch` to raise `InvalidCursorName`; our cursors
-    persist across transaction boundaries (task-flagged as deferrable).
-  - **`NO SCROLL` is not enforced** — `test_non_scrollable` expects a backward
-    scroll on a `NO SCROLL` cursor to raise `OperationalError`; every cursor is
-    materialised and scrolls both ways. (`is_scrollable` is now REPORTED
-    correctly in `pg_cursors`, just not enforced on FETCH/MOVE.)
-  - **Streaming / no-column cursors** — `server sent data ("D") without prior row
-    description ("T")` on `test_stream_no_col`; `at least one column expected` on
-    `test_row_maker_returns_none`.
-  - `test_leak` failures are a randomised memory-leak probe round-tripping random
-    values — type-fidelity noise, not cursor mechanics; the failing params shuffle
-    per run.
 - [x] ~~**Rust PG server: DDL IS NOT TRANSACTIONAL.**~~ **FIXED — re-measured
   2026-09-28, BOTH directions**, against a `secantusd-pg` built from
   `HEAD:crates`. `begin; create table rb(a int); rollback` leaves no table
@@ -7356,14 +7209,6 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
   parsed `SAVEPOINT` and ignored it passes that probe and silently loses the
   semantics, which is exactly the failure this entry warned about. Probe the
   state after the rollback, always.
-- **Rust PG server: `generate_series` with EVERY bound a small-int parameter is
-  accepted where PostgreSQL refuses it as ambiguous.** `generate_series(%s, %s,
-  %s)` with `(1, 10, 3)` sends three `int2`s, and PostgreSQL answers `42725`
-  *"function generate_series(smallint, smallint, smallint) is not unique"* --
-  it cannot choose between the int4 / int8 / numeric overloads. This server
-  answers rows. Matching it needs the parameters' DECLARED OIDS threaded into
-  the planner, which today sees only decoded values; every other argument shape
-  matches (19-case probe, 2026-09-05).
 - **Rust PG server: a SAVEPOINT captures whole tables, so its cost is the size
   of what the block writes.** WiredTiger has no savepoint, so one here is a set
   of pre-images: the first write to a table after a savepoint copies that
@@ -7371,72 +7216,6 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
   a write to a large table copies the whole table into memory. Lazy capture is
   what keeps the common case free (a savepoint nobody writes through costs
   nothing), and a per-row undo log would be the fix if the cost ever bites.
-- **Rust PG server: a scalar function OVER A COLUMN in a table select list is
-  refused, and the refusal comes out as a GROUPING error.** psycopg's
-  `test_prepared.py` reads `regexp_replace(statement, ...) as statement FROM
-  pg_prepared_statements` (20 tests); `has_aggregate` treats the unknown call
-  as an aggregate, routes to the aggregate planner, and the user sees `column
-  "name" must appear in the GROUP BY clause` -- wrong error for a real gap.
-  Computed columns over table reads exist now for CAST CHAINS (`casts` on
-  `Select`); widening them to scalar calls is the natural next step.
-- **Rust PG server: `pg_type` is 37 builtin rows and nothing else.** No user
-  types (the enum campaign needs `pg_enum` and CREATE TYPE), no `typtype` /
-  `typnamespace` / `typrelid` columns. (`pg_prepared_statements` lists the
-  session's named protocol-level statements as of 2026-09-09 — the handler
-  keeps its own registry beside pgwire's statement store.) The Python
-  server's `sql/virtual.py` (3.5k lines) is the reference for how far this
-  eventually goes.
-- **Rust PG server: no regtype has a BINARY encoding.** A binary-format cursor
-  reading any regtype column (including `pg_typeof`, which answers a real
-  regtype as of 2026-09-06) gets text bytes where PostgreSQL sends the 4-byte
-  oid. The text format matches; only the binary encoder is missing.
-- **Rust PG server: a passthrough `select %s` of an enum parameter reports the
-  wrong output oid.** `test_enum_dumper` binds an enum MEMBER (psycopg's dumper
-  declares the enum's oid, e.g. 65000) with no cast; the output column of
-  `select $1` should echo that declared oid so psycopg's registered loader
-  fires and maps `'ONE'` back to `<IntTestEnum.ONE>`. We report the value's
-  inferred type (text, 25), so the loader never fires -- ~36 `test_enum`
-  tests. The chain: `internal_type_name` drops an unknown (enum) param oid, so
-  the declared type is lost before the passthrough column can echo it. The
-  CAST form (`select %s::mood`) already reports the enum oid and passes.
-- **Rust PG server: range and multirange OPERATORS are unsupported.** Both type
-  families themselves (literals, constructors, casts, canonicalisation, merging,
-  parameters in both wire formats) are in; `@>` / `<@` / `&&` / `-|-` and the
-  multirange set operators are not.
-- **Rust PG server: the `oid` cast is unsupported**, and binary parameters of
-  that oid with it
-  (the binary decoder covers `numeric` / `date` / `time` / `timestamp` /
-  arrays / ranges / multiranges; a type it does not have cannot be decoded into
-  one — what remains unhandled there is `json`, a missing TYPE not a decoder
-  gap; `uuid` shipped 2026-09-07 as a text-valued type, so its BINARY parameter
-  form is the remaining gap. `inet` / `cidr` shipped 2026-09-07 WITH their
-  binary parameter + result form).
-- [ ] **OPEN — CHORE, RUST pgserver: two vendored `pgwire` unit tests need
-  TLS fixtures that are gitignored.** `cd crates/vendor/pgwire && cargo test
-  --lib` fails `tokio::tls::...` ×2 for a missing `examples/ssl/server.key`
-  (`*.key` is in `.gitignore`). Nothing else in that crate fails; either
-  generate a throwaway self-signed pair in the test or `#[ignore]` the two
-  until one exists. Noted 2026-09-09 while running the crate's tests after
-  the `put_cstring` / `cstring_body_len` patch.
-- **Rust PG server: `DROP` of anything but a table leaks Rust debug
-  formatting into the client-facing message** — `DROP of Ok(ObjectType) is not
-  supported yet`. Whatever the eventual support, the MESSAGE is a bug on its
-  own: a `{:?}` of a protobuf enum reached the wire. 207 psycopg tests block on
-  the missing feature behind it (`DROP TYPE` / `DROP SCHEMA` / `DROP FUNCTION`).
-- **Rust PG server: `DEALLOCATE <name>` is refused (`0A000`).** `DEALLOCATE ALL`
-  is supported; the named form would need the wire layer's prepared-statement
-  store, and PostgreSQL answers `26000` for a name that does not exist, so
-  accepting it as a no-op would be a wrong answer.
-- **Rust PG server: `aclitem` knows one role (2026-09-09).** The parser is
-  PostgreSQL 16's, but there is no role catalog, so the only grantee /
-  grantor it resolves is the session user (`'nobody=r/test'::aclitem` is
-  `42704 role "nobody" does not exist`, as on PostgreSQL for a role that is
-  not there; `public` too — PostgreSQL's `PUBLIC` is the EMPTY grantee, so
-  `'=r/test'` is the spelling that works on both). An omitted grantor
-  defaults to the session user, where PostgreSQL uses the bootstrap
-  superuser (`jd=r/postgres`), with the same WARNING. Stored as text, so
-  `'x=r/x'::aclitem::oid` is `22P02` where PostgreSQL has no such cast
-  (`42846`).
 - [x] **RESOLVED (re-measured 2026-09-28): Rust PG server NOT NULL IS
   enforced.** The entry this replaces said `create table t (id int not null);
   insert into t (id) values (null)` "stores a NULL id" and that "the catalog
@@ -7474,12 +7253,6 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
   form, not `float4out`**~~ **FIXED — re-measured 2026-09-28** against a
   `secantusd-pg` built from `HEAD:crates`: `select 1e20::float4::text` is
   `1e+20`, matching `float4out`.
-- **Rust PG server: psycopg's `test_array.py` is 158/158 (2026-09-09).**
-  Multidimensional arrays round-trip in text and binary both ways,
-  `INSERT … RETURNING`, the `box` type and its `;` array separator all
-  land, a table's row type is a composite (`test_array_register`) and
-  `aclitem` parses (`test_array_of_unknown_builtin`), both 2026-09-09.
-
 - [x] **Five probes never compared the Rust server — instrumented 2026-09-02.**
   `tools/probes/_servers.py` is now the shared `probe_targets()` helper, and
   `update_operators`, `arg_types_documents`, `update_path_conflicts` and

@@ -1708,7 +1708,11 @@ fn numeric_rounding(name: &str, args: &[Bson]) -> Result<Bson> {
         return Err(wrong_args(name));
     }
     Ok(match subject {
-        Bson::Int32(_) | Bson::Int64(_) => subject,
+        // An integer has no rounding overload of its own: PostgreSQL picks
+        // the float8 one (float8 is its category's preferred type), so
+        // `round(1)` is the double `1`.
+        Bson::Int32(i) => Bson::Double(f64::from(i)),
+        Bson::Int64(i) => Bson::Double(i as f64),
         Bson::Double(d) => Bson::Double(match name {
             "ceil" | "ceiling" => d.ceil(),
             "floor" => d.floor(),

@@ -274,6 +274,15 @@ impl Error {
             {
                 Some("No function matches the given name and argument types. You might need to add explicit type casts.")
             }
+            // A PREFIX operator (`- oid`) has one argument, and its hint says so.
+            Error::UndefinedFunction(m)
+                if m
+                    .strip_prefix("operator does not exist: ")
+                    .and_then(|rest| rest.chars().next())
+                    .is_some_and(|c| !c.is_alphanumeric() && c != '"' && c != '_') =>
+            {
+                Some("No operator matches the given name and argument type. You might need to add an explicit type cast.")
+            }
             Error::UndefinedFunction(m) if m.starts_with("operator does not exist: ") => {
                 Some("No operator matches the given name and argument types. You might need to add explicit type casts.")
             }
@@ -1450,6 +1459,9 @@ pub struct Series {
     /// The output column's name: `generate_series` unless the FROM item was
     /// given an alias.
     pub column: String,
+    /// The `int8` overload (an argument is a bigint), whose column is
+    /// `bigint`; otherwise the `int4` one.
+    pub int8: bool,
 }
 
 impl Series {
@@ -8824,6 +8836,114 @@ fn plan_window_args(
     Ok((Some(expr), source_type, args))
 }
 
+/// A HAVING with no GROUP BY and no aggregate in the select list: the whole
+/// input is ONE group, so the query yields one row or none -- never a row per
+/// input row, which is what ignoring the clause answered (`select 1 from t
+/// having count(*) > 5` returned every row). Rewritten so the group is an
+/// inner aggregate query, which the aggregate planner already runs:
+/// `select <targets> from (select count(*) from <from> where <w> having <h>)`.
+/// A target naming a column is PostgreSQL's 42803: the column is not grouped.
+fn ungrouped_having(
+    s: &pg_query::protobuf::SelectStmt,
+) -> Result<Option<pg_query::protobuf::SelectStmt>> {
+    if s.having_clause.is_none() || !s.group_clause.is_empty() || has_aggregate(s) {
+        return Ok(None);
+    }
+    for t in &s.target_list {
+        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+            continue;
+        };
+        let Some(mut val) = rt.val.as_deref().cloned() else {
+            continue;
+        };
+        let mut stray: Option<Vec<String>> = None;
+        walk_column_refs(&mut val, &mut |_, c| {
+            if stray.is_none() {
+                stray = Some(
+                    c.fields
+                        .iter()
+                        .filter_map(|f| match f.node.as_ref() {
+                            Some(N::String(s)) => Some(s.sval.clone()),
+                            Some(N::AStar(_)) => Some("*".into()),
+                            _ => None,
+                        })
+                        .collect(),
+                );
+            }
+            Ok(())
+        })?;
+        if let Some(mut parts) = stray {
+            if parts.len() == 1 {
+                if let [only] = s.from_clause.as_slice() {
+                    if let Some(N::RangeVar(rv)) = only.node.as_ref() {
+                        let q = rv
+                            .alias
+                            .as_ref()
+                            .map(|a| a.aliasname.clone())
+                            .unwrap_or_else(|| rv.relname.clone());
+                        parts.insert(0, q);
+                    }
+                }
+            }
+            return Err(Error::Grouping(format!(
+                "column \"{}\" must appear in the GROUP BY clause or be used in an aggregate function",
+                parts.join(".")
+            )));
+        }
+    }
+    let parsed = pg_query::parse("select from (select count(*)) as \"*grp*\"")
+        .map_err(|e| Error::Parse(e.to_string()))?;
+    let Some(N::SelectStmt(template)) = parsed
+        .protobuf
+        .stmts
+        .first()
+        .and_then(|st| st.stmt.as_ref())
+        .and_then(|st| st.node.clone())
+    else {
+        return Ok(None);
+    };
+    let mut from = template.from_clause[0].clone();
+    if let Some(N::RangeSubselect(rs)) = from.node.as_mut() {
+        if let Some(N::SelectStmt(inner)) = rs.subquery.as_mut().and_then(|q| q.node.as_mut()) {
+            inner.from_clause = s.from_clause.clone();
+            inner.where_clause = s.where_clause.clone();
+            inner.having_clause = s.having_clause.clone();
+        }
+    }
+    let mut out = s.clone();
+    out.from_clause = vec![from];
+    out.where_clause = None;
+    out.having_clause = None;
+    Ok(Some(out))
+}
+
+/// A FROM-less select that aggregates, rewritten to read a one-row
+/// derived table.
+fn over_one_row(s: &pg_query::protobuf::SelectStmt) -> Option<pg_query::protobuf::SelectStmt> {
+    if !s.from_clause.is_empty()
+        || !s.values_lists.is_empty()
+        || !(has_aggregate(s) || s.having_clause.is_some())
+    {
+        return None;
+    }
+    let parsed = pg_query::parse("select from (select 1) as \"*one*\"").ok()?;
+    let from = match parsed
+        .protobuf
+        .stmts
+        .first()?
+        .stmt
+        .as_ref()?
+        .node
+        .as_ref()?
+    {
+        N::SelectStmt(one) => one.from_clause.first()?.clone(),
+        _ => return None,
+    };
+    let mut out = s.clone();
+    out.from_clause = vec![from];
+    Some(out)
+}
+
 fn has_aggregate(s: &pg_query::protobuf::SelectStmt) -> bool {
     // Only the names the aggregate planner actually handles. Any-FuncCall
     // routed a scalar call over a column (`regexp_replace(col, ...)`) into the
@@ -9283,6 +9403,7 @@ fn integer_series_rows(
         stop: int(&vals[1])?,
         step,
         column: name.into(),
+        int8: false,
     };
     let rows = series
         .values()
@@ -9929,6 +10050,34 @@ fn series_from_args(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result
             "function generate_series does not exist with that argument list".into(),
         ));
     }
+    // Three smallints (typed literals or parameters) fit the int4, int8 and
+    // numeric overloads equally: PostgreSQL cannot choose (42725).
+    let types: Vec<String> = f
+        .args
+        .iter()
+        .map(|a| match a.node.as_ref() {
+            Some(N::ParamRef(p)) => {
+                declared_param_type(usize::try_from(p.number).unwrap_or(0)).unwrap_or_default()
+            }
+            _ => const_value(a, params)
+                .map(|v| static_type(a, &v))
+                .unwrap_or_default(),
+        })
+        .collect();
+    let int8 = types.iter().any(|t| t == "int8");
+    if funcsig::ambiguous("generate_series", &types) {
+        return Err(Error::Sqlstate(
+            "42725",
+            format!(
+                "function generate_series({}) is not unique",
+                types
+                    .iter()
+                    .map(|t| display_type(t))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
     // `None` is a NULL argument, which is not an error: PostgreSQL answers a
     // series with any NULL bound with ZERO ROWS.
     let int_at = |i: usize| -> Result<Option<i64>> {
@@ -9977,6 +10126,7 @@ fn series_from_args(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result
             stop,
             step,
             column: "generate_series".to_string(),
+            int8,
         }),
         // A NULL bound: an EMPTY series rather than an error, spelled as a
         // range that generates nothing.
@@ -9985,6 +10135,7 @@ fn series_from_args(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result
             stop: 0,
             step: 1,
             column: "generate_series".to_string(),
+            int8,
         }),
     }
 }
@@ -10061,7 +10212,9 @@ fn plan_series_select(
             }
         }
     }
-    if columns.is_empty() {
+    // An EMPTY select list (`select from generate_series(1, 2)`) is rows of
+    // no columns, as it is over a table.
+    if columns.is_empty() && !s.target_list.is_empty() {
         columns.push((series.column.clone(), series.column.clone()));
         casts.push(None);
     }
@@ -10946,6 +11099,9 @@ fn plan_table_targets(
                 let field = def
                     .field_of(&column)
                     .ok_or_else(|| Error::UndefinedColumn(column.clone()))?;
+                // The overload PostgreSQL picks for these argument types
+                // (`round` of an integer is the float8 one).
+                let selected = funcsig::result_type(&name, &types);
                 // `length` of a tsvector counts its lexemes.
                 let name = if name == "length"
                     && def.column(&column).is_some_and(|c| c.pg_type == "tsvector")
@@ -10968,7 +11124,8 @@ fn plan_table_targets(
                 };
                 columns.push((out, field));
                 casts.push(Some(ColumnExpr::Call {
-                    result_type: scalar::static_result_type(&name).to_string(),
+                    result_type: selected
+                        .unwrap_or_else(|| scalar::static_result_type(&name).to_string()),
                     name,
                     args,
                 }));
@@ -13722,6 +13879,19 @@ fn text_function_mismatch(f: &pg_query::protobuf::FuncCall, types: &[String]) ->
     if !correlated::user_function_named(&name) && funcsig::resolves(&name, types) == Some(false) {
         return Some(missing());
     }
+    if !correlated::user_function_named(&name) && funcsig::ambiguous(&name, types) {
+        return Some(Error::Sqlstate(
+            "42725",
+            format!(
+                "function {shown}({}) is not unique",
+                types
+                    .iter()
+                    .map(|t| display_type(t))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
     if !correlated::user_function_named(&name) {
         let first = types.first().map(String::as_str).unwrap_or("");
         // The array built-ins take an array first; a known scalar has no
@@ -15269,7 +15439,16 @@ fn plan_select(
     {
         return plan_select(&values_as_subquery(s), lookup, params);
     }
+    if let Some(rewritten) = ungrouped_having(s)? {
+        return plan_select(&rewritten, lookup, params);
+    }
     if s.from_clause.is_empty() {
+        // An aggregate with no FROM aggregates the ONE row a FROM-less
+        // select has (`select sum(1)` is 1, `select count(*) having false`
+        // no row): the same query over a one-row derived table.
+        if let Some(rewritten) = over_one_row(s) {
+            return plan_select(&rewritten, lookup, params);
+        }
         return plan_select_constant(s, params);
     }
     // `FROM t TABLESAMPLE method (p)` is `t` with each row kept with
@@ -17772,6 +17951,17 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
     static_type_uncached(node, value)
 }
 
+/// The return type of the built-in overload `func_select_candidate` picks for
+/// `f`'s argument types, when each is statically known.
+fn selected_call_type(f: &pg_query::protobuf::FuncCall) -> Option<String> {
+    let name = func_name(f)?;
+    if f.agg_star || f.over.is_some() || correlated::user_function_named(&name) {
+        return None;
+    }
+    let types: Vec<String> = f.args.iter().map(|a| static_type(a, &Bson::Null)).collect();
+    funcsig::selected_result_type(&name, &types)
+}
+
 fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String {
     // `pg_trgm`: its functions and operators answer `real` (and `text[]`,
     // `boolean`), which a value alone -- a double -- does not say.
@@ -18123,6 +18313,12 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
         Some(N::FuncCall(f)) if range_accessor(f).is_some() => {
             let (element, _, _) = range_accessor(f).unwrap_or_default();
             range::accessor_result_type(&func_name(f).unwrap_or_default(), &element)
+        }
+        // Any other built-in reports the type of the overload PostgreSQL
+        // picks for its arguments' types (`abs(real)` is `real`, not the
+        // double its value is carried as).
+        Some(N::FuncCall(f)) if selected_call_type(f).is_some() => {
+            selected_call_type(f).unwrap_or_default()
         }
         Some(N::BoolExpr(_)) | Some(N::NullTest(_)) | Some(N::BooleanTest(_)) => "bool".to_string(),
         // These pick one of their arguments, so they report its type.
@@ -18962,6 +19158,10 @@ fn plan_select_srf(
     let Some((f, cast_chain)) = rt.val.as_ref().and_then(|v| series_target_call(v)) else {
         return Ok(None);
     };
+    // A numeric or timestamp series is the general set-returning path's.
+    if non_integer_series_kind(f).is_some() {
+        return Ok(None);
+    }
     let series = series_from_args(f, params)?;
     let column = if rt.name.is_empty() {
         series.column.clone()
@@ -22535,6 +22735,14 @@ pub fn apply_column_expr(expr: &ColumnExpr, value: Bson, tz: &TimeZoneSetting) -
                     v = user_casts::apply(&cast, v)?;
                     prev = Some(target);
                     continue;
+                }
+                // `array_out` prints an inet / cidr element with `inet_out`.
+                if let Some(net @ ("inet[]" | "cidr[]")) = from.as_deref() {
+                    if is_string_type(target) && matches!(v, Bson::Array(_)) {
+                        v = cast_value(net_elements_out(&v, net == "cidr[]"), target)?;
+                        prev = Some(target);
+                        continue;
+                    }
                 }
                 if matches!(target.as_str(), "text" | "varchar" | "name") {
                     if let Some(styled) = prev.and_then(|p| datetime_text_styled(&v, p, tz)) {
@@ -28189,6 +28397,18 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
     out
 }
 
+/// Each element of an `inet[]` / `cidr[]` as `inet_out` / `cidr_out` prints
+/// it, at any depth.
+fn net_elements_out(v: &Bson, is_cidr: bool) -> Bson {
+    match v {
+        Bson::Array(items) => {
+            Bson::Array(items.iter().map(|x| net_elements_out(x, is_cidr)).collect())
+        }
+        Bson::String(s) => Bson::String(net::text_out(s, is_cidr)),
+        other => other.clone(),
+    }
+}
+
 fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson> {
     // `'1'::int`, `$1::text`, `null::int`. The cast is applied to whatever the
     // operand evaluates to, so a bound parameter casts exactly like a literal.
@@ -28234,6 +28454,24 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                 return Err(Error::CannotCoerce(format!(
                     "cannot cast type {} to {}",
                     display_type(&source),
+                    display_type(&target)
+                )));
+            }
+            // An `inet[]` / `cidr[]` to text is `array_out`, which prints each
+            // element with `inet_out` -- a full host mask dropped
+            // (`{127.0.0.1}`) -- where the scalar `text(inet)` keeps it.
+            if matches!(source.as_str(), "inet[]" | "cidr[]") && is_string_type(&target) {
+                if let Bson::Array(_) = value {
+                    let out = net_elements_out(&value, source == "cidr[]");
+                    return cast_value(out, &target);
+                }
+            }
+            // An aclitem casts to the string types (I/O conversion) and to
+            // itself; nothing else (`'x=r/x'::aclitem::oid` is 42846).
+            if source == "aclitem" && !is_string_type(&target) && target != "aclitem" {
+                set_error_location(tc.location);
+                return Err(Error::CannotCoerce(format!(
+                    "cannot cast type aclitem to {}",
                     display_type(&target)
                 )));
             }

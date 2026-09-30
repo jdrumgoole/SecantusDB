@@ -2604,6 +2604,7 @@ fn generate_series_counts_by_its_step() {
             stop,
             step,
             column: "generate_series".into(),
+            int8: false,
         }
         .values()
     };
