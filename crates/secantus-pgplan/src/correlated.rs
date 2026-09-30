@@ -539,7 +539,46 @@ pub fn with_sequence_hook<R>(hook: &SequenceHook<'_>, f: impl FnOnce() -> R) -> 
 }
 
 /// The sequence functions.
-pub(crate) const SEQUENCE_FUNCTIONS: &[&str] = &["nextval", "currval", "setval", "lastval"];
+pub(crate) const SEQUENCE_FUNCTIONS: &[&str] = &[
+    "nextval",
+    "currval",
+    "setval",
+    "lastval",
+    // The storage-size functions ride the same executor hook: they read the
+    // store, which the planner cannot.
+    "pg_relation_size",
+    "pg_total_relation_size",
+    "pg_table_size",
+    "pg_indexes_size",
+    "pg_database_size",
+    // Advisory locks: session state the executor keeps.
+    "pg_advisory_lock",
+    "pg_advisory_lock_shared",
+    "pg_try_advisory_lock",
+    "pg_try_advisory_lock_shared",
+    "pg_advisory_unlock",
+    "pg_advisory_unlock_shared",
+    "pg_advisory_unlock_all",
+    "pg_advisory_xact_lock",
+    "pg_advisory_xact_lock_shared",
+    "pg_try_advisory_xact_lock",
+    "pg_try_advisory_xact_lock_shared",
+];
+
+/// The result type of an executor-answered function other than the
+/// sequence ones.
+pub fn executor_function_type(name: &str) -> Option<&'static str> {
+    Some(match name {
+        n if n.starts_with("pg_") && n.ends_with("_size") => "int8",
+        n if n.starts_with("pg_try_advisory")
+            || n.starts_with("pg_advisory_unlock") && n != "pg_advisory_unlock_all" =>
+        {
+            "bool"
+        }
+        n if n.contains("advisory") => "void",
+        _ => return None,
+    })
+}
 
 /// Call a sequence function. With no hook installed -- a Describe, or any
 /// plan that will not execute -- the call must NOT advance anything, and its

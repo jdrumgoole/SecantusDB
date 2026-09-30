@@ -137,6 +137,9 @@ pub struct StorageOptions {
 pub struct UserTransactionHandle {
     session: Option<Session>,
     began: bool,
+    /// The transaction has written, so its snapshot can no longer be
+    /// refreshed (see [`Storage::refresh_user_snapshot`]).
+    snapshot_fixed: bool,
     /// Oplog seq ranges minted by this transaction's statements, still
     /// registered in the sync-mode in-flight window (they pin the visible
     /// tail). Deregistered — advancing the tail and waking tailers — when the
@@ -6341,6 +6344,7 @@ impl Storage {
         Ok(UserTransactionHandle {
             session: Some(session),
             began: false,
+            snapshot_fixed: false,
             minted_ranges: Vec::new(),
             pending_async: Vec::new(),
             oplog: Arc::clone(&self.oplog),
@@ -6411,6 +6415,39 @@ impl Storage {
             in_async: IN_ASYNC_STMT.with(|f| f.replace(false)),
         };
         f()
+    }
+
+    /// Give `handle`'s transaction a fresh snapshot, as PostgreSQL's READ
+    /// COMMITTED takes one per statement: rows and catalog entries other
+    /// connections committed since are then visible, and an update over them
+    /// is not a conflict. WiredTiger allows this only until the transaction
+    /// first writes (a `read-committed` WiredTiger transaction cannot write at
+    /// all), so from its first write on the transaction keeps its snapshot --
+    /// REPEATABLE READ behaviour -- and `false` says so. A transaction that
+    /// has not begun yet takes a fresh snapshot at its first statement anyway.
+    pub fn refresh_user_snapshot(&self, handle: &mut UserTransactionHandle) -> Result<bool> {
+        if !handle.began {
+            return Ok(true);
+        }
+        // A write that emitted an oplog entry is known without asking; asking
+        // anyway would have WiredTiger log an error for every statement.
+        if handle.snapshot_fixed || handle.dirty_bytes > 0 || !handle.minted_ranges.is_empty() {
+            handle.snapshot_fixed = true;
+            return Ok(false);
+        }
+        let Some(session) = handle.session.as_ref() else {
+            return Ok(false);
+        };
+        match session.reset_snapshot() {
+            Ok(()) => Ok(true),
+            // The transaction wrote without an oplog entry: WiredTiger's
+            // refusal is the answer, and it is sticky.
+            Err(e) if e.is_not_supported() => {
+                handle.snapshot_fixed = true;
+                Ok(false)
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Run `f` with `handle`'s session installed as this thread's transaction

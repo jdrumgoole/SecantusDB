@@ -35,21 +35,223 @@ use bson::Bson;
 pub enum Config {
     English,
     Simple,
+    /// One of PostgreSQL's other Snowball configurations (`french`, ...).
+    Snowball(Lang),
+}
+
+/// The Snowball languages PostgreSQL ships a configuration for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lang {
+    Arabic,
+    Armenian,
+    Basque,
+    Catalan,
+    Hindi,
+    Indonesian,
+    Irish,
+    Lithuanian,
+    Nepali,
+    Serbian,
+    Yiddish,
+    Danish,
+    Dutch,
+    Finnish,
+    French,
+    German,
+    Greek,
+    Hungarian,
+    Italian,
+    Norwegian,
+    Portuguese,
+    Romanian,
+    Russian,
+    Spanish,
+    Swedish,
+    Tamil,
+    Turkish,
+}
+
+const LANGS: [Lang; 27] = [
+    Lang::Arabic,
+    Lang::Armenian,
+    Lang::Basque,
+    Lang::Catalan,
+    Lang::Hindi,
+    Lang::Indonesian,
+    Lang::Irish,
+    Lang::Lithuanian,
+    Lang::Nepali,
+    Lang::Serbian,
+    Lang::Yiddish,
+    Lang::Danish,
+    Lang::Dutch,
+    Lang::Finnish,
+    Lang::French,
+    Lang::German,
+    Lang::Greek,
+    Lang::Hungarian,
+    Lang::Italian,
+    Lang::Norwegian,
+    Lang::Portuguese,
+    Lang::Romanian,
+    Lang::Russian,
+    Lang::Spanish,
+    Lang::Swedish,
+    Lang::Tamil,
+    Lang::Turkish,
+];
+
+impl Lang {
+    pub fn name(self) -> &'static str {
+        match self {
+            Lang::Arabic => "arabic",
+            Lang::Armenian => "armenian",
+            Lang::Basque => "basque",
+            Lang::Catalan => "catalan",
+            Lang::Hindi => "hindi",
+            Lang::Indonesian => "indonesian",
+            Lang::Irish => "irish",
+            Lang::Lithuanian => "lithuanian",
+            Lang::Nepali => "nepali",
+            Lang::Serbian => "serbian",
+            Lang::Yiddish => "yiddish",
+            Lang::Danish => "danish",
+            Lang::Dutch => "dutch",
+            Lang::Finnish => "finnish",
+            Lang::French => "french",
+            Lang::German => "german",
+            Lang::Greek => "greek",
+            Lang::Hungarian => "hungarian",
+            Lang::Italian => "italian",
+            Lang::Norwegian => "norwegian",
+            Lang::Portuguese => "portuguese",
+            Lang::Romanian => "romanian",
+            Lang::Russian => "russian",
+            Lang::Spanish => "spanish",
+            Lang::Swedish => "swedish",
+            Lang::Tamil => "tamil",
+            Lang::Turkish => "turkish",
+        }
+    }
+
+    /// The algorithm when `snowball_stemmers_rs` runs it, else `None` (the
+    /// `rust-stemmers` languages; see `algorithm`).
+    fn newer_algorithm(self) -> Option<snowball_stemmers_rs::Algorithm> {
+        use snowball_stemmers_rs::Algorithm as A;
+        Some(match self {
+            Lang::Armenian => A::Armenian,
+            Lang::Basque => A::Basque,
+            Lang::Catalan => A::Catalan,
+            Lang::Hindi => A::Hindi,
+            Lang::Indonesian => A::Indonesian,
+            Lang::Irish => A::Irish,
+            Lang::Lithuanian => A::Lithuanian,
+            Lang::Nepali => A::Nepali,
+            Lang::Serbian => A::Serbian,
+            Lang::Yiddish => A::Yiddish,
+            _ => return None,
+        })
+    }
+
+    fn algorithm(self) -> rust_stemmers::Algorithm {
+        use rust_stemmers::Algorithm as A;
+        match self {
+            Lang::Arabic => A::Arabic,
+            Lang::Danish => A::Danish,
+            Lang::Dutch => A::Dutch,
+            Lang::Finnish => A::Finnish,
+            Lang::French => A::French,
+            Lang::German => A::German,
+            Lang::Greek => A::Greek,
+            Lang::Hungarian => A::Hungarian,
+            Lang::Italian => A::Italian,
+            Lang::Norwegian => A::Norwegian,
+            Lang::Portuguese => A::Portuguese,
+            Lang::Romanian => A::Romanian,
+            Lang::Russian => A::Russian,
+            Lang::Spanish => A::Spanish,
+            Lang::Swedish => A::Swedish,
+            Lang::Tamil => A::Tamil,
+            Lang::Turkish => A::Turkish,
+            // Stemmed by `newer_algorithm`; never reached.
+            _ => A::English,
+        }
+    }
+
+    /// The dictionary's `stopwords` file, when its `_stem` dictionary names
+    /// one (PostgreSQL's `tsearch_data/<language>.stop`, vendored as is).
+    fn stop_file(self) -> Option<&'static str> {
+        Some(match self {
+            Lang::Danish => include_str!("tsearch_data/danish.stop"),
+            Lang::Dutch => include_str!("tsearch_data/dutch.stop"),
+            Lang::Finnish => include_str!("tsearch_data/finnish.stop"),
+            Lang::French => include_str!("tsearch_data/french.stop"),
+            Lang::German => include_str!("tsearch_data/german.stop"),
+            Lang::Hungarian => include_str!("tsearch_data/hungarian.stop"),
+            Lang::Italian => include_str!("tsearch_data/italian.stop"),
+            Lang::Norwegian => include_str!("tsearch_data/norwegian.stop"),
+            Lang::Portuguese => include_str!("tsearch_data/portuguese.stop"),
+            Lang::Russian => include_str!("tsearch_data/russian.stop"),
+            Lang::Spanish => include_str!("tsearch_data/spanish.stop"),
+            Lang::Swedish => include_str!("tsearch_data/swedish.stop"),
+            Lang::Turkish => include_str!("tsearch_data/turkish.stop"),
+            Lang::Nepali => include_str!("tsearch_data/nepali.stop"),
+            _ => return None,
+        })
+    }
+
+    fn is_stop(self, word: &str) -> bool {
+        static SETS: std::sync::OnceLock<Vec<std::collections::HashSet<&'static str>>> =
+            std::sync::OnceLock::new();
+        let sets = SETS.get_or_init(|| {
+            LANGS
+                .iter()
+                .map(|l| {
+                    l.stop_file()
+                        .map(|f| f.lines().map(str::trim).filter(|w| !w.is_empty()).collect())
+                        .unwrap_or_default()
+                })
+                .collect()
+        });
+        LANGS
+            .iter()
+            .position(|l| *l == self)
+            .is_some_and(|i| sets[i].contains(word))
+    }
+
+    fn stem(self, word: &str) -> String {
+        match self.newer_algorithm() {
+            Some(a) => snowball_stemmers_rs::Stemmer::create(a)
+                .stem(word)
+                .into_owned(),
+            None => rust_stemmers::Stemmer::create(self.algorithm())
+                .stem(word)
+                .into_owned(),
+        }
+    }
+}
+
+impl Config {
+    /// The configuration's name, as `regconfig` prints it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Config::English => "english",
+            Config::Simple => "simple",
+            Config::Snowball(l) => l.name(),
+        }
+    }
 }
 
 /// Resolve a configuration name (`english`, `pg_catalog.simple`, ...).
 pub fn config(name: &str) -> Result<Config> {
     let n = name.trim().trim_matches('"').to_ascii_lowercase();
     let n = n.strip_prefix("pg_catalog.").unwrap_or(&n);
+    if let Some(l) = LANGS.iter().find(|l| l.name() == n) {
+        return Ok(Config::Snowball(*l));
+    }
     match n {
         "english" => Ok(Config::English),
         "simple" => Ok(Config::Simple),
-        "arabic" | "armenian" | "basque" | "catalan" | "danish" | "dutch" | "finnish"
-        | "french" | "german" | "greek" | "hindi" | "hungarian" | "indonesian" | "irish"
-        | "italian" | "lithuanian" | "nepali" | "norwegian" | "portuguese" | "romanian"
-        | "russian" | "serbian" | "spanish" | "swedish" | "tamil" | "turkish" | "yiddish" => Err(
-            Error::Unsupported(format!("text search configuration \"{n}\"")),
-        ),
         _ => Err(Error::Sqlstate(
             "42704",
             format!(
@@ -226,7 +428,7 @@ fn tokens(text: &str) -> Vec<(String, Kind)> {
     let n = chars.len();
     let mut out = Vec::new();
     let mut i = 0;
-    let is_word = |c: char| c.is_alphanumeric();
+    let is_word = word_char;
     while i < n {
         let c = chars[i];
         // A protocol (`http://`) is a token no configuration indexes; the
@@ -338,7 +540,7 @@ fn emit(raw: &str, out: &mut Vec<(String, Kind)>) {
         || (raw.contains('.')
             && raw
                 .split('.')
-                .all(|seg| !seg.is_empty() && seg.chars().all(char::is_alphanumeric)))
+                .all(|seg| !seg.is_empty() && seg.chars().all(word_char)))
     {
         out.push((raw.to_string(), Kind::Other));
         return;
@@ -352,7 +554,7 @@ fn emit(raw: &str, out: &mut Vec<(String, Kind)>) {
     }
     for seg in pieces {
         let parts: Vec<&str> = seg.split('-').filter(|p| !p.is_empty()).collect();
-        let word_like = |p: &str| p.chars().any(|c| c.is_alphabetic());
+        let word_like = |p: &str| p.chars().any(letter_char);
         if parts.len() > 1
             && seg.split('-').all(|p| !p.is_empty())
             && parts.iter().any(|p| word_like(p))
@@ -384,19 +586,42 @@ fn emit(raw: &str, out: &mut Vec<(String, Kind)>) {
     }
 }
 
+/// A letter to PostgreSQL's parser under the `C` locale the reference runs:
+/// an ASCII letter, or ANY non-ASCII character -- `wparser_def.c` treats
+/// every character above 0x7F as alphabetic there, so `«bonjour»`, `a—b`
+/// and Devanagari with its virama are each one word.
+fn letter_char(c: char) -> bool {
+    c.is_ascii_alphabetic() || !c.is_ascii()
+}
+
+/// A letter or an ASCII digit, by the same rule.
+fn word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || !c.is_ascii()
+}
+
 /// One token through the configuration's dictionary: `None` for a
 /// stop-word (which still takes a position).
 fn normalise(token: &str, kind: Kind, cfg: Config) -> Option<String> {
     // Lower-casing follows the database's LC_CTYPE; the reference server
     // runs `C`, where only ASCII letters fold (`Ünïcode` keeps its `Ü`).
     let lower = token.to_ascii_lowercase();
+    let english = |lower: String| {
+        if ENGLISH_STOP.contains(&lower.as_str()) {
+            None
+        } else {
+            Some(stem(&lower))
+        }
+    };
     match (cfg, kind) {
-        (Config::Simple, _) | (Config::English, Kind::Other) => Some(lower),
-        (Config::English, Kind::Word) => {
-            if ENGLISH_STOP.contains(&lower.as_str()) {
+        (Config::Simple, _) | (_, Kind::Other) => Some(lower),
+        (Config::English, Kind::Word) => english(lower),
+        // `russian` sends its ASCII words to english_stem.
+        (Config::Snowball(Lang::Russian), Kind::Word) if lower.is_ascii() => english(lower),
+        (Config::Snowball(lang), Kind::Word) => {
+            if lang.is_stop(&lower) {
                 None
             } else {
-                Some(stem(&lower))
+                Some(lang.stem(&lower))
             }
         }
     }
@@ -1059,7 +1284,7 @@ pub fn websearch_to_tsquery(cfg: Config, text: &str) -> Option<Query> {
             continue;
         }
         let q = morph(&word, cfg, false, 0, true);
-        if q == Query::Stop && !word.chars().any(|c| c.is_alphanumeric()) {
+        if q == Query::Stop && !word.chars().any(word_char) {
             continue;
         }
         items.push(Item::Term(if negate { Query::Not(Box::new(q)) } else { q }));
@@ -1483,7 +1708,7 @@ pub fn headline(cfg: Config, doc: &str, q: &Option<Query>) -> String {
     let mut cur = String::new();
     let mut in_word = false;
     for c in doc.chars() {
-        let w = c.is_alphanumeric();
+        let w = word_char(c);
         if w != in_word && !cur.is_empty() {
             pieces.push((std::mem::take(&mut cur), in_word));
         }

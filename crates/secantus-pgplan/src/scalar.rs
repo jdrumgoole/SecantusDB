@@ -17,6 +17,9 @@ pub fn is_scalar(name: &str) -> bool {
         || crate::arrays::is_array_function(name)
         || extension_scalar(name).is_some()
         || crate::fts::is_function(name)
+        || crate::xml::is_function(name)
+        || crate::jsonops::FUNCTIONS.contains(&name)
+        || crate::mathfn::FUNCTIONS.contains(&name)
 }
 
 /// Does this built-in's result type follow from its NAME alone?
@@ -86,6 +89,9 @@ fn extension_scalar(name: &str) -> Option<crate::ExtensionType> {
 }
 
 const SCALAR_NAMES: &[&str] = &[
+    "pg_size_pretty",
+    "pg_size_bytes",
+    "pg_column_size",
     "to_char",
     "to_number",
     "similar_to_escape",
@@ -125,6 +131,10 @@ const SCALAR_NAMES: &[&str] = &[
     "concat",
     "concat_ws",
     "md5",
+    "sha224",
+    "sha256",
+    "sha384",
+    "sha512",
     "quote_ident",
     "format",
     "chr",
@@ -397,6 +407,15 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         return crate::arrays::call(name, args);
     }
     if let Some(out) = crate::fts::call(name, args) {
+        return out;
+    }
+    if let Some(out) = crate::xml::call(name, args) {
+        return out;
+    }
+    if let Some(out) = crate::jsonops::call(name, args) {
+        return out;
+    }
+    if let Some(out) = crate::mathfn::call(name, args) {
         return out;
     }
     if crate::jsonpath::is_function(name) {
@@ -767,6 +786,23 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
                     .collect::<Vec<_>>()
                     .join(&sep),
             ))
+        }
+        "sha224" | "sha256" | "sha384" | "sha512" => {
+            use sha2::Digest;
+            let bytes = match &args[0] {
+                Bson::Binary(b) => b.bytes.clone(),
+                other => text(other).into_bytes(),
+            };
+            let digest: Vec<u8> = match name {
+                "sha224" => sha2::Sha224::digest(&bytes).to_vec(),
+                "sha256" => sha2::Sha256::digest(&bytes).to_vec(),
+                "sha384" => sha2::Sha384::digest(&bytes).to_vec(),
+                _ => sha2::Sha512::digest(&bytes).to_vec(),
+            };
+            Ok(Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::Generic,
+                bytes: digest,
+            }))
         }
         "md5" => {
             need(1)?;
@@ -1211,14 +1247,50 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
                 ))),
             }
         }
-        // No COMMENT is stored for a relation, so its description is NULL --
-        // which is also what PostgreSQL answers for an uncommented one.
-        "obj_description" | "col_description" | "shobj_description" => Ok(Bson::Null),
+        // `COMMENT ON` text, published by the server per catalog version:
+        // `obj_description(oid [, catalog])` is an object's own comment,
+        // `col_description(table_oid, attnum)` a column's. NULL for an
+        // uncommented object, as in PostgreSQL.
+        "obj_description" | "col_description" | "shobj_description" => {
+            let oid = match args.first() {
+                Some(Bson::Int32(i)) => i64::from(*i),
+                Some(Bson::Int64(i)) => *i,
+                Some(other) => match crate::regclass_oid(other) {
+                    Some(o) => o,
+                    None => return Ok(Bson::Null),
+                },
+                None => return Ok(Bson::Null),
+            };
+            let subid = if name == "col_description" {
+                match args.get(1) {
+                    Some(Bson::Int32(i)) => *i,
+                    Some(Bson::Int64(i)) => i32::try_from(*i).unwrap_or(-1),
+                    _ => return Ok(Bson::Null),
+                }
+            } else {
+                0
+            };
+            Ok(crate::object_comment(oid, subid).map_or(Bson::Null, Bson::String))
+        }
         // `pg_get_expr(adbin, adrelid)` renders a stored expression. This
         // server keeps `adbin` as the rendered TEXT already (see the
         // `pg_attrdef` rows), so it hands the first argument straight back.
         "pg_get_expr" => Ok(args.first().cloned().unwrap_or(Bson::Null)),
-        _ => Err(Error::Unsupported(format!("function {name}()"))),
+        "pg_size_pretty" => size_pretty(&args[0]),
+        "pg_size_bytes" => size_bytes(&crate::value_text(&args[0])),
+        "pg_column_size" => Ok(column_size(&args[0])),
+        // PostgreSQL names the argument types it could not match; a
+        // constant string argument is an untyped literal, `unknown`.
+        _ => Err(Error::Unsupported(format!(
+            "function {name}({})",
+            args.iter()
+                .map(|a| match a {
+                    Bson::String(_) => "unknown".to_string(),
+                    other => crate::display_type(crate::inferred_type(other)),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
     }
 }
 
@@ -1234,7 +1306,14 @@ fn format_type_call(args: &[Bson]) -> Result<Bson> {
         return Ok(Bson::Null);
     };
     let Some(name) = crate::pgtypes::name_of_oid(oid) else {
-        return Ok(Bson::String(format!("???({oid})")));
+        // A user type (enum, composite, range, domain, ...) prints as its
+        // regtype name; only an oid nothing knows is `???`.
+        let text = crate::regtype_text(oid);
+        return Ok(Bson::String(if text == oid.to_string() {
+            format!("???({oid})")
+        } else {
+            text
+        }));
     };
     let typmod = args.get(1).and_then(|v| match v {
         Bson::Int32(x) => Some(*x),
@@ -1474,37 +1553,91 @@ fn pg_format(fmt: &str, args: &[Bson]) -> Result<String> {
             out.push('%');
             continue;
         }
-        // An optional `n$` position.
-        let mut digits = String::new();
-        while let Some(&d) = chars.peek() {
-            if d.is_ascii_digit() {
-                digits.push(d);
-                chars.next();
-            } else {
-                break;
+        // `%[n$][-][width | * | *n$]type`.
+        let digits_of = |chars: &mut std::iter::Peekable<std::str::Chars>| {
+            let mut d = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_ascii_digit() {
+                    d.push(c);
+                    chars.next();
+                } else {
+                    break;
+                }
             }
-        }
-        let index = if !digits.is_empty() && chars.peek() == Some(&'$') {
-            chars.next();
-            let n: usize = digits.parse().map_err(|_| {
-                Error::InvalidParameter(
-                    "format specifies argument 0, but arguments are numbered from 1".into(),
-                )
-            })?;
+            d
+        };
+        let position = |n: &str| -> Result<usize> {
+            let n: usize = n.parse().unwrap_or(0);
             if n == 0 {
                 return Err(Error::InvalidParameter(
                     "format specifies argument 0, but arguments are numbered from 1".into(),
                 ));
             }
-            n - 1
-        } else {
-            if !digits.is_empty() {
-                // A width, which this server does not lay out.
-                return Err(Error::Unsupported("a format() field width".into()));
+            Ok(n - 1)
+        };
+        let mut digits = digits_of(&mut chars);
+        let mut explicit_index = None;
+        if !digits.is_empty() && chars.peek() == Some(&'$') {
+            chars.next();
+            explicit_index = Some(position(&digits)?);
+            digits.clear();
+        }
+        let mut left = false;
+        if digits.is_empty() {
+            while chars.peek() == Some(&'-') {
+                chars.next();
+                left = true;
             }
-            let i = next_arg;
-            next_arg += 1;
-            i
+        }
+        let mut width: Option<i64> = None;
+        if digits.is_empty() && chars.peek() == Some(&'*') {
+            chars.next();
+            let d = digits_of(&mut chars);
+            let wi = if !d.is_empty() && chars.peek() == Some(&'$') {
+                chars.next();
+                position(&d)?
+            } else {
+                let i = next_arg;
+                next_arg += 1;
+                i
+            };
+            let w = args
+                .get(wi)
+                .ok_or_else(|| Error::InvalidParameter("too few arguments for format()".into()))?;
+            width = match w {
+                Bson::Null => None,
+                Bson::Int32(v) => Some(i64::from(*v)),
+                Bson::Int64(v) => Some(*v),
+                other => {
+                    let t = text(other);
+                    Some(t.trim().parse().map_err(|_| {
+                        Error::InvalidText(format!(
+                            "invalid input syntax for type integer: \"{t}\""
+                        ))
+                    })?)
+                }
+            };
+        } else {
+            if digits.is_empty() {
+                digits = digits_of(&mut chars);
+            }
+            if !digits.is_empty() {
+                width = digits.parse().ok();
+            }
+        }
+        if let Some(w) = width {
+            if w < 0 {
+                left = true;
+                width = Some(-w);
+            }
+        }
+        let index = match explicit_index {
+            Some(i) => i,
+            None => {
+                let i = next_arg;
+                next_arg += 1;
+                i
+            }
         };
         let Some(spec) = chars.next() else {
             return Err(Error::InvalidParameter(
@@ -1514,6 +1647,7 @@ fn pg_format(fmt: &str, args: &[Bson]) -> Result<String> {
         let value = args
             .get(index)
             .ok_or_else(|| Error::InvalidParameter("too few arguments for format()".into()))?;
+        let field_start = out.len();
         match spec {
             's' => {
                 if *value != Bson::Null {
@@ -1539,6 +1673,22 @@ fn pg_format(fmt: &str, args: &[Bson]) -> Result<String> {
                 return Err(Error::InvalidParameter(format!(
                     "unrecognized format() type specifier \"{other}\""
                 )));
+            }
+        }
+        // Pad the field to its width, on the right when left-justified.
+        if let Some(w) = width {
+            let field: String = out[field_start..].to_string();
+            let n = field.chars().count() as i64;
+            if n < w {
+                let pad = " ".repeat((w - n) as usize);
+                out.truncate(field_start);
+                if left {
+                    out.push_str(&field);
+                    out.push_str(&pad);
+                } else {
+                    out.push_str(&pad);
+                    out.push_str(&field);
+                }
             }
         }
     }
@@ -1648,10 +1798,42 @@ fn md5_hex(data: &[u8]) -> String {
 /// input and fall back to text only when unknown, which is also what an
 /// untyped output column defaults to.
 pub fn static_result_type(name: &str) -> &'static str {
+    if let Some(t) = crate::correlated::executor_function_type(name) {
+        return t;
+    }
+    if matches!(
+        name,
+        "pg_relation_size"
+            | "pg_total_relation_size"
+            | "pg_table_size"
+            | "pg_indexes_size"
+            | "pg_database_size"
+            | "pg_size_bytes"
+    ) {
+        return "int8";
+    }
+    if name == "pg_size_pretty" {
+        return "text";
+    }
+    if matches!(name, "sha224" | "sha256" | "sha384" | "sha512") {
+        return "bytea";
+    }
+    if name == "pg_column_size" {
+        return "int4";
+    }
     if let Some(t) = crate::arrays::static_result_type(name) {
         return t;
     }
     if let Some(t) = crate::fts::result_type(name) {
+        return t;
+    }
+    if let Some(t) = crate::xml::result_type(name) {
+        return t;
+    }
+    if let Some(t) = crate::jsonops::result_type(name) {
+        return t;
+    }
+    if let Some(t) = crate::mathfn::result_type(name) {
         return t;
     }
     match name {
@@ -1785,4 +1967,70 @@ fn similar_escape(pattern: &str, escape: Option<&str>) -> Result<String> {
     }
     r.push_str(")$");
     Ok(r)
+}
+
+/// `pg_size_pretty(bigint | numeric)`, PostgreSQL 14's rule: bytes below
+/// 10 kB, then each unit while the value stays under 20 of it (with a half
+/// unit of rounding carried in one spare bit), up to TB.
+fn size_pretty(v: &Bson) -> Result<Bson> {
+    let size: i128 = match v {
+        Bson::Int32(i) => i128::from(*i),
+        Bson::Int64(i) => i128::from(*i),
+        Bson::Double(d) => *d as i128,
+        other => crate::value_text(other)
+            .split('.')
+            .next()
+            .and_then(|t| t.parse().ok())
+            .ok_or_else(|| Error::InvalidText("invalid size".into()))?,
+    };
+    let limit: i128 = 10 * 1024;
+    let limit2 = limit * 2 - 1;
+    let half_rounded = |x: i128| (x + if x < 0 { -1 } else { 1 }) / 2;
+    if size.abs() < limit {
+        return Ok(Bson::String(format!("{size} bytes")));
+    }
+    let mut s = size >> 9;
+    for unit in ["kB", "MB", "GB"] {
+        if s.abs() < limit2 {
+            return Ok(Bson::String(format!("{} {unit}", half_rounded(s))));
+        }
+        s >>= 10;
+    }
+    Ok(Bson::String(format!("{} TB", half_rounded(s))))
+}
+
+/// `pg_size_bytes(text)`: a number, then optionally `bytes` / `kB` / `MB` /
+/// `GB` / `TB` (any case, 1024-based).
+fn size_bytes(text: &str) -> Result<Bson> {
+    let t = text.trim();
+    let split = t
+        .find(|c: char| !(c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E')))
+        .unwrap_or(t.len());
+    let (num, unit) = t.split_at(split);
+    let invalid = || Error::InvalidText(format!("invalid size: \"{text}\""));
+    let value: f64 = num.trim().parse().map_err(|_| invalid())?;
+    let mult: f64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "bytes" => 1.0,
+        "kb" => 1024.0,
+        "mb" => 1024.0 * 1024.0,
+        "gb" => 1024.0 * 1024.0 * 1024.0,
+        "tb" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => return Err(Error::InvalidText(format!("invalid size: \"{text}\""))),
+    };
+    Ok(Bson::Int64((value * mult) as i64))
+}
+
+/// `pg_column_size(value)`: the bytes the value's datum takes -- a short
+/// varlena (under 127 bytes) carries a 1-byte header, a longer one 4.
+fn column_size(v: &Bson) -> Bson {
+    match v {
+        Bson::Null => Bson::Null,
+        Bson::Boolean(_) => Bson::Int32(1),
+        Bson::Int32(_) => Bson::Int32(4),
+        Bson::Int64(_) | Bson::Double(_) | Bson::DateTime(_) => Bson::Int32(8),
+        other => {
+            let n = crate::value_text(other).len();
+            Bson::Int32(if n < 127 { n + 1 } else { n + 4 } as i32)
+        }
+    }
 }

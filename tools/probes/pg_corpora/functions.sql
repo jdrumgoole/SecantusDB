@@ -25,3 +25,14 @@ CREATE OR REPLACE FUNCTION add2(a int, b int) RETURNS int AS 'SELECT a * b' LANG
 SELECT add2(3, 4)
 CREATE FUNCTION bad() RETURNS int AS $$ BEGIN RETURN nosuchvar + ; END $$ LANGUAGE plpgsql
 DO $$ BEGIN RAISE NOTICE 'fact %', fact(4); END $$
+CREATE FUNCTION nfact(n int) RETURNS numeric AS $$ BEGIN IF n <= 1 THEN RETURN 1; END IF; RETURN n * nfact(n - 1); END $$ LANGUAGE plpgsql
+CREATE FUNCTION nmul(a int, b numeric) RETURNS numeric AS $$ BEGIN RETURN a * b; END $$ LANGUAGE plpgsql
+SELECT nfact(20)
+SELECT nfact(25)
+SELECT nmul(100000, 99999999999)
+SELECT pg_typeof(nfact(3))
+SELECT 3 * 99999999999::numeric
+SELECT nfact(150) > 0
+CREATE FUNCTION runaway(n int) RETURNS int AS $$ BEGIN RETURN runaway(n + 1); END $$ LANGUAGE plpgsql
+SELECT runaway(1)
+SELECT 1

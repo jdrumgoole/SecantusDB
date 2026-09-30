@@ -301,9 +301,11 @@ fn update_and_delete_are_planned() {
         }
         other => panic!("wrong statement: {other:?}"),
     }
-    // The PK is the document's `_id`, which storage treats as immutable.
-    let err = plan("UPDATE t SET id = 2 WHERE id = 1", &lookup).expect_err("PK update");
-    assert_eq!(err.sqlstate(), "0A000");
+    // The PK is the document's `_id`: the executor re-keys the row.
+    match plan_ok("UPDATE t SET id = 2 WHERE id = 1") {
+        Statement::Update(u) => assert_eq!(u.set.get("_id"), Some(&Bson::Int32(2))),
+        other => panic!("wrong statement: {other:?}"),
+    }
 }
 
 #[test]
@@ -567,13 +569,6 @@ fn aggregate_refusals_carry_the_right_sqlstate() {
     let cases: Vec<(&str, &str)> = vec![
         // A bare column beside an aggregate must be grouped.
         ("SELECT name, count(*) FROM t", "42803"),
-        // Deliberately deferred rather than approximated. Keep this naming
-        // something that IS still refused -- `avg` and `string_agg` each sat
-        // here until they landed, and the stale case failed the build.
-        (
-            "SELECT array_agg(name ORDER BY length(name)) FROM t",
-            "0A000",
-        ),
         // `DISTINCT ON` over an aggregate resolves its keys against the GROUP
         // BY output, which this slice does not do; plain `count(DISTINCT n)`
         // IS supported (see `count_distinct_plans_a_distinct_aggregate`).
@@ -607,9 +602,9 @@ fn having_plans_and_adds_the_aggregates_it_needs() {
         }
         other => panic!("wrong statement: {other:?}"),
     }
-    // A shape the lowerer does not cover is refused, not approximated.
+    // An ungrouped column in HAVING is PostgreSQL's 42803.
     let err = plan("SELECT count(*) FROM t HAVING count(*) > n", &lookup).expect_err("n in HAVING");
-    assert_eq!(err.sqlstate(), "0A000");
+    assert_eq!(err.sqlstate(), "42803");
 }
 
 /// `count(DISTINCT col)` plans as an aggregate that dedups its input.
@@ -3143,6 +3138,7 @@ fn create_table_as_carries_its_query() {
             column_names,
             query,
             with_data,
+            ..
         } => {
             assert_eq!(table, "tt");
             assert!(!if_not_exists);
@@ -3170,7 +3166,10 @@ fn create_table_as_carries_its_query() {
     }
     assert!(matches!(
         plan("CREATE MATERIALIZED VIEW mv AS SELECT 1", &lookup),
-        Err(Error::Unsupported(_))
+        Ok(Statement::CreateTableAs {
+            matview_sql: Some(_),
+            ..
+        })
     ));
 }
 

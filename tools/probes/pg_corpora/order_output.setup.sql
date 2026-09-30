@@ -1,0 +1,3 @@
+DROP TABLE IF EXISTS ob_t
+CREATE TABLE ob_t (id int PRIMARY KEY, n int)
+INSERT INTO ob_t VALUES (1, 9), (2, 10), (3, 100)
