@@ -1,8 +1,8 @@
 """Every regex-shaped query crossed with every document-side value type.
 
 A regex is a VALUE as well as a pattern, and that half was missing on both
-servers. 104 shapes; 14 diverged on the Python server and 21 on the Rust one
-when this was written:
+servers. 104 shapes (plus the end-anchor block added 2026-09-30); 14
+diverged on the Python server and 21 on the Rust one when this was written:
 
 * a bare `/ab/i` never matched a STORED regex equal to it, so
   `find({v: /ab/i})` missed `{v: /ab/i}` -- a silent wrong answer, not an error;
@@ -22,15 +22,12 @@ import os
 import sys
 
 import pymongo
-from _servers import probe_store
+from _servers import probe_server
 from bson import Code, Regex
-
-from secantus import SecantusDBServer
 
 mon = pymongo.MongoClient(os.environ.get("PROBE_MONGOD", "mongodb://127.0.0.1:27041"))
 
-s = SecantusDBServer(port=0, storage_path=probe_store())
-s.start()
+s = probe_server()
 py = pymongo.MongoClient(s.uri)
 targets = [("mongod", mon), ("python", py)]
 if os.environ.get("PROBE_SERVER"):
@@ -76,6 +73,49 @@ for qn, qf in QUERIES:
             except Exception as e:
                 res[label] = f"ERR {getattr(e, 'code', '?')}"
         rows.append((qn, dn, res))
+
+# PCRE's END ANCHORS (2026-09-30). Outside multiline mode `$` and `\Z` match
+# at the end OR before a final newline; the Rust server's linear engine matched
+# only the very end, and refused `\Z` outright. The subjects are what make it
+# visible: none of the values above ends in a newline.
+ANCHOR_SUBJECTS = ["foo", "foo\n", "foo\n\n", "foo\nbar", "x\nfoo\nbar"]
+ANCHOR_PATTERNS = [
+    ("foo$", ""),
+    ("foo$", "m"),
+    ("foo$", "s"),
+    ("o$|z", ""),
+    ("foo$\\n", ""),
+    ("foo\\Z", ""),
+    ("\\Z", ""),
+    ("(?m)foo$", ""),
+    ("[$]", ""),
+    ("foo\\z", ""),
+]
+for pat, opt in ANCHOR_PATTERNS:
+    res = {}
+    for label, cli in targets:
+        c = cli["rxcmp"]["anchors"]
+        c.drop()
+        c.insert_many([{"_id": i, "v": v} for i, v in enumerate(ANCHOR_SUBJECTS)])
+        try:
+            hits = sorted(d["_id"] for d in c.find({"v": {"$regex": pat, "$options": opt}}))
+            found = [
+                d["m"] and d["m"]["match"]
+                for d in c.aggregate(
+                    [
+                        {"$sort": {"_id": 1}},
+                        {
+                            "$project": {
+                                "m": {"$regexFind": {"input": "$v", "regex": pat, "options": opt}}
+                            }
+                        },
+                    ]
+                )
+            ]
+            res[label] = f"{hits} {found}"
+        except Exception as e:
+            res[label] = f"ERR {getattr(e, 'code', '?')}"
+    rows.append((f"anchor /{pat}/{opt}", "newline-subjects", res))
 
 bad = [(q, d, r) for q, d, r in rows if len({v for k, v in r.items()}) > 1]
 print(f"total {len(rows)}  divergent {len(bad)}")

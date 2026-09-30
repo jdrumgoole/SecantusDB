@@ -31,7 +31,7 @@ use crate::cursors::{CursorProducer, CursorRegistry, TailableOptions};
 use crate::storage::Storage;
 use crate::util::{
     as_i64, bool_field, coll_arg, collation_of, command_error, doc_field, docs_to_bson,
-    encode_docs, resolve_let_vars,
+    encode_docs_ref, resolve_let_vars,
 };
 use crate::{
     CommandContext, CommandError, HandlerResult, DEFAULT_BATCH_SIZE, MAX_GETMORE_BATCH_BYTES,
@@ -677,11 +677,37 @@ pub(crate) fn split_into_cursor(
 /// while only the cursor remainder is encoded to bytes for the registry. Shared
 /// with the `aggregate` handler.
 pub(crate) fn split_docs_into_cursor(
+    docs: Vec<Document>,
+    batch_size: i64,
+    ns: &str,
+    cursors: &CursorRegistry,
+    bounded: bool,
+) -> Result<(Vec<Bson>, i64), CommandError> {
+    split_docs_into_cursor_checked(docs, batch_size, ns, cursors, bounded, None)
+}
+
+/// mongod's internal BSON ceiling (16MB + 16KB): a result document past it
+/// cannot be serialised into a reply at all.
+const BSON_OBJ_MAX_INTERNAL_SIZE: usize = 16 * 1024 * 1024 + 16 * 1024;
+
+/// [`split_docs_into_cursor`], byte-budgeted like [`split_into_cursor`] and,
+/// when `oversize_prefix` is given, refusing a document too large to send.
+///
+/// Both halves were missing for decoded results. Without the budget a first
+/// batch of large projected / aggregated documents went out as one reply of
+/// any size; without the refusal a single result over 16MB -- `{$range: [0,
+/// 6553590]}` is 84MB -- was sent as an 84MB MESSAGE, past the 48MB wire
+/// maximum, and the driver dropped the connection with a ProtocolError.
+/// mongod answers 10334 `Serializing Document failed` under its executor
+/// prefix (measured 8.2.11, 2026-09-30). Every result is encoded once here: the
+/// size decides both, and the cursor remainder needs the bytes anyway.
+pub(crate) fn split_docs_into_cursor_checked(
     mut docs: Vec<Document>,
     batch_size: i64,
     ns: &str,
     cursors: &CursorRegistry,
     bounded: bool,
+    oversize_prefix: Option<&str>,
 ) -> Result<(Vec<Bson>, i64), CommandError> {
     let take = if batch_size < 0 {
         DEFAULT_BATCH_SIZE as usize
@@ -689,14 +715,43 @@ pub(crate) fn split_docs_into_cursor(
         batch_size as usize
     }
     .min(docs.len());
-    let remaining = docs.split_off(take);
+    let mut encoded = encode_docs_ref(&docs)?;
+    if let Some(prefix) = oversize_prefix {
+        if let Some(big) = encoded
+            .iter()
+            .find(|b| b.len() > BSON_OBJ_MAX_INTERNAL_SIZE)
+        {
+            return Err(CommandError::new(
+                10334,
+                "BSONObjectTooLarge",
+                format!(
+                    "{prefix} :: caused by :: Serializing Document failed :: caused by :: \
+                     Size {} exceeds maximum {BSON_OBJ_MAX_INTERNAL_SIZE}",
+                    big.len()
+                ),
+            ));
+        }
+    }
+    // Same rule as the blob path: stop before the batch passes 16MB, but always
+    // take one document so an oversized one still makes progress.
+    let mut bytes = 0usize;
+    let mut fitted = 0usize;
+    for blob in encoded.iter().take(take) {
+        if fitted > 0 && bytes + blob.len() > MAX_GETMORE_BATCH_BYTES {
+            break;
+        }
+        bytes += blob.len();
+        fitted += 1;
+    }
+    docs.truncate(fitted);
+    let remaining = encoded.split_off(fitted);
     let filled_exactly = batch_size > 0 && docs.len() == batch_size as usize;
     let first: Vec<Bson> = docs.into_iter().map(Bson::Document).collect();
     if remaining.is_empty() && (bounded || !filled_exactly) {
         return Ok((first, 0));
     }
     let cursor_id = cursors
-        .register_bounded(ns, encode_docs(remaining)?, bounded)
+        .register_bounded(ns, remaining, bounded)
         .map_err(|e| CommandError::new(1, "InternalError", format!("cursor registry: {e:?}")))?;
     Ok((first, cursor_id))
 }

@@ -55,6 +55,7 @@ pub mod storage;
 pub mod topstats;
 pub mod transactions;
 mod util;
+mod validation_errors;
 
 use std::sync::{Arc, Mutex};
 
@@ -596,25 +597,71 @@ pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
 /// actually run: it answers `UnsatisfiableWriteConcern`, and so does a
 /// `failCommand` injecting 100 at the top level. Neither context uses the old
 /// name.
+///
+/// Measured again on 2026-09-30 across insert / update / delete / findAndModify
+/// / create / createIndexes / drop, three things this missed:
+///
+/// - an UNKNOWN tag (`w: "tag"`) is not a pre-flight refusal: the write runs,
+///   and the reply carries `79 UnknownReplWriteConcern` here, like `w > 1`;
+/// - every `writeConcernError` carries `errInfo.writeConcern` -- the client's
+///   `w`, its `j` if given, `wtimeout` (0 when absent) and
+///   `provenance: "clientSupplied"`, in that order;
+/// - it sits immediately BEFORE `ok`, not after it.
 fn attach_write_concern_error(doc: &Document, reply: &mut Document) {
     if reply.get_f64("ok").unwrap_or(0.0) != 1.0 || reply.contains_key("writeConcernError") {
         return;
     }
-    let w = doc
-        .get("writeConcern")
-        .and_then(bson::Bson::as_document)
-        .and_then(|wc| wc.get("w"));
-    let unsatisfiable = match w {
-        Some(bson::Bson::Int32(n)) => *n > 1,
-        Some(bson::Bson::Int64(n)) => *n > 1,
-        _ => false,
+    let Some(wc) = doc.get("writeConcern").and_then(bson::Bson::as_document) else {
+        return;
     };
-    if unsatisfiable {
-        let mut wce = Document::new();
-        wce.insert("code", 100i32);
-        wce.insert("codeName", "UnsatisfiableWriteConcern");
-        wce.insert("errmsg", "Not enough data-bearing nodes");
-        reply.insert("writeConcernError", wce);
+    let (code, code_name, errmsg) = match wc.get("w") {
+        Some(bson::Bson::Int32(n)) if *n > 1 => (
+            100,
+            "UnsatisfiableWriteConcern",
+            "Not enough data-bearing nodes".to_string(),
+        ),
+        Some(bson::Bson::Int64(n)) if *n > 1 => (
+            100,
+            "UnsatisfiableWriteConcern",
+            "Not enough data-bearing nodes".to_string(),
+        ),
+        Some(bson::Bson::String(tag)) if tag != "majority" => (
+            79,
+            "UnknownReplWriteConcern",
+            format!("No write concern mode named '{tag}' found in replica set configuration"),
+        ),
+        _ => return,
+    };
+    let mut echoed = Document::new();
+    if let Some(w) = wc.get("w") {
+        echoed.insert("w", w.clone());
+    }
+    if let Some(j) = wc.get("j") {
+        let j = match j {
+            bson::Bson::Boolean(b) => *b,
+            other => util::as_i64(other).is_some_and(|n| n != 0),
+        };
+        echoed.insert("j", j);
+    }
+    echoed.insert(
+        "wtimeout",
+        wc.get("wtimeout")
+            .and_then(util::as_i64)
+            .map_or(bson::Bson::Int32(0), |n| {
+                i32::try_from(n).map_or(bson::Bson::Int64(n), bson::Bson::Int32)
+            }),
+    );
+    echoed.insert("provenance", "clientSupplied");
+    let mut wce = Document::new();
+    wce.insert("code", code);
+    wce.insert("codeName", code_name);
+    wce.insert("errmsg", errmsg);
+    wce.insert("errInfo", doc! {"writeConcern": echoed});
+    // Before `ok`: take `ok` out, add the error, put `ok` back last.
+    let ok = reply.remove("ok");
+    reply.insert("writeConcernError", wce);
+    if let Some(ok) = ok {
+        reply.insert("ok", ok);
     }
 }
 
@@ -644,10 +691,10 @@ fn is_write_concern_command(name: &str) -> bool {
 /// Reject a malformed `writeConcern` before a write command runs, mirroring
 /// `commands.py::_validate_write_concern`: a non-document `writeConcern` or a
 /// non-bool/int `j` / non-number `wtimeout` → `TypeMismatch` (14); a `w` that's a
-/// bool or non-number/string → `TypeMismatch` (14); a string `w` other than
-/// `"majority"` → `UnknownReplWriteConcern` (79); an integer `w` outside `[0, 50]`
-/// → `FailedToParse` (9). `None` when absent or well-formed. (`w > 1` still
-/// succeeds with a `writeConcernError` attached — see `attach_write_concern_error`.)
+/// bool or non-number/string → `TypeMismatch` (14); an integer `w` outside
+/// `[0, 50]` → `FailedToParse` (9). `None` when absent or well-formed. (`w > 1`
+/// and an unknown tag still succeed with a `writeConcernError` attached — see
+/// `attach_write_concern_error`.)
 fn validate_write_concern(doc: &Document, command: &str) -> Option<CommandError> {
     let wc = match doc.get("writeConcern") {
         // An explicit `writeConcern: null` is ACCEPTED — the BSON-field family's
@@ -686,14 +733,9 @@ fn validate_write_concern(doc: &Document, command: &str) -> Option<CommandError>
                     ));
                 }
             }
-            Bson::String(s) if s == "majority" => {}
-            Bson::String(s) => {
-                return Some(CommandError::new(
-                    79,
-                    "UnknownReplWriteConcern",
-                    format!("No write concern mode named '{s}' found in replica set configuration"),
-                ))
-            }
+            // Any tag parses; an unknown one is reported AFTER the write, as a
+            // `writeConcernError` (see `attach_write_concern_error`).
+            Bson::String(_) => {}
             _ => {
                 return Some(CommandError::new(
                     14,
@@ -879,7 +921,9 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
                     let mut reply = CommandError::new(
                         code,
                         failpoints::fail_code_name(code),
-                        "Failing command due to 'failCommand' failpoint",
+                        // mongod 8.2.11's wording, measured 2026-09-30; libmongoc's
+                        // `/crud/prose_test_9` asserts on it ("due to" failed it).
+                        "Failing command via 'failCommand' failpoint",
                     )
                     .into_reply();
                     // `failGetMoreAfterCursorCheckout` is injected inside the
@@ -1194,12 +1238,64 @@ fn run_handler(handler: Handler, doc: &Document, ctx: &mut CommandContext) -> Do
     match handler(doc, ctx) {
         Ok(reply) => {
             if budget > 0 {
+                if let Some(e) = expired_write_statement(doc, &reply) {
+                    return e.into_reply();
+                }
                 mark_time_limited_cursor(&reply, ctx);
             }
             reply
         }
-        Err(e) => e.into_reply(),
+        Err(mut e) => {
+            if budget > 0 && e.code == deadline::MaxTimeMsExpired::CODE {
+                if let Some(prefix) = executor_error_prefix(doc, &ctx.db_name) {
+                    e.errmsg = format!("{prefix} :: caused by :: {}", e.errmsg);
+                }
+            }
+            e.into_reply()
+        }
     }
+}
+
+/// mongod's wrapper for a budget spent while a READ command's plan executor
+/// was running. Measured on 8.2.11 (2026-09-30) at 5ms and 20ms budgets over
+/// 100,000 documents: `find`, `aggregate`, `distinct` and `count` wrap it, every
+/// time; `findAndModify`, `update`, `delete` and `createIndexes` send it bare.
+/// mongod sends the bare message for these four too when the budget is gone
+/// before execution starts, which on this server is only the
+/// `maxTimeAlwaysTimeOut` failpoint, answered before the handler runs.
+fn executor_error_prefix(doc: &Document, db: &str) -> Option<String> {
+    let (name, target) = doc.iter().next()?;
+    let ns = match target {
+        Bson::String(coll) => format!("{db}.{coll}"),
+        _ => format!("{db}.$cmd.{name}"),
+    };
+    match name.as_str() {
+        "find" => Some(format!("Executor error during find command: {ns}")),
+        "aggregate" | "distinct" | "count" => Some(format!(
+            "Executor error during {name} command on namespace: {ns}"
+        )),
+        _ => None,
+    }
+}
+
+/// A write command whose statement ran out of budget. mongod fails the whole
+/// COMMAND with code 50 (`ok: 0`); the write path reports storage faults as a
+/// per-statement `writeErrors` entry under `ok: 1`, which is the right shape
+/// for a duplicate key and the wrong one for an interrupted operation.
+fn expired_write_statement(doc: &Document, reply: &Document) -> Option<CommandError> {
+    if !matches!(
+        doc.keys().next().map(String::as_str),
+        Some("update" | "delete" | "insert")
+    ) {
+        return None;
+    }
+    let expired = reply.get_array("writeErrors").ok()?.iter().any(|we| {
+        we.as_document()
+            .and_then(|d| d.get("code"))
+            .and_then(util::as_i64)
+            == Some(i64::from(deadline::MaxTimeMsExpired::CODE))
+    });
+    expired.then(CommandError::max_time_expired)
 }
 
 /// The command's `maxTimeMS` as a time limit, or 0 for none. A `getMore`'s own
@@ -1648,6 +1744,35 @@ fn attach_cluster_time_gossip(req: &Document, reply: &mut Document, ctx: &Comman
     }
 }
 
+/// mongod's LOCALHOST EXCEPTION: while no user exists, a connection from a
+/// loopback address may create the first one, on `admin`. Without it a fresh
+/// `--auth` server could never be given a user -- every `createUser` answered
+/// 13, where mongod 8.2.11 accepts it (measured 2026-09-30; a second
+/// `createUser`, once a user exists, is 13 there too).
+fn localhost_exception(name: &str, ctx: &CommandContext) -> bool {
+    if name != "createUser" || ctx.db_name != "admin" {
+        return false;
+    }
+    let loopback = ctx
+        .conn_auth
+        .as_ref()
+        .is_some_and(|a| a.lock().unwrap_or_else(|e| e.into_inner()).peer_loopback);
+    if !loopback || ctx.server_params.as_ref().is_some_and(|p| p.users_seen()) {
+        return false;
+    }
+    let none_stored = ctx
+        .storage
+        .as_deref()
+        .and_then(|s| s.list_users(None, 0, 1).ok())
+        .is_some_and(|users| users.is_empty());
+    if !none_stored {
+        if let Some(p) = &ctx.server_params {
+            p.mark_users_seen();
+        }
+    }
+    none_stored
+}
+
 /// `--auth` gating + RBAC privilege check (`commands.py::dispatch`). A no-op when
 /// `require_auth` is off (default-allow). When on: any command outside
 /// [`is_pre_auth_command`] requires an authenticated principal (`Unauthorized`,
@@ -1669,10 +1794,14 @@ fn authorize(name: &str, doc: &Document, ctx: &CommandContext) -> Result<(), Com
         .unwrap_or(false);
 
     if !is_pre_auth_command(name) && !authenticated {
+        if localhost_exception(name, ctx) {
+            return Ok(());
+        }
         return Err(CommandError::new(
             13,
             "Unauthorized",
-            format!("command {name} requires authentication"),
+            // mongod's capitalisation (8.2.11).
+            format!("Command {name} requires authentication"),
         ));
     }
 
@@ -2241,6 +2370,44 @@ mod tests {
     /// not depend on secantus-core. Two copies of a constant is how they drift,
     /// so this pins them: if the core ever changes the code or the wording, this
     /// fails rather than the two halves quietly disagreeing over the wire.
+    /// mongod 8.2.11 (2026-09-30), a budget spent mid-execution: the four read
+    /// commands carry their executor prefix, everything else is bare.
+    #[test]
+    fn max_time_expiry_prefix_is_per_command() {
+        let p = |d: Document| executor_error_prefix(&d, "db");
+        assert_eq!(
+            p(doc! {"find": "c"}).as_deref(),
+            Some("Executor error during find command: db.c")
+        );
+        for cmd in ["aggregate", "distinct", "count"] {
+            assert_eq!(
+                p(doc! {cmd: "c"}),
+                Some(format!(
+                    "Executor error during {cmd} command on namespace: db.c"
+                ))
+            );
+        }
+        for cmd in ["findAndModify", "update", "delete", "createIndexes"] {
+            assert_eq!(p(doc! {cmd: "c"}), None, "{cmd}");
+        }
+    }
+
+    /// An interrupted write fails the COMMAND; a duplicate key does not.
+    #[test]
+    fn expired_write_statement_fails_the_command() {
+        let reply =
+            doc! {"n": 0, "writeErrors": [{"index": 0, "code": 50, "errmsg": "x"}], "ok": 1.0};
+        let err = expired_write_statement(&doc! {"update": "c"}, &reply).expect("lifted");
+        assert_eq!(
+            (err.code, err.errmsg.as_str()),
+            (50, "operation exceeded time limit")
+        );
+        let dup =
+            doc! {"n": 0, "writeErrors": [{"index": 0, "code": 11000, "errmsg": "x"}], "ok": 1.0};
+        assert!(expired_write_statement(&doc! {"insert": "c"}, &dup).is_none());
+        assert!(expired_write_statement(&doc! {"find": "c"}, &reply).is_none());
+    }
+
     #[test]
     fn max_time_expired_matches_core() {
         use secantus_core::deadline::MaxTimeMsExpired as E;
@@ -2339,13 +2506,19 @@ mod tests {
         // Without the field, hello doesn't volunteer mechanisms.
         let plain = dispatch(&doc! {"hello": 1}, &mut ctx());
         assert!(plain.get("saslSupportedMechs").is_none());
-        // With saslSupportedMechs: "<db>.<user>", advertise SCRAM-SHA-256.
+        // For a user that does not exist mongod OMITS the field (8.2.11); a
+        // stored user's own mechanisms are pinned in `auth::tests`.
         let reply = dispatch(
             &doc! {"hello": 1, "saslSupportedMechs": "admin.alice"},
             &mut ctx(),
         );
-        let mechs = reply.get_array("saslSupportedMechs").unwrap();
-        assert_eq!(mechs, &vec![Bson::String("SCRAM-SHA-256".into())]);
+        assert!(reply.get("saslSupportedMechs").is_none());
+        // A name with no `.` is refused.
+        let bad = dispatch(
+            &doc! {"hello": 1, "saslSupportedMechs": "alice"},
+            &mut ctx(),
+        );
+        assert_eq!(bad.get_i32("code").unwrap(), 2);
     }
 
     #[test]

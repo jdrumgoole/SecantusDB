@@ -643,6 +643,14 @@ pub fn drop(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     if let Ok(cursors) = ctx.cursors() {
         cursors.kill_namespace(&ns);
     }
+    // mongod reports the index count the collection HAD, `_id_` included -- 3
+    // for a collection with two secondary indexes, where this always said 1
+    // (measured 8.2.11, 2026-09-30). A collection that does not exist lists
+    // nothing, and that branch reports no count at all.
+    let n_indexes = storage
+        .list_indexes(&ctx.db_name, &coll)
+        .map(|ix| ix.len().max(1))
+        .unwrap_or(1);
     let existed = storage
         .drop_collection(&ctx.db_name, &coll)
         .map_err(command_error)?;
@@ -655,7 +663,8 @@ pub fn drop(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         // Mirrors commands.py::_drop.
         return Ok(doc! { "ok": 1.0 });
     }
-    Ok(doc! { "ns": format!("{}.{}", ctx.db_name, coll), "nIndexesWas": 1, "ok": 1.0 })
+    // mongod's field order: the count first, then the namespace.
+    Ok(doc! { "nIndexesWas": n_indexes as i32, "ns": ns, "ok": 1.0 })
 }
 
 /// `secantusAdmin.backupArchive` — force a checkpoint and tar the WiredTiger home

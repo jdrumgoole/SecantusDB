@@ -54,7 +54,7 @@
 use bson::{doc, Bson, Document};
 
 use crate::argtypes;
-use crate::find::split_docs_into_cursor;
+use crate::find::split_docs_into_cursor_checked;
 use crate::util::{
     as_i64, bool_field, collation_of, command_error, decode_docs, decode_docs_minimal, encode_docs,
     resolve_let_vars,
@@ -336,7 +336,9 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // The pipeline result is already decoded `Document`s. Send the `firstBatch`
     // straight to the wire as `Bson` and encode only the cursor remainder for the
     // registry — no encode→decode round-trip on the docs the client gets now.
-    let (first_batch, cursor_id) = split_docs_into_cursor(result, batch_size, &ns, cursors, false)?;
+    let prefix = format!("Executor error during aggregate command on namespace: {ns}");
+    let (first_batch, cursor_id) =
+        split_docs_into_cursor_checked(result, batch_size, &ns, cursors, false, Some(&prefix))?;
     Ok(doc! {
         "cursor": {
             "firstBatch": first_batch,

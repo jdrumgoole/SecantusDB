@@ -1049,7 +1049,7 @@ These commands accept the request and return a wire-valid response, but the resp
 
 These work end-to-end but cut corners.
 
-- [x] **`$bucketAuto` `granularity` rounding — SHIPPED, hex-exact on both servers (2026-07-19).** The prior "1-ULP blocker" was a wrong-constants artifact: mongod stores each preferred-number series as **integer-valued doubles** (R5 = `{10,16,25,40,63}`, not normalised `0.63`-style literals) and computes `series_element * multiplier` (multiplier a power of 10), which reproduces its non-standard ULPs (`63 * 0.1 = 6.300000000000001`) bit-for-bit in Python and Rust f64. Ported `roundUp` / `roundDown` (double path) verbatim from `granularity_rounder_preferred_numbers.cpp` + the `populateNextBucket` boundary walk (first min = `roundDown(dataMin)`, every other boundary = `roundUp(chunkMax)` with the absorb-below-boundary loop; `std::round(nDocs/nBuckets)` bucket size), plus the POWERSOF2 rounder. Both engines: `secantus.aggregate._bucket_auto_granular` (`_BUCKET_AUTO_SERIES` + `_round_up/down_series` + `_round_up/down_pow2`) and `secantus-core` `group::bucket_auto_granular`. **Verified hex-exact vs a live mongod 7.0.12 oracle** (1200+ cases across all 13 granularities × scales × bucket counts, incl. edges: zeros, exact-boundary values, +inf, single bucket); Rust pinned to Python by a 400-case parity fuzz. Value validation reproduces mongod's codes on the Python server — non-numeric 40258, NaN 40259, negative 40260 (name errors 40261/40257 already shipped) — and defers on the Rust server (BadValue, the standing error-code gap). **Remaining sub-limitation:** a **Decimal128**-valued groupBy defers/rejects (code 2) rather than running mongod's separate Decimal128 rounder — the standing Decimal128 precision deferral; the double/int path (the common case) is complete.
+- [x] **`$bucketAuto` `granularity` rounding — SHIPPED, hex-exact on both servers (2026-07-19).** The prior "1-ULP blocker" was a wrong-constants artifact: mongod stores each preferred-number series as **integer-valued doubles** (R5 = `{10,16,25,40,63}`, not normalised `0.63`-style literals) and computes `series_element * multiplier` (multiplier a power of 10), which reproduces its non-standard ULPs (`63 * 0.1 = 6.300000000000001`) bit-for-bit in Python and Rust f64. Ported `roundUp` / `roundDown` (double path) verbatim from `granularity_rounder_preferred_numbers.cpp` + the `populateNextBucket` boundary walk (first min = `roundDown(dataMin)`, every other boundary = `roundUp(chunkMax)` with the absorb-below-boundary loop; `std::round(nDocs/nBuckets)` bucket size), plus the POWERSOF2 rounder. Both engines: `secantus.aggregate._bucket_auto_granular` (`_BUCKET_AUTO_SERIES` + `_round_up/down_series` + `_round_up/down_pow2`) and `secantus-core` `group::bucket_auto_granular`. **Verified hex-exact vs a live mongod 7.0.12 oracle** (1200+ cases across all 13 granularities × scales × bucket counts, incl. edges: zeros, exact-boundary values, +inf, single bucket); Rust pinned to Python by a 400-case parity fuzz. Value validation reproduces mongod's codes on the Python server — non-numeric 40258, NaN 40259, negative 40260 (name errors 40261/40257 already shipped) — and defers on the Rust server (BadValue, the standing error-code gap). **The Decimal128 sub-limitation is FIXED on the Rust server (2026-09-30)**: a decimal groupBy runs mongod's decimal rounder (`decimal::granularity_round_series` / `_pow2`, transcribed from the 8.2 source) with its quantum (`1600.0000000000000`), and a mixed-type set rounds each boundary in its own type. Measuring it found a second, older divergence on the double/int path: `POWERSOF2` answers an INT for a whole power (`$pow(2, <int>)` in mongod) where both servers answered a double. `tools/probes/bucket_auto_granularity.py`: 240 of 312 divergent -> 0. The Python server still refuses a decimal groupBy (code 2) and still answers doubles for `POWERSOF2`.
 - [x] **`_id` numeric type bridge — NaN was a real bug and is FIXED (2026-08-22).**
   Works for finite int/float/Decimal128; `bool` is deliberately not numeric. The old
   "NaN and infinity fall through to the BSON-blob path; behavior is unspecified" was
@@ -1700,11 +1700,15 @@ These work end-to-end but cut corners.
   in `commands.py::_split_into_cursor` (encode-to-measure) and
   `find.rs::split_into_cursor` (blob lengths already known, so free). Both now
   answer 15 / 15.0 MiB / cursor open, matching mongod exactly.
-  **Not covered:** `find.rs::split_docs_into_cursor`, the projected/aggregate path
-  that carries decoded `Document`s rather than blobs. Measuring there means encoding
-  each document purely to size it — real overhead on the Rust server's hot path for
-  a case (megabyte documents *and* a projection) that no driver has hit. Left
-  deliberately, recorded rather than silently skipped.
+  **The projected / aggregate path is covered too since 2026-09-30.**
+  `find.rs::split_docs_into_cursor_checked` encodes each result once, which both
+  sizes the batch and produces the bytes the cursor remainder needs anyway
+  (20 x 1.5 MB aggregate results: first batch 11, cursor open — identical to
+  mongod 8.2.11). It found a worse bug than the budget: a single result over
+  16 MB (`{$range: [0, 6553590]}` is 84 MB) went out as an 84 MB MESSAGE, past
+  the 48 MB wire maximum, and the driver dropped the connection. `aggregate`
+  now answers mongod's `10334 Serializing Document failed` under the executor
+  prefix.
 - ~~**Three-droplet DigitalOcean benchmark: no repeat-and-median mode**~~ — shipped. `--repeat N` interleaves the engines within each pass (so drift lands on both equally) and reports medians plus a `(max - min) / median` spread column and a per-pass table. Measured 3.4% spread for secantusdb and 1.1% for mongod over three 60s passes. The whole harness is now live-verified: provisioning, VPC + firewall, SSH, cloud-init, both deploy routes, both engines, repeat/median, and all three teardown modes. See `bench/DO_CLUSTER.md`.
 - [x] **RESOLVED (2026-08-30): the Rust server has the MongoDB 8.0 features and
   advertises 8.2.11, matching the Python server.** `bulkWrite`, `sort` on update
@@ -3064,8 +3068,17 @@ These are explicit non-goals. Don't add them without a reason.
         We refuse the parameters deliberately rather than accepting names we do
         not honour; see the `$where` item.
 
-      * **`TestSDAMProse/heartbeats_processed_more_frequently` — still OPEN,
-        with two causes now RULED OUT by probe.** The entry originally blamed
+      * **`TestSDAMProse/heartbeats_processed_more_frequently` — FOUND
+        2026-09-30, fixed on the RUST server, still open on the Python one.**
+        The extra messages were the FIRST streamed `hello` reply: mongod holds
+        it for the whole `maxAwaitTimeMS` when the client already has the
+        current topology, and both servers sent it at once -- one extra reply
+        per stream, found by timing a raw exhaust `hello` against mongod rather
+        than by diffing the driver's totals. The Rust Go gauge now passes it
+        (598 / 12 / 49, 98.0%); see §7.00 round 4 and
+        `tools/probes/awaitable_hello.py`. The investigation below is the
+        record of what it was NOT.
+        Previously -- still OPEN, with two causes RULED OUT by probe. The entry originally blamed
         `setParameter` ("almost certainly"); it is not that. It is also not
         `helloOk`, which the 2026-09-29 investigation found and fixed along the
         way — a real bug with broad reach, just not this one.
@@ -3267,10 +3280,37 @@ These are explicit non-goals. Don't add them without a reason.
         `/Client/select_server/err/{single,pooled}`, `/Client/ipv6/single` (x2),
         plus `/find_and_modify/hint` and `/crud/prose_test_9`. The
         `select_server` cluster is one surface, not six bugs; triage it as one.
+        **Triaged 2026-09-30:** `/find_and_modify/hint` was fixed by #1622 (a
+        hint on a missing collection is accepted; re-measured equal to 8.2.11);
+        `/crud/prose_test_9` failed on the failpoint's WORDING -- mongod says
+        `Failing command via 'failCommand' failpoint`, the Rust server said
+        `due to` -- fixed. The `select_server` x4 and `ipv6` x2 are the
+        documented inherents (§ C gauge above): one asserts a non-primary member
+        this topology cannot offer, the other hard-codes `[::1]:27017`.
+        **Confirmed by a C gauge re-run 2026-09-30** (Rust server, tree
+        `be40c1fb`): 768 / 2 / 68 of 838, 99.7%, every result reported. Both
+        `/find_and_modify/hint` and `/crud/prose_test_9` pass, and so do all
+        four `select_server` tests -- the runner now starts the daemon
+        `--standalone` (#1622). The two failures left are `/Client/ipv6/single`.
 
       All eleven gauges and their rates are tabulated in
       `tasks/driver-conformance-followups-plan.md` §5.
 
+- [ ] **OPEN -- the C gauge's `--standalone` daemon trades 4 passes for 20
+  skips.** `c_validation/runner.py` has started the daemon `--standalone`
+  since #1622, which fixed the four `/Client/select_server` tests (they assert
+  standalone semantics because `MONGOC_TEST_URI` carries no `replicaSet=`).
+  But libmongoc then self-skips every replica-set-only test: measured
+  2026-09-30 on the Rust server, `/change_stream` went from 23 pass / 2 skip to
+  **7 pass / 18 skip** (`live/watch`, `live/track_resume_token`,
+  `resume_at_optime`, `start_at_operation_time`, `database`, `client`,
+  `live/prose_test_11`-`14`, ...), and `/WriteConcern`, `/Collection` and
+  `/long_namespace` lost 4 more to skips. The headline went UP (98.9% -> 99.7%)
+  while passing tests went DOWN (782 -> 768), and the gauge no longer
+  exercises change streams through libmongoc at all. Options: run the C gauge
+  twice (a standalone pass for `select_server`, a replica-set pass for the
+  rest) and merge, or go back to the replica-set daemon and list the four
+  `select_server` tests as inherent. A scope decision, not a bug -- Joe's call.
 - [ ] **OPEN — the .NET gauge spends ~90% of its wall clock after its last log
       line (2026-09-28).** Observed: TRX and report both written at 14:53, the
       process exited at 15:12 with `rc=0` and nothing logged in between — 19 of
@@ -3407,8 +3447,20 @@ These are explicit non-goals. Don't add them without a reason.
       remaining work is on the Python side, not the Rust side. Read from the
       source, not run — the Python server was out of scope for that slice.
 
-- [ ] **OPEN — the Rust server does not ENFORCE `maxTimeMS`, demonstrated
-      (2026-09-28).** This is §6 of the driver-conformance plan, which called it
+- [x] **RESOLVED (2026-09-30) — `maxTimeMS` is enforced on every read and
+      write path of the Rust server.** #1622 added the deadline and the scan /
+      index-build polls; the aggregation pipeline never polled (`check_now`
+      existed with no caller), and neither did the index walks, so `$group`,
+      `$sort`, `$project`, `distinct` and a sorted `find` ran to completion.
+      They poll now; `find` / `aggregate` / `distinct` / `count` wrap an
+      execution-time expiry in mongod's executor prefix; and `update` /
+      `delete` fail the COMMAND (`ok: 0`) instead of reporting a code-50
+      `writeErrors` entry under `ok: 1`. `tools/probes/max_time_expiry.py`:
+      0 of 11 divergent against 8.2.11 (the Python server is 8 of 11 -- see the
+      entry below). The original entry follows.
+
+      ~~**OPEN — the Rust server does not ENFORCE `maxTimeMS`, demonstrated
+      (2026-09-28).**~~ This is §6 of the driver-conformance plan, which called it
       "a project, not a fix". It still is, but it now has a reproducer instead of
       a description:
 
@@ -3571,8 +3623,15 @@ These are explicit non-goals. Don't add them without a reason.
       `commitTransaction` itself and converts the NotPrimary family into a
       client-side exception, so a pymongo-driven probe measures the driver.
 
-- [ ] **OPEN — neither server sends `errInfo` on a write-concern error
-      (2026-09-28).** mongod's unsatisfiable-write-concern reply carries
+- [ ] **OPEN on the Python server; fixed on the Rust server
+      (2026-09-30).** Rust now sends `errInfo.writeConcern` with the client's `w`,
+      its `j` if given, `wtimeout` (0 when absent) and `provenance:
+      "clientSupplied"`, places `writeConcernError` before `ok`, and runs a
+      write whose `w` names an unknown tag (79 afterwards, not a pre-flight
+      refusal) -- matching 8.2.11 across insert / update / delete /
+      findAndModify / create / createIndexes / drop. The original entry:
+      ~~**OPEN — neither server sends `errInfo` on a write-concern error
+      (2026-09-28).**~~ mongod's unsatisfiable-write-concern reply carries
       `errInfo: {writeConcern: {w, wtimeout, provenance}}` alongside the code and
       message; we send code + codeName + errmsg only. Measured with a `w: 5`
       write against a single-node replica-set mongod 8.2.11, which answered
@@ -4267,10 +4326,19 @@ all still open. Probe: `scratchpad/readsweep.py` + `readsweep_lib.py`.
   Pinned by `tests/test_rust_descending_sort.py` (7 tests over the wire, 4 of
   which fail against the pre-fix binary) and four `secantus-storage` unit tests.
 
-  **Still open, and unrelated to the prefix bug:** the `sort: x desc` case in
-  the read-path sweep now differs only on `[[5]]` versus `[1, [2, [3]]]` — an
-  array-versus-array comparison, which belongs to the array-descent family
-  above.
+  **The `[[5]]` versus `[1, [2, [3]]]` case is FIXED on the Rust server
+  (2026-09-30), and it was not an array-descent bug.** The storage sort compared
+  the `sortkey` BYTES of the representative values, and `sortkey` writes a
+  document or array as raw BSON, which leads with a little-endian LENGTH — so
+  `[2, [3]]` ranked above `[5]`, and `{a: 2, b: [3]}` above `{a: 5}`, for being
+  longer. `find().sort()` over embedded documents was wrong on 5 of 7 measured
+  shapes while the aggregation `$sort` (which compares values with
+  `order::cmp`) was right on all 7. The storage sort now carries the value for a
+  document / array key part and compares it with `order::cmp`
+  (`SortPart` / `compare_sort_part`), and an index walk that meets such a value
+  gives up its sort-order claim, because the entries keep the byte form (it is
+  on disk). Standing cover: `tools/probes/nested_value_sort.py` (0 of 20 against
+  8.2.11; 14 of 20 before). Pinned by two `planner_fidelity.rs` tests.
 
 
 ### 2026-09-03 SQL sweep twelve: LIMIT and row NULLs — what is still open
@@ -6817,7 +6885,7 @@ Subtler than the above; these may bite specific test suites.
   - ~~**Client-metadata handshake** (`integration tests for client metadata handshake feature/with client`, `/with pool`)~~ **FIXED (0.5.4b12)** — the test connects with `?appName=xyz` and scans `db.aggregate([{$currentOp: {}}])` for an op whose `appName` matches, then reads its `clientMetadata.{application,driver,os}`. The `$currentOp` *aggregation stage* (`aggregate._stage_current_op`) was a bare stub; it now surfaces the connection's `clientMetadata` + a top-level `appName` (threaded via `PipelineContext.client_metadata` from the connection registry), like the `currentOp` command already did. Regression: `tests/test_hello_client_metadata.py::test_aggregation_currentop_surfaces_appname_and_metadata`.
   - Out-of-scope tags excluded in `cxx_validation/include_paths.py` (CSFLE, Atlas, search indexes, transactions, sessions, SDAM monitoring, and `[uri_options]` which needs the `URI_OPTIONS_TESTS_PATH` spec-data dir).
 - [x] **mongo-csharp-driver (C# / .NET) gauge landed (2026-06-19) — the one gap surfaced is FIXED (headline corrected 2026-08-21).** `mongo-csharp-driver` is at **0 failures / 100.0%** in the current `docs/validation-summary.md`, and this entry's own body already records the fix ("gauge-verified at 202 pass / 0 fail / 26 skip"). New `dotnet_validation` gauge runs the vendored driver's xUnit `MongoDB.Driver.Tests` via `dotnet test` against an embedded daemon over `MONGODB_URI`. Driver pinned `v3.9.0`; scoped to the **CRUD specification suite** (`MongoDB.Driver.Tests.Specifications.crud`) via `--filter` — `MongoDB.Driver.Tests` as a whole is enormous and dominated by non-server unit tests (LINQ/serialization) plus external-service suites (CSFLE/KMS, auth, Atlas Search, load balancing) and multi-node features (transactions, sessions, SDAM, retryable). At landing: **201 pass / 1 fail / 26 skip (99.5%)** (the 26 are `[RequireServer]`/CSFLE-gated skips). After the 0.5.4b9 validation-detail fix below, gauge-verified at **202 pass / 0 fail / 26 skip**. The one (now-fixed) divergence:
-  - ~~**Document-validation error detail** (`CrudProseTests.WriteError_details_should_expose_writeErrors_errInfo`)~~ **FIXED (0.5.4b9)** — a failed query-expression validator now synthesises mongod's per-operator `errInfo.details` (`operatorName` / `specifiedAs` / `reason` / `consideredValue` / `consideredType`) via `commands._validation_failure_details` + `query.bson_type_name`, used by both the insert path and `_validate_doc_against_collection`. ($jsonSchema validators still report a minimal `{operatorName: "$jsonSchema"}` — their schema-rules detail is unsynthesised.)
+  - ~~**Document-validation error detail** (`CrudProseTests.WriteError_details_should_expose_writeErrors_errInfo`)~~ **FIXED (0.5.4b9)** — a failed query-expression validator now synthesises mongod's per-operator `errInfo.details` (`operatorName` / `specifiedAs` / `reason` / `consideredValue` / `consideredType`) via `commands._validation_failure_details` + `query.bson_type_name`, used by both the insert path and `_validate_doc_against_collection`. ($jsonSchema validators still report a minimal `{operatorName: "$jsonSchema"}` — their schema-rules detail is unsynthesised. **The Rust server synthesises the full explanation since 2026-09-30** -- every `$jsonSchema` keyword in mongod's rule order, and query validators flattened per operator under `$and` with `$or` / `$nor` / `$not` / `$expr` -- transcribed from 8.2's `doc_validation_error.cpp`; `tools/probes/validation_error_details.py` 47 -> 0 of 71. The Python server still sends the minimal form.)
   - The CRUD-only scope is deliberate and expandable — broaden the `--filter` in `dotnet_validation/include_paths.py` to add more spec families (e.g. `read_write_concern`, `change-streams`) as they're validated. Build note: the driver's `MongoDB.Driver.Encryption` project verifies a downloaded libmongocrypt with **gpg** at build time, so `gpg` (and network for the libmongocrypt download) are build prerequisites even though CSFLE itself is out of scope.
 
 > **Rust-server follow-up — RESOLVED (Rust 0.5.3-beta.73).** The 0.5.4b8/b9
@@ -6932,6 +7000,121 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   for the same TestClient reason).
 
 ## 7. Python → Rust rewrite (in progress)
+
+### 7.00 Rust MongoDB server batch — 2026-09-30, measured against mongod 8.2.11
+
+Every item below was found by running the Rust server and mongod side by side
+(`PROBE_SERVER` against a real `mongod`), fixed on the Rust server, and pinned by
+a probe that goes 0-divergent plus a Rust test. Old-build -> new-build counts
+are the probes' own numbers.
+
+- [x] **Silent data loss, all on `main` before this batch** (`planner_fidelity.rs`,
+  `tools/probes/index_result_sets.py`):
+  - a compound sort walked a PARTIAL index under an empty filter (4 of 10 rows);
+  - a sort or a hint walked a MULTIKEY index, and an empty-array document has
+    no entry -- `find({}).sort({a: 1})`, `find({}).hint("a_1")` and
+    `count({}, hint: "a_1")` all dropped it;
+  - an index range scan bounded by an array or document compared raw-BSON
+    bytes (length first): `{x: {$gt: [1, 2, 3]}}` dropped `{x: [9]}`.
+- [x] **Wrong answers:** `find().sort()` over embedded documents / nested arrays
+  ordered by encoded LENGTH (`nested_value_sort.py` 14 -> 0 of 20); aggregate
+  `$project: {_id: 1}` returned whole documents; `$slice` took a decimal as
+  null, a count past int32 as "all", a count of 0 as `[]`, and a negative
+  start with a count from the wrong end; `$indexOf*` past int32 answered -1;
+  `$range` refused over 100,000 elements (`int32_arguments.py` 83 -> 0 of
+  189); `$bucketAuto` POWERSOF2 answered doubles for whole powers.
+- [x] **Wire:** an aggregate result over 16 MB went out as an 84 MB message the
+  driver rejected (now 10334); decoded first batches are byte-budgeted.
+- [x] **Missing:** decimal `$pow` / `$atan2` / `$bucketAuto` granularity; PCRE
+  `$` / `\Z` (`\Z` was refused); `$jsonSchema` `integer` / unknown type
+  names; `maxTimeMS` on aggregate, distinct, sorted find and the index walks
+  (`max_time_expiry.py` 0 of 11); a multi-field filter riding one
+  single-field index, and a sort under an unindexed filter walking the sort
+  index (mongod's two plans).
+- [x] **Round 3 -- authentication:** SCRAM-SHA-1 (MongoDB's MD5 prepass;
+  created by default alongside SCRAM-SHA-256; credentials byte-identical to a
+  mongod-created user's); `hello`'s `saslSupportedMechs` lists the user's own
+  mechanisms and omits an unknown user; a mechanism the user lacks is 334. The
+  LOCALHOST EXCEPTION: a fresh `--auth` server refused every `createUser`, so it
+  could never be given a user -- mongod lets a loopback connection create the
+  first one, and keeps the exception closed for the process once any user has
+  existed. SASL errors are mongod's (`Authentication failed.`, 334 for an
+  unknown mechanism, 17 for no conversation), `Command X requires
+  authentication` is capitalised, and `usersInfo {forAllDBs: true}` answered
+  `[]`. `tools/probes/scram_auth.py` 0 of 26.
+- [x] **Round 2:** `writeConcernError` carries mongod's `errInfo` and sits
+  before `ok`, and an unknown `w` tag writes then reports 79; `drop` answers
+  the real `nIndexesWas` in mongod's field order; document-validation
+  failures explain every broken rule (`validation_error_details.py` 0 of 71).
+- [x] **Probe harness:** three probes ran their embedded server into a
+  `WT_PANIC` at exit (the store was deleted under a live connection) --
+  `_servers.probe_server()` now stops it first.
+- [x] **Round 4 -- the awaitable `hello` (streaming SDAM):** the Rust server
+  sent the FIRST streamed reply at once even when the client already had the
+  current topology -- 5 replies in 2s where mongod sends 4, which is exactly
+  the Go driver's `TestSDAMProse/heartbeats_processed_more_frequently` (12
+  monitor messages against a ceiling of 10). mongod holds a client naming the
+  current `topologyVersion` for the whole `maxAwaitTimeMS`, streamed or not,
+  and answers a client naming another process or an older counter AT ONCE;
+  both paths now do the same. Every malformed argument used to be accepted:
+  `topologyVersion` must be an object with an ObjectId `processId` and a
+  LONG `counter` (int32 is 14) and no other field (40415), `counter` is
+  reported missing before `processId` (40414), `maxAwaitTimeMS` is any number
+  truncated toward zero and not negative (14 / 2), either one without the
+  other is 31368 in BOTH directions (only one was), a negative counter is
+  31372, and one newer than ours from this process is 31382. Also: returning
+  to primary after `replSetStepDown` never moved `topologyVersion.counter`, so
+  a streaming monitor was never woken and the driver learned the node was
+  writable again only when its wait ran out -- it now bumps (mongod moves
+  it +2 down and +3 back; we move it once each way, see `stepdown.rs`), and a
+  non-streamed hold whose topology moves rebuilds its reply instead of sending
+  the pre-wait one. `tools/probes/awaitable_hello.py` 0 of 35.
+
+**Found and NOT fixed -- Python-server divergences** (out of this batch's scope,
+which was the Rust server; each measured against 8.2.11 on 2026-09-30):
+
+- [ ] `maxTimeMS`: 8 of 11 commands differ (`tools/probes/max_time_expiry.py`
+  without `PROBE_SERVER`) -- no executor prefix on find / aggregate /
+  distinct / count.
+- [ ] regex `\Z` misses a final newline and `\z` is refused (the anchor block
+  of `regex_value_semantics.py`).
+- [ ] `$jsonSchema` accepts `type: "integer"` (mongod: 9).
+- [ ] aggregate `$project: {_id: 1}` returns whole documents
+  (`aggregation_stage_results.py`, python 2).
+- [ ] the awaitable `hello`: 25 of 33 shapes differ
+  (`tools/probes/awaitable_hello.py` with `PROBE_SERVER` at a Python server) --
+  every malformed `topologyVersion` / `maxAwaitTimeMS` accepted, a stale or
+  another process's topology held instead of answered, and the first streamed
+  reply sent at once (so the Python Go gauge's
+  `heartbeats_processed_more_frequently` failure is this too).
+- [ ] `$slice: [a, <negative>, n]` counts from the raw start (`[[4, 3, 1, 3, 1],
+  -3, 4]` is `[]`, mongod `[1, 3, 1]`) and a count of 0 or less is accepted.
+  `test_index_math_fuzz` draws around both, with the reason written in.
+- [ ] `$bucketAuto` refuses a decimal groupBy with a granularity, and answers
+  doubles for `POWERSOF2`.
+- [ ] write-concern errors carry no `errInfo`, and an unknown `w` tag is a
+  pre-flight refusal.
+- [ ] `$jsonSchema` validation failures report only `{operatorName: "$jsonSchema"}`.
+- [ ] decimal `$pow` is `exp(e * ln b)` at 34 digits; correctly rounded matches
+  mongod on 130 of 183 finite pairs, that method on 56.
+
+**Still open on the Rust server after this batch:**
+
+- [ ] **A mongod plan artifact, recorded not matched:** with a multikey index,
+  `$sort: {x: -1, _id: 1}` over `[[3], [1, 2, 3]]` returns `[1, 0]` on mongod,
+  contradicting its own `_id` tiebreak (without the index it returns `[0, 1]`).
+  `nested_value_sort.py` lists it as KNOWN.
+- [ ] **The entries table still orders document / array keys by raw BSON.** The
+  batch made every READER correct (sort walks, hint walks and range bounds no
+  longer trust that order), so no query answers differently. What is lost is
+  speed: those queries now post-sort or scan. A real fix is an `entryFormat`
+  bump with a value-ordered encoding for documents and arrays, on both servers
+  (the layout is shared).
+- [x] **The Go gauge was re-run 2026-09-30** with `--noop-heartbeat-seconds 10`
+  reaching the Rust server (checked in the daemon's argv): 598 / 12 / 49 of
+  659, 98.0%, all 659 reporting a result, no change-stream failure, and
+  `TestSDAMProse/heartbeats_processed_more_frequently` passing after round 4.
+
 
 - [x] **Aggregation stage-spec messages — the PYTHON server is DONE 2026-09-02.**
   `tools/probes/aggregation_stage_specs.py` went 167 → 22 → **0 of 725**. The
@@ -9211,7 +9394,14 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   computes at 34 digits THROUGHOUT to track mongod's own error; `$asinh` is now
   the one exception, and any decision here should say which rule wins.
 
-- [ ] **Decimal128 operands are refused by some Rust operators.** Shrinking:
+- [ ] **Decimal128 operands are refused by some Rust operators.** `$pow` and
+  `$atan2` answer a decimal since 2026-09-30 -- correctly rounded under the
+  #1436 rule, which was MEASURED for `$pow` rather than assumed: over 183
+  finite pairs against 8.2.11, correct rounding matched mongod on 130 where
+  `exp(e * ln b)` at 34 digits (mongod's apparent algorithm, and the Python
+  engine's) matched on 56. The special values are mongod's own, a 12x12 grid
+  per operator; 10 of 288 differ, each a last digit where mongod is off by one
+  ULP (verified against a 90-digit reference). Shrinking:
   `$abs`, `$toBool`, `$toInt`, `$toLong`, `$toDouble`, and now `$sqrt`,
   `$degreesToRadians`, `$radiansToDegrees` and `$exp`'s decided regions
   (2026-09-08) take them. What still declines is the transcendental set above
@@ -9688,7 +9878,10 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   timeseries `_id` uniqueness FIXED (suffixed doc keys; the one surviving
   E11000 is gone) — the 2026-06-12 E11000 triage is fully closed. The
   remaining ShowExpandedEvents / disambiguatedPaths introspection failures
-  are separate unimplemented features. (`clusteredIndex` introspection is
+  are separate unimplemented features. (STALE -- measured 2026-09-30: the Rust
+  server answers `showExpandedEvents` change streams event-for-event like
+  8.2.11 -- createIndexes / dropIndexes / modify / create / rename / drop, and
+  `disambiguatedPaths` on the update.) (`clusteredIndex` introspection is
   DONE in 0.5.3-beta.49 — `create` validates+stores it, `listCollections`
   surfaces `options.clusteredIndex` and omits `idIndex`, `listIndexes`
   reports the single `clustered: true` entry; mirrors commands.py. Closes the
@@ -9791,7 +9984,11 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   `$external`/admin, require an X509 credential, and auth without a password;
   hello/getParameter advertise MONGODB-X509. 4 unit tests. **This closes R5 (auth)
   bar SCRAM-SHA-1** (legacy MD5 prepass — deferred, low priority). Deferred:
-  non-ASCII SASLprep.
+  non-ASCII SASLprep. **SCRAM-SHA-1 SHIPPED 2026-09-30** (see §7.00): created
+  by default with SCRAM-SHA-256 as mongod 8.2 does, byte-identical credentials
+  (pinned against a mongod-created user), plus the localhost exception, mongod's
+  SASL error surface and `usersInfo {forAllDBs}`. `tools/probes/scram_auth.py`
+  0 of 26.
 - [x] **R4b — WiredTiger storage adapter** (`crates/secantus-storage-adapter`,
   `StorageAdapter`): CI-green (rust-storage builds it against vendored WT;
   `Send + Sync` confirmed). Bytes at the seam, `Hint` from `RawHint`, `map_err`.
@@ -9912,12 +10109,15 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   lookahead). Only patterns neither engine compiles, or over the 1000-char cap,
   → `Fallback` (defer). Parity suite extended: curated regex cases (incl.
   lookahead/lookbehind/backref) + a 4000-iteration `test_regex_fuzz_parity`
-  (safe-subset patterns/options/subjects; Rust ≡ Python `re`). **Known divergence
-  (accepted):** the `regex` crate's `$` matches only end-of-haystack, not before a
-  trailing `\n` like Python/PCRE — so `{x:{$regex:"foo$"}}` against `"foo\n"`
-  matches on the Python server but not the Rust server. Rare; documented in
-  `query.rs` module docs. Fuzz subjects are newline-free to avoid spurious parity
-  failures from this gap.
+  (safe-subset patterns/options/subjects; Rust ≡ Python `re`). **The `$` anchor
+  divergence is FIXED on the Rust server (2026-09-30).** It had been "accepted" as
+  rare, and it was worse than recorded: PCRE's non-multiline `$` and `\Z` match
+  before a final newline, so `{x: /foo$/}` missed `"foo\n"`, `$regexFind`
+  reported no match, and `\Z` did not compile at all — the query was REFUSED.
+  `regexutil::pcre_end_anchors` rewrites both to `(?=\n?\z)` (PCRE's own
+  definition) and sends the pattern to `fancy-regex`. Pinned by the anchor block
+  of `tools/probes/regex_value_semantics.py` (0 divergent against 8.2.11 for the
+  Rust server) and `regexutil::pcre_anchor_tests`.
 - [x] **View-collection reads — DONE on both servers.** `find` / `aggregate` /
   `count` on a view resolve the view's `viewOn` + pipeline against the base
   collection (recursively for a view-on-a-view): Python `commands._resolve_view`
@@ -10316,9 +10516,14 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   accept a whole-number double and reject a fractional one — same helpers, three-way
   mongod 7.0.12-verified. (`$substrBytes`/`$substr` already accept any double and
   truncate — mongod-correct, left as-is.) So the whole-double-index sweep is
-  **complete** across the aggregation surface. Remaining edge: a *huge* whole double
-  (> 2^31) is accepted here but mongod rejects it (32-bit-representable check) — a
-  narrow case; both SecantusDB engines stay mutually consistent (both null/whole).
+  **complete** across the aggregation surface. The *huge* whole-number edge is
+  FIXED on the Rust server (2026-09-30), and "narrow" undersold it: `$slice`
+  took `3e9` as a count and returned the whole array, a whole DECIMAL made
+  `$slice` return null, `$slice`'s count of 0 or -1 was accepted, `$slice:
+  [a, -1, 1]` returned `[]` (mongod `[3]`), `$indexOf*` answered -1 for a
+  start past int32, and `$range` refused anything past 100,000 elements where
+  mongod's limit is a 100 MiB memory estimate (146). 83 of 189 shapes diverged;
+  `tools/probes/int32_arguments.py` is 0 of 189 now.
   (2) **`$substrBytes` / `$substr` mid-UTF8-character — FIXED (2026-07-18).**
   A byte range that splits a UTF-8 char now raises mongod's codes on the Python
   server (28656 start-on-continuation-byte / 28657 end-mid-character, verbatim
@@ -10853,7 +11058,13 @@ session tests + the go harness race below.
   mtest harness under full-gauge load, not suppressible at the runner and not a server bug.
   **Accepted**, same as the Python-server verdict in §5. See the top-section entry for the
   full 2026-06-26 evidence.
-  - [ ] *Minor, separate — the CAUSE has changed; re-probed 2026-08-20.* The go gauge
+  - [x] **Unstripped 2026-09-30.** `_PYTHON_ONLY_FLAGS` is empty: `secantusd-rs`
+    accepts all six flags it listed, and with `--noop-heartbeat-seconds 1` a quiet
+    change stream's resume token advances on every getMore (13 distinct in 13s).
+    **Confirmed 2026-09-30:** the Go gauge ran against the Rust server with the
+    flag in the daemon's argv and no change-stream test failed (598 / 12 / 49,
+    98.0%). The original entry follows.
+  - ~~*Minor, separate — the CAUSE has changed; re-probed 2026-08-20.*~~ The go gauge
     still runs the Rust server without periodic noop heartbeats, but no longer because
     the binary lacks the flag: `secantusd-rs --help` lists `--noop-heartbeat-seconds S`,
     `crates/secantus-server/src/args.rs:268` parses it, and the daemon starts cleanly
@@ -11247,8 +11458,10 @@ complete on both servers** (only date *formatting/parsing* edges below remain).
   non-string metadata, non-object schema) → `14 TypeMismatch`. Python:
   `query._check_json_schema_keywords` (QueryError now carries code/codeName);
   Rust: `secantus_core::query::json_schema_keyword_error` + the find-command
-  parse-time check. (`type: "integer"` acceptance remains a small known
-  divergence — mongod rejects the alias; both our servers accept it.)
+  parse-time check. (`type: "integer"` is FIXED on the Rust server
+  (2026-09-30): 9 "not currently supported" in `type` or `bsonType`, and an
+  unknown name — including `type: "int"`, which only `bsonType` takes — is
+  2 `Unknown type name alias`. The Python server still accepts `integer`.)
 - [x] **Error-code — unrecognized expression operator: FIXED on both servers.**
   Query `$expr` → `168 InvalidPipelineOperator` on both (find.rs parse-time
   check via `expressions::first_unknown_expr_operator`); aggregation

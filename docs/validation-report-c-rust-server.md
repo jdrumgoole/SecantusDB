@@ -1,6 +1,6 @@
 # mongo-c-driver Validation Report
 
-Generated 2026-09-28 — SecantusDB 0.6.0b17 vs mongo-c-driver 57dba9c (`vendor/mongo-c-driver/`).
+Generated 2026-09-30 — SecantusDB 0.6.0b17 vs mongo-c-driver 57dba9c049 (`vendor/mongo-c-driver/`).
 
 Run `uv run python -m invoke validate-c` to refresh. The official MongoDB **C** driver (`libmongoc`) is the lowest-level official client — and (with the Go and PHP-extension gauges) one of the strictest wire-protocol checks.
 
@@ -9,40 +9,34 @@ Run `uv run python -m invoke validate-c` to refresh. The official MongoDB **C** 
 | Suite | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
 | `/BulkOperation` | 93 | 0 | 10 | 103 | 100.0% |
-| `/Client` | 96 | 6 | 17 | 119 | 94.1% |
-| `/Collection` | 144 | 0 | 12 | 156 | 100.0% |
+| `/Client` | 102 | 2 | 15 | 119 | 98.0% |
+| `/Collection` | 143 | 0 | 13 | 156 | 100.0% |
 | `/Cursor` | 70 | 0 | 0 | 70 | 100.0% |
 | `/Database` | 19 | 0 | 0 | 19 | 100.0% |
 | `/ReadConcern` | 6 | 0 | 0 | 6 | 100.0% |
 | `/ReadPrefs` | 16 | 0 | 0 | 16 | 100.0% |
 | `/WriteCommand` | 6 | 0 | 0 | 6 | 100.0% |
-| `/WriteConcern` | 13 | 0 | 0 | 13 | 100.0% |
+| `/WriteConcern` | 11 | 0 | 2 | 13 | 100.0% |
 | `/bulkwrite` | 12 | 0 | 1 | 13 | 100.0% |
-| `/change_stream` | 23 | 0 | 2 | 25 | 100.0% |
+| `/change_stream` | 7 | 0 | 18 | 25 | 100.0% |
 | `/change_streams` | 11 | 0 | 0 | 11 | 100.0% |
 | `/collection-management` | 5 | 0 | 0 | 5 | 100.0% |
 | `/command_monitoring` | 34 | 0 | 1 | 35 | 100.0% |
-| `/crud` | 170 | 1 | 1 | 172 | 99.4% |
-| `/find_and_modify` | 8 | 1 | 0 | 9 | 88.8% |
+| `/crud` | 170 | 0 | 2 | 172 | 100.0% |
+| `/find_and_modify` | 8 | 0 | 1 | 9 | 100.0% |
 | `/gridfs` | 10 | 0 | 1 | 11 | 100.0% |
 | `/gridfs_old` | 32 | 0 | 2 | 34 | 100.0% |
 | `/index-management` | 6 | 0 | 0 | 6 | 100.0% |
-| `/long_namespace` | 8 | 0 | 1 | 9 | 100.0% |
-| **Overall** | **782** | **8** | **48** | **838** | **98.9%** |
+| `/long_namespace` | 7 | 0 | 2 | 9 | 100.0% |
+| **Overall** | **768** | **2** | **68** | **838** | **99.7%** |
 
-## Failures (8)
+## Failures (2)
 
 First 30 failed tests for triage:
 
 ```
 /Client/ipv6/single
 /Client/ipv6/single
-/Client/select_server/single
-/Client/select_server/pooled
-/Client/select_server/err/single
-/Client/select_server/err/pooled
-/find_and_modify/hint
-/crud/prose_test_9
 ```
 
 ## How this is generated

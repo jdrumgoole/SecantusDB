@@ -24,7 +24,7 @@ use std::cmp::Ordering;
 
 use crate::collation::Collation;
 use crate::numeric::{as_int_like, int_to_bson};
-use crate::{densify, expressions, fill, group, order, paths, query, windowfields};
+use crate::{deadline, densify, expressions, fill, group, order, paths, query, windowfields};
 
 pub use crate::fallback::Fallback;
 
@@ -55,8 +55,13 @@ pub fn apply_pipeline(
             return Err(Fallback::Defer); // Python raises; defer so it raises there
         }
         let (name, spec) = s.iter().next().unwrap();
+        // `maxTimeMS` bounds the whole pipeline: between stages is the one
+        // point every stage passes through, including those (a `$sort`) that
+        // are a single call with no per-document loop to poll from.
+        deadline::check_now()?;
         docs = apply_stage(name, spec, docs, vars, coll)?;
     }
+    deadline::check_now()?;
     Ok(docs)
 }
 
@@ -74,6 +79,7 @@ fn apply_stage(
             };
             let mut out = Vec::new();
             for d in docs {
+                deadline::check()?;
                 if query::matches(&d, q, vars, coll)? {
                     out.push(d);
                 }
@@ -1027,6 +1033,7 @@ fn unwind_stage(docs: Vec<Document>, spec: &Bson) -> R<Vec<Document>> {
 fn map_docs(docs: Vec<Document>, mut f: impl FnMut(Document) -> R<Document>) -> R<Vec<Document>> {
     let mut out = Vec::with_capacity(docs.len());
     for d in docs {
+        deadline::check()?;
         out.push(f(d)?);
     }
     Ok(out)
@@ -1235,8 +1242,13 @@ fn project_one(doc: &Document, spec: &Document, vars: &Document) -> R<Document> 
         }
     }
 
-    let has_inclusion = !inclusions.is_empty() || !computed.is_empty();
     let has_exclusion = !exclusions.is_empty();
+    // `{_id: 1}` on its own is an INCLUSION projection: mongod returns only
+    // `_id` (measured 8.2.11, 2026-09-30). With nothing else included it fell
+    // through to exclusion mode here, excluded nothing, and returned the whole
+    // document. Beside an exclusion (`{_id: 1, a: 0}`) it stays an exclusion.
+    let id_only_inclusion = id_handling == Some(1) && !has_exclusion;
+    let has_inclusion = !inclusions.is_empty() || !computed.is_empty() || id_only_inclusion;
     if has_inclusion && has_exclusion {
         return Err(Fallback::Defer); // Python raises (mix of inclusion/exclusion)
     }
@@ -1603,5 +1615,27 @@ mod redact_tests {
             }}
         }})];
         assert!(runtime_error(&[doc! {"_id": 1, "n": 1}], &defaulted, &vars, None).is_none());
+    }
+}
+
+#[cfg(test)]
+mod project_id_only_tests {
+    use super::*;
+    use bson::{bson, doc};
+
+    fn project(spec: Bson) -> Document {
+        let docs = vec![doc! {"_id": 1, "v": true, "w": 2}];
+        apply_pipeline(docs, &[bson!({"$project": spec})], &Document::new(), None)
+            .unwrap()
+            .remove(0)
+    }
+
+    /// mongod 8.2.11 (2026-09-30).
+    #[test]
+    fn id_alone_is_an_inclusion_projection() {
+        assert_eq!(project(bson!({"_id": 1})), doc! {"_id": 1});
+        assert_eq!(project(bson!({"_id": true})), doc! {"_id": 1});
+        assert_eq!(project(bson!({"_id": 1, "v": 0})), doc! {"_id": 1, "w": 2});
+        assert_eq!(project(bson!({"_id": 0, "w": 1})), doc! {"w": 2});
     }
 }

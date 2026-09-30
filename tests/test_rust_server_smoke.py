@@ -697,11 +697,11 @@ def test_lookup_index_order_against_rust_server(tmp_path) -> None:
 
 def test_write_concern_validation_against_rust_server(tmp_path) -> None:
     """The Rust server rejects a malformed `writeConcern` before running a write
-    command, with mongod's codes (matching the Python server): negative/too-large
-    integer `w` → FailedToParse (9), unknown string `w` → UnknownReplWriteConcern
-    (79), a bool / non-number-or-string `w` → TypeMismatch (14). A well-formed
-    (or absent) writeConcern is accepted; `w > 1` still succeeds (the single-node
-    writeConcernError is attached, not an error)."""
+    command, with mongod's codes: negative/too-large integer `w` → FailedToParse
+    (9), a bool / non-number-or-string `w` → TypeMismatch (14). A well-formed (or
+    absent) writeConcern is accepted; `w > 1` and an unknown tag still succeed,
+    with a writeConcernError attached (100 / 79) -- mongod 8.2.11 runs the write
+    for an unknown tag and reports it afterwards (measured 2026-09-30)."""
     import pymongo.errors
 
     srv = _server.RustServer(str(tmp_path / "wt"), 0)
@@ -710,7 +710,6 @@ def test_write_concern_validation_against_rust_server(tmp_path) -> None:
         rejects = [
             ({"w": -5}, 9),
             ({"w": 99}, 9),
-            ({"w": "nope"}, 79),
             ({"w": 1.5}, 14),
             ({"w": True}, 14),
             ({"j": "x"}, 14),
@@ -724,6 +723,18 @@ def test_write_concern_validation_against_rust_server(tmp_path) -> None:
         for wc in [{"w": 1}, {"w": "majority"}, {"j": True}, {"wtimeout": 100}, {"w": 2}]:
             r = db.command("insert", "c", documents=[{"x": 1}], writeConcern=wc)
             assert r["ok"] == 1.0, f"wc={wc} should succeed"
+
+        # An unknown tag: the write happens, then 79 -- with mongod's errInfo,
+        # and the error placed before `ok`.
+        r = db.command("insert", "c", documents=[{"x": 1}], writeConcern={"w": "nope", "j": True})
+        assert r["n"] == 1
+        wce = r["writeConcernError"]
+        assert (wce["code"], wce["codeName"]) == (79, "UnknownReplWriteConcern")
+        assert wce["errInfo"] == {
+            "writeConcern": {"w": "nope", "j": True, "wtimeout": 0, "provenance": "clientSupplied"}
+        }
+        keys = [k for k in r if not k.startswith("$") and k not in ("operationTime",)]
+        assert keys[-2:] == ["writeConcernError", "ok"]
     finally:
         srv.stop()
 

@@ -4,8 +4,9 @@
 //! connection handshake. Faithful ports of `commands.py::_hello` / `_ping` /
 //! `_build_info`.
 //!
-//! **Deferred to R5 (auth):** `saslSupportedMechs` resolution,
-//! `speculativeAuthenticate` (folding a SCRAM client-first into `hello`), and
+//! `saslSupportedMechs` lists the queried user's own SCRAM mechanisms.
+//! **Deferred:** `speculativeAuthenticate` (folding a SCRAM client-first into
+//! `hello`), and
 //! stashing the driver's `client` metadata into the connection registry for
 //! `currentOp`. The non-auth handshake path — the default, and what most
 //! conformance suites exercise — is complete here.
@@ -48,17 +49,8 @@ pub fn hello(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     }
 
-    // mongod refuses an awaitable request that names a budget but no version to
-    // wait on -- there is nothing to compare against, so the wait is undefined.
-    // Measured 8.2.11 (2026-09-29): 31368 / Location31368. Both servers used to
-    // ACCEPT it and answer immediately.
-    if doc.contains_key("maxAwaitTimeMS") && !doc.contains_key("topologyVersion") {
-        return Err(CommandError::new(
-            31368,
-            "Location31368",
-            "A request with 'maxAwaitTimeMS' must include a 'topologyVersion'",
-        ));
-    }
+    let topology_counter = ctx.step_down.as_ref().map_or(0, |s| s.topology_counter());
+    validate_awaitable_arguments(doc, topology_counter)?;
 
     let now = DateTime::now();
     // Inside a `replSetStepDown` window this node is a SECONDARY. The SDAM spec
@@ -66,7 +58,6 @@ pub fn hello(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // flip together with the write refusal -- a server that keeps claiming to be
     // primary while rejecting every write is worse than either alone.
     let stepped_down = ctx.step_down.as_ref().is_some_and(|s| s.is_stepped_down());
-    let topology_counter = ctx.step_down.as_ref().map_or(0, |s| s.topology_counter());
     let mut response = doc! {
         "isWritablePrimary": !stepped_down,
         "ismaster": !stepped_down,
@@ -155,13 +146,20 @@ pub fn hello(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
 
     // `saslSupportedMechs: "<db>.<user>"` — drivers ask which mechanisms to
-    // attempt for a principal. We only implement SCRAM-SHA-256, so advertise
-    // exactly that (mongod lists whatever the user's credentials carry).
-    if doc.get_str("saslSupportedMechs").is_ok() {
-        response.insert(
-            "saslSupportedMechs",
-            vec![Bson::String("SCRAM-SHA-256".to_string())],
-        );
+    // attempt for a principal. mongod 8.2.11 lists the user's own SCRAM
+    // mechanisms, OMITS the field for an unknown user, and refuses a name with
+    // no `.` (measured 2026-09-30). This always said `["SCRAM-SHA-256"]`.
+    if let Ok(principal) = doc.get_str("saslSupportedMechs") {
+        let Some((db, user)) = principal.split_once('.') else {
+            return Err(CommandError::new(
+                2,
+                "BadValue",
+                "UserName must contain a '.' separated database.user pair",
+            ));
+        };
+        if let Some(mechs) = user_scram_mechanisms(ctx, db, user) {
+            response.insert("saslSupportedMechs", mechs);
+        }
     }
 
     Ok(response)
@@ -279,9 +277,261 @@ pub fn build_info(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
     })
 }
 
+/// `maxAwaitTimeMS` as mongod reads it: any number, truncated toward zero.
+/// `None` when absent, `null` or not a number (the handler has already refused
+/// a non-number by the time the server asks).
+pub fn max_await_time_ms(doc: &Document) -> Option<i64> {
+    match doc.get("maxAwaitTimeMS")? {
+        Bson::Int32(n) => Some(i64::from(*n)),
+        Bson::Int64(n) => Some(*n),
+        Bson::Double(d) => Some(d.trunc() as i64),
+        Bson::Decimal128(d) => d.to_string().parse::<f64>().ok().map(|f| f.trunc() as i64),
+        _ => None,
+    }
+}
+
+/// True when an awaitable `hello` names the topology this server is in NOW --
+/// same `processId`, same counter -- which is the only case mongod HOLDS the
+/// reply for `maxAwaitTimeMS`. A different process (the client last saw
+/// another server, or this one before a restart) or an older counter means the
+/// client is out of date, and mongod answers at once so it catches up.
+/// Measured 8.2.11 (2026-09-30), streamed and not.
+pub fn awaitable_topology_is_current(doc: &Document, counter: i64) -> bool {
+    let Ok(tv) = doc.get_document("topologyVersion") else {
+        return false;
+    };
+    tv.get_object_id("processId").ok() == Some(hello_process_id())
+        && tv.get_i64("counter").ok() == Some(counter)
+}
+
+/// mongod's parse of the awaitable-hello arguments, in its order (measured
+/// 8.2.11, 2026-09-30). Every shape below was ACCEPTED here before, and a
+/// malformed or newer-than-ours `topologyVersion` was simply waited on.
+///
+/// 1. IDL parse, field by field in document order: `topologyVersion` must be an
+///    object whose `processId` is an ObjectId and whose `counter` is a LONG (an
+///    int32 counter is a type error), with no other field, and with `counter`
+///    reported missing before `processId`; `maxAwaitTimeMS` must be a number
+///    and, truncated toward zero, not negative. `null` is absent for both. The
+///    path says `hello.` for `isMaster` too.
+/// 2. The pair: either one without the other is 31368.
+/// 3. The counter: negative is 31372; for THIS process, newer than ours is
+///    31382 (a counter from another process is merely stale, not an error).
+fn validate_awaitable_arguments(doc: &Document, counter: i64) -> Result<(), CommandError> {
+    let type_mismatch = |path: &str, v: &Bson, expected: &str| {
+        CommandError::new(
+            14,
+            "TypeMismatch",
+            format!(
+                "BSON field '{path}' is the wrong type '{}', expected {expected}",
+                secantus_core::query::bson_type_name(v)
+            ),
+        )
+    };
+    let mut topology: Option<&Document> = None;
+    let mut max_await = false;
+    for (key, value) in doc {
+        match (key.as_str(), value) {
+            ("topologyVersion", Bson::Null) | ("maxAwaitTimeMS", Bson::Null) => {}
+            ("topologyVersion", Bson::Document(tv)) => {
+                for (field, v) in tv {
+                    let path = format!("hello.topologyVersion.{field}");
+                    match (field.as_str(), v) {
+                        ("processId", Bson::ObjectId(_)) | ("counter", Bson::Int64(_)) => {}
+                        ("processId", v) => {
+                            return Err(type_mismatch(&path, v, "type 'objectId'"));
+                        }
+                        ("counter", v) => return Err(type_mismatch(&path, v, "type 'long'")),
+                        _ => {
+                            return Err(CommandError::new(
+                                40415,
+                                "IDLUnknownField",
+                                format!("BSON field '{path}' is an unknown field."),
+                            ))
+                        }
+                    }
+                }
+                for required in ["counter", "processId"] {
+                    if !tv.contains_key(required) {
+                        return Err(CommandError::new(
+                            40414,
+                            "IDLFailedToParse",
+                            format!(
+                                "BSON field 'hello.topologyVersion.{required}' is missing but a \
+                                 required field"
+                            ),
+                        ));
+                    }
+                }
+                topology = Some(tv);
+            }
+            ("topologyVersion", v) => {
+                return Err(type_mismatch("hello.topologyVersion", v, "type 'object'"));
+            }
+            ("maxAwaitTimeMS", v) => {
+                let Some(ms) = max_await_time_ms(doc) else {
+                    return Err(type_mismatch(
+                        "hello.maxAwaitTimeMS",
+                        v,
+                        "types '[int, decimal, long, double]'",
+                    ));
+                };
+                if ms < 0 {
+                    return Err(CommandError::new(
+                        2,
+                        "BadValue",
+                        format!(
+                            "BSON field 'maxAwaitTimeMS' value must be >= 0, actual value '{ms}'"
+                        ),
+                    ));
+                }
+                max_await = true;
+            }
+            _ => {}
+        }
+    }
+    match (topology, max_await) {
+        (None, true) => Err(CommandError::new(
+            31368,
+            "Location31368",
+            "A request with 'maxAwaitTimeMS' must include a 'topologyVersion'",
+        )),
+        (Some(_), false) => Err(CommandError::new(
+            31368,
+            "Location31368",
+            "A request with a 'topologyVersion' must include 'maxAwaitTimeMS'",
+        )),
+        (Some(tv), true) => {
+            let theirs = tv.get_i64("counter").unwrap_or(0);
+            if theirs < 0 {
+                return Err(CommandError::new(
+                    31372,
+                    "Location31372",
+                    "topologyVersion must have a non-negative counter",
+                ));
+            }
+            if tv.get_object_id("processId").ok() == Some(hello_process_id()) && theirs > counter {
+                return Err(CommandError::new(
+                    31382,
+                    "Location31382",
+                    format!(
+                        "Received a topology version with counter: {theirs} which is greater \
+                         than the server topology version counter: {counter}"
+                    ),
+                ));
+            }
+            Ok(())
+        }
+        (None, false) => Ok(()),
+    }
+}
+
+/// The SCRAM mechanisms a stored user can authenticate with, in mongod's
+/// order, or `None` when there is no such user.
+fn user_scram_mechanisms(ctx: &CommandContext, db: &str, user: &str) -> Option<Vec<Bson>> {
+    let bytes = ctx.storage.as_deref()?.get_user(db, user).ok()??;
+    let record = Document::from_reader(&mut bytes.as_slice()).ok()?;
+    let creds = record.get_document("credentials").ok();
+    Some(
+        ["SCRAM-SHA-1", "SCRAM-SHA-256"]
+            .into_iter()
+            .filter(|m| creds.is_some_and(|c| c.contains_key(*m)))
+            .map(|m| Bson::String(m.to_string()))
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn code_of(doc: Document) -> Option<i32> {
+        validate_awaitable_arguments(&doc, 3).err().map(|e| e.code)
+    }
+
+    /// mongod's parse of the awaitable-hello arguments, measured 8.2.11.
+    #[test]
+    fn awaitable_arguments_are_parsed_as_mongod_does() {
+        let pid = hello_process_id();
+        let tv = doc! {"processId": pid, "counter": 3_i64};
+        assert_eq!(
+            code_of(doc! {"hello": 1, "topologyVersion": tv.clone(), "maxAwaitTimeMS": 5}),
+            None
+        );
+        assert_eq!(code_of(doc! {"hello": 1}), None);
+        assert_eq!(
+            code_of(doc! {"hello": 1, "topologyVersion": Bson::Null, "maxAwaitTimeMS": Bson::Null}),
+            None
+        );
+        // An int32 counter is a type error: the field is a long.
+        assert_eq!(
+            code_of(
+                doc! {"hello": 1, "topologyVersion": {"processId": pid, "counter": 3_i32}, "maxAwaitTimeMS": 5}
+            ),
+            Some(14)
+        );
+        assert_eq!(
+            code_of(doc! {"hello": 1, "topologyVersion": 1, "maxAwaitTimeMS": 5}),
+            Some(14)
+        );
+        assert_eq!(
+            code_of(doc! {"hello": 1, "topologyVersion": {"processId": pid}, "maxAwaitTimeMS": 5}),
+            Some(40414)
+        );
+        assert_eq!(
+            code_of(
+                doc! {"hello": 1, "topologyVersion": {"processId": pid, "counter": 3_i64, "z": 1}, "maxAwaitTimeMS": 5}
+            ),
+            Some(40415)
+        );
+        assert_eq!(
+            code_of(doc! {"hello": 1, "topologyVersion": tv.clone(), "maxAwaitTimeMS": "x"}),
+            Some(14)
+        );
+        assert_eq!(
+            code_of(doc! {"hello": 1, "topologyVersion": tv.clone(), "maxAwaitTimeMS": -1}),
+            Some(2)
+        );
+        // -0.5 truncates to 0, which is allowed.
+        assert_eq!(
+            code_of(doc! {"hello": 1, "topologyVersion": tv.clone(), "maxAwaitTimeMS": -0.5}),
+            None
+        );
+        assert_eq!(
+            code_of(doc! {"hello": 1, "topologyVersion": tv.clone()}),
+            Some(31368)
+        );
+        assert_eq!(code_of(doc! {"hello": 1, "maxAwaitTimeMS": 5}), Some(31368));
+        assert_eq!(
+            code_of(
+                doc! {"hello": 1, "topologyVersion": {"processId": pid, "counter": -1_i64}, "maxAwaitTimeMS": 5}
+            ),
+            Some(31372)
+        );
+        // Newer than ours is an error for THIS process, merely stale for another.
+        assert_eq!(
+            code_of(
+                doc! {"hello": 1, "topologyVersion": {"processId": pid, "counter": 4_i64}, "maxAwaitTimeMS": 5}
+            ),
+            Some(31382)
+        );
+        assert_eq!(
+            code_of(
+                doc! {"hello": 1, "topologyVersion": {"processId": ObjectId::new(), "counter": 4_i64}, "maxAwaitTimeMS": 5}
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn only_the_current_topology_is_held() {
+        let pid = hello_process_id();
+        let current = doc! {"topologyVersion": {"processId": pid, "counter": 3_i64}};
+        assert!(awaitable_topology_is_current(&current, 3));
+        assert!(!awaitable_topology_is_current(&current, 4));
+        let other = doc! {"topologyVersion": {"processId": ObjectId::new(), "counter": 3_i64}};
+        assert!(!awaitable_topology_is_current(&other, 3));
+    }
 
     /// With a set name configured, `hello` already claims to be a replica-set
     /// primary; `replSetGetStatus` has to agree. Driver harnesses count the

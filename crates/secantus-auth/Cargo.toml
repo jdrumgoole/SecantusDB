@@ -17,6 +17,9 @@ crate-type = ["rlib"]
 [dependencies]
 hmac = "0.12"
 sha2 = "0.10"
+# SCRAM-SHA-1: HMAC/PBKDF2-SHA1 and MongoDB's legacy MD5 password prepass.
+sha1 = "0.10"
+md-5 = "0.10"
 pbkdf2 = "0.12"
 base64 = "0.22"
 rand = "0.9"

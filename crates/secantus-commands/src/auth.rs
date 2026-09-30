@@ -39,21 +39,29 @@
 //! ([`CommandContext::peer_cert_dn`], set by the server's mTLS handshake), look
 //! the user up on `$external` / `admin`, and authenticate without a password.
 //!
-//! ## Deferred (later slices, tracked in `tasks/rust-server-plan.md`)
-//!
-//! * **SCRAM-SHA-1** (legacy MD5 prepass) and non-ASCII SASLprep.
+//! **SCRAM-SHA-1** (2026-09-30): created for every user by default alongside
+//! SCRAM-SHA-256, as mongod 8.2 does, and authenticated with MongoDB's legacy
+//! MD5 password prepass (`secantus_auth::derive_credentials_sha1`). A user
+//! without credentials for the requested mechanism is 334 at `saslStart`.
 
 use std::sync::{Arc, Mutex};
 
 use bson::spec::BinarySubtype;
 use bson::{doc, Binary, Bson, Document};
 
-use secantus_auth::{begin_scram, continue_scram, derive_credentials, peek_username, ScramState};
+use secantus_auth::{
+    begin_scram_with, continue_scram, derive_credentials, derive_credentials_sha1, peek_username,
+    Mechanism, ScramState,
+};
 
 use crate::{rbac, CommandContext, CommandError, HandlerResult};
 
-/// The only mechanism this slice implements (the modern driver default).
+/// The modern driver default.
 const SCRAM_SHA_256: &str = "SCRAM-SHA-256";
+/// The legacy SCRAM, which mongod 8.2 still creates for every user by default.
+const SCRAM_SHA_1: &str = "SCRAM-SHA-1";
+/// `MechanismUnavailable` -- the user has no credentials for that mechanism.
+const MECHANISM_UNAVAILABLE: i32 = 334;
 /// The TLS-cert-as-username mechanism (R5c-2).
 const MONGODB_X509: &str = "MONGODB-X509";
 /// `AuthenticationFailed`.
@@ -81,6 +89,10 @@ pub struct ConnectionAuth {
     /// The driver `client` metadata document sent in the handshake (`hello`'s
     /// `client` field), surfaced by `currentOp` as `clientMetadata`.
     pub client_metadata: Option<Document>,
+    /// Whether the peer is a loopback address -- the precondition of mongod's
+    /// LOCALHOST EXCEPTION (see `lib.rs::localhost_exception`). Set by the
+    /// accept loop; `false` wherever the peer is unknown.
+    pub peer_loopback: bool,
 }
 
 impl ConnectionAuth {
@@ -91,6 +103,7 @@ impl ConnectionAuth {
             authenticated: Vec::new(),
             effective_roles: Vec::new(),
             client_metadata: None,
+            peer_loopback: false,
         }
     }
 
@@ -126,6 +139,11 @@ fn auth_failure(msg: impl Into<String>) -> CommandError {
     CommandError::new(AUTHENTICATION_FAILED, "AuthenticationFailed", msg)
 }
 
+/// mongod's one message for EVERY failed SCRAM step -- a wrong password, an
+/// unknown user, a malformed payload -- so the reply says nothing about which
+/// (measured 8.2.11, 2026-09-30). The specific reason stays internal.
+const AUTHENTICATION_FAILED_MSG: &str = "Authentication failed.";
+
 /// Extract a SCRAM payload (BSON Binary, or raw bytes) into a byte vector.
 fn payload_bytes(value: Option<&Bson>) -> Vec<u8> {
     match value {
@@ -155,23 +173,89 @@ fn conn_auth(ctx: &CommandContext) -> Result<Arc<Mutex<ConnectionAuth>>, Command
     }
 }
 
-/// Look up a user's SCRAM-SHA-256 credentials, decoding the stored record.
-/// Returns `None` when the user doesn't exist or carries no SCRAM-SHA-256 entry
-/// (so `begin_scram` fabricates credentials and fails at the proof step).
+/// Look up a user's credentials for `mechanism`, decoding the stored record.
+///
+/// `Ok(None)` when the user does not exist -- `begin_scram_with` then
+/// fabricates credentials and the conversation fails at the proof step, as on
+/// mongod. A user who EXISTS without credentials for this mechanism is refused
+/// up front with mongod's 334 (measured 8.2.11, 2026-09-30).
 fn lookup_creds(
     ctx: &CommandContext,
     db: &str,
     username: &str,
-) -> Option<secantus_auth::StoredCredentials> {
-    let record_bytes = ctx.storage().ok()?.get_user(db, username).ok()??;
-    let record = Document::from_reader(&mut record_bytes.as_slice()).ok()?;
-    let creds = record.get_document("credentials").ok()?;
-    let sub = creds.get_document(SCRAM_SHA_256).ok()?;
-    let iteration_count = sub.get_i32("iterationCount").ok()? as u32;
-    let salt = sub.get_str("salt").ok()?;
-    let stored_key = sub.get_str("storedKey").ok()?;
-    let server_key = sub.get_str("serverKey").ok()?;
-    secantus_auth::StoredCredentials::from_b64(iteration_count, salt, stored_key, server_key).ok()
+    mechanism: Mechanism,
+) -> Result<Option<secantus_auth::StoredCredentials>, CommandError> {
+    let record = ctx
+        .storage()
+        .ok()
+        .and_then(|s| s.get_user(db, username).ok().flatten())
+        .and_then(|bytes| Document::from_reader(&mut bytes.as_slice()).ok());
+    let Some(record) = record else {
+        return Ok(None);
+    };
+    let name = mechanism.name();
+    let Some(sub) = record
+        .get_document("credentials")
+        .ok()
+        .and_then(|c| c.get_document(name).ok())
+    else {
+        return Err(CommandError::new(
+            MECHANISM_UNAVAILABLE,
+            "MechanismUnavailable",
+            format!(
+                "Unable to use {name} based authentication for user without any {name} \
+                 credentials registered"
+            ),
+        ));
+    };
+    let decoded = (|| {
+        let iteration_count = sub.get_i32("iterationCount").ok()? as u32;
+        secantus_auth::StoredCredentials::from_b64(
+            iteration_count,
+            sub.get_str("salt").ok()?,
+            sub.get_str("storedKey").ok()?,
+            sub.get_str("serverKey").ok()?,
+        )
+        .ok()
+    })();
+    Ok(decoded)
+}
+
+/// The SCRAM mechanisms a user record names, in mongod's order
+/// (`["SCRAM-SHA-1", "SCRAM-SHA-256"]`), or both when it names none.
+fn scram_mechanisms_of(names: &[String]) -> Vec<Mechanism> {
+    let wanted: Vec<Mechanism> = [Mechanism::Sha1, Mechanism::Sha256]
+        .into_iter()
+        .filter(|m| names.iter().any(|n| n == m.name()))
+        .collect();
+    wanted
+}
+
+/// `credentials` entries for `mechanisms`, derived from `pwd`.
+fn scram_credentials(
+    username: &str,
+    pwd: &str,
+    mechanisms: &[Mechanism],
+    command: &str,
+) -> Result<Document, CommandError> {
+    let mut out = Document::new();
+    for mech in mechanisms {
+        let creds = match mech {
+            Mechanism::Sha1 => derive_credentials_sha1(username, pwd, None, None),
+            Mechanism::Sha256 => derive_credentials(pwd, None, None)
+                .map_err(|e| bad_value(format!("{command}: {e}")))?,
+        };
+        out.insert(
+            mech.name(),
+            doc! {
+                "iterationCount": creds.iteration_count as i32,
+                "salt": creds.salt_b64(),
+                "storedKey": creds.stored_key_b64(),
+                "serverKey": creds.server_key_b64(),
+            },
+        );
+    }
+    Ok(out)
 }
 
 /// The `roles` array (`[{role, db}, ...]`) stored on a user record, or `None`
@@ -182,17 +266,19 @@ fn lookup_roles(ctx: &CommandContext, db: &str, username: &str) -> Option<Vec<Bs
     record.get_array("roles").ok().cloned()
 }
 
-/// `saslStart` — begin a SCRAM-SHA-256 conversation.
+/// `saslStart` — begin a SCRAM-SHA-1 / SCRAM-SHA-256 conversation.
 pub fn sasl_start(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let mechanism = doc.get_str("mechanism").unwrap_or("");
     if mechanism == MONGODB_X509 {
         return sasl_start_x509(doc, ctx);
     }
-    if mechanism != SCRAM_SHA_256 {
-        return Err(auth_failure(format!(
-            "Unsupported SASL mechanism: '{mechanism}' (supported: {SCRAM_SHA_256}, {MONGODB_X509})"
-        )));
-    }
+    let Some(mech) = Mechanism::from_name(mechanism) else {
+        return Err(CommandError::new(
+            MECHANISM_UNAVAILABLE,
+            "MechanismUnavailable",
+            format!("Received authentication for mechanism {mechanism} which is not enabled"),
+        ));
+    };
     let payload = payload_bytes(doc.get("payload"));
     let db_name = if ctx.db_name.is_empty() {
         "admin".to_string()
@@ -200,15 +286,15 @@ pub fn sasl_start(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         ctx.db_name.clone()
     };
     let username = peek_username(&payload).unwrap_or_default();
-    let creds = lookup_creds(ctx, &db_name, &username);
+    let creds = lookup_creds(ctx, &db_name, &username, mech)?;
 
     let auth = conn_auth(ctx)?;
     let mut auth = auth
         .lock()
         .map_err(|_| CommandError::new(1, "InternalError", "connection auth state corrupted"))?;
     let conversation_id = auth.new_conversation_id();
-    let (server_first, state) = begin_scram(conversation_id, &db_name, &payload, creds)
-        .map_err(|e| auth_failure(e.to_string()))?;
+    let (server_first, state) = begin_scram_with(conversation_id, &db_name, &payload, creds, mech)
+        .map_err(|_| auth_failure(AUTHENTICATION_FAILED_MSG))?;
     auth.scram = Some(state);
 
     Ok(doc! {
@@ -229,7 +315,11 @@ pub fn sasl_continue(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
         .lock()
         .map_err(|_| CommandError::new(1, "InternalError", "connection auth state corrupted"))?;
     let Some(mut state) = auth.scram.take() else {
-        return Err(auth_failure("No SCRAM conversation in progress"));
+        return Err(CommandError::new(
+            17,
+            "ProtocolError",
+            "No SASL session state found",
+        ));
     };
     if incoming_id != Some(state.conversation_id) {
         // Restore so a spurious id doesn't silently drop the conversation.
@@ -238,7 +328,7 @@ pub fn sasl_continue(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
     }
     let server_final = match continue_scram(&mut state, &payload) {
         Ok(v) => v,
-        Err(e) => return Err(auth_failure(e.to_string())),
+        Err(_) => return Err(auth_failure(AUTHENTICATION_FAILED_MSG)),
     };
     // Successful proof: record the principal. mongod returns done=true from the
     // second server message (skipping the spec's optional third round-trip).
@@ -445,27 +535,31 @@ pub fn create_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     } else {
         ctx.db_name.clone()
     };
-    // Requested mechanisms (default SCRAM-SHA-256). We implement SCRAM-SHA-256
-    // and MONGODB-X509; an unknown mechanism is dropped.
+    // Requested mechanisms -- by default BOTH SCRAMs, as mongod 8.2.11 creates
+    // (measured 2026-09-30); an unknown mechanism is dropped. Stored in mongod's
+    // order whatever order they were asked in.
     let requested: Vec<String> = match doc.get_array("mechanisms") {
-        Ok(arr) if !arr.is_empty() => arr
-            .iter()
-            .filter_map(|m| m.as_str())
-            .filter(|m| *m == SCRAM_SHA_256 || *m == MONGODB_X509)
-            .map(String::from)
-            .collect(),
-        _ => vec![SCRAM_SHA_256.to_string()],
+        Ok(arr) if !arr.is_empty() => {
+            let asked: Vec<&str> = arr.iter().filter_map(|m| m.as_str()).collect();
+            [SCRAM_SHA_1, SCRAM_SHA_256, MONGODB_X509]
+                .into_iter()
+                .filter(|m| asked.contains(m))
+                .map(String::from)
+                .collect()
+        }
+        _ => vec![SCRAM_SHA_1.to_string(), SCRAM_SHA_256.to_string()],
     };
     if requested.is_empty() {
         return Err(bad_value(format!(
-            "createUser: mechanisms must contain at least one of '{SCRAM_SHA_256}', '{MONGODB_X509}'"
+            "createUser: mechanisms must contain at least one of '{SCRAM_SHA_1}', \
+             '{SCRAM_SHA_256}', '{MONGODB_X509}'"
         )));
     }
-    let scram_requested = requested.iter().any(|m| m == SCRAM_SHA_256);
+    let scram_mechs = scram_mechanisms_of(&requested);
     let x509_requested = requested.iter().any(|m| m == MONGODB_X509);
 
     let mut credentials = Document::new();
-    if scram_requested {
+    if !scram_mechs.is_empty() {
         let pwd = match doc.get_str("pwd") {
             Ok(p) if !p.is_empty() => p.to_string(),
             _ => {
@@ -474,17 +568,7 @@ pub fn create_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 ))
             }
         };
-        let creds = derive_credentials(&pwd, None, None)
-            .map_err(|e| bad_value(format!("createUser: {e}")))?;
-        credentials.insert(
-            SCRAM_SHA_256,
-            doc! {
-                "iterationCount": creds.iteration_count as i32,
-                "salt": creds.salt_b64(),
-                "storedKey": creds.stored_key_b64(),
-                "serverKey": creds.server_key_b64(),
-            },
-        );
+        credentials = scram_credentials(&username, &pwd, &scram_mechs, "createUser")?;
     }
     if x509_requested {
         // The credential IS the cert presented at the TLS handshake; this
@@ -517,6 +601,10 @@ pub fn create_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             "Location51003",
             format!("User \"{username}@{db_name}\" already exists"),
         ));
+    }
+    // Close the localhost exception for the rest of this server's life.
+    if let Some(p) = &ctx.server_params {
+        p.mark_users_seen();
     }
     Ok(doc! { "ok": 1.0 })
 }
@@ -607,19 +695,27 @@ pub fn update_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         if pwd.is_empty() {
             return Err(bad_value("updateUser: pwd must be a non-empty string"));
         }
-        let creds = derive_credentials(pwd, None, None)
-            .map_err(|e| bad_value(format!("updateUser: {e}")))?;
-        record.insert(
-            "credentials",
-            doc! {
-                SCRAM_SHA_256: {
-                    "iterationCount": creds.iteration_count as i32,
-                    "salt": creds.salt_b64(),
-                    "storedKey": creds.stored_key_b64(),
-                    "serverKey": creds.server_key_b64(),
-                }
-            },
-        );
+        // Re-derive for the SCRAMs the user already has (both, for a record
+        // that names none), and keep an X509 marker.
+        let names: Vec<String> = record
+            .get_array("mechanisms")
+            .map(|a| {
+                a.iter()
+                    .filter_map(|m| m.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut mechs = scram_mechanisms_of(&names);
+        if mechs.is_empty() {
+            mechs = vec![Mechanism::Sha1, Mechanism::Sha256];
+        }
+        let mut credentials = scram_credentials(&username, pwd, &mechs, "updateUser")?;
+        if let Ok(old) = record.get_document("credentials") {
+            if let Some(x) = old.get(MONGODB_X509) {
+                credentials.insert(MONGODB_X509, x.clone());
+            }
+        }
+        record.insert("credentials", credentials);
     }
     if has_roles {
         let roles = normalise_roles(doc.get("roles"), &db_name, ctx)?;
@@ -819,6 +915,14 @@ pub fn users_info(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             {
                 raw.push(r);
             }
+        }
+        // `{usersInfo: {forAllDBs: true}}` ⇒ every user in every database. It
+        // fell into the principal arm below, found no `user`, and answered
+        // `[]` whatever was stored.
+        Some(Bson::Document(spec)) if spec.get_bool("forAllDBs").unwrap_or(false) => {
+            raw = storage
+                .list_users(None, 0, 0)
+                .map_err(crate::util::command_error)?;
         }
         // `{usersInfo: {user, db}}` ⇒ a single fully-qualified principal.
         Some(Bson::Document(spec)) => {
@@ -1371,10 +1475,64 @@ mod tests {
     fn unsupported_mechanism_rejected() {
         let (mut ctx, _auth) = ctx_with_store();
         let reply = dispatch(
-            &doc! {"saslStart": 1, "mechanism": "SCRAM-SHA-1", "payload": payload_binary(b"n,,n=x,r=y".to_vec()), "$db": "admin"},
+            &doc! {"saslStart": 1, "mechanism": "PLAIN", "payload": payload_binary(b"n,,n=x,r=y".to_vec()), "$db": "admin"},
             &mut ctx,
         );
-        assert_eq!(reply.get_i32("code").unwrap(), AUTHENTICATION_FAILED);
+        // mongod 8.2.11: 334, naming the mechanism.
+        assert_eq!(reply.get_i32("code").unwrap(), MECHANISM_UNAVAILABLE);
+        assert_eq!(
+            reply.get_str("errmsg").unwrap(),
+            "Received authentication for mechanism PLAIN which is not enabled"
+        );
+    }
+
+    /// mongod 8.2.11 (2026-09-30): a user gets BOTH SCRAMs by default, `hello`
+    /// lists the user's own, and a mechanism the user lacks is 334 at saslStart.
+    #[test]
+    fn scram_sha1_is_created_by_default_and_refused_when_absent() {
+        let (mut ctx, _auth) = ctx_with_store();
+        for (user, mechs) in [("both", None), ("only256", Some(vec!["SCRAM-SHA-256"]))] {
+            let mut cmd = doc! {"createUser": user, "pwd": "pw", "roles": [], "$db": "admin"};
+            if let Some(m) = mechs {
+                cmd.insert("mechanisms", m);
+            }
+            assert_eq!(dispatch(&cmd, &mut ctx).get_f64("ok").unwrap(), 1.0);
+        }
+        let hello = |ctx: &mut CommandContext, who: &str| {
+            dispatch(
+                &doc! {"hello": 1, "saslSupportedMechs": who, "$db": "admin"},
+                ctx,
+            )
+        };
+        assert_eq!(
+            hello(&mut ctx, "admin.both")
+                .get_array("saslSupportedMechs")
+                .unwrap(),
+            &vec![
+                Bson::String("SCRAM-SHA-1".into()),
+                Bson::String("SCRAM-SHA-256".into())
+            ]
+        );
+        assert!(hello(&mut ctx, "admin.nobody")
+            .get("saslSupportedMechs")
+            .is_none());
+        let refused = dispatch(
+            &doc! {"saslStart": 1, "mechanism": "SCRAM-SHA-1",
+            "payload": payload_binary(b"n,,n=only256,r=abc".to_vec()), "$db": "admin"},
+            &mut ctx,
+        );
+        assert_eq!(refused.get_i32("code").unwrap(), 334);
+        assert_eq!(
+            refused.get_str("errmsg").unwrap(),
+            "Unable to use SCRAM-SHA-1 based authentication for user without any SCRAM-SHA-1 \
+             credentials registered"
+        );
+        let started = dispatch(
+            &doc! {"saslStart": 1, "mechanism": "SCRAM-SHA-1",
+            "payload": payload_binary(b"n,,n=both,r=abc".to_vec()), "$db": "admin"},
+            &mut ctx,
+        );
+        assert_eq!(started.get_f64("ok").unwrap(), 1.0);
     }
 
     #[test]

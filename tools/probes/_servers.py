@@ -91,6 +91,27 @@ def probe_store() -> str:
     return path
 
 
+def probe_server(**kwargs: object) -> object:
+    """A started Python server on a fresh ``probe_store()``, stopped at exit.
+
+    Three probes started a server at module scope and never stopped it, so
+    interpreter shutdown ran ``probe_store``'s rmtree underneath a LIVE
+    WiredTiger connection. WT's log-server thread then found its directory gone
+    and panicked -- ``the process must exit and restart: WT_PANIC`` in the
+    middle of an otherwise clean probe log (2026-09-30).
+
+    ``atexit`` runs hooks last-registered-first, and ``stop`` is registered
+    after the store's delete, so the server is always stopped before its files
+    go. Use this rather than ``SecantusDBServer(storage_path=probe_store())``.
+    """
+    from secantus import SecantusDBServer
+
+    server = SecantusDBServer(port=0, storage_path=probe_store(), **kwargs)
+    server.start()
+    atexit.register(server.stop)
+    return server
+
+
 @contextlib.contextmanager
 def probe_targets(
     *, mongod_uri: str | None = None, replica_set: str | None = None
