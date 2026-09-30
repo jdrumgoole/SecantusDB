@@ -515,6 +515,17 @@ fn time_of(v: &Bson) -> Result<NaiveTime> {
 /// its midnight -- local midnight when promoted to `timestamptz`.
 fn instant_of(v: &Bson, ty: &str) -> Result<i64> {
     if let Bson::String(s) = v {
+        // A wide-year or BC value travels as UTC text (a `timestamp` as its
+        // wall clock): read it whole, fraction and all.
+        if let Some((at, frac)) = crate::wide_instant(s.trim()) {
+            let digits: String = frac.trim_start_matches('.').chars().take(6).collect();
+            let us: i64 = if digits.is_empty() {
+                0
+            } else {
+                format!("{digits:0<6}").parse().unwrap_or(0)
+            };
+            return Ok(at.and_utc().timestamp_micros() + us);
+        }
         // A BC timestamp travels as its text: year N BC is astronomical 1-N.
         if let Some(body) = s.trim().strip_suffix(" BC") {
             let body = body.trim();

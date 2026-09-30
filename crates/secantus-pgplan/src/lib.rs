@@ -19317,13 +19317,46 @@ impl TimeZoneSetting {
         if v.is_empty() || v.eq_ignore_ascii_case("utc") || v.eq_ignore_ascii_case("gmt") {
             return TimeZoneSetting::Utc;
         }
-        if let Some(off) = parse_utc_offset_posix(v) {
-            return TimeZoneSetting::Fixed(off);
+        // A bare number is hours EAST of UTC (`SET timezone = 3`, `'+03'`),
+        // which PostgreSQL records as the POSIX spec `<+03>-03`.
+        if let Some(hours) = numeric_zone_hours(v) {
+            if let Some(off) = chrono::FixedOffset::east_opt((hours * 3600.0).round() as i32) {
+                return TimeZoneSetting::Fixed(off);
+            }
         }
-        match v.parse::<chrono_tz::Tz>() {
-            Ok(tz) => TimeZoneSetting::Named(tz),
-            Err(_) => TimeZoneSetting::Utc,
+        if let Ok(tz) = v.parse::<chrono_tz::Tz>() {
+            return TimeZoneSetting::Named(tz);
         }
+        // A POSIX spec: an optional zone name (`UTC`, `GMT`, `<+04>`) and an
+        // offset WEST of UTC (`UTC+3` is three hours behind).
+        let rest = if let Some(r) = v.strip_prefix('<') {
+            r.split_once('>').map_or(v, |(_, r)| r)
+        } else {
+            v.trim_start_matches(|c: char| c.is_ascii_alphabetic())
+        };
+        match parse_utc_offset_posix(rest) {
+            Some(off) => TimeZoneSetting::Fixed(off),
+            None => TimeZoneSetting::Utc,
+        }
+    }
+
+    /// `numeric_zone_hours`'s form as PostgreSQL shows the setting:
+    /// `3` -> `<+03>-03`. `None` when `value` is not a bare number.
+    pub fn canonical_setting(value: &str) -> Option<String> {
+        let v = value.trim().trim_matches('\'');
+        let hours = numeric_zone_hours(v)?;
+        let east = (hours * 3600.0).round() as i32;
+        let render = |secs: i32| {
+            let sign = if secs < 0 { '-' } else { '+' };
+            let a = secs.abs();
+            let (h, m) = (a / 3600, a % 3600 / 60);
+            if m == 0 {
+                format!("{sign}{h:02}")
+            } else {
+                format!("{sign}{h:02}:{m:02}")
+            }
+        };
+        Some(format!("<{}>{}", render(east), render(-east)))
     }
 
     /// The offset in effect at a given instant.
@@ -19334,7 +19367,8 @@ impl TimeZoneSetting {
             TimeZoneSetting::Fixed(off) => *off,
             TimeZoneSetting::Named(tz) => {
                 let instant = chrono::DateTime::from_timestamp_micros(micros).unwrap_or_default();
-                tz.from_utc_datetime(&instant.naive_utc()).offset().fix()
+                let naive = future_proxy(instant.naive_utc());
+                tz.from_utc_datetime(&naive).offset().fix()
             }
         }
     }
@@ -19347,9 +19381,11 @@ impl TimeZoneSetting {
             TimeZoneSetting::Utc => chrono::FixedOffset::east_opt(0).expect("zero is valid"),
             TimeZoneSetting::Fixed(off) => *off,
             TimeZoneSetting::Named(tz) => {
-                let naive = chrono::DateTime::from_timestamp_micros(naive_micros)
-                    .unwrap_or_default()
-                    .naive_utc();
+                let naive = future_proxy(
+                    chrono::DateTime::from_timestamp_micros(naive_micros)
+                        .unwrap_or_default()
+                        .naive_utc(),
+                );
                 // A local time can be ambiguous (the hour DST repeats) or absent
                 // (the hour it skips). PostgreSQL's DetermineTimeZoneOffset
                 // picks, in BOTH cases, the offset further WEST of the two
@@ -19378,6 +19414,42 @@ impl TimeZoneSetting {
 /// Greenwich, so `'+02:00'` is UTC-02. A bare `'02:00'` is the same as `'+02:00'`.
 /// This is the OPPOSITE of the sign in `'2026-01-01 12:00+02'`, and was probed
 /// rather than assumed.
+/// A `TimeZone` value that is a bare number of hours (`3`, `+03`, `-4.5`).
+fn numeric_zone_hours(v: &str) -> Option<f64> {
+    let body = v.strip_prefix(['+', '-']).unwrap_or(v);
+    if body.is_empty() || !body.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return None;
+    }
+    let h: f64 = v.parse().ok()?;
+    (h.abs() <= 15.0).then_some(h)
+}
+
+/// The instant to ask a zone about for a date past its transition table.
+///
+/// PostgreSQL extends a zone's current daylight-saving RULE forever (the
+/// tzdata footer); `chrono-tz`'s table ends in 2037, after which it gives
+/// standard time all year. A later year borrows the rules of a year inside
+/// the table with the same calendar -- January 1st on the same weekday, the
+/// same leap status -- so "the second Sunday in March" falls on the same
+/// date.
+fn future_proxy(naive: NaiveDateTime) -> NaiveDateTime {
+    use chrono::Datelike;
+    let year = naive.year();
+    if year <= 2037 {
+        return naive;
+    }
+    let leap = |y: i32| (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let jan1 = |y: i32| NaiveDate::from_ymd_opt(y, 1, 1).map(|d| d.weekday());
+    let Some(target) = jan1(year) else {
+        return naive;
+    };
+    (2010..=2037)
+        .rev()
+        .find(|y| leap(*y) == leap(year) && jan1(*y) == Some(target))
+        .and_then(|y| naive.with_year(y))
+        .unwrap_or(naive)
+}
+
 fn parse_utc_offset_posix(v: &str) -> Option<chrono::FixedOffset> {
     let (sign, rest) = match v.strip_prefix('-') {
         Some(r) => (1i32, r),
@@ -19557,23 +19629,101 @@ pub fn wide_timestamptz_text(text: &str, tz: &TimeZoneSetting) -> String {
     if t.eq_ignore_ascii_case("infinity") || t.eq_ignore_ascii_case("-infinity") {
         return t.to_string();
     }
-    let (core, era) = match t.strip_suffix(" BC") {
-        Some(b) => (b, " BC"),
-        None => (t, ""),
-    };
-    let Some((_, time)) = core.split_once(' ') else {
-        return t.to_string();
-    };
-    if time.contains(['+', '-']) {
-        return t.to_string();
+    wide_instant(t)
+        .map(|(utc, frac)| {
+            // The session zone's offset AT that instant -- a zone's local
+            // mean time before its first transition, to the second.
+            let micros = utc.and_utc().timestamp_micros();
+            let offset = tz.offset_at(micros).local_minus_utc();
+            let local = utc + chrono::Duration::seconds(i64::from(offset));
+            let year = chrono::Datelike::year(&local.date());
+            let (shown, era) = if year <= 0 {
+                (1 - year, " BC")
+            } else {
+                (year, "")
+            };
+            format!(
+                "{shown:04}-{}{frac}{}{era}",
+                local.format("%m-%d %H:%M:%S"),
+                render_offset(offset)
+            )
+        })
+        .unwrap_or_else(|| t.to_string())
+}
+
+/// A wide-year or BC timestamptz's text as canonical UTC text with an
+/// explicit `+00`; a value with no offset is read in `tz`.
+fn wide_to_utc_text(text: &str, tz: &TimeZoneSetting) -> Option<String> {
+    let t = text.trim();
+    if t.eq_ignore_ascii_case("infinity") || t.eq_ignore_ascii_case("-infinity") {
+        return None;
     }
-    let probe = if era.is_empty() {
-        253_402_300_799_000_000 // 9999-12-31 23:59:59
-    } else {
-        -62_135_596_800_000_000 // 0001-01-01
+    let (core, _) = match t.strip_suffix(" BC") {
+        Some(b) => (b, true),
+        None => (t, false),
     };
-    let offset = tz.offset_at(probe).local_minus_utc();
-    format!("{core}{}{era}", render_offset(offset))
+    let has_offset = core
+        .split_once(' ')
+        .is_some_and(|(_, time)| time.contains(['+', '-']));
+    let (mut utc, frac) = wide_instant(t)?;
+    if !has_offset {
+        // `wide_instant` read the wall clock as UTC; shift by the zone's
+        // offset at that local time.
+        let off = tz.offset_for_local(utc.and_utc().timestamp_micros());
+        utc -= chrono::Duration::seconds(i64::from(off.local_minus_utc()));
+    }
+    let year = chrono::Datelike::year(&utc.date());
+    let (shown, era) = if year <= 0 {
+        (1 - year, " BC")
+    } else {
+        (year, "")
+    };
+    // Stored offset-less, which every reader of these values takes as UTC.
+    Some(format!(
+        "{shown:04}-{}{frac}{era}",
+        utc.format("%m-%d %H:%M:%S")
+    ))
+}
+
+/// A wide-year or BC timestamptz's text as `(UTC instant, fraction text)`:
+/// `YYYY...-MM-DD HH:MM[:SS[.f]][+HH[:MM[:SS]]][ BC]`, a value with no
+/// offset being UTC.
+fn wide_instant(t: &str) -> Option<(NaiveDateTime, String)> {
+    let (core, bc) = match t.strip_suffix(" BC") {
+        Some(b) => (b.trim(), true),
+        None => (t, false),
+    };
+    let (date, time) = core.split_once(' ')?;
+    let (time, offset) = match time.rfind(['+', '-']) {
+        Some(i) => {
+            let (clock, off) = time.split_at(i);
+            let sign = if off.starts_with('-') { -1 } else { 1 };
+            let parts: Vec<i32> = off[1..]
+                .split(':')
+                .map(|p| p.parse().ok())
+                .collect::<Option<_>>()?;
+            let secs = parts.first().copied().unwrap_or(0) * 3600
+                + parts.get(1).copied().unwrap_or(0) * 60
+                + parts.get(2).copied().unwrap_or(0);
+            (clock, sign * secs)
+        }
+        None => (time, 0),
+    };
+    let mut d = date.splitn(3, '-');
+    let y: i32 = d.next()?.parse().ok()?;
+    let m: u32 = d.next()?.parse().ok()?;
+    let day: u32 = d.next()?.parse().ok()?;
+    let year = if bc { 1 - y } else { y };
+    let (clock, frac) = match time.split_once('.') {
+        Some((c, f)) => (c, format!(".{f}")),
+        None => (time, String::new()),
+    };
+    let mut c = clock.split(':');
+    let h: u32 = c.next()?.parse().ok()?;
+    let mi: u32 = c.next().unwrap_or("0").parse().ok()?;
+    let sec: u32 = c.next().unwrap_or("0").parse().ok()?;
+    let local = NaiveDate::from_ymd_opt(year, m, day)?.and_hms_opt(h, mi, sec)?;
+    Some((local - chrono::Duration::seconds(i64::from(offset)), frac))
 }
 
 /// Render a canonical ISO timestamp (`render_timestamp`' output:
@@ -20345,9 +20495,14 @@ pub fn apply_column_expr(expr: &ColumnExpr, value: Bson, tz: &TimeZoneSetting) -
                         continue;
                     }
                 }
-                // timestamptz -> text renders the instant in the session zone.
+                // timestamptz -> text renders the instant in the session zone
+                // (a wide or BC one is kept as UTC text).
                 if target == "text" && prev == Some("timestamptz") {
-                    if let Some(t) = timestamptz_value_text(&v, tz) {
+                    let rendered = match &v {
+                        Bson::String(s) => Some(wide_timestamptz_text(s, tz)),
+                        other => timestamptz_value_text(other, tz),
+                    };
+                    if let Some(t) = rendered {
                         v = Bson::String(t);
                         prev = Some(target);
                         continue;
@@ -22332,7 +22487,11 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
             // storing session-rendered text would be a wrong answer for any
             // other session. infinity / wide-year / BC stay text.
             if let Some(text) = special_timestamp_text(&as_text(&value)) {
-                return Ok(Bson::String(text));
+                // A wide or BC instant is kept as UTC text: one given with no
+                // offset is read in the session zone now, not at output.
+                return Ok(Bson::String(
+                    wide_to_utc_text(&text, &session_timezone()).unwrap_or(text),
+                ));
             }
             let micros = parse_timestamptz(&as_text(&value), &session_timezone())?;
             let (ms, rem) = split_subms(micros);

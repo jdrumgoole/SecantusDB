@@ -21010,6 +21010,10 @@ impl PgHandler {
                         canonical_ms_guc(&key, &value)?
                     } else if BOOL_GUCS.contains(&key.as_str()) {
                         canonical_bool_guc(&key, &value)?
+                    } else if key == "TimeZone" {
+                        // A bare number of hours is recorded as its POSIX
+                        // spec, as PostgreSQL shows it (`3` -> `<+03>-03`).
+                        secantus_pgplan::TimeZoneSetting::canonical_setting(&value).unwrap_or(value)
                     } else {
                         value
                     };
