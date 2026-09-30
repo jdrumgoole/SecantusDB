@@ -272,3 +272,45 @@ pub(crate) fn replacement(n: &pg_query::protobuf::Node) -> Option<pg_query::prot
         }))),
     })
 }
+
+/// PostgreSQL 15's `LANGUAGE internal` functions: `prosrc proname nargs`,
+/// measured from `pg_proc` (`prolang = 12`, ordinary functions).
+const INTERNAL_FUNCTIONS: &str = include_str!("internal_functions.txt");
+
+/// Is `prosrc` a built-in C function PostgreSQL knows?
+pub fn is_internal_function(prosrc: &str) -> bool {
+    INTERNAL_FUNCTIONS
+        .lines()
+        .any(|l| l.split(' ').next() == Some(prosrc))
+}
+
+/// The SQL a `LANGUAGE internal` wrapper over `prosrc` with `nargs`
+/// arguments runs: the built-in operator behind it (`int4pl` is `$1 + $2`),
+/// or a SQL-callable built-in over the same C function (`textlen` is
+/// `length($1)`). `None` when this server has neither.
+pub fn internal_call_sql(prosrc: &str, nargs: usize) -> Option<String> {
+    let args: Vec<String> = (1..=nargs).map(|i| format!("${i}")).collect();
+    if nargs == 2 {
+        if let Some(sym) = builtin_symbol(prosrc) {
+            return Some(format!("SELECT $1 {sym} $2"));
+        }
+    }
+    if nargs == 1 {
+        if let Some(name) = builtin_unary(prosrc) {
+            return Some(format!("SELECT {name}($1)"));
+        }
+    }
+    let n = nargs.to_string();
+    let mut names: Vec<&str> = INTERNAL_FUNCTIONS
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split(' ');
+            let (src, name, k) = (it.next()?, it.next()?, it.next()?);
+            (src == prosrc && k == n).then_some(name)
+        })
+        .collect();
+    // The function of the C name's own name first, then the others.
+    names.sort_by_key(|name| *name != prosrc);
+    let name = names.into_iter().find(|name| scalar::is_scalar(name))?;
+    Some(format!("SELECT {}({})", name, args.join(", ")))
+}

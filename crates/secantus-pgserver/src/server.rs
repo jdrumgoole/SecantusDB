@@ -189,12 +189,24 @@ impl Drop for RunningPgServer {
 ///
 /// `storage` is taken by value and owned by the returned handle — see the
 /// module docs; that ownership is what makes `stop()` checkpoint.
+/// Each runtime worker's stack: see `bind`.
+pub const WORKER_STACK_BYTES: usize = 256 << 20;
+
 pub fn bind(
     addr: &str,
     storage: Storage,
     databases: Arc<DatabaseRegistry>,
 ) -> io::Result<RunningPgServer> {
-    let runtime = Builder::new_multi_thread().enable_all().build()?;
+    // Statements are planned and run on the worker threads (`block_in_place`),
+    // and planning recurses once per expression level: tokio's 2 MiB default
+    // overflowed on a 24-term `||` chain, which ABORTS the process -- every
+    // connection with it. The stack is reserved, not committed, so a large
+    // one costs address space only. `planning_depth_guard` refuses what even
+    // this cannot hold, as PostgreSQL's 54001 does.
+    let runtime = Builder::new_multi_thread()
+        .thread_stack_size(WORKER_STACK_BYTES)
+        .enable_all()
+        .build()?;
     let listener = runtime.block_on(async { TcpListener::bind(addr).await })?;
     let address = listener.local_addr()?;
 

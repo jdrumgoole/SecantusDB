@@ -281,41 +281,63 @@ fn bookkeeping_outside_the_block_keeps_the_prepared_write_set_whole() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// A recovered prepared transaction holds no row locks (it is a record, not
-/// an open WiredTiger transaction), so a write can slip in under it. The
-/// replay must not paper over that: an insert whose unique key now exists
-/// fails the COMMIT PREPARED, nothing of the replay lands, and the record
-/// stays for a ROLLBACK PREPARED.
+/// A recovered prepared transaction is revived as a LIVE transaction at
+/// open, so it still holds what it wrote -- its unique keys included. A
+/// write of one of its keys WAITS for it, as in PostgreSQL, rather than
+/// slipping in under it (which let COMMIT PREPARED overwrite a committed
+/// write, or fail on the key it had taken). Resolving the transaction
+/// releases the waiter: after COMMIT PREPARED the key is a duplicate, after
+/// ROLLBACK PREPARED it is free.
 #[test]
-fn replay_refuses_a_key_taken_since_the_prepare() {
-    let home = temp_home();
-    {
-        let st = Storage::open(home.to_str().unwrap()).unwrap();
-        st.create_collection("app", "t").unwrap();
-        st.create_index("app", "t", "a_1", &doc! {"a": 1}, &doc! {"unique": true})
+fn a_recovered_prepared_transaction_still_holds_its_keys() {
+    for commit in [true, false] {
+        let home = temp_home();
+        {
+            let st = Storage::open(home.to_str().unwrap()).unwrap();
+            st.create_collection("app", "t").unwrap();
+            st.create_index("app", "t", "a_1", &doc! {"a": 1}, &doc! {"unique": true})
+                .unwrap();
+            let mut txn = st.begin_user_transaction().unwrap();
+            st.with_user_transaction(&mut txn, || {
+                st.insert_one("app", "t", &enc(&doc! {"_id": 1, "a": 1}))?;
+                st.insert_one("app", "t", &enc(&doc! {"_id": 2, "a": 2}))
+            })
+            .unwrap()
             .unwrap();
-        let mut txn = st.begin_user_transaction().unwrap();
-        st.with_user_transaction(&mut txn, || {
-            st.insert_one("app", "t", &enc(&doc! {"_id": 1, "a": 1}))?;
-            st.insert_one("app", "t", &enc(&doc! {"_id": 2, "a": 2}))
-        })
-        .unwrap()
-        .unwrap();
-        st.prepare_user_transaction(txn, "taken", "postgres", "postgres")
-            .unwrap();
+            st.prepare_user_transaction(txn, "taken", "postgres", "postgres")
+                .unwrap();
+        }
+        let st = std::sync::Arc::new(Storage::open(home.to_str().unwrap()).unwrap());
+        assert_eq!(gids(&st), vec!["taken".to_string()]);
+        // The prepared rows are invisible until the commit.
+        assert!(rows(&st, "t").is_empty());
+        let writer = {
+            let st = std::sync::Arc::clone(&st);
+            std::thread::spawn(move || st.insert_one("app", "t", &enc(&doc! {"_id": 9, "a": 2})))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !writer.is_finished(),
+            "the write must wait for the prepared transaction"
+        );
+        if commit {
+            st.commit_prepared("taken").unwrap();
+            let err = writer.join().unwrap().unwrap_err();
+            assert!(
+                matches!(err, StorageError::DuplicateKey(_)),
+                "expected a duplicate-key refusal, got {err:?}"
+            );
+            assert_eq!(
+                rows(&st, "t"),
+                vec![doc! {"_id": 1, "a": 1}, doc! {"_id": 2, "a": 2}]
+            );
+        } else {
+            st.rollback_prepared("taken").unwrap();
+            writer.join().unwrap().unwrap();
+            assert_eq!(rows(&st, "t"), vec![doc! {"_id": 9, "a": 2}]);
+        }
+        assert!(gids(&st).is_empty());
+        drop(st);
+        let _ = std::fs::remove_dir_all(&home);
     }
-    let st = Storage::open(home.to_str().unwrap()).unwrap();
-    st.insert_one("app", "t", &enc(&doc! {"_id": 9, "a": 2}))
-        .unwrap();
-    let err = st.commit_prepared("taken").unwrap_err();
-    assert!(
-        matches!(err, StorageError::DuplicateKey(_)),
-        "expected a duplicate-key refusal, got {err:?}"
-    );
-    assert_eq!(rows(&st, "t"), vec![doc! {"_id": 9, "a": 2}]);
-    assert_eq!(gids(&st), vec!["taken".to_string()]);
-    st.rollback_prepared("taken").unwrap();
-    assert!(gids(&st).is_empty());
-    drop(st);
-    let _ = std::fs::remove_dir_all(&home);
 }

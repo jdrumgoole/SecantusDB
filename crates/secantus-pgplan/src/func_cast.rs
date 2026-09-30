@@ -231,7 +231,24 @@ pub(crate) fn rewrite(node: &mut N) {
             for (n, _, _) in node.nodes_mut() {
                 use pg_query::NodeMut as M;
                 replaced = match n {
-                    M::ResTarget(r) => fix_box(&mut (*r).val),
+                    M::ResTarget(r) => {
+                        let rt = &mut *r;
+                        // A call-form cast keeps the FUNCTION's name as its
+                        // output column (`text(a)` is `text`), where the cast
+                        // it becomes would be named after its operand.
+                        if rt.name.is_empty() {
+                            if let Some(N::FuncCall(f)) =
+                                rt.val.as_deref().and_then(|v| v.node.as_ref())
+                            {
+                                if cast_target(f).is_some() {
+                                    if let Some(name) = func_name(f) {
+                                        rt.name = name;
+                                    }
+                                }
+                            }
+                        }
+                        fix_box(&mut rt.val)
+                    }
                     M::AExpr(e) => fix_box(&mut (*e).lexpr) || fix_box(&mut (*e).rexpr),
                     M::BoolExpr(e) => fix_all(&mut (*e).args),
                     M::FuncCall(f) => fix_all(&mut (*f).args),

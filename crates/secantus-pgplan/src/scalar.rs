@@ -204,24 +204,61 @@ const SCALAR_NAMES: &[&str] = &[
     "encode",
     "decode",
     "now",
+    // The planner's own: an inet / cidr value's order key (`enum_order`).
+    "__net_sortkey",
+    "__net_op",
+    "__net_arith",
+    "__net_diff",
+    "__coll_key",
+    "__coll_keyv",
+    "__coll_value",
     "transaction_timestamp",
     "statement_timestamp",
     "clock_timestamp",
 ];
 
-/// The current instant as a stored `timestamptz` value.
-///
-/// PostgreSQL's `now()` is the TRANSACTION's start time and
-/// `statement_timestamp()` the statement's; this planner evaluates a
-/// constant when it plans the statement, so all four clocks read the
-/// statement's own time. A transaction that reads `now()` twice sees two
-/// values where PostgreSQL shows one.
-pub fn now_value() -> Bson {
-    let micros = std::time::SystemTime::now()
+thread_local! {
+    /// `(transaction start, statement start)` in Unix microseconds, as the
+    /// executor installs them per statement (`set_clocks`).
+    static CLOCKS: std::cell::Cell<Option<(i64, i64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Install the transaction's and the statement's start for the statements
+/// that follow on this thread.
+pub fn set_clocks(transaction_start: i64, statement_start: i64) {
+    CLOCKS.with(|c| c.set(Some((transaction_start, statement_start))));
+}
+
+/// The wall clock, in Unix microseconds.
+pub fn wall_micros() -> i64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
+
+/// `now()`: the TRANSACTION's start, as PostgreSQL has it -- also
+/// `transaction_timestamp()`, `CURRENT_TIMESTAMP` and the `'now'` literal,
+/// so two reads in one transaction agree. Before the executor installed a
+/// clock, the wall clock.
+pub fn now_value() -> Bson {
+    let micros = CLOCKS
+        .with(|c| c.get())
+        .map_or_else(wall_micros, |(t, _)| t);
     crate::timestamptz_value_from_micros(micros)
+}
+
+/// `statement_timestamp()`: the statement's start.
+fn statement_value() -> Bson {
+    let micros = CLOCKS
+        .with(|c| c.get())
+        .map_or_else(wall_micros, |(_, s)| s);
+    crate::timestamptz_value_from_micros(micros)
+}
+
+/// `clock_timestamp()`: the wall clock, which moves within a statement.
+fn clock_value() -> Bson {
+    crate::timestamptz_value_from_micros(wall_micros())
 }
 
 pub(crate) fn text(v: &Bson) -> String {
@@ -605,6 +642,16 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
     // Every other built-in sees an array's elements, not its lower bounds.
     if args.iter().any(crate::arrays::is_bounded) {
         let plain: Vec<Bson> = args.iter().map(crate::arrays::strip).collect();
+        // `greatest` / `least` answer one of their ARGUMENTS, bounds and all:
+        // compared by their elements, returned as given.
+        if matches!(name, "greatest" | "least") {
+            return eval(name, &plain).map(|out| {
+                plain
+                    .iter()
+                    .position(|p| *p == out)
+                    .map_or(out, |i| args[i].clone())
+            });
+        }
         return eval(name, &plain);
     }
     if let Some(out) = crate::fts::call(name, args) {
@@ -649,9 +696,55 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
     };
 
     match name {
-        "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp" => {
+        "now" | "transaction_timestamp" => {
             need(0)?;
             Ok(now_value())
+        }
+        "__net_op" => {
+            need(3)?;
+            match (arg(1), arg(2)) {
+                (Bson::Null, _) | (_, Bson::Null) => Ok(Bson::Null),
+                (l, r) => crate::net::containment(&s(0), &text(&l), &text(&r))
+                    .unwrap_or_else(|| Err(Error::Internal("not a network operator".into())))
+                    .map(Bson::Boolean),
+            }
+        }
+        "__net_arith" => {
+            // (op, left or NULL for the prefix `~`, right)
+            need(3)?;
+            let left = if s(0) == "~" { None } else { Some(arg(1)) };
+            crate::net::arith(&s(0), left.as_ref(), &arg(2))
+        }
+        "__coll_key" => {
+            need(2)?;
+            crate::collation::sort_key(&s(0), &s(1)).map(Bson::String)
+        }
+        "__coll_keyv" => {
+            need(2)?;
+            crate::collation::sort_key_with_value(&s(0), &s(1)).map(Bson::String)
+        }
+        "__coll_value" => {
+            need(1)?;
+            Ok(Bson::String(crate::collation::key_value(&s(0))))
+        }
+        "__net_diff" => {
+            need(2)?;
+            crate::net::diff(&arg(0), &arg(1))
+        }
+        "__net_sortkey" => {
+            need(1)?;
+            Ok(match arg(0) {
+                Bson::Null => Bson::Null,
+                v => crate::net::sort_key(&text(&v)).map_or(Bson::Null, Bson::String),
+            })
+        }
+        "statement_timestamp" => {
+            need(0)?;
+            Ok(statement_value())
+        }
+        "clock_timestamp" => {
+            need(0)?;
+            Ok(clock_value())
         }
         "similar_to_escape" | "similar_escape" => {
             let esc = if args.len() > 1 { Some(s(1)) } else { None };
@@ -1570,6 +1663,10 @@ fn format_type_call(args: &[Bson]) -> Result<Bson> {
 
 /// `format_type`'s rendering: the display name, with the declared width or
 /// precision put back on when the modifier carries one.
+pub(crate) fn format_type_text_public(name: &str, typmod: Option<i32>) -> String {
+    format_type_text(name, typmod)
+}
+
 pub(crate) fn format_type_text(name: &str, typmod: Option<i32>) -> String {
     let display = crate::display_type(name);
     let Some(typmod) = typmod.filter(|m| *m >= 4) else {
@@ -1761,7 +1858,7 @@ fn simple_upper(c: char) -> char {
 }
 
 /// One character's SIMPLE lowercase; `İ` (U+0130) is `i`, as towlower has it.
-fn simple_lower(c: char) -> char {
+pub(crate) fn simple_lower(c: char) -> char {
     if c == '\u{130}' {
         return 'i';
     }
@@ -2043,8 +2140,14 @@ pub fn md5_hex(data: &[u8]) -> String {
 /// input and fall back to text only when unknown, which is also what an
 /// untyped output column defaults to.
 pub fn static_result_type(name: &str) -> &'static str {
-    if name == "secantus_hash_partition" {
+    if name == "secantus_hash_partition" || name == "__net_op" {
         return "bool";
+    }
+    if name == "__net_arith" {
+        return "inet";
+    }
+    if name == "__net_diff" {
+        return "int8";
     }
     if let Some(t) = crate::correlated::executor_function_type(name) {
         return t;

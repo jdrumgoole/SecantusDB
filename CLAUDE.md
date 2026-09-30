@@ -524,14 +524,26 @@ one request path:
       Matching the `C` cluster instead would break against every UTF-8-locale
       server.
 
-    **What remains refused** (re-measured 2026-09-30, after batch 10):
-    `CREATE CAST` / `COLLATION` / `RULE` / `EVENT TRIGGER`, foreign data
-    wrappers (`CREATE FOREIGN DATA WRAPPER`, `IMPORT FOREIGN SCHEMA`), a
-    partition's own column options in `PARTITION OF (...)`, and pgcrypto's
-    `pgp_*`. Batch 10 landed `CREATE AGGREGATE` / `OPERATOR` / `STATISTICS`
-    / `PUBLICATION` / `TABLESPACE`, `SECURITY LABEL`, `INHERITS`, `PARTITION
-    BY HASH`, `pg_trgm`, `ALTER VIEW`, `ADD COLUMN ... serial` and partial-
-    index `ON CONFLICT` arbiters.
+    **What remains refused** (re-measured 2026-09-30, after batch 11): no
+    statement the earlier surveys listed. Batch 11 landed `CREATE CAST` /
+    `COLLATION` / `RULE` / `EVENT TRIGGER`, the foreign-data statements
+    (a foreign table refuses reads with PostgreSQL's own `55000`, since no
+    FDW handler exists here), pgcrypto's `pgp_*`, callable `LANGUAGE
+    internal` wrappers, and `pg_get_viewdef` / `pg_rules` / `pg_get_expr` in
+    ruleutils' own layout (`secantus-pgplan/src/ruleutils.rs`). A
+    partition's own column options in `PARTITION OF (...)` work (re-measured;
+    an earlier version of this paragraph still listed them). What each
+    leaves is in `tasks/backlog.md`'s batch 9 / 10 / 11 entries.
+
+    **Two batch-11 lessons:**
+    - **Both reference servers' OpenSSL 3 builds lack Blowfish and CAST5**,
+      so PostgreSQL itself cannot check those pgcrypto ciphers here. GnuPG
+      was the reference for them; do not "fix" them to agree with a PG error.
+    - **ruleutils prints the ANALYSED query.** Which casts appear depends on
+      the operators PostgreSQL resolves (`text = name` is an operator of its
+      own; `varchar = varchar` is `text = text`, casting both sides). The
+      printer falls back to the text as written rather than guess, and every
+      rule it knows was measured against PostgreSQL 15 on a corpus.
 
     **Two batch-10 lessons worth not re-deriving:**
     - **Operators resolve by TYPE, at plan time.** A comparison across type

@@ -1,3 +1,4 @@
+# reference-version: 15
 SELECT to_tsvector('french', 'Les chats mangeaient des souris dans la maison abandonnée')
 SELECT to_tsquery('french', 'chat')
 SELECT to_tsvector('german', 'Die Katzen fraßen Mäuse in den verlassenen Häusern')

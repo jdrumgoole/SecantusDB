@@ -5,7 +5,7 @@
 //!
 //! `crypt` / `gen_salt` cover the four algorithms pgcrypto has: `bf`
 //! (bcrypt, `$2a$`), `md5` (`$1$`), `xdes` (BSDi extended DES, `_`) and `des`
-//! (traditional two-character salt). The PGP functions are not here.
+//! (traditional two-character salt). The PGP functions are in `pgp`.
 
 use super::*;
 
@@ -13,12 +13,19 @@ use super::*;
 pub const FUNCTIONS: &[&str] = &["digest", "hmac", "crypt", "gen_salt", "gen_random_bytes"];
 
 pub fn is_function(name: &str) -> bool {
-    FUNCTIONS.contains(&name) && extension_installed("pgcrypto")
+    (FUNCTIONS.contains(&name)
+        || crate::pgp::FUNCTIONS.contains(&name)
+        || crate::pgcrypto_raw::FUNCTIONS.contains(&name)
+        || crate::pgp_pub::FUNCTIONS.contains(&name))
+        && extension_installed("pgcrypto")
 }
 
 pub fn result_type(name: &str) -> Option<&'static str> {
     if !is_function(name) {
         return None;
+    }
+    if let Some(t) = crate::pgp::result_type(name).or_else(|| crate::pgp_pub::result_type(name)) {
+        return Some(t);
     }
     Some(match name {
         "crypt" | "gen_salt" => "text",
@@ -207,6 +214,15 @@ fn crypt(password: &str, salt: &str) -> Result<String> {
 pub fn call(name: &str, args: &[Bson]) -> Option<Result<Bson>> {
     if !is_function(name) {
         return None;
+    }
+    if let Some(out) = crate::pgp::call(name, args) {
+        return Some(out);
+    }
+    if let Some(out) = crate::pgcrypto_raw::call(name, args) {
+        return Some(out);
+    }
+    if let Some(out) = crate::pgp_pub::call(name, args) {
+        return Some(out);
     }
     if args.contains(&Bson::Null) {
         return Some(Ok(Bson::Null));

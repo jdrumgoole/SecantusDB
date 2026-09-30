@@ -103,6 +103,7 @@ pub(crate) fn pg_collation_def() -> TableDef {
             Column::new("collencoding", "int4", false),
             Column::new("collcollate", "text", false),
             Column::new("collctype", "text", false),
+            Column::new("colliculocale", "text", false),
         ],
     )
 }
@@ -311,6 +312,7 @@ impl PgHandler {
             d.insert(f("collencoding"), Bson::Int32(encoding));
             d.insert(f("collcollate"), collate);
             d.insert(f("collctype"), ctype);
+            d.insert(f("colliculocale"), Bson::Null);
             d
         })
         .collect()
@@ -318,11 +320,14 @@ impl PgHandler {
 
     pub(crate) fn pg_policy_rows(&self, def: &TableDef) -> Vec<Document> {
         let f = |name: &str| def.field_of(name).expect("column");
-        let render = |v: Option<&str>| -> Bson {
+        let render = |table: &str, v: Option<&str>| -> Bson {
             match v {
                 None => Bson::Null,
                 Some(e) => Bson::String(
-                    secantus_pgplan::generation_expression(e).unwrap_or_else(|| e.to_string()),
+                    self.lookup(table)
+                        .and_then(|t| secantus_pgplan::ruleutils::expr_def(e, &t))
+                        .or_else(|| secantus_pgplan::generation_expression(e))
+                        .unwrap_or_else(|| e.to_string()),
                 ),
             }
         };
@@ -367,8 +372,8 @@ impl PgHandler {
                     })
                     .unwrap_or_else(|_| vec![Bson::Int64(0)]);
                 d.insert(f("polroles"), polroles);
-                d.insert(f("polqual"), render(p.get_str("using").ok()));
-                d.insert(f("polwithcheck"), render(p.get_str("check").ok()));
+                d.insert(f("polqual"), render(table, p.get_str("using").ok()));
+                d.insert(f("polwithcheck"), render(table, p.get_str("check").ok()));
                 d
             })
             .collect()
@@ -724,7 +729,7 @@ impl PgHandler {
                                 Bson::Int32(table.map_or(0, |t| t.check_constraints.len() as i32))
                             }
                             // A view is its `_RETURN` rule.
-                            "relhasrules" => Bson::Boolean(kind == "v"),
+                            "relhasrules" => Bson::Boolean(kind == "v" || self.has_rules(&relname)),
                             // A FOREIGN KEY is enforced by RI triggers on
                             // BOTH tables, so either side has triggers --
                             // which is what makes psql print its FK footers.
@@ -751,7 +756,8 @@ impl PgHandler {
                             ),
                             "relisshared" => Bson::Boolean(false),
                             "relpages" | "relallvisible" => Bson::Int32(0),
-                            "reloptions" | "relacl" => Bson::Null,
+                            "relacl" => self.relation_acl(&relname, &kind),
+                            "reloptions" => Bson::Null,
                             _ => Bson::Int64(0),
                         }
                     }
@@ -796,7 +802,24 @@ impl PgHandler {
                                     None => String::new(),
                                 })
                             }
-                            "attcollation" => Bson::Int64(type_collation(type_oid)),
+                            // A column's own COLLATE, else its type's.
+                            "attcollation" => {
+                                let table = table_by_oid(int(get(row, "attrelid")));
+                                let attname = text(get(row, "attname"));
+                                let declared =
+                                    table.and_then(|t| t.column(&attname)).and_then(|col| {
+                                        col.extra.get_str("collation").ok().map(str::to_string)
+                                    });
+                                match declared {
+                                    Some(name) => Bson::Int64(
+                                        secantus_pgplan::regobj::collation_names()
+                                            .into_iter()
+                                            .find(|(n, _)| *n == name)
+                                            .map_or_else(|| type_collation(type_oid), |(_, o)| o),
+                                    ),
+                                    None => Bson::Int64(type_collation(type_oid)),
+                                }
+                            }
                             "attlen" => Bson::Int32(match type_oid {
                                 16 | 18 => 1,
                                 21 => 2,
