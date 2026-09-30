@@ -47,18 +47,27 @@ reports zero divergences.
   `wtimeout`, `provenance`) and sits before `ok`; a write whose `w` names an
   unknown tag runs and then reports 79, instead of being refused.
 - `drop` reports the collection's real index count as `nIndexesWas`.
+- SASL errors match mongod (`Authentication failed.`, 334 for an unknown
+  mechanism, 17 with no conversation), and `usersInfo {forAllDBs: true}` lists
+  every user instead of none.
 - A document that fails its validator gets mongod's full explanation in
   `errInfo.details`: every broken `$jsonSchema` rule in mongod's order, and
   every failing query clause, where it used to get `{operatorName: "$jsonSchema"}`.
 
 #### Added
 
+- **SCRAM-SHA-1 on the Rust server**, created for every user by default next to
+  SCRAM-SHA-256 as mongod 8.2 does; `hello`'s `saslSupportedMechs` names the
+  user's own mechanisms.
+- **The localhost exception**: a fresh `--auth` Rust server lets a loopback
+  connection create the first user, as mongod does. It refused every
+  `createUser`, so it could never be given one.
 - Decimal128 operands for `$pow`, `$atan2` and `$bucketAuto` `granularity`,
   correctly rounded and with mongod's special values and quanta.
 - A multi-field filter rides a single-field index on one of its fields, and a
   sort under an unindexed filter walks the sort index -- the plans mongod picks.
 - Probes: `max_time_expiry.py`, `int32_arguments.py`, `nested_value_sort.py`,
-  `bucket_auto_granularity.py`, `validation_error_details.py`;
+  `bucket_auto_granularity.py`, `validation_error_details.py`, `scram_auth.py`;
   `index_result_sets.py` now covers empty filters, compound sorts, hints,
   partial compound indexes and array / document bounds.
 

@@ -4,8 +4,9 @@
 //! connection handshake. Faithful ports of `commands.py::_hello` / `_ping` /
 //! `_build_info`.
 //!
-//! **Deferred to R5 (auth):** `saslSupportedMechs` resolution,
-//! `speculativeAuthenticate` (folding a SCRAM client-first into `hello`), and
+//! `saslSupportedMechs` lists the queried user's own SCRAM mechanisms.
+//! **Deferred:** `speculativeAuthenticate` (folding a SCRAM client-first into
+//! `hello`), and
 //! stashing the driver's `client` metadata into the connection registry for
 //! `currentOp`. The non-auth handshake path — the default, and what most
 //! conformance suites exercise — is complete here.
@@ -155,13 +156,20 @@ pub fn hello(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
 
     // `saslSupportedMechs: "<db>.<user>"` — drivers ask which mechanisms to
-    // attempt for a principal. We only implement SCRAM-SHA-256, so advertise
-    // exactly that (mongod lists whatever the user's credentials carry).
-    if doc.get_str("saslSupportedMechs").is_ok() {
-        response.insert(
-            "saslSupportedMechs",
-            vec![Bson::String("SCRAM-SHA-256".to_string())],
-        );
+    // attempt for a principal. mongod 8.2.11 lists the user's own SCRAM
+    // mechanisms, OMITS the field for an unknown user, and refuses a name with
+    // no `.` (measured 2026-09-30). This always said `["SCRAM-SHA-256"]`.
+    if let Ok(principal) = doc.get_str("saslSupportedMechs") {
+        let Some((db, user)) = principal.split_once('.') else {
+            return Err(CommandError::new(
+                2,
+                "BadValue",
+                "UserName must contain a '.' separated database.user pair",
+            ));
+        };
+        if let Some(mechs) = user_scram_mechanisms(ctx, db, user) {
+            response.insert("saslSupportedMechs", mechs);
+        }
     }
 
     Ok(response)
@@ -277,6 +285,21 @@ pub fn build_info(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
         "maxBsonObjectSize": MAX_BSON_OBJECT_SIZE,
         "ok": 1.0,
     })
+}
+
+/// The SCRAM mechanisms a stored user can authenticate with, in mongod's
+/// order, or `None` when there is no such user.
+fn user_scram_mechanisms(ctx: &CommandContext, db: &str, user: &str) -> Option<Vec<Bson>> {
+    let bytes = ctx.storage.as_deref()?.get_user(db, user).ok()??;
+    let record = Document::from_reader(&mut bytes.as_slice()).ok()?;
+    let creds = record.get_document("credentials").ok();
+    Some(
+        ["SCRAM-SHA-1", "SCRAM-SHA-256"]
+            .into_iter()
+            .filter(|m| creds.is_some_and(|c| c.contains_key(*m)))
+            .map(|m| Bson::String(m.to_string()))
+            .collect(),
+    )
 }
 
 #[cfg(test)]

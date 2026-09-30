@@ -6,8 +6,9 @@
 //! handlers (`saslStart` / `saslContinue` / `createUser` / …), user storage,
 //! and per-connection auth state wire this in (R5b+).
 //!
-//! **Scope:** SCRAM-SHA-256 only (the modern driver default). SCRAM-SHA-1 (with
-//! MongoDB's legacy MD5 prepass) and MONGODB-X509 (TLS, R5 tail) are deferred.
+//! **Scope:** SCRAM-SHA-256 (the modern driver default) and SCRAM-SHA-1, with
+//! MongoDB's legacy MD5 password prepass -- mongod 8.2 still creates both for
+//! every user by default and authenticates either (measured 2026-09-30).
 //!
 //! **`saslprep`:** RFC 4013 SASLprep is applied to every password (mapping
 //! table B.1 → nothing and C.1.2 → ASCII space, NFKC normalisation, the
@@ -29,6 +30,87 @@ const NONCE_BYTES: usize = 24;
 const SALT_BYTES: usize = 28;
 
 type HmacSha256 = Hmac<Sha256>;
+type HmacSha1 = Hmac<sha1::Sha1>;
+
+/// MongoDB's default SCRAM-SHA-1 iteration count (mongod 8.2.11 stores 10000).
+pub const DEFAULT_ITERATIONS_SHA1: u32 = 10_000;
+/// Salt length in bytes for SCRAM-SHA-1 (mongod stores 16).
+const SALT_BYTES_SHA1: usize = 16;
+
+/// Which SCRAM hash a conversation runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mechanism {
+    Sha1,
+    #[default]
+    Sha256,
+}
+
+impl Mechanism {
+    /// The SASL mechanism name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Mechanism::Sha1 => "SCRAM-SHA-1",
+            Mechanism::Sha256 => "SCRAM-SHA-256",
+        }
+    }
+
+    /// The mechanism a SASL name selects, if it is one of these.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "SCRAM-SHA-1" => Some(Mechanism::Sha1),
+            "SCRAM-SHA-256" => Some(Mechanism::Sha256),
+            _ => None,
+        }
+    }
+
+    fn hmac(self, key: &[u8], msg: &[u8]) -> Vec<u8> {
+        match self {
+            Mechanism::Sha1 => {
+                let mut mac = HmacSha1::new_from_slice(key).expect("HMAC accepts any key length");
+                mac.update(msg);
+                mac.finalize().into_bytes().to_vec()
+            }
+            Mechanism::Sha256 => hmac(key, msg),
+        }
+    }
+
+    fn hash(self, data: &[u8]) -> Vec<u8> {
+        match self {
+            Mechanism::Sha1 => sha1::Sha1::digest(data).to_vec(),
+            Mechanism::Sha256 => Sha256::digest(data).to_vec(),
+        }
+    }
+}
+
+/// Derive SCRAM-SHA-1 credentials as MongoDB does.
+///
+/// SCRAM-SHA-1 in MongoDB hashes a PREPASS of the password, not the password:
+/// `hex(MD5("<username>:mongo:<password>"))`, with no SASLprep -- which is why
+/// it needs the username. The rest is RFC 5802 over HMAC-SHA-1. `salt` /
+/// `iterations` default to a fresh 16-byte salt and 10000.
+pub fn derive_credentials_sha1(
+    username: &str,
+    password: &str,
+    iterations: Option<u32>,
+    salt: Option<Vec<u8>>,
+) -> StoredCredentials {
+    let digest = md5::Md5::digest(format!("{username}:mongo:{password}").as_bytes());
+    let prepass: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    let iterations = iterations.unwrap_or(DEFAULT_ITERATIONS_SHA1);
+    let salt = salt.unwrap_or_else(|| {
+        let bytes: [u8; SALT_BYTES_SHA1] = rand::random();
+        bytes.to_vec()
+    });
+    let mut salted = [0u8; 20];
+    pbkdf2::pbkdf2_hmac::<sha1::Sha1>(prepass.as_bytes(), &salt, iterations, &mut salted);
+    let client_key = Mechanism::Sha1.hmac(&salted, b"Client Key");
+    StoredCredentials {
+        iteration_count: iterations,
+        salt,
+        stored_key: Mechanism::Sha1.hash(&client_key),
+        server_key: Mechanism::Sha1.hmac(&salted, b"Server Key"),
+    }
+}
 
 /// A SCRAM authentication failure. The `Display` text is internal; the command
 /// layer maps it to `AuthenticationFailed` (18) on the wire.
@@ -152,6 +234,8 @@ pub struct ScramState {
     /// not, for constant-time-ish behaviour, then fails — matching mongod).
     pub user_exists: bool,
     pub step: u8,
+    /// The hash this conversation runs.
+    pub mechanism: Mechanism,
 }
 
 /// Process a SCRAM client-first message → `(server-first payload, state)`.
@@ -165,7 +249,25 @@ pub fn begin_scram(
     payload: &[u8],
     creds: Option<StoredCredentials>,
 ) -> Result<(Vec<u8>, ScramState), AuthError> {
-    begin(conversation_id, db_name, payload, creds, false)
+    begin(
+        conversation_id,
+        db_name,
+        payload,
+        creds,
+        false,
+        Mechanism::Sha256,
+    )
+}
+
+/// `begin_scram` for a chosen mechanism (SCRAM-SHA-1 or SCRAM-SHA-256).
+pub fn begin_scram_with(
+    conversation_id: i32,
+    db_name: &str,
+    payload: &[u8],
+    creds: Option<StoredCredentials>,
+    mechanism: Mechanism,
+) -> Result<(Vec<u8>, ScramState), AuthError> {
+    begin(conversation_id, db_name, payload, creds, false, mechanism)
 }
 
 /// `begin_scram` as PostgreSQL's SASL exchange runs it. Two differences from
@@ -178,7 +280,7 @@ pub fn begin_scram_pg(
     payload: &[u8],
     creds: Option<StoredCredentials>,
 ) -> Result<(Vec<u8>, ScramState), AuthError> {
-    begin(0, "", payload, creds, true)
+    begin(0, "", payload, creds, true, Mechanism::Sha256)
 }
 
 fn begin(
@@ -187,6 +289,7 @@ fn begin(
     payload: &[u8],
     creds: Option<StoredCredentials>,
     postgres: bool,
+    mechanism: Mechanism,
 ) -> Result<(Vec<u8>, ScramState), AuthError> {
     let header_ok = payload.starts_with(b"n,") || (postgres && payload.starts_with(b"y,"));
     if !header_ok {
@@ -212,9 +315,14 @@ fn begin(
             // Fabricate same-shape creds so the proof step (not the lookup)
             // surfaces the failure.
             let fake: [u8; 16] = rand::random();
-            // The base64 alphabet is pure ASCII, so SASLprep never fails here.
-            let fake_creds = derive_credentials(&B64.encode(fake), None, None)
-                .expect("base64 nonce is ASCII and saslpreps cleanly");
+            let fake_creds = match mechanism {
+                Mechanism::Sha1 => {
+                    derive_credentials_sha1(&username, &B64.encode(fake), None, None)
+                }
+                // The base64 alphabet is pure ASCII, so SASLprep never fails here.
+                Mechanism::Sha256 => derive_credentials(&B64.encode(fake), None, None)
+                    .expect("base64 nonce is ASCII and saslpreps cleanly"),
+            };
             (fake_creds, false)
         }
     };
@@ -239,6 +347,7 @@ fn begin(
         server_first: server_first.clone(),
         user_exists,
         step: 1,
+        mechanism,
     };
     Ok((server_first, state))
 }
@@ -273,7 +382,8 @@ pub fn continue_scram(state: &mut ScramState, payload: &[u8]) -> Result<Vec<u8>,
     auth_message.push(b',');
     auth_message.extend_from_slice(&client_final_without_proof);
 
-    let client_signature = hmac(&state.creds.stored_key, &auth_message);
+    let mech = state.mechanism;
+    let client_signature = mech.hmac(&state.creds.stored_key, &auth_message);
     let client_proof = B64
         .decode(client_proof_b64.as_bytes())
         .map_err(|_| err("invalid SCRAM client proof encoding"))?;
@@ -285,13 +395,12 @@ pub fn continue_scram(state: &mut ScramState, payload: &[u8]) -> Result<Vec<u8>,
         .zip(client_signature.iter())
         .map(|(a, b)| a ^ b)
         .collect();
-    let expected_stored = Sha256::digest(&received_client_key);
-    if !constant_time_eq(expected_stored.as_slice(), &state.creds.stored_key) || !state.user_exists
-    {
+    let expected_stored = mech.hash(&received_client_key);
+    if !constant_time_eq(&expected_stored, &state.creds.stored_key) || !state.user_exists {
         return Err(err("authentication failed"));
     }
 
-    let server_signature = hmac(&state.creds.server_key, &auth_message);
+    let server_signature = mech.hmac(&state.creds.server_key, &auth_message);
     state.step = 2;
     Ok(format!("v={}", B64.encode(server_signature)).into_bytes())
 }
@@ -381,6 +490,64 @@ mod tests {
         let bare = format!("n={user},r={nonce}").into_bytes();
         let full = format!("n,,n={user},r={nonce}").into_bytes();
         (full, bare)
+    }
+
+    /// mongod 8.2.11 created `u1` / `pw1` in db `test` with exactly these
+    /// SCRAM-SHA-1 credentials (2026-09-30): same salt in, same keys out.
+    #[test]
+    fn sha1_credentials_match_mongod() {
+        let salt = B64.decode("WlrBYkBIEQW18rHAvVs0eA==").unwrap();
+        let c = derive_credentials_sha1("u1", "pw1", Some(10_000), Some(salt));
+        assert_eq!(c.stored_key_b64(), "s1cOJsQyE9gRUkoI/xjo1iKE9iU=");
+        assert_eq!(c.server_key_b64(), "WKe+iyriDFtgbTCyrB5qYkt4NxQ=");
+    }
+
+    /// A SCRAM-SHA-1 client, as a driver runs it: the MD5 prepass, then RFC 5802.
+    fn client_final_sha1(
+        user: &str,
+        password: &str,
+        server_first: &[u8],
+        client_first_bare: &[u8],
+    ) -> Vec<u8> {
+        let attrs = parse_attrs(server_first);
+        let combined_nonce = attrs.get("r").unwrap().clone();
+        let salt = B64.decode(attrs.get("s").unwrap()).unwrap();
+        let iters: u32 = attrs.get("i").unwrap().parse().unwrap();
+        let digest = md5::Md5::digest(format!("{user}:mongo:{password}").as_bytes());
+        let prepass: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        let mut salted = [0u8; 20];
+        pbkdf2::pbkdf2_hmac::<sha1::Sha1>(prepass.as_bytes(), &salt, iters, &mut salted);
+        let client_key = Mechanism::Sha1.hmac(&salted, b"Client Key");
+        let stored_key = Mechanism::Sha1.hash(&client_key);
+        let without_proof = format!("c=biws,r={combined_nonce}");
+        let mut auth_message = client_first_bare.to_vec();
+        auth_message.push(b',');
+        auth_message.extend_from_slice(server_first);
+        auth_message.push(b',');
+        auth_message.extend_from_slice(without_proof.as_bytes());
+        let sig = Mechanism::Sha1.hmac(&stored_key, &auth_message);
+        let proof: Vec<u8> = client_key
+            .iter()
+            .zip(sig.iter())
+            .map(|(a, b)| a ^ b)
+            .collect();
+        format!("{without_proof},p={}", B64.encode(proof)).into_bytes()
+    }
+
+    #[test]
+    fn sha1_roundtrip_succeeds_and_rejects_a_wrong_password() {
+        let creds = derive_credentials_sha1("bob", "pw", None, None);
+        for (password, ok) in [("pw", true), ("nope", false)] {
+            let (first, bare) = client_first("bob", "nonceSHA1");
+            let (server_first, mut state) =
+                begin_scram_with(1, "admin", &first, Some(creds.clone()), Mechanism::Sha1).unwrap();
+            let cf = client_final_sha1("bob", password, &server_first, &bare);
+            assert_eq!(
+                continue_scram(&mut state, &cf).is_ok(),
+                ok,
+                "password {password}"
+            );
+        }
     }
 
     #[test]

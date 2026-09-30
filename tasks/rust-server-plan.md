@@ -403,8 +403,8 @@ handle, `port=0`, `tmp_path`) in CI / on a WT-capable machine.
       `hello`/`getParameter` advertise `MONGODB-X509` alongside SCRAM-SHA-256.
       4 unit tests (X509-only createUser, cert auth, SCRAM-only + DN-mismatch
       rejection, legacy authenticate). **This closes R5 (auth) bar SCRAM-SHA-1.**
-      SCRAM-SHA-1 (legacy MD5 prepass) remains deferred — low priority, no modern
-      driver defaults to it.
+      SCRAM-SHA-1 (legacy MD5 prepass) shipped 2026-09-30 -- see
+      `tasks/backlog.md` §7.00.
     Then the tailable change-stream getMore + storage-backed aggregation stages,
     and **R7/R8** (standalone `secantusdb` binary + the full pymongo conformance
     gate against the Rust server).

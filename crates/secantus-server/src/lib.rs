@@ -494,7 +494,9 @@ fn handle_connection(tcp: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
     // Per-connection auth state, shared across every request on this socket so a
     // SCRAM conversation (saslStart → saslContinue) and the authenticated
     // principals persist for the connection's lifetime.
-    let conn_auth = Arc::new(Mutex::new(ConnectionAuth::new()));
+    let mut auth_state = ConnectionAuth::new();
+    auth_state.peer_loopback = tcp.peer_addr().is_ok_and(|a| a.ip().is_loopback());
+    let conn_auth = Arc::new(Mutex::new(auth_state));
 
     match shared.tls.clone() {
         Some(tls_config) => {

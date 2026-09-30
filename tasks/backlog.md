@@ -3559,8 +3559,8 @@ These are explicit non-goals. Don't add them without a reason.
       `commitTransaction` itself and converts the NotPrimary family into a
       client-side exception, so a pymongo-driven probe measures the driver.
 
-- [ ] **FIXED on the Rust server (2026-09-30); still OPEN on the Python
-      server.** Rust now sends `errInfo.writeConcern` with the client's `w`,
+- [ ] **OPEN on the Python server; fixed on the Rust server
+      (2026-09-30).** Rust now sends `errInfo.writeConcern` with the client's `w`,
       its `j` if given, `wtimeout` (0 when absent) and `provenance:
       "clientSupplied"`, places `writeConcernError` before `ok`, and runs a
       write whose `w` names an unknown tag (79 afterwards, not a pre-flight
@@ -6969,6 +6969,17 @@ are the probes' own numbers.
   (`max_time_expiry.py` 0 of 11); a multi-field filter riding one
   single-field index, and a sort under an unindexed filter walking the sort
   index (mongod's two plans).
+- [x] **Round 3 -- authentication:** SCRAM-SHA-1 (MongoDB's MD5 prepass;
+  created by default alongside SCRAM-SHA-256; credentials byte-identical to a
+  mongod-created user's); `hello`'s `saslSupportedMechs` lists the user's own
+  mechanisms and omits an unknown user; a mechanism the user lacks is 334. The
+  LOCALHOST EXCEPTION: a fresh `--auth` server refused every `createUser`, so it
+  could never be given a user -- mongod lets a loopback connection create the
+  first one, and keeps the exception closed for the process once any user has
+  existed. SASL errors are mongod's (`Authentication failed.`, 334 for an
+  unknown mechanism, 17 for no conversation), `Command X requires
+  authentication` is capitalised, and `usersInfo {forAllDBs: true}` answered
+  `[]`. `tools/probes/scram_auth.py` 0 of 26.
 - [x] **Round 2:** `writeConcernError` carries mongod's `errInfo` and sits
   before `ok`, and an unknown `w` tag writes then reports 79; `drop` answers
   the real `nIndexesWas` in mongod's field order; document-validation
@@ -9895,7 +9906,11 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   `$external`/admin, require an X509 credential, and auth without a password;
   hello/getParameter advertise MONGODB-X509. 4 unit tests. **This closes R5 (auth)
   bar SCRAM-SHA-1** (legacy MD5 prepass — deferred, low priority). Deferred:
-  non-ASCII SASLprep.
+  non-ASCII SASLprep. **SCRAM-SHA-1 SHIPPED 2026-09-30** (see §7.00): created
+  by default with SCRAM-SHA-256 as mongod 8.2 does, byte-identical credentials
+  (pinned against a mongod-created user), plus the localhost exception, mongod's
+  SASL error surface and `usersInfo {forAllDBs}`. `tools/probes/scram_auth.py`
+  0 of 26.
 - [x] **R4b — WiredTiger storage adapter** (`crates/secantus-storage-adapter`,
   `StorageAdapter`): CI-green (rust-storage builds it against vendored WT;
   `Send + Sync` confirmed). Bytes at the seam, `Hint` from `RawHint`, `map_err`.

@@ -1107,6 +1107,16 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest 0.10.7",
+]
+
+[[package]]
+name = "md-5"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69b6441f590336821bb897fb28fc622898ccceb1d6cea3fde5ea86b090c4de98"
@@ -1374,7 +1384,7 @@ dependencies = [
  "bytes",
  "fallible-iterator",
  "hmac 0.13.0",
- "md-5",
+ "md-5 0.11.0",
  "memchr",
  "rand 0.10.2",
  "sha2 0.11.0",
@@ -1792,8 +1802,10 @@ version = "0.5.3-beta.165"
 dependencies = [
  "base64",
  "hmac 0.12.1",
+ "md-5 0.10.6",
  "pbkdf2",
  "rand 0.9.5",
+ "sha1",
  "sha2 0.10.9",
  "stringprep",
  "subtle",
@@ -1846,6 +1858,7 @@ dependencies = [
  "pg_query",
  "regex",
  "secantus-pgcatalog",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -1857,6 +1870,7 @@ dependencies = [
  "bytes",
  "ctrlc",
  "futures",
+ "pg_query",
  "pgwire",
  "postgres-types",
  "rand 0.9.5",
@@ -1865,6 +1879,7 @@ dependencies = [
  "secantus-pgcatalog",
  "secantus-pgplan",
  "secantus-storage",
+ "serde_json",
  "tokio",
 ]
 
@@ -1992,6 +2007,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest 0.10.7",
 ]
 
 [[package]]

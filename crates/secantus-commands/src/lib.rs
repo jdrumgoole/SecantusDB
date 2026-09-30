@@ -1744,6 +1744,35 @@ fn attach_cluster_time_gossip(req: &Document, reply: &mut Document, ctx: &Comman
     }
 }
 
+/// mongod's LOCALHOST EXCEPTION: while no user exists, a connection from a
+/// loopback address may create the first one, on `admin`. Without it a fresh
+/// `--auth` server could never be given a user -- every `createUser` answered
+/// 13, where mongod 8.2.11 accepts it (measured 2026-09-30; a second
+/// `createUser`, once a user exists, is 13 there too).
+fn localhost_exception(name: &str, ctx: &CommandContext) -> bool {
+    if name != "createUser" || ctx.db_name != "admin" {
+        return false;
+    }
+    let loopback = ctx
+        .conn_auth
+        .as_ref()
+        .is_some_and(|a| a.lock().unwrap_or_else(|e| e.into_inner()).peer_loopback);
+    if !loopback || ctx.server_params.as_ref().is_some_and(|p| p.users_seen()) {
+        return false;
+    }
+    let none_stored = ctx
+        .storage
+        .as_deref()
+        .and_then(|s| s.list_users(None, 0, 1).ok())
+        .is_some_and(|users| users.is_empty());
+    if !none_stored {
+        if let Some(p) = &ctx.server_params {
+            p.mark_users_seen();
+        }
+    }
+    none_stored
+}
+
 /// `--auth` gating + RBAC privilege check (`commands.py::dispatch`). A no-op when
 /// `require_auth` is off (default-allow). When on: any command outside
 /// [`is_pre_auth_command`] requires an authenticated principal (`Unauthorized`,
@@ -1765,10 +1794,14 @@ fn authorize(name: &str, doc: &Document, ctx: &CommandContext) -> Result<(), Com
         .unwrap_or(false);
 
     if !is_pre_auth_command(name) && !authenticated {
+        if localhost_exception(name, ctx) {
+            return Ok(());
+        }
         return Err(CommandError::new(
             13,
             "Unauthorized",
-            format!("command {name} requires authentication"),
+            // mongod's capitalisation (8.2.11).
+            format!("Command {name} requires authentication"),
         ));
     }
 
@@ -2473,13 +2506,19 @@ mod tests {
         // Without the field, hello doesn't volunteer mechanisms.
         let plain = dispatch(&doc! {"hello": 1}, &mut ctx());
         assert!(plain.get("saslSupportedMechs").is_none());
-        // With saslSupportedMechs: "<db>.<user>", advertise SCRAM-SHA-256.
+        // For a user that does not exist mongod OMITS the field (8.2.11); a
+        // stored user's own mechanisms are pinned in `auth::tests`.
         let reply = dispatch(
             &doc! {"hello": 1, "saslSupportedMechs": "admin.alice"},
             &mut ctx(),
         );
-        let mechs = reply.get_array("saslSupportedMechs").unwrap();
-        assert_eq!(mechs, &vec![Bson::String("SCRAM-SHA-256".into())]);
+        assert!(reply.get("saslSupportedMechs").is_none());
+        // A name with no `.` is refused.
+        let bad = dispatch(
+            &doc! {"hello": 1, "saslSupportedMechs": "alice"},
+            &mut ctx(),
+        );
+        assert_eq!(bad.get_i32("code").unwrap(), 2);
     }
 
     #[test]
