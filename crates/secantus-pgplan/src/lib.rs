@@ -50,6 +50,7 @@ pub mod regobj;
 pub mod rls;
 mod rowsfrom;
 pub mod trgm;
+pub mod user_casts;
 pub use correlated::set_user_functions;
 pub use correlated::{
     with_correlated_runner, with_function_hook, with_sequence_hook, FnResult, UserFn,
@@ -504,6 +505,14 @@ pub enum Statement {
     Sequence(&'static str, Vec<Statement>),
     /// `CREATE OPERATOR` (see `user_ops`).
     CreateOperator(user_ops::UserOperator),
+    /// `CREATE CAST` (see `user_casts`).
+    CreateCast(user_casts::UserCast),
+    /// `DROP CAST [IF EXISTS] (source AS target)`.
+    DropCast {
+        source: String,
+        target: String,
+        if_exists: bool,
+    },
     /// `DROP OPERATOR [IF EXISTS] name (left, right)`.
     DropOperator {
         name: String,
@@ -2077,6 +2086,10 @@ pub struct SelectConstant {
     /// still waits), a set-returning one yields one row per result, and
     /// every `ConstCol::FromColumn` in `columns` reads that row's value.
     pub source: Option<Box<ConstCol>>,
+    /// Per column: a bare `NULL`, whose type is `unknown` -- a set
+    /// operation gives it the other side's type, where `NULL::text` is text.
+    /// Empty when not recorded.
+    pub untyped: Vec<bool>,
 }
 
 /// The three wire formats a COPY can use. They are not interchangeable: text
@@ -3171,6 +3184,7 @@ fn plan_node(
             plan_create_operator(&d)
         }
         N::CreateFunctionStmt(f) => plan_create_function(&f),
+        N::CreateCastStmt(c) => user_casts::plan_create(&c),
         N::CreateTrigStmt(t) => plan_create_trigger(&t),
         N::CopyStmt(c) => plan_copy(&c, lookup, params),
         N::VariableShowStmt(v) => Ok(Statement::Show(v.name.clone())),
@@ -7411,6 +7425,35 @@ fn is_boolean_type(t: &str) -> bool {
 /// Before this the server coerced the text through the column's parser, so
 /// the psycopg binary-format string that PostgreSQL rejects was stored.
 fn check_assignment_type(column: &Column, node: &pg_query::protobuf::Node) -> Result<()> {
+    check_assignment_type_at(column, node).inspect_err(|e| {
+        // PostgreSQL's cursor is at the expression (`exprLocation`): a
+        // cast's `::`, a call's name.
+        if matches!(e, Error::DatatypeMismatch(_)) {
+            if let Some(loc) = expr_location(node) {
+                set_error_location(loc);
+            }
+        }
+    })
+}
+
+/// Where an expression starts, as PostgreSQL's `exprLocation` reports it.
+fn expr_location(node: &pg_query::protobuf::Node) -> Option<i32> {
+    let loc = match node.node.as_ref()? {
+        N::TypeCast(t) => t.location,
+        N::FuncCall(f) => f.location,
+        N::AExpr(e) => e.location,
+        N::AConst(c) => c.location,
+        N::ColumnRef(c) => c.location,
+        N::ParamRef(p) => p.location,
+        N::RowExpr(r) => r.location,
+        N::AArrayExpr(a) => a.location,
+        N::SqlvalueFunction(f) => f.location,
+        _ => return None,
+    };
+    (loc >= 0).then_some(loc)
+}
+
+fn check_assignment_type_at(column: &Column, node: &pg_query::protobuf::Node) -> Result<()> {
     let from = match declared_expression_type(node) {
         Some(t) => t,
         // A function call or SQL value function has a known result type
@@ -7472,13 +7515,24 @@ fn assignable(column: &Column, from: &str, what: &str) -> Result<()> {
         })
     };
     let cross_family = matches!((family(&from), family(to)), (Some(a), Some(b)) if a != b);
-    let allowed = from_s == to_s
-        || from == "unknown"
-        || is_string_type(to)
-        || !(is_string_type(&from)
-            || cross_family
-            || (is_boolean_type(&from) && is_integer_type(to))
-            || (is_integer_type(&from) && is_boolean_type(to)));
+    // A user cast AS ASSIGNMENT / AS IMPLICIT makes the pair assignable; with
+    // none, a composite and anything but itself (or a string type) are not.
+    if user_casts::find_assignment(&from, to).is_some() {
+        return Ok(());
+    }
+    let composite_mismatch = (user_composite(&from).is_some() || user_composite(to).is_some())
+        && user_casts::type_oid(&from) != user_casts::type_oid(to)
+        && !matches!(from.as_str(), "unknown" | "record")
+        && !is_string_type(to)
+        && !is_string_type(&from);
+    let allowed = !composite_mismatch
+        && (from_s == to_s
+            || from == "unknown"
+            || is_string_type(to)
+            || !(is_string_type(&from)
+                || cross_family
+                || (is_boolean_type(&from) && is_integer_type(to))
+                || (is_integer_type(&from) && is_boolean_type(to))));
     if allowed {
         return Ok(());
     }
@@ -7541,6 +7595,12 @@ pub fn insert_row_typed(
         // the column back could not parse it as a date.
         let value = if already_stored {
             value
+        } else if let Some(cast) = types
+            .get(i)
+            .and_then(|t| user_casts::find_assignment(t, &column.pg_type))
+        {
+            // An assignment through a user cast (`AS ASSIGNMENT`).
+            fit_to_column(user_casts::apply(&cast, value)?, column)?
         } else {
             fit_to_column(cast_value(value, &column.pg_type)?, column)?
         };
@@ -8518,7 +8578,7 @@ fn srf_from_clause(from: &pg_query::protobuf::Node, params: &[Bson]) -> Result<O
             let n = func_name(c).unwrap_or_default();
             let Some((cn, ct, rows)) = (match json_record_rows(&n, c, &[], params)? {
                 Some(r) => Some(r),
-                None => match srf_rows(&n, c, params)? {
+                None => match srf_rows(&n, c, params, true)? {
                     Some(r) => Some(r),
                     None => integer_series_rows(&n, c, params)?,
                 },
@@ -8560,7 +8620,7 @@ fn srf_from_clause(from: &pg_query::protobuf::Node, params: &[Bson]) -> Result<O
         let record_rows = json_record_rows(&name, &call, &rf.coldeflist, params)?;
         let Some(out) = (match record_rows {
             Some(r) => Some(r),
-            None => srf_rows(&name, &call, params)?,
+            None => srf_rows(&name, &call, params, true)?,
         }) else {
             return Ok(None);
         };
@@ -8804,10 +8864,13 @@ type SrfRows = (Vec<String>, Vec<String>, Vec<Vec<Bson>>);
 
 /// The rows a set-returning function produces. `None` means this is not one of
 /// the set-returning functions this server materialises.
+/// `expand`: a FROM item, where a function returning a composite yields the
+/// type's fields as columns; in a select list it is one composite column.
 fn srf_rows(
     name: &str,
     call: &pg_query::protobuf::FuncCall,
     params: &[Bson],
+    expand: bool,
 ) -> Result<Option<SrfRows>> {
     let one = |v: Vec<Bson>, ty: &str| {
         (
@@ -8862,13 +8925,30 @@ fn srf_rows(
         return Ok(Some(one(chain, "regclass")));
     }
     // A user-defined set-returning function: the executor runs it.
-    if let Some(u) = correlated::user_function_for(name, &call.args).filter(|u| u.returns_set) {
+    // A user function in FROM: a set-returning one yields its rows, and one
+    // returning a COMPOSITE yields that type's fields as columns -- one row
+    // for a plain function (`select * from f()` over `returns point_t`),
+    // one per result for SETOF.
+    let composite = |u: &correlated::UserFn| {
+        (expand && u.columns.is_empty())
+            .then(|| user_composite(&u.return_type).map(|(_, fields)| fields))
+            .flatten()
+    };
+    if let Some(u) = correlated::user_function_for(name, &call.args)
+        .filter(|u| u.returns_set || composite(u).is_some())
+    {
         let a: Vec<Bson> = call
             .args
             .iter()
             .map(|x| const_value(x, params))
             .collect::<Result<_>>()?;
-        let (names, types) = if u.columns.is_empty() {
+        let fields = composite(&u);
+        let (names, types) = if let Some(fields) = &fields {
+            (
+                fields.iter().map(|(n, _)| n.clone()).collect(),
+                fields.iter().map(|(_, t)| t.clone()).collect(),
+            )
+        } else if u.columns.is_empty() {
             (vec![name.to_string()], vec![u.return_type.clone()])
         } else {
             (
@@ -8876,10 +8956,21 @@ fn srf_rows(
                 u.columns.iter().map(|(_, t)| t.clone()).collect(),
             )
         };
-        let rows = match correlated::call_user_function(&u, &a)? {
+        let mut rows = match correlated::call_user_function(&u, &a)? {
             correlated::FnResult::Rows(_, _, rows) => rows,
             correlated::FnResult::Value(v) => vec![vec![v]],
         };
+        if let Some(fields) = &fields {
+            // Each result is one composite value: its fields are the row.
+            for row in &mut rows {
+                if let [single] = row.as_slice() {
+                    *row = match single {
+                        Bson::Null => vec![Bson::Null; fields.len()],
+                        v => record_fields(v).cloned().unwrap_or_else(|| vec![v.clone()]),
+                    };
+                }
+            }
+        }
         return Ok(Some((names, types, rows)));
     }
     // `string_to_table(text, delimiter [, null_string])`: string_to_array's
@@ -10352,8 +10443,12 @@ fn plan_table_targets(
             // takes the general path too, which rounds and truncates to it.
             Some(N::TypeCast(tc))
                 if !cast_chain_has_typmod(tc)
-                    && cast_chain_over_column(tc).is_ok_and(|(col, _)| {
+                    && cast_chain_over_column(tc).is_ok_and(|(col, chain)| {
                         def.column(&col).is_none_or(|c| c.pg_type != "bpchar")
+                            && !user_casts::in_chain(
+                                def.column(&col).map(|c| c.pg_type.as_str()),
+                                &chain,
+                            )
                     }) =>
             {
                 let (col_name, chain) = cast_chain_over_column(tc)?;
@@ -11094,6 +11189,15 @@ fn plan_aggregate_item(
             item.source_type.as_deref().unwrap_or("unknown")
         )));
     }
+    // There is no `min` / `max` over boolean in PostgreSQL (`bool_and` /
+    // `bool_or` are the boolean aggregates): a missing function, 42883.
+    if matches!(item.func, AggFunc::Min | AggFunc::Max)
+        && matches!(item.source_type.as_deref(), Some("bool" | "boolean"))
+    {
+        return Err(Error::UndefinedFunction(format!(
+            "function {name}(boolean) does not exist"
+        )));
+    }
     Ok(item)
 }
 
@@ -11500,6 +11604,151 @@ fn plan_aggregate_order(
         });
     }
     Ok(keys)
+}
+
+/// `SELECT DISTINCT ON (k) ... GROUP BY ...` (or over aggregates): the
+/// grouping runs in a FROM subquery and DISTINCT ON / ORDER BY / LIMIT over
+/// its output -- which is what they apply to in PostgreSQL, since they run
+/// after grouping. Each key and sort item must name an output column (by
+/// position, by name, or as the same expression); otherwise `None`, and the
+/// shape stays refused.
+fn distinct_on_over_groups(
+    s: &pg_query::protobuf::SelectStmt,
+) -> Option<pg_query::protobuf::SelectStmt> {
+    if s.distinct_clause.is_empty() || s.distinct_clause[0].node.is_none() {
+        return None;
+    }
+    if s.group_clause.is_empty() && !has_aggregate(s) {
+        return None;
+    }
+    let targets: Vec<&pg_query::protobuf::ResTarget> = s
+        .target_list
+        .iter()
+        .map(|t| match t.node.as_ref() {
+            Some(N::ResTarget(rt)) => Some(&**rt),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    let output_name = |rt: &pg_query::protobuf::ResTarget| -> String {
+        if !rt.name.is_empty() {
+            return rt.name.clone();
+        }
+        match rt.val.as_deref().and_then(|v| v.node.as_ref()) {
+            Some(N::ColumnRef(c)) => column_ref_name(c).unwrap_or_else(|| "?column?".into()),
+            Some(N::FuncCall(f)) => func_name(f).unwrap_or_else(|| "?column?".into()),
+            Some(N::TypeCast(tc)) => cast_chain_over_column(tc)
+                .map(|(c, _)| c)
+                .unwrap_or_else(|_| "?column?".into()),
+            _ => "?column?".into(),
+        }
+    };
+    let names: Vec<String> = targets.iter().map(|rt| output_name(rt)).collect();
+    let inner_name = |i: usize| format!("__d{i}");
+    let col = |name: String| pg_query::protobuf::Node {
+        node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+            fields: vec![pg_query::protobuf::Node {
+                node: Some(N::String(pg_query::protobuf::String { sval: name })),
+            }],
+            location: -1,
+        })),
+    };
+    // A key or sort expression as the inner column it reads.
+    let map = |n: &pg_query::protobuf::Node| -> Option<pg_query::protobuf::Node> {
+        if let Some(N::AConst(c)) = n.node.as_ref() {
+            if let Some(pg_query::protobuf::a_const::Val::Ival(i)) = c.val.as_ref() {
+                let k = usize::try_from(i.ival).ok()?.checked_sub(1)?;
+                return (k < targets.len()).then(|| col(inner_name(k)));
+            }
+        }
+        if let Some(i) = targets
+            .iter()
+            .position(|rt| rt.val.as_deref().is_some_and(|v| same_expression(v, n)))
+        {
+            return Some(col(inner_name(i)));
+        }
+        if let Some(N::ColumnRef(c)) = n.node.as_ref() {
+            if c.fields.len() == 1 {
+                let name = column_ref_name(c)?;
+                let i = names.iter().position(|x| *x == name)?;
+                return Some(col(inner_name(i)));
+            }
+        }
+        None
+    };
+    let keys: Vec<pg_query::protobuf::Node> =
+        s.distinct_clause.iter().map(map).collect::<Option<_>>()?;
+    let mut sorts = Vec::with_capacity(s.sort_clause.len());
+    for item in &s.sort_clause {
+        let Some(N::SortBy(sb)) = item.node.as_ref() else {
+            return None;
+        };
+        let mut sb = (**sb).clone();
+        sb.node = Some(Box::new(map(sb.node.as_deref()?)?));
+        sorts.push(pg_query::protobuf::Node {
+            node: Some(N::SortBy(Box::new(sb))),
+        });
+    }
+    let mut inner = s.clone();
+    inner.distinct_clause = Vec::new();
+    inner.sort_clause = Vec::new();
+    inner.limit_count = None;
+    inner.limit_offset = None;
+    inner.target_list = targets
+        .iter()
+        .enumerate()
+        .map(|(i, rt)| {
+            let mut rt = (*rt).clone();
+            rt.name = inner_name(i);
+            pg_query::protobuf::Node {
+                node: Some(N::ResTarget(Box::new(rt))),
+            }
+        })
+        .collect();
+    let outer_targets = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| pg_query::protobuf::Node {
+            node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+                name: name.clone(),
+                val: Some(Box::new(col(inner_name(i)))),
+                location: -1,
+                ..Default::default()
+            }))),
+        })
+        .collect();
+    Some(pg_query::protobuf::SelectStmt {
+        distinct_clause: keys,
+        target_list: outer_targets,
+        from_clause: vec![pg_query::protobuf::Node {
+            node: Some(N::RangeSubselect(Box::new(
+                pg_query::protobuf::RangeSubselect {
+                    lateral: false,
+                    subquery: Some(Box::new(pg_query::protobuf::Node {
+                        node: Some(N::SelectStmt(Box::new(inner))),
+                    })),
+                    alias: Some(pg_query::protobuf::Alias {
+                        aliasname: "__don".into(),
+                        colnames: Vec::new(),
+                    }),
+                },
+            ))),
+        }],
+        sort_clause: sorts,
+        limit_count: s.limit_count.clone(),
+        limit_offset: s.limit_offset.clone(),
+        limit_option: s.limit_option,
+        op: pg_query::protobuf::SetOperation::SetopNone as i32,
+        ..Default::default()
+    })
+}
+
+/// Are two expressions the same, ignoring where in the text each was
+/// written? (`ORDER BY sum(v)` names the select list's `sum(v)`.)
+fn same_expression(a: &pg_query::protobuf::Node, b: &pg_query::protobuf::Node) -> bool {
+    static LOCATION: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re =
+        LOCATION.get_or_init(|| regex::Regex::new(r"location: -?\d+").expect("a fixed pattern"));
+    re.replace_all(&format!("{a:?}"), "") == re.replace_all(&format!("{b:?}"), "")
 }
 
 fn aggregate_distinct(s: &pg_query::protobuf::SelectStmt) -> Result<bool> {
@@ -12845,6 +13094,61 @@ fn numeric_signature(name: &str) -> Option<usize> {
 /// type at plan time, where this server would otherwise stringify.
 fn text_function_mismatch(f: &pg_query::protobuf::FuncCall, types: &[String]) -> Option<Error> {
     let name = func_name(f)?;
+    let missing = || {
+        Error::UndefinedFunction(format!(
+            "function {name}({}) does not exist",
+            types
+                .iter()
+                .map(|t| display_type(t))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    };
+    let known_scalar = |t: &str| {
+        !t.is_empty()
+            && t != "unknown"
+            && !t.ends_with("[]")
+            && !matches!(t, "int2vector" | "oidvector" | "anyarray" | "record")
+            && pgtypes::oid_of_name(t).is_some()
+    };
+    if !correlated::user_function_named(&name) {
+        let first = types.first().map(String::as_str).unwrap_or("");
+        // The array built-ins take an array first; a known scalar has no
+        // cast to one (`array_length(1, 1)`).
+        let array_first = matches!(
+            name.as_str(),
+            "array_length"
+                | "array_lower"
+                | "array_upper"
+                | "array_dims"
+                | "array_ndims"
+                | "cardinality"
+                | "array_to_string"
+                | "array_position"
+                | "array_positions"
+                | "array_remove"
+                | "array_replace"
+        );
+        if array_first && known_scalar(first) {
+            return Some(missing());
+        }
+        // `to_hex` is integer-only.
+        if name == "to_hex" && known_scalar(first) && !matches!(first, "int2" | "int4" | "int8") {
+            return Some(missing());
+        }
+        // `md5` / `substr` take text or bytea; a number or a date has no
+        // implicit cast to either.
+        if matches!(name.as_str(), "md5" | "substr")
+            && known_scalar(first)
+            && !matches!(
+                first,
+                "text" | "varchar" | "bpchar" | "name" | "char" | "bytea"
+            )
+            && domains::user_domain(first).is_none()
+        {
+            return Some(missing());
+        }
+    }
     // `length` also takes bytea, bit strings, a tsvector and the geometric
     // path types -- but not a number or a date.
     if name == "length" && !correlated::user_function_named(&name) {
@@ -14279,6 +14583,12 @@ fn plan_select(
     if let Some(rewritten) = whole_row_rewrite(s, lookup, params)? {
         return plan_select(&rewritten, lookup, params);
     }
+    if let Some(rewritten) = expand_composite_star(s) {
+        return plan_select(&rewritten, lookup, params);
+    }
+    if let Some(rewritten) = distinct_on_over_groups(s) {
+        return plan_select(&rewritten, lookup, params);
+    }
     // An enum orders by its labels' declared positions, not their text.
     if let Some(rewritten) = enum_order::rewrite(s, lookup)? {
         return plan_select(&rewritten, lookup, params);
@@ -14384,6 +14694,71 @@ thread_local! {
     /// Set while an aggregate's WHERE is being planned as a FROM subquery,
     /// so the rewrite is not applied to itself.
     static IN_WHERE_SPLIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `(expr).*` in a select list over a COMPOSITE-typed expression -- a
+/// function returning one, a cast to one -- expanded into `(expr).field` per
+/// field, as PostgreSQL's parse analysis expands it (which is also why it
+/// evaluates `expr` once per field). `None` when there is none to expand.
+fn expand_composite_star(
+    s: &pg_query::protobuf::SelectStmt,
+) -> Option<pg_query::protobuf::SelectStmt> {
+    let fields_of = |rt: &pg_query::protobuf::ResTarget| {
+        let Some(N::AIndirection(ind)) = rt.val.as_ref()?.node.as_ref() else {
+            return None;
+        };
+        let [star] = ind.indirection.as_slice() else {
+            return None;
+        };
+        if !matches!(star.node.as_ref(), Some(N::AStar(_))) {
+            return None;
+        }
+        let arg = ind.arg.as_deref()?;
+        if matches!(arg.node.as_ref(), Some(N::ColumnRef(_))) {
+            return None;
+        }
+        let (_, fields) = user_composite(&static_type(arg, &Bson::Null))?;
+        Some((arg.clone(), fields))
+    };
+    let mut changed = false;
+    let mut targets = Vec::with_capacity(s.target_list.len());
+    for t in &s.target_list {
+        match t.node.as_ref() {
+            Some(N::ResTarget(rt)) => match fields_of(rt) {
+                Some((arg, fields)) => {
+                    changed = true;
+                    for (name, _) in fields {
+                        targets.push(pg_query::protobuf::Node {
+                            node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+                                name: name.clone(),
+                                val: Some(Box::new(pg_query::protobuf::Node {
+                                    node: Some(N::AIndirection(Box::new(
+                                        pg_query::protobuf::AIndirection {
+                                            arg: Some(Box::new(arg.clone())),
+                                            indirection: vec![pg_query::protobuf::Node {
+                                                node: Some(N::String(pg_query::protobuf::String {
+                                                    sval: name,
+                                                })),
+                                            }],
+                                        },
+                                    ))),
+                                })),
+                                location: rt.location,
+                                ..Default::default()
+                            }))),
+                        });
+                    }
+                }
+                None => targets.push(t.clone()),
+            },
+            _ => targets.push(t.clone()),
+        }
+    }
+    changed.then(|| {
+        let mut out = s.clone();
+        out.target_list = targets;
+        out
+    })
 }
 
 /// `SELECT <aggs> FROM r WHERE p ...` as `SELECT <aggs> FROM (SELECT * FROM
@@ -15689,7 +16064,9 @@ fn plan_join_select(
             // beside the column, same as a plain select's. A cast over a
             // CONSTANT (`'t1'::regclass::oid`) is a constant target, below.
             Some(N::TypeCast(tc))
-                if !cast_chain_has_typmod(tc) && cast_chain_over_column_qualified(tc).is_ok() =>
+                if !cast_chain_has_typmod(tc)
+                    && cast_chain_over_column_qualified(tc)
+                        .is_ok_and(|(_, (_, chain))| !user_casts::in_chain(None, &chain)) =>
             {
                 let (col_name, chain) = cast_chain_over_column_qualified(tc)?;
                 let out = if rt.name.is_empty() {
@@ -15921,9 +16298,26 @@ pub fn sub_plan_def(
         Statement::Aggregate(agg) => aggregate_output_def(agg),
         Statement::Select(sel) => select_output_def(sel, lookup),
         Statement::SetOp(set) => {
-            // PostgreSQL takes a set operation's column NAMES and TYPES from
-            // its left side, which is what `set_op_fields` reports on the wire.
-            sub_plan_def(&set.left, lookup)
+            // The column NAMES are the left side's; each TYPE is the two
+            // sides' common type, as the executor reports it on the wire.
+            let mut left = sub_plan_def(&set.left, lookup)?;
+            let Ok(right) = sub_plan_def(&set.right, lookup) else {
+                return Ok(left);
+            };
+            let untyped = |stmt: &Statement, i: usize| match stmt {
+                Statement::SelectConstant(sc) => sc.untyped.get(i).copied().unwrap_or(false),
+                _ => false,
+            };
+            for (i, (l, r)) in left.columns.iter_mut().zip(&right.columns).enumerate() {
+                l.pg_type = if untyped(&set.left, i) {
+                    r.pg_type.clone()
+                } else if untyped(&set.right, i) {
+                    l.pg_type.clone()
+                } else {
+                    set_op_common_type(&l.pg_type, &r.pg_type)
+                };
+            }
+            Ok(left)
         }
         Statement::SelectConstant(sc) => Ok(TableDef::new(
             "",
@@ -15941,6 +16335,40 @@ pub fn sub_plan_def(
                 .collect(),
         )),
         _ => Err(Error::Unsupported("this subquery shape".into())),
+    }
+}
+
+/// Two set-operation sides' common column type, as `select_common_type`
+/// chooses it: the wider number, the wider date/time, and among the string
+/// types `text` (preferred) or else the left side's -- unless only the left
+/// casts implicitly to the right (`varchar` / `bpchar` to `name`).
+/// Mismatched categories are the executor's 42804; this keeps the left.
+fn set_op_common_type(left: &str, right: &str) -> String {
+    let rank = |t: &str| -> Option<(u8, u8)> {
+        Some(match t {
+            "int2" => (1, 1),
+            "int4" => (1, 2),
+            "int8" => (1, 3),
+            "numeric" => (1, 4),
+            "float4" => (1, 5),
+            "float8" => (1, 6),
+            "text" | "varchar" | "bpchar" | "name" => (2, 0),
+            "date" => (3, 1),
+            "timestamp" => (3, 2),
+            "timestamptz" => (3, 3),
+            _ => return None,
+        })
+    };
+    match (rank(left), rank(right)) {
+        (Some((2, _)), Some((2, _))) => {
+            if left != "text" && matches!(left, "varchar" | "bpchar") && right == "name" {
+                right.to_string()
+            } else {
+                left.to_string()
+            }
+        }
+        (Some((lc, lr)), Some((rc, rr))) if lc == rc && rr > lr => right.to_string(),
+        _ => left.to_string(),
     }
 }
 
@@ -17952,7 +18380,7 @@ fn plan_select_unnest(
         return Ok(None);
     };
     let name = func_name(f).unwrap_or_default();
-    let Some((names, types, rows)) = srf_rows(&name, f, params)? else {
+    let Some((names, types, rows)) = srf_rows(&name, f, params, false)? else {
         return Ok(None);
     };
     // A clause needs a source to apply to, and this shape has none. Refused by
@@ -18734,10 +19162,25 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
         };
         columns.push((out, value, pg_type, typmod));
     }
+    let untyped: Vec<bool> = s
+        .target_list
+        .iter()
+        .map(|t| {
+            matches!(t.node.as_ref(), Some(N::ResTarget(rt))
+                if matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()),
+                    Some(N::AConst(c)) if c.isnull))
+        })
+        .collect();
+    let untyped = if untyped.len() == columns.len() {
+        untyped
+    } else {
+        Vec::new()
+    };
     Ok(Statement::SelectConstant(SelectConstant {
         columns,
         where_true,
         source: None,
+        untyped,
     }))
 }
 
@@ -18892,6 +19335,7 @@ fn plan_function_source_select(
         columns,
         where_true: rest.where_true,
         source: Some(Box::new(source_col)),
+        untyped: Vec::new(),
     }))
 }
 
@@ -21406,6 +21850,8 @@ pub fn apply_column_expr(expr: &ColumnExpr, value: Bson, tz: &TimeZoneSetting) -
     match expr {
         ColumnExpr::Casts { source, chain } => {
             let mut v = value;
+            // The operand's type through the chain, for a user cast's lookup.
+            let mut current: Option<String> = source.clone();
             let mut prev: Option<&str> = match source.as_deref() {
                 Some("timestamptz") | Some("timestamp with time zone") => Some("timestamptz"),
                 Some(t @ ("int2vector" | "oidvector" | "date" | "timestamp")) => Some(t),
@@ -21414,6 +21860,12 @@ pub fn apply_column_expr(expr: &ColumnExpr, value: Bson, tz: &TimeZoneSetting) -
                 _ => None,
             };
             for target in chain {
+                let from = current.replace(target.clone());
+                if let Some(cast) = from.as_deref().and_then(|f| user_casts::find(f, target)) {
+                    v = user_casts::apply(&cast, v)?;
+                    prev = Some(target);
+                    continue;
+                }
                 if matches!(target.as_str(), "text" | "varchar" | "name") {
                     if let Some(styled) = prev.and_then(|p| datetime_text_styled(&v, p, tz)) {
                         v = styled;
@@ -24576,6 +25028,11 @@ fn datetime_result_type(f: &pg_query::protobuf::FuncCall, name: &str) -> Option<
         return Some(t.to_string());
     }
     let types: Vec<String> = f.args.iter().map(|a| static_type(a, &Bson::Null)).collect();
+    // The network functions (`host`, `masklen`, `network`, ...) are typed
+    // by their inet / cidr argument, as the datetime family is by its own.
+    if let Some(t) = net::result_type(name, &types) {
+        return Some(t);
+    }
     datetime::result_type(name, &types)
 }
 
@@ -24635,6 +25092,9 @@ fn datetime_call(
     let args: Vec<Bson> = args.iter().map(arrays::strip).collect();
     if jsonfn::result_type(name).is_some() {
         return Some(jsonfn::call(name, &args, &types));
+    }
+    if net::result_type(name, &types).is_some() {
+        return Some(net::call(name, &args, &types));
     }
     datetime::call(name, &args, &types)
 }
@@ -25749,6 +26209,9 @@ fn plan_set(v: &pg_query::protobuf::VariableSetStmt) -> Result<Statement> {
 }
 
 fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
+    if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectCast) {
+        return user_casts::plan_drop(d);
+    }
     // `DROP SCHEMA`: the object is a bare String / one-element List.
     if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectSchema) {
         let mut names = Vec::new();
@@ -26236,6 +26699,35 @@ fn plan_update(
             &**val
         };
         check_assignment_type(column, val)?;
+        // An assignment through a user cast (`AS ASSIGNMENT` / `AS
+        // IMPLICIT`): the value is cast to the column's type, which the
+        // cast evaluation takes through the user's cast.
+        let assigned_node;
+        let val = {
+            let from =
+                declared_expression_type(val).unwrap_or_else(|| static_type(val, &Bson::Null));
+            if user_casts::find_assignment(&from, &column.pg_type).is_some() {
+                assigned_node = pg_query::protobuf::Node {
+                    node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                        arg: Some(Box::new(val.clone())),
+                        type_name: Some(pg_query::protobuf::TypeName {
+                            names: vec![pg_query::protobuf::Node {
+                                node: Some(N::String(pg_query::protobuf::String {
+                                    sval: column.pg_type.clone(),
+                                })),
+                            }],
+                            typemod: -1,
+                            location: -1,
+                            ..Default::default()
+                        }),
+                        location: -1,
+                    }))),
+                };
+                &assigned_node
+            } else {
+                val
+            }
+        };
         // A value that reads the row (`num * 2`) has no constant to store;
         // it is planned as a row expression and evaluated per matched row --
         // as is a VOLATILE one (`nextval`, `random()`), which PostgreSQL
@@ -26990,6 +27482,49 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
             if !(is_string_type(&target) || target_base.as_deref() == Some(source.as_str())) {
                 return Err(Error::CannotCoerce(format!(
                     "cannot cast type {source} to {}",
+                    display_type(&target)
+                )));
+            }
+        }
+        // A user cast (`CREATE CAST`) between the operand's type and the
+        // target. Never for an untyped literal, which is the target type's
+        // own input (`'happy'::mood` does not take a `text -> mood` cast).
+        let untyped = matches!(arg.node.as_ref(), Some(N::AConst(c))
+            if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) || c.isnull);
+        if !untyped {
+            let source = static_type(arg, &value);
+            if let Some(cast) = user_casts::find(&source, &target) {
+                return user_casts::apply(&cast, value);
+            }
+            // The network types are cast to from text (and each other) only.
+            if matches!(target.as_str(), "inet" | "cidr")
+                && !matches!(
+                    source.as_str(),
+                    "text" | "unknown" | "varchar" | "bpchar" | "name" | "inet" | "cidr" | ""
+                )
+                && pgtypes::oid_of_name(&source).is_some()
+            {
+                set_error_location(tc.location);
+                return Err(Error::CannotCoerce(format!(
+                    "cannot cast type {} to {}",
+                    display_type(&source),
+                    display_type(&target)
+                )));
+            }
+            // No cast between a scalar and a composite: 42846, naming both.
+            if value != Bson::Null
+                && user_composite(&target).is_some()
+                && !matches!(
+                    source.as_str(),
+                    "text" | "unknown" | "record" | "varchar" | "bpchar" | "name"
+                )
+                && user_casts::type_oid(&source) != user_casts::type_oid(&target)
+                && user_composite(&source).is_none()
+            {
+                set_error_location(tc.location);
+                return Err(Error::CannotCoerce(format!(
+                    "cannot cast type {} to {}",
+                    display_type(&source),
                     display_type(&target)
                 )));
             }

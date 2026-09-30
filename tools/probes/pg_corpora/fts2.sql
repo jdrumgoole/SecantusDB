@@ -1,3 +1,4 @@
+# reference-version: 15
 SELECT id FROM ts2 WHERE tv @@ to_tsquery('english', 'cat') ORDER BY id
 SELECT id FROM ts2 WHERE tv @@ to_tsquery('english', 'cat & !dog') ORDER BY id
 SELECT id FROM ts2 WHERE tv @@ to_tsquery('english', 'dog <-> chase') ORDER BY id

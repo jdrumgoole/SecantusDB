@@ -15,6 +15,13 @@
 //!
 //! Equality, `IN` and `DISTINCT` are unaffected: two labels are equal exactly
 //! when their positions are.
+//!
+//! The NETWORK types (`inet`, `cidr`) are stored as their canonical text and
+//! had the same defect -- `10.0.0.1` sorted before `9.0.0.1`, and `a <
+//! '9.255.0.0'::inet` compared strings. They take the same rewrite with an
+//! order KEY (`__net_sortkey`, whose string order is PostgreSQL's
+//! `network_cmp`) in place of the position; equality and `IN` go through it
+//! too, so an unnormalised literal (`'10.0.0.1'` for `10.0.0.1/32`) matches.
 
 use super::*;
 
@@ -115,6 +122,91 @@ impl Rewriter<'_> {
         }
     }
 
+    /// The network type `node` statically has: an `inet` / `cidr` column in
+    /// scope, or a cast to one.
+    fn net_of(&self, node: &pg_query::protobuf::Node) -> Option<String> {
+        let net = |t: &str| matches!(t, "inet" | "cidr").then(|| t.to_string());
+        match node.node.as_ref() {
+            Some(N::ColumnRef(c)) => {
+                let parts: Vec<&str> = c
+                    .fields
+                    .iter()
+                    .filter_map(|f| match f.node.as_ref() {
+                        Some(N::String(s)) => Some(s.sval.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let column = match parts.as_slice() {
+                    [q, col] | [_, q, col] => self
+                        .scope
+                        .iter()
+                        .find(|(n, _)| n == q)
+                        .and_then(|(_, def)| def.column(col)),
+                    [col] => {
+                        let hits: Vec<&Column> = self
+                            .scope
+                            .iter()
+                            .filter_map(|(_, def)| def.column(col))
+                            .collect();
+                        match hits.as_slice() {
+                            [one] => Some(*one),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                column.and_then(|c| net(&c.pg_type))
+            }
+            Some(N::TypeCast(tc)) => net(&tc.type_name.as_ref().map(type_name_of)?),
+            _ => None,
+        }
+    }
+
+    /// `__net_sortkey(node)`.
+    fn net_key(node: pg_query::protobuf::Node) -> pg_query::protobuf::Node {
+        pg_query::protobuf::Node {
+            node: Some(N::FuncCall(Box::new(pg_query::protobuf::FuncCall {
+                funcname: vec![pg_query::protobuf::Node {
+                    node: Some(N::String(pg_query::protobuf::String {
+                        sval: "__net_sortkey".into(),
+                    })),
+                }],
+                args: vec![node],
+                funcformat: pg_query::protobuf::CoercionForm::CoerceExplicitCall as i32,
+                location: -1,
+                ..Default::default()
+            }))),
+        }
+    }
+
+    /// One side of a comparison against network type `ty`, as its key: a
+    /// value of the type as it is, anything else cast to it first (which
+    /// validates and normalises a literal).
+    fn net_side(&self, node: &pg_query::protobuf::Node, ty: &str) -> pg_query::protobuf::Node {
+        if self.net_of(node).is_some() {
+            return Self::net_key(node.clone());
+        }
+        Self::net_key(pg_query::protobuf::Node {
+            node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                arg: Some(Box::new(node.clone())),
+                type_name: Some(type_name_node(ty)),
+                location: -1,
+            }))),
+        })
+    }
+
+    /// `split_part(key, '|', 2)::ty`: an extreme key back to its value.
+    fn net_value(key: pg_query::protobuf::Node, ty: &str) -> pg_query::protobuf::Node {
+        let mut node = parse_expr(&format!("SELECT split_part(NULL::text, '|', 2)::{ty}"))
+            .expect("a fixed shape parses");
+        if let Some(N::TypeCast(tc)) = node.node.as_mut() {
+            if let Some(N::FuncCall(f)) = tc.arg.as_deref_mut().and_then(|a| a.node.as_mut()) {
+                f.args[0] = key;
+            }
+        }
+        node
+    }
+
     /// `array_position(ARRAY[labels]::text[], node::text)`.
     fn ord(node: pg_query::protobuf::Node, labels: &[String]) -> pg_query::protobuf::Node {
         let quoted: Vec<String> = labels
@@ -202,6 +294,9 @@ impl Rewriter<'_> {
                 if let Some((_, labels)) = self.enum_of(key) {
                     sb.node = Some(Box::new(Self::ord(key.clone(), &labels)));
                     self.changed = true;
+                } else if self.net_of(key).is_some() {
+                    sb.node = Some(Box::new(Self::net_key(key.clone())));
+                    self.changed = true;
                 }
             }
         }
@@ -220,6 +315,171 @@ impl Rewriter<'_> {
             let kind = AExprKind::try_from(e.kind);
             let op = operator_name(e).ok().map(str::to_string);
             let ordered = matches!(op.as_deref(), Some("<" | "<=" | ">" | ">="));
+            let equality = matches!(op.as_deref(), Some("=" | "<>" | "!="));
+            if kind == Ok(AExprKind::AexprOp) && (ordered || equality) {
+                if let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
+                    if let Some(ty) = self.net_of(l).or_else(|| self.net_of(r)) {
+                        let (nl, nr) = (self.net_side(l, &ty), self.net_side(r, &ty));
+                        if let Some(N::AExpr(e)) = node.node.as_mut() {
+                            e.lexpr = Some(Box::new(nl));
+                            e.rexpr = Some(Box::new(nr));
+                        }
+                        self.changed = true;
+                        return Ok(());
+                    }
+                }
+            }
+            // The containment operators (`<<`, `<<=`, `>>`, `>>=`, `&&`):
+            // `__net_op(op, l, r)`, each side cast to the network type.
+            if kind == Ok(AExprKind::AexprOp)
+                && matches!(op.as_deref(), Some("<<" | "<<=" | ">>" | ">>=" | "&&"))
+            {
+                if let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
+                    if let Some(ty) = self.net_of(l).or_else(|| self.net_of(r)) {
+                        let cast = |n: &pg_query::protobuf::Node| -> pg_query::protobuf::Node {
+                            if self.net_of(n).is_some() {
+                                return n.clone();
+                            }
+                            pg_query::protobuf::Node {
+                                node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                                    arg: Some(Box::new(n.clone())),
+                                    type_name: Some(type_name_node(&ty)),
+                                    location: -1,
+                                }))),
+                            }
+                        };
+                        let op_text = pg_query::protobuf::Node {
+                            node: Some(N::AConst(pg_query::protobuf::AConst {
+                                isnull: false,
+                                location: -1,
+                                val: Some(a_const::Val::Sval(pg_query::protobuf::String {
+                                    sval: op.clone().unwrap_or_default(),
+                                })),
+                            })),
+                        };
+                        *node = pg_query::protobuf::Node {
+                            node: Some(N::FuncCall(Box::new(pg_query::protobuf::FuncCall {
+                                funcname: vec![pg_query::protobuf::Node {
+                                    node: Some(N::String(pg_query::protobuf::String {
+                                        sval: "__net_op".into(),
+                                    })),
+                                }],
+                                args: vec![op_text, cast(l), cast(r)],
+                                funcformat: pg_query::protobuf::CoercionForm::CoerceExplicitCall
+                                    as i32,
+                                location: -1,
+                                ..Default::default()
+                            }))),
+                        };
+                        self.changed = true;
+                        return Ok(());
+                    }
+                }
+            }
+            // Network arithmetic: `inet + n`, `n + inet`, `inet - n`,
+            // `inet - inet` (a bigint), `~inet`, `inet & inet`, `inet | inet`.
+            if kind == Ok(AExprKind::AexprOp)
+                && matches!(op.as_deref(), Some("+" | "-" | "&" | "|" | "~"))
+            {
+                let (l, r) = (e.lexpr.as_deref(), e.rexpr.as_deref());
+                let net_side = l
+                    .and_then(|n| self.net_of(n))
+                    .or_else(|| r.and_then(|n| self.net_of(n)));
+                if let (Some(ty), Some(r)) = (net_side, r) {
+                    let op = op.clone().unwrap_or_default();
+                    let untyped = |n: &pg_query::protobuf::Node| {
+                        matches!(n.node.as_ref(), Some(N::AConst(c))
+                            if matches!(c.val, Some(a_const::Val::Sval(_))))
+                    };
+                    let as_net = |n: &pg_query::protobuf::Node| -> pg_query::protobuf::Node {
+                        if self.net_of(n).is_some() {
+                            return n.clone();
+                        }
+                        pg_query::protobuf::Node {
+                            node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                                arg: Some(Box::new(n.clone())),
+                                type_name: Some(type_name_node(&ty)),
+                                location: -1,
+                            }))),
+                        }
+                    };
+                    let both_net = l.is_some_and(|l| self.net_of(l).is_some() || untyped(l))
+                        && (self.net_of(r).is_some() || untyped(r));
+                    let call = |name: &str, args: Vec<pg_query::protobuf::Node>| {
+                        pg_query::protobuf::Node {
+                            node: Some(N::FuncCall(Box::new(pg_query::protobuf::FuncCall {
+                                funcname: vec![pg_query::protobuf::Node {
+                                    node: Some(N::String(pg_query::protobuf::String {
+                                        sval: name.into(),
+                                    })),
+                                }],
+                                args,
+                                funcformat: pg_query::protobuf::CoercionForm::CoerceExplicitCall
+                                    as i32,
+                                location: -1,
+                                ..Default::default()
+                            }))),
+                        }
+                    };
+                    let text = |v: &str| pg_query::protobuf::Node {
+                        node: Some(N::AConst(pg_query::protobuf::AConst {
+                            isnull: false,
+                            location: -1,
+                            val: Some(a_const::Val::Sval(pg_query::protobuf::String {
+                                sval: v.into(),
+                            })),
+                        })),
+                    };
+                    // The result is an inet: cast, so it is TYPED as one.
+                    let inet = |n: pg_query::protobuf::Node| pg_query::protobuf::Node {
+                        node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                            arg: Some(Box::new(n)),
+                            type_name: Some(type_name_node("inet")),
+                            location: -1,
+                        }))),
+                    };
+                    *node = match (op.as_str(), l) {
+                        ("-", Some(l)) if both_net => {
+                            call("__net_diff", vec![as_net(l), as_net(r)])
+                        }
+                        ("&" | "|", Some(l)) => {
+                            inet(call("__net_arith", vec![text(&op), as_net(l), as_net(r)]))
+                        }
+                        // A NULL placeholder would short-circuit the call.
+                        ("~", None) => {
+                            inet(call("__net_arith", vec![text("~"), text(""), as_net(r)]))
+                        }
+                        (_, Some(l)) => {
+                            inet(call("__net_arith", vec![text(&op), l.clone(), r.clone()]))
+                        }
+                        _ => return Ok(()),
+                    };
+                    self.changed = true;
+                    return Ok(());
+                }
+            }
+            // `inet_col IN (...)`: each member cast to the type, so a literal
+            // is compared in its canonical form.
+            if matches!(kind, Ok(AExprKind::AexprIn)) {
+                if let (Some(l), Some(N::List(items))) = (
+                    e.lexpr.as_deref(),
+                    e.rexpr.as_deref().and_then(|r| r.node.as_ref()),
+                ) {
+                    if let Some(ty) = self.net_of(l) {
+                        let items: Vec<pg_query::protobuf::Node> =
+                            items.items.iter().map(|i| self.net_side(i, &ty)).collect();
+                        let lkey = Self::net_key(l.clone());
+                        if let Some(N::AExpr(e)) = node.node.as_mut() {
+                            e.lexpr = Some(Box::new(lkey));
+                            e.rexpr = Some(Box::new(pg_query::protobuf::Node {
+                                node: Some(N::List(pg_query::protobuf::List { items })),
+                            }));
+                        }
+                        self.changed = true;
+                        return Ok(());
+                    }
+                }
+            }
             if kind == Ok(AExprKind::AexprOp) && ordered {
                 let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) else {
                     return Ok(());
@@ -295,6 +555,16 @@ impl Rewriter<'_> {
             let name = func_name(f);
             if matches!(name.as_deref(), Some("min" | "max")) && f.over.is_none() {
                 if let [arg] = f.args.as_slice() {
+                    if let Some(ty) = self.net_of(arg) {
+                        let mut agg = (**f).clone();
+                        agg.args = vec![Self::net_key(arg.clone())];
+                        let call = pg_query::protobuf::Node {
+                            node: Some(N::FuncCall(Box::new(agg))),
+                        };
+                        *node = Self::net_value(call, &ty);
+                        self.changed = true;
+                        return Ok(());
+                    }
                     if let Some((ty, labels)) = self.enum_of(arg) {
                         let mut agg = (**f).clone();
                         agg.args = vec![Self::ord(arg.clone(), &labels)];
@@ -309,6 +579,16 @@ impl Rewriter<'_> {
             }
         }
         if let Some(N::MinMaxExpr(m)) = node.node.as_ref() {
+            if let Some(ty) = m.args.iter().find_map(|a| self.net_of(a)) {
+                let mut mm = (**m).clone();
+                mm.args = m.args.iter().map(|a| self.net_side(a, &ty)).collect();
+                let inner = pg_query::protobuf::Node {
+                    node: Some(N::MinMaxExpr(Box::new(mm))),
+                };
+                *node = Self::net_value(inner, &ty);
+                self.changed = true;
+                return Ok(());
+            }
             if let Some((ty, labels)) = m.args.iter().find_map(|a| self.enum_of(a)) {
                 let mut mm = (**m).clone();
                 mm.args = m
@@ -449,7 +729,10 @@ pub(crate) fn rewrite(
         if let Some(t) = target {
             // An enum target is sorted by position (below); a non-enum one
             // named like an enum column is sorted as itself.
-            if r.enum_of(&t).is_some() || !matches!(t.node.as_ref(), Some(N::ColumnRef(_))) {
+            if r.enum_of(&t).is_some()
+                || r.net_of(&t).is_some()
+                || !matches!(t.node.as_ref(), Some(N::ColumnRef(_)))
+            {
                 sb.node = Some(Box::new(t));
             }
         }

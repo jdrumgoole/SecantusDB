@@ -16,3 +16,11 @@ SELECT i, sum(i) OVER (ORDER BY i ROWS BETWEEN -1 PRECEDING AND CURRENT ROW) FRO
 SELECT i, sum(i) OVER (ORDER BY i GROUPS BETWEEN CURRENT ROW AND -1 FOLLOWING) FROM wo
 SELECT f, sum(i) OVER (ORDER BY f RANGE BETWEEN 'NaN' PRECEDING AND CURRENT ROW) FROM wo
 DROP TABLE wo
+# RANGE offsets over numeric keys past f64's precision compare exactly.
+create table wr_t (x numeric)
+insert into wr_t values (100000000000000000000), (100000000000000000001), (100000000000000000002), (1.5), (1.55), (null)
+select x, count(*) over (order by x range between 1 preceding and current row) from wr_t order by x
+select x, count(*) over (order by x desc range between 1 preceding and 1 following) from wr_t order by x desc
+select x, sum(x) over (order by x range between current row and 0.05 following) from wr_t order by x
+select x, count(*) over (order by x range between 1 following and 2 following) from wr_t order by x
+drop table wr_t

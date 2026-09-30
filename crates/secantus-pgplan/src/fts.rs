@@ -586,25 +586,30 @@ fn emit(raw: &str, out: &mut Vec<(String, Kind)>) {
     }
 }
 
-/// A letter to PostgreSQL's parser under the `C` locale the reference runs:
-/// an ASCII letter, or ANY non-ASCII character -- `wparser_def.c` treats
-/// every character above 0x7F as alphabetic there, so `«bonjour»`, `a—b`
-/// and Devanagari with its virama are each one word.
+/// A letter to PostgreSQL's parser under the UTF-8 locale this server
+/// reports (`C.UTF-8`): `iswalpha`, so a Unicode letter -- or a combining
+/// mark, which stays inside its word (Devanagari's virama) -- and NOT the
+/// punctuation or symbols around it (`«bonjour»` is `bonjour`, `x²` is
+/// `x`). A `C`-locale server calls every non-ASCII character a letter.
 fn letter_char(c: char) -> bool {
-    c.is_ascii_alphabetic() || !c.is_ascii()
+    c.is_ascii_alphabetic()
+        || (!c.is_ascii()
+            && (c.is_alphabetic() || unicode_normalization::char::is_combining_mark(c)))
 }
 
 /// A letter or an ASCII digit, by the same rule.
 fn word_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || !c.is_ascii()
+    c.is_ascii_digit() || letter_char(c)
 }
 
 /// One token through the configuration's dictionary: `None` for a
 /// stop-word (which still takes a position).
 fn normalise(token: &str, kind: Kind, cfg: Config) -> Option<String> {
-    // Lower-casing follows the database's LC_CTYPE; the reference server
-    // runs `C`, where only ASCII letters fold (`Ünïcode` keeps its `Ü`).
-    let lower = token.to_ascii_lowercase();
+    // Lower-casing follows the database's LC_CTYPE, which this server
+    // reports as `C.UTF-8`: every letter folds, by the same simple mapping
+    // `lower()` uses (`ÄBC` is `äbc`). A `C`-locale PostgreSQL folds ASCII
+    // only; the server is consistent with the locale it reports.
+    let lower: String = token.chars().map(crate::scalar::simple_lower).collect();
     let english = |lower: String| {
         if ENGLISH_STOP.contains(&lower.as_str()) {
             None
@@ -2270,6 +2275,12 @@ fn call_inner(name: &str, args: &[Bson]) -> Result<Bson> {
         "array_to_tsvector" => {
             let mut map = BTreeMap::new();
             for s in strings(&args[0])? {
+                if s.is_empty() {
+                    return Err(Error::Sqlstate(
+                        "2200F",
+                        "lexeme array may not contain empty strings".into(),
+                    ));
+                }
                 map.insert(s, Vec::new());
             }
             Ok(vector_out(&TsVector(map)))

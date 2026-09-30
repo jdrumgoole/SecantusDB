@@ -33,6 +33,17 @@ fn quoted_between<'a>(m: &'a str, prefix: &str) -> Option<&'a str> {
 /// message, when it can be found.
 pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize> {
     let location = take_error_location();
+    // `CREATE CAST` / `DROP CAST` resolve their types and function by name,
+    // outside any expression, and PostgreSQL reports no position for them.
+    let head: String = sql
+        .split_whitespace()
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    if head == "create cast" || head == "drop cast" {
+        return None;
+    }
     let scanned = pg_query::scan(sql).ok()?;
     let toks: Vec<Tok> = scanned
         .tokens
@@ -53,6 +64,24 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
     }
     let ident_at = |name: &str| toks.iter().position(|t| unquote_ident(t.text) == name);
     let m = message.split('\n').next().unwrap_or("");
+    // A set operation whose column types cannot be unified points at the
+    // RIGHT arm's expression (`select null::text union select 1`, under `1`).
+    if sqlstate == "42804" && m.contains(" types ") && m.ends_with("cannot be matched") {
+        let tree = pg_query::parse(sql).ok()?;
+        let stmt = tree.protobuf.stmts.first()?.stmt.as_ref()?;
+        let Some(N::SelectStmt(sel)) = stmt.node.as_ref() else {
+            return None;
+        };
+        let right = sel.rarg.as_deref()?;
+        let loc = right
+            .target_list
+            .first()
+            .and_then(|t| match t.node.as_ref() {
+                Some(N::ResTarget(rt)) => rt.val.as_deref().and_then(crate::expr_location),
+                _ => None,
+            })?;
+        return pos(usize::try_from(loc).ok()?);
+    }
     match sqlstate {
         "42703" => {
             // `column "x" does not exist`, or `column t.x does not exist`:

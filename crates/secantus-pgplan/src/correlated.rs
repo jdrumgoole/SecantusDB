@@ -500,6 +500,13 @@ pub fn has_correlated(expr: &ColumnExpr) -> bool {
                         || user_function_for(&name, &f.args).is_some()
                 });
         }
+        // So does a cast that may take a user cast's function.
+        if let Some(N::TypeCast(tc)) = n.node.as_ref() {
+            found |= tc
+                .type_name
+                .as_ref()
+                .is_some_and(|t| crate::user_casts::casts_to(&crate::type_name_of(t)));
+        }
         Ok(())
     });
     found

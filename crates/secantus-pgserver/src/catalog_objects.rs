@@ -190,7 +190,12 @@ impl PgHandler {
         Ok(())
     }
 
-    fn put(&self, collection: &'static str, id: &str, doc: Document) -> PgWireResult<()> {
+    pub(crate) fn put(
+        &self,
+        collection: &'static str,
+        id: &str,
+        doc: Document,
+    ) -> PgWireResult<()> {
         self.ensure_collection(collection)?;
         if self.catalog_doc(collection, id).is_some() {
             self.delete_type_doc(collection, id)?;
