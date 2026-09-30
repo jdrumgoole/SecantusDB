@@ -1,4 +1,4 @@
-### The Rust PostgreSQL server: two silent data-loss fixes, pgcrypto's PGP and cipher functions, CREATE CAST, network-type ordering, and deep expressions without crashes
+### The Rust PostgreSQL server: two silent data-loss fixes, rules, event triggers, foreign data, CREATE CAST and COLLATION, pgcrypto's PGP, and view definitions as PostgreSQL prints them
 
 Batch 11 started from a re-measured backlog: every open Rust-server entry was
 probed against PostgreSQL 15. Two of them were losing committed data without an
@@ -56,6 +56,18 @@ change is measured against PostgreSQL 15 (and 14 where a corpus needs it).
   `42883`, as in PostgreSQL.
 - **Dropping a type** that a function's signature names now refuses (`2BP01`)
   or cascades, as PostgreSQL does.
+- **`DROP FUNCTION f(), g()`** with several functions works. It runs as
+  one transaction: when one is missing, none is dropped (it was `0A000`).
+- **A PL/pgSQL record's array field** keeps its array type. `r.a` of a
+  `text[]` column was typed `text`, so storing it failed with `42804`.
+- **A computed column's type modifier.** `x::numeric(5,2)` in a select list
+  or a view now reports `numeric(5,2)`, in the row description and in
+  `pg_attribute`, where it was bare `numeric`.
+- **`pg_table_size`** counts a table's TOAST index (8192 bytes) when a
+  column can be TOASTed, as PostgreSQL does.
+- **`pg_class.relacl`** shows the grants on a table (`grantee=arwd/owner`,
+  `*` for WITH GRANT OPTION, per privilege); it was always NULL.
+  `relhasrules` is true for a table with a rule.
 
 #### Added
 
@@ -97,5 +109,29 @@ change is measured against PostgreSQL 15 (and 14 where a corpus needs it).
   `netmask`, `hostmask`, `family`, `abbrev`, `text`, `set_masklen`,
   `inet_same_family`, `inet_merge`, and the containment operators `<<`,
   `<<=`, `>>`, `>>=` and `&&`.
-- **New corpora:** `user_casts`, `pgcrypto_ciphers`, `expr_depth`, `clocks`
-  and `triage_fixes`.
+- **`CREATE RULE` / `DROP RULE`** on INSERT, UPDATE and DELETE: `DO ALSO`,
+  `DO INSTEAD`, `DO INSTEAD NOTHING` and a `WHERE`, with `pg_rewrite` and
+  `pg_rules`. `ALTER TABLE ... ENABLE` / `DISABLE RULE` and `TRIGGER`
+  (including `ALL` and `USER`) work too.
+- **Event triggers:** `CREATE` / `ALTER` / `DROP EVENT TRIGGER` on
+  `ddl_command_start`, `ddl_command_end` and `sql_drop`, with `TG_EVENT`,
+  `TG_TAG`, a `WHEN TAG IN` filter, `pg_event_trigger_dropped_objects()`,
+  `pg_event_trigger_ddl_commands()` and `pg_event_trigger`.
+- **Foreign data:** `CREATE` / `ALTER` / `DROP FOREIGN DATA WRAPPER`,
+  `SERVER`, `USER MAPPING` and `FOREIGN TABLE`, with their options,
+  dependencies and `CASCADE`, and the `pg_foreign_*` catalogs and
+  `information_schema` views. There is no FDW handler here, so reading or
+  writing a foreign table, and `IMPORT FOREIGN SCHEMA`, answer PostgreSQL's
+  own `55000` for a wrapper without one.
+- **View definitions as PostgreSQL prints them.** `pg_get_viewdef` and
+  `pg_views.definition` now follow ruleutils' layout: qualified columns,
+  typed literals, implicit casts written out, and parenthesised operators.
+  The pretty form `pg_get_viewdef(v, true)` (which psql's `\d+` uses) works
+  too. `pg_rules.definition`, and `pg_get_expr` over generated columns,
+  CHECK constraints and policies, use the same printer.
+- **`LANGUAGE internal` wrappers** are callable when the C function they
+  name has a SQL form here (`int4pl`, `textlen`, `upper`, ...).
+- **New corpora:** `user_casts`, `pgcrypto_ciphers`, `expr_depth`, `clocks`,
+  `triage_fixes`, `collations`, `rules`, `event_triggers`, `fdw`,
+  `catalog_b11`, `views_ruleutils`, `expr_ruleutils` and
+  `internal_functions`.

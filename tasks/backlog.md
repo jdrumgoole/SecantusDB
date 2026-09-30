@@ -595,12 +595,17 @@ remain open:
 - [ ] **OPEN — RUST pgserver: what `CREATE FUNCTION` still refuses
       (updated 2026-09-30).** `LANGUAGE sql` / `plpgsql` functions, overloads
       (keyed `name/nargs/types`), `VARIADIC`, SQL-standard bodies and
-      `RETURNING INTO` all work (corpora `functions`, `overloads`). Left:
-      `LANGUAGE internal` wrappers are catalog rows that are never callable
-      (PG 16.15 crashed its backend when a mis-declared one was called, so
-      that is not imitated), and the `CREATE TYPE` options other than
-      `input` / `output` / `like` (`internallength`, `category`, `receive`,
-      ...) are 0A000 rather than applied.
+      `RETURNING INTO` all work (corpora `functions`, `overloads`). A
+      `LANGUAGE internal` wrapper is accepted for any `prosrc` PostgreSQL 15
+      has and, since batch 11, CALLABLE where the C function has a SQL form
+      here -- the operator behind it (`int4pl` is `$1 + $2`) or a built-in
+      over the same C function (`textlen` is `length`); corpus
+      `internal_functions`. Left: a wrapper over any other C function is a
+      catalog row that answers 42883 when called (a wrapper declared over the
+      wrong C signature crashed a PG 16.15 backend, so calling one blind is
+      not imitated), and the `CREATE TYPE` options other than `input` /
+      `output` / `like` (`internallength`, `category`, `receive`, ...) are
+      0A000 rather than applied.
 - [ ] **OPEN — RUST pgserver triggers: the cross-server gap (2026-09-30).**
       `INSTEAD OF`, constraint triggers (deferred firing, `SET CONSTRAINTS`)
       and transition tables landed in batch 9 (corpora `instead_of`,
@@ -651,13 +656,10 @@ remain open:
         CHECK, UNIQUE, PRIMARY KEY, enforced -- landed in batch 10.) A
         partition's UNIQUE / PRIMARY KEY is checked by scanning the
         partition's rows per write, not by an index.
-      - A ruleutils-style deparser is approximated: a generation expression or
-        policy qual with a function call over a cast, or a CASE, renders
-        differently from `pg_get_expr` (`generated` corpus covers the common
-        shapes; `column_default` shapes in the `defaults` corpus).
-        `pg_get_viewdef` / `pg_views.definition` print the definition as
-        written, not in ruleutils' layout (columns qualified, one target per
-        line, implicit casts shown).
+      - The ruleutils deparser (`secantus-pgplan/src/ruleutils.rs`, batch 11)
+        prints views, rules and stored expressions from a small analyser; a
+        shape outside it falls back to the text as written -- see the batch
+        11 entry below for what it covers.
       - Built-in function arguments are type-checked for the text and numeric
         families only (`upper(1)`, `abs('x'::text)` are 42883); other
         built-ins still take what they are given.
@@ -667,11 +669,6 @@ remain open:
       locks and timeouts, array lower bounds, ALTER TABLE constraints, PG 15
       functions) leaves (2026-09-30).** 110 corpora at 0 divergences (PG 14
       reference; `merge` / `pg15_features` against a PG 15.19 reference). Left:
-      - **Refused statements** (0A000 by name): `CREATE CAST`, `CREATE
-        COLLATION`, `CREATE RULE`, `CREATE EVENT TRIGGER`, `CREATE FOREIGN
-        DATA WRAPPER`, `IMPORT FOREIGN SCHEMA`. (`CREATE AGGREGATE`,
-        `OPERATOR`, `STATISTICS`, `PUBLICATION`, `TABLESPACE`, `SECURITY
-        LABEL` and `INHERITS` landed in batch 10.)
       - Array lower bounds survive the functions measured to keep them
         (`array_append` / `_prepend` / `_cat` / `_remove` / `_replace` /
         `_fill`, `||`, subscript assignment); any other array-returning
@@ -699,8 +696,6 @@ remain open:
         139 relations and 2,005 columns); matching the set needs the catalogs
         this server does not model. psql's describe commands do not depend on
         it (`psql_describe*` corpora, byte-identical output).
-      - `pg_table_size` / `\dt+` report 0 bytes for an empty table where
-        PostgreSQL counts its TOAST index's 8192.
       - **Harness, not server:** `tests/test_tmp_retention_guard.py::
         test_default_tmp_retention_policy_is_allowed` timed out ONCE in three
         quiet full-suite runs on 2026-09-30: its nested `pytest --co -q
@@ -711,6 +706,48 @@ remain open:
       - `CREATE AGGREGATE`'s built-in state / final function signatures are
         checked for the operator functions (`int4pl`, `numeric_add`,
         `textcat`, ...); any other built-in is taken as declared.
+- [ ] **OPEN — RUST pgserver: what batch 11 (rules, event triggers, foreign
+      data, CREATE CAST / COLLATION, pgcrypto PGP, ruleutils) leaves
+      (2026-09-30).** Every statement batch 9 listed as refused now runs.
+      Corpora at 0 against PostgreSQL 15.19: `rules`, `event_triggers`, `fdw`,
+      `collations`, `user_casts`, `views_ruleutils`, `expr_ruleutils`,
+      `internal_functions`, `catalog_b11`, `pgcrypto_ciphers`. Left, each
+      measured:
+      - **Rules** run as row-level actions of the statement (a synthetic
+        BEFORE trigger for INSTEAD, AFTER for ALSO), so an action runs once
+        per affected ROW where PostgreSQL rewrites the statement into one
+        query: an action that aggregates over the table (`INSERT ... SELECT
+        count(*)`) sees each row's state, not the statement's. Rules on a
+        VIEW and `ON SELECT` rules (turning a table into a view) are refused.
+      - **Event triggers**: `table_rewrite` never fires, and only a
+        top-level DDL command fires them (DDL run inside a trigger function
+        does not). `pg_event_trigger_ddl_commands()` reports CREATE / ALTER
+        TABLE, CREATE INDEX / VIEW / SEQUENCE / TYPE / FUNCTION and no rows
+        for other commands, and has no `command` column;
+        `pg_event_trigger_dropped_objects()` reports a function's (and a few
+        other objects') `objid` as 0.
+      - **Foreign data**: no FDW handler can exist here, so a foreign table
+        is never readable or writable (PostgreSQL's own answer for a
+        handler-less wrapper); `postgres_fdw` / `file_fdw` are not available,
+        and a `VALIDATOR` must be a user function, which cannot be written.
+      - **ruleutils** (`pg_get_viewdef`, `pg_views`, `pg_rules`,
+        `pg_get_expr` over generated columns, CHECKs and policies): the
+        analyser knows the common operator and function families. A view or
+        expression it cannot type -- a cross-type date/time comparison, a
+        function outside its signature table, VALUES, window frames, LATERAL,
+        column-alias lists, a set operation with ORDER BY / LIMIT, WITH
+        RECURSIVE -- falls back to the definition as written. The int
+        wrap-column form of `pg_get_viewdef` prints the pretty form without
+        its wrapping rule.
+      - **Collations**: `pg_collation` lists only `und-x-icu` / `en-x-icu` of
+        PostgreSQL's hundreds of ICU built-ins; `pg_typeof('x' COLLATE "C")`
+        is `text` where PostgreSQL says `unknown`; a PRIMARY KEY under a
+        nondeterministic collation is not case-insensitive.
+      - **`relacl`** is NULL until the first GRANT, and after every grant is
+        revoked again (PostgreSQL keeps the owner's entry); `attacl` is not
+        rendered.
+      - **pgcrypto**: Blowfish and CAST5 PGP messages are verified against
+        GnuPG only -- both reference servers' OpenSSL 3 builds refuse them.
 - [ ] **OPEN — RUST pgserver: residuals of the wide-`numeric` slice
       (2026-09-09).** Values wider than Decimal128 now store exactly as
       `{__numeric: <canonical text>, __numkey: <byte-sortable key>}`
