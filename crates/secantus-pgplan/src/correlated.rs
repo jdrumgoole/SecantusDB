@@ -540,6 +540,8 @@ pub fn with_sequence_hook<R>(hook: &SequenceHook<'_>, f: impl FnOnce() -> R) -> 
 
 /// The sequence functions.
 pub(crate) const SEQUENCE_FUNCTIONS: &[&str] = &[
+    // `pg_trgm`'s `set_limit` writes the session's threshold.
+    "set_limit",
     "nextval",
     "currval",
     "setval",
@@ -579,6 +581,7 @@ pub fn executor_function_type(name: &str) -> Option<&'static str> {
         }
         n if n.contains("advisory") => "void",
         "pg_has_role" => "bool",
+        "set_limit" => "float4",
         _ => return None,
     })
 }

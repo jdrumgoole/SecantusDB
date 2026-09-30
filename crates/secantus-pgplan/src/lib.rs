@@ -43,6 +43,7 @@ pub mod privileges;
 pub mod regobj;
 pub mod rls;
 mod rowsfrom;
+pub mod trgm;
 pub use correlated::set_user_functions;
 pub use correlated::{
     with_correlated_runner, with_function_hook, with_sequence_hook, FnResult, UserFn,
@@ -5122,6 +5123,17 @@ fn index_operator_class(method: &str, pg_type: &str, explicit: Option<&str>) -> 
         // The non-default classes PostgreSQL ships for these methods (and
         // `gin_trgm_ops` / `gist_trgm_ops` once pg_trgm is installed, which
         // this server does not provide).
+        // `pg_trgm`'s classes over the string types.
+        (Some(o @ ("gin_trgm_ops" | "gist_trgm_ops")), _)
+            if extension_installed("pg_trgm")
+                && o.starts_with(method)
+                && matches!(
+                    ty.as_str(),
+                    "text" | "varchar" | "bpchar" | "character varying" | "character"
+                ) =>
+        {
+            Ok(format!(" {o}"))
+        }
         (Some(o @ ("jsonb_path_ops" | "jsonb_ops")), _) if method == "gin" && ty == "jsonb" => {
             Ok(if o == "jsonb_ops" {
                 String::new()
@@ -15854,6 +15866,41 @@ fn default_is_volatile(node: &pg_query::protobuf::Node) -> bool {
 }
 
 fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
+    // `pg_trgm`: its functions and operators answer `real` (and `text[]`,
+    // `boolean`), which a value alone -- a double -- does not say.
+    match node.node.as_ref() {
+        Some(N::FuncCall(f)) if func_name(f).is_some_and(|n| trgm::is_function(&n)) => {
+            if let Some(t) = func_name(f).as_deref().and_then(trgm::result_type) {
+                return t.to_string();
+            }
+        }
+        Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("set_limit") => {
+            return "float4".to_string();
+        }
+        Some(N::AExpr(e)) if extension_installed("pg_trgm") => {
+            let op = e.name.last().and_then(|n| match n.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            });
+            let texty = |n: Option<&pg_query::protobuf::Node>| {
+                n.is_some_and(|n| {
+                    matches!(
+                        static_type(n, &Bson::Null).as_str(),
+                        "text" | "varchar" | "bpchar" | "name"
+                    ) || matches!(n.node.as_ref(), Some(N::AConst(c))
+                            if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))))
+                })
+            };
+            if texty(e.lexpr.as_deref()) && texty(e.rexpr.as_deref()) {
+                match op {
+                    Some("<->" | "<<->" | "<->>" | "<<<->" | "<->>>") => return "float4".into(),
+                    Some("%" | "<%" | "%>" | "<<%" | "%>>") => return "bool".into(),
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
     match node.node.as_ref() {
         Some(N::TypeCast(tc)) => tc
             .type_name
@@ -17468,6 +17515,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                             || mathfn::result_type(&name).is_some()
                             || geom::result_type(&name).is_some()
                             || pgcrypto::result_type(&name).is_some()
+                            || (trgm::is_function(&name) && trgm::result_type(&name).is_some())
                             || jsonpath::is_function(&name)
                         {
                             declared.to_string()
@@ -23836,6 +23884,12 @@ fn is_time_text(v: &Bson) -> bool {
 }
 
 pub(crate) fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
+    // `pg_trgm`'s operators over two texts.
+    if let (Bson::String(a), Bson::String(b)) = (&lhs, &rhs) {
+        if let Some(v) = trgm::operator(op, a, b) {
+            return Ok(v);
+        }
+    }
     if arrays::is_bounded(&lhs) || arrays::is_bounded(&rhs) {
         return eval_binary_bounded(op, lhs, rhs);
     }
@@ -24517,6 +24571,13 @@ fn plan_set(v: &pg_query::protobuf::VariableSetStmt) -> Result<Statement> {
     // text PostgreSQL stores, joined by commas (`SET DateStyle = 'ISO','MDY'`).
     let mut parts = Vec::new();
     for a in &v.args {
+        // A numeric literal is kept as written (`0.6`, not a decimal's form).
+        if let Some(N::AConst(c)) = a.node.as_ref() {
+            if let Some(pg_query::protobuf::a_const::Val::Fval(f)) = c.val.as_ref() {
+                parts.push(f.fval.clone());
+                continue;
+            }
+        }
         let text = match const_value(a, &[])? {
             Bson::String(s) => s,
             Bson::Int32(i) => i.to_string(),
@@ -24524,7 +24585,7 @@ fn plan_set(v: &pg_query::protobuf::VariableSetStmt) -> Result<Statement> {
             Bson::Double(d) => d.to_string(),
             Bson::Boolean(b) => (if b { "on" } else { "off" }).to_string(),
             Bson::Null => "".to_string(),
-            other => format!("{other:?}"),
+            other => value_text(&other),
         };
         parts.push(text);
     }

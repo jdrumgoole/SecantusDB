@@ -4413,6 +4413,8 @@ impl PgHandler {
             "btree_gist" => Some(("1.6", true, &[])),
             // Functions only: digest / hmac / crypt / gen_salt / ...
             "pgcrypto" => Some(("1.3", true, &[])),
+            // Trigram similarity: functions and operators, no types.
+            "pg_trgm" => Some(("1.6", true, &[])),
             "postgis" => Some(("3.4.6", false, &["geometry"])),
             _ => None,
         }
@@ -14041,6 +14043,32 @@ impl PgHandler {
         if name == "pg_has_role" {
             return self.has_role_call(args);
         }
+        // `pg_trgm`'s `set_limit(real)`: the session's similarity threshold.
+        if name == "set_limit" {
+            let v = match args.first() {
+                Some(Bson::Double(d)) => *d,
+                Some(Bson::Int32(i)) => f64::from(*i),
+                Some(Bson::Int64(i)) => *i as f64,
+                Some(other) => secantus_pgplan::value_text(other)
+                    .parse()
+                    .unwrap_or(f64::NAN),
+                None => f64::NAN,
+            };
+            if !(0.0..=1.0).contains(&v) {
+                return Err(Self::user_error(
+                    "22023",
+                    format!(
+                        "{v} is outside the valid range for parameter \"pg_trgm.similarity_threshold\" (0 .. 1)"
+                    ),
+                ));
+            }
+            let text = format!("{}", v as f32);
+            self.settings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert("pg_trgm.similarity_threshold".into(), text);
+            return Ok(Bson::Double(f64::from(v as f32)));
+        }
         let seq = |i: usize| -> PgWireResult<Option<String>> {
             self.sequence_name_arg(&ConstCol::Value(args.get(i).cloned().unwrap_or(Bson::Null)))
         };
@@ -15158,8 +15186,23 @@ impl PgHandler {
             ConstCol::CurrentSetting { name, missing_ok } => {
                 let key = canonical_setting(name);
                 let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
-                match settings.get(&key) {
-                    Some(v) => Ok(Bson::String(v.clone())),
+                // `pg_trgm`'s thresholds exist once the extension does.
+                let trgm_default = match key.as_str() {
+                    "pg_trgm.similarity_threshold" => Some("0.3"),
+                    "pg_trgm.word_similarity_threshold" => Some("0.6"),
+                    "pg_trgm.strict_word_similarity_threshold" => Some("0.5"),
+                    _ => None,
+                }
+                .filter(|_| {
+                    self.type_catalog_docs(Self::EXTENSION_COLLECTION)
+                        .is_ok_and(|d| d.iter().any(|e| e.get_str("_id") == Ok("pg_trgm")))
+                });
+                match settings
+                    .get(&key)
+                    .cloned()
+                    .or(trgm_default.map(str::to_string))
+                {
+                    Some(v) => Ok(Bson::String(v)),
                     // `current_setting(x)` errors on an unknown name;
                     // `current_setting(x, true)` answers NULL (probed PG 14).
                     None if *missing_ok => Ok(Bson::Null),

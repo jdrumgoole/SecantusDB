@@ -40,6 +40,10 @@ const BUILTIN: &[&str] = &[
 /// Does PostgreSQL itself have an operator of this name? (`!=` is `<>`.)
 pub fn is_builtin(op: &str) -> bool {
     BUILTIN.contains(&op)
+        || (matches!(
+            op,
+            "<%" | "%>" | "<<%" | "%>>" | "<<->" | "<->>" | "<<<->" | "<->>>"
+        ) && crate::extension_installed("pg_trgm"))
 }
 
 /// The ordinary operator a built-in operator FUNCTION implements.
