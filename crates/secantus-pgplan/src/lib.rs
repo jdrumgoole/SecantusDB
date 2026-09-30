@@ -42,6 +42,9 @@ pub mod joins;
 pub mod merge;
 pub mod partitions;
 pub mod pgcrypto;
+pub mod pgcrypto_raw;
+pub mod pgp;
+pub mod pgp_pub;
 pub mod privileges;
 pub mod regobj;
 pub mod rls;
@@ -2692,13 +2695,126 @@ fn parse_tree(sql: &str) -> Result<std::sync::Arc<pg_query::protobuf::ParseResul
         return Ok(Arc::clone(tree));
     }
     func_cast::check_numeric_junk(sql)?;
-    let tree = Arc::new(pg_query::parse(sql).map_err(parse_error)?.protobuf);
+    let tree = Arc::new(parse_guarded(sql)?.protobuf);
+    check_depth(&tree)?;
     let mut guard = memo.lock().unwrap_or_else(|e| e.into_inner());
     if guard.len() >= MAX_ENTRIES {
         guard.clear();
     }
     guard.insert(sql.to_string(), Arc::clone(&tree));
     Ok(tree)
+}
+
+/// The deepest expression nesting the planner will walk. Planning recurses
+/// once per level, so past some depth the thread's stack runs out -- which
+/// aborts the whole server, not the statement. PostgreSQL's own
+/// `max_stack_depth` refuses at a similar point (a 1,000-term `||` chain
+/// runs, a 5,000-term one is 54001), so this is its error, raised before
+/// any recursion starts. The worker stack (`WORKER_STACK_BYTES` in the
+/// server) holds this depth in a debug build with room to spare.
+pub const MAX_EXPR_DEPTH: i32 = 2500;
+
+/// An upper bound on how deeply `sql`'s expressions can nest, from its
+/// tokens. A run of operators with nothing between them but operands builds
+/// a chain one level per operator (`a || b || c`); a `,`, `AND` or `OR`
+/// ends the run, because a list and a boolean chain are flat. Each open
+/// bracket adds a level on top of its enclosing run. Scanning is iterative,
+/// so this is safe on any input.
+fn nesting_bound(sql: &str) -> usize {
+    use pg_query::protobuf::Token as T;
+    let Ok(scan) = pg_query::scan(sql) else {
+        return 0;
+    };
+    // One operator-run counter per open bracket; `base` is the depth the
+    // enclosing levels have already reached.
+    let mut stack: Vec<(usize, usize)> = vec![(0, 0)];
+    let mut deepest = 0usize;
+    for t in &scan.tokens {
+        let (base, run) = stack.last_mut().expect("never empty");
+        match T::try_from(t.token) {
+            Ok(T::Ascii40 | T::Ascii91) => {
+                let level = *base + *run + 1;
+                stack.push((level, 0));
+                deepest = deepest.max(level);
+            }
+            Ok(T::Ascii41 | T::Ascii93) => {
+                if stack.len() > 1 {
+                    stack.pop();
+                }
+            }
+            Ok(T::Ascii44 | T::And | T::Or) => *run = 0,
+            Ok(
+                T::Ascii37
+                | T::Ascii42
+                | T::Ascii43
+                | T::Ascii45
+                | T::Ascii47
+                | T::Ascii60
+                | T::Ascii61
+                | T::Ascii62
+                | T::Ascii94
+                | T::Op
+                | T::Typecast
+                | T::LessEquals
+                | T::GreaterEquals
+                | T::NotEquals,
+            ) => {
+                *run += 1;
+                deepest = deepest.max(*base + *run);
+            }
+            _ => {}
+        }
+    }
+    deepest
+}
+
+/// `pg_query::parse`, safe against a statement nested deep enough to
+/// overflow the stack WHILE PARSING -- libpg_query's protobuf writer and the
+/// decoder both recurse once per level, before `check_depth` can look. A
+/// statement short enough cannot nest far; a longer one is bounded by its
+/// tokens, parsed on a thread with a stack sized for the bound, and refused
+/// outright past what that thread holds.
+fn parse_guarded(sql: &str) -> Result<pg_query::ParseResult> {
+    const DIRECT_CHARS: usize = 4000;
+    const BIG_STACK_BYTES: usize = 1 << 30;
+    // A debug build spends ~20 KiB of stack per level here; PostgreSQL
+    // itself refuses a 5,000-term chain.
+    const MAX_BOUND: usize = 20_000;
+    if sql.len() <= DIRECT_CHARS {
+        return pg_query::parse(sql).map_err(parse_error);
+    }
+    let bound = nesting_bound(sql);
+    if bound <= MAX_EXPR_DEPTH as usize {
+        return pg_query::parse(sql).map_err(parse_error);
+    }
+    if bound > MAX_BOUND {
+        return Err(Error::Sqlstate(
+            "54001",
+            "stack depth limit exceeded".into(),
+        ));
+    }
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(BIG_STACK_BYTES)
+            .spawn_scoped(scope, || pg_query::parse(sql).map_err(parse_error))
+            .map_err(|e| Error::Sqlstate("54001", format!("stack depth limit exceeded: {e}")))?
+            .join()
+            .map_err(|_| Error::Sqlstate("XX000", "the parser thread panicked".into()))?
+    })
+}
+
+fn check_depth(tree: &pg_query::protobuf::ParseResult) -> Result<()> {
+    if tree
+        .nodes()
+        .iter()
+        .any(|(_, depth, _, _)| *depth > MAX_EXPR_DEPTH)
+    {
+        return Err(Error::Sqlstate(
+            "54001",
+            "stack depth limit exceeded".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_one(sql: &str) -> Result<N> {
@@ -14271,22 +14387,34 @@ thread_local! {
 }
 
 /// `SELECT <aggs> FROM r WHERE p ...` as `SELECT <aggs> FROM (SELECT * FROM
-/// r WHERE p) r ...`, for a single plain relation `r`; `None` otherwise.
+/// r WHERE p) r ...`, for a single relation, subquery or function `r`;
+/// `None` otherwise.
 fn aggregate_where_as_subquery(
     s: &pg_query::protobuf::SelectStmt,
 ) -> Option<pg_query::protobuf::SelectStmt> {
     let [item] = s.from_clause.as_slice() else {
         return None;
     };
-    let Some(N::RangeVar(r)) = item.node.as_ref() else {
-        return None;
+    let named = |a: Option<&pg_query::protobuf::Alias>| {
+        a.map(|a| a.aliasname.clone()).filter(|a| !a.is_empty())
     };
-    let alias = r
-        .alias
-        .as_ref()
-        .map(|a| a.aliasname.clone())
-        .filter(|a| !a.is_empty())
-        .unwrap_or_else(|| r.relname.clone());
+    // A table, or a subquery / function in FROM (`(VALUES ...) v(x)`,
+    // `generate_series(1, 3) g`): the outer query reads the filtered rows
+    // under the same name, so `v.x` and `g` still resolve.
+    let alias = match item.node.as_ref() {
+        Some(N::RangeVar(r)) => named(r.alias.as_ref()).unwrap_or_else(|| r.relname.clone()),
+        Some(N::RangeSubselect(r)) if !r.lateral => named(r.alias.as_ref())?,
+        Some(N::RangeFunction(f)) if !f.lateral => named(f.alias.as_ref()).or_else(|| {
+            let Some(N::List(l)) = f.functions.first()?.node.as_ref() else {
+                return None;
+            };
+            let Some(N::FuncCall(call)) = l.items.first()?.node.as_ref() else {
+                return None;
+            };
+            func_name(call)
+        })?,
+        _ => return None,
+    };
     let star = pg_query::protobuf::Node {
         node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
             val: Some(Box::new(pg_query::protobuf::Node {
@@ -16520,6 +16648,34 @@ fn default_is_volatile(node: &pg_query::protobuf::Node) -> bool {
 }
 
 fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
+    // Memoised inside a `const_value` evaluation (see `TYPE_MEMO`), for an
+    // operator node typed without a value -- the answer then depends on the
+    // node alone.
+    let key = match node.node.as_ref() {
+        Some(N::AExpr(e)) if *value == Bson::Null && CONST_DEPTH.with(|d| d.get()) > 0 => Some((
+            std::ptr::from_ref(node) as usize,
+            e.location,
+            e.lexpr
+                .as_deref()
+                .map_or(0, |n| std::ptr::from_ref(n) as usize),
+            e.rexpr
+                .as_deref()
+                .map_or(0, |n| std::ptr::from_ref(n) as usize),
+        )),
+        _ => None,
+    };
+    if let Some(key) = key {
+        if let Some(t) = TYPE_MEMO.with(|m| m.borrow().get(&key).cloned()) {
+            return t;
+        }
+        let t = static_type_uncached(node, value);
+        TYPE_MEMO.with(|m| m.borrow_mut().insert(key, t.clone()));
+        return t;
+    }
+    static_type_uncached(node, value)
+}
+
+fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String {
     // `pg_trgm`: its functions and operators answer `real` (and `text[]`,
     // `boolean`), which a value alone -- a double -- does not say.
     match node.node.as_ref() {
@@ -16961,18 +17117,31 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
                 };
             }
             let op = operator_name(e).unwrap_or("");
+            // Each operand is typed ONCE per node. The arms below all ask, and
+            // re-typing a child in each made a left-deep `a || b || c || ...`
+            // cost ~5^depth: ten terms never finished.
+            let (lt_cell, rt_cell) = (std::cell::OnceCell::new(), std::cell::OnceCell::new());
+            let lt = || -> Option<&String> {
+                lt_cell
+                    .get_or_init(|| e.lexpr.as_deref().map(|l| static_type(l, &Bson::Null)))
+                    .as_ref()
+            };
+            let rt = || -> Option<&String> {
+                rt_cell
+                    .get_or_init(|| e.rexpr.as_deref().map(|r| static_type(r, &Bson::Null)))
+                    .as_ref()
+            };
             // A prefix operator over a geometric operand (`@@ circle`).
-            if let (None, Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
-                if let Some(t) = geom::unary_type(op, &static_type(r, &Bson::Null)) {
+            if let (None, Some(r)) = (lt(), rt()) {
+                if let Some(t) = geom::unary_type(op, r) {
                     return t.to_string();
                 }
             }
-            if let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
-                let (lt, rt) = (static_type(l, &Bson::Null), static_type(r, &Bson::Null));
-                if let Some(t) = range_ops::result_type(op, &lt, &rt) {
+            if let (Some(lt), Some(rt)) = (lt(), rt()) {
+                if let Some(t) = range_ops::result_type(op, lt, rt) {
                     return t;
                 }
-                if let Some(t) = geom::operator_type(op, &lt, &rt) {
+                if let Some(t) = geom::operator_type(op, lt, rt) {
                     return t.to_string();
                 }
                 // jsonb's `-` / `#-` / `||` answer jsonb.
@@ -16985,10 +17154,13 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
             // Bit-string operators keep the left operand's type; `||` is varbit
             // and `~` the operand's.
             if matches!(op, "&" | "|" | "#" | "<<" | ">>" | "||" | "~") {
-                let side = e.lexpr.as_deref().or(e.rexpr.as_deref());
-                if let Some(t) = side.map(|n| static_type(n, &Bson::Null)) {
-                    if bits::is_bit_type(&t) {
-                        return if op == "||" { "varbit".to_string() } else { t };
+                if let Some(t) = lt().or(rt()) {
+                    if bits::is_bit_type(t) {
+                        return if op == "||" {
+                            "varbit".to_string()
+                        } else {
+                            t.clone()
+                        };
                     }
                 }
             }
@@ -17000,16 +17172,17 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
                 return "tsquery".to_string();
             }
             if matches!(op, "||" | "&&" | "<->") {
-                if let Some(l) = e.lexpr.as_deref() {
-                    let t = static_type(l, &Bson::Null);
+                if let Some(t) = lt() {
                     if t == "tsvector" || t == "tsquery" {
-                        return t;
+                        return t.clone();
                     }
                 }
             }
             // The hstore operators type from the operator and, for `->`,
             // from whether the RIGHT operand is a key or a key list.
-            if static_hstore_operand(e.lexpr.as_deref(), &Bson::Null) {
+            if lt().is_some_and(|t| t == "hstore")
+                && extension_type("hstore") == Some(ExtensionType::Hstore)
+            {
                 if let Some(t) = static_hstore_result(op, e.rexpr.as_deref()) {
                     return t;
                 }
@@ -17032,30 +17205,25 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
             // The array containment operators answer a boolean. Reached only
             // when the json branch above did not claim the operator, so an
             // array operand is what is left.
-            if matches!(op, "@>" | "<@" | "&&") {
-                let side = |n: Option<&pg_query::protobuf::Node>| {
-                    n.map(|node| static_type(node, &Bson::Null))
-                };
-                if side(e.lexpr.as_deref()).is_some_and(|t| t.ends_with("[]"))
-                    || side(e.rexpr.as_deref()).is_some_and(|t| t.ends_with("[]"))
-                {
-                    return "bool".to_string();
-                }
+            if matches!(op, "@>" | "<@" | "&&")
+                && (lt().is_some_and(|t| t.ends_with("[]"))
+                    || rt().is_some_and(|t| t.ends_with("[]")))
+            {
+                return "bool".to_string();
             }
             match op {
                 // `||` is text concatenation EXCEPT bytea||bytea, which is
                 // bytea: type it from the operands so a bare (uncast) concat
                 // reports oid 17 rather than 25.
                 "||" => {
-                    let side = |n: Option<&pg_query::protobuf::Node>| {
-                        n.map(|node| static_type(node, &Bson::Null))
-                    };
-                    let (l, r) = (side(e.lexpr.as_deref()), side(e.rexpr.as_deref()));
+                    let (l, r) = (lt(), rt());
                     // An array beside anything is `array_cat` / `array_append`
                     // / `array_prepend`, typed as the array.
                     if let Some(t) = l.iter().chain(r.iter()).find(|t| t.ends_with("[]")) {
-                        t.clone()
-                    } else if l.as_deref() == Some("bytea") || r.as_deref() == Some("bytea") {
+                        (*t).clone()
+                    } else if l.map(String::as_str) == Some("bytea")
+                        || r.map(String::as_str) == Some("bytea")
+                    {
                         "bytea".to_string()
                     } else {
                         "text".to_string()
@@ -17073,16 +17241,14 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
                     // result loader. Without this a `timestamp + interval` was
                     // described as `int4`/`text` and the client decoded it wrong.
                     // Unary minus keeps an interval an interval.
-                    if e.lexpr.is_none() && matches!(op, "-" | "+") {
-                        if let Some(r) = e.rexpr.as_deref() {
-                            if static_type(r, &Bson::Null) == "interval" {
-                                return "interval".to_string();
-                            }
-                        }
+                    if e.lexpr.is_none()
+                        && matches!(op, "-" | "+")
+                        && rt().is_some_and(|t| t == "interval")
+                    {
+                        return "interval".to_string();
                     }
-                    if let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
-                        let lt = static_type(l, &Bson::Null);
-                        let rt = static_type(r, &Bson::Null);
+                    if let (Some(lt), Some(rt)) = (lt(), rt()) {
+                        let (lt, rt) = (lt.clone(), rt.clone());
                         if let Some(t) = datetime_arith_type(op, &lt, &rt) {
                             return t.to_string();
                         }
@@ -26773,7 +26939,39 @@ fn xml_expr_value(x: &pg_query::protobuf::XmlExpr, params: &[Bson]) -> Result<Bs
     })
 }
 
+thread_local! {
+    /// `const_value` nesting on this thread; see [`const_value`].
+    static CONST_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// `static_type` of operator nodes, for ONE outermost `const_value`
+    /// evaluation. Keyed by the node's address, its location and its operands'
+    /// addresses: the tree being evaluated is not changed while it is walked,
+    /// so within one evaluation an address names one node.
+    static TYPE_MEMO: std::cell::RefCell<std::collections::HashMap<(usize, i32, usize, usize), String>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Evaluate a constant expression. The evaluator asks `static_type` about
+/// each operand at every level, and each ask walks the subtree beneath it,
+/// so a long `a || b || c ...` cost O(n^2) -- 1,000 terms took most of a
+/// minute. `static_type`'s answers are memoised for the evaluation.
 fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson> {
+    let depth = CONST_DEPTH.with(|d| {
+        let v = d.get();
+        d.set(v + 1);
+        v
+    });
+    if depth == 0 {
+        TYPE_MEMO.with(|m| m.borrow_mut().clear());
+    }
+    let out = const_value_inner(node, params);
+    CONST_DEPTH.with(|d| d.set(depth));
+    if depth == 0 {
+        TYPE_MEMO.with(|m| m.borrow_mut().clear());
+    }
+    out
+}
+
+fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson> {
     // `'1'::int`, `$1::text`, `null::int`. The cast is applied to whatever the
     // operand evaluates to, so a bound parameter casts exactly like a literal.
     if let Some(N::TypeCast(tc)) = node.node.as_ref() {
