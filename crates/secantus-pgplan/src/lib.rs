@@ -58,6 +58,7 @@ pub mod range;
 pub mod range_ops;
 pub mod scalar;
 pub mod user_agg;
+pub mod user_ops;
 pub mod view_deps;
 pub mod view_dml;
 pub mod xml;
@@ -486,6 +487,15 @@ pub enum Statement {
     },
     /// A statement that only records something (see `catalog_stmts`).
     Catalog(catalog_stmts::CatalogOp),
+    /// `CREATE OPERATOR` (see `user_ops`).
+    CreateOperator(user_ops::UserOperator),
+    /// `DROP OPERATOR [IF EXISTS] name (left, right)`.
+    DropOperator {
+        name: String,
+        left: Option<String>,
+        right: String,
+        if_exists: bool,
+    },
     /// `DROP AGGREGATE [IF EXISTS] name (args)`.
     DropAggregate {
         name: String,
@@ -2953,6 +2963,9 @@ fn plan_node(
         N::DefineStmt(d) if ObjectType::try_from(d.kind) == Ok(ObjectType::ObjectAggregate) => {
             plan_create_aggregate(&d)
         }
+        N::DefineStmt(d) if ObjectType::try_from(d.kind) == Ok(ObjectType::ObjectOperator) => {
+            plan_create_operator(&d)
+        }
         N::CreateFunctionStmt(f) => plan_create_function(&f),
         N::CreateTrigStmt(t) => plan_create_trigger(&t),
         N::CopyStmt(c) => plan_copy(&c, lookup, params),
@@ -3320,6 +3333,71 @@ fn plan_define_type(d: &pg_query::protobuf::DefineStmt) -> Result<Statement> {
         input,
         output,
     })
+}
+
+/// `CREATE OPERATOR name (leftarg = t, rightarg = t, function = f, ...)`.
+/// The optimizer hints (`commutator`, `negator`, `restrict`, `join`,
+/// `hashes`, `merges`) are accepted; nothing here plans with them.
+fn plan_create_operator(d: &pg_query::protobuf::DefineStmt) -> Result<Statement> {
+    let name = d
+        .defnames
+        .iter()
+        .rev()
+        .find_map(|n| match n.node.as_ref() {
+            Some(N::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let mut left = None;
+    let mut right = None;
+    let mut function = None;
+    for opt in &d.definition {
+        let Some(N::DefElem(e)) = opt.node.as_ref() else {
+            continue;
+        };
+        let value = match e.arg.as_ref().and_then(|a| a.node.as_ref()) {
+            Some(N::TypeName(t)) => Some(type_name_of(t)),
+            Some(N::String(s)) => Some(s.sval.clone()),
+            Some(N::List(l)) => l.items.iter().rev().find_map(|n| match n.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            }),
+            _ => None,
+        };
+        match e.defname.to_ascii_lowercase().as_str() {
+            "leftarg" => left = value,
+            "rightarg" => right = value,
+            "function" | "procedure" => function = value,
+            "commutator" | "negator" | "restrict" | "join" | "hashes" | "merges" | "sort1"
+            | "sort2" | "ltcmp" | "gtcmp" => {}
+            other => {
+                return Err(Error::Sqlstate(
+                    "42601",
+                    format!("operator attribute \"{other}\" not recognized"),
+                ))
+            }
+        }
+    }
+    let Some(function) = function else {
+        return Err(Error::Sqlstate(
+            "42P13",
+            "operator function must be specified".into(),
+        ));
+    };
+    let Some(right) = right else {
+        return Err(Error::Sqlstate(
+            "42P13",
+            "operator right argument type must be specified".into(),
+        ));
+    };
+    let result = user_ops::resolve_function(&function, left.as_deref(), &right)?;
+    Ok(Statement::CreateOperator(user_ops::UserOperator {
+        name,
+        left,
+        right,
+        function,
+        result,
+    }))
 }
 
 /// `CREATE AGGREGATE`, in both forms: `name (args) (sfunc = ..., ...)` and
@@ -9297,8 +9375,21 @@ fn row_column_expr(
     // A sample row's value types what the node alone cannot (a scalar call's
     // result); an expression that fails on the sample still gets the node's
     // own type, and fails per row when run.
-    let sample_value =
-        correlated::without_side_effects(|| apply_row_expr(&out, sample)).unwrap_or(Bson::Null);
+    // A symbol PostgreSQL has no operator for is its 42883 at plan time,
+    // not an error per row -- which an empty table would never raise.
+    let unknown_op = expr.node.as_ref().is_some_and(|n| {
+        n.nodes().iter().any(|(x, _, _, _)| {
+            matches!(x, pg_query::NodeRef::AExpr(e)
+                if pg_query::protobuf::AExprKind::try_from(e.kind) == Ok(pg_query::protobuf::AExprKind::AexprOp)
+                    && e.name.iter().any(|n| matches!(n.node.as_ref(),
+                        Some(N::String(s)) if !user_ops::is_builtin(&s.sval))))
+        })
+    });
+    let sample_value = match correlated::without_side_effects(|| apply_row_expr(&out, sample)) {
+        Ok(v) => v,
+        Err(e @ Error::UndefinedFunction(_)) if unknown_op => return Err(e),
+        Err(_) => Bson::Null,
+    };
     let previous = declare_row_fields(params.len(), fields);
     let result_type = static_type(&expr, &sample_value);
     PLAN_PARAM_TYPES.with(|t| *t.borrow_mut() = previous);
@@ -18580,8 +18671,10 @@ pub fn regtype_oid(v: &Bson) -> Option<i64> {
 /// element's display name plus `[]`.
 pub fn regtype_text(oid: i64) -> String {
     // The catalog's `char` (oid 18) is the one-byte `"char"`, which
-    // display_type would read as `character` (bpchar).
+    // display_type would read as `character` (bpchar). Oid 0 -- "none", a
+    // prefix operator's left type -- prints as `-`.
     match oid {
+        0 => return "-".to_string(),
         18 => return QUOTED_CHAR.to_string(),
         1002 => return format!("{QUOTED_CHAR}[]"),
         _ => {}
@@ -23880,6 +23973,13 @@ pub(crate) fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
             }
             a.checked_rem(b)
         }
+        other if !user_ops::is_builtin(other) => {
+            return Err(Error::UndefinedFunction(format!(
+                "operator does not exist: {} {other} {}",
+                display_type(inferred_type(&lhs)),
+                display_type(inferred_type(&rhs))
+            )))
+        }
         other => return Err(Error::Unsupported(format!("operator {other}"))),
     };
     // The result has the WIDER operand's type, and overflowing it is an
@@ -24382,6 +24482,49 @@ fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
                 }
             },
         ));
+    }
+    // `DROP OPERATOR name (left, right)`, `NONE` for a prefix operator's left.
+    if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectOperator) {
+        let [obj] = d.objects.as_slice() else {
+            return Err(Error::Unsupported(
+                "DROP OPERATOR of more than one operator".into(),
+            ));
+        };
+        let Some(N::ObjectWithArgs(o)) = obj.node.as_ref() else {
+            return Err(Error::Unsupported("this DROP OPERATOR target".into()));
+        };
+        let name = o
+            .objname
+            .iter()
+            .rev()
+            .find_map(|n| match n.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let types: Vec<Option<String>> = o
+            .objargs
+            .iter()
+            .map(|n| match n.node.as_ref() {
+                Some(N::TypeName(tn)) => Some(type_name_of(tn)),
+                _ => None,
+            })
+            .collect();
+        let (left, right) = match types.as_slice() {
+            [l, Some(r)] => (l.clone(), r.clone()),
+            [Some(r)] => (None, r.clone()),
+            _ => {
+                return Err(Error::Parse(
+                    "DROP OPERATOR needs its argument types".into(),
+                ))
+            }
+        };
+        return Ok(Statement::DropOperator {
+            name,
+            left,
+            right,
+            if_exists: d.missing_ok,
+        });
     }
     // `DROP AGGREGATE name (args)`: an ObjectWithArgs, as a function's is.
     if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectAggregate) {
@@ -27375,7 +27518,24 @@ fn lower_aexpr(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     // MQL's `$ne` matches a missing-or-null field, so `n <> 1` returned the
     // row whose `n` is NULL. SQL says `NULL <> 1` is NULL, so PostgreSQL
     // excludes it (probed 14). The explicit not-null guard restores that.
-    let mongo_op = op_to_mql(op).ok_or_else(|| Error::Unsupported(format!("operator {op}")))?;
+    let mongo_op = op_to_mql(op).ok_or_else(|| {
+        if user_ops::is_builtin(op) {
+            Error::Unsupported(format!("operator {op}"))
+        } else {
+            // A symbol PostgreSQL has no operator for: its 42883, at plan
+            // time, naming the column's type.
+            Error::UndefinedFunction(format!(
+                "operator does not exist: {} {op} {}",
+                display_type(
+                    &def.columns
+                        .iter()
+                        .find(|c| c.field() == field)
+                        .map_or_else(|| "unknown".to_string(), |c| c.pg_type.clone())
+                ),
+                display_type(inferred_type(&value))
+            ))
+        }
+    })?;
     Ok(scalar_filter(def, &field, mongo_op, value))
 }
 

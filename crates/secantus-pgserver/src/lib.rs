@@ -1955,6 +1955,7 @@ impl PgHandler {
         ));
         secantus_pgplan::set_current_user(Some(self.current_role_name()));
         secantus_pgplan::catalog_stmts::set_tablespaces(self.tablespace_names());
+        secantus_pgplan::user_ops::set_user_operators(self.user_operators());
         secantus_pgplan::rls::set_rls(self.rls_tables());
         secantus_pgplan::rls::set_view_rls(self.view_rls_tables());
         // The database and the GUCs, for `current_database()` and
@@ -12800,6 +12801,9 @@ impl PgHandler {
             Statement::CreateAggregate { .. } | Statement::DropAggregate { .. } => {
                 vec![Self::AGGREGATE_COLLECTION.to_string()]
             }
+            Statement::CreateOperator(_) | Statement::DropOperator { .. } => {
+                vec![catalog_objects::OPERATOR_COLLECTION.to_string()]
+            }
             Statement::Catalog(_) => vec![
                 catalog_objects::STATISTICS_COLLECTION.to_string(),
                 catalog_objects::TABLESPACE_COLLECTION.to_string(),
@@ -17449,6 +17453,8 @@ impl PgHandler {
             Statement::DropFunction { .. } => "DROP FUNCTION",
             Statement::CreateAggregate { .. } => "CREATE AGGREGATE",
             Statement::Catalog(op) => op.tag(),
+            Statement::CreateOperator(_) => "CREATE OPERATOR",
+            Statement::DropOperator { .. } => "DROP OPERATOR",
             Statement::AlterView { table_form, .. }
             | Statement::RenameView { table_form, .. }
             | Statement::RenameViewColumn { table_form, .. } => {
@@ -18668,6 +18674,13 @@ impl PgHandler {
 
             Statement::CreateAggregate { def, replace } => self.create_aggregate(def, replace),
             Statement::Catalog(op) => self.execute_catalog(op),
+            Statement::CreateOperator(op) => self.create_operator(op),
+            Statement::DropOperator {
+                name,
+                left,
+                right,
+                if_exists,
+            } => self.drop_operator(&name, left.as_deref(), &right, if_exists),
             Statement::AlterView {
                 view,
                 missing_ok,

@@ -189,7 +189,7 @@ fn as_cast(n: &pg_query::protobuf::Node) -> Option<pg_query::protobuf::Node> {
 
 /// Replace one child slot, when it holds a cast in call form.
 fn fix(slot: &mut pg_query::protobuf::Node) -> bool {
-    match as_cast(slot) {
+    match user_ops::replacement(slot).or_else(|| as_cast(slot)) {
         Some(cast) => {
             *slot = cast;
             true
@@ -212,11 +212,12 @@ fn fix_all(slots: &mut [pg_query::protobuf::Node]) -> bool {
 /// what the list's later pointers may point into, so the walk restarts
 /// rather than touch them.
 pub(crate) fn rewrite(node: &mut N) {
-    let wanted = node.nodes().iter().any(|(n, _, _, _)| match n {
-        pg_query::NodeRef::FuncCall(f) => cast_target(f).is_some(),
-        pg_query::NodeRef::JsonParseExpr(_) => true,
-        _ => false,
-    });
+    let wanted = user_ops::wanted(node)
+        || node.nodes().iter().any(|(n, _, _, _)| match n {
+            pg_query::NodeRef::FuncCall(f) => cast_target(f).is_some(),
+            pg_query::NodeRef::JsonParseExpr(_) => true,
+            _ => false,
+        });
     if !wanted {
         return;
     }

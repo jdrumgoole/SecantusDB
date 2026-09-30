@@ -14,6 +14,7 @@ use crate::PgHandler;
 pub(crate) const STATISTICS_COLLECTION: &str = "__sql_statistics__";
 pub(crate) const TABLESPACE_COLLECTION: &str = "__sql_tablespaces__";
 pub(crate) const PUBLICATION_COLLECTION: &str = "__sql_publications__";
+pub(crate) const OPERATOR_COLLECTION: &str = "__sql_operators__";
 
 /// PostgreSQL's fixed oids for its own two tablespaces.
 const PG_DEFAULT_OID: i64 = 1663;
@@ -71,6 +72,92 @@ impl PgHandler {
         self.catalog_docs(collection)
             .into_iter()
             .find(|d| d.get_str("_id") == Ok(id))
+    }
+
+    /// The database's user operators, for the planner's rewrite.
+    pub(crate) fn user_operators(&self) -> Vec<secantus_pgplan::user_ops::UserOperator> {
+        self.catalog_docs(OPERATOR_COLLECTION)
+            .iter()
+            .map(|d| secantus_pgplan::user_ops::UserOperator {
+                name: d.get_str("name").unwrap_or_default().to_string(),
+                left: d.get_str("left").ok().map(str::to_string),
+                right: d.get_str("right").unwrap_or_default().to_string(),
+                function: d.get_str("function").unwrap_or_default().to_string(),
+                result: d.get_str("result").unwrap_or_default().to_string(),
+            })
+            .collect()
+    }
+
+    fn operator_key(name: &str, left: Option<&str>, right: &str) -> String {
+        format!("{name}({},{right})", left.unwrap_or("NONE"))
+    }
+
+    fn operator_signature(&self, name: &str, left: Option<&str>, right: &str) -> String {
+        let d = secantus_pgplan::display_type;
+        match left {
+            Some(l) => format!("{} {name} {}", d(l), d(right)),
+            None => format!("{name} {}", d(right)),
+        }
+    }
+
+    pub(crate) fn create_operator(
+        &self,
+        op: secantus_pgplan::user_ops::UserOperator,
+    ) -> PgWireResult<Vec<Response>> {
+        let key = Self::operator_key(&op.name, op.left.as_deref(), &op.right);
+        if self.catalog_doc(OPERATOR_COLLECTION, &key).is_some() {
+            return Err(Self::user_error(
+                "42723",
+                format!("operator {} already exists", op.name),
+            ));
+        }
+        let mut doc = bson::doc! {
+            "_id": &key,
+            "name": &op.name,
+            "right": &op.right,
+            "function": &op.function,
+            "result": &op.result,
+            "owner": self.current_role_name(),
+        };
+        if let Some(l) = &op.left {
+            doc.insert("left", l);
+        }
+        self.put(OPERATOR_COLLECTION, &key, doc)?;
+        Ok(vec![Response::Execution(Tag::new("CREATE OPERATOR"))])
+    }
+
+    pub(crate) fn drop_operator(
+        &self,
+        name: &str,
+        left: Option<&str>,
+        right: &str,
+        if_exists: bool,
+    ) -> PgWireResult<Vec<Response>> {
+        let key = Self::operator_key(name, left, right);
+        if self.catalog_doc(OPERATOR_COLLECTION, &key).is_none() {
+            if if_exists {
+                let d = secantus_pgplan::display_type;
+                self.notice(
+                    "00000",
+                    format!(
+                        "operator {name}({},{}) does not exist, skipping",
+                        left.map_or("NONE".to_string(), d),
+                        d(right)
+                    ),
+                    None,
+                );
+                return Ok(vec![Response::Execution(Tag::new("DROP OPERATOR"))]);
+            }
+            return Err(Self::user_error(
+                "42883",
+                format!(
+                    "operator does not exist: {}",
+                    self.operator_signature(name, left, right)
+                ),
+            ));
+        }
+        self.delete_type_doc(OPERATOR_COLLECTION, &key)?;
+        Ok(vec![Response::Execution(Tag::new("DROP OPERATOR"))])
     }
 
     /// The user tablespaces' names, for the planner's `TABLESPACE` check.
@@ -445,6 +532,24 @@ impl PgHandler {
                     c("prattrs", "int2vector"),
                 ],
             ),
+            "pg_operator" => TableDef::new(
+                "pg_operator",
+                vec![
+                    c("oid", "oid"),
+                    c("oprname", "name"),
+                    c("oprnamespace", "oid"),
+                    c("oprowner", "oid"),
+                    c("oprkind", "char"),
+                    c("oprcanmerge", "bool"),
+                    c("oprcanhash", "bool"),
+                    c("oprleft", "regtype"),
+                    c("oprright", "regtype"),
+                    c("oprresult", "regtype"),
+                    c("oprcom", "oid"),
+                    c("oprnegate", "oid"),
+                    c("oprcode", "regproc"),
+                ],
+            ),
             "pg_publication_tables" => TableDef::new(
                 "pg_publication_tables",
                 vec![
@@ -509,6 +614,42 @@ impl PgHandler {
                             Bson::String(exprs.join(", "))
                         },
                     );
+                    r
+                })
+                .collect(),
+            "pg_operator" => self
+                .catalog_docs(OPERATOR_COLLECTION)
+                .iter()
+                .map(|d| {
+                    let type_oid = |t: &str| {
+                        secantus_pgplan::pgtypes::oid_of_name(t)
+                            .or_else(|| self.relation_oid(t))
+                            .unwrap_or(0)
+                    };
+                    let left = d.get_str("left").ok();
+                    let mut r = Document::new();
+                    r.insert(f("oid"), oid("opr", d.get_str("_id").unwrap_or_default()));
+                    r.insert(f("oprname"), d.get_str("name").unwrap_or_default());
+                    r.insert(f("oprnamespace"), Bson::Int64(Self::PUBLIC_NAMESPACE_OID));
+                    r.insert(
+                        f("oprowner"),
+                        Bson::Int64(self.role_oid_of(d.get_str("owner").unwrap_or_default())),
+                    );
+                    r.insert(f("oprkind"), if left.is_some() { "b" } else { "l" });
+                    r.insert(f("oprcanmerge"), false);
+                    r.insert(f("oprcanhash"), false);
+                    r.insert(f("oprleft"), Bson::Int64(left.map_or(0, type_oid)));
+                    r.insert(
+                        f("oprright"),
+                        Bson::Int64(type_oid(d.get_str("right").unwrap_or_default())),
+                    );
+                    r.insert(
+                        f("oprresult"),
+                        Bson::Int64(type_oid(d.get_str("result").unwrap_or_default())),
+                    );
+                    r.insert(f("oprcom"), Bson::Int64(0));
+                    r.insert(f("oprnegate"), Bson::Int64(0));
+                    r.insert(f("oprcode"), d.get_str("function").unwrap_or_default());
                     r
                 })
                 .collect(),
