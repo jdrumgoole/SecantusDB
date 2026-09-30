@@ -52,6 +52,7 @@ pub mod privileges;
 pub mod regobj;
 pub mod rls;
 mod rowsfrom;
+pub mod ruleutils;
 pub mod trgm;
 pub mod user_casts;
 pub use correlated::set_user_functions;
@@ -4195,6 +4196,10 @@ fn cast_typmod(node: &pg_query::protobuf::Node) -> i32 {
 }
 
 /// The `atttypmod` a declared type carries, or -1 for an unmodified type.
+pub(crate) fn declared_typmod_public(tn: &pg_query::protobuf::TypeName) -> i32 {
+    declared_typmod(tn)
+}
+
 fn declared_typmod(tn: &pg_query::protobuf::TypeName) -> i32 {
     let mods: Vec<i32> = tn.typmods.iter().filter_map(typmod_ival).collect();
     // A modifier we could not read as an integer means no faithful typmod.
@@ -5855,6 +5860,9 @@ thread_local! {
     /// materialized view, published with the rest of the catalog.
     static VIEW_DEFS: std::cell::RefCell<Vec<(i64, String, String)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// The same, as `pg_get_viewdef(view, true)` prints them.
+    static VIEW_DEFS_PRETTY: std::cell::RefCell<Vec<(i64, String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 thread_local! {
@@ -5926,6 +5934,11 @@ pub fn set_index_defs(defs: Vec<(i64, String)>) {
 /// Install the view definitions `pg_get_viewdef` answers from.
 pub fn set_view_defs(defs: Vec<(i64, String, String)>) {
     VIEW_DEFS.with(|d| *d.borrow_mut() = defs);
+}
+
+/// Install the pretty (`pg_get_viewdef(view, true)`) view definitions.
+pub fn set_view_defs_pretty(defs: Vec<(i64, String, String)>) {
+    VIEW_DEFS_PRETTY.with(|d| *d.borrow_mut() = defs);
 }
 
 /// Pretty ruleutils prints a cast's simple operand bare: `(0)::numeric` is
@@ -28351,7 +28364,21 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                 Bson::Null => return Ok(Bson::Null),
                 other => regclass_oid(other),
             };
-            return Ok(VIEW_DEFS.with(|d| {
+            // `pg_get_viewdef(v, true)` (or a wrap column) prints pretty.
+            let pretty = match f.args.get(1) {
+                Some(a) => match const_value(a, params)? {
+                    Bson::Boolean(b) => b,
+                    Bson::Int32(_) | Bson::Int64(_) => true,
+                    _ => false,
+                },
+                None => false,
+            };
+            let table = if pretty {
+                &VIEW_DEFS_PRETTY
+            } else {
+                &VIEW_DEFS
+            };
+            return Ok(table.with(|d| {
                 d.borrow()
                     .iter()
                     .find(|(o, n, _)| Some(*o) == oid || by_name.as_deref() == Some(n.as_str()))

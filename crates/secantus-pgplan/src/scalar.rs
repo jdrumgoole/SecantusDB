@@ -1663,6 +1663,10 @@ fn format_type_call(args: &[Bson]) -> Result<Bson> {
 
 /// `format_type`'s rendering: the display name, with the declared width or
 /// precision put back on when the modifier carries one.
+pub(crate) fn format_type_text_public(name: &str, typmod: Option<i32>) -> String {
+    format_type_text(name, typmod)
+}
+
 pub(crate) fn format_type_text(name: &str, typmod: Option<i32>) -> String {
     let display = crate::display_type(name);
     let Some(typmod) = typmod.filter(|m| *m >= 4) else {

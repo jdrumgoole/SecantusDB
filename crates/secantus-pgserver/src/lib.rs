@@ -2397,6 +2397,7 @@ impl PgHandler {
         );
         secantus_pgplan::set_constraint_defs(self.constraint_defs().unwrap_or_default());
         secantus_pgplan::set_view_defs(self.view_defs());
+        secantus_pgplan::set_view_defs_pretty(self.view_defs_as(true));
         secantus_pgplan::set_index_defs(self.index_defs());
         secantus_pgplan::set_trigger_defs(self.trigger_defs());
         secantus_pgplan::set_function_sigs(self.function_sigs());
@@ -6424,20 +6425,40 @@ impl PgHandler {
     /// Every view's and materialized view's `(regclass oid, name,
     /// definition)`, as `pg_get_viewdef` prints it (`pg_views.definition`).
     fn view_defs(&self) -> Vec<(i64, String, String)> {
+        self.view_defs_as(false)
+    }
+
+    /// `view_defs`, pretty (`pg_get_viewdef(view, true)`) or not.
+    fn view_defs_as(&self, pretty: bool) -> Vec<(i64, String, String)> {
         let views = self.views().unwrap_or_default();
         let matviews = self
             .matviews()
             .unwrap_or_default()
             .into_iter()
             .map(|(n, d, _)| (n, d));
+        let lookup = |n: &str| self.lookup(n);
+        let view_sql = |n: &str| views.iter().find(|(v, _)| v == n).map(|(_, d)| d.clone());
+        let cat = secantus_pgplan::ruleutils::Catalog {
+            lookup: &lookup,
+            view_sql: &view_sql,
+        };
         views
-            .into_iter()
+            .iter()
+            .cloned()
             .chain(matviews)
             .map(|(name, definition)| {
                 let oid = self
                     .relation_oid(&name)
                     .unwrap_or_else(|| Self::view_oid(&name));
-                (oid, name, format!(" {definition};"))
+                // As ruleutils prints the analysed query; the definition as
+                // written for a shape the printer does not reproduce.
+                let text = if pretty {
+                    secantus_pgplan::ruleutils::viewdef_pretty(&definition, &cat)
+                } else {
+                    secantus_pgplan::ruleutils::viewdef(&definition, &cat)
+                }
+                .unwrap_or_else(|| format!(" {definition};"));
+                (oid, name, text)
             })
             .collect()
     }
@@ -10622,6 +10643,7 @@ impl PgHandler {
             "pg_views" => {
                 let f = |name: &str| def.field_of(name).expect("column");
                 let login = self.session_user_name();
+                let texts = self.view_defs();
                 self.type_catalog_docs(Self::VIEW_COLLECTION)
                     .ok()?
                     .iter()
@@ -10631,16 +10653,21 @@ impl PgHandler {
                         d.insert(f("schemaname"), "public");
                         d.insert(f("viewname"), name);
                         d.insert(f("viewowner"), v.get_str("owner").unwrap_or(login.as_str()));
-                        d.insert(
-                            f("definition"),
-                            format!(" {};", v.get_str("definition").unwrap_or_default()),
-                        );
+                        let text = texts
+                            .iter()
+                            .find(|(_, n, _)| n == name)
+                            .map(|(_, _, t)| t.clone())
+                            .unwrap_or_else(|| {
+                                format!(" {};", v.get_str("definition").unwrap_or_default())
+                            });
+                        d.insert(f("definition"), text);
                         Some(d)
                     })
                     .collect()
             }
             "pg_matviews" => {
                 let f = |name: &str| def.field_of(name).expect("column");
+                let texts = self.view_defs();
                 let owner = self.session_user_name();
                 self.matviews()
                     .ok()?
@@ -10648,9 +10675,14 @@ impl PgHandler {
                     .map(|(name, definition, populated)| {
                         let mut d = Document::new();
                         d.insert(f("schemaname"), "public");
-                        d.insert(f("matviewname"), name);
+                        d.insert(f("matviewname"), name.as_str());
                         d.insert(f("matviewowner"), owner.as_str());
-                        d.insert(f("definition"), definition);
+                        let text = texts
+                            .iter()
+                            .find(|(_, n, _)| *n == name)
+                            .map(|(_, _, t)| t.clone())
+                            .unwrap_or(definition);
+                        d.insert(f("definition"), text);
                         d.insert(f("ispopulated"), populated);
                         d
                     })

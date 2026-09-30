@@ -1,0 +1,2087 @@
+//! `pg_get_viewdef` as PostgreSQL's `ruleutils.c` prints a view: every
+//! column qualified by its relation, each literal with the type the parser
+//! resolved for it, each implicit coercion written out as a cast, every
+//! operator parenthesised, and the query laid out by `appendContextKeyword`'s
+//! indentation rules (`get_basic_select_query`, `get_target_list`,
+//! `get_from_clause`, ...), transcribed from PostgreSQL 15.
+//!
+//! PostgreSQL prints the ANALYSED query, so the types and coercions are
+//! resolved here by a small analyser over the parse tree: the operator and
+//! function families a view commonly uses. A shape it does not know answers
+//! `None`, and the caller keeps the definition as written -- never a wrong
+//! reconstruction.
+
+use pg_query::protobuf::a_const::Val;
+use pg_query::protobuf::node::Node as N;
+use pg_query::protobuf::{
+    AExprKind, BoolExprType, BoolTestType, JoinType, NullTestType, SetOperation, SortByDir,
+    SortByNulls, SubLinkType,
+};
+
+use crate::TableDef;
+
+type Node = pg_query::protobuf::Node;
+
+const PRETTYINDENT_STD: i32 = 8;
+const PRETTYINDENT_JOIN: i32 = 4;
+const PRETTYINDENT_VAR: i32 = 4;
+
+/// One relation in a query's FROM, as ruleutils names it.
+#[derive(Clone, Debug)]
+struct Rte {
+    refname: String,
+    columns: Vec<(String, String)>,
+}
+
+/// Where a query's relations and views come from.
+pub struct Catalog<'a> {
+    pub lookup: &'a dyn Fn(&str) -> Option<TableDef>,
+    /// A view's definition SQL, by name.
+    pub view_sql: &'a dyn Fn(&str) -> Option<String>,
+}
+
+struct Printer<'a> {
+    cat: &'a Catalog<'a>,
+    buf: String,
+    indent: i32,
+    /// The enclosing queries' relations, innermost last (a correlated
+    /// reference resolves outward).
+    scopes: Vec<Vec<Rte>>,
+    /// CTEs visible by name: their output columns.
+    ctes: Vec<(String, Vec<(String, String)>)>,
+    depth: usize,
+    /// ruleutils' `colNamesVisible`: false inside a sublink, where an
+    /// unnamed column shows no `AS "?column?"`.
+    col_names_visible: bool,
+    /// PRETTYFLAG_PAREN: parentheses only where precedence needs them.
+    pretty: bool,
+}
+
+/// What a sub-expression is printed inside, for `isSimpleNode`.
+#[derive(Clone, Copy, PartialEq)]
+enum Parent<'o> {
+    /// Printed with `get_rule_expr`: never parenthesised for its parent.
+    Direct,
+    /// An operator's operand: the operator, and whether it is the left one.
+    Op(&'o str, bool),
+    Bool(BoolExprType),
+    Cast,
+    /// Any other `get_rule_expr_paren` parent.
+    Other,
+}
+
+fn arith_priority(op: &str) -> u8 {
+    match op.chars().next() {
+        Some('+' | '-') if op.len() == 1 => 1,
+        Some('*' | '/' | '%') if op.len() == 1 => 2,
+        _ => 0,
+    }
+}
+
+/// `format_type` of a type with no modifier: a bare `char` is `bpchar`.
+fn display_type(t: &str) -> String {
+    match t {
+        "bpchar" => "bpchar".into(),
+        "bpchar[]" => "bpchar[]".into(),
+        other => crate::display_type(other),
+    }
+}
+
+fn q(ident: &str) -> String {
+    crate::scalar::quote_identifier(ident)
+}
+
+fn sval(n: &Node) -> Option<&str> {
+    match n.node.as_ref()? {
+        N::String(s) => Some(&s.sval),
+        _ => None,
+    }
+}
+
+fn names(nodes: &[Node]) -> Vec<String> {
+    nodes
+        .iter()
+        .filter_map(|n| sval(n).map(str::to_string))
+        .collect()
+}
+
+/// The type families the analyser distinguishes.
+fn is_int(t: &str) -> bool {
+    matches!(t, "int2" | "int4" | "int8")
+}
+
+fn is_numberish(t: &str) -> bool {
+    matches!(
+        t,
+        "int2" | "int4" | "int8" | "numeric" | "float4" | "float8"
+    )
+}
+
+fn is_stringish(t: &str) -> bool {
+    matches!(t, "text" | "varchar" | "bpchar" | "name" | "unknown")
+}
+
+/// The numeric type two numeric operands meet at (int48 operators exist, so
+/// integers keep their own widths).
+fn numeric_meet(a: &str, b: &str) -> Option<(&'static str, bool)> {
+    let rank = |t: &str| match t {
+        "int2" | "int4" | "int8" => 1,
+        "numeric" => 2,
+        "float4" | "float8" => 3,
+        _ => 0,
+    };
+    let (ra, rb) = (rank(a), rank(b));
+    if ra == 0 || rb == 0 {
+        return None;
+    }
+    Some(match ra.max(rb) {
+        1 => ("", false),
+        2 => ("numeric", true),
+        _ => ("float8", true),
+    })
+}
+
+/// A function's known signature: `(argument type every argument coerces to,
+/// result)`; `None` result means the first argument's type.
+fn function_sig(name: &str) -> Option<(Option<&'static str>, Option<&'static str>)> {
+    Some(match name {
+        "upper" | "lower" | "initcap" | "btrim" | "ltrim" | "rtrim" | "md5" | "reverse"
+        | "replace" | "translate" | "repeat" | "lpad" | "rpad" | "split_part" | "left"
+        | "right" | "substr" | "quote_ident" | "quote_literal" => (Some("text"), Some("text")),
+        "length" | "char_length" | "character_length" | "octet_length" | "strpos" | "ascii" => {
+            (Some("text"), Some("int4"))
+        }
+        "concat" | "concat_ws" | "format" => (None, Some("text")),
+        "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp" => {
+            (None, Some("timestamptz"))
+        }
+        "count" | "row_number" | "rank" | "dense_rank" | "ntile" => (None, Some("int8")),
+        "percent_rank" | "cume_dist" => (None, Some("float8")),
+        "abs" | "max" | "min" | "lag" | "lead" | "first_value" | "last_value" | "nth_value" => {
+            (None, None)
+        }
+        "random" => (None, Some("float8")),
+        "pg_typeof" => (None, Some("regtype")),
+        "array_agg" | "string_agg" | "json_agg" | "jsonb_agg" | "sum" | "avg" | "bool_and"
+        | "bool_or" | "every" => (None, None),
+        _ => return None,
+    })
+}
+
+impl<'a> Printer<'a> {
+    fn new(cat: &'a Catalog<'a>, indent: i32) -> Self {
+        Self {
+            cat,
+            buf: String::new(),
+            indent,
+            scopes: Vec::new(),
+            ctes: Vec::new(),
+            depth: 0,
+            col_names_visible: true,
+            pretty: false,
+        }
+    }
+
+    fn remove_trailing_spaces(&mut self) {
+        while self.buf.ends_with(' ') {
+            self.buf.pop();
+        }
+    }
+
+    /// ruleutils' `appendContextKeyword` under PRETTYFLAG_INDENT.
+    fn keyword(&mut self, s: &str, before: i32, after: i32, plus: i32) {
+        self.indent += before;
+        self.remove_trailing_spaces();
+        self.buf.push('\n');
+        let amount = self.indent.max(0) + plus;
+        self.buf.push_str(&" ".repeat(amount as usize));
+        self.buf.push_str(s);
+        self.indent += after;
+        if self.indent < 0 {
+            self.indent = 0;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Name resolution and types
+    // ------------------------------------------------------------------
+
+    /// A relation's columns: a table, a view (its own output), a CTE.
+    fn relation_columns(&mut self, name: &str) -> Option<Vec<(String, String)>> {
+        if let Some((_, cols)) = self.ctes.iter().rev().find(|(n, _)| n == name) {
+            return Some(cols.clone());
+        }
+        if let Some(def) = (self.cat.lookup)(name) {
+            return Some(
+                def.columns
+                    .iter()
+                    .map(|c| (c.name.clone(), base_type(&c.pg_type)))
+                    .collect(),
+            );
+        }
+        let sql = (self.cat.view_sql)(name)?;
+        if self.depth > 16 {
+            return None;
+        }
+        let node = parse_select(&sql)?;
+        let mut inner = Printer::new(self.cat, 0);
+        inner.depth = self.depth + 1;
+        inner.pretty = self.pretty;
+        inner.query_columns(&node)
+    }
+
+    /// Resolve a column reference: `(refname, column, type)`.
+    fn resolve(&self, fields: &[String]) -> Option<(String, String, String)> {
+        let find_col = |r: &Rte, c: &str| {
+            r.columns
+                .iter()
+                .find(|(n, _)| n == c)
+                .map(|(_, t)| t.clone())
+        };
+        for scope in self.scopes.iter().rev() {
+            match fields {
+                [col] => {
+                    let hits: Vec<&Rte> = scope
+                        .iter()
+                        .filter(|r| r.columns.iter().any(|(n, _)| n == col))
+                        .collect();
+                    match hits.as_slice() {
+                        [r] => return Some((r.refname.clone(), col.clone(), find_col(r, col)?)),
+                        [] => continue,
+                        _ => return None,
+                    }
+                }
+                [.., rel, col] => {
+                    if let Some(r) = scope.iter().find(|r| r.refname == *rel) {
+                        return Some((r.refname.clone(), col.clone(), find_col(r, col)?));
+                    }
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// The analysed type of an expression; `unknown` for an untyped string
+    /// literal or NULL.
+    fn typ(&mut self, n: &Node) -> Option<String> {
+        Some(match n.node.as_ref()? {
+            N::ColumnRef(c) => self.resolve(&names(&c.fields))?.2,
+            N::AConst(c) => match c.val.as_ref() {
+                Some(Val::Ival(_)) => "int4".into(),
+                Some(Val::Fval(f)) => {
+                    // An integer too wide for int4 is int8, then numeric.
+                    if f.fval.contains(['.', 'e', 'E']) {
+                        "numeric".into()
+                    } else if f.fval.parse::<i64>().is_ok() {
+                        "int8".into()
+                    } else {
+                        "numeric".into()
+                    }
+                }
+                Some(Val::Boolval(_)) => "bool".into(),
+                Some(Val::Sval(_)) | None => "unknown".into(),
+                Some(Val::Bsval(_)) => "bit".into(),
+            },
+            N::TypeCast(tc) => base_type(&crate::type_name_of(tc.type_name.as_ref()?)),
+            N::AExpr(e) => {
+                let kind = AExprKind::try_from(e.kind).ok()?;
+                match kind {
+                    AExprKind::AexprOp => {
+                        let op = crate::operator_name(e).ok()?.to_string();
+                        if matches!(
+                            op.as_str(),
+                            "=" | "<>"
+                                | "!="
+                                | "<"
+                                | ">"
+                                | "<="
+                                | ">="
+                                | "~~"
+                                | "!~~"
+                                | "~~*"
+                                | "!~~*"
+                                | "~"
+                                | "~*"
+                                | "!~"
+                                | "!~*"
+                        ) {
+                            return Some("bool".into());
+                        }
+                        let r = self.typ(e.rexpr.as_deref()?)?;
+                        let Some(l) = e.lexpr.as_deref() else {
+                            return Some(r);
+                        };
+                        let l = self.typ(l)?;
+                        Self::arith_result(&op, &l, &r)?.2
+                    }
+                    AExprKind::AexprLike
+                    | AExprKind::AexprIlike
+                    | AExprKind::AexprIn
+                    | AExprKind::AexprBetween
+                    | AExprKind::AexprNotBetween
+                    | AExprKind::AexprDistinct
+                    | AExprKind::AexprNotDistinct
+                    | AExprKind::AexprOpAny
+                    | AExprKind::AexprOpAll => "bool".into(),
+                    AExprKind::AexprNullif => self.typ(e.lexpr.as_deref()?)?,
+                    _ => return None,
+                }
+            }
+            N::BoolExpr(_) | N::NullTest(_) | N::BooleanTest(_) => "bool".into(),
+            N::FuncCall(f) => {
+                let name = crate::func_name(f)?;
+                let (_, result) = function_sig(&name)?;
+                match result {
+                    Some(r) => r.to_string(),
+                    None => match name.as_str() {
+                        "sum" => match self.typ(f.args.first()?)?.as_str() {
+                            "int2" | "int4" => "int8".into(),
+                            "int8" | "numeric" => "numeric".into(),
+                            other => other.to_string(),
+                        },
+                        "avg" => match self.typ(f.args.first()?)?.as_str() {
+                            "float4" | "float8" => "float8".into(),
+                            _ => "numeric".into(),
+                        },
+                        "array_agg" => format!("{}[]", self.typ(f.args.first()?)?),
+                        "string_agg" => "text".into(),
+                        "json_agg" => "json".into(),
+                        "jsonb_agg" => "jsonb".into(),
+                        "bool_and" | "bool_or" | "every" => "bool".into(),
+                        _ => {
+                            let t = self.typ(f.args.first()?)?;
+                            if t == "unknown" {
+                                "text".into()
+                            } else {
+                                t
+                            }
+                        }
+                    },
+                }
+            }
+            N::CoalesceExpr(c) => self.common_type(&c.args)?,
+            N::MinMaxExpr(m) => self.common_type(&m.args)?,
+            N::CaseExpr(c) => {
+                let mut results: Vec<Node> = c
+                    .args
+                    .iter()
+                    .filter_map(|w| match w.node.as_ref() {
+                        Some(N::CaseWhen(cw)) => cw.result.as_deref().cloned(),
+                        _ => None,
+                    })
+                    .collect();
+                if let Some(d) = c.defresult.as_deref() {
+                    results.push(d.clone());
+                }
+                self.common_type(&results)?
+            }
+            N::SubLink(s) => match SubLinkType::try_from(s.sub_link_type).ok()? {
+                SubLinkType::ExistsSublink | SubLinkType::AnySublink | SubLinkType::AllSublink => {
+                    "bool".into()
+                }
+                SubLinkType::ExprSublink => {
+                    let cols = self.subquery_columns(s.subselect.as_deref()?)?;
+                    cols.first()?.1.clone()
+                }
+                SubLinkType::ArraySublink => {
+                    let cols = self.subquery_columns(s.subselect.as_deref()?)?;
+                    format!("{}[]", cols.first()?.1)
+                }
+                _ => return None,
+            },
+            N::AArrayExpr(a) => {
+                let t = self.common_type(&a.elements)?;
+                format!("{t}[]")
+            }
+            N::SqlvalueFunction(v) => {
+                use pg_query::protobuf::SqlValueFunctionOp as Op;
+                match Op::try_from(v.op).ok()? {
+                    Op::SvfopCurrentDate => "date".into(),
+                    Op::SvfopCurrentTimestamp | Op::SvfopCurrentTimestampN => "timestamptz".into(),
+                    Op::SvfopLocaltimestamp | Op::SvfopLocaltimestampN => "timestamp".into(),
+                    Op::SvfopCurrentTime | Op::SvfopCurrentTimeN => "timetz".into(),
+                    Op::SvfopLocaltime | Op::SvfopLocaltimeN => "time".into(),
+                    _ => "name".into(),
+                }
+            }
+            _ => return None,
+        })
+    }
+
+    /// The type several expressions resolve to (`select_common_type`), with
+    /// an untyped literal taking the others' type, and all-unknown as text.
+    fn common_type(&mut self, nodes: &[Node]) -> Option<String> {
+        let mut out: Option<String> = None;
+        for n in nodes {
+            let t = self.typ(n)?;
+            if t == "unknown" {
+                continue;
+            }
+            out = Some(match out {
+                None => t,
+                Some(o) if o == t => o,
+                Some(o) => {
+                    if let Some((meet, _)) = numeric_meet(&o, &t) {
+                        if meet.is_empty() {
+                            // Integers meet at the widest.
+                            let w = |x: &str| match x {
+                                "int2" => 1,
+                                "int4" => 2,
+                                _ => 3,
+                            };
+                            if w(&o) >= w(&t) {
+                                o
+                            } else {
+                                t
+                            }
+                        } else {
+                            meet.to_string()
+                        }
+                    } else if is_stringish(&o) && is_stringish(&t) {
+                        "text".into()
+                    } else {
+                        return None;
+                    }
+                }
+            });
+        }
+        Some(out.unwrap_or_else(|| "text".into()))
+    }
+
+    /// An arithmetic or string operator: `(left coerced to, right coerced
+    /// to, result)`, empty meaning "as is".
+    fn arith_result(op: &str, l: &str, r: &str) -> Option<(String, String, String)> {
+        if op == "||" {
+            let lt = if l == "text" { "" } else { "text" };
+            let rt = if r == "text" { "" } else { "text" };
+            return Some((lt.into(), rt.into(), "text".into()));
+        }
+        if matches!(op, "+" | "-" | "*" | "/" | "%") {
+            if let Some((meet, cast)) = numeric_meet(l, r) {
+                if !cast {
+                    let w = |x: &str| match x {
+                        "int2" => 1,
+                        "int4" => 2,
+                        _ => 3,
+                    };
+                    let res = if w(l) >= w(r) { l } else { r };
+                    return Some((String::new(), String::new(), res.to_string()));
+                }
+                let lt = if l == meet { "" } else { meet };
+                let rt = if r == meet { "" } else { meet };
+                return Some((lt.into(), rt.into(), meet.into()));
+            }
+            // date +/- integer is a date; date - date an integer.
+            return match (l, r, op) {
+                ("date", "int4", "+" | "-") | ("int4", "date", "+") => {
+                    Some((String::new(), String::new(), "date".into()))
+                }
+                ("date", "date", "-") => Some((String::new(), String::new(), "int4".into())),
+                ("timestamptz" | "timestamp", "interval", "+" | "-") => {
+                    Some((String::new(), String::new(), l.into()))
+                }
+                (_, "unknown", _) if is_numberish(l) => Some((String::new(), l.into(), l.into())),
+                _ => None,
+            };
+        }
+        None
+    }
+
+    /// The coercions a comparison puts on its operands.
+    fn compare_coercion(l: &str, r: &str) -> Option<(String, String)> {
+        if l == r {
+            if matches!(l, "varchar" | "name") {
+                return Some(("text".into(), "text".into()));
+            }
+            if l == "unknown" {
+                return Some(("text".into(), "text".into()));
+            }
+            return Some((String::new(), String::new()));
+        }
+        if l == "unknown" {
+            let t = match r {
+                "varchar" | "name" => "text",
+                other => other,
+            };
+            let rt = if t == r { "" } else { t };
+            return Some((t.into(), rt.into()));
+        }
+        if r == "unknown" {
+            let t = match l {
+                "varchar" | "name" => "text",
+                other => other,
+            };
+            let lt = if t == l { "" } else { t };
+            return Some((lt.into(), t.into()));
+        }
+        if let Some((meet, cast)) = numeric_meet(l, r) {
+            if !cast || (is_int(l) && is_int(r)) {
+                return Some((String::new(), String::new()));
+            }
+            let lt = if l == meet { "" } else { meet };
+            let rt = if r == meet { "" } else { meet };
+            return Some((lt.into(), rt.into()));
+        }
+        if is_stringish(l) && is_stringish(r) {
+            let lt = if l == "text" { "" } else { "text" };
+            let rt = if r == "text" { "" } else { "text" };
+            return Some((lt.into(), rt.into()));
+        }
+        // date vs timestamp and the like: this analyser does not know.
+        None
+    }
+
+    // ------------------------------------------------------------------
+    // Expressions
+    // ------------------------------------------------------------------
+
+    /// Print `n`, coerced to `want` when that differs from its own type,
+    /// directly (as `get_rule_expr` does).
+    fn expr_as(&mut self, n: &Node, want: &str) -> Option<()> {
+        self.child(n, want, Parent::Direct)
+    }
+
+    /// `get_rule_expr_paren`: `n` inside `parent`, coerced to `want`.
+    fn child(&mut self, n: &Node, want: &str, parent: Parent<'_>) -> Option<()> {
+        if !want.is_empty() {
+            let own = self.typ(n)?;
+            if own == "unknown" {
+                // An untyped literal or NULL takes the wanted type directly.
+                return self.const_as(n, want);
+            }
+            if own != want {
+                if self.pretty {
+                    self.child(n, "", Parent::Cast)?;
+                    self.buf.push_str(&format!("::{}", display_type(want)));
+                } else {
+                    self.buf.push('(');
+                    self.expr(n)?;
+                    self.buf.push_str(&format!(")::{}", display_type(want)));
+                }
+                return Some(());
+            }
+        }
+        if self.pretty && parent != Parent::Direct && !self.simple(n, parent) {
+            self.buf.push('(');
+            self.expr(n)?;
+            self.buf.push(')');
+            return Some(());
+        }
+        self.expr(n)
+    }
+
+    /// ruleutils' `isSimpleNode`: can `n` go inside `parent` unparenthesised?
+    fn simple(&self, n: &Node, parent: Parent<'_>) -> bool {
+        // The parents under which an operator-like node needs none.
+        let group = |parent: Parent<'_>| matches!(parent, Parent::Bool(_));
+        match n.node.as_ref() {
+            Some(
+                N::ColumnRef(_)
+                | N::AConst(_)
+                | N::ParamRef(_)
+                | N::FuncCall(_)
+                | N::CoalesceExpr(_)
+                | N::MinMaxExpr(_)
+                | N::CaseExpr(_)
+                | N::AArrayExpr(_)
+                | N::SqlvalueFunction(_)
+                | N::TypeCast(_),
+            ) => true,
+            Some(N::AExpr(e)) => match AExprKind::try_from(e.kind) {
+                Ok(AExprKind::AexprNullif) => true,
+                Ok(AExprKind::AexprOp | AExprKind::AexprLike | AExprKind::AexprIlike) => {
+                    if let Parent::Op(pop, first) = parent {
+                        let op = crate::operator_name(e).unwrap_or("");
+                        let (c, p) = (arith_priority(op), arith_priority(pop));
+                        if c == 0 || p == 0 || e.lexpr.is_none() {
+                            return false;
+                        }
+                        return match c.cmp(&p) {
+                            std::cmp::Ordering::Greater => true,
+                            std::cmp::Ordering::Less => false,
+                            std::cmp::Ordering::Equal => first,
+                        };
+                    }
+                    group(parent)
+                }
+                Ok(AExprKind::AexprDistinct | AExprKind::AexprNotDistinct) => group(parent),
+                Ok(AExprKind::AexprBetween | AExprKind::AexprNotBetween) => {
+                    // An AND (or OR) of two comparisons.
+                    let own = if e.kind == AExprKind::AexprBetween as i32 {
+                        BoolExprType::AndExpr
+                    } else {
+                        BoolExprType::OrExpr
+                    };
+                    bool_simple(own, parent)
+                }
+                _ => false,
+            },
+            Some(N::SubLink(_) | N::NullTest(_) | N::BooleanTest(_)) => group(parent),
+            Some(N::BoolExpr(b)) => match BoolExprType::try_from(b.boolop) {
+                Ok(t) => bool_simple(t, parent),
+                Err(_) => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// An untyped literal or NULL, as a constant of type `t`.
+    fn const_as(&mut self, n: &Node, t: &str) -> Option<()> {
+        match n.node.as_ref()? {
+            N::AConst(c) => match c.val.as_ref() {
+                None => self.buf.push_str(&format!("NULL::{}", display_type(t))),
+                Some(Val::Sval(s)) => {
+                    let lit = s.sval.clone();
+                    match t {
+                        "int2" | "int4" | "int8" => {
+                            let v: i64 = lit.trim().parse().ok()?;
+                            self.const_number(&v.to_string(), t);
+                        }
+                        "numeric" => {
+                            lit.trim().parse::<f64>().ok()?;
+                            self.const_number(lit.trim(), t);
+                        }
+                        "bool" => {
+                            let b = match lit.trim().to_ascii_lowercase().as_str() {
+                                "t" | "true" | "yes" | "on" | "1" => "true",
+                                "f" | "false" | "no" | "off" | "0" => "false",
+                                _ => return None,
+                            };
+                            self.buf.push_str(b);
+                        }
+                        _ => self.buf.push_str(&format!(
+                            "{}::{}",
+                            crate::scalar::quote_literal(&lit),
+                            display_type(t)
+                        )),
+                    }
+                }
+                _ => return None,
+            },
+            _ => return None,
+        }
+        Some(())
+    }
+
+    /// `get_const_expr` for a number: bare when it reads back as its type,
+    /// quoted and labelled otherwise.
+    fn const_number(&mut self, text: &str, t: &str) {
+        let label = display_type(t);
+        if text.starts_with('-') {
+            self.buf.push_str(&format!("'{text}'::{label}"));
+            return;
+        }
+        match t {
+            "int4" => self.buf.push_str(text),
+            "numeric" if text.contains(['.', 'e', 'E']) => self.buf.push_str(text),
+            _ => self.buf.push_str(&format!("{text}::{label}")),
+        }
+    }
+
+    fn expr(&mut self, n: &Node) -> Option<()> {
+        match n.node.as_ref()? {
+            N::ColumnRef(c) => {
+                let fields = names(&c.fields);
+                let (rel, col, _) = self.resolve(&fields)?;
+                self.buf.push_str(&format!("{}.{}", q(&rel), q(&col)));
+            }
+            N::AConst(c) => match c.val.as_ref() {
+                None => self.buf.push_str("NULL::text"),
+                Some(Val::Ival(i)) => self.const_number(&i.ival.to_string(), "int4"),
+                Some(Val::Fval(f)) => {
+                    let t = self.typ(n)?;
+                    self.const_number(&f.fval, &t)
+                }
+                Some(Val::Boolval(b)) => {
+                    self.buf.push_str(if b.boolval { "true" } else { "false" })
+                }
+                Some(Val::Sval(s)) => self
+                    .buf
+                    .push_str(&format!("{}::text", crate::scalar::quote_literal(&s.sval))),
+                Some(Val::Bsval(_)) => return None,
+            },
+            N::TypeCast(tc) => {
+                let tn = tc.type_name.as_ref()?;
+                let target = base_type(&crate::type_name_of(tn));
+                let typmod = crate::declared_typmod_public(tn);
+                let label = crate::scalar::format_type_text_public(&target, Some(typmod));
+                let arg = tc.arg.as_deref()?;
+                let own = self.typ(arg)?;
+                if own == "unknown" {
+                    // The parser folds a literal into a constant of the
+                    // target type.
+                    if typmod >= 0 {
+                        if let Some(N::AConst(ac)) = arg.node.as_ref() {
+                            if let Some(Val::Sval(s)) = ac.val.as_ref() {
+                                self.buf.push_str(&format!(
+                                    "{}::{label}",
+                                    crate::scalar::quote_literal(&s.sval)
+                                ));
+                                return Some(());
+                            }
+                        }
+                    }
+                    return self.const_as(arg, &target);
+                }
+                if own == target && typmod < 0 {
+                    return self.expr(arg);
+                }
+                if self.pretty {
+                    self.child(arg, "", Parent::Cast)?;
+                    self.buf.push_str(&format!("::{label}"));
+                } else {
+                    self.buf.push('(');
+                    self.expr(arg)?;
+                    self.buf.push_str(&format!(")::{label}"));
+                }
+            }
+            N::AExpr(e) => self.a_expr(e)?,
+            N::BoolExpr(b) => {
+                let op = BoolExprType::try_from(b.boolop).ok()?;
+                let open = !self.pretty;
+                if op == BoolExprType::NotExpr {
+                    self.buf.push_str(if open { "(NOT " } else { "NOT " });
+                    self.child(b.args.first()?, "", Parent::Bool(op))?;
+                    if open {
+                        self.buf.push(')');
+                    }
+                    return Some(());
+                }
+                let word = if op == BoolExprType::AndExpr {
+                    " AND "
+                } else {
+                    " OR "
+                };
+                // The analyser flattens nested ANDs (and ORs).
+                let mut flat = Vec::new();
+                flatten_bool(b, op, &mut flat);
+                if open {
+                    self.buf.push('(');
+                }
+                for (i, a) in flat.iter().enumerate() {
+                    if i > 0 {
+                        self.buf.push_str(word);
+                    }
+                    self.child(a, "", Parent::Bool(op))?;
+                }
+                if open {
+                    self.buf.push(')');
+                }
+            }
+            N::NullTest(t) => {
+                let open = !self.pretty;
+                if open {
+                    self.buf.push('(');
+                }
+                self.child(t.arg.as_deref()?, "", Parent::Other)?;
+                self.buf.push_str(
+                    if NullTestType::try_from(t.nulltesttype).ok()? == NullTestType::IsNull {
+                        " IS NULL"
+                    } else {
+                        " IS NOT NULL"
+                    },
+                );
+                if open {
+                    self.buf.push(')');
+                }
+            }
+            N::BooleanTest(t) => {
+                let open = !self.pretty;
+                if open {
+                    self.buf.push('(');
+                }
+                self.child(t.arg.as_deref()?, "", Parent::Other)?;
+                self.buf
+                    .push_str(match BoolTestType::try_from(t.booltesttype).ok()? {
+                        BoolTestType::IsTrue => " IS TRUE",
+                        BoolTestType::IsNotTrue => " IS NOT TRUE",
+                        BoolTestType::IsFalse => " IS FALSE",
+                        BoolTestType::IsNotFalse => " IS NOT FALSE",
+                        BoolTestType::IsUnknown => " IS UNKNOWN",
+                        BoolTestType::IsNotUnknown => " IS NOT UNKNOWN",
+                        _ => return None,
+                    });
+                if open {
+                    self.buf.push(')');
+                }
+            }
+            N::FuncCall(f) => self.func_call(f)?,
+            N::CoalesceExpr(c) => self.variadic_call("COALESCE", &c.args)?,
+            N::MinMaxExpr(m) => {
+                let word = if m.op == pg_query::protobuf::MinMaxOp::IsGreatest as i32 {
+                    "GREATEST"
+                } else {
+                    "LEAST"
+                };
+                self.variadic_call(word, &m.args)?
+            }
+            N::CaseExpr(c) => self.case_expr(c)?,
+            N::SubLink(s) => self.sublink(s)?,
+            N::AArrayExpr(a) => {
+                let t = self.typ(n)?;
+                let elem = t.trim_end_matches("[]").to_string();
+                self.buf.push_str("ARRAY[");
+                for (i, x) in a.elements.iter().enumerate() {
+                    if i > 0 {
+                        self.buf.push_str(", ");
+                    }
+                    self.expr_as(x, &elem)?;
+                }
+                self.buf.push(']');
+            }
+            N::SqlvalueFunction(v) => {
+                use pg_query::protobuf::SqlValueFunctionOp as Op;
+                self.buf.push_str(match Op::try_from(v.op).ok()? {
+                    Op::SvfopCurrentDate => "CURRENT_DATE",
+                    Op::SvfopCurrentTimestamp => "CURRENT_TIMESTAMP",
+                    Op::SvfopLocaltimestamp => "LOCALTIMESTAMP",
+                    Op::SvfopCurrentTime => "CURRENT_TIME",
+                    Op::SvfopLocaltime => "LOCALTIME",
+                    Op::SvfopCurrentUser => "CURRENT_USER",
+                    Op::SvfopSessionUser => "SESSION_USER",
+                    Op::SvfopUser => "CURRENT_USER",
+                    Op::SvfopCurrentRole => "CURRENT_ROLE",
+                    _ => return None,
+                });
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+
+    /// An operator expression: parenthesised unless pretty.
+    fn binary(&mut self, l: &Node, lw: &str, op: &str, r: &Node, rw: &str) -> Option<()> {
+        let open = !self.pretty;
+        if open {
+            self.buf.push('(');
+        }
+        self.child(l, lw, Parent::Op(op, true))?;
+        self.buf.push_str(&format!(" {op} "));
+        self.child(r, rw, Parent::Op(op, false))?;
+        if open {
+            self.buf.push(')');
+        }
+        Some(())
+    }
+
+    fn a_expr(&mut self, e: &pg_query::protobuf::AExpr) -> Option<()> {
+        let kind = AExprKind::try_from(e.kind).ok()?;
+        match kind {
+            AExprKind::AexprOp => {
+                let op = crate::operator_name(e).ok()?.to_string();
+                let r = e.rexpr.as_deref()?;
+                let Some(l) = e.lexpr.as_deref() else {
+                    // A prefix operator.
+                    self.buf.push_str(&format!("({op} "));
+                    self.expr(r)?;
+                    self.buf.push(')');
+                    return Some(());
+                };
+                let (lt, rt) = (self.typ(l)?, self.typ(r)?);
+                let (lw, rw) = if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | ">" | "<=" | ">=")
+                {
+                    Self::compare_coercion(&lt, &rt)?
+                } else if matches!(
+                    op.as_str(),
+                    "~~" | "!~~" | "~~*" | "!~~*" | "~" | "~*" | "!~" | "!~*"
+                ) {
+                    Self::string_match_coercion(&lt, &rt)?
+                } else {
+                    let (a, b, _) = Self::arith_result(&op, &lt, &rt)?;
+                    (a, b)
+                };
+                let op = if op == "!=" { "<>".to_string() } else { op };
+                self.binary(l, &lw, &op, r, &rw)?;
+            }
+            AExprKind::AexprLike | AExprKind::AexprIlike => {
+                let op = crate::operator_name(e).ok()?.to_string();
+                let op = match (kind, op.as_str()) {
+                    (AExprKind::AexprLike, "~~") => "~~",
+                    (AExprKind::AexprLike, "!~~") => "!~~",
+                    (AExprKind::AexprIlike, "~~*") => "~~*",
+                    (AExprKind::AexprIlike, "!~~*") => "!~~*",
+                    _ => return None,
+                };
+                let (l, r) = (e.lexpr.as_deref()?, e.rexpr.as_deref()?);
+                let (lt, rt) = (self.typ(l)?, self.typ(r)?);
+                let (lw, rw) = Self::string_match_coercion(&lt, &rt)?;
+                self.binary(l, &lw, op, r, &rw)?;
+            }
+            AExprKind::AexprIn => {
+                let op = crate::operator_name(e).ok()?.to_string();
+                let l = e.lexpr.as_deref()?;
+                let Some(N::List(list)) = e.rexpr.as_deref().and_then(|r| r.node.as_ref()) else {
+                    return None;
+                };
+                let lt = self.typ(l)?;
+                let mut all = vec![l.clone()];
+                all.extend(list.items.iter().cloned());
+                let common = self.common_type(&all)?;
+                let lw = if lt == common {
+                    String::new()
+                } else {
+                    common.clone()
+                };
+                let (word, quant) = if op == "=" {
+                    ("=", "ANY")
+                } else {
+                    ("<>", "ALL")
+                };
+                // varchar has no `=` of its own: the operator is text's, so
+                // the column and the whole array are cast to text.
+                let via_text = matches!(common.as_str(), "varchar" | "name");
+                let lw = if via_text { "text".to_string() } else { lw };
+                let open = !self.pretty;
+                if open {
+                    self.buf.push('(');
+                }
+                self.child(l, &lw, Parent::Other)?;
+                self.buf.push_str(&format!(" {word} {quant} ("));
+                if via_text && open {
+                    self.buf.push('(');
+                }
+                self.buf.push_str("ARRAY[");
+                for (i, x) in list.items.iter().enumerate() {
+                    if i > 0 {
+                        self.buf.push_str(", ");
+                    }
+                    self.expr_as(x, &common)?;
+                }
+                self.buf.push(']');
+                if via_text {
+                    if open {
+                        self.buf.push(')');
+                    }
+                    self.buf.push_str("::text[]");
+                }
+                self.buf.push(')');
+                if open {
+                    self.buf.push(')');
+                }
+            }
+            AExprKind::AexprBetween | AExprKind::AexprNotBetween => {
+                let x = e.lexpr.as_deref()?;
+                let Some(N::List(list)) = e.rexpr.as_deref().and_then(|r| r.node.as_ref()) else {
+                    return None;
+                };
+                let [lo, hi] = list.items.as_slice() else {
+                    return None;
+                };
+                let xt = self.typ(x)?;
+                let (xl, lw) = Self::compare_coercion(&xt, &self.typ(lo)?)?;
+                let (xh, hw) = Self::compare_coercion(&xt, &self.typ(hi)?)?;
+                let not = kind == AExprKind::AexprNotBetween;
+                let (a, b, join) = if not {
+                    ("<", ">", " OR ")
+                } else {
+                    (">=", "<=", " AND ")
+                };
+                let open = !self.pretty;
+                if open {
+                    self.buf.push('(');
+                }
+                self.binary(x, &xl, a, lo, &lw)?;
+                self.buf.push_str(join);
+                self.binary(x, &xh, b, hi, &hw)?;
+                if open {
+                    self.buf.push(')');
+                }
+            }
+            AExprKind::AexprDistinct | AExprKind::AexprNotDistinct => {
+                let (l, r) = (e.lexpr.as_deref()?, e.rexpr.as_deref()?);
+                let (lw, rw) = Self::compare_coercion(&self.typ(l)?, &self.typ(r)?)?;
+                let open = !self.pretty;
+                if open {
+                    self.buf.push('(');
+                }
+                self.child(l, &lw, Parent::Other)?;
+                self.buf.push_str(if kind == AExprKind::AexprDistinct {
+                    " IS DISTINCT FROM "
+                } else {
+                    " IS NOT DISTINCT FROM "
+                });
+                self.child(r, &rw, Parent::Other)?;
+                if open {
+                    self.buf.push(')');
+                }
+            }
+            AExprKind::AexprNullif => {
+                let (l, r) = (e.lexpr.as_deref()?, e.rexpr.as_deref()?);
+                let (lw, rw) = Self::compare_coercion(&self.typ(l)?, &self.typ(r)?)?;
+                self.buf.push_str("NULLIF(");
+                self.expr_as(l, &lw)?;
+                self.buf.push_str(", ");
+                self.expr_as(r, &rw)?;
+                self.buf.push(')');
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+
+    /// LIKE and the regex operators take text on both sides (a `char(n)`
+    /// keeps its own `bpchar ~~ text`).
+    fn string_match_coercion(l: &str, r: &str) -> Option<(String, String)> {
+        if !is_stringish(l) || !is_stringish(r) {
+            return None;
+        }
+        let lw = if matches!(l, "text" | "bpchar") {
+            ""
+        } else {
+            "text"
+        };
+        let rw = if r == "text" { "" } else { "text" };
+        Some((lw.into(), rw.into()))
+    }
+
+    fn variadic_call(&mut self, word: &str, args: &[Node]) -> Option<()> {
+        let common = self.common_type(args)?;
+        self.buf.push_str(word);
+        self.buf.push('(');
+        for (i, a) in args.iter().enumerate() {
+            if i > 0 {
+                self.buf.push_str(", ");
+            }
+            self.expr_as(a, &common)?;
+        }
+        self.buf.push(')');
+        Some(())
+    }
+
+    fn func_call(&mut self, f: &pg_query::protobuf::FuncCall) -> Option<()> {
+        if !f.agg_order.is_empty() || f.agg_filter.is_some() || f.func_variadic {
+            return None;
+        }
+        let parts = names(&f.funcname);
+        let name = parts.last()?.clone();
+        if parts.len() > 1 && parts[0] != "pg_catalog" {
+            return None;
+        }
+        let (arg_type, _) = function_sig(&name)?;
+        self.buf.push_str(&q(&name));
+        self.buf.push('(');
+        if f.agg_star {
+            self.buf.push('*');
+        }
+        if f.agg_distinct {
+            self.buf.push_str("DISTINCT ");
+        }
+        for (i, a) in f.args.iter().enumerate() {
+            if i > 0 {
+                self.buf.push_str(", ");
+            }
+            // The first argument of a text function is text; the others of
+            // `substr` / `lpad` / ... are integers the analyser leaves be.
+            let want = match arg_type {
+                Some(t) => {
+                    let own = self.typ(a)?;
+                    // `char(n)` has its own length functions (bpcharlen).
+                    let bpchar_ok = own == "bpchar"
+                        && matches!(
+                            name.as_str(),
+                            "length" | "char_length" | "character_length" | "octet_length"
+                        );
+                    if bpchar_ok {
+                        ""
+                    } else if i == 0 || is_stringish(&own) {
+                        if own == t {
+                            ""
+                        } else {
+                            t
+                        }
+                    } else {
+                        ""
+                    }
+                }
+                None => {
+                    // An untyped literal argument of a polymorphic function
+                    // (`max('x')`) is text.
+                    if self.typ(a)? == "unknown" {
+                        "text"
+                    } else {
+                        ""
+                    }
+                }
+            };
+            self.expr_as(a, want)?;
+        }
+        self.buf.push(')');
+        if let Some(over) = &f.over {
+            self.buf.push_str(" OVER ");
+            self.window_spec(over)?;
+        }
+        Some(())
+    }
+
+    fn window_spec(&mut self, w: &pg_query::protobuf::WindowDef) -> Option<()> {
+        if !w.name.is_empty() && w.partition_clause.is_empty() && w.order_clause.is_empty() {
+            self.buf.push_str(&q(&w.name));
+            return Some(());
+        }
+        if !w.refname.is_empty() || w.start_offset.is_some() || w.end_offset.is_some() {
+            return None;
+        }
+        // The default frame only (no FRAMEOPTION_NONDEFAULT).
+        if w.frame_options & 0x00001 != 0 {
+            return None;
+        }
+        self.buf.push('(');
+        let mut need_space = false;
+        if !w.partition_clause.is_empty() {
+            self.buf.push_str("PARTITION BY ");
+            for (i, p) in w.partition_clause.iter().enumerate() {
+                if i > 0 {
+                    self.buf.push_str(", ");
+                }
+                self.expr(p)?;
+            }
+            need_space = true;
+        }
+        if !w.order_clause.is_empty() {
+            if need_space {
+                self.buf.push(' ');
+            }
+            self.buf.push_str("ORDER BY ");
+            self.sort_list(&w.order_clause)?;
+        }
+        self.buf.push(')');
+        Some(())
+    }
+
+    fn case_expr(&mut self, c: &pg_query::protobuf::CaseExpr) -> Option<()> {
+        let mut results: Vec<Node> = c
+            .args
+            .iter()
+            .filter_map(|w| match w.node.as_ref() {
+                Some(N::CaseWhen(cw)) => cw.result.as_deref().cloned(),
+                _ => None,
+            })
+            .collect();
+        if let Some(d) = c.defresult.as_deref() {
+            results.push(d.clone());
+        }
+        let common = self.common_type(&results)?;
+        let arg_type = match c.arg.as_deref() {
+            Some(a) => Some(self.typ(a)?),
+            None => None,
+        };
+        self.keyword("CASE", 0, PRETTYINDENT_VAR, 0);
+        if let Some(a) = c.arg.as_deref() {
+            self.buf.push(' ');
+            self.expr(a)?;
+        }
+        for w in &c.args {
+            let Some(N::CaseWhen(cw)) = w.node.as_ref() else {
+                return None;
+            };
+            self.keyword("WHEN ", 0, 0, 0);
+            let cond = cw.expr.as_deref()?;
+            match &arg_type {
+                // `CASE x WHEN v`: the value is compared with x's type.
+                Some(t) => {
+                    let (_, vw) = Self::compare_coercion(t, &self.typ(cond)?)?;
+                    self.expr_as(cond, &vw)?;
+                }
+                None => self.expr(cond)?,
+            }
+            self.buf.push_str(" THEN ");
+            self.expr_as(cw.result.as_deref()?, &common)?;
+        }
+        self.keyword("ELSE ", 0, 0, 0);
+        match c.defresult.as_deref() {
+            Some(d) => self.expr_as(d, &common)?,
+            None => self
+                .buf
+                .push_str(&format!("NULL::{}", display_type(&common))),
+        }
+        self.keyword("END", -PRETTYINDENT_VAR, 0, 0);
+        Some(())
+    }
+
+    fn sublink(&mut self, s: &pg_query::protobuf::SubLink) -> Option<()> {
+        let sub = s.subselect.as_deref()?;
+        match SubLinkType::try_from(s.sub_link_type).ok()? {
+            SubLinkType::ExistsSublink => {
+                self.buf.push_str("(EXISTS (");
+                self.subquery(sub)?;
+                self.buf.push_str("))");
+            }
+            SubLinkType::ExprSublink => {
+                self.buf.push('(');
+                self.subquery(sub)?;
+                self.buf.push(')');
+            }
+            SubLinkType::ArraySublink => {
+                self.buf.push_str("ARRAY(");
+                self.subquery(sub)?;
+                self.buf.push(')');
+            }
+            SubLinkType::AnySublink => {
+                let test = s.testexpr.as_deref()?;
+                let names_ = names(&s.oper_name);
+                let op = names_.last().map(String::as_str).unwrap_or("=");
+                let lt = self.typ(test)?;
+                let cols = self.subquery_columns(sub)?;
+                let (lw, _) = Self::compare_coercion(&lt, &cols.first()?.1)?;
+                if !lw.is_empty() {
+                    return None;
+                }
+                self.buf.push('(');
+                self.expr(test)?;
+                if op == "=" && s.oper_name.is_empty() {
+                    self.buf.push_str(" IN (");
+                } else {
+                    self.buf.push_str(&format!(" {op} ANY ("));
+                }
+                self.subquery(sub)?;
+                self.buf.push_str("))");
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+
+    /// A subquery printed at the current indentation, seeing this query's
+    /// relations as outer references.
+    fn subquery(&mut self, sub: &Node) -> Option<()> {
+        let mut inner = Printer::new(self.cat, self.indent);
+        inner.col_names_visible = false;
+        inner.scopes = self.scopes.clone();
+        inner.ctes = self.ctes.clone();
+        inner.depth = self.depth + 1;
+        inner.pretty = self.pretty;
+        inner.query(sub, None)?;
+        self.buf.push_str(&inner.buf);
+        Some(())
+    }
+
+    fn subquery_visible(&mut self, sub: &Node) -> Option<()> {
+        let mut inner = Printer::new(self.cat, self.indent);
+        inner.scopes = self.scopes.clone();
+        inner.ctes = self.ctes.clone();
+        inner.depth = self.depth + 1;
+        inner.pretty = self.pretty;
+        inner.query(sub, None)?;
+        self.buf.push_str(&inner.buf);
+        Some(())
+    }
+
+    fn subquery_columns(&mut self, sub: &Node) -> Option<Vec<(String, String)>> {
+        let mut inner = Printer::new(self.cat, 0);
+        inner.scopes = self.scopes.clone();
+        inner.ctes = self.ctes.clone();
+        inner.depth = self.depth + 1;
+        inner.pretty = self.pretty;
+        inner.query_columns(sub)
+    }
+
+    /// `get_rule_sortgroupclause`: a function call, aggregate or window
+    /// function is parenthesised.
+    fn sort_expr(&mut self, n: &Node) -> Option<()> {
+        let is_var = matches!(n.node.as_ref(), Some(N::ColumnRef(_)));
+        if !is_var && (self.pretty || matches!(n.node.as_ref(), Some(N::FuncCall(_)))) {
+            self.buf.push('(');
+            self.expr(n)?;
+            self.buf.push(')');
+            return Some(());
+        }
+        self.expr(n)
+    }
+
+    fn sort_list(&mut self, items: &[Node]) -> Option<()> {
+        for (i, s) in items.iter().enumerate() {
+            let Some(N::SortBy(sb)) = s.node.as_ref() else {
+                return None;
+            };
+            if i > 0 {
+                self.buf.push_str(", ");
+            }
+            if !sb.use_op.is_empty() {
+                return None;
+            }
+            self.sort_expr(sb.node.as_deref()?)?;
+            let dir = SortByDir::try_from(sb.sortby_dir).ok()?;
+            let desc = dir == SortByDir::SortbyDesc;
+            if desc {
+                self.buf.push_str(" DESC");
+            }
+            match SortByNulls::try_from(sb.sortby_nulls).ok()? {
+                SortByNulls::SortbyNullsFirst if !desc => self.buf.push_str(" NULLS FIRST"),
+                SortByNulls::SortbyNullsLast if desc => self.buf.push_str(" NULLS LAST"),
+                _ => {}
+            }
+        }
+        Some(())
+    }
+}
+
+fn flatten_bool<'n>(
+    b: &'n pg_query::protobuf::BoolExpr,
+    op: BoolExprType,
+    out: &mut Vec<&'n Node>,
+) {
+    for a in &b.args {
+        match a.node.as_ref() {
+            Some(N::BoolExpr(inner)) if BoolExprType::try_from(inner.boolop).ok() == Some(op) => {
+                flatten_bool(inner, op, out)
+            }
+            _ => out.push(a),
+        }
+    }
+}
+
+/// A declared type without its modifier, as the analyser compares types.
+fn base_type(t: &str) -> String {
+    let t = t.trim();
+    let base = t.split('(').next().unwrap_or(t).trim();
+    match base {
+        "int" | "integer" => "int4",
+        "smallint" => "int2",
+        "bigint" => "int8",
+        "real" => "float4",
+        "double precision" => "float8",
+        "decimal" => "numeric",
+        "boolean" => "bool",
+        "character varying" => "varchar",
+        "character" | "char" => "bpchar",
+        "serial" => "int4",
+        "bigserial" => "int8",
+        "smallserial" => "int2",
+        other => other,
+    }
+    .to_string()
+}
+
+fn parse_select(sql: &str) -> Option<Node> {
+    let parsed = pg_query::parse(sql).ok()?;
+    let stmt = parsed.protobuf.stmts.first()?.stmt.as_deref()?.clone();
+    Some(stmt)
+}
+
+/// `FigureColname`: the name the analyser gives an unaliased target.
+fn figure_colname(n: &Node) -> String {
+    let unnamed = "?column?".to_string();
+    match n.node.as_ref() {
+        Some(N::ColumnRef(c)) => names(&c.fields).pop().unwrap_or(unnamed),
+        Some(N::FuncCall(f)) => names(&f.funcname).pop().unwrap_or(unnamed),
+        Some(N::TypeCast(tc)) => {
+            let inner = tc.arg.as_deref().map(figure_colname).unwrap_or_default();
+            if inner != "?column?" && !inner.is_empty() {
+                inner
+            } else {
+                tc.type_name
+                    .as_ref()
+                    .and_then(|t| names(&t.names).pop())
+                    .unwrap_or(unnamed)
+            }
+        }
+        Some(N::CaseExpr(_)) => "case".into(),
+        Some(N::CoalesceExpr(_)) => "coalesce".into(),
+        Some(N::MinMaxExpr(m)) => {
+            if m.op == pg_query::protobuf::MinMaxOp::IsGreatest as i32 {
+                "greatest".into()
+            } else {
+                "least".into()
+            }
+        }
+        Some(N::AArrayExpr(_)) => "array".into(),
+        Some(N::AExpr(e)) if e.kind == AExprKind::AexprNullif as i32 => "nullif".into(),
+        Some(N::SubLink(s)) => match SubLinkType::try_from(s.sub_link_type) {
+            Ok(SubLinkType::ExistsSublink) => "exists".into(),
+            Ok(SubLinkType::ArraySublink) => "array".into(),
+            Ok(SubLinkType::ExprSublink) => {
+                match s.subselect.as_deref().and_then(|x| x.node.as_ref()) {
+                    Some(N::SelectStmt(sel)) => sel
+                        .target_list
+                        .first()
+                        .and_then(|t| match t.node.as_ref() {
+                            Some(N::ResTarget(rt)) if !rt.name.is_empty() => Some(rt.name.clone()),
+                            Some(N::ResTarget(rt)) => rt.val.as_deref().map(figure_colname),
+                            _ => None,
+                        })
+                        .unwrap_or(unnamed),
+                    _ => unnamed,
+                }
+            }
+            _ => unnamed,
+        },
+        Some(N::SqlvalueFunction(v)) => {
+            use pg_query::protobuf::SqlValueFunctionOp as Op;
+            match Op::try_from(v.op) {
+                Ok(Op::SvfopCurrentDate) => "current_date",
+                Ok(Op::SvfopCurrentTimestamp) => "current_timestamp",
+                Ok(Op::SvfopLocaltimestamp) => "localtimestamp",
+                Ok(Op::SvfopCurrentTime) => "current_time",
+                Ok(Op::SvfopLocaltime) => "localtime",
+                Ok(Op::SvfopCurrentUser) | Ok(Op::SvfopUser) => "current_user",
+                Ok(Op::SvfopSessionUser) => "session_user",
+                Ok(Op::SvfopCurrentRole) => "current_role",
+                _ => "?column?",
+            }
+            .into()
+        }
+        _ => unnamed,
+    }
+}
+
+/// One output column of a select list: its expression, its name, and
+/// whether it is a bare column reference of that same name.
+struct Target {
+    expr: Node,
+    name: String,
+}
+
+impl Printer<'_> {
+    /// The FROM items' relations, each as ruleutils names it.
+    fn from_rtes(&mut self, items: &[Node], out: &mut Vec<Rte>) -> Option<()> {
+        for it in items {
+            match it.node.as_ref()? {
+                N::RangeVar(rv) => {
+                    if !rv.schemaname.is_empty() && rv.schemaname != "public" {
+                        return None;
+                    }
+                    let alias = rv.alias.as_ref();
+                    if alias.is_some_and(|a| !a.colnames.is_empty()) {
+                        return None;
+                    }
+                    let columns = self.relation_columns(&rv.relname)?;
+                    out.push(Rte {
+                        refname: alias
+                            .map(|a| a.aliasname.clone())
+                            .unwrap_or_else(|| rv.relname.clone()),
+                        columns,
+                    });
+                }
+                N::JoinExpr(j) => {
+                    if j.alias.is_some() {
+                        return None;
+                    }
+                    self.from_rtes(
+                        &[j.larg.as_deref()?.clone(), j.rarg.as_deref()?.clone()],
+                        out,
+                    )?;
+                }
+                N::RangeSubselect(rs) => {
+                    if rs.lateral {
+                        return None;
+                    }
+                    let alias = rs.alias.as_ref()?;
+                    if !alias.colnames.is_empty() {
+                        return None;
+                    }
+                    let columns = self.subquery_columns(rs.subquery.as_deref()?)?;
+                    out.push(Rte {
+                        refname: alias.aliasname.clone(),
+                        columns,
+                    });
+                }
+                _ => return None,
+            }
+        }
+        Some(())
+    }
+
+    /// A select list with `*` expanded.
+    fn targets(&mut self, s: &pg_query::protobuf::SelectStmt, rtes: &[Rte]) -> Option<Vec<Target>> {
+        let mut out = Vec::new();
+        for t in &s.target_list {
+            let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+                return None;
+            };
+            let val = rt.val.as_deref()?;
+            if let Some(N::ColumnRef(c)) = val.node.as_ref() {
+                let is_star = c
+                    .fields
+                    .last()
+                    .is_some_and(|f| matches!(f.node.as_ref(), Some(N::AStar(_))));
+                if is_star {
+                    let qual = names(&c.fields);
+                    for r in rtes {
+                        if !qual.is_empty() && qual.last() != Some(&r.refname) {
+                            continue;
+                        }
+                        for (col, _) in &r.columns {
+                            out.push(Target {
+                                expr: column_ref(&[&r.refname, col]),
+                                name: col.clone(),
+                            });
+                        }
+                    }
+                    continue;
+                }
+            }
+            let name = if rt.name.is_empty() {
+                figure_colname(val)
+            } else {
+                rt.name.clone()
+            };
+            out.push(Target {
+                expr: val.clone(),
+                name,
+            });
+        }
+        Some(out)
+    }
+
+    /// A query's output columns and their types.
+    fn query_columns(&mut self, n: &Node) -> Option<Vec<(String, String)>> {
+        let Some(N::SelectStmt(s)) = n.node.as_ref() else {
+            return None;
+        };
+        let pushed_ctes = self.ctes.len();
+        if let Some(w) = &s.with_clause {
+            if w.recursive {
+                return None;
+            }
+            for c in &w.ctes {
+                let Some(N::CommonTableExpr(cte)) = c.node.as_ref() else {
+                    return None;
+                };
+                let cols = self.query_columns(cte.ctequery.as_deref()?)?;
+                self.ctes.push((cte.ctename.clone(), cols));
+            }
+        }
+        let out = if s.op != SetOperation::SetopNone as i32 {
+            let l = self.query_columns(&Node {
+                node: Some(N::SelectStmt(s.larg.clone()?)),
+            })?;
+            let r = self.query_columns(&Node {
+                node: Some(N::SelectStmt(s.rarg.clone()?)),
+            })?;
+            let mut out = Vec::new();
+            for ((ln, lt), (_, rt)) in l.into_iter().zip(r) {
+                let t = if lt == rt {
+                    lt
+                } else if lt == "unknown" {
+                    rt
+                } else if rt == "unknown" {
+                    lt
+                } else if let Some((m, _)) = numeric_meet(&lt, &rt) {
+                    if m.is_empty() {
+                        lt
+                    } else {
+                        m.to_string()
+                    }
+                } else if is_stringish(&lt) && is_stringish(&rt) {
+                    "text".into()
+                } else {
+                    return None;
+                };
+                out.push((ln, t));
+            }
+            Some(out)
+        } else if !s.values_lists.is_empty() {
+            None
+        } else {
+            let mut rtes = Vec::new();
+            self.from_rtes(&s.from_clause, &mut rtes)?;
+            self.scopes.push(rtes.clone());
+            let targets = self.targets(s, &rtes);
+            let out = targets.and_then(|ts| {
+                ts.iter()
+                    .map(|t| {
+                        let ty = self.typ(&t.expr)?;
+                        Some((
+                            t.name.clone(),
+                            if ty == "unknown" { "text".into() } else { ty },
+                        ))
+                    })
+                    .collect::<Option<Vec<_>>>()
+            });
+            self.scopes.pop();
+            out
+        };
+        self.ctes.truncate(pushed_ctes);
+        out
+    }
+
+    /// `get_query_def`: print a query at the current indentation.
+    fn query(&mut self, n: &Node, colnames: Option<&[String]>) -> Option<()> {
+        if self.depth > 32 {
+            return None;
+        }
+        let Some(N::SelectStmt(s)) = n.node.as_ref() else {
+            return None;
+        };
+        if s.into_clause.is_some() || !s.locking_clause.is_empty() {
+            return None;
+        }
+        let pushed_ctes = self.ctes.len();
+        if let Some(w) = &s.with_clause {
+            self.with_clause(w)?;
+        }
+        if s.op != SetOperation::SetopNone as i32 {
+            if !s.sort_clause.is_empty() || s.limit_count.is_some() || s.limit_offset.is_some() {
+                return None;
+            }
+            let names = match colnames {
+                Some(c) => c.to_vec(),
+                None => self.query_columns(n)?.into_iter().map(|(n, _)| n).collect(),
+            };
+            self.setop(s, &names)?;
+        } else {
+            self.basic_select(s, colnames)?;
+        }
+        self.ctes.truncate(pushed_ctes);
+        Some(())
+    }
+
+    fn with_clause(&mut self, w: &pg_query::protobuf::WithClause) -> Option<()> {
+        if w.recursive {
+            return None;
+        }
+        self.indent += PRETTYINDENT_STD;
+        self.buf.push(' ');
+        let mut sep = "WITH ";
+        for c in &w.ctes {
+            let Some(N::CommonTableExpr(cte)) = c.node.as_ref() else {
+                return None;
+            };
+            if !cte.aliascolnames.is_empty()
+                || cte.ctematerialized != pg_query::protobuf::CteMaterialize::Default as i32
+            {
+                return None;
+            }
+            let body = cte.ctequery.as_deref()?;
+            self.buf.push_str(sep);
+            self.buf.push_str(&q(&cte.ctename));
+            self.buf.push_str(" AS (");
+            self.keyword("", 0, 0, 0);
+            let mut inner = Printer::new(self.cat, self.indent);
+            inner.scopes = self.scopes.clone();
+            inner.ctes = self.ctes.clone();
+            inner.depth = self.depth + 1;
+            inner.pretty = self.pretty;
+            inner.query(body, None)?;
+            self.buf.push_str(&inner.buf);
+            self.keyword("", 0, 0, 0);
+            self.buf.push(')');
+            let cols = self.query_columns(body)?;
+            self.ctes.push((cte.ctename.clone(), cols));
+            sep = ", ";
+        }
+        self.indent -= PRETTYINDENT_STD;
+        self.keyword("", 0, 0, 0);
+        Some(())
+    }
+
+    /// `get_setop_query`.
+    fn setop(&mut self, s: &pg_query::protobuf::SelectStmt, colnames: &[String]) -> Option<()> {
+        let op = SetOperation::try_from(s.op).ok()?;
+        if op == SetOperation::SetopNone {
+            let leaf_paren = s.with_clause.is_some()
+                || !s.sort_clause.is_empty()
+                || s.limit_count.is_some()
+                || s.limit_offset.is_some();
+            let sub = if leaf_paren {
+                self.buf.push('(');
+                self.keyword("", PRETTYINDENT_STD, 0, 0);
+                PRETTYINDENT_STD
+            } else {
+                0
+            };
+            let mut inner = Printer::new(self.cat, self.indent);
+            inner.scopes = self.scopes.clone();
+            inner.ctes = self.ctes.clone();
+            inner.depth = self.depth + 1;
+            inner.pretty = self.pretty;
+            inner.query(
+                &Node {
+                    node: Some(N::SelectStmt(Box::new(s.clone()))),
+                },
+                Some(colnames),
+            )?;
+            self.buf.push_str(&inner.buf);
+            if leaf_paren {
+                self.keyword(")", -sub, 0, 0);
+            }
+            return Some(());
+        }
+        let larg = s.larg.as_deref()?;
+        let rarg = s.rarg.as_deref()?;
+        let need_paren =
+            larg.op != SetOperation::SetopNone as i32 && (larg.op != s.op || larg.all != s.all);
+        let sub = if need_paren {
+            self.buf.push('(');
+            self.keyword("", PRETTYINDENT_STD, 0, 0);
+            PRETTYINDENT_STD
+        } else {
+            0
+        };
+        self.setop(larg, colnames)?;
+        if need_paren {
+            self.keyword(") ", -sub, 0, 0);
+        } else {
+            self.keyword("", -sub, 0, 0);
+        }
+        self.buf.push_str(match op {
+            SetOperation::SetopUnion => "UNION ",
+            SetOperation::SetopIntersect => "INTERSECT ",
+            SetOperation::SetopExcept => "EXCEPT ",
+            SetOperation::SetopNone | SetOperation::Undefined => return None,
+        });
+        if s.all {
+            self.buf.push_str("ALL ");
+        }
+        let need_paren = rarg.op != SetOperation::SetopNone as i32;
+        let sub = if need_paren {
+            self.buf.push('(');
+            PRETTYINDENT_STD
+        } else {
+            0
+        };
+        self.keyword("", sub, 0, 0);
+        self.setop(rarg, colnames)?;
+        self.indent -= sub;
+        if need_paren {
+            self.keyword(")", 0, 0, 0);
+        }
+        Some(())
+    }
+
+    /// `get_basic_select_query` plus the ORDER BY / OFFSET / LIMIT of
+    /// `get_select_query_def`.
+    fn basic_select(
+        &mut self,
+        s: &pg_query::protobuf::SelectStmt,
+        colnames: Option<&[String]>,
+    ) -> Option<()> {
+        if !s.values_lists.is_empty() || !s.group_distinct == false && s.group_distinct {
+            return None;
+        }
+        let mut rtes = Vec::new();
+        self.from_rtes(&s.from_clause, &mut rtes)?;
+        self.scopes.push(rtes.clone());
+        let targets = self.targets(s, &rtes)?;
+        self.indent += PRETTYINDENT_STD;
+        self.buf.push(' ');
+        self.buf.push_str("SELECT");
+        if !s.distinct_clause.is_empty() {
+            let plain = s.distinct_clause.len() == 1 && s.distinct_clause[0].node.is_none();
+            if plain {
+                self.buf.push_str(" DISTINCT");
+            } else {
+                self.buf.push_str(" DISTINCT ON (");
+                for (i, d) in s.distinct_clause.iter().enumerate() {
+                    if i > 0 {
+                        self.buf.push_str(", ");
+                    }
+                    let e = self.sort_target(d, &targets)?;
+                    self.sort_expr(&e)?;
+                }
+                self.buf.push(')');
+            }
+        }
+        // get_target_list, wrapping every column after the first.
+        let mut sep = " ";
+        for (i, t) in targets.iter().enumerate() {
+            self.buf.push_str(sep);
+            sep = ", ";
+            let saved = std::mem::take(&mut self.buf);
+            self.expr(&t.expr)?;
+            let name = colnames
+                .and_then(|c| c.get(i).cloned())
+                .unwrap_or_else(|| t.name.clone());
+            let plain_var = match t.expr.node.as_ref() {
+                Some(N::ColumnRef(c)) => names(&c.fields).last() == Some(&name),
+                _ => !self.col_names_visible && name == "?column?",
+            };
+            if !plain_var {
+                self.buf.push_str(" AS ");
+                self.buf.push_str(&q(&name));
+            }
+            let item = std::mem::replace(&mut self.buf, saved);
+            if item.starts_with('\n') {
+                self.remove_trailing_spaces();
+            } else if i > 0 {
+                self.keyword("", -PRETTYINDENT_STD, PRETTYINDENT_STD, PRETTYINDENT_VAR);
+            }
+            self.buf.push_str(&item);
+        }
+        // get_from_clause.
+        for (i, it) in s.from_clause.iter().enumerate() {
+            if i == 0 {
+                self.keyword(" FROM ", -PRETTYINDENT_STD, PRETTYINDENT_STD, 2);
+                self.from_item(it)?;
+            } else {
+                self.buf.push_str(", ");
+                let saved = std::mem::take(&mut self.buf);
+                self.from_item(it)?;
+                let item = std::mem::replace(&mut self.buf, saved);
+                if item.starts_with('\n') {
+                    self.remove_trailing_spaces();
+                } else {
+                    self.keyword("", -PRETTYINDENT_STD, PRETTYINDENT_STD, PRETTYINDENT_VAR);
+                }
+                self.buf.push_str(&item);
+            }
+        }
+        if let Some(w) = s.where_clause.as_deref() {
+            self.keyword(" WHERE ", -PRETTYINDENT_STD, PRETTYINDENT_STD, 1);
+            self.expr(w)?;
+        }
+        if !s.group_clause.is_empty() {
+            self.keyword(" GROUP BY ", -PRETTYINDENT_STD, PRETTYINDENT_STD, 1);
+            for (i, g) in s.group_clause.iter().enumerate() {
+                if i > 0 {
+                    self.buf.push_str(", ");
+                }
+                let e = self.group_target(g, &targets)?;
+                self.sort_expr(&e)?;
+            }
+        }
+        if let Some(h) = s.having_clause.as_deref() {
+            self.keyword(" HAVING ", -PRETTYINDENT_STD, PRETTYINDENT_STD, 0);
+            self.expr(h)?;
+        }
+        let mut sep: Option<&str> = None;
+        for w in &s.window_clause {
+            let Some(N::WindowDef(wd)) = w.node.as_ref() else {
+                return None;
+            };
+            if wd.name.is_empty() {
+                continue;
+            }
+            match sep {
+                None => self.keyword(" WINDOW ", -PRETTYINDENT_STD, PRETTYINDENT_STD, 1),
+                Some(x) => self.buf.push_str(x),
+            }
+            self.buf.push_str(&format!("{} AS ", q(&wd.name)));
+            let mut spec = (**wd).clone();
+            spec.name = String::new();
+            self.window_spec(&spec)?;
+            sep = Some(", ");
+        }
+        if !s.sort_clause.is_empty() {
+            self.keyword(" ORDER BY ", -PRETTYINDENT_STD, PRETTYINDENT_STD, 1);
+            let mut resolved = Vec::new();
+            for sb in &s.sort_clause {
+                let Some(N::SortBy(b)) = sb.node.as_ref() else {
+                    return None;
+                };
+                let mut b = (**b).clone();
+                b.node = Some(Box::new(self.sort_target(b.node.as_deref()?, &targets)?));
+                resolved.push(Node {
+                    node: Some(N::SortBy(Box::new(b))),
+                });
+            }
+            self.sort_list(&resolved)?;
+        }
+        if let Some(o) = s.limit_offset.as_deref() {
+            self.keyword(" OFFSET ", -PRETTYINDENT_STD, PRETTYINDENT_STD, 0);
+            self.expr(o)?;
+        }
+        if let Some(l) = s.limit_count.as_deref() {
+            if s.limit_option != pg_query::protobuf::LimitOption::Count as i32 {
+                return None;
+            }
+            self.keyword(" LIMIT ", -PRETTYINDENT_STD, PRETTYINDENT_STD, 0);
+            match l.node.as_ref() {
+                Some(N::AConst(c)) if c.val.is_none() => self.buf.push_str("ALL"),
+                _ => self.expr(l)?,
+            }
+        }
+        self.scopes.pop();
+        Some(())
+    }
+
+    /// An ORDER BY / DISTINCT ON item: an output column's number or name
+    /// stands for its expression.
+    fn sort_target(&self, n: &Node, targets: &[Target]) -> Option<Node> {
+        match n.node.as_ref()? {
+            N::AConst(c) => match c.val.as_ref() {
+                Some(Val::Ival(i)) => {
+                    let k = usize::try_from(i.ival).ok()?.checked_sub(1)?;
+                    Some(targets.get(k)?.expr.clone())
+                }
+                _ => Some(n.clone()),
+            },
+            N::ColumnRef(c) if c.fields.len() == 1 => {
+                let name = names(&c.fields).pop()?;
+                match targets.iter().filter(|t| t.name == name).count() {
+                    0 => Some(n.clone()),
+                    1 => Some(targets.iter().find(|t| t.name == name)?.expr.clone()),
+                    _ => None,
+                }
+            }
+            _ => Some(n.clone()),
+        }
+    }
+
+    /// A GROUP BY item: an input column first, then an output name.
+    fn group_target(&self, n: &Node, targets: &[Target]) -> Option<Node> {
+        match n.node.as_ref()? {
+            N::AConst(_) => self.sort_target(n, targets),
+            N::ColumnRef(c) if c.fields.len() == 1 => {
+                if self.resolve(&names(&c.fields)).is_some() {
+                    Some(n.clone())
+                } else {
+                    self.sort_target(n, targets)
+                }
+            }
+            _ => Some(n.clone()),
+        }
+    }
+
+    /// `get_from_clause_item`.
+    fn from_item(&mut self, it: &Node) -> Option<()> {
+        match it.node.as_ref()? {
+            N::RangeVar(rv) => {
+                self.buf.push_str(&q(&rv.relname));
+                if let Some(a) = &rv.alias {
+                    self.buf.push(' ');
+                    self.buf.push_str(&q(&a.aliasname));
+                }
+            }
+            N::RangeSubselect(rs) => {
+                self.buf.push('(');
+                self.subquery_visible(rs.subquery.as_deref()?)?;
+                self.buf.push(')');
+                self.buf.push(' ');
+                self.buf.push_str(&q(&rs.alias.as_ref()?.aliasname));
+            }
+            N::JoinExpr(j) => {
+                let open = !self.pretty;
+                if open {
+                    self.buf.push('(');
+                }
+                self.from_item(j.larg.as_deref()?)?;
+                let jt = JoinType::try_from(j.jointype).ok()?;
+                let word = match jt {
+                    JoinType::JoinInner if j.is_natural => " NATURAL JOIN ",
+                    JoinType::JoinInner if j.quals.is_none() && j.using_clause.is_empty() => {
+                        " CROSS JOIN "
+                    }
+                    JoinType::JoinInner => " JOIN ",
+                    JoinType::JoinLeft if j.is_natural => " NATURAL LEFT JOIN ",
+                    JoinType::JoinLeft => " LEFT JOIN ",
+                    JoinType::JoinRight if j.is_natural => " NATURAL RIGHT JOIN ",
+                    JoinType::JoinRight => " RIGHT JOIN ",
+                    JoinType::JoinFull if j.is_natural => " NATURAL FULL JOIN ",
+                    JoinType::JoinFull => " FULL JOIN ",
+                    _ => return None,
+                };
+                self.keyword(word, -PRETTYINDENT_STD, PRETTYINDENT_STD, PRETTYINDENT_JOIN);
+                self.from_item(j.rarg.as_deref()?)?;
+                if !j.using_clause.is_empty() {
+                    let cols: Vec<String> = names(&j.using_clause).iter().map(|c| q(c)).collect();
+                    self.buf.push_str(&format!(" USING ({})", cols.join(", ")));
+                } else if let Some(qual) = j.quals.as_deref() {
+                    self.buf.push_str(" ON ");
+                    if open {
+                        self.buf.push('(');
+                    }
+                    self.expr(qual)?;
+                    if open {
+                        self.buf.push(')');
+                    }
+                }
+                if open {
+                    self.buf.push(')');
+                }
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+}
+
+fn column_ref(parts: &[&str]) -> Node {
+    Node {
+        node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+            fields: parts
+                .iter()
+                .map(|p| Node {
+                    node: Some(N::String(pg_query::protobuf::String {
+                        sval: (*p).to_string(),
+                    })),
+                })
+                .collect(),
+            location: -1,
+        })),
+    }
+}
+
+/// `pg_get_viewdef(view)`: the view's `SELECT` as ruleutils prints it, with
+/// its leading space and trailing semicolon; `None` for a shape this does
+/// not reproduce.
+pub fn viewdef(sql: &str, cat: &Catalog<'_>) -> Option<String> {
+    viewdef_with(sql, cat, false)
+}
+
+/// `pg_get_viewdef(view, true)`: parentheses only where precedence needs
+/// them (PRETTYFLAG_PAREN).
+pub fn viewdef_pretty(sql: &str, cat: &Catalog<'_>) -> Option<String> {
+    viewdef_with(sql, cat, true)
+}
+
+fn viewdef_with(sql: &str, cat: &Catalog<'_>, pretty: bool) -> Option<String> {
+    let node = parse_select(sql)?;
+    let mut p = Printer::new(cat, 0);
+    p.pretty = pretty;
+    p.query(&node, None)?;
+    Some(format!("{};", p.buf))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use secantus_pgcatalog::Column;
+
+    fn cat_lookup(n: &str) -> Option<TableDef> {
+        match n {
+            "vd_t" => Some(TableDef::new(
+                "vd_t",
+                vec![
+                    Column::new("id", "int4", true),
+                    Column::new("v", "varchar", false),
+                    Column::new("t", "text", false),
+                    Column::new("n", "numeric", false),
+                    Column::new("d", "date", false),
+                    Column::new("b", "bool", false),
+                ],
+            )),
+            "vd_u" => Some(TableDef::new(
+                "vd_u",
+                vec![
+                    Column::new("id", "int4", false),
+                    Column::new("t_id", "int4", false),
+                    Column::new("w", "text", false),
+                ],
+            )),
+            _ => None,
+        }
+    }
+
+    fn render(sql: &str) -> Option<String> {
+        let none = |_: &str| None;
+        let cat = Catalog {
+            lookup: &cat_lookup,
+            view_sql: &none,
+        };
+        viewdef(sql, &cat)
+    }
+
+    #[test]
+    fn a_simple_view_reads_as_ruleutils_prints_it() {
+        assert_eq!(
+            render("SELECT id, t FROM vd_t").as_deref(),
+            Some(" SELECT vd_t.id,\n    vd_t.t\n   FROM vd_t;")
+        );
+    }
+}
+
+/// `isSimpleNode` for a boolean expression of type `own` under `parent`.
+fn bool_simple(own: BoolExprType, parent: Parent<'_>) -> bool {
+    match parent {
+        Parent::Bool(p) => match own {
+            BoolExprType::NotExpr | BoolExprType::AndExpr => {
+                matches!(p, BoolExprType::AndExpr | BoolExprType::OrExpr)
+            }
+            BoolExprType::OrExpr => p == BoolExprType::OrExpr,
+            _ => false,
+        },
+        _ => false,
+    }
+}
