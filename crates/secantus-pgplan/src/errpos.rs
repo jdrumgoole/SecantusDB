@@ -118,6 +118,24 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
         }
         "42883" => {
             if let Some(call) = m.strip_prefix("function ") {
+                // A function a DROP / ALTER / COMMENT names is looked up
+                // without a parse position.
+                if toks.first().is_some_and(|t| {
+                    ["drop", "alter", "comment"]
+                        .iter()
+                        .any(|k| t.text.eq_ignore_ascii_case(k))
+                }) {
+                    return None;
+                }
+                // Nor is a trigger's `EXECUTE FUNCTION f()`.
+                if toks.windows(2).any(|w| {
+                    w[0].text.eq_ignore_ascii_case("execute")
+                        && ["function", "procedure"]
+                            .iter()
+                            .any(|k| w[1].text.eq_ignore_ascii_case(k))
+                }) {
+                    return None;
+                }
                 let name = call.split('(').next()?.rsplit('.').next()?;
                 let i = toks.iter().enumerate().position(|(i, t)| {
                     unquote_ident(t.text) == name && toks.get(i + 1).is_some_and(|n| n.text == "(")

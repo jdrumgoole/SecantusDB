@@ -17,6 +17,7 @@ mod catalog_objects;
 mod collations;
 mod do_block;
 mod encoding;
+mod event_triggers;
 mod explain;
 mod merge;
 mod partition;
@@ -612,9 +613,8 @@ impl plpgsql_fn::Host for PlHost<'_> {
         let columns = schema
             .iter()
             .map(|f| {
-                let ty = secantus_pgplan::pgtypes::name_of_oid(i64::from(f.datatype().oid()))
-                    .unwrap_or("text")
-                    .to_string();
+                let ty = secantus_pgplan::pgtypes::type_name_of_oid(i64::from(f.datatype().oid()))
+                    .unwrap_or_else(|| "text".to_string());
                 (f.name().to_string(), ty)
             })
             .collect();
@@ -9227,6 +9227,9 @@ impl PgHandler {
             "pg_opclass" => Some(catalog_fill::pg_opclass_def()),
             "pg_cast" => Some(casts::pg_cast_def()),
             "pg_rewrite" => Some(rules::pg_rewrite_def()),
+            "pg_event_trigger" => Some(event_triggers::pg_event_trigger_def()),
+            "pg_event_trigger_dropped_objects" => Some(event_triggers::dropped_objects_def()),
+            "pg_event_trigger_ddl_commands" => Some(event_triggers::ddl_commands_def()),
             "pg_rules" => Some(rules::pg_rules_def()),
             "pg_depend" => Some(catalog_fill::pg_depend_def()),
             "pg_publication_namespace" => Some(catalog_fill::pg_publication_namespace_def()),
@@ -9250,6 +9253,9 @@ impl PgHandler {
             "pg_opclass" => self.pg_opclass_rows(&def),
             "pg_cast" => self.pg_cast_rows(&def),
             "pg_rewrite" => self.pg_rewrite_rows(&def),
+            "pg_event_trigger" => self.pg_event_trigger_rows(&def),
+            "pg_event_trigger_dropped_objects" => self.dropped_objects_rows(&def),
+            "pg_event_trigger_ddl_commands" => self.ddl_commands_rows(&def),
             "pg_rules" => self.pg_rules_rows(&def),
             "pg_depend" => Vec::new(),
             "pg_publication_namespace" => Vec::new(),
@@ -13511,6 +13517,11 @@ impl PgHandler {
             Statement::CreateRule { .. } | Statement::DropRule { .. } => {
                 vec![rules::RULE_COLLECTION.to_string()]
             }
+            Statement::CreateEventTrigger { .. }
+            | Statement::AlterEventTrigger { .. }
+            | Statement::DropEventTrigger { .. } => {
+                vec![event_triggers::EVENT_TRIGGER_COLLECTION.to_string()]
+            }
             Statement::DropFunction { .. } => vec![
                 Self::FUNCTION_COLLECTION.to_string(),
                 Self::BASE_TYPE_COLLECTION.to_string(),
@@ -15082,6 +15093,25 @@ impl PgHandler {
             "insert" | "update" | "delete" | "select" | "with" | "values" | "truncate" => {
                 self.trigger_docs().is_ok_and(|t| !t.is_empty())
                     || self.user_function_docs().is_ok_and(|f| !f.is_empty())
+                    || self.any_rules()
+            }
+            // An event trigger runs user code around DDL, and a DROP of
+            // several objects is several steps: each is one transaction, so a
+            // failure part-way leaves nothing dropped. Not a command
+            // PostgreSQL refuses inside a transaction block.
+            "create" | "alter" | "drop" | "comment" | "grant" | "revoke" | "refresh"
+            | "security" | "import"
+                if self.has_event_triggers() || (word == "drop" && query.contains(',')) =>
+            {
+                let lower = query.to_ascii_lowercase();
+                let second: String = lower
+                    .trim_start()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                !lower.contains("concurrently")
+                    && !matches!(second.as_str(), "database" | "tablespace" | "system")
             }
             _ => false,
         }
@@ -18321,6 +18351,9 @@ impl PgHandler {
             Statement::DropCast { .. } => "DROP CAST",
             Statement::CreateRule { .. } => "CREATE RULE",
             Statement::DropRule { .. } => "DROP RULE",
+            Statement::CreateEventTrigger { .. } => "CREATE EVENT TRIGGER",
+            Statement::AlterEventTrigger { .. } => "ALTER EVENT TRIGGER",
+            Statement::DropEventTrigger { .. } => "DROP EVENT TRIGGER",
             Statement::DropOperator { .. } => "DROP OPERATOR",
             Statement::AlterView { table_form, .. }
             | Statement::RenameView { table_form, .. }
@@ -18471,7 +18504,7 @@ impl PgHandler {
             self.touched_temp
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        let out = self.execute_inner(stmt, max_rows);
+        let out = self.with_event_triggers(stmt, |stmt| self.execute_inner(stmt, max_rows));
         if may_change_catalog {
             bump_catalog_version();
         }
@@ -19605,11 +19638,13 @@ impl PgHandler {
                         }
                     }
                 }
-                Ok(vec![Response::Execution(if tag == "ALTER TABLE" {
-                    Tag::new(tag)
-                } else {
-                    Tag::new(tag).with_rows(rows)
-                })])
+                Ok(vec![Response::Execution(
+                    if tag == "ALTER TABLE" || tag.starts_with("DROP ") {
+                        Tag::new(tag)
+                    } else {
+                        Tag::new(tag).with_rows(rows)
+                    },
+                )])
             }
             Statement::CreateOperator(op) => self.create_operator(op),
             Statement::DropOperator {
@@ -19643,6 +19678,18 @@ impl PgHandler {
                 name,
                 if_exists,
             } => self.drop_rule(&table, &name, if_exists),
+            Statement::CreateEventTrigger {
+                name,
+                event,
+                tags,
+                function,
+            } => self.create_event_trigger(&name, &event, tags, &function),
+            Statement::AlterEventTrigger { name, enabled } => {
+                self.alter_event_trigger(&name, &enabled)
+            }
+            Statement::DropEventTrigger { names, if_exists } => {
+                self.drop_event_triggers(&names, if_exists)
+            }
             Statement::CreateCollation {
                 collation,
                 if_not_exists,

@@ -26,6 +26,7 @@ pub mod dtparse;
 mod enum_order;
 mod errpos;
 pub mod escape_strings;
+pub mod event_triggers;
 pub mod formatting;
 pub mod fts;
 mod func_cast;
@@ -529,6 +530,25 @@ pub enum Statement {
         condition: Option<String>,
         actions: Vec<String>,
         replace: bool,
+    },
+    /// `CREATE EVENT TRIGGER name ON event [WHEN TAG IN (...)] EXECUTE
+    /// FUNCTION f()`: `tags` upper-cased, `None` for every tag.
+    CreateEventTrigger {
+        name: String,
+        event: String,
+        tags: Option<Vec<String>>,
+        function: String,
+    },
+    /// `ALTER EVENT TRIGGER name ENABLE [REPLICA | ALWAYS] | DISABLE`:
+    /// `enabled` is `pg_event_trigger.evtenabled` (`O` / `R` / `A` / `D`).
+    AlterEventTrigger {
+        name: String,
+        enabled: String,
+    },
+    /// `DROP EVENT TRIGGER [IF EXISTS] name`.
+    DropEventTrigger {
+        names: Vec<String>,
+        if_exists: bool,
     },
     /// `DROP RULE [IF EXISTS] name ON table`.
     DropRule {
@@ -2909,6 +2929,7 @@ pub fn plan_with_params(
     let mut node = pg_query::protobuf::Node {
         node: Some(parse_one(sql)?),
     };
+    event_triggers::rewrite_sources(sql, &mut node);
     if let Some(st) = instead_of::plan(&node)? {
         return Ok(st);
     }
@@ -2945,6 +2966,7 @@ pub fn plan_with_subqueries(
     // The resolved values are appended to the bound parameters as `$N`, so
     // the list the statement is finally planned with is longer than the one
     // the client bound.
+    event_triggers::rewrite_sources(sql, &mut node);
     if let Some(st) = instead_of::plan(&node)? {
         return Ok(st);
     }
@@ -3229,6 +3251,8 @@ fn plan_node(
         N::CreateFunctionStmt(f) => plan_create_function(&f),
         N::CreateCastStmt(c) => user_casts::plan_create(&c),
         N::RuleStmt(r) => plan_create_rule(&r),
+        N::CreateEventTrigStmt(c) => event_triggers::plan_create(&c),
+        N::AlterEventTrigStmt(a) => event_triggers::plan_alter(&a),
         N::CreateTrigStmt(t) => plan_create_trigger(&t),
         N::CopyStmt(c) => plan_copy(&c, lookup, params),
         N::VariableShowStmt(v) => Ok(Statement::Show(v.name.clone())),
@@ -26501,6 +26525,9 @@ fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
     if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectCollation) {
         return collation::plan_drop(d);
     }
+    if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectEventTrigger) {
+        return event_triggers::plan_drop(d);
+    }
     // `DROP RULE name ON table`: the object is `[schema.]table.rule`.
     if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectRule) {
         let [obj] = d.objects.as_slice() else {
@@ -26771,12 +26798,17 @@ fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
     // `DROP FUNCTION`: each object is an ObjectWithArgs -- the name parts plus
     // the declared argument types, which PostgreSQL needs to pick one overload.
     if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectFunction) {
-        if d.objects.len() != 1 {
-            return Err(Error::Unsupported(
-                "DROP FUNCTION of more than one function".into(),
-            ));
+        // `DROP FUNCTION f(), g()`: one drop per function, run in order.
+        if d.objects.len() > 1 {
+            let mut drops = Vec::with_capacity(d.objects.len());
+            for o in &d.objects {
+                let mut one = d.clone();
+                one.objects = vec![o.clone()];
+                drops.push(plan_drop(&one)?);
+            }
+            return Ok(Statement::Sequence("DROP FUNCTION", drops));
         }
-        let Some(N::ObjectWithArgs(o)) = d.objects[0].node.as_ref() else {
+        let Some(N::ObjectWithArgs(o)) = d.objects.first().and_then(|o| o.node.as_ref()) else {
             return Err(Error::Unsupported("this DROP FUNCTION target".into()));
         };
         let name = o

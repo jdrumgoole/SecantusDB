@@ -84,6 +84,11 @@ impl PgHandler {
             .unwrap_or_default()
     }
 
+    /// Does any table have a rule?
+    pub(crate) fn any_rules(&self) -> bool {
+        !self.rule_docs().is_empty()
+    }
+
     /// Does `table` have any rule?
     pub(crate) fn has_rules(&self, table: &str) -> bool {
         self.rule_docs()
