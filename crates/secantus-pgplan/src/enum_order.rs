@@ -44,6 +44,21 @@ fn scope(
                     out.push((name, def));
                 }
             }
+            // A derived table (a VALUES list, a subquery): its columns, with
+            // the collation a `COLLATE` inside it gives each one, which
+            // PostgreSQL carries out as the column's implicit collation.
+            Some(N::RangeSubselect(rs)) => {
+                let (Some(alias), Some(Some(N::SelectStmt(q)))) = (
+                    rs.alias.as_ref(),
+                    rs.subquery.as_deref().map(|n| n.node.as_ref()),
+                ) else {
+                    continue;
+                };
+                out.push((
+                    alias.aliasname.clone(),
+                    derived_def(&alias.aliasname, q, &alias.colnames),
+                ));
+            }
             Some(N::JoinExpr(j)) => {
                 let sides: Vec<pg_query::protobuf::Node> = [j.larg.as_deref(), j.rarg.as_deref()]
                     .into_iter()
@@ -55,6 +70,96 @@ fn scope(
             _ => {}
         }
     }
+}
+
+/// A derived relation's columns: named by `colnames` (an alias list), else
+/// by its first leg's targets (`columnN` for VALUES). A column is `text`
+/// here -- the rewriter reads only its collation -- carrying the collation
+/// an explicit `COLLATE` in any row or leg gives it.
+fn derived_def(
+    name: &str,
+    q: &pg_query::protobuf::SelectStmt,
+    colnames: &[pg_query::protobuf::Node],
+) -> TableDef {
+    fn first_leg(q: &pg_query::protobuf::SelectStmt) -> &pg_query::protobuf::SelectStmt {
+        match q.larg.as_deref() {
+            Some(l) if q.op != pg_query::protobuf::SetOperation::SetopNone as i32 => first_leg(l),
+            _ => q,
+        }
+    }
+    // Every leg's (or row's) expressions, by position.
+    fn rows(q: &pg_query::protobuf::SelectStmt, out: &mut Vec<Vec<pg_query::protobuf::Node>>) {
+        if q.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
+            for side in [q.larg.as_deref(), q.rarg.as_deref()].into_iter().flatten() {
+                rows(side, out);
+            }
+            return;
+        }
+        if !q.values_lists.is_empty() {
+            for vl in &q.values_lists {
+                if let Some(N::List(l)) = vl.node.as_ref() {
+                    out.push(l.items.clone());
+                }
+            }
+            return;
+        }
+        out.push(
+            q.target_list
+                .iter()
+                .filter_map(|t| match t.node.as_ref() {
+                    Some(N::ResTarget(rt)) => rt.val.as_deref().cloned(),
+                    _ => None,
+                })
+                .collect(),
+        );
+    }
+    let first = first_leg(q);
+    let mut names: Vec<String> = if !first.values_lists.is_empty() {
+        let width = match first.values_lists.first().and_then(|v| v.node.as_ref()) {
+            Some(N::List(l)) => l.items.len(),
+            _ => 0,
+        };
+        (1..=width).map(|i| format!("column{i}")).collect()
+    } else {
+        first
+            .target_list
+            .iter()
+            .filter_map(|t| match t.node.as_ref() {
+                Some(N::ResTarget(rt)) => Some(if rt.name.is_empty() {
+                    rt.val
+                        .as_deref()
+                        .map(expression_column_name)
+                        .unwrap_or_default()
+                } else {
+                    rt.name.clone()
+                }),
+                _ => None,
+            })
+            .collect()
+    };
+    for (i, n) in colnames.iter().enumerate() {
+        if let (Some(N::String(s)), Some(slot)) = (n.node.as_ref(), names.get_mut(i)) {
+            *slot = s.sval.clone();
+        }
+    }
+    let mut all = Vec::new();
+    rows(q, &mut all);
+    let columns = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let mut c = Column::new(n, "text", false);
+            let collation = all.iter().find_map(|r| match r.get(i)?.node.as_ref() {
+                Some(N::CollateClause(cc)) => Some(crate::collation::clause_name(cc)),
+                _ => None,
+            });
+            if let Some(coll) = collation {
+                c.extra.insert("collation", coll);
+            }
+            c
+        })
+        .collect();
+    TableDef::new(name, columns)
 }
 
 /// The labels of `ty` when it is an ENUM. The user-type table the planner
@@ -1012,8 +1117,30 @@ pub(crate) fn rewrite(
     s: &pg_query::protobuf::SelectStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
 ) -> Result<Option<pg_query::protobuf::SelectStmt>> {
+    // A CTE is a derived relation too, and shadows a table of its name.
+    let ctes: Vec<(String, TableDef)> = s
+        .with_clause
+        .iter()
+        .flat_map(|w| &w.ctes)
+        .filter_map(|c| match c.node.as_ref() {
+            Some(N::CommonTableExpr(cte)) => match cte.ctequery.as_deref()?.node.as_ref() {
+                Some(N::SelectStmt(q)) => Some((
+                    cte.ctename.clone(),
+                    derived_def(&cte.ctename, q, &cte.aliascolnames),
+                )),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    let with_ctes = |name: &str| {
+        ctes.iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, d)| d.clone())
+            .or_else(|| lookup(name))
+    };
     let mut defs = Vec::new();
-    scope(&s.from_clause, lookup, &mut defs);
+    scope(&s.from_clause, &with_ctes, &mut defs);
     let mut out = s.clone();
     let mut r = Rewriter {
         scope: &defs,
@@ -1076,8 +1203,9 @@ pub(crate) fn rewrite(
         }
     }
     // `GROUP BY` a column of a NONDETERMINISTIC collation groups what the
-    // collation calls equal: by its key, answering one of the group's values
-    // (the byte-least), which keeps ordering by the collation.
+    // collation calls equal: by its key, answering the group's FIRST value in
+    // input order (PostgreSQL's hash aggregate keeps the row that opened the
+    // group), which still orders by the collation.
     let mut grouped: Vec<(pg_query::protobuf::Node, String)> = Vec::new();
     for g in &mut out.group_clause {
         if let Some((c, _)) = r.coll_of(g) {
@@ -1100,6 +1228,36 @@ pub(crate) fn rewrite(
                 ..Default::default()
             }))),
         };
+        // `(array_agg(col))[1]`: array_agg keeps input order.
+        let first_of_group = |col: &pg_query::protobuf::Node| pg_query::protobuf::Node {
+            node: Some(N::AIndirection(Box::new(
+                pg_query::protobuf::AIndirection {
+                    arg: Some(Box::new(fcall(
+                        "array_agg",
+                        vec![match col.node.as_ref() {
+                            Some(N::CollateClause(cc)) => {
+                                cc.arg.as_deref().cloned().unwrap_or_else(|| col.clone())
+                            }
+                            _ => col.clone(),
+                        }],
+                    ))),
+                    indirection: vec![pg_query::protobuf::Node {
+                        node: Some(N::AIndices(Box::new(pg_query::protobuf::AIndices {
+                            is_slice: false,
+                            lidx: None,
+                            uidx: Some(Box::new(pg_query::protobuf::Node {
+                                node: Some(N::AConst(pg_query::protobuf::AConst {
+                                    val: Some(a_const::Val::Ival(pg_query::protobuf::Integer {
+                                        ival: 1,
+                                    })),
+                                    ..Default::default()
+                                })),
+                            })),
+                        }))),
+                    }],
+                },
+            ))),
+        };
         for t in &mut out.target_list {
             let Some(N::ResTarget(rt)) = t.node.as_mut() else {
                 continue;
@@ -1113,15 +1271,12 @@ pub(crate) fn rewrite(
                         rt.name = column_ref_name(cr).unwrap_or_default();
                     }
                 }
-                let value = fcall(
-                    "__coll_value",
-                    vec![fcall("min", vec![Rewriter::coll_keyv(col, c)])],
-                );
+                let value = first_of_group(col);
                 r.derived.borrow_mut().push((value.clone(), c.clone()));
                 rt.val = Some(Box::new(value));
             }
         }
-        // A sort term naming the grouped column reads its representative.
+        // A sort term naming the grouped column orders by the group's key.
         for item in &mut out.sort_clause {
             let Some(N::SortBy(sb)) = item.node.as_mut() else {
                 continue;
@@ -1130,11 +1285,8 @@ pub(crate) fn rewrite(
                 continue;
             };
             if let Some((col, c)) = grouped.iter().find(|(g, _)| crate::same_expression(g, key)) {
-                let value = fcall(
-                    "__coll_value",
-                    vec![fcall("min", vec![Rewriter::coll_keyv(col, c)])],
-                );
-                sb.node = Some(Box::new(value));
+                // By the group's collation key, which every member shares.
+                sb.node = Some(Box::new(fcall("min", vec![Rewriter::coll_key(col, c)])));
             }
         }
     }

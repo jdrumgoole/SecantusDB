@@ -703,11 +703,11 @@ remain open:
         listing `de-x-icu` would advertise an order it cannot produce. (A
         PRIMARY KEY / UNIQUE constraint and `count(DISTINCT)` under a
         nondeterministic collation compare by the collation's key since
-        batch 13 -- `nondeterministic_keys` corpus.) Left: a collation carried
-        out of a derived table by `COLLATE` inside its VALUES (`select
-        count(distinct k) from (values ('a' collate ci), ('A')) v(k)`) is not
-        tracked through the derived column, so that count is 2 where
-        PostgreSQL's is 1; a table column's collation is.
+        batch 13 -- `nondeterministic_keys` corpus; since batch 14 also a
+        collation carried out of a VALUES list, subquery, set operation or CTE
+        by a `COLLATE` inside it, and `GROUP BY` answers the group's first
+        value as PostgreSQL's hash aggregate does -- `derived_collation`
+        corpus.)
       - **pgcrypto**: Blowfish and CAST5 PGP messages are verified against
         GnuPG only -- both reference servers' OpenSSL 3 builds refuse them.
 - [ ] **OPEN — RUST pgserver: residuals of the wide-`numeric` slice

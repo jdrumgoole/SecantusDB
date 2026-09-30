@@ -229,6 +229,16 @@ impl Slots {
             Some(N::List(l)) => children.extend(l.items.iter_mut()),
             Some(N::RowExpr(r)) => children.extend(r.args.iter_mut()),
             Some(N::AArrayExpr(a)) => children.extend(a.elements.iter_mut()),
+            // `(array_agg(x))[1]`: the subscripted value and its subscripts.
+            Some(N::AIndirection(a)) => {
+                children.extend(a.arg.as_deref_mut());
+                for i in &mut a.indirection {
+                    if let Some(N::AIndices(ix)) = i.node.as_mut() {
+                        children.extend(ix.lidx.as_deref_mut());
+                        children.extend(ix.uidx.as_deref_mut());
+                    }
+                }
+            }
             Some(N::CaseExpr(c)) => {
                 children.extend(c.arg.as_deref_mut());
                 for w in &mut c.args {

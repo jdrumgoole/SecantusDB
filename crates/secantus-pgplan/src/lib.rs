@@ -8410,6 +8410,19 @@ fn contains_nested_aggregate(node: &pg_query::protobuf::Node) -> bool {
             Some(N::CaseWhen(w)) => {
                 walk(w.expr.as_deref(), depth + 1) || walk(w.result.as_deref(), depth + 1)
             }
+            Some(N::MinMaxExpr(m)) => m.args.iter().any(|a| walk(Some(a), depth + 1)),
+            Some(N::NullTest(t)) => walk(t.arg.as_deref(), depth + 1),
+            // `(array_agg(n))[2]`.
+            Some(N::AIndirection(a)) => {
+                walk(a.arg.as_deref(), depth + 1)
+                    || a.indirection.iter().any(|i| match i.node.as_ref() {
+                        Some(N::AIndices(ix)) => {
+                            walk(ix.lidx.as_deref(), depth + 1)
+                                || walk(ix.uidx.as_deref(), depth + 1)
+                        }
+                        _ => false,
+                    })
+            }
             _ => false,
         }
     }
