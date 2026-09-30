@@ -210,3 +210,230 @@ impl PgHandler {
         Ok(vec![Response::Query(response)])
     }
 }
+
+impl PgHandler {
+    /// `ALTER FUNCTION | PROCEDURE | ROUTINE name[(args)] ...`, on the
+    /// routine's stored document (the shared shape, not its read-back).
+    pub(crate) fn alter_function(
+        &self,
+        kind: &str,
+        name: &str,
+        arg_types: Option<Vec<String>>,
+        action: secantus_pgplan::alter_routine::AlterFunctionAction,
+    ) -> PgWireResult<Vec<Response>> {
+        use secantus_pgplan::alter_routine::AlterFunctionAction as A;
+        let tag = match kind {
+            "procedure" => "ALTER PROCEDURE",
+            "routine" => "ALTER ROUTINE",
+            _ => "ALTER FUNCTION",
+        };
+        let noun = if kind == "procedure" {
+            "procedure"
+        } else {
+            "function"
+        };
+        let error = |code: &str, message: String| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                code.into(),
+                message,
+            )))
+        };
+        let docs = self.type_catalog_docs(Self::FUNCTION_COLLECTION)?;
+        let by_name: Vec<&Document> = docs
+            .iter()
+            .filter(|d| d.get_str("name") == Ok(name))
+            .collect();
+        let shown = |types: &[String]| {
+            format!(
+                "{name}({})",
+                types
+                    .iter()
+                    .map(|t| secantus_pgplan::display_type(t))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let target: &Document = match &arg_types {
+            Some(types) => {
+                let keys = types
+                    .iter()
+                    .map(|t| self.function_type_key(t))
+                    .collect::<PgWireResult<Vec<_>>>()?;
+                let Some(d) = by_name.iter().find(|d| strings(d, "param_types") == keys) else {
+                    return Err(error(
+                        "42883",
+                        format!("{noun} {} does not exist", shown(types)),
+                    ));
+                };
+                d
+            }
+            None => match by_name.as_slice() {
+                [] => {
+                    return Err(error(
+                        "42883",
+                        format!("could not find a {noun} named \"{name}\""),
+                    ))
+                }
+                [one] => one,
+                _ => {
+                    return Err(error(
+                        "42725",
+                        format!("{noun} name \"{name}\" is not unique"),
+                    ))
+                }
+            },
+        };
+        let is_procedure = target.get_bool("is_procedure").unwrap_or(false);
+        let signature = shown(&strings(target, "param_types"));
+        if (kind == "procedure" && !is_procedure) || (kind == "function" && is_procedure) {
+            return Err(error("42809", format!("{signature} is not a {kind}")));
+        }
+        let id = target.get_str("_id").unwrap_or_default().to_string();
+        let raw = self.type_catalog_docs_raw(Self::FUNCTION_COLLECTION)?;
+        let Some(mut doc) = raw
+            .iter()
+            .find(|d| d.get_str("_id") == Ok(id.as_str()))
+            .cloned()
+        else {
+            return Err(error("42883", format!("{noun} {signature} does not exist")));
+        };
+        let mut new_id = id.clone();
+        match action {
+            A::Rename(to) => {
+                let inputs = strings(target, "param_types");
+                if docs.iter().any(|d| {
+                    d.get_str("name") == Ok(to.as_str()) && strings(d, "param_types") == inputs
+                }) {
+                    return Err(error(
+                        "42723",
+                        format!(
+                            "{noun} {} already exists in schema \"{}\"",
+                            shown(&inputs).replacen(name, &to, 1),
+                            target.get_str("schema").unwrap_or("public")
+                        ),
+                    ));
+                }
+                let nargs = doc.get_i32("nargs").unwrap_or(inputs.len() as i32);
+                new_id = format!("{to}/{nargs}");
+                if raw.iter().any(|d| d.get_str("_id") == Ok(new_id.as_str())) {
+                    new_id = format!("{new_id}/{}", inputs.join(","));
+                }
+                doc.insert("name", to);
+                doc.insert("_id", new_id.clone());
+            }
+            A::SetSchema(schema) => {
+                if !self.namespaces().iter().any(|(n, _)| *n == schema) {
+                    return Err(error(
+                        "3F000",
+                        format!("schema \"{schema}\" does not exist"),
+                    ));
+                }
+                if schema == "public" {
+                    doc.remove("schema");
+                } else {
+                    doc.insert("schema", schema);
+                }
+            }
+            A::Owner(role) => {
+                let role = if matches!(
+                    role.as_str(),
+                    "CURRENT_USER" | "SESSION_USER" | "CURRENT_ROLE"
+                ) {
+                    self.session_user_name()
+                } else {
+                    role
+                };
+                if role != self.session_user_name() && self.role(&role)?.is_none() {
+                    return Err(error("42704", format!("role \"{role}\" does not exist")));
+                }
+                doc.insert("owner", role);
+            }
+            A::Options(options) => {
+                let mut config: Vec<String> = strings(&doc, "config");
+                for (attr, value) in options {
+                    match attr.as_str() {
+                        "volatility" => {
+                            doc.insert("volatility", value);
+                        }
+                        "strict" => {
+                            doc.insert("strict", value == "true");
+                        }
+                        "security" => {
+                            doc.insert("security_definer", value == "true");
+                        }
+                        "leakproof" => {
+                            doc.insert("leakproof", value == "true");
+                        }
+                        "cost" => {
+                            let cost: f64 = value.parse().unwrap_or(0.0);
+                            if cost <= 0.0 {
+                                return Err(error("22023", "COST must be positive".into()));
+                            }
+                            doc.insert("cost", cost);
+                        }
+                        "rows" => {
+                            let rows: f64 = value.parse().unwrap_or(0.0);
+                            if rows <= 0.0 {
+                                return Err(error("22023", "ROWS must be positive".into()));
+                            }
+                            if !target.get_bool("returns_set").unwrap_or(false)
+                                && !target.get_bool("is_table").unwrap_or(false)
+                            {
+                                return Err(error(
+                                    "22023",
+                                    "ROWS is not applicable when function does not return a set"
+                                        .into(),
+                                ));
+                            }
+                            doc.insert("rows", rows);
+                        }
+                        "parallel" => {
+                            let code = match value.as_str() {
+                                "safe" => "s",
+                                "restricted" => "r",
+                                "unsafe" => "u",
+                                other => {
+                                    return Err(error(
+                                        "22023",
+                                        format!(
+                                            "parameter \"parallel\" must be SAFE, RESTRICTED, or UNSAFE, not \"{other}\""
+                                        ),
+                                    ))
+                                }
+                            };
+                            doc.insert("parallel", code);
+                        }
+                        "set" => {
+                            let key = value.split('=').next().unwrap_or_default().to_string();
+                            config.retain(|c| c.split('=').next() != Some(key.as_str()));
+                            config.push(value);
+                        }
+                        "reset" if value == "all" => config.clear(),
+                        "reset" => config.retain(|c| c.split('=').next() != Some(value.as_str())),
+                        other => {
+                            return Err(error(
+                                "0A000",
+                                format!(
+                                    "ALTER FUNCTION ... {} is not supported yet",
+                                    other.to_uppercase()
+                                ),
+                            ))
+                        }
+                    }
+                }
+                if config.is_empty() {
+                    doc.remove("config");
+                } else {
+                    doc.insert(
+                        "config",
+                        config.into_iter().map(Bson::String).collect::<Vec<_>>(),
+                    );
+                }
+            }
+        }
+        self.delete_type_doc(Self::FUNCTION_COLLECTION, &id)?;
+        self.insert_type_doc(Self::FUNCTION_COLLECTION, &new_id, doc)?;
+        Ok(vec![Response::Execution(Tag::new(tag))])
+    }
+}

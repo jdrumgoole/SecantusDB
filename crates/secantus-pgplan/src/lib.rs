@@ -34,6 +34,7 @@ mod func_cast;
 mod funcsig;
 mod optype;
 pub use errpos::error_position;
+pub mod alter_routine;
 pub mod collation;
 pub mod geo;
 pub mod geom;
@@ -616,6 +617,14 @@ pub enum Statement {
         cascade: bool,
         /// `function`, `procedure` or `routine` (either).
         kind: String,
+    },
+    /// `ALTER FUNCTION | PROCEDURE | ROUTINE name[(args)] ...`.
+    AlterFunction {
+        /// `function`, `procedure` or `routine`.
+        kind: String,
+        name: String,
+        arg_types: Option<Vec<String>>,
+        action: alter_routine::AlterFunctionAction,
     },
     /// `CALL name(args)`: the arguments evaluated (a placeholder for each
     /// OUT parameter included), with the types they were written as.
@@ -3342,6 +3351,13 @@ fn plan_node(
         }
         N::CreateFunctionStmt(f) => plan_create_function(&f),
         N::CallStmt(c) => plan_call(&c, params),
+        N::AlterFunctionStmt(a) => alter_routine::plan_alter(&a),
+        N::AlterObjectSchemaStmt(a) if alter_routine::plan_set_schema(&a).is_some() => {
+            alter_routine::plan_set_schema(&a).expect("checked")
+        }
+        N::AlterOwnerStmt(a) if alter_routine::plan_owner(&a).is_some() => {
+            alter_routine::plan_owner(&a).expect("checked")
+        }
         N::CreateCastStmt(c) => user_casts::plan_create(&c),
         N::RuleStmt(r) => plan_create_rule(&r),
         N::CreateEventTrigStmt(c) => event_triggers::plan_create(&c),
@@ -5563,6 +5579,9 @@ fn constraint_mentions(expression: &str, column: &str) -> bool {
 
 /// `ALTER TABLE ... RENAME TO` and `... RENAME COLUMN ... TO`.
 fn plan_rename(r: &pg_query::protobuf::RenameStmt) -> Result<Statement> {
+    if let Some(routine) = alter_routine::plan_rename(r) {
+        return routine;
+    }
     if ObjectType::try_from(r.rename_type) == Ok(ObjectType::ObjectPolicy) {
         return Ok(Statement::Policy(PolicyChange::Alter {
             name: r.subname.clone(),

@@ -21048,6 +21048,12 @@ impl PgHandler {
                 arg_types,
                 ..
             } => self.call_procedure(&name, args, arg_types),
+            Statement::AlterFunction {
+                kind,
+                name,
+                arg_types,
+                action,
+            } => self.alter_function(&kind, &name, arg_types, action),
             Statement::DropFunction {
                 name,
                 arg_types,
