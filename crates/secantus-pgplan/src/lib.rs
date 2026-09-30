@@ -1164,8 +1164,12 @@ pub enum AlterTableAction {
         columns: Vec<String>,
     },
     /// `ADD [CONSTRAINT n] FOREIGN KEY ...`: checked against the rows already
-    /// there, then enforced on every write.
-    AddForeignKey(ForeignKey),
+    /// there, then enforced on every write. `named` when the statement gave
+    /// the name: a clash is then 42710, where a chosen name is renumbered.
+    AddForeignKey {
+        fk: ForeignKey,
+        named: bool,
+    },
     DropConstraint {
         name: String,
         if_exists: bool,
@@ -4447,9 +4451,10 @@ fn plan_alter_action(
                 }
                 Ok(CT::ConstrForeign) => {
                     let cols = string_list(&k.fk_attrs);
-                    return Ok(AlterTableAction::AddForeignKey(foreign_key_of(
-                        k, table, cols,
-                    )?));
+                    return Ok(AlterTableAction::AddForeignKey {
+                        fk: foreign_key_of(k, table, cols)?,
+                        named: !k.conname.is_empty(),
+                    });
                 }
                 _ => {
                     return Err(Error::Unsupported(
@@ -4892,7 +4897,7 @@ pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
                 c.field_override = composite.then(|| format!("_id.{}", c.name));
             }
         }
-        AlterTableAction::AddForeignKey(fk) => def.foreign_keys.push(fk.clone()),
+        AlterTableAction::AddForeignKey { fk, .. } => def.foreign_keys.push(fk.clone()),
         AlterTableAction::DropConstraint { name, .. } => {
             def.check_constraints.retain(|c| c.name != *name);
             def.unique_constraints.retain(|u| u.name != *name);
@@ -6532,6 +6537,18 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                 col.name
             )));
         }
+    }
+    // Two unnamed foreign keys over the same columns are told apart the
+    // way `ChooseConstraintName` does it: `t_a_fkey`, then `t_a_fkey1`.
+    let mut fk_names: Vec<String> = Vec::new();
+    for fk in &mut fks {
+        let base = fk.name.clone();
+        let mut n = 1;
+        while fk_names.contains(&fk.name) {
+            fk.name = format!("{base}{n}");
+            n += 1;
+        }
+        fk_names.push(fk.name.clone());
     }
     let mut check_names: Vec<String> = fks.iter().map(|f| f.name.clone()).collect();
     if def.columns.iter().any(|c| c.pk) {
@@ -9766,6 +9783,12 @@ pub(crate) fn fit_length(v: Bson, pg_type: &str, typmod: i32) -> Result<Bson> {
         return Ok(numeric::numeric_bson(&numeric::apply_numeric_typmod(
             &text, typmod,
         )?));
+    }
+    if matches!(pg_type, "timestamp" | "timestamptz") && (0..6).contains(&typmod) {
+        return Ok(match instant_micros(&v) {
+            Some(micros) => instant_value(round_timestamp_micros(micros, typmod)),
+            None => v,
+        });
     }
     if typmod <= 4 || !matches!(pg_type, "bpchar" | "varchar") {
         return Ok(v);
@@ -21282,6 +21305,20 @@ pub fn apply_column_expr(expr: &ColumnExpr, value: Bson, tz: &TimeZoneSetting) -
                         continue;
                     }
                 }
+                // To a zone-less type a timestamptz is the session zone's
+                // wall clock, as `const_value`'s cast has it.
+                if prev == Some("timestamptz")
+                    && matches!(target.as_str(), "date" | "timestamp" | "time" | "timetz")
+                {
+                    let previous = PLAN_TIMEZONE.with(|t| t.replace(tz.clone()));
+                    let local = timestamptz_as_local(&v, target);
+                    PLAN_TIMEZONE.with(|t| *t.borrow_mut() = previous);
+                    if let Some(local) = local? {
+                        v = local;
+                        prev = Some(target);
+                        continue;
+                    }
+                }
                 v = cast_value_with_tz(v, target, tz)?;
                 prev = Some(target);
             }
@@ -21376,6 +21413,13 @@ pub fn cast_text_to(text: &str, target: &str, tz: &TimeZoneSetting) -> Result<Bs
     let out = cast_value(Bson::String(text.to_string()), target);
     PLAN_TIMEZONE.with(|t| *t.borrow_mut() = previous);
     out
+}
+
+/// Install the session's `TimeZone` for the statements that follow, so an
+/// expression evaluated per row at EXECUTION -- after `plan_with_session`
+/// has restored its own -- still sees the session's zone.
+pub fn set_session_timezone(tz: TimeZoneSetting) {
+    PLAN_TIMEZONE.with(|t| *t.borrow_mut() = tz);
 }
 
 fn session_timezone() -> TimeZoneSetting {
@@ -22685,8 +22729,20 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
 }
 
 fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
-    // A NULL survives every cast; only its declared type changes.
+    // A NULL survives every cast; only its declared type changes -- but the
+    // type must exist: `null::no_such_type` is 42704, as any value's cast.
     if value == Bson::Null {
+        // The cast's own arms are the list of known types: a probe value
+        // that reaches the "no such type" arm is the only refusal kept.
+        let base = target.strip_suffix("[]").unwrap_or(target);
+        if let Err(Error::UndefinedObject(m)) = cast_value_inner(Bson::String(String::new()), base)
+        {
+            if m.starts_with("type \"") && m.ends_with("\" does not exist") {
+                return Err(Error::UndefinedObject(format!(
+                    "type \"{target}\" does not exist"
+                )));
+            }
+        }
         return Ok(Bson::Null);
     }
     // An array whose lower bound is not 1: an array cast keeps the bounds, a
@@ -25289,6 +25345,16 @@ pub(crate) fn compare_constants(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering
             // two different numbers equal. Rendered PLAIN first: Decimal128
             // writes `-8.34184E-7` for a small magnitude, and the digit
             // comparison has no notion of an exponent.
+            // Two integers compare EXACTLY: through f64, int8 values above
+            // 2^53 collide and become peers, duplicates and ties.
+            let int = |v: &Bson| match v {
+                Bson::Int32(i) => Some(i64::from(*i)),
+                Bson::Int64(i) => Some(*i),
+                _ => None,
+            };
+            if let (Some(x), Some(y)) = (int(a), int(b)) {
+                return Some(x.cmp(&y));
+            }
             let dec = numeric::numeric_operand_text;
             // A decimal beside a FLOAT compares as floats: PostgreSQL widens
             // the numeric to float8 for that operator, so the float's own

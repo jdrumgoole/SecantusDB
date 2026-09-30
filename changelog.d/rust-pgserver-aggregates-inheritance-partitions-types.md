@@ -93,6 +93,22 @@ included), unique and check constraints, and comments. That covers
 
 #### Fixed
 
+- Silent wrong answers, each measured against PostgreSQL 15:
+  - `ON UPDATE CASCADE` now checks the child row's other foreign keys, so a
+    cascade onto a key another parent lacks is `23503` instead of committing.
+  - Two unnamed foreign keys over one column are named `t_a_fkey` and
+    `t_a_fkey1`, not both `t_a_fkey`. A named `ADD CONSTRAINT` that clashes
+    is `42710`.
+  - int8 values above 2^53 compare exactly in ORDER BY, DISTINCT and window
+    peers, and in RANGE frames.
+  - A `timestamp(p)` / `timestamptz(p)` column stores its value rounded to
+    `p` digits.
+  - A stored `timestamptz` cast to `timestamp` or `date` is the session
+    zone's wall clock inside a WHERE, a nested cast and an aggregate, not
+    only a plain projection.
+  - An UPDATE onto an equal wide numeric primary key is `23505`, and the
+    error names `t_pkey`.
+- `null::no_such_type` is `42704`.
 - Error codes and messages now match PostgreSQL:
   - `abs(text)` and the other numeric built-ins given a string are `42883`,
     as are `upper(1)` and the other text built-ins given a number;

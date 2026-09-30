@@ -736,9 +736,10 @@ remain open:
       UPDATE action -- before, only the immutable primary key could be
       referenced, so nothing needed to look.
 
-      **Left:** constraint `oid`s are synthetic. An `ON UPDATE CASCADE` that
-      rewrites a child's key does not re-check that child's OTHER constraints
-      against the new key's parent. (`EXCLUDE`, `MATCH FULL`,
+      **Left:** constraint `oid`s are synthetic. (An `ON UPDATE CASCADE`
+      now re-checks the child's OTHER foreign keys, and two unnamed foreign
+      keys on one column are numbered apart -- `batch10_followups.sql`.)
+      (`EXCLUDE`, `MATCH FULL`,
       `pg_get_constraintdef()` and `conbin` were re-measured working in
       batch 10.)
 
@@ -7567,10 +7568,11 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
       is hoisted into its own window item and the expression reads its field.
 
       **Two known limits, neither reached by any corpus:** a `RANGE` frame
-      with a value offset compares through `f64`, so a bound beyond 2^53 on an
-      int8 or a wide numeric column could land a row on the wrong side of it
-      (interval offsets over a date / time column compare microseconds, since
-      batch 10); and partitioning scans the
+      with a value offset over a WIDE NUMERIC column compares through `f64`,
+      so a bound beyond 15 significant digits could land a row on the wrong
+      side of it (integer keys compare exactly, and so do peers, since the
+      batch 10 follow-ups; interval offsets over a date / time column compare
+      microseconds); and partitioning scans the
       distinct partition keys linearly, which is O(partitions^2).
 
       **Carried from the implementation, worth not re-deriving:** the DEFAULT

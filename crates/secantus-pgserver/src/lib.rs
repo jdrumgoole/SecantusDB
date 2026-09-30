@@ -2135,6 +2135,9 @@ impl PgHandler {
         // per catalog version, and a SET DateStyle changes no catalog.
         // `1/5/2020` is January or May by the session's DateStyle order.
         secantus_pgplan::set_session_datestyle(self.session_datestyle());
+        // The zone too: a row expression runs AFTER planning, and a stored
+        // timestamptz cast to `timestamp` is the session zone's wall clock.
+        secantus_pgplan::set_session_timezone(self.session_timezone());
         secantus_pgplan::dtparse::set_date_order(match self.session_datestyle().order {
             secantus_pgplan::DateStyleOrder::Ymd => secantus_pgplan::dtparse::DateOrder::Ymd,
             secantus_pgplan::DateStyleOrder::Dmy => secantus_pgplan::dtparse::DateOrder::Dmy,
@@ -11842,6 +11845,7 @@ impl PgHandler {
         table: &str,
         def: &TableDef,
         rows: &[Document],
+        replacing: &[Bson],
     ) -> PgWireResult<Option<Bson>> {
         let Some(pk) = def.columns.iter().find(|c| c.pk) else {
             return Ok(None);
@@ -11874,7 +11878,14 @@ impl PgHandler {
                     .storage
                     .find_matching(self.db(), table, &filter)
                     .map_err(|e| Self::storage_err("could not check the primary key", e))?;
-                if !hit.is_empty() {
+                // A row this UPDATE rewrites no longer holds its old key.
+                let taken = hit.iter().any(|raw| {
+                    decode_doc(raw)
+                        .ok()
+                        .and_then(|d| d.get("_id").cloned())
+                        .is_none_or(|old| !replacing.contains(&old))
+                });
+                if taken {
                     return Ok(Some(id.clone()));
                 }
             }
@@ -13597,7 +13608,7 @@ impl PgHandler {
                 }
                 return Ok(Some(action.clone()));
             }
-            A::AddForeignKey(fk) => {
+            A::AddForeignKey { fk, named } => {
                 for c in &fk.columns {
                     if def.column(c).is_none() {
                         return Err(missing_column(c));
@@ -13608,7 +13619,32 @@ impl PgHandler {
                     .ok_or_else(|| Self::relation_missing(&fk.ref_table))?;
                 let mut fk = fk.clone();
                 secantus_pgplan::resolve_fk_target(&mut fk, &target).map_err(|e| Self::err(&e))?;
-                return Ok(Some(A::AddForeignKey(fk)));
+                let taken = |n: &str| {
+                    def.check_constraints.iter().any(|c| c.name == n)
+                        || def.unique_constraints.iter().any(|u| u.name == n)
+                        || def.foreign_keys.iter().any(|f| f.name == n)
+                        || (def.columns.iter().any(|c| c.pk) && n == format!("{table}_pkey"))
+                };
+                if taken(&fk.name) {
+                    if *named {
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".into(),
+                            "42710".into(), // duplicate_object
+                            format!(
+                                "constraint \"{}\" for relation \"{table}\" already exists",
+                                fk.name
+                            ),
+                        ))));
+                    }
+                    // `ChooseConstraintName`: the first free `<base><n>`.
+                    let base = fk.name.clone();
+                    let mut n = 1;
+                    while taken(&fk.name) {
+                        fk.name = format!("{base}{n}");
+                        n += 1;
+                    }
+                }
+                return Ok(Some(A::AddForeignKey { fk, named: *named }));
             }
             A::ValidateConstraint(name) => {
                 let exists = def.check_constraints.iter().any(|c| c.name == *name)
@@ -13778,7 +13814,7 @@ impl PgHandler {
             A::AddPrimaryKey { name, columns } => {
                 self.add_primary_key(table, def, before, name, columns)
             }
-            A::AddForeignKey(fk) => {
+            A::AddForeignKey { fk, .. } => {
                 let mut only = def.clone();
                 only.foreign_keys = vec![fk.clone()];
                 let docs = self.table_docs(table)?;
@@ -18675,11 +18711,13 @@ impl PgHandler {
                 self.check_expression_unique(&def, &ins.rows, &[])?;
                 self.check_partition_unique(&def, &ins.rows, &[])?;
                 self.check_exclusions(&def, &ins.rows, &[])?;
-                if let Some(dup) = self.wide_numeric_pk_conflict(&ins.table, &def, &ins.rows)? {
+                if let Some(dup) =
+                    self.wide_numeric_pk_conflict(&ins.table, &def, &ins.rows, &[])?
+                {
                     return Err(Self::write_error(
                         &ins.table,
                         &def,
-                        &bson::doc! { "code": 11000, "keyValue": { "_id": dup } },
+                        &bson::doc! { "code": 11000, "keyPattern": { "_id": 1 }, "keyValue": { "_id": dup } },
                     ));
                 }
                 self.check_foreign_keys(&def, &ins.rows)?;
@@ -22018,6 +22056,17 @@ impl PgHandler {
                         self.check_expression_unique(def, &new_rows, &replacing)?;
                         self.check_partition_unique(def, &new_rows, &replacing)?;
                         self.check_exclusions(def, &new_rows, &replacing)?;
+                        // A wide numeric key is stored by its text, so the
+                        // storage index cannot see `1e41` equal `1e41.0`.
+                        if let Some(dup) =
+                            self.wide_numeric_pk_conflict(&upd.table, def, &new_rows, &replacing)?
+                        {
+                            return Err(Self::write_error(
+                                &upd.table,
+                                def,
+                                &bson::doc! { "code": 11000, "keyPattern": { "_id": 1 }, "keyValue": { "_id": dup } },
+                            ));
+                        }
                     }
                     if let (true, Some(def)) = (referenced, def.as_ref()) {
                         self.check_rekeys(&upd.table, def, &rekeys)?;
@@ -22972,6 +23021,13 @@ impl PgHandler {
             }
             if fk.ref_table == child.name || matches!(action, Some("SET DEFAULT")) {
                 self.check_fk_child_side(child, fk, &after)?;
+            }
+            // The rewritten columns may also belong to the child's OTHER
+            // foreign keys, which PostgreSQL checks against the new values.
+            for other in &child.foreign_keys {
+                if other.name != fk.name && other.columns.iter().any(|c| fk.columns.contains(c)) {
+                    self.check_fk_child_side(child, other, &after)?;
+                }
             }
             self.update_rows(&child.name, child_filter, &set, &[])?;
             Ok(())
@@ -25766,6 +25822,51 @@ fn range_bound(
             peers.end[pos] - 1
         }));
     };
+    // Integers compare EXACTLY: through f64, int8 keys above 2^53 collide
+    // and a row lands in its neighbour's frame.
+    let n = order_values.len();
+    let int_of = |v: &Bson| match v {
+        Bson::Int32(x) => Some(i128::from(*x)),
+        Bson::Int64(x) => Some(i128::from(*x)),
+        _ => None,
+    };
+    let int_offset: Option<i128> = match value {
+        None => Some(i128::from(shift)),
+        Some((RangeOffset::Number(bits), preceding)) => {
+            let f = f64::from_bits(bits);
+            (f.fract() == 0.0 && f.abs() < 9.0e15).then(|| {
+                let o = f as i128;
+                if preceding {
+                    -o
+                } else {
+                    o
+                }
+            })
+        }
+        Some((RangeOffset::Interval(_), _)) => None,
+    };
+    let all_int = (0..n).all(|i| {
+        order_values
+            .get(i)
+            .and_then(|v| v.as_ref())
+            .is_none_or(|v| *v == Bson::Null || int_of(v).is_some())
+    });
+    if let (Some(b), Some(off), true) = (int_of(&current), int_offset, all_int) {
+        let dir = |x: i128| if ascending { x } else { -x };
+        let bound = dir(b) + off;
+        let keyed = |i: usize| {
+            order_values
+                .get(i)
+                .and_then(|v| v.as_ref())
+                .and_then(int_of)
+                .map(dir)
+        };
+        return Ok(if start {
+            (0..n).find(|i| keyed(*i).is_some_and(|k| k >= bound))
+        } else {
+            (0..n).rev().find(|i| keyed(*i).is_some_and(|k| k <= bound))
+        });
+    }
     let Some(base) = key(&current) else {
         return Err(PlanError::FeatureNotSupported(
             "RANGE with an offset over a non-numeric ORDER BY column".into(),
@@ -25807,7 +25908,6 @@ fn range_bound(
             .filter(|v| **v != Bson::Null)
             .and_then(key)
     };
-    let n = order_values.len();
     if start {
         // The FIRST row at or past the bound.
         Ok((0..n).find(|i| keyed(*i).is_some_and(|k| k >= bound)))
