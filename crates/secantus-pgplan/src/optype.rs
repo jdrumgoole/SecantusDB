@@ -1,0 +1,341 @@
+//! Operator resolution by type, as PostgreSQL's parse analysis does it.
+//!
+//! A comparison between two values of different type CATEGORIES -- a text
+//! column against an integer, a date against a number, a boolean against an
+//! integer -- has no operator in `pg_operator` and no implicit cast to find
+//! one through, so PostgreSQL refuses it at plan time with `42883 operator
+//! does not exist: text = integer`. The lowering to MQL would instead compare
+//! the two values and match nothing, answering an empty result where the
+//! client should have been told its query is wrong.
+//!
+//! Only operands whose type is KNOWN statically are checked: a column of a
+//! table in the FROM list, a typed constant, a cast, a declared parameter.
+//! An untyped string literal is `unknown` and takes the other side's type,
+//! so it is never a mismatch; anything else this cannot type is skipped.
+
+use super::*;
+
+/// The type category of a built-in type, by oid; `None` for a type whose
+/// operators this does not reason about (a domain, an enum, `oid`, arrays).
+fn category(ty: &str) -> Option<&'static str> {
+    Some(match pgtypes::oid_of_name(ty)? {
+        20 | 21 | 23 | 700 | 701 | 1700 => "numeric",
+        18 | 19 | 25 | 1042 | 1043 => "string",
+        1082 | 1114 | 1184 => "datetime",
+        16 => "bool",
+        17 => "bytea",
+        1186 => "interval",
+        2950 => "uuid",
+        3802 => "jsonb",
+        _ => return None,
+    })
+}
+
+/// The relations a statement's FROM list names, by the name a column
+/// qualifier uses; `complete` when every FROM item is one of them, so an
+/// unqualified column resolves among them alone.
+struct Scope {
+    tables: Vec<(String, TableDef)>,
+    complete: bool,
+}
+
+impl Scope {
+    fn new(
+        items: &[pg_query::protobuf::Node],
+        ctes: &[String],
+        lookup: &dyn Fn(&str) -> Option<TableDef>,
+    ) -> Scope {
+        let mut scope = Scope {
+            tables: Vec::new(),
+            complete: true,
+        };
+        for item in items {
+            scope.add(item, ctes, lookup);
+        }
+        scope
+    }
+
+    fn add(
+        &mut self,
+        item: &pg_query::protobuf::Node,
+        ctes: &[String],
+        lookup: &dyn Fn(&str) -> Option<TableDef>,
+    ) {
+        match item.node.as_ref() {
+            Some(N::RangeVar(r)) if !r.schemaname.is_empty() || !ctes.contains(&r.relname) => {
+                let name = if r.schemaname.is_empty() || r.schemaname == "public" {
+                    r.relname.clone()
+                } else {
+                    format!("{}.{}", r.schemaname, r.relname)
+                };
+                match lookup(&name) {
+                    Some(def) => {
+                        let alias = r
+                            .alias
+                            .as_ref()
+                            .map(|a| a.aliasname.clone())
+                            .filter(|a| !a.is_empty())
+                            .unwrap_or_else(|| r.relname.clone());
+                        self.tables.push((alias, def));
+                    }
+                    None => self.complete = false,
+                }
+            }
+            Some(N::JoinExpr(j)) => {
+                // A USING / NATURAL join merges columns; their types are the
+                // sides' own, which is what an unqualified lookup finds.
+                if let Some(l) = j.larg.as_deref() {
+                    self.add(l, ctes, lookup);
+                }
+                if let Some(r) = j.rarg.as_deref() {
+                    self.add(r, ctes, lookup);
+                }
+            }
+            _ => self.complete = false,
+        }
+    }
+
+    fn column_type(&self, c: &pg_query::protobuf::ColumnRef) -> Option<String> {
+        let parts: Vec<&str> = c
+            .fields
+            .iter()
+            .map(|f| match f.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        match parts.as_slice() {
+            [col] if self.complete => {
+                let mut found = self
+                    .tables
+                    .iter()
+                    .filter_map(|(_, d)| d.column(col).map(|c| c.pg_type.clone()));
+                let first = found.next()?;
+                // Named by more than one side: ambiguous, not ours to judge.
+                found.next().is_none().then_some(first)
+            }
+            [q, col] => self
+                .tables
+                .iter()
+                .find(|(a, _)| a == q)
+                .and_then(|(_, d)| d.column(col))
+                .map(|c| c.pg_type.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// The type an operand has statically, or `None`.
+fn operand_type(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<String> {
+    use pg_query::protobuf::a_const::Val;
+    match n.node.as_ref()? {
+        N::AConst(c) if !c.isnull => match c.val.as_ref()? {
+            Val::Ival(_) => Some("int4".into()),
+            Val::Fval(_) => Some("numeric".into()),
+            Val::Boolval(_) => Some("bool".into()),
+            _ => None,
+        },
+        N::TypeCast(tc) => {
+            let t = type_name_of(tc.type_name.as_ref()?);
+            (!t.ends_with("[]")).then_some(t)
+        }
+        N::ColumnRef(c) => scope.column_type(c),
+        N::ParamRef(p) => declared_param_type(usize::try_from(p.number).ok()?),
+        _ => None,
+    }
+}
+
+fn op_of(e: &pg_query::protobuf::AExpr) -> Option<String> {
+    match e.name.last()?.node.as_ref()? {
+        N::String(s) => Some(s.sval.clone()),
+        _ => None,
+    }
+}
+
+fn mismatch(op: &str, l: &str, r: &str, location: i32) -> Error {
+    set_error_location(location);
+    Error::UndefinedFunction(format!(
+        "operator does not exist: {} {op} {}",
+        display_type(l),
+        display_type(r)
+    ))
+}
+
+/// Check one `AExpr`: both sides typed, and no operator between them.
+fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
+    use pg_query::protobuf::AExprKind as K;
+    let Some(op) = op_of(e) else {
+        return Ok(());
+    };
+    if user_ops::defines(&op) {
+        return Ok(());
+    }
+    let kind = K::try_from(e.kind).ok();
+    let Some(l) = e.lexpr.as_deref().and_then(|n| operand_type(n, scope)) else {
+        return Ok(());
+    };
+    let Some(lc) = category(&l) else {
+        return Ok(());
+    };
+    match kind {
+        Some(K::AexprOp) if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") => {
+            let Some(r) = e.rexpr.as_deref().and_then(|n| operand_type(n, scope)) else {
+                return Ok(());
+            };
+            if category(&r).is_some_and(|rc| rc != lc) {
+                let op = if op == "!=" { "<>" } else { op.as_str() };
+                return Err(mismatch(op, &l, &r, e.location));
+            }
+        }
+        Some(K::AexprIn) => {
+            let Some(N::List(items)) = e.rexpr.as_deref().and_then(|n| n.node.as_ref()) else {
+                return Ok(());
+            };
+            for item in &items.items {
+                if let Some(r) = operand_type(item, scope) {
+                    if category(&r).is_some_and(|rc| rc != lc) {
+                        return Err(mismatch(&op, &l, &r, e.location));
+                    }
+                }
+            }
+        }
+        Some(K::AexprLike | K::AexprIlike) | Some(K::AexprOp)
+            if matches!(op.as_str(), "~~" | "~~*" | "!~~" | "!~~*") =>
+        {
+            let Some(r) = e.rexpr.as_deref().and_then(|n| operand_type(n, scope)) else {
+                return Ok(());
+            };
+            let Some(rc) = category(&r) else {
+                return Ok(());
+            };
+            let fits = (lc == "string" && rc == "string") || (lc == "bytea" && rc == "bytea");
+            if !fits {
+                return Err(mismatch(&op, &l, &r, e.location));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Walk an expression, stopping at a subquery (its columns are its own
+/// scope's, which this does not model).
+fn walk(n: &pg_query::protobuf::Node, scope: &Scope) -> Result<()> {
+    let Some(node) = n.node.as_ref() else {
+        return Ok(());
+    };
+    match node {
+        N::AExpr(e) => {
+            check_aexpr(e, scope)?;
+            for s in e.lexpr.iter().chain(e.rexpr.iter()) {
+                walk(s, scope)?;
+            }
+        }
+        N::BoolExpr(b) => {
+            for a in &b.args {
+                walk(a, scope)?;
+            }
+        }
+        N::List(l) => {
+            for a in &l.items {
+                walk(a, scope)?;
+            }
+        }
+        N::NullTest(t) => {
+            if let Some(a) = t.arg.as_deref() {
+                walk(a, scope)?;
+            }
+        }
+        N::ResTarget(r) => {
+            if let Some(v) = r.val.as_deref() {
+                walk(v, scope)?;
+            }
+        }
+        N::CaseExpr(c) => {
+            for w in &c.args {
+                if let Some(N::CaseWhen(w)) = w.node.as_ref() {
+                    for s in w.expr.iter().chain(w.result.iter()) {
+                        walk(s, scope)?;
+                    }
+                }
+            }
+            if let Some(d) = c.defresult.as_deref() {
+                walk(d, scope)?;
+            }
+        }
+        N::JoinExpr(j) => {
+            for s in j.larg.iter().chain(j.rarg.iter()).chain(j.quals.iter()) {
+                walk(s, scope)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn check_select(
+    s: &pg_query::protobuf::SelectStmt,
+    outer_ctes: &[String],
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Result<()> {
+    let mut ctes = outer_ctes.to_vec();
+    if let Some(w) = &s.with_clause {
+        for c in &w.ctes {
+            if let Some(N::CommonTableExpr(c)) = c.node.as_ref() {
+                ctes.push(c.ctename.clone());
+            }
+        }
+    }
+    if let Some(l) = s.larg.as_deref() {
+        check_select(l, &ctes, lookup)?;
+    }
+    if let Some(r) = s.rarg.as_deref() {
+        check_select(r, &ctes, lookup)?;
+    }
+    let scope = Scope::new(&s.from_clause, &ctes, lookup);
+    for f in &s.from_clause {
+        walk(f, &scope)?;
+    }
+    for t in &s.target_list {
+        walk(t, &scope)?;
+    }
+    if let Some(w) = s.where_clause.as_deref() {
+        walk(w, &scope)?;
+    }
+    Ok(())
+}
+
+/// 42883 for a comparison with no operator between its operands' types.
+pub(crate) fn check(node: &N, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Result<()> {
+    let relation = |r: &Option<pg_query::protobuf::RangeVar>| {
+        r.as_ref().map(|r| pg_query::protobuf::Node {
+            node: Some(N::RangeVar(r.clone())),
+        })
+    };
+    match node {
+        N::SelectStmt(s) => check_select(s, &[], lookup),
+        N::UpdateStmt(u) if u.with_clause.is_none() => {
+            let items: Vec<_> = relation(&u.relation)
+                .into_iter()
+                .chain(u.from_clause.iter().cloned())
+                .collect();
+            let scope = Scope::new(&items, &[], lookup);
+            match u.where_clause.as_deref() {
+                Some(w) => walk(w, &scope),
+                None => Ok(()),
+            }
+        }
+        N::DeleteStmt(d) if d.with_clause.is_none() => {
+            let items: Vec<_> = relation(&d.relation)
+                .into_iter()
+                .chain(d.using_clause.iter().cloned())
+                .collect();
+            let scope = Scope::new(&items, &[], lookup);
+            match d.where_clause.as_deref() {
+                Some(w) => walk(w, &scope),
+                None => Ok(()),
+            }
+        }
+        _ => Ok(()),
+    }
+}

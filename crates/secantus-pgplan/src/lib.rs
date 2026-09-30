@@ -24,10 +24,13 @@ pub mod datetime;
 pub mod domains;
 pub mod dtparse;
 mod enum_order;
+mod errpos;
 pub mod escape_strings;
 pub mod formatting;
 pub mod fts;
 mod func_cast;
+mod optype;
+pub use errpos::error_position;
 pub mod geo;
 pub mod geom;
 pub mod geometry;
@@ -260,6 +263,9 @@ impl Error {
                 if m.starts_with("function ") && m.ends_with(") does not exist") =>
             {
                 Some("No function matches the given name and argument types. You might need to add explicit type casts.")
+            }
+            Error::UndefinedFunction(m) if m.starts_with("operator does not exist: ") => {
+                Some("No operator matches the given name and argument types. You might need to add explicit type casts.")
             }
             Error::DatatypeMismatch(m) if m.contains(" but expression is of type ") => {
                 Some("You will need to rewrite or cast the expression.")
@@ -2566,6 +2572,25 @@ fn range_accessor_value(
     })())
 }
 
+thread_local! {
+    /// The parse location (a byte offset into the statement) of the token
+    /// the last planning error is about, when the site that raised it knew.
+    static ERROR_LOCATION: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Record where the error about to be raised points.
+pub(crate) fn set_error_location(location: i32) {
+    if location >= 0 {
+        ERROR_LOCATION.with(|l| l.set(Some(location)));
+    }
+}
+
+/// The location the last planning error recorded, consumed; call before
+/// planning to clear a stale one too.
+pub fn take_error_location() -> Option<i32> {
+    ERROR_LOCATION.with(std::cell::Cell::take)
+}
+
 /// Split a multi-command string into its individual commands.
 ///
 /// PostgreSQL's SIMPLE query protocol takes any number of commands separated by
@@ -2736,6 +2761,7 @@ pub fn plan_with_subqueries(
     }
     if let Some(inner) = node.node.as_ref() {
         func_cast::refuse_unresolved(inner)?;
+        optype::check(inner, lookup)?;
     }
     let mut params = params.to_vec();
     materialize_dml_ctes(&mut node, lookup, &mut params, run)?;
@@ -12266,6 +12292,21 @@ fn text_signature(name: &str) -> Option<usize> {
     })
 }
 
+/// The built-ins that take only numbers (PostgreSQL 15's `pg_proc`), and
+/// how many leading arguments are numeric. `trunc` is left out: it also
+/// takes a `macaddr`.
+fn numeric_signature(name: &str) -> Option<usize> {
+    Some(match name {
+        "abs" | "ceil" | "ceiling" | "floor" | "sign" | "sqrt" | "cbrt" | "exp" | "ln"
+        | "log10" | "degrees" | "radians" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan"
+        | "sind" | "cosd" | "tand" | "sinh" | "cosh" | "tanh" | "factorial" | "scale"
+        | "min_scale" | "trim_scale" => 1,
+        "round" => 1,
+        "mod" | "power" | "pow" | "div" | "atan2" | "atan2d" | "gcd" | "lcm" | "log" => 2,
+        _ => return None,
+    })
+}
+
 /// 42883 for a text-only built-in given an argument of a type with no
 /// implicit cast to text (`upper(1)`): PostgreSQL resolves functions by
 /// type at plan time, where this server would otherwise stringify.
@@ -12293,6 +12334,42 @@ fn text_function_mismatch(f: &pg_query::protobuf::FuncCall, types: &[String]) ->
         return numeric_or_time.then(|| {
             Error::UndefinedFunction(format!(
                 "function length({}) does not exist",
+                types
+                    .iter()
+                    .map(|t| display_type(t))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        });
+    }
+    if let Some(n) = numeric_signature(&name) {
+        if correlated::user_function_named(&name) {
+            return None;
+        }
+        // No implicit cast reaches a number from these.
+        let not_numeric = |t: &str| {
+            matches!(
+                t,
+                "text"
+                    | "varchar"
+                    | "bpchar"
+                    | "name"
+                    | "bool"
+                    | "date"
+                    | "timestamp"
+                    | "timestamptz"
+                    | "time"
+                    | "timetz"
+                    | "interval"
+                    | "uuid"
+                    | "json"
+                    | "jsonb"
+                    | "bytea"
+            ) || t.ends_with("[]")
+        };
+        return types.iter().take(n).any(|t| not_numeric(t)).then(|| {
+            Error::UndefinedFunction(format!(
+                "function {name}({}) does not exist",
                 types
                     .iter()
                     .map(|t| display_type(t))
@@ -25703,7 +25780,7 @@ pub fn lower_where(
             other => {
                 return Err(Error::DatatypeMismatch(format!(
                     "argument of WHERE must be type boolean, not type {}",
-                    inferred_type(&other)
+                    display_type(&static_type(node, &other))
                 )))
             }
         });
@@ -27569,6 +27646,46 @@ fn field_type<'a>(def: &'a TableDef, field: &str) -> Option<&'a str> {
         .map(|c| c.pg_type.as_str())
 }
 
+/// `date_column <op> instant`, the date promoted to midnight: over the
+/// instant's own day (in the session zone for a `timestamptz`) an instant
+/// past midnight is above that day and below the next, so each operator
+/// becomes a comparison of the stored date text with that day.
+fn date_instant_filter(field: &str, op: &str, value: &Bson, zoned: bool) -> Option<Document> {
+    let text = if zoned {
+        timestamptz_value_text(value, &session_timezone())?
+    } else {
+        value_text(&cast_value(value.clone(), "text").ok()?)
+    };
+    let b = text.as_bytes();
+    // Only a plain four-digit AD year compares as date text.
+    if text.len() < 19 || b[4] != b'-' || b[10] != b' ' || text.contains("BC") {
+        return None;
+    }
+    let day = &text[..10];
+    let midnight = text[11..].starts_with("00:00:00") && !text[11..].starts_with("00:00:00.");
+    let not_null = || doc! { field: { "$ne": Bson::Null } };
+    Some(match (op, midnight) {
+        ("$eq", true) => doc! { field: day },
+        ("$eq", false) => match_nothing(),
+        ("$ne", true) => doc! { "$and": [ { field: { "$ne": day } }, not_null() ] },
+        ("$ne", false) => not_null(),
+        ("$lt", true) => doc! { field: { "$lt": day } },
+        ("$lt" | "$lte", _) => doc! { field: { "$lte": day } },
+        ("$gt", _) | ("$gte", false) => doc! { field: { "$gt": day } },
+        ("$gte", true) => doc! { field: { "$gte": day } },
+        _ => return None,
+    })
+}
+
+/// A timestamp value: a `DateTime`, or one carrying a microsecond remainder.
+fn is_instant(v: &Bson) -> bool {
+    match v {
+        Bson::DateTime(_) => true,
+        Bson::Document(d) => d.contains_key(COMPOSITE_DATE),
+        _ => false,
+    }
+}
+
 fn is_timestamp_field(def: &TableDef, field: &str) -> bool {
     matches!(field_type(def, field), Some("timestamp" | "timestamptz"))
 }
@@ -27590,6 +27707,9 @@ fn coerce_to_column(def: &TableDef, field: &str, value: Bson) -> Result<Bson> {
             ty @ ("int2" | "int4" | "int8" | "numeric" | "float4" | "float8" | "bool" | "timestamp"
             | "timestamptz" | "interval" | "oid"),
         ) => cast_value(value, ty),
+        // A date is stored as its text, but the literal is read AS a date
+        // first: `d < '2020-01-01 10:00'` compares with `2020-01-01`.
+        Some("date") => cast_value(value, "date"),
         // An array column: the literal is that array type, bounds and all --
         // `a = '[0:1]={5,6}'` must compare the lower bound too.
         Some(ty) if ty.ends_with("[]") => cast_value(value, ty),
@@ -27978,6 +28098,16 @@ fn lower_aexpr(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     // `$1` -- the parameterised tests found it, but the literal was wrong too.
     if value == Bson::Null {
         return Ok(match_nothing());
+    }
+    // A `date` column against a timestamp: the date is PROMOTED to midnight.
+    if field_type(def, &field) == Some("date") && is_instant(&value) {
+        let zoned = e
+            .rexpr
+            .as_deref()
+            .is_some_and(|r| static_type(r, &value) == "timestamptz");
+        let mql = op_to_mql(op).ok_or_else(|| Error::Unsupported(format!("operator {op}")))?;
+        return date_instant_filter(&field, mql, &value, zoned)
+            .ok_or_else(|| Error::Unsupported("a date compared with this timestamp".into()));
     }
     // A SCALAR column compared to an ARRAY with no ANY/ALL is an operator
     // PostgreSQL does not have (`text = text[]` is 42883). An array COLUMN
@@ -28376,6 +28506,22 @@ fn lower_between(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document>
     };
     let lo = coerce_to_column(def, &field, const_value(&bounds[0], params)?)?;
     let hi = coerce_to_column(def, &field, const_value(&bounds[1], params)?)?;
+    if field_type(def, &field) == Some("date") && (is_instant(&lo) || is_instant(&hi)) {
+        let bound = |v: &Bson, node: &pg_query::protobuf::Node, op: &str| {
+            if is_instant(v) {
+                date_instant_filter(&field, op, v, static_type(node, v) == "timestamptz")
+                    .ok_or_else(|| Error::Unsupported("a date compared with this timestamp".into()))
+            } else {
+                Ok(doc! { &field: { op: v.clone() } })
+            }
+        };
+        let not = AExprKind::try_from(e.kind) == Ok(AExprKind::AexprNotBetween);
+        return Ok(if not {
+            doc! { "$or": [ bound(&lo, &bounds[0], "$lt")?, bound(&hi, &bounds[1], "$gt")? ] }
+        } else {
+            doc! { "$and": [ bound(&lo, &bounds[0], "$gte")?, bound(&hi, &bounds[1], "$lte")? ] }
+        });
+    }
     if lo == Bson::Null || hi == Bson::Null {
         return Ok(match_nothing());
     }

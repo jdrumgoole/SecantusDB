@@ -27,6 +27,11 @@ pub fn set_user_operators(ops: Vec<UserOperator>) {
     USER_OPERATORS.with(|o| *o.borrow_mut() = ops);
 }
 
+/// Has the user defined an operator of this name?
+pub(crate) fn defines(name: &str) -> bool {
+    USER_OPERATORS.with(|o| o.borrow().iter().any(|u| u.name == name))
+}
+
 /// The operator names PostgreSQL 15 defines in `pg_catalog`.
 const BUILTIN: &[&str] = &[
     "!!", "!~", "!~*", "!~~", "!~~*", "##", "#", "#-", "#>", "#>>", "%", "&&", "&", "&<", "&<|",

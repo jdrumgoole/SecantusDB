@@ -10837,12 +10837,31 @@ impl PgHandler {
     /// relation points at its first mention (`LINE 1: select * from wat`).
     fn err_in(e: &PlanError, sql: &str) -> PgWireError {
         let mut out = Self::err(e);
-        if let (PlanError::UndefinedTable(name), PgWireError::UserError(info)) = (e, &mut out) {
-            if let Some(pos) = secantus_pgplan::identifier_position(sql, name) {
+        if let PgWireError::UserError(info) = &mut out {
+            let pos = match e {
+                PlanError::UndefinedTable(name) => {
+                    let _ = secantus_pgplan::take_error_location();
+                    secantus_pgplan::identifier_position(sql, name)
+                }
+                _ => secantus_pgplan::error_position(sql, e.sqlstate(), &e.to_string()),
+            };
+            if let Some(pos) = pos {
                 info.position = Some(pos.to_string());
             }
         }
         out
+    }
+
+    /// An error raised while RUNNING `sql` (not planning it), given the
+    /// position PostgreSQL would point at when the statement names it.
+    fn positioned(mut e: PgWireError, sql: &str) -> PgWireError {
+        if let PgWireError::UserError(info) = &mut e {
+            if info.position.is_none() && info.severity == "ERROR" {
+                info.position = secantus_pgplan::error_position(sql, &info.code, &info.message)
+                    .map(|p| p.to_string());
+            }
+        }
+        e
     }
 
     /// Write `rows` honouring an `ON CONFLICT` clause; returns
@@ -12324,7 +12343,7 @@ impl SimpleQueryHandler for PgHandler {
             Err(e) => {
                 self.note_failure();
                 self.flush_notices(_c).await?;
-                return Err(Self::err(&e));
+                return Err(Self::err_in(&e, query));
             }
         };
         let out = if stmts.len() <= 1 && !self.runs_user_code(query) {
@@ -12333,9 +12352,9 @@ impl SimpleQueryHandler for PgHandler {
             // A statement that can run user code is ONE transaction, as every
             // statement is in PostgreSQL: a trigger or a DO block that raises
             // after writing must take those writes with it.
-            self.run_batch(&[query.to_string()]).await
+            self.run_batch(&[query.to_string()], query).await
         } else {
-            self.run_batch(&stmts).await
+            self.run_batch(&stmts, query).await
         };
         // A simple query inside an extended-protocol statement group runs in
         // the group's transaction and ends it, as PostgreSQL's does
@@ -12389,14 +12408,24 @@ impl PgHandler {
     /// no-op here (as it is a warning in PostgreSQL), and `COMMIT` already
     /// takes the handle. After a mid-batch COMMIT a fresh implicit transaction
     /// is opened for the commands that follow, which is what PostgreSQL does.
-    async fn run_batch(&self, stmts: &[String]) -> PgWireResult<Vec<Response>> {
+    async fn run_batch(&self, stmts: &[String], whole: &str) -> PgWireResult<Vec<Response>> {
         let mut implicit = self.txn.lock().unwrap_or_else(|e| e.into_inner()).is_none();
         if implicit {
             self.begin_implicit()?;
         }
 
         let mut out = Vec::with_capacity(stmts.len());
+        // Where each statement starts in the string the client sent: an
+        // error's position counts from there, as PostgreSQL counts it.
+        let mut cursor = 0usize;
         for (i, sql) in stmts.iter().enumerate() {
+            let offset = whole
+                .get(cursor..)
+                .and_then(|rest| rest.find(sql.as_str()))
+                .map(|at| {
+                    cursor += at + sql.len();
+                    whole[..cursor - sql.len()].chars().count()
+                });
             match self.run(sql, &[], 0).await {
                 Ok(responses) => {
                     // A BEGIN inside the batch makes the implicit transaction
@@ -12414,11 +12443,19 @@ impl PgHandler {
                     }
                     out.extend(responses);
                 }
-                Err(e) => {
+                Err(mut e) => {
                     if implicit {
                         // Roll back whatever this batch opened. A failure to
                         // roll back must not mask the error that caused it.
                         let _ = self.rollback_implicit();
+                    }
+                    if let PgWireError::UserError(info) = &mut e {
+                        info.position = match (info.position.as_deref(), offset) {
+                            (Some(p), Some(off)) => {
+                                p.parse::<usize>().ok().map(|p| (p + off).to_string())
+                            }
+                            _ => None,
+                        };
                     }
                     return Err(e);
                 }
@@ -14619,7 +14656,7 @@ impl PgHandler {
             },
             None,
         );
-        result
+        result.map_err(|e| Self::positioned(e, query))
     }
 
     /// Record what `pg_stat_activity` shows for this backend: the state, and
@@ -14764,6 +14801,7 @@ impl PgHandler {
         // The plan that EXECUTES, with the executor's hooks: `values
         // (nextval('s'))` is folded while planning, so the sequence moves
         // here -- once -- and never in a Describe's plan.
+        let _ = secantus_pgplan::take_error_location();
         let planned = self.with_executor_hooks(|| {
             secantus_pgplan::planning_to_execute(|| {
                 secantus_pgplan::plan_with_session_types_and_subqueries(
