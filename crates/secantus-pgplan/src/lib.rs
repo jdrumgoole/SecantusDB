@@ -26,11 +26,14 @@ pub mod dtparse;
 mod enum_order;
 mod errpos;
 pub mod escape_strings;
+pub mod event_triggers;
+pub mod fdw;
 pub mod formatting;
 pub mod fts;
 mod func_cast;
 mod optype;
 pub use errpos::error_position;
+pub mod collation;
 pub mod geo;
 pub mod geom;
 pub mod geometry;
@@ -42,11 +45,16 @@ pub mod joins;
 pub mod merge;
 pub mod partitions;
 pub mod pgcrypto;
+pub mod pgcrypto_raw;
+pub mod pgp;
+pub mod pgp_pub;
 pub mod privileges;
 pub mod regobj;
 pub mod rls;
 mod rowsfrom;
+pub mod ruleutils;
 pub mod trgm;
+pub mod user_casts;
 pub use correlated::set_user_functions;
 pub use correlated::{
     with_correlated_runner, with_function_hook, with_sequence_hook, FnResult, UserFn,
@@ -501,6 +509,63 @@ pub enum Statement {
     Sequence(&'static str, Vec<Statement>),
     /// `CREATE OPERATOR` (see `user_ops`).
     CreateOperator(user_ops::UserOperator),
+    /// `CREATE CAST` (see `user_casts`).
+    CreateCast(user_casts::UserCast),
+    /// `CREATE COLLATION` (see `collation`).
+    CreateCollation {
+        collation: collation::UserCollation,
+        if_not_exists: bool,
+    },
+    /// `DROP COLLATION [IF EXISTS] names [CASCADE]`.
+    DropCollation {
+        names: Vec<String>,
+        if_exists: bool,
+        cascade: bool,
+    },
+    /// `CREATE [OR REPLACE] RULE` on INSERT / UPDATE / DELETE.
+    CreateRule {
+        table: String,
+        name: String,
+        /// `INSERT` / `UPDATE` / `DELETE`.
+        event: String,
+        instead: bool,
+        condition: Option<String>,
+        actions: Vec<String>,
+        replace: bool,
+    },
+    /// Foreign data wrappers, servers, user mappings and foreign tables.
+    Fdw(fdw::FdwOp),
+    /// `CREATE EVENT TRIGGER name ON event [WHEN TAG IN (...)] EXECUTE
+    /// FUNCTION f()`: `tags` upper-cased, `None` for every tag.
+    CreateEventTrigger {
+        name: String,
+        event: String,
+        tags: Option<Vec<String>>,
+        function: String,
+    },
+    /// `ALTER EVENT TRIGGER name ENABLE [REPLICA | ALWAYS] | DISABLE`:
+    /// `enabled` is `pg_event_trigger.evtenabled` (`O` / `R` / `A` / `D`).
+    AlterEventTrigger {
+        name: String,
+        enabled: String,
+    },
+    /// `DROP EVENT TRIGGER [IF EXISTS] name`.
+    DropEventTrigger {
+        names: Vec<String>,
+        if_exists: bool,
+    },
+    /// `DROP RULE [IF EXISTS] name ON table`.
+    DropRule {
+        table: String,
+        name: String,
+        if_exists: bool,
+    },
+    /// `DROP CAST [IF EXISTS] (source AS target)`.
+    DropCast {
+        source: String,
+        target: String,
+        if_exists: bool,
+    },
     /// `DROP OPERATOR [IF EXISTS] name (left, right)`.
     DropOperator {
         name: String,
@@ -1101,6 +1166,19 @@ pub enum AlterTableAction {
     RowSecurity {
         enable: Option<bool>,
         force: Option<bool>,
+    },
+    /// `ENABLE` / `DISABLE TRIGGER name | ALL | USER`: `name` is `None` for
+    /// every trigger on the table.
+    TriggerEnabled {
+        name: Option<String>,
+        enabled: bool,
+    },
+    /// A foreign table's `OPTIONS (...)`, as they stand after the edit.
+    ForeignOptions(Vec<String>),
+    /// `ENABLE` / `DISABLE RULE name`.
+    RuleEnabled {
+        name: String,
+        enabled: bool,
     },
     /// `OWNER TO role`: checked (the role must exist) and otherwise a no-op,
     /// since every relation here is the session's.
@@ -2074,6 +2152,10 @@ pub struct SelectConstant {
     /// still waits), a set-returning one yields one row per result, and
     /// every `ConstCol::FromColumn` in `columns` reads that row's value.
     pub source: Option<Box<ConstCol>>,
+    /// Per column: a bare `NULL`, whose type is `unknown` -- a set
+    /// operation gives it the other side's type, where `NULL::text` is text.
+    /// Empty when not recorded.
+    pub untyped: Vec<bool>,
 }
 
 /// The three wire formats a COPY can use. They are not interchangeable: text
@@ -2692,13 +2774,126 @@ fn parse_tree(sql: &str) -> Result<std::sync::Arc<pg_query::protobuf::ParseResul
         return Ok(Arc::clone(tree));
     }
     func_cast::check_numeric_junk(sql)?;
-    let tree = Arc::new(pg_query::parse(sql).map_err(parse_error)?.protobuf);
+    let tree = Arc::new(parse_guarded(sql)?.protobuf);
+    check_depth(&tree)?;
     let mut guard = memo.lock().unwrap_or_else(|e| e.into_inner());
     if guard.len() >= MAX_ENTRIES {
         guard.clear();
     }
     guard.insert(sql.to_string(), Arc::clone(&tree));
     Ok(tree)
+}
+
+/// The deepest expression nesting the planner will walk. Planning recurses
+/// once per level, so past some depth the thread's stack runs out -- which
+/// aborts the whole server, not the statement. PostgreSQL's own
+/// `max_stack_depth` refuses at a similar point (a 1,000-term `||` chain
+/// runs, a 5,000-term one is 54001), so this is its error, raised before
+/// any recursion starts. The worker stack (`WORKER_STACK_BYTES` in the
+/// server) holds this depth in a debug build with room to spare.
+pub const MAX_EXPR_DEPTH: i32 = 2500;
+
+/// An upper bound on how deeply `sql`'s expressions can nest, from its
+/// tokens. A run of operators with nothing between them but operands builds
+/// a chain one level per operator (`a || b || c`); a `,`, `AND` or `OR`
+/// ends the run, because a list and a boolean chain are flat. Each open
+/// bracket adds a level on top of its enclosing run. Scanning is iterative,
+/// so this is safe on any input.
+fn nesting_bound(sql: &str) -> usize {
+    use pg_query::protobuf::Token as T;
+    let Ok(scan) = pg_query::scan(sql) else {
+        return 0;
+    };
+    // One operator-run counter per open bracket; `base` is the depth the
+    // enclosing levels have already reached.
+    let mut stack: Vec<(usize, usize)> = vec![(0, 0)];
+    let mut deepest = 0usize;
+    for t in &scan.tokens {
+        let (base, run) = stack.last_mut().expect("never empty");
+        match T::try_from(t.token) {
+            Ok(T::Ascii40 | T::Ascii91) => {
+                let level = *base + *run + 1;
+                stack.push((level, 0));
+                deepest = deepest.max(level);
+            }
+            Ok(T::Ascii41 | T::Ascii93) => {
+                if stack.len() > 1 {
+                    stack.pop();
+                }
+            }
+            Ok(T::Ascii44 | T::And | T::Or) => *run = 0,
+            Ok(
+                T::Ascii37
+                | T::Ascii42
+                | T::Ascii43
+                | T::Ascii45
+                | T::Ascii47
+                | T::Ascii60
+                | T::Ascii61
+                | T::Ascii62
+                | T::Ascii94
+                | T::Op
+                | T::Typecast
+                | T::LessEquals
+                | T::GreaterEquals
+                | T::NotEquals,
+            ) => {
+                *run += 1;
+                deepest = deepest.max(*base + *run);
+            }
+            _ => {}
+        }
+    }
+    deepest
+}
+
+/// `pg_query::parse`, safe against a statement nested deep enough to
+/// overflow the stack WHILE PARSING -- libpg_query's protobuf writer and the
+/// decoder both recurse once per level, before `check_depth` can look. A
+/// statement short enough cannot nest far; a longer one is bounded by its
+/// tokens, parsed on a thread with a stack sized for the bound, and refused
+/// outright past what that thread holds.
+fn parse_guarded(sql: &str) -> Result<pg_query::ParseResult> {
+    const DIRECT_CHARS: usize = 4000;
+    const BIG_STACK_BYTES: usize = 1 << 30;
+    // A debug build spends ~20 KiB of stack per level here; PostgreSQL
+    // itself refuses a 5,000-term chain.
+    const MAX_BOUND: usize = 20_000;
+    if sql.len() <= DIRECT_CHARS {
+        return pg_query::parse(sql).map_err(parse_error);
+    }
+    let bound = nesting_bound(sql);
+    if bound <= MAX_EXPR_DEPTH as usize {
+        return pg_query::parse(sql).map_err(parse_error);
+    }
+    if bound > MAX_BOUND {
+        return Err(Error::Sqlstate(
+            "54001",
+            "stack depth limit exceeded".into(),
+        ));
+    }
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(BIG_STACK_BYTES)
+            .spawn_scoped(scope, || pg_query::parse(sql).map_err(parse_error))
+            .map_err(|e| Error::Sqlstate("54001", format!("stack depth limit exceeded: {e}")))?
+            .join()
+            .map_err(|_| Error::Sqlstate("XX000", "the parser thread panicked".into()))?
+    })
+}
+
+fn check_depth(tree: &pg_query::protobuf::ParseResult) -> Result<()> {
+    if tree
+        .nodes()
+        .iter()
+        .any(|(_, depth, _, _)| *depth > MAX_EXPR_DEPTH)
+    {
+        return Err(Error::Sqlstate(
+            "54001",
+            "stack depth limit exceeded".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_one(sql: &str) -> Result<N> {
@@ -2740,6 +2935,10 @@ pub fn plan_with_params(
     let mut node = pg_query::protobuf::Node {
         node: Some(parse_one(sql)?),
     };
+    event_triggers::rewrite_sources(sql, &mut node);
+    if let Some(inner) = node.node.as_ref() {
+        fdw::refuse_foreign_access(inner, lookup)?;
+    }
     if let Some(st) = instead_of::plan(&node)? {
         return Ok(st);
     }
@@ -2776,6 +2975,10 @@ pub fn plan_with_subqueries(
     // The resolved values are appended to the bound parameters as `$N`, so
     // the list the statement is finally planned with is longer than the one
     // the client bound.
+    event_triggers::rewrite_sources(sql, &mut node);
+    if let Some(inner) = node.node.as_ref() {
+        fdw::refuse_foreign_access(inner, lookup)?;
+    }
     if let Some(st) = instead_of::plan(&node)? {
         return Ok(st);
     }
@@ -2806,11 +3009,23 @@ pub fn plan_with_subqueries(
     )
 }
 
+pub(crate) fn plan_node_public(
+    node: N,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Result<Statement> {
+    plan_node(node, lookup, params)
+}
+
 fn plan_node(
     node: N,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &[Bson],
 ) -> Result<Statement> {
+    if let Some(st) = fdw::plan(&node, lookup, params)? {
+        return Ok(st);
+    }
+    fdw::refuse_foreign_access(&node, lookup)?;
     // A write or ALTER over an inheritance parent reaches every descendant.
     if let Some((tag, nodes)) = inherit::per_table(&node)? {
         let statements = nodes
@@ -3054,7 +3269,14 @@ fn plan_node(
         N::DefineStmt(d) if ObjectType::try_from(d.kind) == Ok(ObjectType::ObjectOperator) => {
             plan_create_operator(&d)
         }
+        N::DefineStmt(d) if ObjectType::try_from(d.kind) == Ok(ObjectType::ObjectCollation) => {
+            collation::plan_create(&d)
+        }
         N::CreateFunctionStmt(f) => plan_create_function(&f),
+        N::CreateCastStmt(c) => user_casts::plan_create(&c),
+        N::RuleStmt(r) => plan_create_rule(&r),
+        N::CreateEventTrigStmt(c) => event_triggers::plan_create(&c),
+        N::AlterEventTrigStmt(a) => event_triggers::plan_alter(&a),
         N::CreateTrigStmt(t) => plan_create_trigger(&t),
         N::CopyStmt(c) => plan_copy(&c, lookup, params),
         N::VariableShowStmt(v) => Ok(Statement::Show(v.name.clone())),
@@ -3974,6 +4196,10 @@ fn cast_typmod(node: &pg_query::protobuf::Node) -> i32 {
 }
 
 /// The `atttypmod` a declared type carries, or -1 for an unmodified type.
+pub(crate) fn declared_typmod_public(tn: &pg_query::protobuf::TypeName) -> i32 {
+    declared_typmod(tn)
+}
+
 fn declared_typmod(tn: &pg_query::protobuf::TypeName) -> i32 {
     let mods: Vec<i32> = tn.typmods.iter().filter_map(typmod_ival).collect();
     // A modifier we could not read as an integer means no faithful typmod.
@@ -4338,6 +4564,60 @@ fn plan_alter_action(
             column: cmd.name.clone(),
             not_null: true,
         }),
+        // `ENABLE ALWAYS` / `REPLICA` fire in this server's only replication
+        // role (origin) just as a plain ENABLE does.
+        Ok(AT::AtEnableTrig | AT::AtEnableAlwaysTrig | AT::AtEnableReplicaTrig) => {
+            Ok(AlterTableAction::TriggerEnabled {
+                name: Some(cmd.name.clone()),
+                enabled: true,
+            })
+        }
+        Ok(AT::AtDisableTrig) => Ok(AlterTableAction::TriggerEnabled {
+            name: Some(cmd.name.clone()),
+            enabled: false,
+        }),
+        Ok(AT::AtEnableTrigAll | AT::AtEnableTrigUser) => Ok(AlterTableAction::TriggerEnabled {
+            name: None,
+            enabled: true,
+        }),
+        Ok(AT::AtDisableTrigAll | AT::AtDisableTrigUser) => Ok(AlterTableAction::TriggerEnabled {
+            name: None,
+            enabled: false,
+        }),
+        Ok(AT::AtEnableRule | AT::AtEnableAlwaysRule | AT::AtEnableReplicaRule) => {
+            Ok(AlterTableAction::RuleEnabled {
+                name: cmd.name.clone(),
+                enabled: true,
+            })
+        }
+        Ok(AT::AtDisableRule) => Ok(AlterTableAction::RuleEnabled {
+            name: cmd.name.clone(),
+            enabled: false,
+        }),
+        Ok(AT::AtGenericOptions) => {
+            let Some(N::List(l)) = cmd.def.as_deref().and_then(|d| d.node.as_ref()) else {
+                return Err(Error::Parse("OPTIONS without a list".into()));
+            };
+            if !fdw::is_foreign(def) {
+                return Err(Error::Sqlstate(
+                    "42809",
+                    format!("\"{}\" is not a foreign table", def.name),
+                ));
+            }
+            let stored: Vec<String> = def
+                .extra
+                .get_array("foreign_options")
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let edits = fdw::option_edits_public(&l.items);
+            Ok(AlterTableAction::ForeignOptions(fdw::apply_option_edits(
+                &stored, &edits,
+            )?))
+        }
         Ok(AT::AtEnableRowSecurity) => Ok(AlterTableAction::RowSecurity {
             enable: Some(true),
             force: None,
@@ -4828,7 +5108,19 @@ pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
                 def.extra.remove("clustered_index");
             }
         },
+        AlterTableAction::ForeignOptions(options) => {
+            def.extra.insert(
+                "foreign_options",
+                options
+                    .iter()
+                    .cloned()
+                    .map(Bson::String)
+                    .collect::<Vec<_>>(),
+            );
+        }
         AlterTableAction::RowSecurity { .. }
+        | AlterTableAction::TriggerEnabled { .. }
+        | AlterTableAction::RuleEnabled { .. }
         | AlterTableAction::AttachPartition { .. }
         | AlterTableAction::DetachPartition(_) => {}
         AlterTableAction::ValidateConstraint(name) => {
@@ -5433,12 +5725,29 @@ fn plan_create_index(
         if e.name.is_empty() {
             return Err(Error::Unsupported("this index key".into()));
         }
-        if !e.collation.is_empty() {
-            return Err(Error::Unsupported("an index key COLLATE".into()));
-        }
+        let key_collation = e
+            .collation
+            .iter()
+            .rev()
+            .find_map(|n| match n.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            });
         let Some(column) = def.column(&e.name) else {
             return Err(Error::UndefinedColumn(e.name.clone()));
         };
+        // A key's COLLATE: it must exist and the column must take one. It
+        // changes only which comparisons the index could serve, and a
+        // collated comparison reads a sort key rather than any index.
+        if let Some(name) = &key_collation {
+            if !collation::collatable(&column.pg_type) {
+                return Err(Error::DatatypeMismatch(format!(
+                    "collations are not supported by type {}",
+                    display_type(&column.pg_type)
+                )));
+            }
+            collation::resolve(name)?;
+        }
         let opclass = e
             .opclass
             .iter()
@@ -5452,7 +5761,24 @@ fn plan_create_index(
         // an access path here, and a query's ORDER BY places its NULLs by
         // its own clause whatever the index says.
         key_sql.push(format!("{}{opclass_sql}{suffix}", e.name));
-        expressions.push(e.name.clone());
+        // A key under a NONDETERMINISTIC collation is kept by its sort key,
+        // so a UNIQUE index refuses what the collation calls equal
+        // (`Apple` / `apple` under a case-insensitive one).
+        let key_nondeterministic = key_collation
+            .clone()
+            .or_else(|| column.extra.get_str("collation").ok().map(str::to_string))
+            .filter(|c| collation::resolve(c).is_ok_and(|r| !r.deterministic()));
+        match key_nondeterministic {
+            Some(c) => {
+                expressions.push(format!(
+                    "__coll_key('{}', {})",
+                    c.replace('\'', "''"),
+                    scalar::quote_identifier(&e.name)
+                ));
+                any_expression = true;
+            }
+            None => expressions.push(e.name.clone()),
+        }
         columns.push((e.name.clone(), desc));
     }
     if !any_expression {
@@ -5534,6 +5860,9 @@ thread_local! {
     /// materialized view, published with the rest of the catalog.
     static VIEW_DEFS: std::cell::RefCell<Vec<(i64, String, String)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// The same, as `pg_get_viewdef(view, true)` prints them.
+    static VIEW_DEFS_PRETTY: std::cell::RefCell<Vec<(i64, String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 thread_local! {
@@ -5607,6 +5936,11 @@ pub fn set_view_defs(defs: Vec<(i64, String, String)>) {
     VIEW_DEFS.with(|d| *d.borrow_mut() = defs);
 }
 
+/// Install the pretty (`pg_get_viewdef(view, true)`) view definitions.
+pub fn set_view_defs_pretty(defs: Vec<(i64, String, String)>) {
+    VIEW_DEFS_PRETTY.with(|d| *d.borrow_mut() = defs);
+}
+
 /// Pretty ruleutils prints a cast's simple operand bare: `(0)::numeric` is
 /// `0::numeric`, `('-1'::integer)::numeric` is `'-1'::integer::numeric`.
 fn unparen_cast_operands(text: &str) -> String {
@@ -5641,6 +5975,9 @@ pub fn set_constraint_defs(defs: Vec<(i64, String)>) {
 /// A CHECK constraint's expression as `pg_get_constraintdef` prints it:
 /// `CHECK ((n > 0))`.
 pub fn check_constraint_text(expression: &str, def: &TableDef) -> String {
+    if let Some(inner) = ruleutils::expr_def(expression, def) {
+        return format!("CHECK ({inner})");
+    }
     let inner = pg_query::parse(&format!("SELECT {expression}"))
         .ok()
         .and_then(|p| {
@@ -6253,6 +6590,20 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                 // 4 rather than as an unsized `text` -- and so the Python
                 // server, which shares this catalog, reads the same type.
                 column.typmod = cd.type_name.as_ref().map(declared_typmod).unwrap_or(-1);
+                // `s text COLLATE x`: recorded, and honoured wherever the
+                // column is ordered or compared (`enum_order`). It used to be
+                // dropped, so the column compared by bytes whatever it said.
+                if let Some(cc) = cd.coll_clause.as_deref() {
+                    let name = collation::clause_name(cc);
+                    if !collation::collatable(&underlying) {
+                        return Err(Error::DatatypeMismatch(format!(
+                            "collations are not supported by type {}",
+                            display_type(&underlying)
+                        )));
+                    }
+                    collation::resolve(&name)?;
+                    column.extra.insert("collation", name);
+                }
                 if let Some(d) = &domain {
                     column.typmod = d.typmod;
                     column.extra.insert("domain_type", d.name.clone());
@@ -7295,6 +7646,35 @@ fn is_boolean_type(t: &str) -> bool {
 /// Before this the server coerced the text through the column's parser, so
 /// the psycopg binary-format string that PostgreSQL rejects was stored.
 fn check_assignment_type(column: &Column, node: &pg_query::protobuf::Node) -> Result<()> {
+    check_assignment_type_at(column, node).inspect_err(|e| {
+        // PostgreSQL's cursor is at the expression (`exprLocation`): a
+        // cast's `::`, a call's name.
+        if matches!(e, Error::DatatypeMismatch(_)) {
+            if let Some(loc) = expr_location(node) {
+                set_error_location(loc);
+            }
+        }
+    })
+}
+
+/// Where an expression starts, as PostgreSQL's `exprLocation` reports it.
+fn expr_location(node: &pg_query::protobuf::Node) -> Option<i32> {
+    let loc = match node.node.as_ref()? {
+        N::TypeCast(t) => t.location,
+        N::FuncCall(f) => f.location,
+        N::AExpr(e) => e.location,
+        N::AConst(c) => c.location,
+        N::ColumnRef(c) => c.location,
+        N::ParamRef(p) => p.location,
+        N::RowExpr(r) => r.location,
+        N::AArrayExpr(a) => a.location,
+        N::SqlvalueFunction(f) => f.location,
+        _ => return None,
+    };
+    (loc >= 0).then_some(loc)
+}
+
+fn check_assignment_type_at(column: &Column, node: &pg_query::protobuf::Node) -> Result<()> {
     let from = match declared_expression_type(node) {
         Some(t) => t,
         // A function call or SQL value function has a known result type
@@ -7356,13 +7736,24 @@ fn assignable(column: &Column, from: &str, what: &str) -> Result<()> {
         })
     };
     let cross_family = matches!((family(&from), family(to)), (Some(a), Some(b)) if a != b);
-    let allowed = from_s == to_s
-        || from == "unknown"
-        || is_string_type(to)
-        || !(is_string_type(&from)
-            || cross_family
-            || (is_boolean_type(&from) && is_integer_type(to))
-            || (is_integer_type(&from) && is_boolean_type(to)));
+    // A user cast AS ASSIGNMENT / AS IMPLICIT makes the pair assignable; with
+    // none, a composite and anything but itself (or a string type) are not.
+    if user_casts::find_assignment(&from, to).is_some() {
+        return Ok(());
+    }
+    let composite_mismatch = (user_composite(&from).is_some() || user_composite(to).is_some())
+        && user_casts::type_oid(&from) != user_casts::type_oid(to)
+        && !matches!(from.as_str(), "unknown" | "record")
+        && !is_string_type(to)
+        && !is_string_type(&from);
+    let allowed = !composite_mismatch
+        && (from_s == to_s
+            || from == "unknown"
+            || is_string_type(to)
+            || !(is_string_type(&from)
+                || cross_family
+                || (is_boolean_type(&from) && is_integer_type(to))
+                || (is_integer_type(&from) && is_boolean_type(to))));
     if allowed {
         return Ok(());
     }
@@ -7425,6 +7816,12 @@ pub fn insert_row_typed(
         // the column back could not parse it as a date.
         let value = if already_stored {
             value
+        } else if let Some(cast) = types
+            .get(i)
+            .and_then(|t| user_casts::find_assignment(t, &column.pg_type))
+        {
+            // An assignment through a user cast (`AS ASSIGNMENT`).
+            fit_to_column(user_casts::apply(&cast, value)?, column)?
         } else {
             fit_to_column(cast_value(value, &column.pg_type)?, column)?
         };
@@ -8402,7 +8799,7 @@ fn srf_from_clause(from: &pg_query::protobuf::Node, params: &[Bson]) -> Result<O
             let n = func_name(c).unwrap_or_default();
             let Some((cn, ct, rows)) = (match json_record_rows(&n, c, &[], params)? {
                 Some(r) => Some(r),
-                None => match srf_rows(&n, c, params)? {
+                None => match srf_rows(&n, c, params, true)? {
                     Some(r) => Some(r),
                     None => integer_series_rows(&n, c, params)?,
                 },
@@ -8444,7 +8841,7 @@ fn srf_from_clause(from: &pg_query::protobuf::Node, params: &[Bson]) -> Result<O
         let record_rows = json_record_rows(&name, &call, &rf.coldeflist, params)?;
         let Some(out) = (match record_rows {
             Some(r) => Some(r),
-            None => srf_rows(&name, &call, params)?,
+            None => srf_rows(&name, &call, params, true)?,
         }) else {
             return Ok(None);
         };
@@ -8688,10 +9085,13 @@ type SrfRows = (Vec<String>, Vec<String>, Vec<Vec<Bson>>);
 
 /// The rows a set-returning function produces. `None` means this is not one of
 /// the set-returning functions this server materialises.
+/// `expand`: a FROM item, where a function returning a composite yields the
+/// type's fields as columns; in a select list it is one composite column.
 fn srf_rows(
     name: &str,
     call: &pg_query::protobuf::FuncCall,
     params: &[Bson],
+    expand: bool,
 ) -> Result<Option<SrfRows>> {
     let one = |v: Vec<Bson>, ty: &str| {
         (
@@ -8746,13 +9146,30 @@ fn srf_rows(
         return Ok(Some(one(chain, "regclass")));
     }
     // A user-defined set-returning function: the executor runs it.
-    if let Some(u) = correlated::user_function_for(name, &call.args).filter(|u| u.returns_set) {
+    // A user function in FROM: a set-returning one yields its rows, and one
+    // returning a COMPOSITE yields that type's fields as columns -- one row
+    // for a plain function (`select * from f()` over `returns point_t`),
+    // one per result for SETOF.
+    let composite = |u: &correlated::UserFn| {
+        (expand && u.columns.is_empty())
+            .then(|| user_composite(&u.return_type).map(|(_, fields)| fields))
+            .flatten()
+    };
+    if let Some(u) = correlated::user_function_for(name, &call.args)
+        .filter(|u| u.returns_set || composite(u).is_some())
+    {
         let a: Vec<Bson> = call
             .args
             .iter()
             .map(|x| const_value(x, params))
             .collect::<Result<_>>()?;
-        let (names, types) = if u.columns.is_empty() {
+        let fields = composite(&u);
+        let (names, types) = if let Some(fields) = &fields {
+            (
+                fields.iter().map(|(n, _)| n.clone()).collect(),
+                fields.iter().map(|(_, t)| t.clone()).collect(),
+            )
+        } else if u.columns.is_empty() {
             (vec![name.to_string()], vec![u.return_type.clone()])
         } else {
             (
@@ -8760,10 +9177,21 @@ fn srf_rows(
                 u.columns.iter().map(|(_, t)| t.clone()).collect(),
             )
         };
-        let rows = match correlated::call_user_function(&u, &a)? {
+        let mut rows = match correlated::call_user_function(&u, &a)? {
             correlated::FnResult::Rows(_, _, rows) => rows,
             correlated::FnResult::Value(v) => vec![vec![v]],
         };
+        if let Some(fields) = &fields {
+            // Each result is one composite value: its fields are the row.
+            for row in &mut rows {
+                if let [single] = row.as_slice() {
+                    *row = match single {
+                        Bson::Null => vec![Bson::Null; fields.len()],
+                        v => record_fields(v).cloned().unwrap_or_else(|| vec![v.clone()]),
+                    };
+                }
+            }
+        }
         return Ok(Some((names, types, rows)));
     }
     // `string_to_table(text, delimiter [, null_string])`: string_to_array's
@@ -10236,8 +10664,12 @@ fn plan_table_targets(
             // takes the general path too, which rounds and truncates to it.
             Some(N::TypeCast(tc))
                 if !cast_chain_has_typmod(tc)
-                    && cast_chain_over_column(tc).is_ok_and(|(col, _)| {
+                    && cast_chain_over_column(tc).is_ok_and(|(col, chain)| {
                         def.column(&col).is_none_or(|c| c.pg_type != "bpchar")
+                            && !user_casts::in_chain(
+                                def.column(&col).map(|c| c.pg_type.as_str()),
+                                &chain,
+                            )
                     }) =>
             {
                 let (col_name, chain) = cast_chain_over_column(tc)?;
@@ -10978,6 +11410,15 @@ fn plan_aggregate_item(
             item.source_type.as_deref().unwrap_or("unknown")
         )));
     }
+    // There is no `min` / `max` over boolean in PostgreSQL (`bool_and` /
+    // `bool_or` are the boolean aggregates): a missing function, 42883.
+    if matches!(item.func, AggFunc::Min | AggFunc::Max)
+        && matches!(item.source_type.as_deref(), Some("bool" | "boolean"))
+    {
+        return Err(Error::UndefinedFunction(format!(
+            "function {name}(boolean) does not exist"
+        )));
+    }
     Ok(item)
 }
 
@@ -11384,6 +11825,309 @@ fn plan_aggregate_order(
         });
     }
     Ok(keys)
+}
+
+/// `SELECT DISTINCT ON (k) ... GROUP BY ...` (or over aggregates): the
+/// grouping runs in a FROM subquery and DISTINCT ON / ORDER BY / LIMIT over
+/// its output -- which is what they apply to in PostgreSQL, since they run
+/// after grouping. Each key and sort item must name an output column (by
+/// position, by name, or as the same expression); otherwise `None`, and the
+/// shape stays refused.
+fn distinct_on_over_groups(
+    s: &pg_query::protobuf::SelectStmt,
+) -> Option<pg_query::protobuf::SelectStmt> {
+    if s.distinct_clause.is_empty() || s.distinct_clause[0].node.is_none() {
+        return None;
+    }
+    if s.group_clause.is_empty() && !has_aggregate(s) {
+        return None;
+    }
+    let targets: Vec<&pg_query::protobuf::ResTarget> = s
+        .target_list
+        .iter()
+        .map(|t| match t.node.as_ref() {
+            Some(N::ResTarget(rt)) => Some(&**rt),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    let output_name = |rt: &pg_query::protobuf::ResTarget| -> String {
+        if !rt.name.is_empty() {
+            return rt.name.clone();
+        }
+        match rt.val.as_deref().and_then(|v| v.node.as_ref()) {
+            Some(N::ColumnRef(c)) => column_ref_name(c).unwrap_or_else(|| "?column?".into()),
+            Some(N::FuncCall(f)) => func_name(f).unwrap_or_else(|| "?column?".into()),
+            Some(N::TypeCast(tc)) => cast_chain_over_column(tc)
+                .map(|(c, _)| c)
+                .unwrap_or_else(|_| "?column?".into()),
+            _ => "?column?".into(),
+        }
+    };
+    let names: Vec<String> = targets.iter().map(|rt| output_name(rt)).collect();
+    let inner_name = |i: usize| format!("__d{i}");
+    let col = |name: String| pg_query::protobuf::Node {
+        node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+            fields: vec![pg_query::protobuf::Node {
+                node: Some(N::String(pg_query::protobuf::String { sval: name })),
+            }],
+            location: -1,
+        })),
+    };
+    // A key or sort expression as the inner column it reads.
+    let map = |n: &pg_query::protobuf::Node| -> Option<pg_query::protobuf::Node> {
+        if let Some(N::AConst(c)) = n.node.as_ref() {
+            if let Some(pg_query::protobuf::a_const::Val::Ival(i)) = c.val.as_ref() {
+                let k = usize::try_from(i.ival).ok()?.checked_sub(1)?;
+                return (k < targets.len()).then(|| col(inner_name(k)));
+            }
+        }
+        if let Some(i) = targets
+            .iter()
+            .position(|rt| rt.val.as_deref().is_some_and(|v| same_expression(v, n)))
+        {
+            return Some(col(inner_name(i)));
+        }
+        if let Some(N::ColumnRef(c)) = n.node.as_ref() {
+            if c.fields.len() == 1 {
+                let name = column_ref_name(c)?;
+                let i = names.iter().position(|x| *x == name)?;
+                return Some(col(inner_name(i)));
+            }
+        }
+        None
+    };
+    let keys: Vec<pg_query::protobuf::Node> =
+        s.distinct_clause.iter().map(map).collect::<Option<_>>()?;
+    let mut sorts = Vec::with_capacity(s.sort_clause.len());
+    for item in &s.sort_clause {
+        let Some(N::SortBy(sb)) = item.node.as_ref() else {
+            return None;
+        };
+        let mut sb = (**sb).clone();
+        sb.node = Some(Box::new(map(sb.node.as_deref()?)?));
+        sorts.push(pg_query::protobuf::Node {
+            node: Some(N::SortBy(Box::new(sb))),
+        });
+    }
+    let mut inner = s.clone();
+    inner.distinct_clause = Vec::new();
+    inner.sort_clause = Vec::new();
+    inner.limit_count = None;
+    inner.limit_offset = None;
+    inner.target_list = targets
+        .iter()
+        .enumerate()
+        .map(|(i, rt)| {
+            let mut rt = (*rt).clone();
+            rt.name = inner_name(i);
+            pg_query::protobuf::Node {
+                node: Some(N::ResTarget(Box::new(rt))),
+            }
+        })
+        .collect();
+    let outer_targets = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| pg_query::protobuf::Node {
+            node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+                name: name.clone(),
+                val: Some(Box::new(col(inner_name(i)))),
+                location: -1,
+                ..Default::default()
+            }))),
+        })
+        .collect();
+    Some(pg_query::protobuf::SelectStmt {
+        distinct_clause: keys,
+        target_list: outer_targets,
+        from_clause: vec![pg_query::protobuf::Node {
+            node: Some(N::RangeSubselect(Box::new(
+                pg_query::protobuf::RangeSubselect {
+                    lateral: false,
+                    subquery: Some(Box::new(pg_query::protobuf::Node {
+                        node: Some(N::SelectStmt(Box::new(inner))),
+                    })),
+                    alias: Some(pg_query::protobuf::Alias {
+                        aliasname: "__don".into(),
+                        colnames: Vec::new(),
+                    }),
+                },
+            ))),
+        }],
+        sort_clause: sorts,
+        limit_count: s.limit_count.clone(),
+        limit_offset: s.limit_offset.clone(),
+        limit_option: s.limit_option,
+        op: pg_query::protobuf::SetOperation::SetopNone as i32,
+        ..Default::default()
+    })
+}
+
+/// `SELECT DISTINCT ON (<expressions>) ...` over plain rows: the keys and
+/// the ORDER BY terms are computed as columns of a FROM subquery, and the
+/// DISTINCT ON / ORDER BY / LIMIT run over those -- the planner's DISTINCT
+/// ON reads stored columns only. `None` when every key is already a column
+/// (or the query groups, which `distinct_on_over_groups` handles).
+fn distinct_on_over_expressions(
+    s: &pg_query::protobuf::SelectStmt,
+) -> Option<pg_query::protobuf::SelectStmt> {
+    if s.distinct_clause.is_empty() || s.distinct_clause[0].node.is_none() {
+        return None;
+    }
+    if !s.group_clause.is_empty() || has_aggregate(s) {
+        return None;
+    }
+    if s.distinct_clause
+        .iter()
+        .all(|k| matches!(k.node.as_ref(), Some(N::ColumnRef(_))))
+    {
+        return None;
+    }
+    let targets: Vec<&pg_query::protobuf::ResTarget> = s
+        .target_list
+        .iter()
+        .map(|t| match t.node.as_ref() {
+            Some(N::ResTarget(rt)) => Some(&**rt),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    // `*` expands to columns this cannot name.
+    if targets.iter().any(|rt| {
+        matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()),
+            Some(N::ColumnRef(c)) if c.fields.iter().any(|f| matches!(f.node, Some(N::AStar(_)))))
+    }) {
+        return None;
+    }
+    let output_name = |rt: &pg_query::protobuf::ResTarget| -> String {
+        if !rt.name.is_empty() {
+            return rt.name.clone();
+        }
+        match rt.val.as_deref().and_then(|v| v.node.as_ref()) {
+            Some(N::ColumnRef(c)) => column_ref_name(c).unwrap_or_else(|| "?column?".into()),
+            Some(N::FuncCall(f)) => func_name(f).unwrap_or_else(|| "?column?".into()),
+            Some(N::TypeCast(tc)) => cast_chain_over_column(tc)
+                .map(|(c, _)| c)
+                .unwrap_or_else(|_| "?column?".into()),
+            _ => "?column?".into(),
+        }
+    };
+    let names: Vec<String> = targets.iter().map(|rt| output_name(rt)).collect();
+    let col = |name: String| pg_query::protobuf::Node {
+        node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+            fields: vec![pg_query::protobuf::Node {
+                node: Some(N::String(pg_query::protobuf::String { sval: name })),
+            }],
+            location: -1,
+        })),
+    };
+    let named = |name: String, val: pg_query::protobuf::Node| pg_query::protobuf::Node {
+        node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+            name,
+            val: Some(Box::new(val)),
+            location: -1,
+            ..Default::default()
+        }))),
+    };
+    // An output position or name reads the target it names.
+    let output_ref = |n: &pg_query::protobuf::Node| -> Option<usize> {
+        match n.node.as_ref() {
+            Some(N::AConst(c)) => match c.val.as_ref() {
+                Some(pg_query::protobuf::a_const::Val::Ival(i)) => usize::try_from(i.ival)
+                    .ok()?
+                    .checked_sub(1)
+                    .filter(|k| *k < targets.len()),
+                _ => None,
+            },
+            Some(N::ColumnRef(c)) if c.fields.len() == 1 => {
+                let name = column_ref_name(c)?;
+                names.iter().position(|x| *x == name)
+            }
+            _ => None,
+        }
+    };
+    let mut inner_targets: Vec<pg_query::protobuf::Node> = targets
+        .iter()
+        .enumerate()
+        .map(|(i, rt)| {
+            named(
+                format!("__dt{i}"),
+                rt.val.as_deref().cloned().unwrap_or_default(),
+            )
+        })
+        .collect();
+    let mut keys = Vec::new();
+    for (k, key) in s.distinct_clause.iter().enumerate() {
+        match output_ref(key) {
+            Some(i) => keys.push(col(format!("__dt{i}"))),
+            None => {
+                inner_targets.push(named(format!("__dk{k}"), key.clone()));
+                keys.push(col(format!("__dk{k}")));
+            }
+        }
+    }
+    let mut sorts = Vec::new();
+    for (j, item) in s.sort_clause.iter().enumerate() {
+        let Some(N::SortBy(sb)) = item.node.as_ref() else {
+            return None;
+        };
+        let mut sb = (**sb).clone();
+        let node = sb.node.as_deref()?;
+        let reference = match output_ref(node) {
+            Some(i) => col(format!("__dt{i}")),
+            None => {
+                inner_targets.push(named(format!("__ds{j}"), node.clone()));
+                col(format!("__ds{j}"))
+            }
+        };
+        sb.node = Some(Box::new(reference));
+        sorts.push(pg_query::protobuf::Node {
+            node: Some(N::SortBy(Box::new(sb))),
+        });
+    }
+    let mut inner = s.clone();
+    inner.distinct_clause = Vec::new();
+    inner.sort_clause = Vec::new();
+    inner.limit_count = None;
+    inner.limit_offset = None;
+    inner.target_list = inner_targets;
+    let outer_targets = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| named(name.clone(), col(format!("__dt{i}"))))
+        .collect();
+    Some(pg_query::protobuf::SelectStmt {
+        distinct_clause: keys,
+        target_list: outer_targets,
+        from_clause: vec![pg_query::protobuf::Node {
+            node: Some(N::RangeSubselect(Box::new(
+                pg_query::protobuf::RangeSubselect {
+                    lateral: false,
+                    subquery: Some(Box::new(pg_query::protobuf::Node {
+                        node: Some(N::SelectStmt(Box::new(inner))),
+                    })),
+                    alias: Some(pg_query::protobuf::Alias {
+                        aliasname: "__dx".into(),
+                        colnames: Vec::new(),
+                    }),
+                },
+            ))),
+        }],
+        sort_clause: sorts,
+        limit_count: s.limit_count.clone(),
+        limit_offset: s.limit_offset.clone(),
+        limit_option: s.limit_option,
+        op: pg_query::protobuf::SetOperation::SetopNone as i32,
+        ..Default::default()
+    })
+}
+
+/// Are two expressions the same, ignoring where in the text each was
+/// written? (`ORDER BY sum(v)` names the select list's `sum(v)`.)
+pub(crate) fn same_expression(a: &pg_query::protobuf::Node, b: &pg_query::protobuf::Node) -> bool {
+    static LOCATION: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re =
+        LOCATION.get_or_init(|| regex::Regex::new(r"location: -?\d+").expect("a fixed pattern"));
+    re.replace_all(&format!("{a:?}"), "") == re.replace_all(&format!("{b:?}"), "")
 }
 
 fn aggregate_distinct(s: &pg_query::protobuf::SelectStmt) -> Result<bool> {
@@ -12729,6 +13473,61 @@ fn numeric_signature(name: &str) -> Option<usize> {
 /// type at plan time, where this server would otherwise stringify.
 fn text_function_mismatch(f: &pg_query::protobuf::FuncCall, types: &[String]) -> Option<Error> {
     let name = func_name(f)?;
+    let missing = || {
+        Error::UndefinedFunction(format!(
+            "function {name}({}) does not exist",
+            types
+                .iter()
+                .map(|t| display_type(t))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    };
+    let known_scalar = |t: &str| {
+        !t.is_empty()
+            && t != "unknown"
+            && !t.ends_with("[]")
+            && !matches!(t, "int2vector" | "oidvector" | "anyarray" | "record")
+            && pgtypes::oid_of_name(t).is_some()
+    };
+    if !correlated::user_function_named(&name) {
+        let first = types.first().map(String::as_str).unwrap_or("");
+        // The array built-ins take an array first; a known scalar has no
+        // cast to one (`array_length(1, 1)`).
+        let array_first = matches!(
+            name.as_str(),
+            "array_length"
+                | "array_lower"
+                | "array_upper"
+                | "array_dims"
+                | "array_ndims"
+                | "cardinality"
+                | "array_to_string"
+                | "array_position"
+                | "array_positions"
+                | "array_remove"
+                | "array_replace"
+        );
+        if array_first && known_scalar(first) {
+            return Some(missing());
+        }
+        // `to_hex` is integer-only.
+        if name == "to_hex" && known_scalar(first) && !matches!(first, "int2" | "int4" | "int8") {
+            return Some(missing());
+        }
+        // `md5` / `substr` take text or bytea; a number or a date has no
+        // implicit cast to either.
+        if matches!(name.as_str(), "md5" | "substr")
+            && known_scalar(first)
+            && !matches!(
+                first,
+                "text" | "varchar" | "bpchar" | "name" | "char" | "bytea"
+            )
+            && domains::user_domain(first).is_none()
+        {
+            return Some(missing());
+        }
+    }
     // `length` also takes bytea, bit strings, a tsvector and the geometric
     // path types -- but not a number or a date.
     if name == "length" && !correlated::user_function_named(&name) {
@@ -14163,6 +14962,15 @@ fn plan_select(
     if let Some(rewritten) = whole_row_rewrite(s, lookup, params)? {
         return plan_select(&rewritten, lookup, params);
     }
+    if let Some(rewritten) = expand_composite_star(s) {
+        return plan_select(&rewritten, lookup, params);
+    }
+    if let Some(rewritten) = distinct_on_over_groups(s) {
+        return plan_select(&rewritten, lookup, params);
+    }
+    if let Some(rewritten) = distinct_on_over_expressions(s) {
+        return plan_select(&rewritten, lookup, params);
+    }
     // An enum orders by its labels' declared positions, not their text.
     if let Some(rewritten) = enum_order::rewrite(s, lookup)? {
         return plan_select(&rewritten, lookup, params);
@@ -14270,23 +15078,100 @@ thread_local! {
     static IN_WHERE_SPLIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// `(expr).*` in a select list over a COMPOSITE-typed expression -- a
+/// function returning one, a cast to one -- expanded into `(expr).field` per
+/// field, as PostgreSQL's parse analysis expands it (which is also why it
+/// evaluates `expr` once per field). `None` when there is none to expand.
+fn expand_composite_star(
+    s: &pg_query::protobuf::SelectStmt,
+) -> Option<pg_query::protobuf::SelectStmt> {
+    let fields_of = |rt: &pg_query::protobuf::ResTarget| {
+        let Some(N::AIndirection(ind)) = rt.val.as_ref()?.node.as_ref() else {
+            return None;
+        };
+        let [star] = ind.indirection.as_slice() else {
+            return None;
+        };
+        if !matches!(star.node.as_ref(), Some(N::AStar(_))) {
+            return None;
+        }
+        let arg = ind.arg.as_deref()?;
+        if matches!(arg.node.as_ref(), Some(N::ColumnRef(_))) {
+            return None;
+        }
+        let (_, fields) = user_composite(&static_type(arg, &Bson::Null))?;
+        Some((arg.clone(), fields))
+    };
+    let mut changed = false;
+    let mut targets = Vec::with_capacity(s.target_list.len());
+    for t in &s.target_list {
+        match t.node.as_ref() {
+            Some(N::ResTarget(rt)) => match fields_of(rt) {
+                Some((arg, fields)) => {
+                    changed = true;
+                    for (name, _) in fields {
+                        targets.push(pg_query::protobuf::Node {
+                            node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+                                name: name.clone(),
+                                val: Some(Box::new(pg_query::protobuf::Node {
+                                    node: Some(N::AIndirection(Box::new(
+                                        pg_query::protobuf::AIndirection {
+                                            arg: Some(Box::new(arg.clone())),
+                                            indirection: vec![pg_query::protobuf::Node {
+                                                node: Some(N::String(pg_query::protobuf::String {
+                                                    sval: name,
+                                                })),
+                                            }],
+                                        },
+                                    ))),
+                                })),
+                                location: rt.location,
+                                ..Default::default()
+                            }))),
+                        });
+                    }
+                }
+                None => targets.push(t.clone()),
+            },
+            _ => targets.push(t.clone()),
+        }
+    }
+    changed.then(|| {
+        let mut out = s.clone();
+        out.target_list = targets;
+        out
+    })
+}
+
 /// `SELECT <aggs> FROM r WHERE p ...` as `SELECT <aggs> FROM (SELECT * FROM
-/// r WHERE p) r ...`, for a single plain relation `r`; `None` otherwise.
+/// r WHERE p) r ...`, for a single relation, subquery or function `r`;
+/// `None` otherwise.
 fn aggregate_where_as_subquery(
     s: &pg_query::protobuf::SelectStmt,
 ) -> Option<pg_query::protobuf::SelectStmt> {
     let [item] = s.from_clause.as_slice() else {
         return None;
     };
-    let Some(N::RangeVar(r)) = item.node.as_ref() else {
-        return None;
+    let named = |a: Option<&pg_query::protobuf::Alias>| {
+        a.map(|a| a.aliasname.clone()).filter(|a| !a.is_empty())
     };
-    let alias = r
-        .alias
-        .as_ref()
-        .map(|a| a.aliasname.clone())
-        .filter(|a| !a.is_empty())
-        .unwrap_or_else(|| r.relname.clone());
+    // A table, or a subquery / function in FROM (`(VALUES ...) v(x)`,
+    // `generate_series(1, 3) g`): the outer query reads the filtered rows
+    // under the same name, so `v.x` and `g` still resolve.
+    let alias = match item.node.as_ref() {
+        Some(N::RangeVar(r)) => named(r.alias.as_ref()).unwrap_or_else(|| r.relname.clone()),
+        Some(N::RangeSubselect(r)) if !r.lateral => named(r.alias.as_ref())?,
+        Some(N::RangeFunction(f)) if !f.lateral => named(f.alias.as_ref()).or_else(|| {
+            let Some(N::List(l)) = f.functions.first()?.node.as_ref() else {
+                return None;
+            };
+            let Some(N::FuncCall(call)) = l.items.first()?.node.as_ref() else {
+                return None;
+            };
+            func_name(call)
+        })?,
+        _ => return None,
+    };
     let star = pg_query::protobuf::Node {
         node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
             val: Some(Box::new(pg_query::protobuf::Node {
@@ -15561,7 +16446,9 @@ fn plan_join_select(
             // beside the column, same as a plain select's. A cast over a
             // CONSTANT (`'t1'::regclass::oid`) is a constant target, below.
             Some(N::TypeCast(tc))
-                if !cast_chain_has_typmod(tc) && cast_chain_over_column_qualified(tc).is_ok() =>
+                if !cast_chain_has_typmod(tc)
+                    && cast_chain_over_column_qualified(tc)
+                        .is_ok_and(|(_, (_, chain))| !user_casts::in_chain(None, &chain)) =>
             {
                 let (col_name, chain) = cast_chain_over_column_qualified(tc)?;
                 let out = if rt.name.is_empty() {
@@ -15793,9 +16680,26 @@ pub fn sub_plan_def(
         Statement::Aggregate(agg) => aggregate_output_def(agg),
         Statement::Select(sel) => select_output_def(sel, lookup),
         Statement::SetOp(set) => {
-            // PostgreSQL takes a set operation's column NAMES and TYPES from
-            // its left side, which is what `set_op_fields` reports on the wire.
-            sub_plan_def(&set.left, lookup)
+            // The column NAMES are the left side's; each TYPE is the two
+            // sides' common type, as the executor reports it on the wire.
+            let mut left = sub_plan_def(&set.left, lookup)?;
+            let Ok(right) = sub_plan_def(&set.right, lookup) else {
+                return Ok(left);
+            };
+            let untyped = |stmt: &Statement, i: usize| match stmt {
+                Statement::SelectConstant(sc) => sc.untyped.get(i).copied().unwrap_or(false),
+                _ => false,
+            };
+            for (i, (l, r)) in left.columns.iter_mut().zip(&right.columns).enumerate() {
+                l.pg_type = if untyped(&set.left, i) {
+                    r.pg_type.clone()
+                } else if untyped(&set.right, i) {
+                    l.pg_type.clone()
+                } else {
+                    set_op_common_type(&l.pg_type, &r.pg_type)
+                };
+            }
+            Ok(left)
         }
         Statement::SelectConstant(sc) => Ok(TableDef::new(
             "",
@@ -15813,6 +16717,40 @@ pub fn sub_plan_def(
                 .collect(),
         )),
         _ => Err(Error::Unsupported("this subquery shape".into())),
+    }
+}
+
+/// Two set-operation sides' common column type, as `select_common_type`
+/// chooses it: the wider number, the wider date/time, and among the string
+/// types `text` (preferred) or else the left side's -- unless only the left
+/// casts implicitly to the right (`varchar` / `bpchar` to `name`).
+/// Mismatched categories are the executor's 42804; this keeps the left.
+fn set_op_common_type(left: &str, right: &str) -> String {
+    let rank = |t: &str| -> Option<(u8, u8)> {
+        Some(match t {
+            "int2" => (1, 1),
+            "int4" => (1, 2),
+            "int8" => (1, 3),
+            "numeric" => (1, 4),
+            "float4" => (1, 5),
+            "float8" => (1, 6),
+            "text" | "varchar" | "bpchar" | "name" => (2, 0),
+            "date" => (3, 1),
+            "timestamp" => (3, 2),
+            "timestamptz" => (3, 3),
+            _ => return None,
+        })
+    };
+    match (rank(left), rank(right)) {
+        (Some((2, _)), Some((2, _))) => {
+            if left != "text" && matches!(left, "varchar" | "bpchar") && right == "name" {
+                right.to_string()
+            } else {
+                left.to_string()
+            }
+        }
+        (Some((lc, lr)), Some((rc, rr))) if lc == rc && rr > lr => right.to_string(),
+        _ => left.to_string(),
     }
 }
 
@@ -15865,10 +16803,13 @@ pub fn select_output_def(
         let mut col = Column::new(out, &ty, false);
         // A column read straight through keeps its modifier: a `char(n)`
         // is still `char(n)` seen from outside the subquery.
-        if expr.is_none() {
-            if let Some(c) = src {
-                col.typmod = c.typmod;
+        match expr {
+            None => {
+                if let Some(c) = src {
+                    col.typmod = c.typmod;
+                }
             }
+            Some(e) => col.typmod = column_expr_typmod(e),
         }
         columns.push(col);
     }
@@ -16520,6 +17461,34 @@ fn default_is_volatile(node: &pg_query::protobuf::Node) -> bool {
 }
 
 fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
+    // Memoised inside a `const_value` evaluation (see `TYPE_MEMO`), for an
+    // operator node typed without a value -- the answer then depends on the
+    // node alone.
+    let key = match node.node.as_ref() {
+        Some(N::AExpr(e)) if *value == Bson::Null && CONST_DEPTH.with(|d| d.get()) > 0 => Some((
+            std::ptr::from_ref(node) as usize,
+            e.location,
+            e.lexpr
+                .as_deref()
+                .map_or(0, |n| std::ptr::from_ref(n) as usize),
+            e.rexpr
+                .as_deref()
+                .map_or(0, |n| std::ptr::from_ref(n) as usize),
+        )),
+        _ => None,
+    };
+    if let Some(key) = key {
+        if let Some(t) = TYPE_MEMO.with(|m| m.borrow().get(&key).cloned()) {
+            return t;
+        }
+        let t = static_type_uncached(node, value);
+        TYPE_MEMO.with(|m| m.borrow_mut().insert(key, t.clone()));
+        return t;
+    }
+    static_type_uncached(node, value)
+}
+
+fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String {
     // `pg_trgm`: its functions and operators answer `real` (and `text[]`,
     // `boolean`), which a value alone -- a double -- does not say.
     match node.node.as_ref() {
@@ -16961,18 +17930,31 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
                 };
             }
             let op = operator_name(e).unwrap_or("");
+            // Each operand is typed ONCE per node. The arms below all ask, and
+            // re-typing a child in each made a left-deep `a || b || c || ...`
+            // cost ~5^depth: ten terms never finished.
+            let (lt_cell, rt_cell) = (std::cell::OnceCell::new(), std::cell::OnceCell::new());
+            let lt = || -> Option<&String> {
+                lt_cell
+                    .get_or_init(|| e.lexpr.as_deref().map(|l| static_type(l, &Bson::Null)))
+                    .as_ref()
+            };
+            let rt = || -> Option<&String> {
+                rt_cell
+                    .get_or_init(|| e.rexpr.as_deref().map(|r| static_type(r, &Bson::Null)))
+                    .as_ref()
+            };
             // A prefix operator over a geometric operand (`@@ circle`).
-            if let (None, Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
-                if let Some(t) = geom::unary_type(op, &static_type(r, &Bson::Null)) {
+            if let (None, Some(r)) = (lt(), rt()) {
+                if let Some(t) = geom::unary_type(op, r) {
                     return t.to_string();
                 }
             }
-            if let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
-                let (lt, rt) = (static_type(l, &Bson::Null), static_type(r, &Bson::Null));
-                if let Some(t) = range_ops::result_type(op, &lt, &rt) {
+            if let (Some(lt), Some(rt)) = (lt(), rt()) {
+                if let Some(t) = range_ops::result_type(op, lt, rt) {
                     return t;
                 }
-                if let Some(t) = geom::operator_type(op, &lt, &rt) {
+                if let Some(t) = geom::operator_type(op, lt, rt) {
                     return t.to_string();
                 }
                 // jsonb's `-` / `#-` / `||` answer jsonb.
@@ -16985,10 +17967,13 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
             // Bit-string operators keep the left operand's type; `||` is varbit
             // and `~` the operand's.
             if matches!(op, "&" | "|" | "#" | "<<" | ">>" | "||" | "~") {
-                let side = e.lexpr.as_deref().or(e.rexpr.as_deref());
-                if let Some(t) = side.map(|n| static_type(n, &Bson::Null)) {
-                    if bits::is_bit_type(&t) {
-                        return if op == "||" { "varbit".to_string() } else { t };
+                if let Some(t) = lt().or(rt()) {
+                    if bits::is_bit_type(t) {
+                        return if op == "||" {
+                            "varbit".to_string()
+                        } else {
+                            t.clone()
+                        };
                     }
                 }
             }
@@ -17000,16 +17985,17 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
                 return "tsquery".to_string();
             }
             if matches!(op, "||" | "&&" | "<->") {
-                if let Some(l) = e.lexpr.as_deref() {
-                    let t = static_type(l, &Bson::Null);
+                if let Some(t) = lt() {
                     if t == "tsvector" || t == "tsquery" {
-                        return t;
+                        return t.clone();
                     }
                 }
             }
             // The hstore operators type from the operator and, for `->`,
             // from whether the RIGHT operand is a key or a key list.
-            if static_hstore_operand(e.lexpr.as_deref(), &Bson::Null) {
+            if lt().is_some_and(|t| t == "hstore")
+                && extension_type("hstore") == Some(ExtensionType::Hstore)
+            {
                 if let Some(t) = static_hstore_result(op, e.rexpr.as_deref()) {
                     return t;
                 }
@@ -17032,30 +18018,25 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
             // The array containment operators answer a boolean. Reached only
             // when the json branch above did not claim the operator, so an
             // array operand is what is left.
-            if matches!(op, "@>" | "<@" | "&&") {
-                let side = |n: Option<&pg_query::protobuf::Node>| {
-                    n.map(|node| static_type(node, &Bson::Null))
-                };
-                if side(e.lexpr.as_deref()).is_some_and(|t| t.ends_with("[]"))
-                    || side(e.rexpr.as_deref()).is_some_and(|t| t.ends_with("[]"))
-                {
-                    return "bool".to_string();
-                }
+            if matches!(op, "@>" | "<@" | "&&")
+                && (lt().is_some_and(|t| t.ends_with("[]"))
+                    || rt().is_some_and(|t| t.ends_with("[]")))
+            {
+                return "bool".to_string();
             }
             match op {
                 // `||` is text concatenation EXCEPT bytea||bytea, which is
                 // bytea: type it from the operands so a bare (uncast) concat
                 // reports oid 17 rather than 25.
                 "||" => {
-                    let side = |n: Option<&pg_query::protobuf::Node>| {
-                        n.map(|node| static_type(node, &Bson::Null))
-                    };
-                    let (l, r) = (side(e.lexpr.as_deref()), side(e.rexpr.as_deref()));
+                    let (l, r) = (lt(), rt());
                     // An array beside anything is `array_cat` / `array_append`
                     // / `array_prepend`, typed as the array.
                     if let Some(t) = l.iter().chain(r.iter()).find(|t| t.ends_with("[]")) {
-                        t.clone()
-                    } else if l.as_deref() == Some("bytea") || r.as_deref() == Some("bytea") {
+                        (*t).clone()
+                    } else if l.map(String::as_str) == Some("bytea")
+                        || r.map(String::as_str) == Some("bytea")
+                    {
                         "bytea".to_string()
                     } else {
                         "text".to_string()
@@ -17073,16 +18054,14 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
                     // result loader. Without this a `timestamp + interval` was
                     // described as `int4`/`text` and the client decoded it wrong.
                     // Unary minus keeps an interval an interval.
-                    if e.lexpr.is_none() && matches!(op, "-" | "+") {
-                        if let Some(r) = e.rexpr.as_deref() {
-                            if static_type(r, &Bson::Null) == "interval" {
-                                return "interval".to_string();
-                            }
-                        }
+                    if e.lexpr.is_none()
+                        && matches!(op, "-" | "+")
+                        && rt().is_some_and(|t| t == "interval")
+                    {
+                        return "interval".to_string();
                     }
-                    if let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
-                        let lt = static_type(l, &Bson::Null);
-                        let rt = static_type(r, &Bson::Null);
+                    if let (Some(lt), Some(rt)) = (lt(), rt()) {
+                        let (lt, rt) = (lt.clone(), rt.clone());
                         if let Some(t) = datetime_arith_type(op, &lt, &rt) {
                             return t.to_string();
                         }
@@ -17786,7 +18765,7 @@ fn plan_select_unnest(
         return Ok(None);
     };
     let name = func_name(f).unwrap_or_default();
-    let Some((names, types, rows)) = srf_rows(&name, f, params)? else {
+    let Some((names, types, rows)) = srf_rows(&name, f, params, false)? else {
         return Ok(None);
     };
     // A clause needs a source to apply to, and this shape has none. Refused by
@@ -18548,6 +19527,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 // `const_value` handles it perfectly well -- which is why CASE
                 // worked over a table and not here.
                 | N::CaseExpr(_)
+                | N::CollateClause(_)
                 | N::XmlExpr(_)
                 | N::XmlSerialize(_)),
             ) => {
@@ -18568,10 +19548,25 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
         };
         columns.push((out, value, pg_type, typmod));
     }
+    let untyped: Vec<bool> = s
+        .target_list
+        .iter()
+        .map(|t| {
+            matches!(t.node.as_ref(), Some(N::ResTarget(rt))
+                if matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()),
+                    Some(N::AConst(c)) if c.isnull))
+        })
+        .collect();
+    let untyped = if untyped.len() == columns.len() {
+        untyped
+    } else {
+        Vec::new()
+    };
     Ok(Statement::SelectConstant(SelectConstant {
         columns,
         where_true,
         source: None,
+        untyped,
     }))
 }
 
@@ -18726,6 +19721,7 @@ fn plan_function_source_select(
         columns,
         where_true: rest.where_true,
         source: Some(Box::new(source_col)),
+        untyped: Vec::new(),
     }))
 }
 
@@ -21240,6 +22236,8 @@ pub fn apply_column_expr(expr: &ColumnExpr, value: Bson, tz: &TimeZoneSetting) -
     match expr {
         ColumnExpr::Casts { source, chain } => {
             let mut v = value;
+            // The operand's type through the chain, for a user cast's lookup.
+            let mut current: Option<String> = source.clone();
             let mut prev: Option<&str> = match source.as_deref() {
                 Some("timestamptz") | Some("timestamp with time zone") => Some("timestamptz"),
                 Some(t @ ("int2vector" | "oidvector" | "date" | "timestamp")) => Some(t),
@@ -21248,6 +22246,12 @@ pub fn apply_column_expr(expr: &ColumnExpr, value: Bson, tz: &TimeZoneSetting) -
                 _ => None,
             };
             for target in chain {
+                let from = current.replace(target.clone());
+                if let Some(cast) = from.as_deref().and_then(|f| user_casts::find(f, target)) {
+                    v = user_casts::apply(&cast, v)?;
+                    prev = Some(target);
+                    continue;
+                }
                 if matches!(target.as_str(), "text" | "varchar" | "name") {
                     if let Some(styled) = prev.and_then(|p| datetime_text_styled(&v, p, tz)) {
                         v = styled;
@@ -21358,6 +22362,15 @@ pub fn apply_column_expr(expr: &ColumnExpr, value: Bson, tz: &TimeZoneSetting) -
             }
             apply_row_expr(expr, &row)
         }
+    }
+}
+
+/// The type modifier a ColumnExpr's column carries: a top-level cast's
+/// (`x::numeric(5,2)`), else -1.
+pub fn column_expr_typmod(expr: &ColumnExpr) -> i32 {
+    match expr {
+        ColumnExpr::Row { expr, .. } => cast_typmod(expr),
+        _ => -1,
     }
 }
 
@@ -21672,6 +22685,17 @@ pub fn render_timetz(micros: i64, east_seconds: i32) -> String {
 /// A literal with no offset takes the session zone's CURRENT offset, so the
 /// same literal can mean different things on either side of a DST change.
 fn parse_timetz(text: &str, tz: &TimeZoneSetting) -> Result<String> {
+    // A zone ABBREVIATION (`12:00 EST`) is DecodeTimeOnly's to read: the
+    // plain time parser would take the time and drop the zone.
+    if text.chars().any(|c| c.is_ascii_alphabetic()) {
+        if let Ok(p) = dtparse::parse_time_only(text.trim(), "time with time zone") {
+            if p.zone.is_none() {
+                if let Some(off) = p.offset {
+                    return Ok(format!("{}{}", render_time_parts(&p), render_offset(off)));
+                }
+            }
+        }
+    }
     let (body, offset) = split_trailing_offset(text);
     let (time, offset) = match parse_time(&body) {
         Ok(time) => (time, offset),
@@ -24410,6 +25434,11 @@ fn datetime_result_type(f: &pg_query::protobuf::FuncCall, name: &str) -> Option<
         return Some(t.to_string());
     }
     let types: Vec<String> = f.args.iter().map(|a| static_type(a, &Bson::Null)).collect();
+    // The network functions (`host`, `masklen`, `network`, ...) are typed
+    // by their inet / cidr argument, as the datetime family is by its own.
+    if let Some(t) = net::result_type(name, &types) {
+        return Some(t);
+    }
     datetime::result_type(name, &types)
 }
 
@@ -24469,6 +25498,9 @@ fn datetime_call(
     let args: Vec<Bson> = args.iter().map(arrays::strip).collect();
     if jsonfn::result_type(name).is_some() {
         return Some(jsonfn::call(name, &args, &types));
+    }
+    if net::result_type(name, &types).is_some() {
+        return Some(net::call(name, &args, &types));
     }
     datetime::call(name, &args, &types)
 }
@@ -25583,6 +26615,40 @@ fn plan_set(v: &pg_query::protobuf::VariableSetStmt) -> Result<Statement> {
 }
 
 fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
+    if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectCast) {
+        return user_casts::plan_drop(d);
+    }
+    if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectCollation) {
+        return collation::plan_drop(d);
+    }
+    if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectEventTrigger) {
+        return event_triggers::plan_drop(d);
+    }
+    // `DROP RULE name ON table`: the object is `[schema.]table.rule`.
+    if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectRule) {
+        let [obj] = d.objects.as_slice() else {
+            return Err(Error::Unsupported("DROP RULE of more than one rule".into()));
+        };
+        let Some(N::List(l)) = obj.node.as_ref() else {
+            return Err(Error::Unsupported("this DROP RULE target".into()));
+        };
+        let parts: Vec<String> = l
+            .items
+            .iter()
+            .filter_map(|n| match n.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            })
+            .collect();
+        let [.., table, name] = parts.as_slice() else {
+            return Err(Error::Parse("DROP RULE needs a table".into()));
+        };
+        return Ok(Statement::DropRule {
+            table: table.clone(),
+            name: name.clone(),
+            if_exists: d.missing_ok,
+        });
+    }
     // `DROP SCHEMA`: the object is a bare String / one-element List.
     if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectSchema) {
         let mut names = Vec::new();
@@ -25828,12 +26894,17 @@ fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
     // `DROP FUNCTION`: each object is an ObjectWithArgs -- the name parts plus
     // the declared argument types, which PostgreSQL needs to pick one overload.
     if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectFunction) {
-        if d.objects.len() != 1 {
-            return Err(Error::Unsupported(
-                "DROP FUNCTION of more than one function".into(),
-            ));
+        // `DROP FUNCTION f(), g()`: one drop per function, run in order.
+        if d.objects.len() > 1 {
+            let mut drops = Vec::with_capacity(d.objects.len());
+            for o in &d.objects {
+                let mut one = d.clone();
+                one.objects = vec![o.clone()];
+                drops.push(plan_drop(&one)?);
+            }
+            return Ok(Statement::Sequence("DROP FUNCTION", drops));
         }
-        let Some(N::ObjectWithArgs(o)) = d.objects[0].node.as_ref() else {
+        let Some(N::ObjectWithArgs(o)) = d.objects.first().and_then(|o| o.node.as_ref()) else {
             return Err(Error::Unsupported("this DROP FUNCTION target".into()));
         };
         let name = o
@@ -26070,6 +27141,35 @@ fn plan_update(
             &**val
         };
         check_assignment_type(column, val)?;
+        // An assignment through a user cast (`AS ASSIGNMENT` / `AS
+        // IMPLICIT`): the value is cast to the column's type, which the
+        // cast evaluation takes through the user's cast.
+        let assigned_node;
+        let val = {
+            let from =
+                declared_expression_type(val).unwrap_or_else(|| static_type(val, &Bson::Null));
+            if user_casts::find_assignment(&from, &column.pg_type).is_some() {
+                assigned_node = pg_query::protobuf::Node {
+                    node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                        arg: Some(Box::new(val.clone())),
+                        type_name: Some(pg_query::protobuf::TypeName {
+                            names: vec![pg_query::protobuf::Node {
+                                node: Some(N::String(pg_query::protobuf::String {
+                                    sval: column.pg_type.clone(),
+                                })),
+                            }],
+                            typemod: -1,
+                            location: -1,
+                            ..Default::default()
+                        }),
+                        location: -1,
+                    }))),
+                };
+                &assigned_node
+            } else {
+                val
+            }
+        };
         // A value that reads the row (`num * 2`) has no constant to store;
         // it is planned as a row expression and evaluated per matched row --
         // as is a VOLATILE one (`nextval`, `random()`), which PostgreSQL
@@ -26773,7 +27873,39 @@ fn xml_expr_value(x: &pg_query::protobuf::XmlExpr, params: &[Bson]) -> Result<Bs
     })
 }
 
+thread_local! {
+    /// `const_value` nesting on this thread; see [`const_value`].
+    static CONST_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// `static_type` of operator nodes, for ONE outermost `const_value`
+    /// evaluation. Keyed by the node's address, its location and its operands'
+    /// addresses: the tree being evaluated is not changed while it is walked,
+    /// so within one evaluation an address names one node.
+    static TYPE_MEMO: std::cell::RefCell<std::collections::HashMap<(usize, i32, usize, usize), String>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Evaluate a constant expression. The evaluator asks `static_type` about
+/// each operand at every level, and each ask walks the subtree beneath it,
+/// so a long `a || b || c ...` cost O(n^2) -- 1,000 terms took most of a
+/// minute. `static_type`'s answers are memoised for the evaluation.
 fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson> {
+    let depth = CONST_DEPTH.with(|d| {
+        let v = d.get();
+        d.set(v + 1);
+        v
+    });
+    if depth == 0 {
+        TYPE_MEMO.with(|m| m.borrow_mut().clear());
+    }
+    let out = const_value_inner(node, params);
+    CONST_DEPTH.with(|d| d.set(depth));
+    if depth == 0 {
+        TYPE_MEMO.with(|m| m.borrow_mut().clear());
+    }
+    out
+}
+
+fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson> {
     // `'1'::int`, `$1::text`, `null::int`. The cast is applied to whatever the
     // operand evaluates to, so a bound parameter casts exactly like a literal.
     if let Some(N::TypeCast(tc)) = node.node.as_ref() {
@@ -26792,6 +27924,49 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             if !(is_string_type(&target) || target_base.as_deref() == Some(source.as_str())) {
                 return Err(Error::CannotCoerce(format!(
                     "cannot cast type {source} to {}",
+                    display_type(&target)
+                )));
+            }
+        }
+        // A user cast (`CREATE CAST`) between the operand's type and the
+        // target. Never for an untyped literal, which is the target type's
+        // own input (`'happy'::mood` does not take a `text -> mood` cast).
+        let untyped = matches!(arg.node.as_ref(), Some(N::AConst(c))
+            if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) || c.isnull);
+        if !untyped {
+            let source = static_type(arg, &value);
+            if let Some(cast) = user_casts::find(&source, &target) {
+                return user_casts::apply(&cast, value);
+            }
+            // The network types are cast to from text (and each other) only.
+            if matches!(target.as_str(), "inet" | "cidr")
+                && !matches!(
+                    source.as_str(),
+                    "text" | "unknown" | "varchar" | "bpchar" | "name" | "inet" | "cidr" | ""
+                )
+                && pgtypes::oid_of_name(&source).is_some()
+            {
+                set_error_location(tc.location);
+                return Err(Error::CannotCoerce(format!(
+                    "cannot cast type {} to {}",
+                    display_type(&source),
+                    display_type(&target)
+                )));
+            }
+            // No cast between a scalar and a composite: 42846, naming both.
+            if value != Bson::Null
+                && user_composite(&target).is_some()
+                && !matches!(
+                    source.as_str(),
+                    "text" | "unknown" | "record" | "varchar" | "bpchar" | "name"
+                )
+                && user_casts::type_oid(&source) != user_casts::type_oid(&target)
+                && user_composite(&source).is_none()
+            {
+                set_error_location(tc.location);
+                return Err(Error::CannotCoerce(format!(
+                    "cannot cast type {} to {}",
+                    display_type(&source),
                     display_type(&target)
                 )));
             }
@@ -27082,9 +28257,9 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             })
             .next_back()
             .unwrap_or_default();
-        if !matches!(collation.as_str(), "C" | "POSIX" | "default" | "ucs_basic") {
-            return Err(Error::Unsupported(format!("COLLATE \"{collation}\"")));
-        }
+        // The name must exist; what it changes -- ordering and comparison --
+        // is applied where those happen (`enum_order`), not to the value.
+        collation::resolve(&collation)?;
         return Ok(value);
     }
     if let Some(N::FuncCall(f)) = node.node.as_ref() {
@@ -27203,7 +28378,21 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 Bson::Null => return Ok(Bson::Null),
                 other => regclass_oid(other),
             };
-            return Ok(VIEW_DEFS.with(|d| {
+            // `pg_get_viewdef(v, true)` (or a wrap column) prints pretty.
+            let pretty = match f.args.get(1) {
+                Some(a) => match const_value(a, params)? {
+                    Bson::Boolean(b) => b,
+                    Bson::Int32(_) | Bson::Int64(_) => true,
+                    _ => false,
+                },
+                None => false,
+            };
+            let table = if pretty {
+                &VIEW_DEFS_PRETTY
+            } else {
+                &VIEW_DEFS
+            };
+            return Ok(table.with(|d| {
                 d.borrow()
                     .iter()
                     .find(|(o, n, _)| Some(*o) == oid || by_name.as_deref() == Some(n.as_str()))
@@ -29453,3 +30642,49 @@ fn lower_between(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document>
 
 #[cfg(test)]
 mod tests;
+
+/// `CREATE [OR REPLACE] RULE name AS ON event TO table [WHERE cond] DO
+/// [ALSO | INSTEAD] { NOTHING | command | ( command; ... ) }`.
+fn plan_create_rule(r: &pg_query::protobuf::RuleStmt) -> Result<Statement> {
+    use pg_query::protobuf::CmdType;
+    let table = r
+        .relation
+        .as_ref()
+        .map(|rv| rv.relname.clone())
+        .ok_or_else(|| Error::Parse("a rule needs a table".into()))?;
+    let event = match CmdType::try_from(r.event) {
+        Ok(CmdType::CmdInsert) => "INSERT",
+        Ok(CmdType::CmdUpdate) => "UPDATE",
+        Ok(CmdType::CmdDelete) => "DELETE",
+        Ok(CmdType::CmdSelect) => {
+            // An ON SELECT rule turns a table into a view: `_RETURN` only.
+            if r.rulename != "_RETURN" {
+                return Err(Error::Sqlstate(
+                    "42P17",
+                    format!("view rule for \"{table}\" must be named \"_RETURN\""),
+                ));
+            }
+            return Err(Error::FeatureNotSupported(
+                "converting a table to a view with an ON SELECT rule".into(),
+            ));
+        }
+        _ => return Err(Error::Unsupported("this rule event".into())),
+    };
+    let condition = r.where_clause.as_deref().map(deparse_expr).transpose()?;
+    let mut actions = Vec::with_capacity(r.actions.len());
+    for a in &r.actions {
+        actions.push(
+            a.deparse()
+                .map_err(|e| Error::Parse(format!("a rule action: {e}")))?,
+        );
+    }
+    Ok(Statement::CreateRule {
+        table,
+        name: r.rulename.clone(),
+        event: event.to_string(),
+        instead: r.instead,
+        condition,
+        actions,
+        replace: r.replace,
+    })
+}

@@ -15,6 +15,7 @@ pub const KINDS: &[(&str, &str)] = &[
     ("regrole", "__regrole_oid"),
     ("regproc", "__regproc_oid"),
     ("regprocedure", "__regprocedure_oid"),
+    ("regcollation", "__regcollation_oid"),
 ];
 
 thread_local! {
@@ -97,6 +98,10 @@ pub fn text(kind: &str, oid: i64) -> String {
                 .find(|(_, o)| *o == oid)
                 .map(|(n, _)| crate::scalar::quote_identifier(n))
         }),
+        "regcollation" => collation_names()
+            .into_iter()
+            .find(|(_, o)| *o == oid)
+            .map(|(n, _)| crate::scalar::quote_identifier(&n)),
         "regproc" => PROCS.with(|t| {
             t.borrow()
                 .iter()
@@ -133,6 +138,18 @@ pub fn resolve(kind: &str, input: &str) -> Result<i64> {
                 .with(|t| t.borrow().iter().find(|(n, _)| *n == name).map(|(_, o)| *o))
                 .ok_or_else(|| {
                     Error::Sqlstate("3F000", format!("schema \"{name}\" does not exist"))
+                })
+        }
+        "regcollation" => {
+            let name = unquote(input);
+            collation_names()
+                .into_iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, o)| o)
+                .ok_or_else(|| {
+                    Error::UndefinedObject(format!(
+                        "collation \"{name}\" for encoding \"UTF8\" does not exist"
+                    ))
                 })
         }
         "regrole" => {
@@ -233,4 +250,26 @@ pub fn cast(value: &Bson, target: &str) -> Option<Result<Bson>> {
             crate::display_type(crate::inferred_type(other))
         ))),
     })
+}
+
+/// Every collation by name and oid: PostgreSQL's fixed ones, then the
+/// database's own.
+pub fn collation_names() -> Vec<(String, i64)> {
+    let mut out: Vec<(String, i64)> = [
+        ("default", 100),
+        ("C", 950),
+        ("POSIX", 951),
+        ("ucs_basic", 962),
+        ("und-x-icu", 12713),
+        ("en-x-icu", 12860),
+    ]
+    .into_iter()
+    .map(|(n, o)| (n.to_string(), o))
+    .collect();
+    out.extend(
+        crate::collation::user_collations()
+            .into_iter()
+            .map(|c| (c.name, c.oid)),
+    );
+    out
 }

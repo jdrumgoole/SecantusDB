@@ -190,7 +190,12 @@ impl PgHandler {
         Ok(())
     }
 
-    fn put(&self, collection: &'static str, id: &str, doc: Document) -> PgWireResult<()> {
+    pub(crate) fn put(
+        &self,
+        collection: &'static str,
+        id: &str,
+        doc: Document,
+    ) -> PgWireResult<()> {
         self.ensure_collection(collection)?;
         if self.catalog_doc(collection, id).is_some() {
             self.delete_type_doc(collection, id)?;
@@ -564,7 +569,7 @@ impl PgHandler {
         })
     }
 
-    fn role_oid_of(&self, name: &str) -> i64 {
+    pub(crate) fn role_oid_of(&self, name: &str) -> i64 {
         self.role(name).ok().flatten().map_or(10, |r| r.oid)
     }
 

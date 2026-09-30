@@ -35,6 +35,9 @@ fn category(ty: &str) -> Option<&'static str> {
 /// qualifier uses; `complete` when every FROM item is one of them, so an
 /// unqualified column resolves among them alone. A subquery's scope has
 /// its enclosing query's as `parent`, where a name it does not have resolves.
+/// A CTE in scope: its name and, when it is a plain SELECT, its query.
+type Cte = (String, Option<pg_query::protobuf::SelectStmt>);
+
 struct Scope<'p> {
     tables: Vec<(String, TableDef)>,
     complete: bool,
@@ -44,7 +47,7 @@ struct Scope<'p> {
 impl<'p> Scope<'p> {
     fn new(
         items: &[pg_query::protobuf::Node],
-        ctes: &[String],
+        ctes: &[Cte],
         lookup: &dyn Fn(&str) -> Option<TableDef>,
         parent: Option<&'p Scope<'p>>,
     ) -> Scope<'p> {
@@ -62,11 +65,55 @@ impl<'p> Scope<'p> {
     fn add(
         &mut self,
         item: &pg_query::protobuf::Node,
-        ctes: &[String],
+        ctes: &[Cte],
         lookup: &dyn Fn(&str) -> Option<TableDef>,
     ) {
+        let is_cte = |r: &pg_query::protobuf::RangeVar| {
+            r.schemaname.is_empty() && ctes.iter().any(|(n, _)| *n == r.relname)
+        };
         match item.node.as_ref() {
-            Some(N::RangeVar(r)) if !r.schemaname.is_empty() || !ctes.contains(&r.relname) => {
+            // A CTE: typed from its query, as a FROM subquery is.
+            Some(N::RangeVar(r)) if is_cte(r) => {
+                let def = ctes
+                    .iter()
+                    .rev()
+                    .find(|(n, _)| *n == r.relname)
+                    .and_then(|(_, q)| q.as_ref());
+                let alias = r
+                    .alias
+                    .as_ref()
+                    .map(|a| a.aliasname.clone())
+                    .filter(|a| !a.is_empty())
+                    .unwrap_or_else(|| r.relname.clone());
+                let colnames = r
+                    .alias
+                    .as_ref()
+                    .map(|a| a.colnames.clone())
+                    .unwrap_or_default();
+                match def {
+                    Some(q) => self.add_derived(alias, &colnames, q, ctes, lookup),
+                    None => self.complete = false,
+                }
+            }
+            Some(N::RangeSubselect(rs)) if !rs.lateral => {
+                let alias = rs
+                    .alias
+                    .as_ref()
+                    .map(|a| a.aliasname.clone())
+                    .unwrap_or_default();
+                let colnames = rs
+                    .alias
+                    .as_ref()
+                    .map(|a| a.colnames.clone())
+                    .unwrap_or_default();
+                match rs.subquery.as_deref().and_then(|n| n.node.as_ref()) {
+                    Some(N::SelectStmt(q)) if !alias.is_empty() => {
+                        self.add_derived(alias, &colnames, q, ctes, lookup)
+                    }
+                    _ => self.complete = false,
+                }
+            }
+            Some(N::RangeVar(r)) if !is_cte(r) => {
                 let name = if r.schemaname.is_empty() || r.schemaname == "public" {
                     r.relname.clone()
                 } else {
@@ -99,7 +146,67 @@ impl<'p> Scope<'p> {
         }
     }
 
+    /// A derived table -- a FROM subquery or a CTE -- whose columns are
+    /// typed from its select list. A column this cannot type is still a
+    /// column (so an unqualified name resolves among the known ones); it is
+    /// just never judged.
+    fn add_derived(
+        &mut self,
+        alias: String,
+        colnames: &[pg_query::protobuf::Node],
+        q: &pg_query::protobuf::SelectStmt,
+        ctes: &[Cte],
+        lookup: &dyn Fn(&str) -> Option<TableDef>,
+    ) {
+        if q.op != pg_query::protobuf::SetOperation::SetopNone as i32 || !q.values_lists.is_empty()
+        {
+            self.complete = false;
+            return;
+        }
+        let inner = Scope::new(&q.from_clause, ctes, lookup, None);
+        let mut columns = Vec::new();
+        for (i, t) in q.target_list.iter().enumerate() {
+            let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+                self.complete = false;
+                return;
+            };
+            let Some(val) = rt.val.as_deref() else {
+                self.complete = false;
+                return;
+            };
+            // `*` expands to columns this does not list.
+            if let Some(N::ColumnRef(c)) = val.node.as_ref() {
+                if c.fields.iter().any(|f| matches!(f.node, Some(N::AStar(_)))) {
+                    self.complete = false;
+                    return;
+                }
+            }
+            let named = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            };
+            let name = colnames
+                .get(i)
+                .and_then(named)
+                .or_else(|| (!rt.name.is_empty()).then(|| rt.name.clone()))
+                .or_else(|| match val.node.as_ref() {
+                    Some(N::ColumnRef(c)) => c.fields.last().and_then(named),
+                    Some(N::FuncCall(f)) => func_name(f),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "?column?".to_string());
+            let ty = operand_type(val, &inner).unwrap_or_default();
+            columns.push(Column::new(&name, &ty, true));
+        }
+        self.tables
+            .push((alias.clone(), TableDef::new(&alias, columns)));
+    }
+
     fn column_type(&self, c: &pg_query::protobuf::ColumnRef) -> Option<String> {
+        self.column_type_raw(c).filter(|t| !t.is_empty())
+    }
+
+    fn column_type_raw(&self, c: &pg_query::protobuf::ColumnRef) -> Option<String> {
         let parts: Vec<&str> = c
             .fields
             .iter()
@@ -149,6 +256,23 @@ fn operand_type(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<String> {
         }
         N::ColumnRef(c) => scope.column_type(c),
         N::ParamRef(p) => declared_param_type(usize::try_from(p.number).ok()?),
+        // Arithmetic over two numbers is a number: `a + 0` is numeric, so
+        // `a + 0 = 'x'::text` is judged like `a = 'x'::text`.
+        N::AExpr(e)
+            if pg_query::protobuf::AExprKind::try_from(e.kind)
+                == Ok(pg_query::protobuf::AExprKind::AexprOp)
+                && matches!(op_of(e).as_deref(), Some("+" | "-" | "*" | "/" | "%")) =>
+        {
+            let l = operand_type(e.lexpr.as_deref()?, scope)?;
+            let r = operand_type(e.rexpr.as_deref()?, scope)?;
+            (category(&l) == Some("numeric") && category(&r) == Some("numeric")).then(|| {
+                if l == r {
+                    l
+                } else {
+                    "numeric".to_string()
+                }
+            })
+        }
         _ => None,
     }
 }
@@ -179,6 +303,24 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
         return Ok(());
     }
     let kind = K::try_from(e.kind).ok();
+    // A COMPOSITE has only the record operators, and those only against the
+    // same type: beside any other typed operand there is no operator at all
+    // (`integer + point_t`, `point_t = integer`), and a user cast never
+    // supplies one.
+    if kind == Some(K::AexprOp) {
+        let side = |n: Option<&pg_query::protobuf::Node>| n.and_then(|n| operand_type(n, scope));
+        if let (Some(l), Some(r)) = (side(e.lexpr.as_deref()), side(e.rexpr.as_deref())) {
+            let composite = |t: &str| user_composite(t).is_some();
+            if (composite(&l) || composite(&r))
+                && user_casts::type_oid(&l) != user_casts::type_oid(&r)
+                && l != "record"
+                && r != "record"
+            {
+                let op = if op == "!=" { "<>" } else { op.as_str() };
+                return Err(mismatch(op, &l, &r, e.location));
+            }
+        }
+    }
     let Some(l) = e.lexpr.as_deref().and_then(|n| operand_type(n, scope)) else {
         return Ok(());
     };
@@ -229,7 +371,7 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
 /// What a walk needs to open a subquery's own scope.
 struct Cx<'a> {
     lookup: &'a dyn Fn(&str) -> Option<TableDef>,
-    ctes: Vec<String>,
+    ctes: Vec<Cte>,
 }
 
 /// Walk an expression; a subquery is checked in a scope of its own whose
@@ -291,6 +433,25 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
                 check_select(sel, &cx.ctes, cx.lookup, Some(scope))?;
             }
         }
+        N::FuncCall(f) => {
+            // `min` / `max` have no boolean form (`bool_and` / `bool_or` do
+            // that job): a missing function, whatever the query's shape.
+            if let (Some(name), [arg]) = (func_name(f), f.args.as_slice()) {
+                if matches!(name.as_str(), "min" | "max")
+                    && !correlated::user_function_named(&name)
+                    && operand_type(arg, scope)
+                        .is_some_and(|t| matches!(t.as_str(), "bool" | "boolean"))
+                {
+                    set_error_location(f.location);
+                    return Err(Error::UndefinedFunction(format!(
+                        "function {name}(boolean) does not exist"
+                    )));
+                }
+            }
+            for a in &f.args {
+                walk(a, scope, cx)?;
+            }
+        }
         // A FROM subquery sees the outer query only when it is LATERAL.
         N::RangeSubselect(rs) => {
             if let Some(N::SelectStmt(sel)) = rs.subquery.as_deref().and_then(|n| n.node.as_ref()) {
@@ -304,7 +465,7 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
 
 fn check_select(
     s: &pg_query::protobuf::SelectStmt,
-    outer_ctes: &[String],
+    outer_ctes: &[Cte],
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     parent: Option<&Scope>,
 ) -> Result<()> {
@@ -312,7 +473,11 @@ fn check_select(
     if let Some(w) = &s.with_clause {
         for c in &w.ctes {
             if let Some(N::CommonTableExpr(c)) = c.node.as_ref() {
-                ctes.push(c.ctename.clone());
+                let query = match c.ctequery.as_deref().and_then(|n| n.node.as_ref()) {
+                    Some(N::SelectStmt(q)) if !w.recursive => Some((**q).clone()),
+                    _ => None,
+                };
+                ctes.push((c.ctename.clone(), query));
             }
         }
     }

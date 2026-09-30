@@ -8632,6 +8632,77 @@ def test_prepared_transaction_survives_a_restart(home: Path) -> None:
         assert conn.execute("select count(*) from pg_prepared_xacts").fetchone() == (0,)
 
 
+def test_a_recovered_prepared_transaction_still_holds_its_rows(home: Path) -> None:
+    """After a restart a prepared transaction keeps its rows, as PostgreSQL's does.
+
+    It used to be RECORDED but not live, so it held nothing: another session
+    updated the row and committed, then COMMIT PREPARED replayed the old write
+    over it and the committed value was silently lost. Now the writer waits
+    for the transaction (55P03 under lock_timeout) and the commit is the only
+    write.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table tpc_hold (id int primary key, n int)")
+        conn.execute("insert into tpc_hold values (1, 0), (2, 0)")
+        conn.execute("begin")
+        conn.execute("update tpc_hold set n = 5 where id = 1")
+        conn.execute("delete from tpc_hold where id = 2")
+        conn.execute("prepare transaction 'p-hold'")
+
+    for _ in range(2):  # revived on every open, not just the first
+        with _Server(home) as server, server.connect() as conn:
+            assert conn.execute("select id, n from tpc_hold order by id").fetchall() == [
+                (1, 0),
+                (2, 0),
+            ]
+            conn.execute("set lock_timeout = '200ms'")
+            assert _sqlstate(conn, "update tpc_hold set n = 7 where id = 1") == "55P03"
+            assert _sqlstate(conn, "update tpc_hold set n = 7 where id = 2") == "55P03"
+
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("commit prepared 'p-hold'")
+        assert conn.execute("select id, n from tpc_hold order by id").fetchall() == [(1, 5)]
+        conn.execute("update tpc_hold set n = 6 where id = 1")
+        assert conn.execute("select n from tpc_hold").fetchall() == [(6,)]
+
+
+def test_a_blocks_earlier_write_survives_a_later_conflict(home: Path) -> None:
+    """A write that loses a conflict never takes the block's earlier writes with it.
+
+    The retry on a fresh transaction is only invisible for a transaction that
+    has not written. The check read a flag the snapshot refresh sets, BEFORE
+    the refresh ran, so a block's second UPDATE that waited on another
+    session rolled back and retried -- and the block's first UPDATE vanished
+    while both statements and the COMMIT reported success. The block now
+    fails whole (40001) and nothing it wrote is half-kept.
+    """
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        a.execute("create table tq_c (id int primary key, n int)")
+        a.execute("insert into tq_c values (1, 0), (2, 0)")
+        b.execute("begin")
+        b.execute("update tq_c set n = n + 1 where id = 2")
+        a.execute("begin")
+        a.execute("update tq_c set n = n + 1 where id = 1")
+        outcome: dict[str, str] = {}
+
+        def second_write() -> None:
+            outcome["b"] = _sqlstate(b, "update tq_c set n = n + 10 where id = 1") or "ok"
+
+        t = threading.Thread(target=second_write)
+        t.start()
+        time.sleep(0.5)
+        a.execute("commit")
+        t.join(10)
+        b.execute("commit")
+        rows = a.execute("select id, n from tq_c order by id").fetchall()
+        # Either the whole block (PostgreSQL waits and applies both) or
+        # none of it -- never its second write without its first.
+        assert (outcome["b"], rows) in [
+            ("ok", [(1, 11), (2, 1)]),
+            ("40001", [(1, 1), (2, 0)]),
+        ]
+
+
 def test_prepared_gid_is_byte_exact(home: Path) -> None:
     """A gid is an arbitrary string up to 199 bytes: quotes, unicode and the
     empty string all round-trip through pg_prepared_xacts unchanged, and the
@@ -9750,9 +9821,10 @@ def test_select_distinct_over_an_aggregate(home: Path) -> None:
             ("2", "2"),
             ("3", "1"),
         ]
-        with pytest.raises(psycopg.Error) as exc:
-            conn.execute("select distinct on (g) g, count(*) from t group by g").fetchall()
-        assert exc.value.sqlstate == "0A000"
+        # DISTINCT ON over the groups: one row per key, the first in ORDER BY.
+        assert _rows(
+            conn, "select distinct on (g) g, count(*) from t group by g order by g desc"
+        ) == [("3", "1"), ("2", "2"), ("1", "2")]
 
 
 def test_update_and_delete_returning(home: Path) -> None:
@@ -13842,7 +13914,10 @@ def test_drop_extension_cascade_drops_dependent_columns(home: Path) -> None:
 def test_text_search_configurations_for_every_language(home: Path) -> None:
     """Every PostgreSQL text-search configuration stems as PostgreSQL does:
     its Snowball stemmer and stop-word list; `russian` sends ASCII words to
-    the English stemmer; any non-ASCII character is a letter (C locale)."""
+    the English stemmer; under the `C.UTF-8` locale the server reports,
+    every letter lowercases and only letters make words (PostgreSQL 15 on a
+    UTF-8 locale; a `C` locale would call every non-ASCII character a letter
+    and fold ASCII only)."""
     with _Server(home) as server, server.connect() as conn:
         assert _fetch(
             conn,
@@ -13854,8 +13929,8 @@ def test_text_search_configurations_for_every_language(home: Path) -> None:
             (
                 "'chat':2 'le':1 'mang':3 'sour':5",
                 "'frass':3 'katz':2 'maus':4",
-                "'run':2 'Кошк':1",
-                "'a—b':2 '«bonjour»':1",
+                "'run':2 'кошк':1",
+                "'a':2 'b':3 'bonjour':1",
             )
         ]
         assert _fetch(conn, "SELECT to_tsvector('basque', 'etxea')::text") == [("'etxea':1",)]

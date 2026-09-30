@@ -165,14 +165,24 @@ pub struct UserTransactionHandle {
     /// dirty is roughly twice this; `with_user_transaction` enforces the
     /// cache-derived budget against it after every statement.
     dirty_bytes: u64,
+    /// When the transaction was opened, in Unix microseconds: SQL's
+    /// transaction start (`now()`).
+    opened_at: i64,
 }
 
 impl UserTransactionHandle {
     /// Has the transaction written anything? Until it has, abandoning it and
     /// starting afresh is invisible at READ COMMITTED -- which is how a
     /// server retries a statement whose first write lost a conflict.
+    /// When the transaction was opened, in Unix microseconds.
+    pub fn opened_at_micros(&self) -> i64 {
+        self.opened_at
+    }
+
     pub fn has_written(&self) -> bool {
-        self.snapshot_fixed
+        // Any evidence counts: the sticky flag a snapshot refresh sets, or
+        // what this transaction's statements have already emitted.
+        self.snapshot_fixed || self.dirty_bytes > 0 || !self.minted_ranges.is_empty()
     }
 }
 
@@ -4494,6 +4504,7 @@ impl Storage {
         // Finish any chunked drop a crash interrupted (registry row already
         // gone; the leftover rows must not resurface under a re-created name).
         storage.recover_pending_drops()?;
+        storage.revive_prepared_xacts()?;
         Ok(storage)
     }
 
@@ -6359,6 +6370,9 @@ impl Storage {
             oplog: Arc::clone(&self.oplog),
             oplog_cv: Arc::clone(&self.oplog_cv),
             dirty_bytes: 0,
+            opened_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_micros() as i64),
         })
     }
 
@@ -6822,6 +6836,83 @@ impl Storage {
             Err(e) if e.is_not_found() => Ok(false),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Bring every prepared transaction recorded by a previous run of the
+    /// process back as a LIVE one: its write set is replayed into an open,
+    /// uncommitted transaction and parked in `prepared_xacts`, exactly as
+    /// `prepare_user_transaction` left it before the restart.
+    ///
+    /// A prepared transaction holds its rows until COMMIT / ROLLBACK
+    /// PREPARED. Recorded but not live, it held nothing: another session
+    /// updated one of its rows and committed, and COMMIT PREPARED then
+    /// replayed the old write over it -- a committed write silently lost.
+    /// Live, the uncommitted rows are WiredTiger's, and a conflicting writer
+    /// waits for the transaction as it would in PostgreSQL.
+    fn revive_prepared_xacts(&self) -> Result<()> {
+        let session = self.conn.open_session()?;
+        let mut rows = Vec::new();
+        {
+            let cur = match session.open_cursor(PREPARED_XACT_TABLE, None) {
+                Ok(c) => c,
+                Err(e) if e.is_not_found() => return Ok(()),
+                Err(e) => return Err(e.into()),
+            };
+            while cur.next()? {
+                rows.push(decode_doc(&cur.get_value_u()?)?);
+            }
+        }
+        for mut row in rows {
+            let gid = row.get_str("gid").unwrap_or_default().to_string();
+            // It committed before the crash that left its record behind.
+            if self.prepared_already_committed(&row)? {
+                Self::delete_prepared_row(&session, &gid)?;
+                continue;
+            }
+            let ops: Vec<Document> = row
+                .get_array("ops")
+                .map_err(|_| {
+                    StorageError::Internal("prepared transaction record lacks ops".into())
+                })?
+                .iter()
+                .map(|b| match b {
+                    Bson::Binary(bin) => decode_doc(&bin.bytes),
+                    _ => Err(StorageError::Internal(
+                        "prepared transaction record: malformed op".into(),
+                    )),
+                })
+                .collect::<Result<_>>()?;
+            let mut handle = self.begin_user_transaction()?;
+            let applied = self.with_user_transaction(&mut handle, || -> Result<()> {
+                for op in &ops {
+                    replay::apply_entry_strict(self, op)?;
+                }
+                Ok(())
+            });
+            if let Err(e) = applied.and_then(|r| r) {
+                self.rollback_user_transaction(&mut handle)?;
+                return Err(e);
+            }
+            // The revived transaction minted its own oplog seqs; the record
+            // points at those now, so a crash after its commit is still
+            // recognised as committed on the next open.
+            let minted: Vec<Bson> = handle
+                .minted_ranges
+                .iter()
+                .flat_map(|(start, end)| [Bson::Int64(*start), Bson::Int64(*end)])
+                .collect();
+            row.insert("minted", minted);
+            let cur = session.open_cursor(PREPARED_XACT_TABLE, None)?;
+            cur.set_key_s(&gid);
+            cur.set_value_u(&encode_doc(&row)?);
+            cur.update()?;
+            drop(cur);
+            self.prepared_xacts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(gid, handle);
+        }
+        Ok(())
     }
 
     /// `COMMIT PREPARED`. A transaction still open in this process commits as

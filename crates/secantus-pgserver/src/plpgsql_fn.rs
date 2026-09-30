@@ -89,7 +89,12 @@ impl Record {
 }
 
 /// A trigger invocation's special variables.
+/// `TriggerData::level` for an event trigger: `op` is the command tag
+/// (`TG_TAG`) and `when` the event (`TG_EVENT`).
+pub const EVENT_LEVEL: &str = "EVENT";
+
 #[derive(Debug, Clone, Default)]
+
 pub struct TriggerData {
     pub new: Option<Record>,
     pub old: Option<Record>,
@@ -493,6 +498,14 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
     match interp.stmt(&action)? {
         Flow::Return(o) => Ok(o),
         _ if interp.returns_set => Ok(Outcome::Rows(std::mem::take(&mut interp.set_rows))),
+        // An event trigger function returns nothing.
+        _ if interp
+            .trigger
+            .as_ref()
+            .is_some_and(|t| t.level == EVENT_LEVEL) =>
+        {
+            Ok(Outcome::Value(Bson::Null))
+        }
         _ if interp.trigger.is_some() => Err(PlError::new(
             "2F005",
             "control reached end of trigger procedure without RETURN",
@@ -626,6 +639,13 @@ impl Interp<'_> {
     fn trigger_scalar(&self, name: &str) -> Option<(Bson, String)> {
         let t = self.trigger.as_ref()?;
         let text = |s: &str| Some((Bson::String(s.to_string()), "text".to_string()));
+        if t.level == EVENT_LEVEL {
+            return match name {
+                "tg_event" => text(&t.when),
+                "tg_tag" => text(&t.op),
+                _ => None,
+            };
+        }
         match name {
             "tg_op" => text(&t.op),
             "tg_name" => text(&t.name),

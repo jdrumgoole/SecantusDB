@@ -26,6 +26,11 @@ chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 # reason on the MongoDB side.
 chrono-tz = { version = "0.10", default-features = false }
 pg_query = "6"
+# pg_query hands its parse tree over as protobuf, and prost refuses a message
+# nested past 100 levels -- a 50-term `a || b || ...` was a 42601 "Error
+# decoding result". PostgreSQL takes 1,000 terms; depth is policed by the
+# planner's own 54001 guard (`check_depth`) instead.
+prost = { version = "0.13", features = ["no-recursion-limit"] }
 secantus-pgcatalog = { path = "../secantus-pgcatalog" }
 # `numeric` arithmetic beyond Decimal128's 34 digits: PostgreSQL's numeric is
 # arbitrary precision, and a sum or product of two wide values has to be exact.
@@ -50,3 +55,14 @@ hmac = "0.12"
 md-5 = "0.10"
 sha1 = "0.10"
 getrandom = "0.2"
+# pgcrypto's `pgp_sym_*`: OpenPGP symmetric encryption (RFC 4880) with the
+# ciphers pgcrypto offers and its ZIP / ZLIB compression packets.
+aes = "0.8"
+des = "0.8"
+blowfish = "0.9"
+cast5 = "0.11"
+flate2 = "1"
+# ICU collation (`COLLATE "und-x-icu"`, `CREATE COLLATION ... provider = icu`):
+# the CLDR root collation and its tailorings, compiled in.
+icu_collator = "2"
+icu_locale = "2"
