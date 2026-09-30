@@ -1042,8 +1042,24 @@ pub enum AlterTableAction {
         column: String,
         pg_type: String,
         typmod: i32,
+        /// `USING <expr>`: the new value computed from the row, as SQL
+        /// (planned by the executor over the table), instead of a cast.
+        using: Option<String>,
     },
     AddCheck(CheckConstraint),
+    /// `ADD [CONSTRAINT n] UNIQUE (...)`: checked against the rows already
+    /// there, then enforced by a unique index.
+    AddUnique(UniqueConstraint),
+    /// `ADD [CONSTRAINT n] PRIMARY KEY (...)`: the columns become NOT NULL
+    /// and the key -- every stored row re-keyed by them, as a CREATE TABLE
+    /// key would have stored it.
+    AddPrimaryKey {
+        name: String,
+        columns: Vec<String>,
+    },
+    /// `ADD [CONSTRAINT n] FOREIGN KEY ...`: checked against the rows already
+    /// there, then enforced on every write.
+    AddForeignKey(ForeignKey),
     DropConstraint {
         name: String,
         if_exists: bool,
@@ -3836,11 +3852,9 @@ fn plan_alter_action(
             let Some(N::ColumnDef(cd)) = cmd.def.as_ref().and_then(|d| d.node.as_ref()) else {
                 return Err(Error::Parse("ALTER COLUMN TYPE without a type".into()));
             };
-            // `USING <expr>` rewrites the value rather than casting it, which
-            // is a different conversion; refused rather than silently cast.
-            if cd.raw_default.is_some() {
-                return Err(Error::Unsupported("ALTER COLUMN TYPE ... USING".into()));
-            }
+            // `USING <expr>` computes the new value from the row instead of
+            // casting the old one, so the automatic-cast rule does not apply.
+            let using = cd.raw_default.as_deref().map(deparse_expr).transpose()?;
             let ty = cd
                 .type_name
                 .as_ref()
@@ -3857,7 +3871,7 @@ fn plan_alter_action(
             // `text -> int` succeed on a table whose values were all digits
             // and answer `22P02` on one whose values were not -- neither of
             // which is what PostgreSQL does.
-            if !alter_type_is_automatic(&current.pg_type, &ty) {
+            if using.is_none() && !alter_type_is_automatic(&current.pg_type, &ty) {
                 return Err(Error::DatatypeMismatch(format!(
                     "column \"{}\" cannot be cast automatically to type {}",
                     cmd.name,
@@ -3868,19 +3882,47 @@ fn plan_alter_action(
                 column: cmd.name.clone(),
                 pg_type: ty,
                 typmod: cd.type_name.as_ref().map(declared_typmod).unwrap_or(-1),
+                using,
             })
         }
         Ok(AT::AtAddConstraint) => {
             let Some(N::Constraint(k)) = cmd.def.as_ref().and_then(|d| d.node.as_ref()) else {
                 return Err(Error::Parse("ADD CONSTRAINT without a constraint".into()));
             };
-            if CT::try_from(k.contype) != Ok(CT::ConstrCheck) {
-                // UNIQUE / PRIMARY KEY / FOREIGN KEY added after the fact each
-                // need an index built over the rows already there, which is
-                // the `CREATE INDEX` work rather than this.
-                return Err(Error::Unsupported(
-                    "ALTER TABLE ADD CONSTRAINT of this kind".into(),
-                ));
+            match CT::try_from(k.contype) {
+                Ok(CT::ConstrCheck) => {}
+                Ok(CT::ConstrUnique) => {
+                    let cols = string_list(&k.keys);
+                    let name = if k.conname.is_empty() {
+                        format!("{table}_{}_key", cols.join("_"))
+                    } else {
+                        k.conname.clone()
+                    };
+                    let mut uq = UniqueConstraint::new(&name, cols);
+                    uq.deferrable = k.deferrable;
+                    uq.initially_deferred = k.initdeferred;
+                    uq.nulls_not_distinct = k.nulls_not_distinct;
+                    return Ok(AlterTableAction::AddUnique(uq));
+                }
+                Ok(CT::ConstrPrimary) => {
+                    return Ok(AlterTableAction::AddPrimaryKey {
+                        name: if k.conname.is_empty() {
+                            format!("{table}_pkey")
+                        } else {
+                            k.conname.clone()
+                        },
+                        columns: string_list(&k.keys),
+                    });
+                }
+                Ok(CT::ConstrForeign) => {
+                    let cols = string_list(&k.fk_attrs);
+                    return Ok(AlterTableAction::AddForeignKey(foreign_key_of(k, table, cols)?));
+                }
+                _ => {
+                    return Err(Error::Unsupported(
+                        "ALTER TABLE ADD CONSTRAINT of this kind".into(),
+                    ))
+                }
             }
             let raw = k
                 .raw_expr
@@ -3910,6 +3952,7 @@ fn plan_alter_action(
                 name,
                 expression,
                 comment: None,
+                not_valid: k.skip_validation,
             }))
         }
         Ok(AT::AtDropConstraint) => Ok(AlterTableAction::DropConstraint {
@@ -4163,8 +4206,12 @@ pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
         },
         AlterTableAction::RowSecurity { .. }
         | AlterTableAction::AttachPartition { .. }
-        | AlterTableAction::DetachPartition(_)
-        | AlterTableAction::ValidateConstraint(_) => {}
+        | AlterTableAction::DetachPartition(_) => {}
+        AlterTableAction::ValidateConstraint(name) => {
+            for c in def.check_constraints.iter_mut().filter(|c| c.name == *name) {
+                c.not_valid = false;
+            }
+        }
         AlterTableAction::AddColumn { column, .. } => {
             if def.column(&column.name).is_none() {
                 def.columns.push(column.clone());
@@ -4202,6 +4249,7 @@ pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
             column,
             pg_type,
             typmod,
+            ..
         } => {
             if let Some(c) = def.columns.iter_mut().find(|c| c.name == *column) {
                 c.pg_type = pg_type.clone();
@@ -4212,6 +4260,20 @@ pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
             def.check_constraints.push(check.clone());
             def.check_constraints.sort_by(|a, b| a.name.cmp(&b.name));
         }
+        AlterTableAction::AddUnique(uq) => def.unique_constraints.push(uq.clone()),
+        AlterTableAction::AddPrimaryKey { columns, .. } => {
+            // The key is the document `_id`, as a CREATE TABLE key is: the
+            // value itself for one column, a subdocument of the key columns
+            // in TABLE-column order for several. The executor moves every
+            // stored row's values to match.
+            let composite = columns.len() > 1;
+            for c in def.columns.iter_mut().filter(|c| columns.contains(&c.name)) {
+                c.pk = true;
+                c.nullable = false;
+                c.field_override = composite.then(|| format!("_id.{}", c.name));
+            }
+        }
+        AlterTableAction::AddForeignKey(fk) => def.foreign_keys.push(fk.clone()),
         AlterTableAction::DropConstraint { name, .. } => {
             def.check_constraints.retain(|c| c.name != *name);
             def.unique_constraints.retain(|u| u.name != *name);
@@ -5716,6 +5778,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
             name,
             expression,
             comment: None,
+            not_valid: false,
         });
     }
     // PostgreSQL evaluates CHECK constraints in name order.

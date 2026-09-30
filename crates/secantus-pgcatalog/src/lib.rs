@@ -304,6 +304,10 @@ pub struct CheckConstraint {
     pub expression: String,
     /// `COMMENT ON CONSTRAINT`, shared with the Python server.
     pub comment: Option<String>,
+    /// Added `NOT VALID`: enforced on new writes, not yet checked against the
+    /// rows already there (`VALIDATE CONSTRAINT` does that). Recorded only
+    /// when set, so the shared shape is unchanged otherwise.
+    pub not_valid: bool,
 }
 
 /// A declared UNIQUE constraint, in the Python server's on-disk shape
@@ -424,11 +428,15 @@ pub struct ForeignKey {
 
 impl CheckConstraint {
     pub fn to_document(&self) -> Document {
-        doc! {
+        let mut d = doc! {
             "name": &self.name,
             "expression": &self.expression,
             "comment": self.comment.clone().map_or(Bson::Null, Bson::String),
+        };
+        if self.not_valid {
+            d.insert("not_valid", true);
         }
+        d
     }
 
     pub fn from_document(d: &Document) -> Option<Self> {
@@ -436,6 +444,7 @@ impl CheckConstraint {
             name: d.get_str("name").ok()?.to_string(),
             expression: d.get_str("expression").ok()?.to_string(),
             comment: d.get_str("comment").ok().map(str::to_string),
+            not_valid: d.get_bool("not_valid").unwrap_or(false),
         })
     }
 }

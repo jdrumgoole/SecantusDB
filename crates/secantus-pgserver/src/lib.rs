@@ -4998,6 +4998,105 @@ impl PgHandler {
         Ok(())
     }
 
+    /// The rows already in `table` against a new UNIQUE (or PRIMARY KEY) over
+    /// `columns`: a key two rows share is PostgreSQL's 23505 `could not
+    /// create unique index`. Rows with a NULL in the key do not collide
+    /// unless NULLs are not distinct.
+    fn check_existing_unique(
+        &self,
+        table: &str,
+        def: &TableDef,
+        name: &str,
+        columns: &[String],
+        nulls_not_distinct: bool,
+    ) -> PgWireResult<()> {
+        let fields: Vec<String> = columns
+            .iter()
+            .map(|c| def.field_of(c).unwrap_or_else(|| c.clone()))
+            .collect();
+        let mut seen: Vec<Vec<Bson>> = Vec::new();
+        for d in self.table_docs(table)? {
+            let key: Vec<Bson> = fields
+                .iter()
+                .map(|f| d.get(f).cloned().unwrap_or(Bson::Null))
+                .collect();
+            if !nulls_not_distinct && key.contains(&Bson::Null) {
+                continue;
+            }
+            if seen.iter().any(|k| {
+                k.iter().zip(&key).all(|(a, b)| {
+                    secantus_pgplan::compare_values(a, b) == Some(std::cmp::Ordering::Equal)
+                        || (*a == Bson::Null && *b == Bson::Null)
+                })
+            }) {
+                let shown: Vec<String> = key
+                    .iter()
+                    .map(|v| {
+                        if *v == Bson::Null {
+                            "null".into()
+                        } else {
+                            secantus_pgplan::value_text(v)
+                        }
+                    })
+                    .collect();
+                let mut info = ErrorInfo::new(
+                    "ERROR".into(),
+                    "23505".into(),
+                    format!("could not create unique index \"{name}\""),
+                );
+                info.detail = Some(format!(
+                    "Key ({})=({}) is duplicated.",
+                    columns.join(", "),
+                    shown.join(", ")
+                ));
+                return Err(PgWireError::UserError(Box::new(info)));
+            }
+            seen.push(key);
+        }
+        Ok(())
+    }
+
+    /// A duplicate key raised while a table's rows are REWRITTEN (a type
+    /// change) is the index rebuild failing, which PostgreSQL reports as
+    /// `could not create unique index`.
+    fn unique_rebuild_error(e: PgWireError, def: &TableDef) -> PgWireError {
+        let text = e.to_string();
+        let Some(index) = def
+            .unique_constraints
+            .iter()
+            .map(|u| u.name.clone())
+            .chain(std::iter::once(format!("{}_pkey", def.name)))
+            .find(|n| text.contains(n.as_str()))
+        else {
+            return e;
+        };
+        if !(text.contains("duplicate key") || text.contains("E11000")) {
+            return e;
+        }
+        Self::user_error("23505", format!("could not create unique index \"{index}\""))
+    }
+
+    /// Insert `docs` into `coll`, failing on the first write error. The
+    /// storage insert REPORTS a rejected document (a duplicate key) in its
+    /// result rather than failing, so a caller that drops the result drops the
+    /// row with it -- which is how a table rewrite once lost rows silently.
+    fn insert_checked(&self, coll: &str, docs: Vec<Vec<u8>>, context: &str) -> PgWireResult<usize> {
+        let (n, errors) = self
+            .storage
+            .insert(self.db(), coll, docs, true)
+            .map_err(|e| Self::storage_err(context, e))?;
+        if let Some(first) = errors.first() {
+            return Err(match self.lookup(coll) {
+                Some(def) => Self::write_error(coll, &def, first),
+                None => Self::storage_err(
+                    context,
+                    first.get_str("errmsg").unwrap_or("a document was rejected"),
+                ),
+            });
+        }
+        Ok(n)
+    }
+
     /// 42P01 for a relation that does not exist.
     fn relation_missing(name: &str) -> PgWireError {
         Self::user_error("42P01", format!("relation \"{name}\" does not exist"))
@@ -5114,12 +5213,7 @@ impl PgHandler {
                 .iter()
                 .map(|d| encode_doc(d).map_err(|e| Self::storage_err("could not encode a row", e)))
                 .collect::<PgWireResult<Vec<_>>>()?;
-            self.storage
-                .delete_matching(self.db(), table, &Document::new(), 0, &Document::new(), None)
-                .map_err(|e| Self::storage_err("could not clear the table", e))?;
-            self.storage
-                .insert(self.db(), table, out, true)
-                .map_err(|e| Self::storage_err("could not rewrite the table", e))?;
+            self.replace_table_rows(table, out)?;
         }
         let record = self.plan_internal(&format!(
             "ALTER TABLE {} CLUSTER ON {}",
@@ -5786,9 +5880,7 @@ impl PgHandler {
         }
         let bytes =
             encode_doc(&doc).map_err(|e| Self::storage_err("could not encode the view", e))?;
-        self.storage
-            .insert(self.db(), Self::VIEW_COLLECTION, vec![bytes], true)
-            .map_err(|e| Self::storage_err("could not record the view", e))?;
+        self.insert_checked(Self::VIEW_COLLECTION, vec![bytes], "could not record the view")?;
         self.note_uncommitted_type(Self::VIEW_COLLECTION, &name, Some(doc));
         Ok(vec![Response::Execution(Tag::new("CREATE VIEW"))])
     }
@@ -5858,9 +5950,7 @@ impl PgHandler {
     ) -> PgWireResult<()> {
         let bytes =
             encode_doc(&doc).map_err(|e| Self::storage_err("could not encode the catalog", e))?;
-        self.storage
-            .insert(self.db(), collection, vec![bytes], true)
-            .map_err(|e| Self::storage_err("could not record the catalog", e))?;
+        self.insert_checked(collection, vec![bytes], "could not record the catalog")?;
         self.note_uncommitted_type(collection, id, Some(doc));
         Ok(())
     }
@@ -5909,9 +5999,7 @@ impl PgHandler {
         if let Some(d) = doc {
             let bytes =
                 encode_doc(&d).map_err(|e| Self::storage_err("could not encode the comment", e))?;
-            self.storage
-                .insert(self.db(), collection, vec![bytes], true)
-                .map_err(|e| Self::storage_err("could not record the comment", e))?;
+            self.insert_checked(collection, vec![bytes], "could not record the comment")?;
         }
         Ok(())
     }
@@ -7280,9 +7368,7 @@ impl PgHandler {
         let doc = bson::doc! {"_id": key, "next": oid + 1};
         let bytes = encode_doc(&doc)
             .map_err(|e| Self::storage_err("could not encode the oid counter", e))?;
-        self.storage
-            .insert(self.db(), Self::ENUM_META_COLLECTION, vec![bytes], true)
-            .map_err(|e| Self::storage_err("could not advance the oid counter", e))?;
+        self.insert_checked(Self::ENUM_META_COLLECTION, vec![bytes], "could not advance the oid counter")?;
         Ok(oid)
     }
 
@@ -7380,9 +7466,7 @@ impl PgHandler {
         let doc = bson::doc! {"_id": "oid_counter", "next": oid + 1};
         let bytes = encode_doc(&doc)
             .map_err(|e| Self::storage_err("could not encode the oid counter", e))?;
-        self.storage
-            .insert(self.db(), Self::ENUM_META_COLLECTION, vec![bytes], true)
-            .map_err(|e| Self::storage_err("could not advance the oid counter", e))?;
+        self.insert_checked(Self::ENUM_META_COLLECTION, vec![bytes], "could not advance the oid counter")?;
         Ok(oid)
     }
 
@@ -9515,6 +9599,7 @@ impl PgHandler {
                             let text = secantus_pgplan::generation_expression(&ck.expression)
                                 .unwrap_or_else(|| format!("({})", ck.expression));
                             row.insert(field("conbin"), text);
+                            row.insert(field("convalidated"), Bson::Boolean(!ck.not_valid));
                         }
                     }
                     for fk in &t.foreign_keys {
@@ -9850,21 +9935,35 @@ impl PgHandler {
         def: &TableDef,
     ) -> Result<(), PgWireError> {
         for uq in &def.unique_constraints {
+            Self::create_unique_index(storage, db, def, uq)?;
+        }
+        Ok(())
+    }
+
+    /// The storage index that enforces one UNIQUE constraint (or an added
+    /// PRIMARY KEY's uniqueness).
+    fn create_unique_index(
+        storage: &Arc<Storage>,
+        db: &str,
+        def: &TableDef,
+        uq: &secantus_pgcatalog::UniqueConstraint,
+    ) -> Result<(), PgWireError> {
+        {
             // An EXCLUDE over anything but `=` is not a uniqueness; the
             // executor enforces it row by row (`check_exclusions`).
             if !uq.exclusion_ops.is_empty() {
-                continue;
+                return Ok(());
             }
             if uq.deferrable {
                 // A DEFERRABLE constraint may be violated transiently inside a
                 // transaction and is judged at COMMIT — swapping two values is
                 // the classic case. An index enforcing on every write would
                 // reject the intermediate state.
-                continue;
+                return Ok(());
             }
             let fields: Vec<String> = uq.columns.iter().filter_map(|c| def.field_of(c)).collect();
             if fields.len() != uq.columns.len() {
-                continue;
+                return Ok(());
             }
             let mut key_spec = Document::new();
             for f in &fields {
@@ -11711,9 +11810,7 @@ impl PgHandler {
                     )
                     .map_err(|e| Self::storage_err("could not clear the table", e))?;
                 if !docs.is_empty() {
-                    self.storage
-                        .insert(self.db(), table, docs.clone(), true)
-                        .map_err(|e| Self::storage_err("could not restore the table", e))?;
+                    self.insert_checked(table, docs.clone(), "could not restore the table")?;
                 }
             }
         }
@@ -11754,6 +11851,47 @@ impl PgHandler {
                 return Ok(Some(action.clone()));
             }
             A::ClusterOn(None) => return Ok(Some(action.clone())),
+            A::AddUnique(uq) => {
+                for c in &uq.columns {
+                    if def.column(c).is_none() {
+                        return Err(missing_column(c));
+                    }
+                }
+                if self.relation_exists(&uq.name)? {
+                    return Err(Self::user_error(
+                        "42P07",
+                        format!("relation \"{}\" already exists", uq.name),
+                    ));
+                }
+                return Ok(Some(action.clone()));
+            }
+            A::AddPrimaryKey { columns, .. } => {
+                if def.columns.iter().any(|c| c.pk) {
+                    return Err(Self::user_error(
+                        "42P16",
+                        format!("multiple primary keys for table \"{table}\" are not allowed"),
+                    ));
+                }
+                for c in columns {
+                    if def.column(c).is_none() {
+                        return Err(missing_column(c));
+                    }
+                }
+                return Ok(Some(action.clone()));
+            }
+            A::AddForeignKey(fk) => {
+                for c in &fk.columns {
+                    if def.column(c).is_none() {
+                        return Err(missing_column(c));
+                    }
+                }
+                let target = self
+                    .lookup(&fk.ref_table)
+                    .ok_or_else(|| Self::relation_missing(&fk.ref_table))?;
+                let mut fk = fk.clone();
+                secantus_pgplan::resolve_fk_target(&mut fk, &target).map_err(|e| Self::err(&e))?;
+                return Ok(Some(A::AddForeignKey(fk)));
+            }
             A::ValidateConstraint(name) => {
                 let exists = def.check_constraints.iter().any(|c| c.name == *name)
                     || def.foreign_keys.iter().any(|f| f.name == *name)
@@ -11765,6 +11903,10 @@ impl PgHandler {
                         "42704".into(),
                         format!("constraint \"{name}\" of relation \"{table}\" does not exist"),
                     ))));
+                }
+                // A CHECK added NOT VALID is checked against the rows now.
+                if def.check_constraints.iter().any(|c| c.name == *name && c.not_valid) {
+                    return Ok(Some(action.clone()));
                 }
                 return Ok(None);
             }
@@ -11854,6 +11996,7 @@ impl PgHandler {
         table: &str,
         def: &TableDef,
         action: &secantus_pgplan::AlterTableAction,
+        before: &TableDef,
     ) -> PgWireResult<()> {
         use secantus_pgplan::AlterTableAction as A;
         match action {
@@ -11867,7 +12010,28 @@ impl PgHandler {
                 };
                 self.put_comment_doc(Self::RLS_COLLECTION, table, Some(doc))
             }
-            A::OwnerTo(_) | A::ValidateConstraint(_) | A::ClusterOn(_) => Ok(()),
+            A::ValidateConstraint(name) => {
+                let Some(check) = before.check_constraints.iter().find(|c| c.name == *name) else {
+                    return Ok(());
+                };
+                let mut check = check.clone();
+                check.not_valid = false;
+                self.apply_alter_rows(table, def, &A::AddCheck(check), before)
+            }
+            A::OwnerTo(_) | A::ClusterOn(_) => Ok(()),
+            A::AddUnique(uq) => {
+                self.check_existing_unique(table, def, &uq.name, &uq.columns, uq.nulls_not_distinct)?;
+                Self::create_unique_index(&self.storage, self.db(), def, uq)
+            }
+            A::AddPrimaryKey { name, columns } => {
+                self.add_primary_key(table, def, before, name, columns)
+            }
+            A::AddForeignKey(fk) => {
+                let mut only = def.clone();
+                only.foreign_keys = vec![fk.clone()];
+                let docs = self.table_docs(table)?;
+                self.check_foreign_keys(&only, &docs)
+            }
             A::AttachPartition { name, bound } => self.attach_partition(table, name, bound),
             A::DetachPartition(name) => self.detach_partition(table, name),
             // The rows are rewritten rather than left short a field, for two
@@ -11901,6 +12065,36 @@ impl PgHandler {
                 })
             }
             A::AlterType {
+                column,
+                pg_type,
+                using: Some(sql),
+                ..
+            } => {
+                // `USING <expr>`: the new value is the expression over the row
+                // as it stands, converted to the new type.
+                let field = def
+                    .column(column)
+                    .map(|c| c.field())
+                    .unwrap_or_else(|| column.clone());
+                // Over the row as it was: the column still has its OLD type.
+                let expr = secantus_pgplan::plan_check_expression(sql, before)
+                    .map_err(|e| Self::err(&e))?;
+                let ty = pg_type.clone();
+                let tz = self.session_timezone();
+                self.rewrite_rows(table, move |d| {
+                    let v = secantus_pgplan::apply_row_expr(&expr, d).map_err(|e| Self::err(&e))?;
+                    let v = if v == Bson::Null {
+                        v
+                    } else {
+                        secantus_pgplan::cast_value_with_tz(v, &ty, &tz)
+                            .map_err(|e| PgHandler::err(&e))?
+                    };
+                    d.insert(field.clone(), v);
+                    Ok(())
+                })
+                .map_err(|e| Self::unique_rebuild_error(e, def))
+            }
+            A::AlterType {
                 column, pg_type, ..
             } => {
                 let field = def
@@ -11927,6 +12121,8 @@ impl PgHandler {
             }
             // PostgreSQL VALIDATES a new CHECK against the rows already there,
             // and refuses the ALTER when one fails it.
+            // `NOT VALID` skips the rows already there.
+            A::AddCheck(check) if check.not_valid => Ok(()),
             A::AddCheck(check) => {
                 let expr = secantus_pgplan::plan_check_expression(&check.expression, def)
                     .map_err(|e| Self::err(&e))?;
@@ -11971,7 +12167,17 @@ impl PgHandler {
             }
             // A default, a dropped NOT NULL and a dropped constraint are
             // catalog-only: no row changes meaning.
-            A::SetDefault { .. } | A::SetNotNull { .. } | A::DropConstraint { .. } => Ok(()),
+            // A UNIQUE constraint's index goes with it (the other kinds have
+            // none; a missing index is nothing to drop).
+            A::DropConstraint { name, .. } => {
+                if before.unique_constraints.iter().any(|u| u.name == *name) {
+                    self.storage
+                        .drop_index(self.db(), table, name)
+                        .map_err(|e| Self::storage_err("could not drop the index", e))?;
+                }
+                Ok(())
+            }
+            A::SetDefault { .. } | A::SetNotNull { .. } => Ok(()),
         }
     }
 
@@ -11995,19 +12201,142 @@ impl PgHandler {
             f(&mut d)?;
             out.push(encode_doc(&d).map_err(|e| Self::storage_err("could not encode a row", e))?);
         }
-        self.storage
-            .delete_matching(
-                self.db(),
-                table,
-                &Document::new(),
-                0,
-                &Document::new(),
-                None,
-            )
-            .map_err(|e| Self::storage_err("could not clear the table", e))?;
-        self.storage
-            .insert(self.db(), table, out, true)
-            .map_err(|e| Self::storage_err("could not rewrite the table", e))?;
+        self.replace_table_rows(table, out)
+    }
+
+    /// Replace every row of `table` with `rows`, ATOMICALLY: the rewrite is a
+    /// delete of everything and an insert of the new rows, and outside a
+    /// transaction a failing insert (a key the new rows repeat) used to leave
+    /// the table EMPTIED -- the old rows deleted and committed, the new ones
+    /// never written. Inside a block the block's transaction already covers it.
+    fn replace_table_rows(&self, table: &str, rows: Vec<Vec<u8>>) -> PgWireResult<()> {
+        let run = || -> PgWireResult<()> {
+            self.storage
+                .delete_matching(self.db(), table, &Document::new(), 0, &Document::new(), None)
+                .map_err(|e| Self::storage_err("could not clear the table", e))?;
+            if !rows.is_empty() {
+                self.insert_checked(table, rows.clone(), "could not rewrite the table")?;
+            }
+            Ok(())
+        };
+        self.atomically(run)
+    }
+
+    /// Run `f` as one transaction: the open one if this thread has one,
+    /// otherwise its own, committed on success and rolled back on failure.
+    /// For a multi-write step that must not half-happen in autocommit.
+    fn atomically<T>(&self, f: impl FnOnce() -> PgWireResult<T>) -> PgWireResult<T> {
+        if self.storage.in_user_txn() {
+            return f();
+        }
+        let mut handle = self.open_transaction_handle()?;
+        let out = self
+            .storage
+            .with_user_transaction(&mut handle, f)
+            .map_err(|e| Self::storage_err("transaction failed", e))
+            .and_then(|r| r);
+        match out {
+            Ok(v) => {
+                self.storage
+                    .commit_user_transaction(&mut handle)
+                    .map_err(|e| Self::storage_err("could not commit a transaction", e))?;
+                Ok(v)
+            }
+            Err(e) => {
+                if let Err(re) = self.storage.rollback_user_transaction(&mut handle) {
+                    eprintln!("secantusd-pg: rolling back a failed statement step: {re}");
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// `ADD PRIMARY KEY`: the key columns must hold no NULL and no repeat,
+    /// and then every row is re-keyed -- its `_id` becomes the key (a
+    /// subdocument of the key columns, in table-column order, for several),
+    /// exactly as a CREATE TABLE key stores it -- and every index over a
+    /// moved column is rebuilt over its new field.
+    fn add_primary_key(
+        &self,
+        table: &str,
+        def: &TableDef,
+        before: &TableDef,
+        name: &str,
+        columns: &[String],
+    ) -> PgWireResult<()> {
+        let docs = self.table_docs(table)?;
+        let old: Vec<(String, String)> = before
+            .columns
+            .iter()
+            .filter(|c| columns.contains(&c.name))
+            .map(|c| (c.name.clone(), c.field()))
+            .collect();
+        for (col, field) in &old {
+            if docs.iter().any(|d| d.get(field).is_none_or(|v| *v == Bson::Null)) {
+                return Err(Self::user_error(
+                    "23502",
+                    format!("column \"{col}\" of relation \"{table}\" contains null values"),
+                ));
+            }
+        }
+        self.check_existing_unique(table, before, name, columns, false)?;
+        let composite = old.len() > 1;
+        let mut out = Vec::with_capacity(docs.len());
+        for mut d in docs {
+            let mut key = Document::new();
+            let mut single = Bson::Null;
+            for (col, field) in &old {
+                let v = d.remove(field).unwrap_or(Bson::Null);
+                if composite {
+                    key.insert(col.clone(), v);
+                } else {
+                    single = v;
+                }
+            }
+            d.insert("_id", if composite { Bson::Document(key) } else { single });
+            out.push(encode_doc(&d).map_err(|e| Self::storage_err("could not encode a row", e))?);
+        }
+        self.replace_table_rows(table, out)
+            .map_err(|e| Self::unique_rebuild_error(e, def))?;
+        // Indexes over a key column now read the column at its new field.
+        let moved: Vec<(String, String)> = old
+            .iter()
+            .map(|(col, field)| (field.clone(), def.field_of(col).unwrap_or_else(|| col.clone())))
+            .collect();
+        for ix in self.storage.list_indexes(self.db(), table).unwrap_or_default() {
+            let Ok(ix_name) = ix.get_str("name") else { continue };
+            if ix_name == "_id_" {
+                continue;
+            }
+            let Ok(key) = ix.get_document("key") else { continue };
+            if !key.keys().any(|k| moved.iter().any(|(from, _)| from == k)) {
+                continue;
+            }
+            let rename = |k: &str| -> String {
+                moved
+                    .iter()
+                    .find(|(from, _)| from == k)
+                    .map_or_else(|| k.to_string(), |(_, to)| to.clone())
+            };
+            let mut new_key = Document::new();
+            for (k, v) in key {
+                new_key.insert(rename(k), v.clone());
+            }
+            let mut options = Document::new();
+            for (k, v) in &ix {
+                if matches!(k.as_str(), "name" | "key" | "v" | "ns") {
+                    continue;
+                }
+                options.insert(k.clone(), rename_filter_fields(v, &rename));
+            }
+            let ix_name = ix_name.to_string();
+            self.storage
+                .drop_index(self.db(), table, &ix_name)
+                .map_err(|e| Self::storage_err("could not rebuild an index", e))?;
+            self.storage
+                .create_index(self.db(), table, &ix_name, &new_key, &options)
+                .map_err(|e| Self::storage_err("could not rebuild an index", e))?;
+        }
         Ok(())
     }
 
@@ -12034,9 +12363,7 @@ impl PgHandler {
         self.delete_catalog(name)?;
         let bytes = encode_doc(&def.to_document())
             .map_err(|e| Self::storage_err("could not encode the catalog entry", e))?;
-        self.storage
-            .insert(self.db(), CATALOG_COLLECTION, vec![bytes], true)
-            .map_err(|e| Self::storage_err("could not record the table", e))?;
+        self.insert_checked(CATALOG_COLLECTION, vec![bytes], "could not record the table")?;
         self.note_uncommitted(name, Some(def.clone()));
         Ok(())
     }
@@ -16138,9 +16465,7 @@ impl PgHandler {
                 Self::create_unique_indexes(&self.storage, self.db(), &def)?;
                 let bytes = encode_doc(&def.to_document())
                     .map_err(|e| Self::storage_err("could not encode the catalog entry", e))?;
-                self.storage
-                    .insert(self.db(), CATALOG_COLLECTION, vec![bytes], true)
-                    .map_err(|e| Self::storage_err("could not record the table", e))?;
+                self.insert_checked(CATALOG_COLLECTION, vec![bytes], "could not record the table")?;
                 // Each serial column's sequence, owned by the column so the
                 // table's DROP takes it along.
                 let sequences = def
@@ -16177,9 +16502,7 @@ impl PgHandler {
                             )
                             .map_err(|e| Self::storage_err("could not reset a sequence", e))?;
                     }
-                    self.storage
-                        .insert(self.db(), SEQUENCE_COLLECTION, sequences, true)
-                        .map_err(|e| Self::storage_err("could not record a sequence", e))?;
+                    self.insert_checked(SEQUENCE_COLLECTION, sequences, "could not record a sequence")?;
                 }
                 // The table's ROW TYPE: a composite of its columns, in the
                 // type catalog like any other so `'(foo)'::mytype`,
@@ -16209,9 +16532,7 @@ impl PgHandler {
                 };
                 let bytes = encode_doc(&row_type)
                     .map_err(|e| Self::storage_err("could not encode the row type", e))?;
-                self.storage
-                    .insert(self.db(), Self::COMPOSITE_COLLECTION, vec![bytes], true)
-                    .map_err(|e| Self::storage_err("could not record the row type", e))?;
+                self.insert_checked(Self::COMPOSITE_COLLECTION, vec![bytes], "could not record the row type")?;
                 self.note_uncommitted_type(Self::COMPOSITE_COLLECTION, &def.name, Some(row_type));
                 // Remember it for the rest of this transaction: the catalog row
                 // above is not committed yet, so a plain read cannot see it.
@@ -16584,9 +16905,7 @@ impl PgHandler {
                 let doc = bson::doc! {"_id": &name, "schema": &name};
                 let bytes = encode_doc(&doc)
                     .map_err(|e| Self::storage_err("could not encode the schema", e))?;
-                self.storage
-                    .insert(self.db(), Self::SCHEMA_COLLECTION, vec![bytes], true)
-                    .map_err(|e| Self::storage_err("could not record the schema", e))?;
+                self.insert_checked(Self::SCHEMA_COLLECTION, vec![bytes], "could not record the schema")?;
                 Ok(vec![Response::Execution(Tag::new("CREATE SCHEMA"))])
             }
 
@@ -16731,9 +17050,7 @@ impl PgHandler {
                 };
                 let bytes = encode_doc(&doc)
                     .map_err(|e| Self::storage_err("could not encode the type", e))?;
-                self.storage
-                    .insert(self.db(), Self::COMPOSITE_COLLECTION, vec![bytes], true)
-                    .map_err(|e| Self::storage_err("could not record the type", e))?;
+                self.insert_checked(Self::COMPOSITE_COLLECTION, vec![bytes], "could not record the type")?;
                 self.note_uncommitted_type(Self::COMPOSITE_COLLECTION, &id_key, Some(doc));
                 Ok(vec![Response::Execution(Tag::new("CREATE TYPE"))])
             }
@@ -16782,9 +17099,7 @@ impl PgHandler {
                 };
                 let bytes = encode_doc(&doc)
                     .map_err(|e| Self::storage_err("could not encode the type", e))?;
-                self.storage
-                    .insert(self.db(), Self::RANGE_COLLECTION, vec![bytes], true)
-                    .map_err(|e| Self::storage_err("could not record the type", e))?;
+                self.insert_checked(Self::RANGE_COLLECTION, vec![bytes], "could not record the type")?;
                 self.note_uncommitted_type(Self::RANGE_COLLECTION, &id_key, Some(doc));
                 Ok(vec![Response::Execution(Tag::new("CREATE TYPE"))])
             }
@@ -17317,9 +17632,7 @@ impl PgHandler {
                 };
                 let bytes = encode_doc(&doc)
                     .map_err(|e| Self::storage_err("could not encode the type", e))?;
-                self.storage
-                    .insert(self.db(), Self::ENUM_COLLECTION, vec![bytes], true)
-                    .map_err(|e| Self::storage_err("could not record the type", e))?;
+                self.insert_checked(Self::ENUM_COLLECTION, vec![bytes], "could not record the type")?;
                 self.note_uncommitted_type(Self::ENUM_COLLECTION, &id_key, Some(doc));
                 Ok(vec![Response::Execution(Tag::new("CREATE TYPE"))])
             }
@@ -17506,8 +17819,9 @@ impl PgHandler {
                         effective.push(a);
                     }
                 }
+                let before = self.lookup(&table).unwrap_or_else(|| def.clone());
                 for action in &effective {
-                    self.apply_alter_rows(&table, &def, action)?;
+                    self.apply_alter_rows(&table, &def, action, &before)?;
                 }
                 // ATTACH / DETACH rewrote catalog rows of their own; the
                 // parent's is re-read so this write does not undo them.
@@ -17648,9 +17962,7 @@ impl PgHandler {
                 let doc = Self::new_sequence_doc(&name, &options)?;
                 let bytes = encode_doc(&doc)
                     .map_err(|e| Self::storage_err("could not encode the sequence", e))?;
-                self.storage
-                    .insert(self.db(), SEQUENCE_COLLECTION, vec![bytes], true)
-                    .map_err(|e| Self::storage_err("could not create the sequence", e))?;
+                self.insert_checked(SEQUENCE_COLLECTION, vec![bytes], "could not create the sequence")?;
                 Ok(vec![Response::Execution(Tag::new("CREATE SEQUENCE"))])
             }
 
@@ -17683,9 +17995,7 @@ impl PgHandler {
                         None,
                     )
                     .map_err(|e| Self::storage_err("could not alter the sequence", e))?;
-                self.storage
-                    .insert(self.db(), SEQUENCE_COLLECTION, vec![bytes], true)
-                    .map_err(|e| Self::storage_err("could not alter the sequence", e))?;
+                self.insert_checked(SEQUENCE_COLLECTION, vec![bytes], "could not alter the sequence")?;
                 Ok(vec![Response::Execution(Tag::new("ALTER SEQUENCE"))])
             }
 
@@ -19482,6 +19792,7 @@ impl PgHandler {
                         self.check_exclusions(def, &new_rows, &replacing)?;
                     }
                     if let (true, Some(def)) = (referenced, def.as_ref()) {
+                        self.check_rekeys(&upd.table, def, &rekeys)?;
                         self.check_referencing_updates(def, &key_changes)?;
                     }
                     let mut matched = 0usize;
@@ -19962,6 +20273,20 @@ impl PgHandler {
         def: &TableDef,
         rekeys: &[(Document, Document)],
     ) -> PgWireResult<usize> {
+        self.check_rekeys(table, def, rekeys)?;
+        self.move_rekeyed_rows(table, def, rekeys)
+    }
+
+    /// The new keys of re-keyed rows against the rows stored (and each
+    /// other): a key already taken is the key's own 23505 -- which PostgreSQL
+    /// reports BEFORE any foreign key that references the old key is looked
+    /// at, since the row is written before the referential check runs.
+    fn check_rekeys(
+        &self,
+        table: &str,
+        def: &TableDef,
+        rekeys: &[(Document, Document)],
+    ) -> PgWireResult<()> {
         let key = |b: &Bson| format!("{b:?}");
         let mut removed = std::collections::HashSet::new();
         let mut added = std::collections::HashSet::new();
@@ -19987,6 +20312,15 @@ impl PgHandler {
             }
             added.insert(key(&id));
         }
+        Ok(())
+    }
+
+    fn move_rekeyed_rows(
+        &self,
+        table: &str,
+        def: &TableDef,
+        rekeys: &[(Document, Document)],
+    ) -> PgWireResult<usize> {
         for (old, new) in rekeys {
             self.storage
                 .delete_matching(
@@ -20009,9 +20343,7 @@ impl PgHandler {
                 // back before reporting it.
                 let bytes =
                     encode_doc(old).map_err(|e| Self::storage_err("could not encode a row", e))?;
-                self.storage
-                    .insert(self.db(), table, vec![bytes], true)
-                    .map_err(|e| Self::storage_err("could not restore a row", e))?;
+                self.insert_checked(table, vec![bytes], "could not restore a row")?;
                 return Err(Self::write_error(table, def, first));
             }
         }
@@ -23408,6 +23740,25 @@ fn binary_array(
     Ok(secantus_pgplan::arrays::bounded(Bson::Array(level), &lower))
 }
 
+/// `v` with every document key `rename` maps changed: a partial index's
+/// filter names the fields it constrains.
+fn rename_filter_fields(v: &Bson, rename: &dyn Fn(&str) -> String) -> Bson {
+    match v {
+        Bson::Document(d) => {
+            let mut out = Document::new();
+            for (k, val) in d {
+                let key = if k.starts_with('$') { k.clone() } else { rename(k) };
+                out.insert(key, rename_filter_fields(val, rename));
+            }
+            Bson::Document(out)
+        }
+        Bson::Array(items) => {
+            Bson::Array(items.iter().map(|i| rename_filter_fields(i, rename)).collect())
+        }
+        other => other.clone(),
+    }
+}
+
 /// The privilege a view's owner needs on what the view reads, for a use of
 /// the view needing `privilege`: a write through an auto-updatable view is
 /// that write on its base table; anything else reads it.
@@ -25571,12 +25922,20 @@ impl CopyHandler for PgHandler {
                     .map_err(|e| Self::storage_err("could not insert COPY rows", e))
             };
             let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
+            // Outside a block the COPY is its own transaction: a row refused
+            // midway must not leave the rows before it loaded.
             let (_, errors) = match guard.as_mut() {
                 Some(handle) => self
                     .storage
                     .with_user_transaction(self.with_isolation(handle)?, load)
                     .map_err(|e| Self::storage_err("transaction failed", e))?,
-                None => load(),
+                None => self.atomically(|| {
+                    let (n, errors) = load()?;
+                    if let Some(first) = errors.first() {
+                        return Err(Self::write_error(&state.table, &def, first));
+                    }
+                    Ok((n, errors))
+                }),
             }?;
             drop(guard);
             if let Some(first) = errors.first() {
