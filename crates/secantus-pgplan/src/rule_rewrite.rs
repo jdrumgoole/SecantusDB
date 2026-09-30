@@ -710,7 +710,7 @@ pub(crate) fn plan(
     let Some(table) = table else {
         return Ok(None);
     };
-    if SUPPRESSED.with(|s| s.borrow().iter().any(|t| *t == table)) {
+    if SUPPRESSED.with(|s| s.borrow().contains(&table)) {
         return Ok(None);
     }
     let mut rules: Vec<RuleDef> = RULES.with(|r| {

@@ -14065,6 +14065,13 @@ fn call_arg_types(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Vec<Stri
                 "unknown".to_string()
             }
             Some(N::AConst(c)) if c.isnull => "unknown".to_string(),
+            // A parameter the client sent untyped (oid 0) is `unknown` to
+            // resolution, whatever text its value arrived as.
+            Some(N::ParamRef(p))
+                if declared_param_type(usize::try_from(p.number).unwrap_or(0)).is_none() =>
+            {
+                "unknown".to_string()
+            }
             _ => {
                 let v = const_value(a, params).unwrap_or(Bson::Null);
                 static_type(a, &v)

@@ -38,12 +38,15 @@ fn category(ty: &str) -> Option<&'static str> {
 /// A CTE in scope: its name and, when it is a plain SELECT, its query.
 type Cte = (String, Option<pg_query::protobuf::SelectStmt>);
 
+/// The catalog: a relation's definition by name.
+type Lookup<'p> = &'p dyn Fn(&str) -> Option<TableDef>;
+
 struct Scope<'p> {
     tables: Vec<(String, TableDef)>,
     complete: bool,
     parent: Option<&'p Scope<'p>>,
     /// The catalog and CTEs in view, to type a scalar subquery's column.
-    lookup: Option<&'p dyn Fn(&str) -> Option<TableDef>>,
+    lookup: Option<Lookup<'p>>,
     ctes: Vec<Cte>,
 }
 
