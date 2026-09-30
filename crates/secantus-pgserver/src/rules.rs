@@ -1,17 +1,8 @@
-//! `CREATE RULE` on INSERT / UPDATE / DELETE: a query rewrite PostgreSQL
-//! applies before any trigger. Each rule runs here as a ROW-level action
-//! with `NEW` / `OLD`, which is what a rule's action sees for the rows its
-//! statement touches:
-//!
-//! * `DO ALSO <actions>` runs its actions after each row is written (when
-//!   the rule's WHERE holds);
-//! * `DO INSTEAD <actions>` runs them in place of the row, which is not
-//!   written;
-//! * `DO INSTEAD NOTHING` drops the row.
-//!
-//! They are executed as synthetic triggers (`rule_triggers`), ordered ahead
-//! of the table's real triggers because a rewrite happens first, and they are
-//! never listed in `pg_trigger`. `pg_rewrite` and `pg_rules` report them.
+//! `CREATE RULE` on INSERT / UPDATE / DELETE, stored in `__sql_rules__` and
+//! listed in `pg_rewrite` / `pg_rules`. The rules themselves are applied by
+//! the planner (`secantus_pgplan::rule_rewrite`), which rewrites a statement
+//! into the ones PostgreSQL's rewriter produces; this module is their
+//! catalog.
 
 use bson::{Bson, Document};
 use pgwire::api::results::{Response, Tag};
@@ -20,21 +11,13 @@ use secantus_pgcatalog::{Column, TableDef};
 
 use crate::PgHandler;
 
-pub(crate) const RULE_COLLECTION: &str = "__sql_rules__";
-
 thread_local! {
-    /// Rows an INSTEAD rule of the statement's own kind replaced.
-    static INSTEAD_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How deep rule rewrites are nested (a rule action whose target has
+    /// rules of its own is rewritten in turn).
+    static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Read and reset the replaced-row count.
-pub(crate) fn take_instead_rows() -> usize {
-    INSTEAD_ROWS.with(|c| c.replace(0))
-}
-
-pub(crate) fn add_instead_rows(n: usize) {
-    INSTEAD_ROWS.with(|c| c.set(c.get() + n));
-}
+pub(crate) const RULE_COLLECTION: &str = "__sql_rules__";
 
 /// One rule, as `CREATE RULE` planned it.
 #[derive(Debug, Clone, PartialEq)]
@@ -97,7 +80,8 @@ impl PgHandler {
     }
 
     pub(crate) fn create_rule(&self, rule: Rule, replace: bool) -> PgWireResult<Vec<Response>> {
-        if self.lookup(&rule.table).is_none() {
+        let is_view = self.views()?.iter().any(|(n, _)| *n == rule.table);
+        if self.lookup(&rule.table).is_none() && !is_view {
             return Err(Self::relation_missing(&rule.table));
         }
         let key = rule_key(&rule.table, &rule.name);
@@ -186,56 +170,89 @@ impl PgHandler {
         Ok(())
     }
 
-    /// The rules on `table` for `event` that run at `timing` (`BEFORE` for
-    /// INSTEAD, `AFTER` for ALSO), as synthetic ROW trigger documents
-    /// carrying their own PL/pgSQL body (`inline_function`), in name order.
-    pub(crate) fn rule_triggers(&self, table: &str, timing: &str, event: &str) -> Vec<Document> {
-        let mut rules: Vec<Rule> = self
-            .rule_docs()
+    /// Run a rewritten statement: each step planned (with the original's
+    /// parameters) and executed in order, the original's own step with its
+    /// relation's rules not applied again.
+    pub(crate) fn run_rule_plan(
+        &self,
+        p: secantus_pgplan::rule_rewrite::RulePlan,
+        max_rows: usize,
+    ) -> PgWireResult<Vec<Response>> {
+        if DEPTH.with(|d| d.get()) >= 16 {
+            return Err(Self::user_error(
+                "42P17",
+                format!(
+                    "infinite recursion detected in rules for relation \"{}\"",
+                    p.table
+                ),
+            ));
+        }
+        DEPTH.with(|d| d.set(d.get() + 1));
+        let out = self.run_rule_steps(&p, max_rows);
+        DEPTH.with(|d| d.set(d.get() - 1));
+        out
+    }
+
+    fn run_rule_steps(
+        &self,
+        p: &secantus_pgplan::rule_rewrite::RulePlan,
+        max_rows: usize,
+    ) -> PgWireResult<Vec<Response>> {
+        let tz = self.session_timezone();
+        let mut tagged: Option<Vec<Response>> = None;
+        for (i, (sql, is_original)) in p.steps.iter().enumerate() {
+            let plan = || {
+                let run = |stmt: &secantus_pgplan::Statement| self.subquery_rows(stmt);
+                secantus_pgplan::planning_to_execute(|| {
+                    secantus_pgplan::plan_with_session_types_and_subqueries(
+                        sql,
+                        &|n| self.lookup(n),
+                        &p.params,
+                        &p.param_types,
+                        &tz,
+                        Some(&run),
+                    )
+                })
+            };
+            let stmt = if *is_original {
+                secantus_pgplan::rule_rewrite::with_rules_suppressed(&p.table, plan)
+            } else {
+                plan()
+            }
+            .map_err(|e| Self::err(&e))?;
+            let responses = if *is_original {
+                secantus_pgplan::rule_rewrite::with_rules_suppressed(&p.table, || {
+                    self.execute(stmt, max_rows)
+                })?
+            } else {
+                self.execute(stmt, max_rows)?
+            };
+            if p.tag_step == Some(i) {
+                tagged = Some(responses);
+            }
+        }
+        Ok(tagged.unwrap_or_else(|| {
+            let tag = match p.kind.as_str() {
+                "INSERT" => Tag::new("INSERT").with_oid(0).with_rows(0),
+                other => Tag::new(other).with_rows(0),
+            };
+            vec![Response::Execution(tag)]
+        }))
+    }
+
+    /// The enabled rules, for the planner.
+    pub(crate) fn enabled_rules(&self) -> Vec<secantus_pgplan::rule_rewrite::RuleDef> {
+        self.rule_docs()
             .iter()
             .map(rule_of)
-            .filter(|(r, enabled, _)| {
-                *enabled
-                    && r.table == table
-                    && r.event == event
-                    && (timing == "BEFORE") == r.instead
-            })
-            .map(|(r, _, _)| r)
-            .collect();
-        rules.sort_by(|a, b| a.name.cmp(&b.name));
-        rules
-            .into_iter()
-            .map(|r| {
-                let row = if r.event == "DELETE" { "OLD" } else { "NEW" };
-                let actions: String = r.actions.iter().map(|a| format!("{a}; ")).collect();
-                let body = if r.instead {
-                    // The row is replaced: the actions run, and the row is
-                    // not written (a trigger's NULL).
-                    match &r.condition {
-                        Some(c) => format!(
-                            "BEGIN IF ({c}) THEN {actions}RETURN NULL; END IF; RETURN {row}; END"
-                        ),
-                        None => format!("BEGIN {actions}RETURN NULL; END"),
-                    }
-                } else {
-                    match &r.condition {
-                        Some(c) => format!("BEGIN IF ({c}) THEN {actions}END IF; RETURN NULL; END"),
-                        None => format!("BEGIN {actions}RETURN NULL; END"),
-                    }
-                };
-                bson::doc! {
-                    "name": format!("\u{1}rule:{}", r.name),
-                    "table": &r.table,
-                    "timing": timing,
-                    "level": "ROW",
-                    "events": [event],
-                    "rule": true,
-                    "rule_instead_same_kind": r.instead
-                        && r.actions.iter().any(|a| a.trim_start().to_ascii_uppercase().starts_with(&r.event)),
-                    "inline_function": format!(
-                        "CREATE FUNCTION secantus_rule() RETURNS trigger AS $secantus_rule$ {body} $secantus_rule$ LANGUAGE plpgsql"
-                    ),
-                }
+            .filter(|(_, enabled, _)| *enabled)
+            .map(|(r, _, _)| secantus_pgplan::rule_rewrite::RuleDef {
+                table: r.table,
+                name: r.name,
+                event: r.event,
+                instead: r.instead,
+                condition: r.condition,
+                actions: r.actions,
             })
             .collect()
     }

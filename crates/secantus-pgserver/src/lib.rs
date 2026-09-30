@@ -13,6 +13,7 @@ mod advisory;
 mod aggregates;
 mod casts;
 mod catalog_fill;
+mod catalog_meta;
 mod catalog_objects;
 mod collations;
 mod do_block;
@@ -22,6 +23,7 @@ mod explain;
 mod fdw;
 mod merge;
 mod partition;
+mod pg_type_facts;
 mod plpgsql_do;
 mod plpgsql_fn;
 mod rules;
@@ -1975,9 +1977,8 @@ impl PgHandler {
         };
         // The RowDescription carries column names in the client encoding, so
         // a LATIN1 / LATIN9 session gets the name's transcoded bytes. A name
-        // with a character the encoding cannot represent keeps its UTF-8 bytes
-        // (PostgreSQL raises 22P05 there; `field_mod` is infallible and the
-        // case needs a non-Latin alias under a Latin client encoding).
+        // with a character the encoding cannot represent is refused 22P05
+        // where the fields leave the handler (`check_field_names`).
         let name_raw = transcoded_name(self.client_encoding(), &name);
         let (table_id, column_id) = match source {
             Some((oid, attnum)) => (i32::try_from(oid).ok(), Some(attnum)),
@@ -2423,6 +2424,7 @@ impl PgHandler {
         secantus_pgplan::domains::set_user_domains(self.domains().unwrap_or_default());
         secantus_pgplan::user_agg::set_user_aggregates(self.user_aggregates().unwrap_or_default());
         // User-defined functions, so the planner can type and route a call.
+        secantus_pgplan::rule_rewrite::set_rules(self.enabled_rules());
         secantus_pgplan::set_user_functions(
             self.user_function_docs()
                 .unwrap_or_default()
@@ -7126,11 +7128,30 @@ impl PgHandler {
     /// (`t[]`) is as defined as its element type.
     fn type_kind(&self, key: &str) -> PgWireResult<TypeKind> {
         let element = key.strip_suffix("[]").unwrap_or(key);
-        if element == "cstring"
-            || element == "void"
-            || element == "trigger"
-            || element == "record"
-            || secantus_pgplan::pgtypes::oid_of_name(element).is_some()
+        if matches!(
+            element,
+            "cstring"
+                | "void"
+                | "trigger"
+                | "record"
+                | "internal"
+                | "event_trigger"
+                | "fdw_handler"
+                | "language_handler"
+                | "index_am_handler"
+                | "table_am_handler"
+                | "tsm_handler"
+                | "anyelement"
+                | "anyarray"
+                | "anynonarray"
+                | "anyenum"
+                | "anyrange"
+                | "anymultirange"
+                | "anycompatible"
+                | "anycompatiblearray"
+                | "anycompatiblenonarray"
+                | "anycompatiblerange"
+        ) || secantus_pgplan::pgtypes::oid_of_name(element).is_some()
         {
             return Ok(TypeKind::Defined);
         }
@@ -9126,7 +9147,11 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("typname", "name", false),
                     secantus_pgcatalog::Column::new("oid", "int8", false),
                     secantus_pgcatalog::Column::new("typarray", "int8", false),
-                    secantus_pgcatalog::Column::new("typdelim", "text", false),
+                    secantus_pgcatalog::Column::new(
+                        "typdelim",
+                        secantus_pgplan::QUOTED_CHAR,
+                        false,
+                    ),
                     // A composite's row type: its own oid here, 0 otherwise.
                     // `pg_attribute` keys a composite's fields on it.
                     secantus_pgcatalog::Column::new("typrelid", "oid", false),
@@ -9641,6 +9666,7 @@ impl PgHandler {
                         rows.push(d);
                     }
                 }
+                rows.extend(catalog_meta::column_rows(&def, self.db()));
                 rows
             }
             "information_schema.views" => {
@@ -9751,6 +9777,7 @@ impl PgHandler {
                             })
                             .collect::<Vec<_>>(),
                     )
+                    .chain(catalog_meta::relation_rows(&def, &db))
                     .collect()
             }
             "information_schema.table_constraints" => {
@@ -10289,8 +10316,84 @@ impl PgHandler {
                 // Base types: `typarray` is 0 while the type is a SHELL --
                 // PostgreSQL mints the array type only when the full CREATE
                 // TYPE completes it (measured on 16) -- and derived after.
+                let base_docs = self
+                    .type_catalog_docs(Self::BASE_TYPE_COLLECTION)
+                    .map(|d| d.to_vec())
+                    .unwrap_or_default();
                 for b in self.base_types().ok()? {
                     let mut d = Document::new();
+                    let raw = base_docs.iter().find(|x| {
+                        x.get_i64("oid")
+                            .or_else(|_| x.get_i32("oid").map(i64::from))
+                            == Ok(b.oid)
+                    });
+                    let field = |n: &str| def.field_of(n);
+                    if !b.defined {
+                        // A shell: PostgreSQL's TypeShellMake.
+                        d.insert(def.field_of("typtype").expect("column"), "p");
+                        if let Some(f) = field("typisdefined") {
+                            d.insert(f, false);
+                        }
+                    } else if let Some(raw) = raw.filter(|r| r.contains_key("typlen")) {
+                        let proc = |k: &str| -> Bson {
+                            Bson::String(raw.get_str(k).unwrap_or("-").to_string())
+                        };
+                        let put = |d: &mut Document, n: &str, v: Bson| {
+                            if let Some(f) = def.field_of(n) {
+                                d.insert(f, v);
+                            }
+                        };
+                        put(
+                            &mut d,
+                            "typlen",
+                            Bson::Int32(raw.get_i32("typlen").unwrap_or(-1)),
+                        );
+                        put(
+                            &mut d,
+                            "typbyval",
+                            Bson::Boolean(raw.get_bool("typbyval").unwrap_or(false)),
+                        );
+                        for k in ["typalign", "typstorage", "typcategory"] {
+                            put(
+                                &mut d,
+                                k,
+                                Bson::String(raw.get_str(k).unwrap_or_default().to_string()),
+                            );
+                        }
+                        put(
+                            &mut d,
+                            "typispreferred",
+                            Bson::Boolean(raw.get_bool("typispreferred").unwrap_or(false)),
+                        );
+                        put(
+                            &mut d,
+                            "typinput",
+                            Bson::String(b.input.clone().unwrap_or_default()),
+                        );
+                        put(
+                            &mut d,
+                            "typoutput",
+                            Bson::String(b.output.clone().unwrap_or_default()),
+                        );
+                        for k in [
+                            "typreceive",
+                            "typsend",
+                            "typmodin",
+                            "typmodout",
+                            "typanalyze",
+                            "typsubscript",
+                        ] {
+                            put(&mut d, k, proc(k));
+                        }
+                        put(
+                            &mut d,
+                            "typdefault",
+                            raw.get("typdefault").cloned().unwrap_or(Bson::Null),
+                        );
+                        if raw.get_bool("collatable").unwrap_or(false) {
+                            put(&mut d, "typcollation", Bson::Int64(100));
+                        }
+                    }
                     d.insert(def.field_of("typname").expect("column"), b.name.clone());
                     d.insert(def.field_of("oid").expect("column"), Bson::Int64(b.oid));
                     let typarray = if b.defined {
@@ -10305,9 +10408,11 @@ impl PgHandler {
                     // PostGIS declares `geometry` with `DELIMITER = ':'`
                     // (measured on 3.4.6); every other base type is `,`.
                     let delim = if b.extension.is_some() && b.name == "geometry" {
-                        ":"
+                        ":".to_string()
                     } else {
-                        ","
+                        raw.and_then(|r| r.get_str("typdelim").ok())
+                            .unwrap_or(",")
+                            .to_string()
                     };
                     d.insert(def.field_of("typdelim").expect("column"), delim);
                     d.insert(def.field_of("typrelid").expect("column"), Bson::Int64(0));
@@ -10341,6 +10446,26 @@ impl PgHandler {
                     );
                     rows.push(d);
                 }
+                // Each built-in's ARRAY type is a row of its own (`_int4`).
+                let listed: std::collections::HashSet<i64> = rows
+                    .iter()
+                    .filter_map(|d| d.get_i64(def.field_of("oid").expect("column")).ok())
+                    .collect();
+                for (typname, _, typarray) in secantus_pgplan::pgtypes::BUILTIN_TYPES {
+                    if *typarray == 0 || listed.contains(typarray) {
+                        continue;
+                    }
+                    let mut d = Document::new();
+                    d.insert(
+                        def.field_of("typname").expect("column"),
+                        format!("_{typname}"),
+                    );
+                    d.insert(def.field_of("oid").expect("column"), Bson::Int64(*typarray));
+                    d.insert(def.field_of("typarray").expect("column"), Bson::Int64(0));
+                    d.insert(def.field_of("typdelim").expect("column"), ",");
+                    d.insert(def.field_of("typrelid").expect("column"), Bson::Int64(0));
+                    rows.push(d);
+                }
                 // The columns the loops above leave to their defaults: the
                 // type's kind from where it came from, and its namespace.
                 let oids =
@@ -10352,7 +10477,7 @@ impl PgHandler {
                 for d in &mut rows {
                     let oid = d.get_i64(f("oid")).unwrap_or(0);
                     let name = d.get_str(f("typname")).unwrap_or_default().to_string();
-                    let builtin = secantus_pgplan::pgtypes::name_of_oid(oid).is_some();
+                    let builtin = secantus_pgplan::pgtypes::type_name_of_oid(oid).is_some();
                     if !d.contains_key(f("typtype")) {
                         let kind = if enum_oids.contains(&oid) {
                             "e"
@@ -10377,7 +10502,9 @@ impl PgHandler {
                         d.insert(f("typbasetype"), Bson::Int64(0));
                         d.insert(f("typnotnull"), false);
                         d.insert(f("typtypmod"), Bson::Int32(-1));
-                        d.insert(f("typdefault"), Bson::Null);
+                        if !d.contains_key(f("typdefault")) {
+                            d.insert(f("typdefault"), Bson::Null);
+                        }
                     }
                     d.insert(
                         f("typnamespace"),
@@ -13267,6 +13394,17 @@ impl SimpleQueryHandler for PgHandler {
         // A simple query inside an extended-protocol statement group runs in
         // the group's transaction and ends it, as PostgreSQL's does
         // (`exec_simple_query` finishes the transaction command).
+        let out = out.and_then(|resps| {
+            for r in &resps {
+                if let Response::Query(q) = r {
+                    if let Err(e) = check_field_names(self.client_encoding(), &q.row_schema()) {
+                        self.note_failure();
+                        return Err(e);
+                    }
+                }
+            }
+            Ok(resps)
+        });
         let out = match self.close_extended_group(out.is_err()) {
             Ok(()) => out,
             Err(e) => out.and(Err(e)),
@@ -13692,6 +13830,13 @@ impl PgHandler {
     fn written_tables(stmt: &Statement) -> Vec<String> {
         let mut out = match stmt {
             Statement::Sequence(_, stmts) => stmts.iter().flat_map(Self::written_tables).collect(),
+            // Every table a rewrite's steps write, and the sequences a
+            // default draws from.
+            Statement::RuleRewrite(p) => {
+                let mut v = p.targets.clone();
+                v.push(SEQUENCE_COLLECTION.to_string());
+                v
+            }
             // A serial column's INSERT moves its sequence too.
             Statement::Insert(i) => vec![i.table.clone(), SEQUENCE_COLLECTION.to_string()],
             // An ALTER rewrites the ROWS as well as the catalog, so a
@@ -18605,6 +18750,11 @@ impl PgHandler {
             Statement::Insert(_) => "INSERT",
             Statement::Update(_) => "UPDATE",
             Statement::Delete(_) => "DELETE",
+            Statement::RuleRewrite(p) => match p.kind.as_str() {
+                "INSERT" => "INSERT",
+                "UPDATE" => "UPDATE",
+                _ => "DELETE",
+            },
             Statement::Truncate { .. } => "TRUNCATE TABLE",
             Statement::CopyFrom(_) => "COPY FROM",
             Statement::Notify { .. } => "NOTIFY",
@@ -18693,6 +18843,7 @@ impl PgHandler {
                 | Statement::ValuesConstant(_)
                 | Statement::Insert(_)
                 | Statement::InsteadOf(_)
+                | Statement::RuleRewrite(_)
                 | Statement::SetConstraints { .. }
                 | Statement::Update(_)
                 | Statement::Delete(_)
@@ -18803,32 +18954,6 @@ impl PgHandler {
     }
 
     fn execute_inner(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response>> {
-        // A row an INSTEAD rule of the statement's own kind replaced counts
-        // in its tag, as the rule's action does in PostgreSQL's.
-        if !matches!(
-            stmt,
-            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
-        ) {
-            return self.execute_dispatch(stmt, max_rows);
-        }
-        let saved = rules::take_instead_rows();
-        let out = self.execute_dispatch(stmt, max_rows);
-        let replaced = rules::take_instead_rows();
-        rules::add_instead_rows(saved);
-        let mut out = out?;
-        if replaced > 0 {
-            for r in &mut out {
-                if let Response::Execution(tag) = r {
-                    if let Some(n) = tag.rows() {
-                        *tag = tag.clone().with_rows(n + replaced);
-                    }
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    fn execute_dispatch(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response>> {
         // A timestamptz renders in the SESSION zone; capture it once here and
         // thread it into the row encoder explicitly. A thread-local does not
         // work: pgwire may encode the DataRows lazily on another async worker
@@ -18847,6 +18972,7 @@ impl PgHandler {
             // Handled in `run`, which can await the row stream.
             Statement::DeclareCursor { .. } => unreachable!("handled before execute"),
             Statement::Do { .. } => unreachable!("handled before execute"),
+            Statement::RuleRewrite(p) => self.run_rule_plan(p, max_rows),
             Statement::CreateTable(mut def, if_not_exists) => {
                 if self.lookup(&def.name).is_some()
                     || self.views()?.iter().any(|(n, _)| *n == def.name)
@@ -19675,6 +19801,7 @@ impl PgHandler {
                 schema,
                 input,
                 output,
+                attrs,
             } => {
                 // The full form completes a shell. Every refusal below is
                 // PostgreSQL 16's, in its order: the shell must exist
@@ -19715,6 +19842,10 @@ impl PgHandler {
                         return Err(PgWireError::UserError(Box::new(info)));
                     }
                 };
+                // An attribute's value, read after the shell is found.
+                if let Some((code, message)) = &attrs.error {
+                    return Err(Self::user_error(code, message.clone()));
+                }
                 let Some(input) = input else {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
@@ -19781,6 +19912,78 @@ impl PgHandler {
                         );
                     }
                 }
+                // The other support functions, each by its signature.
+                let lookup_fn =
+                    |f: &Option<String>, sig: &[&str], shown: &str| -> PgWireResult<()> {
+                        let Some(f) = f else { return Ok(()) };
+                        if functions.iter().any(|x| {
+                            x.name == *f
+                                && x.param_types.first().map(String::as_str) == sig.first().copied()
+                        }) {
+                            return Ok(());
+                        }
+                        Err(Self::user_error(
+                            "42883",
+                            format!("function {f}({shown}) does not exist"),
+                        ))
+                    };
+                lookup_fn(&attrs.receive, &["internal"], "internal")?;
+                lookup_fn(&attrs.send, &[id_key.as_str()], &quoted)?;
+                lookup_fn(&attrs.typmod_in, &["cstring[]"], "cstring[]")?;
+                lookup_fn(&attrs.typmod_out, &["int4"], "integer")?;
+                lookup_fn(&attrs.analyze, &["internal"], "internal")?;
+                lookup_fn(&attrs.subscript, &["internal"], "internal")?;
+                // LIKE supplies the representation the options leave out.
+                let like = match &attrs.like {
+                    Some(t) => {
+                        let oid = secantus_pgplan::pgtypes::oid_of_name(t);
+                        let fact = |c: &str| oid.and_then(|o| pg_type_facts::builtin(o, c));
+                        (
+                            fact("typlen").and_then(|v| v.as_i32()),
+                            fact("typbyval").and_then(|v| v.as_bool()),
+                            fact("typalign")
+                                .and_then(|v| v.as_str().and_then(|s| s.chars().next())),
+                            fact("typstorage")
+                                .and_then(|v| v.as_str().and_then(|s| s.chars().next())),
+                        )
+                    }
+                    None => (None, None, None, None),
+                };
+                let len = attrs.internallength.or(like.0).unwrap_or(-1);
+                let byval = attrs.byval.or(like.1).unwrap_or(false);
+                let align = attrs.align.or(like.2).unwrap_or('i');
+                let storage = attrs.storage.or(like.3).unwrap_or('p');
+                // TypeCreate's checks, in its order.
+                let invalid = |m: String| Self::user_error("42P17", m);
+                if !(len > 0 || len == -1 || len == -2) {
+                    return Err(invalid(format!("invalid type internal size {len}")));
+                }
+                if byval {
+                    let want = match len {
+                        1 => 'c',
+                        2 => 's',
+                        4 => 'i',
+                        8 => 'd',
+                        _ => {
+                            return Err(invalid(format!(
+                                "internal size {len} is invalid for passed-by-value type"
+                            )))
+                        }
+                    };
+                    if align != want {
+                        return Err(invalid(format!(
+                            "alignment \"{align}\" is invalid for passed-by-value type of size {len}"
+                        )));
+                    }
+                } else if len == -1 && !matches!(align, 'i' | 'd') {
+                    return Err(invalid(format!(
+                        "alignment \"{align}\" is invalid for variable-length type"
+                    )));
+                }
+                if storage != 'p' && len != -1 {
+                    return Err(invalid("fixed-size types must have storage PLAIN".into()));
+                }
+                let opt = |v: &Option<String>| v.clone().map_or(Bson::Null, Bson::String);
                 let doc = bson::doc! {
                     "_id": &id_key,
                     "base": &name,
@@ -19789,6 +19992,22 @@ impl PgHandler {
                     "defined": true,
                     "input": &input,
                     "output": &output,
+                    "typlen": len,
+                    "typbyval": byval,
+                    "typalign": align.to_string(),
+                    "typstorage": storage.to_string(),
+                    "typcategory": attrs.category.unwrap_or('U').to_string(),
+                    "typispreferred": attrs.preferred,
+                    "typdefault": opt(&attrs.default),
+                    "typdelim": attrs.delimiter.unwrap_or(',').to_string(),
+                    "typreceive": opt(&attrs.receive),
+                    "typsend": opt(&attrs.send),
+                    "typmodin": opt(&attrs.typmod_in),
+                    "typmodout": opt(&attrs.typmod_out),
+                    "typanalyze": opt(&attrs.analyze),
+                    "typsubscript": opt(&attrs.subscript),
+                    "typelem_name": opt(&attrs.element),
+                    "collatable": attrs.collatable,
                 };
                 self.delete_type_doc(Self::BASE_TYPE_COLLECTION, &id_key)?;
                 self.insert_type_doc(Self::BASE_TYPE_COLLECTION, &id_key, doc)?;
@@ -20784,7 +21003,24 @@ impl PgHandler {
                         secantus_storage::ExplainPlan::CollScan => None,
                     }
                 };
-                let tree = explain::plan_tree(&inner, &chooser);
+                let mut tree = explain::plan_tree(&inner, &chooser);
+                let relations = self.index_relations();
+                let index_columns = |name: &str| -> Vec<String> {
+                    relations
+                        .iter()
+                        .find(|ix| ix.name == name)
+                        .map(|ix| {
+                            ix.keys
+                                .iter()
+                                .filter_map(|k| usize::try_from(*k).ok()?.checked_sub(1))
+                                .filter_map(|i| ix.table.columns.get(i).map(|c| c.name.clone()))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                explain::attach_scan_quals(&mut tree, &options.scan_quals, &index_columns);
+                explain::attach_join_conds(&mut tree, &options.join_conds);
+                explain::attach_join_where(&mut tree, &options.join_where);
                 // ANALYZE runs the statement, as PostgreSQL's does -- a write
                 // is written -- and reports the rows it produced.
                 let actual = if options.analyze {
@@ -24839,6 +25075,22 @@ fn rebind_field_format(field: &FieldInfo, binary: bool) -> FieldInfo {
 /// A column name's `RowDescription` bytes under the client encoding, or `None`
 /// when they are the name's own UTF-8 (the UTF8 / passthrough encodings, and a
 /// name the target encoding cannot represent).
+/// PostgreSQL converts each column name to the client encoding as it writes
+/// the RowDescription, so a name with a character the encoding cannot
+/// represent is `22P05` for the statement (Describe or Execute alike) rather
+/// than the name's UTF-8 bytes.
+fn check_field_names(cenc: ClientEncoding, fields: &[FieldInfo]) -> PgWireResult<()> {
+    if !cenc.transcodes() {
+        return Ok(());
+    }
+    for f in fields.iter().filter(|f| !f.name().is_ascii()) {
+        if let Err(ch) = encoding::encode(cenc, f.name().as_bytes()) {
+            return Err(untranslatable_char(ch, cenc));
+        }
+    }
+    Ok(())
+}
+
 fn transcoded_name(cenc: ClientEncoding, name: &str) -> Option<Bytes> {
     if !cenc.transcodes() || name.is_ascii() {
         return None;
@@ -24870,6 +25122,51 @@ fn encode_typed_row(
 }
 
 /// Whether a field's rendered bytes may carry non-ASCII characters that need
+/// A binary-format array of a text-family type: its elements carry text,
+/// between length words a whole-payload transcode would corrupt.
+fn binary_text_array(field: &FieldInfo) -> bool {
+    field.format() == FieldFormat::Binary
+        && matches!(
+            *field.datatype(),
+            Type::TEXT_ARRAY
+                | Type::VARCHAR_ARRAY
+                | Type::BPCHAR_ARRAY
+                | Type::NAME_ARRAY
+                | Type::CHAR_ARRAY
+        )
+}
+
+/// `array_send`'s bytes with each element transcoded (and its length word
+/// rewritten): `ndim, flags, elemtype, (size, lbound) per dim`, then each
+/// element as `len` + bytes (`-1` for NULL).
+fn transcode_binary_array(bytes: &[u8], cenc: ClientEncoding) -> Result<Vec<u8>, Option<char>> {
+    let word = |at: usize| -> Result<i32, Option<char>> {
+        bytes
+            .get(at..at + 4)
+            .map(|b| i32::from_be_bytes(b.try_into().expect("4 bytes")))
+            .ok_or(None)
+    };
+    let ndim = usize::try_from(word(0)?).map_err(|_| None)?;
+    let head = 12 + 8 * ndim;
+    let mut out = bytes.get(..head).ok_or(None)?.to_vec();
+    let mut at = head;
+    while at < bytes.len() {
+        let len = word(at)?;
+        at += 4;
+        if len < 0 {
+            out.extend_from_slice(&len.to_be_bytes());
+            continue;
+        }
+        let elem = bytes.get(at..at + len as usize).ok_or(None)?;
+        at += len as usize;
+        let converted = encoding::encode(cenc, elem).map_err(Some)?;
+        out.extend_from_slice(&(converted.len() as i32).to_be_bytes());
+        out.extend_from_slice(&converted);
+    }
+    Ok(out)
+}
+
+/// Whether a field's rendered bytes may carry non-ASCII characters that need
 /// transcoding to the client encoding.
 ///
 /// In TEXT format every value is safe to transcode as one blob: the structural
@@ -24877,10 +25174,8 @@ fn encode_typed_row(
 /// LATIN1 / LATIN9, so only the character content moves. In BINARY format that
 /// is true only for a scalar text-family value, whose whole payload IS the
 /// string bytes -- json too, and jsonb, whose only non-text byte is the `1`
-/// version prefix that a Latin transcode leaves alone; a binary array or record
-/// interleaves big-endian length words that a blanket transcode would corrupt,
-/// so those keep the internal UTF-8 bytes (correct for ASCII; non-ASCII in a
-/// binary array under LATIN1 / LATIN9 is deferred -- see `tasks/backlog.md`).
+/// version prefix that a Latin transcode leaves alone. A binary text-family
+/// ARRAY is transcoded element by element (`transcode_binary_array`).
 fn field_may_carry_text(field: &FieldInfo) -> bool {
     match field.format() {
         FieldFormat::Text => true,
@@ -24950,7 +25245,8 @@ fn transcoding_field<F>(
 where
     F: FnOnce(&mut DataRowEncoder) -> PgWireResult<()>,
 {
-    if !cenc.transcodes() || !field_may_carry_text(field) {
+    let array = binary_text_array(field);
+    if !cenc.transcodes() || !(field_may_carry_text(field) || array) {
         return encode_once(enc);
     }
     let schema = Arc::new(vec![field.clone()]);
@@ -24960,8 +25256,14 @@ where
     match split_single_field(&row) {
         None => enc.encode_field(&None::<&str>),
         Some(utf8) => {
-            let bytes =
-                encoding::encode(cenc, &utf8).map_err(|ch| untranslatable_char(ch, cenc))?;
+            let bytes = if array {
+                transcode_binary_array(&utf8, cenc).map_err(|e| match e {
+                    Some(ch) => untranslatable_char(ch, cenc),
+                    None => PgWireError::ApiError("malformed binary array".into()),
+                })?
+            } else {
+                encoding::encode(cenc, &utf8).map_err(|ch| untranslatable_char(ch, cenc))?
+            };
             enc.encode_field_with_type_and_format(
                 &RawEncoded(bytes),
                 field.datatype(),
@@ -25161,7 +25463,9 @@ fn encode_field_value_inner(
         // encoder cannot do; its whole text is rendered here instead.
         // Sent as plain TEXT: the `&str` encoder quotes a value that holds
         // braces when the field is array-typed, and this is the whole array.
-        if element == "box" {
+        // A MULTIDIMENSIONAL array likewise: the element-wise encoder would
+        // quote each sub-array as a string (`{"{a,b}","{c,d}"}`).
+        if element == "box" || items.iter().any(|x| matches!(x, Bson::Array(_))) {
             let text = secantus_pgplan::value_text(&Bson::Array(items.clone()));
             let options = field.format_options().clone();
             return enc.encode_field_with_type_and_format(
@@ -27412,7 +27716,7 @@ fn series_table_def(series: &secantus_pgplan::Series) -> TableDef {
         "generate_series",
         vec![secantus_pgcatalog::Column::new(
             &series.column,
-            "int4",
+            if series.int8 { "int8" } else { "int4" },
             false,
         )],
     )
@@ -28675,6 +28979,9 @@ impl ExtendedQueryHandler for PgHandler {
         let param_types = self.param_type_names(target);
         let fields =
             self.describe_fields(&target.statement.sql, param_types.len(), &param_types)?;
+        if let Some(fields) = &fields {
+            check_field_names(self.client_encoding(), fields)?;
+        }
         // A parameter with no mapped builtin type reports its user-type oid
         // when the raw Parse oid named one (a composite / enum); otherwise
         // the type the STATEMENT gives it -- `$1::int4` describes as int4 and
@@ -28801,6 +29108,9 @@ impl ExtendedQueryHandler for PgHandler {
             param_types.len(),
             &param_types,
         )?;
+        if let Some(fields) = &fields {
+            check_field_names(self.client_encoding(), fields)?;
+        }
         Ok(match fields {
             Some(fields) => DescribePortalResponse::new(self.mixed_fields(fields)?),
             None => pgwire::api::results::DescribeResponse::no_data(),

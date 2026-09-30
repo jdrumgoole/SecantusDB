@@ -1,0 +1,208 @@
+information_schema	_pg_foreign_data_wrappers	VIEW
+information_schema	_pg_foreign_servers	VIEW
+information_schema	_pg_foreign_table_columns	VIEW
+information_schema	_pg_foreign_tables	VIEW
+information_schema	_pg_user_mappings	VIEW
+information_schema	administrable_role_authorizations	VIEW
+information_schema	applicable_roles	VIEW
+information_schema	attributes	VIEW
+information_schema	character_sets	VIEW
+information_schema	check_constraint_routine_usage	VIEW
+information_schema	check_constraints	VIEW
+information_schema	collation_character_set_applicability	VIEW
+information_schema	collations	VIEW
+information_schema	column_column_usage	VIEW
+information_schema	column_domain_usage	VIEW
+information_schema	column_options	VIEW
+information_schema	column_privileges	VIEW
+information_schema	column_udt_usage	VIEW
+information_schema	columns	VIEW
+information_schema	constraint_column_usage	VIEW
+information_schema	constraint_table_usage	VIEW
+information_schema	data_type_privileges	VIEW
+information_schema	domain_constraints	VIEW
+information_schema	domain_udt_usage	VIEW
+information_schema	domains	VIEW
+information_schema	element_types	VIEW
+information_schema	enabled_roles	VIEW
+information_schema	foreign_data_wrapper_options	VIEW
+information_schema	foreign_data_wrappers	VIEW
+information_schema	foreign_server_options	VIEW
+information_schema	foreign_servers	VIEW
+information_schema	foreign_table_options	VIEW
+information_schema	foreign_tables	VIEW
+information_schema	information_schema_catalog_name	VIEW
+information_schema	key_column_usage	VIEW
+information_schema	parameters	VIEW
+information_schema	referential_constraints	VIEW
+information_schema	role_column_grants	VIEW
+information_schema	role_routine_grants	VIEW
+information_schema	role_table_grants	VIEW
+information_schema	role_udt_grants	VIEW
+information_schema	role_usage_grants	VIEW
+information_schema	routine_column_usage	VIEW
+information_schema	routine_privileges	VIEW
+information_schema	routine_routine_usage	VIEW
+information_schema	routine_sequence_usage	VIEW
+information_schema	routine_table_usage	VIEW
+information_schema	routines	VIEW
+information_schema	schemata	VIEW
+information_schema	sequences	VIEW
+information_schema	sql_features	BASE TABLE
+information_schema	sql_implementation_info	BASE TABLE
+information_schema	sql_parts	BASE TABLE
+information_schema	sql_sizing	BASE TABLE
+information_schema	table_constraints	VIEW
+information_schema	table_privileges	VIEW
+information_schema	tables	VIEW
+information_schema	transforms	VIEW
+information_schema	triggered_update_columns	VIEW
+information_schema	triggers	VIEW
+information_schema	udt_privileges	VIEW
+information_schema	usage_privileges	VIEW
+information_schema	user_defined_types	VIEW
+information_schema	user_mapping_options	VIEW
+information_schema	user_mappings	VIEW
+information_schema	view_column_usage	VIEW
+information_schema	view_routine_usage	VIEW
+information_schema	view_table_usage	VIEW
+information_schema	views	VIEW
+pg_catalog	pg_aggregate	BASE TABLE
+pg_catalog	pg_am	BASE TABLE
+pg_catalog	pg_amop	BASE TABLE
+pg_catalog	pg_amproc	BASE TABLE
+pg_catalog	pg_attrdef	BASE TABLE
+pg_catalog	pg_attribute	BASE TABLE
+pg_catalog	pg_auth_members	BASE TABLE
+pg_catalog	pg_authid	BASE TABLE
+pg_catalog	pg_available_extension_versions	VIEW
+pg_catalog	pg_available_extensions	VIEW
+pg_catalog	pg_backend_memory_contexts	VIEW
+pg_catalog	pg_cast	BASE TABLE
+pg_catalog	pg_class	BASE TABLE
+pg_catalog	pg_collation	BASE TABLE
+pg_catalog	pg_config	VIEW
+pg_catalog	pg_constraint	BASE TABLE
+pg_catalog	pg_conversion	BASE TABLE
+pg_catalog	pg_cursors	VIEW
+pg_catalog	pg_database	BASE TABLE
+pg_catalog	pg_db_role_setting	BASE TABLE
+pg_catalog	pg_default_acl	BASE TABLE
+pg_catalog	pg_depend	BASE TABLE
+pg_catalog	pg_description	BASE TABLE
+pg_catalog	pg_enum	BASE TABLE
+pg_catalog	pg_event_trigger	BASE TABLE
+pg_catalog	pg_extension	BASE TABLE
+pg_catalog	pg_file_settings	VIEW
+pg_catalog	pg_foreign_data_wrapper	BASE TABLE
+pg_catalog	pg_foreign_server	BASE TABLE
+pg_catalog	pg_foreign_table	BASE TABLE
+pg_catalog	pg_group	VIEW
+pg_catalog	pg_hba_file_rules	VIEW
+pg_catalog	pg_ident_file_mappings	VIEW
+pg_catalog	pg_index	BASE TABLE
+pg_catalog	pg_indexes	VIEW
+pg_catalog	pg_inherits	BASE TABLE
+pg_catalog	pg_init_privs	BASE TABLE
+pg_catalog	pg_language	BASE TABLE
+pg_catalog	pg_largeobject	BASE TABLE
+pg_catalog	pg_largeobject_metadata	BASE TABLE
+pg_catalog	pg_locks	VIEW
+pg_catalog	pg_matviews	VIEW
+pg_catalog	pg_namespace	BASE TABLE
+pg_catalog	pg_opclass	BASE TABLE
+pg_catalog	pg_operator	BASE TABLE
+pg_catalog	pg_opfamily	BASE TABLE
+pg_catalog	pg_parameter_acl	BASE TABLE
+pg_catalog	pg_partitioned_table	BASE TABLE
+pg_catalog	pg_policies	VIEW
+pg_catalog	pg_policy	BASE TABLE
+pg_catalog	pg_prepared_statements	VIEW
+pg_catalog	pg_prepared_xacts	VIEW
+pg_catalog	pg_proc	BASE TABLE
+pg_catalog	pg_publication	BASE TABLE
+pg_catalog	pg_publication_namespace	BASE TABLE
+pg_catalog	pg_publication_rel	BASE TABLE
+pg_catalog	pg_publication_tables	VIEW
+pg_catalog	pg_range	BASE TABLE
+pg_catalog	pg_replication_origin	BASE TABLE
+pg_catalog	pg_replication_origin_status	VIEW
+pg_catalog	pg_replication_slots	VIEW
+pg_catalog	pg_rewrite	BASE TABLE
+pg_catalog	pg_roles	VIEW
+pg_catalog	pg_rules	VIEW
+pg_catalog	pg_seclabel	BASE TABLE
+pg_catalog	pg_seclabels	VIEW
+pg_catalog	pg_sequence	BASE TABLE
+pg_catalog	pg_sequences	VIEW
+pg_catalog	pg_settings	VIEW
+pg_catalog	pg_shadow	VIEW
+pg_catalog	pg_shdepend	BASE TABLE
+pg_catalog	pg_shdescription	BASE TABLE
+pg_catalog	pg_shmem_allocations	VIEW
+pg_catalog	pg_shseclabel	BASE TABLE
+pg_catalog	pg_stat_activity	VIEW
+pg_catalog	pg_stat_all_indexes	VIEW
+pg_catalog	pg_stat_all_tables	VIEW
+pg_catalog	pg_stat_archiver	VIEW
+pg_catalog	pg_stat_bgwriter	VIEW
+pg_catalog	pg_stat_database	VIEW
+pg_catalog	pg_stat_database_conflicts	VIEW
+pg_catalog	pg_stat_gssapi	VIEW
+pg_catalog	pg_stat_progress_analyze	VIEW
+pg_catalog	pg_stat_progress_basebackup	VIEW
+pg_catalog	pg_stat_progress_cluster	VIEW
+pg_catalog	pg_stat_progress_copy	VIEW
+pg_catalog	pg_stat_progress_create_index	VIEW
+pg_catalog	pg_stat_progress_vacuum	VIEW
+pg_catalog	pg_stat_recovery_prefetch	VIEW
+pg_catalog	pg_stat_replication	VIEW
+pg_catalog	pg_stat_replication_slots	VIEW
+pg_catalog	pg_stat_slru	VIEW
+pg_catalog	pg_stat_ssl	VIEW
+pg_catalog	pg_stat_subscription	VIEW
+pg_catalog	pg_stat_subscription_stats	VIEW
+pg_catalog	pg_stat_sys_indexes	VIEW
+pg_catalog	pg_stat_sys_tables	VIEW
+pg_catalog	pg_stat_user_functions	VIEW
+pg_catalog	pg_stat_user_indexes	VIEW
+pg_catalog	pg_stat_user_tables	VIEW
+pg_catalog	pg_stat_wal	VIEW
+pg_catalog	pg_stat_wal_receiver	VIEW
+pg_catalog	pg_stat_xact_all_tables	VIEW
+pg_catalog	pg_stat_xact_sys_tables	VIEW
+pg_catalog	pg_stat_xact_user_functions	VIEW
+pg_catalog	pg_stat_xact_user_tables	VIEW
+pg_catalog	pg_statio_all_indexes	VIEW
+pg_catalog	pg_statio_all_sequences	VIEW
+pg_catalog	pg_statio_all_tables	VIEW
+pg_catalog	pg_statio_sys_indexes	VIEW
+pg_catalog	pg_statio_sys_sequences	VIEW
+pg_catalog	pg_statio_sys_tables	VIEW
+pg_catalog	pg_statio_user_indexes	VIEW
+pg_catalog	pg_statio_user_sequences	VIEW
+pg_catalog	pg_statio_user_tables	VIEW
+pg_catalog	pg_statistic	BASE TABLE
+pg_catalog	pg_statistic_ext	BASE TABLE
+pg_catalog	pg_statistic_ext_data	BASE TABLE
+pg_catalog	pg_stats	VIEW
+pg_catalog	pg_stats_ext	VIEW
+pg_catalog	pg_stats_ext_exprs	VIEW
+pg_catalog	pg_subscription	BASE TABLE
+pg_catalog	pg_subscription_rel	BASE TABLE
+pg_catalog	pg_tables	VIEW
+pg_catalog	pg_tablespace	BASE TABLE
+pg_catalog	pg_timezone_abbrevs	VIEW
+pg_catalog	pg_timezone_names	VIEW
+pg_catalog	pg_transform	BASE TABLE
+pg_catalog	pg_trigger	BASE TABLE
+pg_catalog	pg_ts_config	BASE TABLE
+pg_catalog	pg_ts_config_map	BASE TABLE
+pg_catalog	pg_ts_dict	BASE TABLE
+pg_catalog	pg_ts_parser	BASE TABLE
+pg_catalog	pg_ts_template	BASE TABLE
+pg_catalog	pg_type	BASE TABLE
+pg_catalog	pg_user	VIEW
+pg_catalog	pg_user_mapping	BASE TABLE
+pg_catalog	pg_user_mappings	VIEW
+pg_catalog	pg_views	VIEW

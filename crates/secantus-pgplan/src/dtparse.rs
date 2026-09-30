@@ -106,9 +106,13 @@ fn to_error(f: Fail, text: &str, type_name: &str) -> Error {
         Fail::BadFormat => Error::InvalidDatetimeFormat(format!(
             "invalid input syntax for type {type_name}: \"{text}\""
         )),
-        Fail::FieldOverflow | Fail::MdFieldOverflow => {
+        Fail::FieldOverflow => {
             Error::DatetimeFieldOverflow(format!("date/time field value out of range: \"{text}\""))
         }
+        // A month or day out of range may be a DateStyle mix-up.
+        Fail::MdFieldOverflow => Error::DatetimeFieldOverflow(format!(
+            "date/time field value out of range: \"{text}\"\nHint: Perhaps you need a different \"datestyle\" setting."
+        )),
         Fail::TzOverflow => Error::Sqlstate(
             "22009",
             format!("time zone displacement out of range: \"{text}\""),

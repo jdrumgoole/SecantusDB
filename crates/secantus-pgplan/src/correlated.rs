@@ -206,24 +206,77 @@ fn walk_from(
     }
 }
 
-/// Every name the FROM items of `s` can be addressed by, at every level.
-fn inner_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut s = s.clone();
-    for item in &s.from_clause {
-        collect_from_names(item, &mut names);
+/// Every name the FROM items of `s` can be addressed by, at every level:
+/// its own FROM (and the FROM of each derived table, join side, CTE and set
+/// operation arm inside it), and the FROM of every subquery in its
+/// expressions. A name found only one level down is still the subquery's
+/// own, never an outer reference: missing the derived tables made
+/// `(SELECT r.id FROM t r WHERE ...)` read `r.id` from the OUTER query.
+pub(crate) fn inner_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
+    fn from_item(item: &pg_query::protobuf::Node, names: &mut Vec<String>) {
+        // An aliased relation goes by its alias ONLY, so an inner `t r`
+        // does not hide an outer `t`.
+        match item.node.as_ref() {
+            Some(N::RangeVar(r)) => names.push(
+                r.alias
+                    .as_ref()
+                    .map(|a| a.aliasname.clone())
+                    .unwrap_or_else(|| r.relname.clone()),
+            ),
+            Some(N::JoinExpr(_)) => {}
+            _ => collect_from_names(item, names),
+        }
+        match item.node.as_ref() {
+            Some(N::RangeSubselect(rs)) => {
+                if let Some(N::SelectStmt(body)) =
+                    rs.subquery.as_deref().and_then(|q| q.node.as_ref())
+                {
+                    select(body, names);
+                }
+            }
+            Some(N::JoinExpr(j)) => {
+                for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                    from_item(side, names);
+                }
+            }
+            _ => {}
+        }
     }
-    let _ = walk_select(&mut s, &mut |n| {
-        if let Some(N::SubLink(sl)) = n.node.as_ref() {
-            if let Some(N::SelectStmt(body)) = sl.subselect.as_deref().and_then(|q| q.node.as_ref())
-            {
-                for item in &body.from_clause {
-                    collect_from_names(item, &mut names);
+    fn select(s: &pg_query::protobuf::SelectStmt, names: &mut Vec<String>) {
+        for item in &s.from_clause {
+            from_item(item, names);
+        }
+        for side in [s.larg.as_deref(), s.rarg.as_deref()].into_iter().flatten() {
+            select(side, names);
+        }
+        if let Some(with) = s.with_clause.as_ref() {
+            for cte in &with.ctes {
+                if let Some(N::CommonTableExpr(c)) = cte.node.as_ref() {
+                    names.push(c.ctename.clone());
+                    if let Some(N::SelectStmt(body)) =
+                        c.ctequery.as_deref().and_then(|q| q.node.as_ref())
+                    {
+                        select(body, names);
+                    }
                 }
             }
         }
-        Ok(())
-    });
+        let mut copy = s.clone();
+        let _ = walk_select(&mut copy, &mut |n| {
+            if let Some(N::SubLink(sl)) = n.node.as_ref() {
+                if let Some(N::SelectStmt(body)) =
+                    sl.subselect.as_deref().and_then(|q| q.node.as_ref())
+                {
+                    for item in &body.from_clause {
+                        from_item(item, names);
+                    }
+                }
+            }
+            Ok(())
+        });
+    }
+    let mut names = Vec::new();
+    select(s, &mut names);
     names
 }
 

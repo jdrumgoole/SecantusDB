@@ -3,8 +3,8 @@
 //! PostgreSQL 16.
 //!
 //! The grantee and grantor are ROLES, which PostgreSQL resolves against its
-//! role catalog (`role "nobody" does not exist`). This server has no role
-//! catalog: the one role it can vouch for is the session user, the name the
+//! role catalog (`role "nobody" does not exist`): here the roles the executor
+//! publishes (`regobj::role_known`) and the session user, the name the
 //! client gave at startup, which is also the superuser an omitted grantor
 //! defaults to (PostgreSQL defaults to the bootstrap superuser, with a
 //! WARNING that names its user ID; the message is kept verbatim).
@@ -17,7 +17,7 @@ pub const ALL_RIGHTS: &str = "arwdDxtXUCTcsA";
 
 /// The names the server accepts as a grantee or grantor.
 pub fn role_exists(name: &str) -> bool {
-    crate::current_user().is_some_and(|u| u == name)
+    crate::current_user().is_some_and(|u| u == name) || crate::regobj::role_known(name)
 }
 
 /// `aclitemin`: parse a literal to its canonical text. An omitted grantor

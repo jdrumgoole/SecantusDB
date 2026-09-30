@@ -47,6 +47,11 @@ pub fn role_name(oid: i64) -> String {
     })
 }
 
+/// Whether a role of this name exists (the published role catalog).
+pub fn role_known(name: &str) -> bool {
+    ROLES.with(|t| t.borrow().iter().any(|(n, _)| n == name))
+}
+
 pub fn set_roles(v: Vec<(String, i64)>) {
     ROLES.with(|t| *t.borrow_mut() = v);
 }

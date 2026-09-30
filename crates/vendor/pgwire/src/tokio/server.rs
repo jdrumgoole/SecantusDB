@@ -827,8 +827,7 @@ where
 #[cfg(all(test, any(feature = "_ring", feature = "_aws-lc-rs")))]
 mod tests {
     use super::*;
-    use std::fs::File;
-    use std::io::{BufReader, Error as IOError};
+    use std::io::Error as IOError;
     use std::sync::Arc;
     use tokio::sync::oneshot;
     use tokio_rustls::TlsAcceptor;
@@ -837,15 +836,17 @@ mod tests {
     use tokio_rustls::rustls::crypto::CryptoProvider;
 
     fn load_test_server_config() -> Result<rustls::ServerConfig, IOError> {
-        use rustls_pemfile::{certs, pkcs8_private_keys};
-        use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+        use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
-        let certs = certs(&mut BufReader::new(File::open("examples/ssl/server.crt")?))
-            .collect::<Result<Vec<CertificateDer>, _>>()?;
-        let key = pkcs8_private_keys(&mut BufReader::new(File::open("examples/ssl/server.key")?))
-            .map(|key| key.map(PrivateKeyDer::from))
-            .collect::<Result<Vec<PrivateKeyDer>, _>>()?
-            .remove(0);
+        // A throwaway self-signed certificate made per run. Upstream reads
+        // `examples/ssl/server.key`, which this vendored copy does not carry:
+        // the repository keeps private keys out of the tree (`*.key` is
+        // ignored), so the fixture never existed here and both tests failed.
+        let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .map_err(IOError::other)?;
+        let certs = vec![CertificateDer::from(generated.cert.der().to_vec())];
+        let key =
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(generated.key_pair.serialize_der()));
 
         let mut cfg = rustls::ServerConfig::builder()
             .with_no_client_auth()
