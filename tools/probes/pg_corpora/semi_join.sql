@@ -1,0 +1,12 @@
+select id from sj14_a a where exists (select 1 from sj14_b b where b.a_id = a.id) order by 1;
+select id from sj14_a a where not exists (select 1 from sj14_b b where b.a_id = a.id) order by 1 nulls first;
+select id from sj14_a a where exists (select 1 from sj14_b b where a.id = b.a_id and b.w = 'x') order by 1;
+select id from sj14_a a where not exists (select * from sj14_b b where b.a_id = a.id and w is not null) order by 1 nulls first;
+select id from sj14_a a where a.v > 5 and exists (select 1 from sj14_b where sj14_b.a_id = a.id) order by 1;
+select id from sj14_a a where exists (select count(*) from sj14_b b where b.a_id = a.id) order by 1 nulls first;
+select id from sj14_a a where exists (select 1 from sj14_b b where b.a_id = a.id limit 0) order by 1;
+select id, exists (select 1 from sj14_b b where b.a_id = a.id) from sj14_a a order by 1 nulls first;
+select id from sj14_a a where exists (select 1 from sj14_b b where b.a_id = a.id and b.id = a.v / 10) order by 1;
+select id from sj14_a a where exists (select 1 from sj14_b a where a.a_id = 1) order by 1 nulls first;
+select id from sj14_a a where not (not exists (select 1 from sj14_b b where b.a_id = a.id)) order by 1;
+select count(*) from sj14_a a join sj14_b b on b.id = a.id where exists (select 1 from sj14_b c where c.a_id = b.id);

@@ -33,6 +33,7 @@ pub mod fts;
 mod func_cast;
 mod funcsig;
 mod optype;
+mod semijoin;
 pub use errpos::error_position;
 pub mod alter_routine;
 pub mod collation;
@@ -13811,6 +13812,8 @@ fn resolve_sublinks_in_select_scoped(
         resolve_sublinks_in_from(item, lookup, params, run)?;
     }
 
+    // `EXISTS` over one equality, as the uncorrelated `IN` it is.
+    semijoin::rewrite(s, lookup);
     for t in &mut s.target_list {
         if let Some(N::ResTarget(rt)) = t.node.as_mut() {
             if let Some(v) = rt.val.as_deref_mut() {

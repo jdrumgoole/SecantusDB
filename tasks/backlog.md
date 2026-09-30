@@ -6998,9 +6998,17 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
       the select list, ORDER BY, CASE, an UPDATE's SET and an UPDATE / DELETE
       WHERE (which gained a per-row RESIDUAL for this).
 
-      * **Cost**: O(distinct outer values) plans and scans. PostgreSQL turns
-        EXISTS / IN into a semi-join; doing that here (the general JOIN
-        planner now exists) is the performance follow-up. Not measured.
+      * **Cost**: O(distinct outer values) plans and scans. Since batch 14 a
+        WHERE-level `EXISTS` / `NOT EXISTS` over ONE `inner = outer`
+        equality (plus inner-only conjuncts) is rewritten to the uncorrelated
+        `IN` / null-safe `NOT IN` it equals (`semijoin.rs`, corpus
+        `semi_join`): 2,000 x 2,000 rows, debug build, EXISTS 7.2 s -> 46 ms,
+        NOT EXISTS 7.3 s -> 0.73 s. Left: `NOT IN` itself is `$nin`, which
+        the core matcher checks element by element per row (O(rows x list));
+        a hash-set fast path belongs in `secantus-core`'s matcher and must
+        keep BSON equality (numeric cross-type, collation, array descent).
+        Other correlated shapes (two equalities, a correlated IN, a
+        select-list EXISTS) still run per outer value.
       * **The qualifier check still matters**: correlation is detected by a
         qualifier naming nothing inside, because the lowering resolves a
         column by its last name part. `foreign_qualifier` is what routes
