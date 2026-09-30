@@ -618,6 +618,22 @@ pub enum Statement {
         /// `function`, `procedure` or `routine` (either).
         kind: String,
     },
+    /// `ALTER INDEX | SEQUENCE | TYPE | DOMAIN | SCHEMA | TRIGGER | RULE ...
+    /// RENAME`, `ALTER TABLE ... RENAME CONSTRAINT`, `ALTER TYPE ... RENAME
+    /// ATTRIBUTE` and `ALTER DOMAIN ... RENAME CONSTRAINT`.
+    RenameObject {
+        /// `index`, `constraint`, `sequence`, `type`, `attribute`, `domain`,
+        /// `domain constraint`, `schema`, `trigger` or `rule`.
+        kind: String,
+        /// The relation named (an index, a sequence, the table a constraint /
+        /// trigger / rule is on, the composite type of an attribute) or the
+        /// type / domain / schema itself.
+        target: String,
+        /// The constraint, trigger, rule or attribute within `target`.
+        sub: String,
+        to: String,
+        missing_ok: bool,
+    },
     /// `ALTER FUNCTION | PROCEDURE | ROUTINE name[(args)] ...`.
     AlterFunction {
         /// `function`, `procedure` or `routine`.
@@ -5582,6 +5598,50 @@ fn plan_rename(r: &pg_query::protobuf::RenameStmt) -> Result<Statement> {
     if let Some(routine) = alter_routine::plan_rename(r) {
         return routine;
     }
+    // The object renames that are not a table / view / column one.
+    let object_kind = match ObjectType::try_from(r.rename_type) {
+        Ok(ObjectType::ObjectIndex) => Some("index"),
+        Ok(ObjectType::ObjectTabconstraint) => Some("constraint"),
+        Ok(ObjectType::ObjectSequence) => Some("sequence"),
+        Ok(ObjectType::ObjectType) => Some("type"),
+        Ok(ObjectType::ObjectAttribute) => Some("attribute"),
+        Ok(ObjectType::ObjectDomain) => Some("domain"),
+        Ok(ObjectType::ObjectDomconstraint) => Some("domain constraint"),
+        Ok(ObjectType::ObjectSchema) => Some("schema"),
+        Ok(ObjectType::ObjectTrigger) => Some("trigger"),
+        Ok(ObjectType::ObjectRule) => Some("rule"),
+        _ => None,
+    };
+    if let Some(kind) = object_kind {
+        let target = match (
+            &r.relation,
+            r.object.as_deref().and_then(|o| o.node.as_ref()),
+        ) {
+            (Some(rv), _) => relation_name(rv),
+            (None, Some(N::List(l))) => {
+                let parts = string_list(&l.items);
+                match parts.as_slice() {
+                    [schema, bare] if schema == "public" => bare.clone(),
+                    _ => parts.join("."),
+                }
+            }
+            (None, Some(N::TypeName(t))) => type_name_of(t),
+            _ if kind == "schema" => r.subname.clone(),
+            _ => return Err(Error::Parse("RENAME without an object".into())),
+        };
+        let sub = if kind == "schema" {
+            String::new()
+        } else {
+            r.subname.clone()
+        };
+        return Ok(Statement::RenameObject {
+            kind: kind.to_string(),
+            target,
+            sub,
+            to: r.newname.clone(),
+            missing_ok: r.missing_ok,
+        });
+    }
     if ObjectType::try_from(r.rename_type) == Ok(ObjectType::ObjectPolicy) {
         return Ok(Statement::Policy(PolicyChange::Alter {
             name: r.subname.clone(),
@@ -6964,6 +7024,8 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
     // to an unrelated foreign key earlier in the same table.
     let mut last_deferrable: Option<DeferTarget> = None;
     let mut table_pk: Vec<String> = Vec::new();
+    // `CONSTRAINT name PRIMARY KEY`: the key's name, when it was given one.
+    let mut pk_name: Option<String> = None;
     for el in &c.table_elts {
         match el.node.as_ref() {
             Some(N::ColumnDef(cd)) => {
@@ -7037,7 +7099,11 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                         continue;
                     };
                     match CT::try_from(k.contype) {
-                        Ok(CT::ConstrPrimary) => {}
+                        Ok(CT::ConstrPrimary) => {
+                            if !k.conname.is_empty() {
+                                pk_name = Some(k.conname.clone());
+                            }
+                        }
                         Ok(CT::ConstrNotnull) => column.nullable = false,
                         Ok(CT::ConstrNull) => column.nullable = !pk,
                         // A literal DEFAULT is cast to the column's type now
@@ -7178,7 +7244,12 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                     uq.nulls_not_distinct = k.nulls_not_distinct;
                     uniques.push(uq);
                 }
-                Ok(CT::ConstrPrimary) => table_pk = string_list(&k.keys),
+                Ok(CT::ConstrPrimary) => {
+                    table_pk = string_list(&k.keys);
+                    if !k.conname.is_empty() {
+                        pk_name = Some(k.conname.clone());
+                    }
+                }
                 // `EXCLUDE [USING m] (col WITH op, ...)`: each exclusion is a
                 // `[IndexElem, [op]]` pair. An all-`=` one is a UNIQUE (the
                 // Python server's shape); any other operator is enforced row
@@ -7271,6 +7342,9 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
         }
     }
     let mut def = TableDef::new(&table, columns);
+    if let Some(name) = pk_name {
+        def.extra.insert("pk_name", name);
+    }
     def.temp = temp;
     // A self-referencing FOREIGN KEY reads this table's own PK, which is only
     // settled now; a FK to another table is checked against the catalog by

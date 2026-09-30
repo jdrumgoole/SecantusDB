@@ -27,6 +27,7 @@ mod pg_type_facts;
 mod plpgsql_do;
 mod plpgsql_fn;
 mod procedures;
+mod renames;
 mod rules;
 mod server;
 mod table_locks;
@@ -497,6 +498,15 @@ fn plpgsql_create_sql(doc: &Document) -> String {
         "CREATE FUNCTION f({}) RETURNS {returns} AS $secantus_body${body}$secantus_body$ LANGUAGE plpgsql",
         params.join(", ")
     )
+}
+
+/// A table's PRIMARY KEY constraint (and index) name: `<table>_pkey`, or
+/// the name it was given or renamed to.
+pub(crate) fn pk_constraint_name(def: &TableDef) -> String {
+    def.extra
+        .get_str("pk_name")
+        .map(str::to_string)
+        .unwrap_or_else(|_| format!("{}_pkey", def.name))
 }
 
 /// A call's input arguments spread over every declared parameter position
@@ -4793,7 +4803,7 @@ impl PgHandler {
                 .map(|(i, _)| (i + 1) as i32)
                 .collect();
             if !pk.is_empty() {
-                let name = format!("{}_pkey", t.name);
+                let name = pk_constraint_name(&t);
                 out.push(IndexRelation {
                     oid: derived(1, &name),
                     name,
@@ -6295,7 +6305,7 @@ impl PgHandler {
             .unique_constraints
             .iter()
             .map(|u| u.name.clone())
-            .chain(std::iter::once(format!("{}_pkey", def.name)))
+            .chain(std::iter::once(pk_constraint_name(&def)))
             .find(|n| text.contains(n.as_str()))
         else {
             return e;
@@ -6393,7 +6403,7 @@ impl PgHandler {
                 format!("index \"{index}\" for table \"{table}\" does not exist"),
             )
         };
-        if index == format!("{table}_pkey") && def.columns.iter().any(|c| c.pk) {
+        if index == pk_constraint_name(&def) && def.columns.iter().any(|c| c.pk) {
             return Ok(def
                 .columns
                 .iter()
@@ -7723,7 +7733,7 @@ impl PgHandler {
                         found = true;
                     }
                 }
-                if !found && *con == format!("{name}_pkey") && def.columns.iter().any(|c| c.pk) {
+                if !found && *con == pk_constraint_name(&def) && def.columns.iter().any(|c| c.pk) {
                     match &comment {
                         Some(text) => {
                             def.extra.insert("pk_comment", text.clone());
@@ -10496,7 +10506,7 @@ impl PgHandler {
                         rows.push(d);
                     };
                     if t.columns.iter().any(|c| c.pk) {
-                        push(&format!("{}_pkey", t.name), "PRIMARY KEY", &mut rows);
+                        push(&pk_constraint_name(&t), "PRIMARY KEY", &mut rows);
                     }
                     for u in &t.unique_constraints {
                         push(&u.name, "UNIQUE", &mut rows);
@@ -10544,7 +10554,7 @@ impl PgHandler {
                     // key column, which is why a count over this view is one
                     // for a single-column primary key rather than one per
                     // constraint of any kind.
-                    let pkey = format!("{}_pkey", t.name);
+                    let pkey = pk_constraint_name(&t);
                     for (i, c) in t.columns.iter().filter(|c| c.pk).enumerate() {
                         push(&pkey, &c.name, (i + 1) as i32, &mut rows);
                     }
@@ -10868,7 +10878,7 @@ impl PgHandler {
                         let mut d = Document::new();
                         d.insert(f("schemaname"), schema.as_str());
                         d.insert(f("tablename"), t.name.as_str());
-                        d.insert(f("indexname"), format!("{}_pkey", t.name));
+                        d.insert(f("indexname"), pk_constraint_name(&t));
                         d.insert(f("tablespace"), Bson::Null);
                         d.insert(
                             f("indexdef"),
@@ -12489,7 +12499,7 @@ impl PgHandler {
                         .collect();
                     if !pk_cols.is_empty() {
                         push(
-                            format!("{}_pkey", t.name),
+                            pk_constraint_name(t),
                             "p",
                             pk_cols,
                             false,
@@ -12962,7 +12972,7 @@ impl PgHandler {
         let columns: Vec<String> = match target {
             secantus_pgplan::ConflictTarget::Columns(cols) => cols.clone(),
             secantus_pgplan::ConflictTarget::Constraint(name) => {
-                if *name == format!("{}_pkey", def.name) {
+                if *name == pk_constraint_name(def) {
                     def.columns
                         .iter()
                         .filter(|c| c.pk)
@@ -13135,7 +13145,7 @@ impl PgHandler {
             }
             let mut info = Self::unique_violation(table, def, &pattern, &value, None);
             if let PgWireError::UserError(i) = &mut info {
-                let name = format!("{table}_pkey");
+                let name = pk_constraint_name(def);
                 i.message = format!("duplicate key value violates unique constraint \"{name}\"");
                 i.constraint = Some(name);
             }
@@ -13155,7 +13165,7 @@ impl PgHandler {
         // The constraint whose columns these are; the `_id` index is the PK.
         let is_pk = key_pattern.keys().any(|f| f == "_id");
         let name = if is_pk {
-            format!("{table}_pkey")
+            pk_constraint_name(def)
         } else if let Some(index) = index.filter(|i| *i != "_id_") {
             // The storage index IS the constraint (a declared UNIQUE's index
             // takes its name) or the `CREATE UNIQUE INDEX` itself, which is
@@ -14802,6 +14812,21 @@ impl PgHandler {
                 vec![Self::BASE_TYPE_COLLECTION.to_string()]
             }
             Statement::Grant { .. } => Self::grant_collections().map(String::from).to_vec(),
+            // A rename rewrites the catalog rows naming the object, and an
+            // expression index's hidden field in the rows.
+            Statement::RenameObject { target, .. } => vec![
+                target.clone(),
+                CATALOG_COLLECTION.to_string(),
+                SEQUENCE_COLLECTION.to_string(),
+                triggers::TRIGGER_COLLECTION.to_string(),
+                rules::RULE_COLLECTION.to_string(),
+                Self::ENUM_COLLECTION.to_string(),
+                Self::COMPOSITE_COLLECTION.to_string(),
+                Self::RANGE_COLLECTION.to_string(),
+                Self::DOMAIN_COLLECTION.to_string(),
+                Self::BASE_TYPE_COLLECTION.to_string(),
+                Self::SCHEMA_COLLECTION.to_string(),
+            ],
             Statement::AlterEnum { .. } => vec![Self::ENUM_COLLECTION.to_string()],
             Statement::Policy(_) => vec![Self::POLICY_COLLECTION.to_string()],
             Statement::RefreshMatView { name, .. } => {
@@ -15083,7 +15108,7 @@ impl PgHandler {
                     def.check_constraints.iter().any(|c| c.name == n)
                         || def.unique_constraints.iter().any(|u| u.name == n)
                         || def.foreign_keys.iter().any(|f| f.name == n)
-                        || (def.columns.iter().any(|c| c.pk) && n == format!("{table}_pkey"))
+                        || (def.columns.iter().any(|c| c.pk) && n == pk_constraint_name(&def))
                 };
                 if taken(&fk.name) {
                     if *named {
@@ -19689,6 +19714,16 @@ impl PgHandler {
                 "routine" => "ALTER ROUTINE",
                 _ => "ALTER FUNCTION",
             },
+            Statement::RenameObject { kind, .. } => match kind.as_str() {
+                "index" => "ALTER INDEX",
+                "constraint" => "ALTER TABLE",
+                "sequence" => "ALTER SEQUENCE",
+                "trigger" => "ALTER TRIGGER",
+                "rule" => "ALTER RULE",
+                "domain" | "domain constraint" => "ALTER DOMAIN",
+                "schema" => "ALTER SCHEMA",
+                _ => "ALTER TYPE",
+            },
             Statement::CreateAggregate { .. } => "CREATE AGGREGATE",
             Statement::Catalog(op) => op.tag(),
             Statement::Sequence(tag, _) => tag,
@@ -21167,6 +21202,13 @@ impl PgHandler {
                 arg_types,
                 action,
             } => self.alter_function(&kind, &name, arg_types, action),
+            Statement::RenameObject {
+                kind,
+                target,
+                sub,
+                to,
+                missing_ok,
+            } => self.rename_object(&kind, &target, &sub, &to, missing_ok),
             Statement::DropFunction {
                 name,
                 arg_types,
