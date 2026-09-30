@@ -64,6 +64,12 @@ pub trait Host {
     fn execute(&self, sql: &str, params: &[Bson], types: &[String]) -> Result<u64, PlError>;
     /// A `RAISE` below ERROR: `(severity, sqlstate, message)`.
     fn notice(&self, severity: &str, sqlstate: &str, message: String);
+    /// Run an INSERT / UPDATE / DELETE and answer its RETURNING rows
+    /// (`... RETURNING ... INTO`).
+    fn returning(&self, sql: &str, params: &[Bson], types: &[String]) -> Result<QueryOut, PlError> {
+        let _ = (sql, params, types);
+        Err(PlError::unsupported("INSERT / UPDATE / DELETE ... RETURNING INTO"))
+    }
 }
 
 /// A record value: its columns (name, type) and their values, or NULL.
@@ -1172,12 +1178,13 @@ impl Interp<'_> {
                     || head.starts_with("with")
                     || head.starts_with("values");
                 if into {
-                    if !is_query {
-                        return Err(PlError::unsupported(
-                            "INSERT / UPDATE / DELETE ... RETURNING INTO",
-                        ));
-                    }
-                    let out = self.host.query(&sql, &params, &types)?;
+                    let out = if is_query {
+                        self.host.query(&sql, &params, &types)?
+                    } else {
+                        // A write with `RETURNING ... INTO`: its returned
+                        // row fills the target, as a SELECT INTO's would.
+                        self.host.returning(&sql, &params, &types)?
+                    };
                     if strict && out.rows.is_empty() {
                         return Err(PlError::new("P0002", "query returned no rows"));
                     }

@@ -1,0 +1,215 @@
+//! The object-identifier types beyond `regtype` / `regclass`:
+//! `regnamespace`, `regrole`, `regproc` and `regprocedure`. Each is an oid
+//! that renders as its object's name, so a value is a tagged document holding
+//! the oid (as `regclass` is), compared and filtered by that oid, and cast to
+//! text as the name. The names come from tables the executor publishes per
+//! statement. Measured against PostgreSQL 14.
+
+use bson::{Bson, Document};
+
+use crate::{Error, Result};
+
+/// `(type name, document key)`.
+pub const KINDS: &[(&str, &str)] = &[
+    ("regnamespace", "__regnamespace_oid"),
+    ("regrole", "__regrole_oid"),
+    ("regproc", "__regproc_oid"),
+    ("regprocedure", "__regprocedure_oid"),
+];
+
+thread_local! {
+    static NAMESPACES: std::cell::RefCell<Vec<(String, i64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static ROLES: std::cell::RefCell<Vec<(String, i64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// `(name, oid, argument types as regprocedure prints them)`.
+    static PROCS: std::cell::RefCell<Vec<(String, i64, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub fn set_namespaces(v: Vec<(String, i64)>) {
+    NAMESPACES.with(|t| *t.borrow_mut() = v);
+}
+pub fn set_roles(v: Vec<(String, i64)>) {
+    ROLES.with(|t| *t.borrow_mut() = v);
+}
+pub fn set_procs(v: Vec<(String, i64, String)>) {
+    PROCS.with(|t| *t.borrow_mut() = v);
+}
+
+pub fn is_kind(t: &str) -> bool {
+    KINDS.iter().any(|(k, _)| *k == t)
+}
+
+pub fn value(kind: &str, oid: i64) -> Bson {
+    let key = KINDS
+        .iter()
+        .find(|(k, _)| *k == kind)
+        .map_or("__regnamespace_oid", |(_, key)| *key);
+    let mut d = Document::new();
+    d.insert(key, Bson::Int64(oid));
+    Bson::Document(d)
+}
+
+/// `(kind, oid)` of a value of one of these types.
+pub fn from_bson(v: &Bson) -> Option<(&'static str, i64)> {
+    let Bson::Document(d) = v else { return None };
+    if d.len() != 1 {
+        return None;
+    }
+    KINDS
+        .iter()
+        .find_map(|(kind, key)| d.get_i64(key).ok().map(|oid| (*kind, oid)))
+}
+
+/// The name an oid of `kind` renders as; an oid naming nothing prints as
+/// the number, and 0 as `-`.
+pub fn text(kind: &str, oid: i64) -> String {
+    if oid == 0 {
+        return "-".into();
+    }
+    let found = match kind {
+        "regnamespace" => NAMESPACES.with(|t| {
+            t.borrow()
+                .iter()
+                .find(|(_, o)| *o == oid)
+                .map(|(n, _)| crate::scalar::quote_identifier(n))
+        }),
+        "regrole" => ROLES.with(|t| {
+            t.borrow()
+                .iter()
+                .find(|(_, o)| *o == oid)
+                .map(|(n, _)| crate::scalar::quote_identifier(n))
+        }),
+        "regproc" => PROCS.with(|t| {
+            t.borrow()
+                .iter()
+                .find(|(_, o, _)| *o == oid)
+                .map(|(n, _, _)| n.clone())
+        }),
+        _ => PROCS.with(|t| {
+            t.borrow()
+                .iter()
+                .find(|(_, o, _)| *o == oid)
+                .map(|(n, _, args)| format!("{n}({args})"))
+        }),
+    };
+    found.unwrap_or_else(|| oid.to_string())
+}
+
+fn unquote(name: &str) -> String {
+    let t = name.trim();
+    match t.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        Some(inner) => inner.replace("\"\"", "\""),
+        None => t.to_ascii_lowercase(),
+    }
+}
+
+/// The oid a name of `kind` resolves to (a number stands for itself).
+pub fn resolve(kind: &str, input: &str) -> Result<i64> {
+    if let Ok(oid) = input.trim().parse::<i64>() {
+        return Ok(oid);
+    }
+    match kind {
+        "regnamespace" => {
+            let name = unquote(input);
+            NAMESPACES
+                .with(|t| t.borrow().iter().find(|(n, _)| *n == name).map(|(_, o)| *o))
+                .ok_or_else(|| Error::Sqlstate("3F000", format!("schema \"{name}\" does not exist")))
+        }
+        "regrole" => {
+            let name = unquote(input);
+            ROLES
+                .with(|t| t.borrow().iter().find(|(n, _)| *n == name).map(|(_, o)| *o))
+                .ok_or_else(|| Error::UndefinedObject(format!("role \"{name}\" does not exist")))
+        }
+        "regproc" => {
+            let name = unquote(input);
+            let hits: Vec<i64> = PROCS.with(|t| {
+                t.borrow()
+                    .iter()
+                    .filter(|(n, _, _)| *n == name)
+                    .map(|(_, o, _)| *o)
+                    .collect()
+            });
+            match hits.as_slice() {
+                [one] => Ok(*one),
+                [] => Err(Error::UndefinedFunction(format!(
+                    "function \"{name}\" does not exist"
+                ))),
+                _ => Err(Error::Sqlstate(
+                    "42725",
+                    format!("more than one function named \"{name}\""),
+                )),
+            }
+        }
+        _ => {
+            // `name(argtypes)`.
+            let (name, args) = input
+                .trim()
+                .split_once('(')
+                .map(|(n, a)| (unquote(n), a.trim_end_matches(')').trim().to_string()))
+                .ok_or_else(|| {
+                    Error::Sqlstate(
+                        "22P02",
+                        format!("invalid input syntax for type regprocedure: \"{input}\""),
+                    )
+                })?;
+            let wanted: Vec<String> = args
+                .split(',')
+                .map(|a| {
+                    let a = a.trim();
+                    // Any spelling of a type (`int`, `integer`) as its
+                    // canonical name, then as PostgreSQL displays it.
+                    let canonical = crate::pgtypes::oid_of_name(a)
+                        .and_then(crate::pgtypes::name_of_oid)
+                        .map_or_else(|| a.to_string(), str::to_string);
+                    crate::display_type(&canonical)
+                })
+                .filter(|a| !a.is_empty())
+                .collect();
+            PROCS
+                .with(|t| {
+                    t.borrow()
+                        .iter()
+                        .find(|(n, _, a)| {
+                            *n == name
+                                && a.split(',').map(str::trim).filter(|x| !x.is_empty()).collect::<Vec<_>>()
+                                    == wanted.iter().map(String::as_str).collect::<Vec<_>>()
+                        })
+                        .map(|(_, o, _)| *o)
+                })
+                .ok_or_else(|| {
+                    Error::UndefinedFunction(format!("function \"{input}\" does not exist"))
+                })
+        }
+    }
+}
+
+/// A cast involving one of these types: from its value, or to it.
+pub fn cast(value: &Bson, target: &str) -> Option<Result<Bson>> {
+    if let Some((kind, oid)) = from_bson(value) {
+        return Some(match target {
+            t if t == kind => Ok(value.clone()),
+            "text" | "varchar" | "name" | "bpchar" => Ok(Bson::String(text(kind, oid))),
+            "int4" | "int8" | "oid" | "integer" | "int" | "bigint" => Ok(Bson::Int64(oid)),
+            t if is_kind(t) => Ok(self::value(t, oid)),
+            _ => Err(Error::CannotCoerce(format!(
+                "cannot cast type {kind} to {}",
+                crate::display_type(target)
+            ))),
+        });
+    }
+    if !is_kind(target) {
+        return None;
+    }
+    Some(match value {
+        Bson::Int32(o) => Ok(self::value(target, i64::from(*o))),
+        Bson::Int64(o) => Ok(self::value(target, *o)),
+        Bson::String(s) => resolve(target, s).map(|o| self::value(target, o)),
+        other => Err(Error::CannotCoerce(format!(
+            "cannot cast type {} to {target}",
+            crate::display_type(crate::inferred_type(other))
+        ))),
+    })
+}

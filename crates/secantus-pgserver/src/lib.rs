@@ -507,6 +507,7 @@ fn user_fn_of(d: &Document) -> secantus_pgplan::UserFn {
             || d.get_bool("is_table").unwrap_or(false),
         columns,
         variadic: d.get_bool("variadic").unwrap_or(false),
+        key: d.get_str("_id").unwrap_or_default().to_string(),
     }
 }
 
@@ -603,6 +604,17 @@ impl plpgsql_fn::Host for PlHost<'_> {
                 _ => None,
             })
             .sum::<usize>() as u64)
+    }
+
+    fn returning(
+        &self,
+        sql: &str,
+        params: &[Bson],
+        types: &[String],
+    ) -> Result<plpgsql_fn::QueryOut, plpgsql_fn::PlError> {
+        let stmt = self.plan(sql, params, types)?;
+        let (columns, rows) = self.h.dml_returning_values(stmt).map_err(|e| pl_error(&e))?;
+        Ok(plpgsql_fn::QueryOut { columns, rows })
     }
 
     fn notice(&self, severity: &str, sqlstate: &str, message: String) {
@@ -1389,6 +1401,9 @@ struct UserFunction {
     param_types: Vec<String>,
     return_type: String,
     language: String,
+    /// The catalog key: `name/nargs`, or for a second overload at the same
+    /// arity `name/nargs/types`.
+    key: String,
 }
 
 /// What a type name resolves to when a function declares it.
@@ -1729,6 +1744,33 @@ impl PgHandler {
         secantus_pgplan::set_views(views);
         secantus_pgplan::view_dml::set_checked_views(checked);
         secantus_pgplan::partitions::set_tableoids(self.tableoid_expressions());
+        secantus_pgplan::regobj::set_namespaces(self.namespaces());
+        secantus_pgplan::regobj::set_roles(
+            std::iter::once((self.session_user_name(), 10i64))
+                .chain(
+                    self.roles()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|r| (r.name, r.oid)),
+                )
+                .collect(),
+        );
+        secantus_pgplan::regobj::set_procs(
+            self.functions()
+                .unwrap_or_default()
+                .iter()
+                .map(|f| {
+                    let args: Vec<String> =
+                        f.param_types.iter().map(|t| self.display_type_name(t)).collect();
+                    (
+                        f.name.clone(),
+                        Self::index_oid(&format!("fn:{}", f.key)),
+                        // `regprocedure` prints `f(integer,text)`, no spaces.
+                        args.join(","),
+                    )
+                })
+                .collect(),
+        );
         secantus_pgplan::instead_of::set_instead_of_triggers(
             self.trigger_docs()
                 .unwrap_or_default()
@@ -2646,7 +2688,92 @@ impl PgHandler {
     /// subquery's own `SELECT` and passes that, so nothing that writes can
     /// reach here. The error type is the planner's, because its caller is
     /// mid-plan and has no wire error to return yet.
+    /// Run a DML statement and answer its RETURNING rows as values (none
+    /// when it has no RETURNING): a data-modifying WITH, and PL/pgSQL's
+    /// `... RETURNING ... INTO`.
+    pub(crate) fn dml_returning_values(
+        &self,
+        stmt: Statement,
+    ) -> PgWireResult<(Vec<(String, String)>, Vec<Vec<Bson>>)> {
+        let previous = self
+            .cursor_capture
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(Vec::new());
+        let responses = self.execute_statement(stmt, 0);
+        let restore = |this: &Self| {
+            std::mem::replace(
+                &mut *this.cursor_capture.lock().unwrap_or_else(|e| e.into_inner()),
+                previous.clone(),
+            )
+        };
+        let responses = match responses {
+            Ok(r) => r,
+            Err(e) => {
+                restore(self);
+                return Err(e);
+            }
+        };
+        let mut columns = Vec::new();
+        for r in responses {
+            if let Response::Query(q) = r {
+                columns = q
+                    .row_schema
+                    .iter()
+                    .map(|f| {
+                        let ty = secantus_pgplan::pgtypes::name_of_oid(i64::from(f.datatype().oid()))
+                            .unwrap_or("text")
+                            .to_string();
+                        (f.name().to_string(), ty)
+                    })
+                    .collect();
+                // The rows are produced as the stream is read; reading it is
+                // what fills the capture.
+                futures::executor::block_on(q.data_rows.try_collect::<Vec<_>>())?;
+            }
+        }
+        let captured = restore(self).unwrap_or_default();
+        let rows = captured
+            .into_iter()
+            .map(|r| r.into_iter().map(|v| v.unwrap_or(Bson::Null)).collect())
+            .collect();
+        Ok((columns, rows))
+    }
+
+    /// A wire error as a planner error, its SQLSTATE kept.
+    fn plan_error_of(e: PgWireError) -> PlanError {
+        match e {
+            PgWireError::UserError(info) => {
+                let code: &'static str = Box::leak(info.code.clone().into_boxed_str());
+                PlanError::Sqlstate(code, info.message.clone())
+            }
+            other => PlanError::Internal(other.to_string()),
+        }
+    }
+
     fn subquery_rows(&self, stmt: &Statement) -> std::result::Result<Vec<Vec<Bson>>, PlanError> {
+        // A data-modifying WITH item runs here, once, and its RETURNING rows
+        // stand in for it.
+        if matches!(
+            stmt,
+            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+        ) {
+            let run = || self.dml_returning_values(stmt.clone());
+            let out = match self.txn.try_lock() {
+                Ok(mut guard) => match guard.as_mut() {
+                    Some(handle) => self
+                        .storage
+                        .with_user_transaction(handle, run)
+                        .map_err(|e| PlanError::Internal(format!("could not run a WITH item: {e}")))?,
+                    None => {
+                        drop(guard);
+                        run()
+                    }
+                },
+                Err(_) => run(),
+            };
+            return out.map(|(_, rows)| rows).map_err(Self::plan_error_of);
+        }
         // INSIDE the open transaction, because a WiredTiger transaction reads
         // its own snapshot and this read happens during PLANNING -- outside
         // the `with_user_transaction` scope that the statement's execution
@@ -4016,10 +4143,34 @@ impl PgHandler {
                 param_types: strings("param_types"),
                 return_type: d.get_str("return_tag").unwrap_or_default().to_string(),
                 language: d.get_str("language").unwrap_or_default().to_string(),
+                key: d.get_str("_id").unwrap_or_default().to_string(),
             });
         }
         out.sort();
         Ok(out)
+    }
+
+    /// Every schema, `(name, oid)`: PostgreSQL's own under their fixed oids
+    /// (pg_catalog 11, pg_toast 99, public 2200; information_schema's is
+    /// assigned at initdb and 13 stands in for it), then the ones CREATE
+    /// SCHEMA made, each under an oid derived from its name.
+    fn namespaces(&self) -> Vec<(String, i64)> {
+        let mut out: Vec<(String, i64)> = vec![
+            ("public".into(), Self::PUBLIC_NAMESPACE_OID),
+            ("pg_catalog".into(), 11),
+            ("information_schema".into(), 13),
+            ("pg_toast".into(), 99),
+        ];
+        if let Ok(docs) = self.type_catalog_docs(Self::SCHEMA_COLLECTION) {
+            for d in docs.iter() {
+                if let Ok(name) = d.get_str("_id") {
+                    if !out.iter().any(|(n, _)| n == name) {
+                        out.push((name.to_string(), Self::index_oid(&format!("ns:{name}"))));
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// A function's signature as PostgreSQL prints it in messages:
@@ -4206,7 +4357,22 @@ impl PgHandler {
         def: secantus_pgplan::UserFunctionDef,
     ) -> PgWireResult<Vec<Response>> {
         let nargs = def.params.len();
-        let key = format!("{}/{nargs}", def.name);
+        // `name/nargs` is the shared catalog's key; an OVERLOAD at the same
+        // arity (different argument types) takes `name/nargs/types`, which the
+        // Python server does not know to look for.
+        let base_key = format!("{}/{nargs}", def.name);
+        let new_types: Vec<String> = def.params.iter().map(|(_, t)| t.clone()).collect();
+        let same_arity: Vec<UserFunction> = self
+            .functions()?
+            .into_iter()
+            .filter(|f| f.name == def.name && f.param_types.len() == nargs)
+            .collect();
+        let same_signature = same_arity.iter().find(|f| f.param_types == new_types);
+        let key = match same_signature {
+            Some(f) => f.key.clone(),
+            None if same_arity.is_empty() => base_key,
+            None => format!("{base_key}/{}", new_types.join(",")),
+        };
         let doc = bson::doc! {
             "_id": &key,
             "name": &def.name,
@@ -4302,7 +4468,11 @@ impl PgHandler {
         u: &secantus_pgplan::UserFn,
         args: &[Bson],
     ) -> PgWireResult<secantus_pgplan::FnResult> {
-        let key = format!("{}/{}", u.name, u.arg_types.len());
+        let key = if u.key.is_empty() {
+            format!("{}/{}", u.name, u.arg_types.len())
+        } else {
+            u.key.clone()
+        };
         let doc = self
             .user_function_docs()?
             .into_iter()
@@ -6823,6 +6993,34 @@ impl PgHandler {
                     Column::new("indexdef", "text", false),
                 ],
             )),
+            "pg_proc" => Some(TableDef::new(
+                "pg_proc",
+                vec![
+                    Column::new("oid", "oid", false),
+                    Column::new("proname", "name", false),
+                    Column::new("pronamespace", "oid", false),
+                    Column::new("proowner", "oid", false),
+                    Column::new("prolang", "oid", false),
+                    Column::new("prokind", secantus_pgplan::QUOTED_CHAR, false),
+                    Column::new("prosecdef", "bool", false),
+                    Column::new("proisstrict", "bool", false),
+                    Column::new("proretset", "bool", false),
+                    Column::new("provolatile", secantus_pgplan::QUOTED_CHAR, false),
+                    Column::new("pronargs", "int2", false),
+                    Column::new("prorettype", "oid", false),
+                    Column::new("proargtypes", "oidvector", false),
+                    Column::new("proargnames", "text[]", false),
+                    Column::new("prosrc", "text", false),
+                ],
+            )),
+            "pg_language" => Some(TableDef::new(
+                "pg_language",
+                vec![
+                    Column::new("oid", "oid", false),
+                    Column::new("lanname", "name", false),
+                    Column::new("lanpltrusted", "bool", false),
+                ],
+            )),
             "pg_trigger" => Some(TableDef::new(
                 "pg_trigger",
                 vec![
@@ -7512,23 +7710,12 @@ impl PgHandler {
             }
             "pg_namespace" => {
                 let f = |name: &str| def.field_of(name).expect("column");
-                ["public", "pg_catalog", "information_schema", "pg_toast"]
-                    .iter()
-                    .map(|name| {
+                self.namespaces()
+                    .into_iter()
+                    .map(|(name, oid)| {
                         let mut d = Document::new();
-                        // PostgreSQL's own oids: pg_catalog 11, pg_toast 99,
-                        // public 2200 (information_schema's is assigned at
-                        // initdb; 13 stands in for it).
-                        d.insert(
-                            f("oid"),
-                            Bson::Int64(match *name {
-                                "public" => Self::PUBLIC_NAMESPACE_OID,
-                                "pg_catalog" => 11,
-                                "pg_toast" => 99,
-                                _ => 13,
-                            }),
-                        );
-                        d.insert(f("nspname"), *name);
+                        d.insert(f("oid"), Bson::Int64(oid));
+                        d.insert(f("nspname"), name);
                         d.insert(f("nspowner"), Bson::Int64(10));
                         d
                     })
@@ -7935,6 +8122,92 @@ impl PgHandler {
                         d.insert(f("qual"), render(p.get_str("using").ok()));
                         d.insert(f("with_check"), render(p.get_str("check").ok()));
                         d
+                    })
+                    .collect()
+            }
+            "pg_language" => {
+                let f = |name: &str| def.field_of(name).expect("column");
+                [(12i64, "internal", false), (13, "c", false), (14, "sql", true), (14078, "plpgsql", true)]
+                    .iter()
+                    .map(|(oid, name, trusted)| {
+                        let mut d = Document::new();
+                        d.insert(f("oid"), Bson::Int64(*oid));
+                        d.insert(f("lanname"), *name);
+                        d.insert(f("lanpltrusted"), *trusted);
+                        d
+                    })
+                    .collect()
+            }
+            "pg_proc" => {
+                let f = |name: &str| def.field_of(name).expect("column");
+                let type_oid = |t: &str| -> i64 {
+                    secantus_pgplan::pgtypes::oid_of_name(t)
+                        .or_else(|| self.relation_oid(t))
+                        .unwrap_or(0)
+                };
+                self.type_catalog_docs(Self::FUNCTION_COLLECTION)
+                    .ok()?
+                    .iter()
+                    .map(|d| {
+                        let strings = |key: &str| -> Vec<String> {
+                            d.get_array(key)
+                                .map(|a| a.iter().map(|v| v.as_str().unwrap_or_default().to_string()).collect())
+                                .unwrap_or_default()
+                        };
+                        let types = strings("param_types");
+                        let names = strings("params");
+                        let lang = match d.get_str("language").unwrap_or_default() {
+                            "sql" => 14i64,
+                            "plpgsql" => 14078,
+                            "c" => 13,
+                            _ => 12,
+                        };
+                        let mut row = Document::new();
+                        row.insert(
+                            f("oid"),
+                            Bson::Int64(Self::index_oid(&format!(
+                                "fn:{}",
+                                d.get_str("_id").unwrap_or_default()
+                            ))),
+                        );
+                        row.insert(f("proname"), d.get_str("name").unwrap_or_default());
+                        row.insert(f("pronamespace"), Bson::Int64(Self::PUBLIC_NAMESPACE_OID));
+                        row.insert(f("proowner"), Bson::Int64(10));
+                        row.insert(f("prolang"), Bson::Int64(lang));
+                        row.insert(f("prokind"), "f");
+                        row.insert(f("prosecdef"), false);
+                        row.insert(f("proisstrict"), false);
+                        row.insert(
+                            f("proretset"),
+                            d.get_bool("returns_set").unwrap_or(false),
+                        );
+                        row.insert(
+                            f("provolatile"),
+                            match d.get_str("volatility").unwrap_or("volatile") {
+                                "immutable" => "i",
+                                "stable" => "s",
+                                _ => "v",
+                            },
+                        );
+                        row.insert(f("pronargs"), Bson::Int32(types.len() as i32));
+                        row.insert(
+                            f("prorettype"),
+                            Bson::Int64(type_oid(d.get_str("return_tag").unwrap_or("void"))),
+                        );
+                        row.insert(
+                            f("proargtypes"),
+                            Bson::Array(types.iter().map(|t| Bson::Int64(type_oid(t))).collect()),
+                        );
+                        row.insert(
+                            f("proargnames"),
+                            if names.iter().all(|n| n.is_empty()) {
+                                Bson::Null
+                            } else {
+                                Bson::Array(names.into_iter().map(Bson::String).collect())
+                            },
+                        );
+                        row.insert(f("prosrc"), d.get_str("body").unwrap_or_default());
+                        row
                     })
                     .collect()
             }
@@ -8663,6 +8936,14 @@ impl PgHandler {
                             Vec::new(),
                             &mut rows,
                         );
+                        // `conbin` is the expression; `pg_get_expr(conbin,
+                        // conrelid)` -- which is how a client reads a CHECK
+                        // back -- answers it as ruleutils prints it.
+                        if let Some(row) = rows.last_mut() {
+                            let text = secantus_pgplan::generation_expression(&ck.expression)
+                                .unwrap_or_else(|| format!("({})", ck.expression));
+                            row.insert(field("conbin"), text);
+                        }
                     }
                     for fk in &t.foreign_keys {
                         let cols: Vec<i32> = fk.columns.iter().filter_map(|c| attnum(c)).collect();
@@ -9492,6 +9773,10 @@ fn internal_type_name(ty: &Type) -> Option<String> {
             650 => "cidr",
             1033 => "aclitem",
             603 => "box",
+            24 => "regproc",
+            2202 => "regprocedure",
+            4089 => "regnamespace",
+            4096 => "regrole",
             600 => "point",
             601 => "lseg",
             602 => "path",
@@ -9656,6 +9941,10 @@ fn wire_type(pg_type: &str) -> Type {
         // 25 would print the same characters but compare unequal to a regtype.
         "regtype" => Type::REGTYPE,
         "regclass" => Type::REGCLASS,
+        "regnamespace" => Type::REGNAMESPACE,
+        "regrole" => Type::REGROLE,
+        "regproc" => Type::REGPROC,
+        "regprocedure" => Type::REGPROCEDURE,
         // A real oid column type: psycopg's numeric tests read the oid back
         // and check `ftype(0) == 26`.
         "oid" => Type::OID,
@@ -15497,16 +15786,35 @@ impl PgHandler {
                             }
                         }
                     }
+                    // What PostgreSQL names each dependant: `type s.t`.
+                    let descs: Vec<String> = members
+                        .iter()
+                        .map(|(_, id)| {
+                            if id.contains('.') {
+                                format!("type {id}")
+                            } else {
+                                format!("type {name}.{id}")
+                            }
+                        })
+                        .collect();
                     if !members.is_empty() && !cascade {
                         let mut info = ErrorInfo::new(
                             "ERROR".into(),
                             "2BP01".into(),
                             format!("cannot drop schema {name} because other objects depend on it"),
                         );
+                        info.detail = Some(
+                            descs
+                                .iter()
+                                .map(|d| format!("{d} depends on schema {name}"))
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        );
                         info.hint =
                             Some("Use DROP ... CASCADE to drop the dependent objects too.".into());
                         return Err(PgWireError::UserError(Box::new(info)));
                     }
+                    self.cascade_notice(&descs);
                     for (coll, id) in &members {
                         self.delete_type_doc(coll, id)?;
                     }
@@ -15955,6 +16263,7 @@ impl PgHandler {
                                 param_types: keys.clone(),
                                 return_type: String::new(),
                                 language: String::new(),
+                                key: String::new(),
                             };
                             let sig = self.function_signature(&probe);
                             if if_exists {
@@ -16111,7 +16420,11 @@ impl PgHandler {
                         }
                     }
                 }
-                let id_key = format!("{}/{}", target.name, target.param_types.len());
+                let id_key = if target.key.is_empty() {
+                    format!("{}/{}", target.name, target.param_types.len())
+                } else {
+                    target.key.clone()
+                };
                 self.delete_type_doc(Self::FUNCTION_COLLECTION, &id_key)?;
                 tag()
             }
@@ -16784,6 +17097,11 @@ impl PgHandler {
                     }
                     let Some(def) = self.lookup(table) else {
                         if drop.if_exists {
+                            self.notice(
+                                "00000",
+                                format!("table \"{table}\" does not exist, skipping"),
+                                None,
+                            );
                             continue;
                         }
                         return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -19290,7 +19608,11 @@ fn copy_reassemble(d: &Document, field: &str, ty: &Type) -> Option<Bson> {
 /// every type, and the gap is recorded in `tasks/backlog.md` rather than
 /// hidden.
 fn binary_encodable(ty: &Type) -> bool {
-    const OK: [Type; 56] = [
+    const OK: [Type; 60] = [
+        Type::REGNAMESPACE,
+        Type::REGROLE,
+        Type::REGPROC,
+        Type::REGPROCEDURE,
         Type::POINT_ARRAY,
         Type::LSEG_ARRAY,
         Type::PATH_ARRAY,
@@ -19686,8 +20008,16 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
             return enc.encode_field(&Some(out));
         }
     }
-    // A regtype / regclass is its 4-byte oid.
-    if matches!(*ty, Type::REGTYPE | Type::REGCLASS) {
+    // A regtype / regclass (and the other reg types) is its 4-byte oid.
+    if matches!(
+        *ty,
+        Type::REGTYPE
+            | Type::REGCLASS
+            | Type::REGNAMESPACE
+            | Type::REGROLE
+            | Type::REGPROC
+            | Type::REGPROCEDURE
+    ) {
         let oid = secantus_pgplan::regtype_oid(v)
             .or_else(|| secantus_pgplan::regclass_oid(v))
             .or_else(|| match v {
@@ -20586,6 +20916,11 @@ fn encode_value(enc: &mut DataRowEncoder, v: Option<&Bson>) -> PgWireResult<()> 
         // A regtype is an oid in a document; the wire wants its display name.
         if let Some(oid) = secantus_pgplan::regtype_oid(value) {
             return enc.encode_field(&Some(secantus_pgplan::regtype_text(oid).as_str()));
+        }
+        // regnamespace / regrole / regproc / regprocedure: an oid whose text
+        // is its object's name.
+        if let Some((kind, oid)) = secantus_pgplan::regobj::from_bson(value) {
+            return enc.encode_field(&Some(secantus_pgplan::regobj::text(kind, oid).as_str()));
         }
         // A regclass likewise: an oid whose text is the relation's name.
         if let Some(oid) = secantus_pgplan::regclass_oid(value) {
@@ -22004,6 +22339,10 @@ impl ToSqlText for RawField {
 /// prefix). Mirrors the single-value arms of `encode_binary`; returns `None`
 /// for an element type whose binary layout this server does not emit.
 fn element_binary(v: &Bson, elem: &Type) -> Option<Vec<u8>> {
+    // An ARRAY element (a composite's array field): its own array framing.
+    if let (postgres_types::Kind::Array(inner), Bson::Array(items)) = (elem.kind(), v) {
+        return array_binary(items, inner);
+    }
     // A geometric element: its type's `*_send` layout.
     if matches!(
         *elem,

@@ -34,6 +34,7 @@ pub mod partitions;
 pub mod instead_of;
 pub mod pgcrypto;
 pub mod geom;
+pub mod regobj;
 pub use correlated::set_user_functions;
 pub use correlated::{
     with_correlated_runner, with_function_hook, with_sequence_hook, FnResult, UserFn,
@@ -2504,6 +2505,7 @@ pub fn plan_with_subqueries(
         return Ok(st);
     }
     let mut params = params.to_vec();
+    materialize_dml_ctes(&mut node, lookup, &mut params, run)?;
     rewrite_dml_from(&mut node, lookup)?;
     materialize_recursive_ctes(&mut node, lookup, &mut params, run)?;
     resolve_sublinks(&mut node, lookup, &mut params, run)?;
@@ -6211,8 +6213,21 @@ fn is_boolean_type(t: &str) -> bool {
 /// Before this the server coerced the text through the column's parser, so
 /// the psycopg binary-format string that PostgreSQL rejects was stored.
 fn check_assignment_type(column: &Column, node: &pg_query::protobuf::Node) -> Result<()> {
-    let Some(from) = declared_expression_type(node) else {
-        return Ok(());
+    let from = match declared_expression_type(node) {
+        Some(t) => t,
+        // A function call or SQL value function has a known result type
+        // (`SET n = now()` is 42804 over an integer column); a value-derived
+        // `text` from one says nothing, so it is not held against it.
+        None => match node.node.as_ref() {
+            Some(N::FuncCall(_) | N::SqlvalueFunction(_)) => {
+                let t = static_type(node, &Bson::Null);
+                if t == "text" || t.is_empty() {
+                    return Ok(());
+                }
+                t
+            }
+            _ => return Ok(()),
+        },
     };
     assignable(column, &from, "expression")
 }
@@ -7410,7 +7425,7 @@ fn srf_rows(
         }
     }
     // A user-defined set-returning function: the executor runs it.
-    if let Some(u) = correlated::user_function(name, call.args.len()).filter(|u| u.returns_set) {
+    if let Some(u) = correlated::user_function_for(name, &call.args).filter(|u| u.returns_set) {
         let a: Vec<Bson> = call
             .args
             .iter()
@@ -9977,6 +9992,125 @@ fn reads_relation(s: &pg_query::protobuf::SelectStmt, name: &str) -> bool {
 /// every one. The column names come from the CTE's own list or else the
 /// non-recursive term, and so do the types. Uses the executor, so a caller
 /// without one keeps the refusal in `inline_ctes`.
+/// A data-modifying WITH item (`WITH x AS (INSERT ... RETURNING ...)`) runs
+/// ONCE, here, through the executor, and its RETURNING rows stand in for it
+/// as VALUES -- so however often the query reads `x`, the write happened
+/// once. An `INSERT ... SELECT` that carries the WITH has it moved onto its
+/// SELECT first, where the CTEs are read.
+///
+/// PostgreSQL runs the main query on the snapshot from BEFORE the item's
+/// write; here the write has happened by the time it runs, so a main query
+/// that reads the item's own TABLE sees the change.
+fn materialize_dml_ctes(
+    node: &mut pg_query::protobuf::Node,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &mut Vec<Bson>,
+    run: SubqueryRunner<'_>,
+) -> Result<()> {
+    if let Some(N::InsertStmt(i)) = node.node.as_mut() {
+        if let (Some(with), Some(N::SelectStmt(sel))) = (
+            i.with_clause.clone(),
+            i.select_stmt.as_deref_mut().and_then(|n| n.node.as_mut()),
+        ) {
+            if sel.with_clause.is_none() {
+                sel.with_clause = Some(with);
+                i.with_clause = None;
+            }
+        }
+    }
+    let with = match node.node.as_mut() {
+        Some(N::SelectStmt(s)) => s.with_clause.as_mut(),
+        Some(N::InsertStmt(i)) => i
+            .select_stmt
+            .as_deref_mut()
+            .and_then(|n| n.node.as_mut())
+            .and_then(|n| match n {
+                N::SelectStmt(s) => s.with_clause.as_mut(),
+                _ => None,
+            }),
+        Some(N::UpdateStmt(u)) => u.with_clause.as_mut(),
+        Some(N::DeleteStmt(d)) => d.with_clause.as_mut(),
+        _ => None,
+    };
+    let Some(with) = with else {
+        return Ok(());
+    };
+    for cte in &mut with.ctes {
+        let Some(N::CommonTableExpr(c)) = cte.node.as_mut() else {
+            continue;
+        };
+        let Some(inner) = c.ctequery.as_deref().and_then(|q| q.node.clone()) else {
+            continue;
+        };
+        if !matches!(inner, N::InsertStmt(_) | N::UpdateStmt(_) | N::DeleteStmt(_)) {
+            continue;
+        }
+        let mut dml = pg_query::protobuf::Node { node: Some(inner) };
+        let mut p = params.clone();
+        rewrite_dml_from(&mut dml, lookup)?;
+        resolve_sublinks(&mut dml, lookup, &mut p, run)?;
+        let plan = plan_node(
+            dml.node
+                .ok_or_else(|| Error::Parse("empty WITH item".into()))?,
+            lookup,
+            &p,
+        )?;
+        let rows = run(&plan)?;
+        let cols: Vec<(String, String)> = match returning_output_def(&plan, lookup)? {
+            Some(def) => def
+                .columns
+                .iter()
+                .map(|c| (c.name.clone(), c.pg_type.clone()))
+                .collect(),
+            None => Vec::new(),
+        };
+        let types: Vec<String> = cols.iter().map(|(_, t)| t.clone()).collect();
+        let names: Vec<pg_query::protobuf::Node> = if c.aliascolnames.is_empty() {
+            cols.iter().map(|(n, _)| string_node(n)).collect()
+        } else {
+            c.aliascolnames.clone()
+        };
+        let table = values_select(&rows, &types, params);
+        c.ctequery = Some(Box::new(pg_query::protobuf::Node {
+            node: Some(N::SelectStmt(Box::new(table))),
+        }));
+        c.aliascolnames = names;
+    }
+    Ok(())
+}
+
+/// The columns a DML statement's RETURNING produces, typed; `None` without
+/// one.
+fn returning_output_def(
+    stmt: &Statement,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Result<Option<TableDef>> {
+    let (table, returning) = match stmt {
+        Statement::Insert(i) => (&i.table, i.returning.as_ref()),
+        Statement::Update(u) => (&u.table, u.returning.as_ref()),
+        Statement::Delete(d) => (&d.table, d.returning.as_ref()),
+        _ => return Ok(None),
+    };
+    let Some(returning) = returning else {
+        return Ok(None);
+    };
+    let source = lookup(table).ok_or_else(|| Error::UndefinedTable(table.clone()))?;
+    let mut columns = Vec::new();
+    for (i, (out, field)) in returning.columns.iter().enumerate() {
+        let expr = returning.casts.get(i).and_then(|c| c.as_ref());
+        let src = source
+            .columns
+            .iter()
+            .find(|c| c.field() == *field || c.name == *field);
+        let ty = match expr {
+            Some(e) if !matches!(e, ColumnExpr::Coalesce { .. }) => column_expr_type(e).to_string(),
+            _ => src.map_or_else(|| "text".to_string(), |c| c.pg_type.clone()),
+        };
+        columns.push(Column::new(out, &ty, true));
+    }
+    Ok(Some(TableDef::new("", columns)))
+}
+
 fn materialize_recursive_ctes(
     node: &mut pg_query::protobuf::Node,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
@@ -10901,7 +11035,7 @@ fn function_absent_in_reference(
 ) -> Option<Error> {
     let name = func_name(f)?;
     if correlated::user_function_named(&name)
-        && correlated::user_function(&name, f.args.len()).is_none()
+        && correlated::user_function_for(&name, &f.args).is_none()
     {
         let types: Vec<String> = f
             .args
@@ -14363,11 +14497,11 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
         }
         Some(N::FuncCall(f))
             if func_name(f)
-                .and_then(|n| correlated::user_function(&n, f.args.len()))
+                .and_then(|n| correlated::user_function_for(&n, &f.args))
                 .is_some() =>
         {
             func_name(f)
-                .and_then(|n| correlated::user_function(&n, f.args.len()))
+                .and_then(|n| correlated::user_function_for(&n, &f.args))
                 .map(|u| u.return_type)
                 .unwrap_or_default()
         }
@@ -15190,6 +15324,7 @@ pub(crate) fn inferred_type(v: &Bson) -> &'static str {
         Bson::Decimal128(_) => "numeric",
         Bson::Document(d) if d.contains_key(WIDE_NUMERIC_KEY) => "numeric",
         Bson::Document(d) if d.len() == 1 && d.contains_key(REGCLASS_KEY) => "regclass",
+        other if regobj::from_bson(other).is_some() => regobj::from_bson(other).expect("checked").0,
         // A MULTIDIMENSIONAL array is the same array type as its elements --
         // `int4[]` (oid 1007), never `int4[][]`, which is no type at all.
         // Recursing is what makes that so: reading only the first element's
@@ -15585,7 +15720,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                     return Err(e);
                 }
                 if let Some(u) =
-                    func_name(f).and_then(|n| correlated::user_function(&n, f.args.len()))
+                    func_name(f).and_then(|n| correlated::user_function_for(&n, &f.args))
                 {
                     if !u.returns_set {
                         let node = rt.val.as_deref().expect("a FuncCall target");
@@ -17283,7 +17418,12 @@ pub(crate) fn regclass_value(oid: i64) -> Bson {
 /// The oid inside a regclass value, or `None` for any other value.
 pub fn regclass_oid(v: &Bson) -> Option<i64> {
     match v {
-        Bson::Document(d) if d.len() == 1 => d.get_i64(REGCLASS_KEY).ok(),
+        Bson::Document(d) if d.len() == 1 => d
+            .get_i64(REGCLASS_KEY)
+            .ok()
+            // The other object-identifier types compare and filter by their
+            // oid exactly as a regclass does.
+            .or_else(|| regobj::from_bson(v).map(|(_, oid)| oid)),
         _ => None,
     }
 }
@@ -20021,7 +20161,14 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
                 return Ok(Bson::String(bytea::render_hex(&b.bytes)))
             }
             "bytea" => return Ok(value.clone()),
-            _ => {}
+            // No other cast leaves bytea: PostgreSQL refuses on the TYPE
+            // (42846) before looking at the bytes.
+            other => {
+                return Err(Error::CannotCoerce(format!(
+                    "cannot cast type bytea to {}",
+                    display_type(other)
+                )))
+            }
         }
     }
     // A regtype value casts onward by its two natures: to text as its display
@@ -20033,6 +20180,10 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
             "int4" | "int8" | "oid" | "integer" | "int" | "bigint" => Ok(Bson::Int64(oid)),
             _ => Err(Error::Unsupported(format!("a regtype cast to {target}"))),
         };
+    }
+    // regnamespace / regrole / regproc / regprocedure: to and from.
+    if let Some(out) = regobj::cast(&value, target) {
+        return out;
     }
     // A regclass value likewise: to text as the relation's NAME, to `oid` /
     // the two integer widths as its oid; anything else has no cast path
@@ -23899,7 +24050,7 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
         if let Some(e) = function_absent_in_reference(f, params) {
             return Err(e);
         }
-        if let Some(u) = func_name(f).and_then(|n| correlated::user_function(&n, f.args.len())) {
+        if let Some(u) = func_name(f).and_then(|n| correlated::user_function_for(&n, &f.args)) {
             if u.returns_set {
                 return Err(Error::FeatureNotSupported(
                     "set-valued function called in context that cannot accept a set".into(),

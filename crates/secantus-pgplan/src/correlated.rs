@@ -497,7 +497,7 @@ pub fn has_correlated(expr: &ColumnExpr) -> bool {
             found |= is_correlated(f)
                 || func_name(f).is_some_and(|name| {
                     SEQUENCE_FUNCTIONS.contains(&name.as_str())
-                        || user_function(&name, f.args.len()).is_some()
+                        || user_function_for(&name, &f.args).is_some()
                 });
         }
         Ok(())
@@ -622,6 +622,8 @@ pub struct UserFn {
     /// The last parameter is `VARIADIC`: trailing arguments are packed into
     /// its array.
     pub variadic: bool,
+    /// The catalog key the executor finds the function's body under.
+    pub key: String,
 }
 
 /// What a user function call produced.
@@ -645,17 +647,65 @@ pub fn set_user_functions(fns: Vec<UserFn>) {
     USER_FUNCTIONS.with(|f| *f.borrow_mut() = fns);
 }
 
-/// The user function a call names, by name and argument count.
-pub(crate) fn user_function(name: &str, nargs: usize) -> Option<UserFn> {
-    USER_FUNCTIONS.with(|f| {
+/// The user function a call resolves to: by name and argument count, and --
+/// when overloads share the count -- by the arguments' types, an untyped
+/// literal matching any. Several equally good candidates are PostgreSQL's
+/// `42725 function ... is not unique`, surfaced by the caller as no match.
+pub(crate) fn user_function_for(name: &str, args: &[pg_query::protobuf::Node]) -> Option<UserFn> {
+    let candidates: Vec<UserFn> = USER_FUNCTIONS.with(|f| {
         f.borrow()
             .iter()
-            .find(|u| {
+            .filter(|u| {
                 u.name == name
-                    && (u.arg_types.len() == nargs || (u.variadic && nargs >= u.arg_types.len()))
+                    && (u.arg_types.len() == args.len()
+                        || (u.variadic && args.len() >= u.arg_types.len()))
             })
             .cloned()
-    })
+            .collect()
+    });
+    if candidates.len() <= 1 {
+        return candidates.into_iter().next();
+    }
+    let canon = |t: &str| {
+        crate::pgtypes::oid_of_name(t)
+            .map(|o| o.to_string())
+            .unwrap_or_else(|| t.to_ascii_lowercase())
+    };
+    let untyped = |n: &pg_query::protobuf::Node| {
+        matches!(
+            n.node.as_ref(),
+            Some(pg_query::protobuf::node::Node::AConst(c))
+                if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_)))
+        )
+    };
+    let arg_types: Vec<Option<String>> = args
+        .iter()
+        .map(|a| (!untyped(a)).then(|| canon(&crate::static_type(a, &Bson::Null))))
+        .collect();
+    // Score: exact type matches; an untyped literal prefers a string type.
+    let score = |u: &UserFn| -> Option<i32> {
+        let mut s = 0;
+        for (i, t) in arg_types.iter().enumerate() {
+            let want = canon(u.arg_types.get(i).or(u.arg_types.last())?);
+            match t {
+                Some(t) if *t == want => s += 2,
+                Some(_) => return None,
+                None if want == canon("text") => s += 1,
+                None => {}
+            }
+        }
+        Some(s)
+    };
+    let mut best: Vec<(i32, UserFn)> = candidates
+        .into_iter()
+        .filter_map(|u| score(&u).map(|s| (s, u)))
+        .collect();
+    best.sort_by(|a, b| b.0.cmp(&a.0));
+    match best.as_slice() {
+        [(s1, _), (s2, _), ..] if s1 == s2 => None,
+        [(_, u), ..] => Some(u.clone()),
+        [] => None,
+    }
 }
 
 /// Run `f` able to call user-defined functions.
