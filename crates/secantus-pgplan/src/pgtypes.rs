@@ -124,6 +124,16 @@ pub fn oid_of_name(name: &str) -> Option<i64> {
         .map(|(_, oid, _)| *oid)
 }
 
+/// The internal name for a scalar OR ARRAY type oid (`int4`, `int4[]`).
+pub fn type_name_of_oid(oid: i64) -> Option<String> {
+    name_of_oid(oid).map(str::to_string).or_else(|| {
+        BUILTIN_TYPES
+            .iter()
+            .find(|(_, _, a)| *a == oid)
+            .map(|(t, _, _)| format!("{t}[]"))
+    })
+}
+
 /// The internal name for an oid, or `None`.
 pub fn name_of_oid(oid: i64) -> Option<&'static str> {
     BUILTIN_TYPES

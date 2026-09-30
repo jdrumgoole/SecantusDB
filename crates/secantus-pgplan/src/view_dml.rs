@@ -32,11 +32,14 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Per view, its `(column, default SQL)` pairs.
+type ViewDefaults = Vec<(String, Vec<(String, String)>)>;
+
 thread_local! {
     /// `ALTER VIEW ... ALTER COLUMN c SET DEFAULT`: per view, `(column,
     /// default SQL)`, which an INSERT through the view gives a column it
     /// omits (or writes as DEFAULT).
-    static VIEW_DEFAULTS: std::cell::RefCell<Vec<(String, Vec<(String, String)>)>> =
+    static VIEW_DEFAULTS: std::cell::RefCell<ViewDefaults> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 

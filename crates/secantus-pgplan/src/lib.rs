@@ -9265,19 +9265,40 @@ fn series_where(
         None => Ok(Document::new()),
         // `where false` / `where $1`: a predicate with no column in it keeps
         // every row or none.
-        Some(w) if matches!(w.node.as_ref(), Some(N::AConst(_) | N::ParamRef(_))) => {
+        Some(w)
+            if matches!(w.node.as_ref(), Some(N::AConst(_) | N::ParamRef(_)))
+                || !references_columns(w) =>
+        {
             Ok(if constant_where(w, params)? {
                 Document::new()
             } else {
                 doc! { "$expr": false }
             })
         }
-        Some(w) => {
+        // `FROM generate_series(...) g`: the series is the column.
+        Some(w) if !s.from_clause.is_empty() => {
             let def = TableDef::new(
                 "generate_series",
                 vec![Column::new(&series.column, "int4", false)],
             );
             lower_where(w, &def, params)
+        }
+        // A FROM-less select has no column for its WHERE to name: an output
+        // alias is not visible there (`select generate_series(1, 3) as g
+        // where g > 1` is 42703 on PostgreSQL).
+        Some(w) => {
+            let name = w
+                .node
+                .as_ref()
+                .map(|n| n.nodes())
+                .unwrap_or_default()
+                .into_iter()
+                .find_map(|(n, _, _, _)| match n {
+                    pg_query::NodeRef::ColumnRef(c) => column_ref_name(c),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            Err(Error::UndefinedColumn(name))
         }
     }
 }
@@ -11123,6 +11144,24 @@ fn run_select(
     Ok((rows, cols))
 }
 
+/// The type a recursive UNION resolves a column to when it is WIDER than
+/// the non-recursive term's, measured for the integer / numeric ladder (a
+/// `varchar` anchor beside a `text` step is accepted); `None` when the
+/// anchor's type holds.
+fn recursive_widening<'a>(anchor: &str, step: &'a str) -> Option<&'a str> {
+    let rank = |t: &str| match t {
+        "int2" => Some(1),
+        "int4" => Some(2),
+        "int8" => Some(3),
+        "numeric" => Some(4),
+        _ => None,
+    };
+    match (rank(anchor), rank(step)) {
+        (Some(a), Some(b)) if b > a => Some(step),
+        _ => None,
+    }
+}
+
 /// Rows as a SELECT: `VALUES ($1::t, ...), ...` with each value a typed
 /// parameter appended to `params`, or a typed empty select when there are
 /// none (VALUES cannot be empty).
@@ -11411,7 +11450,21 @@ fn materialize_recursive_ctes(
                 let mut p = params.clone();
                 let table = values_select(&working, &types, &mut p);
                 let step = substitute_ctes(step, &[(c.ctename.clone(), table, names.clone())]);
-                let (mut fresh, _) = run_select(&step, lookup, &p, run)?;
+                let (mut fresh, step_cols) = run_select(&step, lookup, &p, run)?;
+                // The column's type is the UNION's resolved type; an anchor
+                // narrower than it is 42804 (`$1` bound as smallint, then
+                // `n + 1`), since the anchor's rows were already typed.
+                for (i, ((_, a), (_, b))) in cols.iter().zip(&step_cols).enumerate() {
+                    if let Some(overall) = recursive_widening(a, b) {
+                        return Err(Error::DatatypeMismatch(format!(
+                            "recursive query \"{}\" column {} has type {} in non-recursive term but type {} overall",
+                            c.ctename,
+                            i + 1,
+                            display_type(a),
+                            display_type(overall)
+                        )));
+                    }
+                }
                 if !body.all {
                     let mut kept: Vec<Vec<Bson>> = Vec::new();
                     for r in fresh.drain(..) {
@@ -17347,8 +17400,12 @@ fn plan_values_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
         for (i, item) in items.iter().enumerate() {
             let value = const_value(item, params)?;
             // Fill in this column's type from the first row that offers a
-            // non-null typed cell.
-            if types[i].is_empty() && !matches!(value, Bson::Null) {
+            // non-null typed cell -- or a NULL under an explicit cast, which
+            // is typed (`NULL::int4`, a Describe's placeholder `$1::int4`).
+            if types[i].is_empty()
+                && (!matches!(value, Bson::Null)
+                    || matches!(item.node.as_ref(), Some(N::TypeCast(_))))
+            {
                 types[i] = static_type(item, &value);
             }
             row.push(value);

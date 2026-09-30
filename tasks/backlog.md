@@ -537,25 +537,9 @@ resolved typed values of a `SELECT` source are captured and re-encoded through
 reporting the binary format). Companion planner fix:
 `select generate_series(...)::type` (a cast over a FROM-less set-returning
 target) is now planned as a per-row cast; a WHERE over such a series is refused
-rather than silently dropped. Two of the sixteen remain open — see below.
-
-- [ ] **OPEN — a WHERE clause over a FROM-less `generate_series` target is
-      refused, not evaluated (`select generate_series(1,3) where false`).**
-      This blocks `test_cursor_server.py::test_no_result` (2 cases: sync +
-      async), which expects `[]`. As of 2026-09-08 `plan_select_srf` refuses a
-      WHERE with `0A000` (matching the sibling `plan_series_select`, which
-      refuses `FROM generate_series(...) WHERE ...` for the same reason) — an
-      honest error rather than the previous silent divergence, but still a
-      failure against PG, which returns the filtered rows. A real fix must
-      evaluate the predicate over the synthetic series column (plan the
-      `where_clause` into the `Select.filter` and apply it to the generated
-      docs, which the series executor path does not do today). Sized as a
-      planner/executor slice, not a state check — deferred from this batch.
-      Binary server cursors over non-`SELECT` DECLARE sources (VALUES /
-      aggregate / FROM-less constant) are likewise not re-encodable: only a
-      `SELECT` source captures typed values, so a binary FETCH of those falls
-      back to the text bytes. Untested by the psycopg suite; note if a gauge
-      ever exercises it.
+rather than silently dropped. The last two -- a WHERE over that series, and
+a binary FETCH from a VALUES / aggregate / constant cursor -- landed in batch 10
+(2026-09-30).
 
 **Rust pgserver connection error / lifecycle — LANDED 2026-09-08 (psycopg's
 `vendor/psycopg/tests/test_connection.py`, oracle PostgreSQL 16; 11 → 6
@@ -714,10 +698,6 @@ remain open:
         statement lock (only for an explicit `LOCK TABLE`).
       - `CREATE AGGREGATE` over a built-in state function does not check the
         function's signature against the declared state type.
-      - A join's WHERE is applied after the join; it is not pushed into the
-        sides (correct, and slower on large tables).
-      - Extended protocol: a Bind with MIXED per-column result formats, and a
-        binary-format `FETCH` from a cursor, are not fully honoured.
 - [ ] **OPEN — RUST pgserver: residuals of the wide-`numeric` slice
       (2026-09-09).** Values wider than Decimal128 now store exactly as
       `{__numeric: <canonical text>, __numkey: <byte-sortable key>}`
@@ -7537,14 +7517,6 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
         `e.dept_id = d.id` to the per-row path instead of binding `d.id` to
         the inner table's own `id`.
 
-- [ ] **OPEN — RUST pgserver: `column_default` shows a FOLDED constant
-      (2026-09-29).** A non-volatile DEFAULT expression is evaluated once at
-      CREATE and stored as its value, so `default 1 + 2` reports `3` where
-      PostgreSQL reports `(1 + 2)`, and `default 'x' || 'y'` reports
-      `'xy'::text` where PostgreSQL has `('x'::text || 'y'::text)`. The values
-      the rows get are identical; only the catalog text differs. Reproducing
-      ruleutils' rendering is the fix, and it is not small.
-
 - [ ] **OPEN — RUST pgserver: the general JOIN planner has no predicate
       pushdown (2026-09-29).** A join is planned as a source whose leaves are
       `SELECT * FROM <leaf>` (`secantus-pgplan/src/joins.rs`), hash-joined on
@@ -7557,16 +7529,6 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
       two-table path still goes first, because psycopg's catalog queries rely
       on its regtype-aware OID equality; that is the other reason to measure
       before trusting the general path on catalog tables.
-
-- [ ] **OPEN — RUST pgserver: catalog columns carry the wrong wire TYPE
-      (found 2026-09-29, `catalog` corpus with `--types`).** Values match;
-      OIDs do not. `information_schema.*` string columns (`column_name`,
-      `data_type`, `is_nullable`, `table_type`, `constraint_type`, ...) go out
-      as `text` (25) where PostgreSQL sends its domains' base type -- `name`
-      (19) for `sql_identifier`, `varchar` (1043) for `character_data` /
-      `yes_or_no`. `pg_class.relkind` goes out as `bpchar` (1042) where
-      PostgreSQL's is `"char"` (18). A client that decodes by OID reads these
-      differently; psql and psycopg's text path do not notice.
 
 - [ ] **OPEN — PYTHON pgserver: CREATE INDEX diverges from PostgreSQL 14.13
       on 13 of 48 lines of `indexes.sql` (found 2026-09-29).** Three are
@@ -7594,7 +7556,8 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
       **Two known limits, neither reached by any corpus:** a `RANGE` frame
       with a value offset compares through `f64`, so a bound beyond 2^53 on an
       int8 or a wide numeric column could land a row on the wrong side of it
-      (the non-numeric case is refused by name); and partitioning scans the
+      (interval offsets over a date / time column compare microseconds, since
+      batch 10); and partitioning scans the
       distinct partition keys linearly, which is O(partitions^2).
 
       **Carried from the implementation, worth not re-deriving:** the DEFAULT
@@ -7617,13 +7580,6 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
   `select 10::numeric / 4::numeric` answers `2.5000000000000000`, PostgreSQL's
   sixteen places. The entry above described the state before the scale rules
   were measured.
-- **Rust PG server: array comparison does not require matching element types.**
-  PostgreSQL has no `integer[] = smallint[]` operator — array operators need
-  identical element types and do not widen — so `select array[1,2,3] = %s` with
-  a Python list is `42883` there (psycopg dumps small ints as `smallint[]`) and
-  `true` here. Reproducing it needs PostgreSQL's operator-resolution table for
-  arrays, not a comparison fix. Being more permissive, so it accepts queries
-  PostgreSQL rejects rather than answering them differently.
 - **Rust PG server: user-type DDL is now visible within its own open
   transaction — FIXED (2026-09-08).** An uncommitted `CREATE`/`DROP TYPE`
   (composite, enum, range) is now visible to later statements in the same

@@ -297,7 +297,7 @@ pub fn call(name: &str, args: &[Bson]) -> crate::Result<Bson> {
     let f = |v: f32| Bson::Double(f64::from(v));
     Ok(match name {
         "show_limit" => f(threshold("pg_trgm.similarity_threshold") as f32),
-        _ if args.iter().any(|a| *a == Bson::Null) => Bson::Null,
+        _ if args.contains(&Bson::Null) => Bson::Null,
         "similarity" => f(similarity(&text(0), &text(1))),
         "show_trgm" => show_trgm(&text(0)),
         "word_similarity" => f(word_similarity(&text(0), &text(1), false)),

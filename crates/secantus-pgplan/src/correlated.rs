@@ -743,7 +743,7 @@ pub(crate) fn call_user_function(u: &UserFn, args: &[Bson]) -> Result<FnResult> 
     if SUPPRESSED.with(|s| s.get()) {
         return Ok(FnResult::Value(Bson::Null));
     }
-    if u.strict && args.iter().any(|a| *a == Bson::Null) {
+    if u.strict && args.contains(&Bson::Null) {
         return Ok(if u.returns_set {
             FnResult::Rows(Vec::new(), Vec::new(), Vec::new())
         } else {

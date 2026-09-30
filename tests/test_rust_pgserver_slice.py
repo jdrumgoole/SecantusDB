@@ -10525,19 +10525,15 @@ def test_on_conflict_do_update_still_checks_constraints(home: Path) -> None:
             cur.execute("insert into c values (1, 1) on conflict (id) do update set n = 500")
 
 
-def test_on_conflict_partial_index_arbiter_is_refused(home: Path) -> None:
-    """A WHERE on the TARGET needs partial-index inference this server has not.
-
-    Refused loudly rather than widened to the unconditional index, which would
-    absorb a conflict the user's predicate excludes — the silent-divergence
-    failure this whole change exists to remove.
-    """
+def test_on_conflict_where_without_a_partial_index_infers_the_key(home: Path) -> None:
+    """A WHERE on the TARGET selects a partial unique index whose predicate
+    it implies; with none, PostgreSQL's inference falls back to the plain
+    unique key (here the primary key), and the conflict is absorbed."""
     with _Server(home) as server, server.connect() as conn:
         _oc_table(conn)
         cur = conn.cursor()
-        with pytest.raises(psycopg.Error) as info:
-            cur.execute("insert into t values (1, 'z', 9) on conflict (id) where id > 0 do nothing")
-        assert info.value.sqlstate == "0A000"
+        cur.execute("insert into t values (1, 'z', 9) on conflict (id) where id > 0 do nothing")
+        assert cur.rowcount == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -14712,3 +14708,22 @@ def test_ordinality_rows_from_and_values_clauses(home: Path) -> None:
         ) == [(1, "x"), (2, "y"), (None, "z")]
         assert _fetch(conn, "VALUES (1), (2), (3) ORDER BY 1 DESC LIMIT 2") == [(3,), (2,)]
         assert _fetch(conn, "SELECT * FROM (SELECT 1 AS a, 2 AS a) s") == [(1, 2)]
+
+
+def test_binary_cursor_over_any_source_sends_binary(home: Path) -> None:
+    """A binary server-side cursor over VALUES, an aggregate or a constant
+    select FETCHes binary values, as a SELECT source does. It used to send
+    the text bytes, which a binary client decoded as garbage integers."""
+    with _Server(home) as server, server.connect(autocommit=False) as conn:
+        sources = {
+            "VALUES (1, 'a'::text), (2, 'b')": [(1, "a"), (2, "b")],
+            "SELECT count(*), max(x) FROM generate_series(1, 4) x": [(4, 4)],
+            "SELECT 1::int, 2.5::numeric, 'q'::text": [(1, dc.Decimal("2.5"), "q")],
+        }
+        for source, expected in sources.items():
+            with conn.cursor(name="bc", binary=True) as cur:
+                cur.execute(source)
+                assert cur.fetchall() == expected, source
+                assert cur.pgresult is not None
+                assert cur.pgresult.fformat(0) == 1, source
+            conn.rollback()

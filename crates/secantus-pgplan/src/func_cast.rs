@@ -307,17 +307,14 @@ pub(crate) fn refuse_unresolved(node: &N) -> Result<()> {
                 if matches!(
                     func_name(f).as_deref(),
                     Some("to_json" | "to_jsonb" | "array_to_json")
-                ) && !correlated::user_function_named(&func_name(f).unwrap_or_default()) =>
+                ) && !correlated::user_function_named(&func_name(f).unwrap_or_default())
+                    && f.args
+                        .first()
+                        .is_some_and(|a| untyped_literal(a) || untyped_param(a).is_some()) =>
             {
-                if f.args
-                    .first()
-                    .is_some_and(|a| untyped_literal(a) || untyped_param(a).is_some())
-                {
-                    return Err(Error::DatatypeMismatch(
-                        "could not determine polymorphic type because input has type unknown"
-                            .into(),
-                    ));
-                }
+                return Err(Error::DatatypeMismatch(
+                    "could not determine polymorphic type because input has type unknown".into(),
+                ));
             }
             _ => {}
         }

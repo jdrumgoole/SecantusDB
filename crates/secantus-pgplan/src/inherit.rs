@@ -15,12 +15,15 @@
 
 use super::*;
 
+/// `(child, parent)` pairs, and each parent's column names in order.
+type Tree = (Vec<(String, String)>, Vec<(String, Vec<String>)>);
+
 thread_local! {
     /// Set while a statement that names `tableoid` has its FROM expanded:
     /// each union arm then carries its table's oid under that name.
     pub(crate) static WANT_TABLEOID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `(child, parent)` pairs, and each parent's column names in order.
-    static TREE: std::cell::RefCell<(Vec<(String, String)>, Vec<(String, Vec<String>)>)> =
+    static TREE: std::cell::RefCell<Tree> =
         const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
 }
 
@@ -201,13 +204,12 @@ pub(crate) fn per_table(node: &N) -> Result<Option<(&'static str, Vec<N>)>> {
             rel.relname = table.clone();
             rel.inh = false;
             // A reference qualified by the parent's name still resolves.
-            if rel.alias.as_ref().is_none_or(|a| a.aliasname.is_empty()) && *table != parent {
-                if dml {
-                    rel.alias = Some(pg_query::protobuf::Alias {
-                        aliasname: parent.clone(),
-                        colnames: Vec::new(),
-                    });
-                }
+            if rel.alias.as_ref().is_none_or(|a| a.aliasname.is_empty()) && *table != parent && dml
+            {
+                rel.alias = Some(pg_query::protobuf::Alias {
+                    aliasname: parent.clone(),
+                    colnames: Vec::new(),
+                });
             }
         }
         out.push(n);

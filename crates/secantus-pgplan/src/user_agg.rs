@@ -118,7 +118,7 @@ fn resolve_polymorphic(t: &str, source: Option<&str>) -> String {
 pub fn result_type(agg: &UserAggregate, source: Option<&str>) -> String {
     let state = state_type(agg, source);
     match &agg.finalfunc {
-        Some(f) => match user_fn(f, &[state.clone()]) {
+        Some(f) => match user_fn(f, std::slice::from_ref(&state)) {
             Some(u) => resolve_polymorphic(&u.return_type, Some(&state)),
             None => builtin_result_type(f).unwrap_or(state),
         },
@@ -225,7 +225,7 @@ fn builtin_strict(name: &str) -> bool {
 }
 
 fn call_builtin(name: &str, b: Builtin, args: &[Bson]) -> Result<Bson> {
-    if builtin_strict(name) && args.iter().any(|a| *a == Bson::Null) {
+    if builtin_strict(name) && args.contains(&Bson::Null) {
         return Ok(Bson::Null);
     }
     match b {
@@ -318,7 +318,7 @@ pub fn validate(agg: &UserAggregate) -> Result<()> {
     sig.extend(agg.arg_types.iter().cloned());
     callee(&agg.sfunc, &sig)?;
     if let Some(f) = &agg.finalfunc {
-        match callee(f, &[agg.stype.clone()])? {
+        match callee(f, std::slice::from_ref(&agg.stype))? {
             Callee::Builtin(_, Builtin::Scalar) if builtin_result_type(f).is_none() => {
                 return Err(Error::Unsupported(format!(
                     "the built-in final function {f}"

@@ -2104,8 +2104,7 @@ fn from_char_mode(input: &str, fmt: &str, strict: bool) -> Result<(NaiveDate, i6
     let iso = iso_week.filter(|_| iso_year).map(|w| {
         let day4 = date2j(y as i32, 1, 4);
         let day0 = (day4 - 1 + 1).rem_euclid(7);
-        let jday = (w - 1) * 7 + (day4 - day0) + iso_day.map_or(0, |d| (d - 1).rem_euclid(7));
-        jday
+        (w - 1) * 7 + (day4 - day0) + iso_day.map_or(0, |d| (d - 1).rem_euclid(7))
     });
     let date = if let Some(j) = iso {
         let days = j - date2j(2000, 1, 1);

@@ -1454,6 +1454,10 @@ pub struct PgHandler {
     /// `in_transaction`, it is read from inside `execute` while `run` holds
     /// the mutexes.
     binary_results: std::sync::atomic::AtomicBool,
+    /// A `Bind`'s per-column result formats when they are MIXED (some text,
+    /// some binary); `binary_results` is then off and the answer is
+    /// re-encoded column by column on its way out (`apply_mixed_formats`).
+    mixed_formats: Mutex<Option<Vec<i16>>>,
     /// Whether the open transaction has FAILED.
     ///
     /// PostgreSQL refuses every statement after an error inside a transaction
@@ -1572,6 +1576,69 @@ type UncommittedTypes = HashMap<(&'static str, String), Option<Document>>;
 /// server cursor so a BINARY `FETCH` can re-encode rows frozen in text at
 /// DECLARE.
 type CapturedRows = Vec<Vec<Option<Bson>>>;
+
+/// `(child, parent)` pairs, and each parent's column names in order.
+type InheritanceTree = (Vec<(String, String)>, Vec<(String, Vec<String>)>);
+
+/// A `DataRow`'s cells: each one's bytes, or `None` for NULL.
+fn split_data_row(row: &DataRow) -> Vec<Option<Vec<u8>>> {
+    let mut data: &[u8] = &row.data;
+    let mut out = Vec::with_capacity(usize::try_from(row.field_count).unwrap_or(0));
+    for _ in 0..row.field_count {
+        let Some(len) = data
+            .get(..4)
+            .and_then(|b| b.try_into().ok())
+            .map(i32::from_be_bytes)
+        else {
+            break;
+        };
+        data = &data[4..];
+        if len < 0 {
+            out.push(None);
+            continue;
+        }
+        let len = len as usize;
+        out.push(data.get(..len).map(<[u8]>::to_vec));
+        data = data.get(len..).unwrap_or_default();
+    }
+    out
+}
+
+/// A cursor's typed values read back from the TEXT rows it froze at DECLARE,
+/// each cell cast from its text through its column's type; `None` when any
+/// cell does not come back (a type with no name here, a non-UTF-8 client
+/// encoding), which leaves the cursor on its text rows.
+fn typed_from_text(
+    schema: &[FieldInfo],
+    rows: &[DataRow],
+    tz: &secantus_pgplan::TimeZoneSetting,
+) -> Option<CapturedRows> {
+    let types: Vec<String> = schema
+        .iter()
+        .map(|f| secantus_pgplan::pgtypes::type_name_of_oid(i64::from(f.datatype().oid())))
+        .collect::<Option<_>>()?;
+    rows.iter()
+        .map(|row| {
+            let mut data: &[u8] = &row.data;
+            types
+                .iter()
+                .map(|ty| {
+                    let len = i32::from_be_bytes(data.get(..4)?.try_into().ok()?);
+                    data = &data[4..];
+                    if len < 0 {
+                        return Some(None);
+                    }
+                    let len = len as usize;
+                    let text = std::str::from_utf8(data.get(..len)?).ok()?;
+                    data = &data[len..];
+                    secantus_pgplan::cast_text_to(text, ty.as_str(), tz)
+                        .ok()
+                        .map(Some)
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+        .collect()
+}
 
 /// One open savepoint and the table contents it can put back.
 struct Savepoint {
@@ -1707,6 +1774,7 @@ impl PgHandler {
             uncommitted_types: Mutex::new(HashMap::new()),
             in_transaction: std::sync::atomic::AtomicBool::new(false),
             binary_results: std::sync::atomic::AtomicBool::new(false),
+            mixed_formats: Mutex::new(None),
             txn_failed: std::sync::atomic::AtomicBool::new(false),
             ensured_catalog: Mutex::new(HashSet::new()),
             savepoints: Mutex::new(Vec::new()),
@@ -1800,19 +1868,139 @@ impl PgHandler {
 
     /// Remember the result format a `Bind` asked for.
     ///
-    /// A MIXED request -- some columns binary, some text -- is answered
-    /// entirely in text. PostgreSQL honours it column by column; no client
-    /// this server is measured against sends one, and quietly answering half
-    /// of it in the wrong format would be worse than uniformly answering the
-    /// format the `RowDescription` then reports.
+    /// A MIXED request -- some columns binary, some text -- is produced in
+    /// text and then re-encoded column by column (`apply_mixed_formats`), as
+    /// PostgreSQL honours it.
     fn note_result_format(&self, format: &Format) {
-        let binary = match format {
-            Format::UnifiedText => false,
-            Format::UnifiedBinary => true,
-            Format::Individual(codes) => !codes.is_empty() && codes.iter().all(|c| *c == 1),
+        let (binary, mixed) = match format {
+            Format::UnifiedText => (false, None),
+            Format::UnifiedBinary => (true, None),
+            // One code per column: kept, so the count is checked against the
+            // columns (08P01 when it differs) and a mix is honoured.
+            Format::Individual(codes) => (
+                !codes.is_empty() && codes.iter().all(|c| *c == 1),
+                Some(codes.clone()),
+            ),
         };
         self.binary_results
             .store(binary, std::sync::atomic::Ordering::Relaxed);
+        *self.mixed_formats.lock().unwrap_or_else(|e| e.into_inner()) = mixed;
+    }
+
+    /// A description in the MIXED formats the `Bind` asked for: each column
+    /// binary where its code says so and its type has a binary form.
+    fn mixed_fields(&self, fields: Vec<FieldInfo>) -> PgWireResult<Vec<FieldInfo>> {
+        let mixed = self
+            .mixed_formats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(codes) = mixed else {
+            return Ok(fields);
+        };
+        if codes.len() != fields.len() {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "08P01".into(),
+                format!(
+                    "bind message has {} result formats but query has {} columns",
+                    codes.len(),
+                    fields.len()
+                ),
+            ))));
+        }
+        Ok(fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let binary = codes.get(i).copied() == Some(1)
+                    && secantus_pgplan::pgtypes::type_name_of_oid(i64::from(f.datatype().oid()))
+                        .is_some();
+                rebind_field_format(f, binary)
+            })
+            .collect())
+    }
+
+    /// A text answer re-encoded in the MIXED formats the `Bind` asked for:
+    /// each binary-requested cell is read back from its text through its
+    /// column's type and encoded in binary; the text cells go out as they are.
+    fn apply_mixed_formats(&self, response: Response) -> PgWireResult<Response> {
+        let Response::Query(q) = response else {
+            return Ok(response);
+        };
+        let fields = self.mixed_fields(q.row_schema.as_ref().clone())?;
+        if fields
+            .iter()
+            .zip(q.row_schema.iter())
+            .all(|(a, b)| a.format() == b.format())
+        {
+            return Ok(Response::Query(q));
+        }
+        let schema = Arc::new(fields);
+        let bin_schema = Arc::new(
+            q.row_schema
+                .iter()
+                .map(|f| rebind_field_format(f, true))
+                .collect::<Vec<_>>(),
+        );
+        let types: Vec<Option<String>> = q
+            .row_schema
+            .iter()
+            .map(|f| secantus_pgplan::pgtypes::type_name_of_oid(i64::from(f.datatype().oid())))
+            .collect();
+        let (tz, ds, cenc) = (
+            self.session_timezone(),
+            self.session_datestyle(),
+            self.client_encoding(),
+        );
+        let out_schema = schema.clone();
+        let rows = q.data_rows.map(move |row| {
+            let row = row?;
+            let cells = split_data_row(&row);
+            let bad = || {
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".into(),
+                    "XX000".into(),
+                    "a result cell could not be re-encoded in binary".into(),
+                )))
+            };
+            let mut values: Vec<Option<Bson>> = Vec::with_capacity(cells.len());
+            for (i, cell) in cells.iter().enumerate() {
+                let binary = out_schema.get(i).map(|f| f.format()) == Some(FieldFormat::Binary);
+                values.push(match (cell, binary) {
+                    (Some(bytes), true) => {
+                        let text = std::str::from_utf8(bytes).map_err(|_| bad())?;
+                        let ty = types.get(i).cloned().flatten().ok_or_else(bad)?;
+                        let ty = ty.as_str();
+                        Some(secantus_pgplan::cast_text_to(text, ty, &tz).map_err(|_| bad())?)
+                    }
+                    _ => None,
+                });
+            }
+            let binary_row = encode_typed_row(&bin_schema, &values, &tz, &ds, cenc)?;
+            let binary_cells = split_data_row(&binary_row);
+            let mut data = BytesMut::new();
+            for (i, cell) in cells.iter().enumerate() {
+                let binary = out_schema.get(i).map(|f| f.format()) == Some(FieldFormat::Binary);
+                let chosen = if binary {
+                    binary_cells.get(i).cloned().flatten()
+                } else {
+                    cell.clone()
+                };
+                match chosen {
+                    None => data.extend_from_slice(&(-1i32).to_be_bytes()),
+                    Some(b) => {
+                        data.extend_from_slice(&(b.len() as i32).to_be_bytes());
+                        data.extend_from_slice(&b);
+                    }
+                }
+            }
+            Ok(DataRow::new(data, row.field_count))
+        });
+        let mut out = QueryResponse::new(schema, rows);
+        out.command_tag = q.command_tag;
+        out.tag_counts_rows = q.tag_counts_rows;
+        Ok(Response::Query(out))
     }
 
     /// Plan a statement, resolving table names against the catalog PLUS any
@@ -5886,7 +6074,7 @@ impl PgHandler {
 
     /// The inheritance tree, for the planner: `(child, parent)` pairs and
     /// each parent's columns.
-    fn inheritance(&self) -> (Vec<(String, String)>, Vec<(String, Vec<String>)>) {
+    fn inheritance(&self) -> InheritanceTree {
         let defs = self.all_table_defs().unwrap_or_default();
         let mut pairs = Vec::new();
         let mut columns: Vec<(String, Vec<String>)> = Vec::new();
@@ -14965,7 +15153,11 @@ impl PgHandler {
                 .cursor_capture
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .take();
+                .take()
+                // A source the executor did not capture (VALUES, an
+                // aggregate, a constant select) is recovered from its text
+                // rows, so a binary FETCH still sends binary.
+                .or_else(|| typed_from_text(&schema, &rows, &tz));
             self.cursors
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -27499,7 +27691,7 @@ impl ExtendedQueryHandler for PgHandler {
             &param_types,
         )?;
         Ok(match fields {
-            Some(fields) => DescribePortalResponse::new(fields),
+            Some(fields) => DescribePortalResponse::new(self.mixed_fields(fields)?),
             None => pgwire::api::results::DescribeResponse::no_data(),
         })
     }
@@ -27546,7 +27738,7 @@ impl ExtendedQueryHandler for PgHandler {
         // Report any GUC change (TimeZone, DateStyle, ...) the statement made.
         self.report_pending_params(_c).await?;
         // One portal is one statement, so exactly one response.
-        Ok(responses.remove(0))
+        self.apply_mixed_formats(responses.remove(0))
     }
 }
 
