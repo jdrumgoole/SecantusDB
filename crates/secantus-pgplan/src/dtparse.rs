@@ -254,6 +254,90 @@ enum Tok {
     Reserved(Res),
     Tz(i32),
     Dtz(i32),
+    /// A dynamic abbreviation (`MSK`): an index into `DYNAMIC`, resolved
+    /// against its zone's history once the date is known.
+    DynTz(u16),
+}
+
+/// The `Default` set's DYNAMIC abbreviations: each names a zone rather than
+/// an offset, and means that zone's offset at the time given
+/// (`timezonesets/Default`, PostgreSQL 15).
+const DYNAMIC: &[(&str, &str)] = &[
+    ("art", "America/Argentina/Buenos_Aires"),
+    ("arst", "America/Argentina/Buenos_Aires"),
+    ("clt", "America/Santiago"),
+    ("gyt", "America/Guyana"),
+    ("pyt", "America/Asuncion"),
+    ("vet", "America/Caracas"),
+    ("davt", "Antarctica/Davis"),
+    ("mawt", "Antarctica/Mawson"),
+    ("amst", "Asia/Yerevan"),
+    ("anast", "Asia/Anadyr"),
+    ("anat", "Asia/Anadyr"),
+    ("azst", "Asia/Baku"),
+    ("azt", "Asia/Baku"),
+    ("gest", "Asia/Tbilisi"),
+    ("get", "Asia/Tbilisi"),
+    ("irkst", "Asia/Irkutsk"),
+    ("irkt", "Asia/Irkutsk"),
+    ("kgt", "Asia/Bishkek"),
+    ("krast", "Asia/Krasnoyarsk"),
+    ("krat", "Asia/Krasnoyarsk"),
+    ("lkt", "Asia/Colombo"),
+    ("magst", "Asia/Magadan"),
+    ("magt", "Asia/Magadan"),
+    ("novst", "Asia/Novosibirsk"),
+    ("novt", "Asia/Novosibirsk"),
+    ("omsst", "Asia/Omsk"),
+    ("omst", "Asia/Omsk"),
+    ("petst", "Asia/Kamchatka"),
+    ("pett", "Asia/Kamchatka"),
+    ("sgt", "Asia/Singapore"),
+    ("tmt", "Asia/Ashgabat"),
+    ("ulat", "Asia/Ulaanbaatar"),
+    ("vlast", "Asia/Vladivostok"),
+    ("vlat", "Asia/Vladivostok"),
+    ("yakst", "Asia/Yakutsk"),
+    ("yakt", "Asia/Yakutsk"),
+    ("yekt", "Asia/Yekaterinburg"),
+    ("fkst", "Atlantic/Stanley"),
+    ("fkt", "Atlantic/Stanley"),
+    ("lhdt", "Australia/Lord_Howe"),
+    ("msk", "Europe/Moscow"),
+    ("volt", "Europe/Volgograd"),
+    ("iot", "Indian/Chagos"),
+    ("ckt", "Pacific/Rarotonga"),
+    ("easst", "Pacific/Easter"),
+    ("east", "Pacific/Easter"),
+    ("kost", "Pacific/Kosrae"),
+    ("lint", "Pacific/Kiritimati"),
+    ("nut", "Pacific/Niue"),
+    ("tkt", "Pacific/Fakaofo"),
+];
+
+/// A dynamic abbreviation's offset at a local date and time
+/// (`DetermineTimeZoneAbbrevOffset`): the zone's offset then when it went
+/// by this abbreviation, else its standard (or, for a daylight-saving
+/// abbreviation, its daylight) offset then.
+fn dynamic_offset(i: u16, y: i32, mo: u32, d: u32, h: u32, mi: u32, sec: u32) -> Option<i32> {
+    use chrono::{NaiveDate, Offset, TimeZone};
+    use chrono_tz::{OffsetComponents, OffsetName};
+    let (abbrev, zone) = DYNAMIC.get(usize::from(i))?;
+    let tz: chrono_tz::Tz = zone.parse().ok()?;
+    let local = NaiveDate::from_ymd_opt(y, mo, d)?.and_hms_opt(h.min(23), mi, sec.min(59))?;
+    let off = tz
+        .offset_from_local_datetime(&local)
+        .earliest()
+        .unwrap_or_else(|| tz.offset_from_utc_datetime(&local));
+    // The zone went by this abbreviation then -- or tzdata now names that
+    // period by its number (`+10`), which says nothing against it.
+    let named = off.abbreviation();
+    if named.is_none_or(|a| a.eq_ignore_ascii_case(abbrev) || a.starts_with(['+', '-'])) {
+        return Some(off.fix().local_minus_utc());
+    }
+    let base = off.base_utc_offset().num_seconds() as i32;
+    let dst = default_abbreviation(abbrev).is_some_and(|(_, dst)| dst);
+    Some(if dst { base + 3600 } else { base })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -347,8 +431,11 @@ fn keyword(t: &str) -> Option<Tok> {
         "nzst" => Tok::Tz(12 * 3600),
         "nzdt" => Tok::Dtz(13 * 3600),
         _ => {
+            if let Some(i) = DYNAMIC.iter().position(|(a, _)| *a == t) {
+                return Some(Tok::DynTz(i as u16));
+            }
             return default_abbreviation(t)
-                .map(|(off, dst)| if dst { Tok::Dtz(off) } else { Tok::Tz(off) })
+                .map(|(off, dst)| if dst { Tok::Dtz(off) } else { Tok::Tz(off) });
         }
     })
 }
@@ -970,6 +1057,7 @@ fn decode(text: &str, time_only: bool) -> std::result::Result<Parsed, Fail> {
     let mut bc = false;
     let mut out = Parsed::default();
     let mut tz: Option<i32> = None;
+    let mut dyn_zone: Option<u16> = None;
     for i in 0..nf {
         let (f, kind) = (&fields[i].0, fields[i].1);
         let tmask: u32;
@@ -1189,6 +1277,13 @@ fn decode(text: &str, time_only: bool) -> std::result::Result<Parsed, Fail> {
                     tmask = TZ;
                     tz = Some(v);
                 }
+                Some(Tok::DynTz(z)) => {
+                    tmask = TZ;
+                    // The current offset stands until the date is known.
+                    tz =
+                        Some(default_abbreviation(DYNAMIC[usize::from(z)].0).map_or(0, |(o, _)| o));
+                    dyn_zone = Some(z);
+                }
                 Some(Tok::AmPm(pm)) => {
                     tmask = 1 << 17; // AMPM
                     mer = Some(pm);
@@ -1264,6 +1359,19 @@ fn decode(text: &str, time_only: bool) -> std::result::Result<Parsed, Fail> {
     out.second = tm.sec as u32;
     out.micros = tm.fsec;
     out.offset = tz;
+    if let Some(z) = dyn_zone {
+        if let Some(o) = dynamic_offset(
+            z,
+            tm.year,
+            tm.mon as u32,
+            tm.mday as u32,
+            tm.hour as u32,
+            tm.min as u32,
+            tm.sec as u32,
+        ) {
+            out.offset = Some(o);
+        }
+    }
     Ok(out)
 }
 
@@ -1322,6 +1430,7 @@ fn finish_time_only(
 pub fn abbreviation_offset(name: &str) -> Option<i32> {
     match keyword(&name.to_ascii_lowercase()) {
         Some(Tok::Tz(v)) | Some(Tok::Dtz(v)) => Some(v),
+        Some(Tok::DynTz(z)) => default_abbreviation(DYNAMIC[usize::from(z)].0).map(|(o, _)| o),
         _ => None,
     }
 }

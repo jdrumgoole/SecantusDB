@@ -1457,7 +1457,7 @@ struct Target {
 
 impl Printer<'_> {
     /// The FROM items' relations, each as ruleutils names it.
-    fn from_rtes(&mut self, items: &[Node], out: &mut Vec<Rte>) -> Option<()> {
+    fn collect_rtes(&mut self, items: &[Node], out: &mut Vec<Rte>) -> Option<()> {
         for it in items {
             match it.node.as_ref()? {
                 N::RangeVar(rv) => {
@@ -1481,7 +1481,7 @@ impl Printer<'_> {
                     if j.alias.is_some() {
                         return None;
                     }
-                    self.from_rtes(
+                    self.collect_rtes(
                         &[j.larg.as_deref()?.clone(), j.rarg.as_deref()?.clone()],
                         out,
                     )?;
@@ -1600,7 +1600,7 @@ impl Printer<'_> {
             None
         } else {
             let mut rtes = Vec::new();
-            self.from_rtes(&s.from_clause, &mut rtes)?;
+            self.collect_rtes(&s.from_clause, &mut rtes)?;
             self.scopes.push(rtes.clone());
             let targets = self.targets(s, &rtes);
             let out = targets.and_then(|ts| {
@@ -1772,11 +1772,11 @@ impl Printer<'_> {
         s: &pg_query::protobuf::SelectStmt,
         colnames: Option<&[String]>,
     ) -> Option<()> {
-        if !s.values_lists.is_empty() || !s.group_distinct == false && s.group_distinct {
+        if !s.values_lists.is_empty() || s.group_distinct {
             return None;
         }
         let mut rtes = Vec::new();
-        self.from_rtes(&s.from_clause, &mut rtes)?;
+        self.collect_rtes(&s.from_clause, &mut rtes)?;
         self.scopes.push(rtes.clone());
         let targets = self.targets(s, &rtes)?;
         self.indent += PRETTYINDENT_STD;
@@ -1828,11 +1828,11 @@ impl Printer<'_> {
         for (i, it) in s.from_clause.iter().enumerate() {
             if i == 0 {
                 self.keyword(" FROM ", -PRETTYINDENT_STD, PRETTYINDENT_STD, 2);
-                self.from_item(it)?;
+                self.print_from_item(it)?;
             } else {
                 self.buf.push_str(", ");
                 let saved = std::mem::take(&mut self.buf);
-                self.from_item(it)?;
+                self.print_from_item(it)?;
                 let item = std::mem::replace(&mut self.buf, saved);
                 if item.starts_with('\n') {
                     self.remove_trailing_spaces();
@@ -1950,7 +1950,7 @@ impl Printer<'_> {
     }
 
     /// `get_from_clause_item`.
-    fn from_item(&mut self, it: &Node) -> Option<()> {
+    fn print_from_item(&mut self, it: &Node) -> Option<()> {
         match it.node.as_ref()? {
             N::RangeVar(rv) => {
                 self.buf.push_str(&q(&rv.relname));
@@ -1971,7 +1971,7 @@ impl Printer<'_> {
                 if open {
                     self.buf.push('(');
                 }
-                self.from_item(j.larg.as_deref()?)?;
+                self.print_from_item(j.larg.as_deref()?)?;
                 let jt = JoinType::try_from(j.jointype).ok()?;
                 let word = match jt {
                     JoinType::JoinInner if j.is_natural => " NATURAL JOIN ",
@@ -1988,7 +1988,7 @@ impl Printer<'_> {
                     _ => return None,
                 };
                 self.keyword(word, -PRETTYINDENT_STD, PRETTYINDENT_STD, PRETTYINDENT_JOIN);
-                self.from_item(j.rarg.as_deref()?)?;
+                self.print_from_item(j.rarg.as_deref()?)?;
                 if !j.using_clause.is_empty() {
                     let cols: Vec<String> = names(&j.using_clause).iter().map(|c| q(c)).collect();
                     self.buf.push_str(&format!(" USING ({})", cols.join(", ")));
@@ -2047,54 +2047,6 @@ fn viewdef_with(sql: &str, cat: &Catalog<'_>, pretty: bool) -> Option<String> {
     p.pretty = pretty;
     p.query(&node, None)?;
     Some(format!("{};", p.buf))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use secantus_pgcatalog::Column;
-
-    fn cat_lookup(n: &str) -> Option<TableDef> {
-        match n {
-            "vd_t" => Some(TableDef::new(
-                "vd_t",
-                vec![
-                    Column::new("id", "int4", true),
-                    Column::new("v", "varchar", false),
-                    Column::new("t", "text", false),
-                    Column::new("n", "numeric", false),
-                    Column::new("d", "date", false),
-                    Column::new("b", "bool", false),
-                ],
-            )),
-            "vd_u" => Some(TableDef::new(
-                "vd_u",
-                vec![
-                    Column::new("id", "int4", false),
-                    Column::new("t_id", "int4", false),
-                    Column::new("w", "text", false),
-                ],
-            )),
-            _ => None,
-        }
-    }
-
-    fn render(sql: &str) -> Option<String> {
-        let none = |_: &str| None;
-        let cat = Catalog {
-            lookup: &cat_lookup,
-            view_sql: &none,
-        };
-        viewdef(sql, &cat)
-    }
-
-    #[test]
-    fn a_simple_view_reads_as_ruleutils_prints_it() {
-        assert_eq!(
-            render("SELECT id, t FROM vd_t").as_deref(),
-            Some(" SELECT vd_t.id,\n    vd_t.t\n   FROM vd_t;")
-        );
-    }
 }
 
 /// `isSimpleNode` for a boolean expression of type `own` under `parent`.
@@ -2359,4 +2311,52 @@ pub fn expr_def(sql: &str, def: &TableDef) -> Option<String> {
     }]);
     p.expr(rt.val.as_deref()?)?;
     Some(p.buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use secantus_pgcatalog::Column;
+
+    fn cat_lookup(n: &str) -> Option<TableDef> {
+        match n {
+            "vd_t" => Some(TableDef::new(
+                "vd_t",
+                vec![
+                    Column::new("id", "int4", true),
+                    Column::new("v", "varchar", false),
+                    Column::new("t", "text", false),
+                    Column::new("n", "numeric", false),
+                    Column::new("d", "date", false),
+                    Column::new("b", "bool", false),
+                ],
+            )),
+            "vd_u" => Some(TableDef::new(
+                "vd_u",
+                vec![
+                    Column::new("id", "int4", false),
+                    Column::new("t_id", "int4", false),
+                    Column::new("w", "text", false),
+                ],
+            )),
+            _ => None,
+        }
+    }
+
+    fn render(sql: &str) -> Option<String> {
+        let none = |_: &str| None;
+        let cat = Catalog {
+            lookup: &cat_lookup,
+            view_sql: &none,
+        };
+        viewdef(sql, &cat)
+    }
+
+    #[test]
+    fn a_simple_view_reads_as_ruleutils_prints_it() {
+        assert_eq!(
+            render("SELECT id, t FROM vd_t").as_deref(),
+            Some(" SELECT vd_t.id,\n    vd_t.t\n   FROM vd_t;")
+        );
+    }
 }

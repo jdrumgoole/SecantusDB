@@ -663,16 +663,6 @@ remain open:
       - Built-in function arguments are type-checked for the text and numeric
         families only (`upper(1)`, `abs('x'::text)` are 42883); other
         built-ins still take what they are given.
-      - `pgcrypto`'s `pgp_*` functions are refused (the rest of the extension
-        landed in batch 9; `pg_trgm` in batch 10).
-- [ ] **OPEN — RUST pgserver: what batch 9 (MERGE, RLS enforcement, table
-      locks and timeouts, array lower bounds, ALTER TABLE constraints, PG 15
-      functions) leaves (2026-09-30).** 110 corpora at 0 divergences (PG 14
-      reference; `merge` / `pg15_features` against a PG 15.19 reference). Left:
-      - Array lower bounds survive the functions measured to keep them
-        (`array_append` / `_prepend` / `_cat` / `_remove` / `_replace` /
-        `_fill`, `||`, subscript assignment); any other array-returning
-        function answers a 1-based array.
 - [ ] **OPEN — RUST pgserver: what batch 10 (CREATE AGGREGATE / OPERATOR /
       STATISTICS / PUBLICATION, INHERITS, hash and expression partitioning,
       pg_trgm, ALTER VIEW, table locks, time input, wide timestamptz,

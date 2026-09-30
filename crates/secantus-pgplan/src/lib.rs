@@ -22685,6 +22685,17 @@ pub fn render_timetz(micros: i64, east_seconds: i32) -> String {
 /// A literal with no offset takes the session zone's CURRENT offset, so the
 /// same literal can mean different things on either side of a DST change.
 fn parse_timetz(text: &str, tz: &TimeZoneSetting) -> Result<String> {
+    // A zone ABBREVIATION (`12:00 EST`) is DecodeTimeOnly's to read: the
+    // plain time parser would take the time and drop the zone.
+    if text.chars().any(|c| c.is_ascii_alphabetic()) {
+        if let Ok(p) = dtparse::parse_time_only(text.trim(), "time with time zone") {
+            if p.zone.is_none() {
+                if let Some(off) = p.offset {
+                    return Ok(format!("{}{}", render_time_parts(&p), render_offset(off)));
+                }
+            }
+        }
+    }
     let (body, offset) = split_trailing_offset(text);
     let (time, offset) = match parse_time(&body) {
         Ok(time) => (time, offset),

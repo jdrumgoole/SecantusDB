@@ -11561,7 +11561,7 @@ impl PgHandler {
                         // conrelid)` -- which is how a client reads a CHECK
                         // back -- answers it as ruleutils prints it.
                         if let Some(row) = rows.last_mut() {
-                            let text = secantus_pgplan::ruleutils::expr_def(&ck.expression, &t)
+                            let text = secantus_pgplan::ruleutils::expr_def(&ck.expression, t)
                                 .or_else(|| secantus_pgplan::generation_expression(&ck.expression))
                                 .unwrap_or_else(|| format!("({})", ck.expression));
                             row.insert(field("conbin"), text);
@@ -15396,7 +15396,6 @@ impl PgHandler {
             {
                 let lower = query.to_ascii_lowercase();
                 let second: String = lower
-                    .trim_start()
                     .split_whitespace()
                     .nth(1)
                     .unwrap_or_default()
