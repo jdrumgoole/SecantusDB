@@ -33,21 +33,25 @@ fn category(ty: &str) -> Option<&'static str> {
 
 /// The relations a statement's FROM list names, by the name a column
 /// qualifier uses; `complete` when every FROM item is one of them, so an
-/// unqualified column resolves among them alone.
-struct Scope {
+/// unqualified column resolves among them alone. A subquery's scope has
+/// its enclosing query's as `parent`, where a name it does not have resolves.
+struct Scope<'p> {
     tables: Vec<(String, TableDef)>,
     complete: bool,
+    parent: Option<&'p Scope<'p>>,
 }
 
-impl Scope {
+impl<'p> Scope<'p> {
     fn new(
         items: &[pg_query::protobuf::Node],
         ctes: &[String],
         lookup: &dyn Fn(&str) -> Option<TableDef>,
-    ) -> Scope {
+        parent: Option<&'p Scope<'p>>,
+    ) -> Scope<'p> {
         let mut scope = Scope {
             tables: Vec::new(),
             complete: true,
+            parent,
         };
         for item in items {
             scope.add(item, ctes, lookup);
@@ -105,21 +109,25 @@ impl Scope {
             })
             .collect::<Option<_>>()?;
         match parts.as_slice() {
-            [col] if self.complete => {
+            [col] => {
                 let mut found = self
                     .tables
                     .iter()
                     .filter_map(|(_, d)| d.column(col).map(|c| c.pg_type.clone()));
-                let first = found.next()?;
-                // Named by more than one side: ambiguous, not ours to judge.
-                found.next().is_none().then_some(first)
+                match found.next() {
+                    // Named by more than one side, or possibly by a FROM item
+                    // this cannot see into: not ours to judge.
+                    Some(first) => (self.complete && found.next().is_none()).then_some(first),
+                    // Not a column here: an outer reference.
+                    None if self.complete => self.parent?.column_type(c),
+                    None => None,
+                }
             }
-            [q, col] => self
-                .tables
-                .iter()
-                .find(|(a, _)| a == q)
-                .and_then(|(_, d)| d.column(col))
-                .map(|c| c.pg_type.clone()),
+            [q, col] => match self.tables.iter().find(|(a, _)| a == q) {
+                Some((_, d)) => d.column(col).map(|c| c.pg_type.clone()),
+                None if self.complete => self.parent?.column_type(c),
+                None => None,
+            },
             _ => None,
         }
     }
@@ -218,9 +226,15 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
     Ok(())
 }
 
-/// Walk an expression, stopping at a subquery (its columns are its own
-/// scope's, which this does not model).
-fn walk(n: &pg_query::protobuf::Node, scope: &Scope) -> Result<()> {
+/// What a walk needs to open a subquery's own scope.
+struct Cx<'a> {
+    lookup: &'a dyn Fn(&str) -> Option<TableDef>,
+    ctes: Vec<String>,
+}
+
+/// Walk an expression; a subquery is checked in a scope of its own whose
+/// parent is this one.
+fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
     let Some(node) = n.node.as_ref() else {
         return Ok(());
     };
@@ -228,44 +242,59 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope) -> Result<()> {
         N::AExpr(e) => {
             check_aexpr(e, scope)?;
             for s in e.lexpr.iter().chain(e.rexpr.iter()) {
-                walk(s, scope)?;
+                walk(s, scope, cx)?;
             }
         }
         N::BoolExpr(b) => {
             for a in &b.args {
-                walk(a, scope)?;
+                walk(a, scope, cx)?;
             }
         }
         N::List(l) => {
             for a in &l.items {
-                walk(a, scope)?;
+                walk(a, scope, cx)?;
             }
         }
         N::NullTest(t) => {
             if let Some(a) = t.arg.as_deref() {
-                walk(a, scope)?;
+                walk(a, scope, cx)?;
             }
         }
         N::ResTarget(r) => {
             if let Some(v) = r.val.as_deref() {
-                walk(v, scope)?;
+                walk(v, scope, cx)?;
             }
         }
         N::CaseExpr(c) => {
             for w in &c.args {
                 if let Some(N::CaseWhen(w)) = w.node.as_ref() {
                     for s in w.expr.iter().chain(w.result.iter()) {
-                        walk(s, scope)?;
+                        walk(s, scope, cx)?;
                     }
                 }
             }
             if let Some(d) = c.defresult.as_deref() {
-                walk(d, scope)?;
+                walk(d, scope, cx)?;
             }
         }
         N::JoinExpr(j) => {
             for s in j.larg.iter().chain(j.rarg.iter()).chain(j.quals.iter()) {
-                walk(s, scope)?;
+                walk(s, scope, cx)?;
+            }
+        }
+        N::SubLink(sl) => {
+            if let Some(t) = sl.testexpr.as_deref() {
+                walk(t, scope, cx)?;
+            }
+            if let Some(N::SelectStmt(sel)) = sl.subselect.as_deref().and_then(|n| n.node.as_ref())
+            {
+                check_select(sel, &cx.ctes, cx.lookup, Some(scope))?;
+            }
+        }
+        // A FROM subquery sees the outer query only when it is LATERAL.
+        N::RangeSubselect(rs) => {
+            if let Some(N::SelectStmt(sel)) = rs.subquery.as_deref().and_then(|n| n.node.as_ref()) {
+                check_select(sel, &cx.ctes, cx.lookup, rs.lateral.then_some(scope))?;
             }
         }
         _ => {}
@@ -277,6 +306,7 @@ fn check_select(
     s: &pg_query::protobuf::SelectStmt,
     outer_ctes: &[String],
     lookup: &dyn Fn(&str) -> Option<TableDef>,
+    parent: Option<&Scope>,
 ) -> Result<()> {
     let mut ctes = outer_ctes.to_vec();
     if let Some(w) = &s.with_clause {
@@ -286,21 +316,23 @@ fn check_select(
             }
         }
     }
+    // A set operation's arms each have their own FROM, under the same parent.
     if let Some(l) = s.larg.as_deref() {
-        check_select(l, &ctes, lookup)?;
+        check_select(l, &ctes, lookup, parent)?;
     }
     if let Some(r) = s.rarg.as_deref() {
-        check_select(r, &ctes, lookup)?;
+        check_select(r, &ctes, lookup, parent)?;
     }
-    let scope = Scope::new(&s.from_clause, &ctes, lookup);
+    let scope = Scope::new(&s.from_clause, &ctes, lookup, parent);
+    let cx = Cx { lookup, ctes };
     for f in &s.from_clause {
-        walk(f, &scope)?;
+        walk(f, &scope, &cx)?;
     }
     for t in &s.target_list {
-        walk(t, &scope)?;
+        walk(t, &scope, &cx)?;
     }
     if let Some(w) = s.where_clause.as_deref() {
-        walk(w, &scope)?;
+        walk(w, &scope, &cx)?;
     }
     Ok(())
 }
@@ -313,15 +345,19 @@ pub(crate) fn check(node: &N, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Resu
         })
     };
     match node {
-        N::SelectStmt(s) => check_select(s, &[], lookup),
+        N::SelectStmt(s) => check_select(s, &[], lookup, None),
         N::UpdateStmt(u) if u.with_clause.is_none() => {
             let items: Vec<_> = relation(&u.relation)
                 .into_iter()
                 .chain(u.from_clause.iter().cloned())
                 .collect();
-            let scope = Scope::new(&items, &[], lookup);
+            let scope = Scope::new(&items, &[], lookup, None);
+            let cx = Cx {
+                lookup,
+                ctes: Vec::new(),
+            };
             match u.where_clause.as_deref() {
-                Some(w) => walk(w, &scope),
+                Some(w) => walk(w, &scope, &cx),
                 None => Ok(()),
             }
         }
@@ -330,9 +366,13 @@ pub(crate) fn check(node: &N, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Resu
                 .into_iter()
                 .chain(d.using_clause.iter().cloned())
                 .collect();
-            let scope = Scope::new(&items, &[], lookup);
+            let scope = Scope::new(&items, &[], lookup, None);
+            let cx = Cx {
+                lookup,
+                ctes: Vec::new(),
+            };
             match d.where_clause.as_deref() {
-                Some(w) => walk(w, &scope),
+                Some(w) => walk(w, &scope, &cx),
                 None => Ok(()),
             }
         }

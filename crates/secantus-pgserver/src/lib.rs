@@ -2258,6 +2258,7 @@ impl PgHandler {
                 .collect(),
         );
         secantus_pgplan::set_constraint_defs(self.constraint_defs().unwrap_or_default());
+        secantus_pgplan::set_view_defs(self.view_defs());
         secantus_pgplan::set_object_comments(self.object_comments());
         secantus_pgplan::domains::set_user_domains(self.domains().unwrap_or_default());
         secantus_pgplan::user_agg::set_user_aggregates(self.user_aggregates().unwrap_or_default());
@@ -5850,12 +5851,20 @@ impl PgHandler {
             return Ok(());
         }
         let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
-        for (table, privilege) in secantus_pgplan::privileges::sql_relations(sql) {
-            let mode = match privilege {
-                "SELECT" => table_locks::ACCESS_SHARE,
-                "TRUNCATE" => table_locks::ACCESS_EXCLUSIVE,
-                _ => table_locks::ROW_EXCLUSIVE,
-            };
+        let dml = secantus_pgplan::privileges::sql_relations(sql)
+            .into_iter()
+            .map(|(table, privilege)| {
+                let mode = match privilege {
+                    "SELECT" => table_locks::ACCESS_SHARE,
+                    "TRUNCATE" => table_locks::ACCESS_EXCLUSIVE,
+                    _ => table_locks::ROW_EXCLUSIVE,
+                };
+                (table, mode)
+            });
+        // DDL waits for readers too: ALTER / DROP / rename / CLUSTER take
+        // ACCESS EXCLUSIVE, CREATE INDEX takes SHARE.
+        let ddl = secantus_pgplan::privileges::ddl_locks(sql);
+        for (table, mode) in dml.chain(ddl) {
             table_locks::acquire(
                 &table,
                 pid,
@@ -6096,9 +6105,9 @@ impl PgHandler {
 
     /// Per view, `ALTER VIEW ... SET DEFAULT`'s `(column, default SQL)`.
     fn view_column_defaults(&self) -> Vec<(String, Vec<(String, String)>)> {
-        let Ok(docs) = self.type_catalog_docs(Self::VIEW_COLLECTION) else {
-            return Vec::new();
-        };
+        let docs = self
+            .type_catalog_docs(Self::VIEW_COLLECTION)
+            .unwrap_or_default();
         docs.iter()
             .filter_map(|d| {
                 let defaults = d.get_document("defaults").ok()?;
@@ -6109,6 +6118,7 @@ impl PgHandler {
                     .collect();
                 (!cols.is_empty()).then(|| (name.to_string(), cols))
             })
+            .chain(self.partition_defaults())
             .collect()
     }
 
@@ -6174,6 +6184,27 @@ impl PgHandler {
             }
         }
         Ok(())
+    }
+
+    /// Every view's and materialized view's `(regclass oid, name,
+    /// definition)`, as `pg_get_viewdef` prints it (`pg_views.definition`).
+    fn view_defs(&self) -> Vec<(i64, String, String)> {
+        let views = self.views().unwrap_or_default();
+        let matviews = self
+            .matviews()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(n, d, _)| (n, d));
+        views
+            .into_iter()
+            .chain(matviews)
+            .map(|(name, definition)| {
+                let oid = self
+                    .relation_oid(&name)
+                    .unwrap_or_else(|| Self::view_oid(&name));
+                (oid, name, format!(" {definition};"))
+            })
+            .collect()
     }
 
     fn views(&self) -> PgWireResult<Vec<(String, String)>> {
@@ -13513,7 +13544,7 @@ impl PgHandler {
                         Ok(())
                     });
                 }
-                let value = column.default.clone().unwrap_or(Bson::Null);
+                let value = typed_default(column)?.unwrap_or(Bson::Null);
                 self.rewrite_rows(table, |d| {
                     d.insert(column.field(), value.clone());
                     Ok(())
@@ -16525,9 +16556,12 @@ impl PgHandler {
     /// own earlier ones. The exception is a sequence the open transaction
     /// created: it is invisible outside, and rolls back with the block anyway.
     fn nextval(&self, name: &str, count: usize) -> PgWireResult<Vec<i64>> {
-        if !self.transaction_handle_open() {
-            return self.nextval_in_scope(name, count);
-        }
+        // A sequence advance is never rolled back -- not with a block, and
+        // not with a failed autocommit statement, whose own transaction (not
+        // the session's handle) would otherwise take the advance with it: a
+        // duplicate-key INSERT consumes its serial value on PostgreSQL. A
+        // sequence created in the open transaction is invisible outside it,
+        // so it advances inside.
         match self
             .storage
             .outside_user_transaction(|| self.nextval_in_scope(name, count))
@@ -18326,7 +18360,7 @@ impl PgHandler {
                 )?;
                 self.apply_serial_defaults(&def, &mut ins.rows)?;
                 self.apply_expression_defaults(&def, &mut ins.rows)?;
-                apply_column_defaults(&def, &mut ins.rows);
+                apply_column_defaults(&def, &mut ins.rows)?;
                 self.apply_generated(&def, &mut ins.rows)?;
                 // BEFORE triggers see each row with its defaults, and may
                 // rewrite or drop it before any constraint is checked.
@@ -18343,6 +18377,7 @@ impl PgHandler {
                     self.check_partition_route(&def, row)?;
                 }
                 self.check_expression_unique(&def, &ins.rows, &[])?;
+                self.check_partition_unique(&def, &ins.rows, &[])?;
                 self.check_exclusions(&def, &ins.rows, &[])?;
                 if let Some(dup) = self.wide_numeric_pk_conflict(&ins.table, &def, &ins.rows)? {
                     return Err(Self::write_error(
@@ -21685,6 +21720,7 @@ impl PgHandler {
                             .chain(rekeys.iter().map(|(old, _)| row_id(old)))
                             .collect();
                         self.check_expression_unique(def, &new_rows, &replacing)?;
+                        self.check_partition_unique(def, &new_rows, &replacing)?;
                         self.check_exclusions(def, &new_rows, &replacing)?;
                     }
                     if let (true, Some(def)) = (referenced, def.as_ref()) {
@@ -22814,9 +22850,30 @@ impl PgHandler {
 /// Fill every column an INSERT omitted with its literal DEFAULT. Sequence
 /// defaults are applied first (`apply_serial_defaults`); a column with
 /// neither stays absent, which reads as NULL.
-fn apply_column_defaults(def: &TableDef, rows: &mut [Document]) {
+/// A column's folded DEFAULT as a row stores it. The default is kept as
+/// written (`column_default` prints `1.25`) and takes the column's modifier
+/// on the way in: a numeric(4,1) stores `1.3`, as an inserted literal would.
+fn typed_default(column: &Column) -> PgWireResult<Option<Bson>> {
+    let Some(default) = column.default.as_ref() else {
+        return Ok(None);
+    };
+    Ok(Some(match (column.pg_type.as_str(), column.typmod) {
+        ("numeric" | "decimal", t) if t > 4 => {
+            match secantus_pgplan::numeric::numeric_text(default) {
+                Some(text) => secantus_pgplan::numeric::numeric_bson(
+                    &secantus_pgplan::numeric::apply_numeric_typmod(&text, t)
+                        .map_err(|e| PgHandler::err(&e))?,
+                ),
+                None => default.clone(),
+            }
+        }
+        _ => default.clone(),
+    }))
+}
+
+fn apply_column_defaults(def: &TableDef, rows: &mut [Document]) -> PgWireResult<()> {
     for column in &def.columns {
-        let Some(default) = column.default.as_ref() else {
+        let Some(default) = typed_default(column)? else {
             continue;
         };
         let field = column.field();
@@ -22826,6 +22883,7 @@ fn apply_column_defaults(def: &TableDef, rows: &mut [Document]) {
             }
         }
     }
+    Ok(())
 }
 
 /// A stored timestamp, with its hidden companion added back.
@@ -27929,7 +27987,7 @@ impl CopyHandler for PgHandler {
                 let mut rows = parsed_rows;
                 self.apply_serial_defaults(&def, &mut rows)?;
                 self.apply_expression_defaults(&def, &mut rows)?;
-                apply_column_defaults(&def, &mut rows);
+                apply_column_defaults(&def, &mut rows)?;
                 self.apply_generated(&def, &mut rows)?;
                 let (table, _, rows) = self.copy_target(&def, rows)?;
                 let docs = rows

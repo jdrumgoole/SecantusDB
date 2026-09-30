@@ -298,6 +298,79 @@ fn callee(name: &str, arg_types: &[String]) -> Result<Callee> {
     )))
 }
 
+/// The argument types of a built-in operator function, read off its name as
+/// `pg_proc` spells them: `int4pl(int4, int4)`, `int48mi(int4, int8)`,
+/// `numeric_add(numeric, numeric)`, `textcat(text, text)`. `None` for a
+/// function this does not know the signature of, which is not checked.
+fn builtin_signature(name: &str) -> Option<Vec<&'static str>> {
+    if crate::correlated::user_function_named(name) {
+        return None;
+    }
+    let ops = [
+        "pl", "mi", "mul", "div", "mod", "larger", "smaller", "eq", "ne", "lt", "le", "gt", "ge",
+    ];
+    if name == "textcat" || name == "text_larger" || name == "text_smaller" {
+        return Some(vec!["text", "text"]);
+    }
+    if let Some(op) = name.strip_prefix("numeric_") {
+        return matches!(
+            op,
+            "add" | "sub" | "mul" | "div" | "mod" | "larger" | "smaller"
+        )
+        .then(|| vec!["numeric", "numeric"]);
+    }
+    let width = |c: char| match c {
+        '2' => Some("int2"),
+        '4' => Some("int4"),
+        '8' => Some("int8"),
+        _ => None,
+    };
+    for float in ["float4", "float8"] {
+        if let Some(op) = name.strip_prefix(float) {
+            if ops.contains(&op) {
+                return Some(vec![float, float]);
+            }
+        }
+    }
+    let rest = name.strip_prefix("int")?;
+    let mut chars = rest.chars();
+    let a = width(chars.next()?)?;
+    let tail: String = chars.collect();
+    if ops.contains(&tail.as_str()) {
+        return Some(vec![a, a]);
+    }
+    let mut tail_chars = tail.chars();
+    let b = width(tail_chars.next()?)?;
+    let op: String = tail_chars.collect();
+    ops.contains(&op.as_str()).then(|| vec![a, b])
+}
+
+/// 42883 when a built-in state or final function does not take these
+/// argument types (`int4pl(integer, text)`), as `DefineAggregate` finds.
+fn check_builtin_signature(name: &str, arg_types: &[String]) -> Result<()> {
+    let Some(want) = builtin_signature(name) else {
+        return Ok(());
+    };
+    let same = |a: &str, b: &str| match (
+        crate::pgtypes::oid_of_name(a),
+        crate::pgtypes::oid_of_name(b),
+    ) {
+        (Some(x), Some(y)) => x == y,
+        _ => a.eq_ignore_ascii_case(b),
+    };
+    if want.len() == arg_types.len() && want.iter().zip(arg_types).all(|(w, a)| same(w, a)) {
+        return Ok(());
+    }
+    Err(Error::UndefinedFunction(format!(
+        "function {name}({}) does not exist",
+        arg_types
+            .iter()
+            .map(|t| crate::display_type(t))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )))
+}
+
 /// Check a definition the way `DefineAggregate` does, before it is stored:
 /// the required options, then that the state (and final) function exists
 /// for these types.
@@ -317,7 +390,9 @@ pub fn validate(agg: &UserAggregate) -> Result<()> {
     let mut sig = vec![agg.stype.clone()];
     sig.extend(agg.arg_types.iter().cloned());
     callee(&agg.sfunc, &sig)?;
+    check_builtin_signature(&agg.sfunc, &sig)?;
     if let Some(f) = &agg.finalfunc {
+        check_builtin_signature(f, std::slice::from_ref(&agg.stype))?;
         match callee(f, std::slice::from_ref(&agg.stype))? {
             Callee::Builtin(_, Builtin::Scalar) if builtin_result_type(f).is_none() => {
                 return Err(Error::Unsupported(format!(

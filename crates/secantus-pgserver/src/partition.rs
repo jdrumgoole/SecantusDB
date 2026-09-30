@@ -228,6 +228,38 @@ impl PgHandler {
             .collect()
     }
 
+    /// Each partition's own column DEFAULTs (those differing from its
+    /// parent's), which an INSERT written directly into the partition --
+    /// served as a view -- gives a column it omits.
+    pub(crate) fn partition_defaults(&self) -> Vec<(String, Vec<(String, String)>)> {
+        let Ok(defs) = self.all_table_defs() else {
+            return Vec::new();
+        };
+        defs.iter()
+            .filter_map(|d| {
+                let parent = self.lookup(parent_of(d)?)?;
+                let cols: Vec<(String, String)> = d
+                    .columns
+                    .iter()
+                    .filter_map(|c| {
+                        let own = Self::default_expression(c);
+                        let inherited = parent
+                            .column(&c.name)
+                            .map(Self::default_expression)
+                            .unwrap_or(Bson::Null);
+                        match own {
+                            Bson::String(sql) if Bson::String(sql.clone()) != inherited => {
+                                Some((c.name.clone(), sql))
+                            }
+                            _ => None,
+                        }
+                    })
+                    .collect();
+                (!cols.is_empty()).then(|| (d.name.clone(), cols))
+            })
+            .collect()
+    }
+
     /// Every table's `tableoid`: its own oid, or -- for a partitioned one --
     /// the oid of the leaf partition each row falls in.
     pub(crate) fn tableoid_expressions(&self) -> Vec<(String, String)> {
@@ -603,7 +635,15 @@ impl PgHandler {
                 }
             }
             match found {
-                Some(p) => level = p,
+                // The partition's OWN NOT NULLs and CHECKs hold for the rows
+                // it takes, whichever table they were written through.
+                Some(p) => {
+                    let shaped = Self::reshape_rows(def, &p, std::slice::from_ref(row))?;
+                    if let Some(r) = shaped.first() {
+                        self.check_row_constraints(&p, r)?;
+                    }
+                    level = p;
+                }
                 None => {
                     let key = ordered_key(&level);
                     let names: Vec<&str> = key.iter().map(|(n, _)| n.as_str()).collect();
@@ -628,6 +668,121 @@ impl PgHandler {
                         values.join(", ")
                     ));
                     return Err(PgWireError::UserError(Box::new(info)));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The partitions a row of `def` passes through, top level first.
+    fn route_path(&self, def: &TableDef, row: &Document) -> PgWireResult<Vec<TableDef>> {
+        let mut path = Vec::new();
+        let mut level = def.clone();
+        for _ in 0..64 {
+            if !is_partitioned(&level) {
+                break;
+            }
+            let mut next = None;
+            for p in self.partitions_of(&level.name)? {
+                if let Some(cond) = self.partition_condition(&p)? {
+                    if self.row_satisfies(def, &cond, row)? {
+                        next = Some(p);
+                        break;
+                    }
+                }
+            }
+            match next {
+                Some(p) => {
+                    path.push(p.clone());
+                    level = p;
+                }
+                None => break,
+            }
+        }
+        Ok(path)
+    }
+
+    /// A partition's own PRIMARY KEY and UNIQUE constraints, over the rows
+    /// the partition holds: `rows` (under the root `def`'s fields) against
+    /// its stored rows other than `replacing`, and against one another.
+    pub(crate) fn check_partition_unique(
+        &self,
+        def: &TableDef,
+        rows: &[Document],
+        replacing: &[Bson],
+    ) -> PgWireResult<()> {
+        if !is_partitioned(def) {
+            return Ok(());
+        }
+        // (partition, constraint name, columns) -> keys already taken.
+        let mut taken: Vec<(String, String, Vec<Vec<Bson>>)> = Vec::new();
+        for row in rows {
+            for p in self.route_path(def, row)? {
+                let mut keys: Vec<(String, Vec<String>)> = Vec::new();
+                let pk: Vec<String> = p
+                    .columns
+                    .iter()
+                    .filter(|c| c.pk)
+                    .map(|c| c.name.clone())
+                    .collect();
+                if !pk.is_empty() {
+                    keys.push((format!("{}_pkey", p.name), pk));
+                }
+                for u in p.unique_constraints.iter().filter(|u| !u.exclusion) {
+                    keys.push((u.name.clone(), u.columns.clone()));
+                }
+                for (name, columns) in keys {
+                    let key_of = |d: &Document| -> Option<Vec<Bson>> {
+                        columns
+                            .iter()
+                            .map(|c| {
+                                let field = def.column(c).map(|col| col.field())?;
+                                match d.get(&field) {
+                                    None | Some(Bson::Null) => None,
+                                    Some(v) => Some(v.clone()),
+                                }
+                            })
+                            .collect()
+                    };
+                    let Some(key) = key_of(row) else {
+                        continue;
+                    };
+                    let slot = match taken
+                        .iter()
+                        .position(|(t, n, _)| *t == p.name && *n == name)
+                    {
+                        Some(i) => i,
+                        None => {
+                            let stored = match self.partition_rows(&p)? {
+                                Some((_, docs)) => docs,
+                                None => Vec::new(),
+                            };
+                            let existing: Vec<Vec<Bson>> = stored
+                                .iter()
+                                .filter(|d| !d.get("_id").is_some_and(|id| replacing.contains(id)))
+                                .filter_map(key_of)
+                                .collect();
+                            taken.push((p.name.clone(), name.clone(), existing));
+                            taken.len() - 1
+                        }
+                    };
+                    if taken[slot].2.contains(&key) {
+                        let text: Vec<String> =
+                            key.iter().map(secantus_pgplan::value_text).collect();
+                        return Err(Self::constraint_error(
+                            "23505",
+                            format!("duplicate key value violates unique constraint \"{name}\""),
+                            format!(
+                                "Key ({})=({}) already exists.",
+                                columns.join(", "),
+                                text.join(", ")
+                            ),
+                            &p,
+                            Some(&name),
+                            None,
+                        ));
+                    }
+                    taken[slot].2.push(key);
                 }
             }
         }

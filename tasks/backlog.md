@@ -639,24 +639,25 @@ remain open:
       - Date/time input: the whole of PostgreSQL 15's `Default` abbreviation
         set is known (batch 10), but each abbreviation is its CURRENT offset;
         a dynamic abbreviation's history (`MSK` before 2011) is not modelled.
-      - **Python PG server: SQLAlchemy 2.1 reflection queries
-        `pg_catalog.pg_tablespace`**, which the Python server does not have
-        (three reflection tests fail under 2.1; CI pins 2.0.51).
 - [ ] **OPEN — RUST pgserver: what batch 8 (partitioning, row-level
       security, domains, materialized views, WITH RECURSIVE, xml, READ
       COMMITTED, enums, generated columns) leaves (2026-09-30).** 87 corpora
       swept against PostgreSQL 14 at 0 divergences except `arrays` and
       `strings` (one line each, below). Left:
-      - Partitioning: a partition's own column options and constraints in
-        `PARTITION OF ... ( ... )` are refused (0A000). The Python server does
-        not know partitions: it sees a partition as an empty table (the rows
-        are in the root's collection). (`PARTITION BY HASH`, expression keys
-        and `tableoid` everywhere landed in batch 10.)
+      - Partitioning: the Python server does not know partitions: it sees a
+        partition as an empty table (the rows are in the root's collection).
+        (`PARTITION BY HASH`, expression keys, `tableoid` everywhere, and a
+        partition's own column options and constraints -- NOT NULL, DEFAULT,
+        CHECK, UNIQUE, PRIMARY KEY, enforced -- landed in batch 10.) A
+        partition's UNIQUE / PRIMARY KEY is checked by scanning the
+        partition's rows per write, not by an index.
       - A ruleutils-style deparser is approximated: a generation expression or
         policy qual with a function call over a cast, or a CASE, renders
         differently from `pg_get_expr` (`generated` corpus covers the common
         shapes; `column_default` shapes in the `defaults` corpus).
-        `pg_get_viewdef` does not reproduce PostgreSQL's pretty layout.
+        `pg_get_viewdef` / `pg_views.definition` print the definition as
+        written, not in ruleutils' layout (columns qualified, one target per
+        line, implicit casts shown).
       - Built-in function arguments are type-checked for the text and numeric
         families only (`upper(1)`, `abs('x'::text)` are 42883); other
         built-ins still take what they are given.
@@ -683,21 +684,23 @@ remain open:
       corpus needs 15). Left, each measured:
       - **Operator resolution by type** covers comparisons (`=`, `<>`, `<`,
         `<=`, `>`, `>=`, `IN`, `LIKE` / `~~`) whose operands are typed
-        statically inside the statement's own FROM scope. Inside a subquery,
-        and for an operand that is itself an expression, nothing is checked,
-        and a cross-category comparison there still answers no rows rather
-        than 42883.
+        statically: a column of a table in scope (a subquery's own FROM, then
+        the enclosing query's), a constant, a cast, a declared parameter. An
+        operand that is itself an expression, or a column of a FROM subquery
+        or CTE, is not checked, and a cross-category comparison there still
+        answers no rows rather than 42883.
       - **Error positions** (`P`) come from the parse location where the
         raising site recorded one, and otherwise from the first token the
         message names. A name mentioned twice may point at the wrong
         occurrence. An error inside a function body carries no internal
         position.
-      - `information_schema.columns` does not list the columns of the
-        `pg_catalog` views.
-      - A DDL statement does not wait for another session's implicit
-        statement lock (only for an explicit `LOCK TABLE`).
-      - `CREATE AGGREGATE` over a built-in state function does not check the
-        function's signature against the declared state type.
+      - `information_schema.tables` / `.columns` list no `pg_catalog` or
+        `information_schema` relation (PostgreSQL 15 lists 139 relations and
+        2,005 columns); matching the set needs the catalogs this server does
+        not model.
+      - `CREATE AGGREGATE`'s built-in state / final function signatures are
+        checked for the operator functions (`int4pl`, `numeric_add`,
+        `textcat`, ...); any other built-in is taken as declared.
 - [ ] **OPEN — RUST pgserver: residuals of the wide-`numeric` slice
       (2026-09-09).** Values wider than Decimal128 now store exactly as
       `{__numeric: <canonical text>, __numkey: <byte-sortable key>}`

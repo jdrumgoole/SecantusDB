@@ -2776,6 +2776,9 @@ pub fn plan_with_subqueries(
     if let Some(inner) = node.node.as_ref() {
         func_cast::refuse_unresolved(inner)?;
         optype::check(inner, lookup)?;
+        if let N::SelectStmt(sel) = inner {
+            order_by_ambiguity(sel)?;
+        }
     }
     let mut params = params.to_vec();
     materialize_dml_ctes(&mut node, lookup, &mut params, run)?;
@@ -2830,10 +2833,11 @@ fn plan_node(
             if !parents.is_empty() {
                 c.inh_relations.clear();
             }
-            let (c, extra) = partitions::lower_create(&c, lookup)?;
+            let (c, extra, column_options) = partitions::lower_create(&c, lookup)?;
             let mut st = plan_create(&expand_table_like(&c, lookup)?)?;
             if let Statement::CreateTable(def, _) = &mut st {
                 def.extra.extend(extra);
+                partitions::apply_column_options(def, &column_options)?;
                 if !parents.is_empty() {
                     inherit::merge_parents(def, &parents, lookup)?;
                 }
@@ -5497,6 +5501,18 @@ pub(crate) fn object_comment(oid: i64, subid: i32) -> Option<String> {
             .find(|(o, s, _)| *o == oid && *s == subid)
             .map(|(_, _, t)| t.clone())
     })
+}
+
+thread_local! {
+    /// `(relation oid, name, pg_get_viewdef text)` for every view and
+    /// materialized view, published with the rest of the catalog.
+    static VIEW_DEFS: std::cell::RefCell<Vec<(i64, String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Install the view definitions `pg_get_viewdef` answers from.
+pub fn set_view_defs(defs: Vec<(i64, String, String)>) {
+    VIEW_DEFS.with(|d| *d.borrow_mut() = defs);
 }
 
 /// Install the constraint definitions `pg_get_constraintdef` answers from.
@@ -9324,6 +9340,71 @@ fn constant_where(w: &pg_query::protobuf::Node, params: &[Bson]) -> Result<bool>
     })
 }
 
+/// `ORDER BY name` where two or more output columns carry that name and
+/// differ is PostgreSQL's 42702 (`findTargetlistEntrySQL92`): the output
+/// names are searched before the input columns, and must pick ONE.
+fn order_by_ambiguity(s: &pg_query::protobuf::SelectStmt) -> Result<()> {
+    if s.sort_clause.is_empty() || s.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
+        return Ok(());
+    }
+    let mut outputs: Vec<(String, String)> = Vec::new();
+    for t in &s.target_list {
+        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+            return Ok(());
+        };
+        let Some(val) = rt.val.as_deref() else {
+            return Ok(());
+        };
+        if matches!(val.node.as_ref(), Some(N::ColumnRef(c))
+            if c.fields.iter().any(|f| matches!(f.node, Some(N::AStar(_)))))
+        {
+            return Ok(());
+        }
+        let name = if rt.name.is_empty() {
+            expression_column_name(val)
+        } else {
+            rt.name.clone()
+        };
+        // Over one table, `t.a` and `a` are the same column.
+        let single_table = matches!(
+            s.from_clause.as_slice(),
+            [only] if matches!(only.node, Some(N::RangeVar(_)))
+        );
+        let key = match val.node.as_ref() {
+            Some(N::ColumnRef(c)) if single_table => {
+                format!("column {}", column_ref_name(c).unwrap_or_default())
+            }
+            _ => deparse_expr(val).unwrap_or_default(),
+        };
+        outputs.push((name, key));
+    }
+    for sb in &s.sort_clause {
+        let Some(N::SortBy(sb)) = sb.node.as_ref() else {
+            continue;
+        };
+        let Some(N::ColumnRef(c)) = sb.node.as_deref().and_then(|n| n.node.as_ref()) else {
+            continue;
+        };
+        let [only] = c.fields.as_slice() else {
+            continue;
+        };
+        let Some(N::String(name)) = only.node.as_ref() else {
+            continue;
+        };
+        let mut matching = outputs.iter().filter(|(n, _)| *n == name.sval);
+        if let Some((_, first)) = matching.next() {
+            if matching.any(|(_, e)| e != first) {
+                set_error_location(c.location);
+                return Err(Error::Sqlstate(
+                    "42702",
+                    format!("ORDER BY \"{}\" is ambiguous", name.sval),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The name PostgreSQL gives an unaliased expression column: a cast or a
 /// parenthesised reference keeps the column's name, a call takes the
 /// function's, anything else is `?column?`.
@@ -9947,10 +10028,13 @@ fn plan_table_targets(
             // the last one applied to the innermost column.
             // A `char(n)` column takes the general path below, which pads
             // it the way every expression sees it.
+            // A cast carrying a modifier (`::numeric(5,1)`, `::varchar(3)`)
+            // takes the general path too, which rounds and truncates to it.
             Some(N::TypeCast(tc))
-                if cast_chain_over_column(tc).is_ok_and(|(col, _)| {
-                    def.column(&col).is_none_or(|c| c.pg_type != "bpchar")
-                }) =>
+                if !cast_chain_has_typmod(tc)
+                    && cast_chain_over_column(tc).is_ok_and(|(col, _)| {
+                        def.column(&col).is_none_or(|c| c.pg_type != "bpchar")
+                    }) =>
             {
                 let (col_name, chain) = cast_chain_over_column(tc)?;
                 let field = def
@@ -15149,7 +15233,9 @@ fn plan_join_select(
             // `t.oid::regtype::text AS regtype` -- the cast chain rides
             // beside the column, same as a plain select's. A cast over a
             // CONSTANT (`'t1'::regclass::oid`) is a constant target, below.
-            Some(N::TypeCast(tc)) if cast_chain_over_column_qualified(tc).is_ok() => {
+            Some(N::TypeCast(tc))
+                if !cast_chain_has_typmod(tc) && cast_chain_over_column_qualified(tc).is_ok() =>
+            {
                 let (col_name, chain) = cast_chain_over_column_qualified(tc)?;
                 let out = if rt.name.is_empty() {
                     chain
@@ -16276,7 +16362,12 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
             "regtype".to_string()
         }
         Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("pg_sleep") => "void".to_string(),
-        Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("pg_get_constraintdef") => {
+        Some(N::FuncCall(f))
+            if matches!(
+                func_name(f).as_deref(),
+                Some("pg_get_constraintdef" | "pg_get_viewdef")
+            ) =>
+        {
             "text".to_string()
         }
         Some(N::FuncCall(f))
@@ -17201,6 +17292,17 @@ pub fn display_type(internal: &str) -> String {
 /// casts (`generate_series(1, 2)::int4`, `...::int4::text`).
 ///
 /// Returns the underlying `FuncCall` plus the cast chain, innermost-first, so
+/// Does any cast in a chain of casts carry a type modifier?
+fn cast_chain_has_typmod(tc: &pg_query::protobuf::TypeCast) -> bool {
+    if tc.type_name.as_ref().is_some_and(|t| !t.typmods.is_empty()) {
+        return true;
+    }
+    match tc.arg.as_deref().and_then(|a| a.node.as_ref()) {
+        Some(N::TypeCast(inner)) => cast_chain_has_typmod(inner),
+        _ => false,
+    }
+}
+
 /// `apply_column_expr(ColumnExpr::Casts { chain, .. })` reproduces PostgreSQL's
 /// left-to-right cast application over each generated value. `None` when the
 /// node is not a series (or is a series beside some other expression a cast
@@ -17603,6 +17705,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 if name == "to_regtype"
                     || name == "to_regclass"
                     || name == "pg_get_constraintdef"
+                    || name == "pg_get_viewdef"
                     || (name.starts_with("has_") && name.ends_with("_privilege"))
                 {
                     let node = rt.val.as_deref().expect("checked");
@@ -19436,6 +19539,49 @@ pub const COMPOSITE_DATE: &str = "__subms_d";
 pub const COMPOSITE_US: &str = "__subms_u";
 
 /// Split a full-precision timestamp into `(millisecond value, 0-999 remainder)`.
+/// `::timestamp(p)` / `::timestamptz(p)`: the value rounded to `p`
+/// fractional digits; any other cast's value unchanged.
+fn timestamp_precision(tc: &pg_query::protobuf::TypeCast, target: &str, v: Bson) -> Bson {
+    let Some(tn) = tc.type_name.as_ref() else {
+        return v;
+    };
+    let p = declared_typmod(tn);
+    if !(0..6).contains(&p) || !matches!(target, "timestamp" | "timestamptz") {
+        return v;
+    }
+    match instant_micros(&v) {
+        Some(micros) => instant_value(round_timestamp_micros(micros, p)),
+        None => v,
+    }
+}
+
+/// `AdjustTimestampForTypmod`: round to `precision` fractional digits, half
+/// away from zero about PostgreSQL's 2000-01-01 epoch.
+fn round_timestamp_micros(micros: i64, precision: i32) -> i64 {
+    const PG_EPOCH: i64 = 946_684_800_000_000;
+    let scale = 10i64.pow(6 - precision as u32);
+    let offset = scale / 2;
+    let t = micros - PG_EPOCH;
+    let rounded = if t >= 0 {
+        (t + offset) / scale * scale
+    } else {
+        -((-t + offset) / scale * scale)
+    };
+    rounded + PG_EPOCH
+}
+
+/// An instant as the value a timestamp column stores: a `DateTime`, with
+/// the sub-millisecond remainder alongside when there is one.
+fn instant_value(micros: i64) -> Bson {
+    let (ms, rem) = split_subms(micros);
+    let date = Bson::DateTime(bson::DateTime::from_millis(ms));
+    if rem == 0 {
+        date
+    } else {
+        Bson::Document(doc! { COMPOSITE_DATE: date, COMPOSITE_US: rem })
+    }
+}
+
 fn split_subms(micros_since_epoch: i64) -> (i64, i32) {
     // Rust's `%` truncates toward zero; a pre-epoch timestamp needs the
     // remainder to stay non-negative or the reconstruction moves the time.
@@ -24169,12 +24315,18 @@ fn coerce_unknown_operand(
         });
     }
     let coerced = match typed {
-        v if Interval::from_bson(v).is_some() => Some(parse_interval(text)?.to_bson()),
+        // Beside an interval or a timestamp an unknown is that type -- except
+        // for `||`, where it is text (`'a' || ts` is `textanycat`).
+        v if op != "||" && Interval::from_bson(v).is_some() => {
+            Some(parse_interval(text)?.to_bson())
+        }
         // A timestamp, as the sub-millisecond composite or a BSON date.
-        Bson::Document(d) if d.contains_key(COMPOSITE_DATE) => {
+        Bson::Document(d) if op != "||" && d.contains_key(COMPOSITE_DATE) => {
             Some(cast_value(Bson::String(text.clone()), "timestamp")?)
         }
-        Bson::DateTime(_) => Some(cast_value(Bson::String(text.clone()), "timestamp")?),
+        Bson::DateTime(_) if op != "||" => {
+            Some(cast_value(Bson::String(text.clone()), "timestamp")?)
+        }
         // Beside a number or a boolean an unknown IS that type -- `$1 = 1`
         // bound to 'a' is PostgreSQL's 22P02 -- except for `||`, which is
         // text concatenation whatever sits beside it.
@@ -24363,13 +24515,11 @@ pub(crate) fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
             bytes.extend_from_slice(&b.bytes);
             return Ok(bytea::to_binary(bytes));
         }
+        // Each side as its `::text` -- a numeric keeps its scale (`10.50`), a
+        // float its PostgreSQL rendering, a date its DateStyle.
         let text = |v: &Bson| match v {
             Bson::String(s) => s.clone(),
-            Bson::Int32(i) => i.to_string(),
-            Bson::Int64(i) => i.to_string(),
-            Bson::Boolean(b) => (if *b { "true" } else { "false" }).to_string(),
-            Bson::Double(d) => d.to_string(),
-            other => format!("{other:?}"),
+            other => value_text(other),
         };
         return Ok(Bson::String(format!("{}{}", text(&lhs), text(&rhs))));
     }
@@ -26258,7 +26408,7 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             && static_type(arg, &value) == "timestamptz"
         {
             if let Some(v) = timestamptz_as_local(&value, &target)? {
-                return Ok(v);
+                return Ok(timestamp_precision(tc, &target, v));
             }
         }
         // A redundant `timestamptz` -> `timestamptz` cast (e.g. `$1::timestamptz`
@@ -26274,7 +26424,7 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             || matches!(&value, Bson::Document(d) if d.contains_key(COMPOSITE_DATE));
         if target == "timestamptz" && is_stored_instant && static_type(arg, &value) == "timestamptz"
         {
-            return Ok(value);
+            return Ok(timestamp_precision(tc, &target, value));
         }
         // `boolean` has casts from `integer` and text only. A `smallint` or a
         // `date` is stored in the same Bson shape as an integer or a text (an
@@ -26421,6 +26571,7 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 return Ok(Bson::String(t));
             }
         }
+        let out = timestamp_precision(tc, &target, out);
         // `numeric(p,s)` rounds to its scale, and refuses what does not fit.
         if let Some(tn) = tc.type_name.as_ref() {
             let typmod = declared_typmod(tn);
@@ -26607,6 +26758,30 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                     .iter()
                     .find(|(o, _)| *o == oid)
                     .map_or(Bson::Null, |(_, t)| Bson::String(t.clone()))
+            }));
+        }
+        // `pg_get_viewdef(view [, pretty])`: the view's definition, by oid,
+        // regclass or name; NULL for a relation that is no view.
+        if func_name(f).as_deref() == Some("pg_get_viewdef")
+            && !f.args.is_empty()
+            && !correlated::user_function_named("pg_get_viewdef")
+        {
+            let arg = const_value(&f.args[0], params)?;
+            let by_name = match &arg {
+                Bson::String(n) => Some(n.trim_matches('"').to_string()),
+                _ => None,
+            };
+            let oid = match &arg {
+                Bson::Int32(i) => Some(i64::from(*i)),
+                Bson::Int64(i) => Some(*i),
+                Bson::Null => return Ok(Bson::Null),
+                other => regclass_oid(other),
+            };
+            return Ok(VIEW_DEFS.with(|d| {
+                d.borrow()
+                    .iter()
+                    .find(|(o, n, _)| Some(*o) == oid || by_name.as_deref() == Some(n.as_str()))
+                    .map_or(Bson::Null, |(_, _, t)| Bson::String(t.clone()))
             }));
         }
         // `to_regclass(text)`: the relation's regclass, or NULL when there is
@@ -27500,6 +27675,27 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
         // A bare UNKNOWN literal takes the type of the operand beside it,
         // which decides both the parse and the error.
         let (lhs, rhs) = coerce_unknown_operand(e, lhs, rhs, &op)?;
+        // `||` over text renders each side as its `::text`, which for a
+        // float4 and a timestamptz depends on the TYPE, not only the value
+        // (a float4 carried as an f64; an instant shown in the session zone).
+        let (lhs, rhs) = if op == "||" {
+            let render = |node: Option<&pg_query::protobuf::Node>, v: Bson| -> Bson {
+                let ty = node.map(|n| static_type(n, &v)).unwrap_or_default();
+                match (ty.as_str(), &v) {
+                    ("float4", Bson::Double(d)) => Bson::String(geo::float4_text(*d as f32)),
+                    ("timestamptz", _) => {
+                        timestamptz_value_text(&v, &session_timezone()).map_or(v, Bson::String)
+                    }
+                    _ => v,
+                }
+            };
+            (
+                render(e.lexpr.as_deref(), lhs),
+                render(e.rexpr.as_deref(), rhs),
+            )
+        } else {
+            (lhs, rhs)
+        };
         return eval_binary(&op, lhs, rhs);
     }
     if let Some(N::ParamRef(p)) = node.node.as_ref() {

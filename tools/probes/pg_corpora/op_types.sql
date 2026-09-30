@@ -38,3 +38,12 @@ SELECT id FROM opt_d WHERE d < '2020-01-01 10:00' ORDER BY id
 SELECT id FROM opt_d WHERE d = '2020-01-01 10:00' ORDER BY id
 SELECT id FROM opt_d WHERE d IN ('2020-01-01 05:00') ORDER BY id
 SELECT id FROM opt_d WHERE d BETWEEN '2020-01-01 01:00' AND '2020-01-02' ORDER BY id
+# Inside a subquery too: its own FROM, then the enclosing query's.
+SELECT * FROM opt_t WHERE EXISTS (SELECT 1 FROM opt_d WHERE opt_d.id = opt_t.s)
+SELECT * FROM opt_t WHERE EXISTS (SELECT 1 FROM opt_d WHERE d = 1)
+SELECT * FROM opt_t a WHERE (SELECT count(*) FROM opt_d b WHERE b.id = a.s) > 0
+SELECT * FROM (SELECT * FROM opt_t WHERE s = 1) x
+SELECT * FROM opt_t, LATERAL (SELECT * FROM opt_d WHERE opt_d.id = opt_t.s) x
+SELECT count(*) FROM opt_t WHERE EXISTS (SELECT 1 FROM opt_d WHERE opt_d.id = opt_t.n AND opt_d.d = '2020-01-01')
+DROP TABLE opt_t
+DROP TABLE opt_d

@@ -14727,3 +14727,128 @@ def test_binary_cursor_over_any_source_sends_binary(home: Path) -> None:
                 assert cur.pgresult is not None
                 assert cur.pgresult.fformat(0) == 1, source
             conn.rollback()
+
+
+def test_a_partitions_own_constraints_are_enforced(home: Path) -> None:
+    """NOT NULL, CHECK, UNIQUE and PRIMARY KEY declared on a PARTITION hold
+    for the rows it takes, whether written through the parent or the
+    partition; before, a partition's own constraints were accepted and never
+    checked, so duplicate keys went in silently."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE TABLE pk_p (id int, v int, s text) PARTITION BY RANGE (id)")
+        conn.execute(
+            "CREATE TABLE pk_p1 PARTITION OF pk_p (v NOT NULL, s DEFAULT 'dflt', "
+            "CONSTRAINT pk_p1_v CHECK (v > 0)) FOR VALUES FROM (0) TO (10)"
+        )
+        conn.execute(
+            "CREATE TABLE pk_p2 PARTITION OF pk_p (PRIMARY KEY (id)) FOR VALUES FROM (10) TO (20)"
+        )
+        conn.execute("CREATE TABLE pk_p3 PARTITION OF pk_p (s UNIQUE) FOR VALUES FROM (20) TO (30)")
+        assert _sqlstate(conn, "INSERT INTO pk_p (id, v) VALUES (1, NULL)") == "23502"
+        assert _sqlstate(conn, "INSERT INTO pk_p (id, v) VALUES (1, -1)") == "23514"
+        conn.execute("INSERT INTO pk_p1 (id, v) VALUES (4, 4)")
+        assert _fetch(conn, "SELECT s FROM pk_p1 WHERE id = 4") == [("dflt",)]
+        assert _sqlstate(conn, "INSERT INTO pk_p VALUES (11, 1, 'a'), (11, 2, 'b')") == "23505"
+        conn.execute("INSERT INTO pk_p VALUES (11, 1, 'a')")
+        assert _sqlstate(conn, "INSERT INTO pk_p2 VALUES (11, 2, 'b')") == "23505"
+        assert _sqlstate(conn, "UPDATE pk_p SET id = 11 WHERE id = 4") == "23505"
+        assert _sqlstate(conn, "INSERT INTO pk_p VALUES (21, 1, 'x'), (22, 2, 'x')") == "23505"
+        assert _fetch(conn, "SELECT count(*) FROM pk_p") == [(2,)]
+
+
+def test_ddl_waits_for_a_readers_lock(home: Path) -> None:
+    """ALTER / DROP / rename / CLUSTER take ACCESS EXCLUSIVE, so they wait
+    for a session still reading the table (55P03 under a lock_timeout);
+    CREATE INDEX takes SHARE, which a reader does not block. A DDL inside a
+    block holds its lock, so another session's read waits in turn."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        a.execute("CREATE TABLE dw_t (id int)")
+        b.execute("SET lock_timeout = 300")
+        for ddl in [
+            "ALTER TABLE dw_t ADD COLUMN x int",
+            "DROP TABLE dw_t",
+            "ALTER TABLE dw_t RENAME TO dw_t2",
+        ]:
+            a.execute("BEGIN")
+            a.execute("SELECT * FROM dw_t")
+            assert _sqlstate(b, ddl) == "55P03", ddl
+            a.execute("ROLLBACK")
+        a.execute("BEGIN")
+        a.execute("SELECT * FROM dw_t")
+        b.execute("CREATE INDEX ON dw_t (id)")
+        a.execute("ROLLBACK")
+        a.execute("BEGIN")
+        a.execute("ALTER TABLE dw_t ADD COLUMN y int")
+        assert _sqlstate(b, "SELECT count(*) FROM dw_t") == "55P03"
+        a.execute("ROLLBACK")
+        assert _fetch(b, "SELECT count(*) FROM dw_t") == [(0,)]
+
+
+def test_mixed_result_formats_are_honoured_per_column(home: Path) -> None:
+    """A Bind asking for binary, text, binary gets each column in its own
+    format, as PostgreSQL answers it; a format count that matches neither one
+    nor the columns is 08P01."""
+    import socket
+    import struct
+
+    def msg(t: bytes, body: bytes) -> bytes:
+        return t + struct.pack("!I", len(body) + 4) + body
+
+    def cstr(s: str) -> bytes:
+        return s.encode() + b"\0"
+
+    def read_until_ready(sock: socket.socket) -> list[tuple[bytes, bytes]]:
+        out, buf = [], b""
+        while True:
+            while len(buf) < 5:
+                buf += sock.recv(65536)
+            n = struct.unpack("!I", buf[1:5])[0]
+            while len(buf) < 1 + n:
+                buf += sock.recv(65536)
+            out.append((buf[:1], buf[5 : 1 + n]))
+            buf = buf[1 + n :]
+            if out[-1][0] == b"Z":
+                return out
+
+    def run(sock: socket.socket, sql: str, formats: tuple[int, ...]) -> list[tuple[bytes, bytes]]:
+        m = msg(b"P", cstr("") + cstr(sql) + struct.pack("!H", 0))
+        m += msg(
+            b"B",
+            cstr("")
+            + cstr("")
+            + struct.pack("!HH", 0, 0)
+            + struct.pack("!H", len(formats))
+            + struct.pack("!" + "H" * len(formats), *formats),
+        )
+        m += msg(b"E", cstr("") + struct.pack("!I", 0)) + msg(b"S", b"")
+        sock.sendall(m)
+        return read_until_ready(sock)
+
+    with _Server(home) as server:
+        sock = socket.create_connection(("127.0.0.1", server.port))
+        body = (
+            struct.pack("!I", 196608)
+            + cstr("user")
+            + cstr("test")
+            + cstr("database")
+            + cstr("postgres")
+            + b"\0"
+        )
+        sock.sendall(struct.pack("!I", len(body) + 4) + body)
+        read_until_ready(sock)
+        replies = run(sock, "SELECT 1::int4, 'x'::text, 2::int8", (1, 0, 1))
+        rows = [b for t, b in replies if t == b"D"]
+        assert len(rows) == 1
+        row = rows[0]
+        assert row == (
+            struct.pack("!H", 3)
+            + struct.pack("!i", 4)
+            + struct.pack("!i", 1)
+            + struct.pack("!i", 1)
+            + b"x"
+            + struct.pack("!i", 8)
+            + struct.pack("!q", 2)
+        )
+        errors = [b for t, b in run(sock, "SELECT 1, 2, 3", (1, 0)) if t == b"E"]
+        assert errors and b"C08P01\0" in errors[0]
+        sock.close()

@@ -14,6 +14,14 @@ returns rows. Each was silent: no error, just a wrong answer.
 - **A binary FETCH from some cursors.** Over `VALUES`, an aggregate or a
   constant select, the FETCH sent text bytes that a binary client decoded as
   garbage integers.
+- **A partition's own constraints were not enforced.** A PRIMARY KEY, UNIQUE
+  or CHECK declared on a partition was accepted and never checked, so
+  duplicate keys went in silently. They now hold for the rows the partition
+  takes, whether written through the parent or the partition itself.
+- **`text || numeric` printed the value's internal form**
+  (`aDecimal128(96000...)`) instead of `a1.50`.
+- **`col::numeric(5,1)` and `col::timestamp(0)` over a column** ignored the
+  modifier and kept every digit.
 
 Errors now carry PostgreSQL's position, so a client prints the caret under the
 token at fault.
@@ -51,6 +59,12 @@ token at fault.
   fractional offsets over numbers. ROWS and GROUPS offsets are read as bigint.
 - A `Bind` asking for MIXED per-column result formats is honoured column by
   column. A format count that does not match the columns is `08P01`.
+- DDL waits for readers: `ALTER TABLE`, `DROP TABLE`, a rename and `CLUSTER`
+  take ACCESS EXCLUSIVE, and `CREATE INDEX` takes SHARE, so each waits for
+  (or, under `lock_timeout`, fails against) a session still using the table.
+- A partition's own column options in `PARTITION OF (...)`: NOT NULL,
+  DEFAULT, and column CHECK / UNIQUE / PRIMARY KEY.
+- `pg_get_viewdef(view [, pretty])`, by oid, regclass or name.
 
 #### Fixed
 
@@ -62,7 +76,24 @@ token at fault.
   - in a FROM-less select, a WHERE naming an output alias is `42703`, and a
     WHERE naming no column is evaluated once;
   - a recursive CTE whose anchor is narrower than its UNION's type is
-    `42804`.
+    `42804`;
+  - `CREATE AGGREGATE` over a built-in operator function that does not take
+    the declared types is `42883`;
+  - `ORDER BY` a name that two different output columns carry is `42702`;
+  - operators are also resolved by type inside a subquery.
+- `||` renders each side as its `::text`: a float4 in its own digits, a
+  timestamptz in the session zone. An unknown literal beside a timestamp or
+  interval is text there, not that type.
+- A failed autocommit INSERT consumes the serial values it drew, as
+  PostgreSQL's non-transactional sequences do, so the next id matches. The
+  statement's own transaction used to roll the sequence back with it.
+- A folded DEFAULT takes the column's modifier as stored: `numeric(4,1)
+  DEFAULT 1.25` stores `1.3`, on INSERT and on `ADD COLUMN`'s backfill.
+- `timestamp(p)` / `timestamptz(p)` casts round to `p` digits, as
+  PostgreSQL's `AdjustTimestampForTypmod` does.
+- The Python PG server has `pg_catalog.pg_tablespace` and the
+  `default_table_access_method` setting, which SQLAlchemy 2.1's table
+  reflection reads.
 - An untyped literal compared with a date column is read as a date.
 - A parameterised recursive CTE (`SELECT $1::int UNION ALL SELECT n + 1 ...`)
   typed its column as text and failed with `42883`. A VALUES column holding

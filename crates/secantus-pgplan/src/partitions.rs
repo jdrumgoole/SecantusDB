@@ -71,7 +71,12 @@ pub fn bound_document(b: &pg_query::protobuf::PartitionBoundSpec) -> Result<Docu
 pub(crate) fn lower_create(
     c: &pg_query::protobuf::CreateStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
-) -> Result<(pg_query::protobuf::CreateStmt, Document)> {
+) -> Result<(
+    pg_query::protobuf::CreateStmt,
+    Document,
+    Vec<pg_query::protobuf::ColumnDef>,
+)> {
+    let mut column_options = Vec::new();
     use pg_query::protobuf::PartitionStrategy as PS;
     let mut out = c.clone();
     let mut extra = Document::new();
@@ -128,15 +133,15 @@ pub(crate) fn lower_create(
                     relation_oid: 0,
                 })),
             };
-            // Column options (`WITH OPTIONS`) are not modelled; table
-            // constraints carry across.
+            // Table constraints carry across as written; a column's own
+            // options (`v NOT NULL`, `s DEFAULT ...`, a column CHECK) are
+            // applied to the inherited column once the table is planned
+            // (`apply_column_options`).
             let mut elts = vec![like];
             for e in &c.table_elts {
                 match e.node.as_ref() {
                     Some(N::Constraint(_)) => elts.push(e.clone()),
-                    Some(N::ColumnDef(_)) => {
-                        return Err(Error::Unsupported("column options on a partition".into()))
-                    }
+                    Some(N::ColumnDef(cd)) => column_options.push((**cd).clone()),
                     _ => {}
                 }
             }
@@ -149,7 +154,57 @@ pub(crate) fn lower_create(
         }
         _ => {}
     }
-    Ok((out, extra))
+    Ok((out, extra, column_options))
+}
+
+/// A partition's column options, applied to the columns it took from its
+/// parent: each is planned as a one-column table of the parent column's
+/// type, and its NOT NULL, default, key and CHECKs carried over.
+pub(crate) fn apply_column_options(
+    def: &mut TableDef,
+    options: &[pg_query::protobuf::ColumnDef],
+) -> Result<()> {
+    for cd in options {
+        let Some(col) = def.columns.iter().find(|c| c.name == cd.colname).cloned() else {
+            return Err(Error::UndefinedColumn(cd.colname.clone()));
+        };
+        let mut typed = cd.clone();
+        typed.type_name = Some(type_name_node(&col.pg_type));
+        let stmt = pg_query::protobuf::CreateStmt {
+            relation: Some(pg_query::protobuf::RangeVar {
+                relname: def.name.clone(),
+                inh: true,
+                relpersistence: "p".into(),
+                ..Default::default()
+            }),
+            table_elts: vec![pg_query::protobuf::Node {
+                node: Some(N::ColumnDef(Box::new(typed))),
+            }],
+            oncommit: pg_query::protobuf::OnCommitAction::OncommitNoop as i32,
+            ..Default::default()
+        };
+        let Statement::CreateTable(one, _) = plan_create(&stmt)? else {
+            return Err(Error::Internal("a partition column's options".into()));
+        };
+        let Some(planned) = one.columns.first() else {
+            continue;
+        };
+        if let Some(target) = def.columns.iter_mut().find(|c| c.name == cd.colname) {
+            if !planned.nullable {
+                target.nullable = false;
+            }
+            if planned.pk {
+                target.pk = true;
+            }
+            if planned.default.is_some() {
+                target.default = planned.default.clone();
+            }
+            target.extra.extend(planned.extra.clone());
+        }
+        def.check_constraints.extend(one.check_constraints);
+        def.unique_constraints.extend(one.unique_constraints);
+    }
+    Ok(())
 }
 
 /// Each partition key's type, in declared order: a column's own, an
