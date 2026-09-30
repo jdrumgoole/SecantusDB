@@ -14852,3 +14852,43 @@ def test_mixed_result_formats_are_honoured_per_column(home: Path) -> None:
         errors = [b for t, b in run(sock, "SELECT 1, 2, 3", (1, 0)) if t == b"E"]
         assert errors and b"C08P01\0" in errors[0]
         sock.close()
+
+
+def test_sqlalchemy_reflection_matches_postgresql(home: Path) -> None:
+    """SQLAlchemy's inspector reads the catalogs psql does, and more
+    (`pg_opclass`, `pg_index.indclass` / `indoption`, set-returning
+    functions over `pg_index`). Every value here is what PostgreSQL 15
+    answers for the same tables."""
+    sa = pytest.importorskip("sqlalchemy")
+    with _Server(home) as server:
+        engine = sa.create_engine(f"postgresql+psycopg://test@127.0.0.1:{server.port}/postgres")
+        with engine.begin() as c:
+            for q in [
+                "create table sa_p (id serial primary key, code varchar(10) unique not null)",
+                "create table sa_c (id int primary key, pid int references sa_p(id) "
+                "on delete cascade, amt numeric(8,2) check (amt >= 0), note text)",
+                "create index sa_c_amt on sa_c (amt desc, note)",
+                "comment on table sa_c is 'kids'",
+            ]:
+                c.execute(sa.text(q))
+        i = sa.inspect(engine)
+        assert [(c["name"], str(c["type"]), c["nullable"]) for c in i.get_columns("sa_c")] == [
+            ("id", "INTEGER", False),
+            ("pid", "INTEGER", True),
+            ("amt", "NUMERIC(8, 2)", True),
+            ("note", "TEXT", True),
+        ]
+        assert i.get_pk_constraint("sa_c")["constrained_columns"] == ["id"]
+        fks = i.get_foreign_keys("sa_c")
+        assert [(k["name"], k["referred_table"], k["options"]) for k in fks] == [
+            ("sa_c_pid_fkey", "sa_p", {"ondelete": "CASCADE"})
+        ]
+        assert [
+            (x["name"], x["column_names"], x.get("column_sorting")) for x in i.get_indexes("sa_c")
+        ] == [("sa_c_amt", ["amt", "note"], {"amt": ("desc",)})]
+        assert i.get_check_constraints("sa_c") == [
+            {"name": "sa_c_amt_check", "sqltext": "amt >= 0::numeric", "comment": None}
+        ]
+        assert i.get_unique_constraints("sa_p")[0]["column_names"] == ["code"]
+        assert i.get_table_comment("sa_c") == {"text": "kids"}
+        engine.dispose()

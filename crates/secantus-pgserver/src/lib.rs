@@ -9158,6 +9158,7 @@ impl PgHandler {
             "pg_policy" => Some(catalog_fill::pg_policy_def()),
             "pg_sequence" => Some(catalog_fill::pg_sequence_def()),
             "pg_description" => Some(catalog_fill::pg_description_def()),
+            "pg_opclass" => Some(catalog_fill::pg_opclass_def()),
             "pg_depend" => Some(catalog_fill::pg_depend_def()),
             "pg_publication_namespace" => Some(catalog_fill::pg_publication_namespace_def()),
             _ => Self::catalog_object_table(name),
@@ -9173,6 +9174,7 @@ impl PgHandler {
             "pg_policy" => self.pg_policy_rows(&def),
             "pg_sequence" => self.pg_sequence_rows(&def),
             "pg_description" => self.pg_description_rows(&def),
+            "pg_opclass" => self.pg_opclass_rows(&def),
             "pg_depend" => Vec::new(),
             "pg_publication_namespace" => Vec::new(),
             "information_schema.columns" => {

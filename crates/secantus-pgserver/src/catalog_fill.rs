@@ -48,6 +48,9 @@ pub(crate) fn extra_columns(name: &str) -> &'static [(&'static str, &'static str
             ("indnullsnotdistinct", "bool"),
             ("indexprs", "text"),
             ("indpred", "text"),
+            ("indclass", "oidvector"),
+            ("indoption", "int2vector"),
+            ("indcollation", "oidvector"),
         ],
         "pg_attribute" => &[
             ("attidentity", secantus_pgplan::QUOTED_CHAR),
@@ -216,6 +219,58 @@ pub(crate) fn pg_description_def() -> TableDef {
             Column::new("description", "text", false),
         ],
     )
+}
+
+/// The default btree operator class of each type: `(opclass oid, name,
+/// input type oid)`, from PostgreSQL 15's `pg_opclass`.
+const DEFAULT_OPCLASSES: &[(i64, &str, i64)] = &[
+    (424, "bool_ops", 16),
+    (426, "bpchar_ops", 1042),
+    (428, "bytea_ops", 17),
+    (429, "char_ops", 18),
+    (1978, "int4_ops", 23),
+    (1979, "int2_ops", 21),
+    (1980, "int8_ops", 20),
+    (1981, "oid_ops", 26),
+    (1970, "float4_ops", 700),
+    (3123, "float8_ops", 701),
+    (3125, "numeric_ops", 1700),
+    (3126, "text_ops", 25),
+    (3122, "date_ops", 1082),
+    (3128, "timestamp_ops", 1114),
+    (3127, "timestamptz_ops", 1184),
+    (3129, "time_ops", 1083),
+    (3130, "interval_ops", 1186),
+    (2968, "uuid_ops", 2950),
+    (3124, "jsonb_ops", 3802),
+    (3121, "name_ops", 19),
+];
+
+/// `pg_opclass`: the default btree operator classes.
+pub(crate) fn pg_opclass_def() -> TableDef {
+    TableDef::new(
+        "pg_opclass",
+        vec![
+            Column::new("oid", "oid", false),
+            Column::new("opcmethod", "oid", false),
+            Column::new("opcname", "name", false),
+            Column::new("opcnamespace", "oid", false),
+            Column::new("opcowner", "oid", false),
+            Column::new("opcfamily", "oid", false),
+            Column::new("opcintype", "oid", false),
+            Column::new("opcdefault", "bool", false),
+            Column::new("opckeytype", "oid", false),
+        ],
+    )
+}
+
+/// A type's default btree opclass oid (a `varchar` key uses `text_ops`).
+fn default_opclass(type_oid: i64) -> i64 {
+    let t = if type_oid == 1043 { 25 } else { type_oid };
+    DEFAULT_OPCLASSES
+        .iter()
+        .find(|(_, _, ty)| *ty == t)
+        .map_or(0, |(o, _, _)| *o)
 }
 
 /// A type's collation: `default` for the collatable string types, `C` for
@@ -509,6 +564,26 @@ impl PgHandler {
             .collect()
     }
 
+    pub(crate) fn pg_opclass_rows(&self, def: &TableDef) -> Vec<Document> {
+        let f = |name: &str| def.field_of(name).expect("column");
+        DEFAULT_OPCLASSES
+            .iter()
+            .map(|(oid, name, ty)| {
+                let mut d = Document::new();
+                d.insert(f("oid"), Bson::Int64(*oid));
+                d.insert(f("opcmethod"), Bson::Int64(403));
+                d.insert(f("opcname"), *name);
+                d.insert(f("opcnamespace"), Bson::Int64(11));
+                d.insert(f("opcowner"), Bson::Int64(10));
+                d.insert(f("opcfamily"), Bson::Int64(0));
+                d.insert(f("opcintype"), Bson::Int64(*ty));
+                d.insert(f("opcdefault"), true);
+                d.insert(f("opckeytype"), Bson::Int64(0));
+                d
+            })
+            .collect()
+    }
+
     pub(crate) fn pg_am_rows(&self, def: &TableDef) -> Vec<Document> {
         let f = |name: &str| def.field_of(name).expect("column");
         [
@@ -560,6 +635,45 @@ impl PgHandler {
             _ => Vec::new(),
         };
         let table_by_oid = |oid: i64| tables.iter().find(|(o, _)| *o == oid).map(|(_, t)| t);
+        // Per index: each key's type oid and whether it sorts DESC.
+        let index_keys: Vec<(i64, Vec<(i64, bool)>)> = if name == "pg_index" {
+            self.index_relations()
+                .into_iter()
+                .map(|ix| {
+                    let stored = self
+                        .storage
+                        .list_indexes(self.db(), &ix.table.name)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|d| d.get_str("name") == Ok(ix.name.as_str()));
+                    let directions: Vec<bool> = stored
+                        .and_then(|d| d.get_document("key").ok().cloned())
+                        .map(|k| {
+                            k.values()
+                                .map(|v| matches!(v, Bson::Int32(-1)) || v.as_f64() == Some(-1.0))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let keys = ix
+                        .keys
+                        .iter()
+                        .enumerate()
+                        .map(|(i, k)| {
+                            let ty = usize::try_from(*k)
+                                .ok()
+                                .filter(|k| *k > 0)
+                                .and_then(|k| ix.table.columns.get(k - 1))
+                                .and_then(|c| secantus_pgplan::pgtypes::oid_of_name(&c.pg_type))
+                                .unwrap_or(0);
+                            (ty, directions.get(i).copied().unwrap_or(false))
+                        })
+                        .collect();
+                    (ix.oid, keys)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let parents: Vec<String> = if name == "pg_class" {
             tables
                 .iter()
@@ -642,6 +756,24 @@ impl PgHandler {
                         }
                     }
                     ("pg_index", c) => match c {
+                        "indclass" | "indoption" | "indcollation" => {
+                            let oid = int(get(row, "indexrelid"));
+                            let keys = index_keys
+                                .iter()
+                                .find(|(o, _)| *o == oid)
+                                .map(|(_, k)| k.clone())
+                                .unwrap_or_default();
+                            Bson::Array(
+                                keys.iter()
+                                    .map(|(ty, desc)| match c {
+                                        "indclass" => Bson::Int64(default_opclass(*ty)),
+                                        // DESC implies NULLS FIRST: both bits.
+                                        "indoption" => Bson::Int32(if *desc { 3 } else { 0 }),
+                                        _ => Bson::Int64(type_collation(*ty)),
+                                    })
+                                    .collect(),
+                            )
+                        }
                         "indnkeyatts" => get(row, "indnatts").unwrap_or(Bson::Int32(0)),
                         "indcheckxmin" | "indisreplident" | "indnullsnotdistinct" => {
                             Bson::Boolean(false)
