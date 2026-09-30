@@ -855,6 +855,16 @@ fn bson_i64(v: &Bson) -> Option<i64> {
 /// `bool` must not meet a number.
 fn group_key_ident(v: &Option<Bson>) -> Option<Bson> {
     let Some(b) = v else { return None };
+    // PostgreSQL's equality puts every NaN in one group and `-0` with `0`;
+    // Rust's `==` would make each NaN its own (`NaN != NaN`).
+    if let Bson::Double(d) = b {
+        if d.is_nan() {
+            return Some(Bson::Document(bson::doc! { "__nan": true }));
+        }
+        if *d == 0.0 {
+            return Some(Bson::Double(0.0));
+        }
+    }
     if secantus_pgplan::numeric::is_numeric(b) {
         if let Some(text) = secantus_pgplan::numeric::numeric_text(b) {
             return Some(Bson::String(secantus_pgplan::numeric::numeric_sort_key(
@@ -27222,27 +27232,38 @@ fn materialise_windows(
 
 /// The row indices of each partition, in the rows' original order.
 ///
-/// Grouped by VALUE rather than by a hash of it (`group_key_ident`), because
-/// BSON equality and Rust's `==` disagree about NaN, signed zero and
-/// bool-versus-int, and a partition keyed on the wrong one would split or
-/// merge groups that PostgreSQL keeps together.
+/// Partitions group what PostgreSQL's equality groups: every NaN together
+/// and `-0` with `0` (Rust's `==` splits the first and a byte compare the
+/// second), a numeric by its value (`group_key_ident`). Each row's key is
+/// that canonical form ENCODED, so partitioning is one hash lookup per row
+/// rather than a scan of the partitions seen so far.
 fn window_partitions(docs: &[Document], keys: &[OrderKey]) -> Vec<Vec<usize>> {
     if keys.is_empty() {
         return vec![(0..docs.len()).collect()];
     }
-    let ident = |d: &Document| -> Vec<Option<Bson>> {
-        keys.iter()
-            .map(|k| group_key_ident(&d.get(&k.field).cloned()))
-            .collect()
+    fn canonical(v: Option<Bson>) -> Bson {
+        match v {
+            None | Some(Bson::Null) => Bson::Null,
+            Some(Bson::Double(d)) if d.is_nan() => Bson::Double(f64::NAN),
+            Some(Bson::Double(d)) if d == 0.0 => Bson::Double(0.0),
+            Some(Bson::Int32(i)) => Bson::Int64(i64::from(i)),
+            Some(other) => other,
+        }
+    }
+    let key = |d: &Document| -> Vec<u8> {
+        let values: Vec<Bson> = keys
+            .iter()
+            .map(|k| canonical(group_key_ident(&d.get(&k.field).cloned())))
+            .collect();
+        bson::to_vec(&bson::doc! { "k": values }).unwrap_or_default()
     };
-    let mut seen: Vec<Vec<Option<Bson>>> = Vec::new();
+    let mut index: HashMap<Vec<u8>, usize> = HashMap::new();
     let mut out: Vec<Vec<usize>> = Vec::new();
     for (i, d) in docs.iter().enumerate() {
-        let id = ident(d);
-        match seen.iter().position(|s| *s == id) {
-            Some(p) => out[p].push(i),
-            None => {
-                seen.push(id);
+        match index.entry(key(d)) {
+            std::collections::hash_map::Entry::Occupied(e) => out[*e.get()].push(i),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(out.len());
                 out.push(vec![i]);
             }
         }

@@ -19619,11 +19619,33 @@ fn plan_values_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
         }
         rows.push(row);
     }
-    // A column that was NULL in every row defaults to `text`, as PostgreSQL
-    // resolves an all-unknown VALUES column.
-    for t in &mut types {
-        if t.is_empty() {
-            *t = "text".to_string();
+    // Each column's type is the rows' COMMON type (`select_common_type`):
+    // an untyped literal takes it (`VALUES (1.5::float8), ('2.5')` is two
+    // float8s), and mixed numerics widen (`(1), (2.5)` is numeric). A column
+    // NULL or untyped in every row is `text`. Every row's value is then that
+    // type -- a `'2.25'` left a string summed as 0.
+    for (i, t) in types.iter_mut().enumerate() {
+        let items: Vec<&pg_query::protobuf::Node> = s
+            .values_lists
+            .iter()
+            .filter_map(|vl| match vl.node.as_ref() {
+                Some(N::List(l)) => l.items.get(i),
+                _ => None,
+            })
+            .collect();
+        let common = common_type(&items);
+        *t = common.clone();
+        for (row, item) in rows.iter_mut().zip(&items) {
+            let untyped = matches!(item.node.as_ref(), Some(N::AConst(c))
+                if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))));
+            let v = std::mem::replace(&mut row[i], Bson::Null);
+            row[i] = if v == Bson::Null || common == "text" {
+                v
+            } else if untyped {
+                cast_value(v, &common)?
+            } else {
+                to_common_type(v, &common)?
+            };
         }
     }
     let names = (1..=width).map(|i| format!("column{i}")).collect();

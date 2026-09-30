@@ -1,0 +1,11 @@
+select x + 1 from (values (1.5::float8), ('2.5')) v(x) order by 1;
+select x, pg_typeof(x) from (values (1::int), ('2')) v(x) order by 1;
+select sum(x) from (values (1.5::numeric), ('2.25')) v(x);
+select x from (values ('2020-01-01'::date), ('2020-01-02')) v(x) order by 1;
+select count(distinct x) from (values ('NaN'::float8), ('NaN')) v(x);
+select count(*) from wn14 group by x order by 1;
+select count(*) from wn14 group by n order by 1;
+select count(distinct x), count(distinct n) from wn14;
+select x::text from (select distinct x from wn14) s order by 1;
+select pg_typeof(x), x::text from (values ('NaN'::float8), ('NaN')) v(x);
+select x::text, count(*) over (partition by x) from (values ('NaN'::float8), ('NaN')) v(x);
