@@ -1165,6 +1165,39 @@ pub(crate) fn rewrite(
             r.changed = true;
         }
     }
+    // `count(DISTINCT x)` over a NONDETERMINISTIC collation counts what the
+    // collation calls distinct: the distinct KEYS.
+    for n in out
+        .target_list
+        .iter_mut()
+        .chain(out.having_clause.as_deref_mut())
+    {
+        let mut failed = None;
+        crate::walk_expr(n, &mut |node| {
+            let Some(N::FuncCall(f)) = node.node.as_mut() else {
+                return Ok(());
+            };
+            if !f.agg_distinct || crate::func_name(f).as_deref() != Some("count") {
+                return Ok(());
+            }
+            if let [arg] = f.args.as_mut_slice() {
+                if let Some((c, _)) = r.coll_of(arg) {
+                    match crate::collation::resolve(&c) {
+                        Ok(res) if !res.deterministic() => {
+                            *arg = Rewriter::coll_key(arg, &c);
+                            r.changed = true;
+                        }
+                        Ok(_) => {}
+                        Err(e) => failed = Some(e),
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        if let Some(e) = failed {
+            return Err(e);
+        }
+    }
     for item in &mut out.sort_clause {
         r.sort_by(item);
     }

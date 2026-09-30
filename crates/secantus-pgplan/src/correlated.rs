@@ -720,6 +720,20 @@ type FHook = FunctionHook<'static>;
 thread_local! {
     static FUNCTION_HOOK: std::cell::Cell<Option<*const FHook>> = const { std::cell::Cell::new(None) };
     static USER_FUNCTIONS: std::cell::RefCell<Vec<UserFn>> = const { std::cell::RefCell::new(Vec::new()) };
+    static USER_PROCEDURES: std::cell::RefCell<Vec<(String, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Install the user-defined PROCEDURES, `(name, number of inputs)`: a
+/// procedure is not a function, so a call of one in an expression is
+/// PostgreSQL's 42809.
+pub fn set_user_procedures(procs: Vec<(String, usize)>) {
+    USER_PROCEDURES.with(|p| *p.borrow_mut() = procs);
+}
+
+/// Whether a procedure of this name takes `nargs` inputs -- what an
+/// expression calling it resolves to, before 42809 refuses it.
+pub fn is_user_procedure(name: &str, nargs: usize) -> bool {
+    USER_PROCEDURES.with(|p| p.borrow().iter().any(|(n, k)| n == name && *k == nargs))
 }
 
 /// Install the user-defined functions for the statements that follow.

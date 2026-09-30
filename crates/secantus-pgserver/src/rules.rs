@@ -6,7 +6,7 @@
 
 use bson::{Bson, Document};
 use pgwire::api::results::{Response, Tag};
-use pgwire::error::PgWireResult;
+use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use secantus_pgcatalog::{Column, TableDef};
 
 use crate::PgHandler;
@@ -81,6 +81,9 @@ impl PgHandler {
 
     pub(crate) fn create_rule(&self, rule: Rule, replace: bool) -> PgWireResult<Vec<Response>> {
         let is_view = self.views()?.iter().any(|(n, _)| *n == rule.table);
+        if rule.event == "SELECT" && !is_view {
+            return self.convert_table_to_view(&rule);
+        }
         if self.lookup(&rule.table).is_none() && !is_view {
             return Err(Self::relation_missing(&rule.table));
         }
@@ -112,6 +115,121 @@ impl PgHandler {
             doc.insert("where", w);
         }
         self.put(RULE_COLLECTION, &key, doc)?;
+        Ok(vec![Response::Execution(Tag::new("CREATE RULE"))])
+    }
+
+    /// `CREATE RULE "_RETURN" AS ON SELECT TO t DO INSTEAD SELECT ...`:
+    /// PostgreSQL 15 turns an EMPTY table with no triggers, indexes or
+    /// children into a view, when the SELECT's target list matches its
+    /// columns by name and type (`DefineQueryRewrite` / `checkRuleResultList`).
+    fn convert_table_to_view(&self, rule: &Rule) -> PgWireResult<Vec<Response>> {
+        let table = &rule.table;
+        let Some(def) = self.lookup(table) else {
+            return Err(Self::relation_missing(table));
+        };
+        let select = match rule.actions.as_slice() {
+            [a] if rule.instead && a.trim_start().to_ascii_uppercase().starts_with("SELECT") => a,
+            _ => {
+                return Err(Self::user_error(
+                    "0A000",
+                    "rules on SELECT must have action INSTEAD SELECT".into(),
+                ))
+            }
+        };
+        if rule.condition.is_some() {
+            return Err(Self::user_error(
+                "0A000",
+                "event qualifications are not implemented for rules on SELECT".into(),
+            ));
+        }
+        let quoted = secantus_pgplan::scalar::quote_identifier(table);
+        let not_convertible = |why: &str, hint: Option<&str>| {
+            let mut info = ErrorInfo::new(
+                "ERROR".into(),
+                "55000".into(),
+                format!("could not convert table \"{table}\" to a view because {why}"),
+            );
+            info.hint = hint.map(str::to_string);
+            PgWireError::UserError(Box::new(info))
+        };
+        let (_, rows) = self.internal_query(&format!("SELECT 1 FROM {quoted} LIMIT 1"))?;
+        if !rows.is_empty() {
+            return Err(not_convertible("it is not empty", None));
+        }
+        if self.has_triggers(table).unwrap_or(false) || !def.foreign_keys.is_empty() {
+            return Err(not_convertible(
+                "it has triggers",
+                Some(
+                    "In particular, the table cannot be involved in any foreign key relationships.",
+                ),
+            ));
+        }
+        if self
+            .index_relations()
+            .iter()
+            .any(|ix| ix.table.name == *table)
+        {
+            return Err(not_convertible("it has indexes", None));
+        }
+        if self
+            .all_table_defs()?
+            .iter()
+            .any(|t| Self::inherited_parents(t).contains(table))
+        {
+            return Err(not_convertible("it has child tables", None));
+        }
+        // `checkRuleResultList`: entry by entry against the columns.
+        let (fields, _) =
+            self.internal_query(&format!("SELECT * FROM ({select}) AS __rule_view LIMIT 0"))?;
+        let invalid = |message: String, detail: Option<String>| {
+            let mut info = ErrorInfo::new("ERROR".into(), "42P17".into(), message);
+            info.detail = detail;
+            PgWireError::UserError(Box::new(info))
+        };
+        for (i, (name, ty)) in fields.iter().enumerate() {
+            let Some(col) = def.columns.get(i) else {
+                return Err(invalid(
+                    "SELECT rule's target list has too many entries".into(),
+                    None,
+                ));
+            };
+            if *name != col.name {
+                return Err(invalid(
+                    format!(
+                        "SELECT rule's target entry {} has different column name from column \"{}\"",
+                        i + 1,
+                        col.name
+                    ),
+                    Some(format!("SELECT target entry is named \"{name}\".")),
+                ));
+            }
+            let base = |t: &str| t.split('(').next().unwrap_or(t).trim().to_string();
+            if base(ty) != base(&col.pg_type) {
+                return Err(invalid(
+                    format!(
+                        "SELECT rule's target entry {} has different type from column \"{}\"",
+                        i + 1,
+                        col.name
+                    ),
+                    Some(format!(
+                        "SELECT target entry has type {}, but column has type {}.",
+                        secantus_pgplan::display_type(ty),
+                        secantus_pgplan::display_type(&col.pg_type)
+                    )),
+                ));
+            }
+        }
+        if fields.len() < def.columns.len() {
+            return Err(invalid(
+                "SELECT rule's target list has too few entries".into(),
+                None,
+            ));
+        }
+        self.execute(self.plan_internal(&format!("DROP TABLE {quoted}"))?, 0)?;
+        self.execute(
+            self.plan_internal(&format!("CREATE VIEW {quoted} AS {select}"))?,
+            0,
+        )?;
         Ok(vec![Response::Execution(Tag::new("CREATE RULE"))])
     }
 
@@ -284,6 +402,22 @@ impl PgHandler {
                 d.insert(f("is_instead"), r.instead);
                 d
             })
+            // A view IS its `_RETURN` rule, as PostgreSQL records it.
+            .chain(
+                self.views()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(view, _)| {
+                        let mut d = Document::new();
+                        d.insert(f("oid"), Bson::Int64(Self::view_rule_oid(&view)));
+                        d.insert(f("rulename"), "_RETURN");
+                        d.insert(f("ev_class"), Bson::Int64(Self::view_oid(&view)));
+                        d.insert(f("ev_type"), "1");
+                        d.insert(f("ev_enabled"), "O");
+                        d.insert(f("is_instead"), true);
+                        d
+                    }),
+            )
             .collect()
     }
 

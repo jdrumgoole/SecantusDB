@@ -102,6 +102,111 @@ pub fn sql_relations(sql: &str) -> Vec<(String, &'static str)> {
     out
 }
 
+/// The columns of `table` a statement needs `privilege` on, for checking a
+/// role that holds only COLUMN privileges (`GRANT SELECT (a) ON t`), as
+/// PostgreSQL's `ExecCheckRTPerms` checks `selectedCols` / `insertedCols` /
+/// `updatedCols`. SELECT: every column read anywhere in the statement, `*` or
+/// a whole-row reference meaning all of them. INSERT: the target list (all
+/// columns without one). UPDATE: the SET targets. `columns` is the table's
+/// column list, which attributes an unqualified name.
+pub fn sql_columns(sql: &str, table: &str, columns: &[String], privilege: &str) -> Vec<String> {
+    let Ok(parsed) = pg_query::parse(sql) else {
+        return columns.to_vec();
+    };
+    let mut out: Vec<String> = Vec::new();
+    let add = |c: &str, out: &mut Vec<String>| {
+        if columns.iter().any(|k| k == c) && !out.iter().any(|k| k == c) {
+            out.push(c.to_string());
+        }
+    };
+    let target_names = |list: &[pg_query::protobuf::Node]| -> Vec<String> {
+        list.iter()
+            .filter_map(|n| match n.node.as_ref() {
+                Some(N::ResTarget(r)) => Some(r.name.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    for raw in &parsed.protobuf.stmts {
+        let Some(stmt) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
+            continue;
+        };
+        match (privilege, stmt) {
+            ("INSERT", N::InsertStmt(i))
+                if i.relation.as_ref().is_some_and(|r| r.relname == table) =>
+            {
+                if i.cols.is_empty() {
+                    return columns.to_vec();
+                }
+                for c in target_names(&i.cols) {
+                    add(&c, &mut out);
+                }
+            }
+            ("UPDATE", N::UpdateStmt(u))
+                if u.relation.as_ref().is_some_and(|r| r.relname == table) =>
+            {
+                for c in target_names(&u.target_list) {
+                    add(&c, &mut out);
+                }
+            }
+            ("UPDATE", N::InsertStmt(i))
+                if i.relation.as_ref().is_some_and(|r| r.relname == table) =>
+            {
+                if let Some(oc) = &i.on_conflict_clause {
+                    for c in target_names(&oc.target_list) {
+                        add(&c, &mut out);
+                    }
+                }
+            }
+            ("SELECT", _) => {
+                // The names this table goes by in the statement.
+                let mut names = vec![table.to_string()];
+                for (node, _, _, _) in stmt.nodes() {
+                    if let pg_query::NodeRef::RangeVar(r) = node {
+                        if r.relname == table {
+                            if let Some(a) = &r.alias {
+                                names.push(a.aliasname.clone());
+                            }
+                        }
+                    }
+                }
+                for (node, _, _, _) in stmt.nodes() {
+                    let pg_query::NodeRef::ColumnRef(c) = node else {
+                        continue;
+                    };
+                    let parts: Vec<Option<&str>> = c
+                        .fields
+                        .iter()
+                        .map(|f| match f.node.as_ref() {
+                            Some(N::String(s)) => Some(s.sval.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    match parts.as_slice() {
+                        // `*`, or `t.*`
+                        [None] => return columns.to_vec(),
+                        [Some(q), None] if names.iter().any(|n| n == q) => {
+                            return columns.to_vec();
+                        }
+                        // A bare name: a column, or the whole row.
+                        [Some(n)] => {
+                            if columns.iter().any(|k| k == n) {
+                                add(n, &mut out);
+                            } else if names.iter().any(|t| t == n) {
+                                return columns.to_vec();
+                            }
+                        }
+                        [.., Some(q), Some(n)] if names.iter().any(|t| t == q) => add(n, &mut out),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 fn push(out: &mut Vec<(String, &'static str)>, table: &str, privilege: &'static str) {
     if !table.is_empty() && !out.iter().any(|(t, p)| t == table && *p == privilege) {
         out.push((table.to_string(), privilege));

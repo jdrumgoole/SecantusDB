@@ -256,14 +256,16 @@ fn source_of(node: &N, def: &TableDef) -> Result<Option<Source>> {
                     )
                 }
                 Some(sel) => {
+                    // A VALUES `DEFAULT` is the column's default expression
+                    // here, which a derived table can hold.
+                    let mut sel = sel.clone();
+                    if let Some(N::SelectStmt(s)) = sel.node.as_mut() {
+                        fill_values_defaults(s, &names, def)?;
+                    }
                     let Some(N::SelectStmt(s)) = sel.node.as_ref() else {
                         return Ok(None);
                     };
-                    // A VALUES with DEFAULT in it cannot be a derived table.
-                    let body = deparse(sel)?;
-                    if !s.values_lists.is_empty() && body.contains("DEFAULT") {
-                        return Ok(None);
-                    }
+                    let body = deparse(&sel)?;
                     let width = if !s.values_lists.is_empty() {
                         match s.values_lists.first().and_then(|r| r.node.as_ref()) {
                             Some(N::List(l)) => l.items.len(),
@@ -488,6 +490,32 @@ fn and(
     }
 }
 
+/// Replace each `DEFAULT` in a VALUES list with the column's default
+/// expression (NULL for a column that has none), as PostgreSQL's rewriter
+/// does before a rule sees the statement. `cols` names the VALUES columns in
+/// order.
+fn fill_values_defaults(
+    s: &mut pg_query::protobuf::SelectStmt,
+    cols: &[String],
+    def: &TableDef,
+) -> Result<()> {
+    for row in &mut s.values_lists {
+        let Some(N::List(l)) = row.node.as_mut() else {
+            continue;
+        };
+        for (i, item) in l.items.iter_mut().enumerate() {
+            if matches!(item.node.as_ref(), Some(N::SetToDefault(_))) {
+                let sql = cols
+                    .get(i)
+                    .and_then(|c| def.column(c))
+                    .map_or_else(|| "NULL".to_string(), default_sql);
+                *item = parse_expr(&sql)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn from_item(sql: &str) -> Result<pg_query::protobuf::Node> {
     let n = parse_one(&format!("SELECT 1 FROM {sql}"))?;
     match n.node {
@@ -507,6 +535,7 @@ fn rewrite_action(
     rule_qual: Option<&str>,
     src: &Source,
     join_source: bool,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
 ) -> Result<Option<(String, String)>> {
     let mut node = parse_one(action)?;
     let qual = rule_qual.map(parse_expr).transpose()?;
@@ -521,6 +550,27 @@ fn rewrite_action(
             if ins.returning_list.len() + usize::from(ins.with_clause.is_some()) > 0 {
                 return Ok(None);
             }
+            // The action's own `VALUES (..., DEFAULT)`: its target's default.
+            if let Some(def) = lookup(&target) {
+                let listed: Vec<String> = ins
+                    .cols
+                    .iter()
+                    .filter_map(|c| match c.node.as_ref() {
+                        Some(N::ResTarget(rt)) => Some(rt.name.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                let cols: Vec<String> = if listed.is_empty() {
+                    def.columns.iter().map(|c| c.name.clone()).collect()
+                } else {
+                    listed
+                };
+                if let Some(N::SelectStmt(s)) =
+                    ins.select_stmt.as_deref_mut().and_then(|n| n.node.as_mut())
+                {
+                    fill_values_defaults(s, &cols, &def)?;
+                }
+            }
             if join_source {
                 let Some(sel) = ins.select_stmt.as_deref_mut() else {
                     return Ok(None);
@@ -531,7 +581,34 @@ fn rewrite_action(
                 if s.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
                     return Ok(None);
                 }
-                if !s.values_lists.is_empty() {
+                if s.values_lists.len() > 1 {
+                    // Several rows: one `SELECT row FROM source [WHERE qual]`
+                    // per row, joined by UNION ALL -- each row once per
+                    // source row, as the rewritten VALUES yields them.
+                    let from = &src.from;
+                    let cond = qual
+                        .as_ref()
+                        .map(crate::deparse_expr)
+                        .transpose()?
+                        .map(|q| format!(" WHERE {q}"))
+                        .unwrap_or_default();
+                    let mut members = Vec::new();
+                    for row in &s.values_lists {
+                        let Some(N::List(l)) = row.node.as_ref() else {
+                            return Ok(None);
+                        };
+                        let items = l
+                            .items
+                            .iter()
+                            .map(crate::deparse_expr)
+                            .collect::<Result<Vec<_>>>()?;
+                        members.push(format!("SELECT {} FROM {from}{cond}", items.join(", ")));
+                    }
+                    *sel = parse_one(&members.join(" UNION ALL "))?;
+                    let text = deparse(&node)?;
+                    let text = substitute(&text, &|which, col| src.pseudo(which, col))?;
+                    return Ok(Some((text, target)));
+                } else if !s.values_lists.is_empty() {
                     // `VALUES (row)` becomes `SELECT row FROM source`.
                     let [row] = s.values_lists.as_slice() else {
                         return Ok(None);
@@ -551,8 +628,10 @@ fn rewrite_action(
                         .collect();
                     s.values_lists.clear();
                     s.target_list = targets;
+                    s.from_clause.push(from_item(&src.from)?);
+                } else {
+                    s.from_clause.push(from_item(&src.from)?);
                 }
-                s.from_clause.push(from_item(&src.from)?);
                 if let Some(qn) = qual {
                     s.where_clause = Some(Box::new(and(s.where_clause.take().map(|b| *b), qn)));
                 }
@@ -756,8 +835,8 @@ pub(crate) fn plan(
         for a in &r.actions {
             let join =
                 kind == "INSERT" || src.has_where || r.condition.is_some() || mentions_pseudo(a);
-            let (sql, target) =
-                rewrite_action(a, r.condition.as_deref(), &src, join)?.ok_or_else(unsupported)?;
+            let (sql, target) = rewrite_action(a, r.condition.as_deref(), &src, join, lookup)?
+                .ok_or_else(unsupported)?;
             let action_kind = sql
                 .split_whitespace()
                 .next()
