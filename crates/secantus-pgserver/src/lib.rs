@@ -6691,6 +6691,120 @@ impl PgHandler {
     /// An expression index's key for `row`, with its display text -- `None`
     /// when the row is outside a partial index or any key part is NULL
     /// (NULLs never collide).
+    /// A PRIMARY KEY or UNIQUE constraint over a column under a
+    /// NONDETERMINISTIC collation: two keys are equal when the collation
+    /// says so (`Apple` / `apple` under a case-insensitive one), which the
+    /// storage index -- comparing bytes -- cannot see. Checked by the
+    /// collation's sort key against the stored rows other than `replacing`
+    /// and the batch itself; NULLs stay distinct.
+    fn check_collated_unique(
+        &self,
+        def: &TableDef,
+        rows: &[Document],
+        replacing: &[Bson],
+    ) -> PgWireResult<()> {
+        let nondeterministic = |col: &str| -> Option<String> {
+            def.column(col)?
+                .extra
+                .get_str("collation")
+                .ok()
+                .filter(|c| {
+                    secantus_pgplan::collation::resolve(c).is_ok_and(|r| !r.deterministic())
+                })
+                .map(str::to_string)
+        };
+        let mut constraints: Vec<(String, Vec<String>)> = Vec::new();
+        let pk: Vec<String> = def
+            .columns
+            .iter()
+            .filter(|c| c.pk)
+            .map(|c| c.name.clone())
+            .collect();
+        if !pk.is_empty() {
+            let name = def
+                .extra
+                .get_str("pk_name")
+                .map(str::to_string)
+                .unwrap_or_else(|_| format!("{}_pkey", def.name));
+            constraints.push((name, pk));
+        }
+        for u in &def.unique_constraints {
+            if u.exclusion_ops.is_empty() && !u.deferrable {
+                constraints.push((u.name.clone(), u.columns.clone()));
+            }
+        }
+        constraints.retain(|(_, cols)| cols.iter().any(|c| nondeterministic(c).is_some()));
+        if constraints.is_empty() {
+            return Ok(());
+        }
+        let stored: Vec<Document> = self
+            .storage
+            .find_matching(self.db(), &def.name, &Document::new())
+            .map_err(|e| Self::storage_err("could not read", e))?
+            .into_iter()
+            .filter_map(|raw| bson::from_slice::<Document>(&raw).ok())
+            .filter(|d| !d.get("_id").is_some_and(|id| replacing.contains(id)))
+            .collect();
+        let key = |row: &Document, cols: &[String]| -> PgWireResult<Option<Vec<Bson>>> {
+            let mut out = Vec::new();
+            for c in cols {
+                let v = def
+                    .field_of(c)
+                    .and_then(|f| row.get(&f).cloned())
+                    .unwrap_or(Bson::Null);
+                if v == Bson::Null {
+                    return Ok(None);
+                }
+                out.push(match (nondeterministic(c), &v) {
+                    (Some(coll), Bson::String(text)) => Bson::String(
+                        secantus_pgplan::collation::sort_key(&coll, text)
+                            .map_err(|e| Self::err(&e))?,
+                    ),
+                    _ => v,
+                });
+            }
+            Ok(Some(out))
+        };
+        for (name, cols) in &constraints {
+            let mut taken: Vec<Vec<Bson>> = Vec::new();
+            for row in &stored {
+                if let Some(k) = key(row, cols)? {
+                    taken.push(k);
+                }
+            }
+            for row in rows {
+                let Some(k) = key(row, cols)? else {
+                    continue;
+                };
+                if taken.contains(&k) {
+                    let shown: Vec<String> = cols
+                        .iter()
+                        .map(|c| {
+                            def.field_of(c)
+                                .and_then(|f| row.get(&f))
+                                .map(secantus_pgplan::value_text)
+                                .unwrap_or_default()
+                        })
+                        .collect();
+                    return Err(Self::constraint_error(
+                        "23505",
+                        format!("duplicate key value violates unique constraint \"{name}\""),
+                        format!(
+                            "Key ({})=({}) already exists.",
+                            cols.join(", "),
+                            shown.join(", ")
+                        ),
+                        def,
+                        Some(name),
+                        None,
+                    ));
+                }
+                taken.push(k);
+            }
+        }
+        Ok(())
+    }
+
     fn expression_key(
         &self,
         def: &TableDef,
@@ -6846,6 +6960,7 @@ impl PgHandler {
         rows: &[Document],
         replacing: &[Bson],
     ) -> PgWireResult<()> {
+        self.check_collated_unique(def, rows, replacing)?;
         let indexes = self.unique_expression_indexes(&def.name)?;
         if indexes.is_empty() {
             return Ok(());
