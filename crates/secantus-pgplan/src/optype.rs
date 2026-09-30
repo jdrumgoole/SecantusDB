@@ -340,6 +340,48 @@ fn operand_type(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<String> {
                 _ => None,
             }
         }
+        // A window function's result: the ranking functions are bigint (ntile
+        // integer, the distributions float8), the value functions their
+        // argument's type, an aggregate over a window its overload's result.
+        N::FuncCall(f) if f.over.is_some() => {
+            let name = func_name(f)?;
+            match name.as_str() {
+                "row_number" | "rank" | "dense_rank" => Some("int8".into()),
+                "count" => Some("int8".into()),
+                "ntile" => Some("int4".into()),
+                "percent_rank" | "cume_dist" => Some("float8".into()),
+                "lag" | "lead" | "first_value" | "last_value" | "nth_value" => {
+                    operand_type(f.args.first()?, scope)
+                }
+                _ => {
+                    let args = f
+                        .args
+                        .iter()
+                        .map(|a| operand_type(a, scope))
+                        .collect::<Option<Vec<_>>>()?;
+                    crate::funcsig::result_type(&name, &args)
+                }
+            }
+        }
+        // An array subscript: the ELEMENT type; a slice keeps the array's.
+        N::AIndirection(ind)
+            if !ind.indirection.is_empty()
+                && ind
+                    .indirection
+                    .iter()
+                    .all(|i| matches!(i.node.as_ref(), Some(N::AIndices(_)))) =>
+        {
+            let base = match ind.arg.as_deref()?.node.as_ref()? {
+                N::ColumnRef(c) => scope.column_type(c)?,
+                _ => return None,
+            };
+            let slice = ind
+                .indirection
+                .iter()
+                .any(|i| matches!(i.node.as_ref(), Some(N::AIndices(x)) if x.is_slice));
+            let element = base.strip_suffix("[]")?.to_string();
+            (!slice).then_some(element)
+        }
         // A built-in's result, as the overload its arguments select returns.
         N::FuncCall(f) if f.over.is_none() && !f.agg_star && f.agg_order.is_empty() => {
             let name = func_name(f)?;
@@ -443,6 +485,31 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
                 (true, Some(l), Some(r)) => return Err(mismatch(&op, &l, &r, e.location)),
                 _ => {}
             }
+        }
+    }
+    // Two row constructors compare field by field: each pair needs an
+    // operator of its own (`row(id, t) = row(true, 'a')` is integer =
+    // boolean).
+    if kind == Some(K::AexprOp)
+        && matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=")
+    {
+        if let (Some(N::RowExpr(l)), Some(N::RowExpr(r))) = (
+            e.lexpr.as_deref().and_then(|n| n.node.as_ref()),
+            e.rexpr.as_deref().and_then(|n| n.node.as_ref()),
+        ) {
+            if l.args.len() == r.args.len() {
+                for (a, b) in l.args.iter().zip(&r.args) {
+                    let (Some(at), Some(bt)) = (operand_type(a, scope), operand_type(b, scope))
+                    else {
+                        continue;
+                    };
+                    if matches!((category(&at), category(&bt)), (Some(x), Some(y)) if x != y) {
+                        let op = if op == "!=" { "<>" } else { op.as_str() };
+                        return Err(mismatch(op, &at, &bt, e.location));
+                    }
+                }
+            }
+            return Ok(());
         }
     }
     let Some(l) = e.lexpr.as_deref().and_then(|n| operand_type(n, scope)) else {
