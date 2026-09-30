@@ -641,9 +641,6 @@ remain open:
         partial filter nothing matches) plus its SQL; a MongoDB-side
         `listIndexes` on that collection shows it. Its UNIQUE check scans the
         table per write.
-      - Date/time input: the whole of PostgreSQL 15's `Default` abbreviation
-        set is known (batch 10), but each abbreviation is its CURRENT offset;
-        a dynamic abbreviation's history (`MSK` before 2011) is not modelled.
 - [ ] **OPEN — RUST pgserver: what batch 8 (partitioning, row-level
       security, domains, materialized views, WITH RECURSIVE, xml, READ
       COMMITTED, enums, generated columns) leaves (2026-09-30).** 87 corpora

@@ -65,6 +65,10 @@ change is measured against PostgreSQL 15 (and 14 where a corpus needs it).
   `pg_attribute`, where it was bare `numeric`.
 - **`pg_table_size`** counts a table's TOAST index (8192 bytes) when a
   column can be TOASTed, as PostgreSQL does.
+- **Time zone abbreviations tied to a zone** (`MSK`, `VOLT`, `YAKT`, ...)
+  mean that zone's offset at the time given: `2012-01-01 12:00 MSK` is
+  UTC+4, as it was then. A zone abbreviation on a `timetz` (`'12:00
+  EST'::timetz`) is read; it was dropped.
 - **`pg_class.relacl`** shows the grants on a table (`grantee=arwd/owner`,
   `*` for WITH GRANT OPTION, per privilege); it was always NULL.
   `relhasrules` is true for a table with a rule.
