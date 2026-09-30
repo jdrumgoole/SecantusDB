@@ -606,9 +606,12 @@ remain open:
       schemas (corpora `procedures`, `alter_routines`). Left: a wrapper over
       any other C function is a catalog row that answers 42883 when called
       (a wrapper declared over the wrong C signature crashed a PG 16.15
-      backend, so calling one blind is not imitated), and a procedure's
-      `COMMIT` / `ROLLBACK` is 2D000 (transaction control inside a CALL is
-      not implemented).
+      backend, so calling one blind is not imitated). (Batch 14 added
+      `COMMIT` / `ROLLBACK` [`AND CHAIN`] in procedures and DO blocks, `CALL`
+      inside PL/pgSQL with OUT / INOUT write-back, and EXCEPTION blocks as
+      subtransactions -- corpus `procedure_transactions`.) An EXCEPTION
+      block's subtransaction is a savepoint, which captures whole tables
+      (see the SAVEPOINT cost entry in section 7).
 - [ ] **OPEN — RUST pgserver triggers: the cross-server gap (2026-09-30).**
       `INSTEAD OF`, constraint triggers (deferred firing, `SET CONSTRAINTS`)
       and transition tables landed in batch 9 (corpora `instead_of`,
@@ -7004,18 +7007,17 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
         `e.dept_id = d.id` to the per-row path instead of binding `d.id` to
         the inner table's own `id`.
 
-- [ ] **OPEN — RUST pgserver: the general JOIN planner has no predicate
-      pushdown (2026-09-29).** A join is planned as a source whose leaves are
-      `SELECT * FROM <leaf>` (`secantus-pgplan/src/joins.rs`), hash-joined on
-      the ON clause's column equalities; the query's WHERE runs on the joined
-      rows. So every join reads both tables in full, however selective the
-      WHERE. Correct, and not measured. Pushing a single-leaf conjunct into its
-      leaf is safe for an inner join and for the PRESERVED side of an outer
-      one -- NOT the nullable side, which is exactly the bug the narrow join
-      path had (a LEFT JOIN pre-filter keeping NULL-extended rows). The narrow
-      two-table path still goes first, because psycopg's catalog queries rely
-      on its regtype-aware OID equality; that is the other reason to measure
-      before trusting the general path on catalog tables.
+- [x] **DONE (batch 14) — RUST pgserver: the general JOIN planner pushes
+      WHERE conjuncts into its table leaves.** A conjunct that reads ONE
+      alias's columns (qualified), built of operators, casts, constants and
+      parameters, is applied inside that leaf's `SELECT * FROM t` too, so the
+      leaf can use an index; it stays in the outer WHERE, so the answer
+      cannot change. Only a leaf on the PRESERVED side of every outer join
+      above it takes one (filtering the nullable side is the pre-filter bug
+      the narrow path had). Measured: `a JOIN b ON b.a_id = a.id WHERE a.id =
+      5 AND b.id = 5` over 20,000 rows each, 731 ms -> 1.7 ms (debug build).
+      Corpus `join_pushdown`. Not pushed: an unqualified column, a function
+      call (it may be volatile), a subquery, a conjunct over two aliases.
 
 - [ ] **OPEN — PYTHON pgserver: CREATE INDEX diverges from PostgreSQL 14.13
       on 13 of 48 lines of `indexes.sql` (found 2026-09-29).** Three are
@@ -7040,8 +7042,9 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
       (`split_window_over_aggregate`). A window call nested in an expression
       is hoisted into its own window item and the expression reads its field.
 
-      **One known limit:** partitioning scans the
-      distinct partition keys linearly, which is O(partitions^2).
+      (Partitioning used to scan the distinct partition keys linearly,
+      O(partitions^2); since batch 14 it hashes a canonical encoding of each
+      key, with NaN and -0 grouped as PostgreSQL groups them.)
 
       **Carried from the implementation, worth not re-deriving:** the DEFAULT
       frame is `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` whether or
