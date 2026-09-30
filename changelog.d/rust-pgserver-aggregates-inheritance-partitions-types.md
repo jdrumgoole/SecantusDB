@@ -26,6 +26,11 @@ returns rows. Each was silent: no error, just a wrong answer.
 Errors now carry PostgreSQL's position, so a client prints the caret under the
 token at fault.
 
+**psql's describe commands work.** With psql 15, the output of `\d`, `\d+`,
+`\dt`, `\di`, `\dv`, `\ds`, `\df`, `\dT`, `\dn` and `\dx` is byte-for-byte
+what PostgreSQL 15 prints, including the index, check, foreign-key,
+referenced-by, trigger and policy footers.
+
 #### Added
 
 - `CREATE AGGREGATE`, `CREATE OPERATOR`, `CREATE STATISTICS`,
@@ -65,6 +70,18 @@ token at fault.
 - A partition's own column options in `PARTITION OF (...)`: NOT NULL,
   DEFAULT, and column CHECK / UNIQUE / PRIMARY KEY.
 - `pg_get_viewdef(view [, pretty])`, by oid, regclass or name.
+- For psql and ORMs:
+  - the relations `pg_collation`, `pg_am`, `pg_policy`, `pg_depend`,
+    `pg_sequence`, `pg_description` and `pg_publication_namespace`;
+  - the missing columns of `pg_class`, `pg_index`, `pg_attribute`, `pg_type`
+    and `pg_extension`, with `pg_attribute` rows for view and index columns;
+  - the functions `pg_get_indexdef`, `pg_get_triggerdef`, `pg_get_partkeydef`,
+    `pg_get_function_arguments` / `_result`, `pg_get_userbyid`,
+    `pg_partition_ancestors`, `pg_relation_is_publishable` and the
+    `pg_*_is_visible` family;
+  - `OPERATOR(pg_catalog.op)` syntax;
+  - PostgreSQL's catalog relation oids;
+  - a sequence resolves as a `regclass`, and `nextval('s'::regclass)` works.
 
 #### Fixed
 
@@ -84,6 +101,13 @@ token at fault.
 - `||` renders each side as its `::text`: a float4 in its own digits, a
   timestamptz in the session zone. An unknown literal beside a timestamp or
   interval is text there, not that type.
+- An aggregate whose WHERE compares two columns over a join, such as `SELECT
+  count(*) FROM a, b WHERE a.id = b.id`, was refused. So was a subquery
+  correlated through a FROM function's argument, such as `ARRAY(SELECT ...
+  FROM unnest(t.opts) x)`.
+- `pg_get_constraintdef(oid, true)` drops a CHECK's outer parentheses, and a
+  CHECK shows PostgreSQL's implicit casts (`v > 0::numeric`, `'-3'::integer`).
+- `pg_class.relhastriggers` is true for both sides of a foreign key.
 - A failed autocommit INSERT consumes the serial values it drew, as
   PostgreSQL's non-transactional sequences do, so the next id matches. The
   statement's own transaction used to roll the sequence back with it.

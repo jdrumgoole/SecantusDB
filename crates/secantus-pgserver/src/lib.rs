@@ -11,6 +11,7 @@
 
 mod advisory;
 mod aggregates;
+mod catalog_fill;
 mod catalog_objects;
 mod do_block;
 mod encoding;
@@ -2259,6 +2260,26 @@ impl PgHandler {
         );
         secantus_pgplan::set_constraint_defs(self.constraint_defs().unwrap_or_default());
         secantus_pgplan::set_view_defs(self.view_defs());
+        secantus_pgplan::set_index_defs(self.index_defs());
+        secantus_pgplan::set_trigger_defs(self.trigger_defs());
+        secantus_pgplan::set_function_sigs(self.function_sigs());
+        secantus_pgplan::set_partkey_defs(
+            self.all_table_defs()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|t| Some((self.relation_oid(&t.name)?, partition::partkey_text(t)?)))
+                .collect(),
+        );
+        secantus_pgplan::set_partition_parents(
+            self.all_table_defs()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|t| {
+                    let parent = partition::parent_of(t)?;
+                    Some((self.relation_oid(&t.name)?, self.relation_oid(parent)?))
+                })
+                .collect(),
+        );
         secantus_pgplan::set_object_comments(self.object_comments());
         secantus_pgplan::domains::set_user_domains(self.domains().unwrap_or_default());
         secantus_pgplan::user_agg::set_user_aggregates(self.user_aggregates().unwrap_or_default());
@@ -4239,7 +4260,7 @@ impl PgHandler {
 
     /// Every table with a relation oid, as `(stored name, oid, temp)`, for
     /// the planner's `regclass` resolution.
-    fn relations(&self) -> Vec<(String, i64, bool)> {
+    pub(crate) fn relations(&self) -> Vec<(String, i64, bool)> {
         let docs = match self.type_catalog_docs(Self::COMPOSITE_COLLECTION) {
             Ok(docs) => docs,
             Err(_) => return Vec::new(),
@@ -4275,7 +4296,23 @@ impl PgHandler {
                         (name, oid, false)
                     }),
             )
+            // A sequence is a relation too: `'s'::regclass` names it.
+            .chain(
+                self.all_sequence_docs()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|d| {
+                        let name = d.get_str("_id").ok()?.to_string();
+                        let oid = Self::sequence_oid(&name);
+                        Some((name, oid, false))
+                    }),
+            )
             .collect()
+    }
+
+    /// A sequence's relation oid: stable for its name, in its own band.
+    pub(crate) fn sequence_oid(name: &str) -> i64 {
+        Self::index_oid(&format!("seq:{name}")) | 0x0400_0000
     }
 
     /// A view's oid: stable for its name, in a band no table, type or index
@@ -6184,6 +6221,39 @@ impl PgHandler {
             }
         }
         Ok(())
+    }
+
+    /// Every index's `(oid, pg_get_indexdef text)`: `pg_indexes.indexdef`,
+    /// keyed by the index oid `pg_index` / `pg_class` carry.
+    fn index_defs(&self) -> Vec<(i64, String)> {
+        let Some(rows) = self.virtual_rows("pg_indexes", &Document::new()) else {
+            return Vec::new();
+        };
+        let Some(def) = Self::virtual_table("pg_indexes") else {
+            return Vec::new();
+        };
+        let (Some(name_f), Some(def_f)) = (def.field_of("indexname"), def.field_of("indexdef"))
+        else {
+            return Vec::new();
+        };
+        let by_name: Vec<(String, String)> = rows
+            .iter()
+            .filter_map(|r| {
+                Some((
+                    r.get_str(&name_f).ok()?.to_string(),
+                    r.get_str(&def_f).ok()?.to_string(),
+                ))
+            })
+            .collect();
+        self.index_relations()
+            .into_iter()
+            .filter_map(|ix| {
+                by_name
+                    .iter()
+                    .find(|(n, _)| *n == ix.name)
+                    .map(|(_, d)| (ix.oid, d.clone()))
+            })
+            .collect()
     }
 
     /// Every view's and materialized view's `(regclass oid, name,
@@ -8200,8 +8270,19 @@ impl PgHandler {
     /// Every stored comment as pg_description keys it: `(object oid,
     /// sub-id, text)`, the sub-id a column's number or 0. Objects with no
     /// oid here (a sequence, a schema) are not listed.
-    fn object_comments(&self) -> Vec<(i64, i32, String)> {
+    pub(crate) fn object_comments(&self) -> Vec<(i64, i32, String)> {
         let mut out = Vec::new();
+        // An extension's description is its control file's `comment`.
+        for (i, (name, _, _)) in self
+            .extensions()
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+        {
+            if let Some(c) = catalog_fill::extension_description(&name) {
+                out.push((13_826 + i as i64, 0, c.to_string()));
+            }
+        }
         for def in self.all_table_defs().unwrap_or_default() {
             let Some(oid) = self.relation_oid(&def.name) else {
                 continue;
@@ -8445,6 +8526,19 @@ impl PgHandler {
     /// pipeline tests count (empty here -- the statement store lives in the
     /// wire layer and holds nothing a client named).
     fn virtual_table(name: &str) -> Option<TableDef> {
+        let mut def = Self::virtual_table_base(name)?;
+        // The columns clients read that are PostgreSQL's constant (or
+        // simply derived) values; `fill_catalog_columns` sets them.
+        for (column, ty) in catalog_fill::extra_columns(name) {
+            if def.column(column).is_none() {
+                def.columns
+                    .push(secantus_pgcatalog::Column::new(column, ty, false));
+            }
+        }
+        Some(def)
+    }
+
+    fn virtual_table_base(name: &str) -> Option<TableDef> {
         match name {
             // `information_schema` keeps its SCHEMA in the name, because its
             // views are called `tables` / `columns` / `sequences` -- names a
@@ -9003,6 +9097,13 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("conbin", "pg_node_tree", false),
                 ],
             )),
+            "pg_collation" => Some(catalog_fill::pg_collation_def()),
+            "pg_am" => Some(catalog_fill::pg_am_def()),
+            "pg_policy" => Some(catalog_fill::pg_policy_def()),
+            "pg_sequence" => Some(catalog_fill::pg_sequence_def()),
+            "pg_description" => Some(catalog_fill::pg_description_def()),
+            "pg_depend" => Some(catalog_fill::pg_depend_def()),
+            "pg_publication_namespace" => Some(catalog_fill::pg_publication_namespace_def()),
             _ => Self::catalog_object_table(name),
         }
     }
@@ -9010,7 +9111,14 @@ impl PgHandler {
     /// The rows of one virtual table, already filtered.
     fn virtual_rows(&self, name: &str, filter: &Document) -> Option<Vec<Document>> {
         let def = Self::virtual_table(name)?;
-        let rows: Vec<Document> = match name {
+        let mut rows: Vec<Document> = match name {
+            "pg_collation" => self.pg_collation_rows(&def),
+            "pg_am" => self.pg_am_rows(&def),
+            "pg_policy" => self.pg_policy_rows(&def),
+            "pg_sequence" => self.pg_sequence_rows(&def),
+            "pg_description" => self.pg_description_rows(&def),
+            "pg_depend" => Vec::new(),
+            "pg_publication_namespace" => Vec::new(),
             "information_schema.columns" => {
                 let f = |name: &str| def.field_of(name).expect("column");
                 let db = self.db().to_string();
@@ -9419,6 +9527,8 @@ impl PgHandler {
                     d.insert(f("relpersistence"), if ix.table.temp { "t" } else { "p" });
                     d.insert(f("relrowsecurity"), false);
                     d.insert(f("relforcerowsecurity"), false);
+                    d.insert(f("relispartition"), false);
+                    d.insert(f("relpartbound"), Bson::Null);
                     rows.push(d);
                 }
                 // A sequence is a relation too, and `relkind` is how a client
@@ -9451,7 +9561,7 @@ impl PgHandler {
                 for s in self.all_sequence_docs().ok()? {
                     let name = s.get_str("_id").unwrap_or_default().to_string();
                     let mut d = Document::new();
-                    d.insert(f("oid"), Bson::Int64(0));
+                    d.insert(f("oid"), Bson::Int64(Self::sequence_oid(&name)));
                     d.insert(f("relname"), name.as_str());
                     d.insert(f("relnamespace"), Bson::Int64(Self::PUBLIC_NAMESPACE_OID));
                     d.insert(f("relkind"), "S");
@@ -9462,6 +9572,8 @@ impl PgHandler {
                     d.insert(f("relpersistence"), "p");
                     d.insert(f("relrowsecurity"), false);
                     d.insert(f("relforcerowsecurity"), false);
+                    d.insert(f("relispartition"), false);
+                    d.insert(f("relpartbound"), Bson::Null);
                     rows.push(d);
                 }
                 rows
@@ -9473,8 +9585,12 @@ impl PgHandler {
                     .map(|(name, oid)| {
                         let mut d = Document::new();
                         d.insert(f("oid"), Bson::Int64(oid));
+                        // `public` belongs to `pg_database_owner` since 15.
+                        d.insert(
+                            f("nspowner"),
+                            Bson::Int64(if name == "public" { 6171 } else { 10 }),
+                        );
                         d.insert(f("nspname"), name);
-                        d.insert(f("nspowner"), Bson::Int64(10));
                         d
                     })
                     .collect()
@@ -9537,7 +9653,7 @@ impl PgHandler {
                     }
                     let nargs = t.get_array("args").map(|a| a.len()).unwrap_or(0);
                     let mut d = Document::new();
-                    d.insert(f("oid"), Bson::Int64(0));
+                    d.insert(f("oid"), Bson::Int64(Self::trigger_oid(&t)));
                     d.insert(
                         f("tgrelid"),
                         Bson::Int64(self.relation_oid(table).unwrap_or(0)),
@@ -10354,6 +10470,84 @@ impl PgHandler {
                         rows.push(d);
                     }
                 }
+                // A view's and a materialized view's columns are its output
+                // columns; an index's are its key columns, in key order
+                // (psql's `\d view` / `\d index` read them here).
+                let plain = |relid: i64, name: &str, atttypid: i64, attnum: usize| {
+                    let mut d = Document::new();
+                    d.insert(
+                        def.field_of("attrelid").expect("column"),
+                        Bson::Int64(relid),
+                    );
+                    d.insert(def.field_of("attname").expect("column"), name);
+                    d.insert(
+                        def.field_of("atttypid").expect("column"),
+                        Bson::Int64(atttypid),
+                    );
+                    d.insert(
+                        def.field_of("attnum").expect("column"),
+                        Bson::Int32(attnum as i32),
+                    );
+                    d.insert(
+                        def.field_of("attisdropped").expect("column"),
+                        Bson::Boolean(false),
+                    );
+                    d.insert(
+                        def.field_of("attnotnull").expect("column"),
+                        Bson::Boolean(false),
+                    );
+                    d.insert(def.field_of("atttypmod").expect("column"), Bson::Int32(-1));
+                    d.insert(
+                        def.field_of("atthasdef").expect("column"),
+                        Bson::Boolean(false),
+                    );
+                    d.insert(def.field_of("attgenerated").expect("column"), "");
+                    d
+                };
+                let views = self
+                    .views()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(n, _)| (Self::view_oid(&n), n))
+                    .chain(
+                        self.matviews()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter_map(|(n, _, _)| Some((self.relation_oid(&n)?, n))),
+                    );
+                for (relid, name) in views {
+                    let Ok((cols, _)) = self.internal_query(&format!(
+                        "SELECT * FROM {} LIMIT 0",
+                        secantus_pgplan::scalar::quote_identifier(&name)
+                    )) else {
+                        continue;
+                    };
+                    for (i, (cname, ctype)) in cols.iter().enumerate() {
+                        if let Some(atttypid) = self.type_oid_by_name(ctype) {
+                            rows.push(plain(relid, cname, atttypid, i + 1));
+                        }
+                    }
+                }
+                for ix in self.index_relations() {
+                    for (i, key) in ix.keys.iter().enumerate() {
+                        let Some(c) = usize::try_from(*key)
+                            .ok()
+                            .filter(|k| *k > 0)
+                            .and_then(|k| ix.table.columns.get(k - 1))
+                        else {
+                            continue;
+                        };
+                        let declared = c.extra.get_str("domain_type").unwrap_or(&c.pg_type);
+                        if let Some(atttypid) = self.type_oid_by_name(declared) {
+                            let mut d = plain(ix.oid, &c.name, atttypid, i + 1);
+                            d.insert(
+                                def.field_of("atttypmod").expect("column"),
+                                Bson::Int32(c.typmod),
+                            );
+                            rows.push(d);
+                        }
+                    }
+                }
                 // A table's ROW TYPE is a composite under the same name and
                 // the same relation oid, so listing both put every table
                 // column in twice -- once from the table and once from its
@@ -10708,6 +10902,12 @@ impl PgHandler {
             "pg_constraint" => {
                 let field = |c: &str| def.field_of(c).expect("column");
                 let defs = self.all_table_defs().ok()?;
+                // A key / unique / exclude constraint's index, by name.
+                let index_oids: Vec<(String, String, i64)> = self
+                    .index_relations()
+                    .into_iter()
+                    .map(|ix| (ix.table.name.clone(), ix.name.clone(), ix.oid))
+                    .collect();
                 let mut rows: Vec<Document> = Vec::new();
                 for t in &defs {
                     // A table created before row types were recorded has no
@@ -10749,7 +10949,7 @@ impl PgHandler {
                             Bson::Int64(Self::constraint_oid(conrelid, ordinal)),
                         );
                         ordinal += 1;
-                        d.insert(field("conname"), conname);
+                        d.insert(field("conname"), conname.as_str());
                         d.insert(field("connamespace"), Bson::Int64(namespace_oid));
                         d.insert(field("contype"), contype);
                         d.insert(field("condeferrable"), Bson::Boolean(deferrable));
@@ -10757,11 +10957,18 @@ impl PgHandler {
                         d.insert(field("convalidated"), Bson::Boolean(true));
                         d.insert(field("conrelid"), Bson::Int64(conrelid));
                         d.insert(field("contypid"), Bson::Int64(0));
-                        // No `pg_index` rows exist on this server, so a
-                        // non-zero `conindid` would point at nothing. 0 is the
-                        // honest answer; PostgreSQL has a real index oid here
-                        // for p / u / f.
-                        d.insert(field("conindid"), Bson::Int64(0));
+                        // The index behind a PRIMARY KEY / UNIQUE / EXCLUDE
+                        // constraint (psql's `\d` joins on it). A FOREIGN
+                        // KEY's -- the referenced key's index -- stays 0.
+                        let conindid = if matches!(contype, "p" | "u" | "x") {
+                            index_oids
+                                .iter()
+                                .find(|(table, name, _)| *table == t.name && *name == conname)
+                                .map_or(0, |(_, _, oid)| *oid)
+                        } else {
+                            0
+                        };
+                        d.insert(field("conindid"), Bson::Int64(conindid));
                         d.insert(field("conparentid"), Bson::Int64(0));
                         d.insert(field("confrelid"), Bson::Int64(confrelid));
                         // ' ' for every non-FK row, measured on 14.24.
@@ -10921,6 +11128,7 @@ impl PgHandler {
             }
             _ => self.catalog_object_rows(name, &def).unwrap_or_default(),
         };
+        self.fill_catalog_columns(name, &def, &mut rows);
         let empty = Document::new();
         Some(
             rows.into_iter()
@@ -13927,7 +14135,12 @@ impl PgHandler {
     /// string literal (`nextval('s')`) and a schema qualifier is dropped --
     /// this server has one schema, so `public.s` and `s` name the same thing.
     fn sequence_name_arg(&self, arg: &ConstCol) -> PgWireResult<Option<String>> {
-        Ok(match self.resolve_const_col(arg)? {
+        let value = self.resolve_const_col(arg)?;
+        // `nextval('s'::regclass)`: the regclass names the sequence by oid.
+        if let Some(oid) = secantus_pgplan::regclass_oid(&value) {
+            return Ok(Some(secantus_pgplan::regclass_text(oid)));
+        }
+        Ok(match value {
             Bson::Null => None,
             Bson::String(s) => Some(
                 s.rsplit('.')

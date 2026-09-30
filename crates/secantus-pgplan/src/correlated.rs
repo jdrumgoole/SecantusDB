@@ -593,9 +593,18 @@ pub(crate) fn call_sequence(name: &str, args: &[Bson]) -> Result<Bson> {
     if SUPPRESSED.with(|s| s.get()) {
         return Ok(Bson::Null);
     }
+    // A `regclass` argument (`nextval('s'::regclass)`) names the sequence
+    // by oid; the hook takes its name.
+    let args: Vec<Bson> = args
+        .iter()
+        .map(|a| match crate::regclass_oid(a) {
+            Some(oid) => Bson::String(crate::regclass_text(oid)),
+            None => a.clone(),
+        })
+        .collect();
     match SEQUENCE_HOOK.with(|r| r.get()) {
         // SAFETY: set only inside `with_sequence_hook`, whose borrow is live.
-        Some(hook) => unsafe { (*hook)(name, args) },
+        Some(hook) => unsafe { (*hook)(name, &args) },
         None => Ok(Bson::Null),
     }
 }

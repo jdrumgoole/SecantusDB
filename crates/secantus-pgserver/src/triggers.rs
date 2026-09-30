@@ -190,6 +190,99 @@ impl PgHandler {
         self.insert_type_doc(TRIGGER_COLLECTION, &key, doc)
     }
 
+    /// A trigger's oid, derived from its key so `pg_trigger` and
+    /// `pg_get_triggerdef` agree on it.
+    pub(crate) fn trigger_oid(doc: &Document) -> i64 {
+        Self::index_oid(&format!(
+            "trigger:{}",
+            doc.get_str("_id").unwrap_or_default()
+        )) | 0x0800_0000
+    }
+
+    /// Every trigger's `(oid, pg_get_triggerdef text)`, with the table
+    /// schema-qualified (the non-pretty form).
+    pub(crate) fn trigger_defs(&self) -> Vec<(i64, String)> {
+        self.trigger_docs()
+            .unwrap_or_default()
+            .iter()
+            .map(|t| {
+                let strs = |k: &str| -> Vec<String> {
+                    t.get_array(k)
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                let mut events = strs("events");
+                if events.is_empty() {
+                    events.push(t.get_str("event").unwrap_or_default().to_string());
+                }
+                // ruleutils' order: the TRIGGER_TYPE_* bits, low to high.
+                let update_columns = strs("update_columns");
+                let mut parts = Vec::new();
+                for e in ["INSERT", "DELETE", "UPDATE", "TRUNCATE"] {
+                    if events.iter().any(|x| x == e) {
+                        if e == "UPDATE" && !update_columns.is_empty() {
+                            parts.push(format!("UPDATE OF {}", update_columns.join(", ")));
+                        } else {
+                            parts.push(e.to_string());
+                        }
+                    }
+                }
+                let constraint = t.get_bool("constraint").unwrap_or(false);
+                let mut text = format!(
+                    "CREATE {}TRIGGER {} {} {} ON public.{}",
+                    if constraint { "CONSTRAINT " } else { "" },
+                    t.get_str("name").unwrap_or_default(),
+                    t.get_str("timing").unwrap_or("BEFORE"),
+                    parts.join(" OR "),
+                    t.get_str("table").unwrap_or_default(),
+                );
+                if constraint {
+                    text.push_str(if t.get_bool("deferrable").unwrap_or(false) {
+                        if t.get_bool("initially_deferred").unwrap_or(false) {
+                            " DEFERRABLE INITIALLY DEFERRED"
+                        } else {
+                            " DEFERRABLE INITIALLY IMMEDIATE"
+                        }
+                    } else {
+                        " NOT DEFERRABLE INITIALLY IMMEDIATE"
+                    });
+                }
+                let old_t = t.get_str("transition_old").ok();
+                let new_t = t.get_str("transition_new").ok();
+                if old_t.is_some() || new_t.is_some() {
+                    text.push_str(" REFERENCING");
+                    if let Some(o) = old_t {
+                        text.push_str(&format!(" OLD TABLE AS {o}"));
+                    }
+                    if let Some(n) = new_t {
+                        text.push_str(&format!(" NEW TABLE AS {n}"));
+                    }
+                }
+                text.push_str(&format!(
+                    " FOR EACH {}",
+                    t.get_str("level").unwrap_or("ROW")
+                ));
+                if let Ok(when) = t.get_str("when") {
+                    text.push_str(&format!(" WHEN ({when})"));
+                }
+                let args: Vec<String> = strs("args")
+                    .iter()
+                    .map(|a| secantus_pgplan::scalar::quote_literal(a))
+                    .collect();
+                text.push_str(&format!(
+                    " EXECUTE FUNCTION {}({})",
+                    t.get_str("function").unwrap_or_default(),
+                    args.join(", ")
+                ));
+                (Self::trigger_oid(t), text)
+            })
+            .collect()
+    }
+
     pub(crate) fn drop_trigger(
         &self,
         name: &str,

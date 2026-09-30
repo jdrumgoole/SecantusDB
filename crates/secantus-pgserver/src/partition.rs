@@ -34,6 +34,17 @@ pub(crate) fn parent_of(def: &TableDef) -> Option<&str> {
     def.extra.get_str("partition_of").ok()
 }
 
+/// `pg_get_partkeydef`: the strategy and the key, `LIST (k)`.
+pub(crate) fn partkey_text(def: &TableDef) -> Option<String> {
+    let strategy = match strategy(def) {
+        "range" => "RANGE",
+        "list" => "LIST",
+        "hash" => "HASH",
+        _ => return None,
+    };
+    Some(format!("{strategy} ({})", key_names(def).join(", ")))
+}
+
 /// Is `def` a partitioned table (`PARTITION BY`)?
 pub(crate) fn is_partitioned(def: &TableDef) -> bool {
     def.extra.get_document("partition_by").is_ok()

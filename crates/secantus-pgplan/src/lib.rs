@@ -5510,9 +5510,90 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    /// `(index oid, pg_get_indexdef text)`, published with the catalog.
+    static INDEX_DEFS: std::cell::RefCell<Vec<(i64, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+thread_local! {
+    /// `(trigger oid, pg_get_triggerdef text)`, published with the catalog.
+    static TRIGGER_DEFS: std::cell::RefCell<Vec<(i64, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+thread_local! {
+    /// `(partition oid, parent oid)` for every partition.
+    static PARTITION_PARENTS: std::cell::RefCell<Vec<(i64, i64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+thread_local! {
+    /// `(partitioned table oid, pg_get_partkeydef text)`.
+    static PARTKEY_DEFS: std::cell::RefCell<Vec<(i64, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+thread_local! {
+    /// `(function oid, arguments text, result text)`.
+    static FUNCTION_SIGS: std::cell::RefCell<Vec<(i64, String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Install what `pg_get_function_arguments` / `_result` answer from.
+pub fn set_function_sigs(sigs: Vec<(i64, String, String)>) {
+    FUNCTION_SIGS.with(|d| *d.borrow_mut() = sigs);
+}
+
+/// Install the partition keys `pg_get_partkeydef` answers from.
+pub fn set_partkey_defs(defs: Vec<(i64, String)>) {
+    PARTKEY_DEFS.with(|d| *d.borrow_mut() = defs);
+}
+
+/// Install the partition tree `pg_partition_ancestors` walks.
+pub fn set_partition_parents(pairs: Vec<(i64, i64)>) {
+    PARTITION_PARENTS.with(|p| *p.borrow_mut() = pairs);
+}
+
+/// Install the trigger definitions `pg_get_triggerdef` answers from.
+pub fn set_trigger_defs(defs: Vec<(i64, String)>) {
+    TRIGGER_DEFS.with(|d| *d.borrow_mut() = defs);
+}
+
+/// Install the index definitions `pg_get_indexdef` answers from.
+pub fn set_index_defs(defs: Vec<(i64, String)>) {
+    INDEX_DEFS.with(|d| *d.borrow_mut() = defs);
+}
+
 /// Install the view definitions `pg_get_viewdef` answers from.
 pub fn set_view_defs(defs: Vec<(i64, String, String)>) {
     VIEW_DEFS.with(|d| *d.borrow_mut() = defs);
+}
+
+/// Pretty ruleutils prints a cast's simple operand bare: `(0)::numeric` is
+/// `0::numeric`, `('-1'::integer)::numeric` is `'-1'::integer::numeric`.
+fn unparen_cast_operands(text: &str) -> String {
+    let re =
+        regex::Regex::new(r"\((\d+(?:\.\d+)?|'-?[0-9.]+'::[a-z ]+)\)::").expect("static regex");
+    re.replace_all(text, "$1::").into_owned()
+}
+
+/// Are `text`'s parentheses balanced, so the ones round it belong together?
+fn balanced(text: &str) -> bool {
+    let mut depth = 0i32;
+    for c in text.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
 }
 
 /// Install the constraint definitions `pg_get_constraintdef` answers from.
@@ -5586,7 +5667,7 @@ fn render_index_predicate(node: &pg_query::protobuf::Node, def: &TableDef) -> Op
         }
         N::ColumnRef(_) => column(node),
         N::AExpr(a) if a.kind == pg_query::protobuf::AExprKind::AexprOp as i32 => {
-            let op = match a.name.first()?.node.as_ref()? {
+            let op = match a.name.last()?.node.as_ref()? {
                 N::String(s) => s.sval.clone(),
                 _ => return None,
             };
@@ -5598,9 +5679,31 @@ fn render_index_predicate(node: &pg_query::protobuf::Node, def: &TableDef) -> Op
                 return None;
             };
             let ty = def.column(&col)?.pg_type.clone();
+            // An integer or decimal constant beside a column of a wider
+            // numeric type is coerced, which ruleutils shows as a cast:
+            // `(0)::numeric`, `('-1'::integer)::numeric`.
+            let widened = match ty.as_str() {
+                "numeric" => Some("numeric"),
+                "float8" => Some("double precision"),
+                "float4" => Some("real"),
+                _ => None,
+            };
             let lit = match c.val.as_ref()? {
-                Val::Ival(v) => v.ival.to_string(),
+                Val::Ival(v) => match widened {
+                    Some(t) if v.ival < 0 => format!("('{}'::integer)::{t}", v.ival),
+                    Some(t) => format!("({})::{t}", v.ival),
+                    None if v.ival < 0 => format!("'{}'::integer", v.ival),
+                    None => v.ival.to_string(),
+                },
                 Val::Fval(v) if ty == "numeric" => v.fval.clone(),
+                Val::Fval(v) if matches!(ty.as_str(), "float8" | "float4") => {
+                    let t = widened?;
+                    if v.fval.starts_with('-') {
+                        format!("('{}'::numeric)::{t}", v.fval)
+                    } else {
+                        format!("({})::{t}", v.fval)
+                    }
+                }
                 Val::Boolval(v) => v.boolval.to_string(),
                 Val::Sval(v) => {
                     let cast = match ty.as_str() {
@@ -8322,6 +8425,11 @@ fn srf_from_clause(from: &pg_query::protobuf::Node, params: &[Bson]) -> Result<O
     if colnames.is_empty() && names.len() == 1 && !alias.is_empty() {
         names[0] = alias.clone();
     }
+    // A function whose one column is a named OUT parameter keeps that name
+    // in FROM, whatever the alias: `pg_partition_ancestors(...)` is `relid`.
+    if colnames.is_empty() && names.len() == 1 && name == "pg_partition_ancestors" {
+        names[0] = "relid".into();
+    }
     let plan = Statement::ValuesConstant(ValuesConstant {
         names: names.clone(),
         types: types.clone(),
@@ -8557,6 +8665,36 @@ fn srf_rows(
         if let Some(kind) = non_integer_series_kind(call) {
             return series_rows(name, kind, call, params).map(Some);
         }
+    }
+    // `pg_partition_ancestors(rel)`: the relation, then each parent up to
+    // the root.
+    if name == "pg_partition_ancestors" && !correlated::user_function_named(name) {
+        let [arg] = args(1)?
+            .try_into()
+            .map_err(|_| Error::Internal("one argument".into()))?;
+        let oid = match &arg {
+            Bson::Int32(i) => i64::from(*i),
+            Bson::Int64(i) => *i,
+            Bson::Null => return Ok(Some(one(Vec::new(), "regclass"))),
+            // A numeric string is an oid, as a `regclass` input.
+            Bson::String(t) => match t.trim().parse::<i64>() {
+                Ok(n) => n,
+                Err(_) => resolve_regclass(t)?,
+            },
+            other => regclass_oid(other).unwrap_or(-1),
+        };
+        let mut chain = vec![regclass_value(oid)];
+        let mut at = oid;
+        for _ in 0..64 {
+            let Some(parent) = PARTITION_PARENTS
+                .with(|p| p.borrow().iter().find(|(c, _)| *c == at).map(|(_, p)| *p))
+            else {
+                break;
+            };
+            chain.push(regclass_value(parent));
+            at = parent;
+        }
+        return Ok(Some(one(chain, "regclass")));
     }
     // A user-defined set-returning function: the executor runs it.
     if let Some(u) = correlated::user_function_for(name, &call.args).filter(|u| u.returns_set) {
@@ -8836,10 +8974,21 @@ fn srf_rows(
                 return Ok(Some((columns, types, rows)));
             }
             let value = arrays::strip(&const_value(&call.args[0], params)?);
-            let element = static_type(&call.args[0], &value)
-                .strip_suffix("[]")
-                .map(str::to_owned)
-                .ok_or_else(|| Error::Unsupported("unnest() over a non-array".into()))?;
+            // The argument's declared type names the element; a value with
+            // no static type (a correlated reference's parameter) names it
+            // by what it holds -- and a NULL holds no rows at all.
+            let element = match static_type(&call.args[0], &value).strip_suffix("[]") {
+                Some(e) => e.to_owned(),
+                None => match &value {
+                    Bson::Null => "text".to_string(),
+                    Bson::Array(items) => items
+                        .iter()
+                        .find(|v| **v != Bson::Null)
+                        .map_or("text", inferred_type)
+                        .to_string(),
+                    _ => return Err(Error::Unsupported("unnest() over a non-array".into())),
+                },
+            };
             // A multidimensional array unnests to its LEAVES, in row-major
             // order -- `unnest(ARRAY[[1,2],[3,4]])` is four rows, not two.
             let values = match value {
@@ -13129,6 +13278,35 @@ fn foreign_qualifier(s: &pg_query::protobuf::SelectStmt) -> Option<String> {
             }
         }
     }
+    // A FROM function's arguments can read the enclosing query too:
+    // `ARRAY(SELECT ... FROM unnest(t.opts) x)`.
+    fn function_args(item: &mut pg_query::protobuf::Node, out: &mut Vec<pg_query::protobuf::Node>) {
+        match item.node.as_mut() {
+            Some(N::RangeFunction(rf)) => {
+                for f in &rf.functions {
+                    if let Some(N::List(l)) = f.node.as_ref() {
+                        out.extend(l.items.iter().cloned());
+                    }
+                }
+            }
+            Some(N::JoinExpr(j)) => {
+                for side in [j.larg.as_deref_mut(), j.rarg.as_deref_mut()]
+                    .into_iter()
+                    .flatten()
+                {
+                    function_args(side, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut args = Vec::new();
+    for item in &mut s.from_clause {
+        function_args(item, &mut args);
+    }
+    for a in &mut args {
+        let _ = walk_expr(a, &mut check);
+    }
     found
 }
 
@@ -13147,7 +13325,11 @@ fn collect_from_names(item: &pg_query::protobuf::Node, out: &mut Vec<String>) {
                 out.push(a.aliasname.clone());
             }
         }
-        Some(N::RangeFunction(_)) => {}
+        Some(N::RangeFunction(rf)) => {
+            if let Some(a) = rf.alias.as_ref() {
+                out.push(a.aliasname.clone());
+            }
+        }
         Some(N::JoinExpr(j)) => {
             for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
                 collect_from_names(side, out);
@@ -13972,6 +14154,32 @@ fn plan_select(
     } else {
         plan_select_rest(s, lookup, params)
     };
+    // An aggregate whose WHERE does not lower to a filter (two columns
+    // compared, over a join source above all): the rows are filtered in a
+    // FROM subquery -- a plain select, which evaluates any WHERE per row --
+    // and aggregated outside it, under the same name so every reference
+    // still resolves.
+    let planned = match planned {
+        Err(Error::Unsupported(m))
+            if (!s.group_clause.is_empty() || has_aggregate(s))
+                && s.where_clause.is_some()
+                && !IN_WHERE_SPLIT.with(std::cell::Cell::get) =>
+        {
+            match aggregate_where_as_subquery(s) {
+                Some(rewritten) => {
+                    IN_WHERE_SPLIT.with(|f| f.set(true));
+                    let out = plan_select(&rewritten, lookup, params);
+                    IN_WHERE_SPLIT.with(|f| f.set(false));
+                    out.map_err(|e| match e {
+                        Error::Unsupported(_) => Error::Unsupported(m),
+                        other => other,
+                    })
+                }
+                None => Err(Error::Unsupported(m)),
+            }
+        }
+        other => other,
+    };
     // A grouped query computing over its groups (`n::text ... GROUP BY n`)
     // that the aggregate planner refuses: group in an inner query, compute
     // in an outer one. Not re-entered while planning that rewrite, whose
@@ -13999,6 +14207,70 @@ fn plan_select(
     planned
         .map_err(|e| qualify_undefined_column(e, s))
         .map_err(|e| invalid_from_reference(e, s))
+}
+
+thread_local! {
+    /// Set while an aggregate's WHERE is being planned as a FROM subquery,
+    /// so the rewrite is not applied to itself.
+    static IN_WHERE_SPLIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `SELECT <aggs> FROM r WHERE p ...` as `SELECT <aggs> FROM (SELECT * FROM
+/// r WHERE p) r ...`, for a single plain relation `r`; `None` otherwise.
+fn aggregate_where_as_subquery(
+    s: &pg_query::protobuf::SelectStmt,
+) -> Option<pg_query::protobuf::SelectStmt> {
+    let [item] = s.from_clause.as_slice() else {
+        return None;
+    };
+    let Some(N::RangeVar(r)) = item.node.as_ref() else {
+        return None;
+    };
+    let alias = r
+        .alias
+        .as_ref()
+        .map(|a| a.aliasname.clone())
+        .filter(|a| !a.is_empty())
+        .unwrap_or_else(|| r.relname.clone());
+    let star = pg_query::protobuf::Node {
+        node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+            val: Some(Box::new(pg_query::protobuf::Node {
+                node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+                    fields: vec![pg_query::protobuf::Node {
+                        node: Some(N::AStar(pg_query::protobuf::AStar {})),
+                    }],
+                    location: -1,
+                })),
+            })),
+            location: -1,
+            ..Default::default()
+        }))),
+    };
+    let inner = pg_query::protobuf::SelectStmt {
+        target_list: vec![star],
+        from_clause: s.from_clause.clone(),
+        where_clause: s.where_clause.clone(),
+        limit_option: pg_query::protobuf::LimitOption::Default as i32,
+        op: pg_query::protobuf::SetOperation::SetopNone as i32,
+        ..Default::default()
+    };
+    let mut out = s.clone();
+    out.where_clause = None;
+    out.from_clause = vec![pg_query::protobuf::Node {
+        node: Some(N::RangeSubselect(Box::new(
+            pg_query::protobuf::RangeSubselect {
+                lateral: false,
+                subquery: Some(Box::new(pg_query::protobuf::Node {
+                    node: Some(N::SelectStmt(Box::new(inner))),
+                })),
+                alias: Some(pg_query::protobuf::Alias {
+                    aliasname: alias,
+                    colnames: Vec::new(),
+                }),
+            },
+        ))),
+    }];
+    Some(out)
 }
 
 /// A subquery in FROM naming a table of its ENCLOSING FROM list without
@@ -16365,7 +16637,16 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
         Some(N::FuncCall(f))
             if matches!(
                 func_name(f).as_deref(),
-                Some("pg_get_constraintdef" | "pg_get_viewdef")
+                Some(
+                    "pg_get_constraintdef"
+                        | "pg_get_viewdef"
+                        | "pg_get_indexdef"
+                        | "pg_get_triggerdef"
+                        | "pg_get_partkeydef"
+                        | "pg_get_function_arguments"
+                        | "pg_get_function_identity_arguments"
+                        | "pg_get_function_result"
+                )
             ) =>
         {
             "text".to_string()
@@ -17706,6 +17987,12 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                     || name == "to_regclass"
                     || name == "pg_get_constraintdef"
                     || name == "pg_get_viewdef"
+                    || name == "pg_get_indexdef"
+                    || name == "pg_get_triggerdef"
+                    || name == "pg_get_partkeydef"
+                    || name == "pg_get_function_arguments"
+                    || name == "pg_get_function_identity_arguments"
+                    || name == "pg_get_function_result"
                     || (name.starts_with("has_") && name.ends_with("_privilege"))
                 {
                     let node = rt.val.as_deref().expect("checked");
@@ -19390,6 +19677,28 @@ const CATALOG_RELATIONS: &[(&str, i64)] = &[
     ("pg_range", 3541),
     ("pg_extension", 3079),
     ("pg_authid", 1260),
+    ("pg_trigger", 2620),
+    ("pg_depend", 2608),
+    ("pg_description", 2609),
+    ("pg_inherits", 2611),
+    ("pg_am", 2601),
+    ("pg_collation", 3456),
+    ("pg_policy", 3256),
+    ("pg_rewrite", 2618),
+    ("pg_attrdef", 2604),
+    ("pg_operator", 2617),
+    ("pg_opclass", 2616),
+    ("pg_aggregate", 2600),
+    ("pg_cast", 2605),
+    ("pg_language", 2612),
+    ("pg_tablespace", 1213),
+    ("pg_sequence", 2224),
+    ("pg_statistic_ext", 3381),
+    ("pg_publication", 6104),
+    ("pg_publication_rel", 6106),
+    ("pg_event_trigger", 3466),
+    ("pg_foreign_table", 3118),
+    ("pg_shdescription", 2396),
 ];
 
 /// The display rendering of a regclass value: the relation's name, quoted
@@ -26753,11 +27062,28 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 Bson::Null => return Ok(Bson::Null),
                 other => regclass_oid(&other).unwrap_or(-1),
             };
+            // `pretty` drops the parentheses ruleutils puts round a CHECK's
+            // top-level expression: `CHECK (v > 0)` for `CHECK ((v > 0))`.
+            let pretty = matches!(
+                f.args.get(1).map(|a| const_value(a, params)).transpose()?,
+                Some(Bson::Boolean(true))
+            );
             return Ok(CONSTRAINT_DEFS.with(|d| {
                 d.borrow()
                     .iter()
                     .find(|(o, _)| *o == oid)
-                    .map_or(Bson::Null, |(_, t)| Bson::String(t.clone()))
+                    .map_or(Bson::Null, |(_, t)| {
+                        let text = match t.strip_prefix("CHECK ((").and_then(|r| {
+                            let (body, rest) = r.rsplit_once("))")?;
+                            Some((body, rest))
+                        }) {
+                            Some((body, rest)) if pretty && balanced(body) => {
+                                format!("CHECK ({}){rest}", unparen_cast_operands(body))
+                            }
+                            _ => t.clone(),
+                        };
+                        Bson::String(text)
+                    })
             }));
         }
         // `pg_get_viewdef(view [, pretty])`: the view's definition, by oid,
@@ -26782,6 +27108,135 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                     .iter()
                     .find(|(o, n, _)| Some(*o) == oid || by_name.as_deref() == Some(n.as_str()))
                     .map_or(Bson::Null, |(_, _, t)| Bson::String(t.clone()))
+            }));
+        }
+        // `pg_get_function_arguments(fn)` / `_identity_arguments` / `_result`:
+        // a function's signature as `\df` prints it.
+        if let Some(which) = func_name(f).as_deref().and_then(|n| match n {
+            "pg_get_function_arguments" | "pg_get_function_identity_arguments" => Some(1),
+            "pg_get_function_result" => Some(2),
+            _ => None,
+        }) {
+            if !f.args.is_empty() {
+                let oid = match const_value(&f.args[0], params)? {
+                    Bson::Int32(i) => i64::from(i),
+                    Bson::Int64(i) => i,
+                    Bson::Null => return Ok(Bson::Null),
+                    Bson::String(t) => t.trim().parse().unwrap_or(-1),
+                    other => regobj::from_bson(&other).map_or(-1, |(_, o)| o),
+                };
+                return Ok(FUNCTION_SIGS.with(|d| {
+                    d.borrow()
+                        .iter()
+                        .find(|(o, _, _)| *o == oid)
+                        .map_or(Bson::Null, |(_, a, r)| {
+                            Bson::String(if which == 1 { a.clone() } else { r.clone() })
+                        })
+                }));
+            }
+        }
+        // `pg_get_partkeydef(table)`: `LIST (k)`, `RANGE (a, b)`; NULL for a
+        // table that is not partitioned.
+        if func_name(f).as_deref() == Some("pg_get_partkeydef")
+            && !f.args.is_empty()
+            && !correlated::user_function_named("pg_get_partkeydef")
+        {
+            let oid = match const_value(&f.args[0], params)? {
+                Bson::Int32(i) => i64::from(i),
+                Bson::Int64(i) => i,
+                Bson::Null => return Ok(Bson::Null),
+                Bson::String(t) => t.trim().parse().unwrap_or(-1),
+                other => regclass_oid(&other).unwrap_or(-1),
+            };
+            return Ok(PARTKEY_DEFS.with(|d| {
+                d.borrow()
+                    .iter()
+                    .find(|(o, _)| *o == oid)
+                    .map_or(Bson::Null, |(_, t)| Bson::String(t.clone()))
+            }));
+        }
+        // `pg_get_triggerdef(trigger [, pretty])`: the CREATE TRIGGER, its
+        // table schema-qualified unless `pretty`.
+        if func_name(f).as_deref() == Some("pg_get_triggerdef")
+            && !f.args.is_empty()
+            && !correlated::user_function_named("pg_get_triggerdef")
+        {
+            let oid = match const_value(&f.args[0], params)? {
+                Bson::Int32(i) => i64::from(i),
+                Bson::Int64(i) => i,
+                Bson::Null => return Ok(Bson::Null),
+                _ => -1,
+            };
+            let pretty = matches!(
+                f.args.get(1).map(|a| const_value(a, params)).transpose()?,
+                Some(Bson::Boolean(true))
+            );
+            return Ok(TRIGGER_DEFS.with(|d| {
+                d.borrow()
+                    .iter()
+                    .find(|(o, _)| *o == oid)
+                    .map_or(Bson::Null, |(_, t)| {
+                        Bson::String(if pretty {
+                            t.replacen(" ON public.", " ON ", 1)
+                        } else {
+                            t.clone()
+                        })
+                    })
+            }));
+        }
+        // `pg_get_indexdef(index [, column, pretty])`: the CREATE INDEX, its
+        // table schema-qualified unless `pretty`; with a column number, that
+        // key column alone (without its ordering), or '' past the last.
+        if func_name(f).as_deref() == Some("pg_get_indexdef")
+            && !f.args.is_empty()
+            && !correlated::user_function_named("pg_get_indexdef")
+        {
+            let arg = const_value(&f.args[0], params)?;
+            let oid = match &arg {
+                Bson::Int32(i) => i64::from(*i),
+                Bson::Int64(i) => *i,
+                Bson::Null => return Ok(Bson::Null),
+                other => regclass_oid(other).unwrap_or(-1),
+            };
+            let column = match f.args.get(1).map(|a| const_value(a, params)).transpose()? {
+                Some(Bson::Int32(i)) => i64::from(i),
+                Some(Bson::Int64(i)) => i,
+                _ => 0,
+            };
+            let pretty = matches!(
+                f.args.get(2).map(|a| const_value(a, params)).transpose()?,
+                Some(Bson::Boolean(true))
+            );
+            let Some(def) = INDEX_DEFS.with(|d| {
+                d.borrow()
+                    .iter()
+                    .find(|(o, _)| *o == oid)
+                    .map(|(_, t)| t.clone())
+            }) else {
+                return Ok(Bson::Null);
+            };
+            if column > 0 {
+                let keys = def
+                    .rfind('(')
+                    .and_then(|open| def[open + 1..].split_once(')').map(|(k, _)| k.to_string()))
+                    .unwrap_or_default();
+                let key = keys
+                    .split(", ")
+                    .nth(usize::try_from(column - 1).unwrap_or(usize::MAX))
+                    .map(|k| {
+                        k.trim_end_matches(" NULLS FIRST")
+                            .trim_end_matches(" NULLS LAST")
+                            .trim_end_matches(" DESC")
+                            .trim_end_matches(" ASC")
+                            .to_string()
+                    })
+                    .unwrap_or_default();
+                return Ok(Bson::String(key));
+            }
+            return Ok(Bson::String(if pretty {
+                def.replacen(" ON public.", " ON ", 1)
+            } else {
+                def
             }));
         }
         // `to_regclass(text)`: the relation's regclass, or NULL when there is
@@ -27915,9 +28370,11 @@ fn string_node(s: &str) -> pg_query::protobuf::Node {
     }
 }
 
+/// An operator's name: the LAST part of `OPERATOR(pg_catalog.~)`, whose
+/// first part is the schema.
 fn operator_name(e: &AExpr) -> Result<&str> {
     e.name
-        .first()
+        .last()
         .and_then(|n| n.node.as_ref())
         .and_then(|n| match n {
             N::String(s) => Some(s.sval.as_str()),

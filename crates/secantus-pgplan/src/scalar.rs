@@ -72,6 +72,21 @@ const CATALOG_NAMES: &[&str] = &[
     "col_description",
     "shobj_description",
     "pg_get_expr",
+    "pg_table_is_visible",
+    "pg_relation_is_publishable",
+    "pg_get_userbyid",
+    "pg_type_is_visible",
+    "pg_function_is_visible",
+    "pg_operator_is_visible",
+    "pg_opclass_is_visible",
+    "pg_opfamily_is_visible",
+    "pg_collation_is_visible",
+    "pg_conversion_is_visible",
+    "pg_statistics_obj_is_visible",
+    "pg_ts_config_is_visible",
+    "pg_ts_dict_is_visible",
+    "pg_ts_parser_is_visible",
+    "pg_ts_template_is_visible",
 ];
 
 /// The extension a function belongs to, when that extension's type is
@@ -1481,6 +1496,27 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         // server keeps `adbin` as the rendered TEXT already (see the
         // `pg_attrdef` rows), so it hands the first argument straight back.
         "pg_get_expr" => Ok(args.first().cloned().unwrap_or(Bson::Null)),
+        // Every object lives on the one search path (`public`, then
+        // `pg_catalog`), so any object is visible by its bare name.
+        // Every table is a regular, permanent one or a view; a view (or a
+        // missing oid) is not publishable, which only the catalog can tell,
+        // and psql's publication footer asks it about tables.
+        "pg_get_userbyid" => Ok(match args.first() {
+            None | Some(Bson::Null) => Bson::Null,
+            Some(Bson::Int32(i)) => Bson::String(crate::regobj::role_name(i64::from(*i))),
+            Some(Bson::Int64(i)) => Bson::String(crate::regobj::role_name(*i)),
+            Some(other) => Bson::String(crate::regobj::role_name(
+                crate::value_text(other).trim().parse().unwrap_or(-1),
+            )),
+        }),
+        "pg_relation_is_publishable" => Ok(match args.first() {
+            None | Some(Bson::Null) => Bson::Null,
+            Some(_) => Bson::Boolean(true),
+        }),
+        n if n.starts_with("pg_") && n.ends_with("_is_visible") => Ok(match args.first() {
+            None | Some(Bson::Null) => Bson::Null,
+            Some(_) => Bson::Boolean(true),
+        }),
         "pg_size_pretty" => size_pretty(&args[0]),
         "pg_size_bytes" => size_bytes(&crate::value_text(&args[0])),
         "pg_column_size" => Ok(column_size(&args[0])),
@@ -1902,7 +1938,7 @@ fn pg_format(fmt: &str, args: &[Bson]) -> Result<String> {
 
 /// PostgreSQL's `quote_literal`: single quotes doubled, and a backslash
 /// forces the `E'...'` form with the backslashes doubled too.
-pub(crate) fn quote_literal(text: &str) -> String {
+pub fn quote_literal(text: &str) -> String {
     let body = text.replace('\'', "''");
     if body.contains('\\') {
         format!("E'{}'", body.replace('\\', "\\\\"))
@@ -2067,6 +2103,9 @@ pub fn static_result_type(name: &str) -> &'static str {
         "trim_scale" => "numeric",
         "numeric_send" => "bytea",
         "starts_with" => "bool",
+        n if n.starts_with("pg_") && n.ends_with("_is_visible") => "bool",
+        "pg_relation_is_publishable" => "bool",
+        "pg_get_userbyid" => "name",
         "to_number" => "numeric",
         "jsonb_path_exists"
         | "jsonb_path_match"
