@@ -737,7 +737,7 @@ impl PgHandler {
                     .map(|c| c.name.clone())
                     .collect();
                 if !pk.is_empty() {
-                    keys.push((format!("{}_pkey", p.name), pk));
+                    keys.push((crate::pk_constraint_name(&p), pk));
                 }
                 for u in p.unique_constraints.iter().filter(|u| !u.exclusion) {
                     keys.push((u.name.clone(), u.columns.clone()));

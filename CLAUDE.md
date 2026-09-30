@@ -547,6 +547,23 @@ one request path:
       `overloads.sql` was written over the existing user-function corpus of
       that name and only the `M` in `git status` gave it away.
 
+    **Batch 13 (2026-09-30)** fixed two privilege bugs: a column GRANT acted
+    as a table GRANT, and a recreated table inherited a dropped one's grants.
+    It also added procedures, `ALTER FUNCTION`, every `ALTER ... RENAME`,
+    and PostgreSQL's own relations in `pg_class` / `pg_attribute`. Rules
+    from that work:
+
+    - **Catalog state the Python server also keeps goes in the Python
+      server's collection and shape.** Column grants, relation ACLs and
+      routine parameter modes each had a Python layout already
+      (`__sql_column_grants__`, `__sql_relation_acl__`, `param_modes`); the
+      first Rust version invented its own and had to be rewritten. Grep
+      `src/secantus/sql/catalog.py` before adding a field.
+    - **Dump reference catalogs with `oid < 16384`.** The shared reference
+      database holds other sessions' tables, whose TOAST relations sit in
+      `pg_toast`; a `pg_class` dump without the filter shipped 42 of them as
+      "system" relations.
+
     **What remains refused** (re-measured 2026-09-30, after batch 11): no
     statement the earlier surveys listed. Batch 11 landed `CREATE CAST` /
     `COLLATION` / `RULE` / `EVENT TRIGGER`, the foreign-data statements

@@ -336,7 +336,14 @@ impl<'a> Printer<'a> {
             N::BoolExpr(_) | N::NullTest(_) | N::BooleanTest(_) => "bool".into(),
             N::FuncCall(f) => {
                 let name = crate::func_name(f)?;
-                let (_, result) = function_sig(&name)?;
+                let Some((_, result)) = function_sig(&name) else {
+                    let types = f
+                        .args
+                        .iter()
+                        .map(|a| self.typ(a))
+                        .collect::<Option<Vec<String>>>()?;
+                    return crate::funcsig::selected_result_type(&name, &types);
+                };
                 match result {
                     Some(r) => r.to_string(),
                     None => match name.as_str() {
@@ -1081,7 +1088,9 @@ impl<'a> Printer<'a> {
         if parts.len() > 1 && parts[0] != "pg_catalog" {
             return None;
         }
-        let (arg_type, _) = function_sig(&name)?;
+        let Some((arg_type, _)) = function_sig(&name) else {
+            return self.call_by_signature(f, &name);
+        };
         self.buf.push_str(&q(&name));
         self.buf.push('(');
         if f.agg_star {
@@ -1134,6 +1143,33 @@ impl<'a> Printer<'a> {
             self.buf.push_str(" OVER ");
             self.window_spec(over)?;
         }
+        Some(())
+    }
+
+    /// A built-in outside `function_sig`'s table, printed when one of its
+    /// `pg_proc` overloads declares exactly the arguments' types -- so no
+    /// cast is implied -- as `int4range(a, (a + 1))`.
+    fn call_by_signature(&mut self, f: &pg_query::protobuf::FuncCall, name: &str) -> Option<()> {
+        if f.agg_star || f.agg_distinct || f.over.is_some() {
+            return None;
+        }
+        let types = f
+            .args
+            .iter()
+            .map(|a| self.typ(a))
+            .collect::<Option<Vec<String>>>()?;
+        if !crate::funcsig::has_exact(name, &types) {
+            return None;
+        }
+        self.buf.push_str(&q(name));
+        self.buf.push('(');
+        for (i, a) in f.args.iter().enumerate() {
+            if i > 0 {
+                self.buf.push_str(", ");
+            }
+            self.expr(a)?;
+        }
+        self.buf.push(')');
         Some(())
     }
 

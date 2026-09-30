@@ -600,12 +600,15 @@ remain open:
       has and, since batch 11, CALLABLE where the C function has a SQL form
       here -- the operator behind it (`int4pl` is `$1 + $2`) or a built-in
       over the same C function (`textlen` is `length`); corpus
-      `internal_functions`. Left: a wrapper over any other C function is a
-      catalog row that answers 42883 when called (a wrapper declared over the
-      wrong C signature crashed a PG 16.15 backend, so calling one blind is
-      not imitated), and the `CREATE TYPE` options other than `input` /
-      `output` / `like` (`internallength`, `category`, `receive`, ...) are
-      0A000 rather than applied.
+      `internal_functions`. Batch 13 added OUT / INOUT parameters (and
+      CREATE FUNCTION without RETURNS), `CREATE / CALL / DROP PROCEDURE`,
+      `ALTER FUNCTION / PROCEDURE / ROUTINE` in every form, and function
+      schemas (corpora `procedures`, `alter_routines`). Left: a wrapper over
+      any other C function is a catalog row that answers 42883 when called
+      (a wrapper declared over the wrong C signature crashed a PG 16.15
+      backend, so calling one blind is not imitated), and a procedure's
+      `COMMIT` / `ROLLBACK` is 2D000 (transaction control inside a CALL is
+      not implemented).
 - [ ] **OPEN — RUST pgserver triggers: the cross-server gap (2026-09-30).**
       `INSTEAD OF`, constraint triggers (deferred firing, `SET CONSTRAINTS`)
       and transition tables landed in batch 9 (corpora `instead_of`,
@@ -667,9 +670,6 @@ remain open:
         message names. A name mentioned twice may point at the wrong
         occurrence. An error inside a function body carries no internal
         position.
-      - `pg_class` lists no `pg_catalog` or `information_schema` relation.
-        (`information_schema.tables` / `.columns` do since batch 12 -- all
-        208 relations and 2,005 columns, `infoschema_system` corpus.)
       - **Harness, not server:** `tests/test_tmp_retention_guard.py::
         test_default_tmp_retention_policy_is_allowed` timed out ONCE in three
         quiet full-suite runs on 2026-09-30: its nested `pytest --co -q
@@ -687,18 +687,6 @@ remain open:
       `collations`, `user_casts`, `views_ruleutils`, `expr_ruleutils`,
       `internal_functions`, `catalog_b11`, `pgcrypto_ciphers`. Left, each
       measured:
-      - **Rules** (rewritten as PostgreSQL's rewriter does since batch 12:
-        `secantus-pgplan/src/rule_rewrite.rs`) refuse only `ON SELECT` rules
-        (turning a table into a view), and a statement shape the rewrite
-        cannot join to its source (a multi-row VALUES action, a set-operation
-        action SELECT, an INSERT with `DEFAULT` inside VALUES) answers 0A000.
-      - **Event triggers**: `table_rewrite` never fires, and only a
-        top-level DDL command fires them (DDL run inside a trigger function
-        does not). `pg_event_trigger_ddl_commands()` reports CREATE / ALTER
-        TABLE, CREATE INDEX / VIEW / SEQUENCE / TYPE / FUNCTION and no rows
-        for other commands, and has no `command` column;
-        `pg_event_trigger_dropped_objects()` reports a function's (and a few
-        other objects') `objid` as 0.
       - **Foreign data**: no FDW handler can exist here, so a foreign table
         is never readable or writable (PostgreSQL's own answer for a
         handler-less wrapper); `postgres_fdw` / `file_fdw` are not available,
@@ -713,12 +701,16 @@ remain open:
         wrap-column form of `pg_get_viewdef` prints the pretty form without
         its wrapping rule.
       - **Collations**: `pg_collation` lists only `und-x-icu` / `en-x-icu` of
-        PostgreSQL's hundreds of ICU built-ins; `pg_typeof('x' COLLATE "C")`
-        is `text` where PostgreSQL says `unknown`; a PRIMARY KEY under a
-        nondeterministic collation is not case-insensitive.
-      - **`relacl`** is NULL until the first GRANT, and after every grant is
-        revoked again (PostgreSQL keeps the owner's entry); `attacl` is not
-        rendered.
+        PostgreSQL's hundreds of ICU built-ins, deliberately: ordering by a
+        locale needs ICU's CLDR data, which this server does not carry, so
+        listing `de-x-icu` would advertise an order it cannot produce. (A
+        PRIMARY KEY / UNIQUE constraint and `count(DISTINCT)` under a
+        nondeterministic collation compare by the collation's key since
+        batch 13 -- `nondeterministic_keys` corpus.) Left: a collation carried
+        out of a derived table by `COLLATE` inside its VALUES (`select
+        count(distinct k) from (values ('a' collate ci), ('A')) v(k)`) is not
+        tracked through the derived column, so that count is 2 where
+        PostgreSQL's is 1; a table column's collation is.
       - **pgcrypto**: Blowfish and CAST5 PGP messages are verified against
         GnuPG only -- both reference servers' OpenSSL 3 builds refuse them.
 - [ ] **OPEN — RUST pgserver: residuals of the wide-`numeric` slice
@@ -4290,6 +4282,10 @@ all match, and so do CREATE INDEX / VIEW and their error surface. What is open:
       of its tests are blocked on a number, not a bug.
 - [ ] **`getColumnPrivileges` on a SYSTEM catalog needs TWO things, and the
       bigger one is that `pg_class` does not self-describe.** Probed 2026-09-28.
+      **The RUST server has both since batch 13** -- `pg_class` / `pg_attribute`
+      list PostgreSQL 15's own relations and columns (`catalog_system` corpus)
+      and `attacl` renders column grants (`column_privileges`); what follows
+      describes the Python server.
       pgjdbc's `columnPrivileges` asks for `getColumnPrivileges(null, null,
       'pg_statistic', null)` and expects at least one row.
       1. **`pg_class` lists no system catalogs at all**: zero `pg_%` rows in an
@@ -6988,50 +6984,6 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
   day validation. STILL OPEN: a wide/BC `timestamptz` is not rendered with its
   session-tz offset (`infinity` is correct for it), and the clock-dependent
   input keywords `now` / `today` / `tomorrow` / `yesterday` are not handled.
-- [ ] **OPEN — RUST pgserver: what CREATE INDEX / CREATE VIEW still refuse
-      (landed 2026-09-29).** `ddl.sql` 7 divergences of 41 -> 0; the new
-      `indexes.sql` is 2 of 48 and `views.sql` 2 of 44, every one a refusal
-      by name:
-
-      * **An index over an EXPRESSION** (`create index on t (lower(b))`),
-        a non-default `NULLS FIRST/LAST`, an operator class, a `COLLATE`, and
-        the gin / gist / brin / spgist access methods. A non-unique one of
-        these changes no answer, so accepting it as metadata only is the cheap
-        path; a UNIQUE expression index enforces, and needs the hidden-field
-        scheme the Python server uses (`ExprIndex`).
-      * **Writing THROUGH a view** (`insert into v ...`): PostgreSQL's
-        auto-updatable views (one table, no aggregates / DISTINCT / LIMIT /
-        set operations, plain column targets) plus `WITH CHECK OPTION`.
-        Refused as `0A000 INSERT into a view`; the check option is stored.
-      * **A view breaks on `ALTER TABLE ... RENAME COLUMN`** of a column it
-        reads: the definition is stored as TEXT (the shared on-disk shape),
-        where PostgreSQL binds by attnum. Not probed against PostgreSQL yet.
-      * `ALTER TABLE ADD CONSTRAINT UNIQUE` landed in batch 9. A partial-index
-        `ON CONFLICT (v) WHERE ...` arbiter is still refused (0A000, re-probed
-        2026-09-30).
-
-      **Two things worth not re-deriving.** A unique index is built with a
-      partial filter excluding NULL from every key column, which is how SQL's
-      "NULLs are distinct" survives a storage unique index that collides them
-      -- the same trick the UNIQUE constraint's index already used -- and it
-      records `sqlNullsDistinct` so `pg_indexes` does not render that filter
-      as the user's WHERE. And a violation now names the INDEX: before, the
-      23505 path guessed `<table>_<cols>_key` from the columns.
-
-      **What ALTER still refuses, and why** (carried over from the DDL entry
-      this replaced), updated 2026-09-30: `ALTER COLUMN TYPE ... USING`, `ADD
-      UNIQUE / PRIMARY KEY / FOREIGN KEY` and `ADD COLUMN` with inline
-      constraints landed in batch 9; `ADD COLUMN ... serial` (a sequence built
-      over the existing rows) is still refused by name.
-
-      **One rule there was measured rather than assumed, and it is easy to get
-      backwards.** `ALTER COLUMN TYPE` is allowed exactly where an ASSIGNMENT
-      cast exists, which is a property of the TYPES and not of the values:
-      `text -> int` is `42804` even when every value is a digit string. The
-      matrix (31 pairs on 14.24) is: to a STRING type always; within the
-      numeric family; within the date/time family; `json` and `jsonb`; a type
-      to itself. Everything else needs `USING`.
-
 - [ ] **OPEN — RUST pgserver: correlated subqueries landed (2026-09-29);
       what is left.** `subqueries.sql` 5 of 50 -> 0 (53 lines now), `joins.sql`
       0 of 38, and the new `correlated.sql` 1 of 24. A correlated subquery
@@ -7042,9 +6994,6 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
       the select list, ORDER BY, CASE, an UPDATE's SET and an UPDATE / DELETE
       WHERE (which gained a per-row RESIDUAL for this).
 
-      * **Left: correlation through an AGGREGATE** -- `having count(*) =
-        (select ... where x.dept_id = min(d.id))` answers `0A000 function
-        min() is not supported yet`, which is false.
       * **Cost**: O(distinct outer values) plans and scans. PostgreSQL turns
         EXISTS / IN into a semi-join; doing that here (the general JOIN
         planner now exists) is the performance follow-up. Not measured.

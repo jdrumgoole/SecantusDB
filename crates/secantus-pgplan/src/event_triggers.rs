@@ -2,6 +2,7 @@
 //! PostgreSQL's `evtcache` / `event_trigger.c` validate them; the server
 //! stores and fires them.
 
+use bson::Bson;
 use pg_query::protobuf::node::Node as N;
 
 use crate::{Error, Result, Statement};
@@ -270,6 +271,55 @@ pub(crate) fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
     })
 }
 
+thread_local! {
+    /// The event whose trigger functions are running, set by the executor.
+    static CONTEXT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+    /// The relation a `table_rewrite` event is rewriting, and why.
+    static REWRITE: std::cell::Cell<Option<(i64, i32)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Install the event whose trigger functions run next (`None` after).
+pub fn set_context(event: Option<&'static str>) {
+    CONTEXT.with(|c| c.set(event));
+}
+
+/// Install the relation a `table_rewrite` trigger sees, and the reason
+/// (`AT_REWRITE_*`: 1 persistence, 2 default value, 4 column rewrite, 8
+/// access method).
+pub fn set_rewrite(rewrite: Option<(i64, i32)>) {
+    REWRITE.with(|r| r.set(rewrite));
+}
+
+fn outside(function: &str, event: &str) -> Error {
+    Error::Sqlstate(
+        "39P03",
+        if event == "ddl_command_end" {
+            format!("{function}() can only be called in an event trigger function")
+        } else {
+            format!("{function}() can only be called in a {event} event trigger function")
+        },
+    )
+}
+
+/// `pg_event_trigger_table_rewrite_oid()` / `_reason()`.
+pub(crate) fn rewrite_function(name: &str) -> Option<Result<Bson>> {
+    let which = match name {
+        "pg_event_trigger_table_rewrite_oid" => 0,
+        "pg_event_trigger_table_rewrite_reason" => 1,
+        _ => return None,
+    };
+    Some(match REWRITE.with(std::cell::Cell::get) {
+        Some((oid, reason)) if CONTEXT.with(std::cell::Cell::get) == Some("table_rewrite") => {
+            Ok(if which == 0 {
+                crate::regclass_value(oid)
+            } else {
+                Bson::Int32(reason)
+            })
+        }
+        _ => Err(outside(name, "table_rewrite")),
+    })
+}
+
 /// The functions an event trigger's body reads, served by the server as
 /// relations of the same name.
 pub const SOURCES: [&str; 2] = [
@@ -278,7 +328,7 @@ pub const SOURCES: [&str; 2] = [
 ];
 
 /// The source relation `n` names, when it is a call to one of `SOURCES`.
-fn source_of(n: &pg_query::protobuf::Node) -> Option<pg_query::protobuf::Node> {
+fn source_of(n: &pg_query::protobuf::Node) -> Option<Result<pg_query::protobuf::Node>> {
     let Some(N::RangeFunction(rf)) = n.node.as_ref() else {
         return None;
     };
@@ -295,7 +345,16 @@ fn source_of(n: &pg_query::protobuf::Node) -> Option<pg_query::protobuf::Node> {
     if !SOURCES.contains(&name.as_str()) || !f.args.is_empty() {
         return None;
     }
-    Some(pg_query::protobuf::Node {
+    // Only inside the event that fills it (`sql_drop`, `ddl_command_end`).
+    let event = if name == "pg_event_trigger_dropped_objects" {
+        "sql_drop"
+    } else {
+        "ddl_command_end"
+    };
+    if CONTEXT.with(std::cell::Cell::get) != Some(event) {
+        return Some(Err(outside(&name, event)));
+    }
+    Some(Ok(pg_query::protobuf::Node {
         node: Some(N::RangeVar(pg_query::protobuf::RangeVar {
             relname: name,
             inh: true,
@@ -303,17 +362,17 @@ fn source_of(n: &pg_query::protobuf::Node) -> Option<pg_query::protobuf::Node> {
             alias: rf.alias.clone(),
             ..Default::default()
         })),
-    })
+    }))
 }
 
 /// Turn `FROM pg_event_trigger_dropped_objects()` (and its sibling) into a
 /// read of the relation the server fills while an event trigger runs.
-pub(crate) fn rewrite_sources(sql: &str, node: &mut pg_query::protobuf::Node) {
+pub(crate) fn rewrite_sources(sql: &str, node: &mut pg_query::protobuf::Node) -> Result<()> {
     if !sql.to_ascii_lowercase().contains("pg_event_trigger_") {
-        return;
+        return Ok(());
     }
     let Some(root) = node.node.as_mut() else {
-        return;
+        return Ok(());
     };
     for _ in 0..1_000 {
         let mut replaced = false;
@@ -333,7 +392,7 @@ pub(crate) fn rewrite_sources(sql: &str, node: &mut pg_query::protobuf::Node) {
                 };
                 for slot in slots {
                     if let Some(new) = source_of(&*slot) {
-                        *slot = new;
+                        *slot = new?;
                         replaced = true;
                     }
                 }
@@ -343,7 +402,8 @@ pub(crate) fn rewrite_sources(sql: &str, node: &mut pg_query::protobuf::Node) {
             }
         }
         if !replaced {
-            return;
+            return Ok(());
         }
     }
+    Ok(())
 }

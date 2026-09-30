@@ -116,8 +116,33 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
             let name = name.rsplit('.').next()?;
             pos(toks[ident_at(name)?].start)
         }
+        // A procedure called in an expression: at its name.
+        "42809" if m.ends_with(" is a procedure") => {
+            let name = m.split('(').next()?.rsplit('.').next()?;
+            let i = toks.iter().enumerate().position(|(i, t)| {
+                unquote_ident(t.text) == name && toks.get(i + 1).is_some_and(|n| n.text == "(")
+            })?;
+            pos(toks[i].start)
+        }
+        // `CALL f()` over a FUNCTION: at the name, as a missing procedure.
+        "42809" if m.ends_with(" is not a procedure") => {
+            if !toks
+                .first()
+                .is_some_and(|t| t.text.eq_ignore_ascii_case("call"))
+            {
+                return None;
+            }
+            let name = m.split('(').next()?.rsplit('.').next()?;
+            let i = toks.iter().enumerate().position(|(i, t)| {
+                unquote_ident(t.text) == name && toks.get(i + 1).is_some_and(|n| n.text == "(")
+            })?;
+            pos(toks[i].start)
+        }
         "42883" => {
-            if let Some(call) = m.strip_prefix("function ") {
+            if let Some(call) = m
+                .strip_prefix("function ")
+                .or_else(|| m.strip_prefix("procedure "))
+            {
                 // A function a DROP / ALTER / COMMENT names is looked up
                 // without a parse position.
                 if toks.first().is_some_and(|t| {

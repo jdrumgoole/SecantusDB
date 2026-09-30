@@ -3934,7 +3934,10 @@ def test_an_enum_created_by_one_server_is_the_other_servers_too(home: Path) -> N
 
     with _Server(home) as server, server.connect() as conn:
         cur = conn.cursor()
-        cur.execute("select typname, oid from pg_type where oid >= 65000 order by oid")
+        # The enums themselves; each also has an array type (`_rustmood`).
+        cur.execute(
+            "select typname, oid from pg_type where oid >= 65000 and typtype = 'e' order by oid"
+        )
         rows = cur.fetchall()
         assert rows == [("rustmood", rust_oid), ("pymood", rust_oid + 1)]
 
@@ -15031,3 +15034,39 @@ def test_latin1_binary_text_arrays_and_untranslatable_names(home: Path) -> None:
         assert c.execute('SELECT 1 AS U&"\\00E9"').description[0].name == "é"
         cur = c.execute("SELECT '{{a,b},{c,\"d e\"}}'::varchar[]")
         assert cur.fetchone() == ([["a", "b"], ["c", "d e"]],)
+
+
+def test_column_grants_are_shared_with_the_python_server(home: Path) -> None:
+    """Grants live in the shared catalog, in the Python server's own shape.
+
+    A column grant (`GRANT SELECT (v)`) is a row of `__sql_column_grants__`
+    and a touched ACL a row of `__sql_relation_acl__`, so either server reads
+    what the other wrote: the Python server reports the same `relacl` and
+    `attacl` for a store the Rust server granted on. A column grant used to be
+    recorded as a TABLE grant, which let the grantee read every column.
+    """
+    with _Server(home) as server, server.connect() as c:
+        c.execute("create role cg_r")
+        c.execute("create table cg_t (id int, v text)")
+        c.execute("grant select (v) on cg_t to cg_r")
+        c.execute("grant select on cg_t to cg_r")
+        c.execute("revoke select on cg_t from cg_r")
+        c.execute("grant select (v) on cg_t to cg_r")
+        c.execute("set role cg_r")
+        assert c.execute("select v from cg_t").fetchall() == []
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            c.execute("select id from cg_t")
+        c.execute("reset role")
+        rust_acl = c.execute(
+            "select relacl::text, (select attacl::text from pg_attribute"
+            " where attrelid = 'cg_t'::regclass and attname = 'v')"
+            " from pg_class where relname = 'cg_t'"
+        ).fetchone()
+    owner = rust_acl[0].strip("{}").split("=")[0]
+    assert rust_acl == (f"{{{owner}=arwdDxt/{owner}}}", f"{{cg_r=r/{owner}}}")
+    python_grants = _python_sql(
+        home,
+        "select grantee, privilege_type from information_schema.column_privileges"
+        " where table_name = 'cg_t' and grantee = 'cg_r'",
+    )
+    assert python_grants == [("cg_r", "SELECT")]

@@ -80,6 +80,8 @@ impl PgHandler {
                         arg_types: &[],
                         trigger: None,
                         returns_set: false,
+                        out_params: &[],
+                        procedure: false,
                     },
                     &crate::PlHost { h: self },
                 )
