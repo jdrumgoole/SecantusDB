@@ -97,6 +97,10 @@ pub struct TriggerData {
 /// One call.
 pub struct Invocation<'a> {
     pub args: &'a [Bson],
+    /// The parameters' declared types, from the catalog. The parsed function
+    /// loses an ARRAY parameter's brackets (`int4[]` reads as `int4`), so
+    /// these win over what the parse says.
+    pub arg_types: &'a [String],
     pub trigger: Option<TriggerData>,
     pub returns_set: bool,
 }
@@ -422,11 +426,14 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
         if arg >= inv.args.len() {
             break;
         }
-        if let Datum::Var { value, name, .. } = d {
+        if let Datum::Var { value, name, ty } = d {
             if name == "found" {
                 continue;
             }
             *value = inv.args[arg].clone();
+            if let Some(declared) = inv.arg_types.get(arg) {
+                *ty = canonical_type(declared);
+            }
             arg += 1;
         }
     }

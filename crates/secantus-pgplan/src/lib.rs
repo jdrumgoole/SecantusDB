@@ -31,6 +31,7 @@ pub mod geometry;
 pub mod hstore;
 pub mod joins;
 pub mod partitions;
+pub mod instead_of;
 pub use correlated::set_user_functions;
 pub use correlated::{
     with_correlated_runner, with_function_hook, with_sequence_hook, FnResult, UserFn,
@@ -302,6 +303,14 @@ pub enum Statement {
     /// a NO-OP on an existing table rather than the `42P07` a bare one gets.
     CreateTable(TableDef, bool),
     Insert(Insert),
+    /// `SET CONSTRAINTS { ALL | name, ... } { DEFERRED | IMMEDIATE }`; an
+    /// empty `names` is ALL.
+    SetConstraints {
+        names: Vec<String>,
+        deferred: bool,
+    },
+    /// A write to a view handed to its `INSTEAD OF` triggers.
+    InsteadOf(instead_of::InsteadOf),
     /// `ALTER TABLE <t> <action>, ...`. PostgreSQL applies the actions in
     /// order and the whole statement is one transaction, so a later one
     /// failing undoes the earlier ones.
@@ -1926,6 +1935,8 @@ pub struct UserFunctionDef {
     pub body: String,
     pub language: String,
     pub volatility: String,
+    /// The last parameter is `VARIADIC`.
+    pub variadic: bool,
 }
 
 /// A trigger as CREATE TRIGGER declares it.
@@ -1947,6 +1958,13 @@ pub struct TriggerDef {
     pub args: Vec<String>,
     /// The `WHEN (...)` condition, deparsed.
     pub when: Option<String>,
+    /// `CREATE CONSTRAINT TRIGGER`, and its deferral.
+    pub constraint: bool,
+    pub deferrable: bool,
+    pub initially_deferred: bool,
+    /// `REFERENCING NEW TABLE AS n` / `OLD TABLE AS o`.
+    pub transition_new: Option<String>,
+    pub transition_old: Option<String>,
 }
 
 /// `EXPLAIN`'s options, as PostgreSQL defaults them.
@@ -2423,6 +2441,9 @@ pub fn plan_with_params(
     let mut node = pg_query::protobuf::Node {
         node: Some(parse_one(sql)?),
     };
+    if let Some(st) = instead_of::plan(&node)? {
+        return Ok(st);
+    }
     // Without a runner the subqueries this produces are refused, which is
     // the point: an `UPDATE ... FROM` must never plan as a plain UPDATE.
     rewrite_dml_from(&mut node, lookup)?;
@@ -2453,6 +2474,9 @@ pub fn plan_with_subqueries(
     // The resolved values are appended to the bound parameters as `$N`, so
     // the list the statement is finally planned with is longer than the one
     // the client bound.
+    if let Some(st) = instead_of::plan(&node)? {
+        return Ok(st);
+    }
     let mut params = params.to_vec();
     rewrite_dml_from(&mut node, lookup)?;
     materialize_recursive_ctes(&mut node, lookup, &mut params, run)?;
@@ -2760,6 +2784,17 @@ fn plan_node(
             })
         }
         N::VariableSetStmt(v) => plan_set(&v),
+        N::ConstraintsSetStmt(c) => Ok(Statement::SetConstraints {
+            names: c
+                .constraints
+                .iter()
+                .filter_map(|n| match n.node.as_ref() {
+                    Some(N::RangeVar(r)) => Some(r.relname.clone()),
+                    _ => None,
+                })
+                .collect(),
+            deferred: c.deferred,
+        }),
         N::TransactionStmt(t) => {
             // Named enum, not the wire integer -- twice bitten already.
             match TransactionStmtKind::try_from(t.kind) {
@@ -2883,21 +2918,27 @@ fn plan_define_type(d: &pg_query::protobuf::DefineStmt) -> Result<Statement> {
 /// `CREATE TRIGGER`. `timing` and `events` are PostgreSQL's `TRIGGER_TYPE_*`
 /// bits: BEFORE 2, INSERT 4, DELETE 8, UPDATE 16, TRUNCATE 32, INSTEAD 64.
 fn plan_create_trigger(t: &pg_query::protobuf::CreateTrigStmt) -> Result<Statement> {
-    if t.isconstraint {
-        return Err(Error::Unsupported("CREATE CONSTRAINT TRIGGER".into()));
-    }
-    if !t.transition_rels.is_empty() {
-        return Err(Error::Unsupported(
-            "a trigger's REFERENCING transition tables".into(),
-        ));
-    }
     let timing = match t.timing {
         2 => "BEFORE",
         64 => "INSTEAD OF",
         _ => "AFTER",
     };
     if timing == "INSTEAD OF" {
-        return Err(Error::Unsupported("INSTEAD OF triggers".into()));
+        if !t.row {
+            return Err(Error::FeatureNotSupported(
+                "INSTEAD OF triggers must be FOR EACH ROW".into(),
+            ));
+        }
+        if t.when_clause.is_some() {
+            return Err(Error::FeatureNotSupported(
+                "INSTEAD OF triggers cannot have WHEN conditions".into(),
+            ));
+        }
+        if !t.columns.is_empty() {
+            return Err(Error::FeatureNotSupported(
+                "INSTEAD OF triggers cannot have column lists".into(),
+            ));
+        }
     }
     let mut events = Vec::new();
     for (bit, name) in [
@@ -2914,6 +2955,62 @@ fn plan_create_trigger(t: &pg_query::protobuf::CreateTrigStmt) -> Result<Stateme
         return Err(Error::FeatureNotSupported(
             "TRUNCATE FOR EACH ROW triggers are not supported".into(),
         ));
+    }
+    // `REFERENCING NEW TABLE AS n OLD TABLE AS o`, with PostgreSQL 14's
+    // refusals in its order.
+    let mut transition_new = None;
+    let mut transition_old = None;
+    for r in &t.transition_rels {
+        let Some(N::TriggerTransition(tr)) = r.node.as_ref() else {
+            continue;
+        };
+        if !tr.is_table {
+            return Err(Error::FeatureNotSupported(
+                "ROW variable naming in the REFERENCING clause is not supported".into(),
+            ));
+        }
+        if timing != "AFTER" {
+            return Err(Error::Sqlstate(
+                "42P17",
+                "transition table name can only be specified for an AFTER trigger".into(),
+            ));
+        }
+        if tr.is_new {
+            if !events.iter().any(|e| e == "INSERT" || e == "UPDATE") {
+                return Err(Error::Sqlstate(
+                    "42P17",
+                    "NEW TABLE can only be specified for an INSERT or UPDATE trigger".into(),
+                ));
+            }
+            transition_new = Some(tr.name.clone());
+        } else {
+            if !events.iter().any(|e| e == "DELETE" || e == "UPDATE") {
+                return Err(Error::Sqlstate(
+                    "42P17",
+                    "OLD TABLE can only be specified for a DELETE or UPDATE trigger".into(),
+                ));
+            }
+            transition_old = Some(tr.name.clone());
+        }
+    }
+    if transition_new.is_some() || transition_old.is_some() {
+        if events.len() > 1 {
+            return Err(Error::FeatureNotSupported(
+                "transition tables cannot be specified for triggers with more than one event"
+                    .into(),
+            ));
+        }
+        if !t.columns.is_empty() {
+            return Err(Error::FeatureNotSupported(
+                "transition tables cannot be specified for triggers with column lists".into(),
+            ));
+        }
+        if transition_new.is_some() && transition_new == transition_old {
+            return Err(Error::Sqlstate(
+                "42P17",
+                "OLD TABLE name and NEW TABLE name cannot be the same".into(),
+            ));
+        }
     }
     let table = t
         .relation
@@ -2961,6 +3058,11 @@ fn plan_create_trigger(t: &pg_query::protobuf::CreateTrigStmt) -> Result<Stateme
         function,
         args: strings(&t.args),
         when,
+        constraint: t.isconstraint,
+        deferrable: t.deferrable,
+        initially_deferred: t.initdeferred,
+        transition_new,
+        transition_old,
     }))
 }
 
@@ -3009,15 +3111,30 @@ fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<St
             _ => {}
         }
     }
-    let language = language.unwrap_or_default().to_ascii_lowercase();
-    if matches!(language.as_str(), "sql" | "plpgsql") {
-        if f.sql_body.is_some() {
-            return Err(Error::Unsupported(
-                "a SQL-standard function body (BEGIN ATOMIC / RETURN)".into(),
+    // A SQL-standard body (`RETURN expr` / `BEGIN ATOMIC ... END`) is a
+    // LANGUAGE sql function whose body arrives parsed rather than as a
+    // string: it is rendered back to the statements a string body would hold.
+    if let Some(sql_body) = f.sql_body.as_deref() {
+        if body.is_some() {
+            return Err(Error::Sqlstate(
+                "42P13",
+                "duplicate function body specified".into(),
             ));
         }
+        if !language.as_deref().is_none_or(|l| l.eq_ignore_ascii_case("sql")) {
+            return Err(Error::Sqlstate(
+                "42P13",
+                "inline SQL function body only valid for language SQL".into(),
+            ));
+        }
+        language = Some("sql".into());
+        body = Some(sql_standard_body(sql_body)?);
+    }
+    let language = language.unwrap_or_default().to_ascii_lowercase();
+    if matches!(language.as_str(), "sql" | "plpgsql") {
         let mut params = Vec::new();
         let mut columns = Vec::new();
+        let mut variadic = false;
         for p in &f.parameters {
             let Some(N::FunctionParameter(fp)) = p.node.as_ref() else {
                 continue;
@@ -3031,7 +3148,14 @@ fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<St
                     columns.push((fp.name.clone(), ty));
                 }
                 Ok(M::FuncParamVariadic) => {
-                    return Err(Error::Unsupported("a VARIADIC parameter".into()))
+                    if !ty.ends_with("[]") {
+                        return Err(Error::Sqlstate(
+                            "42P13",
+                            "VARIADIC parameter must be an array".into(),
+                        ));
+                    }
+                    variadic = true;
+                    params.push((fp.name.clone(), ty));
                 }
                 _ => params.push((fp.name.clone(), ty)),
             }
@@ -3048,6 +3172,7 @@ fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<St
             body,
             language,
             volatility,
+            variadic,
         }));
     }
     if !language.eq_ignore_ascii_case("internal") {
@@ -3064,6 +3189,37 @@ fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<St
         body,
         volatility,
     })
+}
+
+/// A SQL-standard function body as the statements of a string body: `RETURN
+/// expr` is `SELECT expr`, and `BEGIN ATOMIC s1; s2; END` is `s1; s2`.
+fn sql_standard_body(node: &pg_query::protobuf::Node) -> Result<String> {
+    fn collect(node: &pg_query::protobuf::Node, out: &mut Vec<String>) -> Result<()> {
+        match node.node.as_ref() {
+            Some(N::List(l)) => {
+                for item in &l.items {
+                    collect(item, out)?;
+                }
+                Ok(())
+            }
+            Some(N::ReturnStmt(r)) => {
+                let value = r
+                    .returnval
+                    .as_deref()
+                    .ok_or_else(|| Error::Parse("RETURN without a value".into()))?;
+                out.push(format!("SELECT {}", deparse_expr(value)?));
+                Ok(())
+            }
+            Some(_) => {
+                out.push(node.deparse().map_err(|e| Error::Parse(e.to_string()))?);
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+    let mut stmts = Vec::new();
+    collect(node, &mut stmts)?;
+    Ok(stmts.join("; "))
 }
 
 /// Resolve a `serial` pseudo-type to its underlying integer type.

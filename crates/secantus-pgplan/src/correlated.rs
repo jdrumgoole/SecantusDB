@@ -619,6 +619,9 @@ pub struct UserFn {
     pub returns_set: bool,
     /// `RETURNS TABLE (...)` / OUT columns, `(name, type)`.
     pub columns: Vec<(String, String)>,
+    /// The last parameter is `VARIADIC`: trailing arguments are packed into
+    /// its array.
+    pub variadic: bool,
 }
 
 /// What a user function call produced.
@@ -647,7 +650,10 @@ pub(crate) fn user_function(name: &str, nargs: usize) -> Option<UserFn> {
     USER_FUNCTIONS.with(|f| {
         f.borrow()
             .iter()
-            .find(|u| u.name == name && u.arg_types.len() == nargs)
+            .find(|u| {
+                u.name == name
+                    && (u.arg_types.len() == nargs || (u.variadic && nargs >= u.arg_types.len()))
+            })
             .cloned()
     })
 }
@@ -673,6 +679,23 @@ pub(crate) fn call_user_function(u: &UserFn, args: &[Bson]) -> Result<FnResult> 
     if SUPPRESSED.with(|s| s.get()) {
         return Ok(FnResult::Value(Bson::Null));
     }
+    // A VARIADIC call packs its trailing arguments into the last parameter's
+    // array, unless it passed that array itself (`VARIADIC ARRAY[...]`).
+    let packed;
+    let args = if u.variadic && !u.arg_types.is_empty() {
+        let fixed = u.arg_types.len() - 1;
+        let explicit = args.len() == u.arg_types.len() && matches!(args[fixed], Bson::Array(_));
+        if explicit {
+            args
+        } else {
+            let mut out = args[..fixed.min(args.len())].to_vec();
+            out.push(Bson::Array(args[fixed.min(args.len())..].to_vec()));
+            packed = out;
+            &packed[..]
+        }
+    } else {
+        args
+    };
     match FUNCTION_HOOK.with(|r| r.get()) {
         // SAFETY: set only inside `with_function_hook`, whose borrow is live.
         Some(hook) => unsafe { (*hook)(u, args) },

@@ -506,6 +506,7 @@ fn user_fn_of(d: &Document) -> secantus_pgplan::UserFn {
         returns_set: d.get_bool("returns_set").unwrap_or(false)
             || d.get_bool("is_table").unwrap_or(false),
         columns,
+        variadic: d.get_bool("variadic").unwrap_or(false),
     }
 }
 
@@ -1256,6 +1257,14 @@ pub struct PgHandler {
     /// `(table, constraint name)` of every INITIALLY DEFERRED foreign key a
     /// write in the open transaction touched; re-checked at COMMIT.
     deferred_fks: Mutex<Vec<(String, String)>>,
+    /// INITIALLY DEFERRED constraint-trigger events queued for COMMIT.
+    deferred_triggers: Mutex<Vec<triggers::DeferredTrigger>>,
+    /// The rows the statement in flight wrote to each table, `(new, old)`,
+    /// for its triggers' `REFERENCING` transition tables.
+    transition_rows: Mutex<HashMap<String, (Vec<Document>, Vec<Document>)>>,
+    /// `SET CONSTRAINTS` for the open transaction: ALL's mode, then each
+    /// named constraint's (`true` = deferred).
+    constraint_modes: Mutex<(Option<bool>, HashMap<String, bool>)>,
     /// Set when a COMMIT failed its deferred checks and rolled back: the
     /// error goes out, and the `ReadyForQuery` after it must say IDLE (the
     /// transaction is over), where pgwire's error path would say failed.
@@ -1432,6 +1441,9 @@ impl PgHandler {
             session_user: Mutex::new(String::new()),
             backend: Arc::new(BackendEntry::new("")),
             deferred_fks: Mutex::new(Vec::new()),
+            deferred_triggers: Mutex::new(Vec::new()),
+            transition_rows: Mutex::new(HashMap::new()),
+            constraint_modes: Mutex::new((None, HashMap::new())),
             commit_failed: AtomicBool::new(false),
             implicit_extended: AtomicBool::new(false),
             group_failed: AtomicBool::new(false),
@@ -1717,6 +1729,21 @@ impl PgHandler {
         secantus_pgplan::set_views(views);
         secantus_pgplan::view_dml::set_checked_views(checked);
         secantus_pgplan::partitions::set_tableoids(self.tableoid_expressions());
+        secantus_pgplan::instead_of::set_instead_of_triggers(
+            self.trigger_docs()
+                .unwrap_or_default()
+                .iter()
+                .filter(|d| d.get_str("timing") == Ok("INSTEAD OF"))
+                .flat_map(|d| {
+                    let view = d.get_str("table").unwrap_or_default().to_string();
+                    d.get_array("events")
+                        .map(|a| a.iter().filter_map(|e| e.as_str().map(str::to_string)).collect::<Vec<_>>())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(move |e| (view.clone(), e))
+                })
+                .collect(),
+        );
         secantus_pgplan::set_constraint_defs(self.constraint_defs().unwrap_or_default());
         secantus_pgplan::set_object_comments(self.object_comments());
         secantus_pgplan::domains::set_user_domains(self.domains().unwrap_or_default());
@@ -3589,6 +3616,14 @@ impl PgHandler {
                     .or_else(|_| d.get_i32("oid").map(i64::from))
                     .ok()
             })
+            // A view has no stored row type; its oid is derived.
+            .or_else(|| {
+                self.views()
+                    .ok()?
+                    .iter()
+                    .any(|(n, _)| n == name)
+                    .then(|| Self::view_oid(name))
+            })
     }
 
     /// Every table with a relation oid, as `(stored name, oid, temp)`, for
@@ -3620,7 +3655,22 @@ impl PgHandler {
                 let temp = temps.contains(&ix.table.name);
                 (ix.name, ix.oid, temp)
             }))
+            .chain(
+                self.views()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(name, _)| {
+                        let oid = Self::view_oid(&name);
+                        (name, oid, false)
+                    }),
+            )
             .collect()
+    }
+
+    /// A view's oid: stable for its name, in a band no table, type or index
+    /// oid reaches.
+    fn view_oid(name: &str) -> i64 {
+        Self::index_oid(&format!("view:{name}")) | 0x2000_0000
     }
 
     /// Index oids live in their own band so they never meet a type or table
@@ -4173,6 +4223,7 @@ impl PgHandler {
             "language": &def.language,
             "returns_trigger": def.return_type == "trigger",
             "volatility": &def.volatility,
+            "variadic": def.variadic,
         };
         // PostgreSQL checks the body at CREATE (`check_function_bodies`).
         match def.language.as_str() {
@@ -4299,6 +4350,7 @@ impl PgHandler {
                     &plpgsql_create_sql(doc),
                     plpgsql_fn::Invocation {
                         args,
+                        arg_types: &u.arg_types,
                         trigger: None,
                         returns_set: u.returns_set,
                     },
@@ -4563,6 +4615,8 @@ impl PgHandler {
     }
 
     fn delete_view(&self, name: &str) -> PgWireResult<()> {
+        // Its INSTEAD OF (and statement) triggers go with it.
+        self.drop_table_triggers(name)?;
         self.storage
             .delete_matching(
                 self.db(),
@@ -7411,6 +7465,31 @@ impl PgHandler {
                 }
                 // A sequence is a relation too, and `relkind` is how a client
                 // tells one from a table.
+                // A view is a relation too, `relkind 'v'`.
+                for (name, _) in self.views().unwrap_or_default() {
+                    let natts = self
+                        .internal_query(&format!(
+                            "SELECT * FROM {} LIMIT 0",
+                            secantus_pgplan::scalar::quote_identifier(&name)
+                        ))
+                        .map(|(cols, _)| cols.len())
+                        .unwrap_or(0);
+                    let mut d = Document::new();
+                    d.insert(f("oid"), Bson::Int64(Self::view_oid(&name)));
+                    d.insert(f("relname"), name.as_str());
+                    d.insert(f("relnamespace"), Bson::Int64(Self::PUBLIC_NAMESPACE_OID));
+                    d.insert(f("relkind"), "v");
+                    d.insert(f("relnatts"), Bson::Int32(natts as i32));
+                    d.insert(f("relhasindex"), false);
+                    d.insert(f("reltuples"), Bson::Double(-1.0));
+                    d.insert(f("relowner"), Bson::Int64(10));
+                    d.insert(f("relpersistence"), "p");
+                    d.insert(f("relrowsecurity"), false);
+                    d.insert(f("relforcerowsecurity"), false);
+                    d.insert(f("relispartition"), false);
+                    d.insert(f("relpartbound"), Bson::Null);
+                    rows.push(d);
+                }
                 for s in self.all_sequence_docs().ok()? {
                     let name = s.get_str("_id").unwrap_or_default().to_string();
                     let mut d = Document::new();
@@ -7520,9 +7599,13 @@ impl PgHandler {
                     d.insert(f("tgisinternal"), false);
                     d.insert(f("tgconstrrelid"), Bson::Int64(0));
                     d.insert(f("tgconstrindid"), Bson::Int64(0));
-                    d.insert(f("tgconstraint"), Bson::Int64(0));
-                    d.insert(f("tgdeferrable"), false);
-                    d.insert(f("tginitdeferred"), false);
+                    let constraint = t.get_bool("constraint").unwrap_or(false);
+                    d.insert(
+                        f("tgconstraint"),
+                        Bson::Int64(if constraint { Self::index_oid(&format!("trg:{key}", key = t.get_str("_id").unwrap_or_default())) } else { 0 }),
+                    );
+                    d.insert(f("tgdeferrable"), t.get_bool("deferrable").unwrap_or(false));
+                    d.insert(f("tginitdeferred"), t.get_bool("initially_deferred").unwrap_or(false));
                     d.insert(f("tgnargs"), Bson::Int32(nargs as i32));
                     rows.push(d);
                 }
@@ -11737,10 +11820,7 @@ impl PgHandler {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
-        self.deferred_fks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        self.clear_deferred();
         if let Some(mut handle) = self.txn.lock().unwrap_or_else(|e| e.into_inner()).take() {
             self.storage
                 .rollback_user_transaction(&mut handle)
@@ -11813,10 +11893,7 @@ impl PgHandler {
             .clear();
         self.in_transaction
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        self.deferred_fks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        self.clear_deferred();
         if let Some(mut handle) = self.txn.lock().unwrap_or_else(|e| e.into_inner()).take() {
             self.storage
                 .rollback_user_transaction(&mut handle)
@@ -13136,10 +13213,7 @@ impl PgHandler {
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 // A ROLLBACK closes ALL cursors, holdable included.
                 self.close_cursors_on_txn_end(false);
-                self.deferred_fks
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clear();
+                self.clear_deferred();
                 if let Some(mut handle) = guard.take() {
                     self.in_transaction
                         .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -13560,6 +13634,42 @@ impl PgHandler {
 
     /// The single value of a constant `SELECT`, planned and run as the
     /// executing statement (so `nextval` draws, once).
+    /// Plan a statement the server writes itself, with subqueries runnable.
+    pub(crate) fn plan_internal(&self, sql: &str) -> PgWireResult<Statement> {
+        let tz = self.session_timezone();
+        let run = |stmt: &Statement| self.subquery_rows(stmt);
+        self.with_executor_hooks(|| {
+            secantus_pgplan::planning_to_execute(|| {
+                secantus_pgplan::plan_with_session_types_and_subqueries(
+                    sql,
+                    &|n| self.lookup(n),
+                    &[],
+                    &[],
+                    &tz,
+                    Some(&run),
+                )
+            })
+        })
+        .map_err(|e| Self::err(&e))
+    }
+
+    /// A query's columns `(name, type)` and its rows.
+    pub(crate) fn internal_query(
+        &self,
+        sql: &str,
+    ) -> PgWireResult<(Vec<(String, String)>, Vec<Vec<Option<Bson>>>)> {
+        let stmt = self.plan_internal(sql)?;
+        let fields = self.copy_query_fields(&stmt)?;
+        let rows = self.with_executor_hooks(|| self.query_rows(&stmt))?;
+        Ok((
+            fields
+                .iter()
+                .map(|f| (f.name().to_string(), f.datatype().name().to_string()))
+                .collect(),
+            rows,
+        ))
+    }
+
     fn eval_constant_sql(&self, sql: &str) -> PgWireResult<Bson> {
         let tz = self.session_timezone();
         let run = |stmt: &Statement| self.subquery_rows(stmt);
@@ -14655,6 +14765,8 @@ impl PgHandler {
                 | Statement::SelectConstant(_)
                 | Statement::ValuesConstant(_)
                 | Statement::Insert(_)
+                | Statement::InsteadOf(_)
+                | Statement::SetConstraints { .. }
                 | Statement::Update(_)
                 | Statement::Delete(_)
                 | Statement::Truncate { .. }
@@ -16996,6 +17108,11 @@ impl PgHandler {
                 Ok(vec![Response::Execution(Tag::new("CREATE EXTENSION"))])
             }
 
+            Statement::InsteadOf(io) => self.run_instead_of(io),
+            Statement::SetConstraints { names, deferred } => {
+                self.set_constraints(&names, deferred)?;
+                Ok(vec![Response::Execution(Tag::new("SET CONSTRAINTS"))])
+            }
             Statement::Policy(change) => {
                 let tag = match &change {
                     secantus_pgplan::PolicyChange::Create { .. } => "CREATE POLICY",
@@ -18594,17 +18711,38 @@ impl PgHandler {
     /// transaction is queued for COMMIT instead.
     fn check_foreign_keys(&self, def: &TableDef, rows: &[Document]) -> PgWireResult<()> {
         for fk in &def.foreign_keys {
-            if fk.initially_deferred
-                && self
-                    .in_transaction
-                    .load(std::sync::atomic::Ordering::Relaxed)
-            {
+            if self.deferred_now(&fk.name, fk.deferrable, fk.initially_deferred) {
                 self.defer_fk(&def.name, &fk.name);
                 continue;
             }
             self.check_fk_child_side(def, fk, rows)?;
         }
         Ok(())
+    }
+
+    /// Is the constraint `name` checked at COMMIT right now? Only inside a
+    /// transaction block, and `SET CONSTRAINTS` overrides the declaration for
+    /// a DEFERRABLE one.
+    pub(crate) fn deferred_now(&self, name: &str, deferrable: bool, initially: bool) -> bool {
+        if !self.in_transaction.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        if !deferrable {
+            return false;
+        }
+        let modes = self.constraint_modes.lock().unwrap_or_else(|e| e.into_inner());
+        modes.1.get(name).copied().or(modes.0).unwrap_or(initially)
+    }
+
+    /// Forget every deferred check and `SET CONSTRAINTS` mode: the block is
+    /// over.
+    fn clear_deferred(&self) {
+        self.deferred_fks.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.deferred_triggers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        *self.constraint_modes.lock().unwrap_or_else(|e| e.into_inner()) = (None, HashMap::new());
     }
 
     fn defer_fk(&self, table: &str, name: &str) {
@@ -18859,11 +18997,7 @@ impl PgHandler {
                     None => Ok(column.default.clone().unwrap_or(Bson::Null)),
                 }
             }),
-            _ if fk.initially_deferred
-                && self
-                    .in_transaction
-                    .load(std::sync::atomic::Ordering::Relaxed) =>
-            {
+            _ if self.deferred_now(&fk.name, fk.deferrable, fk.initially_deferred) => {
                 self.defer_fk(&child.name, &fk.name);
                 Ok(())
             }
@@ -18934,8 +19068,30 @@ impl PgHandler {
     /// Re-check every deferred FOREIGN KEY over the whole referencing table,
     /// as COMMIT does. Runs inside the transaction, so it sees its writes.
     fn run_deferred_checks(&self) -> PgWireResult<()> {
-        let queued: Vec<(String, String)> =
-            std::mem::take(&mut *self.deferred_fks.lock().unwrap_or_else(|e| e.into_inner()));
+        self.run_deferred(None)
+    }
+
+    /// Run the queued deferred checks -- all, or those of the named
+    /// constraints (`SET CONSTRAINTS name IMMEDIATE`).
+    fn run_deferred(&self, only: Option<&[String]>) -> PgWireResult<()> {
+        let wanted = |name: &str| only.is_none_or(|n| n.iter().any(|x| x == name));
+        let queued: Vec<(String, String)> = {
+            let mut q = self.deferred_fks.lock().unwrap_or_else(|e| e.into_inner());
+            let (run, keep): (Vec<_>, Vec<_>) = q.drain(..).partition(|(_, n)| wanted(n));
+            *q = keep;
+            run
+        };
+        let events: Vec<triggers::DeferredTrigger> = {
+            let mut q = self.deferred_triggers.lock().unwrap_or_else(|e| e.into_inner());
+            let (run, keep): (Vec<_>, Vec<_>) = q
+                .drain(..)
+                .partition(|t| wanted(t.trg.get_str("name").unwrap_or_default()));
+            *q = keep;
+            run
+        };
+        for event in events {
+            self.run_deferred_trigger(event)?;
+        }
         for (table, name) in queued {
             let Some(def) = self.lookup(&table) else {
                 continue;

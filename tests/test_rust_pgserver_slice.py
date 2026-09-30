@@ -14267,3 +14267,121 @@ def test_composite_and_distinct_aggregate_ordering(home: Path) -> None:
         assert _fetch(conn, "SELECT string_agg(DISTINCT s, ',' ORDER BY s DESC) FROM dag") == [
             ("b,a",)
         ]
+
+
+def test_sql_standard_and_variadic_functions(home: Path) -> None:
+    """`RETURN expr` / `BEGIN ATOMIC ... END` bodies, VARIADIC parameters
+    (packed, or passed whole with `VARIADIC ARRAY[...]`), and array
+    parameters to a PL/pgSQL function."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE FUNCTION sa(x int) RETURNS int LANGUAGE sql RETURN x + 1")
+        conn.execute(
+            "CREATE FUNCTION sb(x int) RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT x * 2; END"
+        )
+        assert _fetch(conn, "SELECT sa(4), sb(4)") == [(5, 8)]
+        assert (
+            _sqlstate(conn, "CREATE FUNCTION sc() RETURNS int LANGUAGE plpgsql RETURN 5") == "42P13"
+        )
+        conn.execute(
+            "CREATE FUNCTION vf(VARIADIC xs int[]) RETURNS int LANGUAGE sql "
+            "AS 'SELECT array_length(xs, 1)'"
+        )
+        assert _fetch(conn, "SELECT vf(1, 2, 3), vf(7), vf(VARIADIC ARRAY[1, 2])") == [(3, 1, 2)]
+        assert _sqlstate(conn, "SELECT vf()") == "42883"
+        conn.execute(
+            "CREATE FUNCTION vg(p text, VARIADIC xs int[]) RETURNS text LANGUAGE plpgsql "
+            "AS $$ BEGIN RETURN p || array_to_string(xs, ','); END $$"
+        )
+        assert _fetch(conn, "SELECT vg('n=', 4, 5)") == [("n=4,5",)]
+
+
+def test_instead_of_triggers_on_a_view(home: Path) -> None:
+    """INSERT / UPDATE / DELETE on a view with INSTEAD OF triggers run the
+    trigger per row with NEW / OLD in the view's columns; a trigger that
+    answers NULL leaves the row uncounted. Views are relations in pg_class."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE TABLE it_t (id int PRIMARY KEY, name text)")
+        conn.execute("INSERT INTO it_t VALUES (1, 'a')")
+        conn.execute("CREATE VIEW it_v AS SELECT id, upper(name) AS uname FROM it_t")
+        conn.execute(
+            "CREATE FUNCTION it_f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+            "IF TG_OP = 'INSERT' THEN INSERT INTO it_t VALUES (NEW.id, lower(NEW.uname)); "
+            "RETURN NEW; ELSIF TG_OP = 'UPDATE' THEN UPDATE it_t SET name = lower(NEW.uname) "
+            "WHERE id = OLD.id; RETURN NEW; ELSE IF OLD.id = 1 THEN RETURN NULL; END IF; "
+            "DELETE FROM it_t WHERE id = OLD.id; RETURN OLD; END IF; END $$"
+        )
+        conn.execute(
+            "CREATE TRIGGER it_trg INSTEAD OF INSERT OR UPDATE OR DELETE ON it_v "
+            "FOR EACH ROW EXECUTE FUNCTION it_f()"
+        )
+        cur = conn.execute("INSERT INTO it_v VALUES (2, 'B'), (3, 'C')")
+        assert cur.rowcount == 2
+        conn.execute("UPDATE it_v SET uname = 'ZZ' WHERE id = 2")
+        cur = conn.execute("DELETE FROM it_v")
+        assert cur.rowcount == 2
+        assert _fetch(conn, "SELECT id, name FROM it_t ORDER BY id") == [(1, "a")]
+        assert (
+            _sqlstate(
+                conn,
+                "CREATE TRIGGER bad INSTEAD OF INSERT ON it_t FOR EACH ROW EXECUTE FUNCTION it_f()",
+            )
+            == "42809"
+        )
+        assert _fetch(conn, "SELECT relkind FROM pg_class WHERE oid = 'it_v'::regclass") == [("v",)]
+
+
+def test_constraint_triggers_and_set_constraints(home: Path) -> None:
+    """A DEFERRABLE INITIALLY DEFERRED constraint trigger fires at COMMIT
+    (its error fails the COMMIT and rolls back), SET CONSTRAINTS ...
+    IMMEDIATE runs what is queued, and a deferred foreign key can be
+    satisfied before COMMIT."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE TABLE ctt (id int PRIMARY KEY, n int)")
+        conn.execute(
+            "CREATE FUNCTION ctt_chk() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+            "IF NEW.n < 0 THEN RAISE EXCEPTION 'negative'; END IF; RETURN NULL; END $$"
+        )
+        conn.execute(
+            "CREATE CONSTRAINT TRIGGER ctt_def AFTER UPDATE ON ctt DEFERRABLE INITIALLY "
+            "DEFERRED FOR EACH ROW EXECUTE FUNCTION ctt_chk()"
+        )
+        conn.execute("INSERT INTO ctt VALUES (1, 1)")
+        conn.autocommit = False
+        conn.execute("UPDATE ctt SET n = -1")
+        with pytest.raises(psycopg.errors.RaiseException):
+            conn.commit()
+        conn.rollback()
+        assert _fetch(conn, "SELECT n FROM ctt") == [(1,)]
+        conn.execute("UPDATE ctt SET n = -2")
+        with pytest.raises(psycopg.errors.RaiseException):
+            conn.execute("SET CONSTRAINTS ctt_def IMMEDIATE")
+        conn.rollback()
+        conn.autocommit = True
+        conn.execute("CREATE TABLE ctp (id int PRIMARY KEY)")
+        conn.execute("CREATE TABLE ctc (id int PRIMARY KEY, p int REFERENCES ctp DEFERRABLE)")
+        conn.autocommit = False
+        conn.execute("SET CONSTRAINTS ALL DEFERRED")
+        conn.execute("INSERT INTO ctc VALUES (1, 10)")
+        conn.execute("INSERT INTO ctp VALUES (10)")
+        conn.commit()
+        assert _fetch(conn, "SELECT p FROM ctc") == [(10,)]
+
+
+def test_trigger_transition_tables(home: Path) -> None:
+    """`REFERENCING NEW TABLE / OLD TABLE` make the statement's rows a table
+    inside the trigger, and the table is gone afterwards."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE TABLE trt (id int PRIMARY KEY, n int)")
+        conn.execute("CREATE TABLE trlog (msg text)")
+        conn.execute(
+            "CREATE FUNCTION trf() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+            "INSERT INTO trlog SELECT count(*) || ':' || coalesce(sum(n), 0) FROM nt; "
+            "RETURN NULL; END $$"
+        )
+        conn.execute(
+            "CREATE TRIGGER trg AFTER INSERT ON trt REFERENCING NEW TABLE AS nt "
+            "FOR EACH STATEMENT EXECUTE FUNCTION trf()"
+        )
+        conn.execute("INSERT INTO trt VALUES (1, 10), (2, 20)")
+        assert _fetch(conn, "SELECT msg FROM trlog") == [("2:30",)]
+        assert _fetch(conn, "SELECT count(*) FROM pg_class WHERE relname = 'nt'") == [(0,)]
