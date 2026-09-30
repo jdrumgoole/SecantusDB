@@ -863,7 +863,7 @@ impl PgHandler {
                             }),
                             "attcompression" => Bson::String(String::new()),
                             "attacl" => match table_by_oid(int(get(row, "attrelid"))) {
-                                Some(t) => self.column_acl(&t, &text(get(row, "attname"))),
+                                Some(t) => self.column_acl(t, &text(get(row, "attname"))),
                                 None => Bson::Null,
                             },
                             "attoptions" | "attfdwoptions" => Bson::Null,

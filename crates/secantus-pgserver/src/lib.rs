@@ -6306,7 +6306,7 @@ impl PgHandler {
             .unique_constraints
             .iter()
             .map(|u| u.name.clone())
-            .chain(std::iter::once(pk_constraint_name(&def)))
+            .chain(std::iter::once(pk_constraint_name(def)))
             .find(|n| text.contains(n.as_str()))
         else {
             return e;
@@ -8187,7 +8187,7 @@ impl PgHandler {
                 .map(|p| p.to_string())
                 .collect(),
         };
-        if grantees.iter().any(|g| *g == owner) {
+        if grantees.contains(&owner) {
             if is_grant {
                 for p in wanted {
                     if !held.iter().any(|h| h == p) {
@@ -15111,7 +15111,7 @@ impl PgHandler {
                     def.check_constraints.iter().any(|c| c.name == n)
                         || def.unique_constraints.iter().any(|u| u.name == n)
                         || def.foreign_keys.iter().any(|f| f.name == n)
-                        || (def.columns.iter().any(|c| c.pk) && n == pk_constraint_name(&def))
+                        || (def.columns.iter().any(|c| c.pk) && n == pk_constraint_name(def))
                 };
                 if taken(&fk.name) {
                     if *named {

@@ -3934,7 +3934,10 @@ def test_an_enum_created_by_one_server_is_the_other_servers_too(home: Path) -> N
 
     with _Server(home) as server, server.connect() as conn:
         cur = conn.cursor()
-        cur.execute("select typname, oid from pg_type where oid >= 65000 order by oid")
+        # The enums themselves; each also has an array type (`_rustmood`).
+        cur.execute(
+            "select typname, oid from pg_type where oid >= 65000 and typtype = 'e' order by oid"
+        )
         rows = cur.fetchall()
         assert rows == [("rustmood", rust_oid), ("pymood", rust_oid + 1)]
 
