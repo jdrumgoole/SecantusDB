@@ -52,6 +52,7 @@ pub mod privileges;
 pub mod regobj;
 pub mod rls;
 mod rowsfrom;
+pub mod rule_rewrite;
 pub mod ruleutils;
 pub mod trgm;
 pub mod user_casts;
@@ -277,6 +278,16 @@ impl Error {
             }
             Error::DatatypeMismatch(m) if m.contains(" but expression is of type ") => {
                 Some("You will need to rewrite or cast the expression.")
+            }
+            // RETURNING on a relation with INSTEAD rules (rewriteHandler.c).
+            Error::FeatureNotSupported(m) if m.starts_with("cannot perform INSERT RETURNING") => {
+                Some("You need an unconditional ON INSERT DO INSTEAD rule with a RETURNING clause.")
+            }
+            Error::FeatureNotSupported(m) if m.starts_with("cannot perform UPDATE RETURNING") => {
+                Some("You need an unconditional ON UPDATE DO INSTEAD rule with a RETURNING clause.")
+            }
+            Error::FeatureNotSupported(m) if m.starts_with("cannot perform DELETE RETURNING") => {
+                Some("You need an unconditional ON DELETE DO INSTEAD rule with a RETURNING clause.")
             }
             _ => None,
         }
@@ -535,6 +546,8 @@ pub enum Statement {
     },
     /// Foreign data wrappers, servers, user mappings and foreign tables.
     Fdw(fdw::FdwOp),
+    /// An INSERT / UPDATE / DELETE rewritten by the target's rules.
+    RuleRewrite(rule_rewrite::RulePlan),
     /// `CREATE EVENT TRIGGER name ON event [WHEN TAG IN (...)] EXECUTE
     /// FUNCTION f()`: `tags` upper-cased, `None` for every tag.
     CreateEventTrigger {
@@ -2939,6 +2952,9 @@ pub fn plan_with_params(
     if let Some(inner) = node.node.as_ref() {
         fdw::refuse_foreign_access(inner, lookup)?;
     }
+    if let Some(p) = rule_rewrite::plan(&node, lookup, params)? {
+        return Ok(Statement::RuleRewrite(p));
+    }
     if let Some(st) = instead_of::plan(&node)? {
         return Ok(st);
     }
@@ -2978,6 +2994,9 @@ pub fn plan_with_subqueries(
     event_triggers::rewrite_sources(sql, &mut node);
     if let Some(inner) = node.node.as_ref() {
         fdw::refuse_foreign_access(inner, lookup)?;
+    }
+    if let Some(p) = rule_rewrite::plan(&node, lookup, params)? {
+        return Ok(Statement::RuleRewrite(p));
     }
     if let Some(st) = instead_of::plan(&node)? {
         return Ok(st);

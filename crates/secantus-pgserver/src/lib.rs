@@ -2423,6 +2423,7 @@ impl PgHandler {
         secantus_pgplan::domains::set_user_domains(self.domains().unwrap_or_default());
         secantus_pgplan::user_agg::set_user_aggregates(self.user_aggregates().unwrap_or_default());
         // User-defined functions, so the planner can type and route a call.
+        secantus_pgplan::rule_rewrite::set_rules(self.enabled_rules());
         secantus_pgplan::set_user_functions(
             self.user_function_docs()
                 .unwrap_or_default()
@@ -13692,6 +13693,13 @@ impl PgHandler {
     fn written_tables(stmt: &Statement) -> Vec<String> {
         let mut out = match stmt {
             Statement::Sequence(_, stmts) => stmts.iter().flat_map(Self::written_tables).collect(),
+            // Every table a rewrite's steps write, and the sequences a
+            // default draws from.
+            Statement::RuleRewrite(p) => {
+                let mut v = p.targets.clone();
+                v.push(SEQUENCE_COLLECTION.to_string());
+                v
+            }
             // A serial column's INSERT moves its sequence too.
             Statement::Insert(i) => vec![i.table.clone(), SEQUENCE_COLLECTION.to_string()],
             // An ALTER rewrites the ROWS as well as the catalog, so a
@@ -18605,6 +18613,11 @@ impl PgHandler {
             Statement::Insert(_) => "INSERT",
             Statement::Update(_) => "UPDATE",
             Statement::Delete(_) => "DELETE",
+            Statement::RuleRewrite(p) => match p.kind.as_str() {
+                "INSERT" => "INSERT",
+                "UPDATE" => "UPDATE",
+                _ => "DELETE",
+            },
             Statement::Truncate { .. } => "TRUNCATE TABLE",
             Statement::CopyFrom(_) => "COPY FROM",
             Statement::Notify { .. } => "NOTIFY",
@@ -18693,6 +18706,7 @@ impl PgHandler {
                 | Statement::ValuesConstant(_)
                 | Statement::Insert(_)
                 | Statement::InsteadOf(_)
+                | Statement::RuleRewrite(_)
                 | Statement::SetConstraints { .. }
                 | Statement::Update(_)
                 | Statement::Delete(_)
@@ -18803,32 +18817,6 @@ impl PgHandler {
     }
 
     fn execute_inner(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response>> {
-        // A row an INSTEAD rule of the statement's own kind replaced counts
-        // in its tag, as the rule's action does in PostgreSQL's.
-        if !matches!(
-            stmt,
-            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
-        ) {
-            return self.execute_dispatch(stmt, max_rows);
-        }
-        let saved = rules::take_instead_rows();
-        let out = self.execute_dispatch(stmt, max_rows);
-        let replaced = rules::take_instead_rows();
-        rules::add_instead_rows(saved);
-        let mut out = out?;
-        if replaced > 0 {
-            for r in &mut out {
-                if let Response::Execution(tag) = r {
-                    if let Some(n) = tag.rows() {
-                        *tag = tag.clone().with_rows(n + replaced);
-                    }
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    fn execute_dispatch(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response>> {
         // A timestamptz renders in the SESSION zone; capture it once here and
         // thread it into the row encoder explicitly. A thread-local does not
         // work: pgwire may encode the DataRows lazily on another async worker
@@ -18847,6 +18835,7 @@ impl PgHandler {
             // Handled in `run`, which can await the row stream.
             Statement::DeclareCursor { .. } => unreachable!("handled before execute"),
             Statement::Do { .. } => unreachable!("handled before execute"),
+            Statement::RuleRewrite(p) => self.run_rule_plan(p, max_rows),
             Statement::CreateTable(mut def, if_not_exists) => {
                 if self.lookup(&def.name).is_some()
                     || self.views()?.iter().any(|(n, _)| *n == def.name)
