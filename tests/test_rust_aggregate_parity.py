@@ -928,7 +928,6 @@ def test_bucket_auto_granularity_fuzz():
         ([1.0, 2.0, "x"], 40258),  # non-numeric value
         ([float("nan"), 1.0], 40259),  # NaN
         ([None, 1.0, 2.0], 40258),  # null is non-numeric
-        ([bson.Decimal128("1.5"), bson.Decimal128("2.5")], 2),  # Decimal128 deferral
     ],
 )
 def test_bucket_auto_granularity_value_defers_and_raises(values, code):
@@ -940,6 +939,25 @@ def test_bucket_auto_granularity_value_defers_and_raises(values, code):
     with pytest.raises(Exception) as exc:
         _pure.apply_pipeline(docs_b, pipeline_b, _PipelineContext())
     assert getattr(exc.value, "code", None) == code
+
+
+def test_bucket_auto_granularity_decimal_matches_mongod():
+    """A Decimal128 `groupBy` is rounded in decimal, with mongod's quantum.
+
+    The Rust engine used to DEFER this (a refusal on the Rust server), and the
+    pure engine still raises code 2 -- a Python-side gap recorded in
+    `tasks/backlog.md`. So this compares the Rust engine with values MEASURED on
+    mongod 8.2.11 (2026-09-30), not with the pure engine.
+    """
+    docs = [{"_id": i, "a": bson.Decimal128(v)} for i, v in enumerate(["1.5", "2.5"])]
+    pipeline = [{"$bucketAuto": {"groupBy": "$a", "buckets": 2, "granularity": "R5"}}]
+    docs_b = bson.decode(bson.encode({"d": docs}))["d"]
+    pipeline_b = bson.decode(bson.encode({"p": pipeline}))["p"]
+    got = [row["_id"] for row in _rust_pipeline(docs_b, pipeline_b)]
+    assert [(str(b["min"]), str(b["max"])) for b in got] == [
+        ("1.00000000000000", "1.60000000000000"),
+        ("1.60000000000000", "4.00000000000000"),
+    ]
 
 
 @pytest.mark.parametrize(

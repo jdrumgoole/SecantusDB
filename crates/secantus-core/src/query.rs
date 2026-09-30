@@ -1459,6 +1459,39 @@ const JSON_SCHEMA_UNSUPPORTED: &[&str] =
 /// verbatim from a mongod 7.0 probe. Returns `Some((code, codeName, errmsg))`
 /// for the first violation, `None` for a clean schema. The command layer runs
 /// this up-front (mongod rejects the whole query before matching a document).
+/// A `type` / `bsonType` name mongod refuses while PARSING the schema --
+/// before any document is looked at. Measured 8.2.11 (2026-09-30):
+///
+/// - `integer` in either keyword is 9 "not currently supported" -- it was
+///   accepted, and matched ints, where mongod runs no query at all;
+/// - `type` takes only the six JSON names (`int` is an unknown alias there,
+///   although `bsonType` takes it), and an unknown name is 2 BadValue.
+///
+/// `integer` wins over an unknown name anywhere in the list.
+fn json_schema_type_name_error(kw: &str, arg: &Bson) -> Option<(i32, &'static str, String)> {
+    const JSON_TYPES: [&str; 6] = ["object", "array", "number", "boolean", "string", "null"];
+    let names: Vec<&str> = match arg {
+        Bson::String(s) => vec![s.as_str()],
+        Bson::Array(a) => a.iter().filter_map(Bson::as_str).collect(),
+        _ => return None,
+    };
+    if names.contains(&"integer") {
+        return Some((
+            9,
+            "FailedToParse",
+            "$jsonSchema type 'integer' is not currently supported.".into(),
+        ));
+    }
+    names.into_iter().find_map(|n| {
+        let known = if kw == "type" {
+            JSON_TYPES.contains(&n)
+        } else {
+            type_spec_valid(&Bson::String(n.to_string())).is_ok()
+        };
+        (!known).then(|| (2, "BadValue", format!("Unknown type name alias: {n}")))
+    })
+}
+
 pub fn json_schema_keyword_error(schema: &Bson) -> Option<(i32, &'static str, String)> {
     let Bson::Document(sch) = schema else {
         return Some((14, "TypeMismatch", "$jsonSchema must be an object".into()));
@@ -1505,6 +1538,11 @@ pub fn json_schema_keyword_error(schema: &Bson) -> Option<(i32, &'static str, St
                     "FailedToParse",
                     "$jsonSchema keyword 'multipleOf' must have a positive value".into(),
                 ));
+            }
+        }
+        if kw == "type" || kw == "bsonType" {
+            if let Some(e) = json_schema_type_name_error(kw, arg) {
+                return Some(e);
             }
         }
         if kw == "exclusiveMinimum" || kw == "exclusiveMaximum" {
@@ -3128,5 +3166,44 @@ mod tests {
         // recursively inside sub-arrays
         assert!(!m(doc! {"arr": [[1, 2], [1.0, 2.0]]}, schema.clone()));
         assert!(m(doc! {"arr": [[1, 2], [1, 3]]}, schema));
+    }
+}
+
+/// `type` / `bsonType` names mongod refuses while parsing a `$jsonSchema`
+/// (measured 8.2.11, 2026-09-30).
+#[cfg(test)]
+mod json_schema_type_name_tests {
+    use super::json_schema_keyword_error;
+    use bson::bson;
+
+    fn code(schema: bson::Bson) -> Option<(i32, String)> {
+        json_schema_keyword_error(&bson!({"properties": {"v": schema}})).map(|(c, _, m)| (c, m))
+    }
+
+    #[test]
+    fn integer_is_not_supported_in_either_keyword() {
+        let want = Some((
+            9,
+            "$jsonSchema type 'integer' is not currently supported.".to_string(),
+        ));
+        assert_eq!(code(bson!({"type": "integer"})), want);
+        assert_eq!(code(bson!({"bsonType": "integer"})), want);
+        // `integer` wins over an unknown name, wherever it sits.
+        assert_eq!(code(bson!({"bsonType": ["int", "integer"]})), want);
+        assert_eq!(code(bson!({"type": ["string", "integer"]})), want);
+    }
+
+    #[test]
+    fn type_takes_only_json_names_and_bson_type_takes_aliases() {
+        assert_eq!(
+            code(bson!({"type": "int"})),
+            Some((2, "Unknown type name alias: int".to_string()))
+        );
+        assert_eq!(
+            code(bson!({"bsonType": "foo"})),
+            Some((2, "Unknown type name alias: foo".to_string()))
+        );
+        assert_eq!(code(bson!({"bsonType": "int"})), None);
+        assert_eq!(code(bson!({"type": "number"})), None);
     }
 }

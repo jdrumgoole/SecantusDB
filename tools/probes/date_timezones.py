@@ -29,15 +29,12 @@ import os
 import sys
 
 import pymongo
-from _servers import probe_store
-
-from secantus import SecantusDBServer
+from _servers import probe_server
 
 targets = [
     ("mongod", pymongo.MongoClient(os.environ.get("PROBE_MONGOD", "mongodb://127.0.0.1:27041")))
 ]
-_s = SecantusDBServer(port=0, storage_path=probe_store())
-_s.start()
+_s = probe_server()
 targets.append(("python", pymongo.MongoClient(_s.uri)))
 if os.environ.get("PROBE_SERVER"):
     targets.append(("rust", pymongo.MongoClient(os.environ["PROBE_SERVER"])))

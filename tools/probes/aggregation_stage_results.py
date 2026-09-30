@@ -121,6 +121,11 @@ STAGES: list[tuple[str, list]] = [
     ("project-computed", [{"$project": {"double": {"$multiply": ["$v", 2]}}}]),
     ("project-nested", [{"$project": {"sub.k": 1}}]),
     ("project-rename", [{"$project": {"renamed": "$v"}}]),
+    # `{_id: 1}` alone is an INCLUSION projection; the Rust server returned the
+    # whole document for it (2026-09-30). The pair beside it keeps it honest.
+    ("project-id-only", [{"$project": {"_id": 1}}]),
+    ("project-id-true", [{"$project": {"_id": True}}]),
+    ("project-id-and-exclude", [{"$project": {"_id": 1, "v": 0}}]),
     ("addfields", [{"$addFields": {"extra": {"$type": "$v"}}}]),
     ("set-overwrite", [{"$set": {"v": "$g"}}]),
     ("unset", [{"$unset": "arr"}]),

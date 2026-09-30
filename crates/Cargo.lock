@@ -1447,8 +1447,10 @@ version = "0.5.3-beta.165"
 dependencies = [
  "base64",
  "hmac 0.12.1",
+ "md-5 0.10.6",
  "pbkdf2",
  "rand 0.9.4",
+ "sha1",
  "sha2 0.10.9",
  "stringprep",
  "subtle",

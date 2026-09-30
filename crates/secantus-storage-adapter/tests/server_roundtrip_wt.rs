@@ -346,7 +346,10 @@ fn awaitable_exhaust_hello_streams_more_to_come() {
     let hello = doc! {
         "hello": 1,
         "maxAwaitTimeMS": 100i32,
-        "topologyVersion": {"counter": 0i64},
+        // Another process's topology: the client is out of date, so the first
+        // frame comes at once and later ones are held. (A malformed version --
+        // this used to send no `processId` -- is a 40414 on mongod and here.)
+        "topologyVersion": {"processId": bson::oid::ObjectId::new(), "counter": 0i64},
         "$db": "admin",
     };
     let body = enc(&hello);

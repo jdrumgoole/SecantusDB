@@ -132,3 +132,13 @@ impl Fallback {
         )
     }
 }
+
+/// A spent `maxTimeMS` budget inside an engine loop. mongod's message is the
+/// bare "operation exceeded time limit" whenever the aggregate has not started
+/// streaming results, so it is sent without a pipeline wrapper.
+impl From<crate::deadline::MaxTimeMsExpired> for Fallback {
+    fn from(_: crate::deadline::MaxTimeMsExpired) -> Self {
+        use crate::deadline::MaxTimeMsExpired as E;
+        Fallback::mongo(E::CODE, E::MESSAGE).bare()
+    }
+}

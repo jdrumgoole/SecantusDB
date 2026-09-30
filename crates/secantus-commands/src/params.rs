@@ -115,11 +115,27 @@ const STARTUP_ONLY: &[&str] = &[
 #[derive(Default)]
 pub struct ServerParams {
     values: Mutex<BTreeMap<String, Bson>>,
+    /// Sticky: a user has existed on this server since it started. mongod closes
+    /// its localhost exception for the life of the PROCESS once any user
+    /// exists -- deleting every user does not reopen it until a restart
+    /// (measured 8.2.11, 2026-09-30).
+    users_seen: std::sync::atomic::AtomicBool,
 }
 
 impl ServerParams {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record that a user exists (see `users_seen`).
+    pub fn mark_users_seen(&self) {
+        self.users_seen
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether a user has existed since the server started.
+    pub fn users_seen(&self) -> bool {
+        self.users_seen.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The current value, or `None` when it has never been set.

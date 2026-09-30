@@ -40,14 +40,15 @@ _LISTENING_RE = re.compile(r"listening on (\d{1,3}(?:\.\d{1,3}){3}):(\d+)")
 
 # Python-server-only daemon flags the `secantusdb` binary doesn't accept yet;
 # each takes a following value, dropped together when targeting the Rust server.
-_PYTHON_ONLY_FLAGS = {
-    "--log-level",
-    "--noop-heartbeat-seconds",
-    "--cache-size",
-    "--session-max",
-    "--sync-on-commit",
-    "--oplog-retention-seconds",
-}
+#
+# EMPTY since 2026-09-30: `secantusd-rs --help` accepts every flag this used to
+# list (`--log-level`, `--noop-heartbeat-seconds`, `--cache-size`,
+# `--session-max`, `--sync-on-commit`, `--oplog-retention-seconds`), so
+# stripping them only hid behaviour from the Rust gauges -- the Go gauge's
+# change streams ran with no noop heartbeat on the Rust server alone. Note
+# `--sync-on-commit` is a BOOLEAN there: were it ever listed again, the
+# skip-the-value loop below would drop the argument after it.
+_PYTHON_ONLY_FLAGS: set[str] = set()
 
 
 def gauge_server() -> str:

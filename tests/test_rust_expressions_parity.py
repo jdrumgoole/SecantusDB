@@ -1155,10 +1155,20 @@ def test_index_math_fuzz():
         arr = [rng.randint(0, 4) for _ in range(rng.randint(0, 6))]
         s = "".join(rng.choice("abcde") for _ in range(rng.randint(0, 6)))
         lo, hi = rng.randint(-8, 8), rng.randint(-8, 8)
+        # The 3-argument `$slice` is drawn with a POSITIVE count and a
+        # NON-NEGATIVE position. Both engines were wrong together outside that
+        # range, and only the Rust one is fixed (2026-09-30, measured 8.2.11):
+        # mongod refuses a count of 0 or less (28729), and a negative position
+        # counts from the NORMALISED start -- `[[4, 3, 1, 3, 1], -3, 4]` is
+        # `[1, 3, 1]`, where the Python engine answers `[]`. Those are
+        # Python-side divergences recorded in `tasks/backlog.md`, not drift to
+        # fold back into Rust; the Rust behaviour is pinned by
+        # `int32_argument_tests` in `secantus-core/src/expressions.rs`.
+        count, pos = rng.randint(1, 8), rng.randint(0, 8)
         expr = rng.choice(
             [
                 {"$slice": [arr, lo]},
-                {"$slice": [arr, lo, hi]},
+                {"$slice": [arr, pos, count]},
                 {"$substrCP": [s, lo, hi]},
                 {"$indexOfArray": [arr, rng.randint(0, 4)]},
                 {"$indexOfArray": [arr, rng.randint(0, 4), lo]},

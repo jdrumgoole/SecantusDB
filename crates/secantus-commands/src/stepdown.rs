@@ -30,6 +30,13 @@
 //! requested period. A client that measures how long the server stays secondary
 //! after a ZERO-second forced step-down will see a difference; every other
 //! observable in the table above matches.
+//!
+//! The same machinery sets how far `topologyVersion.counter` moves. mongod
+//! passes through several states each way and bumps the counter at each (+2
+//! stepping down, +3 more back to primary, measured 8.2.11); here each of the
+//! two transitions is ONE bump. What a driver relies on -- the counter only
+//! grows, and grows at every change it must notice -- holds; the size of each
+//! step is election bookkeeping.
 
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex;
@@ -63,19 +70,46 @@ impl StepDownState {
 
     /// Whether this node is currently a secondary because it stepped down.
     pub fn is_stepped_down(&self) -> bool {
-        match self.until.lock() {
-            Ok(guard) => guard.is_some_and(|deadline| Instant::now() < deadline),
-            // A poisoned lock must not silently promote a secondary back to
-            // primary: report the safe answer and let the write be refused.
-            Err(poisoned) => poisoned
-                .into_inner()
-                .is_some_and(|deadline| Instant::now() < deadline),
-        }
+        self.settle()
     }
 
     /// The current `topologyVersion.counter`.
     pub fn topology_counter(&self) -> i64 {
+        self.settle();
         self.counter.load(Ordering::SeqCst)
+    }
+
+    /// Close an elapsed step-down window, and return whether one is still open.
+    ///
+    /// Becoming primary again is a topology change, so it moves the counter
+    /// like the step-down did. It used not to: the window simply lapsed, the
+    /// counter stayed where the step-down left it, and a streaming monitor
+    /// holding for a change was never woken -- the driver learned the node was
+    /// writable again only when `maxAwaitTimeMS` ran out, where mongod pushes
+    /// it at once (measured 8.2.11, 2026-09-30: its counter moves on every
+    /// transition, down and back up). The window has no timer of its own, so
+    /// whichever caller first sees it elapsed performs the bump; the hello
+    /// stream polls this every 20ms.
+    fn settle(&self) -> bool {
+        let mut guard = match self.until.lock() {
+            Ok(guard) => guard,
+            // A poisoned lock must not silently promote a secondary back to
+            // primary: report the safe answer and let the write be refused.
+            Err(poisoned) => {
+                return poisoned
+                    .into_inner()
+                    .is_some_and(|deadline| Instant::now() < deadline)
+            }
+        };
+        match *guard {
+            Some(deadline) if Instant::now() < deadline => true,
+            Some(_) => {
+                *guard = None;
+                self.counter.fetch_add(1, Ordering::SeqCst);
+                false
+            }
+            None => false,
+        }
     }
 
     fn step_down_for(&self, period: Duration) {
@@ -201,6 +235,20 @@ mod tests {
         let mut c = ctx(true);
         replset_step_down(&doc! {"replSetStepDown": 0_i32, "force": true}, &mut c).unwrap();
         assert!(!c.step_down.as_ref().unwrap().is_stepped_down());
+    }
+
+    #[test]
+    fn becoming_primary_again_moves_the_topology_counter() {
+        let state = StepDownState::new();
+        assert_eq!(state.topology_counter(), 0);
+        state.step_down_for(Duration::from_millis(30));
+        assert_eq!(state.topology_counter(), 1);
+        assert!(state.is_stepped_down());
+        std::thread::sleep(Duration::from_millis(60));
+        // The window lapsed: primary again, and that is a second change.
+        assert_eq!(state.topology_counter(), 2);
+        assert!(!state.is_stepped_down());
+        assert_eq!(state.topology_counter(), 2, "bumped once, not per call");
     }
 
     #[test]
