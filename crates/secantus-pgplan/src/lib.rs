@@ -35,6 +35,8 @@ pub mod instead_of;
 pub mod pgcrypto;
 pub mod geom;
 pub mod regobj;
+pub mod privileges;
+pub mod rls;
 pub use correlated::set_user_functions;
 pub use correlated::{
     with_correlated_runner, with_function_hook, with_sequence_hook, FnResult, UserFn,
@@ -1813,9 +1815,12 @@ pub enum ConstCol {
     /// `pg_cancel_backend(pid)` -- cancel that backend's running statement.
     /// Same argument shapes as `TerminateBackend`.
     CancelBackend(Box<ConstCol>),
-    /// `current_user` / `session_user` / `user` / `current_role` -- the role
-    /// the client connected as, which only the server's session knows.
+    /// `session_user` -- the role the client connected as, which only the
+    /// server's session knows.
     SessionUser,
+    /// `current_user` / `user` / `current_role` -- the EFFECTIVE role, which
+    /// `SET ROLE` changes.
+    CurrentUser,
     /// `current_database()` / `current_catalog` -- the database the client
     /// connected to, which only the server's session knows.
     CurrentDatabase,
@@ -3982,8 +3987,10 @@ fn default_value_or_expr(
 pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
     match action {
         // Nothing in the table's shape.
+        AlterTableAction::OwnerTo(role) => {
+            def.extra.insert("owner", role.clone());
+        }
         AlterTableAction::RowSecurity { .. }
-        | AlterTableAction::OwnerTo(_)
         | AlterTableAction::AttachPartition { .. }
         | AlterTableAction::DetachPartition(_)
         | AlterTableAction::ValidateConstraint(_) => {}
@@ -4945,7 +4952,7 @@ pub fn is_view(name: &str) -> bool {
 /// expression and each side of a set operation are all planned through
 /// `plan_select` in their turn, which expands their own references.
 fn expand_views(s: &pg_query::protobuf::SelectStmt) -> Result<pg_query::protobuf::SelectStmt> {
-    if PLAN_VIEWS.with(|v| v.borrow().is_empty()) {
+    if PLAN_VIEWS.with(|v| v.borrow().is_empty()) && !rls::active() {
         return Ok(s.clone());
     }
     let mut out = s.clone();
@@ -4956,6 +4963,8 @@ fn expand_views(s: &pg_query::protobuf::SelectStmt) -> Result<pg_query::protobuf
 }
 
 fn expand_views_in_from(item: &mut pg_query::protobuf::Node, depth: usize) -> Result<()> {
+    // A table row-level security restricts reads as its filtered subquery.
+    rls::expand_from(item)?;
     match item.node.as_mut() {
         Some(N::RangeVar(r)) => {
             if !(r.schemaname.is_empty() || r.schemaname == "public") || !r.catalogname.is_empty() {
@@ -10507,6 +10516,8 @@ fn rewrite_dml_from(
     // A write whose target is a VIEW becomes the same write on its base
     // table (automatically updatable views).
     view_dml::rewrite(node, lookup)?;
+    // Row-level security, on the relation the write finally targets.
+    rls::rewrite_dml(node)?;
     // An enum compares by its labels' positions in an UPDATE / DELETE's
     // WHERE too.
     enum_order::rewrite_dml(node, lookup)?;
@@ -14320,8 +14331,9 @@ fn sql_value_function(svf: &pg_query::protobuf::SqlValueFunction) -> Result<Bson
     use pg_query::protobuf::SqlValueFunctionOp as Op;
     let op = Op::try_from(svf.op).unwrap_or(Op::SqlvalueFunctionOpUndefined);
     Ok(match op {
-        Op::SvfopCurrentUser | Op::SvfopUser | Op::SvfopSessionUser | Op::SvfopCurrentRole => {
-            session_user().map_or(Bson::Null, Bson::String)
+        Op::SvfopSessionUser => session_user().map_or(Bson::Null, Bson::String),
+        Op::SvfopCurrentUser | Op::SvfopUser | Op::SvfopCurrentRole => {
+            current_user().map_or(Bson::Null, Bson::String)
         }
         Op::SvfopCurrentCatalog => Bson::String(session_database()),
         Op::SvfopCurrentSchema => Bson::String("public".into()),
@@ -16250,10 +16262,10 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                     continue;
                 }
                 let (name, col) = match op {
-                    Op::SvfopCurrentUser => ("current_user", ConstCol::SessionUser),
-                    Op::SvfopUser => ("user", ConstCol::SessionUser),
+                    Op::SvfopCurrentUser => ("current_user", ConstCol::CurrentUser),
+                    Op::SvfopUser => ("user", ConstCol::CurrentUser),
                     Op::SvfopSessionUser => ("session_user", ConstCol::SessionUser),
-                    Op::SvfopCurrentRole => ("current_role", ConstCol::SessionUser),
+                    Op::SvfopCurrentRole => ("current_role", ConstCol::CurrentUser),
                     Op::SvfopCurrentCatalog => ("current_catalog", ConstCol::CurrentDatabase),
                     Op::SvfopCurrentSchema => (
                         "current_schema",
@@ -18200,6 +18212,23 @@ pub(crate) fn session_setting(name: &str) -> Option<String> {
 
 pub(crate) fn session_user() -> Option<String> {
     PLAN_SESSION_USER.with(|u| u.borrow().clone())
+}
+
+thread_local! {
+    static PLAN_CURRENT_USER: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install the EFFECTIVE role (`SET ROLE`'s), for `current_user`.
+pub fn set_current_user(user: Option<String>) {
+    PLAN_CURRENT_USER.with(|u| *u.borrow_mut() = user);
+}
+
+/// The effective role: `SET ROLE`'s, else the session's.
+pub(crate) fn current_user() -> Option<String> {
+    PLAN_CURRENT_USER
+        .with(|u| u.borrow().clone())
+        .or_else(session_user)
 }
 
 pub(crate) fn warn(sqlstate: &str, message: String) {

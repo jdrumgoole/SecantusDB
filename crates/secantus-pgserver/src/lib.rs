@@ -1109,6 +1109,185 @@ impl PgHandler {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
+
+    /// The EFFECTIVE role: `SET ROLE`'s, else the session's.
+    fn current_role_name(&self) -> String {
+        let role = self
+            .settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get("role")
+            .cloned()
+            .unwrap_or_default();
+        if role.is_empty() || role.eq_ignore_ascii_case("none") {
+            self.session_user_name()
+        } else {
+            role
+        }
+    }
+
+    /// A table's owner: the role that created it (or took it with `ALTER
+    /// TABLE ... OWNER TO`); a table from before owners were recorded
+    /// belongs to the session's login role.
+    fn table_owner(&self, def: &TableDef) -> String {
+        def.extra
+            .get_str("owner")
+            .map(str::to_string)
+            .unwrap_or_else(|_| self.session_user_name())
+    }
+
+    /// May the effective role use `privilege` on `table`? A superuser and the
+    /// owner (or a member of the owning role) may; anyone else needs a GRANT
+    /// to itself, a role it is in, or PUBLIC. 42501 otherwise.
+    fn check_table_privilege(&self, table: &str, privilege: &str) -> PgWireResult<()> {
+        let role = self.current_role_name();
+        if self.is_superuser(&role) {
+            return Ok(());
+        }
+        let Some(def) = self.lookup(table) else {
+            return Ok(());
+        };
+        let member_of = |other: &str| -> bool {
+            other == role
+                || self
+                    .has_role_call(&[
+                        Bson::String(role.clone()),
+                        Bson::String(other.to_string()),
+                        Bson::String("USAGE".into()),
+                    ])
+                    .is_ok_and(|b| b == Bson::Boolean(true))
+        };
+        if member_of(&self.table_owner(&def)) {
+            return Ok(());
+        }
+        let granted = self
+            .storage
+            .find_matching(
+                self.db(),
+                Self::GRANT_COLLECTION,
+                &bson::doc! {"table": table},
+            )
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|b| decode_doc(b).ok())
+            .any(|g| {
+                let grantee = g.get_str("grantee").unwrap_or_default();
+                (grantee.eq_ignore_ascii_case("PUBLIC") || member_of(grantee))
+                    && g.get_array("privileges").is_ok_and(|ps| {
+                        ps.iter().any(|p| p.as_str() == Some(privilege))
+                    })
+            });
+        if granted {
+            return Ok(());
+        }
+        Err(Self::user_error(
+            "42501",
+            format!("permission denied for table {table}"),
+        ))
+    }
+
+    /// The tables row-level security restricts for the effective role, with
+    /// each command's combined policy conditions: permissive policies ORed
+    /// (none at all denies), restrictive ones ANDed on. A superuser, a
+    /// BYPASSRLS role and -- unless FORCE -- the owner are not restricted.
+    fn rls_tables(&self) -> Vec<secantus_pgplan::rls::RlsTable> {
+        let role = self.current_role_name();
+        if self.is_superuser(&role)
+            || self.role(&role).ok().flatten().is_some_and(|r| r.bypassrls)
+        {
+            return Vec::new();
+        }
+        let Ok(enabled) = self
+            .storage
+            .find_matching(self.db(), Self::RLS_COLLECTION, &bson::doc! {"enabled": true})
+        else {
+            return Vec::new();
+        };
+        let policies = self.policy_docs();
+        let member_of = |other: &str| -> bool {
+            other.eq_ignore_ascii_case("PUBLIC")
+                || other == role
+                || self
+                    .has_role_call(&[
+                        Bson::String(role.clone()),
+                        Bson::String(other.to_string()),
+                        Bson::String("USAGE".into()),
+                    ])
+                    .is_ok_and(|b| b == Bson::Boolean(true))
+        };
+        let mut out = Vec::new();
+        for doc in enabled.iter().filter_map(|b| decode_doc(b).ok()) {
+            let table = doc.get_str("_id").unwrap_or_default().to_string();
+            let forced = doc.get_bool("forced").unwrap_or(false);
+            let Some(def) = self.lookup(&table) else { continue };
+            if !forced && member_of(&self.table_owner(&def)) {
+                continue;
+            }
+            // Policies on this table that apply to this role.
+            let mine: Vec<&Document> = policies
+                .iter()
+                .filter(|p| p.get_str("table") == Ok(table.as_str()))
+                .filter(|p| {
+                    p.get_array("roles").is_ok_and(|rs| {
+                        rs.iter().any(|r| r.as_str().is_some_and(|r| member_of(r)))
+                    })
+                })
+                .collect();
+            let combine = |command: &str, key: &str, fallback_using: bool| -> String {
+                let applies = |p: &&&Document| {
+                    let c = p.get_str("command").unwrap_or("ALL");
+                    c == "ALL" || c == command
+                };
+                let expr = |p: &Document| -> Option<String> {
+                    let own = p.get_str(key).ok().map(str::to_string);
+                    if fallback_using {
+                        own.or_else(|| p.get_str("using").ok().map(str::to_string))
+                    } else {
+                        own
+                    }
+                };
+                let permissive: Vec<String> = mine
+                    .iter()
+                    .filter(applies)
+                    .filter(|p| p.get_bool("permissive").unwrap_or(true))
+                    .map(|p| expr(p).unwrap_or_else(|| "true".into()))
+                    .collect();
+                let restrictive: Vec<String> = mine
+                    .iter()
+                    .filter(applies)
+                    .filter(|p| !p.get_bool("permissive").unwrap_or(true))
+                    .filter_map(|p| expr(p))
+                    .collect();
+                let mut cond = if permissive.is_empty() {
+                    "false".to_string()
+                } else {
+                    format!("(({}))", permissive.join(") OR ("))
+                };
+                for r in restrictive {
+                    cond = format!("({cond} AND ({r}))");
+                }
+                cond
+            };
+            out.push(secantus_pgplan::rls::RlsTable {
+                table: table.clone(),
+                select: Some(combine("SELECT", "using", false)),
+                update: Some(combine("UPDATE", "using", false)),
+                delete: Some(combine("DELETE", "using", false)),
+                insert_check: Some(combine("INSERT", "check", true)),
+                update_check: Some(combine("UPDATE", "check", true)),
+            });
+        }
+        out
+    }
+
+    /// Is `name` a superuser? The login user this server has no record of
+    /// is trusted as one (the password-less bootstrap `postgres`).
+    fn is_superuser(&self, name: &str) -> bool {
+        match self.role(name) {
+            Ok(Some(r)) => r.superuser,
+            _ => name == self.session_user_name(),
+        }
+    }
 }
 
 /// One database's worth of SQL over a shared `Storage`.
@@ -1689,6 +1868,8 @@ impl PgHandler {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
         ));
+        secantus_pgplan::set_current_user(Some(self.current_role_name()));
+        secantus_pgplan::rls::set_rls(self.rls_tables());
         // The database and the GUCs, for `current_database()` and
         // `current_setting()` reached INSIDE an expression -- where the
         // constant evaluator handles them rather than the server, and had
@@ -4752,6 +4933,12 @@ impl PgHandler {
                 .map_err(|e| Self::err(&e))?;
             let verdict = secantus_pgplan::apply_row_expr(&expr, row).map_err(|e| Self::err(&e))?;
             if verdict != Bson::Boolean(true) {
+                if let Some(table) = view.strip_prefix(secantus_pgplan::rls::CHECK_PREFIX) {
+                    return Err(Self::user_error(
+                        "42501",
+                        format!("new row violates row-level security policy for table \"{table}\""),
+                    ));
+                }
                 let mut info = if self.is_partition(view) {
                     ErrorInfo::new(
                         "ERROR".into(),
@@ -11299,8 +11486,7 @@ impl PgHandler {
                 return Ok(Some(action.clone()))
             }
             A::OwnerTo(role) => {
-                self.grantee_name(role)?;
-                return Ok(None);
+                return Ok(Some(A::OwnerTo(self.grantee_name(role)?)));
             }
             A::ValidateConstraint(name) => {
                 let exists = def.check_constraints.iter().any(|c| c.name == *name)
@@ -13021,6 +13207,7 @@ impl PgHandler {
                     .unwrap_or_else(|e| e.into_inner())
                     .clone(),
             )),
+            ConstCol::CurrentUser => Ok(Bson::String(self.current_role_name())),
             ConstCol::CurrentDatabase => Ok(Bson::String(self.db().to_string())),
             // `pg_sleep(NULL)` is NULL (strict); zero or negative seconds
             // return at once; otherwise the wait is the given fraction of a
@@ -15348,6 +15535,13 @@ impl PgHandler {
     }
 
     fn execute_statement(&self, stmt: Statement, max_rows: usize) -> PgWireResult<Vec<Response>> {
+        // Table privileges, for a role that is not a superuser: nothing to
+        // look up in the common case.
+        if !self.is_superuser(&self.current_role_name()) {
+            for (table, privilege) in secantus_pgplan::privileges::statement_relations(&stmt) {
+                self.check_table_privilege(&table, privilege)?;
+            }
+        }
         // A READ ONLY transaction refuses every write, DDL included, with the
         // statement's own command name (`cannot execute INSERT in a read-only
         // transaction`). Checked here, where a statement run by another --
@@ -15498,6 +15692,8 @@ impl PgHandler {
                     })?;
                     secantus_pgplan::resolve_fk_target(fk, &target).map_err(|e| Self::err(&e))?;
                 }
+                // The creating role owns the table.
+                def.extra.insert("owner", self.current_role_name());
                 self.storage
                     .create_collection(self.db(), &def.name)
                     .map_err(|e| Self::storage_err("could not create the table", e))?;
@@ -18172,6 +18368,38 @@ impl PgHandler {
 
             Statement::Set { name, value } => {
                 let key = canonical_setting(&name);
+                if key == "role" {
+                    // `SET ROLE r`: r must exist, and a non-superuser may take
+                    // only a role it is a member of.
+                    let wanted = value.trim().trim_matches('\'').to_string();
+                    if !wanted.eq_ignore_ascii_case("none") {
+                        let session = self.session_user_name();
+                        if wanted != session && self.role(&wanted)?.is_none() {
+                            return Err(Self::user_error(
+                                "22023",
+                                format!("role \"{wanted}\" does not exist"),
+                            ));
+                        }
+                        if !self.is_superuser(&session)
+                            && wanted != session
+                            && self.has_role_call(&[
+                                Bson::String(session.clone()),
+                                Bson::String(wanted.clone()),
+                                Bson::String("MEMBER".into()),
+                            ])? != Bson::Boolean(true)
+                        {
+                            return Err(Self::user_error(
+                                "42501",
+                                format!("permission denied to set role \"{wanted}\""),
+                            ));
+                        }
+                    }
+                    self.settings
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert("role".into(), wanted);
+                    return Ok(vec![Response::Execution(Tag::new("SET"))]);
+                }
                 if key == "client_encoding" {
                     // Validated, canonicalised, and reported separately: an
                     // invalid name must be refused (not stored), and the stored

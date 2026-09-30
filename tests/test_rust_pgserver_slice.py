@@ -14500,3 +14500,35 @@ def test_jsonpath_datetime_and_nested_srfs(home: Path) -> None:
             conn, f"SELECT count(*) FROM jsonb_path_query_tz('\"2020-01-02\"', {tz_query})"
         ) == [(1,)]
         assert _fetch(conn, "SELECT generate_series(1, 3) * 2") == [(2,), (4,), (6,)]
+
+
+def test_row_level_security_enforced(home: Path) -> None:
+    """With row security on, a non-owner sees and writes only what its
+    policies allow: no policy denies everything, permissive policies OR,
+    restrictive ones AND, a new row failing a check is 42501, and a
+    reading UPDATE / DELETE is filtered by the SELECT policies too. A
+    superuser and a BYPASSRLS role are not restricted."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE ROLE ra LOGIN")
+        conn.execute("CREATE ROLE rb LOGIN BYPASSRLS")
+        conn.execute("CREATE TABLE rt (id int, owner text, lvl int)")
+        conn.execute("INSERT INTO rt VALUES (1, 'ra', 1), (2, 'x', 1), (3, 'ra', 5)")
+        conn.execute("GRANT ALL ON rt TO ra, rb")
+        conn.execute("ALTER TABLE rt ENABLE ROW LEVEL SECURITY")
+        conn.execute("SET ROLE ra")
+        assert _fetch(conn, "SELECT count(*) FROM rt") == [(0,)]
+        conn.execute("RESET ROLE")
+        conn.execute("CREATE POLICY s ON rt FOR SELECT USING (owner = current_user)")
+        conn.execute("CREATE POLICY i ON rt FOR INSERT WITH CHECK (owner = current_user)")
+        conn.execute("CREATE POLICY d ON rt FOR DELETE USING (lvl = 1)")
+        conn.execute("CREATE POLICY r ON rt AS RESTRICTIVE FOR SELECT USING (lvl < 3)")
+        conn.execute("SET ROLE ra")
+        assert _fetch(conn, "SELECT id FROM rt ORDER BY id") == [(1,)]
+        assert _sqlstate(conn, "INSERT INTO rt VALUES (9, 'x', 1)") == "42501"
+        conn.execute("INSERT INTO rt VALUES (8, 'ra', 1)")
+        # RETURNING reads the rows, so row 2 (not visible) is not deleted.
+        assert sorted(_fetch(conn, "DELETE FROM rt RETURNING id")) == [(1,), (8,)]
+        conn.execute("SET ROLE rb")
+        assert _fetch(conn, "SELECT id FROM rt ORDER BY id") == [(2,), (3,)]
+        conn.execute("RESET ROLE")
+        assert _fetch(conn, "SELECT count(*) FROM rt") == [(2,)]
