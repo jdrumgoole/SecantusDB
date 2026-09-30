@@ -13,6 +13,7 @@ mod advisory;
 mod aggregates;
 mod casts;
 mod catalog_fill;
+mod catalog_meta;
 mod catalog_objects;
 mod collations;
 mod do_block;
@@ -9642,6 +9643,7 @@ impl PgHandler {
                         rows.push(d);
                     }
                 }
+                rows.extend(catalog_meta::column_rows(&def, self.db()));
                 rows
             }
             "information_schema.views" => {
@@ -9752,6 +9754,7 @@ impl PgHandler {
                             })
                             .collect::<Vec<_>>(),
                     )
+                    .chain(catalog_meta::relation_rows(&def, &db))
                     .collect()
             }
             "information_schema.table_constraints" => {

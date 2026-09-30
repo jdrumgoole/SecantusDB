@@ -14967,3 +14967,44 @@ def test_sqlalchemy_reflection_matches_postgresql(home: Path) -> None:
         assert i.get_unique_constraints("sa_p")[0]["column_names"] == ["code"]
         assert i.get_table_comment("sa_c") == {"text": "kids"}
         engine.dispose()
+
+
+def test_delete_using_a_derived_table_deletes_only_its_matches(home: Path) -> None:
+    """A table named inside a derived table in USING is that table, not the target.
+
+    `DELETE FROM t USING (SELECT v.id FROM v WHERE id = 1) s WHERE t.id = s.id`
+    deleted EVERY row of `t`: the derived table's own relation was read as an
+    outer reference, so its filter never applied. PostgreSQL deletes one row.
+    """
+    with _Server(home) as server, server.connect() as c:
+        c.execute("create table dq_o (id int, n int)")
+        c.execute("insert into dq_o values (1, 10), (2, 20), (3, 30)")
+        c.execute("create view dq_v as select id, n from dq_o")
+        cur = c.execute(
+            "delete from dq_o using (select dq_v.id as o_id from dq_v where id = 1) as s "
+            "where dq_o.id = s.o_id"
+        )
+        assert cur.statusmessage == "DELETE 1"
+        assert c.execute("select id from dq_o order by id").fetchall() == [(2,), (3,)]
+
+
+def test_a_rule_action_runs_once_per_statement_not_per_row(home: Path) -> None:
+    """A rule rewrites the statement; it is not a trigger.
+
+    An action naming neither NEW nor OLD runs once, and an UPDATE's action
+    runs BEFORE the UPDATE, so an aggregate in it sees the old rows. Run as
+    per-row triggers, both came out wrong with no error.
+    """
+    with _Server(home) as server, server.connect() as c:
+        c.execute("create table rq_t (id int, v int)")
+        c.execute("create table rq_log (n bigint)")
+        c.execute("insert into rq_t values (1, 1), (2, 2), (3, 3)")
+        c.execute("create rule rq_u as on update to rq_t do also insert into rq_log values (1)")
+        c.execute("update rq_t set v = v + 1")
+        assert c.execute("select count(*) from rq_log").fetchone() == (1,)
+        c.execute(
+            "create rule rq_d as on delete to rq_t do also "
+            "insert into rq_log select count(*) from rq_t"
+        )
+        c.execute("delete from rq_t where id = 1")
+        assert c.execute("select max(n) from rq_log").fetchone() == (3,)
