@@ -2615,3 +2615,444 @@ pub fn rem(a: &Dec, b: &Dec) -> Option<Dec> {
         exp: target,
     })
 }
+
+// --- `$pow` and `$atan2` on Decimal128 -----------------------------------
+//
+// Both follow the rule the rest of the decimal transcendentals settled on
+// (#1436): answer CORRECTLY ROUNDED at 34 digits. mongod carries Intel RDFP's
+// last-digit error, so exact agreement is capped, and being correct is the
+// closest approximation to it. For `$pow` that was measured rather than
+// assumed: over 183 finite (base, exponent) pairs against 8.2.11
+// (2026-09-30), the correctly-rounded value matched mongod on 130, where
+// `exp(e * ln b)` evaluated at 34 digits -- mongod's apparent algorithm --
+// matched on only 56.
+//
+// The special values are NOT a matter of rounding and are mongod's own,
+// measured over a 12x12 grid of {0, -0, 1, -1, 2.5, -2.5, 0.5, 3, -3, Inf,
+// -Inf, NaN} per operator. The padding is mongod's too: a result carries all
+// 34 digits (`2^10` is `1024.000000000000000000000000000000`).
+
+/// `0E-6176` / `-0E-6176`: the zero mongod answers from both operators.
+fn min_zero(sign: i8) -> Dec {
+    Dec::Fin {
+        sign,
+        coeff: vec![0],
+        exp: MIN_EXP,
+    }
+}
+
+/// `1.000000000000000000000000000000000`.
+fn one_34() -> Dec {
+    pad_34(hp_from_i64(1, 0))
+}
+
+/// Pad a finite non-zero value's coefficient to 34 significant digits, the way
+/// mongod renders every `$pow` / `$atan2` result. Never below the minimum
+/// exponent, which is where decimal128 runs out of room for the zeros.
+fn pad_34(d: Dec) -> Dec {
+    let Dec::Fin { sign, coeff, exp } = &d else {
+        return d;
+    };
+    let mut mag = strip_leading(coeff).to_vec();
+    if mag.iter().all(|x| *x == 0) || mag.len() >= MAX_DIGITS {
+        return d;
+    }
+    let room = (*exp - MIN_EXP).max(0) as usize;
+    let k = (MAX_DIGITS - mag.len()).min(room);
+    mag.extend(std::iter::repeat_n(0u8, k));
+    Dec::Fin {
+        sign: *sign,
+        coeff: mag,
+        exp: exp - k as i32,
+    }
+}
+
+/// Round an EXACT value to 34 digits, half-even.
+fn round_exact_34(d: &Dec) -> Dec {
+    match d {
+        Dec::Fin { sign, coeff, exp } => {
+            let mag = strip_leading(coeff).to_vec();
+            let (kept, bump) = round_half_even(&mag, MAX_DIGITS);
+            Dec::Fin {
+                sign: *sign,
+                coeff: kept,
+                exp: exp + bump,
+            }
+        }
+        other => other.clone(),
+    }
+}
+
+fn is_sign_negative(d: &Dec) -> bool {
+    matches!(d, Dec::Fin { sign, .. } | Dec::Inf(sign) if *sign < 0)
+}
+
+/// Whether a finite decimal is a whole number (`2.0`, `2E+3`, `-0`).
+fn is_integral(d: &Dec) -> bool {
+    let Dec::Fin { coeff, exp, .. } = d else {
+        return false;
+    };
+    if *exp >= 0 {
+        return true;
+    }
+    let frac = (-*exp) as usize;
+    coeff[coeff.len().saturating_sub(frac)..]
+        .iter()
+        .all(|x| *x == 0)
+}
+
+/// Whether an INTEGRAL decimal is odd -- its units digit, however wide.
+fn is_odd_integral(d: &Dec) -> bool {
+    let Dec::Fin { coeff, exp, .. } = d else {
+        return false;
+    };
+    if *exp > 0 {
+        return false;
+    }
+    let units = coeff.len() as i64 - 1 + *exp as i64;
+    units >= 0 && coeff[units as usize] % 2 == 1
+}
+
+/// `$pow` with a zero base and a NEGATIVE exponent -- mongod's 28764. Note
+/// "negative" is the SIGN BIT: `$pow: [0, -0]` is refused too (measured).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZeroToNegativePower;
+
+/// The widest exact power computed digit by digit before falling back to
+/// `exp(e * ln b)`. Past it the product is thousands of digits that are then
+/// rounded away, and the series is as accurate.
+const EXACT_POW_DIGITS: usize = 4_000;
+
+/// `b^e` at decimal128 precision. `Ok(None)` when the rounding could not be
+/// settled, which the caller reports rather than guess.
+pub fn pow(b: &Dec, e: &Dec) -> Result<Option<Dec>, ZeroToNegativePower> {
+    use std::cmp::Ordering;
+    let one = hp_from_i64(1, 0);
+    if b.is_zero() {
+        return match e {
+            Dec::Nan => Ok(Some(Dec::Nan)),
+            _ if is_sign_negative(e) => Err(ZeroToNegativePower),
+            _ if e.is_zero() => Ok(Some(one_34())),
+            _ => Ok(Some(min_zero(1))),
+        };
+    }
+    if e.is_zero() {
+        return Ok(Some(one_34()));
+    }
+    if matches!(b, Dec::Fin { sign: 1, .. }) && cmp_abs(b, &one) == Some(Ordering::Equal) {
+        return Ok(Some(one_34()));
+    }
+    if matches!(b, Dec::Nan) || matches!(e, Dec::Nan) {
+        return Ok(Some(Dec::Nan));
+    }
+    let b_neg = is_sign_negative(b);
+    if b_neg && cmp_abs(b, &one) == Some(Ordering::Equal) {
+        return Ok(Some(match e {
+            Dec::Inf(_) => one_34(),
+            _ if !is_integral(e) => Dec::Nan,
+            _ if is_odd_integral(e) => neg(&one_34()),
+            _ => one_34(),
+        }));
+    }
+    let e_neg = is_sign_negative(e);
+    if let Dec::Inf(_) = e {
+        let grows = cmp_abs(b, &one) == Some(Ordering::Greater);
+        return Ok(Some(if grows != e_neg {
+            Dec::Inf(1)
+        } else {
+            min_zero(1)
+        }));
+    }
+    if let Dec::Inf(_) = b {
+        return Ok(Some(if e_neg {
+            min_zero(1)
+        } else if b_neg && is_odd_integral(e) {
+            Dec::Inf(-1)
+        } else {
+            Dec::Inf(1)
+        }));
+    }
+    // Both finite and non-zero from here.
+    let integral = is_integral(e);
+    if b_neg && !integral {
+        return Ok(Some(Dec::Nan));
+    }
+    let result = if integral {
+        pow_integral(b, e)
+    } else {
+        pow_series(b, e, false)
+    };
+    Ok(result.map(|r| pad_34(clamp(&r))))
+}
+
+/// An integral exponent: the exact power when it is small enough to write out,
+/// otherwise the series with the sign restored from the exponent's parity.
+fn pow_integral(b: &Dec, e: &Dec) -> Option<Dec> {
+    let Dec::Fin { coeff: bc, .. } = b else {
+        return None;
+    };
+    let width = strip_leading(bc).len().max(1);
+    let n = trunc_to_i64(e).filter(|n| n.unsigned_abs() as usize * width <= EXACT_POW_DIGITS);
+    let Some(n) = n else {
+        return pow_series(b, e, is_sign_negative(b) && is_odd_integral(e));
+    };
+    // Exact: the working precision is wider than any product it can form.
+    let prec = EXACT_POW_DIGITS + 2 * width + 8;
+    let mut result = hp_from_i64(1, 0);
+    let mut base = b.clone();
+    let mut k = n.unsigned_abs();
+    while k > 0 {
+        if k & 1 == 1 {
+            result = hp_mul(&result, &base, prec);
+        }
+        k >>= 1;
+        if k > 0 {
+            base = hp_mul(&base, &base, prec);
+        }
+    }
+    if n > 0 {
+        return Some(round_exact_34(&result));
+    }
+    // A negative exponent is a reciprocal. When it terminates (`2.5^-1` is
+    // `0.4`) the quotient is exact and checking it by multiplying back says
+    // so; otherwise the verified-precision loop rounds it.
+    let one = hp_from_i64(1, 0);
+    let q = hp_div(&one, &result, 400);
+    let back = hp_mul(&q, &result, 2 * prec);
+    if hp_sub(&back, &one, 2 * prec).is_zero() {
+        return Some(round_exact_34(&q));
+    }
+    with_precision(|p| Some(hp_div(&one, &result, p)))
+}
+
+/// `exp(e * ln|b|)`, negated when `negate`. Saturates to the format's limits
+/// before evaluating, so a huge result costs nothing.
+fn pow_series(b: &Dec, e: &Dec, negate: bool) -> Option<Dec> {
+    let ab = if is_sign_negative(b) {
+        neg(b)
+    } else {
+        b.clone()
+    };
+    // `ln(9.99E+6144)` is about 14149.9 and `ln(0.5E-6176)` about -14223.1, so
+    // outside (-14240, 14160) the answer is decided without the series.
+    let t = hp_mul(e, &hp_ln(&ab, 40)?, 40);
+    let decided = if cmp_abs(&t, &hp_from_i64(14_160, 0)) == Some(std::cmp::Ordering::Greater)
+        && !is_sign_negative(&t)
+    {
+        Some(Dec::Inf(1))
+    } else if cmp_abs(&t, &hp_from_i64(14_240, 0)) == Some(std::cmp::Ordering::Greater) {
+        Some(min_zero(1))
+    } else {
+        None
+    };
+    let r = match decided {
+        Some(r) => r,
+        None => with_precision(|p| {
+            let t = hp_mul(e, &hp_ln(&ab, p + 10)?, p + 10);
+            hp_exp(&t, p)
+        })?,
+    };
+    Some(if negate { neg(&r) } else { r })
+}
+
+/// `pi` rounded to 34 digits.
+const PI_34: &str = "3.141592653589793238462643383279503";
+/// `pi / 2` rounded to 34 digits.
+const HALF_PI_34: &str = "1.570796326794896619231321691639751";
+/// mongod's `atan2(Inf, Inf)` -- 33 digits, one short of the correctly
+/// rounded `pi / 4` it answers for `atan2(1, 1)`. Measured, not derived.
+const INF_INF_ATAN2: &str = "0.785398163397448309615660845819876";
+/// mongod's `atan2(Inf, -Inf)`, `3 pi / 4`.
+const INF_NEG_INF_ATAN2: &str = "2.356194490192344928846982537459627";
+
+fn signed_const(text: &str, negative: bool) -> Dec {
+    let d = parse(text).expect("constant parses");
+    if negative {
+        neg(&d)
+    } else {
+        d
+    }
+}
+
+/// `atan2(y, x)` at decimal128 precision. `None` when the rounding could not
+/// be settled.
+pub fn atan2(y: &Dec, x: &Dec) -> Option<Dec> {
+    if matches!(y, Dec::Nan) || matches!(x, Dec::Nan) {
+        return Some(Dec::Nan);
+    }
+    let y_neg = is_sign_negative(y);
+    let x_neg = is_sign_negative(x);
+    if let Dec::Inf(_) = y {
+        return Some(match x {
+            Dec::Inf(_) if x_neg => signed_const(INF_NEG_INF_ATAN2, y_neg),
+            Dec::Inf(_) => signed_const(INF_INF_ATAN2, y_neg),
+            _ => signed_const(HALF_PI_34, y_neg),
+        });
+    }
+    if y.is_zero() {
+        // The zero's sign picks the side of the branch cut; `-0` in `x` counts
+        // as negative (`atan2(0, -0)` is pi).
+        return Some(if x_neg {
+            signed_const(PI_34, y_neg)
+        } else {
+            min_zero(if y_neg { -1 } else { 1 })
+        });
+    }
+    if let Dec::Inf(_) = x {
+        return Some(if x_neg {
+            signed_const(PI_34, y_neg)
+        } else {
+            min_zero(if y_neg { -1 } else { 1 })
+        });
+    }
+    if x.is_zero() {
+        return Some(signed_const(HALF_PI_34, y_neg));
+    }
+    let r = with_precision(|p| {
+        let w = p + 10;
+        let a = hp_atan(&hp_div(y, x, w), w)?;
+        Some(if !x_neg {
+            a
+        } else {
+            let pi = hp_mul(&hp_half_pi(w), &hp_from_i64(2, 0), w);
+            if y_neg {
+                hp_sub(&a, &pi, w)
+            } else {
+                hp_add(&a, &pi, w)
+            }
+        })
+    })?;
+    Some(pad_34(r))
+}
+
+#[cfg(test)]
+mod pow_atan2_tests {
+    use super::*;
+
+    fn d(s: &str) -> Dec {
+        parse(s).unwrap()
+    }
+
+    fn show(r: Option<Dec>) -> String {
+        to_string(&r.expect("settled"))
+    }
+
+    fn p(b: &str, e: &str) -> String {
+        show(pow(&d(b), &d(e)).expect("not the zero-base error"))
+    }
+
+    /// mongod 8.2.11's special values, measured 2026-09-30.
+    #[test]
+    fn pow_special_values_match_mongod() {
+        let z = "0E-6176";
+        let one = "1.000000000000000000000000000000000";
+        for (b, e, want) in [
+            ("0", "0", one),
+            ("0", "2.5", z),
+            ("0", "Infinity", z),
+            ("0", "NaN", "NaN"),
+            ("NaN", "0", one),
+            ("NaN", "1", "NaN"),
+            ("1", "NaN", one),
+            ("1", "-Infinity", one),
+            ("-1", "Infinity", one),
+            ("-1", "3", "-1.000000000000000000000000000000000"),
+            ("-1", "0.5", "NaN"),
+            ("-1", "NaN", "NaN"),
+            ("2.5", "Infinity", "Infinity"),
+            ("2.5", "-Infinity", z),
+            ("-2.5", "Infinity", "Infinity"),
+            ("0.5", "Infinity", z),
+            ("0.5", "-Infinity", "Infinity"),
+            ("Infinity", "-1", z),
+            ("-Infinity", "3", "-Infinity"),
+            ("-Infinity", "2.5", "Infinity"),
+            ("-Infinity", "-3", z),
+            ("-2.5", "0.5", "NaN"),
+        ] {
+            assert_eq!(p(b, e), want, "pow({b}, {e})");
+        }
+        for (b, e) in [("0", "-0"), ("-0", "-1"), ("0", "-Infinity")] {
+            assert_eq!(pow(&d(b), &d(e)), Err(ZeroToNegativePower), "pow({b}, {e})");
+        }
+    }
+
+    /// Integral exponents are exact, then padded to 34 digits the way mongod
+    /// renders them -- including where mongod itself is a digit off
+    /// (`2.5^-1` is `0.4000...0001` there).
+    #[test]
+    fn pow_integral_exponent_is_exact_and_padded() {
+        for (b, e, want) in [
+            ("2", "10", "1024.000000000000000000000000000000"),
+            ("2.5", "3", "15.62500000000000000000000000000000"),
+            ("2.5", "-3", "0.06400000000000000000000000000000000"),
+            ("2.5", "-1", "0.4000000000000000000000000000000000"),
+            ("-2.5", "3", "-15.62500000000000000000000000000000"),
+            ("0.5", "-1", "2.000000000000000000000000000000000"),
+            ("3", "-1", "0.3333333333333333333333333333333333"),
+            ("10", "400", "1.000000000000000000000000000000000E+400"),
+            ("10", "7000", "Infinity"),
+            ("1E-400", "50", "0E-6176"),
+        ] {
+            assert_eq!(p(b, e), want, "pow({b}, {e})");
+        }
+    }
+
+    /// Non-integral exponents: the correctly-rounded value, checked against a
+    /// 90-digit reference. mongod agrees on two of these five and is one ULP
+    /// off on the other three -- which is the trade-off #1436 chose.
+    #[test]
+    fn pow_fractional_exponent_is_correctly_rounded() {
+        for (b, e, want) in [
+            ("2", "0.5", "1.414213562373095048801688724209698"),
+            ("3", "-2.5", "0.06415002990995841827879430894466194"),
+            // mongod: ...064 (true value ...0645477...)
+            ("1.1", "2.2", "1.233286300554662510989000587952065"),
+            // mongod: ...246
+            ("2.5", "2.5", "9.882117688026185412496542326352245"),
+            // mongod: ...491
+            ("0.5", "0.5", "0.7071067811865475244008443621048490"),
+        ] {
+            assert_eq!(p(b, e), want, "pow({b}, {e})");
+        }
+    }
+
+    #[test]
+    fn atan2_matches_mongod() {
+        let z = "0E-6176";
+        let pi = "3.141592653589793238462643383279503";
+        let half = "1.570796326794896619231321691639751";
+        for (y, x, want) in [
+            ("0", "0", z),
+            ("0", "-0", pi),
+            ("-0", "-1", "-3.141592653589793238462643383279503"),
+            ("-0", "1", "-0E-6176"),
+            ("1", "0", half),
+            ("-1", "-0", "-1.570796326794896619231321691639751"),
+            ("1", "Infinity", z),
+            ("-1", "Infinity", "-0E-6176"),
+            ("1", "-Infinity", pi),
+            (
+                "Infinity",
+                "Infinity",
+                "0.785398163397448309615660845819876",
+            ),
+            (
+                "-Infinity",
+                "-Infinity",
+                "-2.356194490192344928846982537459627",
+            ),
+            ("Infinity", "-3", half),
+            ("NaN", "1", "NaN"),
+            ("1", "1", "0.7853981633974483096156608458198757"),
+            ("2.5", "1", "1.190289949682531732927733774829318"),
+            ("1", "-2.5", "2.761086276477428352159055466469070"),
+            ("-2.5", "-1", "-1.951302703907261505534909608450185"),
+            // mongod answers ...560, one ULP high: the true value is
+            // 2.97644397617516640018351509363555943...
+            ("0.5", "-3", "2.976443976175166400183515093635559"),
+        ] {
+            assert_eq!(show(atan2(&d(y), &d(x))), want, "atan2({y}, {x})");
+        }
+    }
+}

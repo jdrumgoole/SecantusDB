@@ -3998,10 +3998,23 @@ fn op_atan2(arg: &Bson, ctx: &Ctx) -> R {
         _ => None,
     };
     // A non-numeric operand is named, with a DIFFERENT code per position
-    // (51044 first, 51045 second). A Decimal128 is numeric and falls through to
-    // the defer below, where mongod would answer a decimal.
+    // (51044 first, 51045 second).
     if let Some(fault) = arith_type_error("$atan2", &vals[0], &vals[1]) {
         return Err(fault);
+    }
+    if matches!(vals[0], Bson::Decimal128(_)) || matches!(vals[1], Bson::Decimal128(_)) {
+        // One decimal operand is enough: mongod answers a Decimal128 whichever
+        // side it is on.
+        let (Some(y), Some(x)) = (
+            crate::decimal::from_bson(&vals[0]),
+            crate::decimal::from_bson(&vals[1]),
+        ) else {
+            return Err(Fallback::Defer);
+        };
+        return crate::decimal::atan2(&y, &x)
+            .as_ref()
+            .and_then(crate::decimal::to_bson)
+            .ok_or(Fallback::Defer);
     }
     let (Some(y), Some(x)) = (extract(&vals[0]), extract(&vals[1])) else {
         return Err(Fallback::Defer);
@@ -7015,10 +7028,35 @@ fn op_pow(arg: &Bson, ctx: &Ctx) -> R {
     }
     // The type guard runs before the integer fast path below: `as_float_like`
     // would otherwise coerce a bool to 1.0 and answer a number where mongod
-    // refuses. Decimal128 still defers (it is numeric -- the decimal engine
-    // computes it).
-    math_operand_named(&vals[0], "$pow's base must be numeric, not ", 28762)?;
-    math_operand_named(&vals[1], "$pow's exponent must be numeric, not ", 28763)?;
+    // refuses.
+    let is_dec = |v: &Bson| matches!(v, Bson::Decimal128(_));
+    // `math_operand_named` refuses a decimal outright, so it only vets the
+    // other kinds -- base first, as mongod reports them.
+    if !is_dec(&vals[0]) {
+        math_operand_named(&vals[0], "$pow's base must be numeric, not ", 28762)?;
+    }
+    if !is_dec(&vals[1]) {
+        math_operand_named(&vals[1], "$pow's exponent must be numeric, not ", 28763)?;
+    }
+    if is_dec(&vals[0]) || is_dec(&vals[1]) {
+        // One decimal operand makes the answer a decimal, whichever side it is.
+        let (Some(b), Some(e)) = (
+            crate::decimal::from_bson(&vals[0]),
+            crate::decimal::from_bson(&vals[1]),
+        ) else {
+            return Err(Fallback::Defer);
+        };
+        return match crate::decimal::pow(&b, &e) {
+            Err(crate::decimal::ZeroToNegativePower) => Err(Fallback::mongo(
+                28764,
+                "$pow cannot take a base of 0 and a negative exponent",
+            )),
+            Ok(r) => r
+                .as_ref()
+                .and_then(crate::decimal::to_bson)
+                .ok_or(Fallback::Defer),
+        };
+    }
     if let (b @ (Bson::Int32(_) | Bson::Int64(_)), e @ (Bson::Int32(_) | Bson::Int64(_))) =
         (&vals[0], &vals[1])
     {

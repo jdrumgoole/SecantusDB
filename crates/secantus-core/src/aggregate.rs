@@ -24,7 +24,7 @@ use std::cmp::Ordering;
 
 use crate::collation::Collation;
 use crate::numeric::{as_int_like, int_to_bson};
-use crate::{densify, expressions, fill, group, order, paths, query, windowfields};
+use crate::{deadline, densify, expressions, fill, group, order, paths, query, windowfields};
 
 pub use crate::fallback::Fallback;
 
@@ -55,8 +55,13 @@ pub fn apply_pipeline(
             return Err(Fallback::Defer); // Python raises; defer so it raises there
         }
         let (name, spec) = s.iter().next().unwrap();
+        // `maxTimeMS` bounds the whole pipeline: between stages is the one
+        // point every stage passes through, including those (a `$sort`) that
+        // are a single call with no per-document loop to poll from.
+        deadline::check_now()?;
         docs = apply_stage(name, spec, docs, vars, coll)?;
     }
+    deadline::check_now()?;
     Ok(docs)
 }
 
@@ -74,6 +79,7 @@ fn apply_stage(
             };
             let mut out = Vec::new();
             for d in docs {
+                deadline::check()?;
                 if query::matches(&d, q, vars, coll)? {
                     out.push(d);
                 }
@@ -1027,6 +1033,7 @@ fn unwind_stage(docs: Vec<Document>, spec: &Bson) -> R<Vec<Document>> {
 fn map_docs(docs: Vec<Document>, mut f: impl FnMut(Document) -> R<Document>) -> R<Vec<Document>> {
     let mut out = Vec::with_capacity(docs.len());
     for d in docs {
+        deadline::check()?;
         out.push(f(d)?);
     }
     Ok(out)

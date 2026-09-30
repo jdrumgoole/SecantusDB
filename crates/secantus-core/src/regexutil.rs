@@ -132,15 +132,23 @@ pub(crate) fn compile(pattern: &Bson, options: Option<&Bson>) -> Result<Compiled
             _ => {}
         }
     }
-    // Fast path: the linear engine handles almost every pattern.
-    if let Ok(re) = RegexBuilder::new(pat)
-        .case_insensitive(ci)
-        .multi_line(ml)
-        .dot_matches_new_line(dotall)
-        .ignore_whitespace(ext)
-        .build()
-    {
-        return Ok(CompiledRegex::Linear(re));
+    // PCRE's end anchors assert "end, or before a final newline"; the linear
+    // engine has no lookahead to say that, so a pattern using them goes to the
+    // backtracking engine with the anchor spelled out.
+    let rewritten = pcre_end_anchors(pat, ml);
+    let pat: &str = rewritten.as_deref().unwrap_or(pat);
+    // Fast path: the linear engine handles almost every pattern -- but not a
+    // rewritten one, which needs lookahead.
+    if rewritten.is_none() {
+        if let Ok(re) = RegexBuilder::new(pat)
+            .case_insensitive(ci)
+            .multi_line(ml)
+            .dot_matches_new_line(dotall)
+            .ignore_whitespace(ext)
+            .build()
+        {
+            return Ok(CompiledRegex::Linear(re));
+        }
     }
     // Fallback: lookaround / backreferences via the backtracking engine. Flags
     // ride an inline group prefix since fancy-regex has no builder-flag API.
@@ -158,6 +166,67 @@ pub(crate) fn compile(pattern: &Bson, options: Option<&Bson>) -> Result<Compiled
     fancy_regex::Regex::new(&full)
         .map(CompiledRegex::Fancy)
         .map_err(|_| ())
+}
+
+/// PCRE's lookahead-free spelling of `$` and `\Z`, for a pattern that uses
+/// them -- `None` when it uses neither.
+///
+/// Outside multiline mode PCRE's `$` matches at the end of the subject OR
+/// before a newline that ends it; `\Z` always does. The `regex` crate's `$` is
+/// only the very end, so `{s: /foo$/}` missed `"foo\n"` and `$regexFind`
+/// reported no match, where mongod matches both (measured 8.2.11,
+/// 2026-09-30); `\Z` did not compile at all and the query was REFUSED. Both
+/// become `(?=\n?\z)`, which is PCRE's definition verbatim.
+///
+/// A `$` inside a character class is a literal and an escaped one is too. When
+/// multiline is on -- by option or by an inline `(?m)` anywhere -- `$` is left
+/// alone: the `regex` crate's multiline `$` is PCRE's.
+fn pcre_end_anchors(pat: &str, multiline: bool) -> Option<String> {
+    let inline_m = pat
+        .match_indices("(?")
+        .any(|(i, _)| pat[i + 2..].chars().take_while(|c| c.is_ascii_alphabetic()).any(|c| c == 'm'));
+    let rewrite_dollar = !multiline && !inline_m;
+    const END: &str = "(?=\\n?\\z)";
+    let mut out = String::with_capacity(pat.len() + 16);
+    let mut changed = false;
+    let mut in_class = false;
+    let mut chars = pat.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some('Z') if !in_class => {
+                    out.push_str(END);
+                    changed = true;
+                }
+                Some(n) => {
+                    out.push('\\');
+                    out.push(n);
+                }
+                None => out.push('\\'),
+            },
+            '[' if !in_class => {
+                in_class = true;
+                out.push(c);
+                // A `]` straight after `[` or `[^` is a literal member.
+                if chars.peek() == Some(&'^') {
+                    out.push(chars.next().unwrap());
+                }
+                if chars.peek() == Some(&']') {
+                    out.push(chars.next().unwrap());
+                }
+            }
+            ']' if in_class => {
+                in_class = false;
+                out.push(c);
+            }
+            '$' if !in_class && rewrite_dollar => {
+                out.push_str(END);
+                changed = true;
+            }
+            _ => out.push(c),
+        }
+    }
+    changed.then_some(out)
 }
 
 /// mongod's regex-to-regex equality: exact pattern, and options compared as a
@@ -193,6 +262,42 @@ pub(crate) fn regex_sort_key(r: &bson::Regex) -> (&str, String) {
     o.sort_unstable();
     o.dedup();
     (r.pattern.as_str(), o.into_iter().collect())
+}
+
+#[cfg(test)]
+mod pcre_anchor_tests {
+    use super::compile;
+    use bson::Bson;
+
+    fn hits(pattern: &str, options: &str, subjects: &[&str]) -> Vec<bool> {
+        let re = compile(&Bson::String(pattern.into()), Some(&Bson::String(options.into())))
+            .expect("compiles");
+        subjects.iter().map(|s| re.is_match(s)).collect()
+    }
+
+    /// mongod 8.2.11, 2026-09-30.
+    #[test]
+    fn end_anchors_match_before_a_final_newline() {
+        let subjects = ["foo", "foo\n", "foo\n\n", "foo\nbar"];
+        assert_eq!(hits("foo$", "", &subjects), [true, true, false, false]);
+        assert_eq!(hits("o$|z", "", &subjects), [true, true, false, false]);
+        assert_eq!(hits("foo$\\n", "", &subjects), [false, true, false, false]);
+        assert_eq!(hits("foo\\Z", "", &subjects), [true, true, false, false]);
+        assert_eq!(hits("foo$", "s", &subjects), [true, true, false, false]);
+        // Unchanged: multiline, a class member, an escaped dollar, `\z`.
+        assert_eq!(hits("foo$", "m", &subjects), [true, true, true, true]);
+        assert_eq!(hits("(?m)foo$", "", &subjects), [true, true, true, true]);
+        assert_eq!(hits("[$]", "", &["$", "a"]), [true, false]);
+        assert_eq!(hits("a\\$", "", &["a$", "a"]), [true, false]);
+        assert_eq!(hits("foo\\z", "", &subjects), [true, false, false, false]);
+    }
+
+    #[test]
+    fn find_reports_the_text_without_the_newline() {
+        let re = compile(&Bson::String("o$".into()), None).unwrap();
+        let m = re.find_first("foo\n").unwrap().expect("matches");
+        assert_eq!((m.text.as_str(), m.codepoint_idx), ("o", 2));
+    }
 }
 
 #[cfg(test)]

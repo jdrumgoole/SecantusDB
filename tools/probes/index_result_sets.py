@@ -107,6 +107,45 @@ CURATED = [
         [{"b": 5}, {"b": 9}, {"b": 0}],
         None,
     ),
+    # --- 2026-09-30: three more, all silent data loss on the Rust server ----
+    # The randomised block below could not reach any of them: it never issued
+    # an EMPTY filter, a compound sort, a hint, or a partial COMPOUND index.
+    (
+        "compound sort walked a PARTIAL index under an empty filter",
+        [("a", 1), ("b", 1)],
+        {"partialFilterExpression": {"a": {"$gt": 5}}},
+        [{"_id": i, "a": i, "b": i % 3} for i in range(10)],
+        [{}],
+        {"a": 1, "b": 1},
+    ),
+    (
+        "sort walked a MULTIKEY index -- an empty array has no entry",
+        [("a", 1)],
+        {},
+        [{"_id": 1, "a": 2}, {"_id": 2, "a": []}, {"_id": 3, "a": [5, 1]}, {"_id": 4}],
+        [{}, {"b": {"$exists": False}}],
+        {"a": 1},
+    ),
+]
+
+#: Shapes run with ``hint="ix"`` and compared with mongod's HINTED answer only:
+#: hinting a sparse or partial index legitimately returns a subset, so the
+#: unindexed collection is no reference here.
+HINTED = [
+    (
+        "hinted MULTIKEY index -- an empty array has no entry",
+        [("a", 1)],
+        {},
+        [{"_id": 1, "a": 2}, {"_id": 2, "a": []}, {"_id": 3, "a": [5, 1]}, {"_id": 4}],
+        [{}, {"_id": {"$gt": 0}}],
+    ),
+    (
+        "hinted sparse MULTIKEY index",
+        [("a", 1)],
+        {"sparse": True},
+        [{"_id": 1, "a": 2}, {"_id": 2, "a": []}, {"_id": 3, "a": [5, 1]}, {"_id": 4}],
+        [{}],
+    ),
 ]
 
 #: The population for both the documents and the query values.
@@ -156,14 +195,15 @@ INDEXES = [
     ([("b", -1)], {"sparse": True}),
     ([("a", 1)], {"partialFilterExpression": {"b": {"$gt": 0}}}),
     ([("a", 1)], {"partialFilterExpression": {"b": {"$lte": 1.5}}}),
+    ([("a", 1), ("b", 1)], {"partialFilterExpression": {"a": {"$gt": 0}}}),
 ]
 
 
-def _ids(coll, query, sort):
+def _ids(coll, query, sort, hint=None):
     """The ``_id`` SET a query returns. Order is deliberately not part of it —
     see the module docstring."""
     order = list(sort.items()) if sort else None
-    return sorted(d["_id"] for d in coll.find(query, sort=order))
+    return sorted(d["_id"] for d in coll.find(query, sort=order, hint=hint))
 
 
 def main() -> int:
@@ -200,6 +240,27 @@ def main() -> int:
                 print(f"  indexed={indexed}  no-index={bare}  mongod={expected}")
     print(f"--- curated: {bad} of {total} divergent")
 
+    hbad = htotal = 0
+    for i, (name, keys, opts, docs, queries) in enumerate(HINTED):
+        dbn = f"probe_idx_hinted{i}"
+        mon.drop_database(dbn)
+        sec.drop_database(dbn)
+        for db in (mon[dbn], sec[dbn]):
+            db.c.insert_many([dict(d) for d in docs])
+            db.c.create_index(keys, name="ix", **opts)
+        for q in queries:
+            for sort in (None, {"a": 1}, {"a": -1}):
+                htotal += 1
+                ours = _ids(sec[dbn].c, q, sort, hint="ix")
+                expected = _ids(mon[dbn].c, q, sort, hint="ix")
+                n_ours = sec[dbn].c.count_documents(q, hint="ix")
+                n_expected = mon[dbn].c.count_documents(q, hint="ix")
+                if ours != expected or n_ours != n_expected:
+                    hbad += 1
+                    print(f"DIFF [{name}] q={q} sort={sort} hint=ix")
+                    print(f"  ours={ours} (count {n_ours})  mongod={expected} (count {n_expected})")
+    print(f"--- hinted: {hbad} of {htotal} divergent")
+
     rng = random.Random(int(os.environ.get("PROBE_SEED", "20260901")))
     gen = lambda: rng.choice(  # noqa: E731
         [
@@ -234,10 +295,12 @@ def main() -> int:
         except pymongo.errors.PyMongoError:
             continue  # mongod rejects the combination (e.g. parallel arrays)
         for _ in range(12):
-            q = gen()(rng.choice(["a", "b"]))
-            if rng.random() < 0.3:
+            # An EMPTY filter is its own planner branch -- a sort over it may
+            # walk the whole index -- and was never generated before.
+            q = {} if rng.random() < 0.15 else gen()(rng.choice(["a", "b"]))
+            if q and rng.random() < 0.3:
                 q.update(gen()(rng.choice(["a", "b"])))
-            sort = rng.choice([None, {"a": 1}, {"b": -1}])
+            sort = rng.choice([None, {"a": 1}, {"b": -1}, {"a": 1, "b": 1}, {"a": -1, "b": -1}])
             rtotal += 1
             try:
                 indexed = _ids(sec[dbn].c, q, sort)
@@ -252,10 +315,11 @@ def main() -> int:
                     print(f"  indexed={indexed}  no-index={bare}  mongod={expected}")
                     print(f"  docs={docs}")
     print(f"--- randomised: {rbad} of {rtotal} divergent")
+    bad += hbad + rbad
 
     if srv is not None:
         srv.stop()
-    return 0
+    return 1 if bad else 0
 
 
 if __name__ == "__main__":

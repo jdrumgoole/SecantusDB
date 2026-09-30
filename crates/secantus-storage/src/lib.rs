@@ -2157,6 +2157,24 @@ fn bson_truthy_exists(v: &Bson) -> bool {
 /// made `find({a: null})` skip every document missing `a`, and a sort over one
 /// skipped them too, because a sort walks the WHOLE index. Measured against
 /// mongod 8.2.11; mirrors `storage._sparse_index_usable`.
+/// The one-field filters a multi-field filter can be routed through (see
+/// `try_residual_index_id_keys`). Empty unless there are two or more fields and
+/// none is a top-level operator (`$and` / `$or` / `$expr` / ...), whose
+/// candidates are not a single field's.
+fn residual_subfilters(filter: &Document) -> Vec<Document> {
+    if filter.len() < 2 || filter.keys().any(|k| k.starts_with('$')) {
+        return Vec::new();
+    }
+    filter
+        .iter()
+        .map(|(k, v)| {
+            let mut sub = Document::new();
+            sub.insert(k.clone(), v.clone());
+            sub
+        })
+        .collect()
+}
+
 fn sparse_index_usable(key_spec: &Document, filter: &Document) -> bool {
     key_spec
         .keys()
@@ -9262,6 +9280,10 @@ impl Storage {
         };
         let mut out = Vec::new();
         while more && out.len() < limit {
+            // Data-sized loop: honour a `maxTimeMS` budget (see `scan_docs`).
+            if deadline::check().is_err() {
+                return Err(StorageError::MaxTimeExpired);
+            }
             let (d, c, recordid) = cur.get_key_ssq()?;
             if d != db || c != coll {
                 break;
@@ -9457,6 +9479,10 @@ impl Storage {
             Err(e) => return Err(e.into()),
         };
         while more {
+            // Data-sized loop: honour a `maxTimeMS` budget (see `scan_docs`).
+            if deadline::check().is_err() {
+                return Err(StorageError::MaxTimeExpired);
+            }
             let (d, c, _recordid) = cur.get_key_ssq()?;
             if d != db || c != coll {
                 break;
@@ -10511,22 +10537,33 @@ impl Storage {
             // ordered the candidates (modulo direction).
             if let Some(sf) = sort_field {
                 let single = filter.len() == 1 && filter.keys().next().is_some_and(|f| f == sf);
-                if single {
+                // Only a non-multikey index's walk is a sort (see
+                // `sort_walk_index`); otherwise the post-sort below orders it.
+                let walk = if single {
+                    self.sort_walk_index(&session, db, coll, sf, filter)?
+                } else {
+                    None
+                };
+                if let Some((_name, idx_dir, _compound)) = walk {
                     in_sort_order = true;
-                    let idx_dir = self
-                        .find_leading_field_index(&session, db, coll, sf, filter)?
-                        .map(|m| m.1)
-                        .unwrap_or(1);
                     if sort_dir != idx_dir {
                         docs.reverse();
                     }
                 }
             }
             docs
-        } else if filter.is_empty() {
+        } else if let Some(id_keys) = self.try_residual_index_id_keys(&session, db, coll, filter)? {
+            self.docs_by_recordids(&session, db, coll, &id_keys)?
+        } else if filter.is_empty() || sort.is_some() {
+            // With a non-empty filter nothing indexes, so the choice is a scan
+            // plus a blocking sort, or a walk of the SORT index that filters
+            // each document -- which is what mongod picks
+            // (`find({nope: 1}).sort({a: -1})` walks `a_1` backward). Both
+            // pickers are handed the filter, so a sparse or partial index is
+            // only walked when the filter excludes every document it omits.
             if let Some(sf) = sort_field {
                 // Single-field sort: walk a leading-field index, else COLLSCAN.
-                match self.find_leading_field_index(&session, db, coll, sf, filter)? {
+                match self.sort_walk_index(&session, db, coll, sf, filter)? {
                     Some((idx_name, idx_dir, _is_compound)) => {
                         in_sort_order = true;
                         self.walk_index_in_order(
@@ -10542,7 +10579,7 @@ impl Storage {
                 }
             } else if let Some(multi) = multi_sort_spec(sort).filter(|m| m.len() > 1) {
                 // Multi-field sort: walk a strict-match compound index, else COLLSCAN.
-                match self.compound_index_for_sort(&session, db, coll, &multi)? {
+                match self.compound_index_for_sort(&session, db, coll, &multi, filter)? {
                     Some((idx_name, reverse)) => {
                         in_sort_order = true;
                         self.walk_index_in_order(&session, db, coll, &idx_name, reverse, 1)?
@@ -10620,7 +10657,11 @@ impl Storage {
         if filter.is_empty() || force_scan {
             return self.scan_docs(session, db, coll);
         }
-        if let Some(recordids) = self.try_index_id_keys(session, db, coll, filter)? {
+        let routed = match self.try_index_id_keys(session, db, coll, filter)? {
+            Some(r) => Some(r),
+            None => self.try_residual_index_id_keys(session, db, coll, filter)?,
+        };
+        if let Some(recordids) = routed {
             // Index entries carry the RecordId (step 2), so this reads the doc row
             // directly — no `id_key -> _id index -> RecordId` hop. The doc's own
             // id_key comes back from the framed value, which is what the callers
@@ -11803,10 +11844,24 @@ impl Storage {
         if let Some((name, key_spec)) = self.pick_index_for_filter(&session, db, coll, filter)? {
             return Ok(make_ixscan_plan(name, &key_spec, sort_field, sort_dir));
         }
-        if filter.is_empty() {
+        for sub in residual_subfilters(filter) {
+            if let Some((name, key_spec)) = self.pick_index_for_filter(&session, db, coll, &sub)? {
+                // The residual walk is not in sort order (`find_matching_with`
+                // post-sorts it), so the plan must not claim it is.
+                let mut plan = make_ixscan_plan(name, &key_spec, sort_field, sort_dir);
+                if let ExplainPlan::IxScan {
+                    sorted_by_index, ..
+                } = &mut plan
+                {
+                    *sorted_by_index = false;
+                }
+                return Ok(plan);
+            }
+        }
+        if filter.is_empty() || sort.is_some() {
             if let Some(sf) = sort_field {
                 if let Some((name, _dir, _comp)) =
-                    self.find_leading_field_index(&session, db, coll, sf, filter)?
+                    self.sort_walk_index(&session, db, coll, sf, filter)?
                 {
                     if let Some(key_spec) = self.key_spec_for(&session, db, coll, &name)? {
                         return Ok(make_ixscan_plan(name, &key_spec, sort_field, sort_dir));
@@ -11815,7 +11870,7 @@ impl Storage {
             } else if sort.is_some() {
                 if let Some(multi) = multi_sort_spec(sort).filter(|m| m.len() > 1) {
                     if let Some((name, reverse)) =
-                        self.compound_index_for_sort(&session, db, coll, &multi)?
+                        self.compound_index_for_sort(&session, db, coll, &multi, filter)?
                     {
                         if let Some(key_spec) = self.key_spec_for(&session, db, coll, &name)? {
                             return Ok(ExplainPlan::IxScan {
@@ -11954,12 +12009,27 @@ impl Storage {
             }
             ResolvedHint::Named(name) => {
                 let mut leading: Option<(String, i32)> = None;
-                for (n, key_spec, _o) in self.iter_indexes(session, db, coll)? {
+                let mut found: Option<(Document, Document)> = None;
+                for (n, key_spec, o) in self.iter_indexes(session, db, coll)? {
                     if &n == name {
                         if let Some((f, dv)) = key_spec.iter().next() {
                             leading = Some((f.clone(), direction_of(dv).unwrap_or(1)));
                         }
+                        found = Some((key_spec, o));
                         break;
+                    }
+                }
+                if let Some((key_spec, opts)) = &found {
+                    if let Some(docs) =
+                        self.multikey_hint_docs(session, db, coll, key_spec, opts)?
+                    {
+                        // Already in the index's own order; only a forward
+                        // sort on its leading field is satisfied by that.
+                        let in_order = matches!(
+                            (&leading, sort_field),
+                            (Some((f, d)), Some(sf)) if f == sf && *d == sort_dir
+                        );
+                        return Ok((docs, in_order));
                     }
                 }
                 let mut docs = self.walk_index_in_order(session, db, coll, name, false, 1)?;
@@ -11973,6 +12043,62 @@ impl Storage {
                 Ok((docs, in_order))
             }
         }
+    }
+
+    /// The documents a hinted MULTIKEY index holds, in its order, read from the
+    /// collection rather than the entries table -- or `None` for any other
+    /// index, whose walk is exact.
+    ///
+    /// The entries table cannot answer this for a multikey index: a document
+    /// whose indexed field is an EMPTY ARRAY writes no entry, where mongod
+    /// indexes it as `undefined`. So `find({}).hint("a_1")` and
+    /// `count({}, hint: "a_1")` silently dropped it (mongod: first in index
+    /// order). Found 2026-09-30. Writing an entry would change the on-disk
+    /// layout the two servers share, so membership is recomputed here with the
+    /// index's own rules (sparse: an indexed field present; partial: the doc
+    /// matches the filter), and ordered by the key pattern -- which is exactly
+    /// what a first-sight-deduplicated forward walk of a multikey index yields.
+    /// Geo indexes keep their walk: their entries are cells, not values.
+    fn multikey_hint_docs(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        key_spec: &Document,
+        opts: &Document,
+    ) -> Result<Option<Vec<Vec<u8>>>> {
+        if !opts.get_bool("multikey").unwrap_or(false) {
+            return Ok(None);
+        }
+        let Some(spec) = key_spec
+            .iter()
+            .map(|(f, d)| direction_of(d).map(|di| (f.clone(), di)))
+            .collect::<Option<Vec<(String, i32)>>>()
+            .filter(|p| p.iter().all(|(_, d)| *d == 1 || *d == -1))
+        else {
+            return Ok(None);
+        };
+        let sparse = opts.get_bool("sparse").unwrap_or(false);
+        let partial = opts
+            .get_document("partialFilterExpression")
+            .ok()
+            .filter(|d| !d.is_empty());
+        let mut keyed: Vec<(Vec<Vec<u8>>, Vec<u8>)> = Vec::new();
+        for (_rid, _id_k, blob) in self.scan_docs(session, db, coll)? {
+            let d = decode_doc(&blob)?;
+            if sparse && !sparse_covers(&d, key_spec) {
+                continue;
+            }
+            if let Some(pf) = partial {
+                if !query_matches(&d, pf, &Document::new(), None).map_err(query_fault)? {
+                    continue;
+                }
+            }
+            keyed.push((sort_key(&d, &spec, None)?, blob));
+        }
+        // Stable, so equal keys stay in RecordId order -- as in the entries.
+        keyed.sort_by(|a, b| compare_sort_keys(&a.0, &b.0, &spec));
+        Ok(Some(keyed.into_iter().map(|(_, b)| b).collect()))
     }
 
     /// All docs of an index, in WT entry order (or reversed), deduped — for
@@ -12001,6 +12127,10 @@ impl Storage {
             Err(e) => return Err(e.into()),
         };
         while more {
+            // Data-sized loop: honour a `maxTimeMS` budget (see `scan_docs`).
+            if deadline::check().is_err() {
+                return Err(StorageError::MaxTimeExpired);
+            }
             let (d, c, n, packed) = cur.get_key_sssu()?;
             if d != db || c != coll || n != name {
                 break;
@@ -12038,6 +12168,7 @@ impl Storage {
         db: &str,
         coll: &str,
         sort_fields: &[(String, i32)],
+        query: &Document,
     ) -> Result<Option<(String, bool)>> {
         let inverted: Vec<(String, i32)> =
             sort_fields.iter().map(|(f, d)| (f.clone(), -d)).collect();
@@ -12045,12 +12176,21 @@ impl Storage {
             if opts.get_bool("multikey").unwrap_or(false) {
                 continue;
             }
-            // A sort walks the WHOLE index, so a sparse one drops every
-            // document it omits straight out of the result set. This picker is
-            // only reached with an EMPTY filter, so nothing can guarantee the
-            // indexed fields are present.
-            if opts.get_bool("sparse").unwrap_or(false) {
+            // A sort walks the WHOLE index, so an index that omits documents
+            // drops them straight out of the result set unless the query
+            // excludes them anyway. A sparse index needs the query to guarantee
+            // an indexed field is present; a PARTIAL one needs the query to
+            // imply its filter. The partial half was missing: with an empty
+            // filter, `find({}).sort({a: 1, b: 1})` over a compound index
+            // partial on `{a: {$gt: 5}}` returned 4 of 10 documents (mongod:
+            // 10). Found 2026-09-30.
+            if opts.get_bool("sparse").unwrap_or(false) && !sparse_index_usable(&key_spec, query) {
                 continue;
+            }
+            if let Ok(pf) = opts.get_document("partialFilterExpression") {
+                if !pf.is_empty() && !query_implies_partial(query, pf) {
+                    continue;
+                }
             }
             let idx_pairs: Vec<(String, i32)> = match key_spec
                 .iter()
@@ -12065,6 +12205,29 @@ impl Storage {
             }
             if idx_pairs == inverted {
                 return Ok(Some((name, true)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// A multi-field filter that no index covers WHOLE: route it through an
+    /// index on ONE of its fields, and let the caller's full-filter pass check
+    /// the rest -- mongod's plan for `find({a: 1, b: "1"})` with one index on
+    /// `a` and another on `b`, where this server used to scan the collection.
+    /// Any clause's candidates are a superset of the filter's matches, and each
+    /// sub-filter goes through the same sparse / partial usability gates as a
+    /// whole filter would. The first field (in filter order) that indexes wins;
+    /// mongod's choice is cost-based, and the documents are the same either way.
+    fn try_residual_index_id_keys(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+    ) -> Result<Option<Vec<i64>>> {
+        for sub in residual_subfilters(filter) {
+            if let Some(ids) = self.try_index_id_keys(session, db, coll, &sub)? {
+                return Ok(Some(ids));
             }
         }
         Ok(None)
@@ -12286,6 +12449,32 @@ impl Storage {
     /// Multikey indexes are NOT skipped — per-element entries cover the lookup,
     /// and `find_matching` re-checks with `matches()`. Mirrors
     /// `storage._find_leading_field_index`.
+    /// `find_leading_field_index` for a SORT walk: the same pick, refused when
+    /// the index is multikey. Walking a multikey index is not a sort. A doc
+    /// whose field is an EMPTY ARRAY writes no entry at all, so
+    /// `find({}).sort({a: 1})` over an index on `a` dropped it from the result
+    /// (mongod returns it first) -- silent data loss on `main` until
+    /// 2026-09-30. And a reversed walk deduplicated by first sight orders an
+    /// array by its SMALLEST element, where a descending sort uses the largest.
+    /// `compound_index_for_sort` has always skipped multikey for this reason.
+    fn sort_walk_index(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        field: &str,
+        query: &Document,
+    ) -> Result<Option<(String, i32, bool)>> {
+        let Some(found) = self.find_leading_field_index(session, db, coll, field, query)? else {
+            return Ok(None);
+        };
+        let multikey = self
+            .iter_indexes(session, db, coll)?
+            .into_iter()
+            .any(|(n, _k, opts)| n == found.0 && opts.get_bool("multikey").unwrap_or(false));
+        Ok((!multikey).then_some(found))
+    }
+
     fn find_leading_field_index(
         &self,
         session: &Session,
@@ -12572,6 +12761,10 @@ impl Storage {
             Err(e) => return Err(e.into()),
         };
         while more {
+            // Data-sized loop: honour a `maxTimeMS` budget (see `scan_docs`).
+            if deadline::check().is_err() {
+                return Err(StorageError::MaxTimeExpired);
+            }
             let (d, c, n, packed) = cur.get_key_sssu()?;
             if d != db || c != coll || n != name {
                 break;
@@ -12637,6 +12830,10 @@ impl Storage {
             Err(e) => return Err(e.into()),
         };
         while more {
+            // Data-sized loop: honour a `maxTimeMS` budget (see `scan_docs`).
+            if deadline::check().is_err() {
+                return Err(StorageError::MaxTimeExpired);
+            }
             let (d, c, n, packed) = cur.get_key_sssu()?;
             if d != db || c != coll || n != name {
                 break;
@@ -12715,6 +12912,10 @@ impl Storage {
         let lower_eq_prefix = esc_lower.as_deref().map(eq_prefix);
         let upper_eq_prefix = esc_upper.as_deref().map(eq_prefix);
         while more {
+            // Data-sized loop: honour a `maxTimeMS` budget (see `scan_docs`).
+            if deadline::check().is_err() {
+                return Err(StorageError::MaxTimeExpired);
+            }
             let (d, c, n, packed) = cur.get_key_sssu()?;
             if d != db || c != coll || n != name {
                 break;

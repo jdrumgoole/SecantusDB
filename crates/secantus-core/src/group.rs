@@ -1075,6 +1075,7 @@ fn run_group(
     let mut states: Vec<Vec<Acc>> = Vec::new();
 
     for d in docs {
+        crate::deadline::check()?;
         let key_val = eval(id_expr, d, vars)?;
         let gk = gkey(&key_val)?;
         let idx = match index.get(&gk) {

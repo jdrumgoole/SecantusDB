@@ -1194,12 +1194,64 @@ fn run_handler(handler: Handler, doc: &Document, ctx: &mut CommandContext) -> Do
     match handler(doc, ctx) {
         Ok(reply) => {
             if budget > 0 {
+                if let Some(e) = expired_write_statement(doc, &reply) {
+                    return e.into_reply();
+                }
                 mark_time_limited_cursor(&reply, ctx);
             }
             reply
         }
-        Err(e) => e.into_reply(),
+        Err(mut e) => {
+            if budget > 0 && e.code == deadline::MaxTimeMsExpired::CODE {
+                if let Some(prefix) = executor_error_prefix(doc, ctx) {
+                    e.errmsg = format!("{prefix} :: caused by :: {}", e.errmsg);
+                }
+            }
+            e.into_reply()
+        }
     }
+}
+
+/// mongod's wrapper for a budget spent while a READ command's plan executor
+/// was running. Measured on 8.2.11 (2026-09-30) at 5ms and 20ms budgets over
+/// 100,000 documents: `find`, `aggregate`, `distinct` and `count` wrap it, every
+/// time; `findAndModify`, `update`, `delete` and `createIndexes` send it bare.
+/// mongod sends the bare message for these four too when the budget is gone
+/// before execution starts, which on this server is only the
+/// `maxTimeAlwaysTimeOut` failpoint, answered before the handler runs.
+fn executor_error_prefix(doc: &Document, ctx: &CommandContext) -> Option<String> {
+    let (name, target) = doc.iter().next()?;
+    let ns = match target {
+        Bson::String(coll) => format!("{}.{coll}", ctx.db_name),
+        _ => format!("{}.$cmd.{name}", ctx.db_name),
+    };
+    match name.as_str() {
+        "find" => Some(format!("Executor error during find command: {ns}")),
+        "aggregate" | "distinct" | "count" => Some(format!(
+            "Executor error during {name} command on namespace: {ns}"
+        )),
+        _ => None,
+    }
+}
+
+/// A write command whose statement ran out of budget. mongod fails the whole
+/// COMMAND with code 50 (`ok: 0`); the write path reports storage faults as a
+/// per-statement `writeErrors` entry under `ok: 1`, which is the right shape
+/// for a duplicate key and the wrong one for an interrupted operation.
+fn expired_write_statement(doc: &Document, reply: &Document) -> Option<CommandError> {
+    if !matches!(
+        doc.keys().next().map(String::as_str),
+        Some("update" | "delete" | "insert")
+    ) {
+        return None;
+    }
+    let expired = reply.get_array("writeErrors").ok()?.iter().any(|we| {
+        we.as_document()
+            .and_then(|d| d.get("code"))
+            .and_then(util::as_i64)
+            == Some(i64::from(deadline::MaxTimeMsExpired::CODE))
+    });
+    expired.then(CommandError::max_time_expired)
 }
 
 /// The command's `maxTimeMS` as a time limit, or 0 for none. A `getMore`'s own
