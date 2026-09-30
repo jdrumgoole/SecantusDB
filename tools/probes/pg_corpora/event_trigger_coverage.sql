@@ -49,3 +49,33 @@ drop table etn_y
 drop function etn_mk()
 drop function etn_f()
 drop table etn_log
+create table etw_log (tag text, otype text, ident text)
+create function etw_f() returns event_trigger language plpgsql as $$ declare r record; begin for r in select * from pg_event_trigger_ddl_commands() loop insert into etw_log values (r.command_tag, r.object_type, r.object_identity); end loop; end $$
+create event trigger etw_t on ddl_command_end execute function etw_f()
+create table etw_a (id int primary key, v text)
+create function etw_trg() returns trigger language plpgsql as $$ begin return new; end $$
+create trigger etw_tr before insert on etw_a for each row execute function etw_trg()
+create rule etw_r as on update to etw_a do also select 1
+create sequence etw_seq
+alter sequence etw_seq increment by 2
+create type etw_e as enum ('a')
+alter type etw_e add value 'b'
+create domain etw_d as int check (value > 0)
+alter domain etw_d set default 1
+alter table etw_a enable row level security
+create policy etw_p on etw_a using (true)
+create index etw_i on etw_a (v)
+alter index etw_i rename to etw_i2
+create statistics etw_st on id, v from etw_a
+create publication etw_pub for table etw_a
+alter table etw_a add column w int
+select tag, otype, ident from etw_log order by 1, 2, 3
+drop event trigger etw_t
+drop publication etw_pub
+drop table etw_a
+drop function etw_trg()
+drop sequence etw_seq
+drop type etw_e
+drop domain etw_d
+drop function etw_f()
+drop table etw_log

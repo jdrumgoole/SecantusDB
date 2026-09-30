@@ -600,12 +600,15 @@ remain open:
       has and, since batch 11, CALLABLE where the C function has a SQL form
       here -- the operator behind it (`int4pl` is `$1 + $2`) or a built-in
       over the same C function (`textlen` is `length`); corpus
-      `internal_functions`. Left: a wrapper over any other C function is a
-      catalog row that answers 42883 when called (a wrapper declared over the
-      wrong C signature crashed a PG 16.15 backend, so calling one blind is
-      not imitated), and the `CREATE TYPE` options other than `input` /
-      `output` / `like` (`internallength`, `category`, `receive`, ...) are
-      0A000 rather than applied.
+      `internal_functions`. Batch 13 added OUT / INOUT parameters (and
+      CREATE FUNCTION without RETURNS), `CREATE / CALL / DROP PROCEDURE`,
+      `ALTER FUNCTION / PROCEDURE / ROUTINE` in every form, and function
+      schemas (corpora `procedures`, `alter_routines`). Left: a wrapper over
+      any other C function is a catalog row that answers 42883 when called
+      (a wrapper declared over the wrong C signature crashed a PG 16.15
+      backend, so calling one blind is not imitated), and a procedure's
+      `COMMIT` / `ROLLBACK` is 2D000 (transaction control inside a CALL is
+      not implemented).
 - [ ] **OPEN — RUST pgserver triggers: the cross-server gap (2026-09-30).**
       `INSTEAD OF`, constraint triggers (deferred firing, `SET CONSTRAINTS`)
       and transition tables landed in batch 9 (corpora `instead_of`,
@@ -684,13 +687,6 @@ remain open:
       `collations`, `user_casts`, `views_ruleutils`, `expr_ruleutils`,
       `internal_functions`, `catalog_b11`, `pgcrypto_ciphers`. Left, each
       measured:
-      - **Event triggers**: `table_rewrite` never fires, and only a
-        top-level DDL command fires them (DDL run inside a trigger function
-        does not). `pg_event_trigger_ddl_commands()` reports CREATE / ALTER
-        TABLE, CREATE INDEX / VIEW / SEQUENCE / TYPE / FUNCTION and no rows
-        for other commands, and has no `command` column;
-        `pg_event_trigger_dropped_objects()` reports a function's (and a few
-        other objects') `objid` as 0.
       - **Foreign data**: no FDW handler can exist here, so a foreign table
         is never readable or writable (PostgreSQL's own answer for a
         handler-less wrapper); `postgres_fdw` / `file_fdw` are not available,

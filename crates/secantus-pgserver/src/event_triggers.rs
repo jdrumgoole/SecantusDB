@@ -280,6 +280,11 @@ impl PgHandler {
             Statement::CreateRule { .. } => "CREATE RULE",
             Statement::DropRule { .. } => "DROP RULE",
             Statement::CreateCollation { .. } => "CREATE COLLATION",
+            Statement::Policy(p) => match p {
+                secantus_pgplan::PolicyChange::Create { .. } => "CREATE POLICY",
+                secantus_pgplan::PolicyChange::Alter { .. } => "ALTER POLICY",
+                secantus_pgplan::PolicyChange::Drop { .. } => "DROP POLICY",
+            },
             _ => Self::write_verb(stmt)?,
         };
         secantus_pgplan::event_triggers::OK_TAGS
@@ -676,6 +681,47 @@ impl PgHandler {
             Statement::RenameView { to, .. } => vec![("view", to.clone())],
             Statement::AlterView { view, .. } => vec![("view", view.clone())],
             Statement::CreateSchema { name, .. } => vec![("schema", name.clone())],
+            Statement::CreateDomain(d) => vec![("type", d.name.clone())],
+            Statement::AlterDomain { name, .. } | Statement::AlterEnum { name, .. } => {
+                vec![("type", name.clone())]
+            }
+            Statement::AlterSequence { name, .. } => vec![("sequence", name.clone())],
+            Statement::CreateTrigger(t) => vec![(
+                "trigger",
+                format!("{} on public.{}", ident(&t.name), ident(&t.table)),
+            )],
+            Statement::CreateRule { table, name, .. } => vec![(
+                "rule",
+                format!("{} on public.{}", ident(name), ident(table)),
+            )],
+            Statement::Policy(secantus_pgplan::PolicyChange::Create { name, table, .. }) => {
+                vec![(
+                    "policy",
+                    format!("{} on public.{}", ident(name), ident(table)),
+                )]
+            }
+            Statement::Catalog(secantus_pgplan::catalog_stmts::CatalogOp::CreateStatistics {
+                name,
+                ..
+            }) => vec![("statistics object", format!("public.{}", ident(name)))],
+            Statement::Catalog(secantus_pgplan::catalog_stmts::CatalogOp::CreatePublication {
+                name,
+                ..
+            }) => vec![("publication", ident(name))],
+            Statement::RenameObject {
+                kind, target, to, ..
+            } => match kind.as_str() {
+                "index" => vec![("index", to.clone())],
+                "sequence" => vec![("sequence", to.clone())],
+                "type" | "domain" => vec![(
+                    "type",
+                    match target.rsplit_once('.') {
+                        Some((schema, _)) => format!("{schema}.{to}"),
+                        None => to.clone(),
+                    },
+                )],
+                _ => Vec::new(),
+            },
             Statement::Grant { .. } => vec![("grant", String::new())],
             Statement::Comment { kind, names, .. } => match (kind.as_str(), names.as_slice()) {
                 ("column", [.., t, c]) => vec![("table column", format!("{t}.{c}"))],
@@ -836,6 +882,24 @@ impl PgHandler {
                         identity: Some(format!("public.{}.{}", ident(table), ident(column))),
                         schema: Some("public".into()),
                     });
+                }
+                // An object named by its identity as PostgreSQL prints it.
+                "trigger" | "rule" | "policy" | "statistics object" | "publication" => {
+                    out.push(DdlCommand {
+                        classid: match kind {
+                            "trigger" => 2620,
+                            "rule" => PG_REWRITE,
+                            "policy" => 3256,
+                            "statistics object" => 3381,
+                            _ => 6104,
+                        },
+                        objid: 0,
+                        objsubid: 0,
+                        tag: tag.to_string(),
+                        object_type: kind,
+                        identity: Some(name.clone()),
+                        schema: (kind != "publication").then(|| "public".to_string()),
+                    })
                 }
                 // A GRANT names no single object: PostgreSQL reports the
                 // object KIND and nothing else.
