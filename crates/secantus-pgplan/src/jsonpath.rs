@@ -10,8 +10,12 @@
 //! against `null`, and every structural error is swallowed in lax mode but
 //! raised in strict.
 //!
-//! Not implemented: the `.datetime()` method (refused by name), and
-//! `.keyvalue()`'s `id` for a nested object (PostgreSQL derives it from the
+//! `.datetime()` parses an ISO form (or a template's) into a date / time /
+//! timetz / timestamp / timestamptz item, compared as that kind -- and a
+//! comparison that needs a time zone is refused unless a `*_tz` function
+//! asked for one, as PostgreSQL has it.
+//!
+//! Not implemented: `.keyvalue()`'s `id` for a nested object (PostgreSQL derives it from the
 //! object's byte offset inside the binary jsonb, which this server does not
 //! store).
 
@@ -1130,6 +1134,15 @@ macro_rules! ret_err {
 }
 
 fn jtype(v: &Json) -> &'static str {
+    if let Some(d) = dt_of(v) {
+        return match d.kind.as_str() {
+            "date" => "date",
+            "time" => "time without time zone",
+            "timetz" => "time with time zone",
+            "timestamp" => "timestamp without time zone",
+            _ => "timestamp with time zone",
+        };
+    }
     match v {
         Json::Null => "null",
         Json::Bool(_) => "boolean",
@@ -1685,7 +1698,28 @@ impl Cxt<'_> {
                 }
                 Ok(res)
             }
-            Item::Datetime(_) => Err(Error::Unsupported("the jsonpath .datetime() method".into())),
+            Item::Datetime(tmpl) => {
+                if unwrap {
+                    if let Json::Array(a) = jb {
+                        let a = a.clone();
+                        return self.unwrap_array(Some(n), &a, found, false);
+                    }
+                }
+                let Json::Str(text) = jb else {
+                    ret_err!(
+                        self,
+                        sqlerr(
+                            "22031",
+                            "jsonpath item method .datetime() can only be applied to a string"
+                        )
+                    );
+                };
+                let item = match parse_datetime(text, tmpl.as_deref()) {
+                    Ok(item) => item,
+                    Err(e) => ret_err!(self, e),
+                };
+                self.next(n, item, found)
+            }
         }
     }
 
@@ -2170,6 +2204,18 @@ fn float8_text(f: f64) -> String {
 
 /// `compareItems`.
 fn compare(op: Op, a: &Json, b: &Json) -> Tri {
+    // Two datetime items compare as their kinds allow; a datetime against
+    // anything else is UNKNOWN (or the null rule below).
+    if let (Some(x), Some(y)) = (dt_of(a), dt_of(b)) {
+        return match compare_datetimes(&x, &y) {
+            Ok(Some(ord)) => tri_of(op, ord),
+            Ok(None) => Tri::Unknown,
+            Err(e) => {
+                DT_ERROR.with(|c| *c.borrow_mut() = Some(e));
+                Tri::Unknown
+            }
+        };
+    }
     let same_kind = std::mem::discriminant(a) == std::mem::discriminant(b);
     if !same_kind {
         if matches!(a, Json::Null) || matches!(b, Json::Null) {
@@ -2312,12 +2358,36 @@ pub fn call(
         Some(v) => parse_json(v)?,
         None => Json::Object(Vec::new()),
     };
+    // `*_tz` lets a datetime comparison cross the time-zone line.
+    USE_TZ.with(|t| t.set(name.ends_with("_tz")));
+    DT_ERROR.with(|c| c.borrow_mut().take());
+    let out = call_inner(name.trim_end_matches("_tz"), &target, &path, &vars, silent);
+    // A comparison refused inside a filter is the statement's error (it
+    // is not one lax mode or `silent` suppresses).
+    if let Some(e) = DT_ERROR.with(|c| c.borrow_mut().take()) {
+        return Err(e);
+    }
+    // A datetime item leaves the path as the string it prints as.
+    out.map(|o| match o {
+        PathOut::Items(items) => PathOut::Items(items.into_iter().map(dt_to_json).collect()),
+        other => other,
+    })
+}
+
+fn call_inner(
+    name: &str,
+    target: &Json,
+    path: &JsonPath,
+    vars: &Json,
+    silent: bool,
+) -> Result<PathOut> {
+    let (target, path, vars) = (target, path, vars);
     match name {
         "jsonb_path_exists" => Ok(PathOut::Bool(
-            execute(&path, &vars, &target, !silent, false)?.map(|(r, _)| r == Res::Ok),
+            execute(path, vars, target, !silent, false)?.map(|(r, _)| r == Res::Ok),
         )),
         "jsonb_path_match" => {
-            let Some((_, found)) = execute(&path, &vars, &target, !silent, true)? else {
+            let Some((_, found)) = execute(path, vars, target, !silent, true)? else {
                 return Ok(PathOut::Bool(None));
             };
             match found.as_slice() {
@@ -2328,7 +2398,7 @@ pub fn call(
             }
         }
         _ => {
-            let found = execute(&path, &vars, &target, !silent, true)?
+            let found = execute(path, vars, target, !silent, true)?
                 .map(|(_, f)| f)
                 .unwrap_or_default();
             Ok(PathOut::Items(found))
@@ -2351,4 +2421,321 @@ pub fn is_function(name: &str) -> bool {
             | "jsonb_path_query_array_tz"
             | "jsonb_path_query_first_tz"
     )
+}
+
+// ------------------------------------------------------------------------
+// .datetime()
+// ------------------------------------------------------------------------
+
+thread_local! {
+    static USE_TZ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DT_ERROR: std::cell::RefCell<Option<Error>> = const { std::cell::RefCell::new(None) };
+}
+
+const DT_KEY: &str = "\u{0}datetime";
+
+/// A datetime item: its kind, the text it prints as, and a comparison key
+/// (micros since the epoch -- LOCAL for the zone-less kinds, UTC for the
+/// zoned ones; micros of the day for the times).
+struct Dt {
+    kind: String,
+    text: String,
+    key: i64,
+}
+
+fn dt_json(kind: &str, text: String, key: i64, offset: Option<i64>) -> Json {
+    Json::Object(vec![(
+        DT_KEY.to_string(),
+        Json::Array(vec![
+            Json::Str(kind.to_string()),
+            Json::Str(text),
+            Json::Number(key.to_string()),
+            offset.map_or(Json::Null, |o| Json::Number(o.to_string())),
+        ]),
+    )])
+}
+
+fn dt_of(v: &Json) -> Option<Dt> {
+    let Json::Object(o) = v else { return None };
+    let [(k, Json::Array(parts))] = o.as_slice() else {
+        return None;
+    };
+    if k != DT_KEY {
+        return None;
+    }
+    match parts.as_slice() {
+        [Json::Str(kind), Json::Str(text), Json::Number(key), _] => Some(Dt {
+            kind: kind.clone(),
+            text: text.clone(),
+            key: key.parse().ok()?,
+        }),
+        _ => None,
+    }
+}
+
+fn dt_to_json(v: Json) -> Json {
+    match dt_of(&v) {
+        Some(d) => Json::Str(d.text),
+        None => v,
+    }
+}
+
+fn tri_of(op: Op, ord: std::cmp::Ordering) -> Tri {
+    let r = match op {
+        Op::Eq => ord.is_eq(),
+        Op::Ne => ord.is_ne(),
+        Op::Lt => ord.is_lt(),
+        Op::Gt => ord.is_gt(),
+        Op::Le => ord.is_le(),
+        Op::Ge => ord.is_ge(),
+        _ => false,
+    };
+    if r {
+        Tri::True
+    } else {
+        Tri::False
+    }
+}
+
+const USECS_PER_DAY: i64 = 86_400_000_000;
+
+/// Compare two datetime items (`compareDatetime`): a date against a
+/// timestamp as timestamps; a zone-less kind against a zoned one only under
+/// `*_tz` (read in UTC, the session zone this server defaults to); a date or
+/// timestamp against a time never (UNKNOWN).
+fn compare_datetimes(a: &Dt, b: &Dt) -> Result<Option<std::cmp::Ordering>> {
+    let family = |k: &str| match k {
+        "date" | "timestamp" | "timestamptz" => 1,
+        _ => 2,
+    };
+    if family(&a.kind) != family(&b.kind) {
+        return Ok(None);
+    }
+    let zoned = |k: &str| matches!(k, "timestamptz" | "timetz");
+    if zoned(&a.kind) != zoned(&b.kind) && !USE_TZ.with(|t| t.get()) {
+        let (from, to) = if zoned(&a.kind) {
+            (&b.kind, &a.kind)
+        } else {
+            (&a.kind, &b.kind)
+        };
+        let mut msg = format!("cannot convert value from {from} to {to} without time zone usage");
+        msg.push_str("\nHint: Use *_tz() function for time zone support.");
+        return Err(sqlerr("0A000", msg));
+    }
+    // Zone-less keys are local; with `*_tz` they are read as UTC.
+    Ok(Some(a.key.cmp(&b.key)))
+}
+
+fn two(n: i64) -> String {
+    format!("{n:02}")
+}
+
+fn frac_text(us: i64) -> String {
+    if us == 0 {
+        return String::new();
+    }
+    let s = format!(".{us:06}");
+    s.trim_end_matches('0').to_string()
+}
+
+fn time_text(tod: i64) -> String {
+    let secs = tod / 1_000_000;
+    format!(
+        "{}:{}:{}{}",
+        two(secs / 3600),
+        two(secs / 60 % 60),
+        two(secs % 60),
+        frac_text(tod % 1_000_000)
+    )
+}
+
+fn offset_text(off: i64) -> String {
+    let sign = if off < 0 { '-' } else { '+' };
+    let a = off.abs();
+    let (h, m, s) = (a / 3600, a / 60 % 60, a % 60);
+    if s != 0 {
+        format!("{sign}{}:{}:{}", two(h), two(m), two(s))
+    } else {
+        format!("{sign}{}:{}", two(h), two(m))
+    }
+}
+
+fn date_text(d: chrono::NaiveDate) -> String {
+    use chrono::Datelike;
+    format!(
+        "{:04}-{}-{}",
+        d.year(),
+        two(i64::from(d.month())),
+        two(i64::from(d.day()))
+    )
+}
+
+fn days_from_epoch(d: chrono::NaiveDate) -> i64 {
+    (d - chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch")).num_days()
+}
+
+/// Build the item for a parsed value of `kind`.
+fn dt_item(kind: &str, date: Option<chrono::NaiveDate>, tod: i64, off: Option<i64>) -> Json {
+    match kind {
+        "date" => {
+            let d = date.expect("date kind");
+            dt_json(
+                "date",
+                date_text(d),
+                days_from_epoch(d) * USECS_PER_DAY,
+                None,
+            )
+        }
+        "time" => dt_json("time", time_text(tod), tod, None),
+        "timetz" => {
+            let o = off.unwrap_or(0);
+            dt_json(
+                "timetz",
+                format!("{}{}", time_text(tod), offset_text(o)),
+                tod - o * 1_000_000,
+                Some(o),
+            )
+        }
+        "timestamp" => {
+            let d = date.expect("date");
+            dt_json(
+                "timestamp",
+                format!("{}T{}", date_text(d), time_text(tod)),
+                days_from_epoch(d) * USECS_PER_DAY + tod,
+                None,
+            )
+        }
+        _ => {
+            let d = date.expect("date");
+            let o = off.unwrap_or(0);
+            dt_json(
+                "timestamptz",
+                format!("{}T{}{}", date_text(d), time_text(tod), offset_text(o)),
+                days_from_epoch(d) * USECS_PER_DAY + tod - o * 1_000_000,
+                Some(o),
+            )
+        }
+    }
+}
+
+/// `[+-]HH[:MM[:SS]]` at the end of a time, if any: `(rest, offset secs)`.
+fn split_offset(s: &str) -> (&str, Option<i64>) {
+    let Some(pos) = s.rfind(['+', '-']) else {
+        return (s, None);
+    };
+    let (head, tail) = s.split_at(pos);
+    let sign = if tail.starts_with('-') { -1 } else { 1 };
+    let parts: Vec<&str> = tail[1..].split(':').collect();
+    let nums: Option<Vec<i64>> = parts.iter().map(|p| p.parse::<i64>().ok()).collect();
+    match nums.as_deref() {
+        Some([h]) if parts[0].len() <= 2 => (head, Some(sign * h * 3600)),
+        Some([h, m]) => (head, Some(sign * (h * 3600 + m * 60))),
+        Some([h, m, sec]) => (head, Some(sign * (h * 3600 + m * 60 + sec))),
+        _ => (s, None),
+    }
+}
+
+fn parse_time_of_day(s: &str) -> Option<i64> {
+    let (hms, frac) = match s.split_once('.') {
+        Some((a, b)) => (a, Some(b)),
+        None => (s, None),
+    };
+    let parts: Vec<&str> = hms.split(':').collect();
+    let [h, m, sec] = parts.as_slice() else {
+        return None;
+    };
+    if h.len() != 2 || m.len() != 2 || sec.len() != 2 {
+        return None;
+    }
+    let (h, m, sec): (i64, i64, i64) = (h.parse().ok()?, m.parse().ok()?, sec.parse().ok()?);
+    if h > 24 || m > 59 || sec > 60 {
+        return None;
+    }
+    let us = match frac {
+        Some(f) if !f.is_empty() && f.chars().all(|c| c.is_ascii_digit()) => {
+            let padded: String = f.chars().chain(std::iter::repeat('0')).take(6).collect();
+            padded.parse::<i64>().ok()?
+        }
+        Some(_) => return None,
+        None => 0,
+    };
+    Some(((h * 60 + m) * 60 + sec) * 1_000_000 + us)
+}
+
+fn parse_date(s: &str) -> Option<chrono::NaiveDate> {
+    let parts: Vec<&str> = s.split('-').collect();
+    let [y, m, d] = parts.as_slice() else {
+        return None;
+    };
+    if y.len() < 4 || m.len() != 2 || d.len() != 2 {
+        return None;
+    }
+    chrono::NaiveDate::from_ymd_opt(y.parse().ok()?, m.parse().ok()?, d.parse().ok()?)
+}
+
+/// `.datetime([template])` (`executeDateTimeMethod`): the ISO forms
+/// PostgreSQL tries without a template -- date, time, time with zone,
+/// timestamp (space or `T`), timestamp with zone -- or the template's
+/// fields.
+fn parse_datetime(text: &str, template: Option<&str>) -> Result<Json> {
+    if let Some(fmt) = template {
+        let (d, tod, off) = crate::datetime::from_char_strict(text, fmt)?;
+        let f = fmt.to_ascii_uppercase();
+        let has_date = ["YY", "MM", "DD", "MON", "J", "IYY", "Q"]
+            .iter()
+            .any(|t| f.contains(t));
+        let has_time = ["HH", "MI", "SS", "MS", "US", "AM", "PM"]
+            .iter()
+            .any(|t| f.contains(t));
+        let has_tz = ["TZH", "TZM", "TZ", "OF"].iter().any(|t| f.contains(t));
+        let kind = match (has_date, has_time, has_tz) {
+            (true, false, _) => "date",
+            (false, _, false) => "time",
+            (false, _, true) => "timetz",
+            (true, true, false) => "timestamp",
+            (true, true, true) => "timestamptz",
+        };
+        return Ok(dt_item(kind, Some(d), tod, off));
+    }
+    let unrecognised = || {
+        sqlerr(
+            "22031",
+            format!(
+                "datetime format is not recognized: \"{text}\"\nHint: Use a datetime template argument to specify the input data format."
+            ),
+        )
+    };
+    let t = text.trim();
+    if let Some(d) = parse_date(t) {
+        return Ok(dt_item("date", Some(d), 0, None));
+    }
+    // Time, with or without a zone.
+    let (time_part, off) = split_offset(t);
+    if let Some(tod) = parse_time_of_day(time_part) {
+        return Ok(dt_item(
+            if off.is_some() { "timetz" } else { "time" },
+            None,
+            tod,
+            off,
+        ));
+    }
+    // Timestamp: a date, a space or `T`, a time, maybe a zone.
+    if t.len() > 11 {
+        let (date_part, rest) = t.split_at(10);
+        let sep = rest.chars().next();
+        if matches!(sep, Some(' ' | 'T')) {
+            if let Some(d) = parse_date(date_part) {
+                let (time_part, off) = split_offset(&rest[1..]);
+                if let Some(tod) = parse_time_of_day(time_part) {
+                    let kind = if off.is_some() {
+                        "timestamptz"
+                    } else {
+                        "timestamp"
+                    };
+                    return Ok(dt_item(kind, Some(d), tod, off));
+                }
+            }
+        }
+    }
+    Err(unrecognised())
 }

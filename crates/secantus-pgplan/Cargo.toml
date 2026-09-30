@@ -45,3 +45,8 @@ sxd-xpath = "0.4.2"
 # `sha224()` .. `sha512()` over bytea (the digest `secantus-auth` already
 # carries for SCRAM).
 sha2 = "0.10"
+pwhash = "1"
+hmac = "0.12"
+md-5 = "0.10"
+sha1 = "0.10"
+getrandom = "0.2"

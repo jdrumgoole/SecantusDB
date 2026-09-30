@@ -1,0 +1,20 @@
+# MERGE, which PostgreSQL 15 added (this server reports 15.0).
+# reference-version: 15
+MERGE INTO mt t USING ms s ON t.id = s.id WHEN MATCHED AND s.id = 2 THEN DELETE WHEN MATCHED THEN UPDATE SET v = s.v, n = t.n + 10 WHEN NOT MATCHED AND s.v IS NOT NULL THEN INSERT (id, v) VALUES (s.id, s.v) WHEN NOT MATCHED THEN INSERT VALUES (s.id, 'none', DEFAULT)
+SELECT * FROM mt ORDER BY id
+MERGE INTO mt USING (VALUES (1, 'x'), (9, 'y')) AS src(id, v) ON mt.id = src.id WHEN MATCHED THEN DO NOTHING WHEN NOT MATCHED THEN INSERT DEFAULT VALUES
+MERGE INTO mt USING (VALUES (1, 'x'), (1, 'y')) AS src(id, v) ON mt.id = src.id WHEN MATCHED THEN UPDATE SET v = src.v
+MERGE INTO mt USING (VALUES (1, 'x'), (1, 'y')) AS src(id, v) ON mt.id = src.id WHEN MATCHED THEN DO NOTHING
+MERGE INTO mt USING ms ON mt.id = ms.id WHEN NOT MATCHED THEN INSERT VALUES (ms.id)
+MERGE INTO nosuch USING ms ON true WHEN MATCHED THEN DELETE
+MERGE INTO mt USING ms ON mt.id = ms.id WHEN MATCHED AND mt.n > 10 THEN UPDATE SET n = 0
+SELECT * FROM mt ORDER BY id
+MERGE INTO mt t USING ms s ON t.id = s.id WHEN MATCHED THEN UPDATE SET id = s.id + 100
+SELECT * FROM mt ORDER BY id
+MERGE INTO mt USING (SELECT 3 AS id) s ON mt.id = s.id WHEN MATCHED THEN UPDATE SET v = 'three'
+SELECT v FROM mt WHERE id = 3
+MERGE INTO mnk USING (VALUES (2, 'z'), (3, 'w')) AS s(a, b) ON mnk.a = s.a WHEN MATCHED THEN UPDATE SET b = s.b WHEN NOT MATCHED THEN INSERT VALUES (s.a, s.b)
+SELECT * FROM mnk ORDER BY a
+MERGE INTO mt USING ms ON mt.id = ms.id WHEN NOT MATCHED THEN INSERT (id, v) VALUES (ms.id + 1000, upper(ms.v))
+SELECT count(*) FROM mt
+MERGE INTO mt USING ms ON mt.id = %s WHEN MATCHED THEN DELETE ||| [3]

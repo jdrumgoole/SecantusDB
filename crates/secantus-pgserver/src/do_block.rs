@@ -77,6 +77,7 @@ impl PgHandler {
                     &sql,
                     crate::plpgsql_fn::Invocation {
                         args: &[],
+                        arg_types: &[],
                         trigger: None,
                         returns_set: false,
                     },

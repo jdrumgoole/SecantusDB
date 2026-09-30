@@ -1,8 +1,7 @@
+# reference-locale: C.UTF-8
 # --- pattern / regex corners not covered before
 SELECT regexp_replace('a1b2c3', '[0-9]', 'X', 'g'), regexp_replace('aaa', 'a', 'X', 'gi')
 SELECT regexp_replace('abc', '(b)', '[\1]'), regexp_replace('abc', 'b', '\&\&')
-SELECT regexp_count('a1b2c3', '[0-9]'), regexp_instr('a1b2', '[0-9]'), regexp_like('abc','b')
-SELECT regexp_substr('a1b22c', '[0-9]+'), regexp_substr('a1b22c', '[0-9]+', 1, 2)
 SELECT regexp_split_to_array('a1b22c', '[0-9]+'), regexp_split_to_table('a,b', ',')
 SELECT 'abc' ~ '^a', 'abc' ~ 'c$', 'aXbc' ~ 'a.b'
 SELECT substring('abc' from '(b)'), substring('abc' from 'x')
@@ -35,3 +34,8 @@ SELECT encode('abc'::bytea, 'hex'), encode('abc'::bytea, 'escape')
 SELECT unistr('d\\0061t\\+000061')
 SELECT normalize('a'), normalize('a', NFC)
 SELECT 'a' || NULL, concat('a', NULL)
+# --- character classes and case-insensitive matching follow the UTF-8 ctype
+SELECT 'é' ~ '[[:alpha:]]', 'é' ~* 'É', 'Ä' ~ '[[:upper:]]', 'ä' ~ '[[:lower:]]', '٣' ~ '[[:digit:]]', 'é' ~ '\w'
+SELECT datcollate, datctype FROM pg_database WHERE datname = current_database()
+SELECT id FROM s9t WHERE t ~ '^[[:upper:]][[:lower:]]+' ORDER BY id
+SELECT regexp_replace('éa1', '[[:alpha:]]', 'x', 'g'), regexp_split_to_array('aébÄc', '[[:upper:]]'), substring('xéy' from '[[:alpha:]]+'), 'é1' ~ '^[[:alnum:]]+$'

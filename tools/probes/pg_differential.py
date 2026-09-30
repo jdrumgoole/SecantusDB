@@ -177,6 +177,74 @@ def _split_params(line: str) -> tuple[str, list | None]:
     return sql.strip(), list(args)
 
 
+def _directive(path: str, name: str) -> str | None:
+    """The value of a corpus's `# <name>: <value>` line, if it has one."""
+    with open(path) as fh:
+        for ln in fh:
+            head, _, value = ln.strip().partition(f"{name}:")
+            if head.strip() == "#" and value.strip():
+                return value.strip()
+    return None
+
+
+def _reference_connection(corpus_path: str) -> psycopg.Connection:
+    """The reference server for a corpus.
+
+    A corpus that measures a feature newer than the default reference (14)
+    names the major it needs -- `# reference-version: 15` for MERGE -- and
+    runs against `SECANTUS_PG_ORACLE_DSN_<major>`, a cluster of that version.
+    The run refuses a reference of the wrong major rather than report its
+    `syntax error` as a divergence.
+    """
+    major = _directive(corpus_path, "reference-version")
+    if major is None:
+        dsn = os.environ.get("SECANTUS_PG_ORACLE_DSN", DEFAULT_DSN)
+    else:
+        dsn = os.environ.get(
+            f"SECANTUS_PG_ORACLE_DSN_{major}",
+            f"host=127.0.0.1 port=54{int(major):02d} dbname=postgres user=postgres",
+        )
+    ref = psycopg.connect(dsn, autocommit=True)
+    if major is not None:
+        got = ref.execute("SHOW server_version_num").fetchone()[0]
+        if int(got) // 10000 != int(major):
+            raise SystemExit(f"{corpus_path} needs a PostgreSQL {major} reference; {dsn} is {got}")
+    return ref
+
+
+def _reference_locale(path: str) -> str | None:
+    """The locale a corpus's `# reference-locale: <name>` line asks for.
+
+    Case mapping and character classes follow the DATABASE's LC_CTYPE, and a
+    reference cluster initialised under `C` maps ASCII only -- while this
+    server reports (and behaves as) `C.UTF-8`. A corpus that measures those
+    runs against a reference database in the locale the server claims, so the
+    comparison is like with like rather than a report of the reference's
+    configuration.
+    """
+    with open(path) as fh:
+        for ln in fh:
+            head, _, value = ln.strip().partition("reference-locale:")
+            if head.strip() == "#" and value.strip():
+                return value.strip()
+    return None
+
+
+def _reference_in_locale(ref: psycopg.Connection, locale: str) -> psycopg.Connection:
+    """A connection to a reference database whose collation and ctype are
+    `locale`, created from `template0` on first use."""
+    dbname = "secantus_ref_" + "".join(c if c.isalnum() else "_" for c in locale.lower())
+    exists = ref.execute("SELECT 1 FROM pg_database WHERE datname = %s", [dbname]).fetchone()
+    if not exists:
+        ref.execute(
+            f"CREATE DATABASE {dbname} TEMPLATE template0 ENCODING 'UTF8' "
+            f"LC_COLLATE '{locale}' LC_CTYPE '{locale}'"
+        )
+    host, port, user = ref.info.host, ref.info.port, ref.info.user
+    ref.close()
+    return psycopg.connect(host=host, port=port, user=user, dbname=dbname, autocommit=True)
+
+
 def _read(path: str) -> list[str]:
     with open(path) as fh:
         return [ln.rstrip() for ln in fh if ln.strip() and not ln.lstrip().startswith("#")]
@@ -238,7 +306,10 @@ def main(setup_path: str, corpus_path: str, *, types: bool, tags: bool, server: 
         srv.start()
         host, port = srv.address
         sec = psycopg.connect(host=host, port=port, dbname="db", user="probe", autocommit=True)
-    ref = psycopg.connect(os.environ.get("SECANTUS_PG_ORACLE_DSN", DEFAULT_DSN), autocommit=True)
+    ref = _reference_connection(corpus_path)
+    locale = _reference_locale(corpus_path)
+    if locale:
+        ref = _reference_in_locale(ref, locale)
     scur, rcur = sec.cursor(), ref.cursor()
 
     for stmt in _read(setup_path):

@@ -64,6 +64,14 @@ pub trait Host {
     fn execute(&self, sql: &str, params: &[Bson], types: &[String]) -> Result<u64, PlError>;
     /// A `RAISE` below ERROR: `(severity, sqlstate, message)`.
     fn notice(&self, severity: &str, sqlstate: &str, message: String);
+    /// Run an INSERT / UPDATE / DELETE and answer its RETURNING rows
+    /// (`... RETURNING ... INTO`).
+    fn returning(&self, sql: &str, params: &[Bson], types: &[String]) -> Result<QueryOut, PlError> {
+        let _ = (sql, params, types);
+        Err(PlError::unsupported(
+            "INSERT / UPDATE / DELETE ... RETURNING INTO",
+        ))
+    }
 }
 
 /// A record value: its columns (name, type) and their values, or NULL.
@@ -97,6 +105,10 @@ pub struct TriggerData {
 /// One call.
 pub struct Invocation<'a> {
     pub args: &'a [Bson],
+    /// The parameters' declared types, from the catalog. The parsed function
+    /// loses an ARRAY parameter's brackets (`int4[]` reads as `int4`), so
+    /// these win over what the parse says.
+    pub arg_types: &'a [String],
     pub trigger: Option<TriggerData>,
     pub returns_set: bool,
 }
@@ -422,11 +434,14 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
         if arg >= inv.args.len() {
             break;
         }
-        if let Datum::Var { value, name, .. } = d {
+        if let Datum::Var { value, name, ty } = d {
             if name == "found" {
                 continue;
             }
             *value = inv.args[arg].clone();
+            if let Some(declared) = inv.arg_types.get(arg) {
+                *ty = canonical_type(declared);
+            }
             arg += 1;
         }
     }
@@ -1165,12 +1180,13 @@ impl Interp<'_> {
                     || head.starts_with("with")
                     || head.starts_with("values");
                 if into {
-                    if !is_query {
-                        return Err(PlError::unsupported(
-                            "INSERT / UPDATE / DELETE ... RETURNING INTO",
-                        ));
-                    }
-                    let out = self.host.query(&sql, &params, &types)?;
+                    let out = if is_query {
+                        self.host.query(&sql, &params, &types)?
+                    } else {
+                        // A write with `RETURNING ... INTO`: its returned
+                        // row fills the target, as a SELECT INTO's would.
+                        self.host.returning(&sql, &params, &types)?
+                    };
                     if strict && out.rows.is_empty() {
                         return Err(PlError::new("P0002", "query returned no rows"));
                     }

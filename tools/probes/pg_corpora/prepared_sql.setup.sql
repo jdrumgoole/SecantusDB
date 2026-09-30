@@ -1,0 +1,3 @@
+DEALLOCATE ALL
+DROP TABLE IF EXISTS pp
+CREATE TABLE pp (id int, v text)

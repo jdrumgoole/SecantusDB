@@ -695,7 +695,7 @@ impl PgHandler {
 
     /// `docs` (stored under `from`'s fields) as rows of `to`: the values
     /// column by column, shaped as an INSERT into `to` stores them.
-    fn reshape_rows(
+    pub(crate) fn reshape_rows(
         from: &TableDef,
         to: &TableDef,
         docs: &[Document],
@@ -719,7 +719,7 @@ impl PgHandler {
 
     /// Insert already-shaped rows into `table` through the ordinary INSERT
     /// path, so constraints, uniqueness and routing all apply.
-    fn insert_shaped(&self, table: &str, rows: Vec<Document>) -> PgWireResult<()> {
+    pub(crate) fn insert_shaped(&self, table: &str, rows: Vec<Document>) -> PgWireResult<()> {
         if rows.is_empty() {
             return Ok(());
         }

@@ -2709,12 +2709,14 @@ fn a_set_returning_function_in_the_select_list_makes_rows() {
 
 /// A set-returning function BESIDE another output column plans -- as a
 /// LATERAL join over one row, which repeats the constant across the generated
-/// rows as PostgreSQL does. Several of them are refused by name: PostgreSQL
-/// runs those in LOCKSTEP, which a join would silently get wrong.
+/// rows as PostgreSQL does. Several run in LOCKSTEP -- a `ROWS FROM` of them
+/// all -- and two inside ONE expression are refused by name.
 #[test]
-fn a_set_returning_function_beside_a_column_plans_and_two_are_refused() {
+fn a_set_returning_function_beside_a_column_plans_and_several_run_in_lockstep() {
     plan("SELECT 1, generate_series(1,3)", &lookup).expect("srf beside a column");
-    let err = plan("SELECT unnest(ARRAY[1]), unnest(ARRAY[2])", &lookup).expect_err("two srfs");
+    plan("SELECT unnest(ARRAY[1]), unnest(ARRAY[2])", &lookup).expect("two srfs");
+    let err = plan("SELECT unnest(ARRAY[1]) + unnest(ARRAY[2])", &lookup)
+        .expect_err("two srfs in one expression");
     assert_eq!(err.sqlstate(), "0A000");
 }
 
