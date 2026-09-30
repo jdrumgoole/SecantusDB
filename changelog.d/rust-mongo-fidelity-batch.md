@@ -50,6 +50,15 @@ reports zero divergences.
 - SASL errors match mongod (`Authentication failed.`, 334 for an unknown
   mechanism, 17 with no conversation), and `usersInfo {forAllDBs: true}` lists
   every user instead of none.
+- **The streaming `hello` a driver's server monitor sends is held as mongod
+  holds it.** A monitor that already had the current topology got its first
+  streamed reply at once, one extra heartbeat per stream: the Go driver's
+  `heartbeats_processed_more_frequently` test counted 12 messages against a
+  limit of 10. A monitor with an out-of-date topology is now answered at once
+  instead of held, returning to primary after `replSetStepDown` moves
+  `topologyVersion` so the monitor hears about it immediately, and a
+  malformed `topologyVersion` or `maxAwaitTimeMS` gets mongod's error instead
+  of being accepted.
 - A document that fails its validator gets mongod's full explanation in
   `errInfo.details`: every broken `$jsonSchema` rule in mongod's order, and
   every failing query clause, where it used to get `{operatorName: "$jsonSchema"}`.
@@ -67,7 +76,8 @@ reports zero divergences.
 - A multi-field filter rides a single-field index on one of its fields, and a
   sort under an unindexed filter walks the sort index -- the plans mongod picks.
 - Probes: `max_time_expiry.py`, `int32_arguments.py`, `nested_value_sort.py`,
-  `bucket_auto_granularity.py`, `validation_error_details.py`, `scram_auth.py`;
+  `bucket_auto_granularity.py`, `validation_error_details.py`, `scram_auth.py`,
+  `awaitable_hello.py`;
   `index_result_sets.py` now covers empty filters, compound sorts, hints,
   partial compound indexes and array / document bounds.
 

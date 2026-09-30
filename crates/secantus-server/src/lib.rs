@@ -669,7 +669,26 @@ fn serve<S: Read + Write>(
                     // We answered immediately -- 0.3ms where mongod took the
                     // full 502ms (measured 2026-09-29) -- which makes a driver
                     // that polls this way spin instead of waiting.
-                    let reply = await_hello_reply(stream, shared, &request, reply);
+                    //
+                    // Only a client naming the CURRENT topology is held; a stale
+                    // one is answered at once so it can catch up (mongod,
+                    // 2026-09-30). And when the topology moves during the hold,
+                    // the reply is rebuilt: the one produced before the wait
+                    // describes the topology the client already had.
+                    let counter = shared.step_down.topology_counter();
+                    let reply = if secantus_commands::handshake::awaitable_topology_is_current(
+                        &request, counter,
+                    ) && await_hello_reply(shared, &request, counter)
+                    {
+                        let (fresh, close, _) =
+                            run_dispatch(&request, None, conn_id, shared, conn_auth, &peer_cert_dn);
+                        if close {
+                            return Ok(());
+                        }
+                        fresh
+                    } else {
+                        reply
+                    };
                     write_op_msg(stream, &header, shared, &reply, None)?;
                 } else {
                     write_op_msg(stream, &header, shared, &reply, pending.as_ref())?;
@@ -1186,39 +1205,30 @@ fn reply_ok(reply: &Document) -> bool {
 /// Mirrors `server.py::_stream_awaitable_hello`. `Ok(true)` = ended cleanly,
 /// `Ok(false)` = a write failed (drop the connection).
 /// Hold an awaitable `hello` until the topology changes or `maxAwaitTimeMS`
-/// expires, then return the reply to send.
+/// expires. Returns true when the topology MOVED, so the caller rebuilds the
+/// reply rather than sending the pre-wait one.
 ///
 /// The non-streaming half of the SDAM awaitable-hello protocol: one request,
 /// one reply, but the reply is DELAYED. `shared.stop` is polled so shutdown
 /// stays prompt, and the socket is left alone -- unlike the streaming case there
 /// is no `moreToCome` sequence to police, and the client is simply waiting.
-fn await_hello_reply<S: Read + Write>(
-    _stream: &mut S,
-    shared: &Arc<Shared>,
-    request: &Document,
-    reply: Document,
-) -> Document {
-    let max_await_ms = request
-        .get_i64("maxAwaitTimeMS")
-        .or_else(|_| request.get_i32("maxAwaitTimeMS").map(i64::from))
+fn await_hello_reply(shared: &Arc<Shared>, request: &Document, counter_at_entry: i64) -> bool {
+    let max_await_ms = secantus_commands::handshake::max_await_time_ms(request)
         .unwrap_or(0)
         .clamp(0, 60_000) as u64;
-    let counter_at_entry = shared.step_down.topology_counter();
     let deadline = Instant::now() + Duration::from_millis(max_await_ms);
     while Instant::now() < deadline {
         if shared.stop.load(Ordering::SeqCst) {
             break;
         }
         if shared.step_down.topology_counter() != counter_at_entry {
-            // The topology moved: answer NOW, and with the new state rather
-            // than the snapshot taken before the wait.
-            break;
+            return true;
         }
         std::thread::sleep(
             Duration::from_millis(20).min(deadline.saturating_duration_since(Instant::now())),
         );
     }
-    reply
+    false
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1232,17 +1242,24 @@ fn stream_awaitable_hello<S: Read + Write>(
     peer_cert_dn: &Option<String>,
     first_reply: Document,
 ) -> io::Result<bool> {
-    let max_await_ms = request
-        .get_i64("maxAwaitTimeMS")
-        .or_else(|_| request.get_i32("maxAwaitTimeMS").map(i64::from))
+    let max_await_ms = secantus_commands::handshake::max_await_time_ms(request)
         .unwrap_or(10_000)
         .max(0) as u64;
 
     // The topology counter as of the reply we are about to send; the wait below
     // ends early when it moves.
     let mut topology_counter_at_send = shared.step_down.topology_counter();
-    // Establish the stream with the reply the handler already produced.
-    if write_op_msg_flags(
+    // A client that names the CURRENT topology gets nothing until the wait
+    // ends -- the first frame too. Only an out-of-date client (another process,
+    // an older counter) is answered at once. We used to send the first frame
+    // immediately regardless, one extra reply per stream: the Go driver's
+    // `TestSDAMProse/heartbeats_processed_more_frequently` counted 12 monitor
+    // messages in 2s against a ceiling of 10, and mongod held that frame for
+    // the full 500ms (measured 8.2.11, 2026-09-30).
+    if !secantus_commands::handshake::awaitable_topology_is_current(
+        request,
+        topology_counter_at_send,
+    ) && write_op_msg_flags(
         stream,
         header,
         shared,

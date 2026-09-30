@@ -3032,8 +3032,17 @@ These are explicit non-goals. Don't add them without a reason.
         We refuse the parameters deliberately rather than accepting names we do
         not honour; see the `$where` item.
 
-      * **`TestSDAMProse/heartbeats_processed_more_frequently` — still OPEN,
-        with two causes now RULED OUT by probe.** The entry originally blamed
+      * **`TestSDAMProse/heartbeats_processed_more_frequently` — FOUND
+        2026-09-30, fixed on the RUST server, still open on the Python one.**
+        The extra messages were the FIRST streamed `hello` reply: mongod holds
+        it for the whole `maxAwaitTimeMS` when the client already has the
+        current topology, and both servers sent it at once -- one extra reply
+        per stream, found by timing a raw exhaust `hello` against mongod rather
+        than by diffing the driver's totals. The Rust Go gauge now passes it
+        (598 / 12 / 49, 98.0%); see §7.00 round 4 and
+        `tools/probes/awaitable_hello.py`. The investigation below is the
+        record of what it was NOT.
+        Previously -- still OPEN, with two causes RULED OUT by probe. The entry originally blamed
         `setParameter` ("almost certainly"); it is not that. It is also not
         `helloOk`, which the 2026-09-29 investigation found and fixed along the
         way — a real bug with broad reach, just not this one.
@@ -3241,12 +3250,31 @@ These are explicit non-goals. Don't add them without a reason.
         `Failing command via 'failCommand' failpoint`, the Rust server said
         `due to` -- fixed. The `select_server` x4 and `ipv6` x2 are the
         documented inherents (§ C gauge above): one asserts a non-primary member
-        this topology cannot offer, the other hard-codes `[::1]:27017`. Not yet
-        confirmed by a C gauge re-run.
+        this topology cannot offer, the other hard-codes `[::1]:27017`.
+        **Confirmed by a C gauge re-run 2026-09-30** (Rust server, tree
+        `be40c1fb`): 768 / 2 / 68 of 838, 99.7%, every result reported. Both
+        `/find_and_modify/hint` and `/crud/prose_test_9` pass, and so do all
+        four `select_server` tests -- the runner now starts the daemon
+        `--standalone` (#1622). The two failures left are `/Client/ipv6/single`.
 
       All eleven gauges and their rates are tabulated in
       `tasks/driver-conformance-followups-plan.md` §5.
 
+- [ ] **OPEN -- the C gauge's `--standalone` daemon trades 4 passes for 20
+  skips.** `c_validation/runner.py` has started the daemon `--standalone`
+  since #1622, which fixed the four `/Client/select_server` tests (they assert
+  standalone semantics because `MONGOC_TEST_URI` carries no `replicaSet=`).
+  But libmongoc then self-skips every replica-set-only test: measured
+  2026-09-30 on the Rust server, `/change_stream` went from 23 pass / 2 skip to
+  **7 pass / 18 skip** (`live/watch`, `live/track_resume_token`,
+  `resume_at_optime`, `start_at_operation_time`, `database`, `client`,
+  `live/prose_test_11`-`14`, ...), and `/WriteConcern`, `/Collection` and
+  `/long_namespace` lost 4 more to skips. The headline went UP (98.9% -> 99.7%)
+  while passing tests went DOWN (782 -> 768), and the gauge no longer
+  exercises change streams through libmongoc at all. Options: run the C gauge
+  twice (a standalone pass for `select_server`, a replica-set pass for the
+  rest) and merge, or go back to the replica-set daemon and list the four
+  `select_server` tests as inherent. A scope decision, not a bug -- Joe's call.
 - [ ] **OPEN — the .NET gauge spends ~90% of its wall clock after its last log
       line (2026-09-28).** Observed: TRX and report both written at 14:53, the
       process exited at 15:12 with `rc=0` and nothing logged in between — 19 of
@@ -6987,6 +7015,26 @@ are the probes' own numbers.
 - [x] **Probe harness:** three probes ran their embedded server into a
   `WT_PANIC` at exit (the store was deleted under a live connection) --
   `_servers.probe_server()` now stops it first.
+- [x] **Round 4 -- the awaitable `hello` (streaming SDAM):** the Rust server
+  sent the FIRST streamed reply at once even when the client already had the
+  current topology -- 5 replies in 2s where mongod sends 4, which is exactly
+  the Go driver's `TestSDAMProse/heartbeats_processed_more_frequently` (12
+  monitor messages against a ceiling of 10). mongod holds a client naming the
+  current `topologyVersion` for the whole `maxAwaitTimeMS`, streamed or not,
+  and answers a client naming another process or an older counter AT ONCE;
+  both paths now do the same. Every malformed argument used to be accepted:
+  `topologyVersion` must be an object with an ObjectId `processId` and a
+  LONG `counter` (int32 is 14) and no other field (40415), `counter` is
+  reported missing before `processId` (40414), `maxAwaitTimeMS` is any number
+  truncated toward zero and not negative (14 / 2), either one without the
+  other is 31368 in BOTH directions (only one was), a negative counter is
+  31372, and one newer than ours from this process is 31382. Also: returning
+  to primary after `replSetStepDown` never moved `topologyVersion.counter`, so
+  a streaming monitor was never woken and the driver learned the node was
+  writable again only when its wait ran out -- it now bumps (mongod moves
+  it +2 down and +3 back; we move it once each way, see `stepdown.rs`), and a
+  non-streamed hold whose topology moves rebuilds its reply instead of sending
+  the pre-wait one. `tools/probes/awaitable_hello.py` 0 of 35.
 
 **Found and NOT fixed -- Python-server divergences** (out of this batch's scope,
 which was the Rust server; each measured against 8.2.11 on 2026-09-30):
@@ -6999,6 +7047,12 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
 - [ ] `$jsonSchema` accepts `type: "integer"` (mongod: 9).
 - [ ] aggregate `$project: {_id: 1}` returns whole documents
   (`aggregation_stage_results.py`, python 2).
+- [ ] the awaitable `hello`: 25 of 33 shapes differ
+  (`tools/probes/awaitable_hello.py` with `PROBE_SERVER` at a Python server) --
+  every malformed `topologyVersion` / `maxAwaitTimeMS` accepted, a stale or
+  another process's topology held instead of answered, and the first streamed
+  reply sent at once (so the Python Go gauge's
+  `heartbeats_processed_more_frequently` failure is this too).
 - [ ] `$slice: [a, <negative>, n]` counts from the raw start (`[[4, 3, 1, 3, 1],
   -3, 4]` is `[]`, mongod `[1, 3, 1]`) and a count of 0 or less is accepted.
   `test_index_math_fuzz` draws around both, with the reason written in.
@@ -7022,8 +7076,10 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
   speed: those queries now post-sort or scan. A real fix is an `entryFormat`
   bump with a value-ordered encoding for documents and arrays, on both servers
   (the layout is shared).
-- [ ] **The Go gauge has not been re-run** with `--noop-heartbeat-seconds` now
-  reaching the Rust server (see the §7.5 entry).
+- [x] **The Go gauge was re-run 2026-09-30** with `--noop-heartbeat-seconds 10`
+  reaching the Rust server (checked in the daemon's argv): 598 / 12 / 49 of
+  659, 98.0%, all 659 reporting a result, no change-stream failure, and
+  `TestSDAMProse/heartbeats_processed_more_frequently` passing after round 4.
 
 
 - [x] **Aggregation stage-spec messages — the PYTHON server is DONE 2026-09-02.**
@@ -10983,8 +11039,9 @@ session tests + the go harness race below.
   - [x] **Unstripped 2026-09-30.** `_PYTHON_ONLY_FLAGS` is empty: `secantusd-rs`
     accepts all six flags it listed, and with `--noop-heartbeat-seconds 1` a quiet
     change stream's resume token advances on every getMore (13 distinct in 13s).
-    The Go gauge has not yet been re-run with heartbeats on against the Rust server
-    -- that confirmation is still owed. The original entry follows.
+    **Confirmed 2026-09-30:** the Go gauge ran against the Rust server with the
+    flag in the daemon's argv and no change-stream test failed (598 / 12 / 49,
+    98.0%). The original entry follows.
   - ~~*Minor, separate — the CAUSE has changed; re-probed 2026-08-20.*~~ The go gauge
     still runs the Rust server without periodic noop heartbeats, but no longer because
     the binary lacks the flag: `secantusd-rs --help` lists `--noop-heartbeat-seconds S`,
