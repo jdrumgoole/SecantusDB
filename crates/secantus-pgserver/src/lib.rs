@@ -11,6 +11,7 @@
 
 mod advisory;
 mod aggregates;
+mod catalog_objects;
 mod do_block;
 mod encoding;
 mod explain;
@@ -1953,6 +1954,7 @@ impl PgHandler {
                 .clone(),
         ));
         secantus_pgplan::set_current_user(Some(self.current_role_name()));
+        secantus_pgplan::catalog_stmts::set_tablespaces(self.tablespace_names());
         secantus_pgplan::rls::set_rls(self.rls_tables());
         secantus_pgplan::rls::set_view_rls(self.view_rls_tables());
         // The database and the GUCs, for `current_database()` and
@@ -8743,7 +8745,7 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("conbin", "pg_node_tree", false),
                 ],
             )),
-            _ => None,
+            _ => Self::catalog_object_table(name),
         }
     }
 
@@ -10647,7 +10649,7 @@ impl PgHandler {
                 }
                 rows
             }
-            _ => Vec::new(),
+            _ => self.catalog_object_rows(name, &def).unwrap_or_default(),
         };
         let empty = Document::new();
         Some(
@@ -12798,6 +12800,11 @@ impl PgHandler {
             Statement::CreateAggregate { .. } | Statement::DropAggregate { .. } => {
                 vec![Self::AGGREGATE_COLLECTION.to_string()]
             }
+            Statement::Catalog(_) => vec![
+                catalog_objects::STATISTICS_COLLECTION.to_string(),
+                catalog_objects::TABLESPACE_COLLECTION.to_string(),
+                catalog_objects::PUBLICATION_COLLECTION.to_string(),
+            ],
             Statement::AlterView { .. }
             | Statement::RenameView { .. }
             | Statement::RenameViewColumn { .. } => vec![
@@ -17441,6 +17448,7 @@ impl PgHandler {
             }
             Statement::DropFunction { .. } => "DROP FUNCTION",
             Statement::CreateAggregate { .. } => "CREATE AGGREGATE",
+            Statement::Catalog(op) => op.tag(),
             Statement::AlterView { table_form, .. }
             | Statement::RenameView { table_form, .. }
             | Statement::RenameViewColumn { table_form, .. } => {
@@ -18659,6 +18667,7 @@ impl PgHandler {
             }
 
             Statement::CreateAggregate { def, replace } => self.create_aggregate(def, replace),
+            Statement::Catalog(op) => self.execute_catalog(op),
             Statement::AlterView {
                 view,
                 missing_ok,
@@ -19622,6 +19631,7 @@ impl PgHandler {
                                 Statement::DropTable(secantus_pgplan::DropTable {
                                     tables: vec![child.name.clone()],
                                     if_exists: false,
+                                    cascade: drop.cascade,
                                 }),
                                 max_rows,
                             )?;
@@ -19630,13 +19640,85 @@ impl PgHandler {
                             self.delete_partition_rows(&def)?;
                         }
                     }
-                    let mut dependants = secantus_pgplan::views_reading(table);
-                    dependants.retain(|v| !self.is_partition(v) && !children.contains(v));
-                    if !dependants.is_empty() && self.lookup(table).is_some() {
-                        return Err(Self::dependants_error(
-                            &format!("table {table}"),
-                            &dependants,
-                        ));
+                    // What depends on the table: other tables' foreign keys
+                    // referencing it, then the views over it (and over those
+                    // views), in PostgreSQL's order. RESTRICT refuses;
+                    // CASCADE drops the views and the constraints.
+                    if self.lookup(table).is_some() {
+                        let fks: Vec<(TableDef, secantus_pgcatalog::ForeignKey)> = self
+                            .referencing_keys(table)?
+                            .into_iter()
+                            .filter(|(child, _)| {
+                                child.name != *table && !drop.tables.contains(&child.name)
+                            })
+                            .collect();
+                        // (view, what it depends on), breadth first.
+                        let mut views: Vec<(String, String)> = Vec::new();
+                        let mut frontier = vec![format!("table {table}")];
+                        let mut names = vec![table.clone()];
+                        while let Some(on) = names.first().cloned() {
+                            names.remove(0);
+                            let what = frontier.remove(0);
+                            for v in secantus_pgplan::views_reading(&on) {
+                                if self.is_partition(&v)
+                                    || children.contains(&v)
+                                    || views.iter().any(|(n, _)| *n == v)
+                                {
+                                    continue;
+                                }
+                                views.push((v.clone(), what.clone()));
+                                names.push(v.clone());
+                                frontier.push(format!("view {v}"));
+                            }
+                        }
+                        let objects: Vec<(String, String)> = fks
+                            .iter()
+                            .map(|(child, fk)| {
+                                (
+                                    format!("constraint {} on table {}", fk.name, child.name),
+                                    format!("table {table}"),
+                                )
+                            })
+                            .chain(
+                                views
+                                    .iter()
+                                    .map(|(v, on)| (format!("view {v}"), on.clone())),
+                            )
+                            .collect();
+                        if !objects.is_empty() {
+                            if !drop.cascade {
+                                let mut info = ErrorInfo::new(
+                                    "ERROR".into(),
+                                    "2BP01".into(),
+                                    format!(
+                                        "cannot drop table {table} because other objects depend on it"
+                                    ),
+                                );
+                                info.detail = Some(
+                                    objects
+                                        .iter()
+                                        .map(|(o, on)| format!("{o} depends on {on}"))
+                                        .collect::<Vec<_>>()
+                                        .join("\n"),
+                                );
+                                info.hint = Some(
+                                    "Use DROP ... CASCADE to drop the dependent objects too."
+                                        .into(),
+                                );
+                                return Err(PgWireError::UserError(Box::new(info)));
+                            }
+                            let descs: Vec<String> = objects.into_iter().map(|(o, _)| o).collect();
+                            self.cascade_notice(&descs);
+                            for (child, fk) in &fks {
+                                let mut def =
+                                    self.lookup(&child.name).unwrap_or_else(|| child.clone());
+                                def.foreign_keys.retain(|f| f.name != fk.name);
+                                self.rewrite_catalog(&child.name, &def)?;
+                            }
+                            for (v, _) in views.iter().rev() {
+                                self.delete_view(v)?;
+                            }
+                        }
                     }
                     let Some(def) = self.lookup(table) else {
                         if drop.if_exists {
@@ -19653,8 +19735,10 @@ impl PgHandler {
                             format!("table \"{table}\" does not exist"),
                         ))));
                     };
-                    // Its triggers go with it.
+                    // Its triggers go with it, and its statistics objects and
+                    // publication memberships.
                     self.drop_table_triggers(table)?;
+                    self.drop_table_catalog_objects(table)?;
                     // The sequences its serial columns own go with it.
                     if def.columns.iter().any(|c| c.sequence.is_some()) {
                         self.ensure_collection(SEQUENCE_COLLECTION)?;
@@ -20044,6 +20128,7 @@ impl PgHandler {
                         Statement::DropTable(secantus_pgplan::DropTable {
                             tables: vec![name.clone()],
                             if_exists: true,
+                            cascade: false,
                         }),
                         max_rows,
                     )?;

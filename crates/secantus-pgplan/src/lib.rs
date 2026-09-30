@@ -18,6 +18,7 @@ mod agg_hoist;
 pub mod arrays;
 pub mod bits;
 pub mod bytea;
+pub mod catalog_stmts;
 pub mod correlated;
 pub mod datetime;
 pub mod domains;
@@ -483,6 +484,8 @@ pub enum Statement {
         missing_ok: bool,
         table_form: bool,
     },
+    /// A statement that only records something (see `catalog_stmts`).
+    Catalog(catalog_stmts::CatalogOp),
     /// `DROP AGGREGATE [IF EXISTS] name (args)`.
     DropAggregate {
         name: String,
@@ -2067,6 +2070,9 @@ pub struct DropTable {
     /// `IF EXISTS`: a missing table is not an error (probed PG 14, which still
     /// answers the `DROP TABLE` tag).
     pub if_exists: bool,
+    /// `CASCADE`: the views over the table and the foreign keys referencing
+    /// it go too.
+    pub cascade: bool,
 }
 
 /// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name] ON t (cols) [INCLUDE (...)]
@@ -2739,6 +2745,7 @@ fn plan_node(
 ) -> Result<Statement> {
     match node {
         N::CreateStmt(c) => {
+            catalog_stmts::check_tablespace(&c.tablespacename)?;
             let (c, extra) = partitions::lower_create(&c, lookup)?;
             let mut st = plan_create(&expand_table_like(&c, lookup)?)?;
             if let Statement::CreateTable(def, _) = &mut st {
@@ -2752,7 +2759,48 @@ fn plan_node(
         N::ViewStmt(v) => plan_create_view(&v),
         N::ExplainStmt(e) => plan_explain(&e, lookup, params),
         N::AlterSeqStmt(a) => plan_alter_sequence(&a),
+        N::RenameStmt(r)
+            if ObjectType::try_from(r.rename_type) == Ok(ObjectType::ObjectStatisticExt) =>
+        {
+            let name = match r.object.as_deref().and_then(|o| o.node.as_ref()) {
+                Some(N::List(l)) => l
+                    .items
+                    .iter()
+                    .rev()
+                    .find_map(|n| match n.node.as_ref() {
+                        Some(N::String(s)) => Some(s.sval.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            Ok(Statement::Catalog(
+                catalog_stmts::CatalogOp::AlterStatistics {
+                    name,
+                    rename: Some(r.newname.clone()),
+                    missing_ok: r.missing_ok,
+                },
+            ))
+        }
         N::RenameStmt(r) => plan_rename(&r),
+        N::CreateStatsStmt(s) => catalog_stmts::plan_create_statistics(&s, lookup),
+        N::AlterStatsStmt(s) => Ok(catalog_stmts::plan_alter_statistics(&s)),
+        N::SecLabelStmt(s) => Err(catalog_stmts::plan_security_label(&s)),
+        N::CreateTableSpaceStmt(t) => Ok(Statement::Catalog(
+            catalog_stmts::CatalogOp::CreateTablespace {
+                name: t.tablespacename.clone(),
+                location: t.location.clone(),
+                owner: t.owner.as_ref().map(role_spec_name),
+            },
+        )),
+        N::DropTableSpaceStmt(t) => Ok(Statement::Catalog(
+            catalog_stmts::CatalogOp::DropTablespace {
+                name: t.tablespacename.clone(),
+                if_exists: t.missing_ok,
+            },
+        )),
+        N::CreatePublicationStmt(p) => catalog_stmts::plan_create_publication(&p, lookup),
+        N::AlterPublicationStmt(p) => catalog_stmts::plan_alter_publication(&p, lookup),
         N::CreateTableAsStmt(c) => plan_create_table_as(&c, lookup, params),
         N::InsertStmt(i) => plan_insert(&i, lookup, params),
         N::SelectStmt(s) => plan_select(&s, lookup, params),
@@ -24304,6 +24352,37 @@ fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
             cascade,
         });
     }
+    // `DROP STATISTICS` / `DROP PUBLICATION`: names only.
+    if matches!(
+        ObjectType::try_from(d.remove_type),
+        Ok(ObjectType::ObjectStatisticExt | ObjectType::ObjectPublication)
+    ) {
+        let names: Vec<String> = d
+            .objects
+            .iter()
+            .filter_map(|o| match o.node.as_ref()? {
+                N::String(s) => Some(s.sval.clone()),
+                N::List(l) => l.items.iter().rev().find_map(|n| match n.node.as_ref() {
+                    Some(N::String(s)) => Some(s.sval.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .collect();
+        return Ok(Statement::Catalog(
+            if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectPublication) {
+                catalog_stmts::CatalogOp::DropPublication {
+                    names,
+                    if_exists: d.missing_ok,
+                }
+            } else {
+                catalog_stmts::CatalogOp::DropStatistics {
+                    names,
+                    if_exists: d.missing_ok,
+                }
+            },
+        ));
+    }
     // `DROP AGGREGATE name (args)`: an ObjectWithArgs, as a function's is.
     if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectAggregate) {
         let [obj] = d.objects.as_slice() else {
@@ -24481,11 +24560,7 @@ fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
         };
         return Err(Error::Unsupported(format!("DROP of {what}")));
     }
-    // CASCADE would have to chase dependants; refuse rather than silently
-    // behave as RESTRICT. DropBehavior: Restrict = 1, Cascade = 2.
-    if DropBehavior::try_from(d.behavior) == Ok(DropBehavior::DropCascade) {
-        return Err(Error::Unsupported("DROP TABLE ... CASCADE".into()));
-    }
+    let cascade = DropBehavior::try_from(d.behavior) == Ok(DropBehavior::DropCascade);
     let mut tables = Vec::new();
     for obj in &d.objects {
         // Each object is a List of name parts (schema, table).
@@ -24509,6 +24584,7 @@ fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
     Ok(Statement::DropTable(DropTable {
         tables,
         if_exists: d.missing_ok,
+        cascade,
     }))
 }
 
