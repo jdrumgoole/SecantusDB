@@ -56,6 +56,7 @@ pub mod range;
 pub mod range_ops;
 pub mod scalar;
 pub mod user_agg;
+pub mod view_deps;
 pub mod view_dml;
 pub mod xml;
 
@@ -456,6 +457,30 @@ pub enum Statement {
     CreateAggregate {
         def: user_agg::UserAggregate,
         replace: bool,
+    },
+    /// `ALTER VIEW v <action>, ...` (and the forms `ALTER TABLE` takes on a
+    /// view).
+    AlterView {
+        view: String,
+        missing_ok: bool,
+        actions: Vec<AlterViewAction>,
+        /// Written as `ALTER TABLE`, which is also the command tag.
+        table_form: bool,
+    },
+    /// `ALTER VIEW v RENAME TO w`.
+    RenameView {
+        view: String,
+        to: String,
+        missing_ok: bool,
+        table_form: bool,
+    },
+    /// `ALTER VIEW v RENAME COLUMN c TO d`.
+    RenameViewColumn {
+        view: String,
+        column: String,
+        to: String,
+        missing_ok: bool,
+        table_form: bool,
     },
     /// `DROP AGGREGATE [IF EXISTS] name (args)`.
     DropAggregate {
@@ -2099,6 +2124,20 @@ pub struct UserFunctionDef {
     pub strict: bool,
 }
 
+/// One `ALTER VIEW` action.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterViewAction {
+    OwnerTo(String),
+    /// `ALTER COLUMN c SET DEFAULT <expr>` (`None`: DROP DEFAULT), the
+    /// default an INSERT through the view gives an omitted column.
+    SetDefault {
+        column: String,
+        sql: Option<String>,
+    },
+    /// `SET (option = value, ...)` / `RESET (option, ...)` (`None` values).
+    Options(Vec<(String, Option<String>)>),
+}
+
 /// A trigger as CREATE TRIGGER declares it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TriggerDef {
@@ -2673,6 +2712,13 @@ pub fn plan_with_subqueries(
     materialize_dml_ctes(&mut node, lookup, &mut params, run)?;
     rewrite_dml_from(&mut node, lookup)?;
     materialize_recursive_ctes(&mut node, lookup, &mut params, run)?;
+    // Views expand BEFORE subqueries resolve: a view's body may hold a
+    // (correlated) subquery, which the resolver has to see.
+    if let Some(N::SelectStmt(s)) = node.node.as_mut() {
+        if s.with_clause.is_none() {
+            **s = expand_views(s)?;
+        }
+    }
     resolve_sublinks(&mut node, lookup, &mut params, run)?;
     plan_node(
         node.node
@@ -3840,12 +3886,19 @@ fn plan_alter_table(
         .as_ref()
         .ok_or_else(|| Error::Parse("ALTER TABLE without a relation".into()))?;
     let table = relation.relname.clone();
-    // Only tables. `ALTER INDEX` / `ALTER VIEW` / `ALTER SEQUENCE` parse to
-    // the same node with a different `objtype`, and answering them as though
-    // they were table alterations would be worse than refusing them.
+    // `ALTER VIEW`, and `ALTER TABLE` naming a view (PostgreSQL takes the
+    // forms that make sense for one either way).
+    if a.objtype == ObjectType::ObjectView as i32
+        || (a.objtype == ObjectType::ObjectTable as i32 && is_view(&table))
+    {
+        return plan_alter_view(a, &table);
+    }
+    // Only tables. `ALTER INDEX` / `ALTER SEQUENCE` parse to the same node
+    // with a different `objtype`, and answering them as though they were
+    // table alterations would be worse than refusing them.
     if a.objtype != ObjectType::ObjectTable as i32 {
         return Err(Error::Unsupported(format!(
-            "ALTER {} ",
+            "ALTER {}",
             object_type_word(a.objtype)
         )));
     }
@@ -3918,6 +3971,69 @@ fn alter_type_is_automatic(from: &str, to: &str) -> bool {
     }
     let both = |set: &[&str]| set.contains(&from) && set.contains(&to);
     both(NUMBERS) || both(DATETIMES) || both(&["json", "jsonb"])
+}
+
+fn plan_alter_view(a: &pg_query::protobuf::AlterTableStmt, view: &str) -> Result<Statement> {
+    use pg_query::protobuf::AlterTableType as AT;
+    let mut actions = Vec::new();
+    for c in &a.cmds {
+        let Some(N::AlterTableCmd(cmd)) = c.node.as_ref() else {
+            continue;
+        };
+        actions.push(match AT::try_from(cmd.subtype) {
+            Ok(AT::AtChangeOwner) => AlterViewAction::OwnerTo(
+                cmd.newowner
+                    .as_ref()
+                    .map(role_spec_name)
+                    .unwrap_or_default(),
+            ),
+            Ok(AT::AtColumnDefault) => AlterViewAction::SetDefault {
+                column: cmd.name.clone(),
+                sql: cmd.def.as_deref().map(deparse_expr).transpose()?,
+            },
+            Ok(sub @ (AT::AtSetRelOptions | AT::AtResetRelOptions)) => {
+                let Some(N::List(l)) = cmd.def.as_ref().and_then(|d| d.node.as_ref()) else {
+                    return Err(Error::Parse("ALTER VIEW options without a list".into()));
+                };
+                let mut opts = Vec::new();
+                for item in &l.items {
+                    let Some(N::DefElem(e)) = item.node.as_ref() else {
+                        continue;
+                    };
+                    let value = if sub == AT::AtResetRelOptions {
+                        None
+                    } else {
+                        Some(match e.arg.as_ref().and_then(|x| x.node.as_ref()) {
+                            Some(N::String(s)) => s.sval.clone(),
+                            Some(N::Boolean(b)) => b.boolval.to_string(),
+                            Some(N::Integer(i)) => i.ival.to_string(),
+                            Some(N::TypeName(t)) => type_name_of(t),
+                            // A bare option (`security_barrier`) is true.
+                            None => "true".to_string(),
+                            Some(other) => deparse_expr(&pg_query::protobuf::Node {
+                                node: Some(other.clone()),
+                            })?,
+                        })
+                    };
+                    opts.push((e.defname.to_ascii_lowercase(), value));
+                }
+                AlterViewAction::Options(opts)
+            }
+            Ok(other) => {
+                return Err(Error::Unsupported(format!(
+                    "ALTER VIEW ... {}",
+                    alter_action_word(other)
+                )))
+            }
+            Err(_) => return Err(Error::Unsupported("this ALTER VIEW".into())),
+        });
+    }
+    Ok(Statement::AlterView {
+        view: view.to_string(),
+        missing_ok: a.missing_ok,
+        actions,
+        table_form: a.objtype == ObjectType::ObjectTable as i32,
+    })
 }
 
 /// The word PostgreSQL uses for an object type in `ALTER <word>`, for a
@@ -4561,7 +4677,28 @@ fn plan_rename(r: &pg_query::protobuf::RenameStmt) -> Result<Statement> {
         .as_ref()
         .ok_or_else(|| Error::Parse("RENAME without a relation".into()))?;
     let table = relation.relname.clone();
+    let on_view = ObjectType::try_from(r.relation_type) == Ok(ObjectType::ObjectView)
+        || ObjectType::try_from(r.rename_type) == Ok(ObjectType::ObjectView)
+        || is_view(&table);
+    let table_form = ObjectType::try_from(r.rename_type) == Ok(ObjectType::ObjectTable)
+        || (ObjectType::try_from(r.rename_type) == Ok(ObjectType::ObjectColumn)
+            && ObjectType::try_from(r.relation_type) == Ok(ObjectType::ObjectTable));
     match ObjectType::try_from(r.rename_type) {
+        Ok(ObjectType::ObjectView) | Ok(ObjectType::ObjectTable) if on_view => {
+            Ok(Statement::RenameView {
+                view: table,
+                to: r.newname.clone(),
+                missing_ok: r.missing_ok,
+                table_form,
+            })
+        }
+        Ok(ObjectType::ObjectColumn) if on_view => Ok(Statement::RenameViewColumn {
+            view: table,
+            column: r.subname.clone(),
+            to: r.newname.clone(),
+            missing_ok: r.missing_ok,
+            table_form,
+        }),
         Ok(ObjectType::ObjectTable) => Ok(Statement::RenameTable {
             table,
             to: r.newname.clone(),
@@ -5457,9 +5594,14 @@ fn expand_views_in_from(item: &mut pg_query::protobuf::Node, depth: usize) -> Re
                 )));
             };
             let mut body = *body;
-            for inner in &mut body.from_clause {
-                expand_views_in_from(inner, depth + 1)?;
-            }
+            // What the view reads is read as its OWNER: under the owner's
+            // row-level security.
+            rls::within_view(&r.relname, || {
+                for inner in &mut body.from_clause {
+                    expand_views_in_from(inner, depth + 1)?;
+                }
+                Ok::<(), Error>(())
+            })?;
             let alias = r
                 .alias
                 .clone()

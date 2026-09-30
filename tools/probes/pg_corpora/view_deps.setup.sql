@@ -1,0 +1,20 @@
+DROP VIEW IF EXISTS vdp_vv CASCADE
+DROP VIEW IF EXISTS vdp_v CASCADE
+DROP VIEW IF EXISTS vdp_star CASCADE
+DROP VIEW IF EXISTS vdp_join CASCADE
+DROP VIEW IF EXISTS vdp_sub CASCADE
+DROP VIEW IF EXISTS vdp_cols CASCADE
+DROP TABLE IF EXISTS vdp_t CASCADE
+DROP TABLE IF EXISTS vdp_t2
+DROP TABLE IF EXISTS vdp_t3
+DROP TABLE IF EXISTS vdp_u CASCADE
+CREATE TABLE vdp_t (id int, v int)
+CREATE TABLE vdp_u (id int, w text)
+INSERT INTO vdp_t VALUES (1, 2), (2, 3)
+INSERT INTO vdp_u VALUES (1, 'a')
+CREATE VIEW vdp_v AS SELECT id, v FROM vdp_t WHERE v > 0
+CREATE VIEW vdp_vv AS SELECT * FROM vdp_v
+CREATE VIEW vdp_star AS SELECT * FROM vdp_t
+CREATE VIEW vdp_join AS SELECT t.id, t.v, u.w FROM vdp_t t JOIN vdp_u u ON t.id = u.id WHERE t.v > 1
+CREATE VIEW vdp_sub AS SELECT id, (SELECT max(v) FROM vdp_t x WHERE x.id <= o.id) AS m FROM vdp_t o
+CREATE VIEW vdp_cols (a, b) AS SELECT * FROM vdp_t

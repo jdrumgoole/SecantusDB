@@ -377,6 +377,11 @@ impl PgHandler {
         timing: &str,
         event: &str,
     ) -> PgWireResult<()> {
+        // A MERGE fires its target's statement triggers itself, once per
+        // action type, rather than once per row action it runs.
+        if crate::merge::statement_triggers_suppressed(table) {
+            return Ok(());
+        }
         for trg in self.triggers_for(table, timing, event, "STATEMENT")? {
             // A statement trigger's WHEN reads no row, so it is a plain
             // boolean expression.

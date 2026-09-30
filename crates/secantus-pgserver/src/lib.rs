@@ -1224,7 +1224,46 @@ impl PgHandler {
     /// (none at all denies), restrictive ones ANDed on. A superuser, a
     /// BYPASSRLS role and -- unless FORCE -- the owner are not restricted.
     fn rls_tables(&self) -> Vec<secantus_pgplan::rls::RlsTable> {
-        let role = self.current_role_name();
+        self.rls_tables_for(&self.current_role_name())
+    }
+
+    /// Per view, the tables RLS restricts for the view's owner (a view with
+    /// none recorded belongs to the login role). Empty when no table has RLS
+    /// enabled, which is the common case and costs one catalog read.
+    fn view_rls_tables(&self) -> Vec<(String, Vec<secantus_pgplan::rls::RlsTable>)> {
+        let any_enabled = self
+            .storage
+            .find_matching(
+                self.db(),
+                Self::RLS_COLLECTION,
+                &bson::doc! {"enabled": true},
+            )
+            .is_ok_and(|r| !r.is_empty());
+        if !any_enabled {
+            return Vec::new();
+        }
+        let Ok(views) = self.type_catalog_docs(Self::VIEW_COLLECTION) else {
+            return Vec::new();
+        };
+        views
+            .iter()
+            .filter(|d| {
+                d.get_document("options")
+                    .map_or(true, |o| o.get_str("security_invoker") != Ok("true"))
+            })
+            .filter_map(|d| {
+                let name = d.get_str("view").or_else(|_| d.get_str("_id")).ok()?;
+                let owner = d
+                    .get_str("owner")
+                    .map(str::to_string)
+                    .unwrap_or_else(|_| self.session_user_name());
+                Some((name.to_string(), self.rls_tables_for(&owner)))
+            })
+            .collect()
+    }
+
+    fn rls_tables_for(&self, role: &str) -> Vec<secantus_pgplan::rls::RlsTable> {
+        let role = role.to_string();
         if self.is_superuser(&role) || self.role(&role).ok().flatten().is_some_and(|r| r.bypassrls)
         {
             return Vec::new();
@@ -1915,6 +1954,7 @@ impl PgHandler {
         ));
         secantus_pgplan::set_current_user(Some(self.current_role_name()));
         secantus_pgplan::rls::set_rls(self.rls_tables());
+        secantus_pgplan::rls::set_view_rls(self.view_rls_tables());
         // The database and the GUCs, for `current_database()` and
         // `current_setting()` reached INSIDE an expression -- where the
         // constant evaluator handles them rather than the server, and had
@@ -1973,6 +2013,7 @@ impl PgHandler {
         views.extend(partitions);
         secantus_pgplan::set_views(views);
         secantus_pgplan::view_dml::set_checked_views(checked);
+        secantus_pgplan::view_dml::set_view_defaults(self.view_column_defaults());
         secantus_pgplan::partitions::set_tableoids(self.tableoid_expressions());
         secantus_pgplan::regobj::set_namespaces(self.namespaces());
         secantus_pgplan::regobj::set_roles(
@@ -4687,6 +4728,343 @@ impl PgHandler {
         Ok(vec![Response::Execution(Tag::new("CREATE FUNCTION"))])
     }
 
+    /// The view an `ALTER VIEW` names, checked the way PostgreSQL does: it
+    /// must exist (or IF EXISTS skips with a notice), be a view, and belong
+    /// to the caller. `None`: skipped.
+    fn view_to_alter(&self, view: &str, missing_ok: bool) -> PgWireResult<Option<Document>> {
+        let Some(doc) = self.view_doc(view) else {
+            if self.lookup(view).is_some() {
+                return Err(Self::user_error(
+                    "42809",
+                    format!("\"{view}\" is not a view"),
+                ));
+            }
+            if missing_ok {
+                self.notice(
+                    "00000",
+                    format!("relation \"{view}\" does not exist, skipping"),
+                    None,
+                );
+                return Ok(None);
+            }
+            return Err(Self::user_error(
+                "42P01",
+                format!("relation \"{view}\" does not exist"),
+            ));
+        };
+        let role = self.current_role_name();
+        let owner = doc
+            .get_str("owner")
+            .map(str::to_string)
+            .unwrap_or_else(|_| self.session_user_name());
+        let member = role == owner
+            || self
+                .has_role_call(&[
+                    Bson::String(role.clone()),
+                    Bson::String(owner.clone()),
+                    Bson::String("USAGE".into()),
+                ])
+                .is_ok_and(|b| b == Bson::Boolean(true));
+        if !self.is_superuser(&role) && !member {
+            return Err(Self::user_error(
+                "42501",
+                format!("must be owner of view {view}"),
+            ));
+        }
+        Ok(Some(doc))
+    }
+
+    fn replace_view_doc(&self, old_id: &str, doc: Document) -> PgWireResult<()> {
+        self.delete_type_doc(Self::VIEW_COLLECTION, old_id)?;
+        let id = doc.get_str("_id").unwrap_or_default().to_string();
+        self.insert_type_doc(Self::VIEW_COLLECTION, &id, doc)
+    }
+
+    fn alter_view(
+        &self,
+        view: &str,
+        missing_ok: bool,
+        actions: Vec<secantus_pgplan::AlterViewAction>,
+        table_form: bool,
+    ) -> PgWireResult<Vec<Response>> {
+        use secantus_pgplan::AlterViewAction as A;
+        let tag = if table_form {
+            "ALTER TABLE"
+        } else {
+            "ALTER VIEW"
+        };
+        let Some(mut doc) = self.view_to_alter(view, missing_ok)? else {
+            return Ok(vec![Response::Execution(Tag::new(tag))]);
+        };
+        let definition = doc.get_str("definition").unwrap_or_default().to_string();
+        for action in actions {
+            match action {
+                A::OwnerTo(role) => {
+                    let role = if matches!(role.as_str(), "CURRENT_USER" | "CURRENT_ROLE") {
+                        self.current_role_name()
+                    } else {
+                        self.grantee_name(&role)?
+                    };
+                    doc.insert("owner", role);
+                }
+                A::SetDefault { column, sql } => {
+                    let names: Vec<String> = self
+                        .describe_fields(&definition, 0, &[])?
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|f| f.name().to_string())
+                        .collect();
+                    if !names.contains(&column) {
+                        return Err(Self::user_error(
+                            "42703",
+                            format!("column \"{column}\" of relation \"{view}\" does not exist"),
+                        ));
+                    }
+                    let mut defaults = doc.get_document("defaults").cloned().unwrap_or_default();
+                    match sql {
+                        Some(sql) => {
+                            defaults.insert(column, sql);
+                        }
+                        None => {
+                            defaults.remove(&column);
+                        }
+                    }
+                    doc.insert("defaults", defaults);
+                }
+                A::Options(opts) => {
+                    let mut options = doc.get_document("options").cloned().unwrap_or_default();
+                    for (name, value) in opts {
+                        match name.as_str() {
+                            "check_option" => match value.as_deref().map(str::to_ascii_lowercase) {
+                                None => {
+                                    doc.insert("check_option", Bson::Null);
+                                }
+                                Some(v) if v == "local" || v == "cascaded" => {
+                                    doc.insert("check_option", v.to_ascii_uppercase());
+                                }
+                                Some(v) => {
+                                    let mut info = ErrorInfo::new(
+                                        "ERROR".into(),
+                                        "22023".into(),
+                                        format!(
+                                            "invalid value for enum option \"check_option\": {v}"
+                                        ),
+                                    );
+                                    info.detail =
+                                        Some("Valid values are \"local\" and \"cascaded\".".into());
+                                    return Err(PgWireError::UserError(Box::new(info)));
+                                }
+                            },
+                            "security_barrier" | "security_invoker" => match value {
+                                None => {
+                                    options.remove(&name);
+                                }
+                                Some(v) => {
+                                    let b = match v.to_ascii_lowercase().as_str() {
+                                        "true" | "on" | "yes" | "1" => "true",
+                                        "false" | "off" | "no" | "0" => "false",
+                                        _ => return Err(Self::user_error(
+                                            "22023",
+                                            format!(
+                                                "invalid value for boolean option \"{name}\": {v}"
+                                            ),
+                                        )),
+                                    };
+                                    options.insert(name, b);
+                                }
+                            },
+                            other => {
+                                return Err(Self::user_error(
+                                    "22023",
+                                    format!("unrecognized parameter \"{other}\""),
+                                ))
+                            }
+                        }
+                    }
+                    doc.insert("options", options);
+                }
+            }
+        }
+        self.replace_view_doc(view, doc)?;
+        Ok(vec![Response::Execution(Tag::new(tag))])
+    }
+
+    fn rename_view(
+        &self,
+        view: &str,
+        to: &str,
+        missing_ok: bool,
+        table_form: bool,
+    ) -> PgWireResult<Vec<Response>> {
+        let tag = if table_form {
+            "ALTER TABLE"
+        } else {
+            "ALTER VIEW"
+        };
+        let Some(mut doc) = self.view_to_alter(view, missing_ok)? else {
+            return Ok(vec![Response::Execution(Tag::new(tag))]);
+        };
+        if self.relation_exists(to)? {
+            return Err(Self::user_error(
+                "42P07",
+                format!("relation \"{to}\" already exists"),
+            ));
+        }
+        doc.insert("_id", to);
+        doc.insert("view", to);
+        self.replace_view_doc(view, doc)?;
+        self.rename_relation_in_views(view, to)?;
+        // What is keyed by the view's name follows it: its triggers and its
+        // grants.
+        for mut t in self.trigger_docs()?.iter().cloned() {
+            if t.get_str("table") == Ok(view) {
+                let id = t.get_str("_id").unwrap_or_default().to_string();
+                t.insert("table", to);
+                let new_id = id.replacen(view, to, 1);
+                t.insert("_id", new_id.clone());
+                self.delete_type_doc(triggers::TRIGGER_COLLECTION, &id)?;
+                self.insert_type_doc(triggers::TRIGGER_COLLECTION, &new_id, t)?;
+            }
+        }
+        let grants: Vec<Document> = self
+            .storage
+            .find_matching(
+                self.db(),
+                Self::GRANT_COLLECTION,
+                &bson::doc! {"table": view},
+            )
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|b| decode_doc(b).ok())
+            .collect();
+        for mut g in grants {
+            let id = g.get_str("_id").unwrap_or_default().to_string();
+            let grantee = g.get_str("grantee").unwrap_or_default().to_string();
+            let new_id = format!("{to}\0{grantee}");
+            g.insert("table", to);
+            g.insert("_id", new_id.clone());
+            self.put_comment_doc(Self::GRANT_COLLECTION, &id, None)?;
+            self.put_comment_doc(Self::GRANT_COLLECTION, &new_id, Some(g))?;
+        }
+        Ok(vec![Response::Execution(Tag::new(tag))])
+    }
+
+    /// Every view (but `skip`) whose definition reads column `old` of
+    /// `relation`, rewritten to read `new` -- called BEFORE the rename lands,
+    /// so the relations' columns are still the old ones.
+    fn rename_column_in_views(
+        &self,
+        relation: &str,
+        old: &str,
+        new: &str,
+        skip: Option<&str>,
+    ) -> PgWireResult<()> {
+        let docs = self.type_catalog_docs(Self::VIEW_COLLECTION)?;
+        let views = self.views()?;
+        let columns_of = |name: &str| -> Option<Vec<String>> {
+            if let Some((_, def)) = views.iter().find(|(n, _)| n == name) {
+                return self
+                    .describe_fields(def, 0, &[])
+                    .ok()
+                    .flatten()
+                    .map(|fs| fs.iter().map(|f| f.name().to_string()).collect());
+            }
+            self.lookup(name)
+                .map(|d| d.columns.iter().map(|c| c.name.clone()).collect())
+        };
+        let mut rewrites = Vec::new();
+        for d in docs.iter() {
+            let id = d.get_str("_id").unwrap_or_default().to_string();
+            if Some(id.as_str()) == skip {
+                continue;
+            }
+            let Ok(def) = d.get_str("definition") else {
+                continue;
+            };
+            let rewritten =
+                secantus_pgplan::view_deps::rename_column(def, relation, old, new, &columns_of)
+                    .map_err(|e| Self::err(&e))?;
+            if rewritten != def {
+                let mut d = d.clone();
+                d.insert("definition", rewritten);
+                rewrites.push((id, d));
+            }
+        }
+        for (id, d) in rewrites {
+            self.replace_view_doc(&id, d)?;
+        }
+        Ok(())
+    }
+
+    /// Every OTHER view whose definition names relation `old`, rewritten to
+    /// name `new` (PostgreSQL's views follow a rename by OID).
+    fn rename_relation_in_views(&self, old: &str, new: &str) -> PgWireResult<()> {
+        let docs = self.type_catalog_docs(Self::VIEW_COLLECTION)?;
+        for d in docs.iter() {
+            let Ok(def) = d.get_str("definition") else {
+                continue;
+            };
+            let rewritten = secantus_pgplan::view_deps::rename_relation(def, old, new)
+                .map_err(|e| Self::err(&e))?;
+            if rewritten != def {
+                let id = d.get_str("_id").unwrap_or_default().to_string();
+                let mut d = d.clone();
+                d.insert("definition", rewritten);
+                self.replace_view_doc(&id, d)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn rename_view_column(
+        &self,
+        view: &str,
+        column: &str,
+        to: &str,
+        missing_ok: bool,
+        table_form: bool,
+    ) -> PgWireResult<Vec<Response>> {
+        let tag = if table_form {
+            "ALTER TABLE"
+        } else {
+            "ALTER VIEW"
+        };
+        let Some(mut doc) = self.view_to_alter(view, missing_ok)? else {
+            return Ok(vec![Response::Execution(Tag::new(tag))]);
+        };
+        let definition = doc.get_str("definition").unwrap_or_default().to_string();
+        let names: Vec<String> = self
+            .describe_fields(&definition, 0, &[])?
+            .unwrap_or_default()
+            .iter()
+            .map(|f| f.name().to_string())
+            .collect();
+        let Some(index) = names.iter().position(|n| n == column) else {
+            return Err(Self::user_error(
+                "42703",
+                format!("column \"{column}\" does not exist"),
+            ));
+        };
+        if names.iter().any(|n| n == to) {
+            return Err(Self::user_error(
+                "42701",
+                format!("column \"{to}\" of relation \"{view}\" already exists"),
+            ));
+        }
+        self.rename_column_in_views(view, column, to, Some(view))?;
+        let rewritten = secantus_pgplan::view_deps::rename_output(&definition, &names, index, to)
+            .map_err(|e| Self::err(&e))?;
+        doc.insert("definition", rewritten);
+        if let Ok(mut defaults) = doc.get_document("defaults").cloned() {
+            if let Some(v) = defaults.remove(column) {
+                defaults.insert(to, v);
+                doc.insert("defaults", defaults);
+            }
+        }
+        self.replace_view_doc(view, doc)?;
+        Ok(vec![Response::Execution(Tag::new(tag))])
+    }
+
     /// The `__sql_aggregates__` key: the name and the argument types.
     fn aggregate_key(name: &str, arg_types: &[String]) -> String {
         format!("{name}/{}", arg_types.join(","))
@@ -5397,6 +5775,41 @@ impl PgHandler {
         )
     }
 
+    /// The stored catalog document of view `name`.
+    fn view_doc(&self, name: &str) -> Option<Document> {
+        self.type_catalog_docs(Self::VIEW_COLLECTION)
+            .ok()?
+            .iter()
+            .find(|d| d.get_str("view").or_else(|_| d.get_str("_id")) == Ok(name))
+            .cloned()
+    }
+
+    /// Per view, `ALTER VIEW ... SET DEFAULT`'s `(column, default SQL)`.
+    fn view_column_defaults(&self) -> Vec<(String, Vec<(String, String)>)> {
+        let Ok(docs) = self.type_catalog_docs(Self::VIEW_COLLECTION) else {
+            return Vec::new();
+        };
+        docs.iter()
+            .filter_map(|d| {
+                let defaults = d.get_document("defaults").ok()?;
+                let name = d.get_str("view").or_else(|_| d.get_str("_id")).ok()?;
+                let cols: Vec<(String, String)> = defaults
+                    .iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect();
+                (!cols.is_empty()).then(|| (name.to_string(), cols))
+            })
+            .collect()
+    }
+
+    /// `ALTER VIEW ... SET (security_invoker = true)`: the view's reads are
+    /// checked, and row-level-secured, as the caller rather than its owner.
+    fn view_security_invoker(&self, name: &str) -> bool {
+        self.view_doc(name)
+            .and_then(|d| d.get_document("options").ok().cloned())
+            .is_some_and(|o| o.get_str("security_invoker") == Ok("true"))
+    }
+
     /// The role that owns view `name`, when it is a view with one recorded.
     fn view_owner(&self, name: &str) -> Option<String> {
         self.type_catalog_docs(Self::VIEW_COLLECTION)
@@ -5414,26 +5827,29 @@ impl PgHandler {
     /// subquery -- correlated or not -- is still part of the statement.
     fn check_sql_privileges(&self, sql: &str) -> PgWireResult<()> {
         let role = self.current_role_name();
-        if self.is_superuser(&role) {
+        let views = self.views()?;
+        // A superuser needs no check of its own -- but what a view reads is
+        // checked as the view's OWNER even then, so views still expand.
+        if self.is_superuser(&role) && views.is_empty() {
             return Ok(());
         }
-        let views = self.views()?;
         let mut pending: Vec<(String, String, &'static str, usize)> =
             secantus_pgplan::privileges::sql_relations(sql)
                 .into_iter()
                 .map(|(t, p)| (role.clone(), t, p, 0))
                 .collect();
         while let Some((as_role, relation, privilege, depth)) = pending.pop() {
-            if self.is_superuser(&as_role) {
-                continue;
-            }
             match views.iter().find(|(n, _)| *n == relation) {
                 Some((name, definition)) => {
                     self.check_privilege_as(&as_role, name, privilege, "view")?;
                     if depth < 16 {
-                        let owner = self
-                            .view_owner(name)
-                            .unwrap_or_else(|| self.session_user_name());
+                        // `security_invoker` views read as the caller.
+                        let owner = if self.view_security_invoker(name) {
+                            as_role.clone()
+                        } else {
+                            self.view_owner(name)
+                                .unwrap_or_else(|| self.session_user_name())
+                        };
                         for (t, _) in secantus_pgplan::privileges::sql_relations(definition) {
                             pending.push((
                                 owner.clone(),
@@ -6019,6 +6435,21 @@ impl PgHandler {
             }
         }
         self.ensure_collection(Self::VIEW_COLLECTION)?;
+        // `*` expands NOW, as PostgreSQL expands it when the view is made.
+        let all_views = self.views()?;
+        let columns_of = |rel: &str| -> Option<Vec<String>> {
+            if let Some((_, def)) = all_views.iter().find(|(n, _)| n == rel) {
+                return self
+                    .describe_fields(def, 0, &[])
+                    .ok()
+                    .flatten()
+                    .map(|fs| fs.iter().map(|f| f.name().to_string()).collect());
+            }
+            self.lookup(rel)
+                .map(|d| d.columns.iter().map(|c| c.name.clone()).collect())
+        };
+        let definition = secantus_pgplan::view_deps::expand_stars(&cv.definition, &columns_of)
+            .map_err(|e| Self::err(&e))?;
         let check = cv.check_option.as_deref().map_or(Bson::Null, Bson::from);
         // The owner is whoever created it; `CREATE OR REPLACE` keeps it.
         let owner = self
@@ -6027,7 +6458,7 @@ impl PgHandler {
         let doc = bson::doc! {
             "_id": &name,
             "view": &name,
-            "definition": &cv.definition,
+            "definition": &definition,
             "check_option": check,
             "owner": owner,
         };
@@ -7703,6 +8134,21 @@ impl PgHandler {
                     Column::new("generation_expression", "varchar", false),
                 ],
             )),
+            "information_schema.views" => Some(TableDef::new(
+                "views",
+                vec![
+                    Column::new("table_catalog", "name", false),
+                    Column::new("table_schema", "name", false),
+                    Column::new("table_name", "name", false),
+                    Column::new("view_definition", "varchar", false),
+                    Column::new("check_option", "varchar", false),
+                    Column::new("is_updatable", "varchar", false),
+                    Column::new("is_insertable_into", "varchar", false),
+                    Column::new("is_trigger_updatable", "varchar", false),
+                    Column::new("is_trigger_deletable", "varchar", false),
+                    Column::new("is_trigger_insertable_into", "varchar", false),
+                ],
+            )),
             "information_schema.domains" => Some(TableDef::new(
                 "domains",
                 vec![
@@ -7929,6 +8375,15 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("partnatts", "int2", false),
                     secantus_pgcatalog::Column::new("partdefid", "oid", false),
                     secantus_pgcatalog::Column::new("partattrs", "int2vector", false),
+                ],
+            )),
+            "pg_views" => Some(TableDef::new(
+                "pg_views",
+                vec![
+                    secantus_pgcatalog::Column::new("schemaname", "name", false),
+                    secantus_pgcatalog::Column::new("viewname", "name", false),
+                    secantus_pgcatalog::Column::new("viewowner", "name", false),
+                    secantus_pgcatalog::Column::new("definition", "text", false),
                 ],
             )),
             "pg_matviews" => Some(TableDef::new(
@@ -8260,7 +8715,108 @@ impl PgHandler {
                         rows.push(d);
                     }
                 }
+                // A view's columns: its output, nullable, typed as described.
+                let docs = self.type_catalog_docs(Self::VIEW_COLLECTION).ok()?;
+                for v in docs.iter() {
+                    let Ok(name) = v.get_str("view").or_else(|_| v.get_str("_id")) else {
+                        continue;
+                    };
+                    let Some(fields) = v
+                        .get_str("definition")
+                        .ok()
+                        .and_then(|sql| self.describe_fields(sql, 0, &[]).ok().flatten())
+                    else {
+                        continue;
+                    };
+                    let defaults = v.get_document("defaults").ok();
+                    for (i, fd) in fields.iter().enumerate() {
+                        let ty =
+                            secantus_pgplan::pgtypes::name_of_oid(i64::from(fd.datatype().oid()))
+                                .unwrap_or("text");
+                        let mut d = Document::new();
+                        d.insert(f("table_catalog"), db.as_str());
+                        d.insert(f("table_schema"), "public");
+                        d.insert(f("table_name"), name);
+                        d.insert(f("column_name"), fd.name());
+                        d.insert(f("ordinal_position"), Bson::Int32((i + 1) as i32));
+                        d.insert(
+                            f("column_default"),
+                            defaults
+                                .and_then(|m| m.get_str(fd.name()).ok())
+                                .map_or(Bson::Null, |s| Bson::String(s.to_string())),
+                        );
+                        d.insert(f("is_nullable"), "YES");
+                        d.insert(f("data_type"), secantus_pgplan::display_type(ty));
+                        for k in [
+                            "character_maximum_length",
+                            "numeric_precision",
+                            "numeric_scale",
+                            "datetime_precision",
+                            "identity_generation",
+                            "domain_catalog",
+                            "domain_schema",
+                            "domain_name",
+                            "generation_expression",
+                        ] {
+                            d.insert(f(k), Bson::Null);
+                        }
+                        d.insert(f("udt_name"), ty);
+                        d.insert(f("is_identity"), "NO");
+                        d.insert(f("is_generated"), "NEVER");
+                        rows.push(d);
+                    }
+                }
                 rows
+            }
+            "information_schema.views" => {
+                let f = |name: &str| def.field_of(name).expect("column");
+                let db = self.db().to_string();
+                self.type_catalog_docs(Self::VIEW_COLLECTION)
+                    .ok()?
+                    .iter()
+                    .filter_map(|v| {
+                        let name = v.get_str("view").or_else(|_| v.get_str("_id")).ok()?;
+                        let sql = v.get_str("definition").unwrap_or_default();
+                        let updatable = secantus_pgplan::view_dml::is_updatable(sql);
+                        let yes_no = |b: bool| if b { "YES" } else { "NO" };
+                        let triggers: Vec<String> = self
+                            .trigger_docs()
+                            .unwrap_or_default()
+                            .iter()
+                            .filter(|t| {
+                                t.get_str("table") == Ok(name)
+                                    && t.get_str("timing") == Ok("INSTEAD OF")
+                            })
+                            .flat_map(|t| {
+                                t.get_array("events")
+                                    .map(|a| {
+                                        a.iter()
+                                            .filter_map(|e| e.as_str().map(str::to_string))
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .unwrap_or_default()
+                            })
+                            .collect();
+                        let has = |e: &str| triggers.iter().any(|t| t == e);
+                        let mut d = Document::new();
+                        d.insert(f("table_catalog"), db.as_str());
+                        d.insert(f("table_schema"), "public");
+                        d.insert(f("table_name"), name);
+                        d.insert(f("view_definition"), format!(" {sql};"));
+                        d.insert(
+                            f("check_option"),
+                            v.get_str("check_option")
+                                .unwrap_or("NONE")
+                                .to_ascii_uppercase(),
+                        );
+                        d.insert(f("is_updatable"), yes_no(updatable));
+                        d.insert(f("is_insertable_into"), yes_no(updatable || has("INSERT")));
+                        d.insert(f("is_trigger_updatable"), yes_no(has("UPDATE")));
+                        d.insert(f("is_trigger_deletable"), yes_no(has("DELETE")));
+                        d.insert(f("is_trigger_insertable_into"), yes_no(has("INSERT")));
+                        Some(d)
+                    })
+                    .collect()
             }
             "information_schema.domains" => {
                 let f = |name: &str| def.field_of(name).expect("column");
@@ -8299,6 +8855,20 @@ impl PgHandler {
                         d.insert(f("table_type"), "BASE TABLE");
                         d
                     })
+                    .chain(
+                        self.views()
+                            .ok()?
+                            .into_iter()
+                            .map(|(name, _)| {
+                                let mut d = Document::new();
+                                d.insert(f("table_catalog"), db.as_str());
+                                d.insert(f("table_schema"), "public");
+                                d.insert(f("table_name"), name);
+                                d.insert(f("table_type"), "VIEW");
+                                d
+                            })
+                            .collect::<Vec<_>>(),
+                    )
                     .collect()
             }
             "information_schema.table_constraints" => {
@@ -9170,6 +9740,26 @@ impl PgHandler {
                         d.insert(
                             f("partattrs"),
                             Bson::Array(attrs.into_iter().map(|a| Bson::Int32(a.into())).collect()),
+                        );
+                        Some(d)
+                    })
+                    .collect()
+            }
+            "pg_views" => {
+                let f = |name: &str| def.field_of(name).expect("column");
+                let login = self.session_user_name();
+                self.type_catalog_docs(Self::VIEW_COLLECTION)
+                    .ok()?
+                    .iter()
+                    .filter_map(|v| {
+                        let name = v.get_str("view").or_else(|_| v.get_str("_id")).ok()?;
+                        let mut d = Document::new();
+                        d.insert(f("schemaname"), "public");
+                        d.insert(f("viewname"), name);
+                        d.insert(f("viewowner"), v.get_str("owner").unwrap_or(login.as_str()));
+                        d.insert(
+                            f("definition"),
+                            format!(" {};", v.get_str("definition").unwrap_or_default()),
                         );
                         Some(d)
                     })
@@ -12040,6 +12630,13 @@ impl PgHandler {
             Statement::CreateAggregate { .. } | Statement::DropAggregate { .. } => {
                 vec![Self::AGGREGATE_COLLECTION.to_string()]
             }
+            Statement::AlterView { .. }
+            | Statement::RenameView { .. }
+            | Statement::RenameViewColumn { .. } => vec![
+                Self::VIEW_COLLECTION.to_string(),
+                triggers::TRIGGER_COLLECTION.to_string(),
+                Self::GRANT_COLLECTION.to_string(),
+            ],
             Statement::DropType { .. } => vec![
                 Self::ENUM_COLLECTION.to_string(),
                 Self::COMPOSITE_COLLECTION.to_string(),
@@ -16664,6 +17261,15 @@ impl PgHandler {
             }
             Statement::DropFunction { .. } => "DROP FUNCTION",
             Statement::CreateAggregate { .. } => "CREATE AGGREGATE",
+            Statement::AlterView { table_form, .. }
+            | Statement::RenameView { table_form, .. }
+            | Statement::RenameViewColumn { table_form, .. } => {
+                if *table_form {
+                    "ALTER TABLE"
+                } else {
+                    "ALTER VIEW"
+                }
+            }
             Statement::DropAggregate { .. } => "DROP AGGREGATE",
             Statement::CreateTrigger(..) => "CREATE TRIGGER",
             Statement::DropTrigger { .. } => "DROP TRIGGER",
@@ -17873,6 +18479,25 @@ impl PgHandler {
             }
 
             Statement::CreateAggregate { def, replace } => self.create_aggregate(def, replace),
+            Statement::AlterView {
+                view,
+                missing_ok,
+                actions,
+                table_form,
+            } => self.alter_view(&view, missing_ok, actions, table_form),
+            Statement::RenameView {
+                view,
+                to,
+                missing_ok,
+                table_form,
+            } => self.rename_view(&view, &to, missing_ok, table_form),
+            Statement::RenameViewColumn {
+                view,
+                column,
+                to,
+                missing_ok,
+                table_form,
+            } => self.rename_view_column(&view, &column, &to, missing_ok, table_form),
             Statement::DropAggregate {
                 name,
                 arg_types,
@@ -18442,6 +19067,8 @@ impl PgHandler {
                 def.name = to.clone();
                 self.rewrite_catalog(&to, &def)?;
                 self.note_uncommitted(&table, None);
+                // Views reading the table follow the rename.
+                self.rename_relation_in_views(&table, &to)?;
                 // Its partitions follow the new name.
                 for mut child in self.partitions_of(&table)? {
                     child.extra.insert("partition_of", to.as_str());
@@ -18491,6 +19118,8 @@ impl PgHandler {
                         format!("cannot rename inherited column \"{column}\""),
                     ))));
                 }
+                // Views reading the column follow the rename.
+                self.rename_column_in_views(&table, &column, &to, None)?;
                 if !old.pk {
                     self.rename_row_field(&table, &old.field(), &to)?;
                 }

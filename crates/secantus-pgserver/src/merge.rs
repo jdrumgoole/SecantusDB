@@ -15,8 +15,52 @@ use secantus_pgplan::scalar::quote_identifier as q;
 
 use crate::{PgHandler, PlHost};
 
+thread_local! {
+    /// The MERGE target whose statement triggers the row actions must not
+    /// fire: the MERGE fires them itself.
+    static MERGING: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn statement_triggers_suppressed(table: &str) -> bool {
+    MERGING.with(|m| m.borrow().as_deref() == Some(table))
+}
+
 impl PgHandler {
+    /// MERGE's statement triggers: PostgreSQL fires BEFORE STATEMENT for
+    /// every action type the command names (INSERT, then UPDATE, then
+    /// DELETE) before it reads a row, and AFTER STATEMENT in the reverse
+    /// order at the end -- whether or not any row took that action.
     pub(crate) fn execute_merge(&self, m: Merge) -> PgWireResult<Vec<Response>> {
+        let has = |f: fn(&MergeAction) -> bool| m.clauses.iter().any(|(_, a)| f(a));
+        let events: Vec<&str> = [
+            ("INSERT", has(|a| matches!(a, MergeAction::Insert { .. }))),
+            ("UPDATE", has(|a| matches!(a, MergeAction::Update(_)))),
+            ("DELETE", has(|a| matches!(a, MergeAction::Delete))),
+        ]
+        .into_iter()
+        .filter_map(|(e, on)| on.then_some(e))
+        .collect();
+        for e in &events {
+            self.fire_statement_triggers(&m.target, "BEFORE", e)?;
+        }
+        struct Restore(Option<String>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                MERGING.with(|m| *m.borrow_mut() = self.0.take());
+            }
+        }
+        let target = m.target.clone();
+        let out = {
+            let _restore = Restore(MERGING.with(|g| g.borrow_mut().replace(target)));
+            self.merge_rows(m.clone())?
+        };
+        for e in events.iter().rev() {
+            self.fire_statement_triggers(&m.target, "AFTER", e)?;
+        }
+        Ok(out)
+    }
+
+    fn merge_rows(&self, m: Merge) -> PgWireResult<Vec<Response>> {
         let def = self.lookup(&m.target).ok_or_else(|| {
             Self::user_error("42P01", format!("relation \"{}\" does not exist", m.target))
         })?;
