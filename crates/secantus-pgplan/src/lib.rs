@@ -709,7 +709,11 @@ pub enum Statement {
     /// `PUBLIC`, or `CURRENT_USER` / `SESSION_USER` / `CURRENT_ROLE`.
     Grant {
         is_grant: bool,
+        /// Table-level privileges (`GRANT SELECT ON t`).
         privileges: Vec<String>,
+        /// Column-level ones, `(privilege, columns)` (`GRANT SELECT (a, b)
+        /// ON t`); `ALL (a)` is the four a column can hold.
+        column_privileges: Vec<(String, Vec<String>)>,
         kind: String,
         objects: Vec<String>,
         all_in_schema: bool,
@@ -5913,10 +5917,19 @@ fn plan_create_index(
                         ),
                         _ => sql.clone(),
                     },
-                    _ => sql.clone(),
+                    _ => ruleutils::expr_node_def(expr, &def).unwrap_or_else(|| sql.clone()),
                 }
+            } else if matches!(
+                expr.node.as_ref(),
+                Some(N::CoalesceExpr(_) | N::MinMaxExpr(_) | N::SqlvalueFunction(_))
+            ) {
+                // `looks_like_function`: printed bare, as a call is.
+                ruleutils::expr_node_def(expr, &def).unwrap_or_else(|| sql.clone())
             } else {
-                format!("(({sql}))")
+                match ruleutils::expr_node_def(expr, &def) {
+                    Some(printed) => format!("({printed})"),
+                    None => format!("(({sql}))"),
+                }
             };
             key_sql.push(format!("{shown}{suffix}"));
             expressions.push(sql);
@@ -5968,7 +5981,18 @@ fn plan_create_index(
         // A non-default NULLS ordering is recorded, not built: an index is
         // an access path here, and a query's ORDER BY places its NULLs by
         // its own clause whatever the index says.
-        key_sql.push(format!("{}{opclass_sql}{suffix}", e.name));
+        // `pg_get_indexdef` prints a key's COLLATE when it is not the
+        // column's own: `b COLLATE "C" text_pattern_ops DESC`.
+        let collate_sql = match &key_collation {
+            Some(name)
+                if column.extra.get_str("collation").ok() != Some(name.as_str())
+                    && !(name == "default" && column.extra.get_str("collation").is_err()) =>
+            {
+                format!(" COLLATE {}", scalar::quote_identifier(name))
+            }
+            _ => String::new(),
+        };
+        key_sql.push(format!("{}{collate_sql}{opclass_sql}{suffix}", e.name));
         // A key under a NONDETERMINISTIC collation is kept by its sort key,
         // so a UNIQUE index refuses what the collation calls equal
         // (`Apple` / `apple` under a case-insensitive one).
@@ -15035,14 +15059,31 @@ fn plan_grant(g: &pg_query::protobuf::GrantStmt) -> Result<Statement> {
             _ => None,
         })
         .collect();
-    let privileges = g
-        .privileges
-        .iter()
-        .filter_map(|p| match p.node.as_ref() {
-            Some(N::AccessPriv(a)) => Some(a.priv_name.to_ascii_uppercase()),
-            _ => None,
-        })
-        .collect();
+    let mut privileges = Vec::new();
+    let mut column_privileges: Vec<(String, Vec<String>)> = Vec::new();
+    for p in &g.privileges {
+        let Some(N::AccessPriv(a)) = p.node.as_ref() else {
+            continue;
+        };
+        let name = a.priv_name.to_ascii_uppercase();
+        let cols: Vec<String> = a
+            .cols
+            .iter()
+            .filter_map(|c| match c.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            })
+            .collect();
+        if cols.is_empty() {
+            privileges.push(name);
+        } else if name.is_empty() || name == "ALL" {
+            for p in ["SELECT", "INSERT", "UPDATE", "REFERENCES"] {
+                column_privileges.push((p.to_string(), cols.clone()));
+            }
+        } else {
+            column_privileges.push((name, cols));
+        }
+    }
     let grantees = g
         .grantees
         .iter()
@@ -15054,6 +15095,7 @@ fn plan_grant(g: &pg_query::protobuf::GrantStmt) -> Result<Statement> {
     Ok(Statement::Grant {
         is_grant: g.is_grant,
         privileges,
+        column_privileges,
         kind: kind.to_string(),
         objects,
         all_in_schema,
@@ -19029,8 +19071,16 @@ fn pg_typeof(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result<Bson> 
     }
     let value = const_value(arg, params)?;
     // An untyped literal -- a NULL, or a bare string -- is `unknown`: nothing
-    // around it resolved it to a type (`pg_typeof('a')` on PostgreSQL).
-    let untyped_literal = match arg.node.as_ref() {
+    // around it resolved it to a type (`pg_typeof('a')` on PostgreSQL). A
+    // COLLATE clause does not resolve one either (`'x' COLLATE "C"`).
+    let mut bare = arg;
+    while let Some(N::CollateClause(cc)) = bare.node.as_ref() {
+        match cc.arg.as_deref() {
+            Some(inner) => bare = inner,
+            None => break,
+        }
+    }
+    let untyped_literal = match bare.node.as_ref() {
         Some(N::AConst(c)) => {
             c.isnull || matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_)))
         }

@@ -1193,7 +1193,11 @@ impl PgHandler {
             .iter()
             .filter_map(|b| decode_doc(b).ok())
             .collect();
-        if grants.is_empty() {
+        let state = self
+            .grant_docs_in(Self::RELATION_ACL_COLLECTION, relname)
+            .into_iter()
+            .next();
+        if grants.is_empty() && state.is_none() {
             return Bson::Null;
         }
         let owner = if kind == "v" {
@@ -1221,11 +1225,43 @@ impl PgHandler {
             "REFERENCES" => 'x',
             _ => 't',
         };
-        let mut items = vec![Bson::String(format!(
-            "{}=arwdDxt/{}",
-            name(&owner),
-            name(&owner)
-        ))];
+        // The owner's retained privileges: all of them unless a statement
+        // naming the owner took some back (then possibly no entry at all).
+        let owner_privs: Vec<String> = match &state {
+            Some(d) => d
+                .get_array("owner_privs")
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            None => Self::TABLE_PRIVILEGES
+                .iter()
+                .map(|p| p.to_string())
+                .collect(),
+        };
+        let owner_letters: String = [
+            "INSERT",
+            "SELECT",
+            "UPDATE",
+            "DELETE",
+            "TRUNCATE",
+            "REFERENCES",
+            "TRIGGER",
+        ]
+        .iter()
+        .filter(|p| owner_privs.iter().any(|h| h == *p))
+        .map(|p| letter(p))
+        .collect();
+        let mut items = Vec::new();
+        if !owner_letters.is_empty() {
+            items.push(Bson::String(format!(
+                "{}={owner_letters}/{}",
+                name(&owner),
+                name(&owner)
+            )));
+        }
         for g in grants {
             let grantee = g.get_str("grantee").unwrap_or_default();
             if grantee == owner {
@@ -1293,6 +1329,7 @@ impl PgHandler {
         table: &str,
         privilege: &str,
         kind: &str,
+        sql: &str,
     ) -> PgWireResult<()> {
         let role = role.to_string();
         if self.is_superuser(&role) {
@@ -1338,6 +1375,33 @@ impl PgHandler {
             });
         if granted {
             return Ok(());
+        }
+        // Without the table-level privilege, COLUMN privileges suffice when
+        // they cover every column the statement needs it on -- and, for a
+        // statement naming none (`select count(*) from t`), when the role
+        // holds it on any column.
+        if kind == "table" && matches!(privilege, "SELECT" | "INSERT" | "UPDATE") {
+            if let Some(def) = self.lookup(table) {
+                let held: Vec<String> = self
+                    .column_grant_docs(table)
+                    .into_iter()
+                    .filter(|g| {
+                        let grantee = g.get_str("grantee").unwrap_or_default();
+                        (grantee.eq_ignore_ascii_case("PUBLIC") || member_of(grantee))
+                            && g.get_array("privileges")
+                                .is_ok_and(|ps| ps.iter().any(|p| p.as_str() == Some(privilege)))
+                    })
+                    .filter_map(|g| g.get_str("column").ok().map(str::to_string))
+                    .collect();
+                if !held.is_empty() {
+                    let names: Vec<String> = def.columns.iter().map(|c| c.name.clone()).collect();
+                    let needed =
+                        secantus_pgplan::privileges::sql_columns(sql, table, &names, privilege);
+                    if needed.iter().all(|c| held.contains(c)) {
+                        return Ok(());
+                    }
+                }
+            }
         }
         Err(Self::user_error(
             "42501",
@@ -2216,6 +2280,23 @@ impl PgHandler {
     /// `GRANT ... ON TABLE`: `{_id: "<table>\0<grantee>", table, grantee,
     /// privileges, grant_option}`, the Python server's store.
     const GRANT_COLLECTION: &'static str = "__sql_grants__";
+    /// Column privileges, one row per `(table, grantee, column)` -- the
+    /// Python server's `COLUMN_GRANT_COLLECTION`, same shape.
+    const COLUMN_GRANT_COLLECTION: &'static str = "__sql_column_grants__";
+    /// A relation's ACL once a GRANT / REVOKE has touched it: `{_id: table,
+    /// owner, owner_privs}`, the owner's retained privileges -- the Python
+    /// server's `RELATION_ACL_COLLECTION`, same shape. No row is PostgreSQL's
+    /// default ACL (`relacl` NULL).
+    const RELATION_ACL_COLLECTION: &'static str = "__sql_relation_acl__";
+
+    /// Every collection a grant lives in.
+    fn grant_collections() -> [&'static str; 3] {
+        [
+            Self::GRANT_COLLECTION,
+            Self::COLUMN_GRANT_COLLECTION,
+            Self::RELATION_ACL_COLLECTION,
+        ]
+    }
     /// `GRANT role TO member`: `{_id: "<role>\0<member>", role, member,
     /// admin_option}`, the Python server's store.
     const ROLE_MEMBER_COLLECTION: &'static str = "__sql_role_members__";
@@ -5310,26 +5391,7 @@ impl PgHandler {
                 self.insert_type_doc(triggers::TRIGGER_COLLECTION, &new_id, t)?;
             }
         }
-        let grants: Vec<Document> = self
-            .storage
-            .find_matching(
-                self.db(),
-                Self::GRANT_COLLECTION,
-                &bson::doc! {"table": view},
-            )
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|b| decode_doc(b).ok())
-            .collect();
-        for mut g in grants {
-            let id = g.get_str("_id").unwrap_or_default().to_string();
-            let grantee = g.get_str("grantee").unwrap_or_default().to_string();
-            let new_id = format!("{to}\0{grantee}");
-            g.insert("table", to);
-            g.insert("_id", new_id.clone());
-            self.put_comment_doc(Self::GRANT_COLLECTION, &id, None)?;
-            self.put_comment_doc(Self::GRANT_COLLECTION, &new_id, Some(g))?;
-        }
+        self.move_grants(view, to)?;
         Ok(vec![Response::Execution(Tag::new(tag))])
     }
 
@@ -6368,15 +6430,15 @@ impl PgHandler {
         if self.is_superuser(&role) && views.is_empty() {
             return Ok(());
         }
-        let mut pending: Vec<(String, String, &'static str, usize)> =
+        let mut pending: Vec<(String, String, &'static str, usize, String)> =
             secantus_pgplan::privileges::sql_relations(sql)
                 .into_iter()
-                .map(|(t, p)| (role.clone(), t, p, 0))
+                .map(|(t, p)| (role.clone(), t, p, 0, sql.to_string()))
                 .collect();
-        while let Some((as_role, relation, privilege, depth)) = pending.pop() {
+        while let Some((as_role, relation, privilege, depth, source)) = pending.pop() {
             match views.iter().find(|(n, _)| *n == relation) {
                 Some((name, definition)) => {
-                    self.check_privilege_as(&as_role, name, privilege, "view")?;
+                    self.check_privilege_as(&as_role, name, privilege, "view", &source)?;
                     if depth < 16 {
                         // `security_invoker` views read as the caller.
                         let owner = if self.view_security_invoker(name) {
@@ -6391,11 +6453,14 @@ impl PgHandler {
                                 t,
                                 privilege_through_view(privilege),
                                 depth + 1,
+                                definition.clone(),
                             ));
                         }
                     }
                 }
-                None => self.check_privilege_as(&as_role, &relation, privilege, "table")?,
+                None => {
+                    self.check_privilege_as(&as_role, &relation, privilege, "table", &source)?
+                }
             }
         }
         Ok(())
@@ -6917,11 +6982,12 @@ impl PgHandler {
         if ci.method != "btree" {
             options.insert("sqlMethod", ci.method.as_str());
         }
-        if ci
-            .key_sql
-            .iter()
-            .any(|k| k.contains(" NULLS ") || k.contains("_ops") || k.contains("::regconfig"))
-        {
+        if ci.key_sql.iter().any(|k| {
+            k.contains(" NULLS ")
+                || k.contains("_ops")
+                || k.contains("::regconfig")
+                || k.contains(" COLLATE ")
+        }) {
             options.insert("sqlKeys", ci.key_sql.clone());
         }
         options.insert("sqlOid", self.mint_index_oid()?);
@@ -7444,6 +7510,7 @@ impl PgHandler {
         &self,
         is_grant: bool,
         privileges: &[String],
+        column_privileges: &[(String, Vec<String>)],
         kind: &str,
         objects: &[String],
         all_in_schema: bool,
@@ -7457,25 +7524,29 @@ impl PgHandler {
         if kind != "table" {
             return Ok(());
         }
-        let wanted: Vec<&'static str> =
-            if privileges.is_empty() || privileges.iter().any(|p| p == "ALL") {
-                Self::TABLE_PRIVILEGES.to_vec()
-            } else {
-                let mut out = Vec::new();
-                for p in privileges {
-                    match Self::TABLE_PRIVILEGES.iter().find(|t| **t == p.as_str()) {
-                        Some(t) => out.push(*t),
-                        None => {
-                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                                "ERROR".into(),
-                                "0LP01".into(), // invalid_grant_operation
-                                format!("invalid privilege type {p} for table"),
-                            ))));
-                        }
+        // `GRANT ALL ON t` parses to no privilege list at all; a statement
+        // with only column privileges (`GRANT SELECT (a) ON t`) grants no
+        // table-level one.
+        let wanted: Vec<&'static str> = if (privileges.is_empty() && column_privileges.is_empty())
+            || privileges.iter().any(|p| p == "ALL")
+        {
+            Self::TABLE_PRIVILEGES.to_vec()
+        } else {
+            let mut out = Vec::new();
+            for p in privileges {
+                match Self::TABLE_PRIVILEGES.iter().find(|t| **t == p.as_str()) {
+                    Some(t) => out.push(*t),
+                    None => {
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".into(),
+                            "0LP01".into(), // invalid_grant_operation
+                            format!("invalid privilege type {p} for table"),
+                        ))));
                     }
                 }
-                out
-            };
+            }
+            out
+        };
         let tables: Vec<String> = if all_in_schema {
             let defs = self.all_table_defs()?;
             defs.into_iter()
@@ -7571,8 +7642,300 @@ impl PgHandler {
                 });
                 self.put_comment_doc(Self::GRANT_COLLECTION, &id, doc)?;
             }
+            // A table-level GRANT or REVOKE makes the ACL explicit: from
+            // then on `relacl` shows the owner's retained privileges even
+            // with every grant revoked, as PostgreSQL's does.
+            if !wanted.is_empty() {
+                self.materialize_relation_acl(table, is_grant, &wanted, &grantees)?;
+            }
+            self.grant_columns(table, is_grant, &wanted, column_privileges, &grantees)?;
         }
         Ok(())
+    }
+
+    /// Column privileges (`GRANT SELECT (a) ON t TO r`), one document per
+    /// `(table, grantee, column)`. A table-level REVOKE also takes back the
+    /// column-level grants of the privileges it names, as PostgreSQL's does.
+    fn grant_columns(
+        &self,
+        table: &str,
+        is_grant: bool,
+        table_wanted: &[&'static str],
+        column_privileges: &[(String, Vec<String>)],
+        grantees: &[String],
+    ) -> PgWireResult<()> {
+        let def = self.lookup(table);
+        let mut edits: Vec<(String, String, Vec<String>)> = Vec::new();
+        for (privilege, cols) in column_privileges {
+            if !matches!(
+                privilege.as_str(),
+                "SELECT" | "INSERT" | "UPDATE" | "REFERENCES"
+            ) {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".into(),
+                    "0LP01".into(),
+                    format!("invalid privilege type {privilege} for column"),
+                ))));
+            }
+            for col in cols {
+                if let Some(def) = &def {
+                    if def.column(col).is_none() {
+                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".into(),
+                            "42703".into(),
+                            format!("column \"{col}\" of relation \"{table}\" does not exist"),
+                        ))));
+                    }
+                }
+                for grantee in grantees {
+                    edits.push((grantee.clone(), col.clone(), vec![privilege.clone()]));
+                }
+            }
+        }
+        if !is_grant && !table_wanted.is_empty() {
+            for d in self.column_grant_docs(table) {
+                let (Ok(grantee), Ok(col)) = (d.get_str("grantee"), d.get_str("column")) else {
+                    continue;
+                };
+                if grantees.iter().any(|g| g == grantee) {
+                    edits.push((
+                        grantee.to_string(),
+                        col.to_string(),
+                        table_wanted.iter().map(|p| p.to_string()).collect(),
+                    ));
+                }
+            }
+        }
+        for (grantee, col, privs) in edits {
+            let id = format!("{table}\0{grantee}\0{col}");
+            self.ensure_collection(Self::COLUMN_GRANT_COLLECTION)?;
+            let existing = self
+                .storage
+                .find_matching(
+                    self.db(),
+                    Self::COLUMN_GRANT_COLLECTION,
+                    &bson::doc! {"_id": &id},
+                )
+                .map_err(|e| Self::storage_err("could not read the grants", e))?
+                .first()
+                .and_then(|b| decode_doc(b).ok());
+            let mut held: Vec<String> = existing
+                .as_ref()
+                .and_then(|d| d.get_array("privileges").ok())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if is_grant {
+                for p in privs {
+                    if !held.contains(&p) {
+                        held.push(p);
+                    }
+                }
+            } else {
+                held.retain(|h| !privs.contains(h));
+            }
+            let ordered: Vec<Bson> = Self::TABLE_PRIVILEGES
+                .iter()
+                .filter(|p| held.iter().any(|h| h == *p))
+                .map(|p| Bson::String(p.to_string()))
+                .collect();
+            let doc = (!ordered.is_empty()).then(|| {
+                bson::doc! {
+                    "_id": &id,
+                    "table": table,
+                    "grantee": &grantee,
+                    "column": &col,
+                    "privileges": ordered,
+                }
+            });
+            self.put_comment_doc(Self::COLUMN_GRANT_COLLECTION, &id, doc)?;
+        }
+        Ok(())
+    }
+
+    /// Every row of `collection` for `table`: grants are keyed by a `table`
+    /// field, the relation-ACL row by the table name itself.
+    fn grant_docs_in(&self, collection: &str, table: &str) -> Vec<Document> {
+        let filter = if collection == Self::RELATION_ACL_COLLECTION {
+            bson::doc! {"_id": table}
+        } else {
+            bson::doc! {"table": table}
+        };
+        self.storage
+            .find_matching(self.db(), collection, &filter)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|b| decode_doc(b).ok())
+            .collect()
+    }
+
+    /// A dropped relation's grants go with it: a table created later under
+    /// the same name starts with none, as PostgreSQL's does (and the Python
+    /// server's `drop_table`).
+    pub(crate) fn drop_grants(&self, table: &str) -> PgWireResult<()> {
+        for collection in Self::grant_collections() {
+            for g in self.grant_docs_in(collection, table) {
+                if let Ok(id) = g.get_str("_id") {
+                    self.put_comment_doc(collection, id, None)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A renamed relation keeps its grants under the new name.
+    fn move_grants(&self, from: &str, to: &str) -> PgWireResult<()> {
+        for collection in Self::grant_collections() {
+            for mut g in self.grant_docs_in(collection, from) {
+                let id = g.get_str("_id").unwrap_or_default().to_string();
+                let new_id = if collection == Self::RELATION_ACL_COLLECTION {
+                    to.to_string()
+                } else {
+                    let rest = id.split_once('\0').map_or("", |(_, r)| r);
+                    g.insert("table", to);
+                    format!("{to}\0{rest}")
+                };
+                g.insert("_id", new_id.clone());
+                self.put_comment_doc(collection, &id, None)?;
+                self.put_comment_doc(collection, &new_id, Some(g))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Record that a table-level GRANT / REVOKE touched `table`'s ACL: the
+    /// owner's retained privileges start as all of them, and move only when
+    /// the statement names the owner.
+    fn materialize_relation_acl(
+        &self,
+        table: &str,
+        is_grant: bool,
+        wanted: &[&'static str],
+        grantees: &[String],
+    ) -> PgWireResult<()> {
+        self.ensure_collection(Self::RELATION_ACL_COLLECTION)?;
+        let owner = match self.lookup(table) {
+            Some(def) => self.table_owner(&def),
+            None => self
+                .view_owner(table)
+                .unwrap_or_else(|| self.session_user_name()),
+        };
+        let existing = self
+            .grant_docs_in(Self::RELATION_ACL_COLLECTION, table)
+            .into_iter()
+            .next();
+        let mut held: Vec<String> = match &existing {
+            Some(d) => d
+                .get_array("owner_privs")
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            None => Self::TABLE_PRIVILEGES
+                .iter()
+                .map(|p| p.to_string())
+                .collect(),
+        };
+        if grantees.iter().any(|g| *g == owner) {
+            if is_grant {
+                for p in wanted {
+                    if !held.iter().any(|h| h == p) {
+                        held.push(p.to_string());
+                    }
+                }
+            } else {
+                held.retain(|h| !wanted.contains(&h.as_str()));
+            }
+        }
+        let ordered: Vec<Bson> = Self::TABLE_PRIVILEGES
+            .iter()
+            .filter(|p| held.iter().any(|h| h == *p))
+            .map(|p| Bson::String(p.to_string()))
+            .collect();
+        self.put_comment_doc(
+            Self::RELATION_ACL_COLLECTION,
+            table,
+            Some(bson::doc! {"_id": table, "owner": &owner, "owner_privs": ordered}),
+        )
+    }
+
+    /// `pg_attribute.attacl`: the column-level grants on one column, as
+    /// aclitems in `ACL_ALL_RIGHTS_COLUMN` order (`arwx`), granted by the
+    /// table's owner; NULL when there are none.
+    pub(crate) fn column_acl(&self, def: &TableDef, column: &str) -> Bson {
+        let owner = self.table_owner(def);
+        let name = |n: &str| -> String {
+            if n.eq_ignore_ascii_case("public") {
+                String::new()
+            } else {
+                secantus_pgplan::scalar::quote_identifier(n)
+            }
+        };
+        let items: Vec<Bson> = self
+            .column_grant_docs(&def.name)
+            .into_iter()
+            .filter(|g| g.get_str("column") == Ok(column))
+            .filter_map(|g| {
+                let held: Vec<String> = g
+                    .get_array("privileges")
+                    .ok()?
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect();
+                let privs: String = [
+                    ("INSERT", 'a'),
+                    ("SELECT", 'r'),
+                    ("UPDATE", 'w'),
+                    ("REFERENCES", 'x'),
+                ]
+                .iter()
+                .filter(|(p, _)| held.iter().any(|h| h == p))
+                .map(|(_, c)| *c)
+                .collect();
+                (!privs.is_empty()).then(|| {
+                    Bson::String(format!(
+                        "{}={privs}/{}",
+                        name(g.get_str("grantee").unwrap_or_default()),
+                        name(&owner)
+                    ))
+                })
+            })
+            .collect();
+        if items.is_empty() {
+            Bson::Null
+        } else {
+            Bson::Array(items)
+        }
+    }
+
+    /// A renamed column keeps its grants; a dropped one's go with it (so a
+    /// column added later under the old name starts with none).
+    fn move_column_grants(&self, table: &str, from: &str, to: Option<&str>) -> PgWireResult<()> {
+        for mut g in self.column_grant_docs(table) {
+            if g.get_str("column") != Ok(from) {
+                continue;
+            }
+            let id = g.get_str("_id").unwrap_or_default().to_string();
+            self.put_comment_doc(Self::COLUMN_GRANT_COLLECTION, &id, None)?;
+            if let Some(to) = to {
+                let grantee = g.get_str("grantee").unwrap_or_default().to_string();
+                let new_id = format!("{table}\0{grantee}\0{to}");
+                g.insert("column", to);
+                g.insert("_id", new_id.clone());
+                self.put_comment_doc(Self::COLUMN_GRANT_COLLECTION, &new_id, Some(g))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Every column-level grant on `table`.
+    fn column_grant_docs(&self, table: &str) -> Vec<Document> {
+        self.grant_docs_in(Self::COLUMN_GRANT_COLLECTION, table)
     }
 
     /// `GRANT role TO member` / `REVOKE role FROM member`.
@@ -13843,17 +14206,25 @@ impl PgHandler {
             // savepoint has to capture both -- a `ROLLBACK TO` that put the
             // catalog back but left the rewritten rows would describe the
             // table with a shape its own rows do not have.
-            Statement::AlterTable { table, .. } => vec![
-                table.clone(),
-                CATALOG_COLLECTION.to_string(),
-                triggers::TRIGGER_COLLECTION.to_string(),
-                rules::RULE_COLLECTION.to_string(),
-            ],
+            Statement::AlterTable { table, .. } => {
+                let mut v = vec![
+                    table.clone(),
+                    CATALOG_COLLECTION.to_string(),
+                    triggers::TRIGGER_COLLECTION.to_string(),
+                    rules::RULE_COLLECTION.to_string(),
+                ];
+                v.extend(Self::grant_collections().map(String::from));
+                v
+            }
             Statement::RenameColumn { table, .. } => {
-                vec![table.clone(), CATALOG_COLLECTION.to_string()]
+                let mut v = vec![table.clone(), CATALOG_COLLECTION.to_string()];
+                v.extend(Self::grant_collections().map(String::from));
+                v
             }
             Statement::RenameTable { table, to, .. } => {
-                vec![table.clone(), to.clone(), CATALOG_COLLECTION.to_string()]
+                let mut v = vec![table.clone(), to.clone(), CATALOG_COLLECTION.to_string()];
+                v.extend(Self::grant_collections().map(String::from));
+                v
             }
             Statement::Update(u) => vec![u.table.clone()],
             Statement::Delete(d) => vec![d.table.clone()],
@@ -13891,6 +14262,7 @@ impl PgHandler {
                 v.push(Self::COMPOSITE_COLLECTION.to_string());
                 v.push(triggers::TRIGGER_COLLECTION.to_string());
                 v.push(rules::RULE_COLLECTION.to_string());
+                v.extend(Self::grant_collections().map(String::from));
                 v
             }
             // CREATE/DROP TYPE writes a type-catalog row; a `ROLLBACK TO`
@@ -13899,14 +14271,17 @@ impl PgHandler {
             // is what stops a later COMMIT from resurrecting it.
             Statement::CreateComposite { .. } => vec![Self::COMPOSITE_COLLECTION.to_string()],
             Statement::CreateEnum { .. } => vec![Self::ENUM_COLLECTION.to_string()],
-            Statement::CreateView(_) | Statement::DropView { .. } => {
-                vec![Self::VIEW_COLLECTION.to_string()]
+            Statement::CreateView(_) => vec![Self::VIEW_COLLECTION.to_string()],
+            Statement::DropView { .. } => {
+                let mut v = vec![Self::VIEW_COLLECTION.to_string()];
+                v.extend(Self::grant_collections().map(String::from));
+                v
             }
             Statement::CreateRange { .. } => vec![Self::RANGE_COLLECTION.to_string()],
             Statement::CreateShellType { .. } | Statement::CreateBaseType { .. } => {
                 vec![Self::BASE_TYPE_COLLECTION.to_string()]
             }
-            Statement::Grant { .. } => vec![Self::GRANT_COLLECTION.to_string()],
+            Statement::Grant { .. } => Self::grant_collections().map(String::from).to_vec(),
             Statement::AlterEnum { .. } => vec![Self::ENUM_COLLECTION.to_string()],
             Statement::Policy(_) => vec![Self::POLICY_COLLECTION.to_string()],
             Statement::RefreshMatView { name, .. } => {
@@ -13984,6 +14359,8 @@ impl PgHandler {
                 Self::VIEW_COLLECTION.to_string(),
                 triggers::TRIGGER_COLLECTION.to_string(),
                 Self::GRANT_COLLECTION.to_string(),
+                Self::COLUMN_GRANT_COLLECTION.to_string(),
+                Self::RELATION_ACL_COLLECTION.to_string(),
             ],
             Statement::DropType { .. } => vec![
                 Self::ENUM_COLLECTION.to_string(),
@@ -14446,6 +14823,7 @@ impl PgHandler {
                 })
             }
             A::DropColumn { name, .. } => {
+                self.move_column_grants(table, name, None)?;
                 // The field goes with the column, so re-adding the name later
                 // starts empty rather than finding the old values.
                 let field = secantus_pgcatalog::field_for(name, false);
@@ -20818,8 +21196,10 @@ impl PgHandler {
                 def.name = to.clone();
                 self.rewrite_catalog(&to, &def)?;
                 self.note_uncommitted(&table, None);
-                // Views reading the table follow the rename.
+                // Views reading the table follow the rename, and so do its
+                // grants.
                 self.rename_relation_in_views(&table, &to)?;
+                self.move_grants(&table, &to)?;
                 // Its partitions follow the new name.
                 for mut child in self.partitions_of(&table)? {
                     child.extra.insert("partition_of", to.as_str());
@@ -20871,6 +21251,7 @@ impl PgHandler {
                 }
                 // Views reading the column follow the rename.
                 self.rename_column_in_views(&table, &column, &to, None)?;
+                self.move_column_grants(&table, &column, Some(&to))?;
                 if !old.pk {
                     self.rename_row_field(&table, &old.field(), &to)?;
                 }
@@ -21185,6 +21566,7 @@ impl PgHandler {
                         }
                     }
                     self.delete_view(name)?;
+                    self.drop_grants(name)?;
                 }
                 Ok(vec![Response::Execution(Tag::new("DROP VIEW"))])
             }
@@ -21766,6 +22148,7 @@ impl PgHandler {
             Statement::Grant {
                 is_grant,
                 privileges,
+                column_privileges,
                 kind,
                 objects,
                 all_in_schema,
@@ -21775,6 +22158,7 @@ impl PgHandler {
                 self.grant(
                     is_grant,
                     &privileges,
+                    &column_privileges,
                     &kind,
                     &objects,
                     all_in_schema,

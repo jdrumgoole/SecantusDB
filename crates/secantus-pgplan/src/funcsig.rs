@@ -251,6 +251,18 @@ fn select_candidates<'a>(name: &str, args: &[String]) -> Option<Vec<&'a Sig>> {
     Some(cands)
 }
 
+/// Whether some overload of `name` declares exactly `args` (so a call
+/// prints with no casts).
+pub(crate) fn has_exact(name: &str, args: &[String]) -> bool {
+    sigs().get(name).is_some_and(|o| {
+        o.iter().any(|s| {
+            !s.variadic
+                && s.args.len() == args.len()
+                && s.args.iter().zip(args).all(|(p, a)| p == a)
+        })
+    })
+}
+
 /// Several overloads take `args` equally well: 42725 `is not unique`.
 pub(crate) fn ambiguous(name: &str, args: &[String]) -> bool {
     select_candidates(name, args).is_some_and(|c| c.len() > 1)
