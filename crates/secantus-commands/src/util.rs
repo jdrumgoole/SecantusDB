@@ -379,7 +379,7 @@ pub(crate) fn command_error_during(err: StorageError, command: &str) -> CommandE
 /// naming it `Location9` is a divergence the differential gate catches.
 pub(crate) fn error_code_name(code: i32) -> String {
     match code_name_for(code) {
-        "Location" => format!("Location{code}"),
+        "Location" => crate::failpoints::fail_code_name(code),
         name => name.to_string(),
     }
 }
@@ -398,7 +398,6 @@ fn code_name_for(code: i32) -> &'static str {
         85 => "IndexOptionsConflict",
         86 => "IndexKeySpecsConflict",
         112 => "WriteConflict",
-        313 => "TransactionTooLargeForCache",
         121 => "DocumentValidationFailure",
         10334 => "BSONObjectTooLarge",
         11000 => "DuplicateKey",

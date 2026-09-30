@@ -3178,10 +3178,11 @@ These are explicit non-goals. Don't add them without a reason.
         nothing); sorting BY the 2dsphere-indexed field gives mongod
         `[1, 2, 3, 4]` and this server `[3, 2, 1, 4]`, which is a genuine
         document-sort divergence.
-      * **Change-stream resume drops the original read preference.** php-lib's
+      * ~~**Change-stream resume drops the original read preference.**~~ Not a
+        divergence: php-lib's
         `WatchFunctionalTest::testOriginalReadPreferenceIsPreservedOnResume`
-        fails `assertTrue`. Single-node, so the read preference has no practical
-        effect here, but the driver asserts the value round-trips.
+        fails the same way against a single-node mongod 8.2.11 (measured
+        2026-09-30, see §7.01) -- it needs a secondary to exist.
       * **C driver: 8 failures, mostly connection-string/topology.**
         `/Client/select_server/{single,pooled}`,
         `/Client/select_server/err/{single,pooled}`, `/Client/ipv6/single` (x2),
@@ -6897,6 +6898,90 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   for the same TestClient reason).
 
 ## 7. Python → Rust rewrite (in progress)
+
+### 7.01 Rust MongoDB server driver-gauge sweep — 2026-09-30
+
+Every MongoDB driver gauge run against the Rust server (tree `96f95c18`), then
+each failure triaged against mongod 8.2.11. No server regression; two tests
+newly pass (Rust driver `find_one_and_delete_hint_server_version`, Java
+`VersionedApiTest ... find and getMore append API version`).
+
+| gauge | passed / failed / skipped | rate |
+| --- | --- | --- |
+| pymongo | 1205 / 5 / 290 | 99.5% |
+| pymongo async | 1111 / 6 / 306 | 99.4% |
+| node | 357 / 1 / 6 | 98.1% |
+| rust driver | 101 / 0 / 0 | 100.0% |
+| ruby | 293 / 1 / 24 | 99.6% |
+| php-lib | 3101 / 2 / 27 | 99.9% |
+| php-ext | 679 / 1 / 35 | 99.8% |
+| java | 496 / 0 / 404 | 100.0% |
+| kotlin | 340 / 0 / 198 | 100.0% |
+| cxx | 889 / 1 / 9 (the 1 was the harness, fixed below) | 99.8% |
+| go / c | see §7.00 (run earlier the same day) | |
+
+- [x] **`errorLabels` on `failCommand` errors (php-ext `bug1419-001.phpt`).**
+  The Rust server attached a label in exactly one context -- a transaction
+  statement -- and missed the rest. Swept every code in 1..520 plus the
+  well-known high ones on mongod: 280 / 286 are `NonResumableChangeStreamError`
+  on ANY command; the aggregate that OPENS a change stream gets
+  `ResumableChangeStreamError` (28 codes); a retryable write (`txnNumber`, not
+  in a transaction) gets `RetryableWriteError` (23 codes) -- never labelled
+  before, so a driver saw a bare code and did not retry; the transaction and
+  commit sets were each missing codes (150, 239, 250, 272, 317, ... on a
+  statement; 317, 358, ... on a commit); 433 / 449 / 450 / 462 add
+  `SystemOverloadedError` after any other label. Also: 24 codes whose error
+  carries extra info are REFUSED by mongod's `failCommand` (`40671 Missing
+  required extra info for error code DuplicateKey`), not injected; on 303 /
+  354 / 372 / 398 mongod drops the connection; and an injected code's
+  `codeName` is mongod's real name for 452 codes where the Rust server said
+  `Location<n>` for all but 21. `tools/probes/error_labels.py` 73 -> 0 of 243
+  (now 540 cases with the widened code list and a commit context).
+  `mongod_codes.rs` is GENERATED from that measurement.
+- [x] **Code 330 CRASHES mongod 8.2.11** when injected with `failCommand` (an
+  invariant in its OP_MSG builder). Nothing to copy; the probe skips it.
+- [x] **An oversized transaction answered code 313, which is not its code.**
+  `TransactionTooLargeForCache` is 388 on mongod; 313 is
+  `ResumableRangeDeleterDisabled`. The Rust storage adapter now sends 388.
+- [x] **The C++ gauge ran without failpoints** since #1624 turned them off by
+  default: it launches its daemon with a bare `Popen` on the fixed port 27017,
+  bypassing `spawn_daemon`'s `_force_test_commands`, so `configureFailPoint`
+  was "no such command" and `WriteConcernError 'errInfo' is propagated` failed
+  on the harness. Fixed, and `test_test_command_gate.py` now fails if any
+  runner launches a daemon around the choke point.
+- [x] **Not server divergences:** pymongo async
+  `test_read_preference_hedge_deprecated` fails `DeprecationWarning not raised`
+  -- a client-side warning, emitted once per process, that never reaches the
+  server. Ruby `applies the write concern passed in as an option` passes
+  `w: 2` to a one-member set (documented inherent, see §5).
+- [x] **php-lib `testOriginalReadPreferenceIsPreservedOnResume` is inherent**
+  -- measured, not reasoned: the same phpunit test against a single-node
+  mongod 8.2.11 replica set fails identically ("Failed asserting that false is
+  true", 1 failure of 2 assertions). It selects a SECONDARY, gets the one node
+  (a direct connection accepts any server type), and asserts the resumed
+  cursor's server `isSecondary()`; one member cannot be both.
+- [ ] **The .NET gauge could not run on this box:** its build step `gpg
+  --batch --import` blocks on a stale `~/.gnupg/public-keys.d/pubring.db.lock`
+  left by a dead process under an old hostname. An environment problem, not a
+  repo one; clear the lock and re-run `invoke validate-dotnet --server rust`.
+  (The Ruby gauge hit a similar local problem -- Homebrew's read-only
+  `rdoc_plugin.rb` -- and passed with `BUNDLE_PATH` pointed elsewhere.)
+
+- [ ] **`test_tmp_retention_guard.py::test_default_tmp_retention_policy_is_allowed`
+  timed out ONCE (2026-09-30).** Its nested collect-only pytest hit the 300s
+  `subprocess.run` timeout in an `-n auto` run of eight files alongside the
+  PG-binary tests; it takes ~3s, and passed 3 of 3 alone straight after. A
+  300s wall on a 3s job is a hang, not slowness -- the docstring already
+  names one such hang (the atexit `pytest-of-<user>` cleanup), which
+  `--basetemp` was meant to remove. Not reproduced yet; run the file under
+  `-n auto` next to a heavy suite and sample the nested process if it sticks.
+
+**Found and NOT fixed -- Python-server divergences** (out of scope here):
+
+- [ ] the Python server has the same oversized-transaction code, 313 instead
+  of 388 (`commands.py`, and `tests/test_transactions.py` asserts 313).
+- [ ] its `failCommand` labels and code names were not measured this batch;
+  run `tools/probes/error_labels.py` with `PROBE_SERVER` at a Python server.
 
 ### 7.00 Rust MongoDB server batch — 2026-09-30, measured against mongod 8.2.11
 

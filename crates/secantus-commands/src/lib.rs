@@ -47,6 +47,7 @@ pub mod findandmodify;
 pub mod handshake;
 pub mod logbuf;
 pub mod mapreduce;
+pub mod mongod_codes;
 pub mod params;
 pub mod rbac;
 pub mod roles;
@@ -918,6 +919,25 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
                     return doc! { "ok": 1.0 };
                 }
                 if let Some(code) = m.error_code {
+                    // A code whose error carries structured extra info cannot be
+                    // injected bare: mongod refuses with 40671 rather than send
+                    // an error missing the fields a driver would read from it.
+                    if crate::mongod_codes::NEEDS_EXTRA_INFO.contains(&code) {
+                        return CommandError::new(
+                            40671,
+                            "Location40671",
+                            format!(
+                                "Missing required extra info for error code {}",
+                                failpoints::fail_code_name(code)
+                            ),
+                        )
+                        .into_reply();
+                    }
+                    // And on these mongod drops the connection instead of replying.
+                    if crate::mongod_codes::CLOSES_CONNECTION.contains(&code) {
+                        ctx.close_connection = true;
+                        return doc! { "ok": 1.0 };
+                    }
                     let mut reply = CommandError::new(
                         code,
                         failpoints::fail_code_name(code),
@@ -926,64 +946,7 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
                         "Failing command via 'failCommand' failpoint",
                     )
                     .into_reply();
-                    // `failGetMoreAfterCursorCheckout` is injected inside the
-                    // change-stream getMore path, where mongod stamps a
-                    // resumable code with `ResumableChangeStreamError`; drivers
-                    // on wire >= 9 resume on that label and never on the bare
-                    // code. `failCommand` short-circuits earlier and carries
-                    // only the labels it was given — which is why the spec has
-                    // `failGetMoreAfterCursorCheckout` + code 6 resume while
-                    // `failCommand` + code 6 does not.
-                    // A supplied `errorLabels` — including an explicit `[]` — is
-                    // authoritative: mongod answers with exactly that list and
-                    // adds nothing of its own (measured 2026-09-28). Only when
-                    // the failpoint said nothing about labels does the server
-                    // compute them, which is what the two branches below do.
-                    let supplied = m.error_labels.is_some();
-                    let mut labels = m.error_labels.clone().unwrap_or_default();
-                    if !supplied
-                        && m.server_injected
-                        && failpoints::is_resumable_change_stream_code(code)
-                        && !labels.iter().any(|l| l == "ResumableChangeStreamError")
-                    {
-                        labels.push("ResumableChangeStreamError".to_string());
-                    }
-                    // A driver decides whether to replay a whole transaction, or
-                    // just retry the commit, by reading the label off the error.
-                    // `finish_txn_statement` has labelled transient in-transaction
-                    // failures all along, but this short-circuit returns before
-                    // the handler runs and before the transaction is resolved, so
-                    // it never reached that code. Every test in the drivers'
-                    // transaction error-label suite injects its error with
-                    // `failCommand`, so every one of them took this path and saw
-                    // `errorLabels: []` — a retry loop, exercised exactly as the
-                    // specification intends, silently did not engage.
-                    //
-                    // `autocommit: false` is the signal mongod itself uses (drivers
-                    // send it on every statement of a transaction, commit and abort
-                    // included), so the check works here without moving the
-                    // failpoint below the transaction resolution — which would
-                    // reorder failpoint-versus-transaction error precedence, and no
-                    // probe says which mongod prefers.
-                    //
-                    // Which label depends on WHICH COMMAND failed, not only on the
-                    // code: ending the transaction splits the set in two. See
-                    // `failpoints::COMMIT_RETRYABLE_WRITE_CODES` for the
-                    // measurement.
-                    if !supplied
-                        && doc.get("autocommit") == Some(&Bson::Boolean(false))
-                        && is_transient_txn_code(code)
-                    {
-                        let ending = name == "commitTransaction" || name == "abortTransaction";
-                        let label = if ending && failpoints::is_commit_retryable_write_code(code) {
-                            transactions::RETRYABLE_WRITE_LABEL
-                        } else {
-                            transactions::TRANSIENT_LABEL
-                        };
-                        if !labels.iter().any(|l| l == label) {
-                            labels.push(label.to_string());
-                        }
-                    }
+                    let labels = failpoint_error_labels(name, doc, code, m);
                     if !labels.is_empty() {
                         reply.insert(
                             "errorLabels",
@@ -1390,45 +1353,6 @@ fn txn_blocked_agg_stage(stage: &str) -> bool {
     )
 }
 
-/// Error codes that earn the `TransientTransactionError` label when a statement
-/// inside a transaction fails.
-///
-/// **Measured against mongod, not against the Python server.** The previous
-/// version of this comment cited `commands.py::_TRANSIENT_TXN_CODES` as its
-/// authority, and that is exactly how both servers ended up missing 134 and 262
-/// together: a parity check is satisfied by two engines being wrong in the same
-/// way. The set below is every code that came back carrying the label when
-/// injected into a statement with `autocommit: false` on a single-node replica
-/// set mongod 8.2.11 (2026-09-28, raw OP_MSG socket).
-///
-/// Deliberately absent, because mongod gives them NO labels there: 50
-/// `MaxTimeMSExpired`, 100 `UnsatisfiableWriteConcern`, 11601 `Interrupted`, and
-/// 11000 duplicate key — which aborts the transaction, but retrying would not
-/// help. 11601 is the one worth remembering: its gauge failure looked like a
-/// missing label and was a missing code NAME.
-fn is_transient_txn_code(code: i32) -> bool {
-    matches!(
-        code,
-        6 | 7
-            | 24
-            | 89
-            | 91
-            | 112
-            | 134
-            | 189
-            | 246
-            | 251
-            | 262
-            | 267
-            | 9001
-            | 10107
-            | 11600
-            | 11602
-            | 13435
-            | 13436
-    )
-}
-
 /// The mongod-shaped reason a statement can't run in a transaction, or `None`.
 fn txn_unsupported_reason(name: &str, doc: &Document) -> Option<String> {
     if !txn_allowed_command(name) {
@@ -1642,6 +1566,85 @@ fn run_with_txn_envelope(
     result
 }
 
+/// The `errorLabels` mongod puts on a `failCommand`-injected error.
+///
+/// A supplied `errorLabels` -- including an explicit `[]` -- is authoritative:
+/// mongod answers with exactly that list and adds nothing (measured
+/// 2026-09-28). Otherwise mongod computes them, and the rules below are what a
+/// sweep of every code in 1..520 found on 8.2.11 (2026-09-30,
+/// `tools/probes/error_labels.py`); the code sets live in `failpoints`:
+///
+/// * 280 / 286 -> `NonResumableChangeStreamError`, on ANY command;
+/// * the aggregate that OPENS a change stream -> `ResumableChangeStreamError`
+///   for the resumable set (a `getMore` gets nothing from `failCommand`; its
+///   label comes from `failGetMoreAfterCursorCheckout`, `server_injected`);
+/// * a statement inside a transaction (`autocommit: false`) ->
+///   `TransientTransactionError`; a `commitTransaction` / `abortTransaction`
+///   -> `RetryableWriteError` for the retryable-write codes and
+///   `TransientTransactionError` for the other transient ones;
+/// * a retryable write (a write carrying `txnNumber`, not in a transaction)
+///   -> `RetryableWriteError`;
+/// * then `SystemOverloadedError`, AFTER any of the above, for its codes.
+///
+/// Every one of these was missing except the transaction label, so a driver
+/// saw a bare code where mongod tells it to retry or resume -- and a
+/// transaction label's `autocommit: false` path is what all the drivers'
+/// transaction error-label specs exercise, which is why that one existed.
+fn failpoint_error_labels(
+    name: &str,
+    doc: &Document,
+    code: i32,
+    m: &failpoints::FailPointMatch,
+) -> Vec<String> {
+    if let Some(supplied) = &m.error_labels {
+        return supplied.clone();
+    }
+    let mut labels: Vec<&str> = Vec::new();
+    if failpoints::NON_RESUMABLE_CHANGE_STREAM_CODES.contains(&code) {
+        labels.push("NonResumableChangeStreamError");
+    } else if m.server_injected {
+        if failpoints::is_resumable_change_stream_code(code) {
+            labels.push("ResumableChangeStreamError");
+        }
+    } else if name == "aggregate" && opens_change_stream(doc) {
+        if failpoints::CHANGE_STREAM_OPEN_RESUMABLE_CODES.contains(&code) {
+            labels.push("ResumableChangeStreamError");
+        }
+    } else if doc.get("autocommit") == Some(&Bson::Boolean(false)) {
+        let ending = name == "commitTransaction" || name == "abortTransaction";
+        if ending && failpoints::is_retryable_write_code(code) {
+            labels.push(transactions::RETRYABLE_WRITE_LABEL);
+        } else if failpoints::is_transient_txn_code(code) {
+            labels.push(transactions::TRANSIENT_LABEL);
+        }
+    } else if doc.contains_key("txnNumber")
+        && is_retryable_write_command(name)
+        && failpoints::is_retryable_write_code(code)
+    {
+        labels.push(transactions::RETRYABLE_WRITE_LABEL);
+    }
+    if failpoints::SYSTEM_OVERLOADED_CODES.contains(&code) {
+        labels.push("SystemOverloadedError");
+    }
+    labels.into_iter().map(String::from).collect()
+}
+
+/// Whether an `aggregate` opens a change stream (`$changeStream` first).
+fn opens_change_stream(doc: &Document) -> bool {
+    matches!(
+        doc.get_array("pipeline").ok().and_then(|p| p.first()),
+        Some(Bson::Document(stage)) if stage.contains_key("$changeStream")
+    )
+}
+
+/// The commands a driver retries as retryable writes.
+fn is_retryable_write_command(name: &str) -> bool {
+    matches!(
+        name,
+        "insert" | "update" | "delete" | "findAndModify" | "findandmodify" | "bulkWrite"
+    )
+}
+
 /// mongod parity: any failed statement aborts the transaction server-side. Only
 /// transient-class codes earn the `TransientTransactionError` label (E11000
 /// aborts unlabeled). Mirrors `commands.py::_finish_txn_statement`.
@@ -1658,7 +1661,7 @@ fn finish_txn_statement(
     registry.abort_in_progress(txn);
     if !ok {
         let code = result.get_i32("code").unwrap_or(0);
-        if is_transient_txn_code(code) {
+        if failpoints::is_transient_txn_code(code) {
             let labels = match result.get_array_mut("errorLabels") {
                 Ok(arr) => arr,
                 Err(_) => {
@@ -2308,6 +2311,71 @@ fn py_repr(v: &Bson) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn injected(code: i32) -> failpoints::FailPointMatch {
+        failpoints::FailPointMatch {
+            error_code: Some(code),
+            server_injected: false,
+            error_labels: None,
+            write_concern_error: None,
+            close_connection: false,
+            block_time_ms: 0,
+        }
+    }
+
+    /// The label rules measured on mongod 8.2.11 (2026-09-30).
+    #[test]
+    fn failpoint_error_labels_follow_the_mongod_sweep() {
+        let find = doc! {"find": "c"};
+        let stream = doc! {"aggregate": "c", "pipeline": [{"$changeStream": {}}]};
+        let retryable = doc! {"insert": "c", "txnNumber": 1_i64};
+        let in_txn = doc! {"insert": "c", "txnNumber": 1_i64, "autocommit": false};
+        let commit = doc! {"commitTransaction": 1, "txnNumber": 1_i64, "autocommit": false};
+        let labels = |name: &str, doc: &Document, code: i32| {
+            failpoint_error_labels(name, doc, code, &injected(code))
+        };
+        // 280 on anything, a plain find cursor included (php bug1419-001).
+        assert_eq!(
+            labels("find", &find, 280),
+            ["NonResumableChangeStreamError"]
+        );
+        assert_eq!(
+            labels("insert", &retryable, 286),
+            ["NonResumableChangeStreamError"]
+        );
+        // Opening a change stream vs a plain read.
+        assert_eq!(
+            labels("aggregate", &stream, 6),
+            ["ResumableChangeStreamError"]
+        );
+        assert!(labels("find", &find, 6).is_empty());
+        // A retryable write, a transaction statement, a commit.
+        assert_eq!(labels("insert", &retryable, 9001), ["RetryableWriteError"]);
+        assert!(labels("insert", &doc! {"insert": "c"}, 9001).is_empty());
+        assert_eq!(
+            labels("insert", &in_txn, 150),
+            ["TransientTransactionError"]
+        );
+        assert_eq!(
+            labels("commitTransaction", &commit, 358),
+            ["RetryableWriteError"]
+        );
+        assert!(labels("insert", &in_txn, 358).is_empty());
+        assert_eq!(
+            labels("commitTransaction", &commit, 112),
+            ["TransientTransactionError"]
+        );
+        // SystemOverloadedError comes after the context label.
+        assert_eq!(
+            labels("insert", &retryable, 462),
+            ["RetryableWriteError", "SystemOverloadedError"]
+        );
+        assert_eq!(labels("find", &find, 433), ["SystemOverloadedError"]);
+        // A supplied list is authoritative, an explicit [] included.
+        let mut m = injected(280);
+        m.error_labels = Some(vec![]);
+        assert!(failpoint_error_labels("find", &find, 280, &m).is_empty());
+    }
     use bson::doc;
 
     fn ctx() -> CommandContext {

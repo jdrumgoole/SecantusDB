@@ -282,8 +282,6 @@ pub fn failpoint_app_name(
         .map(String::from)
 }
 
-/// A `codeName` for a failpoint-injected error code — the well-known mongod
-/// names the driver retry/label logic keys on, else a generic `Location<code>`.
 /// Error codes mongod classifies as resumable for a change stream
 /// (`ErrorCodes::isResumableChangeStreamError`). On one of these it stamps the
 /// reply with `ResumableChangeStreamError`, and drivers on wire >= 9 resume on
@@ -315,86 +313,75 @@ pub fn is_resumable_change_stream_code(code: i32) -> bool {
     RESUMABLE_CHANGE_STREAM_CODES.contains(&code)
 }
 
-/// Codes that earn `RetryableWriteError` instead of `TransientTransactionError`
-/// when the failure lands on `commitTransaction` or `abortTransaction`.
+/// The codes mongod labels `RetryableWriteError` -- on a retryable write (a
+/// write command carrying `txnNumber` outside a transaction) and on a failed
+/// `commitTransaction` / `abortTransaction`, which are the same set.
 ///
-/// The transaction label is not one set but two, split by which command failed —
-/// measured on a single-node replica-set mongod 8.2.11 (2026-09-28), with
-/// `commitTransaction` and `abortTransaction` behaving identically:
+/// Measured by sweeping `failCommand` over every code in 1..520 plus the
+/// well-known high ones on a single-node replica-set mongod 8.2.11 (2026-09-30,
+/// `tools/probes/error_labels.py`; commit measured over a raw socket). The
+/// earlier list had 13 of these 23, taken from the codes a driver spec named;
+/// and a retryable write was never labelled at all, so a driver saw the bare
+/// code and did not retry.
 ///
-/// * a STATEMENT inside a transaction (`autocommit: false`) gets
-///   `TransientTransactionError` for every code in `is_transient_txn_code`;
-/// * a COMMIT or ABORT gets `RetryableWriteError` for the codes below and
-///   `TransientTransactionError` for the remaining five (24 `LockTimeout`,
-///   112 `WriteConflict`, 246 `SnapshotUnavailable`, 251 `NoSuchTransaction`,
-///   267 `PreparedTransactionInProgress`) — the failures that are about the
-///   transaction rather than about reaching the node.
-///
-/// The two lists are disjoint and together are exactly `is_transient_txn_code`.
-/// Telling a driver `TransientTransactionError` here, as this server did until
-/// now, asks it to replay the whole transaction where mongod asks it to retry
-/// just the commit.
-pub const COMMIT_RETRYABLE_WRITE_CODES: &[i32] = &[
-    6,     // HostUnreachable
-    7,     // HostNotFound
-    89,    // NetworkTimeout
-    91,    // ShutdownInProgress
-    134,   // ReadConcernMajorityNotAvailableYet
-    189,   // PrimarySteppedDown
-    262,   // ExceededTimeLimit
-    9001,  // SocketException
-    10107, // NotWritablePrimary
-    11600, // InterruptedAtShutdown
-    11602, // InterruptedDueToReplStateChange
-    13435, // NotPrimaryNoSecondaryOk
-    13436, // NotPrimaryOrSecondary
+/// 358 is here but not in [`TRANSIENT_TXN_CODES`]: a commit that fails with it
+/// is retried, a statement that fails with it does not replay the transaction.
+pub const RETRYABLE_WRITE_CODES: &[i32] = &[
+    6, 7, 89, 91, 134, 189, 262, 317, 358, 384, 402, 406, 407, 412, 453, 462, 9001, 10107, 11600,
+    11602, 13435, 13436, 50915,
 ];
 
-/// Whether a commit/abort failure with `code` is labelled `RetryableWriteError`.
-pub fn is_commit_retryable_write_code(code: i32) -> bool {
-    COMMIT_RETRYABLE_WRITE_CODES.contains(&code)
+/// Whether mongod labels `code` `RetryableWriteError` (see the constant).
+pub fn is_retryable_write_code(code: i32) -> bool {
+    RETRYABLE_WRITE_CODES.contains(&code)
 }
 
-/// The `codeName` mongod renders for a `failCommand`-injected code.
+/// The codes mongod labels `TransientTransactionError` on a STATEMENT inside a
+/// transaction (`autocommit: false`), from the same sweep. On a commit or abort
+/// the [`RETRYABLE_WRITE_CODES`] among them get `RetryableWriteError` instead
+/// and the rest keep this label.
 ///
-/// Every name here was read off a single-node REPLICA SET mongod 8.2.11 over a
-/// raw OP_MSG socket (2026-09-28) — transactions need a replica set, and a
-/// driver in the path is not safe to probe through: pymongo retries
-/// `commitTransaction` itself and converts the NotPrimary family into a
-/// client-side exception, so two earlier columns measured the driver rather
-/// than the server.
+/// Deliberately absent, because mongod gives them no label there: 50
+/// `MaxTimeMSExpired`, 100 `UnsatisfiableWriteConcern`, 11601 `Interrupted`,
+/// and 11000 -- which aborts the transaction, but retrying would not help.
+pub const TRANSIENT_TXN_CODES: &[i32] = &[
+    6, 7, 24, 89, 91, 112, 134, 150, 189, 239, 246, 250, 251, 262, 267, 272, 317, 384, 402, 406,
+    407, 412, 453, 462, 9001, 10107, 11600, 11602, 13435, 13436, 50915,
+];
+
+/// Whether mongod labels `code` `TransientTransactionError` in a transaction.
+pub fn is_transient_txn_code(code: i32) -> bool {
+    TRANSIENT_TXN_CODES.contains(&code)
+}
+
+/// The codes mongod labels `ResumableChangeStreamError` when `failCommand`
+/// fails the AGGREGATE that opens a change stream (same sweep). Not its
+/// `getMore`: there `failCommand` adds nothing, and the resumable label comes
+/// only from `failGetMoreAfterCursorCheckout` -- [`RESUMABLE_CHANGE_STREAM_CODES`].
+pub const CHANGE_STREAM_OPEN_RESUMABLE_CODES: &[i32] = &[
+    6, 7, 89, 91, 133, 134, 150, 175, 189, 234, 262, 317, 358, 384, 401, 402, 406, 407, 412, 453,
+    462, 9001, 10107, 11600, 11602, 13435, 13436, 50915,
+];
+
+/// Labelled `NonResumableChangeStreamError` on EVERY command, change stream or
+/// not: 280 `ChangeStreamFatalError`, 286 `ChangeStreamHistoryLost`. The PHP
+/// driver's `bug1419-001.phpt` fails a plain `find` cursor's getMore with 280.
+pub const NON_RESUMABLE_CHANGE_STREAM_CODES: &[i32] = &[280, 286];
+
+/// Labelled `SystemOverloadedError` on every command, after any other label.
+pub const SYSTEM_OVERLOADED_CODES: &[i32] = &[433, 449, 450, 462];
+
+/// The `codeName` mongod renders for a `failCommand`-injected code: its real
+/// name where it has one (`mongod_codes`, measured), else `Location<code>`.
 ///
-/// The transaction codes (24 / 112 / 246 / 251 / 267 / 11601) were missing and
-/// fell through to `Location<code>`, which is what made the drivers' spec test
-/// `commitTransaction fails after Interrupted` assert `Interrupted` and get
-/// `Location11601`. 100 was `CannotSatisfyWriteConcern`, a name mongod does not
-/// use in either context — see `write_concern_error`.
+/// This used to be a hand list of 21 names read off a probe of the codes the
+/// driver specs name. Every other code mongod names -- 400-odd, 391
+/// `ReauthenticationRequired` among them -- came out as `Location<code>`.
 pub fn fail_code_name(code: i32) -> String {
-    match code {
-        6 => "HostUnreachable",
-        7 => "HostNotFound",
-        24 => "LockTimeout",
-        50 => "MaxTimeMSExpired",
-        89 => "NetworkTimeout",
-        91 => "ShutdownInProgress",
-        100 => "UnsatisfiableWriteConcern",
-        112 => "WriteConflict",
-        134 => "ReadConcernMajorityNotAvailableYet",
-        189 => "PrimarySteppedDown",
-        246 => "SnapshotUnavailable",
-        251 => "NoSuchTransaction",
-        262 => "ExceededTimeLimit",
-        267 => "PreparedTransactionInProgress",
-        9001 => "SocketException",
-        10107 => "NotWritablePrimary",
-        11600 => "InterruptedAtShutdown",
-        11601 => "Interrupted",
-        11602 => "InterruptedDueToReplStateChange",
-        13435 => "NotPrimaryNoSecondaryOk",
-        13436 => "NotPrimaryOrSecondary",
-        _ => return format!("Location{code}"),
+    match crate::mongod_codes::code_name(code) {
+        Some(name) => name.to_string(),
+        None => format!("Location{code}"),
     }
-    .to_string()
 }
 
 #[cfg(test)]
@@ -580,15 +567,16 @@ mod resume_label_tests {
         assert_ne!(fail_code_name(11601), "Location11601");
     }
 
-    /// The commit/abort label split, measured in the same run. The two lists are
-    /// disjoint and together are exactly the transient set, so a code that is
-    /// transient on a STATEMENT is labelled one way or the other when the
-    /// failure lands on the command that ENDS the transaction.
+    /// The commit/abort label split. The transaction-shaped failures (24, 112,
+    /// 246, 251, 267) keep `TransientTransactionError` on commit; the
+    /// reach-the-node failures get `RetryableWriteError`. The two sets are NOT
+    /// complementary: 358 is retryable on a commit but not transient on a
+    /// statement (measured 8.2.11, 2026-09-30).
     #[test]
     fn commit_retryable_and_transaction_transient_codes_are_disjoint() {
         for code in [24, 112, 246, 251, 267] {
             assert!(
-                !is_commit_retryable_write_code(code),
+                !is_retryable_write_code(code),
                 "{code} is about the transaction, so commit keeps TransientTransactionError"
             );
         }
@@ -596,16 +584,13 @@ mod resume_label_tests {
             6, 7, 89, 91, 134, 189, 262, 9001, 10107, 11600, 11602, 13435, 13436,
         ] {
             assert!(
-                is_commit_retryable_write_code(code),
+                is_retryable_write_code(code),
                 "{code} is a retryable-write failure, so commit gets RetryableWriteError"
             );
         }
         // Never labelled on commit at all — mongod gives these none.
         for code in [50, 100, 11601] {
-            assert!(
-                !is_commit_retryable_write_code(code),
-                "{code} earns no label"
-            );
+            assert!(!is_retryable_write_code(code), "{code} earns no label");
         }
     }
 

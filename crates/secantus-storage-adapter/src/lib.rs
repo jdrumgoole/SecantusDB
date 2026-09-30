@@ -854,11 +854,13 @@ fn map_err(e: WtError) -> StorageError {
         // command-level by the write handlers so the txn envelope labels it.
         WtError::WriteConflict => StorageError::WriteConflict,
         // An oversized multi-document transaction → mongod's
-        // TransactionTooLargeForCache (313). Deliberately NOT in the
-        // transient-label set: retrying the same transaction hits the same
-        // wall.
+        // TransactionTooLargeForCache, which is code 388. This said 313 --
+        // `ResumableRangeDeleterDisabled` on mongod 8.2.11 (measured
+        // 2026-09-30) -- so a driver checking the code read the wrong error.
+        // Deliberately NOT in the transient-label set: retrying the same
+        // transaction hits the same wall (mongod labels 388 with nothing).
         WtError::TransactionTooLargeForCache => StorageError::WriteError {
-            code: 313,
+            code: 388,
             errmsg: "Transaction is too large and will not fit in the storage engine cache"
                 .to_string(),
             exec: false,
