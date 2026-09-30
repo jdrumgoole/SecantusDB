@@ -43,6 +43,13 @@ reports zero divergences.
   refused.
 - `$jsonSchema` refuses `type: "integer"` (9) and unknown type names (2).
 - `$bucketAuto` `POWERSOF2` answers an int for a whole power of two.
+- A `writeConcernError` carries mongod's `errInfo.writeConcern` (`w`, `j`,
+  `wtimeout`, `provenance`) and sits before `ok`; a write whose `w` names an
+  unknown tag runs and then reports 79, instead of being refused.
+- `drop` reports the collection's real index count as `nIndexesWas`.
+- A document that fails its validator gets mongod's full explanation in
+  `errInfo.details`: every broken `$jsonSchema` rule in mongod's order, and
+  every failing query clause, where it used to get `{operatorName: "$jsonSchema"}`.
 
 #### Added
 
@@ -51,8 +58,9 @@ reports zero divergences.
 - A multi-field filter rides a single-field index on one of its fields, and a
   sort under an unindexed filter walks the sort index -- the plans mongod picks.
 - Probes: `max_time_expiry.py`, `int32_arguments.py`, `nested_value_sort.py`,
-  `bucket_auto_granularity.py`; `index_result_sets.py` now covers empty filters,
-  compound sorts, hints, partial compound indexes and array / document bounds.
+  `bucket_auto_granularity.py`, `validation_error_details.py`;
+  `index_result_sets.py` now covers empty filters, compound sorts, hints,
+  partial compound indexes and array / document bounds.
 
 #### Changed
 

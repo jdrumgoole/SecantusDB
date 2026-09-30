@@ -3235,6 +3235,14 @@ These are explicit non-goals. Don't add them without a reason.
         `/Client/select_server/err/{single,pooled}`, `/Client/ipv6/single` (x2),
         plus `/find_and_modify/hint` and `/crud/prose_test_9`. The
         `select_server` cluster is one surface, not six bugs; triage it as one.
+        **Triaged 2026-09-30:** `/find_and_modify/hint` was fixed by #1622 (a
+        hint on a missing collection is accepted; re-measured equal to 8.2.11);
+        `/crud/prose_test_9` failed on the failpoint's WORDING -- mongod says
+        `Failing command via 'failCommand' failpoint`, the Rust server said
+        `due to` -- fixed. The `select_server` x4 and `ipv6` x2 are the
+        documented inherents (§ C gauge above): one asserts a non-primary member
+        this topology cannot offer, the other hard-codes `[::1]:27017`. Not yet
+        confirmed by a C gauge re-run.
 
       All eleven gauges and their rates are tabulated in
       `tasks/driver-conformance-followups-plan.md` §5.
@@ -3551,8 +3559,15 @@ These are explicit non-goals. Don't add them without a reason.
       `commitTransaction` itself and converts the NotPrimary family into a
       client-side exception, so a pymongo-driven probe measures the driver.
 
-- [ ] **OPEN — neither server sends `errInfo` on a write-concern error
-      (2026-09-28).** mongod's unsatisfiable-write-concern reply carries
+- [ ] **FIXED on the Rust server (2026-09-30); still OPEN on the Python
+      server.** Rust now sends `errInfo.writeConcern` with the client's `w`,
+      its `j` if given, `wtimeout` (0 when absent) and `provenance:
+      "clientSupplied"`, places `writeConcernError` before `ok`, and runs a
+      write whose `w` names an unknown tag (79 afterwards, not a pre-flight
+      refusal) -- matching 8.2.11 across insert / update / delete /
+      findAndModify / create / createIndexes / drop. The original entry:
+      ~~**OPEN — neither server sends `errInfo` on a write-concern error
+      (2026-09-28).**~~ mongod's unsatisfiable-write-concern reply carries
       `errInfo: {writeConcern: {w, wtimeout, provenance}}` alongside the code and
       message; we send code + codeName + errmsg only. Measured with a `w: 5`
       write against a single-node replica-set mongod 8.2.11, which answered
@@ -6808,7 +6823,7 @@ Subtler than the above; these may bite specific test suites.
   - ~~**Client-metadata handshake** (`integration tests for client metadata handshake feature/with client`, `/with pool`)~~ **FIXED (0.5.4b12)** — the test connects with `?appName=xyz` and scans `db.aggregate([{$currentOp: {}}])` for an op whose `appName` matches, then reads its `clientMetadata.{application,driver,os}`. The `$currentOp` *aggregation stage* (`aggregate._stage_current_op`) was a bare stub; it now surfaces the connection's `clientMetadata` + a top-level `appName` (threaded via `PipelineContext.client_metadata` from the connection registry), like the `currentOp` command already did. Regression: `tests/test_hello_client_metadata.py::test_aggregation_currentop_surfaces_appname_and_metadata`.
   - Out-of-scope tags excluded in `cxx_validation/include_paths.py` (CSFLE, Atlas, search indexes, transactions, sessions, SDAM monitoring, and `[uri_options]` which needs the `URI_OPTIONS_TESTS_PATH` spec-data dir).
 - [x] **mongo-csharp-driver (C# / .NET) gauge landed (2026-06-19) — the one gap surfaced is FIXED (headline corrected 2026-08-21).** `mongo-csharp-driver` is at **0 failures / 100.0%** in the current `docs/validation-summary.md`, and this entry's own body already records the fix ("gauge-verified at 202 pass / 0 fail / 26 skip"). New `dotnet_validation` gauge runs the vendored driver's xUnit `MongoDB.Driver.Tests` via `dotnet test` against an embedded daemon over `MONGODB_URI`. Driver pinned `v3.9.0`; scoped to the **CRUD specification suite** (`MongoDB.Driver.Tests.Specifications.crud`) via `--filter` — `MongoDB.Driver.Tests` as a whole is enormous and dominated by non-server unit tests (LINQ/serialization) plus external-service suites (CSFLE/KMS, auth, Atlas Search, load balancing) and multi-node features (transactions, sessions, SDAM, retryable). At landing: **201 pass / 1 fail / 26 skip (99.5%)** (the 26 are `[RequireServer]`/CSFLE-gated skips). After the 0.5.4b9 validation-detail fix below, gauge-verified at **202 pass / 0 fail / 26 skip**. The one (now-fixed) divergence:
-  - ~~**Document-validation error detail** (`CrudProseTests.WriteError_details_should_expose_writeErrors_errInfo`)~~ **FIXED (0.5.4b9)** — a failed query-expression validator now synthesises mongod's per-operator `errInfo.details` (`operatorName` / `specifiedAs` / `reason` / `consideredValue` / `consideredType`) via `commands._validation_failure_details` + `query.bson_type_name`, used by both the insert path and `_validate_doc_against_collection`. ($jsonSchema validators still report a minimal `{operatorName: "$jsonSchema"}` — their schema-rules detail is unsynthesised.)
+  - ~~**Document-validation error detail** (`CrudProseTests.WriteError_details_should_expose_writeErrors_errInfo`)~~ **FIXED (0.5.4b9)** — a failed query-expression validator now synthesises mongod's per-operator `errInfo.details` (`operatorName` / `specifiedAs` / `reason` / `consideredValue` / `consideredType`) via `commands._validation_failure_details` + `query.bson_type_name`, used by both the insert path and `_validate_doc_against_collection`. ($jsonSchema validators still report a minimal `{operatorName: "$jsonSchema"}` — their schema-rules detail is unsynthesised. **The Rust server synthesises the full explanation since 2026-09-30** -- every `$jsonSchema` keyword in mongod's rule order, and query validators flattened per operator under `$and` with `$or` / `$nor` / `$not` / `$expr` -- transcribed from 8.2's `doc_validation_error.cpp`; `tools/probes/validation_error_details.py` 47 -> 0 of 71. The Python server still sends the minimal form.)
   - The CRUD-only scope is deliberate and expandable — broaden the `--filter` in `dotnet_validation/include_paths.py` to add more spec families (e.g. `read_write_concern`, `change-streams`) as they're validated. Build note: the driver's `MongoDB.Driver.Encryption` project verifies a downloaded libmongocrypt with **gpg** at build time, so `gpg` (and network for the libmongocrypt download) are build prerequisites even though CSFLE itself is out of scope.
 
 > **Rust-server follow-up — RESOLVED (Rust 0.5.3-beta.73).** The 0.5.4b8/b9
@@ -6954,6 +6969,10 @@ are the probes' own numbers.
   (`max_time_expiry.py` 0 of 11); a multi-field filter riding one
   single-field index, and a sort under an unindexed filter walking the sort
   index (mongod's two plans).
+- [x] **Round 2:** `writeConcernError` carries mongod's `errInfo` and sits
+  before `ok`, and an unknown `w` tag writes then reports 79; `drop` answers
+  the real `nIndexesWas` in mongod's field order; document-validation
+  failures explain every broken rule (`validation_error_details.py` 0 of 71).
 - [x] **Probe harness:** three probes ran their embedded server into a
   `WT_PANIC` at exit (the store was deleted under a live connection) --
   `_servers.probe_server()` now stops it first.
@@ -6974,6 +6993,9 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
   `test_index_math_fuzz` draws around both, with the reason written in.
 - [ ] `$bucketAuto` refuses a decimal groupBy with a granularity, and answers
   doubles for `POWERSOF2`.
+- [ ] write-concern errors carry no `errInfo`, and an unknown `w` tag is a
+  pre-flight refusal.
+- [ ] `$jsonSchema` validation failures report only `{operatorName: "$jsonSchema"}`.
 - [ ] decimal `$pow` is `exp(e * ln b)` at 34 digits; correctly rounded matches
   mongod on 130 of 183 finite pairs, that method on 56.
 
@@ -9767,7 +9789,10 @@ manylinux + Windows wheels contain `secantusd-rs`(`.exe`) under
   timeseries `_id` uniqueness FIXED (suffixed doc keys; the one surviving
   E11000 is gone) — the 2026-06-12 E11000 triage is fully closed. The
   remaining ShowExpandedEvents / disambiguatedPaths introspection failures
-  are separate unimplemented features. (`clusteredIndex` introspection is
+  are separate unimplemented features. (STALE -- measured 2026-09-30: the Rust
+  server answers `showExpandedEvents` change streams event-for-event like
+  8.2.11 -- createIndexes / dropIndexes / modify / create / rename / drop, and
+  `disambiguatedPaths` on the update.) (`clusteredIndex` introspection is
   DONE in 0.5.3-beta.49 — `create` validates+stores it, `listCollections`
   surfaces `options.clusteredIndex` and omits `idIndex`, `listIndexes`
   reports the single `clustered: true` entry; mirrors commands.py. Closes the

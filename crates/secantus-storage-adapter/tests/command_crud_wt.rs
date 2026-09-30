@@ -100,7 +100,8 @@ fn insert_rejects_validator_violation() {
         assert_eq!(info.get_i32("failingDocumentId").unwrap(), 1);
         let details = info.get_document("details").unwrap();
         assert_eq!(details.get_str("operatorName").unwrap(), "$exists");
-        assert_eq!(details.get_str("reason").unwrap(), "field was missing");
+        // mongod 8.2.11's wording for a failed `$exists: true` (2026-09-30).
+        assert_eq!(details.get_str("reason").unwrap(), "path does not exist");
     });
 }
 

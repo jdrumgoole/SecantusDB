@@ -55,6 +55,7 @@ pub mod storage;
 pub mod topstats;
 pub mod transactions;
 mod util;
+mod validation_errors;
 
 use std::sync::{Arc, Mutex};
 
@@ -920,7 +921,9 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
                     let mut reply = CommandError::new(
                         code,
                         failpoints::fail_code_name(code),
-                        "Failing command due to 'failCommand' failpoint",
+                        // mongod 8.2.11's wording, measured 2026-09-30; libmongoc's
+                        // `/crud/prose_test_9` asserts on it ("due to" failed it).
+                        "Failing command via 'failCommand' failpoint",
                     )
                     .into_reply();
                     // `failGetMoreAfterCursorCheckout` is injected inside the
