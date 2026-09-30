@@ -49,3 +49,6 @@ SELECT '1' IS JSON OBJECT
 SELECT json_scalar(1)
 SELECT JSON_OBJECT('a' VALUE 1)
 SELECT merge_action()
+# --- range_agg / range_intersect_agg over multiranges (15)
+SELECT range_agg(m)::text FROM (VALUES (int4multirange(int4range(1,2))), (int4multirange(int4range(4,6)))) v(m)
+SELECT range_intersect_agg(m)::text FROM (VALUES (int4multirange(int4range(1,5))), (int4multirange(int4range(3,9)))) v(m)

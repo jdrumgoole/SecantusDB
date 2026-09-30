@@ -172,6 +172,15 @@ pub(crate) fn compute(item: &AggItem, rows: &[Document]) -> PgWireResult<Bson> {
                 format!("{{ {} }}", parts.join(", "))
             }))
         }
+        AggFunc::RangeAgg | AggFunc::RangeIntersectAgg => {
+            let ty = item.source_type.as_deref().unwrap_or_default();
+            let out = if item.func == AggFunc::RangeAgg {
+                secantus_pgplan::range_ops::range_agg(&non_null, ty)
+            } else {
+                secantus_pgplan::range_ops::range_intersect_agg(&non_null, ty)
+            };
+            out.map_err(|e| crate::PgHandler::err(&e))
+        }
         AggFunc::BitAnd | AggFunc::BitOr => {
             let ints: Vec<i64> = non_null
                 .iter()

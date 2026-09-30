@@ -1300,6 +1300,9 @@ pub enum AggFunc {
     HypDenseRank,
     HypPercentRank,
     HypCumeDist,
+    /// `range_agg` (a multirange of the union) and `range_intersect_agg`.
+    RangeAgg,
+    RangeIntersectAgg,
     /// `bit_and` / `bit_or` over integers.
     BitAnd,
     BitOr,
@@ -9475,6 +9478,8 @@ fn aggregate_func(name: &str, within_group: bool) -> Option<(AggFunc, usize)> {
         "regr_r2" => (AggFunc::RegrR2, 2),
         "bit_and" => (AggFunc::BitAnd, 1),
         "bit_or" => (AggFunc::BitOr, 1),
+        "range_agg" => (AggFunc::RangeAgg, 1),
+        "range_intersect_agg" => (AggFunc::RangeIntersectAgg, 1),
         _ => return None,
     })
 }
@@ -9645,6 +9650,16 @@ fn plan_aggregate_item(
         item.source_type2 = ty2;
         item.expr2 = expr2;
     }
+    if matches!(func, AggFunc::RangeAgg | AggFunc::RangeIntersectAgg)
+        && !item.source_type.as_deref().is_some_and(|t| {
+            range::is_range_type(t) || range::is_multirange_type(t)
+        })
+    {
+        return Err(Error::UndefinedFunction(format!(
+            "function {name}({}) does not exist",
+            display_type(item.source_type.as_deref().unwrap_or("unknown"))
+        )));
+    }
     if matches!(func, AggFunc::BitAnd | AggFunc::BitOr)
         && !matches!(
             item.source_type.as_deref(),
@@ -9793,6 +9808,15 @@ pub fn aggregate_item_type(item: &AggItem) -> String {
         AggFunc::JsonAgg | AggFunc::JsonObjectAgg => "json".to_string(),
         AggFunc::JsonbAgg | AggFunc::JsonbObjectAgg => "jsonb".to_string(),
         AggFunc::RegrCount | AggFunc::HypRank | AggFunc::HypDenseRank => "int8".to_string(),
+        AggFunc::RangeAgg => {
+            let ty = item.source_type.clone().unwrap_or_default();
+            if range::is_multirange_type(&ty) {
+                ty
+            } else {
+                range::multirange_name_for(&ty)
+            }
+        }
+        AggFunc::RangeIntersectAgg => item.source_type.clone().unwrap_or_default(),
         AggFunc::Corr
         | AggFunc::CovarPop
         | AggFunc::CovarSamp

@@ -292,6 +292,46 @@ fn as_multi(s: &Side) -> Option<(Vec<Range>, String)> {
     }
 }
 
+/// `range_agg(r)`: the union of the non-NULL ranges (or multiranges) as a
+/// multirange; NULL over no rows.
+pub fn range_agg(values: &[Bson], ty: &str) -> Result<Bson> {
+    if values.is_empty() {
+        return Ok(Bson::Null);
+    }
+    let mut members = Vec::new();
+    let mut member_type = ty.to_string();
+    for v in values {
+        if let Some((m, t)) = as_multi(&side(v, ty)?) {
+            members.extend(m);
+            member_type = t;
+        }
+    }
+    let norm = range::normalise_multirange(members, &member_type)?;
+    Ok(Bson::String(range::render_multirange(&norm)))
+}
+
+/// `range_intersect_agg(r)`: the intersection of the non-NULL ranges (a
+/// range) or multiranges (a multirange); NULL over no rows.
+pub fn range_intersect_agg(values: &[Bson], ty: &str) -> Result<Bson> {
+    let Some((first, rest)) = values.split_first() else {
+        return Ok(Bson::Null);
+    };
+    if range::is_range_type(ty) {
+        let mut acc = range::from_text(&crate::render_value_text(first), ty)?;
+        for v in rest {
+            acc = intersect(&acc, &range::from_text(&crate::render_value_text(v), ty)?, ty)?;
+        }
+        return Ok(Bson::String(range::render(&acc)));
+    }
+    let mut acc = first.clone();
+    for v in rest {
+        acc = binary("*", &acc, v, ty, ty).unwrap_or_else(|| {
+            Err(Error::Unsupported(format!("range_intersect_agg over {ty}")))
+        })?;
+    }
+    Ok(acc)
+}
+
 /// Evaluate `op` when either operand is (statically) a range or multirange.
 /// `None` when this is not a range operator.
 pub fn binary(op: &str, lhs: &Bson, rhs: &Bson, lt: &str, rt: &str) -> Option<Result<Bson>> {
