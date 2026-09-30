@@ -7400,33 +7400,83 @@ fn srf_from_clause(from: &pg_query::protobuf::Node, params: &[Bson]) -> Result<O
     let Some(N::RangeFunction(rf)) = from.node.as_ref() else {
         return Ok(None);
     };
-    if rf.is_rowsfrom && rf.functions.len() > 1 {
-        return Err(Error::Unsupported(
-            "ROWS FROM with several functions".into(),
-        ));
-    }
-    // The nesting is a list of lists; the call is the first leaf.
-    let call = rf
+    // Each entry is a list of (call, column definition list).
+    let calls: Vec<pg_query::protobuf::FuncCall> = rf
         .functions
         .iter()
-        .flat_map(|f| match f.node.as_ref() {
-            Some(N::List(l)) => l.items.clone(),
-            _ => vec![f.clone()],
+        .filter_map(|f| {
+            let first = match f.node.as_ref() {
+                Some(N::List(l)) => l.items.first().cloned(),
+                _ => Some(f.clone()),
+            }?;
+            match first.node {
+                Some(N::FuncCall(f)) => Some(*f),
+                _ => None,
+            }
         })
-        .find_map(|n| match n.node.as_ref() {
-            Some(N::FuncCall(f)) => Some(f.clone()),
-            _ => None,
-        });
-    let Some(call) = call else {
+        .collect();
+    let Some(call) = calls.first().cloned() else {
         return Ok(None);
     };
     let name = func_name(&call).unwrap_or_default();
-    let record_rows = json_record_rows(&name, &call, &rf.coldeflist, params)?;
-    let Some((names, types, rows)) = (match record_rows {
-        Some(r) => Some(r),
-        None => srf_rows(&name, &call, params)?,
-    }) else {
-        return Ok(None);
+    let (names, types, rows) = if calls.len() > 1 {
+        // `ROWS FROM (f, g)`: each function's rows side by side, the longest
+        // deciding the count and the shorter padded with NULL -- also what
+        // several set-returning calls in one select list mean.
+        let mut names = Vec::new();
+        let mut types = Vec::new();
+        let mut parts: Vec<Vec<Vec<Bson>>> = Vec::new();
+        for c in &calls {
+            let n = func_name(c).unwrap_or_default();
+            let Some((cn, ct, rows)) = (match json_record_rows(&n, c, &[], params)? {
+                Some(r) => Some(r),
+                None => match srf_rows(&n, c, params)? {
+                    Some(r) => Some(r),
+                    None => integer_series_rows(&n, c, params)?,
+                },
+            }) else {
+                return Err(Error::Unsupported(format!("{n}() in ROWS FROM")));
+            };
+            names.extend(cn);
+            types.extend(ct.clone());
+            parts.push(
+                rows.into_iter()
+                    .map(|r| {
+                        let mut r = r;
+                        r.resize(ct.len(), Bson::Null);
+                        r
+                    })
+                    .collect(),
+            );
+        }
+        let widths: Vec<usize> = calls
+            .iter()
+            .zip(&parts)
+            .map(|(_, p)| p.first().map_or(0, Vec::len))
+            .collect();
+        let depth = parts.iter().map(Vec::len).max().unwrap_or(0);
+        let mut rows = Vec::with_capacity(depth);
+        for i in 0..depth {
+            let mut row = Vec::with_capacity(names.len());
+            for (p, part) in parts.iter().enumerate() {
+                match part.get(i) {
+                    Some(cells) => row.extend(cells.iter().cloned()),
+                    None => row.extend(std::iter::repeat_n(Bson::Null, widths[p].max(1))),
+                }
+            }
+            row.resize(names.len(), Bson::Null);
+            rows.push(row);
+        }
+        (names, types, rows)
+    } else {
+        let record_rows = json_record_rows(&name, &call, &rf.coldeflist, params)?;
+        let Some(out) = (match record_rows {
+            Some(r) => Some(r),
+            None => srf_rows(&name, &call, params)?,
+        }) else {
+            return Ok(None);
+        };
+        out
     };
     // `AS t(a, b)` renames positionally; `AS t` names the table, and for a
     // single-column function the column takes that name too -- which is what
@@ -7595,6 +7645,55 @@ fn json_record_rows(
         cols.iter().map(|(_, t)| t.clone()).collect(),
         rows,
     )))
+}
+
+/// An integer `generate_series(start, stop [, step])` as rows -- the lazy
+/// `Series` source is for the function on its own; beside others in a
+/// `ROWS FROM` its rows are materialised like theirs.
+fn integer_series_rows(
+    name: &str,
+    call: &pg_query::protobuf::FuncCall,
+    params: &[Bson],
+) -> Result<Option<SrfRows>> {
+    if name != "generate_series" || !matches!(call.args.len(), 2 | 3) {
+        return Ok(None);
+    }
+    let vals = call
+        .args
+        .iter()
+        .map(|a| const_value(a, params))
+        .collect::<Result<Vec<_>>>()?;
+    let wide = vals.iter().any(|v| matches!(v, Bson::Int64(_)));
+    let ty = if wide { "int8" } else { "int4" };
+    if vals.contains(&Bson::Null) {
+        return Ok(Some((vec![name.into()], vec![ty.into()], Vec::new())));
+    }
+    let int = |v: &Bson| -> Result<i64> {
+        match v {
+            Bson::Int32(n) => Ok(i64::from(*n)),
+            Bson::Int64(n) => Ok(*n),
+            _ => Err(Error::Unsupported("this generate_series argument".into())),
+        }
+    };
+    let step = match vals.get(2) {
+        Some(v) => int(v)?,
+        None => 1,
+    };
+    if step == 0 {
+        return Err(Error::InvalidParameter("step size cannot equal zero".into()));
+    }
+    let series = Series {
+        start: int(&vals[0])?,
+        stop: int(&vals[1])?,
+        step,
+        column: name.into(),
+    };
+    let rows = series
+        .values()
+        .into_iter()
+        .map(|v| vec![if wide { Bson::Int64(v) } else { Bson::Int32(v as i32) }])
+        .collect();
+    Ok(Some((vec![name.into()], vec![ty.into()], rows)))
 }
 
 /// What a set-returning function yields: the output column names, their
@@ -7976,6 +8075,10 @@ fn series_from_clause(from: &pg_query::protobuf::Node, params: &[Bson]) -> Resul
     let Some(N::RangeFunction(rf)) = from.node.as_ref() else {
         return Ok(None);
     };
+    // `ROWS FROM (generate_series(...), ...)` is several functions' rows.
+    if rf.functions.len() > 1 {
+        return Ok(None);
+    }
     // The nesting is a list of lists; the call is the first leaf.
     let call = rf
         .functions
@@ -11123,7 +11226,7 @@ fn resolve_sublinks_in_from(
     // subqueries they mean first, so the subqueries THAT introduces
     // (`ARRAY(SELECT f(...))`) are resolved with the rest.
     if let Some(N::RangeFunction(rf)) = item.node.as_ref() {
-        if rf.ordinality || rf.functions.len() > 1 {
+        if rf.ordinality {
             item.node = Some(rowsfrom::as_subselect(rf)?);
         }
     }

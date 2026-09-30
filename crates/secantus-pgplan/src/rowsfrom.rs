@@ -1,17 +1,12 @@
-//! `FROM f(...) WITH ORDINALITY` and `FROM ROWS FROM (f(...), g(...))`, as
-//! the subqueries they mean.
+//! `FROM f(...) WITH ORDINALITY`, as the subquery it means: a `bigint`
+//! column numbering the function's rows from 1 in the order it produced
+//! them, which is `row_number() OVER ()` over the function as a FROM item.
+//! (`ROWS FROM (f, g)` itself -- several functions side by side, the shorter
+//! padded with NULL -- is materialised by `srf_from_clause`.)
 //!
-//! * `WITH ORDINALITY` adds a `bigint` column numbering the function's rows
-//!   from 1 in the order it produced them: `row_number() OVER ()` over the
-//!   function as a FROM item.
-//! * `ROWS FROM` runs several functions side by side, the shorter ones padded
-//!   with NULL: exactly what a multi-argument `unnest` does to arrays, so each
-//!   function becomes `ARRAY(SELECT f(...))` and the arrays are unnested
-//!   together.
-//!
-//! Before this rewrite both forms reached the single-function path, which
-//! silently kept the FIRST function and dropped the ordinality column -- a
-//! wrong answer rather than an error. Measured against PostgreSQL 14.
+//! Before this rewrite `WITH ORDINALITY` reached the single-function path,
+//! which silently dropped the ordinality column -- a wrong answer rather than
+//! an error. Measured against PostgreSQL 14.
 
 use super::*;
 
@@ -39,7 +34,7 @@ fn rewrite_item(item: &mut pg_query::protobuf::Node) -> Result<bool> {
             }
             Ok(changed)
         }
-        Some(N::RangeFunction(rf)) if rf.ordinality || rf.functions.len() > 1 => {
+        Some(N::RangeFunction(rf)) if rf.ordinality => {
             let rewritten = as_subselect(rf)?;
             item.node = Some(rewritten);
             Ok(true)
@@ -77,8 +72,7 @@ pub(crate) fn as_subselect(rf: &pg_query::protobuf::RangeFunction) -> Result<N> 
     let rows = if let [only] = calls.as_slice() {
         format!("SELECT * FROM {only}")
     } else {
-        let arrays: Vec<String> = calls.iter().map(|c| format!("ARRAY(SELECT {c})")).collect();
-        format!("SELECT * FROM unnest({})", arrays.join(", "))
+        format!("SELECT * FROM ROWS FROM ({}) AS __rows", calls.join(", "))
     };
     let sql = if rf.ordinality {
         format!("SELECT s.*, row_number() OVER () AS ordinality FROM ({rows}) AS s")
