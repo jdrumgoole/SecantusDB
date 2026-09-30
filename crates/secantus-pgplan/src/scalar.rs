@@ -1623,13 +1623,27 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         "pg_size_pretty" => size_pretty(&args[0]),
         "pg_size_bytes" => size_bytes(&crate::value_text(&args[0])),
         "pg_column_size" => Ok(column_size(&args[0])),
+        // A PROCEDURE is not callable in an expression.
+        _ if crate::correlated::is_user_procedure(name, args.len()) => Err(Error::Sqlstate(
+            "42809",
+            format!(
+                "{name}({}) is a procedure",
+                args.iter()
+                    .map(|a| match a {
+                        Bson::String(_) | Bson::Null => "unknown".to_string(),
+                        other => crate::display_type(crate::inferred_type(other)),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )),
         // PostgreSQL names the argument types it could not match; a
         // constant string argument is an untyped literal, `unknown`.
         _ => Err(Error::Unsupported(format!(
             "function {name}({})",
             args.iter()
                 .map(|a| match a {
-                    Bson::String(_) => "unknown".to_string(),
+                    Bson::String(_) | Bson::Null => "unknown".to_string(),
                     other => crate::display_type(crate::inferred_type(other)),
                 })
                 .collect::<Vec<_>>()

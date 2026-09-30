@@ -57,7 +57,7 @@ pub mod rule_rewrite;
 pub mod ruleutils;
 pub mod trgm;
 pub mod user_casts;
-pub use correlated::set_user_functions;
+pub use correlated::{is_user_procedure, set_user_functions, set_user_procedures};
 pub use correlated::{
     with_correlated_runner, with_function_hook, with_sequence_hook, FnResult, UserFn,
 };
@@ -273,6 +273,9 @@ impl Error {
                 if m.starts_with("function ") && m.ends_with(") does not exist") =>
             {
                 Some("No function matches the given name and argument types. You might need to add explicit type casts.")
+            }
+            Error::Sqlstate("42809", m) if m.ends_with(" is a procedure") => {
+                Some("To call a procedure, use CALL.")
             }
             // A PREFIX operator (`- oid`) has one argument, and its hint says so.
             Error::UndefinedFunction(m)
@@ -603,13 +606,24 @@ pub enum Statement {
         arg_types: Vec<String>,
         if_exists: bool,
     },
-    /// `DROP FUNCTION [IF EXISTS] name[(args)] [CASCADE]`.
+    /// `DROP FUNCTION | PROCEDURE | ROUTINE [IF EXISTS] name[(args)]
+    /// [CASCADE]`.
     DropFunction {
         name: String,
         /// `None` when the signature was left off (`DROP FUNCTION f`).
         arg_types: Option<Vec<String>>,
         if_exists: bool,
         cascade: bool,
+        /// `function`, `procedure` or `routine` (either).
+        kind: String,
+    },
+    /// `CALL name(args)`: the arguments evaluated (a placeholder for each
+    /// OUT parameter included), with the types they were written as.
+    Call {
+        name: String,
+        args: Vec<Bson>,
+        arg_types: Vec<String>,
+        location: i32,
     },
     /// `CREATE SCHEMA [IF NOT EXISTS] <name>`.
     CreateSchema {
@@ -2453,7 +2467,8 @@ fn disc(n: &N) -> String {
                 .iter()
                 .map(|a| match a.node.as_ref() {
                     Some(N::AConst(c))
-                        if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) =>
+                        if c.isnull
+                            || matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) =>
                     {
                         "unknown".to_string()
                     }
@@ -3326,6 +3341,7 @@ fn plan_node(
             collation::plan_create(&d)
         }
         N::CreateFunctionStmt(f) => plan_create_function(&f),
+        N::CallStmt(c) => plan_call(&c, params),
         N::CreateCastStmt(c) => user_casts::plan_create(&c),
         N::RuleStmt(r) => plan_create_rule(&r),
         N::CreateEventTrigStmt(c) => event_triggers::plan_create(&c),
@@ -4166,6 +4182,34 @@ fn plan_create_trigger(t: &pg_query::protobuf::CreateTrigStmt) -> Result<Stateme
         transition_new,
         transition_old,
     }))
+}
+
+/// `CALL name(args)`.
+fn plan_call(c: &pg_query::protobuf::CallStmt, params: &[Bson]) -> Result<Statement> {
+    let f = c
+        .funccall
+        .as_ref()
+        .ok_or_else(|| Error::Parse("CALL without a procedure".into()))?;
+    let name = func_name(f).ok_or_else(|| Error::Parse("CALL without a name".into()))?;
+    let mut args = Vec::with_capacity(f.args.len());
+    let mut arg_types = Vec::with_capacity(f.args.len());
+    for a in &f.args {
+        let v = const_value(a, params)?;
+        let untyped = matches!(a.node.as_ref(), Some(N::AConst(k))
+            if k.isnull || matches!(k.val, Some(pg_query::protobuf::a_const::Val::Sval(_))));
+        arg_types.push(if untyped {
+            "unknown".to_string()
+        } else {
+            static_type(a, &v)
+        });
+        args.push(v);
+    }
+    Ok(Statement::Call {
+        name,
+        args,
+        arg_types,
+        location: f.location,
+    })
 }
 
 fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<Statement> {
@@ -20871,6 +20915,11 @@ pub fn record_field_types(v: &Bson) -> Option<Vec<String>> {
 }
 
 /// The field list inside a record value, or `None` for any other value.
+/// A record value's fields, in order (`None` for anything else).
+pub fn record_values(v: &Bson) -> Option<&Vec<Bson>> {
+    record_fields(v)
+}
+
 pub(crate) fn record_fields(v: &Bson) -> Option<&Vec<Bson>> {
     match v {
         Bson::Document(d)
@@ -27543,7 +27592,13 @@ fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
     }
     // `DROP FUNCTION`: each object is an ObjectWithArgs -- the name parts plus
     // the declared argument types, which PostgreSQL needs to pick one overload.
-    if ObjectType::try_from(d.remove_type) == Ok(ObjectType::ObjectFunction) {
+    let routine_kind = match ObjectType::try_from(d.remove_type) {
+        Ok(ObjectType::ObjectFunction) => Some("function"),
+        Ok(ObjectType::ObjectProcedure) => Some("procedure"),
+        Ok(ObjectType::ObjectRoutine) => Some("routine"),
+        _ => None,
+    };
+    if let Some(kind) = routine_kind {
         // `DROP FUNCTION f(), g()`: one drop per function, run in order.
         if d.objects.len() > 1 {
             let mut drops = Vec::with_capacity(d.objects.len());
@@ -27552,7 +27607,12 @@ fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
                 one.objects = vec![o.clone()];
                 drops.push(plan_drop(&one)?);
             }
-            return Ok(Statement::Sequence("DROP FUNCTION", drops));
+            let tag = match kind {
+                "procedure" => "DROP PROCEDURE",
+                "routine" => "DROP ROUTINE",
+                _ => "DROP FUNCTION",
+            };
+            return Ok(Statement::Sequence(tag, drops));
         }
         let Some(N::ObjectWithArgs(o)) = d.objects.first().and_then(|o| o.node.as_ref()) else {
             return Err(Error::Unsupported("this DROP FUNCTION target".into()));
@@ -27584,6 +27644,7 @@ fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
             arg_types,
             if_exists: d.missing_ok,
             cascade: DropBehavior::try_from(d.behavior) == Ok(DropBehavior::DropCascade),
+            kind: kind.to_string(),
         });
     }
     // `DROP TRIGGER name ON table`: the object is the list

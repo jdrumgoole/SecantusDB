@@ -363,6 +363,7 @@ impl PgHandler {
                         trigger: Some(data),
                         returns_set: false,
                         out_params: &[],
+                        procedure: false,
                     },
                     &PlHost { h: self },
                 )

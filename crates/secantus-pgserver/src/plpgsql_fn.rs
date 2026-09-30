@@ -120,6 +120,8 @@ pub struct Invocation<'a> {
     /// returns their values when control reaches its end (or a bare RETURN)
     /// -- the one value, or a record of several.
     pub out_params: &'a [String],
+    /// A procedure: reaching the end without RETURN is how it finishes.
+    pub procedure: bool,
 }
 
 /// What a call produced.
@@ -166,6 +168,7 @@ struct Interp<'a> {
     trigger: Option<TriggerData>,
     returns_set: bool,
     out_params: Vec<String>,
+    procedure: bool,
     set_rows: Vec<Vec<Bson>>,
     row_count: u64,
     found_no: Option<usize>,
@@ -500,6 +503,7 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
         trigger: inv.trigger.clone(),
         returns_set: inv.returns_set,
         out_params: inv.out_params.to_vec(),
+        procedure: inv.procedure,
         set_rows: Vec::new(),
         row_count: 0,
         found_no,
@@ -543,6 +547,8 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
     match interp.stmt(&action)? {
         Flow::Return(o) => Ok(o),
         _ if interp.returns_set => Ok(Outcome::Rows(std::mem::take(&mut interp.set_rows))),
+        // A procedure simply ends; its OUT / INOUT values are its result.
+        _ if interp.procedure => Ok(Outcome::Value(interp.out_value().unwrap_or(Bson::Null))),
         // A function with OUT parameters returns them at its end.
         _ if interp.trigger.is_none() && !interp.out_params.is_empty() => {
             Ok(Outcome::Value(interp.out_value().unwrap_or(Bson::Null)))

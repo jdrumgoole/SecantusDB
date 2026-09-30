@@ -26,6 +26,7 @@ mod partition;
 mod pg_type_facts;
 mod plpgsql_do;
 mod plpgsql_fn;
+mod procedures;
 mod rules;
 mod server;
 mod table_locks;
@@ -2073,6 +2074,8 @@ struct UserFunction {
     /// The catalog key: `name/nargs`, or for a second overload at the same
     /// arity `name/nargs/types`.
     key: String,
+    /// `CREATE PROCEDURE`.
+    is_procedure: bool,
 }
 
 /// What a type name resolves to when a function declares it.
@@ -2657,11 +2660,23 @@ impl PgHandler {
         secantus_pgplan::user_agg::set_user_aggregates(self.user_aggregates().unwrap_or_default());
         // User-defined functions, so the planner can type and route a call.
         secantus_pgplan::rule_rewrite::set_rules(self.enabled_rules());
+        let routines = self.user_function_docs().unwrap_or_default();
+        let is_procedure = |d: &&Document| d.get_bool("is_procedure").unwrap_or(false);
         secantus_pgplan::set_user_functions(
-            self.user_function_docs()
-                .unwrap_or_default()
+            routines
                 .iter()
+                .filter(|d| !is_procedure(d))
                 .map(user_fn_of)
+                .collect(),
+        );
+        secantus_pgplan::set_user_procedures(
+            routines
+                .iter()
+                .filter(is_procedure)
+                .filter_map(|d| {
+                    let inputs = d.get_array("param_types").map_or(0, |a| a.len());
+                    d.get_str("name").ok().map(|n| (n.to_string(), inputs))
+                })
                 .collect(),
         );
         // Enums resolve by name too. A `public` enum resolves by its bare name
@@ -5053,6 +5068,7 @@ impl PgHandler {
                 return_type: d.get_str("return_tag").unwrap_or_default().to_string(),
                 language: d.get_str("language").unwrap_or_default().to_string(),
                 key: d.get_str("_id").unwrap_or_default().to_string(),
+                is_procedure: d.get_bool("is_procedure").unwrap_or(false),
             });
         }
         out.sort();
@@ -5283,11 +5299,8 @@ impl PgHandler {
         // arity (different argument types) takes `name/nargs/types`, which the
         // Python server does not know to look for.
         let base_key = format!("{}/{nargs}", def.name);
-        let new_types: Vec<String> = if def.is_procedure {
-            def.all_params.iter().map(|(_, t, _)| t.clone()).collect()
-        } else {
-            def.params.iter().map(|(_, t)| t.clone()).collect()
-        };
+        // A routine's identity is its INPUT types (OUT ones excluded).
+        let new_types: Vec<String> = def.params.iter().map(|(_, t)| t.clone()).collect();
         let same_arity: Vec<UserFunction> = self
             .functions()?
             .into_iter()
@@ -5365,12 +5378,7 @@ impl PgHandler {
                     "ERROR".into(),
                     "42723".into(),
                     format!(
-                        "{} \"{}\" already exists with same argument types",
-                        if def.is_procedure {
-                            "procedure"
-                        } else {
-                            "function"
-                        },
+                        "function \"{}\" already exists with same argument types",
                         def.name
                     ),
                 ))));
@@ -5923,6 +5931,7 @@ impl PgHandler {
                         trigger: None,
                         returns_set: u.returns_set,
                         out_params: &u.columns.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+                        procedure: false,
                     },
                     &host,
                 )
@@ -12586,6 +12595,21 @@ impl PgHandler {
                 .and_then(|r| r.split_once('('))
                 .filter(|(n, _)| !secantus_pgplan::is_catalog_function(n))
             {
+                // A PROCEDURE the call's arguments fit: 42809.
+                let nargs = if args.trim().is_empty() {
+                    0
+                } else {
+                    args.split(", ").count()
+                };
+                if secantus_pgplan::is_user_procedure(name, nargs) {
+                    let mut info = ErrorInfo::new(
+                        "ERROR".into(),
+                        "42809".into(),
+                        format!("{name}({args}) is a procedure"),
+                    );
+                    info.hint = Some("To call a procedure, use CALL.".into());
+                    return PgWireError::UserError(Box::new(info));
+                }
                 let mut info = ErrorInfo::new(
                     "ERROR".into(),
                     "42883".into(),
@@ -16296,7 +16320,7 @@ impl PgHandler {
             .collect::<String>()
             .to_ascii_lowercase();
         match word.as_str() {
-            "do" => true,
+            "do" | "call" => true,
             "insert" | "update" | "delete" | "select" | "with" | "values" | "truncate" => {
                 self.trigger_docs().is_ok_and(|t| !t.is_empty())
                     || self.user_function_docs().is_ok_and(|f| !f.is_empty())
@@ -21018,13 +21042,30 @@ impl PgHandler {
                 arg_types,
                 if_exists,
             } => self.drop_aggregate(&name, &arg_types, if_exists),
+            Statement::Call {
+                name,
+                args,
+                arg_types,
+                ..
+            } => self.call_procedure(&name, args, arg_types),
             Statement::DropFunction {
                 name,
                 arg_types,
                 if_exists,
                 cascade,
+                kind,
             } => {
-                let tag = || Ok(vec![Response::Execution(Tag::new("DROP FUNCTION"))]);
+                let tag_text = match kind.as_str() {
+                    "procedure" => "DROP PROCEDURE",
+                    "routine" => "DROP ROUTINE",
+                    _ => "DROP FUNCTION",
+                };
+                let noun = if kind == "procedure" {
+                    "procedure"
+                } else {
+                    "function"
+                };
+                let tag = || Ok(vec![Response::Execution(Tag::new(tag_text))]);
                 // An aggregate is dropped with DROP AGGREGATE (42809).
                 if !self.functions()?.iter().any(|f| f.name == name)
                     && self.user_aggregates()?.iter().any(|a| {
@@ -21081,12 +21122,13 @@ impl PgHandler {
                                 return_type: String::new(),
                                 language: String::new(),
                                 key: String::new(),
+                                is_procedure: false,
                             };
                             let sig = self.function_signature(&probe);
                             if if_exists {
                                 self.notice(
                                     "00000",
-                                    format!("function {sig} does not exist, skipping"),
+                                    format!("{noun} {sig} does not exist, skipping"),
                                     None,
                                 );
                                 return tag();
@@ -21094,7 +21136,7 @@ impl PgHandler {
                             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                                 "ERROR".into(),
                                 "42883".into(),
-                                format!("function {sig} does not exist"),
+                                format!("{noun} {sig} does not exist"),
                             ))));
                         };
                         (*f).clone()
@@ -21104,7 +21146,7 @@ impl PgHandler {
                             if if_exists {
                                 self.notice(
                                     "00000",
-                                    format!("function {name}() does not exist, skipping"),
+                                    format!("{noun} {name}() does not exist, skipping"),
                                     None,
                                 );
                                 return tag();
@@ -21112,7 +21154,7 @@ impl PgHandler {
                             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                                 "ERROR".into(),
                                 "42883".into(),
-                                format!("could not find a function named \"{name}\""),
+                                format!("could not find a {noun} named \"{name}\""),
                             ))));
                         }
                         [one] => (*one).clone(),
@@ -21132,6 +21174,16 @@ impl PgHandler {
                     },
                 };
                 let sig = self.function_signature(&target);
+                // DROP FUNCTION names a function and DROP PROCEDURE a
+                // procedure (DROP ROUTINE either): 42809 across them.
+                if (kind == "procedure" && !target.is_procedure)
+                    || (kind == "function" && target.is_procedure)
+                {
+                    return Err(Self::user_error(
+                        "42809",
+                        format!("{sig} is not a {}", kind),
+                    ));
+                }
                 self.drop_function_casts(&target, cascade)?;
                 // A DEFINED base type depends on its I/O functions; and the
                 // type's other I/O function depends on the type, so it goes
