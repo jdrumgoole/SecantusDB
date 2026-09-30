@@ -27,10 +27,18 @@ pub mod escape_strings;
 pub mod formatting;
 pub mod fts;
 pub mod geo;
+pub mod geom;
 pub mod geometry;
 pub mod hstore;
+pub mod instead_of;
 pub mod joins;
+pub mod merge;
 pub mod partitions;
+pub mod pgcrypto;
+pub mod privileges;
+pub mod regobj;
+pub mod rls;
+mod rowsfrom;
 pub use correlated::set_user_functions;
 pub use correlated::{
     with_correlated_runner, with_function_hook, with_sequence_hook, FnResult, UserFn,
@@ -302,6 +310,14 @@ pub enum Statement {
     /// a NO-OP on an existing table rather than the `42P07` a bare one gets.
     CreateTable(TableDef, bool),
     Insert(Insert),
+    /// `SET CONSTRAINTS { ALL | name, ... } { DEFERRED | IMMEDIATE }`; an
+    /// empty `names` is ALL.
+    SetConstraints {
+        names: Vec<String>,
+        deferred: bool,
+    },
+    /// A write to a view handed to its `INSTEAD OF` triggers.
+    InsteadOf(instead_of::InsteadOf),
     /// `ALTER TABLE <t> <action>, ...`. PostgreSQL applies the actions in
     /// order and the whole statement is one transaction, so a later one
     /// failing undoes the earlier ones.
@@ -622,6 +638,45 @@ pub enum Statement {
     /// `DEALLOCATE <name>`: the wire layer drops that one prepared statement,
     /// answering 26000 when no statement of the name exists.
     Deallocate(String),
+    /// `VACUUM` / `ANALYZE` / `CHECKPOINT` / `REINDEX`: nothing to do in this
+    /// storage, but PostgreSQL's validation still applies -- the relations
+    /// and columns must exist (`indexes` names ones that must be indexes),
+    /// and `outside_block` ones refuse a transaction block (25001).
+    Maintenance {
+        command: String,
+        tables: Vec<(String, Vec<String>)>,
+        indexes: Vec<String>,
+        outside_block: bool,
+    },
+    /// `CLUSTER [table [USING index]]`: the table's rows rewritten in the
+    /// index's order, which an unordered scan then shows.
+    Cluster {
+        table: Option<String>,
+        index: Option<String>,
+    },
+    /// `LOCK [TABLE] t, ... [IN mode MODE] [NOWAIT]`, `mode` being
+    /// PostgreSQL's lock-mode number (1 ACCESS SHARE .. 8 ACCESS EXCLUSIVE).
+    LockTable {
+        tables: Vec<String>,
+        mode: i32,
+        nowait: bool,
+    },
+    /// `MERGE INTO t USING s ON c WHEN ...` (see `merge`).
+    Merge(merge::Merge),
+    /// `PREPARE name [(types)] AS query`: the query, planned again on each
+    /// `EXECUTE` with the arguments as its parameters. `text` is the
+    /// statement as `pg_prepared_statements` shows it.
+    SqlPrepare {
+        name: String,
+        arg_types: Vec<String>,
+        query: String,
+        text: String,
+    },
+    /// `EXECUTE name [(args)]`, the arguments already evaluated.
+    SqlExecute {
+        name: String,
+        args: Vec<Bson>,
+    },
     /// `NOTIFY channel [, payload]`: queued for the transaction, delivered
     /// to every backend LISTENing on the channel when it commits.
     Notify {
@@ -950,6 +1005,9 @@ pub enum AlterTableAction {
     /// `VALIDATE CONSTRAINT name`: every constraint here is validated when
     /// added, so only its existence is checked.
     ValidateConstraint(String),
+    /// `CLUSTER ON index` / `SET WITHOUT CLUSTER` (`None`): the index a bare
+    /// `CLUSTER t` reorders by, which `pg_index.indisclustered` reports.
+    ClusterOn(Option<String>),
     /// `ATTACH PARTITION name FOR VALUES ...`: the bound as
     /// [`partitions::bound_document`] records it.
     AttachPartition {
@@ -987,8 +1045,24 @@ pub enum AlterTableAction {
         column: String,
         pg_type: String,
         typmod: i32,
+        /// `USING <expr>`: the new value computed from the row, as SQL
+        /// (planned by the executor over the table), instead of a cast.
+        using: Option<String>,
     },
     AddCheck(CheckConstraint),
+    /// `ADD [CONSTRAINT n] UNIQUE (...)`: checked against the rows already
+    /// there, then enforced by a unique index.
+    AddUnique(UniqueConstraint),
+    /// `ADD [CONSTRAINT n] PRIMARY KEY (...)`: the columns become NOT NULL
+    /// and the key -- every stored row re-keyed by them, as a CREATE TABLE
+    /// key would have stored it.
+    AddPrimaryKey {
+        name: String,
+        columns: Vec<String>,
+    },
+    /// `ADD [CONSTRAINT n] FOREIGN KEY ...`: checked against the rows already
+    /// there, then enforced on every write.
+    AddForeignKey(ForeignKey),
     DropConstraint {
         name: String,
         if_exists: bool,
@@ -1245,6 +1319,9 @@ pub enum AggFunc {
     HypDenseRank,
     HypPercentRank,
     HypCumeDist,
+    /// `range_agg` (a multirange of the union) and `range_intersect_agg`.
+    RangeAgg,
+    RangeIntersectAgg,
     /// `bit_and` / `bit_or` over integers.
     BitAnd,
     BitOr,
@@ -1571,6 +1648,12 @@ pub struct RoleOptions {
     pub connection_limit: Option<i64>,
     pub password: Option<Option<String>>,
     pub valid_until: Option<String>,
+    /// `IN ROLE r, ...`: the new role becomes a member of each.
+    pub in_roles: Vec<String>,
+    /// `ROLE m, ...`: each becomes a member of the new role.
+    pub members: Vec<String>,
+    /// `ADMIN m, ...`: members with the admin option.
+    pub admins: Vec<String>,
 }
 
 /// The role option list of a CREATE / ALTER ROLE: `DefElem`s named by
@@ -1636,10 +1719,29 @@ fn role_options(options: &[pg_query::protobuf::Node]) -> Result<RoleOptions> {
                     _ => Some(-1),
                 }
             }
-            // Membership and SYSID options: parsed by PostgreSQL, but this
-            // server has no role graph to record them in.
-            "addroleto" | "rolemembers" | "adminmembers" | "sysid" | "encrypted"
-            | "unencrypted" => {
+            // Membership: the same role graph `GRANT role TO role` records.
+            "addroleto" | "rolemembers" | "adminmembers" => {
+                let names: Vec<String> = match d.arg.as_ref().and_then(|a| a.node.as_ref()) {
+                    Some(N::List(l)) => l
+                        .items
+                        .iter()
+                        .filter_map(|n| match n.node.as_ref() {
+                            Some(N::RoleSpec(r)) => Some(role_spec_name(r)),
+                            _ => None,
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                match d.defname.as_str() {
+                    "addroleto" => out.in_roles.extend(names),
+                    "rolemembers" => out.members.extend(names),
+                    _ => out.admins.extend(names),
+                }
+            }
+            // PostgreSQL ignores SYSID (with a NOTICE the executor does not
+            // send); UNENCRYPTED passwords are gone since 10.
+            "sysid" => {}
+            "encrypted" | "unencrypted" => {
                 return Err(Error::Unsupported(format!("the {} role option", d.defname)))
             }
             other => {
@@ -1776,9 +1878,12 @@ pub enum ConstCol {
     /// `pg_cancel_backend(pid)` -- cancel that backend's running statement.
     /// Same argument shapes as `TerminateBackend`.
     CancelBackend(Box<ConstCol>),
-    /// `current_user` / `session_user` / `user` / `current_role` -- the role
-    /// the client connected as, which only the server's session knows.
+    /// `session_user` -- the role the client connected as, which only the
+    /// server's session knows.
     SessionUser,
+    /// `current_user` / `user` / `current_role` -- the EFFECTIVE role, which
+    /// `SET ROLE` changes.
+    CurrentUser,
     /// `current_database()` / `current_catalog` -- the database the client
     /// connected to, which only the server's session knows.
     CurrentDatabase,
@@ -1895,6 +2000,8 @@ pub struct CreateIndex {
     /// `INCLUDE (...)` columns: metadata only, reported by the catalog.
     pub include: Vec<String>,
     pub unique: bool,
+    /// `UNIQUE NULLS NOT DISTINCT`: NULL keys collide.
+    pub nulls_not_distinct: bool,
     pub if_not_exists: bool,
     /// `WHERE pred` lowered to a filter over stored fields.
     pub predicate: Option<Document>,
@@ -1926,6 +2033,8 @@ pub struct UserFunctionDef {
     pub body: String,
     pub language: String,
     pub volatility: String,
+    /// The last parameter is `VARIADIC`.
+    pub variadic: bool,
 }
 
 /// A trigger as CREATE TRIGGER declares it.
@@ -1947,6 +2056,13 @@ pub struct TriggerDef {
     pub args: Vec<String>,
     /// The `WHEN (...)` condition, deparsed.
     pub when: Option<String>,
+    /// `CREATE CONSTRAINT TRIGGER`, and its deferral.
+    pub constraint: bool,
+    pub deferrable: bool,
+    pub initially_deferred: bool,
+    /// `REFERENCING NEW TABLE AS n` / `OLD TABLE AS o`.
+    pub transition_new: Option<String>,
+    pub transition_old: Option<String>,
 }
 
 /// `EXPLAIN`'s options, as PostgreSQL defaults them.
@@ -2116,6 +2232,34 @@ fn array_subscript(
     if value == Bson::Null {
         return Ok(Bson::Null);
     }
+    // `point[0]`, `lseg[1]`, `box[0]`: a geometric value's coordinates or
+    // corner points.
+    if let Some(g) = geom::from_bson(&value) {
+        if let [one] = indirection {
+            if let Some(N::AIndices(ix)) = one.node.as_ref() {
+                if !ix.is_slice {
+                    let i = ix
+                        .uidx
+                        .as_deref()
+                        .map(|n| const_value(n, params))
+                        .transpose()?
+                        .and_then(|v| match v {
+                            Bson::Int32(i) => Some(i64::from(i)),
+                            Bson::Int64(i) => Some(i),
+                            _ => None,
+                        })
+                        .unwrap_or(-1);
+                    if let Some(v) = geom::subscript(&g, i) {
+                        return Ok(v);
+                    }
+                }
+            }
+        }
+    }
+    // An array whose lower bound is not 1 is subscripted relative to it: each
+    // dimension's subscripts move by that dimension's bound.
+    let lower = arrays::lower_bounds(&value);
+    let value = arrays::strip(&value);
     if !matches!(value, Bson::Array(_)) {
         return Err(Error::DatatypeMismatch(format!(
             "cannot subscript type {} because it does not support subscripting",
@@ -2127,24 +2271,25 @@ fn array_subscript(
         static_type(arg, &value).as_str(),
         "int2vector" | "oidvector"
     ));
-    let bound = |n: Option<&pg_query::protobuf::Node>| -> Result<Option<i64>> {
+    let bound = |n: Option<&pg_query::protobuf::Node>, dim: usize| -> Result<Option<i64>> {
         let Some(n) = n else { return Ok(None) };
+        let rebase = 1 - lower.get(dim).copied().unwrap_or(1);
         Ok(match const_value(n, params)? {
             Bson::Null => None,
-            v => Some(arrays::subscript_index(&v)? + shift),
+            v => Some(arrays::subscript_index(&v)? + shift + rebase),
         })
     };
     let mut subs = Vec::with_capacity(indirection.len());
     let mut any_slice = false;
-    for ind in indirection {
+    for (dim, ind) in indirection.iter().enumerate() {
         let Some(N::AIndices(idx)) = ind.node.as_ref() else {
             return Err(Error::Unsupported("this field selection".into()));
         };
         any_slice |= idx.is_slice;
         subs.push((
             idx.is_slice,
-            bound(idx.lidx.as_deref())?,
-            bound(idx.uidx.as_deref())?,
+            bound(idx.lidx.as_deref(), dim)?,
+            bound(idx.uidx.as_deref(), dim)?,
         ));
     }
     if !any_slice {
@@ -2423,6 +2568,9 @@ pub fn plan_with_params(
     let mut node = pg_query::protobuf::Node {
         node: Some(parse_one(sql)?),
     };
+    if let Some(st) = instead_of::plan(&node)? {
+        return Ok(st);
+    }
     // Without a runner the subqueries this produces are refused, which is
     // the point: an `UPDATE ... FROM` must never plan as a plain UPDATE.
     rewrite_dml_from(&mut node, lookup)?;
@@ -2450,10 +2598,17 @@ pub fn plan_with_subqueries(
     let mut node = pg_query::protobuf::Node {
         node: Some(parse_one(sql)?),
     };
+    if let Some(e) = sql_json_absent(&node, sql, params) {
+        return Err(e);
+    }
     // The resolved values are appended to the bound parameters as `$N`, so
     // the list the statement is finally planned with is longer than the one
     // the client bound.
+    if let Some(st) = instead_of::plan(&node)? {
+        return Ok(st);
+    }
     let mut params = params.to_vec();
+    materialize_dml_ctes(&mut node, lookup, &mut params, run)?;
     rewrite_dml_from(&mut node, lookup)?;
     materialize_recursive_ctes(&mut node, lookup, &mut params, run)?;
     resolve_sublinks(&mut node, lookup, &mut params, run)?;
@@ -2722,6 +2877,123 @@ fn plan_node(
         }
         N::ClosePortalStmt(c) => Ok(Statement::CloseCursor(c.portalname.clone())),
         // `DEALLOCATE ALL` carries no name; `DEALLOCATE x` names one.
+        N::MergeStmt(m) => merge::plan(&m, lookup, params),
+        N::VacuumStmt(v) => {
+            let command = if v.is_vacuumcmd { "VACUUM" } else { "ANALYZE" };
+            let analyze = !v.is_vacuumcmd
+                || v.options.iter().any(
+                    |o| matches!(o.node.as_ref(), Some(N::DefElem(d)) if d.defname == "analyze"),
+                );
+            let mut tables = Vec::new();
+            for r in &v.rels {
+                let Some(N::VacuumRelation(vr)) = r.node.as_ref() else {
+                    continue;
+                };
+                let columns: Vec<String> = vr
+                    .va_cols
+                    .iter()
+                    .filter_map(|c| match c.node.as_ref() {
+                        Some(N::String(s)) => Some(s.sval.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if !columns.is_empty() && !analyze {
+                    return Err(Error::FeatureNotSupported(
+                        "ANALYZE option must be specified when a column list is provided".into(),
+                    ));
+                }
+                let name = vr
+                    .relation
+                    .as_ref()
+                    .map(|r| r.relname.clone())
+                    .unwrap_or_default();
+                tables.push((name, columns));
+            }
+            Ok(Statement::Maintenance {
+                command: command.into(),
+                tables,
+                indexes: Vec::new(),
+                outside_block: v.is_vacuumcmd,
+            })
+        }
+        N::CheckPointStmt(_) => Ok(Statement::Maintenance {
+            command: "CHECKPOINT".into(),
+            tables: Vec::new(),
+            indexes: Vec::new(),
+            outside_block: false,
+        }),
+        N::ReindexStmt(r) => {
+            use pg_query::protobuf::ReindexObjectType as R;
+            let rel = r
+                .relation
+                .as_ref()
+                .map(|r| r.relname.clone())
+                .unwrap_or_default();
+            let (tables, indexes, whole) = match R::try_from(r.kind) {
+                Ok(R::ReindexObjectTable) => (vec![(rel, Vec::new())], Vec::new(), None),
+                Ok(R::ReindexObjectIndex) => (Vec::new(), vec![rel], None),
+                Ok(R::ReindexObjectDatabase) => (Vec::new(), Vec::new(), Some("DATABASE")),
+                Ok(R::ReindexObjectSystem) => (Vec::new(), Vec::new(), Some("SYSTEM")),
+                _ => (Vec::new(), Vec::new(), Some("SCHEMA")),
+            };
+            Ok(Statement::Maintenance {
+                command: match whole {
+                    Some(w) => format!("REINDEX {w}"),
+                    None => "REINDEX".into(),
+                },
+                tables,
+                indexes,
+                outside_block: whole.is_some(),
+            })
+        }
+        N::ClusterStmt(c) => Ok(Statement::Cluster {
+            table: c.relation.as_ref().map(|r| r.relname.clone()),
+            index: Some(c.indexname.clone()).filter(|i| !i.is_empty()),
+        }),
+        N::LockStmt(l) => Ok(Statement::LockTable {
+            tables: l
+                .relations
+                .iter()
+                .filter_map(|r| match r.node.as_ref() {
+                    Some(N::RangeVar(r)) => Some(r.relname.clone()),
+                    _ => None,
+                })
+                .collect(),
+            mode: l.mode,
+            nowait: l.nowait,
+        }),
+        N::PrepareStmt(p) => {
+            let query = p
+                .query
+                .as_deref()
+                .ok_or_else(|| Error::Parse("PREPARE with no statement".into()))?;
+            let arg_types = p
+                .argtypes
+                .iter()
+                .map(|t| match t.node.as_ref() {
+                    Some(N::TypeName(t)) => Ok(type_name_of(t)),
+                    _ => Err(Error::Parse("a PREPARE parameter type".into())),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Statement::SqlPrepare {
+                name: p.name.clone(),
+                arg_types,
+                query: query.deparse().map_err(|e| Error::Parse(e.to_string()))?,
+                text: pg_query::protobuf::Node {
+                    node: Some(N::PrepareStmt(p.clone())),
+                }
+                .deparse()
+                .map_err(|e| Error::Parse(e.to_string()))?,
+            })
+        }
+        N::ExecuteStmt(e) => Ok(Statement::SqlExecute {
+            name: e.name.clone(),
+            args: e
+                .params
+                .iter()
+                .map(|a| const_value(a, params))
+                .collect::<Result<Vec<_>>>()?,
+        }),
         N::DeallocateStmt(d) if d.name.is_empty() => Ok(Statement::DeallocateAll),
         N::DeallocateStmt(d) => Ok(Statement::Deallocate(d.name.clone())),
         // LISTEN / UNLISTEN / NOTIFY: the parser has already folded the
@@ -2760,6 +3032,17 @@ fn plan_node(
             })
         }
         N::VariableSetStmt(v) => plan_set(&v),
+        N::ConstraintsSetStmt(c) => Ok(Statement::SetConstraints {
+            names: c
+                .constraints
+                .iter()
+                .filter_map(|n| match n.node.as_ref() {
+                    Some(N::RangeVar(r)) => Some(r.relname.clone()),
+                    _ => None,
+                })
+                .collect(),
+            deferred: c.deferred,
+        }),
         N::TransactionStmt(t) => {
             // Named enum, not the wire integer -- twice bitten already.
             match TransactionStmtKind::try_from(t.kind) {
@@ -2883,21 +3166,27 @@ fn plan_define_type(d: &pg_query::protobuf::DefineStmt) -> Result<Statement> {
 /// `CREATE TRIGGER`. `timing` and `events` are PostgreSQL's `TRIGGER_TYPE_*`
 /// bits: BEFORE 2, INSERT 4, DELETE 8, UPDATE 16, TRUNCATE 32, INSTEAD 64.
 fn plan_create_trigger(t: &pg_query::protobuf::CreateTrigStmt) -> Result<Statement> {
-    if t.isconstraint {
-        return Err(Error::Unsupported("CREATE CONSTRAINT TRIGGER".into()));
-    }
-    if !t.transition_rels.is_empty() {
-        return Err(Error::Unsupported(
-            "a trigger's REFERENCING transition tables".into(),
-        ));
-    }
     let timing = match t.timing {
         2 => "BEFORE",
         64 => "INSTEAD OF",
         _ => "AFTER",
     };
     if timing == "INSTEAD OF" {
-        return Err(Error::Unsupported("INSTEAD OF triggers".into()));
+        if !t.row {
+            return Err(Error::FeatureNotSupported(
+                "INSTEAD OF triggers must be FOR EACH ROW".into(),
+            ));
+        }
+        if t.when_clause.is_some() {
+            return Err(Error::FeatureNotSupported(
+                "INSTEAD OF triggers cannot have WHEN conditions".into(),
+            ));
+        }
+        if !t.columns.is_empty() {
+            return Err(Error::FeatureNotSupported(
+                "INSTEAD OF triggers cannot have column lists".into(),
+            ));
+        }
     }
     let mut events = Vec::new();
     for (bit, name) in [
@@ -2914,6 +3203,62 @@ fn plan_create_trigger(t: &pg_query::protobuf::CreateTrigStmt) -> Result<Stateme
         return Err(Error::FeatureNotSupported(
             "TRUNCATE FOR EACH ROW triggers are not supported".into(),
         ));
+    }
+    // `REFERENCING NEW TABLE AS n OLD TABLE AS o`, with PostgreSQL 14's
+    // refusals in its order.
+    let mut transition_new = None;
+    let mut transition_old = None;
+    for r in &t.transition_rels {
+        let Some(N::TriggerTransition(tr)) = r.node.as_ref() else {
+            continue;
+        };
+        if !tr.is_table {
+            return Err(Error::FeatureNotSupported(
+                "ROW variable naming in the REFERENCING clause is not supported".into(),
+            ));
+        }
+        if timing != "AFTER" {
+            return Err(Error::Sqlstate(
+                "42P17",
+                "transition table name can only be specified for an AFTER trigger".into(),
+            ));
+        }
+        if tr.is_new {
+            if !events.iter().any(|e| e == "INSERT" || e == "UPDATE") {
+                return Err(Error::Sqlstate(
+                    "42P17",
+                    "NEW TABLE can only be specified for an INSERT or UPDATE trigger".into(),
+                ));
+            }
+            transition_new = Some(tr.name.clone());
+        } else {
+            if !events.iter().any(|e| e == "DELETE" || e == "UPDATE") {
+                return Err(Error::Sqlstate(
+                    "42P17",
+                    "OLD TABLE can only be specified for a DELETE or UPDATE trigger".into(),
+                ));
+            }
+            transition_old = Some(tr.name.clone());
+        }
+    }
+    if transition_new.is_some() || transition_old.is_some() {
+        if events.len() > 1 {
+            return Err(Error::FeatureNotSupported(
+                "transition tables cannot be specified for triggers with more than one event"
+                    .into(),
+            ));
+        }
+        if !t.columns.is_empty() {
+            return Err(Error::FeatureNotSupported(
+                "transition tables cannot be specified for triggers with column lists".into(),
+            ));
+        }
+        if transition_new.is_some() && transition_new == transition_old {
+            return Err(Error::Sqlstate(
+                "42P17",
+                "OLD TABLE name and NEW TABLE name cannot be the same".into(),
+            ));
+        }
     }
     let table = t
         .relation
@@ -2961,6 +3306,11 @@ fn plan_create_trigger(t: &pg_query::protobuf::CreateTrigStmt) -> Result<Stateme
         function,
         args: strings(&t.args),
         when,
+        constraint: t.isconstraint,
+        deferrable: t.deferrable,
+        initially_deferred: t.initdeferred,
+        transition_new,
+        transition_old,
     }))
 }
 
@@ -3009,15 +3359,33 @@ fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<St
             _ => {}
         }
     }
-    let language = language.unwrap_or_default().to_ascii_lowercase();
-    if matches!(language.as_str(), "sql" | "plpgsql") {
-        if f.sql_body.is_some() {
-            return Err(Error::Unsupported(
-                "a SQL-standard function body (BEGIN ATOMIC / RETURN)".into(),
+    // A SQL-standard body (`RETURN expr` / `BEGIN ATOMIC ... END`) is a
+    // LANGUAGE sql function whose body arrives parsed rather than as a
+    // string: it is rendered back to the statements a string body would hold.
+    if let Some(sql_body) = f.sql_body.as_deref() {
+        if body.is_some() {
+            return Err(Error::Sqlstate(
+                "42P13",
+                "duplicate function body specified".into(),
             ));
         }
+        if !language
+            .as_deref()
+            .is_none_or(|l| l.eq_ignore_ascii_case("sql"))
+        {
+            return Err(Error::Sqlstate(
+                "42P13",
+                "inline SQL function body only valid for language SQL".into(),
+            ));
+        }
+        language = Some("sql".into());
+        body = Some(sql_standard_body(sql_body)?);
+    }
+    let language = language.unwrap_or_default().to_ascii_lowercase();
+    if matches!(language.as_str(), "sql" | "plpgsql") {
         let mut params = Vec::new();
         let mut columns = Vec::new();
+        let mut variadic = false;
         for p in &f.parameters {
             let Some(N::FunctionParameter(fp)) = p.node.as_ref() else {
                 continue;
@@ -3031,7 +3399,14 @@ fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<St
                     columns.push((fp.name.clone(), ty));
                 }
                 Ok(M::FuncParamVariadic) => {
-                    return Err(Error::Unsupported("a VARIADIC parameter".into()))
+                    if !ty.ends_with("[]") {
+                        return Err(Error::Sqlstate(
+                            "42P13",
+                            "VARIADIC parameter must be an array".into(),
+                        ));
+                    }
+                    variadic = true;
+                    params.push((fp.name.clone(), ty));
                 }
                 _ => params.push((fp.name.clone(), ty)),
             }
@@ -3048,6 +3423,7 @@ fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<St
             body,
             language,
             volatility,
+            variadic,
         }));
     }
     if !language.eq_ignore_ascii_case("internal") {
@@ -3064,6 +3440,37 @@ fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<St
         body,
         volatility,
     })
+}
+
+/// A SQL-standard function body as the statements of a string body: `RETURN
+/// expr` is `SELECT expr`, and `BEGIN ATOMIC s1; s2; END` is `s1; s2`.
+fn sql_standard_body(node: &pg_query::protobuf::Node) -> Result<String> {
+    fn collect(node: &pg_query::protobuf::Node, out: &mut Vec<String>) -> Result<()> {
+        match node.node.as_ref() {
+            Some(N::List(l)) => {
+                for item in &l.items {
+                    collect(item, out)?;
+                }
+                Ok(())
+            }
+            Some(N::ReturnStmt(r)) => {
+                let value = r
+                    .returnval
+                    .as_deref()
+                    .ok_or_else(|| Error::Parse("RETURN without a value".into()))?;
+                out.push(format!("SELECT {}", deparse_expr(value)?));
+                Ok(())
+            }
+            Some(_) => {
+                out.push(node.deparse().map_err(|e| Error::Parse(e.to_string()))?);
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+    let mut stmts = Vec::new();
+    collect(node, &mut stmts)?;
+    Ok(stmts.join("; "))
 }
 
 /// Resolve a `serial` pseudo-type to its underlying integer type.
@@ -3300,10 +3707,18 @@ fn plan_alter_table(
         let Some(N::AlterTableCmd(cmd)) = cmd.node.as_ref() else {
             return Err(Error::Unsupported("this ALTER TABLE action".into()));
         };
-        let action = plan_alter_action(cmd, &table, &def, params)?;
+        // `ADD COLUMN c int UNIQUE REFERENCES t` is the column, then each of
+        // its constraints added as a table constraint over it.
+        let (cmd, constraints) = split_added_column_constraints(cmd);
+        let action = plan_alter_action(&cmd, &table, &def, params)?;
         // Apply it to the working def so the NEXT action sees it.
         apply_alter_to_def(&mut def, &action);
         actions.push(action);
+        for extra in &constraints {
+            let action = plan_alter_action(extra, &table, &def, params)?;
+            apply_alter_to_def(&mut def, &action);
+            actions.push(action);
+        }
     }
     Ok(Statement::AlterTable {
         table,
@@ -3451,6 +3866,8 @@ fn plan_alter_action(
                 .unwrap_or_default(),
         )),
         Ok(AT::AtValidateConstraint) => Ok(AlterTableAction::ValidateConstraint(cmd.name.clone())),
+        Ok(AT::AtClusterOn) => Ok(AlterTableAction::ClusterOn(Some(cmd.name.clone()))),
+        Ok(AT::AtDropCluster) => Ok(AlterTableAction::ClusterOn(None)),
         Ok(AT::AtDropNotNull) => Ok(AlterTableAction::SetNotNull {
             column: cmd.name.clone(),
             not_null: false,
@@ -3459,11 +3876,9 @@ fn plan_alter_action(
             let Some(N::ColumnDef(cd)) = cmd.def.as_ref().and_then(|d| d.node.as_ref()) else {
                 return Err(Error::Parse("ALTER COLUMN TYPE without a type".into()));
             };
-            // `USING <expr>` rewrites the value rather than casting it, which
-            // is a different conversion; refused rather than silently cast.
-            if cd.raw_default.is_some() {
-                return Err(Error::Unsupported("ALTER COLUMN TYPE ... USING".into()));
-            }
+            // `USING <expr>` computes the new value from the row instead of
+            // casting the old one, so the automatic-cast rule does not apply.
+            let using = cd.raw_default.as_deref().map(deparse_expr).transpose()?;
             let ty = cd
                 .type_name
                 .as_ref()
@@ -3480,7 +3895,7 @@ fn plan_alter_action(
             // `text -> int` succeed on a table whose values were all digits
             // and answer `22P02` on one whose values were not -- neither of
             // which is what PostgreSQL does.
-            if !alter_type_is_automatic(&current.pg_type, &ty) {
+            if using.is_none() && !alter_type_is_automatic(&current.pg_type, &ty) {
                 return Err(Error::DatatypeMismatch(format!(
                     "column \"{}\" cannot be cast automatically to type {}",
                     cmd.name,
@@ -3491,19 +3906,49 @@ fn plan_alter_action(
                 column: cmd.name.clone(),
                 pg_type: ty,
                 typmod: cd.type_name.as_ref().map(declared_typmod).unwrap_or(-1),
+                using,
             })
         }
         Ok(AT::AtAddConstraint) => {
             let Some(N::Constraint(k)) = cmd.def.as_ref().and_then(|d| d.node.as_ref()) else {
                 return Err(Error::Parse("ADD CONSTRAINT without a constraint".into()));
             };
-            if CT::try_from(k.contype) != Ok(CT::ConstrCheck) {
-                // UNIQUE / PRIMARY KEY / FOREIGN KEY added after the fact each
-                // need an index built over the rows already there, which is
-                // the `CREATE INDEX` work rather than this.
-                return Err(Error::Unsupported(
-                    "ALTER TABLE ADD CONSTRAINT of this kind".into(),
-                ));
+            match CT::try_from(k.contype) {
+                Ok(CT::ConstrCheck) => {}
+                Ok(CT::ConstrUnique) => {
+                    let cols = string_list(&k.keys);
+                    let name = if k.conname.is_empty() {
+                        format!("{table}_{}_key", cols.join("_"))
+                    } else {
+                        k.conname.clone()
+                    };
+                    let mut uq = UniqueConstraint::new(&name, cols);
+                    uq.deferrable = k.deferrable;
+                    uq.initially_deferred = k.initdeferred;
+                    uq.nulls_not_distinct = k.nulls_not_distinct;
+                    return Ok(AlterTableAction::AddUnique(uq));
+                }
+                Ok(CT::ConstrPrimary) => {
+                    return Ok(AlterTableAction::AddPrimaryKey {
+                        name: if k.conname.is_empty() {
+                            format!("{table}_pkey")
+                        } else {
+                            k.conname.clone()
+                        },
+                        columns: string_list(&k.keys),
+                    });
+                }
+                Ok(CT::ConstrForeign) => {
+                    let cols = string_list(&k.fk_attrs);
+                    return Ok(AlterTableAction::AddForeignKey(foreign_key_of(
+                        k, table, cols,
+                    )?));
+                }
+                _ => {
+                    return Err(Error::Unsupported(
+                        "ALTER TABLE ADD CONSTRAINT of this kind".into(),
+                    ))
+                }
             }
             let raw = k
                 .raw_expr
@@ -3533,6 +3978,7 @@ fn plan_alter_action(
                 name,
                 expression,
                 comment: None,
+                not_valid: k.skip_validation,
             }))
         }
         Ok(AT::AtDropConstraint) => Ok(AlterTableAction::DropConstraint {
@@ -3576,6 +4022,55 @@ fn alter_action_word(t: pg_query::protobuf::AlterTableType) -> &'static str {
 /// sequence built over rows that already exist, and answering the statement
 /// without building it would leave the catalog claiming a constraint nothing
 /// enforces.
+/// An `ADD COLUMN` with its UNIQUE / PRIMARY KEY / REFERENCES / CHECK
+/// constraints taken off, and each as the `ADD CONSTRAINT` over the column it
+/// means -- which is also how PostgreSQL names them (`<t>_<c>_key`,
+/// `<t>_pkey`, `<t>_<c>_fkey`, `<t>_<c>_check`).
+fn split_added_column_constraints(
+    cmd: &pg_query::protobuf::AlterTableCmd,
+) -> (
+    pg_query::protobuf::AlterTableCmd,
+    Vec<pg_query::protobuf::AlterTableCmd>,
+) {
+    use pg_query::protobuf::{AlterTableType as AT, ConstrType as CT};
+    let mut main = cmd.clone();
+    if AT::try_from(cmd.subtype) != Ok(AT::AtAddColumn) {
+        return (main, Vec::new());
+    }
+    let Some(N::ColumnDef(cd)) = main.def.as_mut().and_then(|d| d.node.as_mut()) else {
+        return (main, Vec::new());
+    };
+    let column = cd.colname.clone();
+    let string = |v: &str| pg_query::protobuf::Node {
+        node: Some(N::String(pg_query::protobuf::String {
+            sval: v.to_string(),
+        })),
+    };
+    let mut extra = Vec::new();
+    cd.constraints.retain(|c| {
+        let Some(N::Constraint(k)) = c.node.as_ref() else {
+            return true;
+        };
+        let mut k = (**k).clone();
+        match CT::try_from(k.contype) {
+            Ok(CT::ConstrUnique) | Ok(CT::ConstrPrimary) => k.keys = vec![string(&column)],
+            Ok(CT::ConstrForeign) => k.fk_attrs = vec![string(&column)],
+            Ok(CT::ConstrCheck) => {}
+            _ => return true,
+        }
+        extra.push(pg_query::protobuf::AlterTableCmd {
+            subtype: AT::AtAddConstraint as i32,
+            def: Some(Box::new(pg_query::protobuf::Node {
+                node: Some(N::Constraint(Box::new(k))),
+            })),
+            behavior: cmd.behavior,
+            ..Default::default()
+        });
+        false
+    });
+    (main, extra)
+}
+
 fn plan_added_column(cd: &pg_query::protobuf::ColumnDef, params: &[Bson]) -> Result<Column> {
     use pg_query::protobuf::ConstrType as CT;
     let ty = cd.type_name.as_ref().map(type_name_of).unwrap_or_default();
@@ -3773,11 +4268,25 @@ fn default_value_or_expr(
 pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
     match action {
         // Nothing in the table's shape.
+        AlterTableAction::OwnerTo(role) => {
+            def.extra.insert("owner", role.clone());
+        }
+        AlterTableAction::ClusterOn(index) => match index {
+            Some(i) => {
+                def.extra.insert("clustered_index", i.clone());
+            }
+            None => {
+                def.extra.remove("clustered_index");
+            }
+        },
         AlterTableAction::RowSecurity { .. }
-        | AlterTableAction::OwnerTo(_)
         | AlterTableAction::AttachPartition { .. }
-        | AlterTableAction::DetachPartition(_)
-        | AlterTableAction::ValidateConstraint(_) => {}
+        | AlterTableAction::DetachPartition(_) => {}
+        AlterTableAction::ValidateConstraint(name) => {
+            for c in def.check_constraints.iter_mut().filter(|c| c.name == *name) {
+                c.not_valid = false;
+            }
+        }
         AlterTableAction::AddColumn { column, .. } => {
             if def.column(&column.name).is_none() {
                 def.columns.push(column.clone());
@@ -3815,6 +4324,7 @@ pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
             column,
             pg_type,
             typmod,
+            ..
         } => {
             if let Some(c) = def.columns.iter_mut().find(|c| c.name == *column) {
                 c.pg_type = pg_type.clone();
@@ -3825,6 +4335,20 @@ pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
             def.check_constraints.push(check.clone());
             def.check_constraints.sort_by(|a, b| a.name.cmp(&b.name));
         }
+        AlterTableAction::AddUnique(uq) => def.unique_constraints.push(uq.clone()),
+        AlterTableAction::AddPrimaryKey { columns, .. } => {
+            // The key is the document `_id`, as a CREATE TABLE key is: the
+            // value itself for one column, a subdocument of the key columns
+            // in TABLE-column order for several. The executor moves every
+            // stored row's values to match.
+            let composite = columns.len() > 1;
+            for c in def.columns.iter_mut().filter(|c| columns.contains(&c.name)) {
+                c.pk = true;
+                c.nullable = false;
+                c.field_override = composite.then(|| format!("_id.{}", c.name));
+            }
+        }
+        AlterTableAction::AddForeignKey(fk) => def.foreign_keys.push(fk.clone()),
         AlterTableAction::DropConstraint { name, .. } => {
             def.check_constraints.retain(|c| c.name != *name);
             def.unique_constraints.retain(|u| u.name != *name);
@@ -4221,9 +4745,6 @@ fn plan_create_index(
         }
     }
     let ordered = matches!(method.as_str(), "btree");
-    if i.nulls_not_distinct {
-        return Err(Error::Unsupported("UNIQUE NULLS NOT DISTINCT".into()));
-    }
     let mut columns = Vec::new();
     let mut key_sql = Vec::new();
     let mut expressions = Vec::new();
@@ -4388,6 +4909,7 @@ fn plan_create_index(
         columns,
         include,
         unique: i.unique,
+        nulls_not_distinct: i.nulls_not_distinct,
         if_not_exists: i.if_not_exists,
         predicate,
         predicate_sql,
@@ -4736,7 +5258,7 @@ pub fn is_view(name: &str) -> bool {
 /// expression and each side of a set operation are all planned through
 /// `plan_select` in their turn, which expands their own references.
 fn expand_views(s: &pg_query::protobuf::SelectStmt) -> Result<pg_query::protobuf::SelectStmt> {
-    if PLAN_VIEWS.with(|v| v.borrow().is_empty()) {
+    if PLAN_VIEWS.with(|v| v.borrow().is_empty()) && !rls::active() {
         return Ok(s.clone());
     }
     let mut out = s.clone();
@@ -4747,6 +5269,8 @@ fn expand_views(s: &pg_query::protobuf::SelectStmt) -> Result<pg_query::protobuf
 }
 
 fn expand_views_in_from(item: &mut pg_query::protobuf::Node, depth: usize) -> Result<()> {
+    // A table row-level security restricts reads as its filtered subquery.
+    rls::expand_from(item)?;
     match item.node.as_mut() {
         Some(N::RangeVar(r)) => {
             if !(r.schemaname.is_empty() || r.schemaname == "public") || !r.catalogname.is_empty() {
@@ -5123,7 +5647,9 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                             } else {
                                 k.conname.clone()
                             };
-                            uniques.push(UniqueConstraint::new(&name, vec![cd.colname.clone()]));
+                            let mut uq = UniqueConstraint::new(&name, vec![cd.colname.clone()]);
+                            uq.nulls_not_distinct = k.nulls_not_distinct;
+                            uniques.push(uq);
                             last_deferrable = Some(DeferTarget::Unique);
                         }
                         // `GENERATED ALWAYS AS IDENTITY` / `GENERATED BY
@@ -5178,6 +5704,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                     let mut uq = UniqueConstraint::new(&name, cols);
                     uq.deferrable = k.deferrable;
                     uq.initially_deferred = k.initdeferred;
+                    uq.nulls_not_distinct = k.nulls_not_distinct;
                     uniques.push(uq);
                 }
                 Ok(CT::ConstrPrimary) => table_pk = string_list(&k.keys),
@@ -5326,6 +5853,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
             name,
             expression,
             comment: None,
+            not_valid: false,
         });
     }
     // PostgreSQL evaluates CHECK constraints in name order.
@@ -6029,8 +6557,21 @@ fn is_boolean_type(t: &str) -> bool {
 /// Before this the server coerced the text through the column's parser, so
 /// the psycopg binary-format string that PostgreSQL rejects was stored.
 fn check_assignment_type(column: &Column, node: &pg_query::protobuf::Node) -> Result<()> {
-    let Some(from) = declared_expression_type(node) else {
-        return Ok(());
+    let from = match declared_expression_type(node) {
+        Some(t) => t,
+        // A function call or SQL value function has a known result type
+        // (`SET n = now()` is 42804 over an integer column); a value-derived
+        // `text` from one says nothing, so it is not held against it.
+        None => match node.node.as_ref() {
+            Some(N::FuncCall(_) | N::SqlvalueFunction(_)) => {
+                let t = static_type(node, &Bson::Null);
+                if t == "text" || t.is_empty() {
+                    return Ok(());
+                }
+                t
+            }
+            _ => return Ok(()),
+        },
     };
     assignable(column, &from, "expression")
 }
@@ -6997,33 +7538,83 @@ fn srf_from_clause(from: &pg_query::protobuf::Node, params: &[Bson]) -> Result<O
     let Some(N::RangeFunction(rf)) = from.node.as_ref() else {
         return Ok(None);
     };
-    if rf.is_rowsfrom && rf.functions.len() > 1 {
-        return Err(Error::Unsupported(
-            "ROWS FROM with several functions".into(),
-        ));
-    }
-    // The nesting is a list of lists; the call is the first leaf.
-    let call = rf
+    // Each entry is a list of (call, column definition list).
+    let calls: Vec<pg_query::protobuf::FuncCall> = rf
         .functions
         .iter()
-        .flat_map(|f| match f.node.as_ref() {
-            Some(N::List(l)) => l.items.clone(),
-            _ => vec![f.clone()],
+        .filter_map(|f| {
+            let first = match f.node.as_ref() {
+                Some(N::List(l)) => l.items.first().cloned(),
+                _ => Some(f.clone()),
+            }?;
+            match first.node {
+                Some(N::FuncCall(f)) => Some(*f),
+                _ => None,
+            }
         })
-        .find_map(|n| match n.node.as_ref() {
-            Some(N::FuncCall(f)) => Some(f.clone()),
-            _ => None,
-        });
-    let Some(call) = call else {
+        .collect();
+    let Some(call) = calls.first().cloned() else {
         return Ok(None);
     };
     let name = func_name(&call).unwrap_or_default();
-    let record_rows = json_record_rows(&name, &call, &rf.coldeflist, params)?;
-    let Some((names, types, rows)) = (match record_rows {
-        Some(r) => Some(r),
-        None => srf_rows(&name, &call, params)?,
-    }) else {
-        return Ok(None);
+    let (names, types, rows) = if calls.len() > 1 {
+        // `ROWS FROM (f, g)`: each function's rows side by side, the longest
+        // deciding the count and the shorter padded with NULL -- also what
+        // several set-returning calls in one select list mean.
+        let mut names = Vec::new();
+        let mut types = Vec::new();
+        let mut parts: Vec<Vec<Vec<Bson>>> = Vec::new();
+        for c in &calls {
+            let n = func_name(c).unwrap_or_default();
+            let Some((cn, ct, rows)) = (match json_record_rows(&n, c, &[], params)? {
+                Some(r) => Some(r),
+                None => match srf_rows(&n, c, params)? {
+                    Some(r) => Some(r),
+                    None => integer_series_rows(&n, c, params)?,
+                },
+            }) else {
+                return Err(Error::Unsupported(format!("{n}() in ROWS FROM")));
+            };
+            names.extend(cn);
+            types.extend(ct.clone());
+            parts.push(
+                rows.into_iter()
+                    .map(|r| {
+                        let mut r = r;
+                        r.resize(ct.len(), Bson::Null);
+                        r
+                    })
+                    .collect(),
+            );
+        }
+        let widths: Vec<usize> = calls
+            .iter()
+            .zip(&parts)
+            .map(|(_, p)| p.first().map_or(0, Vec::len))
+            .collect();
+        let depth = parts.iter().map(Vec::len).max().unwrap_or(0);
+        let mut rows = Vec::with_capacity(depth);
+        for i in 0..depth {
+            let mut row = Vec::with_capacity(names.len());
+            for (p, part) in parts.iter().enumerate() {
+                match part.get(i) {
+                    Some(cells) => row.extend(cells.iter().cloned()),
+                    None => row.extend(std::iter::repeat_n(Bson::Null, widths[p].max(1))),
+                }
+            }
+            row.resize(names.len(), Bson::Null);
+            rows.push(row);
+        }
+        (names, types, rows)
+    } else {
+        let record_rows = json_record_rows(&name, &call, &rf.coldeflist, params)?;
+        let Some(out) = (match record_rows {
+            Some(r) => Some(r),
+            None => srf_rows(&name, &call, params)?,
+        }) else {
+            return Ok(None);
+        };
+        out
     };
     // `AS t(a, b)` renames positionally; `AS t` names the table, and for a
     // single-column function the column takes that name too -- which is what
@@ -7062,6 +7653,7 @@ fn srf_from_clause(from: &pg_query::protobuf::Node, params: &[Bson]) -> Result<O
             .map(|(n, t)| Column::new(n, t, false))
             .collect(),
     );
+    distinct_fields(&mut def);
     def.name = alias.clone();
     Ok(Some(SubSource {
         alias,
@@ -7193,6 +7785,63 @@ fn json_record_rows(
     )))
 }
 
+/// An integer `generate_series(start, stop [, step])` as rows -- the lazy
+/// `Series` source is for the function on its own; beside others in a
+/// `ROWS FROM` its rows are materialised like theirs.
+fn integer_series_rows(
+    name: &str,
+    call: &pg_query::protobuf::FuncCall,
+    params: &[Bson],
+) -> Result<Option<SrfRows>> {
+    if name != "generate_series" || !matches!(call.args.len(), 2 | 3) {
+        return Ok(None);
+    }
+    let vals = call
+        .args
+        .iter()
+        .map(|a| const_value(a, params))
+        .collect::<Result<Vec<_>>>()?;
+    let wide = vals.iter().any(|v| matches!(v, Bson::Int64(_)));
+    let ty = if wide { "int8" } else { "int4" };
+    if vals.contains(&Bson::Null) {
+        return Ok(Some((vec![name.into()], vec![ty.into()], Vec::new())));
+    }
+    let int = |v: &Bson| -> Result<i64> {
+        match v {
+            Bson::Int32(n) => Ok(i64::from(*n)),
+            Bson::Int64(n) => Ok(*n),
+            _ => Err(Error::Unsupported("this generate_series argument".into())),
+        }
+    };
+    let step = match vals.get(2) {
+        Some(v) => int(v)?,
+        None => 1,
+    };
+    if step == 0 {
+        return Err(Error::InvalidParameter(
+            "step size cannot equal zero".into(),
+        ));
+    }
+    let series = Series {
+        start: int(&vals[0])?,
+        stop: int(&vals[1])?,
+        step,
+        column: name.into(),
+    };
+    let rows = series
+        .values()
+        .into_iter()
+        .map(|v| {
+            vec![if wide {
+                Bson::Int64(v)
+            } else {
+                Bson::Int32(v as i32)
+            }]
+        })
+        .collect();
+    Ok(Some((vec![name.into()], vec![ty.into()], rows)))
+}
+
 /// What a set-returning function yields: the output column names, their
 /// declared types, and the rows -- one `Vec<Bson>` per row, one cell per
 /// column.
@@ -7228,7 +7877,7 @@ fn srf_rows(
         }
     }
     // A user-defined set-returning function: the executor runs it.
-    if let Some(u) = correlated::user_function(name, call.args.len()).filter(|u| u.returns_set) {
+    if let Some(u) = correlated::user_function_for(name, &call.args).filter(|u| u.returns_set) {
         let a: Vec<Bson> = call
             .args
             .iter()
@@ -7419,8 +8068,9 @@ fn srf_rows(
             let (source, pattern) = (text(&a[0]), text(&a[1]));
             let flags = a.get(2).map(&text).unwrap_or_default();
             let re = regex::Regex::new(&format!(
-                "{}{pattern}",
-                if flags.contains('i') { "(?i)" } else { "" }
+                "{}{}",
+                if flags.contains('i') { "(?i)" } else { "" },
+                scalar::pg_regex_source(&pattern)
             ))
             .map_err(|_| {
                 Error::InvalidRegex(format!("invalid regular expression: \"{pattern}\""))
@@ -7479,7 +8129,7 @@ fn srf_rows(
                 let mut types = Vec::new();
                 let mut lists = Vec::new();
                 for a in &call.args {
-                    let value = const_value(a, params)?;
+                    let value = arrays::strip(&const_value(a, params)?);
                     let element = static_type(a, &value)
                         .strip_suffix("[]")
                         .map(str::to_owned)
@@ -7503,7 +8153,7 @@ fn srf_rows(
                     .collect();
                 return Ok(Some((columns, types, rows)));
             }
-            let value = const_value(&call.args[0], params)?;
+            let value = arrays::strip(&const_value(&call.args[0], params)?);
             let element = static_type(&call.args[0], &value)
                 .strip_suffix("[]")
                 .map(str::to_owned)
@@ -7519,16 +8169,20 @@ fn srf_rows(
         }
         "generate_subscripts" => {
             let a = args(2)?;
-            let dims = arrays::dim_lengths(&a[0]);
+            let lower = arrays::lower_bounds(&a[0]);
+            let dims = arrays::dim_lengths(&arrays::strip(&a[0]));
             let dim = match &a[1] {
                 Bson::Int32(i) => i64::from(*i),
                 Bson::Int64(i) => *i,
                 _ => return Ok(Some(one(Vec::new(), "int4"))),
             };
             let values = match usize::try_from(dim).ok().filter(|d| *d >= 1) {
-                Some(d) if d <= dims.len() => (1..=dims[d - 1])
-                    .map(|i| Bson::Int32(i32::try_from(i).unwrap_or(i32::MAX)))
-                    .collect(),
+                Some(d) if d <= dims.len() => {
+                    let lb = lower.get(d - 1).copied().unwrap_or(1);
+                    (0..dims[d - 1] as i64)
+                        .map(|i| Bson::Int32(i32::try_from(lb + i).unwrap_or(i32::MAX)))
+                        .collect()
+                }
                 _ => Vec::new(),
             };
             one(values, "int4")
@@ -7567,6 +8221,10 @@ fn series_from_clause(from: &pg_query::protobuf::Node, params: &[Bson]) -> Resul
     let Some(N::RangeFunction(rf)) = from.node.as_ref() else {
         return Ok(None);
     };
+    // `ROWS FROM (generate_series(...), ...)` is several functions' rows.
+    if rf.functions.len() > 1 {
+        return Ok(None);
+    }
     // The nesting is a list of lists; the call is the first leaf.
     let call = rf
         .functions
@@ -8602,6 +9260,13 @@ fn plan_table_targets(
                     && def.column(&column).is_some_and(|c| c.pg_type == "tsvector")
                 {
                     "tsvector_length".to_string()
+                } else if name == "length"
+                    && def
+                        .column(&column)
+                        .is_some_and(|c| matches!(c.pg_type.as_str(), "lseg" | "path"))
+                {
+                    // A segment's or a path's length is a float8.
+                    "geom_length".to_string()
                 } else {
                     name
                 };
@@ -9062,6 +9727,8 @@ fn aggregate_func(name: &str, within_group: bool) -> Option<(AggFunc, usize)> {
         "regr_r2" => (AggFunc::RegrR2, 2),
         "bit_and" => (AggFunc::BitAnd, 1),
         "bit_or" => (AggFunc::BitOr, 1),
+        "range_agg" => (AggFunc::RangeAgg, 1),
+        "range_intersect_agg" => (AggFunc::RangeIntersectAgg, 1),
         _ => return None,
     })
 }
@@ -9232,6 +9899,17 @@ fn plan_aggregate_item(
         item.source_type2 = ty2;
         item.expr2 = expr2;
     }
+    if matches!(func, AggFunc::RangeAgg | AggFunc::RangeIntersectAgg)
+        && !item
+            .source_type
+            .as_deref()
+            .is_some_and(|t| range::is_range_type(t) || range::is_multirange_type(t))
+    {
+        return Err(Error::UndefinedFunction(format!(
+            "function {name}({}) does not exist",
+            display_type(item.source_type.as_deref().unwrap_or("unknown"))
+        )));
+    }
     if matches!(func, AggFunc::BitAnd | AggFunc::BitOr)
         && !matches!(
             item.source_type.as_deref(),
@@ -9380,6 +10058,15 @@ pub fn aggregate_item_type(item: &AggItem) -> String {
         AggFunc::JsonAgg | AggFunc::JsonObjectAgg => "json".to_string(),
         AggFunc::JsonbAgg | AggFunc::JsonbObjectAgg => "jsonb".to_string(),
         AggFunc::RegrCount | AggFunc::HypRank | AggFunc::HypDenseRank => "int8".to_string(),
+        AggFunc::RangeAgg => {
+            let ty = item.source_type.clone().unwrap_or_default();
+            if range::is_multirange_type(&ty) {
+                ty
+            } else {
+                range::multirange_name_for(&ty)
+            }
+        }
+        AggFunc::RangeIntersectAgg => item.source_type.clone().unwrap_or_default(),
         AggFunc::Corr
         | AggFunc::CovarPop
         | AggFunc::CovarSamp
@@ -9788,6 +10475,128 @@ fn reads_relation(s: &pg_query::protobuf::SelectStmt, name: &str) -> bool {
 /// every one. The column names come from the CTE's own list or else the
 /// non-recursive term, and so do the types. Uses the executor, so a caller
 /// without one keeps the refusal in `inline_ctes`.
+/// A data-modifying WITH item (`WITH x AS (INSERT ... RETURNING ...)`) runs
+/// ONCE, here, through the executor, and its RETURNING rows stand in for it
+/// as VALUES -- so however often the query reads `x`, the write happened
+/// once. An `INSERT ... SELECT` that carries the WITH has it moved onto its
+/// SELECT first, where the CTEs are read.
+///
+/// PostgreSQL runs the main query on the snapshot from BEFORE the item's
+/// write; here the write has happened by the time it runs, so a main query
+/// that reads the item's own TABLE sees the change.
+fn materialize_dml_ctes(
+    node: &mut pg_query::protobuf::Node,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &mut Vec<Bson>,
+    run: SubqueryRunner<'_>,
+) -> Result<()> {
+    if let Some(N::InsertStmt(i)) = node.node.as_mut() {
+        if let (Some(with), Some(N::SelectStmt(sel))) = (
+            i.with_clause.clone(),
+            i.select_stmt.as_deref_mut().and_then(|n| n.node.as_mut()),
+        ) {
+            if sel.with_clause.is_none() {
+                sel.with_clause = Some(with);
+                i.with_clause = None;
+            }
+        }
+    }
+    let with = match node.node.as_mut() {
+        Some(N::SelectStmt(s)) => s.with_clause.as_mut(),
+        Some(N::InsertStmt(i)) => i
+            .select_stmt
+            .as_deref_mut()
+            .and_then(|n| n.node.as_mut())
+            .and_then(|n| match n {
+                N::SelectStmt(s) => s.with_clause.as_mut(),
+                _ => None,
+            }),
+        Some(N::UpdateStmt(u)) => u.with_clause.as_mut(),
+        Some(N::DeleteStmt(d)) => d.with_clause.as_mut(),
+        _ => None,
+    };
+    let Some(with) = with else {
+        return Ok(());
+    };
+    for cte in &mut with.ctes {
+        let Some(N::CommonTableExpr(c)) = cte.node.as_mut() else {
+            continue;
+        };
+        let Some(inner) = c.ctequery.as_deref().and_then(|q| q.node.clone()) else {
+            continue;
+        };
+        if !matches!(
+            inner,
+            N::InsertStmt(_) | N::UpdateStmt(_) | N::DeleteStmt(_)
+        ) {
+            continue;
+        }
+        let mut dml = pg_query::protobuf::Node { node: Some(inner) };
+        let mut p = params.clone();
+        rewrite_dml_from(&mut dml, lookup)?;
+        resolve_sublinks(&mut dml, lookup, &mut p, run)?;
+        let plan = plan_node(
+            dml.node
+                .ok_or_else(|| Error::Parse("empty WITH item".into()))?,
+            lookup,
+            &p,
+        )?;
+        let rows = run(&plan)?;
+        let cols: Vec<(String, String)> = match returning_output_def(&plan, lookup)? {
+            Some(def) => def
+                .columns
+                .iter()
+                .map(|c| (c.name.clone(), c.pg_type.clone()))
+                .collect(),
+            None => Vec::new(),
+        };
+        let types: Vec<String> = cols.iter().map(|(_, t)| t.clone()).collect();
+        let names: Vec<pg_query::protobuf::Node> = if c.aliascolnames.is_empty() {
+            cols.iter().map(|(n, _)| string_node(n)).collect()
+        } else {
+            c.aliascolnames.clone()
+        };
+        let table = values_select(&rows, &types, params);
+        c.ctequery = Some(Box::new(pg_query::protobuf::Node {
+            node: Some(N::SelectStmt(Box::new(table))),
+        }));
+        c.aliascolnames = names;
+    }
+    Ok(())
+}
+
+/// The columns a DML statement's RETURNING produces, typed; `None` without
+/// one.
+fn returning_output_def(
+    stmt: &Statement,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Result<Option<TableDef>> {
+    let (table, returning) = match stmt {
+        Statement::Insert(i) => (&i.table, i.returning.as_ref()),
+        Statement::Update(u) => (&u.table, u.returning.as_ref()),
+        Statement::Delete(d) => (&d.table, d.returning.as_ref()),
+        _ => return Ok(None),
+    };
+    let Some(returning) = returning else {
+        return Ok(None);
+    };
+    let source = lookup(table).ok_or_else(|| Error::UndefinedTable(table.clone()))?;
+    let mut columns = Vec::new();
+    for (i, (out, field)) in returning.columns.iter().enumerate() {
+        let expr = returning.casts.get(i).and_then(|c| c.as_ref());
+        let src = source
+            .columns
+            .iter()
+            .find(|c| c.field() == *field || c.name == *field);
+        let ty = match expr {
+            Some(e) if !matches!(e, ColumnExpr::Coalesce { .. }) => column_expr_type(e).to_string(),
+            _ => src.map_or_else(|| "text".to_string(), |c| c.pg_type.clone()),
+        };
+        columns.push(Column::new(out, &ty, true));
+    }
+    Ok(Some(TableDef::new("", columns)))
+}
+
 fn materialize_recursive_ctes(
     node: &mut pg_query::protobuf::Node,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
@@ -10159,6 +10968,8 @@ fn rewrite_dml_from(
     // A write whose target is a VIEW becomes the same write on its base
     // table (automatically updatable views).
     view_dml::rewrite(node, lookup)?;
+    // Row-level security, on the relation the write finally targets.
+    rls::rewrite_dml(node)?;
     // An enum compares by its labels' positions in an UPDATE / DELETE's
     // WHERE too.
     enum_order::rewrite_dml(node, lookup)?;
@@ -10561,6 +11372,14 @@ fn resolve_sublinks_in_from(
     params: &mut Vec<Bson>,
     run: SubqueryRunner<'_>,
 ) -> Result<()> {
+    // `WITH ORDINALITY` / a several-function `ROWS FROM` become the
+    // subqueries they mean first, so the subqueries THAT introduces
+    // (`ARRAY(SELECT f(...))`) are resolved with the rest.
+    if let Some(N::RangeFunction(rf)) = item.node.as_ref() {
+        if rf.ordinality {
+            item.node = Some(rowsfrom::as_subselect(rf)?);
+        }
+    }
     match item.node.as_mut() {
         Some(N::RangeSubselect(rs)) => {
             match rs.subquery.as_deref_mut().and_then(|q| q.node.as_mut()) {
@@ -10569,6 +11388,18 @@ fn resolve_sublinks_in_from(
                 }
                 _ => Ok(()),
             }
+        }
+        // A subquery in a FROM function's arguments: `unnest(ARRAY(SELECT
+        // ...))`.
+        Some(N::RangeFunction(rf)) => {
+            for f in &mut rf.functions {
+                if let Some(N::List(l)) = f.node.as_mut() {
+                    if let Some(call) = l.items.first_mut() {
+                        resolve_sublinks_in_expr(call, lookup, params, run, &[])?;
+                    }
+                }
+            }
+            Ok(())
         }
         Some(N::JoinExpr(j)) => {
             for side in [j.larg.as_deref_mut(), j.rarg.as_deref_mut()]
@@ -10702,17 +11533,101 @@ pub fn planning_to_execute<R>(f: impl FnOnce() -> R) -> R {
     out
 }
 
-/// A function this server's reference -- PostgreSQL 14 -- does not have, or
-/// refuses in a UTF8 database, answered as PostgreSQL answers it:
-/// `regexp_count` and friends arrived in 15 (42883, naming the argument
-/// types), and `to_ascii` cannot convert from UTF8 (0A000).
+/// The SQL/JSON syntax PostgreSQL 16 and 17 added, which the parser (17's
+/// grammar) accepts and PostgreSQL 15 -- what this server reports -- does
+/// not: answered as 15 answers it. The constructors and query functions that
+/// 15 reads as ordinary calls are 42883 naming their argument types; the
+/// forms it cannot parse are 42601 at the token it stops on. Measured on
+/// PostgreSQL 15.19.
+fn sql_json_absent(node: &pg_query::protobuf::Node, sql: &str, params: &[Bson]) -> Option<Error> {
+    let arg_types = |args: Vec<&pg_query::protobuf::Node>| -> String {
+        args.iter()
+            .map(|a| match a.node.as_ref() {
+                Some(N::AConst(c))
+                    if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) =>
+                {
+                    "unknown".to_string()
+                }
+                _ => {
+                    let v = const_value(a, params).unwrap_or(Bson::Null);
+                    display_type(&static_type(a, &v))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    fn raw(
+        v: &Option<Box<pg_query::protobuf::JsonValueExpr>>,
+    ) -> Option<&pg_query::protobuf::Node> {
+        v.as_ref().and_then(|v| v.raw_expr.as_deref())
+    }
+    // A key/value pair is written `k : v` or `k VALUE v`; 15 stops at either.
+    let pair_token = if sql.to_ascii_uppercase().contains(" VALUE ") {
+        "VALUE"
+    } else {
+        ":"
+    };
+    let absent = |name: &str, args: Vec<&pg_query::protobuf::Node>| {
+        Some(Error::UndefinedFunction(format!(
+            "function {name}({}) does not exist",
+            arg_types(args)
+        )))
+    };
+    let syntax = |at: &str| Some(Error::Parse(format!("syntax error at or near \"{at}\"")));
+    let inner = node.node.as_ref()?;
+    for (n, _, _, _) in inner.nodes() {
+        use pg_query::NodeRef as R;
+        let out = match n {
+            R::JsonIsPredicate(_) => syntax("JSON"),
+            // `merge_action()` is 17's; 15 reads it as a call to nothing.
+            R::MergeSupportFunc(_) => absent("merge_action", vec![]),
+            R::JsonTable(_) => syntax("COLUMNS"),
+            R::JsonObjectConstructor(o) if o.exprs.is_empty() => absent("json_object", vec![]),
+            R::JsonObjectConstructor(_) | R::JsonObjectAgg(_) => syntax(pair_token),
+            R::JsonArrayConstructor(a) => absent(
+                "json_array",
+                a.exprs
+                    .iter()
+                    .map(|e| match e.node.as_ref() {
+                        Some(N::JsonValueExpr(v)) => v.raw_expr.as_deref().unwrap_or(e),
+                        _ => e,
+                    })
+                    .collect(),
+            ),
+            R::JsonArrayAgg(a) => absent("json_arrayagg", raw(&a.arg).into_iter().collect()),
+            R::JsonScalarExpr(e) => absent("json_scalar", e.expr.as_deref().into_iter().collect()),
+            R::JsonSerializeExpr(e) => absent("json_serialize", raw(&e.expr).into_iter().collect()),
+            R::JsonFuncExpr(f) => {
+                let name = match pg_query::protobuf::JsonExprOp::try_from(f.op) {
+                    Ok(pg_query::protobuf::JsonExprOp::JsonExistsOp) => "json_exists",
+                    Ok(pg_query::protobuf::JsonExprOp::JsonValueOp) => "json_value",
+                    _ => "json_query",
+                };
+                let mut args: Vec<&pg_query::protobuf::Node> =
+                    raw(&f.context_item).into_iter().collect();
+                args.extend(f.pathspec.as_deref());
+                absent(name, args)
+            }
+            _ => None,
+        };
+        if out.is_some() {
+            return out;
+        }
+    }
+    None
+}
+
+/// A function the PostgreSQL this server reports (15) does not have, or
+/// refuses in a UTF8 database, answered as PostgreSQL answers it: 42883
+/// naming the argument types, and `to_ascii` cannot convert from UTF8
+/// (0A000).
 fn function_absent_in_reference(
     f: &pg_query::protobuf::FuncCall,
     params: &[Bson],
 ) -> Option<Error> {
     let name = func_name(f)?;
     if correlated::user_function_named(&name)
-        && correlated::user_function(&name, f.args.len()).is_none()
+        && correlated::user_function_for(&name, &f.args).is_none()
     {
         let types: Vec<String> = f
             .args
@@ -10732,10 +11647,9 @@ fn function_absent_in_reference(
             "encoding conversion from UTF8 to ASCII not supported".into(),
         ));
     }
-    if !matches!(
-        name.as_str(),
-        "regexp_count" | "regexp_instr" | "regexp_substr" | "regexp_like"
-    ) {
+    // `json_scalar` / `json_serialize` and friends parse (the grammar is
+    // PostgreSQL 17's) but are PostgreSQL 16+: this server reports 15.
+    if !matches!(name.as_str(), "json_scalar" | "json_serialize") {
         return None;
     }
     let types: Vec<String> = f
@@ -10949,6 +11863,22 @@ fn resolve_one_sublink(
             let values: Vec<Bson> = rows.into_iter().map(first_column).collect();
             Ok(param_node(params, Bson::Array(values)))
         }
+        Ok(kind @ (SubLinkType::AnySublink | SubLinkType::AllSublink))
+            if matches!(
+                sl.testexpr.as_deref().and_then(|t| t.node.as_ref()),
+                Some(N::RowExpr(_))
+            ) =>
+        {
+            row_subquery_comparison(
+                sl,
+                kind == SubLinkType::AnySublink,
+                rows,
+                lookup,
+                params,
+                run,
+                outer,
+            )
+        }
         Ok(kind @ (SubLinkType::AnySublink | SubLinkType::AllSublink)) => {
             let values: Vec<Bson> = rows.into_iter().map(first_column).collect();
             let mut test = sl
@@ -10994,6 +11924,101 @@ fn resolve_one_sublink(
         }
         _ => Err(Error::Unsupported("this subquery form".into())),
     }
+}
+
+/// `(a, b) IN (SELECT x, y ...)` / `(a, b) NOT IN (...)` over the subquery's
+/// rows, as the boolean tree a row comparison means: `IN` is an OR over the
+/// rows of `a = x AND b = y`, `NOT IN` an AND over the rows of `a <> x OR b
+/// <> y` -- whose three-valued logic is SQL's row comparison exactly (a NULL
+/// makes a row's comparison unknown, not false). No rows: FALSE for IN,
+/// TRUE for NOT IN.
+#[allow(clippy::too_many_arguments)]
+fn row_subquery_comparison(
+    sl: &pg_query::protobuf::SubLink,
+    any: bool,
+    rows: Vec<Vec<Bson>>,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &mut Vec<Bson>,
+    run: SubqueryRunner<'_>,
+    outer: &[String],
+) -> Result<pg_query::protobuf::Node> {
+    let mut test = sl.testexpr.as_deref().cloned().expect("checked");
+    resolve_sublinks_in_expr(&mut test, lookup, params, run, outer)?;
+    let Some(N::RowExpr(row)) = test.node.as_ref() else {
+        return Err(Error::Unsupported("this row comparison".into()));
+    };
+    let op = sl
+        .oper_name
+        .first()
+        .and_then(|n| match n.node.as_ref() {
+            Some(N::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "=".to_string());
+    if !matches!(op.as_str(), "=" | "<>") {
+        return Err(Error::Unsupported(format!(
+            "a row comparison with {op} and a subquery"
+        )));
+    }
+    let width = row.args.len();
+    if let Some(r) = rows.first() {
+        if r.len() != width {
+            return Err(Error::Parse(if r.len() > width {
+                "subquery has too many columns".into()
+            } else {
+                "subquery has too few columns".into()
+            }));
+        }
+    }
+    let boolexpr =
+        |op: BoolExprType, args: Vec<pg_query::protobuf::Node>| pg_query::protobuf::Node {
+            node: Some(N::BoolExpr(Box::new(pg_query::protobuf::BoolExpr {
+                boolop: op as i32,
+                args,
+                location: -1,
+                ..Default::default()
+            }))),
+        };
+    let (inner, outer_op) = if any {
+        (BoolExprType::AndExpr, BoolExprType::OrExpr)
+    } else {
+        (BoolExprType::OrExpr, BoolExprType::AndExpr)
+    };
+    let mut arms = Vec::with_capacity(rows.len());
+    for r in rows {
+        let cmps: Vec<pg_query::protobuf::Node> = row
+            .args
+            .iter()
+            .zip(r)
+            .map(|(lhs, v)| pg_query::protobuf::Node {
+                node: Some(N::AExpr(Box::new(AExpr {
+                    kind: AExprKind::AexprOp as i32,
+                    name: vec![string_node(&op)],
+                    lexpr: Some(Box::new(lhs.clone())),
+                    rexpr: Some(Box::new(param_node(params, v))),
+                    location: -1,
+                }))),
+            })
+            .collect();
+        arms.push(if cmps.len() == 1 {
+            cmps.into_iter().next().expect("one")
+        } else {
+            boolexpr(inner, cmps)
+        });
+    }
+    Ok(match arms.len() {
+        0 => pg_query::protobuf::Node {
+            node: Some(N::AConst(pg_query::protobuf::AConst {
+                isnull: false,
+                location: -1,
+                val: Some(pg_query::protobuf::a_const::Val::Boolval(
+                    pg_query::protobuf::Boolean { boolval: !any },
+                )),
+            })),
+        },
+        1 => arms.into_iter().next().expect("one"),
+        _ => boolexpr(outer_op, arms),
+    })
 }
 
 /// The first qualified column reference in `s` whose qualifier names nothing
@@ -11830,6 +12855,10 @@ fn plan_select(
     }
     let expanded = expand_views(s)?;
     let s = &expanded;
+    // `WITH ORDINALITY` and a several-function `ROWS FROM` as subqueries.
+    if let Some(rewritten) = rowsfrom::rewrite(s)? {
+        return plan_select(&rewritten, lookup, params);
+    }
     if s.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
         return plan_set_operation(s, lookup, params);
     }
@@ -11846,6 +12875,16 @@ fn plan_select(
     // An enum orders by its labels' declared positions, not their text.
     if let Some(rewritten) = enum_order::rewrite(s, lookup)? {
         return plan_select(&rewritten, lookup, params);
+    }
+    // A bare `VALUES` with ORDER BY / LIMIT / OFFSET: the clauses belong to
+    // the rows, so it is `SELECT * FROM (VALUES ...) AS "*VALUES*"(column1,
+    // ...)` with them outside -- PostgreSQL's own column names, which is what
+    // `ORDER BY column1` refers to.
+    if !s.values_lists.is_empty()
+        && s.target_list.is_empty()
+        && (!s.sort_clause.is_empty() || s.limit_count.is_some() || s.limit_offset.is_some())
+    {
+        return plan_select(&values_as_subquery(s), lookup, params);
     }
     if s.from_clause.is_empty() {
         return plan_select_constant(s, params);
@@ -12466,12 +13505,30 @@ fn plan_from_subquery(
     for (c, name) in def.columns.iter_mut().zip(&colnames) {
         c.name = name.clone();
     }
+    distinct_fields(&mut def);
     def.name = alias.clone();
     Ok(SubSource {
         alias,
         plan: Box::new(plan),
         def,
     })
+}
+
+/// Give a column whose name repeats an earlier one's a field of its own.
+///
+/// A subquery's output may carry one name twice -- `(SELECT 1 AS a, 2 AS a)
+/// s`, a two-array `unnest` whose columns are both `unnest` -- and each is
+/// still its own column: PostgreSQL shows `(1, 2)`. Keyed by name, the second
+/// overwrote the first and `SELECT *` answered `(2, 2)`.
+fn distinct_fields(def: &mut TableDef) {
+    let mut seen: Vec<String> = Vec::new();
+    for (i, c) in def.columns.iter_mut().enumerate() {
+        let field = c.field();
+        if seen.contains(&field) {
+            c.field_override = Some(format!("{field}\u{1}{i}"));
+        }
+        seen.push(c.field());
+    }
 }
 
 /// One name from an alias's column list (`s(a, b)`).
@@ -13972,8 +15029,9 @@ fn sql_value_function(svf: &pg_query::protobuf::SqlValueFunction) -> Result<Bson
     use pg_query::protobuf::SqlValueFunctionOp as Op;
     let op = Op::try_from(svf.op).unwrap_or(Op::SqlvalueFunctionOpUndefined);
     Ok(match op {
-        Op::SvfopCurrentUser | Op::SvfopUser | Op::SvfopSessionUser | Op::SvfopCurrentRole => {
-            session_user().map_or(Bson::Null, Bson::String)
+        Op::SvfopSessionUser => session_user().map_or(Bson::Null, Bson::String),
+        Op::SvfopCurrentUser | Op::SvfopUser | Op::SvfopCurrentRole => {
+            current_user().map_or(Bson::Null, Bson::String)
         }
         Op::SvfopCurrentCatalog => Bson::String(session_database()),
         Op::SvfopCurrentSchema => Bson::String("public".into()),
@@ -14174,11 +15232,11 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
         }
         Some(N::FuncCall(f))
             if func_name(f)
-                .and_then(|n| correlated::user_function(&n, f.args.len()))
+                .and_then(|n| correlated::user_function_for(&n, &f.args))
                 .is_some() =>
         {
             func_name(f)
-                .and_then(|n| correlated::user_function(&n, f.args.len()))
+                .and_then(|n| correlated::user_function_for(&n, &f.args))
                 .map(|u| u.return_type)
                 .unwrap_or_default()
         }
@@ -14190,6 +15248,18 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
         {
             let name = func_name(f).expect("checked");
             bit_function_type(f, &name).expect("checked")
+        }
+        // `length` of a line segment or a path is its float8 length, not a
+        // string's character count.
+        Some(N::FuncCall(f))
+            if func_name(f).as_deref() == Some("length")
+                && f.args.len() == 1
+                && matches!(
+                    static_type(&f.args[0], &Bson::Null).as_str(),
+                    "lseg" | "path"
+                ) =>
+        {
+            "float8".to_string()
         }
         Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("to_regtype") => {
             "regtype".to_string()
@@ -14223,6 +15293,7 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
                         | "array_prepend"
                         | "array_remove"
                         | "array_replace"
+                        | "trim_array"
                 )
             ) =>
         {
@@ -14292,6 +15363,18 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
             } else {
                 "int4".to_string()
             }
+        }
+        Some(N::FuncCall(f))
+            if func_name(f)
+                .as_deref()
+                .and_then(pgcrypto::result_type)
+                .is_some() =>
+        {
+            func_name(f)
+                .as_deref()
+                .and_then(pgcrypto::result_type)
+                .unwrap_or("bytea")
+                .to_string()
         }
         Some(N::FuncCall(f))
             if func_name(f)
@@ -14388,6 +15471,8 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
                     if any_slice { "int2[]" } else { "int2" }.to_string()
                 }
                 None if base == "oidvector" => if any_slice { "oid[]" } else { "oid" }.to_string(),
+                None if base == "point" => "float8".to_string(),
+                None if matches!(base.as_str(), "lseg" | "box") => "point".to_string(),
                 None => inferred_type(value).to_string(),
             }
         }
@@ -14443,10 +15528,19 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
                 };
             }
             let op = operator_name(e).unwrap_or("");
+            // A prefix operator over a geometric operand (`@@ circle`).
+            if let (None, Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
+                if let Some(t) = geom::unary_type(op, &static_type(r, &Bson::Null)) {
+                    return t.to_string();
+                }
+            }
             if let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
                 let (lt, rt) = (static_type(l, &Bson::Null), static_type(r, &Bson::Null));
                 if let Some(t) = range_ops::result_type(op, &lt, &rt) {
                     return t;
+                }
+                if let Some(t) = geom::operator_type(op, &lt, &rt) {
+                    return t.to_string();
                 }
                 // jsonb's `-` / `#-` / `||` answer jsonb.
                 if (lt == "jsonb" && matches!(op, "-" | "#-" | "||"))
@@ -14966,6 +16060,8 @@ pub(crate) fn inferred_type(v: &Bson) -> &'static str {
         Bson::Decimal128(_) => "numeric",
         Bson::Document(d) if d.contains_key(WIDE_NUMERIC_KEY) => "numeric",
         Bson::Document(d) if d.len() == 1 && d.contains_key(REGCLASS_KEY) => "regclass",
+        other if regobj::from_bson(other).is_some() => regobj::from_bson(other).expect("checked").0,
+        other if arrays::is_bounded(other) => inferred_type(&arrays::strip(other)),
         // A MULTIDIMENSIONAL array is the same array type as its elements --
         // `int4[]` (oid 1007), never `int4[][]`, which is no type at all.
         // Recursing is what makes that so: reading only the first element's
@@ -14984,6 +16080,16 @@ pub(crate) fn inferred_type(v: &Bson) -> &'static str {
             Some(Bson::Binary(_)) => "bytea[]",
             Some(inner @ Bson::Array(_)) => inferred_type(inner),
             Some(other) if geo::is_box(other) => "box[]",
+            Some(other) if geom::is_geom(other) => {
+                match geom::from_bson(other).map(|g| g.type_name()) {
+                    Some("point") => "point[]",
+                    Some("lseg") => "lseg[]",
+                    Some("line") => "line[]",
+                    Some("path") => "path[]",
+                    Some("polygon") => "polygon[]",
+                    _ => "circle[]",
+                }
+            }
             _ => "text[]",
         },
         Bson::Boolean(_) => "bool",
@@ -14993,6 +16099,7 @@ pub(crate) fn inferred_type(v: &Bson) -> &'static str {
         // format rendered `\x..` under oid 17.
         Bson::Binary(_) => "bytea",
         other if geo::is_box(other) => "box",
+        other if geom::is_geom(other) => geom::from_bson(other).map_or("text", |g| g.type_name()),
         _ => "text",
     }
 }
@@ -15311,6 +16418,64 @@ fn plan_values_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
     }))
 }
 
+/// `VALUES ... ORDER BY ... LIMIT ...` as the select over the bare rows.
+fn values_as_subquery(s: &pg_query::protobuf::SelectStmt) -> pg_query::protobuf::SelectStmt {
+    let width = s
+        .values_lists
+        .first()
+        .and_then(|r| match r.node.as_ref() {
+            Some(N::List(l)) => Some(l.items.len()),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let mut rows = s.clone();
+    rows.sort_clause.clear();
+    rows.limit_count = None;
+    rows.limit_offset = None;
+    rows.limit_option = pg_query::protobuf::LimitOption::Default as i32;
+    let string = |v: String| pg_query::protobuf::Node {
+        node: Some(N::String(pg_query::protobuf::String { sval: v })),
+    };
+    let star = pg_query::protobuf::Node {
+        node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+            val: Some(Box::new(pg_query::protobuf::Node {
+                node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+                    fields: vec![pg_query::protobuf::Node {
+                        node: Some(N::AStar(pg_query::protobuf::AStar {})),
+                    }],
+                    location: -1,
+                })),
+            })),
+            location: -1,
+            ..Default::default()
+        }))),
+    };
+    let from = pg_query::protobuf::Node {
+        node: Some(N::RangeSubselect(Box::new(
+            pg_query::protobuf::RangeSubselect {
+                lateral: false,
+                subquery: Some(Box::new(pg_query::protobuf::Node {
+                    node: Some(N::SelectStmt(Box::new(rows))),
+                })),
+                alias: Some(pg_query::protobuf::Alias {
+                    aliasname: "*VALUES*".into(),
+                    colnames: (1..=width).map(|i| string(format!("column{i}"))).collect(),
+                }),
+            },
+        ))),
+    };
+    pg_query::protobuf::SelectStmt {
+        target_list: vec![star],
+        from_clause: vec![from],
+        sort_clause: s.sort_clause.clone(),
+        limit_count: s.limit_count.clone(),
+        limit_offset: s.limit_offset.clone(),
+        limit_option: s.limit_option,
+        op: pg_query::protobuf::SetOperation::SetopNone as i32,
+        ..Default::default()
+    }
+}
+
 fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> Result<Statement> {
     // A bare `VALUES (...), (...)` -- a multi-row literal source with no target
     // list at all. `SelectConstant` below is the single-row case; a multi-row
@@ -15352,7 +16517,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                     return Err(e);
                 }
                 if let Some(u) =
-                    func_name(f).and_then(|n| correlated::user_function(&n, f.args.len()))
+                    func_name(f).and_then(|n| correlated::user_function_for(&n, &f.args))
                 {
                     if !u.returns_set {
                         let node = rt.val.as_deref().expect("a FuncCall target");
@@ -15581,6 +16746,8 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                             || xml::result_type(&name).is_some()
                             || jsonops::result_type(&name).is_some()
                             || mathfn::result_type(&name).is_some()
+                            || geom::result_type(&name).is_some()
+                            || pgcrypto::result_type(&name).is_some()
                             || jsonpath::is_function(&name)
                         {
                             declared.to_string()
@@ -15855,10 +17022,10 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                     continue;
                 }
                 let (name, col) = match op {
-                    Op::SvfopCurrentUser => ("current_user", ConstCol::SessionUser),
-                    Op::SvfopUser => ("user", ConstCol::SessionUser),
+                    Op::SvfopCurrentUser => ("current_user", ConstCol::CurrentUser),
+                    Op::SvfopUser => ("user", ConstCol::CurrentUser),
                     Op::SvfopSessionUser => ("session_user", ConstCol::SessionUser),
-                    Op::SvfopCurrentRole => ("current_role", ConstCol::SessionUser),
+                    Op::SvfopCurrentRole => ("current_role", ConstCol::CurrentUser),
                     Op::SvfopCurrentCatalog => ("current_catalog", ConstCol::CurrentDatabase),
                     Op::SvfopCurrentSchema => (
                         "current_schema",
@@ -17048,7 +18215,12 @@ pub(crate) fn regclass_value(oid: i64) -> Bson {
 /// The oid inside a regclass value, or `None` for any other value.
 pub fn regclass_oid(v: &Bson) -> Option<i64> {
     match v {
-        Bson::Document(d) if d.len() == 1 => d.get_i64(REGCLASS_KEY).ok(),
+        Bson::Document(d) if d.len() == 1 => d
+            .get_i64(REGCLASS_KEY)
+            .ok()
+            // The other object-identifier types compare and filter by their
+            // oid exactly as a regclass does.
+            .or_else(|| regobj::from_bson(v).map(|(_, oid)| oid)),
         _ => None,
     }
 }
@@ -17802,6 +18974,23 @@ pub(crate) fn session_user() -> Option<String> {
     PLAN_SESSION_USER.with(|u| u.borrow().clone())
 }
 
+thread_local! {
+    static PLAN_CURRENT_USER: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install the EFFECTIVE role (`SET ROLE`'s), for `current_user`.
+pub fn set_current_user(user: Option<String>) {
+    PLAN_CURRENT_USER.with(|u| *u.borrow_mut() = user);
+}
+
+/// The effective role: `SET ROLE`'s, else the session's.
+pub(crate) fn current_user() -> Option<String> {
+    PLAN_CURRENT_USER
+        .with(|u| u.borrow().clone())
+        .or_else(session_user)
+}
+
 pub(crate) fn warn(sqlstate: &str, message: String) {
     PLAN_WARNINGS.with(|w| w.borrow_mut().push((sqlstate.to_string(), message)));
 }
@@ -18000,6 +19189,13 @@ fn user_base_type(name: &str) -> Option<(String, i64, bool)> {
             .find(|(n, _, _)| *n == target || (fold && n.eq_ignore_ascii_case(&target)))
             .map(|(n, oid, defined)| (n.clone(), *oid, *defined))
     })
+}
+
+/// The user base type (not an extension's) an expression statically has.
+fn user_defined_base_source(arg: &pg_query::protobuf::Node, value: &Bson) -> Option<String> {
+    let t = static_type(arg, value);
+    let (name, _, defined) = user_base_type(&t)?;
+    (defined && extension_type(&t).is_none()).then_some(name)
 }
 
 /// A base type's resolution NAME by oid -- the reverse door, for rendering
@@ -18283,7 +19479,7 @@ fn regexp_replace(args: &[Bson]) -> Result<Bson> {
     if flags.contains('i') {
         builder.push_str("(?i)");
     }
-    builder.push_str(&pattern);
+    builder.push_str(&scalar::pg_regex_source(&pattern));
     let re = regex::Regex::new(&builder)
         .map_err(|_| Error::InvalidRegex(format!("invalid regular expression: \"{pattern}\"")))?;
     // PostgreSQL's `\1` group references are the regex crate's `${1}`, and its
@@ -19314,6 +20510,9 @@ fn render_array_element(v: &Bson) -> String {
         // A box's commas are not the array's delimiter (that is `;`), so the
         // text needs no quoting: `{(3,4),(1,2);(7,8),(5,6)}`.
         _ if geo::is_box(v) => return geo::box_text(&geo::box_coords(v).expect("checked")),
+        // The other geometric types' commas ARE the delimiter, so their text
+        // is quoted below: `{"(1,2)","(3,4)"}`.
+        _ if geom::is_geom(v) => geom::text(&geom::from_bson(v).expect("checked")),
         // A bytea element renders as its `\x…` hex, then the array-quoting
         // below wraps and escapes it (`"\\x01"`), matching PostgreSQL.
         Bson::Binary(b) => bytea::render_hex(&b.bytes),
@@ -19407,25 +20606,33 @@ fn parse_array(text: &str, element_type: &str) -> Result<Bson> {
         delim: pgtypes::typdelim(element_type),
     };
     p.skip_space();
-    // An optional dimension decoration, `[lo:hi]...=`, which PostgreSQL checks
-    // against the contents and otherwise discards -- the parsed value carries
-    // no lower bounds. A wrong bound count is the same 22P02 as any other
-    // malformed literal.
+    // An optional dimension decoration, `[lo:hi]...=` (`[hi]` alone means
+    // `[1:hi]`), checked against the contents and kept as the value's lower
+    // bounds. A wrong bound count is the same 22P02 as any other malformed
+    // literal; bounds in the wrong order are PostgreSQL's own 2202E.
     let mut declared: Vec<usize> = Vec::new();
+    let mut lower: Vec<i64> = Vec::new();
     while p.peek() == Some('[') {
         p.pos += 1;
-        let lo = p.take_int().ok_or_else(malformed)?;
-        let hi = if p.peek() == Some(':') {
+        let first = p.take_int().ok_or_else(malformed)?;
+        let (lo, hi) = if p.peek() == Some(':') {
             p.pos += 1;
-            p.take_int().ok_or_else(malformed)?
+            (first, p.take_int().ok_or_else(malformed)?)
         } else {
-            lo
+            (1, first)
         };
-        if p.peek() != Some(']') || hi < lo {
+        if p.peek() != Some(']') {
             return Err(malformed());
+        }
+        if hi < lo {
+            return Err(Error::Sqlstate(
+                "2202E",
+                "upper bound cannot be less than lower bound".into(),
+            ));
         }
         p.pos += 1;
         declared.push(usize::try_from(hi - lo + 1).map_err(|_| malformed())?);
+        lower.push(lo);
     }
     if !declared.is_empty() {
         p.skip_space();
@@ -19455,7 +20662,7 @@ fn parse_array(text: &str, element_type: &str) -> Result<Bson> {
     if !declared.is_empty() && array_dims(&items) != declared {
         return Err(malformed());
     }
-    Ok(Bson::Array(items))
+    Ok(arrays::bounded(Bson::Array(items), &lower))
 }
 
 /// The lengths of a (rectangular) array along each dimension, outermost first.
@@ -19684,6 +20891,23 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
     if value == Bson::Null {
         return Ok(Bson::Null);
     }
+    // An array whose lower bound is not 1: an array cast keeps the bounds, a
+    // text cast shows them (`[0:1]={a,b}`), anything else sees the elements.
+    if arrays::is_bounded(&value) {
+        let plain = arrays::strip(&value);
+        if target.ends_with("[]") {
+            let lower = arrays::lower_bounds(&value);
+            return Ok(arrays::bounded(cast_value_inner(plain, target)?, &lower));
+        }
+        if matches!(target, "text" | "varchar" | "bpchar" | "name") {
+            return Ok(Bson::String(format!(
+                "{}={}",
+                arrays::dims_text(&value).unwrap_or_default(),
+                value_text(&plain)
+            )));
+        }
+        return cast_value_inner(plain, target);
+    }
     // A bit string from text: validated, never fitted (the caller fits it --
     // an explicit cast pads, an assignment refuses).
     if bits::is_bit_type(target) {
@@ -19741,6 +20965,23 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
     }
     // A box renders to text as `(high),(low)` and is a no-op cast to itself;
     // no other cast is defined for it on PostgreSQL.
+    // The other geometric types, from their text, and between each other.
+    if let Some(g) = geom::from_bson(&value).filter(|g| !matches!(g, geom::Geo::Box(..))) {
+        return geom::cast(&g, target);
+    }
+    if geom::TYPES.contains(&target) {
+        return match &value {
+            Bson::String(text) => geom::parse(target, text).map(|g| geom::to_bson(&g)),
+            other if geo::is_box(other) => {
+                geom::cast(&geom::from_bson(other).expect("box"), target)
+            }
+            other => Err(Error::CannotCoerce(format!(
+                "cannot cast type {} to {}",
+                display_type(inferred_type(other)),
+                target
+            ))),
+        };
+    }
     if let Some(coords) = geo::box_coords(&value) {
         return match target {
             "text" | "varchar" | "bpchar" | "name" => Ok(Bson::String(geo::box_text(&coords))),
@@ -19768,7 +21009,14 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
                 return Ok(Bson::String(bytea::render_hex(&b.bytes)))
             }
             "bytea" => return Ok(value.clone()),
-            _ => {}
+            // No other cast leaves bytea: PostgreSQL refuses on the TYPE
+            // (42846) before looking at the bytes.
+            other => {
+                return Err(Error::CannotCoerce(format!(
+                    "cannot cast type bytea to {}",
+                    display_type(other)
+                )))
+            }
         }
     }
     // A regtype value casts onward by its two natures: to text as its display
@@ -19780,6 +21028,10 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
             "int4" | "int8" | "oid" | "integer" | "int" | "bigint" => Ok(Bson::Int64(oid)),
             _ => Err(Error::Unsupported(format!("a regtype cast to {target}"))),
         };
+    }
+    // regnamespace / regrole / regproc / regprocedure: to and from.
+    if let Some(out) = regobj::cast(&value, target) {
+        return out;
     }
     // A regclass value likewise: to text as the relation's NAME, to `oid` /
     // the two integer widths as its oid; anything else has no cast path
@@ -20717,8 +21969,62 @@ pub fn catalog_param_types_opt(
         _ => None,
     };
     if let Ok(parsed) = parse_tree(sql) {
+        // The statement's own tables, for a parameter compared with (or
+        // assigned to) a column: `where id = $1` is `id`'s type.
+        let tables: Vec<String> = parsed
+            .nodes()
+            .into_iter()
+            .filter_map(|(node, _, _, _)| match node {
+                pg_query::NodeRef::RangeVar(r) => Some(r.relname.clone()),
+                _ => None,
+            })
+            .collect();
+        let named_column_type = |c: &pg_query::protobuf::ColumnRef| -> Option<String> {
+            let name = column_ref_name(c)?;
+            let bare = name.rsplit('.').next().unwrap_or(&name).to_string();
+            tables
+                .iter()
+                .find_map(|t| column_type(t, ColumnRef::Name(&bare)))
+        };
         for (node, _, _, _) in parsed.nodes() {
             match node {
+                pg_query::NodeRef::AExpr(e) => {
+                    let (l, r) = (
+                        e.lexpr.as_deref().and_then(|n| n.node.as_ref()),
+                        e.rexpr.as_deref().and_then(|n| n.node.as_ref()),
+                    );
+                    let pair = match (l, r) {
+                        (Some(N::ColumnRef(c)), Some(N::ParamRef(p)))
+                        | (Some(N::ParamRef(p)), Some(N::ColumnRef(c))) => Some((c, p)),
+                        _ => None,
+                    };
+                    if let Some((c, p)) = pair {
+                        let i = usize::try_from(p.number)
+                            .ok()
+                            .and_then(|n| n.checked_sub(1));
+                        if let Some(slot @ None) = i.and_then(|i| inferred.get_mut(i)) {
+                            *slot = named_column_type(c);
+                        }
+                    }
+                }
+                pg_query::NodeRef::UpdateStmt(u) => {
+                    let table = u
+                        .relation
+                        .as_ref()
+                        .map(|r| r.relname.clone())
+                        .unwrap_or_default();
+                    for t in &u.target_list {
+                        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+                            continue;
+                        };
+                        let Some(i) = rt.val.as_deref().and_then(param_index) else {
+                            continue;
+                        };
+                        if let Some(slot @ None) = inferred.get_mut(i) {
+                            *slot = column_type(&table, ColumnRef::Name(&rt.name));
+                        }
+                    }
+                }
                 pg_query::NodeRef::TypeCast(tc) => {
                     let Some(i) = tc.arg.as_deref().and_then(param_index) else {
                         continue;
@@ -20898,8 +22204,10 @@ pub(crate) fn jsonpath_call(name: &str, args: &[Bson]) -> Result<Bson> {
         None => false,
     };
     let base = name.strip_suffix("_tz").unwrap_or(name);
+    // The `_tz` suffix travels with the name: it is what lets a datetime
+    // comparison in the path cross the time-zone line.
     let out = jsonpath::call(
-        base,
+        name,
         &json_text_of(&args[0]),
         &value_text(&args[1]),
         vars.as_deref(),
@@ -21298,6 +22606,9 @@ fn datetime_call(
         .zip(&args)
         .map(|(a, v)| static_type(a, v))
         .collect();
+    // None of these has a use for an array's lower bounds: `to_json` of
+    // `[0:1]={a,b}` is `["a","b"]`.
+    let args: Vec<Bson> = args.iter().map(arrays::strip).collect();
     if jsonfn::result_type(name).is_some() {
         return Some(jsonfn::call(name, &args, &types));
     }
@@ -21309,6 +22620,15 @@ fn datetime_call(
 fn overload_name(f: &pg_query::protobuf::FuncCall, name: String) -> String {
     if name == "length" && f.args.len() == 1 && static_type(&f.args[0], &Bson::Null) == "tsvector" {
         return "tsvector_length".to_string();
+    }
+    if name == "length"
+        && f.args.len() == 1
+        && matches!(
+            static_type(&f.args[0], &Bson::Null).as_str(),
+            "lseg" | "path"
+        )
+    {
+        return "geom_length".to_string();
     }
     name
 }
@@ -21566,6 +22886,43 @@ fn coerce_unknown_operand(
 /// an N-dimensional array takes an (N-1)-dimensional one as a new last (or
 /// first) slice, which is how `element || array` and `array || element` are
 /// the same rule with N = 1; a NULL or empty side yields the other.
+/// An operator with an array whose lower bound is not 1 on either side.
+///
+/// `||` keeps the bounds as `array_cat` / `array_append` / `array_prepend` do.
+/// A comparison compares the ELEMENTS first and only then the bounds (with
+/// equal elements, `'[0:1]={a,b}' < '{a,b}'`), so two arrays that differ
+/// only in their bounds are not equal -- PostgreSQL's `array_cmp`. Every other
+/// operator (containment, overlap) has no use for the bounds.
+fn eval_binary_bounded(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
+    let arrayish = |v: &Bson| matches!(v, Bson::Array(_)) || arrays::is_bounded(v);
+    if op == "||" {
+        let (name, args) = match (arrayish(&lhs), arrayish(&rhs)) {
+            (true, true) => ("array_cat", [lhs, rhs]),
+            (true, false) => ("array_append", [lhs, rhs]),
+            _ => ("array_prepend", [lhs, rhs]),
+        };
+        return arrays::call(name, &args);
+    }
+    let (pl, pr) = (arrays::strip(&lhs), arrays::strip(&rhs));
+    if matches!(op, "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") && arrayish(&lhs) && arrayish(&rhs)
+    {
+        if eval_binary("=", pl.clone(), pr.clone())? != Bson::Boolean(true) {
+            return eval_binary(op, pl, pr);
+        }
+        let ord = arrays::lower_bounds(&lhs).cmp(&arrays::lower_bounds(&rhs));
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        return Ok(Bson::Boolean(match op {
+            "=" => ord == Equal,
+            "<>" | "!=" => ord != Equal,
+            "<" => ord == Less,
+            "<=" => ord != Greater,
+            ">" => ord == Greater,
+            _ => ord != Less,
+        }));
+    }
+    eval_binary(op, pl, pr)
+}
+
 fn array_concat(lhs: Bson, rhs: Bson) -> Result<Bson> {
     fn ndim(v: &Bson) -> usize {
         match v {
@@ -21631,6 +22988,9 @@ fn is_time_text(v: &Bson) -> bool {
 }
 
 fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
+    if arrays::is_bounded(&lhs) || arrays::is_bounded(&rhs) {
+        return eval_binary_bounded(op, lhs, rhs);
+    }
     // Array concatenation is `array_cat`, which is NOT strict: a NULL beside
     // an array is the array. So it goes before the NULL propagation below.
     if op == "||" && (matches!(lhs, Bson::Array(_)) || matches!(rhs, Bson::Array(_))) {
@@ -21643,7 +23003,21 @@ fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
     // box operators (`geo_ops.c`): equality and ordering compare AREAS within
     // EPSILON, `~=` compares corners, the rest are positional.
     if let (Some(a), Some(b)) = (geo::box_coords(&lhs), geo::box_coords(&rhs)) {
-        return box_operator(op, &a, &b);
+        // Distance is the geometric module's (between the centres).
+        if op != "<->" {
+            return box_operator(op, &a, &b);
+        }
+    }
+    // The other geometric types, and a box beside one of them.
+    if let (Some(a), Some(b)) = (geom::from_bson(&lhs), geom::from_bson(&rhs)) {
+        if let Some(out) = geom::operator(op, &a, &b) {
+            return out;
+        }
+        return Err(Error::UndefinedFunction(format!(
+            "operator does not exist: {} {op} {}",
+            a.type_name(),
+            b.type_name()
+        )));
     }
     // `^` is `power()` under another name: `numeric_power` over numerics,
     // `dpow` (float8) otherwise -- there is no integer `^`.
@@ -22811,11 +24185,9 @@ pub fn update_row_sets(upd: &Update, row: &Document) -> Result<(Document, Vec<St
 /// Plan one `SET a[...] = v`.
 ///
 /// Every subscript is planned as an expression over the row, because `a[n]`
-/// may name a column. A subscript BELOW 1 is refused: PostgreSQL answers it by
-/// moving the array's lower bound (`UPDATE ... SET ia[0] = 0` leaves an
-/// `[0:5]={...}`), and this server does not model lower bounds -- see the
-/// `arrays` module header. Refusing is the honest answer; re-basing to 1 would
-/// silently shift every other subscript into the array.
+/// may name a column. A subscript below the array's lower bound moves the
+/// bound (`UPDATE ... SET ia[0] = 0` leaves an `[0:5]={...}`), as in
+/// PostgreSQL -- see `apply_subscript_assign`.
 #[allow(clippy::too_many_arguments)]
 fn plan_subscript_assign(
     column: &secantus_pgcatalog::Column,
@@ -22889,28 +24261,53 @@ fn apply_subscript_assign(a: &SubscriptAssign, row: &Document, current: Bson) ->
     let value = cast_value(apply_row_expr(&a.value, row)?, &a.value_type)?;
     let index = |e: &ColumnExpr| -> Result<i64> {
         let i = arrays::subscript_index(&apply_row_expr(e, row)?)?;
-        if i < 1 {
-            return Err(Error::Unsupported(
-                "UPDATE of an array element below subscript 1".into(),
-            ));
-        }
         // A subscript past the end EXTENDS the array, so the subscript is the
         // size being asked for -- `SET a[1000000000] = 1` is a one-line
         // statement that would otherwise allocate a billion slots.
-        arrays::check_array_size(i)?;
+        arrays::check_array_size(i.abs())?;
         Ok(i)
     };
+    // The array as its elements and each dimension's lower bound; a NULL
+    // column is an empty array, which takes whatever bound it is given.
+    let lower = arrays::lower_bounds(&current);
+    let items = match arrays::strip(&current) {
+        Bson::Array(items) => items,
+        _ => Vec::new(),
+    };
+    let one_dim = arrays::dim_lengths(&Bson::Array(items.clone())).len() <= 1;
+    // One dimension: the assignment may reach BELOW the lower bound as well as
+    // past the upper one, and either way the array grows to meet it, the gap
+    // NULL-filled -- `SET a[0] = 9` over `{1,2}` is `[0:2]={9,1,2}`.
+    let place_range = |lo: i64, hi: i64, source: &[Bson]| -> Result<Bson> {
+        let (mut lb, mut out) = (lower.first().copied().unwrap_or(1), items.clone());
+        if out.is_empty() {
+            lb = lo;
+        }
+        if lo < lb {
+            let grow = (lb - lo) as usize;
+            let mut front = vec![Bson::Null; grow];
+            front.extend(out);
+            out = front;
+            lb = lo;
+        }
+        let needed = (hi - lb + 1).max(0) as usize;
+        arrays::check_array_size(needed as i64)?;
+        if out.len() < needed {
+            out.resize(needed, Bson::Null);
+        }
+        for (n, slot) in (lo..=hi).enumerate() {
+            out[(slot - lb) as usize] = source[n].clone();
+        }
+        Ok(arrays::bounded(Bson::Array(out), &[lb]))
+    };
     if let [SubscriptTarget::Slice(lo, hi)] = a.subs.as_slice() {
-        let items = match &current {
-            Bson::Array(items) => items.clone(),
-            _ => Vec::new(),
-        };
-        let lo = lo.as_ref().map(&index).transpose()?.unwrap_or(1);
+        let lb = lower.first().copied().unwrap_or(1);
+        let lo = lo.as_ref().map(&index).transpose()?.unwrap_or(lb);
         let hi = match hi.as_ref().map(&index).transpose()? {
             Some(h) => h,
-            None => items.len() as i64,
+            None => lb + items.len() as i64 - 1,
         };
-        let Bson::Array(source) = &value else {
+        let Bson::Array(source) = arrays::strip(&value) else {
             // A NULL source for a slice is PostgreSQL's own error rather than
             // a no-op: there is nothing to copy into the range.
             return Err(Error::DataException("source array too small".into()));
@@ -22919,17 +24316,29 @@ fn apply_subscript_assign(a: &SubscriptAssign, row: &Document, current: Bson) ->
         if source.len() < width {
             return Err(Error::DataException("source array too small".into()));
         }
-        let mut out = items;
-        out.resize(out.len().max(hi.max(0) as usize), Bson::Null);
-        for (n, slot) in (lo..=hi).enumerate() {
-            out[slot as usize - 1] = source[n].clone();
+        if width == 0 {
+            return Ok(current);
         }
-        return Ok(Bson::Array(out));
+        return place_range(lo, hi, &source);
     }
+    if let ([SubscriptTarget::Index(e)], true) = (a.subs.as_slice(), one_dim) {
+        let i = index(e)?;
+        return place_range(i, i, std::slice::from_ref(&value));
+    }
+    // Several dimensions: each subscript is relative to its dimension's lower
+    // bound, and one below it is refused by name rather than re-based.
     let mut path = Vec::with_capacity(a.subs.len());
-    for sub in &a.subs {
+    for (dim, sub) in a.subs.iter().enumerate() {
         match sub {
-            SubscriptTarget::Index(e) => path.push(index(e)?),
+            SubscriptTarget::Index(e) => {
+                let rebased = index(e)? - lower.get(dim).copied().unwrap_or(1) + 1;
+                if rebased < 1 {
+                    return Err(Error::Unsupported(
+                        "UPDATE of a multidimensional array element below its lower bound".into(),
+                    ));
+                }
+                path.push(rebased);
+            }
             SubscriptTarget::Slice(..) => {
                 return Err(Error::Unsupported(
                     "UPDATE of a slice of a multidimensional array".into(),
@@ -22952,7 +24361,10 @@ fn apply_subscript_assign(a: &SubscriptAssign, row: &Document, current: Bson) ->
         items[slot] = place(&items[slot].clone(), rest, value);
         Bson::Array(items)
     }
-    Ok(place(&current, &path, value))
+    Ok(arrays::bounded(
+        place(&Bson::Array(items), &path, value),
+        &lower,
+    ))
 }
 
 /// Whether `node` reads a column anywhere beneath it.
@@ -23043,6 +24455,11 @@ pub fn lower_where(
     }
     match node.node.as_ref() {
         Some(N::AExpr(e)) => lower_aexpr(e, def, params),
+        // A bare boolean column -- `WHERE f`, `FILTER (WHERE f)`: TRUE rows
+        // only, a NULL being no more TRUE than FALSE is.
+        Some(N::ColumnRef(_)) if bool_column_field(node, def).is_some() => {
+            Ok(doc! { bool_column_field(node, def).expect("checked"): true })
+        }
         Some(N::NullTest(t)) => {
             let field = column_field(t.arg.as_deref(), def)?;
             // A SQL NULL is either an explicit null or an absent field here,
@@ -23342,6 +24759,19 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             .ok_or_else(|| Error::Parse("cast with no operand".into()))?;
         let value = const_value(arg, params)?;
         let target = tc.type_name.as_ref().map(type_name_of).unwrap_or_default();
+        // A user BASE type (`CREATE TYPE t (input = ..., output = ...)`) is
+        // carried as its text, but it has no cast to anything but the string
+        // types and itself: `'a'::t::int` is 42846 on PostgreSQL rather than a
+        // parse of the text.
+        if let Some(source) = user_defined_base_source(arg, &value) {
+            let target_base = user_base_type(&target).map(|(n, _, _)| n);
+            if !(is_string_type(&target) || target_base.as_deref() == Some(source.as_str())) {
+                return Err(Error::CannotCoerce(format!(
+                    "cannot cast type {source} to {}",
+                    display_type(&target)
+                )));
+            }
+        }
         // Casting a timestamptz INSTANT to text renders it in the session zone
         // (the instant alone cannot say it is a timestamptz, so the source cast
         // decides). PLAN_TIMEZONE is set during planning, where this evaluates.
@@ -23626,7 +25056,7 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
         if let Some(e) = function_absent_in_reference(f, params) {
             return Err(e);
         }
-        if let Some(u) = func_name(f).and_then(|n| correlated::user_function(&n, f.args.len())) {
+        if let Some(u) = func_name(f).and_then(|n| correlated::user_function_for(&n, &f.args)) {
             if u.returns_set {
                 return Err(Error::FeatureNotSupported(
                     "set-valued function called in context that cannot accept a set".into(),
@@ -24160,7 +25590,7 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                     .ok_or_else(|| Error::Parse("ANY/ALL with no array operand".into()))?,
                 params,
             )?;
-            return eval_scalar_array_const(&op, lhs, rhs, is_any);
+            return eval_scalar_array_const(&op, lhs, arrays::strip(&rhs), is_any);
         }
         // `LIKE` / `ILIKE` as a VALUE (`select a like 'a%'`), not just as a
         // WHERE predicate. Their own AExpr kind, so they never reached the
@@ -24259,7 +25689,7 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
             let (Bson::String(subject), Bson::String(pattern)) = (&subject, &pattern) else {
                 return Ok(Bson::Null);
             };
-            let re = regex::Regex::new(pattern)
+            let re = regex::Regex::new(&scalar::pg_regex_source(pattern))
                 .map_err(|err| Error::InvalidText(format!("invalid regular expression: {err}")))?;
             let hit = re.is_match(subject);
             return Ok(Bson::Boolean(if operator_name(e)? == "!~" {
@@ -24325,6 +25755,15 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 {
                     return Ok(bits::not(&rhs));
                 }
+                _ if geom::from_bson(&rhs).is_some() => {
+                    let g = geom::from_bson(&rhs).expect("checked");
+                    return geom::unary(op.as_str(), &g).unwrap_or_else(|| {
+                        Err(Error::UndefinedFunction(format!(
+                            "operator does not exist: {op} {}",
+                            g.type_name()
+                        )))
+                    });
+                }
                 "!!" if rhs == Bson::Null => return Ok(Bson::Null),
                 "!!" => return fts::not_value(&rhs),
                 // `@ x` is abs(x), `|/ x` sqrt(x), `||/ x` cbrt(x).
@@ -24340,6 +25779,26 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
                 _ => return Err(Error::Unsupported(format!("unary {op}"))),
             },
         };
+        // A user BASE type has no operators unless someone defined them,
+        // which this server cannot: `'a'::t = 'a'::t` is 42883 on
+        // PostgreSQL, not a comparison of the carried text.
+        if let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
+            let (ls, rs) = (
+                user_defined_base_source(l, &lhs),
+                user_defined_base_source(r, &rhs),
+            );
+            if ls.is_some() || rs.is_some() {
+                let name = |n: &pg_query::protobuf::Node, v: &Bson, b: &Option<String>| {
+                    b.clone()
+                        .unwrap_or_else(|| display_type(&static_type(n, v)))
+                };
+                return Err(Error::UndefinedFunction(format!(
+                    "operator does not exist: {} {op} {}",
+                    name(l, &lhs, &ls),
+                    name(r, &rhs, &rs)
+                )));
+            }
+        }
         // Ranges and multiranges are text at run time too.
         {
             let lt = e
@@ -24676,12 +26135,25 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
 /// De Morgan is valid in SQL's three-valued (Kleene) logic, so `NOT (a AND b)`
 /// -> `NOT a OR NOT b` is sound, as is the double-negation collapse. Anything
 /// not handled here stays an honest 0A000 rather than an approximation.
+/// The field of a bare `boolean` column reference, or `None`.
+fn bool_column_field(node: &pg_query::protobuf::Node, def: &TableDef) -> Option<String> {
+    let Some(N::ColumnRef(c)) = node.node.as_ref() else {
+        return None;
+    };
+    let column = def.column(&column_ref_name(c)?)?;
+    (column.pg_type == "bool").then(|| column.field())
+}
+
 fn lower_negated(
     node: &pg_query::protobuf::Node,
     def: &TableDef,
     params: &[Bson],
 ) -> Result<Document> {
     match node.node.as_ref() {
+        // `NOT f`: FALSE rows only -- a NULL stays out, as it does in SQL.
+        Some(N::ColumnRef(_)) if bool_column_field(node, def).is_some() => {
+            Ok(doc! { bool_column_field(node, def).expect("checked"): false })
+        }
         Some(N::BoolExpr(b)) => match BoolExprType::try_from(b.boolop) {
             Ok(BoolExprType::AndExpr) => {
                 let arms = b
@@ -24844,6 +26316,9 @@ fn coerce_to_column(def: &TableDef, field: &str, value: Bson) -> Result<Bson> {
             ty @ ("int2" | "int4" | "int8" | "numeric" | "float4" | "float8" | "bool" | "timestamp"
             | "timestamptz" | "interval" | "oid"),
         ) => cast_value(value, ty),
+        // An array column: the literal is that array type, bounds and all --
+        // `a = '[0:1]={5,6}'` must compare the lower bound too.
+        Some(ty) if ty.ends_with("[]") => cast_value(value, ty),
         _ => Ok(value),
     }
 }
@@ -25054,7 +26529,7 @@ fn eval_pattern_match_const(e: &AExpr, params: &[Bson]) -> Result<Bson> {
     let source = if is_like {
         like_to_regex(pattern, escape)?
     } else {
-        pattern.clone()
+        scalar::pg_regex_source(pattern)
     };
     let re = regex::RegexBuilder::new(&source)
         .case_insensitive(insensitive)
@@ -25119,7 +26594,7 @@ fn lower_pattern_match(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Doc
     let regex = if is_like {
         like_to_regex(&pattern, escape)?
     } else {
-        pattern
+        scalar::pg_regex_source(&pattern)
     };
     let mut spec = doc! { "$regex": regex };
     if insensitive {
@@ -25333,7 +26808,7 @@ fn coerce_any_array(rhs: Bson, element_type: &str) -> Bson {
     if let Bson::String(s) = &rhs {
         if s.starts_with('{') {
             if let Ok(arr) = parse_array(s, element_type) {
-                return arr;
+                return arrays::strip(&arr);
             }
         }
     }

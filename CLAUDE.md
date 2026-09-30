@@ -517,19 +517,41 @@ one request path:
       onto shapes the planner already runs (correlated subqueries, a FROM
       subquery). Each needed no executor change.
     - **Case mapping is Unicode-aware with the SIMPLE mapping**, and the
-      server reports `lc_ctype = C.UTF-8`. This box's reference runs `C`,
-      which maps no non-ASCII letter; matching it would break against every
-      UTF-8-locale server. That decision was recorded before and briefly
-      overridden this batch -- read the `strings` notes in the backlog
-      before touching it again.
+      server reports (and `pg_database` records) `C.UTF-8`. This box's
+      reference cluster runs `C`, which maps no non-ASCII letter, so a corpus
+      that measures case or character classes declares `# reference-locale:
+      C.UTF-8` and the probe runs it in a reference database of that locale.
+      Matching the `C` cluster instead would break against every UTF-8-locale
+      server.
 
-    **What remains refused** (re-measured 2026-09-30): `INSTEAD OF` triggers,
-    constraint triggers and transition tables, and `VARIADIC` / `BEGIN
-    ATOMIC` functions. Writing through a view, expression and GIN / GiST /
-    BRIN / SP-GiST indexes, and correlation through an aggregate in HAVING
-    have all landed, as have declarative partitioning, row-level-security DDL
-    (recorded, not enforced), domains, materialized views, `WITH RECURSIVE`
-    and `xml`. `tasks/backlog.md` has the detail.
+    **What remains refused** (re-measured 2026-09-30, after batch 9):
+    - Catalog-object statements: `CREATE AGGREGATE` / `CAST` / `OPERATOR` /
+      `COLLATION` / `STATISTICS` / `PUBLICATION` / `RULE` / `EVENT TRIGGER`.
+    - Foreign data wrappers, tablespaces, `SECURITY LABEL`, and table
+      inheritance.
+    - `ADD COLUMN ... serial`, and a partial-index `ON CONFLICT` arbiter.
+
+    `MERGE`, row-level security (ENFORCED now), `LOCK TABLE`,
+    `statement_timeout` / `lock_timeout`, `CLUSTER`, array lower bounds,
+    `ALTER TABLE ADD UNIQUE / PRIMARY KEY / FOREIGN KEY`, SQL `PREPARE`,
+    `INSTEAD OF` / constraint triggers and transition tables have all
+    landed. `tasks/backlog.md` has the detail.
+
+    **Three batch-9 lessons worth not re-deriving:**
+    - **An autocommit write ran with NO transaction**, so a SET computed from
+      a row was written after another session's commit -- a silent lost
+      update (`2` where PostgreSQL answers `101`). Autocommit row writes now
+      run in a transaction of their own, retried on a write conflict at READ
+      COMMITTED (`run_autocommit_write`). A probe had to run two sessions
+      concurrently to see it; no single-connection corpus could.
+    - **`Storage::insert` REPORTS a rejected document in its result rather
+      than failing**, and a dozen callers dropped that result -- one of them
+      the table rewrite, which lost rows on a duplicate key.
+      `insert_checked` is the call to use.
+    - **The server reports PostgreSQL 15.0, but the reference cluster is
+      14.** A PG 15.19 cluster (`brew install postgresql@15`, run on port
+      5415) is the reference for what 15 added; a corpus asks for it with
+      `# reference-version: 15`.
 
     **Correlation detection is still the qualifier check.** `foreign_qualifier`
     finds a qualified reference naming nothing in the subquery's own FROM and

@@ -17,7 +17,7 @@ pub const ALL_RIGHTS: &str = "arwdDxtXUCTcsA";
 
 /// The names the server accepts as a grantee or grantor.
 pub fn role_exists(name: &str) -> bool {
-    crate::session_user().is_some_and(|u| u == name)
+    crate::current_user().is_some_and(|u| u == name)
 }
 
 /// `aclitemin`: parse a literal to its canonical text. An omitted grantor
@@ -85,7 +85,7 @@ pub fn parse(input: &str) -> Result<String> {
     } else {
         // Backward compatibility: the grantor defaults to the superuser.
         crate::warn("0L000", "defaulting grantor to user ID 10".to_string());
-        crate::session_user().unwrap_or_default()
+        crate::current_user().unwrap_or_default()
     };
     if !s.trim_start().is_empty() {
         return Err(invalid(

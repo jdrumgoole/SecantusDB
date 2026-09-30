@@ -1,0 +1,46 @@
+SET ROLE rle_alice
+SELECT count(*) FROM rle
+UPDATE rle SET lvl = 0
+DELETE FROM rle
+INSERT INTO rle VALUES (9, 'rle_alice', 1)
+RESET ROLE
+DELETE FROM rle WHERE id = 9
+CREATE POLICY sel ON rle FOR SELECT USING (owner = current_user)
+CREATE POLICY upd ON rle FOR UPDATE USING (owner = current_user) WITH CHECK (lvl < 5)
+CREATE POLICY del ON rle FOR DELETE USING (lvl = 1)
+CREATE POLICY ins ON rle FOR INSERT WITH CHECK (owner = current_user)
+SET ROLE rle_alice
+SELECT id FROM rle ORDER BY id
+UPDATE rle SET lvl = lvl + 1 RETURNING id, lvl
+UPDATE rle SET lvl = 10 WHERE id = 1
+UPDATE rle SET lvl = 0 WHERE id = 2
+DELETE FROM rle RETURNING id
+INSERT INTO rle VALUES (7, 'rle_bob', 1)
+INSERT INTO rle VALUES (8, 'rle_alice', 1)
+SELECT id, lvl FROM rle ORDER BY id
+SELECT p.id FROM rle p JOIN rle q ON p.id = q.id ORDER BY 1
+SELECT (SELECT count(*) FROM rle)
+RESET ROLE
+CREATE POLICY lowonly ON rle AS RESTRICTIVE FOR SELECT USING (lvl < 3)
+SET ROLE rle_alice
+SELECT id FROM rle ORDER BY id
+RESET ROLE
+SET ROLE rle_carol
+SELECT id FROM rle ORDER BY id
+RESET ROLE
+CREATE POLICY bobsees ON rle FOR SELECT TO rle_bob USING (true)
+SET ROLE rle_bob
+SELECT id FROM rle ORDER BY id
+RESET ROLE
+ALTER TABLE rle OWNER TO rle_bob
+SET ROLE rle_bob
+SELECT id FROM rle ORDER BY id
+RESET ROLE
+ALTER TABLE rle FORCE ROW LEVEL SECURITY
+SET ROLE rle_bob
+SELECT id FROM rle ORDER BY id
+RESET ROLE
+ALTER TABLE rle DISABLE ROW LEVEL SECURITY
+SET ROLE rle_alice
+SELECT id FROM rle ORDER BY id
+RESET ROLE

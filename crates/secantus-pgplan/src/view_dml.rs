@@ -37,6 +37,11 @@ pub fn set_checked_views(views: Vec<(String, String)>) {
     CHECKED_VIEWS.with(|v| *v.borrow_mut() = views);
 }
 
+/// Add a condition new rows must hold (row-level security's `WITH CHECK`).
+pub(crate) fn add_check(name: String, condition: String) {
+    PENDING.with(|p| p.borrow_mut().push((name, condition)));
+}
+
 /// The CHECK OPTION conditions the last rewrite produced.
 pub(crate) fn take_view_checks() -> Vec<(String, String)> {
     PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()))

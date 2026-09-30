@@ -12,6 +12,7 @@
 //! return value is ignored; STATEMENT triggers run once, even for no rows.
 
 use bson::{Bson, Document};
+use pgwire::api::results::{Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use secantus_pgcatalog::TableDef;
 use secantus_pgplan::TriggerDef;
@@ -20,6 +21,14 @@ use crate::plpgsql_fn::{self, Record, TriggerData};
 use crate::{PgHandler, PlHost};
 
 pub(crate) const TRIGGER_COLLECTION: &str = "__sql_triggers__";
+
+/// A constraint trigger's row event, held for COMMIT.
+pub(crate) struct DeferredTrigger {
+    pub(crate) trg: Document,
+    op: String,
+    new: Option<Record>,
+    old: Option<Record>,
+}
 
 fn user_error(code: &str, message: String) -> PgWireError {
     PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -92,10 +101,31 @@ impl PgHandler {
     }
 
     pub(crate) fn create_trigger(&self, def: TriggerDef) -> PgWireResult<()> {
-        if self.lookup(&def.table).is_none() {
+        let is_view = self.views()?.iter().any(|(n, _)| *n == def.table);
+        if self.lookup(&def.table).is_none() && !is_view {
             return Err(user_error(
                 "42P01",
                 format!("relation \"{}\" does not exist", def.table),
+            ));
+        }
+        // INSTEAD OF is for views only, and a view takes no row-level
+        // BEFORE / AFTER trigger (measured on PostgreSQL 14).
+        let wrong = |kind: &str, detail: &str| {
+            let mut info = ErrorInfo::new(
+                "ERROR".into(),
+                "42809".into(),
+                format!("\"{}\" is a {kind}", def.table),
+            );
+            info.detail = Some(detail.into());
+            PgWireError::UserError(Box::new(info))
+        };
+        if def.timing == "INSTEAD OF" && !is_view {
+            return Err(wrong("table", "Tables cannot have INSTEAD OF triggers."));
+        }
+        if is_view && def.timing != "INSTEAD OF" && def.level == "ROW" {
+            return Err(wrong(
+                "view",
+                "Views cannot have row-level BEFORE or AFTER triggers.",
             ));
         }
         let function = self.user_function_docs()?.into_iter().find(|d| {
@@ -143,6 +173,17 @@ impl PgHandler {
             "args": def.args.clone(),
             "update_columns": def.update_columns.clone(),
         };
+        if let Some(n) = &def.transition_new {
+            doc.insert("transition_new", n.as_str());
+        }
+        if let Some(o) = &def.transition_old {
+            doc.insert("transition_old", o.as_str());
+        }
+        if def.constraint {
+            doc.insert("constraint", true);
+            doc.insert("deferrable", def.deferrable);
+            doc.insert("initially_deferred", def.initially_deferred);
+        }
         if let Some(when) = &def.when {
             doc.insert("when", when.clone());
         }
@@ -155,7 +196,7 @@ impl PgHandler {
         table: &str,
         if_exists: bool,
     ) -> PgWireResult<()> {
-        if self.lookup(table).is_none() {
+        if self.lookup(table).is_none() && !self.views()?.iter().any(|(n, _)| n == table) {
             if if_exists {
                 self.notice(
                     "00000",
@@ -266,17 +307,20 @@ impl PgHandler {
             level: trg.get_str("level").unwrap_or("ROW").to_string(),
             args: strings(trg, "args"),
         };
-        let outcome = self.with_call_depth(|| {
-            plpgsql_fn::run(
-                &crate::plpgsql_create_sql(&doc),
-                plpgsql_fn::Invocation {
-                    args: &[],
-                    trigger: Some(data),
-                    returns_set: false,
-                },
-                &PlHost { h: self },
-            )
-            .map_err(crate::wire_pl_error)
+        let outcome = self.with_transition_tables(trg, || {
+            self.with_call_depth(|| {
+                plpgsql_fn::run(
+                    &crate::plpgsql_create_sql(&doc),
+                    plpgsql_fn::Invocation {
+                        args: &[],
+                        arg_types: &[],
+                        trigger: Some(data),
+                        returns_set: false,
+                    },
+                    &PlHost { h: self },
+                )
+                .map_err(crate::wire_pl_error)
+            })
         })?;
         Ok(match outcome {
             plpgsql_fn::Outcome::Record(r) => r,
@@ -316,6 +360,7 @@ impl PgHandler {
             &sql,
             plpgsql_fn::Invocation {
                 args: &[],
+                arg_types: &[],
                 trigger: Some(data),
                 returns_set: false,
             },
@@ -391,6 +436,7 @@ impl PgHandler {
 
     /// AFTER INSERT ROW, over the rows as written.
     pub(crate) fn after_insert_rows(&self, def: &TableDef, rows: &[Document]) -> PgWireResult<()> {
+        self.note_transition(&def.name, rows.to_vec(), Vec::new());
         let triggers = self.triggers_for(&def.name, "AFTER", "INSERT", "ROW")?;
         for row in rows {
             if triggers.is_empty() {
@@ -399,7 +445,7 @@ impl PgHandler {
             let new = Some(self.row_record(def, row)?);
             for trg in &triggers {
                 if self.when_holds(trg, "INSERT", &new, &None)? {
-                    self.run_trigger(trg, "INSERT", new.clone(), None)?;
+                    self.fire_after_row(trg, "INSERT", new.clone(), None)?;
                 }
             }
         }
@@ -465,6 +511,11 @@ impl PgHandler {
         targets: &[String],
         pairs: &[(Document, Document)],
     ) -> PgWireResult<()> {
+        self.note_transition(
+            &def.name,
+            pairs.iter().map(|(_, n)| n.clone()).collect(),
+            pairs.iter().map(|(o, _)| o.clone()).collect(),
+        );
         let triggers = self.triggers_for(&def.name, "AFTER", "UPDATE", "ROW")?;
         if triggers.is_empty() {
             return Ok(());
@@ -476,7 +527,7 @@ impl PgHandler {
                 if Self::update_of_applies(trg, targets)
                     && self.when_holds(trg, "UPDATE", &new, &old)?
                 {
-                    self.run_trigger(trg, "UPDATE", new.clone(), old.clone())?;
+                    self.fire_after_row(trg, "UPDATE", new.clone(), old.clone())?;
                 }
             }
         }
@@ -506,6 +557,7 @@ impl PgHandler {
 
     /// AFTER DELETE ROW over the deleted rows.
     pub(crate) fn after_delete_rows(&self, def: &TableDef, rows: &[Document]) -> PgWireResult<()> {
+        self.note_transition(&def.name, Vec::new(), rows.to_vec());
         let triggers = self.triggers_for(&def.name, "AFTER", "DELETE", "ROW")?;
         if triggers.is_empty() {
             return Ok(());
@@ -514,10 +566,277 @@ impl PgHandler {
             let old = Some(self.row_record(def, row)?);
             for trg in &triggers {
                 if self.when_holds(trg, "DELETE", &None, &old)? {
-                    self.run_trigger(trg, "DELETE", None, old.clone())?;
+                    self.fire_after_row(trg, "DELETE", None, old.clone())?;
                 }
             }
         }
         Ok(())
+    }
+
+    /// A write to a view with `INSTEAD OF` row triggers: each row the
+    /// statement names goes to the triggers (in name order) instead of to
+    /// any table; a row counts when every trigger returned non-NULL.
+    pub(crate) fn run_instead_of(
+        &self,
+        io: secantus_pgplan::instead_of::InsteadOf,
+    ) -> PgWireResult<Vec<Response>> {
+        let q = secantus_pgplan::scalar::quote_identifier;
+        let (view_cols, _) =
+            self.internal_query(&format!("SELECT * FROM {} LIMIT 0", q(&io.view)))?;
+        let width = view_cols.len();
+        let (_, rows) = self.internal_query(&io.query_sql)?;
+        let triggers = self.triggers_for(&io.view, "INSTEAD OF", &io.event, "ROW")?;
+        self.fire_statement_triggers(&io.view, "BEFORE", &io.event)?;
+        let record = |values: Vec<Bson>| Record {
+            columns: view_cols.clone(),
+            values,
+        };
+        let mut count = 0usize;
+        for row in rows {
+            let row: Vec<Bson> = row.into_iter().map(|v| v.unwrap_or(Bson::Null)).collect();
+            let (new, old) = match io.event.as_str() {
+                "INSERT" => {
+                    let mut values = vec![Bson::Null; width];
+                    for (i, v) in row.into_iter().enumerate() {
+                        let slot = match io.columns.get(i) {
+                            Some(name) => view_cols
+                                .iter()
+                                .position(|(c, _)| c == name)
+                                .ok_or_else(|| {
+                                    user_error(
+                                        "42703",
+                                        format!(
+                                            "column \"{name}\" of relation \"{}\" does not exist",
+                                            io.view
+                                        ),
+                                    )
+                                })?,
+                            None if io.columns.is_empty() && i < width => i,
+                            None => {
+                                return Err(user_error(
+                                    "42601",
+                                    "INSERT has more expressions than target columns".into(),
+                                ))
+                            }
+                        };
+                        values[slot] = v;
+                    }
+                    (Some(record(values)), None)
+                }
+                "UPDATE" => {
+                    let old: Vec<Bson> = row[..width.min(row.len())].to_vec();
+                    let mut new = old.clone();
+                    for (name, v) in io.columns.iter().zip(row.iter().skip(width)) {
+                        let slot =
+                            view_cols
+                                .iter()
+                                .position(|(c, _)| c == name)
+                                .ok_or_else(|| {
+                                    user_error(
+                                        "42703",
+                                        format!(
+                                            "column \"{name}\" of relation \"{}\" does not exist",
+                                            io.view
+                                        ),
+                                    )
+                                })?;
+                        new[slot] = v.clone();
+                    }
+                    (Some(record(new)), Some(record(old)))
+                }
+                _ => (None, Some(record(row))),
+            };
+            let mut kept = true;
+            for trg in &triggers {
+                if self
+                    .run_trigger(trg, &io.event, new.clone(), old.clone())?
+                    .is_none()
+                {
+                    kept = false;
+                    break;
+                }
+            }
+            if kept {
+                count += 1;
+            }
+        }
+        self.fire_statement_triggers(&io.view, "AFTER", &io.event)?;
+        let tag = match io.event.as_str() {
+            "INSERT" => Tag::new("INSERT").with_oid(0).with_rows(count),
+            other => Tag::new(other).with_rows(count),
+        };
+        Ok(vec![Response::Execution(tag)])
+    }
+
+    /// An AFTER ROW trigger's event: run now, or -- a constraint trigger
+    /// whose constraint is deferred -- queued for COMMIT.
+    fn fire_after_row(
+        &self,
+        trg: &Document,
+        op: &str,
+        new: Option<Record>,
+        old: Option<Record>,
+    ) -> PgWireResult<()> {
+        if trg.get_bool("constraint").unwrap_or(false)
+            && self.deferred_now(
+                trg.get_str("name").unwrap_or_default(),
+                trg.get_bool("deferrable").unwrap_or(false),
+                trg.get_bool("initially_deferred").unwrap_or(false),
+            )
+        {
+            self.deferred_triggers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(DeferredTrigger {
+                    trg: trg.clone(),
+                    op: op.to_string(),
+                    new,
+                    old,
+                });
+            return Ok(());
+        }
+        self.run_trigger(trg, op, new, old).map(|_| ())
+    }
+
+    pub(crate) fn run_deferred_trigger(&self, event: DeferredTrigger) -> PgWireResult<()> {
+        self.run_trigger(&event.trg, &event.op, event.new, event.old)
+            .map(|_| ())
+    }
+
+    /// `SET CONSTRAINTS`: the named (or ALL) deferrable constraints' mode for
+    /// the rest of the block. IMMEDIATE also runs what is already queued for
+    /// them, as PostgreSQL does. Outside a block it only warns.
+    pub(crate) fn set_constraints(&self, names: &[String], deferred: bool) -> PgWireResult<()> {
+        if !self
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.warning(
+                "25P01",
+                "SET CONSTRAINTS can only be used in transaction blocks".into(),
+            );
+            return Ok(());
+        }
+        // Every named constraint must exist and be deferrable.
+        let mut known: Vec<(String, bool)> = Vec::new();
+        for def in self.all_table_defs()? {
+            for fk in &def.foreign_keys {
+                known.push((fk.name.clone(), fk.deferrable));
+            }
+            for u in &def.unique_constraints {
+                known.push((u.name.clone(), u.deferrable));
+            }
+        }
+        for t in self.trigger_docs()? {
+            if t.get_bool("constraint").unwrap_or(false) {
+                known.push((
+                    t.get_str("name").unwrap_or_default().to_string(),
+                    t.get_bool("deferrable").unwrap_or(false),
+                ));
+            }
+        }
+        for name in names {
+            match known.iter().find(|(n, _)| n == name) {
+                None => {
+                    return Err(user_error(
+                        "42704",
+                        format!("constraint \"{name}\" does not exist"),
+                    ))
+                }
+                Some((_, false)) => {
+                    return Err(user_error(
+                        "42809",
+                        format!("constraint \"{name}\" is not deferrable"),
+                    ))
+                }
+                _ => {}
+            }
+        }
+        {
+            let mut modes = self
+                .constraint_modes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if names.is_empty() {
+                modes.0 = Some(deferred);
+                modes.1.clear();
+            } else {
+                for n in names {
+                    modes.1.insert(n.clone(), deferred);
+                }
+            }
+        }
+        // This statement already runs inside the block, so the queued checks
+        // run here directly (wrapping them in the block again would wait on
+        // the block's own lock).
+        if !deferred {
+            self.run_deferred((!names.is_empty()).then_some(names))?;
+        }
+        Ok(())
+    }
+
+    fn note_transition(&self, table: &str, new: Vec<Document>, old: Vec<Document>) {
+        self.transition_rows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(table.to_string(), (new, old));
+    }
+
+    /// Run `f` with a trigger's `REFERENCING` transition tables in place:
+    /// each is a temporary table shaped like the trigger's table, holding
+    /// the statement's new (or old) rows, and gone when `f` returns.
+    fn with_transition_tables<T>(
+        &self,
+        trg: &Document,
+        f: impl FnOnce() -> PgWireResult<T>,
+    ) -> PgWireResult<T> {
+        let names: Vec<(String, bool)> = [("transition_new", true), ("transition_old", false)]
+            .iter()
+            .filter_map(|(k, is_new)| trg.get_str(k).ok().map(|n| (n.to_string(), *is_new)))
+            .collect();
+        if names.is_empty() {
+            return f();
+        }
+        let q = secantus_pgplan::scalar::quote_identifier;
+        let table = trg.get_str("table").unwrap_or_default().to_string();
+        let def = self
+            .lookup(&table)
+            .ok_or_else(|| user_error("42P01", format!("relation \"{table}\" does not exist")))?;
+        let (new, old) = self
+            .transition_rows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&table)
+            .cloned()
+            .unwrap_or_default();
+        let mut made = Vec::new();
+        let mut setup = || -> PgWireResult<()> {
+            for (name, is_new) in &names {
+                self.internal_sql(&format!(
+                    "CREATE TEMP TABLE {} (LIKE {})",
+                    q(name),
+                    q(&table)
+                ))?;
+                made.push(name.clone());
+                let tdef = self.lookup(name).ok_or_else(|| {
+                    user_error("42P01", format!("relation \"{name}\" does not exist"))
+                })?;
+                let docs = if *is_new { &new } else { &old };
+                self.insert_shaped(name, Self::reshape_rows(&def, &tdef, docs)?)?;
+            }
+            Ok(())
+        };
+        let out = setup().and_then(|()| f());
+        // The tables go whatever happened; a failure to drop one is an
+        // error of its own, reported when the trigger itself succeeded.
+        let mut cleanup = Ok(());
+        for name in made {
+            if let Err(e) = self.internal_sql(&format!("DROP TABLE {}", q(&name))) {
+                cleanup = Err(e);
+            }
+        }
+        let value = out?;
+        cleanup?;
+        Ok(value)
     }
 }

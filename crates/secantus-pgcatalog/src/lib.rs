@@ -304,6 +304,10 @@ pub struct CheckConstraint {
     pub expression: String,
     /// `COMMENT ON CONSTRAINT`, shared with the Python server.
     pub comment: Option<String>,
+    /// Added `NOT VALID`: enforced on new writes, not yet checked against the
+    /// rows already there (`VALIDATE CONSTRAINT` does that). Recorded only
+    /// when set, so the shared shape is unchanged otherwise.
+    pub not_valid: bool,
 }
 
 /// A declared UNIQUE constraint, in the Python server's on-disk shape
@@ -330,6 +334,10 @@ pub struct UniqueConstraint {
     pub exclusion_ops: Vec<String>,
     /// The EXCLUDE's access method (`gist`, `btree`), for its definition.
     pub exclusion_method: Option<String>,
+    /// `UNIQUE NULLS NOT DISTINCT` (PostgreSQL 15): NULLs collide like any
+    /// other value. Recorded only when set, so the shared shape is unchanged
+    /// for every constraint without it.
+    pub nulls_not_distinct: bool,
 }
 
 impl UniqueConstraint {
@@ -343,6 +351,7 @@ impl UniqueConstraint {
             exclusion: false,
             exclusion_ops: Vec::new(),
             exclusion_method: None,
+            nulls_not_distinct: false,
         }
     }
 
@@ -361,6 +370,9 @@ impl UniqueConstraint {
         }
         if let Some(m) = &self.exclusion_method {
             d.insert("exclusion_method", m.as_str());
+        }
+        if self.nulls_not_distinct {
+            d.insert("nulls_not_distinct", true);
         }
         d
     }
@@ -387,6 +399,7 @@ impl UniqueConstraint {
                 })
                 .unwrap_or_default(),
             exclusion_method: d.get_str("exclusion_method").ok().map(str::to_string),
+            nulls_not_distinct: d.get_bool("nulls_not_distinct").unwrap_or(false),
         })
     }
 }
@@ -415,11 +428,15 @@ pub struct ForeignKey {
 
 impl CheckConstraint {
     pub fn to_document(&self) -> Document {
-        doc! {
+        let mut d = doc! {
             "name": &self.name,
             "expression": &self.expression,
             "comment": self.comment.clone().map_or(Bson::Null, Bson::String),
+        };
+        if self.not_valid {
+            d.insert("not_valid", true);
         }
+        d
     }
 
     pub fn from_document(d: &Document) -> Option<Self> {
@@ -427,6 +444,7 @@ impl CheckConstraint {
             name: d.get_str("name").ok()?.to_string(),
             expression: d.get_str("expression").ok()?.to_string(),
             comment: d.get_str("comment").ok().map(str::to_string),
+            not_valid: d.get_bool("not_valid").unwrap_or(false),
         })
     }
 }

@@ -370,7 +370,7 @@ fn build(
             let mut rf = rf.clone();
             rf.lateral = false;
             let colnames = function_colnames(&rf);
-            rf.alias = None;
+            rf.alias = keep_column_names(&rf, &alias);
             leaf(
                 pg_query::protobuf::Node {
                     node: Some(N::RangeFunction(rf)),
@@ -384,6 +384,23 @@ fn build(
         }
         _ => Err(Error::Unsupported("this JOIN side".into())),
     }
+}
+
+/// The alias a function keeps when planned as `SELECT * FROM f(...)`: its
+/// column names, if it gave any. Without them a `ROWS FROM` of two functions
+/// of one name (`unnest`, `unnest`) would answer `*` with that name twice,
+/// and the second column would overwrite the first.
+fn keep_column_names(
+    rf: &pg_query::protobuf::RangeFunction,
+    alias: &str,
+) -> Option<pg_query::protobuf::Alias> {
+    rf.alias
+        .as_ref()
+        .filter(|a| !a.colnames.is_empty())
+        .map(|a| pg_query::protobuf::Alias {
+            aliasname: alias.to_string(),
+            colnames: a.colnames.clone(),
+        })
 }
 
 /// A function's output column names from its alias: `AS t(a, b)` names them;
@@ -445,7 +462,7 @@ fn lateral_leaf(
             let colnames = function_colnames(rf);
             let mut bare = rf.clone();
             bare.lateral = false;
-            bare.alias = None;
+            bare.alias = keep_column_names(rf, &alias);
             let select = pg_query::protobuf::SelectStmt {
                 target_list: vec![star_target()],
                 from_clause: vec![pg_query::protobuf::Node {
@@ -1107,97 +1124,156 @@ const SELECT_LIST_SRFS: &[&str] = &[
 /// set-returning function in the select list changes the ROW COUNT, which no
 /// per-row expression can do; as a lateral source it is just more rows.
 ///
-/// `None` when the select list calls none over a column. Several are refused
-/// by name: PostgreSQL runs them in LOCKSTEP (the longest decides the row
-/// count, the others pad with NULL), which a join would get wrong silently.
+/// `None` when the select list calls none over a column. Several run in
+/// LOCKSTEP (the longest decides the row count, the others pad with NULL), as
+/// PostgreSQL runs them: a `ROWS FROM` of them all.
 pub(crate) fn select_list_srf(
     s: &pg_query::protobuf::SelectStmt,
 ) -> Result<Option<pg_query::protobuf::SelectStmt>> {
     let is_srf = |n: Option<&pg_query::protobuf::Node>| match n.and_then(|v| v.node.as_ref()) {
         Some(N::FuncCall(f)) if f.over.is_none() => func_name(f).is_some_and(|name| {
             SELECT_LIST_SRFS.contains(&name.as_str())
-                || crate::correlated::user_function(&name, f.args.len())
+                || crate::correlated::user_function_for(&name, &f.args)
                     .is_some_and(|u| u.returns_set)
         }),
         _ => false,
+    };
+    // A target that IS a set-returning call, or holds one inside an
+    // expression (`generate_series(1, 3) * 2`, `jsonb_path_query(...)::text`).
+    let holds_srf = |n: Option<&pg_query::protobuf::Node>| -> bool {
+        let Some(n) = n else { return false };
+        let mut probe = n.clone();
+        let mut hit = false;
+        let _ = walk_expr(&mut probe, &mut |m| {
+            if is_srf(Some(m)) {
+                hit = true;
+            }
+            Ok(())
+        });
+        hit
     };
     let positions: Vec<usize> = s
         .target_list
         .iter()
         .enumerate()
         .filter(
-            |(_, t)| matches!(t.node.as_ref(), Some(N::ResTarget(r)) if is_srf(r.val.as_deref())),
+            |(_, t)| matches!(t.node.as_ref(), Some(N::ResTarget(r)) if holds_srf(r.val.as_deref())),
         )
         .map(|(i, _)| i)
         .collect();
     // With no FROM, a set-returning function ALONE is already its own
-    // source; beside another target it needs one row to join to.
-    if s.from_clause.is_empty() && (positions.is_empty() || s.target_list.len() == 1) {
+    // source; beside another target, or inside an expression, it needs one
+    // row to join to.
+    let bare_single = s.target_list.len() == 1
+        && matches!(s.target_list[0].node.as_ref(), Some(N::ResTarget(r)) if is_srf(r.val.as_deref()));
+    if s.from_clause.is_empty() && (positions.is_empty() || bare_single) {
         return Ok(None);
     }
-    match positions.as_slice() {
-        [] => Ok(None),
-        [i] => {
-            let mut out = s.clone();
-            if out.from_clause.is_empty() {
-                let one = pg_query::protobuf::SelectStmt {
-                    target_list: Vec::new(),
-                    limit_option: pg_query::protobuf::LimitOption::Default as i32,
-                    op: pg_query::protobuf::SetOperation::SetopNone as i32,
-                    ..Default::default()
-                };
-                out.from_clause.push(pg_query::protobuf::Node {
-                    node: Some(N::RangeSubselect(Box::new(
-                        pg_query::protobuf::RangeSubselect {
-                            lateral: false,
-                            subquery: Some(Box::new(pg_query::protobuf::Node {
-                                node: Some(N::SelectStmt(Box::new(one))),
-                            })),
-                            alias: Some(pg_query::protobuf::Alias {
-                                aliasname: "__one".into(),
-                                colnames: Vec::new(),
-                            }),
-                        },
-                    ))),
-                });
-            }
-            let Some(N::ResTarget(rt)) = out.target_list[*i].node.as_mut() else {
-                return Ok(None);
-            };
-            let call = rt.val.take().expect("checked");
-            let name = match call.node.as_ref() {
-                Some(N::FuncCall(f)) => func_name(f).unwrap_or_default(),
-                _ => String::new(),
-            };
-            if rt.name.is_empty() {
-                rt.name = name;
-            }
-            rt.val = Some(Box::new(pg_query::protobuf::Node {
-                node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
-                    fields: vec![string_node("__srf0"), string_node("__srf0")],
-                    location: -1,
-                })),
-            }));
-            let rf = pg_query::protobuf::RangeFunction {
-                lateral: true,
-                functions: vec![pg_query::protobuf::Node {
-                    node: Some(N::List(pg_query::protobuf::List {
-                        items: vec![*call, pg_query::protobuf::Node { node: None }],
-                    })),
-                }],
-                alias: Some(pg_query::protobuf::Alias {
-                    aliasname: "__srf0".into(),
-                    colnames: vec![string_node("__srf0")],
-                }),
-                ..Default::default()
-            };
-            out.from_clause.push(pg_query::protobuf::Node {
-                node: Some(N::RangeFunction(rf)),
-            });
-            Ok(Some(out))
-        }
-        _ => Err(Error::Unsupported(
-            "several set-returning functions in one select list".into(),
-        )),
+    if positions.is_empty() {
+        return Ok(None);
     }
+    let mut out = s.clone();
+    if out.from_clause.is_empty() {
+        let one = pg_query::protobuf::SelectStmt {
+            target_list: Vec::new(),
+            limit_option: pg_query::protobuf::LimitOption::Default as i32,
+            op: pg_query::protobuf::SetOperation::SetopNone as i32,
+            ..Default::default()
+        };
+        out.from_clause.push(pg_query::protobuf::Node {
+            node: Some(N::RangeSubselect(Box::new(
+                pg_query::protobuf::RangeSubselect {
+                    lateral: false,
+                    subquery: Some(Box::new(pg_query::protobuf::Node {
+                        node: Some(N::SelectStmt(Box::new(one))),
+                    })),
+                    alias: Some(pg_query::protobuf::Alias {
+                        aliasname: "__one".into(),
+                        colnames: Vec::new(),
+                    }),
+                },
+            ))),
+        });
+    }
+    // One function's column is `__srf0.__srf0`, as before; several run in
+    // LOCKSTEP -- the longest decides the row count, the others pad with
+    // NULL -- which is `ROWS FROM (f, g)`, one column each.
+    let several = positions.len() > 1;
+    let column_name = |k: usize| {
+        if several {
+            format!("c{k}")
+        } else {
+            "__srf0".to_string()
+        }
+    };
+    let mut calls = Vec::new();
+    for (k, i) in positions.iter().enumerate() {
+        let Some(N::ResTarget(rt)) = out.target_list[*i].node.as_mut() else {
+            return Ok(None);
+        };
+        let mut expr = *rt.val.take().expect("checked");
+        // The output keeps the name PostgreSQL gives the ORIGINAL
+        // expression (`jsonb_path_query` for its `::text` too).
+        if rt.name.is_empty() {
+            rt.name = expression_column_name(&expr);
+        }
+        let column = pg_query::protobuf::Node {
+            node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+                fields: vec![string_node("__srf0"), string_node(&column_name(k))],
+                location: -1,
+            })),
+        };
+        // Pull the call out of the expression; the column takes its place.
+        let mut call: Option<pg_query::protobuf::Node> = None;
+        if is_srf(Some(&expr)) {
+            call = Some(std::mem::replace(&mut expr, column.clone()));
+        } else {
+            walk_expr(&mut expr, &mut |m| {
+                if call.is_none() && is_srf(Some(m)) {
+                    call = Some(std::mem::replace(m, column.clone()));
+                }
+                Ok(())
+            })?;
+        }
+        let Some(call) = call else {
+            return Ok(None);
+        };
+        // Two set-returning calls inside ONE expression would also run in
+        // lockstep; that shape keeps a refusal rather than a wrong guess.
+        let mut another = false;
+        walk_expr(&mut expr, &mut |m| {
+            another |= is_srf(Some(m));
+            Ok(())
+        })?;
+        if another {
+            return Err(Error::Unsupported(
+                "several set-returning functions in one expression".into(),
+            ));
+        }
+        rt.val = Some(Box::new(expr));
+        calls.push(call);
+    }
+    let rf = pg_query::protobuf::RangeFunction {
+        lateral: true,
+        is_rowsfrom: several,
+        functions: calls
+            .into_iter()
+            .map(|call| pg_query::protobuf::Node {
+                node: Some(N::List(pg_query::protobuf::List {
+                    items: vec![call, pg_query::protobuf::Node { node: None }],
+                })),
+            })
+            .collect(),
+        alias: Some(pg_query::protobuf::Alias {
+            aliasname: "__srf0".into(),
+            colnames: (0..positions.len())
+                .map(|k| string_node(&column_name(k)))
+                .collect(),
+        }),
+        ..Default::default()
+    };
+    out.from_clause.push(pg_query::protobuf::Node {
+        node: Some(N::RangeFunction(rf)),
+    });
+    Ok(Some(out))
 }

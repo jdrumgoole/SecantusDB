@@ -608,34 +608,20 @@ remain open:
   `escape_string_warning` notices; `N'...'` literals are not rewritten (they
   keep the conforming reading), and `backslash_quote` is not a setting
   (2026-09-09).
-- [ ] **OPEN — RUST pgserver: a user BASE type is carried as text, so a
-      cast OUT of it never fails and its values compare (2026-09-09).** A
-      base type completed by `CREATE TYPE t (input=, output=)` stores and
-      returns its text form; `'a'::"a-b"::int` is 42846 `cannot cast type
-      "a-b" to integer` on PG 16.15 but parses the text here, and `=` /
-      `ORDER BY` on the type answer where PG says 42883 `operator does not
-      exist: "a-b" = "a-b"` / `could not identify an ordering operator for
-      type "a-b"`. Values carry no type tag on the way out of storage, which
-      is what a faithful refusal needs.
 - [ ] **OPEN — RUST pgserver: what `CREATE FUNCTION` still refuses
-      (updated 2026-09-29).** `LANGUAGE sql` / `plpgsql` functions are now
-      stored AND callable (corpus `functions` 0 of 27), on the PL/pgSQL
-      interpreter in `plpgsql_fn.rs`. Still refused or unimitated:
-      `VARIADIC` parameters and `BEGIN ATOMIC` SQL bodies (0A000); two
-      overloads at one arity (0A000 — the shared catalog keys a function on
-      `name/nargs`); `DML ... RETURNING INTO` inside PL/pgSQL (0A000);
+      (updated 2026-09-30).** `LANGUAGE sql` / `plpgsql` functions, overloads
+      (keyed `name/nargs/types`), `VARIADIC`, SQL-standard bodies and
+      `RETURNING INTO` all work (corpora `functions`, `overloads`). Left:
       `LANGUAGE internal` wrappers are catalog rows that are never callable
       (PG 16.15 crashed its backend when a mis-declared one was called, so
-      that is not imitated); PG's `WARNING: type input function f should not
-      be volatile` is not emitted; and the `CREATE TYPE` options other than
+      that is not imitated), and the `CREATE TYPE` options other than
       `input` / `output` / `like` (`internallength`, `category`, `receive`,
       ...) are 0A000 rather than applied.
-- [ ] **OPEN — RUST pgserver: what triggers still refuse (2026-09-29).**
-      Corpora `triggers` 0/41 and `triggers2` 0/44 against PostgreSQL 14.
-      Refused with 0A000: `INSTEAD OF` (simple views are writable since
-      2026-09-29 without one; a trigger for a NON-updatable view is not), `CREATE CONSTRAINT TRIGGER` (and so deferred
-      firing), and `REFERENCING OLD/NEW TABLE` transition tables.
-      **Cross-server:** the Python PG server
+- [ ] **OPEN — RUST pgserver triggers: the cross-server gap (2026-09-30).**
+      `INSTEAD OF`, constraint triggers (deferred firing, `SET CONSTRAINTS`)
+      and transition tables landed in batch 9 (corpora `instead_of`,
+      `constraint_triggers`, `transition_tables`, `triggers`, `triggers2` at
+      0 against PostgreSQL 14). **Cross-server:** the Python PG server
       fires only `BEFORE INSERT FOR EACH ROW` triggers, so it silently
       ignores every other kind the Rust server stores in the shared
       `__sql_triggers__` catalog; its `event` key carries only the first
@@ -649,8 +635,6 @@ remain open:
       jsonpath 935/935, aggregates 239 + 375 all matching. Left:
       - Text search lowercasing is ASCII (C-locale), which is what the
         reference cluster runs; a UTF-8 locale would fold more.
-      - jsonpath `.datetime()` is refused (0A000); every other method is
-        implemented.
       - `keyvalue()` ids are computed from a modelled jsonb binary layout; a
         path that visits the SAME object twice through different containers
         can get an id PostgreSQL would number differently.
@@ -665,20 +649,12 @@ remain open:
       - An array operator does not check element types: `int4[] @> $1` with an
         `int2[]` parameter answers where PostgreSQL says 42883 (`params`, 3
         lines). Needs the parameter's declared array type at the operator.
-      - A CORRELATED subquery that aggregates an OUTER column inside HAVING
-        (`HAVING count(*) = (SELECT ... WHERE x = min(d.id))`) is refused.
-      - `array_fill` with explicit lower bounds (arrays here have no lower
-        bound other than 1).
       - EXPLAIN's structured formats carry no `Filter` / `Hash Cond` /
         `Join Type` / costs: the plan holds the lowered MQL filter, not SQL.
       - An EXPRESSION index is an empty storage index (a synthetic key, a
         partial filter nothing matches) plus its SQL; a MongoDB-side
         `listIndexes` on that collection shows it. Its UNIQUE check scans the
         table per write.
-      - Case mapping is Unicode-aware with the SIMPLE mapping, which matches a
-        UTF-8-locale PostgreSQL; this box's reference is `lc_ctype=C`, so
-        `lower('İ')` / `initcap('ßx')` still differ in `strings` (not a bug,
-        see the `strings` notes).
       - Date/time input: the zone abbreviations are the fixed-offset subset
         of PostgreSQL's `Default` set (no dynamic abbreviations like `MSK`
         history), and `DecodeTimeOnly` (bare `time` input) is unchanged.
@@ -690,24 +666,12 @@ remain open:
       COMMITTED, enums, generated columns) leaves (2026-09-30).** 87 corpora
       swept against PostgreSQL 14 at 0 divergences except `arrays` and
       `strings` (one line each, below). Left:
-      - **Row-level security is recorded, not enforced.** Policies are stored
-        and listed in `pg_policies`, and `relrowsecurity` is set, but no read
-        or write is filtered. That needs per-role privilege enforcement, which
-        this server does not have at all yet (every connection is effectively
-        the owner, which PostgreSQL also exempts from RLS unless FORCE is set).
-        FORCE with the owner is the case that would differ today.
       - Partitioning: `PARTITION BY HASH` and expression partition keys are
         refused (0A000). A partition's own column options and constraints in
         `PARTITION OF ... ( ... )` are refused. The Python server does not know
         partitions: it sees a partition as an empty table (the rows are in the
         root's collection). `tableoid` is resolved for relations in the FROM
         list and its JOINs, not inside a FROM subquery.
-      - PRIMARY KEY UPDATE: a SECONDARY unique index refusing a re-keyed row
-        restores that row, but rows re-keyed earlier in the same statement
-        stay moved when the statement is outside a transaction block.
-      - `arrays`: an array's lower bound is always 1 (`'[0:1]={1,2}'` is
-        refused), so `array_lower` / `array_fill` with bounds differ.
-      - `strings`: `lower('İ')`: the C-locale reference, not a bug.
       - A ruleutils-style deparser is approximated: a generation expression or
         policy qual with a function call over a cast, or a CASE, renders
         differently from `pg_get_expr` (`generated` corpus covers the common
@@ -718,11 +682,43 @@ remain open:
       - Built-in function arguments are not type-checked: `upper(1)` answers
         `'1'` where PostgreSQL has no implicit int -> text cast (42883).
       - Extensions still refused (`is not available`): `pg_trgm`
-        (`similarity`, `%`, trigram opclasses) and `pgcrypto` (`digest`,
-        `hmac`, `crypt`, `gen_salt`, `gen_random_bytes`, `pgp_*`). The
-        reference database has both installed.
-      - The geometric types other than `box` (`point`, `line`, `lseg`,
-        `path`, `polygon`, `circle`) do not exist (42704).
+        (`similarity`, `%`, trigram opclasses). `pgcrypto` landed in batch 9
+        except its `pgp_*` functions.
+- [ ] **OPEN — RUST pgserver: what batch 9 (MERGE, RLS enforcement, table
+      locks and timeouts, array lower bounds, ALTER TABLE constraints, PG 15
+      functions) leaves (2026-09-30).** 110 corpora at 0 divergences (PG 14
+      reference; `merge` / `pg15_features` against a PG 15.19 reference). Left:
+      - **Refused statements**:
+        - Catalog objects: `CREATE AGGREGATE`, `CREATE CAST`, `CREATE
+          OPERATOR`, `CREATE COLLATION`, `CREATE STATISTICS`, `CREATE
+          PUBLICATION`, `CREATE RULE`.
+        - Foreign data: `CREATE FOREIGN DATA WRAPPER`, `IMPORT FOREIGN
+          SCHEMA`.
+        - Also refused: `CREATE EVENT TRIGGER`, `CREATE TABLESPACE`,
+          `SECURITY LABEL`.
+        - Table inheritance (`INHERITS`).
+
+        All answer 0A000 by name.
+      - `ALTER TABLE ADD COLUMN ... serial` and a partial-index
+        `ON CONFLICT (c) WHERE ...` arbiter are refused (0A000).
+      - MERGE fires each action's statement triggers once per internal
+        UPDATE / DELETE / INSERT it issues; PostgreSQL fires them once per
+        action type. A target with no primary key finds its rows by EVERY
+        column, so two identical rows act as one.
+      - Row-level security on a table read THROUGH A VIEW applies the
+        caller's policies; PostgreSQL applies the view owner's.
+      - `LOCK TABLE` conflicts with other `LOCK TABLE`s and makes plain
+        statements wait on an explicit lock, but a `LOCK` does not wait for
+        another session's IN-FLIGHT statement (plain statements take no holds),
+        and `pg_locks` does not list table locks.
+      - Array lower bounds survive the functions measured to keep them
+        (`array_append` / `_prepend` / `_cat` / `_remove` / `_replace` /
+        `_fill`, `||`, subscript assignment); any other array-returning
+        function answers a 1-based array.
+      - `CLUSTER` over an expression index is refused (0A000).
+      - PostgreSQL 16 syntax this server accepts where 15 refuses: numeric
+        literals with `_` separators and `0x` / `0o` / `0b` prefixes. `JSON(x)`
+        -- 15's cast to json -- is refused.
 - [ ] **OPEN — RUST pgserver: a non-boolean constant WHERE over
       `generate_series` carries no error POSITION (2026-09-09).** `select 1
       from generate_series(1,3) where 1` is `42804 argument of WHERE must be
@@ -819,30 +815,27 @@ remain open:
       actually qualified, and the UPDATE path never reached the PostgreSQL
       error renderer at all, so any unique violation there (the PRIMARY KEY one
       included) leaked `E11000` with no SQLSTATE.
-- [ ] **OPEN — RUST pgserver: a write that conflicts with a prepared
-      transaction is not a lock wait (2026-09-17).** Two-phase commit landed
-      (`PREPARE TRANSACTION` / `COMMIT PREPARED` / `ROLLBACK PREPARED` /
-      `pg_prepared_xacts`, resolvable from any connection, after a
-      disconnect and after a restart; differential probe of 34 scenarios
-      matches PG 16.15 on all but this one). A prepared transaction keeps
-      its WiredTiger transaction open, so a second writer touching one of
-      its rows hits a WT write conflict where PostgreSQL waits on the row
-      lock. In autocommit the storage layer's unbounded retry makes it
-      BLOCK until the prepared transaction resolves — the PG shape — but
-      the wait is uninterruptible (no `statement_timeout` / `lock_timeout`
-      `57014`; the daemon in that loop also ignores SIGTERM, use
-      `kill -9`). Inside an explicit block it surfaces at once as `XX000`
-      `WriteConflict` and fails the block, where PG blocks. Two smaller
-      narrowings: after a restart a recovered prepared transaction is a
-      replay record, not an open WT transaction, so it holds NO row locks
-      (a conflicting write goes through; the later `COMMIT PREPARED`
-      replays its updates over it, and an insert whose unique key was
-      taken meanwhile fails the commit with `23505`, record retained for
-      `ROLLBACK PREPARED` — PG keeps the locks, so neither can happen); and a
-      crash between a live `COMMIT PREPARED`'s WT commit and the record's
-      deletion is detected at the next `COMMIT PREPARED` by the first
-      minted seq being readable (`prepared_already_committed`), not by a
-      commit record.
+- [ ] **OPEN — RUST pgserver: write conflicts, what is left (updated
+      2026-09-30).** An autocommit write -- and the first write of a block or
+      of an extended-protocol group -- now runs in a transaction it owns, so a
+      conflict with another transaction (a prepared one included) WAITS and
+      re-evaluates against the row that transaction left, as READ COMMITTED
+      does, polling for a cancel, `statement_timeout` (57014) and
+      `lock_timeout` (55P03). (Before, an autocommit `UPDATE ... SET n = n + 1`
+      could silently overwrite a concurrent commit -- a lost update.) Left:
+      - A block that has ALREADY written and then collides answers `40001`
+        where PostgreSQL waits: WiredTiger cannot refresh the snapshot of a
+        transaction that has written, and a conflict aborts the whole of it.
+      - After a restart a recovered prepared transaction is a replay record,
+        not an open WT transaction, so it holds NO row locks (a conflicting
+        write goes through; the later `COMMIT PREPARED` replays its updates
+        over it, and an insert whose unique key was taken meanwhile fails the
+        commit with `23505`, record retained for `ROLLBACK PREPARED` -- PG
+        keeps the locks, so neither can happen).
+      - A crash between a live `COMMIT PREPARED`'s WT commit and the record's
+        deletion is detected at the next `COMMIT PREPARED` by the first minted
+        seq being readable (`prepared_already_committed`), not by a commit
+        record.
 - [ ] **OPEN — RUST pgserver: role membership and md5 passwords (password
       verification landed 2026-09-29).** A role WITH a password now has to
       prove it over SCRAM-SHA-256 (`secantus_auth::begin_scram_pg`), and a
@@ -7311,7 +7304,7 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
       | remaining | why |
       | --- | --- |
       | `upper('ss-sharp')` / `lower` / `initcap` on non-ASCII | **NOT a bug.** This box's PostgreSQL runs `lc_ctype = C`, which does no non-ASCII case mapping at all. Matching it would break against any UTF-8-locale server. Check `SHOW lc_ctype` before touching this. |
-      | `regexp_count` / `_substr` / `_instr` / `_like` | PostgreSQL **14 does not have them** (added in 15), so the reference server answers `42883`. Implementing them puts us AHEAD of the reference and the corpus still shows a divergence. |
+      | ~~`regexp_count` / `_substr` / `_instr` / `_like`~~ | **DONE 2026-09-30.** PostgreSQL 15 added them and this server reports 15.0; measured against a 15.19 reference (`pg15_features` corpus, `# reference-version: 15`). |
       | `regexp_matches`, `regexp_split_to_table` | SET-RETURNING -- the `unnest` family, the single largest remaining gap on both servers. |
       | ~~`normalize(s [, form])`~~ | **DONE 2026-09-29.** Joe approved the `unicode-normalization` dependency. All four forms match PostgreSQL 14.13; the form arrives as an ordinary string constant, so an unknown one is a SYNTAX error before the evaluator sees it. `IS NORMALIZED` is a separate node and still unimplemented. |
       | `COLLATE` in an expression | `CollateClause`, a separate feature. |
@@ -7357,9 +7350,10 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
       architecture rule in CLAUDE.md directly ("Don't leak Python tracebacks to
       the wire"), and it was reachable from a plain SELECT.
 
-      `SET a[i] = v` is implemented on both servers now. What both still refuse,
-      by name: a subscript below 1, and `array_fill` with a lower bound other
-      than 1 -- neither server models array lower bounds.
+      `SET a[i] = v` is implemented on both servers now. The RUST server models
+      array lower bounds since batch 9 (2026-09-30, corpus `array_bounds`); the
+      Python server still refuses, by name, a subscript below 1 and
+      `array_fill` with a lower bound other than 1.
 
       Still open on the Python server after this batch (2 of 29 on `arrays`):
       `ta || 'c'` is accepted where PostgreSQL 14 answers `22P02 malformed
@@ -7390,13 +7384,11 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
         one correct. Probe a subscript rule at 2, never at 1.
       * **A subscript list shorter than the array's dimensionality selects
         NOTHING**: `(ARRAY[[1,2],[3,4]])[1]` is NULL, not the inner row.
-      * **Array lower bounds are NOT modelled, and the two constructors that
-        could produce one are refused by name** rather than re-based to 1:
-        `array_fill(v, dims, lbounds)` with a bound other than 1, and
-        `SET a[i] = v` below subscript 1 (PostgreSQL answers the latter by
-        MOVING the bound, leaving an `[0:5]={...}`). The value would be right
-        and every subscript into it wrong — see `crates/secantus-pgplan/src/
-        arrays.rs`' header.
+      * **Array lower bounds are modelled since batch 9** (2026-09-30): an
+        array whose bound is not 1 is a tagged document (`arrays::bounded`),
+        so `'[0:1]={a,b}'`, `array_fill(v, dims, lbounds)` and `SET a[0] = v`
+        (which MOVES the bound, leaving `[0:5]={...}`) keep their subscripts
+        right. See `crates/secantus-pgplan/src/arrays.rs`' header.
       * **Three TYPE bugs sat behind this and none was visible in a value
         comparison**: an array whose first element is NULL typed as `text[]`
         (so a binary client decoded the integers beside it as NULL); a
@@ -7560,9 +7552,9 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
       * **A view breaks on `ALTER TABLE ... RENAME COLUMN`** of a column it
         reads: the definition is stored as TEXT (the shared on-disk shape),
         where PostgreSQL binds by attnum. Not probed against PostgreSQL yet.
-      * `ALTER TABLE ADD CONSTRAINT UNIQUE` and a partial-index `ON CONFLICT`
-        arbiter, which the backlog said waited on CREATE INDEX, are still
-        refused -- the index machinery now exists for both.
+      * `ALTER TABLE ADD CONSTRAINT UNIQUE` landed in batch 9. A partial-index
+        `ON CONFLICT (v) WHERE ...` arbiter is still refused (0A000, re-probed
+        2026-09-30).
 
       **Two things worth not re-deriving.** A unique index is built with a
       partial filter excluding NULL from every key column, which is how SQL's
@@ -7573,10 +7565,10 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
       23505 path guessed `<table>_<cols>_key` from the columns.
 
       **What ALTER still refuses, and why** (carried over from the DDL entry
-      this replaced): `ALTER COLUMN TYPE ... USING` (the expression rewrites
-      the value rather than casting it), and `ADD COLUMN` carrying `PRIMARY
-      KEY` / `UNIQUE` / `REFERENCES` / a `serial` (each needs an index or a
-      sequence built over existing rows). Each is refused by its own name.
+      this replaced), updated 2026-09-30: `ALTER COLUMN TYPE ... USING`, `ADD
+      UNIQUE / PRIMARY KEY / FOREIGN KEY` and `ADD COLUMN` with inline
+      constraints landed in batch 9; `ADD COLUMN ... serial` (a sequence built
+      over the existing rows) is still refused by name.
 
       **One rule there was measured rather than assumed, and it is easy to get
       backwards.** `ALTER COLUMN TYPE` is allowed exactly where an ASSIGNMENT
@@ -7927,27 +7919,6 @@ which was the Rust server; each measured against 8.2.11 on 2026-09-30):
   cursor's schema is the one both `Describe` and `FETCH` report). Making it
   honour the FETCH's format means keeping the cursor's rows as VALUES and
   encoding per fetch, rather than materialising `DataRow`s once.
-- **Rust PG server: a bare boolean column in WHERE is unsupported (`0A000`
-  ColumnRef).** `WHERE attisdropped` and `WHERE NOT attisdropped` are how
-  PostgreSQL filters a bool column; `attisdropped = false` works. Needed by
-  `CompositeInfo.fetch`'s inner subquery (`AND NOT a.attisdropped`). lower_where
-  handles comparisons and BoolExpr(AND/OR/NOT of comparisons) but not a bare
-  ColumnRef or `NOT <ColumnRef>` as a truth test.
-- [ ] **OPEN — Rust PG server: an array's dimension decoration is dropped
-  on the way back out.** `select '[0:1]={a,b}'::text[]::text` is
-  `[0:1]={a,b}` on PostgreSQL 16 and `{a,b}` here: the literal parser
-  validates the `[lo:hi]` prefix and discards it, because a `Bson::Array`
-  has nowhere to carry lower bounds. The binary form drops them the same
-  way (every dimension is sent with lower bound 1). psycopg's loaders ignore
-  bounds, so no gauge test sees this.
-- [ ] **OPEN — Rust PG server: a composite RESULT column in BINARY format
-  with an ARRAY field fails with `cannot send this value as a binary
-  record`.** `element_binary` has no array arm, so
-  `conn.cursor(binary=True).execute("select row(array[1,2])")` is refused
-  where PostgreSQL 16 sends
-  `00000001000003ef00000024000000010000000000000017000000020000000100000004000000010000000400000002`.
-  (The range / date fields it also used to refuse match PostgreSQL as of
-  2026-09-09.)
 - [ ] **OPEN — RUST pgserver: an ARRAY constructor mixing a typed element
   and an unknown literal keeps the value-derived type where PostgreSQL
   coerces the literal to the typed element's type.** Measured 2026-09-09

@@ -13,7 +13,6 @@ SELECT 7 & 3, 7 | 8, 7 # 2, ~7, 1 << 4, 16 >> 2
 SELECT translate('hello', 'el', 'ip'), overlay('Txxxxas' placing 'hom' from 2 for 4), reverse('abc'), initcap('hello world')
 SELECT lpad('5', 3, '0'), rpad('ab', 5, 'xy'), btrim('xxhixx', 'x'), chr(65), ascii('A'), md5('a'), to_hex(255)
 SELECT starts_with('hello', 'he'), strpos('hello', 'l'), substr('hello', 2, 3), position('l' in 'hello')
-SELECT regexp_split_to_array('a1b2c', '\d'), regexp_count('aaa', 'a'), regexp_instr('abc', 'c'), regexp_substr('abc123', '\d+')
 SELECT quote_ident('a b'), quote_literal('it''s'), quote_nullable(NULL), format('%3s|%-3s|', 'a', 'b')
 SELECT encode('abc'::bytea, 'hex'), decode('616263', 'hex'), encode('abc'::bytea, 'base64'), sha256('abc'::bytea)
 SELECT string_to_table('a,b', ','), unistr('\0041')

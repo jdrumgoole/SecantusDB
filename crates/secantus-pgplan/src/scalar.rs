@@ -20,6 +20,8 @@ pub fn is_scalar(name: &str) -> bool {
         || crate::xml::is_function(name)
         || crate::jsonops::FUNCTIONS.contains(&name)
         || crate::mathfn::FUNCTIONS.contains(&name)
+        || crate::pgcrypto::is_function(name)
+        || crate::geom::FUNCTIONS.contains(&name)
 }
 
 /// Does this built-in's result type follow from its NAME alone?
@@ -149,6 +151,11 @@ const SCALAR_NAMES: &[&str] = &[
     "quote_literal",
     "quote_nullable",
     "normalize",
+    "is_normalized",
+    "regexp_count",
+    "regexp_instr",
+    "regexp_substr",
+    "regexp_like",
     "regexp_split_to_array",
     "unistr",
     "convert_from",
@@ -265,6 +272,173 @@ fn substring(s: &str, start: i64, len: Option<i64>) -> String {
 ///
 /// Without an escape the pattern is a POSIX regex and the answer is the first
 /// CAPTURE GROUP when there is one, the whole match otherwise -- so
+/// A PostgreSQL regular expression's POSIX character classes as the server's
+/// `C.UTF-8` ctype reads them. The regex crate's `[[:alpha:]]` is ASCII-only,
+/// where PostgreSQL under a UTF-8 locale counts `é` as a letter; `[:digit:]`
+/// stays ASCII, as PostgreSQL's does (measured on 14 under `C.UTF-8`).
+pub(crate) fn pg_regex_source(pattern: &str) -> String {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = String::with_capacity(pattern.len());
+    let mut in_bracket = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            out.push(c);
+            if let Some(n) = chars.get(i + 1) {
+                out.push(*n);
+            }
+            i += 2;
+            continue;
+        }
+        if in_bracket && c == '[' && chars.get(i + 1) == Some(&':') {
+            let rest: String = chars[i + 2..].iter().collect();
+            if let Some(end) = rest.find(":]") {
+                let class = &rest[..end];
+                let mapped = match class {
+                    "alpha" => Some("\\p{Alphabetic}"),
+                    "upper" => Some("\\p{Uppercase}"),
+                    "lower" => Some("\\p{Lowercase}"),
+                    "alnum" => Some("\\p{Alphabetic}0-9"),
+                    _ => None,
+                };
+                if let Some(m) = mapped {
+                    out.push_str(m);
+                    i += 2 + class.chars().count() + 2;
+                    continue;
+                }
+            }
+        }
+        if !in_bracket && c == '[' {
+            in_bracket = true;
+            out.push(c);
+            i += 1;
+            // A leading `^` and a leading `]` belong to the bracket.
+            if chars.get(i) == Some(&'^') {
+                out.push('^');
+                i += 1;
+            }
+            if chars.get(i) == Some(&']') {
+                out.push(']');
+                i += 1;
+            }
+            continue;
+        }
+        if in_bracket && c == ']' {
+            in_bracket = false;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// PostgreSQL 15's `regexp_count` / `regexp_instr` / `regexp_substr` /
+/// `regexp_like`, over CHARACTER positions (1-based, as PostgreSQL counts).
+/// Measured against PostgreSQL 15.19: an empty match counts at every
+/// position, `g` is refused, and out-of-range parameters are 22023.
+fn regexp_function(name: &str, args: &[Bson]) -> Result<Bson> {
+    let text = |i: usize| -> Option<String> {
+        args.get(i).map(|v| match v {
+            Bson::String(s) => s.clone(),
+            other => crate::value_text(other),
+        })
+    };
+    let int = |i: usize, param: &str, default: i64, min: i64| -> Result<i64> {
+        let Some(v) = args.get(i) else {
+            return Ok(default);
+        };
+        let n = match v {
+            Bson::Int32(n) => i64::from(*n),
+            Bson::Int64(n) => *n,
+            Bson::String(s) => s.trim().parse().map_err(|_| {
+                Error::InvalidText(format!("invalid input syntax for type integer: \"{s}\""))
+            })?,
+            other => crate::value_text(other).parse().unwrap_or(default),
+        };
+        if n < min {
+            return Err(Error::Sqlstate(
+                "22023",
+                format!("invalid value for parameter \"{param}\": {n}"),
+            ));
+        }
+        Ok(n)
+    };
+    let (subject, pattern) = (text(0).unwrap_or_default(), text(1).unwrap_or_default());
+    // Where each function keeps its flags.
+    let flags_at = match name {
+        "regexp_count" => 3,
+        "regexp_like" => 2,
+        "regexp_instr" => 5,
+        _ => 4,
+    };
+    let flags = text(flags_at).unwrap_or_default();
+    if flags.contains('g') {
+        return Err(Error::Sqlstate(
+            "22023",
+            format!("{name}() does not support the \"global\" option"),
+        ));
+    }
+    let re = regex::RegexBuilder::new(&pg_regex_source(&pattern))
+        .case_insensitive(flags.contains('i'))
+        .build()
+        .map_err(|e| Error::InvalidRegex(format!("invalid regular expression: {e}")))?;
+    if name == "regexp_like" {
+        return Ok(Bson::Boolean(re.is_match(&subject)));
+    }
+    let start = if name == "regexp_like" {
+        1
+    } else {
+        int(2, "start", 1, 1)?
+    };
+    // The byte offset of character `start`; past the end, no match.
+    let chars: Vec<(usize, char)> = subject.char_indices().collect();
+    let char_at = |byte: usize| {
+        chars
+            .iter()
+            .position(|(b, _)| *b >= byte)
+            .unwrap_or(chars.len())
+    };
+    let from = match chars.get(start as usize - 1) {
+        Some((b, _)) => *b,
+        None if start as usize - 1 == chars.len() => subject.len(),
+        None => {
+            return Ok(match name {
+                "regexp_substr" => Bson::Null,
+                _ => Bson::Int32(0),
+            })
+        }
+    };
+    if name == "regexp_count" {
+        let n = re.find_iter(&subject[from..]).count();
+        return Ok(Bson::Int32(i32::try_from(n).unwrap_or(i32::MAX)));
+    }
+    let nth = int(3, "n", 1, 1)?;
+    let (endoption, subexpr) = if name == "regexp_instr" {
+        let e = int(4, "endoption", 0, 0)?;
+        if e > 1 {
+            return Err(Error::Sqlstate(
+                "22023",
+                format!("invalid value for parameter \"endoption\": {e}"),
+            ));
+        }
+        (e, int(6, "subexpr", 0, 0)?)
+    } else {
+        (0, int(5, "subexpr", 0, 0)?)
+    };
+    let hit = re.captures_iter(&subject[from..]).nth(nth as usize - 1);
+    let group = hit.as_ref().and_then(|c| c.get(subexpr as usize));
+    Ok(match (name, group) {
+        ("regexp_substr", Some(m)) => Bson::String(m.as_str().to_string()),
+        ("regexp_substr", None) => Bson::Null,
+        (_, Some(m)) => {
+            let byte = from + if endoption == 1 { m.end() } else { m.start() };
+            Bson::Int32(char_at(byte) as i32 + 1)
+        }
+        (_, None) => Bson::Int32(0),
+    })
+}
+
 /// `substring('abc' from '(b)')` and `substring('abc' from 'b')` both give
 /// `b`, by different routes. No match is NULL, not the empty string.
 ///
@@ -276,7 +450,7 @@ fn substring_pattern(subject: &str, pattern: &str, escape: Option<String>) -> Re
         None => pattern.to_string(),
         Some(esc) => sql_substring_to_regex(pattern, esc)?,
     };
-    let re = regex::Regex::new(&source)
+    let re = regex::Regex::new(&pg_regex_source(&source))
         .map_err(|e| Error::InvalidText(format!("invalid regular expression: {e}")))?;
     let Some(caps) = re.captures(subject) else {
         return Ok(Bson::Null);
@@ -406,6 +580,11 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
     if crate::arrays::is_array_function(name) {
         return crate::arrays::call(name, args);
     }
+    // Every other built-in sees an array's elements, not its lower bounds.
+    if args.iter().any(crate::arrays::is_bounded) {
+        let plain: Vec<Bson> = args.iter().map(crate::arrays::strip).collect();
+        return eval(name, &plain);
+    }
     if let Some(out) = crate::fts::call(name, args) {
         return out;
     }
@@ -416,6 +595,12 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         return out;
     }
     if let Some(out) = crate::mathfn::call(name, args) {
+        return out;
+    }
+    if let Some(out) = crate::pgcrypto::call(name, args) {
+        return out;
+    }
+    if let Some(out) = crate::geom::call(name, args) {
         return out;
     }
     if crate::jsonpath::is_function(name) {
@@ -997,7 +1182,7 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
                 return Err(wrong_args(name));
             }
             let flags = if args.len() == 3 { s(2) } else { String::new() };
-            let re = regex::RegexBuilder::new(&s(1))
+            let re = regex::RegexBuilder::new(&pg_regex_source(&s(1)))
                 .case_insensitive(flags.contains('i'))
                 .build()
                 .map_err(|e| Error::InvalidText(format!("invalid regular expression: {e}")))?;
@@ -1046,6 +1231,17 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
                     )))
                 }
             }))
+        }
+        "regexp_count" | "regexp_instr" | "regexp_substr" | "regexp_like" => {
+            regexp_function(name, args)
+        }
+        // `s IS [form] NORMALIZED`: whether `normalize(s, form)` is `s`.
+        "is_normalized" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(wrong_args(name));
+            }
+            let normal = eval("normalize", args)?;
+            Ok(Bson::Boolean(normal == Bson::String(s(0))))
         }
         // `convert_from(bytea, encoding)` -- decode stored bytes as text.
         "convert_from" => {
@@ -1744,7 +1940,7 @@ fn is_reserved_word(word: &str) -> bool {
     )
 }
 
-fn md5_hex(data: &[u8]) -> String {
+pub fn md5_hex(data: &[u8]) -> String {
     const S: [u32; 64] = [
         7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
         9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
@@ -1836,6 +2032,12 @@ pub fn static_result_type(name: &str) -> &'static str {
     if let Some(t) = crate::mathfn::result_type(name) {
         return t;
     }
+    if let Some(t) = crate::pgcrypto::result_type(name) {
+        return t;
+    }
+    if let Some(t) = crate::geom::result_type(name) {
+        return t;
+    }
     match name {
         "gen_random_uuid" | "uuid_generate_v4" => "uuid",
         "random" => "float8",
@@ -1852,7 +2054,11 @@ pub fn static_result_type(name: &str) -> &'static str {
         "jsonb_path_exists"
         | "jsonb_path_match"
         | "jsonb_path_exists_tz"
-        | "jsonb_path_match_tz" => "bool",
+        | "jsonb_path_match_tz"
+        | "is_normalized"
+        | "regexp_like" => "bool",
+        "regexp_count" | "regexp_instr" => "int4",
+        "regexp_substr" => "text",
         "jsonb_path_query_first"
         | "jsonb_path_query_array"
         | "jsonb_path_query_first_tz"

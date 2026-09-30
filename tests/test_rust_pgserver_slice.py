@@ -11210,22 +11210,21 @@ def test_correlated_subqueries_in_update_and_delete(home: Path) -> None:
         assert cur.fetchall() == [(3,)]
 
 
-def test_a_data_modifying_with_is_refused(home: Path) -> None:
-    """A write inside WITH must run exactly once however many times it is
-    referenced, so it cannot be inlined like a read. (`WITH RECURSIVE`, once
-    refused beside it, is iterated to a fixed point now.)"""
+def test_a_data_modifying_with_runs_once(home: Path) -> None:
+    """A write inside WITH runs exactly once, however many times it is
+    referenced, and the query reads its RETURNING rows."""
     with _Server(home) as server, server.connect() as conn:
         _dept_emp(conn)
         cur = conn.cursor()
         cur.execute("WITH RECURSIVE c AS (SELECT 1 AS x) SELECT x FROM c")
         assert cur.fetchall() == [(1,)]
-        for sql in (
-            "WITH c AS (INSERT INTO sq_dept VALUES (9,'x',1) RETURNING id) SELECT * FROM c",
-        ):
-            with pytest.raises(psycopg.Error) as info:
-                cur.execute(sql)
-            assert info.value.sqlstate == "0A000"
-            conn.rollback()
+        cur.execute(
+            "WITH c AS (INSERT INTO sq_dept VALUES (9,'x',1) RETURNING id) "
+            "SELECT a.id, b.id FROM c a, c b"
+        )
+        assert cur.fetchall() == [(9, 9)]
+        cur.execute("SELECT count(*) FROM sq_dept WHERE id = 9")
+        assert cur.fetchall() == [(1,)]
 
 
 def test_a_qualified_aggregate_argument_resolves_to_the_column(home: Path) -> None:
@@ -12468,24 +12467,19 @@ def test_concatenation_joins_by_dimensionality(home: Path) -> None:
             cur.execute("SELECT array_cat(ARRAY[1,2], ARRAY[[3,4,5]])")
 
 
-def test_array_fill_refuses_a_lower_bound_it_cannot_represent(home: Path) -> None:
-    """This server does not model array lower bounds, so `array_fill` with one
-    is REFUSED rather than answered with a 1-based array.
-
-    The value would be right and every subscript into it wrong — PostgreSQL
-    renders it as `[3:4]={7,7}` and answers `(...)[3]` as 7. A named 0A000 is
-    the honest answer; silently re-basing is the kind of divergence this
-    project treats as data loss.
-    """
+def test_array_fill_keeps_its_lower_bound(home: Path) -> None:
+    """`array_fill(7, ARRAY[2], ARRAY[3])` is `[3:4]={7,7}`: its text shows the
+    bound and its subscripts start there, as PostgreSQL's do."""
     with _Server(home) as server, server.connect() as conn:
         cur = conn.cursor()
         cur.execute("SELECT array_fill(0, ARRAY[2,2]), array_fill(1, ARRAY[0])")
         assert cur.fetchall() == [([[0, 0], [0, 0]], [])]
         cur.execute("SELECT array_fill(7, ARRAY[2], ARRAY[1])")
         assert cur.fetchall() == [([7, 7],)]
-        with pytest.raises(psycopg.Error) as info:
-            cur.execute("SELECT array_fill(7, ARRAY[2], ARRAY[3])")
-        assert info.value.sqlstate == "0A000"
+        cur.execute(
+            "SELECT array_fill(7, ARRAY[2], ARRAY[3])::text, (array_fill(7, ARRAY[2], ARRAY[3]))[3]"
+        )
+        assert cur.fetchall() == [("[3:4]={7,7}", 7)]
 
 
 def test_subscripting_reads_elements_and_slices(home: Path) -> None:
@@ -12586,20 +12580,17 @@ def test_assigning_into_an_array_extends_it_with_nulls(home: Path) -> None:
         assert cur.fetchall() == [([7, 4, 5, None, None, 6], [[1, 42], [3, 4]])]
 
 
-def test_assigning_below_subscript_1_is_refused(home: Path) -> None:
-    """PostgreSQL answers it by MOVING the array's lower bound — `SET ia[0]=0`
-    leaves an `[0:5]={...}`. Without a lower-bound model, writing it at index 1
-    would silently shift every other subscript, so it is refused by name."""
+def test_assigning_below_subscript_1_moves_the_bound(home: Path) -> None:
+    """PostgreSQL answers it by MOVING the array's lower bound -- `SET ia[0]=0`
+    over `{1,2,3}` leaves `[0:3]={0,1,2,3}` -- and every other subscript
+    keeps pointing where it did."""
     with _Server(home) as server, server.connect() as conn:
         cur = conn.cursor()
         cur.execute("CREATE TABLE arr_lb (id int PRIMARY KEY, ia int[])")
         cur.execute("INSERT INTO arr_lb VALUES (1, ARRAY[1,2,3])")
-        with pytest.raises(psycopg.Error) as info:
-            cur.execute("UPDATE arr_lb SET ia[0] = 0 WHERE id=1")
-        assert info.value.sqlstate == "0A000"
-        conn.rollback()
-        cur.execute("SELECT ia FROM arr_lb WHERE id=1")
-        assert cur.fetchall() == [([1, 2, 3],)]
+        cur.execute("UPDATE arr_lb SET ia[0] = 0 WHERE id=1")
+        cur.execute("SELECT ia::text, ia[1] FROM arr_lb WHERE id=1")
+        assert cur.fetchall() == [("[0:3]={0,1,2,3}", 1)]
 
 
 def test_a_slice_assignment_source_must_fill_the_range(home: Path) -> None:
@@ -14267,3 +14258,414 @@ def test_composite_and_distinct_aggregate_ordering(home: Path) -> None:
         assert _fetch(conn, "SELECT string_agg(DISTINCT s, ',' ORDER BY s DESC) FROM dag") == [
             ("b,a",)
         ]
+
+
+def test_sql_standard_and_variadic_functions(home: Path) -> None:
+    """`RETURN expr` / `BEGIN ATOMIC ... END` bodies, VARIADIC parameters
+    (packed, or passed whole with `VARIADIC ARRAY[...]`), and array
+    parameters to a PL/pgSQL function."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE FUNCTION sa(x int) RETURNS int LANGUAGE sql RETURN x + 1")
+        conn.execute(
+            "CREATE FUNCTION sb(x int) RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT x * 2; END"
+        )
+        assert _fetch(conn, "SELECT sa(4), sb(4)") == [(5, 8)]
+        assert (
+            _sqlstate(conn, "CREATE FUNCTION sc() RETURNS int LANGUAGE plpgsql RETURN 5") == "42P13"
+        )
+        conn.execute(
+            "CREATE FUNCTION vf(VARIADIC xs int[]) RETURNS int LANGUAGE sql "
+            "AS 'SELECT array_length(xs, 1)'"
+        )
+        assert _fetch(conn, "SELECT vf(1, 2, 3), vf(7), vf(VARIADIC ARRAY[1, 2])") == [(3, 1, 2)]
+        assert _sqlstate(conn, "SELECT vf()") == "42883"
+        conn.execute(
+            "CREATE FUNCTION vg(p text, VARIADIC xs int[]) RETURNS text LANGUAGE plpgsql "
+            "AS $$ BEGIN RETURN p || array_to_string(xs, ','); END $$"
+        )
+        assert _fetch(conn, "SELECT vg('n=', 4, 5)") == [("n=4,5",)]
+
+
+def test_instead_of_triggers_on_a_view(home: Path) -> None:
+    """INSERT / UPDATE / DELETE on a view with INSTEAD OF triggers run the
+    trigger per row with NEW / OLD in the view's columns; a trigger that
+    answers NULL leaves the row uncounted. Views are relations in pg_class."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE TABLE it_t (id int PRIMARY KEY, name text)")
+        conn.execute("INSERT INTO it_t VALUES (1, 'a')")
+        conn.execute("CREATE VIEW it_v AS SELECT id, upper(name) AS uname FROM it_t")
+        conn.execute(
+            "CREATE FUNCTION it_f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+            "IF TG_OP = 'INSERT' THEN INSERT INTO it_t VALUES (NEW.id, lower(NEW.uname)); "
+            "RETURN NEW; ELSIF TG_OP = 'UPDATE' THEN UPDATE it_t SET name = lower(NEW.uname) "
+            "WHERE id = OLD.id; RETURN NEW; ELSE IF OLD.id = 1 THEN RETURN NULL; END IF; "
+            "DELETE FROM it_t WHERE id = OLD.id; RETURN OLD; END IF; END $$"
+        )
+        conn.execute(
+            "CREATE TRIGGER it_trg INSTEAD OF INSERT OR UPDATE OR DELETE ON it_v "
+            "FOR EACH ROW EXECUTE FUNCTION it_f()"
+        )
+        cur = conn.execute("INSERT INTO it_v VALUES (2, 'B'), (3, 'C')")
+        assert cur.rowcount == 2
+        conn.execute("UPDATE it_v SET uname = 'ZZ' WHERE id = 2")
+        cur = conn.execute("DELETE FROM it_v")
+        assert cur.rowcount == 2
+        assert _fetch(conn, "SELECT id, name FROM it_t ORDER BY id") == [(1, "a")]
+        assert (
+            _sqlstate(
+                conn,
+                "CREATE TRIGGER bad INSTEAD OF INSERT ON it_t FOR EACH ROW EXECUTE FUNCTION it_f()",
+            )
+            == "42809"
+        )
+        assert _fetch(conn, "SELECT relkind FROM pg_class WHERE oid = 'it_v'::regclass") == [("v",)]
+
+
+def test_constraint_triggers_and_set_constraints(home: Path) -> None:
+    """A DEFERRABLE INITIALLY DEFERRED constraint trigger fires at COMMIT
+    (its error fails the COMMIT and rolls back), SET CONSTRAINTS ...
+    IMMEDIATE runs what is queued, and a deferred foreign key can be
+    satisfied before COMMIT."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE TABLE ctt (id int PRIMARY KEY, n int)")
+        conn.execute(
+            "CREATE FUNCTION ctt_chk() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+            "IF NEW.n < 0 THEN RAISE EXCEPTION 'negative'; END IF; RETURN NULL; END $$"
+        )
+        conn.execute(
+            "CREATE CONSTRAINT TRIGGER ctt_def AFTER UPDATE ON ctt DEFERRABLE INITIALLY "
+            "DEFERRED FOR EACH ROW EXECUTE FUNCTION ctt_chk()"
+        )
+        conn.execute("INSERT INTO ctt VALUES (1, 1)")
+        conn.autocommit = False
+        conn.execute("UPDATE ctt SET n = -1")
+        with pytest.raises(psycopg.errors.RaiseException):
+            conn.commit()
+        conn.rollback()
+        assert _fetch(conn, "SELECT n FROM ctt") == [(1,)]
+        conn.execute("UPDATE ctt SET n = -2")
+        with pytest.raises(psycopg.errors.RaiseException):
+            conn.execute("SET CONSTRAINTS ctt_def IMMEDIATE")
+        conn.rollback()
+        conn.autocommit = True
+        conn.execute("CREATE TABLE ctp (id int PRIMARY KEY)")
+        conn.execute("CREATE TABLE ctc (id int PRIMARY KEY, p int REFERENCES ctp DEFERRABLE)")
+        conn.autocommit = False
+        conn.execute("SET CONSTRAINTS ALL DEFERRED")
+        conn.execute("INSERT INTO ctc VALUES (1, 10)")
+        conn.execute("INSERT INTO ctp VALUES (10)")
+        conn.commit()
+        assert _fetch(conn, "SELECT p FROM ctc") == [(10,)]
+
+
+def test_trigger_transition_tables(home: Path) -> None:
+    """`REFERENCING NEW TABLE / OLD TABLE` make the statement's rows a table
+    inside the trigger, and the table is gone afterwards."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE TABLE trt (id int PRIMARY KEY, n int)")
+        conn.execute("CREATE TABLE trlog (msg text)")
+        conn.execute(
+            "CREATE FUNCTION trf() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+            "INSERT INTO trlog SELECT count(*) || ':' || coalesce(sum(n), 0) FROM nt; "
+            "RETURN NULL; END $$"
+        )
+        conn.execute(
+            "CREATE TRIGGER trg AFTER INSERT ON trt REFERENCING NEW TABLE AS nt "
+            "FOR EACH STATEMENT EXECUTE FUNCTION trf()"
+        )
+        conn.execute("INSERT INTO trt VALUES (1, 10), (2, 20)")
+        assert _fetch(conn, "SELECT msg FROM trlog") == [("2:30",)]
+        assert _fetch(conn, "SELECT count(*) FROM pg_class WHERE relname = 'nt'") == [(0,)]
+
+
+def test_geometric_types(home: Path) -> None:
+    """point / lseg / line / path / polygon / circle: input and output forms,
+    casts, the common operators and functions, stored columns, and binary
+    results byte-identical to PostgreSQL 14's `*_send`."""
+    with _Server(home) as server, server.connect() as conn:
+        assert _fetch(
+            conn,
+            "SELECT '1 , 2'::point::text, '1,2,3,4'::lseg::text, '[(0,0),(1,1)]'::line::text, "
+            "'1,2,3,4'::path::text, '(0,0),(1,0),(1,1)'::polygon::text, '1,2,3'::circle::text",
+        ) == [
+            (
+                "(1,2)",
+                "[(1,2),(3,4)]",
+                "{1,-1,0}",
+                "((1,2),(3,4))",
+                "((0,0),(1,0),(1,1))",
+                "<(1,2),3>",
+            )
+        ]
+        assert _fetch(
+            conn,
+            "SELECT point(1.5, 2.25) <-> point(4, 6), circle '<(0,0),5>' @> point '(3,4)', "
+            "(point '(1,2)' * point '(3,4)')::text, area(circle '<(0,0),1>')",
+        ) == [(4.5069390943299865, True, "(-5,10)", 3.141592653589793)]
+        assert _sqlstate(conn, "SELECT area('((0,0),(4,0),(4,3))'::polygon)") == "42883"
+        conn.execute("CREATE TABLE gtt (id int PRIMARY KEY, p point, c circle)")
+        conn.execute("INSERT INTO gtt VALUES (1, '(3,4)', '<(0,0),1>')")
+        assert _fetch(
+            conn, "SELECT p[0], p <-> point '(0,0)', length('[(0,0),(3,4)]'::lseg) FROM gtt"
+        ) == [(3.0, 5.0, 5.0)]
+        cur = conn.cursor(binary=True)
+        cur.execute("SELECT p, c FROM gtt")
+        assert cur.pgresult.fformat(0) == 1
+        assert cur.pgresult.get_value(0, 0) == bytes.fromhex("40080000000000004010000000000000")
+
+
+def test_data_modifying_with_and_returning_into(home: Path) -> None:
+    """A data-modifying WITH item runs once and its RETURNING rows feed the
+    query; PL/pgSQL's `INSERT ... RETURNING ... INTO` fills its target."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE TABLE dws (id int PRIMARY KEY, v text)")
+        conn.execute("CREATE TABLE dwa (id int, v text)")
+        conn.execute("INSERT INTO dws VALUES (1, 'a'), (2, 'b')")
+        conn.execute(
+            "WITH moved AS (DELETE FROM dws WHERE id = 1 RETURNING id, v) "
+            "INSERT INTO dwa SELECT id, v FROM moved"
+        )
+        assert _fetch(conn, "SELECT * FROM dwa") == [(1, "a")]
+        assert _fetch(conn, "SELECT id FROM dws") == [(2,)]
+        conn.execute("CREATE TABLE dwi (id serial PRIMARY KEY, name text)")
+        conn.execute(
+            "CREATE FUNCTION dwadd(n text) RETURNS int LANGUAGE plpgsql AS $$ DECLARE x int; "
+            "BEGIN INSERT INTO dwi (name) VALUES (n) RETURNING id INTO x; RETURN x; END $$"
+        )
+        assert _fetch(conn, "SELECT dwadd('p'), dwadd('q')") == [(1, 2)]
+
+
+def test_function_overloads_and_pg_proc(home: Path) -> None:
+    """Two functions with one name and arity resolve by argument type (an
+    untyped literal prefers text), DROP names the overload, and pg_proc
+    lists them."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE FUNCTION ov(a int) RETURNS text LANGUAGE sql AS 'SELECT ''int'''")
+        conn.execute("CREATE FUNCTION ov(a text) RETURNS text LANGUAGE sql AS 'SELECT ''text'''")
+        assert _fetch(conn, "SELECT ov(1), ov('x')") == [("int", "text")]
+        assert _fetch(conn, "SELECT count(*) FROM pg_proc WHERE proname = 'ov'") == [(2,)]
+        assert _sqlstate(conn, "DROP FUNCTION ov") == "42725"
+        conn.execute("DROP FUNCTION ov(text)")
+        assert _fetch(conn, "SELECT ov('5')") == [("int",)]
+
+
+def test_role_membership_and_reg_types(home: Path) -> None:
+    """CREATE ROLE ... IN ROLE / ROLE / ADMIN record memberships that
+    pg_auth_members and pg_has_role answer from; regnamespace / regrole /
+    regproc resolve and render names."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE ROLE ra")
+        conn.execute("CREATE ROLE rb IN ROLE ra")
+        conn.execute("CREATE ROLE rc")
+        assert _fetch(
+            conn,
+            "SELECT pg_has_role('rb', 'ra', 'member'), pg_has_role('rc', 'ra', 'member')",
+        ) == [(True, False)]
+        assert _fetch(conn, "SELECT count(*) FROM pg_auth_members") == [(1,)]
+        conn.execute("CREATE SCHEMA rs")
+        conn.execute("CREATE FUNCTION rf(a int) RETURNS int LANGUAGE sql AS 'SELECT a'")
+        assert _fetch(
+            conn,
+            "SELECT 'public'::regnamespace::oid, 'rs'::regnamespace::text, "
+            "'rf'::regproc::text, 'rf(integer)'::regprocedure::text",
+        ) == [(2200, "rs", "rf", "rf(integer)")]
+        assert _sqlstate(conn, "SELECT 'nope'::regnamespace") == "3F000"
+
+
+def test_jsonpath_datetime_and_nested_srfs(home: Path) -> None:
+    """`.datetime()` parses ISO forms and templates, compares by kind, and a
+    zone-crossing comparison needs a `*_tz` function; a set-returning call
+    inside a select-list expression expands rows."""
+    with _Server(home) as server, server.connect() as conn:
+        assert _fetch(
+            conn, "SELECT jsonb_path_query('\"2020-01-02 03:04:05+03\"', '$.datetime()')::text"
+        ) == [('"2020-01-02T03:04:05+03:00"',)]
+        assert _fetch(
+            conn,
+            'SELECT jsonb_path_query(\'["2020-01-02", "2019-05-05"]\', '
+            "'$[*] ? (@.datetime() < \"2020-01-01\".datetime())')::text",
+        ) == [('"2019-05-05"',)]
+        tz_query = "'$.datetime() ? (@ < \"2020-01-02 01:00:00+00\".datetime())'"
+        assert _sqlstate(conn, f"SELECT jsonb_path_query('\"2020-01-02\"', {tz_query})") == "0A000"
+        assert _fetch(
+            conn, f"SELECT count(*) FROM jsonb_path_query_tz('\"2020-01-02\"', {tz_query})"
+        ) == [(1,)]
+        assert _fetch(conn, "SELECT generate_series(1, 3) * 2") == [(2,), (4,), (6,)]
+
+
+def test_row_level_security_enforced(home: Path) -> None:
+    """With row security on, a non-owner sees and writes only what its
+    policies allow: no policy denies everything, permissive policies OR,
+    restrictive ones AND, a new row failing a check is 42501, and a
+    reading UPDATE / DELETE is filtered by the SELECT policies too. A
+    superuser and a BYPASSRLS role are not restricted."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE ROLE ra LOGIN")
+        conn.execute("CREATE ROLE rb LOGIN BYPASSRLS")
+        conn.execute("CREATE TABLE rt (id int, owner text, lvl int)")
+        conn.execute("INSERT INTO rt VALUES (1, 'ra', 1), (2, 'x', 1), (3, 'ra', 5)")
+        conn.execute("GRANT ALL ON rt TO ra, rb")
+        conn.execute("ALTER TABLE rt ENABLE ROW LEVEL SECURITY")
+        conn.execute("SET ROLE ra")
+        assert _fetch(conn, "SELECT count(*) FROM rt") == [(0,)]
+        conn.execute("RESET ROLE")
+        conn.execute("CREATE POLICY s ON rt FOR SELECT USING (owner = current_user)")
+        conn.execute("CREATE POLICY i ON rt FOR INSERT WITH CHECK (owner = current_user)")
+        conn.execute("CREATE POLICY d ON rt FOR DELETE USING (lvl = 1)")
+        conn.execute("CREATE POLICY r ON rt AS RESTRICTIVE FOR SELECT USING (lvl < 3)")
+        conn.execute("SET ROLE ra")
+        assert _fetch(conn, "SELECT id FROM rt ORDER BY id") == [(1,)]
+        assert _sqlstate(conn, "INSERT INTO rt VALUES (9, 'x', 1)") == "42501"
+        conn.execute("INSERT INTO rt VALUES (8, 'ra', 1)")
+        # RETURNING reads the rows, so row 2 (not visible) is not deleted.
+        assert sorted(_fetch(conn, "DELETE FROM rt RETURNING id")) == [(1,), (8,)]
+        conn.execute("SET ROLE rb")
+        assert _fetch(conn, "SELECT id FROM rt ORDER BY id") == [(2,), (3,)]
+        conn.execute("RESET ROLE")
+        assert _fetch(conn, "SELECT count(*) FROM rt") == [(2,)]
+
+
+def test_array_lower_bounds(home: Path) -> None:
+    """An array whose lower bound is not 1 keeps it: in its text form, its
+    subscripts, `array_lower` / `array_dims`, equality, the functions that
+    carry it (`array_append`, `||`), a stored column, and an assignment below
+    or past its bounds, which extends it."""
+    with _Server(home) as server, server.connect() as conn:
+        assert _fetch(
+            conn,
+            "SELECT '[0:1]={a,b}'::text[]::text, ('[0:1]={a,b}'::text[])[0], "
+            "array_lower('[0:1]={a,b}'::text[], 1), array_dims(array_fill(7, ARRAY[2], ARRAY[3]))",
+        ) == [("[0:1]={a,b}", "a", 0, "[3:4]")]
+        assert _fetch(
+            conn,
+            "SELECT '[0:1]={a,b}'::text[] = '{a,b}'::text[], "
+            "(array_append('[0:1]={a,b}'::text[], 'c'))::text",
+        ) == [(False, "[0:2]={a,b,c}")]
+        conn.execute("CREATE TABLE lb (id int, a int[])")
+        conn.execute("INSERT INTO lb VALUES (1, '{1,2}'), (2, '[0:1]={5,6}')")
+        conn.execute("UPDATE lb SET a[0] = 9 WHERE id = 1")
+        conn.execute("UPDATE lb SET a[3] = 8 WHERE id = 2")
+        assert _fetch(conn, "SELECT a::text FROM lb ORDER BY id") == [
+            ("[0:2]={9,1,2}",),
+            ("[0:3]={5,6,NULL,8}",),
+        ]
+        assert _fetch(conn, "SELECT id FROM lb WHERE a = '[0:3]={5,6,NULL,8}'") == [(2,)]
+
+
+def test_view_and_subquery_privileges(home: Path) -> None:
+    """A view is checked as the view, its base tables as its owner; a
+    subquery anywhere in the statement is checked with it."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE ROLE vu LOGIN")
+        conn.execute("CREATE TABLE vb (id int)")
+        conn.execute("CREATE TABLE vo (id int)")
+        conn.execute("INSERT INTO vb VALUES (1), (2)")
+        conn.execute("CREATE VIEW vv AS SELECT id FROM vb")
+        conn.execute("GRANT SELECT ON vv TO vu")
+        conn.execute("SET ROLE vu")
+        assert _fetch(conn, "SELECT id FROM vv ORDER BY id") == [(1,), (2,)]
+        assert _sqlstate(conn, "SELECT id FROM vb") == "42501"
+        assert _sqlstate(conn, "SELECT id FROM vv WHERE id IN (SELECT id FROM vo)") == "42501"
+        assert _sqlstate(conn, "UPDATE vv SET id = 3") == "42501"
+
+
+def test_sql_prepare_execute(home: Path) -> None:
+    """SQL `PREPARE` / `EXECUTE` / `DEALLOCATE`: arguments coerced to the
+    parameters' types, the wrong count refused, and the statement listed in
+    `pg_prepared_statements` with `from_sql`."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE TABLE ps (id int, v text)")
+        conn.execute("PREPARE ins(int, text) AS INSERT INTO ps VALUES ($1, $2)")
+        conn.execute("EXECUTE ins(1, 'a')")
+        conn.execute("PREPARE sel AS SELECT v FROM ps WHERE id = $1")
+        assert _fetch(conn, "EXECUTE sel('1')") == [("a",)]
+        assert _sqlstate(conn, "EXECUTE sel") == "42601"
+        assert _sqlstate(conn, "EXECUTE nope") == "26000"
+        assert _sqlstate(conn, "PREPARE sel AS SELECT 1") == "42P05"
+        assert _fetch(
+            conn,
+            "SELECT name, parameter_types::text, from_sql FROM pg_prepared_statements ORDER BY 1",
+        ) == [("ins", "{integer,text}", True), ("sel", "{integer}", True)]
+        conn.execute("DEALLOCATE ALL")
+        assert _fetch(conn, "SELECT count(*) FROM pg_prepared_statements") == [(0,)]
+
+
+def test_autocommit_write_waits_and_reevaluates(home: Path) -> None:
+    """An autocommit UPDATE that meets another transaction's uncommitted
+    write to its row waits for it and then builds on the committed value --
+    it does not overwrite it (a lost update). Simple and extended protocol."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        a.execute("CREATE TABLE lu (id int PRIMARY KEY, n int)")
+        a.execute("INSERT INTO lu VALUES (1, 0)")
+        for sql, args in (
+            ("UPDATE lu SET n = n + 1 WHERE id = 1", None),
+            ("UPDATE lu SET n = n + %s WHERE id = %s", (1, 1)),
+        ):
+            a.execute("BEGIN")
+            a.execute("UPDATE lu SET n = n + 100 WHERE id = 1")
+            worker = threading.Thread(target=b.execute, args=(sql, args))
+            worker.start()
+            time.sleep(0.3)
+            a.execute("COMMIT")
+            worker.join(10)
+            assert not worker.is_alive()
+        assert _fetch(a, "SELECT n FROM lu") == [(202,)]
+
+
+def test_statement_and_lock_timeouts(home: Path) -> None:
+    """`statement_timeout` cancels a running statement (57014) and
+    `lock_timeout` a lock wait (55P03); `LOCK TABLE` needs a block, and a
+    table locked ACCESS EXCLUSIVE shuts out another session's reads."""
+    with _Server(home) as server, server.connect() as a, server.connect() as b:
+        a.execute("SET statement_timeout = 100")
+        assert _sqlstate(a, "SELECT pg_sleep(1)") == "57014"
+        a.execute("RESET statement_timeout")
+        assert _fetch(a, "SHOW statement_timeout") == [("0",)]
+        a.execute("CREATE TABLE lt (id int)")
+        assert _sqlstate(a, "LOCK TABLE lt") == "25P01"
+        a.execute("BEGIN")
+        a.execute("LOCK TABLE lt IN ACCESS EXCLUSIVE MODE")
+        b.execute("SET lock_timeout = 100")
+        assert _sqlstate(b, "SELECT count(*) FROM lt") == "55P03"
+        b.execute("BEGIN")
+        assert _sqlstate(b, "LOCK TABLE lt IN SHARE MODE NOWAIT") == "55P03"
+        b.execute("ROLLBACK")
+        a.execute("COMMIT")
+        assert _fetch(b, "SELECT count(*) FROM lt") == [(0,)]
+
+
+def test_maintenance_statements_and_cluster(home: Path) -> None:
+    """VACUUM / ANALYZE / CHECKPOINT / REINDEX validate what they name, and
+    CLUSTER rewrites the table in an index's order, recording it."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("CREATE TABLE mc (id int PRIMARY KEY, v text)")
+        conn.execute("INSERT INTO mc VALUES (3, 'c'), (1, 'a'), (2, 'b')")
+        conn.execute("CREATE INDEX mc_v ON mc (v DESC)")
+        for ok in ("VACUUM mc", "ANALYZE mc (v)", "CHECKPOINT", "REINDEX TABLE mc"):
+            conn.execute(ok)
+        assert _sqlstate(conn, "VACUUM nosuch") == "42P01"
+        assert _sqlstate(conn, "ANALYZE mc (nope)") == "42703"
+        conn.execute("CLUSTER mc USING mc_v")
+        assert _fetch(conn, "SELECT id FROM mc") == [(3,), (2,), (1,)]
+        conn.execute("CLUSTER mc USING mc_pkey")
+        assert _fetch(conn, "SELECT id FROM mc") == [(1,), (2,), (3,)]
+        conn.execute("BEGIN")
+        assert _sqlstate(conn, "VACUUM mc") == "25001"
+        conn.execute("ROLLBACK")
+
+
+def test_ordinality_rows_from_and_values_clauses(home: Path) -> None:
+    """`WITH ORDINALITY` numbers a function's rows, `ROWS FROM` zips
+    functions, a bare VALUES takes ORDER BY / LIMIT, and one output name
+    twice in a FROM subquery is still two columns."""
+    with _Server(home) as server, server.connect() as conn:
+        assert _fetch(conn, "SELECT * FROM unnest(ARRAY['a','b']) WITH ORDINALITY AS t(v, n)") == [
+            ("a", 1),
+            ("b", 2),
+        ]
+        assert _fetch(
+            conn,
+            "SELECT * FROM ROWS FROM (generate_series(1,2), unnest(ARRAY['x','y','z'])) AS t(a, b)",
+        ) == [(1, "x"), (2, "y"), (None, "z")]
+        assert _fetch(conn, "VALUES (1), (2), (3) ORDER BY 1 DESC LIMIT 2") == [(3,), (2,)]
+        assert _fetch(conn, "SELECT * FROM (SELECT 1 AS a, 2 AS a) s") == [(1, 2)]
