@@ -67,7 +67,27 @@ pub(crate) fn extra_columns(name: &str) -> &'static [(&'static str, &'static str
             ("attoptions", "text[]"),
             ("attfdwoptions", "text[]"),
         ],
-        "pg_type" => &[("typcollation", "oid"), ("typelem", "oid")],
+        "pg_type" => &[
+            ("typcollation", "oid"),
+            ("typelem", "oid"),
+            ("typlen", "int2"),
+            ("typbyval", "bool"),
+            ("typalign", secantus_pgplan::QUOTED_CHAR),
+            ("typstorage", secantus_pgplan::QUOTED_CHAR),
+            ("typcategory", secantus_pgplan::QUOTED_CHAR),
+            ("typispreferred", "bool"),
+            ("typisdefined", "bool"),
+            ("typinput", "regproc"),
+            ("typoutput", "regproc"),
+            ("typreceive", "regproc"),
+            ("typsend", "regproc"),
+            ("typmodin", "regproc"),
+            ("typmodout", "regproc"),
+            ("typanalyze", "regproc"),
+            ("typsubscript", "regproc"),
+            ("typndims", "int4"),
+            ("typacl", "text[]"),
+        ],
         "pg_proc" => &[
             ("proparallel", secantus_pgplan::QUOTED_CHAR),
             ("proacl", "text[]"),
@@ -846,6 +866,19 @@ impl PgHandler {
                             "attislocal" => Bson::Boolean(true),
                             _ => Bson::Boolean(false),
                         }
+                    }
+                    ("pg_type", "typisdefined") => Bson::Boolean(true),
+                    ("pg_type", "typndims") => Bson::Int32(0),
+                    ("pg_type", "typacl") => Bson::Null,
+                    ("pg_type", c) if crate::pg_type_facts::COLUMNS.contains(&c) => {
+                        let oid = int(get(row, "oid"));
+                        crate::pg_type_facts::builtin(oid, c)
+                            .or_else(|| {
+                                let kind = text(get(row, "typtype"));
+                                let base = int(get(row, "typbasetype"));
+                                crate::pg_type_facts::by_kind(&kind, (base > 0).then_some(base), c)
+                            })
+                            .unwrap_or(Bson::Null)
                     }
                     ("pg_type", "typcollation") => {
                         Bson::Int64(type_collation(int(get(row, "oid"))))

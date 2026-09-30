@@ -17,3 +17,14 @@ DELETE FROM df_t t USING df_s s WHERE t.id = s.tid AND s.v = 200
 SELECT id FROM df_t ORDER BY id
 DELETE FROM df_t USING df_s WHERE df_s.id = 42
 SELECT id FROM df_t ORDER BY id
+create table ry_o (id int, n int)
+insert into ry_o values (1, 10), (2, 20), (3, 30)
+create view ry_v as select id, n from ry_o
+select count(*) from ry_o where exists (select 1 from (SELECT r2.id AS o_id FROM ry_o r2 WHERE id = 1) AS s where ry_o.id = s.o_id)
+select count(*) from ry_o where exists (select 1 from (SELECT ry_v.id AS o_id FROM ry_v WHERE id = 1) AS s where ry_o.id = s.o_id)
+DELETE FROM ry_o USING (SELECT ry_v.id AS o_id FROM ry_v WHERE id = 1) AS s WHERE ry_o.id = s.o_id
+select * from ry_o order by 1
+UPDATE ry_o SET n = s.x FROM (SELECT r2.id AS i, r2.n * 2 AS x FROM ry_o r2 WHERE id = 2) AS s WHERE ry_o.id = s.i
+select * from ry_o order by 1
+drop view ry_v
+drop table ry_o

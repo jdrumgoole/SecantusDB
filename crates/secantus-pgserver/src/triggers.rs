@@ -89,14 +89,6 @@ impl PgHandler {
             })
             .collect();
         out.sort_by(|a, b| a.get_str("name").ok().cmp(&b.get_str("name").ok()));
-        // A rule is a rewrite, applied before any trigger fires.
-        if level == "ROW" {
-            let mut rules = self.rule_triggers(table, timing, event);
-            if !rules.is_empty() {
-                rules.append(&mut out);
-                return Ok(rules);
-            }
-        }
         Ok(out)
     }
 
@@ -106,8 +98,7 @@ impl PgHandler {
         Ok(self
             .trigger_docs()?
             .iter()
-            .any(|d| d.get_str("table") == Ok(table))
-            || self.has_rules(table))
+            .any(|d| d.get_str("table") == Ok(table)))
     }
 
     /// `ALTER TABLE ... ENABLE / DISABLE TRIGGER name | ALL | USER`.
@@ -421,21 +412,13 @@ impl PgHandler {
         new: Option<Record>,
         old: Option<Record>,
     ) -> PgWireResult<Option<Record>> {
-        // A rule carries its own body.
-        let source = match trg.get_str("inline_function") {
-            Ok(sql) => sql.to_string(),
-            Err(_) => {
-                let function = trg.get_str("function").unwrap_or_default();
-                let doc = self
-                    .user_function_docs()?
-                    .into_iter()
-                    .find(|d| d.get_str("name") == Ok(function) && d.get_i32("nargs") == Ok(0))
-                    .ok_or_else(|| {
-                        user_error("42883", format!("function {function}() does not exist"))
-                    })?;
-                crate::plpgsql_create_sql(&doc)
-            }
-        };
+        let function = trg.get_str("function").unwrap_or_default();
+        let doc = self
+            .user_function_docs()?
+            .into_iter()
+            .find(|d| d.get_str("name") == Ok(function) && d.get_i32("nargs") == Ok(0))
+            .ok_or_else(|| user_error("42883", format!("function {function}() does not exist")))?;
+        let source = crate::plpgsql_create_sql(&doc);
         let data = TriggerData {
             new,
             old,
@@ -465,9 +448,6 @@ impl PgHandler {
             plpgsql_fn::Outcome::Record(r) => r,
             _ => None,
         };
-        if row.is_none() && trg.get_bool("rule_instead_same_kind").unwrap_or(false) {
-            crate::rules::add_instead_rows(1);
-        }
         Ok(row)
     }
 

@@ -524,6 +524,29 @@ one request path:
       Matching the `C` cluster instead would break against every UTF-8-locale
       server.
 
+    **Batch 12 (2026-09-30)** fixed two more silent wrong answers: a
+    `DELETE ... USING (subquery)` that deleted every row, and a `HAVING` with
+    no `GROUP BY` that was ignored. It also replaced three approximations with
+    PostgreSQL's own machinery:
+    - rules now rewrite the statement (`rule_rewrite.rs`), where they used
+      to run as per-row triggers;
+    - built-in calls pick an overload with `func_select_candidate`
+      (`funcsig.rs`, over PG 15's `pg_proc` / implicit casts / type
+      categories), so `round(int)` is `float8` and
+      `generate_series(int2, int2)` is `42725`;
+    - `pg_type` carries PG 15's facts for the built-ins.
+
+    Rules from that work:
+
+    - **Overload choice is by TYPE CATEGORY, and the answer is often not the
+      "natural" one.** An integer argument to `round` / `ceil` / `floor` picks
+      `float8` over `numeric` because `float8` is the numeric category's
+      preferred type. Read the catalogs (`pg_proc`, `typcategory`,
+      `typispreferred`) rather than reasoning about which overload "fits".
+    - **Check `git ls-files` before naming a new corpus.** A new
+      `overloads.sql` was written over the existing user-function corpus of
+      that name and only the `M` in `git status` gave it away.
+
     **What remains refused** (re-measured 2026-09-30, after batch 11): no
     statement the earlier surveys listed. Batch 11 landed `CREATE CAST` /
     `COLLATION` / `RULE` / `EVENT TRIGGER`, the foreign-data statements

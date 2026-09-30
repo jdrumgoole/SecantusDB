@@ -358,6 +358,9 @@ features = ["aws_lc_rs"]
 version = "0.13"
 features = ["json"]
 
+[dev-dependencies.rcgen]
+version = "0.13"
+
 [dev-dependencies.rsa]
 version = "0.9"
 

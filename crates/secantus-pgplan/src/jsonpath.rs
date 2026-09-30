@@ -1116,6 +1116,28 @@ struct Cxt<'a> {
     ignore_structural: bool,
     throw_errors: bool,
     innermost_array_size: i64,
+    /// Where the item handed to the next `exec` sits in the root document
+    /// (`None`: a computed item, not the document's). `.keyvalue()`'s `id` is
+    /// that position's byte offset, which a value alone cannot tell apart
+    /// from an equal object elsewhere.
+    pending_path: Option<Vec<Step>>,
+    /// The position of `@` inside a filter.
+    current_path: Option<Vec<Step>>,
+}
+
+/// One step from a container to a child.
+#[derive(Debug, Clone, PartialEq)]
+enum Step {
+    Key(String),
+    Idx(usize),
+}
+
+fn child_path(base: &Option<Vec<Step>>, step: Step) -> Option<Vec<Step>> {
+    base.as_ref().map(|b| {
+        let mut p = b.clone();
+        p.push(step);
+        p
+    })
 }
 
 fn sqlerr(code: &'static str, msg: impl Into<String>) -> Error {
@@ -1206,11 +1228,13 @@ impl Cxt<'_> {
         items: &[Json],
         mut found: Option<&mut Vec<Json>>,
         unwrap_elems: bool,
+        base: Option<Vec<Step>>,
     ) -> Result<Res> {
         let mut res = Res::NotFound;
-        for v in items {
+        for (i, v) in items.iter().enumerate() {
             match n {
                 Some(n) => {
+                    self.pending_path = child_path(&base, Step::Idx(i));
                     res = self.exec_opt(n, v, found.as_deref_mut(), unwrap_elems)?;
                     if res == Res::Error {
                         break;
@@ -1241,17 +1265,23 @@ impl Cxt<'_> {
         last: u32,
         ignore_structural: bool,
         unwrap_next: bool,
+        base: Option<Vec<Step>>,
     ) -> Result<Res> {
         let mut res = Res::NotFound;
         if level > last {
             return Ok(res);
         }
-        let children: Vec<&Json> = match container {
-            Json::Array(a) => a.iter().collect(),
-            Json::Object(o) => o.iter().map(|(_, v)| v).collect(),
+        let children: Vec<(Step, &Json)> = match container {
+            Json::Array(a) => a
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (Step::Idx(i), v))
+                .collect(),
+            Json::Object(o) => o.iter().map(|(k, v)| (Step::Key(k.clone()), v)).collect(),
             _ => Vec::new(),
         };
-        for v in children {
+        for (step, v) in children {
+            let here = child_path(&base, step);
             if level >= first
                 || (first == u32::MAX
                     && last == u32::MAX
@@ -1263,6 +1293,7 @@ impl Cxt<'_> {
                         if ignore_structural {
                             self.ignore_structural = true;
                         }
+                        self.pending_path = here.clone();
                         let r = self.exec_opt(n, v, found.as_deref_mut(), unwrap_next);
                         self.ignore_structural = saved;
                         res = r?;
@@ -1289,6 +1320,7 @@ impl Cxt<'_> {
                     last,
                     ignore_structural,
                     unwrap_next,
+                    here.clone(),
                 )?;
                 if res == Res::Error {
                     break;
@@ -1308,6 +1340,7 @@ impl Cxt<'_> {
         mut found: Option<&mut Vec<Json>>,
         unwrap: bool,
     ) -> Result<Res> {
+        let here = self.pending_path.take();
         match &n.item {
             Item::Binary(
                 Op::And
@@ -1340,6 +1373,7 @@ impl Cxt<'_> {
                 Json::Object(o) => match o.iter().rev().find(|(kk, _)| kk == k) {
                     Some((_, v)) => {
                         let v = v.clone();
+                        self.pending_path = child_path(&here, Step::Key(k.clone()));
                         self.next(n, v, found)
                     }
                     None => {
@@ -1357,7 +1391,7 @@ impl Cxt<'_> {
                 },
                 Json::Array(a) if unwrap => {
                     let a = a.clone();
-                    self.unwrap_array(Some(n), &a, found, false)
+                    self.unwrap_array(Some(n), &a, found, false, here.clone())
                 }
                 _ => {
                     if !self.ignore_structural {
@@ -1374,10 +1408,12 @@ impl Cxt<'_> {
             },
             Item::Root => {
                 let root = self.root.clone();
+                self.pending_path = Some(Vec::new());
                 self.next(n, root, found)
             }
             Item::Current => {
                 let cur = self.current.clone();
+                self.pending_path = self.current_path.clone();
                 self.next(n, cur, found)
             }
             Item::AnyArray => {
@@ -1385,9 +1421,12 @@ impl Cxt<'_> {
                     Json::Array(a) => {
                         let a = a.clone();
                         let unwrap_elems = self.auto_unwrap();
-                        self.unwrap_array(n.next.as_deref(), &a, found, unwrap_elems)
+                        self.unwrap_array(n.next.as_deref(), &a, found, unwrap_elems, here)
                     }
-                    _ if self.auto_wrap() => self.next(n, jb.clone(), found),
+                    _ if self.auto_wrap() => {
+                        self.pending_path = here;
+                        self.next(n, jb.clone(), found)
+                    }
                     _ => {
                         if !self.ignore_structural {
                             ret_err!(self, sqlerr("22039", "jsonpath wildcard array accessor can only be applied to an array"));
@@ -1448,8 +1487,10 @@ impl Cxt<'_> {
                     let mut idx = lo;
                     while idx <= hi {
                         let v = if singleton {
+                            self.pending_path = here.clone();
                             jb.clone()
                         } else {
+                            self.pending_path = child_path(&here, Step::Idx(idx as usize));
                             arr.as_ref().expect("array")[idx as usize].clone()
                         };
                         if !Self::has_next(n) && found.is_none() {
@@ -1487,11 +1528,21 @@ impl Cxt<'_> {
                 Json::Object(_) => {
                     let c = jb.clone();
                     let unwrap_next = self.auto_unwrap();
-                    self.any_item(n.next.as_deref(), &c, found, 1, 1, 1, false, unwrap_next)
+                    self.any_item(
+                        n.next.as_deref(),
+                        &c,
+                        found,
+                        1,
+                        1,
+                        1,
+                        false,
+                        unwrap_next,
+                        here,
+                    )
                 }
                 Json::Array(a) if unwrap => {
                     let a = a.clone();
-                    self.unwrap_array(Some(n), &a, found, false)
+                    self.unwrap_array(Some(n), &a, found, false, here.clone())
                 }
                 _ => {
                     if !self.ignore_structural {
@@ -1509,15 +1560,18 @@ impl Cxt<'_> {
                 if unwrap {
                     if let Json::Array(a) = jb {
                         let a = a.clone();
-                        return self.unwrap_array(Some(n), &a, found, false);
+                        return self.unwrap_array(Some(n), &a, found, false, here.clone());
                     }
                 }
                 let prev = std::mem::replace(&mut self.current, jb.clone());
+                let prev_path = std::mem::replace(&mut self.current_path, here.clone());
                 let st = self.bool_item(p, jb);
                 self.current = prev;
+                self.current_path = prev_path;
                 if st? != Tri::True {
                     Ok(Res::NotFound)
                 } else {
+                    self.pending_path = here;
                     self.next(n, jb.clone(), found)
                 }
             }
@@ -1527,7 +1581,10 @@ impl Cxt<'_> {
                     let saved = self.ignore_structural;
                     self.ignore_structural = true;
                     let r = match &n.next {
-                        Some(nx) => self.exec(nx, jb, found.as_deref_mut()),
+                        Some(nx) => {
+                            self.pending_path = here.clone();
+                            self.exec(nx, jb, found.as_deref_mut())
+                        }
                         None => {
                             if let Some(f) = found.as_deref_mut() {
                                 f.push(jb.clone());
@@ -1552,6 +1609,7 @@ impl Cxt<'_> {
                         *last,
                         true,
                         unwrap_next,
+                        here.clone(),
                     )?;
                 }
                 Ok(res)
@@ -1593,7 +1651,7 @@ impl Cxt<'_> {
                 if unwrap {
                     if let Json::Array(a) = jb {
                         let a = a.clone();
-                        return self.unwrap_array(Some(n), &a, found, false);
+                        return self.unwrap_array(Some(n), &a, found, false, here.clone());
                     }
                 }
                 let Some(t) = num_text(jb) else {
@@ -1624,7 +1682,7 @@ impl Cxt<'_> {
                 if unwrap {
                     if let Json::Array(a) = jb {
                         let a = a.clone();
-                        return self.unwrap_array(Some(n), &a, found, false);
+                        return self.unwrap_array(Some(n), &a, found, false, here.clone());
                     }
                 }
                 let v = match jb {
@@ -1658,7 +1716,7 @@ impl Cxt<'_> {
                 if unwrap {
                     if let Json::Array(a) = jb {
                         let a = a.clone();
-                        return self.unwrap_array(Some(n), &a, found, false);
+                        return self.unwrap_array(Some(n), &a, found, false, here.clone());
                     }
                 }
                 let Json::Object(o) = jb else {
@@ -1674,8 +1732,14 @@ impl Cxt<'_> {
                     return Ok(Res::NotFound);
                 }
                 // PostgreSQL's id is the object's byte offset inside the
-                // binary jsonb of the document it came from.
-                let id = container_offset(self.root, jb).unwrap_or(0);
+                // binary jsonb of the document it came from: found by the
+                // object's POSITION, since equal objects sit at different
+                // offsets.
+                let id = here
+                    .as_ref()
+                    .and_then(|path| offset_at(self.root, path))
+                    .or_else(|| container_offset(self.root, jb))
+                    .unwrap_or(0);
                 let mut res = Res::NotFound;
                 let pairs = normalized_pairs(o);
                 for (k, v) in pairs {
@@ -1702,7 +1766,7 @@ impl Cxt<'_> {
                 if unwrap {
                     if let Json::Array(a) = jb {
                         let a = a.clone();
-                        return self.unwrap_array(Some(n), &a, found, false);
+                        return self.unwrap_array(Some(n), &a, found, false, here.clone());
                     }
                 }
                 let Json::Str(text) = jb else {
@@ -2165,6 +2229,46 @@ fn layout<'a>(v: &'a Json, p: usize, out: &mut Vec<(usize, &'a Json)>) -> usize 
     }
 }
 
+/// The byte offset of the container at `path` within `root`'s binary jsonb.
+fn offset_at(root: &Json, path: &[Step]) -> Option<usize> {
+    fn walk(v: &Json, p: usize, path: &[Step]) -> Option<usize> {
+        let Some((step, rest)) = path.split_first() else {
+            return matches!(v, Json::Object(_) | Json::Array(_)).then(|| align4(p));
+        };
+        match (v, step) {
+            (Json::Object(o), Step::Key(key)) => {
+                let start = align4(p);
+                let pairs = normalized_pairs(o);
+                let mut q = start + 4 + 8 * pairs.len();
+                for (k, _) in &pairs {
+                    q += k.len();
+                }
+                for (k, _) in &pairs {
+                    let val = o.iter().rev().find(|(kk, _)| kk == k).map(|(_, v)| v)?;
+                    if k == key {
+                        return walk(val, q, rest);
+                    }
+                    q = layout(val, q, &mut Vec::new());
+                }
+                None
+            }
+            (Json::Array(a), Step::Idx(i)) => {
+                let start = align4(p);
+                let mut q = start + 4 + 4 * a.len();
+                for (j, e) in a.iter().enumerate() {
+                    if j == *i {
+                        return walk(e, q, rest);
+                    }
+                    q = layout(e, q, &mut Vec::new());
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+    walk(root, 0, path)
+}
+
 /// The byte offset of `target` (the first container equal to it) within
 /// `root`'s binary jsonb.
 fn container_offset(root: &Json, target: &Json) -> Option<usize> {
@@ -2313,6 +2417,8 @@ fn execute(
         ignore_structural: path.lax,
         throw_errors,
         innermost_array_size: -1,
+        pending_path: Some(Vec::new()),
+        current_path: Some(Vec::new()),
     };
     let mut found = Vec::new();
     let r = if !want_items && cxt.strict_absence_of_errors() {

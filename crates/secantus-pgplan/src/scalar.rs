@@ -61,6 +61,12 @@ pub fn defers_to_connection(name: &str) -> bool {
 /// only their arguments, and because that is the fact worth seeing at a
 /// glance: as a bare select-list target they become a `ConstCol` the server
 /// resolves, and this list is what lets the constant evaluator reach them too.
+/// Is `name` one of the catalog readers (`version`, `format_type`,
+/// `obj_description` ...), which take this server's catalog columns?
+pub(crate) fn is_catalog_reader(name: &str) -> bool {
+    CATALOG_NAMES.contains(&name)
+}
+
 const CATALOG_NAMES: &[&str] = &[
     "version",
     "current_schema",
@@ -1702,7 +1708,11 @@ fn numeric_rounding(name: &str, args: &[Bson]) -> Result<Bson> {
         return Err(wrong_args(name));
     }
     Ok(match subject {
-        Bson::Int32(_) | Bson::Int64(_) => subject,
+        // An integer has no rounding overload of its own: PostgreSQL picks
+        // the float8 one (float8 is its category's preferred type), so
+        // `round(1)` is the double `1`.
+        Bson::Int32(i) => Bson::Double(f64::from(i)),
+        Bson::Int64(i) => Bson::Double(i as f64),
         Bson::Double(d) => Bson::Double(match name {
             "ceil" | "ceiling" => d.ceil(),
             "floor" => d.floor(),

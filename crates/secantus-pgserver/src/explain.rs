@@ -186,10 +186,26 @@ fn table_scan(table: &str, filter: &Document, scan: &ScanChooser<'_>) -> PlanNod
 fn join_tree(node: &JoinNode, scan: &ScanChooser<'_>) -> PlanNode {
     match node {
         JoinNode::Lateral { .. } => PlanNode::new("Function Scan"),
-        JoinNode::Leaf { plan, def, .. } => {
+        JoinNode::Leaf { plan, def, columns } => {
             let mut n = plan_tree(plan, scan);
             if n.name == "Result" && !def.name.is_empty() {
                 n.name = format!("Subquery Scan on {}", def.name);
+            }
+            // A scan of an aliased relation names the alias too.
+            let alias = columns
+                .first()
+                .and_then(|(key, _)| key.split(secantus_pgplan::joins::SEP).next())
+                .map(str::to_string);
+            let relation = n
+                .props
+                .iter()
+                .find(|(k, _)| k == "Relation Name")
+                .map(|(_, v)| v.clone());
+            if let (Some(alias), Some(rel)) = (alias, relation) {
+                if alias != rel && !alias.is_empty() {
+                    n.name = format!("{} {alias}", n.name);
+                    n.props.push(("Alias".into(), alias));
+                }
             }
             n
         }
@@ -536,6 +552,160 @@ mod serde_json_lite {
                     format!("{{\n{}\n{pad}}}", parts.join(",\n"))
                 }
             }
+        }
+    }
+}
+
+/// Put a single-relation statement's WHERE on its scan, as PostgreSQL shows
+/// it: the conjuncts an index scan's key constrains as `Index Cond`, the
+/// rest as `Filter`. A plan with more than one scan is left alone.
+pub(crate) fn attach_scan_quals(
+    root: &mut PlanNode,
+    quals: &[(String, Option<String>)],
+    index_columns: &dyn Fn(&str) -> Vec<String>,
+) {
+    if quals.is_empty() {
+        return;
+    }
+    fn scans<'a>(n: &'a mut PlanNode, out: &mut Vec<&'a mut PlanNode>) {
+        if n.name.starts_with("Seq Scan on ") || n.name.starts_with("Index Scan using ") {
+            out.push(n);
+            return;
+        }
+        for c in &mut n.children {
+            scans(c, out);
+        }
+    }
+    let mut found = Vec::new();
+    scans(root, &mut found);
+    let [scan] = found.as_mut_slice() else {
+        return;
+    };
+    let keys = scan
+        .props
+        .iter()
+        .find(|(k, _)| k == "Index Name")
+        .map(|(_, v)| index_columns(v))
+        .unwrap_or_default();
+    let (cond, filter): (Vec<&String>, Vec<&String>) = {
+        let mut cond = Vec::new();
+        let mut filter = Vec::new();
+        for (text, col) in quals {
+            if col.as_ref().is_some_and(|c| keys.contains(c)) {
+                cond.push(text);
+            } else {
+                filter.push(text);
+            }
+        }
+        (cond, filter)
+    };
+    let join = |parts: &[&String]| -> String {
+        match parts {
+            [one] => (*one).clone(),
+            many => format!(
+                "({})",
+                many.iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" AND ")
+            ),
+        }
+    };
+    if !cond.is_empty() {
+        scan.details.push(("Index Cond".into(), join(&cond)));
+    }
+    if !filter.is_empty() {
+        scan.details.push(("Filter".into(), join(&filter)));
+    }
+}
+
+/// Put each join's ON condition on its join node (post-order, as
+/// `join_conditions` lists them): `Hash Cond` on a hash join, `Join Filter`
+/// on a nested loop.
+pub(crate) fn attach_join_conds(root: &mut PlanNode, conds: &[String]) {
+    fn walk(n: &mut PlanNode, conds: &[String], next: &mut usize) {
+        for c in &mut n.children {
+            walk(c, conds, next);
+        }
+        let label = if n.name.starts_with("Hash") && n.name.ends_with("Join") {
+            "Hash Cond"
+        } else if n.name.starts_with("Nested Loop") {
+            "Join Filter"
+        } else {
+            return;
+        };
+        if let Some(c) = conds.get(*next) {
+            if !c.is_empty() {
+                n.details.insert(0, (label.into(), c.clone()));
+            }
+        }
+        *next += 1;
+    }
+    if conds.is_empty() {
+        return;
+    }
+    let mut next = 0;
+    walk(root, conds, &mut next);
+}
+
+/// Place a joined SELECT's WHERE conjuncts: one naming a single relation
+/// that no outer join null-extends filters that relation's scan; any other
+/// filters the top join.
+pub(crate) fn attach_join_where(root: &mut PlanNode, quals: &[(String, Option<String>)]) {
+    if quals.is_empty() {
+        return;
+    }
+    fn is_scan(n: &PlanNode) -> bool {
+        n.name.starts_with("Seq Scan on ") || n.name.starts_with("Index Scan using ")
+    }
+    fn scan_for<'a>(n: &'a mut PlanNode, rel: &str) -> Option<&'a mut PlanNode> {
+        if is_scan(n) {
+            let name = n
+                .props
+                .iter()
+                .find(|(k, _)| k == "Alias")
+                .or_else(|| n.props.iter().find(|(k, _)| k == "Relation Name"))
+                .map(|(_, v)| v.clone());
+            return (name.as_deref() == Some(rel)).then_some(n);
+        }
+        n.children.iter_mut().find_map(|c| scan_for(c, rel))
+    }
+    fn top_join(n: &mut PlanNode) -> Option<&mut PlanNode> {
+        if n.name.contains("Join") || n.name.starts_with("Nested Loop") {
+            return Some(n);
+        }
+        n.children.iter_mut().find_map(top_join)
+    }
+    let combine = |parts: &[&String]| -> String {
+        match parts {
+            [one] => (*one).clone(),
+            many => format!(
+                "({})",
+                many.iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" AND ")
+            ),
+        }
+    };
+    let mut homes: Vec<(Option<String>, Vec<&String>)> = Vec::new();
+    for (text, home) in quals {
+        match homes.iter_mut().find(|(h, _)| h == home) {
+            Some((_, v)) => v.push(text),
+            None => homes.push((home.clone(), vec![text])),
+        }
+    }
+    for (home, parts) in homes {
+        let target = match &home {
+            Some(rel) => scan_for(root, rel),
+            None => top_join(root),
+        };
+        if let Some(n) = target {
+            // Over an inner join a WHERE conjunct is a join qual.
+            let inner = home.is_none()
+                && (n.name == "Hash Join" || n.name == "Nested Loop" || n.name == "Merge Join");
+            let label = if inner { "Join Filter" } else { "Filter" };
+            n.details.push((label.into(), combine(&parts)));
         }
     }
 }

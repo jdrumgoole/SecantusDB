@@ -31,6 +31,7 @@ pub mod fdw;
 pub mod formatting;
 pub mod fts;
 mod func_cast;
+mod funcsig;
 mod optype;
 pub use errpos::error_position;
 pub mod collation;
@@ -52,6 +53,7 @@ pub mod privileges;
 pub mod regobj;
 pub mod rls;
 mod rowsfrom;
+pub mod rule_rewrite;
 pub mod ruleutils;
 pub mod trgm;
 pub mod user_casts;
@@ -272,11 +274,30 @@ impl Error {
             {
                 Some("No function matches the given name and argument types. You might need to add explicit type casts.")
             }
+            // A PREFIX operator (`- oid`) has one argument, and its hint says so.
+            Error::UndefinedFunction(m)
+                if m
+                    .strip_prefix("operator does not exist: ")
+                    .and_then(|rest| rest.chars().next())
+                    .is_some_and(|c| !c.is_alphanumeric() && c != '"' && c != '_') =>
+            {
+                Some("No operator matches the given name and argument type. You might need to add an explicit type cast.")
+            }
             Error::UndefinedFunction(m) if m.starts_with("operator does not exist: ") => {
                 Some("No operator matches the given name and argument types. You might need to add explicit type casts.")
             }
             Error::DatatypeMismatch(m) if m.contains(" but expression is of type ") => {
                 Some("You will need to rewrite or cast the expression.")
+            }
+            // RETURNING on a relation with INSTEAD rules (rewriteHandler.c).
+            Error::FeatureNotSupported(m) if m.starts_with("cannot perform INSERT RETURNING") => {
+                Some("You need an unconditional ON INSERT DO INSTEAD rule with a RETURNING clause.")
+            }
+            Error::FeatureNotSupported(m) if m.starts_with("cannot perform UPDATE RETURNING") => {
+                Some("You need an unconditional ON UPDATE DO INSTEAD rule with a RETURNING clause.")
+            }
+            Error::FeatureNotSupported(m) if m.starts_with("cannot perform DELETE RETURNING") => {
+                Some("You need an unconditional ON DELETE DO INSTEAD rule with a RETURNING clause.")
             }
             _ => None,
         }
@@ -448,6 +469,7 @@ pub enum Statement {
         schema: Option<String>,
         input: Option<String>,
         output: Option<String>,
+        attrs: BaseTypeAttrs,
     },
     /// `CREATE [OR REPLACE] FUNCTION name(args) RETURNS t LANGUAGE internal AS
     /// '<builtin>'` -- a catalog registration of an internal-language wrapper,
@@ -535,6 +557,8 @@ pub enum Statement {
     },
     /// Foreign data wrappers, servers, user mappings and foreign tables.
     Fdw(fdw::FdwOp),
+    /// An INSERT / UPDATE / DELETE rewritten by the target's rules.
+    RuleRewrite(rule_rewrite::RulePlan),
     /// `CREATE EVENT TRIGGER name ON event [WHEN TAG IN (...)] EXECUTE
     /// FUNCTION f()`: `tags` upper-cased, `None` for every tag.
     CreateEventTrigger {
@@ -1435,6 +1459,9 @@ pub struct Series {
     /// The output column's name: `generate_series` unless the FROM item was
     /// given an alias.
     pub column: String,
+    /// The `int8` overload (an argument is a bigint), whose column is
+    /// `bigint`; otherwise the `int4` one.
+    pub int8: bool,
 }
 
 impl Series {
@@ -2305,6 +2332,15 @@ pub struct ExplainOptions {
     pub costs: bool,
     /// `text` or `json`.
     pub format: String,
+    /// A single-relation statement's WHERE, as the scan's `Index Cond` /
+    /// `Filter` print it: each AND conjunct's text and, for an index-usable
+    /// one, the column it constrains.
+    pub scan_quals: Vec<(String, Option<String>)>,
+    /// Each JOIN's ON condition, post-order, as its join node prints it.
+    pub join_conds: Vec<String>,
+    /// A joined SELECT's WHERE conjuncts, each with the relation whose scan
+    /// it filters (`None`: the top join's filter).
+    pub join_where: Vec<(String, Option<String>)>,
 }
 
 /// `CREATE [OR REPLACE] VIEW`.
@@ -2939,6 +2975,9 @@ pub fn plan_with_params(
     if let Some(inner) = node.node.as_ref() {
         fdw::refuse_foreign_access(inner, lookup)?;
     }
+    if let Some(p) = rule_rewrite::plan(&node, lookup, params)? {
+        return Ok(Statement::RuleRewrite(p));
+    }
     if let Some(st) = instead_of::plan(&node)? {
         return Ok(st);
     }
@@ -2978,6 +3017,9 @@ pub fn plan_with_subqueries(
     event_triggers::rewrite_sources(sql, &mut node);
     if let Some(inner) = node.node.as_ref() {
         fdw::refuse_foreign_access(inner, lookup)?;
+    }
+    if let Some(p) = rule_rewrite::plan(&node, lookup, params)? {
+        return Ok(Statement::RuleRewrite(p));
     }
     if let Some(st) = instead_of::plan(&node)? {
         return Ok(st);
@@ -3608,6 +3650,92 @@ fn split_qualified_type_name(
     }
 }
 
+/// A base type's `CREATE TYPE` attributes other than its I/O functions, as
+/// `DefineType` reads them. `None` is "not given" (a `LIKE` type or the
+/// default fills it).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BaseTypeAttrs {
+    /// `internallength`: a size in bytes, or -1 for `variable`.
+    pub internallength: Option<i32>,
+    pub byval: Option<bool>,
+    /// `typalign`: `c` / `s` / `i` / `d`.
+    pub align: Option<char>,
+    /// `typstorage`: `p` / `e` / `x` / `m`.
+    pub storage: Option<char>,
+    pub category: Option<char>,
+    pub preferred: bool,
+    pub default: Option<String>,
+    pub delimiter: Option<char>,
+    pub receive: Option<String>,
+    pub send: Option<String>,
+    pub typmod_in: Option<String>,
+    pub typmod_out: Option<String>,
+    pub analyze: Option<String>,
+    pub subscript: Option<String>,
+    pub element: Option<String>,
+    pub collatable: bool,
+    pub like: Option<String>,
+    /// The first invalid attribute value, as `(sqlstate, message)`:
+    /// PostgreSQL finds the shell type before it reads the attributes, so
+    /// the executor raises this after that check.
+    pub error: Option<(String, String)>,
+}
+
+/// A `CREATE TYPE` attribute's value as a string, however it was written.
+fn def_elem_string(e: &pg_query::protobuf::DefElem) -> Option<String> {
+    use pg_query::protobuf::a_const::Val;
+    match e.arg.as_deref()?.node.as_ref()? {
+        N::String(s) => Some(s.sval.clone()),
+        N::Integer(i) => Some(i.ival.to_string()),
+        N::Float(f) => Some(f.fval.clone()),
+        N::Boolean(b) => Some(b.boolval.to_string()),
+        N::AConst(c) => match c.val.as_ref()? {
+            Val::Sval(s) => Some(s.sval.clone()),
+            Val::Ival(i) => Some(i.ival.to_string()),
+            Val::Fval(f) => Some(f.fval.clone()),
+            Val::Boolval(b) => Some(b.boolval.to_string()),
+            Val::Bsval(b) => Some(b.bsval.clone()),
+        },
+        N::TypeName(t) => {
+            // As written, qualification included (`pg_catalog.int4`).
+            let parts: Vec<String> = t
+                .names
+                .iter()
+                .filter_map(|n| match n.node.as_ref()? {
+                    N::String(s) => Some(s.sval.clone()),
+                    _ => None,
+                })
+                .collect();
+            Some(parts.join("."))
+        }
+        N::List(l) => Some(
+            l.items
+                .iter()
+                .filter_map(|n| match n.node.as_ref()? {
+                    N::String(s) => Some(s.sval.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("."),
+        ),
+        _ => None,
+    }
+}
+
+fn type_attr_bool(e: &pg_query::protobuf::DefElem) -> Result<bool> {
+    let Some(v) = def_elem_string(e) else {
+        return Ok(true);
+    };
+    match v.to_ascii_lowercase().as_str() {
+        "true" | "on" | "1" | "yes" | "t" => Ok(true),
+        "false" | "off" | "0" | "no" | "f" => Ok(false),
+        _ => Err(Error::Sqlstate(
+            "22023",
+            format!("{} requires a Boolean value", e.defname),
+        )),
+    }
+}
+
 /// `CREATE TYPE name` (a shell) or `CREATE TYPE name (input = f, output = g,
 /// like = t)` (a base type over its shell). Both arrive as a `DefineStmt` of
 /// kind OBJECT_TYPE; an empty option list is the shell form.
@@ -3618,30 +3746,110 @@ fn plan_define_type(d: &pg_query::protobuf::DefineStmt) -> Result<Statement> {
     }
     let mut input = None;
     let mut output = None;
+    let mut a = BaseTypeAttrs::default();
     for opt in &d.definition {
         let Some(N::DefElem(e)) = opt.node.as_ref() else {
             return Err(Error::Parse("malformed CREATE TYPE option".into()));
         };
         let value = e.arg.as_ref().and_then(|a| type_name_of_node(a));
+        let text = def_elem_string(e);
         match e.defname.to_ascii_lowercase().as_str() {
             "input" => input = value,
             "output" => output = value,
-            // `like = text` copies the representation (typlen / alignment /
-            // storage), none of which this server surfaces: a base type is
-            // carried as its text form whatever it is `like`.
-            "like" => {}
-            other => {
-                return Err(Error::Unsupported(format!(
-                    "the CREATE TYPE option \"{other}\""
-                )))
+            "receive" => a.receive = value,
+            "send" => a.send = value,
+            "typmod_in" => a.typmod_in = value,
+            "typmod_out" => a.typmod_out = value,
+            "analyze" | "analyse" => a.analyze = value,
+            "subscript" => a.subscript = value,
+            "element" => a.element = value,
+            "like" => a.like = value,
+            "internallength" => {
+                let t = text.unwrap_or_default();
+                a.internallength = Some(if t.eq_ignore_ascii_case("variable") {
+                    -1
+                } else {
+                    match t.parse::<i32>() {
+                        Ok(n) => n,
+                        Err(_) => {
+                            a.error.get_or_insert((
+                                "22023".into(),
+                                format!("invalid type internal size {t}"),
+                            ));
+                            continue;
+                        }
+                    }
+                });
             }
+            "passedbyvalue" => a.byval = Some(type_attr_bool(e)?),
+            "alignment" => {
+                let t = text.unwrap_or_default();
+                a.align = Some(match t.to_ascii_lowercase().as_str() {
+                    "double" | "float8" | "pg_catalog.float8" => 'd',
+                    "int4" | "pg_catalog.int4" => 'i',
+                    "int2" | "pg_catalog.int2" => 's',
+                    "char" | "pg_catalog.bpchar" => 'c',
+                    _ => {
+                        a.error.get_or_insert((
+                            "22023".into(),
+                            format!("alignment \"{t}\" not recognized"),
+                        ));
+                        continue;
+                    }
+                });
+            }
+            "storage" => {
+                let t = text.unwrap_or_default();
+                a.storage = Some(match t.to_ascii_lowercase().as_str() {
+                    "plain" => 'p',
+                    "external" => 'e',
+                    "extended" => 'x',
+                    "main" => 'm',
+                    _ => {
+                        a.error.get_or_insert((
+                            "22023".into(),
+                            format!("storage \"{t}\" not recognized"),
+                        ));
+                        continue;
+                    }
+                });
+            }
+            "category" => {
+                let t = text.unwrap_or_default();
+                match t.chars().next() {
+                    Some(c) if (' '..='~').contains(&c) => a.category = Some(c),
+                    _ => {
+                        a.error.get_or_insert((
+                            "22023".into(),
+                            format!("invalid type category \"{t}\": must be simple ASCII"),
+                        ));
+                        continue;
+                    }
+                }
+            }
+            "preferred" => a.preferred = type_attr_bool(e)?,
+            "default" => a.default = text,
+            "delimiter" => a.delimiter = text.and_then(|t| t.chars().next()),
+            "collatable" => a.collatable = type_attr_bool(e)?,
+            // PostgreSQL WARNS about an attribute it does not know and goes on.
+            other => warn(
+                "42601",
+                format!("type attribute \"{other}\" not recognized"),
+            ),
         }
+    }
+    if a.element.is_some() && a.subscript.is_none() {
+        a.error.get_or_insert((
+            "22023".into(),
+            "element type cannot be specified without a subscripting function".into(),
+        ));
     }
     Ok(Statement::CreateBaseType {
         name,
         schema,
         input,
         output,
+        attrs: a,
     })
 }
 
@@ -6108,6 +6316,9 @@ fn plan_explain(
         verbose: false,
         costs: true,
         format: "text".into(),
+        scan_quals: Vec::new(),
+        join_conds: Vec::new(),
+        join_where: Vec::new(),
     };
     for o in &e.options {
         let Some(N::DefElem(d)) = o.node.as_ref() else {
@@ -6161,7 +6372,28 @@ fn plan_explain(
         .as_deref()
         .and_then(|q| q.node.clone())
         .ok_or_else(|| Error::Parse("EXPLAIN without a statement".into()))?;
+    let scan_quals = explain_scan_quals(&query, lookup).unwrap_or_default();
+    let join_conds = match &query {
+        N::SelectStmt(s) => {
+            let none = |_: &str| None;
+            let cat = ruleutils::Catalog {
+                lookup,
+                view_sql: &none,
+            };
+            options.join_where = if s.from_clause.len() == 1
+                && matches!(s.from_clause[0].node.as_ref(), Some(N::JoinExpr(_)))
+            {
+                ruleutils::join_where(s, &cat).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            ruleutils::join_conditions(s, &cat).unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
     let inner = plan_node(query, lookup, params)?;
+    options.scan_quals = scan_quals;
+    options.join_conds = join_conds;
     if !matches!(
         inner,
         Statement::Select(_)
@@ -8604,6 +8836,114 @@ fn plan_window_args(
     Ok((Some(expr), source_type, args))
 }
 
+/// A HAVING with no GROUP BY and no aggregate in the select list: the whole
+/// input is ONE group, so the query yields one row or none -- never a row per
+/// input row, which is what ignoring the clause answered (`select 1 from t
+/// having count(*) > 5` returned every row). Rewritten so the group is an
+/// inner aggregate query, which the aggregate planner already runs:
+/// `select <targets> from (select count(*) from <from> where <w> having <h>)`.
+/// A target naming a column is PostgreSQL's 42803: the column is not grouped.
+fn ungrouped_having(
+    s: &pg_query::protobuf::SelectStmt,
+) -> Result<Option<pg_query::protobuf::SelectStmt>> {
+    if s.having_clause.is_none() || !s.group_clause.is_empty() || has_aggregate(s) {
+        return Ok(None);
+    }
+    for t in &s.target_list {
+        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+            continue;
+        };
+        let Some(mut val) = rt.val.as_deref().cloned() else {
+            continue;
+        };
+        let mut stray: Option<Vec<String>> = None;
+        walk_column_refs(&mut val, &mut |_, c| {
+            if stray.is_none() {
+                stray = Some(
+                    c.fields
+                        .iter()
+                        .filter_map(|f| match f.node.as_ref() {
+                            Some(N::String(s)) => Some(s.sval.clone()),
+                            Some(N::AStar(_)) => Some("*".into()),
+                            _ => None,
+                        })
+                        .collect(),
+                );
+            }
+            Ok(())
+        })?;
+        if let Some(mut parts) = stray {
+            if parts.len() == 1 {
+                if let [only] = s.from_clause.as_slice() {
+                    if let Some(N::RangeVar(rv)) = only.node.as_ref() {
+                        let q = rv
+                            .alias
+                            .as_ref()
+                            .map(|a| a.aliasname.clone())
+                            .unwrap_or_else(|| rv.relname.clone());
+                        parts.insert(0, q);
+                    }
+                }
+            }
+            return Err(Error::Grouping(format!(
+                "column \"{}\" must appear in the GROUP BY clause or be used in an aggregate function",
+                parts.join(".")
+            )));
+        }
+    }
+    let parsed = pg_query::parse("select from (select count(*)) as \"*grp*\"")
+        .map_err(|e| Error::Parse(e.to_string()))?;
+    let Some(N::SelectStmt(template)) = parsed
+        .protobuf
+        .stmts
+        .first()
+        .and_then(|st| st.stmt.as_ref())
+        .and_then(|st| st.node.clone())
+    else {
+        return Ok(None);
+    };
+    let mut from = template.from_clause[0].clone();
+    if let Some(N::RangeSubselect(rs)) = from.node.as_mut() {
+        if let Some(N::SelectStmt(inner)) = rs.subquery.as_mut().and_then(|q| q.node.as_mut()) {
+            inner.from_clause = s.from_clause.clone();
+            inner.where_clause = s.where_clause.clone();
+            inner.having_clause = s.having_clause.clone();
+        }
+    }
+    let mut out = s.clone();
+    out.from_clause = vec![from];
+    out.where_clause = None;
+    out.having_clause = None;
+    Ok(Some(out))
+}
+
+/// A FROM-less select that aggregates, rewritten to read a one-row
+/// derived table.
+fn over_one_row(s: &pg_query::protobuf::SelectStmt) -> Option<pg_query::protobuf::SelectStmt> {
+    if !s.from_clause.is_empty()
+        || !s.values_lists.is_empty()
+        || !(has_aggregate(s) || s.having_clause.is_some())
+    {
+        return None;
+    }
+    let parsed = pg_query::parse("select from (select 1) as \"*one*\"").ok()?;
+    let from = match parsed
+        .protobuf
+        .stmts
+        .first()?
+        .stmt
+        .as_ref()?
+        .node
+        .as_ref()?
+    {
+        N::SelectStmt(one) => one.from_clause.first()?.clone(),
+        _ => return None,
+    };
+    let mut out = s.clone();
+    out.from_clause = vec![from];
+    Some(out)
+}
+
 fn has_aggregate(s: &pg_query::protobuf::SelectStmt) -> bool {
     // Only the names the aggregate planner actually handles. Any-FuncCall
     // routed a scalar call over a column (`regexp_replace(col, ...)`) into the
@@ -9063,6 +9403,7 @@ fn integer_series_rows(
         stop: int(&vals[1])?,
         step,
         column: name.into(),
+        int8: false,
     };
     let rows = series
         .values()
@@ -9709,6 +10050,34 @@ fn series_from_args(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result
             "function generate_series does not exist with that argument list".into(),
         ));
     }
+    // Three smallints (typed literals or parameters) fit the int4, int8 and
+    // numeric overloads equally: PostgreSQL cannot choose (42725).
+    let types: Vec<String> = f
+        .args
+        .iter()
+        .map(|a| match a.node.as_ref() {
+            Some(N::ParamRef(p)) => {
+                declared_param_type(usize::try_from(p.number).unwrap_or(0)).unwrap_or_default()
+            }
+            _ => const_value(a, params)
+                .map(|v| static_type(a, &v))
+                .unwrap_or_default(),
+        })
+        .collect();
+    let int8 = types.iter().any(|t| t == "int8");
+    if funcsig::ambiguous("generate_series", &types) {
+        return Err(Error::Sqlstate(
+            "42725",
+            format!(
+                "function generate_series({}) is not unique",
+                types
+                    .iter()
+                    .map(|t| display_type(t))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
     // `None` is a NULL argument, which is not an error: PostgreSQL answers a
     // series with any NULL bound with ZERO ROWS.
     let int_at = |i: usize| -> Result<Option<i64>> {
@@ -9757,6 +10126,7 @@ fn series_from_args(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result
             stop,
             step,
             column: "generate_series".to_string(),
+            int8,
         }),
         // A NULL bound: an EMPTY series rather than an error, spelled as a
         // range that generates nothing.
@@ -9765,6 +10135,7 @@ fn series_from_args(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result
             stop: 0,
             step: 1,
             column: "generate_series".to_string(),
+            int8,
         }),
     }
 }
@@ -9841,7 +10212,9 @@ fn plan_series_select(
             }
         }
     }
-    if columns.is_empty() {
+    // An EMPTY select list (`select from generate_series(1, 2)`) is rows of
+    // no columns, as it is over a table.
+    if columns.is_empty() && !s.target_list.is_empty() {
         columns.push((series.column.clone(), series.column.clone()));
         casts.push(None);
     }
@@ -10726,6 +11099,9 @@ fn plan_table_targets(
                 let field = def
                     .field_of(&column)
                     .ok_or_else(|| Error::UndefinedColumn(column.clone()))?;
+                // The overload PostgreSQL picks for these argument types
+                // (`round` of an integer is the float8 one).
+                let selected = funcsig::result_type(&name, &types);
                 // `length` of a tsvector counts its lexemes.
                 let name = if name == "length"
                     && def.column(&column).is_some_and(|c| c.pg_type == "tsvector")
@@ -10748,7 +11124,8 @@ fn plan_table_targets(
                 };
                 columns.push((out, field));
                 casts.push(Some(ColumnExpr::Call {
-                    result_type: scalar::static_result_type(&name).to_string(),
+                    result_type: selected
+                        .unwrap_or_else(|| scalar::static_result_type(&name).to_string()),
                     name,
                     args,
                 }));
@@ -13473,9 +13850,17 @@ fn numeric_signature(name: &str) -> Option<usize> {
 /// type at plan time, where this server would otherwise stringify.
 fn text_function_mismatch(f: &pg_query::protobuf::FuncCall, types: &[String]) -> Option<Error> {
     let name = func_name(f)?;
+    // A SQL-syntax function (`EXTRACT`, `OVERLAY`) is `pg_catalog.`-qualified
+    // by the grammar, and PostgreSQL names it so.
+    let shown = match f.funcname.first().and_then(|n| n.node.as_ref()) {
+        Some(N::String(s)) if s.sval == "pg_catalog" && f.funcname.len() == 2 => {
+            format!("pg_catalog.{name}")
+        }
+        _ => name.clone(),
+    };
     let missing = || {
         Error::UndefinedFunction(format!(
-            "function {name}({}) does not exist",
+            "function {shown}({}) does not exist",
             types
                 .iter()
                 .map(|t| display_type(t))
@@ -13490,6 +13875,23 @@ fn text_function_mismatch(f: &pg_query::protobuf::FuncCall, types: &[String]) ->
             && !matches!(t, "int2vector" | "oidvector" | "anyarray" | "record")
             && pgtypes::oid_of_name(t).is_some()
     };
+    // A built-in no overload of which takes these argument types.
+    if !correlated::user_function_named(&name) && funcsig::resolves(&name, types) == Some(false) {
+        return Some(missing());
+    }
+    if !correlated::user_function_named(&name) && funcsig::ambiguous(&name, types) {
+        return Some(Error::Sqlstate(
+            "42725",
+            format!(
+                "function {shown}({}) is not unique",
+                types
+                    .iter()
+                    .map(|t| display_type(t))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
     if !correlated::user_function_named(&name) {
         let first = types.first().map(String::as_str).unwrap_or("");
         // The array built-ins take an array first; a known scalar has no
@@ -13663,6 +14065,13 @@ fn call_arg_types(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Vec<Stri
                 "unknown".to_string()
             }
             Some(N::AConst(c)) if c.isnull => "unknown".to_string(),
+            // A parameter the client sent untyped (oid 0) is `unknown` to
+            // resolution, whatever text its value arrived as.
+            Some(N::ParamRef(p))
+                if declared_param_type(usize::try_from(p.number).unwrap_or(0)).is_none() =>
+            {
+                "unknown".to_string()
+            }
             _ => {
                 let v = const_value(a, params).unwrap_or(Bson::Null);
                 static_type(a, &v)
@@ -14161,7 +14570,59 @@ fn foreign_qualifier(s: &pg_query::protobuf::SelectStmt) -> Option<String> {
     for a in &mut args {
         let _ = walk_expr(a, &mut check);
     }
-    found
+    if found.is_some() {
+        return found;
+    }
+    // A derived table in FROM (not LATERAL) sees only its own FROM and the
+    // queries ENCLOSING this subquery -- so a qualifier its own FROM does not
+    // define reads the enclosing row. Its names follow PostgreSQL: an
+    // aliased relation goes by the alias only, so an inner `t q` does not
+    // hide the outer `t`.
+    for item in &s.from_clause {
+        if let Some(f) = derived_foreign_qualifier(item) {
+            return Some(f);
+        }
+    }
+    None
+}
+
+fn derived_foreign_qualifier(item: &pg_query::protobuf::Node) -> Option<String> {
+    match item.node.as_ref()? {
+        N::RangeSubselect(rs) if !rs.lateral => {
+            let Some(N::SelectStmt(body)) = rs.subquery.as_deref().and_then(|q| q.node.as_ref())
+            else {
+                return None;
+            };
+            let names = correlated::inner_names(body);
+            let mut found = None;
+            let mut b = (**body).clone();
+            let _ = correlated::walk_select(&mut b, &mut |n| {
+                if found.is_some() {
+                    return Ok(());
+                }
+                if let Some(N::ColumnRef(c)) = n.node.as_ref() {
+                    if c.fields.len() >= 2 {
+                        if let Some(N::String(q)) = c.fields[c.fields.len() - 2].node.as_ref() {
+                            if !names.contains(&q.sval) {
+                                found = Some(format!(
+                                    "{}.{}",
+                                    q.sval,
+                                    column_ref_name(c).unwrap_or_default()
+                                ));
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            });
+            found.or_else(|| body.from_clause.iter().find_map(derived_foreign_qualifier))
+        }
+        N::JoinExpr(j) => [j.larg.as_deref(), j.rarg.as_deref()]
+            .into_iter()
+            .flatten()
+            .find_map(derived_foreign_qualifier),
+        _ => None,
+    }
 }
 
 /// Every name a FROM item can be addressed by: its alias when it has one, and
@@ -14985,7 +15446,16 @@ fn plan_select(
     {
         return plan_select(&values_as_subquery(s), lookup, params);
     }
+    if let Some(rewritten) = ungrouped_having(s)? {
+        return plan_select(&rewritten, lookup, params);
+    }
     if s.from_clause.is_empty() {
+        // An aggregate with no FROM aggregates the ONE row a FROM-less
+        // select has (`select sum(1)` is 1, `select count(*) having false`
+        // no row): the same query over a one-row derived table.
+        if let Some(rewritten) = over_one_row(s) {
+            return plan_select(&rewritten, lookup, params);
+        }
         return plan_select_constant(s, params);
     }
     // `FROM t TABLESAMPLE method (p)` is `t` with each row kept with
@@ -17488,6 +17958,17 @@ fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
     static_type_uncached(node, value)
 }
 
+/// The return type of the built-in overload `func_select_candidate` picks for
+/// `f`'s argument types, when each is statically known.
+fn selected_call_type(f: &pg_query::protobuf::FuncCall) -> Option<String> {
+    let name = func_name(f)?;
+    if f.agg_star || f.over.is_some() || correlated::user_function_named(&name) {
+        return None;
+    }
+    let types: Vec<String> = f.args.iter().map(|a| static_type(a, &Bson::Null)).collect();
+    funcsig::selected_result_type(&name, &types)
+}
+
 fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String {
     // `pg_trgm`: its functions and operators answer `real` (and `text[]`,
     // `boolean`), which a value alone -- a double -- does not say.
@@ -17839,6 +18320,12 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
         Some(N::FuncCall(f)) if range_accessor(f).is_some() => {
             let (element, _, _) = range_accessor(f).unwrap_or_default();
             range::accessor_result_type(&func_name(f).unwrap_or_default(), &element)
+        }
+        // Any other built-in reports the type of the overload PostgreSQL
+        // picks for its arguments' types (`abs(real)` is `real`, not the
+        // double its value is carried as).
+        Some(N::FuncCall(f)) if selected_call_type(f).is_some() => {
+            selected_call_type(f).unwrap_or_default()
         }
         Some(N::BoolExpr(_)) | Some(N::NullTest(_)) | Some(N::BooleanTest(_)) => "bool".to_string(),
         // These pick one of their arguments, so they report its type.
@@ -18678,6 +19165,10 @@ fn plan_select_srf(
     let Some((f, cast_chain)) = rt.val.as_ref().and_then(|v| series_target_call(v)) else {
         return Ok(None);
     };
+    // A numeric or timestamp series is the general set-returning path's.
+    if non_integer_series_kind(f).is_some() {
+        return Ok(None);
+    }
     let series = series_from_args(f, params)?;
     let column = if rt.name.is_empty() {
         series.column.clone()
@@ -22251,6 +22742,14 @@ pub fn apply_column_expr(expr: &ColumnExpr, value: Bson, tz: &TimeZoneSetting) -
                     v = user_casts::apply(&cast, v)?;
                     prev = Some(target);
                     continue;
+                }
+                // `array_out` prints an inet / cidr element with `inet_out`.
+                if let Some(net @ ("inet[]" | "cidr[]")) = from.as_deref() {
+                    if is_string_type(target) && matches!(v, Bson::Array(_)) {
+                        v = cast_value(net_elements_out(&v, net == "cidr[]"), target)?;
+                        prev = Some(target);
+                        continue;
+                    }
                 }
                 if matches!(target.as_str(), "text" | "varchar" | "name") {
                     if let Some(styled) = prev.and_then(|p| datetime_text_styled(&v, p, tz)) {
@@ -27905,6 +28404,18 @@ fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson>
     out
 }
 
+/// Each element of an `inet[]` / `cidr[]` as `inet_out` / `cidr_out` prints
+/// it, at any depth.
+fn net_elements_out(v: &Bson, is_cidr: bool) -> Bson {
+    match v {
+        Bson::Array(items) => {
+            Bson::Array(items.iter().map(|x| net_elements_out(x, is_cidr)).collect())
+        }
+        Bson::String(s) => Bson::String(net::text_out(s, is_cidr)),
+        other => other.clone(),
+    }
+}
+
 fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson> {
     // `'1'::int`, `$1::text`, `null::int`. The cast is applied to whatever the
     // operand evaluates to, so a bound parameter casts exactly like a literal.
@@ -27950,6 +28461,24 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                 return Err(Error::CannotCoerce(format!(
                     "cannot cast type {} to {}",
                     display_type(&source),
+                    display_type(&target)
+                )));
+            }
+            // An `inet[]` / `cidr[]` to text is `array_out`, which prints each
+            // element with `inet_out` -- a full host mask dropped
+            // (`{127.0.0.1}`) -- where the scalar `text(inet)` keeps it.
+            if matches!(source.as_str(), "inet[]" | "cidr[]") && is_string_type(&target) {
+                if let Bson::Array(_) = value {
+                    let out = net_elements_out(&value, source == "cidr[]");
+                    return cast_value(out, &target);
+                }
+            }
+            // An aclitem casts to the string types (I/O conversion) and to
+            // itself; nothing else (`'x=r/x'::aclitem::oid` is 42846).
+            if source == "aclitem" && !is_string_type(&target) && target != "aclitem" {
+                set_error_location(tc.location);
+                return Err(Error::CannotCoerce(format!(
+                    "cannot cast type aclitem to {}",
                     display_type(&target)
                 )));
             }
@@ -30687,4 +31216,33 @@ fn plan_create_rule(r: &pg_query::protobuf::RuleStmt) -> Result<Statement> {
         actions,
         replace: r.replace,
     })
+}
+
+/// A statement over ONE relation: its WHERE's conjuncts for EXPLAIN.
+fn explain_scan_quals(
+    query: &N,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<Vec<(String, Option<String>)>> {
+    let (table, where_clause) = match query {
+        N::SelectStmt(s) => {
+            let [item] = s.from_clause.as_slice() else {
+                return None;
+            };
+            let Some(N::RangeVar(rv)) = item.node.as_ref() else {
+                return None;
+            };
+            (rv.relname.clone(), s.where_clause.as_deref()?)
+        }
+        N::UpdateStmt(u) if u.from_clause.is_empty() => (
+            u.relation.as_ref()?.relname.clone(),
+            u.where_clause.as_deref()?,
+        ),
+        N::DeleteStmt(d) if d.using_clause.is_empty() => (
+            d.relation.as_ref()?.relname.clone(),
+            d.where_clause.as_deref()?,
+        ),
+        _ => return None,
+    };
+    let def = lookup(&table)?;
+    ruleutils::explain_conjuncts(where_clause, &def)
 }

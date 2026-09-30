@@ -38,23 +38,31 @@ fn category(ty: &str) -> Option<&'static str> {
 /// A CTE in scope: its name and, when it is a plain SELECT, its query.
 type Cte = (String, Option<pg_query::protobuf::SelectStmt>);
 
+/// The catalog: a relation's definition by name.
+type Lookup<'p> = &'p dyn Fn(&str) -> Option<TableDef>;
+
 struct Scope<'p> {
     tables: Vec<(String, TableDef)>,
     complete: bool,
     parent: Option<&'p Scope<'p>>,
+    /// The catalog and CTEs in view, to type a scalar subquery's column.
+    lookup: Option<Lookup<'p>>,
+    ctes: Vec<Cte>,
 }
 
 impl<'p> Scope<'p> {
     fn new(
         items: &[pg_query::protobuf::Node],
         ctes: &[Cte],
-        lookup: &dyn Fn(&str) -> Option<TableDef>,
+        lookup: &'p dyn Fn(&str) -> Option<TableDef>,
         parent: Option<&'p Scope<'p>>,
     ) -> Scope<'p> {
         let mut scope = Scope {
             tables: Vec::new(),
             complete: true,
             parent,
+            lookup: Some(lookup),
+            ctes: ctes.to_vec(),
         };
         for item in items {
             scope.add(item, ctes, lookup);
@@ -256,6 +264,102 @@ fn operand_type(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<String> {
         }
         N::ColumnRef(c) => scope.column_type(c),
         N::ParamRef(p) => declared_param_type(usize::try_from(p.number).ok()?),
+        // A scalar subquery: its one column's type, in a scope of its own.
+        N::SubLink(sl)
+            if pg_query::protobuf::SubLinkType::try_from(sl.sub_link_type)
+                == Ok(pg_query::protobuf::SubLinkType::ExprSublink) =>
+        {
+            let Some(N::SelectStmt(sub)) = sl.subselect.as_deref().and_then(|n| n.node.as_ref())
+            else {
+                return None;
+            };
+            if sub.op != pg_query::protobuf::SetOperation::SetopNone as i32
+                || sub.with_clause.is_some()
+            {
+                return None;
+            }
+            let lookup = scope.lookup?;
+            let inner = Scope::new(&sub.from_clause, &scope.ctes, lookup, Some(scope));
+            let Some(N::ResTarget(rt)) = sub.target_list.first()?.node.as_ref() else {
+                return None;
+            };
+            operand_type(rt.val.as_deref()?, &inner)
+        }
+        // CASE / COALESCE / GREATEST / LEAST: their branches' common type,
+        // untyped literals taking it.
+        N::CaseExpr(c) => {
+            let mut parts: Vec<&pg_query::protobuf::Node> = c
+                .args
+                .iter()
+                .filter_map(|w| match w.node.as_ref() {
+                    Some(N::CaseWhen(cw)) => cw.result.as_deref(),
+                    _ => None,
+                })
+                .collect();
+            parts.extend(c.defresult.as_deref());
+            common_type(&parts, scope)
+        }
+        N::CoalesceExpr(c) => common_type(&c.args.iter().collect::<Vec<_>>(), scope),
+        N::MinMaxExpr(m) => common_type(&m.args.iter().collect::<Vec<_>>(), scope),
+        N::AExpr(e)
+            if pg_query::protobuf::AExprKind::try_from(e.kind)
+                == Ok(pg_query::protobuf::AExprKind::AexprNullif) =>
+        {
+            operand_type(e.lexpr.as_deref()?, scope)
+        }
+        // `||` over a string is text; date arithmetic keeps its kind.
+        N::AExpr(e)
+            if pg_query::protobuf::AExprKind::try_from(e.kind)
+                == Ok(pg_query::protobuf::AExprKind::AexprOp)
+                && matches!(op_of(e).as_deref(), Some("||" | "+" | "-")) =>
+        {
+            let op = op_of(e)?;
+            let l = e.lexpr.as_deref().and_then(|n| operand_type(n, scope));
+            let r = e.rexpr.as_deref().and_then(|n| operand_type(n, scope));
+            let stringy = |t: &Option<String>| {
+                t.as_deref()
+                    .is_some_and(|t| matches!(t, "text" | "varchar" | "bpchar" | "name"))
+            };
+            if op == "||" {
+                return (stringy(&l) || stringy(&r)).then(|| "text".to_string());
+            }
+            match (l.as_deref(), r.as_deref(), op.as_str()) {
+                (Some("date"), Some("int4" | "int2"), "+" | "-")
+                | (Some("int4" | "int2"), Some("date"), "+") => Some("date".into()),
+                (Some("date"), Some("date"), "-") => Some("int4".into()),
+                // Numbers meet as numbers (the arithmetic rule below).
+                (Some(l), Some(r), _)
+                    if category(l) == Some("numeric") && category(r) == Some("numeric") =>
+                {
+                    Some(if l == r {
+                        l.to_string()
+                    } else {
+                        "numeric".to_string()
+                    })
+                }
+                _ => None,
+            }
+        }
+        // A built-in's result, as the overload its arguments select returns.
+        N::FuncCall(f) if f.over.is_none() && !f.agg_star && f.agg_order.is_empty() => {
+            let name = func_name(f)?;
+            if correlated::user_function_named(&name) || f.funcname.len() > 2 {
+                return None;
+            }
+            let args: Vec<String> = f
+                .args
+                .iter()
+                .map(|a| match a.node.as_ref() {
+                    Some(N::AConst(c))
+                        if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) =>
+                    {
+                        Some(String::new())
+                    }
+                    _ => operand_type(a, scope),
+                })
+                .collect::<Option<Vec<_>>>()?;
+            crate::funcsig::result_type(&name, &args)
+        }
         // Arithmetic over two numbers is a number: `a + 0` is numeric, so
         // `a + 0 = 'x'::text` is judged like `a = 'x'::text`.
         N::AExpr(e)
@@ -321,6 +425,26 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
             }
         }
     }
+    // `oid` has comparison operators and nothing arithmetic: `oid + integer`,
+    // `oid - oid` and a prefix `- oid` are all 42883 on PostgreSQL, where
+    // evaluating them as the integers the values are carried as answered.
+    if kind == Some(K::AexprOp) && matches!(op.as_str(), "+" | "-" | "*" | "/" | "%" | "^") {
+        let side = |n: Option<&pg_query::protobuf::Node>| n.and_then(|n| operand_type(n, scope));
+        let (l, r) = (side(e.lexpr.as_deref()), side(e.rexpr.as_deref()));
+        if l.as_deref() == Some("oid") || r.as_deref() == Some("oid") {
+            match (e.lexpr.is_some(), l, r) {
+                (false, _, Some(r)) => {
+                    set_error_location(e.location);
+                    return Err(Error::UndefinedFunction(format!(
+                        "operator does not exist: {op} {}",
+                        display_type(&r)
+                    )));
+                }
+                (true, Some(l), Some(r)) => return Err(mismatch(&op, &l, &r, e.location)),
+                _ => {}
+            }
+        }
+    }
     let Some(l) = e.lexpr.as_deref().and_then(|n| operand_type(n, scope)) else {
         return Ok(());
     };
@@ -329,6 +453,11 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
     };
     match kind {
         Some(K::AexprOp) if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") => {
+            // An untyped literal takes the other side's type when the
+            // statement is analysed: one that is not valid input fails then.
+            if let Some(r) = e.rexpr.as_deref() {
+                literal_fits(r, &l)?;
+            }
             let Some(r) = e.rexpr.as_deref().and_then(|n| operand_type(n, scope)) else {
                 return Ok(());
             };
@@ -405,6 +534,21 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
         N::ResTarget(r) => {
             if let Some(v) = r.val.as_deref() {
                 walk(v, scope, cx)?;
+            }
+        }
+        // An untyped literal among typed arguments is coerced to their type
+        // when the statement is analysed, so a literal that is not valid
+        // input for it fails then -- evaluated or not (`coalesce(id, 'x')`).
+        N::CoalesceExpr(c) => {
+            literals_fit(&c.args, scope)?;
+            for a in &c.args {
+                walk(a, scope, cx)?;
+            }
+        }
+        N::MinMaxExpr(m) => {
+            literals_fit(&m.args, scope)?;
+            for a in &m.args {
+                walk(a, scope, cx)?;
             }
         }
         N::CaseExpr(c) => {
@@ -543,4 +687,82 @@ pub(crate) fn check(node: &N, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Resu
         }
         _ => Ok(()),
     }
+}
+
+/// Does an untyped string literal read as `ty`? Its cast's error at the
+/// literal when not; anything else (or a type this does not judge) passes.
+fn literal_fits(n: &pg_query::protobuf::Node, ty: &str) -> Result<()> {
+    use pg_query::protobuf::a_const::Val;
+    if !matches!(
+        ty,
+        "int2" | "int4" | "int8" | "numeric" | "float4" | "float8" | "bool" | "date" | "uuid"
+    ) {
+        return Ok(());
+    }
+    if let Some(N::AConst(c)) = n.node.as_ref() {
+        if let Some(Val::Sval(s)) = c.val.as_ref() {
+            if let Err(e) = crate::cast_value(bson::Bson::String(s.sval.clone()), ty) {
+                set_error_location(c.location);
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The type several branches share: their known types agreeing (numbers
+/// meeting as numeric), untyped literals ignored.
+fn common_type(parts: &[&pg_query::protobuf::Node], scope: &Scope) -> Option<String> {
+    use pg_query::protobuf::a_const::Val;
+    let mut out: Option<String> = None;
+    for p in parts {
+        let t = match p.node.as_ref() {
+            Some(N::AConst(c)) if c.isnull || matches!(c.val, Some(Val::Sval(_))) => continue,
+            _ => operand_type(p, scope)?,
+        };
+        out = Some(match out {
+            None => t,
+            Some(o) if o == t => o,
+            Some(o) if category(&o) == Some("numeric") && category(&t) == Some("numeric") => {
+                "numeric".into()
+            }
+            Some(o) if category(&o) == Some("string") && category(&t) == Some("string") => {
+                "text".into()
+            }
+            _ => return None,
+        });
+    }
+    out
+}
+
+/// Do the untyped string literals among `args` read as the type the typed
+/// ones share? The first literal that does not is its cast's error, at the
+/// literal.
+fn literals_fit(args: &[pg_query::protobuf::Node], scope: &Scope) -> Result<()> {
+    use pg_query::protobuf::a_const::Val;
+    let typed: Vec<String> = args.iter().filter_map(|a| operand_type(a, scope)).collect();
+    let Some(first) = typed.first() else {
+        return Ok(());
+    };
+    if typed.iter().any(|t| t != first) {
+        return Ok(());
+    }
+    // Only the types whose input this check can judge exactly.
+    if !matches!(
+        first.as_str(),
+        "int2" | "int4" | "int8" | "numeric" | "float4" | "float8" | "bool" | "date" | "uuid"
+    ) {
+        return Ok(());
+    }
+    for a in args {
+        if let Some(N::AConst(c)) = a.node.as_ref() {
+            if let Some(Val::Sval(s)) = c.val.as_ref() {
+                if let Err(e) = crate::cast_value(bson::Bson::String(s.sval.clone()), first) {
+                    set_error_location(c.location);
+                    return Err(e);
+                }
+            }
+        }
+    }
+    Ok(())
 }
